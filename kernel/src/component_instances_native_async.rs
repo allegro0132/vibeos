@@ -10,12 +10,14 @@
 #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
 use super::native_pending_shadow_model::ExactRevokeDecision;
 use super::native_pending_shadow_model::{
-    BackendEffect, ExactBackendAction, ExactBackendPendingKind as PendingKind, ExactBackendReturn,
-    ExactCancelCause, ExactCancelPlan, ExactCleanupDecision, ExactContinuation,
-    ExactContinuationCleanup, ExactHostFunction, ExactInputSpillReceipt, ExactInstanceIdentity,
-    ExactLedgerError, ExactLedgerPhase, ExactLedgerSnapshot, ExactOperationLedger,
-    ExactResidualCancelPlan, ExactResourceRevokePlan, ExactResourceState, ExactRuntimeCleanup,
-    ExactRuntimeToken, ExactStreamResource, InputSpill, OutputStaging, DRIVER_CHUNK_BYTES,
+    exact_backend_cancel_then_release, BackendEffect, ExactBackendAction,
+    ExactBackendPendingKind as PendingKind, ExactBackendReturn, ExactCancelCause, ExactCancelPlan,
+    ExactCleanupDecision, ExactContinuation, ExactContinuationCleanup, ExactHostFunction,
+    ExactInputSpillReceipt, ExactInstanceIdentity, ExactLedgerError, ExactLedgerPhase,
+    ExactLedgerSnapshot, ExactNativeLeaseBranch, ExactNativeLeaseContinuationReceipt,
+    ExactNativeLeaseError, ExactNativeLeaseLedger, ExactOperationLedger, ExactResidualCancelPlan,
+    ExactResourceRevokePlan, ExactResourceState, ExactRuntimeCleanup, ExactRuntimeToken,
+    ExactStreamResource, InputSpill, OutputStaging, DRIVER_CHUNK_BYTES, EXACT_NATIVE_LEASE_LIMIT,
 };
 use super::*;
 use crate::instance::{
@@ -48,7 +50,7 @@ use vibeos_component_runtime::decode::ComponentPlan;
 use vibeos_component_runtime::native_async_acceptance::{
     Component as NativeComponent, Error as NativeError, FinalizeError as NativeFinalizeError,
     HostRequest as NativeHostRequest, HostToken as NativeHostToken, Invocation as NativeInvocation,
-    Poll as NativePoll,
+    Poll as NativePoll, WaitRegistration as NativeWaitRegistration, WaitToken as NativeWaitToken,
 };
 #[cfg(feature = "ssh-native-async-command")]
 use vibeos_image_policy::C53_NATIVE_ASYNC_COMMAND;
@@ -582,6 +584,9 @@ pub(super) struct TargetManagedReport {
     reaper_waiters: usize,
     route_exact: bool,
     gates_open: bool,
+    lease_current: usize,
+    lease_peak: u8,
+    lease_limit: u8,
 }
 
 #[cfg(feature = "ssh-native-async-qemu-acceptance")]
@@ -823,10 +828,35 @@ pub(super) fn target_record_managed_acknowledgement(
 pub(super) fn target_pending_shadow_residue() -> usize {
     PENDING_LEDGERS
         .iter()
-        .filter(|ledger| {
-            ledger.lock().phase() != super::native_pending_shadow_model::ExactLedgerPhase::Retired
+        .enumerate()
+        .filter(|(index, ledger)| {
+            let operation_live = {
+                ledger.lock().phase()
+                    != super::native_pending_shadow_model::ExactLedgerPhase::Retired
+            };
+            let lease_live = { !LEASE_LEDGERS[*index].lock().is_retired() };
+            operation_live || lease_live
         })
         .count()
+}
+
+#[cfg(any(
+    feature = "ssh-native-async-qemu-acceptance",
+    feature = "ssh-native-async-revoke-qemu-acceptance"
+))]
+fn target_lease_evidence() -> (usize, u8, u8, bool) {
+    let mut current = 0usize;
+    let mut peak = 0u8;
+    let mut exact = true;
+    for ledger in &LEASE_LEDGERS {
+        let metrics = ledger.lock().metrics();
+        current = current.saturating_add(usize::from(metrics.current()));
+        peak = peak.max(metrics.peak());
+        exact &= metrics.limit() == EXACT_NATIVE_LEASE_LIMIT
+            && metrics.peak() <= metrics.limit()
+            && metrics.current() <= metrics.limit();
+    }
+    (current, peak, EXACT_NATIVE_LEASE_LIMIT, exact)
 }
 
 #[cfg(feature = "ssh-native-async-qemu-acceptance")]
@@ -851,6 +881,7 @@ pub(super) fn target_completion_report(
     let reaper_notifies = TARGET_MANAGED_REAPER_NOTIFIES.load(Ordering::Acquire);
     let acknowledgements = TARGET_MANAGED_ACKNOWLEDGEMENTS.load(Ordering::Acquire);
     let completions = TARGET_MANAGED_COMPLETIONS.load(Ordering::Acquire);
+    let (lease_current, lease_peak, lease_limit, lease_exact) = target_lease_evidence();
     let mut active = 0usize;
     let mut acknowledged = None;
     let mut acknowledged_count = 0usize;
@@ -901,6 +932,7 @@ pub(super) fn target_completion_report(
         && starts == reaper_notifies
         && starts == acknowledgements
         && acknowledgements == completions.saturating_add(1);
+    let passed = passed && lease_exact && lease_current == 0 && lease_peak <= lease_limit;
 
     if passed {
         TARGET_MANAGED_AUDIT[acknowledged.expect("checked target acknowledgement")]
@@ -931,6 +963,9 @@ pub(super) fn target_completion_report(
         reaper_waiters,
         route_exact,
         gates_open,
+        lease_current,
+        lease_peak,
+        lease_limit,
     }
 }
 
@@ -943,7 +978,7 @@ pub(super) fn target_report_passed(report: TargetManagedReport) -> bool {
 pub(super) fn publish_target_report(report: TargetManagedReport) {
     let result = if report.passed { "PASS" } else { "FAIL" };
     crate::println!(
-        "WASM_C53_NATIVE_SSH_ACCEPTANCE {} starts={} shadow_retires={} terminals={} cspace_resets={} reaper_notifies={} acks={} input_bytes={} output_bytes={} normal_eof={} normal_close={} pending_shadows={} registry_occupied={} registry_header_mismatches={} control_live={} stream_bindings={} cleanup_shadows={} reaper_slots={} reaper_waiters={} route_exact={} gates_open={}",
+        "WASM_C53_NATIVE_SSH_ACCEPTANCE {} starts={} shadow_retires={} terminals={} cspace_resets={} reaper_notifies={} acks={} input_bytes={} output_bytes={} normal_eof={} normal_close={} pending_shadows={} registry_occupied={} registry_header_mismatches={} control_live={} stream_bindings={} cleanup_shadows={} reaper_slots={} reaper_waiters={} route_exact={} gates_open={} lease_current={} lease_peak={} lease_limit={}",
         result,
         report.starts,
         report.shadow_retires,
@@ -965,6 +1000,9 @@ pub(super) fn publish_target_report(report: TargetManagedReport) {
         report.reaper_waiters,
         usize::from(report.route_exact),
         usize::from(report.gates_open),
+        report.lease_current,
+        report.lease_peak,
+        report.lease_limit,
     );
 }
 
@@ -981,6 +1019,21 @@ type NativeOperationLedger = ExactOperationLedger<
     RegistryStreamBindings,
     NativeHostToken,
     HostOperationToken,
+    InstanceContinuationToken,
+>;
+type NativeLeaseLedger = ExactNativeLeaseLedger<
+    InstanceToken,
+    TaskId,
+    AllocationDomain,
+    RegistryStreamBindings,
+    NativeWaitToken,
+    InstanceContinuationToken,
+>;
+type NativeLeaseContinuation = ExactNativeLeaseContinuationReceipt<
+    InstanceToken,
+    TaskId,
+    AllocationDomain,
+    RegistryStreamBindings,
     InstanceContinuationToken,
 >;
 type NativeLedgerSnapshot = ExactLedgerSnapshot<
@@ -1219,6 +1272,8 @@ static C54_WORK_COMPLETE: OneShotWaitQueue = OneShotWaitQueue::new();
 
 static PENDING_LEDGERS: [SpinLock<NativeOperationLedger>; CONTROL_SLOTS] =
     [const { SpinLock::new(NativeOperationLedger::new()) }; CONTROL_SLOTS];
+static LEASE_LEDGERS: [SpinLock<NativeLeaseLedger>; CONTROL_SLOTS] =
+    [const { SpinLock::new(NativeLeaseLedger::new()) }; CONTROL_SLOTS];
 static SHADOW_KIND_INSTALLS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 const fn pending_kind_index(kind: PendingKind) -> usize {
@@ -1242,6 +1297,10 @@ fn ledger_slot(key: ControlKey) -> Option<&'static SpinLock<NativeOperationLedge
     PENDING_LEDGERS.get(key.slot as usize)
 }
 
+fn lease_slot(key: ControlKey) -> Option<&'static SpinLock<NativeLeaseLedger>> {
+    LEASE_LEDGERS.get(key.slot as usize)
+}
+
 fn with_ledger<T>(
     identity: DriverIdentity,
     operation: impl FnOnce(&mut NativeOperationLedger) -> Result<T, ExactLedgerError>,
@@ -1251,6 +1310,19 @@ fn with_ledger<T>(
     }
     let Some(slot) = ledger_slot(identity.key) else {
         return Err(ExactLedgerError::IdentityMismatch);
+    };
+    operation(&mut slot.lock())
+}
+
+fn with_leases<T>(
+    identity: DriverIdentity,
+    operation: impl FnOnce(&mut NativeLeaseLedger) -> Result<T, ExactNativeLeaseError>,
+) -> Result<T, ExactNativeLeaseError> {
+    if identity.exact().is_none() {
+        return Err(ExactNativeLeaseError::IdentityMismatch);
+    }
+    let Some(slot) = lease_slot(identity.key) else {
+        return Err(ExactNativeLeaseError::IdentityMismatch);
     };
     operation(&mut slot.lock())
 }
@@ -1777,7 +1849,12 @@ pub(super) fn target_record_revoke_ack(
 pub(super) fn target_revoke_pending_shadow_residue() -> usize {
     PENDING_LEDGERS
         .iter()
-        .filter(|ledger| ledger.lock().phase() != ExactLedgerPhase::Retired)
+        .enumerate()
+        .filter(|(index, ledger)| {
+            let operation_live = { ledger.lock().phase() != ExactLedgerPhase::Retired };
+            let lease_live = { !LEASE_LEDGERS[*index].lock().is_retired() };
+            operation_live || lease_live
+        })
         .count()
 }
 
@@ -1871,6 +1948,7 @@ pub(super) fn target_revoke_ssh_completed(
     reaper_slots: usize,
     reaper_waiters: usize,
 ) -> bool {
+    let (lease_current, lease_peak, lease_limit, lease_exact) = target_lease_evidence();
     let residues_zero = pending_shadows == 0
         && registry_occupied == 0
         && registry_header_mismatches == 0
@@ -1885,6 +1963,9 @@ pub(super) fn target_revoke_ssh_completed(
         && route_exact
         && gates_open
         && residues_zero
+        && lease_exact
+        && lease_current == 0
+        && lease_peak <= lease_limit
         && audit.claims == 1
         && audit.pending_claims == 1
         && audit.deferred_claims == 0
@@ -1939,7 +2020,7 @@ pub(super) fn target_revoke_ssh_completed(
                 && audit.restart_stale_backend == 1;
             if passed {
                 audit.ssh_completions = 2;
-                crate::println!("WASM_C54_NATIVE_REVOKE PASS starts=2 claims=1 pending_claims=1 cap_revokes=1 backend_cancels=1 core_already_consumed=1 consumed_deltas=1 runtime_cancel_acks=1 cancel_idles=1 backend_first=257 backend_second=767 canonical_total=851 canonical_first=99 canonical_second=99 canonical_commits=9 sent_prefixes=8 sent_total=752 waiting_ops=1 cancelled_terminals=1 cspace_resets=2 reaper_notifies=2 acks=2 late_wake_stale=1 restart_stale_claim=1 restart_stale_backend=1 replacement_success=1");
+                crate::println!("WASM_C54_NATIVE_REVOKE PASS starts=2 claims=1 pending_claims=1 cap_revokes=1 backend_cancels=1 core_already_consumed=1 consumed_deltas=1 runtime_cancel_acks=1 cancel_idles=1 backend_first=257 backend_second=767 canonical_total=851 canonical_first=99 canonical_second=99 canonical_commits=9 sent_prefixes=8 sent_total=752 waiting_ops=1 cancelled_terminals=1 cspace_resets=2 reaper_notifies=2 acks=2 late_wake_stale=1 restart_stale_claim=1 restart_stale_backend=1 replacement_success=1 lease_current={} lease_peak={} lease_limit={}", lease_current, lease_peak, lease_limit);
             }
             passed
         }
@@ -1951,6 +2032,18 @@ fn ledger_error_terminal(identity: DriverIdentity, error: ExactLedgerError) -> C
     // A caller from an older CONTROL generation is inert. In particular it may
     // not quarantine a replacement which now owns the same fixed slot.
     if error != ExactLedgerError::StaleGeneration {
+        quarantine_shadow(identity);
+    }
+    ComponentTerminal::RunnerFault
+}
+
+fn lease_error_terminal(
+    identity: DriverIdentity,
+    error: ExactNativeLeaseError,
+) -> ComponentTerminal {
+    // Like the operation shadow, an older generation is observationally inert
+    // toward the replacement which now owns this fixed slot.
+    if error != ExactNativeLeaseError::StaleGeneration {
         quarantine_shadow(identity);
     }
     ComponentTerminal::RunnerFault
@@ -1975,8 +2068,22 @@ pub(super) fn bind_pending_shadow(
         ledger.bind(exact)
     });
     match result {
+        Ok(()) => {}
+        Err(ExactLedgerError::StaleGeneration) => return false,
+        Err(_) => {
+            quarantine_shadow(identity);
+            return false;
+        }
+    }
+    let leases = with_leases(identity, |ledger| {
+        let exact = identity
+            .exact()
+            .ok_or(ExactNativeLeaseError::IdentityMismatch)?;
+        ledger.bind(exact)
+    });
+    match leases {
         Ok(()) => true,
-        Err(ExactLedgerError::StaleGeneration) => false,
+        Err(ExactNativeLeaseError::StaleGeneration) => false,
         Err(_) => {
             quarantine_shadow(identity);
             false
@@ -2015,7 +2122,52 @@ fn ledger_begin_backend(
     previous: NativeLedgerSnapshot,
     action: ExactBackendAction,
 ) -> Result<NativeLedgerSnapshot, ExactLedgerError> {
-    with_ledger(identity, |ledger| ledger.begin_backend(previous, action))
+    let starts_backend = action == ExactBackendAction::Start;
+    if starts_backend {
+        with_leases(identity, |leases| {
+            leases.begin_backend(
+                identity
+                    .exact()
+                    .ok_or(ExactNativeLeaseError::IdentityMismatch)?,
+            )
+        })
+        .map_err(|error| match error {
+            ExactNativeLeaseError::StaleGeneration => ExactLedgerError::StaleGeneration,
+            _ => {
+                let _ = lease_error_terminal(identity, error);
+                ExactLedgerError::Quarantined
+            }
+        })?;
+    }
+    let result = with_ledger(identity, |ledger| ledger.begin_backend(previous, action));
+    if starts_backend && result.is_err() {
+        let _ = with_leases(identity, |leases| {
+            leases.finish_backend(
+                identity
+                    .exact()
+                    .ok_or(ExactNativeLeaseError::IdentityMismatch)?,
+            )
+        });
+    }
+    result
+}
+
+fn finish_backend_lease(identity: DriverIdentity) -> Result<(), ComponentTerminal> {
+    with_leases(identity, |leases| {
+        leases.finish_backend(
+            identity
+                .exact()
+                .ok_or(ExactNativeLeaseError::IdentityMismatch)?,
+        )
+    })
+    .map_err(|error| lease_error_terminal(identity, error))
+}
+
+fn lease_result<T>(
+    identity: DriverIdentity,
+    result: Result<T, ExactNativeLeaseError>,
+) -> Result<T, ComponentTerminal> {
+    result.map_err(|error| lease_error_terminal(identity, error))
 }
 
 fn ledger_backend_pending(
@@ -2064,6 +2216,24 @@ fn quarantine_shadow(identity: DriverIdentity) {
         }
     };
     if stale {
+        return;
+    }
+    let Some(lease_slot) = lease_slot(identity.key) else {
+        lifecycle_fail_stop();
+        return;
+    };
+    let lease_stale = {
+        let mut leases = lease_slot.lock();
+        match leases.terminal_empty(exact) {
+            Err(ExactNativeLeaseError::StaleGeneration) => true,
+            Ok(_) | Err(_) => {
+                leases.quarantine();
+                false
+            }
+        }
+    };
+    if lease_stale {
+        lifecycle_fail_stop();
         return;
     }
     if let Some(shadow) = CONTROL.child_shadow.get(identity.key.slot as usize) {
@@ -2173,11 +2343,20 @@ fn revoke_endpoint_cap_in_space(
         if validate_stream_space(&cspace, identity.streams).is_err() {
             return Err(());
         }
-        if cspace.revoke_exact_admin(endpoint).map_err(|_| ())? == 0 {
+        if cspace.revoke_exact_admin(endpoint).map_err(|_| ())? != 1 {
             return Err(());
         }
     }
     with_ledger(identity, |ledger| ledger.finish_cap_revoke(plan)).map_err(|_| ())?;
+    with_leases(identity, |leases| {
+        leases.release_stream_cap(
+            identity
+                .exact()
+                .ok_or(ExactNativeLeaseError::IdentityMismatch)?,
+            plan.resource(),
+        )
+    })
+    .map_err(|_| ())?;
     Ok(())
 }
 
@@ -2194,25 +2373,97 @@ fn revoke_endpoint_and_retain_cancel_lease(
     let lease = {
         let mut cspace = space.cspace().lock();
         let lease = backend_cancel_lease_from_cspace(&cspace, identity, kind).ok_or(())?;
-        if cspace.revoke_exact_admin(endpoint).map_err(|_| ())? == 0 {
+        if cspace.revoke_exact_admin(endpoint).map_err(|_| ())? != 1 {
             return Err(());
         }
         lease
     };
     with_ledger(identity, |ledger| ledger.finish_cap_revoke(plan)).map_err(|_| ())?;
+    with_leases(identity, |leases| {
+        leases.release_stream_cap(
+            identity
+                .exact()
+                .ok_or(ExactNativeLeaseError::IdentityMismatch)?,
+            plan.resource(),
+        )
+    })
+    .map_err(|_| ())?;
     Ok(lease)
 }
 
 /// Complete a SYSTEM cancellation without holding the ledger, CSpace, or
 /// stream lock across another layer. The endpoint cap may already be revoked;
 /// only the independently retained supervisor capability is used here.
+#[derive(Clone, Copy)]
+enum DeferredBackendContinuationRelease {
+    Dropped {
+        continuation: NativeLeaseContinuation,
+        token: InstanceContinuationToken,
+    },
+    Abandoned {
+        continuation: NativeLeaseContinuation,
+    },
+}
+
+impl DeferredBackendContinuationRelease {
+    const fn continuation(self) -> NativeLeaseContinuation {
+        match self {
+            Self::Dropped { continuation, .. } | Self::Abandoned { continuation } => continuation,
+        }
+    }
+
+    fn validate(self, identity: DriverIdentity) -> Result<(), ()> {
+        let continuation = self.continuation();
+        if continuation.branch() != ExactNativeLeaseBranch::Backend
+            || matches!(
+                self,
+                Self::Dropped { token, .. } if continuation.token() != Some(token)
+            )
+        {
+            return Err(());
+        }
+        let exact = identity.exact().ok_or(())?;
+        match with_leases(identity, |leases| leases.continuation(exact)) {
+            Ok(Some(current)) if current == continuation => Ok(()),
+            Ok(Some(_) | None) | Err(_) => Err(()),
+        }
+    }
+
+    fn validate_for_plan(self, identity: DriverIdentity, plan: NativeCancelPlan) -> Result<(), ()> {
+        if plan.claim().cause() == ExactCancelCause::Revoke
+            || plan.continuation().token() != self.continuation().token()
+        {
+            return Err(());
+        }
+        self.validate(identity)
+    }
+
+    fn finish(self, identity: DriverIdentity) -> Result<(), ()> {
+        self.validate(identity)?;
+        with_leases(identity, |leases| match self {
+            Self::Dropped {
+                continuation,
+                token,
+            } => leases.drop_cancelled_continuation(continuation, token),
+            Self::Abandoned { continuation } => leases.abandon_continuation_raw_fault(continuation),
+        })
+        .map_err(|_| ())
+    }
+}
+
 fn cancel_plan_in_space(
     space: &InstanceSpace,
     identity: DriverIdentity,
     plan: NativeCancelPlan,
+    deferred_continuation: Option<DeferredBackendContinuationRelease>,
 ) -> Result<NativeLedgerSnapshot, ()> {
     if plan.snapshot().identity() != identity.exact().ok_or(())? {
         return Err(());
+    }
+    if let Some(deferred) = deferred_continuation {
+        // Validate before the external mutation. A bad aggregate receipt must
+        // leave the still-live backend operation and its wake token untouched.
+        deferred.validate_for_plan(identity, plan)?;
     }
     let lease = if plan.claim().cause() == ExactCancelCause::Revoke {
         let lease = revoke_endpoint_and_retain_cancel_lease(
@@ -2229,13 +2480,24 @@ fn cancel_plan_in_space(
     } else {
         backend_cancel_lease(space, identity, plan.kind()).ok_or(())?
     };
-    invoke_backend_cancel(lease, plan.backend()).map_err(|_| ())?;
-    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
-    if plan.claim().cause() == ExactCancelCause::Revoke
-        && c54_is_healthy_primary(identity)
-        && !c54_record_backend_cancel(identity)
-    {
-        return Err(());
+    if let Some(deferred) = deferred_continuation {
+        exact_backend_cancel_then_release(
+            || invoke_backend_cancel(lease, plan.backend()).map_err(|_| ()),
+            || {
+                // The physical stream slot and its copied HostWakeToken are
+                // gone. A second exact validation now guards the sole credit.
+                deferred.finish(identity)
+            },
+        )?;
+    } else {
+        invoke_backend_cancel(lease, plan.backend()).map_err(|_| ())?;
+        #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+        if plan.claim().cause() == ExactCancelCause::Revoke
+            && c54_is_healthy_primary(identity)
+            && !c54_record_backend_cancel(identity)
+        {
+            return Err(());
+        }
     }
     let continuation = plan.continuation();
     let mut cancelled =
@@ -2287,6 +2549,7 @@ fn cancel_plan_in_space(
 fn cancel_plan_in_current(
     identity: DriverIdentity,
     plan: NativeCancelPlan,
+    deferred_continuation: Option<DeferredBackendContinuationRelease>,
 ) -> Result<NativeLedgerSnapshot, ()> {
     let witness = crate::exec::current_reclaimable_task_witness().ok_or(())?;
     if witness.instance_token() != Some(identity.instance)
@@ -2298,7 +2561,7 @@ fn cancel_plan_in_current(
     unsafe {
         registry()
             .with_current_space_for_cleanup(witness, |space| {
-                cancel_plan_in_space(space, identity, plan)
+                cancel_plan_in_space(space, identity, plan, deferred_continuation)
             })
             .map_err(|_| ())?
     }
@@ -2321,7 +2584,7 @@ fn backend_return_pending(
             // ledger. Revoke the exact endpoint cap and cancel only through its
             // supervisor. The driver still owns the runtime token and must
             // explicitly drop it before the cancellation can be consumed.
-            cancel_plan_in_current(identity, plan)
+            cancel_plan_in_current(identity, plan, None)
                 .map(BackendPendingOutcome::Revoked)
                 .map_err(|()| unexpected_native_driver_error(identity, "deferred revoke cancel"))
         }
@@ -2349,6 +2612,7 @@ fn finish_live_revoke(
         identity,
         with_ledger(identity, |ledger| ledger.consume_cancelled(acknowledged)),
     )?;
+    finish_backend_lease(identity)?;
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
     if c54_is_healthy_primary(identity) && !c54_record_cancel_idle(identity) {
         return Err(unexpected_native_driver_error(
@@ -2385,6 +2649,140 @@ fn cancel_residual_in_current(
     }
 }
 
+#[derive(Clone, Copy)]
+struct NativeLeaseCleanupProjection {
+    continuation: Option<NativeLeaseContinuation>,
+    core_continuation: Option<InstanceContinuationToken>,
+    core_continuation_branch: Option<ExactNativeLeaseBranch>,
+    backend: bool,
+    input_spill: bool,
+    runtime_wait: Option<NativeWaitToken>,
+}
+
+fn lease_cleanup_projection(
+    identity: DriverIdentity,
+) -> Result<NativeLeaseCleanupProjection, ExactNativeLeaseError> {
+    with_leases(identity, |leases| {
+        let exact = identity
+            .exact()
+            .ok_or(ExactNativeLeaseError::IdentityMismatch)?;
+        let continuation = leases.continuation(exact)?;
+        let core_continuation = leases.core_continuation(exact)?;
+        let core_continuation_branch = leases.core_continuation_branch(exact)?;
+        Ok(NativeLeaseCleanupProjection {
+            continuation,
+            core_continuation,
+            core_continuation_branch,
+            backend: leases.has_backend(exact)?,
+            input_spill: leases.has_input_spill(exact)?,
+            runtime_wait: leases.runtime_wait(exact)?,
+        })
+    })
+}
+
+fn operation_holds_backend(snapshot: Option<NativeLedgerSnapshot>) -> bool {
+    snapshot.is_some_and(|snapshot| {
+        matches!(
+            snapshot.phase(),
+            ExactLedgerPhase::BackendInvoking
+                | ExactLedgerPhase::BackendPending
+                | ExactLedgerPhase::BackendLinearized
+                | ExactLedgerPhase::CancelClaimed
+                | ExactLedgerPhase::BackendCancelled
+        )
+    })
+}
+
+fn cleanup_projections_match(
+    operation: Option<NativeLedgerSnapshot>,
+    operation_input_spill: bool,
+    leases: NativeLeaseCleanupProjection,
+) -> bool {
+    if operation_holds_backend(operation) != leases.backend
+        || operation_input_spill != leases.input_spill
+        || (leases.runtime_wait.is_some() && operation.is_some())
+    {
+        return false;
+    }
+    let operation_continuation = operation
+        .map(NativeLedgerSnapshot::continuation)
+        .unwrap_or(ExactContinuation::None);
+    match leases.continuation {
+        Some(continuation) => {
+            let branch_exact = match continuation.branch() {
+                ExactNativeLeaseBranch::Quantum => true,
+                ExactNativeLeaseBranch::Backend => leases.backend && leases.runtime_wait.is_none(),
+                ExactNativeLeaseBranch::RuntimeWait => {
+                    !leases.backend && leases.runtime_wait.is_some()
+                }
+            };
+            let live_token_exact = continuation.token().is_none_or(|token| {
+                leases.core_continuation == Some(token)
+                    && leases.core_continuation_branch == Some(continuation.branch())
+            });
+            let operation_exact = match operation_continuation {
+                ExactContinuation::Armed(token)
+                | ExactContinuation::WakeRegistered(token)
+                | ExactContinuation::Signalled(token)
+                | ExactContinuation::Cancelled(token)
+                | ExactContinuation::Abandoned(token) => {
+                    continuation.branch() == ExactNativeLeaseBranch::Backend
+                        && continuation.token() == Some(token)
+                }
+                ExactContinuation::Consumed(token) => match continuation.branch() {
+                    ExactNativeLeaseBranch::Backend => continuation.token() == Some(token),
+                    ExactNativeLeaseBranch::Quantum => true,
+                    ExactNativeLeaseBranch::RuntimeWait => false,
+                },
+                ExactContinuation::None => true,
+            };
+            branch_exact && live_token_exact && operation_exact
+        }
+        None => match leases.core_continuation_branch {
+            Some(ExactNativeLeaseBranch::Backend) => operation_continuation
+                .token()
+                .is_none_or(|token| leases.core_continuation == Some(token)),
+            Some(ExactNativeLeaseBranch::Quantum) => matches!(
+                operation_continuation,
+                ExactContinuation::None | ExactContinuation::Consumed(_)
+            ),
+            Some(ExactNativeLeaseBranch::RuntimeWait) | None => {
+                operation_continuation == ExactContinuation::None
+            }
+        },
+    }
+}
+
+fn reconcile_terminal_lease_residues(
+    identity: DriverIdentity,
+    projection: NativeLeaseCleanupProjection,
+) -> Result<bool, ExactNativeLeaseError> {
+    with_leases(identity, |leases| {
+        let exact = identity
+            .exact()
+            .ok_or(ExactNativeLeaseError::IdentityMismatch)?;
+        if leases.continuation(exact)?.is_some()
+            || leases.core_continuation(exact)? != projection.core_continuation
+            || leases.core_continuation_branch(exact)? != projection.core_continuation_branch
+            || leases.has_backend(exact)? != projection.backend
+            || leases.has_input_spill(exact)? != projection.input_spill
+            || leases.runtime_wait(exact)? != projection.runtime_wait
+        {
+            return Ok(false);
+        }
+        if projection.backend {
+            leases.finish_backend(exact)?;
+        }
+        if let Some(wait) = projection.runtime_wait {
+            leases.finish_runtime_wait(exact, wait)?;
+        }
+        if projection.input_spill {
+            leases.finish_input_spill(exact)?;
+        }
+        leases.terminal_empty(exact)
+    })
+}
+
 pub(super) fn payload_drop(
     key: ControlKey,
     token: InstanceToken,
@@ -2414,19 +2812,97 @@ pub(super) fn payload_drop(
             return;
         }
     };
-    let waiter = before.and_then(|snapshot| match snapshot.continuation() {
-        ExactContinuation::Armed(token) | ExactContinuation::WakeRegistered(token) => Some(token),
-        _ => None,
-    });
-    let cancelled_waiter = match waiter {
-        Some(waiter) => match registry().confirm_cancelled_continuation_current(waiter) {
-            Ok(receipt) if receipt.matches_token(waiter) => Some(receipt),
-            _ => {
+    let operation_input_spill =
+        match with_ledger(identity, |ledger| ledger.input_spill_remaining(exact)) {
+            Ok(remaining) => remaining.is_some(),
+            Err(ExactLedgerError::StaleGeneration) => return,
+            Err(_) => {
                 quarantine_shadow(identity);
                 return;
             }
+        };
+    let lease_projection = match lease_cleanup_projection(identity) {
+        Ok(projection) => projection,
+        Err(ExactNativeLeaseError::StaleGeneration) => return,
+        Err(_) => {
+            quarantine_shadow(identity);
+            return;
+        }
+    };
+    if !cleanup_projections_match(before, operation_input_spill, lease_projection) {
+        quarantine_shadow(identity);
+        return;
+    }
+    let waiter = before.and_then(|snapshot| match snapshot.continuation() {
+        ExactContinuation::Armed(token)
+        | ExactContinuation::WakeRegistered(token)
+        | ExactContinuation::Signalled(token) => Some(token),
+        _ => None,
+    });
+    let mut deferred_backend_continuation = None;
+    let cancelled_waiter = match lease_projection.continuation {
+        Some(continuation) => match continuation.token() {
+            Some(token) => {
+                if (continuation.branch() == ExactNativeLeaseBranch::Backend
+                    && waiter != Some(token))
+                    || (continuation.branch() != ExactNativeLeaseBranch::Backend
+                        && waiter.is_some())
+                {
+                    quarantine_shadow(identity);
+                    return;
+                }
+                let cancelled = match registry().confirm_cancelled_continuation_current(token) {
+                    Ok(receipt) if receipt.matches_token(token) => receipt,
+                    _ => {
+                        quarantine_shadow(identity);
+                        return;
+                    }
+                };
+                let backend_already_cancelled = before.is_some_and(|snapshot| {
+                    snapshot.phase() == ExactLedgerPhase::BackendCancelled
+                        && snapshot.continuation() == ExactContinuation::Signalled(token)
+                });
+                if continuation.branch() == ExactNativeLeaseBranch::Backend
+                    && !backend_already_cancelled
+                {
+                    // Core's receipt retires only the scheduler continuation.
+                    // The stream still owns its copied wake token until the
+                    // exact backend cancellation below removes the operation.
+                    deferred_backend_continuation =
+                        Some(DeferredBackendContinuationRelease::Dropped {
+                            continuation,
+                            token,
+                        });
+                } else if with_leases(identity, |leases| {
+                    leases.drop_cancelled_continuation(continuation, token)
+                })
+                .is_err()
+                {
+                    quarantine_shadow(identity);
+                    return;
+                }
+                waiter.map(|_| cancelled)
+            }
+            None => {
+                if waiter.is_some()
+                    || with_leases(identity, |leases| {
+                        leases.cancel_reserved_continuation(continuation)
+                    })
+                    .is_err()
+                {
+                    quarantine_shadow(identity);
+                    return;
+                }
+                None
+            }
         },
-        None => None,
+        None => {
+            if waiter.is_some() {
+                quarantine_shadow(identity);
+                return;
+            }
+            None
+        }
     };
     if let Err(error) = with_ledger(identity, |ledger| {
         ledger.acknowledge_runtime_owner_drop(exact)
@@ -2436,6 +2912,47 @@ pub(super) fn payload_drop(
         }
         return;
     }
+    if let (Some(snapshot), Some(waiter), Some(receipt)) = (before, waiter, cancelled_waiter) {
+        if snapshot.phase() == ExactLedgerPhase::BackendCancelled
+            && snapshot.continuation() == ExactContinuation::Signalled(waiter)
+        {
+            if !receipt.matches_token(waiter) {
+                quarantine_shadow(identity);
+                return;
+            }
+            let cancelled = match with_ledger(identity, |ledger| {
+                ledger.finish_continuation_cleanup(
+                    snapshot,
+                    waiter,
+                    ExactContinuationCleanup::Cancelled,
+                )
+            }) {
+                Ok(cancelled) => cancelled,
+                Err(_) => {
+                    quarantine_shadow(identity);
+                    return;
+                }
+            };
+            let dropped = match with_ledger(identity, |ledger| {
+                ledger.acknowledge_runtime_cleanup(cancelled, ExactRuntimeCleanup::Dropped)
+            }) {
+                Ok(dropped) => dropped,
+                Err(_) => {
+                    quarantine_shadow(identity);
+                    return;
+                }
+            };
+            if with_ledger(identity, |ledger| ledger.consume_cancelled(dropped)).is_err() {
+                quarantine_shadow(identity);
+                return;
+            }
+            match reconcile_terminal_lease_residues(identity, lease_projection) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => quarantine_shadow(identity),
+            }
+            return;
+        }
+    }
     let decision = match with_ledger(identity, |ledger| ledger.prepare_finalizer(exact, false)) {
         Ok(decision) => decision,
         Err(_) => {
@@ -2444,7 +2961,13 @@ pub(super) fn payload_drop(
         }
     };
     let plan = match decision {
-        ExactCleanupDecision::ReclaimSafe => return,
+        ExactCleanupDecision::ReclaimSafe => {
+            match reconcile_terminal_lease_residues(identity, lease_projection) {
+                Ok(true) => {}
+                Ok(false) | Err(_) => quarantine_shadow(identity),
+            }
+            return;
+        }
         ExactCleanupDecision::Quarantined => {
             quarantine_shadow(identity);
             return;
@@ -2452,7 +2975,8 @@ pub(super) fn payload_drop(
         ExactCleanupDecision::Cancel(plan) => plan,
     };
     let continuation = plan.continuation();
-    let mut cancelled = match cancel_plan_in_current(identity, plan) {
+    let mut cancelled = match cancel_plan_in_current(identity, plan, deferred_backend_continuation)
+    {
         Ok(cancelled) => cancelled,
         Err(()) => {
             quarantine_shadow(identity);
@@ -2461,7 +2985,9 @@ pub(super) fn payload_drop(
     };
     match (continuation, waiter, cancelled_waiter) {
         (
-            ExactContinuation::Armed(current) | ExactContinuation::WakeRegistered(current),
+            ExactContinuation::Armed(current)
+            | ExactContinuation::WakeRegistered(current)
+            | ExactContinuation::Signalled(current),
             Some(waiter),
             Some(receipt),
         ) if current == waiter && receipt.matches_token(waiter) => {
@@ -2496,6 +3022,11 @@ pub(super) fn payload_drop(
     };
     if with_ledger(identity, |ledger| ledger.consume_cancelled(cancelled)).is_err() {
         quarantine_shadow(identity);
+        return;
+    }
+    match reconcile_terminal_lease_residues(identity, lease_projection) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => quarantine_shadow(identity),
     }
 }
 
@@ -2504,6 +3035,7 @@ fn terminal_shadow_empty(identity: DriverIdentity) -> bool {
         return false;
     };
     with_ledger(identity, |ledger| ledger.terminal_empty(exact)).is_ok_and(|empty| empty)
+        && with_leases(identity, |leases| leases.terminal_empty(exact)).is_ok_and(|empty| empty)
 }
 
 pub(super) fn retire_terminal_shadow(
@@ -2520,6 +3052,10 @@ pub(super) fn retire_terminal_shadow(
         domain,
         streams,
     };
+    if !terminal_shadow_empty(identity) {
+        quarantine_shadow(identity);
+        return false;
+    }
     let retired = with_ledger(identity, |ledger| {
         ledger.retire(identity.exact().ok_or(ExactLedgerError::IdentityMismatch)?)
     });
@@ -2537,6 +3073,43 @@ pub(super) fn retire_terminal_shadow(
         return false;
     }
     true
+}
+
+pub(super) fn finish_terminal_lease_reset(
+    key: ControlKey,
+    token: InstanceToken,
+    task: TaskId,
+    domain: AllocationDomain,
+    streams: RegistryStreamBindings,
+    revoked_capabilities: usize,
+) -> bool {
+    let identity = DriverIdentity {
+        key,
+        instance: token,
+        task,
+        domain,
+        streams,
+    };
+    let Some(exact) = identity.exact() else {
+        return false;
+    };
+    let Ok(revoked_capabilities) = u8::try_from(revoked_capabilities) else {
+        return false;
+    };
+    with_leases(identity, |leases| {
+        leases.reset_stream_caps(exact, revoked_capabilities)?;
+        let metrics = leases.metrics();
+        if metrics.current() != 0
+            || metrics.peak() > metrics.limit()
+            || metrics.limit() != EXACT_NATIVE_LEASE_LIMIT
+        {
+            leases.quarantine();
+            return Ok(false);
+        }
+        leases.retire(exact)?;
+        Ok(leases.is_retired())
+    })
+    .is_ok_and(|retired| retired)
 }
 
 fn validate_terminal_resource_projection(
@@ -2639,14 +3212,21 @@ pub(super) fn prepare_terminal_shadow(
         ledger.prepare_finalizer(exact, terminal == ComponentTerminal::Success)
     });
     match decision {
-        Ok(ExactCleanupDecision::ReclaimSafe) => true,
+        Ok(ExactCleanupDecision::ReclaimSafe) => {
+            if terminal_shadow_empty(identity) {
+                true
+            } else {
+                quarantine_shadow(identity);
+                false
+            }
+        }
         Ok(ExactCleanupDecision::Quarantined) | Err(_) => {
             quarantine_shadow(identity);
             false
         }
         Ok(ExactCleanupDecision::Cancel(plan)) => {
             let continuation = plan.continuation();
-            let mut cancelled = match cancel_plan_in_space(space, identity, plan) {
+            let mut cancelled = match cancel_plan_in_space(space, identity, plan, None) {
                 Ok(cancelled) => cancelled,
                 Err(()) => {
                     quarantine_shadow(identity);
@@ -2674,7 +3254,14 @@ pub(super) fn prepare_terminal_shadow(
             };
             let _ = cancelled;
             match with_ledger(identity, |ledger| ledger.prepare_finalizer(exact, false)) {
-                Ok(ExactCleanupDecision::ReclaimSafe) => true,
+                Ok(ExactCleanupDecision::ReclaimSafe) => {
+                    if terminal_shadow_empty(identity) {
+                        true
+                    } else {
+                        quarantine_shadow(identity);
+                        false
+                    }
+                }
                 Ok(ExactCleanupDecision::Cancel(_) | ExactCleanupDecision::Quarantined)
                 | Err(_) => {
                     quarantine_shadow(identity);
@@ -2705,28 +3292,109 @@ pub(super) fn raw_fault_cleanup(
         quarantine_shadow(identity);
         return false;
     };
-    if !receipt.matches_instance(token) {
-        quarantine_shadow(identity);
-        return false;
-    }
     let snapshot = match ledger_snapshot(identity) {
         Ok(snapshot) => snapshot,
+        Err(ExactLedgerError::StaleGeneration) => return false,
         Err(_) => {
             quarantine_shadow(identity);
             return false;
         }
     };
+    let operation_input_spill =
+        match with_ledger(identity, |ledger| ledger.input_spill_remaining(exact)) {
+            Ok(remaining) => remaining.is_some(),
+            Err(ExactLedgerError::StaleGeneration) => return false,
+            Err(_) => {
+                quarantine_shadow(identity);
+                return false;
+            }
+        };
+    let lease_projection = match lease_cleanup_projection(identity) {
+        Ok(projection) => projection,
+        Err(ExactNativeLeaseError::StaleGeneration) => return false,
+        Err(_) => {
+            quarantine_shadow(identity);
+            return false;
+        }
+    };
+    if !cleanup_projections_match(snapshot, operation_input_spill, lease_projection) {
+        quarantine_shadow(identity);
+        return false;
+    }
+    if !receipt.matches_exact(token, lease_projection.core_continuation) {
+        quarantine_shadow(identity);
+        return false;
+    }
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
     let raw_phase = snapshot.map(NativeLedgerSnapshot::phase);
-    if let Some(continuation) = snapshot.and_then(|snapshot| snapshot.continuation().token()) {
-        if !receipt.matches_continuation(Some(continuation)) {
+    let mut deferred_backend_continuation = None;
+    if let Some(continuation) = lease_projection.continuation {
+        if continuation.branch() == ExactNativeLeaseBranch::Backend {
+            // Core abandonment does not revoke the stream's copied wake
+            // token. Keep both aggregate charges until exact backend cancel.
+            deferred_backend_continuation =
+                Some(DeferredBackendContinuationRelease::Abandoned { continuation });
+        } else if with_leases(identity, |leases| {
+            leases.abandon_continuation_raw_fault(continuation)
+        })
+        .is_err()
+        {
             quarantine_shadow(identity);
             return false;
         }
     }
+    let completed_revoke = snapshot.filter(|snapshot| {
+        snapshot.phase() == ExactLedgerPhase::BackendCancelled
+            && matches!(
+                snapshot.continuation(),
+                ExactContinuation::Signalled(_) | ExactContinuation::Consumed(_)
+            )
+    });
+    if let Some(completed_revoke) = completed_revoke {
+        // The exact revoked latch and BackendCancelled snapshot prove the
+        // physical backend operation is already gone. Take over only after
+        // Core's fault receipt matched the current continuation projection.
+        if with_ledger(identity, |ledger| {
+            ledger.abandon_completed_revoke_raw_fault(completed_revoke)
+        })
+        .is_err()
+        {
+            quarantine_shadow(identity);
+            return false;
+        }
+        if let Some(deferred) = deferred_backend_continuation {
+            if deferred.finish(identity).is_err() {
+                quarantine_shadow(identity);
+                return false;
+            }
+        }
+        return match with_ledger(identity, |ledger| ledger.raw_fault(exact)) {
+            Ok(ExactCleanupDecision::ReclaimSafe) => {
+                match reconcile_terminal_lease_residues(identity, lease_projection) {
+                    Ok(true) => true,
+                    Ok(false) | Err(_) => {
+                        quarantine_shadow(identity);
+                        false
+                    }
+                }
+            }
+            Ok(ExactCleanupDecision::Cancel(_) | ExactCleanupDecision::Quarantined) | Err(_) => {
+                quarantine_shadow(identity);
+                false
+            }
+        };
+    }
     let decision = with_ledger(identity, |ledger| ledger.raw_fault(exact));
     let plan = match decision {
-        Ok(ExactCleanupDecision::ReclaimSafe) => return true,
+        Ok(ExactCleanupDecision::ReclaimSafe) => {
+            return match reconcile_terminal_lease_residues(identity, lease_projection) {
+                Ok(true) => true,
+                Ok(false) | Err(_) => {
+                    quarantine_shadow(identity);
+                    false
+                }
+            };
+        }
         Ok(ExactCleanupDecision::Cancel(plan)) => plan,
         Ok(ExactCleanupDecision::Quarantined) | Err(_) => {
             #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
@@ -2750,13 +3418,14 @@ pub(super) fn raw_fault_cleanup(
         }
     };
     let continuation = plan.continuation();
-    let mut cancelled = match cancel_plan_in_space(space, identity, plan) {
-        Ok(cancelled) => cancelled,
-        Err(()) => {
-            quarantine_shadow(identity);
-            return false;
-        }
-    };
+    let mut cancelled =
+        match cancel_plan_in_space(space, identity, plan, deferred_backend_continuation) {
+            Ok(cancelled) => cancelled,
+            Err(()) => {
+                quarantine_shadow(identity);
+                return false;
+            }
+        };
     match continuation {
         ExactContinuation::Armed(continuation)
         | ExactContinuation::WakeRegistered(continuation) => {
@@ -2778,7 +3447,29 @@ pub(super) fn raw_fault_cleanup(
                 }
             };
         }
-        ExactContinuation::None | ExactContinuation::Consumed(_) => {}
+        ExactContinuation::Consumed(continuation) => {
+            if receipt.matches_continuation(Some(continuation)) {
+                cancelled = match with_ledger(identity, |ledger| {
+                    ledger.finish_continuation_cleanup(
+                        cancelled,
+                        continuation,
+                        ExactContinuationCleanup::Abandoned,
+                    )
+                }) {
+                    Ok(cancelled) => cancelled,
+                    Err(_) => {
+                        quarantine_shadow(identity);
+                        return false;
+                    }
+                };
+            } else if lease_projection.core_continuation_branch
+                != Some(ExactNativeLeaseBranch::Quantum)
+            {
+                quarantine_shadow(identity);
+                return false;
+            }
+        }
+        ExactContinuation::None => {}
         ExactContinuation::Signalled(_)
         | ExactContinuation::Cancelled(_)
         | ExactContinuation::Abandoned(_) => {
@@ -2797,7 +3488,15 @@ pub(super) fn raw_fault_cleanup(
     };
     let _ = cancelled;
     match with_ledger(identity, |ledger| ledger.raw_fault(exact)) {
-        Ok(ExactCleanupDecision::ReclaimSafe) => true,
+        Ok(ExactCleanupDecision::ReclaimSafe) => {
+            match reconcile_terminal_lease_residues(identity, lease_projection) {
+                Ok(true) => true,
+                Ok(false) | Err(_) => {
+                    quarantine_shadow(identity);
+                    false
+                }
+            }
+        }
         Ok(ExactCleanupDecision::Cancel(_) | ExactCleanupDecision::Quarantined) | Err(_) => {
             quarantine_shadow(identity);
             false
@@ -2902,9 +3601,7 @@ async fn drain_runtime_cleanup(
     let NativePoll::CleanupPending { trap, .. } = poll else {
         return Ok(poll);
     };
-    quantum(identity.instance)
-        .await
-        .map_err(|_| unexpected_native_driver_error(identity, "cleanup quantum"))?;
+    quantum(identity).await?;
     match invocation.poll() {
         NativePoll::Trapped(observed) if observed == trap => Ok(NativePoll::Trapped(observed)),
         other => Err(unexpected_native_driver_error(
@@ -2947,13 +3644,112 @@ async fn finalize_runtime_transport(
     }
 }
 
-async fn quantum(instance: InstanceToken) -> Result<(), ()> {
-    let operation = registry()
-        .arm_continuation_current(instance, InstanceContinuationKind::Quantum)
-        .map_err(|_| ())?;
-    let continuation = registry().wait_continuation(operation).map_err(|_| ())?;
-    let consumed = continuation.await.map_err(|_| ())?;
-    consumed.matches_token(operation).then_some(()).ok_or(())
+async fn quantum(identity: DriverIdentity) -> Result<(), ComponentTerminal> {
+    let exact = identity
+        .exact()
+        .ok_or_else(|| unexpected_native_driver_error(identity, "quantum identity"))?;
+    let reserved = lease_result(
+        identity,
+        with_leases(identity, |leases| {
+            leases.reserve_quantum_continuation(exact)
+        }),
+    )?;
+    let operation = match registry()
+        .arm_continuation_current(identity.instance, InstanceContinuationKind::Quantum)
+    {
+        Ok(operation) => operation,
+        Err(error) => {
+            lease_result(
+                identity,
+                with_leases(identity, |leases| {
+                    leases.cancel_reserved_continuation(reserved)
+                }),
+            )?;
+            return Err(unexpected_native_driver_error(identity, error));
+        }
+    };
+    let bound = lease_result(
+        identity,
+        with_leases(identity, |leases| {
+            leases.bind_continuation(reserved, operation)
+        }),
+    )?;
+    let continuation = registry()
+        .wait_continuation(operation)
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    let consumed = continuation
+        .await
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    if !consumed.matches_token(operation) {
+        return Err(unexpected_native_driver_error(
+            identity,
+            "quantum continuation receipt mismatch",
+        ));
+    }
+    lease_result(
+        identity,
+        with_leases(identity, |leases| {
+            leases.consume_quantum_continuation(bound, operation)
+        }),
+    )
+}
+
+async fn await_runtime_wait(
+    invocation: &mut NativeInvocation<'_>,
+    identity: DriverIdentity,
+    wait: NativeWaitToken,
+) -> Result<NativePoll, ComponentTerminal> {
+    let exact = identity
+        .exact()
+        .ok_or_else(|| unexpected_native_driver_error(identity, "runtime wait identity"))?;
+    lease_result(
+        identity,
+        with_leases(identity, |leases| leases.begin_runtime_wait(exact, wait)),
+    )?;
+    let (continuation_token, bound_lease, continuation) =
+        arm_external_lease_continuation(identity)?;
+    let registered_lease = lease_result(
+        identity,
+        with_leases(identity, |leases| {
+            leases.register_runtime_wake(bound_lease, wait)
+        }),
+    )?;
+    let wake = HostWakeToken::new(continuation_token.signal_words(), stream_wake);
+    let registration: NativeWaitRegistration = match invocation.register_wait_wake(wait, wake) {
+        Ok(registration) => registration,
+        Err(error) => {
+            drop(continuation);
+            confirm_dropped_lease_continuation(identity, registered_lease, continuation_token)?;
+            lease_result(
+                identity,
+                with_leases(identity, |leases| leases.finish_runtime_wait(exact, wait)),
+            )?;
+            return Err(unexpected_native_driver_error(identity, error));
+        }
+    };
+    let consumed = continuation
+        .await
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    if !consumed.matches_token(continuation_token) {
+        return Err(unexpected_native_driver_error(
+            identity,
+            "runtime wait continuation receipt mismatch",
+        ));
+    }
+    lease_result(
+        identity,
+        with_leases(identity, |leases| {
+            leases.consume_continuation(registered_lease, continuation_token)
+        }),
+    )?;
+    let resumed = invocation
+        .resume_wait(registration)
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    lease_result(
+        identity,
+        with_leases(identity, |leases| leases.finish_runtime_wait(exact, wait)),
+    )?;
+    drain_runtime_cleanup(invocation, identity, resumed).await
 }
 
 fn stream_wake(words: [usize; 4]) {
@@ -2964,6 +3760,69 @@ fn stream_wake(words: [usize; 4]) {
         | crate::instance::InstanceContinuationSignal::Stale => {}
         crate::instance::InstanceContinuationSignal::Quarantined => lifecycle_fail_stop(),
     }
+}
+
+fn arm_external_lease_continuation(
+    identity: DriverIdentity,
+) -> Result<
+    (
+        InstanceContinuationToken,
+        NativeLeaseContinuation,
+        crate::instance::InstanceContinuation<'static>,
+    ),
+    ComponentTerminal,
+> {
+    let exact = identity.exact().ok_or_else(|| {
+        unexpected_native_driver_error(identity, "external continuation identity")
+    })?;
+    let reserved = lease_result(
+        identity,
+        with_leases(identity, |leases| leases.reserve_continuation(exact)),
+    )?;
+    let token = match registry()
+        .arm_continuation_current(identity.instance, InstanceContinuationKind::External)
+    {
+        Ok(token) => token,
+        Err(error) => {
+            lease_result(
+                identity,
+                with_leases(identity, |leases| {
+                    leases.cancel_reserved_continuation(reserved)
+                }),
+            )?;
+            return Err(unexpected_native_driver_error(identity, error));
+        }
+    };
+    let bound = lease_result(
+        identity,
+        with_leases(identity, |leases| leases.bind_continuation(reserved, token)),
+    )?;
+    let continuation = registry()
+        .wait_continuation(token)
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    Ok((token, bound, continuation))
+}
+
+fn confirm_dropped_lease_continuation(
+    identity: DriverIdentity,
+    receipt: NativeLeaseContinuation,
+    token: InstanceContinuationToken,
+) -> Result<(), ComponentTerminal> {
+    let cancelled = registry()
+        .confirm_cancelled_continuation_current(token)
+        .map_err(|error| unexpected_native_driver_error(identity, error))?;
+    if !cancelled.matches_token(token) {
+        return Err(unexpected_native_driver_error(
+            identity,
+            "cancelled continuation receipt mismatch",
+        ));
+    }
+    lease_result(
+        identity,
+        with_leases(identity, |leases| {
+            leases.drop_cancelled_continuation(receipt, token)
+        }),
+    )
 }
 
 fn model_result<T>(
@@ -3341,6 +4200,28 @@ fn backend_effect(
     )
 }
 
+fn commit_backend_runtime(
+    identity: DriverIdentity,
+    linearized: NativeLedgerSnapshot,
+) -> Result<(), ComponentTerminal> {
+    model_result(
+        identity,
+        with_ledger(identity, |ledger| ledger.commit_runtime(linearized)),
+    )?;
+    finish_backend_lease(identity)
+}
+
+fn drop_backend_runtime_peer(
+    identity: DriverIdentity,
+    linearized: NativeLedgerSnapshot,
+) -> Result<(), ComponentTerminal> {
+    model_result(
+        identity,
+        with_ledger(identity, |ledger| ledger.drop_runtime_peer(linearized)),
+    )?;
+    finish_backend_lease(identity)
+}
+
 enum WakeOutcome {
     Resume(NativeLedgerSnapshot),
     Revoked(NativeLedgerSnapshot),
@@ -3350,29 +4231,26 @@ fn begin_register_wake(
     identity: DriverIdentity,
     pending: NativeLedgerSnapshot,
     continuation: InstanceContinuationToken,
-) -> Result<WakeOutcome, ComponentTerminal> {
-    model_result(
-        identity,
-        with_ledger(identity, |ledger| {
-            let current = ledger
-                .snapshot(identity.exact().ok_or(ExactLedgerError::IdentityMismatch)?)?
-                .ok_or(ExactLedgerError::Vacant)?;
-            if current == pending {
-                let armed = ledger.arm_continuation(current, continuation)?;
-                return ledger
-                    .begin_backend(armed, ExactBackendAction::RegisterWake)
-                    .map(WakeOutcome::Resume);
-            }
-            if current.phase() == ExactLedgerPhase::BackendCancelled
-                && current.resource() == pending.resource()
-                && current.function() == pending.function()
-                && current.continuation() == ExactContinuation::None
-            {
-                return Ok(WakeOutcome::Revoked(current));
-            }
-            Err(ExactLedgerError::SnapshotMismatch)
-        }),
-    )
+) -> Result<WakeOutcome, ExactLedgerError> {
+    with_ledger(identity, |ledger| {
+        let current = ledger
+            .snapshot(identity.exact().ok_or(ExactLedgerError::IdentityMismatch)?)?
+            .ok_or(ExactLedgerError::Vacant)?;
+        if current == pending {
+            let armed = ledger.arm_continuation(current, continuation)?;
+            return ledger
+                .begin_backend(armed, ExactBackendAction::RegisterWake)
+                .map(WakeOutcome::Resume);
+        }
+        if current.phase() == ExactLedgerPhase::BackendCancelled
+            && current.resource() == pending.resource()
+            && current.function() == pending.function()
+            && current.continuation() == ExactContinuation::None
+        {
+            return Ok(WakeOutcome::Revoked(current));
+        }
+        Err(ExactLedgerError::SnapshotMismatch)
+    })
 }
 
 fn finish_wake_receipt(
@@ -3417,19 +4295,25 @@ async fn await_reader_wake(
     let operation = pending.backend().ok_or_else(|| {
         unexpected_native_driver_error(identity, "reader waiter without backend token")
     })?;
-    let continuation_token = registry()
-        .arm_continuation_current(identity.instance, InstanceContinuationKind::External)
-        .map_err(|error| unexpected_native_driver_error(identity, error))?;
-    let continuation = registry()
-        .wait_continuation(continuation_token)
-        .map_err(|error| unexpected_native_driver_error(identity, error))?;
-    let invoking = match begin_register_wake(identity, pending, continuation_token)? {
-        WakeOutcome::Resume(invoking) => invoking,
-        WakeOutcome::Revoked(cancelled) => {
+    let (continuation_token, bound_lease, continuation) =
+        arm_external_lease_continuation(identity)?;
+    let invoking = match begin_register_wake(identity, pending, continuation_token) {
+        Ok(WakeOutcome::Resume(invoking)) => invoking,
+        Ok(WakeOutcome::Revoked(cancelled)) => {
             drop(continuation);
+            confirm_dropped_lease_continuation(identity, bound_lease, continuation_token)?;
             return Ok(WakeOutcome::Revoked(cancelled));
         }
+        Err(error) => {
+            drop(continuation);
+            confirm_dropped_lease_continuation(identity, bound_lease, continuation_token)?;
+            return Err(ledger_error_terminal(identity, error));
+        }
     };
+    let registered_lease = lease_result(
+        identity,
+        with_leases(identity, |leases| leases.register_stream_wake(bound_lease)),
+    )?;
     let wake = HostWakeToken::new(continuation_token.signal_words(), stream_wake);
     if !matches!(
         with_active_reader(identity.instance, identity.streams, |reader, _| {
@@ -3438,14 +4322,21 @@ async fn await_reader_wake(
         Ok(Ok(()))
     ) {
         drop(continuation);
+        confirm_dropped_lease_continuation(identity, registered_lease, continuation_token)?;
         return Err(abort_backend_call(identity, invoking));
     }
-    let registered = model_result(
-        identity,
-        with_ledger(identity, |ledger| {
-            ledger.finish_register_wake(invoking, continuation_token)
-        }),
-    )?;
+    let registered = match with_ledger(identity, |ledger| {
+        ledger.finish_register_wake(invoking, continuation_token)
+    }) {
+        Ok(registered) => registered,
+        Err(error) => {
+            // The backend already retained its copied wake token. Unwinding
+            // drops Core's listener, but the aggregate wake/continuation lease
+            // must remain charged on this fail-stop path rather than inventing
+            // a cancellation receipt for the external registration.
+            return Err(ledger_error_terminal(identity, error));
+        }
+    };
     let returned = backend_return_pending(identity, registered)?;
     let consumed = continuation
         .await
@@ -3456,6 +4347,12 @@ async fn await_reader_wake(
             "reader continuation receipt mismatch",
         ));
     }
+    lease_result(
+        identity,
+        with_leases(identity, |leases| {
+            leases.consume_continuation(registered_lease, continuation_token)
+        }),
+    )?;
     finish_wake_receipt(identity, returned, consumed)
 }
 
@@ -3466,19 +4363,25 @@ async fn await_writer_wake(
     let operation = pending.backend().ok_or_else(|| {
         unexpected_native_driver_error(identity, "writer waiter without backend token")
     })?;
-    let continuation_token = registry()
-        .arm_continuation_current(identity.instance, InstanceContinuationKind::External)
-        .map_err(|error| unexpected_native_driver_error(identity, error))?;
-    let continuation = registry()
-        .wait_continuation(continuation_token)
-        .map_err(|error| unexpected_native_driver_error(identity, error))?;
-    let invoking = match begin_register_wake(identity, pending, continuation_token)? {
-        WakeOutcome::Resume(invoking) => invoking,
-        WakeOutcome::Revoked(cancelled) => {
+    let (continuation_token, bound_lease, continuation) =
+        arm_external_lease_continuation(identity)?;
+    let invoking = match begin_register_wake(identity, pending, continuation_token) {
+        Ok(WakeOutcome::Resume(invoking)) => invoking,
+        Ok(WakeOutcome::Revoked(cancelled)) => {
             drop(continuation);
+            confirm_dropped_lease_continuation(identity, bound_lease, continuation_token)?;
             return Ok(WakeOutcome::Revoked(cancelled));
         }
+        Err(error) => {
+            drop(continuation);
+            confirm_dropped_lease_continuation(identity, bound_lease, continuation_token)?;
+            return Err(ledger_error_terminal(identity, error));
+        }
     };
+    let registered_lease = lease_result(
+        identity,
+        with_leases(identity, |leases| leases.register_stream_wake(bound_lease)),
+    )?;
     let wake = HostWakeToken::new(continuation_token.signal_words(), stream_wake);
     if !matches!(
         with_active_writer(identity.instance, identity.streams, |writer| {
@@ -3487,14 +4390,19 @@ async fn await_writer_wake(
         Ok(Ok(()))
     ) {
         drop(continuation);
+        confirm_dropped_lease_continuation(identity, registered_lease, continuation_token)?;
         return Err(abort_backend_call(identity, invoking));
     }
-    let registered = model_result(
-        identity,
-        with_ledger(identity, |ledger| {
-            ledger.finish_register_wake(invoking, continuation_token)
-        }),
-    )?;
+    let registered = match with_ledger(identity, |ledger| {
+        ledger.finish_register_wake(invoking, continuation_token)
+    }) {
+        Ok(registered) => registered,
+        Err(error) => {
+            // Physical registration is irreversible here; retain both charged
+            // aggregate authorities while the generation is fail-stopped.
+            return Err(ledger_error_terminal(identity, error));
+        }
+    };
     let returned = backend_return_pending(identity, registered)?;
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
     if let BackendPendingOutcome::Pending(registered) = returned {
@@ -3509,9 +4417,15 @@ async fn await_writer_wake(
             "writer continuation receipt mismatch",
         ));
     }
+    lease_result(
+        identity,
+        with_leases(identity, |leases| {
+            leases.consume_continuation(registered_lease, continuation_token)
+        }),
+    )?;
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
     if let Some(plan) = c54_claim_after_consumed(identity, consumed).await? {
-        let cancelled = cancel_plan_in_current(identity, plan).map_err(|()| {
+        let cancelled = cancel_plan_in_current(identity, plan, None).map_err(|()| {
             unexpected_native_driver_error(identity, "C5.4 exact pending cancellation")
         })?;
         return Ok(WakeOutcome::Revoked(cancelled));
@@ -3526,19 +4440,25 @@ async fn await_terminal_wake(
     let operation = pending.backend().ok_or_else(|| {
         unexpected_native_driver_error(identity, "terminal waiter without backend token")
     })?;
-    let continuation_token = registry()
-        .arm_continuation_current(identity.instance, InstanceContinuationKind::External)
-        .map_err(|error| unexpected_native_driver_error(identity, error))?;
-    let continuation = registry()
-        .wait_continuation(continuation_token)
-        .map_err(|error| unexpected_native_driver_error(identity, error))?;
-    let invoking = match begin_register_wake(identity, pending, continuation_token)? {
-        WakeOutcome::Resume(invoking) => invoking,
-        WakeOutcome::Revoked(cancelled) => {
+    let (continuation_token, bound_lease, continuation) =
+        arm_external_lease_continuation(identity)?;
+    let invoking = match begin_register_wake(identity, pending, continuation_token) {
+        Ok(WakeOutcome::Resume(invoking)) => invoking,
+        Ok(WakeOutcome::Revoked(cancelled)) => {
             drop(continuation);
+            confirm_dropped_lease_continuation(identity, bound_lease, continuation_token)?;
             return Ok(WakeOutcome::Revoked(cancelled));
         }
+        Err(error) => {
+            drop(continuation);
+            confirm_dropped_lease_continuation(identity, bound_lease, continuation_token)?;
+            return Err(ledger_error_terminal(identity, error));
+        }
     };
+    let registered_lease = lease_result(
+        identity,
+        with_leases(identity, |leases| leases.register_stream_wake(bound_lease)),
+    )?;
     let wake = HostWakeToken::new(continuation_token.signal_words(), stream_wake);
     if !matches!(
         with_active_reader(identity.instance, identity.streams, |_, supervisor| {
@@ -3547,14 +4467,19 @@ async fn await_terminal_wake(
         Ok(Ok(()))
     ) {
         drop(continuation);
+        confirm_dropped_lease_continuation(identity, registered_lease, continuation_token)?;
         return Err(abort_backend_call(identity, invoking));
     }
-    let registered = model_result(
-        identity,
-        with_ledger(identity, |ledger| {
-            ledger.finish_register_wake(invoking, continuation_token)
-        }),
-    )?;
+    let registered = match with_ledger(identity, |ledger| {
+        ledger.finish_register_wake(invoking, continuation_token)
+    }) {
+        Ok(registered) => registered,
+        Err(error) => {
+            // Physical registration is irreversible here; retain both charged
+            // aggregate authorities while the generation is fail-stopped.
+            return Err(ledger_error_terminal(identity, error));
+        }
+    };
     let returned = backend_return_pending(identity, registered)?;
     let consumed = continuation
         .await
@@ -3565,6 +4490,12 @@ async fn await_terminal_wake(
             "terminal continuation receipt mismatch",
         ));
     }
+    lease_result(
+        identity,
+        with_leases(identity, |leases| {
+            leases.consume_continuation(registered_lease, continuation_token)
+        }),
+    )?;
     finish_wake_receipt(identity, returned, consumed)
 }
 
@@ -3868,6 +4799,22 @@ async fn drive_input_stream(
                 "input spill successor divergence",
             ));
         }
+        match next_receipt.as_ref() {
+            Some(receipt) => lease_result(
+                identity,
+                with_leases(identity, |leases| leases.update_input_spill(receipt)),
+            )?,
+            None => lease_result(
+                identity,
+                with_leases(identity, |leases| {
+                    leases.finish_input_spill(
+                        identity
+                            .exact()
+                            .ok_or(ExactNativeLeaseError::IdentityMismatch)?,
+                    )
+                }),
+            )?,
+        }
         *spill_receipt = next_receipt;
         return Ok(committed);
     }
@@ -3926,10 +4873,7 @@ async fn drive_input_stream(
                 quarantine_shadow(identity);
                 return Err(terminal);
             }
-            model_result(
-                identity,
-                with_ledger(identity, |ledger| ledger.drop_runtime_peer(linearized)),
-            )?;
+            drop_backend_runtime_peer(identity, linearized)?;
             return Ok(dropped);
         }
         PreparedReader::Revoked(cancelled) => {
@@ -4045,6 +4989,13 @@ async fn drive_input_stream(
                     "initial input spill receipt divergence",
                 ));
             }
+            if let Some(receipt) = next_receipt.as_ref() {
+                lease_result(
+                    identity,
+                    with_leases(identity, |leases| leases.begin_input_spill(receipt)),
+                )?;
+            }
+            finish_backend_lease(identity)?;
             *spill_receipt = next_receipt;
             return Ok(runtime_committed);
         }
@@ -4082,15 +5033,7 @@ async fn drive_input_stream(
                 quarantine_shadow(identity);
                 return Err(terminal);
             }
-            if model_result(
-                identity,
-                with_ledger(identity, |ledger| ledger.drop_runtime_peer(linearized)),
-            )
-            .is_err()
-            {
-                quarantine_shadow(identity);
-                return Err(ComponentTerminal::RunnerFault);
-            }
+            drop_backend_runtime_peer(identity, linearized)?;
             return Ok(dropped);
         }
     }
@@ -4174,10 +5117,7 @@ async fn drive_input_closed(
                     quarantine_shadow(identity);
                     return Err(terminal);
                 }
-                model_result(
-                    identity,
-                    with_ledger(identity, |ledger| ledger.commit_runtime(ledger_state)),
-                )?;
+                commit_backend_runtime(identity, ledger_state)?;
                 #[cfg(feature = "ssh-native-async-qemu-acceptance")]
                 if reason == StreamCloseReason::Normal
                     && poll_terminal(committed).is_none()
@@ -4308,10 +5248,7 @@ async fn drive_output_stream(
                 return Err(terminal);
             }
             staging.clear();
-            model_result(
-                identity,
-                with_ledger(identity, |ledger| ledger.commit_runtime(linearized)),
-            )?;
+            commit_backend_runtime(identity, linearized)?;
             #[cfg(feature = "ssh-native-async-qemu-acceptance")]
             if !target_record_output_bytes(identity, output_bytes) {
                 return Err(unexpected_native_driver_error(
@@ -4338,10 +5275,7 @@ async fn drive_output_stream(
                 return Err(terminal);
             }
             staging.clear();
-            model_result(
-                identity,
-                with_ledger(identity, |ledger| ledger.drop_runtime_peer(linearized)),
-            )?;
+            drop_backend_runtime_peer(identity, linearized)?;
             Ok(dropped)
         }
         OutputDispatch::Revoked(cancelled) => {
@@ -4454,10 +5388,7 @@ async fn drive_output_closed(
                 quarantine_shadow(identity);
                 Err(terminal)
             } else {
-                model_result(
-                    identity,
-                    with_ledger(identity, |ledger| ledger.commit_runtime(linearized)),
-                )?;
+                commit_backend_runtime(identity, linearized)?;
                 #[cfg(feature = "ssh-native-async-qemu-acceptance")]
                 if reason == StreamCloseReason::Normal && !target_record_normal_close(identity) {
                     return Err(unexpected_native_driver_error(
@@ -4481,10 +5412,7 @@ async fn drive_output_closed(
                 quarantine_shadow(identity);
                 return Err(terminal);
             }
-            model_result(
-                identity,
-                with_ledger(identity, |ledger| ledger.drop_runtime_peer(linearized)),
-            )?;
+            drop_backend_runtime_peer(identity, linearized)?;
             Ok(dropped)
         }
         _ => Err(unexpected_native_driver_error(
@@ -4548,25 +5476,16 @@ async fn run_driver(
         };
         let result = match poll {
             NativePoll::Pending(_) | NativePoll::Resolved(_) | NativePoll::Yielded(_) => {
-                if quantum(token).await.is_err() {
-                    Err(unexpected_native_driver_error(
-                        identity,
-                        "quantum continuation",
-                    ))
-                } else {
-                    next = None;
-                    continue;
+                match quantum(identity).await {
+                    Ok(()) => {
+                        next = None;
+                        continue;
+                    }
+                    Err(terminal) => Err(terminal),
                 }
             }
             NativePoll::WaitPending { token: wait, .. } => {
-                if quantum(token).await.is_err() {
-                    Err(unexpected_native_driver_error(identity, "wait quantum"))
-                } else {
-                    match invocation.resume_wait(wait) {
-                        Ok(poll) => drain_runtime_cleanup(&mut invocation, identity, poll).await,
-                        Err(error) => Err(unexpected_native_driver_error(identity, error)),
-                    }
-                }
+                await_runtime_wait(&mut invocation, identity, wait).await
             }
             NativePoll::HostPending {
                 token: host,

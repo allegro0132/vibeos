@@ -4219,6 +4219,20 @@ impl AsyncState {
         Ok(WaitResume::Ready(EventLease::endpoint_pending(event)))
     }
 
+    /// Rechecks whether one exact blocked callback wait has become ready
+    /// without consuming its ticket or changing selector state.
+    ///
+    /// Native executors use this after installing an owner wake envelope and
+    /// after a producer publishes an event. The retained wait ticket seals the
+    /// task, set, and wait epoch, so a stale or foreign recheck fails closed.
+    pub(crate) fn callback_wait_ready(&self, ticket: &WaitTicket) -> Result<bool, AsyncStateError> {
+        self.validate_wait_ticket(ticket)?;
+        if self.tasks.get(ticket.task)?.cancel == TaskCancelState::Requested {
+            return Ok(true);
+        }
+        Ok(self.pending_event_in_set(ticket.set)?.is_some())
+    }
+
     pub fn cancel_callback_wait(&mut self, ticket: &mut WaitTicket) -> Result<(), AsyncStateError> {
         self.validate_wait_ticket(ticket)?;
         self.clear_wait_registration(ticket)?;

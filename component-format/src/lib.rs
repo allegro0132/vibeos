@@ -519,6 +519,70 @@ pub const PROFILE_1_LIMITS: ProfileLimits = ProfileLimits {
     poll_quantum: 10_000,
 };
 
+/// Absolute aggregate ceilings for one inert C6 component-composition plan.
+///
+/// These are deliberately separate from [`PROFILE_1_LIMITS`]: those limits
+/// describe one Component binary or instance, while these limits bound the
+/// complete multi-principal graph before any graph-plan storage is allocated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentGraphLimits {
+    pub max_nodes: u64,
+    pub max_edges: u64,
+    pub max_nesting: u64,
+    pub max_external_imports: u64,
+    pub max_published_exports: u64,
+    pub max_component_bytes: u64,
+    pub max_core_instances: u64,
+    pub max_adapters: u64,
+    pub max_resource_types: u64,
+    pub max_resource_slots: u64,
+    pub max_memory_bytes: u64,
+    pub max_total_fuel: u64,
+    pub max_poll_quantum: u64,
+}
+
+pub const PROFILE_1_COMPONENT_GRAPH_LIMITS: ComponentGraphLimits = ComponentGraphLimits {
+    max_nodes: 16,
+    max_edges: 256,
+    // Kept below the node ceiling so the containment-depth gate has an
+    // independently testable failure boundary.
+    max_nesting: 8,
+    max_external_imports: PROFILE_1_LIMITS.max_imports as u64,
+    max_published_exports: PROFILE_1_LIMITS.max_exports as u64,
+    max_component_bytes: PROFILE_1_LIMITS.max_component_bytes as u64,
+    max_core_instances: PROFILE_1_LIMITS.max_component_instances as u64,
+    max_adapters: PROFILE_1_LIMITS.max_adapters as u64,
+    max_resource_types: PROFILE_1_LIMITS.max_resources as u64,
+    max_resource_slots: PROFILE_1_LIMITS.max_resources as u64,
+    max_memory_bytes: PROFILE_1_LIMITS.max_memory_pages as u64 * 65_536,
+    max_total_fuel: PROFILE_1_LIMITS.total_fuel,
+    max_poll_quantum: PROFILE_1_LIMITS.poll_quantum,
+};
+
+/// Policy-selected volatile capacity for one graph node. These values carry no
+/// admission authority; C6.2 must intersect them with the exact admitted node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentGraphInstanceBudget {
+    pub resource_slots: u64,
+    pub memory_bytes: u64,
+    pub total_fuel: u64,
+    pub poll_quantum: u64,
+}
+
+/// Complete charge for one node after runtime-owned component facts have been
+/// combined with its requested instance budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComponentGraphNodeBudget {
+    pub component_bytes: u64,
+    pub core_instances: u64,
+    pub adapters: u64,
+    pub resource_types: u64,
+    pub resource_slots: u64,
+    pub memory_bytes: u64,
+    pub total_fuel: u64,
+    pub poll_quantum: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
 pub enum TrapCode {
@@ -601,6 +665,19 @@ pub enum LimitKind {
     ListElements,
     CoreNesting,
     EngineAllocationBytes,
+    GraphNodes,
+    GraphEdges,
+    GraphNesting,
+    GraphExternalImports,
+    GraphPublishedExports,
+    GraphComponentBytes,
+    GraphCoreInstances,
+    GraphAdapters,
+    GraphResourceTypes,
+    GraphResourceSlots,
+    GraphMemoryBytes,
+    GraphTotalFuel,
+    GraphPollQuantum,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -608,6 +685,157 @@ pub struct LimitError {
     pub kind: LimitKind,
     pub attempted: u64,
     pub maximum: u64,
+}
+
+/// Allocation-independent aggregate accounting for one component graph.
+///
+/// Every mutating operation is transactional: a failed multi-field node charge
+/// leaves the complete account unchanged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ComponentGraphAccount {
+    pub nodes: u64,
+    pub edges: u64,
+    pub maximum_nesting: u64,
+    pub external_imports: u64,
+    pub published_exports: u64,
+    pub component_bytes: u64,
+    pub core_instances: u64,
+    pub adapters: u64,
+    pub resource_types: u64,
+    pub resource_slots: u64,
+    pub memory_bytes: u64,
+    pub total_fuel: u64,
+    pub maximum_poll_quantum: u64,
+}
+
+impl ComponentGraphAccount {
+    fn added(current: u64, amount: u64, maximum: u64, kind: LimitKind) -> Result<u64, LimitError> {
+        let attempted = current.checked_add(amount).ok_or(LimitError {
+            kind,
+            attempted: u64::MAX,
+            maximum,
+        })?;
+        if attempted > maximum {
+            return Err(LimitError {
+                kind,
+                attempted,
+                maximum,
+            });
+        }
+        Ok(attempted)
+    }
+
+    fn observed(
+        current: u64,
+        value: u64,
+        maximum: u64,
+        kind: LimitKind,
+    ) -> Result<u64, LimitError> {
+        if value > maximum {
+            return Err(LimitError {
+                kind,
+                attempted: value,
+                maximum,
+            });
+        }
+        Ok(if value > current { value } else { current })
+    }
+
+    pub fn charge_node(&mut self, budget: ComponentGraphNodeBudget) -> Result<(), LimitError> {
+        let limits = PROFILE_1_COMPONENT_GRAPH_LIMITS;
+        let mut next = *self;
+        next.nodes = Self::added(next.nodes, 1, limits.max_nodes, LimitKind::GraphNodes)?;
+        next.component_bytes = Self::added(
+            next.component_bytes,
+            budget.component_bytes,
+            limits.max_component_bytes,
+            LimitKind::GraphComponentBytes,
+        )?;
+        next.core_instances = Self::added(
+            next.core_instances,
+            budget.core_instances,
+            limits.max_core_instances,
+            LimitKind::GraphCoreInstances,
+        )?;
+        next.adapters = Self::added(
+            next.adapters,
+            budget.adapters,
+            limits.max_adapters,
+            LimitKind::GraphAdapters,
+        )?;
+        next.resource_types = Self::added(
+            next.resource_types,
+            budget.resource_types,
+            limits.max_resource_types,
+            LimitKind::GraphResourceTypes,
+        )?;
+        next.resource_slots = Self::added(
+            next.resource_slots,
+            budget.resource_slots,
+            limits.max_resource_slots,
+            LimitKind::GraphResourceSlots,
+        )?;
+        next.memory_bytes = Self::added(
+            next.memory_bytes,
+            budget.memory_bytes,
+            limits.max_memory_bytes,
+            LimitKind::GraphMemoryBytes,
+        )?;
+        next.total_fuel = Self::added(
+            next.total_fuel,
+            budget.total_fuel,
+            limits.max_total_fuel,
+            LimitKind::GraphTotalFuel,
+        )?;
+        next.maximum_poll_quantum = Self::observed(
+            next.maximum_poll_quantum,
+            budget.poll_quantum,
+            limits.max_poll_quantum,
+            LimitKind::GraphPollQuantum,
+        )?;
+        *self = next;
+        Ok(())
+    }
+
+    pub fn observe_nesting(&mut self, depth: u64) -> Result<(), LimitError> {
+        self.maximum_nesting = Self::observed(
+            self.maximum_nesting,
+            depth,
+            PROFILE_1_COMPONENT_GRAPH_LIMITS.max_nesting,
+            LimitKind::GraphNesting,
+        )?;
+        Ok(())
+    }
+
+    pub fn charge_edges(&mut self, amount: u64) -> Result<(), LimitError> {
+        self.edges = Self::added(
+            self.edges,
+            amount,
+            PROFILE_1_COMPONENT_GRAPH_LIMITS.max_edges,
+            LimitKind::GraphEdges,
+        )?;
+        Ok(())
+    }
+
+    pub fn charge_external_imports(&mut self, amount: u64) -> Result<(), LimitError> {
+        self.external_imports = Self::added(
+            self.external_imports,
+            amount,
+            PROFILE_1_COMPONENT_GRAPH_LIMITS.max_external_imports,
+            LimitKind::GraphExternalImports,
+        )?;
+        Ok(())
+    }
+
+    pub fn charge_published_exports(&mut self, amount: u64) -> Result<(), LimitError> {
+        self.published_exports = Self::added(
+            self.published_exports,
+            amount,
+            PROFILE_1_COMPONENT_GRAPH_LIMITS.max_published_exports,
+            LimitKind::GraphPublishedExports,
+        )?;
+        Ok(())
+    }
 }
 
 /// Allocation-independent counters used while streaming an untrusted binary.
@@ -773,3 +1001,14 @@ const _: () = assert!(PROFILE_1_LIMITS.poll_quantum < PROFILE_1_LIMITS.total_fue
 const _: () = assert!(PROFILE_1_LIMITS.max_memories == 1);
 const _: () =
     assert!(PROFILE_1_LIMITS.max_initial_memory_pages <= PROFILE_1_LIMITS.max_memory_pages);
+const _: () = assert!(PROFILE_1_COMPONENT_GRAPH_LIMITS.max_nodes <= u16::MAX as u64);
+const _: () = assert!(PROFILE_1_LIMITS.max_imports <= u16::MAX as u32 + 1);
+const _: () = assert!(PROFILE_1_LIMITS.max_exports <= u16::MAX as u32 + 1);
+const _: () = assert!(PROFILE_1_COMPONENT_GRAPH_LIMITS.max_nesting > 0);
+const _: () = assert!(
+    PROFILE_1_COMPONENT_GRAPH_LIMITS.max_nesting < PROFILE_1_COMPONENT_GRAPH_LIMITS.max_nodes
+);
+const _: () = assert!(
+    PROFILE_1_COMPONENT_GRAPH_LIMITS.max_poll_quantum
+        <= PROFILE_1_COMPONENT_GRAPH_LIMITS.max_total_fuel
+);

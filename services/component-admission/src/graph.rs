@@ -88,6 +88,9 @@ pub enum ComponentGraphAdmissionError {
     DuplicateResourceBinding {
         target: ComponentGraphImportEndpoint,
     },
+    DuplicateResourceSource {
+        source: ComponentGraphExportEndpoint,
+    },
     DuplicatePublishedExport {
         source: ComponentGraphExportEndpoint,
     },
@@ -140,6 +143,9 @@ impl fmt::Display for ComponentGraphAdmissionError {
             Self::DuplicateBinding { .. } => "component graph import has multiple bindings",
             Self::DuplicateResourceBinding { .. } => {
                 "component graph resource import has multiple bindings"
+            }
+            Self::DuplicateResourceSource { .. } => {
+                "component graph resource export has multiple consumers"
             }
             Self::DuplicatePublishedExport { .. } => {
                 "component graph export is published more than once"
@@ -1041,6 +1047,17 @@ fn check_complete_bindings(graph: &ComponentGraph<'_>) -> Result<(), ComponentGr
         }
         if contains_resource_entity(&published.shape().entity) {
             return Err(ComponentGraphAdmissionError::InvalidPolicy);
+        }
+    }
+    for (index, edge) in graph.edges().iter().enumerate() {
+        if contains_resource_entity(&edge.source_shape().entity)
+            && graph.edges()[..index]
+                .iter()
+                .any(|earlier| earlier.source() == edge.source())
+        {
+            return Err(ComponentGraphAdmissionError::DuplicateResourceSource {
+                source: edge.source(),
+            });
         }
     }
     Ok(())

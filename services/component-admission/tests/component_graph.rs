@@ -486,6 +486,134 @@ fn resource_bearing_internal_edge_is_rejected_without_nominal_provenance() {
 }
 
 #[test]
+fn resource_bearing_source_fanout_is_rejected_before_route_admission() {
+    let producer_world = world(RESOURCE_WIT, RESOURCE_PRODUCER_WORLD);
+    let first_consumer_world = world(RESOURCE_WIT, RESOURCE_CONSUMER_WORLD);
+    let second_consumer_world = world(RESOURCE_WIT, RESOURCE_CONSUMER_WORLD);
+    let provider = artifact(RESOURCE_PRODUCER_WAT);
+    let first_consumer = artifact(RESOURCE_CONSUMER_WAT);
+    let second_consumer = artifact(RESOURCE_CONSUMER_WAT);
+    let nodes = [
+        policy_node("resource-provider", &producer_world, &provider, &[]),
+        policy_node(
+            "resource-consumer-a",
+            &first_consumer_world,
+            &first_consumer,
+            &[],
+        ),
+        policy_node(
+            "resource-consumer-b",
+            &second_consumer_world,
+            &second_consumer,
+            &[],
+        ),
+    ];
+    let edges = [edge(0, 1), edge(0, 2)];
+    let policy = ComponentGraphAdmissionPolicy {
+        name: "resource-fanout",
+        profile: ProfileIdentity::PROFILE_1,
+        nodes: &nodes,
+        edges: &edges,
+        external_imports: &[],
+        published_exports: &[],
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    assert_eq!(
+        admit_component_graph(
+            vec![provider, first_consumer, second_consumer],
+            &policy,
+            &CallerAuthority { offers: &[] },
+        )
+        .expect_graph_error(),
+        ComponentGraphAdmissionError::DuplicateResourceSource {
+            source: export(0, 0),
+        }
+    );
+}
+
+#[test]
+fn owned_resource_source_fanout_is_also_rejected_conservatively() {
+    let own_wit = RESOURCE_WIT.replace("borrow<handle>", "own<handle>");
+    let own_producer_wat = RESOURCE_PRODUCER_WAT.replace("(borrow $handle)", "(own $handle)");
+    let own_consumer_wat = RESOURCE_CONSUMER_WAT.replace("(borrow $handle)", "(own $handle)");
+    let producer_world = world(&own_wit, RESOURCE_PRODUCER_WORLD);
+    let first_consumer_world = world(&own_wit, RESOURCE_CONSUMER_WORLD);
+    let second_consumer_world = world(&own_wit, RESOURCE_CONSUMER_WORLD);
+    let provider = artifact(&own_producer_wat);
+    let first_consumer = artifact(&own_consumer_wat);
+    let second_consumer = artifact(&own_consumer_wat);
+    let nodes = [
+        policy_node("own-provider", &producer_world, &provider, &[]),
+        policy_node(
+            "own-consumer-a",
+            &first_consumer_world,
+            &first_consumer,
+            &[],
+        ),
+        policy_node(
+            "own-consumer-b",
+            &second_consumer_world,
+            &second_consumer,
+            &[],
+        ),
+    ];
+    let edges = [edge(0, 1), edge(0, 2)];
+    let policy = ComponentGraphAdmissionPolicy {
+        name: "owned-resource-fanout",
+        profile: ProfileIdentity::PROFILE_1,
+        nodes: &nodes,
+        edges: &edges,
+        external_imports: &[],
+        published_exports: &[],
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    assert_eq!(
+        admit_component_graph(
+            vec![provider, first_consumer, second_consumer],
+            &policy,
+            &CallerAuthority { offers: &[] },
+        )
+        .expect_graph_error(),
+        ComponentGraphAdmissionError::DuplicateResourceSource {
+            source: export(0, 0),
+        }
+    );
+}
+
+#[test]
+fn resource_free_source_fanout_remains_admissible() {
+    let producer_world = world(PIPE_WIT, PRODUCER_WORLD);
+    let first_consumer_world = world(PIPE_WIT, CONSUMER_WORLD);
+    let second_consumer_world = world(PIPE_WIT, CONSUMER_WORLD);
+    let provider = artifact(PRODUCER_WAT);
+    let first_consumer = artifact(CONSUMER_WAT);
+    let second_consumer = artifact(CONSUMER_WAT);
+    let nodes = [
+        policy_node("provider", &producer_world, &provider, &[]),
+        policy_node("consumer-a", &first_consumer_world, &first_consumer, &[]),
+        policy_node("consumer-b", &second_consumer_world, &second_consumer, &[]),
+    ];
+    let edges = [edge(0, 1), edge(0, 2)];
+    let policy = ComponentGraphAdmissionPolicy {
+        name: "resource-free-fanout",
+        profile: ProfileIdentity::PROFILE_1,
+        nodes: &nodes,
+        edges: &edges,
+        external_imports: &[],
+        published_exports: &[],
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    let graph = admit_component_graph(
+        vec![provider, first_consumer, second_consumer],
+        &policy,
+        &CallerAuthority { offers: &[] },
+    )
+    .expect("resource-free interfaces may have explicit fanout");
+    assert_eq!(graph.manifest().edges(), edges);
+    assert!(graph.grants().is_empty());
+}
+
+#[test]
 fn resource_ownership_mismatch_is_rejected_before_nominal_provenance() {
     let consumer_wit = RESOURCE_WIT.replace("borrow<handle>", "own<handle>");
     let consumer_wat = RESOURCE_CONSUMER_WAT.replace("(borrow $handle)", "(own $handle)");

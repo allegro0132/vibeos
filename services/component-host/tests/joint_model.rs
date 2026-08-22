@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use vibeos_component_format::TrapCode;
 use vibeos_component_host::{
-    transfer_owned, AuthorityError, ComponentAuthority, ComponentAuthoritySpace,
-    ComponentHostDispatcher, OwnedTransferError, RandomBackend, RandomBackendFault, RandomResource,
-    SharedCSpace, VibeHostManifest, MAX_RANDOM_FILL_BYTES,
+    transfer_owned, ComponentAuthority, ComponentAuthoritySpace, ComponentHostDispatcher,
+    OwnedTransferError, RandomBackend, RandomBackendFault, RandomResource, SharedCSpace,
+    VibeHostManifest, MAX_RANDOM_FILL_BYTES,
 };
 use vibeos_component_runtime::decode::inspect_component;
 use vibeos_component_runtime::resource::{
@@ -288,11 +288,14 @@ fn probe_exhaustion(side: &mut Side, backend: &Arc<CountingRandom>) {
     assert_eq!(side.binding.revoke_dropped(authority), Ok(1));
 }
 
-fn move_resource(source: &mut Side, target: &mut Side) {
+fn refuse_cross_space_move(source: &mut Side, target: &mut Side) {
     let (Some(token), None) = (source.token, target.token) else {
         return;
     };
+    let source_cap = source.cap.expect("published source must name its cap");
     let was_live = source.cap_is_live();
+    let source_caps_before = source.cspace.lock().list().len();
+    let target_caps_before = target.cspace.lock().list().len();
     let result = transfer_owned::<RandomResource>(
         &mut source.table,
         token,
@@ -303,22 +306,16 @@ fn move_resource(source: &mut Side, target: &mut Side) {
         &target.binding,
         Rights::READ,
     );
-    if was_live {
-        let token = result.unwrap();
-        source.token = None;
-        source.cap = None;
-        target.token = Some(token);
-        target.cap = target.cspace.lock().list().last().map(|item| item.0);
-        assert!(target.cap.is_some());
-    } else {
-        assert_eq!(
-            result,
-            Err(OwnedTransferError::Authority(
-                AuthorityError::InvalidOrRevoked
-            ))
-        );
-        assert_eq!(source.table.contains(token, RESOURCE_TYPE), Ok(true));
-    }
+    assert_eq!(
+        result,
+        Err(OwnedTransferError::CrossSpaceSupervisorRequired),
+    );
+    assert_eq!(source.table.contains(token, RESOURCE_TYPE), Ok(true));
+    assert!(target.table.is_empty());
+    assert_eq!(source.cap_is_live(), was_live);
+    assert_eq!(source.cap, Some(source_cap));
+    assert_eq!(source.cspace.lock().list().len(), source_caps_before);
+    assert_eq!(target.cspace.lock().list().len(), target_caps_before);
 }
 
 fn probe_cross_table(source: &Side, target: &mut Side, backend: &CountingRandom) {
@@ -350,8 +347,8 @@ fn next(seed: &mut u64) -> u64 {
 }
 
 /// C3.6 joint state-machine evidence. Real Component/Canonical ABI execution
-/// is interleaved with the same resource tables and CSpaces being moved,
-/// dropped, revoked, exhausted and rolled back after traps.
+/// is interleaved with the same resource tables and CSpaces facing cross-space
+/// transfer attempts, drops, revocation, exhaustion and rollback after traps.
 #[test]
 fn seeded_canonical_abi_and_capability_state_never_strands_authority() {
     let grow = grow_source();
@@ -377,12 +374,14 @@ fn seeded_canonical_abi_and_capability_state_never_strands_authority() {
         right.insert(&backend);
         probe_cross_table(&left, &mut right, &backend);
         right.drop_resource();
-        move_resource(&mut left, &mut right);
-        right.revoke();
-        invoke_normal(&mut right, &backend, 1);
-        right.drop_resource();
+        refuse_cross_space_move(&mut left, &mut right);
+        invoke_normal(&mut left, &backend, 1);
+        left.revoke();
+        invoke_normal(&mut left, &backend, 1);
+        left.drop_resource();
         right.insert(&backend);
-        move_resource(&mut right, &mut left);
+        refuse_cross_space_move(&mut right, &mut left);
+        invoke_normal(&mut right, &backend, 1);
 
         for _ in 0..STEPS {
             let choose_left = next(&mut seed) & 1 == 0;
@@ -401,7 +400,7 @@ fn seeded_canonical_abi_and_capability_state_never_strands_authority() {
                 3 if selected.token.is_some() => invoke_alias(selected, &backend, &alias),
                 4 if selected.token.is_some() => invoke_trap(selected, &backend, &trap),
                 5 => probe_exhaustion(selected, &backend),
-                6 => move_resource(selected, peer),
+                6 => refuse_cross_space_move(selected, peer),
                 7 => selected.revoke(),
                 8 => selected.drop_resource(),
                 9 => probe_cross_table(peer, selected, &backend),

@@ -8,7 +8,7 @@ use vibeos_component_host::{
 use vibeos_component_runtime::resource::{
     ResourceError, ResourceTable, ResourceToken, ResourceTypeId,
 };
-use vibeos_core::cap::{CSpace, Cap, CapError, Resource, Rights};
+use vibeos_core::cap::{CSpace, Cap, Resource, Rights};
 use vibeos_core::sync::SpinLock;
 
 const RESOURCE_TYPE: ResourceTypeId = ResourceTypeId(31);
@@ -118,7 +118,7 @@ fn next(seed: &mut u64) -> u64 {
     *seed
 }
 
-fn model_move(source: &mut Side, target: &mut Side, hostile: bool) {
+fn model_cross_space_attempt(source: &mut Side, target: &mut Side, hostile: bool) {
     let Some(token) = source.token else {
         return;
     };
@@ -126,8 +126,9 @@ fn model_move(source: &mut Side, target: &mut Side, hostile: bool) {
         return;
     }
     let old_cap = source.cap.unwrap();
-    let old_value = source.value.unwrap();
     let source_was_live = source.cspace.lock().lookup(old_cap, Rights::READ).is_ok();
+    let source_caps_before = source.cspace.lock().list().len();
+    let target_caps_before = target.cspace.lock().list().len();
     let result = transfer_owned::<Probe>(
         &mut source.table,
         token,
@@ -138,47 +139,27 @@ fn model_move(source: &mut Side, target: &mut Side, hostile: bool) {
         &target.binding,
         Rights::READ,
     );
-    if hostile {
-        assert_eq!(
-            result,
-            Err(OwnedTransferError::SourceTable(ResourceError::WrongType)),
-        );
-        assert_eq!(source.table.contains(token, RESOURCE_TYPE), Ok(true));
-        let still_live = source.cspace.lock().lookup(old_cap, Rights::READ).is_ok();
-        let operation_live = source
-            .table
-            .with_borrow(token, RESOURCE_TYPE, |borrowed| {
-                borrowed.with(|authority| {
-                    authority
-                        .with_revocable::<Probe, _, _>(&source.cspace, Rights::READ, |_| ())
-                        .is_ok()
-                })
+    assert_eq!(
+        result,
+        Err(OwnedTransferError::CrossSpaceSupervisorRequired),
+    );
+    assert_eq!(source.table.contains(token, RESOURCE_TYPE), Ok(true));
+    assert!(target.table.is_empty());
+    assert_eq!(source.cspace.lock().list().len(), source_caps_before);
+    assert_eq!(target.cspace.lock().list().len(), target_caps_before);
+    let still_live = source.cspace.lock().lookup(old_cap, Rights::READ).is_ok();
+    let operation_live = source
+        .table
+        .with_borrow(token, RESOURCE_TYPE, |borrowed| {
+            borrowed.with(|authority| {
+                authority
+                    .with_revocable::<Probe, _, _>(&source.cspace, Rights::READ, |_| ())
+                    .is_ok()
             })
-            .unwrap();
-        assert_eq!(still_live, operation_live);
-    } else {
-        if !source_was_live {
-            assert_eq!(
-                result,
-                Err(OwnedTransferError::Authority(
-                    AuthorityError::InvalidOrRevoked,
-                )),
-            );
-            assert_eq!(source.table.contains(token, RESOURCE_TYPE), Ok(true));
-            return;
-        }
-        let target_token = result.unwrap();
-        assert_eq!(
-            source.cspace.lock().lookup(old_cap, Rights::READ).err(),
-            Some(CapError::Invalid),
-        );
-        source.token = None;
-        source.cap = None;
-        source.value = None;
-        target.token = Some(target_token);
-        target.cap = target.cspace.lock().list().last().map(|entry| entry.0);
-        target.value = Some(old_value);
-    }
+        })
+        .unwrap();
+    assert_eq!(still_live, source_was_live);
+    assert_eq!(operation_live, source_was_live);
 }
 
 /// Deterministic state-machine coverage across the table/capability boundary.
@@ -203,10 +184,10 @@ fn seeded_resource_capability_state_machine_preserves_linear_ownership() {
                     right.insert(value);
                     value = value.wrapping_add(1);
                 }
-                2 => model_move(&mut left, &mut right, false),
-                3 => model_move(&mut right, &mut left, false),
-                4 => model_move(&mut left, &mut right, true),
-                5 => model_move(&mut right, &mut left, true),
+                2 => model_cross_space_attempt(&mut left, &mut right, false),
+                3 => model_cross_space_attempt(&mut right, &mut left, false),
+                4 => model_cross_space_attempt(&mut left, &mut right, true),
+                5 => model_cross_space_attempt(&mut right, &mut left, true),
                 6 => {
                     let side = if next(&mut seed) & 1 == 0 {
                         &mut left

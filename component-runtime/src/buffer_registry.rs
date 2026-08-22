@@ -4,7 +4,10 @@
 //! never a reference into guest memory. Slots are allocated up front and are
 //! sealed by the registry identity plus a one-based slot and generation.
 
-use crate::{async_state::BufferLease, value::AsyncValueTypeId};
+use crate::{
+    async_state::{AsyncArenaUsage, BufferLease},
+    value::AsyncValueTypeId,
+};
 use alloc::vec::Vec;
 use core::{
     num::{NonZeroU32, NonZeroU64},
@@ -97,6 +100,7 @@ pub(crate) struct BufferRegistry {
     id: NonZeroU64,
     slots: Vec<BufferSlot>,
     live: u32,
+    peak: u32,
     maximum: u32,
     scratch: Vec<u8>,
     max_copy_bytes: usize,
@@ -155,6 +159,7 @@ impl BufferRegistry {
             id,
             slots,
             live: 0,
+            peak: 0,
             maximum,
             scratch,
             max_copy_bytes,
@@ -179,8 +184,16 @@ impl BufferRegistry {
     }
 
     #[cfg(test)]
-    const fn maximum(&self) -> u32 {
+    pub(crate) const fn maximum(&self) -> u32 {
         self.maximum
+    }
+
+    pub(crate) const fn usage(&self) -> AsyncArenaUsage {
+        AsyncArenaUsage {
+            current: self.live,
+            peak: self.peak,
+            limit: self.maximum,
+        }
     }
 
     #[cfg(test)]
@@ -274,6 +287,7 @@ impl BufferRegistry {
             value_type: prepared.value_type,
         });
         self.live = next_live;
+        self.peak = self.peak.max(next_live);
         Ok(lease)
     }
 
@@ -698,6 +712,14 @@ mod tests {
 
         let registry = BufferRegistry::new(3, 17).unwrap();
         assert_eq!((registry.live(), registry.maximum()), (0, 3));
+        assert_eq!(
+            registry.usage(),
+            AsyncArenaUsage {
+                current: 0,
+                peak: 0,
+                limit: 3,
+            }
+        );
         assert_eq!(registry.slots.len(), 3);
         assert!(registry.slots.capacity() >= 3);
         assert_eq!(registry.scratch.len(), 17);
@@ -733,6 +755,14 @@ mod tests {
             ty(1),
         );
         assert_eq!(registry.live(), 1);
+        assert_eq!(
+            registry.usage(),
+            AsyncArenaUsage {
+                current: 1,
+                peak: 1,
+                limit: 1,
+            }
+        );
         assert!(matches!(
             registry.preflight(
                 &modules,
@@ -747,6 +777,7 @@ mod tests {
         ));
         registry.release(&lease, BufferRole::SourceWrite).unwrap();
         assert_eq!(registry.live(), 0);
+        assert_eq!(registry.usage().peak, 1);
         let replacement = issue(
             &mut registry,
             &modules,

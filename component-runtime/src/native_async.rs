@@ -13,11 +13,11 @@ use crate::{
         EventCode,
     },
     async_state::{
-        AsyncState, AsyncStateError, AsyncStateLimits, CommitError, CopyBegin, EndpointKind, Event,
-        EventLease, EventLeaseState, EventToken, HostCopyTicket, HostPeerDropReceipt,
-        HostReadableBindingsPair, NativeFilterFinalizeError, ReadableTransferRequest, ReclaimError,
-        TaskCancelState, TaskHandle, TaskResultState, TransferredReadableEndpoint, WaitBegin,
-        WaitResume, WaitTicket,
+        AsyncArenaUsage, AsyncState, AsyncStateError, AsyncStateLimits, AsyncStateMetrics,
+        CommitError, CopyBegin, EndpointKind, Event, EventLease, EventLeaseState, EventToken,
+        HostCopyTicket, HostPeerDropReceipt, HostReadableBindingsPair, NativeFilterFinalizeError,
+        ReadableTransferRequest, ReclaimError, TaskCancelState, TaskHandle, TaskResultState,
+        TransferredReadableEndpoint, WaitBegin, WaitResume, WaitTicket,
     },
     buffer_registry::{BufferPlanId, BufferRegistry, BufferRole},
     decode::ComponentPlan,
@@ -43,30 +43,56 @@ use vibeos_wasm_runtime::{
 
 /// Versioned Vibe fuel charged for resolving one empty native async result.
 const TASK_RETURN_WORK: u64 = 1;
-/// Versioned Vibe fuel charged for one handle-arena transition.
+const HANDLE_STATE_SCAN_FACTOR: u64 = 8;
+/// Fixed work for committing one local byte-stream transfer.
+const BUFFER_COPY_BASE_WORK: u64 = 1;
+/// Versioned Vibe fuel charged for decoding and committing one callback code.
+const CALLBACK_RESULT_WORK: u64 = 1;
+
+/// Versioned work schedule derived from one Component's admitted async arena.
 ///
 /// Pair creation can scan each bounded pair/handle table while preparing and
 /// inserting, and a reserve can move their existing entries (at most seven
-/// `max_resources`-sized passes in total). Join and joined-endpoint drop scan
-/// and move at most four such member ranges. Eight full passes plus one fixed
-/// dispatch/commit unit is therefore a conservative upper bound for every
-/// handle action enabled by this executor slice.
-const HANDLE_STATE_SCAN_FACTOR: u64 = 8;
-const HANDLE_STATE_WORK: u64 = 1 + HANDLE_STATE_SCAN_FACTOR * PROFILE_1_LIMITS.max_resources as u64;
-/// Versioned work for finding and sealing one component-owned buffer slot.
-const BUFFER_STATE_WORK: u64 = 1 + PROFILE_1_LIMITS.max_resources as u64;
-/// A stream begin/cancel validates both the canonical handle and buffer arena.
-const BUFFER_BRIDGE_WORK: u64 = HANDLE_STATE_WORK + BUFFER_STATE_WORK;
-/// Fixed work for committing one local byte-stream transfer.
-const BUFFER_COPY_BASE_WORK: u64 = 1;
-/// Versioned Vibe fuel charged for one actual callback wait selection.
-///
-/// Beginning or explicitly resuming a wait may scan the same bounded handle
-/// arena as another handle transition. Merely observing an already-blocked
-/// invocation does no state work and therefore spends no fuel.
-const WAIT_STATE_WORK: u64 = HANDLE_STATE_WORK;
-/// Versioned Vibe fuel charged for decoding and committing one callback code.
-const CALLBACK_RESULT_WORK: u64 = 1;
+/// `resource_limit`-sized passes in total). Join, joined-endpoint drop, and
+/// wait selection scan the same fixed arena. The fixed dispatch/commit unit is
+/// included in every public cost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeAsyncWorkCosts {
+    pub handle_state: u64,
+    pub buffer_state: u64,
+    pub buffer_bridge: u64,
+    pub wait_state: u64,
+}
+
+impl NativeAsyncWorkCosts {
+    const fn from_resource_limit(resource_limit: u32) -> Self {
+        let handle_state = 1 + HANDLE_STATE_SCAN_FACTOR * resource_limit as u64;
+        let buffer_state = 1 + resource_limit as u64;
+        Self {
+            handle_state,
+            buffer_state,
+            buffer_bridge: handle_state + buffer_state,
+            wait_state: handle_state,
+        }
+    }
+}
+
+/// Identity-free current, peak, and configured native async storage counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeAsyncStorageMetrics {
+    pub async_state: AsyncStateMetrics,
+    pub buffers: AsyncArenaUsage,
+}
+
+#[cfg(test)]
+const PROFILE_WORK_COSTS: NativeAsyncWorkCosts =
+    NativeAsyncWorkCosts::from_resource_limit(PROFILE_1_LIMITS.max_resources);
+#[cfg(test)]
+const HANDLE_STATE_WORK: u64 = PROFILE_WORK_COSTS.handle_state;
+#[cfg(test)]
+const BUFFER_BRIDGE_WORK: u64 = PROFILE_WORK_COSTS.buffer_bridge;
+#[cfg(test)]
+const WAIT_STATE_WORK: u64 = PROFILE_WORK_COSTS.wait_state;
 
 #[cfg(test)]
 use crate::async_state::TaskInfo;
@@ -208,6 +234,7 @@ pub struct NativeAsyncComponent {
     buffers: BufferRegistry,
     /// Canonical handles belong to the Component instance, not one invocation.
     state: AsyncState,
+    work_costs: NativeAsyncWorkCosts,
     poisoned: bool,
 }
 
@@ -330,6 +357,8 @@ impl NativeAsyncComponent {
         plan: &ComponentPlan<'_>,
         engine: &ProfileEngine,
         reservation_per_module: OwnerAllocationReservation,
+        manifest_memory_bytes: usize,
+        manifest_resource_limit: u32,
     ) -> Result<Self, NativeAsyncError> {
         if !plan.native_async_runtime_ready() {
             return Err(NativeAsyncError::AsyncUnavailable);
@@ -338,7 +367,8 @@ impl NativeAsyncComponent {
             plan,
             engine,
             reservation_per_module,
-            PROFILE_1_LIMITS.max_memory_pages as usize * 65_536,
+            manifest_memory_bytes,
+            manifest_resource_limit,
         )
     }
 
@@ -347,18 +377,26 @@ impl NativeAsyncComponent {
     /// This constructor is deliberately available only to the acceptance
     /// façade. It neither consults nor changes a production activation bit;
     /// instead it rejects a plan that claims to be runtime-ready and applies
-    /// the manifest-selected memory ceiling directly to every Core store.
+    /// the manifest-selected memory and async-arena ceilings directly to the
+    /// Core stores and every canonical state registry.
     #[cfg(feature = "native-async-acceptance")]
     pub fn instantiate_validation_candidate_with_memory_limit(
         plan: &ComponentPlan<'_>,
         engine: &ProfileEngine,
         reservation_per_module: OwnerAllocationReservation,
         manifest_memory_bytes: usize,
+        manifest_resource_limit: u32,
     ) -> Result<Self, NativeAsyncError> {
         if plan.native_async_runtime_ready() {
             return Err(NativeAsyncError::NotValidationCandidate);
         }
-        Self::instantiate_sealed(plan, engine, reservation_per_module, manifest_memory_bytes)
+        Self::instantiate_sealed(
+            plan,
+            engine,
+            reservation_per_module,
+            manifest_memory_bytes,
+            manifest_resource_limit,
+        )
     }
 
     #[cfg(test)]
@@ -372,6 +410,7 @@ impl NativeAsyncComponent {
             engine,
             reservation_per_module,
             PROFILE_1_LIMITS.max_memory_pages as usize * 65_536,
+            PROFILE_1_LIMITS.max_resources,
         )
     }
 
@@ -380,10 +419,15 @@ impl NativeAsyncComponent {
         engine: &ProfileEngine,
         reservation_per_module: OwnerAllocationReservation,
         memory_bytes: usize,
+        resource_limit: u32,
     ) -> Result<Self, NativeAsyncError> {
         if plan.profile() != ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE {
             return Err(NativeAsyncError::AsyncUnavailable);
         }
+        if resource_limit == 0 || resource_limit > PROFILE_1_LIMITS.max_resources {
+            return Err(NativeAsyncError::InvalidBudget);
+        }
+        let work_costs = NativeAsyncWorkCosts::from_resource_limit(resource_limit);
         let execution = plan
             .native_async_execution_plan()
             .ok_or(NativeAsyncError::InvalidWiring)?;
@@ -394,7 +438,7 @@ impl NativeAsyncComponent {
         let exports = runtime_exports(execution)?;
         // Reserve all registry slots and the fixed byte-stream copy scratch
         // before any Core start function can execute during instantiation.
-        let buffers = BufferRegistry::new(PROFILE_1_LIMITS.max_resources, memory_bytes)
+        let buffers = BufferRegistry::new(resource_limit, memory_bytes)
             .map_err(|_| NativeAsyncError::Allocation)?;
         let mut modules = CoreComponentGroup::new_with_memory_limit(
             engine,
@@ -455,10 +499,10 @@ impl NativeAsyncComponent {
             callback_slots.push(slot);
         }
         let state = AsyncState::new(AsyncStateLimits {
-            handles: PROFILE_1_LIMITS.max_resources,
-            pairs: PROFILE_1_LIMITS.max_resources,
+            handles: resource_limit,
+            pairs: resource_limit,
             tasks: 1,
-            waitables_per_set: PROFILE_1_LIMITS.max_resources,
+            waitables_per_set: resource_limit,
         })
         .map_err(map_state_error)?;
         Ok(Self {
@@ -468,8 +512,22 @@ impl NativeAsyncComponent {
             bridges,
             buffers,
             state,
+            work_costs,
             poisoned: false,
         })
+    }
+
+    /// Return the exact work schedule derived from this Component's ceiling.
+    pub const fn work_costs(&self) -> NativeAsyncWorkCosts {
+        self.work_costs
+    }
+
+    /// Return aggregate storage accounting without exposing runtime identity.
+    pub const fn storage_metrics(&self) -> NativeAsyncStorageMetrics {
+        NativeAsyncStorageMetrics {
+            async_state: self.state.metrics(),
+            buffers: self.buffers.usage(),
+        }
     }
 
     fn start<'a>(
@@ -2394,7 +2452,8 @@ impl NativeAsyncInvocation<'_> {
                 }
             }
             (BridgeAction::StreamNew(value_type), []) => {
-                if let Err(trap) = self.debit_active_work(authority, HANDLE_STATE_WORK) {
+                let work = self.component.work_costs.handle_state;
+                if let Err(trap) = self.debit_active_work(authority, work) {
                     return self.finish_trap(trap);
                 }
                 let pair = match self.component.state.create_stream_pair(value_type) {
@@ -2414,7 +2473,8 @@ impl NativeAsyncInvocation<'_> {
                 NativeAsyncPoll::Pending(self.metrics())
             }
             (BridgeAction::FutureNew(value_type), []) => {
-                if let Err(trap) = self.debit_active_work(authority, HANDLE_STATE_WORK) {
+                let work = self.component.work_costs.handle_state;
+                if let Err(trap) = self.debit_active_work(authority, work) {
                     return self.finish_trap(trap);
                 }
                 let pair = match self.component.state.create_future_pair(value_type) {
@@ -2521,7 +2581,8 @@ impl NativeAsyncInvocation<'_> {
                     Ok(handle) => handle,
                     Err(error) => return self.finish_trap(map_runtime_state_error(error)),
                 };
-                if let Err(trap) = self.debit_active_work(authority, HANDLE_STATE_WORK) {
+                let work = self.component.work_costs.handle_state;
+                if let Err(trap) = self.debit_active_work(authority, work) {
                     return self.finish_trap(trap);
                 }
                 if let Err(error) = self
@@ -2537,7 +2598,8 @@ impl NativeAsyncInvocation<'_> {
                 NativeAsyncPoll::Pending(self.metrics())
             }
             (BridgeAction::WaitableSetNew, []) => {
-                if let Err(trap) = self.debit_active_work(authority, HANDLE_STATE_WORK) {
+                let work = self.component.work_costs.handle_state;
+                if let Err(trap) = self.debit_active_work(authority, work) {
                     return self.finish_trap(trap);
                 }
                 let set = match self.component.state.create_waitable_set() {
@@ -2555,7 +2617,8 @@ impl NativeAsyncInvocation<'_> {
                     Ok(set) => set,
                     Err(error) => return self.finish_trap(map_runtime_state_error(error)),
                 };
-                if let Err(trap) = self.debit_active_work(authority, HANDLE_STATE_WORK) {
+                let work = self.component.work_costs.handle_state;
+                if let Err(trap) = self.debit_active_work(authority, work) {
                     return self.finish_trap(trap);
                 }
                 if let Err(error) = self.component.state.drop_waitable_set(set) {
@@ -2578,7 +2641,8 @@ impl NativeAsyncInvocation<'_> {
                     Ok(waitable) => waitable,
                     Err(error) => return self.finish_trap(map_runtime_state_error(error)),
                 };
-                if let Err(trap) = self.debit_active_work(authority, HANDLE_STATE_WORK) {
+                let work = self.component.work_costs.handle_state;
+                if let Err(trap) = self.debit_active_work(authority, work) {
                     return self.finish_trap(trap);
                 }
                 if let Err(error) = self
@@ -2642,7 +2706,8 @@ impl NativeAsyncInvocation<'_> {
             Ok(prepared) => prepared,
             Err(trap) => return self.finish_trap(trap),
         };
-        if let Err(trap) = self.debit_active_work_with_reserve(authority, BUFFER_BRIDGE_WORK) {
+        let work = self.component.work_costs.buffer_bridge;
+        if let Err(trap) = self.debit_active_work_with_reserve(authority, work) {
             return self.finish_trap(trap);
         }
         let lease = match self.component.buffers.issue(prepared) {
@@ -2934,7 +2999,8 @@ impl NativeAsyncInvocation<'_> {
         {
             return self.finish_trap(map_exact_endpoint_state_error(error));
         }
-        if let Err(trap) = self.debit_active_work_with_reserve(authority, BUFFER_BRIDGE_WORK) {
+        let work = self.component.work_costs.buffer_bridge;
+        if let Err(trap) = self.debit_active_work_with_reserve(authority, work) {
             return self.finish_trap(trap);
         }
         let event = match self
@@ -3239,7 +3305,10 @@ impl NativeAsyncInvocation<'_> {
     }
 
     fn charge_wait_state_work(&mut self) -> bool {
-        let Some(remaining) = self.remaining_work.checked_sub(WAIT_STATE_WORK) else {
+        let Some(remaining) = self
+            .remaining_work
+            .checked_sub(self.component.work_costs.wait_state)
+        else {
             return false;
         };
         if remaining == 0 {
@@ -3429,18 +3498,26 @@ mod tests {
     const QUANTUM: u64 = 10_000;
 
     fn instantiate(source: &str) -> NativeAsyncComponent {
+        instantiate_with_resource_limit(source, PROFILE_1_LIMITS.max_resources).unwrap()
+    }
+
+    fn instantiate_with_resource_limit(
+        source: &str,
+        resource_limit: u32,
+    ) -> Result<NativeAsyncComponent, NativeAsyncError> {
         let bytes = wat::parse_str(source).unwrap();
         let plan = inspect_component_for_profile(
             &bytes,
             ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
         )
         .unwrap();
-        NativeAsyncComponent::instantiate_validation_plan(
+        NativeAsyncComponent::instantiate_sealed(
             &plan,
             &ProfileEngine::new(),
             OwnerAllocationReservation::profile_default(),
+            PROFILE_1_LIMITS.max_memory_pages as usize * 65_536,
+            resource_limit,
         )
-        .unwrap()
     }
 
     fn replace_once(source: &str, from: &str, to: &str) -> String {
@@ -4271,6 +4348,7 @@ mod tests {
 
     fn assert_exact_run_bridge_debits(call: &mut NativeAsyncInvocation<'_>) -> usize {
         let active = call.binding().core_instance;
+        let work_costs = call.component.work_costs();
         let mut handle_transitions = 0;
         loop {
             let result = call.component.modules.poll_call(active);
@@ -4288,14 +4366,14 @@ mod tests {
                         | BridgeAction::WaitableSetDrop
                         | BridgeAction::WaitableJoin => {
                             handle_transitions += 1;
-                            HANDLE_STATE_WORK
+                            work_costs.handle_state
                         }
                         BridgeAction::StreamCopy { .. }
                         | BridgeAction::StreamCancel { .. }
                         | BridgeAction::FutureCopy { .. }
                         | BridgeAction::FutureCancel { .. } => {
                             handle_transitions += 1;
-                            BUFFER_BRIDGE_WORK
+                            work_costs.buffer_bridge
                         }
                         BridgeAction::Unsupported => {
                             panic!("fixture reached an unsupported bridge")
@@ -4399,15 +4477,83 @@ mod tests {
                 &plan,
                 &ProfileEngine::new(),
                 OwnerAllocationReservation::new(0),
+                PROFILE_1_LIMITS.max_memory_pages as usize * 65_536,
+                PROFILE_1_LIMITS.max_resources,
             )
             .err(),
             Some(NativeAsyncError::AsyncUnavailable)
         );
     }
 
+    #[test]
+    fn manifest_resource_ceiling_binds_arenas_metrics_and_state_work() {
+        assert_eq!(
+            instantiate_with_resource_limit(SMOKE, 0).err(),
+            Some(NativeAsyncError::InvalidBudget)
+        );
+        assert_eq!(
+            instantiate_with_resource_limit(SMOKE, PROFILE_1_LIMITS.max_resources + 1).err(),
+            Some(NativeAsyncError::InvalidBudget)
+        );
+
+        let mut component = instantiate_with_resource_limit(SMOKE, 8).unwrap();
+        assert_eq!(
+            component.work_costs(),
+            NativeAsyncWorkCosts {
+                handle_state: 65,
+                buffer_state: 9,
+                buffer_bridge: 74,
+                wait_state: 65,
+            }
+        );
+        let storage = component.storage_metrics();
+        assert_eq!(
+            storage.async_state.handles,
+            AsyncArenaUsage {
+                current: 0,
+                peak: 0,
+                limit: 8,
+            }
+        );
+        assert_eq!(storage.async_state.pairs.limit, 8);
+        assert_eq!(storage.async_state.tasks.limit, 1);
+        assert_eq!(storage.async_state.joined_waitables.limit, 8);
+        assert_eq!(storage.async_state.wait_registrations.limit, 1);
+        assert_eq!(
+            storage.buffers,
+            AsyncArenaUsage {
+                current: 0,
+                peak: 0,
+                limit: 8,
+            }
+        );
+
+        let value_type = AsyncValueTypeId::new(1).unwrap();
+        for _ in 0..4 {
+            component.state.create_stream_pair(value_type).unwrap();
+        }
+        let full = component.storage_metrics();
+        assert_eq!(
+            (
+                full.async_state.handles.current,
+                full.async_state.handles.peak
+            ),
+            (8, 8)
+        );
+        assert_eq!(
+            (full.async_state.pairs.current, full.async_state.pairs.peak),
+            (4, 4)
+        );
+        assert!(matches!(
+            component.state.create_stream_pair(value_type),
+            Err(AsyncStateError::HandleTableFull)
+        ));
+        assert_eq!(component.storage_metrics(), full);
+    }
+
     #[cfg(feature = "native-async-acceptance")]
     #[test]
-    fn acceptance_facade_requires_an_explicit_candidate_and_manifest_memory_limit() {
+    fn acceptance_facade_requires_an_explicit_candidate_and_manifest_limits() {
         let source = clean_finalize_component(false);
         let bytes = wat::parse_str(&source).unwrap();
         let plan = inspect_component_for_profile(
@@ -4421,6 +4567,8 @@ mod tests {
                 &plan,
                 &ProfileEngine::new(),
                 OwnerAllocationReservation::profile_default(),
+                65_536,
+                PROFILE_1_LIMITS.max_resources,
             )
             .err(),
             Some(NativeAsyncError::AsyncUnavailable)
@@ -4431,6 +4579,7 @@ mod tests {
                 &ProfileEngine::new(),
                 OwnerAllocationReservation::profile_default(),
                 65_535,
+                PROFILE_1_LIMITS.max_resources,
             )
             .err(),
             Some(NativeAsyncError::CoreInstantiation)
@@ -4441,6 +4590,7 @@ mod tests {
                 &ProfileEngine::new(),
                 OwnerAllocationReservation::profile_default(),
                 65_536,
+                PROFILE_1_LIMITS.max_resources,
             )
             .unwrap();
         assert!(!component.is_poisoned());
@@ -7223,23 +7373,23 @@ mod tests {
     }
 
     #[test]
-    fn full_handle_arena_traps_as_limit_after_exact_transition_debit() {
+    fn selected_handle_arena_traps_as_limit_after_its_exact_transition_debit() {
         let source = handle_component("call $stream-new\n                  drop");
-        let mut component = instantiate(&source);
-        let value_type = component
-            .bridges
-            .iter()
-            .find_map(|bridge| match bridge.action {
-                BridgeAction::StreamNew(value_type) => Some(value_type),
-                _ => None,
-            })
-            .unwrap();
-        assert_eq!(PROFILE_1_LIMITS.max_resources % 2, 0);
-        for _ in 0..PROFILE_1_LIMITS.max_resources / 2 {
-            component.state.create_stream_pair(value_type).unwrap();
-        }
-
-        {
+        for resource_limit in [8, PROFILE_1_LIMITS.max_resources] {
+            let mut component = instantiate_with_resource_limit(&source, resource_limit).unwrap();
+            let value_type = component
+                .bridges
+                .iter()
+                .find_map(|bridge| match bridge.action {
+                    BridgeAction::StreamNew(value_type) => Some(value_type),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(resource_limit % 2, 0);
+            for _ in 0..resource_limit / 2 {
+                component.state.create_stream_pair(value_type).unwrap();
+            }
+            let expected_work = component.work_costs().handle_state;
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
             let active = call.binding().core_instance;
             let host = loop {
@@ -7257,16 +7407,62 @@ mod tests {
                 NativeAsyncPoll::Trapped(TrapCode::LimitExceeded)
             );
             let after = call.metrics();
-            assert_eq!(
-                before.remaining_work - after.remaining_work,
-                HANDLE_STATE_WORK
-            );
-            assert_eq!(
-                after.consumed_work - before.consumed_work,
-                HANDLE_STATE_WORK
-            );
+            assert_eq!(before.remaining_work - after.remaining_work, expected_work);
+            assert_eq!(after.consumed_work - before.consumed_work, expected_work);
+            drop(call);
+            assert!(component.is_poisoned());
         }
-        assert!(component.is_poisoned());
+    }
+
+    #[test]
+    fn selected_buffer_arena_charges_its_exact_bridge_work() {
+        let source = byte_stream_component(
+            r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      call $stream-new
+      local.set $pair
+      i32.const 0
+      i32.const 42
+      i32.store8
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.const 0
+      i32.const 1
+      call $stream-write
+      drop
+      i32.const 1)"#,
+            r#"    (func (export "callback") (param i32 i32 i32) (result i32)
+      i32.const 0)"#,
+        );
+        let mut component = instantiate_with_resource_limit(&source, 8).unwrap();
+        assert_eq!(component.work_costs().buffer_bridge, 74);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        let active = call.binding().core_instance;
+        loop {
+            let progress = call.component.modules.poll_call(active);
+            assert!(call.settle_metrics(CallAuthority::Run(active)));
+            match progress {
+                PollResult::Pending { .. } => {}
+                PollResult::HostCall(host) => {
+                    let action = call.component.bridges[host.id as usize].action;
+                    let before = call.metrics();
+                    let progress = call.handle_host_call(CallAuthority::Run(active), host);
+                    let after = call.metrics();
+                    if matches!(action, BridgeAction::StreamCopy { .. }) {
+                        assert!(matches!(progress, NativeAsyncPoll::Pending(_)));
+                        assert_eq!(before.remaining_work - after.remaining_work, 74);
+                        assert_eq!(after.consumed_work - before.consumed_work, 74);
+                        assert_eq!(call.component.buffers.usage().peak, 1);
+                        break;
+                    }
+                    assert!(matches!(progress, NativeAsyncPoll::Pending(_)));
+                }
+                PollResult::Ready(_) => panic!("copy fixture returned before stream.write"),
+                PollResult::Trapped(trap) => panic!("copy fixture trapped early: {trap:?}"),
+            }
+        }
     }
 
     #[test]
@@ -7583,8 +7779,10 @@ mod tests {
     #[test]
     fn exact_wait_resume_charges_once_rotates_and_rejects_stale_or_foreign_tokens() {
         let source = wait_component(false, cancellation_exit_callback());
-        let mut component = instantiate(&source);
-        let mut foreign_component = instantiate(&source);
+        let mut component = instantiate_with_resource_limit(&source, 8).unwrap();
+        let mut foreign_component = instantiate_with_resource_limit(&source, 8).unwrap();
+        let wait_work = component.work_costs().wait_state;
+        assert_eq!(wait_work, 65);
         let mut call = component.start("run", WORK, QUANTUM).unwrap();
         let mut foreign_call = foreign_component.start("run", WORK, QUANTUM).unwrap();
         let (token, blocked_metrics) = poll_to_wait(&mut call);
@@ -7606,11 +7804,11 @@ mod tests {
         assert_ne!(rotated, token);
         assert_eq!(
             blocked_metrics.remaining_work - resumed_metrics.remaining_work,
-            WAIT_STATE_WORK
+            wait_work
         );
         assert_eq!(
             resumed_metrics.consumed_work - blocked_metrics.consumed_work,
-            WAIT_STATE_WORK
+            wait_work
         );
 
         assert_eq!(
@@ -7645,7 +7843,7 @@ mod tests {
         ));
         assert_eq!(
             before_cancel_resume.remaining_work - call.metrics().remaining_work,
-            WAIT_STATE_WORK
+            wait_work
         );
         assert_eq!(call.task_info().cancel, TaskCancelState::Delivered);
         assert_eq!(

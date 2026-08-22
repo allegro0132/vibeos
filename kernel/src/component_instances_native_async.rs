@@ -146,6 +146,20 @@ impl NativeImageRoot {
             self.projection.manifest().poll_quantum()
         }
     }
+
+    fn resource_limit(&self) -> u16 {
+        #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+        {
+            return self.admitted.limits().resources;
+        }
+        #[cfg(all(
+            feature = "ssh-native-async-command",
+            not(feature = "wasm-c53-native-async-qemu-acceptance")
+        ))]
+        {
+            self.projection.manifest().resource_limit()
+        }
+    }
 }
 
 pub(super) fn lifecycle_is_healthy() -> bool {
@@ -4265,6 +4279,7 @@ async fn run_driver(
         &engine,
         OwnerAllocationReservation::new(root.memory_bytes()),
         root.memory_bytes(),
+        u32::from(root.resource_limit()),
     ) {
         Ok(component) => component,
         Err(error) => return terminal_word(native_error_terminal(error)),

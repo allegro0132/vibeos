@@ -8,6 +8,8 @@ use vibeos_component_admission::{
     admit_native_async_acceptance_candidate, AdmittedNativeAsyncAcceptanceCandidate,
     NATIVE_STREAM_FILTER_WORLD,
 };
+#[cfg(feature = "native-async-acceptance")]
+use vibeos_component_format::ProfileStage;
 use vibeos_component_host::{
     HostManifestError, HostResourceKind, CLOCK_INTERFACE, STREAM_INTERFACE,
 };
@@ -401,10 +403,7 @@ fn native_policy<'a>(
             memory_bytes: 64 * 1024,
             total_fuel: 500_000,
             poll_quantum: 100,
-            // The current native executor allocates the frozen profile-wide
-            // handle/pair/waitable tables. Do not advertise a paper ceiling it
-            // does not enforce yet.
-            resources: vibeos_component_format::PROFILE_1_LIMITS.max_resources as u16,
+            resources: 8,
         },
         stdin: CommandStreamMode::Required,
         stdout: CommandStreamMode::Required,
@@ -442,10 +441,7 @@ fn native_async_acceptance_candidate_is_sealed_inert_and_authority_free() {
     assert_eq!(candidate.stdin(), CommandStreamMode::Required);
     assert_eq!(candidate.stdout(), CommandStreamMode::Required);
     assert_eq!(candidate.stderr(), CommandStreamMode::Optional);
-    assert_eq!(
-        usize::from(candidate.limits().resources),
-        vibeos_component_format::PROFILE_1_LIMITS.max_resources as usize
-    );
+    assert_eq!(candidate.limits().resources, 8);
 
     let plan = candidate.validated_plan().unwrap();
     assert!(!plan.runtime_ready());
@@ -493,19 +489,6 @@ fn native_async_acceptance_rejects_authority_modes_limits_and_adjacent_topology(
         )
         .err(),
         Some(AdmissionError::InvalidPolicy)
-    );
-
-    let artifact = native_artifact();
-    let mut policy = native_policy(artifact.identity(), &world, &[]);
-    policy.limits.resources -= 1;
-    assert_eq!(
-        admit_native_async_acceptance_candidate(
-            artifact,
-            &policy,
-            &CallerAuthority { offers: &[] },
-        )
-        .err(),
-        Some(AdmissionError::InvalidLimits)
     );
 
     let adjacent = NATIVE_STREAM_COMPONENT.replacen(
@@ -585,6 +568,45 @@ fn native_async_acceptance_rejects_authority_modes_limits_and_adjacent_topology(
         .err(),
         Some(AdmissionError::InvalidPolicy)
     );
+}
+
+#[cfg(feature = "native-async-acceptance")]
+#[test]
+fn native_async_acceptance_preserves_exact_resource_limit_and_rejects_out_of_range() {
+    let world = native_world();
+
+    let artifact = native_artifact();
+    let mut policy = native_policy(artifact.identity(), &world, &[]);
+    policy.limits.resources = 3;
+    let candidate = admit_native_async_acceptance_candidate(
+        artifact,
+        &policy,
+        &CallerAuthority { offers: &[] },
+    )
+    .unwrap();
+    assert_eq!(candidate.limits().resources, 3);
+    let plan = candidate.validated_plan().unwrap();
+    assert_eq!(plan.profile().stage, ProfileStage::ValidationOnly);
+    assert!(!plan.runtime_ready());
+    assert!(!plan.native_async_runtime_ready());
+
+    for resources in [
+        0,
+        vibeos_component_format::PROFILE_1_LIMITS.max_resources as u16 + 1,
+    ] {
+        let artifact = native_artifact();
+        let mut policy = native_policy(artifact.identity(), &world, &[]);
+        policy.limits.resources = resources;
+        assert_eq!(
+            admit_native_async_acceptance_candidate(
+                artifact,
+                &policy,
+                &CallerAuthority { offers: &[] },
+            )
+            .err(),
+            Some(AdmissionError::InvalidLimits)
+        );
+    }
 }
 
 #[cfg(feature = "native-async-acceptance")]

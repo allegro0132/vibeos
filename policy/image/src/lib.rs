@@ -4,11 +4,6 @@
 //! firmware images. Physical hardware descriptions remain in the BSP/HAL.
 
 use vibeos_component_format::ProfileIdentity;
-#[cfg(any(
-    feature = "c53-native-async-qemu-acceptance",
-    feature = "c53-native-async-command-projection"
-))]
-use vibeos_component_format::PROFILE_1_LIMITS;
 
 #[cfg(all(feature = "qemu-default", feature = "milkv-duo-sd"))]
 compile_error!("image policies `qemu-default` and `milkv-duo-sd` are mutually exclusive");
@@ -517,10 +512,7 @@ pub const C53_NATIVE_ASYNC_QEMU_ACCEPTANCE: NativeAsyncAcceptancePin = NativeAsy
         memory_bytes: 64 * 1024,
         total_fuel: 500_000,
         poll_quantum: 100,
-        // The native runtime currently enforces the Profile-1-wide table
-        // capacity. A smaller value here would be documentation, not a
-        // real ceiling.
-        resources: PROFILE_1_LIMITS.max_resources as u16,
+        resources: 8,
     },
 };
 
@@ -548,7 +540,7 @@ pub const C53_NATIVE_ASYNC_COMMAND: NativeAsyncCommandPin = NativeAsyncCommandPi
         memory_bytes: 64 * 1024,
         total_fuel: 500_000,
         poll_quantum: 100,
-        resources: PROFILE_1_LIMITS.max_resources as u16,
+        resources: 8,
     },
 };
 
@@ -636,10 +628,7 @@ mod tests {
         assert_eq!(pin.stdin(), ComponentStreamMode::Required);
         assert_eq!(pin.stdout(), ComponentStreamMode::Required);
         assert_eq!(pin.stderr(), ComponentStreamMode::Optional);
-        assert_eq!(
-            usize::from(pin.limits().resources),
-            PROFILE_1_LIMITS.max_resources as usize
-        );
+        assert_eq!(pin.limits().resources, 8);
         assert!(pin.wit_source().contains("type bytes = stream<u8>;"));
         assert!(pin
             .wit_source()
@@ -667,10 +656,7 @@ mod tests {
         assert_eq!(pin.stdin(), ComponentStreamMode::Required);
         assert_eq!(pin.stdout(), ComponentStreamMode::Required);
         assert_eq!(pin.stderr(), ComponentStreamMode::Optional);
-        assert_eq!(
-            usize::from(pin.limits().resources),
-            PROFILE_1_LIMITS.max_resources as usize
-        );
+        assert_eq!(pin.limits().resources, 8);
     }
 
     #[cfg(all(

@@ -47,6 +47,7 @@ pub mod native_async_acceptance {
         NativeAsyncFinalizeError as FinalizeError, NativeAsyncHostError as HostError,
         NativeAsyncHostRequest as HostRequest, NativeAsyncHostToken as HostToken,
         NativeAsyncInvocation as Invocation, NativeAsyncMetrics as Metrics,
-        NativeAsyncPoll as Poll, NativeAsyncWaitToken as WaitToken,
+        NativeAsyncPoll as Poll, NativeAsyncStorageMetrics as StorageMetrics,
+        NativeAsyncWaitToken as WaitToken, NativeAsyncWorkCosts as WorkCosts,
     };
 }

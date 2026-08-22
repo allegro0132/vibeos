@@ -5661,6 +5661,26 @@ fn finalize_instance(key: ControlKey) -> FinalizeControl {
     acceptance::record_terminal_visible(&tuple.handle, tuple.domain, state);
     let finalized =
         unsafe { finalize_registry_terminal(key, &tuple, terminal, expected_completion) };
+    #[cfg(any(
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "ssh-native-async-command"
+    ))]
+    let native_lease_reset = match &finalized {
+        Ok(outcome)
+            if outcome.detached_completion == expected_completion
+                && tuple.start_kind.is_native_async() =>
+        {
+            native_async_acceptance::finish_terminal_lease_reset(
+                key,
+                tuple.core_token,
+                tuple.handle.id(),
+                tuple.domain,
+                tuple.streams,
+                outcome.revoked_capabilities,
+            )
+        }
+        Ok(_) | Err(_) => true,
+    };
     let mut control = match suspended.resume() {
         Ok(control) => control,
         Err(_) => {
@@ -5682,6 +5702,21 @@ fn finalize_instance(key: ControlKey) -> FinalizeControl {
             return FinalizeControl::Lost;
         }
     };
+    #[cfg(any(
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "ssh-native-async-command"
+    ))]
+    if !native_lease_reset {
+        CONTROL.child_shadow[key.slot as usize].quarantine(key);
+        CONTROL.supervisor_shadow[key.slot as usize].quarantine(key);
+        if let Some(record) = control.exact_mut(key) {
+            record.quarantine();
+        }
+        let _ = registry().quarantine(tuple.core_token);
+        lifecycle_fail_stop();
+        system.restore();
+        return FinalizeControl::Lost;
+    }
     #[cfg(feature = "ssh-native-async-qemu-acceptance")]
     if tuple.start_kind == ControlStartKind::ManagedNativeAsync
         && !native_async_acceptance::target_record_managed_terminal(

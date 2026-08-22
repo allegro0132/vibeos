@@ -26,6 +26,7 @@ use crate::{
         NativeAsyncExecutionPlan, NativeAsyncFuturePlan, NativeAsyncStreamPlan,
         NativeAsyncWaitablePlan,
     },
+    host::HostWakeToken,
     value::{
         AsyncValueTypeId, EndpointDirection, ReadableFutureEndpointToken,
         ReadableStreamEndpointToken, ValueType,
@@ -102,6 +103,9 @@ fn fail_stop_cleanup_work(
 pub struct NativeAsyncStorageMetrics {
     pub async_state: AsyncStateMetrics,
     pub buffers: AsyncArenaUsage,
+    /// Runtime-owned supervisor wakes currently installed for callback waits.
+    /// Counts disclose no task, set, wait, or continuation identity.
+    pub wait_wake_registrations: AsyncArenaUsage,
 }
 
 #[cfg(test)]
@@ -223,6 +227,30 @@ impl core::fmt::Debug for NativeAsyncWaitToken {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WaitRegistrationAuthority {
+    wait: NativeAsyncWaitToken,
+    generation: NonZeroU64,
+}
+
+/// Linear authority to resume one exact callback wait after its registered
+/// supervisor wake has been signalled by this runtime.
+///
+/// The task seal, wait generation, and independent registration generation
+/// remain private. The type is intentionally neither `Copy` nor `Clone`;
+/// consuming [`NativeAsyncInvocation::resume_wait`] is the only successful
+/// owner transition.
+#[must_use = "a live native async wait registration must be resumed or cancelled by invocation teardown"]
+pub struct NativeAsyncWaitRegistration {
+    authority: WaitRegistrationAuthority,
+}
+
+impl core::fmt::Debug for NativeAsyncWaitRegistration {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("NativeAsyncWaitRegistration(<opaque>)")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeAsyncCancelOutcome {
     Requested,
@@ -234,6 +262,8 @@ pub enum NativeAsyncCancelOutcome {
 pub enum NativeAsyncControlError {
     Invariant,
     InvalidWaitToken,
+    InvalidWaitRegistration,
+    WaitNotSignalled,
     NotWaiting,
 }
 
@@ -268,6 +298,8 @@ pub struct NativeAsyncComponent {
     state: AsyncState,
     work_costs: NativeAsyncWorkCosts,
     fail_stop_cleanup_work: u64,
+    wait_wake_registrations: u32,
+    peak_wait_wake_registrations: u32,
     poisoned: bool,
 }
 
@@ -553,6 +585,8 @@ impl NativeAsyncComponent {
             state,
             work_costs,
             fail_stop_cleanup_work,
+            wait_wake_registrations: 0,
+            peak_wait_wake_registrations: 0,
             poisoned: false,
         })
     }
@@ -564,9 +598,15 @@ impl NativeAsyncComponent {
 
     /// Return aggregate storage accounting without exposing runtime identity.
     pub const fn storage_metrics(&self) -> NativeAsyncStorageMetrics {
+        let async_state = self.state.metrics();
         NativeAsyncStorageMetrics {
-            async_state: self.state.metrics(),
+            async_state,
             buffers: self.buffers.usage(),
+            wait_wake_registrations: AsyncArenaUsage {
+                current: self.wait_wake_registrations,
+                peak: self.peak_wait_wake_registrations,
+                limit: async_state.tasks.limit,
+            },
         }
     }
 
@@ -701,6 +741,8 @@ impl NativeAsyncComponent {
             wait_ticket: None,
             wait_token: None,
             next_wait_generation: 1,
+            wait_wake: None,
+            next_wait_wake_generation: 1,
             input: None,
             output_stream: None,
             output_closed: None,
@@ -849,6 +891,8 @@ impl NativeAsyncComponent {
             wait_ticket: None,
             wait_token: None,
             next_wait_generation: 1,
+            wait_wake: None,
+            next_wait_wake_generation: 1,
             input: Some(input),
             output_stream: None,
             output_closed: None,
@@ -1604,6 +1648,13 @@ struct PendingHostCopy {
     charged: bool,
 }
 
+struct PendingWaitWake {
+    authority: WaitRegistrationAuthority,
+    /// Present until the exact selector becomes ready. Taking this envelope
+    /// marks the registration signalled before its callback is invoked.
+    wake: Option<HostWakeToken>,
+}
+
 #[derive(Default)]
 struct NativeFilterTerminalDropLedger {
     input_stream: Option<HostPeerDropReceipt>,
@@ -1628,6 +1679,8 @@ pub struct NativeAsyncInvocation<'a> {
     wait_ticket: Option<WaitTicket>,
     wait_token: Option<NativeAsyncWaitToken>,
     next_wait_generation: u64,
+    wait_wake: Option<PendingWaitWake>,
+    next_wait_wake_generation: u64,
     /// Exact input-side host authorities and the guest handles passed to Core.
     /// This aggregate is deliberately private and non-cloneable.
     input: Option<HostReadableBindingsPair>,
@@ -1699,19 +1752,26 @@ impl NativeAsyncInvocation<'_> {
         if info.result == TaskResultState::Resolved {
             return Ok(NativeAsyncCancelOutcome::TooLate);
         }
-        match info.cancel {
+        let outcome = match info.cancel {
             TaskCancelState::None => {
                 self.component
                     .state
                     .request_task_cancel(self.task)
                     .map_err(|_| NativeAsyncControlError::Invariant)?;
-                Ok(NativeAsyncCancelOutcome::Requested)
+                NativeAsyncCancelOutcome::Requested
             }
-            TaskCancelState::Requested => Ok(NativeAsyncCancelOutcome::Requested),
+            TaskCancelState::Requested => NativeAsyncCancelOutcome::Requested,
             TaskCancelState::Delivered | TaskCancelState::Acknowledged => {
-                Ok(NativeAsyncCancelOutcome::TooLate)
+                NativeAsyncCancelOutcome::TooLate
             }
-        }
+        };
+        // The task-state mutation and all of its internal borrows are complete
+        // before the supervisor callback is selected. Mark the exact wake
+        // signalled first, then invoke its copy-only envelope outside those
+        // borrows so a synchronous scheduler callback cannot observe an
+        // uncommitted readiness transition.
+        self.dispatch_registered_wait_wake_if_ready()?;
+        Ok(outcome)
     }
 
     /// Reserves byte work and validates the exact guest input target before a
@@ -2026,6 +2086,8 @@ impl NativeAsyncInvocation<'_> {
             || self.callback_pending
             || self.wait_ticket.is_some()
             || self.wait_token.is_some()
+            || self.wait_wake.is_some()
+            || self.component.wait_wake_registrations != 0
             || self.deferred_core.is_some()
             || self.host_current.is_some()
             || self.host_next.is_some()
@@ -2115,35 +2177,119 @@ impl NativeAsyncInvocation<'_> {
         }
     }
 
-    /// Uses one exact owner token to perform one real blocked-wait scan.
+    /// Installs the sole supervisor wake for the current exact callback wait.
     ///
-    /// Ordinary [`Self::poll`] calls never scan a blocked wait. A pending
-    /// explicit resume spends one bounded state-transition charge and rotates
-    /// the token, making retries and spurious wakes observable and linear.
-    pub fn resume_wait(
+    /// The wake is committed before readiness is rechecked. If cancellation
+    /// or an endpoint event raced ahead of registration, the registration is
+    /// marked signalled and its callback is invoked before this method
+    /// returns. A duplicate, stale, or foreign wait token is rejected without
+    /// replacing the live envelope.
+    pub fn register_wait_wake(
         &mut self,
         token: NativeAsyncWaitToken,
-    ) -> Result<NativeAsyncPoll, NativeAsyncControlError> {
+        wake: HostWakeToken,
+    ) -> Result<NativeAsyncWaitRegistration, NativeAsyncControlError> {
         if !matches!(self.stage, InvocationStage::WaitBlocked) {
             return Err(NativeAsyncControlError::NotWaiting);
         }
         let Some(expected) = self.wait_token else {
-            return Ok(self.finish_trap(TrapCode::Validation));
+            return Err(NativeAsyncControlError::Invariant);
         };
         if token != expected {
             return Err(NativeAsyncControlError::InvalidWaitToken);
         }
-        if self.wait_ticket.is_none() {
-            return Ok(self.finish_trap(TrapCode::Validation));
+        if self.wait_ticket.is_none()
+            || self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle
+            || self.callback_pending
+        {
+            return Err(NativeAsyncControlError::Invariant);
         }
-        if self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle
+        if self.wait_wake.is_some() {
+            return Err(NativeAsyncControlError::InvalidWaitRegistration);
+        }
+        let generation = NonZeroU64::new(self.next_wait_wake_generation)
+            .ok_or(NativeAsyncControlError::Invariant)?;
+        let next = self
+            .next_wait_wake_generation
+            .checked_add(1)
+            .ok_or(NativeAsyncControlError::Invariant)?;
+        if self.component.wait_wake_registrations != 0 {
+            return Err(NativeAsyncControlError::Invariant);
+        }
+        let authority = WaitRegistrationAuthority {
+            wait: token,
+            generation,
+        };
+        self.next_wait_wake_generation = next;
+        self.component.wait_wake_registrations = 1;
+        self.component.peak_wait_wake_registrations =
+            self.component.peak_wait_wake_registrations.max(1);
+        self.wait_wake = Some(PendingWaitWake {
+            authority,
+            wake: Some(wake),
+        });
+
+        let raced_wake = match self.take_registered_wait_wake_if_ready() {
+            Ok(wake) => wake,
+            Err(error) => {
+                let _ = self.clear_wait_wake_registration();
+                return Err(error);
+            }
+        };
+        let registration = NativeAsyncWaitRegistration { authority };
+        // `take_registered_wait_wake_if_ready` marked this exact authority as
+        // signalled before returning the envelope. No AsyncState or pending
+        // registration borrow remains while the callback runs.
+        if let Some(wake) = raced_wake {
+            wake.wake();
+        }
+        Ok(registration)
+    }
+
+    /// Consumes one exact, runtime-signalled registration and performs one
+    /// charged selector transition.
+    ///
+    /// Ordinary [`Self::poll`] calls never scan a blocked wait. A copied host
+    /// wake envelope cannot authorize this method: only the runtime readiness
+    /// recheck can mark the retained registration signalled. A signalled
+    /// selector which nevertheless remains pending is an invariant failure,
+    /// never a reason to mint another token or poll again.
+    pub fn resume_wait(
+        &mut self,
+        registration: NativeAsyncWaitRegistration,
+    ) -> Result<NativeAsyncPoll, NativeAsyncControlError> {
+        if !matches!(self.stage, InvocationStage::WaitBlocked) {
+            return Err(NativeAsyncControlError::NotWaiting);
+        }
+        let authority = registration.authority;
+        let Some(expected) = self.wait_token else {
+            return Ok(self.finish_trap(TrapCode::Validation));
+        };
+        if authority.wait != expected {
+            return Err(NativeAsyncControlError::InvalidWaitRegistration);
+        }
+        let Some(pending) = self.wait_wake.as_ref() else {
+            return Err(NativeAsyncControlError::InvalidWaitRegistration);
+        };
+        if pending.authority != authority {
+            return Err(NativeAsyncControlError::InvalidWaitRegistration);
+        }
+        if pending.wake.is_some() {
+            return Err(NativeAsyncControlError::WaitNotSignalled);
+        }
+        if self.wait_ticket.is_none()
+            || self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle
             || self.callback_pending
         {
             return Ok(self.finish_trap(TrapCode::Validation));
         }
 
-        // Consume the exact wake authority before doing state work. If the
-        // selector remains pending, `park_wait` mints a fresh authority.
+        // Consume both exact owner authorities and credit the fixed wake slot
+        // before doing state work. Every failure below is fail-stop, so no
+        // signalled registration can be replayed.
+        if self.clear_wait_wake_registration().is_err() {
+            return Ok(self.finish_trap(TrapCode::Validation));
+        }
         self.wait_token = None;
         if !self.charge_wait_state_work() {
             return Ok(self.finish_trap(TrapCode::FuelExhausted));
@@ -2155,23 +2301,68 @@ impl NativeAsyncInvocation<'_> {
             self.component.state.resume_callback_wait(ticket)
         };
         match resumed {
-            Ok(WaitResume::Pending) => {
-                let token = match self.mint_wait_token() {
-                    Ok(token) => token,
-                    Err(trap) => return Ok(self.finish_trap(trap)),
-                };
-                self.wait_token = Some(token);
-                Ok(NativeAsyncPoll::WaitPending {
-                    token,
-                    metrics: self.metrics(),
-                })
-            }
+            Ok(WaitResume::Pending) => Ok(self.finish_trap(TrapCode::Validation)),
             Ok(WaitResume::Ready(lease)) => {
                 self.wait_ticket = None;
                 Ok(self.handle_wait_event(lease))
             }
             Err(error) => Ok(self.finish_trap(map_callback_wait_resume_error(error))),
         }
+    }
+
+    /// Selects a wake only after the retained exact wait ticket reports
+    /// readiness. Taking the envelope is the linearization point: `None` in a
+    /// live `PendingWaitWake` means signalled, not unregistered.
+    fn take_registered_wait_wake_if_ready(
+        &mut self,
+    ) -> Result<Option<HostWakeToken>, NativeAsyncControlError> {
+        let Some(pending) = self.wait_wake.as_ref() else {
+            return Ok(None);
+        };
+        if pending.wake.is_none() {
+            return Ok(None);
+        }
+        if self.wait_token != Some(pending.authority.wait) {
+            return Err(NativeAsyncControlError::Invariant);
+        }
+        let ticket = self
+            .wait_ticket
+            .as_ref()
+            .ok_or(NativeAsyncControlError::Invariant)?;
+        let ready = self
+            .component
+            .state
+            .callback_wait_ready(ticket)
+            .map_err(|_| NativeAsyncControlError::Invariant)?;
+        if !ready {
+            return Ok(None);
+        }
+        Ok(self
+            .wait_wake
+            .as_mut()
+            .ok_or(NativeAsyncControlError::Invariant)?
+            .wake
+            .take())
+    }
+
+    fn dispatch_registered_wait_wake_if_ready(&mut self) -> Result<bool, NativeAsyncControlError> {
+        let wake = self.take_registered_wait_wake_if_ready()?;
+        let signalled = wake.is_some();
+        if let Some(wake) = wake {
+            wake.wake();
+        }
+        Ok(signalled)
+    }
+
+    fn clear_wait_wake_registration(&mut self) -> Result<(), TrapCode> {
+        if self.wait_wake.take().is_none() {
+            return Ok(());
+        }
+        if self.component.wait_wake_registrations != 1 {
+            return Err(TrapCode::Validation);
+        }
+        self.component.wait_wake_registrations = 0;
+        Ok(())
     }
 
     fn binding(&self) -> &RuntimeExport {
@@ -2182,9 +2373,14 @@ impl NativeAsyncInvocation<'_> {
         let Some(token) = self.wait_token else {
             return self.finish_trap(TrapCode::Validation);
         };
+        let wake_is_exact = self
+            .wait_wake
+            .as_ref()
+            .is_none_or(|wake| wake.authority.wait == token);
         if self.wait_ticket.is_none()
             || self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle
             || self.callback_pending
+            || !wake_is_exact
         {
             return self.finish_trap(TrapCode::Validation);
         }
@@ -3486,6 +3682,8 @@ impl NativeAsyncInvocation<'_> {
                     || self.callback_pending
                     || self.wait_ticket.is_some()
                     || self.wait_token.is_some()
+                    || self.wait_wake.is_some()
+                    || self.component.wait_wake_registrations != 0
                 {
                     return self.finish_trap(TrapCode::Validation);
                 }
@@ -3504,6 +3702,8 @@ impl NativeAsyncInvocation<'_> {
                     || self.callback_pending
                     || self.wait_ticket.is_some()
                     || self.wait_token.is_some()
+                    || self.wait_wake.is_some()
+                    || self.component.wait_wake_registrations != 0
                 {
                     return self.finish_trap(TrapCode::Validation);
                 }
@@ -3525,6 +3725,8 @@ impl NativeAsyncInvocation<'_> {
             || self.callback_pending
             || self.wait_ticket.is_some()
             || self.wait_token.is_some()
+            || self.wait_wake.is_some()
+            || self.component.wait_wake_registrations != 0
         {
             return self.finish_trap(TrapCode::Validation);
         }
@@ -3547,7 +3749,11 @@ impl NativeAsyncInvocation<'_> {
     }
 
     fn park_wait(&mut self, ticket: WaitTicket) -> NativeAsyncPoll {
-        if self.wait_ticket.is_some() || self.wait_token.is_some() {
+        if self.wait_ticket.is_some()
+            || self.wait_token.is_some()
+            || self.wait_wake.is_some()
+            || self.component.wait_wake_registrations != 0
+        {
             return self.finish_trap(TrapCode::Validation);
         }
         self.wait_ticket = Some(ticket);
@@ -3577,6 +3783,9 @@ impl NativeAsyncInvocation<'_> {
     }
 
     fn handle_wait_event(&mut self, mut lease: EventLease) -> NativeAsyncPoll {
+        if self.wait_wake.is_some() || self.component.wait_wake_registrations != 0 {
+            return self.finish_trap(TrapCode::Validation);
+        }
         self.wait_token = None;
         match lease.state() {
             EventLeaseState::TaskCancelled => {
@@ -3707,7 +3916,7 @@ impl NativeAsyncInvocation<'_> {
         true
     }
 
-    fn finish_trap(&mut self, trap: TrapCode) -> NativeAsyncPoll {
+    fn finish_trap(&mut self, mut trap: TrapCode) -> NativeAsyncPoll {
         if self.stage == InvocationStage::Cleanup {
             let trap = self.pending_trap.unwrap_or(trap);
             return NativeAsyncPoll::CleanupPending {
@@ -3720,6 +3929,9 @@ impl NativeAsyncInvocation<'_> {
         // invocation ledger and paid only by the following public poll.
         self.component.poisoned = true;
         self.host_token = None;
+        if self.clear_wait_wake_registration().is_err() {
+            trap = TrapCode::Validation;
+        }
         self.wait_token = None;
         self.deferred_core = None;
         self.pending_trap = Some(trap);
@@ -3753,6 +3965,7 @@ impl NativeAsyncInvocation<'_> {
         // authority. No cleanup error may make this Component reusable.
         self.component.poisoned = true;
         self.host_token = None;
+        let _ = self.clear_wait_wake_registration();
         self.deferred_core = None;
         // A reusable call's storage can only be recovered with its exact slot
         // authority. Recover every active slot before the principal-wide
@@ -3861,7 +4074,33 @@ mod tests {
         decode::inspect_component_for_profile,
     };
     use alloc::format;
+    use core::sync::atomic::{AtomicU64, Ordering};
     use vibeos_wasm_runtime::CoreHostCall;
+
+    static WAIT_WAKE_COUNTS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
+
+    fn wait_wake_index(mask: u64) -> usize {
+        assert!(mask.is_power_of_two());
+        mask.trailing_zeros() as usize
+    }
+
+    fn record_wait_wake(words: [usize; 4]) {
+        let mask = words[0] as u64;
+        WAIT_WAKE_COUNTS[wait_wake_index(mask)].fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn test_wait_wake(mask: u64) -> HostWakeToken {
+        WAIT_WAKE_COUNTS[wait_wake_index(mask)].store(0, Ordering::SeqCst);
+        HostWakeToken::new([mask as usize, 0, 0, 0], record_wait_wake)
+    }
+
+    fn wait_wake_seen(mask: u64) -> bool {
+        wait_wake_count(mask) != 0
+    }
+
+    fn wait_wake_count(mask: u64) -> u64 {
+        WAIT_WAKE_COUNTS[wait_wake_index(mask)].load(Ordering::SeqCst)
+    }
 
     const SMOKE: &str = include_str!(
         "../../component-format/tests/corpus/component/native-async-smoke-0.255.0.component.wat"
@@ -9016,7 +9255,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_wait_resume_charges_once_rotates_and_rejects_stale_or_foreign_tokens() {
+    fn exact_wait_registration_signals_once_charges_once_and_rejects_stale_or_foreign() {
         let source = wait_component(false, cancellation_exit_callback());
         let mut component = instantiate_with_resource_limit(&source, 8).unwrap();
         let mut foreign_component = instantiate_with_resource_limit(&source, 8).unwrap();
@@ -9028,38 +9267,30 @@ mod tests {
         let (foreign, _) = poll_to_wait(&mut foreign_call);
         assert_ne!(token, foreign);
 
-        assert_eq!(
-            call.resume_wait(foreign),
+        assert!(matches!(
+            call.register_wait_wake(foreign, test_wait_wake(1 << 0)),
             Err(NativeAsyncControlError::InvalidWaitToken)
-        );
+        ));
         assert_eq!(call.metrics(), blocked_metrics);
-        let NativeAsyncPoll::WaitPending {
-            token: rotated,
-            metrics: resumed_metrics,
-        } = call.resume_wait(token).unwrap()
-        else {
-            panic!("empty wait must remain blocked")
-        };
-        assert_ne!(rotated, token);
-        assert_eq!(
-            blocked_metrics.remaining_work - resumed_metrics.remaining_work,
-            wait_work
-        );
-        assert_eq!(
-            resumed_metrics.consumed_work - blocked_metrics.consumed_work,
-            wait_work
-        );
-
-        assert_eq!(
-            call.resume_wait(token),
-            Err(NativeAsyncControlError::InvalidWaitToken)
-        );
-        assert_eq!(call.metrics(), resumed_metrics);
+        let wake_mask = 1 << 1;
+        let registration = call
+            .register_wait_wake(token, test_wait_wake(wake_mask))
+            .unwrap();
+        let replay_authority = registration.authority;
+        assert!(!wait_wake_seen(wake_mask));
+        assert!(matches!(
+            call.register_wait_wake(token, test_wait_wake(1 << 2)),
+            Err(NativeAsyncControlError::InvalidWaitRegistration)
+        ));
+        let wake_metrics = call.component.storage_metrics().wait_wake_registrations;
+        assert_eq!(wake_metrics.current, 1);
+        assert_eq!(wake_metrics.peak, 1);
+        assert_eq!(wake_metrics.limit, 1);
         assert_eq!(
             call.poll(),
             NativeAsyncPoll::WaitPending {
-                token: rotated,
-                metrics: resumed_metrics,
+                token,
+                metrics: blocked_metrics,
             }
         );
 
@@ -9067,28 +9298,48 @@ mod tests {
             call.request_cancel(),
             Ok(NativeAsyncCancelOutcome::Requested)
         );
+        assert!(wait_wake_seen(wake_mask));
+        assert_eq!(wait_wake_count(wake_mask), 1);
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::Requested)
+        );
+        assert_eq!(wait_wake_count(wake_mask), 1);
         assert_eq!(
             call.poll(),
             NativeAsyncPoll::WaitPending {
-                token: rotated,
-                metrics: resumed_metrics,
+                token,
+                metrics: blocked_metrics,
             }
         );
         assert_eq!(call.task_info().cancel, TaskCancelState::Requested);
         let before_cancel_resume = call.metrics();
         assert!(matches!(
-            call.resume_wait(rotated),
+            call.resume_wait(registration),
             Ok(NativeAsyncPoll::Pending(_))
         ));
         assert_eq!(
             before_cancel_resume.remaining_work - call.metrics().remaining_work,
             wait_work
         );
-        assert_eq!(call.task_info().cancel, TaskCancelState::Delivered);
         assert_eq!(
-            call.resume_wait(rotated),
-            Err(NativeAsyncControlError::NotWaiting)
+            call.metrics().consumed_work - before_cancel_resume.consumed_work,
+            wait_work
         );
+        assert_eq!(
+            call.component
+                .storage_metrics()
+                .wait_wake_registrations
+                .current,
+            0
+        );
+        assert_eq!(call.task_info().cancel, TaskCancelState::Delivered);
+        assert!(matches!(
+            call.resume_wait(NativeAsyncWaitRegistration {
+                authority: replay_authority,
+            }),
+            Err(NativeAsyncControlError::NotWaiting)
+        ));
         finish_cancelled_wait_callback(&mut call);
         assert_eq!(
             call.component.callback_slots[call.export].state(),
@@ -9096,18 +9347,94 @@ mod tests {
         );
         assert!(call.wait_ticket.is_none());
         assert!(call.wait_token.is_none());
+        assert!(call.wait_wake.is_none());
         assert!(!call.component.is_poisoned());
-        let old_invocation_token = rotated;
+        let old_invocation_token = token;
         drop(call);
 
         let mut next_call = component.start("run", WORK, QUANTUM).unwrap();
         let (next_token, next_metrics) = poll_to_wait(&mut next_call);
         assert_ne!(next_token, old_invocation_token);
-        assert_eq!(
-            next_call.resume_wait(old_invocation_token),
-            Err(NativeAsyncControlError::InvalidWaitToken)
-        );
+        assert!(matches!(
+            next_call.resume_wait(NativeAsyncWaitRegistration {
+                authority: replay_authority,
+            }),
+            Err(NativeAsyncControlError::InvalidWaitRegistration)
+        ));
         assert_eq!(next_call.metrics(), next_metrics);
+    }
+
+    #[test]
+    fn wait_signal_before_registration_is_rechecked_and_woken_immediately() {
+        let source = wait_component(false, cancellation_exit_callback());
+        let mut component = instantiate(&source);
+        let mut call = component.start("run", WORK, QUANTUM).unwrap();
+        let (token, blocked) = poll_to_wait(&mut call);
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::Requested)
+        );
+        let mask = 1 << 3;
+        let registration = call
+            .register_wait_wake(token, test_wait_wake(mask))
+            .unwrap();
+        assert!(wait_wake_seen(mask));
+        assert_eq!(wait_wake_count(mask), 1);
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::Requested)
+        );
+        assert_eq!(wait_wake_count(mask), 1);
+        assert_eq!(call.metrics(), blocked);
+        assert!(matches!(
+            call.resume_wait(registration),
+            Ok(NativeAsyncPoll::Pending(_))
+        ));
+        finish_cancelled_wait_callback(&mut call);
+        assert!(!call.component.is_poisoned());
+    }
+
+    #[test]
+    fn copied_host_wake_cannot_authorize_an_unsignalled_runtime_registration() {
+        let source = wait_component(false, cancellation_exit_callback());
+        let mut component = instantiate(&source);
+        {
+            let mut call = component.start("run", WORK, QUANTUM).unwrap();
+            let (token, blocked) = poll_to_wait(&mut call);
+            let mask = 1 << 4;
+            let wake = test_wait_wake(mask);
+            let copied = wake;
+            let registration = call.register_wait_wake(token, wake).unwrap();
+            copied.wake();
+            assert!(wait_wake_seen(mask));
+            assert_eq!(wait_wake_count(mask), 1);
+            assert_eq!(call.dispatch_registered_wait_wake_if_ready(), Ok(false));
+            assert_eq!(wait_wake_count(mask), 1);
+            assert!(matches!(
+                call.resume_wait(registration),
+                Err(NativeAsyncControlError::WaitNotSignalled)
+            ));
+            assert_eq!(call.metrics(), blocked);
+            assert_eq!(
+                call.poll(),
+                NativeAsyncPoll::WaitPending {
+                    token,
+                    metrics: blocked,
+                }
+            );
+            assert_eq!(
+                call.component
+                    .storage_metrics()
+                    .wait_wake_registrations
+                    .current,
+                1
+            );
+        }
+        assert!(component.is_poisoned());
+        assert_eq!(
+            component.storage_metrics().wait_wake_registrations.current,
+            0
+        );
     }
 
     #[test]
@@ -9150,7 +9477,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_tasks_can_wait_but_owner_cancellation_is_too_late() {
+    fn resolved_tasks_park_without_spin_and_too_late_cancellation_never_signals() {
         let source = wait_component(
             true,
             "    (func (export \"callback\") (param i32 i32 i32) (result i32)\n      i32.const 0)",
@@ -9160,19 +9487,15 @@ mod tests {
         let (token, metrics) = poll_to_wait(&mut call);
         assert_eq!(call.task_info().result, TaskResultState::Resolved);
         assert_eq!(call.request_cancel(), Ok(NativeAsyncCancelOutcome::TooLate));
-        let NativeAsyncPoll::WaitPending {
-            token: rotated,
-            metrics: resumed,
-        } = call.resume_wait(token).unwrap()
-        else {
-            panic!("resolved empty wait must remain pending")
-        };
-        assert_ne!(rotated, token);
-        assert_eq!(
-            metrics.remaining_work - resumed.remaining_work,
-            WAIT_STATE_WORK
-        );
+        let mask = 1 << 5;
+        let _registration = call
+            .register_wait_wake(token, test_wait_wake(mask))
+            .unwrap();
         assert_eq!(call.request_cancel(), Ok(NativeAsyncCancelOutcome::TooLate));
+        assert!(!wait_wake_seen(mask));
+        for _ in 0..3 {
+            assert_eq!(call.poll(), NativeAsyncPoll::WaitPending { token, metrics });
+        }
         assert!(call.task_info().waiting);
     }
 
@@ -9240,9 +9563,20 @@ mod tests {
         for trap in [false, true] {
             let source = wait_component(false, cancellation_exit_callback());
             let mut component = instantiate(&source);
+            let wake_mask = if trap { 1 << 10 } else { 1 << 11 };
             let (task, set) = {
                 let mut call = component.start("run", WORK, QUANTUM).unwrap();
-                let _ = poll_to_wait(&mut call);
+                let (token, _) = poll_to_wait(&mut call);
+                let _registration = call
+                    .register_wait_wake(token, test_wait_wake(wake_mask))
+                    .unwrap();
+                assert_eq!(
+                    call.component
+                        .storage_metrics()
+                        .wait_wake_registrations
+                        .current,
+                    1
+                );
                 let set = call.component.state.resolve_guest_waitable_set(1).unwrap();
                 let task = call.task;
                 if trap {
@@ -9257,6 +9591,11 @@ mod tests {
                 (task, set)
             };
             assert!(component.is_poisoned());
+            assert!(!wait_wake_seen(wake_mask));
+            assert_eq!(
+                component.storage_metrics().wait_wake_registrations.current,
+                0
+            );
             assert!(!component.modules.any_active_call());
             assert_eq!(component.callback_slots[0].state(), CoreCallSlotState::Idle);
             assert_eq!(
@@ -9273,6 +9612,10 @@ mod tests {
         let mut component = instantiate(&source);
         let mut call = component.start("run", WORK, QUANTUM).unwrap();
         let (token, blocked) = poll_to_wait(&mut call);
+        let wake_mask = 1 << 6;
+        let registration = call
+            .register_wait_wake(token, test_wait_wake(wake_mask))
+            .unwrap();
         let set = call.component.state.resolve_guest_waitable_set(1).unwrap();
         let value_type = AsyncValueTypeId::new(99).unwrap();
         let pair = call.component.state.create_stream_pair(value_type).unwrap();
@@ -9299,8 +9642,13 @@ mod tests {
             ),
             Ok(CopyBegin::Ready(_))
         ));
+        assert_eq!(call.dispatch_registered_wait_wake_if_ready(), Ok(true));
+        assert!(wait_wake_seen(wake_mask));
+        assert_eq!(wait_wake_count(wake_mask), 1);
+        assert_eq!(call.dispatch_registered_wait_wake_if_ready(), Ok(false));
+        assert_eq!(wait_wake_count(wake_mask), 1);
 
-        let pending = call.resume_wait(token).unwrap();
+        let pending = call.resume_wait(registration).unwrap();
         let after_failure = call.metrics();
         assert_eq!(
             blocked.remaining_work - after_failure.remaining_work,
@@ -9395,12 +9743,15 @@ mod tests {
         let set = call.component.state.resolve_guest_waitable_set(1).unwrap();
         let task = call.task;
         call.remaining_work = call.cleanup_reserve + WAIT_STATE_WORK;
+        let registration = call
+            .register_wait_wake(token, test_wait_wake(1 << 7))
+            .unwrap();
         assert_eq!(
             call.request_cancel(),
             Ok(NativeAsyncCancelOutcome::Requested)
         );
         let before = call.metrics();
-        let pending = call.resume_wait(token).unwrap();
+        let pending = call.resume_wait(registration).unwrap();
         assert_eq!(call.metrics(), before);
         assert_eq!(
             finish_cleanup_turn(&mut call, pending),
@@ -9423,6 +9774,13 @@ mod tests {
         let mut component = instantiate(&source);
         let mut call = component.start("run", WORK, QUANTUM).unwrap();
         let (token, _) = poll_to_wait(&mut call);
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::Requested)
+        );
+        let registration = call
+            .register_wait_wake(token, test_wait_wake(1 << 8))
+            .unwrap();
         let inputs = [CoreValue::I32(0), CoreValue::I32(0), CoreValue::I32(0)];
         let (modules, exports, slots) = (
             &mut call.component.modules,
@@ -9442,7 +9800,7 @@ mod tests {
             .unwrap();
         assert_eq!(slots[call.export].state(), CoreCallSlotState::Active);
         let before = call.metrics();
-        let pending = call.resume_wait(token).unwrap();
+        let pending = call.resume_wait(registration).unwrap();
         assert_eq!(call.metrics(), before);
         assert_eq!(
             finish_cleanup_turn(&mut call, pending),
@@ -9462,9 +9820,16 @@ mod tests {
         let mut component = instantiate(&source);
         let mut call = component.start("run", WORK, QUANTUM).unwrap();
         let (token, _) = poll_to_wait(&mut call);
+        let registration = call
+            .register_wait_wake(token, test_wait_wake(1 << 9))
+            .unwrap();
+        assert_eq!(
+            call.request_cancel(),
+            Ok(NativeAsyncCancelOutcome::Requested)
+        );
         call.wait_token = None;
         let before = call.metrics();
-        let pending = call.resume_wait(token).unwrap();
+        let pending = call.resume_wait(registration).unwrap();
         assert_eq!(call.metrics(), before);
         assert_eq!(
             finish_cleanup_turn(&mut call, pending),

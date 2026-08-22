@@ -12,6 +12,18 @@ pub(crate) trait ExactRuntimeToken: Copy + Eq {
     fn strictly_after(self, previous: Self) -> bool;
 }
 
+/// Orders an irreversible backend cancellation before the exact aggregate
+/// receipt which credits its copied wake authority. A failed external cancel
+/// never calls `release`; a failed release remains fail-stop after the
+/// physical operation has already disappeared.
+pub(crate) fn exact_backend_cancel_then_release<E>(
+    cancel: impl FnOnce() -> Result<(), E>,
+    release: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    cancel()?;
+    release()
+}
+
 /// Bytes already popped from the backend but not yet committed to the guest.
 /// Input and output intentionally never alias the same fixed storage.
 pub(crate) struct InputSpill {
@@ -1919,10 +1931,13 @@ impl<
             return Err(ExactLedgerError::ResourceRevoking);
         }
         let continuation_complete = match claim.cause {
-            ExactCancelCause::Revoke => matches!(
-                continuation,
-                ExactContinuation::None | ExactContinuation::Consumed(_)
-            ),
+            ExactCancelCause::Revoke => {
+                matches!(
+                    continuation,
+                    ExactContinuation::None | ExactContinuation::Consumed(_)
+                ) || (matches!(continuation, ExactContinuation::Cancelled(_))
+                    && runtime_cleanup == Some(ExactRuntimeCleanup::Dropped))
+            }
             ExactCancelCause::RawFault => matches!(
                 continuation,
                 ExactContinuation::None
@@ -1964,25 +1979,55 @@ impl<
         else {
             return self.reject(ExactLedgerError::InvalidTransition);
         };
-        let current = match continuation {
-            ExactContinuation::Armed(current) | ExactContinuation::WakeRegistered(current) => {
-                current
-            }
-            _ => return self.reject(ExactLedgerError::InvalidTransition),
+        let Some(current) = continuation.token() else {
+            return self.reject(ExactLedgerError::InvalidTransition);
         };
         if current != token {
             return self.reject(ExactLedgerError::SnapshotMismatch);
         }
         let disposition_exact = match claim.cause {
-            ExactCancelCause::Revoke => matches!(
-                cleanup,
-                ExactContinuationCleanup::Signalled | ExactContinuationCleanup::AlreadySignalled
-            ),
+            ExactCancelCause::Revoke => {
+                matches!(
+                    cleanup,
+                    ExactContinuationCleanup::Signalled
+                        | ExactContinuationCleanup::AlreadySignalled
+                ) || (cleanup == ExactContinuationCleanup::Cancelled
+                    && self.runtime_owner == RuntimeOwner::Dropped
+                    && matches!(
+                        self.resources[invocation.resource.index()],
+                        ResourceLatch::Revoked(current) if current == claim
+                    ))
+            }
             ExactCancelCause::RawFault => cleanup == ExactContinuationCleanup::Abandoned,
             ExactCancelCause::FaultFinalizer => cleanup == ExactContinuationCleanup::Cancelled,
             ExactCancelCause::BackendResidual => false,
         };
         if !disposition_exact {
+            return self.reject(ExactLedgerError::InvalidTransition);
+        }
+        let source_exact = match (claim.cause, cleanup) {
+            (ExactCancelCause::Revoke, ExactContinuationCleanup::Cancelled) => {
+                matches!(continuation, ExactContinuation::Signalled(_))
+            }
+            (
+                _,
+                ExactContinuationCleanup::Signalled
+                | ExactContinuationCleanup::AlreadySignalled
+                | ExactContinuationCleanup::Cancelled,
+            ) => matches!(
+                continuation,
+                ExactContinuation::Armed(_)
+                    | ExactContinuation::WakeRegistered(_)
+                    | ExactContinuation::Signalled(_)
+            ),
+            (_, ExactContinuationCleanup::Abandoned) => matches!(
+                continuation,
+                ExactContinuation::Armed(_)
+                    | ExactContinuation::WakeRegistered(_)
+                    | ExactContinuation::Consumed(_)
+            ),
+        };
+        if !source_exact {
             return self.reject(ExactLedgerError::InvalidTransition);
         }
         self.publish(
@@ -2024,6 +2069,11 @@ impl<
                 ExactRuntimeCleanup::Cancelled,
                 ExactContinuation::None | ExactContinuation::Consumed(_),
             ) if self.runtime_owner == RuntimeOwner::Live => (continuation, true),
+            (
+                ExactCancelCause::Revoke,
+                ExactRuntimeCleanup::Dropped,
+                ExactContinuation::Cancelled(_),
+            ) if self.runtime_owner == RuntimeOwner::Dropped => (continuation, true),
             (
                 ExactCancelCause::RawFault,
                 ExactRuntimeCleanup::Abandoned,
@@ -2082,6 +2132,66 @@ impl<
             ExactOperation::BackendCancelled {
                 invocation,
                 continuation: ExactContinuation::Consumed(token),
+                claim,
+                runtime_cleanup,
+            },
+        )
+    }
+
+    /// Takes over a revoke whose physical backend cancellation and Core wake
+    /// publication both completed before the runtime owner faulted.
+    ///
+    /// `Armed` and `WakeRegistered` are deliberately excluded: either can
+    /// still overlap the worker which publishes the revoke signal. Only an
+    /// exact `Signalled` or already `Consumed` snapshot with the matching
+    /// revoked resource latch proves that no backend mutation remains.
+    pub(crate) fn abandon_completed_revoke_raw_fault(
+        &mut self,
+        previous: ExactLedgerSnapshot<I, T, D, B, R, O, C>,
+    ) -> Result<ExactLedgerSnapshot<I, T, D, B, R, O, C>, ExactLedgerError> {
+        self.require_snapshot(previous)?;
+        self.require_runtime_owner_live()?;
+        let ExactOperation::BackendCancelled {
+            invocation,
+            continuation,
+            claim,
+            runtime_cleanup,
+        } = previous.operation
+        else {
+            return self.reject(ExactLedgerError::InvalidTransition);
+        };
+        if claim.cause != ExactCancelCause::Revoke
+            || !matches!(
+                self.resources[invocation.resource.index()],
+                ResourceLatch::Revoked(current) if current == claim
+            )
+        {
+            return self.reject(ExactLedgerError::ClaimMismatch);
+        }
+        let (continuation, runtime_cleanup) = match (continuation, runtime_cleanup) {
+            (ExactContinuation::Signalled(token), None) => (
+                ExactContinuation::Abandoned(token),
+                Some(ExactRuntimeCleanup::Abandoned),
+            ),
+            (ExactContinuation::Consumed(token), None) => (
+                ExactContinuation::Consumed(token),
+                Some(ExactRuntimeCleanup::Abandoned),
+            ),
+            // The live driver may already have acknowledged cancellation
+            // after consuming Core's signal. Raw fault merely takes over the
+            // owner; the exact Cancelled cleanup evidence stays intact.
+            (ExactContinuation::Consumed(token), Some(ExactRuntimeCleanup::Cancelled)) => (
+                ExactContinuation::Consumed(token),
+                Some(ExactRuntimeCleanup::Cancelled),
+            ),
+            _ => return self.reject(ExactLedgerError::ContinuationPending),
+        };
+        self.runtime_owner = RuntimeOwner::Abandoned;
+        self.publish(
+            previous.identity,
+            ExactOperation::BackendCancelled {
+                invocation,
+                continuation,
                 claim,
                 runtime_cleanup,
             },
@@ -2263,6 +2373,29 @@ impl<
                 if !success
                     && (cause == ExactCancelCause::RawFault
                         || self.runtime_owner == RuntimeOwner::Dropped) =>
+            {
+                self.record_runtime_consumed(invocation)?;
+                self.operation = None;
+                self.input_spill = None;
+                Ok(ExactCleanupDecision::ReclaimSafe)
+            }
+            ExactOperation::BackendCancelled {
+                invocation,
+                continuation,
+                claim,
+                runtime_cleanup: Some(ExactRuntimeCleanup::Abandoned),
+            } if !success
+                && cause == ExactCancelCause::RawFault
+                && self.runtime_owner == RuntimeOwner::Abandoned
+                && claim.cause == ExactCancelCause::Revoke
+                && matches!(
+                    self.resources[invocation.resource.index()],
+                    ResourceLatch::Revoked(current) if current == claim
+                )
+                && matches!(
+                    continuation,
+                    ExactContinuation::Consumed(_) | ExactContinuation::Abandoned(_)
+                ) =>
             {
                 self.record_runtime_consumed(invocation)?;
                 self.operation = None;
@@ -2531,9 +2664,932 @@ impl<
     }
 }
 
+/// Aggregate number of cross-turn native authorities allowed for one stable
+/// CONTROL incarnation.
+///
+/// Four entries are permanently reserved for the stdin/stdout endpoint and
+/// supervisor capabilities while an incarnation is live. The other four
+/// entries cover the largest legal pending branch: an input-spill receipt, a
+/// backend or runtime-selector reservation, one scheduler continuation, and
+/// its matching wake registration.
+pub(crate) const EXACT_NATIVE_LEASE_LIMIT: u8 = 8;
+
+const LEASE_STDIN_READER: u16 = 1 << 0;
+const LEASE_STDOUT_WRITER: u16 = 1 << 1;
+const LEASE_STDIN_SUPERVISOR: u16 = 1 << 2;
+const LEASE_STDOUT_SUPERVISOR: u16 = 1 << 3;
+const LEASE_STREAM_CAPS: u16 =
+    LEASE_STDIN_READER | LEASE_STDOUT_WRITER | LEASE_STDIN_SUPERVISOR | LEASE_STDOUT_SUPERVISOR;
+const LEASE_INPUT_SPILL: u16 = 1 << 4;
+const LEASE_BACKEND_OPERATION: u16 = 1 << 5;
+const LEASE_STREAM_WAKE: u16 = 1 << 6;
+const LEASE_SCHEDULER_CONTINUATION: u16 = 1 << 7;
+const LEASE_RUNTIME_SELECTOR_WAIT: u16 = 1 << 8;
+const LEASE_RUNTIME_WAKE: u16 = 1 << 9;
+const LEASE_TRANSIENTS: u16 = LEASE_INPUT_SPILL
+    | LEASE_BACKEND_OPERATION
+    | LEASE_STREAM_WAKE
+    | LEASE_SCHEDULER_CONTINUATION
+    | LEASE_RUNTIME_SELECTOR_WAIT
+    | LEASE_RUNTIME_WAKE;
+
+const fn stream_cap_lease(resource: ExactStreamResource) -> u16 {
+    match resource {
+        ExactStreamResource::StdinReader => LEASE_STDIN_READER,
+        ExactStreamResource::StdoutWriter => LEASE_STDOUT_WRITER,
+        ExactStreamResource::StdinSupervisor => LEASE_STDIN_SUPERVISOR,
+        ExactStreamResource::StdoutSupervisor => LEASE_STDOUT_SUPERVISOR,
+    }
+}
+
+/// Redacted aggregate lease telemetry. It deliberately contains no CONTROL,
+/// task, CSpace, runtime-wait, or continuation identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExactNativeLeaseMetrics {
+    current: u8,
+    peak: u8,
+    limit: u8,
+}
+
+impl ExactNativeLeaseMetrics {
+    pub(crate) const fn current(self) -> u8 {
+        self.current
+    }
+
+    pub(crate) const fn peak(self) -> u8 {
+        self.peak
+    }
+
+    pub(crate) const fn limit(self) -> u8 {
+        self.limit
+    }
+}
+
+/// The two pending branches are deliberately exclusive. A backend call is
+/// driven by the synchronous host adapter; a runtime selector wait parks the
+/// component between runtime turns. Holding both would manufacture a ninth
+/// authority and make cancellation ownership ambiguous.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExactNativeLeaseBranch {
+    Quantum,
+    Backend,
+    RuntimeWait,
+}
+
+/// Redacted phase of an exact scheduler-continuation reservation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExactNativeLeaseContinuationPhase {
+    Reserved,
+    Bound,
+    WakeRegistered,
+    Signalled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExactNativePendingBranch<W> {
+    None,
+    Backend,
+    RuntimeWait(W),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExactNativeContinuationState<C> {
+    generation: u64,
+    branch: ExactNativeLeaseBranch,
+    phase: ExactNativeLeaseContinuationPhase,
+    token: Option<C>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExactNativeContinuationTombstone<C> {
+    branch: ExactNativeLeaseBranch,
+    token: C,
+}
+
+/// Copy-only exact receipt for the single continuation reservation. The
+/// private generation prevents an old same-valued Core token from replaying
+/// after the slot has completed and been reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExactNativeLeaseContinuationReceipt<I, T, D, B, C> {
+    identity: ExactInstanceIdentity<I, T, D, B>,
+    state: ExactNativeContinuationState<C>,
+}
+
+impl<I: Copy, T: Copy, D: Copy, B: Copy, C: Copy>
+    ExactNativeLeaseContinuationReceipt<I, T, D, B, C>
+{
+    pub(crate) const fn branch(self) -> ExactNativeLeaseBranch {
+        self.state.branch
+    }
+
+    pub(crate) const fn phase(self) -> ExactNativeLeaseContinuationPhase {
+        self.state.phase
+    }
+
+    pub(crate) const fn token(self) -> Option<C> {
+        self.state.token
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExactNativeLeaseError {
+    Busy,
+    StaleGeneration,
+    IdentityMismatch,
+    LimitExceeded,
+    CategoryAlreadyHeld,
+    CategoryVacant,
+    BranchConflict,
+    WaitTokenMismatch,
+    StaleReceipt,
+    ReceiptMismatch,
+    InvalidTransition,
+    GenerationExhausted,
+    Quarantined,
+}
+
+/// Allocation-free aggregate authority ledger for one stable CONTROL slot.
+///
+/// The operation ledger above proves the semantics of each stream action. This
+/// parallel ledger proves that the union of all authorities which survive a
+/// kernel turn never exceeds `R`, even when an input spill overlaps work on
+/// the opposite stream. Categories are individual bits, so every increment
+/// has exactly one matching decrement and failed admission cannot partially
+/// mutate the count.
+pub(crate) struct ExactNativeLeaseLedger<I, T, D, B, W, C> {
+    watermark: u64,
+    next_continuation: u64,
+    identity: Option<ExactInstanceIdentity<I, T, D, B>>,
+    held: u16,
+    peak: u8,
+    input_spill: Option<ExactInputSpillState>,
+    branch: ExactNativePendingBranch<W>,
+    continuation: Option<ExactNativeContinuationState<C>>,
+    continuation_tombstone: Option<ExactNativeContinuationTombstone<C>>,
+    quarantined: bool,
+}
+
+impl<I: Copy + Eq, T: Copy + Eq, D: Copy + Eq, B: Copy + Eq, W: Copy + Eq, C: Copy + Eq>
+    ExactNativeLeaseLedger<I, T, D, B, W, C>
+{
+    pub(crate) const fn new() -> Self {
+        Self {
+            watermark: 0,
+            next_continuation: 1,
+            identity: None,
+            held: 0,
+            peak: 0,
+            input_spill: None,
+            branch: ExactNativePendingBranch::None,
+            continuation: None,
+            continuation_tombstone: None,
+            quarantined: false,
+        }
+    }
+
+    /// Binds a strictly newer CONTROL incarnation and seeds its four exact
+    /// stream-capability authorities.
+    pub(crate) fn bind(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.check_live()?;
+        if identity.control_generation == 0 || identity.control_generation < self.watermark {
+            return Err(ExactNativeLeaseError::StaleGeneration);
+        }
+        if identity.control_generation == self.watermark {
+            return match self.identity {
+                None => Err(ExactNativeLeaseError::StaleGeneration),
+                Some(current) if current != identity => {
+                    self.reject(ExactNativeLeaseError::IdentityMismatch)
+                }
+                Some(_) => self.reject(ExactNativeLeaseError::Busy),
+            };
+        }
+        if self.identity.is_some() || self.held != 0 {
+            return self.reject(ExactNativeLeaseError::Busy);
+        }
+        self.watermark = identity.control_generation;
+        self.identity = Some(identity);
+        self.held = LEASE_STREAM_CAPS;
+        self.peak = LEASE_STREAM_CAPS.count_ones() as u8;
+        self.input_spill = None;
+        self.branch = ExactNativePendingBranch::None;
+        self.continuation = None;
+        self.continuation_tombstone = None;
+        Ok(())
+    }
+
+    pub(crate) const fn metrics(&self) -> ExactNativeLeaseMetrics {
+        ExactNativeLeaseMetrics {
+            current: self.held.count_ones() as u8,
+            peak: self.peak,
+            limit: EXACT_NATIVE_LEASE_LIMIT,
+        }
+    }
+
+    pub(crate) const fn is_quarantined(&self) -> bool {
+        self.quarantined
+    }
+
+    /// Sticky fail-stop projection used when the paired operation ledger
+    /// detects a same-incarnation invariant violation first.
+    pub(crate) fn quarantine(&mut self) {
+        self.quarantined = true;
+    }
+
+    /// Redacted residue check for target finalization hooks.
+    pub(crate) const fn is_retired(&self) -> bool {
+        self.identity.is_none() && self.held == 0
+    }
+
+    pub(crate) fn release_stream_cap(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+        resource: ExactStreamResource,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        self.release(stream_cap_lease(resource))
+    }
+
+    /// Drops any still-live base caps after all cross-turn work has been
+    /// reconciled. Already-revoked individual caps remain exact no-ops here.
+    pub(crate) fn reset_stream_caps(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+        revoked_capabilities: u8,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        if self.held & LEASE_TRANSIENTS != 0
+            || self.input_spill.is_some()
+            || self.branch != ExactNativePendingBranch::None
+            || self.continuation.is_some()
+        {
+            return self.reject(ExactNativeLeaseError::Busy);
+        }
+        if (self.held & LEASE_STREAM_CAPS).count_ones() as u8 != revoked_capabilities {
+            return self.reject(ExactNativeLeaseError::ReceiptMismatch);
+        }
+        self.held &= !LEASE_STREAM_CAPS;
+        Ok(())
+    }
+
+    pub(crate) fn retire(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        if self.held != 0
+            || self.input_spill.is_some()
+            || self.branch != ExactNativePendingBranch::None
+            || self.continuation.is_some()
+        {
+            return self.reject(ExactNativeLeaseError::Busy);
+        }
+        self.identity = None;
+        self.continuation_tombstone = None;
+        Ok(())
+    }
+
+    /// Accounts the linear spill receipt created by the operation ledger.
+    /// Successor receipts rotate monotonically with the consuming runtime
+    /// invocation and advance their cursor independently.
+    pub(crate) fn begin_input_spill(
+        &mut self,
+        receipt: &ExactInputSpillReceipt<I, T, D, B>,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_identity(receipt.identity)?;
+        if self.input_spill.is_some()
+            || receipt.state.total == 0
+            || receipt.state.cursor >= receipt.state.total
+        {
+            return self.reject(ExactNativeLeaseError::InvalidTransition);
+        }
+        self.acquire(LEASE_INPUT_SPILL)?;
+        self.input_spill = Some(receipt.state);
+        Ok(())
+    }
+
+    pub(crate) fn update_input_spill(
+        &mut self,
+        receipt: &ExactInputSpillReceipt<I, T, D, B>,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_identity(receipt.identity)?;
+        let Some(previous) = self.input_spill else {
+            return self.reject(ExactNativeLeaseError::CategoryVacant);
+        };
+        if receipt.state.generation <= previous.generation
+            || receipt.state.total != previous.total
+            || receipt.state.cursor < previous.cursor
+            || receipt.state.cursor >= receipt.state.total
+        {
+            return self.reject(ExactNativeLeaseError::ReceiptMismatch);
+        }
+        self.input_spill = Some(receipt.state);
+        Ok(())
+    }
+
+    pub(crate) fn finish_input_spill(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        if self.input_spill.is_none() {
+            return self.reject(ExactNativeLeaseError::CategoryVacant);
+        }
+        self.release(LEASE_INPUT_SPILL)?;
+        self.input_spill = None;
+        Ok(())
+    }
+
+    pub(crate) fn has_input_spill(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<bool, ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        Ok(self.input_spill.is_some())
+    }
+
+    pub(crate) fn begin_backend(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        self.preflight_acquire(LEASE_BACKEND_OPERATION)?;
+        if self.branch != ExactNativePendingBranch::None {
+            return self.reject(ExactNativeLeaseError::BranchConflict);
+        }
+        self.acquire_preflighted(LEASE_BACKEND_OPERATION);
+        self.branch = ExactNativePendingBranch::Backend;
+        Ok(())
+    }
+
+    pub(crate) fn finish_backend(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        if self.branch != ExactNativePendingBranch::Backend || self.continuation.is_some() {
+            return self.reject(ExactNativeLeaseError::InvalidTransition);
+        }
+        self.release(LEASE_BACKEND_OPERATION)?;
+        self.branch = ExactNativePendingBranch::None;
+        Ok(())
+    }
+
+    pub(crate) fn has_backend(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<bool, ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        Ok(self.branch == ExactNativePendingBranch::Backend)
+    }
+
+    pub(crate) fn begin_runtime_wait(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+        wait: W,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        self.preflight_acquire(LEASE_RUNTIME_SELECTOR_WAIT)?;
+        if self.branch != ExactNativePendingBranch::None {
+            return self.reject(ExactNativeLeaseError::BranchConflict);
+        }
+        self.acquire_preflighted(LEASE_RUNTIME_SELECTOR_WAIT);
+        self.branch = ExactNativePendingBranch::RuntimeWait(wait);
+        Ok(())
+    }
+
+    /// Rotates the exact runtime selector token after precisely one resume.
+    /// No count changes: the cross-turn selector authority remains live.
+    pub(crate) fn rotate_runtime_wait(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+        previous: W,
+        next: W,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        if self.continuation.is_some() {
+            return self.reject(ExactNativeLeaseError::InvalidTransition);
+        }
+        match self.branch {
+            ExactNativePendingBranch::RuntimeWait(current) if current == previous => {}
+            ExactNativePendingBranch::RuntimeWait(_) => {
+                return Err(ExactNativeLeaseError::WaitTokenMismatch)
+            }
+            _ => return self.reject(ExactNativeLeaseError::BranchConflict),
+        }
+        if next == previous {
+            return self.reject(ExactNativeLeaseError::InvalidTransition);
+        }
+        self.branch = ExactNativePendingBranch::RuntimeWait(next);
+        Ok(())
+    }
+
+    pub(crate) fn finish_runtime_wait(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+        wait: W,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        if self.continuation.is_some() {
+            return self.reject(ExactNativeLeaseError::InvalidTransition);
+        }
+        match self.branch {
+            ExactNativePendingBranch::RuntimeWait(current) if current == wait => {}
+            ExactNativePendingBranch::RuntimeWait(_) => {
+                return Err(ExactNativeLeaseError::WaitTokenMismatch)
+            }
+            _ => return self.reject(ExactNativeLeaseError::BranchConflict),
+        }
+        self.release(LEASE_RUNTIME_SELECTOR_WAIT)?;
+        self.branch = ExactNativePendingBranch::None;
+        Ok(())
+    }
+
+    /// Identity-gated exact selector token used only to drive teardown of the
+    /// matching runtime registration. It is never included in diagnostics.
+    pub(crate) fn runtime_wait(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<Option<W>, ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        Ok(match self.branch {
+            ExactNativePendingBranch::RuntimeWait(wait) => Some(wait),
+            ExactNativePendingBranch::None | ExactNativePendingBranch::Backend => None,
+        })
+    }
+
+    /// Exact terminal residue check. Base stream caps intentionally do not
+    /// participate because finalization validates and debits their separate
+    /// CSpace reset receipt afterwards.
+    pub(crate) fn terminal_empty(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<bool, ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        Ok(self.held & LEASE_TRANSIENTS == 0
+            && self.input_spill.is_none()
+            && self.branch == ExactNativePendingBranch::None
+            && self.continuation.is_none())
+    }
+
+    /// Reserves aggregate capacity before the adapter asks Core to arm its
+    /// sole continuation slot. If Core cannot arm, the returned receipt is
+    /// cancelled with [`Self::cancel_reserved_continuation`].
+    pub(crate) fn reserve_continuation(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<ExactNativeLeaseContinuationReceipt<I, T, D, B, C>, ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        let branch = match self.branch {
+            ExactNativePendingBranch::Backend => ExactNativeLeaseBranch::Backend,
+            ExactNativePendingBranch::RuntimeWait(_) => ExactNativeLeaseBranch::RuntimeWait,
+            ExactNativePendingBranch::None => {
+                return self.reject(ExactNativeLeaseError::BranchConflict)
+            }
+        };
+        self.reserve_continuation_inner(identity, branch)
+    }
+
+    /// Reserves the ordinary scheduler-yield continuation before Core is
+    /// called. Quantum continuations have no host wake registration and their
+    /// exact bound receipt is consumed directly when the scheduler runs the
+    /// task again. They retain, rather than replace, any backend or runtime-wait
+    /// branch whose bounded cleanup turn requested the yield.
+    pub(crate) fn reserve_quantum_continuation(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<ExactNativeLeaseContinuationReceipt<I, T, D, B, C>, ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        self.reserve_continuation_inner(identity, ExactNativeLeaseBranch::Quantum)
+    }
+
+    fn reserve_continuation_inner(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+        branch: ExactNativeLeaseBranch,
+    ) -> Result<ExactNativeLeaseContinuationReceipt<I, T, D, B, C>, ExactNativeLeaseError> {
+        self.preflight_acquire(LEASE_SCHEDULER_CONTINUATION)?;
+        if self.continuation.is_some() {
+            return self.reject(ExactNativeLeaseError::CategoryAlreadyHeld);
+        }
+        let generation = self.next_continuation;
+        let Some(next) = generation.checked_add(1) else {
+            return self.reject(ExactNativeLeaseError::GenerationExhausted);
+        };
+        let state = ExactNativeContinuationState {
+            generation,
+            branch,
+            phase: ExactNativeLeaseContinuationPhase::Reserved,
+            token: None,
+        };
+        self.acquire_preflighted(LEASE_SCHEDULER_CONTINUATION);
+        self.next_continuation = next;
+        self.continuation = Some(state);
+        Ok(ExactNativeLeaseContinuationReceipt { identity, state })
+    }
+
+    pub(crate) fn bind_continuation(
+        &mut self,
+        previous: ExactNativeLeaseContinuationReceipt<I, T, D, B, C>,
+        token: C,
+    ) -> Result<ExactNativeLeaseContinuationReceipt<I, T, D, B, C>, ExactNativeLeaseError> {
+        self.require_continuation(previous)?;
+        if previous.state.phase != ExactNativeLeaseContinuationPhase::Reserved
+            || previous.state.token.is_some()
+        {
+            return self.reject(ExactNativeLeaseError::InvalidTransition);
+        }
+        let state = ExactNativeContinuationState {
+            phase: ExactNativeLeaseContinuationPhase::Bound,
+            token: Some(token),
+            ..previous.state
+        };
+        // Core has published a newer live operation, so an older terminal
+        // disposition can no longer describe its current continuation record.
+        self.continuation_tombstone = None;
+        self.continuation = Some(state);
+        Ok(ExactNativeLeaseContinuationReceipt {
+            identity: previous.identity,
+            state,
+        })
+    }
+
+    pub(crate) fn register_stream_wake(
+        &mut self,
+        previous: ExactNativeLeaseContinuationReceipt<I, T, D, B, C>,
+    ) -> Result<ExactNativeLeaseContinuationReceipt<I, T, D, B, C>, ExactNativeLeaseError> {
+        self.require_continuation(previous)?;
+        if previous.state.branch != ExactNativeLeaseBranch::Backend
+            || previous.state.phase != ExactNativeLeaseContinuationPhase::Bound
+            || self.branch != ExactNativePendingBranch::Backend
+        {
+            return self.reject(ExactNativeLeaseError::InvalidTransition);
+        }
+        self.register_wake(previous, LEASE_STREAM_WAKE)
+    }
+
+    pub(crate) fn register_runtime_wake(
+        &mut self,
+        previous: ExactNativeLeaseContinuationReceipt<I, T, D, B, C>,
+        wait: W,
+    ) -> Result<ExactNativeLeaseContinuationReceipt<I, T, D, B, C>, ExactNativeLeaseError> {
+        self.require_continuation(previous)?;
+        if previous.state.branch != ExactNativeLeaseBranch::RuntimeWait
+            || previous.state.phase != ExactNativeLeaseContinuationPhase::Bound
+        {
+            return self.reject(ExactNativeLeaseError::InvalidTransition);
+        }
+        match self.branch {
+            ExactNativePendingBranch::RuntimeWait(current) if current == wait => {}
+            ExactNativePendingBranch::RuntimeWait(_) => {
+                return Err(ExactNativeLeaseError::WaitTokenMismatch)
+            }
+            _ => return self.reject(ExactNativeLeaseError::BranchConflict),
+        }
+        self.register_wake(previous, LEASE_RUNTIME_WAKE)
+    }
+
+    /// Records a separately witnessed Core signal. Wake ownership is consumed
+    /// here, after the signal callback has returned and outside all ledger and
+    /// registry locks.
+    pub(crate) fn mark_signalled(
+        &mut self,
+        previous: ExactNativeLeaseContinuationReceipt<I, T, D, B, C>,
+        token: C,
+    ) -> Result<ExactNativeLeaseContinuationReceipt<I, T, D, B, C>, ExactNativeLeaseError> {
+        self.require_continuation(previous)?;
+        if previous.state.phase != ExactNativeLeaseContinuationPhase::WakeRegistered
+            || previous.state.token != Some(token)
+        {
+            return self.reject(ExactNativeLeaseError::ReceiptMismatch);
+        }
+        let Some(wake) = self.wake_bit(previous.state.branch) else {
+            return self.reject(ExactNativeLeaseError::InvalidTransition);
+        };
+        self.release(wake)?;
+        let state = ExactNativeContinuationState {
+            phase: ExactNativeLeaseContinuationPhase::Signalled,
+            ..previous.state
+        };
+        self.continuation = Some(state);
+        Ok(ExactNativeLeaseContinuationReceipt {
+            identity: previous.identity,
+            state,
+        })
+    }
+
+    /// Consumes Core's exact listener receipt. A wake which raced registration
+    /// may still be projected as `WakeRegistered`; in that case this single
+    /// transition debits both the wake and continuation authorities.
+    pub(crate) fn consume_continuation(
+        &mut self,
+        previous: ExactNativeLeaseContinuationReceipt<I, T, D, B, C>,
+        token: C,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_continuation(previous)?;
+        if previous.state.token != Some(token)
+            || !matches!(
+                previous.state.phase,
+                ExactNativeLeaseContinuationPhase::WakeRegistered
+                    | ExactNativeLeaseContinuationPhase::Signalled
+            )
+        {
+            return self.reject(ExactNativeLeaseError::ReceiptMismatch);
+        }
+        self.release_continuation(previous.state)?;
+        self.continuation_tombstone = Some(ExactNativeContinuationTombstone {
+            branch: previous.state.branch,
+            token,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn consume_quantum_continuation(
+        &mut self,
+        previous: ExactNativeLeaseContinuationReceipt<I, T, D, B, C>,
+        token: C,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_continuation(previous)?;
+        if previous.state.branch != ExactNativeLeaseBranch::Quantum
+            || previous.state.phase != ExactNativeLeaseContinuationPhase::Bound
+            || previous.state.token != Some(token)
+        {
+            return self.reject(ExactNativeLeaseError::ReceiptMismatch);
+        }
+        self.release_continuation(previous.state)?;
+        self.continuation_tombstone = Some(ExactNativeContinuationTombstone {
+            branch: previous.state.branch,
+            token,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn cancel_reserved_continuation(
+        &mut self,
+        previous: ExactNativeLeaseContinuationReceipt<I, T, D, B, C>,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_continuation(previous)?;
+        if previous.state.phase != ExactNativeLeaseContinuationPhase::Reserved {
+            return self.reject(ExactNativeLeaseError::InvalidTransition);
+        }
+        self.release_continuation(previous.state)
+    }
+
+    /// Exact normal-drop cancellation after Core has armed the token.
+    pub(crate) fn drop_cancelled_continuation(
+        &mut self,
+        previous: ExactNativeLeaseContinuationReceipt<I, T, D, B, C>,
+        token: C,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_continuation(previous)?;
+        if previous.state.token != Some(token)
+            || !matches!(
+                previous.state.phase,
+                ExactNativeLeaseContinuationPhase::Bound
+                    | ExactNativeLeaseContinuationPhase::WakeRegistered
+                    | ExactNativeLeaseContinuationPhase::Signalled
+            )
+        {
+            return self.reject(ExactNativeLeaseError::ReceiptMismatch);
+        }
+        self.release_continuation(previous.state)?;
+        self.continuation_tombstone = Some(ExactNativeContinuationTombstone {
+            branch: previous.state.branch,
+            token,
+        });
+        Ok(())
+    }
+
+    /// Exact raw-fault projection. Core's reclaimer, rather than the abandoned
+    /// child stack, supplies this receipt; no untyped global sweep is allowed.
+    pub(crate) fn abandon_continuation_raw_fault(
+        &mut self,
+        previous: ExactNativeLeaseContinuationReceipt<I, T, D, B, C>,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_continuation(previous)?;
+        self.release_continuation(previous.state)?;
+        if let Some(token) = previous.state.token {
+            self.continuation_tombstone = Some(ExactNativeContinuationTombstone {
+                branch: previous.state.branch,
+                token,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn continuation(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<Option<ExactNativeLeaseContinuationReceipt<I, T, D, B, C>>, ExactNativeLeaseError>
+    {
+        self.require_identity(identity)?;
+        Ok(self
+            .continuation
+            .map(|state| ExactNativeLeaseContinuationReceipt { identity, state }))
+    }
+
+    /// Exact non-authority projection of Core's current continuation record.
+    /// A consumed, cancelled, or fault-abandoned operation no longer contributes
+    /// to `current`, but its opaque token remains until Core arms a successor so
+    /// raw-fault teardown can validate the complete abandonment receipt.
+    pub(crate) fn core_continuation(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<Option<C>, ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        Ok(self
+            .continuation
+            .and_then(|continuation| continuation.token)
+            .or(self.continuation_tombstone.map(|tombstone| tombstone.token)))
+    }
+
+    pub(crate) fn core_continuation_branch(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<Option<ExactNativeLeaseBranch>, ExactNativeLeaseError> {
+        self.require_identity(identity)?;
+        Ok(self
+            .continuation
+            .and_then(|continuation| continuation.token.map(|_| continuation.branch))
+            .or(self
+                .continuation_tombstone
+                .map(|tombstone| tombstone.branch)))
+    }
+
+    fn register_wake(
+        &mut self,
+        previous: ExactNativeLeaseContinuationReceipt<I, T, D, B, C>,
+        bit: u16,
+    ) -> Result<ExactNativeLeaseContinuationReceipt<I, T, D, B, C>, ExactNativeLeaseError> {
+        self.acquire(bit)?;
+        let state = ExactNativeContinuationState {
+            phase: ExactNativeLeaseContinuationPhase::WakeRegistered,
+            ..previous.state
+        };
+        self.continuation = Some(state);
+        Ok(ExactNativeLeaseContinuationReceipt {
+            identity: previous.identity,
+            state,
+        })
+    }
+
+    fn release_continuation(
+        &mut self,
+        state: ExactNativeContinuationState<C>,
+    ) -> Result<(), ExactNativeLeaseError> {
+        if state.phase == ExactNativeLeaseContinuationPhase::WakeRegistered {
+            let Some(wake) = self.wake_bit(state.branch) else {
+                return self.reject(ExactNativeLeaseError::InvalidTransition);
+            };
+            self.release(wake)?;
+        }
+        self.release(LEASE_SCHEDULER_CONTINUATION)?;
+        self.continuation = None;
+        Ok(())
+    }
+
+    const fn wake_bit(&self, branch: ExactNativeLeaseBranch) -> Option<u16> {
+        match branch {
+            ExactNativeLeaseBranch::Quantum => None,
+            ExactNativeLeaseBranch::Backend => Some(LEASE_STREAM_WAKE),
+            ExactNativeLeaseBranch::RuntimeWait => Some(LEASE_RUNTIME_WAKE),
+        }
+    }
+
+    fn preflight_acquire(&self, bit: u16) -> Result<(), ExactNativeLeaseError> {
+        if self.held & bit != 0 {
+            return Err(ExactNativeLeaseError::CategoryAlreadyHeld);
+        }
+        if self.metrics().current >= EXACT_NATIVE_LEASE_LIMIT {
+            return Err(ExactNativeLeaseError::LimitExceeded);
+        }
+        Ok(())
+    }
+
+    fn acquire(&mut self, bit: u16) -> Result<(), ExactNativeLeaseError> {
+        self.preflight_acquire(bit)?;
+        self.acquire_preflighted(bit);
+        Ok(())
+    }
+
+    fn acquire_preflighted(&mut self, bit: u16) {
+        self.held |= bit;
+        self.peak = self.peak.max(self.metrics().current);
+    }
+
+    fn release(&mut self, bit: u16) -> Result<(), ExactNativeLeaseError> {
+        if self.held & bit == 0 {
+            return self.reject(ExactNativeLeaseError::CategoryVacant);
+        }
+        self.held &= !bit;
+        Ok(())
+    }
+
+    fn require_continuation(
+        &mut self,
+        receipt: ExactNativeLeaseContinuationReceipt<I, T, D, B, C>,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.require_identity(receipt.identity)?;
+        match self.continuation {
+            Some(current) if receipt.state.generation < current.generation => {
+                Err(ExactNativeLeaseError::StaleReceipt)
+            }
+            None if receipt.state.generation < self.next_continuation => {
+                Err(ExactNativeLeaseError::StaleReceipt)
+            }
+            Some(current) if current == receipt.state => Ok(()),
+            _ => self.reject(ExactNativeLeaseError::ReceiptMismatch),
+        }
+    }
+
+    fn require_identity(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<(), ExactNativeLeaseError> {
+        self.check_live()?;
+        if identity.control_generation < self.watermark
+            || (self.identity.is_none() && identity.control_generation == self.watermark)
+        {
+            return Err(ExactNativeLeaseError::StaleGeneration);
+        }
+        if self.identity != Some(identity) || identity.control_generation != self.watermark {
+            return self.reject(ExactNativeLeaseError::IdentityMismatch);
+        }
+        Ok(())
+    }
+
+    fn check_live(&self) -> Result<(), ExactNativeLeaseError> {
+        if self.quarantined {
+            Err(ExactNativeLeaseError::Quarantined)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn reject<U>(&mut self, error: ExactNativeLeaseError) -> Result<U, ExactNativeLeaseError> {
+        self.quarantined = true;
+        Err(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
+
+    #[test]
+    fn backend_release_coordinator_never_credits_before_physical_cancel() {
+        let stage = Cell::new(0_u8);
+        exact_backend_cancel_then_release(
+            || {
+                assert_eq!(stage.get(), 0);
+                stage.set(1);
+                Ok::<(), u8>(())
+            },
+            || {
+                assert_eq!(stage.get(), 1);
+                stage.set(2);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(stage.get(), 2);
+
+        let cancel_failed_stage = Cell::new(0_u8);
+        assert_eq!(
+            exact_backend_cancel_then_release(
+                || {
+                    cancel_failed_stage.set(1);
+                    Err::<(), u8>(1)
+                },
+                || {
+                    cancel_failed_stage.set(2);
+                    Ok(())
+                },
+            ),
+            Err(1)
+        );
+        assert_eq!(cancel_failed_stage.get(), 1);
+
+        let release_failed_stage = Cell::new(0_u8);
+        assert_eq!(
+            exact_backend_cancel_then_release(
+                || {
+                    release_failed_stage.set(1);
+                    Ok::<(), u8>(())
+                },
+                || {
+                    assert_eq!(release_failed_stage.get(), 1);
+                    release_failed_stage.set(2);
+                    Err(2)
+                },
+            ),
+            Err(2)
+        );
+        assert_eq!(release_failed_stage.get(), 2);
+    }
 
     #[test]
     fn input_spill_and_output_staging_are_independent_and_bounded() {
@@ -3130,6 +4186,34 @@ mod tests {
             Ok(ExactCleanupDecision::Quarantined)
         );
         assert!(linearized.is_quarantined());
+    }
+
+    #[test]
+    fn raw_fault_projects_exact_consumed_core_receipt_to_abandoned() {
+        let identity = exact_identity(79);
+        let mut ledger = TestLedger::new();
+        ledger.bind(identity).unwrap();
+        let _registered =
+            registered_output_operation(&mut ledger, identity, 1_250, 1_260, 1_270, 2);
+        ledger
+            .project_consumed_continuation(identity, 1_270)
+            .unwrap();
+        let plan = match ledger.raw_fault(identity).unwrap() {
+            ExactCleanupDecision::Cancel(plan) => plan,
+            other => panic!("consumed pending operation must cancel, got {other:?}"),
+        };
+        let cancelled = ledger.finish_cancel(plan).unwrap();
+        let abandoned = ledger
+            .finish_continuation_cleanup(cancelled, 1_270, ExactContinuationCleanup::Abandoned)
+            .unwrap();
+        let abandoned = ledger
+            .acknowledge_runtime_cleanup(abandoned, ExactRuntimeCleanup::Abandoned)
+            .unwrap();
+        assert_eq!(
+            ledger.raw_fault(identity),
+            Ok(ExactCleanupDecision::ReclaimSafe)
+        );
+        let _ = abandoned;
     }
 
     #[test]
@@ -4076,6 +5160,216 @@ mod tests {
             .unwrap();
         ledger.consume_cancelled(runtime_dropped).unwrap();
         assert_eq!(ledger.phase(), ExactLedgerPhase::Idle);
+    }
+
+    #[test]
+    fn payload_drop_takes_over_exact_signalled_revoke() {
+        let identity = exact_identity(78);
+        let mut ledger = TestLedger::new();
+        ledger.bind(identity).unwrap();
+        let _registered =
+            registered_output_operation(&mut ledger, identity, 1_220, 1_230, 1_240, 2);
+        let plan = match ledger
+            .claim_revoke(identity, ExactStreamResource::StdoutWriter)
+            .unwrap()
+        {
+            ExactRevokeDecision::Cancel(plan) => plan,
+            other => panic!("registered waiter must cancel, got {other:?}"),
+        };
+        ledger
+            .finish_cap_revoke(plan.resource_revoke_plan())
+            .unwrap();
+        let cancelled = ledger.finish_cancel(plan).unwrap();
+        let signalled = ledger
+            .finish_continuation_cleanup(cancelled, 1_240, ExactContinuationCleanup::Signalled)
+            .unwrap();
+
+        ledger.acknowledge_runtime_owner_drop(identity).unwrap();
+        let cancelled = ledger
+            .finish_continuation_cleanup(signalled, 1_240, ExactContinuationCleanup::Cancelled)
+            .unwrap();
+        let dropped = ledger
+            .acknowledge_runtime_cleanup(cancelled, ExactRuntimeCleanup::Dropped)
+            .unwrap();
+        ledger.consume_cancelled(dropped).unwrap();
+        assert_eq!(ledger.phase(), ExactLedgerPhase::Idle);
+        assert_eq!(ledger.terminal_empty(identity), Ok(true));
+    }
+
+    #[test]
+    fn payload_drop_cannot_take_over_revoke_before_signal_publication() {
+        let identity = exact_identity(80);
+        let mut ledger = TestLedger::new();
+        ledger.bind(identity).unwrap();
+        let _registered =
+            registered_output_operation(&mut ledger, identity, 1_280, 1_290, 1_300, 2);
+        let plan = match ledger
+            .claim_revoke(identity, ExactStreamResource::StdoutWriter)
+            .unwrap()
+        {
+            ExactRevokeDecision::Cancel(plan) => plan,
+            other => panic!("registered waiter must cancel, got {other:?}"),
+        };
+        ledger
+            .finish_cap_revoke(plan.resource_revoke_plan())
+            .unwrap();
+        let cancelled = ledger.finish_cancel(plan).unwrap();
+        ledger.acknowledge_runtime_owner_drop(identity).unwrap();
+        assert_eq!(
+            ledger.finish_continuation_cleanup(
+                cancelled,
+                1_300,
+                ExactContinuationCleanup::Cancelled,
+            ),
+            Err(ExactLedgerError::InvalidTransition)
+        );
+        assert!(ledger.is_quarantined());
+    }
+
+    #[test]
+    fn raw_fault_takes_over_exact_signalled_completed_revoke() {
+        let identity = exact_identity(82);
+        let mut ledger = TestLedger::new();
+        ledger.bind(identity).unwrap();
+        let _registered =
+            registered_output_operation(&mut ledger, identity, 1_310, 1_320, 1_330, 2);
+        let plan = match ledger
+            .claim_revoke(identity, ExactStreamResource::StdoutWriter)
+            .unwrap()
+        {
+            ExactRevokeDecision::Cancel(plan) => plan,
+            other => panic!("registered waiter must cancel, got {other:?}"),
+        };
+        ledger
+            .finish_cap_revoke(plan.resource_revoke_plan())
+            .unwrap();
+        let cancelled = ledger.finish_cancel(plan).unwrap();
+        let signalled = ledger
+            .finish_continuation_cleanup(cancelled, 1_330, ExactContinuationCleanup::Signalled)
+            .unwrap();
+
+        let abandoned = ledger
+            .abandon_completed_revoke_raw_fault(signalled)
+            .unwrap();
+        assert_eq!(
+            abandoned.continuation(),
+            ExactContinuation::Abandoned(1_330)
+        );
+        assert_eq!(abandoned.phase(), ExactLedgerPhase::BackendCancelled);
+        assert_eq!(
+            ledger.raw_fault(identity),
+            Ok(ExactCleanupDecision::ReclaimSafe)
+        );
+        assert_eq!(ledger.phase(), ExactLedgerPhase::Idle);
+        assert_eq!(ledger.terminal_empty(identity), Ok(true));
+        ledger.retire(identity).unwrap();
+    }
+
+    #[test]
+    fn raw_fault_takes_over_exact_consumed_completed_revoke() {
+        let identity = exact_identity(83);
+        let mut ledger = TestLedger::new();
+        ledger.bind(identity).unwrap();
+        let _registered =
+            registered_output_operation(&mut ledger, identity, 1_340, 1_350, 1_360, 2);
+        let plan = match ledger
+            .claim_revoke(identity, ExactStreamResource::StdoutWriter)
+            .unwrap()
+        {
+            ExactRevokeDecision::Cancel(plan) => plan,
+            other => panic!("registered waiter must cancel, got {other:?}"),
+        };
+        ledger
+            .finish_cap_revoke(plan.resource_revoke_plan())
+            .unwrap();
+        let cancelled = ledger.finish_cancel(plan).unwrap();
+        let signalled = ledger
+            .finish_continuation_cleanup(cancelled, 1_360, ExactContinuationCleanup::Signalled)
+            .unwrap();
+        let consumed = ledger
+            .acknowledge_cancelled_continuation(signalled, 1_360)
+            .unwrap();
+
+        let abandoned = ledger.abandon_completed_revoke_raw_fault(consumed).unwrap();
+        assert_eq!(abandoned.continuation(), ExactContinuation::Consumed(1_360));
+        assert_eq!(
+            ledger.raw_fault(identity),
+            Ok(ExactCleanupDecision::ReclaimSafe)
+        );
+        assert_eq!(ledger.phase(), ExactLedgerPhase::Idle);
+        ledger.retire(identity).unwrap();
+    }
+
+    #[test]
+    fn raw_fault_preserves_acknowledged_cancelled_revoke_cleanup() {
+        let identity = exact_identity(85);
+        let mut ledger = TestLedger::new();
+        ledger.bind(identity).unwrap();
+        let _registered =
+            registered_output_operation(&mut ledger, identity, 1_400, 1_410, 1_420, 2);
+        let plan = match ledger
+            .claim_revoke(identity, ExactStreamResource::StdoutWriter)
+            .unwrap()
+        {
+            ExactRevokeDecision::Cancel(plan) => plan,
+            other => panic!("registered waiter must cancel, got {other:?}"),
+        };
+        ledger
+            .finish_cap_revoke(plan.resource_revoke_plan())
+            .unwrap();
+        let cancelled = ledger.finish_cancel(plan).unwrap();
+        let signalled = ledger
+            .finish_continuation_cleanup(cancelled, 1_420, ExactContinuationCleanup::Signalled)
+            .unwrap();
+        let consumed = ledger
+            .acknowledge_cancelled_continuation(signalled, 1_420)
+            .unwrap();
+        let acknowledged = ledger
+            .acknowledge_runtime_cleanup(consumed, ExactRuntimeCleanup::Cancelled)
+            .unwrap();
+
+        let taken_over = ledger
+            .abandon_completed_revoke_raw_fault(acknowledged)
+            .unwrap();
+        assert_eq!(
+            taken_over.continuation(),
+            ExactContinuation::Consumed(1_420)
+        );
+        assert_eq!(
+            ledger.raw_fault(identity),
+            Ok(ExactCleanupDecision::ReclaimSafe)
+        );
+        assert_eq!(ledger.phase(), ExactLedgerPhase::Idle);
+        ledger.retire(identity).unwrap();
+    }
+
+    #[test]
+    fn raw_fault_completed_revoke_takeover_rejects_pre_signal_state() {
+        let identity = exact_identity(84);
+        let mut ledger = TestLedger::new();
+        ledger.bind(identity).unwrap();
+        let _registered =
+            registered_output_operation(&mut ledger, identity, 1_370, 1_380, 1_390, 2);
+        let plan = match ledger
+            .claim_revoke(identity, ExactStreamResource::StdoutWriter)
+            .unwrap()
+        {
+            ExactRevokeDecision::Cancel(plan) => plan,
+            other => panic!("registered waiter must cancel, got {other:?}"),
+        };
+        ledger
+            .finish_cap_revoke(plan.resource_revoke_plan())
+            .unwrap();
+        let cancelled = ledger.finish_cancel(plan).unwrap();
+        assert_eq!(
+            cancelled.continuation(),
+            ExactContinuation::WakeRegistered(1_390)
+        );
+        assert_eq!(
+            ledger.abandon_completed_revoke_raw_fault(cancelled),
+            Err(ExactLedgerError::ContinuationPending)
+        );
+        assert!(ledger.is_quarantined());
     }
 
     #[test]
@@ -5127,5 +6421,666 @@ mod tests {
                 .map(|state| state.total - state.cursor),
             Some(158)
         );
+    }
+
+    type TestLeaseLedger = ExactNativeLeaseLedger<u64, u64, u64, u64, u64, u64>;
+
+    fn lease_spill(
+        identity: ExactInstanceIdentity<u64, u64, u64, u64>,
+        generation: u64,
+        total: u16,
+        cursor: u16,
+    ) -> TestInputSpillReceipt {
+        ExactInputSpillReceipt {
+            identity,
+            state: ExactInputSpillState {
+                generation,
+                total,
+                cursor,
+            },
+        }
+    }
+
+    #[test]
+    fn aggregate_lease_backend_branch_reaches_r_and_r_plus_one_is_inert() {
+        let identity = exact_identity(60);
+        let mut ledger = TestLeaseLedger::new();
+        assert_eq!(
+            ledger.metrics(),
+            ExactNativeLeaseMetrics {
+                current: 0,
+                peak: 0,
+                limit: EXACT_NATIVE_LEASE_LIMIT,
+            }
+        );
+        ledger.bind(identity).unwrap();
+        assert_eq!(ledger.metrics().current(), 4);
+
+        let spill = lease_spill(identity, 7, 257, 99);
+        ledger.begin_input_spill(&spill).unwrap();
+        assert_eq!(ledger.has_input_spill(identity), Ok(true));
+        ledger.begin_backend(identity).unwrap();
+        assert_eq!(ledger.has_backend(identity), Ok(true));
+        assert_eq!(ledger.runtime_wait(identity), Ok(None));
+        assert_eq!(ledger.terminal_empty(identity), Ok(false));
+        let reserved = ledger.reserve_continuation(identity).unwrap();
+        assert_eq!(reserved.branch(), ExactNativeLeaseBranch::Backend);
+        assert_eq!(
+            reserved.phase(),
+            ExactNativeLeaseContinuationPhase::Reserved
+        );
+        let bound = ledger.bind_continuation(reserved, 0x710).unwrap();
+        assert_eq!(bound.token(), Some(0x710));
+        let registered = ledger.register_stream_wake(bound).unwrap();
+        assert_eq!(ledger.metrics().current(), EXACT_NATIVE_LEASE_LIMIT);
+        assert_eq!(ledger.metrics().peak(), EXACT_NATIVE_LEASE_LIMIT);
+
+        let at_limit = ledger.metrics();
+        assert_eq!(
+            ledger.begin_runtime_wait(identity, 0x900),
+            Err(ExactNativeLeaseError::LimitExceeded)
+        );
+        assert_eq!(ledger.metrics(), at_limit);
+        assert!(!ledger.is_quarantined());
+
+        let signalled = ledger.mark_signalled(registered, 0x710).unwrap();
+        assert_eq!(
+            signalled.phase(),
+            ExactNativeLeaseContinuationPhase::Signalled
+        );
+        assert_eq!(ledger.metrics().current(), 7);
+        ledger.consume_continuation(signalled, 0x710).unwrap();
+        assert_eq!(ledger.metrics().current(), 6);
+
+        let after_consume = ledger.metrics();
+        assert_eq!(
+            ledger.consume_continuation(registered, 0x710),
+            Err(ExactNativeLeaseError::StaleReceipt)
+        );
+        assert_eq!(ledger.metrics(), after_consume);
+        assert!(!ledger.is_quarantined());
+
+        ledger.finish_backend(identity).unwrap();
+        ledger.finish_input_spill(identity).unwrap();
+        assert_eq!(ledger.has_backend(identity), Ok(false));
+        assert_eq!(ledger.has_input_spill(identity), Ok(false));
+        assert_eq!(ledger.terminal_empty(identity), Ok(true));
+        ledger.reset_stream_caps(identity, 4).unwrap();
+        assert_eq!(ledger.metrics().current(), 0);
+        assert!(ledger.metrics().peak() <= ledger.metrics().limit());
+        ledger.retire(identity).unwrap();
+        assert_eq!(ledger.metrics().current(), 0);
+    }
+
+    #[test]
+    fn aggregate_lease_runtime_wait_parks_rotates_and_cancels_exactly() {
+        let identity = exact_identity(61);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+        let spill = lease_spill(identity, 9, 767, 99);
+        ledger.begin_input_spill(&spill).unwrap();
+        ledger.begin_runtime_wait(identity, 0xa00).unwrap();
+        assert_eq!(ledger.runtime_wait(identity), Ok(Some(0xa00)));
+        assert_eq!(ledger.has_backend(identity), Ok(false));
+
+        let reserved = ledger.reserve_continuation(identity).unwrap();
+        assert_eq!(reserved.branch(), ExactNativeLeaseBranch::RuntimeWait);
+        let bound = ledger.bind_continuation(reserved, 0xa10).unwrap();
+        let before_wrong_wait = ledger.metrics();
+        assert_eq!(
+            ledger.register_runtime_wake(bound, 0xa01),
+            Err(ExactNativeLeaseError::WaitTokenMismatch)
+        );
+        assert_eq!(ledger.metrics(), before_wrong_wait);
+        assert!(!ledger.is_quarantined());
+
+        let registered = ledger.register_runtime_wake(bound, 0xa00).unwrap();
+        assert_eq!(ledger.metrics().current(), EXACT_NATIVE_LEASE_LIMIT);
+        // A signal which raced registration is consumed directly from the
+        // registered projection; there is no intermediate polling turn.
+        ledger.consume_continuation(registered, 0xa10).unwrap();
+        assert_eq!(ledger.metrics().current(), 6);
+        ledger.rotate_runtime_wait(identity, 0xa00, 0xa01).unwrap();
+        assert_eq!(ledger.runtime_wait(identity), Ok(Some(0xa01)));
+        let after_rotate = ledger.metrics();
+        assert_eq!(
+            ledger.finish_runtime_wait(identity, 0xa00),
+            Err(ExactNativeLeaseError::WaitTokenMismatch)
+        );
+        assert_eq!(ledger.metrics(), after_rotate);
+        assert!(!ledger.is_quarantined());
+
+        let next_reserved = ledger.reserve_continuation(identity).unwrap();
+        let next_bound = ledger.bind_continuation(next_reserved, 0xa11).unwrap();
+        let next_registered = ledger.register_runtime_wake(next_bound, 0xa01).unwrap();
+        assert_eq!(ledger.metrics().current(), EXACT_NATIVE_LEASE_LIMIT);
+        ledger
+            .drop_cancelled_continuation(next_registered, 0xa11)
+            .unwrap();
+        assert_eq!(ledger.metrics().current(), 6);
+
+        ledger.finish_runtime_wait(identity, 0xa01).unwrap();
+        assert_eq!(ledger.runtime_wait(identity), Ok(None));
+        ledger.finish_input_spill(identity).unwrap();
+        ledger.reset_stream_caps(identity, 4).unwrap();
+        ledger.retire(identity).unwrap();
+        assert_eq!(ledger.metrics().current(), 0);
+        assert_eq!(ledger.metrics().peak(), EXACT_NATIVE_LEASE_LIMIT);
+    }
+
+    #[test]
+    fn aggregate_lease_continuation_reserve_cancel_and_raw_abandon_are_exact() {
+        let identity = exact_identity(62);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+        ledger.begin_backend(identity).unwrap();
+
+        let unarmed = ledger.reserve_continuation(identity).unwrap();
+        assert_eq!(ledger.metrics().current(), 6);
+        ledger.cancel_reserved_continuation(unarmed).unwrap();
+        assert_eq!(ledger.metrics().current(), 5);
+
+        let reserved = ledger.reserve_continuation(identity).unwrap();
+        let bound = ledger.bind_continuation(reserved, 0xb10).unwrap();
+        let registered = ledger.register_stream_wake(bound).unwrap();
+        assert_eq!(ledger.metrics().current(), 7);
+        assert_eq!(ledger.continuation(identity), Ok(Some(registered)));
+        ledger.abandon_continuation_raw_fault(registered).unwrap();
+        assert_eq!(ledger.metrics().current(), 5);
+        assert_eq!(ledger.continuation(identity), Ok(None));
+
+        let stable = ledger.metrics();
+        assert_eq!(
+            ledger.abandon_continuation_raw_fault(registered),
+            Err(ExactNativeLeaseError::StaleReceipt)
+        );
+        assert_eq!(ledger.metrics(), stable);
+        assert!(!ledger.is_quarantined());
+
+        ledger.finish_backend(identity).unwrap();
+        ledger.reset_stream_caps(identity, 4).unwrap();
+        ledger.retire(identity).unwrap();
+        assert_eq!(ledger.metrics().current(), 0);
+    }
+
+    #[test]
+    fn aggregate_lease_backend_drop_waits_for_physical_cancel_ack() {
+        let identity = exact_identity(78);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+        ledger.begin_backend(identity).unwrap();
+
+        let reserved = ledger.reserve_continuation(identity).unwrap();
+        let bound = ledger.bind_continuation(reserved, 0x1110).unwrap();
+        let registered = ledger.register_stream_wake(bound).unwrap();
+        let awaiting_physical_cancel = ledger.metrics();
+        assert_eq!(awaiting_physical_cancel.current(), 7);
+        assert_eq!(ledger.continuation(identity), Ok(Some(registered)));
+
+        // Core may already have returned its cancellation disposition here,
+        // but the backend still owns the copied wake token. Until physical
+        // cancellation succeeds, both wake and scheduler charges stay live.
+        assert_eq!(ledger.metrics(), awaiting_physical_cancel);
+        assert_eq!(
+            registered.phase(),
+            ExactNativeLeaseContinuationPhase::WakeRegistered
+        );
+
+        // This exact disposition is published only after the simulated
+        // physical cancellation acknowledgement.
+        ledger
+            .drop_cancelled_continuation(registered, 0x1110)
+            .unwrap();
+        assert_eq!(
+            awaiting_physical_cancel.current() - ledger.metrics().current(),
+            2
+        );
+        assert_eq!(ledger.continuation(identity), Ok(None));
+
+        let after_drop = ledger.metrics();
+        assert_eq!(
+            ledger.drop_cancelled_continuation(registered, 0x1110),
+            Err(ExactNativeLeaseError::StaleReceipt)
+        );
+        assert_eq!(ledger.metrics(), after_drop);
+        assert!(!ledger.is_quarantined());
+
+        // A successor may reuse the same opaque Core token. The private
+        // receipt generation keeps the old physical-cancel disposition inert.
+        let successor = ledger.reserve_continuation(identity).unwrap();
+        let successor = ledger.bind_continuation(successor, 0x1110).unwrap();
+        let successor = ledger.register_stream_wake(successor).unwrap();
+        let successor_live = ledger.metrics();
+        assert_eq!(
+            ledger.drop_cancelled_continuation(registered, 0x1110),
+            Err(ExactNativeLeaseError::StaleReceipt)
+        );
+        assert_eq!(ledger.metrics(), successor_live);
+        assert_eq!(ledger.continuation(identity), Ok(Some(successor)));
+        assert!(!ledger.is_quarantined());
+        ledger
+            .drop_cancelled_continuation(successor, 0x1110)
+            .unwrap();
+        assert_eq!(successor_live.current() - ledger.metrics().current(), 2);
+
+        ledger.finish_backend(identity).unwrap();
+        ledger.reset_stream_caps(identity, 4).unwrap();
+        ledger.retire(identity).unwrap();
+        assert_eq!(ledger.metrics().current(), 0);
+        assert!(ledger.metrics().peak() <= ledger.metrics().limit());
+    }
+
+    #[test]
+    fn aggregate_lease_backend_abandon_waits_for_physical_cancel_ack() {
+        let identity = exact_identity(79);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+        ledger.begin_backend(identity).unwrap();
+
+        let reserved = ledger.reserve_continuation(identity).unwrap();
+        let bound = ledger.bind_continuation(reserved, 0x1210).unwrap();
+        let registered = ledger.register_stream_wake(bound).unwrap();
+        let awaiting_physical_cancel = ledger.metrics();
+        assert_eq!(awaiting_physical_cancel.current(), 7);
+        assert_eq!(ledger.continuation(identity), Ok(Some(registered)));
+
+        // Core abandonment alone cannot release the wake copied into the
+        // physical stream slot, so the aggregate projection remains exact.
+        assert_eq!(ledger.metrics(), awaiting_physical_cancel);
+        ledger.abandon_continuation_raw_fault(registered).unwrap();
+        assert_eq!(
+            awaiting_physical_cancel.current() - ledger.metrics().current(),
+            2
+        );
+
+        let after_abandon = ledger.metrics();
+        assert_eq!(
+            ledger.abandon_continuation_raw_fault(registered),
+            Err(ExactNativeLeaseError::StaleReceipt)
+        );
+        assert_eq!(ledger.metrics(), after_abandon);
+        assert!(!ledger.is_quarantined());
+
+        ledger.finish_backend(identity).unwrap();
+        ledger.reset_stream_caps(identity, 4).unwrap();
+        ledger.retire(identity).unwrap();
+        assert_eq!(ledger.metrics().current(), 0);
+        assert!(ledger.metrics().peak() <= ledger.metrics().limit());
+    }
+
+    #[test]
+    fn aggregate_lease_backend_bound_and_signalled_release_one_each() {
+        let identity = exact_identity(80);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+        ledger.begin_backend(identity).unwrap();
+
+        let reserved = ledger.reserve_continuation(identity).unwrap();
+        let bound = ledger.bind_continuation(reserved, 0x1310).unwrap();
+        let bound_live = ledger.metrics();
+        assert_eq!(bound_live.current(), 6);
+        ledger.drop_cancelled_continuation(bound, 0x1310).unwrap();
+        assert_eq!(bound_live.current() - ledger.metrics().current(), 1);
+
+        let reserved = ledger.reserve_continuation(identity).unwrap();
+        let bound = ledger.bind_continuation(reserved, 0x1320).unwrap();
+        let registered = ledger.register_stream_wake(bound).unwrap();
+        let signalled = ledger.mark_signalled(registered, 0x1320).unwrap();
+        let signalled_live = ledger.metrics();
+        assert_eq!(
+            signalled.phase(),
+            ExactNativeLeaseContinuationPhase::Signalled
+        );
+        assert_eq!(signalled_live.current(), 6);
+        ledger.abandon_continuation_raw_fault(signalled).unwrap();
+        assert_eq!(signalled_live.current() - ledger.metrics().current(), 1);
+
+        ledger.finish_backend(identity).unwrap();
+        ledger.reset_stream_caps(identity, 4).unwrap();
+        ledger.retire(identity).unwrap();
+        assert_eq!(ledger.metrics().current(), 0);
+        assert!(ledger.metrics().peak() <= ledger.metrics().limit());
+    }
+
+    #[test]
+    fn aggregate_lease_backend_wrong_cancel_disposition_is_fail_stop() {
+        let identity = exact_identity(81);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+        ledger.begin_backend(identity).unwrap();
+
+        let reserved = ledger.reserve_continuation(identity).unwrap();
+        let bound = ledger.bind_continuation(reserved, 0x1410).unwrap();
+        let registered = ledger.register_stream_wake(bound).unwrap();
+        let charged = ledger.metrics();
+        assert_eq!(charged.current(), 7);
+
+        assert_eq!(
+            ledger.drop_cancelled_continuation(registered, 0x1411),
+            Err(ExactNativeLeaseError::ReceiptMismatch)
+        );
+        assert_eq!(ledger.metrics(), charged);
+        assert!(ledger.is_quarantined());
+        assert_eq!(
+            ledger.drop_cancelled_continuation(registered, 0x1410),
+            Err(ExactNativeLeaseError::Quarantined)
+        );
+        assert_eq!(ledger.metrics(), charged);
+        assert!(ledger.metrics().peak() <= ledger.metrics().limit());
+    }
+
+    #[test]
+    fn aggregate_lease_spill_successors_do_not_mint_extra_authority() {
+        let identity = exact_identity(63);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+        let first = lease_spill(identity, 21, 767, 99);
+        let second = lease_spill(identity, 22, 767, 198);
+        ledger.begin_input_spill(&first).unwrap();
+        assert_eq!(ledger.metrics().current(), 5);
+        ledger.update_input_spill(&second).unwrap();
+        assert_eq!(ledger.metrics().current(), 5);
+
+        let stale = lease_spill(identity, 21, 767, 99);
+        assert_eq!(
+            ledger.update_input_spill(&stale),
+            Err(ExactNativeLeaseError::ReceiptMismatch)
+        );
+        assert_eq!(ledger.metrics().current(), 5);
+        assert!(ledger.is_quarantined());
+    }
+
+    #[test]
+    fn aggregate_lease_accepts_operation_ledger_spill_successors() {
+        let identity = exact_identity(64);
+        let mut operations = TestLedger::new();
+        let mut leases = TestLeaseLedger::new();
+        operations.bind(identity).unwrap();
+        leases.bind(identity).unwrap();
+
+        let pending = pending_operation(
+            &mut operations,
+            identity,
+            1_000,
+            1_010,
+            ExactStreamResource::StdinReader,
+            ExactHostFunction::InputStream,
+            3,
+        );
+        let invoking = operations
+            .begin_backend(pending, ExactBackendAction::CommitPrepared)
+            .unwrap();
+        let received = operations
+            .backend_linearized(
+                invoking,
+                BackendEffect::InputReceived {
+                    total: 9,
+                    cursor: 0,
+                },
+            )
+            .unwrap();
+        let first = operations
+            .commit_input_prefix(received, 3)
+            .unwrap()
+            .unwrap();
+        leases.begin_input_spill(&first).unwrap();
+
+        let offered = operations.attach_input_runtime(first, 1_020, 3).unwrap();
+        let prepared = operations.prepare_input_runtime(offered, 1_021).unwrap();
+        let second = operations
+            .commit_input_prefix(prepared, 3)
+            .unwrap()
+            .unwrap();
+        leases.update_input_spill(&second).unwrap();
+        assert_eq!(leases.metrics().current(), 5);
+
+        let offered = operations.attach_input_runtime(second, 1_030, 3).unwrap();
+        let prepared = operations.prepare_input_runtime(offered, 1_031).unwrap();
+        assert_eq!(operations.commit_input_prefix(prepared, 3), Ok(None));
+        leases.finish_input_spill(identity).unwrap();
+        leases.reset_stream_caps(identity, 4).unwrap();
+        leases.retire(identity).unwrap();
+        assert_eq!(leases.metrics().current(), 0);
+    }
+
+    #[test]
+    fn aggregate_lease_old_control_generation_is_inert_and_alias_quarantines() {
+        let identity = exact_identity(70);
+        let stale = exact_identity(69);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+        let seeded = ledger.metrics();
+        assert_eq!(
+            ledger.begin_backend(stale),
+            Err(ExactNativeLeaseError::StaleGeneration)
+        );
+        assert_eq!(ledger.metrics(), seeded);
+        assert!(!ledger.is_quarantined());
+
+        let same_generation_alias = ExactInstanceIdentity {
+            bindings: 0x45,
+            ..identity
+        };
+        assert_eq!(
+            ledger.bind(same_generation_alias),
+            Err(ExactNativeLeaseError::IdentityMismatch)
+        );
+        assert_eq!(ledger.metrics(), seeded);
+        assert!(ledger.is_quarantined());
+    }
+
+    #[test]
+    fn aggregate_lease_double_wake_registration_is_fail_stop_without_overcount() {
+        let identity = exact_identity(71);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+        ledger.begin_backend(identity).unwrap();
+        let reserved = ledger.reserve_continuation(identity).unwrap();
+        let bound = ledger.bind_continuation(reserved, 0xc10).unwrap();
+        let _registered = ledger.register_stream_wake(bound).unwrap();
+        let once = ledger.metrics();
+        assert_eq!(
+            ledger.register_stream_wake(bound),
+            Err(ExactNativeLeaseError::ReceiptMismatch)
+        );
+        assert_eq!(ledger.metrics(), once);
+        assert!(ledger.is_quarantined());
+        assert!(ledger.metrics().peak() <= ledger.metrics().limit());
+    }
+
+    #[test]
+    fn aggregate_lease_quantum_count_is_stable_and_receipt_generation_blocks_aba() {
+        let identity = exact_identity(72);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+
+        let first_reserved = ledger.reserve_quantum_continuation(identity).unwrap();
+        assert_eq!(first_reserved.branch(), ExactNativeLeaseBranch::Quantum);
+        assert_eq!(ledger.metrics().current(), 5);
+        let first_bound = ledger.bind_continuation(first_reserved, 0xd10).unwrap();
+        assert_eq!(ledger.metrics().current(), 5);
+        ledger
+            .consume_quantum_continuation(first_bound, 0xd10)
+            .unwrap();
+        assert_eq!(ledger.metrics().current(), 4);
+
+        let stable = ledger.metrics();
+        assert_eq!(
+            ledger.consume_quantum_continuation(first_bound, 0xd10),
+            Err(ExactNativeLeaseError::StaleReceipt)
+        );
+        assert_eq!(ledger.metrics(), stable);
+        assert!(!ledger.is_quarantined());
+
+        // Core token values are opaque and may compare equal. The private
+        // reservation generation still prevents the first receipt from
+        // consuming the second incarnation.
+        let second_reserved = ledger.reserve_quantum_continuation(identity).unwrap();
+        let second_bound = ledger.bind_continuation(second_reserved, 0xd10).unwrap();
+        let second_live = ledger.metrics();
+        assert_eq!(
+            ledger.consume_quantum_continuation(first_bound, 0xd10),
+            Err(ExactNativeLeaseError::StaleReceipt)
+        );
+        assert_eq!(ledger.metrics(), second_live);
+        assert!(!ledger.is_quarantined());
+        ledger
+            .drop_cancelled_continuation(second_bound, 0xd10)
+            .unwrap();
+        assert_eq!(ledger.metrics().current(), 4);
+
+        ledger.reset_stream_caps(identity, 4).unwrap();
+        ledger.retire(identity).unwrap();
+        assert!(ledger.is_retired());
+        assert_eq!(ledger.metrics().current(), 0);
+        assert_eq!(ledger.metrics().peak(), 5);
+    }
+
+    #[test]
+    fn aggregate_lease_tombstone_tracks_uncharged_core_disposition() {
+        let identity = exact_identity(76);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+
+        let first = ledger.reserve_quantum_continuation(identity).unwrap();
+        let first = ledger.bind_continuation(first, 0xf10).unwrap();
+        ledger.consume_quantum_continuation(first, 0xf10).unwrap();
+        assert_eq!(ledger.metrics().current(), 4);
+        assert_eq!(ledger.core_continuation(identity), Ok(Some(0xf10)));
+
+        // Reserving capacity does not itself change Core. A failed arm must
+        // therefore preserve the previous terminal projection.
+        let unarmed = ledger.reserve_quantum_continuation(identity).unwrap();
+        assert_eq!(ledger.core_continuation(identity), Ok(Some(0xf10)));
+        ledger.cancel_reserved_continuation(unarmed).unwrap();
+        assert_eq!(ledger.core_continuation(identity), Ok(Some(0xf10)));
+
+        let second = ledger.reserve_quantum_continuation(identity).unwrap();
+        let second = ledger.bind_continuation(second, 0xf20).unwrap();
+        assert_eq!(ledger.core_continuation(identity), Ok(Some(0xf20)));
+        ledger.drop_cancelled_continuation(second, 0xf20).unwrap();
+        assert_eq!(ledger.metrics().current(), 4);
+        assert_eq!(ledger.core_continuation(identity), Ok(Some(0xf20)));
+
+        ledger.reset_stream_caps(identity, 4).unwrap();
+        ledger.retire(identity).unwrap();
+        assert!(ledger.is_retired());
+    }
+
+    #[test]
+    fn aggregate_lease_quantum_retains_backend_and_spill_branch() {
+        let identity = exact_identity(75);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+        let spill = lease_spill(identity, 31, 9, 3);
+        ledger.begin_input_spill(&spill).unwrap();
+        ledger.begin_backend(identity).unwrap();
+
+        let reserved = ledger.reserve_quantum_continuation(identity).unwrap();
+        assert_eq!(reserved.branch(), ExactNativeLeaseBranch::Quantum);
+        let bound = ledger.bind_continuation(reserved, 0xe10).unwrap();
+        assert_eq!(ledger.metrics().current(), 7);
+        ledger.consume_quantum_continuation(bound, 0xe10).unwrap();
+        assert_eq!(ledger.has_backend(identity), Ok(true));
+        assert_eq!(ledger.has_input_spill(identity), Ok(true));
+
+        ledger.finish_backend(identity).unwrap();
+        ledger.finish_input_spill(identity).unwrap();
+        ledger.reset_stream_caps(identity, 4).unwrap();
+        ledger.retire(identity).unwrap();
+        assert_eq!(ledger.metrics().current(), 0);
+        assert_eq!(ledger.metrics().peak(), 7);
+    }
+
+    #[test]
+    fn raw_fault_keeps_historical_backend_consumed_under_new_quantum_tombstone() {
+        let identity = exact_identity(77);
+        let mut operations = TestLedger::new();
+        let mut leases = TestLeaseLedger::new();
+        operations.bind(identity).unwrap();
+        leases.bind(identity).unwrap();
+        leases.begin_backend(identity).unwrap();
+
+        let registered =
+            registered_output_operation(&mut operations, identity, 1_200, 1_210, 0x1010, 2);
+        let consumed = operations
+            .project_consumed_continuation(identity, 0x1010)
+            .unwrap();
+        assert_eq!(consumed.continuation(), ExactContinuation::Consumed(0x1010));
+
+        let old = leases.reserve_continuation(identity).unwrap();
+        let old = leases.bind_continuation(old, 0x1010).unwrap();
+        let old = leases.register_stream_wake(old).unwrap();
+        leases.consume_continuation(old, 0x1010).unwrap();
+        assert_eq!(leases.core_continuation(identity), Ok(Some(0x1010)));
+
+        let quantum = leases.reserve_quantum_continuation(identity).unwrap();
+        let quantum = leases.bind_continuation(quantum, 0x1020).unwrap();
+        leases
+            .consume_quantum_continuation(quantum, 0x1020)
+            .unwrap();
+        assert_eq!(leases.core_continuation(identity), Ok(Some(0x1020)));
+        assert_eq!(
+            leases.core_continuation_branch(identity),
+            Ok(Some(ExactNativeLeaseBranch::Quantum))
+        );
+
+        let plan = match operations.raw_fault(identity).unwrap() {
+            ExactCleanupDecision::Cancel(plan) => plan,
+            other => panic!("pending raw fault needs exact cancel, got {other:?}"),
+        };
+        let cancelled = operations.finish_cancel(plan).unwrap();
+        assert_eq!(
+            cancelled.continuation(),
+            ExactContinuation::Consumed(0x1010)
+        );
+        let abandoned = operations
+            .acknowledge_runtime_cleanup(cancelled, ExactRuntimeCleanup::Abandoned)
+            .unwrap();
+        assert_eq!(
+            operations.raw_fault(identity),
+            Ok(ExactCleanupDecision::ReclaimSafe)
+        );
+        let _ = (registered, abandoned);
+
+        leases.finish_backend(identity).unwrap();
+        leases.reset_stream_caps(identity, 4).unwrap();
+        leases.retire(identity).unwrap();
+        assert_eq!(leases.metrics().current(), 0);
+    }
+
+    #[test]
+    fn aggregate_lease_cap_reset_requires_exact_revocation_credit() {
+        let identity = exact_identity(73);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+        let before = ledger.metrics();
+        assert_eq!(
+            ledger.reset_stream_caps(identity, 3),
+            Err(ExactNativeLeaseError::ReceiptMismatch)
+        );
+        assert_eq!(ledger.metrics(), before);
+        assert!(ledger.is_quarantined());
+    }
+
+    #[test]
+    fn aggregate_lease_individual_cap_reset_reaches_zero_before_retire() {
+        let identity = exact_identity(74);
+        let mut ledger = TestLeaseLedger::new();
+        ledger.bind(identity).unwrap();
+        for resource in [
+            ExactStreamResource::StdinReader,
+            ExactStreamResource::StdoutWriter,
+            ExactStreamResource::StdinSupervisor,
+            ExactStreamResource::StdoutSupervisor,
+        ] {
+            ledger.release_stream_cap(identity, resource).unwrap();
+        }
+        assert_eq!(ledger.metrics().current(), 0);
+        assert_eq!(ledger.metrics().peak(), 4);
+        assert_eq!(ledger.metrics().limit(), EXACT_NATIVE_LEASE_LIMIT);
+        ledger.reset_stream_caps(identity, 0).unwrap();
+        ledger.retire(identity).unwrap();
+        assert_eq!(ledger.metrics().current(), 0);
     }
 }

@@ -50,6 +50,14 @@ pub const ASYNC_WASM_TOOLS_REVISION: &str =
     "wasm-tools-v1.255.0-76e20611d1920a7a39ca08983c6c77c3060de380";
 pub const WASI_API_REVISION: &str = "wasi-v0.3.0-3ee2a590c766594ae44a54730fc74fc27da5c609";
 
+/// Exact, inert WIT source for the selected WASI command validation contract.
+///
+/// The nested packages are retained locally so parsing requires neither a
+/// filesystem package search nor a network lookup. This constant is format
+/// metadata only: it supplies no host implementation or execution authority.
+pub const SELECTED_WASI_COMMAND_WIT: &str = include_str!("../wit/selected-wasi-command.wit");
+pub const SELECTED_WASI_COMMAND_WORLD: &str = "vibe:wasi-selected/command@1.0.0";
+
 /// Crates.io payload identities for the exact frontend crates used by C5.1.
 pub const WASMPARSER_0_255_0_CHECKSUM: &str =
     "e8e329ef4b5d46e73b91d3ac6924417cad55a8cbbf869c199283383427c3320b";
@@ -238,6 +246,132 @@ pub const WIT_PACKAGES: [WitPackage; 5] = [
     WitPackage {
         name: "vibe:log",
         version: "1.0.0",
+    },
+];
+
+/// Exact standard packages nested in [`SELECTED_WASI_COMMAND_WIT`]. The Vibe
+/// root package is named separately by [`SELECTED_WASI_COMMAND_WORLD`] and is
+/// deliberately not added to the unchanged Profile 1 [`WIT_PACKAGES`] list.
+pub const SELECTED_WASI_PACKAGES: [WitPackage; 3] = [
+    WitPackage {
+        name: "wasi:clocks",
+        version: "0.3.0",
+    },
+    WitPackage {
+        name: "wasi:random",
+        version: "0.3.0",
+    },
+    WitPackage {
+        name: "wasi:cli",
+        version: "0.3.0",
+    },
+];
+
+/// Exact identities of the five operational interfaces selected by the
+/// validation-only command world.
+pub const SELECTED_WASI_MONOTONIC_CLOCK_INTERFACE: &str = "wasi:clocks/monotonic-clock@0.3.0";
+pub const SELECTED_WASI_SECURE_RANDOM_INTERFACE: &str = "wasi:random/random@0.3.0";
+pub const SELECTED_WASI_COMMAND_STDIN_INTERFACE: &str = "wasi:cli/stdin@0.3.0";
+pub const SELECTED_WASI_COMMAND_STDOUT_INTERFACE: &str = "wasi:cli/stdout@0.3.0";
+pub const SELECTED_WASI_INVOCATION_LIFECYCLE_INTERFACE: &str = "wasi:cli/run@0.3.0";
+
+/// Exact identities of the two imported interfaces that contribute types but
+/// no callable host operation and therefore never receive an authority mapping.
+pub const SELECTED_WASI_CLOCK_TYPES_INTERFACE: &str = "wasi:clocks/types@0.3.0";
+pub const SELECTED_WASI_CLI_TYPES_INTERFACE: &str = "wasi:cli/types@0.3.0";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SelectedWasiInterfaceDirection {
+    Import,
+    Export,
+}
+
+/// Semantic capability classes selected by the inert standard-interface map.
+/// Concrete capabilities and CSpace identities remain outside this crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SelectedWasiCapability {
+    MonotonicClock,
+    SecureRandom,
+}
+
+/// Closed disposition for one operational interface in the selected world.
+///
+/// There is intentionally no ambient or catch-all variant. An interface absent
+/// from [`SELECTED_WASI_INTERFACE_MAPPINGS`] is not selected and must be rejected
+/// by admission rather than projected through this vocabulary.
+///
+/// ```compile_fail
+/// use vibeos_component_format::SelectedWasiMappingCategory;
+///
+/// let _ = SelectedWasiMappingCategory::Ambient;
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SelectedWasiMappingCategory {
+    Capability(SelectedWasiCapability),
+    CommandStdin,
+    CommandStdout,
+    InvocationLifecycle,
+}
+
+/// One fixed operational-interface mapping. Private fields prevent downstream
+/// callers from manufacturing an adjacent spelling or reclassifying a route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SelectedWasiInterfaceMapping {
+    interface: &'static str,
+    direction: SelectedWasiInterfaceDirection,
+    category: SelectedWasiMappingCategory,
+}
+
+impl SelectedWasiInterfaceMapping {
+    pub const fn interface(&self) -> &'static str {
+        self.interface
+    }
+
+    pub const fn direction(&self) -> SelectedWasiInterfaceDirection {
+        self.direction
+    }
+
+    pub const fn category(&self) -> SelectedWasiMappingCategory {
+        self.category
+    }
+
+    pub const fn capability(&self) -> Option<SelectedWasiCapability> {
+        match self.category {
+            SelectedWasiMappingCategory::Capability(capability) => Some(capability),
+            SelectedWasiMappingCategory::CommandStdin
+            | SelectedWasiMappingCategory::CommandStdout
+            | SelectedWasiMappingCategory::InvocationLifecycle => None,
+        }
+    }
+}
+
+/// Complete operational surface of the selected command world. The two
+/// type-only interfaces are intentionally excluded from this fixed table.
+pub const SELECTED_WASI_INTERFACE_MAPPINGS: [SelectedWasiInterfaceMapping; 5] = [
+    SelectedWasiInterfaceMapping {
+        interface: SELECTED_WASI_MONOTONIC_CLOCK_INTERFACE,
+        direction: SelectedWasiInterfaceDirection::Import,
+        category: SelectedWasiMappingCategory::Capability(SelectedWasiCapability::MonotonicClock),
+    },
+    SelectedWasiInterfaceMapping {
+        interface: SELECTED_WASI_SECURE_RANDOM_INTERFACE,
+        direction: SelectedWasiInterfaceDirection::Import,
+        category: SelectedWasiMappingCategory::Capability(SelectedWasiCapability::SecureRandom),
+    },
+    SelectedWasiInterfaceMapping {
+        interface: SELECTED_WASI_COMMAND_STDIN_INTERFACE,
+        direction: SelectedWasiInterfaceDirection::Import,
+        category: SelectedWasiMappingCategory::CommandStdin,
+    },
+    SelectedWasiInterfaceMapping {
+        interface: SELECTED_WASI_COMMAND_STDOUT_INTERFACE,
+        direction: SelectedWasiInterfaceDirection::Import,
+        category: SelectedWasiMappingCategory::CommandStdout,
+    },
+    SelectedWasiInterfaceMapping {
+        interface: SELECTED_WASI_INVOCATION_LIFECYCLE_INTERFACE,
+        direction: SelectedWasiInterfaceDirection::Export,
+        category: SelectedWasiMappingCategory::InvocationLifecycle,
     },
 ];
 

@@ -20,6 +20,21 @@ use vibeos_component_admission::{
 ```
 "#
 )]
+#![cfg_attr(
+    not(feature = "selected-wasi-admission"),
+    doc = r#"
+The validation-only selected WASI admission surface is structurally absent by
+default:
+
+```compile_fail
+use vibeos_component_admission::{
+    admit_selected_wasi_candidate,
+    AdmittedSelectedWasiCandidate,
+    SelectedWasiAdmissionPolicy,
+};
+```
+"#
+)]
 #![no_std]
 
 extern crate alloc;
@@ -28,9 +43,22 @@ use alloc::{string::String, vec::Vec};
 use core::fmt;
 use sha2::{Digest, Sha256};
 pub use vibeos_component_format::ProfileIdentity;
-#[cfg(feature = "native-async-acceptance")]
+#[cfg(any(
+    feature = "native-async-acceptance",
+    feature = "selected-wasi-admission"
+))]
 use vibeos_component_format::ProfileStage;
 use vibeos_component_format::{ProfileLimits, PROFILE_1_LIMITS};
+#[cfg(feature = "selected-wasi-admission")]
+use vibeos_component_format::{
+    SelectedWasiCapability, SelectedWasiInterfaceDirection, SelectedWasiInterfaceMapping,
+    SelectedWasiMappingCategory, SELECTED_WASI_CLI_TYPES_INTERFACE,
+    SELECTED_WASI_CLOCK_TYPES_INTERFACE, SELECTED_WASI_COMMAND_STDIN_INTERFACE,
+    SELECTED_WASI_COMMAND_STDOUT_INTERFACE, SELECTED_WASI_COMMAND_WIT, SELECTED_WASI_COMMAND_WORLD,
+    SELECTED_WASI_INTERFACE_MAPPINGS, SELECTED_WASI_INVOCATION_LIFECYCLE_INTERFACE,
+    SELECTED_WASI_MONOTONIC_CLOCK_INTERFACE, SELECTED_WASI_SECURE_RANDOM_INTERFACE,
+    WASI_API_REVISION,
+};
 use vibeos_component_host::{
     HostManifestError, HostResourceKind, VibeHostManifest, VibeHostRequirement,
 };
@@ -274,6 +302,19 @@ pub struct AdmissionPolicy<'a> {
     pub interfaces: &'a [InterfaceCeiling<'a>],
 }
 
+/// Trusted image inputs for the closed C5.6 selected-WASI admission path.
+///
+/// The WIT world, interface mapping, entrypoint, stream routes, and capability
+/// requirement kinds are fixed by the selected profile rather than supplied
+/// by the caller. This policy therefore cannot broaden that closed surface.
+#[cfg(feature = "selected-wasi-admission")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectedWasiAdmissionPolicy<'a> {
+    pub command_name: &'a str,
+    pub trust: ArtifactTrust,
+    pub limits: InstanceLimits,
+}
+
 pub struct CallerAuthority<'a> {
     pub offers: &'a [AuthorityOffer<'a>],
 }
@@ -461,8 +502,192 @@ impl InspectionSummary {
     }
 }
 
+/// One unresolved capability obligation in the selected WASI mapping.
+///
+/// This is an inert requirement projection, not a capability, grant, CSpace
+/// slot, or guest resource handle. The concrete host binding remains a later
+/// lifecycle operation.
+#[cfg(feature = "selected-wasi-admission")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectedWasiCapabilityRequirement {
+    interface: &'static str,
+    capability: SelectedWasiCapability,
+    kind: HostResourceKind,
+    rights: Rights,
+}
+
+#[cfg(feature = "selected-wasi-admission")]
+impl SelectedWasiCapabilityRequirement {
+    pub const fn interface(&self) -> &'static str {
+        self.interface
+    }
+
+    pub const fn capability(&self) -> SelectedWasiCapability {
+        self.capability
+    }
+
+    pub const fn kind(&self) -> HostResourceKind {
+        self.kind
+    }
+
+    pub const fn rights(&self) -> Rights {
+        self.rights
+    }
+}
+
+/// Immutable, capability-free manifest for the exact selected WASI surface.
+///
+/// Unlike [`ComponentCommandManifest`], this value has no executable export
+/// projection and cannot enter the synchronous command runner.
+#[cfg(feature = "selected-wasi-admission")]
+#[derive(Debug, PartialEq, Eq)]
+pub struct SelectedWasiManifest {
+    name: String,
+    profile: ProfileIdentity,
+    artifact: ComponentIdentity,
+    world: String,
+    limits: InstanceLimits,
+    mappings: &'static [SelectedWasiInterfaceMapping; 5],
+    capability_requirements: [SelectedWasiCapabilityRequirement; 2],
+}
+
+#[cfg(feature = "selected-wasi-admission")]
+impl SelectedWasiManifest {
+    pub fn command_name(&self) -> &str {
+        &self.name
+    }
+
+    pub const fn profile(&self) -> ProfileIdentity {
+        self.profile
+    }
+
+    pub const fn abi(&self) -> u16 {
+        self.profile.runtime_abi
+    }
+
+    pub const fn artifact(&self) -> ComponentIdentity {
+        self.artifact
+    }
+
+    pub fn world(&self) -> &str {
+        &self.world
+    }
+
+    pub const fn limits(&self) -> InstanceLimits {
+        self.limits
+    }
+
+    pub const fn host_mappings(&self) -> &'static [SelectedWasiInterfaceMapping; 5] {
+        self.mappings
+    }
+
+    pub const fn capability_requirements(&self) -> &[SelectedWasiCapabilityRequirement; 2] {
+        &self.capability_requirements
+    }
+}
+
+#[cfg(feature = "selected-wasi-admission")]
+const SELECTED_WASI_CAPABILITY_REQUIREMENTS: [SelectedWasiCapabilityRequirement; 2] = [
+    SelectedWasiCapabilityRequirement {
+        interface: SELECTED_WASI_MONOTONIC_CLOCK_INTERFACE,
+        capability: SelectedWasiCapability::MonotonicClock,
+        kind: HostResourceKind::Clock,
+        rights: Rights::READ,
+    },
+    SelectedWasiCapabilityRequirement {
+        interface: SELECTED_WASI_SECURE_RANDOM_INTERFACE,
+        capability: SelectedWasiCapability::SecureRandom,
+        kind: HostResourceKind::Random,
+        rights: Rights::READ,
+    },
+];
+
 mod private {
     pub struct Seal;
+}
+
+/// Sealed, validation-only result for the exact C5.6 selected WASI surface.
+///
+/// The candidate deliberately exposes neither artifact bytes nor a
+/// [`ComponentPlan`]. Revalidation is an inert yes/no operation, and there is
+/// no conversion to [`AdmittedComponent`] or any runtime component type.
+///
+/// ```compile_fail
+/// use vibeos_component_admission::{
+///     AdmittedComponent, AdmittedSelectedWasiCandidate,
+/// };
+///
+/// fn executable(candidate: AdmittedSelectedWasiCandidate) -> AdmittedComponent {
+///     candidate.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_admission::AdmittedSelectedWasiCandidate;
+///
+/// fn raw_bytes(candidate: &AdmittedSelectedWasiCandidate) {
+///     let _ = candidate.bytes();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_admission::AdmittedSelectedWasiCandidate;
+///
+/// fn executable_plan(candidate: &AdmittedSelectedWasiCandidate) {
+///     let _ = candidate.validated_plan();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_admission::AdmittedSelectedWasiCandidate;
+///
+/// fn borrowed_plan(candidate: &AdmittedSelectedWasiCandidate) {
+///     let _ = candidate.plan();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_admission::AdmittedSelectedWasiCandidate;
+///
+/// fn grants(candidate: &AdmittedSelectedWasiCandidate) {
+///     let _ = candidate.grants();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_admission::AdmittedSelectedWasiCandidate;
+///
+/// fn duplicate(candidate: AdmittedSelectedWasiCandidate) {
+///     let _ = candidate.clone();
+/// }
+/// ```
+#[cfg(feature = "selected-wasi-admission")]
+pub struct AdmittedSelectedWasiCandidate {
+    artifact: ComponentArtifact,
+    inspection: InspectionSummary,
+    manifest: SelectedWasiManifest,
+    _sealed: private::Seal,
+}
+
+#[cfg(feature = "selected-wasi-admission")]
+impl AdmittedSelectedWasiCandidate {
+    pub const fn identity(&self) -> ComponentIdentity {
+        self.artifact.identity
+    }
+
+    pub fn inspection(&self) -> &InspectionSummary {
+        &self.inspection
+    }
+
+    pub fn manifest(&self) -> &SelectedWasiManifest {
+        &self.manifest
+    }
+
+    /// Revalidate immutable bytes, the pinned world, all mappings, and the
+    /// permanently inert profile without exposing an executable plan.
+    pub fn revalidate(&self) -> Result<(), AdmissionError> {
+        revalidate_selected_wasi_candidate(self)
+    }
 }
 
 /// Sealed, authority-free C5.3 validation candidate.
@@ -710,6 +935,7 @@ pub enum AdmissionError {
     InvalidEntrypoint = 16,
     InvalidArgumentLimits = 17,
     RuntimeUnavailable = 18,
+    UnsupportedWasiInterface = 19,
 }
 
 impl AdmissionError {
@@ -733,6 +959,7 @@ impl AdmissionError {
             Self::InvalidEntrypoint => 16,
             Self::InvalidArgumentLimits => 17,
             Self::RuntimeUnavailable => 18,
+            Self::UnsupportedWasiInterface => 19,
         }
     }
 }
@@ -759,8 +986,9 @@ impl fmt::Display for AdmissionError {
             Self::RevalidationMismatch => "component revalidation differs from admitted manifest",
             Self::InvalidEntrypoint => "component entrypoint is not an executable export",
             Self::InvalidArgumentLimits => "component command argument limits are invalid",
-            Self::RuntimeUnavailable => {
-                "component requires async execution that is unavailable before C5.2"
+            Self::RuntimeUnavailable => "component validation-only async profile is not executable",
+            Self::UnsupportedWasiInterface => {
+                "component imports or exports an unsupported WASI interface"
             }
         })
     }
@@ -932,6 +1160,225 @@ pub fn admit(
         grants,
         _sealed: private::Seal,
     })
+}
+
+/// Admit the one closed, validation-only WASI command surface selected by
+/// C5.6.
+///
+/// This operation validates immutable bytes and projects two explicit
+/// capability requirements, but does not bind those capabilities, create a
+/// command runner, or expose an executable plan.
+#[cfg(feature = "selected-wasi-admission")]
+pub fn admit_selected_wasi_candidate(
+    artifact: ComponentArtifact,
+    policy: &SelectedWasiAdmissionPolicy<'_>,
+) -> Result<AdmittedSelectedWasiCandidate, AdmissionError> {
+    let profile = ProfileIdentity::PROFILE_1_ASYNC;
+    if !selected_wasi_profile_matches(profile) || artifact.profile != profile {
+        return Err(AdmissionError::BadProfile);
+    }
+    if policy.trust != ArtifactTrust::ImagePinned(artifact.identity) {
+        return Err(AdmissionError::UntrustedArtifact);
+    }
+    policy.limits.validate()?;
+    if !valid_name(policy.command_name) {
+        return Err(AdmissionError::InvalidCommandName);
+    }
+    if !selected_wasi_mapping_contract_matches() {
+        return Err(AdmissionError::InvalidPolicy);
+    }
+
+    let world = WorldContract::parse(SELECTED_WASI_COMMAND_WIT, SELECTED_WASI_COMMAND_WORLD)
+        .map_err(AdmissionError::World)?;
+    if world.identity != SELECTED_WASI_COMMAND_WORLD
+        || world.imports.len() != 6
+        || world.exports.len() != 1
+    {
+        return Err(AdmissionError::InvalidPolicy);
+    }
+
+    let (component, modules, imports, exports) = {
+        let plan = inspect_component_for_profile(&artifact.bytes, profile)
+            .map_err(AdmissionError::Decode)?;
+        validate_selected_wasi_plan(&plan, &world, AdmissionError::InvalidPolicy)?;
+
+        let mut modules = Vec::new();
+        modules
+            .try_reserve_exact(plan.embedded_modules().len())
+            .map_err(|_| AdmissionError::Allocation)?;
+        for bytes in plan.embedded_modules() {
+            modules.push(inspect_core(bytes).map_err(AdmissionError::Core)?);
+        }
+        (plan.summary(), modules, plan.imports, plan.exports)
+    };
+
+    let manifest = SelectedWasiManifest {
+        name: copied(policy.command_name)?,
+        profile,
+        artifact: artifact.identity,
+        world: copied(SELECTED_WASI_COMMAND_WORLD)?,
+        limits: policy.limits,
+        mappings: &SELECTED_WASI_INTERFACE_MAPPINGS,
+        capability_requirements: SELECTED_WASI_CAPABILITY_REQUIREMENTS,
+    };
+    let candidate = AdmittedSelectedWasiCandidate {
+        artifact,
+        inspection: InspectionSummary {
+            profile,
+            world: copied(SELECTED_WASI_COMMAND_WORLD)?,
+            component,
+            modules,
+            imports,
+            exports,
+        },
+        manifest,
+        _sealed: private::Seal,
+    };
+    candidate.revalidate()?;
+    Ok(candidate)
+}
+
+#[cfg(feature = "selected-wasi-admission")]
+fn revalidate_selected_wasi_candidate(
+    candidate: &AdmittedSelectedWasiCandidate,
+) -> Result<(), AdmissionError> {
+    let identity = ComponentIdentity(Sha256::digest(&candidate.artifact.bytes).into());
+    if identity != candidate.artifact.identity
+        || identity != candidate.manifest.artifact
+        || candidate.artifact.profile != candidate.manifest.profile
+        || candidate.inspection.profile != candidate.manifest.profile
+        || candidate.inspection.world != candidate.manifest.world
+        || !selected_wasi_profile_matches(candidate.manifest.profile)
+        || !valid_name(&candidate.manifest.name)
+        || candidate.manifest.world != SELECTED_WASI_COMMAND_WORLD
+        || candidate.manifest.limits.validate().is_err()
+        || candidate.manifest.mappings != &SELECTED_WASI_INTERFACE_MAPPINGS
+        || candidate.manifest.capability_requirements != SELECTED_WASI_CAPABILITY_REQUIREMENTS
+        || !selected_wasi_mapping_contract_matches()
+    {
+        return Err(AdmissionError::RevalidationMismatch);
+    }
+
+    let world = WorldContract::parse(SELECTED_WASI_COMMAND_WIT, SELECTED_WASI_COMMAND_WORLD)
+        .map_err(AdmissionError::World)?;
+    if world.identity != SELECTED_WASI_COMMAND_WORLD
+        || world.imports.len() != 6
+        || world.exports.len() != 1
+    {
+        return Err(AdmissionError::RevalidationMismatch);
+    }
+
+    let plan = inspect_component_for_profile(&candidate.artifact.bytes, candidate.artifact.profile)
+        .map_err(AdmissionError::Decode)?;
+    validate_selected_wasi_plan(&plan, &world, AdmissionError::RevalidationMismatch)?;
+    if plan.summary() != candidate.inspection.component
+        || plan.imports() != candidate.inspection.imports
+        || plan.exports() != candidate.inspection.exports
+        || plan.embedded_modules().len() != candidate.inspection.modules.len()
+    {
+        return Err(AdmissionError::RevalidationMismatch);
+    }
+    for (bytes, expected) in plan
+        .embedded_modules()
+        .iter()
+        .zip(&candidate.inspection.modules)
+    {
+        if inspect_core(bytes).map_err(AdmissionError::Core)? != *expected {
+            return Err(AdmissionError::RevalidationMismatch);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "selected-wasi-admission")]
+fn validate_selected_wasi_plan(
+    plan: &ComponentPlan<'_>,
+    world: &WorldContract,
+    mismatch: AdmissionError,
+) -> Result<(), AdmissionError> {
+    if !selected_wasi_profile_matches(plan.profile())
+        || plan.runtime_ready()
+        || plan.native_async_runtime_ready()
+        || plan.native_async_execution_plan().is_some()
+        || plan.executable_exports().next().is_some()
+        || plan.host_imports().next().is_some()
+    {
+        return Err(mismatch);
+    }
+
+    for import in plan.imports() {
+        if import.name == SELECTED_WASI_CLOCK_TYPES_INTERFACE
+            || import.name == SELECTED_WASI_CLI_TYPES_INTERFACE
+        {
+            continue;
+        }
+        if !selected_wasi_mapping_exists(&import.name, SelectedWasiInterfaceDirection::Import) {
+            return Err(AdmissionError::UnsupportedWasiInterface);
+        }
+    }
+    for export in plan.exports() {
+        if !selected_wasi_mapping_exists(&export.name, SelectedWasiInterfaceDirection::Export) {
+            return Err(AdmissionError::UnsupportedWasiInterface);
+        }
+    }
+
+    if plan.imports().len() != 6
+        || plan.exports().len() != 1
+        || plan.summary().imports != 6
+        || plan.summary().exports != 1
+    {
+        return Err(mismatch);
+    }
+
+    plan.check_world(world).map_err(AdmissionError::World)
+}
+
+#[cfg(feature = "selected-wasi-admission")]
+fn selected_wasi_mapping_exists(
+    interface: &str,
+    direction: SelectedWasiInterfaceDirection,
+) -> bool {
+    SELECTED_WASI_INTERFACE_MAPPINGS
+        .iter()
+        .any(|mapping| mapping.interface() == interface && mapping.direction() == direction)
+}
+
+#[cfg(feature = "selected-wasi-admission")]
+fn selected_wasi_profile_matches(profile: ProfileIdentity) -> bool {
+    profile == ProfileIdentity::PROFILE_1_ASYNC
+        && matches!(profile.stage, ProfileStage::ValidationOnly)
+        && !profile.execution_enabled()
+        && profile.wasi_revision == WASI_API_REVISION
+}
+
+#[cfg(feature = "selected-wasi-admission")]
+fn selected_wasi_mapping_contract_matches() -> bool {
+    let [clock, random, stdin, stdout, run] = &SELECTED_WASI_INTERFACE_MAPPINGS;
+    clock.interface() == SELECTED_WASI_MONOTONIC_CLOCK_INTERFACE
+        && clock.direction() == SelectedWasiInterfaceDirection::Import
+        && clock.category()
+            == SelectedWasiMappingCategory::Capability(SelectedWasiCapability::MonotonicClock)
+        && random.interface() == SELECTED_WASI_SECURE_RANDOM_INTERFACE
+        && random.direction() == SelectedWasiInterfaceDirection::Import
+        && random.category()
+            == SelectedWasiMappingCategory::Capability(SelectedWasiCapability::SecureRandom)
+        && stdin.interface() == SELECTED_WASI_COMMAND_STDIN_INTERFACE
+        && stdin.direction() == SelectedWasiInterfaceDirection::Import
+        && stdin.category() == SelectedWasiMappingCategory::CommandStdin
+        && stdout.interface() == SELECTED_WASI_COMMAND_STDOUT_INTERFACE
+        && stdout.direction() == SelectedWasiInterfaceDirection::Import
+        && stdout.category() == SelectedWasiMappingCategory::CommandStdout
+        && run.interface() == SELECTED_WASI_INVOCATION_LIFECYCLE_INTERFACE
+        && run.direction() == SelectedWasiInterfaceDirection::Export
+        && run.category() == SelectedWasiMappingCategory::InvocationLifecycle
+        && SELECTED_WASI_CAPABILITY_REQUIREMENTS[0].interface == clock.interface()
+        && clock.capability() == Some(SELECTED_WASI_CAPABILITY_REQUIREMENTS[0].capability)
+        && SELECTED_WASI_CAPABILITY_REQUIREMENTS[0].kind == HostResourceKind::Clock
+        && SELECTED_WASI_CAPABILITY_REQUIREMENTS[0].rights == Rights::READ
+        && SELECTED_WASI_CAPABILITY_REQUIREMENTS[1].interface == random.interface()
+        && random.capability() == Some(SELECTED_WASI_CAPABILITY_REQUIREMENTS[1].capability)
+        && SELECTED_WASI_CAPABILITY_REQUIREMENTS[1].kind == HostResourceKind::Random
+        && SELECTED_WASI_CAPABILITY_REQUIREMENTS[1].rights == Rights::READ
 }
 
 /// Admit the one isolated, validation-only native async acceptance shape.

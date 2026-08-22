@@ -555,7 +555,6 @@ impl AdmittedNativeAsyncAcceptanceCandidate {
             || self.min_args != 0
             || self.max_args != 0
             || self.limits.validate().is_err()
-            || usize::from(self.limits.resources) != PROFILE_1_LIMITS.max_resources as usize
             || self.stdin != CommandStreamMode::Required
             || self.stdout != CommandStreamMode::Required
             || self.stderr == CommandStreamMode::Required
@@ -957,9 +956,6 @@ pub fn admit_native_async_acceptance_candidate(
         return Err(AdmissionError::UntrustedArtifact);
     }
     policy.limits.validate()?;
-    if usize::from(policy.limits.resources) != PROFILE_1_LIMITS.max_resources as usize {
-        return Err(AdmissionError::InvalidLimits);
-    }
     if !valid_name(policy.command_name) {
         return Err(AdmissionError::InvalidCommandName);
     }

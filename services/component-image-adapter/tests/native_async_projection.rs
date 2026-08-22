@@ -1,6 +1,6 @@
 #![cfg(feature = "native-async-command-projection")]
 
-use vibeos_component_format::{ProfileIdentity, ProfileStage, PROFILE_1_LIMITS};
+use vibeos_component_format::{ProfileIdentity, ProfileStage};
 use vibeos_component_image_adapter::{
     project_native_async_command, NativeAsyncCommandProjection, ProjectionError,
 };
@@ -48,10 +48,7 @@ fn projection_revalidates_the_inert_native_plan_without_runtime_activation() {
         assert_eq!(plan.summary().resources, 0);
         assert!(plan.native_async_execution_plan().is_some());
     }
-    assert_eq!(
-        usize::from(projection.manifest().resource_limit()),
-        PROFILE_1_LIMITS.max_resources as usize
-    );
+    assert_eq!(projection.manifest().resource_limit(), 8);
 }
 
 #[test]

@@ -63,6 +63,7 @@ fn exact_world(pin: NativeAsyncAcceptancePin) -> WorldContract {
 #[test]
 fn pinned_native_async_candidate_admits_only_through_the_isolated_path() {
     let pin = C53_NATIVE_ASYNC_QEMU_ACCEPTANCE;
+    assert_eq!(pin.limits().resources, 8);
     let artifact = ComponentArtifact::copy_from(pin.artifact_bytes(), pin.profile()).unwrap();
     let identity = artifact.identity();
     assert_eq!(identity.as_bytes(), &pin.expected_sha256());
@@ -76,6 +77,7 @@ fn pinned_native_async_candidate_admits_only_through_the_isolated_path() {
 
     assert_eq!(candidate.command_name(), "c53-native-filter");
     assert_eq!(candidate.world(), "vibe:stream/native-filter@1.0.0");
+    assert_eq!(candidate.limits().resources, 8);
     let plan = candidate.validated_plan().unwrap();
     assert!(!plan.runtime_ready());
     assert!(!plan.native_async_runtime_ready());
@@ -120,13 +122,21 @@ fn runtime_component() -> NativeAsyncComponent {
     )
     .unwrap();
     let plan = candidate.validated_plan().unwrap();
-    NativeAsyncComponent::instantiate_validation_candidate_with_memory_limit(
+    let component = NativeAsyncComponent::instantiate_validation_candidate_with_memory_limit(
         &plan,
         &ProfileEngine::new(),
         OwnerAllocationReservation::profile_default(),
         candidate.limits().memory_bytes,
+        u32::from(candidate.limits().resources),
     )
-    .unwrap()
+    .unwrap();
+    assert_eq!(component.work_costs().handle_state, 65);
+    assert_eq!(component.work_costs().buffer_bridge, 74);
+    assert_eq!(component.work_costs().wait_state, 65);
+    assert_eq!(component.storage_metrics().async_state.handles.limit, 8);
+    assert_eq!(component.storage_metrics().async_state.pairs.limit, 8);
+    assert_eq!(component.storage_metrics().buffers.limit, 8);
+    component
 }
 
 #[derive(Debug)]
@@ -363,6 +373,20 @@ fn pinned_artifact_executes_large_backpressured_xor_and_reuses_one_component() {
     let second = drive_runtime_filter(&mut component, second_input, 1);
     assert_eq!(second.output, xor_0x20(second_input));
     assert_eq!(second.output_close, 1);
+
+    let storage = component.storage_metrics();
+    assert_eq!(storage.async_state.handles.current, 0);
+    assert_eq!(storage.async_state.pairs.current, 0);
+    assert_eq!(storage.async_state.tasks.current, 0);
+    assert_eq!(storage.async_state.joined_waitables.current, 0);
+    assert_eq!(storage.async_state.wait_registrations.current, 0);
+    assert_eq!(storage.buffers.current, 0);
+    assert_eq!(storage.async_state.handles.peak, 7);
+    assert_eq!(storage.async_state.pairs.peak, 4);
+    assert_eq!(storage.async_state.tasks.peak, 1);
+    assert_eq!(storage.async_state.joined_waitables.peak, 4);
+    assert_eq!(storage.async_state.wait_registrations.peak, 0);
+    assert_eq!(storage.buffers.peak, 1);
 }
 
 #[test]

@@ -38,6 +38,21 @@ jobs:
             rustup run "$VIBEOS_TOOLCHAIN" cargo test \
               --manifest-path vendor/sunset/Cargo.toml -p sunset \
               --no-default-features --features alloc --verbose
+      - name: Test the native async state-machine evidence
+        # The kernel library has `test = false`, but this model deliberately
+        # has no kernel dependencies and is a portable host evidence layer.
+        # The component-runtime fuzzer is feature-gated, so the workspace's
+        # default test command above does not discover it.
+        run: |
+          "$VIBEOS_RUSTC" --edition=2021 --test \
+            kernel/src/native_pending_shadow_model.rs \
+            -o "$RUNNER_TEMP/native-pending-shadow-model"
+          "$RUNNER_TEMP/native-pending-shadow-model"
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test \
+              -p vibeos-component-runtime \
+              --features native-async-acceptance \
+              --test native_async_fuzz --verbose
       - name: Report repository status
         run: ./scripts/status.sh --check
       - name: Exercise SMP benchmark transcript validation

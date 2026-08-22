@@ -7083,4 +7083,920 @@ mod tests {
         ledger.retire(identity).unwrap();
         assert_eq!(ledger.metrics().current(), 0);
     }
+
+    type TestLeaseReceipt = ExactNativeLeaseContinuationReceipt<u64, u64, u64, u64, u64>;
+    type TestCancelPlan = ExactCancelPlan<u64, u64, u64, u64, u64, u64, u64>;
+
+    const C57_TRACE_STEPS: usize = 512;
+    const C57_TRACE_SEEDS: [u64; 3] = [1, 0x9e37_79b9_7f4a_7c15, u64::MAX - 58];
+
+    #[derive(Clone, Copy, Debug)]
+    enum C57TraceCase {
+        Quantum,
+        RuntimeWait,
+        Backpressure,
+        RevokeBeforeAwait,
+        RevokeAfterAwait,
+        RawFault,
+        PayloadDrop,
+        Replacement,
+    }
+
+    impl C57TraceCase {
+        const PREFIX: [Self; 8] = [
+            Self::Quantum,
+            Self::RuntimeWait,
+            Self::Backpressure,
+            Self::RevokeBeforeAwait,
+            Self::RevokeAfterAwait,
+            Self::RawFault,
+            Self::PayloadDrop,
+            Self::Replacement,
+        ];
+
+        const fn from_index(index: u64) -> Self {
+            Self::PREFIX[(index % Self::PREFIX.len() as u64) as usize]
+        }
+    }
+
+    struct C57Trace {
+        initial_seed: u64,
+        random: u64,
+        step: usize,
+        case: C57TraceCase,
+        phase: &'static str,
+        next_control_generation: u64,
+    }
+
+    impl C57Trace {
+        const fn new(seed: u64) -> Self {
+            Self {
+                initial_seed: seed,
+                random: seed,
+                step: 0,
+                case: C57TraceCase::Quantum,
+                phase: "trace-entry",
+                next_control_generation: 1_000,
+            }
+        }
+
+        fn next(&mut self) -> u64 {
+            self.random ^= self.random << 13;
+            self.random ^= self.random >> 7;
+            self.random ^= self.random << 17;
+            self.random
+        }
+
+        fn identity(&mut self) -> ExactInstanceIdentity<u64, u64, u64, u64> {
+            let generation = self.next_control_generation;
+            self.next_control_generation += 1;
+            exact_identity(generation)
+        }
+
+        fn token_base(&mut self) -> u64 {
+            (self.next() & 0x0000_ffff_ffff_f000) | 0x100
+        }
+
+        fn enter(&mut self, phase: &'static str) {
+            self.phase = phase;
+        }
+
+        fn ok<T, E: core::fmt::Debug>(&self, result: Result<T, E>) -> T {
+            match result {
+                Ok(value) => value,
+                Err(error) => panic!(
+                    "C5.7 seed={:#018x} step={} case={:?} phase={}: unexpected error {error:?}",
+                    self.initial_seed, self.step, self.case, self.phase
+                ),
+            }
+        }
+
+        fn check(&self, condition: bool, invariant: &'static str) {
+            assert!(
+                condition,
+                "C5.7 seed={:#018x} step={} case={:?} phase={}: {invariant}",
+                self.initial_seed, self.step, self.case, self.phase
+            );
+        }
+
+        fn equal<T: core::fmt::Debug + PartialEq>(
+            &self,
+            actual: T,
+            expected: T,
+            invariant: &'static str,
+        ) {
+            assert_eq!(
+                actual, expected,
+                "C5.7 seed={:#018x} step={} case={:?} phase={}: {invariant}",
+                self.initial_seed, self.step, self.case, self.phase
+            );
+        }
+
+        fn lease_bounds(&self, leases: &TestLeaseLedger) {
+            let metrics = leases.metrics();
+            self.check(
+                metrics.current() <= metrics.peak(),
+                "lease current exceeded its historical peak",
+            );
+            self.check(
+                metrics.peak() <= metrics.limit(),
+                "lease peak exceeded the fixed R limit",
+            );
+            self.equal(
+                metrics.limit(),
+                EXACT_NATIVE_LEASE_LIMIT,
+                "lease limit changed during a trace",
+            );
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct C57RegisteredWait {
+        operation: TestSnapshot,
+        lease: TestLeaseReceipt,
+        continuation: u64,
+    }
+
+    fn c57_pending(
+        trace: &C57Trace,
+        result: Result<ExactBackendReturn<u64, u64, u64, u64, u64, u64, u64>, ExactLedgerError>,
+    ) -> TestSnapshot {
+        match trace.ok(result) {
+            ExactBackendReturn::Pending(snapshot) => snapshot,
+            ExactBackendReturn::Cancel(_) => {
+                trace.check(
+                    false,
+                    "unexpected cancellation while publishing pending backend",
+                );
+                unreachable!()
+            }
+        }
+    }
+
+    fn c57_cancel_plan(
+        trace: &C57Trace,
+        decision: ExactRevokeDecision<u64, u64, u64, u64, u64, u64, u64>,
+    ) -> TestCancelPlan {
+        match decision {
+            ExactRevokeDecision::Cancel(plan) => plan,
+            _ => {
+                trace.check(
+                    false,
+                    "pending operation did not return an exact cancel plan",
+                );
+                unreachable!()
+            }
+        }
+    }
+
+    fn c57_cleanup_plan(
+        trace: &C57Trace,
+        decision: ExactCleanupDecision<u64, u64, u64, u64, u64, u64, u64>,
+    ) -> TestCancelPlan {
+        match decision {
+            ExactCleanupDecision::Cancel(plan) => plan,
+            _ => {
+                trace.check(false, "pending cleanup did not return an exact cancel plan");
+                unreachable!()
+            }
+        }
+    }
+
+    fn c57_bind(
+        trace: &mut C57Trace,
+        operations: &mut TestLedger,
+        leases: &mut TestLeaseLedger,
+        identity: ExactInstanceIdentity<u64, u64, u64, u64>,
+    ) {
+        trace.enter("bind");
+        trace.ok(operations.bind(identity));
+        trace.ok(leases.bind(identity));
+        trace.equal(leases.metrics().current(), 4, "bind did not seed four caps");
+        trace.lease_bounds(leases);
+    }
+
+    fn c57_register_pending(
+        trace: &mut C57Trace,
+        operations: &mut TestLedger,
+        leases: &mut TestLeaseLedger,
+        pending: TestSnapshot,
+        continuation: u64,
+    ) -> C57RegisteredWait {
+        trace.enter("reserve-continuation");
+        let reserved = trace.ok(leases.reserve_continuation(pending.identity()));
+        let armed = trace.ok(operations.arm_continuation(pending, continuation));
+        let bound = trace.ok(leases.bind_continuation(reserved, continuation));
+        let registering =
+            trace.ok(operations.begin_backend(armed, ExactBackendAction::RegisterWake));
+        let registered_lease = trace.ok(leases.register_stream_wake(bound));
+        let registered_operation = c57_pending(
+            trace,
+            operations.finish_register_wake(registering, continuation),
+        );
+        trace.equal(
+            registered_operation.continuation(),
+            ExactContinuation::WakeRegistered(continuation),
+            "backend did not retain the exact wake registration",
+        );
+        trace.lease_bounds(leases);
+        C57RegisteredWait {
+            operation: registered_operation,
+            lease: registered_lease,
+            continuation,
+        }
+    }
+
+    fn c57_begin_registered_output(
+        trace: &mut C57Trace,
+        operations: &mut TestLedger,
+        leases: &mut TestLeaseLedger,
+        identity: ExactInstanceIdentity<u64, u64, u64, u64>,
+        base: u64,
+        request_units: u16,
+        continuation: u64,
+    ) -> C57RegisteredWait {
+        trace.enter("output-start-pending");
+        trace.ok(leases.begin_backend(identity));
+        let offered = trace.ok(operations.begin_runtime(
+            identity,
+            base,
+            ExactStreamResource::StdoutWriter,
+            ExactHostFunction::OutputStream,
+            usize::from(request_units),
+        ));
+        let prepared = trace.ok(operations.prepare_runtime(offered, base + 1));
+        let invoking = trace.ok(operations.begin_backend(prepared, ExactBackendAction::Start));
+        let pending = c57_pending(
+            trace,
+            operations.backend_pending(invoking, ExactBackendPendingKind::WriteWaiting, base + 2),
+        );
+        c57_register_pending(trace, operations, leases, pending, continuation)
+    }
+
+    fn c57_consume_wait(
+        trace: &mut C57Trace,
+        operations: &mut TestLedger,
+        leases: &mut TestLeaseLedger,
+        wait: C57RegisteredWait,
+        separately_signalled: bool,
+    ) -> TestSnapshot {
+        trace.enter(if separately_signalled {
+            "signal-then-consume"
+        } else {
+            "raced-signal-consume"
+        });
+        let before = leases.metrics().current();
+        let receipt = if separately_signalled {
+            trace.ok(leases.mark_signalled(wait.lease, wait.continuation))
+        } else {
+            wait.lease
+        };
+        let consumed = trace.ok(operations.consume_continuation(wait.operation, wait.continuation));
+        trace.ok(leases.consume_continuation(receipt, wait.continuation));
+        trace.equal(
+            before - leases.metrics().current(),
+            2,
+            "one wait did not debit exactly its wake and continuation",
+        );
+        trace.lease_bounds(leases);
+        consumed
+    }
+
+    fn c57_finish_leases(
+        trace: &mut C57Trace,
+        leases: &mut TestLeaseLedger,
+        identity: ExactInstanceIdentity<u64, u64, u64, u64>,
+        remaining_caps: u8,
+    ) {
+        trace.enter("lease-terminal");
+        trace.equal(
+            leases.terminal_empty(identity),
+            Ok(true),
+            "terminal lease ledger retained a transient authority",
+        );
+        trace.ok(leases.reset_stream_caps(identity, remaining_caps));
+        trace.ok(leases.retire(identity));
+        trace.equal(
+            leases.metrics().current(),
+            0,
+            "retired lease ledger retained authority",
+        );
+        trace.check(leases.is_retired(), "lease ledger did not retire");
+        trace.lease_bounds(leases);
+    }
+
+    fn c57_finish_operations(
+        trace: &mut C57Trace,
+        operations: &mut TestLedger,
+        identity: ExactInstanceIdentity<u64, u64, u64, u64>,
+        owner_is_live: bool,
+    ) {
+        trace.enter("operation-terminal");
+        trace.equal(
+            operations.terminal_empty(identity),
+            Ok(true),
+            "terminal operation ledger retained work or spill",
+        );
+        if owner_is_live {
+            trace.ok(operations.acknowledge_runtime_owner_drop(identity));
+        }
+        trace.ok(operations.retire(identity));
+        trace.equal(
+            operations.phase(),
+            ExactLedgerPhase::Retired,
+            "operation ledger did not retire",
+        );
+    }
+
+    fn c57_quantum_trace(trace: &mut C57Trace) {
+        let identity = trace.identity();
+        let mut leases = TestLeaseLedger::new();
+        trace.enter("quantum-bind");
+        trace.ok(leases.bind(identity));
+        let spill = lease_spill(identity, 1, 9, 3);
+        trace.ok(leases.begin_input_spill(&spill));
+        trace.ok(leases.begin_backend(identity));
+        let token = trace.token_base();
+
+        trace.enter("quantum-first");
+        let first = trace.ok(leases.reserve_quantum_continuation(identity));
+        let first = trace.ok(leases.bind_continuation(first, token));
+        trace.ok(leases.consume_quantum_continuation(first, token));
+        let stable = leases.metrics();
+        trace.equal(
+            leases.consume_quantum_continuation(first, token),
+            Err(ExactNativeLeaseError::StaleReceipt),
+            "completed quantum receipt was not inert",
+        );
+        trace.equal(leases.metrics(), stable, "stale quantum changed accounting");
+
+        trace.enter("quantum-aba");
+        let second = trace.ok(leases.reserve_quantum_continuation(identity));
+        let second = trace.ok(leases.bind_continuation(second, token));
+        let live = leases.metrics();
+        trace.equal(
+            leases.consume_quantum_continuation(first, token),
+            Err(ExactNativeLeaseError::StaleReceipt),
+            "old quantum receipt consumed a same-token successor",
+        );
+        trace.equal(leases.metrics(), live, "ABA replay changed accounting");
+        if trace.next() & 1 == 0 {
+            trace.ok(leases.consume_quantum_continuation(second, token));
+        } else {
+            trace.ok(leases.drop_cancelled_continuation(second, token));
+        }
+        trace.ok(leases.finish_backend(identity));
+        trace.ok(leases.finish_input_spill(identity));
+        c57_finish_leases(trace, &mut leases, identity, 4);
+    }
+
+    fn c57_runtime_wait_trace(trace: &mut C57Trace) {
+        let identity = trace.identity();
+        let mut leases = TestLeaseLedger::new();
+        trace.enter("runtime-wait-bind");
+        trace.ok(leases.bind(identity));
+        let spill = lease_spill(identity, 1, 17, 5);
+        trace.ok(leases.begin_input_spill(&spill));
+        let mut wait_token = trace.token_base();
+        trace.ok(leases.begin_runtime_wait(identity, wait_token));
+        let continuation = trace.token_base();
+        let rounds = 1 + (trace.next() % 3) as usize;
+        let mut old = None;
+
+        for round in 0..rounds {
+            trace.enter("runtime-wait-register");
+            let reserved = trace.ok(leases.reserve_continuation(identity));
+            let bound = trace.ok(leases.bind_continuation(reserved, continuation));
+            let registered = trace.ok(leases.register_runtime_wake(bound, wait_token));
+            trace.equal(
+                leases.metrics().current(),
+                EXACT_NATIVE_LEASE_LIMIT,
+                "spill plus runtime wait did not reach the exact R peak",
+            );
+            if let Some(stale) = old {
+                let live_metrics = leases.metrics();
+                let live_registration = trace.ok(leases.continuation(identity));
+                trace.equal(
+                    leases.consume_continuation(stale, continuation),
+                    Err(ExactNativeLeaseError::StaleReceipt),
+                    "old runtime-wait receipt consumed its same-token successor",
+                );
+                trace.equal(
+                    leases.metrics(),
+                    live_metrics,
+                    "stale runtime-wait receipt changed accounting",
+                );
+                trace.equal(
+                    trace.ok(leases.continuation(identity)),
+                    live_registration,
+                    "stale runtime-wait receipt replaced the live registration",
+                );
+            }
+
+            trace.enter("runtime-wait-resume");
+            if trace.next() & 1 == 0 {
+                let signalled = trace.ok(leases.mark_signalled(registered, continuation));
+                trace.ok(leases.consume_continuation(signalled, continuation));
+            } else {
+                // A listener which became ready during registration can
+                // return its exact Core receipt before the separate signalled
+                // projection reaches this aggregate ledger.
+                trace.ok(leases.consume_continuation(registered, continuation));
+            }
+            old = Some(registered);
+            if round + 1 != rounds {
+                let next_wait = wait_token + 1;
+                trace.ok(leases.rotate_runtime_wait(identity, wait_token, next_wait));
+                wait_token = next_wait;
+            }
+            trace.lease_bounds(&leases);
+        }
+
+        trace.ok(leases.finish_runtime_wait(identity, wait_token));
+        trace.ok(leases.finish_input_spill(identity));
+        c57_finish_leases(trace, &mut leases, identity, 4);
+    }
+
+    fn c57_backpressure_trace(trace: &mut C57Trace) {
+        let identity = trace.identity();
+        let base = trace.token_base();
+        let mut operations = TestLedger::new();
+        let mut leases = TestLeaseLedger::new();
+        c57_bind(trace, &mut operations, &mut leases, identity);
+
+        trace.enter("spill-linearize");
+        trace.ok(leases.begin_backend(identity));
+        let offered = trace.ok(operations.begin_runtime(
+            identity,
+            base,
+            ExactStreamResource::StdinReader,
+            ExactHostFunction::InputStream,
+            3,
+        ));
+        let prepared = trace.ok(operations.prepare_runtime(offered, base + 1));
+        let invoking = trace.ok(operations.begin_backend(prepared, ExactBackendAction::Start));
+        let pending = c57_pending(
+            trace,
+            operations.backend_pending(invoking, ExactBackendPendingKind::ReadPrepared, base + 2),
+        );
+        let invoking =
+            trace.ok(operations.begin_backend(pending, ExactBackendAction::CommitPrepared));
+        let received = trace.ok(operations.backend_linearized(
+            invoking,
+            BackendEffect::InputReceived {
+                total: 9,
+                cursor: 0,
+            },
+        ));
+        let spill = trace
+            .ok(operations.commit_input_prefix(received, 3))
+            .expect("six exact spill bytes remain");
+        trace.ok(leases.begin_input_spill(&spill));
+        trace.ok(leases.finish_backend(identity));
+
+        let request_units = 1 + (trace.next() % 31) as u16;
+        let continuation = trace.token_base();
+        let mut wait = c57_begin_registered_output(
+            trace,
+            &mut operations,
+            &mut leases,
+            identity,
+            base + 0x20,
+            request_units,
+            continuation,
+        );
+        trace.equal(
+            leases.metrics().current(),
+            EXACT_NATIVE_LEASE_LIMIT,
+            "spill plus backpressured write did not reach R",
+        );
+        let rounds = 1 + (trace.next() % 4) as usize;
+        let mut old_lease = None;
+
+        for round in 0..rounds {
+            if let Some(stale) = old_lease {
+                trace.enter("backpressure-stale-continuation");
+                let live_metrics = leases.metrics();
+                let live_registration = trace.ok(leases.continuation(identity));
+                trace.equal(
+                    leases.consume_continuation(stale, continuation),
+                    Err(ExactNativeLeaseError::StaleReceipt),
+                    "old backpressure receipt consumed a successor",
+                );
+                trace.equal(leases.metrics(), live_metrics, "stale receipt changed R");
+                trace.equal(
+                    trace.ok(leases.continuation(identity)),
+                    live_registration,
+                    "stale receipt replaced the live continuation",
+                );
+            }
+            let separately_signalled = trace.next() & 1 == 0;
+            let consumed = c57_consume_wait(
+                trace,
+                &mut operations,
+                &mut leases,
+                wait,
+                separately_signalled,
+            );
+            old_lease = Some(wait.lease);
+            trace.enter("backpressure-resume");
+            let invoking = trace.ok(operations.begin_backend(consumed, ExactBackendAction::Resume));
+            if round + 1 == rounds {
+                let sent = trace.ok(operations.backend_linearized(
+                    invoking,
+                    BackendEffect::OutputSent {
+                        length: request_units,
+                    },
+                ));
+                trace.ok(operations.commit_runtime(sent));
+            } else {
+                let pending = c57_pending(
+                    trace,
+                    operations.backend_pending(
+                        invoking,
+                        ExactBackendPendingKind::WriteWaiting,
+                        base + 0x30 + round as u64,
+                    ),
+                );
+                wait = c57_register_pending(
+                    trace,
+                    &mut operations,
+                    &mut leases,
+                    pending,
+                    continuation,
+                );
+            }
+            trace.lease_bounds(&leases);
+        }
+
+        trace.enter("spill-drain");
+        trace.ok(leases.finish_backend(identity));
+        let remaining = spill.remaining();
+        let offered =
+            trace.ok(operations.attach_input_runtime(spill, base + 0x100, usize::from(remaining)));
+        let prepared = trace.ok(operations.prepare_input_runtime(offered, base + 0x101));
+        trace.equal(
+            trace.ok(operations.commit_input_prefix(prepared, remaining)),
+            None,
+            "exact spill suffix did not drain",
+        );
+        trace.ok(leases.finish_input_spill(identity));
+        c57_finish_operations(trace, &mut operations, identity, true);
+        c57_finish_leases(trace, &mut leases, identity, 4);
+    }
+
+    fn c57_finish_physical_cancel(
+        trace: &mut C57Trace,
+        operations: &mut TestLedger,
+        plan: TestCancelPlan,
+    ) -> TestSnapshot {
+        let stage = Cell::new(0_u8);
+        let cancelled = Cell::new(None);
+        trace.enter("physical-cancel-before-credit");
+        trace.ok(exact_backend_cancel_then_release(
+            || {
+                if stage.get() != 0 {
+                    return Err(ExactLedgerError::InvalidTransition);
+                }
+                stage.set(1);
+                Ok(())
+            },
+            || {
+                if stage.get() != 1 {
+                    return Err(ExactLedgerError::InvalidTransition);
+                }
+                cancelled.set(Some(operations.finish_cancel(plan)?));
+                stage.set(2);
+                Ok(())
+            },
+        ));
+        trace.equal(
+            stage.get(),
+            2,
+            "cancellation receipt was published before physical cancellation",
+        );
+        cancelled.get().expect("cancelled snapshot was published")
+    }
+
+    fn c57_revoke_trace(trace: &mut C57Trace, consumed_before_revoke: bool) {
+        let identity = trace.identity();
+        let base = trace.token_base();
+        let continuation = trace.token_base();
+        let request_units = 1 + (trace.next() % 31) as u16;
+        let mut operations = TestLedger::new();
+        let mut leases = TestLeaseLedger::new();
+        c57_bind(trace, &mut operations, &mut leases, identity);
+        let wait = c57_begin_registered_output(
+            trace,
+            &mut operations,
+            &mut leases,
+            identity,
+            base,
+            request_units,
+            continuation,
+        );
+
+        let operation = if consumed_before_revoke {
+            let separately_signalled = trace.next() & 1 == 0;
+            c57_consume_wait(
+                trace,
+                &mut operations,
+                &mut leases,
+                wait,
+                separately_signalled,
+            )
+        } else {
+            wait.operation
+        };
+        trace.enter(if consumed_before_revoke {
+            "post-await-revoke"
+        } else {
+            "pre-await-revoke"
+        });
+        trace.equal(
+            operation.effect(),
+            None,
+            "pending write published before revoke",
+        );
+        let plan = c57_cancel_plan(
+            trace,
+            trace.ok(operations.claim_revoke(identity, ExactStreamResource::StdoutWriter)),
+        );
+        trace.ok(operations.finish_cap_revoke(plan.resource_revoke_plan()));
+        let mut cancelled = c57_finish_physical_cancel(trace, &mut operations, plan);
+
+        if consumed_before_revoke {
+            trace.equal(
+                cancelled.continuation(),
+                ExactContinuation::Consumed(continuation),
+                "post-await revoke lost the typed consumed receipt",
+            );
+        } else {
+            let signalled_lease = trace.ok(leases.mark_signalled(wait.lease, continuation));
+            trace.ok(leases.consume_continuation(signalled_lease, continuation));
+            let cleanup = if trace.next() & 1 == 0 {
+                ExactContinuationCleanup::Signalled
+            } else {
+                ExactContinuationCleanup::AlreadySignalled
+            };
+            cancelled =
+                trace.ok(operations.finish_continuation_cleanup(cancelled, continuation, cleanup));
+            cancelled =
+                trace.ok(operations.acknowledge_cancelled_continuation(cancelled, continuation));
+        }
+        let acknowledged = trace
+            .ok(operations.acknowledge_runtime_cleanup(cancelled, ExactRuntimeCleanup::Cancelled));
+        trace.ok(operations.consume_cancelled(acknowledged));
+        trace.equal(
+            operations.resource_state(identity, ExactStreamResource::StdoutWriter),
+            Ok(ExactResourceState::Revoked),
+            "revoke did not latch the exact output resource",
+        );
+        trace.ok(leases.finish_backend(identity));
+        trace.ok(leases.release_stream_cap(identity, ExactStreamResource::StdoutWriter));
+        c57_finish_operations(trace, &mut operations, identity, true);
+        c57_finish_leases(trace, &mut leases, identity, 3);
+    }
+
+    fn c57_raw_fault_trace(trace: &mut C57Trace) {
+        let identity = trace.identity();
+        let base = trace.token_base();
+        let continuation = trace.token_base();
+        let mut operations = TestLedger::new();
+        let mut leases = TestLeaseLedger::new();
+        c57_bind(trace, &mut operations, &mut leases, identity);
+        let wait = c57_begin_registered_output(
+            trace,
+            &mut operations,
+            &mut leases,
+            identity,
+            base,
+            1,
+            continuation,
+        );
+        let consumed_before_fault = trace.next() & 1 == 0;
+        if consumed_before_fault {
+            let separately_signalled = trace.next() & 1 == 0;
+            let _ = c57_consume_wait(
+                trace,
+                &mut operations,
+                &mut leases,
+                wait,
+                separately_signalled,
+            );
+        }
+
+        trace.enter("raw-fault-claim");
+        let plan = c57_cleanup_plan(trace, trace.ok(operations.raw_fault(identity)));
+        let mut cancelled = c57_finish_physical_cancel(trace, &mut operations, plan);
+        if !consumed_before_fault {
+            trace.ok(leases.abandon_continuation_raw_fault(wait.lease));
+            cancelled = trace.ok(operations.finish_continuation_cleanup(
+                cancelled,
+                continuation,
+                ExactContinuationCleanup::Abandoned,
+            ));
+        }
+        let abandoned = trace
+            .ok(operations.acknowledge_runtime_cleanup(cancelled, ExactRuntimeCleanup::Abandoned));
+        trace.ok(operations.consume_cancelled(abandoned));
+        trace.equal(
+            operations.raw_fault(identity),
+            Ok(ExactCleanupDecision::ReclaimSafe),
+            "raw-fault cleanup did not become reclaim-safe",
+        );
+        trace.ok(leases.finish_backend(identity));
+        c57_finish_operations(trace, &mut operations, identity, false);
+        c57_finish_leases(trace, &mut leases, identity, 4);
+    }
+
+    fn c57_payload_drop_trace(trace: &mut C57Trace) {
+        let identity = trace.identity();
+        let base = trace.token_base();
+        let continuation = trace.token_base();
+        let mut operations = TestLedger::new();
+        let mut leases = TestLeaseLedger::new();
+        c57_bind(trace, &mut operations, &mut leases, identity);
+        let wait = c57_begin_registered_output(
+            trace,
+            &mut operations,
+            &mut leases,
+            identity,
+            base,
+            1,
+            continuation,
+        );
+
+        trace.enter("payload-drop-claim");
+        trace.ok(operations.acknowledge_runtime_owner_drop(identity));
+        let plan = c57_cleanup_plan(
+            trace,
+            trace.ok(operations.prepare_finalizer(identity, false)),
+        );
+        let mut cancelled = c57_finish_physical_cancel(trace, &mut operations, plan);
+        trace.ok(leases.drop_cancelled_continuation(wait.lease, continuation));
+        cancelled = trace.ok(operations.finish_continuation_cleanup(
+            cancelled,
+            continuation,
+            ExactContinuationCleanup::Cancelled,
+        ));
+        let dropped = trace
+            .ok(operations.acknowledge_runtime_cleanup(cancelled, ExactRuntimeCleanup::Dropped));
+        trace.ok(operations.consume_cancelled(dropped));
+        trace.equal(
+            operations.prepare_finalizer(identity, false),
+            Ok(ExactCleanupDecision::ReclaimSafe),
+            "payload-drop cleanup did not become reclaim-safe",
+        );
+        trace.ok(leases.finish_backend(identity));
+        c57_finish_operations(trace, &mut operations, identity, false);
+        c57_finish_leases(trace, &mut leases, identity, 4);
+    }
+
+    fn c57_replacement_trace(trace: &mut C57Trace) {
+        let old_identity = trace.identity();
+        let new_identity = trace.identity();
+        let base = trace.token_base();
+        let continuation = trace.token_base();
+        let effect = BackendEffect::OutputSent { length: 1 };
+        let mut operations = TestLedger::new();
+        let mut leases = TestLeaseLedger::new();
+        c57_bind(trace, &mut operations, &mut leases, old_identity);
+        let old_wait = c57_begin_registered_output(
+            trace,
+            &mut operations,
+            &mut leases,
+            old_identity,
+            base,
+            1,
+            continuation,
+        );
+        let consumed = c57_consume_wait(trace, &mut operations, &mut leases, old_wait, true);
+        let old_invoking = trace.ok(operations.begin_backend(consumed, ExactBackendAction::Resume));
+        let linearized = trace.ok(operations.backend_linearized(old_invoking, effect));
+        trace.ok(operations.commit_runtime(linearized));
+        trace.ok(leases.finish_backend(old_identity));
+        c57_finish_operations(trace, &mut operations, old_identity, true);
+        c57_finish_leases(trace, &mut leases, old_identity, 4);
+
+        trace.enter("replacement-bind");
+        c57_bind(trace, &mut operations, &mut leases, new_identity);
+        // Reuse every opaque numeric token deliberately. Exact CONTROL and
+        // private receipt generations, not token value, must block ABA.
+        let new_wait = c57_begin_registered_output(
+            trace,
+            &mut operations,
+            &mut leases,
+            new_identity,
+            base,
+            1,
+            continuation,
+        );
+        let replacement_snapshot = trace.ok(operations.snapshot(new_identity));
+        let replacement_metrics = leases.metrics();
+        let replacement_continuation = trace.ok(leases.continuation(new_identity));
+
+        trace.enter("replacement-late-backend");
+        trace.equal(
+            operations.backend_linearized(old_invoking, effect),
+            Err(ExactLedgerError::StaleGeneration),
+            "late backend completion was not inert after replacement",
+        );
+        trace.equal(
+            trace.ok(operations.snapshot(new_identity)),
+            replacement_snapshot,
+            "late backend completion mutated replacement operation",
+        );
+        trace.check(
+            !operations.is_quarantined(),
+            "stale completion quarantined replacement",
+        );
+
+        trace.enter("replacement-late-continuation");
+        trace.equal(
+            operations.consume_continuation(old_wait.operation, continuation),
+            Err(ExactLedgerError::StaleGeneration),
+            "old operation continuation was not inert after replacement",
+        );
+        trace.equal(
+            leases.consume_continuation(old_wait.lease, continuation),
+            Err(ExactNativeLeaseError::StaleGeneration),
+            "old lease receipt was not inert after replacement",
+        );
+        trace.equal(
+            trace.ok(operations.snapshot(new_identity)),
+            replacement_snapshot,
+            "stale continuation mutated replacement operation",
+        );
+        trace.equal(
+            leases.metrics(),
+            replacement_metrics,
+            "stale continuation changed replacement accounting",
+        );
+        trace.equal(
+            trace.ok(leases.continuation(new_identity)),
+            replacement_continuation,
+            "stale continuation displaced replacement registration",
+        );
+        trace.check(
+            !leases.is_quarantined(),
+            "stale receipt quarantined replacement",
+        );
+
+        let consumed = c57_consume_wait(trace, &mut operations, &mut leases, new_wait, false);
+        let invoking = trace.ok(operations.begin_backend(consumed, ExactBackendAction::Resume));
+        let linearized = trace.ok(operations.backend_linearized(invoking, effect));
+        trace.ok(operations.commit_runtime(linearized));
+        trace.ok(leases.finish_backend(new_identity));
+        c57_finish_operations(trace, &mut operations, new_identity, true);
+        c57_finish_leases(trace, &mut leases, new_identity, 4);
+    }
+
+    fn c57_run_case(trace: &mut C57Trace, case: C57TraceCase) {
+        trace.case = case;
+        trace.phase = "case-entry";
+        match case {
+            C57TraceCase::Quantum => c57_quantum_trace(trace),
+            C57TraceCase::RuntimeWait => c57_runtime_wait_trace(trace),
+            C57TraceCase::Backpressure => c57_backpressure_trace(trace),
+            C57TraceCase::RevokeBeforeAwait => c57_revoke_trace(trace, false),
+            C57TraceCase::RevokeAfterAwait => c57_revoke_trace(trace, true),
+            C57TraceCase::RawFault => c57_raw_fault_trace(trace),
+            C57TraceCase::PayloadDrop => c57_payload_drop_trace(trace),
+            C57TraceCase::Replacement => c57_replacement_trace(trace),
+        }
+    }
+
+    fn c57_run_case_with_context(trace: &mut C57Trace, case: C57TraceCase) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            c57_run_case(trace, case);
+        }));
+        if result.is_err() {
+            panic!(
+                "C5.7 reproducible failure: seed={:#018x} step={} case={:?} phase={} rng={:#018x}",
+                trace.initial_seed, trace.step, trace.case, trace.phase, trace.random
+            );
+        }
+    }
+
+    /// Deterministic transition fuzz for the allocation-free kernel side of
+    /// C5.7. The mandatory prefix makes every named lifecycle edge a coverage
+    /// requirement; the bounded pseudo-random suffix explores their ordering
+    /// and receipt-generation choices without introducing a non-reproducible
+    /// CI dependency.
+    #[test]
+    fn seeded_async_state_machines_never_strand_authority_or_wake_replacements() {
+        for initial_seed in C57_TRACE_SEEDS {
+            let mut trace = C57Trace::new(initial_seed);
+            for case in C57TraceCase::PREFIX {
+                c57_run_case_with_context(&mut trace, case);
+                trace.step += 1;
+            }
+            for _ in 0..C57_TRACE_STEPS {
+                let case = C57TraceCase::from_index(trace.next());
+                c57_run_case_with_context(&mut trace, case);
+                trace.step += 1;
+            }
+        }
+    }
 }

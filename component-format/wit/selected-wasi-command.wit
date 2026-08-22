@@ -1,0 +1,85 @@
+package vibe:wasi-selected@1.0.0;
+
+// Exact, locally retained subset of WASI 0.3.0 at the revision pinned by
+// `WASI_API_REVISION`. Nested packages keep the complete selected type graph in
+// one inert source file; this file grants no host implementation or authority.
+package wasi:clocks@0.3.0 {
+    @since(version = 0.3.0)
+    interface types {
+        @since(version = 0.3.0)
+        type duration = u64;
+    }
+
+    @since(version = 0.3.0)
+    interface monotonic-clock {
+        use types.{duration};
+
+        @since(version = 0.3.0)
+        type mark = u64;
+
+        @since(version = 0.3.0)
+        now: func() -> mark;
+
+        @since(version = 0.3.0)
+        get-resolution: func() -> duration;
+
+        @since(version = 0.3.0)
+        wait-until: async func(when: mark);
+
+        @since(version = 0.3.0)
+        wait-for: async func(how-long: duration);
+    }
+}
+
+package wasi:random@0.3.0 {
+    @since(version = 0.3.0)
+    interface random {
+        @since(version = 0.3.0)
+        get-random-bytes: func(max-len: u64) -> list<u8>;
+
+        @since(version = 0.3.0)
+        get-random-u64: func() -> u64;
+    }
+}
+
+package wasi:cli@0.3.0 {
+    @since(version = 0.3.0)
+    interface types {
+        @since(version = 0.3.0)
+        enum error-code {
+            io,
+            illegal-byte-sequence,
+            pipe,
+        }
+    }
+
+    @since(version = 0.3.0)
+    interface stdin {
+        use types.{error-code};
+
+        @since(version = 0.3.0)
+        read-via-stream: func() -> tuple<stream<u8>, future<result<_, error-code>>>;
+    }
+
+    @since(version = 0.3.0)
+    interface stdout {
+        use types.{error-code};
+
+        @since(version = 0.3.0)
+        write-via-stream: func(data: stream<u8>) -> future<result<_, error-code>>;
+    }
+
+    @since(version = 0.3.0)
+    interface run {
+        @since(version = 0.3.0)
+        run: async func() -> result;
+    }
+}
+
+world command {
+    import wasi:clocks/monotonic-clock@0.3.0;
+    import wasi:random/random@0.3.0;
+    import wasi:cli/stdin@0.3.0;
+    import wasi:cli/stdout@0.3.0;
+    export wasi:cli/run@0.3.0;
+}

@@ -1,13 +1,19 @@
 use vibeos_component_format::{
     CanonicalAbiFeature, CoreFeature, LimitError, LimitKind, ProfileIdentity, ProfileStage,
-    TrapCode, ValidationAccount, ARTIFACT_ABI_VERSION, ARTIFACT_MAGIC, ASYNC_ARTIFACT_ABI_VERSION,
+    SelectedWasiCapability, SelectedWasiInterfaceDirection, SelectedWasiMappingCategory, TrapCode,
+    ValidationAccount, ARTIFACT_ABI_VERSION, ARTIFACT_MAGIC, ASYNC_ARTIFACT_ABI_VERSION,
     ASYNC_CANONICAL_ABI_REVISION, ASYNC_COMPONENT_MODEL_REVISION, ASYNC_RUNTIME_ABI_VERSION,
     ASYNC_WASM_TOOLS_REVISION, CANONICAL_ABI_REVISION, COMPONENT_MODEL_REVISION,
     COMPONENT_PROFILE_VERSION, CORE_PROFILE_VERSION,
     NATIVE_ASYNC_RESOURCE_FREE_ARTIFACT_ABI_VERSION,
     NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_ABI_REVISION,
     NATIVE_ASYNC_RESOURCE_FREE_RUNTIME_ABI_VERSION, NATIVE_ASYNC_RESOURCE_FREE_WASI_REVISION,
-    PROFILE_1_LIMITS, RUNTIME_ABI_VERSION, SYNC_WASM_TOOLS_REVISION, WASI_API_REVISION,
+    PROFILE_1_LIMITS, RUNTIME_ABI_VERSION, SELECTED_WASI_CLI_TYPES_INTERFACE,
+    SELECTED_WASI_CLOCK_TYPES_INTERFACE, SELECTED_WASI_COMMAND_STDIN_INTERFACE,
+    SELECTED_WASI_COMMAND_STDOUT_INTERFACE, SELECTED_WASI_COMMAND_WIT, SELECTED_WASI_COMMAND_WORLD,
+    SELECTED_WASI_INTERFACE_MAPPINGS, SELECTED_WASI_INVOCATION_LIFECYCLE_INTERFACE,
+    SELECTED_WASI_MONOTONIC_CLOCK_INTERFACE, SELECTED_WASI_PACKAGES,
+    SELECTED_WASI_SECURE_RANDOM_INTERFACE, SYNC_WASM_TOOLS_REVISION, WASI_API_REVISION,
     WASMPARSER_0_255_0_CHECKSUM, WASM_ENCODER_0_255_0_CHECKSUM, WIT_PACKAGES,
     WIT_PARSER_0_255_0_CHECKSUM,
 };
@@ -26,9 +32,145 @@ fn profile_identity_and_packages_are_exact() {
         "wasmparser-component-model-0.255.0"
     );
     assert_eq!(CANONICAL_ABI_REVISION, "component-model-0.255.0-sync");
-    assert_eq!(WIT_PACKAGES.len(), 5);
-    assert_eq!(WIT_PACKAGES[0].name, "vibe:stream");
-    assert_eq!(WIT_PACKAGES[4].version, "1.0.0");
+    assert_eq!(
+        WIT_PACKAGES.map(|package| (package.name, package.version)),
+        [
+            ("vibe:stream", "1.0.0"),
+            ("vibe:clock", "1.0.0"),
+            ("vibe:random", "1.0.0"),
+            ("vibe:blob", "1.0.0"),
+            ("vibe:log", "1.0.0"),
+        ]
+    );
+}
+
+#[test]
+fn c56_selected_wasi_command_contract_and_mapping_are_exact() {
+    assert_eq!(
+        SELECTED_WASI_COMMAND_WORLD,
+        "vibe:wasi-selected/command@1.0.0"
+    );
+    assert_eq!(
+        SELECTED_WASI_PACKAGES.map(|package| (package.name, package.version)),
+        [
+            ("wasi:clocks", "0.3.0"),
+            ("wasi:random", "0.3.0"),
+            ("wasi:cli", "0.3.0"),
+        ]
+    );
+
+    assert_eq!(
+        SELECTED_WASI_CLOCK_TYPES_INTERFACE,
+        "wasi:clocks/types@0.3.0"
+    );
+    assert_eq!(SELECTED_WASI_CLI_TYPES_INTERFACE, "wasi:cli/types@0.3.0");
+
+    let expected = [
+        (
+            SELECTED_WASI_MONOTONIC_CLOCK_INTERFACE,
+            SelectedWasiInterfaceDirection::Import,
+            SelectedWasiMappingCategory::Capability(SelectedWasiCapability::MonotonicClock),
+            Some(SelectedWasiCapability::MonotonicClock),
+        ),
+        (
+            SELECTED_WASI_SECURE_RANDOM_INTERFACE,
+            SelectedWasiInterfaceDirection::Import,
+            SelectedWasiMappingCategory::Capability(SelectedWasiCapability::SecureRandom),
+            Some(SelectedWasiCapability::SecureRandom),
+        ),
+        (
+            SELECTED_WASI_COMMAND_STDIN_INTERFACE,
+            SelectedWasiInterfaceDirection::Import,
+            SelectedWasiMappingCategory::CommandStdin,
+            None,
+        ),
+        (
+            SELECTED_WASI_COMMAND_STDOUT_INTERFACE,
+            SelectedWasiInterfaceDirection::Import,
+            SelectedWasiMappingCategory::CommandStdout,
+            None,
+        ),
+        (
+            SELECTED_WASI_INVOCATION_LIFECYCLE_INTERFACE,
+            SelectedWasiInterfaceDirection::Export,
+            SelectedWasiMappingCategory::InvocationLifecycle,
+            None,
+        ),
+    ];
+    assert_eq!(SELECTED_WASI_INTERFACE_MAPPINGS.len(), expected.len());
+    for (mapping, (interface, direction, category, capability)) in
+        SELECTED_WASI_INTERFACE_MAPPINGS.iter().zip(expected)
+    {
+        assert_eq!(mapping.interface(), interface);
+        assert_eq!(mapping.direction(), direction);
+        assert_eq!(mapping.category(), category);
+        assert_eq!(mapping.capability(), capability);
+        assert_ne!(mapping.interface(), SELECTED_WASI_CLOCK_TYPES_INTERFACE);
+        assert_ne!(mapping.interface(), SELECTED_WASI_CLI_TYPES_INTERFACE);
+    }
+    for (index, mapping) in SELECTED_WASI_INTERFACE_MAPPINGS.iter().enumerate() {
+        assert!(SELECTED_WASI_INTERFACE_MAPPINGS[..index]
+            .iter()
+            .all(|earlier| earlier.interface() != mapping.interface()));
+    }
+
+    for marker in [
+        "package vibe:wasi-selected@1.0.0;",
+        "package wasi:clocks@0.3.0 {",
+        "package wasi:random@0.3.0 {",
+        "package wasi:cli@0.3.0 {",
+        "world command {",
+        "type duration = u64;",
+        "wait-until: async func(when: mark);",
+        "wait-for: async func(how-long: duration);",
+        "get-random-bytes: func(max-len: u64) -> list<u8>;",
+        "read-via-stream: func() -> tuple<stream<u8>, future<result<_, error-code>>>;",
+        "write-via-stream: func(data: stream<u8>) -> future<result<_, error-code>>;",
+        "run: async func() -> result;",
+        "import wasi:clocks/monotonic-clock@0.3.0;",
+        "import wasi:random/random@0.3.0;",
+        "import wasi:cli/stdin@0.3.0;",
+        "import wasi:cli/stdout@0.3.0;",
+        "export wasi:cli/run@0.3.0;",
+    ] {
+        assert!(SELECTED_WASI_COMMAND_WIT.contains(marker), "{marker}");
+    }
+    // The nested operational interfaces refer to these type interfaces. The
+    // resolver expands their exact identities; the world must not duplicate
+    // them as explicit imports.
+    for type_only in [
+        SELECTED_WASI_CLOCK_TYPES_INTERFACE,
+        SELECTED_WASI_CLI_TYPES_INTERFACE,
+    ] {
+        assert!(
+            !SELECTED_WASI_COMMAND_WIT.contains(type_only),
+            "{type_only}"
+        );
+    }
+    for ambient in [
+        "system-clock",
+        "timezone",
+        "insecure-seed",
+        "interface insecure",
+        "interface environment",
+        "interface exit",
+        "interface stderr",
+        "terminal-",
+        "wasi:filesystem",
+        "wasi:sockets",
+    ] {
+        assert!(!SELECTED_WASI_COMMAND_WIT.contains(ambient), "{ambient}");
+    }
+
+    assert_eq!(
+        ProfileIdentity::PROFILE_1_ASYNC.wasi_revision,
+        WASI_API_REVISION
+    );
+    assert_eq!(
+        ProfileIdentity::PROFILE_1_ASYNC.stage,
+        ProfileStage::ValidationOnly
+    );
+    assert!(!ProfileIdentity::PROFILE_1_ASYNC.execution_enabled());
 }
 
 #[test]

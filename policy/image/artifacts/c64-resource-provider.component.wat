@@ -1,0 +1,20 @@
+(component
+  (type $handle (resource (rep i32)))
+  (type $borrow-handle (borrow $handle))
+  (type $own-handle (own $handle))
+  (type $inspect-type (func (param "value" $borrow-handle) (result u32)))
+  (type $transfer-type (func (param "value" $own-handle)))
+  (core module $module
+    (func (export "inspect") (param i32) (result i32)
+      local.get 0)
+    (func (export "transfer") (param i32)))
+  (core instance $instance (instantiate $module))
+  (alias core export $instance "inspect" (core func $inspect-core))
+  (alias core export $instance "transfer" (core func $transfer-core))
+  (func $inspect (type $inspect-type) (canon lift (core func $inspect-core)))
+  (func $transfer (type $transfer-type) (canon lift (core func $transfer-core)))
+  (instance $route
+    (export "handle" (type $handle))
+    (export "inspect" (func $inspect))
+    (export "transfer" (func $transfer)))
+  (export "test:c64-resource/route@1.0.0" (instance $route)))

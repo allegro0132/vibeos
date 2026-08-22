@@ -21,7 +21,10 @@ use core::task::{Context, Poll};
 
 #[cfg(feature = "wasm-c48-target-acceptance")]
 use crate::cap::CapabilityTableRange;
-use crate::cap::{CSpace, CSpaceIdentity, CSpaceResetError};
+use crate::cap::{
+    CSpace, CSpaceIdentity, CSpaceResetError, CapError, SupervisedTransferReceipt,
+    SupervisedTransferStage,
+};
 use crate::exec::{
     OneShotWaitFuture, OneShotWaitQueue, OneShotWake, PreparedReclaimableActivation,
     PreparedReclaimableBinding, ReclaimableFaultWitness, ReclaimableSchedulerIdentity,
@@ -44,6 +47,9 @@ pub const MAX_INSTANCE_SLOTS: usize = 16;
 pub const MAX_COMPONENT_INSTANCES: usize = MAX_INSTANCE_SLOTS;
 
 static PAYLOAD_POLL_ALWAYS_ALLOWED: AtomicU8 = AtomicU8::new(1);
+
+#[cfg(test)]
+static TEST_RESERVED_PAIR_POSTFLIGHT_FAULT: AtomicU8 = AtomicU8::new(0);
 
 const PHASE_BITS: u32 = 4;
 const PHASE_MASK: u64 = (1 << PHASE_BITS) - 1;
@@ -453,6 +459,16 @@ pub enum RegistryError {
     TerminalRetireFailed,
     CSpaceResetRejected,
     Quarantined,
+}
+
+/// Recoverable failure inside an exact reserved-space transfer gate.
+///
+/// Neither variant carries a capability selector, CSpace identity, registry
+/// token, durable object identity, or other authority-bearing diagnostic.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PairTransferError<E> {
+    Configure(E),
+    Capability(CapError),
 }
 
 #[derive(Clone, Copy)]
@@ -1408,6 +1424,368 @@ impl InstanceRegistry {
         drop(_transaction);
         system.restore();
         Ok(result)
+    }
+
+    /// Observe two exact, distinct registry-owned CSpaces in one unpublished
+    /// supervisor transaction.
+    ///
+    /// Both reservations, allocation domains, stable Space objects, CSpace
+    /// identities, and exact incarnations are validated before `configure` is
+    /// entered. Record and CSpace locks are always acquired in stable-slot
+    /// order, while callback arguments retain the caller's `first`, `second`
+    /// order. The callback receives shared references only. The registry
+    /// transaction prevents either reservation from being bound or published
+    /// until the callback and postflight both complete.
+    ///
+    /// This gate deliberately provides observation rather than capability
+    /// mutation. Cross-space capability operations must use
+    /// [`Self::transfer_reserved_space_pair`], whose sealed request executes
+    /// only after its complete registry postflight.
+    ///
+    /// # Safety
+    ///
+    /// `observe` has the complete no-escape contract of
+    /// [`Self::configure_reserved_space`] for both CSpaces. It must additionally
+    /// not exchange ownership through any side channel. It may perform bounded
+    /// allocation-free read-only capability validation through the supplied
+    /// shared references, but must not invoke a mutating capability API, reset
+    /// either CSpace, alter persistent lifecycle state, block, panic, re-enter
+    /// instance lifecycle APIs, or retain/return a reference, guard, `Arc`,
+    /// resource, or ownership obtained from either CSpace. The returned `R`
+    /// must contain only detached copy values.
+    pub unsafe fn with_reserved_space_pair<R: Copy>(
+        &self,
+        first: InstanceToken,
+        second: InstanceToken,
+        observe: impl FnOnce(&CSpace, &CSpace) -> R,
+    ) -> Result<R, RegistryError> {
+        if first.shares_stable_slot(second) {
+            return Err(RegistryError::IdentityMismatch);
+        }
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let result = (|| {
+            let _transaction = self.transaction.lock();
+            let (low_token, high_token, callback_reversed) = if first.slot < second.slot {
+                (first, second, false)
+            } else {
+                (second, first, true)
+            };
+            let Some(low_slot) = self.slot(low_token) else {
+                return Err(RegistryError::IdentityMismatch);
+            };
+            let Some(high_slot) = self.slot(high_token) else {
+                return Err(RegistryError::IdentityMismatch);
+            };
+            let mut low_record = low_slot.record.lock();
+            let mut high_record = high_slot.record.lock();
+
+            // A stale token is not authority to quarantine the current
+            // generation occupying that stable slot.
+            if !Self::token_matches(low_slot, &low_record, low_token)
+                || !Self::token_matches(high_slot, &high_record, high_token)
+            {
+                return Err(RegistryError::IdentityMismatch);
+            }
+            if !Self::reserved_record_is_unpublished(low_slot, &low_record)
+                || !Self::reserved_record_is_unpublished(high_slot, &high_record)
+            {
+                Self::quarantine_locked(low_slot, &mut low_record);
+                Self::quarantine_locked(high_slot, &mut high_record);
+                return Err(RegistryError::IdentityMismatch);
+            }
+
+            let low_domain = low_record
+                .domain
+                .expect("validated reservation retains its allocation domain");
+            let high_domain = high_record
+                .domain
+                .expect("validated reservation retains its allocation domain");
+            let low_seal = low_record
+                .space_seal
+                .expect("validated reservation retains its Space seal");
+            let high_seal = high_record
+                .space_seal
+                .expect("validated reservation retains its Space seal");
+            let low_space = low_record
+                .space
+                .as_deref()
+                .expect("validated reservation retains its Space");
+            let high_space = high_record
+                .space
+                .as_deref()
+                .expect("validated reservation retains its Space");
+
+            let distinct_bindings = low_domain != high_domain
+                && low_domain.owner != high_domain.owner
+                && low_domain.arena != high_domain.arena
+                && !core::ptr::eq(low_space, high_space)
+                && !core::ptr::eq(low_space.cspace(), high_space.cspace())
+                && low_seal.cspace_identity != high_seal.cspace_identity;
+            if !distinct_bindings
+                || !low_seal.immutable_objects_match(low_space)
+                || !high_seal.immutable_objects_match(high_space)
+            {
+                Self::quarantine_locked(low_slot, &mut low_record);
+                Self::quarantine_locked(high_slot, &mut high_record);
+                return Err(RegistryError::IdentityMismatch);
+            }
+
+            // Record and CSpace guards follow the same stable-slot order.
+            let low_cspace = low_space.cspace().lock();
+            let high_cspace = high_space.cspace().lock();
+            if !low_seal.reset_preflight_matches(&low_cspace)
+                || !high_seal.reset_preflight_matches(&high_cspace)
+                || low_cspace.identity() == high_cspace.identity()
+            {
+                drop(high_cspace);
+                drop(low_cspace);
+                Self::quarantine_locked(low_slot, &mut low_record);
+                Self::quarantine_locked(high_slot, &mut high_record);
+                return Err(RegistryError::IdentityMismatch);
+            }
+
+            let observed = if callback_reversed {
+                observe(&high_cspace, &low_cspace)
+            } else {
+                observe(&low_cspace, &high_cspace)
+            };
+            let post_matches = Self::token_matches(low_slot, &low_record, low_token)
+                && Self::token_matches(high_slot, &high_record, high_token)
+                && Self::reserved_record_is_unpublished(low_slot, &low_record)
+                && Self::reserved_record_is_unpublished(high_slot, &high_record)
+                && low_record.domain == Some(low_domain)
+                && high_record.domain == Some(high_domain)
+                && low_record.space_seal == Some(low_seal)
+                && high_record.space_seal == Some(high_seal)
+                && low_record
+                    .space
+                    .as_deref()
+                    .is_some_and(|space| low_seal.immutable_objects_match(space))
+                && high_record
+                    .space
+                    .as_deref()
+                    .is_some_and(|space| high_seal.immutable_objects_match(space))
+                && low_seal.reset_preflight_matches(&low_cspace)
+                && high_seal.reset_preflight_matches(&high_cspace);
+            if !post_matches {
+                drop(high_cspace);
+                drop(low_cspace);
+                let _ = observed;
+                Self::quarantine_locked(low_slot, &mut low_record);
+                Self::quarantine_locked(high_slot, &mut high_record);
+                return Err(RegistryError::IdentityMismatch);
+            }
+            drop(high_cspace);
+            drop(low_cspace);
+            Ok(observed)
+        })();
+        system.restore();
+        result
+    }
+
+    /// Transfer one sealed capability only after an exact two-reservation
+    /// lifecycle postflight, then infallibly commit prepared external state.
+    ///
+    /// Record and CSpace locks are acquired in stable-slot order, while
+    /// `prepare` observes shared CSpace references in the caller's `first`,
+    /// `second` order. `prepare` may couple an opaque core request to non-copy
+    /// resource-table rollback guards in [`SupervisedTransferStage`], but it
+    /// cannot mutate either CSpace. The complete registry and CSpace postflight
+    /// runs before the request is executed.
+    ///
+    /// A capability failure leaves both CSpaces unchanged and drops the stage,
+    /// restoring its external tables. After a successful core transfer there
+    /// are no remaining fallible capability or registry steps: the CSpace
+    /// guards are released and `finalize` consumes the receipt exactly once
+    /// while the registry transaction and both exact record guards remain
+    /// held. A registry postflight mismatch instead drops the uncalled
+    /// finalizer and stage and sticky-quarantines both reservations.
+    ///
+    /// # Safety
+    ///
+    /// `prepare` must be read-only, non-blocking, non-reentrant, and must not
+    /// retain a CSpace reference or authority through a side channel. `S` must
+    /// be the exact source/target/type guards associated with the request to
+    /// which it is attached; callers may not exchange state between requests.
+    /// Its `Drop` must be an allocation-free, non-blocking rollback and must
+    /// not panic, re-enter lifecycle/capability APIs, or access either CSpace.
+    /// `E` must not retain authority or references obtained from either CSpace.
+    ///
+    /// `finalize` must be infallible and must not allocate, validate, block,
+    /// panic, re-enter registry/capability APIs, or access either CSpace. It may
+    /// only commit the exact guards in `S`, consume the sealed receipt, and
+    /// return detached copy metadata. All values captured by either closure
+    /// must have non-blocking, non-panicking, non-reentrant destructors which
+    /// do not access the registry, capability APIs, or either CSpace.
+    pub unsafe fn transfer_reserved_space_pair<S, R: Copy, E>(
+        &self,
+        first: InstanceToken,
+        second: InstanceToken,
+        prepare: impl FnOnce(&CSpace, &CSpace) -> Result<SupervisedTransferStage<S>, E>,
+        finalize: impl FnOnce(S, SupervisedTransferReceipt) -> R,
+    ) -> Result<Result<R, PairTransferError<E>>, RegistryError> {
+        if first.shares_stable_slot(second) {
+            return Err(RegistryError::IdentityMismatch);
+        }
+
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let result = (|| {
+            let _transaction = self.transaction.lock();
+            let (low_token, high_token, callback_reversed) = if first.slot < second.slot {
+                (first, second, false)
+            } else {
+                (second, first, true)
+            };
+            let Some(low_slot) = self.slot(low_token) else {
+                return Err(RegistryError::IdentityMismatch);
+            };
+            let Some(high_slot) = self.slot(high_token) else {
+                return Err(RegistryError::IdentityMismatch);
+            };
+            let mut low_record = low_slot.record.lock();
+            let mut high_record = high_slot.record.lock();
+
+            // A stale token is not authority to quarantine the current
+            // generation occupying that stable slot.
+            if !Self::token_matches(low_slot, &low_record, low_token)
+                || !Self::token_matches(high_slot, &high_record, high_token)
+            {
+                return Err(RegistryError::IdentityMismatch);
+            }
+            if !Self::reserved_record_is_unpublished(low_slot, &low_record)
+                || !Self::reserved_record_is_unpublished(high_slot, &high_record)
+            {
+                Self::quarantine_locked(low_slot, &mut low_record);
+                Self::quarantine_locked(high_slot, &mut high_record);
+                return Err(RegistryError::IdentityMismatch);
+            }
+
+            let low_domain = low_record
+                .domain
+                .expect("validated reservation retains its allocation domain");
+            let high_domain = high_record
+                .domain
+                .expect("validated reservation retains its allocation domain");
+            let low_seal = low_record
+                .space_seal
+                .expect("validated reservation retains its Space seal");
+            let high_seal = high_record
+                .space_seal
+                .expect("validated reservation retains its Space seal");
+            let low_space = low_record
+                .space
+                .as_deref()
+                .expect("validated reservation retains its Space");
+            let high_space = high_record
+                .space
+                .as_deref()
+                .expect("validated reservation retains its Space");
+
+            let distinct_bindings = low_domain != high_domain
+                && low_domain.owner != high_domain.owner
+                && low_domain.arena != high_domain.arena
+                && !core::ptr::eq(low_space, high_space)
+                && !core::ptr::eq(low_space.cspace(), high_space.cspace())
+                && low_seal.cspace_identity != high_seal.cspace_identity;
+            if !distinct_bindings
+                || !low_seal.immutable_objects_match(low_space)
+                || !high_seal.immutable_objects_match(high_space)
+            {
+                Self::quarantine_locked(low_slot, &mut low_record);
+                Self::quarantine_locked(high_slot, &mut high_record);
+                return Err(RegistryError::IdentityMismatch);
+            }
+
+            let mut low_cspace = low_space.cspace().lock();
+            let mut high_cspace = high_space.cspace().lock();
+            if !low_seal.reset_preflight_matches(&low_cspace)
+                || !high_seal.reset_preflight_matches(&high_cspace)
+                || low_cspace.identity() == high_cspace.identity()
+            {
+                drop(high_cspace);
+                drop(low_cspace);
+                Self::quarantine_locked(low_slot, &mut low_record);
+                Self::quarantine_locked(high_slot, &mut high_record);
+                return Err(RegistryError::IdentityMismatch);
+            }
+
+            let prepared = if callback_reversed {
+                prepare(&high_cspace, &low_cspace)
+            } else {
+                prepare(&low_cspace, &high_cspace)
+            };
+            #[cfg(test)]
+            if TEST_RESERVED_PAIR_POSTFLIGHT_FAULT.swap(0, Ordering::SeqCst) == 1 {
+                let identity = low_cspace.identity();
+                let incarnation = low_cspace.incarnation();
+                assert!(low_cspace.reset_exact(identity, incarnation).is_ok());
+            }
+            let post_matches = Self::token_matches(low_slot, &low_record, low_token)
+                && Self::token_matches(high_slot, &high_record, high_token)
+                && Self::reserved_record_is_unpublished(low_slot, &low_record)
+                && Self::reserved_record_is_unpublished(high_slot, &high_record)
+                && low_record.domain == Some(low_domain)
+                && high_record.domain == Some(high_domain)
+                && low_record.space_seal == Some(low_seal)
+                && high_record.space_seal == Some(high_seal)
+                && low_record
+                    .space
+                    .as_deref()
+                    .is_some_and(|space| low_seal.immutable_objects_match(space))
+                && high_record
+                    .space
+                    .as_deref()
+                    .is_some_and(|space| high_seal.immutable_objects_match(space))
+                && low_seal.reset_preflight_matches(&low_cspace)
+                && high_seal.reset_preflight_matches(&high_cspace);
+            if !post_matches {
+                drop(high_cspace);
+                drop(low_cspace);
+                Self::quarantine_locked(low_slot, &mut low_record);
+                Self::quarantine_locked(high_slot, &mut high_record);
+                drop(high_record);
+                drop(low_record);
+                drop(_transaction);
+                drop(prepared);
+                drop(finalize);
+                return Err(RegistryError::IdentityMismatch);
+            }
+
+            let stage = match prepared {
+                Ok(stage) => stage,
+                Err(error) => {
+                    drop(high_cspace);
+                    drop(low_cspace);
+                    drop(high_record);
+                    drop(low_record);
+                    drop(_transaction);
+                    drop(finalize);
+                    return Ok(Err(PairTransferError::Configure(error)));
+                }
+            };
+            let (request, state) = stage.into_parts();
+            let receipt = match request.execute(&mut low_cspace, &mut high_cspace) {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    drop(high_cspace);
+                    drop(low_cspace);
+                    drop(high_record);
+                    drop(low_record);
+                    drop(_transaction);
+                    drop(state);
+                    drop(finalize);
+                    return Ok(Err(PairTransferError::Capability(error)));
+                }
+            };
+
+            // The core transfer is committed. No fallible registry or
+            // capability operation may follow it.
+            drop(high_cspace);
+            drop(low_cspace);
+            Ok(Ok(finalize(state, receipt)))
+        })();
+        system.restore();
+        result
     }
 
     /// Construct and install arena-owned component state in a reserved slot.
@@ -4474,7 +4852,7 @@ impl Drop for InstanceContinuation<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cap::{Resource, Rights};
+    use crate::cap::{CapError, Resource, Rights, SupervisedTransferRequest};
     use crate::exec::{
         self, CancelOutcome, FaultReclaimOutcome, PreparedTaskBatch, PreparedTaskBatchError,
     };
@@ -4514,6 +4892,40 @@ mod tests {
         }
     }
 
+    struct TestPairStage<'a> {
+        marker: u64,
+        drops: &'a AtomicU64,
+    }
+
+    impl Drop for TestPairStage<'_> {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    struct TestFinalizeGuard<'a> {
+        sequence: &'a AtomicU64,
+        drops: &'a AtomicU64,
+        expected_sequence: u64,
+        next_sequence: u64,
+    }
+
+    impl Drop for TestFinalizeGuard<'_> {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.sequence.compare_exchange(
+                    self.expected_sequence,
+                    self.next_sequence,
+                    AtomicOrdering::SeqCst,
+                    AtomicOrdering::SeqCst,
+                ),
+                Ok(self.expected_sequence),
+                "captured finalize guard dropped out of order",
+            );
+            self.drops.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
     #[test]
     fn opaque_tokens_expose_only_stable_slot_alias_rejection() {
         let first = InstanceToken {
@@ -4532,6 +4944,466 @@ mod tests {
         assert_ne!(first, replacement);
         assert!(first.shares_stable_slot(replacement));
         assert!(!first.shares_stable_slot(unrelated));
+    }
+
+    #[test]
+    fn reserved_space_pair_gate_runs_in_caller_order_and_is_read_only() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let domains = [domain(59_001), domain(59_002)];
+        let tokens = registry
+            .reserve_named_batch(&[(domains[0], "pair-source"), (domains[1], "pair-target")])
+            .unwrap();
+        let source_state = cspace_state(&registry, tokens[0]);
+        let target_state = cspace_state(&registry, tokens[1]);
+        assert_ne!(source_state.0, target_state.0);
+
+        let source_cap = unsafe {
+            registry
+                .configure_reserved_space(tokens[0], |source| {
+                    source.mint(
+                        Arc::new(TestSpaceResource),
+                        Rights::READ.union(Rights::GRANT).union(Rights::REVOKE),
+                    )
+                })
+                .unwrap()
+        };
+        // Pass the higher stable slot first. The callback must still receive
+        // target then source even though locks are acquired source then target.
+        let observed = unsafe {
+            registry
+                .with_reserved_space_pair(tokens[1], tokens[0], |target, source| {
+                    assert_eq!(target.identity(), target_state.0);
+                    assert_eq!(source.identity(), source_state.0);
+                    (
+                        target.live_count(),
+                        source.rights_of(source_cap)
+                            == Ok(Rights::READ.union(Rights::GRANT).union(Rights::REVOKE)),
+                        source.live_count(),
+                    )
+                })
+                .unwrap()
+        };
+        assert_eq!(observed, (0, true, 1));
+
+        unsafe {
+            registry
+                .with_reserved_space_pair(tokens[0], tokens[1], |source, target| {
+                    assert_eq!(
+                        source.rights_of(source_cap),
+                        Ok(Rights::READ.union(Rights::GRANT).union(Rights::REVOKE)),
+                    );
+                    assert_eq!(target.live_count(), 0);
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            registry.snapshot(tokens[0]).unwrap().phase,
+            InstancePhase::Reserved
+        );
+        assert_eq!(
+            registry.snapshot(tokens[1]).unwrap().phase,
+            InstancePhase::Reserved
+        );
+        assert_eq!(cspace_state(&registry, tokens[0]).2, 1);
+        assert_eq!(cspace_state(&registry, tokens[1]).2, 0);
+        assert_eq!(
+            registry
+                .abort_reserved_batch(&tokens)
+                .unwrap()
+                .aborted_instances(),
+            2
+        );
+    }
+
+    #[test]
+    fn reserved_space_pair_transfer_executes_after_postflight_and_finalizes_once() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let tokens = registry
+            .reserve_named_batch(&[
+                (domain(59_011), "staged-source"),
+                (domain(59_012), "staged-target"),
+            ])
+            .unwrap();
+        let source_state = cspace_state(&registry, tokens[0]);
+        let target_state = cspace_state(&registry, tokens[1]);
+        let source_cap = unsafe {
+            registry
+                .configure_reserved_space(tokens[0], |source| {
+                    source.mint(
+                        Arc::new(TestSpaceResource),
+                        Rights::READ.union(Rights::GRANT),
+                    )
+                })
+                .unwrap()
+        };
+        let sequence = AtomicU64::new(0);
+        let stage_drops = AtomicU64::new(0);
+        let finalize_drops = AtomicU64::new(0);
+        let finalizations = AtomicU64::new(0);
+        let finalize_guard = TestFinalizeGuard {
+            sequence: &sequence,
+            drops: &finalize_drops,
+            expected_sequence: 2,
+            next_sequence: 3,
+        };
+
+        let result = unsafe {
+            registry.transfer_reserved_space_pair(
+                tokens[1],
+                tokens[0],
+                |target, source| {
+                    assert_eq!(target.identity(), target_state.0);
+                    assert_eq!(source.identity(), source_state.0);
+                    assert_eq!(
+                        sequence.compare_exchange(
+                            0,
+                            1,
+                            AtomicOrdering::SeqCst,
+                            AtomicOrdering::SeqCst,
+                        ),
+                        Ok(0),
+                    );
+                    SupervisedTransferRequest::prepare_attenuated_grant::<TestSpaceResource>(
+                        source,
+                        source_cap,
+                        Rights::READ,
+                        target,
+                    )
+                    .map(|request| {
+                        request.attach(TestPairStage {
+                            marker: 0xC6_40,
+                            drops: &stage_drops,
+                        })
+                    })
+                },
+                |staged, receipt| {
+                    assert_eq!(staged.marker, 0xC6_40);
+                    assert_eq!(
+                        sequence.compare_exchange(
+                            1,
+                            2,
+                            AtomicOrdering::SeqCst,
+                            AtomicOrdering::SeqCst,
+                        ),
+                        Ok(1),
+                    );
+                    assert_eq!(
+                        finalizations.fetch_add(1, AtomicOrdering::SeqCst),
+                        0,
+                        "finalize ran more than once",
+                    );
+                    drop(staged);
+                    drop(finalize_guard);
+                    receipt.into_target_cap()
+                },
+            )
+        };
+
+        let transferred = result
+            .expect("exact pair gate")
+            .expect("attenuated transfer");
+        assert_eq!(sequence.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(stage_drops.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(finalize_drops.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(finalizations.load(AtomicOrdering::SeqCst), 1);
+        unsafe {
+            registry
+                .with_reserved_space_pair(tokens[0], tokens[1], |source, target| {
+                    assert_eq!(source.rights_of(source_cap), Err(CapError::Invalid));
+                    assert_eq!(target.rights_of(transferred), Ok(Rights::READ));
+                    assert_eq!(
+                        target.lookup(transferred, Rights::GRANT).err(),
+                        Some(CapError::InsufficientRights),
+                    );
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            registry.snapshot(tokens[0]).unwrap().phase,
+            InstancePhase::Reserved
+        );
+        assert_eq!(
+            registry.snapshot(tokens[1]).unwrap().phase,
+            InstancePhase::Reserved
+        );
+        registry.abort_reserved_batch(&tokens).unwrap();
+    }
+
+    #[test]
+    fn reserved_space_pair_transfer_rolls_back_without_finalize_on_postflight_failure() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let tokens = registry
+            .reserve_named_batch(&[
+                (domain(59_021), "staged-fault-a"),
+                (domain(59_022), "staged-fault-b"),
+            ])
+            .unwrap();
+        let source_cap = unsafe {
+            registry
+                .configure_reserved_space(tokens[0], |source| {
+                    source.mint(
+                        Arc::new(TestSpaceResource),
+                        Rights::READ.union(Rights::GRANT),
+                    )
+                })
+                .unwrap()
+        };
+        let sequence = AtomicU64::new(0);
+        let stage_drops = AtomicU64::new(0);
+        let finalize_drops = AtomicU64::new(0);
+        let finalizations = AtomicU64::new(0);
+        let finalize_guard = TestFinalizeGuard {
+            sequence: &sequence,
+            drops: &finalize_drops,
+            expected_sequence: 1,
+            next_sequence: 2,
+        };
+        TEST_RESERVED_PAIR_POSTFLIGHT_FAULT.store(1, Ordering::SeqCst);
+
+        let result = unsafe {
+            registry.transfer_reserved_space_pair(
+                tokens[0],
+                tokens[1],
+                |source, target| {
+                    sequence.store(1, AtomicOrdering::SeqCst);
+                    SupervisedTransferRequest::prepare_attenuated_grant::<TestSpaceResource>(
+                        source,
+                        source_cap,
+                        Rights::READ,
+                        target,
+                    )
+                    .map(|request| {
+                        request.attach(TestPairStage {
+                            marker: 0xBAD,
+                            drops: &stage_drops,
+                        })
+                    })
+                },
+                |staged, _receipt| {
+                    assert_eq!(staged.marker, 0xBAD);
+                    finalizations.fetch_add(1, AtomicOrdering::SeqCst);
+                    drop(staged);
+                    drop(finalize_guard);
+                    0xBADu64
+                },
+            )
+        };
+
+        assert_eq!(result, Err(RegistryError::IdentityMismatch));
+        assert_eq!(sequence.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(stage_drops.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(finalize_drops.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(finalizations.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            registry.snapshot(tokens[0]),
+            Err(RegistryError::Quarantined)
+        );
+        assert_eq!(
+            registry.snapshot(tokens[1]),
+            Err(RegistryError::Quarantined)
+        );
+    }
+
+    #[test]
+    fn reserved_space_pair_transfer_capability_error_rolls_back_without_mutation() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let tokens = registry
+            .reserve_named_batch(&[
+                (domain(59_031), "transfer-error-source"),
+                (domain(59_032), "transfer-error-target"),
+            ])
+            .unwrap();
+        let before = [
+            cspace_state(&registry, tokens[0]),
+            cspace_state(&registry, tokens[1]),
+        ];
+
+        // A valid request sealed to unrelated spaces cannot authorize this
+        // exact registry pair. Execution rejects it before either pair CSpace
+        // changes, and the attached external state rolls back once.
+        let mut unrelated_source = CSpace::new("unrelated-transfer-source");
+        let unrelated_target = CSpace::new("unrelated-transfer-target");
+        let unrelated_cap = unrelated_source.mint(
+            Arc::new(TestSpaceResource),
+            Rights::READ.union(Rights::GRANT),
+        );
+        let wrong_request =
+            SupervisedTransferRequest::prepare_attenuated_grant::<TestSpaceResource>(
+                &unrelated_source,
+                unrelated_cap,
+                Rights::READ,
+                &unrelated_target,
+            )
+            .unwrap();
+        let stage_drops = AtomicU64::new(0);
+        let finalizations = AtomicU64::new(0);
+
+        let result = unsafe {
+            registry.transfer_reserved_space_pair(
+                tokens[0],
+                tokens[1],
+                |_source, _target| {
+                    Ok::<_, ()>(wrong_request.attach(TestPairStage {
+                        marker: 0xBAD_C640,
+                        drops: &stage_drops,
+                    }))
+                },
+                |staged, _receipt| {
+                    drop(staged);
+                    finalizations.fetch_add(1, AtomicOrdering::SeqCst);
+                    0_u64
+                },
+            )
+        };
+
+        assert_eq!(
+            result,
+            Ok(Err(PairTransferError::Capability(CapError::Invalid)))
+        );
+        assert_eq!(stage_drops.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(finalizations.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(cspace_state(&registry, tokens[0]), before[0]);
+        assert_eq!(cspace_state(&registry, tokens[1]), before[1]);
+        assert_eq!(
+            unrelated_source.rights_of(unrelated_cap),
+            Ok(Rights::READ.union(Rights::GRANT))
+        );
+        assert!(unrelated_target.list().is_empty());
+        registry.abort_reserved_batch(&tokens).unwrap();
+    }
+
+    #[test]
+    fn reserved_space_pair_gate_rejects_same_slot_and_stale_token_without_mutation() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let tokens = registry
+            .reserve_named_batch(&[(domain(59_101), "pair-a"), (domain(59_102), "pair-b")])
+            .unwrap();
+        let before = [
+            cspace_state(&registry, tokens[0]),
+            cspace_state(&registry, tokens[1]),
+        ];
+        let called = AtomicBool::new(false);
+
+        assert_eq!(
+            unsafe {
+                registry.with_reserved_space_pair(tokens[0], tokens[0], |_, _| {
+                    called.store(true, AtomicOrdering::SeqCst);
+                })
+            },
+            Err(RegistryError::IdentityMismatch),
+        );
+        let stale = InstanceToken {
+            slot: tokens[0].slot,
+            generation: tokens[0].generation + 1,
+        };
+        assert_eq!(
+            unsafe {
+                registry.with_reserved_space_pair(stale, tokens[1], |_, _| {
+                    called.store(true, AtomicOrdering::SeqCst);
+                })
+            },
+            Err(RegistryError::IdentityMismatch),
+        );
+        assert!(!called.load(AtomicOrdering::SeqCst));
+        assert_eq!(cspace_state(&registry, tokens[0]), before[0]);
+        assert_eq!(cspace_state(&registry, tokens[1]), before[1]);
+        assert_eq!(
+            registry.snapshot(tokens[0]).unwrap().phase,
+            InstancePhase::Reserved
+        );
+        assert_eq!(
+            registry.snapshot(tokens[1]).unwrap().phase,
+            InstancePhase::Reserved
+        );
+        registry.abort_reserved_batch(&tokens).unwrap();
+    }
+
+    #[test]
+    fn reserved_space_pair_gate_quarantines_both_on_exact_incarnation_fault() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let tokens = registry
+            .reserve_named_batch(&[(domain(59_201), "fault-a"), (domain(59_202), "fault-b")])
+            .unwrap();
+        let before = [
+            cspace_state(&registry, tokens[0]),
+            cspace_state(&registry, tokens[1]),
+        ];
+        {
+            let _transaction = registry.transaction.lock();
+            let slot = registry.slot(tokens[1]).unwrap();
+            let mut record = slot.record.lock();
+            let mut seal = record.space_seal.unwrap();
+            seal.cspace_incarnation = seal.cspace_incarnation.checked_add(1).unwrap();
+            record.space_seal = Some(seal);
+        }
+        let called = AtomicBool::new(false);
+
+        assert_eq!(
+            unsafe {
+                registry.with_reserved_space_pair(tokens[0], tokens[1], |_, _| {
+                    called.store(true, AtomicOrdering::SeqCst);
+                })
+            },
+            Err(RegistryError::IdentityMismatch),
+        );
+        assert!(!called.load(AtomicOrdering::SeqCst));
+        assert_eq!(cspace_state(&registry, tokens[0]), before[0]);
+        assert_eq!(cspace_state(&registry, tokens[1]), before[1]);
+        assert_eq!(
+            registry.snapshot(tokens[0]),
+            Err(RegistryError::Quarantined)
+        );
+        assert_eq!(
+            registry.snapshot(tokens[1]),
+            Err(RegistryError::Quarantined)
+        );
+    }
+
+    #[test]
+    fn reserved_space_pair_gate_rejects_an_exact_owner_alias() {
+        let _executor = executor();
+        let registry = InstanceRegistry::new();
+        let tokens = registry
+            .reserve_named_batch(&[(domain(59_301), "owner-a"), (domain(59_302), "owner-b")])
+            .unwrap();
+        let before = [
+            cspace_state(&registry, tokens[0]),
+            cspace_state(&registry, tokens[1]),
+        ];
+        {
+            let _transaction = registry.transaction.lock();
+            let first_domain = registry
+                .slot(tokens[0])
+                .unwrap()
+                .record
+                .lock()
+                .domain
+                .unwrap();
+            let second_slot = registry.slot(tokens[1]).unwrap();
+            let mut second_record = second_slot.record.lock();
+            second_record.domain.as_mut().unwrap().owner = first_domain.owner;
+        }
+
+        assert_eq!(
+            unsafe { registry.with_reserved_space_pair(tokens[0], tokens[1], |_, _| ()) },
+            Err(RegistryError::IdentityMismatch),
+        );
+        assert_eq!(cspace_state(&registry, tokens[0]), before[0]);
+        assert_eq!(cspace_state(&registry, tokens[1]), before[1]);
+        assert_eq!(
+            registry.snapshot(tokens[0]),
+            Err(RegistryError::Quarantined)
+        );
+        assert_eq!(
+            registry.snapshot(tokens[1]),
+            Err(RegistryError::Quarantined)
+        );
     }
 
     #[test]

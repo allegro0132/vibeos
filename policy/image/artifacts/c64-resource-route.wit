@@ -1,0 +1,15 @@
+package test:c64-resource@1.0.0;
+
+interface route {
+    resource handle;
+    inspect: func(value: borrow<handle>) -> u32;
+    transfer: func(value: own<handle>);
+}
+
+world provider {
+    export route;
+}
+
+world consumer {
+    import route;
+}

@@ -17,6 +17,12 @@ compile_error!("exactly one image policy must be selected");
 ))]
 compile_error!("feature `c53-native-async-qemu-acceptance` requires `qemu-default`");
 
+#[cfg(all(
+    feature = "c64-resource-route-qemu-acceptance",
+    not(feature = "qemu-default")
+))]
+compile_error!("feature `c64-resource-route-qemu-acceptance` requires `qemu-default`");
+
 /// A logical block-device view carved out of a packaged storage image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockSlice {
@@ -56,6 +62,90 @@ pub struct ComponentInstanceLimits {
     pub total_fuel: u64,
     pub poll_quantum: u64,
     pub resources: u16,
+}
+
+/// Immutable, validation-only two-node artifact pair for the C6.4 resource
+/// route acceptance image.
+///
+/// The pin supplies bytes and independent WIT policy only. It carries no Cap,
+/// resource handle, CSpace identity, durable object identity, or execution
+/// entry point, and its profile can never authorize guest execution.
+#[cfg(feature = "c64-resource-route-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub struct ComponentGraphResourceRoutePin {
+    provider_bytes: &'static [u8],
+    provider_sha256: [u8; 32],
+    consumer_bytes: &'static [u8],
+    consumer_sha256: [u8; 32],
+    wit_source: &'static str,
+    wit_sha256: [u8; 32],
+    provider_world: &'static str,
+    consumer_world: &'static str,
+    interface: &'static str,
+    profile: ProfileIdentity,
+    limits: ComponentInstanceLimits,
+}
+
+#[cfg(feature = "c64-resource-route-qemu-acceptance")]
+impl ComponentGraphResourceRoutePin {
+    pub const fn provider_bytes(self) -> &'static [u8] {
+        self.provider_bytes
+    }
+
+    pub const fn provider_sha256(self) -> [u8; 32] {
+        self.provider_sha256
+    }
+
+    pub const fn consumer_bytes(self) -> &'static [u8] {
+        self.consumer_bytes
+    }
+
+    pub const fn consumer_sha256(self) -> [u8; 32] {
+        self.consumer_sha256
+    }
+
+    pub const fn wit_source(self) -> &'static str {
+        self.wit_source
+    }
+
+    pub const fn wit_sha256(self) -> [u8; 32] {
+        self.wit_sha256
+    }
+
+    pub const fn provider_world(self) -> &'static str {
+        self.provider_world
+    }
+
+    pub const fn consumer_world(self) -> &'static str {
+        self.consumer_world
+    }
+
+    pub const fn interface(self) -> &'static str {
+        self.interface
+    }
+
+    pub const fn profile(self) -> ProfileIdentity {
+        self.profile
+    }
+
+    pub const fn limits(self) -> ComponentInstanceLimits {
+        self.limits
+    }
+}
+
+#[cfg(feature = "c64-resource-route-qemu-acceptance")]
+impl core::fmt::Debug for ComponentGraphResourceRoutePin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ComponentGraphResourceRoutePin")
+            .field("artifacts", &"<redacted>")
+            .field("provider_world", &self.provider_world)
+            .field("consumer_world", &self.consumer_world)
+            .field("interface", &self.interface)
+            .field("profile", &self.profile)
+            .field("limits", &self.limits)
+            .finish()
+    }
 }
 
 /// Immutable image-policy root for one admitted Component command.
@@ -382,6 +472,26 @@ const C53_STREAM_FILTER_BYTES: &[u8] = include_bytes!(concat!(
 const C53_STREAM_FILTER_SHA256: [u8; 32] =
     include!(concat!(env!("OUT_DIR"), "/c53-stream-filter.sha256.rs"));
 
+#[cfg(feature = "c64-resource-route-qemu-acceptance")]
+const C64_RESOURCE_PROVIDER_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/c64-resource-provider.component.wasm"
+));
+
+#[cfg(feature = "c64-resource-route-qemu-acceptance")]
+const C64_RESOURCE_PROVIDER_SHA256: [u8; 32] =
+    include!(concat!(env!("OUT_DIR"), "/c64-resource-provider.sha256.rs"));
+
+#[cfg(feature = "c64-resource-route-qemu-acceptance")]
+const C64_RESOURCE_CONSUMER_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/c64-resource-consumer.component.wasm"
+));
+
+#[cfg(feature = "c64-resource-route-qemu-acceptance")]
+const C64_RESOURCE_CONSUMER_SHA256: [u8; 32] =
+    include!(concat!(env!("OUT_DIR"), "/c64-resource-consumer.sha256.rs"));
+
 #[cfg(any(
     feature = "c53-native-async-qemu-acceptance",
     feature = "c53-native-async-command-projection"
@@ -544,6 +654,35 @@ pub const C53_NATIVE_ASYNC_COMMAND: NativeAsyncCommandPin = NativeAsyncCommandPi
     },
 };
 
+/// Exact validation-only graph policy root used by the C6.4 QEMU lifecycle
+/// proof. Resource authority is created later by the explicit kernel
+/// supervisor transaction; these artifacts and names are never lookup
+/// authority.
+#[cfg(feature = "c64-resource-route-qemu-acceptance")]
+pub const C64_RESOURCE_ROUTE_QEMU_ACCEPTANCE: ComponentGraphResourceRoutePin =
+    ComponentGraphResourceRoutePin {
+        provider_bytes: C64_RESOURCE_PROVIDER_BYTES,
+        provider_sha256: C64_RESOURCE_PROVIDER_SHA256,
+        consumer_bytes: C64_RESOURCE_CONSUMER_BYTES,
+        consumer_sha256: C64_RESOURCE_CONSUMER_SHA256,
+        wit_source: include_str!("../artifacts/c64-resource-route.wit"),
+        wit_sha256: [
+            0x07, 0x16, 0xe0, 0x79, 0x84, 0x89, 0x6d, 0xf8, 0x3b, 0xc2, 0x6a, 0x82, 0x82, 0x23,
+            0x6e, 0x6d, 0xfa, 0x70, 0x8b, 0xf6, 0x71, 0x92, 0x85, 0x3b, 0xd8, 0xcd, 0x84, 0x79,
+            0xcc, 0xec, 0x13, 0x41,
+        ],
+        provider_world: "test:c64-resource/provider@1.0.0",
+        consumer_world: "test:c64-resource/consumer@1.0.0",
+        interface: "test:c64-resource/route@1.0.0",
+        profile: ProfileIdentity::PROFILE_1_ASYNC,
+        limits: ComponentInstanceLimits {
+            memory_bytes: 64 * 1024,
+            total_fuel: 1_000,
+            poll_quantum: 100,
+            resources: 2,
+        },
+    };
+
 /// The default QEMU image admits a bounded managed slice. Storage V2 initially
 /// formats only its policy range within this slice; unused suffix capacity is
 /// not ambient store capacity and may be admitted only by explicit growth.
@@ -663,6 +802,31 @@ mod tests {
         assert!(pin
             .wit_source()
             .contains("export run: async func(input: byte-stream) -> byte-stream;"));
+    }
+
+    #[cfg(feature = "c64-resource-route-qemu-acceptance")]
+    #[test]
+    fn c64_resource_route_pair_is_exact_and_validation_only() {
+        let pin = C64_RESOURCE_ROUTE_QEMU_ACCEPTANCE;
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(pin.provider_bytes())),
+            pin.provider_sha256()
+        );
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(pin.consumer_bytes())),
+            pin.consumer_sha256()
+        );
+        assert_ne!(pin.provider_sha256(), pin.consumer_sha256());
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(pin.wit_source().as_bytes())),
+            pin.wit_sha256()
+        );
+        assert_eq!(pin.profile(), ProfileIdentity::PROFILE_1_ASYNC);
+        assert!(!pin.profile().execution_enabled());
+        assert_eq!(pin.interface(), "test:c64-resource/route@1.0.0");
+        assert!(pin.wit_source().contains("borrow<handle>"));
+        assert!(pin.wit_source().contains("own<handle>"));
+        assert_eq!(pin.limits().resources, 2);
     }
 
     #[cfg(feature = "c53-native-async-command-projection")]

@@ -1,8 +1,9 @@
 use vibeos_component_admission::{
-    admit_component_graph, AdmissionError, AdmittedComponentGraph, ArtifactTrust, AuthorityOffer,
-    CallerAuthority, ComponentArtifact, ComponentGraphAdmissionError,
-    ComponentGraphAdmissionPolicy, ComponentGraphBindingMismatch, ComponentGraphCyclePolicy,
-    ComponentGraphNodeAdmissionPolicy, InstanceLimits, InterfaceCeiling, ProfileIdentity,
+    admit_component_graph, admit_component_graph_with_resource_policy, AdmissionError,
+    AdmittedComponentGraph, ArtifactTrust, AuthorityOffer, CallerAuthority, ComponentArtifact,
+    ComponentGraphAdmissionError, ComponentGraphAdmissionPolicy, ComponentGraphBindingMismatch,
+    ComponentGraphCyclePolicy, ComponentGraphNodeAdmissionPolicy, ComponentGraphResourceEdgePolicy,
+    ComponentGraphResourceMode, InstanceLimits, InterfaceCeiling, ProfileIdentity,
     STREAM_FILTER_WORLD,
 };
 use vibeos_component_host::{HostResourceKind, STREAM_INTERFACE};
@@ -193,6 +194,97 @@ const RESOURCE_CONSUMER_WAT: &str = r#"
       (import "test:c62-resource/pipe@1.0.0" (instance $pipe-in (type $pipe))))
 "#;
 
+const MIXED_RESOURCE_WIT: &str = r#"
+    package test:c62-resource@1.0.0;
+
+    interface pipe {
+        resource handle;
+        send-borrow: func(value: borrow<handle>);
+        send-own: func(value: option<own<handle>>);
+    }
+
+    world producer {
+        export pipe;
+    }
+
+    world consumer {
+        import pipe;
+    }
+"#;
+
+const MIXED_RESOURCE_PRODUCER_WAT: &str = r#"
+    (component
+      (type $handle (resource (rep i32)))
+      (type $borrow-handle (borrow $handle))
+      (type $own-handle (own $handle))
+      (type $maybe-own (option $own-handle))
+      (type $borrow-type (func (param "value" $borrow-handle)))
+      (type $own-type (func (param "value" $maybe-own)))
+      (core module $module
+        (func (export "send-borrow") (param i32))
+        (func (export "send-own") (param i32 i32)))
+      (core instance $instance (instantiate $module))
+      (alias core export $instance "send-borrow" (core func $borrow-core))
+      (alias core export $instance "send-own" (core func $own-core))
+      (func $send-borrow (type $borrow-type) (canon lift (core func $borrow-core)))
+      (func $send-own (type $own-type) (canon lift (core func $own-core)))
+      (instance $pipe
+        (export "handle" (type $handle))
+        (export "send-borrow" (func $send-borrow))
+        (export "send-own" (func $send-own)))
+      (export "test:c62-resource/pipe@1.0.0" (instance $pipe)))
+"#;
+
+const MIXED_RESOURCE_CONSUMER_WAT: &str = r#"
+    (component
+      (type $pipe
+        (instance
+          (export "handle" (type $handle (sub resource)))
+          (type $borrow-handle (borrow $handle))
+          (type $own-handle (own $handle))
+          (type $maybe-own (option $own-handle))
+          (type $borrow-type (func (param "value" $borrow-handle)))
+          (type $own-type (func (param "value" $maybe-own)))
+          (export "send-borrow" (func (type $borrow-type)))
+          (export "send-own" (func (type $own-type)))))
+      (import "test:c62-resource/pipe@1.0.0" (instance $pipe-in (type $pipe))))
+"#;
+
+const AMBIGUOUS_RESOURCE_WIT: &str = r#"
+    package test:c62-resource@1.0.0;
+
+    interface pipe {
+        resource first;
+        resource second;
+    }
+
+    world producer {
+        export pipe;
+    }
+
+    world consumer {
+        import pipe;
+    }
+"#;
+
+const AMBIGUOUS_RESOURCE_PRODUCER_WAT: &str = r#"
+    (component
+      (type $handle (resource (rep i32)))
+      (instance $pipe
+        (export "first" (type $handle))
+        (export "second" (type $handle)))
+      (export "test:c62-resource/pipe@1.0.0" (instance $pipe)))
+"#;
+
+const AMBIGUOUS_RESOURCE_CONSUMER_WAT: &str = r#"
+    (component
+      (type $pipe
+        (instance
+          (export "first" (type $handle (sub resource)))
+          (export "second" (type (eq $handle)))))
+      (import "test:c62-resource/pipe@1.0.0" (instance $pipe-in (type $pipe))))
+"#;
+
 const STREAM_COMPONENT: &str =
     include_str!("../../../component-runtime/tests/fixtures/host-stream.component.wat");
 const STREAM_WIT: &str = include_str!("../../../component-format/tests/corpus/wit/stream.wit");
@@ -280,6 +372,38 @@ fn admit_pair(
     admit_component_graph(
         vec![provider, consumer],
         &policy,
+        &CallerAuthority { offers: &[] },
+    )
+}
+
+fn admit_resource_pair(
+    exact_wit: &str,
+    producer_wat: &str,
+    consumer_wat: &str,
+    resource_policy: &[ComponentGraphResourceEdgePolicy],
+) -> Result<AdmittedComponentGraph, ComponentGraphAdmissionError> {
+    let producer_world = world(exact_wit, RESOURCE_PRODUCER_WORLD);
+    let consumer_world = world(exact_wit, RESOURCE_CONSUMER_WORLD);
+    let producer = artifact(producer_wat);
+    let consumer = artifact(consumer_wat);
+    let nodes = [
+        policy_node("resource-provider", &producer_world, &producer, &[]),
+        policy_node("resource-consumer", &consumer_world, &consumer, &[]),
+    ];
+    let edges = [edge(0, 1)];
+    let policy = ComponentGraphAdmissionPolicy {
+        name: "resource-edge",
+        profile: ProfileIdentity::PROFILE_1,
+        nodes: &nodes,
+        edges: &edges,
+        external_imports: &[],
+        published_exports: &[],
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    admit_component_graph_with_resource_policy(
+        vec![producer, consumer],
+        &policy,
+        resource_policy,
         &CallerAuthority { offers: &[] },
     )
 }
@@ -459,7 +583,7 @@ fn direct_non_interface_edge_is_rejected_even_when_function_shapes_match() {
 }
 
 #[test]
-fn resource_bearing_internal_edge_is_rejected_without_nominal_provenance() {
+fn exact_resource_edge_requires_explicit_policy() {
     let producer_world = world(RESOURCE_WIT, RESOURCE_PRODUCER_WORLD);
     let consumer_world = world(RESOURCE_WIT, RESOURCE_CONSUMER_WORLD);
     let left = artifact(RESOURCE_PRODUCER_WAT);
@@ -481,6 +605,179 @@ fn resource_bearing_internal_edge_is_rejected_without_nominal_provenance() {
     assert_eq!(
         admit_component_graph(vec![left, right], &policy, &CallerAuthority { offers: &[] },)
             .expect_graph_error(),
+        ComponentGraphAdmissionError::UnauthorizedResourceBinding { edge: 0 }
+    );
+}
+
+#[test]
+fn exact_borrow_resource_edge_is_inert_owned_and_freshly_revalidated() {
+    let routes = [ComponentGraphResourceEdgePolicy {
+        edge: edge(0, 1),
+        mode: ComponentGraphResourceMode::Borrow,
+    }];
+    let graph = admit_resource_pair(
+        RESOURCE_WIT,
+        RESOURCE_PRODUCER_WAT,
+        RESOURCE_CONSUMER_WAT,
+        &routes,
+    )
+    .expect("exact borrow policy and nominal provenance must admit");
+
+    assert!(!graph.runtime_ready());
+    assert!(graph.grants().is_empty());
+    assert_eq!(graph.manifest().resource_edges().len(), 1);
+    let route = &graph.manifest().resource_edges()[0];
+    assert_eq!(route.edge(), edge(0, 1));
+    assert_eq!(route.mode(), ComponentGraphResourceMode::Borrow);
+    assert_eq!(route.resources(), [String::from("handle")]);
+    graph
+        .revalidate()
+        .expect("revalidation must obtain fresh exact provenance");
+}
+
+#[test]
+fn exact_own_resource_edge_is_inert_and_revalidated() {
+    let own_wit = RESOURCE_WIT.replace("borrow<handle>", "own<handle>");
+    let own_producer = RESOURCE_PRODUCER_WAT.replace("(borrow $handle)", "(own $handle)");
+    let own_consumer = RESOURCE_CONSUMER_WAT.replace("(borrow $handle)", "(own $handle)");
+    let routes = [ComponentGraphResourceEdgePolicy {
+        edge: edge(0, 1),
+        mode: ComponentGraphResourceMode::Own,
+    }];
+    let graph = admit_resource_pair(&own_wit, &own_producer, &own_consumer, &routes)
+        .expect("exact own policy and nominal provenance must admit");
+
+    assert!(!graph.runtime_ready());
+    assert_eq!(
+        graph.manifest().resource_edges()[0].mode(),
+        ComponentGraphResourceMode::Own
+    );
+    graph.revalidate().expect("fresh own provenance");
+}
+
+#[test]
+fn nested_mixed_resource_modes_require_the_exact_combined_policy() {
+    let routes = [ComponentGraphResourceEdgePolicy {
+        edge: edge(0, 1),
+        mode: ComponentGraphResourceMode::OwnAndBorrow,
+    }];
+    let graph = admit_resource_pair(
+        MIXED_RESOURCE_WIT,
+        MIXED_RESOURCE_PRODUCER_WAT,
+        MIXED_RESOURCE_CONSUMER_WAT,
+        &routes,
+    )
+    .expect("nested own plus direct borrow must be derived recursively");
+    assert_eq!(
+        graph.manifest().resource_edges()[0].mode(),
+        ComponentGraphResourceMode::OwnAndBorrow
+    );
+    graph.revalidate().expect("fresh mixed provenance");
+}
+
+#[test]
+fn resource_policy_must_be_exact_and_cannot_attach_to_a_resource_free_edge() {
+    for wrong in [
+        ComponentGraphResourceMode::Own,
+        ComponentGraphResourceMode::OwnAndBorrow,
+    ] {
+        let routes = [ComponentGraphResourceEdgePolicy {
+            edge: edge(0, 1),
+            mode: wrong,
+        }];
+        assert_eq!(
+            admit_resource_pair(
+                RESOURCE_WIT,
+                RESOURCE_PRODUCER_WAT,
+                RESOURCE_CONSUMER_WAT,
+                &routes,
+            )
+            .expect_graph_error(),
+            ComponentGraphAdmissionError::UnauthorizedResourceBinding { edge: 0 }
+        );
+    }
+
+    let provider_world = world(PIPE_WIT, PRODUCER_WORLD);
+    let consumer_world = world(PIPE_WIT, CONSUMER_WORLD);
+    let provider = artifact(PRODUCER_WAT);
+    let consumer = artifact(CONSUMER_WAT);
+    let nodes = [
+        policy_node("provider", &provider_world, &provider, &[]),
+        policy_node("consumer", &consumer_world, &consumer, &[]),
+    ];
+    let edges = [edge(0, 1)];
+    let policy = ComponentGraphAdmissionPolicy {
+        name: "resource-free-extra-policy",
+        profile: ProfileIdentity::PROFILE_1,
+        nodes: &nodes,
+        edges: &edges,
+        external_imports: &[],
+        published_exports: &[],
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    let routes = [ComponentGraphResourceEdgePolicy {
+        edge: edge(0, 1),
+        mode: ComponentGraphResourceMode::Borrow,
+    }];
+    assert_eq!(
+        admit_component_graph_with_resource_policy(
+            vec![provider, consumer],
+            &policy,
+            &routes,
+            &CallerAuthority { offers: &[] },
+        )
+        .expect_graph_error(),
+        ComponentGraphAdmissionError::UnauthorizedResourceBinding { edge: 0 }
+    );
+}
+
+#[test]
+fn duplicate_or_unknown_resource_policy_is_invalid() {
+    let route = ComponentGraphResourceEdgePolicy {
+        edge: edge(0, 1),
+        mode: ComponentGraphResourceMode::Borrow,
+    };
+    assert_eq!(
+        admit_resource_pair(
+            RESOURCE_WIT,
+            RESOURCE_PRODUCER_WAT,
+            RESOURCE_CONSUMER_WAT,
+            &[route, route],
+        )
+        .expect_graph_error(),
+        ComponentGraphAdmissionError::InvalidPolicy
+    );
+
+    let unknown = [ComponentGraphResourceEdgePolicy {
+        edge: edge(1, 0),
+        mode: ComponentGraphResourceMode::Borrow,
+    }];
+    assert_eq!(
+        admit_resource_pair(
+            RESOURCE_WIT,
+            RESOURCE_PRODUCER_WAT,
+            RESOURCE_CONSUMER_WAT,
+            &unknown,
+        )
+        .expect_graph_error(),
+        ComponentGraphAdmissionError::InvalidPolicy
+    );
+}
+
+#[test]
+fn matching_surface_without_exact_nominal_roots_fails_before_policy() {
+    let routes = [ComponentGraphResourceEdgePolicy {
+        edge: edge(0, 1),
+        mode: ComponentGraphResourceMode::Borrow,
+    }];
+    assert_eq!(
+        admit_resource_pair(
+            AMBIGUOUS_RESOURCE_WIT,
+            AMBIGUOUS_RESOURCE_PRODUCER_WAT,
+            AMBIGUOUS_RESOURCE_CONSUMER_WAT,
+            &routes,
+        )
+        .expect_graph_error(),
         ComponentGraphAdmissionError::UnsupportedResourceBinding { edge: 0 }
     );
 }

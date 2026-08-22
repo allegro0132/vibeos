@@ -12,6 +12,7 @@ qemu-default = []
 milkv-duo-sd = []
 c53-native-async-qemu-acceptance = []
 c53-native-async-command-projection = []
+c64-resource-route-qemu-acceptance = []
 file-tree = []
 storage-bench = []
 

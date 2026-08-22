@@ -54,7 +54,11 @@ pub use stream::{
     StreamReceiveDispatch, StreamSendDispatch, StreamTerminalDispatch, MAX_STREAM_CHUNK_BYTES,
     STREAM_BUFFER_CHUNKS,
 };
-pub use transfer::{transfer_owned, OwnedTransferError};
+pub use transfer::{
+    prepare_owned_supervised, revoke_owned_supervised, transfer_owned, with_supervised_borrow,
+    OwnedTransferError, PreparedSupervisedOwnTransfer, SupervisedBorrowError,
+    SupervisedBorrowScope, SupervisedOwnTransferGuard, SupervisedRevokeError,
+};
 
 /// Shared ownership used by the trusted host to serialize one CSpace.
 pub type SharedCSpace = Arc<SpinLock<CSpace>>;
@@ -84,6 +88,10 @@ pub trait ComponentHostResource: Resource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AuthorityClass {
     Ephemeral,
+    /// Volatile source authority sealed for one supervisor-controlled edge
+    /// transfer. Component operations can use only `rights_ceiling`; the hidden
+    /// `GRANT` bit is never exposed and cannot cross into the target.
+    EphemeralGrantSource,
     PersistentProxy,
 }
 
@@ -104,6 +112,8 @@ pub enum AuthorityError {
     PersistentGrantRequired,
     PersistentProxyRights,
     PersistentProxyTarget,
+    SupervisorDistinctSpacesRequired,
+    SupervisorGrantRequired,
     TableNotEmpty,
     TeardownRejected,
 }
@@ -124,6 +134,12 @@ impl fmt::Display for AuthorityError {
             Self::PersistentProxyRights => "persistent proxy requested forbidden rights",
             Self::PersistentProxyTarget => {
                 "persistent proxy target must be a distinct volatile CSpace"
+            }
+            Self::SupervisorDistinctSpacesRequired => {
+                "supervised resource routing requires two distinct CSpaces"
+            }
+            Self::SupervisorGrantRequired => {
+                "cross-principal volatile transfer requires sealed GRANT authority"
             }
             Self::TableNotEmpty => "component resource table must be empty before teardown",
             Self::TeardownRejected => "component CSpace refused volatile teardown",
@@ -233,7 +249,9 @@ impl ComponentAuthoritySpace {
         let mut guard = self.inner.cspace.lock();
         self.check_incarnation(&guard)?;
         match authority.class {
-            AuthorityClass::Ephemeral | AuthorityClass::PersistentProxy => guard
+            AuthorityClass::Ephemeral
+            | AuthorityClass::EphemeralGrantSource
+            | AuthorityClass::PersistentProxy => guard
                 .revoke_exact_admin(authority.cap)
                 .map_err(map_cap_error),
         }
@@ -390,6 +408,77 @@ pub struct ComponentAuthority {
     class: AuthorityClass,
 }
 
+/// Opaque, detached proof that one exact volatile capability was validated as
+/// a sealed supervisor transfer source.
+///
+/// This detached one-shot receipt is suitable for return from a reserved-space
+/// callback. Its private fields and redacted debug output do not expose the
+/// capability.
+#[must_use = "the prepared authority must be published or its reserved CSpace reset"]
+pub struct PreparedSupervisedEphemeralSource {
+    cspace_identity: CSpaceIdentity,
+    cspace_incarnation: u64,
+    cap: Cap,
+    kind: HostResourceKind,
+    rights_ceiling: Rights,
+}
+
+/// Opaque detached proof for one boot-local proxy whose durable parent was
+/// resolved through an exact typed CSpace reference.
+///
+/// No durable identity, parent token, or local capability is exposed. The
+/// one-shot receipt can leave a reserved-space callback for table publication
+/// after registry postflight.
+#[must_use = "the prepared proxy must be published or its reserved CSpace reset"]
+pub struct PreparedSupervisedPersistentProxySource {
+    cspace_identity: CSpaceIdentity,
+    cspace_incarnation: u64,
+    cap: Cap,
+    kind: HostResourceKind,
+    rights_ceiling: Rights,
+}
+
+impl fmt::Debug for PreparedSupervisedPersistentProxySource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedSupervisedPersistentProxySource(<redacted>)")
+    }
+}
+
+impl PreparedSupervisedPersistentProxySource {
+    /// Materialize the already-validated proxy authority without lookup.
+    pub const fn into_authority(self) -> ComponentAuthority {
+        ComponentAuthority {
+            cspace_identity: self.cspace_identity,
+            cspace_incarnation: self.cspace_incarnation,
+            cap: self.cap,
+            kind: self.kind,
+            rights_ceiling: self.rights_ceiling,
+            class: AuthorityClass::PersistentProxy,
+        }
+    }
+}
+
+impl fmt::Debug for PreparedSupervisedEphemeralSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedSupervisedEphemeralSource(<redacted>)")
+    }
+}
+
+impl PreparedSupervisedEphemeralSource {
+    /// Materialize the already-validated authority after the CSpace callback.
+    /// This performs no allocation, lookup, or validation.
+    pub const fn into_authority(self) -> ComponentAuthority {
+        ComponentAuthority {
+            cspace_identity: self.cspace_identity,
+            cspace_incarnation: self.cspace_incarnation,
+            cap: self.cap,
+            kind: self.kind,
+            rights_ceiling: self.rights_ceiling,
+            class: AuthorityClass::EphemeralGrantSource,
+        }
+    }
+}
+
 impl fmt::Debug for ComponentAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -425,6 +514,121 @@ impl ComponentAuthority {
         };
         drop(guard);
         Ok(authority)
+    }
+
+    /// Seal one exact volatile cap as a supervisor-only transfer source.
+    ///
+    /// The held rights must equal the component operation ceiling plus
+    /// `GRANT`; `REVOKE` and `INVOKE` are forbidden. Ordinary bindings continue
+    /// to reject `GRANT`, so only this explicit constructor can enter the
+    /// cross-principal derive-and-retire path.
+    pub fn bind_supervised_ephemeral_source_in<T: ComponentHostResource>(
+        cspace: &CSpace,
+        cap: Cap,
+        rights_ceiling: Rights,
+    ) -> Result<Self, AuthorityError> {
+        Self::prepare_supervised_ephemeral_source_in::<T>(cspace, cap, rights_ceiling)
+            .map(PreparedSupervisedEphemeralSource::into_authority)
+    }
+
+    /// Validate inside a reserved-space callback and return a detached,
+    /// non-duplicable receipt containing only copyable metadata for publication
+    /// after that callback succeeds.
+    pub fn prepare_supervised_ephemeral_source_in<T: ComponentHostResource>(
+        cspace: &CSpace,
+        cap: Cap,
+        rights_ceiling: Rights,
+    ) -> Result<PreparedSupervisedEphemeralSource, AuthorityError> {
+        const FORBIDDEN: Rights = Rights::REVOKE.union(Rights::INVOKE);
+        if rights_ceiling.intersect(Rights::GRANT.union(FORBIDDEN)) != Rights::NONE
+            || !T::OPERATION_RIGHTS.contains(rights_ceiling)
+        {
+            return Err(AuthorityError::RightsExceedCeiling);
+        }
+        let held = cspace.rights_of(cap).map_err(map_cap_error)?;
+        if held != rights_ceiling.union(Rights::GRANT) {
+            return Err(if held.contains(Rights::GRANT) {
+                AuthorityError::RightsExceedCeiling
+            } else {
+                AuthorityError::SupervisorGrantRequired
+            });
+        }
+        drop(
+            cspace
+                .lookup_revocable::<T>(cap, Rights::NONE)
+                .map_err(map_cap_error)?,
+        );
+        match cspace.persistent_witness::<T>(cap, Rights::NONE) {
+            Ok(_) => return Err(AuthorityError::RawPersistentAuthority),
+            Err(CapError::NotPersistent) => {}
+            Err(error) => return Err(map_cap_error(error)),
+        }
+        Ok(PreparedSupervisedEphemeralSource {
+            cspace_identity: cspace.identity(),
+            cspace_incarnation: cspace.incarnation(),
+            cap,
+            kind: T::HOST_KIND,
+            rights_ceiling,
+        })
+    }
+
+    /// Mint a typed, boot-local persistent proxy into an exact volatile source
+    /// CSpace for later sealed pair transfer.
+    ///
+    /// The durable parent is resolved at preparation time with `GRANT` plus the
+    /// requested operation rights. Only its revocation-aware typed token enters
+    /// the private proxy; no durable ID or raw persistent capability escapes.
+    /// The local proxy never carries `GRANT`, `REVOKE`, or `INVOKE`.
+    ///
+    /// # Safety
+    ///
+    /// `target` must be an exclusively held, unpublished registry CSpace. The
+    /// caller must reserve the matching ResourceTable entry before this call and
+    /// publish the consumed receipt only after registry postflight. A failed
+    /// postflight must not publish the receipt: the registry must retain the
+    /// affected CSpace in sticky quarantine or tear it down through the exact
+    /// reservation path. The callback must not let the receipt or minted proxy
+    /// escape by any other path.
+    pub unsafe fn prepare_supervised_persistent_proxy_source_in<T: ComponentHostResource>(
+        target: &mut CSpace,
+        source: &CSpace,
+        source_cap: Cap,
+        rights: Rights,
+    ) -> Result<PreparedSupervisedPersistentProxySource, AuthorityError> {
+        const FORBIDDEN: Rights = Rights::GRANT.union(Rights::REVOKE).union(Rights::INVOKE);
+        if core::ptr::eq(target, source)
+            || target.identity() == source.identity()
+            || target.persistent_space_id().is_some()
+        {
+            return Err(AuthorityError::PersistentProxyTarget);
+        }
+        if source.persistent_space_id().is_none() {
+            return Err(AuthorityError::PersistentAuthorityRequired);
+        }
+        if rights.intersect(FORBIDDEN) != Rights::NONE {
+            return Err(AuthorityError::PersistentProxyRights);
+        }
+        if !T::OPERATION_RIGHTS.contains(rights) {
+            return Err(AuthorityError::RightsExceedCeiling);
+        }
+        let held = source.rights_of(source_cap).map_err(map_cap_error)?;
+        if !held.contains(Rights::GRANT) {
+            return Err(AuthorityError::PersistentGrantRequired);
+        }
+        if !held.contains(rights) {
+            return Err(AuthorityError::InsufficientRights);
+        }
+        let parent = source
+            .lookup_persistent_revocable::<T>(source_cap, rights.union(Rights::GRANT))
+            .map_err(map_cap_error)?;
+        let cap = target.mint(Arc::new(PersistentProxy { parent, rights }), rights);
+        Ok(PreparedSupervisedPersistentProxySource {
+            cspace_identity: target.identity(),
+            cspace_incarnation: target.incarnation(),
+            cap,
+            kind: T::HOST_KIND,
+            rights_ceiling: rights,
+        })
     }
 
     pub const fn kind(&self) -> HostResourceKind {
@@ -487,9 +691,77 @@ impl ComponentAuthority {
         F: for<'a> FnOnce(&'a T) -> R,
     {
         match self.class {
-            AuthorityClass::Ephemeral => self.with_revocable::<T, R, F>(cspace, need, operation),
+            AuthorityClass::Ephemeral | AuthorityClass::EphemeralGrantSource => {
+                self.with_revocable::<T, R, F>(cspace, need, operation)
+            }
             AuthorityClass::PersistentProxy => {
                 self.with_persistent_proxy::<T, R, F>(cspace, need, operation)
+            }
+        }
+    }
+
+    /// Resolve either authority class through an already-held exact CSpace.
+    ///
+    /// This is the pair-gate form of [`Self::with_resource`]: it retains no
+    /// lock owner or CSpace wrapper and performs the complete identity,
+    /// incarnation, rights, concrete backing type, local revocation, and (for
+    /// a persistent proxy) durable-parent revocation check on every call.
+    pub fn with_resource_in<T, R, F>(
+        &self,
+        cspace: &CSpace,
+        need: Rights,
+        operation: F,
+    ) -> Result<R, AuthorityError>
+    where
+        T: ComponentHostResource,
+        F: for<'a> FnOnce(&'a T) -> R,
+    {
+        if T::HOST_KIND != self.kind {
+            return Err(AuthorityError::WrongResourceKind);
+        }
+        if !self.rights_ceiling.contains(need) {
+            return Err(AuthorityError::RightsExceedCeiling);
+        }
+        if cspace.identity() != self.cspace_identity {
+            return Err(AuthorityError::WrongSpace);
+        }
+        if cspace.incarnation() != self.cspace_incarnation {
+            return Err(AuthorityError::IncarnationMismatch);
+        }
+        let held = cspace.rights_of(self.cap).map_err(map_cap_error)?;
+        match self.class {
+            AuthorityClass::Ephemeral => {
+                if !self.rights_ceiling.contains(held) {
+                    return Err(AuthorityError::RightsExceedCeiling);
+                }
+                let token = cspace
+                    .lookup_revocable::<T>(self.cap, need)
+                    .map_err(map_cap_error)?;
+                token.try_with(operation).map_err(map_cap_error)
+            }
+            AuthorityClass::EphemeralGrantSource => {
+                if held != self.rights_ceiling.union(Rights::GRANT) {
+                    return Err(if held.contains(Rights::GRANT) {
+                        AuthorityError::RightsExceedCeiling
+                    } else {
+                        AuthorityError::SupervisorGrantRequired
+                    });
+                }
+                let token = cspace
+                    .lookup_revocable::<T>(self.cap, need)
+                    .map_err(map_cap_error)?;
+                token.try_with(operation).map_err(map_cap_error)
+            }
+            AuthorityClass::PersistentProxy => {
+                if !self.rights_ceiling.contains(held) {
+                    return Err(AuthorityError::RightsExceedCeiling);
+                }
+                let token = cspace
+                    .lookup_revocable::<PersistentProxy<T>>(self.cap, need)
+                    .map_err(map_cap_error)?;
+                token
+                    .try_with(|proxy| proxy.try_with(need, operation))
+                    .map_err(map_cap_error)?
             }
         }
     }
@@ -519,8 +791,17 @@ impl ComponentAuthority {
             return Err(AuthorityError::IncarnationMismatch);
         }
         let held = guard.rights_of(self.cap).map_err(map_cap_error)?;
-        if !self.rights_ceiling.contains(held) {
-            return Err(AuthorityError::RightsExceedCeiling);
+        match self.class {
+            AuthorityClass::EphemeralGrantSource => {
+                if held != self.rights_ceiling.union(Rights::GRANT) {
+                    return Err(AuthorityError::RightsExceedCeiling);
+                }
+            }
+            AuthorityClass::Ephemeral | AuthorityClass::PersistentProxy => {
+                if !self.rights_ceiling.contains(held) {
+                    return Err(AuthorityError::RightsExceedCeiling);
+                }
+            }
         }
         let token = guard
             .lookup_revocable::<T>(self.cap, need)

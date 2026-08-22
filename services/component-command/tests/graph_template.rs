@@ -1,16 +1,20 @@
 use std::sync::Arc;
 
 use vibeos_component_admission::{
-    admit_component_graph, ArtifactTrust, CallerAuthority, ComponentArtifact,
-    ComponentGraphAdmissionPolicy, ComponentGraphCyclePolicy, ComponentGraphNodeAdmissionPolicy,
-    InstanceLimits, ProfileIdentity,
+    admit_component_graph, admit_component_graph_with_resource_policy, ArtifactTrust,
+    CallerAuthority, ComponentArtifact, ComponentGraphAdmissionPolicy, ComponentGraphCyclePolicy,
+    ComponentGraphNodeAdmissionPolicy, ComponentGraphResourceEdgePolicy,
+    ComponentGraphResourceMode, InstanceLimits, ProfileIdentity,
 };
 use vibeos_component_command::{
     ComponentGraphNodePrincipalTemplate, ComponentGraphNodeReportError, ComponentGraphNodeTerminal,
     ComponentGraphPrincipalIsolation, ComponentGraphPrincipalTemplate,
 };
 use vibeos_component_runtime::{
-    graph::{ComponentGraphNesting, ComponentGraphNodeId},
+    graph::{
+        ComponentGraphEdgeSpec, ComponentGraphEntityIndex, ComponentGraphExportEndpoint,
+        ComponentGraphImportEndpoint, ComponentGraphNesting, ComponentGraphNodeId,
+    },
     world::WorldContract,
 };
 
@@ -21,6 +25,68 @@ const EMPTY_WORLD_WIT: &str = r#"
 "#;
 
 const EMPTY_WORLD: &str = "test:c63/empty@1.0.0";
+
+const RESOURCE_WIT: &str = r#"
+    package test:c64-command@1.0.0;
+
+    interface pipe {
+        resource handle;
+        send: func(value: borrow<handle>);
+    }
+
+    world producer {
+        export pipe;
+    }
+
+    world consumer {
+        import pipe;
+    }
+"#;
+
+const RESOURCE_PRODUCER_WORLD: &str = "test:c64-command/producer@1.0.0";
+const RESOURCE_CONSUMER_WORLD: &str = "test:c64-command/consumer@1.0.0";
+
+const RESOURCE_PRODUCER_WAT: &str = r#"
+    (component
+      (type $handle (resource (rep i32)))
+      (type $borrow-handle (borrow $handle))
+      (type $send-type (func (param "value" $borrow-handle)))
+      (core module $module
+        (func (export "send") (param i32)))
+      (core instance $instance (instantiate $module))
+      (alias core export $instance "send" (core func $send-core))
+      (func $send (type $send-type) (canon lift (core func $send-core)))
+      (instance $pipe
+        (export "handle" (type $handle))
+        (export "send" (func $send)))
+      (export "test:c64-command/pipe@1.0.0" (instance $pipe)))
+"#;
+
+const RESOURCE_CONSUMER_WAT: &str = r#"
+    (component
+      (type $pipe
+        (instance
+          (export "handle" (type $handle (sub resource)))
+          (type $borrow-handle (borrow $handle))
+          (type $send-type (func (param "value" $borrow-handle)))
+          (export "send" (func (type $send-type)))))
+      (import "test:c64-command/pipe@1.0.0" (instance $pipe-in (type $pipe))))
+"#;
+
+fn graph_node(index: u16) -> ComponentGraphNodeId {
+    ComponentGraphNodeId::new(index)
+}
+
+fn graph_entity(index: u16) -> ComponentGraphEntityIndex {
+    ComponentGraphEntityIndex::new(index)
+}
+
+fn resource_edge() -> ComponentGraphEdgeSpec {
+    ComponentGraphEdgeSpec::new(
+        ComponentGraphExportEndpoint::new(graph_node(0), graph_entity(0)),
+        ComponentGraphImportEndpoint::new(graph_node(1), graph_entity(0)),
+    )
+}
 
 fn limits(
     memory_bytes: usize,
@@ -75,6 +141,58 @@ fn admitted_graph() -> vibeos_component_admission::AdmittedComponentGraph {
     };
     admit_component_graph(vec![root, child], &policy, &CallerAuthority { offers: &[] })
         .expect("empty validation-only graph must admit")
+}
+
+fn admitted_resource_graph() -> vibeos_component_admission::AdmittedComponentGraph {
+    let producer_bytes = wat::parse_str(RESOURCE_PRODUCER_WAT).expect("producer must encode");
+    let consumer_bytes = wat::parse_str(RESOURCE_CONSUMER_WAT).expect("consumer must encode");
+    let producer = ComponentArtifact::copy_from(&producer_bytes, ProfileIdentity::PROFILE_1)
+        .expect("producer artifact must fit");
+    let consumer = ComponentArtifact::copy_from(&consumer_bytes, ProfileIdentity::PROFILE_1)
+        .expect("consumer artifact must fit");
+    let producer_world = WorldContract::parse(RESOURCE_WIT, RESOURCE_PRODUCER_WORLD)
+        .expect("producer world must parse");
+    let consumer_world = WorldContract::parse(RESOURCE_WIT, RESOURCE_CONSUMER_WORLD)
+        .expect("consumer world must parse");
+    let nodes = [
+        ComponentGraphNodeAdmissionPolicy {
+            label: "resource-producer",
+            nesting: ComponentGraphNesting::Root,
+            exact_world: &producer_world,
+            trust: ArtifactTrust::ImagePinned(producer.identity()),
+            limits: limits(64 * 1024, 1_000, 100, 3),
+            interfaces: &[],
+        },
+        ComponentGraphNodeAdmissionPolicy {
+            label: "resource-consumer",
+            nesting: ComponentGraphNesting::Root,
+            exact_world: &consumer_world,
+            trust: ArtifactTrust::ImagePinned(consumer.identity()),
+            limits: limits(64 * 1024, 2_000, 100, 5),
+            interfaces: &[],
+        },
+    ];
+    let edges = [resource_edge()];
+    let policy = ComponentGraphAdmissionPolicy {
+        name: "resource-route-report",
+        profile: ProfileIdentity::PROFILE_1,
+        nodes: &nodes,
+        edges: &edges,
+        external_imports: &[],
+        published_exports: &[],
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    let resource_policy = [ComponentGraphResourceEdgePolicy {
+        edge: resource_edge(),
+        mode: ComponentGraphResourceMode::Borrow,
+    }];
+    admit_component_graph_with_resource_policy(
+        vec![producer, consumer],
+        &policy,
+        &resource_policy,
+        &CallerAuthority { offers: &[] },
+    )
+    .expect("exact resource graph must admit")
 }
 
 #[test]
@@ -170,6 +288,99 @@ fn runtime_unavailable_reports_are_zero_bounded_and_semantic() {
     assert_eq!(
         template.runtime_unavailable_report(unknown),
         Err(ComponentGraphNodeReportError::UnknownNode { node: unknown })
+    );
+}
+
+#[test]
+fn admitted_resource_edges_are_public_inert_and_freshly_revalidated() {
+    let template = ComponentGraphPrincipalTemplate::new(Arc::new(admitted_resource_graph()))
+        .expect("resource template must build");
+
+    assert!(!template.runtime_ready());
+    assert_eq!(template.resource_edges().len(), 1);
+    let route = &template.resource_edges()[0];
+    assert_eq!(route.edge(), resource_edge());
+    assert_eq!(route.mode(), ComponentGraphResourceMode::Borrow);
+    assert_eq!(route.resources().len(), 1);
+    assert_eq!(route.resources()[0], "handle");
+    template
+        .revalidate()
+        .expect("resource edges require fresh admission provenance");
+}
+
+#[test]
+fn supervisor_prepared_resource_report_is_positive_bounded_and_guest_inert() {
+    let template = ComponentGraphPrincipalTemplate::new(Arc::new(admitted_resource_graph()))
+        .expect("resource template must build");
+
+    for node in [graph_node(0), graph_node(1)] {
+        let principal = template.principal(node).unwrap();
+        let report = template
+            .supervisor_prepared_resource_unavailable_report(node, 1)
+            .expect("both exact resource-edge endpoints may report measured setup use");
+        assert_eq!(report.node(), node);
+        assert_eq!(
+            report.terminal(),
+            ComponentGraphNodeTerminal::RuntimeUnavailable
+        );
+        assert_eq!(report.fuel().limit(), principal.fuel_limit());
+        assert_eq!(report.fuel().consumed(), 0);
+        assert_eq!(
+            report.resources().slot_limit(),
+            principal.resource_slot_limit()
+        );
+        assert_eq!(report.resources().peak_slots(), 1);
+        assert_eq!(report.resources().live_slots(), 0);
+
+        // The ordinary path remains a distinct zero-resource report even
+        // after the supervisor-prepared builder is available.
+        let ordinary = template.runtime_unavailable_report(node).unwrap();
+        assert_eq!(ordinary.resources().peak_slots(), 0);
+        assert_eq!(ordinary.resources().live_slots(), 0);
+    }
+    let at_limit = template
+        .supervisor_prepared_resource_unavailable_report(graph_node(0), 3)
+        .expect("the exact manifest slot ceiling is inclusive");
+    assert_eq!(at_limit.resources().peak_slots(), 3);
+    assert_eq!(at_limit.resources().live_slots(), 0);
+    assert!(!template.runtime_ready());
+}
+
+#[test]
+fn supervisor_prepared_resource_report_rejects_zero_unrouted_unknown_and_over_limit() {
+    let resource_template =
+        ComponentGraphPrincipalTemplate::new(Arc::new(admitted_resource_graph()))
+            .expect("resource template must build");
+    assert_eq!(
+        resource_template.supervisor_prepared_resource_unavailable_report(graph_node(0), 0),
+        Err(ComponentGraphNodeReportError::SupervisorPreparedPeakRequired)
+    );
+    assert_eq!(
+        resource_template.supervisor_prepared_resource_unavailable_report(graph_node(0), 4),
+        Err(ComponentGraphNodeReportError::ResourceLimitExceeded)
+    );
+    let unknown = graph_node(u16::MAX);
+    assert_eq!(
+        resource_template.supervisor_prepared_resource_unavailable_report(unknown, 1),
+        Err(ComponentGraphNodeReportError::UnknownNode { node: unknown })
+    );
+
+    let resource_free = ComponentGraphPrincipalTemplate::new(Arc::new(admitted_graph()))
+        .expect("resource-free template must build");
+    assert_eq!(
+        resource_free.supervisor_prepared_resource_unavailable_report(graph_node(0), 1),
+        Err(ComponentGraphNodeReportError::ResourceEdgeRequired {
+            node: graph_node(0),
+        })
+    );
+    // Its pre-existing ordinary report remains valid and strictly zero.
+    assert_eq!(
+        resource_free
+            .runtime_unavailable_report(graph_node(0))
+            .unwrap()
+            .resources()
+            .peak_slots(),
+        0
     );
 }
 

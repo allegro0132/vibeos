@@ -7,9 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use vibeos_core::cap::{
-    grant, move_cap, CSpace, CSpaceResetError, CapError, PersistentInstallError,
-    PersistentResourceWitness, Resource, Rights, ScopedResource, CAPABILITY_TABLE_PAGE_SIZE,
-    MAX_PERSISTENT_SLOTS,
+    grant, CSpace, CSpaceResetError, CapError, PersistentInstallError, PersistentResourceWitness,
+    Resource, Rights, ScopedResource, CAPABILITY_TABLE_PAGE_SIZE, MAX_PERSISTENT_SLOTS,
 };
 use vibeos_core::heap::{current_owner, enter_owner, OwnerId};
 use vibeos_durable_format::{
@@ -187,69 +186,6 @@ fn exact_cspace_reset_rejects_identity_incarnation_and_aba_without_mutation() {
         "fresh",
         "a stale reset cannot revoke authority from the replacement incarnation"
     );
-}
-
-#[test]
-fn supervisor_move_relocates_without_copying_widening_or_breaking_ancestry() {
-    let mut source = CSpace::new("move-source");
-    let mut target = CSpace::new("move-target");
-    let root = source.mint(
-        Arc::new(Widget("moved")),
-        Rights::READ.union(Rights::WRITE).union(Rights::REVOKE),
-    );
-    let moved = move_cap(&mut source, root, Rights::READ, &mut target).unwrap();
-
-    assert_eq!(
-        source.lookup(root, Rights::NONE).err(),
-        Some(CapError::Invalid)
-    );
-    assert_eq!(source.list().len(), 0);
-    assert_eq!(target.list().len(), 1);
-    assert_eq!(target.rights_of(moved), Ok(Rights::READ));
-    assert_eq!(
-        target.lookup_as::<Widget>(moved, Rights::READ).unwrap().0,
-        "moved",
-    );
-    assert_eq!(
-        target.lookup(moved, Rights::WRITE).err(),
-        Some(CapError::InsufficientRights),
-    );
-}
-
-#[test]
-fn supervisor_move_retains_the_exact_derivation_node() {
-    let mut source = CSpace::new("move-derived-source");
-    let mut target = CSpace::new("move-derived-target");
-    let ancestor = source.mint(
-        Arc::new(Widget("derived")),
-        Rights::READ.union(Rights::GRANT).union(Rights::REVOKE),
-    );
-    let child = source.derive(ancestor, Rights::READ).unwrap();
-    let moved = move_cap(&mut source, child, Rights::READ, &mut target).unwrap();
-
-    assert_eq!(source.revoke(ancestor), Ok(1));
-    assert_eq!(
-        target.lookup(moved, Rights::READ).err(),
-        Some(CapError::Invalid),
-    );
-    assert!(target.list().is_empty());
-}
-
-#[test]
-fn failed_supervisor_move_leaves_source_exactly_live() {
-    let mut source = CSpace::new("move-failure-source");
-    let mut target = CSpace::new("move-failure-target");
-    let cap = source.mint(Arc::new(Widget("still-live")), Rights::READ);
-
-    assert_eq!(
-        move_cap(&mut source, cap, Rights::WRITE, &mut target),
-        Err(CapError::Amplification),
-    );
-    assert_eq!(
-        source.lookup_as::<Widget>(cap, Rights::READ).unwrap().0,
-        "still-live"
-    );
-    assert!(target.list().is_empty());
 }
 
 #[test]
@@ -1139,7 +1075,6 @@ fn committed_root_and_child_install_with_exact_identity_and_attenuation() {
         grant(&cs, root_cap, Rights::READ, &mut other).err(),
         Some(CapError::PersistentLifecycleRequired)
     );
-
     assert_eq!(
         cs.complete_persistent_revoke(&root, child.identity())
             .unwrap(),

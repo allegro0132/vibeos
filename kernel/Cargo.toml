@@ -105,12 +105,21 @@ ssh-component-command = [
 # ValidationOnly graph remains non-executable.
 component-graph-principals = [
     "dep:vibeos-component-command",
+    "dep:vibeos-component-host",
     "dep:vibeos-component-runtime",
 ]
 # QEMU image gate for the real two-node C6.3 lifecycle proof.
 wasm-c63-graph-principal-acceptance = [
     "component-graph-principals",
     "dep:vibeos-component-admission",
+]
+# QEMU image gate for the C6.4 exact resource-edge supervisor proof. The
+# selected profile remains validation-only; this feature never enables or
+# calls guest execution from the graph-principal path.
+wasm-c64-resource-route-acceptance = [
+    "component-graph-principals",
+    "dep:vibeos-component-admission",
+    "vibeos-image-policy/c64-resource-route-qemu-acceptance",
 ]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness

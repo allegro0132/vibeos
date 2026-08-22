@@ -1,10 +1,14 @@
 //! Fresh, separately supervised kernel principals for one admitted Component graph.
 //!
-//! C6.3 deliberately stops at the lifecycle boundary. Every node receives a
-//! distinct owner, tracked arena, registry generation, CSpace, task, resource
-//! table, and fuel envelope, but its payload never decodes, instantiates, or
-//! calls guest code. The only successful terminal is therefore the semantic
-//! `RuntimeUnavailable` report supplied by the sealed command template.
+//! Every node receives a distinct owner, tracked arena, registry generation,
+//! CSpace, task, resource table, and fuel envelope, but its payload never
+//! decodes, instantiates, or calls guest code. C6.4 may additionally prepare an
+//! exact admitted resource edge while both node reservations are unpublished:
+//! the supervisor proves one invocation-scoped borrow and one attenuated owned
+//! transfer before either payload becomes runnable, then proves target-first
+//! exact revocation before publishing reports. The only successful terminal
+//! remains the semantic `RuntimeUnavailable` report supplied by the sealed
+//! command template.
 
 extern crate alloc;
 
@@ -20,16 +24,42 @@ use vibeos_component_command::{
     ComponentGraphPrincipalTemplate,
 };
 use vibeos_component_runtime::graph::ComponentGraphNodeId;
-use vibeos_component_runtime::resource::ResourceTable;
-#[cfg(feature = "wasm-c63-graph-principal-acceptance")]
+use vibeos_component_runtime::resource::{ResourceTable, ResourceToken, ResourceTypeId};
+#[cfg(any(
+    feature = "wasm-c63-graph-principal-acceptance",
+    feature = "wasm-c64-resource-route-acceptance"
+))]
 use vibeos_component_runtime::{graph::ComponentGraphNesting, world::WorldContract};
 
 #[cfg(feature = "wasm-c63-graph-principal-acceptance")]
+use vibeos_component_admission::admit_component_graph;
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
 use vibeos_component_admission::{
-    admit_component_graph, ArtifactTrust, CallerAuthority, ComponentArtifact,
-    ComponentGraphAdmissionPolicy, ComponentGraphCyclePolicy, ComponentGraphNodeAdmissionPolicy,
-    InstanceLimits, ProfileIdentity,
+    admit_component_graph_with_resource_policy, ComponentGraphResourceEdgePolicy,
+    ComponentGraphResourceMode,
 };
+#[cfg(any(
+    feature = "wasm-c63-graph-principal-acceptance",
+    feature = "wasm-c64-resource-route-acceptance"
+))]
+use vibeos_component_admission::{
+    ArtifactTrust, CallerAuthority, ComponentArtifact, ComponentGraphAdmissionPolicy,
+    ComponentGraphCyclePolicy, ComponentGraphNodeAdmissionPolicy, InstanceLimits, ProfileIdentity,
+};
+use vibeos_component_host::ComponentAuthority;
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+use vibeos_component_host::{
+    prepare_owned_supervised, with_supervised_borrow, ComponentHostResource, HostResourceKind,
+};
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+use vibeos_component_runtime::graph::{
+    ComponentGraphEdgeSpec, ComponentGraphEntityIndex, ComponentGraphExportEndpoint,
+    ComponentGraphImportEndpoint,
+};
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+use vibeos_core::cap::{Resource, Rights};
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+use vibeos_image_policy::C64_RESOURCE_ROUTE_QEMU_ACCEPTANCE;
 
 use crate::exec::{PreparedTaskBatch, TaskHandle, TaskState};
 use crate::heap::{AllocationDomain, FreshDomainBatchError, OwnerId};
@@ -39,10 +69,10 @@ use crate::instance::{
 use crate::sync::SpinLock;
 use crate::HEAP;
 
-/// Audited non-guest storage allowance for one C6.3 node lifecycle.
+/// Audited non-guest storage allowance for one graph-node lifecycle.
 ///
 /// This frozen 64-KiB charge covers the managed task future, registry payload,
-/// empty resource table, and bounded lifecycle bookkeeping allocated in the
+/// bounded resource table, and lifecycle bookkeeping allocated in the
 /// node's tracked arena. It is added with `checked_add` to the owner quota. The
 /// admitted guest-memory ceiling remains a separate field in the payload and
 /// is never enlarged by this allowance.
@@ -52,8 +82,57 @@ const PRINCIPAL_CSPACE_NAME: &str = "wasm-graph-principal";
 const PRINCIPAL_TASK_NAME: &str = "wasm-graph-principal";
 const RUNTIME_UNAVAILABLE_COMPLETION: u64 = 0x5649_4245_4336_0300;
 const INVALID_ENVELOPE_COMPLETION: u64 = 0x5649_4245_4336_FFFF;
+const RUNTIME_UNAVAILABLE_GUEST_CALL_MASK: u64 = 0xFF;
+
+const fn encode_runtime_unavailable_completion(guest_calls: u64) -> u64 {
+    if guest_calls > RUNTIME_UNAVAILABLE_GUEST_CALL_MASK {
+        INVALID_ENVELOPE_COMPLETION
+    } else {
+        RUNTIME_UNAVAILABLE_COMPLETION | guest_calls
+    }
+}
+
+const fn completion_guest_calls(completion: u64) -> Option<u64> {
+    if completion & !RUNTIME_UNAVAILABLE_GUEST_CALL_MASK == RUNTIME_UNAVAILABLE_COMPLETION {
+        Some(completion & RUNTIME_UNAVAILABLE_GUEST_CALL_MASK)
+    } else {
+        None
+    }
+}
 
 static NEXT_RESOURCE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+const C64_SOURCE_RESOURCE_TYPE: ResourceTypeId = ResourceTypeId(0xC6_04_0001);
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+const C64_TARGET_RESOURCE_TYPE: ResourceTypeId = ResourceTypeId(0xC6_04_0002);
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+const C64_ROUTE_PROBE_VALUE: u32 = 0xC604_0001;
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+const C64_RESOURCE_ROUTE_WIT_SHA256: [u8; 32] = [
+    0x07, 0x16, 0xe0, 0x79, 0x84, 0x89, 0x6d, 0xf8, 0x3b, 0xc2, 0x6a, 0x82, 0x82, 0x23, 0x6e, 0x6d,
+    0xfa, 0x70, 0x8b, 0xf6, 0x71, 0x92, 0x85, 0x3b, 0xd8, 0xcd, 0x84, 0x79, 0xcc, 0xec, 0x13, 0x41,
+];
+
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+struct C64RouteProbe(u32);
+
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+impl Resource for C64RouteProbe {
+    fn kind(&self) -> &'static str {
+        "c64-supervised-route-probe"
+    }
+
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+impl ComponentHostResource for C64RouteProbe {
+    const HOST_KIND: HostResourceKind = HostResourceKind::Blob;
+    const OPERATION_RIGHTS: Rights = Rights::READ;
+}
 
 /// A public lifecycle failure contains only a semantic graph-local node and a
 /// bounded classification. It never formats a TaskId, owner, arena, registry
@@ -62,6 +141,9 @@ static NEXT_RESOURCE_GENERATION: AtomicU64 = AtomicU64::new(1);
 pub enum ComponentGraphPrincipalLifecycleError {
     Revalidation,
     AuthorityBearingGraph,
+    ResourceRouteRequired,
+    ResourceRoutePolicy,
+    ResourceRouteSetup,
     ExecutableTemplate,
     InvalidPrincipalSet,
     BudgetOverflow { node: ComponentGraphNodeId },
@@ -86,9 +168,16 @@ impl fmt::Display for ComponentGraphPrincipalLifecycleError {
         formatter.write_str(match self {
             Self::Revalidation => "component graph principal revalidation failed",
             Self::AuthorityBearingGraph => {
-                "C6.3 cannot materialize a graph with unresolved live authority grants"
+                "component graph cannot materialize unresolved live authority grants"
             }
-            Self::ExecutableTemplate => "C6.3 accepts only a validation-only graph template",
+            Self::ResourceRouteRequired => {
+                "resource-bearing graph requires an explicit supervisor route"
+            }
+            Self::ResourceRoutePolicy => "component graph resource route is not exact",
+            Self::ResourceRouteSetup => "component graph resource route setup failed",
+            Self::ExecutableTemplate => {
+                "component graph lifecycle accepts only a validation-only template"
+            }
             Self::InvalidPrincipalSet => "component graph principal set is invalid",
             Self::BudgetOverflow { .. } => "component graph principal budget overflowed",
             Self::ResourceGenerationExhausted => {
@@ -123,6 +212,8 @@ impl fmt::Display for ComponentGraphPrincipalLifecycleError {
 /// exact registry finalization and allocator retirement.
 pub struct ComponentGraphPrincipalReports {
     reports: Vec<ComponentGraphNodeTerminalReport>,
+    teardown: Vec<PrincipalTeardownReceipt>,
+    guest_calls: u64,
 }
 
 struct PrincipalCompletion {
@@ -195,6 +286,11 @@ impl ComponentGraphPrincipalReports {
     pub fn node(&self, node: ComponentGraphNodeId) -> Option<&ComponentGraphNodeTerminalReport> {
         self.reports.iter().find(|report| report.node() == node)
     }
+
+    /// Exact guest-call attempts encoded by the terminal payload receipts.
+    pub const fn guest_calls(&self) -> u64 {
+        self.guest_calls
+    }
 }
 
 impl fmt::Debug for ComponentGraphPrincipalReports {
@@ -202,6 +298,7 @@ impl fmt::Debug for ComponentGraphPrincipalReports {
         formatter
             .debug_struct("ComponentGraphPrincipalReports")
             .field("nodes", &self.reports)
+            .field("guest_calls", &self.guest_calls)
             .finish()
     }
 }
@@ -216,6 +313,46 @@ struct PrincipalPlan {
     resource_types: u64,
     resource_slots: u16,
     resource_generation: u64,
+    expected_resource_peak: u64,
+    expected_revoked_capabilities: usize,
+    drain: Option<PrincipalResourceDrain>,
+}
+
+#[derive(Clone, Copy)]
+struct PrincipalResourceDrain {
+    token: ResourceToken,
+    resource_type: ResourceTypeId,
+}
+
+#[derive(Clone, Copy)]
+struct ResourceRoutePlan {
+    source_index: usize,
+    target_index: usize,
+}
+
+#[derive(Clone, Copy)]
+enum ResourceRouteRequest {
+    None,
+    #[cfg(feature = "wasm-c64-resource-route-acceptance")]
+    C64Exact,
+}
+
+#[derive(Clone, Copy)]
+struct ResourceRouteReceipt {
+    borrow_invocations: u64,
+    owned_transfers: u64,
+    attenuated_grants: u64,
+    source_peak_slots: u64,
+    target_peak_slots: u64,
+    borrow_source_caps_before: u64,
+    borrow_source_caps_after: u64,
+    borrow_target_caps_before: u64,
+    borrow_target_caps_after: u64,
+    source_caps_after_transfer: u64,
+    target_caps_after_transfer: u64,
+    source_live_after_transfer: u64,
+    target_live_after_transfer: u64,
+    target_grant_absent: bool,
 }
 
 struct PrincipalSupervisor {
@@ -231,6 +368,8 @@ struct PrincipalSupervisor {
 #[derive(Clone, Copy)]
 struct PrincipalTeardownReceipt {
     node: ComponentGraphNodeId,
+    revoked_capabilities: usize,
+    guest_calls: u64,
 }
 
 impl PrincipalSupervisor {
@@ -248,7 +387,7 @@ impl PrincipalSupervisor {
         .and_then(|()| {
             publish_semantic_reports(
                 &self.plans,
-                &self.teardown,
+                core::mem::take(&mut self.teardown),
                 core::mem::take(&mut self.reports),
             )
         });
@@ -257,9 +396,13 @@ impl PrincipalSupervisor {
 }
 
 struct PrincipalPayload {
-    resources: ResourceTable<()>,
+    resources: ResourceTable<ComponentAuthority>,
     fuel: PrincipalFuelEnvelope,
     guest_memory_limit: usize,
+    expected_resource_peak: u64,
+    resource_slot_limit: u16,
+    drain: Option<PrincipalResourceDrain>,
+    guest_calls: u64,
     completed: bool,
 }
 
@@ -271,7 +414,7 @@ struct PrincipalFuelEnvelope {
 }
 
 impl PrincipalPayload {
-    fn new(plan: PrincipalPlan, resources: ResourceTable<()>) -> Self {
+    fn new(plan: PrincipalPlan, resources: ResourceTable<ComponentAuthority>) -> Self {
         Self {
             resources,
             fuel: PrincipalFuelEnvelope {
@@ -280,30 +423,49 @@ impl PrincipalPayload {
                 consumed: 0,
             },
             guest_memory_limit: plan.guest_memory_limit,
+            expected_resource_peak: plan.expected_resource_peak,
+            resource_slot_limit: plan.resource_slots,
+            drain: plan.drain,
+            guest_calls: 0,
             completed: false,
         }
     }
 
     fn runtime_unavailable_completion(&mut self) -> u64 {
-        let pristine = !self.completed
-            && self.resources.is_empty()
+        let envelope_valid = !self.completed
             && self.fuel.consumed == 0
             && self.fuel.limit != 0
             && self.fuel.poll_quantum != 0
             && self.fuel.poll_quantum <= self.fuel.limit
-            && self.guest_memory_limit != 0;
-        if !pristine {
+            && self.guest_memory_limit != 0
+            && self.expected_resource_peak <= u64::from(self.resource_slot_limit);
+        if !envelope_valid {
+            return INVALID_ENVELOPE_COMPLETION;
+        }
+        if let Some(drain) = self.drain {
+            if self
+                .resources
+                .drop_owned(drain.token, drain.resource_type)
+                .is_err()
+            {
+                return INVALID_ENVELOPE_COMPLETION;
+            }
+            self.drain = None;
+        }
+        if !self.resources.is_empty() {
             return INVALID_ENVELOPE_COMPLETION;
         }
         self.completed = true;
-        RUNTIME_UNAVAILABLE_COMPLETION
+        encode_runtime_unavailable_completion(self.guest_calls)
     }
 }
 
 impl Drop for PrincipalPayload {
     fn drop(&mut self) {
         debug_assert!(self.resources.is_empty());
+        debug_assert!(self.drain.is_none());
         debug_assert_eq!(self.fuel.consumed, 0);
+        debug_assert_eq!(self.guest_calls, 0);
     }
 }
 
@@ -443,10 +605,74 @@ fn checked_plan(
             resource_types: principal.budget().resource_types,
             resource_slots,
             resource_generation: 0,
+            expected_resource_peak: 0,
+            expected_revoked_capabilities: 0,
+            drain: None,
         });
     }
     system.restore();
     Ok(plans)
+}
+
+fn bind_expected_resource_peaks(
+    plans: &mut [PrincipalPlan],
+    route: Option<ResourceRoutePlan>,
+) -> Result<(), ComponentGraphPrincipalLifecycleError> {
+    let Some(route) = route else {
+        return Ok(());
+    };
+    if route.source_index == route.target_index
+        || route.source_index >= plans.len()
+        || route.target_index >= plans.len()
+        || plans[route.source_index].resource_slots == 0
+        || plans[route.target_index].resource_slots == 0
+        || plans[route.source_index].expected_resource_peak != 0
+        || plans[route.target_index].expected_resource_peak != 0
+    {
+        return Err(ComponentGraphPrincipalLifecycleError::ResourceRoutePolicy);
+    }
+    plans[route.source_index].expected_resource_peak = 1;
+    plans[route.target_index].expected_resource_peak = 1;
+    Ok(())
+}
+
+fn select_resource_route(
+    template: &ComponentGraphPrincipalTemplate,
+    request: ResourceRouteRequest,
+) -> Result<Option<ResourceRoutePlan>, ComponentGraphPrincipalLifecycleError> {
+    match request {
+        ResourceRouteRequest::None => {
+            if template.resource_edges().is_empty() {
+                Ok(None)
+            } else {
+                Err(ComponentGraphPrincipalLifecycleError::ResourceRouteRequired)
+            }
+        }
+        #[cfg(feature = "wasm-c64-resource-route-acceptance")]
+        ResourceRouteRequest::C64Exact => exact_c64_resource_route_plan(template).map(Some),
+    }
+}
+
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+fn exact_c64_resource_route_plan(
+    template: &ComponentGraphPrincipalTemplate,
+) -> Result<ResourceRoutePlan, ComponentGraphPrincipalLifecycleError> {
+    let [route] = template.resource_edges() else {
+        return Err(ComponentGraphPrincipalLifecycleError::ResourceRoutePolicy);
+    };
+    if template.principals().len() != 2
+        || template.manifest().edges() != core::slice::from_ref(&c64_resource_edge())
+        || route.edge() != c64_resource_edge()
+        || route.mode() != ComponentGraphResourceMode::OwnAndBorrow
+        || route.resources().len() != 1
+        || route.resources()[0].as_str() != "handle"
+    {
+        return Err(ComponentGraphPrincipalLifecycleError::ResourceRoutePolicy);
+    }
+    Ok(ResourceRoutePlan {
+        source_index: usize::from(route.edge().source().node().index()),
+        target_index: usize::from(route.edge().target().node().index()),
+    })
 }
 
 fn assign_resource_generations(
@@ -463,7 +689,7 @@ fn assign_resource_generations(
 
 fn prepare_resource_tables(
     plans: &[PrincipalPlan],
-) -> Result<Vec<Option<ResourceTable<()>>>, ComponentGraphPrincipalLifecycleError> {
+) -> Result<Vec<Option<ResourceTable<ComponentAuthority>>>, ComponentGraphPrincipalLifecycleError> {
     let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
     let mut tables = Vec::new();
     if tables.try_reserve_exact(plans.len()).is_err() {
@@ -486,6 +712,297 @@ fn prepare_resource_tables(
     }
     system.restore();
     Ok(tables)
+}
+
+fn prepare_resource_route(
+    route: Option<ResourceRoutePlan>,
+    plans: &mut [PrincipalPlan],
+    tokens: &[InstanceToken],
+    tables: &mut [Option<ResourceTable<ComponentAuthority>>],
+) -> Result<Option<ResourceRouteReceipt>, ComponentGraphPrincipalLifecycleError> {
+    let Some(route) = route else {
+        return Ok(None);
+    };
+    #[cfg(feature = "wasm-c64-resource-route-acceptance")]
+    {
+        return prepare_c64_resource_route(route, plans, tokens, tables).map(Some);
+    }
+    #[cfg(not(feature = "wasm-c64-resource-route-acceptance"))]
+    {
+        let _ = (route, plans, tokens, tables);
+        Err(ComponentGraphPrincipalLifecycleError::ResourceRoutePolicy)
+    }
+}
+
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+fn c64_route_tables_mut(
+    tables: &mut [Option<ResourceTable<ComponentAuthority>>],
+    route: ResourceRoutePlan,
+) -> Option<(
+    &mut ResourceTable<ComponentAuthority>,
+    &mut ResourceTable<ComponentAuthority>,
+)> {
+    if route.source_index == route.target_index
+        || route.source_index >= tables.len()
+        || route.target_index >= tables.len()
+    {
+        return None;
+    }
+    if route.source_index < route.target_index {
+        let (before_target, from_target) = tables.split_at_mut(route.target_index);
+        Some((
+            before_target[route.source_index].as_mut()?,
+            from_target[0].as_mut()?,
+        ))
+    } else {
+        let (before_source, from_source) = tables.split_at_mut(route.source_index);
+        Some((
+            from_source[0].as_mut()?,
+            before_source[route.target_index].as_mut()?,
+        ))
+    }
+}
+
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+fn prepare_c64_resource_route(
+    route: ResourceRoutePlan,
+    plans: &mut [PrincipalPlan],
+    tokens: &[InstanceToken],
+    tables: &mut [Option<ResourceTable<ComponentAuthority>>],
+) -> Result<ResourceRouteReceipt, ComponentGraphPrincipalLifecycleError> {
+    let setup_error = || ComponentGraphPrincipalLifecycleError::ResourceRouteSetup;
+    if route.source_index != 0
+        || route.target_index != 1
+        || plans.len() != 2
+        || tokens.len() != 2
+        || tables.len() != 2
+        || C64_SOURCE_RESOURCE_TYPE == C64_TARGET_RESOURCE_TYPE
+        || plans.iter().any(|plan| {
+            plan.resource_slots != 2
+                || plan.expected_resource_peak != 1
+                || plan.expected_revoked_capabilities != 0
+                || plan.drain.is_some()
+        })
+        || plans[route.source_index].resource_types != 1
+        || plans[route.target_index].resource_types != 0
+    {
+        return Err(ComponentGraphPrincipalLifecycleError::ResourceRoutePolicy);
+    }
+    let (source_table, target_table) =
+        c64_route_tables_mut(tables, route).ok_or_else(setup_error)?;
+    if !source_table.is_empty() || !target_table.is_empty() {
+        return Err(setup_error());
+    }
+
+    // Prove the exact pair pristine before creating the source root. The root
+    // itself is minted through the existing single-reservation setup gate; no
+    // cross-space derivation exists until the fused pair transfer below.
+    let pair_pristine = unsafe {
+        super::component_instances::registry().with_reserved_space_pair(
+            tokens[route.source_index],
+            tokens[route.target_index],
+            |source_space, target_space| {
+                source_space.live_count() == 0 && target_space.live_count() == 0
+            },
+        )
+    }
+    .map_err(|_| setup_error())?;
+    if !pair_pristine {
+        return Err(setup_error());
+    }
+
+    // Reserve the table entry before minting. The single-space callback
+    // returns only a detached copy receipt; table ownership is committed only
+    // after that exact reservation's postflight succeeds.
+    let source_reservation = source_table.reserve().map_err(|_| setup_error())?;
+    let source_receipt = unsafe {
+        super::component_instances::registry().configure_reserved_space(
+            tokens[route.source_index],
+            |source_space| {
+                if source_space.live_count() != 0 {
+                    return None;
+                }
+                let source_cap = source_space.mint(
+                    Arc::new(C64RouteProbe(C64_ROUTE_PROBE_VALUE)),
+                    Rights::READ.union(Rights::GRANT),
+                );
+                ComponentAuthority::prepare_supervised_ephemeral_source_in::<C64RouteProbe>(
+                    source_space,
+                    source_cap,
+                    Rights::READ,
+                )
+                .ok()
+            },
+        )
+    }
+    .map_err(|_| setup_error())?
+    .ok_or_else(setup_error)?;
+    let source_token =
+        source_reservation.commit(C64_SOURCE_RESOURCE_TYPE, source_receipt.into_authority());
+    if source_table.len() != 1
+        || source_table.contains(source_token, C64_SOURCE_RESOURCE_TYPE) != Ok(true)
+        || !target_table.is_empty()
+    {
+        return Err(setup_error());
+    }
+
+    // One invocation-scoped alias proves the admitted borrow mode. The target
+    // receives neither a ResourceTable entry nor a capability, and the source
+    // remains byte-for-byte live for the subsequent owned transfer.
+    let (
+        borrow_source_caps_before,
+        borrow_source_caps_after,
+        borrow_target_caps_before,
+        borrow_target_caps_after,
+        borrowed_value,
+    ) = unsafe {
+        super::component_instances::registry().with_reserved_space_pair(
+            tokens[route.source_index],
+            tokens[route.target_index],
+            |source_space, target_space| {
+                let source_before = source_space.live_count();
+                let target_before = target_space.live_count();
+                if source_before != 1
+                    || source_space.singleton_live_shape()
+                        != Some((
+                            "c64-supervised-route-probe",
+                            Rights::READ.union(Rights::GRANT),
+                        ))
+                    || target_before != 0
+                    || source_table.len() != 1
+                    || !target_table.is_empty()
+                {
+                    return None;
+                }
+                let value = with_supervised_borrow::<C64RouteProbe, _>(
+                    source_table,
+                    source_token,
+                    C64_SOURCE_RESOURCE_TYPE,
+                    source_space,
+                    target_table,
+                    C64_TARGET_RESOURCE_TYPE,
+                    target_space,
+                    Rights::READ,
+                    |scope| {
+                        let alias = scope.alias();
+                        scope.with_alias(&alias, |resource| resource.0)
+                    },
+                )
+                .ok()?
+                .ok()?;
+                let source_after = source_space.live_count();
+                let target_after = target_space.live_count();
+                if source_after != 1
+                    || source_space.singleton_live_shape()
+                        != Some((
+                            "c64-supervised-route-probe",
+                            Rights::READ.union(Rights::GRANT),
+                        ))
+                    || target_after != 0
+                    || source_table.len() != 1
+                    || !target_table.is_empty()
+                {
+                    return None;
+                }
+                Some((
+                    u64::try_from(source_before).ok()?,
+                    u64::try_from(source_after).ok()?,
+                    u64::try_from(target_before).ok()?,
+                    u64::try_from(target_after).ok()?,
+                    value,
+                ))
+            },
+        )
+    }
+    .map_err(|_| setup_error())?
+    .ok_or_else(setup_error)?;
+    if borrowed_value != C64_ROUTE_PROBE_VALUE {
+        return Err(setup_error());
+    }
+
+    // All ResourceTable fallibility is prepared before the pair transaction.
+    // The fused registry gate performs a read-only host preflight, completes
+    // the exact two-node postflight, commits the strict grant derivation, drops
+    // both CSpace locks, and only then infallibly publishes the table move.
+    let transfer = prepare_owned_supervised(
+        source_table,
+        source_token,
+        C64_SOURCE_RESOURCE_TYPE,
+        target_table,
+        C64_TARGET_RESOURCE_TYPE,
+    )
+    .map_err(|_| setup_error())?;
+    let target_token = unsafe {
+        super::component_instances::registry().transfer_reserved_space_pair(
+            tokens[route.source_index],
+            tokens[route.target_index],
+            |source_space, target_space| {
+                transfer.prepare_in::<C64RouteProbe>(source_space, target_space, Rights::READ)
+            },
+            |prepared, receipt| prepared.commit(receipt),
+        )
+    }
+    .map_err(|_| setup_error())?
+    .map_err(|_| setup_error())?;
+
+    if !source_table.is_empty()
+        || target_table.len() != 1
+        || target_table.contains(target_token, C64_TARGET_RESOURCE_TYPE) != Ok(true)
+    {
+        return Err(setup_error());
+    }
+    let (source_caps_after_transfer, target_caps_after_transfer, target_grant_absent) = unsafe {
+        super::component_instances::registry().with_reserved_space_pair(
+            tokens[route.source_index],
+            tokens[route.target_index],
+            |source_space, target_space| {
+                let source = source_space.live_count();
+                let target = target_space.live_count();
+                let target_shape = target_space.singleton_live_shape();
+                (
+                    u64::try_from(source).ok(),
+                    u64::try_from(target).ok(),
+                    target == 1
+                        && target_shape.is_some_and(|(kind, rights)| {
+                            kind == "c64-supervised-route-probe"
+                                && rights == Rights::READ
+                                && !rights.contains(Rights::GRANT)
+                        }),
+                )
+            },
+        )
+    }
+    .map_err(|_| setup_error())?;
+    let source_caps_after_transfer = source_caps_after_transfer.ok_or_else(setup_error)?;
+    let target_caps_after_transfer = target_caps_after_transfer.ok_or_else(setup_error)?;
+    if source_caps_after_transfer != 0 || target_caps_after_transfer != 1 || !target_grant_absent {
+        return Err(setup_error());
+    }
+
+    plans[route.source_index].expected_revoked_capabilities = 0;
+    plans[route.source_index].drain = None;
+    plans[route.target_index].expected_revoked_capabilities = 1;
+    plans[route.target_index].drain = Some(PrincipalResourceDrain {
+        token: target_token,
+        resource_type: C64_TARGET_RESOURCE_TYPE,
+    });
+
+    Ok(ResourceRouteReceipt {
+        borrow_invocations: 1,
+        owned_transfers: 1,
+        attenuated_grants: 1,
+        source_peak_slots: 1,
+        target_peak_slots: 1,
+        borrow_source_caps_before,
+        borrow_source_caps_after,
+        borrow_target_caps_before,
+        borrow_target_caps_after,
+        source_caps_after_transfer,
+        target_caps_after_transfer,
+        source_live_after_transfer: u64::try_from(source_table.len()).map_err(|_| setup_error())?,
+        target_live_after_transfer: u64::try_from(target_table.len()).map_err(|_| setup_error())?,
+        target_grant_absent,
+    })
 }
 
 fn release_empty_domain(domain: AllocationDomain) -> bool {
@@ -639,7 +1156,7 @@ fn lifecycle_invariant_failed(tokens: &[InstanceToken], message: &'static str) -
 fn install_payloads(
     plans: &[PrincipalPlan],
     tokens: &[InstanceToken],
-    tables: &mut [Option<ResourceTable<()>>],
+    tables: &mut [Option<ResourceTable<ComponentAuthority>>],
 ) -> Result<(), ComponentGraphPrincipalLifecycleError> {
     for ((plan, token), table) in plans.iter().zip(tokens).zip(tables) {
         let Some(resources) = table.take() else {
@@ -681,7 +1198,10 @@ fn finalize_all(
     teardown: &mut Vec<PrincipalTeardownReceipt>,
 ) -> Result<(), ComponentGraphPrincipalLifecycleError> {
     let mut first_error = None;
-    for index in 0..plans.len() {
+    // Reverse graph order gives consumers/children deterministic teardown
+    // before their providers/parents. C6.4 relies on this target-first gate;
+    // resource-free C6.3 graphs retain the same semantic reports.
+    for index in (0..plans.len()).rev() {
         let expected =
             (states[index] == TaskState::Exited).then_some(RUNTIME_UNAVAILABLE_COMPLETION);
         let finalized = unsafe {
@@ -694,7 +1214,8 @@ fn finalize_all(
             )
         };
         let teardown_exact = finalized.as_ref().is_ok_and(|outcome| {
-            outcome.revoked_capabilities == 0 && outcome.detached_completion == expected
+            outcome.revoked_capabilities == plans[index].expected_revoked_capabilities
+                && outcome.detached_completion == expected
         });
         if states[index] != TaskState::Exited || !teardown_exact {
             first_error.get_or_insert(if !teardown_exact {
@@ -707,8 +1228,18 @@ fn finalize_all(
                 }
             });
         } else {
+            let outcome = finalized
+                .as_ref()
+                .expect("validated terminal teardown has an outcome");
+            let revoked_capabilities = outcome.revoked_capabilities;
+            let guest_calls = outcome
+                .detached_completion
+                .and_then(completion_guest_calls)
+                .expect("validated RuntimeUnavailable completion encodes guest calls");
             teardown.push(PrincipalTeardownReceipt {
                 node: plans[index].node,
+                revoked_capabilities,
+                guest_calls,
             });
         }
     }
@@ -725,7 +1256,7 @@ fn semantic_report_matches_plan(
         && report.fuel().consumed() == 0
         && report.resources().declared_types() == plan.resource_types
         && report.resources().slot_limit() == u64::from(plan.resource_slots)
-        && report.resources().peak_slots() == 0
+        && report.resources().peak_slots() == plan.expected_resource_peak
         && report.resources().live_slots() == 0
 }
 
@@ -740,7 +1271,14 @@ fn precompute_semantic_reports(
         return Err(ComponentGraphPrincipalLifecycleError::Allocation);
     }
     for plan in plans {
-        let report = match template.runtime_unavailable_report(plan.node) {
+        let report = match if plan.expected_resource_peak == 0 {
+            template.runtime_unavailable_report(plan.node)
+        } else {
+            template.supervisor_prepared_resource_unavailable_report(
+                plan.node,
+                plan.expected_resource_peak,
+            )
+        } {
             Ok(report) => report,
             Err(_) => {
                 system.restore();
@@ -761,46 +1299,52 @@ fn precompute_semantic_reports(
 
 fn publish_semantic_reports(
     plans: &[PrincipalPlan],
-    teardown: &[PrincipalTeardownReceipt],
+    teardown: Vec<PrincipalTeardownReceipt>,
     reports: Vec<ComponentGraphNodeTerminalReport>,
 ) -> Result<ComponentGraphPrincipalReports, ComponentGraphPrincipalLifecycleError> {
     if teardown.len() != plans.len()
         || reports.len() != plans.len()
-        || teardown
+        || reports
             .iter()
             .zip(plans)
-            .zip(&reports)
-            .any(|((receipt, plan), report)| {
-                receipt.node != plan.node || !semantic_report_matches_plan(report, plan)
-            })
+            .any(|(report, plan)| !semantic_report_matches_plan(report, plan))
+        || plans.iter().any(|plan| {
+            teardown
+                .iter()
+                .filter(|receipt| receipt.node == plan.node)
+                .count()
+                != 1
+        })
     {
         return Err(ComponentGraphPrincipalLifecycleError::SemanticReport {
             node: plans[0].node,
         });
     }
-    Ok(ComponentGraphPrincipalReports { reports })
+    let Some(guest_calls) = teardown.iter().try_fold(0_u64, |total, receipt| {
+        total.checked_add(receipt.guest_calls)
+    }) else {
+        return Err(ComponentGraphPrincipalLifecycleError::SemanticReport {
+            node: plans[0].node,
+        });
+    };
+    Ok(ComponentGraphPrincipalReports {
+        reports,
+        teardown,
+        guest_calls,
+    })
 }
 
-/// Allocate and publish one fresh kernel principal per admitted graph node.
-///
-/// Revalidation and the zero-grant gate run before any owner, arena, registry
-/// slot, task, or CSpace is created. The executor reservation is established
-/// while the registry batch is still pristine and abortable. After the first
-/// tracked future is prepared, every remaining fallible identity operation is
-/// an internal invariant gate and fail-stops rather than pretending the arena
-/// can be rolled back safely.
-pub fn start_component_graph_principals(
+fn start_component_graph_principals_inner(
     template: Arc<ComponentGraphPrincipalTemplate>,
-) -> Result<ComponentGraphPrincipalRun, ComponentGraphPrincipalLifecycleError> {
+    route_request: ResourceRouteRequest,
+) -> Result<
+    (ComponentGraphPrincipalRun, Option<ResourceRouteReceipt>),
+    ComponentGraphPrincipalLifecycleError,
+> {
     revalidate_template(&template)?;
+    let route = select_resource_route(&template, route_request)?;
     let mut plans = checked_plan(&template)?;
-    // Freeze the only terminal values C6.3 can publish while the caller still
-    // owns the template. The report buffer is SYSTEM-owned and every element is
-    // copy-only semantic data. Dropping the caller Arc here ensures no admitted
-    // graph, String, Vec, or other caller-arena allocation can escape into the
-    // independently supervised lifecycle below.
-    let reports = precompute_semantic_reports(&template, &plans)?;
-    drop(template);
+    bind_expected_resource_peaks(&mut plans, route)?;
 
     // The batch remains empty and ordinarily droppable through all
     // registry/scheduler reservation failures below. Its reservation method
@@ -820,6 +1364,26 @@ pub fn start_component_graph_principals(
             });
         }
     };
+    let route_receipt = match prepare_resource_route(route, &mut plans, &tokens, &mut tables) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            abort_pristine_registry_batch(&tokens, &domains)?;
+            return Err(error);
+        }
+    };
+    // Freeze reports only after any explicit supervisor route produced its
+    // measured receipt. The report buffer is SYSTEM-owned and every element is
+    // copy-only semantic data. Dropping the caller Arc here ensures no admitted
+    // graph, String, Vec, or other caller-arena allocation can escape into the
+    // independently supervised tasks below.
+    let reports = match precompute_semantic_reports(&template, &plans) {
+        Ok(reports) => reports,
+        Err(error) => {
+            abort_pristine_registry_batch(&tokens, &domains)?;
+            return Err(error);
+        }
+    };
+    drop(template);
     let (mut supervisor, mut verification_handles, completion) =
         match prepare_supervisor(&plans, &tokens, reports) {
             Ok(supervisor) => supervisor,
@@ -908,10 +1472,33 @@ pub fn start_component_graph_principals(
         .pop()
         .expect("validated graph publication contains its SYSTEM supervisor");
     drop(published);
-    Ok(ComponentGraphPrincipalRun {
-        supervisor,
-        completion: completion_for_run,
-    })
+    Ok((
+        ComponentGraphPrincipalRun {
+            supervisor,
+            completion: completion_for_run,
+        },
+        route_receipt,
+    ))
+}
+
+/// Allocate and publish one fresh kernel principal per admitted graph node.
+///
+/// This public C6.3-compatible path remains resource-free and rejects every
+/// manifest containing a resource edge. Revalidation and the zero-grant gate
+/// run before any owner, arena, registry slot, task, or CSpace is created. The
+/// executor reservation is established while the registry batch is still
+/// pristine and abortable. After the first tracked future is prepared, every
+/// remaining fallible identity operation is an internal invariant gate and
+/// fail-stops rather than pretending the arena can be rolled back safely.
+pub fn start_component_graph_principals(
+    template: Arc<ComponentGraphPrincipalTemplate>,
+) -> Result<ComponentGraphPrincipalRun, ComponentGraphPrincipalLifecycleError> {
+    start_component_graph_principals_inner(template, ResourceRouteRequest::None).map(
+        |(run, receipt)| {
+            debug_assert!(receipt.is_none());
+            run
+        },
+    )
 }
 
 /// Convenience wrapper which observes a graph run to completion. Dropping the
@@ -925,12 +1512,20 @@ pub async fn supervise_component_graph_principals(
 
 /// Allocation-free checks for the feature-gated architecture-neutral model.
 /// The real registry/scheduler path is exercised by
-/// [`run_qemu_acceptance`]; this early sanity helper remains directly callable
+/// the feature-specific QEMU acceptance; this early sanity helper remains directly callable
 /// despite the kernel archive's `test = false` setting.
-#[cfg(feature = "wasm-c63-graph-principal-acceptance")]
+#[cfg(any(
+    feature = "wasm-c63-graph-principal-acceptance",
+    feature = "wasm-c64-resource-route-acceptance"
+))]
 pub(crate) fn run_host_model_selftest() -> bool {
     if checked_owner_quota(1) != Some(1 + COMPONENT_GRAPH_PRINCIPAL_LIFECYCLE_OVERHEAD_BYTES)
         || checked_owner_quota(usize::MAX).is_some()
+        || encode_runtime_unavailable_completion(0) != RUNTIME_UNAVAILABLE_COMPLETION
+        || completion_guest_calls(RUNTIME_UNAVAILABLE_COMPLETION) != Some(0)
+        || completion_guest_calls(encode_runtime_unavailable_completion(1)) != Some(1)
+        || encode_runtime_unavailable_completion(RUNTIME_UNAVAILABLE_GUEST_CALL_MASK + 1)
+            != INVALID_ENVELOPE_COMPLETION
     {
         return false;
     }
@@ -947,6 +1542,9 @@ pub(crate) fn run_host_model_selftest() -> bool {
             resource_types: 0,
             resource_slots: 1,
             resource_generation: 1,
+            expected_resource_peak: 0,
+            expected_revoked_capabilities: 0,
+            drain: None,
         },
         resources,
     );
@@ -1098,4 +1696,215 @@ pub(crate) async fn run_qemu_acceptance() -> bool {
     }
     let after = super::component_instances::registry().occupancy_stats();
     after.occupied == 0 && after.header_mismatches == 0
+}
+
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+fn c64_resource_edge() -> ComponentGraphEdgeSpec {
+    ComponentGraphEdgeSpec::new(
+        ComponentGraphExportEndpoint::new(
+            ComponentGraphNodeId::new(0),
+            ComponentGraphEntityIndex::new(0),
+        ),
+        ComponentGraphImportEndpoint::new(
+            ComponentGraphNodeId::new(1),
+            ComponentGraphEntityIndex::new(0),
+        ),
+    )
+}
+
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+fn c64_qemu_acceptance_template() -> Option<(Arc<ComponentGraphPrincipalTemplate>, AllocationDomain)>
+{
+    let caller_quota = 4usize.checked_mul(1024)?.checked_mul(1024)?;
+    let caller_domains = HEAP.create_fresh_domains_batch(&[caller_quota]).ok()?;
+    let [caller_domain] = caller_domains.as_slice() else {
+        let _ = release_empty_domains(&caller_domains);
+        return None;
+    };
+    let caller_domain = *caller_domain;
+    drop(caller_domains);
+
+    // SAFETY: the acceptance task exclusively owns this unpublished domain.
+    // It synchronously consumes the sole successful template escape through
+    // the C6.4 start gate and proves the arena empty before its first await.
+    let mut caller = unsafe { crate::heap::enter_domain(caller_domain) };
+    let template = (|| {
+        let pin = C64_RESOURCE_ROUTE_QEMU_ACCEPTANCE;
+        if pin.profile() != ProfileIdentity::PROFILE_1_ASYNC
+            || pin.profile().execution_enabled()
+            || pin.interface() != "test:c64-resource/route@1.0.0"
+            || pin.wit_sha256() != C64_RESOURCE_ROUTE_WIT_SHA256
+        {
+            return None;
+        }
+        let provider = ComponentArtifact::copy_from(pin.provider_bytes(), pin.profile()).ok()?;
+        let consumer = ComponentArtifact::copy_from(pin.consumer_bytes(), pin.profile()).ok()?;
+        if provider.identity().as_bytes() != &pin.provider_sha256()
+            || consumer.identity().as_bytes() != &pin.consumer_sha256()
+        {
+            return None;
+        }
+        let provider_world = WorldContract::parse(pin.wit_source(), pin.provider_world()).ok()?;
+        let consumer_world = WorldContract::parse(pin.wit_source(), pin.consumer_world()).ok()?;
+        let limits = pin.limits();
+        let nodes = [
+            ComponentGraphNodeAdmissionPolicy {
+                label: "c64-resource-provider",
+                nesting: ComponentGraphNesting::Root,
+                exact_world: &provider_world,
+                trust: ArtifactTrust::ImagePinned(provider.identity()),
+                limits: InstanceLimits {
+                    memory_bytes: limits.memory_bytes,
+                    total_fuel: limits.total_fuel,
+                    poll_quantum: limits.poll_quantum,
+                    resources: limits.resources,
+                },
+                interfaces: &[],
+            },
+            ComponentGraphNodeAdmissionPolicy {
+                label: "c64-resource-consumer",
+                nesting: ComponentGraphNesting::Root,
+                exact_world: &consumer_world,
+                trust: ArtifactTrust::ImagePinned(consumer.identity()),
+                limits: InstanceLimits {
+                    memory_bytes: limits.memory_bytes,
+                    total_fuel: limits.total_fuel,
+                    poll_quantum: limits.poll_quantum,
+                    resources: limits.resources,
+                },
+                interfaces: &[],
+            },
+        ];
+        let edges = [c64_resource_edge()];
+        let policy = ComponentGraphAdmissionPolicy {
+            name: "c64-qemu-resource-route",
+            profile: pin.profile(),
+            nodes: &nodes,
+            edges: &edges,
+            external_imports: &[],
+            published_exports: &[],
+            cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+        };
+        let resource_policy = [ComponentGraphResourceEdgePolicy {
+            edge: c64_resource_edge(),
+            mode: ComponentGraphResourceMode::OwnAndBorrow,
+        }];
+        let admitted = admit_component_graph_with_resource_policy(
+            Vec::from([provider, consumer]),
+            &policy,
+            &resource_policy,
+            &CallerAuthority { offers: &[] },
+        )
+        .ok()?;
+        let template = ComponentGraphPrincipalTemplate::new(Arc::new(admitted)).ok()?;
+        if template.runtime_ready()
+            || !template.grants().is_empty()
+            || exact_c64_resource_route_plan(&template).is_err()
+        {
+            return None;
+        }
+        Some(Arc::new(template))
+    })();
+    caller.restore();
+    match template {
+        Some(template) => Some((template, caller_domain)),
+        None => {
+            let _ = release_empty_domain(caller_domain);
+            None
+        }
+    }
+}
+
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+fn start_c64_resource_route(
+    template: Arc<ComponentGraphPrincipalTemplate>,
+) -> Result<(ComponentGraphPrincipalRun, ResourceRouteReceipt), ComponentGraphPrincipalLifecycleError>
+{
+    let (run, receipt) =
+        start_component_graph_principals_inner(template, ResourceRouteRequest::C64Exact)?;
+    receipt
+        .map(|receipt| (run, receipt))
+        .ok_or(ComponentGraphPrincipalLifecycleError::ResourceRouteSetup)
+}
+
+/// Exercise exact admission, prepublication borrow/own setup, target-first
+/// teardown, semantic reports, and arena/registry retirement without ever
+/// decoding, instantiating, or calling either pinned guest Component.
+#[cfg(feature = "wasm-c64-resource-route-acceptance")]
+pub(crate) async fn run_c64_qemu_acceptance() -> Option<u64> {
+    let before = super::component_instances::registry().occupancy_stats();
+    if before.occupied != 0 || before.header_mismatches != 0 {
+        return None;
+    }
+    let Some((template, caller_domain)) = c64_qemu_acceptance_template() else {
+        return None;
+    };
+    if !matches!(
+        start_component_graph_principals(template.clone()),
+        Err(ComponentGraphPrincipalLifecycleError::ResourceRouteRequired)
+    ) {
+        drop(template);
+        let _ = release_empty_domain(caller_domain);
+        return None;
+    }
+    let (run, route) = match start_c64_resource_route(template) {
+        Ok(started) => started,
+        Err(_) => {
+            let _ = release_empty_domain(caller_domain);
+            return None;
+        }
+    };
+    if !release_empty_domain(caller_domain) {
+        return None;
+    }
+    if route.borrow_invocations != 1
+        || route.owned_transfers != 1
+        || route.attenuated_grants != 1
+        || route.source_peak_slots != 1
+        || route.target_peak_slots != 1
+        || route.borrow_source_caps_before != 1
+        || route.borrow_source_caps_after != 1
+        || route.borrow_target_caps_before != 0
+        || route.borrow_target_caps_after != 0
+        || route.source_caps_after_transfer != 0
+        || route.target_caps_after_transfer != 1
+        || route.source_live_after_transfer != 0
+        || route.target_live_after_transfer != 1
+        || !route.target_grant_absent
+    {
+        return None;
+    }
+    let Ok(reports) = run.wait().await else {
+        return None;
+    };
+    let guest_calls = reports.guest_calls();
+    if reports.nodes().len() != 2
+        || reports.teardown.len() != 2
+        || reports.teardown[0].node != ComponentGraphNodeId::new(1)
+        || reports.teardown[0].revoked_capabilities != 1
+        || reports.teardown[0].guest_calls != 0
+        || reports.teardown[1].node != ComponentGraphNodeId::new(0)
+        || reports.teardown[1].revoked_capabilities != 0
+        || reports.teardown[1].guest_calls != 0
+        || guest_calls != 0
+    {
+        return None;
+    }
+    for (index, declared_types) in [1, 0].into_iter().enumerate() {
+        let Some(report) = reports.node(ComponentGraphNodeId::new(index as u16)) else {
+            return None;
+        };
+        if report.terminal() != ComponentGraphNodeTerminal::RuntimeUnavailable
+            || report.fuel().limit() != 1_000
+            || report.fuel().consumed() != 0
+            || report.resources().declared_types() != declared_types
+            || report.resources().slot_limit() != 2
+            || report.resources().peak_slots() != 1
+            || report.resources().live_slots() != 0
+        {
+            return None;
+        }
+    }
+    let after = super::component_instances::registry().occupancy_stats();
+    (after.occupied == 0 && after.header_mismatches == 0).then_some(guest_calls)
 }

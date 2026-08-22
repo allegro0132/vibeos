@@ -67,7 +67,11 @@ use vibeos_component_host::{
     HostManifestError, HostResourceKind, VibeHostManifest, VibeHostRequirement,
 };
 use vibeos_component_runtime::{
-    decode::{inspect_component_for_profile, ComponentPlan, ComponentSummary, DecodeError},
+    decode::{
+        inspect_component_for_profile, inspect_component_graph_for_profile, ComponentPlan,
+        ComponentSummary, DecodeError,
+    },
+    graph::ComponentGraphResourceProvenance,
     world::{NamedEntityShape, WorldContract, WorldError},
 };
 use vibeos_core::cap::Rights;
@@ -150,6 +154,31 @@ impl ComponentArtifact {
         }
         let plan = inspect_component_for_profile(&self.bytes, self.profile)
             .map_err(AdmissionError::Decode)?;
+        self.finish_inspection(plan)
+    }
+
+    /// Reuses ordinary admission inspection while retaining the graph-only
+    /// nominal-resource evidence produced by the validator. The sidecar is
+    /// never stored in an admitted value; graph revalidation obtains fresh
+    /// evidence from the immutable artifact bytes.
+    pub(crate) fn inspect_graph(
+        &self,
+    ) -> Result<(InspectedComponent<'_>, ComponentGraphResourceProvenance), AdmissionError> {
+        if self.profile != ProfileIdentity::PROFILE_1
+            && self.profile != ProfileIdentity::PROFILE_1_ASYNC
+        {
+            return Err(AdmissionError::BadProfile);
+        }
+        let graph = inspect_component_graph_for_profile(&self.bytes, self.profile)
+            .map_err(AdmissionError::Decode)?;
+        let (plan, resources) = graph.into_parts();
+        Ok((self.finish_inspection(plan)?, resources))
+    }
+
+    fn finish_inspection<'a>(
+        &'a self,
+        plan: ComponentPlan<'a>,
+    ) -> Result<InspectedComponent<'a>, AdmissionError> {
         let mut modules = Vec::new();
         modules
             .try_reserve_exact(plan.embedded_modules().len())

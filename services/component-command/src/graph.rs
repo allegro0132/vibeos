@@ -11,7 +11,8 @@ use core::fmt;
 
 use vibeos_component_admission::{
     AdmittedComponentGraph, ComponentGraphAdmissionError, ComponentGraphAuthorityGrant,
-    ComponentGraphManifest, ComponentIdentity, InstanceLimits, ProfileIdentity,
+    ComponentGraphManifest, ComponentGraphResourceEdgeManifest, ComponentIdentity, InstanceLimits,
+    ProfileIdentity,
 };
 use vibeos_component_format::{ComponentGraphAccount, ComponentGraphNodeBudget, TrapCode};
 use vibeos_component_runtime::graph::{ComponentGraphNesting, ComponentGraphNodeId};
@@ -211,6 +212,13 @@ impl ComponentGraphPrincipalTemplate {
         self.admitted.grants()
     }
 
+    /// Validator-derived, capability-free resource edges sealed by graph
+    /// admission. Construction and [`Self::revalidate`] prove these values
+    /// again from fresh nominal provenance before exposing them here.
+    pub fn resource_edges(&self) -> &[ComponentGraphResourceEdgeManifest] {
+        self.admitted.manifest().resource_edges()
+    }
+
     pub const fn profile(&self) -> ProfileIdentity {
         self.profile
     }
@@ -263,6 +271,55 @@ impl ComponentGraphPrincipalTemplate {
             0,
             0,
         )
+    }
+
+    /// Build a deterministic RuntimeUnavailable report after a kernel
+    /// supervisor has pre-established an admitted resource route and then
+    /// torn down every live resource slot without starting guest execution.
+    ///
+    /// `peak_resource_slots` must be the supervisor's measured, positive peak;
+    /// declaration counts are not substituted for live-slot observations. The
+    /// node must be an endpoint of a sealed resource edge and the observation
+    /// must fit its exact manifest ceiling. This builder neither proves the
+    /// supervisor operation nor authorizes publication: a kernel adapter must
+    /// retain the matching route and teardown receipts. Fuel and live slots
+    /// remain fixed at zero, and [`Self::runtime_ready`] remains false.
+    ///
+    /// The ordinary [`Self::runtime_unavailable_report`] path remains stricter
+    /// and continues requiring a zero peak.
+    pub fn supervisor_prepared_resource_unavailable_report(
+        &self,
+        node: ComponentGraphNodeId,
+        peak_resource_slots: u64,
+    ) -> Result<ComponentGraphNodeTerminalReport, ComponentGraphNodeReportError> {
+        let principal = self
+            .principal(node)
+            .ok_or(ComponentGraphNodeReportError::UnknownNode { node })?;
+        if !self.resource_edges().iter().any(|route| {
+            route.edge().source().node() == node || route.edge().target().node() == node
+        }) {
+            return Err(ComponentGraphNodeReportError::ResourceEdgeRequired { node });
+        }
+        if peak_resource_slots == 0 {
+            return Err(ComponentGraphNodeReportError::SupervisorPreparedPeakRequired);
+        }
+        if peak_resource_slots > principal.resource_slot_limit() {
+            return Err(ComponentGraphNodeReportError::ResourceLimitExceeded);
+        }
+        Ok(ComponentGraphNodeTerminalReport {
+            node,
+            terminal: ComponentGraphNodeTerminal::RuntimeUnavailable,
+            fuel: ComponentGraphNodeFuelAccount {
+                limit: principal.fuel_limit(),
+                consumed: 0,
+            },
+            resources: ComponentGraphNodeResourceAccount {
+                declared_types: principal.budget.resource_types,
+                slot_limit: principal.resource_slot_limit(),
+                peak_slots: peak_resource_slots,
+                live_slots: 0,
+            },
+        })
     }
 
     fn try_terminal_report(
@@ -327,6 +384,20 @@ impl ComponentGraphPrincipalTemplate {
                         || principal.nesting != node.nesting()
                         || principal.limits != node.limits()
                         || principal.budget != node.budget()
+                })
+            || manifest
+                .resource_edges()
+                .iter()
+                .enumerate()
+                .any(|(index, route)| {
+                    route.resources().is_empty()
+                        || manifest.resource_edges()[..index]
+                            .iter()
+                            .any(|earlier| earlier.edge() == route.edge())
+                        || !manifest.edges().contains(&route.edge())
+                        || self.principal(route.edge().source().node()).is_none()
+                        || self.principal(route.edge().target().node()).is_none()
+                        || route.resources().windows(2).any(|pair| pair[0] >= pair[1])
                 })
         {
             return Err(ComponentGraphPrincipalTemplateError::ProjectionMismatch);
@@ -452,6 +523,8 @@ impl fmt::Debug for ComponentGraphNodeTerminalReport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentGraphNodeReportError {
     UnknownNode { node: ComponentGraphNodeId },
+    ResourceEdgeRequired { node: ComponentGraphNodeId },
+    SupervisorPreparedPeakRequired,
     FuelLimitExceeded,
     ResourceLimitExceeded,
     InvalidResourceAccount,

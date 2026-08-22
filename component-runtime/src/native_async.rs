@@ -36,14 +36,21 @@ use alloc::{string::String, vec::Vec};
 use core::num::NonZeroU64;
 use vibeos_component_format::{ProfileIdentity, TrapCode, PROFILE_1_LIMITS};
 use vibeos_wasm_runtime::{
-    CoreCallSlot, CoreCallSlotState, CoreComponentGroup, CoreHostImport, CoreInstanceExportImport,
-    CoreMemoryAuthority, CoreModuleImport, CoreSlotPollResult, CoreValue, CoreValueType,
-    OwnerAllocationReservation, PollResult, ProfileEngine, ValidatedCore,
+    CoreCallSlot, CoreCallSlotState, CoreComponentGroup, CoreHostCall, CoreHostImport,
+    CoreInstanceExportImport, CoreMemoryAuthority, CoreModuleImport, CoreResults,
+    CoreSlotPollResult, CoreValue, CoreValueType, OwnerAllocationReservation, PollResult,
+    ProfileEngine, ValidatedCore,
 };
 
 /// Versioned Vibe fuel charged for resolving one empty native async result.
 const TASK_RETURN_WORK: u64 = 1;
 const HANDLE_STATE_SCAN_FACTOR: u64 = 8;
+/// Versioned conservative passes used by fail-stop reclamation.
+///
+/// The handle-derived term covers the pair, handle, buffer, transferred-token,
+/// wait, and task walks. Callback slots and Core instances are then charged
+/// separately from the exact instantiated graph shape.
+const FAIL_STOP_CORE_INSTANCE_FACTOR: u64 = 2;
 /// Fixed work for committing one local byte-stream transfer.
 const BUFFER_COPY_BASE_WORK: u64 = 1;
 /// Versioned Vibe fuel charged for decoding and committing one callback code.
@@ -75,6 +82,19 @@ impl NativeAsyncWorkCosts {
             wait_state: handle_state,
         }
     }
+}
+
+fn fail_stop_cleanup_work(
+    work_costs: NativeAsyncWorkCosts,
+    core_instances: usize,
+    callback_slots: usize,
+) -> Option<u64> {
+    let core_instances = u64::try_from(core_instances).ok()?;
+    let callback_slots = u64::try_from(callback_slots).ok()?;
+    work_costs
+        .handle_state
+        .checked_add(callback_slots)?
+        .checked_add(core_instances.checked_mul(FAIL_STOP_CORE_INSTANCE_FACTOR)?)
 }
 
 /// Identity-free current, peak, and configured native async storage counts.
@@ -135,6 +155,12 @@ pub enum NativeAsyncPoll {
         metrics: NativeAsyncMetrics,
     },
     Complete(NativeAsyncMetrics),
+    /// Fail-stop authority is already fenced, but bounded reclamation must run
+    /// after one owner-visible quantum boundary.
+    CleanupPending {
+        trap: TrapCode,
+        metrics: NativeAsyncMetrics,
+    },
     Trapped(TrapCode),
 }
 
@@ -217,7 +243,13 @@ pub enum NativeAsyncFinalizeError {
     AlreadyFinalized,
     WrongContract,
     Poisoned,
-    Invariant,
+    /// Terminal finalization detected an executor invariant after paying its
+    /// own bounded turn. Authority is fenced; one later poll must pay the
+    /// separately reserved cleanup charge and return the matching trap.
+    CleanupPending {
+        trap: TrapCode,
+        metrics: NativeAsyncMetrics,
+    },
 }
 
 pub struct NativeAsyncComponent {
@@ -235,6 +267,7 @@ pub struct NativeAsyncComponent {
     /// Canonical handles belong to the Component instance, not one invocation.
     state: AsyncState,
     work_costs: NativeAsyncWorkCosts,
+    fail_stop_cleanup_work: u64,
     poisoned: bool,
 }
 
@@ -427,10 +460,16 @@ impl NativeAsyncComponent {
         if resource_limit == 0 || resource_limit > PROFILE_1_LIMITS.max_resources {
             return Err(NativeAsyncError::InvalidBudget);
         }
-        let work_costs = NativeAsyncWorkCosts::from_resource_limit(resource_limit);
         let execution = plan
             .native_async_execution_plan()
             .ok_or(NativeAsyncError::InvalidWiring)?;
+        let work_costs = NativeAsyncWorkCosts::from_resource_limit(resource_limit);
+        let fail_stop_cleanup_work = fail_stop_cleanup_work(
+            work_costs,
+            execution.instances().len(),
+            execution.exports().len(),
+        )
+        .ok_or(NativeAsyncError::InvalidBudget)?;
         // Classify every canonical bridge and reject unsupported exported
         // lifts before a Core module is instantiated. Core start functions
         // are guest execution; linked-but-disabled builtins remain fail-closed.
@@ -513,6 +552,7 @@ impl NativeAsyncComponent {
             buffers,
             state,
             work_costs,
+            fail_stop_cleanup_work,
             poisoned: false,
         })
     }
@@ -530,15 +570,56 @@ impl NativeAsyncComponent {
         }
     }
 
+    /// Minimum public quantum which can make progress through every admitted
+    /// native bridge in this Component, including bridges reached through a
+    /// transitive Core-instance export. Core execution itself may consume the
+    /// complete configured quantum because its outcome is deferred to the next
+    /// public turn.
+    fn minimum_poll_quantum(&self, _binding: &RuntimeExport) -> Option<u64> {
+        let mut required = CALLBACK_RESULT_WORK.max(self.fail_stop_cleanup_work);
+        let mut has_waitable_bridge = false;
+        for bridge in &self.bridges {
+            let work = match bridge.action {
+                BridgeAction::TaskReturn(RuntimeExportContract::Unit) => TASK_RETURN_WORK,
+                BridgeAction::TaskReturn(RuntimeExportContract::ByteStream(_))
+                | BridgeAction::StreamNew(_)
+                | BridgeAction::FutureNew(_)
+                | BridgeAction::DropEndpoint { .. }
+                | BridgeAction::WaitableSetNew
+                | BridgeAction::WaitableSetDrop
+                | BridgeAction::WaitableJoin => self.work_costs.handle_state,
+                BridgeAction::StreamCopy { .. } | BridgeAction::FutureCopy { .. } => self
+                    .work_costs
+                    .buffer_bridge
+                    .checked_add(buffer_copy_work(1, self.buffers.scratch_bytes())?)?,
+                BridgeAction::StreamCancel { .. } | BridgeAction::FutureCancel { .. } => {
+                    self.work_costs.buffer_bridge
+                }
+                BridgeAction::Unsupported => 0,
+            };
+            has_waitable_bridge |= matches!(
+                bridge.action,
+                BridgeAction::WaitableSetNew
+                    | BridgeAction::WaitableSetDrop
+                    | BridgeAction::WaitableJoin
+            );
+            required = required.max(work);
+        }
+        if has_waitable_bridge {
+            required = required.max(CALLBACK_RESULT_WORK.checked_add(self.work_costs.wait_state)?);
+        }
+        Some(required)
+    }
+
     fn start<'a>(
         &'a mut self,
         export: &str,
         total_work: u64,
         poll_quantum: u64,
     ) -> Result<NativeAsyncInvocation<'a>, NativeAsyncError> {
-        // `poll_quantum` is the maximum Core-engine grant per public poll.
-        // A surfaced canonical transition can additionally spend its small,
-        // versioned work constant from the same total invocation ledger.
+        // `poll_quantum` bounds both kinds of owner-visible turn. Core gets at
+        // most one complete grant, then its outcome is retained; the following
+        // poll spends only the corresponding versioned canonical work.
         if self.poisoned {
             return Err(NativeAsyncError::Poisoned);
         }
@@ -562,6 +643,12 @@ impl NativeAsyncComponent {
             .exports
             .get(export_index)
             .ok_or(NativeAsyncError::InvalidWiring)?;
+        if self
+            .minimum_poll_quantum(binding)
+            .is_none_or(|minimum| poll_quantum < minimum)
+        {
+            return Err(NativeAsyncError::InvalidBudget);
+        }
         if binding.contract != RuntimeExportContract::Unit {
             return Err(NativeAsyncError::UnsupportedFeature);
         }
@@ -573,13 +660,20 @@ impl NativeAsyncComponent {
             self.poisoned = true;
             return Err(NativeAsyncError::Poisoned);
         }
+        let cleanup_reserve = self.fail_stop_cleanup_work;
+        let finalize_reserve = 0;
+        let execution_work = total_work
+            .checked_sub(cleanup_reserve)
+            .and_then(|work| work.checked_sub(finalize_reserve))
+            .filter(|work| *work != 0)
+            .ok_or(NativeAsyncError::InvalidBudget)?;
         self.modules
             .start_call(
                 binding.core_instance,
                 &binding.core_function,
                 &[],
-                total_work,
-                poll_quantum,
+                execution_work,
+                poll_quantum.min(execution_work),
             )
             .map_err(|_| NativeAsyncError::InvalidWiring)?;
         let task = match self.state.create_task() {
@@ -597,8 +691,12 @@ impl NativeAsyncComponent {
             stage: InvocationStage::Run,
             total_work,
             remaining_work: total_work,
-            active_call_budget: total_work,
+            active_call_budget: execution_work,
             poll_quantum,
+            cleanup_reserve,
+            finalize_reserve,
+            pending_trap: None,
+            deferred_core: None,
             callback_pending: false,
             wait_ticket: None,
             wait_token: None,
@@ -652,6 +750,12 @@ impl NativeAsyncComponent {
             .exports
             .get(export_index)
             .ok_or(NativeAsyncError::InvalidWiring)?;
+        if self
+            .minimum_poll_quantum(binding)
+            .is_none_or(|minimum| poll_quantum < minimum)
+        {
+            return Err(NativeAsyncError::InvalidBudget);
+        }
         let RuntimeExportContract::ByteStream(contract) = binding.contract else {
             return Err(NativeAsyncError::UnsupportedFeature);
         };
@@ -663,6 +767,17 @@ impl NativeAsyncComponent {
             self.poisoned = true;
             return Err(NativeAsyncError::Poisoned);
         }
+        let cleanup_reserve = self.fail_stop_cleanup_work;
+        // A successful filter has one final owner-visible transport commit;
+        // an invariant in that commit then needs a distinct later fail-stop
+        // cleanup turn. Keep both worst-case charges out of Core/canonical
+        // fuel so neither turn can consume the other's authority.
+        let finalize_reserve = self.fail_stop_cleanup_work;
+        let execution_work = total_work
+            .checked_sub(cleanup_reserve)
+            .and_then(|work| work.checked_sub(finalize_reserve))
+            .filter(|work| *work != 0)
+            .ok_or(NativeAsyncError::InvalidBudget)?;
 
         // A filter start is transactional across the task arena, both input
         // endpoint pairs, and Core continuation state. Expected bounded-state
@@ -703,8 +818,8 @@ impl NativeAsyncComponent {
                 binding.core_instance,
                 &binding.core_function,
                 &inputs,
-                total_work,
-                poll_quantum,
+                execution_work,
+                poll_quantum.min(execution_work),
             )
             .is_err()
         {
@@ -724,8 +839,12 @@ impl NativeAsyncComponent {
             stage: InvocationStage::Run,
             total_work,
             remaining_work: total_work,
-            active_call_budget: total_work,
+            active_call_budget: execution_work,
             poll_quantum,
+            cleanup_reserve,
+            finalize_reserve,
+            pending_trap: None,
+            deferred_core: None,
             callback_pending: false,
             wait_ticket: None,
             wait_token: None,
@@ -1223,6 +1342,29 @@ fn buffer_copy_work(progress: u32, scratch_bytes: usize) -> Option<u64> {
         .checked_add(chunks)
 }
 
+/// Selects the largest non-empty stream prefix whose complete local bridge
+/// work fits in `available_work`. The schedule is monotonic in `progress`, so
+/// this search is bounded by the width of `u32`, not by guest input size.
+fn maximum_local_copy_progress(
+    limit: u32,
+    scratch_bytes: usize,
+    available_work: u64,
+) -> Option<u32> {
+    if limit == 0 || buffer_copy_work(1, scratch_bytes)? > available_work {
+        return None;
+    }
+    let mut low = 1_u32;
+    let mut high = limit;
+    while low < high {
+        let midpoint = low + (high - low) / 2 + 1;
+        match buffer_copy_work(midpoint, scratch_bytes) {
+            Some(work) if work <= available_work => low = midpoint,
+            _ => high = midpoint - 1,
+        }
+    }
+    Some(low)
+}
+
 /// Host transport freezes one guest buffer and moves each selected byte once.
 /// The Canonical ABI bridge transition was already charged separately.
 const fn host_copy_work(progress: u32) -> Option<u64> {
@@ -1392,6 +1534,7 @@ enum InvocationStage {
     Callback,
     WaitBlocked,
     HostBlocked,
+    Cleanup,
     Terminal,
 }
 
@@ -1399,6 +1542,22 @@ enum InvocationStage {
 enum CallAuthority {
     Run(usize),
     Callback,
+}
+
+/// One Core outcome retained across the mandatory Core/native turn boundary.
+///
+/// Core may consume the entire public poll quantum before producing any of
+/// these outcomes. Keeping exactly one bounded result here ensures that host
+/// bridge work, callback decoding, and fail-stop cleanup begin only on the
+/// next owner-visible poll.
+enum DeferredCoreTurn {
+    Host {
+        authority: CallAuthority,
+        call: CoreHostCall,
+    },
+    RunReady(Vec<CoreValue>),
+    CallbackReady(CoreResults),
+    Trapped(TrapCode),
 }
 
 const fn call_stage(authority: CallAuthority) -> InvocationStage {
@@ -1461,6 +1620,10 @@ pub struct NativeAsyncInvocation<'a> {
     remaining_work: u64,
     active_call_budget: u64,
     poll_quantum: u64,
+    cleanup_reserve: u64,
+    finalize_reserve: u64,
+    pending_trap: Option<TrapCode>,
+    deferred_core: Option<DeferredCoreTurn>,
     callback_pending: bool,
     wait_ticket: Option<WaitTicket>,
     wait_token: Option<NativeAsyncWaitToken>,
@@ -1486,6 +1649,9 @@ impl NativeAsyncInvocation<'_> {
         if self.terminal {
             return NativeAsyncPoll::Trapped(TrapCode::Cancelled);
         }
+        if let Some(deferred) = self.deferred_core.take() {
+            return self.finish_deferred_core_turn(deferred);
+        }
         match self.stage {
             InvocationStage::Run => {
                 let active = self.binding().core_instance;
@@ -1495,6 +1661,7 @@ impl NativeAsyncInvocation<'_> {
             InvocationStage::Callback => self.poll_callback(),
             InvocationStage::WaitBlocked => self.poll_wait_blocked(),
             InvocationStage::HostBlocked => self.poll_host_blocked(),
+            InvocationStage::Cleanup => self.finish_fail_stop_cleanup(),
             InvocationStage::Terminal => NativeAsyncPoll::Trapped(TrapCode::Cancelled),
         }
     }
@@ -1504,6 +1671,18 @@ impl NativeAsyncInvocation<'_> {
             consumed_work: self.total_work - self.remaining_work,
             remaining_work: self.remaining_work,
         }
+    }
+
+    fn reserved_work(&self) -> Option<u64> {
+        self.cleanup_reserve.checked_add(self.finalize_reserve)
+    }
+
+    fn spendable_work(&self) -> Option<u64> {
+        self.remaining_work.checked_sub(self.reserved_work()?)
+    }
+
+    fn spendable_work_with_continuation_reserve(&self) -> Option<u64> {
+        self.spendable_work()?.checked_sub(1)
     }
 
     /// Requests owner-side task cancellation without cancelling or otherwise
@@ -1751,7 +1930,9 @@ impl NativeAsyncInvocation<'_> {
         token: NativeAsyncHostToken,
     ) -> Result<NativeAsyncPoll, NativeAsyncHostError> {
         self.validate_any_host_driver(token)?;
-        self.host_token = None;
+        if let Err(trap) = self.begin_host_control() {
+            return Ok(self.finish_trap(trap));
+        }
         let cancelled = {
             let host = self.host_current.as_mut().unwrap();
             self.component.state.cancel_host_copy(&mut host.ticket)
@@ -1774,7 +1955,9 @@ impl NativeAsyncInvocation<'_> {
             return Err(NativeAsyncHostError::WrongRequest);
         }
         let request = self.host_current.as_ref().unwrap().request;
-        self.host_token = None;
+        if let Err(trap) = self.begin_host_control() {
+            return Ok(self.finish_trap(trap));
+        }
         let dropped = {
             let host = self.host_current.as_mut().unwrap();
             self.component
@@ -1827,6 +2010,13 @@ impl NativeAsyncInvocation<'_> {
         if !self.terminal || self.stage != InvocationStage::Terminal {
             return Err(NativeAsyncFinalizeError::NotReady);
         }
+        // Finalization is a real owner-visible state transition, not part of
+        // the `Complete` turn which made it eligible. Pay its exact reserved
+        // worst-case charge before the first graph or arena scan. The cleanup
+        // reserve remains intact in case any sealed invariant rejects below.
+        if !self.charge_finalize_work() {
+            return Err(self.poison_finalize_invariant());
+        }
         if self.component.modules.any_active_call()
             || self
                 .component
@@ -1836,23 +2026,21 @@ impl NativeAsyncInvocation<'_> {
             || self.callback_pending
             || self.wait_ticket.is_some()
             || self.wait_token.is_some()
+            || self.deferred_core.is_some()
             || self.host_current.is_some()
             || self.host_next.is_some()
             || self.host_token.is_some()
         {
-            self.poison_finalize_invariant();
-            return Err(NativeAsyncFinalizeError::Invariant);
+            return Err(self.poison_finalize_invariant());
         }
         if !matches!(
             self.component.state.task_info(self.task),
             Err(AsyncStateError::StaleHandle)
         ) {
-            self.poison_finalize_invariant();
-            return Err(NativeAsyncFinalizeError::Invariant);
+            return Err(self.poison_finalize_invariant());
         }
         if self.component.buffers.live() != 0 {
-            self.poison_finalize_invariant();
-            return Err(NativeAsyncFinalizeError::Invariant);
+            return Err(self.poison_finalize_invariant());
         }
 
         let finalized = match (
@@ -1870,8 +2058,7 @@ impl NativeAsyncInvocation<'_> {
                     || output_stream.value_type() != contract.stream
                     || output_closed.value_type() != contract.closed
                 {
-                    self.poison_finalize_invariant();
-                    return Err(NativeAsyncFinalizeError::Invariant);
+                    return Err(self.poison_finalize_invariant());
                 }
                 self.component.state.finalize_native_filter_transport(
                     input,
@@ -1883,8 +2070,7 @@ impl NativeAsyncInvocation<'_> {
                 )
             }
             _ => {
-                self.poison_finalize_invariant();
-                return Err(NativeAsyncFinalizeError::Invariant);
+                return Err(self.poison_finalize_invariant());
             }
         };
         match finalized {
@@ -1894,20 +2080,39 @@ impl NativeAsyncInvocation<'_> {
                 self.output_closed = None;
                 self.terminal_drops = NativeFilterTerminalDropLedger::default();
                 self.transport_finalized = true;
+                // No fail-stop work remains after the atomic terminal commit.
+                // Its reserve was never consumed, so make it ordinary unused
+                // invocation fuel without moving the public metrics ledger.
+                self.cleanup_reserve = 0;
                 Ok(())
             }
-            Err(NativeFilterFinalizeError::Invariant(_)) => {
-                self.poison_finalize_invariant();
-                Err(NativeAsyncFinalizeError::Invariant)
-            }
+            Err(NativeFilterFinalizeError::Invariant(_)) => Err(self.poison_finalize_invariant()),
         }
     }
 
-    fn poison_finalize_invariant(&mut self) {
-        self.host_token = None;
-        self.stage = InvocationStage::Terminal;
-        self.terminal = true;
-        self.poison_and_discard();
+    fn charge_finalize_work(&mut self) -> bool {
+        let exact = self.component.fail_stop_cleanup_work;
+        let Some(required_reserve) = exact.checked_add(self.cleanup_reserve) else {
+            return false;
+        };
+        if self.finalize_reserve != exact
+            || self.cleanup_reserve != exact
+            || self.remaining_work < required_reserve
+        {
+            return false;
+        }
+        self.remaining_work -= exact;
+        self.finalize_reserve = 0;
+        true
+    }
+
+    fn poison_finalize_invariant(&mut self) -> NativeAsyncFinalizeError {
+        match self.finish_trap(TrapCode::Validation) {
+            NativeAsyncPoll::CleanupPending { trap, metrics } => {
+                NativeAsyncFinalizeError::CleanupPending { trap, metrics }
+            }
+            _ => unreachable!("finish_trap always enters or retains cleanup"),
+        }
     }
 
     /// Uses one exact owner token to perform one real blocked-wait scan.
@@ -2159,6 +2364,21 @@ impl NativeAsyncInvocation<'_> {
         self.mark_host_prepared(progress, value, token)
     }
 
+    /// Revokes the current driver generation and charges an offered copy's
+    /// state-only terminal transition. A prepared copy already prepaid its
+    /// fixed transition unit together with the selected byte prefix.
+    fn begin_host_control(&mut self) -> Result<(), TrapCode> {
+        let host = self.host_current.as_ref().ok_or(TrapCode::Validation)?;
+        let authority = host.authority;
+        let charged = host.charged;
+        self.host_token = None;
+        if charged {
+            Ok(())
+        } else {
+            self.debit_active_work_with_reserve(authority, BUFFER_COPY_BASE_WORK)
+        }
+    }
+
     fn charge_host_prepare(&mut self, progress: u32) -> Result<NativeAsyncHostToken, TrapCode> {
         let host = self.host_current.as_ref().ok_or(TrapCode::Validation)?;
         if host.phase != HostCopyPhase::Offered
@@ -2241,9 +2461,11 @@ impl NativeAsyncInvocation<'_> {
         }
         match result {
             PollResult::Pending { .. } => NativeAsyncPoll::Pending(self.metrics()),
-            PollResult::HostCall(call) => self.handle_host_call(authority, call),
-            PollResult::Ready(values) => self.handle_callback_result(values.as_slice()),
-            PollResult::Trapped(trap) => self.finish_trap(trap),
+            PollResult::HostCall(call) => {
+                self.defer_core_turn(DeferredCoreTurn::Host { authority, call })
+            }
+            PollResult::Ready(values) => self.defer_core_turn(DeferredCoreTurn::RunReady(values)),
+            PollResult::Trapped(trap) => self.defer_core_turn(DeferredCoreTurn::Trapped(trap)),
         }
     }
 
@@ -2257,11 +2479,47 @@ impl NativeAsyncInvocation<'_> {
         }
         match result {
             CoreSlotPollResult::Pending { .. } => NativeAsyncPoll::Pending(self.metrics()),
-            CoreSlotPollResult::HostCall(call) => {
-                self.handle_host_call(CallAuthority::Callback, call)
+            CoreSlotPollResult::HostCall(call) => self.defer_core_turn(DeferredCoreTurn::Host {
+                authority: CallAuthority::Callback,
+                call,
+            }),
+            CoreSlotPollResult::Ready(values) => {
+                self.defer_core_turn(DeferredCoreTurn::CallbackReady(values))
             }
-            CoreSlotPollResult::Ready(values) => self.handle_callback_result(values.as_slice()),
-            CoreSlotPollResult::Trapped(trap) => self.finish_trap(trap),
+            CoreSlotPollResult::Trapped(trap) => {
+                self.defer_core_turn(DeferredCoreTurn::Trapped(trap))
+            }
+        }
+    }
+
+    fn defer_core_turn(&mut self, deferred: DeferredCoreTurn) -> NativeAsyncPoll {
+        if self.deferred_core.replace(deferred).is_some() {
+            return self.finish_trap(TrapCode::Validation);
+        }
+        NativeAsyncPoll::Pending(self.metrics())
+    }
+
+    fn finish_deferred_core_turn(&mut self, deferred: DeferredCoreTurn) -> NativeAsyncPoll {
+        match deferred {
+            DeferredCoreTurn::Host { authority, call } => {
+                if self.stage != call_stage(authority) {
+                    return self.finish_trap(TrapCode::Validation);
+                }
+                self.handle_host_call(authority, call)
+            }
+            DeferredCoreTurn::RunReady(values) => {
+                if self.stage != InvocationStage::Run {
+                    return self.finish_trap(TrapCode::Validation);
+                }
+                self.handle_callback_result(values.as_slice())
+            }
+            DeferredCoreTurn::CallbackReady(values) => {
+                if self.stage != InvocationStage::Callback {
+                    return self.finish_trap(TrapCode::Validation);
+                }
+                self.handle_callback_result(values.as_slice())
+            }
+            DeferredCoreTurn::Trapped(trap) => self.finish_trap(trap),
         }
     }
 
@@ -2278,11 +2536,17 @@ impl NativeAsyncInvocation<'_> {
         let Some(metrics) = metrics else {
             return false;
         };
-        metrics.remaining_fuel <= self.remaining_work
+        metrics.remaining_fuel <= self.spendable_work().unwrap_or(0)
             && metrics.remaining_fuel.checked_add(metrics.consumed_fuel)
                 == Some(self.active_call_budget)
             && {
-                self.remaining_work = metrics.remaining_fuel;
+                let Some(remaining_work) = self
+                    .reserved_work()
+                    .and_then(|reserve| metrics.remaining_fuel.checked_add(reserve))
+                else {
+                    return false;
+                };
+                self.remaining_work = remaining_work;
                 true
             }
     }
@@ -2365,7 +2629,8 @@ impl NativeAsyncInvocation<'_> {
                 }) {
                     return self.finish_trap(TrapCode::CanonicalAbi);
                 }
-                if let Err(trap) = self.debit_active_work(authority, TASK_RETURN_WORK) {
+                let work = self.component.work_costs.handle_state;
+                if let Err(trap) = self.debit_active_work(authority, work) {
                     return self.finish_trap(trap);
                 }
                 let detached = self.component.state.detach_readables_pair_with_pending(
@@ -2436,8 +2701,8 @@ impl NativeAsyncInvocation<'_> {
                 } else {
                     self.host_current = closed_host;
                 }
-                if self.initialize_output_host_copies().is_err() {
-                    return self.finish_trap(TrapCode::Validation);
+                if let Err(trap) = self.initialize_output_host_copies() {
+                    return self.finish_trap(trap);
                 }
                 if let Err(error) = self.component.state.resolve_task_result(self.task) {
                     return self.finish_trap(map_sealed_state_error(error));
@@ -2745,9 +3010,28 @@ impl NativeAsyncInvocation<'_> {
             }
             CopyBegin::Ready(event) => event,
             CopyBegin::Local(mut ticket) => {
-                let progress = match self.component.state.local_copy_progress(&ticket) {
-                    Ok(progress) => progress,
+                let limit = match self.component.state.local_copy_progress(&ticket) {
+                    Ok(limit) => limit,
                     Err(_) => return self.finish_trap(TrapCode::Validation),
+                };
+                let turn_available = match self
+                    .poll_quantum
+                    .checked_sub(self.component.work_costs.buffer_bridge)
+                {
+                    Some(available) => available,
+                    None => return self.finish_trap(TrapCode::LimitExceeded),
+                };
+                let Some(fuel_available) = self.spendable_work_with_continuation_reserve() else {
+                    return self.finish_trap(TrapCode::FuelExhausted);
+                };
+                let available = turn_available.min(fuel_available);
+                let progress = match maximum_local_copy_progress(
+                    limit,
+                    self.component.buffers.scratch_bytes(),
+                    available,
+                ) {
+                    Some(progress) => progress,
+                    None => return self.finish_trap(TrapCode::FuelExhausted),
                 };
                 let Some(work) = buffer_copy_work(progress, self.component.buffers.scratch_bytes())
                 else {
@@ -2837,6 +3121,7 @@ impl NativeAsyncInvocation<'_> {
                 .state
                 .host_copy_progress_limit(&ticket)
                 .map_err(|_| TrapCode::Validation)?;
+            let limit = self.host_progress_limit(kind, limit)?;
             let request = match kind {
                 EndpointKind::Stream => NativeAsyncHostRequest::OutputStream { maximum: limit },
                 EndpointKind::Future if limit == 1 => {
@@ -2893,6 +3178,7 @@ impl NativeAsyncInvocation<'_> {
             .state
             .host_copy_progress_limit(&ticket)
             .map_err(|_| TrapCode::Validation)?;
+        let limit = self.host_progress_limit(kind, limit)?;
         let request = match kind {
             EndpointKind::Stream => NativeAsyncHostRequest::InputStream { maximum: limit },
             EndpointKind::Future if limit == 1 => NativeAsyncHostRequest::InputClosed,
@@ -2925,6 +3211,9 @@ impl NativeAsyncInvocation<'_> {
         if self.host_current.is_none() || self.host_token.is_some() {
             return self.finish_trap(TrapCode::Validation);
         }
+        if let Err(trap) = self.refresh_current_host_copy_limit() {
+            return self.finish_trap(trap);
+        }
         let token = match self.mint_host_token() {
             Ok(token) => token,
             Err(trap) => return self.finish_trap(trap),
@@ -2941,25 +3230,104 @@ impl NativeAsyncInvocation<'_> {
         }
     }
 
-    fn initialize_output_host_copies(&mut self) -> Result<(), ()> {
+    fn initialize_output_host_copies(&mut self) -> Result<(), TrapCode> {
+        let host_progress_limit = self.host_progress_budget()?;
         for host in [&mut self.host_current, &mut self.host_next]
             .into_iter()
             .flatten()
         {
-            let limit = self
+            let exact = self
                 .component
                 .state
                 .host_copy_progress_limit(&host.ticket)
-                .map_err(|_| ())?;
+                .map_err(|_| TrapCode::Validation)?;
+            let limit = exact.min(host_progress_limit);
+            if limit == 0 && host.kind == EndpointKind::Stream {
+                if exact != 0 {
+                    return Err(TrapCode::FuelExhausted);
+                }
+            } else if limit == 0 {
+                return Err(TrapCode::FuelExhausted);
+            }
+            if host.kind == EndpointKind::Future && limit != 1 {
+                return Err(TrapCode::FuelExhausted);
+            }
             host.limit = limit;
             host.request = match host.kind {
                 EndpointKind::Stream => NativeAsyncHostRequest::OutputStream { maximum: limit },
                 EndpointKind::Future if limit == 1 => {
                     NativeAsyncHostRequest::OutputClosed { value: None }
                 }
-                EndpointKind::Future => return Err(()),
+                EndpointKind::Future => return Err(TrapCode::Validation),
             };
         }
+        Ok(())
+    }
+
+    fn host_progress_budget(&self) -> Result<u32, TrapCode> {
+        let turn = self
+            .poll_quantum
+            .checked_sub(BUFFER_COPY_BASE_WORK)
+            .ok_or(TrapCode::LimitExceeded)?;
+        let fuel = self
+            .spendable_work_with_continuation_reserve()
+            .and_then(|work| work.checked_sub(BUFFER_COPY_BASE_WORK))
+            .ok_or(TrapCode::FuelExhausted)?;
+        Ok(u32::try_from(turn.min(fuel)).unwrap_or(u32::MAX))
+    }
+
+    fn host_progress_limit(&self, kind: EndpointKind, exact: u32) -> Result<u32, TrapCode> {
+        let budget = self.host_progress_budget()?;
+        if exact == 0 && kind == EndpointKind::Stream {
+            return Ok(0);
+        }
+        let limit = exact.min(budget);
+        if limit == 0 {
+            return Err(TrapCode::FuelExhausted);
+        }
+        if kind == EndpointKind::Future && limit != 1 {
+            return Err(TrapCode::FuelExhausted);
+        }
+        Ok(limit)
+    }
+
+    fn refresh_current_host_copy_limit(&mut self) -> Result<(), TrapCode> {
+        let host = self.host_current.as_ref().ok_or(TrapCode::Validation)?;
+        if host.phase != HostCopyPhase::Offered || host.charged || host.progress != 0 {
+            return Err(TrapCode::Validation);
+        }
+        let exact = self
+            .component
+            .state
+            .host_copy_progress_limit(&host.ticket)
+            .map_err(|_| TrapCode::Validation)?;
+        let kind = host.kind;
+        let limit = self.host_progress_limit(kind, exact)?;
+        let host = self.host_current.as_mut().ok_or(TrapCode::Validation)?;
+        host.limit = limit;
+        host.request = match kind {
+            EndpointKind::Stream => match host.request {
+                NativeAsyncHostRequest::InputStream { .. } => {
+                    NativeAsyncHostRequest::InputStream { maximum: limit }
+                }
+                NativeAsyncHostRequest::OutputStream { .. } => {
+                    NativeAsyncHostRequest::OutputStream { maximum: limit }
+                }
+                NativeAsyncHostRequest::InputClosed
+                | NativeAsyncHostRequest::OutputClosed { .. } => return Err(TrapCode::Validation),
+            },
+            EndpointKind::Future => match host.request {
+                NativeAsyncHostRequest::InputClosed => NativeAsyncHostRequest::InputClosed,
+                NativeAsyncHostRequest::OutputClosed { value: None } => {
+                    NativeAsyncHostRequest::OutputClosed { value: None }
+                }
+                NativeAsyncHostRequest::InputStream { .. }
+                | NativeAsyncHostRequest::OutputStream { .. }
+                | NativeAsyncHostRequest::OutputClosed { value: Some(_) } => {
+                    return Err(TrapCode::Validation)
+                }
+            },
+        };
         Ok(())
     }
 
@@ -3054,7 +3422,10 @@ impl NativeAsyncInvocation<'_> {
         authority: CallAuthority,
         amount: u64,
     ) -> Result<(), TrapCode> {
-        if self.remaining_work <= amount {
+        if self
+            .spendable_work()
+            .is_none_or(|spendable| spendable <= amount)
+        {
             return Err(TrapCode::FuelExhausted);
         }
         self.debit_active_work(authority, amount)
@@ -3234,7 +3605,7 @@ impl NativeAsyncInvocation<'_> {
     }
 
     fn start_callback(&mut self) -> NativeAsyncPoll {
-        if self.remaining_work == 0 {
+        if self.spendable_work() == Some(0) {
             return self.finish_trap(TrapCode::FuelExhausted);
         }
         if !self.callback_pending {
@@ -3255,10 +3626,13 @@ impl NativeAsyncInvocation<'_> {
     }
 
     fn start_callback_event(&mut self, event: Event) -> NativeAsyncPoll {
-        if self.remaining_work == 0
+        let Some(spendable_work) = self.spendable_work() else {
+            return self.finish_trap(TrapCode::Validation);
+        };
+        if spendable_work == 0
             || self.component.callback_slots[self.export].state() != CoreCallSlotState::Idle
         {
-            return self.finish_trap(if self.remaining_work == 0 {
+            return self.finish_trap(if spendable_work == 0 {
                 TrapCode::FuelExhausted
             } else {
                 TrapCode::Validation
@@ -3269,7 +3643,7 @@ impl NativeAsyncInvocation<'_> {
             CoreValue::I32(event.p1 as i32),
             CoreValue::I32(event.p2 as i32),
         ];
-        let quantum = self.poll_quantum.min(self.remaining_work);
+        let quantum = self.poll_quantum.min(spendable_work);
         let (modules, exports, callback_slots) = (
             &mut self.component.modules,
             &self.component.exports,
@@ -3283,7 +3657,7 @@ impl NativeAsyncInvocation<'_> {
                 binding.callback_instance,
                 &binding.callback,
                 &inputs,
-                self.remaining_work,
+                spendable_work,
                 quantum,
             )
             .is_err()
@@ -3291,13 +3665,22 @@ impl NativeAsyncInvocation<'_> {
             return self.finish_trap(TrapCode::Validation);
         }
         self.callback_pending = false;
-        self.active_call_budget = self.remaining_work;
+        self.active_call_budget = spendable_work;
         self.stage = InvocationStage::Callback;
         NativeAsyncPoll::Pending(self.metrics())
     }
 
     fn charge_inactive_work(&mut self, amount: u64) -> bool {
-        let Some(remaining) = self.remaining_work.checked_sub(amount) else {
+        let Some(spendable) = self.spendable_work() else {
+            return false;
+        };
+        let Some(spendable) = spendable.checked_sub(amount) else {
+            return false;
+        };
+        let Some(remaining) = self
+            .reserved_work()
+            .and_then(|reserve| spendable.checked_add(reserve))
+        else {
             return false;
         };
         self.remaining_work = remaining;
@@ -3305,26 +3688,64 @@ impl NativeAsyncInvocation<'_> {
     }
 
     fn charge_wait_state_work(&mut self) -> bool {
+        let Some(spendable) = self.spendable_work() else {
+            return false;
+        };
+        let Some(spendable) = spendable.checked_sub(self.component.work_costs.wait_state) else {
+            return false;
+        };
+        if spendable == 0 {
+            return false;
+        }
         let Some(remaining) = self
-            .remaining_work
-            .checked_sub(self.component.work_costs.wait_state)
+            .reserved_work()
+            .and_then(|reserve| spendable.checked_add(reserve))
         else {
             return false;
         };
-        if remaining == 0 {
-            return false;
-        }
         self.remaining_work = remaining;
         true
     }
 
     fn finish_trap(&mut self, trap: TrapCode) -> NativeAsyncPoll {
-        // Revoke owner-visible host authority before any fail-stop cleanup.
+        if self.stage == InvocationStage::Cleanup {
+            let trap = self.pending_trap.unwrap_or(trap);
+            return NativeAsyncPoll::CleanupPending {
+                trap,
+                metrics: self.metrics(),
+            };
+        }
+        // Latch fail-stop and revoke every owner-visible continuation before
+        // yielding. The exact bounded reclamation charge is reserved from the
+        // invocation ledger and paid only by the following public poll.
+        self.component.poisoned = true;
         self.host_token = None;
+        self.wait_token = None;
+        self.deferred_core = None;
+        self.pending_trap = Some(trap);
+        self.stage = InvocationStage::Cleanup;
+        self.terminal = false;
+        NativeAsyncPoll::CleanupPending {
+            trap,
+            metrics: self.metrics(),
+        }
+    }
+
+    fn finish_fail_stop_cleanup(&mut self) -> NativeAsyncPoll {
+        let trap = self.pending_trap.take().unwrap_or(TrapCode::Validation);
+        let exact = self.component.fail_stop_cleanup_work;
+        let charged = self.cleanup_reserve == exact && self.remaining_work >= exact;
+        if charged {
+            self.remaining_work -= exact;
+            self.cleanup_reserve = 0;
+            // A trapped invocation never reaches the successful transport
+            // finalizer, so its independent terminal reserve remains unused.
+            self.finalize_reserve = 0;
+        }
+        self.poison_and_discard();
         self.stage = InvocationStage::Terminal;
         self.terminal = true;
-        self.poison_and_discard();
-        NativeAsyncPoll::Trapped(trap)
+        NativeAsyncPoll::Trapped(if charged { trap } else { TrapCode::Validation })
     }
 
     fn poison_and_discard(&mut self) {
@@ -3332,6 +3753,7 @@ impl NativeAsyncInvocation<'_> {
         // authority. No cleanup error may make this Component reusable.
         self.component.poisoned = true;
         self.host_token = None;
+        self.deferred_core = None;
         // A reusable call's storage can only be recovered with its exact slot
         // authority. Recover every active slot before the principal-wide
         // fallback so no slot can be left looking reusable after its storage
@@ -3662,6 +4084,9 @@ mod tests {
                 }
                 NativeAsyncPoll::Complete(_) => {
                     panic!("host transport fixture completed before HostPending")
+                }
+                NativeAsyncPoll::CleanupPending { trap, .. } => {
+                    panic!("host transport fixture entered cleanup: {trap:?}")
                 }
                 NativeAsyncPoll::Trapped(trap) => {
                     panic!("host transport fixture trapped: {trap:?}")
@@ -4072,6 +4497,9 @@ mod tests {
                     )
                 }
                 NativeAsyncPoll::Complete(_) => break,
+                NativeAsyncPoll::CleanupPending { trap, .. } => {
+                    panic!("clean filter entered cleanup before finalization: {trap:?}")
+                }
                 NativeAsyncPoll::Trapped(trap) => {
                     panic!("clean filter trapped before finalization: {trap:?}")
                 }
@@ -4192,6 +4620,9 @@ mod tests {
                     panic!("wait fixture unexpectedly requested host transport")
                 }
                 NativeAsyncPoll::Complete(_) => panic!("wait fixture completed before WAIT"),
+                NativeAsyncPoll::CleanupPending { trap, .. } => {
+                    panic!("wait fixture entered cleanup: {trap:?}")
+                }
                 NativeAsyncPoll::Trapped(trap) => panic!("wait fixture trapped: {trap:?}"),
             }
         }
@@ -4209,6 +4640,9 @@ mod tests {
                 }
                 NativeAsyncPoll::HostPending { .. } => {
                     panic!("cancel callback unexpectedly requested host transport")
+                }
+                NativeAsyncPoll::CleanupPending { trap, .. } => {
+                    panic!("cancel callback entered cleanup: {trap:?}")
                 }
                 NativeAsyncPoll::Trapped(trap) => {
                     panic!("cancel callback trapped: {trap:?}")
@@ -4332,6 +4766,13 @@ mod tests {
         loop {
             match call.poll() {
                 NativeAsyncPoll::Trapped(trap) => return trap,
+                pending @ NativeAsyncPoll::CleanupPending { .. } => {
+                    let NativeAsyncPoll::Trapped(trap) = finish_cleanup_turn(&mut call, pending)
+                    else {
+                        unreachable!("cleanup helper pins its terminal result")
+                    };
+                    return trap;
+                }
                 NativeAsyncPoll::Pending(_)
                 | NativeAsyncPoll::Resolved(_)
                 | NativeAsyncPoll::Yielded(_) => {}
@@ -4346,6 +4787,62 @@ mod tests {
         }
     }
 
+    /// Executes exactly one owner-visible poll and pins its aggregate work.
+    fn poll_within_quantum(call: &mut NativeAsyncInvocation<'_>) -> NativeAsyncPoll {
+        let before = call.metrics().consumed_work;
+        let progress = call.poll();
+        let delta = call.metrics().consumed_work - before;
+        assert!(
+            delta <= call.poll_quantum,
+            "one public poll spent {delta} work with quantum {}",
+            call.poll_quantum
+        );
+        progress
+    }
+
+    fn finish_cleanup_turn(
+        call: &mut NativeAsyncInvocation<'_>,
+        pending: NativeAsyncPoll,
+    ) -> NativeAsyncPoll {
+        let NativeAsyncPoll::CleanupPending { trap, metrics } = pending else {
+            return pending;
+        };
+        assert_eq!(metrics, call.metrics());
+        assert!(call.component.is_poisoned());
+        assert_eq!(call.stage, InvocationStage::Cleanup);
+        let exact = call.component.fail_stop_cleanup_work;
+        let before = call.metrics();
+        let terminal = poll_within_quantum(call);
+        let after = call.metrics();
+        assert_eq!(before.remaining_work - after.remaining_work, exact);
+        assert_eq!(after.consumed_work - before.consumed_work, exact);
+        assert_eq!(terminal, NativeAsyncPoll::Trapped(trap));
+        terminal
+    }
+
+    fn finish_finalize_cleanup_turn(
+        call: &mut NativeAsyncInvocation<'_>,
+        pending: NativeAsyncFinalizeError,
+    ) -> NativeAsyncPoll {
+        let NativeAsyncFinalizeError::CleanupPending { trap, metrics } = pending else {
+            panic!("finalize invariant did not retain fail-stop cleanup: {pending:?}")
+        };
+        finish_cleanup_turn(call, NativeAsyncPoll::CleanupPending { trap, metrics })
+    }
+
+    /// Drives at most one deferred Core outcome and, for legacy fixture
+    /// callers, a separately measured cleanup turn.
+    fn poll_after_core_turn(call: &mut NativeAsyncInvocation<'_>) -> NativeAsyncPoll {
+        let first = poll_within_quantum(call);
+        let progress = if call.deferred_core.is_none() {
+            first
+        } else {
+            assert!(matches!(first, NativeAsyncPoll::Pending(_)));
+            poll_within_quantum(call)
+        };
+        finish_cleanup_turn(call, progress)
+    }
+
     fn assert_exact_run_bridge_debits(call: &mut NativeAsyncInvocation<'_>) -> usize {
         let active = call.binding().core_instance;
         let work_costs = call.component.work_costs();
@@ -4358,8 +4855,9 @@ mod tests {
                 PollResult::HostCall(host) => {
                     let action = call.component.bridges[host.id as usize].action;
                     let expected = match action {
-                        BridgeAction::TaskReturn(_) => TASK_RETURN_WORK,
-                        BridgeAction::StreamNew(_)
+                        BridgeAction::TaskReturn(RuntimeExportContract::Unit) => TASK_RETURN_WORK,
+                        BridgeAction::TaskReturn(RuntimeExportContract::ByteStream(_))
+                        | BridgeAction::StreamNew(_)
                         | BridgeAction::FutureNew(_)
                         | BridgeAction::DropEndpoint { .. }
                         | BridgeAction::WaitableSetNew
@@ -4425,6 +4923,9 @@ mod tests {
                 NativeAsyncPoll::HostPending { .. } => {
                     panic!("callback unexpectedly requested host transport")
                 }
+                NativeAsyncPoll::CleanupPending { trap, .. } => {
+                    panic!("callback entered cleanup: {trap:?}")
+                }
                 NativeAsyncPoll::Trapped(trap) => panic!("callback trapped: {trap:?}"),
             }
         }
@@ -4432,7 +4933,10 @@ mod tests {
 
     fn assert_smoke_sequence(component: &mut NativeAsyncComponent) -> NativeAsyncMetrics {
         let mut call = component.start("run", WORK, QUANTUM).unwrap();
-        assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
+        assert!(matches!(
+            poll_after_core_turn(&mut call),
+            NativeAsyncPoll::Resolved(_)
+        ));
         let task = call.task_info();
         assert_eq!(task.result, TaskResultState::Resolved);
         assert_eq!(task.callback, TaskCallbackState::Running);
@@ -4457,8 +4961,11 @@ mod tests {
             after_yield.consumed_work - before_yield.consumed_work,
             CALLBACK_RESULT_WORK
         );
-        assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
-        let NativeAsyncPoll::Complete(metrics) = call.poll() else {
+        assert!(matches!(
+            poll_within_quantum(&mut call),
+            NativeAsyncPoll::Pending(_)
+        ));
+        let NativeAsyncPoll::Complete(metrics) = poll_after_core_turn(&mut call) else {
             panic!("the exact callback must exit after task resolution")
         };
         metrics
@@ -4551,6 +5058,459 @@ mod tests {
         assert_eq!(component.storage_metrics(), full);
     }
 
+    #[test]
+    fn core_host_and_ready_outcomes_are_deferred_with_one_quantum_per_public_poll() {
+        const PIN_QUANTUM: u64 = 100;
+        let mut component = instantiate_with_resource_limit(SMOKE, 8).unwrap();
+        let mut call = component.start("run", WORK, PIN_QUANTUM).unwrap();
+
+        assert!(matches!(
+            poll_within_quantum(&mut call),
+            NativeAsyncPoll::Pending(_)
+        ));
+        assert!(matches!(
+            call.deferred_core.as_ref(),
+            Some(DeferredCoreTurn::Host {
+                authority: CallAuthority::Run(_),
+                ..
+            })
+        ));
+        assert_eq!(call.task_info().result, TaskResultState::Pending);
+
+        assert!(matches!(
+            poll_within_quantum(&mut call),
+            NativeAsyncPoll::Resolved(_)
+        ));
+        assert!(call.deferred_core.is_none());
+        assert_eq!(call.task_info().result, TaskResultState::Resolved);
+
+        assert!(matches!(
+            poll_within_quantum(&mut call),
+            NativeAsyncPoll::Pending(_)
+        ));
+        assert!(matches!(
+            call.deferred_core.as_ref(),
+            Some(DeferredCoreTurn::RunReady(_))
+        ));
+        assert!(matches!(
+            poll_within_quantum(&mut call),
+            NativeAsyncPoll::Yielded(_)
+        ));
+        assert!(call.deferred_core.is_none());
+
+        assert!(matches!(
+            poll_within_quantum(&mut call),
+            NativeAsyncPoll::Pending(_)
+        ));
+        assert!(matches!(
+            poll_after_core_turn(&mut call),
+            NativeAsyncPoll::Complete(_)
+        ));
+    }
+
+    #[test]
+    fn fail_stop_cleanup_is_a_separate_exact_reserved_quantum() {
+        const PIN_QUANTUM: u64 = 100;
+        let source = replace_once(
+            SMOKE,
+            "    (func (export \"run\") (result i32)\n      call $task-return\n      i32.const 1)",
+            "    (func (export \"run\") (result i32)\n      unreachable)",
+        );
+        let mut component = instantiate_with_resource_limit(&source, 8).unwrap();
+        assert_eq!(component.fail_stop_cleanup_work, 70);
+        assert!(component.fail_stop_cleanup_work <= PIN_QUANTUM);
+        let mut call = component.start("run", WORK, PIN_QUANTUM).unwrap();
+
+        assert!(matches!(
+            poll_within_quantum(&mut call),
+            NativeAsyncPoll::Pending(_)
+        ));
+        assert!(matches!(
+            call.deferred_core,
+            Some(DeferredCoreTurn::Trapped(TrapCode::Unreachable))
+        ));
+        let before_failure = call.metrics();
+        let NativeAsyncPoll::CleanupPending { trap, metrics } = poll_within_quantum(&mut call)
+        else {
+            panic!("deferred Core trap did not enter fail-stop cleanup")
+        };
+        assert_eq!(trap, TrapCode::Unreachable);
+        assert_eq!(metrics, before_failure);
+        assert_eq!(call.metrics(), before_failure);
+        assert_eq!(call.stage, InvocationStage::Cleanup);
+        assert!(!call.terminal);
+        assert!(call.component.is_poisoned());
+        assert!(call.host_token.is_none());
+        assert!(call.wait_token.is_none());
+        assert!(call.deferred_core.is_none());
+
+        let terminal = poll_within_quantum(&mut call);
+        assert_eq!(terminal, NativeAsyncPoll::Trapped(TrapCode::Unreachable));
+        assert_eq!(call.stage, InvocationStage::Terminal);
+        assert!(call.terminal);
+        assert_eq!(call.cleanup_reserve, 0);
+        assert_eq!(
+            call.metrics().consumed_work - before_failure.consumed_work,
+            70
+        );
+        assert_eq!(
+            before_failure.remaining_work - call.metrics().remaining_work,
+            70
+        );
+    }
+
+    #[test]
+    fn minimum_quantum_rejection_precedes_unit_and_filter_state_mutation() {
+        let mut unit = instantiate_with_resource_limit(SMOKE, 8).unwrap();
+        let unit_minimum = unit.minimum_poll_quantum(&unit.exports[0]).unwrap();
+        assert_eq!(unit_minimum, 79);
+        let unit_storage = unit.storage_metrics();
+        let unit_generation = unit.callback_slots[0].generation();
+        assert_eq!(
+            unit.start("run", WORK, unit_minimum - 1).err(),
+            Some(NativeAsyncError::InvalidBudget)
+        );
+        assert_eq!(unit.storage_metrics(), unit_storage);
+        assert_eq!(unit.callback_slots[0].state(), CoreCallSlotState::Idle);
+        assert_eq!(unit.callback_slots[0].generation(), unit_generation);
+        assert!(!unit.modules.any_active_call());
+        assert!(!unit.is_poisoned());
+
+        let source = input_transport_component();
+        let mut filter = instantiate_with_resource_limit(&source, 8).unwrap();
+        let filter_minimum = filter.minimum_poll_quantum(&filter.exports[0]).unwrap();
+        assert_eq!(filter_minimum, 79);
+        let filter_storage = filter.storage_metrics();
+        let filter_generation = filter.callback_slots[0].generation();
+        assert_eq!(
+            filter.start_filter("run", WORK, filter_minimum - 1).err(),
+            Some(NativeAsyncError::InvalidBudget)
+        );
+        assert_eq!(filter.storage_metrics(), filter_storage);
+        assert_eq!(filter.callback_slots[0].state(), CoreCallSlotState::Idle);
+        assert_eq!(filter.callback_slots[0].generation(), filter_generation);
+        assert!(!filter.modules.any_active_call());
+        assert!(!filter.is_poisoned());
+    }
+
+    #[test]
+    fn resource_eight_quantum_100_pins_host_99_and_local_prefix_eight() {
+        const PIN_QUANTUM: u64 = 100;
+        let source = filter_transport_component(
+            r#"local.get $input-bytes
+              i32.const 16
+              i32.const 1024
+              call $stream-read
+              i32.const -1
+              i32.ne
+              if unreachable end
+              unreachable"#,
+            "i32.const 0",
+        );
+        let mut component = instantiate_with_resource_limit(&source, 8).unwrap();
+        let costs = component.work_costs();
+        assert_eq!(costs.buffer_bridge, 74);
+        let scratch_bytes = component.buffers.scratch_bytes();
+        assert!(scratch_bytes >= 1024);
+        let available_copy_work = PIN_QUANTUM - costs.buffer_bridge;
+        assert_eq!(available_copy_work, 26);
+        assert_eq!(
+            maximum_local_copy_progress(1024, scratch_bytes, available_copy_work),
+            Some(8)
+        );
+        assert_eq!(buffer_copy_work(8, scratch_bytes), Some(26));
+        assert_eq!(
+            costs.buffer_bridge + buffer_copy_work(8, scratch_bytes).unwrap(),
+            PIN_QUANTUM
+        );
+        assert!(costs.buffer_bridge + buffer_copy_work(9, scratch_bytes).unwrap() > PIN_QUANTUM);
+
+        let mut call = component.start_filter("run", WORK, PIN_QUANTUM).unwrap();
+        let (offered, maximum) = loop {
+            match poll_within_quantum(&mut call) {
+                NativeAsyncPoll::Pending(_) => {}
+                NativeAsyncPoll::HostPending {
+                    token,
+                    request: NativeAsyncHostRequest::InputStream { maximum },
+                    ..
+                } => break (token, maximum),
+                other => panic!("large input did not reach HostPending: {other:?}"),
+            }
+        };
+        assert_eq!(maximum, 99);
+
+        let before_prepare = call.metrics();
+        let prepared = match call.prepare_host_input_stream(offered, maximum).unwrap() {
+            NativeAsyncPoll::HostPending {
+                token,
+                request: NativeAsyncHostRequest::InputStream { maximum: 99 },
+                ..
+            } => token,
+            other => panic!("99-byte host prepare failed: {other:?}"),
+        };
+        assert_eq!(
+            call.metrics().consumed_work - before_prepare.consumed_work,
+            PIN_QUANTUM
+        );
+        let before_commit = call.metrics();
+        assert!(matches!(
+            call.commit_host_input_stream(prepared, &[0x5a; 99]),
+            Ok(NativeAsyncPoll::Pending(_))
+        ));
+        assert!(call.metrics().consumed_work - before_commit.consumed_work <= PIN_QUANTUM);
+
+        let run = r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      call $stream-new
+      local.set $pair
+      i32.const 16
+      i64.const 0x0807060504030201
+      i64.store
+      i32.const 32
+      i64.const 0xaaaaaaaaaaaaaaaa
+      i64.store
+      i32.const 40
+      i32.const 170
+      i32.store8
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.const 16
+      i32.const 1024
+      call $stream-write
+      i32.const -1
+      i32.ne
+      if unreachable end
+      local.get $pair
+      i32.wrap_i64
+      i32.const 32
+      i32.const 1024
+      call $stream-read
+      i32.const 128
+      i32.ne
+      if unreachable end
+      i32.const 48
+      i32.const 1
+      i32.store
+      i32.const 32
+      i64.load
+      i64.const 0x0807060504030201
+      i64.ne
+      if unreachable end
+      i32.const 40
+      i32.load8_u
+      i32.const 170
+      i32.ne
+      if unreachable end
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      call $stream-cancel-write
+      i32.const 128
+      i32.ne
+      if unreachable end
+      i32.const 48
+      i32.const 48
+      i32.load
+      i32.const 1
+      i32.add
+      i32.store
+      call $task-return
+      i32.const 1)"#;
+        let source = byte_stream_component(
+            run,
+            r#"    (func (export "callback") (param i32 i32 i32) (result i32)
+      i32.const 0)"#,
+        );
+        let mut component = instantiate_with_resource_limit(&source, 8).unwrap();
+        let mut call = component.start("run", WORK, PIN_QUANTUM).unwrap();
+        let mut saw_exact_local_turn = false;
+        loop {
+            let before = call.metrics();
+            let live_before = call.component.buffers.live();
+            let progress = poll_within_quantum(&mut call);
+            let delta = call.metrics().consumed_work - before.consumed_work;
+            if live_before == 1 && call.component.buffers.live() == 1 && delta == PIN_QUANTUM {
+                assert!(!saw_exact_local_turn);
+                saw_exact_local_turn = true;
+            }
+            match progress {
+                NativeAsyncPoll::Pending(_)
+                | NativeAsyncPoll::Resolved(_)
+                | NativeAsyncPoll::Yielded(_) => {}
+                NativeAsyncPoll::Complete(_) => break,
+                other => panic!("local eight-byte rendezvous failed: {other:?}"),
+            }
+        }
+        assert!(saw_exact_local_turn);
+        let mut copied = [0_u8; 9];
+        call.component
+            .modules
+            .read_memory(0, "memory", 32, &mut copied)
+            .unwrap();
+        assert_eq!(copied, [1, 2, 3, 4, 5, 6, 7, 8, 0xaa]);
+        let mut events = [0_u8; 4];
+        call.component
+            .modules
+            .read_memory(0, "memory", 48, &mut events)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(events), 2);
+    }
+
+    #[test]
+    fn remaining_fuel_clamps_host_and_local_stream_prefixes() {
+        const PIN_QUANTUM: u64 = 100;
+        let source = input_transport_component();
+        let mut component = instantiate_with_resource_limit(&source, 8).unwrap();
+        let mut call = component.start_filter("run", WORK, PIN_QUANTUM).unwrap();
+        let active = call.binding().core_instance;
+        let authority = CallAuthority::Run(active);
+        let host = loop {
+            let result = call.component.modules.poll_call(active);
+            assert!(call.settle_metrics(authority));
+            match result {
+                PollResult::Pending { .. } => {}
+                PollResult::HostCall(host) => break host,
+                other => panic!("input clamp fixture did not reach stream.read: {other:?}"),
+            }
+        };
+        assert!(matches!(
+            call.component.bridges[host.id as usize].action,
+            BridgeAction::StreamCopy {
+                direction: EndpointDirection::Read,
+                ..
+            }
+        ));
+        let desired_spendable = call
+            .component
+            .work_costs
+            .buffer_bridge
+            .checked_add(host_copy_work(2).unwrap())
+            .and_then(|work| work.checked_add(1))
+            .unwrap();
+        let desired_remaining = call
+            .reserved_work()
+            .and_then(|reserve| reserve.checked_add(desired_spendable))
+            .unwrap();
+        let excess = call.remaining_work.checked_sub(desired_remaining).unwrap();
+        call.debit_active_work(authority, excess).unwrap();
+        let before = call.metrics();
+        let NativeAsyncPoll::HostPending {
+            token,
+            request: NativeAsyncHostRequest::InputStream { maximum },
+            metrics,
+        } = call.handle_host_call(authority, host)
+        else {
+            panic!("low remaining fuel did not offer a host prefix")
+        };
+        assert_eq!(maximum, 2);
+        assert_eq!(
+            metrics.consumed_work - before.consumed_work,
+            call.component.work_costs.buffer_bridge
+        );
+        let prepared = match call.prepare_host_input_stream(token, maximum).unwrap() {
+            NativeAsyncPoll::HostPending { token, .. } => token,
+            other => panic!("clamped host prefix did not prepare: {other:?}"),
+        };
+        assert!(matches!(
+            call.commit_host_input_stream(prepared, &[1, 2]),
+            Ok(NativeAsyncPoll::Pending(_))
+        ));
+
+        let run = r#"    (func (export "run") (result i32)
+      (local $pair i64)
+      call $stream-new
+      local.set $pair
+      i32.const 16
+      i32.const 67305985
+      i32.store
+      i32.const 24
+      i32.const -1431655766
+      i32.store
+      local.get $pair
+      i64.const 32
+      i64.shr_u
+      i32.wrap_i64
+      i32.const 16
+      i32.const 4
+      call $stream-write
+      drop
+      local.get $pair
+      i32.wrap_i64
+      i32.const 24
+      i32.const 4
+      call $stream-read
+      drop
+      unreachable)"#;
+        let source = byte_stream_component(
+            run,
+            r#"    (func (export "callback") (param i32 i32 i32) (result i32)
+      unreachable)"#,
+        );
+        let mut component = instantiate_with_resource_limit(&source, 8).unwrap();
+        let mut call = component.start("run", WORK, PIN_QUANTUM).unwrap();
+        let active = call.binding().core_instance;
+        let authority = CallAuthority::Run(active);
+        let mut stream_copies = 0;
+        loop {
+            let result = call.component.modules.poll_call(active);
+            assert!(call.settle_metrics(authority));
+            match result {
+                PollResult::Pending { .. } => {}
+                PollResult::HostCall(host) => {
+                    if matches!(
+                        call.component.bridges[host.id as usize].action,
+                        BridgeAction::StreamCopy { .. }
+                    ) {
+                        stream_copies += 1;
+                    }
+                    if stream_copies == 2 {
+                        let local_work =
+                            buffer_copy_work(2, call.component.buffers.scratch_bytes()).unwrap();
+                        let desired_spendable = call
+                            .component
+                            .work_costs
+                            .buffer_bridge
+                            .checked_add(local_work)
+                            .and_then(|work| work.checked_add(1))
+                            .unwrap();
+                        let desired_remaining = call
+                            .reserved_work()
+                            .and_then(|reserve| reserve.checked_add(desired_spendable))
+                            .unwrap();
+                        let excess = call.remaining_work.checked_sub(desired_remaining).unwrap();
+                        call.debit_active_work(authority, excess).unwrap();
+                        let before = call.metrics();
+                        assert!(matches!(
+                            call.handle_host_call(authority, host),
+                            NativeAsyncPoll::Pending(_)
+                        ));
+                        let after = call.metrics();
+                        assert_eq!(
+                            after.consumed_work - before.consumed_work,
+                            call.component.work_costs.buffer_bridge + local_work
+                        );
+                        break;
+                    }
+                    assert!(matches!(
+                        call.handle_host_call(authority, host),
+                        NativeAsyncPoll::Pending(_)
+                    ));
+                }
+                other => panic!("local clamp fixture failed before rendezvous: {other:?}"),
+            }
+        }
+        assert_eq!(stream_copies, 2);
+        let mut copied = [0_u8; 4];
+        call.component
+            .modules
+            .read_memory(0, "memory", 24, &mut copied)
+            .unwrap();
+        assert_eq!(copied, [1, 2, 0xaa, 0xaa]);
+    }
+
     #[cfg(feature = "native-async-acceptance")]
     #[test]
     fn acceptance_facade_requires_an_explicit_candidate_and_manifest_limits() {
@@ -4597,7 +5557,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_is_read_only_before_complete_and_clean_completion_is_reusable() {
+    fn finalize_success_debits_exact_reserved_turn_and_clean_completion_is_reusable() {
         let source = clean_finalize_component(false);
         let mut component = instantiate(&source);
         for invocation in 0..2 {
@@ -4616,7 +5576,22 @@ mod tests {
                 assert!(!call.component.is_poisoned());
 
                 drive_clean_filter_to_complete(&mut call, false, false, false);
+                let before_finalize = call.metrics();
+                let exact_finalize = call.component.fail_stop_cleanup_work;
+                assert_eq!(call.finalize_reserve, exact_finalize);
+                assert_eq!(call.cleanup_reserve, exact_finalize);
                 assert_eq!(call.finalize_transport(), Ok(()));
+                let after_finalize = call.metrics();
+                assert_eq!(
+                    after_finalize.consumed_work - before_finalize.consumed_work,
+                    exact_finalize
+                );
+                assert_eq!(
+                    before_finalize.remaining_work - after_finalize.remaining_work,
+                    exact_finalize
+                );
+                assert_eq!(call.finalize_reserve, 0);
+                assert_eq!(call.cleanup_reserve, 0);
                 assert!(call.input.is_none());
                 assert!(call.output_stream.is_none());
                 assert!(call.output_closed.is_none());
@@ -4717,7 +5692,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_transport_invariants_poison_without_partial_finalization() {
+    fn terminal_transport_invariant_debits_finalize_then_cleanup_in_distinct_turns() {
         // A guest callback which exits without dropping every retained peer
         // has no remaining execution path that could make progress. This is
         // terminal malformed cleanup, not a retryable early finalize.
@@ -4734,12 +5709,40 @@ mod tests {
             }
         }
         assert_eq!(call.component.buffers.live(), 0);
+        let exact = call.component.fail_stop_cleanup_work;
+        let before_finalize = call.metrics();
+        let finalize_pending = call.finalize_transport().unwrap_err();
+        let NativeAsyncFinalizeError::CleanupPending { trap, metrics } = finalize_pending else {
+            panic!("terminal invariant did not enter finalize cleanup")
+        };
+        assert_eq!(trap, TrapCode::Validation);
+        assert_eq!(metrics, call.metrics());
+        assert_eq!(metrics.consumed_work - before_finalize.consumed_work, exact);
         assert_eq!(
-            call.finalize_transport(),
-            Err(NativeAsyncFinalizeError::Invariant)
+            before_finalize.remaining_work - metrics.remaining_work,
+            exact
         );
+        assert_eq!(call.finalize_reserve, 0);
+        assert_eq!(call.cleanup_reserve, exact);
+        assert_eq!(call.stage, InvocationStage::Cleanup);
+        assert!(!call.terminal);
         assert!(!call.transport_finalized);
         assert!(call.component.is_poisoned());
+        let before_cleanup = call.metrics();
+        assert_eq!(
+            finish_finalize_cleanup_turn(&mut call, finalize_pending),
+            NativeAsyncPoll::Trapped(TrapCode::Validation)
+        );
+        let after_cleanup = call.metrics();
+        assert_eq!(
+            after_cleanup.consumed_work - before_cleanup.consumed_work,
+            exact
+        );
+        assert_eq!(
+            before_cleanup.remaining_work - after_cleanup.remaining_work,
+            exact
+        );
+        assert_eq!(call.cleanup_reserve, 0);
 
         // Even with the expected four pairs otherwise clean, an unrelated
         // live guest pair at callback Exit violates the exact global baseline.
@@ -4747,9 +5750,10 @@ mod tests {
         let mut component = instantiate(&source);
         let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
         drive_clean_filter_to_complete(&mut call, false, false, false);
+        let finalize_pending = call.finalize_transport().unwrap_err();
         assert_eq!(
-            call.finalize_transport(),
-            Err(NativeAsyncFinalizeError::Invariant)
+            finish_finalize_cleanup_turn(&mut call, finalize_pending),
+            NativeAsyncPoll::Trapped(TrapCode::Validation)
         );
         assert!(!call.transport_finalized);
         assert!(call.component.is_poisoned());
@@ -4775,9 +5779,10 @@ mod tests {
             .unwrap();
         assert_eq!(replacement.first.guest.raw(), old_input.raw());
         assert_ne!(replacement.first.guest, old_input);
+        let finalize_pending = call.finalize_transport().unwrap_err();
         assert_eq!(
-            call.finalize_transport(),
-            Err(NativeAsyncFinalizeError::Invariant)
+            finish_finalize_cleanup_turn(&mut call, finalize_pending),
+            NativeAsyncPoll::Trapped(TrapCode::Validation)
         );
         assert!(!call.transport_finalized);
         assert!(call.component.is_poisoned());
@@ -4811,12 +5816,14 @@ mod tests {
             .unwrap();
         let _orphaned_for_invariant_test = call.component.buffers.issue(prepared).unwrap();
         assert_eq!(call.component.buffers.live(), 1);
-        assert_eq!(
-            call.finalize_transport(),
-            Err(NativeAsyncFinalizeError::Invariant)
-        );
+        let finalize_pending = call.finalize_transport().unwrap_err();
         assert!(!call.transport_finalized);
         assert!(call.component.is_poisoned());
+        assert_eq!(call.component.buffers.live(), 1);
+        assert_eq!(
+            finish_finalize_cleanup_turn(&mut call, finalize_pending),
+            NativeAsyncPoll::Trapped(TrapCode::Validation)
+        );
         assert_eq!(call.component.buffers.live(), 0);
     }
 
@@ -4840,7 +5847,16 @@ mod tests {
         loop {
             match call.poll() {
                 NativeAsyncPoll::Pending(_) => {}
-                NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi) => break,
+                pending @ NativeAsyncPoll::CleanupPending {
+                    trap: TrapCode::CanonicalAbi,
+                    ..
+                } => {
+                    assert_eq!(
+                        finish_cleanup_turn(&mut call, pending),
+                        NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
+                    );
+                    break;
+                }
                 other => panic!("host-backed input echo must fail closed: {other:?}"),
             }
         }
@@ -4867,7 +5883,16 @@ mod tests {
         loop {
             match call.poll() {
                 NativeAsyncPoll::Pending(_) => {}
-                NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi) => break,
+                pending @ NativeAsyncPoll::CleanupPending {
+                    trap: TrapCode::CanonicalAbi,
+                    ..
+                } => {
+                    assert_eq!(
+                        finish_cleanup_turn(&mut call, pending),
+                        NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
+                    );
+                    break;
+                }
                 other => panic!("mixed host-backed result must fail closed: {other:?}"),
             }
         }
@@ -5201,7 +6226,10 @@ mod tests {
         // No Core instruction ran during either HostPending phase. Only the
         // explicit test perturbations above changed memory; the guest's post-
         // return stores execute after both commits release the continuation.
-        assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+        assert!(matches!(
+            poll_after_core_turn(&mut call),
+            NativeAsyncPoll::Yielded(_)
+        ));
         call.component
             .modules
             .read_memory(0, "memory", 64, &mut source_bytes)
@@ -5213,6 +6241,56 @@ mod tests {
             .read_memory(0, "memory", 72, &mut closed_source)
             .unwrap();
         assert_eq!(closed_source, [7]);
+    }
+
+    #[test]
+    fn queued_host_limit_is_refreshed_from_remaining_fuel_on_activation() {
+        const PIN_QUANTUM: u64 = 100;
+        let source = output_transport_component(true, true, false);
+        let mut component = instantiate_with_resource_limit(&source, 8).unwrap();
+        let mut call = component.start_filter("run", WORK, PIN_QUANTUM).unwrap();
+        let (offered, request, _) = poll_to_host(&mut call);
+        assert_eq!(request, NativeAsyncHostRequest::OutputStream { maximum: 4 });
+        assert!(matches!(
+            call.host_next.as_ref().map(|host| host.request),
+            Some(NativeAsyncHostRequest::OutputClosed { value: None })
+        ));
+        let mut output = [0_u8; 4];
+        let prepared = match call
+            .prepare_host_output_stream(offered, &mut output)
+            .unwrap()
+        {
+            NativeAsyncPoll::HostPending { token, .. } => token,
+            other => panic!("queued-limit fixture did not prepare its stream: {other:?}"),
+        };
+        assert_eq!(output, [1, 2, 3, 4]);
+        let authority = call.host_current.as_ref().unwrap().authority;
+        let desired_remaining = call
+            .reserved_work()
+            .and_then(|reserve| reserve.checked_add(2))
+            .unwrap();
+        let excess = call.remaining_work.checked_sub(desired_remaining).unwrap();
+        call.debit_active_work(authority, excess).unwrap();
+        let before = call.metrics();
+        let pending = call.commit_host_output(prepared).unwrap();
+        assert_eq!(call.metrics(), before);
+        assert!(matches!(
+            pending,
+            NativeAsyncPoll::CleanupPending {
+                trap: TrapCode::FuelExhausted,
+                metrics,
+            } if metrics == before
+        ));
+        assert!(call.host_token.is_none());
+        assert!(call.host_next.is_none());
+        assert!(matches!(
+            call.host_current.as_ref().map(|host| host.kind),
+            Some(EndpointKind::Future)
+        ));
+        assert_eq!(
+            finish_cleanup_turn(&mut call, pending),
+            NativeAsyncPoll::Trapped(TrapCode::FuelExhausted)
+        );
     }
 
     #[test]
@@ -5263,7 +6341,10 @@ mod tests {
             call.cancel_host_copy(token),
             Ok(NativeAsyncPoll::Pending(_))
         ));
-        assert_eq!(call.metrics(), metrics);
+        assert_eq!(
+            call.metrics().consumed_work - metrics.consumed_work,
+            BUFFER_COPY_BASE_WORK
+        );
         assert!(
             call.component
                 .state
@@ -5304,7 +6385,10 @@ mod tests {
             call.drop_host_copy_peer(token),
             Ok(NativeAsyncPoll::Pending(_))
         ));
-        assert_eq!(call.metrics(), metrics);
+        assert_eq!(
+            call.metrics().consumed_work - metrics.consumed_work,
+            BUFFER_COPY_BASE_WORK
+        );
         assert!(
             call.component
                 .state
@@ -5372,9 +6456,10 @@ mod tests {
             NativeAsyncPoll::HostPending { token, .. } => token,
             other => panic!("input close prepare failed: {other:?}"),
         };
+        let pending = call.commit_host_input_closed(prepared, 8).unwrap();
         assert_eq!(
-            call.commit_host_input_closed(prepared, 8),
-            Ok(NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi))
+            finish_cleanup_turn(&mut call, pending),
+            NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
         );
         let mut target = [0];
         call.component
@@ -5391,15 +6476,29 @@ mod tests {
         let (offered, _, _) = poll_to_host(&mut call);
         let work = host_copy_work(4).unwrap();
         let authority = call.host_current.as_ref().unwrap().authority;
-        let debit = call.remaining_work.checked_sub(work).unwrap();
+        let remaining = call
+            .reserved_work()
+            .and_then(|reserve| reserve.checked_add(work))
+            .unwrap();
+        let debit = call.remaining_work.checked_sub(remaining).unwrap();
         call.debit_active_work(authority, debit).unwrap();
-        assert_eq!(call.remaining_work, work);
+        assert_eq!(call.remaining_work, remaining);
         let before = call.metrics();
+        let pending = call.prepare_host_input_stream(offered, 4).unwrap();
+        let NativeAsyncPoll::CleanupPending { metrics, .. } = pending else {
+            panic!("low-fuel host prepare did not enter cleanup")
+        };
+        assert_eq!(metrics, before);
         assert_eq!(
-            call.prepare_host_input_stream(offered, 4),
-            Ok(NativeAsyncPoll::Trapped(TrapCode::FuelExhausted))
+            finish_cleanup_turn(
+                &mut call,
+                NativeAsyncPoll::CleanupPending {
+                    trap: TrapCode::FuelExhausted,
+                    metrics,
+                },
+            ),
+            NativeAsyncPoll::Trapped(TrapCode::FuelExhausted)
         );
-        assert_eq!(call.metrics(), before);
         assert!(call.host_token.is_none());
         let mut target = [0xff; 4];
         call.component
@@ -5421,14 +6520,22 @@ mod tests {
             panic!("input fixture did not block on its stream")
         };
         *maximum += 1;
-        assert_eq!(call.poll(), NativeAsyncPoll::Trapped(TrapCode::Validation));
+        let pending = call.poll();
+        assert_eq!(
+            finish_cleanup_turn(&mut call, pending),
+            NativeAsyncPoll::Trapped(TrapCode::Validation)
+        );
 
         let mut component = instantiate(&source);
         let mut call = component.start_filter("run", WORK, QUANTUM).unwrap();
         let _ = poll_to_host(&mut call);
         let host = call.host_current.as_mut().unwrap();
         host.value_type = AsyncValueTypeId::new(host.value_type.get() + 1).unwrap();
-        assert_eq!(call.poll(), NativeAsyncPoll::Trapped(TrapCode::Validation));
+        let pending = call.poll();
+        assert_eq!(
+            finish_cleanup_turn(&mut call, pending),
+            NativeAsyncPoll::Trapped(TrapCode::Validation)
+        );
 
         let source = output_transport_component(false, true, false);
         let mut component = instantiate(&source);
@@ -5436,7 +6543,11 @@ mod tests {
         let _ = poll_to_host(&mut call);
         call.host_current.as_mut().unwrap().request =
             NativeAsyncHostRequest::OutputClosed { value: Some(6) };
-        assert_eq!(call.poll(), NativeAsyncPoll::Trapped(TrapCode::Validation));
+        let pending = call.poll();
+        assert_eq!(
+            finish_cleanup_turn(&mut call, pending),
+            NativeAsyncPoll::Trapped(TrapCode::Validation)
+        );
     }
 
     #[test]
@@ -5510,7 +6621,16 @@ mod tests {
             loop {
                 match call.poll() {
                     NativeAsyncPoll::Pending(_) => pending += 1,
-                    NativeAsyncPoll::Trapped(TrapCode::Unreachable) => break,
+                    cleanup @ NativeAsyncPoll::CleanupPending {
+                        trap: TrapCode::Unreachable,
+                        ..
+                    } => {
+                        assert_eq!(
+                            finish_cleanup_turn(&mut call, cleanup),
+                            NativeAsyncPoll::Trapped(TrapCode::Unreachable)
+                        );
+                        break;
+                    }
                     NativeAsyncPoll::HostPending { .. } => {
                         panic!("{label} raw ABA rebound the stale input authority")
                     }
@@ -5568,7 +6688,16 @@ mod tests {
         loop {
             match call.poll() {
                 NativeAsyncPoll::Pending(_) => {}
-                NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi) => break,
+                pending @ NativeAsyncPoll::CleanupPending {
+                    trap: TrapCode::CanonicalAbi,
+                    ..
+                } => {
+                    assert_eq!(
+                        finish_cleanup_turn(&mut call, pending),
+                        NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
+                    );
+                    break;
+                }
                 other => panic!("duplicate filter result must fail closed: {other:?}"),
             }
         }
@@ -5591,7 +6720,16 @@ mod tests {
         loop {
             match call.poll() {
                 NativeAsyncPoll::Pending(_) => {}
-                NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi) => break,
+                pending @ NativeAsyncPoll::CleanupPending {
+                    trap: TrapCode::CanonicalAbi,
+                    ..
+                } => {
+                    assert_eq!(
+                        finish_cleanup_turn(&mut call, pending),
+                        NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
+                    );
+                    break;
+                }
                 other => panic!("bad result handle must trap: {other:?}"),
             }
         }
@@ -5915,7 +7053,10 @@ mod tests {
 
         for _ in 0..2 {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
-            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Resolved(_)
+            ));
             let run_instance = call.binding().core_instance;
             let run_values = loop {
                 let result = call.component.modules.poll_call(run_instance);
@@ -6052,7 +7193,10 @@ mod tests {
         let mut component = instantiate(&source);
         let mut call = component.start("run", WORK, QUANTUM).unwrap();
 
-        assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+        assert!(matches!(
+            poll_after_core_turn(&mut call),
+            NativeAsyncPoll::Yielded(_)
+        ));
         assert_eq!(call.task_info().cancel, TaskCancelState::None);
         assert_eq!(
             call.request_cancel(),
@@ -6092,6 +7236,9 @@ mod tests {
                     assert!(!call.component.is_poisoned());
                 }
                 NativeAsyncPoll::Complete(_) => break,
+                NativeAsyncPoll::CleanupPending { trap, .. } => {
+                    panic!("cancel delivery callback entered cleanup: {trap:?}")
+                }
                 NativeAsyncPoll::Trapped(trap) => {
                     panic!("cancel delivery callback trapped: {trap:?}")
                 }
@@ -6110,27 +7257,45 @@ mod tests {
         let source = replace_once(
             SMOKE,
             "      call $task-return\n      i32.const 1",
-            "      i32.const 1",
+            r#"      (local $n i32)
+      i32.const 80
+      local.set $n
+      block $done
+        loop $loop
+          local.get $n
+          i32.eqz
+          br_if $done
+          local.get $n
+          i32.const 1
+          i32.sub
+          local.set $n
+          br $loop
+        end
+      end
+      i32.const 1"#,
         );
         let exact_yield_work = {
-            let mut component = instantiate(&source);
+            let mut component = instantiate_with_resource_limit(&source, 8).unwrap();
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
-            let NativeAsyncPoll::Yielded(metrics) = call.poll() else {
+            let NativeAsyncPoll::Yielded(metrics) = poll_after_core_turn(&mut call) else {
                 panic!("unresolved run must yield")
             };
             metrics.consumed_work
         };
-        assert!(exact_yield_work > CALLBACK_RESULT_WORK);
-
-        let mut component = instantiate(&source);
-        let mut call = component
-            .start("run", exact_yield_work, exact_yield_work)
+        let mut component = instantiate_with_resource_limit(&source, 8).unwrap();
+        let minimum = component
+            .minimum_poll_quantum(&component.exports[0])
             .unwrap();
+        assert!(exact_yield_work >= minimum);
+        let cleanup = component.fail_stop_cleanup_work;
+        let total = exact_yield_work.checked_add(cleanup).unwrap();
+
+        let mut call = component.start("run", total, exact_yield_work).unwrap();
         assert_eq!(
-            call.poll(),
+            poll_after_core_turn(&mut call),
             NativeAsyncPoll::Yielded(NativeAsyncMetrics {
                 consumed_work: exact_yield_work,
-                remaining_work: 0,
+                remaining_work: cleanup,
             })
         );
         assert_eq!(
@@ -6138,8 +7303,11 @@ mod tests {
             Ok(NativeAsyncCancelOutcome::Requested)
         );
         assert_eq!(call.task_info().cancel, TaskCancelState::Requested);
+        let pending = call.poll();
+        assert!(matches!(pending, NativeAsyncPoll::CleanupPending { .. }));
+        assert_eq!(call.metrics().remaining_work, cleanup);
         assert_eq!(
-            call.poll(),
+            finish_cleanup_turn(&mut call, pending),
             NativeAsyncPoll::Trapped(TrapCode::FuelExhausted)
         );
         assert_eq!(
@@ -6182,7 +7350,10 @@ mod tests {
             TASK_RETURN_WORK
         );
 
-        assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+        assert!(matches!(
+            poll_after_core_turn(&mut call),
+            NativeAsyncPoll::Yielded(_)
+        ));
         assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
         let callback = call
             .component
@@ -6239,7 +7410,10 @@ mod tests {
           (export "run" (func $lifted)))"#;
         let mut component = instantiate(source);
         let mut call = component.start("run", WORK, QUANTUM).unwrap();
-        assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+        assert!(matches!(
+            poll_after_core_turn(&mut call),
+            NativeAsyncPoll::Yielded(_)
+        ));
         assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
 
         let callback_instance = call.binding().callback_instance;
@@ -6324,6 +7498,9 @@ mod tests {
                 }
                 NativeAsyncPoll::HostPending { .. } => {
                     panic!("callback host-call fixture unexpectedly requested host transport")
+                }
+                NativeAsyncPoll::CleanupPending { trap, .. } => {
+                    panic!("callback host-call fixture entered cleanup: {trap:?}")
                 }
                 NativeAsyncPoll::Trapped(trap) => {
                     panic!("callback host-call fixture trapped: {trap:?}")
@@ -6616,6 +7793,9 @@ mod tests {
                     NativeAsyncPoll::HostPending { .. } => {
                         panic!("local close future unexpectedly requested host transport")
                     }
+                    NativeAsyncPoll::CleanupPending { trap, .. } => {
+                        panic!("local close future entered cleanup: {trap:?}")
+                    }
                     NativeAsyncPoll::Trapped(trap) => {
                         panic!("local close future trapped: {trap:?}")
                     }
@@ -6747,6 +7927,9 @@ mod tests {
                     }
                     NativeAsyncPoll::HostPending { .. } => {
                         panic!("local byte-stream fixture unexpectedly requested host transport")
+                    }
+                    NativeAsyncPoll::CleanupPending { trap, .. } => {
+                        panic!("local byte-stream fixture entered cleanup: {trap:?}")
                     }
                     NativeAsyncPoll::Trapped(trap) => {
                         panic!("local byte-stream fixture trapped: {trap:?}")
@@ -6908,6 +8091,9 @@ mod tests {
                     NativeAsyncPoll::HostPending { .. } => {
                         panic!("ready endpoint wait unexpectedly requested host transport")
                     }
+                    NativeAsyncPoll::CleanupPending { trap, .. } => {
+                        panic!("endpoint wait fixture entered cleanup: {trap:?}")
+                    }
                     NativeAsyncPoll::Trapped(trap) => {
                         panic!("endpoint wait fixture trapped: {trap:?}")
                     }
@@ -6973,6 +8159,9 @@ mod tests {
                     NativeAsyncPoll::WaitPending { .. } => panic!("zero copy unexpectedly waited"),
                     NativeAsyncPoll::HostPending { .. } => {
                         panic!("zero copy unexpectedly requested host transport")
+                    }
+                    NativeAsyncPoll::CleanupPending { trap, .. } => {
+                        panic!("zero copy entered cleanup: {trap:?}")
                     }
                     NativeAsyncPoll::Trapped(trap) => panic!("zero copy trapped: {trap:?}"),
                 }
@@ -7066,11 +8255,12 @@ mod tests {
                             if writes == 2 {
                                 assert_eq!(call.component.buffers.live(), 1);
                                 let before = call.metrics();
+                                let pending = call.handle_host_call(authority, host);
+                                assert_eq!(call.metrics(), before);
                                 assert_eq!(
-                                    call.handle_host_call(authority, host),
+                                    finish_cleanup_turn(&mut call, pending),
                                     NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
                                 );
-                                assert_eq!(call.metrics(), before);
                                 break;
                             }
                         }
@@ -7163,19 +8353,21 @@ mod tests {
                         let action = call.component.bridges[host.id as usize].action;
                         if matches!(action, BridgeAction::StreamCancel { .. }) {
                             assert_eq!(call.component.buffers.live(), live_before_cancel);
-                            let excess = call
-                                .metrics()
-                                .remaining_work
-                                .checked_sub(BUFFER_BRIDGE_WORK)
+                            let desired = call
+                                .cleanup_reserve
+                                .checked_add(BUFFER_BRIDGE_WORK)
                                 .unwrap();
+                            let excess =
+                                call.metrics().remaining_work.checked_sub(desired).unwrap();
                             call.debit_active_work(authority, excess).unwrap();
                             let before = call.metrics();
-                            assert_eq!(before.remaining_work, BUFFER_BRIDGE_WORK);
+                            assert_eq!(before.remaining_work, desired);
+                            let pending = call.handle_host_call(authority, host);
+                            assert_eq!(call.metrics(), before);
                             assert_eq!(
-                                call.handle_host_call(authority, host),
+                                finish_cleanup_turn(&mut call, pending),
                                 NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
                             );
-                            assert_eq!(call.metrics(), before);
                             break;
                         }
                         assert!(matches!(
@@ -7248,20 +8440,25 @@ mod tests {
                         }
                     ) {
                         assert_eq!(call.component.buffers.live(), 1);
-                        let transfer =
-                            buffer_copy_work(4, call.component.buffers.scratch_bytes()).unwrap();
-                        let tight = BUFFER_BRIDGE_WORK + transfer;
+                        let minimum_transfer =
+                            buffer_copy_work(1, call.component.buffers.scratch_bytes()).unwrap();
+                        let tight = call
+                            .cleanup_reserve
+                            .checked_add(BUFFER_BRIDGE_WORK)
+                            .and_then(|work| work.checked_add(minimum_transfer))
+                            .unwrap();
                         let excess = call.metrics().remaining_work.checked_sub(tight).unwrap();
                         call.debit_active_work(authority, excess).unwrap();
                         let before = call.metrics();
-                        assert_eq!(
-                            call.handle_host_call(authority, host),
-                            NativeAsyncPoll::Trapped(TrapCode::FuelExhausted)
-                        );
+                        let pending = call.handle_host_call(authority, host);
                         let after = call.metrics();
                         assert_eq!(
                             before.remaining_work - after.remaining_work,
                             BUFFER_BRIDGE_WORK
+                        );
+                        assert_eq!(
+                            finish_cleanup_turn(&mut call, pending),
+                            NativeAsyncPoll::Trapped(TrapCode::FuelExhausted)
                         );
                         break;
                     }
@@ -7402,13 +8599,14 @@ mod tests {
                 }
             };
             let before = call.metrics();
-            assert_eq!(
-                call.handle_host_call(CallAuthority::Run(active), host),
-                NativeAsyncPoll::Trapped(TrapCode::LimitExceeded)
-            );
+            let pending = call.handle_host_call(CallAuthority::Run(active), host);
             let after = call.metrics();
             assert_eq!(before.remaining_work - after.remaining_work, expected_work);
             assert_eq!(after.consumed_work - before.consumed_work, expected_work);
+            assert_eq!(
+                finish_cleanup_turn(&mut call, pending),
+                NativeAsyncPoll::Trapped(TrapCode::LimitExceeded)
+            );
             drop(call);
             assert!(component.is_poisoned());
         }
@@ -7539,11 +8737,12 @@ mod tests {
         };
         host.arguments.push(CoreValue::I32(0));
         let before = call.metrics();
+        let pending = call.handle_host_call(CallAuthority::Run(active), host);
+        assert_eq!(call.metrics(), before);
         assert_eq!(
-            call.handle_host_call(CallAuthority::Run(active), host),
+            finish_cleanup_turn(&mut call, pending),
             NativeAsyncPoll::Trapped(TrapCode::Validation)
         );
-        assert_eq!(call.metrics(), before);
         assert!(call.component.is_poisoned());
     }
 
@@ -7571,14 +8770,15 @@ mod tests {
             .resume_host_call(active, host.id, &[CoreValue::I32(1)])
             .unwrap();
         let before = call.metrics();
-        assert_eq!(
-            call.handle_host_call(CallAuthority::Run(active), host),
-            NativeAsyncPoll::Trapped(TrapCode::Validation)
-        );
+        let pending = call.handle_host_call(CallAuthority::Run(active), host);
         let after = call.metrics();
         assert_eq!(
             before.remaining_work - after.remaining_work,
             HANDLE_STATE_WORK
+        );
+        assert_eq!(
+            finish_cleanup_turn(&mut call, pending),
+            NativeAsyncPoll::Trapped(TrapCode::Validation)
         );
         assert_eq!(
             after.consumed_work - before.consumed_work,
@@ -7599,7 +8799,7 @@ mod tests {
         {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
             assert_eq!(
-                call.poll(),
+                poll_after_core_turn(&mut call),
                 NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
             );
         }
@@ -7617,10 +8817,16 @@ mod tests {
         let mut component = instantiate(&yielded_unresolved);
         {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
-            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
-            assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Yielded(_)
+            ));
+            assert!(matches!(
+                poll_within_quantum(&mut call),
+                NativeAsyncPoll::Pending(_)
+            ));
             assert_eq!(
-                call.poll(),
+                poll_after_core_turn(&mut call),
                 NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
             );
         }
@@ -7634,9 +8840,12 @@ mod tests {
         let mut component = instantiate(&duplicate);
         {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
-            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Resolved(_)
+            ));
             assert_eq!(
-                call.poll(),
+                poll_after_core_turn(&mut call),
                 NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
             );
         }
@@ -7656,11 +8865,23 @@ mod tests {
         );
         let mut component = instantiate(&source);
         let mut call = component.start("run", WORK, QUANTUM).unwrap();
-        assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
-        assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
-        assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
+        assert!(matches!(
+            poll_after_core_turn(&mut call),
+            NativeAsyncPoll::Yielded(_)
+        ));
+        assert!(matches!(
+            poll_within_quantum(&mut call),
+            NativeAsyncPoll::Pending(_)
+        ));
+        assert!(matches!(
+            poll_after_core_turn(&mut call),
+            NativeAsyncPoll::Resolved(_)
+        ));
         assert_eq!(call.task_info().result, TaskResultState::Resolved);
-        assert!(matches!(call.poll(), NativeAsyncPoll::Complete(_)));
+        assert!(matches!(
+            poll_after_core_turn(&mut call),
+            NativeAsyncPoll::Complete(_)
+        ));
     }
 
     #[test]
@@ -7681,7 +8902,7 @@ mod tests {
         {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
             assert_eq!(
-                call.poll(),
+                poll_after_core_turn(&mut call),
                 NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
             );
         }
@@ -7698,11 +8919,20 @@ mod tests {
         let mut component = instantiate(&invalid);
         {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
-            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
-            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
-            assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Resolved(_)
+            ));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Yielded(_)
+            ));
+            assert!(matches!(
+                poll_within_quantum(&mut call),
+                NativeAsyncPoll::Pending(_)
+            ));
             assert_eq!(
-                call.poll(),
+                poll_after_core_turn(&mut call),
                 NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
             );
         }
@@ -7717,7 +8947,7 @@ mod tests {
         {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
             assert_eq!(
-                call.poll(),
+                poll_after_core_turn(&mut call),
                 NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
             );
         }
@@ -7734,11 +8964,20 @@ mod tests {
         let mut component = instantiate(&source);
         {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
-            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
-            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
-            assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Resolved(_)
+            ));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Yielded(_)
+            ));
+            assert!(matches!(
+                poll_within_quantum(&mut call),
+                NativeAsyncPoll::Pending(_)
+            ));
             assert_eq!(
-                call.poll(),
+                poll_after_core_turn(&mut call),
                 NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
             );
             assert_eq!(
@@ -7896,6 +9135,9 @@ mod tests {
                     panic!("pre-WAIT cancellation unexpectedly requested host transport")
                 }
                 NativeAsyncPoll::Yielded(_) => panic!("WAIT fixture unexpectedly yielded"),
+                NativeAsyncPoll::CleanupPending { trap, .. } => {
+                    panic!("pre-WAIT cancellation entered cleanup: {trap:?}")
+                }
                 NativeAsyncPoll::Trapped(trap) => {
                     panic!("pre-WAIT cancellation callback trapped: {trap:?}")
                 }
@@ -7971,10 +9213,7 @@ mod tests {
                     )),
                     PollResult::Ready(values) => {
                         let before = call.metrics();
-                        assert_eq!(
-                            call.handle_callback_result(values.as_slice()),
-                            NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
-                        );
+                        let pending = call.handle_callback_result(values.as_slice());
                         let after = call.metrics();
                         assert_eq!(
                             before.remaining_work - after.remaining_work,
@@ -7983,6 +9222,10 @@ mod tests {
                         assert_eq!(
                             after.consumed_work - before.consumed_work,
                             CALLBACK_RESULT_WORK
+                        );
+                        assert_eq!(
+                            finish_cleanup_turn(&mut call, pending),
+                            NativeAsyncPoll::Trapped(TrapCode::CanonicalAbi)
                         );
                         break;
                     }
@@ -8003,10 +9246,13 @@ mod tests {
                 let set = call.component.state.resolve_guest_waitable_set(1).unwrap();
                 let task = call.task;
                 if trap {
-                    assert_eq!(
+                    assert!(matches!(
                         call.finish_trap(TrapCode::Validation),
-                        NativeAsyncPoll::Trapped(TrapCode::Validation)
-                    );
+                        NativeAsyncPoll::CleanupPending {
+                            trap: TrapCode::Validation,
+                            ..
+                        }
+                    ));
                 }
                 (task, set)
             };
@@ -8054,13 +9300,15 @@ mod tests {
             Ok(CopyBegin::Ready(_))
         ));
 
+        let pending = call.resume_wait(token).unwrap();
+        let after_failure = call.metrics();
         assert_eq!(
-            call.resume_wait(token),
-            Ok(NativeAsyncPoll::Trapped(TrapCode::Validation))
+            blocked.remaining_work - after_failure.remaining_work,
+            WAIT_STATE_WORK
         );
         assert_eq!(
-            blocked.remaining_work - call.metrics().remaining_work,
-            WAIT_STATE_WORK
+            finish_cleanup_turn(&mut call, pending),
+            NativeAsyncPoll::Trapped(TrapCode::Validation)
         );
         let endpoint = call.component.state.endpoint_info(pair.readable).unwrap();
         assert!(!endpoint.has_pending_event);
@@ -8105,22 +9353,28 @@ mod tests {
         };
         let set = call.component.state.resolve_guest_waitable_set(1).unwrap();
         let task = call.task;
-        call.remaining_work = CALLBACK_RESULT_WORK + WAIT_STATE_WORK;
+        call.remaining_work = call
+            .cleanup_reserve
+            .checked_add(CALLBACK_RESULT_WORK)
+            .and_then(|work| work.checked_add(WAIT_STATE_WORK))
+            .unwrap();
         assert_eq!(
             call.request_cancel(),
             Ok(NativeAsyncCancelOutcome::Requested)
         );
         let before = call.metrics();
-        assert_eq!(
-            call.handle_callback_result(values.as_slice()),
-            NativeAsyncPoll::Trapped(TrapCode::FuelExhausted)
-        );
+        let pending = call.handle_callback_result(values.as_slice());
         let after = call.metrics();
         assert_eq!(
             before.remaining_work - after.remaining_work,
             CALLBACK_RESULT_WORK
         );
-        assert_eq!(after.remaining_work, WAIT_STATE_WORK);
+        assert_eq!(after.remaining_work, call.cleanup_reserve + WAIT_STATE_WORK);
+        assert_eq!(
+            finish_cleanup_turn(&mut call, pending),
+            NativeAsyncPoll::Trapped(TrapCode::FuelExhausted)
+        );
+        assert_eq!(call.metrics().remaining_work, WAIT_STATE_WORK);
         assert_eq!(
             call.component.state.task_info(task).err(),
             Some(AsyncStateError::StaleHandle)
@@ -8140,17 +9394,18 @@ mod tests {
         let (token, _) = poll_to_wait(&mut call);
         let set = call.component.state.resolve_guest_waitable_set(1).unwrap();
         let task = call.task;
-        call.remaining_work = WAIT_STATE_WORK;
+        call.remaining_work = call.cleanup_reserve + WAIT_STATE_WORK;
         assert_eq!(
             call.request_cancel(),
             Ok(NativeAsyncCancelOutcome::Requested)
         );
         let before = call.metrics();
-        assert_eq!(
-            call.resume_wait(token),
-            Ok(NativeAsyncPoll::Trapped(TrapCode::FuelExhausted))
-        );
+        let pending = call.resume_wait(token).unwrap();
         assert_eq!(call.metrics(), before);
+        assert_eq!(
+            finish_cleanup_turn(&mut call, pending),
+            NativeAsyncPoll::Trapped(TrapCode::FuelExhausted)
+        );
         assert_eq!(
             call.component.state.task_info(task).err(),
             Some(AsyncStateError::StaleHandle)
@@ -8187,11 +9442,12 @@ mod tests {
             .unwrap();
         assert_eq!(slots[call.export].state(), CoreCallSlotState::Active);
         let before = call.metrics();
-        assert_eq!(
-            call.resume_wait(token),
-            Ok(NativeAsyncPoll::Trapped(TrapCode::Validation))
-        );
+        let pending = call.resume_wait(token).unwrap();
         assert_eq!(call.metrics(), before);
+        assert_eq!(
+            finish_cleanup_turn(&mut call, pending),
+            NativeAsyncPoll::Trapped(TrapCode::Validation)
+        );
         assert_eq!(
             call.component.callback_slots[call.export].state(),
             CoreCallSlotState::Idle
@@ -8208,11 +9464,12 @@ mod tests {
         let (token, _) = poll_to_wait(&mut call);
         call.wait_token = None;
         let before = call.metrics();
-        assert_eq!(
-            call.resume_wait(token),
-            Ok(NativeAsyncPoll::Trapped(TrapCode::Validation))
-        );
+        let pending = call.resume_wait(token).unwrap();
         assert_eq!(call.metrics(), before);
+        assert_eq!(
+            finish_cleanup_turn(&mut call, pending),
+            NativeAsyncPoll::Trapped(TrapCode::Validation)
+        );
         assert!(call.component.is_poisoned());
         assert_eq!(
             call.component.state.task_info(call.task).err(),
@@ -8230,10 +9487,19 @@ mod tests {
         let mut component = instantiate(&trapping);
         {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
-            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
-            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Resolved(_)
+            ));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Yielded(_)
+            ));
             assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
-            assert!(matches!(call.poll(), NativeAsyncPoll::Trapped(_)));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Trapped(_)
+            ));
             assert_eq!(
                 call.request_cancel(),
                 Ok(NativeAsyncCancelOutcome::AlreadyTerminal)
@@ -8254,8 +9520,14 @@ mod tests {
         let generation = component.callback_slots[0].generation();
         {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
-            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
-            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Resolved(_)
+            ));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Yielded(_)
+            ));
             assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
             assert_eq!(
                 call.component.callback_slots[call.export].state(),
@@ -8277,8 +9549,14 @@ mod tests {
         let mut component = instantiate(&host_calling);
         {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
-            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
-            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Resolved(_)
+            ));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Yielded(_)
+            ));
             assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
             loop {
                 let result = call
@@ -8304,8 +9582,14 @@ mod tests {
         let mut component = instantiate(SMOKE);
         {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
-            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
-            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Resolved(_)
+            ));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Yielded(_)
+            ));
             assert_eq!(
                 call.component.callback_slots[call.export].state(),
                 CoreCallSlotState::Idle
@@ -8321,16 +9605,23 @@ mod tests {
         let mut component = instantiate(SMOKE);
         {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
-            assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
-            assert!(matches!(call.poll(), NativeAsyncPoll::Yielded(_)));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Resolved(_)
+            ));
+            assert!(matches!(
+                poll_after_core_turn(&mut call),
+                NativeAsyncPoll::Yielded(_)
+            ));
             assert!(matches!(call.poll(), NativeAsyncPoll::Pending(_)));
             let callback_instance = call.binding().callback_instance;
             assert_eq!(
                 call.component.modules.poll_call(callback_instance),
                 PollResult::Trapped(TrapCode::Validation)
             );
+            let pending = call.finish_trap(TrapCode::Validation);
             assert_eq!(
-                call.finish_trap(TrapCode::Validation),
+                finish_cleanup_turn(&mut call, pending),
                 NativeAsyncPoll::Trapped(TrapCode::Validation)
             );
             assert_eq!(
@@ -8425,7 +9716,10 @@ mod tests {
             {
                 let mut call = component.start("run", WORK, QUANTUM).unwrap();
                 if after_resolution {
-                    assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
+                    assert!(matches!(
+                        poll_after_core_turn(&mut call),
+                        NativeAsyncPoll::Resolved(_)
+                    ));
                 }
                 let active = call.binding().core_instance;
                 let (origin_instance, id) = if after_resolution {
@@ -8433,15 +9727,16 @@ mod tests {
                 } else {
                     (0, u32::MAX)
                 };
+                let pending = call.handle_host_call(
+                    CallAuthority::Run(active),
+                    CoreHostCall {
+                        origin_instance,
+                        id,
+                        arguments: Vec::new(),
+                    },
+                );
                 assert_eq!(
-                    call.handle_host_call(
-                        CallAuthority::Run(active),
-                        CoreHostCall {
-                            origin_instance,
-                            id,
-                            arguments: Vec::new(),
-                        },
-                    ),
+                    finish_cleanup_turn(&mut call, pending),
                     NativeAsyncPoll::Trapped(TrapCode::Validation)
                 );
                 assert!(!call.component.modules.any_active_call());
@@ -8457,7 +9752,10 @@ mod tests {
             {
                 let mut call = component.start("run", WORK, QUANTUM).unwrap();
                 if resolve_first {
-                    assert!(matches!(call.poll(), NativeAsyncPoll::Resolved(_)));
+                    assert!(matches!(
+                        poll_after_core_turn(&mut call),
+                        NativeAsyncPoll::Resolved(_)
+                    ));
                 }
             }
             assert!(component.is_poisoned());
@@ -8483,7 +9781,7 @@ mod tests {
             callback_body,
         );
 
-        let mut component = instantiate(&source);
+        let mut component = instantiate_with_resource_limit(&source, 8).unwrap();
         let (run_consumed, total_consumed) = {
             let mut call = component.start("run", WORK, QUANTUM).unwrap();
             let mut run_consumed = None;
@@ -8498,6 +9796,9 @@ mod tests {
                     NativeAsyncPoll::HostPending { .. } => {
                         panic!("shared-fuel fixture unexpectedly requested host transport")
                     }
+                    NativeAsyncPoll::CleanupPending { trap, .. } => {
+                        panic!("high-budget call entered cleanup: {trap:?}")
+                    }
                     NativeAsyncPoll::Trapped(trap) => panic!("high-budget call trapped: {trap:?}"),
                 }
             };
@@ -8509,11 +9810,18 @@ mod tests {
 
         let tight = run_consumed.max(callback_consumed);
         assert!(tight < total_consumed);
-        let mut component = instantiate(&source);
+        let mut component = instantiate_with_resource_limit(&source, 8).unwrap();
         let mut call = component.start("run", tight, tight.min(QUANTUM)).unwrap();
         let trap = loop {
             match call.poll() {
                 NativeAsyncPoll::Trapped(trap) => break trap,
+                pending @ NativeAsyncPoll::CleanupPending { .. } => {
+                    let NativeAsyncPoll::Trapped(trap) = finish_cleanup_turn(&mut call, pending)
+                    else {
+                        unreachable!("cleanup helper pins its terminal result")
+                    };
+                    break trap;
+                }
                 NativeAsyncPoll::Complete(_) => {
                     panic!("separate per-Core fuel ledgers would incorrectly complete")
                 }

@@ -2467,11 +2467,13 @@ impl AsyncState {
 }
 
 impl AsyncState {
-    /// Revalidates a local rendezvous ticket and returns its exact progress.
+    /// Revalidates a local rendezvous ticket and returns its exact progress limit.
     ///
     /// The returned minimum is sealed by the pair nonce, both operations, the
-    /// endpoint metadata, and the two still-owned leases. The executor can use
-    /// it to charge and bounds-check a copy before mutating guest memory.
+    /// endpoint metadata, and the two still-owned leases. A stream commit may
+    /// select any non-zero prefix through this limit; a future remains exactly
+    /// one element. The executor can use the limit to charge and bounds-check a
+    /// copy before mutating guest memory.
     pub(crate) fn local_copy_progress(
         &self,
         ticket: &LocalCopyTicket,
@@ -2549,17 +2551,17 @@ impl AsyncState {
         let exact_progress = self
             .local_copy_progress(ticket)
             .map_err(CommitError::State)?;
-        if progress != exact_progress {
-            return Err(CommitError::State(AsyncStateError::ProgressLimit));
-        }
         let event_progress = match self
             .pairs
             .get(ticket.pair)
             .map_err(CommitError::State)?
             .kind
         {
-            EndpointKind::Stream => progress,
-            EndpointKind::Future => 0,
+            EndpointKind::Stream if progress != 0 && progress <= exact_progress => progress,
+            EndpointKind::Future if progress == exact_progress => 0,
+            EndpointKind::Stream | EndpointKind::Future => {
+                return Err(CommitError::State(AsyncStateError::ProgressLimit));
+            }
         };
         self.prepare_event(ticket.read, CopyResult::Completed, event_progress)
             .map_err(CommitError::State)?;
@@ -5276,7 +5278,7 @@ mod tests {
     }
 
     #[test]
-    fn local_stream_commit_and_reclaim_are_two_phase_and_exact() {
+    fn local_stream_commit_selects_one_positive_prefix_for_both_events() {
         let mut state = AsyncState::new(limits()).unwrap();
         let pair = state.create_stream_pair(ty(1)).unwrap();
         let read_op = blocked(
@@ -5302,12 +5304,21 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            state.commit_local_copy(&mut ticket, 4, |_, _, _| Ok::<_, ()>(())),
+            state.commit_local_copy(&mut ticket, 0, |_, _, _| -> Result<(), ()> {
+                panic!("zero progress must be rejected before copy")
+            }),
             Err(CommitError::State(AsyncStateError::ProgressLimit))
         );
         assert_eq!(
-            state.commit_local_copy(&mut ticket, 3, |source, target, progress| {
-                assert_eq!((source.slot(), target.slot(), progress), (2, 1, 3));
+            state.commit_local_copy(&mut ticket, 4, |_, _, _| -> Result<(), ()> {
+                panic!("progress above the exact minimum must be rejected before copy")
+            }),
+            Err(CommitError::State(AsyncStateError::ProgressLimit))
+        );
+        assert_eq!(state.local_copy_progress(&ticket), Ok(3));
+        assert_eq!(
+            state.commit_local_copy(&mut ticket, 2, |source, target, progress| {
+                assert_eq!((source.slot(), target.slot(), progress), (2, 1, 2));
                 Err::<(), _>(7_u8)
             }),
             Err(CommitError::Operation(7))
@@ -5318,8 +5329,8 @@ mod tests {
         );
 
         let write_event = state
-            .commit_local_copy(&mut ticket, 3, |source, target, progress| {
-                assert_eq!((source.elements(), target.elements(), progress), (5, 3, 3));
+            .commit_local_copy(&mut ticket, 2, |source, target, progress| {
+                assert_eq!((source.elements(), target.elements(), progress), (5, 3, 2));
                 Ok::<_, ()>(())
             })
             .unwrap();
@@ -5343,7 +5354,7 @@ mod tests {
             unpack_stream_copy_result(event.p2).unwrap(),
             StreamCopyResult {
                 result: CopyResult::Completed,
-                progress: 3,
+                progress: 2,
             }
         );
         assert_eq!(
@@ -5372,6 +5383,13 @@ mod tests {
         let read_event = read_event.unwrap();
         let event = reclaim_ok(&mut state, &read_event);
         assert_eq!(event.p1, pair.readable.raw());
+        assert_eq!(
+            unpack_stream_copy_result(event.p2).unwrap(),
+            StreamCopyResult {
+                result: CopyResult::Completed,
+                progress: 2,
+            }
+        );
         assert_eq!(
             state.endpoint_info(pair.readable).unwrap().copy_state,
             CopyState::Idle
@@ -5837,6 +5855,20 @@ mod tests {
                 )
                 .unwrap(),
         );
+        assert_eq!(state.local_copy_progress(&ticket), Ok(1));
+        assert_eq!(
+            state.commit_local_copy(&mut ticket, 0, |_, _, _| -> Result<(), ()> {
+                panic!("a future cannot commit zero progress")
+            }),
+            Err(CommitError::State(AsyncStateError::ProgressLimit))
+        );
+        assert_eq!(
+            state.commit_local_copy(&mut ticket, 2, |_, _, _| -> Result<(), ()> {
+                panic!("a future cannot commit more than one element")
+            }),
+            Err(CommitError::State(AsyncStateError::ProgressLimit))
+        );
+        assert_eq!(state.local_copy_progress(&ticket), Ok(1));
         let write_event = state
             .commit_local_copy(&mut ticket, 1, |_, _, n| {
                 assert_eq!(n, 1);

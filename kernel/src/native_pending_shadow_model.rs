@@ -363,9 +363,9 @@ impl ExactCancelClaim {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ExactInvocation<R> {
     generation: u64,
+    input_spill_generation: Option<u64>,
     offered_runtime: R,
     prepared_runtime: Option<R>,
-    last_consumed_runtime: Option<R>,
     resource: ExactStreamResource,
     function: ExactHostFunction,
     request_units: u16,
@@ -426,6 +426,7 @@ enum ExactOperation<R, O, C> {
 pub(crate) enum ExactLedgerPhase {
     Retired,
     Idle,
+    InputSpill,
     RuntimeOffered,
     RuntimePrepared,
     BackendInvoking,
@@ -434,6 +435,32 @@ pub(crate) enum ExactLedgerPhase {
     CancelClaimed,
     BackendCancelled,
     Quarantined,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExactInputSpillState {
+    generation: u64,
+    total: u16,
+    cursor: u16,
+}
+
+/// Linear authority for bytes which have crossed the backend receive point but
+/// have not yet been committed to the guest. The ledger retains the matching
+/// fixed state while its ordinary operation slot remains available for the
+/// opposite stream direction.
+///
+/// This receipt is deliberately neither `Copy` nor `Clone`: each remaining
+/// prefix must consume the preceding authority and receive the exact successor.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ExactInputSpillReceipt<I, T, D, B> {
+    identity: ExactInstanceIdentity<I, T, D, B>,
+    state: ExactInputSpillState,
+}
+
+impl<I: Copy, T: Copy, D: Copy, B: Copy> ExactInputSpillReceipt<I, T, D, B> {
+    pub(crate) const fn remaining(&self) -> u16 {
+        self.state.total - self.state.cursor
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -739,6 +766,7 @@ pub(crate) struct ExactOperationLedger<I, T, D, B, R, O, C> {
     next_claim: u64,
     identity: Option<ExactInstanceIdentity<I, T, D, B>>,
     operation: Option<ExactOperation<R, O, C>>,
+    input_spill: Option<ExactInputSpillState>,
     runtime_watermark: Option<R>,
     resources: [ResourceLatch; 4],
     runtime_owner: RuntimeOwner,
@@ -762,6 +790,7 @@ impl<
             next_claim: 1,
             identity: None,
             operation: None,
+            input_spill: None,
             runtime_watermark: None,
             resources: [ResourceLatch::Live; 4],
             runtime_owner: RuntimeOwner::Live,
@@ -780,11 +809,12 @@ impl<
         if identity.control_generation <= self.watermark {
             return Err(ExactLedgerError::StaleGeneration);
         }
-        if self.identity.is_some() || self.operation.is_some() {
+        if self.identity.is_some() || self.operation.is_some() || self.input_spill.is_some() {
             return self.reject(ExactLedgerError::Busy);
         }
         self.watermark = identity.control_generation;
         self.identity = Some(identity);
+        self.input_spill = None;
         self.runtime_watermark = None;
         self.resources = [ResourceLatch::Live; 4];
         self.runtime_owner = RuntimeOwner::Live;
@@ -799,9 +829,34 @@ impl<
         function: ExactHostFunction,
         request_units: usize,
     ) -> Result<ExactLedgerSnapshot<I, T, D, B, R, O, C>, ExactLedgerError> {
+        self.begin_runtime_inner(
+            identity,
+            offered_runtime,
+            resource,
+            function,
+            request_units,
+            false,
+        )
+    }
+
+    fn begin_runtime_inner(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+        offered_runtime: R,
+        resource: ExactStreamResource,
+        function: ExactHostFunction,
+        request_units: usize,
+        consuming_input_spill: bool,
+    ) -> Result<ExactLedgerSnapshot<I, T, D, B, R, O, C>, ExactLedgerError> {
         self.require_identity(identity)?;
         self.require_runtime_owner_live()?;
         if self.operation.is_some() {
+            return self.reject(ExactLedgerError::Busy);
+        }
+        if self.input_spill.is_some()
+            && ((resource == ExactStreamResource::StdinReader && !consuming_input_spill)
+                || function == ExactHostFunction::InputClosed)
+        {
             return self.reject(ExactLedgerError::Busy);
         }
         if !resource_function_exact(resource, function) {
@@ -830,12 +885,21 @@ impl<
             return self.reject(ExactLedgerError::TokenDidNotRotate);
         }
         let generation = self.take_invocation_generation()?;
+        let input_spill_generation = if consuming_input_spill {
+            Some(
+                self.input_spill
+                    .expect("receipt-consuming input has exact spill state")
+                    .generation,
+            )
+        } else {
+            None
+        };
         let operation = ExactOperation::RuntimeOffered {
             invocation: ExactInvocation {
                 generation,
+                input_spill_generation,
                 offered_runtime,
                 prepared_runtime: None,
-                last_consumed_runtime: None,
                 resource,
                 function,
                 request_units,
@@ -923,12 +987,14 @@ impl<
         self.require_runtime_owner_live()?;
         let (invocation, previous_backend, previous_kind, continuation) = match previous.operation {
             ExactOperation::RuntimePrepared { invocation }
-                if action == ExactBackendAction::Start =>
+                if action == ExactBackendAction::Start
+                    && invocation.input_spill_generation.is_none() =>
             {
                 (invocation, None, None, ExactContinuation::None)
             }
             ExactOperation::RuntimeOffered { invocation }
                 if action == ExactBackendAction::Start
+                    && invocation.input_spill_generation.is_none()
                     && matches!(
                         invocation.function,
                         ExactHostFunction::InputStream | ExactHostFunction::InputClosed
@@ -1378,9 +1444,8 @@ impl<
         Ok(())
     }
 
-    /// Commits a host call which is satisfied entirely from fixed runtime-side
-    /// staging (for example, a remaining input spill) and therefore never
-    /// crossed a backend linearization point.
+    /// Commits a zero-length stream host call which is satisfied entirely by
+    /// the runtime and therefore never crossed a backend linearization point.
     pub(crate) fn commit_runtime_only(
         &mut self,
         previous: ExactLedgerSnapshot<I, T, D, B, R, O, C>,
@@ -1391,6 +1456,7 @@ impl<
             return self.reject(ExactLedgerError::InvalidTransition);
         };
         if invocation.request_units != 0
+            || invocation.input_spill_generation.is_some()
             || !matches!(
                 invocation.function,
                 ExactHostFunction::InputStream | ExactHostFunction::OutputStream
@@ -1502,95 +1568,88 @@ impl<
         &mut self,
         previous: ExactLedgerSnapshot<I, T, D, B, R, O, C>,
         bytes: u16,
-    ) -> Result<Option<ExactLedgerSnapshot<I, T, D, B, R, O, C>>, ExactLedgerError> {
+    ) -> Result<Option<ExactInputSpillReceipt<I, T, D, B>>, ExactLedgerError> {
         self.require_snapshot(previous)?;
         self.require_runtime_owner_live()?;
-        let ExactOperation::BackendLinearized {
-            mut invocation,
-            backend,
-            continuation,
-            effect: BackendEffect::InputReceived { total, cursor },
-        } = previous.operation
-        else {
-            return self.reject(ExactLedgerError::InvalidTransition);
+        let (invocation, state) = match previous.operation {
+            ExactOperation::BackendLinearized {
+                invocation,
+                effect: BackendEffect::InputReceived { total, cursor },
+                ..
+            } => {
+                if self.input_spill.is_some() {
+                    return self.reject(ExactLedgerError::InvalidTransition);
+                }
+                (
+                    invocation,
+                    ExactInputSpillState {
+                        generation: invocation.generation,
+                        total,
+                        cursor,
+                    },
+                )
+            }
+            ExactOperation::RuntimePrepared { invocation }
+                if invocation.resource == ExactStreamResource::StdinReader
+                    && invocation.function == ExactHostFunction::InputStream
+                    && self.input_spill.is_some_and(|state| {
+                        invocation.input_spill_generation == Some(state.generation)
+                    }) =>
+            {
+                let Some(state) = self.input_spill else {
+                    return self.reject(ExactLedgerError::InvalidTransition);
+                };
+                (invocation, state)
+            }
+            _ => return self.reject(ExactLedgerError::InvalidTransition),
         };
-        let Some(next) = cursor.checked_add(bytes) else {
+        let Some(next) = state.cursor.checked_add(bytes) else {
             return self.reject(ExactLedgerError::InvalidEffect);
         };
-        if next > total || bytes > invocation.request_units {
+        if next > state.total || bytes > invocation.request_units {
             return self.reject(ExactLedgerError::InvalidEffect);
         }
-        let Some(consumed_runtime) = invocation.prepared_runtime else {
+        if invocation.prepared_runtime.is_none() {
             return self.reject(ExactLedgerError::InvalidTransition);
-        };
+        }
         self.record_runtime_consumed(invocation)?;
-        if next == total {
-            self.operation = None;
+        self.operation = None;
+        if next == state.total {
+            self.input_spill = None;
             return Ok(None);
         }
-        invocation.last_consumed_runtime = Some(consumed_runtime);
-        invocation.prepared_runtime = None;
-        let operation = ExactOperation::BackendLinearized {
-            invocation,
-            backend,
-            continuation,
-            effect: BackendEffect::InputReceived {
-                total,
-                cursor: next,
-            },
+        let state = ExactInputSpillState {
+            generation: invocation.generation,
+            cursor: next,
+            ..state
         };
-        self.operation = Some(operation);
-        Ok(Some(ExactLedgerSnapshot {
+        self.input_spill = Some(state);
+        Ok(Some(ExactInputSpillReceipt {
             identity: previous.identity,
-            operation,
+            state,
         }))
     }
 
     pub(crate) fn attach_input_runtime(
         &mut self,
-        previous: ExactLedgerSnapshot<I, T, D, B, R, O, C>,
+        receipt: ExactInputSpillReceipt<I, T, D, B>,
         offered_runtime: R,
         request_units: usize,
     ) -> Result<ExactLedgerSnapshot<I, T, D, B, R, O, C>, ExactLedgerError> {
-        self.require_snapshot(previous)?;
-        self.require_runtime_owner_live()?;
-        let ExactOperation::BackendLinearized {
-            invocation,
-            backend,
-            continuation,
-            effect: effect @ BackendEffect::InputReceived { total, cursor },
-        } = previous.operation
-        else {
-            return self.reject(ExactLedgerError::InvalidTransition);
-        };
-        if cursor >= total || invocation.prepared_runtime.is_some() {
-            return self.reject(ExactLedgerError::InvalidTransition);
-        }
-        if request_units > DRIVER_CHUNK_BYTES {
-            return self.reject(ExactLedgerError::InvalidEffect);
-        }
-        if !offered_runtime.strictly_after(invocation.offered_runtime)
-            || self
-                .runtime_watermark
-                .is_some_and(|previous| !offered_runtime.strictly_after(previous))
+        self.require_identity(receipt.identity)?;
+        if self.input_spill != Some(receipt.state)
+            || receipt.state.cursor >= receipt.state.total
+            || self.operation.is_some()
         {
-            return self.reject(ExactLedgerError::TokenDidNotRotate);
+            return self.reject(ExactLedgerError::SnapshotMismatch);
         }
-        let generation = self.take_invocation_generation()?;
-        self.publish(
-            previous.identity,
-            ExactOperation::BackendLinearized {
-                invocation: ExactInvocation {
-                    generation,
-                    offered_runtime,
-                    prepared_runtime: None,
-                    request_units: request_units as u16,
-                    ..invocation
-                },
-                backend,
-                continuation,
-                effect,
-            },
+        self.begin_runtime_inner(
+            receipt.identity,
+            offered_runtime,
+            ExactStreamResource::StdinReader,
+            ExactHostFunction::InputStream,
+            request_units,
+            true,
         )
     }
 
@@ -1600,36 +1659,20 @@ impl<
         prepared_runtime: R,
     ) -> Result<ExactLedgerSnapshot<I, T, D, B, R, O, C>, ExactLedgerError> {
         self.require_snapshot(previous)?;
-        self.require_runtime_owner_live()?;
-        let ExactOperation::BackendLinearized {
-            mut invocation,
-            backend,
-            continuation,
-            effect: effect @ BackendEffect::InputReceived { total, cursor },
-        } = previous.operation
-        else {
-            return self.reject(ExactLedgerError::InvalidTransition);
-        };
-        if cursor >= total || invocation.prepared_runtime.is_some() {
-            return self.reject(ExactLedgerError::InvalidTransition);
-        }
-        if !prepared_runtime.strictly_after(invocation.offered_runtime)
-            || self
-                .runtime_watermark
-                .is_some_and(|previous| !prepared_runtime.strictly_after(previous))
+        if self.input_spill.is_none()
+            || !matches!(
+                previous.operation,
+                ExactOperation::RuntimeOffered { invocation }
+                    if invocation.resource == ExactStreamResource::StdinReader
+                        && invocation.function == ExactHostFunction::InputStream
+                        && self.input_spill.is_some_and(|state| {
+                            invocation.input_spill_generation == Some(state.generation)
+                        })
+            )
         {
-            return self.reject(ExactLedgerError::TokenDidNotRotate);
+            return self.reject(ExactLedgerError::InvalidTransition);
         }
-        invocation.prepared_runtime = Some(prepared_runtime);
-        self.publish(
-            previous.identity,
-            ExactOperation::BackendLinearized {
-                invocation,
-                backend,
-                continuation,
-                effect,
-            },
-        )
+        self.prepare_runtime(previous, prepared_runtime)
     }
 
     pub(crate) fn claim_revoke(
@@ -1639,6 +1682,9 @@ impl<
     ) -> Result<ExactRevokeDecision<I, T, D, B, R, O, C>, ExactLedgerError> {
         self.require_identity(identity)?;
         if !resource.revocable_endpoint() {
+            return self.reject(ExactLedgerError::InvalidTransition);
+        }
+        if resource == ExactStreamResource::StdinReader && self.input_spill.is_some() {
             return self.reject(ExactLedgerError::InvalidTransition);
         }
         match self.resources[resource.index()] {
@@ -2072,6 +2118,7 @@ impl<
         ) {
             return self.reject(ExactLedgerError::InvalidTransition);
         }
+        self.input_spill = None;
         self.runtime_owner = RuntimeOwner::Dropped;
         Ok(())
     }
@@ -2089,7 +2136,7 @@ impl<
         identity: ExactInstanceIdentity<I, T, D, B>,
     ) -> Result<(), ExactLedgerError> {
         self.require_identity(identity)?;
-        if self.operation.is_some() {
+        if self.operation.is_some() || self.input_spill.is_some() {
             return self.reject(ExactLedgerError::Busy);
         }
         if self.has_revoking_resource() {
@@ -2110,6 +2157,7 @@ impl<
             return ExactLedgerPhase::Retired;
         }
         match self.operation {
+            None if self.input_spill.is_some() => ExactLedgerPhase::InputSpill,
             None => ExactLedgerPhase::Idle,
             Some(operation) => ExactLedgerSnapshot {
                 identity: self.identity.expect("live ledger identity"),
@@ -2130,6 +2178,22 @@ impl<
             ResourceLatch::Revoking(_) => ExactResourceState::Revoking,
             ResourceLatch::Revoked(_) => ExactResourceState::Revoked,
         })
+    }
+
+    pub(crate) fn terminal_empty(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<bool, ExactLedgerError> {
+        self.require_identity(identity)?;
+        Ok(self.operation.is_none() && self.input_spill.is_none())
+    }
+
+    pub(crate) fn input_spill_remaining(
+        &mut self,
+        identity: ExactInstanceIdentity<I, T, D, B>,
+    ) -> Result<Option<u16>, ExactLedgerError> {
+        self.require_identity(identity)?;
+        Ok(self.input_spill.map(|state| state.total - state.cursor))
     }
 
     pub(crate) const fn is_quarantined(&self) -> bool {
@@ -2181,6 +2245,16 @@ impl<
             return Ok(ExactCleanupDecision::Quarantined);
         }
         let Some(operation) = self.operation else {
+            if self.input_spill.is_some() {
+                if success
+                    || (cause != ExactCancelCause::RawFault
+                        && self.runtime_owner != RuntimeOwner::Dropped)
+                {
+                    self.quarantined = true;
+                    return Ok(ExactCleanupDecision::Quarantined);
+                }
+                self.input_spill = None;
+            }
             return Ok(ExactCleanupDecision::ReclaimSafe);
         };
         match operation {
@@ -2192,6 +2266,7 @@ impl<
             {
                 self.record_runtime_consumed(invocation)?;
                 self.operation = None;
+                self.input_spill = None;
                 Ok(ExactCleanupDecision::ReclaimSafe)
             }
             ExactOperation::BackendCancelled {
@@ -2213,6 +2288,7 @@ impl<
             {
                 self.record_runtime_consumed(invocation)?;
                 self.operation = None;
+                self.input_spill = None;
                 Ok(ExactCleanupDecision::ReclaimSafe)
             }
             ExactOperation::BackendCancelled {
@@ -2243,6 +2319,7 @@ impl<
             {
                 self.record_runtime_consumed(invocation)?;
                 self.operation = None;
+                self.input_spill = None;
                 Ok(ExactCleanupDecision::ReclaimSafe)
             }
             ExactOperation::BackendPending {
@@ -2487,6 +2564,7 @@ mod tests {
 
     type TestLedger = ExactOperationLedger<u64, u64, u64, u64, u64, u64, u64>;
     type TestSnapshot = ExactLedgerSnapshot<u64, u64, u64, u64, u64, u64, u64>;
+    type TestInputSpillReceipt = ExactInputSpillReceipt<u64, u64, u64, u64>;
 
     impl ExactRuntimeToken for u64 {
         fn strictly_after(self, previous: Self) -> bool {
@@ -2589,6 +2667,35 @@ mod tests {
         }
     }
 
+    fn input_spill_receipt(
+        ledger: &mut TestLedger,
+        identity: ExactInstanceIdentity<u64, u64, u64, u64>,
+        runtime: u64,
+        backend: u64,
+        total: u16,
+        prefix: u16,
+    ) -> TestInputSpillReceipt {
+        let pending = pending_operation(
+            ledger,
+            identity,
+            runtime,
+            backend,
+            ExactStreamResource::StdinReader,
+            ExactHostFunction::InputStream,
+            usize::from(prefix),
+        );
+        let invoking = ledger
+            .begin_backend(pending, ExactBackendAction::CommitPrepared)
+            .unwrap();
+        let received = ledger
+            .backend_linearized(invoking, BackendEffect::InputReceived { total, cursor: 0 })
+            .unwrap();
+        ledger
+            .commit_input_prefix(received, prefix)
+            .unwrap()
+            .expect("test spill must retain a nonempty suffix")
+    }
+
     #[test]
     fn exact_ledger_preserves_every_linearization_phase_until_runtime_commit() {
         let mut ledger = TestLedger::new();
@@ -2639,7 +2746,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_input_effect_survives_multiple_runtime_tokens() {
+    fn input_spill_receipt_allows_interleaved_output_and_exact_prefixes() {
         let mut ledger = TestLedger::new();
         let identity = exact_identity(2);
         ledger.bind(identity).unwrap();
@@ -2648,6 +2755,90 @@ mod tests {
             identity,
             40,
             50,
+            ExactStreamResource::StdinReader,
+            ExactHostFunction::InputStream,
+            99,
+        );
+        let invoking = ledger
+            .begin_backend(pending, ExactBackendAction::CommitPrepared)
+            .unwrap();
+        let linearized = ledger
+            .backend_linearized(
+                invoking,
+                BackendEffect::InputReceived {
+                    total: 257,
+                    cursor: 0,
+                },
+            )
+            .unwrap();
+        let first = ledger
+            .commit_input_prefix(linearized, 99)
+            .unwrap()
+            .expect("158 backend bytes remain irreversible");
+        assert_eq!(first.remaining(), 158);
+        assert_eq!(ledger.phase(), ExactLedgerPhase::InputSpill);
+
+        let output = prepared_operation(
+            &mut ledger,
+            identity,
+            60,
+            61,
+            ExactStreamResource::StdoutWriter,
+            ExactHostFunction::OutputStream,
+            3,
+        );
+        let invoking = ledger
+            .begin_backend(output, ExactBackendAction::Start)
+            .unwrap();
+        let sent = ledger
+            .backend_linearized(invoking, BackendEffect::OutputSent { length: 3 })
+            .unwrap();
+        ledger.commit_runtime(sent).unwrap();
+        assert_eq!(ledger.phase(), ExactLedgerPhase::InputSpill);
+
+        let attached = ledger.attach_input_runtime(first, 70, 99).unwrap();
+        let prepared = ledger.prepare_input_runtime(attached, 71).unwrap();
+        let second = ledger
+            .commit_input_prefix(prepared, 99)
+            .unwrap()
+            .expect("59 backend bytes remain irreversible");
+        assert_eq!(second.remaining(), 59);
+
+        let output = prepared_operation(
+            &mut ledger,
+            identity,
+            80,
+            81,
+            ExactStreamResource::StdoutWriter,
+            ExactHostFunction::OutputStream,
+            2,
+        );
+        let invoking = ledger
+            .begin_backend(output, ExactBackendAction::Start)
+            .unwrap();
+        let sent = ledger
+            .backend_linearized(invoking, BackendEffect::OutputSent { length: 2 })
+            .unwrap();
+        ledger.commit_runtime(sent).unwrap();
+        assert_eq!(ledger.phase(), ExactLedgerPhase::InputSpill);
+
+        let attached = ledger.attach_input_runtime(second, 90, 99).unwrap();
+        let prepared = ledger.prepare_input_runtime(attached, 91).unwrap();
+        assert_eq!(ledger.commit_input_prefix(prepared, 59).unwrap(), None);
+        assert_eq!(ledger.phase(), ExactLedgerPhase::Idle);
+        assert_eq!(ledger.terminal_empty(identity), Ok(true));
+    }
+
+    #[test]
+    fn zero_length_prefix_rotates_the_spill_receipt_generation() {
+        let mut ledger = TestLedger::new();
+        let identity = exact_identity(3);
+        ledger.bind(identity).unwrap();
+        let pending = pending_operation(
+            &mut ledger,
+            identity,
+            100,
+            110,
             ExactStreamResource::StdinReader,
             ExactHostFunction::InputStream,
             10,
@@ -2664,29 +2855,31 @@ mod tests {
                 },
             )
             .unwrap();
-        let zero = ledger
+        let first = ledger
             .commit_input_prefix(linearized, 0)
             .unwrap()
-            .expect("a zero-length guest event cannot consume backend spill");
-        assert_eq!(
-            zero.effect(),
-            Some(BackendEffect::InputReceived {
-                total: 10,
-                cursor: 0
-            })
-        );
-        assert_eq!(zero.prepared_runtime(), None);
-        let attached = ledger.attach_input_runtime(zero, 60, 4).unwrap();
-        let prepared = ledger.prepare_input_runtime(attached, 61).unwrap();
-        assert_eq!(prepared.prepared_runtime(), Some(61));
-        let partial = ledger
-            .commit_input_prefix(prepared, 4)
+            .expect("the full spill remains");
+        let first_generation = first.state.generation;
+        let stale_state = first.state;
+        let attached = ledger.attach_input_runtime(first, 120, 0).unwrap();
+        let prepared = ledger.prepare_input_runtime(attached, 121).unwrap();
+        let second = ledger
+            .commit_input_prefix(prepared, 0)
             .unwrap()
-            .expect("six backend bytes remain irreversible");
-        let attached = ledger.attach_input_runtime(partial, 70, 6).unwrap();
-        let prepared = ledger.prepare_input_runtime(attached, 71).unwrap();
-        assert_eq!(ledger.commit_input_prefix(prepared, 6).unwrap(), None);
-        assert_eq!(ledger.phase(), ExactLedgerPhase::Idle);
+            .expect("the full spill still remains");
+        assert_eq!(second.remaining(), 10);
+        assert!(second.state.generation > first_generation);
+        assert_eq!(ledger.phase(), ExactLedgerPhase::InputSpill);
+        let stale = ExactInputSpillReceipt {
+            identity,
+            state: stale_state,
+        };
+        assert_eq!(
+            ledger.attach_input_runtime(stale, 130, 0),
+            Err(ExactLedgerError::SnapshotMismatch)
+        );
+        drop(second);
+        assert!(ledger.is_quarantined());
     }
 
     #[test]
@@ -3486,7 +3679,7 @@ mod tests {
     fn partial_input_requires_a_fresh_prepared_runtime_for_every_prefix() {
         fn linearized(
             identity: ExactInstanceIdentity<u64, u64, u64, u64>,
-        ) -> (TestLedger, TestSnapshot) {
+        ) -> (TestLedger, TestInputSpillReceipt) {
             let mut ledger = TestLedger::new();
             ledger.bind(identity).unwrap();
             let pending = pending_operation(
@@ -3516,8 +3709,11 @@ mod tests {
 
         let identity = exact_identity(20);
         let (mut missing_prepare, partial) = linearized(identity);
+        let attached = missing_prepare
+            .attach_input_runtime(partial, 620, 5)
+            .unwrap();
         assert_eq!(
-            missing_prepare.commit_input_prefix(partial, 1),
+            missing_prepare.commit_input_prefix(attached, 1),
             Err(ExactLedgerError::InvalidTransition)
         );
 
@@ -4153,13 +4349,8 @@ mod tests {
             .commit_input_prefix(received, 4)
             .unwrap()
             .expect("the backend batch must retain its 1020-byte spill");
-        assert_eq!(
-            residual.effect(),
-            Some(BackendEffect::InputReceived {
-                total: DRIVER_CHUNK_BYTES as u16,
-                cursor: 4,
-            })
-        );
+        assert_eq!(residual.remaining(), (DRIVER_CHUNK_BYTES - 4) as u16);
+        assert_eq!(input_batch.phase(), ExactLedgerPhase::InputSpill);
 
         let mut input_overflow = TestLedger::new();
         input_overflow.bind(identity).unwrap();
@@ -4240,7 +4431,7 @@ mod tests {
     fn every_attached_input_runtime_rebinds_its_request_units() {
         fn residual(
             identity: ExactInstanceIdentity<u64, u64, u64, u64>,
-        ) -> (TestLedger, TestSnapshot) {
+        ) -> (TestLedger, TestInputSpillReceipt) {
             let mut ledger = TestLedger::new();
             ledger.bind(identity).unwrap();
             let pending = pending_operation(
@@ -4756,5 +4947,185 @@ mod tests {
             .unwrap();
         ledger.commit_runtime(sent).unwrap();
         assert_eq!(ledger.phase(), ExactLedgerPhase::Idle);
+    }
+
+    #[test]
+    fn spill_blocks_success_and_retirement_but_owner_drop_discards_it_exactly() {
+        let identity = exact_identity(55);
+        let mut success = TestLedger::new();
+        success.bind(identity).unwrap();
+        let receipt = input_spill_receipt(&mut success, identity, 1_300, 1_310, 257, 99);
+        assert_eq!(receipt.remaining(), 158);
+        assert_eq!(success.terminal_empty(identity), Ok(false));
+        assert_eq!(
+            success.prepare_finalizer(identity, true),
+            Ok(ExactCleanupDecision::Quarantined)
+        );
+        assert_eq!(
+            success.input_spill.map(|state| state.total - state.cursor),
+            Some(158)
+        );
+
+        let mut retire = TestLedger::new();
+        retire.bind(identity).unwrap();
+        let _receipt = input_spill_receipt(&mut retire, identity, 1_320, 1_330, 257, 99);
+        assert_eq!(retire.retire(identity), Err(ExactLedgerError::Busy));
+        assert_eq!(
+            retire.input_spill.map(|state| state.total - state.cursor),
+            Some(158)
+        );
+
+        let mut dropped = TestLedger::new();
+        dropped.bind(identity).unwrap();
+        let receipt = input_spill_receipt(&mut dropped, identity, 1_340, 1_350, 257, 99);
+        drop(receipt);
+        dropped.acknowledge_runtime_owner_drop(identity).unwrap();
+        assert_eq!(dropped.terminal_empty(identity), Ok(true));
+        assert_eq!(
+            dropped.prepare_finalizer(identity, false),
+            Ok(ExactCleanupDecision::ReclaimSafe)
+        );
+        dropped.retire(identity).unwrap();
+        assert_eq!(dropped.phase(), ExactLedgerPhase::Retired);
+    }
+
+    #[test]
+    fn stdout_revoke_preserves_exact_spill_until_payload_owner_drop() {
+        let identity = exact_identity(56);
+        let mut ledger = TestLedger::new();
+        ledger.bind(identity).unwrap();
+        let receipt = input_spill_receipt(&mut ledger, identity, 1_400, 1_410, 767, 594);
+        assert_eq!(receipt.remaining(), 173);
+        let _pending = pending_operation(
+            &mut ledger,
+            identity,
+            1_420,
+            1_430,
+            ExactStreamResource::StdoutWriter,
+            ExactHostFunction::OutputStream,
+            1,
+        );
+        let plan = match ledger
+            .claim_revoke(identity, ExactStreamResource::StdoutWriter)
+            .unwrap()
+        {
+            ExactRevokeDecision::Cancel(plan) => plan,
+            other => panic!("pending stdout revoke expected, got {other:?}"),
+        };
+        let cap = plan.resource_revoke_plan();
+        ledger.finish_cap_revoke(cap).unwrap();
+        let cancelled = ledger.finish_cancel(plan).unwrap();
+        let cancelled = ledger
+            .acknowledge_runtime_cleanup(cancelled, ExactRuntimeCleanup::Cancelled)
+            .unwrap();
+        ledger.consume_cancelled(cancelled).unwrap();
+        assert_eq!(ledger.phase(), ExactLedgerPhase::InputSpill);
+        assert_eq!(ledger.input_spill_remaining(identity), Ok(Some(173)));
+
+        drop(receipt);
+        ledger.acknowledge_runtime_owner_drop(identity).unwrap();
+        assert_eq!(ledger.input_spill_remaining(identity), Ok(None));
+        assert_eq!(
+            ledger.prepare_finalizer(identity, false),
+            Ok(ExactCleanupDecision::ReclaimSafe)
+        );
+        ledger.retire(identity).unwrap();
+    }
+
+    #[test]
+    fn spill_overtake_and_fault_paths_preserve_or_discard_only_exactly() {
+        let identity = exact_identity(57);
+
+        let mut close = TestLedger::new();
+        close.bind(identity).unwrap();
+        let _receipt = input_spill_receipt(&mut close, identity, 1_500, 1_510, 257, 99);
+        assert_eq!(
+            close.begin_runtime(
+                identity,
+                1_520,
+                ExactStreamResource::StdinSupervisor,
+                ExactHostFunction::InputClosed,
+                0,
+            ),
+            Err(ExactLedgerError::Busy)
+        );
+        assert_eq!(
+            close.input_spill.map(|state| state.total - state.cursor),
+            Some(158)
+        );
+
+        let mut backend = TestLedger::new();
+        backend.bind(identity).unwrap();
+        let receipt = input_spill_receipt(&mut backend, identity, 1_530, 1_540, 257, 99);
+        let offered = backend.attach_input_runtime(receipt, 1_550, 99).unwrap();
+        let prepared = backend.prepare_input_runtime(offered, 1_551).unwrap();
+        assert_eq!(
+            backend.begin_backend(prepared, ExactBackendAction::Start),
+            Err(ExactLedgerError::InvalidTransition)
+        );
+        assert_eq!(
+            backend.input_spill.map(|state| state.total - state.cursor),
+            Some(158)
+        );
+
+        let mut revoke = TestLedger::new();
+        revoke.bind(identity).unwrap();
+        let _receipt = input_spill_receipt(&mut revoke, identity, 1_560, 1_570, 257, 99);
+        let _output = prepared_operation(
+            &mut revoke,
+            identity,
+            1_580,
+            1_581,
+            ExactStreamResource::StdoutWriter,
+            ExactHostFunction::OutputStream,
+            1,
+        );
+        assert_eq!(
+            revoke.claim_revoke(identity, ExactStreamResource::StdinReader),
+            Err(ExactLedgerError::InvalidTransition)
+        );
+        assert_eq!(
+            revoke.input_spill.map(|state| state.total - state.cursor),
+            Some(158)
+        );
+
+        let mut reclaim = TestLedger::new();
+        reclaim.bind(identity).unwrap();
+        let receipt = input_spill_receipt(&mut reclaim, identity, 1_590, 1_600, 257, 99);
+        drop(receipt);
+        assert_eq!(
+            reclaim.raw_fault(identity),
+            Ok(ExactCleanupDecision::ReclaimSafe)
+        );
+        assert_eq!(reclaim.input_spill_remaining(identity), Ok(None));
+
+        let mut ambiguous = TestLedger::new();
+        ambiguous.bind(identity).unwrap();
+        let _receipt = input_spill_receipt(&mut ambiguous, identity, 1_610, 1_620, 257, 99);
+        let output = prepared_operation(
+            &mut ambiguous,
+            identity,
+            1_630,
+            1_631,
+            ExactStreamResource::StdoutWriter,
+            ExactHostFunction::OutputStream,
+            1,
+        );
+        let invoking = ambiguous
+            .begin_backend(output, ExactBackendAction::Start)
+            .unwrap();
+        let _linearized = ambiguous
+            .backend_linearized(invoking, BackendEffect::OutputSent { length: 1 })
+            .unwrap();
+        assert_eq!(
+            ambiguous.raw_fault(identity),
+            Ok(ExactCleanupDecision::Quarantined)
+        );
+        assert_eq!(
+            ambiguous
+                .input_spill
+                .map(|state| state.total - state.cursor),
+            Some(158)
+        );
     }
 }

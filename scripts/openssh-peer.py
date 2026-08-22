@@ -41,7 +41,21 @@ NATIVE_CASE_FILTER_INPUT = bytes(
 )
 NATIVE_CASE_FILTER_OUTPUT = bytes(byte ^ 0x20 for byte in NATIVE_CASE_FILTER_INPUT)
 NATIVE_REVOKE_FIXTURE_BYTES = 13 * 1024 + 73
-NATIVE_REVOKE_HEALTHY_OUTPUT_BYTES = 257 + 767 + 6 * 1024
+NATIVE_REVOKE_BACKEND_STDIN_FIRST_BYTES = 257
+NATIVE_REVOKE_BACKEND_STDIN_SECOND_BYTES = 767
+NATIVE_REVOKE_REPLACEMENT_BYTES = (
+    NATIVE_REVOKE_BACKEND_STDIN_FIRST_BYTES + NATIVE_REVOKE_BACKEND_STDIN_SECOND_BYTES
+)
+NATIVE_REVOKE_CANONICAL_SLICE_BYTES = 99
+NATIVE_REVOKE_FIRST_BACKEND_TAIL_BYTES = (
+    NATIVE_REVOKE_BACKEND_STDIN_FIRST_BYTES - 2 * NATIVE_REVOKE_CANONICAL_SLICE_BYTES
+)
+NATIVE_REVOKE_HEALTHY_SENT_PREFIXES = 8
+NATIVE_REVOKE_HEALTHY_OUTPUT_BYTES = (
+    NATIVE_REVOKE_BACKEND_STDIN_FIRST_BYTES
+    + (NATIVE_REVOKE_HEALTHY_SENT_PREFIXES - 3)
+    * NATIVE_REVOKE_CANONICAL_SLICE_BYTES
+)
 NATIVE_REVOKE_MAGICS = {
     "healthy": b"VIBE-C54-HEALTHY\n",
     "linearized": b"VIBE-C54-LINEARIZED\n",
@@ -66,6 +80,12 @@ NATIVE_REVOKE_HEALTHY_OUTPUT = bytes(
     byte ^ 0x20
     for byte in NATIVE_REVOKE_INPUTS["healthy"][:NATIVE_REVOKE_HEALTHY_OUTPUT_BYTES]
 )
+NATIVE_REVOKE_REPLACEMENT_INPUT = NATIVE_CASE_FILTER_INPUT[
+    :NATIVE_REVOKE_REPLACEMENT_BYTES
+]
+NATIVE_REVOKE_REPLACEMENT_OUTPUT = NATIVE_CASE_FILTER_OUTPUT[
+    :NATIVE_REVOKE_REPLACEMENT_BYTES
+]
 INTERACTIVE_INPUT = b"discard\x03echo vibeos-vsh-interactivX\x7fe\r\x04"
 INTERACTIVE_OUTPUT = (
     b"vsh> discard^C\r\n"
@@ -216,7 +236,17 @@ def run_ssh(
             timeout=command_timeout,
         )
     except subprocess.TimeoutExpired as error:
-        raise PeerError(f"{label} timed out after {command_timeout:.1f}s") from error
+        stdout = error.stdout or b""
+        stderr = error.stderr or b""
+        if stdout:
+            raise PeerError(
+                f"{label} timed out after {command_timeout:.1f}s with "
+                f"stdout={stdout!r}; stderr tail={stderr[-800:]!r}"
+            ) from error
+        raise PeerError(
+            f"{label} timed out after {command_timeout:.1f}s without stdout; "
+            f"stderr tail={stderr[-800:]!r}"
+        ) from error
 
 
 def _display_failure(label: str, result: subprocess.CompletedProcess[bytes]) -> str:
@@ -435,13 +465,13 @@ def run_acceptance(
             accepted_key,
             ["-T"],
             ["native-case-filter"],
-            input_bytes=NATIVE_CASE_FILTER_INPUT,
+            input_bytes=NATIVE_REVOKE_REPLACEMENT_INPUT,
         )
         require_result(
             "authorized native revoke replacement",
             native_replacement,
             {0},
-            NATIVE_CASE_FILTER_OUTPUT,
+            NATIVE_REVOKE_REPLACEMENT_OUTPUT,
             stderr_exact=b"",
         )
     elif native_case_filter_enabled:
@@ -537,7 +567,8 @@ def run_acceptance(
                 input_bytes=NATIVE_REVOKE_INPUTS[native_revoke_scenario],
             )
         except PeerError as error:
-            if " timed out after " not in str(error):
+            message = str(error)
+            if " timed out after " not in message or " without stdout; " not in message:
                 raise
         else:
             if guard.returncode == 0 or guard.stdout:
@@ -590,6 +621,25 @@ def selftest() -> None:
         for byte in NATIVE_REVOKE_INPUTS["healthy"][:NATIVE_REVOKE_HEALTHY_OUTPUT_BYTES]
     ):
         raise PeerError("native revoke healthy XOR prefix changed")
+    if (
+        NATIVE_REVOKE_BACKEND_STDIN_FIRST_BYTES,
+        NATIVE_REVOKE_BACKEND_STDIN_SECOND_BYTES,
+    ) != (257, 767):
+        raise PeerError("native revoke backend stdin chunks changed")
+    if (
+        NATIVE_REVOKE_CANONICAL_SLICE_BYTES != 99
+        or NATIVE_REVOKE_FIRST_BACKEND_TAIL_BYTES != 59
+        or NATIVE_REVOKE_HEALTHY_SENT_PREFIXES != 8
+        or NATIVE_REVOKE_HEALTHY_OUTPUT_BYTES != 752
+    ):
+        raise PeerError("native revoke canonical output prefix changed")
+    if (
+        NATIVE_REVOKE_REPLACEMENT_BYTES != 1024
+        or len(NATIVE_REVOKE_REPLACEMENT_INPUT) != NATIVE_REVOKE_REPLACEMENT_BYTES
+        or NATIVE_REVOKE_REPLACEMENT_OUTPUT
+        != bytes(byte ^ 0x20 for byte in NATIVE_REVOKE_REPLACEMENT_INPUT)
+    ):
+        raise PeerError("native revoke replacement fixture changed")
     command = _base_ssh_command(
         "ssh",
         "localhost",

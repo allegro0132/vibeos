@@ -944,7 +944,31 @@ struct PendingComponentOutput {
 #[cfg(feature = "native-revoke-target-acceptance")]
 const COMPONENT_STDOUT_PENDING_BYTES: usize = MAX_STREAM_CHUNK_BYTES * STREAM_BUFFER_CHUNKS;
 #[cfg(feature = "native-revoke-target-acceptance")]
-const NATIVE_REVOKE_PREFETCH_BYTES: usize = 7 * MAX_STREAM_CHUNK_BYTES;
+const NATIVE_REVOKE_CANONICAL_SLICE_BYTES: usize = 99;
+#[cfg(feature = "native-revoke-target-acceptance")]
+const NATIVE_REVOKE_FIRST_BACKEND_TAIL_BYTES: usize = 59;
+#[cfg(feature = "native-revoke-target-acceptance")]
+const NATIVE_REVOKE_PREFETCH_CHUNK_LENGTHS: [usize; STREAM_BUFFER_CHUNKS] = [
+    NATIVE_REVOKE_CANONICAL_SLICE_BYTES,
+    NATIVE_REVOKE_CANONICAL_SLICE_BYTES,
+    NATIVE_REVOKE_FIRST_BACKEND_TAIL_BYTES,
+    NATIVE_REVOKE_CANONICAL_SLICE_BYTES,
+    NATIVE_REVOKE_CANONICAL_SLICE_BYTES,
+    NATIVE_REVOKE_CANONICAL_SLICE_BYTES,
+    NATIVE_REVOKE_CANONICAL_SLICE_BYTES,
+    NATIVE_REVOKE_CANONICAL_SLICE_BYTES,
+];
+#[cfg(feature = "native-revoke-target-acceptance")]
+const NATIVE_REVOKE_PREFETCH_BYTES: usize = 752;
+#[cfg(feature = "native-revoke-target-acceptance")]
+const _: () = {
+    assert!(STREAM_BUFFER_CHUNKS == 8);
+    assert!(NATIVE_REVOKE_PREFETCH_CHUNK_LENGTHS.len() == STREAM_BUFFER_CHUNKS);
+    assert!(
+        7 * NATIVE_REVOKE_CANONICAL_SLICE_BYTES + NATIVE_REVOKE_FIRST_BACKEND_TAIL_BYTES
+            == NATIVE_REVOKE_PREFETCH_BYTES
+    );
+};
 #[cfg(not(feature = "native-revoke-target-acceptance"))]
 const COMPONENT_STDOUT_PENDING_BYTES: usize = MAX_STREAM_CHUNK_BYTES;
 
@@ -1187,7 +1211,7 @@ impl ComponentStreamPump {
             offset: 0,
         };
         let mut chunks = 0usize;
-        for _ in 0..STREAM_BUFFER_CHUNKS {
+        for expected_length in NATIVE_REVOKE_PREFETCH_CHUNK_LENGTHS {
             let dispatch = match self.stdout_waiting.take() {
                 Some(operation) => self
                     .stdout
@@ -1208,8 +1232,7 @@ impl ComponentStreamPump {
                 break;
             };
             let length = prepared.length();
-            if length == 0
-                || length > MAX_STREAM_CHUNK_BYTES
+            if length != expected_length
                 || pending.length.saturating_add(length) > pending.bytes.len()
             {
                 let _ = self.stdout.cancel(prepared.operation());
@@ -4781,10 +4804,9 @@ mod tests {
         let stdout_supervisor = stdout_stream.supervisor();
         let mut pump =
             ComponentStreamPump::from_endpoints(stdin_stream.writer(), stdout_stream.reader());
-        let lengths = [257, 767, 1024, 1024, 1024, 1024, 1024, 1024];
         let mut expected = [0u8; NATIVE_REVOKE_PREFETCH_BYTES];
         let mut expected_bytes = 0usize;
-        for (index, length) in lengths.into_iter().enumerate() {
+        for (index, length) in NATIVE_REVOKE_PREFETCH_CHUNK_LENGTHS.into_iter().enumerate() {
             let chunk = [0x40 | index as u8; MAX_STREAM_CHUNK_BYTES];
             assert_eq!(
                 component_output.start(&chunk[..length]),
@@ -4795,7 +4817,7 @@ mod tests {
         }
         assert_eq!(expected_bytes, NATIVE_REVOKE_PREFETCH_BYTES);
         let StreamSendDispatch::Waiting(ninth) = component_output
-            .start(&[0xfe; MAX_STREAM_CHUNK_BYTES])
+            .start(&[0xfe; NATIVE_REVOKE_CANONICAL_SLICE_BYTES])
             .unwrap()
         else {
             panic!("native revoke fixture did not retain its ninth writer")
@@ -4813,8 +4835,8 @@ mod tests {
             StreamCloseOutcome::Published
         );
 
-        assert!(!pump.consume_stdout(2_000).unwrap());
-        assert_eq!(pump.pending_stdout(), &expected[2_000..]);
+        assert!(!pump.consume_stdout(200).unwrap());
+        assert_eq!(pump.pending_stdout(), &expected[200..]);
         let remaining = pump.pending_stdout().len();
         assert!(pump.consume_stdout(remaining).unwrap());
         assert!(pump.poll_stdout_target().unwrap());

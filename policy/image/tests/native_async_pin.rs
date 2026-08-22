@@ -64,6 +64,7 @@ fn exact_world(pin: NativeAsyncAcceptancePin) -> WorldContract {
 fn pinned_native_async_candidate_admits_only_through_the_isolated_path() {
     let pin = C53_NATIVE_ASYNC_QEMU_ACCEPTANCE;
     assert_eq!(pin.limits().resources, 8);
+    assert_eq!(pin.limits().poll_quantum, 100);
     let artifact = ComponentArtifact::copy_from(pin.artifact_bytes(), pin.profile()).unwrap();
     let identity = artifact.identity();
     assert_eq!(identity.as_bytes(), &pin.expected_sha256());
@@ -161,18 +162,54 @@ fn prepared_host_token(
     }
 }
 
+fn assert_bounded_invocation_api<T>(
+    invocation: &mut NativeAsyncInvocation<'_>,
+    poll_quantum: u64,
+    operation: &'static str,
+    invoke: impl FnOnce(&mut NativeAsyncInvocation<'_>) -> T,
+) -> T {
+    let before = invocation.metrics();
+    let result = invoke(invocation);
+    let after = invocation.metrics();
+    let consumed = after
+        .consumed_work
+        .checked_sub(before.consumed_work)
+        .unwrap_or_else(|| panic!("{operation} moved consumed work backward"));
+    let remaining = before
+        .remaining_work
+        .checked_sub(after.remaining_work)
+        .unwrap_or_else(|| panic!("{operation} increased remaining work"));
+    assert_eq!(consumed, remaining, "{operation} split the work ledger");
+    assert!(
+        consumed <= poll_quantum,
+        "{operation} spent {consumed} work in one public turn with quantum {poll_quantum}"
+    );
+    result
+}
+
 fn assert_stable_host_pending(
     invocation: &mut NativeAsyncInvocation<'_>,
+    poll_quantum: u64,
     expected_token: NativeAsyncHostToken,
     expected_request: NativeAsyncHostRequest,
 ) {
-    match invocation.poll() {
+    match assert_bounded_invocation_api(invocation, poll_quantum, "poll HostPending", |call| {
+        call.poll()
+    }) {
         NativeAsyncPoll::HostPending { token, request, .. } => {
             assert_eq!(token, expected_token);
             assert_eq!(request, expected_request);
         }
         other => panic!("delayed host operation changed without a driver action: {other:?}"),
     }
+}
+
+fn expected_stream_maximum(limits: ComponentInstanceLimits) -> u32 {
+    assert_eq!(limits.resources, 8);
+    assert_eq!(limits.poll_quantum, 100);
+    let maximum = u32::try_from(limits.poll_quantum.checked_sub(1).unwrap()).unwrap();
+    assert_eq!(maximum, 99);
+    maximum
 }
 
 fn drive_runtime_filter(
@@ -183,6 +220,7 @@ fn drive_runtime_filter(
     assert!(close_reason < 8);
     let pin = C53_NATIVE_ASYNC_QEMU_ACCEPTANCE;
     let limits = pin.limits();
+    let stream_maximum = expected_stream_maximum(limits);
     let mut invocation = component
         .start_filter(pin.entrypoint(), limits.total_fuel, limits.poll_quantum)
         .unwrap();
@@ -205,10 +243,15 @@ fn drive_runtime_filter(
             transitions < 100_000,
             "native guest made no bounded progress"
         );
-        match invocation.poll() {
-            NativeAsyncPoll::Pending(_)
-            | NativeAsyncPoll::Resolved(_)
-            | NativeAsyncPoll::Yielded(_) => {}
+        let progress =
+            assert_bounded_invocation_api(&mut invocation, limits.poll_quantum, "poll", |call| {
+                call.poll()
+            });
+        match progress {
+            // Core outcomes are deliberately deferred. Treat Pending as an
+            // ordinary owner-visible turn and let the next loop poll handle it.
+            NativeAsyncPoll::Pending(_) => {}
+            NativeAsyncPoll::Resolved(_) | NativeAsyncPoll::Yielded(_) => {}
             NativeAsyncPoll::WaitPending { .. } => {
                 panic!("guest parked without a corresponding host transition")
             }
@@ -217,17 +260,24 @@ fn drive_runtime_filter(
                 request: NativeAsyncHostRequest::InputStream { maximum },
                 ..
             } => {
-                assert!((1..=1024).contains(&maximum));
+                assert!((1..=stream_maximum).contains(&maximum));
                 max_input_request = max_input_request.max(maximum);
                 assert_stable_host_pending(
                     &mut invocation,
+                    limits.poll_quantum,
                     token,
                     NativeAsyncHostRequest::InputStream { maximum },
                 );
                 stable_host_pending_polls += 1;
                 if input_offset == input.len() {
                     assert!(matches!(
-                        invocation.drop_host_copy_peer(token).unwrap(),
+                        assert_bounded_invocation_api(
+                            &mut invocation,
+                            limits.poll_quantum,
+                            "drop_host_copy_peer",
+                            |call| call.drop_host_copy_peer(token),
+                        )
+                        .unwrap(),
                         NativeAsyncPoll::Pending(_)
                     ));
                     continue;
@@ -237,17 +287,25 @@ fn drive_runtime_filter(
                 let progress = desired
                     .min(maximum as usize)
                     .min(input.len() - input_offset);
-                assert!((1..=1024).contains(&progress));
-                let prepared = invocation
-                    .prepare_host_input_stream(token, progress as u32)
-                    .unwrap();
+                assert!((1..=stream_maximum as usize).contains(&progress));
+                let prepared = assert_bounded_invocation_api(
+                    &mut invocation,
+                    limits.poll_quantum,
+                    "prepare_host_input_stream",
+                    |call| call.prepare_host_input_stream(token, progress as u32),
+                )
+                .unwrap();
                 let token =
                     prepared_host_token(prepared, NativeAsyncHostRequest::InputStream { maximum });
                 let end = input_offset + progress;
                 assert!(matches!(
-                    invocation
-                        .commit_host_input_stream(token, &input[input_offset..end])
-                        .unwrap(),
+                    assert_bounded_invocation_api(
+                        &mut invocation,
+                        limits.poll_quantum,
+                        "commit_host_input_stream",
+                        |call| call.commit_host_input_stream(token, &input[input_offset..end]),
+                    )
+                    .unwrap(),
                     NativeAsyncPoll::Pending(_)
                 ));
                 input_offset = end;
@@ -259,12 +317,22 @@ fn drive_runtime_filter(
                 ..
             } => {
                 assert_eq!(input_offset, input.len());
-                let prepared = invocation.prepare_host_input_closed(token).unwrap();
+                let prepared = assert_bounded_invocation_api(
+                    &mut invocation,
+                    limits.poll_quantum,
+                    "prepare_host_input_closed",
+                    |call| call.prepare_host_input_closed(token),
+                )
+                .unwrap();
                 let token = prepared_host_token(prepared, NativeAsyncHostRequest::InputClosed);
                 assert!(matches!(
-                    invocation
-                        .commit_host_input_closed(token, close_reason)
-                        .unwrap(),
+                    assert_bounded_invocation_api(
+                        &mut invocation,
+                        limits.poll_quantum,
+                        "commit_host_input_closed",
+                        |call| call.commit_host_input_closed(token, close_reason),
+                    )
+                    .unwrap(),
                     NativeAsyncPoll::Pending(_)
                 ));
             }
@@ -273,10 +341,11 @@ fn drive_runtime_filter(
                 request: NativeAsyncHostRequest::OutputStream { maximum },
                 ..
             } => {
-                assert!((1..=1024).contains(&maximum));
+                assert!((1..=stream_maximum).contains(&maximum));
                 max_output_request = max_output_request.max(maximum);
                 assert_stable_host_pending(
                     &mut invocation,
+                    limits.poll_quantum,
                     token,
                     NativeAsyncHostRequest::OutputStream { maximum },
                 );
@@ -289,19 +358,30 @@ fn drive_runtime_filter(
                 }
                 let start = output.len();
                 output.resize(start + progress, 0);
-                let prepared = invocation
-                    .prepare_host_output_stream(token, &mut output[start..])
-                    .unwrap();
+                let prepared = assert_bounded_invocation_api(
+                    &mut invocation,
+                    limits.poll_quantum,
+                    "prepare_host_output_stream",
+                    |call| call.prepare_host_output_stream(token, &mut output[start..]),
+                )
+                .unwrap();
                 let token =
                     prepared_host_token(prepared, NativeAsyncHostRequest::OutputStream { maximum });
                 assert_stable_host_pending(
                     &mut invocation,
+                    limits.poll_quantum,
                     token,
                     NativeAsyncHostRequest::OutputStream { maximum },
                 );
                 stable_host_pending_polls += 1;
                 assert!(matches!(
-                    invocation.commit_host_output(token).unwrap(),
+                    assert_bounded_invocation_api(
+                        &mut invocation,
+                        limits.poll_quantum,
+                        "commit_host_output stream",
+                        |call| call.commit_host_output(token),
+                    )
+                    .unwrap(),
                     NativeAsyncPoll::Pending(_)
                 ));
                 output_chunks += 1;
@@ -311,16 +391,33 @@ fn drive_runtime_filter(
                 request: NativeAsyncHostRequest::OutputClosed { value: None },
                 ..
             } => {
-                let prepared = invocation.prepare_host_output_closed(token).unwrap();
+                let prepared = assert_bounded_invocation_api(
+                    &mut invocation,
+                    limits.poll_quantum,
+                    "prepare_host_output_closed",
+                    |call| call.prepare_host_output_closed(token),
+                )
+                .unwrap();
                 let prepared_request = NativeAsyncHostRequest::OutputClosed {
                     value: Some(close_reason),
                 };
                 let token = prepared_host_token(prepared, prepared_request);
-                assert_stable_host_pending(&mut invocation, token, prepared_request);
+                assert_stable_host_pending(
+                    &mut invocation,
+                    limits.poll_quantum,
+                    token,
+                    prepared_request,
+                );
                 stable_host_pending_polls += 1;
                 observed_output_close = Some(close_reason);
                 assert!(matches!(
-                    invocation.commit_host_output(token).unwrap(),
+                    assert_bounded_invocation_api(
+                        &mut invocation,
+                        limits.poll_quantum,
+                        "commit_host_output closed",
+                        |call| call.commit_host_output(token),
+                    )
+                    .unwrap(),
                     NativeAsyncPoll::Pending(_)
                 ));
             }
@@ -328,8 +425,17 @@ fn drive_runtime_filter(
                 panic!("unexpected prepared request surfaced to driver: {request:?}")
             }
             NativeAsyncPoll::Complete(_) => {
-                invocation.finalize_transport().unwrap();
+                assert_bounded_invocation_api(
+                    &mut invocation,
+                    limits.poll_quantum,
+                    "finalize_transport",
+                    |call| call.finalize_transport(),
+                )
+                .unwrap();
                 break;
+            }
+            NativeAsyncPoll::CleanupPending { trap, .. } => {
+                panic!("native artifact entered fail-stop cleanup: {trap:?}")
             }
             NativeAsyncPoll::Trapped(trap) => panic!("native artifact trapped: {trap:?}"),
         }
@@ -355,6 +461,7 @@ fn xor_0x20(input: &[u8]) -> Vec<u8> {
 
 #[test]
 fn pinned_artifact_executes_large_backpressured_xor_and_reuses_one_component() {
+    let stream_maximum = expected_stream_maximum(C53_NATIVE_ASYNC_QEMU_ACCEPTANCE.limits());
     let mut component = runtime_component();
     let input: Vec<u8> = (0..(8 * 1024 + 333))
         .map(|index| ((index * 37 + 11) & 0xff) as u8)
@@ -362,12 +469,13 @@ fn pinned_artifact_executes_large_backpressured_xor_and_reuses_one_component() {
     let first = drive_runtime_filter(&mut component, &input, 0);
     assert_eq!(first.output, xor_0x20(&input));
     assert_eq!(first.output_close, 0);
-    assert!(first.input_chunks > 8);
+    assert_eq!(first.output.len(), input.len());
+    assert!(first.input_chunks > input.len().div_ceil(stream_maximum as usize));
     assert!(first.output_chunks > first.input_chunks);
     assert!(first.partial_output_chunks > 8);
     assert!(first.stable_host_pending_polls > first.output_chunks);
-    assert_eq!(first.max_input_request, 1024);
-    assert!(first.max_output_request <= 1024);
+    assert_eq!(first.max_input_request, stream_maximum);
+    assert_eq!(first.max_output_request, stream_maximum);
 
     let second_input = b"second invocation crosses the same sealed runtime";
     let second = drive_runtime_filter(&mut component, second_input, 1);

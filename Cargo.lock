@@ -927,6 +927,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-component-loader"
+version = "0.1.0"
+dependencies = [
+ "vibeos-component-admission",
+ "vibeos-component-command",
+ "vibeos-component-format",
+ "vibeos-component-runtime",
+ "vibeos-core",
+ "vibeos-durable-format",
+ "vibeos-object-store",
+ "vibeos-storage-device",
+ "vibeos-vsh",
+ "wat",
+]
+
+[[package]]
 name = "vibeos-component-runtime"
 version = "0.1.0"
 dependencies = [

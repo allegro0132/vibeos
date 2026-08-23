@@ -876,6 +876,33 @@ impl PersistentCapIdentity {
 /// Typed, non-forgeable view of one live durable derivation. It retains the
 /// object and ancestry only inside the capability module, allowing a child to
 /// be installed after an asynchronous commit without exposing a raw lookup.
+///
+/// Operation callbacks cannot let a resource borrow escape:
+///
+/// ```compile_fail
+/// use vibeos_core::cap::{PersistentDerivationWitness, Resource, Rights};
+///
+/// fn leak<T: Resource>(witness: &PersistentDerivationWitness<T>) -> &T {
+///     witness
+///         .try_with(Rights::READ, |resource| resource)
+///         .unwrap()
+/// }
+/// ```
+///
+/// Consuming a witness yields only an opaque invocation lease, never its
+/// backing `Arc`:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use vibeos_core::cap::{PersistentDerivationWitness, Resource, Rights};
+///
+/// fn into_arc<T: Resource>(witness: PersistentDerivationWitness<T>) -> Arc<T> {
+///     witness
+///         .try_into_invocation_lease(Rights::READ)
+///         .unwrap()
+///         .into_inner()
+/// }
+/// ```
 pub struct PersistentDerivationWitness<T: Resource> {
     identity: PersistentCapIdentity,
     object: Arc<T>,
@@ -886,6 +913,46 @@ pub struct PersistentDerivationWitness<T: Resource> {
 impl<T: Resource> PersistentDerivationWitness<T> {
     pub const fn identity(&self) -> PersistentCapIdentity {
         self.identity
+    }
+
+    /// Revalidate the complete durable ancestry and required rights, then
+    /// perform one operation without disclosing a borrow or backing `Arc`.
+    ///
+    /// The successful check is the operation's authority-acquisition
+    /// linearization point. Revocation that completed before this call is
+    /// observed; a concurrent revocation prevents later acquisitions but does
+    /// not interrupt a callback which already passed the check.
+    pub fn try_with<R, F>(&self, need: Rights, operation: F) -> Result<R, CapError>
+    where
+        F: for<'a> FnOnce(&'a T) -> R,
+    {
+        self.revalidate(need)?;
+        Ok(operation(&self.object))
+    }
+
+    /// Consume this durable witness into one invocation-scoped non-capability
+    /// borrow alias.
+    ///
+    /// Complete ancestry and rights are checked immediately before delivery.
+    /// Once delivered, the lease follows normal invocation semantics:
+    /// revocation prevents the next acquisition but does not interrupt this
+    /// already-linearized invocation.
+    pub fn try_into_invocation_lease(self, need: Rights) -> Result<InvocationLease<T>, CapError> {
+        self.revalidate(need)?;
+        Ok(InvocationLease {
+            object: self.object,
+            rights: self.identity.rights,
+        })
+    }
+
+    fn revalidate(&self, need: Rights) -> Result<(), CapError> {
+        if !self.node.is_alive() {
+            return Err(CapError::Invalid);
+        }
+        if !self.identity.rights.contains(need) {
+            return Err(CapError::InsufficientRights);
+        }
+        Ok(())
     }
 
     fn into_revocable(self) -> Revocable<T> {
@@ -2470,6 +2537,106 @@ pub fn grant(src: &CSpace, cap: Cap, rights: Rights, dst: &mut CSpace) -> Result
     };
     dst.publish_slots(candidate);
     Ok(granted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct WitnessResource(u32);
+
+    impl Resource for WitnessResource {
+        fn kind(&self) -> &'static str {
+            "witness-resource"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn witness_with_ancestor(
+        rights: Rights,
+    ) -> (
+        PersistentDerivationWitness<WitnessResource>,
+        Arc<Derivation>,
+    ) {
+        let root_identity = PersistentNodeIdentity {
+            derivation_id: DerivationId::new(1).unwrap(),
+            object_id: ObjectId::new(2).unwrap(),
+            resource_kind: ResourceKind::new(3).unwrap(),
+        };
+        let root = Derivation::persistent_root(root_identity);
+        let child_identity = PersistentNodeIdentity {
+            derivation_id: DerivationId::new(4).unwrap(),
+            ..root_identity
+        };
+        let child = Derivation::persistent_child(&root, child_identity);
+        let identity = PersistentCapIdentity {
+            space: SpaceId::new(5).unwrap(),
+            slot: 0,
+            generation: 0,
+            derivation_id: child_identity.derivation_id,
+            object_id: child_identity.object_id,
+            resource_kind: child_identity.resource_kind,
+            rights,
+        };
+        (
+            PersistentDerivationWitness {
+                identity,
+                object: Arc::new(WitnessResource(7)),
+                node: child,
+                marker: PhantomData,
+            },
+            root,
+        )
+    }
+
+    #[test]
+    fn persistent_witness_rechecks_rights_and_complete_ancestry() {
+        let (witness, ancestor) = witness_with_ancestor(Rights::READ);
+        assert_eq!(witness.try_with(Rights::READ, |resource| resource.0), Ok(7));
+        assert_eq!(
+            witness.try_with(Rights::WRITE, |_| ()),
+            Err(CapError::InsufficientRights)
+        );
+
+        ancestor.kill();
+        assert_eq!(
+            witness.try_with(Rights::READ, |_| ()),
+            Err(CapError::Invalid),
+            "revoking an ancestor invalidates a previously delivered witness"
+        );
+    }
+
+    #[test]
+    fn persistent_witness_consumption_checks_delivery_then_scopes_the_lease() {
+        let (under_righted, _) = witness_with_ancestor(Rights::READ);
+        assert_eq!(
+            under_righted.try_into_invocation_lease(Rights::WRITE).err(),
+            Some(CapError::InsufficientRights)
+        );
+
+        let (revoked, ancestor) = witness_with_ancestor(Rights::READ);
+        ancestor.kill();
+        assert_eq!(
+            revoked.try_into_invocation_lease(Rights::READ).err(),
+            Some(CapError::Invalid)
+        );
+
+        let (live, ancestor) = witness_with_ancestor(Rights::READ);
+        let lease = live
+            .try_into_invocation_lease(Rights::READ)
+            .expect("live, sufficiently-righted witness must yield one lease");
+        assert!(lease.authorizes(Rights::READ));
+        assert!(!lease.authorizes(Rights::WRITE));
+        ancestor.kill();
+        assert_eq!(
+            lease.with(|resource| resource.0),
+            7,
+            "an acquired invocation lease survives later revocation"
+        );
+    }
 }
 
 /// Supervisor-only consume-and-derive transfer between distinct CSpaces.

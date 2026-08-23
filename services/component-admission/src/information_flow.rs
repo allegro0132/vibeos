@@ -537,7 +537,7 @@ fn semantic_endpoint(
     Ok(ComponentGraphInformationFlowEndpoint {
         principal_policy_label: copied(policy_label)?,
         entity_name: copied(&entity.name)?,
-        entity_shape: entity_shape_text(&entity.entity)?,
+        entity_shape: canonical_entity_shape_text_v1(&entity.entity)?,
     })
 }
 
@@ -616,7 +616,16 @@ fn compare_authority_policies(
         .then_with(|| left.rights.bits().cmp(&right.rights.bits()))
 }
 
-fn entity_shape_text(entity: &EntityShape) -> Result<String, ComponentGraphInformationFlowError> {
+/// Render the bounded canonical v1 diagnostic text for a freshly normalized
+/// entity shape.
+///
+/// This projection is suitable for checking that an inert manifest remains
+/// self-consistent. It is not nominal-resource identity or admission
+/// authority; trust boundaries must still compare fresh typed validator and
+/// WIT evidence.
+pub fn canonical_entity_shape_text_v1(
+    entity: &EntityShape,
+) -> Result<String, ComponentGraphInformationFlowError> {
     let mut output = String::new();
     append_entity_shape(&mut output, entity)?;
     Ok(output)

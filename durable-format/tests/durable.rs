@@ -774,6 +774,95 @@ fn sealed_semantic_field_errors_are_all_rejected_canonically() {
 }
 
 #[test]
+fn durable_v1_rights_exclude_the_volatile_invoke_bit() {
+    const DURABLE_V1_ALL: u32 = 0x3f;
+    const VOLATILE_INVOKE_BIT: u32 = 0x40;
+
+    assert_eq!(DurableRights::ALL.bits(), DURABLE_V1_ALL);
+    assert_eq!(
+        DurableRights::from_bits(DURABLE_V1_ALL),
+        Some(DurableRights::ALL)
+    );
+    assert_eq!(DurableRights::from_bits(VOLATILE_INVOKE_BIT), None);
+    assert_eq!(
+        DurableRights::from_bits(DURABLE_V1_ALL | VOLATILE_INVOKE_BIT),
+        None
+    );
+}
+
+#[test]
+fn sealed_grant_with_volatile_invoke_bit_is_rejected_after_crc_and_chain_rebinding() {
+    const VOLATILE_INVOKE_BIT: u32 = 0x40;
+    const PREVIOUS_CRC_OFFSET: usize = 0x20;
+    const GRANT_RIGHTS_OFFSET: usize = PAYLOAD_OFFSET + 68;
+    const COMMIT_PREPARE_CRC_OFFSET: usize = PAYLOAD_OFFSET + 8;
+
+    let root = root_grant(10, 20, 0, 0);
+    let mut log = TestLog::formatted();
+    let mut prepare = log
+        .chain
+        .append(Some(tx(30)), RecordBody::GrantPrepare(root.clone()))
+        .unwrap();
+    let DecodeStatus::Valid(decoded) = LogRecord::decode(&prepare).unwrap() else {
+        unreachable!()
+    };
+    let mut commit = log
+        .chain
+        .append(
+            Some(tx(30)),
+            RecordBody::GrantCommit {
+                prepare_sequence: decoded.record.sequence,
+                prepare_crc32c: decoded.crc32c,
+                derivation_id: root.derivation_id,
+            },
+        )
+        .unwrap();
+
+    let serialized_rights = DurableRights::ALL.bits() | VOLATILE_INVOKE_BIT;
+    prepare[GRANT_RIGHTS_OFFSET..GRANT_RIGHTS_OFFSET + 4]
+        .copy_from_slice(&serialized_rights.to_le_bytes());
+    refresh_crc(&mut prepare);
+    let prepare_crc = u32::from_le_bytes(prepare[CRC_OFFSET..CRC_OFFSET + 4].try_into().unwrap());
+
+    commit[PREVIOUS_CRC_OFFSET..PREVIOUS_CRC_OFFSET + 4]
+        .copy_from_slice(&prepare_crc.to_le_bytes());
+    commit[COMMIT_PREPARE_CRC_OFFSET..COMMIT_PREPARE_CRC_OFFSET + 4]
+        .copy_from_slice(&prepare_crc.to_le_bytes());
+    refresh_crc(&mut commit);
+
+    assert_eq!(LogRecord::decode(&prepare), Err(DecodeError::UnknownRights));
+    assert!(matches!(
+        LogRecord::decode(&commit),
+        Ok(DecodeStatus::Valid(_))
+    ));
+    assert_eq!(
+        u32::from_le_bytes(
+            commit[PREVIOUS_CRC_OFFSET..PREVIOUS_CRC_OFFSET + 4]
+                .try_into()
+                .unwrap()
+        ),
+        prepare_crc
+    );
+    assert_eq!(
+        u32::from_le_bytes(
+            commit[COMMIT_PREPARE_CRC_OFFSET..COMMIT_PREPARE_CRC_OFFSET + 4]
+                .try_into()
+                .unwrap()
+        ),
+        prepare_crc
+    );
+
+    log.sectors.extend([prepare, commit]);
+    assert_eq!(
+        recover_with(&log.sectors, &[root]),
+        Err(RecoveryError::SealedRecord {
+            sector: 2,
+            source: DecodeError::UnknownRights,
+        })
+    );
+}
+
+#[test]
 fn write_flush_publish_and_revoke_ack_boundaries_are_ordered() {
     let root = root_grant(10, 20, 0, 0);
     let mut base = TestLog::formatted();

@@ -1,0 +1,18 @@
+[package]
+name = "vibeos-component-loader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vibeos-component-admission = { path = "../component-admission" }
+vibeos-component-command = { path = "../component-command" }
+vibeos-component-format = { path = "../../component-format" }
+vibeos-component-runtime = { path = "../../component-runtime" }
+vibeos-core = { path = "../../core" }
+vibeos-durable-format = { path = "../../durable-format" }
+vibeos-object-store = { path = "../object-store" }
+vibeos-vsh = { path = "../../components/vsh", default-features = false }
+
+[dev-dependencies]
+vibeos-storage-device = { path = "../../storage-device" }
+wat = { version = "=1.255.0", features = ["component-model"] }

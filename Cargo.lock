@@ -873,6 +873,7 @@ dependencies = [
 name = "vibeos-component-admission"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "sha2",
  "vibeos-component-format",
  "vibeos-component-host",
@@ -930,6 +931,8 @@ dependencies = [
 name = "vibeos-component-loader"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
+ "sha2",
  "vibeos-component-admission",
  "vibeos-component-command",
  "vibeos-component-format",
@@ -1085,10 +1088,12 @@ version = "0.1.0"
 name = "vibeos-image-policy"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "sha2",
  "vibeos-component-admission",
  "vibeos-component-command",
  "vibeos-component-format",
+ "vibeos-component-loader",
  "vibeos-component-runtime",
  "vibeos-wasm-runtime",
  "wat",
@@ -1115,6 +1120,7 @@ dependencies = [
  "vibeos-component-format",
  "vibeos-component-host",
  "vibeos-component-image-adapter",
+ "vibeos-component-loader",
  "vibeos-component-runtime",
  "vibeos-core",
  "vibeos-driver-dwc2-host",

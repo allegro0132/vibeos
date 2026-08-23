@@ -1,0 +1,5 @@
+package vibe:bytes@1.0.0;
+
+world filter {
+    export run: func(input: list<u8>) -> list<u8>;
+}

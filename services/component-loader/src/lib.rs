@@ -5,8 +5,14 @@
 //! bytes. Only after those bytes match an independent image pin and pass fresh
 //! Component, Core, WIT, manifest, limit, and ordinary policy admission does
 //! this crate construct a boot-local command runner. The runner remains
-//! unavailable in C7.2: it can be installed as a volatile VSH `Command`, but
-//! it cannot execute guest code and never acquires durable `INVOKE` authority.
+//! unavailable: it can be installed as a volatile VSH `Command`, but it cannot
+//! execute guest code and never acquires durable `INVOKE` authority.
+//!
+//! C7.3 adds a disjoint deployable path. Canonical detached evidence must pass
+//! strict Ed25519 verification against one explicit operator policy before a
+//! move-only authentication wrapper can enter the same fresh semantic gate.
+//! A content hash, policy digest, key identifier, or failed operator check can
+//! never select or fall back to development trust.
 
 #![no_std]
 
@@ -22,13 +28,16 @@ use core::fmt;
 use core::future::Future;
 
 use vibeos_component_admission::{
-    admit, canonical_entity_shape_text_v1, AdmissionError, AdmissionPolicy, AdmittedComponent,
-    ArtifactTrust, CallerAuthority, ComponentArtifact, InstanceLimits,
+    admit, admit_authenticated, authenticate_component_artifact, canonical_entity_shape_text_v1,
+    AdmissionError, AdmissionPolicy, AdmittedComponent, ArtifactAuthenticationError, ArtifactTrust,
+    AuthenticatedAdmissionError, AuthenticatedComponentArtifact, CallerAuthority,
+    ComponentArtifact, InstanceLimits, OperatorArtifactAdmissionPolicy,
 };
 use vibeos_component_command::{
     try_manifest_from_admitted, validate_admitted_filter, RunnerBuildError,
 };
 use vibeos_component_format::{
+    ComponentArtifactAuthenticationError, ComponentArtifactAuthenticationEvidenceV1,
     ComponentArtifactCoreModuleV1, ComponentArtifactEntityKind, ComponentArtifactError,
     ComponentArtifactInterfaceDirection, ComponentArtifactManifestV1,
     ComponentArtifactSignerPolicyKind, ComponentArtifactV1, ProfileIdentity, PROFILE_1_LIMITS,
@@ -47,8 +56,8 @@ use vibeos_vsh::{
 ///
 /// `exact_artifact_bytes` and `exact_wit_source` must come from trusted image
 /// configuration, never from the object which is being loaded. The whole-byte
-/// pin is intentionally stronger than a self-declared content hash. C7.3 will
-/// add an authenticated operator-policy alternative.
+/// pin is intentionally stronger than a self-declared content hash. C7.3's
+/// authenticated operator-policy alternative is a separate loader path.
 pub struct DevelopmentComponentLoadPolicy<'a> {
     exact_artifact_bytes: &'a [u8],
     exact_wit_source: &'a str,
@@ -77,7 +86,27 @@ impl<'a> DevelopmentComponentLoadPolicy<'a> {
     }
 }
 
-/// Stable, redacted C7.2 load failures.
+/// Independently configured deployable loading policy.
+///
+/// The wrapped operator policy owns no artifact bytes and performs no lookup.
+/// Its complete signer table, WIT source, semantic admission rules, and policy
+/// generation are committed before detached evidence can mint a boot-local
+/// authentication receipt.
+pub struct DeployableComponentLoadPolicy<'a> {
+    operator: &'a OperatorArtifactAdmissionPolicy<'a>,
+}
+
+impl<'a> DeployableComponentLoadPolicy<'a> {
+    pub const fn new(operator: &'a OperatorArtifactAdmissionPolicy<'a>) -> Self {
+        Self { operator }
+    }
+
+    pub const fn operator_policy(&self) -> &OperatorArtifactAdmissionPolicy<'a> {
+        self.operator
+    }
+}
+
+/// Stable, redacted Component load failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentLoadError {
     Root(ComponentRootError),
@@ -86,6 +115,8 @@ pub enum ComponentLoadError {
     Store(StoreError),
     ReadLength,
     Artifact(ComponentArtifactError),
+    AuthenticationEvidence(ComponentArtifactAuthenticationError),
+    Authentication(ArtifactAuthenticationError),
     ImagePinMismatch,
     SignerPolicy,
     Profile,
@@ -112,11 +143,17 @@ impl fmt::Display for ComponentLoadError {
             Self::Store(_) => "component artifact capability read failed",
             Self::ReadLength => "component artifact read length differs from the rooted object",
             Self::Artifact(_) => "component artifact canonical decoding failed",
+            Self::AuthenticationEvidence(_) => {
+                "component authentication evidence canonical decoding failed"
+            }
+            Self::Authentication(_) => "component operator authentication failed",
             Self::ImagePinMismatch => "component artifact differs from independent image policy",
             Self::SignerPolicy => "component signer-policy descriptor differs from image policy",
-            Self::Profile => "component artifact profile is outside the C7.2 loading profile",
+            Self::Profile => "component artifact profile is outside the selected loading profile",
             Self::Limits => "component artifact instance limits differ from image policy",
-            Self::UnsupportedWitPackageSet => "C7.2 requires one independently pinned WIT source",
+            Self::UnsupportedWitPackageSet => {
+                "component loading requires one independently configured WIT source"
+            }
             Self::Wit(_) => "component artifact WIT source failed fresh parsing",
             Self::WitPolicyMismatch => "component WIT world differs from independent image policy",
             Self::InterfaceManifest => {
@@ -126,13 +163,13 @@ impl fmt::Display for ComponentLoadError {
                 "component Core-module manifest differs from fresh traversal evidence"
             }
             Self::UnsupportedAdapterEvidence => {
-                "C7.2 rejects adapters until exact validator evidence is available"
+                "the selected loading profile permits no component adapters"
             }
             Self::UnsupportedResourceShape => {
-                "C7.2 rejects nominal resources until scoped identity evidence is available"
+                "the selected loading profile permits no nominal resources"
             }
             Self::UnsupportedImports => {
-                "C7.2 durable command loading admits no external component authority"
+                "the selected loading profile admits no external component authority"
             }
             Self::Admission(_) => "component failed ordinary policy admission",
             Self::Command(_) => "component failed volatile command projection",
@@ -153,11 +190,11 @@ impl From<StoreError> for ComponentLoadError {
     }
 }
 
-/// A boot-local command created only by the complete C7.2 loader gate.
+/// A boot-local command created only by a complete C7.2 or C7.3 loader gate.
 ///
 /// The admitted Component is private and cannot be converted into the
 /// synchronous guest runner. The only public runner implementation returns
-/// `Unavailable`, keeping C7.2's activation bit false while still allowing the
+/// `Unavailable`, keeping both activation bits false while still allowing an
 /// ordinary VSH session to construct a real volatile `Command` capability.
 ///
 /// ```compile_fail
@@ -194,7 +231,7 @@ impl VolatileComponentCommand {
         &self.manifest
     }
 
-    /// C7.2 constructs command authority but does not activate guest runtime.
+    /// C7.2/C7.3 construct command authority but do not activate guest runtime.
     pub const fn runtime_ready(&self) -> bool {
         false
     }
@@ -274,6 +311,56 @@ where
     Read: FnOnce(InvocationLease<StoreService>, InvocationLease<StoredObject>) -> ReadFuture,
     ReadFuture: Future<Output = Result<Vec<u8>, StoreError>>,
 {
+    let bytes = read_exact_component_bytes(store_read, artifact_read, read).await?;
+    project_development_component_command(&bytes, policy)
+}
+
+/// Load and authenticate one deployable root-bound Component artifact.
+///
+/// Detached evidence is untrusted data. The loader decodes it canonically,
+/// verifies it against the explicitly supplied operator policy, consumes the
+/// resulting move-only authentication wrapper, and only then projects a
+/// volatile command. Operator failure never falls back to image-pin trust.
+pub async fn load_authenticated_component_command(
+    store_read: InvocationLease<StoreService>,
+    artifact_read: ComponentArtifactPersistentRead,
+    evidence_bytes: &[u8],
+    policy: &DeployableComponentLoadPolicy<'_>,
+) -> Result<VolatileComponentCommand, ComponentLoadError> {
+    load_authenticated_component_command_with(
+        store_read,
+        artifact_read,
+        evidence_bytes,
+        policy,
+        get_with,
+    )
+    .await
+}
+
+async fn load_authenticated_component_command_with<Read, ReadFuture>(
+    store_read: InvocationLease<StoreService>,
+    artifact_read: ComponentArtifactPersistentRead,
+    evidence_bytes: &[u8],
+    policy: &DeployableComponentLoadPolicy<'_>,
+    read: Read,
+) -> Result<VolatileComponentCommand, ComponentLoadError>
+where
+    Read: FnOnce(InvocationLease<StoreService>, InvocationLease<StoredObject>) -> ReadFuture,
+    ReadFuture: Future<Output = Result<Vec<u8>, StoreError>>,
+{
+    let bytes = read_exact_component_bytes(store_read, artifact_read, read).await?;
+    authenticate_and_project_component_bytes(&bytes, evidence_bytes, policy)
+}
+
+async fn read_exact_component_bytes<Read, ReadFuture>(
+    store_read: InvocationLease<StoreService>,
+    artifact_read: ComponentArtifactPersistentRead,
+    read: Read,
+) -> Result<Vec<u8>, ComponentLoadError>
+where
+    Read: FnOnce(InvocationLease<StoreService>, InvocationLease<StoredObject>) -> ReadFuture,
+    ReadFuture: Future<Output = Result<Vec<u8>, StoreError>>,
+{
     if !lease_has_exact_read(&store_read) {
         return Err(ComponentLoadError::StoreAuthority);
     }
@@ -285,7 +372,7 @@ where
     if bytes.len() != expected_len {
         return Err(ComponentLoadError::ReadLength);
     }
-    revalidate_and_project(&bytes, policy)
+    Ok(bytes)
 }
 
 fn lease_has_exact_read<T: Resource>(lease: &InvocationLease<T>) -> bool {
@@ -298,7 +385,9 @@ fn lease_has_exact_read<T: Resource>(lease: &InvocationLease<T>) -> bool {
         && !lease.authorizes(Rights::INVOKE)
 }
 
-fn revalidate_and_project(
+/// Project one development artifact only after exact whole-envelope image
+/// equality and independent semantic-policy validation.
+pub fn project_development_component_command(
     bytes: &[u8],
     policy: &DevelopmentComponentLoadPolicy<'_>,
 ) -> Result<VolatileComponentCommand, ComponentLoadError> {
@@ -326,7 +415,7 @@ fn revalidate_and_project(
     if component.identity() != expected_identity {
         return Err(ComponentLoadError::ImagePinMismatch);
     }
-    validate_fresh_evidence(&durable, &component, policy)?;
+    validate_fresh_evidence(&durable, &component, policy.admission.exact_world)?;
 
     let admitted = admit(
         component,
@@ -334,6 +423,52 @@ fn revalidate_and_project(
         &CallerAuthority { offers: &[] },
     )
     .map_err(ComponentLoadError::Admission)?;
+    project_admitted_component(admitted)
+}
+
+fn authenticate_and_project_component_bytes(
+    bytes: &[u8],
+    evidence_bytes: &[u8],
+    policy: &DeployableComponentLoadPolicy<'_>,
+) -> Result<VolatileComponentCommand, ComponentLoadError> {
+    let evidence = ComponentArtifactAuthenticationEvidenceV1::decode(evidence_bytes)
+        .map_err(ComponentLoadError::AuthenticationEvidence)?;
+    let artifact = ComponentArtifactV1::decode(bytes).map_err(ComponentLoadError::Artifact)?;
+    let authenticated = authenticate_component_artifact(artifact, &evidence, policy.operator)
+        .map_err(ComponentLoadError::Authentication)?;
+    project_authenticated_component_command(authenticated, policy.operator)
+}
+
+/// Consume one unforgeable, boot-local authentication wrapper and perform the
+/// same fresh Component/Core/WIT/manifest/limit validation as development
+/// loading before constructing an inert volatile command.
+pub fn project_authenticated_component_command(
+    authenticated: AuthenticatedComponentArtifact,
+    policy: &OperatorArtifactAdmissionPolicy<'_>,
+) -> Result<VolatileComponentCommand, ComponentLoadError> {
+    let artifact = authenticated.artifact();
+    validate_operator_external_policy(artifact, policy)?;
+    let component = ComponentArtifact::copy_from(artifact.component_bytes(), artifact.profile())
+        .map_err(ComponentLoadError::Admission)?;
+    validate_fresh_evidence(artifact, &component, policy.exact_world())?;
+
+    let admitted = admit_authenticated(authenticated, policy, &CallerAuthority { offers: &[] })
+        .map_err(map_authenticated_admission_error)?;
+    project_admitted_component(admitted)
+}
+
+fn map_authenticated_admission_error(error: AuthenticatedAdmissionError) -> ComponentLoadError {
+    match error {
+        AuthenticatedAdmissionError::Authentication(error) => {
+            ComponentLoadError::Authentication(error)
+        }
+        AuthenticatedAdmissionError::Admission(error) => ComponentLoadError::Admission(error),
+    }
+}
+
+fn project_admitted_component(
+    admitted: AdmittedComponent,
+) -> Result<VolatileComponentCommand, ComponentLoadError> {
     if !admitted.grants().is_empty() || !admitted.command_manifest().requirements().is_empty() {
         return Err(ComponentLoadError::UnsupportedImports);
     }
@@ -348,29 +483,64 @@ fn validate_external_policy(
     artifact: &ComponentArtifactV1,
     policy: &DevelopmentComponentLoadPolicy<'_>,
 ) -> Result<(), ComponentLoadError> {
-    if artifact.profile() != ProfileIdentity::PROFILE_1_SYNC
-        || policy.admission.profile != ProfileIdentity::PROFILE_1_SYNC
-        || artifact.profile() != policy.admission.profile
-        || artifact.profile_limits() != PROFILE_1_LIMITS
-        || artifact.runtime_ready()
-    {
-        return Err(ComponentLoadError::Profile);
-    }
     if artifact.signer_policy().kind() != ComponentArtifactSignerPolicyKind::DevelopmentImagePin
         || artifact.signer_policy().policy_digest().as_bytes() != &policy.signer_policy_digest
     {
         return Err(ComponentLoadError::SignerPolicy);
     }
-    if !instance_limits_match(artifact, policy.admission.limits) {
+    validate_common_external_policy(
+        artifact,
+        policy.exact_wit_source,
+        policy.admission.exact_world,
+        policy.admission.profile,
+        policy.admission.limits,
+        policy.admission.interfaces.is_empty(),
+    )
+}
+
+fn validate_operator_external_policy(
+    artifact: &ComponentArtifactV1,
+    policy: &OperatorArtifactAdmissionPolicy<'_>,
+) -> Result<(), ComponentLoadError> {
+    if artifact.signer_policy().kind() != ComponentArtifactSignerPolicyKind::OperatorRequired {
+        return Err(ComponentLoadError::SignerPolicy);
+    }
+    validate_common_external_policy(
+        artifact,
+        policy.exact_wit_source(),
+        policy.exact_world(),
+        policy.profile(),
+        policy.limits(),
+        policy.interfaces().is_empty(),
+    )
+}
+
+fn validate_common_external_policy(
+    artifact: &ComponentArtifactV1,
+    exact_wit_source: &str,
+    exact_world: &WorldContract,
+    profile: ProfileIdentity,
+    limits: InstanceLimits,
+    interfaces_empty: bool,
+) -> Result<(), ComponentLoadError> {
+    if artifact.profile() != ProfileIdentity::PROFILE_1_SYNC
+        || profile != ProfileIdentity::PROFILE_1_SYNC
+        || artifact.profile() != profile
+        || artifact.profile_limits() != PROFILE_1_LIMITS
+        || artifact.runtime_ready()
+    {
+        return Err(ComponentLoadError::Profile);
+    }
+    if !instance_limits_match(artifact, limits) {
         return Err(ComponentLoadError::Limits);
     }
-    if !policy.admission.interfaces.is_empty() {
+    if !interfaces_empty {
         return Err(ComponentLoadError::UnsupportedImports);
     }
     let [package] = artifact.manifest().wit_packages() else {
         return Err(ComponentLoadError::UnsupportedWitPackageSet);
     };
-    if package.source() != policy.exact_wit_source {
+    if package.source() != exact_wit_source {
         return Err(ComponentLoadError::WitPolicyMismatch);
     }
     let (package_name, package_version) =
@@ -380,9 +550,7 @@ fn validate_external_policy(
     }
     let parsed = WorldContract::parse(package.source(), artifact.manifest().world())
         .map_err(ComponentLoadError::Wit)?;
-    if &parsed != policy.admission.exact_world
-        || artifact.manifest().world() != policy.admission.exact_world.identity
-    {
+    if &parsed != exact_world || artifact.manifest().world() != exact_world.identity {
         return Err(ComponentLoadError::WitPolicyMismatch);
     }
     if !entities_are_resource_free(&parsed.imports) || !entities_are_resource_free(&parsed.exports)
@@ -395,7 +563,7 @@ fn validate_external_policy(
 fn validate_fresh_evidence(
     artifact: &ComponentArtifactV1,
     component: &ComponentArtifact,
-    policy: &DevelopmentComponentLoadPolicy<'_>,
+    exact_world: &WorldContract,
 ) -> Result<(), ComponentLoadError> {
     let inspection = component.inspect().map_err(ComponentLoadError::Admission)?;
     let plan = inspection.plan();
@@ -415,7 +583,7 @@ fn validate_fresh_evidence(
     };
     let parsed = WorldContract::parse(package.source(), artifact.manifest().world())
         .map_err(ComponentLoadError::Wit)?;
-    if parsed != *policy.admission.exact_world || plan.check_world(&parsed).is_err() {
+    if parsed != *exact_world || plan.check_world(&parsed).is_err() {
         return Err(ComponentLoadError::WitPolicyMismatch);
     }
     if !interface_manifest_matches(artifact.manifest(), plan.imports(), plan.exports()) {

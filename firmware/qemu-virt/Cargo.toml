@@ -30,6 +30,9 @@ wasm-c66-node-replacement-acceptance = [
 wasm-c67-information-flow-acceptance = [
     "vibeos-kernel/wasm-c67-information-flow-acceptance",
 ]
+wasm-c73-authenticated-admission-acceptance = [
+    "vibeos-kernel/wasm-c73-authenticated-admission-acceptance",
+]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = [
     "vibeos-kernel/ssh-test",

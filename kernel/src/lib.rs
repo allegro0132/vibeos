@@ -103,6 +103,30 @@ compile_error!("feature `wasm-c66-node-replacement-acceptance` requires the QEMU
 ))]
 compile_error!("feature `wasm-c67-information-flow-acceptance` requires the QEMU default image");
 #[cfg(all(
+    feature = "wasm-c73-authenticated-admission-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!(
+    "feature `wasm-c73-authenticated-admission-acceptance` requires the QEMU default image"
+);
+#[cfg(all(
+    feature = "wasm-c73-authenticated-admission-acceptance",
+    any(
+        feature = "legacy-shell",
+        feature = "component-graph-principals",
+        feature = "ssh-component-command",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c73-authenticated-admission-acceptance` is isolated from live guest and older WASM acceptance roots"
+);
+#[cfg(all(
     feature = "wasm-c67-information-flow-acceptance",
     any(
         feature = "legacy-shell",
@@ -271,6 +295,8 @@ mod bench_platform;
 mod board_led;
 mod cap_table_pool;
 mod code_pool;
+#[cfg(feature = "wasm-c73-authenticated-admission-acceptance")]
+mod component_authenticated_admission;
 #[cfg(feature = "wasm-c67-information-flow-acceptance")]
 mod component_graph_information_flow;
 #[cfg(feature = "component-graph-principals")]
@@ -803,6 +829,15 @@ pub extern "C" fn kmain() -> ! {
             crate::println!("WASM_C67_INFORMATION_FLOW PASS harts=4 nodes=3 edges=2 principal_policy_labels=3 typed_edges=2 async_edges=2 published=1 exact_render=1 negative_rejections=5 forbidden_classes=5 forbidden_hits=0 manifest_only=1 runtime_ready=0 guest_calls=0 registry_occupied=0 registry_header_mismatches=0");
         } else {
             crate::println!("WASM_C67_INFORMATION_FLOW FAIL");
+            sbi::shutdown(true);
+        }
+    });
+    #[cfg(feature = "wasm-c73-authenticated-admission-acceptance")]
+    exec::spawn("wasm-c73-authenticated-admission-acceptance", async {
+        if component_authenticated_admission::run_qemu_acceptance() {
+            crate::println!("\nWASM_C73_AUTHENTICATED_ADMISSION PASS development_accepted=1 operator_p1_accepted=2 operator_p2_accepted=1 wrong_signer_rejected=1 unknown_signer_rejected=1 revoked_signer_rejected=1 old_policy_rejected=1 artifact_mutations_rejected=2 module_mutations_rejected=2 wit_mutations_rejected=2 adapter_mutations_rejected=2 limit_mutations_rejected=2 profile_mutations_rejected=2 signature_replays_rejected=2 content_hash_only_rejected=1 runtime_unavailable=4 runtime_ready=0 guest_calls=0 raw_ids=0");
+        } else {
+            crate::println!("WASM_C73_AUTHENTICATED_ADMISSION FAIL");
             sbi::shutdown(true);
         }
     });

@@ -5,6 +5,18 @@
 
 use vibeos_component_format::ProfileIdentity;
 
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+use vibeos_component_admission::{
+    ArtifactAuthenticationError, CommandStreamMode as AdmissionStreamMode, InstanceLimits,
+    OperatorRoleIdentity, OperatorSignerStatus, OperatorSignerV1,
+};
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+use vibeos_component_format::{
+    ComponentArtifactAuthenticationError, ComponentArtifactAuthenticationEvidenceV1,
+    ComponentArtifactError, ComponentArtifactPolicyDigest, ComponentArtifactSignerPolicyV1,
+    ComponentArtifactV1,
+};
+
 #[cfg(all(feature = "qemu-default", feature = "milkv-duo-sd"))]
 compile_error!("image policies `qemu-default` and `milkv-duo-sd` are mutually exclusive");
 
@@ -40,6 +52,12 @@ compile_error!("feature `c66-node-replacement-qemu-acceptance` requires `qemu-de
     not(feature = "qemu-default")
 ))]
 compile_error!("feature `c67-information-flow-qemu-acceptance` requires `qemu-default`");
+
+#[cfg(all(
+    feature = "c73-authenticated-admission-qemu-acceptance",
+    not(feature = "qemu-default")
+))]
+compile_error!("feature `c73-authenticated-admission-qemu-acceptance` requires `qemu-default`");
 
 /// A logical block-device view carved out of a packaged storage image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +98,412 @@ pub struct ComponentInstanceLimits {
     pub total_fuel: u64,
     pub poll_quantum: u64,
     pub resources: u16,
+}
+
+/// Exact negative authentication case embedded in the C7.3 acceptance image.
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum C73RejectedEvidenceKind {
+    WrongSignature,
+    UnknownSigner,
+    RevokedSigner,
+    ContentHashOnly,
+}
+
+/// Exact double-layer mutation selected by the C7.3 acceptance image.
+///
+/// Each artifact is paired with a fresh, valid signature. Admission must first
+/// reject the baseline signature over changed bytes, then still reject the
+/// freshly signed artifact at the named semantic revalidation gate.
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum C73ArtifactMutationKind {
+    ArtifactManifest,
+    CoreModuleManifest,
+    ExactWitSource,
+    AdapterManifest,
+    InstanceLimits,
+    ProfileIdentity,
+}
+
+/// Image-pinned development artifact. Its exact encoded bytes are encapsulated,
+/// build-verified, and exposed only through the explicit development projector
+/// input below; operator pins deliberately have no equivalent byte getter.
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub struct C73DevelopmentArtifactPin {
+    artifact_bytes: &'static [u8],
+    signer_policy_digest: [u8; 32],
+}
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+impl C73DevelopmentArtifactPin {
+    /// Exact canonical envelope owned by this development image.
+    ///
+    /// This is an input only to the development image-pin projector. It is not
+    /// deployable operator evidence, a content-addressed lookup key, or a
+    /// substitute for [`C73OperatorArtifactPin::authentication_evidence`].
+    pub const fn canonical_artifact_bytes(self) -> &'static [u8] {
+        self.artifact_bytes
+    }
+
+    /// Independently generated development signer policy for the exact image
+    /// descriptor. The digest is never copied out as a raw identifier.
+    pub fn signer_policy(self) -> Result<ComponentArtifactSignerPolicyV1, ComponentArtifactError> {
+        ComponentArtifactSignerPolicyV1::development_image_pin(self.signer_policy_digest)
+    }
+
+    pub fn signer_policy_digest(
+        self,
+    ) -> Result<ComponentArtifactPolicyDigest, ComponentArtifactError> {
+        self.signer_policy().map(|policy| policy.policy_digest())
+    }
+
+    pub fn artifact(self) -> Result<ComponentArtifactV1, ComponentArtifactError> {
+        ComponentArtifactV1::decode(self.artifact_bytes)
+    }
+
+    pub const fn runtime_ready(self) -> bool {
+        false
+    }
+
+    pub const fn guest_calls(self) -> u64 {
+        0
+    }
+}
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+impl core::fmt::Debug for C73DevelopmentArtifactPin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("C73DevelopmentArtifactPin")
+            .field("artifact", &"<redacted>")
+            .field("runtime_ready", &false)
+            .field("guest_calls", &0)
+            .finish()
+    }
+}
+
+/// One deployable operator-signed artifact with detached canonical evidence.
+/// Encoded bytes remain private; callers receive only decoded format types.
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub struct C73OperatorArtifactPin {
+    artifact_bytes: &'static [u8],
+    evidence_bytes: &'static [u8],
+}
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+impl C73OperatorArtifactPin {
+    pub fn artifact(self) -> Result<ComponentArtifactV1, ComponentArtifactError> {
+        ComponentArtifactV1::decode(self.artifact_bytes)
+    }
+
+    pub fn authentication_evidence(
+        self,
+    ) -> Result<ComponentArtifactAuthenticationEvidenceV1, ComponentArtifactAuthenticationError>
+    {
+        ComponentArtifactAuthenticationEvidenceV1::decode(self.evidence_bytes)
+    }
+
+    pub const fn runtime_ready(self) -> bool {
+        false
+    }
+
+    pub const fn guest_calls(self) -> u64 {
+        0
+    }
+}
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+impl core::fmt::Debug for C73OperatorArtifactPin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("C73OperatorArtifactPin")
+            .field("artifact", &"<redacted>")
+            .field("authentication_evidence", &"<redacted>")
+            .field("runtime_ready", &false)
+            .field("guest_calls", &0)
+            .finish()
+    }
+}
+
+/// One structurally canonical but deliberately rejected detached evidence.
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub struct C73RejectedEvidencePin {
+    kind: C73RejectedEvidenceKind,
+    evidence_bytes: &'static [u8],
+}
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+impl C73RejectedEvidencePin {
+    pub const fn kind(self) -> C73RejectedEvidenceKind {
+        self.kind
+    }
+
+    pub fn authentication_evidence(
+        self,
+    ) -> Result<ComponentArtifactAuthenticationEvidenceV1, ComponentArtifactAuthenticationError>
+    {
+        ComponentArtifactAuthenticationEvidenceV1::decode(self.evidence_bytes)
+    }
+
+    pub const fn runtime_ready(self) -> bool {
+        false
+    }
+
+    pub const fn guest_calls(self) -> u64 {
+        0
+    }
+}
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+impl core::fmt::Debug for C73RejectedEvidencePin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("C73RejectedEvidencePin")
+            .field("kind", &self.kind)
+            .field("authentication_evidence", &"<redacted>")
+            .field("runtime_ready", &false)
+            .field("guest_calls", &0)
+            .finish()
+    }
+}
+
+/// One freshly signed semantic mutation fixture. Both byte arrays are private
+/// so the image cannot turn a diagnostic fixture into ambient lookup material.
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub struct C73ArtifactMutationPin {
+    kind: C73ArtifactMutationKind,
+    artifact_bytes: &'static [u8],
+    evidence_bytes: &'static [u8],
+}
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+impl C73ArtifactMutationPin {
+    pub const fn kind(self) -> C73ArtifactMutationKind {
+        self.kind
+    }
+
+    pub fn artifact(self) -> Result<ComponentArtifactV1, ComponentArtifactError> {
+        ComponentArtifactV1::decode(self.artifact_bytes)
+    }
+
+    pub fn authentication_evidence(
+        self,
+    ) -> Result<ComponentArtifactAuthenticationEvidenceV1, ComponentArtifactAuthenticationError>
+    {
+        ComponentArtifactAuthenticationEvidenceV1::decode(self.evidence_bytes)
+    }
+
+    pub const fn runtime_ready(self) -> bool {
+        false
+    }
+
+    pub const fn guest_calls(self) -> u64 {
+        0
+    }
+}
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+impl core::fmt::Debug for C73ArtifactMutationPin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("C73ArtifactMutationPin")
+            .field("kind", &self.kind)
+            .field("artifact", &"<redacted>")
+            .field("authentication_evidence", &"<redacted>")
+            .field("runtime_ready", &false)
+            .field("guest_calls", &0)
+            .finish()
+    }
+}
+
+/// Private, redacted typed inputs for one canonical operator-policy generation.
+///
+/// The raw key and role storage remains private. Fallible typed accessors
+/// construct the production admission values, rechecking curve points and
+/// fail-closing if the checked fixture ever drifts.
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub struct C73OperatorPolicyPin {
+    generation: u64,
+    operator_role: [u8; 32],
+    active_signer: [u8; 32],
+    revoked_signer: [u8; 32],
+    exact_wit_source: &'static str,
+}
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+impl C73OperatorPolicyPin {
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub fn operator_role(self) -> Result<OperatorRoleIdentity, ArtifactAuthenticationError> {
+        OperatorRoleIdentity::from_bytes(self.operator_role)
+    }
+
+    /// Return the complete canonical signer table, ordered by public-key bytes.
+    pub fn signers(self) -> Result<[OperatorSignerV1; 2], ArtifactAuthenticationError> {
+        let revoked = OperatorSignerV1::new(self.revoked_signer, OperatorSignerStatus::Revoked)?;
+        let active = OperatorSignerV1::new(self.active_signer, OperatorSignerStatus::Active)?;
+        let mut signers = [revoked, active];
+        signers.sort_by_key(|signer| *signer.public_key());
+        if signers[0].public_key() >= signers[1].public_key() {
+            return Err(ArtifactAuthenticationError::NonCanonicalSignerTable);
+        }
+        Ok(signers)
+    }
+
+    pub const fn profile(self) -> ProfileIdentity {
+        ProfileIdentity::PROFILE_1_SYNC
+    }
+
+    pub const fn command_name(self) -> &'static str {
+        "c73-filter"
+    }
+
+    pub const fn entrypoint(self) -> &'static str {
+        "run"
+    }
+
+    pub const fn min_args(self) -> usize {
+        0
+    }
+
+    pub const fn max_args(self) -> usize {
+        0
+    }
+
+    pub const fn exact_wit_source(self) -> &'static str {
+        self.exact_wit_source
+    }
+
+    pub const fn exact_world(self) -> &'static str {
+        "vibe:bytes/filter@1.0.0"
+    }
+
+    pub const fn limits(self) -> InstanceLimits {
+        InstanceLimits {
+            memory_bytes: 512 * 1024,
+            total_fuel: 100_000,
+            poll_quantum: 100,
+            resources: 4,
+        }
+    }
+
+    pub const fn stdin(self) -> AdmissionStreamMode {
+        AdmissionStreamMode::Required
+    }
+
+    pub const fn stdout(self) -> AdmissionStreamMode {
+        AdmissionStreamMode::Required
+    }
+
+    pub const fn stderr(self) -> AdmissionStreamMode {
+        AdmissionStreamMode::Optional
+    }
+
+    pub const fn runtime_ready(self) -> bool {
+        false
+    }
+
+    pub const fn guest_calls(self) -> u64 {
+        0
+    }
+}
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+impl core::fmt::Debug for C73OperatorPolicyPin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("C73OperatorPolicyPin")
+            .field("generation", &self.generation)
+            .field("operator_role", &"<redacted>")
+            .field("signers", &"<redacted>")
+            .field("exact_wit_source", &"<redacted>")
+            .field("profile", &ProfileIdentity::PROFILE_1_SYNC)
+            .field("runtime_ready", &false)
+            .field("guest_calls", &0)
+            .finish()
+    }
+}
+
+/// Closed C7.3 acceptance-image policy root.
+///
+/// It contains only canonical artifact bytes, detached public evidence, exact
+/// WIT, and typed signer-policy inputs. It contains no private signing seed,
+/// capability, durable identity, lookup handle, invocation token, or guest
+/// execution authority.
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub struct C73AuthenticatedAdmissionPin {
+    development: C73DevelopmentArtifactPin,
+    policy_p1: C73OperatorPolicyPin,
+    policy_p2: C73OperatorPolicyPin,
+    operator_p1: [C73OperatorArtifactPin; 2],
+    operator_p2: C73OperatorArtifactPin,
+    rejected_evidence: [C73RejectedEvidencePin; 4],
+    mutations: [C73ArtifactMutationPin; 6],
+}
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+impl C73AuthenticatedAdmissionPin {
+    pub const fn development(self) -> C73DevelopmentArtifactPin {
+        self.development
+    }
+
+    pub const fn policy_p1(self) -> C73OperatorPolicyPin {
+        self.policy_p1
+    }
+
+    pub const fn policy_p2(self) -> C73OperatorPolicyPin {
+        self.policy_p2
+    }
+
+    pub const fn operator_p1(self) -> [C73OperatorArtifactPin; 2] {
+        self.operator_p1
+    }
+
+    pub const fn operator_p2(self) -> C73OperatorArtifactPin {
+        self.operator_p2
+    }
+
+    pub const fn rejected_evidence(self) -> [C73RejectedEvidencePin; 4] {
+        self.rejected_evidence
+    }
+
+    pub const fn mutations(self) -> [C73ArtifactMutationPin; 6] {
+        self.mutations
+    }
+
+    pub const fn runtime_ready(self) -> bool {
+        false
+    }
+
+    pub const fn guest_calls(self) -> u64 {
+        0
+    }
+}
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+impl core::fmt::Debug for C73AuthenticatedAdmissionPin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("C73AuthenticatedAdmissionPin")
+            .field("development", &"<redacted>")
+            .field("operator_p1", &"<redacted:2>")
+            .field("operator_p2", &"<redacted>")
+            .field("policies", &"<redacted:2>")
+            .field("rejected_evidence", &"<redacted:4>")
+            .field("mutations", &"<redacted:6>")
+            .field("runtime_ready", &false)
+            .field("guest_calls", &0)
+            .finish()
+    }
 }
 
 /// Immutable, validation-only two-node artifact pair for the C6.4 resource
@@ -796,6 +1220,106 @@ impl core::fmt::Debug for NativeAsyncCommandPin {
     }
 }
 
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_DEVELOPMENT_ARTIFACT_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c73-development.artifact"));
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_OPERATOR_A_P1_ARTIFACT_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c73-operator-a-p1.artifact"));
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_OPERATOR_A_P1_EVIDENCE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c73-operator-a-p1.evidence"));
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_OPERATOR_B_P1_ARTIFACT_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c73-operator-b-p1.artifact"));
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_OPERATOR_B_P1_EVIDENCE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c73-operator-b-p1.evidence"));
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_OPERATOR_A_P2_ARTIFACT_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c73-operator-a-p2.artifact"));
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_OPERATOR_A_P2_EVIDENCE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c73-operator-a-p2.evidence"));
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_WRONG_SIGNER_EVIDENCE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c73-wrong-signer.evidence"));
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_UNKNOWN_SIGNER_EVIDENCE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c73-unknown-signer.evidence"));
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_REVOKED_SIGNER_EVIDENCE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c73-revoked-signer.evidence"));
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_CONTENT_HASH_ONLY_EVIDENCE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c73-content-hash-only.evidence"));
+
+macro_rules! c73_mutation_bytes {
+    ($artifact:ident, $evidence:ident, $name:literal) => {
+        #[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+        const $artifact: &[u8] = include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/c73-mutation-",
+            $name,
+            ".artifact"
+        ));
+        #[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+        const $evidence: &[u8] = include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/c73-mutation-",
+            $name,
+            ".evidence"
+        ));
+    };
+}
+
+c73_mutation_bytes!(
+    C73_MUTATION_ARTIFACT_ARTIFACT_BYTES,
+    C73_MUTATION_ARTIFACT_EVIDENCE_BYTES,
+    "artifact"
+);
+c73_mutation_bytes!(
+    C73_MUTATION_MODULE_ARTIFACT_BYTES,
+    C73_MUTATION_MODULE_EVIDENCE_BYTES,
+    "module"
+);
+c73_mutation_bytes!(
+    C73_MUTATION_WIT_ARTIFACT_BYTES,
+    C73_MUTATION_WIT_EVIDENCE_BYTES,
+    "wit"
+);
+c73_mutation_bytes!(
+    C73_MUTATION_ADAPTER_ARTIFACT_BYTES,
+    C73_MUTATION_ADAPTER_EVIDENCE_BYTES,
+    "adapter"
+);
+c73_mutation_bytes!(
+    C73_MUTATION_LIMIT_ARTIFACT_BYTES,
+    C73_MUTATION_LIMIT_EVIDENCE_BYTES,
+    "limit"
+);
+c73_mutation_bytes!(
+    C73_MUTATION_PROFILE_ARTIFACT_BYTES,
+    C73_MUTATION_PROFILE_EVIDENCE_BYTES,
+    "profile"
+);
+
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_OPERATOR_ROLE_BYTES: [u8; 32] =
+    include!(concat!(env!("OUT_DIR"), "/c73-operator-role.rs"));
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_ACTIVE_PUBLIC_KEY_BYTES: [u8; 32] =
+    include!(concat!(env!("OUT_DIR"), "/c73-active-public-key.rs"));
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_REVOKED_PUBLIC_KEY_BYTES: [u8; 32] =
+    include!(concat!(env!("OUT_DIR"), "/c73-revoked-public-key.rs"));
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+const C73_DEVELOPMENT_POLICY_DIGEST_BYTES: [u8; 32] = include!(concat!(
+    env!("OUT_DIR"),
+    "/c73-development-policy-digest.rs"
+));
+
 const C53_STREAM_FILTER_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/c53-stream-filter.component.wasm"
@@ -1051,6 +1575,100 @@ pub const C53_NATIVE_ASYNC_COMMAND: NativeAsyncCommandPin = NativeAsyncCommandPi
         resources: 8,
     },
 };
+
+/// Closed C7.3 development and deployable operator-authentication fixture.
+///
+/// Build-time checks independently regenerate every canonical artifact and
+/// policy commitment, strictly verify every checked signature, and require
+/// exact equality with the public vector file. No signing seed is linked into
+/// this image. All artifacts and evidence remain inert (`runtime_ready=false`,
+/// `guest_calls=0`) until later authenticated admission and execution gates.
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+pub const C73_AUTHENTICATED_ADMISSION_QEMU_ACCEPTANCE: C73AuthenticatedAdmissionPin =
+    C73AuthenticatedAdmissionPin {
+        development: C73DevelopmentArtifactPin {
+            artifact_bytes: C73_DEVELOPMENT_ARTIFACT_BYTES,
+            signer_policy_digest: C73_DEVELOPMENT_POLICY_DIGEST_BYTES,
+        },
+        policy_p1: C73OperatorPolicyPin {
+            generation: 1,
+            operator_role: C73_OPERATOR_ROLE_BYTES,
+            active_signer: C73_ACTIVE_PUBLIC_KEY_BYTES,
+            revoked_signer: C73_REVOKED_PUBLIC_KEY_BYTES,
+            exact_wit_source: include_str!("../artifacts/c73-byte-filter.wit"),
+        },
+        policy_p2: C73OperatorPolicyPin {
+            generation: 2,
+            operator_role: C73_OPERATOR_ROLE_BYTES,
+            active_signer: C73_ACTIVE_PUBLIC_KEY_BYTES,
+            revoked_signer: C73_REVOKED_PUBLIC_KEY_BYTES,
+            exact_wit_source: include_str!("../artifacts/c73-byte-filter.wit"),
+        },
+        operator_p1: [
+            C73OperatorArtifactPin {
+                artifact_bytes: C73_OPERATOR_A_P1_ARTIFACT_BYTES,
+                evidence_bytes: C73_OPERATOR_A_P1_EVIDENCE_BYTES,
+            },
+            C73OperatorArtifactPin {
+                artifact_bytes: C73_OPERATOR_B_P1_ARTIFACT_BYTES,
+                evidence_bytes: C73_OPERATOR_B_P1_EVIDENCE_BYTES,
+            },
+        ],
+        operator_p2: C73OperatorArtifactPin {
+            artifact_bytes: C73_OPERATOR_A_P2_ARTIFACT_BYTES,
+            evidence_bytes: C73_OPERATOR_A_P2_EVIDENCE_BYTES,
+        },
+        rejected_evidence: [
+            C73RejectedEvidencePin {
+                kind: C73RejectedEvidenceKind::WrongSignature,
+                evidence_bytes: C73_WRONG_SIGNER_EVIDENCE_BYTES,
+            },
+            C73RejectedEvidencePin {
+                kind: C73RejectedEvidenceKind::UnknownSigner,
+                evidence_bytes: C73_UNKNOWN_SIGNER_EVIDENCE_BYTES,
+            },
+            C73RejectedEvidencePin {
+                kind: C73RejectedEvidenceKind::RevokedSigner,
+                evidence_bytes: C73_REVOKED_SIGNER_EVIDENCE_BYTES,
+            },
+            C73RejectedEvidencePin {
+                kind: C73RejectedEvidenceKind::ContentHashOnly,
+                evidence_bytes: C73_CONTENT_HASH_ONLY_EVIDENCE_BYTES,
+            },
+        ],
+        mutations: [
+            C73ArtifactMutationPin {
+                kind: C73ArtifactMutationKind::ArtifactManifest,
+                artifact_bytes: C73_MUTATION_ARTIFACT_ARTIFACT_BYTES,
+                evidence_bytes: C73_MUTATION_ARTIFACT_EVIDENCE_BYTES,
+            },
+            C73ArtifactMutationPin {
+                kind: C73ArtifactMutationKind::CoreModuleManifest,
+                artifact_bytes: C73_MUTATION_MODULE_ARTIFACT_BYTES,
+                evidence_bytes: C73_MUTATION_MODULE_EVIDENCE_BYTES,
+            },
+            C73ArtifactMutationPin {
+                kind: C73ArtifactMutationKind::ExactWitSource,
+                artifact_bytes: C73_MUTATION_WIT_ARTIFACT_BYTES,
+                evidence_bytes: C73_MUTATION_WIT_EVIDENCE_BYTES,
+            },
+            C73ArtifactMutationPin {
+                kind: C73ArtifactMutationKind::AdapterManifest,
+                artifact_bytes: C73_MUTATION_ADAPTER_ARTIFACT_BYTES,
+                evidence_bytes: C73_MUTATION_ADAPTER_EVIDENCE_BYTES,
+            },
+            C73ArtifactMutationPin {
+                kind: C73ArtifactMutationKind::InstanceLimits,
+                artifact_bytes: C73_MUTATION_LIMIT_ARTIFACT_BYTES,
+                evidence_bytes: C73_MUTATION_LIMIT_EVIDENCE_BYTES,
+            },
+            C73ArtifactMutationPin {
+                kind: C73ArtifactMutationKind::ProfileIdentity,
+                artifact_bytes: C73_MUTATION_PROFILE_ARTIFACT_BYTES,
+                evidence_bytes: C73_MUTATION_PROFILE_EVIDENCE_BYTES,
+            },
+        ],
+    };
 
 /// Exact validation-only graph policy root used by the C6.4 QEMU lifecycle
 /// proof. Resource authority is created later by the explicit kernel

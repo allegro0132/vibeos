@@ -147,6 +147,17 @@ wasm-c67-information-flow-acceptance = [
     "dep:vibeos-component-runtime",
     "vibeos-image-policy/c67-information-flow-qemu-acceptance",
 ]
+# QEMU-only C7.3 proof for the two disjoint artifact trust roots. The
+# development case retains an exact whole-envelope image pin; deployable
+# artifacts require detached operator evidence and remain unavailable after
+# command projection. No guest-execution feature, call, or durable lookup
+# surface is enabled by this gate.
+wasm-c73-authenticated-admission-acceptance = [
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-loader",
+    "dep:vibeos-component-runtime",
+    "vibeos-image-policy/c73-authenticated-admission-qemu-acceptance",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.
@@ -219,6 +230,7 @@ vibeos-component-command = { path = "../services/component-command", optional = 
 vibeos-component-format = { path = "../component-format", optional = true }
 vibeos-component-host = { path = "../services/component-host", optional = true }
 vibeos-component-image-adapter = { path = "../services/component-image-adapter", optional = true }
+vibeos-component-loader = { path = "../services/component-loader", optional = true }
 vibeos-component-runtime = { path = "../component-runtime", optional = true }
 vibeos-core = { path = "../core" }
 vibeos-durable-format = { path = "../durable-format" }

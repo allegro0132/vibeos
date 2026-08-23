@@ -8,16 +8,20 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::future::Future;
 use core::task::{Context, Poll, Waker};
+use ed25519_dalek::{Signer, SigningKey};
+use sha2::Digest;
 use std::sync::OnceLock;
 
 use vibeos_component_admission::{
     AdmissionPolicy, ArtifactTrust, CommandStreamMode, ComponentArtifact, InstanceLimits,
+    OperatorArtifactAdmissionPolicy, OperatorRoleIdentity, OperatorSignerStatus, OperatorSignerV1,
 };
 use vibeos_component_format::{
-    ComponentArtifactAdapterV1, ComponentArtifactCoreModuleV1, ComponentArtifactEntityKind,
-    ComponentArtifactInstanceLimitsV1, ComponentArtifactInterfaceDirection,
-    ComponentArtifactInterfaceV1, ComponentArtifactManifestV1, ComponentArtifactSignerPolicyV1,
-    ComponentArtifactV1, ProfileIdentity, COMPONENT_ARTIFACT_OBJECT_KIND_RAW,
+    ComponentArtifactAdapterV1, ComponentArtifactAuthenticationEvidenceV1,
+    ComponentArtifactCoreModuleV1, ComponentArtifactEntityKind, ComponentArtifactInstanceLimitsV1,
+    ComponentArtifactInterfaceDirection, ComponentArtifactInterfaceV1, ComponentArtifactManifestV1,
+    ComponentArtifactSignerPolicyV1, ComponentArtifactV1, ProfileIdentity,
+    COMPONENT_ARTIFACT_OBJECT_KIND_RAW,
 };
 use vibeos_component_runtime::{decode::inspect_component, world::WorldContract};
 use vibeos_core::cap::{CSpace, InvocationLease, Rights};
@@ -64,6 +68,13 @@ const MEMORY_BYTES: usize = 512 * 1024;
 const TOTAL_FUEL: u64 = 100_000;
 const POLL_QUANTUM: u64 = 100;
 const RESOURCE_LIMIT: u16 = 4;
+const OPERATOR_ROLE: [u8; 32] = [0x73; 32];
+// C7.3-only deterministic acceptance key, distinct from every SSH fixture.
+// This public test seed is absent from non-test builds.
+const OPERATOR_TEST_SEED: [u8; 32] = [
+    0x20, 0xc4, 0x84, 0xcd, 0x66, 0x0d, 0xbe, 0x4f, 0xdc, 0xac, 0x63, 0xf8, 0x12, 0x6a, 0x5b, 0x70,
+    0xfb, 0xee, 0xc3, 0x8a, 0x6a, 0x37, 0xc9, 0xa8, 0xbe, 0x06, 0x70, 0x59, 0x20, 0x36, 0xbd, 0x75,
+];
 
 #[derive(Clone, Copy)]
 enum SignerSpec {
@@ -265,6 +276,66 @@ fn admission_policy<'a>(
     }
 }
 
+fn operator_signer(status: OperatorSignerStatus) -> OperatorSignerV1 {
+    let key = SigningKey::from_bytes(&OPERATOR_TEST_SEED)
+        .verifying_key()
+        .to_bytes();
+    OperatorSignerV1::new(key, status)
+        .expect("the C7.3-specific operator fixture is canonical and strong")
+}
+
+fn operator_policy<'a>(
+    world: &'a WorldContract,
+    signers: &'a [OperatorSignerV1],
+    generation: u64,
+) -> OperatorArtifactAdmissionPolicy<'a> {
+    OperatorArtifactAdmissionPolicy::new(
+        OperatorRoleIdentity::from_bytes(OPERATOR_ROLE).unwrap(),
+        generation,
+        ProfileIdentity::PROFILE_1_SYNC,
+        "durable-filter",
+        "run",
+        0,
+        0,
+        WIT,
+        world,
+        admission_limits(),
+        CommandStreamMode::Required,
+        CommandStreamMode::Required,
+        CommandStreamMode::Optional,
+        &[],
+        signers,
+    )
+    .expect("the operator test policy is exact and independently configured")
+}
+
+fn operator_artifact_bytes(
+    component: &[u8],
+    policy: &OperatorArtifactAdmissionPolicy<'_>,
+) -> Vec<u8> {
+    let mut spec = ArtifactSpec::exact();
+    spec.signer = SignerSpec::Operator(*policy.commitment().unwrap().as_bytes());
+    artifact_bytes_for_component(component, spec)
+}
+
+fn operator_evidence(
+    artifact_bytes: &[u8],
+    policy: &OperatorArtifactAdmissionPolicy<'_>,
+) -> [u8; 112] {
+    let signing_key = SigningKey::from_bytes(&OPERATOR_TEST_SEED);
+    let artifact = ComponentArtifactV1::decode(artifact_bytes).unwrap();
+    let transcript = policy
+        .signature_transcript(&artifact, signing_key.verifying_key().to_bytes())
+        .unwrap();
+    let signature = signing_key.sign(&transcript).to_bytes();
+    ComponentArtifactAuthenticationEvidenceV1::new(
+        signing_key.verifying_key().to_bytes(),
+        signature,
+    )
+    .unwrap()
+    .encode()
+}
+
 fn stable<T>(value: u128, constructor: fn(u128) -> Option<T>) -> T {
     constructor(value).unwrap()
 }
@@ -427,6 +498,26 @@ fn load_exact(
         admission,
         Rights::READ,
     )
+}
+
+fn load_authenticated_exact(
+    encoded: Vec<u8>,
+    evidence: &[u8],
+    operator: &OperatorArtifactAdmissionPolicy<'_>,
+) -> Result<VolatileComponentCommand, ComponentLoadError> {
+    let artifact_read = artifact_read(&encoded);
+    let policy = DeployableComponentLoadPolicy::new(operator);
+    block_on(load_authenticated_component_command_with(
+        store_lease(Rights::READ),
+        artifact_read,
+        evidence,
+        &policy,
+        move |store, object| async move {
+            assert!(store.authorizes(Rights::READ));
+            assert!(object.authorizes(Rights::READ));
+            Ok(encoded)
+        },
+    ))
 }
 
 #[test]
@@ -782,5 +873,157 @@ fn rooted_length_and_capability_read_failures_do_not_fall_back() {
         ))
         .err(),
         Some(ComponentLoadError::Store(StoreError::ObjectUnavailable))
+    );
+}
+
+#[test]
+fn active_operator_policy_loads_two_distinct_signed_artifacts_without_an_image_pin() {
+    let world = exact_world();
+    let signers = [operator_signer(OperatorSignerStatus::Active)];
+    let policy = operator_policy(&world, &signers, 1);
+    let component_a = component_bytes();
+    let component_b = wat::parse_str(FILTER.replace("i32.const 32", "i32.const 1"))
+        .expect("the adjacent operator fixture must remain a valid Component");
+    assert_ne!(component_a, component_b);
+
+    for component in [&component_a, &component_b] {
+        let encoded = operator_artifact_bytes(component, &policy);
+        let evidence = operator_evidence(&encoded, &policy);
+        let command = load_authenticated_exact(encoded, &evidence, &policy)
+            .expect("one configured policy must authenticate distinct signed artifacts");
+        assert_eq!(command.manifest().name(), "durable-filter");
+        assert_eq!(command.manifest().world(), WORLD);
+        assert!(!command.runtime_ready());
+        assert_eq!(command.guest_calls(), 0);
+        assert_eq!(
+            ComponentCommandRunner::preflight(&command, command.manifest()),
+            Err(ComponentTerminal::Unavailable)
+        );
+    }
+}
+
+#[test]
+fn operator_authentication_has_no_development_or_content_hash_fallback() {
+    let world = exact_world();
+    let signers = [operator_signer(OperatorSignerStatus::Active)];
+    let policy = operator_policy(&world, &signers, 1);
+    let operator = operator_artifact_bytes(&component_bytes(), &policy);
+    let valid_evidence = operator_evidence(&operator, &policy);
+
+    let development = artifact_bytes(ArtifactSpec::exact());
+    assert_eq!(
+        load_authenticated_exact(development, &valid_evidence, &policy).err(),
+        Some(ComponentLoadError::Authentication(
+            ArtifactAuthenticationError::SignerPolicyKind
+        ))
+    );
+
+    let mut hash_only = valid_evidence;
+    let digest: [u8; 32] = sha2::Sha256::digest(&operator).into();
+    hash_only[48..80].copy_from_slice(&digest);
+    hash_only[80..112].copy_from_slice(&digest);
+    assert_eq!(
+        load_authenticated_exact(operator, &hash_only, &policy).err(),
+        Some(ComponentLoadError::Authentication(
+            ArtifactAuthenticationError::InvalidSignature
+        ))
+    );
+}
+
+#[test]
+fn signatures_and_receipts_cannot_replay_across_artifacts_or_policy_rotation() {
+    let world = exact_world();
+    let signers = [operator_signer(OperatorSignerStatus::Active)];
+    let policy_p1 = operator_policy(&world, &signers, 1);
+    let artifact_a_p1 = operator_artifact_bytes(&component_bytes(), &policy_p1);
+    let evidence_a_p1 = operator_evidence(&artifact_a_p1, &policy_p1);
+
+    let component_b = wat::parse_str(FILTER.replace("i32.const 32", "i32.const 1")).unwrap();
+    let artifact_b_p1 = operator_artifact_bytes(&component_b, &policy_p1);
+    assert_eq!(
+        load_authenticated_exact(artifact_b_p1, &evidence_a_p1, &policy_p1).err(),
+        Some(ComponentLoadError::Authentication(
+            ArtifactAuthenticationError::InvalidSignature
+        ))
+    );
+
+    let policy_p2 = operator_policy(&world, &signers, 2);
+    assert_ne!(
+        policy_p1.commitment().unwrap(),
+        policy_p2.commitment().unwrap()
+    );
+    assert_eq!(
+        load_authenticated_exact(artifact_a_p1, &evidence_a_p1, &policy_p2).err(),
+        Some(ComponentLoadError::Authentication(
+            ArtifactAuthenticationError::PolicyDigestMismatch
+        ))
+    );
+
+    let artifact_a_p2 = operator_artifact_bytes(&component_bytes(), &policy_p2);
+    let evidence_a_p2 = operator_evidence(&artifact_a_p2, &policy_p2);
+    assert!(load_authenticated_exact(artifact_a_p2, &evidence_a_p2, &policy_p2).is_ok());
+}
+
+#[test]
+fn valid_operator_signature_cannot_bypass_fresh_manifest_validation() {
+    let world = exact_world();
+    let signers = [operator_signer(OperatorSignerStatus::Active)];
+    let policy = operator_policy(&world, &signers, 1);
+    let commitment = *policy.commitment().unwrap().as_bytes();
+
+    for (mut spec, expected) in [
+        {
+            let mut spec = ArtifactSpec::exact();
+            spec.interface = InterfaceSpec::WrongShape;
+            (spec, ComponentLoadError::InterfaceManifest)
+        },
+        {
+            let mut spec = ArtifactSpec::exact();
+            spec.core = CoreSpec::WrongCommitment;
+            (spec, ComponentLoadError::CoreManifest)
+        },
+        {
+            let mut spec = ArtifactSpec::exact();
+            spec.adapter = true;
+            (spec, ComponentLoadError::UnsupportedAdapterEvidence)
+        },
+    ] {
+        spec.signer = SignerSpec::Operator(commitment);
+        let encoded = artifact_bytes(spec);
+        let evidence = operator_evidence(&encoded, &policy);
+        assert_eq!(
+            load_authenticated_exact(encoded, &evidence, &policy).err(),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn authenticated_loader_rejects_noncanonical_evidence_and_over_righted_store_authority() {
+    let world = exact_world();
+    let signers = [operator_signer(OperatorSignerStatus::Active)];
+    let operator = operator_policy(&world, &signers, 1);
+    let encoded = operator_artifact_bytes(&component_bytes(), &operator);
+    let evidence = operator_evidence(&encoded, &operator);
+    let policy = DeployableComponentLoadPolicy::new(&operator);
+
+    assert_eq!(
+        load_authenticated_exact(encoded.clone(), &evidence[..111], &operator).err(),
+        Some(ComponentLoadError::AuthenticationEvidence(
+            ComponentArtifactAuthenticationError::EncodedLength { actual: 111 }
+        ))
+    );
+
+    let artifact_read = artifact_read(&encoded);
+    assert_eq!(
+        block_on(load_authenticated_component_command_with(
+            store_lease(Rights::READ.union(Rights::INVOKE)),
+            artifact_read,
+            &evidence,
+            &policy,
+            move |_, _| async move { Ok(encoded) },
+        ))
+        .err(),
+        Some(ComponentLoadError::StoreAuthority)
     );
 }

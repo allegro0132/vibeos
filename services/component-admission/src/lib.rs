@@ -40,8 +40,10 @@ use vibeos_component_admission::{
 extern crate alloc;
 
 mod graph;
+mod information_flow;
 
 pub use graph::*;
+pub use information_flow::*;
 
 use alloc::{string::String, vec::Vec};
 use core::fmt;

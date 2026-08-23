@@ -98,11 +98,29 @@ compile_error!("feature `wasm-c65-async-chain-acceptance` requires the QEMU defa
 ))]
 compile_error!("feature `wasm-c66-node-replacement-acceptance` requires the QEMU default image");
 #[cfg(all(
+    feature = "wasm-c67-information-flow-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c67-information-flow-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "wasm-c67-information-flow-acceptance",
+    any(
+        feature = "legacy-shell",
+        feature = "component-graph-principals",
+        feature = "ssh-component-command",
+        feature = "wasm-c53-native-async-qemu-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c67-information-flow-acceptance` is isolated from live shell/guest diagnostics"
+);
+#[cfg(all(
     any(
         feature = "wasm-c63-graph-principal-acceptance",
         feature = "wasm-c64-resource-route-acceptance",
         feature = "wasm-c65-async-chain-acceptance",
-        feature = "wasm-c66-node-replacement-acceptance"
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance"
     ),
     any(
         all(
@@ -128,10 +146,26 @@ compile_error!("feature `wasm-c66-node-replacement-acceptance` requires the QEMU
         all(
             feature = "wasm-c65-async-chain-acceptance",
             feature = "wasm-c66-node-replacement-acceptance"
+        ),
+        all(
+            feature = "wasm-c63-graph-principal-acceptance",
+            feature = "wasm-c67-information-flow-acceptance"
+        ),
+        all(
+            feature = "wasm-c64-resource-route-acceptance",
+            feature = "wasm-c67-information-flow-acceptance"
+        ),
+        all(
+            feature = "wasm-c65-async-chain-acceptance",
+            feature = "wasm-c67-information-flow-acceptance"
+        ),
+        all(
+            feature = "wasm-c66-node-replacement-acceptance",
+            feature = "wasm-c67-information-flow-acceptance"
         )
     )
 ))]
-compile_error!("the C6.3, C6.4, C6.5, and C6.6 graph acceptance images are distinct roots");
+compile_error!("the C6.3 through C6.7 graph acceptance images are distinct roots");
 #[cfg(all(
     feature = "component-graph-principals",
     feature = "ssh-component-command"
@@ -237,6 +271,8 @@ mod bench_platform;
 mod board_led;
 mod cap_table_pool;
 mod code_pool;
+#[cfg(feature = "wasm-c67-information-flow-acceptance")]
+mod component_graph_information_flow;
 #[cfg(feature = "component-graph-principals")]
 pub mod component_graph_principals;
 mod component_instances;
@@ -760,6 +796,16 @@ pub extern "C" fn kmain() -> ! {
             sbi::shutdown(true);
         }
     });
+
+    #[cfg(feature = "wasm-c67-information-flow-acceptance")]
+    exec::spawn("wasm-c67-information-flow-acceptance", async {
+        if component_graph_information_flow::run_qemu_acceptance() {
+            crate::println!("WASM_C67_INFORMATION_FLOW PASS harts=4 nodes=3 edges=2 principal_policy_labels=3 typed_edges=2 async_edges=2 published=1 exact_render=1 negative_rejections=5 forbidden_classes=5 forbidden_hits=0 manifest_only=1 runtime_ready=0 guest_calls=0 registry_occupied=0 registry_header_mismatches=0");
+        } else {
+            crate::println!("WASM_C67_INFORMATION_FLOW FAIL");
+            sbi::shutdown(true);
+        }
+    });
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
     exec::spawn(
         "wasm-c54-native-revoke-worker",
@@ -788,7 +834,10 @@ pub extern "C" fn kmain() -> ! {
         world::SHELL_MEMORY_BUDGET,
         legacy_shell::shell_task(boot_time),
     );
-    #[cfg(not(feature = "legacy-shell"))]
+    #[cfg(not(any(
+        feature = "legacy-shell",
+        feature = "wasm-c67-information-flow-acceptance"
+    )))]
     {
         let space = world.spaces["vsh"].clone();
         let mut session = vsh::Session::with_cspace(space.0.clone());

@@ -154,6 +154,7 @@ fn main() {
 
     if env::var_os("CARGO_FEATURE_C65_ASYNC_CHAIN_QEMU_ACCEPTANCE").is_some()
         || env::var_os("CARGO_FEATURE_C66_NODE_REPLACEMENT_QEMU_ACCEPTANCE").is_some()
+        || env::var_os("CARGO_FEATURE_C67_INFORMATION_FLOW_QEMU_ACCEPTANCE").is_some()
     {
         let source = wat::parse_str(C65_ASYNC_SOURCE_SOURCE)
             .expect("pinned C6.5 source Component WAT must parse");

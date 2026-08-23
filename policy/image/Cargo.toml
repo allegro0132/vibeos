@@ -15,6 +15,7 @@ c53-native-async-command-projection = []
 c64-resource-route-qemu-acceptance = []
 c65-async-chain-qemu-acceptance = []
 c66-node-replacement-qemu-acceptance = []
+c67-information-flow-qemu-acceptance = []
 file-tree = []
 storage-bench = []
 

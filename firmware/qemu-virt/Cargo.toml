@@ -27,6 +27,9 @@ wasm-c65-async-chain-acceptance = [
 wasm-c66-node-replacement-acceptance = [
     "vibeos-kernel/wasm-c66-node-replacement-acceptance",
 ]
+wasm-c67-information-flow-acceptance = [
+    "vibeos-kernel/wasm-c67-information-flow-acceptance",
+]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = [
     "vibeos-kernel/ssh-test",

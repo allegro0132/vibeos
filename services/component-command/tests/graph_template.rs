@@ -483,6 +483,23 @@ fn admitted_async_edges_are_public_inert_exact_and_freshly_revalidated() {
 }
 
 #[test]
+fn command_information_flow_delegates_the_closed_fresh_admission_projection() {
+    let admitted = Arc::new(admitted_async_graph());
+    let expected = admitted
+        .information_flow()
+        .expect("direct admission diagnostic");
+    let template = ComponentGraphPrincipalTemplate::new(Arc::clone(&admitted))
+        .expect("async template must build");
+    let observed = template
+        .information_flow()
+        .expect("command diagnostic must freshly revalidate");
+
+    assert!(!observed.runtime_ready());
+    assert_eq!(observed.to_string(), expected.to_string());
+    assert_eq!(format!("{observed:?}"), format!("{expected:?}"));
+}
+
+#[test]
 fn supervisor_prepared_async_report_is_endpoint_only_positive_bounded_and_guest_inert() {
     let template = ComponentGraphPrincipalTemplate::new(Arc::new(admitted_async_graph()))
         .expect("async template must build");

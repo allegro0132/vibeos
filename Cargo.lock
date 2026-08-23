@@ -899,6 +899,9 @@ dependencies = [
 [[package]]
 name = "vibeos-component-format"
 version = "0.1.0"
+dependencies = [
+ "sha2",
+]
 
 [[package]]
 name = "vibeos-component-host"
@@ -1029,6 +1032,9 @@ version = "0.1.0"
 [[package]]
 name = "vibeos-durable-format"
 version = "0.1.0"
+dependencies = [
+ "vibeos-component-format",
+]
 
 [[package]]
 name = "vibeos-file-store"

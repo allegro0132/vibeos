@@ -6,6 +6,12 @@
 
 #![no_std]
 
+extern crate alloc;
+
+mod artifact;
+
+pub use artifact::*;
+
 /// Canonical eight-byte prefix for a durable component artifact envelope.
 pub const ARTIFACT_MAGIC: [u8; 8] = *b"VIBECMP\0";
 pub const ARTIFACT_ABI_VERSION: u16 = 1;
@@ -426,7 +432,11 @@ impl CoreFeature {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProfileLimits {
+    /// Maximum raw code-artifact input admitted by Profile 1. This predates
+    /// the C7 durable envelope and does not include its bounded metadata.
     pub max_artifact_bytes: usize,
+    /// Maximum exact raw Component payload within either volatile admission or
+    /// a canonical durable [`ComponentArtifactV1`] envelope.
     pub max_component_bytes: usize,
     pub max_core_module_bytes: usize,
     pub max_component_nesting: u32,

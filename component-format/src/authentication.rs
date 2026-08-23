@@ -15,6 +15,10 @@ pub const COMPONENT_ARTIFACT_AUTHENTICATION_MAGIC: [u8; 8] = *b"VIBESIG\0";
 pub const COMPONENT_ARTIFACT_AUTHENTICATION_VERSION: u16 = 1;
 /// Exact encoded size of [`ComponentArtifactAuthenticationEvidenceV1`].
 pub const COMPONENT_ARTIFACT_AUTHENTICATION_ENCODED_LEN: usize = 112;
+/// Stable durable ObjectKind for one canonical, detached operator evidence
+/// value. The tag selects this exact 112-byte decoder only; it is not an object
+/// name, lookup key, authentication receipt, capability, or execution right.
+pub const COMPONENT_ARTIFACT_OPERATOR_EVIDENCE_OBJECT_KIND_RAW: u32 = 0x434d_4531;
 /// Exact byte length of an operator-role Ed25519 public key.
 pub const COMPONENT_ARTIFACT_OPERATOR_PUBLIC_KEY_LEN: usize = 32;
 /// Exact byte length of an Ed25519 signature.

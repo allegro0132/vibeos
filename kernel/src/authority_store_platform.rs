@@ -45,12 +45,78 @@ pub use vibeos_authority_store::{
     PersistentTestReport,
 };
 
-const STORAGE_V2_EXTERNAL_POLICY: &[u8] = b"vibeos.storage-v2.external-policy.v1\0persistent-space=0x5053,slot=0,generation=0,rights=rgx,kind=0x43535043\0program-space=0x50524f47,slot=0,generation=0,rights=r,kind=0x50524731\0sealed-singleton-optional=0x53534801";
+const STORAGE_V2_EXTERNAL_POLICY_V1: &[u8] = b"vibeos.storage-v2.external-policy.v1\0persistent-space=0x5053,slot=0,generation=0,rights=rgx,kind=0x43535043\0program-space=0x50524f47,slot=0,generation=0,rights=r,kind=0x50524731\0sealed-singleton-optional=0x53534801";
+const STORAGE_V2_EXTERNAL_POLICY_V2: &[u8] = b"vibeos.storage-v2.external-policy.v2\0persistent-space=0x5053,slot=0,generation=0,rights=rgx,kind=0x43535043\0program-space=0x50524f47,slot=0,generation=0,rights=r,kind=0x50524731\0component-space=0x564942454f532d434f4d504f4e454e54,slot=0,generation=0,rights=r,kind=0x434d5031\0component-evidence=exact-root-relative,kind=0x434d4531,len=112,inline=1,ungranted=1\0sealed-singleton-optional=0x53534801";
 const SSH_CONFIG_OBJECT_KIND_RAW: u32 = 0x5353_4801;
+const COMPONENT_ARTIFACT_SPACE_ID_RAW: u128 = 0x5649_4245_4f53_2d43_4f4d_504f_4e45_4e54;
+const COMPONENT_ARTIFACT_OBJECT_KIND_RAW: u32 = 0x434d_5031;
+const COMPONENT_OPERATOR_EVIDENCE_OBJECT_KIND_RAW: u32 = 0x434d_4531;
 const M4_STORE_ID_RAW: u128 = 0x5649_4245_4f53_2d53_544f_5245_2d4d_3401;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StorageV2ExternalPolicy {
+    LegacyV1,
+    ComponentV2,
+}
+
+impl StorageV2ExternalPolicy {
+    const fn canonical(self) -> &'static [u8] {
+        match self {
+            Self::LegacyV1 => STORAGE_V2_EXTERNAL_POLICY_V1,
+            Self::ComponentV2 => STORAGE_V2_EXTERNAL_POLICY_V2,
+        }
+    }
+
+    fn commitment(self) -> [u8; 32] {
+        vibeos_segment_store::root_policy_commitment(self.canonical())
+    }
+
+    fn from_commitment(commitment: [u8; 32]) -> Option<Self> {
+        if commitment == Self::LegacyV1.commitment() {
+            Some(Self::LegacyV1)
+        } else if commitment == Self::ComponentV2.commitment() {
+            Some(Self::ComponentV2)
+        } else {
+            None
+        }
+    }
+}
+
+const fn active_storage_v2_external_policy() -> StorageV2ExternalPolicy {
+    #[cfg(feature = "component-durable-publication")]
+    {
+        StorageV2ExternalPolicy::ComponentV2
+    }
+    #[cfg(not(feature = "component-durable-publication"))]
+    {
+        StorageV2ExternalPolicy::LegacyV1
+    }
+}
+
 pub(crate) fn storage_v2_external_policy_sha256() -> [u8; 32] {
-    vibeos_segment_store::root_policy_commitment(STORAGE_V2_EXTERNAL_POLICY)
+    active_storage_v2_external_policy().commitment()
+}
+
+pub(crate) fn storage_v2_component_external_policy_sha256() -> [u8; 32] {
+    StorageV2ExternalPolicy::ComponentV2.commitment()
+}
+
+pub(crate) fn storage_v2_legacy_external_policy_sha256() -> [u8; 32] {
+    StorageV2ExternalPolicy::LegacyV1.commitment()
+}
+
+pub(crate) fn storage_v2_recovery_policy_is_recognized(commitment: [u8; 32]) -> bool {
+    if commitment == storage_v2_external_policy_sha256() {
+        return true;
+    }
+    #[cfg(feature = "component-durable-publication")]
+    {
+        commitment == storage_v2_legacy_external_policy_sha256()
+    }
+    #[cfg(not(feature = "component-durable-publication"))]
+    {
+        false
+    }
 }
 
 /// Construct the sole native-empty authority snapshot. It is deliberately the
@@ -62,7 +128,7 @@ pub(crate) fn storage_v2_empty_import(
     let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
     vibeos_segment_store::PersistentAuthorityImport::empty(
         store_id,
-        STORAGE_V2_EXTERNAL_POLICY,
+        active_storage_v2_external_policy().canonical(),
         Vec::new(),
     )
     .map_err(|_| DurableCSpaceError::RootPolicy)
@@ -87,12 +153,12 @@ pub(crate) fn is_storage_v2_native_empty_view(
 
 fn validate_storage_v2_records(
     records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    policy: StorageV2ExternalPolicy,
 ) -> Result<durable::RecoveryPreflight, DurableCSpaceError> {
     // The V2 logical stream is not constrained by the M4 journal's physical
     // 512-sector log; its envelope is the persistent authority snapshot
     // payload, which admits multi-MiB large objects.
-    if records.is_empty()
-        || records.len() > vibeos_segment_store::MAX_PERSISTENT_AUTHORITY_RECORDS
+    if records.is_empty() || records.len() > vibeos_segment_store::MAX_PERSISTENT_AUTHORITY_RECORDS
     {
         return Err(DurableCSpaceError::RootPolicy);
     }
@@ -102,7 +168,7 @@ fn validate_storage_v2_records(
     // This is the complete production validator: exact external roots, fixed
     // CSpace history, typed resource witnesses, and saved-program semantics.
     let snapshot = AuthoritySnapshot::from_legacy_preflight(records.len(), preflight.clone())?;
-    let _validated = authorize_snapshot(snapshot)?;
+    let _validated = authorize_snapshot_with_policy(snapshot, policy)?;
     Ok(preflight)
 }
 
@@ -115,6 +181,13 @@ pub(crate) fn validate_storage_v2_record_stream(
     storage_v2_recovery_import(record_stream).map(|_| ())
 }
 
+pub(crate) fn validate_storage_v2_record_stream_for_policy(
+    record_stream: &[u8],
+    policy_sha256: [u8; 32],
+) -> Result<(), DurableCSpaceError> {
+    storage_v2_recovery_import_for_policy(record_stream, policy_sha256).map(|_| ())
+}
+
 /// Reconstruct the exact inert authority import selected by the kernel's
 /// compiled external policy. Cold Storage V2 recovery uses this value to prove
 /// that every private stable-object binding names the logical record bytes,
@@ -122,6 +195,18 @@ pub(crate) fn validate_storage_v2_record_stream(
 pub(crate) fn storage_v2_recovery_import(
     record_stream: &[u8],
 ) -> Result<vibeos_segment_store::PersistentAuthorityImport, DurableCSpaceError> {
+    storage_v2_recovery_import_for_policy(record_stream, storage_v2_external_policy_sha256())
+}
+
+/// Reconstruct an inert import under exactly the policy committed by the
+/// recovered V2 checkpoint. v1 and v2 are separate semantic profiles; an
+/// unknown digest is never interpreted as the active build's policy.
+pub(crate) fn storage_v2_recovery_import_for_policy(
+    record_stream: &[u8],
+    policy_sha256: [u8; 32],
+) -> Result<vibeos_segment_store::PersistentAuthorityImport, DurableCSpaceError> {
+    let policy = StorageV2ExternalPolicy::from_commitment(policy_sha256)
+        .ok_or(DurableCSpaceError::RootPolicy)?;
     if record_stream.is_empty()
         || !record_stream
             .len()
@@ -144,7 +229,7 @@ pub(crate) fn storage_v2_recovery_import(
                 .map_err(|_| DurableCSpaceError::RootPolicy)?,
         );
     }
-    storage_v2_migration_import(&records)
+    storage_v2_import_exact_policy(&records, policy)
 }
 
 #[cfg(any(test, feature = "legacy-shell"))]
@@ -224,12 +309,74 @@ mod storage_v2_policy_tests {
         );
         assert_eq!(native.admitted_object_count(), 0);
     }
+
+    #[cfg_attr(test, test)]
+    pub(crate) fn storage_v2_policy_commitments_dispatch_without_reinterpretation() {
+        let store_id = StoreId::new(M4_STORE_ID_RAW).unwrap();
+        let mut chain = durable::RecordChain::new(store_id);
+        let records = [chain.append(None, durable::RecordBody::Format).unwrap()];
+        let stream = record_stream(&records);
+        let legacy = storage_v2_recovery_import_for_policy(
+            &stream,
+            storage_v2_legacy_external_policy_sha256(),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.root_policy_sha256(),
+            storage_v2_legacy_external_policy_sha256()
+        );
+        assert_ne!(
+            storage_v2_legacy_external_policy_sha256(),
+            storage_v2_component_external_policy_sha256()
+        );
+        assert!(matches!(
+            storage_v2_recovery_import_for_policy(&stream, [0xa5; 32]),
+            Err(DurableCSpaceError::RootPolicy)
+        ));
+
+        #[cfg(feature = "component-durable-publication")]
+        {
+            let component = storage_v2_recovery_import_for_policy(
+                &stream,
+                storage_v2_component_external_policy_sha256(),
+            )
+            .unwrap();
+            assert_eq!(
+                component.root_policy_sha256(),
+                vibeos_component_loader::C74_STORAGE_V2_EXTERNAL_POLICY_SHA256
+            );
+            assert_eq!(
+                storage_v2_component_external_policy_sha256(),
+                vibeos_component_loader::C74_STORAGE_V2_EXTERNAL_POLICY_SHA256
+            );
+            assert!(storage_v2_recovery_policy_is_recognized(
+                storage_v2_legacy_external_policy_sha256()
+            ));
+            assert!(storage_v2_recovery_policy_is_recognized(
+                storage_v2_component_external_policy_sha256()
+            ));
+        }
+        #[cfg(not(feature = "component-durable-publication"))]
+        {
+            assert!(matches!(
+                storage_v2_recovery_import_for_policy(
+                    &stream,
+                    storage_v2_component_external_policy_sha256(),
+                ),
+                Err(DurableCSpaceError::RootPolicy)
+            ));
+            assert!(!storage_v2_recovery_policy_is_recognized(
+                storage_v2_component_external_policy_sha256()
+            ));
+        }
+    }
 }
 
 #[cfg(feature = "legacy-shell")]
 pub(crate) fn run_storage_v2_policy_selftests() {
     storage_v2_policy_tests::v2_stream_policy_accepts_canonical_empty_authority();
     storage_v2_policy_tests::v2_stream_policy_rejects_semantic_extra_root_with_canonical_records();
+    storage_v2_policy_tests::storage_v2_policy_commitments_dispatch_without_reinterpretation();
 }
 
 /// Build the inert import only after running the same exact graph and saved
@@ -241,9 +388,38 @@ pub(crate) fn storage_v2_migration_import(
     records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
 ) -> Result<vibeos_segment_store::PersistentAuthorityImport, DurableCSpaceError> {
     let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
-    let preflight = validate_storage_v2_records(records)?;
-    let roots = select_storage_v2_roots(&preflight)?;
-    storage_v2_import_from_parts(records, store_id, preflight, roots)
+    // Frozen M4 is always checked under its historical v1 allowlist. Only
+    // after that proof may the disjoint V2 checkpoint commit to the active
+    // policy. This is an explicit cutover, never an in-place reinterpretation
+    // of v1 media.
+    let preflight = validate_storage_v2_records(records, StorageV2ExternalPolicy::LegacyV1)?;
+    let roots = select_storage_v2_roots(&preflight, StorageV2ExternalPolicy::LegacyV1)?;
+    storage_v2_import_from_parts(
+        records,
+        store_id,
+        preflight,
+        roots,
+        active_storage_v2_external_policy(),
+    )
+}
+
+fn storage_v2_import_exact_policy(
+    records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    policy: StorageV2ExternalPolicy,
+) -> Result<vibeos_segment_store::PersistentAuthorityImport, DurableCSpaceError> {
+    let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
+    let preflight = validate_storage_v2_records(records, policy)?;
+    let roots = select_storage_v2_roots(&preflight, policy)?;
+    storage_v2_import_from_parts(records, store_id, preflight, roots, policy)
+}
+
+pub(crate) fn storage_v2_compaction_import_for_policy(
+    records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    policy_sha256: [u8; 32],
+) -> Result<vibeos_segment_store::PersistentAuthorityImport, DurableCSpaceError> {
+    let policy = StorageV2ExternalPolicy::from_commitment(policy_sha256)
+        .ok_or(DurableCSpaceError::RootPolicy)?;
+    storage_v2_import_exact_policy(records, policy)
 }
 
 fn storage_v2_import_from_parts(
@@ -251,6 +427,7 @@ fn storage_v2_import_from_parts(
     store_id: StoreId,
     preflight: durable::RecoveryPreflight,
     roots: Vec<RootPolicy>,
+    policy: StorageV2ExternalPolicy,
 ) -> Result<vibeos_segment_store::PersistentAuthorityImport, DurableCSpaceError> {
     let ssh_kind = durable::ObjectKind::new(SSH_CONFIG_OBJECT_KIND_RAW)
         .expect("fixed SSH configuration kind is non-zero");
@@ -259,18 +436,109 @@ fn storage_v2_import_from_parts(
         .iter()
         .any(|object| object.object_kind == ssh_kind)
         .then_some(ssh_kind);
-    // The preflight above already validated this exact stream; hand it to
-    // the import so the stream is not decoded a second time.
-    vibeos_segment_store::PersistentAuthorityImport::from_m4_with_sealed_singletons_preflighted(
+    let exact_attachments = exact_component_evidence_attachment(&preflight, &roots, policy)?;
+    // The policy pass above selects the exact root-relative attachment. The
+    // public import boundary independently re-preflights these same sectors so
+    // a caller-supplied recovery can never stand in for their provenance.
+    // Component evidence is retained only through that selected full record,
+    // never by `latest(kind)` or singleton scanning.
+    vibeos_segment_store::PersistentAuthorityImport::from_m4_with_exact_inline_attachments_preflighted(
         records,
         store_id,
         &roots,
         sealed_singletons.as_slice(),
-        STORAGE_V2_EXTERNAL_POLICY,
+        &exact_attachments,
+        policy.canonical(),
         Vec::new(),
         preflight,
     )
     .map_err(|_| DurableCSpaceError::RootPolicy)
+}
+
+fn exact_component_evidence_attachment(
+    preflight: &durable::RecoveryPreflight,
+    roots: &[RootPolicy],
+    policy: StorageV2ExternalPolicy,
+) -> Result<Vec<durable::RecoveredObject>, DurableCSpaceError> {
+    if policy == StorageV2ExternalPolicy::LegacyV1 {
+        return Ok(Vec::new());
+    }
+    #[cfg(not(feature = "component-durable-publication"))]
+    {
+        let _ = (preflight, roots);
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    #[cfg(feature = "component-durable-publication")]
+    {
+        use vibeos_component_format::{ComponentArtifactSignerPolicyKind, ComponentArtifactV1};
+
+        let recovered = preflight
+            .clone()
+            .finish(roots)
+            .map_err(|_| DurableCSpaceError::RootPolicy)?;
+        let present = vibeos_component_loader::validate_recovered_bundle_shape(&recovered)
+            .map_err(|_| DurableCSpaceError::RootPolicy)?;
+        if !present {
+            let artifact_kind = durable::ObjectKind::new(COMPONENT_ARTIFACT_OBJECT_KIND_RAW)
+                .expect("fixed Component artifact kind is non-zero");
+            let evidence_kind =
+                durable::ObjectKind::new(COMPONENT_OPERATOR_EVIDENCE_OBJECT_KIND_RAW)
+                    .expect("fixed Component evidence kind is non-zero");
+            if recovered.objects.iter().any(|object| {
+                object.object_kind == artifact_kind || object.object_kind == evidence_kind
+            }) {
+                // v2 does not treat an orphan of either reserved Component
+                // kind as a future lookup target. Initial installation is one
+                // complete bundle or no Component records at all.
+                return Err(DurableCSpaceError::RootPolicy);
+            }
+            return Ok(Vec::new());
+        }
+        let component_space = vibeos_durable_format::SpaceId::new(
+            vibeos_component_loader::COMPONENT_ARTIFACT_SPACE_ID_RAW,
+        )
+        .expect("fixed Component space is non-zero");
+        let root = recovered
+            .grants
+            .iter()
+            .find(|grant| grant.grant.target.space == component_space)
+            .ok_or(DurableCSpaceError::RootPolicy)?;
+        let artifact = recovered
+            .objects
+            .iter()
+            .find(|object| object.object_id == root.grant.object_id)
+            .ok_or(DurableCSpaceError::RootPolicy)?;
+        let artifact = ComponentArtifactV1::decode(&artifact.bytes)
+            .map_err(|_| DurableCSpaceError::RootPolicy)?;
+        match artifact.signer_policy().kind() {
+            ComponentArtifactSignerPolicyKind::DevelopmentImagePin => Ok(Vec::new()),
+            ComponentArtifactSignerPolicyKind::OperatorRequired => {
+                let evidence_id = root
+                    .transaction_id
+                    .get()
+                    .checked_sub(3)
+                    .and_then(durable::ObjectId::new)
+                    .ok_or(DurableCSpaceError::RootPolicy)?;
+                let evidence = recovered
+                    .objects
+                    .iter()
+                    .find(|object| object.object_id == evidence_id)
+                    .cloned()
+                    .ok_or(DurableCSpaceError::RootPolicy)?;
+                if preflight
+                    .committed_grants()
+                    .iter()
+                    .any(|grant| grant.grant.object_id == evidence_id)
+                {
+                    // Evidence is inert data forever. Even a tombstoned
+                    // historical grant would prove that this stable object
+                    // once crossed the capability boundary.
+                    return Err(DurableCSpaceError::RootPolicy);
+                }
+                Ok(vec![evidence])
+            }
+        }
+    }
 }
 
 /// Retained validated replay of the exact published logical stream, so the
@@ -300,6 +568,30 @@ pub(crate) fn storage_v2_migration_import_incremental(
     ),
     DurableCSpaceError,
 > {
+    storage_v2_migration_import_incremental_for_policy(
+        full_records,
+        appended,
+        observed,
+        cache,
+        storage_v2_external_policy_sha256(),
+    )
+}
+
+pub(crate) fn storage_v2_migration_import_incremental_for_policy(
+    full_records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    appended: usize,
+    observed: vibeos_durable_format::ChainCheckpoint,
+    cache: Option<StorageV2PreflightCache>,
+    policy_sha256: [u8; 32],
+) -> Result<
+    (
+        vibeos_segment_store::PersistentAuthorityImport,
+        StorageV2PreflightCache,
+    ),
+    DurableCSpaceError,
+> {
+    let policy = StorageV2ExternalPolicy::from_commitment(policy_sha256)
+        .ok_or(DurableCSpaceError::RootPolicy)?;
     if full_records.is_empty()
         || appended == 0
         || appended > full_records.len()
@@ -335,9 +627,9 @@ pub(crate) fn storage_v2_migration_import_incremental(
     // This is the complete production validator: exact external roots, fixed
     // CSpace history, typed resource witnesses, and saved-program semantics.
     let snapshot = AuthoritySnapshot::from_legacy_preflight(full_records.len(), preflight.clone())?;
-    let _validated = authorize_snapshot(snapshot)?;
-    let roots = select_storage_v2_roots(&preflight)?;
-    let import = storage_v2_import_from_parts(full_records, store_id, preflight, roots)?;
+    let _validated = authorize_snapshot_with_policy(snapshot, policy)?;
+    let roots = select_storage_v2_roots(&preflight, policy)?;
+    let import = storage_v2_import_from_parts(full_records, store_id, preflight, roots, policy)?;
     let checkpoint = replay
         .chain_checkpoint()
         .map_err(|_| DurableCSpaceError::RootPolicy)?;
@@ -359,12 +651,34 @@ pub(crate) fn storage_v2_compact_records(
     records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
     drop_ungranted_objects: bool,
 ) -> Result<Option<Vec<[u8; vibeos_durable_format::RECORD_SIZE]>>, DurableCSpaceError> {
-    let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
-    let preflight = durable::preflight_recovery(records, store_id)
-        .map_err(|_| DurableCSpaceError::RootPolicy)?;
-    let compacted = preflight
-        .compact(drop_ungranted_objects)
-        .map_err(|_| DurableCSpaceError::RootPolicy)?;
+    storage_v2_compact_records_for_policy(
+        records,
+        drop_ungranted_objects,
+        storage_v2_external_policy_sha256(),
+    )
+}
+
+pub(crate) fn storage_v2_compact_records_for_policy(
+    records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    drop_ungranted_objects: bool,
+    policy_sha256: [u8; 32],
+) -> Result<Option<Vec<[u8; vibeos_durable_format::RECORD_SIZE]>>, DurableCSpaceError> {
+    let policy = StorageV2ExternalPolicy::from_commitment(policy_sha256)
+        .ok_or(DurableCSpaceError::RootPolicy)?;
+    let compacted = if drop_ungranted_objects {
+        // Constructing the import first performs the complete external-policy
+        // pass and freezes its exact admitted set. Segment-store then retains
+        // only those full comparison records; no kernel kind/ID scan can turn
+        // an unrelated orphan into a compaction attachment.
+        storage_v2_import_exact_policy(records, policy)?
+            .compact_boot_boundary_records()
+            .map_err(|_| DurableCSpaceError::RootPolicy)?
+    } else {
+        let preflight = validate_storage_v2_records(records, policy)?;
+        preflight
+            .compact(false)
+            .map_err(|_| DurableCSpaceError::RootPolicy)?
+    };
     // The rewrite must be worth a replace checkpoint plus the risk budget of
     // touching authority at all: require at least a 25% record reduction.
     if compacted
@@ -1399,8 +1713,32 @@ struct TrustedSnapshot {
     program: TrustedProgram,
 }
 
+fn component_artifact_space_id() -> durable::SpaceId {
+    durable::SpaceId::new(COMPONENT_ARTIFACT_SPACE_ID_RAW)
+        .expect("fixed Component artifact space is non-zero")
+}
+
+fn component_space_has_live_root(
+    preflight: &durable::RecoveryPreflight,
+) -> Result<bool, DurableCSpaceError> {
+    let space = component_artifact_space_id();
+    let has_live = preflight
+        .slots()
+        .iter()
+        .any(|slot| slot.space == space && slot.live_derivation.is_some());
+    if preflight
+        .slots()
+        .iter()
+        .any(|slot| slot.space == space && slot.slot != 0)
+    {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    Ok(has_live)
+}
+
 fn select_storage_v2_roots(
     preflight: &durable::RecoveryPreflight,
+    policy: StorageV2ExternalPolicy,
 ) -> Result<Vec<RootPolicy>, DurableCSpaceError> {
     let has_live_authority = preflight
         .slots()
@@ -1409,6 +1747,14 @@ fn select_storage_v2_roots(
     let has_live_program = preflight.slots().iter().any(|slot| {
         slot.space == program_model::program_space_id() && slot.live_derivation.is_some()
     });
+    let has_live_component = component_space_has_live_root(preflight)?;
+    if policy == StorageV2ExternalPolicy::LegacyV1 && has_live_component {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    #[cfg(not(feature = "component-durable-publication"))]
+    if policy == StorageV2ExternalPolicy::ComponentV2 {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
     let persistent_constraints = [RootConstraint {
         space: persistent_space_id(),
         first_slot: ROOT_SLOT,
@@ -1418,6 +1764,8 @@ fn select_storage_v2_roots(
         object_kind: persistent_object_kind(),
     }];
     let program_constraints = [program_model::program_root_constraint()];
+    #[cfg(feature = "component-durable-publication")]
+    let component_constraints = [vibeos_component_loader::root_constraint()];
     let mut partitions = Vec::new();
     if has_live_authority {
         partitions.push(RootPolicyPartition {
@@ -1429,6 +1777,13 @@ fn select_storage_v2_roots(
         partitions.push(RootPolicyPartition {
             space: program_model::program_space_id(),
             constraints: &program_constraints,
+        });
+    }
+    #[cfg(feature = "component-durable-publication")]
+    if policy == StorageV2ExternalPolicy::ComponentV2 && has_live_component {
+        partitions.push(RootPolicyPartition {
+            space: component_artifact_space_id(),
+            constraints: &component_constraints,
         });
     }
     let roots = durable::select_root_policy_union(preflight, &partitions)
@@ -1454,10 +1809,27 @@ fn select_storage_v2_roots(
     {
         return Err(DurableCSpaceError::RootPolicy);
     }
+    #[cfg(feature = "component-durable-publication")]
+    if policy == StorageV2ExternalPolicy::ComponentV2
+        && has_live_component
+        && !roots.iter().any(|root| {
+            root.grant.target.space == component_artifact_space_id()
+                && vibeos_component_loader::root_policy_is_exact(root)
+        })
+    {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
     Ok(roots)
 }
 
 fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, DurableCSpaceError> {
+    authorize_snapshot_with_policy(snapshot, StorageV2ExternalPolicy::LegacyV1)
+}
+
+fn authorize_snapshot_with_policy(
+    snapshot: AuthoritySnapshot,
+    policy: StorageV2ExternalPolicy,
+) -> Result<TrustedSnapshot, DurableCSpaceError> {
     let object_resolver = snapshot.object_resolver();
     let Some(preflight) = snapshot.preflight else {
         return Ok(TrustedSnapshot {
@@ -1486,7 +1858,7 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
     // Root selection is global. Each independently owned SpaceId contributes a
     // constraint only when its slot history says it has live authority; finish
     // then rejects every extra root not present in this union.
-    let roots = select_storage_v2_roots(&preflight)?;
+    let roots = select_storage_v2_roots(&preflight, policy)?;
     let root_object = roots
         .iter()
         .find(|root| root.grant.target.space == persistent_space_id())
@@ -1508,7 +1880,17 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
     let recovered = preflight
         .finish(&roots)
         .map_err(|_| DurableCSpaceError::RootPolicy)?;
-    let policy_spaces = [persistent_space_id(), program_model::program_space_id()];
+    if policy == StorageV2ExternalPolicy::ComponentV2 {
+        #[cfg(feature = "component-durable-publication")]
+        vibeos_component_loader::validate_recovered_bundle_shape(&recovered)
+            .map_err(|_| DurableCSpaceError::RootPolicy)?;
+        #[cfg(not(feature = "component-durable-publication"))]
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    let mut policy_spaces = vec![persistent_space_id(), program_model::program_space_id()];
+    if policy == StorageV2ExternalPolicy::ComponentV2 {
+        policy_spaces.push(component_artifact_space_id());
+    }
     let tombstone_partitions = durable::partition_tombstones_by_space(
         &committed_grants,
         &recovered.tombstones,
@@ -1527,14 +1909,21 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
         .ok_or(DurableCSpaceError::RootPolicy)?
         .tombstones
         .clone();
-    if recovered.grants.iter().any(|grant| {
-        !matches!(
-            grant.grant.target.space,
-            space if space == persistent_space_id() || space == program_model::program_space_id()
-        )
-    }) || recovered.slots.iter().any(|slot| {
-        slot.space != persistent_space_id() && slot.space != program_model::program_space_id()
-    }) {
+    let allowed_space = |space| {
+        space == persistent_space_id()
+            || space == program_model::program_space_id()
+            || (policy == StorageV2ExternalPolicy::ComponentV2
+                && space == component_artifact_space_id())
+    };
+    if recovered
+        .grants
+        .iter()
+        .any(|grant| !allowed_space(grant.grant.target.space))
+        || recovered
+            .slots
+            .iter()
+            .any(|slot| !allowed_space(slot.space))
+    {
         return Err(DurableCSpaceError::RootPolicy);
     }
     // The shape validator reads only object identities, never content, so
@@ -1566,8 +1955,11 @@ fn authorize_snapshot(snapshot: AuthoritySnapshot) -> Result<TrustedSnapshot, Du
     }) {
         return Err(DurableCSpaceError::RootPolicy);
     }
-    let shape =
-        validate_fixed_graph_shape(&persistent_committed_grants, &persistent, &recovered.objects)?;
+    let shape = validate_fixed_graph_shape(
+        &persistent_committed_grants,
+        &persistent,
+        &recovered.objects,
+    )?;
     let persistent_root = roots
         .iter()
         .find(|root| root.grant.target.space == persistent_space_id());

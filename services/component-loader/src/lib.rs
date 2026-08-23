@@ -13,13 +13,21 @@
 //! move-only authentication wrapper can enter the same fresh semantic gate.
 //! A content hash, policy digest, key identifier, or failed operator check can
 //! never select or fall back to development trust.
+//!
+//! C7.4 adds an initial-install-only Storage V2 publication protocol. Its
+//! private four/six-ID batches commit artifact or evidence-then-artifact before
+//! one exact READ root. Neither a command nor recovered authority escapes until
+//! an independent physical readback binds the complete global root-policy
+//! union and matches the sealed candidate byte-for-byte.
 
 #![no_std]
 
 extern crate alloc;
 
+mod publication;
 mod root;
 
+pub use publication::*;
 pub use root::*;
 
 use alloc::boxed::Box;
@@ -337,6 +345,26 @@ pub async fn load_authenticated_component_command(
     .await
 }
 
+/// Load one deployable artifact with only the inert evidence selected by its
+/// exact durable root bundle. The caller cannot substitute arbitrary evidence
+/// bytes or name an evidence object.
+pub async fn load_recovered_authenticated_component_command(
+    store_read: InvocationLease<StoreService>,
+    installed: InstalledOperatorComponentArtifact,
+    policy: &DeployableComponentLoadPolicy<'_>,
+) -> Result<VolatileComponentCommand, ComponentLoadError> {
+    let (artifact_read, evidence) = installed.into_parts();
+    let evidence = evidence.into_bytes();
+    load_authenticated_component_command_with(
+        store_read,
+        artifact_read,
+        &evidence,
+        policy,
+        get_with,
+    )
+    .await
+}
+
 async fn load_authenticated_component_command_with<Read, ReadFuture>(
     store_read: InvocationLease<StoreService>,
     artifact_read: ComponentArtifactPersistentRead,
@@ -391,6 +419,13 @@ pub fn project_development_component_command(
     bytes: &[u8],
     policy: &DevelopmentComponentLoadPolicy<'_>,
 ) -> Result<VolatileComponentCommand, ComponentLoadError> {
+    project_admitted_component(admit_development_component_bytes(bytes, policy)?)
+}
+
+pub(crate) fn admit_development_component_bytes(
+    bytes: &[u8],
+    policy: &DevelopmentComponentLoadPolicy<'_>,
+) -> Result<AdmittedComponent, ComponentLoadError> {
     // Parse the trusted image copy independently. The trust identity below is
     // derived from this copy, never from the durable bytes under review.
     let expected = ComponentArtifactV1::decode(policy.exact_artifact_bytes)
@@ -423,7 +458,8 @@ pub fn project_development_component_command(
         &CallerAuthority { offers: &[] },
     )
     .map_err(ComponentLoadError::Admission)?;
-    project_admitted_component(admitted)
+    validate_admitted_component(&admitted)?;
+    Ok(admitted)
 }
 
 fn authenticate_and_project_component_bytes(
@@ -431,12 +467,24 @@ fn authenticate_and_project_component_bytes(
     evidence_bytes: &[u8],
     policy: &DeployableComponentLoadPolicy<'_>,
 ) -> Result<VolatileComponentCommand, ComponentLoadError> {
+    project_admitted_component(authenticate_and_admit_component_bytes(
+        bytes,
+        evidence_bytes,
+        policy,
+    )?)
+}
+
+pub(crate) fn authenticate_and_admit_component_bytes(
+    bytes: &[u8],
+    evidence_bytes: &[u8],
+    policy: &DeployableComponentLoadPolicy<'_>,
+) -> Result<AdmittedComponent, ComponentLoadError> {
     let evidence = ComponentArtifactAuthenticationEvidenceV1::decode(evidence_bytes)
         .map_err(ComponentLoadError::AuthenticationEvidence)?;
     let artifact = ComponentArtifactV1::decode(bytes).map_err(ComponentLoadError::Artifact)?;
     let authenticated = authenticate_component_artifact(artifact, &evidence, policy.operator)
         .map_err(ComponentLoadError::Authentication)?;
-    project_authenticated_component_command(authenticated, policy.operator)
+    admit_authenticated_component(authenticated, policy.operator)
 }
 
 /// Consume one unforgeable, boot-local authentication wrapper and perform the
@@ -446,6 +494,13 @@ pub fn project_authenticated_component_command(
     authenticated: AuthenticatedComponentArtifact,
     policy: &OperatorArtifactAdmissionPolicy<'_>,
 ) -> Result<VolatileComponentCommand, ComponentLoadError> {
+    project_admitted_component(admit_authenticated_component(authenticated, policy)?)
+}
+
+fn admit_authenticated_component(
+    authenticated: AuthenticatedComponentArtifact,
+    policy: &OperatorArtifactAdmissionPolicy<'_>,
+) -> Result<AdmittedComponent, ComponentLoadError> {
     let artifact = authenticated.artifact();
     validate_operator_external_policy(artifact, policy)?;
     let component = ComponentArtifact::copy_from(artifact.component_bytes(), artifact.profile())
@@ -454,7 +509,8 @@ pub fn project_authenticated_component_command(
 
     let admitted = admit_authenticated(authenticated, policy, &CallerAuthority { offers: &[] })
         .map_err(map_authenticated_admission_error)?;
-    project_admitted_component(admitted)
+    validate_admitted_component(&admitted)?;
+    Ok(admitted)
 }
 
 fn map_authenticated_admission_error(error: AuthenticatedAdmissionError) -> ComponentLoadError {
@@ -469,14 +525,21 @@ fn map_authenticated_admission_error(error: AuthenticatedAdmissionError) -> Comp
 fn project_admitted_component(
     admitted: AdmittedComponent,
 ) -> Result<VolatileComponentCommand, ComponentLoadError> {
+    let manifest = validate_admitted_component(&admitted)?;
+    let command = VolatileComponentCommand { admitted, manifest };
+    command.revalidate()?;
+    Ok(command)
+}
+
+fn validate_admitted_component(
+    admitted: &AdmittedComponent,
+) -> Result<ComponentCommandManifest, ComponentLoadError> {
     if !admitted.grants().is_empty() || !admitted.command_manifest().requirements().is_empty() {
         return Err(ComponentLoadError::UnsupportedImports);
     }
     let manifest = try_manifest_from_admitted(&admitted).map_err(ComponentLoadError::Command)?;
     validate_admitted_filter(&admitted, &manifest).map_err(ComponentLoadError::Command)?;
-    let command = VolatileComponentCommand { admitted, manifest };
-    command.revalidate()?;
-    Ok(command)
+    Ok(manifest)
 }
 
 fn validate_external_policy(

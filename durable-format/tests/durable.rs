@@ -1117,6 +1117,49 @@ fn boot_compaction_may_drop_only_ungranted_objects() {
 }
 
 #[test]
+fn boot_compaction_retains_only_exact_ungranted_witnesses() {
+    let log = replace_style_log();
+    let original = preflight_recovery(&log.sectors, store()).unwrap();
+    let attachment = original
+        .committed_objects()
+        .iter()
+        .find(|candidate| candidate.object_id == object(300))
+        .unwrap()
+        .clone();
+    let compacted = original
+        .compact_with_exact_ungranted(core::slice::from_ref(&attachment))
+        .unwrap();
+    let recovered = preflight_recovery(&compacted, store()).unwrap();
+    let object_ids: Vec<u128> = recovered
+        .committed_objects()
+        .iter()
+        .map(|object| object.object_id.get())
+        .collect();
+    assert_eq!(object_ids, vec![100, 201, 210, 300]);
+
+    let mut substituted = attachment.clone();
+    substituted.bytes[0] ^= 1;
+    assert_eq!(
+        original.compact_with_exact_ungranted(&[substituted]),
+        Err(RecoveryError::CompactionMismatch)
+    );
+    let historically_granted = original
+        .committed_objects()
+        .iter()
+        .find(|candidate| candidate.object_id == object(200))
+        .unwrap()
+        .clone();
+    assert_eq!(
+        original.compact_with_exact_ungranted(&[historically_granted]),
+        Err(RecoveryError::CompactionMismatch)
+    );
+    assert_eq!(
+        original.compact_with_exact_ungranted(&[attachment.clone(), attachment]),
+        Err(RecoveryError::CompactionMismatch)
+    );
+}
+
+#[test]
 fn compaction_is_idempotent_and_preserves_root_selection() {
     let log = replace_style_log();
     let original = preflight_recovery(&log.sectors, store()).unwrap();

@@ -11,15 +11,18 @@ extern crate alloc;
 use alloc::{sync::Arc, vec::Vec};
 
 use vibeos_component_format::{
+    ComponentArtifactAuthenticationEvidenceV1, ComponentArtifactSignerPolicyKind,
+    ComponentArtifactV1, COMPONENT_ARTIFACT_AUTHENTICATION_ENCODED_LEN,
     COMPONENT_ARTIFACT_HEADER_LEN, COMPONENT_ARTIFACT_OBJECT_KIND_RAW,
-    MAX_COMPONENT_ARTIFACT_ENCODED_BYTES,
+    COMPONENT_ARTIFACT_OPERATOR_EVIDENCE_OBJECT_KIND_RAW, MAX_COMPONENT_ARTIFACT_ENCODED_BYTES,
 };
 use vibeos_core::cap::{
     CSpace, PersistentDerivationWitness, PersistentInstallError, PersistentResourceWitness, Rights,
 };
 use vibeos_durable_format::{
-    DurableRights, ObjectKind, RecoveredGrant, RecoveredObject, RecoveredSlot, RecoveredStore,
-    ResourceKind, RootConstraint, RootPolicy, RootRightsConstraint, SpaceId,
+    DerivationId, DurableRights, ObjectId, ObjectKind, RecoveredGrant, RecoveredObject,
+    RecoveredSlot, RecoveredStore, ResourceKind, RootConstraint, RootPolicy, RootRightsConstraint,
+    SpaceId, TransactionId,
 };
 use vibeos_object_store::{BoundAuthorityRecovery, StoredObject};
 
@@ -28,26 +31,33 @@ use vibeos_object_store::{BoundAuthorityRecovery, StoredObject};
 /// This value is policy metadata, not authority and not an object lookup key.
 pub const COMPONENT_ARTIFACT_SPACE_ID_RAW: u128 = 0x5649_4245_4f53_2d43_4f4d_504f_4e45_4e54;
 
-const COMPONENT_ARTIFACT_ROOT_SLOT: u32 = 0;
-const COMPONENT_ARTIFACT_ROOT_GENERATION: u64 = 0;
+pub(crate) const COMPONENT_ARTIFACT_ROOT_SLOT: u32 = 0;
+pub(crate) const COMPONENT_ARTIFACT_ROOT_GENERATION: u64 = 0;
 const STORED_OBJECT_RESOURCE_KIND_RAW: u32 = 0x5354_4f52;
-const COMPONENT_ARTIFACT_ROOT_RIGHTS: DurableRights = DurableRights::READ;
+pub(crate) const COMPONENT_ARTIFACT_ROOT_RIGHTS: DurableRights = DurableRights::READ;
 
-const fn component_artifact_space_id() -> SpaceId {
+pub(crate) const fn component_artifact_space_id() -> SpaceId {
     match SpaceId::new(COMPONENT_ARTIFACT_SPACE_ID_RAW) {
         Some(space) => space,
         None => unreachable!(),
     }
 }
 
-const fn component_artifact_object_kind() -> ObjectKind {
+pub(crate) const fn component_artifact_object_kind() -> ObjectKind {
     match ObjectKind::new(COMPONENT_ARTIFACT_OBJECT_KIND_RAW) {
         Some(kind) => kind,
         None => unreachable!(),
     }
 }
 
-const fn stored_object_resource_kind() -> ResourceKind {
+pub(crate) const fn operator_evidence_object_kind() -> ObjectKind {
+    match ObjectKind::new(COMPONENT_ARTIFACT_OPERATOR_EVIDENCE_OBJECT_KIND_RAW) {
+        Some(kind) => kind,
+        None => unreachable!(),
+    }
+}
+
+pub(crate) const fn stored_object_resource_kind() -> ResourceKind {
     match ResourceKind::new(STORED_OBJECT_RESOURCE_KIND_RAW) {
         Some(kind) => kind,
         None => unreachable!(),
@@ -93,6 +103,15 @@ pub enum ComponentRootError {
     ObjectSize,
     /// Prepare/commit ordering cannot prove object-before-root publication.
     CommitOrder,
+    /// The root-relative durable ID layout is not the sealed C7.4 bundle.
+    BundleIdentity,
+    /// Operator evidence is missing, ambiguous, externally stored, granted, or
+    /// otherwise not the sole exact root-relative attachment.
+    EvidenceShape,
+    /// The fixed-width evidence payload is not canonical.
+    EvidenceEncoding,
+    /// The rooted inline artifact is not one canonical ComponentArtifact.
+    ArtifactEncoding,
     /// The object-store snapshot could not bind the selected recovered object.
     ObjectBinding,
     /// Atomic persistent-CSpace installation rejected the recovered graph.
@@ -149,15 +168,15 @@ pub struct ComponentArtifactPersistentRead {
     expected_len: usize,
 }
 
-struct ValidatedRecoveredComponentRoot<'a> {
-    slot: &'a RecoveredSlot,
-    grant: &'a RecoveredGrant,
-    object: &'a RecoveredObject,
-    expected_len: usize,
+pub(crate) struct ValidatedRecoveredComponentRoot<'a> {
+    pub(crate) slot: &'a RecoveredSlot,
+    pub(crate) grant: &'a RecoveredGrant,
+    pub(crate) object: &'a RecoveredObject,
+    pub(crate) expected_len: usize,
 }
 
 impl ValidatedRecoveredComponentRoot<'_> {
-    fn bind(self, resource: Arc<StoredObject>) -> TrustedComponentArtifactRoot {
+    pub(crate) fn bind(self, resource: Arc<StoredObject>) -> TrustedComponentArtifactRoot {
         let resource = PersistentResourceWitness::new(
             self.grant.grant.object_id,
             stored_object_resource_kind(),
@@ -168,6 +187,82 @@ impl ValidatedRecoveredComponentRoot<'_> {
             grants: alloc::vec![self.grant.clone()],
             resource,
             expected_len: self.expected_len,
+        }
+    }
+}
+
+/// Canonical durable operator evidence selected only through the exact root
+/// bundle. It is inert data, not a StoredObject capability or an authentication
+/// receipt. This type intentionally implements neither `Clone` nor `Debug`.
+#[must_use = "root-bound operator evidence must be consumed by fresh authentication"]
+pub struct DurableOperatorEvidence {
+    encoded: [u8; COMPONENT_ARTIFACT_AUTHENTICATION_ENCODED_LEN],
+}
+
+impl DurableOperatorEvidence {
+    pub(crate) fn into_bytes(self) -> [u8; COMPONENT_ARTIFACT_AUTHENTICATION_ENCODED_LEN] {
+        self.encoded
+    }
+}
+
+/// Move-only root plus its exact inert operator-evidence attachment.
+///
+/// ```compile_fail
+/// use vibeos_component_loader::TrustedOperatorComponentArtifactBundle;
+/// fn no_raw_identity(bundle: &TrustedOperatorComponentArtifactBundle) {
+///     let _ = bundle.object_id();
+///     let _ = bundle.evidence_bytes();
+/// }
+/// ```
+#[must_use = "an authorized operator bundle must be installed or discarded"]
+pub struct TrustedOperatorComponentArtifactBundle {
+    root: TrustedComponentArtifactRoot,
+    evidence: DurableOperatorEvidence,
+}
+
+/// Exact typed artifact READ witness paired with root-bound inert evidence.
+#[must_use = "an installed operator bundle must be consumed by the authenticated loader"]
+pub struct InstalledOperatorComponentArtifact {
+    artifact: ComponentArtifactPersistentRead,
+    evidence: DurableOperatorEvidence,
+}
+
+impl InstalledOperatorComponentArtifact {
+    pub(crate) fn into_parts(self) -> (ComponentArtifactPersistentRead, DurableOperatorEvidence) {
+        (self.artifact, self.evidence)
+    }
+}
+
+impl TrustedOperatorComponentArtifactBundle {
+    pub fn install(
+        self,
+        cspace: &mut CSpace,
+        expected_incarnation: u64,
+    ) -> Result<InstalledOperatorComponentArtifact, ComponentRootError> {
+        let artifact = self.root.install(cspace, expected_incarnation)?;
+        Ok(InstalledOperatorComponentArtifact {
+            artifact,
+            evidence: self.evidence,
+        })
+    }
+}
+
+pub(crate) struct ValidatedRecoveredOperatorBundle<'a> {
+    pub(crate) root: ValidatedRecoveredComponentRoot<'a>,
+    pub(crate) evidence: &'a RecoveredObject,
+    pub(crate) evidence_bytes: [u8; COMPONENT_ARTIFACT_AUTHENTICATION_ENCODED_LEN],
+}
+
+impl ValidatedRecoveredOperatorBundle<'_> {
+    pub(crate) fn bind(
+        self,
+        resource: Arc<StoredObject>,
+    ) -> TrustedOperatorComponentArtifactBundle {
+        TrustedOperatorComponentArtifactBundle {
+            root: self.root.bind(resource),
+            evidence: DurableOperatorEvidence {
+                encoded: self.evidence_bytes,
+            },
         }
     }
 }
@@ -223,7 +318,76 @@ pub fn authorize_recovered(
     Ok(Some(validated.bind(resource)))
 }
 
-fn validate_recovered(
+/// Authorize one operator bundle only when the fixed root, root-relative six-ID
+/// layout, canonical inline evidence, and record order all agree. The evidence
+/// object is selected by its exact root-relative ID, never by newest kind.
+pub fn authorize_recovered_operator_bundle(
+    recovery: &BoundAuthorityRecovery,
+) -> Result<Option<TrustedOperatorComponentArtifactBundle>, ComponentRootError> {
+    let Some(validated) = validate_recovered_operator_bundle(recovery.recovered())? else {
+        return Ok(None);
+    };
+    if recovery
+        .exact_object_has_grant_history(validated.evidence)
+        .map_err(|_| ComponentRootError::ObjectBinding)?
+    {
+        return Err(ComponentRootError::EvidenceShape);
+    }
+    let resource = recovery
+        .stored_object(validated.root.object)
+        .map_err(|_| ComponentRootError::ObjectBinding)?;
+    Ok(Some(validated.bind(resource)))
+}
+
+/// Inert semantic hook for the global authority-policy coordinator. It confers
+/// no capability and returns only root presence. Inline artifacts must select
+/// exactly one disjoint development or operator layout from their canonical
+/// signer-policy kind; mixed Component/evidence orphan objects fail closed.
+pub fn validate_recovered_bundle_shape(
+    recovered: &RecoveredStore,
+) -> Result<bool, ComponentRootError> {
+    let component_history = recovered
+        .slots
+        .iter()
+        .any(|slot| slot.space == component_artifact_space_id())
+        || recovered
+            .grants
+            .iter()
+            .any(|grant| grant.grant.target.space == component_artifact_space_id())
+        || recovered.objects.iter().any(|object| {
+            object.object_kind == component_artifact_object_kind()
+                || object.object_kind == operator_evidence_object_kind()
+        });
+    let Some(root) = validate_recovered(recovered)? else {
+        return if component_history {
+            Err(ComponentRootError::UnexpectedGraph)
+        } else {
+            Ok(false)
+        };
+    };
+    validate_single_artifact_object(recovered, root.object)?;
+    validate_c74_artifact_root_layout(&root)?;
+
+    if root.object.is_external() {
+        // C7.4's sealed initial-install protocol is deliberately one complete
+        // inline batch. C7.2 generic root recovery remains external-capable.
+        return Err(ComponentRootError::BundleIdentity);
+    }
+
+    let artifact = decode_canonical_artifact(root.object)?;
+    match artifact.signer_policy().kind() {
+        ComponentArtifactSignerPolicyKind::DevelopmentImagePin => {
+            validate_c74_reservation_end(recovered, &root, 2, 4)?;
+            reject_any_evidence_object(recovered)?;
+        }
+        ComponentArtifactSignerPolicyKind::OperatorRequired => {
+            let _ = validate_recovered_operator_from_root(recovered, root)?;
+        }
+    }
+    Ok(true)
+}
+
+pub(crate) fn validate_recovered(
     recovered: &RecoveredStore,
 ) -> Result<Option<ValidatedRecoveredComponentRoot<'_>>, ComponentRootError> {
     let space = component_artifact_space_id();
@@ -318,6 +482,209 @@ fn validate_recovered(
         object,
         expected_len,
     }))
+}
+
+pub(crate) fn validate_recovered_operator_bundle(
+    recovered: &RecoveredStore,
+) -> Result<Option<ValidatedRecoveredOperatorBundle<'_>>, ComponentRootError> {
+    let Some(root) = validate_recovered(recovered)? else {
+        return Ok(None);
+    };
+    validate_single_artifact_object(recovered, root.object)?;
+    if decode_canonical_artifact(root.object)?
+        .signer_policy()
+        .kind()
+        != ComponentArtifactSignerPolicyKind::OperatorRequired
+    {
+        return Err(ComponentRootError::ArtifactEncoding);
+    }
+    validate_recovered_operator_from_root(recovered, root).map(Some)
+}
+
+fn decode_canonical_artifact(
+    object: &RecoveredObject,
+) -> Result<ComponentArtifactV1, ComponentRootError> {
+    let artifact = ComponentArtifactV1::decode(&object.bytes)
+        .map_err(|_| ComponentRootError::ArtifactEncoding)?;
+    let canonical = artifact
+        .encode()
+        .map_err(|_| ComponentRootError::ArtifactEncoding)?;
+    if canonical != object.bytes {
+        return Err(ComponentRootError::ArtifactEncoding);
+    }
+    Ok(artifact)
+}
+
+fn validate_recovered_operator_from_root<'a>(
+    recovered: &'a RecoveredStore,
+    root: ValidatedRecoveredComponentRoot<'a>,
+) -> Result<ValidatedRecoveredOperatorBundle<'a>, ComponentRootError> {
+    if root.object.is_external() {
+        return Err(ComponentRootError::BundleIdentity);
+    }
+    validate_c74_artifact_root_layout(&root)?;
+    let root_transaction = root.grant.transaction_id.get();
+    let first = root_transaction
+        .checked_sub(4)
+        .ok_or(ComponentRootError::BundleIdentity)?;
+    validate_c74_reservation_end(recovered, &root, 4, 6)?;
+    let evidence_transaction =
+        TransactionId::new(first).ok_or(ComponentRootError::BundleIdentity)?;
+    let evidence_object = ObjectId::new(
+        first
+            .checked_add(1)
+            .ok_or(ComponentRootError::BundleIdentity)?,
+    )
+    .ok_or(ComponentRootError::BundleIdentity)?;
+
+    let mut exact = recovered
+        .objects
+        .iter()
+        .filter(|object| object.object_id == evidence_object);
+    let evidence = exact.next().ok_or(ComponentRootError::EvidenceShape)?;
+    if exact.next().is_some()
+        || evidence.transaction_id != evidence_transaction
+        || evidence.object_kind != operator_evidence_object_kind()
+        || evidence.is_external()
+        || evidence.byte_len() != COMPONENT_ARTIFACT_AUTHENTICATION_ENCODED_LEN as u64
+        || evidence.bytes.len() != COMPONENT_ARTIFACT_AUTHENTICATION_ENCODED_LEN
+        || evidence.prepare_sequence == 0
+        || evidence
+            .prepare_sequence
+            .checked_add(2)
+            .is_none_or(|commit| commit != evidence.commit_sequence)
+        || evidence
+            .commit_sequence
+            .checked_add(1)
+            .is_none_or(|prepare| prepare != root.object.prepare_sequence)
+        || recovered
+            .grants
+            .iter()
+            .any(|grant| grant.grant.object_id == evidence_object)
+    {
+        return Err(ComponentRootError::EvidenceShape);
+    }
+
+    let evidence_count = recovered
+        .objects
+        .iter()
+        .filter(|object| object.object_kind == operator_evidence_object_kind())
+        .count();
+    if evidence_count != 1 {
+        return Err(ComponentRootError::EvidenceShape);
+    }
+
+    let encoded: [u8; COMPONENT_ARTIFACT_AUTHENTICATION_ENCODED_LEN] = evidence
+        .bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| ComponentRootError::EvidenceEncoding)?;
+    let canonical = ComponentArtifactAuthenticationEvidenceV1::decode(&encoded)
+        .map_err(|_| ComponentRootError::EvidenceEncoding)?
+        .encode();
+    if canonical != encoded {
+        return Err(ComponentRootError::EvidenceEncoding);
+    }
+
+    Ok(ValidatedRecoveredOperatorBundle {
+        root,
+        evidence,
+        evidence_bytes: canonical,
+    })
+}
+
+fn validate_c74_reservation_end(
+    recovered: &RecoveredStore,
+    root: &ValidatedRecoveredComponentRoot<'_>,
+    root_transaction_offset: u128,
+    id_count: u128,
+) -> Result<(), ComponentRootError> {
+    let base = root
+        .grant
+        .transaction_id
+        .get()
+        .checked_sub(root_transaction_offset)
+        .ok_or(ComponentRootError::BundleIdentity)?;
+    let id_end = base
+        .checked_add(id_count)
+        .ok_or(ComponentRootError::BundleIdentity)?;
+    let space_end = COMPONENT_ARTIFACT_SPACE_ID_RAW
+        .checked_add(1)
+        .ok_or(ComponentRootError::BundleIdentity)?;
+    if recovered.id_high_water != id_end.max(space_end)
+        || recovered.last_sequence != root.grant.commit_sequence
+    {
+        return Err(ComponentRootError::BundleIdentity);
+    }
+    Ok(())
+}
+
+fn validate_single_artifact_object(
+    recovered: &RecoveredStore,
+    selected: &RecoveredObject,
+) -> Result<(), ComponentRootError> {
+    let mut artifacts = recovered
+        .objects
+        .iter()
+        .filter(|object| object.object_kind == component_artifact_object_kind());
+    let exact = artifacts
+        .next()
+        .ok_or(ComponentRootError::UnexpectedGraph)?;
+    if artifacts.next().is_some() || exact.object_id != selected.object_id {
+        return Err(ComponentRootError::UnexpectedGraph);
+    }
+    Ok(())
+}
+
+fn reject_any_evidence_object(recovered: &RecoveredStore) -> Result<(), ComponentRootError> {
+    if recovered
+        .objects
+        .iter()
+        .any(|object| object.object_kind == operator_evidence_object_kind())
+    {
+        Err(ComponentRootError::EvidenceShape)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_c74_artifact_root_layout(
+    root: &ValidatedRecoveredComponentRoot<'_>,
+) -> Result<(), ComponentRootError> {
+    let root_transaction = root.grant.transaction_id.get();
+    let expected_artifact_transaction = root_transaction
+        .checked_sub(2)
+        .and_then(TransactionId::new)
+        .ok_or(ComponentRootError::BundleIdentity)?;
+    let expected_artifact_object = root_transaction
+        .checked_sub(1)
+        .and_then(ObjectId::new)
+        .ok_or(ComponentRootError::BundleIdentity)?;
+    let expected_derivation = root_transaction
+        .checked_add(1)
+        .and_then(DerivationId::new)
+        .ok_or(ComponentRootError::BundleIdentity)?;
+    if root.object.transaction_id != expected_artifact_transaction
+        || root.object.object_id != expected_artifact_object
+        || root.grant.grant.object_id != expected_artifact_object
+        || root.grant.grant.derivation_id != expected_derivation
+    {
+        return Err(ComponentRootError::BundleIdentity);
+    }
+    if root
+        .object
+        .commit_sequence
+        .checked_add(1)
+        .is_none_or(|prepare| prepare != root.grant.prepare_sequence)
+        || root
+            .grant
+            .prepare_sequence
+            .checked_add(1)
+            .is_none_or(|commit| commit != root.grant.commit_sequence)
+    {
+        return Err(ComponentRootError::CommitOrder);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

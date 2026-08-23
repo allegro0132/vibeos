@@ -3,7 +3,9 @@ use vibeos_component_format::{
     ComponentArtifactAuthenticationEvidenceV1, ComponentArtifactEd25519Signature,
     ComponentArtifactOperatorPublicKey, COMPONENT_ARTIFACT_AUTHENTICATION_ENCODED_LEN,
     COMPONENT_ARTIFACT_AUTHENTICATION_MAGIC, COMPONENT_ARTIFACT_AUTHENTICATION_VERSION,
-    COMPONENT_ARTIFACT_ED25519_SIGNATURE_LEN, COMPONENT_ARTIFACT_OPERATOR_PUBLIC_KEY_LEN,
+    COMPONENT_ARTIFACT_ED25519_SIGNATURE_LEN, COMPONENT_ARTIFACT_OBJECT_KIND_RAW,
+    COMPONENT_ARTIFACT_OPERATOR_EVIDENCE_OBJECT_KIND_RAW,
+    COMPONENT_ARTIFACT_OPERATOR_PUBLIC_KEY_LEN,
 };
 
 const KEY: [u8; COMPONENT_ARTIFACT_OPERATOR_PUBLIC_KEY_LEN] =
@@ -45,6 +47,23 @@ fn exact_wire_round_trips_without_allocation_or_trailing_data() {
     assert_eq!(decoded.public_key().to_bytes(), KEY);
     assert_eq!(decoded.signature().as_bytes(), &SIGNATURE);
     assert_eq!(decoded.signature().to_bytes(), SIGNATURE);
+}
+
+#[test]
+fn durable_evidence_kind_is_fixed_nonzero_and_distinct_from_artifact() {
+    assert_eq!(
+        COMPONENT_ARTIFACT_OPERATOR_EVIDENCE_OBJECT_KIND_RAW,
+        0x434d_4531
+    );
+    assert_ne!(COMPONENT_ARTIFACT_OPERATOR_EVIDENCE_OBJECT_KIND_RAW, 0);
+    assert_ne!(
+        COMPONENT_ARTIFACT_OPERATOR_EVIDENCE_OBJECT_KIND_RAW,
+        COMPONENT_ARTIFACT_OBJECT_KIND_RAW
+    );
+    assert_eq!(
+        evidence().encode().len(),
+        COMPONENT_ARTIFACT_AUTHENTICATION_ENCODED_LEN
+    );
 }
 
 #[test]

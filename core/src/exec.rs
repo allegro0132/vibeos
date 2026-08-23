@@ -608,11 +608,16 @@ struct TaskStatus {
 
 impl TaskStatus {
     fn new(published: Arc<AtomicBool>) -> Self {
-        Self::with_joiners(published, Vec::new())
+        Self::with_ledgers(published, Vec::new(), Vec::new())
     }
 
-    fn with_joiners(published: Arc<AtomicBool>, joiners: Vec<JoinWaiter>) -> Self {
+    fn with_ledgers(
+        published: Arc<AtomicBool>,
+        joiners: Vec<JoinWaiter>,
+        registrations: Vec<OwnedRegistrationEntry>,
+    ) -> Self {
         debug_assert!(joiners.is_empty());
+        debug_assert!(registrations.is_empty());
         Self {
             published,
             polls: AtomicU64::new(0),
@@ -620,7 +625,7 @@ impl TaskStatus {
             next_joiner: AtomicU64::new(1),
             joiners: SpinLock::new(joiners),
             next_registration: AtomicU64::new(1),
-            registrations: SpinLock::new(Vec::new()),
+            registrations: SpinLock::new(registrations),
         }
     }
 
@@ -1823,6 +1828,15 @@ enum ReclaimableDomainError {
 /// graph supervisor; keeping this bound narrow prevents the reservation API
 /// from becoming a caller-sized hidden scheduler surface.
 pub const MAX_MANAGED_PUBLICATION_SAFE_TASKS: usize = 1;
+
+/// Maximum additional cleanup-ledger entries accepted by one prepared-task
+/// reservation call. Six covers the exact C6.5 supervisor peak: three
+/// lifecycle queues plus one join for each of its three managed nodes.
+pub const MAX_PREPARED_TASK_REGISTRATION_RESERVE: usize = 6;
+
+/// Maximum inbound join slots preallocated for one prepared SYSTEM task.
+/// Observation handles are move-only, so graph supervisors require one.
+pub const MAX_PREPARED_TASK_JOINER_RESERVE: usize = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ReclaimableDomainKey {
@@ -3308,6 +3322,12 @@ pub struct PreparedTaskBatch {
     /// prefix member. Reservation allocates every buffer before the first raw
     /// future; ordered managed preparation moves each buffer into TaskStatus.
     reserved_managed_joiners: Vec<Option<Vec<JoinWaiter>>>,
+    /// Optional per-task outbound ledgers allocated after managed scheduler
+    /// reservation but before any raw future. Managed members precede safe
+    /// members in the same order used by `tasks` and `handles`.
+    reserved_task_registrations: Vec<Option<Vec<OwnedRegistrationEntry>>>,
+    /// Optional inbound join ledgers for the bounded safe-task suffix.
+    reserved_safe_joiners: Vec<Option<Vec<JoinWaiter>>>,
     publication: Arc<AtomicBool>,
 }
 
@@ -3327,6 +3347,8 @@ impl PreparedTaskBatch {
             reserved_managed_tasks: 0,
             reserved_safe_tasks: 0,
             reserved_managed_joiners: Vec::new(),
+            reserved_task_registrations: Vec::new(),
+            reserved_safe_joiners: Vec::new(),
             publication,
         }
     }
@@ -3344,8 +3366,8 @@ impl PreparedTaskBatch {
         self.reclaimable_bindings.try_reserve_exact(additional)
     }
 
-    /// Reserve every recoverable scheduler resource for one exact managed
-    /// batch before any tracked future is allocated or registry record bound.
+    /// Reserve the scheduler-publication resources for one exact managed batch
+    /// before any tracked future is allocated or registry record bound.
     ///
     /// `managed` fixes the ordered `(instance, domain)` projection for the
     /// exclusive members. They must be prepared first and exactly in that
@@ -3361,6 +3383,11 @@ impl PreparedTaskBatch {
     /// into the exact TaskStatus objects without allocating. This lets the
     /// SYSTEM supervisor register its one lifecycle join per managed task after
     /// publication without growing a raw task's status ledger.
+    ///
+    /// Callers which also need per-task outbound registrations or safe-task
+    /// inbound joiners must next call [`Self::reserve_managed_task_ledgers`].
+    /// That separate recoverable step must likewise finish before the first
+    /// task is prepared.
     ///
     /// The reservation is invisible to task/domain reports and is released by
     /// `Drop` unless staging consumes it. Therefore every recoverable setup
@@ -3387,6 +3414,8 @@ impl PreparedTaskBatch {
             || self.reserved_managed_tasks != 0
             || self.reserved_safe_tasks != 0
             || !self.reserved_managed_joiners.is_empty()
+            || !self.reserved_task_registrations.is_empty()
+            || !self.reserved_safe_joiners.is_empty()
         {
             return Err(PreparedTaskBatchError::ExclusiveBindingRequired);
         }
@@ -3478,6 +3507,92 @@ impl PreparedTaskBatch {
         Ok(())
     }
 
+    /// Preallocate every TaskStatus ledger required by a hidden managed batch.
+    ///
+    /// This must run after [`Self::reserve_managed_publication`] and before the
+    /// first task is prepared. `managed_outbound` applies to each managed
+    /// prefix member. The bounded safe suffix currently contains at most one
+    /// task, so `safe_outbound` and `safe_inbound_joiners` apply to that exact
+    /// member. Zero requests install empty ledgers without granting an edge.
+    ///
+    /// Allocation failure leaves the batch task-free and fully droppable; no
+    /// raw-reclaimable future, TaskStatus registration, or join target exists.
+    pub fn reserve_managed_task_ledgers(
+        &mut self,
+        managed_outbound: usize,
+        safe_outbound: usize,
+        safe_inbound_joiners: usize,
+    ) -> Result<(), PreparedTaskBatchError> {
+        if self.published {
+            return Err(PreparedTaskBatchError::AlreadyPublished);
+        }
+        if self.binding_rejected {
+            return Err(PreparedTaskBatchError::ExclusiveBindingRejected);
+        }
+        if self.staged
+            || self.reserved_managed_tasks == 0
+            || !self.tasks.is_empty()
+            || !self.handles.is_empty()
+            || !self.reclaimable_bindings.is_empty()
+            || !self.reserved_task_registrations.is_empty()
+            || !self.reserved_safe_joiners.is_empty()
+        {
+            return Err(PreparedTaskBatchError::ExclusiveBindingRequired);
+        }
+        if managed_outbound > MAX_PREPARED_TASK_REGISTRATION_RESERVE
+            || safe_outbound > MAX_PREPARED_TASK_REGISTRATION_RESERVE
+            || safe_inbound_joiners > MAX_PREPARED_TASK_JOINER_RESERVE
+            || (self.reserved_safe_tasks == 0 && (safe_outbound != 0 || safe_inbound_joiners != 0))
+        {
+            return Err(PreparedTaskBatchError::ReclaimableCapacity);
+        }
+
+        let total = self
+            .reserved_managed_tasks
+            .checked_add(self.reserved_safe_tasks)
+            .ok_or(PreparedTaskBatchError::Capacity)?;
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        let mut task_registrations = Vec::new();
+        let mut safe_joiners = Vec::new();
+        let reserved = (|| {
+            task_registrations
+                .try_reserve_exact(total)
+                .map_err(|_| ())?;
+            for index in 0..total {
+                let capacity = if index < self.reserved_managed_tasks {
+                    managed_outbound
+                } else {
+                    safe_outbound
+                };
+                let mut registrations = Vec::new();
+                registrations.try_reserve_exact(capacity).map_err(|_| ())?;
+                task_registrations.push(Some(registrations));
+            }
+            safe_joiners
+                .try_reserve_exact(self.reserved_safe_tasks)
+                .map_err(|_| ())?;
+            for _ in 0..self.reserved_safe_tasks {
+                let mut joiners = Vec::new();
+                joiners
+                    .try_reserve_exact(safe_inbound_joiners)
+                    .map_err(|_| ())?;
+                safe_joiners.push(Some(joiners));
+            }
+            Ok::<(), ()>(())
+        })()
+        .is_ok();
+        if !reserved {
+            drop(task_registrations);
+            drop(safe_joiners);
+            system.restore();
+            return Err(PreparedTaskBatchError::Capacity);
+        }
+        self.reserved_task_registrations = task_registrations;
+        self.reserved_safe_joiners = safe_joiners;
+        system.restore();
+        Ok(())
+    }
+
     /// Borrow opaque, non-owning lifecycle tokens for the candidates already
     /// prepared in this batch. Before publication these handles expose only
     /// identity/domain data and `is_published == false`; state, polls, joins,
@@ -3492,20 +3607,19 @@ impl PreparedTaskBatch {
     ///
     /// This is the batch-local counterpart of
     /// [`try_reserve_current_task_registrations`]. It is used when a SYSTEM
-    /// supervisor will await a fixed lifecycle edge rather than retain an
-    /// owning [`TaskHandle::join`] future. The narrow bound prevents this from
-    /// becoming a caller-sized SYSTEM allocation surface.
+    /// supervisor will await a fixed set of lifecycle edges. The fixed
+    /// per-call bound prevents one request from becoming a caller-sized SYSTEM
+    /// allocation surface; it is not a total TaskStatus capacity ceiling.
     pub fn try_reserve_prepared_task_registrations(
         &mut self,
         task_index: usize,
         additional: usize,
     ) -> bool {
-        const MAX_PREPARED_REGISTRATION_RESERVE: usize = 2;
         if self.published
             || self.binding_rejected
             || task_index >= self.handles.len()
             || additional == 0
-            || additional > MAX_PREPARED_REGISTRATION_RESERVE
+            || additional > MAX_PREPARED_TASK_REGISTRATION_RESERVE
         {
             return false;
         }
@@ -3598,13 +3712,17 @@ impl PreparedTaskBatch {
             "a closed task batch is immutable"
         );
         let domain = heap::current_domain();
+        let mut joiners = Vec::new();
+        let mut registrations = Vec::new();
         if self.reserved_managed_tasks != 0 {
+            let task_index = self.tasks.len();
             assert!(
-                self.tasks.len() >= self.reserved_managed_tasks,
+                task_index >= self.reserved_managed_tasks,
                 "reserved safe tasks must follow every managed member"
             );
+            let safe_ordinal = task_index - self.reserved_managed_tasks;
             assert!(
-                self.tasks.len() - self.reserved_managed_tasks < self.reserved_safe_tasks,
+                safe_ordinal < self.reserved_safe_tasks,
                 "managed publication reserved no additional safe task"
             );
             assert_eq!(
@@ -3612,6 +3730,26 @@ impl PreparedTaskBatch {
                 AllocationDomain::SYSTEM,
                 "a reserved managed-batch supervisor must be SYSTEM-owned"
             );
+            if !self.reserved_safe_joiners.is_empty() {
+                assert_eq!(
+                    self.reserved_safe_joiners.len(),
+                    self.reserved_safe_tasks,
+                    "managed publication lost its safe-task join ledgers"
+                );
+                joiners = self.reserved_safe_joiners[safe_ordinal]
+                    .take()
+                    .expect("safe prepared member consumed its join ledger twice");
+            }
+            if !self.reserved_task_registrations.is_empty() {
+                assert_eq!(
+                    self.reserved_task_registrations.len(),
+                    self.reserved_managed_tasks + self.reserved_safe_tasks,
+                    "managed publication lost its per-task outbound ledgers"
+                );
+                registrations = self.reserved_task_registrations[task_index]
+                    .take()
+                    .expect("safe prepared member consumed its outbound ledger twice");
+            }
         }
         assert!(
             !domain.arena.is_tracked(),
@@ -3623,7 +3761,8 @@ impl PreparedTaskBatch {
             true,
             false,
             None,
-            Vec::new(),
+            joiners,
+            registrations,
             name,
             fut,
         )
@@ -3676,6 +3815,7 @@ impl PreparedTaskBatch {
             true,
             None,
             Vec::new(),
+            Vec::new(),
             name,
             fut,
         )
@@ -3715,6 +3855,7 @@ impl PreparedTaskBatch {
             load_fault_reclaimer().is_some(),
             "a managed instance task needs an installed fault reclaimer"
         );
+        let mut registrations = Vec::new();
         let joiners = if self.reserved_managed_tasks != 0 {
             let ordinal = self.tasks.len();
             assert!(
@@ -3737,9 +3878,20 @@ impl PreparedTaskBatch {
                 self.reserved_managed_tasks,
                 "managed publication lost its preallocated join ledgers"
             );
-            self.reserved_managed_joiners[ordinal]
+            let joiners = self.reserved_managed_joiners[ordinal]
                 .take()
-                .expect("managed prepared member consumed its join ledger twice")
+                .expect("managed prepared member consumed its join ledger twice");
+            if !self.reserved_task_registrations.is_empty() {
+                assert_eq!(
+                    self.reserved_task_registrations.len(),
+                    self.reserved_managed_tasks + self.reserved_safe_tasks,
+                    "managed publication lost its per-task outbound ledgers"
+                );
+                registrations = self.reserved_task_registrations[ordinal]
+                    .take()
+                    .expect("managed prepared member consumed its outbound ledger twice");
+            }
+            joiners
         } else {
             Vec::new()
         };
@@ -3750,6 +3902,7 @@ impl PreparedTaskBatch {
             true,
             Some(instance),
             joiners,
+            registrations,
             name,
             fut,
         )
@@ -3763,6 +3916,7 @@ impl PreparedTaskBatch {
         exclusive_reclaimable: bool,
         instance_token: Option<InstanceToken>,
         joiners: Vec<JoinWaiter>,
+        registrations: Vec<OwnedRegistrationEntry>,
         name: &str,
         fut: impl Future<Output = ()> + Send + 'static,
     ) -> &PreparedTask {
@@ -3786,6 +3940,7 @@ impl PreparedTaskBatch {
             self.publication.clone(),
             instance_token,
             joiners,
+            registrations,
         );
         task.publication = TaskPublication::Prepared(self.id);
         let id = task.id;
@@ -4449,10 +4604,15 @@ fn make_task(
     publication: Arc<AtomicBool>,
     instance_token: Option<InstanceToken>,
     joiners: Vec<JoinWaiter>,
+    registrations: Vec<OwnedRegistrationEntry>,
 ) -> (Task, TaskHandle) {
     let id = next_task_id();
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
-    let status = Arc::new(TaskStatus::with_joiners(publication, joiners));
+    let status = Arc::new(TaskStatus::with_ledgers(
+        publication,
+        joiners,
+        registrations,
+    ));
     let task_name = Arc::<str>::from(name);
     system.restore();
 
@@ -6974,7 +7134,10 @@ mod one_shot_wait_tests {
         assert!(batch.install_prepared_task_detach(0, detach));
         assert!(!batch.install_prepared_task_detach(0, detach));
         assert!(!batch.try_reserve_prepared_task_registrations(0, 0));
-        assert!(!batch.try_reserve_prepared_task_registrations(0, 3));
+        assert!(!batch.try_reserve_prepared_task_registrations(
+            0,
+            MAX_PREPARED_TASK_REGISTRATION_RESERVE + 1
+        ));
         assert!(!batch.try_reserve_prepared_task_registrations(1, 1));
         assert!(batch.try_reserve_prepared_task_registrations(0, 1));
 
@@ -7014,6 +7177,82 @@ mod one_shot_wait_tests {
             0,
             "normal supervisor exit disarmed its preinstalled callback"
         );
+    }
+
+    #[test]
+    fn prepared_six_edge_wait_uses_only_prepublication_registration_capacity() {
+        let _serial = EXECUTOR_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::arch::set_test_hart_id(0);
+        run_until_idle(10_000);
+
+        let queues: [Arc<OneShotWaitQueue>; MAX_PREPARED_TASK_REGISTRATION_RESERVE] =
+            core::array::from_fn(|_| Arc::new(OneShotWaitQueue::new()));
+        let task_queues = queues.clone();
+        let mut batch = PreparedTaskBatch::new();
+        batch.prepare("prepared-six-edge-supervisor", async move {
+            let mut waits: [OneShotWaitFuture<'_>; MAX_PREPARED_TASK_REGISTRATION_RESERVE] =
+                core::array::from_fn(|index| task_queues[index].wait(1));
+            let mut completed = [false; MAX_PREPARED_TASK_REGISTRATION_RESERVE];
+            core::future::poll_fn(|context| {
+                for (index, wait) in waits.iter_mut().enumerate() {
+                    if !completed[index] {
+                        if let Poll::Ready(result) = Pin::new(wait).poll(context) {
+                            result.expect("fixed prepared edge remains exact");
+                            completed[index] = true;
+                        }
+                    }
+                }
+                if completed.iter().all(|complete| *complete) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+        });
+
+        assert!(!batch.try_reserve_prepared_task_registrations(
+            0,
+            MAX_PREPARED_TASK_REGISTRATION_RESERVE + 1
+        ));
+        assert!(batch
+            .try_reserve_prepared_task_registrations(0, MAX_PREPARED_TASK_REGISTRATION_RESERVE));
+        let reserved_capacity = batch.prepared_handles()[0]
+            .status
+            .registrations
+            .lock()
+            .capacity();
+        let handles = batch
+            .publish()
+            .expect("six-edge prepared supervisor publishes");
+        run_until_idle(10_000);
+
+        assert!(queues.iter().all(|queue| queue.waiter_count() == 1));
+        assert_eq!(
+            handles[0].status.registrations.lock().len(),
+            MAX_PREPARED_TASK_REGISTRATION_RESERVE
+        );
+        assert_eq!(
+            handles[0].status.registrations.lock().capacity(),
+            reserved_capacity,
+            "six concurrent waits grew the published cleanup ledger"
+        );
+
+        for queue in &queues {
+            assert!(
+                queue
+                    .publish(1)
+                    .expect("exact queue generation publishes once")
+                    .dispatch(),
+                "published prepared edge wakes the exact supervisor"
+            );
+        }
+        run_until_idle(10_000);
+        assert_eq!(handles[0].state(), TaskState::Exited);
+        assert!(handles[0].status.registrations.lock().is_empty());
+        assert!(queues.iter().all(|queue| queue.waiter_count() == 0));
     }
 
     #[test]
@@ -7450,6 +7689,119 @@ mod reclaimable_domain_tests {
             drop(join);
             assert_eq!(handle.status.joiners.lock().len(), 0);
         }
+        for handle in handles {
+            assert_eq!(handle.cancel(), CancelOutcome::Requested);
+        }
+    }
+
+    #[test]
+    fn managed_task_ledgers_move_into_exact_statuses_before_publication() {
+        let _serial = EXECUTOR_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::arch::set_test_hart_id(0);
+        run_until_idle(10_000);
+        set_fault_reclaimer(accept_join_capacity_reclaim);
+
+        let registry = crate::instance::InstanceRegistry::new();
+        let domain = AllocationDomain::new(OwnerId::new(190), ArenaId::new(191));
+        let token = registry.reserve(domain).unwrap();
+        let plan = [(token, domain)];
+        let mut batch = PreparedTaskBatch::new();
+        batch.reserve_managed_publication(&plan, 1).unwrap();
+
+        assert_eq!(
+            batch.reserve_managed_task_ledgers(1, MAX_PREPARED_TASK_REGISTRATION_RESERVE + 1, 1,),
+            Err(PreparedTaskBatchError::ReclaimableCapacity)
+        );
+        assert!(batch.reserved_task_registrations.is_empty());
+        assert!(batch.reserved_safe_joiners.is_empty());
+
+        batch
+            .reserve_managed_task_ledgers(
+                1,
+                MAX_PREPARED_TASK_REGISTRATION_RESERVE,
+                MAX_PREPARED_TASK_JOINER_RESERVE,
+            )
+            .unwrap();
+        assert_eq!(
+            batch.reserve_managed_task_ledgers(1, 1, 1),
+            Err(PreparedTaskBatchError::ExclusiveBindingRequired)
+        );
+        assert_eq!(batch.reserved_task_registrations.len(), 2);
+        assert_eq!(batch.reserved_safe_joiners.len(), 1);
+        let managed_registration_capacity = batch.reserved_task_registrations[0]
+            .as_ref()
+            .expect("managed outbound ledger is reserved")
+            .capacity();
+        let supervisor_registration_capacity = batch.reserved_task_registrations[1]
+            .as_ref()
+            .expect("safe outbound ledger is reserved")
+            .capacity();
+        let supervisor_join_capacity = batch.reserved_safe_joiners[0]
+            .as_ref()
+            .expect("safe inbound join ledger is reserved")
+            .capacity();
+        assert!(managed_registration_capacity >= 1);
+        assert!(supervisor_registration_capacity >= MAX_PREPARED_TASK_REGISTRATION_RESERVE);
+        assert!(supervisor_join_capacity >= MAX_PREPARED_TASK_JOINER_RESERVE);
+
+        unsafe {
+            batch.prepare_managed_instance_owned(
+                token,
+                domain,
+                "managed-preallocated-outbound-target",
+                core::future::pending::<()>(),
+            );
+        }
+        let mut system = heap::enter_owner(OwnerId::SYSTEM);
+        batch.prepare(
+            "safe-preallocated-ledger-target",
+            core::future::pending::<()>(),
+        );
+        system.restore();
+
+        assert!(batch
+            .reserved_task_registrations
+            .iter()
+            .all(Option::is_none));
+        assert!(batch.reserved_safe_joiners.iter().all(Option::is_none));
+        let prepared_handles = batch.prepared_handles().to_vec();
+        assert_eq!(
+            prepared_handles[0].status.registrations.lock().capacity(),
+            managed_registration_capacity
+        );
+        assert_eq!(
+            prepared_handles[1].status.registrations.lock().capacity(),
+            supervisor_registration_capacity
+        );
+        assert_eq!(
+            prepared_handles[1].status.joiners.lock().capacity(),
+            supervisor_join_capacity
+        );
+
+        let bindings = batch.prepared_reclaimable_bindings().to_vec();
+        registry
+            .bind(token, bindings[0], &prepared_handles[0])
+            .unwrap();
+        let handles = unsafe {
+            batch.publish_exclusive_reclaimable_with(|bindings| registry.activate_batch(bindings))
+        }
+        .unwrap();
+
+        let waker = Waker::from(Arc::new(SilentWake));
+        let mut join = Box::pin(handles[1].join());
+        assert_eq!(
+            join.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        );
+        let joiners = handles[1].status.joiners.lock();
+        assert_eq!(joiners.len(), 1);
+        assert_eq!(joiners.capacity(), supervisor_join_capacity);
+        drop(joiners);
+        drop(join);
+        assert_eq!(handles[1].status.joiners.lock().len(), 0);
+
         for handle in handles {
             assert_eq!(handle.cancel(), CancelOutcome::Requested);
         }

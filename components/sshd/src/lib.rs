@@ -1349,7 +1349,6 @@ fn component_stream_error(error: StreamError) -> &'static str {
         StreamError::Busy => "SSH Component stream operation overlapped",
         StreamError::TokenMismatch => "SSH Component stream token changed",
         StreamError::WakeAlreadyRegistered => "SSH Component stream wake was duplicated",
-        StreamError::WakeNotSignalled => "SSH Component stream wake was not signalled",
         StreamError::SealedWakeRequired => "SSH Component stream required a sealed wake",
         StreamError::InvalidCommitLength => "SSH Component stream commit length was invalid",
         StreamError::EndpointClosed => "SSH Component stream endpoint closed unexpectedly",
@@ -4642,10 +4641,6 @@ mod tests {
 
     #[test]
     fn component_wake_protocol_errors_have_exact_fail_closed_diagnostics() {
-        assert_eq!(
-            component_stream_error(StreamError::WakeNotSignalled),
-            "SSH Component stream wake was not signalled"
-        );
         assert_eq!(
             component_stream_error(StreamError::SealedWakeRequired),
             "SSH Component stream required a sealed wake"

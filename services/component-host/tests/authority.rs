@@ -17,7 +17,7 @@ const BLOB_TYPE: ResourceTypeId = ResourceTypeId(1);
 
 struct Probe(u32);
 struct OtherProbe;
-struct ManagementProbe;
+struct ExternalRightsProbe(u32);
 
 impl Resource for Probe {
     fn kind(&self) -> &'static str {
@@ -49,9 +49,9 @@ impl ComponentHostResource for OtherProbe {
     const OPERATION_RIGHTS: Rights = Rights::READ;
 }
 
-impl Resource for ManagementProbe {
+impl Resource for ExternalRightsProbe {
     fn kind(&self) -> &'static str {
-        "management-probe"
+        "external-rights-probe"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -59,9 +59,11 @@ impl Resource for ManagementProbe {
     }
 }
 
-impl ComponentHostResource for ManagementProbe {
+impl ComponentHostResource for ExternalRightsProbe {
     const HOST_KIND: HostResourceKind = HostResourceKind::Blob;
-    const OPERATION_RIGHTS: Rights = Rights::READ.union(Rights::GRANT);
+    // This integration-test implementation has the same freedom as any safe
+    // external crate and maliciously claims host management bits as operations.
+    const OPERATION_RIGHTS: Rights = Rights::ALL_VOLATILE;
 }
 
 fn ordinary(name: &str) -> (SharedCSpace, ComponentAuthoritySpace) {
@@ -114,26 +116,95 @@ fn guessed_stale_wrong_type_and_over_rights_are_rejected_at_binding() {
 }
 
 #[test]
-fn ordinary_ephemeral_receipts_reject_trait_declared_management_rights() {
-    let (space, binding) = ordinary("management-rights-negative");
-    let cap = space
-        .lock()
-        .mint(Arc::new(ManagementProbe), Rights::READ.union(Rights::GRANT));
-    assert_eq!(
-        binding
-            .bind_ephemeral::<ManagementProbe>(cap, Rights::READ.union(Rights::GRANT))
-            .unwrap_err(),
-        AuthorityError::RightsExceedCeiling,
-    );
+fn ordinary_ephemeral_receipts_reject_every_trait_declared_management_right() {
+    const MANAGEMENT_CASES: [Rights; 4] = [
+        Rights::GRANT,
+        Rights::REVOKE,
+        Rights::INVOKE,
+        Rights::GRANT.union(Rights::REVOKE).union(Rights::INVOKE),
+    ];
+
+    let (space, _) = ordinary("management-rights-negative");
+    for (index, management) in MANAGEMENT_CASES.into_iter().enumerate() {
+        let held = Rights::READ.union(management);
+        let cap = space
+            .lock()
+            .mint(Arc::new(ExternalRightsProbe(index as u32)), held);
+        let guard = space.lock();
+        let identity = guard.identity();
+        let incarnation = guard.incarnation();
+        let table_range = guard.capability_table_range();
+
+        let rejected =
+            ComponentAuthority::prepare_ephemeral_in::<ExternalRightsProbe>(&guard, cap, held);
+        assert_eq!(
+            rejected.unwrap_err(),
+            AuthorityError::RightsExceedCeiling,
+            "held management rights {management:?} must not produce a receipt",
+        );
+        assert_eq!(guard.identity(), identity);
+        assert_eq!(guard.incarnation(), incarnation);
+        assert_eq!(guard.capability_table_range(), table_range);
+        assert_eq!(guard.rights_of(cap), Ok(held));
+    }
+}
+
+#[test]
+fn ordinary_ephemeral_receipts_reject_management_bits_in_the_ceiling() {
+    const MANAGEMENT_CASES: [Rights; 4] = [
+        Rights::GRANT,
+        Rights::REVOKE,
+        Rights::INVOKE,
+        Rights::GRANT.union(Rights::REVOKE).union(Rights::INVOKE),
+    ];
+
+    let (space, _) = ordinary("management-ceiling-negative");
+    for (index, management) in MANAGEMENT_CASES.into_iter().enumerate() {
+        let cap = space
+            .lock()
+            .mint(Arc::new(ExternalRightsProbe(index as u32)), Rights::READ);
+        let guard = space.lock();
+        let identity = guard.identity();
+        let incarnation = guard.incarnation();
+        let table_range = guard.capability_table_range();
+        let ceiling = Rights::READ.union(management);
+
+        let rejected =
+            ComponentAuthority::prepare_ephemeral_in::<ExternalRightsProbe>(&guard, cap, ceiling);
+        assert_eq!(
+            rejected.unwrap_err(),
+            AuthorityError::RightsExceedCeiling,
+            "ceiling management rights {management:?} must not produce a receipt",
+        );
+        assert_eq!(guard.identity(), identity);
+        assert_eq!(guard.incarnation(), incarnation);
+        assert_eq!(guard.capability_table_range(), table_range);
+        assert_eq!(guard.rights_of(cap), Ok(Rights::READ));
+    }
+}
+
+#[test]
+fn ordinary_ephemeral_receipt_accepts_only_normal_operation_rights_and_is_redacted() {
+    let normal = Rights::READ
+        .union(Rights::WRITE)
+        .union(Rights::SEND)
+        .union(Rights::RECV);
+    let (space, _) = ordinary("normal-operation-rights");
+    let cap = space.lock().mint(Arc::new(ExternalRightsProbe(73)), normal);
     let guard = space.lock();
+    let prepared =
+        ComponentAuthority::prepare_ephemeral_in::<ExternalRightsProbe>(&guard, cap, normal)
+            .unwrap();
     assert_eq!(
-        ComponentAuthority::prepare_ephemeral_in::<ManagementProbe>(
-            &guard,
-            cap,
-            Rights::READ.union(Rights::GRANT),
-        )
-        .unwrap_err(),
-        AuthorityError::RightsExceedCeiling,
+        format!("{prepared:?}"),
+        "PreparedEphemeralAuthority(<redacted>)"
+    );
+    let authority = prepared.into_authority();
+    drop(guard);
+
+    assert_eq!(
+        authority.with_revocable::<ExternalRightsProbe, _, _>(&space, normal, |probe| probe.0,),
+        Ok(73),
     );
 }
 

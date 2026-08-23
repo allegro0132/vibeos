@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
 use vibeos_component_host::{
     ByteStream, StreamCloseOutcome, StreamCloseReason, StreamError, StreamReceiveCommit,
-    StreamReceiveDispatch, StreamSendDispatch, StreamTerminalDispatch, MAX_STREAM_CHUNK_BYTES,
-    STREAM_BUFFER_CHUNKS,
+    StreamReceiveDispatch, StreamSealedWakeToken, StreamSendDispatch, StreamTerminalDispatch,
+    StreamWakeSignal, MAX_STREAM_CHUNK_BYTES, STREAM_BUFFER_CHUNKS,
 };
 use vibeos_component_runtime::host::HostWakeToken;
 use vibeos_core::cap::{CSpace, Resource, Rights};
@@ -23,6 +23,13 @@ struct DelayedWakeProbe {
     entered: Barrier,
     release: Barrier,
     count: AtomicUsize,
+}
+
+struct DelayedSealedWakeProbe {
+    entered: Barrier,
+    release: Barrier,
+    count: AtomicUsize,
+    signal: Mutex<Option<StreamWakeSignal>>,
 }
 
 fn count_wake(words: [usize; 4]) {
@@ -61,6 +68,23 @@ fn delayed_wake(words: [usize; 4]) {
 
 fn delayed_wake_token(probe: &Arc<DelayedWakeProbe>) -> HostWakeToken {
     HostWakeToken::new([Arc::as_ptr(probe) as usize, 0, 0, 0], delayed_wake)
+}
+
+fn delayed_sealed_wake(words: [usize; 4], signal: StreamWakeSignal) {
+    let probe = unsafe { &*(words[0] as *const DelayedSealedWakeProbe) };
+    // The callback owns the only readiness proof while it is held here. A
+    // task which retained only registration metadata has no value accepted by
+    // resume_after_wake and therefore cannot poll across this gap.
+    probe.entered.wait();
+    probe.release.wait();
+    let mut stored = probe.signal.lock().unwrap();
+    assert!(stored.is_none());
+    *stored = Some(signal);
+    probe.count.fetch_add(1, Ordering::SeqCst);
+}
+
+fn delayed_sealed_wake_token(probe: &Arc<DelayedSealedWakeProbe>) -> StreamSealedWakeToken {
+    StreamSealedWakeToken::new([Arc::as_ptr(probe) as usize, 0, 0, 0], delayed_sealed_wake)
 }
 
 fn receive_one(reader: &vibeos_component_host::ByteStreamReader) -> Vec<u8> {
@@ -386,6 +410,181 @@ fn late_listener_recheck_never_loses_readable_or_writable_wake() {
         .unwrap();
     assert_eq!(probe.count.load(Ordering::SeqCst), 2);
     writer.cancel(send_wait).unwrap();
+}
+
+#[test]
+fn sealed_readiness_is_owned_by_callback_across_the_dispatch_gap() {
+    let stream = ByteStream::new();
+    let reader = stream.reader();
+    let writer = stream.writer();
+    let probe = Arc::new(DelayedSealedWakeProbe {
+        entered: Barrier::new(2),
+        release: Barrier::new(2),
+        count: AtomicUsize::new(0),
+        signal: Mutex::new(None),
+    });
+
+    let waiting = match reader.start().unwrap() {
+        StreamReceiveDispatch::Waiting(operation) => operation,
+        other => panic!("expected reader wait, got {other:?}"),
+    };
+    let registration = reader
+        .register_wake_sealed(waiting, delayed_sealed_wake_token(&probe))
+        .unwrap();
+    let producer = thread::spawn(move || writer.start(&[0x5a]));
+
+    probe.entered.wait();
+    // Readiness detached the callback, but the callback deliberately has not
+    // published its move-only signal. Registration exposes cancellation only.
+    assert!(probe.signal.lock().unwrap().is_none());
+    assert_eq!(probe.count.load(Ordering::SeqCst), 0);
+    assert_eq!(stream.depth(), 1);
+    assert_eq!(registration.operation(), waiting);
+    assert_eq!(reader.resume(waiting), Err(StreamError::SealedWakeRequired));
+    assert_eq!(reader.start(), Err(StreamError::Busy));
+    assert_eq!(stream.depth(), 1);
+
+    probe.release.wait();
+    assert_eq!(producer.join().unwrap(), Ok(StreamSendDispatch::Sent));
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    let signal = probe
+        .signal
+        .lock()
+        .unwrap()
+        .take()
+        .expect("callback must publish exact readiness");
+    let prepared = match reader.resume_after_wake(signal).unwrap() {
+        StreamReceiveDispatch::Prepared(prepared) => prepared,
+        other => panic!("callback-issued signal must prepare, got {other:?}"),
+    };
+    drop(registration);
+    let mut byte = [0_u8];
+    assert_eq!(
+        reader.commit(prepared.operation(), &mut byte),
+        Ok(StreamReceiveCommit::Received(1))
+    );
+    assert_eq!(byte, [0x5a]);
+}
+
+#[test]
+fn sealed_writer_cannot_resume_across_the_callback_dispatch_gap() {
+    let stream = ByteStream::new();
+    let reader = stream.reader();
+    let writer = stream.writer();
+    let probe = Arc::new(DelayedSealedWakeProbe {
+        entered: Barrier::new(2),
+        release: Barrier::new(2),
+        count: AtomicUsize::new(0),
+        signal: Mutex::new(None),
+    });
+
+    for byte in 0..STREAM_BUFFER_CHUNKS {
+        assert_eq!(writer.start(&[byte as u8]), Ok(StreamSendDispatch::Sent));
+    }
+    let waiting = match writer.start(&[0xd1]).unwrap() {
+        StreamSendDispatch::Waiting(operation) => operation,
+        other => panic!("expected writer backpressure, got {other:?}"),
+    };
+    let registration = writer
+        .register_wake_sealed(waiting, delayed_sealed_wake_token(&probe))
+        .unwrap();
+    let consumer = thread::spawn(move || receive_one(&reader));
+
+    probe.entered.wait();
+    assert!(probe.signal.lock().unwrap().is_none());
+    assert_eq!(probe.count.load(Ordering::SeqCst), 0);
+    assert_eq!(registration.operation(), waiting);
+    assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS - 1);
+    assert_eq!(
+        writer.resume(waiting, &[0xd1]),
+        Err(StreamError::SealedWakeRequired)
+    );
+    assert_eq!(writer.start(&[0xd2]), Err(StreamError::Busy));
+    assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS - 1);
+
+    probe.release.wait();
+    assert_eq!(consumer.join().unwrap(), [0]);
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    let signal = probe
+        .signal
+        .lock()
+        .unwrap()
+        .take()
+        .expect("writer callback must publish exact readiness");
+    assert_eq!(
+        writer.resume_after_wake(signal, &[0xd1]).unwrap(),
+        StreamSendDispatch::Sent
+    );
+    drop(registration);
+    assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS);
+    assert_eq!(
+        writer.resume(waiting, &[0xd1]),
+        Err(StreamError::TokenMismatch)
+    );
+    assert!(probe.signal.lock().unwrap().is_none());
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn sealed_terminal_cannot_resume_across_the_callback_dispatch_gap() {
+    let stream = ByteStream::new();
+    let supervisor = stream.supervisor();
+    let probe = Arc::new(DelayedSealedWakeProbe {
+        entered: Barrier::new(2),
+        release: Barrier::new(2),
+        count: AtomicUsize::new(0),
+        signal: Mutex::new(None),
+    });
+
+    let waiting = match supervisor.start_terminal().unwrap() {
+        StreamTerminalDispatch::Waiting(operation) => operation,
+        other => panic!("expected terminal wait, got {other:?}"),
+    };
+    let registration = supervisor
+        .register_terminal_wake_sealed(waiting, delayed_sealed_wake_token(&probe))
+        .unwrap();
+    let finalizer = {
+        let supervisor = supervisor.clone();
+        thread::spawn(move || supervisor.finalize(StreamCloseReason::BackendFault))
+    };
+
+    probe.entered.wait();
+    assert!(probe.signal.lock().unwrap().is_none());
+    assert_eq!(probe.count.load(Ordering::SeqCst), 0);
+    assert_eq!(registration.operation(), waiting);
+    assert_eq!(
+        supervisor.resume_terminal(waiting),
+        Err(StreamError::SealedWakeRequired)
+    );
+    assert_eq!(supervisor.start_terminal(), Err(StreamError::Busy));
+    assert_eq!(stream.final_reason(), Some(StreamCloseReason::BackendFault));
+
+    probe.release.wait();
+    assert_eq!(finalizer.join().unwrap(), StreamCloseOutcome::Published);
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+    let signal = probe
+        .signal
+        .lock()
+        .unwrap()
+        .take()
+        .expect("terminal callback must publish exact readiness");
+    assert_eq!(
+        supervisor.resume_terminal_after_wake(signal).unwrap(),
+        StreamTerminalDispatch::Ready(StreamCloseReason::BackendFault)
+    );
+    drop(registration);
+    assert_eq!(
+        supervisor.resume_terminal(waiting),
+        Err(StreamError::TokenMismatch)
+    );
+    assert_eq!(
+        supervisor.start_terminal(),
+        Ok(StreamTerminalDispatch::Ready(
+            StreamCloseReason::BackendFault
+        ))
+    );
+    assert!(probe.signal.lock().unwrap().is_none());
+    assert_eq!(probe.count.load(Ordering::SeqCst), 1);
 }
 
 #[test]

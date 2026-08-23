@@ -8,6 +8,10 @@ const C64_RESOURCE_PROVIDER_SOURCE: &str =
 const C64_RESOURCE_CONSUMER_SOURCE: &str =
     include_str!("artifacts/c64-resource-consumer.component.wat");
 const C64_RESOURCE_ROUTE_WIT: &str = include_str!("artifacts/c64-resource-route.wit");
+const C65_ASYNC_SOURCE_SOURCE: &str = include_str!("artifacts/c65-async-source.component.wat");
+const C65_ASYNC_RELAY_SOURCE: &str = include_str!("artifacts/c65-async-relay.component.wat");
+const C65_ASYNC_SINK_SOURCE: &str = include_str!("artifacts/c65-async-sink.component.wat");
+const C65_ASYNC_CHAIN_WIT: &str = include_str!("artifacts/c65-async-chain.wit");
 
 // This is deliberately independent of the artifact bytes produced below.
 // Updating the WAT source or pinned parser must fail the build until review
@@ -37,12 +41,33 @@ const C64_RESOURCE_ROUTE_WIT_EXPECTED_SHA256: [u8; 32] = [
     0xfa, 0x70, 0x8b, 0xf6, 0x71, 0x92, 0x85, 0x3b, 0xd8, 0xcd, 0x84, 0x79, 0xcc, 0xec, 0x13, 0x41,
 ];
 
+const C65_ASYNC_SOURCE_EXPECTED_SHA256: [u8; 32] = [
+    0x7f, 0x95, 0x59, 0xa1, 0x20, 0x77, 0x3a, 0x61, 0x43, 0x28, 0xf5, 0xb8, 0x58, 0x75, 0xe2, 0x39,
+    0x53, 0xee, 0x5e, 0xbf, 0xf6, 0x86, 0x1c, 0xa4, 0x3b, 0xdb, 0xe1, 0x0c, 0x3c, 0xdf, 0x6c, 0x81,
+];
+const C65_ASYNC_RELAY_EXPECTED_SHA256: [u8; 32] = [
+    0xc9, 0xa1, 0x4d, 0x5d, 0xf6, 0x3a, 0xf5, 0x3b, 0x33, 0x46, 0x75, 0x24, 0x2b, 0x63, 0x42, 0x72,
+    0x59, 0x1d, 0xff, 0xd2, 0x6b, 0xea, 0x8a, 0xf5, 0xbc, 0xdb, 0x24, 0x0e, 0x59, 0xfd, 0x0f, 0xb1,
+];
+const C65_ASYNC_SINK_EXPECTED_SHA256: [u8; 32] = [
+    0x28, 0x42, 0xca, 0xc9, 0xaf, 0x1a, 0x6b, 0xd0, 0x86, 0x4e, 0xff, 0xfe, 0xe6, 0x16, 0x50, 0xbe,
+    0x5e, 0x56, 0x42, 0x39, 0xad, 0xa2, 0x9e, 0x97, 0x5f, 0xf2, 0x79, 0xcf, 0x7b, 0x3e, 0x5b, 0xa9,
+];
+const C65_ASYNC_CHAIN_WIT_EXPECTED_SHA256: [u8; 32] = [
+    0x05, 0x3e, 0x44, 0x72, 0x9a, 0x38, 0x75, 0x45, 0xf5, 0xdc, 0x73, 0xba, 0xc2, 0x11, 0xd3, 0x07,
+    0xde, 0x74, 0x6a, 0x4c, 0xf7, 0x58, 0xd1, 0x79, 0xc0, 0xfa, 0x3c, 0xf2, 0xb9, 0xe8, 0xc5, 0xbf,
+];
+
 fn main() {
     println!("cargo:rerun-if-changed=artifacts/c53-stream-filter.component.wat");
     println!("cargo:rerun-if-changed=artifacts/c53-native-async-filter.component.wat");
     println!("cargo:rerun-if-changed=artifacts/c64-resource-provider.component.wat");
     println!("cargo:rerun-if-changed=artifacts/c64-resource-consumer.component.wat");
     println!("cargo:rerun-if-changed=artifacts/c64-resource-route.wit");
+    println!("cargo:rerun-if-changed=artifacts/c65-async-source.component.wat");
+    println!("cargo:rerun-if-changed=artifacts/c65-async-relay.component.wat");
+    println!("cargo:rerun-if-changed=artifacts/c65-async-sink.component.wat");
+    println!("cargo:rerun-if-changed=artifacts/c65-async-chain.wit");
 
     let bytes = wat::parse_str(SOURCE).expect("pinned Component WAT must parse");
     let observed: [u8; 32] = Sha256::digest(&bytes).into();
@@ -119,5 +144,67 @@ fn main() {
             format!("{C64_RESOURCE_CONSUMER_EXPECTED_SHA256:?}"),
         )
         .expect("write checked C6.4 consumer Component identity constant");
+    }
+
+    if env::var_os("CARGO_FEATURE_C65_ASYNC_CHAIN_QEMU_ACCEPTANCE").is_some() {
+        let source = wat::parse_str(C65_ASYNC_SOURCE_SOURCE)
+            .expect("pinned C6.5 source Component WAT must parse");
+        let source_observed: [u8; 32] = Sha256::digest(&source).into();
+        assert_eq!(
+            source_observed, C65_ASYNC_SOURCE_EXPECTED_SHA256,
+            "pinned C6.5 source Component digest changed: {source_observed:02x?}"
+        );
+        let relay = wat::parse_str(C65_ASYNC_RELAY_SOURCE)
+            .expect("pinned C6.5 relay Component WAT must parse");
+        let relay_observed: [u8; 32] = Sha256::digest(&relay).into();
+        assert_eq!(
+            relay_observed, C65_ASYNC_RELAY_EXPECTED_SHA256,
+            "pinned C6.5 relay Component digest changed: {relay_observed:02x?}"
+        );
+        let sink = wat::parse_str(C65_ASYNC_SINK_SOURCE)
+            .expect("pinned C6.5 sink Component WAT must parse");
+        let sink_observed: [u8; 32] = Sha256::digest(&sink).into();
+        assert_eq!(
+            sink_observed, C65_ASYNC_SINK_EXPECTED_SHA256,
+            "pinned C6.5 sink Component digest changed: {sink_observed:02x?}"
+        );
+        assert!(
+            source_observed != relay_observed
+                && source_observed != sink_observed
+                && relay_observed != sink_observed,
+            "the three C6.5 Component artifacts must have distinct identities"
+        );
+        let wit_observed: [u8; 32] = Sha256::digest(C65_ASYNC_CHAIN_WIT.as_bytes()).into();
+        assert_eq!(
+            wit_observed, C65_ASYNC_CHAIN_WIT_EXPECTED_SHA256,
+            "pinned C6.5 chain WIT digest changed: {wit_observed:02x?}"
+        );
+
+        fs::write(output.join("c65-async-source.component.wasm"), source)
+            .expect("write pinned C6.5 source Component artifact");
+        fs::write(output.join("c65-async-relay.component.wasm"), relay)
+            .expect("write pinned C6.5 relay Component artifact");
+        fs::write(output.join("c65-async-sink.component.wasm"), sink)
+            .expect("write pinned C6.5 sink Component artifact");
+        fs::write(
+            output.join("c65-async-source.sha256.rs"),
+            format!("{C65_ASYNC_SOURCE_EXPECTED_SHA256:?}"),
+        )
+        .expect("write checked C6.5 source Component identity constant");
+        fs::write(
+            output.join("c65-async-relay.sha256.rs"),
+            format!("{C65_ASYNC_RELAY_EXPECTED_SHA256:?}"),
+        )
+        .expect("write checked C6.5 relay Component identity constant");
+        fs::write(
+            output.join("c65-async-sink.sha256.rs"),
+            format!("{C65_ASYNC_SINK_EXPECTED_SHA256:?}"),
+        )
+        .expect("write checked C6.5 sink Component identity constant");
+        fs::write(
+            output.join("c65-async-chain-wit.sha256.rs"),
+            format!("{C65_ASYNC_CHAIN_WIT_EXPECTED_SHA256:?}"),
+        )
+        .expect("write checked C6.5 chain WIT identity constant");
     }
 }

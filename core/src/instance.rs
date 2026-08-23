@@ -331,8 +331,12 @@ impl InstanceSpace {
 /// must never be installed into the stable instance CSpace.  External wake,
 /// timer, join, probe, or wait registrations are permitted only through the
 /// exact TaskStatus-owned executor paths which are synchronously drained before
-/// raw fault reclaim; implementors may not create an independent registration
-/// escape path.
+/// raw fault reclaim. An external backend may copy a callback targeting such
+/// an exact continuation only when callback registration is preceded by a
+/// boot-stable, opaque operation mirror and terminal supervision can revoke
+/// both mirrored operations and the bounded start-before-mirror fault window
+/// without entering the arena. No callback may contain an arena pointer or
+/// independently retain payload ownership.
 ///
 /// The registry exclusively owns CSpace lifecycle.  A payload may use a
 /// short-lived guarded borrow during its quantum, but must not call CSpace

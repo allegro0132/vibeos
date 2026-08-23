@@ -11,7 +11,11 @@ use crate::{
     value::{CanonicalValue, ResourceOwnership, ValueType},
 };
 use alloc::vec::Vec;
-use core::{fmt, num::NonZeroU64};
+use core::{
+    fmt,
+    num::NonZeroU64,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use vibeos_component_format::PROFILE_1_LIMITS;
 
 /// Stable failures at the trusted host-import boundary.
@@ -90,6 +94,68 @@ impl HostOperationToken {
 impl fmt::Debug for HostOperationToken {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("HostOperationToken(..)")
+    }
+}
+
+/// Fault-stable, authority-neutral storage for one exact backend operation.
+///
+/// The slot deliberately exposes only opaque-token comparisons. It lets a
+/// stable supervisor mirror an arena-owned payload's current backend wait so
+/// fault teardown can revoke that exact operation even when the payload's
+/// destructor cannot run. Publishing before wake registration closes the
+/// registration/fault race: a concurrent supervisor may cancel the already
+/// started backend operation, after which registration fails inertly.
+pub struct AtomicHostOperationSlot {
+    generation: AtomicU64,
+}
+
+impl AtomicHostOperationSlot {
+    pub const fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Publish one exact operation only while the slot is empty.
+    pub fn publish(&self, operation: HostOperationToken) -> bool {
+        self.generation
+            .compare_exchange(0, operation.0.get(), Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Reconstruct the currently mirrored opaque token without exposing its
+    /// numeric generation.
+    pub fn load(&self) -> Option<HostOperationToken> {
+        NonZeroU64::new(self.generation.load(Ordering::Acquire)).map(HostOperationToken)
+    }
+
+    /// Check that the exact operation remains supervisor-visible.
+    pub fn contains(&self, operation: HostOperationToken) -> bool {
+        self.generation.load(Ordering::Acquire) == operation.0.get()
+    }
+
+    /// Clear only the exact mirrored operation. A stale payload or supervisor
+    /// cannot erase a replacement generation.
+    pub fn clear_exact(&self, operation: HostOperationToken) -> bool {
+        self.generation
+            .compare_exchange(operation.0.get(), 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.generation.load(Ordering::Acquire) == 0
+    }
+}
+
+impl Default for AtomicHostOperationSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for AtomicHostOperationSlot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AtomicHostOperationSlot(<redacted>)")
     }
 }
 
@@ -422,5 +488,31 @@ impl<A> HostDispatcher<A> for RejectHost {
 
     fn dispatch(&mut self, _request: HostRequest<'_, A>) -> Result<HostResponse, HostError> {
         Err(HostError::Denied)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::format;
+
+    #[test]
+    fn atomic_operation_slot_is_exact_stale_safe_and_redacted() {
+        let slot = AtomicHostOperationSlot::new();
+        let first = HostOperationToken::from_generation(41).unwrap();
+        let replacement = HostOperationToken::from_generation(42).unwrap();
+
+        assert!(slot.is_empty());
+        assert!(slot.publish(first));
+        assert!(!slot.publish(replacement));
+        assert!(slot.contains(first));
+        assert_eq!(slot.load(), Some(first));
+        assert!(!slot.clear_exact(replacement));
+        assert!(slot.contains(first));
+        assert!(slot.clear_exact(first));
+        assert!(slot.publish(replacement));
+        assert!(!slot.clear_exact(first));
+        assert!(slot.contains(replacement));
+        assert_eq!(format!("{slot:?}"), "AtomicHostOperationSlot(<redacted>)");
     }
 }

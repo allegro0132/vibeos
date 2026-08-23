@@ -10,11 +10,13 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::fmt;
 
 use vibeos_component_admission::{
-    AdmittedComponentGraph, ComponentGraphAdmissionError, ComponentGraphAuthorityGrant,
-    ComponentGraphManifest, ComponentGraphResourceEdgeManifest, ComponentIdentity, InstanceLimits,
-    ProfileIdentity,
+    AdmittedComponentGraph, ComponentGraphAdmissionError, ComponentGraphAsyncEdgeManifest,
+    ComponentGraphAuthorityGrant, ComponentGraphManifest, ComponentGraphResourceEdgeManifest,
+    ComponentIdentity, InstanceLimits, ProfileIdentity,
 };
-use vibeos_component_format::{ComponentGraphAccount, ComponentGraphNodeBudget, TrapCode};
+use vibeos_component_format::{
+    ComponentGraphAccount, ComponentGraphNodeBudget, TrapCode, PROFILE_1_LIMITS,
+};
 use vibeos_component_runtime::graph::{ComponentGraphNesting, ComponentGraphNodeId};
 
 /// Failure while deriving or revalidating an inert principal template.
@@ -219,6 +221,13 @@ impl ComponentGraphPrincipalTemplate {
         self.admitted.manifest().resource_edges()
     }
 
+    /// Freshly revalidated, capability-free async evidence for internal graph
+    /// edges. These records contain only graph-local endpoints and bounded
+    /// exact shape counts; they are not wake or execution authority.
+    pub fn async_edges(&self) -> &[ComponentGraphAsyncEdgeManifest] {
+        self.admitted.manifest().async_edges()
+    }
+
     pub const fn profile(&self) -> ProfileIdentity {
         self.profile
     }
@@ -322,6 +331,48 @@ impl ComponentGraphPrincipalTemplate {
         })
     }
 
+    /// Build a deterministic RuntimeUnavailable report after a supervisor has
+    /// prepared and torn down bounded state for an admitted async edge without
+    /// starting guest execution.
+    ///
+    /// Only an endpoint of a freshly sealed async edge may report a positive
+    /// observed resource-slot peak. Fuel and live slots remain zero, and this
+    /// method never changes [`Self::runtime_ready`].
+    pub fn supervisor_prepared_async_unavailable_report(
+        &self,
+        node: ComponentGraphNodeId,
+        peak_resource_slots: u64,
+    ) -> Result<ComponentGraphNodeTerminalReport, ComponentGraphNodeReportError> {
+        let principal = self
+            .principal(node)
+            .ok_or(ComponentGraphNodeReportError::UnknownNode { node })?;
+        if !self.async_edges().iter().any(|route| {
+            route.edge().source().node() == node || route.edge().target().node() == node
+        }) {
+            return Err(ComponentGraphNodeReportError::AsyncEdgeRequired { node });
+        }
+        if peak_resource_slots == 0 {
+            return Err(ComponentGraphNodeReportError::SupervisorPreparedPeakRequired);
+        }
+        if peak_resource_slots > principal.resource_slot_limit() {
+            return Err(ComponentGraphNodeReportError::ResourceLimitExceeded);
+        }
+        Ok(ComponentGraphNodeTerminalReport {
+            node,
+            terminal: ComponentGraphNodeTerminal::RuntimeUnavailable,
+            fuel: ComponentGraphNodeFuelAccount {
+                limit: principal.fuel_limit(),
+                consumed: 0,
+            },
+            resources: ComponentGraphNodeResourceAccount {
+                declared_types: principal.budget.resource_types,
+                slot_limit: principal.resource_slot_limit(),
+                peak_slots: peak_resource_slots,
+                live_slots: 0,
+            },
+        })
+    }
+
     fn try_terminal_report(
         &self,
         node: ComponentGraphNodeId,
@@ -386,6 +437,22 @@ impl ComponentGraphPrincipalTemplate {
                         || principal.budget != node.budget()
                 })
             || manifest
+                .async_edges()
+                .iter()
+                .enumerate()
+                .any(|(index, route)| {
+                    (route.async_functions() == 0 && route.streams() == 0 && route.futures() == 0)
+                        || route.async_functions() > PROFILE_1_LIMITS.max_component_definitions
+                        || route.streams() > PROFILE_1_LIMITS.max_component_definitions
+                        || route.futures() > PROFILE_1_LIMITS.max_component_definitions
+                        || manifest.async_edges()[..index]
+                            .iter()
+                            .any(|earlier| earlier.edge() == route.edge())
+                        || !manifest.edges().contains(&route.edge())
+                        || self.principal(route.edge().source().node()).is_none()
+                        || self.principal(route.edge().target().node()).is_none()
+                })
+            || manifest
                 .resource_edges()
                 .iter()
                 .enumerate()
@@ -414,6 +481,7 @@ impl fmt::Debug for ComponentGraphPrincipalTemplate {
             .field("profile", &self.profile)
             .field("account", &self.account)
             .field("principals", &self.principals)
+            .field("async_edges", &self.async_edges())
             .field("runtime_ready", &self.runtime_ready())
             .finish()
     }
@@ -523,6 +591,7 @@ impl fmt::Debug for ComponentGraphNodeTerminalReport {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentGraphNodeReportError {
     UnknownNode { node: ComponentGraphNodeId },
+    AsyncEdgeRequired { node: ComponentGraphNodeId },
     ResourceEdgeRequired { node: ComponentGraphNodeId },
     SupervisorPreparedPeakRequired,
     FuelLimitExceeded,

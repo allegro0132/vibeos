@@ -50,9 +50,10 @@ pub use runtime_dispatch::{
 pub use service::{ComponentCallError, ComponentHostServices};
 pub use stream::{
     ByteStream, ByteStreamReader, ByteStreamSupervisor, ByteStreamWriter, StreamCloseObservation,
-    StreamCloseOutcome, StreamCloseReason, StreamError, StreamPreparedReceive, StreamReceiveCommit,
-    StreamReceiveDispatch, StreamSendDispatch, StreamTerminalDispatch, MAX_STREAM_CHUNK_BYTES,
-    STREAM_BUFFER_CHUNKS,
+    StreamCloseOutcome, StreamCloseReason, StreamError, StreamPendingRevocation,
+    StreamPreparedReceive, StreamReceiveCommit, StreamReceiveDispatch, StreamSendDispatch,
+    StreamTerminalDispatch, StreamWakeRegistration, StreamWakeResumeFailure,
+    MAX_STREAM_CHUNK_BYTES, STREAM_BUFFER_CHUNKS,
 };
 pub use transfer::{
     prepare_owned_supervised, revoke_owned_supervised, transfer_owned, with_supervised_borrow,
@@ -408,6 +409,43 @@ pub struct ComponentAuthority {
     class: AuthorityClass,
 }
 
+/// Detached move-only proof that an ordinary volatile capability was validated
+/// inside an exact reserved CSpace.
+///
+/// This is the non-transfer counterpart to
+/// [`PreparedSupervisedEphemeralSource`]. It accepts only the component's
+/// operation rights. `GRANT`, `REVOKE`, `INVOKE`, and persistent capabilities
+/// are rejected independently of a caller-defined resource trait constant.
+#[must_use = "the prepared authority must be published or its reserved CSpace reset"]
+pub struct PreparedEphemeralAuthority {
+    cspace_identity: CSpaceIdentity,
+    cspace_incarnation: u64,
+    cap: Cap,
+    kind: HostResourceKind,
+    rights_ceiling: Rights,
+}
+
+impl fmt::Debug for PreparedEphemeralAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PreparedEphemeralAuthority(<redacted>)")
+    }
+}
+
+impl PreparedEphemeralAuthority {
+    /// Materialize the already-validated ordinary authority without another
+    /// lookup, allocation, or lock acquisition.
+    pub const fn into_authority(self) -> ComponentAuthority {
+        ComponentAuthority {
+            cspace_identity: self.cspace_identity,
+            cspace_incarnation: self.cspace_incarnation,
+            cap: self.cap,
+            kind: self.kind,
+            rights_ceiling: self.rights_ceiling,
+            class: AuthorityClass::Ephemeral,
+        }
+    }
+}
+
 /// Opaque, detached proof that one exact volatile capability was validated as
 /// a sealed supervisor transfer source.
 ///
@@ -514,6 +552,25 @@ impl ComponentAuthority {
         };
         drop(guard);
         Ok(authority)
+    }
+
+    /// Validate an ordinary volatile cap while its reserved CSpace is already
+    /// held, returning a detached move-only publication receipt. Repeating the
+    /// exact validation can produce another receipt; uniqueness comes from the
+    /// caller's ResourceTable reservation and lifecycle gate, not this value.
+    pub fn prepare_ephemeral_in<T: ComponentHostResource>(
+        cspace: &CSpace,
+        cap: Cap,
+        rights_ceiling: Rights,
+    ) -> Result<PreparedEphemeralAuthority, AuthorityError> {
+        validate_ephemeral_cap::<T>(cspace, cap, rights_ceiling)?;
+        Ok(PreparedEphemeralAuthority {
+            cspace_identity: cspace.identity(),
+            cspace_incarnation: cspace.incarnation(),
+            cap,
+            kind: T::HOST_KIND,
+            rights_ceiling,
+        })
     }
 
     /// Seal one exact volatile cap as a supervisor-only transfer source.
@@ -816,6 +873,7 @@ fn validate_ephemeral_cap<T: ComponentHostResource>(
     cap: Cap,
     rights_ceiling: Rights,
 ) -> Result<(), AuthorityError> {
+    const MANAGEMENT: Rights = Rights::GRANT.union(Rights::REVOKE).union(Rights::INVOKE);
     let held = cspace.rights_of(cap).map_err(map_cap_error)?;
 
     // Resolve by the concrete caller-supplied T. `Resource::kind()` is not
@@ -830,7 +888,9 @@ fn validate_ephemeral_cap<T: ComponentHostResource>(
         Err(CapError::NotPersistent) => {}
         Err(error) => return Err(map_cap_error(error)),
     }
-    if !rights_ceiling.contains(held)
+    if held.intersect(MANAGEMENT) != Rights::NONE
+        || rights_ceiling.intersect(MANAGEMENT) != Rights::NONE
+        || !rights_ceiling.contains(held)
         || !T::OPERATION_RIGHTS.contains(held)
         || !T::OPERATION_RIGHTS.contains(rights_ceiling)
     {

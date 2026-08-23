@@ -1101,7 +1101,10 @@ impl CSpace {
     /// Allocation-free count of installed entries for target lifecycle
     /// acceptance. Vacant slot generations deliberately survive reset even
     /// when COW republishes the table, so slot count is not a liveness metric.
-    #[cfg(feature = "wasm-c48-target-acceptance")]
+    #[cfg(any(
+        feature = "wasm-c48-target-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance"
+    ))]
     pub(crate) fn acceptance_installed_capability_count(&self) -> usize {
         self.slots
             .iter()

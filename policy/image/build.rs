@@ -12,6 +12,7 @@ const C65_ASYNC_SOURCE_SOURCE: &str = include_str!("artifacts/c65-async-source.c
 const C65_ASYNC_RELAY_SOURCE: &str = include_str!("artifacts/c65-async-relay.component.wat");
 const C65_ASYNC_SINK_SOURCE: &str = include_str!("artifacts/c65-async-sink.component.wat");
 const C65_ASYNC_CHAIN_WIT: &str = include_str!("artifacts/c65-async-chain.wit");
+const C66_ASYNC_RELAY_V2_SOURCE: &str = include_str!("artifacts/c66-async-relay-v2.component.wat");
 
 // This is deliberately independent of the artifact bytes produced below.
 // Updating the WAT source or pinned parser must fail the build until review
@@ -57,6 +58,10 @@ const C65_ASYNC_CHAIN_WIT_EXPECTED_SHA256: [u8; 32] = [
     0x05, 0x3e, 0x44, 0x72, 0x9a, 0x38, 0x75, 0x45, 0xf5, 0xdc, 0x73, 0xba, 0xc2, 0x11, 0xd3, 0x07,
     0xde, 0x74, 0x6a, 0x4c, 0xf7, 0x58, 0xd1, 0x79, 0xc0, 0xfa, 0x3c, 0xf2, 0xb9, 0xe8, 0xc5, 0xbf,
 ];
+const C66_ASYNC_RELAY_V2_EXPECTED_SHA256: [u8; 32] = [
+    0x04, 0x26, 0xc2, 0x53, 0xbd, 0x80, 0x82, 0xf8, 0x9c, 0x9d, 0x1e, 0x95, 0x8f, 0x19, 0x70, 0xc3,
+    0xa8, 0x48, 0x67, 0x5c, 0xdb, 0xc2, 0x5c, 0xd6, 0xee, 0x94, 0xc6, 0x4f, 0x2a, 0xee, 0x5e, 0xb8,
+];
 
 fn main() {
     println!("cargo:rerun-if-changed=artifacts/c53-stream-filter.component.wat");
@@ -68,6 +73,7 @@ fn main() {
     println!("cargo:rerun-if-changed=artifacts/c65-async-relay.component.wat");
     println!("cargo:rerun-if-changed=artifacts/c65-async-sink.component.wat");
     println!("cargo:rerun-if-changed=artifacts/c65-async-chain.wit");
+    println!("cargo:rerun-if-changed=artifacts/c66-async-relay-v2.component.wat");
 
     let bytes = wat::parse_str(SOURCE).expect("pinned Component WAT must parse");
     let observed: [u8; 32] = Sha256::digest(&bytes).into();
@@ -146,7 +152,9 @@ fn main() {
         .expect("write checked C6.4 consumer Component identity constant");
     }
 
-    if env::var_os("CARGO_FEATURE_C65_ASYNC_CHAIN_QEMU_ACCEPTANCE").is_some() {
+    if env::var_os("CARGO_FEATURE_C65_ASYNC_CHAIN_QEMU_ACCEPTANCE").is_some()
+        || env::var_os("CARGO_FEATURE_C66_NODE_REPLACEMENT_QEMU_ACCEPTANCE").is_some()
+    {
         let source = wat::parse_str(C65_ASYNC_SOURCE_SOURCE)
             .expect("pinned C6.5 source Component WAT must parse");
         let source_observed: [u8; 32] = Sha256::digest(&source).into();
@@ -206,5 +214,30 @@ fn main() {
             format!("{C65_ASYNC_CHAIN_WIT_EXPECTED_SHA256:?}"),
         )
         .expect("write checked C6.5 chain WIT identity constant");
+
+        if env::var_os("CARGO_FEATURE_C66_NODE_REPLACEMENT_QEMU_ACCEPTANCE").is_some() {
+            let relay_v2 = wat::parse_str(C66_ASYNC_RELAY_V2_SOURCE)
+                .expect("pinned C6.6 replacement relay Component WAT must parse");
+            let relay_v2_observed: [u8; 32] = Sha256::digest(&relay_v2).into();
+            assert_eq!(
+                relay_v2_observed, C66_ASYNC_RELAY_V2_EXPECTED_SHA256,
+                "pinned C6.6 replacement relay Component digest changed: {relay_v2_observed:02x?}"
+            );
+            assert_ne!(
+                relay_v2_observed, relay_observed,
+                "the C6.6 old and replacement relay identities must be distinct"
+            );
+            assert!(
+                relay_v2_observed != source_observed && relay_v2_observed != sink_observed,
+                "the C6.6 replacement relay identity must be graph-node-local"
+            );
+            fs::write(output.join("c66-async-relay-v2.component.wasm"), relay_v2)
+                .expect("write pinned C6.6 replacement relay Component artifact");
+            fs::write(
+                output.join("c66-async-relay-v2.sha256.rs"),
+                format!("{C66_ASYNC_RELAY_V2_EXPECTED_SHA256:?}"),
+            )
+            .expect("write checked C6.6 replacement relay Component identity constant");
+        }
     }
 }

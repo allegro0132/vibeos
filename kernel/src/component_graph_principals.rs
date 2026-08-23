@@ -102,6 +102,13 @@ use crate::instance::{
 use crate::sync::SpinLock;
 use crate::HEAP;
 
+#[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+#[path = "component_graph_replacement.rs"]
+mod c66;
+
+#[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+pub(crate) use c66::run_qemu_acceptance as run_c66_qemu_acceptance;
+
 /// Audited non-guest storage allowance for one graph-node lifecycle.
 ///
 /// This frozen 64-KiB charge covers the managed task future, registry payload,
@@ -462,6 +469,10 @@ pub enum ComponentGraphPrincipalLifecycleError {
     AsyncRoutePolicy,
     AsyncRouteSetup,
     AsyncChainInvariant,
+    NodeReplacementPolicy,
+    NodeReplacementSetup,
+    NodeReplacementInvariant,
+    NodeReplacementCapacity,
     ExecutableTemplate,
     InvalidPrincipalSet,
     BudgetOverflow { node: ComponentGraphNodeId },
@@ -497,6 +508,12 @@ impl fmt::Display for ComponentGraphPrincipalLifecycleError {
             Self::AsyncRoutePolicy => "component graph async route is not exact",
             Self::AsyncRouteSetup => "component graph async route setup failed",
             Self::AsyncChainInvariant => "component graph async chain invariant failed",
+            Self::NodeReplacementPolicy => "component graph node replacement policy is not exact",
+            Self::NodeReplacementSetup => "component graph node replacement setup failed",
+            Self::NodeReplacementInvariant => "component graph node replacement invariant failed",
+            Self::NodeReplacementCapacity => {
+                "component graph has no overlap capacity for a hidden replacement"
+            }
             Self::ExecutableTemplate => {
                 "component graph lifecycle accepts only a validation-only template"
             }
@@ -3477,7 +3494,8 @@ pub async fn supervise_component_graph_principals(
 #[cfg(any(
     feature = "wasm-c63-graph-principal-acceptance",
     feature = "wasm-c64-resource-route-acceptance",
-    feature = "wasm-c65-async-chain-acceptance"
+    feature = "wasm-c65-async-chain-acceptance",
+    feature = "wasm-c66-node-replacement-acceptance"
 ))]
 pub(crate) fn run_host_model_selftest() -> bool {
     if checked_owner_quota(1) != Some(1 + COMPONENT_GRAPH_PRINCIPAL_LIFECYCLE_OVERHEAD_BYTES)

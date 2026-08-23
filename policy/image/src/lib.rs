@@ -29,6 +29,12 @@ compile_error!("feature `c64-resource-route-qemu-acceptance` requires `qemu-defa
 ))]
 compile_error!("feature `c65-async-chain-qemu-acceptance` requires `qemu-default`");
 
+#[cfg(all(
+    feature = "c66-node-replacement-qemu-acceptance",
+    not(feature = "qemu-default")
+))]
+compile_error!("feature `c66-node-replacement-qemu-acceptance` requires `qemu-default`");
+
 /// A logical block-device view carved out of a packaged storage image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockSlice {
@@ -253,6 +259,208 @@ impl core::fmt::Debug for ComponentGraphAsyncChainPin {
             .field("interface", &self.interface)
             .field("profile", &self.profile)
             .field("limits", &self.limits)
+            .finish()
+    }
+}
+
+/// Exact authority-preserving action selected for one incident graph edge
+/// while replacing a node.
+///
+/// Disconnect-only teardown is intentionally not representable: the C6.6
+/// image requires the supervisor to create a fresh edge incarnation from the
+/// admitted policy before publishing the replacement.
+#[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComponentGraphReplacementPinAction {
+    RecreateFresh,
+}
+
+/// One graph-local incident edge covered by the C6.6 replacement policy.
+///
+/// Node and entity numbers are inert bounded graph coordinates, never Task,
+/// CSpace, capability, resource, live route, or durable object identities.
+#[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComponentGraphReplacementEdgePin {
+    source_node: u16,
+    source_export: u16,
+    target_node: u16,
+    target_import: u16,
+    action: ComponentGraphReplacementPinAction,
+}
+
+#[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+impl ComponentGraphReplacementEdgePin {
+    const fn new(
+        source_node: u16,
+        source_export: u16,
+        target_node: u16,
+        target_import: u16,
+        action: ComponentGraphReplacementPinAction,
+    ) -> Self {
+        Self {
+            source_node,
+            source_export,
+            target_node,
+            target_import,
+            action,
+        }
+    }
+
+    pub const fn source_node(self) -> u16 {
+        self.source_node
+    }
+
+    pub const fn source_export(self) -> u16 {
+        self.source_export
+    }
+
+    pub const fn target_node(self) -> u16 {
+        self.target_node
+    }
+
+    pub const fn target_import(self) -> u16 {
+        self.target_import
+    }
+
+    pub const fn action(self) -> ComponentGraphReplacementPinAction {
+        self.action
+    }
+}
+
+/// Immutable validation-only C6.6 node-replacement policy root.
+///
+/// Source, sink, old relay, and WIT bytes are the exact C6.5 pins. The new
+/// relay has a distinct independently checked artifact identity but the same
+/// exact relay world and interface. The fixed incident-edge array admits only
+/// one replacement of graph-local node 1 and requires both adjacent routes to
+/// be recreated fresh. No field is execution authority, a live route, a raw
+/// runtime identity, an ambient lookup key, or a durable object identity.
+#[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub struct ComponentGraphNodeReplacementPin {
+    source_bytes: &'static [u8],
+    source_sha256: [u8; 32],
+    old_relay_bytes: &'static [u8],
+    old_relay_sha256: [u8; 32],
+    new_relay_bytes: &'static [u8],
+    new_relay_sha256: [u8; 32],
+    sink_bytes: &'static [u8],
+    sink_sha256: [u8; 32],
+    wit_source: &'static str,
+    wit_sha256: [u8; 32],
+    source_world: &'static str,
+    relay_world: &'static str,
+    sink_world: &'static str,
+    interface: &'static str,
+    profile: ProfileIdentity,
+    limits: ComponentInstanceLimits,
+    node_count: u16,
+    replacement_node: u16,
+    incident_edges: [ComponentGraphReplacementEdgePin; 2],
+    max_replacements: u16,
+}
+
+#[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+impl ComponentGraphNodeReplacementPin {
+    pub const fn source_bytes(self) -> &'static [u8] {
+        self.source_bytes
+    }
+
+    pub const fn source_sha256(self) -> [u8; 32] {
+        self.source_sha256
+    }
+
+    pub const fn old_relay_bytes(self) -> &'static [u8] {
+        self.old_relay_bytes
+    }
+
+    pub const fn old_relay_sha256(self) -> [u8; 32] {
+        self.old_relay_sha256
+    }
+
+    pub const fn new_relay_bytes(self) -> &'static [u8] {
+        self.new_relay_bytes
+    }
+
+    pub const fn new_relay_sha256(self) -> [u8; 32] {
+        self.new_relay_sha256
+    }
+
+    pub const fn sink_bytes(self) -> &'static [u8] {
+        self.sink_bytes
+    }
+
+    pub const fn sink_sha256(self) -> [u8; 32] {
+        self.sink_sha256
+    }
+
+    pub const fn wit_source(self) -> &'static str {
+        self.wit_source
+    }
+
+    pub const fn wit_sha256(self) -> [u8; 32] {
+        self.wit_sha256
+    }
+
+    pub const fn source_world(self) -> &'static str {
+        self.source_world
+    }
+
+    pub const fn relay_world(self) -> &'static str {
+        self.relay_world
+    }
+
+    pub const fn sink_world(self) -> &'static str {
+        self.sink_world
+    }
+
+    pub const fn interface(self) -> &'static str {
+        self.interface
+    }
+
+    pub const fn profile(self) -> ProfileIdentity {
+        self.profile
+    }
+
+    pub const fn limits(self) -> ComponentInstanceLimits {
+        self.limits
+    }
+
+    pub const fn node_count(self) -> u16 {
+        self.node_count
+    }
+
+    pub const fn replacement_node(self) -> u16 {
+        self.replacement_node
+    }
+
+    pub const fn incident_edges(self) -> [ComponentGraphReplacementEdgePin; 2] {
+        self.incident_edges
+    }
+
+    pub const fn max_replacements(self) -> u16 {
+        self.max_replacements
+    }
+}
+
+#[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+impl core::fmt::Debug for ComponentGraphNodeReplacementPin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ComponentGraphNodeReplacementPin")
+            .field("artifacts", &"<redacted>")
+            .field("wit_source", &"<redacted>")
+            .field("source_world", &self.source_world)
+            .field("relay_world", &self.relay_world)
+            .field("sink_world", &self.sink_world)
+            .field("interface", &self.interface)
+            .field("profile", &self.profile)
+            .field("limits", &self.limits)
+            .field("node_count", &self.node_count)
+            .field("replacement_node", &self.replacement_node)
+            .field("incident_edges", &self.incident_edges)
+            .field("max_replacements", &self.max_replacements)
             .finish()
     }
 }
@@ -601,33 +809,64 @@ const C64_RESOURCE_CONSUMER_BYTES: &[u8] = include_bytes!(concat!(
 const C64_RESOURCE_CONSUMER_SHA256: [u8; 32] =
     include!(concat!(env!("OUT_DIR"), "/c64-resource-consumer.sha256.rs"));
 
-#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+#[cfg(any(
+    feature = "c65-async-chain-qemu-acceptance",
+    feature = "c66-node-replacement-qemu-acceptance"
+))]
 const C65_ASYNC_SOURCE_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/c65-async-source.component.wasm"));
 
-#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+#[cfg(any(
+    feature = "c65-async-chain-qemu-acceptance",
+    feature = "c66-node-replacement-qemu-acceptance"
+))]
 const C65_ASYNC_SOURCE_SHA256: [u8; 32] =
     include!(concat!(env!("OUT_DIR"), "/c65-async-source.sha256.rs"));
 
-#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+#[cfg(any(
+    feature = "c65-async-chain-qemu-acceptance",
+    feature = "c66-node-replacement-qemu-acceptance"
+))]
 const C65_ASYNC_RELAY_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/c65-async-relay.component.wasm"));
 
-#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+#[cfg(any(
+    feature = "c65-async-chain-qemu-acceptance",
+    feature = "c66-node-replacement-qemu-acceptance"
+))]
 const C65_ASYNC_RELAY_SHA256: [u8; 32] =
     include!(concat!(env!("OUT_DIR"), "/c65-async-relay.sha256.rs"));
 
-#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+#[cfg(any(
+    feature = "c65-async-chain-qemu-acceptance",
+    feature = "c66-node-replacement-qemu-acceptance"
+))]
 const C65_ASYNC_SINK_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/c65-async-sink.component.wasm"));
 
-#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+#[cfg(any(
+    feature = "c65-async-chain-qemu-acceptance",
+    feature = "c66-node-replacement-qemu-acceptance"
+))]
 const C65_ASYNC_SINK_SHA256: [u8; 32] =
     include!(concat!(env!("OUT_DIR"), "/c65-async-sink.sha256.rs"));
 
-#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+#[cfg(any(
+    feature = "c65-async-chain-qemu-acceptance",
+    feature = "c66-node-replacement-qemu-acceptance"
+))]
 const C65_ASYNC_CHAIN_WIT_SHA256: [u8; 32] =
     include!(concat!(env!("OUT_DIR"), "/c65-async-chain-wit.sha256.rs"));
+
+#[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+const C66_ASYNC_RELAY_V2_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/c66-async-relay-v2.component.wasm"
+));
+
+#[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+const C66_ASYNC_RELAY_V2_SHA256: [u8; 32] =
+    include!(concat!(env!("OUT_DIR"), "/c66-async-relay-v2.sha256.rs"));
 
 #[cfg(any(
     feature = "c53-native-async-qemu-acceptance",
@@ -850,6 +1089,57 @@ pub const C65_ASYNC_CHAIN_QEMU_ACCEPTANCE: ComponentGraphAsyncChainPin =
         },
     };
 
+/// Exact validation-only policy root for replacing the middle C6.5 relay.
+///
+/// This reuses the C6.5 source, old relay, sink, WIT, worlds, profile, and
+/// ceilings without changing the C6.5 pin. Only the relay artifact identity is
+/// updated. Both incident edges must be recreated under fresh local runtime
+/// identities, and the bounded image authorizes exactly one such replacement.
+#[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+pub const C66_NODE_REPLACEMENT_QEMU_ACCEPTANCE: ComponentGraphNodeReplacementPin =
+    ComponentGraphNodeReplacementPin {
+        source_bytes: C65_ASYNC_SOURCE_BYTES,
+        source_sha256: C65_ASYNC_SOURCE_SHA256,
+        old_relay_bytes: C65_ASYNC_RELAY_BYTES,
+        old_relay_sha256: C65_ASYNC_RELAY_SHA256,
+        new_relay_bytes: C66_ASYNC_RELAY_V2_BYTES,
+        new_relay_sha256: C66_ASYNC_RELAY_V2_SHA256,
+        sink_bytes: C65_ASYNC_SINK_BYTES,
+        sink_sha256: C65_ASYNC_SINK_SHA256,
+        wit_source: include_str!("../artifacts/c65-async-chain.wit"),
+        wit_sha256: C65_ASYNC_CHAIN_WIT_SHA256,
+        source_world: "test:c65-chain/source@1.0.0",
+        relay_world: "test:c65-chain/relay@1.0.0",
+        sink_world: "test:c65-chain/sink@1.0.0",
+        interface: "test:c65-chain/pipe@1.0.0",
+        profile: ProfileIdentity::PROFILE_1_ASYNC,
+        limits: ComponentInstanceLimits {
+            memory_bytes: 64 * 1024,
+            total_fuel: 1_000,
+            poll_quantum: 100,
+            resources: 8,
+        },
+        node_count: 3,
+        replacement_node: 1,
+        incident_edges: [
+            ComponentGraphReplacementEdgePin::new(
+                0,
+                0,
+                1,
+                0,
+                ComponentGraphReplacementPinAction::RecreateFresh,
+            ),
+            ComponentGraphReplacementEdgePin::new(
+                1,
+                0,
+                2,
+                0,
+                ComponentGraphReplacementPinAction::RecreateFresh,
+            ),
+        ],
+        max_replacements: 1,
+    };
+
 /// The default QEMU image admits a bounded managed slice. Storage V2 initially
 /// formats only its policy range within this slice; unused suffix capacity is
 /// not ambient store capacity and may be admitted only by explicit growth.
@@ -899,6 +1189,8 @@ pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
     use sha2::{Digest, Sha256};
 
@@ -1069,6 +1361,125 @@ mod tests {
             assert!(!plan.native_async_runtime_ready());
             assert_eq!(plan.executable_exports().count(), 0);
         }
+    }
+
+    #[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+    #[test]
+    fn c66_node_replacement_pin_is_exact_bounded_and_redacted() {
+        let pin = C66_NODE_REPLACEMENT_QEMU_ACCEPTANCE;
+        for (bytes, expected) in [
+            (pin.source_bytes(), pin.source_sha256()),
+            (pin.old_relay_bytes(), pin.old_relay_sha256()),
+            (pin.new_relay_bytes(), pin.new_relay_sha256()),
+            (pin.sink_bytes(), pin.sink_sha256()),
+        ] {
+            assert_eq!(<[u8; 32]>::from(Sha256::digest(bytes)), expected);
+        }
+        assert_eq!(pin.source_sha256(), C65_ASYNC_SOURCE_SHA256);
+        assert_eq!(pin.old_relay_sha256(), C65_ASYNC_RELAY_SHA256);
+        assert_eq!(pin.sink_sha256(), C65_ASYNC_SINK_SHA256);
+        assert_ne!(pin.old_relay_sha256(), pin.new_relay_sha256());
+        assert_ne!(pin.source_sha256(), pin.new_relay_sha256());
+        assert_ne!(pin.sink_sha256(), pin.new_relay_sha256());
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(pin.wit_source().as_bytes())),
+            pin.wit_sha256()
+        );
+        assert_eq!(pin.wit_sha256(), C65_ASYNC_CHAIN_WIT_SHA256);
+        assert_eq!(pin.profile(), ProfileIdentity::PROFILE_1_ASYNC);
+        assert!(!pin.profile().execution_enabled());
+        assert_eq!(pin.source_world(), "test:c65-chain/source@1.0.0");
+        assert_eq!(pin.relay_world(), "test:c65-chain/relay@1.0.0");
+        assert_eq!(pin.sink_world(), "test:c65-chain/sink@1.0.0");
+        assert_eq!(pin.interface(), "test:c65-chain/pipe@1.0.0");
+        assert_eq!(
+            pin.limits(),
+            ComponentInstanceLimits {
+                memory_bytes: 64 * 1024,
+                total_fuel: 1_000,
+                poll_quantum: 100,
+                resources: 8,
+            }
+        );
+        assert_eq!(pin.node_count(), 3);
+        assert_eq!(pin.replacement_node(), 1);
+        assert_eq!(pin.max_replacements(), 1);
+        assert_eq!(
+            pin.incident_edges(),
+            [
+                ComponentGraphReplacementEdgePin::new(
+                    0,
+                    0,
+                    1,
+                    0,
+                    ComponentGraphReplacementPinAction::RecreateFresh,
+                ),
+                ComponentGraphReplacementEdgePin::new(
+                    1,
+                    0,
+                    2,
+                    0,
+                    ComponentGraphReplacementPinAction::RecreateFresh,
+                ),
+            ]
+        );
+        for edge in pin.incident_edges() {
+            assert!(
+                edge.source_node() == pin.replacement_node()
+                    || edge.target_node() == pin.replacement_node()
+            );
+            assert_eq!(edge.source_export(), 0);
+            assert_eq!(edge.target_import(), 0);
+            assert_eq!(
+                edge.action(),
+                ComponentGraphReplacementPinAction::RecreateFresh
+            );
+        }
+
+        let debug = std::format!("{pin:?}");
+        assert!(debug.contains("artifacts: \"<redacted>\""));
+        assert!(debug.contains("wit_source: \"<redacted>\""));
+        assert!(!debug.contains(&std::format!("{:?}", pin.old_relay_sha256())));
+        assert!(!debug.contains(&std::format!("{:?}", pin.new_relay_sha256())));
+        assert!(!debug.contains("(component"));
+    }
+
+    #[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+    #[test]
+    fn c66_relay_update_changes_identity_but_preserves_the_exact_world() {
+        use vibeos_component_runtime::{
+            decode::inspect_component_for_profile, world::WorldContract,
+        };
+
+        let pin = C66_NODE_REPLACEMENT_QEMU_ACCEPTANCE;
+        let world = WorldContract::parse(pin.wit_source(), pin.relay_world())
+            .expect("pinned C6.6 relay world must parse");
+        let old = inspect_component_for_profile(pin.old_relay_bytes(), pin.profile())
+            .expect("pinned C6.6 old relay must inspect under Profile 1 async");
+        let new = inspect_component_for_profile(pin.new_relay_bytes(), pin.profile())
+            .expect("pinned C6.6 new relay must inspect under Profile 1 async");
+
+        old.check_world(&world)
+            .expect("pinned C6.6 old relay must match the exact relay world");
+        new.check_world(&world)
+            .expect("pinned C6.6 new relay must match the exact relay world");
+        assert_eq!(old.imports(), new.imports());
+        assert_eq!(old.exports(), new.exports());
+        assert_eq!(old.imports().len(), 1);
+        assert_eq!(old.exports().len(), 1);
+        assert_eq!(old.imports()[0].name, pin.interface());
+        assert_eq!(old.exports()[0].name, pin.interface());
+        assert_eq!(old.summary().resources, 0);
+        assert_eq!(new.summary().resources, 0);
+        assert_eq!(old.summary().async_abi, new.summary().async_abi);
+        assert!(!old.runtime_ready());
+        assert!(!new.runtime_ready());
+        assert!(!old.native_async_runtime_ready());
+        assert!(!new.native_async_runtime_ready());
+        assert_eq!(old.executable_exports().count(), 0);
+        assert_eq!(new.executable_exports().count(), 0);
+        assert_ne!(pin.old_relay_bytes(), pin.new_relay_bytes());
+        assert_ne!(pin.old_relay_sha256(), pin.new_relay_sha256());
     }
 
     #[cfg(feature = "c53-native-async-command-projection")]

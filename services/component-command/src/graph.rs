@@ -10,9 +10,10 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use core::fmt;
 
 use vibeos_component_admission::{
-    AdmittedComponentGraph, ComponentGraphAdmissionError, ComponentGraphAsyncEdgeManifest,
-    ComponentGraphAuthorityGrant, ComponentGraphManifest, ComponentGraphResourceEdgeManifest,
-    ComponentIdentity, InstanceLimits, ProfileIdentity,
+    AdmittedComponentGraph, AdmittedComponentGraphReplacement, ComponentGraphAdmissionError,
+    ComponentGraphAsyncEdgeManifest, ComponentGraphAuthorityGrant, ComponentGraphManifest,
+    ComponentGraphReplacementAdmissionError, ComponentGraphReplacementEdgePolicy,
+    ComponentGraphResourceEdgeManifest, ComponentIdentity, InstanceLimits, ProfileIdentity,
 };
 use vibeos_component_format::{
     ComponentGraphAccount, ComponentGraphNodeBudget, TrapCode, PROFILE_1_LIMITS,
@@ -42,6 +43,40 @@ impl fmt::Display for ComponentGraphPrincipalTemplateError {
 impl From<ComponentGraphAdmissionError> for ComponentGraphPrincipalTemplateError {
     fn from(error: ComponentGraphAdmissionError) -> Self {
         Self::Admission(error)
+    }
+}
+
+/// Failure while deriving or revalidating an inert replacement template.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentGraphNodeReplacementTemplateError {
+    Admission(ComponentGraphReplacementAdmissionError),
+    Principal(ComponentGraphPrincipalTemplateError),
+    Allocation,
+    ProjectionMismatch,
+}
+
+impl fmt::Display for ComponentGraphNodeReplacementTemplateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Admission(_) => "component graph replacement revalidation failed",
+            Self::Principal(_) => "component graph principal revalidation failed",
+            Self::Allocation => "component graph replacement projection allocation failed",
+            Self::ProjectionMismatch => {
+                "component graph replacement projection differs from admission"
+            }
+        })
+    }
+}
+
+impl From<ComponentGraphReplacementAdmissionError> for ComponentGraphNodeReplacementTemplateError {
+    fn from(error: ComponentGraphReplacementAdmissionError) -> Self {
+        Self::Admission(error)
+    }
+}
+
+impl From<ComponentGraphPrincipalTemplateError> for ComponentGraphNodeReplacementTemplateError {
+    fn from(error: ComponentGraphPrincipalTemplateError) -> Self {
+        Self::Principal(error)
     }
 }
 
@@ -482,6 +517,155 @@ impl fmt::Debug for ComponentGraphPrincipalTemplate {
             .field("account", &self.account)
             .field("principals", &self.principals)
             .field("async_edges", &self.async_edges())
+            .field("runtime_ready", &self.runtime_ready())
+            .finish()
+    }
+}
+
+/// Immutable command-layer envelope for one sealed C6.6 node replacement.
+///
+/// The two graph projections and every incident-edge action remain inert.
+/// Construction and [`Self::revalidate`] freshly prove the underlying graph
+/// admission records; only a kernel supervisor holding the exact live
+/// lifecycle identities may interpret `RecreateFresh`. This type has no
+/// ambient lookup, capability transfer, guest execution, or publication API.
+///
+/// ```compile_fail
+/// use vibeos_component_command::ComponentGraphNodeReplacementTemplate;
+/// fn cannot_run(template: &ComponentGraphNodeReplacementTemplate) { template.run(); }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_command::ComponentGraphNodeReplacementTemplate;
+/// fn cannot_instantiate(template: &ComponentGraphNodeReplacementTemplate) {
+///     template.instantiate();
+/// }
+/// ```
+pub struct ComponentGraphNodeReplacementTemplate {
+    admitted: Arc<AdmittedComponentGraphReplacement>,
+    current: ComponentGraphPrincipalTemplate,
+    candidate: ComponentGraphPrincipalTemplate,
+    target: ComponentGraphNodeId,
+    max_replacements: u16,
+    incident_edges: Vec<ComponentGraphReplacementEdgePolicy>,
+    transient_account: ComponentGraphAccount,
+}
+
+impl ComponentGraphNodeReplacementTemplate {
+    /// Revalidate both complete graphs and the sealed replacement relation
+    /// before projecting any lifecycle metadata.
+    pub fn new(
+        admitted: Arc<AdmittedComponentGraphReplacement>,
+    ) -> Result<Self, ComponentGraphNodeReplacementTemplateError> {
+        admitted.revalidate()?;
+        let current =
+            ComponentGraphPrincipalTemplate::new(Arc::clone(admitted.current_graph_arc()))?;
+        let candidate =
+            ComponentGraphPrincipalTemplate::new(Arc::clone(admitted.candidate_graph_arc()))?;
+        let manifest = admitted.manifest();
+        let mut incident_edges = Vec::new();
+        incident_edges
+            .try_reserve_exact(manifest.incident_edges().len())
+            .map_err(|_| ComponentGraphNodeReplacementTemplateError::Allocation)?;
+        incident_edges.extend_from_slice(manifest.incident_edges());
+        let template = Self {
+            target: manifest.target(),
+            max_replacements: manifest.max_replacements(),
+            transient_account: manifest.transient_account(),
+            admitted,
+            current,
+            candidate,
+            incident_edges,
+        };
+        template.ensure_exact_projection()?;
+        Ok(template)
+    }
+
+    pub fn admitted_replacement(&self) -> &AdmittedComponentGraphReplacement {
+        &self.admitted
+    }
+
+    pub const fn target(&self) -> ComponentGraphNodeId {
+        self.target
+    }
+
+    pub const fn max_replacements(&self) -> u16 {
+        self.max_replacements
+    }
+
+    pub fn incident_edges(&self) -> &[ComponentGraphReplacementEdgePolicy] {
+        &self.incident_edges
+    }
+
+    pub const fn transient_account(&self) -> ComponentGraphAccount {
+        self.transient_account
+    }
+
+    pub const fn current_graph(&self) -> &ComponentGraphPrincipalTemplate {
+        &self.current
+    }
+
+    pub const fn candidate_graph(&self) -> &ComponentGraphPrincipalTemplate {
+        &self.candidate
+    }
+
+    pub fn current_principal(&self) -> Option<&ComponentGraphNodePrincipalTemplate> {
+        self.current.principal(self.target)
+    }
+
+    pub fn candidate_principal(&self) -> Option<&ComponentGraphNodePrincipalTemplate> {
+        self.candidate.principal(self.target)
+    }
+
+    pub const fn runtime_ready(&self) -> bool {
+        false
+    }
+
+    /// Freshly revalidate both graph bytes and prove the cached command-layer
+    /// replacement projection remains exact.
+    pub fn revalidate(&self) -> Result<(), ComponentGraphNodeReplacementTemplateError> {
+        self.admitted.revalidate()?;
+        self.current.revalidate()?;
+        self.candidate.revalidate()?;
+        self.ensure_exact_projection()
+    }
+
+    fn ensure_exact_projection(&self) -> Result<(), ComponentGraphNodeReplacementTemplateError> {
+        let manifest = self.admitted.manifest();
+        if self.target != manifest.target()
+            || self.max_replacements != 1
+            || self.max_replacements != manifest.max_replacements()
+            || self.incident_edges != manifest.incident_edges()
+            || self.transient_account != manifest.transient_account()
+            || !Arc::ptr_eq(&self.current.admitted, self.admitted.current_graph_arc())
+            || !Arc::ptr_eq(
+                &self.candidate.admitted,
+                self.admitted.candidate_graph_arc(),
+            )
+            || self.current.principal(self.target).is_none()
+            || self.candidate.principal(self.target).is_none()
+            || self.admitted.runtime_ready()
+            || self.current.runtime_ready()
+            || self.candidate.runtime_ready()
+            || self.runtime_ready()
+        {
+            return Err(ComponentGraphNodeReplacementTemplateError::ProjectionMismatch);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ComponentGraphNodeReplacementTemplate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ComponentGraphNodeReplacementTemplate")
+            .field("admitted_replacement", &"<redacted>")
+            .field("current_graph", &"<redacted>")
+            .field("candidate_graph", &"<redacted>")
+            .field("target", &self.target)
+            .field("max_replacements", &self.max_replacements)
+            .field("incident_edges", &self.incident_edges)
+            .field("transient_account", &self.transient_account)
             .field("runtime_ready", &self.runtime_ready())
             .finish()
     }

@@ -19,7 +19,10 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use core::task::{Context, Poll};
 
-#[cfg(feature = "wasm-c48-target-acceptance")]
+#[cfg(any(
+    feature = "wasm-c48-target-acceptance",
+    feature = "wasm-c66-node-replacement-acceptance"
+))]
 use crate::cap::CapabilityTableRange;
 use crate::cap::{
     CSpace, CSpaceIdentity, CSpaceResetError, CapError, SupervisedTransferReceipt,
@@ -594,7 +597,10 @@ pub enum AcceptanceSealMismatch {
 /// Identity fields remain private and can only be compared through predicates,
 /// preventing acceptance diagnostics from becoming lookup or reset authority.
 /// This type and every constructor for it are absent from production builds.
-#[cfg(feature = "wasm-c48-target-acceptance")]
+#[cfg(any(
+    feature = "wasm-c48-target-acceptance",
+    feature = "wasm-c66-node-replacement-acceptance"
+))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AcceptanceInstanceProbe {
     exact: bool,
@@ -610,7 +616,10 @@ pub struct AcceptanceInstanceProbe {
     seal_matches_cspace: bool,
 }
 
-#[cfg(feature = "wasm-c48-target-acceptance")]
+#[cfg(any(
+    feature = "wasm-c48-target-acceptance",
+    feature = "wasm-c66-node-replacement-acceptance"
+))]
 impl fmt::Debug for AcceptanceInstanceProbe {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -634,7 +643,10 @@ impl fmt::Debug for AcceptanceInstanceProbe {
     }
 }
 
-#[cfg(feature = "wasm-c48-target-acceptance")]
+#[cfg(any(
+    feature = "wasm-c48-target-acceptance",
+    feature = "wasm-c66-node-replacement-acceptance"
+))]
 impl AcceptanceInstanceProbe {
     /// Whether the requested token still names the slot's exact generation and
     /// the atomic header agrees with the locked record.
@@ -3959,7 +3971,10 @@ impl InstanceRegistry {
     /// while the faulting task may have abandoned that lock; fault recovery
     /// must complete first. The returned copy carries no lookup/reset authority
     /// and may be retained only as diagnostic evidence.
-    #[cfg(feature = "wasm-c48-target-acceptance")]
+    #[cfg(any(
+        feature = "wasm-c48-target-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance"
+    ))]
     pub fn acceptance_probe(&self, token: InstanceToken) -> Option<AcceptanceInstanceProbe> {
         let _transaction = self.transaction.lock();
         let slot = self.slot(token)?;

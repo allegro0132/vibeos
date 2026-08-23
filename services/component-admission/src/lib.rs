@@ -39,9 +39,11 @@ use vibeos_component_admission::{
 
 extern crate alloc;
 
+mod authentication;
 mod graph;
 mod information_flow;
 
+pub use authentication::*;
 pub use graph::*;
 pub use information_flow::*;
 
@@ -335,6 +337,42 @@ pub struct AdmissionPolicy<'a> {
     pub stdout: CommandStreamMode,
     pub stderr: CommandStreamMode,
     pub interfaces: &'a [InterfaceCeiling<'a>],
+}
+
+/// Capability-free admission rules after an external trust gate has proved
+/// the artifact's provenance. This is crate-private so the development and
+/// authenticated paths can share the exact same semantic admission without
+/// either path manufacturing the other's trust token.
+pub(crate) struct ExactAdmissionRules<'a> {
+    pub(crate) command_name: &'a str,
+    pub(crate) entrypoint: &'a str,
+    pub(crate) min_args: usize,
+    pub(crate) max_args: usize,
+    pub(crate) exact_world: &'a WorldContract,
+    pub(crate) profile: ProfileIdentity,
+    pub(crate) limits: InstanceLimits,
+    pub(crate) stdin: CommandStreamMode,
+    pub(crate) stdout: CommandStreamMode,
+    pub(crate) stderr: CommandStreamMode,
+    pub(crate) interfaces: &'a [InterfaceCeiling<'a>],
+}
+
+impl<'a> ExactAdmissionRules<'a> {
+    const fn from_development(policy: &'a AdmissionPolicy<'a>) -> Self {
+        Self {
+            command_name: policy.command_name,
+            entrypoint: policy.entrypoint,
+            min_args: policy.min_args,
+            max_args: policy.max_args,
+            exact_world: policy.exact_world,
+            profile: policy.profile,
+            limits: policy.limits,
+            stdin: policy.stdin,
+            stdout: policy.stdout,
+            stderr: policy.stderr,
+            interfaces: policy.interfaces,
+        }
+    }
 }
 
 /// Trusted image inputs for the closed C5.6 selected-WASI admission path.
@@ -1047,36 +1085,59 @@ pub fn admit(
     if policy.trust != ArtifactTrust::ImagePinned(artifact.identity) {
         return Err(AdmissionError::UntrustedArtifact);
     }
-    policy.limits.validate()?;
-    if !valid_name(policy.command_name) {
+    admit_under_exact_rules(
+        artifact,
+        &ExactAdmissionRules::from_development(policy),
+        caller,
+    )
+}
+
+/// Complete ordinary admission after a separate trust gate has proved the
+/// artifact. This function accepts no trust enum, signer identifier, durable
+/// object identifier, or lookup callback.
+pub(crate) fn admit_under_exact_rules(
+    artifact: ComponentArtifact,
+    rules: &ExactAdmissionRules<'_>,
+    caller: &CallerAuthority<'_>,
+) -> Result<AdmittedComponent, AdmissionError> {
+    if rules.profile != ProfileIdentity::PROFILE_1
+        && rules.profile != ProfileIdentity::PROFILE_1_ASYNC
+    {
+        return Err(AdmissionError::BadProfile);
+    }
+    if artifact.profile != rules.profile {
+        return Err(AdmissionError::BadProfile);
+    }
+    rules.limits.validate()?;
+    if !valid_name(rules.command_name) {
         return Err(AdmissionError::InvalidCommandName);
     }
-    if !valid_entrypoint(policy.entrypoint) {
+    if !valid_entrypoint(rules.entrypoint) {
         return Err(AdmissionError::InvalidEntrypoint);
     }
-    if !valid_argument_limits(policy.min_args, policy.max_args) {
+    if !valid_argument_limits(rules.min_args, rules.max_args) {
         return Err(AdmissionError::InvalidArgumentLimits);
     }
-    if !valid_manifest_text(&policy.exact_world.identity, 256) {
+    if !valid_manifest_text(&rules.exact_world.identity, 256) {
         return Err(AdmissionError::InvalidPolicy);
     }
-    if policy.interfaces.len() > PROFILE_1_LIMITS.max_imports as usize
+    if rules.interfaces.len() > PROFILE_1_LIMITS.max_imports as usize
         || caller.offers.len() > PROFILE_1_LIMITS.max_imports as usize
     {
         return Err(AdmissionError::InvalidPolicy);
     }
-    validate_policy_tables(policy.interfaces, caller.offers)?;
+    validate_policy_tables(rules.interfaces, caller.offers)?;
 
     let (component, modules, imports, exports, host_requirements, stream_transport) = {
         let InspectedComponent { plan, modules, .. } = artifact.inspect()?;
-        plan.check_world(policy.exact_world)
+        plan.check_world(rules.exact_world)
             .map_err(AdmissionError::World)?;
-        if !policy.profile.execution_enabled() || !plan.runtime_ready() {
+        if !rules.profile.execution_enabled() || !plan.runtime_ready() {
             return Err(AdmissionError::RuntimeUnavailable);
         }
         let entrypoints = plan
             .executable_exports()
-            .filter(|export| export.name == policy.entrypoint)
+            .filter(|export| export.name == rules.entrypoint)
             .count();
         if entrypoints != 1 {
             return Err(AdmissionError::InvalidEntrypoint);
@@ -1102,12 +1163,12 @@ pub fn admit(
         }
         let stream_transport = stream_reader && stream_writer;
         if stream_transport
-            && (policy.exact_world.identity != STREAM_FILTER_WORLD
-                || policy.min_args != 0
-                || policy.max_args != 0
-                || policy.stdin != CommandStreamMode::Required
-                || policy.stdout != CommandStreamMode::Required
-                || policy.stderr == CommandStreamMode::Required
+            && (rules.exact_world.identity != STREAM_FILTER_WORLD
+                || rules.min_args != 0
+                || rules.max_args != 0
+                || rules.stdin != CommandStreamMode::Required
+                || rules.stdout != CommandStreamMode::Required
+                || rules.stderr == CommandStreamMode::Required
                 || !requirements.is_empty())
         {
             return Err(AdmissionError::InvalidPolicy);
@@ -1134,7 +1195,7 @@ pub fn admit(
         .map_err(|_| AdmissionError::Allocation)?;
 
     for host in host_requirements {
-        let (ceiling_index, ceiling) = unique_ceiling(policy.interfaces, host)?;
+        let (ceiling_index, ceiling) = unique_ceiling(rules.interfaces, host)?;
         let (offer_index, offer) = unique_offer(caller.offers, ceiling, host)?;
         let rights = host.rights();
         if !ceiling.rights.contains(rights) || !offer.grantable.contains(rights) {
@@ -1163,29 +1224,29 @@ pub fn admit(
         let _ = ceiling_index;
     }
 
-    let name = copied(policy.command_name)?;
-    let world = copied(&policy.exact_world.identity)?;
-    let inspection_world = copied(&policy.exact_world.identity)?;
-    let entrypoint = copied(policy.entrypoint)?;
+    let name = copied(rules.command_name)?;
+    let world = copied(&rules.exact_world.identity)?;
+    let inspection_world = copied(&rules.exact_world.identity)?;
+    let entrypoint = copied(rules.entrypoint)?;
     let command = ComponentCommandManifest {
         name,
-        profile: policy.profile,
+        profile: rules.profile,
         artifact: artifact.identity,
         world,
         entrypoint,
-        min_args: policy.min_args,
-        max_args: policy.max_args,
-        stdin: policy.stdin,
-        stdout: policy.stdout,
-        stderr: policy.stderr,
+        min_args: rules.min_args,
+        max_args: rules.max_args,
+        stdin: rules.stdin,
+        stdout: rules.stdout,
+        stderr: rules.stderr,
         stream_transport,
-        limits: policy.limits,
+        limits: rules.limits,
         requirements,
     };
     Ok(AdmittedComponent {
         artifact,
         inspection: InspectionSummary {
-            profile: policy.profile,
+            profile: rules.profile,
             world: inspection_world,
             component,
             modules,

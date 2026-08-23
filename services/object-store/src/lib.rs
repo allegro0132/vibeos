@@ -773,14 +773,85 @@ impl SealedConfigJournal {
 }
 
 /// One inert view of the shared journal. Authority is still absent: callers
-/// must apply external root constraints and construct typed resource witnesses
-/// before installing anything into a CSpace.
+/// may use the decoded records for migration or policy validation, but this
+/// type has no operation which can confer recovered authority. Only
+/// [`AuthorityJournal::recover_bound`] can consume a freshly recovered source
+/// and produce a [`BoundAuthorityRecovery`].
+///
+/// In particular, a migration snapshot cannot be finished even when its
+/// caller supplied a syntactically valid preflight:
+///
+/// ```compile_fail
+/// use vibeos_durable_format::RootPolicy;
+/// use vibeos_object_store::AuthoritySnapshot;
+///
+/// fn cannot_finish(snapshot: AuthoritySnapshot, roots: &[RootPolicy]) {
+///     let _ = snapshot.finish_bound(roots);
+/// }
+/// ```
 pub struct AuthoritySnapshot {
     pub formatted: bool,
     pub checkpoint: ChainCheckpoint,
     pub used_sectors: usize,
     pub preflight: Option<authority::RecoveryPreflight>,
     v2_objects: Option<Arc<Vec<StorageV2RecoveredObject>>>,
+}
+
+/// One canonical authority recovery produced by consuming the object store's
+/// private preflight under an exact external root policy.
+///
+/// The fields are private and this type is deliberately neither `Clone` nor
+/// `Debug`. A caller may inspect the recovered graph by shared borrow, but can
+/// materialize a resource only when the selected full record is uniquely
+/// present in this same internally-owned recovery.
+///
+/// ```compile_fail
+/// use vibeos_object_store::BoundAuthorityRecovery;
+///
+/// fn require_clone<T: Clone>() {}
+/// fn duplicate() {
+///     require_clone::<BoundAuthorityRecovery>();
+/// }
+/// ```
+#[must_use = "a bound authority recovery must be admitted or discarded"]
+pub struct BoundAuthorityRecovery {
+    recovered: authority::RecoveredStore,
+    v2_objects: Option<Arc<Vec<StorageV2RecoveredObject>>>,
+}
+
+impl BoundAuthorityRecovery {
+    /// Borrow the exact canonical recovered graph retained by this provenance
+    /// receipt. No mutable view or independently replaceable resolver is
+    /// exposed.
+    pub fn recovered(&self) -> &authority::RecoveredStore {
+        &self.recovered
+    }
+
+    /// Materialize only a full record which occurs uniquely in this bound
+    /// recovery under its stable object identity.
+    ///
+    /// `selected` is comparison evidence, not lookup authority. An adjacent
+    /// record with the same ID is rejected and no other object is considered as
+    /// a fallback. The returned resource is always constructed from the
+    /// internally-owned canonical record.
+    pub fn stored_object(
+        &self,
+        selected: &authority::RecoveredObject,
+    ) -> Result<Arc<StoredObject>, StoreError> {
+        let mut candidates = self
+            .recovered
+            .objects
+            .iter()
+            .filter(|candidate| candidate.object_id == selected.object_id);
+        let exact = candidates.next().ok_or(StoreError::ObjectUnavailable)?;
+        if candidates.next().is_some() {
+            return Err(StoreError::Corrupt);
+        }
+        if exact != selected {
+            return Err(StoreError::ObjectUnavailable);
+        }
+        stored_object_from_bindings(self.v2_objects.as_deref(), exact)
+    }
 }
 
 #[derive(Clone)]
@@ -849,11 +920,35 @@ impl AuthoritySnapshot {
     }
 }
 
+fn root_policy_set_is_exact(
+    recovered: &authority::RecoveredStore,
+    roots: &[authority::RootPolicy],
+) -> bool {
+    let live_root_count = recovered
+        .grants
+        .iter()
+        .filter(|grant| grant.grant.flags.is_root())
+        .count();
+    live_root_count == roots.len()
+        && roots.iter().all(|root| {
+            recovered
+                .grants
+                .iter()
+                .filter(|grant| grant.grant.flags.is_root() && grant.grant == root.grant)
+                .count()
+                == 1
+        })
+}
+
 fn stored_object_from_bindings(
     bindings: Option<&Vec<StorageV2RecoveredObject>>,
     object: &authority::RecoveredObject,
 ) -> Result<Arc<StoredObject>, StoreError> {
     match bindings {
+        // An external record carries no inline bytes. Only Storage V2's exact
+        // opaque token can name its payload; manufacturing a legacy object
+        // name here would bind a zero-byte facade to a non-zero logical object.
+        None if object.is_external() => Err(StoreError::ObjectUnavailable),
         None => Ok(StoredObject::from_recovered(object)),
         Some(bindings) => {
             let binding = bindings
@@ -901,6 +996,24 @@ pub struct AuthorityJournal {
 }
 
 impl AuthorityJournal {
+    /// Recover the selected durable backend and admit the complete union of
+    /// independently owned root-policy partitions in one object-store-owned
+    /// transition.
+    ///
+    /// Unlike [`Self::recover`], this method does not expose an intermediate
+    /// [`AuthoritySnapshot`] which a caller could rewrite or replace. Root
+    /// selection and `RecoveryPreflight::finish` run synchronously inside this
+    /// method immediately after the canonical M4 scan or sealed Storage V2
+    /// recovery. Omitting any partition which owns a live root, adding a
+    /// foreign partition, or selecting an extra root therefore fails closed.
+    pub async fn recover_bound(
+        &self,
+        partitions: &[authority::RootPolicyPartition<'_>],
+    ) -> Result<BoundAuthorityRecovery, StoreError> {
+        let snapshot = self.recover().await?;
+        finish_recovered_snapshot(snapshot, partitions)
+    }
+
     pub async fn recover(&self) -> Result<AuthoritySnapshot, StoreError> {
         if let Some(v2) = selected_v2_backend(&self.inner)? {
             return v2.recover_authority().await?.into_facade();
@@ -1015,6 +1128,52 @@ impl AuthorityJournal {
             }
         }
     }
+}
+
+/// Complete authority recovery only for a snapshot obtained directly inside
+/// `AuthorityJournal::recover_bound`. Keeping this transition private is the
+/// origin typestate boundary: public migration/inert snapshot constructors can
+/// never call it, even if their caller manufactures a valid durable record
+/// stream with the fixed store ID.
+fn finish_recovered_snapshot(
+    snapshot: AuthoritySnapshot,
+    partitions: &[authority::RootPolicyPartition<'_>],
+) -> Result<BoundAuthorityRecovery, StoreError> {
+    let AuthoritySnapshot {
+        formatted,
+        checkpoint,
+        used_sectors: _,
+        preflight,
+        v2_objects,
+    } = snapshot;
+    if !formatted {
+        return Err(StoreError::Unformatted);
+    }
+    let preflight = preflight.ok_or(StoreError::Unformatted)?;
+    let preflight_checkpoint = preflight
+        .chain_checkpoint()
+        .map_err(|_| StoreError::Corrupt)?;
+    if preflight.store_id() != store_id() || preflight_checkpoint != checkpoint {
+        return Err(StoreError::Corrupt);
+    }
+
+    let roots = authority::select_root_policy_union(&preflight, partitions)
+        .map_err(|_| StoreError::Corrupt)?;
+    let recovered = preflight.finish(&roots).map_err(|_| StoreError::Corrupt)?;
+    let recovered_checkpoint = recovered
+        .chain_checkpoint()
+        .map_err(|_| StoreError::Corrupt)?;
+    if recovered.store_id != store_id()
+        || recovered_checkpoint != checkpoint
+        || !root_policy_set_is_exact(&recovered, &roots)
+    {
+        return Err(StoreError::Corrupt);
+    }
+
+    Ok(BoundAuthorityRecovery {
+        recovered,
+        v2_objects,
+    })
 }
 
 /// Number of audited puts that reached the deterministic pre-write panic. The
@@ -1853,6 +2012,229 @@ mod tests {
     use super::*;
     use vibeos_storage_device::{DeviceId, DeviceSession};
 
+    const TEST_OBJECT_RAW: u128 = 0x901;
+    const TEST_OBJECT_TRANSACTION_RAW: u128 = 0x902;
+    const TEST_DERIVATION_RAW: u128 = 0x903;
+    const TEST_GRANT_TRANSACTION_RAW: u128 = 0x904;
+    const TEST_SPACE_RAW: u128 = 0x905;
+
+    fn test_object_kind() -> authority::ObjectKind {
+        authority::ObjectKind::new(0x434d_5031).unwrap()
+    }
+
+    fn test_root_constraint() -> authority::RootConstraint {
+        authority::RootConstraint {
+            space: authority::SpaceId::new(TEST_SPACE_RAW).unwrap(),
+            first_slot: 0,
+            last_slot_inclusive: 0,
+            rights: authority::RootRightsConstraint::exact(authority::DurableRights::READ),
+            resource_kind: authority::ResourceKind::new(0x5354_4f52).unwrap(),
+            object_kind: test_object_kind(),
+        }
+    }
+
+    fn test_root_grant() -> authority::GrantRecord {
+        authority::GrantRecord {
+            derivation_id: authority::DerivationId::new(TEST_DERIVATION_RAW).unwrap(),
+            parent_id: None,
+            object_id: authority::ObjectId::new(TEST_OBJECT_RAW).unwrap(),
+            target: authority::SlotIdentity {
+                space: authority::SpaceId::new(TEST_SPACE_RAW).unwrap(),
+                slot: 0,
+                generation: 0,
+            },
+            rights: authority::DurableRights::READ,
+            resource_kind: authority::ResourceKind::new(0x5354_4f52).unwrap(),
+            flags: authority::GrantFlags::ROOT,
+        }
+    }
+
+    fn test_preflight(
+        durable_store: StoreId,
+        external: bool,
+    ) -> (
+        authority::RecoveryPreflight,
+        Vec<authority::RootPolicy>,
+        usize,
+    ) {
+        let mut chain = authority::RecordChain::new(durable_store);
+        let mut records = alloc::vec![chain.append(None, authority::RecordBody::Format).unwrap()];
+        let (high_water, next) = authority::preview_id_high_water(&chain, 0x1000).unwrap();
+        records.extend(high_water.records);
+        chain = next;
+
+        let object_transaction =
+            authority::TransactionId::new(TEST_OBJECT_TRANSACTION_RAW).unwrap();
+        let object_id = authority::ObjectId::new(TEST_OBJECT_RAW).unwrap();
+        let (object_records, next) = if external {
+            let (encoded, next) = authority::preview_external_object_transaction(
+                &chain,
+                object_transaction,
+                object_id,
+                test_object_kind(),
+                4096,
+                [0x3c; 32],
+            )
+            .unwrap();
+            (encoded.records, next)
+        } else {
+            let (encoded, next) = authority::preview_object_transaction(
+                &chain,
+                object_transaction,
+                object_id,
+                test_object_kind(),
+                &[0x5a, 0xa5],
+            )
+            .unwrap();
+            (encoded.records, next)
+        };
+        records.extend(object_records);
+        chain = next;
+
+        let (grant, _next) = authority::preview_grant_transaction(
+            &chain,
+            authority::TransactionId::new(TEST_GRANT_TRANSACTION_RAW).unwrap(),
+            test_root_grant(),
+        )
+        .unwrap();
+        records.extend(grant.records);
+
+        let preflight = authority::preflight_recovery(&records, durable_store).unwrap();
+        let roots = preflight
+            .select_roots(core::slice::from_ref(&test_root_constraint()))
+            .unwrap();
+        (preflight, roots, records.len())
+    }
+
+    fn two_root_preflight() -> (
+        authority::RecoveryPreflight,
+        authority::RootConstraint,
+        authority::RootConstraint,
+        usize,
+    ) {
+        let durable_store = store_id();
+        let first_object = authority::ObjectId::new(0x1101).unwrap();
+        let second_object = authority::ObjectId::new(0x1102).unwrap();
+        let first_kind = test_object_kind();
+        let second_kind = authority::ObjectKind::new(first_kind.get() + 1).unwrap();
+        let first_space = authority::SpaceId::new(0x1501).unwrap();
+        let second_space = authority::SpaceId::new(0x1502).unwrap();
+        let resource_kind = authority::ResourceKind::new(0x5354_4f52).unwrap();
+
+        let mut chain = authority::RecordChain::new(durable_store);
+        let mut records = alloc::vec![chain.append(None, authority::RecordBody::Format).unwrap()];
+        let (high_water, next) = authority::preview_id_high_water(&chain, 0x2000).unwrap();
+        records.extend(high_water.records);
+        chain = next;
+
+        for (transaction, object, kind, bytes) in [
+            (
+                authority::TransactionId::new(0x1201).unwrap(),
+                first_object,
+                first_kind,
+                &[0x11][..],
+            ),
+            (
+                authority::TransactionId::new(0x1202).unwrap(),
+                second_object,
+                second_kind,
+                &[0x22][..],
+            ),
+        ] {
+            let (encoded, next) =
+                authority::preview_object_transaction(&chain, transaction, object, kind, bytes)
+                    .unwrap();
+            records.extend(encoded.records);
+            chain = next;
+        }
+
+        for (transaction_raw, derivation_raw, object, space) in [
+            (0x1401, 0x1301, first_object, first_space),
+            (0x1402, 0x1302, second_object, second_space),
+        ] {
+            let grant = authority::GrantRecord {
+                derivation_id: authority::DerivationId::new(derivation_raw).unwrap(),
+                parent_id: None,
+                object_id: object,
+                target: authority::SlotIdentity {
+                    space,
+                    slot: 0,
+                    generation: 0,
+                },
+                rights: authority::DurableRights::READ,
+                resource_kind,
+                flags: authority::GrantFlags::ROOT,
+            };
+            let (encoded, next) = authority::preview_grant_transaction(
+                &chain,
+                authority::TransactionId::new(transaction_raw).unwrap(),
+                grant,
+            )
+            .unwrap();
+            records.extend(encoded.records);
+            chain = next;
+        }
+
+        let first = authority::RootConstraint {
+            space: first_space,
+            first_slot: 0,
+            last_slot_inclusive: 0,
+            rights: authority::RootRightsConstraint::exact(authority::DurableRights::READ),
+            resource_kind,
+            object_kind: first_kind,
+        };
+        let second = authority::RootConstraint {
+            space: second_space,
+            first_slot: 0,
+            last_slot_inclusive: 0,
+            rights: authority::RootRightsConstraint::exact(authority::DurableRights::READ),
+            resource_kind,
+            object_kind: second_kind,
+        };
+        (
+            authority::preflight_recovery(&records, durable_store).unwrap(),
+            first,
+            second,
+            records.len(),
+        )
+    }
+
+    fn snapshot_from_preflight(
+        preflight: authority::RecoveryPreflight,
+        used_sectors: usize,
+        with_v2_binding: bool,
+    ) -> AuthoritySnapshot {
+        let checkpoint = preflight.chain_checkpoint().unwrap();
+        let v2_objects = with_v2_binding.then(|| {
+            let selected = &preflight.committed_objects()[0];
+            Arc::new(alloc::vec![StorageV2RecoveredObject::new(
+                selected,
+                StorageV2ObjectToken::new(0xfeed_beef_u64),
+            )])
+        });
+        AuthoritySnapshot {
+            formatted: true,
+            checkpoint,
+            used_sectors,
+            preflight: Some(preflight),
+            v2_objects,
+        }
+    }
+
+    /// White-box stand-in for the synchronous tail of
+    /// `AuthorityJournal::recover_bound`. Production callers cannot invoke
+    /// `finish_recovered_snapshot` with an inert or migration snapshot.
+    fn finish_single_test_snapshot(
+        snapshot: AuthoritySnapshot,
+    ) -> Result<BoundAuthorityRecovery, StoreError> {
+        let constraint = test_root_constraint();
+        let partitions = [authority::RootPolicyPartition {
+            space: constraint.space,
+            constraints: core::slice::from_ref(&constraint),
+        }];
+        finish_recovered_snapshot(snapshot, &partitions)
+    }
+
     #[test]
     fn recovery_backend_accepts_frozen_read_only_media() {
         let session = DeviceSession::new(DeviceId::new(1).unwrap(), 1).unwrap();
@@ -1898,6 +2280,178 @@ mod tests {
             selection_uses_storage_v2(StorageBackendSelection::FailClosed),
             Err(StoreError::Corrupt)
         );
+    }
+
+    #[test]
+    fn internal_recovery_completion_materializes_exact_inline_object() {
+        let (preflight, _roots, used_sectors) = test_preflight(store_id(), false);
+        let snapshot = snapshot_from_preflight(preflight, used_sectors, false);
+        let bound = finish_single_test_snapshot(snapshot)
+            .expect("the exact roots must finish the original preflight");
+        let recovered = bound.recovered();
+        assert_eq!(recovered.store_id, store_id());
+        assert_eq!(recovered.grants.len(), 1);
+        assert_eq!(recovered.objects.len(), 1);
+
+        let selected = &recovered.objects[0];
+        let stored = bound
+            .stored_object(selected)
+            .expect("the internally-owned exact inline record must materialize");
+        assert_eq!(stored.store_id, recovered.store_id);
+        assert_eq!(stored.object_id, selected.object_id);
+        assert_eq!(stored.object_kind, selected.object_kind);
+        assert_eq!(stored.byte_len, selected.bytes.len());
+        assert_eq!(stored.commit_sequence, selected.commit_sequence);
+        assert!(stored.v2_token.is_none());
+    }
+
+    #[test]
+    fn internal_recovery_completion_rejects_missing_foreign_and_foreign_store_roots() {
+        let (preflight, _roots, used_sectors) = test_preflight(store_id(), false);
+        let snapshot = snapshot_from_preflight(preflight, used_sectors, false);
+        assert!(matches!(
+            finish_recovered_snapshot(snapshot, &[]),
+            Err(StoreError::Corrupt)
+        ));
+
+        let (preflight, _roots, used_sectors) = test_preflight(store_id(), false);
+        let mut foreign = test_root_constraint();
+        foreign.space = authority::SpaceId::new(TEST_SPACE_RAW + 1).unwrap();
+        let partitions = [authority::RootPolicyPartition {
+            space: foreign.space,
+            constraints: core::slice::from_ref(&foreign),
+        }];
+        let snapshot = snapshot_from_preflight(preflight, used_sectors, false);
+        assert!(matches!(
+            finish_recovered_snapshot(snapshot, &partitions),
+            Err(StoreError::Corrupt)
+        ));
+
+        let foreign_store = StoreId::new(STORE_ID_RAW + 1).unwrap();
+        let (preflight, _roots, used_sectors) = test_preflight(foreign_store, false);
+        let snapshot = snapshot_from_preflight(preflight, used_sectors, false);
+        assert!(matches!(
+            finish_single_test_snapshot(snapshot),
+            Err(StoreError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn internal_recovery_requires_the_complete_multi_partition_root_union() {
+        let (preflight, first, second, used_sectors) = two_root_preflight();
+        let partitions = [
+            authority::RootPolicyPartition {
+                space: first.space,
+                constraints: core::slice::from_ref(&first),
+            },
+            authority::RootPolicyPartition {
+                space: second.space,
+                constraints: core::slice::from_ref(&second),
+            },
+        ];
+        let bound = finish_recovered_snapshot(
+            snapshot_from_preflight(preflight, used_sectors, false),
+            &partitions,
+        )
+        .expect("the complete independently owned root union must recover");
+        assert_eq!(bound.recovered().grants.len(), 2);
+        assert_eq!(bound.recovered().objects.len(), 2);
+
+        let (preflight, first, _second, used_sectors) = two_root_preflight();
+        let incomplete = [authority::RootPolicyPartition {
+            space: first.space,
+            constraints: core::slice::from_ref(&first),
+        }];
+        assert!(matches!(
+            finish_recovered_snapshot(
+                snapshot_from_preflight(preflight, used_sectors, false),
+                &incomplete,
+            ),
+            Err(StoreError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn forged_recovered_clone_cannot_replace_bound_internal_provenance() {
+        let (preflight, _roots, used_sectors) = test_preflight(store_id(), false);
+        let bound =
+            finish_single_test_snapshot(snapshot_from_preflight(preflight, used_sectors, false))
+                .unwrap();
+        let exact = bound.recovered().objects[0].clone();
+
+        let mut forged = bound.recovered().clone();
+        forged.objects[0].bytes[0] ^= 0xff;
+        let forged_selected = &forged.objects[0];
+        assert_eq!(
+            bound.stored_object(forged_selected).err(),
+            Some(StoreError::ObjectUnavailable)
+        );
+        assert_eq!(bound.recovered().objects[0], exact);
+        assert!(bound.stored_object(&exact).is_ok());
+    }
+
+    #[test]
+    fn bound_materialization_rejects_missing_and_adjacent_selected_records() {
+        let (preflight, _roots, used_sectors) = test_preflight(store_id(), false);
+        let bound =
+            finish_single_test_snapshot(snapshot_from_preflight(preflight, used_sectors, false))
+                .unwrap();
+        let exact = bound.recovered().objects[0].clone();
+
+        let mut missing = exact.clone();
+        missing.object_id = authority::ObjectId::new(TEST_OBJECT_RAW + 1).unwrap();
+        assert_eq!(
+            bound.stored_object(&missing).err(),
+            Some(StoreError::ObjectUnavailable)
+        );
+
+        for adjacent in [
+            {
+                let mut value = exact.clone();
+                value.object_kind =
+                    authority::ObjectKind::new(exact.object_kind.get() + 1).unwrap();
+                value
+            },
+            {
+                let mut value = exact.clone();
+                value.byte_len += 1;
+                value
+            },
+            {
+                let mut value = exact.clone();
+                value.commit_sequence += 1;
+                value
+            },
+        ] {
+            assert_eq!(
+                bound.stored_object(&adjacent).err(),
+                Some(StoreError::ObjectUnavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_external_fails_closed_while_bound_v2_token_materializes_logical_object() {
+        let (preflight, _roots, used_sectors) = test_preflight(store_id(), true);
+        let legacy =
+            finish_single_test_snapshot(snapshot_from_preflight(preflight, used_sectors, false))
+                .unwrap();
+        let selected = &legacy.recovered().objects[0];
+        assert_eq!(
+            legacy.stored_object(selected).err(),
+            Some(StoreError::ObjectUnavailable)
+        );
+
+        let (preflight, _roots, used_sectors) = test_preflight(store_id(), true);
+        let v2 =
+            finish_single_test_snapshot(snapshot_from_preflight(preflight, used_sectors, true))
+                .unwrap();
+        let selected = &v2.recovered().objects[0];
+        let stored = v2
+            .stored_object(selected)
+            .expect("the exact bound V2 token must materialize external content");
+        assert_eq!(stored.byte_len, selected.byte_len() as usize);
+        assert!(stored.v2_token.is_some());
     }
 
     #[test]

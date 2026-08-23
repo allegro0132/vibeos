@@ -88,10 +88,32 @@ compile_error!("feature `wasm-c63-graph-principal-acceptance` requires the QEMU 
 ))]
 compile_error!("feature `wasm-c64-resource-route-acceptance` requires the QEMU default image");
 #[cfg(all(
-    feature = "wasm-c63-graph-principal-acceptance",
-    feature = "wasm-c64-resource-route-acceptance"
+    feature = "wasm-c65-async-chain-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
 ))]
-compile_error!("the C6.3 and C6.4 graph acceptance images are distinct roots");
+compile_error!("feature `wasm-c65-async-chain-acceptance` requires the QEMU default image");
+#[cfg(all(
+    any(
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance"
+    ),
+    any(
+        all(
+            feature = "wasm-c63-graph-principal-acceptance",
+            feature = "wasm-c64-resource-route-acceptance"
+        ),
+        all(
+            feature = "wasm-c63-graph-principal-acceptance",
+            feature = "wasm-c65-async-chain-acceptance"
+        ),
+        all(
+            feature = "wasm-c64-resource-route-acceptance",
+            feature = "wasm-c65-async-chain-acceptance"
+        )
+    )
+))]
+compile_error!("the C6.3, C6.4, and C6.5 graph acceptance images are distinct roots");
 #[cfg(all(
     feature = "component-graph-principals",
     feature = "ssh-component-command"
@@ -486,7 +508,8 @@ pub extern "C" fn kmain() -> ! {
     exec::set_fault_reclaimer(reclaim_faulted_component);
     #[cfg(any(
         feature = "wasm-c63-graph-principal-acceptance",
-        feature = "wasm-c64-resource-route-acceptance"
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance"
     ))]
     assert!(
         component_graph_principals::run_host_model_selftest(),
@@ -698,6 +721,15 @@ pub extern "C" fn kmain() -> ! {
                 crate::println!("WASM_C64_RESOURCE_ROUTE FAIL");
                 sbi::shutdown(true);
             }
+        }
+    });
+    #[cfg(feature = "wasm-c65-async-chain-acceptance")]
+    exec::spawn("wasm-c65-async-chain-acceptance", async {
+        if component_graph_principals::run_c65_qemu_acceptance().await {
+            crate::println!("WASM_C65_ASYNC_CHAIN PASS nodes=3 internal_edges=2 host_deliveries=2 causes=backend-fault,cancelled cascades=2 consumer_first=2 no_active_poll=1 lost_wakes=0 guest_calls=0 runtime_ready=0 fuel_consumed=0 peak_depths=8,8,8 registry_occupied=0 registry_header_mismatches=0");
+        } else {
+            crate::println!("WASM_C65_ASYNC_CHAIN FAIL");
+            sbi::shutdown(true);
         }
     });
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]

@@ -1,0 +1,38 @@
+package test:c65-chain@1.0.0;
+
+interface pipe {
+    enum close-reason {
+        normal,
+        failure,
+        cancelled,
+        denied,
+        unavailable,
+        exhausted,
+        invalid,
+        backend-fault,
+    }
+
+    type bytes = stream<u8>;
+    type closed = future<close-reason>;
+
+    record byte-stream {
+        bytes: bytes,
+        closed: closed,
+    }
+
+    run: async func(input: byte-stream) -> byte-stream;
+}
+
+world source {
+    export pipe;
+}
+
+world relay {
+    import pipe;
+    export pipe;
+}
+
+world sink {
+    import pipe;
+    export pipe;
+}

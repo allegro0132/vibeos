@@ -49,10 +49,80 @@ pub enum StreamError {
     Busy,
     TokenMismatch,
     WakeAlreadyRegistered,
+    /// A sealed wait may only be resumed after its registered wake authority
+    /// has been consumed by an exact readiness transition.
+    WakeNotSignalled,
+    /// A wait sealed by [`StreamWakeRegistration`] cannot be resumed through
+    /// the legacy token-only entry point.
+    SealedWakeRequired,
     InvalidCommitLength,
     EndpointClosed,
     TokenExhausted,
     FailStopped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamWakeKind {
+    Reader,
+    Writer,
+    Terminal,
+}
+
+/// One-shot proof that an exact stream operation has a registered wake.
+///
+/// The receipt deliberately is neither `Clone` nor `Copy`. Its fields are
+/// private and its debug representation is redacted, so portable continuation
+/// state can retain it but cannot manufacture, split, or inspect registration
+/// generations. A successful resume consumes the receipt.
+#[must_use = "a registered stream wake must be resumed or cancelled"]
+pub struct StreamWakeRegistration {
+    operation: HostOperationToken,
+    generation: u64,
+    kind: StreamWakeKind,
+}
+
+impl StreamWakeRegistration {
+    /// Return the opaque backend operation token for exact supervisor-side
+    /// cancellation. This does not expose its numeric generation.
+    pub const fn operation(&self) -> HostOperationToken {
+        self.operation
+    }
+}
+
+impl core::fmt::Debug for StreamWakeRegistration {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("StreamWakeRegistration(<redacted>)")
+    }
+}
+
+/// Failed sealed resume with the still-owned one-shot registration.
+///
+/// `WakeNotSignalled` and `TokenMismatch` return the receipt without mutating
+/// the live wait slot. A terminal stream fault may invalidate it.
+#[must_use = "the stream wake registration remains live after a failed resume"]
+pub struct StreamWakeResumeFailure {
+    error: StreamError,
+    registration: StreamWakeRegistration,
+}
+
+impl StreamWakeResumeFailure {
+    pub const fn error(&self) -> StreamError {
+        self.error
+    }
+
+    pub fn into_registration(self) -> StreamWakeRegistration {
+        self.registration
+    }
+}
+
+impl core::fmt::Debug for StreamWakeResumeFailure {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("StreamWakeResumeFailure")
+            .field("error", &self.error)
+            .field("registration", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Result of a producer send attempt.
@@ -116,6 +186,21 @@ pub enum StreamCloseOutcome {
     /// A different immutable final reason already won.  The stream is now
     /// fail-stopped, while the original reason remains intact for auditing.
     Conflict,
+}
+
+/// Bounded supervisor receipt for backend slots revoked after terminal close.
+/// It contains counts only; no operation token or stream identity escapes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamPendingRevocation {
+    reader: bool,
+    writer: bool,
+    terminal: bool,
+}
+
+impl StreamPendingRevocation {
+    pub const fn total(self) -> usize {
+        self.reader as usize + self.writer as usize + self.terminal as usize
+    }
 }
 
 /// One close publication and the effective lifecycle reason observed in the
@@ -240,6 +325,7 @@ enum Lifecycle {
 struct WaitingOperation {
     token: HostOperationToken,
     wake: Option<HostWakeToken>,
+    sealed_generation: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -462,6 +548,7 @@ impl ByteStreamReader {
         state.receive = Some(ReceiveOperation::Waiting(WaitingOperation {
             token,
             wake: None,
+            sealed_generation: None,
         }));
         Ok(StreamReceiveDispatch::Waiting(token))
     }
@@ -477,6 +564,9 @@ impl ByteStreamReader {
         };
         if waiting.token != operation {
             return Err(StreamError::TokenMismatch);
+        }
+        if waiting.sealed_generation.is_some() {
+            return Err(StreamError::SealedWakeRequired);
         }
         if state.consumer_stopped {
             state.receive = None;
@@ -504,6 +594,7 @@ impl ByteStreamReader {
             state.receive = Some(ReceiveOperation::Waiting(WaitingOperation {
                 token: fresh,
                 wake: None,
+                sealed_generation: None,
             }));
             return Ok(StreamReceiveDispatch::Waiting(fresh));
         };
@@ -539,7 +630,7 @@ impl ByteStreamReader {
         if pending.token != operation {
             return Err(StreamError::TokenMismatch);
         }
-        if pending.wake.is_some() {
+        if pending.wake.is_some() || pending.sealed_generation.is_some() {
             return Err(StreamError::WakeAlreadyRegistered);
         }
         pending.wake = Some(wake);
@@ -547,6 +638,127 @@ impl ByteStreamReader {
         drop(state);
         wake_one(ready);
         Ok(())
+    }
+
+    /// Register an exact wake and seal this wait against token-only resume.
+    ///
+    /// Readiness is rechecked while holding the stream lock. If readiness won
+    /// before registration, the supplied callback is taken and invoked after
+    /// the lock is released; the returned receipt is consequently resumable.
+    pub fn register_wake_sealed(
+        &self,
+        operation: HostOperationToken,
+        wake: HostWakeToken,
+    ) -> Result<StreamWakeRegistration, StreamError> {
+        let mut state = self.stream.state.lock();
+        state.check_live()?;
+        let Some(ReceiveOperation::Waiting(pending)) = state.receive.as_mut() else {
+            return Err(StreamError::TokenMismatch);
+        };
+        if pending.token != operation {
+            return Err(StreamError::TokenMismatch);
+        }
+        if pending.wake.is_some() || pending.sealed_generation.is_some() {
+            return Err(StreamError::WakeAlreadyRegistered);
+        }
+        let generation = next_wake_registration_generation()?;
+        pending.wake = Some(wake);
+        pending.sealed_generation = Some(generation);
+        let ready = state.take_ready_receiver_wake();
+        drop(state);
+        wake_one(ready);
+        Ok(StreamWakeRegistration {
+            operation,
+            generation,
+            kind: StreamWakeKind::Reader,
+        })
+    }
+
+    /// Resume only after the exact registered wake was consumed by readiness.
+    /// An early, foreign, stale, or wrong-direction receipt is inert and is
+    /// returned to the caller unchanged.
+    pub fn resume_after_wake(
+        &self,
+        registration: StreamWakeRegistration,
+    ) -> Result<StreamReceiveDispatch, StreamWakeResumeFailure> {
+        let mut state = self.stream.state.lock();
+        if let Err(error) = state.check_live() {
+            return Err(wake_resume_failure(error, registration));
+        }
+        let Some(ReceiveOperation::Waiting(waiting)) = state.receive else {
+            return Err(wake_resume_failure(
+                StreamError::TokenMismatch,
+                registration,
+            ));
+        };
+        if registration.kind != StreamWakeKind::Reader
+            || waiting.token != registration.operation
+            || waiting.sealed_generation != Some(registration.generation)
+        {
+            return Err(wake_resume_failure(
+                StreamError::TokenMismatch,
+                registration,
+            ));
+        }
+        if waiting.wake.is_some() {
+            return Err(wake_resume_failure(
+                StreamError::WakeNotSignalled,
+                registration,
+            ));
+        }
+        if state.consumer_stopped {
+            state.receive = None;
+            return match state.lifecycle {
+                Lifecycle::Final(reason) => Ok(StreamReceiveDispatch::Closed(reason)),
+                Lifecycle::NormalProvisional => {
+                    Ok(StreamReceiveDispatch::Closed(StreamCloseReason::Normal))
+                }
+                Lifecycle::Open => Err(wake_resume_failure(
+                    StreamError::EndpointClosed,
+                    registration,
+                )),
+            };
+        }
+        if let Lifecycle::Final(reason) = state.lifecycle {
+            if !reason.is_normal() || state.ring.depth == 0 {
+                state.receive = None;
+                return Ok(StreamReceiveDispatch::Closed(reason));
+            }
+        }
+        let Some((head, incarnation, length)) = state.ring.front_seal() else {
+            let fresh = match next_operation_token() {
+                Ok(token) => token,
+                Err(error) => {
+                    let wakes = state.fail_stop();
+                    drop(state);
+                    wake_all(wakes);
+                    return Err(wake_resume_failure(error, registration));
+                }
+            };
+            state.receive = Some(ReceiveOperation::Waiting(WaitingOperation {
+                token: fresh,
+                wake: None,
+                sealed_generation: None,
+            }));
+            return Ok(StreamReceiveDispatch::Waiting(fresh));
+        };
+        let fresh = match next_operation_token() {
+            Ok(token) => token,
+            Err(error) => {
+                let wakes = state.fail_stop();
+                drop(state);
+                wake_all(wakes);
+                return Err(wake_resume_failure(error, registration));
+            }
+        };
+        let prepared = StreamPreparedReceive {
+            operation: fresh,
+            length: length as u16,
+            head,
+            incarnation,
+        };
+        state.receive = Some(ReceiveOperation::Prepared(prepared));
+        Ok(StreamReceiveDispatch::Prepared(prepared))
     }
 
     pub fn commit(
@@ -659,7 +871,11 @@ impl ByteStreamWriter {
                     return Err(error);
                 }
             };
-            state.send = Some(WaitingOperation { token, wake: None });
+            state.send = Some(WaitingOperation {
+                token,
+                wake: None,
+                sealed_generation: None,
+            });
             return Ok(StreamSendDispatch::Waiting(token));
         }
         if state.ring.push(bytes).is_err() {
@@ -688,6 +904,9 @@ impl ByteStreamWriter {
         if pending.token != operation {
             return Err(StreamError::TokenMismatch);
         }
+        if pending.sealed_generation.is_some() {
+            return Err(StreamError::SealedWakeRequired);
+        }
         if let Some(reason) = producer_closed(state.lifecycle) {
             state.send = None;
             return Ok(StreamSendDispatch::Closed(reason));
@@ -705,6 +924,7 @@ impl ByteStreamWriter {
             state.send = Some(WaitingOperation {
                 token: fresh,
                 wake: None,
+                sealed_generation: None,
             });
             return Ok(StreamSendDispatch::Waiting(fresh));
         }
@@ -734,7 +954,7 @@ impl ByteStreamWriter {
         if pending.token != operation {
             return Err(StreamError::TokenMismatch);
         }
-        if pending.wake.is_some() {
+        if pending.wake.is_some() || pending.sealed_generation.is_some() {
             return Err(StreamError::WakeAlreadyRegistered);
         }
         pending.wake = Some(wake);
@@ -742,6 +962,99 @@ impl ByteStreamWriter {
         drop(state);
         wake_one(ready);
         Ok(())
+    }
+
+    /// Register an exact producer wake and seal this wait against token-only
+    /// resume. See [`ByteStreamReader::register_wake_sealed`].
+    pub fn register_wake_sealed(
+        &self,
+        operation: HostOperationToken,
+        wake: HostWakeToken,
+    ) -> Result<StreamWakeRegistration, StreamError> {
+        let mut state = self.stream.state.lock();
+        state.check_live()?;
+        let Some(pending) = state.send.as_mut() else {
+            return Err(StreamError::TokenMismatch);
+        };
+        if pending.token != operation {
+            return Err(StreamError::TokenMismatch);
+        }
+        if pending.wake.is_some() || pending.sealed_generation.is_some() {
+            return Err(StreamError::WakeAlreadyRegistered);
+        }
+        let generation = next_wake_registration_generation()?;
+        pending.wake = Some(wake);
+        pending.sealed_generation = Some(generation);
+        let ready = state.take_ready_sender_wake();
+        drop(state);
+        wake_one(ready);
+        Ok(StreamWakeRegistration {
+            operation,
+            generation,
+            kind: StreamWakeKind::Writer,
+        })
+    }
+
+    /// Resume a producer wait only after its exact registered wake fired.
+    pub fn resume_after_wake(
+        &self,
+        registration: StreamWakeRegistration,
+        bytes: &[u8],
+    ) -> Result<StreamSendDispatch, StreamWakeResumeFailure> {
+        if let Err(error) = validate_chunk(bytes) {
+            return Err(wake_resume_failure(error, registration));
+        }
+        let mut state = self.stream.state.lock();
+        if let Err(error) = state.check_live() {
+            return Err(wake_resume_failure(error, registration));
+        }
+        let Some(pending) = state.send else {
+            return Err(wake_resume_failure(
+                StreamError::TokenMismatch,
+                registration,
+            ));
+        };
+        if registration.kind != StreamWakeKind::Writer
+            || pending.token != registration.operation
+            || pending.sealed_generation != Some(registration.generation)
+        {
+            return Err(wake_resume_failure(
+                StreamError::TokenMismatch,
+                registration,
+            ));
+        }
+        if pending.wake.is_some() {
+            return Err(wake_resume_failure(
+                StreamError::WakeNotSignalled,
+                registration,
+            ));
+        }
+        if let Some(reason) = producer_closed(state.lifecycle) {
+            state.send = None;
+            return Ok(StreamSendDispatch::Closed(reason));
+        }
+        if state.ring.depth == STREAM_BUFFER_CHUNKS {
+            // Readiness for a writer is monotonic while this unique producer
+            // slot is occupied. Reaching a full queue here is corruption.
+            let wakes = state.fail_stop();
+            drop(state);
+            wake_all(wakes);
+            return Err(wake_resume_failure(StreamError::FailStopped, registration));
+        }
+        state.send = None;
+        if state.ring.push(bytes).is_err() {
+            let wakes = state.fail_stop();
+            drop(state);
+            wake_all(wakes);
+            return Err(wake_resume_failure(
+                StreamError::TokenExhausted,
+                registration,
+            ));
+        }
+        let receiver = state.take_ready_receiver_wake();
+        drop(state);
+        wake_one(receiver);
+        Ok(StreamSendDispatch::Sent)
     }
 
     pub fn cancel(&self, operation: HostOperationToken) -> Result<(), StreamError> {
@@ -833,6 +1146,30 @@ impl ByteStreamSupervisor {
         cancel_writer_operation_exact(&self.stream, operation)
     }
 
+    /// Revoke every remaining backend operation after trusted terminal close.
+    ///
+    /// Exact-token cancellation remains the ordinary path. This bounded
+    /// terminal backstop covers the fault window between an endpoint `start`
+    /// and publication of its token into a stable supervisor ledger, where an
+    /// arena fault can prevent the payload from reporting that token. It is
+    /// unavailable while the stream is live, invokes no wake, consumes no
+    /// buffered data, and does not alter the immutable close winner.
+    pub fn revoke_pending_after_final(&self) -> Result<StreamPendingRevocation, StreamError> {
+        let mut state = self.stream.state.lock();
+        if !state.fail_stopped && !matches!(state.lifecycle, Lifecycle::Final(_)) {
+            return Err(StreamError::EndpointClosed);
+        }
+        let revoked = StreamPendingRevocation {
+            reader: state.receive.is_some(),
+            writer: state.send.is_some(),
+            terminal: state.terminal.is_some(),
+        };
+        state.receive = None;
+        state.send = None;
+        state.terminal = None;
+        Ok(revoked)
+    }
+
     /// Starts an observation of the one immutable terminal reason.
     ///
     /// This operation uses a dedicated fixed slot and therefore neither
@@ -856,7 +1193,11 @@ impl ByteStreamSupervisor {
                 return Err(error);
             }
         };
-        state.terminal = Some(WaitingOperation { token, wake: None });
+        state.terminal = Some(WaitingOperation {
+            token,
+            wake: None,
+            sealed_generation: None,
+        });
         Ok(StreamTerminalDispatch::Waiting(token))
     }
 
@@ -874,6 +1215,9 @@ impl ByteStreamSupervisor {
         if pending.token != operation {
             return Err(StreamError::TokenMismatch);
         }
+        if pending.sealed_generation.is_some() {
+            return Err(StreamError::SealedWakeRequired);
+        }
         if let Lifecycle::Final(reason) = state.lifecycle {
             state.terminal = None;
             return Ok(StreamTerminalDispatch::Ready(reason));
@@ -890,6 +1234,7 @@ impl ByteStreamSupervisor {
         state.terminal = Some(WaitingOperation {
             token: fresh,
             wake: None,
+            sealed_generation: None,
         });
         Ok(StreamTerminalDispatch::Waiting(fresh))
     }
@@ -911,7 +1256,7 @@ impl ByteStreamSupervisor {
         if pending.token != operation {
             return Err(StreamError::TokenMismatch);
         }
-        if pending.wake.is_some() {
+        if pending.wake.is_some() || pending.sealed_generation.is_some() {
             return Err(StreamError::WakeAlreadyRegistered);
         }
         pending.wake = Some(wake);
@@ -919,6 +1264,78 @@ impl ByteStreamSupervisor {
         drop(state);
         wake_one(ready);
         Ok(())
+    }
+
+    /// Register and seal the exact terminal wait against token-only resume.
+    pub fn register_terminal_wake_sealed(
+        &self,
+        operation: HostOperationToken,
+        wake: HostWakeToken,
+    ) -> Result<StreamWakeRegistration, StreamError> {
+        let mut state = self.stream.state.lock();
+        state.check_live()?;
+        let Some(pending) = state.terminal.as_mut() else {
+            return Err(StreamError::TokenMismatch);
+        };
+        if pending.token != operation {
+            return Err(StreamError::TokenMismatch);
+        }
+        if pending.wake.is_some() || pending.sealed_generation.is_some() {
+            return Err(StreamError::WakeAlreadyRegistered);
+        }
+        let generation = next_wake_registration_generation()?;
+        pending.wake = Some(wake);
+        pending.sealed_generation = Some(generation);
+        let ready = state.take_ready_terminal_wake();
+        drop(state);
+        wake_one(ready);
+        Ok(StreamWakeRegistration {
+            operation,
+            generation,
+            kind: StreamWakeKind::Terminal,
+        })
+    }
+
+    /// Resume the exact terminal wait only after its registered wake fired.
+    pub fn resume_terminal_after_wake(
+        &self,
+        registration: StreamWakeRegistration,
+    ) -> Result<StreamTerminalDispatch, StreamWakeResumeFailure> {
+        let mut state = self.stream.state.lock();
+        if let Err(error) = state.check_live() {
+            return Err(wake_resume_failure(error, registration));
+        }
+        let Some(pending) = state.terminal else {
+            return Err(wake_resume_failure(
+                StreamError::TokenMismatch,
+                registration,
+            ));
+        };
+        if registration.kind != StreamWakeKind::Terminal
+            || pending.token != registration.operation
+            || pending.sealed_generation != Some(registration.generation)
+        {
+            return Err(wake_resume_failure(
+                StreamError::TokenMismatch,
+                registration,
+            ));
+        }
+        if pending.wake.is_some() {
+            return Err(wake_resume_failure(
+                StreamError::WakeNotSignalled,
+                registration,
+            ));
+        }
+        if let Lifecycle::Final(reason) = state.lifecycle {
+            state.terminal = None;
+            return Ok(StreamTerminalDispatch::Ready(reason));
+        }
+        // Terminal readiness is immutable. A consumed wake without a final
+        // reason therefore indicates a violated stream invariant.
+        let wakes = state.fail_stop();
+        drop(state);
+        wake_all(wakes);
+        Err(wake_resume_failure(StreamError::FailStopped, registration))
     }
 
     /// Cancels one exact terminal observation without affecting send, receive,
@@ -1161,12 +1578,17 @@ fn validate_chunk(bytes: &[u8]) -> Result<(), StreamError> {
 }
 
 static NEXT_OPERATION_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_WAKE_REGISTRATION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn next_operation_token() -> Result<HostOperationToken, StreamError> {
     take_operation_token(&NEXT_OPERATION_GENERATION)
 }
 
-fn take_operation_token(counter: &AtomicU64) -> Result<HostOperationToken, StreamError> {
+fn next_wake_registration_generation() -> Result<u64, StreamError> {
+    take_nonzero_generation(&NEXT_WAKE_REGISTRATION_GENERATION)
+}
+
+fn take_nonzero_generation(counter: &AtomicU64) -> Result<u64, StreamError> {
     loop {
         let generation = counter.load(Ordering::Acquire);
         if generation == 0 {
@@ -1177,9 +1599,23 @@ fn take_operation_token(counter: &AtomicU64) -> Result<HostOperationToken, Strea
             .compare_exchange_weak(generation, next, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            return HostOperationToken::from_generation(generation)
-                .ok_or(StreamError::TokenExhausted);
+            return Ok(generation);
         }
+    }
+}
+
+fn take_operation_token(counter: &AtomicU64) -> Result<HostOperationToken, StreamError> {
+    HostOperationToken::from_generation(take_nonzero_generation(counter)?)
+        .ok_or(StreamError::TokenExhausted)
+}
+
+fn wake_resume_failure(
+    error: StreamError,
+    registration: StreamWakeRegistration,
+) -> StreamWakeResumeFailure {
+    StreamWakeResumeFailure {
+        error,
+        registration,
     }
 }
 
@@ -1453,6 +1889,254 @@ mod tests {
         assert_eq!(late.outcome(), StreamCloseOutcome::AlreadyPublished);
         assert_eq!(late.effective_reason(), Some(StreamCloseReason::Failure));
         assert_eq!(stream.final_reason(), Some(StreamCloseReason::Failure));
+        assert!(!stream.is_fail_stopped());
+    }
+
+    #[test]
+    fn sealed_reader_wake_closes_both_registration_race_windows() {
+        // Registration before readiness.
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let writer = stream.writer();
+        let wakes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let StreamReceiveDispatch::Waiting(operation) = reader.start().unwrap() else {
+            panic!("empty stream must wait")
+        };
+        let registration = reader
+            .register_wake_sealed(operation, test_wake(&wakes))
+            .unwrap();
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        assert_eq!(writer.start(&[0x51]), Ok(StreamSendDispatch::Sent));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        let StreamReceiveDispatch::Prepared(prepared) =
+            reader.resume_after_wake(registration).unwrap()
+        else {
+            panic!("signalled reader must prepare")
+        };
+        let mut output = [0_u8];
+        assert_eq!(
+            reader.commit(prepared.operation(), &mut output),
+            Ok(StreamReceiveCommit::Received(1))
+        );
+        assert_eq!(output, [0x51]);
+
+        // Readiness before registration. The locked recheck consumes the wake
+        // before the sealed receipt is returned.
+        let StreamReceiveDispatch::Waiting(operation) = reader.start().unwrap() else {
+            panic!("drained stream must wait")
+        };
+        assert_eq!(writer.start(&[0x52]), Ok(StreamSendDispatch::Sent));
+        let registration = reader
+            .register_wake_sealed(operation, test_wake(&wakes))
+            .unwrap();
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
+        let StreamReceiveDispatch::Prepared(prepared) =
+            reader.resume_after_wake(registration).unwrap()
+        else {
+            panic!("late registration must observe readiness")
+        };
+        assert_eq!(
+            reader.commit(prepared.operation(), &mut output),
+            Ok(StreamReceiveCommit::Received(1))
+        );
+        assert_eq!(output, [0x52]);
+    }
+
+    #[test]
+    fn sealed_early_foreign_and_token_only_resumes_are_inert() {
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let writer = stream.writer();
+        let wakes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let StreamReceiveDispatch::Waiting(operation) = reader.start().unwrap() else {
+            panic!("empty stream must wait")
+        };
+        let registration = reader
+            .register_wake_sealed(operation, test_wake(&wakes))
+            .unwrap();
+
+        assert_eq!(
+            reader.resume(operation),
+            Err(StreamError::SealedWakeRequired)
+        );
+        let failure = reader.resume_after_wake(registration).unwrap_err();
+        assert_eq!(failure.error(), StreamError::WakeNotSignalled);
+        let registration = failure.into_registration();
+
+        let foreign = ByteStream::new();
+        let foreign_reader = foreign.reader();
+        let failure = foreign_reader.resume_after_wake(registration).unwrap_err();
+        assert_eq!(failure.error(), StreamError::TokenMismatch);
+        let registration = failure.into_registration();
+        assert_eq!(foreign.depth(), 0);
+        assert_eq!(stream.depth(), 0);
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+
+        assert_eq!(writer.start(&[0x61]), Ok(StreamSendDispatch::Sent));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            reader.resume_after_wake(registration),
+            Ok(StreamReceiveDispatch::Prepared(_))
+        ));
+    }
+
+    #[test]
+    fn sealed_writer_and_terminal_waits_resume_once_after_exact_wake() {
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let writer = stream.writer();
+        let supervisor = stream.supervisor();
+        for byte in 0..STREAM_BUFFER_CHUNKS {
+            assert_eq!(writer.start(&[byte as u8]), Ok(StreamSendDispatch::Sent));
+        }
+        let writer_wakes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let StreamSendDispatch::Waiting(operation) = writer.start(&[0xfe]).unwrap() else {
+            panic!("full stream must wait")
+        };
+        let registration = writer
+            .register_wake_sealed(operation, test_wake(&writer_wakes))
+            .unwrap();
+        let failure = writer.resume_after_wake(registration, &[0xfe]).unwrap_err();
+        assert_eq!(failure.error(), StreamError::WakeNotSignalled);
+        let registration = failure.into_registration();
+        let StreamReceiveDispatch::Prepared(prepared) = reader.start().unwrap() else {
+            panic!("full stream must prepare")
+        };
+        let mut output = [0_u8];
+        reader.commit(prepared.operation(), &mut output).unwrap();
+        assert_eq!(writer_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            writer.resume_after_wake(registration, &[0xfe]).unwrap(),
+            StreamSendDispatch::Sent
+        );
+        assert_eq!(stream.peak_depth(), STREAM_BUFFER_CHUNKS);
+
+        let terminal_wakes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let StreamTerminalDispatch::Waiting(operation) = supervisor.start_terminal().unwrap()
+        else {
+            panic!("open stream must wait for terminal")
+        };
+        let registration = supervisor
+            .register_terminal_wake_sealed(operation, test_wake(&terminal_wakes))
+            .unwrap();
+        assert_eq!(
+            supervisor.finalize(StreamCloseReason::BackendFault),
+            StreamCloseOutcome::Published
+        );
+        assert_eq!(terminal_wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            supervisor.resume_terminal_after_wake(registration).unwrap(),
+            StreamTerminalDispatch::Ready(StreamCloseReason::BackendFault)
+        );
+    }
+
+    #[test]
+    fn sealed_cancellation_revokes_registration_without_waking() {
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let writer = stream.writer();
+        let supervisor = stream.supervisor();
+        let wakes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let StreamReceiveDispatch::Waiting(operation) = reader.start().unwrap() else {
+            panic!("empty stream must wait")
+        };
+        let registration = reader
+            .register_wake_sealed(operation, test_wake(&wakes))
+            .unwrap();
+        supervisor
+            .cancel_reader_operation_exact(registration.operation())
+            .unwrap();
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        assert_eq!(writer.start(&[0x71]), Ok(StreamSendDispatch::Sent));
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        let failure = reader.resume_after_wake(registration).unwrap_err();
+        assert_eq!(failure.error(), StreamError::TokenMismatch);
+        assert_eq!(stream.depth(), 1);
+        assert_eq!(stream.final_reason(), None);
+        assert!(!stream.is_fail_stopped());
+    }
+
+    #[test]
+    fn terminal_backstop_is_live_inert_and_clears_all_slots_without_data_loss() {
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let writer = stream.writer();
+        let supervisor = stream.supervisor();
+        for byte in 0..STREAM_BUFFER_CHUNKS {
+            assert_eq!(writer.start(&[byte as u8]), Ok(StreamSendDispatch::Sent));
+        }
+        let StreamReceiveDispatch::Prepared(prepared) = reader.start().unwrap() else {
+            panic!("full stream must prepare a read")
+        };
+        let StreamSendDispatch::Waiting(writer_operation) = writer.start(&[0xfe]).unwrap() else {
+            panic!("full stream must park the writer")
+        };
+        let StreamTerminalDispatch::Waiting(terminal_operation) =
+            supervisor.start_terminal().unwrap()
+        else {
+            panic!("live stream must park terminal observation")
+        };
+
+        assert_eq!(
+            supervisor.revoke_pending_after_final(),
+            Err(StreamError::EndpointClosed)
+        );
+        assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS);
+        assert_eq!(stream.final_reason(), None);
+        assert_eq!(
+            supervisor.finalize(StreamCloseReason::Normal),
+            StreamCloseOutcome::Published
+        );
+        let revoked = supervisor.revoke_pending_after_final().unwrap();
+        assert_eq!(revoked.total(), 3);
+        assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS);
+        assert_eq!(stream.final_reason(), Some(StreamCloseReason::Normal));
+        assert_eq!(
+            reader.commit(prepared.operation(), &mut [0_u8]),
+            Err(StreamError::TokenMismatch)
+        );
+        assert_eq!(
+            writer.resume(writer_operation, &[0xfe]),
+            Err(StreamError::TokenMismatch)
+        );
+        assert_eq!(
+            supervisor.resume_terminal(terminal_operation),
+            Err(StreamError::TokenMismatch)
+        );
+
+        let StreamReceiveDispatch::Prepared(fresh) = reader.start().unwrap() else {
+            panic!("terminal normal stream must preserve buffered data")
+        };
+        let mut first = [0xff_u8];
+        assert_eq!(
+            reader.commit(fresh.operation(), &mut first),
+            Ok(StreamReceiveCommit::Received(1))
+        );
+        assert_eq!(first, [0]);
+        assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS - 1);
+    }
+
+    #[test]
+    fn sealed_reader_normal_close_is_a_consuming_terminal_success() {
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let wakes = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let StreamReceiveDispatch::Waiting(operation) = reader.start().unwrap() else {
+            panic!("empty stream must wait")
+        };
+        let registration = reader
+            .register_wake_sealed(operation, test_wake(&wakes))
+            .unwrap();
+        assert_eq!(
+            reader.close(StreamCloseReason::Normal),
+            StreamCloseOutcome::Published
+        );
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            reader.resume_after_wake(registration).unwrap(),
+            StreamReceiveDispatch::Closed(StreamCloseReason::Normal)
+        );
+        assert!(stream.is_normal_provisional());
         assert!(!stream.is_fail_stopped());
     }
 }

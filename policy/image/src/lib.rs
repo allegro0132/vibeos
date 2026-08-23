@@ -23,6 +23,12 @@ compile_error!("feature `c53-native-async-qemu-acceptance` requires `qemu-defaul
 ))]
 compile_error!("feature `c64-resource-route-qemu-acceptance` requires `qemu-default`");
 
+#[cfg(all(
+    feature = "c65-async-chain-qemu-acceptance",
+    not(feature = "qemu-default")
+))]
+compile_error!("feature `c65-async-chain-qemu-acceptance` requires `qemu-default`");
+
 /// A logical block-device view carved out of a packaged storage image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockSlice {
@@ -141,6 +147,109 @@ impl core::fmt::Debug for ComponentGraphResourceRoutePin {
             .field("artifacts", &"<redacted>")
             .field("provider_world", &self.provider_world)
             .field("consumer_world", &self.consumer_world)
+            .field("interface", &self.interface)
+            .field("profile", &self.profile)
+            .field("limits", &self.limits)
+            .finish()
+    }
+}
+
+/// Immutable validation-only three-node artifact set for the C6.5 async-chain
+/// acceptance image.
+///
+/// This root contains only independently hashed Component bytes, exact WIT
+/// policy, and bounded accounting inputs. It contains no guest execution
+/// authority, ambient lookup key, durable object identity, capability, or
+/// graph wiring authority. The kernel must still construct the exact
+/// source-to-relay-to-sink graph and explicitly publish the sink export.
+#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub struct ComponentGraphAsyncChainPin {
+    source_bytes: &'static [u8],
+    source_sha256: [u8; 32],
+    relay_bytes: &'static [u8],
+    relay_sha256: [u8; 32],
+    sink_bytes: &'static [u8],
+    sink_sha256: [u8; 32],
+    wit_source: &'static str,
+    wit_sha256: [u8; 32],
+    source_world: &'static str,
+    relay_world: &'static str,
+    sink_world: &'static str,
+    interface: &'static str,
+    profile: ProfileIdentity,
+    limits: ComponentInstanceLimits,
+}
+
+#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+impl ComponentGraphAsyncChainPin {
+    pub const fn source_bytes(self) -> &'static [u8] {
+        self.source_bytes
+    }
+
+    pub const fn source_sha256(self) -> [u8; 32] {
+        self.source_sha256
+    }
+
+    pub const fn relay_bytes(self) -> &'static [u8] {
+        self.relay_bytes
+    }
+
+    pub const fn relay_sha256(self) -> [u8; 32] {
+        self.relay_sha256
+    }
+
+    pub const fn sink_bytes(self) -> &'static [u8] {
+        self.sink_bytes
+    }
+
+    pub const fn sink_sha256(self) -> [u8; 32] {
+        self.sink_sha256
+    }
+
+    pub const fn wit_source(self) -> &'static str {
+        self.wit_source
+    }
+
+    pub const fn wit_sha256(self) -> [u8; 32] {
+        self.wit_sha256
+    }
+
+    pub const fn source_world(self) -> &'static str {
+        self.source_world
+    }
+
+    pub const fn relay_world(self) -> &'static str {
+        self.relay_world
+    }
+
+    pub const fn sink_world(self) -> &'static str {
+        self.sink_world
+    }
+
+    pub const fn interface(self) -> &'static str {
+        self.interface
+    }
+
+    pub const fn profile(self) -> ProfileIdentity {
+        self.profile
+    }
+
+    pub const fn limits(self) -> ComponentInstanceLimits {
+        self.limits
+    }
+}
+
+#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+impl core::fmt::Debug for ComponentGraphAsyncChainPin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("ComponentGraphAsyncChainPin")
+            .field("artifacts", &"<redacted>")
+            .field("wit_source", &"<redacted>")
+            .field("source_world", &self.source_world)
+            .field("relay_world", &self.relay_world)
+            .field("sink_world", &self.sink_world)
             .field("interface", &self.interface)
             .field("profile", &self.profile)
             .field("limits", &self.limits)
@@ -492,6 +601,34 @@ const C64_RESOURCE_CONSUMER_BYTES: &[u8] = include_bytes!(concat!(
 const C64_RESOURCE_CONSUMER_SHA256: [u8; 32] =
     include!(concat!(env!("OUT_DIR"), "/c64-resource-consumer.sha256.rs"));
 
+#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+const C65_ASYNC_SOURCE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c65-async-source.component.wasm"));
+
+#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+const C65_ASYNC_SOURCE_SHA256: [u8; 32] =
+    include!(concat!(env!("OUT_DIR"), "/c65-async-source.sha256.rs"));
+
+#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+const C65_ASYNC_RELAY_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c65-async-relay.component.wasm"));
+
+#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+const C65_ASYNC_RELAY_SHA256: [u8; 32] =
+    include!(concat!(env!("OUT_DIR"), "/c65-async-relay.sha256.rs"));
+
+#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+const C65_ASYNC_SINK_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c65-async-sink.component.wasm"));
+
+#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+const C65_ASYNC_SINK_SHA256: [u8; 32] =
+    include!(concat!(env!("OUT_DIR"), "/c65-async-sink.sha256.rs"));
+
+#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+const C65_ASYNC_CHAIN_WIT_SHA256: [u8; 32] =
+    include!(concat!(env!("OUT_DIR"), "/c65-async-chain-wit.sha256.rs"));
+
 #[cfg(any(
     feature = "c53-native-async-qemu-acceptance",
     feature = "c53-native-async-command-projection"
@@ -683,6 +820,36 @@ pub const C64_RESOURCE_ROUTE_QEMU_ACCEPTANCE: ComponentGraphResourceRoutePin =
         },
     };
 
+/// Exact image-policy root for a validation-only three-node async chain.
+///
+/// The source exports the pinned pipe interface, relay and sink each import
+/// and export it, and only the sink export may be published by the separately
+/// reviewed kernel graph policy. `PROFILE_1_ASYNC` deliberately keeps every
+/// embedded canonical lift inert.
+#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+pub const C65_ASYNC_CHAIN_QEMU_ACCEPTANCE: ComponentGraphAsyncChainPin =
+    ComponentGraphAsyncChainPin {
+        source_bytes: C65_ASYNC_SOURCE_BYTES,
+        source_sha256: C65_ASYNC_SOURCE_SHA256,
+        relay_bytes: C65_ASYNC_RELAY_BYTES,
+        relay_sha256: C65_ASYNC_RELAY_SHA256,
+        sink_bytes: C65_ASYNC_SINK_BYTES,
+        sink_sha256: C65_ASYNC_SINK_SHA256,
+        wit_source: include_str!("../artifacts/c65-async-chain.wit"),
+        wit_sha256: C65_ASYNC_CHAIN_WIT_SHA256,
+        source_world: "test:c65-chain/source@1.0.0",
+        relay_world: "test:c65-chain/relay@1.0.0",
+        sink_world: "test:c65-chain/sink@1.0.0",
+        interface: "test:c65-chain/pipe@1.0.0",
+        profile: ProfileIdentity::PROFILE_1_ASYNC,
+        limits: ComponentInstanceLimits {
+            memory_bytes: 64 * 1024,
+            total_fuel: 1_000,
+            poll_quantum: 100,
+            resources: 8,
+        },
+    };
+
 /// The default QEMU image admits a bounded managed slice. Storage V2 initially
 /// formats only its policy range within this slice; unused suffix capacity is
 /// not ambient store capacity and may be admitted only by explicit growth.
@@ -827,6 +994,81 @@ mod tests {
         assert!(pin.wit_source().contains("borrow<handle>"));
         assert!(pin.wit_source().contains("own<handle>"));
         assert_eq!(pin.limits().resources, 2);
+    }
+
+    #[cfg(feature = "c65-async-chain-qemu-acceptance")]
+    #[test]
+    fn c65_async_chain_is_exact_resource_free_and_validation_only() {
+        use vibeos_component_runtime::{
+            decode::inspect_component_for_profile, world::WorldContract,
+        };
+
+        let pin = C65_ASYNC_CHAIN_QEMU_ACCEPTANCE;
+        for (bytes, expected) in [
+            (pin.source_bytes(), pin.source_sha256()),
+            (pin.relay_bytes(), pin.relay_sha256()),
+            (pin.sink_bytes(), pin.sink_sha256()),
+        ] {
+            assert_eq!(<[u8; 32]>::from(Sha256::digest(bytes)), expected);
+        }
+        assert_ne!(pin.source_sha256(), pin.relay_sha256());
+        assert_ne!(pin.source_sha256(), pin.sink_sha256());
+        assert_ne!(pin.relay_sha256(), pin.sink_sha256());
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(pin.wit_source().as_bytes())),
+            pin.wit_sha256()
+        );
+        assert_eq!(pin.profile(), ProfileIdentity::PROFILE_1_ASYNC);
+        assert!(!pin.profile().execution_enabled());
+        assert_eq!(pin.source_world(), "test:c65-chain/source@1.0.0");
+        assert_eq!(pin.relay_world(), "test:c65-chain/relay@1.0.0");
+        assert_eq!(pin.sink_world(), "test:c65-chain/sink@1.0.0");
+        assert_eq!(pin.interface(), "test:c65-chain/pipe@1.0.0");
+        assert_eq!(
+            pin.limits(),
+            ComponentInstanceLimits {
+                memory_bytes: 64 * 1024,
+                total_fuel: 1_000,
+                poll_quantum: 100,
+                resources: 8,
+            }
+        );
+        assert!(pin.wit_source().contains("type bytes = stream<u8>;"));
+        assert!(pin
+            .wit_source()
+            .contains("type closed = future<close-reason>;"));
+        assert!(pin
+            .wit_source()
+            .contains("run: async func(input: byte-stream) -> byte-stream;"));
+        assert!(!pin.wit_source().contains("resource "));
+        assert!(!pin.wit_source().contains("borrow<"));
+        assert!(!pin.wit_source().contains("own<"));
+
+        for (bytes, world_name, imports, exports) in [
+            (pin.source_bytes(), pin.source_world(), 0, 1),
+            (pin.relay_bytes(), pin.relay_world(), 1, 1),
+            (pin.sink_bytes(), pin.sink_world(), 1, 1),
+        ] {
+            let plan = inspect_component_for_profile(bytes, pin.profile())
+                .expect("pinned C6.5 Component must inspect under Profile 1 async");
+            let world = WorldContract::parse(pin.wit_source(), world_name)
+                .expect("pinned C6.5 world must parse");
+            plan.check_world(&world)
+                .expect("pinned C6.5 Component must match its exact world");
+            assert_eq!(plan.imports().len(), imports);
+            assert_eq!(plan.exports().len(), exports);
+            assert_eq!(plan.exports()[0].name, pin.interface());
+            if imports == 1 {
+                assert_eq!(plan.imports()[0].name, pin.interface());
+            }
+            assert_eq!(plan.summary().resources, 0);
+            assert!(plan.summary().async_abi.async_function_types > 0);
+            assert!(plan.summary().async_abi.stream_types > 0);
+            assert!(plan.summary().async_abi.future_types > 0);
+            assert!(!plan.runtime_ready());
+            assert!(!plan.native_async_runtime_ready());
+            assert_eq!(plan.executable_exports().count(), 0);
+        }
     }
 
     #[cfg(feature = "c53-native-async-command-projection")]

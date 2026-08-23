@@ -123,6 +123,9 @@ pub enum ComponentGraphAdmissionError {
     UnsupportedResourceBinding {
         edge: u16,
     },
+    AsyncEvidenceLimit {
+        edge: u16,
+    },
     UnauthorizedResourceBinding {
         edge: u16,
     },
@@ -181,6 +184,9 @@ impl fmt::Display for ComponentGraphAdmissionError {
             }
             Self::UnsupportedResourceBinding { .. } => {
                 "component graph resource edge lacks nominal provenance"
+            }
+            Self::AsyncEvidenceLimit { .. } => {
+                "component graph async edge evidence exceeds the selected profile"
             }
             Self::UnauthorizedResourceBinding { .. } => {
                 "component graph resource edge lacks exact trusted policy"
@@ -327,6 +333,56 @@ impl ComponentGraphResourceEdgeManifest {
     }
 }
 
+/// Capability-free async evidence retained for one exact internal edge.
+///
+/// Counts are recursively derived from the freshly validated and exactly
+/// matched interface shape. Stream and future counts are normalized-shape
+/// occurrences, including expanded aliases. A type-only declaration cannot
+/// create a route: at least one function must itself be async or carry an
+/// async value. The edge endpoints are graph-local ordinals; this value
+/// contains no task, continuation, wake, capability, resource token, or
+/// executable route.
+#[derive(PartialEq, Eq)]
+pub struct ComponentGraphAsyncEdgeManifest {
+    edge: ComponentGraphEdgeSpec,
+    async_functions: u32,
+    streams: u32,
+    futures: u32,
+}
+
+impl ComponentGraphAsyncEdgeManifest {
+    pub const fn edge(&self) -> ComponentGraphEdgeSpec {
+        self.edge
+    }
+
+    /// Exact number of async function members in the normalized edge shape.
+    pub const fn async_functions(&self) -> u32 {
+        self.async_functions
+    }
+
+    /// Exact number of stream occurrences after named aliases are expanded.
+    pub const fn streams(&self) -> u32 {
+        self.streams
+    }
+
+    /// Exact number of future occurrences after named aliases are expanded.
+    pub const fn futures(&self) -> u32 {
+        self.futures
+    }
+}
+
+impl fmt::Debug for ComponentGraphAsyncEdgeManifest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ComponentGraphAsyncEdgeManifest")
+            .field("edge", &self.edge)
+            .field("async_functions", &self.async_functions)
+            .field("streams", &self.streams)
+            .field("futures", &self.futures)
+            .finish()
+    }
+}
+
 /// Capability-free graph manifest. Endpoint values are graph-local ordinals,
 /// never runtime handles or authority tokens.
 #[derive(Debug, PartialEq, Eq)]
@@ -337,6 +393,7 @@ pub struct ComponentGraphManifest {
     account: ComponentGraphAccount,
     nodes: Vec<ComponentGraphNodeManifest>,
     edges: Vec<ComponentGraphEdgeSpec>,
+    async_edges: Vec<ComponentGraphAsyncEdgeManifest>,
     resource_edges: Vec<ComponentGraphResourceEdgeManifest>,
     external_imports: Vec<ComponentGraphExternalImportSpec>,
     published_exports: Vec<ComponentGraphPublishedExportSpec>,
@@ -365,6 +422,10 @@ impl ComponentGraphManifest {
 
     pub fn edges(&self) -> &[ComponentGraphEdgeSpec] {
         &self.edges
+    }
+
+    pub fn async_edges(&self) -> &[ComponentGraphAsyncEdgeManifest] {
+        &self.async_edges
     }
 
     pub fn resource_edges(&self) -> &[ComponentGraphResourceEdgeManifest] {
@@ -894,6 +955,148 @@ fn contains_resource_value(value: &ValueShape) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AsyncShapeEvidence {
+    async_functions: u32,
+    streams: u32,
+    futures: u32,
+    has_async_operation: bool,
+}
+
+impl AsyncShapeEvidence {
+    fn increment(counter: &mut u32, maximum: u32) -> Option<()> {
+        let next = counter.checked_add(1)?;
+        if next > maximum {
+            return None;
+        }
+        *counter = next;
+        Some(())
+    }
+
+    fn add_async_function(&mut self) -> Option<()> {
+        Self::increment(
+            &mut self.async_functions,
+            PROFILE_1_LIMITS.max_component_definitions,
+        )
+    }
+
+    fn add_stream(&mut self) -> Option<()> {
+        // World shapes expand named aliases at every use. This is therefore
+        // an exact occurrence count, not the validator's distinct type count;
+        // the matching public ShapeBudget ceiling is component definitions.
+        Self::increment(
+            &mut self.streams,
+            PROFILE_1_LIMITS.max_component_definitions,
+        )
+    }
+
+    fn add_future(&mut self) -> Option<()> {
+        Self::increment(
+            &mut self.futures,
+            PROFILE_1_LIMITS.max_component_definitions,
+        )
+    }
+
+    const fn has_async_operation(self) -> bool {
+        self.has_async_operation
+    }
+}
+
+fn collect_value_async_evidence(
+    value: &ValueShape,
+    evidence: &mut AsyncShapeEvidence,
+) -> Option<()> {
+    use ValueShape::*;
+    match value {
+        List(value) | Option(value) => collect_value_async_evidence(value, evidence)?,
+        Tuple(values) => {
+            for value in values {
+                collect_value_async_evidence(value, evidence)?;
+            }
+        }
+        Record(values) => {
+            for value in values {
+                collect_value_async_evidence(&value.value, evidence)?;
+            }
+        }
+        Result { ok, error } => {
+            if let Some(value) = ok {
+                collect_value_async_evidence(value, evidence)?;
+            }
+            if let Some(value) = error {
+                collect_value_async_evidence(value, evidence)?;
+            }
+        }
+        Variant(cases) => {
+            for case in cases {
+                if let Some(value) = &case.value {
+                    collect_value_async_evidence(value, evidence)?;
+                }
+            }
+        }
+        Future(value) => {
+            evidence.add_future()?;
+            if let Some(value) = value {
+                collect_value_async_evidence(value, evidence)?;
+            }
+        }
+        Stream(value) => {
+            evidence.add_stream()?;
+            if let Some(value) = value {
+                collect_value_async_evidence(value, evidence)?;
+            }
+        }
+        Bool | U8 | U16 | U32 | U64 | S8 | S16 | S32 | S64 | Char | String | Flags(_) | Enum(_)
+        | Own(_) | Borrow(_) => {}
+    }
+    Some(())
+}
+
+fn collect_entity_async_evidence(
+    entity: &EntityShape,
+    evidence: &mut AsyncShapeEvidence,
+) -> Option<()> {
+    match entity {
+        EntityShape::Function(function) => {
+            let streams_before = evidence.streams;
+            let futures_before = evidence.futures;
+            if function.effect == vibeos_component_runtime::world::FunctionEffect::Async {
+                evidence.add_async_function()?;
+            }
+            for parameter in &function.parameters {
+                collect_value_async_evidence(&parameter.value, evidence)?;
+            }
+            if let Some(result) = &function.result {
+                collect_value_async_evidence(result, evidence)?;
+            }
+            if function.effect == vibeos_component_runtime::world::FunctionEffect::Async
+                || evidence.streams != streams_before
+                || evidence.futures != futures_before
+            {
+                evidence.has_async_operation = true;
+            }
+        }
+        EntityShape::Interface(members) => {
+            for member in members {
+                collect_entity_async_evidence(&member.entity, evidence)?;
+            }
+        }
+        EntityShape::Type(TypeShape::Resource) => {}
+        EntityShape::Type(TypeShape::Value(value)) => {
+            collect_value_async_evidence(value, evidence)?;
+        }
+    }
+    Some(())
+}
+
+fn interface_async_evidence(members: &[NamedEntityShape]) -> Option<AsyncShapeEvidence> {
+    let mut evidence = AsyncShapeEvidence::default();
+    for member in members {
+        collect_entity_async_evidence(&member.entity, &mut evidence)?;
+    }
+    Some(evidence)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ResourceModeSet {
     own: bool,
     borrow: bool,
@@ -1317,6 +1520,45 @@ fn check_typed_edges(graph: &ComponentGraph<'_>) -> Result<(), ComponentGraphAdm
     Ok(())
 }
 
+fn derive_async_edges(
+    graph: &ComponentGraph<'_>,
+) -> Result<Vec<ComponentGraphAsyncEdgeManifest>, ComponentGraphAdmissionError> {
+    let mut routes = Vec::new();
+    routes
+        .try_reserve_exact(graph.edges().len())
+        .map_err(|_| ComponentGraphAdmissionError::Allocation)?;
+    for (index, edge) in graph.edges().iter().enumerate() {
+        let edge_index = edge_index(index)?;
+        let (EntityShape::Interface(source), EntityShape::Interface(target)) =
+            (&edge.source_shape().entity, &edge.target_shape().entity)
+        else {
+            // `check_typed_edges` must run before this helper.
+            return Err(ComponentGraphAdmissionError::UnsupportedBindingSurface {
+                edge: edge_index,
+            });
+        };
+        let source = interface_async_evidence(source)
+            .ok_or(ComponentGraphAdmissionError::AsyncEvidenceLimit { edge: edge_index })?;
+        let target = interface_async_evidence(target)
+            .ok_or(ComponentGraphAdmissionError::AsyncEvidenceLimit { edge: edge_index })?;
+        if source != target {
+            // Exact type matching has already succeeded. Divergent evidence is
+            // therefore a fail-closed internal inconsistency, never a route to
+            // execution.
+            return Err(ComponentGraphAdmissionError::RevalidationMismatch);
+        }
+        if source.has_async_operation() {
+            routes.push(ComponentGraphAsyncEdgeManifest {
+                edge: ComponentGraphEdgeSpec::new(edge.source(), edge.target()),
+                async_functions: source.async_functions,
+                streams: source.streams,
+                futures: source.futures,
+            });
+        }
+    }
+    Ok(routes)
+}
+
 fn derive_resource_edges(
     graph: &ComponentGraph<'_>,
     provenances: &[ComponentGraphResourceProvenance],
@@ -1707,6 +1949,7 @@ pub fn admit_component_graph_with_resource_policy(
         policy.published_exports,
     )?;
     check_graph_bindings(&graph)?;
+    let async_edges = derive_async_edges(&graph)?;
     let resource_edges = derive_resource_edges(&graph, &provenances)?;
     authorize_resource_edges(&graph, &resource_edges, resource_policy)?;
     check_acyclic(&graph)?;
@@ -1766,6 +2009,7 @@ pub fn admit_component_graph_with_resource_policy(
             account,
             nodes,
             edges,
+            async_edges,
             resource_edges,
             external_imports,
             published_exports,
@@ -1866,6 +2110,10 @@ fn revalidate_component_graph(
         &admitted.manifest.published_exports,
     )?;
     check_graph_bindings(&graph)?;
+    let observed_async_edges = derive_async_edges(&graph)?;
+    if observed_async_edges != admitted.manifest.async_edges {
+        return Err(ComponentGraphAdmissionError::RevalidationMismatch);
+    }
     let observed_resource_edges = derive_resource_edges(&graph, &provenances)?;
     if observed_resource_edges != admitted.manifest.resource_edges {
         return Err(ComponentGraphAdmissionError::RevalidationMismatch);
@@ -1935,11 +2183,85 @@ fn revalidate_component_graph(
 mod tests {
     use super::*;
 
+    const ASYNC_CHAIN_WIT: &str =
+        include_str!("../../../policy/image/artifacts/c65-async-chain.wit");
+    const ASYNC_SOURCE_WAT: &str =
+        include_str!("../../../policy/image/artifacts/c65-async-source.component.wat");
+    const ASYNC_RELAY_WAT: &str =
+        include_str!("../../../policy/image/artifacts/c65-async-relay.component.wat");
+
     fn scalar(name: &str) -> NamedEntityShape {
         NamedEntityShape {
             name: String::from(name),
             entity: EntityShape::Type(TypeShape::Value(ValueShape::U32)),
         }
+    }
+
+    fn admitted_async_graph() -> AdmittedComponentGraph {
+        let source_bytes = wat::parse_str(ASYNC_SOURCE_WAT).expect("source WAT");
+        let relay_bytes = wat::parse_str(ASYNC_RELAY_WAT).expect("relay WAT");
+        let source = ComponentArtifact::copy_from(&source_bytes, ProfileIdentity::PROFILE_1_ASYNC)
+            .expect("source artifact");
+        let relay = ComponentArtifact::copy_from(&relay_bytes, ProfileIdentity::PROFILE_1_ASYNC)
+            .expect("relay artifact");
+        let source_world = WorldContract::parse(ASYNC_CHAIN_WIT, "test:c65-chain/source@1.0.0")
+            .expect("source world");
+        let relay_world = WorldContract::parse(ASYNC_CHAIN_WIT, "test:c65-chain/relay@1.0.0")
+            .expect("relay world");
+        let nodes = [
+            ComponentGraphNodeAdmissionPolicy {
+                label: "source",
+                nesting: ComponentGraphNesting::Root,
+                exact_world: &source_world,
+                trust: ArtifactTrust::ImagePinned(source.identity()),
+                limits: InstanceLimits {
+                    memory_bytes: 64 * 1024,
+                    total_fuel: 1_000,
+                    poll_quantum: 100,
+                    resources: 4,
+                },
+                interfaces: &[],
+            },
+            ComponentGraphNodeAdmissionPolicy {
+                label: "relay",
+                nesting: ComponentGraphNesting::Root,
+                exact_world: &relay_world,
+                trust: ArtifactTrust::ImagePinned(relay.identity()),
+                limits: InstanceLimits {
+                    memory_bytes: 64 * 1024,
+                    total_fuel: 1_000,
+                    poll_quantum: 100,
+                    resources: 4,
+                },
+                interfaces: &[],
+            },
+        ];
+        let edge = ComponentGraphEdgeSpec::new(
+            ComponentGraphExportEndpoint::new(
+                ComponentGraphNodeId::new(0),
+                vibeos_component_runtime::graph::ComponentGraphEntityIndex::new(0),
+            ),
+            ComponentGraphImportEndpoint::new(
+                ComponentGraphNodeId::new(1),
+                vibeos_component_runtime::graph::ComponentGraphEntityIndex::new(0),
+            ),
+        );
+        let edges = [edge];
+        let policy = ComponentGraphAdmissionPolicy {
+            name: "async-manifest-tamper",
+            profile: ProfileIdentity::PROFILE_1_ASYNC,
+            nodes: &nodes,
+            edges: &edges,
+            external_imports: &[],
+            published_exports: &[],
+            cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+        };
+        admit_component_graph(
+            alloc::vec![source, relay],
+            &policy,
+            &CallerAuthority { offers: &[] },
+        )
+        .expect("async graph admission")
     }
 
     #[test]
@@ -1980,6 +2302,129 @@ mod tests {
         assert_eq!(
             compare_entities(&sync, &asynchronous),
             Some(ComponentGraphBindingMismatch::Effect)
+        );
+    }
+
+    #[test]
+    fn async_evidence_occurrences_are_checked_against_the_normalized_shape_bound() {
+        let mut functions = Vec::new();
+        for index in 0..=PROFILE_1_LIMITS.max_component_definitions {
+            functions.push(NamedEntityShape {
+                name: alloc::format!("run-{index}"),
+                entity: EntityShape::Function(FunctionShape {
+                    effect: vibeos_component_runtime::world::FunctionEffect::Async,
+                    parameters: Vec::new(),
+                    result: None,
+                }),
+            });
+        }
+        assert_eq!(interface_async_evidence(&functions), None);
+
+        for (value, maximum) in [
+            (
+                ValueShape::Future(Some(alloc::boxed::Box::new(ValueShape::U8))),
+                PROFILE_1_LIMITS.max_component_definitions,
+            ),
+            (
+                ValueShape::Stream(Some(alloc::boxed::Box::new(ValueShape::U8))),
+                PROFILE_1_LIMITS.max_component_definitions,
+            ),
+        ] {
+            let mut values = Vec::new();
+            for _ in 0..=maximum {
+                values.push(match &value {
+                    ValueShape::Future(_) => {
+                        ValueShape::Future(Some(alloc::boxed::Box::new(ValueShape::U8)))
+                    }
+                    ValueShape::Stream(_) => {
+                        ValueShape::Stream(Some(alloc::boxed::Box::new(ValueShape::U8)))
+                    }
+                    _ => unreachable!(),
+                });
+            }
+            let members = alloc::vec![NamedEntityShape {
+                name: String::from("nested"),
+                entity: EntityShape::Type(TypeShape::Value(ValueShape::Tuple(values))),
+            }];
+            assert_eq!(interface_async_evidence(&members), None);
+        }
+    }
+
+    #[test]
+    fn standalone_async_type_declarations_do_not_create_an_operation_route() {
+        let members = alloc::vec![
+            NamedEntityShape {
+                name: String::from("pending"),
+                entity: EntityShape::Type(TypeShape::Value(ValueShape::Future(Some(
+                    alloc::boxed::Box::new(ValueShape::U32),
+                )))),
+            },
+            NamedEntityShape {
+                name: String::from("chunks"),
+                entity: EntityShape::Type(TypeShape::Value(ValueShape::Stream(Some(
+                    alloc::boxed::Box::new(ValueShape::U8),
+                )))),
+            },
+            NamedEntityShape {
+                name: String::from("ordinary"),
+                entity: EntityShape::Function(FunctionShape {
+                    effect: vibeos_component_runtime::world::FunctionEffect::Sync,
+                    parameters: Vec::new(),
+                    result: Some(ValueShape::U32),
+                }),
+            },
+        ];
+        let evidence = interface_async_evidence(&members).expect("bounded exact shape");
+        assert_eq!(evidence.streams, 1);
+        assert_eq!(evidence.futures, 1);
+        assert!(!evidence.has_async_operation());
+    }
+
+    #[test]
+    fn sync_function_carrying_nested_stream_and_future_is_an_async_operation_route() {
+        let members = alloc::vec![NamedEntityShape {
+            name: String::from("open"),
+            entity: EntityShape::Function(FunctionShape {
+                effect: vibeos_component_runtime::world::FunctionEffect::Sync,
+                parameters: alloc::vec![NamedValueShape {
+                    name: String::from("input"),
+                    value: ValueShape::Option(alloc::boxed::Box::new(ValueShape::Record(
+                        alloc::vec![NamedValueShape {
+                            name: String::from("chunks"),
+                            value: ValueShape::Stream(Some(alloc::boxed::Box::new(ValueShape::U8))),
+                        }],
+                    ))),
+                }],
+                result: Some(ValueShape::Result {
+                    ok: Some(alloc::boxed::Box::new(ValueShape::Future(Some(
+                        alloc::boxed::Box::new(ValueShape::U32),
+                    )))),
+                    error: None,
+                }),
+            }),
+        }];
+        let evidence = interface_async_evidence(&members).expect("bounded recursive shape");
+        assert_eq!(evidence.async_functions, 0);
+        assert_eq!(evidence.streams, 1);
+        assert_eq!(evidence.futures, 1);
+        assert!(evidence.has_async_operation());
+    }
+
+    #[test]
+    fn revalidation_rejects_missing_or_tampered_async_edge_evidence() {
+        let mut missing = admitted_async_graph();
+        assert_eq!(missing.manifest.async_edges.len(), 1);
+        missing.manifest.async_edges.clear();
+        assert_eq!(
+            missing.revalidate(),
+            Err(ComponentGraphAdmissionError::RevalidationMismatch)
+        );
+
+        let mut tampered = admitted_async_graph();
+        tampered.manifest.async_edges[0].streams += 1;
+        assert_eq!(
+            tampered.revalidate(),
+            Err(ComponentGraphAdmissionError::RevalidationMismatch)
         );
     }
 }

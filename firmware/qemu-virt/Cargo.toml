@@ -21,6 +21,9 @@ wasm-c63-graph-principal-acceptance = [
 wasm-c64-resource-route-acceptance = [
     "vibeos-kernel/wasm-c64-resource-route-acceptance",
 ]
+wasm-c65-async-chain-acceptance = [
+    "vibeos-kernel/wasm-c65-async-chain-acceptance",
+]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = [
     "vibeos-kernel/ssh-test",

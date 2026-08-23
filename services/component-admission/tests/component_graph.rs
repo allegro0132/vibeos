@@ -288,6 +288,16 @@ const AMBIGUOUS_RESOURCE_CONSUMER_WAT: &str = r#"
 const STREAM_COMPONENT: &str =
     include_str!("../../../component-runtime/tests/fixtures/host-stream.component.wat");
 const STREAM_WIT: &str = include_str!("../../../component-format/tests/corpus/wit/stream.wit");
+const ASYNC_CHAIN_WIT: &str = include_str!("../../../policy/image/artifacts/c65-async-chain.wit");
+const ASYNC_SOURCE_WAT: &str =
+    include_str!("../../../policy/image/artifacts/c65-async-source.component.wat");
+const ASYNC_RELAY_WAT: &str =
+    include_str!("../../../policy/image/artifacts/c65-async-relay.component.wat");
+const ASYNC_SINK_WAT: &str =
+    include_str!("../../../policy/image/artifacts/c65-async-sink.component.wat");
+const ASYNC_SOURCE_WORLD: &str = "test:c65-chain/source@1.0.0";
+const ASYNC_RELAY_WORLD: &str = "test:c65-chain/relay@1.0.0";
+const ASYNC_SINK_WORLD: &str = "test:c65-chain/sink@1.0.0";
 
 fn node(index: u16) -> ComponentGraphNodeId {
     ComponentGraphNodeId::new(index)
@@ -322,6 +332,12 @@ fn artifact(source: &str) -> ComponentArtifact {
     let bytes = wat::parse_str(source).expect("component WAT must parse");
     ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1)
         .expect("component artifact must fit the profile")
+}
+
+fn async_artifact(source: &str) -> ComponentArtifact {
+    let bytes = wat::parse_str(source).expect("async component WAT must parse");
+    ComponentArtifact::copy_from(&bytes, ProfileIdentity::PROFILE_1_ASYNC)
+        .expect("async component artifact must fit the profile")
 }
 
 fn world(source: &str, identity: &str) -> WorldContract {
@@ -408,6 +424,62 @@ fn admit_resource_pair(
     )
 }
 
+fn admit_async_pair() -> Result<AdmittedComponentGraph, ComponentGraphAdmissionError> {
+    let source_world = world(ASYNC_CHAIN_WIT, ASYNC_SOURCE_WORLD);
+    let relay_world = world(ASYNC_CHAIN_WIT, ASYNC_RELAY_WORLD);
+    let source = async_artifact(ASYNC_SOURCE_WAT);
+    let relay = async_artifact(ASYNC_RELAY_WAT);
+    let nodes = [
+        policy_node("async-source", &source_world, &source, &[]),
+        policy_node("async-relay", &relay_world, &relay, &[]),
+    ];
+    let edges = [edge(0, 1)];
+    let policy = ComponentGraphAdmissionPolicy {
+        name: "async-edge-evidence",
+        profile: ProfileIdentity::PROFILE_1_ASYNC,
+        nodes: &nodes,
+        edges: &edges,
+        external_imports: &[],
+        published_exports: &[],
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    admit_component_graph(
+        vec![source, relay],
+        &policy,
+        &CallerAuthority { offers: &[] },
+    )
+}
+
+fn admit_async_chain() -> Result<AdmittedComponentGraph, ComponentGraphAdmissionError> {
+    let source_world = world(ASYNC_CHAIN_WIT, ASYNC_SOURCE_WORLD);
+    let relay_world = world(ASYNC_CHAIN_WIT, ASYNC_RELAY_WORLD);
+    let sink_world = world(ASYNC_CHAIN_WIT, ASYNC_SINK_WORLD);
+    let source = async_artifact(ASYNC_SOURCE_WAT);
+    let relay = async_artifact(ASYNC_RELAY_WAT);
+    let sink = async_artifact(ASYNC_SINK_WAT);
+    let nodes = [
+        policy_node("async-source", &source_world, &source, &[]),
+        policy_node("async-relay", &relay_world, &relay, &[]),
+        policy_node("async-sink", &sink_world, &sink, &[]),
+    ];
+    let edges = [edge(0, 1), edge(1, 2)];
+    let published_exports = [ComponentGraphPublishedExportSpec::new(export(2, 0))];
+    let policy = ComponentGraphAdmissionPolicy {
+        name: "async-chain-evidence",
+        profile: ProfileIdentity::PROFILE_1_ASYNC,
+        nodes: &nodes,
+        edges: &edges,
+        external_imports: &[],
+        published_exports: &published_exports,
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    admit_component_graph(
+        vec![source, relay, sink],
+        &policy,
+        &CallerAuthority { offers: &[] },
+    )
+}
+
 fn admit_provider(
     published_exports: &[ComponentGraphPublishedExportSpec],
 ) -> Result<AdmittedComponentGraph, ComponentGraphAdmissionError> {
@@ -448,12 +520,74 @@ fn two_independently_parsed_nodes_admit_as_owned_inert_send_and_revalidate_twice
     assert_eq!(graph.manifest().edges(), [edge(0, 1)]);
     assert_eq!(graph.manifest().account().nodes, 2);
     assert_eq!(graph.manifest().account().edges, 1);
+    assert!(graph.manifest().async_edges().is_empty());
     assert_eq!(graph.node_inspections().len(), 2);
     assert_eq!(graph.node_inspections()[0].world(), PRODUCER_WORLD);
     assert_eq!(graph.node_inspections()[1].world(), CONSUMER_WORLD);
     assert!(graph.grants().is_empty());
     graph.revalidate().expect("first complete revalidation");
     graph.revalidate().expect("second complete revalidation");
+}
+
+#[test]
+fn recursive_async_edge_evidence_is_exact_bounded_inert_and_revalidated() {
+    let graph = admit_async_pair().expect("exact async interface graph must admit");
+
+    assert!(!graph.runtime_ready());
+    assert_eq!(graph.manifest().async_edges().len(), 1);
+    let route = &graph.manifest().async_edges()[0];
+    assert_eq!(route.edge(), edge(0, 1));
+    assert_eq!(route.async_functions(), 1);
+    assert_eq!(route.streams(), 4);
+    assert_eq!(route.futures(), 4);
+    assert!(
+        route.async_functions()
+            <= vibeos_component_format::PROFILE_1_LIMITS.max_component_definitions
+    );
+    assert!(route.streams() <= vibeos_component_format::PROFILE_1_LIMITS.max_component_definitions);
+    assert!(route.futures() <= vibeos_component_format::PROFILE_1_LIMITS.max_component_definitions);
+    assert!(graph.manifest().resource_edges().is_empty());
+
+    let debug = format!("{route:?}");
+    assert!(debug.contains("async_functions"));
+    assert!(debug.contains("streams"));
+    assert!(debug.contains("futures"));
+    for forbidden in ["Task", "CSpace", "HostOperationToken", "Cap(", "generation"] {
+        assert!(
+            !debug.contains(forbidden),
+            "debug leaked {forbidden}: {debug}"
+        );
+    }
+
+    graph.revalidate().expect("first fresh async derivation");
+    graph.revalidate().expect("second fresh async derivation");
+}
+
+#[test]
+fn multi_hop_async_evidence_preserves_edge_order_and_published_sink() {
+    let graph = admit_async_chain().expect("source-to-relay-to-sink graph must admit");
+
+    assert!(!graph.runtime_ready());
+    assert_eq!(graph.manifest().edges(), [edge(0, 1), edge(1, 2)]);
+    assert_eq!(graph.manifest().async_edges().len(), 2);
+    for (route, expected_edge) in graph
+        .manifest()
+        .async_edges()
+        .iter()
+        .zip([edge(0, 1), edge(1, 2)])
+    {
+        assert_eq!(route.edge(), expected_edge);
+        assert_eq!(route.async_functions(), 1);
+        assert_eq!(route.streams(), 4);
+        assert_eq!(route.futures(), 4);
+    }
+    assert_eq!(
+        graph.manifest().published_exports(),
+        [ComponentGraphPublishedExportSpec::new(export(2, 0))]
+    );
+    graph
+        .revalidate()
+        .expect("all hops require fresh exact async evidence");
 }
 
 #[test]
@@ -626,6 +760,7 @@ fn exact_borrow_resource_edge_is_inert_owned_and_freshly_revalidated() {
     assert!(!graph.runtime_ready());
     assert!(graph.grants().is_empty());
     assert_eq!(graph.manifest().resource_edges().len(), 1);
+    assert!(graph.manifest().async_edges().is_empty());
     let route = &graph.manifest().resource_edges()[0];
     assert_eq!(route.edge(), edge(0, 1));
     assert_eq!(route.mode(), ComponentGraphResourceMode::Borrow);

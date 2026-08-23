@@ -17,6 +17,7 @@ const BLOB_TYPE: ResourceTypeId = ResourceTypeId(1);
 
 struct Probe(u32);
 struct OtherProbe;
+struct ManagementProbe;
 
 impl Resource for Probe {
     fn kind(&self) -> &'static str {
@@ -46,6 +47,21 @@ impl Resource for OtherProbe {
 impl ComponentHostResource for OtherProbe {
     const HOST_KIND: HostResourceKind = HostResourceKind::Blob;
     const OPERATION_RIGHTS: Rights = Rights::READ;
+}
+
+impl Resource for ManagementProbe {
+    fn kind(&self) -> &'static str {
+        "management-probe"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl ComponentHostResource for ManagementProbe {
+    const HOST_KIND: HostResourceKind = HostResourceKind::Blob;
+    const OPERATION_RIGHTS: Rights = Rights::READ.union(Rights::GRANT);
 }
 
 fn ordinary(name: &str) -> (SharedCSpace, ComponentAuthoritySpace) {
@@ -93,6 +109,30 @@ fn guessed_stale_wrong_type_and_over_rights_are_rejected_at_binding() {
         binding
             .bind_ephemeral::<Probe>(over_righted, Rights::READ)
             .unwrap_err(),
+        AuthorityError::RightsExceedCeiling,
+    );
+}
+
+#[test]
+fn ordinary_ephemeral_receipts_reject_trait_declared_management_rights() {
+    let (space, binding) = ordinary("management-rights-negative");
+    let cap = space
+        .lock()
+        .mint(Arc::new(ManagementProbe), Rights::READ.union(Rights::GRANT));
+    assert_eq!(
+        binding
+            .bind_ephemeral::<ManagementProbe>(cap, Rights::READ.union(Rights::GRANT))
+            .unwrap_err(),
+        AuthorityError::RightsExceedCeiling,
+    );
+    let guard = space.lock();
+    assert_eq!(
+        ComponentAuthority::prepare_ephemeral_in::<ManagementProbe>(
+            &guard,
+            cap,
+            Rights::READ.union(Rights::GRANT),
+        )
+        .unwrap_err(),
         AuthorityError::RightsExceedCeiling,
     );
 }

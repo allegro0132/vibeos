@@ -14,6 +14,7 @@ use vibeos_component_runtime::{
     graph::{
         ComponentGraphEdgeSpec, ComponentGraphEntityIndex, ComponentGraphExportEndpoint,
         ComponentGraphImportEndpoint, ComponentGraphNesting, ComponentGraphNodeId,
+        ComponentGraphPublishedExportSpec,
     },
     world::WorldContract,
 };
@@ -73,6 +74,17 @@ const RESOURCE_CONSUMER_WAT: &str = r#"
       (import "test:c64-command/pipe@1.0.0" (instance $pipe-in (type $pipe))))
 "#;
 
+const ASYNC_CHAIN_WIT: &str = include_str!("../../../policy/image/artifacts/c65-async-chain.wit");
+const ASYNC_SOURCE_WAT: &str =
+    include_str!("../../../policy/image/artifacts/c65-async-source.component.wat");
+const ASYNC_RELAY_WAT: &str =
+    include_str!("../../../policy/image/artifacts/c65-async-relay.component.wat");
+const ASYNC_SINK_WAT: &str =
+    include_str!("../../../policy/image/artifacts/c65-async-sink.component.wat");
+const ASYNC_SOURCE_WORLD: &str = "test:c65-chain/source@1.0.0";
+const ASYNC_RELAY_WORLD: &str = "test:c65-chain/relay@1.0.0";
+const ASYNC_SINK_WORLD: &str = "test:c65-chain/sink@1.0.0";
+
 fn graph_node(index: u16) -> ComponentGraphNodeId {
     ComponentGraphNodeId::new(index)
 }
@@ -85,6 +97,17 @@ fn resource_edge() -> ComponentGraphEdgeSpec {
     ComponentGraphEdgeSpec::new(
         ComponentGraphExportEndpoint::new(graph_node(0), graph_entity(0)),
         ComponentGraphImportEndpoint::new(graph_node(1), graph_entity(0)),
+    )
+}
+
+fn async_edge() -> ComponentGraphEdgeSpec {
+    resource_edge()
+}
+
+fn second_async_edge() -> ComponentGraphEdgeSpec {
+    ComponentGraphEdgeSpec::new(
+        ComponentGraphExportEndpoint::new(graph_node(1), graph_entity(0)),
+        ComponentGraphImportEndpoint::new(graph_node(2), graph_entity(0)),
     )
 }
 
@@ -195,6 +218,82 @@ fn admitted_resource_graph() -> vibeos_component_admission::AdmittedComponentGra
     .expect("exact resource graph must admit")
 }
 
+fn admitted_async_graph() -> vibeos_component_admission::AdmittedComponentGraph {
+    let source_bytes = wat::parse_str(ASYNC_SOURCE_WAT).expect("source must encode");
+    let relay_bytes = wat::parse_str(ASYNC_RELAY_WAT).expect("relay must encode");
+    let sink_bytes = wat::parse_str(ASYNC_SINK_WAT).expect("sink must encode");
+    let empty_bytes = wat::parse_str("(component)").expect("empty component must encode");
+    let source = ComponentArtifact::copy_from(&source_bytes, ProfileIdentity::PROFILE_1_ASYNC)
+        .expect("source artifact must fit");
+    let relay = ComponentArtifact::copy_from(&relay_bytes, ProfileIdentity::PROFILE_1_ASYNC)
+        .expect("relay artifact must fit");
+    let sink = ComponentArtifact::copy_from(&sink_bytes, ProfileIdentity::PROFILE_1_ASYNC)
+        .expect("sink artifact must fit");
+    let observer = ComponentArtifact::copy_from(&empty_bytes, ProfileIdentity::PROFILE_1_ASYNC)
+        .expect("observer artifact must fit");
+    let source_world =
+        WorldContract::parse(ASYNC_CHAIN_WIT, ASYNC_SOURCE_WORLD).expect("source world must parse");
+    let relay_world =
+        WorldContract::parse(ASYNC_CHAIN_WIT, ASYNC_RELAY_WORLD).expect("relay world must parse");
+    let sink_world =
+        WorldContract::parse(ASYNC_CHAIN_WIT, ASYNC_SINK_WORLD).expect("sink world must parse");
+    let empty_world =
+        WorldContract::parse(EMPTY_WORLD_WIT, EMPTY_WORLD).expect("empty world must parse");
+    let nodes = [
+        ComponentGraphNodeAdmissionPolicy {
+            label: "async-source",
+            nesting: ComponentGraphNesting::Root,
+            exact_world: &source_world,
+            trust: ArtifactTrust::ImagePinned(source.identity()),
+            limits: limits(64 * 1024, 1_000, 100, 3),
+            interfaces: &[],
+        },
+        ComponentGraphNodeAdmissionPolicy {
+            label: "async-relay",
+            nesting: ComponentGraphNesting::Root,
+            exact_world: &relay_world,
+            trust: ArtifactTrust::ImagePinned(relay.identity()),
+            limits: limits(64 * 1024, 2_000, 100, 5),
+            interfaces: &[],
+        },
+        ComponentGraphNodeAdmissionPolicy {
+            label: "async-sink",
+            nesting: ComponentGraphNesting::Root,
+            exact_world: &sink_world,
+            trust: ArtifactTrust::ImagePinned(sink.identity()),
+            limits: limits(64 * 1024, 1_500, 75, 4),
+            interfaces: &[],
+        },
+        ComponentGraphNodeAdmissionPolicy {
+            label: "unrouted-observer",
+            nesting: ComponentGraphNesting::Root,
+            exact_world: &empty_world,
+            trust: ArtifactTrust::ImagePinned(observer.identity()),
+            limits: limits(64 * 1024, 500, 50, 2),
+            interfaces: &[],
+        },
+    ];
+    let edges = [async_edge(), second_async_edge()];
+    let published_exports = [ComponentGraphPublishedExportSpec::new(
+        ComponentGraphExportEndpoint::new(graph_node(2), graph_entity(0)),
+    )];
+    let policy = ComponentGraphAdmissionPolicy {
+        name: "async-route-report",
+        profile: ProfileIdentity::PROFILE_1_ASYNC,
+        nodes: &nodes,
+        edges: &edges,
+        external_imports: &[],
+        published_exports: &published_exports,
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    admit_component_graph(
+        vec![source, relay, sink, observer],
+        &policy,
+        &CallerAuthority { offers: &[] },
+    )
+    .expect("exact async graph must admit")
+}
+
 #[test]
 fn exact_principal_projection_is_owned_inert_send_sync_and_revalidates() {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -230,6 +329,7 @@ fn exact_principal_projection_is_owned_inert_send_sync_and_revalidates() {
     assert_eq!(template.manifest(), admitted.manifest());
     assert!(core::ptr::eq(template.admitted_graph(), admitted.as_ref()));
     assert!(template.grants().is_empty());
+    assert!(template.async_edges().is_empty());
     assert_eq!(template.principals().len(), expected.len());
     for (principal, expected) in template.principals().iter().zip(&expected) {
         assert_eq!(principal.id(), expected.0);
@@ -297,6 +397,7 @@ fn admitted_resource_edges_are_public_inert_and_freshly_revalidated() {
         .expect("resource template must build");
 
     assert!(!template.runtime_ready());
+    assert!(template.async_edges().is_empty());
     assert_eq!(template.resource_edges().len(), 1);
     let route = &template.resource_edges()[0];
     assert_eq!(route.edge(), resource_edge());
@@ -306,6 +407,104 @@ fn admitted_resource_edges_are_public_inert_and_freshly_revalidated() {
     template
         .revalidate()
         .expect("resource edges require fresh admission provenance");
+}
+
+#[test]
+fn admitted_async_edges_are_public_inert_exact_and_freshly_revalidated() {
+    let template = ComponentGraphPrincipalTemplate::new(Arc::new(admitted_async_graph()))
+        .expect("async template must build");
+
+    assert!(!template.runtime_ready());
+    assert_eq!(template.async_edges().len(), 2);
+    let route = &template.async_edges()[0];
+    assert_eq!(route.edge(), async_edge());
+    assert_eq!(route.async_functions(), 1);
+    assert_eq!(route.streams(), 4);
+    assert_eq!(route.futures(), 4);
+    let second_route = &template.async_edges()[1];
+    assert_eq!(second_route.edge(), second_async_edge());
+    assert_eq!(second_route.async_functions(), 1);
+    assert_eq!(second_route.streams(), 4);
+    assert_eq!(second_route.futures(), 4);
+    assert!(template.resource_edges().is_empty());
+    template
+        .revalidate()
+        .expect("async edges require fresh exact shape evidence");
+
+    let output = format!("{template:?}");
+    assert!(output.contains("ComponentGraphAsyncEdgeManifest"));
+    assert!(output.contains("async_functions"));
+    for forbidden in [
+        "TaskId",
+        "CSpace",
+        "HostOperationToken",
+        "Cap(",
+        "generation",
+    ] {
+        assert!(
+            !output.contains(forbidden),
+            "debug leaked {forbidden}: {output}"
+        );
+    }
+}
+
+#[test]
+fn supervisor_prepared_async_report_is_endpoint_only_positive_bounded_and_guest_inert() {
+    let template = ComponentGraphPrincipalTemplate::new(Arc::new(admitted_async_graph()))
+        .expect("async template must build");
+
+    for node in [graph_node(0), graph_node(1), graph_node(2)] {
+        let principal = template.principal(node).unwrap();
+        let report = template
+            .supervisor_prepared_async_unavailable_report(node, 1)
+            .expect("both sealed async-edge endpoints may report measured setup use");
+        assert_eq!(report.node(), node);
+        assert_eq!(
+            report.terminal(),
+            ComponentGraphNodeTerminal::RuntimeUnavailable
+        );
+        assert_eq!(report.fuel().limit(), principal.fuel_limit());
+        assert_eq!(report.fuel().consumed(), 0);
+        assert_eq!(report.resources().peak_slots(), 1);
+        assert_eq!(report.resources().live_slots(), 0);
+    }
+
+    let at_limit = template
+        .supervisor_prepared_async_unavailable_report(graph_node(0), 3)
+        .expect("the exact manifest slot ceiling is inclusive");
+    assert_eq!(at_limit.resources().peak_slots(), 3);
+    assert_eq!(at_limit.resources().live_slots(), 0);
+    assert!(!template.runtime_ready());
+}
+
+#[test]
+fn supervisor_prepared_async_report_rejects_zero_non_endpoint_unknown_and_over_limit() {
+    let template = ComponentGraphPrincipalTemplate::new(Arc::new(admitted_async_graph()))
+        .expect("async template must build");
+    assert_eq!(
+        template.supervisor_prepared_async_unavailable_report(graph_node(0), 0),
+        Err(ComponentGraphNodeReportError::SupervisorPreparedPeakRequired)
+    );
+    assert_eq!(
+        template.supervisor_prepared_async_unavailable_report(graph_node(0), 4),
+        Err(ComponentGraphNodeReportError::ResourceLimitExceeded)
+    );
+    assert_eq!(
+        template.supervisor_prepared_async_unavailable_report(graph_node(3), 1),
+        Err(ComponentGraphNodeReportError::AsyncEdgeRequired {
+            node: graph_node(3),
+        })
+    );
+    let unknown = graph_node(u16::MAX);
+    assert_eq!(
+        template.supervisor_prepared_async_unavailable_report(unknown, 1),
+        Err(ComponentGraphNodeReportError::UnknownNode { node: unknown })
+    );
+
+    let ordinary = template.runtime_unavailable_report(graph_node(0)).unwrap();
+    assert_eq!(ordinary.fuel().consumed(), 0);
+    assert_eq!(ordinary.resources().peak_slots(), 0);
+    assert_eq!(ordinary.resources().live_slots(), 0);
 }
 
 #[test]

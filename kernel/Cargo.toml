@@ -121,6 +121,15 @@ wasm-c64-resource-route-acceptance = [
     "dep:vibeos-component-admission",
     "vibeos-image-policy/c64-resource-route-qemu-acceptance",
 ]
+# QEMU image gate for the C6.5 validation-only async-chain proof. Pinned
+# Components contribute exact validator provenance only; bounded transport is
+# exercised by separately supervised SYSTEM byte streams and never calls guest
+# code while PROFILE_1_ASYNC remains execution-disabled.
+wasm-c65-async-chain-acceptance = [
+    "component-graph-principals",
+    "dep:vibeos-component-admission",
+    "vibeos-image-policy/c65-async-chain-qemu-acceptance",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

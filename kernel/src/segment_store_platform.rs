@@ -13,7 +13,7 @@ use core::cell::UnsafeCell;
 use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use core::task::{Context, Poll};
 
 use alloc::boxed::Box;
@@ -26,7 +26,7 @@ use vibeos_core::cap::{Cap, InvocationLease, Resource, Rights};
 use vibeos_core::heap::OwnerId;
 #[cfg(feature = "file-tree")]
 use vibeos_file_store::{FileError, FileTreeBackend, FileTreeFuture, FileTreeRoot, FsTransaction};
-use vibeos_segment_format::{Page, StoreUuid, PAGE_SIZE};
+use vibeos_segment_format::{PAGE_SIZE, Page, StoreUuid};
 use vibeos_segment_store::{
     ColdScrubEvidence, FormatOptions, FormatProbe, GrowablePageDevice, LegacyFormatProbe,
     MigrationControl, MigrationController, MigrationError, MigrationState, MigrationTransition,
@@ -54,9 +54,9 @@ const BLOCKS_PER_PAGE: u64 = (PAGE_SIZE / LOGICAL_BLOCK_SIZE) as u64;
 const MAX_PAGES_PER_REQUEST: usize =
     crate::virtio::BLOCK_MAX_TRANSFER_SIZE as usize / vibeos_segment_format::PAGE_SIZE;
 #[cfg(feature = "milkv-duo")]
-const MAX_PAGES_PER_REQUEST: usize =
-    crate::sdhci_blk::MAX_TRANSFER_BLOCKS as usize * LOGICAL_BLOCK_SIZE
-        / vibeos_segment_format::PAGE_SIZE;
+const MAX_PAGES_PER_REQUEST: usize = crate::sdhci_blk::MAX_TRANSFER_BLOCKS as usize
+    * LOGICAL_BLOCK_SIZE
+    / vibeos_segment_format::PAGE_SIZE;
 const STORAGE_V2_FOREGROUND_FREE_SEGMENTS: u64 = 10;
 /// Extra segments requested beyond the floor whenever foreground growth
 /// runs, so one growth transaction serves many subsequent commits.
@@ -154,6 +154,31 @@ pub(crate) struct CapabilityPageDevice {
     page_cache: Arc<PageCache>,
 }
 
+/// Recover by the policy identity already committed on media. A v2-enabled
+/// build recognizes the exact legacy-v1 and Component-v2 commitments as two
+/// disjoint profiles; unknown or duplicate commitments fail closed. This does
+/// not upgrade v1, and the Component installer separately requires exact v2.
+async fn recover_recognized_persistent_authority(
+    store: &SegmentStore<CapabilityPageDevice>,
+    requested_policy_sha256: [u8; 32],
+) -> Result<PersistentAuthorityView, PersistentAuthorityError<PageIoError>> {
+    #[cfg(feature = "component-durable-publication")]
+    if requested_policy_sha256
+        == crate::durable_cspace::storage_v2_component_external_policy_sha256()
+    {
+        let recognized = [
+            crate::durable_cspace::storage_v2_legacy_external_policy_sha256(),
+            crate::durable_cspace::storage_v2_component_external_policy_sha256(),
+        ];
+        return store
+            .recover_persistent_authority_recognized(&recognized)
+            .await;
+    }
+    store
+        .recover_persistent_authority(requested_policy_sha256)
+        .await
+}
+
 /// Bounded write-through LRU cache over this device's pages, shared by every
 /// clone of the device handle. The storage stack re-reads its hot B+tree and
 /// manifest pages on every traversal — measured at tens of megabytes of
@@ -245,7 +270,9 @@ impl PageCache {
                 state.entries.remove(&oldest);
             }
         }
-        state.entries.insert(page, PageCacheEntry { data: boxed, tick });
+        state
+            .entries
+            .insert(page, PageCacheEntry { data: boxed, tick });
     }
 
     fn invalidate(&self, first_page: u64, page_count: usize) {
@@ -253,6 +280,16 @@ impl PageCache {
         for page in first_page..first_page.saturating_add(page_count as u64) {
             state.entries.remove(&page);
         }
+    }
+
+    /// Drop every write-through observation before a cold media proof. A
+    /// successful device write may have populated this cache before its flush
+    /// or checkpoint publication later failed, so cached bytes are never
+    /// admissible evidence for physical postflight or ambiguous recovery.
+    fn clear(&self) {
+        let mut state = self.state.lock();
+        state.entries.clear();
+        state.tick = 0;
     }
 }
 
@@ -958,8 +995,7 @@ impl FileTreeBackend for KernelFileTreeBackend {
                         &chunks,
                     ))
                     .await;
-                let declined_clean =
-                    result.is_err() && !operation.store().needs_remount();
+                let declined_clean = result.is_err() && !operation.store().needs_remount();
                 if result.is_err() && !declined_clean {
                     // A failed staged batch leaves the store poisoned; only a
                     // new cold proof may re-establish the durable checkpoint.
@@ -980,7 +1016,8 @@ impl FileTreeBackend for KernelFileTreeBackend {
                             if let Ok(mut operation) = self.runtime.begin() {
                                 let _ = poll_as_system(operation.store().collect_garbage()).await;
                                 if let Ok(view) = poll_as_system(
-                                    operation.store().recover_persistent_authority(
+                                    recover_recognized_persistent_authority(
+                                        operation.store(),
                                         crate::durable_cspace::storage_v2_external_policy_sha256(),
                                     ),
                                 )
@@ -1044,10 +1081,14 @@ impl FileTreeBackend for KernelFileTreeBackend {
                 self.runtime.invalidate_recovery_cache();
             }
             let result = result.map_err(|error| match error {
-                ref detail if {
-                    crate::uart::_print(format_args!("  fs-commit error: {detail:?}\n"));
-                    false
-                } => unreachable!(),
+                ref detail
+                    if {
+                        crate::uart::_print(format_args!("  fs-commit error: {detail:?}\n"));
+                        false
+                    } =>
+                {
+                    unreachable!()
+                }
                 vibeos_file_store::PersistentCommitError::File(error) => error,
                 vibeos_file_store::PersistentCommitError::Publish(
                     vibeos_segment_store::FsRootPublishError::Conflict,
@@ -1366,7 +1407,22 @@ impl StorageV2Runtime {
         view
     }
 
+    /// Revoke facade provenance when an exclusive operation cannot be
+    /// acquired. This path may race the operation which made `begin` return
+    /// `Busy`, so it deliberately performs no page-cache, authority-view, or
+    /// rebuild mutation. Ordinary operations never set the proof bit back to
+    /// true; only a complete physical recovery can mint fresh provenance.
+    fn revoke_boot_proof_without_epoch(&self) {
+        self.authority_boot_proved.store(false, Ordering::Release);
+    }
+
     fn clear_recovery_cache(&self) {
+        // Callers which start a cold proof hold the exclusive V2/page-device
+        // operation before entering here and invoke this before `mount`.
+        // Ambiguous append failures also clear while retaining that same
+        // operation claim. This guarantees the next proof reads device media,
+        // not a write-through page which may never have become durable.
+        self.device.page_cache.clear();
         self.authority_boot_proved.store(false, Ordering::Release);
         *self.authority.lock() = None;
         *self.last_info.lock() = None;
@@ -1536,6 +1592,29 @@ impl StorageV2Runtime {
         principal: StoragePrincipal,
     ) -> Result<PersistentAuthorityAppendResult, V2RuntimeError> {
         let mut operation = self.begin()?;
+        let result = self
+            .append_persistent_authority_in_operation(
+                &mut operation,
+                expected_generation,
+                import,
+                principal,
+            )
+            .await;
+        operation.finish();
+        result
+    }
+
+    /// Append while the caller retains the exact V2/page-device epoch. The
+    /// policy-bound C7.4 facade uses this together with capacity preparation so
+    /// no intervening operation can replace the checked authority policy before
+    /// the durable snapshot write.
+    async fn append_persistent_authority_in_operation(
+        self: &Arc<Self>,
+        operation: &mut V2Operation,
+        expected_generation: u64,
+        import: PersistentAuthorityImport,
+        principal: StoragePrincipal,
+    ) -> Result<PersistentAuthorityAppendResult, V2RuntimeError> {
         let maintenance = self
             .maintenance
             .lock()
@@ -1569,7 +1648,6 @@ impl StorageV2Runtime {
             // probe may establish which atomic checkpoint became durable.
             self.invalidate_recovery_cache();
         }
-        operation.finish();
         result
     }
 
@@ -1602,9 +1680,7 @@ impl StorageV2Runtime {
                             V2RuntimeError::Unformatted
                         }
                         other => {
-                            crate::uart::_print(format_args!(
-                                "  cold mount failed: {other:?}\n"
-                            ));
+                            crate::uart::_print(format_args!("  cold mount failed: {other:?}\n"));
                             V2RuntimeError::Corrupt
                         }
                     })?;
@@ -1631,11 +1707,10 @@ impl StorageV2Runtime {
             // writers replenish capacity themselves (with hysteresis) on
             // their first commit instead.
             *self.last_info.lock() = Some(info);
-            let view = poll_as_system(
-                operation
-                    .store()
-                    .recover_persistent_authority(expected_policy_sha256),
-            )
+            let view = poll_as_system(recover_recognized_persistent_authority(
+                operation.store(),
+                expected_policy_sha256,
+            ))
             .await
             .map_err(|error| match error {
                 PersistentAuthorityError::NotInitialized => V2RuntimeError::AuthorityMissing,
@@ -1651,8 +1726,11 @@ impl StorageV2Runtime {
             // bindings name those exact logical bytes. Rebuild the import
             // under the same fixed-CSpace and saved-program policy used by
             // live M4 recovery, then prove every complete object identity.
-            let import = crate::durable_cspace::storage_v2_recovery_import(view.record_stream())
-                .map_err(|_| V2RuntimeError::Corrupt)?;
+            let import = crate::durable_cspace::storage_v2_recovery_import_for_policy(
+                view.record_stream(),
+                view.root_policy_sha256(),
+            )
+            .map_err(|_| V2RuntimeError::Corrupt)?;
             poll_as_system(
                 operation
                     .store()
@@ -1663,18 +1741,25 @@ impl StorageV2Runtime {
             // Boot-boundary compaction: no runtime capabilities exist yet, so
             // ungranted boot-local objects — which cold recovery deliberately
             // refuses to resolve — may be shed together with dead grant
-            // closures. A replacement is re-validated under the compiled
-            // policy and re-verified exactly like the recovered view; any
-            // failure past the replacement attempt fails the cold proof.
+            // closures. The import-owned compactor retains only any exact
+            // policy attachment already proved from the same preflight (C7.4
+            // operator evidence), never a generic orphan or kind lookup. A
+            // replacement is re-validated under the compiled policy and
+            // re-verified exactly like the recovered view; any failure past
+            // the replacement attempt fails the cold proof.
             let view = {
                 let record_count = view.record_stream().len() / LOGICAL_BLOCK_SIZE;
                 let compacted = if record_count >= STORAGE_V2_COMPACT_MIN_RECORDS {
                     decode_authority_records(view.record_stream())
                         .ok()
                         .and_then(|records| {
-                            crate::durable_cspace::storage_v2_compact_records(&records, true)
-                                .ok()
-                                .flatten()
+                            crate::durable_cspace::storage_v2_compact_records_for_policy(
+                                &records,
+                                true,
+                                view.root_policy_sha256(),
+                            )
+                            .ok()
+                            .flatten()
                         })
                 } else {
                     None
@@ -1683,8 +1768,11 @@ impl StorageV2Runtime {
                     None => view,
                     Some(compacted) => {
                         let import =
-                            crate::durable_cspace::storage_v2_migration_import(&compacted)
-                                .map_err(|_| V2RuntimeError::Corrupt)?;
+                            crate::durable_cspace::storage_v2_compaction_import_for_policy(
+                                &compacted,
+                                view.root_policy_sha256(),
+                            )
+                            .map_err(|_| V2RuntimeError::Corrupt)?;
                         let writer = operation
                             .store()
                             .derive_persistent_authority_writer(&maintenance)
@@ -1692,16 +1780,15 @@ impl StorageV2Runtime {
                         let generation = view.checkpoint_generation();
                         drop(view);
                         let replaced = poll_as_system(
-                            operation.store().replace_persistent_authority(
-                                &writer,
-                                generation,
-                                import,
-                            ),
+                            operation
+                                .store()
+                                .replace_persistent_authority(&writer, generation, import),
                         )
                         .await
                         .map_err(|_| V2RuntimeError::Corrupt)?;
-                        let verify = crate::durable_cspace::storage_v2_recovery_import(
+                        let verify = crate::durable_cspace::storage_v2_recovery_import_for_policy(
                             replaced.record_stream(),
+                            replaced.root_policy_sha256(),
                         )
                         .map_err(|_| V2RuntimeError::Corrupt)?;
                         poll_as_system(
@@ -1723,6 +1810,9 @@ impl StorageV2Runtime {
             // Scrub may therefore be newer than authority, never older.
             if scrub.status != ScrubStatus::Healthy
                 || scrub.checkpoint_generation < view.checkpoint_generation()
+                || !crate::durable_cspace::storage_v2_recovery_policy_is_recognized(
+                    view.root_policy_sha256(),
+                )
             {
                 return Err(V2RuntimeError::Corrupt);
             }
@@ -1750,6 +1840,94 @@ impl StorageV2Runtime {
                 // Invalidate while this operation still excludes every other
                 // hart. Releasing the claim first would permit a waiter to
                 // observe and append through the stale cached authority.
+                self.invalidate_recovery_cache();
+                operation.finish();
+                Err(error)
+            }
+        }
+    }
+
+    /// Re-mount physical media and independently rebuild the persistent
+    /// authority view for a publication postflight. Unlike ordinary facade
+    /// recovery, this never reuses the boot-proved in-memory view and never
+    /// performs boot-only compaction. Success replaces the runtime cache only
+    /// after exact external-policy binding verification and a complete scrub.
+    async fn readback_persistent_authority_from_media(
+        self: &Arc<Self>,
+        expected_policy_sha256: [u8; 32],
+    ) -> Result<Arc<PersistentAuthorityView>, V2RuntimeError> {
+        self.device.expose_preprovisioned_range();
+        let mut operation = self.begin()?;
+        self.clear_recovery_cache();
+        let recovered = async {
+            let info =
+                poll_as_system(operation.store().mount())
+                    .await
+                    .map_err(|error| match error {
+                        vibeos_segment_store::StoreError::Unformatted => {
+                            V2RuntimeError::Unformatted
+                        }
+                        _ => V2RuntimeError::Corrupt,
+                    })?;
+            self.install_maintenance_if_missing(&mut operation)?;
+            let maintenance = self
+                .maintenance
+                .lock()
+                .clone()
+                .ok_or(V2RuntimeError::Corrupt)?;
+            let durable_blocks = vibeos_segment_format::admitted_pages(info.admitted_segments)
+                .ok()
+                .and_then(|pages| pages.checked_mul(BLOCKS_PER_PAGE))
+                .ok_or(V2RuntimeError::Corrupt)?;
+            self.device.expose_block_count(durable_blocks);
+            *self.last_info.lock() = Some(info);
+
+            let view = poll_as_system(recover_recognized_persistent_authority(
+                operation.store(),
+                expected_policy_sha256,
+            ))
+            .await
+            .map_err(|error| match error {
+                PersistentAuthorityError::NotInitialized => V2RuntimeError::AuthorityMissing,
+                _ => V2RuntimeError::Corrupt,
+            })?;
+            let import = crate::durable_cspace::storage_v2_recovery_import_for_policy(
+                view.record_stream(),
+                view.root_policy_sha256(),
+            )
+            .map_err(|_| V2RuntimeError::Corrupt)?;
+            poll_as_system(
+                operation
+                    .store()
+                    .verify_persistent_authority_import(&view, &import),
+            )
+            .await
+            .map_err(|_| V2RuntimeError::Corrupt)?;
+            let scrub = poll_as_system(operation.store().scrub(&maintenance))
+                .await
+                .map_err(|_| V2RuntimeError::Corrupt)?;
+            if scrub.status != ScrubStatus::Healthy
+                || scrub.checkpoint_generation < view.checkpoint_generation()
+                || !crate::durable_cspace::storage_v2_recovery_policy_is_recognized(
+                    view.root_policy_sha256(),
+                )
+                || view.store_uuid() != STORAGE_V2_UUID
+                || BootStoreSelection::decode(self.boot_selection.load(Ordering::Acquire))
+                    != Some(BootStoreSelection::StorageV2)
+            {
+                return Err(V2RuntimeError::Corrupt);
+            }
+            Ok(view)
+        }
+        .await;
+        match recovered {
+            Ok(view) => {
+                let view = self.publish_authority(view);
+                self.authority_boot_proved.store(true, Ordering::Release);
+                operation.finish();
+                Ok(view)
+            }
+            Err(error) => {
                 self.invalidate_recovery_cache();
                 operation.finish();
                 Err(error)
@@ -1787,9 +1965,8 @@ impl StorageV2Runtime {
         self: &Arc<Self>,
         required_free: u64,
     ) -> Result<(), V2RuntimeError> {
-        let total_segments = (self.device.provisioned_page_count()
-            / vibeos_segment_format::SEGMENT_PAGES)
-            .max(1);
+        let total_segments =
+            (self.device.provisioned_page_count() / vibeos_segment_format::SEGMENT_PAGES).max(1);
         let sustainable = scaled_free_floor(total_segments)
             .saturating_add(scaled_growth_hysteresis(total_segments));
         self.ensure_foreground_capacity_for(required_free.min(sustainable))
@@ -1804,19 +1981,33 @@ impl StorageV2Runtime {
         self: &Arc<Self>,
         required_free: u64,
     ) -> Result<(), V2RuntimeError> {
-        let total_segments = (self.device.provisioned_page_count()
-            / vibeos_segment_format::SEGMENT_PAGES)
-            .max(1);
+        let mut operation = self.begin()?;
+        let result = self
+            .ensure_foreground_capacity_for_operation(&mut operation, required_free)
+            .await;
+        operation.finish();
+        result
+    }
+
+    /// Replenish capacity while retaining a caller-owned exclusive mutation
+    /// epoch. This is the only capacity path used by policy-bound authority
+    /// append, so the policy observation made before entry cannot race a
+    /// maintenance replacement on another task or hart.
+    async fn ensure_foreground_capacity_for_operation(
+        self: &Arc<Self>,
+        operation: &mut V2Operation,
+        required_free: u64,
+    ) -> Result<(), V2RuntimeError> {
+        let total_segments =
+            (self.device.provisioned_page_count() / vibeos_segment_format::SEGMENT_PAGES).max(1);
         let scaled_floor = scaled_free_floor(total_segments);
         let hysteresis = scaled_growth_hysteresis(total_segments);
         let floor = scaled_floor.max(required_free);
-        let mut operation = self.begin()?;
         let info = operation
             .store()
             .info()
             .map_err(|_| V2RuntimeError::Corrupt)?;
         if info.free_segments >= floor {
-            operation.finish();
             return Ok(());
         }
         let durable_blocks = vibeos_segment_format::admitted_pages(info.admitted_segments)
@@ -1872,15 +2063,14 @@ impl StorageV2Runtime {
             for _ in 0..8 {
                 #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
                 let io_before = crate::virtio_blk::telemetry();
-                let _telemetry =
-                    match poll_as_system(operation.store().collect_garbage()).await {
-                        Ok(telemetry) => telemetry,
-                        Err(_error) => {
-                            #[cfg(feature = "storage-bench")]
-                            crate::println!("  bench-detail gc error: {_error:?}");
-                            break;
-                        }
-                    };
+                let _telemetry = match poll_as_system(operation.store().collect_garbage()).await {
+                    Ok(telemetry) => telemetry,
+                    Err(_error) => {
+                        #[cfg(feature = "storage-bench")]
+                        crate::println!("  bench-detail gc error: {_error:?}");
+                        break;
+                    }
+                };
                 collected = true;
                 let Ok(current) = operation.store().info() else {
                     break;
@@ -1929,7 +2119,8 @@ impl StorageV2Runtime {
                 // Collection preserves the logical stream but advances the
                 // checkpoint generation; refresh the published authority view
                 // so the next append's generation witness is current.
-                if let Ok(view) = poll_as_system(operation.store().recover_persistent_authority(
+                if let Ok(view) = poll_as_system(recover_recognized_persistent_authority(
+                    operation.store(),
                     crate::durable_cspace::storage_v2_external_policy_sha256(),
                 ))
                 .await
@@ -1938,7 +2129,6 @@ impl StorageV2Runtime {
                 }
             }
         }
-        operation.finish();
         Ok(())
     }
 
@@ -1962,19 +2152,26 @@ impl StorageV2Runtime {
         if watermark != 0 && record_count < watermark.saturating_add(watermark / 4) {
             return Ok(None);
         }
-        self.compact_watermark.store(record_count, Ordering::Release);
+        self.compact_watermark
+            .store(record_count, Ordering::Release);
         // Evaluation failures (nothing worth compacting, policy re-validation
         // declined) leave the appended state authoritative. Only an actual
         // replacement attempt with an unknown durable outcome fails closed.
         let Ok(records) = decode_authority_records(view.record_stream()) else {
             return Ok(None);
         };
-        let compacted = match crate::durable_cspace::storage_v2_compact_records(&records, false)
-        {
+        let compacted = match crate::durable_cspace::storage_v2_compact_records_for_policy(
+            &records,
+            false,
+            view.root_policy_sha256(),
+        ) {
             Ok(Some(compacted)) => compacted,
             _ => return Ok(None),
         };
-        let Ok(import) = crate::durable_cspace::storage_v2_migration_import(&compacted) else {
+        let Ok(import) = crate::durable_cspace::storage_v2_compaction_import_for_policy(
+            &compacted,
+            view.root_policy_sha256(),
+        ) else {
             return Ok(None);
         };
         let mut expected = Vec::new();
@@ -2025,8 +2222,10 @@ impl StorageV2Runtime {
             .await
             .map(|_| ())
             .map_err(|error| {
-                crate::uart::_print(format_args!("  storage v2: re-proof failed: {error:?}
-"));
+                crate::uart::_print(format_args!(
+                    "  storage v2: re-proof failed: {error:?}
+"
+                ));
                 FileError::ServiceUnavailable
             })
     }
@@ -3466,7 +3665,7 @@ fn cache_metadata_matches_boot_proof(
 ) -> bool {
     selection == Some(BootStoreSelection::StorageV2)
         && proved
-        && policy_sha256 == crate::durable_cspace::storage_v2_external_policy_sha256()
+        && crate::durable_cspace::storage_v2_recovery_policy_is_recognized(policy_sha256)
         && store_uuid == STORAGE_V2_UUID
 }
 
@@ -3482,14 +3681,19 @@ fn recovered_v2_snapshot(
     hot_reads: &HotReadCache,
 ) -> Result<vibeos_object_store::StorageV2AuthoritySnapshot, vibeos_object_store::StoreError> {
     let authority_generation = view.checkpoint_generation();
-    recovered_v2_snapshot_with(view.record_stream(), hot_reads, |object| {
-        view.object_for_recovered(object)
-            .map(|handle| StorageV2ReadToken::Persistent {
-                handle: handle.clone(),
-                authority_generation,
-                cached: None,
-            })
-    })
+    recovered_v2_snapshot_with(
+        view.record_stream(),
+        view.root_policy_sha256(),
+        hot_reads,
+        |object| {
+            view.object_for_recovered(object)
+                .map(|handle| StorageV2ReadToken::Persistent {
+                    handle: handle.clone(),
+                    authority_generation,
+                    cached: None,
+                })
+        },
+    )
 }
 
 fn appended_v2_snapshot(
@@ -3498,24 +3702,29 @@ fn appended_v2_snapshot(
     hot_reads: &HotReadCache,
 ) -> Result<vibeos_object_store::StorageV2AuthoritySnapshot, vibeos_object_store::StoreError> {
     let authority_generation = view.checkpoint_generation();
-    recovered_v2_snapshot_with(view.record_stream(), hot_reads, |object| {
-        if let Some(handle) = view.object_for_recovered(object) {
-            Some(StorageV2ReadToken::Persistent {
-                handle: handle.clone(),
-                authority_generation,
-                cached: None,
-            })
-        } else if transient.object_for_recovered(object).is_some() {
-            Some(StorageV2ReadToken::Transient {
-                witness: transient.clone(),
-                recovered: system_arc(object.clone()),
-                authority_generation,
-                cached: None,
-            })
-        } else {
-            None
-        }
-    })
+    recovered_v2_snapshot_with(
+        view.record_stream(),
+        view.root_policy_sha256(),
+        hot_reads,
+        |object| {
+            if let Some(handle) = view.object_for_recovered(object) {
+                Some(StorageV2ReadToken::Persistent {
+                    handle: handle.clone(),
+                    authority_generation,
+                    cached: None,
+                })
+            } else if transient.object_for_recovered(object).is_some() {
+                Some(StorageV2ReadToken::Transient {
+                    witness: transient.clone(),
+                    recovered: system_arc(object.clone()),
+                    authority_generation,
+                    cached: None,
+                })
+            } else {
+                None
+            }
+        },
+    )
 }
 
 #[derive(Clone)]
@@ -3587,19 +3796,50 @@ fn decode_authority_records(
     Ok(records)
 }
 
+fn authority_stream_checkpoint(
+    record_stream: &[u8],
+) -> Result<vibeos_durable_format::ChainCheckpoint, vibeos_object_store::StoreError> {
+    if record_stream.is_empty() || !record_stream.len().is_multiple_of(LOGICAL_BLOCK_SIZE) {
+        return Err(vibeos_object_store::StoreError::Corrupt);
+    }
+    let last: &[u8; LOGICAL_BLOCK_SIZE] = record_stream
+        .last_chunk()
+        .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+    let decoded = match vibeos_durable_format::LogRecord::decode(last) {
+        Ok(vibeos_durable_format::DecodeStatus::Valid(decoded)) => decoded,
+        _ => return Err(vibeos_object_store::StoreError::Corrupt),
+    };
+    Ok(vibeos_durable_format::ChainCheckpoint {
+        next_sequence: decoded
+            .record
+            .sequence
+            .checked_add(1)
+            .ok_or(vibeos_object_store::StoreError::Corrupt)?,
+        previous_sequence: decoded.record.sequence,
+        previous_crc32c: decoded.crc32c,
+    })
+}
+
 fn recovered_v2_snapshot_with(
     record_stream: &[u8],
+    external_root_policy_sha256: [u8; 32],
     hot_reads: &HotReadCache,
     resolve: impl Fn(&vibeos_durable_format::RecoveredObject) -> Option<StorageV2ReadToken>,
 ) -> Result<vibeos_object_store::StorageV2AuthoritySnapshot, vibeos_object_store::StoreError> {
     let mut system = heap::enter_owner(OwnerId::SYSTEM);
-    let result = build_recovered_v2_snapshot(record_stream, hot_reads, resolve);
+    let result = build_recovered_v2_snapshot(
+        record_stream,
+        external_root_policy_sha256,
+        hot_reads,
+        resolve,
+    );
     system.restore();
     result
 }
 
 fn build_recovered_v2_snapshot(
     record_stream: &[u8],
+    external_root_policy_sha256: [u8; 32],
     hot_reads: &HotReadCache,
     resolve: impl Fn(&vibeos_durable_format::RecoveredObject) -> Option<StorageV2ReadToken>,
 ) -> Result<vibeos_object_store::StorageV2AuthoritySnapshot, vibeos_object_store::StoreError> {
@@ -3622,7 +3862,12 @@ fn build_recovered_v2_snapshot(
             ));
         }
     }
-    vibeos_object_store::StorageV2AuthoritySnapshot::new(records.len(), preflight, objects)
+    vibeos_object_store::StorageV2AuthoritySnapshot::new(
+        records.len(),
+        preflight,
+        external_root_policy_sha256,
+        objects,
+    )
 }
 
 impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
@@ -3679,6 +3924,39 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
         })
     }
 
+    fn readback_authority(
+        &self,
+    ) -> vibeos_object_store::StorageV2Future<'_, vibeos_object_store::StorageV2AuthoritySnapshot>
+    {
+        Box::pin(async move {
+            let runtime = INSTALLED_V2_RUNTIME
+                .lock()
+                .as_ref()
+                .filter(|runtime| core::ptr::eq(runtime.as_ref(), self))
+                .cloned()
+                .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            // A media postflight may only begin from the same selected,
+            // boot-proved authority which minted the facade provenance. The
+            // digest is comparison evidence, not a component-policy claim.
+            let proved = runtime
+                .boot_proved_authority()
+                .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            let expected_policy_sha256 = proved.root_policy_sha256();
+            drop(proved);
+            let view = runtime
+                .readback_persistent_authority_from_media(expected_policy_sha256)
+                .await
+                .map_err(map_facade_error)?;
+            match recovered_v2_snapshot(&view, &runtime.hot_reads) {
+                Ok(snapshot) => Ok(snapshot),
+                Err(error) => {
+                    runtime.invalidate_recovery_cache();
+                    Err(error)
+                }
+            }
+        })
+    }
+
     fn append_authority<'a>(
         &'a self,
         expected: vibeos_durable_format::ChainCheckpoint,
@@ -3686,6 +3964,151 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
     ) -> vibeos_object_store::StorageV2Future<'a, vibeos_object_store::StorageV2AuthoritySnapshot>
     {
         self.append_authority_with_payload(expected, records, None)
+    }
+
+    fn append_authority_bound_to_policy<'a>(
+        &'a self,
+        expected: vibeos_durable_format::ChainCheckpoint,
+        expected_external_root_policy_sha256: [u8; 32],
+        records: &'a [[u8; LOGICAL_BLOCK_SIZE]],
+    ) -> vibeos_object_store::StorageV2Future<'a, vibeos_object_store::StorageV2AuthoritySnapshot>
+    {
+        Box::pin(async move {
+            let runtime = INSTALLED_V2_RUNTIME
+                .lock()
+                .as_ref()
+                .filter(|runtime| core::ptr::eq(runtime.as_ref(), self))
+                .cloned()
+                .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            let mut operation = match runtime.begin() {
+                Ok(operation) => operation,
+                Err(error) => {
+                    // Consuming the linear facade must not leave mintable
+                    // predecessor proof even when the exclusive epoch cannot
+                    // be acquired. A concurrently completing cold proof may
+                    // establish a genuinely fresh replacement; ordinary
+                    // operations cannot restore the revoked boot-proof bit.
+                    // This branch owns no mutation epoch, so it must not touch
+                    // the page cache or any other recovery state.
+                    runtime.revoke_boot_proof_without_epoch();
+                    return Err(map_facade_error(error));
+                }
+            };
+            let result = async {
+                // The caller cannot reflect a legacy or unknown digest into the
+                // guard. This exact constant is independently frozen in kernel
+                // policy, while object-store carries only its comparison digest.
+                if expected_external_root_policy_sha256
+                    != crate::durable_cspace::storage_v2_component_external_policy_sha256()
+                    || BootStoreSelection::decode(runtime.boot_selection.load(Ordering::Acquire))
+                        != Some(BootStoreSelection::StorageV2)
+                {
+                    return Err(vibeos_object_store::StoreError::Corrupt);
+                }
+                let predecessor = runtime
+                    .boot_proved_authority()
+                    .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+                if predecessor.root_policy_sha256() != expected_external_root_policy_sha256 {
+                    return Err(vibeos_object_store::StoreError::Corrupt);
+                }
+                if authority_stream_checkpoint(predecessor.record_stream())? != expected {
+                    return Err(vibeos_object_store::StoreError::JournalChanged);
+                }
+                drop(predecessor);
+
+                // Capacity preparation and the authority append intentionally
+                // retain this same ActiveV2Operation. No maintenance writer can
+                // replace the policy between the comparison above and either
+                // class of physical mutation.
+                runtime
+                    .ensure_foreground_capacity_for_operation(
+                        &mut operation,
+                        STORAGE_V2_FOREGROUND_FREE_SEGMENTS,
+                    )
+                    .await
+                    .map_err(map_facade_error)?;
+                let current = runtime
+                    .boot_proved_authority()
+                    .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+                if current.root_policy_sha256() != expected_external_root_policy_sha256 {
+                    return Err(vibeos_object_store::StoreError::Corrupt);
+                }
+                if authority_stream_checkpoint(current.record_stream())? != expected {
+                    return Err(vibeos_object_store::StoreError::JournalChanged);
+                }
+
+                let mut stream_records = Vec::new();
+                stream_records
+                    .try_reserve_exact(
+                        current.record_stream().len() / LOGICAL_BLOCK_SIZE + records.len(),
+                    )
+                    .map_err(|_| vibeos_object_store::StoreError::InsufficientMemory)?;
+                for bytes in current.record_stream().chunks_exact(LOGICAL_BLOCK_SIZE) {
+                    stream_records.push(
+                        bytes
+                            .try_into()
+                            .map_err(|_| vibeos_object_store::StoreError::Corrupt)?,
+                    );
+                }
+                stream_records.extend_from_slice(records);
+                let cached_preflight = runtime.preflight_cache.lock().take();
+                let (import, preflight_cache) =
+                    crate::durable_cspace::storage_v2_migration_import_incremental_for_policy(
+                        &stream_records,
+                        records.len(),
+                        expected,
+                        cached_preflight,
+                        expected_external_root_policy_sha256,
+                    )
+                    .map_err(|_| vibeos_object_store::StoreError::Corrupt)?;
+                drop(stream_records);
+                let principal = current
+                    .principals()
+                    .first()
+                    .filter(|_| current.principals().len() == 1)
+                    .cloned()
+                    .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+                let appended = runtime
+                    .append_persistent_authority_in_operation(
+                        &mut operation,
+                        current.checkpoint_generation(),
+                        import,
+                        principal,
+                    )
+                    .await
+                    .map_err(map_facade_error)?;
+                let (view, transient) = appended.into_parts();
+                if view.root_policy_sha256() != expected_external_root_policy_sha256 {
+                    return Err(vibeos_object_store::StoreError::Corrupt);
+                }
+                let transient = system_arc(transient);
+                let snapshot = match appended_v2_snapshot(&view, transient, &runtime.hot_reads) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        runtime.invalidate_recovery_cache();
+                        return Err(error);
+                    }
+                };
+                *runtime.preflight_cache.lock() = Some(preflight_cache);
+                runtime.publish_authority(view);
+                // C7.4 is one initial installation. Avoid a second, separately
+                // guarded compaction write after this exact policy-bound epoch;
+                // boot-boundary compaction remains available on the next cold
+                // proof if the general threshold is ever reached.
+                Ok(snapshot)
+            }
+            .await;
+            if result.is_err() {
+                // The sealed transition is linear across every failure, even
+                // one proved before the first write. Revoke the cached boot
+                // proof while this exact V2/page-device epoch is still held,
+                // so another facade recovery cannot mint replacement
+                // provenance without a fresh cold media proof.
+                runtime.invalidate_recovery_cache();
+            }
+            operation.finish();
+            result
+        })
     }
 
     fn append_authority_with_payload<'a>(
@@ -3768,11 +4191,12 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             let phase_preflight = crate::sbi::time();
             let cached_preflight = self.preflight_cache.lock().take();
             let (mut import, preflight_cache) =
-                crate::durable_cspace::storage_v2_migration_import_incremental(
+                crate::durable_cspace::storage_v2_migration_import_incremental_for_policy(
                     &stream_records,
                     records.len(),
                     expected,
                     cached_preflight,
+                    current.root_policy_sha256(),
                 )
                 .map_err(|_error| {
                     #[cfg(feature = "storage-bench")]
@@ -3841,14 +4265,14 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                 Some(replacement) => replacement,
                 None => &view,
             };
-            let snapshot =
-                match appended_v2_snapshot(snapshot_view, transient, &runtime.hot_reads) {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        runtime.invalidate_recovery_cache();
-                        return Err(error);
-                    }
-                };
+            let snapshot = match appended_v2_snapshot(snapshot_view, transient, &runtime.hot_reads)
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    runtime.invalidate_recovery_cache();
+                    return Err(error);
+                }
+            };
             if compacted_view.is_none() {
                 runtime.publish_authority(view);
             }
@@ -3984,9 +4408,15 @@ impl PageDevice for CapabilityPageDevice {
             .map_err(PageIoError::Block)?
             .session();
         self.require_session(session)?;
-        block_device::read_blocks_with_session(&lease, session, first, BLOCKS_PER_PAGE as u32, output)
-            .await
-            .map_err(PageIoError::Block)?;
+        block_device::read_blocks_with_session(
+            &lease,
+            session,
+            first,
+            BLOCKS_PER_PAGE as u32,
+            output,
+        )
+        .await
+        .map_err(PageIoError::Block)?;
         self.page_cache.insert(page, output);
         Ok(())
     }
@@ -4032,10 +4462,14 @@ impl PageDevice for CapabilityPageDevice {
         if output.is_empty() {
             return Ok(());
         }
-        let all_cached = output.iter_mut().enumerate().all(|(index, page)| {
-            self.page_cache.get(first_page + index as u64, page)
-        });
-        page_cache_account(output.len() as u64, if all_cached { output.len() as u64 } else { 0 });
+        let all_cached = output
+            .iter_mut()
+            .enumerate()
+            .all(|(index, page)| self.page_cache.get(first_page + index as u64, page));
+        page_cache_account(
+            output.len() as u64,
+            if all_cached { output.len() as u64 } else { 0 },
+        );
         if all_cached {
             return Ok(());
         }

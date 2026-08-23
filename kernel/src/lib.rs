@@ -110,6 +110,32 @@ compile_error!(
     "feature `wasm-c73-authenticated-admission-acceptance` requires the QEMU default image"
 );
 #[cfg(all(
+    feature = "wasm-c74-crash-safe-publication-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!(
+    "feature `wasm-c74-crash-safe-publication-acceptance` requires the QEMU default image"
+);
+#[cfg(all(
+    feature = "wasm-c74-crash-safe-publication-acceptance",
+    any(
+        feature = "legacy-shell",
+        feature = "component-graph-principals",
+        feature = "ssh-component-command",
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c73-authenticated-admission-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c74-crash-safe-publication-acceptance` is isolated from live guest, command, and older WASM acceptance roots"
+);
+#[cfg(all(
     feature = "wasm-c73-authenticated-admission-acceptance",
     any(
         feature = "legacy-shell",
@@ -297,6 +323,10 @@ mod cap_table_pool;
 mod code_pool;
 #[cfg(feature = "wasm-c73-authenticated-admission-acceptance")]
 mod component_authenticated_admission;
+#[cfg(feature = "component-durable-publication")]
+mod component_durable_publication;
+#[cfg(feature = "wasm-c74-crash-safe-publication-acceptance")]
+mod component_crash_safe_publication;
 #[cfg(feature = "wasm-c67-information-flow-acceptance")]
 mod component_graph_information_flow;
 #[cfg(feature = "component-graph-principals")]
@@ -841,6 +871,21 @@ pub extern "C" fn kmain() -> ! {
             sbi::shutdown(true);
         }
     });
+    #[cfg(feature = "wasm-c74-crash-safe-publication-acceptance")]
+    let c74_authority_journal = if online_hart_count() == 4 {
+        world.c74_component_authority_journal()
+    } else {
+        None
+    };
+    #[cfg(feature = "wasm-c74-crash-safe-publication-acceptance")]
+    exec::spawn("wasm-c74-crash-safe-publication-acceptance", async move {
+        if component_crash_safe_publication::run_qemu_acceptance(c74_authority_journal).await {
+            crate::println!("\nWASM_C74_CRASH_SAFE_PUBLICATION PASS evidence_committed=1 artifact_committed=1 root_committed=1 command_published=1 early_publications=0 durable_read=1 durable_grant=0 durable_invoke=0 component_tasks=0 runtime_ready=0 guest_calls=0 raw_ids=0 storage_v2_only=1 policy_v2=1 physical_readback=1");
+        } else {
+            crate::println!("WASM_C74_CRASH_SAFE_PUBLICATION FAIL");
+            sbi::shutdown(true);
+        }
+    });
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
     exec::spawn(
         "wasm-c54-native-revoke-worker",
@@ -871,7 +916,8 @@ pub extern "C" fn kmain() -> ! {
     );
     #[cfg(not(any(
         feature = "legacy-shell",
-        feature = "wasm-c67-information-flow-acceptance"
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c74-crash-safe-publication-acceptance"
     )))]
     {
         let space = world.spaces["vsh"].clone();

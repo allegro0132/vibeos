@@ -1313,6 +1313,72 @@ impl RecoveryPreflight {
         &self,
         drop_ungranted_objects: bool,
     ) -> Result<Vec<[u8; RECORD_SIZE]>, RecoveryError> {
+        self.compact_inner(drop_ungranted_objects, &BTreeSet::new())
+    }
+
+    /// Compact at a boot boundary while retaining only caller-proved exact
+    /// ungranted attachments in addition to objects reachable from retained
+    /// grants.
+    ///
+    /// Each attachment is a complete comparison witness from this preflight,
+    /// not an object-ID lookup request. The slice must be strictly ordered by
+    /// ObjectId; every value must equal the unique recovered object, be inline,
+    /// and have no historical grant reference (including tombstoned grants).
+    /// This keeps detached policy evidence without preserving unrelated
+    /// orphan objects.
+    pub fn compact_with_exact_ungranted(
+        &self,
+        exact_ungranted: &[RecoveredObject],
+    ) -> Result<Vec<[u8; RECORD_SIZE]>, RecoveryError> {
+        for attachment in exact_ungranted {
+            if attachment.is_external()
+                || attachment.byte_len() != attachment.bytes.len() as u64
+                || self
+                    .committed
+                    .iter()
+                    .any(|grant| grant.grant.object_id == attachment.object_id)
+            {
+                return Err(RecoveryError::CompactionMismatch);
+            }
+        }
+        self.compact_with_exact_policy_objects(exact_ungranted)
+    }
+
+    /// Boot-boundary compaction retaining an exact set of externally selected
+    /// policy objects. Every full record must occur uniquely in this same
+    /// preflight and the slice must be strictly ordered. Object identities are
+    /// comparison evidence only; the caller remains responsible for proving
+    /// the policy association (for example root-relative operator evidence or
+    /// the explicitly allowlisted SSH singleton).
+    pub fn compact_with_exact_policy_objects(
+        &self,
+        exact_objects: &[RecoveredObject],
+    ) -> Result<Vec<[u8; RECORD_SIZE]>, RecoveryError> {
+        let mut retained = BTreeSet::new();
+        let mut previous = None;
+        for object in exact_objects {
+            if previous.is_some_and(|id| id >= object.object_id)
+                || self
+                    .objects
+                    .iter()
+                    .filter(|candidate| candidate.object_id == object.object_id)
+                    .count()
+                    != 1
+                || !self.objects.iter().any(|candidate| candidate == object)
+                || !retained.insert(object.object_id)
+            {
+                return Err(RecoveryError::CompactionMismatch);
+            }
+            previous = Some(object.object_id);
+        }
+        self.compact_inner(true, &retained)
+    }
+
+    fn compact_inner(
+        &self,
+        drop_ungranted_objects: bool,
+        exact_ungranted: &BTreeSet<ObjectId>,
+    ) -> Result<Vec<[u8; RECORD_SIZE]>, RecoveryError> {
         // 1. Retained derivations: every live grant, plus each slot's
         // highest-generation holder (alive or dead), plus ancestor closure.
         let mut retained: BTreeSet<DerivationId> = BTreeSet::new();
@@ -1365,6 +1431,8 @@ impl RecoveryPreflight {
                     retained_objects.insert(object.object_id);
                 }
             }
+        } else {
+            retained_objects.extend(exact_ungranted.iter().copied());
         }
 
         // 3. Merge retained events in original sequence order so every

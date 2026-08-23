@@ -471,7 +471,10 @@ impl<D: PageDevice> SegmentStore<D> {
     /// Newly committed objects which are not yet admitted by a live grant or
     /// sealed-singleton policy remain boot-local: only this return value can
     /// resolve them. A later grant append reimports the logical bytes and then
-    /// installs a durable binding in the recovered authority view.
+    /// installs a durable binding in the recovered authority view. Exact
+    /// checkpoint-only policy attachments are the deliberate exception: they
+    /// remain in the logical stream but never enter either the boot-local
+    /// transient resolver or the durable binding table.
     pub async fn append_persistent_authority(
         &mut self,
         writer: &PersistentAuthorityWriter,
@@ -536,7 +539,16 @@ impl<D: PageDevice> SegmentStore<D> {
             .filter(|object| !old_object_ids.contains(&object.object_id.get()))
             .map(|object| object.object_id.get())
             .collect();
-        let transient_ids: BTreeSet<u128> = new_object_ids
+        // Exact policy attachments are logical checkpoint records only. Do
+        // not classify them as ordinary ungranted append outputs: doing so
+        // would mint a boot-local resolver witness even though no durable
+        // binding is installed.
+        let materializable_new_object_ids: BTreeSet<u128> = new_object_ids
+            .iter()
+            .copied()
+            .filter(|object_id| !update.is_retained_only(*object_id))
+            .collect();
+        let transient_ids: BTreeSet<u128> = materializable_new_object_ids
             .iter()
             .copied()
             .filter(|object_id| !update.is_admitted(*object_id))
@@ -554,12 +566,12 @@ impl<D: PageDevice> SegmentStore<D> {
             });
         let retry_update = relief_plausible.then(|| update.clone());
         let retry_transient_ids = transient_ids.clone();
-        let retry_new_object_ids = new_object_ids.clone();
+        let retry_new_object_ids = materializable_new_object_ids.clone();
         let (view, transient_objects) = match self
             .install_persistent_import(
                 update,
                 transient_ids,
-                new_object_ids,
+                materializable_new_object_ids,
                 lease,
                 Some(principal),
             )
@@ -748,12 +760,40 @@ impl<D: PageDevice> SegmentStore<D> {
         &self,
         expected_policy_sha256: [u8; 32],
     ) -> Result<PersistentAuthorityView, PersistentAuthorityError<D::Error>> {
+        self.recover_persistent_authority_recognized(core::slice::from_ref(
+            &expected_policy_sha256,
+        ))
+        .await
+    }
+
+    /// Recover only when the on-media commitment is exactly one member of a
+    /// caller-supplied, finite recognized-policy set. The snapshot chooses its
+    /// own already-committed semantics; this API never retries under or
+    /// re-labels it as another policy. Duplicate recognized commitments are
+    /// rejected to keep policy selection canonical.
+    pub async fn recover_persistent_authority_recognized(
+        &self,
+        recognized_policy_sha256: &[[u8; 32]],
+    ) -> Result<PersistentAuthorityView, PersistentAuthorityError<D::Error>> {
         let state = self.require_current_generation()?;
         let snapshot = state
             .persistent_authority
             .clone()
             .ok_or(PersistentAuthorityError::NotInitialized)?;
-        if snapshot.root_policy_sha256() != expected_policy_sha256 {
+        let observed = snapshot.root_policy_sha256();
+        if recognized_policy_sha256.is_empty()
+            || recognized_policy_sha256
+                .iter()
+                .filter(|candidate| **candidate == observed)
+                .count()
+                != 1
+            || recognized_policy_sha256
+                .iter()
+                .enumerate()
+                .any(|(index, candidate)| {
+                    recognized_policy_sha256[..index].contains(candidate)
+                })
+        {
             return Err(PersistentAuthorityError::PolicyMismatch);
         }
         self.build_persistent_view(state, snapshot, true).await
@@ -945,6 +985,13 @@ impl<D: PageDevice> SegmentStore<D> {
         (PersistentAuthorityView, Vec<PersistentObjectHandle>),
         PersistentAuthorityError<D::Error>,
     > {
+        if transient_ids
+            .iter()
+            .chain(charged_ids.iter())
+            .any(|stable_id| import.is_retained_only(*stable_id))
+        {
+            return Err(PersistentAuthorityError::PolicyMismatch);
+        }
         validate_quota_totals(&import, None)?;
         // Content for external objects committed by this exact append. A
         // re-install (cold recovery, migration replace, compaction) carries
@@ -977,6 +1024,12 @@ impl<D: PageDevice> SegmentStore<D> {
             .as_ref()
             .filter(|snapshot| import.record_stream.starts_with(snapshot.record_stream()))
             .map_or_else(Vec::new, |snapshot| snapshot.objects.clone());
+        if reusable_bindings
+            .iter()
+            .any(|binding| import.is_retained_only(binding.stable_object_id))
+        {
+            return Err(PersistentAuthorityError::PolicyMismatch);
+        }
         let external_roots = self
             .require_current_generation()?
             .persistent_authority
@@ -1085,6 +1138,9 @@ impl<D: PageDevice> SegmentStore<D> {
         let mut next_claims: alloc::collections::BTreeMap<u128, u128> =
             alloc::collections::BTreeMap::new();
         for recovered in &import.recovered.objects {
+            if import.is_retained_only(recovered.object_id.get()) {
+                continue;
+            }
             if reusable_bindings
                 .binary_search_by_key(&recovered.object_id.get(), |binding| {
                     binding.stable_object_id

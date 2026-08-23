@@ -37,9 +37,9 @@ pub const MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN: usize = 16_384 * 4096;
 /// Upper bound on the number of logical M4 records an authority snapshot can
 /// carry. The kernel's Storage V2 record-stream admission check uses this
 /// instead of the M4 journal's physical sector count.
-pub const MAX_PERSISTENT_AUTHORITY_RECORDS: usize =
-    (MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN - PERSISTENT_AUTHORITY_HEADER_LEN)
-        / vibeos_durable_format::RECORD_SIZE;
+pub const MAX_PERSISTENT_AUTHORITY_RECORDS: usize = (MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN
+    - PERSISTENT_AUTHORITY_HEADER_LEN)
+    / vibeos_durable_format::RECORD_SIZE;
 pub const MAX_STABLE_PRINCIPALS: usize = 256;
 pub const LEGACY_SYSTEM_PRINCIPAL: StablePrincipalId = StablePrincipalId(*b"VIBE-M4-SYSTEM!!");
 
@@ -80,17 +80,44 @@ pub struct PersistentPrincipalPolicy {
 /// caller's exact external root policy.  The recovered object identities and
 /// bytes stay private; only [`crate::SegmentStore::import_persistent_authority`]
 /// can bind them to fresh opaque V2 handles.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PersistentAuthorityImport {
     pub(crate) root_policy_sha256: [u8; 32],
     pub(crate) record_stream: Vec<u8>,
     pub(crate) recovered: RecoveredStore,
+    /// Objects which may receive a durable V2 binding and therefore be
+    /// resolved through a recovered authority view.
     admitted_object_ids: BTreeSet<u128>,
+    /// Exact inline policy evidence retained only in the logical checkpoint
+    /// stream. These identities are deliberately disjoint from
+    /// `admitted_object_ids`: no CAS binding, resolver entry, quota charge, or
+    /// persistent object handle may be derived from them.
+    retained_only_object_ids: BTreeSet<u128>,
     pub(crate) principals: Vec<PersistentPrincipalPolicy>,
     /// Content for external objects committed by this exact append, keyed by
     /// stable object id. Never populated by recovery: a re-install binds
     /// external objects to their already-durable blobs instead.
     pub(crate) external_payloads: BTreeMap<u128, Vec<u8>>,
+}
+
+impl fmt::Debug for PersistentAuthorityImport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistentAuthorityImport")
+            .field("root_policy_sha256", &self.root_policy_sha256)
+            .field("record_bytes", &self.record_stream.len())
+            .field(
+                "materializable_object_count",
+                &self.admitted_object_ids.len(),
+            )
+            .field(
+                "retained_only_object_count",
+                &self.retained_only_object_ids.len(),
+            )
+            .field("principal_count", &self.principals.len())
+            .field("external_payload_count", &self.external_payloads.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl PersistentAuthorityImport {
@@ -130,14 +157,16 @@ impl PersistentAuthorityImport {
             store_id,
             exact_roots,
             sealed_singleton_kinds,
+            &[],
             canonical_external_root_policy,
             principals,
             None,
         )
     }
 
-    /// Variant reusing an already-computed preflight of the exact same
-    /// `sectors`/`store_id`, avoiding one full stream re-validation.
+    /// Compatibility variant accepting an already-computed preflight hint.
+    /// The hint is never trusted as provenance: this constructor independently
+    /// recovers the exact `sectors`/`store_id` which will enter the checkpoint.
     pub fn from_m4_with_sealed_singletons_preflighted(
         sectors: &[[u8; RECORD_SIZE]],
         store_id: StoreId,
@@ -145,13 +174,63 @@ impl PersistentAuthorityImport {
         sealed_singleton_kinds: &[vibeos_durable_format::ObjectKind],
         canonical_external_root_policy: &[u8],
         principals: Vec<PersistentPrincipalPolicy>,
-        preflight: vibeos_durable_format::RecoveryPreflight,
+        _preflight: vibeos_durable_format::RecoveryPreflight,
     ) -> Result<Self, AuthoritySnapshotError> {
+        // `RecoveryPreflight` is a freely constructible public value and does
+        // not carry an unforgeable association with `sectors`. Recompute from
+        // the bytes which will actually enter the checkpoint before taking the
+        // dense-stream fast path below. The caller value remains accepted only
+        // for API compatibility; it is never provenance.
+        let preflight = preflight_recovery(sectors, store_id)
+            .map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?;
         Self::from_m4_with_sealed_singletons_inner(
             sectors,
             store_id,
             exact_roots,
             sealed_singleton_kinds,
+            &[],
+            canonical_external_root_policy,
+            principals,
+            Some(preflight),
+        )
+    }
+
+    /// Variant which durably retains validator-selected, exact inline
+    /// attachments in addition to granted objects and sealed singletons.
+    ///
+    /// Attachments are comparison witnesses from the same already-computed
+    /// preflight, not stable-ID lookup requests. Each supplied record must be
+    /// byte-for-byte equal to the unique recovered record, must be inline,
+    /// must not be named by any grant, and the slice must be strictly ordered
+    /// by `ObjectId`. This is the narrow bridge used for root-relative
+    /// evidence: policy code first proves the association, then Storage V2
+    /// retains exactly that proof input without scanning by `ObjectKind`.
+    /// Retention is checkpoint-only: attachments never enter the
+    /// materializable binding set and cannot produce a persistent object
+    /// handle.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_m4_with_exact_inline_attachments_preflighted(
+        sectors: &[[u8; RECORD_SIZE]],
+        store_id: StoreId,
+        exact_roots: &[RootPolicy],
+        sealed_singleton_kinds: &[vibeos_durable_format::ObjectKind],
+        exact_inline_attachments: &[vibeos_durable_format::RecoveredObject],
+        canonical_external_root_policy: &[u8],
+        principals: Vec<PersistentPrincipalPolicy>,
+        _preflight: vibeos_durable_format::RecoveryPreflight,
+    ) -> Result<Self, AuthoritySnapshotError> {
+        // Exact attachments must be compared with a recovery derived from the
+        // same bytes which will be committed. Trusting an independently
+        // supplied preflight here could pair one stream's retained-only set,
+        // bindings, and quota accounting with another same-length stream.
+        let preflight = preflight_recovery(sectors, store_id)
+            .map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?;
+        Self::from_m4_with_sealed_singletons_inner(
+            sectors,
+            store_id,
+            exact_roots,
+            sealed_singleton_kinds,
+            exact_inline_attachments,
             canonical_external_root_policy,
             principals,
             Some(preflight),
@@ -164,6 +243,7 @@ impl PersistentAuthorityImport {
         store_id: StoreId,
         exact_roots: &[RootPolicy],
         sealed_singleton_kinds: &[vibeos_durable_format::ObjectKind],
+        exact_inline_attachments: &[vibeos_durable_format::RecoveredObject],
         canonical_external_root_policy: &[u8],
         principals: Vec<PersistentPrincipalPolicy>,
         preflight: Option<vibeos_durable_format::RecoveryPreflight>,
@@ -179,7 +259,31 @@ impl PersistentAuthorityImport {
             return Err(AuthoritySnapshotError::OutOfBounds);
         }
         validate_principals(&principals)?;
-        let caller_preflighted = preflight.is_some();
+        let sector_bound_preflight = preflight.is_some();
+        if !exact_inline_attachments.is_empty() {
+            let exact_preflight = preflight
+                .as_ref()
+                .ok_or(AuthoritySnapshotError::InvalidAuthorityGraph)?;
+            for attachment in exact_inline_attachments {
+                if exact_preflight
+                    .committed_grants()
+                    .iter()
+                    .any(|grant| grant.grant.object_id == attachment.object_id)
+                    || exact_preflight
+                        .committed_objects()
+                        .iter()
+                        .filter(|candidate| candidate.object_id == attachment.object_id)
+                        .count()
+                        != 1
+                    || !exact_preflight
+                        .committed_objects()
+                        .iter()
+                        .any(|candidate| candidate == attachment)
+                {
+                    return Err(AuthoritySnapshotError::InvalidAuthorityGraph);
+                }
+            }
+        }
         let recovered = match preflight {
             Some(preflight) => preflight.finish(exact_roots),
             None => preflight_recovery(sectors, store_id)
@@ -205,6 +309,34 @@ impl PersistentAuthorityImport {
             {
                 selected_ids.insert(selected.object_id.get());
             }
+        }
+        let mut retained_only_ids = BTreeSet::new();
+        let mut previous_attachment = None;
+        for attachment in exact_inline_attachments {
+            let stable_id = attachment.object_id.get();
+            if previous_attachment.is_some_and(|previous| previous >= stable_id)
+                || attachment.is_external()
+                || attachment.byte_len() != attachment.bytes.len() as u64
+                || recovered
+                    .grants
+                    .iter()
+                    .any(|grant| grant.grant.object_id == attachment.object_id)
+                || recovered
+                    .objects
+                    .iter()
+                    .filter(|candidate| candidate.object_id == attachment.object_id)
+                    .count()
+                    != 1
+                || !recovered
+                    .objects
+                    .iter()
+                    .any(|candidate| candidate == attachment)
+                || selected_ids.contains(&stable_id)
+                || !retained_only_ids.insert(stable_id)
+            {
+                return Err(AuthoritySnapshotError::InvalidAuthorityGraph);
+            }
+            previous_attachment = Some(stable_id);
         }
         let mut record_stream = Vec::new();
         record_stream
@@ -250,12 +382,14 @@ impl PersistentAuthorityImport {
             record_stream,
             recovered,
             admitted_object_ids: selected_ids,
+            retained_only_object_ids: retained_only_ids,
             principals,
         };
-        // When the caller handed in the preflight of exactly these sectors
-        // and the stream bytes above are their verbatim copy, a second full
-        // chain recovery inside validation would only re-prove that pass.
-        validate_import(&mut result, !(caller_preflighted && dense_stream))?;
+        // A `Some` preflight reaches this private helper only after the public
+        // entry point freshly recovered these exact sectors. When the stream
+        // bytes above are their verbatim copy, another full chain recovery
+        // inside validation would only re-prove that same pass.
+        validate_import(&mut result, !(sector_bound_preflight && dense_stream))?;
         Ok(result)
     }
 
@@ -317,6 +451,55 @@ impl PersistentAuthorityImport {
         self.admitted_object_ids.len()
     }
 
+    /// Rebuild this validated import's logical stream for a boot-boundary
+    /// compaction. The retained policy-object set is exactly the import's
+    /// materializable records (live root objects and explicitly selected
+    /// singletons), plus the distinct checkpoint-only exact attachments.
+    /// Arbitrary ungranted objects are dropped. Stable IDs never leave this
+    /// type and checkpoint-only attachments never become bindings.
+    pub fn compact_boot_boundary_records(
+        &self,
+    ) -> Result<Vec<[u8; RECORD_SIZE]>, AuthoritySnapshotError> {
+        let records: Vec<[u8; RECORD_SIZE]> = self
+            .record_stream
+            .chunks_exact(RECORD_SIZE)
+            .map(|record| {
+                record
+                    .try_into()
+                    .map_err(|_| AuthoritySnapshotError::InvalidRecord)
+            })
+            .collect::<Result<_, _>>()?;
+        let preflight = preflight_recovery(&records, self.recovered.store_id)
+            .map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?;
+        let mut exact: Vec<_> = preflight
+            .committed_objects()
+            .iter()
+            .filter(|object| {
+                let stable_id = object.object_id.get();
+                self.admitted_object_ids.contains(&stable_id)
+                    || self.retained_only_object_ids.contains(&stable_id)
+            })
+            .cloned()
+            .collect();
+        exact.sort_unstable_by_key(|object| object.object_id);
+        if exact.len()
+            != self
+                .admitted_object_ids
+                .len()
+                .checked_add(self.retained_only_object_ids.len())
+                .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?
+            || preflight.committed_grants().iter().any(|grant| {
+                self.retained_only_object_ids
+                    .contains(&grant.grant.object_id.get())
+            })
+        {
+            return Err(AuthoritySnapshotError::InvalidAuthorityGraph);
+        }
+        preflight
+            .compact_with_exact_policy_objects(&exact)
+            .map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)
+    }
+
     /// Attach the content bytes for one external object committed by this
     /// exact append. The stream must have committed a matching external
     /// identity (declared length; the content root is proved by the blob
@@ -354,6 +537,10 @@ impl PersistentAuthorityImport {
 
     pub(crate) fn is_admitted(&self, stable_object_id: u128) -> bool {
         self.admitted_object_ids.contains(&stable_object_id)
+    }
+
+    pub(crate) fn is_retained_only(&self, stable_object_id: u128) -> bool {
+        self.retained_only_object_ids.contains(&stable_object_id)
     }
 
     #[cfg(test)]
@@ -969,8 +1156,7 @@ fn system_policy_for_objects<'a>(
     let totals = objects.try_fold((0_u64, 0_u64), |(logical, physical), object| {
         Some((
             logical.checked_add(object.byte_len())?,
-            physical
-                .checked_add(canonical_attributable_physical_bytes(object.byte_len()).ok()?)?,
+            physical.checked_add(canonical_attributable_physical_bytes(object.byte_len()).ok()?)?,
         ))
     });
     let (committed_logical_bytes, committed_physical_bytes) =
@@ -1012,12 +1198,25 @@ fn validate_import(
     }
     let grant_objects = admitted_object_ids(&value.recovered);
     if !grant_objects.is_subset(&value.admitted_object_ids)
+        || !value
+            .admitted_object_ids
+            .is_disjoint(&value.retained_only_object_ids)
         || !value.admitted_object_ids.iter().all(|id| {
             value
                 .recovered
                 .objects
                 .binary_search_by_key(id, |object| object.object_id.get())
                 .is_ok()
+        })
+        || !value.retained_only_object_ids.iter().all(|id| {
+            value
+                .recovered
+                .objects
+                .binary_search_by_key(id, |object| object.object_id.get())
+                .is_ok_and(|index| {
+                    let object = &value.recovered.objects[index];
+                    !object.is_external() && object.byte_len() == object.bytes.len() as u64
+                })
         })
     {
         return Err(AuthoritySnapshotError::InvalidAuthorityGraph);
@@ -1237,6 +1436,289 @@ mod tests {
         assert_eq!(
             import.principals[0].committed_physical_bytes,
             canonical_attributable_physical_bytes(b"new ssh identity".len() as u64).unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_inline_attachments_are_preflight_records_not_kind_lookups() {
+        let store = StoreId::new(73).unwrap();
+        let kind = ObjectKind::new(0x434d_4531).unwrap();
+        let mut chain = RecordChain::new(store);
+        let mut sectors = vec![chain.append(None, RecordBody::Format).unwrap()];
+        sectors.push(
+            chain
+                .append(None, RecordBody::IdHighWater { exclusive_end: 16 })
+                .unwrap(),
+        );
+        for (transaction, object, bytes) in [
+            (
+                TransactionId::new(3).unwrap(),
+                ObjectId::new(4).unwrap(),
+                b"exact".as_slice(),
+            ),
+            (
+                TransactionId::new(5).unwrap(),
+                ObjectId::new(6).unwrap(),
+                b"adjacent".as_slice(),
+            ),
+        ] {
+            sectors.extend(
+                encode_object_transaction(&mut chain, transaction, object, kind, bytes)
+                    .unwrap()
+                    .records,
+            );
+        }
+        let preflight = preflight_recovery(&sectors, store).unwrap();
+        let exact = preflight.committed_objects()[0].clone();
+        let import = PersistentAuthorityImport::from_m4_with_exact_inline_attachments_preflighted(
+            &sectors,
+            store,
+            &[],
+            &[],
+            core::slice::from_ref(&exact),
+            b"roots=[];exact-attachment=root-relative",
+            Vec::new(),
+            preflight.clone(),
+        )
+        .unwrap();
+        assert_eq!(import.admitted_object_count(), 0);
+        assert!(import.admitted_objects().next().is_none());
+        assert_eq!(import.retained_only_object_ids.len(), 1);
+        assert!(import
+            .retained_only_object_ids
+            .contains(&exact.object_id.get()));
+        // Debug is intentionally redacted: the public inert import must not
+        // become a side channel for raw stable IDs or evidence bytes.
+        let debug = alloc::format!("{import:?}");
+        assert!(!debug.contains("exact"));
+        assert!(!debug.contains("RecoveredObject"));
+
+        // The two sets are a hard type invariant, not merely a convention at
+        // the call site: checkpoint-only evidence can never also be selected
+        // for a materializable binding.
+        let mut conflated = import.clone();
+        conflated.admitted_object_ids.insert(exact.object_id.get());
+        assert_eq!(
+            validate_import(&mut conflated, false).unwrap_err(),
+            AuthoritySnapshotError::InvalidAuthorityGraph
+        );
+        let compacted = import.compact_boot_boundary_records().unwrap();
+        let compacted = preflight_recovery(&compacted, store).unwrap();
+        assert_eq!(compacted.committed_objects().len(), 1);
+        assert_eq!(compacted.committed_objects()[0].object_id, exact.object_id);
+        assert_eq!(compacted.committed_objects()[0].bytes, exact.bytes);
+
+        // A same-ID caller value is only comparison evidence. Mutating any
+        // recovered field cannot redirect admission to the canonical record.
+        let mut substituted = exact.clone();
+        substituted.bytes[0] ^= 1;
+        assert_eq!(
+            PersistentAuthorityImport::from_m4_with_exact_inline_attachments_preflighted(
+                &sectors,
+                store,
+                &[],
+                &[],
+                &[substituted],
+                b"roots=[];exact-attachment=root-relative",
+                Vec::new(),
+                preflight.clone(),
+            )
+            .unwrap_err(),
+            AuthoritySnapshotError::InvalidAuthorityGraph
+        );
+
+        let later = preflight.committed_objects()[1].clone();
+        assert_eq!(
+            PersistentAuthorityImport::from_m4_with_exact_inline_attachments_preflighted(
+                &sectors,
+                store,
+                &[],
+                &[],
+                &[later, exact.clone()],
+                b"roots=[];exact-attachment=root-relative",
+                Vec::new(),
+                preflight.clone(),
+            )
+            .unwrap_err(),
+            AuthoritySnapshotError::InvalidAuthorityGraph
+        );
+
+        let grant = vibeos_durable_format::GrantRecord {
+            derivation_id: vibeos_durable_format::DerivationId::new(8).unwrap(),
+            parent_id: None,
+            object_id: exact.object_id,
+            target: vibeos_durable_format::SlotIdentity {
+                space: vibeos_durable_format::SpaceId::new(9).unwrap(),
+                slot: 0,
+                generation: 0,
+            },
+            rights: vibeos_durable_format::DurableRights::READ,
+            resource_kind: vibeos_durable_format::ResourceKind::new(10).unwrap(),
+            flags: vibeos_durable_format::GrantFlags::ROOT,
+        };
+        let (grant_records, next) = vibeos_durable_format::preview_grant_transaction(
+            &chain,
+            TransactionId::new(7).unwrap(),
+            grant,
+        )
+        .unwrap();
+        sectors.extend(grant_records.records);
+        chain = next;
+        let (revoke, _) = vibeos_durable_format::preview_revoke_transaction(
+            &chain,
+            TransactionId::new(11).unwrap(),
+            vibeos_durable_format::DerivationId::new(8).unwrap(),
+        )
+        .unwrap();
+        sectors.extend(revoke.records);
+        let historical = preflight_recovery(&sectors, store).unwrap();
+        let exact = historical
+            .committed_objects()
+            .iter()
+            .find(|object| object.object_id == ObjectId::new(4).unwrap())
+            .unwrap()
+            .clone();
+        assert_eq!(
+            PersistentAuthorityImport::from_m4_with_exact_inline_attachments_preflighted(
+                &sectors,
+                store,
+                &[],
+                &[],
+                &[exact],
+                b"roots=[];exact-attachment=root-relative",
+                Vec::new(),
+                historical,
+            )
+            .unwrap_err(),
+            AuthoritySnapshotError::InvalidAuthorityGraph
+        );
+    }
+
+    #[test]
+    fn public_preflighted_imports_rebind_to_the_exact_same_length_sector_stream() {
+        fn stream(
+            store: StoreId,
+            first_transaction: u128,
+            singleton_kind: ObjectKind,
+            evidence_kind: ObjectKind,
+            byte: u8,
+        ) -> Vec<[u8; RECORD_SIZE]> {
+            let mut chain = RecordChain::new(store);
+            let mut sectors = vec![chain.append(None, RecordBody::Format).unwrap()];
+            sectors.push(
+                chain
+                    .append(None, RecordBody::IdHighWater { exclusive_end: 32 })
+                    .unwrap(),
+            );
+            sectors.extend(
+                encode_object_transaction(
+                    &mut chain,
+                    TransactionId::new(first_transaction).unwrap(),
+                    ObjectId::new(first_transaction + 1).unwrap(),
+                    singleton_kind,
+                    &[byte; 16],
+                )
+                .unwrap()
+                .records,
+            );
+            sectors.extend(
+                encode_object_transaction(
+                    &mut chain,
+                    TransactionId::new(first_transaction + 2).unwrap(),
+                    ObjectId::new(first_transaction + 3).unwrap(),
+                    evidence_kind,
+                    &[byte; 112],
+                )
+                .unwrap()
+                .records,
+            );
+            sectors
+        }
+
+        let store = StoreId::new(74).unwrap();
+        let singleton_kind = ObjectKind::new(0x5353_4801).unwrap();
+        let evidence_kind = ObjectKind::new(0x434d_4531).unwrap();
+        let actual = stream(store, 3, singleton_kind, evidence_kind, 0xa5);
+        let foreign = stream(store, 7, singleton_kind, evidence_kind, 0x5a);
+        assert_eq!(actual.len(), foreign.len());
+
+        let actual_preflight = preflight_recovery(&actual, store).unwrap();
+        let foreign_preflight = preflight_recovery(&foreign, store).unwrap();
+        let actual_singleton = actual_preflight
+            .committed_objects()
+            .iter()
+            .find(|object| object.object_kind == singleton_kind)
+            .unwrap();
+        let actual_evidence = actual_preflight
+            .committed_objects()
+            .iter()
+            .find(|object| object.object_kind == evidence_kind)
+            .unwrap()
+            .clone();
+        let actual_stream: Vec<u8> = actual.iter().flatten().copied().collect();
+
+        let singleton_import =
+            PersistentAuthorityImport::from_m4_with_sealed_singletons_preflighted(
+                &actual,
+                store,
+                &[],
+                &[singleton_kind],
+                b"roots=[];sealed=[ssh]",
+                Vec::new(),
+                foreign_preflight.clone(),
+            )
+            .unwrap();
+        assert_eq!(singleton_import.record_stream(), actual_stream);
+        assert_eq!(
+            singleton_import.recovered.objects,
+            actual_preflight.committed_objects()
+        );
+        let admitted: Vec<_> = singleton_import.admitted_objects().collect();
+        assert_eq!(admitted, vec![actual_singleton]);
+        assert!(!singleton_import.is_admitted(8));
+        assert!(singleton_import.retained_only_object_ids.is_empty());
+        assert_eq!(singleton_import.principals.len(), 1);
+        assert_eq!(
+            singleton_import.principals[0].committed_logical_bytes,
+            actual_singleton.byte_len()
+        );
+        assert_eq!(
+            singleton_import.principals[0].committed_physical_bytes,
+            canonical_attributable_physical_bytes(actual_singleton.byte_len()).unwrap()
+        );
+
+        let attachment_import =
+            PersistentAuthorityImport::from_m4_with_exact_inline_attachments_preflighted(
+                &actual,
+                store,
+                &[],
+                &[singleton_kind],
+                core::slice::from_ref(&actual_evidence),
+                b"roots=[];sealed=[ssh];exact-attachment=root-relative",
+                Vec::new(),
+                foreign_preflight,
+            )
+            .unwrap();
+        assert_eq!(attachment_import.record_stream(), actual_stream);
+        assert_eq!(
+            attachment_import.recovered.objects,
+            actual_preflight.committed_objects()
+        );
+        assert!(attachment_import.is_admitted(actual_singleton.object_id.get()));
+        assert!(!attachment_import.is_admitted(8));
+        assert_eq!(
+            attachment_import.retained_only_object_ids,
+            alloc::collections::BTreeSet::from([actual_evidence.object_id.get()])
+        );
+        assert!(!attachment_import.is_retained_only(10));
+        assert_eq!(attachment_import.principals.len(), 1);
+        assert_eq!(
+            attachment_import.principals[0].committed_logical_bytes,
+            actual_singleton.byte_len()
+        );
+        assert_eq!(
+            attachment_import.principals[0].committed_physical_bytes,
+            canonical_attributable_physical_bytes(actual_singleton.byte_len()).unwrap()
         );
     }
 

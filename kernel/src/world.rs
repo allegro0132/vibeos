@@ -617,6 +617,22 @@ struct StoreBlockGrants {
 }
 
 impl World {
+    /// Hand the C7.4 supervisor its already-provisioned journal endpoint
+    /// through init's explicit store authority. The acceptance task receives
+    /// no `Cap`, CSpace, object name, or durable identity; it can only request
+    /// fresh linear Storage V2 provenance from this sealed facade handle.
+    #[cfg(feature = "wasm-c74-crash-safe-publication-acceptance")]
+    pub(crate) fn c74_component_authority_journal(&self) -> Option<store::AuthorityJournal> {
+        let store = self.store?;
+        let init = self.spaces.get("init")?;
+        let lease = init
+            .0
+            .lock()
+            .lookup_lease::<store::StoreService>(store, Rights::READ)
+            .ok()?;
+        Some(lease.with(store::StoreService::authority_journal))
+    }
+
     /// Spawn and register a task under a stable component identity.
     pub fn spawn_component(
         &self,

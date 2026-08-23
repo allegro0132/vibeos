@@ -33,6 +33,9 @@ wasm-c67-information-flow-acceptance = [
 wasm-c73-authenticated-admission-acceptance = [
     "vibeos-kernel/wasm-c73-authenticated-admission-acceptance",
 ]
+wasm-c74-crash-safe-publication-acceptance = [
+    "vibeos-kernel/wasm-c74-crash-safe-publication-acceptance",
+]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = [
     "vibeos-kernel/ssh-test",

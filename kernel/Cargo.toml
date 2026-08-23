@@ -158,6 +158,23 @@ wasm-c73-authenticated-admission-acceptance = [
     "dep:vibeos-component-runtime",
     "vibeos-image-policy/c73-authenticated-admission-qemu-acceptance",
 ]
+# Internal C7 durable-publication policy seam. Merely enabling this feature
+# admits the exact v2 authority policy and portable validators; it does not
+# publish a command name, mint INVOKE/GRANT, or enable a guest executor.
+component-durable-publication = [
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-loader",
+]
+# QEMU-only C7.4 proof for one crash-safe operator artifact publication. The
+# image uses the production Storage V2 installer and physical postflight, then
+# moves the unavailable command into the sealed supervisor singleton. It does
+# not enable a command registry, guest executor, or durable invocation path.
+wasm-c74-crash-safe-publication-acceptance = [
+    "component-durable-publication",
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-runtime",
+    "vibeos-image-policy/c73-authenticated-admission-qemu-acceptance",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

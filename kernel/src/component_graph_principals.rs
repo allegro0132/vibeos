@@ -81,11 +81,11 @@ use vibeos_image_policy::C65_ASYNC_CHAIN_QEMU_ACCEPTANCE;
 #[cfg(feature = "wasm-c65-async-chain-acceptance")]
 use vibeos_component_host::{
     ByteStream, ByteStreamReader, ByteStreamSupervisor, ByteStreamWriter, StreamCloseOutcome,
-    StreamCloseReason, StreamReceiveCommit, StreamReceiveDispatch, StreamSendDispatch,
-    StreamWakeRegistration,
+    StreamCloseReason, StreamReceiveCommit, StreamReceiveDispatch, StreamSealedWakeToken,
+    StreamSendDispatch, StreamWakeRegistration, StreamWakeSignal,
 };
 #[cfg(feature = "wasm-c65-async-chain-acceptance")]
-use vibeos_component_runtime::host::{AtomicHostOperationSlot, HostOperationToken, HostWakeToken};
+use vibeos_component_runtime::host::{AtomicHostOperationSlot, HostOperationToken};
 
 #[cfg(feature = "wasm-c65-async-chain-acceptance")]
 use crate::exec::{OneShotWaitQueue, MAX_PREPARED_TASK_REGISTRATION_RESERVE};
@@ -212,6 +212,81 @@ static C65_WAIT_SLOTS: [[AtomicHostOperationSlot; 2]; C65_NODE_COUNT] = [
         AtomicHostOperationSlot::new(),
     ],
 ];
+#[cfg(feature = "wasm-c65-async-chain-acceptance")]
+static C65_WAKE_SIGNAL_SLOTS: [[C65WakeSignalSlot; 2]; C65_NODE_COUNT] = [
+    [C65WakeSignalSlot::new(), C65WakeSignalSlot::new()],
+    [C65WakeSignalSlot::new(), C65WakeSignalSlot::new()],
+    [C65WakeSignalSlot::new(), C65WakeSignalSlot::new()],
+];
+#[cfg(feature = "wasm-c65-async-chain-acceptance")]
+static C65_HOST_OPERATION: AtomicHostOperationSlot = AtomicHostOperationSlot::new();
+#[cfg(feature = "wasm-c65-async-chain-acceptance")]
+static C65_HOST_WAKE_SIGNAL: C65WakeSignalSlot = C65WakeSignalSlot::new();
+
+/// One allocation-free, boot-stable cell for a callback-issued move-only
+/// readiness proof. The paired operation slot remains the routing authority:
+/// publication rechecks it while holding this lock so cancellation followed
+/// by replacement cannot be polluted by a callback which was already in
+/// flight. No debug surface exposes either the proof or its operation seal.
+#[cfg(feature = "wasm-c65-async-chain-acceptance")]
+struct C65WakeSignalSlot {
+    signal: SpinLock<Option<StreamWakeSignal>>,
+}
+
+#[cfg(feature = "wasm-c65-async-chain-acceptance")]
+impl C65WakeSignalSlot {
+    const fn new() -> Self {
+        Self {
+            signal: SpinLock::new(None),
+        }
+    }
+
+    fn publish_exact(
+        &self,
+        operation_slot: &AtomicHostOperationSlot,
+        signal: StreamWakeSignal,
+    ) -> bool {
+        let operation = signal.operation();
+        let mut stored = self.signal.lock();
+        if stored.is_some() || !operation_slot.contains(operation) {
+            return false;
+        }
+        *stored = Some(signal);
+        true
+    }
+
+    fn take_exact(&self, operation: HostOperationToken) -> Option<StreamWakeSignal> {
+        let mut stored = self.signal.lock();
+        if stored
+            .as_ref()
+            .is_some_and(|signal| signal.operation() == operation)
+        {
+            stored.take()
+        } else {
+            None
+        }
+    }
+
+    fn clear_exact(&self, operation: HostOperationToken) -> bool {
+        let mut stored = self.signal.lock();
+        match stored.as_ref() {
+            Some(signal) if signal.operation() == operation => {
+                drop(stored.take());
+                true
+            }
+            None => true,
+            Some(_) => false,
+        }
+    }
+
+    fn clear(&self) {
+        drop(self.signal.lock().take());
+    }
+
+    fn is_empty(&self) -> bool {
+        self.signal.lock().is_none()
+    }
+}
 
 #[cfg(feature = "wasm-c64-resource-route-acceptance")]
 struct C64RouteProbe(u32);
@@ -819,6 +894,26 @@ fn c65_wait_slots_empty() -> bool {
         .iter()
         .flatten()
         .all(AtomicHostOperationSlot::is_empty)
+        && C65_WAKE_SIGNAL_SLOTS
+            .iter()
+            .flatten()
+            .all(C65WakeSignalSlot::is_empty)
+        && C65_HOST_OPERATION.is_empty()
+        && C65_HOST_WAKE_SIGNAL.is_empty()
+}
+
+#[cfg(feature = "wasm-c65-async-chain-acceptance")]
+fn c65_reset_signal_slots() -> bool {
+    if C65_WAIT_SLOTS.iter().flatten().any(|slot| !slot.is_empty())
+        || !C65_HOST_OPERATION.is_empty()
+    {
+        return false;
+    }
+    for slot in C65_WAKE_SIGNAL_SLOTS.iter().flatten() {
+        slot.clear();
+    }
+    C65_HOST_WAKE_SIGNAL.clear();
+    c65_wait_slots_empty()
 }
 
 #[cfg(feature = "wasm-c65-async-chain-acceptance")]
@@ -836,10 +931,12 @@ impl C65SupervisorControl {
                     let _ = self.supervisors[node - 1].cancel_reader_operation_exact(operation);
                 }
                 let _ = C65_WAIT_SLOTS[node][0].clear_exact(operation);
+                let _ = C65_WAKE_SIGNAL_SLOTS[node][0].clear_exact(operation);
             }
             if let Some(operation) = C65_WAIT_SLOTS[node][1].load() {
                 let _ = self.supervisors[node].cancel_writer_operation_exact(operation);
                 let _ = C65_WAIT_SLOTS[node][1].clear_exact(operation);
+                let _ = C65_WAKE_SIGNAL_SLOTS[node][1].clear_exact(operation);
             }
         }
     }
@@ -852,8 +949,15 @@ impl C65SupervisorControl {
 
     fn cleanup_host_wait(&mut self) {
         if let Some(registration) = self.host_registration.take() {
-            let _ = self.host_reader.cancel(registration.operation());
+            let operation = registration.operation();
+            let _ = self.host_reader.cancel(operation);
+            let _ = C65_HOST_OPERATION.clear_exact(operation);
+            let _ = C65_HOST_WAKE_SIGNAL.clear_exact(operation);
             drop(registration);
+        } else if let Some(operation) = C65_HOST_OPERATION.load() {
+            let _ = self.host_reader.cancel(operation);
+            let _ = C65_HOST_OPERATION.clear_exact(operation);
+            let _ = C65_HOST_WAKE_SIGNAL.clear_exact(operation);
         }
     }
 
@@ -890,12 +994,37 @@ impl C65SupervisorControl {
         let Some(registration) = self.host_registration.take() else {
             return self.fail();
         };
-        let prepared = match self.host_reader.resume_after_wake(registration) {
-            Ok(StreamReceiveDispatch::Prepared(prepared)) if prepared.length() == 1 => prepared,
-            Ok(_) => return self.fail(),
+        let operation = registration.operation();
+        let Some(signal) = C65_HOST_OPERATION
+            .contains(operation)
+            .then(|| C65_HOST_WAKE_SIGNAL.take_exact(operation))
+            .flatten()
+        else {
+            let _ = self.host_reader.cancel(operation);
+            let _ = C65_HOST_OPERATION.clear_exact(operation);
+            let _ = C65_HOST_WAKE_SIGNAL.clear_exact(operation);
+            drop(registration);
+            return self.fail();
+        };
+        let prepared = match self.host_reader.resume_after_wake(signal) {
+            Ok(StreamReceiveDispatch::Prepared(prepared)) if prepared.length() == 1 => {
+                drop(registration);
+                if !C65_HOST_OPERATION.clear_exact(operation) || !C65_HOST_WAKE_SIGNAL.is_empty() {
+                    return self.fail();
+                }
+                prepared
+            }
+            Ok(_) => {
+                drop(registration);
+                let _ = C65_HOST_OPERATION.clear_exact(operation);
+                let _ = C65_HOST_WAKE_SIGNAL.clear_exact(operation);
+                return self.fail();
+            }
             Err(failure) => {
-                let registration = failure.into_registration();
-                let _ = self.host_reader.cancel(registration.operation());
+                drop(failure.into_signal());
+                let _ = self.host_reader.cancel(operation);
+                let _ = C65_HOST_OPERATION.clear_exact(operation);
+                let _ = C65_HOST_WAKE_SIGNAL.clear_exact(operation);
                 drop(registration);
                 return self.fail();
             }
@@ -1210,12 +1339,39 @@ fn c65_with_writer<R>(
 }
 
 #[cfg(feature = "wasm-c65-async-chain-acceptance")]
-fn c65_stream_wake(words: [usize; 4]) {
-    let signal = super::component_instances::registry().signal_continuation_words(words);
+fn c65_stream_wake(words: [usize; 4], wake_signal: StreamWakeSignal) {
     let generation = C65_AUDIT.generation.load(Ordering::Acquire);
+    if !C65_AUDIT.matches_live_generation(generation) {
+        return;
+    }
+    let operation = wake_signal.operation();
+    let mut route = None;
+    for node in 0..C65_NODE_COUNT {
+        for kind in 0..2 {
+            if C65_WAIT_SLOTS[node][kind].contains(operation) {
+                if route.replace((node, kind)).is_some() {
+                    c65_publish_failure(generation);
+                    return;
+                }
+            }
+        }
+    }
+    let Some((node, kind)) = route else {
+        // Cancellation clears the operation ledger before its signal cell.
+        // A callback which lost that race is stale and must not affect a later
+        // scenario generation.
+        return;
+    };
+    let signal_slot = &C65_WAKE_SIGNAL_SLOTS[node][kind];
+    if !signal_slot.publish_exact(&C65_WAIT_SLOTS[node][kind], wake_signal) {
+        c65_publish_failure(generation);
+        return;
+    }
     if !c65_increment(&C65_AUDIT.wake_callbacks, generation)
-        || signal != InstanceContinuationSignal::Signalled
+        || super::component_instances::registry().signal_continuation_words(words)
+            != InstanceContinuationSignal::Signalled
     {
+        let _ = signal_slot.clear_exact(operation);
         c65_publish_failure(generation);
     }
 }
@@ -1381,6 +1537,10 @@ impl C65AsyncPayload {
         &C65_WAIT_SLOTS[self.route.kind.index()][kind.slot_index()]
     }
 
+    fn wake_signal_slot(&self, kind: C65WaitKind) -> &'static C65WakeSignalSlot {
+        &C65_WAKE_SIGNAL_SLOTS[self.route.kind.index()][kind.slot_index()]
+    }
+
     fn cancel_wait_operation(
         &self,
         resources: &mut ResourceTable<ComponentAuthority>,
@@ -1402,6 +1562,9 @@ impl C65AsyncPayload {
         let slot = self.wait_slot(kind);
         if cancelled {
             let _ = slot.clear_exact(operation);
+        }
+        if !slot.contains(operation) {
+            let _ = self.wake_signal_slot(kind).clear_exact(operation);
         }
         cancelled || !slot.contains(operation)
     }
@@ -1431,7 +1594,8 @@ impl C65AsyncPayload {
         kind: C65WaitKind,
     ) -> bool {
         let slot = self.wait_slot(kind);
-        if !slot.publish(operation) {
+        let signal_slot = self.wake_signal_slot(kind);
+        if !signal_slot.is_empty() || !slot.publish(operation) {
             let _ = self.cancel_wait_operation(resources, space, kind, operation);
             return false;
         }
@@ -1456,7 +1620,7 @@ impl C65AsyncPayload {
             let _ = self.cancel_wait_operation(resources, space, kind, operation);
             return false;
         }
-        let wake = HostWakeToken::new(token.signal_words(), c65_stream_wake);
+        let wake = StreamSealedWakeToken::new(token.signal_words(), c65_stream_wake);
         let registration = match kind {
             C65WaitKind::Receive => {
                 let Ok(input) = self.input() else {
@@ -1680,43 +1844,53 @@ impl C65AsyncPayload {
             drop(waiting);
             return C65PayloadOutcome::InvariantFailure;
         }
+        let signal_slot = self.wake_signal_slot(kind);
         if !slot.contains(operation) {
+            let _ = signal_slot.clear_exact(operation);
             drop(waiting);
             c65_publish_failure(self.route.generation);
             return C65PayloadOutcome::InvariantFailure;
         }
+        let Some(wake_signal) = signal_slot.take_exact(operation) else {
+            let _ = self.cancel_wait_operation(resources, space, kind, operation);
+            drop(waiting);
+            c65_publish_failure(self.route.generation);
+            return C65PayloadOutcome::InvariantFailure;
+        };
+        let registration = waiting.registration;
+        drop(waiting.continuation);
         match kind {
             C65WaitKind::Receive => {
                 let Ok(input) = self.input() else {
                     let _ = self.cancel_wait_operation(resources, space, kind, operation);
-                    drop(waiting);
+                    drop(registration);
+                    drop(wake_signal);
                     return C65PayloadOutcome::InvariantFailure;
                 };
-                let dispatch = c65_with_reader(resources, input, space, |reader| {
-                    reader.resume_after_wake(waiting.registration)
+                let dispatch = c65_with_reader(resources, input, space, move |reader| {
+                    reader.resume_after_wake(wake_signal)
                 });
                 let dispatch = match dispatch {
-                    Ok(Ok(dispatch)) => dispatch,
+                    Ok(Ok(dispatch)) => {
+                        drop(registration);
+                        dispatch
+                    }
                     Ok(Err(failure)) => {
-                        let registration = failure.into_registration();
-                        let _ = self.cancel_wait_operation(
-                            resources,
-                            space,
-                            kind,
-                            registration.operation(),
-                        );
+                        drop(failure.into_signal());
+                        let _ = self.cancel_wait_operation(resources, space, kind, operation);
                         drop(registration);
                         c65_publish_failure(self.route.generation);
                         return C65PayloadOutcome::InvariantFailure;
                     }
                     Err(()) => {
                         let _ = self.cancel_wait_operation(resources, space, kind, operation);
+                        drop(registration);
                         c65_publish_failure(self.route.generation);
                         return C65PayloadOutcome::InvariantFailure;
                     }
                 };
-                let _ = slot.clear_exact(operation);
-                if slot.contains(operation)
+                if !slot.clear_exact(operation)
+                    || !signal_slot.is_empty()
                     || !c65_increment(&C65_AUDIT.sealed_resumes, self.route.generation)
                 {
                     c65_publish_failure(self.route.generation);
@@ -1751,31 +1925,31 @@ impl C65AsyncPayload {
                 }
             }
             C65WaitKind::Send(byte) => {
-                let dispatch = c65_with_writer(resources, self.route.output, space, |writer| {
-                    writer.resume_after_wake(waiting.registration, &[byte])
-                });
+                let dispatch =
+                    c65_with_writer(resources, self.route.output, space, move |writer| {
+                        writer.resume_after_wake(wake_signal, &[byte])
+                    });
                 let dispatch = match dispatch {
-                    Ok(Ok(dispatch)) => dispatch,
+                    Ok(Ok(dispatch)) => {
+                        drop(registration);
+                        dispatch
+                    }
                     Ok(Err(failure)) => {
-                        let registration = failure.into_registration();
-                        let _ = self.cancel_wait_operation(
-                            resources,
-                            space,
-                            kind,
-                            registration.operation(),
-                        );
+                        drop(failure.into_signal());
+                        let _ = self.cancel_wait_operation(resources, space, kind, operation);
                         drop(registration);
                         c65_publish_failure(self.route.generation);
                         return C65PayloadOutcome::InvariantFailure;
                     }
                     Err(()) => {
                         let _ = self.cancel_wait_operation(resources, space, kind, operation);
+                        drop(registration);
                         c65_publish_failure(self.route.generation);
                         return C65PayloadOutcome::InvariantFailure;
                     }
                 };
-                let _ = slot.clear_exact(operation);
-                if slot.contains(operation)
+                if !slot.clear_exact(operation)
+                    || !signal_slot.is_empty()
                     || !c65_increment(&C65_AUDIT.sealed_resumes, self.route.generation)
                 {
                     c65_publish_failure(self.route.generation);
@@ -1902,11 +2076,13 @@ impl Drop for PrincipalPayload {
 // plus `InstanceContinuation`, whose listener is registered against the stable
 // SYSTEM instance slot and executor TaskStatus ledger. Before callback
 // registration, the backend operation is mirrored into a boot-stable atomic
-// slot; the SYSTEM stream supervisor can exact-cancel that mirror and has a
-// terminal-only backstop for the bounded start-before-mirror fault window. It
-// is consumed before normal payload completion; productive transitions are
-// bounded to one chunk, while an external wait returns Pending without
-// self-waking. Drop remains bounded and non-reentrant.
+// slot and its paired fixed signal cell is proven empty. The callback deposits
+// its move-only readiness proof there before signalling the continuation; the
+// SYSTEM stream supervisor can exact-cancel both ledgers and has a terminal-only
+// backstop for the bounded start-before-mirror fault window. They are consumed
+// before normal payload completion; productive transitions are bounded to one
+// chunk, while an external wait returns Pending without self-waking. Drop
+// remains bounded and non-reentrant.
 unsafe impl InstancePayload for PrincipalPayload {
     fn poll_quantum(&mut self, space: &InstanceSpace, context: &mut Context<'_>) -> Poll<u64> {
         #[cfg(feature = "wasm-c65-async-chain-acceptance")]
@@ -2334,16 +2510,20 @@ fn c65_host_wake_words(generation: u64) -> Option<[usize; 4]> {
 }
 
 #[cfg(feature = "wasm-c65-async-chain-acceptance")]
-fn c65_host_wake(words: [usize; 4]) {
+fn c65_host_wake(words: [usize; 4], wake_signal: StreamWakeSignal) {
     let generation = words[0] as u64;
     let exact = c65_host_wake_words(generation).is_some_and(|expected| expected == words);
-    let accepted = exact
-        && C65_AUDIT.matches_live_generation(generation)
+    if !exact || !C65_AUDIT.matches_live_generation(generation) {
+        return;
+    }
+    let operation = wake_signal.operation();
+    let accepted = C65_HOST_WAKE_SIGNAL.publish_exact(&C65_HOST_OPERATION, wake_signal)
         && C65_AUDIT
             .host_wakes
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
     if !accepted {
+        let _ = C65_HOST_WAKE_SIGNAL.clear_exact(operation);
         c65_publish_failure(generation);
         return;
     }
@@ -2391,7 +2571,7 @@ fn prepare_c65_async_route(
         return Err(ComponentGraphPrincipalLifecycleError::AsyncRoutePolicy);
     }
     let generation = next_c65_scenario_generation()?;
-    if !c65_wait_slots_empty() || !C65_AUDIT.reset(generation) {
+    if !c65_reset_signal_slots() || !C65_AUDIT.reset(generation) {
         return Err(ComponentGraphPrincipalLifecycleError::AsyncRouteSetup);
     }
 
@@ -2402,20 +2582,6 @@ fn prepare_c65_async_route(
         streams[2].supervisor(),
     ];
     let host_reader = streams[2].reader();
-    let StreamReceiveDispatch::Waiting(host_operation) = host_reader
-        .start()
-        .map_err(|_| ComponentGraphPrincipalLifecycleError::AsyncRouteSetup)?
-    else {
-        return Err(ComponentGraphPrincipalLifecycleError::AsyncRouteSetup);
-    };
-    let host_words = c65_host_wake_words(generation)
-        .ok_or(ComponentGraphPrincipalLifecycleError::AsyncRouteSetup)?;
-    let host_registration = host_reader
-        .register_wake_sealed(
-            host_operation,
-            HostWakeToken::new(host_words, c65_host_wake),
-        )
-        .map_err(|_| ComponentGraphPrincipalLifecycleError::AsyncRouteSetup)?;
 
     let source_writer = streams[0].writer();
     let relay_reader = streams[0].reader();
@@ -2560,6 +2726,30 @@ fn prepare_c65_async_route(
     {
         return Err(ComponentGraphPrincipalLifecycleError::AsyncRouteSetup);
     }
+    let host_words = c65_host_wake_words(generation)
+        .ok_or(ComponentGraphPrincipalLifecycleError::AsyncRouteSetup)?;
+    let StreamReceiveDispatch::Waiting(host_operation) = host_reader
+        .start()
+        .map_err(|_| ComponentGraphPrincipalLifecycleError::AsyncRouteSetup)?
+    else {
+        return Err(ComponentGraphPrincipalLifecycleError::AsyncRouteSetup);
+    };
+    if !C65_HOST_WAKE_SIGNAL.is_empty() || !C65_HOST_OPERATION.publish(host_operation) {
+        let _ = host_reader.cancel(host_operation);
+        return Err(ComponentGraphPrincipalLifecycleError::AsyncRouteSetup);
+    }
+    let host_registration = match host_reader.register_wake_sealed(
+        host_operation,
+        StreamSealedWakeToken::new(host_words, c65_host_wake),
+    ) {
+        Ok(registration) => registration,
+        Err(_) => {
+            let _ = host_reader.cancel(host_operation);
+            let _ = C65_HOST_OPERATION.clear_exact(host_operation);
+            let _ = C65_HOST_WAKE_SIGNAL.clear_exact(host_operation);
+            return Err(ComponentGraphPrincipalLifecycleError::AsyncRouteSetup);
+        }
+    };
     Ok(C65SupervisorControl {
         generation,
         cause,

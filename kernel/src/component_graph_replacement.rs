@@ -29,14 +29,15 @@ use vibeos_component_command::{
 use vibeos_component_host::{
     revoke_owned_supervised, ByteStream, ByteStreamReader, ByteStreamSupervisor, ByteStreamWriter,
     ComponentAuthority, StreamCloseOutcome, StreamCloseReason, StreamReceiveCommit,
-    StreamReceiveDispatch, StreamSendDispatch, StreamWakeRegistration,
+    StreamReceiveDispatch, StreamSealedWakeToken, StreamSendDispatch, StreamWakeRegistration,
+    StreamWakeSignal,
 };
 use vibeos_component_runtime::graph::{
     ComponentGraphEdgeSpec, ComponentGraphEntityIndex, ComponentGraphExportEndpoint,
     ComponentGraphImportEndpoint, ComponentGraphNesting, ComponentGraphNodeId,
     ComponentGraphPublishedExportSpec,
 };
-use vibeos_component_runtime::host::{AtomicHostOperationSlot, HostOperationToken, HostWakeToken};
+use vibeos_component_runtime::host::{AtomicHostOperationSlot, HostOperationToken};
 use vibeos_component_runtime::resource::{
     ResourceError, ResourceTable, ResourceToken, ResourceTypeId,
 };
@@ -100,9 +101,73 @@ static C66_FRESH_DONE: OneShotWaitQueue = OneShotWaitQueue::new();
 static C66_FAILURE: OneShotWaitQueue = OneShotWaitQueue::new();
 static C66_OLD_OPERATION: AtomicHostOperationSlot = AtomicHostOperationSlot::new();
 static C66_CANDIDATE_OPERATION: AtomicHostOperationSlot = AtomicHostOperationSlot::new();
+static C66_OLD_WAKE_SIGNAL: C66WakeSignalSlot = C66WakeSignalSlot::new();
+static C66_CANDIDATE_WAKE_SIGNAL: C66WakeSignalSlot = C66WakeSignalSlot::new();
 static C66_OLD_WAKE_WORDS: SpinLock<Option<[usize; 4]>> = SpinLock::new(None);
 static C66_CANDIDATE_WAKE_WORDS: SpinLock<Option<[usize; 4]>> = SpinLock::new(None);
 static C66_OLD_OPERATION_REPLAY: SpinLock<Option<HostOperationToken>> = SpinLock::new(None);
+
+/// One fixed supervisor cell for a callback-issued, move-only stream signal.
+/// The paired atomic operation remains the route identity; publication
+/// rechecks it under this lock so a late callback cannot populate a replacement
+/// generation after teardown cleared the operation ledger.
+struct C66WakeSignalSlot {
+    signal: SpinLock<Option<StreamWakeSignal>>,
+}
+
+impl C66WakeSignalSlot {
+    const fn new() -> Self {
+        Self {
+            signal: SpinLock::new(None),
+        }
+    }
+
+    fn publish_exact(
+        &self,
+        operation_slot: &AtomicHostOperationSlot,
+        signal: StreamWakeSignal,
+    ) -> bool {
+        let operation = signal.operation();
+        let mut stored = self.signal.lock();
+        if stored.is_some() || !operation_slot.contains(operation) {
+            return false;
+        }
+        *stored = Some(signal);
+        true
+    }
+
+    fn take_exact(&self, operation: HostOperationToken) -> Option<StreamWakeSignal> {
+        let mut stored = self.signal.lock();
+        if stored
+            .as_ref()
+            .is_some_and(|signal| signal.operation() == operation)
+        {
+            stored.take()
+        } else {
+            None
+        }
+    }
+
+    fn clear_exact(&self, operation: HostOperationToken) -> bool {
+        let mut stored = self.signal.lock();
+        match stored.as_ref() {
+            Some(signal) if signal.operation() == operation => {
+                drop(stored.take());
+                true
+            }
+            None => true,
+            Some(_) => false,
+        }
+    }
+
+    fn clear(&self) {
+        drop(self.signal.lock().take());
+    }
+
+    fn is_empty(&self) -> bool {
+        self.signal.lock().is_none()
+    }
+}
 
 const fn c66_phase_word(generation: u64, phase: u8) -> Option<u64> {
     if generation == 0 || generation > (u64::MAX >> C66_PHASE_BITS) {
@@ -176,8 +241,13 @@ impl C66Audit {
         let Some(old_phase) = c66_phase_word(generation, C66_PHASE_OLD) else {
             return false;
         };
-        if C66_OLD_OPERATION.load().is_some()
-            || C66_CANDIDATE_OPERATION.load().is_some()
+        if C66_OLD_OPERATION.load().is_some() || C66_CANDIDATE_OPERATION.load().is_some() {
+            return false;
+        }
+        C66_OLD_WAKE_SIGNAL.clear();
+        C66_CANDIDATE_WAKE_SIGNAL.clear();
+        if !C66_OLD_WAKE_SIGNAL.is_empty()
+            || !C66_CANDIDATE_WAKE_SIGNAL.is_empty()
             || C66_OLD_WAKE_WORDS.lock().is_some()
             || C66_CANDIDATE_WAKE_WORDS.lock().is_some()
             || C66_OLD_OPERATION_REPLAY.lock().is_some()
@@ -277,12 +347,34 @@ fn c66_mark_mask(
     true
 }
 
-fn c66_stream_wake(words: [usize; 4]) {
+fn c66_stream_wake(words: [usize; 4], wake_signal: StreamWakeSignal) {
     let generation = C66_AUDIT.generation.load(Ordering::Acquire);
+    if !C66_AUDIT.matches(generation) || C66_AUDIT.failed.load(Ordering::Acquire) {
+        return;
+    }
+    let operation = wake_signal.operation();
+    let old = C66_OLD_OPERATION.contains(operation);
+    let candidate = C66_CANDIDATE_OPERATION.contains(operation);
+    let (operation_slot, signal_slot) = match (old, candidate) {
+        (true, false) => (&C66_OLD_OPERATION, &C66_OLD_WAKE_SIGNAL),
+        (false, true) => (&C66_CANDIDATE_OPERATION, &C66_CANDIDATE_WAKE_SIGNAL),
+        // No match is an inert callback which lost a cancellation/replacement
+        // race. Two matches violate globally unique operation routing.
+        (false, false) => return,
+        (true, true) => {
+            c66_publish_failure(generation);
+            return;
+        }
+    };
+    if !signal_slot.publish_exact(operation_slot, wake_signal) {
+        c66_publish_failure(generation);
+        return;
+    }
     if !c66_increment(&C66_AUDIT.wake_callbacks, generation)
         || super::super::component_instances::registry().signal_continuation_words(words)
             != InstanceContinuationSignal::Signalled
     {
+        let _ = signal_slot.clear_exact(operation);
         c66_publish_failure(generation);
     }
 }
@@ -539,6 +631,18 @@ fn c66_with_writer<R>(
         .map_err(|_| ())
 }
 
+fn c66_wake_signal_slot(
+    operation_slot: &'static AtomicHostOperationSlot,
+) -> Option<&'static C66WakeSignalSlot> {
+    if core::ptr::eq(operation_slot, &C66_OLD_OPERATION) {
+        Some(&C66_OLD_WAKE_SIGNAL)
+    } else if core::ptr::eq(operation_slot, &C66_CANDIDATE_OPERATION) {
+        Some(&C66_CANDIDATE_WAKE_SIGNAL)
+    } else {
+        None
+    }
+}
+
 impl C66Payload {
     fn new(
         generation: u64,
@@ -687,15 +791,56 @@ impl C66Payload {
         pending: C66PendingReceive,
         slot: &'static AtomicHostOperationSlot,
     ) -> bool {
+        let Some(signal_slot) = c66_wake_signal_slot(slot) else {
+            return false;
+        };
         let operation = pending.registration.operation();
         let cancelled = c66_with_reader(&mut self.resources, endpoint, space, |reader| {
             reader.cancel(operation)
         }) == Ok(Ok(()));
-        drop(pending);
-        if cancelled {
-            let _ = slot.clear_exact(operation);
+        let backend_revoked = cancelled || !slot.contains(operation);
+        // Even an impossible backend cancellation failure must not leave a
+        // stable route through which its eventual callback could populate a
+        // replacement signal cell. The false return still forces fail-stop.
+        let _ = slot.clear_exact(operation);
+        let signal_cleared = signal_slot.clear_exact(operation);
+        if core::ptr::eq(slot, &C66_OLD_OPERATION) {
+            let _ = C66_OLD_WAKE_WORDS.lock().take();
+            let mut replay = C66_OLD_OPERATION_REPLAY.lock();
+            if replay.as_ref() == Some(&operation) {
+                let _ = replay.take();
+            }
+        } else {
+            let _ = C66_CANDIDATE_WAKE_WORDS.lock().take();
         }
-        cancelled || !slot.contains(operation)
+        // The registration is retained through exact cancellation and is
+        // dropped only after the backend revoke attempt has completed.
+        drop(pending);
+        backend_revoked && signal_cleared && !slot.contains(operation)
+    }
+
+    fn abandon_receive_arm(
+        &mut self,
+        space: &InstanceSpace,
+        endpoint: C66Drain,
+        operation: HostOperationToken,
+        slot: &'static AtomicHostOperationSlot,
+        words: &'static SpinLock<Option<[usize; 4]>>,
+    ) {
+        let _ = c66_with_reader(&mut self.resources, endpoint, space, |reader| {
+            reader.cancel(operation)
+        });
+        let _ = slot.clear_exact(operation);
+        if let Some(signal_slot) = c66_wake_signal_slot(slot) {
+            let _ = signal_slot.clear_exact(operation);
+        }
+        let _ = words.lock().take();
+        if core::ptr::eq(slot, &C66_OLD_OPERATION) {
+            let mut replay = C66_OLD_OPERATION_REPLAY.lock();
+            if replay.as_ref() == Some(&operation) {
+                let _ = replay.take();
+            }
+        }
     }
 
     fn arm_receive(
@@ -707,7 +852,8 @@ impl C66Payload {
         slot: &'static AtomicHostOperationSlot,
         words: &'static SpinLock<Option<[usize; 4]>>,
     ) -> Result<C66PendingReceive, ()> {
-        if !slot.publish(operation) {
+        let signal_slot = c66_wake_signal_slot(slot).ok_or(())?;
+        if !signal_slot.is_empty() || !slot.publish(operation) {
             let _ = c66_with_reader(&mut self.resources, endpoint, space, |reader| {
                 reader.cancel(operation)
             });
@@ -716,37 +862,60 @@ impl C66Payload {
         if core::ptr::eq(slot, &C66_OLD_OPERATION) {
             let mut replay = C66_OLD_OPERATION_REPLAY.lock();
             if replay.is_some() {
+                drop(replay);
+                self.abandon_receive_arm(space, endpoint, operation, slot, words);
                 return Err(());
             }
             *replay = Some(operation);
         }
-        let token = super::super::component_instances::registry()
+        let token = match super::super::component_instances::registry()
             .arm_continuation_current(self.instance, InstanceContinuationKind::External)
-            .map_err(|_| ())?;
+        {
+            Ok(token) => token,
+            Err(_) => {
+                self.abandon_receive_arm(space, endpoint, operation, slot, words);
+                return Err(());
+            }
+        };
         let mut continuation: InstanceContinuation<'static> =
-            super::super::component_instances::registry()
-                .wait_continuation(token)
-                .map_err(|_| ())?;
+            match super::super::component_instances::registry().wait_continuation(token) {
+                Ok(continuation) => continuation,
+                Err(_) => {
+                    self.abandon_receive_arm(space, endpoint, operation, slot, words);
+                    return Err(());
+                }
+            };
         if Pin::new(&mut continuation).poll(context) != Poll::Pending {
+            self.abandon_receive_arm(space, endpoint, operation, slot, words);
             return Err(());
         }
         let signal_words = token.signal_words();
         {
             let mut stored = words.lock();
             if stored.is_some() {
+                drop(stored);
+                self.abandon_receive_arm(space, endpoint, operation, slot, words);
                 return Err(());
             }
             *stored = Some(signal_words);
         }
-        let registration = c66_with_reader(&mut self.resources, endpoint, space, |reader| {
-            reader
-                .register_wake_sealed(operation, HostWakeToken::new(signal_words, c66_stream_wake))
-        })
-        .map_err(|_| ())?
-        .map_err(|_| ())?;
+        let registration = match c66_with_reader(&mut self.resources, endpoint, space, |reader| {
+            reader.register_wake_sealed(
+                operation,
+                StreamSealedWakeToken::new(signal_words, c66_stream_wake),
+            )
+        }) {
+            Ok(Ok(registration)) => registration,
+            _ => {
+                self.abandon_receive_arm(space, endpoint, operation, slot, words);
+                return Err(());
+            }
+        };
         if !slot.contains(operation)
             || !c66_increment(&C66_AUDIT.wake_registrations, self.generation)
         {
+            self.abandon_receive_arm(space, endpoint, operation, slot, words);
+            drop(registration);
             return Err(());
         }
         Ok(C66PendingReceive {
@@ -777,33 +946,63 @@ impl C66Payload {
                 return Err(());
             }
         }
-        if !c66_increment(&C66_AUDIT.continuation_resumes, self.generation) {
+        let operation = pending.registration.operation();
+        let Some(signal_slot) = c66_wake_signal_slot(slot) else {
+            let _ = self.cancel_receive(space, endpoint, pending, slot);
+            return Err(());
+        };
+        if !slot.contains(operation) {
             let _ = self.cancel_receive(space, endpoint, pending, slot);
             return Err(());
         }
-        let operation = pending.registration.operation();
-        if !slot.contains(operation) {
+        let Some(wake_signal) = signal_slot.take_exact(operation) else {
+            let _ = self.cancel_receive(space, endpoint, pending, slot);
+            return Err(());
+        };
+        if !c66_increment(&C66_AUDIT.continuation_resumes, self.generation) {
+            self.abandon_receive_arm(
+                space,
+                endpoint,
+                operation,
+                slot,
+                if core::ptr::eq(slot, &C66_OLD_OPERATION) {
+                    &C66_OLD_WAKE_WORDS
+                } else {
+                    &C66_CANDIDATE_WAKE_WORDS
+                },
+            );
+            drop(wake_signal);
+            drop(pending);
             return Err(());
         }
-        let resumed = c66_with_reader(&mut self.resources, endpoint, space, |reader| {
-            reader.resume_after_wake(pending.registration)
-        })
-        .map_err(|_| ())?;
+        let resumed = c66_with_reader(&mut self.resources, endpoint, space, move |reader| {
+            reader.resume_after_wake(wake_signal)
+        });
         let dispatch = match resumed {
-            Ok(dispatch) => dispatch,
-            Err(failure) => {
-                let registration = failure.into_registration();
-                let operation = registration.operation();
-                let _ = c66_with_reader(&mut self.resources, endpoint, space, |reader| {
-                    reader.cancel(operation)
-                });
-                drop(registration);
+            Ok(Ok(dispatch)) => {
+                // Successful signal consumption retires the cancellation-only
+                // registration. It is never used as resume authority.
+                drop(pending);
+                dispatch
+            }
+            Ok(Err(failure)) => {
+                drop(failure.into_signal());
+                let _ = self.cancel_receive(space, endpoint, pending, slot);
+                return Err(());
+            }
+            Err(()) => {
+                let _ = self.cancel_receive(space, endpoint, pending, slot);
                 return Err(());
             }
         };
-        let _ = slot.clear_exact(operation);
-        if slot.contains(operation) || !c66_increment(&C66_AUDIT.sealed_resumes, self.generation) {
+        if !slot.clear_exact(operation)
+            || !signal_slot.is_empty()
+            || !c66_increment(&C66_AUDIT.sealed_resumes, self.generation)
+        {
             return Err(());
+        }
+        if core::ptr::eq(slot, &C66_CANDIDATE_OPERATION) {
+            let _ = C66_CANDIDATE_WAKE_WORDS.lock().take();
         }
         Ok((dispatch, None))
     }
@@ -1157,9 +1356,11 @@ impl Drop for C66Payload {
 // SAFETY: all retained endpoint Arcs are SYSTEM-owned. The payload never lets
 // an arena pointer, CSpace guard, resolved capability, or resource borrow
 // escape a quantum. Pending receive state contains only exact opaque backend
-// and TaskStatus-owned continuation receipts, whose callback carries copy-only
-// signal words. Normal completion consumes every registration and table entry
-// before the exact registry finalizer resets the CSpace and retires the arena.
+// and TaskStatus-owned continuation receipts. A sealed callback deposits its
+// move-only readiness proof in one exact, boot-stable operation slot before it
+// signals that continuation. Normal completion consumes every signal and
+// registration plus every table entry before the exact registry finalizer
+// resets the CSpace and retires the arena.
 unsafe impl InstancePayload for C66Payload {
     fn poll_quantum(&mut self, space: &InstanceSpace, context: &mut Context<'_>) -> Poll<u64> {
         if self.completed {
@@ -1517,6 +1718,7 @@ impl C66Supervisor {
         let old_target_exit = old_handles[C66_TARGET_INDEX].join().await;
         if old_target_exit.state() != TaskState::Exited
             || C66_OLD_OPERATION.load().is_some()
+            || !C66_OLD_WAKE_SIGNAL.is_empty()
             || supervisors[..2].iter().any(|supervisor| {
                 supervisor.revoke_pending_after_final().map(|r| r.total()) != Ok(0)
             })
@@ -1633,10 +1835,10 @@ impl C66Supervisor {
         }
 
         let candidate_polls = published_candidate.polls();
-        let Some(old_words) = *C66_OLD_WAKE_WORDS.lock() else {
+        let Some(old_words) = C66_OLD_WAKE_WORDS.lock().take() else {
             fail(ComponentGraphPrincipalLifecycleError::NodeReplacementInvariant);
         };
-        let Some(old_operation) = *C66_OLD_OPERATION_REPLAY.lock() else {
+        let Some(old_operation) = C66_OLD_OPERATION_REPLAY.lock().take() else {
             fail(ComponentGraphPrincipalLifecycleError::NodeReplacementInvariant);
         };
         if super::super::component_instances::registry().signal_continuation_words(old_words)
@@ -1662,6 +1864,7 @@ impl C66Supervisor {
         if source_state != Some(TaskState::Exited)
             || candidate_state != Some(TaskState::Exited)
             || C66_CANDIDATE_OPERATION.load().is_some()
+            || !C66_CANDIDATE_WAKE_SIGNAL.is_empty()
             || !c66_transition(generation, C66_PHASE_SEND, C66_PHASE_RECEIVE)
             || !old_handles[2].exact_wake().wake_if_exact()
         {
@@ -1722,6 +1925,11 @@ impl C66Supervisor {
             )
             || C66_OLD_OPERATION.load().is_some()
             || C66_CANDIDATE_OPERATION.load().is_some()
+            || !C66_OLD_WAKE_SIGNAL.is_empty()
+            || !C66_CANDIDATE_WAKE_SIGNAL.is_empty()
+            || C66_OLD_WAKE_WORDS.lock().is_some()
+            || C66_CANDIDATE_WAKE_WORDS.lock().is_some()
+            || C66_OLD_OPERATION_REPLAY.lock().is_some()
         {
             fail(ComponentGraphPrincipalLifecycleError::NodeReplacementInvariant);
         }

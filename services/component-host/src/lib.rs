@@ -51,9 +51,9 @@ pub use service::{ComponentCallError, ComponentHostServices};
 pub use stream::{
     ByteStream, ByteStreamReader, ByteStreamSupervisor, ByteStreamWriter, StreamCloseObservation,
     StreamCloseOutcome, StreamCloseReason, StreamError, StreamPendingRevocation,
-    StreamPreparedReceive, StreamReceiveCommit, StreamReceiveDispatch, StreamSendDispatch,
-    StreamTerminalDispatch, StreamWakeRegistration, StreamWakeResumeFailure,
-    MAX_STREAM_CHUNK_BYTES, STREAM_BUFFER_CHUNKS,
+    StreamPreparedReceive, StreamReceiveCommit, StreamReceiveDispatch, StreamSealedWakeToken,
+    StreamSendDispatch, StreamTerminalDispatch, StreamWakeRegistration, StreamWakeResumeFailure,
+    StreamWakeSignal, MAX_STREAM_CHUNK_BYTES, STREAM_BUFFER_CHUNKS,
 };
 pub use transfer::{
     prepare_owned_supervised, revoke_owned_supervised, transfer_owned, with_supervised_borrow,
@@ -409,13 +409,30 @@ pub struct ComponentAuthority {
     class: AuthorityClass,
 }
 
-/// Detached move-only proof that an ordinary volatile capability was validated
+/// Detached move-only validation receipt for an ordinary volatile capability
 /// inside an exact reserved CSpace.
 ///
 /// This is the non-transfer counterpart to
 /// [`PreparedSupervisedEphemeralSource`]. It accepts only the component's
 /// operation rights. `GRANT`, `REVOKE`, `INVOKE`, and persistent capabilities
 /// are rejected independently of a caller-defined resource trait constant.
+/// Its private fields and lack of `Clone`/`Copy` make each returned value
+/// linear; repeating the validation can still return another receipt, so the
+/// caller's reservation and lifecycle gate provide global uniqueness.
+///
+/// ```compile_fail
+/// fn duplicate(receipt: vibeos_component_host::PreparedEphemeralAuthority) {
+///     let moved = receipt;
+///     let duplicated = receipt;
+///     drop((moved, duplicated));
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn inspect(receipt: vibeos_component_host::PreparedEphemeralAuthority) {
+///     let _ = receipt.rights_ceiling;
+/// }
+/// ```
 #[must_use = "the prepared authority must be published or its reserved CSpace reset"]
 pub struct PreparedEphemeralAuthority {
     cspace_identity: CSpaceIdentity,
@@ -449,9 +466,10 @@ impl PreparedEphemeralAuthority {
 /// Opaque, detached proof that one exact volatile capability was validated as
 /// a sealed supervisor transfer source.
 ///
-/// This detached one-shot receipt is suitable for return from a reserved-space
-/// callback. Its private fields and redacted debug output do not expose the
-/// capability.
+/// This detached move-only validation receipt is suitable for return from a
+/// reserved-space callback. Its private fields and redacted debug output do not
+/// expose the capability. Linear consumption of one value is not a global
+/// one-shot guarantee; the reservation and lifecycle gate provide uniqueness.
 #[must_use = "the prepared authority must be published or its reserved CSpace reset"]
 pub struct PreparedSupervisedEphemeralSource {
     cspace_identity: CSpaceIdentity,
@@ -465,8 +483,9 @@ pub struct PreparedSupervisedEphemeralSource {
 /// resolved through an exact typed CSpace reference.
 ///
 /// No durable identity, parent token, or local capability is exposed. The
-/// one-shot receipt can leave a reserved-space callback for table publication
-/// after registry postflight.
+/// move-only publication receipt can leave a reserved-space callback for table
+/// publication after registry postflight; registry lifecycle state, rather
+/// than the value alone, provides global uniqueness.
 #[must_use = "the prepared proxy must be published or its reserved CSpace reset"]
 pub struct PreparedSupervisedPersistentProxySource {
     cspace_identity: CSpaceIdentity,
@@ -589,8 +608,9 @@ impl ComponentAuthority {
     }
 
     /// Validate inside a reserved-space callback and return a detached,
-    /// non-duplicable receipt containing only copyable metadata for publication
-    /// after that callback succeeds.
+    /// move-only validation receipt containing only publication metadata. A
+    /// repeated validation can return another receipt; the caller's reservation
+    /// and lifecycle gate make publication unique.
     pub fn prepare_supervised_ephemeral_source_in<T: ComponentHostResource>(
         cspace: &CSpace,
         cap: Cap,
@@ -888,6 +908,12 @@ fn validate_ephemeral_cap<T: ComponentHostResource>(
         Err(CapError::NotPersistent) => {}
         Err(error) => return Err(map_cap_error(error)),
     }
+
+    // Management authority is never an ordinary component operation. Check
+    // both the actual capability and the requested ceiling independently of
+    // the externally implementable trait constant. This follows the stable
+    // invalid/type/persistent error ordering above without trusting that
+    // constant for the eventual authority decision.
     if held.intersect(MANAGEMENT) != Rights::NONE
         || rights_ceiling.intersect(MANAGEMENT) != Rights::NONE
         || !rights_ceiling.contains(held)

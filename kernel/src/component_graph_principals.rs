@@ -88,7 +88,7 @@ use vibeos_component_host::{
 use vibeos_component_runtime::host::{AtomicHostOperationSlot, HostOperationToken, HostWakeToken};
 
 #[cfg(feature = "wasm-c65-async-chain-acceptance")]
-use crate::exec::OneShotWaitQueue;
+use crate::exec::{OneShotWaitQueue, MAX_PREPARED_TASK_REGISTRATION_RESERVE};
 use crate::exec::{PreparedTaskBatch, TaskHandle, TaskState};
 use crate::heap::{AllocationDomain, FreshDomainBatchError, OwnerId};
 #[cfg(feature = "wasm-c65-async-chain-acceptance")]
@@ -166,6 +166,13 @@ const C65_SINK_WRITER_TYPE: ResourceTypeId = ResourceTypeId(0xC6_05_0005);
 const C65_NODE_COUNT: usize = 3;
 #[cfg(feature = "wasm-c65-async-chain-acceptance")]
 const C65_ALL_NODES_MASK: u8 = (1 << C65_NODE_COUNT) - 1;
+#[cfg(feature = "wasm-c65-async-chain-acceptance")]
+const C65_NODE_OUTBOUND_REGISTRATION_RESERVE: usize = 1;
+#[cfg(feature = "wasm-c65-async-chain-acceptance")]
+const C65_SUPERVISOR_OUTBOUND_REGISTRATION_RESERVE: usize = C65_NODE_COUNT + 3;
+#[cfg(feature = "wasm-c65-async-chain-acceptance")]
+const _: () =
+    assert!(C65_SUPERVISOR_OUTBOUND_REGISTRATION_RESERVE <= MAX_PREPARED_TASK_REGISTRATION_RESERVE);
 #[cfg(feature = "wasm-c65-async-chain-acceptance")]
 const C65_HOST_WAKE_TAG: usize = 0x4336_3548_4f53_5457;
 #[cfg(feature = "wasm-c65-async-chain-acceptance")]
@@ -576,6 +583,13 @@ impl ComponentGraphPrincipalRun {
     pub async fn wait(
         self,
     ) -> Result<ComponentGraphPrincipalReports, ComponentGraphPrincipalLifecycleError> {
+        // The observer owns one outbound Join edge. Reserve it before polling
+        // the target so an allocation failure drops only this non-authoritative
+        // observation handle; the SYSTEM supervisor remains independently
+        // scheduled and completes graph teardown.
+        if !crate::exec::try_reserve_current_task_registrations(1) {
+            return Err(ComponentGraphPrincipalLifecycleError::SupervisorUnavailable);
+        }
         let exit = self.supervisor.join().await;
         if exit.state() != TaskState::Exited {
             return Err(ComponentGraphPrincipalLifecycleError::SupervisorUnavailable);
@@ -3237,6 +3251,8 @@ fn start_component_graph_principals_inner(
     revalidate_template(&template)?;
     let route = select_resource_route(&template, route_request)?;
     let async_route = select_async_route(&template, async_request)?;
+    #[cfg(feature = "wasm-c65-async-chain-acceptance")]
+    let c65_registration_shape = matches!(async_route, AsyncRoutePlan::C65Exact { .. });
     let mut plans = checked_plan(&template)?;
     bind_expected_resource_peaks(&mut plans, route)?;
     #[cfg(feature = "wasm-c65-async-chain-acceptance")]
@@ -3330,6 +3346,25 @@ fn start_component_graph_principals_inner(
         abort_pristine_registry_batch(&tokens, &domains)?;
         return Err(ComponentGraphPrincipalLifecycleError::SchedulerReservation);
     }
+    #[cfg(feature = "wasm-c65-async-chain-acceptance")]
+    let (managed_outbound_reserve, supervisor_outbound_reserve) = if c65_registration_shape {
+        (
+            C65_NODE_OUTBOUND_REGISTRATION_RESERVE,
+            C65_SUPERVISOR_OUTBOUND_REGISTRATION_RESERVE,
+        )
+    } else {
+        (0, 1)
+    };
+    #[cfg(not(feature = "wasm-c65-async-chain-acceptance"))]
+    let (managed_outbound_reserve, supervisor_outbound_reserve) = (0, 1);
+    if batch
+        .reserve_managed_task_ledgers(managed_outbound_reserve, supervisor_outbound_reserve, 1)
+        .is_err()
+    {
+        drop(batch);
+        abort_pristine_registry_batch(&tokens, &domains)?;
+        return Err(ComponentGraphPrincipalLifecycleError::SchedulerReservation);
+    }
 
     for index in 0..plans.len() {
         unsafe {
@@ -3356,12 +3391,6 @@ fn start_component_graph_principals_inner(
     system.restore();
 
     let supervisor_index = plans.len();
-    if !batch.try_reserve_prepared_task_registrations(supervisor_index, 1) {
-        lifecycle_invariant_failed(
-            &tokens,
-            "graph principal supervisor registration reservation failed",
-        );
-    }
     if install_payloads(&plans, &tokens, &mut tables).is_err() {
         lifecycle_invariant_failed(&tokens, "graph principal payload installation failed");
     }
@@ -3458,6 +3487,13 @@ pub(crate) fn run_host_model_selftest() -> bool {
         || completion_guest_calls(encode_runtime_unavailable_completion(1)) != Some(1)
         || encode_runtime_unavailable_completion(RUNTIME_UNAVAILABLE_GUEST_CALL_MASK + 1)
             != INVALID_ENVELOPE_COMPLETION
+    {
+        return false;
+    }
+    #[cfg(feature = "wasm-c65-async-chain-acceptance")]
+    if C65_NODE_OUTBOUND_REGISTRATION_RESERVE != 1
+        || C65_SUPERVISOR_OUTBOUND_REGISTRATION_RESERVE != 6
+        || C65_SUPERVISOR_OUTBOUND_REGISTRATION_RESERVE > MAX_PREPARED_TASK_REGISTRATION_RESERVE
     {
         return false;
     }

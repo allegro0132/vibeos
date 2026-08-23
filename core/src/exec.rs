@@ -1129,7 +1129,10 @@ pub struct TaskHandle {
 
 /// Allocation-free C4.8 evidence that one terminal task retained no outbound
 /// wake edge after the executor's permanent-detach drain.
-#[cfg(feature = "wasm-c48-target-acceptance")]
+#[cfg(any(
+    feature = "wasm-c48-target-acceptance",
+    feature = "wasm-c66-node-replacement-acceptance"
+))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AcceptanceTaskRegistrationStats {
     pub total: usize,
@@ -1193,6 +1196,58 @@ impl TaskHandle {
         self.status.polls.load(Ordering::Acquire)
     }
 
+    /// Prove under the scheduler lock that this exact published task is
+    /// parked: it is neither running on any hart nor queued ready for another
+    /// quantum. This acceptance-only predicate exposes no task/status address
+    /// and grants no wake, cancellation, or lookup authority.
+    #[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+    pub fn acceptance_is_parked_exact(&self) -> bool {
+        if !self.is_published() || self.status.raw_state() != TaskState::Running as u8 {
+            return false;
+        }
+        let scheduler = SCHED.lock();
+        let parked = scheduler.tasks.get(&self.id).is_some_and(|task| {
+            task.domain == self.domain
+                && Arc::ptr_eq(&task.status, &self.status)
+                && task.publication == TaskPublication::Published
+                && !task.ready
+        });
+        parked
+            && !scheduler.running_tasks().any(|running| {
+                running.id == self.id
+                    || running.domain == self.domain
+                    || Arc::ptr_eq(&running.status, &self.status)
+            })
+    }
+
+    /// Prove that this exact retained handle names the task whose poll is
+    /// currently executing. The private `TaskStatus` identity is compared
+    /// under the scheduler lock, so a copied task number or allocation domain
+    /// cannot authorize an acceptance-only handoff.
+    #[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+    pub fn acceptance_is_current_exact(&self) -> bool {
+        if !self.is_published() || self.status.raw_state() != TaskState::Running as u8 {
+            return false;
+        }
+        let Some(hart) = current_scheduler_hart() else {
+            return false;
+        };
+        let Some(current_status) = CURRENT_TASK_STATUS[hart.index()].lock().clone() else {
+            return false;
+        };
+        let scheduler = SCHED.lock();
+        scheduler.harts[hart.index()]
+            .running
+            .as_ref()
+            .is_some_and(|running| {
+                running.hart == hart
+                    && running.id == self.id
+                    && running.domain == self.domain
+                    && Arc::ptr_eq(&running.status, &self.status)
+                    && Arc::ptr_eq(&running.status, &current_status)
+            })
+    }
+
     /// Number of tasks currently registered to join this task.
     ///
     /// This is exposed for runtime diagnostics and reclamation invariants.
@@ -1215,7 +1270,10 @@ impl TaskHandle {
     /// executor has published a terminal state, proving that fault detach
     /// drained this task's wait/timer/join/IRQ edges without relying on noisy
     /// machine-global service counters.
-    #[cfg(feature = "wasm-c48-target-acceptance")]
+    #[cfg(any(
+        feature = "wasm-c48-target-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance"
+    ))]
     pub fn acceptance_registration_stats(&self) -> AcceptanceTaskRegistrationStats {
         assert!(
             self.is_published(),

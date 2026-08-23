@@ -1,14 +1,17 @@
 use std::sync::Arc;
 
 use vibeos_component_admission::{
-    admit_component_graph, admit_component_graph_with_resource_policy, ArtifactTrust,
-    CallerAuthority, ComponentArtifact, ComponentGraphAdmissionPolicy, ComponentGraphCyclePolicy,
-    ComponentGraphNodeAdmissionPolicy, ComponentGraphResourceEdgePolicy,
+    admit_component_graph, admit_component_graph_replacement,
+    admit_component_graph_with_resource_policy, ArtifactTrust, CallerAuthority, ComponentArtifact,
+    ComponentGraphAdmissionPolicy, ComponentGraphCyclePolicy, ComponentGraphNodeAdmissionPolicy,
+    ComponentGraphNodeReplacementPolicy, ComponentGraphReplacementEdgeAction,
+    ComponentGraphReplacementEdgePolicy, ComponentGraphResourceEdgePolicy,
     ComponentGraphResourceMode, InstanceLimits, ProfileIdentity,
 };
 use vibeos_component_command::{
-    ComponentGraphNodePrincipalTemplate, ComponentGraphNodeReportError, ComponentGraphNodeTerminal,
-    ComponentGraphPrincipalIsolation, ComponentGraphPrincipalTemplate,
+    ComponentGraphNodePrincipalTemplate, ComponentGraphNodeReplacementTemplate,
+    ComponentGraphNodeReportError, ComponentGraphNodeTerminal, ComponentGraphPrincipalIsolation,
+    ComponentGraphPrincipalTemplate,
 };
 use vibeos_component_runtime::{
     graph::{
@@ -79,6 +82,8 @@ const ASYNC_SOURCE_WAT: &str =
     include_str!("../../../policy/image/artifacts/c65-async-source.component.wat");
 const ASYNC_RELAY_WAT: &str =
     include_str!("../../../policy/image/artifacts/c65-async-relay.component.wat");
+const ASYNC_RELAY_V2_WAT: &str =
+    include_str!("../../../policy/image/artifacts/c66-async-relay-v2.component.wat");
 const ASYNC_SINK_WAT: &str =
     include_str!("../../../policy/image/artifacts/c65-async-sink.component.wat");
 const ASYNC_SOURCE_WORLD: &str = "test:c65-chain/source@1.0.0";
@@ -109,6 +114,13 @@ fn second_async_edge() -> ComponentGraphEdgeSpec {
         ComponentGraphExportEndpoint::new(graph_node(1), graph_entity(0)),
         ComponentGraphImportEndpoint::new(graph_node(2), graph_entity(0)),
     )
+}
+
+fn recreate(edge: ComponentGraphEdgeSpec) -> ComponentGraphReplacementEdgePolicy {
+    ComponentGraphReplacementEdgePolicy {
+        edge,
+        action: ComponentGraphReplacementEdgeAction::RecreateFresh,
+    }
 }
 
 fn limits(
@@ -218,9 +230,11 @@ fn admitted_resource_graph() -> vibeos_component_admission::AdmittedComponentGra
     .expect("exact resource graph must admit")
 }
 
-fn admitted_async_graph() -> vibeos_component_admission::AdmittedComponentGraph {
+fn admitted_async_graph_with_relay(
+    relay_wat: &str,
+) -> vibeos_component_admission::AdmittedComponentGraph {
     let source_bytes = wat::parse_str(ASYNC_SOURCE_WAT).expect("source must encode");
-    let relay_bytes = wat::parse_str(ASYNC_RELAY_WAT).expect("relay must encode");
+    let relay_bytes = wat::parse_str(relay_wat).expect("relay must encode");
     let sink_bytes = wat::parse_str(ASYNC_SINK_WAT).expect("sink must encode");
     let empty_bytes = wat::parse_str("(component)").expect("empty component must encode");
     let source = ComponentArtifact::copy_from(&source_bytes, ProfileIdentity::PROFILE_1_ASYNC)
@@ -292,6 +306,26 @@ fn admitted_async_graph() -> vibeos_component_admission::AdmittedComponentGraph 
         &CallerAuthority { offers: &[] },
     )
     .expect("exact async graph must admit")
+}
+
+fn admitted_async_graph() -> vibeos_component_admission::AdmittedComponentGraph {
+    admitted_async_graph_with_relay(ASYNC_RELAY_WAT)
+}
+
+fn admitted_async_replacement() -> vibeos_component_admission::AdmittedComponentGraphReplacement {
+    let current = Arc::new(admitted_async_graph_with_relay(ASYNC_RELAY_WAT));
+    let candidate = Arc::new(admitted_async_graph_with_relay(ASYNC_RELAY_V2_WAT));
+    let incident_edges = [recreate(second_async_edge()), recreate(async_edge())];
+    admit_component_graph_replacement(
+        current,
+        candidate,
+        &ComponentGraphNodeReplacementPolicy {
+            target: graph_node(1),
+            max_replacements: 1,
+            incident_edges: &incident_edges,
+        },
+    )
+    .expect("exact async relay replacement must admit")
 }
 
 #[test]
@@ -610,4 +644,80 @@ fn debug_output_redacts_admitted_graph_and_artifact_identity() {
     assert!(!report_debug.contains("TaskId"));
     assert!(!report_debug.contains("CSpace"));
     assert!(!report_debug.contains("Cap("));
+}
+
+#[test]
+fn replacement_template_is_exact_inert_send_sync_and_revalidates_twice() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<ComponentGraphNodeReplacementTemplate>();
+    let admitted = Arc::new(admitted_async_replacement());
+    let manifest = admitted.manifest();
+    let template = ComponentGraphNodeReplacementTemplate::new(Arc::clone(&admitted))
+        .expect("sealed replacement must project");
+
+    assert!(!template.runtime_ready());
+    assert!(core::ptr::eq(
+        template.admitted_replacement(),
+        admitted.as_ref()
+    ));
+    assert_eq!(template.target(), graph_node(1));
+    assert_eq!(template.max_replacements(), 1);
+    assert_eq!(
+        template.incident_edges(),
+        [recreate(async_edge()), recreate(second_async_edge())]
+    );
+    assert_eq!(template.transient_account(), manifest.transient_account());
+    assert_eq!(template.current_graph().async_edges().len(), 2);
+    assert_eq!(template.candidate_graph().async_edges().len(), 2);
+    assert_eq!(
+        template
+            .current_principal()
+            .expect("current target projection")
+            .label(),
+        "async-relay"
+    );
+    assert_ne!(
+        template
+            .candidate_principal()
+            .expect("candidate target projection")
+            .artifact(),
+        template
+            .current_principal()
+            .expect("current target projection")
+            .artifact()
+    );
+    template.revalidate().expect("first template revalidation");
+    template.revalidate().expect("second template revalidation");
+}
+
+#[test]
+fn replacement_template_debug_redacts_graphs_artifacts_and_runtime_identities() {
+    let template =
+        ComponentGraphNodeReplacementTemplate::new(Arc::new(admitted_async_replacement()))
+            .expect("sealed replacement must project");
+    let output = format!("{template:?}");
+
+    assert!(output.contains("ComponentGraphNodeReplacementTemplate"));
+    assert!(output.contains("<redacted>"));
+    assert!(output.contains("max_replacements: 1"));
+    assert!(output.contains("RecreateFresh"));
+    assert!(output.contains("runtime_ready: false"));
+    for forbidden in [
+        "ComponentIdentity",
+        "async-relay",
+        "test:c65-chain",
+        "TaskId",
+        "CSpace",
+        "Cap(",
+        "ResourceToken",
+        "HostOperationToken",
+        "generation",
+        "digest",
+    ] {
+        assert!(
+            !output.contains(forbidden),
+            "replacement Debug leaked {forbidden}: {output}"
+        );
+    }
 }

@@ -130,6 +130,15 @@ wasm-c65-async-chain-acceptance = [
     "dep:vibeos-component-admission",
     "vibeos-image-policy/c65-async-chain-qemu-acceptance",
 ]
+# QEMU image gate for the C6.6 validation-only single-node replacement proof.
+# Both old and candidate incarnations are admitted from exact image pins, while
+# the replacement supervisor keeps guest execution disabled throughout.
+wasm-c66-node-replacement-acceptance = [
+    "component-graph-principals",
+    "dep:vibeos-component-admission",
+    "vibeos-core/wasm-c66-node-replacement-acceptance",
+    "vibeos-image-policy/c66-node-replacement-qemu-acceptance",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

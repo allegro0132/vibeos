@@ -4,12 +4,12 @@
 //! It never stores a borrowed runtime graph, a live capability, or an
 //! executable entry point.
 
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::fmt;
 
 use sha2::{Digest, Sha256};
 use vibeos_component_format::{
-    ComponentGraphAccount, ComponentGraphInstanceBudget, ComponentGraphNodeBudget,
+    ComponentGraphAccount, ComponentGraphInstanceBudget, ComponentGraphNodeBudget, LimitError,
     PROFILE_1_COMPONENT_GRAPH_LIMITS, PROFILE_1_LIMITS,
 };
 use vibeos_component_host::{HostManifestError, HostResourceKind, VibeHostManifest};
@@ -84,6 +84,36 @@ pub struct ComponentGraphResourceEdgePolicy {
     pub mode: ComponentGraphResourceMode,
 }
 
+/// Required lifecycle action for one edge incident to a replaced node.
+///
+/// `RecreateFresh` never authorizes an old endpoint to resolve to a new
+/// resource. A later kernel supervisor must revoke the old route and create a
+/// fresh route whose capabilities are published under the exact replacement
+/// lifecycle. This value is capability-free policy metadata.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentGraphReplacementEdgeAction {
+    RecreateFresh,
+}
+
+/// Trusted replacement action for one exact graph edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ComponentGraphReplacementEdgePolicy {
+    pub edge: ComponentGraphEdgeSpec,
+    pub action: ComponentGraphReplacementEdgeAction,
+}
+
+/// Trusted policy for one validation-only C6.6 node replacement.
+///
+/// The incident-edge slice must cover all and only the edges touching
+/// `target`. Admission canonicalizes the slice before sealing it, so caller
+/// order cannot become runtime routing authority.
+#[derive(Clone, Copy, Debug)]
+pub struct ComponentGraphNodeReplacementPolicy<'a> {
+    pub target: ComponentGraphNodeId,
+    pub max_replacements: u16,
+    pub incident_edges: &'a [ComponentGraphReplacementEdgePolicy],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentGraphBindingMismatch {
     InterfaceVersion,
@@ -156,6 +186,25 @@ pub enum ComponentGraphAdmissionError {
     RevalidationMismatch,
 }
 
+/// Failure while admitting or freshly revalidating one node replacement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentGraphReplacementAdmissionError {
+    CurrentGraph(ComponentGraphAdmissionError),
+    CandidateGraph(ComponentGraphAdmissionError),
+    InvalidPolicy,
+    UnknownTarget { target: ComponentGraphNodeId },
+    GraphMismatch,
+    NonTargetMismatch { node: ComponentGraphNodeId },
+    TargetContractMismatch,
+    UnsupportedTargetSurface,
+    IncidentEdgePolicyMismatch,
+    ResourceShapeMismatch,
+    AsyncShapeMismatch,
+    TransientAccountLimit(LimitError),
+    Allocation,
+    RevalidationMismatch,
+}
+
 impl From<vibeos_component_runtime::graph::ComponentGraphError> for ComponentGraphAdmissionError {
     fn from(error: vibeos_component_runtime::graph::ComponentGraphError) -> Self {
         Self::Graph(error)
@@ -211,6 +260,41 @@ impl fmt::Display for ComponentGraphAdmissionError {
             Self::Allocation => "component graph admission allocation failed",
             Self::RevalidationMismatch => {
                 "component graph revalidation differs from its admitted manifest"
+            }
+        })
+    }
+}
+
+impl fmt::Display for ComponentGraphReplacementAdmissionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::CurrentGraph(_) => "current component graph revalidation failed",
+            Self::CandidateGraph(_) => "candidate component graph revalidation failed",
+            Self::InvalidPolicy => "component graph replacement policy is invalid",
+            Self::UnknownTarget { .. } => "component graph replacement target does not exist",
+            Self::GraphMismatch => "candidate graph structure differs from the current graph",
+            Self::NonTargetMismatch { .. } => {
+                "candidate graph changes a principal outside the replacement target"
+            }
+            Self::TargetContractMismatch => {
+                "replacement target changes its exact admitted contract"
+            }
+            Self::UnsupportedTargetSurface => {
+                "replacement target uses authority or nesting outside the C6.6 surface"
+            }
+            Self::IncidentEdgePolicyMismatch => {
+                "replacement policy does not exactly cover the target incident edges"
+            }
+            Self::ResourceShapeMismatch => {
+                "replacement changes validator-proven resource edge shape"
+            }
+            Self::AsyncShapeMismatch => "replacement changes exact async edge shape",
+            Self::TransientAccountLimit(_) => {
+                "replacement prepublication peak exceeds graph limits"
+            }
+            Self::Allocation => "component graph replacement admission allocation failed",
+            Self::RevalidationMismatch => {
+                "component graph replacement differs from its admitted manifest"
             }
         })
     }
@@ -523,6 +607,99 @@ impl AdmittedComponentGraph {
     /// graph before accepting the stored manifest again.
     pub fn revalidate(&self) -> Result<(), ComponentGraphAdmissionError> {
         revalidate_component_graph(self)
+    }
+}
+
+/// Canonical, capability-free manifest for one admitted node replacement.
+///
+/// Edge actions are sorted by their complete graph-local endpoint tuple. The
+/// transient account includes the current graph plus the candidate target, as
+/// required to prepare a replacement before revoking the current node.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ComponentGraphReplacementManifest {
+    target: ComponentGraphNodeId,
+    max_replacements: u16,
+    incident_edges: Vec<ComponentGraphReplacementEdgePolicy>,
+    transient_account: ComponentGraphAccount,
+}
+
+impl ComponentGraphReplacementManifest {
+    pub const fn target(&self) -> ComponentGraphNodeId {
+        self.target
+    }
+
+    pub const fn max_replacements(&self) -> u16 {
+        self.max_replacements
+    }
+
+    pub fn incident_edges(&self) -> &[ComponentGraphReplacementEdgePolicy] {
+        &self.incident_edges
+    }
+
+    pub const fn transient_account(&self) -> ComponentGraphAccount {
+        self.transient_account
+    }
+}
+
+/// Sealed result of admitting one exact C6.6 node replacement.
+///
+/// Both complete graphs remain owned by this record. Construction and
+/// [`Self::revalidate`] freshly inspect both graphs, prove that only `target`
+/// may change artifact, and prove that every incident edge is explicitly
+/// recreated with fresh resources. The record contains no runtime identity,
+/// capability, durable ID, ambient lookup key, or executable entry point.
+///
+/// ```compile_fail
+/// use vibeos_component_admission::AdmittedComponentGraphReplacement;
+/// fn run(replacement: &AdmittedComponentGraphReplacement) { replacement.run(); }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_admission::AdmittedComponentGraphReplacement;
+/// fn instantiate(replacement: &AdmittedComponentGraphReplacement) {
+///     replacement.instantiate();
+/// }
+/// ```
+pub struct AdmittedComponentGraphReplacement {
+    current: Arc<AdmittedComponentGraph>,
+    candidate: Arc<AdmittedComponentGraph>,
+    manifest: ComponentGraphReplacementManifest,
+    _sealed: private::Seal,
+}
+
+impl AdmittedComponentGraphReplacement {
+    pub fn current_graph(&self) -> &AdmittedComponentGraph {
+        &self.current
+    }
+
+    pub fn candidate_graph(&self) -> &AdmittedComponentGraph {
+        &self.candidate
+    }
+
+    /// Share the immutable current admission record without exposing its
+    /// artifact bytes or adding any runtime authority.
+    pub fn current_graph_arc(&self) -> &Arc<AdmittedComponentGraph> {
+        &self.current
+    }
+
+    /// Share the immutable candidate admission record without exposing its
+    /// artifact bytes or adding any runtime authority.
+    pub fn candidate_graph_arc(&self) -> &Arc<AdmittedComponentGraph> {
+        &self.candidate
+    }
+
+    pub const fn manifest(&self) -> &ComponentGraphReplacementManifest {
+        &self.manifest
+    }
+
+    pub const fn runtime_ready(&self) -> bool {
+        false
+    }
+
+    /// Re-decode both complete graphs and reconstruct the canonical
+    /// replacement relation before accepting the stored manifest again.
+    pub fn revalidate(&self) -> Result<(), ComponentGraphReplacementAdmissionError> {
+        revalidate_component_graph_replacement(self)
     }
 }
 
@@ -2175,6 +2352,236 @@ fn revalidate_component_graph(
     }
     if observed_grants != admitted.grants.len() {
         return Err(ComponentGraphAdmissionError::RevalidationMismatch);
+    }
+    Ok(())
+}
+
+fn replacement_edge_key(policy: &ComponentGraphReplacementEdgePolicy) -> (u16, u16, u16, u16) {
+    (
+        policy.edge.source().node().index(),
+        policy.edge.source().export().index(),
+        policy.edge.target().node().index(),
+        policy.edge.target().import().index(),
+    )
+}
+
+fn edge_touches_target(edge: ComponentGraphEdgeSpec, target: ComponentGraphNodeId) -> bool {
+    edge.source().node() == target || edge.target().node() == target
+}
+
+fn canonical_incident_replacement_edges(
+    manifest: &ComponentGraphManifest,
+    target: ComponentGraphNodeId,
+) -> Result<Vec<ComponentGraphReplacementEdgePolicy>, ComponentGraphReplacementAdmissionError> {
+    let count = manifest
+        .edges
+        .iter()
+        .filter(|edge| edge_touches_target(**edge, target))
+        .count();
+    let mut edges = Vec::new();
+    edges
+        .try_reserve_exact(count)
+        .map_err(|_| ComponentGraphReplacementAdmissionError::Allocation)?;
+    for edge in manifest
+        .edges
+        .iter()
+        .copied()
+        .filter(|edge| edge_touches_target(*edge, target))
+    {
+        edges.push(ComponentGraphReplacementEdgePolicy {
+            edge,
+            action: ComponentGraphReplacementEdgeAction::RecreateFresh,
+        });
+    }
+    edges.sort_unstable_by_key(replacement_edge_key);
+    Ok(edges)
+}
+
+fn target_uses_unsupported_replacement_surface(
+    graph: &AdmittedComponentGraph,
+    target: ComponentGraphNodeId,
+) -> bool {
+    let manifest = graph.manifest();
+    manifest
+        .nodes
+        .get(usize::from(target.index()))
+        .is_none_or(|node| node.nesting != ComponentGraphNesting::Root)
+        || manifest.nodes.iter().any(|node| {
+            matches!(node.nesting, ComponentGraphNesting::Nested { parent } if parent == target)
+        })
+        || manifest
+            .external_imports
+            .iter()
+            .any(|external| external.target().node() == target)
+        || manifest
+            .published_exports
+            .iter()
+            .any(|published| published.source().node() == target)
+        || graph
+            .grants()
+            .iter()
+            .any(|grant| grant.target().node() == target)
+}
+
+fn derive_component_graph_replacement_manifest(
+    current: &AdmittedComponentGraph,
+    candidate: &AdmittedComponentGraph,
+    policy: &ComponentGraphNodeReplacementPolicy<'_>,
+) -> Result<ComponentGraphReplacementManifest, ComponentGraphReplacementAdmissionError> {
+    if policy.max_replacements != 1
+        || policy.incident_edges.len() > PROFILE_1_COMPONENT_GRAPH_LIMITS.max_edges as usize
+    {
+        return Err(ComponentGraphReplacementAdmissionError::InvalidPolicy);
+    }
+
+    let current_manifest = current.manifest();
+    let candidate_manifest = candidate.manifest();
+    let target_index = usize::from(policy.target.index());
+    let Some(current_target) = current_manifest.nodes.get(target_index) else {
+        return Err(ComponentGraphReplacementAdmissionError::UnknownTarget {
+            target: policy.target,
+        });
+    };
+    let Some(candidate_target) = candidate_manifest.nodes.get(target_index) else {
+        return Err(ComponentGraphReplacementAdmissionError::UnknownTarget {
+            target: policy.target,
+        });
+    };
+
+    if current_manifest.name != candidate_manifest.name
+        || current_manifest.profile != candidate_manifest.profile
+        || current_manifest.cycle_policy != candidate_manifest.cycle_policy
+        || current_manifest.nodes.len() != candidate_manifest.nodes.len()
+        || current_manifest.edges != candidate_manifest.edges
+        || current_manifest.external_imports != candidate_manifest.external_imports
+        || current_manifest.published_exports != candidate_manifest.published_exports
+        || current.grants() != candidate.grants()
+    {
+        return Err(ComponentGraphReplacementAdmissionError::GraphMismatch);
+    }
+
+    for (index, (current_node, candidate_node)) in current_manifest
+        .nodes
+        .iter()
+        .zip(&candidate_manifest.nodes)
+        .enumerate()
+    {
+        if index != target_index
+            && (current_node != candidate_node
+                || current.node_inspections()[index] != candidate.node_inspections()[index])
+        {
+            return Err(ComponentGraphReplacementAdmissionError::NonTargetMismatch {
+                node: ComponentGraphNodeId::new(index as u16),
+            });
+        }
+    }
+
+    let current_target_inspection = &current.node_inspections()[target_index];
+    let candidate_target_inspection = &candidate.node_inspections()[target_index];
+    if current_target.id != candidate_target.id
+        || current_target.label != candidate_target.label
+        || current_target.profile != candidate_target.profile
+        || current_target.world != candidate_target.world
+        || current_target.world_contract != candidate_target.world_contract
+        || current_target.nesting != candidate_target.nesting
+        || current_target.limits != candidate_target.limits
+        || current_target.interfaces != candidate_target.interfaces
+        || current_target_inspection.profile() != candidate_target_inspection.profile()
+        || current_target_inspection.world() != candidate_target_inspection.world()
+        || current_target_inspection.imports() != candidate_target_inspection.imports()
+        || current_target_inspection.exports() != candidate_target_inspection.exports()
+    {
+        return Err(ComponentGraphReplacementAdmissionError::TargetContractMismatch);
+    }
+
+    if target_uses_unsupported_replacement_surface(current, policy.target)
+        || target_uses_unsupported_replacement_surface(candidate, policy.target)
+    {
+        return Err(ComponentGraphReplacementAdmissionError::UnsupportedTargetSurface);
+    }
+
+    if current_manifest.resource_edges != candidate_manifest.resource_edges {
+        return Err(ComponentGraphReplacementAdmissionError::ResourceShapeMismatch);
+    }
+    if current_manifest.async_edges != candidate_manifest.async_edges {
+        return Err(ComponentGraphReplacementAdmissionError::AsyncShapeMismatch);
+    }
+
+    let canonical = canonical_incident_replacement_edges(current_manifest, policy.target)?;
+    let mut supplied = Vec::new();
+    supplied
+        .try_reserve_exact(policy.incident_edges.len())
+        .map_err(|_| ComponentGraphReplacementAdmissionError::Allocation)?;
+    supplied.extend_from_slice(policy.incident_edges);
+    supplied.sort_unstable_by_key(replacement_edge_key);
+    if supplied != canonical {
+        return Err(ComponentGraphReplacementAdmissionError::IncidentEdgePolicyMismatch);
+    }
+
+    let mut transient_account = current_manifest.account;
+    transient_account
+        .charge_node(candidate_target.budget)
+        .map_err(ComponentGraphReplacementAdmissionError::TransientAccountLimit)?;
+
+    Ok(ComponentGraphReplacementManifest {
+        target: policy.target,
+        max_replacements: policy.max_replacements,
+        incident_edges: canonical,
+        transient_account,
+    })
+}
+
+/// Admit one exact, validation-only C6.6 graph-node replacement.
+///
+/// Both complete graph records are freshly revalidated before this function
+/// proves that only the target artifact may differ. All target incident edges
+/// must explicitly select [`ComponentGraphReplacementEdgeAction::RecreateFresh`].
+/// No runtime allocation, authority lookup, capability movement, or guest
+/// execution is reachable from this API.
+pub fn admit_component_graph_replacement(
+    current: Arc<AdmittedComponentGraph>,
+    candidate: Arc<AdmittedComponentGraph>,
+    policy: &ComponentGraphNodeReplacementPolicy<'_>,
+) -> Result<AdmittedComponentGraphReplacement, ComponentGraphReplacementAdmissionError> {
+    current
+        .revalidate()
+        .map_err(ComponentGraphReplacementAdmissionError::CurrentGraph)?;
+    candidate
+        .revalidate()
+        .map_err(ComponentGraphReplacementAdmissionError::CandidateGraph)?;
+    let manifest = derive_component_graph_replacement_manifest(&current, &candidate, policy)?;
+    Ok(AdmittedComponentGraphReplacement {
+        current,
+        candidate,
+        manifest,
+        _sealed: private::Seal,
+    })
+}
+
+fn revalidate_component_graph_replacement(
+    admitted: &AdmittedComponentGraphReplacement,
+) -> Result<(), ComponentGraphReplacementAdmissionError> {
+    admitted
+        .current
+        .revalidate()
+        .map_err(ComponentGraphReplacementAdmissionError::CurrentGraph)?;
+    admitted
+        .candidate
+        .revalidate()
+        .map_err(ComponentGraphReplacementAdmissionError::CandidateGraph)?;
+    let policy = ComponentGraphNodeReplacementPolicy {
+        target: admitted.manifest.target,
+        max_replacements: admitted.manifest.max_replacements,
+        incident_edges: &admitted.manifest.incident_edges,
+    };
+    let observed = derive_component_graph_replacement_manifest(
+        &admitted.current,
+        &admitted.candidate,
+        &policy,
+    )
+    .map_err(|_| ComponentGraphReplacementAdmissionError::RevalidationMismatch)?;
+    if observed != admitted.manifest || admitted.runtime_ready() {
+        return Err(ComponentGraphReplacementAdmissionError::RevalidationMismatch);
     }
     Ok(())
 }

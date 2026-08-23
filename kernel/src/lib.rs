@@ -93,10 +93,16 @@ compile_error!("feature `wasm-c64-resource-route-acceptance` requires the QEMU d
 ))]
 compile_error!("feature `wasm-c65-async-chain-acceptance` requires the QEMU default image");
 #[cfg(all(
+    feature = "wasm-c66-node-replacement-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c66-node-replacement-acceptance` requires the QEMU default image");
+#[cfg(all(
     any(
         feature = "wasm-c63-graph-principal-acceptance",
         feature = "wasm-c64-resource-route-acceptance",
-        feature = "wasm-c65-async-chain-acceptance"
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance"
     ),
     any(
         all(
@@ -110,10 +116,22 @@ compile_error!("feature `wasm-c65-async-chain-acceptance` requires the QEMU defa
         all(
             feature = "wasm-c64-resource-route-acceptance",
             feature = "wasm-c65-async-chain-acceptance"
+        ),
+        all(
+            feature = "wasm-c63-graph-principal-acceptance",
+            feature = "wasm-c66-node-replacement-acceptance"
+        ),
+        all(
+            feature = "wasm-c64-resource-route-acceptance",
+            feature = "wasm-c66-node-replacement-acceptance"
+        ),
+        all(
+            feature = "wasm-c65-async-chain-acceptance",
+            feature = "wasm-c66-node-replacement-acceptance"
         )
     )
 ))]
-compile_error!("the C6.3, C6.4, and C6.5 graph acceptance images are distinct roots");
+compile_error!("the C6.3, C6.4, C6.5, and C6.6 graph acceptance images are distinct roots");
 #[cfg(all(
     feature = "component-graph-principals",
     feature = "ssh-component-command"
@@ -509,7 +527,8 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(any(
         feature = "wasm-c63-graph-principal-acceptance",
         feature = "wasm-c64-resource-route-acceptance",
-        feature = "wasm-c65-async-chain-acceptance"
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance"
     ))]
     assert!(
         component_graph_principals::run_host_model_selftest(),
@@ -729,6 +748,15 @@ pub extern "C" fn kmain() -> ! {
             crate::println!("WASM_C65_ASYNC_CHAIN PASS nodes=3 internal_edges=2 host_deliveries=2 causes=backend-fault,cancelled cascades=2 consumer_first=2 no_active_poll=1 lost_wakes=0 guest_calls=0 runtime_ready=0 fuel_consumed=0 peak_depths=8,8,8 registry_occupied=0 registry_header_mismatches=0");
         } else {
             crate::println!("WASM_C65_ASYNC_CHAIN FAIL");
+            sbi::shutdown(true);
+        }
+    });
+    #[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+    exec::spawn("wasm-c66-node-replacement-acceptance", async {
+        if component_graph_principals::run_c66_qemu_acceptance().await {
+            crate::println!("WASM_C66_NODE_REPLACEMENT PASS nodes=3 incarnations=4 replacements=1 kind=update candidate_staged=1 old_terminal_before_new_ready=1 siblings_stable=2 sibling_restarts=0 sibling_resource_tables=2 incident_edges=2 old_routes_retired=2 fresh_routes=2 sealed_handoffs=2 stale_sibling_routes=2 stale_replacement_tokens=2 late_wake_stale=1 fresh_edge_deliveries=2 sink_deliveries=1 no_active_poll=1 lost_wakes=0 terminal_receipts=4 runtime_unavailable=4 guest_calls=0 runtime_ready=0 fuel_consumed=0 live_slots=0 waiters=0 registrations=0 registry_occupied=0 registry_header_mismatches=0");
+        } else {
+            crate::println!("WASM_C66_NODE_REPLACEMENT FAIL");
             sbi::shutdown(true);
         }
     });

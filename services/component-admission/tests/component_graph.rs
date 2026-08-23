@@ -1,11 +1,17 @@
+use std::sync::Arc;
+
 use vibeos_component_admission::{
-    admit_component_graph, admit_component_graph_with_resource_policy, AdmissionError,
-    AdmittedComponentGraph, ArtifactTrust, AuthorityOffer, CallerAuthority, ComponentArtifact,
-    ComponentGraphAdmissionError, ComponentGraphAdmissionPolicy, ComponentGraphBindingMismatch,
-    ComponentGraphCyclePolicy, ComponentGraphNodeAdmissionPolicy, ComponentGraphResourceEdgePolicy,
-    ComponentGraphResourceMode, InstanceLimits, InterfaceCeiling, ProfileIdentity,
-    STREAM_FILTER_WORLD,
+    admit_component_graph, admit_component_graph_replacement,
+    admit_component_graph_with_resource_policy, AdmissionError, AdmittedComponentGraph,
+    AdmittedComponentGraphReplacement, ArtifactTrust, AuthorityOffer, CallerAuthority,
+    ComponentArtifact, ComponentGraphAdmissionError, ComponentGraphAdmissionPolicy,
+    ComponentGraphBindingMismatch, ComponentGraphCyclePolicy, ComponentGraphNodeAdmissionPolicy,
+    ComponentGraphNodeReplacementPolicy, ComponentGraphReplacementAdmissionError,
+    ComponentGraphReplacementEdgeAction, ComponentGraphReplacementEdgePolicy,
+    ComponentGraphResourceEdgePolicy, ComponentGraphResourceMode, InstanceLimits, InterfaceCeiling,
+    ProfileIdentity, STREAM_FILTER_WORLD,
 };
+use vibeos_component_format::{LimitKind, PROFILE_1_COMPONENT_GRAPH_LIMITS};
 use vibeos_component_host::{HostResourceKind, STREAM_INTERFACE};
 use vibeos_component_runtime::{
     graph::{
@@ -25,6 +31,21 @@ impl GraphAdmissionResultExt for Result<AdmittedComponentGraph, ComponentGraphAd
     fn expect_graph_error(self) -> ComponentGraphAdmissionError {
         match self {
             Ok(_) => panic!("graph admission unexpectedly succeeded"),
+            Err(error) => error,
+        }
+    }
+}
+
+trait GraphReplacementAdmissionResultExt {
+    fn expect_replacement_error(self) -> ComponentGraphReplacementAdmissionError;
+}
+
+impl GraphReplacementAdmissionResultExt
+    for Result<AdmittedComponentGraphReplacement, ComponentGraphReplacementAdmissionError>
+{
+    fn expect_replacement_error(self) -> ComponentGraphReplacementAdmissionError {
+        match self {
+            Ok(_) => panic!("graph replacement admission unexpectedly succeeded"),
             Err(error) => error,
         }
     }
@@ -87,6 +108,41 @@ const RELAY_WAT: &str = r#"
       (core module $module
         (func (export "send") (param i32) (result i32)
           local.get 0))
+      (core instance $instance (instantiate $module))
+      (alias core export $instance "send" (core func $send-core))
+      (type $send-type (func (param "value" u32) (result u32)))
+      (func $send (type $send-type) (canon lift (core func $send-core)))
+      (instance $pipe-out (export "send" (func $send)))
+      (export "test:c62/pipe@1.0.0" (instance $pipe-out)))
+"#;
+
+const PRODUCER_V2_WAT: &str = r#"
+    (component
+      (core module $module
+        (func (export "send") (param i32) (result i32)
+          local.get 0
+          i32.const 2
+          i32.add))
+      (core instance $instance (instantiate $module))
+      (alias core export $instance "send" (core func $send-core))
+      (type $send-type (func (param "value" u32) (result u32)))
+      (func $send (type $send-type) (canon lift (core func $send-core)))
+      (instance $pipe (export "send" (func $send)))
+      (export "test:c62/pipe@1.0.0" (instance $pipe)))
+"#;
+
+const RELAY_V2_WAT: &str = r#"
+    (component
+      (type $pipe
+        (instance
+          (type $send-type (func (param "value" u32) (result u32)))
+          (export "send" (func (type $send-type)))))
+      (import "test:c62/pipe@1.0.0" (instance $pipe-in (type $pipe)))
+      (core module $module
+        (func (export "send") (param i32) (result i32)
+          local.get 0
+          i32.const 1
+          i32.add))
       (core instance $instance (instantiate $module))
       (alias core export $instance "send" (core func $send-core))
       (type $send-type (func (param "value" u32) (result u32)))
@@ -477,6 +533,118 @@ fn admit_async_chain() -> Result<AdmittedComponentGraph, ComponentGraphAdmission
         vec![source, relay, sink],
         &policy,
         &CallerAuthority { offers: &[] },
+    )
+}
+
+fn recreate(edge: ComponentGraphEdgeSpec) -> ComponentGraphReplacementEdgePolicy {
+    ComponentGraphReplacementEdgePolicy {
+        edge,
+        action: ComponentGraphReplacementEdgeAction::RecreateFresh,
+    }
+}
+
+fn admit_replacement_chain_with(
+    producer_wat: &str,
+    relay_wat: &str,
+    relay_limits: InstanceLimits,
+    relay_nesting: ComponentGraphNesting,
+    publish_relay: bool,
+) -> Result<AdmittedComponentGraph, ComponentGraphAdmissionError> {
+    let producer_world = world(PIPE_WIT, PRODUCER_WORLD);
+    let relay_world = world(PIPE_WIT, RELAY_WORLD);
+    let consumer_world = world(PIPE_WIT, CONSUMER_WORLD);
+    let producer = artifact(producer_wat);
+    let relay = artifact(relay_wat);
+    let consumer = artifact(CONSUMER_WAT);
+    let mut relay_policy = policy_node("relay", &relay_world, &relay, &[]);
+    relay_policy.limits = relay_limits;
+    relay_policy.nesting = relay_nesting;
+    let nodes = [
+        policy_node("producer", &producer_world, &producer, &[]),
+        relay_policy,
+        policy_node("consumer", &consumer_world, &consumer, &[]),
+    ];
+    let edges = [edge(0, 1), edge(1, 2)];
+    let published_exports = if publish_relay {
+        vec![ComponentGraphPublishedExportSpec::new(export(1, 0))]
+    } else {
+        Vec::new()
+    };
+    let policy = ComponentGraphAdmissionPolicy {
+        name: "replacement-chain",
+        profile: ProfileIdentity::PROFILE_1,
+        nodes: &nodes,
+        edges: &edges,
+        external_imports: &[],
+        published_exports: &published_exports,
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    admit_component_graph(
+        vec![producer, relay, consumer],
+        &policy,
+        &CallerAuthority { offers: &[] },
+    )
+}
+
+fn admitted_replacement_chain(relay_wat: &str) -> Arc<AdmittedComponentGraph> {
+    Arc::new(
+        admit_replacement_chain_with(
+            PRODUCER_WAT,
+            relay_wat,
+            limits(),
+            ComponentGraphNesting::Root,
+            false,
+        )
+        .expect("replacement chain must admit"),
+    )
+}
+
+fn admitted_max_node_replacement_graph() -> Arc<AdmittedComponentGraph> {
+    const LABELS: [&str; 16] = [
+        "replacement-node-00",
+        "replacement-node-01",
+        "replacement-node-02",
+        "replacement-node-03",
+        "replacement-node-04",
+        "replacement-node-05",
+        "replacement-node-06",
+        "replacement-node-07",
+        "replacement-node-08",
+        "replacement-node-09",
+        "replacement-node-10",
+        "replacement-node-11",
+        "replacement-node-12",
+        "replacement-node-13",
+        "replacement-node-14",
+        "replacement-node-15",
+    ];
+
+    assert_eq!(
+        LABELS.len(),
+        PROFILE_1_COMPONENT_GRAPH_LIMITS.max_nodes as usize
+    );
+    let exact_world = world(PIPE_WIT, PRODUCER_WORLD);
+    let artifacts = LABELS
+        .iter()
+        .map(|_| artifact(PRODUCER_WAT))
+        .collect::<Vec<_>>();
+    let nodes = LABELS
+        .iter()
+        .zip(&artifacts)
+        .map(|(label, artifact)| policy_node(label, &exact_world, artifact, &[]))
+        .collect::<Vec<_>>();
+    let policy = ComponentGraphAdmissionPolicy {
+        name: "replacement-capacity",
+        profile: ProfileIdentity::PROFILE_1,
+        nodes: &nodes,
+        edges: &[],
+        external_imports: &[],
+        published_exports: &[],
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    Arc::new(
+        admit_component_graph(artifacts, &policy, &CallerAuthority { offers: &[] })
+            .expect("graph at the exact node ceiling must independently admit"),
     )
 }
 
@@ -1401,4 +1569,362 @@ fn node_world_failure_remains_scoped_to_the_exact_node() {
             error: AdmissionError::World(_),
         }) if failed == node(1)
     ));
+}
+
+#[test]
+fn replacement_admission_allows_only_target_artifact_change_and_canonicalizes_recreate_fresh() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<AdmittedComponentGraphReplacement>();
+    let current = admitted_replacement_chain(RELAY_WAT);
+    let candidate = admitted_replacement_chain(RELAY_V2_WAT);
+    assert_ne!(
+        current.manifest().nodes()[1].artifact(),
+        candidate.manifest().nodes()[1].artifact()
+    );
+    let supplied = [recreate(edge(1, 2)), recreate(edge(0, 1))];
+    let policy = ComponentGraphNodeReplacementPolicy {
+        target: node(1),
+        max_replacements: 1,
+        incident_edges: &supplied,
+    };
+
+    let admitted =
+        admit_component_graph_replacement(Arc::clone(&current), Arc::clone(&candidate), &policy)
+            .expect("exact target-only update must admit");
+
+    assert!(!admitted.runtime_ready());
+    assert!(Arc::ptr_eq(admitted.current_graph_arc(), &current));
+    assert!(Arc::ptr_eq(admitted.candidate_graph_arc(), &candidate));
+    assert_eq!(admitted.manifest().target(), node(1));
+    assert_eq!(admitted.manifest().max_replacements(), 1);
+    assert_eq!(
+        admitted.manifest().incident_edges(),
+        [recreate(edge(0, 1)), recreate(edge(1, 2))]
+    );
+    let current_account = current.manifest().account();
+    let candidate_budget = candidate.manifest().nodes()[1].budget();
+    let transient = admitted.manifest().transient_account();
+    assert_eq!(transient.nodes, current_account.nodes + 1);
+    assert_eq!(transient.edges, current_account.edges);
+    assert_eq!(transient.maximum_nesting, current_account.maximum_nesting);
+    assert_eq!(transient.external_imports, current_account.external_imports);
+    assert_eq!(
+        transient.published_exports,
+        current_account.published_exports
+    );
+    assert_eq!(
+        transient.component_bytes,
+        current_account.component_bytes + candidate_budget.component_bytes
+    );
+    assert_eq!(
+        transient.core_instances,
+        current_account.core_instances + candidate_budget.core_instances
+    );
+    assert_eq!(
+        transient.adapters,
+        current_account.adapters + candidate_budget.adapters
+    );
+    assert_eq!(
+        transient.resource_types,
+        current_account.resource_types + candidate_budget.resource_types
+    );
+    assert_eq!(
+        transient.resource_slots,
+        current_account.resource_slots + candidate_budget.resource_slots
+    );
+    assert_eq!(
+        transient.memory_bytes,
+        current_account.memory_bytes + candidate_budget.memory_bytes
+    );
+    assert_eq!(
+        transient.total_fuel,
+        current_account.total_fuel + candidate_budget.total_fuel
+    );
+    assert_eq!(
+        transient.maximum_poll_quantum,
+        current_account
+            .maximum_poll_quantum
+            .max(candidate_budget.poll_quantum)
+    );
+    admitted
+        .revalidate()
+        .expect("first replacement revalidation");
+    admitted
+        .revalidate()
+        .expect("second replacement revalidation");
+}
+
+#[test]
+fn replacement_rejects_candidate_overlap_above_the_graph_node_ceiling() {
+    let current = admitted_max_node_replacement_graph();
+    let candidate = admitted_max_node_replacement_graph();
+    let error = admit_component_graph_replacement(
+        current,
+        candidate,
+        &ComponentGraphNodeReplacementPolicy {
+            target: node(15),
+            max_replacements: 1,
+            incident_edges: &[],
+        },
+    )
+    .expect_replacement_error();
+
+    let ComponentGraphReplacementAdmissionError::TransientAccountLimit(limit) = error else {
+        panic!("expected transient-account rejection, got {error:?}");
+    };
+    assert_eq!(limit.kind, LimitKind::GraphNodes);
+    assert_eq!(
+        limit.attempted,
+        PROFILE_1_COMPONENT_GRAPH_LIMITS.max_nodes + 1
+    );
+    assert_eq!(limit.maximum, PROFILE_1_COMPONENT_GRAPH_LIMITS.max_nodes);
+}
+
+#[test]
+fn replacement_admission_revalidates_exact_resource_and_async_edge_shapes() {
+    let resource_routes = [ComponentGraphResourceEdgePolicy {
+        edge: edge(0, 1),
+        mode: ComponentGraphResourceMode::Borrow,
+    }];
+    let resource_current = Arc::new(
+        admit_resource_pair(
+            RESOURCE_WIT,
+            RESOURCE_PRODUCER_WAT,
+            RESOURCE_CONSUMER_WAT,
+            &resource_routes,
+        )
+        .expect("current resource graph"),
+    );
+    let resource_candidate = Arc::new(
+        admit_resource_pair(
+            RESOURCE_WIT,
+            RESOURCE_PRODUCER_WAT,
+            RESOURCE_CONSUMER_WAT,
+            &resource_routes,
+        )
+        .expect("candidate resource graph"),
+    );
+    let resource_edges = [recreate(edge(0, 1))];
+    let resource_replacement = admit_component_graph_replacement(
+        resource_current,
+        resource_candidate,
+        &ComponentGraphNodeReplacementPolicy {
+            target: node(1),
+            max_replacements: 1,
+            incident_edges: &resource_edges,
+        },
+    )
+    .expect("fresh exact resource provenance must admit replacement");
+    assert_eq!(
+        resource_replacement
+            .current_graph()
+            .manifest()
+            .resource_edges()
+            .len(),
+        1
+    );
+    resource_replacement
+        .revalidate()
+        .expect("resource replacement revalidation");
+
+    let async_current = Arc::new(admit_async_chain().expect("current async graph"));
+    let async_candidate = Arc::new(admit_async_chain().expect("candidate async graph"));
+    let async_edges = [recreate(edge(1, 2)), recreate(edge(0, 1))];
+    let async_replacement = admit_component_graph_replacement(
+        async_current,
+        async_candidate,
+        &ComponentGraphNodeReplacementPolicy {
+            target: node(1),
+            max_replacements: 1,
+            incident_edges: &async_edges,
+        },
+    )
+    .expect("exact async shape must admit replacement");
+    assert_eq!(
+        async_replacement
+            .candidate_graph()
+            .manifest()
+            .async_edges()
+            .len(),
+        2
+    );
+    async_replacement
+        .revalidate()
+        .expect("async replacement revalidation");
+}
+
+#[test]
+fn replacement_policy_rejects_wrong_count_unknown_target_and_incomplete_edge_set() {
+    let current = admitted_replacement_chain(RELAY_WAT);
+    let candidate = admitted_replacement_chain(RELAY_V2_WAT);
+    let complete = [recreate(edge(0, 1)), recreate(edge(1, 2))];
+
+    assert_eq!(
+        admit_component_graph_replacement(
+            Arc::clone(&current),
+            Arc::clone(&candidate),
+            &ComponentGraphNodeReplacementPolicy {
+                target: node(1),
+                max_replacements: 0,
+                incident_edges: &complete,
+            },
+        )
+        .expect_replacement_error(),
+        ComponentGraphReplacementAdmissionError::InvalidPolicy
+    );
+    assert_eq!(
+        admit_component_graph_replacement(
+            Arc::clone(&current),
+            Arc::clone(&candidate),
+            &ComponentGraphNodeReplacementPolicy {
+                target: node(9),
+                max_replacements: 1,
+                incident_edges: &[],
+            },
+        )
+        .expect_replacement_error(),
+        ComponentGraphReplacementAdmissionError::UnknownTarget { target: node(9) }
+    );
+
+    for incident_edges in [
+        vec![recreate(edge(0, 1))],
+        vec![recreate(edge(0, 1)), recreate(edge(0, 1))],
+        vec![
+            recreate(edge(0, 1)),
+            recreate(edge(1, 2)),
+            recreate(edge(0, 2)),
+        ],
+    ] {
+        assert_eq!(
+            admit_component_graph_replacement(
+                Arc::clone(&current),
+                Arc::clone(&candidate),
+                &ComponentGraphNodeReplacementPolicy {
+                    target: node(1),
+                    max_replacements: 1,
+                    incident_edges: &incident_edges,
+                },
+            )
+            .expect_replacement_error(),
+            ComponentGraphReplacementAdmissionError::IncidentEdgePolicyMismatch
+        );
+    }
+}
+
+#[test]
+fn replacement_rejects_non_target_change_and_target_contract_change() {
+    let current = admitted_replacement_chain(RELAY_WAT);
+    let changed_non_target = Arc::new(
+        admit_replacement_chain_with(
+            PRODUCER_V2_WAT,
+            RELAY_V2_WAT,
+            limits(),
+            ComponentGraphNesting::Root,
+            false,
+        )
+        .expect("candidate with changed producer must independently admit"),
+    );
+    let complete = [recreate(edge(0, 1)), recreate(edge(1, 2))];
+    assert_eq!(
+        admit_component_graph_replacement(
+            Arc::clone(&current),
+            changed_non_target,
+            &ComponentGraphNodeReplacementPolicy {
+                target: node(1),
+                max_replacements: 1,
+                incident_edges: &complete,
+            },
+        )
+        .expect_replacement_error(),
+        ComponentGraphReplacementAdmissionError::NonTargetMismatch { node: node(0) }
+    );
+
+    let mut changed_limits = limits();
+    changed_limits.resources -= 1;
+    let changed_target_contract = Arc::new(
+        admit_replacement_chain_with(
+            PRODUCER_WAT,
+            RELAY_V2_WAT,
+            changed_limits,
+            ComponentGraphNesting::Root,
+            false,
+        )
+        .expect("candidate with changed target limits must independently admit"),
+    );
+    assert_eq!(
+        admit_component_graph_replacement(
+            current,
+            changed_target_contract,
+            &ComponentGraphNodeReplacementPolicy {
+                target: node(1),
+                max_replacements: 1,
+                incident_edges: &complete,
+            },
+        )
+        .expect_replacement_error(),
+        ComponentGraphReplacementAdmissionError::TargetContractMismatch
+    );
+}
+
+#[test]
+fn replacement_rejects_published_or_nested_target_surface() {
+    let complete = [recreate(edge(0, 1)), recreate(edge(1, 2))];
+    for (nesting, publish_relay) in [
+        (ComponentGraphNesting::Root, true),
+        (ComponentGraphNesting::Nested { parent: node(0) }, false),
+    ] {
+        let current = Arc::new(
+            admit_replacement_chain_with(PRODUCER_WAT, RELAY_WAT, limits(), nesting, publish_relay)
+                .expect("current restricted-surface graph must independently admit"),
+        );
+        let candidate = Arc::new(
+            admit_replacement_chain_with(
+                PRODUCER_WAT,
+                RELAY_V2_WAT,
+                limits(),
+                nesting,
+                publish_relay,
+            )
+            .expect("candidate restricted-surface graph must independently admit"),
+        );
+        assert_eq!(
+            admit_component_graph_replacement(
+                current,
+                candidate,
+                &ComponentGraphNodeReplacementPolicy {
+                    target: node(1),
+                    max_replacements: 1,
+                    incident_edges: &complete,
+                },
+            )
+            .expect_replacement_error(),
+            ComponentGraphReplacementAdmissionError::UnsupportedTargetSurface
+        );
+    }
+
+    let ceilings = stream_ceilings();
+    let offers = stream_offers();
+    let current = Arc::new(
+        admit_stream(&ceilings, &offers)
+            .expect("current external-authority graph must independently admit"),
+    );
+    let candidate = Arc::new(
+        admit_stream(&ceilings, &offers)
+            .expect("candidate external-authority graph must independently admit"),
+    );
+    assert_eq!(current.grants().len(), 2);
+    assert_eq!(
+        admit_component_graph_replacement(
+            current,
+            candidate,
+            &ComponentGraphNodeReplacementPolicy {
+                target: node(0),
+                max_replacements: 1,
+                incident_edges: &[],
+            },
+        )
+        .expect_replacement_error(),
+        ComponentGraphReplacementAdmissionError::UnsupportedTargetSurface
+    );
 }

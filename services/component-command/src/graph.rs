@@ -11,7 +11,8 @@ use core::fmt;
 
 use vibeos_component_admission::{
     AdmittedComponentGraph, AdmittedComponentGraphReplacement, ComponentGraphAdmissionError,
-    ComponentGraphAsyncEdgeManifest, ComponentGraphAuthorityGrant, ComponentGraphManifest,
+    ComponentGraphAsyncEdgeManifest, ComponentGraphAuthorityGrant, ComponentGraphInformationFlow,
+    ComponentGraphInformationFlowError, ComponentGraphManifest,
     ComponentGraphReplacementAdmissionError, ComponentGraphReplacementEdgePolicy,
     ComponentGraphResourceEdgeManifest, ComponentIdentity, InstanceLimits, ProfileIdentity,
 };
@@ -261,6 +262,18 @@ impl ComponentGraphPrincipalTemplate {
     /// exact shape counts; they are not wake or execution authority.
     pub fn async_edges(&self) -> &[ComponentGraphAsyncEdgeManifest] {
         self.admitted.manifest().async_edges()
+    }
+
+    /// Build the closed C6.7 semantic information-flow diagnostic after
+    /// freshly revalidating both the admission record and this command-layer
+    /// projection. The returned owned report retains neither graph ordinals
+    /// nor the admitted graph and remains permanently non-executable.
+    pub fn information_flow(
+        &self,
+    ) -> Result<ComponentGraphInformationFlow, ComponentGraphInformationFlowError> {
+        self.revalidate()
+            .map_err(|_| ComponentGraphInformationFlowError::RevalidationFailed)?;
+        self.admitted.information_flow()
     }
 
     pub const fn profile(&self) -> ProfileIdentity {

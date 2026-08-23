@@ -5,11 +5,16 @@ use vibeos_component_admission::{
     admit_component_graph_with_resource_policy, AdmissionError, AdmittedComponentGraph,
     AdmittedComponentGraphReplacement, ArtifactTrust, AuthorityOffer, CallerAuthority,
     ComponentArtifact, ComponentGraphAdmissionError, ComponentGraphAdmissionPolicy,
-    ComponentGraphBindingMismatch, ComponentGraphCyclePolicy, ComponentGraphNodeAdmissionPolicy,
-    ComponentGraphNodeReplacementPolicy, ComponentGraphReplacementAdmissionError,
-    ComponentGraphReplacementEdgeAction, ComponentGraphReplacementEdgePolicy,
-    ComponentGraphResourceEdgePolicy, ComponentGraphResourceMode, InstanceLimits, InterfaceCeiling,
-    ProfileIdentity, STREAM_FILTER_WORLD,
+    ComponentGraphBindingMismatch, ComponentGraphCyclePolicy, ComponentGraphInformationFlow,
+    ComponentGraphInformationFlowAsyncPolicy, ComponentGraphInformationFlowAuthorityPolicy,
+    ComponentGraphInformationFlowEndpoint, ComponentGraphInformationFlowExternal,
+    ComponentGraphInformationFlowInternal, ComponentGraphInformationFlowNode,
+    ComponentGraphInformationFlowPublished, ComponentGraphInformationFlowResourcePolicy,
+    ComponentGraphNodeAdmissionPolicy, ComponentGraphNodeReplacementPolicy,
+    ComponentGraphReplacementAdmissionError, ComponentGraphReplacementEdgeAction,
+    ComponentGraphReplacementEdgePolicy, ComponentGraphResourceEdgePolicy,
+    ComponentGraphResourceMode, InstanceLimits, InterfaceCeiling, ProfileIdentity,
+    STREAM_FILTER_WORLD,
 };
 use vibeos_component_format::{LimitKind, PROFILE_1_COMPONENT_GRAPH_LIMITS};
 use vibeos_component_host::{HostResourceKind, STREAM_INTERFACE};
@@ -536,6 +541,36 @@ fn admit_async_chain() -> Result<AdmittedComponentGraph, ComponentGraphAdmission
     )
 }
 
+fn admit_reordered_async_chain() -> Result<AdmittedComponentGraph, ComponentGraphAdmissionError> {
+    let source_world = world(ASYNC_CHAIN_WIT, ASYNC_SOURCE_WORLD);
+    let relay_world = world(ASYNC_CHAIN_WIT, ASYNC_RELAY_WORLD);
+    let sink_world = world(ASYNC_CHAIN_WIT, ASYNC_SINK_WORLD);
+    let source = async_artifact(ASYNC_SOURCE_WAT);
+    let relay = async_artifact(ASYNC_RELAY_WAT);
+    let sink = async_artifact(ASYNC_SINK_WAT);
+    let nodes = [
+        policy_node("async-sink", &sink_world, &sink, &[]),
+        policy_node("async-source", &source_world, &source, &[]),
+        policy_node("async-relay", &relay_world, &relay, &[]),
+    ];
+    let edges = [edge(1, 2), edge(2, 0)];
+    let published_exports = [ComponentGraphPublishedExportSpec::new(export(0, 0))];
+    let policy = ComponentGraphAdmissionPolicy {
+        name: "async-chain-evidence",
+        profile: ProfileIdentity::PROFILE_1_ASYNC,
+        nodes: &nodes,
+        edges: &edges,
+        external_imports: &[],
+        published_exports: &published_exports,
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    admit_component_graph(
+        vec![sink, source, relay],
+        &policy,
+        &CallerAuthority { offers: &[] },
+    )
+}
+
 fn recreate(edge: ComponentGraphEdgeSpec) -> ComponentGraphReplacementEdgePolicy {
     ComponentGraphReplacementEdgePolicy {
         edge,
@@ -695,6 +730,258 @@ fn two_independently_parsed_nodes_admit_as_owned_inert_send_and_revalidate_twice
     assert!(graph.grants().is_empty());
     graph.revalidate().expect("first complete revalidation");
     graph.revalidate().expect("second complete revalidation");
+}
+
+#[test]
+fn information_flow_is_owned_canonical_typed_and_diagnostic_only() {
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    assert_send_sync::<ComponentGraphInformationFlow>();
+    assert_send_sync::<ComponentGraphInformationFlowNode>();
+    assert_send_sync::<ComponentGraphInformationFlowEndpoint>();
+    assert_send_sync::<ComponentGraphInformationFlowInternal>();
+    assert_send_sync::<ComponentGraphInformationFlowResourcePolicy>();
+    assert_send_sync::<ComponentGraphInformationFlowAsyncPolicy>();
+    assert_send_sync::<ComponentGraphInformationFlowExternal>();
+    assert_send_sync::<ComponentGraphInformationFlowAuthorityPolicy>();
+    assert_send_sync::<ComponentGraphInformationFlowPublished>();
+
+    let graph = admit_async_chain().expect("async chain must admit");
+    let digest_hex = graph.manifest().nodes()[0]
+        .artifact()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let digest_decimal = format!("{:?}", graph.manifest().nodes()[0].artifact().as_bytes());
+    let first = graph
+        .information_flow()
+        .expect("fresh semantic projection must succeed");
+    let second = graph
+        .information_flow()
+        .expect("a second fresh projection must be identical");
+    let reordered = admit_reordered_async_chain()
+        .expect("coordinate-reordered semantic graph must admit")
+        .information_flow()
+        .expect("coordinate order must not enter the diagnostic");
+
+    assert!(!first.runtime_ready());
+    assert_eq!(first.graph_policy_label(), "async-chain-evidence");
+    assert_eq!(first.nodes().len(), 3);
+    assert_eq!(first.internal_flows().len(), 2);
+    assert!(first.external_flows().is_empty());
+    assert_eq!(first.published_flows().len(), 1);
+    assert_eq!(first.authority_policy_count(), 0);
+    assert_eq!(
+        first
+            .nodes()
+            .iter()
+            .map(|node| node.policy_label())
+            .collect::<Vec<_>>(),
+        ["async-relay", "async-sink", "async-source"]
+    );
+    assert!(first
+        .nodes()
+        .iter()
+        .all(|node| node.parent_policy_label().is_none()));
+
+    let first_flow = &first.internal_flows()[0];
+    assert_eq!(first_flow.source().principal_policy_label(), "async-relay");
+    assert_eq!(first_flow.target().principal_policy_label(), "async-sink");
+    assert_eq!(
+        first_flow.source().entity_name(),
+        "test:c65-chain/pipe@1.0.0"
+    );
+    assert_eq!(
+        first_flow.source().entity_shape(),
+        first_flow.target().entity_shape()
+    );
+    assert!(first_flow.resource_policy().is_none());
+    let async_policy = first_flow.async_policy().expect("sealed async policy");
+    assert_eq!(async_policy.async_functions(), 1);
+    assert_eq!(async_policy.streams(), 4);
+    assert_eq!(async_policy.futures(), 4);
+
+    let display = first.to_string();
+    assert_eq!(display, second.to_string());
+    assert_eq!(display, reordered.to_string());
+    assert_eq!(display, format!("{first:?}"));
+    assert_eq!(display, format!("{first:#?}"));
+    assert!(display.contains("async-func("));
+    assert!(display.contains("stream<u8>"));
+    assert!(display.contains("future<"));
+    assert!(display.contains("published source_policy=\"async-sink\""));
+    for forbidden in [
+        "ComponentGraphNodeId",
+        "ComponentGraphEntityIndex",
+        "ComponentIdentity",
+        "artifact",
+        "runtime_abi",
+        "ResourceToken",
+        "resource_index",
+        "Cap",
+        "cap:",
+        "CSpace",
+        "TaskId",
+        "generation",
+        "ObjectId",
+        "0x",
+        digest_hex.as_str(),
+        digest_decimal.as_str(),
+    ] {
+        assert!(
+            !display.contains(forbidden),
+            "information-flow diagnostic leaked {forbidden}: {display}"
+        );
+    }
+
+    // The report owns its complete safe projection and retains no admission
+    // record or artifact bytes.
+    drop(graph);
+    assert_eq!(display, first.to_string());
+}
+
+#[test]
+fn information_flow_shows_semantic_resource_policy_without_coordinates() {
+    let routes = [ComponentGraphResourceEdgePolicy {
+        edge: edge(0, 1),
+        mode: ComponentGraphResourceMode::OwnAndBorrow,
+    }];
+    let graph = admit_resource_pair(
+        MIXED_RESOURCE_WIT,
+        MIXED_RESOURCE_PRODUCER_WAT,
+        MIXED_RESOURCE_CONSUMER_WAT,
+        &routes,
+    )
+    .expect("exact mixed resource edge must admit");
+    let report = graph.information_flow().expect("resource projection");
+    let flow = &report.internal_flows()[0];
+    let resource = flow.resource_policy().expect("resource edge policy");
+
+    assert_eq!(resource.mode(), ComponentGraphResourceMode::OwnAndBorrow);
+    assert_eq!(resource.resources(), [String::from("handle")]);
+    assert!(flow.source().entity_shape().contains("borrow<handle>"));
+    assert!(flow.source().entity_shape().contains("own<handle>"));
+    let output = report.to_string();
+    assert!(output.contains("resource_mode=own-and-borrow"));
+    assert!(output.contains("resources=[\"handle\"]"));
+    assert!(!output.contains("index"));
+    assert!(!output.contains("ComponentGraphEntityIndex"));
+}
+
+#[test]
+fn information_flow_shows_exact_external_policy_labels_and_symbolic_rights() {
+    let ceilings = stream_ceilings();
+    let offers = stream_offers();
+    let graph = admit_stream(&ceilings, &offers).expect("external stream graph must admit");
+    let report = graph.information_flow().expect("external projection");
+    let reversed = admit_stream(&[ceilings[1], ceilings[0]], &[offers[1], offers[0]])
+        .expect("reordered exact policies must admit")
+        .information_flow()
+        .expect("reordered external projection");
+
+    assert_eq!(report.nodes().len(), 1);
+    assert!(report.internal_flows().is_empty());
+    assert_eq!(report.external_flows().len(), 1);
+    assert_eq!(report.authority_policy_count(), 2);
+    let external = &report.external_flows()[0];
+    assert_eq!(external.target().principal_policy_label(), "stream-filter");
+    assert_eq!(external.authority_policies().len(), 2);
+    assert_eq!(
+        external.authority_policies()[0].source_policy_label(),
+        "stdin"
+    );
+    assert_eq!(
+        external.authority_policies()[0].kind(),
+        HostResourceKind::ByteStreamReader
+    );
+    assert_eq!(external.authority_policies()[0].rights(), Rights::RECV);
+    assert_eq!(
+        external.authority_policies()[1].source_policy_label(),
+        "stdout"
+    );
+    assert_eq!(
+        external.authority_policies()[1].kind(),
+        HostResourceKind::ByteStreamWriter
+    );
+    assert_eq!(external.authority_policies()[1].rights(), Rights::SEND);
+
+    let output = report.to_string();
+    assert_eq!(output, reversed.to_string());
+    assert!(output.contains("source_policy=\"stdin\""));
+    assert!(output.contains("kind=byte-stream-reader rights=---v--"));
+    assert!(output.contains("source_policy=\"stdout\""));
+    assert!(output.contains("kind=byte-stream-writer rights=--s---"));
+    assert!(!output.contains("GRANT"));
+    assert!(!output.contains("REVOKE"));
+}
+
+#[test]
+fn information_flow_escapes_policy_text_and_never_falls_back_after_writer_failure() {
+    use std::fmt::Write as _;
+
+    struct RefusingWriter {
+        remaining: usize,
+    }
+
+    impl std::fmt::Write for RefusingWriter {
+        fn write_str(&mut self, value: &str) -> std::fmt::Result {
+            if value.len() > self.remaining {
+                return Err(std::fmt::Error);
+            }
+            self.remaining -= value.len();
+            Ok(())
+        }
+    }
+
+    let exact_world = world(PIPE_WIT, PRODUCER_WORLD);
+    let provider = artifact(PRODUCER_WAT);
+    let label = "policy\"\\edge";
+    let nodes = [policy_node(label, &exact_world, &provider, &[])];
+    let policy = ComponentGraphAdmissionPolicy {
+        name: "escaped-policy",
+        profile: ProfileIdentity::PROFILE_1,
+        nodes: &nodes,
+        edges: &[],
+        external_imports: &[],
+        published_exports: &[],
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    let graph = admit_component_graph(vec![provider], &policy, &CallerAuthority { offers: &[] })
+        .expect("graphic quote/backslash label must admit");
+    let report = graph.information_flow().expect("escaped projection");
+    let output = report.to_string();
+    assert!(output.contains(&format!("policy={label:?}")));
+    assert!(!output.contains('\n') || output.lines().all(|line| !line.is_empty()));
+
+    let mut refusing = RefusingWriter { remaining: 17 };
+    assert!(write!(&mut refusing, "{report}").is_err());
+
+    let bad_nodes = [policy_node(
+        "bad\nlabel",
+        &exact_world,
+        &artifact(PRODUCER_WAT),
+        &[],
+    )];
+    let bad_provider = artifact(PRODUCER_WAT);
+    let bad_policy = ComponentGraphAdmissionPolicy {
+        name: "bad-policy",
+        profile: ProfileIdentity::PROFILE_1,
+        nodes: &bad_nodes,
+        edges: &[],
+        external_imports: &[],
+        published_exports: &[],
+        cycle_policy: ComponentGraphCyclePolicy::AcyclicOnly,
+    };
+    assert_eq!(
+        admit_component_graph(
+            vec![bad_provider],
+            &bad_policy,
+            &CallerAuthority { offers: &[] },
+        )
+        .expect_graph_error(),
+        ComponentGraphAdmissionError::InvalidPolicy
+    );
 }
 
 #[test]
@@ -1653,6 +1940,27 @@ fn replacement_admission_allows_only_target_artifact_change_and_canonicalizes_re
     admitted
         .revalidate()
         .expect("second replacement revalidation");
+}
+
+#[test]
+fn information_flow_is_identical_for_distinct_artifacts_with_the_same_contract() {
+    let current = admitted_replacement_chain(RELAY_WAT);
+    let candidate = admitted_replacement_chain(RELAY_V2_WAT);
+    let current_identity = current.manifest().nodes()[1].artifact();
+    let candidate_identity = candidate.manifest().nodes()[1].artifact();
+    assert_ne!(current_identity, candidate_identity);
+
+    let current_report = current
+        .information_flow()
+        .expect("current graph semantic report");
+    let candidate_report = candidate
+        .information_flow()
+        .expect("candidate graph semantic report");
+    assert_eq!(current_report.to_string(), candidate_report.to_string());
+    assert_eq!(
+        format!("{current_report:?}"),
+        format!("{candidate_report:?}")
+    );
 }
 
 #[test]

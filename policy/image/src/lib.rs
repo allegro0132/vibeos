@@ -35,6 +35,12 @@ compile_error!("feature `c65-async-chain-qemu-acceptance` requires `qemu-default
 ))]
 compile_error!("feature `c66-node-replacement-qemu-acceptance` requires `qemu-default`");
 
+#[cfg(all(
+    feature = "c67-information-flow-qemu-acceptance",
+    not(feature = "qemu-default")
+))]
+compile_error!("feature `c67-information-flow-qemu-acceptance` requires `qemu-default`");
+
 /// A logical block-device view carved out of a packaged storage image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockSlice {
@@ -168,7 +174,10 @@ impl core::fmt::Debug for ComponentGraphResourceRoutePin {
 /// authority, ambient lookup key, durable object identity, capability, or
 /// graph wiring authority. The kernel must still construct the exact
 /// source-to-relay-to-sink graph and explicitly publish the sink export.
-#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+#[cfg(any(
+    feature = "c65-async-chain-qemu-acceptance",
+    feature = "c67-information-flow-qemu-acceptance"
+))]
 #[derive(Clone, Copy)]
 pub struct ComponentGraphAsyncChainPin {
     source_bytes: &'static [u8],
@@ -187,7 +196,10 @@ pub struct ComponentGraphAsyncChainPin {
     limits: ComponentInstanceLimits,
 }
 
-#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+#[cfg(any(
+    feature = "c65-async-chain-qemu-acceptance",
+    feature = "c67-information-flow-qemu-acceptance"
+))]
 impl ComponentGraphAsyncChainPin {
     pub const fn source_bytes(self) -> &'static [u8] {
         self.source_bytes
@@ -246,7 +258,10 @@ impl ComponentGraphAsyncChainPin {
     }
 }
 
-#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+#[cfg(any(
+    feature = "c65-async-chain-qemu-acceptance",
+    feature = "c67-information-flow-qemu-acceptance"
+))]
 impl core::fmt::Debug for ComponentGraphAsyncChainPin {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
@@ -811,49 +826,56 @@ const C64_RESOURCE_CONSUMER_SHA256: [u8; 32] =
 
 #[cfg(any(
     feature = "c65-async-chain-qemu-acceptance",
-    feature = "c66-node-replacement-qemu-acceptance"
+    feature = "c66-node-replacement-qemu-acceptance",
+    feature = "c67-information-flow-qemu-acceptance"
 ))]
 const C65_ASYNC_SOURCE_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/c65-async-source.component.wasm"));
 
 #[cfg(any(
     feature = "c65-async-chain-qemu-acceptance",
-    feature = "c66-node-replacement-qemu-acceptance"
+    feature = "c66-node-replacement-qemu-acceptance",
+    feature = "c67-information-flow-qemu-acceptance"
 ))]
 const C65_ASYNC_SOURCE_SHA256: [u8; 32] =
     include!(concat!(env!("OUT_DIR"), "/c65-async-source.sha256.rs"));
 
 #[cfg(any(
     feature = "c65-async-chain-qemu-acceptance",
-    feature = "c66-node-replacement-qemu-acceptance"
+    feature = "c66-node-replacement-qemu-acceptance",
+    feature = "c67-information-flow-qemu-acceptance"
 ))]
 const C65_ASYNC_RELAY_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/c65-async-relay.component.wasm"));
 
 #[cfg(any(
     feature = "c65-async-chain-qemu-acceptance",
-    feature = "c66-node-replacement-qemu-acceptance"
+    feature = "c66-node-replacement-qemu-acceptance",
+    feature = "c67-information-flow-qemu-acceptance"
 ))]
 const C65_ASYNC_RELAY_SHA256: [u8; 32] =
     include!(concat!(env!("OUT_DIR"), "/c65-async-relay.sha256.rs"));
 
 #[cfg(any(
     feature = "c65-async-chain-qemu-acceptance",
-    feature = "c66-node-replacement-qemu-acceptance"
+    feature = "c66-node-replacement-qemu-acceptance",
+    feature = "c67-information-flow-qemu-acceptance"
 ))]
 const C65_ASYNC_SINK_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/c65-async-sink.component.wasm"));
 
 #[cfg(any(
     feature = "c65-async-chain-qemu-acceptance",
-    feature = "c66-node-replacement-qemu-acceptance"
+    feature = "c66-node-replacement-qemu-acceptance",
+    feature = "c67-information-flow-qemu-acceptance"
 ))]
 const C65_ASYNC_SINK_SHA256: [u8; 32] =
     include!(concat!(env!("OUT_DIR"), "/c65-async-sink.sha256.rs"));
 
 #[cfg(any(
     feature = "c65-async-chain-qemu-acceptance",
-    feature = "c66-node-replacement-qemu-acceptance"
+    feature = "c66-node-replacement-qemu-acceptance",
+    feature = "c67-information-flow-qemu-acceptance"
 ))]
 const C65_ASYNC_CHAIN_WIT_SHA256: [u8; 32] =
     include!(concat!(env!("OUT_DIR"), "/c65-async-chain-wit.sha256.rs"));
@@ -1065,7 +1087,10 @@ pub const C64_RESOURCE_ROUTE_QEMU_ACCEPTANCE: ComponentGraphResourceRoutePin =
 /// and export it, and only the sink export may be published by the separately
 /// reviewed kernel graph policy. `PROFILE_1_ASYNC` deliberately keeps every
 /// embedded canonical lift inert.
-#[cfg(feature = "c65-async-chain-qemu-acceptance")]
+#[cfg(any(
+    feature = "c65-async-chain-qemu-acceptance",
+    feature = "c67-information-flow-qemu-acceptance"
+))]
 pub const C65_ASYNC_CHAIN_QEMU_ACCEPTANCE: ComponentGraphAsyncChainPin =
     ComponentGraphAsyncChainPin {
         source_bytes: C65_ASYNC_SOURCE_BYTES,
@@ -1088,6 +1113,13 @@ pub const C65_ASYNC_CHAIN_QEMU_ACCEPTANCE: ComponentGraphAsyncChainPin =
             resources: 8,
         },
     };
+
+/// C6.7 deliberately reuses the exact validation-only C6.5 artifact set. The
+/// new policy root authorizes semantic inspection only; graph wiring and
+/// policy labels are still supplied explicitly by the kernel acceptance gate.
+#[cfg(feature = "c67-information-flow-qemu-acceptance")]
+pub const C67_INFORMATION_FLOW_QEMU_ACCEPTANCE: ComponentGraphAsyncChainPin =
+    C65_ASYNC_CHAIN_QEMU_ACCEPTANCE;
 
 /// Exact validation-only policy root for replacing the middle C6.5 relay.
 ///
@@ -1288,7 +1320,10 @@ mod tests {
         assert_eq!(pin.limits().resources, 2);
     }
 
-    #[cfg(feature = "c65-async-chain-qemu-acceptance")]
+    #[cfg(any(
+        feature = "c65-async-chain-qemu-acceptance",
+        feature = "c67-information-flow-qemu-acceptance"
+    ))]
     #[test]
     fn c65_async_chain_is_exact_resource_free_and_validation_only() {
         use vibeos_component_runtime::{

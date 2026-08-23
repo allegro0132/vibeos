@@ -139,6 +139,14 @@ wasm-c66-node-replacement-acceptance = [
     "vibeos-core/wasm-c66-node-replacement-acceptance",
     "vibeos-image-policy/c66-node-replacement-qemu-acceptance",
 ]
+# QEMU image gate for C6.7 semantic-only graph information-flow inspection.
+# It links pinned validation inputs but no graph principal, CSpace, resource
+# table, Task, or guest executor lifecycle.
+wasm-c67-information-flow-acceptance = [
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-runtime",
+    "vibeos-image-policy/c67-information-flow-qemu-acceptance",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

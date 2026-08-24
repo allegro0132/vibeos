@@ -19,6 +19,13 @@
 //! one exact READ root. Neither a command nor recovered authority escapes until
 //! an independent physical readback binds the complete global root-policy
 //! union and matches the sealed candidate byte-for-byte.
+//!
+//! C7.5 removes the candidate admission receipt from that durable transition.
+//! Existing media is discovered from the fixed root itself, and both initial
+//! install and cold recovery converge on opaque physical-readback bytes. Those
+//! bytes must pass the current Component/Core, WIT, manifest, adapter, limit,
+//! signer-policy, and validation-engine gates before an inert publication can
+//! exist; no component-owned CSpace, resource, task, or guest call is created.
 
 #![no_std]
 
@@ -50,8 +57,9 @@ use vibeos_component_format::{
     ComponentArtifactInterfaceDirection, ComponentArtifactManifestV1,
     ComponentArtifactSignerPolicyKind, ComponentArtifactV1, ProfileIdentity, PROFILE_1_LIMITS,
 };
-use vibeos_component_runtime::world::{
-    EntityShape, NamedEntityShape, TypeShape, ValueShape, WorldContract, WorldError,
+use vibeos_component_runtime::{
+    decode::current_component_validation_engine,
+    world::{EntityShape, NamedEntityShape, TypeShape, ValueShape, WorldContract, WorldError},
 };
 use vibeos_core::cap::{InvocationLease, Resource, Rights};
 use vibeos_object_store::{get_with, StoreError, StoreService, StoredObject};
@@ -600,6 +608,7 @@ fn validate_common_external_policy(
     if !interfaces_empty {
         return Err(ComponentLoadError::UnsupportedImports);
     }
+    let engine = current_component_validation_engine(profile).ok_or(ComponentLoadError::Profile)?;
     let [package] = artifact.manifest().wit_packages() else {
         return Err(ComponentLoadError::UnsupportedWitPackageSet);
     };
@@ -611,8 +620,12 @@ fn validate_common_external_policy(
     if package.name() != package_name || package.version() != package_version {
         return Err(ComponentLoadError::WitPolicyMismatch);
     }
-    let parsed = WorldContract::parse(package.source(), artifact.manifest().world())
-        .map_err(ComponentLoadError::Wit)?;
+    let parsed = WorldContract::parse_with_current_engine(
+        package.source(),
+        artifact.manifest().world(),
+        &engine,
+    )
+    .map_err(ComponentLoadError::Wit)?;
     if &parsed != exact_world || artifact.manifest().world() != exact_world.identity {
         return Err(ComponentLoadError::WitPolicyMismatch);
     }
@@ -628,6 +641,8 @@ fn validate_fresh_evidence(
     component: &ComponentArtifact,
     exact_world: &WorldContract,
 ) -> Result<(), ComponentLoadError> {
+    let engine = current_component_validation_engine(artifact.profile())
+        .ok_or(ComponentLoadError::Profile)?;
     let inspection = component.inspect().map_err(ComponentLoadError::Admission)?;
     let plan = inspection.plan();
     if plan.profile() != artifact.profile()
@@ -644,8 +659,12 @@ fn validate_fresh_evidence(
     let [package] = artifact.manifest().wit_packages() else {
         return Err(ComponentLoadError::UnsupportedWitPackageSet);
     };
-    let parsed = WorldContract::parse(package.source(), artifact.manifest().world())
-        .map_err(ComponentLoadError::Wit)?;
+    let parsed = WorldContract::parse_with_current_engine(
+        package.source(),
+        artifact.manifest().world(),
+        &engine,
+    )
+    .map_err(ComponentLoadError::Wit)?;
     if parsed != *exact_world || plan.check_world(&parsed).is_err() {
         return Err(ComponentLoadError::WitPolicyMismatch);
     }

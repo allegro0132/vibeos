@@ -8,7 +8,8 @@
 
 use vibeos_component_admission::OperatorArtifactAdmissionPolicy;
 use vibeos_component_loader::{
-    admit_operator_component_install, begin_component_install, DeployableComponentLoadPolicy,
+    admit_operator_component_install, begin_c75_component_boot, C75ComponentBootState,
+    C75RecoveredComponentInstall, DeployableComponentLoadPolicy,
 };
 use vibeos_component_runtime::world::WorldContract;
 use vibeos_image_policy::C73_AUTHENTICATED_ADMISSION_QEMU_ACCEPTANCE;
@@ -51,12 +52,7 @@ pub(crate) async fn run_qemu_acceptance(journal: Option<AuthorityJournal>) -> bo
 
     let fixture = C73_AUTHENTICATED_ADMISSION_QEMU_ACCEPTANCE;
     let policy_pin = fixture.policy_p1();
-    let artifact_pin = fixture.operator_p1()[0];
-    if artifact_pin.runtime_ready()
-        || artifact_pin.guest_calls() != 0
-        || policy_pin.runtime_ready()
-        || policy_pin.guest_calls() != 0
-    {
+    if policy_pin.runtime_ready() || policy_pin.guest_calls() != 0 {
         return false;
     }
     let Ok(world_contract) =
@@ -89,22 +85,7 @@ pub(crate) async fn run_qemu_acceptance(journal: Option<AuthorityJournal>) -> bo
     ) else {
         return false;
     };
-    let Ok(artifact_bytes) = artifact_pin
-        .artifact()
-        .and_then(|artifact| artifact.encode())
-    else {
-        return false;
-    };
-    let Ok(evidence) = artifact_pin.authentication_evidence() else {
-        return false;
-    };
-    let evidence_bytes = evidence.encode();
     let install_policy = DeployableComponentLoadPolicy::new(&operator_policy);
-    let Ok(candidate) =
-        admit_operator_component_install(&artifact_bytes, &evidence_bytes, &install_policy)
-    else {
-        return false;
-    };
 
     if !c74_publication_ledger_is_empty()
         || c74_publication_ledger_state() != C74PublicationLedgerState::NoRootNoCommand
@@ -117,21 +98,59 @@ pub(crate) async fn run_qemu_acceptance(journal: Option<AuthorityJournal>) -> bo
     if !c74_publication_ledger_is_empty() {
         return false;
     }
-    let Ok(session) = begin_component_install(head) else {
+    let Ok(state) = begin_c75_component_boot(head).await else {
         return false;
     };
     if !c74_publication_ledger_is_empty() {
         return false;
     }
-    let Ok(committed) = session.install_operator(candidate).await else {
-        return false;
+    let pending = match state {
+        C75ComponentBootState::Vacant(vacant) => {
+            let artifact_pin = fixture.operator_p1()[0];
+            if artifact_pin.runtime_ready() || artifact_pin.guest_calls() != 0 {
+                return false;
+            }
+            let Ok(artifact_bytes) = artifact_pin
+                .artifact()
+                .and_then(|artifact| artifact.encode())
+            else {
+                return false;
+            };
+            let Ok(evidence) = artifact_pin.authentication_evidence() else {
+                return false;
+            };
+            let evidence_bytes = evidence.encode();
+            let Ok(candidate) =
+                admit_operator_component_install(&artifact_bytes, &evidence_bytes, &install_policy)
+            else {
+                return false;
+            };
+            let Ok(pending) = vacant.install_operator(candidate).await else {
+                return false;
+            };
+            pending
+        }
+        C75ComponentBootState::Existing(pending) => pending,
     };
     if !c74_publication_ledger_is_empty()
         || c74_publication_ledger_state() != C74PublicationLedgerState::NoRootNoCommand
     {
         return false;
     }
-    let Ok(()) = recover_and_publish_operator(committed).await else {
+    let Ok(recovered) = pending.recover_payload().await else {
+        return false;
+    };
+    let C75RecoveredComponentInstall::Operator(recovered) = recovered else {
+        return false;
+    };
+    let Ok(fresh) = recovered.revalidate_on_boot(&install_policy) else {
+        return false;
+    };
+    let roots = fresh.root_presence();
+    if !roots.component() {
+        return false;
+    }
+    let Ok(()) = recover_and_publish_operator(fresh) else {
         return false;
     };
     c74_publication_ledger_len() == 1

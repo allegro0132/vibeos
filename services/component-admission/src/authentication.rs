@@ -26,10 +26,11 @@ use vibeos_component_runtime::world::{
 };
 
 use crate::{
-    admit_under_exact_rules, canonical_entity_shape_text_v1, private, valid_argument_limits,
-    valid_entrypoint, valid_manifest_text, valid_name, validate_policy_tables, AdmissionError,
-    AdmittedComponent, CallerAuthority, CommandStreamMode, ComponentArtifact, ComponentIdentity,
-    ExactAdmissionRules, InstanceLimits, InterfaceCeiling,
+    admit_under_exact_rules_with_current_engine, canonical_entity_shape_text_v1, private,
+    valid_argument_limits, valid_entrypoint, valid_manifest_text, valid_name,
+    validate_policy_tables, AdmissionError, AdmittedComponent, CallerAuthority, CommandStreamMode,
+    ComponentArtifact, ComponentIdentity, CurrentValidationEngine, ExactAdmissionRules,
+    InstanceLimits, InterfaceCeiling,
 };
 
 /// Frozen canonical operator-policy format version.
@@ -703,6 +704,10 @@ pub fn admit_authenticated(
     {
         return Err(ArtifactAuthenticationError::ReceiptMismatch.into());
     }
+    // Resolve the validator, WIT frontend, embedded-Core frontend, and inert
+    // wasmi configuration from this boot. The proof cannot be supplied by the
+    // durable artifact and remains borrowed through all fresh semantic checks.
+    let engine = CurrentValidationEngine::for_profile(policy.profile)?;
     let signer = policy.signer(receipt.signer_public_key)?;
     if signer.public_key != receipt.signer_public_key {
         return Err(ArtifactAuthenticationError::ReceiptMismatch.into());
@@ -728,8 +733,9 @@ pub fn admit_authenticated(
     if component.identity() != receipt.component_identity {
         return Err(ArtifactAuthenticationError::ReceiptMismatch.into());
     }
-    validate_fresh_artifact_evidence(&artifact, &component, policy)?;
-    admit_under_exact_rules(component, &policy.exact_rules(), caller).map_err(Into::into)
+    validate_fresh_artifact_evidence(&artifact, &component, policy, &engine)?;
+    admit_under_exact_rules_with_current_engine(component, &policy.exact_rules(), caller, &engine)
+        .map_err(Into::into)
 }
 
 fn validate_operator_public_key(public_key: [u8; 32]) -> Result<(), ArtifactAuthenticationError> {
@@ -793,9 +799,19 @@ fn validate_fresh_artifact_evidence(
     artifact: &ComponentArtifactV1,
     component: &ComponentArtifact,
     policy: &OperatorArtifactAdmissionPolicy<'_>,
+    engine: &CurrentValidationEngine,
 ) -> Result<(), ArtifactAuthenticationError> {
+    let fresh_world = WorldContract::parse_with_current_engine(
+        policy.exact_wit_source,
+        &policy.exact_world.identity,
+        engine.component(),
+    )
+    .map_err(|_| ArtifactAuthenticationError::WitPolicyMismatch)?;
+    if fresh_world != *policy.exact_world {
+        return Err(ArtifactAuthenticationError::WitPolicyMismatch);
+    }
     let inspection = component
-        .inspect()
+        .inspect_with_current_engine(engine)
         .map_err(|_| ArtifactAuthenticationError::ArtifactConfiguration)?;
     let plan = inspection.plan();
     if plan.profile() != artifact.profile()

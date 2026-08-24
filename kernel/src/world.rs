@@ -633,6 +633,31 @@ impl World {
         Some(lease.with(store::StoreService::authority_journal))
     }
 
+    /// C7.5 receives the same explicit, capability-mediated journal facade as
+    /// C7.4, but its boot protocol decides vacant versus existing durable
+    /// state before consulting any image artifact candidate. No CSpace,
+    /// object identity, raw token, or lookup surface crosses this handoff.
+    #[cfg(feature = "wasm-c75-boot-revalidation-acceptance")]
+    pub(crate) fn c75_component_authority_journal(&self) -> Option<store::AuthorityJournal> {
+        let store = self.store?;
+        let init = self.spaces.get("init")?;
+        let lease = init
+            .0
+            .lock()
+            .lookup_lease::<store::StoreService>(store, Rights::READ)
+            .ok()?;
+        Some(lease.with(store::StoreService::authority_journal))
+    }
+
+    /// Allocation-free global-registry cardinality used as the C7.5
+    /// no-new-component sentinel. Fixed boot services already occupy this
+    /// registry; their captured baseline must not change while target bytes
+    /// are probed, read back, freshly admitted, sealed, or published.
+    #[cfg(feature = "wasm-c75-boot-revalidation-acceptance")]
+    pub(crate) fn c75_component_count(&self) -> usize {
+        self.components.lock().len()
+    }
+
     /// Spawn and register a task under a stable component identity.
     pub fn spawn_component(
         &self,

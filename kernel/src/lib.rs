@@ -117,6 +117,31 @@ compile_error!(
     "feature `wasm-c74-crash-safe-publication-acceptance` requires the QEMU default image"
 );
 #[cfg(all(
+    feature = "wasm-c75-boot-revalidation-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c75-boot-revalidation-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "wasm-c75-boot-revalidation-acceptance",
+    any(
+        feature = "legacy-shell",
+        feature = "component-graph-principals",
+        feature = "ssh-component-command",
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c73-authenticated-admission-acceptance",
+        feature = "wasm-c74-crash-safe-publication-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c75-boot-revalidation-acceptance` is isolated from live guest, command, and older WASM acceptance roots"
+);
+#[cfg(all(
     feature = "wasm-c74-crash-safe-publication-acceptance",
     any(
         feature = "legacy-shell",
@@ -129,7 +154,8 @@ compile_error!(
         feature = "wasm-c65-async-chain-acceptance",
         feature = "wasm-c66-node-replacement-acceptance",
         feature = "wasm-c67-information-flow-acceptance",
-        feature = "wasm-c73-authenticated-admission-acceptance"
+        feature = "wasm-c73-authenticated-admission-acceptance",
+        feature = "wasm-c75-boot-revalidation-acceptance"
     )
 ))]
 compile_error!(
@@ -323,10 +349,12 @@ mod cap_table_pool;
 mod code_pool;
 #[cfg(feature = "wasm-c73-authenticated-admission-acceptance")]
 mod component_authenticated_admission;
-#[cfg(feature = "component-durable-publication")]
-mod component_durable_publication;
+#[cfg(feature = "wasm-c75-boot-revalidation-acceptance")]
+mod component_boot_revalidation;
 #[cfg(feature = "wasm-c74-crash-safe-publication-acceptance")]
 mod component_crash_safe_publication;
+#[cfg(feature = "component-durable-publication")]
+mod component_durable_publication;
 #[cfg(feature = "wasm-c67-information-flow-acceptance")]
 mod component_graph_information_flow;
 #[cfg(feature = "component-graph-principals")]
@@ -886,6 +914,34 @@ pub extern "C" fn kmain() -> ! {
             sbi::shutdown(true);
         }
     });
+    #[cfg(feature = "wasm-c75-boot-revalidation-acceptance")]
+    let c75_baseline_component_count = world.c75_component_count();
+    #[cfg(feature = "wasm-c75-boot-revalidation-acceptance")]
+    let c75_authority_journal = if online_hart_count() == 4 {
+        world.c75_component_authority_journal()
+    } else {
+        None
+    };
+    #[cfg(feature = "wasm-c75-boot-revalidation-acceptance")]
+    exec::spawn("wasm-c75-boot-revalidation-acceptance", async move {
+        match component_boot_revalidation::run_qemu_acceptance(
+            c75_authority_journal,
+            c75_baseline_component_count,
+        )
+        .await
+        {
+            Some(component_boot_revalidation::C75BootOutcome::Installed) => {
+                crate::println!("\nWASM_C75_BOOT_REVALIDATION PASS durable_state=installed image_candidate=1 preappend_validation=1 physical_readback=1 fresh_component=1 fresh_core=1 fresh_wit=1 fresh_adapter_absence=1 fresh_hashes=1 fresh_limits=1 fresh_signer=1 fresh_engine_identity=1 publication_after_validation=1 early_runtime_objects=0 component_cspaces=0 component_resources=0 component_tasks=0 runtime_ready=0 guest_calls=0 raw_ids=0 ambient_lookup=0 vsh=0");
+            }
+            Some(component_boot_revalidation::C75BootOutcome::Existing) => {
+                crate::println!("\nWASM_C75_BOOT_REVALIDATION PASS durable_state=existing image_candidate=0 preappend_validation=0 physical_readback=1 fresh_component=1 fresh_core=1 fresh_wit=1 fresh_adapter_absence=1 fresh_hashes=1 fresh_limits=1 fresh_signer=1 fresh_engine_identity=1 publication_after_validation=1 early_runtime_objects=0 component_cspaces=0 component_resources=0 component_tasks=0 runtime_ready=0 guest_calls=0 raw_ids=0 ambient_lookup=0 vsh=0");
+            }
+            None => {
+                crate::println!("WASM_C75_BOOT_REVALIDATION FAIL");
+                sbi::shutdown(true);
+            }
+        }
+    });
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
     exec::spawn(
         "wasm-c54-native-revoke-worker",
@@ -917,7 +973,8 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(not(any(
         feature = "legacy-shell",
         feature = "wasm-c67-information-flow-acceptance",
-        feature = "wasm-c74-crash-safe-publication-acceptance"
+        feature = "wasm-c74-crash-safe-publication-acceptance",
+        feature = "wasm-c75-boot-revalidation-acceptance"
     )))]
     {
         let space = world.spaces["vsh"].clone();

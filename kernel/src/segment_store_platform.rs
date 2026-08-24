@@ -1857,7 +1857,20 @@ impl StorageV2Runtime {
         expected_policy_sha256: [u8; 32],
     ) -> Result<Arc<PersistentAuthorityView>, V2RuntimeError> {
         self.device.expose_preprovisioned_range();
-        let mut operation = self.begin()?;
+        let mut operation = match self.begin() {
+            Ok(operation) => operation,
+            Err(error) => {
+                // A publication postflight consumes the caller's linear boot
+                // provenance even when another operation prevents us from
+                // acquiring the media epoch. Do not leave that predecessor
+                // proof usable for a retry which could race the in-flight
+                // mutation. This branch owns no epoch, so revocation is
+                // intentionally limited to the atomic proof bit; it must not
+                // clear the page cache or mutate the authority view.
+                self.revoke_boot_proof_without_epoch();
+                return Err(error);
+            }
+        };
         self.clear_recovery_cache();
         let recovered = async {
             let info =
@@ -3891,6 +3904,20 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             Some(BootStoreSelection::FailClosed) => {
                 vibeos_object_store::StorageBackendSelection::FailClosed
             }
+        }
+    }
+
+    fn revoke_authority_boot_proof(&self) {
+        let installed_current = INSTALLED_V2_RUNTIME
+            .lock()
+            .as_ref()
+            .is_some_and(|runtime| core::ptr::eq(runtime.as_ref(), self));
+        if installed_current {
+            // This callback can be reached after a facade-level error without
+            // an exclusive media epoch. Keep it race-safe and lightweight:
+            // only the mintability bit is revoked. The active operation, or a
+            // later explicit cold recovery, owns all cache/view mutation.
+            self.revoke_boot_proof_without_epoch();
         }
     }
 

@@ -361,16 +361,13 @@ def validate_exact_logical(record_stream: bytes, vectors_path: Path) -> dict[str
     }
 
 
-def configure_physical_parser() -> None:
-    # The shared parser deliberately defaults to the pre-C7.4 v1 policy. Set
-    # its externally supplied policy input and exact selector before parsing;
-    # no v1 bytes are reinterpreted as v2.
-    migration.EXTERNAL_POLICY = POLICY_V2
-    migration.exact_policy_objects = exact_policy_objects
+PHYSICAL_AUTHORITY_POLICY = migration.AuthorityPolicy(
+    external_policy=POLICY_V2,
+    exact_objects=exact_policy_objects,
+)
 
 
 def verify_image(image: bytes, vectors_path: Path) -> dict[str, Any]:
-    configure_physical_parser()
     require(len(image) % BLOCK == 0, "powered-off image is not block aligned")
     # C7.4 acceptance starts from a blank native V2 disk. Enforce both the
     # unmanaged prefix and frozen M4 range as all-zero, rather than accepting a
@@ -385,8 +382,11 @@ def verify_image(image: bytes, vectors_path: Path) -> dict[str, Any]:
         image,
         bytes(migration.M4_FIRST * BLOCK),
         expect_native=True,
+        authority_policy=PHYSICAL_AUTHORITY_POLICY,
     )
-    status, evidence = migration.probe_v2(image)
+    status, evidence = migration.probe_v2(
+        image, authority_policy=PHYSICAL_AUTHORITY_POLICY
+    )
     require(status == "valid" and evidence is not None,
             "C7.4 Storage V2 authority is not independently recoverable")
     recovered = evidence["recovered"]
@@ -639,11 +639,18 @@ def selftest(vectors_path: Path) -> dict[str, Any]:
         else:
             raise VerificationError("C7.4 logical selftest mutation was accepted")
     require(result["operator_policy"] == "p1", "C7.4 valid selftest policy differs")
-    configure_physical_parser()
-    canonical = bytearray(migration.canonical_empty_authority_payload(2))
+    canonical = bytearray(
+        migration.canonical_empty_authority_payload(
+            2, authority_policy=PHYSICAL_AUTHORITY_POLICY
+        )
+    )
     canonical[0x18:0x38] = hashlib.sha256(POLICY_V1).digest()
     try:
-        migration.parse_authority_snapshot(bytes(canonical), 2)
+        migration.parse_authority_snapshot(
+            bytes(canonical),
+            2,
+            authority_policy=PHYSICAL_AUTHORITY_POLICY,
+        )
     except ValueError:
         cases += 1
     else:

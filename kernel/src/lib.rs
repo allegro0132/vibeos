@@ -129,6 +129,31 @@ compile_error!(
     "feature `wasm-c76-graph-version-replacement-acceptance` requires the QEMU default image"
 );
 #[cfg(all(
+    feature = "wasm-c77-ephemeral-runtime-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c77-ephemeral-runtime-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "wasm-c77-ephemeral-runtime-acceptance",
+    any(
+        feature = "legacy-shell",
+        feature = "ssh-component-command",
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c73-authenticated-admission-acceptance",
+        feature = "wasm-c74-crash-safe-publication-acceptance",
+        feature = "wasm-c75-boot-revalidation-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c77-ephemeral-runtime-acceptance` is isolated from guest, command, and every earlier WASM acceptance root"
+);
+#[cfg(all(
     feature = "wasm-c76-graph-version-replacement-acceptance",
     any(
         feature = "legacy-shell",
@@ -382,6 +407,8 @@ mod component_boot_revalidation;
 mod component_crash_safe_publication;
 #[cfg(feature = "component-durable-publication")]
 mod component_durable_publication;
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+mod component_ephemeral_runtime;
 #[cfg(feature = "wasm-c67-information-flow-acceptance")]
 mod component_graph_information_flow;
 #[cfg(feature = "component-graph-principals")]
@@ -971,15 +998,24 @@ pub extern "C" fn kmain() -> ! {
             }
         }
     });
-    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    #[cfg(all(
+        feature = "wasm-c76-graph-version-replacement-acceptance",
+        not(feature = "wasm-c77-ephemeral-runtime-acceptance")
+    ))]
     let c76_baseline_component_count = world.c76_component_count();
-    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    #[cfg(all(
+        feature = "wasm-c76-graph-version-replacement-acceptance",
+        not(feature = "wasm-c77-ephemeral-runtime-acceptance")
+    ))]
     let c76_graph_authority_journal = if online_hart_count() == 4 {
         world.c76_graph_authority_journal()
     } else {
         None
     };
-    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    #[cfg(all(
+        feature = "wasm-c76-graph-version-replacement-acceptance",
+        not(feature = "wasm-c77-ephemeral-runtime-acceptance")
+    ))]
     exec::spawn(
         "wasm-c76-graph-version-replacement-acceptance",
         async move {
@@ -1005,6 +1041,28 @@ pub extern "C" fn kmain() -> ! {
             }
         },
     );
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    let c77_baseline_component_count = world.c77_component_count();
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    let c77_graph_authority_journal = if online_hart_count() == 4 {
+        world.c77_graph_authority_journal()
+    } else {
+        None
+    };
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    exec::spawn("wasm-c77-ephemeral-runtime-acceptance", async move {
+        if component_ephemeral_runtime::run_qemu_acceptance(
+            c77_graph_authority_journal,
+            c77_baseline_component_count,
+        )
+        .await
+        {
+            crate::println!("\nWASM_C77_EPHEMERAL_RUNTIME PASS durable_state=existing_g1 graph_only=1 physical_readback=1 fresh_validation=1 same_manifest=1 cold_start_empty=1 fresh_tasks=3 fresh_arenas=3 fresh_cspaces=3 fresh_memories=3 memory_bytes=196608 fresh_resource_tables=3 live_resources=4 fresh_fuel_accounts=3 fuel_consumed=0 fresh_pending_ledgers=3 active_pending_calls=1 pending_cut=parked cold_no_write=1 runtime_ready=0 guest_calls=0 raw_ids=0 ambient_lookup=0 vsh=0");
+        } else {
+            crate::println!("WASM_C77_EPHEMERAL_RUNTIME FAIL");
+            sbi::shutdown(true);
+        }
+    });
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
     exec::spawn(
         "wasm-c54-native-revoke-worker",

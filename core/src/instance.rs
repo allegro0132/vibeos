@@ -614,6 +614,9 @@ pub struct AcceptanceInstanceProbe {
     installed_capabilities: usize,
     seal_matches_space: bool,
     seal_matches_cspace: bool,
+    continuation_idle: bool,
+    continuation_external_armed: bool,
+    continuation_waiters: usize,
 }
 
 #[cfg(any(
@@ -639,6 +642,12 @@ impl fmt::Debug for AcceptanceInstanceProbe {
             )
             .field("seal_matches_space", &self.seal_matches_space)
             .field("seal_matches_cspace", &self.seal_matches_cspace)
+            .field("continuation_idle", &self.continuation_idle)
+            .field(
+                "continuation_external_armed",
+                &self.continuation_external_armed,
+            )
+            .field("continuation_waiters", &self.continuation_waiters)
             .finish()
     }
 }
@@ -725,6 +734,24 @@ impl AcceptanceInstanceProbe {
     /// incarnation.
     pub const fn seal_matches_cspace(self) -> bool {
         self.seal_matches_cspace
+    }
+
+    /// Whether this exact slot retains the pristine boot-local continuation
+    /// ledger. This exposes no continuation generation or signalling token.
+    pub const fn continuation_is_idle(self) -> bool {
+        self.continuation_idle
+    }
+
+    /// Whether this exact slot retains one armed external continuation with
+    /// a structurally valid seal. No operation or instance identity escapes.
+    pub const fn external_continuation_is_armed(self) -> bool {
+        self.continuation_external_armed
+    }
+
+    /// Number of listeners attached to the stable continuation wait cell.
+    /// This is a bounded shape count, not a lookup or wake capability.
+    pub const fn continuation_waiters(self) -> usize {
+        self.continuation_waiters
     }
 }
 
@@ -4000,6 +4027,16 @@ impl InstanceRegistry {
         let cspace_incarnation = cspace.map(|value| value.1);
         let capability_table = cspace.and_then(|value| value.2);
         let installed_capabilities = cspace.map_or(0, |value| value.3);
+        let continuation_idle = record.continuation.phase == ContinuationPhase::Idle
+            && record.continuation.kind.is_none()
+            && record.continuation.seal.is_none();
+        let continuation_external_armed = record.continuation.phase == ContinuationPhase::Armed
+            && record.continuation.kind == Some(InstanceContinuationKind::External)
+            && record
+                .continuation
+                .seal
+                .is_some_and(|seal| Self::continuation_seal_projection_matches(&record, seal));
+        let continuation_waiters = slot.continuation_wait.waiter_count();
         let seal_matches_space = record.space_seal.is_some_and(|seal| {
             seal.object_identity == space_object_identity.unwrap_or(0)
                 && seal.lock_identity == cspace_lock_identity.unwrap_or(0)
@@ -4020,6 +4057,9 @@ impl InstanceRegistry {
             installed_capabilities,
             seal_matches_space,
             seal_matches_cspace,
+            continuation_idle,
+            continuation_external_armed,
+            continuation_waiters,
         })
     }
 
@@ -6657,6 +6697,13 @@ mod tests {
         );
         let allocation = domain(52_001);
         let token = registry.reserve(allocation).unwrap();
+        #[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+        {
+            let reserved = registry.acceptance_probe(token).unwrap();
+            assert!(reserved.continuation_is_idle());
+            assert!(!reserved.external_continuation_is_armed());
+            assert_eq!(reserved.continuation_waiters(), 0);
+        }
         let incarnation = cspace_incarnation(&registry, token);
         let handle = publish_continuation_managed(
             &registry,
@@ -6671,6 +6718,13 @@ mod tests {
         assert!(TEST_CONTINUATION_BUSY.load(AtomicOrdering::Acquire));
         assert_eq!(handle.polls(), 1);
         assert_eq!(handle.owned_registration_count_for_test(), 1);
+        #[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+        {
+            let parked = registry.acceptance_probe(token).unwrap();
+            assert!(!parked.continuation_is_idle());
+            assert!(parked.external_continuation_is_armed());
+            assert_eq!(parked.continuation_waiters(), 1);
+        }
         assert_eq!(
             registry
                 .slot(token)
@@ -6810,6 +6864,13 @@ mod tests {
         assert_eq!(handle.polls(), 2);
         assert_eq!(TEST_CONTINUATION_STAGE.load(AtomicOrdering::Acquire), 2);
         assert_eq!(handle.owned_registration_count_for_test(), 0);
+        #[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+        {
+            let consumed = registry.acceptance_probe(token).unwrap();
+            assert!(!consumed.continuation_is_idle());
+            assert!(!consumed.external_continuation_is_armed());
+            assert_eq!(consumed.continuation_waiters(), 0);
+        }
         assert_eq!(
             registry
                 .slot(token)

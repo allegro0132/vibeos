@@ -6,15 +6,21 @@
 //!
 //! The unified durable journal is bounded to sectors 64..576 so recovery work
 //! cannot grow with the remainder of the block device.
+//!
+//! C7.7's terminal gate does not add a format: it accepts only the existing
+//! exact C7.6 V3 two-version graph history, proves that no other namespace
+//! history exists, and repeats that proof on an independent physical readback.
 
 #![no_std]
 
 extern crate alloc;
 
 mod c76;
+mod c77;
 mod codec;
 
 pub use c76::*;
+pub use c77::*;
 pub use codec::*;
 
 use alloc::boxed::Box;
@@ -1856,6 +1862,15 @@ impl C74CommittedStorageV2Install {
 }
 
 impl AuthorityJournal {
+    /// Best-effort revocation for a sealed higher-level boot protocol which
+    /// consumed this journal but failed before a linear V2 head was returned.
+    /// No backend handle or durable identity is exposed to that protocol.
+    fn revoke_storage_v2_authority_boot_proof(&self) {
+        if let Ok(backend) = storage_v2_only_backend(&self.inner) {
+            backend.revoke_authority_boot_proof();
+        }
+    }
+
     /// Mint linear journal provenance only from the selected Storage V2
     /// backend's boot-proved authority. Non-V2 selections are rejected before
     /// invoking any backend recovery or legacy-media operation.
@@ -3652,6 +3667,8 @@ mod tests {
     struct TestStorageV2Backend {
         selection: AtomicU8,
         boot_proved: AtomicBool,
+        pending_recover: AtomicBool,
+        fail_recover: AtomicBool,
         fail_append: AtomicBool,
         policy_sha256: SpinLock<[u8; 32]>,
         recover_calls: AtomicUsize,
@@ -3664,6 +3681,8 @@ mod tests {
             Self {
                 selection: AtomicU8::new(Self::encode_selection(selection)),
                 boot_proved: AtomicBool::new(boot_proved),
+                pending_recover: AtomicBool::new(false),
+                fail_recover: AtomicBool::new(false),
                 fail_append: AtomicBool::new(false),
                 policy_sha256: SpinLock::new([0x5a; 32]),
                 recover_calls: AtomicUsize::new(0),
@@ -3697,6 +3716,14 @@ mod tests {
 
         fn fail_next_append(&self) {
             self.fail_append.store(true, Ordering::Release);
+        }
+
+        fn fail_next_recover(&self) {
+            self.fail_recover.store(true, Ordering::Release);
+        }
+
+        fn hold_recovery_pending(&self) {
+            self.pending_recover.store(true, Ordering::Release);
         }
 
         fn complete_cold_recovery(&self) {
@@ -3744,7 +3771,12 @@ mod tests {
         fn recover_authority(&self) -> StorageV2Future<'_, StorageV2AuthoritySnapshot> {
             self.recover_calls.fetch_add(1, Ordering::AcqRel);
             Box::pin(async move {
-                if !self.boot_proved.load(Ordering::Acquire) {
+                if self.pending_recover.load(Ordering::Acquire) {
+                    core::future::pending::<()>().await;
+                }
+                if !self.boot_proved.load(Ordering::Acquire)
+                    || self.fail_recover.swap(false, Ordering::AcqRel)
+                {
                     return Err(StoreError::Corrupt);
                 }
                 Ok(self.snapshot())
@@ -4504,6 +4536,68 @@ mod tests {
             poll_ready(journal.recover_storage_v2_only()).err(),
             Some(StoreError::Corrupt)
         );
+        assert_eq!(backend.recover_calls.load(Ordering::Acquire), 1);
+        assert_eq!(backend.readback_calls.load(Ordering::Acquire), 0);
+        assert_eq!(backend.append_calls.load(Ordering::Acquire), 0);
+        assert_eq!(platform.calls(), 0);
+    }
+
+    #[test]
+    fn c77_first_recovery_error_revokes_the_boot_proof() {
+        let backend = Arc::new(TestStorageV2Backend::new(
+            StorageBackendSelection::StorageV2,
+            true,
+        ));
+        backend.fail_next_recover();
+        let (journal, platform) = test_authority_journal(Some(backend.clone()));
+        let journal = C76AuthorityJournal::new(journal);
+
+        assert!(matches!(
+            poll_ready(journal.recover_exact_v3()),
+            Err(C76StorageV2Error::Recovery(StoreError::Corrupt))
+        ));
+        assert!(!backend.boot_proved.load(Ordering::Acquire));
+        assert_eq!(backend.recover_calls.load(Ordering::Acquire), 1);
+        assert_eq!(backend.readback_calls.load(Ordering::Acquire), 0);
+        assert_eq!(backend.append_calls.load(Ordering::Acquire), 0);
+        assert_eq!(platform.calls(), 0);
+    }
+
+    #[test]
+    fn c77_dropping_an_unpolled_begin_future_revokes_the_boot_proof() {
+        let backend = Arc::new(TestStorageV2Backend::new(
+            StorageBackendSelection::StorageV2,
+            true,
+        ));
+        let (journal, platform) = test_authority_journal(Some(backend.clone()));
+
+        let future = begin_c77_exact_final_g1(C76AuthorityJournal::new(journal));
+        assert!(backend.boot_proved.load(Ordering::Acquire));
+        drop(future);
+
+        assert!(!backend.boot_proved.load(Ordering::Acquire));
+        assert_eq!(backend.recover_calls.load(Ordering::Acquire), 0);
+        assert_eq!(backend.readback_calls.load(Ordering::Acquire), 0);
+        assert_eq!(backend.append_calls.load(Ordering::Acquire), 0);
+        assert_eq!(platform.calls(), 0);
+    }
+
+    #[test]
+    fn c77_cancelling_pending_initial_recovery_revokes_the_boot_proof() {
+        let backend = Arc::new(TestStorageV2Backend::new(
+            StorageBackendSelection::StorageV2,
+            true,
+        ));
+        backend.hold_recovery_pending();
+        let (journal, platform) = test_authority_journal(Some(backend.clone()));
+        let mut future = Box::pin(begin_c77_exact_final_g1(C76AuthorityJournal::new(journal)));
+        let mut context = Context::from_waker(Waker::noop());
+
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        assert!(backend.boot_proved.load(Ordering::Acquire));
+        drop(future);
+
+        assert!(!backend.boot_proved.load(Ordering::Acquire));
         assert_eq!(backend.recover_calls.load(Ordering::Acquire), 1);
         assert_eq!(backend.readback_calls.load(Ordering::Acquire), 0);
         assert_eq!(backend.append_calls.load(Ordering::Acquire), 0);

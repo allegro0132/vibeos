@@ -33,15 +33,22 @@
 //! projection is minted only from physical G0 bytes; a replacement projection
 //! is minted only after physical G1 readback and fresh validation of both
 //! versions. The pre-append candidate is therefore never runtime authority.
+//!
+//! C7.7 adds a terminal cold-boot path for already-final G1 media. The object
+//! store must prove twice that the complete namespace contains only the exact
+//! two graph versions; this loader then repeats current semantic admission and
+//! releases only an opaque successor projection with `runtime_ready=false`.
 
 #![no_std]
 
 extern crate alloc;
 
+mod ephemeral;
 mod graph_publication;
 mod publication;
 mod root;
 
+pub use ephemeral::*;
 pub use graph_publication::*;
 pub use publication::*;
 pub use root::*;

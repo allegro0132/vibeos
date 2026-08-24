@@ -87,9 +87,30 @@ pub struct C76AuthorityJournal {
     journal: AuthorityJournal,
 }
 
+/// C7.7's private cancellation-safe terminal revoker.  It is minted before
+/// the first asynchronous poll and follows the boot typestate through both
+/// logical recovery and independent physical readback.  Dropping any future
+/// or intermediate checkpoint therefore closes the same boot proof as an
+/// explicit success or error.
+pub(super) struct C77BootProofRevocation {
+    journal: AuthorityJournal,
+}
+
+impl Drop for C77BootProofRevocation {
+    fn drop(&mut self) {
+        self.journal.revoke_storage_v2_authority_boot_proof();
+    }
+}
+
 impl C76AuthorityJournal {
     pub(super) const fn new(journal: AuthorityJournal) -> Self {
         Self { journal }
+    }
+
+    pub(super) fn c77_terminal_revocation(&self) -> C77BootProofRevocation {
+        C77BootProofRevocation {
+            journal: self.journal.clone(),
+        }
     }
 
     /// Consume this boot probe, recover and classify the selected physical
@@ -108,9 +129,13 @@ impl C76AuthorityJournal {
                     last_transient = error;
                     vibeos_core::exec::sleep_ms(1).await;
                 }
-                Err(error) => return Err(C76StorageV2Error::Recovery(error)),
+                Err(error) => {
+                    self.journal.revoke_storage_v2_authority_boot_proof();
+                    return Err(C76StorageV2Error::Recovery(error));
+                }
             }
         }
+        self.journal.revoke_storage_v2_authority_boot_proof();
         Err(C76StorageV2Error::Recovery(last_transient))
     }
 }
@@ -251,6 +276,10 @@ pub struct C76PendingPhysicalReadback {
     expected: C76ExactHistory,
     persistent_root_present: bool,
     program_root_present: bool,
+    /// Sealed result of checking the complete logical namespace, not merely
+    /// the live-root union.  C7.7 requires this to reject even tombstoned
+    /// persistent/program history before performing its one physical readback.
+    exact_final_graph_only: bool,
 }
 
 /// Result of independent physical readback.  Only G0 retains the one-shot
@@ -495,6 +524,28 @@ fn c76_recover_state(
     result
 }
 
+/// Consume a generic C7.6 classification into C7.7's narrower terminal gate.
+/// A mismatch revokes the backend's boot proof so a caller cannot obtain a
+/// fresh journal and retry a namespace that has already failed this boot.
+pub(super) fn c77_take_exact_final_g1(
+    state: C76RecoveredState,
+) -> Result<C76PendingPhysicalReadback, C76StorageV2Error> {
+    let revoker = match &state {
+        C76RecoveredState::Vacant(vacant) => vacant.journal.backend.clone(),
+        C76RecoveredState::Existing(pending) => pending.journal.backend.clone(),
+    };
+    let result = match state {
+        C76RecoveredState::Existing(pending) if pending.exact_final_graph_only => Ok(pending),
+        C76RecoveredState::Vacant(_) | C76RecoveredState::Existing(_) => {
+            Err(C76StorageV2Error::ExistingGraphHistory)
+        }
+    };
+    if result.is_err() {
+        revoker.revoke_authority_boot_proof();
+    }
+    result
+}
+
 fn c76_recover_state_inner(
     head: StorageV2RecoveredAuthorityHead,
 ) -> Result<C76RecoveredState, C76StorageV2Error> {
@@ -510,11 +561,13 @@ fn c76_recover_state_inner(
             if !graph {
                 return Err(C76StorageV2Error::ExistingGraphHistory);
             }
+            let exact_final_graph_only = c76_exact_final_graph_only(&snapshot, &expected)?;
             Ok(C76RecoveredState::Existing(C76PendingPhysicalReadback {
                 journal,
                 expected,
                 persistent_root_present: persistent,
                 program_root_present: program,
+                exact_final_graph_only,
             }))
         }
     }
@@ -635,6 +688,76 @@ fn c76_root_presence(
         live(C74_PROGRAM_SPACE_ID_RAW),
         live(C76_GRAPH_SPACE_ID_RAW),
     ))
+}
+
+/// Whether the complete logical namespace is exactly the terminal two-version
+/// graph history used by C7.7.  The live-root booleans are insufficient here:
+/// a tombstoned persistent/program grant still leaves durable object, grant,
+/// and slot history.  Exact G1 validation already fixes the identities,
+/// ordering, high-water value, and one graph tombstone; the global cardinality
+/// checks below therefore prove that no other partition or object remains.
+/// The canonical base/first-prepare check also rejects an otherwise invisible
+/// ID-high-water-only prefix carrying an extra durable numeric token.
+fn c76_exact_final_graph_only(
+    snapshot: &AuthoritySnapshot,
+    history: &C76ExactHistory,
+) -> Result<bool, C76StorageV2Error> {
+    let preflight = snapshot
+        .preflight
+        .as_ref()
+        .ok_or(C76StorageV2Error::Unformatted)?;
+    let [initial, current] = history.versions.as_slice() else {
+        return Ok(false);
+    };
+    let canonical_origin = initial.root.transaction_id.get() == FIRST_ALLOCATABLE_ID + 16
+        && initial
+            .attachments
+            .first()
+            .is_some_and(|object| object.prepare_sequence == 3);
+    let initial_high_water = checked_add(FIRST_ALLOCATABLE_ID, C76_INITIAL_ID_COUNT)?
+        .max(checked_add(C76_GRAPH_SPACE_ID_RAW, 1)?);
+    let second_high_water_sequence = initial
+        .root
+        .commit_sequence
+        .checked_add(1)
+        .ok_or(C76StorageV2Error::ExistingGraphHistory)?;
+    let first_high_water_event = (2, initial_high_water);
+    let second_high_water_event = (second_high_water_sequence, history.id_high_water);
+    let tombstone_transaction = current
+        .root
+        .transaction_id
+        .get()
+        .checked_sub(1)
+        .and_then(authority::TransactionId::new);
+    let tombstone_sequence = current.root.prepare_sequence.checked_sub(1);
+    let exact_transition_records =
+        tombstone_transaction
+            .zip(tombstone_sequence)
+            .is_some_and(|(transaction, sequence)| {
+                preflight.has_only_exact_tombstone(
+                    initial.root.grant.derivation_id,
+                    transaction,
+                    sequence,
+                )
+            })
+            && preflight.has_only_exact_two_id_high_water_events(
+                first_high_water_event,
+                second_high_water_event,
+            );
+    let only_slot = preflight.slots().first().is_some_and(|slot| {
+        slot.space == c76_space()
+            && slot.slot == 0
+            && slot.max_generation == 1
+            && slot.live_derivation == Some(current.root.grant.derivation_id)
+    });
+    Ok(canonical_origin
+        && exact_transition_records
+        && history.versions.len() == 2
+        && preflight.committed_objects().len() == 2 * C76_OBJECTS_PER_VERSION
+        && preflight.committed_grants().len() == 2
+        && preflight.slots().len() == 1
+        && only_slot
+        && c76_root_presence(snapshot)? == (false, false, true))
 }
 
 fn c76_exact_history(
@@ -1115,11 +1238,13 @@ fn c76_pending(
     if !graph {
         return Err(C76StorageV2Error::PostflightMismatch);
     }
+    let exact_final_graph_only = c76_exact_final_graph_only(&snapshot, &expected)?;
     Ok(C76PendingPhysicalReadback {
         journal,
         expected,
         persistent_root_present: persistent,
         program_root_present: program,
+        exact_final_graph_only,
     })
 }
 
@@ -1190,14 +1315,47 @@ impl C76FixedRootPolicyUnion {
 async fn c76_recover_payload(
     pending: C76PendingPhysicalReadback,
 ) -> Result<C76RecoveredGraphState, StoreError> {
+    c76_recover_payload_inner(pending, false).await
+}
+
+/// C7.7's second, independent physical gate.  Unlike the general C7.6
+/// readback, this accepts only the already-final, graph-only two-version
+/// namespace and returns no replacement authority.
+pub(super) async fn c77_recover_exact_final_g1(
+    pending: C76PendingPhysicalReadback,
+) -> Result<C76FinalGraph, StoreError> {
+    let revoker = pending.journal.backend.clone();
+    let result = match c76_recover_payload_inner(pending, true).await {
+        Err(error) => Err(error),
+        Ok(C76RecoveredGraphState::G1(graph)) => Ok(graph),
+        Ok(C76RecoveredGraphState::G0(graph)) => {
+            graph.journal.backend.revoke_authority_boot_proof();
+            Err(StoreError::Corrupt)
+        }
+    };
+    // C7.7 is a terminal, read-only boot transition.  Revoke even a successful
+    // physical proof so neither a later semantic-revalidation failure nor any
+    // other TCB caller can re-mint the broader C7.6 journal in this boot.
+    revoker.revoke_authority_boot_proof();
+    result
+}
+
+async fn c76_recover_payload_inner(
+    pending: C76PendingPhysicalReadback,
+    require_exact_final_graph_only: bool,
+) -> Result<C76RecoveredGraphState, StoreError> {
     let C76PendingPhysicalReadback {
         journal,
         expected,
         persistent_root_present,
         program_root_present,
+        exact_final_graph_only,
     } = pending;
     let revoker = journal.backend.clone();
     let result = async {
+        if require_exact_final_graph_only && !exact_final_graph_only {
+            return Err(StoreError::Corrupt);
+        }
         require_storage_v2_selection(journal.backend.as_ref())?;
         if journal.external_root_policy_sha256 != C76_STORAGE_V2_EXTERNAL_POLICY_SHA256 {
             return Err(StoreError::Corrupt);
@@ -1213,10 +1371,19 @@ async fn c76_recover_payload(
         let observed = c76_exact_history(&snapshot)
             .map_err(|_| StoreError::Corrupt)?
             .ok_or(StoreError::Corrupt)?;
+        if require_exact_final_graph_only
+            && !c76_exact_final_graph_only(&snapshot, &observed).map_err(|_| StoreError::Corrupt)?
+        {
+            return Err(StoreError::Corrupt);
+        }
         if observed != expected {
             return Err(StoreError::Corrupt);
         }
-        let union = C76FixedRootPolicyUnion::new(persistent_root_present, program_root_present);
+        let union = if require_exact_final_graph_only {
+            C76FixedRootPolicyUnion::new(false, false)
+        } else {
+            C76FixedRootPolicyUnion::new(persistent_root_present, program_root_present)
+        };
         let partitions = union.partitions();
         let mut recovery = finish_recovered_snapshot(snapshot, &partitions)?;
         c76_validate_physical_history(&recovery, &expected)?;
@@ -1241,11 +1408,13 @@ async fn c76_recover_payload(
             payloads.push(c76_take_version_bytes(&mut recovery, version, descriptor)?);
         }
         match payloads.len() {
-            1 => Ok(C76RecoveredGraphState::G0(C76ReplaceableGraph {
-                journal,
-                expected,
-                current: payloads.pop().expect("one C7.6 payload"),
-            })),
+            1 if !require_exact_final_graph_only => {
+                Ok(C76RecoveredGraphState::G0(C76ReplaceableGraph {
+                    journal,
+                    expected,
+                    current: payloads.pop().expect("one C7.6 payload"),
+                }))
+            }
             2 => {
                 let successor = payloads.pop().expect("two C7.6 payloads");
                 let predecessor = payloads.pop().expect("two C7.6 payloads");
@@ -1596,6 +1765,303 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum OptionalPartition {
+        Persistent,
+        Program,
+    }
+
+    /// Add policy-valid non-graph history directly to the physical test log.
+    /// The bytes deliberately resemble boot-local execution state: C7.7 must
+    /// exclude them by namespace shape, not by guessing at payload content.
+    fn append_optional_partition_history(
+        backend: &Arc<C76TestBackend>,
+        partition: OptionalPartition,
+        tombstone_root: bool,
+        derived_child: bool,
+    ) {
+        let (space_raw, object_kind_raw, root_rights) = match partition {
+            OptionalPartition::Persistent => (
+                C74_PERSISTENT_SPACE_ID_RAW,
+                C74_PERSISTENT_OBJECT_KIND_RAW,
+                authority::DurableRights::READ
+                    .union(authority::DurableRights::GRANT)
+                    .union(authority::DurableRights::REVOKE),
+            ),
+            OptionalPartition::Program => (
+                C74_PROGRAM_SPACE_ID_RAW,
+                C74_PROGRAM_OBJECT_KIND_RAW,
+                authority::DurableRights::READ,
+            ),
+        };
+        assert!(
+            !derived_child || matches!(partition, OptionalPartition::Persistent),
+            "the fixed program root has no GRANT right"
+        );
+
+        let mut media = backend.records.lock();
+        let preflight = authority::preflight_recovery(&media, store_id()).unwrap();
+        let base = preflight.id_high_water().max(FIRST_ALLOCATABLE_ID);
+        let exclusive_end = base
+            .checked_add(7)
+            .unwrap()
+            .max(space_raw.checked_add(1).unwrap());
+        let mut chain = authority::RecordChain::from_checkpoint(
+            store_id(),
+            preflight.chain_checkpoint().unwrap(),
+        )
+        .unwrap();
+        let (high_water, next) = authority::preview_id_high_water(&chain, exclusive_end).unwrap();
+        let mut records = high_water.records;
+        chain = next;
+
+        let object_id = authority::ObjectId::new(base.checked_add(1).unwrap()).unwrap();
+        let (object, next) = authority::preview_object_transaction(
+            &chain,
+            authority::TransactionId::new(base).unwrap(),
+            object_id,
+            authority::ObjectKind::new(object_kind_raw).unwrap(),
+            b"TaskId=41;arena=9;fuel=7;pending-call=1",
+        )
+        .unwrap();
+        records.extend(object.records);
+        chain = next;
+
+        let root_derivation = authority::DerivationId::new(base.checked_add(3).unwrap()).unwrap();
+        let (root, next) = authority::preview_grant_transaction(
+            &chain,
+            authority::TransactionId::new(base.checked_add(2).unwrap()).unwrap(),
+            authority::GrantRecord {
+                derivation_id: root_derivation,
+                parent_id: None,
+                object_id,
+                target: authority::SlotIdentity {
+                    space: authority::SpaceId::new(space_raw).unwrap(),
+                    slot: 0,
+                    generation: 0,
+                },
+                rights: root_rights,
+                resource_kind: c76_resource_kind(),
+                flags: authority::GrantFlags::ROOT,
+            },
+        )
+        .unwrap();
+        records.extend(root.records);
+        chain = next;
+
+        if derived_child {
+            let (child, next) = authority::preview_grant_transaction(
+                &chain,
+                authority::TransactionId::new(base.checked_add(4).unwrap()).unwrap(),
+                authority::GrantRecord {
+                    derivation_id: authority::DerivationId::new(base.checked_add(5).unwrap())
+                        .unwrap(),
+                    parent_id: Some(root_derivation),
+                    object_id,
+                    target: authority::SlotIdentity {
+                        space: authority::SpaceId::new(space_raw).unwrap(),
+                        slot: 1,
+                        generation: 0,
+                    },
+                    rights: authority::DurableRights::READ,
+                    resource_kind: c76_resource_kind(),
+                    flags: authority::GrantFlags::DERIVED,
+                },
+            )
+            .unwrap();
+            records.extend(child.records);
+            chain = next;
+        }
+
+        if tombstone_root {
+            let (revoke, _) = authority::preview_revoke_transaction(
+                &chain,
+                authority::TransactionId::new(base.checked_add(6).unwrap()).unwrap(),
+                root_derivation,
+            )
+            .unwrap();
+            records.extend(revoke.records);
+        }
+        media.extend(records);
+    }
+
+    fn append_numeric_high_water_prefix(backend: &Arc<C76TestBackend>) {
+        let mut media = backend.records.lock();
+        let preflight = authority::preflight_recovery(&media, store_id()).unwrap();
+        let chain = authority::RecordChain::from_checkpoint(
+            store_id(),
+            preflight.chain_checkpoint().unwrap(),
+        )
+        .unwrap();
+        let (high_water, _) = authority::preview_id_high_water(&chain, 1).unwrap();
+        media.extend(high_water.records);
+    }
+
+    #[derive(Clone, Copy)]
+    enum C77RecordMutation {
+        WrongTombstoneTransaction,
+        WrongInitialHighWater,
+        OrphanInsteadOfSecondHighWater,
+    }
+
+    fn c77_mutated_two_version_records(
+        evidence0: &[[u8; C76_COMPONENT_EVIDENCE_LEN]; 3],
+        evidence1: &[[u8; C76_COMPONENT_EVIDENCE_LEN]; 3],
+        mutation: C77RecordMutation,
+    ) -> Vec<[u8; authority::RECORD_SIZE]> {
+        let initial_base = FIRST_ALLOCATABLE_ID;
+        let successor_base = checked_add(initial_base, C76_INITIAL_ID_COUNT)
+            .unwrap()
+            .max(checked_add(C76_GRAPH_SPACE_ID_RAW, 1).unwrap());
+        let final_high_water = checked_add(successor_base, C76_SUCCESSOR_ID_COUNT).unwrap();
+        let first_high_water = match mutation {
+            C77RecordMutation::WrongInitialHighWater => checked_add(successor_base, 1).unwrap(),
+            C77RecordMutation::OrphanInsteadOfSecondHighWater => final_high_water,
+            C77RecordMutation::WrongTombstoneTransaction => successor_base,
+        };
+
+        let mut chain = authority::RecordChain::new(store_id());
+        let mut records = alloc::vec![chain.append(None, authority::RecordBody::Format).unwrap()];
+        let (high_water, next) =
+            authority::preview_id_high_water(&chain, first_high_water).unwrap();
+        records.extend(high_water.records);
+        chain = next;
+
+        let descriptor = append_version_objects(
+            &mut chain,
+            &mut records,
+            initial_base,
+            &input(0x81, evidence0),
+        )
+        .unwrap();
+        let initial_derivation =
+            c76_derivation(checked_add(initial_base, C76_INITIAL_ID_COUNT - 1).unwrap()).unwrap();
+        let (initial_root, next) = authority::preview_grant_transaction(
+            &chain,
+            c76_transaction(
+                checked_add(initial_base, C76_OBJECTS_PER_VERSION as u128 * 2).unwrap(),
+            )
+            .unwrap(),
+            authority::GrantRecord {
+                derivation_id: initial_derivation,
+                parent_id: None,
+                object_id: descriptor,
+                target: authority::SlotIdentity {
+                    space: c76_space(),
+                    slot: 0,
+                    generation: 0,
+                },
+                rights: authority::DurableRights::READ,
+                resource_kind: c76_resource_kind(),
+                flags: authority::GrantFlags::ROOT,
+            },
+        )
+        .unwrap();
+        records.extend(initial_root.records);
+        chain = next;
+
+        match mutation {
+            C77RecordMutation::OrphanInsteadOfSecondHighWater => {
+                let orphan_transaction =
+                    authority::TransactionId::new(initial_base + C76_INITIAL_ID_COUNT).unwrap();
+                let orphan_derivation =
+                    authority::DerivationId::new(initial_base + C76_INITIAL_ID_COUNT + 1).unwrap();
+                records.push(
+                    chain
+                        .append(
+                            Some(orphan_transaction),
+                            authority::RecordBody::GrantCommit {
+                                prepare_sequence: 1,
+                                prepare_crc32c: 0,
+                                derivation_id: orphan_derivation,
+                            },
+                        )
+                        .unwrap(),
+                );
+            }
+            C77RecordMutation::WrongInitialHighWater
+            | C77RecordMutation::WrongTombstoneTransaction => {
+                let (high_water, next) =
+                    authority::preview_id_high_water(&chain, final_high_water).unwrap();
+                records.extend(high_water.records);
+                chain = next;
+            }
+        }
+
+        let descriptor = append_version_objects(
+            &mut chain,
+            &mut records,
+            successor_base,
+            &input(0x82, evidence1),
+        )
+        .unwrap();
+        let tombstone_transaction = match mutation {
+            C77RecordMutation::WrongTombstoneTransaction => {
+                c76_transaction(initial_base + C76_INITIAL_ID_COUNT).unwrap()
+            }
+            C77RecordMutation::WrongInitialHighWater
+            | C77RecordMutation::OrphanInsteadOfSecondHighWater => c76_transaction(
+                checked_add(successor_base, C76_OBJECTS_PER_VERSION as u128 * 2).unwrap(),
+            )
+            .unwrap(),
+        };
+        let (tombstone, next) = authority::preview_revoke_transaction(
+            &chain,
+            tombstone_transaction,
+            initial_derivation,
+        )
+        .unwrap();
+        records.extend(tombstone.records);
+        chain = next;
+        let (successor_root, _) = authority::preview_grant_transaction(
+            &chain,
+            c76_transaction(
+                checked_add(successor_base, C76_OBJECTS_PER_VERSION as u128 * 2 + 1).unwrap(),
+            )
+            .unwrap(),
+            authority::GrantRecord {
+                derivation_id: c76_derivation(
+                    checked_add(successor_base, C76_SUCCESSOR_ID_COUNT - 1).unwrap(),
+                )
+                .unwrap(),
+                parent_id: None,
+                object_id: descriptor,
+                target: authority::SlotIdentity {
+                    space: c76_space(),
+                    slot: 0,
+                    generation: 1,
+                },
+                rights: authority::DurableRights::READ,
+                resource_kind: c76_resource_kind(),
+                flags: authority::GrantFlags::ROOT,
+            },
+        )
+        .unwrap();
+        records.extend(successor_root.records);
+        records
+    }
+
+    fn install_two_version_graph(
+        backend: &Arc<C76TestBackend>,
+        evidence0: &[[u8; C76_COMPONENT_EVIDENCE_LEN]; 3],
+        evidence1: &[[u8; C76_COMPONENT_EVIDENCE_LEN]; 3],
+    ) {
+        let vacant = match c76_recover_state(backend.head()).unwrap() {
+            C76RecoveredState::Vacant(vacant) => vacant,
+            C76RecoveredState::Existing(_) => panic!("fixture already has graph history"),
+        };
+        let pending = poll_ready(vacant.install_initial(input(0x10, evidence0))).unwrap();
+        let g0 = match poll_ready(pending.recover_payload()).unwrap() {
+            C76RecoveredGraphState::G0(graph) => graph,
+            C76RecoveredGraphState::G1(_) => panic!("initial fixture recovered as G1"),
+        };
+        let pending = poll_ready(g0.replace(input(0x20, evidence1))).unwrap();
+        assert!(matches!(
+            poll_ready(pending.recover_payload()).unwrap(),
+            C76RecoveredGraphState::G1(_)
+        ));
+    }
+
     fn append_snapshot(
         snapshot: AuthoritySnapshot,
         records: &[[u8; authority::RECORD_SIZE]],
@@ -1873,6 +2339,212 @@ mod tests {
             C76RecoveredGraphState::G1(_)
         ));
         assert_eq!(backend.append_calls.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn c77_exact_final_g1_performs_one_readback_and_has_no_write_transition() {
+        let evidence0 = [[0x71; C76_COMPONENT_EVIDENCE_LEN]; 3];
+        let evidence1 = [[0x72; C76_COMPONENT_EVIDENCE_LEN]; 3];
+        let backend = C76TestBackend::formatted();
+        install_two_version_graph(&backend, &evidence0, &evidence1);
+
+        let state = c76_recover_state(backend.head()).unwrap();
+        let pending = c77_take_exact_final_g1(state).expect("exact graph-only G1");
+        let readbacks_before = backend.readback_calls.load(Ordering::Acquire);
+        let appends_before = backend.append_calls.load(Ordering::Acquire);
+        let graph = poll_ready(c77_recover_exact_final_g1(pending)).unwrap();
+
+        assert_eq!(graph.predecessor().descriptor_bytes(), &evidence0[0][..4]);
+        assert_eq!(graph.successor().descriptor_bytes(), &evidence1[0][..4]);
+        assert_eq!(
+            backend.readback_calls.load(Ordering::Acquire),
+            readbacks_before + 1
+        );
+        assert_eq!(backend.append_calls.load(Ordering::Acquire), appends_before);
+        assert!(!backend.boot_proved.load(Ordering::Acquire));
+        assert!(backend.revoke_calls.load(Ordering::Acquire) >= 1);
+    }
+
+    #[test]
+    fn c77_rejects_vacant_and_g0_before_physical_readback() {
+        let vacant_backend = C76TestBackend::formatted();
+        let vacant_state = c76_recover_state(vacant_backend.head()).unwrap();
+        let readbacks_before = vacant_backend.readback_calls.load(Ordering::Acquire);
+        assert!(matches!(
+            c77_take_exact_final_g1(vacant_state),
+            Err(C76StorageV2Error::ExistingGraphHistory)
+        ));
+        assert_eq!(
+            vacant_backend.readback_calls.load(Ordering::Acquire),
+            readbacks_before
+        );
+        assert!(!vacant_backend.boot_proved.load(Ordering::Acquire));
+
+        let evidence = [[0x73; C76_COMPONENT_EVIDENCE_LEN]; 3];
+        let g0_backend = C76TestBackend::formatted();
+        let vacant = match c76_recover_state(g0_backend.head()).unwrap() {
+            C76RecoveredState::Vacant(vacant) => vacant,
+            C76RecoveredState::Existing(_) => panic!("fresh media is not vacant"),
+        };
+        drop(poll_ready(vacant.install_initial(input(0x73, &evidence))).unwrap());
+        let g0_state = c76_recover_state(g0_backend.head()).unwrap();
+        let readbacks_before = g0_backend.readback_calls.load(Ordering::Acquire);
+        assert!(matches!(
+            c77_take_exact_final_g1(g0_state),
+            Err(C76StorageV2Error::ExistingGraphHistory)
+        ));
+        assert_eq!(
+            g0_backend.readback_calls.load(Ordering::Acquire),
+            readbacks_before
+        );
+        assert!(!g0_backend.boot_proved.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn c77_rejects_live_tombstoned_and_derived_optional_partition_history() {
+        let cases = [
+            (OptionalPartition::Persistent, false, false),
+            (OptionalPartition::Program, false, false),
+            (OptionalPartition::Persistent, true, false),
+            (OptionalPartition::Program, true, false),
+            (OptionalPartition::Persistent, false, true),
+        ];
+        for (partition, tombstone_root, derived_child) in cases {
+            let evidence0 = [[0x74; C76_COMPONENT_EVIDENCE_LEN]; 3];
+            let evidence1 = [[0x75; C76_COMPONENT_EVIDENCE_LEN]; 3];
+            let backend = C76TestBackend::formatted();
+            append_optional_partition_history(&backend, partition, tombstone_root, derived_child);
+            install_two_version_graph(&backend, &evidence0, &evidence1);
+
+            let head = backend.head();
+            let expected_presence = if tombstone_root {
+                (false, false, true)
+            } else {
+                match partition {
+                    OptionalPartition::Persistent => (true, false, true),
+                    OptionalPartition::Program => (false, true, true),
+                }
+            };
+            assert_eq!(
+                c76_root_presence(&head.snapshot).unwrap(),
+                expected_presence
+            );
+            let history = c76_exact_history(&head.snapshot).unwrap().unwrap();
+            assert_eq!(history.versions.len(), 2);
+            assert!(!c76_exact_final_graph_only(&head.snapshot, &history).unwrap());
+
+            let state = c76_recover_state(head).unwrap();
+            let readbacks_before = backend.readback_calls.load(Ordering::Acquire);
+            assert!(matches!(
+                c77_take_exact_final_g1(state),
+                Err(C76StorageV2Error::ExistingGraphHistory)
+            ));
+            assert_eq!(
+                backend.readback_calls.load(Ordering::Acquire),
+                readbacks_before
+            );
+            assert!(!backend.boot_proved.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn c77_rejects_numeric_high_water_only_prefix_history() {
+        let evidence0 = [[0x78; C76_COMPONENT_EVIDENCE_LEN]; 3];
+        let evidence1 = [[0x79; C76_COMPONENT_EVIDENCE_LEN]; 3];
+        let backend = C76TestBackend::formatted();
+        append_numeric_high_water_prefix(&backend);
+        install_two_version_graph(&backend, &evidence0, &evidence1);
+
+        let head = backend.head();
+        let history = c76_exact_history(&head.snapshot).unwrap().unwrap();
+        assert_eq!(history.versions.len(), 2);
+        assert_eq!(
+            head.snapshot
+                .preflight
+                .as_ref()
+                .unwrap()
+                .committed_objects()
+                .len(),
+            2 * C76_OBJECTS_PER_VERSION
+        );
+        assert!(!c76_exact_final_graph_only(&head.snapshot, &history).unwrap());
+
+        let readbacks_before = backend.readback_calls.load(Ordering::Acquire);
+        assert!(matches!(
+            c77_take_exact_final_g1(c76_recover_state(head).unwrap()),
+            Err(C76StorageV2Error::ExistingGraphHistory)
+        ));
+        assert_eq!(
+            backend.readback_calls.load(Ordering::Acquire),
+            readbacks_before
+        );
+        assert!(!backend.boot_proved.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn c77_binds_both_high_water_events_and_the_exact_tombstone_transaction() {
+        let evidence0 = [[0x7a; C76_COMPONENT_EVIDENCE_LEN]; 3];
+        let evidence1 = [[0x7b; C76_COMPONENT_EVIDENCE_LEN]; 3];
+        for mutation in [
+            C77RecordMutation::WrongTombstoneTransaction,
+            C77RecordMutation::WrongInitialHighWater,
+            C77RecordMutation::OrphanInsteadOfSecondHighWater,
+        ] {
+            let backend = C76TestBackend::formatted();
+            *backend.records.lock() =
+                c77_mutated_two_version_records(&evidence0, &evidence1, mutation);
+            let head = backend.head();
+            let history = c76_exact_history(&head.snapshot).unwrap().unwrap();
+            assert_eq!(history.versions.len(), 2);
+            assert!(!c76_exact_final_graph_only(&head.snapshot, &history).unwrap());
+
+            let readbacks_before = backend.readback_calls.load(Ordering::Acquire);
+            assert!(matches!(
+                c77_take_exact_final_g1(c76_recover_state(head).unwrap()),
+                Err(C76StorageV2Error::ExistingGraphHistory)
+            ));
+            assert_eq!(
+                backend.readback_calls.load(Ordering::Acquire),
+                readbacks_before
+            );
+            assert!(!backend.boot_proved.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn c77_second_gate_rejects_toctou_and_noncurrent_physical_bindings() {
+        let evidence0 = [[0x76; C76_COMPONENT_EVIDENCE_LEN]; 3];
+        let evidence1 = [[0x77; C76_COMPONENT_EVIDENCE_LEN]; 3];
+
+        let changed = C76TestBackend::formatted();
+        install_two_version_graph(&changed, &evidence0, &evidence1);
+        let pending = c77_take_exact_final_g1(c76_recover_state(changed.head()).unwrap()).unwrap();
+        let appends_before = changed.append_calls.load(Ordering::Acquire);
+        let readbacks_before = changed.readback_calls.load(Ordering::Acquire);
+        append_optional_partition_history(&changed, OptionalPartition::Persistent, false, false);
+        assert_eq!(
+            poll_ready(c77_recover_exact_final_g1(pending)).err(),
+            Some(StoreError::JournalChanged)
+        );
+        assert_eq!(
+            changed.readback_calls.load(Ordering::Acquire),
+            readbacks_before + 1
+        );
+        assert_eq!(changed.append_calls.load(Ordering::Acquire), appends_before);
+        assert!(!changed.boot_proved.load(Ordering::Acquire));
+
+        let bound_retained = C76TestBackend::formatted();
+        install_two_version_graph(&bound_retained, &evidence0, &evidence1);
+        let pending =
+            c77_take_exact_final_g1(c76_recover_state(bound_retained.head()).unwrap()).unwrap();
+        let readbacks_before = bound_retained.readback_calls.load(Ordering::Acquire);
+        bound_retained.bind_retained.store(true, Ordering::Release);
+        assert!(poll_ready(c77_recover_exact_final_g1(pending)).is_err());
+        assert_eq!(
+            bound_retained.readback_calls.load(Ordering::Acquire),
+            readbacks_before + 1
+        );
+        assert!(!bound_retained.boot_proved.load(Ordering::Acquire));
     }
 
     #[test]

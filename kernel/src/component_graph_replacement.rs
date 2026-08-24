@@ -10,7 +10,11 @@
 //! are instantiated or invoked.
 
 use alloc::{sync::Arc, vec::Vec};
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+use core::alloc::Layout;
 use core::cell::UnsafeCell;
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+use core::fmt;
 use core::future::Future;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
@@ -49,6 +53,8 @@ use vibeos_component_runtime::graph::{
     ComponentGraphPublishedExportSpec,
 };
 use vibeos_component_runtime::host::{AtomicHostOperationSlot, HostOperationToken};
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+use vibeos_component_runtime::memory::{GuestMemory, VecMemory};
 use vibeos_component_runtime::resource::{
     ResourceError, ResourceTable, ResourceToken, ResourceTypeId,
 };
@@ -64,6 +70,8 @@ use vibeos_image_policy::C76_GRAPH_OPERATOR_POLICY_QEMU_ACCEPTANCE;
 
 use crate::exec::{OneShotWaitQueue, PreparedTaskBatch, TaskHandle, TaskState};
 use crate::heap::{AllocationDomain, OwnerId};
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+use crate::instance::InstancePhase;
 use crate::instance::{
     AcceptanceInstanceProbe, InstanceContinuation, InstanceContinuationKind,
     InstanceContinuationSignal, InstanceContinuationToken, InstancePayload, InstanceSpace,
@@ -79,6 +87,8 @@ use super::{
     reserve_resource_generations, retire_domain, ComponentGraphPrincipalLifecycleError,
     PRINCIPAL_TASK_NAME, RUNTIME_UNAVAILABLE_COMPLETION,
 };
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+use super::{PrincipalFuelEnvelope, COMPONENT_GRAPH_PRINCIPAL_LIFECYCLE_OVERHEAD_BYTES};
 
 const C66_NODE_COUNT: usize = 3;
 const C66_INCARNATION_COUNT: usize = 4;
@@ -89,6 +99,8 @@ const C66_SINK_BIT: u8 = 1 << 2;
 const C66_ALL_NODE_BITS: u8 = C66_SOURCE_BIT | C66_TARGET_BIT | C66_SINK_BIT;
 const C66_SIBLING_BITS: u8 = C66_SOURCE_BIT | C66_SINK_BIT;
 const C66_VALUE: u8 = 0x66;
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+const C77_MEMORY_BYTES_PER_NODE: usize = 64 * 1024;
 const C66_WIT_SHA256: [u8; 32] = [
     0x05, 0x3e, 0x44, 0x72, 0x9a, 0x38, 0x75, 0x45, 0xf5, 0xdc, 0x73, 0xba, 0xc2, 0x11, 0xd3, 0x07,
     0xde, 0x74, 0x6a, 0x4c, 0xf7, 0x58, 0xd1, 0x79, 0xc0, 0xfa, 0x3c, 0xf2, 0xb9, 0xe8, 0xc5, 0xbf,
@@ -229,6 +241,12 @@ struct C66Audit {
     late_wake_stale: AtomicU64,
     fresh_edge_deliveries: AtomicU64,
     sink_deliveries: AtomicU64,
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    c77_runtime_mask: AtomicU8,
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    c77_pending_ledger_mask: AtomicU8,
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    c77_active_pending_mask: AtomicU8,
 }
 
 impl C66Audit {
@@ -251,6 +269,12 @@ impl C66Audit {
             late_wake_stale: AtomicU64::new(0),
             fresh_edge_deliveries: AtomicU64::new(0),
             sink_deliveries: AtomicU64::new(0),
+            #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+            c77_runtime_mask: AtomicU8::new(0),
+            #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+            c77_pending_ledger_mask: AtomicU8::new(0),
+            #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+            c77_active_pending_mask: AtomicU8::new(0),
         }
     }
 
@@ -304,6 +328,12 @@ impl C66Audit {
         self.late_wake_stale.store(0, Ordering::Release);
         self.fresh_edge_deliveries.store(0, Ordering::Release);
         self.sink_deliveries.store(0, Ordering::Release);
+        #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+        {
+            self.c77_runtime_mask.store(0, Ordering::Release);
+            self.c77_pending_ledger_mask.store(0, Ordering::Release);
+            self.c77_active_pending_mask.store(0, Ordering::Release);
+        }
         true
     }
 
@@ -452,6 +482,12 @@ fn c66_supervisor_activation(
 }
 
 impl C66SupervisorActivationPublisher {
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    fn is_unpublished_exact(&self, generation: u64) -> bool {
+        self.cell.generation == generation
+            && self.cell.state.load(Ordering::Acquire) == C66_HANDOFF_EMPTY
+    }
+
     fn publish(self, generation: u64, supervisor: C66Supervisor) -> Result<(), C66Supervisor> {
         if self.cell.generation != generation
             || self
@@ -660,6 +696,141 @@ struct C66PendingReceive {
     registration: StreamWakeRegistration,
 }
 
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+struct C77PendingLedger {
+    active_calls: u8,
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+struct C77EphemeralRuntimeState {
+    memory: VecMemory,
+    fuel: PrincipalFuelEnvelope,
+    pending: C77PendingLedger,
+    node_bit: u8,
+    resource_generation: u64,
+    expected_live_resources: usize,
+    guest_calls: u64,
+    observed: bool,
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+impl C77EphemeralRuntimeState {
+    fn new(
+        memory: VecMemory,
+        fuel_limit: u64,
+        poll_quantum: u64,
+        node_bit: u8,
+        resource_generation: u64,
+        expected_live_resources: usize,
+    ) -> Self {
+        Self {
+            memory,
+            fuel: PrincipalFuelEnvelope {
+                limit: fuel_limit,
+                poll_quantum,
+                consumed: 0,
+            },
+            pending: C77PendingLedger { active_calls: 0 },
+            node_bit,
+            resource_generation,
+            expected_live_resources,
+            guest_calls: 0,
+            observed: false,
+        }
+    }
+
+    fn memory_is_zeroed(&self) -> bool {
+        let Ok(length) = usize::try_from(self.memory.len()) else {
+            return false;
+        };
+        if length != C77_MEMORY_BYTES_PER_NODE {
+            return false;
+        }
+        let mut offset = 0usize;
+        let mut bytes = [0_u8; 256];
+        while offset < length {
+            let count = (length - offset).min(bytes.len());
+            let Ok(pointer) = u32::try_from(offset) else {
+                return false;
+            };
+            if self
+                .memory
+                .read_exact(pointer, &mut bytes[..count])
+                .is_err()
+                || bytes[..count].iter().any(|byte| *byte != 0)
+            {
+                return false;
+            }
+            offset += count;
+        }
+        true
+    }
+
+    fn shape_is_valid(&self, resources: &ResourceTable<ComponentAuthority>) -> bool {
+        self.node_bit != 0
+            && self.node_bit & !C66_ALL_NODE_BITS == 0
+            && self.memory_is_zeroed()
+            && self.fuel.limit != 0
+            && self.fuel.poll_quantum != 0
+            && self.fuel.poll_quantum <= self.fuel.limit
+            && self.fuel.consumed == 0
+            && self.pending.active_calls <= 1
+            && self.resource_generation != 0
+            && resources.instance_generation() == self.resource_generation
+            && resources.len() == self.expected_live_resources
+            && self.guest_calls == 0
+    }
+
+    fn observe_once(&mut self, generation: u64) -> bool {
+        if self.observed {
+            return C66_AUDIT.c77_runtime_mask.load(Ordering::Acquire) & self.node_bit != 0
+                && C66_AUDIT.c77_pending_ledger_mask.load(Ordering::Acquire) & self.node_bit != 0;
+        }
+        if !C66_AUDIT.matches(generation) {
+            return false;
+        }
+        let runtime_before = C66_AUDIT
+            .c77_runtime_mask
+            .fetch_or(self.node_bit, Ordering::AcqRel);
+        let pending_before = C66_AUDIT
+            .c77_pending_ledger_mask
+            .fetch_or(self.node_bit, Ordering::AcqRel);
+        if runtime_before & self.node_bit != 0 || pending_before & self.node_bit != 0 {
+            return false;
+        }
+        self.observed = true;
+        true
+    }
+
+    fn arm_pending(&mut self, generation: u64) -> bool {
+        if self.pending.active_calls != 0 || !C66_AUDIT.matches(generation) {
+            return false;
+        }
+        let before = C66_AUDIT
+            .c77_active_pending_mask
+            .fetch_or(self.node_bit, Ordering::AcqRel);
+        if before & self.node_bit != 0 {
+            return false;
+        }
+        self.pending.active_calls = 1;
+        true
+    }
+
+    fn clear_pending(&mut self, generation: u64) -> bool {
+        if self.pending.active_calls != 1 || !C66_AUDIT.matches(generation) {
+            return false;
+        }
+        let before = C66_AUDIT
+            .c77_active_pending_mask
+            .fetch_and(!self.node_bit, Ordering::AcqRel);
+        if before & self.node_bit == 0 {
+            return false;
+        }
+        self.pending.active_calls = 0;
+        true
+    }
+}
+
 enum C66CandidateStage {
     Receive,
     Write(u8),
@@ -695,6 +866,8 @@ struct C66Payload {
     drains: [Option<C66Drain>; 2],
     role: C66Role,
     completed: bool,
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    c77_runtime: Option<C77EphemeralRuntimeState>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -771,7 +944,54 @@ impl C66Payload {
             drains,
             role,
             completed: false,
+            #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+            c77_runtime: None,
         }
+    }
+
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    fn with_c77_runtime(mut self, runtime: Option<C77EphemeralRuntimeState>) -> Self {
+        self.c77_runtime = runtime;
+        self
+    }
+
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    fn c77_arm_pending(&mut self) -> bool {
+        self.c77_runtime
+            .as_mut()
+            .is_none_or(|runtime| runtime.arm_pending(self.generation))
+    }
+
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    fn c77_clear_pending(&mut self) -> bool {
+        self.c77_runtime
+            .as_mut()
+            .is_none_or(|runtime| runtime.clear_pending(self.generation))
+    }
+
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    fn c77_runtime_shape_is_valid(&self) -> bool {
+        self.c77_runtime
+            .as_ref()
+            .is_none_or(|runtime| runtime.shape_is_valid(&self.resources))
+    }
+
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    fn c77_pending_role_matches(&self) -> bool {
+        let Some(runtime) = self.c77_runtime.as_ref() else {
+            return true;
+        };
+        let role_has_pending = matches!(
+            self.role,
+            C66Role::OldTarget {
+                waiting: Some(_),
+                ..
+            } | C66Role::Candidate {
+                waiting: Some(_),
+                ..
+            }
+        );
+        role_has_pending == (runtime.pending.active_calls == 1)
     }
 
     fn drain(&self, index: usize) -> Result<C66Drain, ()> {
@@ -780,6 +1000,15 @@ impl C66Payload {
 
     fn finish(&mut self) -> C66PayloadOutcome {
         if self.completed {
+            return C66PayloadOutcome::InvariantFailure;
+        }
+        #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+        if !self.c77_runtime_shape_is_valid()
+            || self
+                .c77_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.pending.active_calls != 0)
+        {
             return C66PayloadOutcome::InvariantFailure;
         }
         for drain in &mut self.drains {
@@ -929,7 +1158,11 @@ impl C66Payload {
         // The registration is retained through exact cancellation and is
         // dropped only after the backend revoke attempt has completed.
         drop(pending);
-        backend_revoked && signal_cleared && !slot.contains(operation)
+        #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+        let pending_cleared = self.c77_clear_pending();
+        #[cfg(not(feature = "wasm-c77-ephemeral-runtime-acceptance"))]
+        let pending_cleared = true;
+        backend_revoked && signal_cleared && !slot.contains(operation) && pending_cleared
     }
 
     fn abandon_receive_arm(
@@ -1031,11 +1264,17 @@ impl C66Payload {
             drop(registration);
             return Err(());
         }
-        Ok(C66PendingReceive {
+        let pending = C66PendingReceive {
             token,
             continuation,
             registration,
-        })
+        };
+        #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+        if !self.c77_arm_pending() {
+            let _ = self.cancel_receive(space, endpoint, pending, slot);
+            return Err(());
+        }
+        Ok(pending)
     }
 
     fn resume_receive(
@@ -1112,6 +1351,10 @@ impl C66Payload {
             || !signal_slot.is_empty()
             || !c66_increment(&C66_AUDIT.sealed_resumes, self.generation)
         {
+            return Err(());
+        }
+        #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+        if !self.c77_clear_pending() {
             return Err(());
         }
         if core::ptr::eq(slot, &C66_CANDIDATE_OPERATION) {
@@ -1463,6 +1706,15 @@ impl Drop for C66Payload {
         debug_assert!(self.resources.is_empty());
         debug_assert!(self.drains.iter().all(Option::is_none));
         debug_assert!(self.completed);
+        #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+        if let Some(runtime) = self.c77_runtime.as_ref() {
+            debug_assert!(runtime.memory_is_zeroed());
+            debug_assert_ne!(runtime.fuel.limit, 0);
+            debug_assert_ne!(runtime.fuel.poll_quantum, 0);
+            debug_assert_eq!(runtime.fuel.consumed, 0);
+            debug_assert_eq!(runtime.guest_calls, 0);
+            debug_assert_eq!(runtime.pending.active_calls, 0);
+        }
     }
 }
 
@@ -1479,6 +1731,18 @@ unsafe impl InstancePayload for C66Payload {
         if self.completed {
             c66_publish_failure(self.generation);
             return Poll::Ready(RUNTIME_UNAVAILABLE_COMPLETION);
+        }
+        #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+        {
+            if !self.c77_runtime_shape_is_valid()
+                || self
+                    .c77_runtime
+                    .as_mut()
+                    .is_some_and(|runtime| !runtime.observe_once(self.generation))
+            {
+                c66_publish_failure(self.generation);
+                return Poll::Ready(RUNTIME_UNAVAILABLE_COMPLETION);
+            }
         }
         let role = core::mem::replace(&mut self.role, C66Role::Transitioning);
         let outcome = match role {
@@ -1500,6 +1764,11 @@ unsafe impl InstancePayload for C66Payload {
             }
             C66Role::Transitioning | C66Role::Completed => C66PayloadOutcome::InvariantFailure,
         };
+        #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+        if !self.c77_runtime_shape_is_valid() || !self.c77_pending_role_matches() {
+            c66_publish_failure(self.generation);
+            return Poll::Ready(RUNTIME_UNAVAILABLE_COMPLETION);
+        }
         match outcome {
             C66PayloadOutcome::Pending => Poll::Pending,
             C66PayloadOutcome::Complete => Poll::Ready(RUNTIME_UNAVAILABLE_COMPLETION),
@@ -1680,6 +1949,8 @@ struct C66StagedCurrent {
     fresh_sink_publisher: C66FreshEndpointPublisher<Arc<ByteStreamReader>>,
     fresh_source_handoff_audit: C66FreshEndpointAudit<Arc<ByteStreamWriter>>,
     fresh_sink_handoff_audit: C66FreshEndpointAudit<Arc<ByteStreamReader>>,
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    c77_resource_generations_distinct: bool,
 }
 
 impl C66Run {
@@ -2668,8 +2939,103 @@ fn c66_prepare_relay(
     .map(|(reader, writer)| (reader.into_authority(), writer.into_authority()))
     .ok_or(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup)
 }
+
+#[derive(Clone, Copy)]
+enum C66StageMode {
+    Legacy,
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    C77Ephemeral,
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+fn c77_memory_allocation_charge() -> Option<usize> {
+    let layout = Layout::array::<u8>(C77_MEMORY_BYTES_PER_NODE).ok()?;
+    crate::heap::Heap::allocation_charge(layout)
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+fn c77_adjust_owner_quotas(
+    plans: &mut [super::PrincipalPlan],
+) -> Result<(), ComponentGraphPrincipalLifecycleError> {
+    let Some(memory_charge) = c77_memory_allocation_charge() else {
+        return Err(ComponentGraphPrincipalLifecycleError::Allocation);
+    };
+    for plan in plans {
+        if plan.guest_memory_limit != C77_MEMORY_BYTES_PER_NODE {
+            return Err(ComponentGraphPrincipalLifecycleError::BudgetOverflow { node: plan.node });
+        }
+        plan.owner_quota = memory_charge
+            .checked_add(COMPONENT_GRAPH_PRINCIPAL_LIFECYCLE_OVERHEAD_BYTES)
+            .ok_or(ComponentGraphPrincipalLifecycleError::BudgetOverflow { node: plan.node })?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+fn c77_allocate_runtime_state(
+    plan: super::PrincipalPlan,
+    domain: AllocationDomain,
+    node_bit: u8,
+    expected_live_resources: usize,
+) -> Result<C77EphemeralRuntimeState, ComponentGraphPrincipalLifecycleError> {
+    let mut allocation = unsafe { crate::heap::enter_domain(domain) };
+    let memory = VecMemory::new(plan.guest_memory_limit, plan.guest_memory_limit);
+    allocation.restore();
+    let memory = memory.map_err(|_| ComponentGraphPrincipalLifecycleError::Allocation)?;
+    Ok(C77EphemeralRuntimeState::new(
+        memory,
+        plan.fuel_limit,
+        plan.poll_quantum,
+        node_bit,
+        plan.resource_generation,
+        expected_live_resources,
+    ))
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+fn c77_prepare_runtime_states(
+    plans: &[super::PrincipalPlan],
+    domains: &[AllocationDomain],
+) -> Result<[Option<C77EphemeralRuntimeState>; C66_NODE_COUNT], ComponentGraphPrincipalLifecycleError>
+{
+    if plans.len() != C66_NODE_COUNT || domains.len() != C66_NODE_COUNT {
+        return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
+    }
+    let source = c77_allocate_runtime_state(plans[0], domains[0], C66_SOURCE_BIT, 1)?;
+    let target = c77_allocate_runtime_state(plans[1], domains[1], C66_TARGET_BIT, 2)?;
+    let sink = c77_allocate_runtime_state(plans[2], domains[2], C66_SINK_BIT, 1)?;
+    let memory_charge =
+        c77_memory_allocation_charge().ok_or(ComponentGraphPrincipalLifecycleError::Allocation)?;
+    for domain in domains {
+        let Some(arena) = crate::HEAP.arena_stats(domain.arena) else {
+            return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
+        };
+        let Some(owner) = crate::HEAP.account_stats(domain.owner) else {
+            return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
+        };
+        if arena.owner != domain.owner
+            || arena.live_bytes != memory_charge
+            || arena.live_allocations != 1
+            || owner.quota_bytes
+                != memory_charge + COMPONENT_GRAPH_PRINCIPAL_LIFECYCLE_OVERHEAD_BYTES
+            || owner.live_bytes != memory_charge
+            || owner.live_allocations != 1
+        {
+            return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
+        }
+    }
+    Ok([Some(source), Some(target), Some(sink)])
+}
+
 fn stage_c66_current_graph(
     current: &ComponentGraphPrincipalTemplate,
+) -> Result<C66StagedCurrent, ComponentGraphPrincipalLifecycleError> {
+    stage_c66_current_graph_with_mode(current, C66StageMode::Legacy)
+}
+
+fn stage_c66_current_graph_with_mode(
+    current: &ComponentGraphPrincipalTemplate,
+    mode: C66StageMode,
 ) -> Result<C66StagedCurrent, ComponentGraphPrincipalLifecycleError> {
     let current_seal = {
         let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
@@ -2681,6 +3047,12 @@ fn stage_c66_current_graph(
     if current_plans.len() != C66_NODE_COUNT {
         return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementPolicy);
     }
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    if matches!(mode, C66StageMode::C77Ephemeral) {
+        c77_adjust_owner_quotas(&mut current_plans)?;
+    }
+    #[cfg(not(feature = "wasm-c77-ephemeral-runtime-acceptance"))]
+    let _ = mode;
     let resource_generation = reserve_resource_generations(C66_NODE_COUNT)?;
     for (index, plan) in current_plans.iter_mut().enumerate() {
         plan.resource_generation = resource_generation
@@ -2816,6 +3188,44 @@ fn stage_c66_current_graph(
         return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
     };
 
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    let mut c77_runtimes = if matches!(mode, C66StageMode::C77Ephemeral) {
+        if ![source_probe, old_target_probe, sink_probe]
+            .iter()
+            .all(|probe| probe.continuation_is_idle() && probe.continuation_waiters() == 0)
+        {
+            drop(old_batch);
+            abort_pristine_registry_batch(&tokens, &domains)?;
+            return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
+        }
+        match c77_prepare_runtime_states(&current_plans, &domains) {
+            Ok(states) => states,
+            Err(error) => {
+                drop(old_batch);
+                abort_pristine_registry_batch(&tokens, &domains)?;
+                return Err(error);
+            }
+        }
+    } else {
+        [const { None }; C66_NODE_COUNT]
+    };
+
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    let c77_resource_generations_distinct = matches!(mode, C66StageMode::C77Ephemeral)
+        && current_plans
+            .iter()
+            .all(|plan| plan.resource_generation != 0)
+        && current_plans[0].resource_generation != current_plans[1].resource_generation
+        && current_plans[0].resource_generation != current_plans[2].resource_generation
+        && current_plans[1].resource_generation != current_plans[2].resource_generation;
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    if matches!(mode, C66StageMode::C77Ephemeral) && !c77_resource_generations_distinct {
+        drop(c77_runtimes);
+        drop(old_batch);
+        abort_pristine_registry_batch(&tokens, &domains)?;
+        return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
+    }
+
     let generation =
         match NEXT_C66_GENERATION.try_update(Ordering::AcqRel, Ordering::Acquire, |next| {
             c66_phase_word(next, C66_PHASE_OLD)?;
@@ -2823,12 +3233,16 @@ fn stage_c66_current_graph(
         }) {
             Ok(generation) => generation,
             Err(_) => {
+                #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+                drop(c77_runtimes);
                 drop(old_batch);
                 abort_pristine_registry_batch(&tokens, &domains)?;
                 return Err(ComponentGraphPrincipalLifecycleError::ResourceGenerationExhausted);
             }
         };
     if !C66_AUDIT.reset(generation) {
+        #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+        drop(c77_runtimes);
         drop(old_batch);
         abort_pristine_registry_batch(&tokens, &domains)?;
         return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
@@ -2891,9 +3305,15 @@ fn stage_c66_current_graph(
         system.restore();
         activation
     };
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    let source_runtime = c77_runtimes[0].take();
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    let target_runtime = c77_runtimes[1].take();
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    let sink_runtime = c77_runtimes[2].take();
     if unsafe {
         registry.install_payload(tokens[0], || {
-            C66Payload::new(
+            let payload = C66Payload::new(
                 generation,
                 tokens[0],
                 source_table,
@@ -2909,7 +3329,10 @@ fn stage_c66_current_graph(
                     rotated: false,
                     handoff: Some(fresh_source_receiver),
                 },
-            )
+            );
+            #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+            let payload = payload.with_c77_runtime(source_runtime);
+            payload
         })
     }
     .is_err()
@@ -2918,7 +3341,7 @@ fn stage_c66_current_graph(
     }
     if unsafe {
         registry.install_payload(tokens[1], || {
-            C66Payload::new(
+            let payload = C66Payload::new(
                 generation,
                 tokens[1],
                 old_target_table,
@@ -2936,7 +3359,10 @@ fn stage_c66_current_graph(
                     waiting: None,
                     announced: false,
                 },
-            )
+            );
+            #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+            let payload = payload.with_c77_runtime(target_runtime);
+            payload
         })
     }
     .is_err()
@@ -2945,7 +3371,7 @@ fn stage_c66_current_graph(
     }
     if unsafe {
         registry.install_payload(tokens[2], || {
-            C66Payload::new(
+            let payload = C66Payload::new(
                 generation,
                 tokens[2],
                 sink_table,
@@ -2961,7 +3387,10 @@ fn stage_c66_current_graph(
                     rotated: false,
                     handoff: Some(fresh_sink_receiver),
                 },
-            )
+            );
+            #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+            let payload = payload.with_c77_runtime(sink_runtime);
+            payload
         })
     }
     .is_err()
@@ -3003,6 +3432,11 @@ fn stage_c66_current_graph(
         Ok(handles) => handles,
         Err(_) => lifecycle_invariant_failed(&tokens, "C6.6 old graph publication failed"),
     };
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    let c77_task_identity_changed = matches!(mode, C66StageMode::C77Ephemeral)
+        && !c77_pairwise_task_identity_is_fresh(&old_handles);
+    #[cfg(not(feature = "wasm-c77-ephemeral-runtime-acceptance"))]
+    let c77_task_identity_changed = false;
     if published.len() != C66_NODE_COUNT + 1
         || published[..C66_NODE_COUNT]
             .iter()
@@ -3014,6 +3448,7 @@ fn stage_c66_current_graph(
             })
         || published[C66_NODE_COUNT].id() != prepared_supervisor.id()
         || !published[C66_NODE_COUNT].shares_status_with(&prepared_supervisor)
+        || c77_task_identity_changed
     {
         lifecycle_invariant_failed(&tokens, "C6.6 old publication identities changed");
     }
@@ -3042,6 +3477,8 @@ fn stage_c66_current_graph(
         fresh_sink_publisher,
         fresh_source_handoff_audit,
         fresh_sink_handoff_audit,
+        #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+        c77_resource_generations_distinct,
     })
 }
 
@@ -3287,6 +3724,8 @@ fn start_c66_authorized_replacement(
         fresh_sink_publisher,
         fresh_source_handoff_audit,
         fresh_sink_handoff_audit,
+        #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+            c77_resource_generations_distinct: _,
     } = staged;
     let [old_stream_0, old_stream_1] = old_streams;
     let [fresh_stream_0, fresh_stream_1] = fresh_streams;
@@ -3392,6 +3831,308 @@ pub(crate) fn stage_c76_current_graph(
     proof
         .consume(|view| stage_c66_current_graph(view.current_graph()))
         .map(C76StagedCurrent)
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+#[must_use = "hold the observed C7.7 boot-local graph until cold reset"]
+pub(crate) struct C77StagedEphemeralGraph {
+    staged: C66StagedCurrent,
+    observed: AtomicBool,
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+#[must_use = "inspect every redacted C7.7 boot-local lifecycle count"]
+pub(crate) struct C77EphemeralBootReceipt {
+    fresh_tasks: usize,
+    fresh_arenas: usize,
+    fresh_cspaces: usize,
+    fresh_memories: usize,
+    fresh_resource_tables: usize,
+    fresh_fuel_accounts: usize,
+    fresh_pending_ledgers: usize,
+    active_pending_calls: usize,
+    memory_bytes: u64,
+    live_resources: usize,
+    fuel_consumed: u64,
+    runtime_ready: bool,
+    guest_calls: u64,
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+impl fmt::Debug for C77EphemeralBootReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("C77EphemeralBootReceipt")
+            .field("fresh_tasks", &self.fresh_tasks)
+            .field("fresh_arenas", &self.fresh_arenas)
+            .field("fresh_cspaces", &self.fresh_cspaces)
+            .field("fresh_memories", &self.fresh_memories)
+            .field("fresh_resource_tables", &self.fresh_resource_tables)
+            .field("fresh_fuel_accounts", &self.fresh_fuel_accounts)
+            .field("fresh_pending_ledgers", &self.fresh_pending_ledgers)
+            .field("active_pending_calls", &self.active_pending_calls)
+            .field("memory_bytes", &self.memory_bytes)
+            .field("live_resources", &self.live_resources)
+            .field("fuel_consumed", &self.fuel_consumed)
+            .field("runtime_ready", &self.runtime_ready)
+            .field("guest_calls", &self.guest_calls)
+            .finish()
+    }
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+impl C77EphemeralBootReceipt {
+    pub(crate) const fn fresh_tasks(&self) -> usize {
+        self.fresh_tasks
+    }
+
+    pub(crate) const fn fresh_arenas(&self) -> usize {
+        self.fresh_arenas
+    }
+
+    pub(crate) const fn fresh_cspaces(&self) -> usize {
+        self.fresh_cspaces
+    }
+
+    pub(crate) const fn fresh_memories(&self) -> usize {
+        self.fresh_memories
+    }
+
+    pub(crate) const fn fresh_resource_tables(&self) -> usize {
+        self.fresh_resource_tables
+    }
+
+    pub(crate) const fn fresh_fuel_accounts(&self) -> usize {
+        self.fresh_fuel_accounts
+    }
+
+    pub(crate) const fn fresh_pending_ledgers(&self) -> usize {
+        self.fresh_pending_ledgers
+    }
+
+    pub(crate) const fn active_pending_calls(&self) -> usize {
+        self.active_pending_calls
+    }
+
+    pub(crate) const fn memory_bytes(&self) -> u64 {
+        self.memory_bytes
+    }
+
+    pub(crate) const fn live_resources(&self) -> usize {
+        self.live_resources
+    }
+
+    pub(crate) const fn fuel_consumed(&self) -> u64 {
+        self.fuel_consumed
+    }
+
+    pub(crate) const fn runtime_ready(&self) -> bool {
+        self.runtime_ready
+    }
+
+    pub(crate) const fn guest_calls(&self) -> u64 {
+        self.guest_calls
+    }
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+fn c77_pairwise_task_identity_is_fresh(handles: &[TaskHandle; C66_NODE_COUNT]) -> bool {
+    handles.iter().enumerate().all(|(index, left)| {
+        handles.iter().skip(index + 1).all(|right| {
+            let left_domain = left.allocation_domain();
+            let right_domain = right.allocation_domain();
+            left.id() != right.id()
+                && !left.shares_status_with(right)
+                && left_domain.owner != right_domain.owner
+                && left_domain.arena != right_domain.arena
+        })
+    })
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+fn c77_arenas_are_live_and_fresh(handles: &[TaskHandle; C66_NODE_COUNT]) -> bool {
+    let Some(memory_charge) = c77_memory_allocation_charge() else {
+        return false;
+    };
+    handles.iter().all(|handle| {
+        let domain = handle.allocation_domain();
+        let Some(arena) = crate::HEAP.arena_stats(domain.arena) else {
+            return false;
+        };
+        let Some(owner) = crate::HEAP.account_stats(domain.owner) else {
+            return false;
+        };
+        domain.owner != OwnerId::SYSTEM
+            && domain.arena.is_tracked()
+            && arena.owner == domain.owner
+            && arena.live_bytes >= memory_charge
+            && arena.live_allocations >= 2
+            && owner.owner == domain.owner
+            && owner.live_bytes == arena.live_bytes
+            && owner.live_allocations == arena.live_allocations
+            && owner.denials == 0
+    })
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+fn c77_cspace_probe_is_stable(
+    before: AcceptanceInstanceProbe,
+    after: AcceptanceInstanceProbe,
+    installed_capabilities: usize,
+) -> bool {
+    before.is_exact()
+        && before.exact_phase() == Some(InstancePhase::Reserved)
+        && after.is_exact()
+        && after.exact_phase() == Some(InstancePhase::Active)
+        && before.same_space_object(after)
+        && before.same_cspace_lock(after)
+        && before.same_cspace_identity(after)
+        && before.same_cspace_incarnation(after)
+        && before.same_capability_table(after)
+        && before.seal_matches_space()
+        && after.seal_matches_space()
+        && before.seal_matches_cspace()
+        && after.seal_matches_cspace()
+        && before.installed_capability_count() == installed_capabilities
+        && after.installed_capability_count() == installed_capabilities
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+pub(crate) fn stage_c77_ephemeral_graph(
+    proof: C76SupervisorCurrentGraph,
+) -> Result<C77StagedEphemeralGraph, ComponentGraphPrincipalLifecycleError> {
+    let baseline = super::super::component_instances::registry().occupancy_stats();
+    if baseline.occupied != 0 || baseline.header_mismatches != 0 {
+        return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
+    }
+    proof
+        .consume(|view| {
+            stage_c66_current_graph_with_mode(view.current_graph(), C66StageMode::C77Ephemeral)
+        })
+        .map(|staged| C77StagedEphemeralGraph {
+            staged,
+            observed: AtomicBool::new(false),
+        })
+}
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+impl C77StagedEphemeralGraph {
+    pub(crate) async fn observe(
+        &self,
+    ) -> Result<C77EphemeralBootReceipt, ComponentGraphPrincipalLifecycleError> {
+        if self
+            .observed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementInvariant);
+        }
+        let staged = &self.staged;
+        if !c66_wait_stage(
+            &C66_OLD_READY,
+            staged.generation,
+            [
+                &staged.old_handles[0],
+                &staged.old_handles[1],
+                &staged.old_handles[2],
+            ],
+        )
+        .await
+        {
+            return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementInvariant);
+        }
+        let mut all_parked = false;
+        for _ in 0..64 {
+            if staged
+                .old_handles
+                .iter()
+                .all(TaskHandle::acceptance_is_parked_exact)
+            {
+                all_parked = true;
+                break;
+            }
+            crate::exec::yield_now().await;
+        }
+        let registry = super::super::component_instances::registry();
+        let probes = [
+            registry.acceptance_probe(staged.old_tokens[0]),
+            registry.acceptance_probe(staged.old_tokens[1]),
+            registry.acceptance_probe(staged.old_tokens[2]),
+        ];
+        let [Some(source_after), Some(target_after), Some(sink_after)] = probes else {
+            return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementInvariant);
+        };
+        let cspaces_fresh = c77_cspace_probe_is_stable(staged.source_probe, source_after, 1)
+            && c77_cspace_probe_is_stable(staged.old_target_probe, target_after, 2)
+            && c77_cspace_probe_is_stable(staged.sink_probe, sink_after, 1)
+            && !source_after.same_space_object(target_after)
+            && !source_after.same_space_object(sink_after)
+            && !target_after.same_space_object(sink_after)
+            && !source_after.same_cspace_lock(target_after)
+            && !source_after.same_cspace_lock(sink_after)
+            && !target_after.same_cspace_lock(sink_after)
+            && !source_after.same_cspace_identity(target_after)
+            && !source_after.same_cspace_identity(sink_after)
+            && !target_after.same_cspace_identity(sink_after)
+            && !source_after.same_capability_table(target_after)
+            && !source_after.same_capability_table(sink_after)
+            && !target_after.same_capability_table(sink_after);
+        let continuation_cut = source_after.continuation_is_idle()
+            && source_after.continuation_waiters() == 0
+            && target_after.external_continuation_is_armed()
+            && target_after.continuation_waiters() == 1
+            && sink_after.continuation_is_idle()
+            && sink_after.continuation_waiters() == 0;
+        let old_operation = C66_OLD_OPERATION.load();
+        let pending_backend_exact = old_operation.is_some()
+            && C66_OLD_OPERATION_REPLAY.lock().as_ref() == old_operation.as_ref()
+            && C66_OLD_WAKE_WORDS.lock().is_some()
+            && C66_OLD_WAKE_SIGNAL.is_empty()
+            && C66_CANDIDATE_OPERATION.load().is_none()
+            && C66_CANDIDATE_WAKE_WORDS.lock().is_none()
+            && C66_CANDIDATE_WAKE_SIGNAL.is_empty();
+        let audit_exact = C66_AUDIT.matches(staged.generation)
+            && !C66_AUDIT.failed.load(Ordering::Acquire)
+            && C66_AUDIT.old_ready_mask.load(Ordering::Acquire) == C66_ALL_NODE_BITS
+            && C66_AUDIT.c77_runtime_mask.load(Ordering::Acquire) == C66_ALL_NODE_BITS
+            && C66_AUDIT.c77_pending_ledger_mask.load(Ordering::Acquire) == C66_ALL_NODE_BITS
+            && C66_AUDIT.c77_active_pending_mask.load(Ordering::Acquire) == C66_TARGET_BIT
+            && C66_AUDIT.wake_registrations.load(Ordering::Acquire) == 1
+            && C66_AUDIT.wake_callbacks.load(Ordering::Acquire) == 0
+            && C66_AUDIT.continuation_resumes.load(Ordering::Acquire) == 0
+            && C66_AUDIT.sealed_resumes.load(Ordering::Acquire) == 0
+            && C66_AUDIT.old_routes_retired.load(Ordering::Acquire) == 0
+            && C66_AUDIT.fresh_routes.load(Ordering::Acquire) == 0
+            && C66_AUDIT.fresh_completed_mask.load(Ordering::Acquire) == 0;
+        if !all_parked
+            || !c77_pairwise_task_identity_is_fresh(&staged.old_handles)
+            || !c77_arenas_are_live_and_fresh(&staged.old_handles)
+            || !cspaces_fresh
+            || !staged.c77_resource_generations_distinct
+            || !continuation_cut
+            || !pending_backend_exact
+            || !audit_exact
+            || c66_phase(staged.generation) != Some(C66_PHASE_OLD)
+            || !staged.activation.is_unpublished_exact(staged.generation)
+        {
+            return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementInvariant);
+        }
+        Ok(C77EphemeralBootReceipt {
+            fresh_tasks: C66_NODE_COUNT,
+            fresh_arenas: C66_NODE_COUNT,
+            fresh_cspaces: C66_NODE_COUNT,
+            fresh_memories: C66_NODE_COUNT,
+            fresh_resource_tables: C66_NODE_COUNT,
+            fresh_fuel_accounts: C66_NODE_COUNT,
+            fresh_pending_ledgers: C66_NODE_COUNT,
+            active_pending_calls: 1,
+            memory_bytes: (C77_MEMORY_BYTES_PER_NODE as u64) * (C66_NODE_COUNT as u64),
+            live_resources: 4,
+            fuel_consumed: 0,
+            runtime_ready: false,
+            guest_calls: 0,
+        })
+    }
 }
 
 #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]

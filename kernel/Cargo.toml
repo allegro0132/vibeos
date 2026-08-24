@@ -198,6 +198,13 @@ wasm-c76-graph-version-replacement-acceptance = [
     "vibeos-core/wasm-c66-node-replacement-acceptance",
     "vibeos-image-policy/c76-graph-version-replacement-qemu-acceptance",
 ]
+# QEMU-only C7.7 cold-recovery proof. It reuses the sealed C7.6 graph format
+# and policy surface, but accepts only an already-final graph-only G1
+# namespace. Every boot constructs fresh validation-only runtime state; no
+# execution identity or dynamic state is read from or written to disk.
+wasm-c77-ephemeral-runtime-acceptance = [
+    "wasm-c76-graph-version-replacement-acceptance",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

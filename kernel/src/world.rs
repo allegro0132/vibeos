@@ -682,6 +682,21 @@ impl World {
         self.components.lock().len()
     }
 
+    /// C7.7 receives the same explicit init-owned journal facade, then its
+    /// object-store typestate narrows that facade to a complete graph-only G1
+    /// namespace before any boot-local lifecycle can be constructed.
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    pub(crate) fn c77_graph_authority_journal(&self) -> Option<store::C76AuthorityJournal> {
+        self.c76_graph_authority_journal()
+    }
+
+    /// Allocation-free baseline used to prove cold recovery starts with no
+    /// component-owned publication before physical readback and revalidation.
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    pub(crate) fn c77_component_count(&self) -> usize {
+        self.c76_component_count()
+    }
+
     /// Spawn and register a task under a stable component identity.
     pub fn spawn_component(
         &self,

@@ -14,6 +14,8 @@ use wasmparser::types::Types;
 use wasmparser::PrimitiveValType;
 use wit_parser::{Handle, Resolve, Type, TypeDefKind, TypeId, WorldItem};
 
+use crate::decode::CurrentComponentValidationEngine;
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct NamedValueShape {
     pub name: String,
@@ -190,6 +192,26 @@ impl WorldContract {
             imports,
             exports,
         })
+    }
+
+    /// Parse WIT while consuming the same opaque current-engine proof used for
+    /// Component validation. The frontend has no runtime feature toggles, so
+    /// its exact version, registry checksum, and Cargo feature set are carried
+    /// by the proof's private identity.
+    pub fn parse_with_current_engine(
+        source: &str,
+        exact_world: &str,
+        engine: &CurrentComponentValidationEngine,
+    ) -> Result<Self, WorldError> {
+        let frontend = engine.identity().wit_parser();
+        if frontend.name() != "wit-parser"
+            || frontend.version() != vibeos_component_format::WIT_PARSER_0_255_0_VERSION
+            || frontend.checksum() != vibeos_component_format::WIT_PARSER_0_255_0_CHECKSUM
+            || frontend.features() != vibeos_component_format::WIT_PARSER_FEATURES
+        {
+            return Err(WorldError::InvalidWit);
+        }
+        Self::parse(source, exact_world)
     }
 
     pub fn check_component(

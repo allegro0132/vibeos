@@ -32,8 +32,13 @@ use crate::{
     world::{normalize_component_world_entities, NamedEntityShape, WorldContract, WorldError},
 };
 use alloc::{string::String, vec::Vec};
-use vibeos_component_format::{LimitKind, ProfileIdentity, PROFILE_1_LIMITS};
-use vibeos_wasm_runtime::inspect_core;
+use vibeos_component_format::{
+    current_validation_engine_identity, LimitKind, ProfileIdentity, ValidationEngineIdentity,
+    WasmParserFeatureSelection, PROFILE_1_LIMITS,
+};
+use vibeos_wasm_runtime::{
+    current_core_validation_engine, inspect_core_with_current_engine, CurrentCoreValidationEngine,
+};
 use wasmparser::{
     component_types::{ComponentAnyTypeId, ComponentEntityType},
     CanonicalFunction, CanonicalOption, ComponentAlias, ComponentDefinedType as RawDefinedType,
@@ -140,6 +145,53 @@ impl DecodeError {
     pub const fn code(self) -> u16 {
         self as u16
     }
+}
+
+mod current_engine_private {
+    pub struct Seal;
+}
+
+/// Opaque, non-cloneable proof that both the Component frontend (including the
+/// WIT frontend identity) and the embedded-Core frontend were selected from
+/// the exact current-boot engine contract.
+///
+/// ```compile_fail
+/// use vibeos_component_runtime::decode::CurrentComponentValidationEngine;
+/// let _forged = CurrentComponentValidationEngine {};
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_runtime::decode::CurrentComponentValidationEngine;
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<CurrentComponentValidationEngine>();
+/// ```
+pub struct CurrentComponentValidationEngine {
+    identity: &'static ValidationEngineIdentity,
+    core: CurrentCoreValidationEngine,
+    _sealed: current_engine_private::Seal,
+}
+
+impl CurrentComponentValidationEngine {
+    pub const fn identity(&self) -> &'static ValidationEngineIdentity {
+        self.identity
+    }
+}
+
+/// Resolve a complete exact profile to this boot's validator stack. There is
+/// no caller-provided identity, ambient lookup, or adjacent-profile fallback.
+pub fn current_component_validation_engine(
+    profile: ProfileIdentity,
+) -> Option<CurrentComponentValidationEngine> {
+    let identity = current_validation_engine_identity(profile)?;
+    let core = current_core_validation_engine(profile)?;
+    if core.identity() != identity {
+        return None;
+    }
+    Some(CurrentComponentValidationEngine {
+        identity,
+        core,
+        _sealed: current_engine_private::Seal,
+    })
 }
 
 /// Sealed result of complete Component validation. Derived counters and world
@@ -288,11 +340,22 @@ impl InspectionMode {
     }
 }
 
-fn profile_features(mode: InspectionMode) -> WasmFeatures {
-    let mut features = WasmFeatures::empty();
-    features.set(WasmFeatures::COMPONENT_MODEL, true);
-    features.set(WasmFeatures::CM_ASYNC, mode.async_enabled());
-    features
+fn parser_features(selection: WasmParserFeatureSelection) -> WasmFeatures {
+    match selection {
+        WasmParserFeatureSelection::Empty => WasmFeatures::empty(),
+        WasmParserFeatureSelection::All => WasmFeatures::all(),
+        WasmParserFeatureSelection::ComponentModel => {
+            let mut features = WasmFeatures::empty();
+            features.set(WasmFeatures::COMPONENT_MODEL, true);
+            features
+        }
+        WasmParserFeatureSelection::ComponentModelAsync => {
+            let mut features = WasmFeatures::empty();
+            features.set(WasmFeatures::COMPONENT_MODEL, true);
+            features.set(WasmFeatures::CM_ASYNC, true);
+            features
+        }
+    }
 }
 
 fn add(value: &mut u32, amount: u32, maximum: u32, _kind: LimitKind) -> Result<(), DecodeError> {
@@ -363,7 +426,19 @@ pub fn inspect_component_for_profile(
     bytes: &[u8],
     profile: ProfileIdentity,
 ) -> Result<ComponentPlan<'_>, DecodeError> {
-    inspect_component_for_profile_impl(bytes, profile, false).map(|(plan, _)| plan)
+    let engine = current_component_validation_engine(profile).ok_or(DecodeError::Unsupported)?;
+    inspect_component_with_current_engine(bytes, &engine)
+}
+
+/// Freshly inspect bytes under an opaque current-engine proof. The profile is
+/// taken from the proof, never from a component custom section or caller
+/// descriptor.
+pub fn inspect_component_with_current_engine<'a>(
+    bytes: &'a [u8],
+    engine: &CurrentComponentValidationEngine,
+) -> Result<ComponentPlan<'a>, DecodeError> {
+    inspect_component_for_profile_impl(bytes, engine.identity.profile(), false, engine)
+        .map(|(plan, _)| plan)
 }
 
 /// Inspect a Component and additionally capture narrow, graph-only nominal
@@ -376,7 +451,17 @@ pub fn inspect_component_graph_for_profile(
     bytes: &[u8],
     profile: ProfileIdentity,
 ) -> Result<ComponentGraphInspection<'_>, DecodeError> {
-    let (plan, resources) = inspect_component_for_profile_impl(bytes, profile, true)?;
+    let engine = current_component_validation_engine(profile).ok_or(DecodeError::Unsupported)?;
+    inspect_component_graph_with_current_engine(bytes, &engine)
+}
+
+/// Current-engine counterpart of [`inspect_component_graph_for_profile`].
+pub fn inspect_component_graph_with_current_engine<'a>(
+    bytes: &'a [u8],
+    engine: &CurrentComponentValidationEngine,
+) -> Result<ComponentGraphInspection<'a>, DecodeError> {
+    let (plan, resources) =
+        inspect_component_for_profile_impl(bytes, engine.identity.profile(), true, engine)?;
     let resources = resources.ok_or(DecodeError::InvalidWiring)?;
     Ok(ComponentGraphInspection::new(plan, resources))
 }
@@ -390,12 +475,20 @@ fn inspect_component_for_profile_impl<'a>(
     bytes: &'a [u8],
     profile: ProfileIdentity,
     collect_graph_resources: bool,
+    engine: &CurrentComponentValidationEngine,
 ) -> Result<(ComponentPlan<'a>, Option<ComponentGraphResourceProvenance>), DecodeError> {
     let mode = InspectionMode::for_profile(profile).ok_or(DecodeError::Unsupported)?;
+    if engine.identity.profile() != profile {
+        return Err(DecodeError::Unsupported);
+    }
+    let validator = engine.identity.component_validator();
+    if validator.predecode_async() != mode.async_enabled() {
+        return Err(DecodeError::Unsupported);
+    }
     if bytes.len() > PROFILE_1_LIMITS.max_component_bytes || bytes.len() > u32::MAX as usize {
         return Err(DecodeError::Limit);
     }
-    predecode_component_for_profile(bytes, mode.async_enabled()).map_err(predecode_error)?;
+    predecode_component_for_profile(bytes, validator.predecode_async()).map_err(predecode_error)?;
     let mut summary = ComponentSummary {
         bytes: bytes.len() as u32,
         ..ComponentSummary::default()
@@ -421,7 +514,7 @@ fn inspect_component_for_profile_impl<'a>(
     // The structural pass recognizes every proposal so it can return the
     // profile's stable `Unsupported` diagnostic itself. The strict validator
     // below receives only the Component Model base feature.
-    parser.set_features(WasmFeatures::all());
+    parser.set_features(parser_features(validator.structural_features()));
 
     for payload in parser.parse_all(bytes) {
         let payload = payload.map_err(|_| DecodeError::Malformed)?;
@@ -1145,13 +1238,16 @@ fn inspect_component_for_profile_impl<'a>(
     }
 
     for module in &modules {
-        inspect_core(module).map_err(|_| DecodeError::InvalidEmbeddedCore)?;
+        inspect_core_with_current_engine(module, &engine.core)
+            .map_err(|_| DecodeError::InvalidEmbeddedCore)?;
     }
 
-    let types = match Validator::new_with_features(profile_features(mode)).validate_all(bytes) {
+    let types = match Validator::new_with_features(parser_features(validator.strict_features()))
+        .validate_all(bytes)
+    {
         Ok(types) => types,
         Err(_) => {
-            if Validator::new_with_features(WasmFeatures::all())
+            if Validator::new_with_features(parser_features(validator.diagnostic_features()))
                 .validate_all(bytes)
                 .is_ok()
             {

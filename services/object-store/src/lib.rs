@@ -383,6 +383,11 @@ pub type StorageV2Future<'a, T> = Pin<Box<dyn Future<Output = Result<T, StoreErr
 pub trait StorageV2Backend: Send + Sync {
     fn selection(&self) -> StorageBackendSelection;
     fn info(&self) -> StorageV2BackendInfo;
+    /// Revoke the currently cached boot authority proof without attempting a
+    /// page-cache, journal, or media mutation. This operation must be safe
+    /// when another storage epoch is active. Only a complete cold physical
+    /// recovery may later restore mintable facade provenance.
+    fn revoke_authority_boot_proof(&self);
     fn recover_authority(&self) -> StorageV2Future<'_, StorageV2AuthoritySnapshot>;
     /// Re-read the authoritative checkpoint and rebuild its exact object
     /// bindings from physical media. This is deliberately separate from
@@ -954,6 +959,83 @@ struct C74ExactPostflightReceipt {
     _sealed: (),
 }
 
+#[derive(Clone, Copy)]
+struct C75RecoveredRootPresence {
+    persistent: bool,
+    program: bool,
+    component: bool,
+}
+
+/// Bytes recovered from the exact sealed C7.5 durable publication layout.
+///
+/// The durable trust mode is part of the move-only value, so an operator
+/// publication cannot be treated as development input by dropping its
+/// evidence. Neither variant contains a journal handle, durable identity,
+/// recovered graph, object token, root policy, checkpoint, or capability.
+#[must_use = "physically recovered publication bytes must be freshly admitted or discarded"]
+pub enum C75RecoveredPublicationPayload {
+    Development(C75RecoveredDevelopmentPayload),
+    Operator(C75RecoveredOperatorPayload),
+}
+
+/// Exact development artifact bytes copied from independent physical
+/// readback. This value is deliberately move-only and carries no authority.
+#[must_use = "physically recovered development bytes must be freshly admitted or discarded"]
+pub struct C75RecoveredDevelopmentPayload {
+    artifact_bytes: Vec<u8>,
+    roots: C75RecoveredRootPresence,
+}
+
+/// Exact operator artifact and canonical retained-only evidence bytes copied
+/// from independent physical readback. Evidence is data only: no evidence
+/// object binding, grant, token, or durable identity survives this boundary.
+#[must_use = "physically recovered operator bytes must be freshly admitted or discarded"]
+pub struct C75RecoveredOperatorPayload {
+    artifact_bytes: Vec<u8>,
+    evidence_bytes: [u8; C74_OPERATOR_EVIDENCE_LEN],
+    roots: C75RecoveredRootPresence,
+}
+
+impl C75RecoveredDevelopmentPayload {
+    pub fn artifact_bytes(&self) -> &[u8] {
+        &self.artifact_bytes
+    }
+}
+
+impl C75RecoveredOperatorPayload {
+    pub fn artifact_bytes(&self) -> &[u8] {
+        &self.artifact_bytes
+    }
+
+    pub fn evidence_bytes(&self) -> &[u8; C74_OPERATOR_EVIDENCE_LEN] {
+        &self.evidence_bytes
+    }
+}
+
+impl C75RecoveredPublicationPayload {
+    fn roots(&self) -> C75RecoveredRootPresence {
+        match self {
+            Self::Development(payload) => payload.roots,
+            Self::Operator(payload) => payload.roots,
+        }
+    }
+
+    /// Physical readback observed the fixed persistent root partition.
+    pub fn persistent_root_present(&self) -> bool {
+        self.roots().persistent
+    }
+
+    /// Physical readback observed the fixed program root partition.
+    pub fn program_root_present(&self) -> bool {
+        self.roots().program
+    }
+
+    /// Physical readback observed the fixed Component root partition.
+    pub fn component_root_present(&self) -> bool {
+        self.roots().component
+    }
+}
+
 impl BoundAuthorityRecovery {
     /// Borrow the exact canonical recovered graph retained by this provenance
     /// receipt. No mutable view or independently replaceable resolver is
@@ -1206,6 +1288,93 @@ fn validate_c74_exact_postflight(
     Ok(C74ExactPostflightReceipt { _sealed: () })
 }
 
+fn recover_c75_payload(
+    mut recovery: BoundAuthorityRecovery,
+    expected: C74ExactPostflightExpectation,
+    mut physically_read_artifact_bytes: Vec<u8>,
+) -> Result<C75RecoveredPublicationPayload, StoreError> {
+    let receipt = validate_c74_exact_postflight(&recovery, &expected)?;
+    drop(receipt);
+
+    let live = |space_raw| {
+        recovery
+            .recovered
+            .slots
+            .iter()
+            .any(|slot| slot.space.get() == space_raw && slot.live_derivation.is_some())
+    };
+    let roots = C75RecoveredRootPresence {
+        persistent: live(C74_PERSISTENT_SPACE_ID_RAW),
+        program: live(C74_PROGRAM_SPACE_ID_RAW),
+        component: live(C74_COMPONENT_SPACE_ID_RAW),
+    };
+    if !roots.component {
+        return Err(StoreError::Corrupt);
+    }
+
+    let artifact_index = recovery
+        .recovered
+        .objects
+        .iter()
+        .position(|object| object == &expected.artifact)
+        .ok_or(StoreError::Corrupt)?;
+    let mut logical_artifact_bytes =
+        core::mem::take(&mut recovery.recovered.objects[artifact_index].bytes);
+    if physically_read_artifact_bytes.as_slice() != logical_artifact_bytes.as_slice()
+        || physically_read_artifact_bytes.len() as u64 != expected.artifact.byte_len()
+    {
+        erase_bytes(&mut logical_artifact_bytes);
+        erase_bytes(&mut physically_read_artifact_bytes);
+        return Err(StoreError::Corrupt);
+    }
+    erase_bytes(&mut logical_artifact_bytes);
+    let artifact_bytes = physically_read_artifact_bytes;
+
+    match expected.evidence {
+        C74ExpectedEvidence::Absent { .. } => Ok(C75RecoveredPublicationPayload::Development(
+            C75RecoveredDevelopmentPayload {
+                artifact_bytes,
+                roots,
+            },
+        )),
+        C74ExpectedEvidence::RetainedOnly(expected_evidence) => {
+            let evidence_index = recovery
+                .recovered
+                .objects
+                .iter()
+                .position(|object| object == &expected_evidence)
+                .ok_or(StoreError::Corrupt)?;
+            let evidence = core::mem::take(&mut recovery.recovered.objects[evidence_index].bytes);
+            let evidence_bytes = evidence.try_into().map_err(|mut adjacent: Vec<u8>| {
+                erase_bytes(&mut adjacent);
+                StoreError::Corrupt
+            })?;
+            Ok(C75RecoveredPublicationPayload::Operator(
+                C75RecoveredOperatorPayload {
+                    artifact_bytes,
+                    evidence_bytes,
+                    roots,
+                },
+            ))
+        }
+    }
+}
+
+fn c75_artifact_token(
+    recovery: &BoundAuthorityRecovery,
+    expected: &C74ExactPostflightExpectation,
+) -> Result<StorageV2ObjectToken, StoreError> {
+    let artifact = recovery.exact_object(&expected.artifact)?;
+    recovery
+        .v2_objects
+        .as_deref()
+        .ok_or(StoreError::Corrupt)?
+        .iter()
+        .find(|binding| binding.matches(artifact))
+        .map(|binding| binding.token.clone())
+        .ok_or(StoreError::ObjectUnavailable)
+}
+
 #[derive(Clone)]
 pub struct AuthorityObjectResolver {
     v2_objects: Option<Arc<Vec<StorageV2RecoveredObject>>>,
@@ -1415,6 +1584,117 @@ impl StorageV2RecoveredAuthorityHead {
         evidence_bytes: &[u8; C74_OPERATOR_EVIDENCE_LEN],
     ) -> Result<C74CommittedStorageV2Install, C74StorageV2InstallError> {
         c74_install(self, artifact_bytes, Some(evidence_bytes)).await
+    }
+
+    /// Consume this boot-proved head and classify only the private fixed C7.5
+    /// Component namespace. Existing publication bytes are derived from the
+    /// sealed recovered head itself; callers supply no artifact, evidence,
+    /// durable identity, snapshot, checkpoint, or root policy.
+    ///
+    /// A vacant result is the sole type which permits initial installation.
+    /// An existing result can only proceed to independent physical readback.
+    pub async fn recover_c75_state(self) -> Result<C75RecoveredState, C75StorageV2Error> {
+        c75_recover_state(self)
+    }
+}
+
+/// Single consuming C7.5 boot probe. The variants are public so the loader can
+/// select the matching current trust policy, while every field and durable
+/// detail remains sealed inside its move-only payload.
+#[must_use = "the recovered C7.5 state must be installed, physically checked, or discarded"]
+pub enum C75RecoveredState {
+    Vacant(C75VacantHead),
+    Existing(C75PendingPhysicalReadback),
+}
+
+/// The exact fixed Component namespace was absent from this boot-proved head.
+/// This is the only C7.5 type which can perform the one-time append.
+#[must_use = "a vacant C7.5 head must be installed or discarded"]
+pub struct C75VacantHead {
+    journal: StorageV2OnlyAuthorityJournal,
+    snapshot: AuthoritySnapshot,
+}
+
+/// One acknowledged exact fixed-layout publication waiting for independent
+/// physical readback. This type exposes no pre-readback root observation.
+#[must_use = "a pending C7.5 publication must be physically recovered or discarded"]
+pub struct C75PendingPhysicalReadback {
+    journal: StorageV2OnlyAuthorityJournal,
+    expectation: C74ExactPostflightExpectation,
+    persistent_root_present: bool,
+    program_root_present: bool,
+    component_root_present: bool,
+}
+
+/// Redacted C7.5 state-probe and initial-install failures. No record,
+/// checkpoint, policy bytes, recovered graph, or durable identity is carried
+/// by this error surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum C75StorageV2Error {
+    Unformatted,
+    ExternalPolicyMismatch,
+    ExistingComponentHistory,
+    IdExhausted,
+    Encode,
+    Append(StoreError),
+    PostflightMismatch,
+}
+
+impl C75VacantHead {
+    /// Commit the private four-ID development layout. The caller's bytes are
+    /// installation input only; the resulting pending state releases bytes
+    /// solely from a later independent physical readback.
+    pub async fn install_development(
+        self,
+        artifact_bytes: &[u8],
+    ) -> Result<C75PendingPhysicalReadback, C75StorageV2Error> {
+        c75_install_vacant(self, artifact_bytes, None).await
+    }
+
+    /// Commit canonical retained-only evidence and the artifact through the
+    /// private six-ID operator layout.
+    pub async fn install_operator(
+        self,
+        artifact_bytes: &[u8],
+        evidence_bytes: &[u8; C74_OPERATOR_EVIDENCE_LEN],
+    ) -> Result<C75PendingPhysicalReadback, C75StorageV2Error> {
+        c75_install_vacant(self, artifact_bytes, Some(evidence_bytes)).await
+    }
+}
+
+impl C75PendingPhysicalReadback {
+    /// Re-read Storage V2 physical media, bind the private complete fixed-root
+    /// union, and release only typed artifact/evidence bytes copied from that
+    /// exact recovery. Every journal handle, graph, token, and stable identity
+    /// is consumed before success returns.
+    pub async fn recover_payload(self) -> Result<C75RecoveredPublicationPayload, StoreError> {
+        let Self {
+            journal,
+            expectation,
+            persistent_root_present,
+            program_root_present,
+            component_root_present,
+        } = self;
+        let revoker = journal.backend.clone();
+        let union = match C74FixedRootPolicyUnion::new(
+            persistent_root_present,
+            program_root_present,
+            component_root_present,
+        ) {
+            Ok(union) => union,
+            Err(error) => {
+                revoker.revoke_authority_boot_proof();
+                return Err(error);
+            }
+        };
+        let partitions = union.partitions();
+        let result = journal
+            .recover_c75_bound_payload(&partitions, expectation)
+            .await;
+        if result.is_err() {
+            revoker.revoke_authority_boot_proof();
+        }
+        result
     }
 }
 
@@ -1719,6 +1999,150 @@ impl AuthorityJournal {
     }
 }
 
+fn map_c75_to_c74_error(error: C75StorageV2Error) -> C74StorageV2InstallError {
+    match error {
+        C75StorageV2Error::Unformatted => C74StorageV2InstallError::Unformatted,
+        C75StorageV2Error::ExternalPolicyMismatch => {
+            C74StorageV2InstallError::ExternalPolicyMismatch
+        }
+        C75StorageV2Error::ExistingComponentHistory => {
+            C74StorageV2InstallError::ExistingComponentHistory
+        }
+        C75StorageV2Error::IdExhausted => C74StorageV2InstallError::IdExhausted,
+        C75StorageV2Error::Encode => C74StorageV2InstallError::Encode,
+        C75StorageV2Error::Append(error) => C74StorageV2InstallError::Append(error),
+        C75StorageV2Error::PostflightMismatch => C74StorageV2InstallError::PostflightMismatch,
+    }
+}
+
+fn map_c74_to_c75_error(error: C74StorageV2InstallError) -> C75StorageV2Error {
+    match error {
+        C74StorageV2InstallError::Unformatted => C75StorageV2Error::Unformatted,
+        C74StorageV2InstallError::ExternalPolicyMismatch => {
+            C75StorageV2Error::ExternalPolicyMismatch
+        }
+        C74StorageV2InstallError::ExistingComponentHistory => {
+            C75StorageV2Error::ExistingComponentHistory
+        }
+        C74StorageV2InstallError::IdExhausted => C75StorageV2Error::IdExhausted,
+        C74StorageV2InstallError::Encode => C75StorageV2Error::Encode,
+        C74StorageV2InstallError::Append(error) => C75StorageV2Error::Append(error),
+        C74StorageV2InstallError::PostflightMismatch => C75StorageV2Error::PostflightMismatch,
+    }
+}
+
+fn c75_recover_state(
+    head: StorageV2RecoveredAuthorityHead,
+) -> Result<C75RecoveredState, C75StorageV2Error> {
+    let revoker = head.journal.backend.clone();
+    let result = c75_recover_state_inner(head);
+    if result.is_err() {
+        revoker.revoke_authority_boot_proof();
+    }
+    result
+}
+
+fn c75_recover_state_inner(
+    head: StorageV2RecoveredAuthorityHead,
+) -> Result<C75RecoveredState, C75StorageV2Error> {
+    let StorageV2RecoveredAuthorityHead { journal, snapshot } = head;
+    if journal.external_root_policy_sha256 != C74_STORAGE_V2_EXTERNAL_POLICY_SHA256 {
+        return Err(C75StorageV2Error::ExternalPolicyMismatch);
+    }
+    c74_validate_sealed_snapshot(journal.checkpoint, &snapshot).map_err(map_c74_to_c75_error)?;
+
+    match c75_exact_existing(&snapshot)? {
+        Some(expectation) => {
+            let presence = c74_root_presence(&snapshot).map_err(map_c74_to_c75_error)?;
+            c75_pending(journal, expectation, presence).map(C75RecoveredState::Existing)
+        }
+        None => {
+            c74_require_virgin_component_namespace(&snapshot).map_err(map_c74_to_c75_error)?;
+            Ok(C75RecoveredState::Vacant(C75VacantHead {
+                journal,
+                snapshot,
+            }))
+        }
+    }
+}
+
+async fn c75_install_vacant(
+    vacant: C75VacantHead,
+    artifact_bytes: &[u8],
+    evidence_bytes: Option<&[u8; C74_OPERATOR_EVIDENCE_LEN]>,
+) -> Result<C75PendingPhysicalReadback, C75StorageV2Error> {
+    let revoker = vacant.journal.backend.clone();
+    let result = c75_install_vacant_inner(vacant, artifact_bytes, evidence_bytes).await;
+    if result.is_err() {
+        revoker.revoke_authority_boot_proof();
+    }
+    result
+}
+
+async fn c75_install_vacant_inner(
+    vacant: C75VacantHead,
+    artifact_bytes: &[u8],
+    evidence_bytes: Option<&[u8; C74_OPERATOR_EVIDENCE_LEN]>,
+) -> Result<C75PendingPhysicalReadback, C75StorageV2Error> {
+    let C75VacantHead { journal, snapshot } = vacant;
+    if journal.external_root_policy_sha256 != C74_STORAGE_V2_EXTERNAL_POLICY_SHA256 {
+        return Err(C75StorageV2Error::ExternalPolicyMismatch);
+    }
+    c74_validate_sealed_snapshot(journal.checkpoint, &snapshot).map_err(map_c74_to_c75_error)?;
+    if c75_exact_existing(&snapshot)?.is_some() {
+        return Err(C75StorageV2Error::ExistingComponentHistory);
+    }
+    c74_require_virgin_component_namespace(&snapshot).map_err(map_c74_to_c75_error)?;
+
+    let records = c74_encode_initial_records(&snapshot, artifact_bytes, evidence_bytes)
+        .map_err(map_c74_to_c75_error)?;
+    let (journal, successor) = journal
+        .append(&records)
+        .await
+        .map_err(C75StorageV2Error::Append)?;
+    let expectation =
+        c75_exact_existing(&successor)?.ok_or(C75StorageV2Error::PostflightMismatch)?;
+    if !c75_expectation_matches_install(&expectation, artifact_bytes, evidence_bytes) {
+        return Err(C75StorageV2Error::PostflightMismatch);
+    }
+    let presence = c74_root_presence(&successor).map_err(map_c74_to_c75_error)?;
+    c75_pending(journal, expectation, presence)
+}
+
+fn c75_pending(
+    journal: StorageV2OnlyAuthorityJournal,
+    expectation: C74ExactPostflightExpectation,
+    presence: (bool, bool, bool),
+) -> Result<C75PendingPhysicalReadback, C75StorageV2Error> {
+    if !presence.2 {
+        return Err(C75StorageV2Error::PostflightMismatch);
+    }
+    Ok(C75PendingPhysicalReadback {
+        journal,
+        expectation,
+        persistent_root_present: presence.0,
+        program_root_present: presence.1,
+        component_root_present: presence.2,
+    })
+}
+
+fn c75_expectation_matches_install(
+    expectation: &C74ExactPostflightExpectation,
+    artifact_bytes: &[u8],
+    evidence_bytes: Option<&[u8; C74_OPERATOR_EVIDENCE_LEN]>,
+) -> bool {
+    if expectation.artifact.bytes.as_slice() != artifact_bytes {
+        return false;
+    }
+    match (&expectation.evidence, evidence_bytes) {
+        (C74ExpectedEvidence::Absent { .. }, None) => true,
+        (C74ExpectedEvidence::RetainedOnly(evidence), Some(expected)) => {
+            evidence.bytes.as_slice() == expected
+        }
+        _ => false,
+    }
+}
+
 async fn c74_install(
     head: StorageV2RecoveredAuthorityHead,
     artifact_bytes: &[u8],
@@ -1921,15 +2345,13 @@ fn c74_encode_initial_records(
     Ok(records)
 }
 
-fn c74_exact_existing(
+fn c75_exact_existing(
     snapshot: &AuthoritySnapshot,
-    artifact_bytes: &[u8],
-    evidence_bytes: Option<&[u8; C74_OPERATOR_EVIDENCE_LEN]>,
-) -> Result<Option<C74ExactPostflightExpectation>, C74StorageV2InstallError> {
+) -> Result<Option<C74ExactPostflightExpectation>, C75StorageV2Error> {
     let preflight = snapshot
         .preflight
         .as_ref()
-        .ok_or(C74StorageV2InstallError::Unformatted)?;
+        .ok_or(C75StorageV2Error::Unformatted)?;
     let has_component_history = preflight
         .slots()
         .iter()
@@ -1951,9 +2373,9 @@ fn c74_exact_existing(
         .filter(|slot| slot.space == c74_space_id());
     let slot = slots
         .next()
-        .ok_or(C74StorageV2InstallError::ExistingComponentHistory)?;
+        .ok_or(C75StorageV2Error::ExistingComponentHistory)?;
     if slots.next().is_some() || slot.slot != 0 || slot.max_generation != 0 {
-        return Err(C74StorageV2InstallError::ExistingComponentHistory);
+        return Err(C75StorageV2Error::ExistingComponentHistory);
     }
     let mut component_grants = preflight
         .committed_grants()
@@ -1961,7 +2383,7 @@ fn c74_exact_existing(
         .filter(|grant| grant.grant.target.space == c74_space_id());
     let root = component_grants
         .next()
-        .ok_or(C74StorageV2InstallError::ExistingComponentHistory)?;
+        .ok_or(C75StorageV2Error::ExistingComponentHistory)?;
     if component_grants.next().is_some()
         || slot.live_derivation != Some(root.grant.derivation_id)
         || root.grant.parent_id.is_some()
@@ -1971,32 +2393,32 @@ fn c74_exact_existing(
         || root.grant.rights != authority::DurableRights::READ
         || root.grant.resource_kind != c74_resource_kind()
     {
-        return Err(C74StorageV2InstallError::ExistingComponentHistory);
+        return Err(C75StorageV2Error::ExistingComponentHistory);
     }
 
     let root_transaction = root.transaction_id.get();
     let artifact_transaction = root_transaction
         .checked_sub(2)
         .and_then(authority::TransactionId::new)
-        .ok_or(C74StorageV2InstallError::ExistingComponentHistory)?;
+        .ok_or(C75StorageV2Error::ExistingComponentHistory)?;
     let artifact_object = root_transaction
         .checked_sub(1)
         .and_then(authority::ObjectId::new)
-        .ok_or(C74StorageV2InstallError::ExistingComponentHistory)?;
+        .ok_or(C75StorageV2Error::ExistingComponentHistory)?;
     let root_derivation = root_transaction
         .checked_add(1)
         .and_then(authority::DerivationId::new)
-        .ok_or(C74StorageV2InstallError::ExistingComponentHistory)?;
+        .ok_or(C75StorageV2Error::ExistingComponentHistory)?;
     let expected_high_water = root_transaction
         .checked_add(2)
         .map(|end| end.max(C74_COMPONENT_SPACE_ID_RAW + 1))
-        .ok_or(C74StorageV2InstallError::ExistingComponentHistory)?;
+        .ok_or(C75StorageV2Error::ExistingComponentHistory)?;
     if root.grant.object_id != artifact_object
         || root.grant.derivation_id != root_derivation
         || preflight.id_high_water() != expected_high_water
         || preflight.last_sequence() != root.commit_sequence
     {
-        return Err(C74StorageV2InstallError::ExistingComponentHistory);
+        return Err(C75StorageV2Error::ExistingComponentHistory);
     }
 
     let mut artifacts = preflight
@@ -2005,13 +2427,12 @@ fn c74_exact_existing(
         .filter(|object| object.object_kind == c74_artifact_kind());
     let artifact = artifacts
         .next()
-        .ok_or(C74StorageV2InstallError::ExistingComponentHistory)?;
+        .ok_or(C75StorageV2Error::ExistingComponentHistory)?;
     if artifacts.next().is_some()
         || artifact.object_id != artifact_object
         || artifact.transaction_id != artifact_transaction
         || artifact.is_external()
         || artifact.byte_len() != artifact.bytes.len() as u64
-        || artifact.bytes.as_slice() != artifact_bytes
         || artifact.prepare_sequence == 0
         || artifact.prepare_sequence >= artifact.commit_sequence
         || artifact
@@ -2023,55 +2444,46 @@ fn c74_exact_existing(
             .checked_add(1)
             .is_none_or(|sequence| sequence != root.commit_sequence)
     {
-        return Err(C74StorageV2InstallError::ExistingComponentHistory);
+        return Err(C75StorageV2Error::ExistingComponentHistory);
     }
     let mut artifact_history = preflight
         .committed_grants()
         .iter()
         .filter(|grant| grant.grant.object_id == artifact.object_id);
     if artifact_history.next() != Some(root) || artifact_history.next().is_some() {
-        return Err(C74StorageV2InstallError::ExistingComponentHistory);
+        return Err(C75StorageV2Error::ExistingComponentHistory);
     }
 
-    let expectation = match evidence_bytes {
-        None => {
-            if preflight
-                .committed_objects()
-                .iter()
-                .any(|object| object.object_kind == c74_evidence_kind())
-            {
-                return Err(C74StorageV2InstallError::ExistingComponentHistory);
-            }
-            C74ExactPostflightExpectation::development(
-                root.clone(),
-                artifact.clone(),
-                c74_evidence_kind(),
-                preflight.id_high_water(),
-                preflight.last_sequence(),
-            )
-        }
-        Some(evidence_bytes) => {
+    let mut evidence_by_kind = preflight
+        .committed_objects()
+        .iter()
+        .filter(|object| object.object_kind == c74_evidence_kind());
+    let first_evidence = evidence_by_kind.next();
+    if evidence_by_kind.next().is_some() {
+        return Err(C75StorageV2Error::ExistingComponentHistory);
+    }
+
+    let expectation = match first_evidence {
+        None => C74ExactPostflightExpectation::development(
+            root.clone(),
+            artifact.clone(),
+            c74_evidence_kind(),
+            preflight.id_high_water(),
+            preflight.last_sequence(),
+        ),
+        Some(evidence) => {
             let evidence_transaction = root_transaction
                 .checked_sub(4)
                 .and_then(authority::TransactionId::new)
-                .ok_or(C74StorageV2InstallError::ExistingComponentHistory)?;
+                .ok_or(C75StorageV2Error::ExistingComponentHistory)?;
             let evidence_object = root_transaction
                 .checked_sub(3)
                 .and_then(authority::ObjectId::new)
-                .ok_or(C74StorageV2InstallError::ExistingComponentHistory)?;
-            let mut evidence_by_kind = preflight
-                .committed_objects()
-                .iter()
-                .filter(|object| object.object_kind == c74_evidence_kind());
-            let evidence = evidence_by_kind
-                .next()
-                .ok_or(C74StorageV2InstallError::ExistingComponentHistory)?;
-            if evidence_by_kind.next().is_some()
-                || evidence.object_id != evidence_object
+                .ok_or(C75StorageV2Error::ExistingComponentHistory)?;
+            if evidence.object_id != evidence_object
                 || evidence.transaction_id != evidence_transaction
                 || evidence.is_external()
                 || evidence.byte_len() != C74_OPERATOR_EVIDENCE_LEN as u64
-                || evidence.bytes.as_slice() != evidence_bytes
                 || evidence.prepare_sequence == 0
                 || evidence
                     .prepare_sequence
@@ -2086,7 +2498,7 @@ fn c74_exact_existing(
                     .iter()
                     .any(|grant| grant.grant.object_id == evidence_object)
             {
-                return Err(C74StorageV2InstallError::ExistingComponentHistory);
+                return Err(C75StorageV2Error::ExistingComponentHistory);
             }
             C74ExactPostflightExpectation::operator(
                 root.clone(),
@@ -2097,7 +2509,27 @@ fn c74_exact_existing(
             )
         }
     }
-    .map_err(|_| C74StorageV2InstallError::ExistingComponentHistory)?;
+    .map_err(|_| C75StorageV2Error::ExistingComponentHistory)?;
+    Ok(Some(expectation))
+}
+
+fn c74_exact_existing(
+    snapshot: &AuthoritySnapshot,
+    artifact_bytes: &[u8],
+    evidence_bytes: Option<&[u8; C74_OPERATOR_EVIDENCE_LEN]>,
+) -> Result<Option<C74ExactPostflightExpectation>, C74StorageV2InstallError> {
+    let Some(expectation) = c75_exact_existing(snapshot).map_err(map_c75_to_c74_error)? else {
+        return Ok(None);
+    };
+    if expectation.artifact.bytes.as_slice() != artifact_bytes {
+        return Err(C74StorageV2InstallError::ExistingComponentHistory);
+    }
+    match (&expectation.evidence, evidence_bytes) {
+        (C74ExpectedEvidence::Absent { .. }, None) => {}
+        (C74ExpectedEvidence::RetainedOnly(evidence), Some(expected))
+            if evidence.bytes.as_slice() == expected => {}
+        _ => return Err(C74StorageV2InstallError::ExistingComponentHistory),
+    }
     Ok(Some(expectation))
 }
 
@@ -2206,6 +2638,35 @@ impl StorageV2OnlyAuthorityJournal {
         let recovery = finish_recovered_snapshot(snapshot, partitions)?;
         let receipt = validate_c74_exact_postflight(&recovery, &expectation)?;
         Ok((self, receipt))
+    }
+
+    /// C7.5 physical readback counterpart. Unlike the C7.4 receipt-only path,
+    /// this consumes the complete bound recovery and releases only the actual
+    /// artifact/evidence bytes recovered from media, tagged with their exact
+    /// durable trust mode. No journal provenance survives success.
+    async fn recover_c75_bound_payload(
+        self,
+        partitions: &[authority::RootPolicyPartition<'_>],
+        expectation: C74ExactPostflightExpectation,
+    ) -> Result<C75RecoveredPublicationPayload, StoreError> {
+        require_storage_v2_selection(self.backend.as_ref())?;
+        if self.external_root_policy_sha256 != C74_STORAGE_V2_EXTERNAL_POLICY_SHA256 {
+            return Err(StoreError::Corrupt);
+        }
+        let readback = self.backend.readback_authority().await?;
+        if readback.external_root_policy_sha256() != C74_STORAGE_V2_EXTERNAL_POLICY_SHA256 {
+            return Err(StoreError::Corrupt);
+        }
+        let snapshot = readback.into_facade()?;
+        if snapshot.checkpoint != self.checkpoint {
+            return Err(StoreError::JournalChanged);
+        }
+        let recovery = finish_recovered_snapshot(snapshot, partitions)?;
+        let receipt = validate_c74_exact_postflight(&recovery, &expectation)?;
+        drop(receipt);
+        let artifact_token = c75_artifact_token(&recovery, &expectation)?;
+        let artifact_bytes = self.backend.read_object(&artifact_token).await?;
+        recover_c75_payload(recovery, expectation, artifact_bytes)
     }
 }
 
@@ -3267,6 +3728,10 @@ mod tests {
             StorageV2BackendInfo::default()
         }
 
+        fn revoke_authority_boot_proof(&self) {
+            self.boot_proved.store(false, Ordering::Release);
+        }
+
         fn recover_authority(&self) -> StorageV2Future<'_, StorageV2AuthoritySnapshot> {
             self.recover_calls.fetch_add(1, Ordering::AcqRel);
             Box::pin(async move {
@@ -3349,6 +3814,10 @@ mod tests {
             self.inner.info()
         }
 
+        fn revoke_authority_boot_proof(&self) {
+            self.inner.revoke_authority_boot_proof();
+        }
+
         fn recover_authority(&self) -> StorageV2Future<'_, StorageV2AuthoritySnapshot> {
             self.inner.recover_authority()
         }
@@ -3370,6 +3839,175 @@ mod tests {
             object: &'a StorageV2ObjectToken,
         ) -> StorageV2Future<'a, Vec<u8>> {
             self.inner.read_object(object)
+        }
+    }
+
+    /// Stateful fixed-layout media used to exercise the complete C7.5 boot1
+    /// and boot2 typestate path. Unlike `TestStorageV2Backend`, append really
+    /// advances the logical stream and readback reconstructs a fresh facade.
+    struct C75TestStorageV2Backend {
+        boot_proved: AtomicBool,
+        fail_readback: AtomicBool,
+        bind_evidence: AtomicBool,
+        mismatch_artifact_token: AtomicBool,
+        records: SpinLock<Vec<[u8; journal::RECORD_SIZE]>>,
+        recover_calls: AtomicUsize,
+        readback_calls: AtomicUsize,
+        append_calls: AtomicUsize,
+        revoke_calls: AtomicUsize,
+    }
+
+    impl C75TestStorageV2Backend {
+        fn formatted() -> Self {
+            let (_snapshot, records) = c74_format_only_snapshot();
+            Self {
+                boot_proved: AtomicBool::new(true),
+                fail_readback: AtomicBool::new(false),
+                bind_evidence: AtomicBool::new(false),
+                mismatch_artifact_token: AtomicBool::new(false),
+                records: SpinLock::new(records),
+                recover_calls: AtomicUsize::new(0),
+                readback_calls: AtomicUsize::new(0),
+                append_calls: AtomicUsize::new(0),
+                revoke_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn complete_cold_recovery(&self) {
+            self.boot_proved.store(true, Ordering::Release);
+        }
+
+        fn fail_next_readback(&self) {
+            self.fail_readback.store(true, Ordering::Release);
+        }
+
+        fn bind_retained_evidence(&self) {
+            self.bind_evidence.store(true, Ordering::Release);
+        }
+
+        fn mismatch_artifact_token(&self) {
+            self.mismatch_artifact_token.store(true, Ordering::Release);
+        }
+
+        fn snapshot(&self) -> Result<StorageV2AuthoritySnapshot, StoreError> {
+            let records = self.records.lock().clone();
+            let preflight = authority::preflight_recovery(&records, store_id())
+                .map_err(|_| StoreError::Corrupt)?;
+            let mut objects = Vec::new();
+            for object in preflight.committed_objects() {
+                if object.object_kind == c74_artifact_kind()
+                    || (self.bind_evidence.load(Ordering::Acquire)
+                        && object.object_kind == c74_evidence_kind())
+                {
+                    let mut token_bytes = object.bytes.clone();
+                    if object.object_kind == c74_artifact_kind()
+                        && self.mismatch_artifact_token.load(Ordering::Acquire)
+                    {
+                        if let Some(first) = token_bytes.first_mut() {
+                            *first ^= 1;
+                        } else {
+                            token_bytes.push(1);
+                        }
+                    }
+                    objects.push(StorageV2RecoveredObject::new(
+                        object,
+                        StorageV2ObjectToken::new(token_bytes),
+                    ));
+                }
+            }
+            StorageV2AuthoritySnapshot::new(
+                records.len(),
+                preflight,
+                C74_STORAGE_V2_EXTERNAL_POLICY_SHA256,
+                objects,
+            )
+        }
+    }
+
+    impl StorageV2Backend for C75TestStorageV2Backend {
+        fn selection(&self) -> StorageBackendSelection {
+            StorageBackendSelection::StorageV2
+        }
+
+        fn info(&self) -> StorageV2BackendInfo {
+            StorageV2BackendInfo::default()
+        }
+
+        fn revoke_authority_boot_proof(&self) {
+            self.revoke_calls.fetch_add(1, Ordering::AcqRel);
+            self.boot_proved.store(false, Ordering::Release);
+        }
+
+        fn recover_authority(&self) -> StorageV2Future<'_, StorageV2AuthoritySnapshot> {
+            self.recover_calls.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move {
+                if !self.boot_proved.load(Ordering::Acquire) {
+                    return Err(StoreError::Corrupt);
+                }
+                self.snapshot()
+            })
+        }
+
+        fn readback_authority(&self) -> StorageV2Future<'_, StorageV2AuthoritySnapshot> {
+            self.readback_calls.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move {
+                if !self.boot_proved.load(Ordering::Acquire)
+                    || self.fail_readback.swap(false, Ordering::AcqRel)
+                {
+                    return Err(StoreError::Corrupt);
+                }
+                self.snapshot()
+            })
+        }
+
+        fn append_authority<'a>(
+            &'a self,
+            expected: ChainCheckpoint,
+            records: &'a [[u8; journal::RECORD_SIZE]],
+        ) -> StorageV2Future<'a, StorageV2AuthoritySnapshot> {
+            self.append_authority_bound_to_policy(
+                expected,
+                C74_STORAGE_V2_EXTERNAL_POLICY_SHA256,
+                records,
+            )
+        }
+
+        fn append_authority_bound_to_policy<'a>(
+            &'a self,
+            expected: ChainCheckpoint,
+            expected_external_root_policy_sha256: [u8; 32],
+            records: &'a [[u8; journal::RECORD_SIZE]],
+        ) -> StorageV2Future<'a, StorageV2AuthoritySnapshot> {
+            self.append_calls.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async move {
+                if !self.boot_proved.load(Ordering::Acquire)
+                    || expected_external_root_policy_sha256 != C74_STORAGE_V2_EXTERNAL_POLICY_SHA256
+                {
+                    return Err(StoreError::Corrupt);
+                }
+                {
+                    let mut media = self.records.lock();
+                    let preflight = authority::preflight_recovery(&media, store_id())
+                        .map_err(|_| StoreError::Corrupt)?;
+                    if preflight.chain_checkpoint().ok() != Some(expected) {
+                        return Err(StoreError::JournalChanged);
+                    }
+                    media.extend_from_slice(records);
+                }
+                self.snapshot()
+            })
+        }
+
+        fn read_object<'a>(
+            &'a self,
+            object: &'a StorageV2ObjectToken,
+        ) -> StorageV2Future<'a, Vec<u8>> {
+            Box::pin(async move {
+                object
+                    .downcast_ref::<Vec<u8>>()
+                    .cloned()
+                    .ok_or(StoreError::ObjectUnavailable)
+            })
         }
     }
 
@@ -3994,6 +4632,184 @@ mod tests {
             c74_exact_existing(&development, artifact, Some(&evidence)).err(),
             Some(C74StorageV2InstallError::ExistingComponentHistory)
         );
+    }
+
+    #[test]
+    fn c75_boot1_and_boot2_converge_on_physical_development_bytes_without_a_candidate() {
+        let backend = Arc::new(C75TestStorageV2Backend::formatted());
+        let (journal, platform) = test_authority_journal(Some(backend.clone()));
+        let artifact = b"canonical durable development artifact";
+
+        let head = poll_ready(journal.recover_storage_v2_only()).unwrap();
+        let vacant = match poll_ready(head.recover_c75_state()).unwrap() {
+            C75RecoveredState::Vacant(vacant) => vacant,
+            C75RecoveredState::Existing(_) => panic!("format-only media must be vacant"),
+        };
+        let pending = poll_ready(vacant.install_development(artifact)).unwrap();
+        assert_eq!(backend.append_calls.load(Ordering::Acquire), 1);
+        assert_eq!(backend.readback_calls.load(Ordering::Acquire), 0);
+        let payload = poll_ready(pending.recover_payload()).unwrap();
+        assert!(!payload.persistent_root_present());
+        assert!(!payload.program_root_present());
+        assert!(payload.component_root_present());
+        let C75RecoveredPublicationPayload::Development(payload) = payload else {
+            panic!("development media must retain its durable trust mode")
+        };
+        assert_eq!(payload.artifact_bytes(), artifact);
+
+        // A second boot supplies no image candidate. The probe derives the
+        // expectation and trust mode from the fixed durable layout, performs
+        // no append, then releases the same bytes only after a new readback.
+        let head = poll_ready(journal.recover_storage_v2_only()).unwrap();
+        let pending = match poll_ready(head.recover_c75_state()).unwrap() {
+            C75RecoveredState::Existing(pending) => pending,
+            C75RecoveredState::Vacant(_) => panic!("boot2 must recognize durable state"),
+        };
+        let payload = poll_ready(pending.recover_payload()).unwrap();
+        let C75RecoveredPublicationPayload::Development(payload) = payload else {
+            panic!("boot2 changed the durable trust mode")
+        };
+        assert_eq!(payload.artifact_bytes(), artifact);
+        assert_eq!(backend.append_calls.load(Ordering::Acquire), 1);
+        assert_eq!(backend.readback_calls.load(Ordering::Acquire), 2);
+        assert_eq!(backend.revoke_calls.load(Ordering::Acquire), 0);
+        assert_eq!(platform.calls(), 0);
+    }
+
+    #[test]
+    fn c75_operator_payload_preserves_exact_retained_only_evidence_mode() {
+        let backend = Arc::new(C75TestStorageV2Backend::formatted());
+        let (journal, platform) = test_authority_journal(Some(backend.clone()));
+        let artifact = b"canonical durable operator artifact";
+        let evidence = [0xa7; C74_OPERATOR_EVIDENCE_LEN];
+
+        let head = poll_ready(journal.recover_storage_v2_only()).unwrap();
+        let C75RecoveredState::Vacant(vacant) = poll_ready(head.recover_c75_state()).unwrap()
+        else {
+            panic!("format-only media must be vacant")
+        };
+        let pending = poll_ready(vacant.install_operator(artifact, &evidence)).unwrap();
+        let payload = poll_ready(pending.recover_payload()).unwrap();
+        let C75RecoveredPublicationPayload::Operator(payload) = payload else {
+            panic!("operator evidence cannot be erased into development mode")
+        };
+        assert_eq!(payload.artifact_bytes(), artifact);
+        assert_eq!(payload.evidence_bytes(), &evidence);
+
+        let head = poll_ready(journal.recover_storage_v2_only()).unwrap();
+        let C75RecoveredState::Existing(pending) = poll_ready(head.recover_c75_state()).unwrap()
+        else {
+            panic!("boot2 must discover the operator layout without caller bytes")
+        };
+        let C75RecoveredPublicationPayload::Operator(payload) =
+            poll_ready(pending.recover_payload()).unwrap()
+        else {
+            panic!("boot2 changed the operator trust mode")
+        };
+        assert_eq!(payload.artifact_bytes(), artifact);
+        assert_eq!(payload.evidence_bytes(), &evidence);
+        assert_eq!(backend.append_calls.load(Ordering::Acquire), 1);
+        assert_eq!(platform.calls(), 0);
+    }
+
+    #[test]
+    fn c75_postflight_rejects_token_bytes_that_differ_from_the_logical_artifact() {
+        let backend = Arc::new(C75TestStorageV2Backend::formatted());
+        let (journal, platform) = test_authority_journal(Some(backend.clone()));
+        let head = poll_ready(journal.recover_storage_v2_only()).unwrap();
+        let C75RecoveredState::Vacant(vacant) = poll_ready(head.recover_c75_state()).unwrap()
+        else {
+            panic!("format-only media must be vacant")
+        };
+        let pending = poll_ready(vacant.install_development(b"artifact")).unwrap();
+        backend.mismatch_artifact_token();
+
+        assert_eq!(
+            poll_ready(pending.recover_payload()).err(),
+            Some(StoreError::Corrupt)
+        );
+        assert!(backend.revoke_calls.load(Ordering::Acquire) >= 1);
+        assert_eq!(
+            poll_ready(journal.recover_storage_v2_only()).err(),
+            Some(StoreError::Corrupt)
+        );
+        assert_eq!(platform.calls(), 0);
+    }
+
+    #[test]
+    fn c75_postflight_rejects_any_evidence_binding_and_requires_cold_recovery() {
+        let backend = Arc::new(C75TestStorageV2Backend::formatted());
+        let (journal, platform) = test_authority_journal(Some(backend.clone()));
+        let evidence = [0x5d; C74_OPERATOR_EVIDENCE_LEN];
+        let head = poll_ready(journal.recover_storage_v2_only()).unwrap();
+        let C75RecoveredState::Vacant(vacant) = poll_ready(head.recover_c75_state()).unwrap()
+        else {
+            panic!("format-only media must be vacant")
+        };
+        let pending = poll_ready(vacant.install_operator(b"artifact", &evidence)).unwrap();
+        backend.bind_retained_evidence();
+
+        assert_eq!(
+            poll_ready(pending.recover_payload()).err(),
+            Some(StoreError::Corrupt)
+        );
+        assert_eq!(
+            poll_ready(journal.recover_storage_v2_only()).err(),
+            Some(StoreError::Corrupt)
+        );
+        backend.bind_evidence.store(false, Ordering::Release);
+        backend.complete_cold_recovery();
+        assert!(poll_ready(journal.recover_storage_v2_only()).is_ok());
+        assert_eq!(platform.calls(), 0);
+    }
+
+    #[test]
+    fn c75_readback_error_consumes_provenance_until_cold_recovery() {
+        let backend = Arc::new(C75TestStorageV2Backend::formatted());
+        let (journal, platform) = test_authority_journal(Some(backend.clone()));
+        let head = poll_ready(journal.recover_storage_v2_only()).unwrap();
+        let C75RecoveredState::Vacant(vacant) = poll_ready(head.recover_c75_state()).unwrap()
+        else {
+            panic!("format-only media must be vacant")
+        };
+        let pending = poll_ready(vacant.install_development(b"artifact")).unwrap();
+        backend.fail_next_readback();
+        assert_eq!(
+            poll_ready(pending.recover_payload()).err(),
+            Some(StoreError::Corrupt)
+        );
+        assert_eq!(
+            poll_ready(journal.recover_storage_v2_only()).err(),
+            Some(StoreError::Corrupt)
+        );
+        backend.complete_cold_recovery();
+        assert!(poll_ready(journal.recover_storage_v2_only()).is_ok());
+        assert_eq!(platform.calls(), 0);
+    }
+
+    #[test]
+    fn c75_invalid_boot_probe_revokes_reusable_boot_provenance() {
+        let backend = Arc::new(TestStorageV2Backend::new(
+            StorageBackendSelection::StorageV2,
+            true,
+        ));
+        backend.set_policy_sha256(C74_STORAGE_V2_EXTERNAL_POLICY_SHA256);
+        let (journal, platform) = test_authority_journal(Some(backend.clone()));
+        let head = poll_ready(journal.recover_storage_v2_only()).unwrap();
+
+        // The generic fixture reserves the Component artifact kind under an
+        // unrelated root, so the fixed namespace is neither vacant nor exact.
+        assert_eq!(
+            poll_ready(head.recover_c75_state()).err(),
+            Some(C75StorageV2Error::ExistingComponentHistory)
+        );
+        assert_eq!(
+            poll_ready(journal.recover_storage_v2_only()).err(),
+            Some(StoreError::Corrupt)
+        );
+        backend.complete_cold_recovery();
+        assert!(poll_ready(journal.recover_storage_v2_only()).is_ok());
+        assert_eq!(platform.calls(), 0);
     }
 
     #[test]

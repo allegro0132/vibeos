@@ -15,7 +15,11 @@ use core::{
     fmt,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
-use vibeos_component_format::{LimitKind, ProfileLimits, TrapCode, PROFILE_1_LIMITS};
+use vibeos_component_format::{
+    current_validation_engine_identity, LimitKind, ProfileIdentity, ProfileLimits, TrapCode,
+    ValidationEngineIdentity, WasmParserFeatureSelection, WasmiCompilationMode,
+    WasmiEnforcedLimits, WasmiFuelCosts, PROFILE_1_LIMITS,
+};
 use wasmi::{
     errors::HostError, CompilationMode, Config, EnforcedLimits, Engine, Error as WasmiError,
     ExternType, Func, FuncType, Instance, Linker, Memory, Module, ResumableCall,
@@ -133,8 +137,64 @@ fn check_table(ty: wasmparser::TableType, limits: &ProfileLimits) -> Result<(), 
     Ok(())
 }
 
-fn parser_features() -> WasmFeatures {
-    WasmFeatures::empty()
+fn parser_features(selection: WasmParserFeatureSelection) -> WasmFeatures {
+    match selection {
+        WasmParserFeatureSelection::Empty => WasmFeatures::empty(),
+        WasmParserFeatureSelection::All => WasmFeatures::all(),
+        WasmParserFeatureSelection::ComponentModel => {
+            let mut features = WasmFeatures::empty();
+            features.set(WasmFeatures::COMPONENT_MODEL, true);
+            features
+        }
+        WasmParserFeatureSelection::ComponentModelAsync => {
+            let mut features = WasmFeatures::empty();
+            features.set(WasmFeatures::COMPONENT_MODEL, true);
+            features.set(WasmFeatures::CM_ASYNC, true);
+            features
+        }
+    }
+}
+
+mod current_engine_private {
+    pub struct Seal;
+}
+
+/// Unforgeable proof that a profile was resolved against the validator and
+/// runtime identity compiled into this boot. The constructor accepts no
+/// caller-supplied engine descriptor and the proof is intentionally not
+/// cloneable.
+///
+/// ```compile_fail
+/// use vibeos_wasm_runtime::CurrentCoreValidationEngine;
+/// let _forged = CurrentCoreValidationEngine {};
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_wasm_runtime::CurrentCoreValidationEngine;
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<CurrentCoreValidationEngine>();
+/// ```
+pub struct CurrentCoreValidationEngine {
+    identity: &'static ValidationEngineIdentity,
+    _sealed: current_engine_private::Seal,
+}
+
+impl CurrentCoreValidationEngine {
+    pub const fn identity(&self) -> &'static ValidationEngineIdentity {
+        self.identity
+    }
+}
+
+/// Resolve one exact profile to the current Core validator/runtime. Adjacent
+/// profile fields fail closed instead of selecting a default engine.
+pub fn current_core_validation_engine(
+    profile: ProfileIdentity,
+) -> Option<CurrentCoreValidationEngine> {
+    let identity = current_validation_engine_identity(profile)?;
+    Some(CurrentCoreValidationEngine {
+        identity,
+        _sealed: current_engine_private::Seal,
+    })
 }
 
 fn read_u32_leb(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<u32, AdmissionError> {
@@ -221,6 +281,25 @@ pub fn inspect_core_with_limits(
     bytes: &[u8],
     limits: &ProfileLimits,
 ) -> Result<CoreSummary, AdmissionError> {
+    let engine = current_core_validation_engine(ProfileIdentity::PROFILE_1_SYNC)
+        .ok_or_else(AdmissionError::unsupported)?;
+    inspect_core_with_limits_and_current_engine(bytes, limits, &engine)
+}
+
+/// Validate Core bytes under an opaque current-engine proof. This is the
+/// admission entrypoint used when durable bytes are freshly revalidated.
+pub fn inspect_core_with_current_engine(
+    bytes: &[u8],
+    engine: &CurrentCoreValidationEngine,
+) -> Result<CoreSummary, AdmissionError> {
+    inspect_core_with_limits_and_current_engine(bytes, &PROFILE_1_LIMITS, engine)
+}
+
+fn inspect_core_with_limits_and_current_engine(
+    bytes: &[u8],
+    limits: &ProfileLimits,
+    engine: &CurrentCoreValidationEngine,
+) -> Result<CoreSummary, AdmissionError> {
     if bytes.len() > limits.max_core_module_bytes || bytes.len() > u32::MAX as usize {
         return Err(AdmissionError::limit(LimitKind::CoreModuleBytes));
     }
@@ -229,8 +308,9 @@ pub fn inspect_core_with_limits(
         ..CoreSummary::default()
     };
     let mut saw_core = false;
+    let validator = engine.identity.core_validator();
     let mut parser = Parser::new(0);
-    parser.set_features(WasmFeatures::all());
+    parser.set_features(parser_features(validator.structural_features()));
     for payload in parser.parse_all(bytes) {
         let payload =
             payload.map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?;
@@ -451,13 +531,14 @@ pub fn inspect_core_with_limits(
         return Err(AdmissionError::validation(AdmissionDetail::Malformed));
     }
 
-    if Validator::new_with_features(parser_features())
+    if Validator::new_with_features(parser_features(validator.strict_features()))
         .validate_all(bytes)
         .is_err()
     {
-        let broadly_valid = Validator::new_with_features(WasmFeatures::all())
-            .validate_all(bytes)
-            .is_ok();
+        let broadly_valid =
+            Validator::new_with_features(parser_features(validator.diagnostic_features()))
+                .validate_all(bytes)
+                .is_ok();
         return Err(if broadly_valid {
             AdmissionError::unsupported()
         } else {
@@ -467,29 +548,41 @@ pub fn inspect_core_with_limits(
     Ok(summary)
 }
 
-fn build_engine() -> Engine {
+fn build_engine(identity: &ValidationEngineIdentity) -> Engine {
+    let runtime = identity.runtime();
     let mut config = Config::default();
     config
-        .floats(false)
-        .wasm_mutable_global(false)
-        .wasm_sign_extension(false)
-        .wasm_saturating_float_to_int(false)
-        .wasm_multi_value(false)
-        .wasm_multi_memory(false)
-        .wasm_bulk_memory(false)
-        .wasm_reference_types(false)
-        .wasm_tail_call(false)
-        .wasm_extended_const(false)
-        .wasm_custom_page_sizes(false)
-        .wasm_memory64(false)
-        .wasm_wide_arithmetic(false)
-        .consume_fuel(true)
-        .compilation_mode(CompilationMode::Eager)
-        .set_max_recursion_depth(PROFILE_1_LIMITS.max_call_depth as usize)
-        .set_min_stack_height(4 * 1024)
-        .set_max_stack_height(128 * 1024)
-        .set_max_cached_stacks(0)
-        .enforced_limits(EnforcedLimits::strict());
+        .floats(runtime.floats())
+        .wasm_mutable_global(runtime.mutable_global())
+        .wasm_sign_extension(runtime.sign_extension())
+        .wasm_saturating_float_to_int(runtime.saturating_float_to_int())
+        .wasm_multi_value(runtime.multi_value())
+        .wasm_multi_memory(runtime.multi_memory())
+        .wasm_bulk_memory(runtime.bulk_memory())
+        .wasm_reference_types(runtime.reference_types())
+        .wasm_tail_call(runtime.tail_call())
+        .wasm_extended_const(runtime.extended_const())
+        .wasm_custom_page_sizes(runtime.custom_page_sizes())
+        .wasm_memory64(runtime.memory64())
+        .wasm_wide_arithmetic(runtime.wide_arithmetic())
+        .consume_fuel(runtime.consume_fuel())
+        .ignore_custom_sections(runtime.ignore_custom_sections())
+        .compilation_mode(match runtime.compilation_mode() {
+            WasmiCompilationMode::Eager => CompilationMode::Eager,
+        })
+        .set_max_recursion_depth(runtime.max_recursion_depth())
+        .set_min_stack_height(runtime.min_stack_height())
+        .set_max_stack_height(runtime.max_stack_height())
+        .set_max_cached_stacks(runtime.max_cached_stacks())
+        .enforced_limits(match runtime.enforced_limits() {
+            WasmiEnforcedLimits::Strict => EnforcedLimits::strict(),
+        });
+    // wasmi's SIMD setters are absent because the exact dependency feature set
+    // excludes `simd`. The identity records that build-time fact explicitly.
+    assert!(!runtime.simd_compiled() && !runtime.relaxed_simd_compiled());
+    match runtime.fuel_costs() {
+        WasmiFuelCosts::Wasmi110Default => {}
+    }
     Engine::new(&config)
 }
 
@@ -501,17 +594,27 @@ fn build_engine() -> Engine {
 #[derive(Clone, Debug)]
 pub struct ProfileEngine {
     inner: Engine,
+    identity: &'static ValidationEngineIdentity,
 }
 
 impl ProfileEngine {
     pub fn new() -> Self {
+        let identity = current_validation_engine_identity(ProfileIdentity::PROFILE_1_SYNC)
+            .expect("the compiled Profile 1 engine identity must exist");
         Self {
-            inner: build_engine(),
+            inner: build_engine(identity),
+            identity,
         }
     }
 
     pub fn as_wasmi(&self) -> &Engine {
         &self.inner
+    }
+
+    /// Exact validator/runtime identity from which this engine's Config was
+    /// constructed. The returned value has no public constructor or fields.
+    pub const fn validation_identity(&self) -> &'static ValidationEngineIdentity {
+        self.identity
     }
 }
 

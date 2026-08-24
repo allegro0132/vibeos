@@ -175,6 +175,17 @@ wasm-c74-crash-safe-publication-acceptance = [
     "dep:vibeos-component-runtime",
     "vibeos-image-policy/c73-authenticated-admission-qemu-acceptance",
 ]
+# QEMU-only C7.5 proof that both a first installation and an existing durable
+# publication pass through physical readback and fresh current-policy/engine
+# validation before the private inert singleton is populated. The existing
+# boot never consumes image artifact bytes and this feature enables no VSH,
+# component-owned runtime principal, resource table, Task, or guest executor.
+wasm-c75-boot-revalidation-acceptance = [
+    "component-durable-publication",
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-runtime",
+    "vibeos-image-policy/c73-authenticated-admission-qemu-acceptance",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

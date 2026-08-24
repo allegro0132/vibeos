@@ -72,14 +72,18 @@ use vibeos_component_host::{
 };
 use vibeos_component_runtime::{
     decode::{
-        inspect_component_for_profile, inspect_component_graph_for_profile, ComponentPlan,
-        ComponentSummary, DecodeError,
+        current_component_validation_engine, inspect_component_for_profile,
+        inspect_component_graph_with_current_engine, inspect_component_with_current_engine,
+        ComponentPlan, ComponentSummary, CurrentComponentValidationEngine, DecodeError,
     },
     graph::ComponentGraphResourceProvenance,
     world::{NamedEntityShape, WorldContract, WorldError},
 };
 use vibeos_core::cap::Rights;
-use vibeos_wasm_runtime::{inspect_core, AdmissionError as CoreAdmissionError, CoreSummary};
+use vibeos_wasm_runtime::{
+    current_core_validation_engine, inspect_core, inspect_core_with_current_engine,
+    AdmissionError as CoreAdmissionError, CoreSummary, CurrentCoreValidationEngine,
+};
 
 /// Exact Profile-1 command world that binds shell byte streams to the nominal
 /// `reader` and `writer` resources in `vibe:stream/streams@1.0.0`.
@@ -116,6 +120,31 @@ pub struct ComponentArtifact {
     bytes: Vec<u8>,
     identity: ComponentIdentity,
     profile: ProfileIdentity,
+}
+
+/// Crate-private join of the independently sealed Component/WIT and Core
+/// current-engine proofs. It is deliberately neither public nor cloneable, so
+/// no durable artifact, loader, or caller can manufacture or retain it as an
+/// authority-like identifier.
+pub(crate) struct CurrentValidationEngine {
+    component: CurrentComponentValidationEngine,
+    core: CurrentCoreValidationEngine,
+}
+
+impl CurrentValidationEngine {
+    fn for_profile(profile: ProfileIdentity) -> Result<Self, AdmissionError> {
+        let component =
+            current_component_validation_engine(profile).ok_or(AdmissionError::BadProfile)?;
+        let core = current_core_validation_engine(profile).ok_or(AdmissionError::BadProfile)?;
+        if component.identity() != core.identity() || component.identity().profile() != profile {
+            return Err(AdmissionError::BadProfile);
+        }
+        Ok(Self { component, core })
+    }
+
+    const fn component(&self) -> &CurrentComponentValidationEngine {
+        &self.component
+    }
 }
 
 impl ComponentArtifact {
@@ -156,9 +185,22 @@ impl ComponentArtifact {
         {
             return Err(AdmissionError::BadProfile);
         }
-        let plan = inspect_component_for_profile(&self.bytes, self.profile)
+        let engine = CurrentValidationEngine::for_profile(self.profile)?;
+        self.inspect_with_current_engine(&engine)
+    }
+
+    fn inspect_with_current_engine<'a>(
+        &'a self,
+        engine: &CurrentValidationEngine,
+    ) -> Result<InspectedComponent<'a>, AdmissionError> {
+        if engine.component.identity().profile() != self.profile
+            || engine.core.identity().profile() != self.profile
+        {
+            return Err(AdmissionError::BadProfile);
+        }
+        let plan = inspect_component_with_current_engine(&self.bytes, &engine.component)
             .map_err(AdmissionError::Decode)?;
-        self.finish_inspection(plan)
+        self.finish_inspection(plan, engine)
     }
 
     /// Reuses ordinary admission inspection while retaining the graph-only
@@ -173,22 +215,27 @@ impl ComponentArtifact {
         {
             return Err(AdmissionError::BadProfile);
         }
-        let graph = inspect_component_graph_for_profile(&self.bytes, self.profile)
+        let engine = CurrentValidationEngine::for_profile(self.profile)?;
+        let graph = inspect_component_graph_with_current_engine(&self.bytes, &engine.component)
             .map_err(AdmissionError::Decode)?;
         let (plan, resources) = graph.into_parts();
-        Ok((self.finish_inspection(plan)?, resources))
+        Ok((self.finish_inspection(plan, &engine)?, resources))
     }
 
     fn finish_inspection<'a>(
         &'a self,
         plan: ComponentPlan<'a>,
+        engine: &CurrentValidationEngine,
     ) -> Result<InspectedComponent<'a>, AdmissionError> {
         let mut modules = Vec::new();
         modules
             .try_reserve_exact(plan.embedded_modules().len())
             .map_err(|_| AdmissionError::Allocation)?;
         for bytes in plan.embedded_modules() {
-            modules.push(inspect_core(bytes).map_err(AdmissionError::Core)?);
+            modules.push(
+                inspect_core_with_current_engine(bytes, &engine.core)
+                    .map_err(AdmissionError::Core)?,
+            );
         }
         Ok(InspectedComponent {
             artifact: self,
@@ -1100,6 +1147,20 @@ pub(crate) fn admit_under_exact_rules(
     rules: &ExactAdmissionRules<'_>,
     caller: &CallerAuthority<'_>,
 ) -> Result<AdmittedComponent, AdmissionError> {
+    let engine = CurrentValidationEngine::for_profile(rules.profile)?;
+    admit_under_exact_rules_with_current_engine(artifact, rules, caller, &engine)
+}
+
+/// Same exact admission, with a current-boot engine proof already acquired by
+/// the authenticated fresh-validation path. Keeping the proof borrowed across
+/// inspection prevents a profile check and a later validator selection from
+/// drifting apart inside one admission attempt.
+pub(crate) fn admit_under_exact_rules_with_current_engine(
+    artifact: ComponentArtifact,
+    rules: &ExactAdmissionRules<'_>,
+    caller: &CallerAuthority<'_>,
+    engine: &CurrentValidationEngine,
+) -> Result<AdmittedComponent, AdmissionError> {
     if rules.profile != ProfileIdentity::PROFILE_1
         && rules.profile != ProfileIdentity::PROFILE_1_ASYNC
     {
@@ -1129,7 +1190,8 @@ pub(crate) fn admit_under_exact_rules(
     validate_policy_tables(rules.interfaces, caller.offers)?;
 
     let (component, modules, imports, exports, host_requirements, stream_transport) = {
-        let InspectedComponent { plan, modules, .. } = artifact.inspect()?;
+        let InspectedComponent { plan, modules, .. } =
+            artifact.inspect_with_current_engine(engine)?;
         plan.check_world(rules.exact_world)
             .map_err(AdmissionError::World)?;
         if !rules.profile.execution_enabled() || !plan.runtime_ready() {

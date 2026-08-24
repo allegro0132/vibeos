@@ -1,12 +1,11 @@
-//! Canonical C7.4 initial Component installation.
+//! C7.5 cold-boot Component revalidation and inert publication.
 //!
 //! The production surface never exposes stable IDs, record bytes, a journal
-//! checkpoint, or a recovered snapshot. An installer consumes one
-//! boot-selected Storage V2 journal handle, appends one private canonical
-//! batch (or recognizes its exact already-committed successor), and can
-//! release only an opaque root observation after an independent physical bound
-//! recovery under the private fixed complete C7.4 root-policy union. The
-//! observation can mint only an accessor-free, non-runner publication value.
+//! checkpoint, or a recovered snapshot. Every boot consumes one boot-proved
+//! Storage V2 head, discovers the fixed root without caller-supplied expected
+//! bytes, performs an independent physical readback, and only then validates
+//! the recovered artifact and evidence against current policy and the current
+//! validation engine. No pre-append admission value can cross that boundary.
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -17,8 +16,9 @@ use vibeos_component_format::{
     ComponentArtifactV1, COMPONENT_ARTIFACT_AUTHENTICATION_ENCODED_LEN,
 };
 use vibeos_object_store::{
-    C74CommittedStorageV2Install, C74StorageV2InstallError, StorageV2RecoveredAuthorityHead,
-    StoreError,
+    C75PendingPhysicalReadback, C75RecoveredDevelopmentPayload, C75RecoveredOperatorPayload,
+    C75RecoveredPublicationPayload, C75RecoveredState, C75StorageV2Error, C75VacantHead,
+    StorageV2RecoveredAuthorityHead, StoreError,
 };
 
 use crate::{
@@ -27,25 +27,30 @@ use crate::{
     DevelopmentComponentLoadPolicy, VolatileComponentCommand,
 };
 
-/// Move-only proof that development bytes passed the complete independent
-/// image-pin and semantic admission gate without constructing a command.
-#[must_use = "an admitted development install candidate must be installed or discarded"]
+/// Move-only preinstallation candidate. Validation prevents writing already
+/// invalid development bytes, but its admission result is destroyed before
+/// this value is returned and conveys no postflight publication authority.
+#[must_use = "a prevalidated development install candidate must be installed or discarded"]
 pub struct DevelopmentComponentInstallCandidate {
     artifact_bytes: Vec<u8>,
-    admitted: AdmittedComponent,
 }
 
-/// Move-only proof that operator bytes and exact detached evidence passed the
-/// complete authenticated semantic admission gate without constructing a
-/// command.
-#[must_use = "an admitted operator install candidate must be installed or discarded"]
+/// Move-only preinstallation candidate for canonical operator bytes/evidence.
+/// It contains no `AdmittedComponent`, command, or reusable validator receipt.
+///
+/// ```compile_fail
+/// use vibeos_component_loader::OperatorComponentInstallCandidate;
+/// fn preappend_proof_cannot_publish(candidate: OperatorComponentInstallCandidate) {
+///     let _ = candidate.seal_inert_publication();
+/// }
+/// ```
+#[must_use = "a prevalidated operator install candidate must be installed or discarded"]
 pub struct OperatorComponentInstallCandidate {
     artifact_bytes: Vec<u8>,
     evidence_bytes: [u8; COMPONENT_ARTIFACT_AUTHENTICATION_ENCODED_LEN],
-    admitted: AdmittedComponent,
 }
 
-/// Perform the development gate and retain only its sealed, non-command result.
+/// Perform the development persistence-hygiene gate and retain only bytes.
 pub fn admit_development_component_install(
     bytes: &[u8],
     policy: &DevelopmentComponentLoadPolicy<'_>,
@@ -58,16 +63,19 @@ pub fn admit_development_component_install(
     if canonical.as_slice() != bytes {
         return Err(ComponentLoadError::ImagePinMismatch);
     }
-    let admitted = admit_development_component_bytes(bytes, policy)?;
+    // This check prevents persisting bytes which are already invalid, but the
+    // admitted value is deliberately destroyed here. It can never authorize
+    // post-append publication; C7.5 repeats the complete gate over physical
+    // readback bytes on every boot.
+    drop(admit_development_component_bytes(bytes, policy)?);
     Ok(DevelopmentComponentInstallCandidate {
         artifact_bytes: canonical,
-        admitted,
     })
 }
 
 /// Perform the deployable gate and retain the canonical 112-byte evidence
-/// beside its sealed, non-command admission result. Failure cannot fall back to
-/// development trust.
+/// beside canonical artifact bytes. The admission result is discarded and
+/// failure cannot fall back to development trust.
 pub fn admit_operator_component_install(
     bytes: &[u8],
     evidence_bytes: &[u8],
@@ -86,47 +94,48 @@ pub fn admit_operator_component_install(
         ));
     }
     let evidence_bytes = evidence.encode();
-    let admitted = authenticate_and_admit_component_bytes(bytes, &evidence_bytes, policy)?;
+    // As above, this is a persistence hygiene check only. The operator
+    // admission proof must not survive the durable boundary.
+    drop(authenticate_and_admit_component_bytes(
+        bytes,
+        &evidence_bytes,
+        policy,
+    )?);
     Ok(OperatorComponentInstallCandidate {
         artifact_bytes: canonical,
         evidence_bytes,
-        admitted,
     })
 }
 
-/// Linear initial-install session. It contains one indivisible object-store
-/// recovered head and exposes neither its journal nor its snapshot.
-#[must_use = "a Component install session must be consumed"]
-pub struct ComponentInstallSession {
-    head: StorageV2RecoveredAuthorityHead,
-}
-
-/// Consume the sealed head returned by
-/// `AuthorityJournal::recover_storage_v2_only` only after comparing its
-/// external-policy commitment to the fixed C7.4 policy. No snapshot or
-/// checkpoint crosses this API.
+/// Start one C7.5 cold-boot probe. The object store privately enforces the
+/// fixed Storage V2 policy and root-relative layout; this crate receives only
+/// an opaque vacant head or an existing value which still requires physical
+/// readback.
 ///
 /// ```compile_fail
-/// use vibeos_component_loader::begin_component_install;
+/// use vibeos_component_loader::begin_c75_component_boot;
 /// use vibeos_object_store::AuthoritySnapshot;
 /// fn cannot_begin_from_snapshot(snapshot: AuthoritySnapshot) {
-///     let _ = begin_component_install(snapshot);
+///     let _ = begin_c75_component_boot(snapshot);
 /// }
 /// ```
-pub fn begin_component_install(
+pub async fn begin_c75_component_boot(
     head: StorageV2RecoveredAuthorityHead,
-) -> Result<ComponentInstallSession, ComponentInstallProtocolError> {
-    validate_storage_v2_policy_commitment(head.external_root_policy_sha256())?;
-    Ok(ComponentInstallSession { head })
-}
-
-fn validate_storage_v2_policy_commitment(
-    actual: [u8; 32],
-) -> Result<(), ComponentInstallProtocolError> {
-    if actual != c74_storage_v2_policy_commitment_sha256() {
-        return Err(ComponentInstallProtocolError::ExternalPolicyMismatch);
+) -> Result<C75ComponentBootState, ComponentInstallProtocolError> {
+    match head
+        .recover_c75_state()
+        .await
+        .map_err(map_c75_storage_v2_error)?
+    {
+        C75RecoveredState::Vacant(head) => {
+            Ok(C75ComponentBootState::Vacant(C75VacantComponentInstall {
+                head,
+            }))
+        }
+        C75RecoveredState::Existing(pending) => Ok(C75ComponentBootState::Existing(
+            C75PendingComponentReadback { pending },
+        )),
     }
-    Ok(())
 }
 
 /// Canonical C7.4 Storage V2 external-root policy image. Kernel policy and the
@@ -154,36 +163,88 @@ pub const fn c74_storage_v2_policy_commitment_sha256() -> [u8; 32] {
     C74_STORAGE_V2_EXTERNAL_POLICY_SHA256
 }
 
-/// Opaque acknowledged development successor. No root authority or command
-/// exists until consuming physical bound recovery succeeds.
-#[must_use = "a committed development install must be physically recovered"]
-pub struct CommittedDevelopmentComponentInstall {
-    storage: C74CommittedStorageV2Install,
-    admitted: AdmittedComponent,
+/// The only outcomes of the fixed-root cold-boot probe. Existing media never
+/// needs (or accepts) artifact/evidence bytes from the caller.
+#[must_use = "the C7.5 boot state must be physically recovered or initialized"]
+pub enum C75ComponentBootState {
+    Vacant(C75VacantComponentInstall),
+    Existing(C75PendingComponentReadback),
 }
 
-/// Opaque acknowledged operator successor. Evidence remains inert and the
-/// pre-append admission receipt remains sealed until physical postflight.
+/// The sole state from which an initial Component bundle can be appended.
+/// There is no command, admission receipt, root ID, or generic journal handle.
+#[must_use = "a vacant C7.5 head must be initialized or discarded"]
+pub struct C75VacantComponentInstall {
+    head: C75VacantHead,
+}
+
+/// An append acknowledgement or exact-existing discovery which still cannot
+/// be validated or published until independent physical readback succeeds.
 ///
 /// ```compile_fail
-/// use vibeos_component_loader::CommittedOperatorComponentInstall;
-/// fn no_raw_plan(committed: &CommittedOperatorComponentInstall) {
-///     let _ = committed.records();
-///     let _ = committed.expected_checkpoint();
-///     let _ = committed.snapshot();
+/// use vibeos_component_loader::C75PendingComponentReadback;
+/// fn pending_has_no_bytes_or_publication(pending: C75PendingComponentReadback) {
+///     let _ = pending.artifact_bytes();
+///     let _ = pending.seal_inert_publication();
 /// }
 /// ```
+#[must_use = "a C7.5 durable successor must be physically read back"]
+pub struct C75PendingComponentReadback {
+    pending: C75PendingPhysicalReadback,
+}
+
+/// Durable trust mode selected by the exact physical layout. In particular,
+/// operator evidence cannot be discarded in order to enter development trust.
+#[must_use = "physical Component bytes must pass the matching boot validator"]
+pub enum C75RecoveredComponentInstall {
+    Development(C75RecoveredDevelopmentComponentInstall),
+    Operator(C75RecoveredOperatorComponentInstall),
+}
+
+/// Untrusted development artifact bytes obtained only after exact physical
+/// root recovery. This type has no byte, ID, capability, or command accessor.
+#[must_use = "recovered development bytes must be freshly validated"]
+pub struct C75RecoveredDevelopmentComponentInstall {
+    payload: C75RecoveredDevelopmentPayload,
+    roots: ComponentInstallRootPresence,
+}
+
+/// Untrusted operator artifact/evidence bytes obtained only after exact
+/// physical root recovery. Evidence remains inert data and cannot be granted.
 ///
 /// ```compile_fail
-/// use vibeos_component_loader::CommittedOperatorComponentInstall;
-/// fn no_command_before_physical_postflight(committed: CommittedOperatorComponentInstall) {
-///     let _ = committed.command();
+/// use vibeos_component_loader::C75RecoveredOperatorComponentInstall;
+/// fn unvalidated_bytes_cannot_publish(recovered: C75RecoveredOperatorComponentInstall) {
+///     let _ = recovered.seal_inert_publication();
+///     let _ = recovered.object_id();
 /// }
 /// ```
-#[must_use = "a committed operator install must be physically recovered"]
-pub struct CommittedOperatorComponentInstall {
-    storage: C74CommittedStorageV2Install,
+#[must_use = "recovered operator bytes must be freshly authenticated and validated"]
+pub struct C75RecoveredOperatorComponentInstall {
+    payload: C75RecoveredOperatorPayload,
+    roots: ComponentInstallRootPresence,
+}
+
+/// Move-only boot-local proof that physical development bytes passed every
+/// current validation gate. Only this state can seal an inert publication.
+#[must_use = "a fresh development admission must be sealed or discarded"]
+pub struct C75FreshDevelopmentAdmission {
     admitted: AdmittedComponent,
+    roots: ComponentInstallRootPresence,
+}
+
+/// Move-only boot-local proof that physical operator bytes passed current
+/// signature policy and every current semantic/engine gate.
+///
+/// ```compile_fail
+/// use vibeos_component_loader::C75FreshOperatorAdmission;
+/// fn requires_clone<T: Clone>() {}
+/// fn fresh_proof_is_linear() { requires_clone::<C75FreshOperatorAdmission>(); }
+/// ```
+#[must_use = "a fresh operator admission must be sealed or discarded"]
+pub struct C75FreshOperatorAdmission {
+    admitted: AdmittedComponent,
+    roots: ComponentInstallRootPresence,
 }
 
 /// Snapshot-derived presence of the three fixed global root partitions used
@@ -209,62 +270,7 @@ impl ComponentInstallRootPresence {
     }
 }
 
-/// Opaque proof that the exact development root was observed by physical
-/// postflight.
-///
-/// The root capability witness has already been consumed and is not retained
-/// here. This type exposes neither the root nor a command; its sole consuming
-/// transition produces an opaque C7.4 publication value which implements no
-/// runner or CSpace-install interface.
-///
-/// ```compile_fail
-/// use vibeos_component_loader::RecoveredDevelopmentComponentInstall;
-/// fn cannot_extract_root_or_command(observed: RecoveredDevelopmentComponentInstall) {
-///     let _ = observed.into_parts();
-/// }
-/// ```
-#[must_use = "a recovered development root observation must be sealed or discarded"]
-pub struct RecoveredDevelopmentComponentInstall {
-    admitted: AdmittedComponent,
-}
-
-impl RecoveredDevelopmentComponentInstall {
-    /// Consume the root observation and construct one opaque inert publication.
-    /// The returned value deliberately implements neither
-    /// [`vibeos_vsh::ComponentCommandRunner`] nor a command getter.
-    pub fn seal_inert_publication(
-        self,
-    ) -> Result<C74SealedVolatileComponentPublication, ComponentInstallProtocolError> {
-        C74SealedVolatileComponentPublication::from_admitted(self.admitted)
-    }
-}
-
-/// Opaque proof that the exact operator root and its inert evidence attachment
-/// were observed by physical postflight. Neither root/evidence authority nor a
-/// command can be extracted from this value.
-///
-/// ```compile_fail
-/// use vibeos_component_loader::RecoveredOperatorComponentInstall;
-/// fn cannot_install_or_extract(observed: RecoveredOperatorComponentInstall) {
-///     let (bundle, command) = observed.into_parts();
-///     let _ = (bundle, command);
-/// }
-/// ```
-#[must_use = "a recovered operator root observation must be sealed or discarded"]
-pub struct RecoveredOperatorComponentInstall {
-    admitted: AdmittedComponent,
-}
-
-impl RecoveredOperatorComponentInstall {
-    /// Consume the root observation and construct one opaque inert publication.
-    pub fn seal_inert_publication(
-        self,
-    ) -> Result<C74SealedVolatileComponentPublication, ComponentInstallProtocolError> {
-        C74SealedVolatileComponentPublication::from_admitted(self.admitted)
-    }
-}
-
-/// One boot-local command sealed for the C7.4 supervisor ledger.
+/// One boot-local command sealed for the C7.5 supervisor ledger.
 ///
 /// This wrapper is intentionally move-only and has no public accessor. In
 /// particular it is not a VSH runner and cannot be installed into a CSpace.
@@ -272,40 +278,40 @@ impl RecoveredOperatorComponentInstall {
 /// command construction happened before this type was minted.
 ///
 /// ```compile_fail
-/// use vibeos_component_loader::C74SealedVolatileComponentPublication;
+/// use vibeos_component_loader::C75SealedVolatileComponentPublication;
 /// use vibeos_vsh::ComponentCommandRunner;
 /// fn require_runner<T: ComponentCommandRunner>() {}
 /// fn cannot_run_or_publish() {
-///     require_runner::<C74SealedVolatileComponentPublication>();
+///     require_runner::<C75SealedVolatileComponentPublication>();
 /// }
 /// ```
 ///
 /// ```compile_fail
-/// use vibeos_component_loader::C74SealedVolatileComponentPublication;
+/// use vibeos_component_loader::C75SealedVolatileComponentPublication;
 /// use vibeos_core::cap::Resource;
 /// fn require_resource<T: Resource>() {}
 /// fn cannot_be_installed_as_a_cspace_resource() {
-///     require_resource::<C74SealedVolatileComponentPublication>();
+///     require_resource::<C75SealedVolatileComponentPublication>();
 /// }
 /// ```
 ///
 /// ```compile_fail
-/// use vibeos_component_loader::C74SealedVolatileComponentPublication;
+/// use vibeos_component_loader::C75SealedVolatileComponentPublication;
 /// fn no_generic_install_surface() {
-///     let _ = C74SealedVolatileComponentPublication::install;
+///     let _ = C75SealedVolatileComponentPublication::install;
 /// }
 /// ```
-#[must_use = "a sealed C7.4 publication must be moved into the supervisor ledger or discarded"]
-pub struct C74SealedVolatileComponentPublication {
+#[must_use = "a sealed C7.5 publication must be moved into the supervisor ledger or discarded"]
+pub struct C75SealedVolatileComponentPublication {
     _command: VolatileComponentCommand,
 }
 
-impl C74SealedVolatileComponentPublication {
+impl C75SealedVolatileComponentPublication {
     fn from_admitted(admitted: AdmittedComponent) -> Result<Self, ComponentInstallProtocolError> {
         let command =
             project_admitted_component(admitted).map_err(ComponentInstallProtocolError::Command)?;
         // These are structural properties of VolatileComponentCommand today,
-        // but retain the explicit C7.4 minting gate so a later runtime change
+        // but retain the explicit C7.5 minting gate so a later runtime change
         // cannot silently make an already-sealed publication executable.
         if command.runtime_ready()
             || command.guest_calls() != 0
@@ -319,6 +325,11 @@ impl C74SealedVolatileComponentPublication {
         Ok(Self { _command: command })
     }
 }
+
+/// Compatibility name for the older C7.4 supervisor storage slot. The alias
+/// does not restore any pre-C7.5 constructor: only a fresh postflight proof can
+/// create the underlying value.
+pub type C74SealedVolatileComponentPublication = C75SealedVolatileComponentPublication;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComponentInstallProtocolError {
@@ -350,124 +361,180 @@ impl fmt::Display for ComponentInstallProtocolError {
             Self::PostflightMismatch => {
                 "component install physical successor differs from its sealed candidate"
             }
-            Self::Command(_) => "component command construction failed after durable postflight",
+            Self::Command(_) => {
+                "component fresh validation or inert projection failed after durable postflight"
+            }
         })
     }
 }
 
-impl ComponentInstallSession {
-    /// Append the private four-ID development batch, or recognize the exact
-    /// same already-committed successor without appending any record.
+impl C75VacantComponentInstall {
+    /// Append the private four-ID development batch. Existing media can never
+    /// reach this state and therefore cannot be compared to caller bytes.
     pub async fn install_development(
         self,
         candidate: DevelopmentComponentInstallCandidate,
-    ) -> Result<CommittedDevelopmentComponentInstall, ComponentInstallProtocolError> {
+    ) -> Result<C75PendingComponentReadback, ComponentInstallProtocolError> {
         let Self { head } = self;
-        let DevelopmentComponentInstallCandidate {
-            artifact_bytes,
-            admitted,
-        } = candidate;
-        let storage = head
-            .install_c74_development(&artifact_bytes)
+        let DevelopmentComponentInstallCandidate { artifact_bytes } = candidate;
+        let pending = head
+            .install_development(&artifact_bytes)
             .await
-            .map_err(map_storage_v2_install_error)?;
-        Ok(CommittedDevelopmentComponentInstall { storage, admitted })
+            .map_err(map_c75_storage_v2_error)?;
+        Ok(C75PendingComponentReadback { pending })
     }
 
-    /// Append the sole private six-ID evidence/artifact/root batch, or
-    /// recognize its exact already-committed successor without appending.
+    /// Append the sole private six-ID evidence/artifact/root batch. The
+    /// preinstall admission value was already destroyed by candidate creation.
     pub async fn install_operator(
         self,
         candidate: OperatorComponentInstallCandidate,
-    ) -> Result<CommittedOperatorComponentInstall, ComponentInstallProtocolError> {
+    ) -> Result<C75PendingComponentReadback, ComponentInstallProtocolError> {
         let Self { head } = self;
         let OperatorComponentInstallCandidate {
             artifact_bytes,
             evidence_bytes,
-            admitted,
         } = candidate;
-        let storage = head
-            .install_c74_operator(&artifact_bytes, &evidence_bytes)
+        let pending = head
+            .install_operator(&artifact_bytes, &evidence_bytes)
             .await
-            .map_err(map_storage_v2_install_error)?;
-        Ok(CommittedOperatorComponentInstall { storage, admitted })
+            .map_err(map_c75_storage_v2_error)?;
+        Ok(C75PendingComponentReadback { pending })
     }
 }
 
-fn map_storage_v2_install_error(error: C74StorageV2InstallError) -> ComponentInstallProtocolError {
+fn map_c75_storage_v2_error(error: C75StorageV2Error) -> ComponentInstallProtocolError {
     match error {
-        C74StorageV2InstallError::Unformatted => ComponentInstallProtocolError::Unformatted,
-        C74StorageV2InstallError::ExternalPolicyMismatch => {
+        C75StorageV2Error::Unformatted => ComponentInstallProtocolError::Unformatted,
+        C75StorageV2Error::ExternalPolicyMismatch => {
             ComponentInstallProtocolError::ExternalPolicyMismatch
         }
-        C74StorageV2InstallError::ExistingComponentHistory => {
+        C75StorageV2Error::ExistingComponentHistory => {
             ComponentInstallProtocolError::ExistingComponentHistory
         }
-        C74StorageV2InstallError::IdExhausted => ComponentInstallProtocolError::IdExhausted,
-        C74StorageV2InstallError::Encode => ComponentInstallProtocolError::Encode,
-        C74StorageV2InstallError::Append(error) => ComponentInstallProtocolError::Append(error),
-        C74StorageV2InstallError::PostflightMismatch => {
-            ComponentInstallProtocolError::PostflightMismatch
-        }
+        C75StorageV2Error::IdExhausted => ComponentInstallProtocolError::IdExhausted,
+        C75StorageV2Error::Encode => ComponentInstallProtocolError::Encode,
+        C75StorageV2Error::Append(error) => ComponentInstallProtocolError::Append(error),
+        C75StorageV2Error::PostflightMismatch => ComponentInstallProtocolError::PostflightMismatch,
     }
 }
 
-impl CommittedDevelopmentComponentInstall {
-    pub fn root_presence(&self) -> ComponentInstallRootPresence {
-        ComponentInstallRootPresence {
-            persistent: self.storage.persistent_root_present(),
-            program: self.storage.program_root_present(),
-            component: self.storage.component_root_present(),
-        }
-    }
-
-    /// Physical readback under the private fixed complete C7.4 root-policy
-    /// union must succeed before an opaque root observation is released. Root
-    /// authority and commands do not escape this transition.
-    pub async fn recover_bound(
+impl C75PendingComponentReadback {
+    /// Perform independent physical readback and consume this linear pending
+    /// value. A storage/postflight error also revokes the backend boot proof,
+    /// so only cold recovery may retry that failed path.
+    pub async fn recover_payload(
         self,
-    ) -> Result<RecoveredDevelopmentComponentInstall, ComponentInstallProtocolError> {
-        let Self { storage, admitted } = self;
-        storage
-            .recover_bound()
+    ) -> Result<C75RecoveredComponentInstall, ComponentInstallProtocolError> {
+        let payload = self
+            .pending
+            .recover_payload()
             .await
             .map_err(ComponentInstallProtocolError::Recovery)?;
-        Ok(RecoveredDevelopmentComponentInstall { admitted })
+        let roots = ComponentInstallRootPresence {
+            persistent: payload.persistent_root_present(),
+            program: payload.program_root_present(),
+            component: payload.component_root_present(),
+        };
+        // Persistent/program partitions are optional and their exact
+        // presence/absence was already bound by the private complete union.
+        // The Component root itself is the sole mandatory publication root.
+        if !roots.component {
+            return Err(ComponentInstallProtocolError::PostflightMismatch);
+        }
+        Ok(match payload {
+            C75RecoveredPublicationPayload::Development(payload) => {
+                C75RecoveredComponentInstall::Development(C75RecoveredDevelopmentComponentInstall {
+                    payload,
+                    roots,
+                })
+            }
+            C75RecoveredPublicationPayload::Operator(payload) => {
+                C75RecoveredComponentInstall::Operator(C75RecoveredOperatorComponentInstall {
+                    payload,
+                    roots,
+                })
+            }
+        })
     }
 }
 
-impl CommittedOperatorComponentInstall {
-    pub fn root_presence(&self) -> ComponentInstallRootPresence {
-        ComponentInstallRootPresence {
-            persistent: self.storage.persistent_root_present(),
-            program: self.storage.program_root_present(),
-            component: self.storage.component_root_present(),
+impl C75RecoveredDevelopmentComponentInstall {
+    /// Consume the real physical artifact bytes and repeat canonical decoding,
+    /// Component/Core inspection, WIT/manifest/adapter/limit checks, current
+    /// engine validation, and image-pin admission. No command or resource is
+    /// allocated before this returns successfully.
+    pub fn revalidate_on_boot(
+        self,
+        policy: &DevelopmentComponentLoadPolicy<'_>,
+    ) -> Result<C75FreshDevelopmentAdmission, ComponentInstallProtocolError> {
+        let admitted = admit_development_component_bytes(self.payload.artifact_bytes(), policy)
+            .map_err(ComponentInstallProtocolError::Command)?;
+        Ok(C75FreshDevelopmentAdmission {
+            admitted,
+            roots: self.roots,
+        })
+    }
+}
+
+impl C75RecoveredOperatorComponentInstall {
+    /// Consume the real physical artifact and retained-only evidence. The
+    /// supplied policy is re-read before and after validation, binding the
+    /// fresh proof to one current immutable generation and commitment.
+    pub fn revalidate_on_boot(
+        self,
+        policy: &DeployableComponentLoadPolicy<'_>,
+    ) -> Result<C75FreshOperatorAdmission, ComponentInstallProtocolError> {
+        let generation = policy.operator_policy().generation();
+        let commitment = policy
+            .operator_policy()
+            .commitment()
+            .map_err(ComponentLoadError::Authentication)
+            .map_err(ComponentInstallProtocolError::Command)?;
+        let admitted = authenticate_and_admit_component_bytes(
+            self.payload.artifact_bytes(),
+            self.payload.evidence_bytes(),
+            policy,
+        )
+        .map_err(ComponentInstallProtocolError::Command)?;
+        let current_commitment = policy
+            .operator_policy()
+            .commitment()
+            .map_err(ComponentLoadError::Authentication)
+            .map_err(ComponentInstallProtocolError::Command)?;
+        if policy.operator_policy().generation() != generation || current_commitment != commitment {
+            return Err(ComponentInstallProtocolError::Command(
+                ComponentLoadError::RevalidationMismatch,
+            ));
         }
+        Ok(C75FreshOperatorAdmission {
+            admitted,
+            roots: self.roots,
+        })
+    }
+}
+
+impl C75FreshDevelopmentAdmission {
+    pub const fn root_presence(&self) -> ComponentInstallRootPresence {
+        self.roots
     }
 
-    /// Physical readback under the private fixed complete C7.4 root-policy
-    /// union must succeed before an opaque root observation is released.
-    /// Root/evidence authority and commands do not escape this transition.
-    ///
-    /// ```compile_fail
-    /// use vibeos_component_loader::CommittedOperatorComponentInstall;
-    /// use vibeos_durable_format::RootPolicyPartition;
-    /// fn cannot_supply_raw_policy(
-    ///     committed: CommittedOperatorComponentInstall,
-    ///     partitions: &[RootPolicyPartition<'_>],
-    /// ) {
-    ///     let _ = committed.recover_bound(partitions);
-    /// }
-    /// ```
-    pub async fn recover_bound(
+    pub fn seal_inert_publication(
         self,
-    ) -> Result<RecoveredOperatorComponentInstall, ComponentInstallProtocolError> {
-        let Self { storage, admitted } = self;
-        storage
-            .recover_bound()
-            .await
-            .map_err(ComponentInstallProtocolError::Recovery)?;
-        Ok(RecoveredOperatorComponentInstall { admitted })
+    ) -> Result<C75SealedVolatileComponentPublication, ComponentInstallProtocolError> {
+        C75SealedVolatileComponentPublication::from_admitted(self.admitted)
+    }
+}
+
+impl C75FreshOperatorAdmission {
+    pub const fn root_presence(&self) -> ComponentInstallRootPresence {
+        self.roots
+    }
+
+    pub fn seal_inert_publication(
+        self,
+    ) -> Result<C75SealedVolatileComponentPublication, ComponentInstallProtocolError> {
+        C75SealedVolatileComponentPublication::from_admitted(self.admitted)
     }
 }
 
@@ -498,15 +565,15 @@ mod tests {
     #[test]
     fn object_store_install_errors_remain_redacted() {
         assert_eq!(
-            map_storage_v2_install_error(C74StorageV2InstallError::ExternalPolicyMismatch),
+            map_c75_storage_v2_error(C75StorageV2Error::ExternalPolicyMismatch),
             ComponentInstallProtocolError::ExternalPolicyMismatch
         );
         assert_eq!(
-            map_storage_v2_install_error(C74StorageV2InstallError::ExistingComponentHistory),
+            map_c75_storage_v2_error(C75StorageV2Error::ExistingComponentHistory),
             ComponentInstallProtocolError::ExistingComponentHistory
         );
         assert_eq!(
-            map_storage_v2_install_error(C74StorageV2InstallError::Append(StoreError::Corrupt)),
+            map_c75_storage_v2_error(C75StorageV2Error::Append(StoreError::Corrupt)),
             ComponentInstallProtocolError::Append(StoreError::Corrupt)
         );
     }

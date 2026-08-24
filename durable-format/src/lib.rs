@@ -1175,6 +1175,9 @@ pub struct RootConstraint {
 pub struct RecoveryPreflight {
     store_id: StoreId,
     id_high_water: u128,
+    id_high_water_event_count: usize,
+    first_id_high_water_event: Option<(u64, u128)>,
+    second_id_high_water_event: Option<(u64, u128)>,
     committed: Vec<RecoveredGrant>,
     objects: Vec<RecoveredObject>,
     tombstone_sequence: BTreeMap<DerivationId, u64>,
@@ -1196,6 +1199,19 @@ impl RecoveryPreflight {
         self.id_high_water
     }
 
+    /// Compare the complete high-water history with exactly two ordered
+    /// expected events without returning any recovered sequence or numeric
+    /// durable identity.
+    pub fn has_only_exact_two_id_high_water_events(
+        &self,
+        first: (u64, u128),
+        second: (u64, u128),
+    ) -> bool {
+        self.id_high_water_event_count == 2
+            && self.first_id_high_water_event == Some(first)
+            && self.second_id_high_water_event == Some(second)
+    }
+
     pub fn committed_objects(&self) -> &[RecoveredObject] {
         &self.objects
     }
@@ -1206,6 +1222,21 @@ impl RecoveryPreflight {
 
     pub fn slots(&self) -> &[RecoveredSlot] {
         &self.slots
+    }
+
+    /// Compare the complete recovered tombstone history with one expected
+    /// record without exposing any recovered transaction or derivation ID.
+    /// This is a validation predicate, not a tombstone lookup surface.
+    pub fn has_only_exact_tombstone(
+        &self,
+        derivation_id: DerivationId,
+        transaction_id: TransactionId,
+        sequence: u64,
+    ) -> bool {
+        self.tombstone_sequence.len() == 1
+            && self.tombstone_transactions.len() == 1
+            && self.tombstone_sequence.get(&derivation_id) == Some(&sequence)
+            && self.tombstone_transactions.get(&derivation_id) == Some(&transaction_id)
     }
 
     pub const fn last_sequence(&self) -> u64 {
@@ -1477,10 +1508,11 @@ impl RecoveryPreflight {
         // 4. Re-encode under a fresh chain.
         let mut chain = RecordChain::new(self.store_id);
         let mut records: Vec<[u8; RECORD_SIZE]> = Vec::new();
-        records
-            .push(chain.append(None, RecordBody::Format).map_err(|_| {
-                RecoveryError::CompactionMismatch
-            })?);
+        records.push(
+            chain
+                .append(None, RecordBody::Format)
+                .map_err(|_| RecoveryError::CompactionMismatch)?,
+        );
         if self.id_high_water != 0 {
             records.push(
                 chain
@@ -1660,37 +1692,90 @@ impl RecoveryPreflight {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecoveryError {
-    SealedRecord { sector: usize, source: DecodeError },
+    SealedRecord {
+        sector: usize,
+        source: DecodeError,
+    },
     MissingFormat,
     FormatNotFirst,
     DuplicateFormat,
-    WrongStore { sector: usize },
-    BrokenSequence { sector: usize },
+    WrongStore {
+        sector: usize,
+    },
+    BrokenSequence {
+        sector: usize,
+    },
     SequenceOverflow,
     NonMonotonicHighWater,
-    IdNotReserved { sequence: u64 },
-    IdClassCollision { sequence: u64 },
-    DuplicateTransaction { sequence: u64 },
-    DuplicateDerivation { sequence: u64 },
-    DuplicateObject { sequence: u64 },
-    CommitMismatch { sequence: u64 },
-    ObjectChunkWithoutPrepare { sequence: u64 },
-    UnexpectedObjectChunk { sequence: u64 },
-    ObjectChunkLength { sequence: u64 },
-    ObjectCommitWithoutPrepare { sequence: u64 },
-    ObjectCommitMismatch { sequence: u64 },
-    ObjectContentCrcMismatch { sequence: u64 },
-    ObjectIdentityMismatch { sequence: u64 },
-    UnexpectedObjectChunkIndex { sequence: u64 },
-    MissingObjectChunks { sequence: u64 },
-    RootShape { sequence: u64 },
-    RootNotTrusted { sequence: u64 },
-    MissingParent { sequence: u64 },
-    ParentCannotGrant { sequence: u64 },
-    RightsAmplification { sequence: u64 },
-    ObjectMismatch { sequence: u64 },
-    SlotGeneration { sequence: u64 },
-    SlotStillLive { sequence: u64 },
+    IdNotReserved {
+        sequence: u64,
+    },
+    IdClassCollision {
+        sequence: u64,
+    },
+    DuplicateTransaction {
+        sequence: u64,
+    },
+    DuplicateDerivation {
+        sequence: u64,
+    },
+    DuplicateObject {
+        sequence: u64,
+    },
+    CommitMismatch {
+        sequence: u64,
+    },
+    ObjectChunkWithoutPrepare {
+        sequence: u64,
+    },
+    UnexpectedObjectChunk {
+        sequence: u64,
+    },
+    ObjectChunkLength {
+        sequence: u64,
+    },
+    ObjectCommitWithoutPrepare {
+        sequence: u64,
+    },
+    ObjectCommitMismatch {
+        sequence: u64,
+    },
+    ObjectContentCrcMismatch {
+        sequence: u64,
+    },
+    ObjectIdentityMismatch {
+        sequence: u64,
+    },
+    UnexpectedObjectChunkIndex {
+        sequence: u64,
+    },
+    MissingObjectChunks {
+        sequence: u64,
+    },
+    RootShape {
+        sequence: u64,
+    },
+    RootNotTrusted {
+        sequence: u64,
+    },
+    MissingParent {
+        sequence: u64,
+    },
+    ParentCannotGrant {
+        sequence: u64,
+    },
+    RightsAmplification {
+        sequence: u64,
+    },
+    ObjectMismatch {
+        sequence: u64,
+    },
+    SlotGeneration {
+        sequence: u64,
+    },
+    SlotStillLive {
+        sequence: u64,
+    },
     InvalidRootConstraint,
     MissingRootConstraint,
     AmbiguousRootConstraint,
@@ -1761,6 +1846,9 @@ pub struct PreflightReplay {
     previous_sequence: u64,
     previous_crc: u32,
     high_water: u128,
+    high_water_event_count: usize,
+    first_high_water_event: Option<(u64, u128)>,
+    second_high_water_event: Option<(u64, u128)>,
     id_classes: BTreeMap<u128, IdClass>,
     transactions: BTreeMap<TransactionId, TxState>,
     seen_derivations: BTreeSet<DerivationId>,
@@ -1781,6 +1869,9 @@ impl PreflightReplay {
             previous_sequence: 0,
             previous_crc: 0,
             high_water: 0,
+            high_water_event_count: 0,
+            first_high_water_event: None,
+            second_high_water_event: None,
             id_classes: BTreeMap::new(),
             transactions: BTreeMap::new(),
             seen_derivations: BTreeSet::new(),
@@ -1894,6 +1985,9 @@ impl PreflightReplay {
 
         // Semantic replay of the appended records against retained state.
         let high_water = &mut self.high_water;
+        let high_water_event_count = &mut self.high_water_event_count;
+        let first_high_water_event = &mut self.first_high_water_event;
+        let second_high_water_event = &mut self.second_high_water_event;
         let id_classes = &mut self.id_classes;
         let transactions = &mut self.transactions;
         let seen_derivations = &mut self.seen_derivations;
@@ -1903,327 +1997,326 @@ impl PreflightReplay {
         let tombstone_sequence = &mut self.tombstone_sequence;
         let tombstone_transactions = &mut self.tombstone_transactions;
         for bytes in sectors {
-        let decoded = match LogRecord::decode(bytes) {
-            Ok(DecodeStatus::Empty | DecodeStatus::Torn) => continue,
-            Ok(DecodeStatus::Valid(decoded)) => decoded,
-            Err(_) => unreachable!("decode-only preflight accepted this sector"),
-        };
-        let sequence = decoded.record.sequence;
-        match &decoded.record.body {
-            RecordBody::Format => {}
-            RecordBody::IdHighWater { exclusive_end } => {
-                if *exclusive_end <= *high_water {
-                    return Err(RecoveryError::NonMonotonicHighWater);
-                }
-                *high_water = *exclusive_end;
-            }
-            RecordBody::GrantPrepare(grant) => {
-                let tx = decoded
-                    .record
-                    .transaction_id
-                    .expect("decoder requires transaction");
-                if !ids_reserved_for_grant(grant, tx, *high_water) {
-                    return Err(RecoveryError::IdNotReserved { sequence });
-                }
-                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
-                claim_id_class(
-                    id_classes,
-                    grant.derivation_id.get(),
-                    IdClass::Derivation,
-                    sequence,
-                )?;
-                if let Some(parent) = grant.parent_id {
-                    claim_id_class(id_classes, parent.get(), IdClass::Derivation, sequence)?;
-                }
-                claim_id_class(
-                    id_classes,
-                    grant.object_id.get(),
-                    IdClass::Object,
-                    sequence,
-                )?;
-                claim_id_class(
-                    id_classes,
-                    grant.target.space.get(),
-                    IdClass::Space,
-                    sequence,
-                )?;
-                if transactions.contains_key(&tx) {
-                    return Err(RecoveryError::DuplicateTransaction { sequence });
-                }
-                if tombstone_sequence.contains_key(&grant.derivation_id)
-                    || !seen_derivations.insert(grant.derivation_id)
-                {
-                    return Err(RecoveryError::DuplicateDerivation { sequence });
-                }
-                transactions.insert(
-                    tx,
-                    TxState::GrantPrepared(PreparedGrant {
-                        grant: grant.clone(),
-                        sequence,
-                        crc32c: decoded.crc32c,
-                    }),
-                );
-            }
-            RecordBody::GrantCommit {
-                prepare_sequence,
-                prepare_crc32c,
-                derivation_id,
-            } => {
-                let tx = decoded
-                    .record
-                    .transaction_id
-                    .expect("decoder requires transaction");
-                if !id_reserved(tx.get(), *high_water)
-                    || !id_reserved(derivation_id.get(), *high_water)
-                {
-                    return Err(RecoveryError::IdNotReserved { sequence });
-                }
-                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
-                claim_id_class(
-                    id_classes,
-                    derivation_id.get(),
-                    IdClass::Derivation,
-                    sequence,
-                )?;
-                match transactions.remove(&tx) {
-                    Some(TxState::GrantPrepared(prepared)) => {
-                        if prepared.sequence != *prepare_sequence
-                            || prepared.crc32c != *prepare_crc32c
-                            || prepared.grant.derivation_id != *derivation_id
-                        {
-                            return Err(RecoveryError::CommitMismatch { sequence });
-                        }
-                        committed.push(RecoveredGrant {
-                            grant: prepared.grant,
-                            transaction_id: tx,
-                            prepare_sequence: prepared.sequence,
-                            commit_sequence: sequence,
-                        });
-                        transactions.insert(tx, TxState::Finished);
+            let decoded = match LogRecord::decode(bytes) {
+                Ok(DecodeStatus::Empty | DecodeStatus::Torn) => continue,
+                Ok(DecodeStatus::Valid(decoded)) => decoded,
+                Err(_) => unreachable!("decode-only preflight accepted this sector"),
+            };
+            let sequence = decoded.record.sequence;
+            match &decoded.record.body {
+                RecordBody::Format => {}
+                RecordBody::IdHighWater { exclusive_end } => {
+                    if *exclusive_end <= *high_water {
+                        return Err(RecoveryError::NonMonotonicHighWater);
                     }
-                    Some(TxState::Finished) => {
+                    *high_water = *exclusive_end;
+                    match *high_water_event_count {
+                        0 => *first_high_water_event = Some((sequence, *exclusive_end)),
+                        1 => *second_high_water_event = Some((sequence, *exclusive_end)),
+                        _ => {}
+                    }
+                    *high_water_event_count = high_water_event_count
+                        .checked_add(1)
+                        .ok_or(RecoveryError::SequenceOverflow)?;
+                }
+                RecordBody::GrantPrepare(grant) => {
+                    let tx = decoded
+                        .record
+                        .transaction_id
+                        .expect("decoder requires transaction");
+                    if !ids_reserved_for_grant(grant, tx, *high_water) {
+                        return Err(RecoveryError::IdNotReserved { sequence });
+                    }
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                    claim_id_class(
+                        id_classes,
+                        grant.derivation_id.get(),
+                        IdClass::Derivation,
+                        sequence,
+                    )?;
+                    if let Some(parent) = grant.parent_id {
+                        claim_id_class(id_classes, parent.get(), IdClass::Derivation, sequence)?;
+                    }
+                    claim_id_class(id_classes, grant.object_id.get(), IdClass::Object, sequence)?;
+                    claim_id_class(
+                        id_classes,
+                        grant.target.space.get(),
+                        IdClass::Space,
+                        sequence,
+                    )?;
+                    if transactions.contains_key(&tx) {
                         return Err(RecoveryError::DuplicateTransaction { sequence });
                     }
-                    Some(TxState::ObjectPrepared(_)) => {
+                    if tombstone_sequence.contains_key(&grant.derivation_id)
+                        || !seen_derivations.insert(grant.derivation_id)
+                    {
+                        return Err(RecoveryError::DuplicateDerivation { sequence });
+                    }
+                    transactions.insert(
+                        tx,
+                        TxState::GrantPrepared(PreparedGrant {
+                            grant: grant.clone(),
+                            sequence,
+                            crc32c: decoded.crc32c,
+                        }),
+                    );
+                }
+                RecordBody::GrantCommit {
+                    prepare_sequence,
+                    prepare_crc32c,
+                    derivation_id,
+                } => {
+                    let tx = decoded
+                        .record
+                        .transaction_id
+                        .expect("decoder requires transaction");
+                    if !id_reserved(tx.get(), *high_water)
+                        || !id_reserved(derivation_id.get(), *high_water)
+                    {
+                        return Err(RecoveryError::IdNotReserved { sequence });
+                    }
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                    claim_id_class(
+                        id_classes,
+                        derivation_id.get(),
+                        IdClass::Derivation,
+                        sequence,
+                    )?;
+                    match transactions.remove(&tx) {
+                        Some(TxState::GrantPrepared(prepared)) => {
+                            if prepared.sequence != *prepare_sequence
+                                || prepared.crc32c != *prepare_crc32c
+                                || prepared.grant.derivation_id != *derivation_id
+                            {
+                                return Err(RecoveryError::CommitMismatch { sequence });
+                            }
+                            committed.push(RecoveredGrant {
+                                grant: prepared.grant,
+                                transaction_id: tx,
+                                prepare_sequence: prepared.sequence,
+                                commit_sequence: sequence,
+                            });
+                            transactions.insert(tx, TxState::Finished);
+                        }
+                        Some(TxState::Finished) => {
+                            return Err(RecoveryError::DuplicateTransaction { sequence });
+                        }
+                        Some(TxState::ObjectPrepared(_)) => {
+                            return Err(RecoveryError::DuplicateTransaction { sequence });
+                        }
+                        None => {
+                            // A complete orphan commit is harmless but consumes its
+                            // transaction and derivation IDs so later records cannot
+                            // attach to it or reuse stable identity.
+                            if !seen_derivations.insert(*derivation_id) {
+                                return Err(RecoveryError::DuplicateDerivation { sequence });
+                            }
+                            transactions.insert(tx, TxState::Finished);
+                        }
+                    }
+                }
+                RecordBody::RevokeTombstone { derivation_id } => {
+                    let tx = decoded
+                        .record
+                        .transaction_id
+                        .expect("decoder requires transaction");
+                    if !id_reserved(tx.get(), *high_water)
+                        || !id_reserved(derivation_id.get(), *high_water)
+                    {
+                        return Err(RecoveryError::IdNotReserved { sequence });
+                    }
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                    claim_id_class(
+                        id_classes,
+                        derivation_id.get(),
+                        IdClass::Derivation,
+                        sequence,
+                    )?;
+                    if transactions.insert(tx, TxState::Finished).is_some() {
                         return Err(RecoveryError::DuplicateTransaction { sequence });
                     }
-                    None => {
-                        // A complete orphan commit is harmless but consumes its
-                        // transaction and derivation IDs so later records cannot
-                        // attach to it or reuse stable identity.
-                        if !seen_derivations.insert(*derivation_id) {
-                            return Err(RecoveryError::DuplicateDerivation { sequence });
-                        }
-                        transactions.insert(tx, TxState::Finished);
+                    if !tombstone_sequence.contains_key(derivation_id) {
+                        tombstone_transactions.insert(*derivation_id, tx);
                     }
+                    tombstone_sequence
+                        .entry(*derivation_id)
+                        .and_modify(|old| *old = (*old).min(sequence))
+                        .or_insert(sequence);
                 }
-            }
-            RecordBody::RevokeTombstone { derivation_id } => {
-                let tx = decoded
-                    .record
-                    .transaction_id
-                    .expect("decoder requires transaction");
-                if !id_reserved(tx.get(), *high_water)
-                    || !id_reserved(derivation_id.get(), *high_water)
-                {
-                    return Err(RecoveryError::IdNotReserved { sequence });
-                }
-                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
-                claim_id_class(
-                    id_classes,
-                    derivation_id.get(),
-                    IdClass::Derivation,
-                    sequence,
-                )?;
-                if transactions.insert(tx, TxState::Finished).is_some() {
-                    return Err(RecoveryError::DuplicateTransaction { sequence });
-                }
-                if !tombstone_sequence.contains_key(derivation_id) {
-                    tombstone_transactions.insert(*derivation_id, tx);
-                }
-                tombstone_sequence
-                    .entry(*derivation_id)
-                    .and_modify(|old| *old = (*old).min(sequence))
-                    .or_insert(sequence);
-            }
-            RecordBody::ObjectPrepare(metadata) => {
-                let tx = decoded
-                    .record
-                    .transaction_id
-                    .expect("decoder requires transaction");
-                if !id_reserved(tx.get(), *high_water)
-                    || !id_reserved(metadata.object_id.get(), *high_water)
-                {
-                    return Err(RecoveryError::IdNotReserved { sequence });
-                }
-                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
-                claim_id_class(
-                    id_classes,
-                    metadata.object_id.get(),
-                    IdClass::Object,
-                    sequence,
-                )?;
-                if transactions.contains_key(&tx) {
-                    return Err(RecoveryError::DuplicateTransaction { sequence });
-                }
-                if !seen_objects.insert(metadata.object_id) {
-                    return Err(RecoveryError::DuplicateObject { sequence });
-                }
-                transactions.insert(
-                    tx,
-                    TxState::ObjectPrepared(PreparedObject {
-                        metadata: metadata.clone(),
+                RecordBody::ObjectPrepare(metadata) => {
+                    let tx = decoded
+                        .record
+                        .transaction_id
+                        .expect("decoder requires transaction");
+                    if !id_reserved(tx.get(), *high_water)
+                        || !id_reserved(metadata.object_id.get(), *high_water)
+                    {
+                        return Err(RecoveryError::IdNotReserved { sequence });
+                    }
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                    claim_id_class(
+                        id_classes,
+                        metadata.object_id.get(),
+                        IdClass::Object,
                         sequence,
-                        crc32c: decoded.crc32c,
-                        next_chunk: 0,
-                        first_chunk_sequence: 0,
-                        chunk_digest: Crc32cDigest::new(),
-                        content_digest: Crc32cDigest::new(),
-                        byte_len: 0,
-                        bytes: Vec::new(),
-                    }),
-                );
-            }
-            RecordBody::ObjectChunk(chunk) => {
-                let tx = decoded
-                    .record
-                    .transaction_id
-                    .expect("decoder requires transaction");
-                if !id_reserved(tx.get(), *high_water)
-                    || !id_reserved(chunk.object_id.get(), *high_water)
-                {
-                    return Err(RecoveryError::IdNotReserved { sequence });
+                    )?;
+                    if transactions.contains_key(&tx) {
+                        return Err(RecoveryError::DuplicateTransaction { sequence });
+                    }
+                    if !seen_objects.insert(metadata.object_id) {
+                        return Err(RecoveryError::DuplicateObject { sequence });
+                    }
+                    transactions.insert(
+                        tx,
+                        TxState::ObjectPrepared(PreparedObject {
+                            metadata: metadata.clone(),
+                            sequence,
+                            crc32c: decoded.crc32c,
+                            next_chunk: 0,
+                            first_chunk_sequence: 0,
+                            chunk_digest: Crc32cDigest::new(),
+                            content_digest: Crc32cDigest::new(),
+                            byte_len: 0,
+                            bytes: Vec::new(),
+                        }),
+                    );
                 }
-                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
-                claim_id_class(
-                    id_classes,
-                    chunk.object_id.get(),
-                    IdClass::Object,
-                    sequence,
-                )?;
-                let Some(state) = transactions.get_mut(&tx) else {
-                    return Err(RecoveryError::ObjectChunkWithoutPrepare { sequence });
-                };
-                let TxState::ObjectPrepared(prepared) = state else {
-                    return Err(RecoveryError::DuplicateTransaction { sequence });
-                };
-                if prepared.metadata.object_id != chunk.object_id {
-                    return Err(RecoveryError::ObjectIdentityMismatch { sequence });
+                RecordBody::ObjectChunk(chunk) => {
+                    let tx = decoded
+                        .record
+                        .transaction_id
+                        .expect("decoder requires transaction");
+                    if !id_reserved(tx.get(), *high_water)
+                        || !id_reserved(chunk.object_id.get(), *high_water)
+                    {
+                        return Err(RecoveryError::IdNotReserved { sequence });
+                    }
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                    claim_id_class(id_classes, chunk.object_id.get(), IdClass::Object, sequence)?;
+                    let Some(state) = transactions.get_mut(&tx) else {
+                        return Err(RecoveryError::ObjectChunkWithoutPrepare { sequence });
+                    };
+                    let TxState::ObjectPrepared(prepared) = state else {
+                        return Err(RecoveryError::DuplicateTransaction { sequence });
+                    };
+                    if prepared.metadata.object_id != chunk.object_id {
+                        return Err(RecoveryError::ObjectIdentityMismatch { sequence });
+                    }
+                    if chunk.chunk_index != prepared.next_chunk
+                        || prepared.next_chunk >= prepared.metadata.chunk_count
+                    {
+                        return Err(RecoveryError::UnexpectedObjectChunkIndex { sequence });
+                    }
+                    let expected_len = expected_chunk_len(
+                        prepared.metadata.byte_len as usize,
+                        prepared.next_chunk,
+                        prepared.metadata.chunk_count,
+                    );
+                    if chunk.data.len() != expected_len {
+                        return Err(RecoveryError::ObjectChunkLength { sequence });
+                    }
+                    if prepared.next_chunk == 0 {
+                        prepared.first_chunk_sequence = sequence;
+                    }
+                    prepared.chunk_digest.update(&decoded.crc32c.to_le_bytes());
+                    prepared.content_digest.update(&chunk.data);
+                    prepared.byte_len += chunk.data.len();
+                    prepared.bytes.extend_from_slice(&chunk.data);
+                    prepared.next_chunk += 1;
                 }
-                if chunk.chunk_index != prepared.next_chunk
-                    || prepared.next_chunk >= prepared.metadata.chunk_count
-                {
-                    return Err(RecoveryError::UnexpectedObjectChunkIndex { sequence });
+                RecordBody::ObjectCommit(commit) => {
+                    let tx = decoded
+                        .record
+                        .transaction_id
+                        .expect("decoder requires transaction");
+                    if !id_reserved(tx.get(), *high_water)
+                        || !id_reserved(commit.object_id.get(), *high_water)
+                    {
+                        return Err(RecoveryError::IdNotReserved { sequence });
+                    }
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                    claim_id_class(
+                        id_classes,
+                        commit.object_id.get(),
+                        IdClass::Object,
+                        sequence,
+                    )?;
+                    // Commit is an ownership transfer: removing the state prevents
+                    // any accumulated payload from being cloned at publication.
+                    let Some(state) = transactions.remove(&tx) else {
+                        return Err(RecoveryError::ObjectCommitWithoutPrepare { sequence });
+                    };
+                    let TxState::ObjectPrepared(prepared) = state else {
+                        return Err(RecoveryError::DuplicateTransaction { sequence });
+                    };
+                    if prepared.metadata.object_id != commit.object_id {
+                        return Err(RecoveryError::ObjectIdentityMismatch { sequence });
+                    }
+                    if prepared.next_chunk != prepared.metadata.chunk_count {
+                        return Err(RecoveryError::MissingObjectChunks { sequence });
+                    }
+                    if commit.prepare_sequence != prepared.sequence
+                        || commit.prepare_crc32c != prepared.crc32c
+                        || commit.chunk_count != prepared.metadata.chunk_count
+                        || commit.first_chunk_sequence != prepared.first_chunk_sequence
+                        || commit.chunks_crc32c != prepared.chunk_digest.finish()
+                        || commit.content_crc32c != prepared.metadata.content_crc32c
+                    {
+                        return Err(RecoveryError::ObjectCommitMismatch { sequence });
+                    }
+                    if prepared.byte_len != prepared.metadata.byte_len as usize
+                        || prepared.content_digest.finish() != prepared.metadata.content_crc32c
+                    {
+                        return Err(RecoveryError::ObjectContentCrcMismatch { sequence });
+                    }
+                    let byte_len = prepared.bytes.len() as u64;
+                    committed_objects.push(RecoveredObject {
+                        object_id: prepared.metadata.object_id,
+                        object_kind: prepared.metadata.object_kind,
+                        bytes: prepared.bytes,
+                        byte_len,
+                        external_root: None,
+                        transaction_id: tx,
+                        prepare_sequence: prepared.sequence,
+                        commit_sequence: sequence,
+                    });
+                    transactions.insert(tx, TxState::Finished);
                 }
-                let expected_len = expected_chunk_len(
-                    prepared.metadata.byte_len as usize,
-                    prepared.next_chunk,
-                    prepared.metadata.chunk_count,
-                );
-                if chunk.data.len() != expected_len {
-                    return Err(RecoveryError::ObjectChunkLength { sequence });
-                }
-                if prepared.next_chunk == 0 {
-                    prepared.first_chunk_sequence = sequence;
-                }
-                prepared.chunk_digest.update(&decoded.crc32c.to_le_bytes());
-                prepared.content_digest.update(&chunk.data);
-                prepared.byte_len += chunk.data.len();
-                prepared.bytes.extend_from_slice(&chunk.data);
-                prepared.next_chunk += 1;
-            }
-            RecordBody::ObjectCommit(commit) => {
-                let tx = decoded
-                    .record
-                    .transaction_id
-                    .expect("decoder requires transaction");
-                if !id_reserved(tx.get(), *high_water)
-                    || !id_reserved(commit.object_id.get(), *high_water)
-                {
-                    return Err(RecoveryError::IdNotReserved { sequence });
-                }
-                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
-                claim_id_class(
-                    id_classes,
-                    commit.object_id.get(),
-                    IdClass::Object,
-                    sequence,
-                )?;
-                // Commit is an ownership transfer: removing the state prevents
-                // any accumulated payload from being cloned at publication.
-                let Some(state) = transactions.remove(&tx) else {
-                    return Err(RecoveryError::ObjectCommitWithoutPrepare { sequence });
-                };
-                let TxState::ObjectPrepared(prepared) = state else {
-                    return Err(RecoveryError::DuplicateTransaction { sequence });
-                };
-                if prepared.metadata.object_id != commit.object_id {
-                    return Err(RecoveryError::ObjectIdentityMismatch { sequence });
-                }
-                if prepared.next_chunk != prepared.metadata.chunk_count {
-                    return Err(RecoveryError::MissingObjectChunks { sequence });
-                }
-                if commit.prepare_sequence != prepared.sequence
-                    || commit.prepare_crc32c != prepared.crc32c
-                    || commit.chunk_count != prepared.metadata.chunk_count
-                    || commit.first_chunk_sequence != prepared.first_chunk_sequence
-                    || commit.chunks_crc32c != prepared.chunk_digest.finish()
-                    || commit.content_crc32c != prepared.metadata.content_crc32c
-                {
-                    return Err(RecoveryError::ObjectCommitMismatch { sequence });
-                }
-                if prepared.byte_len != prepared.metadata.byte_len as usize
-                    || prepared.content_digest.finish() != prepared.metadata.content_crc32c
-                {
-                    return Err(RecoveryError::ObjectContentCrcMismatch { sequence });
-                }
-                let byte_len = prepared.bytes.len() as u64;
-                committed_objects.push(RecoveredObject {
-                    object_id: prepared.metadata.object_id,
-                    object_kind: prepared.metadata.object_kind,
-                    bytes: prepared.bytes,
+                RecordBody::ObjectExternal {
+                    object_id,
+                    object_kind,
                     byte_len,
-                    external_root: None,
-                    transaction_id: tx,
-                    prepare_sequence: prepared.sequence,
-                    commit_sequence: sequence,
-                });
-                transactions.insert(tx, TxState::Finished);
+                    merkle_root,
+                } => {
+                    let tx = decoded
+                        .record
+                        .transaction_id
+                        .expect("decoder requires transaction");
+                    if !id_reserved(tx.get(), *high_water)
+                        || !id_reserved(object_id.get(), *high_water)
+                    {
+                        return Err(RecoveryError::IdNotReserved { sequence });
+                    }
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                    claim_id_class(id_classes, object_id.get(), IdClass::Object, sequence)?;
+                    if transactions.insert(tx, TxState::Finished).is_some() {
+                        return Err(RecoveryError::DuplicateTransaction { sequence });
+                    }
+                    if !seen_objects.insert(*object_id) {
+                        return Err(RecoveryError::DuplicateObject { sequence });
+                    }
+                    committed_objects.push(RecoveredObject {
+                        object_id: *object_id,
+                        object_kind: *object_kind,
+                        bytes: Vec::new(),
+                        byte_len: *byte_len,
+                        external_root: Some(*merkle_root),
+                        transaction_id: tx,
+                        prepare_sequence: sequence,
+                        commit_sequence: sequence,
+                    });
+                }
             }
-            RecordBody::ObjectExternal {
-                object_id,
-                object_kind,
-                byte_len,
-                merkle_root,
-            } => {
-                let tx = decoded
-                    .record
-                    .transaction_id
-                    .expect("decoder requires transaction");
-                if !id_reserved(tx.get(), *high_water) || !id_reserved(object_id.get(), *high_water)
-                {
-                    return Err(RecoveryError::IdNotReserved { sequence });
-                }
-                claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
-                claim_id_class(id_classes, object_id.get(), IdClass::Object, sequence)?;
-                if transactions.insert(tx, TxState::Finished).is_some() {
-                    return Err(RecoveryError::DuplicateTransaction { sequence });
-                }
-                if !seen_objects.insert(*object_id) {
-                    return Err(RecoveryError::DuplicateObject { sequence });
-                }
-                committed_objects.push(RecoveredObject {
-                    object_id: *object_id,
-                    object_kind: *object_kind,
-                    bytes: Vec::new(),
-                    byte_len: *byte_len,
-                    external_root: Some(*merkle_root),
-                    transaction_id: tx,
-                    prepare_sequence: sequence,
-                    commit_sequence: sequence,
-                });
-            }
-        }
         }
         self.previous_sequence = previous_sequence;
         self.previous_crc = previous_crc;
@@ -2244,99 +2337,103 @@ impl PreflightReplay {
         if self.valid_records == 0 {
             return Err(RecoveryError::MissingFormat);
         }
-    let mut graph: BTreeMap<DerivationId, RecoveredGrant> = BTreeMap::new();
-    let mut object_kinds: BTreeMap<ObjectId, ResourceKind> = BTreeMap::new();
-    for recovered in &self.committed {
-        let grant = &recovered.grant;
-        if let Some(kind) = object_kinds.insert(grant.object_id, grant.resource_kind) {
-            if kind != grant.resource_kind {
-                return Err(RecoveryError::ObjectMismatch {
-                    sequence: recovered.commit_sequence,
-                });
+        let mut graph: BTreeMap<DerivationId, RecoveredGrant> = BTreeMap::new();
+        let mut object_kinds: BTreeMap<ObjectId, ResourceKind> = BTreeMap::new();
+        for recovered in &self.committed {
+            let grant = &recovered.grant;
+            if let Some(kind) = object_kinds.insert(grant.object_id, grant.resource_kind) {
+                if kind != grant.resource_kind {
+                    return Err(RecoveryError::ObjectMismatch {
+                        sequence: recovered.commit_sequence,
+                    });
+                }
             }
+            if grant.flags.is_root() {
+                if grant.parent_id.is_some() {
+                    return Err(RecoveryError::RootShape {
+                        sequence: recovered.commit_sequence,
+                    });
+                }
+            } else {
+                let Some(parent_id) = grant.parent_id else {
+                    return Err(RecoveryError::RootShape {
+                        sequence: recovered.commit_sequence,
+                    });
+                };
+                let Some(parent) = graph.get(&parent_id) else {
+                    return Err(RecoveryError::MissingParent {
+                        sequence: recovered.commit_sequence,
+                    });
+                };
+                if !parent.grant.rights.contains(DurableRights::GRANT) {
+                    return Err(RecoveryError::ParentCannotGrant {
+                        sequence: recovered.commit_sequence,
+                    });
+                }
+                if !parent.grant.rights.contains(grant.rights) {
+                    return Err(RecoveryError::RightsAmplification {
+                        sequence: recovered.commit_sequence,
+                    });
+                }
+                if parent.grant.object_id != grant.object_id
+                    || parent.grant.resource_kind != grant.resource_kind
+                {
+                    return Err(RecoveryError::ObjectMismatch {
+                        sequence: recovered.commit_sequence,
+                    });
+                }
+            }
+            graph.insert(grant.derivation_id, recovered.clone());
         }
-        if grant.flags.is_root() {
-            if grant.parent_id.is_some() {
-                return Err(RecoveryError::RootShape {
-                    sequence: recovered.commit_sequence,
-                });
-            }
-        } else {
-            let Some(parent_id) = grant.parent_id else {
-                return Err(RecoveryError::RootShape {
-                    sequence: recovered.commit_sequence,
-                });
-            };
-            let Some(parent) = graph.get(&parent_id) else {
-                return Err(RecoveryError::MissingParent {
-                    sequence: recovered.commit_sequence,
-                });
-            };
-            if !parent.grant.rights.contains(DurableRights::GRANT) {
-                return Err(RecoveryError::ParentCannotGrant {
-                    sequence: recovered.commit_sequence,
-                });
-            }
-            if !parent.grant.rights.contains(grant.rights) {
-                return Err(RecoveryError::RightsAmplification {
-                    sequence: recovered.commit_sequence,
-                });
-            }
-            if parent.grant.object_id != grant.object_id
-                || parent.grant.resource_kind != grant.resource_kind
-            {
-                return Err(RecoveryError::ObjectMismatch {
-                    sequence: recovered.commit_sequence,
-                });
-            }
-        }
-        graph.insert(grant.derivation_id, recovered.clone());
-    }
 
-    let mut slots: BTreeMap<(SpaceId, u32), (u64, DerivationId)> = BTreeMap::new();
-    for recovered in &self.committed {
-        let key = (recovered.grant.target.space, recovered.grant.target.slot);
-        if let Some((old_generation, old_derivation)) = slots.get(&key).copied() {
-            if old_generation == u64::MAX || recovered.grant.target.generation <= old_generation {
-                return Err(RecoveryError::SlotGeneration {
-                    sequence: recovered.commit_sequence,
-                });
+        let mut slots: BTreeMap<(SpaceId, u32), (u64, DerivationId)> = BTreeMap::new();
+        for recovered in &self.committed {
+            let key = (recovered.grant.target.space, recovered.grant.target.slot);
+            if let Some((old_generation, old_derivation)) = slots.get(&key).copied() {
+                if old_generation == u64::MAX || recovered.grant.target.generation <= old_generation
+                {
+                    return Err(RecoveryError::SlotGeneration {
+                        sequence: recovered.commit_sequence,
+                    });
+                }
+                if !is_tombstoned_before(
+                    old_derivation,
+                    recovered.commit_sequence,
+                    &graph,
+                    &self.tombstone_sequence,
+                ) {
+                    return Err(RecoveryError::SlotStillLive {
+                        sequence: recovered.commit_sequence,
+                    });
+                }
             }
-            if !is_tombstoned_before(
-                old_derivation,
-                recovered.commit_sequence,
-                &graph,
-                &self.tombstone_sequence,
-            ) {
-                return Err(RecoveryError::SlotStillLive {
-                    sequence: recovered.commit_sequence,
-                });
-            }
+            slots.insert(
+                key,
+                (
+                    recovered.grant.target.generation,
+                    recovered.grant.derivation_id,
+                ),
+            );
         }
-        slots.insert(
-            key,
-            (
-                recovered.grant.target.generation,
-                recovered.grant.derivation_id,
-            ),
-        );
-    }
 
-    let slots = slots
-        .into_iter()
-        .map(
-            |((space, slot), (max_generation, derivation))| RecoveredSlot {
-                space,
-                slot,
-                max_generation,
-                live_derivation: (!is_tombstoned(derivation, &graph, &self.tombstone_sequence))
-                    .then_some(derivation),
-            },
-        )
-        .collect();
+        let slots = slots
+            .into_iter()
+            .map(
+                |((space, slot), (max_generation, derivation))| RecoveredSlot {
+                    space,
+                    slot,
+                    max_generation,
+                    live_derivation: (!is_tombstoned(derivation, &graph, &self.tombstone_sequence))
+                        .then_some(derivation),
+                },
+            )
+            .collect();
         Ok(RecoveryPreflight {
             store_id: self.store_id,
             id_high_water: self.high_water,
+            id_high_water_event_count: self.high_water_event_count,
+            first_id_high_water_event: self.first_high_water_event,
+            second_id_high_water_event: self.second_high_water_event,
             committed: self.committed,
             objects: self.committed_objects,
             tombstone_sequence: self.tombstone_sequence,

@@ -104,7 +104,8 @@ use crate::HEAP;
 
 #[cfg(any(
     feature = "wasm-c66-node-replacement-acceptance",
-    feature = "wasm-c76-graph-version-replacement-acceptance"
+    feature = "wasm-c76-graph-version-replacement-acceptance",
+    feature = "wasm-c77-ephemeral-runtime-acceptance"
 ))]
 #[path = "component_graph_replacement.rs"]
 mod c66;
@@ -116,6 +117,9 @@ pub(crate) use c66::run_qemu_acceptance as run_c66_qemu_acceptance;
 pub(crate) use c66::{
     stage_c76_current_graph, start_c76_durable_replacement, C76ReplacementReceipt, C76StagedCurrent,
 };
+
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+pub(crate) use c66::{stage_c77_ephemeral_graph, C77EphemeralBootReceipt, C77StagedEphemeralGraph};
 
 /// Audited non-guest storage allowance for one graph-node lifecycle.
 ///

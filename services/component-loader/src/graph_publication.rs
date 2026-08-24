@@ -637,8 +637,25 @@ impl C76FreshDurableGraphReplacement {
         let admitted = Arc::clone(self.template.admitted_replacement().candidate_graph_arc());
         let template = ComponentGraphPrincipalTemplate::new(admitted)
             .map_err(C76GraphInstallProtocolError::PrincipalProjection)?;
+        if template.runtime_ready() {
+            return Err(C76GraphInstallProtocolError::WrongVersion);
+        }
         Ok(C76SupervisorCurrentGraph { template })
     }
+}
+
+/// Narrow C7.7 bridge: freshly revalidate both physically recovered versions
+/// as the exact PolicyCancel replacement, then release only the already-final
+/// successor's opaque current projection.  No predecessor or replacement
+/// authority crosses into the C7.7 API.
+pub(super) fn revalidate_c76_final_g1_to_current(
+    graph: C76FinalGraph,
+    policy: &OperatorComponentGraphAdmissionPolicy<'_>,
+    caller: &CallerAuthority<'_>,
+) -> Result<C76SupervisorCurrentGraph, C76GraphInstallProtocolError> {
+    C76RecoveredFinalGraph { graph }
+        .revalidate_on_boot(policy, caller)?
+        .into_successor_supervisor_graph()
 }
 
 /// Opaque current-only handoff.  Its borrowed view cannot escape `consume`.

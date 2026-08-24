@@ -4023,10 +4023,11 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             };
             let result = async {
                 // The caller cannot reflect a legacy or unknown digest into the
-                // guard. This exact constant is independently frozen in kernel
-                // policy, while object-store carries only its comparison digest.
+                // guard. The active Component-v2 or Graph-v3 constant is
+                // independently frozen in kernel policy, while object-store
+                // carries only its comparison digest.
                 if expected_external_root_policy_sha256
-                    != crate::durable_cspace::storage_v2_component_external_policy_sha256()
+                    != crate::durable_cspace::storage_v2_external_policy_sha256()
                     || BootStoreSelection::decode(runtime.boot_selection.load(Ordering::Acquire))
                         != Some(BootStoreSelection::StorageV2)
                 {

@@ -14,6 +14,8 @@ use vibeos_component_format::{
 };
 use vibeos_component_runtime::decode::inspect_component;
 
+mod build_c76;
+
 const SOURCE: &str = include_str!("artifacts/c53-stream-filter.component.wat");
 const NATIVE_ASYNC_SOURCE: &str = include_str!("artifacts/c53-native-async-filter.component.wat");
 const C64_RESOURCE_PROVIDER_SOURCE: &str =
@@ -790,6 +792,7 @@ fn write_c73_unsigned_fixture(output: &Path) {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=build_c76.rs");
     println!("cargo:rerun-if-changed=artifacts/c53-stream-filter.component.wat");
     println!("cargo:rerun-if-changed=artifacts/c53-native-async-filter.component.wat");
     println!("cargo:rerun-if-changed=artifacts/c64-resource-provider.component.wat");
@@ -804,6 +807,7 @@ fn main() {
     println!("cargo:rerun-if-changed=artifacts/c73-byte-filter-b.component.wat");
     println!("cargo:rerun-if-changed=artifacts/c73-byte-filter.wit");
     println!("cargo:rerun-if-changed=artifacts/c73-authenticated-admission.vectors");
+    println!("cargo:rerun-if-changed=artifacts/c76-graph-version-replacement.vectors");
 
     let bytes = wat::parse_str(SOURCE).expect("pinned Component WAT must parse");
     let observed: [u8; 32] = Sha256::digest(&bytes).into();
@@ -823,6 +827,10 @@ fn main() {
 
     if env::var_os("CARGO_FEATURE_C73_AUTHENTICATED_ADMISSION_QEMU_ACCEPTANCE").is_some() {
         write_c73_unsigned_fixture(&output);
+    }
+
+    if env::var_os("CARGO_FEATURE_C76_GRAPH_VERSION_REPLACEMENT_QEMU_ACCEPTANCE").is_some() {
+        build_c76::write_fixture(&output);
     }
 
     if env::var_os("CARGO_FEATURE_C53_NATIVE_ASYNC_QEMU_ACCEPTANCE").is_some()

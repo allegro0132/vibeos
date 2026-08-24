@@ -686,6 +686,27 @@ pub fn admit_authenticated(
     policy: &OperatorArtifactAdmissionPolicy<'_>,
     caller: &CallerAuthority<'_>,
 ) -> Result<AdmittedComponent, AuthenticatedAdmissionError> {
+    let (component, engine) = revalidate_authenticated_artifact(authenticated, policy)?;
+    admit_under_exact_rules_with_current_engine(component, &policy.exact_rules(), caller, &engine)
+        .map_err(Into::into)
+}
+
+/// Consume a leaf authentication proof and repeat every canonical artifact,
+/// signer-policy, WIT, Core, manifest, limit, and current-engine check without
+/// performing single-command admission. Graph admission uses this crate-only
+/// seam because graph-internal imports are validated as one complete typed
+/// graph rather than misclassified as ambient host imports.
+pub(crate) fn revalidate_authenticated_graph_artifact(
+    authenticated: AuthenticatedComponentArtifact,
+    policy: &OperatorArtifactAdmissionPolicy<'_>,
+) -> Result<ComponentArtifact, AuthenticatedAdmissionError> {
+    revalidate_authenticated_artifact(authenticated, policy).map(|(component, _engine)| component)
+}
+
+fn revalidate_authenticated_artifact(
+    authenticated: AuthenticatedComponentArtifact,
+    policy: &OperatorArtifactAdmissionPolicy<'_>,
+) -> Result<(ComponentArtifact, CurrentValidationEngine), AuthenticatedAdmissionError> {
     let AuthenticatedComponentArtifact {
         artifact,
         receipt,
@@ -734,15 +755,14 @@ pub fn admit_authenticated(
         return Err(ArtifactAuthenticationError::ReceiptMismatch.into());
     }
     validate_fresh_artifact_evidence(&artifact, &component, policy, &engine)?;
-    admit_under_exact_rules_with_current_engine(component, &policy.exact_rules(), caller, &engine)
-        .map_err(Into::into)
+    Ok((component, engine))
 }
 
 fn validate_operator_public_key(public_key: [u8; 32]) -> Result<(), ArtifactAuthenticationError> {
     operator_verifying_key(public_key).map(|_| ())
 }
 
-fn operator_verifying_key(
+pub(crate) fn operator_verifying_key(
     public_key: [u8; 32],
 ) -> Result<VerifyingKey, ArtifactAuthenticationError> {
     let verifying_key = VerifyingKey::from_bytes(&public_key)

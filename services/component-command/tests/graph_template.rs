@@ -5,8 +5,8 @@ use vibeos_component_admission::{
     admit_component_graph_with_resource_policy, ArtifactTrust, CallerAuthority, ComponentArtifact,
     ComponentGraphAdmissionPolicy, ComponentGraphCyclePolicy, ComponentGraphNodeAdmissionPolicy,
     ComponentGraphNodeReplacementPolicy, ComponentGraphReplacementEdgeAction,
-    ComponentGraphReplacementEdgePolicy, ComponentGraphResourceEdgePolicy,
-    ComponentGraphResourceMode, InstanceLimits, ProfileIdentity,
+    ComponentGraphReplacementEdgePolicy, ComponentGraphReplacementNodeAction,
+    ComponentGraphResourceEdgePolicy, ComponentGraphResourceMode, InstanceLimits, ProfileIdentity,
 };
 use vibeos_component_command::{
     ComponentGraphNodePrincipalTemplate, ComponentGraphNodeReplacementTemplate,
@@ -322,6 +322,7 @@ fn admitted_async_replacement() -> vibeos_component_admission::AdmittedComponent
         &ComponentGraphNodeReplacementPolicy {
             target: graph_node(1),
             max_replacements: 1,
+            node_action: ComponentGraphReplacementNodeAction::PolicyCancel,
             incident_edges: &incident_edges,
         },
     )
@@ -681,6 +682,10 @@ fn replacement_template_is_exact_inert_send_sync_and_revalidates_twice() {
     assert_eq!(template.target(), graph_node(1));
     assert_eq!(template.max_replacements(), 1);
     assert_eq!(
+        template.node_action(),
+        ComponentGraphReplacementNodeAction::PolicyCancel
+    );
+    assert_eq!(
         template.incident_edges(),
         [recreate(async_edge()), recreate(second_async_edge())]
     );
@@ -718,6 +723,7 @@ fn replacement_template_debug_redacts_graphs_artifacts_and_runtime_identities() 
     assert!(output.contains("ComponentGraphNodeReplacementTemplate"));
     assert!(output.contains("<redacted>"));
     assert!(output.contains("max_replacements: 1"));
+    assert!(output.contains("PolicyCancel"));
     assert!(output.contains("RecreateFresh"));
     assert!(output.contains("runtime_ready: false"));
     for forbidden in [

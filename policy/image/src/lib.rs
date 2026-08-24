@@ -5,16 +5,28 @@
 
 use vibeos_component_format::ProfileIdentity;
 
-#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+#[cfg(any(
+    feature = "c73-authenticated-admission-qemu-acceptance",
+    feature = "c76-graph-version-replacement-qemu-acceptance"
+))]
 use vibeos_component_admission::{
     ArtifactAuthenticationError, CommandStreamMode as AdmissionStreamMode, InstanceLimits,
     OperatorRoleIdentity, OperatorSignerStatus, OperatorSignerV1,
 };
-#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+#[cfg(any(
+    feature = "c73-authenticated-admission-qemu-acceptance",
+    feature = "c76-graph-version-replacement-qemu-acceptance"
+))]
 use vibeos_component_format::{
     ComponentArtifactAuthenticationError, ComponentArtifactAuthenticationEvidenceV1,
-    ComponentArtifactError, ComponentArtifactPolicyDigest, ComponentArtifactSignerPolicyV1,
-    ComponentArtifactV1,
+    ComponentArtifactError, ComponentArtifactV1,
+};
+#[cfg(feature = "c73-authenticated-admission-qemu-acceptance")]
+use vibeos_component_format::{ComponentArtifactPolicyDigest, ComponentArtifactSignerPolicyV1};
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+use vibeos_component_format::{
+    ComponentGraphVersionAuthenticationError, ComponentGraphVersionAuthenticationEvidenceV1,
+    ComponentGraphVersionError, ComponentGraphVersionV1,
 };
 
 #[cfg(all(feature = "qemu-default", feature = "milkv-duo-sd"))]
@@ -58,6 +70,12 @@ compile_error!("feature `c67-information-flow-qemu-acceptance` requires `qemu-de
     not(feature = "qemu-default")
 ))]
 compile_error!("feature `c73-authenticated-admission-qemu-acceptance` requires `qemu-default`");
+
+#[cfg(all(
+    feature = "c76-graph-version-replacement-qemu-acceptance",
+    not(feature = "qemu-default")
+))]
+compile_error!("feature `c76-graph-version-replacement-qemu-acceptance` requires `qemu-default`");
 
 /// A logical block-device view carved out of a packaged storage image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -506,6 +524,300 @@ impl core::fmt::Debug for C73AuthenticatedAdmissionPin {
     }
 }
 
+/// Exact retirement action authorized by the fixed C7.6 graph policy.
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum C76GraphRetirementAction {
+    PolicyCancel,
+}
+
+/// Private, typed inputs for the current C7.6 operator policy.
+///
+/// The complete public key is carried directly and never selected by a key
+/// identifier or ambient lookup. No signing seed, durable object identity,
+/// capability, runtime principal, or guest entry authority exists here.
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub struct C76GraphOperatorPolicyPin {
+    generation: u64,
+    operator_role: [u8; 32],
+    active_signer: [u8; 32],
+    exact_wit_source: &'static str,
+}
+
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+impl C76GraphOperatorPolicyPin {
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub const fn profile(self) -> ProfileIdentity {
+        ProfileIdentity::PROFILE_1_ASYNC
+    }
+
+    pub const fn graph_name(self) -> &'static str {
+        "c76-chain"
+    }
+
+    pub const fn node_command_name(self) -> &'static str {
+        "c76-node"
+    }
+
+    pub const fn node_entrypoint(self) -> &'static str {
+        "run"
+    }
+
+    pub const fn node_argument_limits(self) -> (usize, usize) {
+        (0, 0)
+    }
+
+    pub const fn node_interface_ceiling_count(self) -> u16 {
+        0
+    }
+
+    pub const fn exact_wit_source(self) -> &'static str {
+        self.exact_wit_source
+    }
+
+    pub const fn node_labels(self) -> [&'static str; 3] {
+        ["source", "relay", "sink"]
+    }
+
+    pub const fn node_worlds(self) -> [&'static str; 3] {
+        [
+            "test:c65-chain/source@1.0.0",
+            "test:c65-chain/relay@1.0.0",
+            "test:c65-chain/sink@1.0.0",
+        ]
+    }
+
+    pub const fn node_limits(self) -> InstanceLimits {
+        InstanceLimits {
+            memory_bytes: 64 * 1024,
+            total_fuel: 1_000,
+            poll_quantum: 100,
+            resources: 8,
+        }
+    }
+
+    pub const fn node_streams(
+        self,
+    ) -> (
+        AdmissionStreamMode,
+        AdmissionStreamMode,
+        AdmissionStreamMode,
+    ) {
+        (
+            AdmissionStreamMode::Closed,
+            AdmissionStreamMode::Closed,
+            AdmissionStreamMode::Closed,
+        )
+    }
+
+    pub fn operator_role(self) -> Result<OperatorRoleIdentity, ArtifactAuthenticationError> {
+        OperatorRoleIdentity::from_bytes(self.operator_role)
+    }
+
+    pub fn active_signer(self) -> Result<OperatorSignerV1, ArtifactAuthenticationError> {
+        OperatorSignerV1::new(self.active_signer, OperatorSignerStatus::Active)
+    }
+
+    /// The complete canonical leaf signer table. It contains no key ID.
+    pub fn leaf_signers(self) -> Result<[OperatorSignerV1; 1], ArtifactAuthenticationError> {
+        Ok([self.active_signer()?])
+    }
+
+    /// The complete canonical graph signer table. C7.6 intentionally uses the
+    /// same current operator role as every leaf while retaining distinct
+    /// artifact and graph signature domains.
+    pub fn graph_signers(self) -> Result<[OperatorSignerV1; 1], ArtifactAuthenticationError> {
+        Ok([self.active_signer()?])
+    }
+
+    pub const fn active_public_key_bytes(self) -> [u8; 32] {
+        self.active_signer
+    }
+
+    pub const fn node_count(self) -> u16 {
+        3
+    }
+
+    pub const fn all_nodes_are_roots(self) -> bool {
+        true
+    }
+
+    pub const fn graph_edges(self) -> [ComponentGraphReplacementEdgePin; 2] {
+        [
+            ComponentGraphReplacementEdgePin::new(
+                0,
+                0,
+                1,
+                0,
+                ComponentGraphReplacementPinAction::RecreateFresh,
+            ),
+            ComponentGraphReplacementEdgePin::new(
+                1,
+                0,
+                2,
+                0,
+                ComponentGraphReplacementPinAction::RecreateFresh,
+            ),
+        ]
+    }
+
+    pub const fn published_export(self) -> (u16, u16) {
+        (2, 0)
+    }
+
+    pub const fn replacement_node(self) -> u16 {
+        1
+    }
+
+    pub const fn retirement_action(self) -> C76GraphRetirementAction {
+        C76GraphRetirementAction::PolicyCancel
+    }
+
+    pub const fn incident_edges(self) -> [ComponentGraphReplacementEdgePin; 2] {
+        self.graph_edges()
+    }
+
+    pub const fn max_replacements(self) -> u16 {
+        1
+    }
+
+    pub const fn resource_edge_count(self) -> u16 {
+        0
+    }
+
+    pub const fn external_import_count(self) -> u16 {
+        0
+    }
+
+    pub const fn runtime_ready(self) -> bool {
+        false
+    }
+
+    pub const fn guest_calls(self) -> u64 {
+        0
+    }
+}
+
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+impl core::fmt::Debug for C76GraphOperatorPolicyPin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("C76GraphOperatorPolicyPin")
+            .field("generation", &self.generation)
+            .field("operator_role", &"<redacted>")
+            .field("active_signer", &"<redacted>")
+            .field("profile", &ProfileIdentity::PROFILE_1_ASYNC)
+            .field("nodes", &3)
+            .field("edges", &2)
+            .field("replacement_node", &1)
+            .field("runtime_ready", &false)
+            .field("guest_calls", &0)
+            .finish()
+    }
+}
+
+/// One complete, inert C7.6 graph-version bundle pinned by canonical bytes.
+///
+/// The byte accessors are explicit installation inputs for the exact
+/// root-relative storage layout. They are content bytes, never durable IDs or
+/// lookup authority, and every typed accessor reparses the canonical format.
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub struct C76GraphVersionPin {
+    ordinal: u64,
+    descriptor_bytes: &'static [u8],
+    artifact_bytes: [&'static [u8]; 3],
+    artifact_evidence_bytes: [&'static [u8]; 3],
+    graph_evidence_bytes: &'static [u8],
+}
+
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+impl C76GraphVersionPin {
+    pub const fn ordinal(self) -> u64 {
+        self.ordinal
+    }
+
+    pub const fn canonical_descriptor_bytes(self) -> &'static [u8] {
+        self.descriptor_bytes
+    }
+
+    pub const fn canonical_artifact_bytes(self) -> [&'static [u8]; 3] {
+        self.artifact_bytes
+    }
+
+    pub const fn canonical_artifact_evidence_bytes(self) -> [&'static [u8]; 3] {
+        self.artifact_evidence_bytes
+    }
+
+    pub const fn canonical_graph_evidence_bytes(self) -> &'static [u8] {
+        self.graph_evidence_bytes
+    }
+
+    pub fn descriptor(self) -> Result<ComponentGraphVersionV1, ComponentGraphVersionError> {
+        ComponentGraphVersionV1::decode(self.descriptor_bytes)
+    }
+
+    pub fn artifacts(self) -> Result<[ComponentArtifactV1; 3], ComponentArtifactError> {
+        Ok([
+            ComponentArtifactV1::decode(self.artifact_bytes[0])?,
+            ComponentArtifactV1::decode(self.artifact_bytes[1])?,
+            ComponentArtifactV1::decode(self.artifact_bytes[2])?,
+        ])
+    }
+
+    pub fn artifact_evidence(
+        self,
+    ) -> Result<[ComponentArtifactAuthenticationEvidenceV1; 3], ComponentArtifactAuthenticationError>
+    {
+        Ok([
+            ComponentArtifactAuthenticationEvidenceV1::decode(self.artifact_evidence_bytes[0])?,
+            ComponentArtifactAuthenticationEvidenceV1::decode(self.artifact_evidence_bytes[1])?,
+            ComponentArtifactAuthenticationEvidenceV1::decode(self.artifact_evidence_bytes[2])?,
+        ])
+    }
+
+    pub fn graph_evidence(
+        self,
+    ) -> Result<
+        ComponentGraphVersionAuthenticationEvidenceV1,
+        ComponentGraphVersionAuthenticationError,
+    > {
+        ComponentGraphVersionAuthenticationEvidenceV1::decode(self.graph_evidence_bytes)
+    }
+
+    pub const fn attachment_counts(self) -> (u16, u16, u16) {
+        (3, 3, 1)
+    }
+
+    pub const fn runtime_ready(self) -> bool {
+        false
+    }
+
+    pub const fn guest_calls(self) -> u64 {
+        0
+    }
+}
+
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+impl core::fmt::Debug for C76GraphVersionPin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("C76GraphVersionPin")
+            .field("ordinal", &self.ordinal)
+            .field("descriptor", &"<redacted>")
+            .field("artifacts", &"<redacted:3>")
+            .field("artifact_evidence", &"<redacted:3>")
+            .field("graph_evidence", &"<redacted>")
+            .field("runtime_ready", &false)
+            .field("guest_calls", &0)
+            .finish()
+    }
+}
+
 /// Immutable, validation-only two-node artifact pair for the C6.4 resource
 /// route acceptance image.
 ///
@@ -708,7 +1020,10 @@ impl core::fmt::Debug for ComponentGraphAsyncChainPin {
 /// Disconnect-only teardown is intentionally not representable: the C6.6
 /// image requires the supervisor to create a fresh edge incarnation from the
 /// admitted policy before publishing the replacement.
-#[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+#[cfg(any(
+    feature = "c66-node-replacement-qemu-acceptance",
+    feature = "c76-graph-version-replacement-qemu-acceptance"
+))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComponentGraphReplacementPinAction {
     RecreateFresh,
@@ -718,7 +1033,10 @@ pub enum ComponentGraphReplacementPinAction {
 ///
 /// Node and entity numbers are inert bounded graph coordinates, never Task,
 /// CSpace, capability, resource, live route, or durable object identities.
-#[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+#[cfg(any(
+    feature = "c66-node-replacement-qemu-acceptance",
+    feature = "c76-graph-version-replacement-qemu-acceptance"
+))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ComponentGraphReplacementEdgePin {
     source_node: u16,
@@ -728,7 +1046,10 @@ pub struct ComponentGraphReplacementEdgePin {
     action: ComponentGraphReplacementPinAction,
 }
 
-#[cfg(feature = "c66-node-replacement-qemu-acceptance")]
+#[cfg(any(
+    feature = "c66-node-replacement-qemu-acceptance",
+    feature = "c76-graph-version-replacement-qemu-acceptance"
+))]
 impl ComponentGraphReplacementEdgePin {
     const fn new(
         source_node: u16,
@@ -1320,6 +1641,59 @@ const C73_DEVELOPMENT_POLICY_DIGEST_BYTES: [u8; 32] = include!(concat!(
     "/c73-development-policy-digest.rs"
 ));
 
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+const C76_OPERATOR_ROLE_BYTES: [u8; 32] =
+    include!(concat!(env!("OUT_DIR"), "/c76-operator-role.rs"));
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+// Hand-reviewed C7.6 trust root. Generated fixture output cannot replace this
+// key; build_c76 independently requires the public vector to match it exactly.
+const C76_ACTIVE_PUBLIC_KEY_BYTES: [u8; 32] = [
+    0x1d, 0xfa, 0xeb, 0x2e, 0x9d, 0x9f, 0xf3, 0xd5, 0xc4, 0xeb, 0x7f, 0x81, 0xa1, 0x19, 0x7d, 0xd0,
+    0x9f, 0x8a, 0x30, 0x1a, 0x5a, 0x31, 0xb6, 0xed, 0x15, 0x92, 0x1e, 0x93, 0x95, 0x74, 0x15, 0x4f,
+];
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+const C76_G0_DESCRIPTOR_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c76-g0.descriptor"));
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+const C76_G1_DESCRIPTOR_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c76-g1.descriptor"));
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+const C76_G0_GRAPH_EVIDENCE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c76-g0-graph.evidence"));
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+const C76_G1_GRAPH_EVIDENCE_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/c76-g1-graph.evidence"));
+
+macro_rules! c76_attachment_bytes {
+    ($artifact:ident, $evidence:ident, $version:literal, $index:literal) => {
+        #[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+        const $artifact: &[u8] = include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/c76-",
+            $version,
+            "-artifact-",
+            $index,
+            ".artifact"
+        ));
+        #[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+        const $evidence: &[u8] = include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/c76-",
+            $version,
+            "-evidence-",
+            $index,
+            ".evidence"
+        ));
+    };
+}
+
+c76_attachment_bytes!(C76_G0_ARTIFACT_0_BYTES, C76_G0_EVIDENCE_0_BYTES, "g0", "0");
+c76_attachment_bytes!(C76_G0_ARTIFACT_1_BYTES, C76_G0_EVIDENCE_1_BYTES, "g0", "1");
+c76_attachment_bytes!(C76_G0_ARTIFACT_2_BYTES, C76_G0_EVIDENCE_2_BYTES, "g0", "2");
+c76_attachment_bytes!(C76_G1_ARTIFACT_0_BYTES, C76_G1_EVIDENCE_0_BYTES, "g1", "0");
+c76_attachment_bytes!(C76_G1_ARTIFACT_1_BYTES, C76_G1_EVIDENCE_1_BYTES, "g1", "1");
+c76_attachment_bytes!(C76_G1_ARTIFACT_2_BYTES, C76_G1_EVIDENCE_2_BYTES, "g1", "2");
+
 const C53_STREAM_FILTER_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/c53-stream-filter.component.wasm"
@@ -1669,6 +2043,55 @@ pub const C73_AUTHENTICATED_ADMISSION_QEMU_ACCEPTANCE: C73AuthenticatedAdmission
             },
         ],
     };
+
+/// Independent current C7.6 operator policy.  It is intentionally a separate
+/// constant from both image candidates so boot recovery can construct the
+/// current validation policy without touching either candidate bundle.
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+pub const C76_GRAPH_OPERATOR_POLICY_QEMU_ACCEPTANCE: C76GraphOperatorPolicyPin =
+    C76GraphOperatorPolicyPin {
+        generation: 1,
+        operator_role: C76_OPERATOR_ROLE_BYTES,
+        active_signer: C76_ACTIVE_PUBLIC_KEY_BYTES,
+        exact_wit_source: include_str!("../artifacts/c65-async-chain.wit"),
+    };
+
+/// Initial graph image candidate, named only by the classified vacant branch.
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+pub const C76_G0_GRAPH_VERSION_QEMU_ACCEPTANCE: C76GraphVersionPin = C76GraphVersionPin {
+    ordinal: 0,
+    descriptor_bytes: C76_G0_DESCRIPTOR_BYTES,
+    artifact_bytes: [
+        C76_G0_ARTIFACT_0_BYTES,
+        C76_G0_ARTIFACT_1_BYTES,
+        C76_G0_ARTIFACT_2_BYTES,
+    ],
+    artifact_evidence_bytes: [
+        C76_G0_EVIDENCE_0_BYTES,
+        C76_G0_EVIDENCE_1_BYTES,
+        C76_G0_EVIDENCE_2_BYTES,
+    ],
+    graph_evidence_bytes: C76_G0_GRAPH_EVIDENCE_BYTES,
+};
+
+/// Successor graph image candidate, named only after physical G0 recovery and
+/// fresh current-policy/current-engine validation release its one-shot gate.
+#[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+pub const C76_G1_GRAPH_VERSION_QEMU_ACCEPTANCE: C76GraphVersionPin = C76GraphVersionPin {
+    ordinal: 1,
+    descriptor_bytes: C76_G1_DESCRIPTOR_BYTES,
+    artifact_bytes: [
+        C76_G1_ARTIFACT_0_BYTES,
+        C76_G1_ARTIFACT_1_BYTES,
+        C76_G1_ARTIFACT_2_BYTES,
+    ],
+    artifact_evidence_bytes: [
+        C76_G1_EVIDENCE_0_BYTES,
+        C76_G1_EVIDENCE_1_BYTES,
+        C76_G1_EVIDENCE_2_BYTES,
+    ],
+    graph_evidence_bytes: C76_G1_GRAPH_EVIDENCE_BYTES,
+};
 
 /// Exact validation-only graph policy root used by the C6.4 QEMU lifecycle
 /// proof. Resource authority is created later by the explicit kernel
@@ -2133,6 +2556,38 @@ mod tests {
         assert_eq!(new.executable_exports().count(), 0);
         assert_ne!(pin.old_relay_bytes(), pin.new_relay_bytes());
         assert_ne!(pin.old_relay_sha256(), pin.new_relay_sha256());
+    }
+
+    #[cfg(feature = "c76-graph-version-replacement-qemu-acceptance")]
+    #[test]
+    fn c76_every_evidence_value_uses_the_handwritten_active_signer() {
+        let policy = C76_GRAPH_OPERATOR_POLICY_QEMU_ACCEPTANCE;
+        assert_eq!(
+            policy.active_public_key_bytes(),
+            C76_ACTIVE_PUBLIC_KEY_BYTES
+        );
+        for version in [
+            C76_G0_GRAPH_VERSION_QEMU_ACCEPTANCE,
+            C76_G1_GRAPH_VERSION_QEMU_ACCEPTANCE,
+        ] {
+            for evidence in version
+                .artifact_evidence()
+                .expect("C7.6 leaf evidence must remain canonical")
+            {
+                assert_eq!(
+                    evidence.public_key().as_bytes(),
+                    &C76_ACTIVE_PUBLIC_KEY_BYTES
+                );
+            }
+            assert_eq!(
+                version
+                    .graph_evidence()
+                    .expect("C7.6 graph evidence must remain canonical")
+                    .public_key()
+                    .as_bytes(),
+                &C76_ACTIVE_PUBLIC_KEY_BYTES
+            );
+        }
     }
 
     #[cfg(feature = "c53-native-async-command-projection")]

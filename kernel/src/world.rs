@@ -658,6 +658,30 @@ impl World {
         self.components.lock().len()
     }
 
+    /// C7.6 receives only the explicit init-owned Storage V2 facade.  The
+    /// graph loader can classify V3 state, append its one bounded successor,
+    /// and request physical readback; no Cap, CSpace, raw durable identity,
+    /// or ambient store lookup crosses this handoff.
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    pub(crate) fn c76_graph_authority_journal(&self) -> Option<store::C76AuthorityJournal> {
+        let store = self.store?;
+        let init = self.spaces.get("init")?;
+        let lease = init
+            .0
+            .lock()
+            .lookup_lease::<store::StoreService>(store, Rights::READ)
+            .ok()?;
+        Some(lease.with(store::StoreService::c76_authority_journal))
+    }
+
+    /// Allocation-free registry cardinality used to prove that C7.6 has not
+    /// created a candidate principal before durable G1 readback and fresh
+    /// current-engine validation release the supervisor handoff.
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    pub(crate) fn c76_component_count(&self) -> usize {
+        self.components.lock().len()
+    }
+
     /// Spawn and register a task under a stable component identity.
     pub fn spawn_component(
         &self,

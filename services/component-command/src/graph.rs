@@ -14,7 +14,8 @@ use vibeos_component_admission::{
     ComponentGraphAsyncEdgeManifest, ComponentGraphAuthorityGrant, ComponentGraphInformationFlow,
     ComponentGraphInformationFlowError, ComponentGraphManifest,
     ComponentGraphReplacementAdmissionError, ComponentGraphReplacementEdgePolicy,
-    ComponentGraphResourceEdgeManifest, ComponentIdentity, InstanceLimits, ProfileIdentity,
+    ComponentGraphReplacementNodeAction, ComponentGraphResourceEdgeManifest, ComponentIdentity,
+    InstanceLimits, ProfileIdentity,
 };
 use vibeos_component_format::{
     ComponentGraphAccount, ComponentGraphNodeBudget, TrapCode, PROFILE_1_LIMITS,
@@ -560,6 +561,7 @@ pub struct ComponentGraphNodeReplacementTemplate {
     candidate: ComponentGraphPrincipalTemplate,
     target: ComponentGraphNodeId,
     max_replacements: u16,
+    node_action: ComponentGraphReplacementNodeAction,
     incident_edges: Vec<ComponentGraphReplacementEdgePolicy>,
     transient_account: ComponentGraphAccount,
 }
@@ -584,6 +586,7 @@ impl ComponentGraphNodeReplacementTemplate {
         let template = Self {
             target: manifest.target(),
             max_replacements: manifest.max_replacements(),
+            node_action: manifest.node_action(),
             transient_account: manifest.transient_account(),
             admitted,
             current,
@@ -604,6 +607,13 @@ impl ComponentGraphNodeReplacementTemplate {
 
     pub const fn max_replacements(&self) -> u16 {
         self.max_replacements
+    }
+
+    /// Exact lifecycle action authorized for the replaced node. C7.6 fixes
+    /// this to policy cancellation; it is not a Task or cancellation-token
+    /// identifier and cannot be used for ambient lookup.
+    pub const fn node_action(&self) -> ComponentGraphReplacementNodeAction {
+        self.node_action
     }
 
     pub fn incident_edges(&self) -> &[ComponentGraphReplacementEdgePolicy] {
@@ -648,6 +658,8 @@ impl ComponentGraphNodeReplacementTemplate {
         if self.target != manifest.target()
             || self.max_replacements != 1
             || self.max_replacements != manifest.max_replacements()
+            || self.node_action != ComponentGraphReplacementNodeAction::PolicyCancel
+            || self.node_action != manifest.node_action()
             || self.incident_edges != manifest.incident_edges()
             || self.transient_account != manifest.transient_account()
             || !Arc::ptr_eq(&self.current.admitted, self.admitted.current_graph_arc())
@@ -677,6 +689,7 @@ impl fmt::Debug for ComponentGraphNodeReplacementTemplate {
             .field("candidate_graph", &"<redacted>")
             .field("target", &self.target)
             .field("max_replacements", &self.max_replacements)
+            .field("node_action", &self.node_action)
             .field("incident_edges", &self.incident_edges)
             .field("transient_account", &self.transient_account)
             .field("runtime_ready", &self.runtime_ready())

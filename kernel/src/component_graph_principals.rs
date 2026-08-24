@@ -102,12 +102,20 @@ use crate::instance::{
 use crate::sync::SpinLock;
 use crate::HEAP;
 
-#[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+#[cfg(any(
+    feature = "wasm-c66-node-replacement-acceptance",
+    feature = "wasm-c76-graph-version-replacement-acceptance"
+))]
 #[path = "component_graph_replacement.rs"]
 mod c66;
 
 #[cfg(feature = "wasm-c66-node-replacement-acceptance")]
 pub(crate) use c66::run_qemu_acceptance as run_c66_qemu_acceptance;
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+pub(crate) use c66::{
+    stage_c76_current_graph, start_c76_durable_replacement, C76ReplacementReceipt, C76StagedCurrent,
+};
 
 /// Audited non-guest storage allowance for one graph-node lifecycle.
 ///

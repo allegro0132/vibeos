@@ -11,8 +11,10 @@
 
 extern crate alloc;
 
+mod c76;
 mod codec;
 
+pub use c76::*;
 pub use codec::*;
 
 use alloc::boxed::Box;
@@ -761,6 +763,13 @@ impl StoreService {
         AuthorityJournal {
             inner: self.inner.clone(),
         }
+    }
+
+    /// C7.6-only journal handoff. The returned move-only facade cannot invoke
+    /// generic recovery or append operations and releases only exact V3
+    /// typestate after a fresh physical authority recovery.
+    pub fn c76_authority_journal(&self) -> C76AuthorityJournal {
+        C76AuthorityJournal::new(self.authority_journal())
     }
 
     /// Sealed kernel-only reader for singleton configuration records. It

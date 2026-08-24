@@ -26,14 +26,23 @@
 //! bytes must pass the current Component/Core, WIT, manifest, adapter, limit,
 //! signer-policy, and validation-engine gates before an inert publication can
 //! exist; no component-owned CSpace, resource, task, or guest call is created.
+//!
+//! C7.6 gives a separate private Storage V3 namespace to one fixed three-node
+//! async graph. G0 and G1 each persist a complete signed graph descriptor,
+//! three signed Component artifacts, and graph evidence. A current supervisor
+//! projection is minted only from physical G0 bytes; a replacement projection
+//! is minted only after physical G1 readback and fresh validation of both
+//! versions. The pre-append candidate is therefore never runtime authority.
 
 #![no_std]
 
 extern crate alloc;
 
+mod graph_publication;
 mod publication;
 mod root;
 
+pub use graph_publication::*;
 pub use publication::*;
 pub use root::*;
 

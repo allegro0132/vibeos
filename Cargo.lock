@@ -462,6 +462,8 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
@@ -481,6 +483,12 @@ checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
  "hybrid-array",
 ]
+
+[[package]]
+name = "itoa"
+version = "1.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jitterentropy-rs"
@@ -605,6 +613,48 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
+name = "serde"
+version = "1.0.229"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "serde_core"
+version = "1.0.229"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67dca2c9c51e58a4791a4b1ed58308b39c64224d349a935ab5039aa360942a48"
+dependencies = [
+ "serde_derive",
+]
+
+[[package]]
+name = "serde_derive"
+version = "1.0.229"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7a5d71263a5a7d47b41f6b3f06ba276f10cc18b0931f1799f710578e2309348"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.3",
+]
+
+[[package]]
+name = "serde_json"
+version = "1.0.151"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
+]
 
 [[package]]
 name = "sha2"
@@ -870,6 +920,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-c81-preview1-componentizer"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "wasmparser 0.255.0",
+ "wat",
+ "wit-component",
+]
+
+[[package]]
 name = "vibeos-component-admission"
 version = "0.1.0"
 dependencies = [
@@ -880,6 +940,7 @@ dependencies = [
  "vibeos-component-runtime",
  "vibeos-core",
  "vibeos-wasm-runtime",
+ "wasmparser 0.255.0",
  "wat",
 ]
 
@@ -1341,6 +1402,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-metadata"
+version = "0.255.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d3b0da506f1b8514517972fbc47057b21273cb619290f51ea31403c157f896c"
+dependencies = [
+ "anyhow",
+ "indexmap",
+ "wasm-encoder",
+ "wasmparser 0.255.0",
+]
+
+[[package]]
 name = "wasmi"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1393,6 +1466,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8e329ef4b5d46e73b91d3ac6924417cad55a8cbbf869c199283383427c3320b"
 dependencies = [
  "bitflags 2.13.1",
+ "hashbrown",
  "indexmap",
  "semver",
 ]
@@ -1420,6 +1494,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "wit-component"
+version = "0.255.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0c8948006f57458ae3b2103f2e0e33847a6cdf4f5c763bbe7540fa89f3039f1"
+dependencies = [
+ "anyhow",
+ "bitflags 2.13.1",
+ "indexmap",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "wasm-encoder",
+ "wasm-metadata",
+ "wasmparser 0.255.0",
+ "wit-parser",
+]
+
+[[package]]
 name = "wit-parser"
 version = "0.255.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1431,7 +1524,11 @@ dependencies = [
  "indexmap",
  "log",
  "semver",
+ "serde",
+ "serde_derive",
+ "serde_json",
  "unicode-ident",
+ "wasmparser 0.255.0",
 ]
 
 [[package]]
@@ -1464,3 +1561,9 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"

@@ -98,6 +98,8 @@ const MANIFEST_HASH_DOMAIN: &[u8] = b"vibeos.component-artifact.manifest.v1\0";
 const WIT_SOURCE_HASH_DOMAIN: &[u8] = b"vibeos.component-artifact.wit-source.v1\0";
 const CORE_MODULE_HASH_DOMAIN: &[u8] = b"vibeos.component-artifact.core-module.v1\0";
 const ADAPTER_HASH_DOMAIN: &[u8] = b"vibeos.component-artifact.adapter.v1\0";
+const COMPONENT_ARTIFACT_RUNTIME_READY: bool = false;
+const _: () = assert!(!COMPONENT_ARTIFACT_RUNTIME_READY);
 
 macro_rules! redacted_digest {
     ($name:ident) => {
@@ -780,6 +782,8 @@ pub(crate) fn profile_code(profile: ProfileIdentity) -> Option<u16> {
         Some(2)
     } else if profile == ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE {
         Some(3)
+    } else if profile == ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED {
+        Some(4)
     } else {
         None
     }
@@ -790,6 +794,7 @@ pub(crate) fn profile_from_code(code: u16) -> Option<ProfileIdentity> {
         1 => Some(ProfileIdentity::PROFILE_1_SYNC),
         2 => Some(ProfileIdentity::PROFILE_1_ASYNC),
         3 => Some(ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE),
+        4 => Some(ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED),
         _ => None,
     }
 }
@@ -1262,7 +1267,7 @@ impl ComponentArtifactV1 {
 
     /// A canonical envelope is still unauthenticated and non-executable.
     pub const fn runtime_ready(&self) -> bool {
-        false
+        COMPONENT_ARTIFACT_RUNTIME_READY
     }
 
     /// Stable content commitment over every canonical header and body byte.

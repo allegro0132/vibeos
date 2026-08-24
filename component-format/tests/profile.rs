@@ -8,13 +8,18 @@ use vibeos_component_format::{
     NATIVE_ASYNC_RESOURCE_FREE_ARTIFACT_ABI_VERSION,
     NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_ABI_REVISION,
     NATIVE_ASYNC_RESOURCE_FREE_RUNTIME_ABI_VERSION, NATIVE_ASYNC_RESOURCE_FREE_WASI_REVISION,
-    PROFILE_1_LIMITS, RUNTIME_ABI_VERSION, SELECTED_WASI_CLI_TYPES_INTERFACE,
-    SELECTED_WASI_CLOCK_TYPES_INTERFACE, SELECTED_WASI_COMMAND_STDIN_INTERFACE,
-    SELECTED_WASI_COMMAND_STDOUT_INTERFACE, SELECTED_WASI_COMMAND_WIT, SELECTED_WASI_COMMAND_WORLD,
-    SELECTED_WASI_INTERFACE_MAPPINGS, SELECTED_WASI_INVOCATION_LIFECYCLE_INTERFACE,
-    SELECTED_WASI_MONOTONIC_CLOCK_INTERFACE, SELECTED_WASI_PACKAGES,
-    SELECTED_WASI_SECURE_RANDOM_INTERFACE, SYNC_WASM_TOOLS_REVISION, WASI_API_REVISION,
-    WASMPARSER_0_255_0_CHECKSUM, WASM_ENCODER_0_255_0_CHECKSUM, WIT_PACKAGES,
+    PREVIEW1_WRAPPED_ADAPTER_ASSET_BYTE_LEN, PREVIEW1_WRAPPED_ADAPTER_ASSET_NAME,
+    PREVIEW1_WRAPPED_ADAPTER_ASSET_PROVENANCE, PREVIEW1_WRAPPED_ADAPTER_ASSET_SHA256,
+    PREVIEW1_WRAPPED_ADAPTER_COMMIT, PREVIEW1_WRAPPED_ADAPTER_RELEASE,
+    PREVIEW1_WRAPPED_ADAPTER_REVISION, PREVIEW1_WRAPPED_ARTIFACT_ABI_VERSION,
+    PREVIEW1_WRAPPED_CANONICAL_FEATURES, PREVIEW1_WRAPPED_RUNTIME_ABI_VERSION,
+    PREVIEW1_WRAPPED_WASI_REVISION, PREVIEW1_WRAPPED_WASM_TOOLS_REVISION, PROFILE_1_LIMITS,
+    RUNTIME_ABI_VERSION, SELECTED_WASI_CLI_TYPES_INTERFACE, SELECTED_WASI_CLOCK_TYPES_INTERFACE,
+    SELECTED_WASI_COMMAND_STDIN_INTERFACE, SELECTED_WASI_COMMAND_STDOUT_INTERFACE,
+    SELECTED_WASI_COMMAND_WIT, SELECTED_WASI_COMMAND_WORLD, SELECTED_WASI_INTERFACE_MAPPINGS,
+    SELECTED_WASI_INVOCATION_LIFECYCLE_INTERFACE, SELECTED_WASI_MONOTONIC_CLOCK_INTERFACE,
+    SELECTED_WASI_PACKAGES, SELECTED_WASI_SECURE_RANDOM_INTERFACE, SYNC_WASM_TOOLS_REVISION,
+    WASI_API_REVISION, WASMPARSER_0_255_0_CHECKSUM, WASM_ENCODER_0_255_0_CHECKSUM, WIT_PACKAGES,
     WIT_PARSER_0_255_0_CHECKSUM,
 };
 
@@ -331,6 +336,108 @@ fn c53_native_async_resource_free_identity_and_feature_vector_are_exact() {
     assert_eq!(
         ProfileIdentity::PROFILE_1_ASYNC.stage,
         ProfileStage::ValidationOnly
+    );
+}
+
+#[test]
+fn c81_preview1_wrapped_identity_adapter_and_feature_vector_are_exact() {
+    let identity = ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED;
+
+    assert_eq!(PREVIEW1_WRAPPED_ARTIFACT_ABI_VERSION, 4);
+    assert_eq!(PREVIEW1_WRAPPED_RUNTIME_ABI_VERSION, 4);
+    assert_ne!(identity, ProfileIdentity::PROFILE_1_SYNC);
+    assert_ne!(identity, ProfileIdentity::PROFILE_1_ASYNC);
+    assert_ne!(
+        identity,
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE
+    );
+    assert_eq!(identity.artifact_abi, PREVIEW1_WRAPPED_ARTIFACT_ABI_VERSION);
+    assert_eq!(identity.component_profile, COMPONENT_PROFILE_VERSION);
+    assert_eq!(identity.core_profile, CORE_PROFILE_VERSION);
+    assert_eq!(identity.runtime_abi, PREVIEW1_WRAPPED_RUNTIME_ABI_VERSION);
+    assert_eq!(identity.core_revision, "webassembly-core-2.0-integer-v1");
+    assert_eq!(identity.component_revision, COMPONENT_MODEL_REVISION);
+    assert_eq!(identity.canonical_abi_revision, CANONICAL_ABI_REVISION);
+    assert_eq!(
+        identity.wasm_tools_revision,
+        PREVIEW1_WRAPPED_WASM_TOOLS_REVISION
+    );
+    assert_eq!(
+        PREVIEW1_WRAPPED_WASM_TOOLS_REVISION,
+        "wasm-tools-v1.255.0-76e20611d1920a7a39ca08983c6c77c3060de380"
+    );
+    assert_eq!(identity.wasi_revision, PREVIEW1_WRAPPED_WASI_REVISION);
+    assert_eq!(PREVIEW1_WRAPPED_WASI_REVISION, "wasi-v0.2.12");
+    assert_eq!(identity.stage, ProfileStage::ValidationOnly);
+    assert!(!identity.execution_enabled());
+    assert_eq!(
+        identity.canonical_features,
+        PREVIEW1_WRAPPED_CANONICAL_FEATURES
+    );
+    assert_eq!(
+        identity.canonical_features,
+        ProfileIdentity::PROFILE_1_SYNC.canonical_features
+    );
+    assert_eq!(identity.canonical_features.count_ones(), 3);
+
+    for feature in [
+        CanonicalAbiFeature::Utf8,
+        CanonicalAbiFeature::SyncLiftLower,
+        CanonicalAbiFeature::Resources,
+    ] {
+        assert!(feature.enabled_in_preview1_wrapped_profile(), "{feature:?}");
+    }
+    for feature in [
+        CanonicalAbiFeature::AsyncFunctions,
+        CanonicalAbiFeature::CallbackLift,
+        CanonicalAbiFeature::AsyncLower,
+        CanonicalAbiFeature::Futures,
+        CanonicalAbiFeature::Streams,
+        CanonicalAbiFeature::TaskBuiltins,
+        CanonicalAbiFeature::ContextI32,
+        CanonicalAbiFeature::Subtasks,
+        CanonicalAbiFeature::CooperativeYield,
+        CanonicalAbiFeature::WaitableSets,
+        CanonicalAbiFeature::Backpressure,
+        CanonicalAbiFeature::StackfulAsync,
+        CanonicalAbiFeature::MoreAsyncBuiltins,
+        CanonicalAbiFeature::Threading,
+        CanonicalAbiFeature::ErrorContext,
+        CanonicalAbiFeature::Gc,
+        CanonicalAbiFeature::Component64,
+        CanonicalAbiFeature::Utf16,
+    ] {
+        assert!(
+            !feature.enabled_in_preview1_wrapped_profile(),
+            "{feature:?}"
+        );
+    }
+
+    assert_eq!(PREVIEW1_WRAPPED_ADAPTER_RELEASE, "wasmtime-v48.0.0");
+    assert_eq!(
+        PREVIEW1_WRAPPED_ADAPTER_COMMIT,
+        "f1412a598f96f3c261a19118d94caffcb0c36235"
+    );
+    assert_eq!(
+        PREVIEW1_WRAPPED_ADAPTER_ASSET_NAME,
+        "wasi_snapshot_preview1.command.wasm"
+    );
+    assert_eq!(
+        PREVIEW1_WRAPPED_ADAPTER_REVISION,
+        "wasmtime-v48.0.0-f1412a598f96f3c261a19118d94caffcb0c36235/wasi_snapshot_preview1.command.wasm"
+    );
+    assert_eq!(PREVIEW1_WRAPPED_ADAPTER_ASSET_BYTE_LEN, 51_828);
+    assert_eq!(
+        PREVIEW1_WRAPPED_ADAPTER_ASSET_SHA256,
+        [
+            0x31, 0x6d, 0xfb, 0xf1, 0x71, 0x59, 0x1d, 0x69, 0xae, 0x41, 0x4e, 0xfd, 0x13, 0xb8,
+            0x59, 0x33, 0xca, 0x13, 0x52, 0x6a, 0xf8, 0xd9, 0xe0, 0xa7, 0x35, 0xab, 0x88, 0xae,
+            0x08, 0xfd, 0x85, 0xf0,
+        ]
+    );
+    assert_eq!(
+        PREVIEW1_WRAPPED_ADAPTER_ASSET_PROVENANCE,
+        "https://github.com/bytecodealliance/wasmtime/releases/download/v48.0.0/wasi_snapshot_preview1.command.wasm"
     );
 }
 

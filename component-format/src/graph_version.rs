@@ -75,6 +75,22 @@ const MANIFEST_HASH_OFFSET: usize = 160;
 const VERSION_COMMITMENT_OFFSET: usize = 192;
 const HEADER_RESERVED1_OFFSET: usize = 224;
 
+/// CGV1 remains limited to the three C0-C7 profiles. C8.1's Preview1-wrapped
+/// identity is intentionally an artifact-only validation surface and must not
+/// become durable graph-version input merely because CMP1 assigns it code 4.
+fn graph_profile_code(profile: ProfileIdentity) -> Option<u16> {
+    let code = profile_code(profile)?;
+    matches!(code, 1 | 2 | 3).then_some(code)
+}
+
+fn graph_profile_from_code(code: u16) -> Option<ProfileIdentity> {
+    if matches!(code, 1 | 2 | 3) {
+        profile_from_code(code)
+    } else {
+        None
+    }
+}
+
 const NODE_FIXED_LEN: usize = 280;
 const EDGE_ENCODED_LEN: usize = 8;
 const ASYNC_EDGE_ENCODED_LEN: usize = 24;
@@ -589,7 +605,7 @@ impl ComponentGraphVersionV1 {
         mut published_exports: Vec<ComponentGraphVersionPublishedExportV1>,
         replacement: ComponentGraphVersionReplacementV1,
     ) -> Result<Self, ComponentGraphVersionError> {
-        if profile_code(profile).is_none() {
+        if graph_profile_code(profile).is_none() {
             return Err(ComponentGraphVersionError::Profile);
         }
         if ordinal > u64::from(replacement.max_replacements)
@@ -865,7 +881,7 @@ impl ComponentGraphVersionV1 {
         put_u16(
             &mut out,
             PROFILE_CODE_OFFSET,
-            profile_code(self.profile).ok_or(ComponentGraphVersionError::Profile)?,
+            graph_profile_code(self.profile).ok_or(ComponentGraphVersionError::Profile)?,
         )?;
         put_u16(
             &mut out,
@@ -980,7 +996,7 @@ impl ComponentGraphVersionV1 {
             return Err(ComponentGraphVersionError::Reserved);
         }
 
-        let profile = profile_from_code(get_u16(bytes, PROFILE_CODE_OFFSET)?)
+        let profile = graph_profile_from_code(get_u16(bytes, PROFILE_CODE_OFFSET)?)
             .ok_or(ComponentGraphVersionError::Profile)?;
         if get_u16(bytes, PROFILE_STAGE_OFFSET)? != profile_stage_raw(profile.stage)
             || get_u16(bytes, ARTIFACT_ABI_OFFSET)? != profile.artifact_abi

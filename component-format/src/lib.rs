@@ -58,6 +58,33 @@ pub const NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_ABI_REVISION: &str =
     "canonical-abi-73b7ad51d3b5d6f1ef53c923d8c585e28b242bcc-vibe-async-callback-1-resource-free-exec-1";
 pub const NATIVE_ASYNC_RESOURCE_FREE_WASI_REVISION: &str =
     "wasi-not-selected-native-async-resource-free";
+
+/// C8.1's host-wrapped WASIp1 validation contract. The adapter is selected and
+/// applied off-device; this profile records the resulting Component as inert
+/// data and deliberately has no current validation/runtime engine binding.
+pub const PREVIEW1_WRAPPED_ARTIFACT_ABI_VERSION: u16 = 4;
+pub const PREVIEW1_WRAPPED_RUNTIME_ABI_VERSION: u16 = 4;
+pub const PREVIEW1_WRAPPED_WASM_TOOLS_REVISION: &str =
+    "wasm-tools-v1.255.0-76e20611d1920a7a39ca08983c6c77c3060de380";
+pub const PREVIEW1_WRAPPED_WASI_REVISION: &str = "wasi-v0.2.12";
+
+/// Exact Wasmtime release asset admitted as the C8.1 command adapter. These
+/// values describe provenance only; the asset bytes are never bundled or
+/// selected by this `no_std` format crate.
+pub const PREVIEW1_WRAPPED_ADAPTER_RELEASE: &str = "wasmtime-v48.0.0";
+pub const PREVIEW1_WRAPPED_ADAPTER_COMMIT: &str = "f1412a598f96f3c261a19118d94caffcb0c36235";
+pub const PREVIEW1_WRAPPED_ADAPTER_ASSET_NAME: &str = "wasi_snapshot_preview1.command.wasm";
+/// Canonical manifest token binding the release, source commit, and asset name.
+pub const PREVIEW1_WRAPPED_ADAPTER_REVISION: &str =
+    "wasmtime-v48.0.0-f1412a598f96f3c261a19118d94caffcb0c36235/wasi_snapshot_preview1.command.wasm";
+pub const PREVIEW1_WRAPPED_ADAPTER_ASSET_BYTE_LEN: usize = 51_828;
+pub const PREVIEW1_WRAPPED_ADAPTER_ASSET_SHA256: [u8; 32] = [
+    0x31, 0x6d, 0xfb, 0xf1, 0x71, 0x59, 0x1d, 0x69, 0xae, 0x41, 0x4e, 0xfd, 0x13, 0xb8, 0x59, 0x33,
+    0xca, 0x13, 0x52, 0x6a, 0xf8, 0xd9, 0xe0, 0xa7, 0x35, 0xab, 0x88, 0xae, 0x08, 0xfd, 0x85, 0xf0,
+];
+pub const PREVIEW1_WRAPPED_ADAPTER_ASSET_PROVENANCE: &str =
+    "https://github.com/bytecodealliance/wasmtime/releases/download/v48.0.0/wasi_snapshot_preview1.command.wasm";
+
 pub const SYNC_WASM_TOOLS_REVISION: &str =
     "wasm-tools-v1.255.0-76e20611d1920a7a39ca08983c6c77c3060de380";
 pub const ASYNC_WASM_TOOLS_REVISION: &str =
@@ -121,7 +148,17 @@ impl CanonicalAbiFeature {
     pub const fn enabled_in_native_async_resource_free_profile(self) -> bool {
         NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_FEATURES & self.bit() != 0
     }
+
+    pub const fn enabled_in_preview1_wrapped_profile(self) -> bool {
+        PREVIEW1_WRAPPED_CANONICAL_FEATURES & self.bit() != 0
+    }
 }
+
+/// C8.1 uses the synchronous Canonical ABI plus nominal resources. Wrapping a
+/// WASIp1 module does not implicitly enable any async or adjacent proposal.
+pub const PREVIEW1_WRAPPED_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
+    | CanonicalAbiFeature::SyncLiftLower.bit()
+    | CanonicalAbiFeature::Resources.bit();
 
 pub const ASYNC_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
     | CanonicalAbiFeature::SyncLiftLower.bit()
@@ -227,12 +264,43 @@ impl ProfileIdentity {
         stage: ProfileStage::ValidationOnly,
     };
 
+    /// Pinned C8.1 validation identity for a Core WASIp1 command wrapped
+    /// off-device with the exact Preview1 adapter above. It deliberately shares
+    /// the synchronous Component/Canonical ABI base while remaining permanently
+    /// non-executable under this identity.
+    pub const PROFILE_1_PREVIEW1_WRAPPED: Self = Self {
+        artifact_abi: PREVIEW1_WRAPPED_ARTIFACT_ABI_VERSION,
+        component_profile: COMPONENT_PROFILE_VERSION,
+        core_profile: CORE_PROFILE_VERSION,
+        runtime_abi: PREVIEW1_WRAPPED_RUNTIME_ABI_VERSION,
+        core_revision: CORE_SPEC_REVISION,
+        component_revision: COMPONENT_MODEL_REVISION,
+        canonical_abi_revision: CANONICAL_ABI_REVISION,
+        wasm_tools_revision: PREVIEW1_WRAPPED_WASM_TOOLS_REVISION,
+        wasi_revision: PREVIEW1_WRAPPED_WASI_REVISION,
+        canonical_features: PREVIEW1_WRAPPED_CANONICAL_FEATURES,
+        stage: ProfileStage::ValidationOnly,
+    };
+
     pub const PROFILE_1: Self = Self::PROFILE_1_SYNC;
 
     pub const fn execution_enabled(self) -> bool {
         matches!(self.stage, ProfileStage::Executable)
     }
 }
+
+const _: () = assert!(matches!(
+    ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED.stage,
+    ProfileStage::ValidationOnly
+));
+const _: () = assert!(!ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED.execution_enabled());
+const _: () = assert!(
+    ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED.artifact_abi
+        == PREVIEW1_WRAPPED_ARTIFACT_ABI_VERSION
+);
+const _: () = assert!(
+    ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED.runtime_abi == PREVIEW1_WRAPPED_RUNTIME_ABI_VERSION
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WitPackage {

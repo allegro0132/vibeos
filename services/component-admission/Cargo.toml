@@ -11,10 +11,12 @@ vibeos-component-host = { path = "../component-host" }
 vibeos-component-runtime = { path = "../../component-runtime" }
 vibeos-core = { path = "../../core" }
 vibeos-wasm-runtime = { path = "../../wasm-runtime" }
+wasmparser = { version = "=0.255.0", default-features = false, features = ["component-model", "features", "prefer-btree-collections", "validate"], optional = true }
 
 [features]
 default = []
 native-async-acceptance = ["vibeos-component-runtime/native-async-acceptance"]
+preview1-wrapped-admission = ["dep:wasmparser"]
 selected-wasi-admission = []
 
 [dev-dependencies]

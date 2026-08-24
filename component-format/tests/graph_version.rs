@@ -534,6 +534,45 @@ fn three_root_node_current_and_candidate_accounts_match_runtime_nesting() {
 }
 
 #[test]
+fn c81_preview1_wrapped_profile_is_artifact_only_and_graph_codec_rejects_it() {
+    let incident_edge = edges()[0];
+    let replacement = ComponentGraphVersionReplacementV1::new(
+        1,
+        1,
+        ComponentGraphVersionRetirementActionV1::PolicyCancel,
+        vec![ComponentGraphVersionIncidentEdgeV1::new(
+            incident_edge,
+            ComponentGraphVersionIncidentEdgeActionV1::RecreateFresh,
+        )],
+    )
+    .unwrap();
+    assert_eq!(
+        ComponentGraphVersionV1::new(
+            "preview1-wrapped-must-not-enter-cgv1",
+            ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED,
+            0,
+            None,
+            ComponentGraphVersionPolicyDigest::from_bytes(GRAPH_POLICY).unwrap(),
+            ComponentGraphAccount::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            replacement,
+        ),
+        Err(ComponentGraphVersionError::Profile)
+    );
+
+    let mut encoded = fixture(0, None, 1).descriptor.encode().unwrap();
+    encoded[PROFILE_CODE_OFFSET..PROFILE_CODE_OFFSET + 2].copy_from_slice(&4_u16.to_le_bytes());
+    assert_eq!(
+        ComponentGraphVersionV1::decode(&encoded),
+        Err(ComponentGraphVersionError::Profile)
+    );
+}
+
+#[test]
 fn fixed_shape_gate_is_separate_from_bounded_general_codec() {
     let (general, _, _) = descriptor(0, None, 1, false, true);
     assert_eq!(general.async_edges().len(), 1);

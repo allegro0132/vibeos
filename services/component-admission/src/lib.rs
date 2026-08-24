@@ -35,6 +35,25 @@ use vibeos_component_admission::{
 ```
 "#
 )]
+#![cfg_attr(
+    not(feature = "preview1-wrapped-admission"),
+    doc = r#"
+The host-only Preview1 wrapped admission surface is structurally absent by
+default:
+
+```compile_fail
+use vibeos_component_admission::admit_preview1_wrapped_candidate;
+```
+
+```compile_fail
+use vibeos_component_admission::AdmittedPreview1WrappedCandidate;
+```
+
+```compile_fail
+use vibeos_component_admission::Preview1WrappedAdmissionPolicy;
+```
+"#
+)]
 #![no_std]
 
 extern crate alloc;
@@ -43,11 +62,15 @@ mod authentication;
 mod graph;
 mod graph_authentication;
 mod information_flow;
+#[cfg(feature = "preview1-wrapped-admission")]
+mod preview1;
 
 pub use authentication::*;
 pub use graph::*;
 pub use graph_authentication::*;
 pub use information_flow::*;
+#[cfg(feature = "preview1-wrapped-admission")]
+pub use preview1::*;
 
 use alloc::{string::String, vec::Vec};
 use core::fmt;

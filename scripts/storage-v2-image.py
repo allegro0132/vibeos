@@ -116,7 +116,11 @@ def put_u64(data: bytearray, offset: int, value: int) -> None:
 
 
 def all_zero(data: bytes | memoryview) -> bool:
-    return not any(data)
+    # bytes.count runs in native code; the former Python-level any() walk made
+    # independent full-segment crash-corpus scans prohibitively expensive.
+    if isinstance(data, memoryview):
+        data = data.tobytes()
+    return data.count(0) == len(data)
 
 
 def require(condition: bool, message: str) -> None:

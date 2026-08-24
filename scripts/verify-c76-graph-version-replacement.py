@@ -1014,9 +1014,10 @@ def validate_exact_logical(
     }
 
 
-def configure_physical_parser() -> None:
-    migration.EXTERNAL_POLICY = POLICY_V3
-    migration.exact_policy_objects = exact_policy_objects
+PHYSICAL_AUTHORITY_POLICY = migration.AuthorityPolicy(
+    external_policy=POLICY_V3,
+    exact_objects=exact_policy_objects,
+)
 
 
 def verify_powered_off_image(
@@ -1024,16 +1025,20 @@ def verify_powered_off_image(
 ) -> dict[str, Any]:
     vectors = load_vectors(vectors_path)
     validate_vectors(vectors)
-    configure_physical_parser()
     require(len(image) % BLOCK == 0, "powered-off C7.6 image is not block aligned")
     require(not any(image[: migration.M4_FIRST * BLOCK]), "C7.6 unmanaged prefix changed")
     m4_start = migration.M4_FIRST * BLOCK
     m4_end = (migration.M4_FIRST + migration.M4_COUNT) * BLOCK
     require(not any(image[m4_start:m4_end]), "C7.6 wrote the frozen M4 range")
     physical = migration.verify_image(
-        image, bytes(migration.M4_FIRST * BLOCK), expect_native=True
+        image,
+        bytes(migration.M4_FIRST * BLOCK),
+        expect_native=True,
+        authority_policy=PHYSICAL_AUTHORITY_POLICY,
     )
-    status, evidence = migration.probe_v2(image)
+    status, evidence = migration.probe_v2(
+        image, authority_policy=PHYSICAL_AUTHORITY_POLICY
+    )
     require(status == "valid" and evidence is not None, "C7.6 V3 authority is not recoverable")
     recovered = evidence["recovered"]
     authority = recovered["authority"]
@@ -1467,8 +1472,11 @@ def selftest(vectors_path: Path) -> dict[str, Any]:
     )
     cases += 1
 
-    configure_physical_parser()
-    canonical = bytearray(migration.canonical_empty_authority_payload(2))
+    canonical = bytearray(
+        migration.canonical_empty_authority_payload(
+            2, authority_policy=PHYSICAL_AUTHORITY_POLICY
+        )
+    )
     policy_v2 = (
         b"vibeos.storage-v2.external-policy.v2\0"
         b"persistent-space=0x5053,slot=0,generation=0,rights=rgx,kind=0x43535043\0"
@@ -1479,7 +1487,11 @@ def selftest(vectors_path: Path) -> dict[str, Any]:
     )
     canonical[0x18:0x38] = hashlib.sha256(policy_v2).digest()
     expect_rejected(
-        lambda: migration.parse_authority_snapshot(bytes(canonical), 2),
+        lambda: migration.parse_authority_snapshot(
+            bytes(canonical),
+            2,
+            authority_policy=PHYSICAL_AUTHORITY_POLICY,
+        ),
         "policy-v2-as-v3",
     )
     cases += 1

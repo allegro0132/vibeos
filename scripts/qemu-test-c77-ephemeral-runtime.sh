@@ -10,6 +10,7 @@ QEMU_SMP=${QEMU_SMP:-4}
 QEMU_ACCEL=${QEMU_ACCEL:-tcg,thread=multi}
 C76_TIMEOUT=${C76_TIMEOUT:-240}
 C77_TIMEOUT=${C77_TIMEOUT:-240}
+C77_CAPTURE_ONLY=${C77_CAPTURE_ONLY:-0}
 
 C76_COMMON='runtime_ready=0 guest_calls=0 raw_ids=0 ambient_lookup=0 vsh=0'
 C76_BOOT1_PASS="WASM_C76_GRAPH_VERSION_REPLACEMENT PASS durable_state=installed_g0 versions=1 replacements=0 image_candidate=1 physical_readback=1 fresh_graphs=1 current_visible=1 candidate_runtime_objects=0 $C76_COMMON"
@@ -25,7 +26,33 @@ C77_PASS="WASM_C77_EPHEMERAL_RUNTIME PASS $C77_COMMON"
 C77_FAIL='WASM_C77_EPHEMERAL_RUNTIME FAIL'
 C77_FAMILY='WASM_C77_EPHEMERAL_RUNTIME'
 
-TEST_TMP=$(mktemp -d)
+if [ -n "${C77_EVIDENCE_DIR:-}" ]; then
+  TEST_TMP=$C77_EVIDENCE_DIR
+  if [ -L "$TEST_TMP" ]; then
+    echo 'FAIL qemu-test-c77-ephemeral-runtime: C77_EVIDENCE_DIR must not be a symlink' >&2
+    exit 1
+  fi
+  if [ -e "$TEST_TMP" ]; then
+    if [ ! -d "$TEST_TMP" ]; then
+      echo 'FAIL qemu-test-c77-ephemeral-runtime: C77_EVIDENCE_DIR is not a directory' >&2
+      exit 1
+    fi
+    if [ -n "$(find "$TEST_TMP" -mindepth 1 -maxdepth 1 -print -quit)" ]; then
+      echo 'FAIL qemu-test-c77-ephemeral-runtime: C77_EVIDENCE_DIR must be empty' >&2
+      exit 1
+    fi
+  else
+    mkdir -p "$TEST_TMP"
+    if [ -L "$TEST_TMP" ]; then
+      echo 'FAIL qemu-test-c77-ephemeral-runtime: C77_EVIDENCE_DIR resolved to a symlink' >&2
+      exit 1
+    fi
+  fi
+  TEST_TMP_OWNED=0
+else
+  TEST_TMP=$(mktemp -d)
+  TEST_TMP_OWNED=1
+fi
 DISK="$TEST_TMP/c77-storage-v3.raw"
 C76_G0_DISK="$TEST_TMP/c76-post-g0.raw"
 C76_G1_DISK="$TEST_TMP/c76-post-g1.raw"
@@ -55,7 +82,7 @@ cleanup() {
     kill "$QEMU_PID" 2>/dev/null || true
     wait "$QEMU_PID" 2>/dev/null || true
   fi
-  if [ "${KEEP_C77_EVIDENCE:-0}" = 1 ]; then
+  if [ "${KEEP_C77_EVIDENCE:-0}" = 1 ] || [ "$TEST_TMP_OWNED" -eq 0 ]; then
     echo "C7.7 evidence retained at $TEST_TMP" >&2
   else
     rm -rf -- "$TEST_TMP"
@@ -162,11 +189,17 @@ esac
 case "$C77_TIMEOUT" in
   ''|*[!0-9]*|0) fail 'C77_TIMEOUT must be a positive integer' ;;
 esac
+case "$C77_CAPTURE_ONLY" in
+  0|1) ;;
+  *) fail 'C77_CAPTURE_ONLY must be 0 or 1' ;;
+esac
 command -v "$QEMU_BIN" >/dev/null 2>&1 || fail "QEMU binary not found: $QEMU_BIN"
 
 # Includes the complete C7.6 mutation suite plus C7.7 marker/token/no-write
 # mutations. It imports no production Rust and writes no pycache.
-python3 -B scripts/verify-c77-ephemeral-runtime.py --selftest >&2
+if [ "$C77_CAPTURE_ONLY" -eq 0 ]; then
+  python3 -B scripts/verify-c77-ephemeral-runtime.py --selftest >&2
+fi
 
 toolchain=$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)
 [ -n "$toolchain" ] || fail 'rust-toolchain.toml has no pinned channel'
@@ -175,8 +208,10 @@ pinned_rustc=$(rustup which --toolchain "$toolchain" rustc)
 pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc)
 
 # Seed only through the real C7.6 image: G0 install, G1 replacement, then one
-# cold ExistingG1 boot. The narrow C7.6 powered-off verifier must accept the
-# complete seed before the C7.7 kernel is built or run.
+# cold ExistingG1 boot. The ordinary C7.7 gate requires the narrow C7.6
+# fixed-vector verdict before the C7.7 kernel runs. C7.8 uses capture-only
+# mode: it records these same real boots but leaves all disk/content verdicts
+# to the independent C7.8 parser.
 build_acceptance wasm-c76-graph-version-replacement-acceptance
 dd if=/dev/zero of="$DISK" bs=1m count=128 >/dev/null 2>&1
 run_boot 'C7.7 seed: C7.6 boot 1' "$C76_BOOT1_PASS" "$C76_FAIL" \
@@ -187,22 +222,26 @@ run_boot 'C7.7 seed: C7.6 boot 2' "$C76_BOOT2_PASS" "$C76_FAIL" \
 cp "$DISK" "$C76_G1_DISK"
 run_boot 'C7.7 seed: C7.6 boot 3' "$C76_BOOT3_PASS" "$C76_FAIL" \
   "$C76_FAMILY" "$C76_TIMEOUT" "$C76_BOOT3_LOG"
-cmp -s "$C76_G1_DISK" "$DISK" || \
-  fail 'C7.6 cold seed boot changed the committed G1 image'
+if [ "$C77_CAPTURE_ONLY" -eq 0 ]; then
+  cmp -s "$C76_G1_DISK" "$DISK" || \
+    fail 'C7.6 cold seed boot changed the committed G1 image'
+fi
 cp "$DISK" "$SEED_DISK"
 
-python3 -B scripts/verify-c76-graph-version-replacement.py \
-  "$SEED_DISK" \
-  --g0-image "$C76_G0_DISK" \
-  --g1-image "$C76_G1_DISK" \
-  --boot1-log "$C76_BOOT1_LOG" \
-  --boot2-log "$C76_BOOT2_LOG" \
-  --boot3-log "$C76_BOOT3_LOG" >"$SEED_EVIDENCE" || \
-  fail 'C7.6 verifier rejected the exact G1 seed'
-grep -F -q '"status":"ok"' "$SEED_EVIDENCE" || \
-  fail 'C7.6 seed verifier did not report exact success'
-grep -F -q '"c78_independent_disk_scope":false' "$SEED_EVIDENCE" || \
-  fail 'C7.6 seed verifier exceeded the reserved C7.8 scope'
+if [ "$C77_CAPTURE_ONLY" -eq 0 ]; then
+  python3 -B scripts/verify-c76-graph-version-replacement.py \
+    "$SEED_DISK" \
+    --g0-image "$C76_G0_DISK" \
+    --g1-image "$C76_G1_DISK" \
+    --boot1-log "$C76_BOOT1_LOG" \
+    --boot2-log "$C76_BOOT2_LOG" \
+    --boot3-log "$C76_BOOT3_LOG" >"$SEED_EVIDENCE" || \
+    fail 'C7.6 verifier rejected the exact G1 seed'
+  grep -F -q '"status":"ok"' "$SEED_EVIDENCE" || \
+    fail 'C7.6 seed verifier did not report exact success'
+  grep -F -q '"c78_independent_disk_scope":false' "$SEED_EVIDENCE" || \
+    fail 'C7.6 seed verifier exceeded the reserved C7.8 scope'
+fi
 
 # The authorized C7.7 feature consumes the already-proved exact G1 disk. Both
 # cold boots must leave every byte unchanged while rebuilding only fresh
@@ -210,15 +249,25 @@ grep -F -q '"c78_independent_disk_scope":false' "$SEED_EVIDENCE" || \
 build_acceptance wasm-c77-ephemeral-runtime-acceptance
 run_boot 'C7.7 cold runtime boot 1' "$C77_PASS" "$C77_FAIL" \
   "$C77_FAMILY" "$C77_TIMEOUT" "$C77_BOOT1_LOG"
-cmp -s "$SEED_DISK" "$DISK" || \
-  fail 'first C7.7 cold boot mutated the exact G1 seed'
+if [ "$C77_CAPTURE_ONLY" -eq 0 ]; then
+  cmp -s "$SEED_DISK" "$DISK" || \
+    fail 'first C7.7 cold boot mutated the exact G1 seed'
+fi
 cp "$DISK" "$C77_COLD1_DISK"
 run_boot 'C7.7 cold runtime boot 2' "$C77_PASS" "$C77_FAIL" \
   "$C77_FAMILY" "$C77_TIMEOUT" "$C77_BOOT2_LOG"
-cmp -s "$SEED_DISK" "$DISK" || \
-  fail 'second C7.7 cold boot mutated the exact G1 seed'
-cmp -s "$C77_COLD1_DISK" "$DISK" || \
-  fail 'C7.7 cold boots produced different powered-off images'
+if [ "$C77_CAPTURE_ONLY" -eq 0 ]; then
+  cmp -s "$SEED_DISK" "$DISK" || \
+    fail 'second C7.7 cold boot mutated the exact G1 seed'
+  cmp -s "$C77_COLD1_DISK" "$DISK" || \
+    fail 'C7.7 cold boots produced different powered-off images'
+fi
+
+if [ "$C77_CAPTURE_ONLY" -eq 1 ]; then
+  RESULT_REPORTED=1
+  echo 'PASS qemu-test-c77-ephemeral-runtime: five QEMU snapshots collected without a fixed-vector host verdict'
+  exit 0
+fi
 
 python3 -B scripts/verify-c77-ephemeral-runtime.py \
   "$DISK" \

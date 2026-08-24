@@ -8,6 +8,20 @@ use vibeos_component_format::{
 };
 
 #[test]
+fn c81_preview1_wrapped_profile_has_no_current_engine_or_activation_path() {
+    let profile = ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED;
+    assert!(!profile.execution_enabled());
+    assert!(current_validation_engine_identity(profile).is_none());
+
+    assert!(current_validation_engine_identity(ProfileIdentity::PROFILE_1_SYNC).is_some());
+    assert!(current_validation_engine_identity(ProfileIdentity::PROFILE_1_ASYNC).is_some());
+    assert!(current_validation_engine_identity(
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE
+    )
+    .is_some());
+}
+
+#[test]
 fn c75_current_engine_identity_is_exact_and_profile_bound() {
     let identity = current_validation_engine_identity(ProfileIdentity::PROFILE_1_SYNC).unwrap();
     assert_eq!(identity.profile(), ProfileIdentity::PROFILE_1_SYNC);

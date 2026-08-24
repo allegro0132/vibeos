@@ -1,0 +1,20 @@
+Adapter provenance and license notice
+=====================================
+
+SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+
+This notice applies to:
+  c81-wasmtime-v48.0.0-preview1-command-adapter.wasm
+
+The file is the official Wasmtime v48.0.0 release asset identified as:
+  wasmtime-v48.0.0-f1412a598f96f3c261a19118d94caffcb0c36235/wasi_snapshot_preview1.command.wasm
+
+Upstream project:
+  https://github.com/bytecodealliance/wasmtime
+
+Complete license text at the pinned release tag:
+  https://github.com/bytecodealliance/wasmtime/blob/v48.0.0/LICENSE
+
+Copyright Bytecode Alliance and Wasmtime contributors. Redistribution is
+subject to the upstream Apache License 2.0 with LLVM exception. This file is a
+provenance and license notice, not a copy of the complete upstream license.

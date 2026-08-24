@@ -6,10 +6,11 @@ use vibeos_component_format::{
     ComponentArtifactError, ComponentArtifactInstanceLimitsV1, ComponentArtifactInterfaceDirection,
     ComponentArtifactInterfaceV1, ComponentArtifactManifestV1, ComponentArtifactSignerPolicyKind,
     ComponentArtifactSignerPolicyV1, ComponentArtifactV1, ComponentArtifactWitPackageV1,
-    ProfileIdentity, COMPONENT_ARTIFACT_FORMAT_VERSION, COMPONENT_ARTIFACT_HASH_SHA256,
-    COMPONENT_ARTIFACT_HEADER_LEN, COMPONENT_ARTIFACT_MANIFEST_VERSION,
-    COMPONENT_ARTIFACT_OBJECT_KIND_RAW, COMPONENT_ARTIFACT_SIGNER_POLICY_VERSION,
-    MAX_COMPONENT_ARTIFACT_ENCODED_BYTES, PROFILE_1_LIMITS,
+    ProfileIdentity, ProfileStage, COMPONENT_ARTIFACT_FORMAT_VERSION,
+    COMPONENT_ARTIFACT_HASH_SHA256, COMPONENT_ARTIFACT_HEADER_LEN,
+    COMPONENT_ARTIFACT_MANIFEST_VERSION, COMPONENT_ARTIFACT_OBJECT_KIND_RAW,
+    COMPONENT_ARTIFACT_SIGNER_POLICY_VERSION, MAX_COMPONENT_ARTIFACT_ENCODED_BYTES,
+    PROFILE_1_LIMITS,
 };
 
 const COMPONENT_BYTES: &[u8] = b"\0asm\r\0\x01\0secret-component-body-c71";
@@ -187,6 +188,10 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
@@ -511,6 +516,7 @@ fn every_frozen_profile_variant_is_exact_and_stays_inert() {
         ProfileIdentity::PROFILE_1_SYNC,
         ProfileIdentity::PROFILE_1_ASYNC,
         ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+        ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED,
     ] {
         let expected = artifact(profile);
         let encoded = expected.encode().unwrap();
@@ -524,6 +530,103 @@ fn every_frozen_profile_variant_is_exact_and_stays_inert() {
         );
         assert!(!decoded.runtime_ready());
         assert_eq!(decoded.encode().unwrap(), encoded);
+    }
+}
+
+#[test]
+fn c81_preview1_wrapped_profile_code_roundtrips_and_adjacent_identities_fail_closed() {
+    let profile = ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED;
+    let encoded = artifact(profile).encode().unwrap();
+
+    assert_eq!(read_u16(&encoded, PROFILE_CODE_OFFSET), 4);
+    assert_eq!(read_u16(&encoded, PROFILE_STAGE_OFFSET), 2);
+    assert_eq!(read_u16(&encoded, ARTIFACT_ABI_OFFSET), 4);
+    assert_eq!(read_u16(&encoded, RUNTIME_ABI_OFFSET), 4);
+    assert_eq!(
+        read_u64(&encoded, CANONICAL_FEATURES_OFFSET),
+        profile.canonical_features
+    );
+    let decoded = ComponentArtifactV1::decode(&encoded).unwrap();
+    assert_eq!(decoded.profile(), profile);
+    assert!(!decoded.runtime_ready());
+    assert_eq!(decoded.encode().unwrap(), encoded);
+
+    let mut unknown_code = encoded;
+    write_u16(&mut unknown_code, PROFILE_CODE_OFFSET, 5);
+    assert_eq!(
+        ComponentArtifactV1::decode(&unknown_code),
+        Err(ComponentArtifactError::Profile)
+    );
+
+    let adjacent = [
+        {
+            let mut adjacent = profile;
+            adjacent.artifact_abi = adjacent.artifact_abi.wrapping_add(1);
+            adjacent
+        },
+        {
+            let mut adjacent = profile;
+            adjacent.component_profile = adjacent.component_profile.wrapping_add(1);
+            adjacent
+        },
+        {
+            let mut adjacent = profile;
+            adjacent.core_profile = adjacent.core_profile.wrapping_add(1);
+            adjacent
+        },
+        {
+            let mut adjacent = profile;
+            adjacent.runtime_abi = adjacent.runtime_abi.wrapping_add(1);
+            adjacent
+        },
+        {
+            let mut adjacent = profile;
+            adjacent.core_revision = "adjacent-core";
+            adjacent
+        },
+        {
+            let mut adjacent = profile;
+            adjacent.component_revision = "adjacent-component";
+            adjacent
+        },
+        {
+            let mut adjacent = profile;
+            adjacent.canonical_abi_revision = "adjacent-canonical";
+            adjacent
+        },
+        {
+            let mut adjacent = profile;
+            adjacent.wasm_tools_revision = "adjacent-wasm-tools";
+            adjacent
+        },
+        {
+            let mut adjacent = profile;
+            adjacent.wasi_revision = "adjacent-wasi";
+            adjacent
+        },
+        {
+            let mut adjacent = profile;
+            adjacent.canonical_features ^= 1;
+            adjacent
+        },
+        {
+            let mut adjacent = profile;
+            adjacent.stage = ProfileStage::Executable;
+            adjacent
+        },
+    ];
+    for adjacent in adjacent {
+        assert_eq!(
+            ComponentArtifactV1::new(
+                COMPONENT_BYTES,
+                adjacent,
+                limits(),
+                signer_policy(),
+                manifest(false),
+            ),
+            Err(ComponentArtifactError::Profile),
+            "accepted adjacent profile: {adjacent:?}"
+        );
     }
 }
 

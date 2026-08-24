@@ -11,10 +11,14 @@ extern crate alloc;
 mod artifact;
 mod authentication;
 mod engine;
+mod graph_authentication;
+mod graph_version;
 
 pub use artifact::*;
 pub use authentication::*;
 pub use engine::*;
+pub use graph_authentication::*;
+pub use graph_version::*;
 
 /// Canonical eight-byte prefix for a durable component artifact envelope.
 pub const ARTIFACT_MAGIC: [u8; 8] = *b"VIBECMP\0";

@@ -41,10 +41,12 @@ extern crate alloc;
 
 mod authentication;
 mod graph;
+mod graph_authentication;
 mod information_flow;
 
 pub use authentication::*;
 pub use graph::*;
+pub use graph_authentication::*;
 pub use information_flow::*;
 
 use alloc::{string::String, vec::Vec};

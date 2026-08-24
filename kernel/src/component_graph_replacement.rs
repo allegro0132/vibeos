@@ -1,8 +1,10 @@
-//! Boot-local C6.6 single-node replacement for one exact admitted graph.
+//! Boot-local C6.6/C7.6 single-node replacement for one exact admitted graph.
 //!
-//! The acceptance path is deliberately validation-only. It stages a fresh
-//! middle principal while the old three-node graph remains live, retires both
-//! incident routes and the old middle principal, rotates only the siblings'
+//! The acceptance path is deliberately validation-only. Stage A publishes
+//! only the current three-node graph and its two routes.
+//! Stage B is unreachable without the loader's move-only post-readback proof;
+//! only then may it stage a fresh middle principal, retire both incident
+//! routes and the old middle principal, rotate only the siblings'
 //! incident endpoints from their own current tasks, then atomically publishes
 //! the complete fresh route bundle and the replacement task. No guest bytes
 //! are instantiated or invoked.
@@ -15,22 +17,31 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use core::task::{Context, Poll};
 
+#[cfg(feature = "wasm-c66-node-replacement-acceptance")]
 use vibeos_component_admission::{
     admit_component_graph, admit_component_graph_replacement, ArtifactTrust, CallerAuthority,
-    ComponentArtifact, ComponentGraphAdmissionPolicy, ComponentGraphCyclePolicy,
-    ComponentGraphNodeAdmissionPolicy, ComponentGraphNodeReplacementPolicy,
-    ComponentGraphReplacementEdgeAction, ComponentGraphReplacementEdgePolicy, InstanceLimits,
+    ComponentArtifact, ComponentGraphAdmissionPolicy, ComponentGraphNodeAdmissionPolicy,
+    ComponentGraphNodeReplacementPolicy,
+};
+use vibeos_component_admission::{
+    ComponentGraphCyclePolicy, ComponentGraphReplacementEdgeAction,
+    ComponentGraphReplacementEdgePolicy, ComponentGraphReplacementNodeAction, InstanceLimits,
     ProfileIdentity,
 };
+#[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+use vibeos_component_command::ComponentGraphNodeReplacementTemplate;
 use vibeos_component_command::{
-    ComponentGraphNodeReplacementTemplate, ComponentGraphNodeTerminal,
-    ComponentGraphNodeTerminalReport,
+    ComponentGraphNodeTerminal, ComponentGraphNodeTerminalReport, ComponentGraphPrincipalTemplate,
 };
 use vibeos_component_host::{
     revoke_owned_supervised, ByteStream, ByteStreamReader, ByteStreamSupervisor, ByteStreamWriter,
     ComponentAuthority, StreamCloseOutcome, StreamCloseReason, StreamReceiveCommit,
     StreamReceiveDispatch, StreamSealedWakeToken, StreamSendDispatch, StreamWakeRegistration,
     StreamWakeSignal,
+};
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+use vibeos_component_loader::{
+    C76PolicyCancelPermit, C76SupervisorCurrentGraph, C76SupervisorGraphReplacement,
 };
 use vibeos_component_runtime::graph::{
     ComponentGraphEdgeSpec, ComponentGraphEntityIndex, ComponentGraphExportEndpoint,
@@ -41,11 +52,15 @@ use vibeos_component_runtime::host::{AtomicHostOperationSlot, HostOperationToken
 use vibeos_component_runtime::resource::{
     ResourceError, ResourceTable, ResourceToken, ResourceTypeId,
 };
+#[cfg(feature = "wasm-c66-node-replacement-acceptance")]
 use vibeos_component_runtime::world::WorldContract;
 use vibeos_core::cap::Rights;
-use vibeos_image_policy::{
-    ComponentGraphReplacementPinAction, C66_NODE_REPLACEMENT_QEMU_ACCEPTANCE,
-};
+#[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+use vibeos_image_policy::ComponentGraphReplacementPinAction;
+#[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+use vibeos_image_policy::C66_NODE_REPLACEMENT_QEMU_ACCEPTANCE;
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+use vibeos_image_policy::C76_GRAPH_OPERATOR_POLICY_QEMU_ACCEPTANCE;
 
 use crate::exec::{OneShotWaitQueue, PreparedTaskBatch, TaskHandle, TaskState};
 use crate::heap::{AllocationDomain, OwnerId};
@@ -56,9 +71,11 @@ use crate::instance::{
 };
 use crate::sync::SpinLock;
 
+#[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+use super::release_empty_domain;
 use super::{
     abort_pristine_registry_batch, checked_plan, completion_guest_calls, create_domains,
-    lifecycle_invariant_failed, publication_pairs, release_empty_domain, reserve_registry_batch,
+    lifecycle_invariant_failed, publication_pairs, reserve_registry_batch,
     reserve_resource_generations, retire_domain, ComponentGraphPrincipalLifecycleError,
     PRINCIPAL_TASK_NAME, RUNTIME_UNAVAILABLE_COMPLETION,
 };
@@ -383,6 +400,102 @@ const C66_HANDOFF_EMPTY: u8 = 0;
 const C66_HANDOFF_WRITING: u8 = 1;
 const C66_HANDOFF_READY: u8 = 2;
 const C66_HANDOFF_TAKEN: u8 = 3;
+
+/// One allocation-only Stage-A latch. It carries no candidate identity,
+/// resource, route, CSpace, arena, or task. Stage B may fill it exactly once
+/// with the already-complete hidden candidate transaction, then wake the
+/// exact SYSTEM supervisor published alongside the current graph.
+struct C66SupervisorActivationCell {
+    generation: u64,
+    state: AtomicU8,
+    value: UnsafeCell<MaybeUninit<C66Supervisor>>,
+}
+
+unsafe impl Send for C66SupervisorActivationCell {}
+unsafe impl Sync for C66SupervisorActivationCell {}
+
+impl Drop for C66SupervisorActivationCell {
+    fn drop(&mut self) {
+        if *self.state.get_mut() == C66_HANDOFF_READY {
+            // SAFETY: READY is published only after the sole writer fully
+            // initialized `value`, and TAKEN is published by the sole reader.
+            unsafe { self.value.get_mut().assume_init_drop() };
+        }
+    }
+}
+
+struct C66SupervisorActivationPublisher {
+    cell: Arc<C66SupervisorActivationCell>,
+}
+
+struct C66SupervisorActivationReceiver {
+    cell: Arc<C66SupervisorActivationCell>,
+}
+
+fn c66_supervisor_activation(
+    generation: u64,
+) -> (
+    C66SupervisorActivationPublisher,
+    C66SupervisorActivationReceiver,
+) {
+    let cell = Arc::new(C66SupervisorActivationCell {
+        generation,
+        state: AtomicU8::new(C66_HANDOFF_EMPTY),
+        value: UnsafeCell::new(MaybeUninit::uninit()),
+    });
+    (
+        C66SupervisorActivationPublisher {
+            cell: Arc::clone(&cell),
+        },
+        C66SupervisorActivationReceiver { cell },
+    )
+}
+
+impl C66SupervisorActivationPublisher {
+    fn publish(self, generation: u64, supervisor: C66Supervisor) -> Result<(), C66Supervisor> {
+        if self.cell.generation != generation
+            || self
+                .cell
+                .state
+                .compare_exchange(
+                    C66_HANDOFF_EMPTY,
+                    C66_HANDOFF_WRITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return Err(supervisor);
+        }
+        // SAFETY: the successful EMPTY -> WRITING transition gives this
+        // consumed publisher unique initialization access.
+        unsafe { (*self.cell.value.get()).write(supervisor) };
+        self.cell.state.store(C66_HANDOFF_READY, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl C66SupervisorActivationReceiver {
+    fn try_take(&mut self, generation: u64) -> Option<C66Supervisor> {
+        if self.cell.generation != generation
+            || self
+                .cell
+                .state
+                .compare_exchange(
+                    C66_HANDOFF_READY,
+                    C66_HANDOFF_TAKEN,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return None;
+        }
+        // SAFETY: READY proves initialization and the successful transition
+        // gives this sole receiver unique ownership of the value.
+        Some(unsafe { (*self.cell.value.get()).assume_init_read() })
+    }
+}
 
 struct C66FreshEndpointCell<T> {
     generation: u64,
@@ -1443,6 +1556,7 @@ struct C66ReplacementReceipt {
     reports: Vec<ComponentGraphNodeTerminalReport>,
     terminal: [C66TerminalReceipt; C66_INCARNATION_COUNT],
     candidate_staged: bool,
+    candidate_hidden_before_policy_cancel: bool,
     old_terminal_before_new_ready: bool,
     fresh_generation: bool,
     fresh_cspace: bool,
@@ -1451,6 +1565,12 @@ struct C66ReplacementReceipt {
     fresh_resources: bool,
     siblings_stable: usize,
     no_active_poll: bool,
+    policy_cancelled: bool,
+    old_routes_retired: u64,
+    fresh_routes: u64,
+    stale_replacement_tokens: u64,
+    late_wake_stale: u64,
+    graph_version_published: bool,
 }
 
 struct C66Completion {
@@ -1481,6 +1601,85 @@ impl C66Completion {
 struct C66Run {
     supervisor: TaskHandle,
     completion: Arc<C66Completion>,
+}
+
+/// Held across the exact old-target cancellation sequence and consumed only
+/// after terminal finalization. Construction is private to an exact validated
+/// replacement relation; this is neither a Task cancellation token nor a
+/// graph/runtime identifier.
+enum C66PolicyCancelPermit {
+    #[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+    C66 {
+        generation: u64,
+        target: ComponentGraphNodeId,
+    },
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    C76(C76PolicyCancelPermit),
+}
+
+/// Move-only proof that the loader permit was consumed after the exact old
+/// target reached terminal state. Candidate visibility consumes this marker.
+struct C66ConsumedPolicyCancel;
+
+impl C66PolicyCancelPermit {
+    fn consume_after_terminal(
+        self,
+        generation: u64,
+        target: ComponentGraphNodeId,
+    ) -> Result<C66ConsumedPolicyCancel, ComponentGraphPrincipalLifecycleError> {
+        #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+        let _ = (generation, target);
+        match self {
+            #[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+            Self::C66 {
+                generation: authorized_generation,
+                target: authorized_target,
+            } if authorized_generation == generation && authorized_target == target => {
+                Ok(C66ConsumedPolicyCancel)
+            }
+            #[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+            Self::C66 { .. } => Err(ComponentGraphPrincipalLifecycleError::NodeReplacementPolicy),
+            #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+            Self::C76(permit) => {
+                permit.consume();
+                Ok(C66ConsumedPolicyCancel)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct C66CurrentSeal {
+    artifacts: [[u8; 32]; C66_NODE_COUNT],
+    worlds: [[u8; 32]; C66_NODE_COUNT],
+    account: [u64; 13],
+}
+
+/// Move-only result of Stage A. At this boundary the current graph and its
+/// dormant SYSTEM supervisor are published, while no candidate domain,
+/// registry slot, task, resource table, or fresh route has been allocated.
+#[must_use = "hold the current graph lifetime or consume it through an exact replacement gate"]
+struct C66StagedCurrent {
+    current: C66CurrentSeal,
+    generation: u64,
+    supervisor: TaskHandle,
+    completion: Arc<C66Completion>,
+    activation: C66SupervisorActivationPublisher,
+    old_tokens: [InstanceToken; C66_NODE_COUNT],
+    old_handles: [TaskHandle; C66_NODE_COUNT],
+    sibling_domains: [AllocationDomain; 2],
+    source_probe: AcceptanceInstanceProbe,
+    old_target_probe: AcceptanceInstanceProbe,
+    sink_probe: AcceptanceInstanceProbe,
+    old_streams: [Arc<ByteStream>; 2],
+    old_supervisors: [Arc<ByteStreamSupervisor>; 2],
+    old_target_reader_token: ResourceToken,
+    old_target_writer_token: ResourceToken,
+    old_target_resource_generation: u64,
+    fresh_source_publisher: C66FreshEndpointPublisher<Arc<ByteStreamWriter>>,
+    fresh_sink_publisher: C66FreshEndpointPublisher<Arc<ByteStreamReader>>,
+    fresh_source_handoff_audit: C66FreshEndpointAudit<Arc<ByteStreamWriter>>,
+    fresh_sink_handoff_audit: C66FreshEndpointAudit<Arc<ByteStreamReader>>,
 }
 
 impl C66Run {
@@ -1520,6 +1719,7 @@ struct C66Supervisor {
     fresh_sink_handoff_audit: C66FreshEndpointAudit<Arc<ByteStreamReader>>,
     reports: Vec<ComponentGraphNodeTerminalReport>,
     completion: Arc<C66Completion>,
+    policy_cancel: C66PolicyCancelPermit,
     fresh_generation: bool,
     fresh_cspace: bool,
     fresh_task: bool,
@@ -1649,6 +1849,7 @@ impl C66Supervisor {
             fresh_sink_handoff_audit,
             reports,
             completion,
+            policy_cancel,
             fresh_generation,
             fresh_cspace,
             fresh_task,
@@ -1680,6 +1881,7 @@ impl C66Supervisor {
         if candidate_handle.is_published() || !C66_AUDIT.matches(generation) {
             fail(ComponentGraphPrincipalLifecycleError::NodeReplacementInvariant);
         }
+        let candidate_hidden_before_policy_cancel = !candidate_handle.is_published();
 
         if !c66_wait_stage(
             &C66_OLD_READY,
@@ -1708,6 +1910,9 @@ impl C66Supervisor {
             fail(ComponentGraphPrincipalLifecycleError::NodeReplacementInvariant);
         }
 
+        // Possession of the deferred loader permit authorizes this exact
+        // PolicyCancel sequence. It is deliberately not consumed until the
+        // old target has reached and finalized its terminal state.
         for supervisor in &supervisors[..2] {
             if supervisor.finalize(StreamCloseReason::Cancelled) != StreamCloseOutcome::Published
                 || !c66_increment(&C66_AUDIT.old_routes_retired, generation)
@@ -1731,6 +1936,15 @@ impl C66Supervisor {
             2,
         ) {
             Ok(receipt) => receipt,
+            Err(error) => {
+                fail(error);
+            }
+        };
+        let policy_cancelled = match policy_cancel.consume_after_terminal(
+            generation,
+            ComponentGraphNodeId::new(C66_TARGET_INDEX as u16),
+        ) {
+            Ok(consumed) => consumed,
             Err(error) => {
                 fail(error);
             }
@@ -1812,6 +2026,9 @@ impl C66Supervisor {
 
         let committed = c66_phase_word(generation, C66_PHASE_COMMITTED)
             .expect("validated C6.6 generation has a committed word");
+        // Type-level order: the only marker able to cross this visibility
+        // boundary is minted by post-terminal permit consumption above.
+        let C66ConsumedPolicyCancel = policy_cancelled;
         let mut candidate_handles =
             match unsafe { stage.publish_ready_if(&C66_GRAPH_CONTROL, committed) } {
                 Ok(handles) => handles,
@@ -2005,6 +2222,7 @@ impl C66Supervisor {
             reports,
             terminal,
             candidate_staged: true,
+            candidate_hidden_before_policy_cancel,
             old_terminal_before_new_ready,
             fresh_generation,
             fresh_cspace,
@@ -2013,6 +2231,15 @@ impl C66Supervisor {
             fresh_resources,
             siblings_stable,
             no_active_poll,
+            policy_cancelled: true,
+            old_routes_retired: C66_AUDIT.old_routes_retired.load(Ordering::Acquire),
+            fresh_routes: C66_AUDIT.fresh_routes.load(Ordering::Acquire),
+            stale_replacement_tokens: C66_AUDIT.stale_replacement_tokens.load(Ordering::Acquire),
+            late_wake_stale: C66_AUDIT.late_wake_stale.load(Ordering::Acquire),
+            // The lifecycle publishes only its boot-local candidate task.
+            // Durable G1 graph-version visibility belongs to the boot
+            // orchestrator after this receipt is consumed.
+            graph_version_published: false,
         }));
     }
 }
@@ -2030,6 +2257,229 @@ fn c66_edge(source: u16, target: u16) -> ComponentGraphEdgeSpec {
     )
 }
 
+#[cfg(all(
+    feature = "wasm-c66-node-replacement-acceptance",
+    not(feature = "wasm-c76-graph-version-replacement-acceptance")
+))]
+fn c66_expected_worlds_and_limits() -> ([&'static str; C66_NODE_COUNT], InstanceLimits) {
+    let pin = C66_NODE_REPLACEMENT_QEMU_ACCEPTANCE;
+    let limits = pin.limits();
+    (
+        [pin.source_world(), pin.relay_world(), pin.sink_world()],
+        InstanceLimits {
+            memory_bytes: limits.memory_bytes,
+            total_fuel: limits.total_fuel,
+            poll_quantum: limits.poll_quantum,
+            resources: limits.resources,
+        },
+    )
+}
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+fn c66_expected_worlds_and_limits() -> ([&'static str; C66_NODE_COUNT], InstanceLimits) {
+    let pin = C76_GRAPH_OPERATOR_POLICY_QEMU_ACCEPTANCE;
+    (pin.node_worlds(), pin.node_limits())
+}
+
+#[cfg(all(
+    feature = "wasm-c66-node-replacement-acceptance",
+    not(feature = "wasm-c76-graph-version-replacement-acceptance")
+))]
+fn c66_current_artifacts_are_known(artifacts: [[u8; 32]; C66_NODE_COUNT]) -> bool {
+    let pin = C66_NODE_REPLACEMENT_QEMU_ACCEPTANCE;
+    artifacts
+        == [
+            pin.source_sha256(),
+            pin.old_relay_sha256(),
+            pin.sink_sha256(),
+        ]
+        || artifacts
+            == [
+                pin.source_sha256(),
+                pin.new_relay_sha256(),
+                pin.sink_sha256(),
+            ]
+}
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+fn c66_current_artifacts_are_known(_artifacts: [[u8; 32]; C66_NODE_COUNT]) -> bool {
+    // The only C7.6 caller holds the loader's move-only proof minted by full
+    // physical readback plus current signer/policy/engine graph admission.
+    true
+}
+
+#[cfg(all(
+    feature = "wasm-c66-node-replacement-acceptance",
+    not(feature = "wasm-c76-graph-version-replacement-acceptance")
+))]
+fn c66_candidate_artifacts(
+    _candidate: &ComponentGraphPrincipalTemplate,
+) -> Result<[[u8; 32]; C66_NODE_COUNT], ComponentGraphPrincipalLifecycleError> {
+    let pin = C66_NODE_REPLACEMENT_QEMU_ACCEPTANCE;
+    Ok([
+        pin.source_sha256(),
+        pin.new_relay_sha256(),
+        pin.sink_sha256(),
+    ])
+}
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+fn c66_candidate_artifacts(
+    candidate: &ComponentGraphPrincipalTemplate,
+) -> Result<[[u8; 32]; C66_NODE_COUNT], ComponentGraphPrincipalLifecycleError> {
+    if candidate.principals().len() != C66_NODE_COUNT {
+        return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementPolicy);
+    }
+    Ok(core::array::from_fn(|index| {
+        *candidate.principals()[index].artifact().as_bytes()
+    }))
+}
+
+#[cfg(all(
+    feature = "wasm-c66-node-replacement-acceptance",
+    not(feature = "wasm-c76-graph-version-replacement-acceptance")
+))]
+fn c66_current_is_replaceable(current: [[u8; 32]; C66_NODE_COUNT]) -> bool {
+    let pin = C66_NODE_REPLACEMENT_QEMU_ACCEPTANCE;
+    current
+        == [
+            pin.source_sha256(),
+            pin.old_relay_sha256(),
+            pin.sink_sha256(),
+        ]
+}
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+fn c66_current_is_replaceable(_current: [[u8; 32]; C66_NODE_COUNT]) -> bool {
+    // G0 -> G1 linkage is already sealed into C76SupervisorGraphReplacement.
+    true
+}
+
+fn exact_c66_graph(
+    graph: &ComponentGraphPrincipalTemplate,
+    artifacts: [[u8; 32]; C66_NODE_COUNT],
+) -> Result<(), ComponentGraphPrincipalLifecycleError> {
+    let edges = [c66_edge(0, 1), c66_edge(1, 2)];
+    let published = [ComponentGraphPublishedExportSpec::new(
+        ComponentGraphExportEndpoint::new(
+            ComponentGraphNodeId::new(2),
+            ComponentGraphEntityIndex::new(0),
+        ),
+    )];
+    let (worlds, expected_limits) = c66_expected_worlds_and_limits();
+    if graph.revalidate().is_err()
+        || graph.runtime_ready()
+        || graph.profile() != ProfileIdentity::PROFILE_1_ASYNC
+        || graph.profile().execution_enabled()
+        || graph.principals().len() != C66_NODE_COUNT
+        || graph.manifest().cycle_policy() != ComponentGraphCyclePolicy::AcyclicOnly
+        || graph.manifest().edges() != edges
+        || graph.manifest().external_imports().len() != 0
+        || graph.manifest().published_exports() != published
+        || !graph.resource_edges().is_empty()
+        || !graph.grants().is_empty()
+        || graph.async_edges().len() != 2
+        || graph
+            .async_edges()
+            .iter()
+            .zip(edges)
+            .any(|(edge, expected)| {
+                edge.edge() != expected
+                    || edge.async_functions() != 1
+                    || edge.streams() != 4
+                    || edge.futures() != 4
+            })
+        || graph
+            .principals()
+            .iter()
+            .zip(artifacts.into_iter().zip(worlds))
+            .enumerate()
+            .any(|(index, (principal, (artifact, world)))| {
+                principal.id() != ComponentGraphNodeId::new(index as u16)
+                    || principal.artifact().as_bytes() != &artifact
+                    || principal.profile() != ProfileIdentity::PROFILE_1_ASYNC
+                    || principal.world() != world
+                    || principal.nesting() != ComponentGraphNesting::Root
+                    || principal.limits() != expected_limits
+            })
+    {
+        return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementPolicy);
+    }
+    Ok(())
+}
+
+fn exact_c66_stage_graph(
+    current: &ComponentGraphPrincipalTemplate,
+) -> Result<C66CurrentSeal, ComponentGraphPrincipalLifecycleError> {
+    if current.principals().len() != C66_NODE_COUNT {
+        return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementPolicy);
+    }
+    let artifacts =
+        core::array::from_fn(|index| *current.principals()[index].artifact().as_bytes());
+    if !c66_current_artifacts_are_known(artifacts) {
+        return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementPolicy);
+    }
+    exact_c66_graph(current, artifacts)?;
+    let nodes = current.manifest().nodes();
+    let account = current.account();
+    Ok(C66CurrentSeal {
+        artifacts,
+        worlds: core::array::from_fn(|index| nodes[index].world_contract_commitment()),
+        account: [
+            account.nodes,
+            account.edges,
+            account.maximum_nesting,
+            account.external_imports,
+            account.published_exports,
+            account.component_bytes,
+            account.core_instances,
+            account.adapters,
+            account.resource_types,
+            account.resource_slots,
+            account.memory_bytes,
+            account.total_fuel,
+            account.maximum_poll_quantum,
+        ],
+    })
+}
+
+fn exact_c66_replacement(
+    current: &ComponentGraphPrincipalTemplate,
+    candidate: &ComponentGraphPrincipalTemplate,
+    node_action: ComponentGraphReplacementNodeAction,
+    max_replacements: u16,
+    incident_edges: &[ComponentGraphReplacementEdgePolicy],
+    staged: C66CurrentSeal,
+) -> Result<(), ComponentGraphPrincipalLifecycleError> {
+    let current_seal = exact_c66_stage_graph(current)?;
+    let candidate_artifacts = c66_candidate_artifacts(candidate)?;
+    exact_c66_graph(candidate, candidate_artifacts)?;
+    let expected_edges = [c66_edge(0, 1), c66_edge(1, 2)];
+    if !c66_current_is_replaceable(current_seal.artifacts)
+        || current_seal.artifacts != staged.artifacts
+        || current_seal.worlds != staged.worlds
+        || current_seal.account != staged.account
+        || node_action != ComponentGraphReplacementNodeAction::PolicyCancel
+        || max_replacements != 1
+        || incident_edges.len() != 2
+        || incident_edges
+            .iter()
+            .zip(expected_edges)
+            .any(|(policy, edge)| {
+                policy.edge != edge
+                    || policy.action != ComponentGraphReplacementEdgeAction::RecreateFresh
+            })
+        || current.principals()[0].artifact() != candidate.principals()[0].artifact()
+        || current.principals()[2].artifact() != candidate.principals()[2].artifact()
+        || current.principals()[C66_TARGET_INDEX].artifact()
+            == candidate.principals()[C66_TARGET_INDEX].artifact()
+    {
+        return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementPolicy);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wasm-c66-node-replacement-acceptance")]
 fn exact_c66_template(
     template: &ComponentGraphNodeReplacementTemplate,
 ) -> Result<(), ComponentGraphPrincipalLifecycleError> {
@@ -2041,6 +2491,7 @@ fn exact_c66_template(
         || template.runtime_ready()
         || template.target() != ComponentGraphNodeId::new(C66_TARGET_INDEX as u16)
         || template.max_replacements() != 1
+        || template.node_action() != ComponentGraphReplacementNodeAction::PolicyCancel
         || template.incident_edges().len() != 2
         || template
             .incident_edges()
@@ -2110,8 +2561,9 @@ fn exact_c66_template(
     Ok(())
 }
 
-fn c66_semantic_reports(
-    template: &ComponentGraphNodeReplacementTemplate,
+fn c66_semantic_reports_for(
+    current: &ComponentGraphPrincipalTemplate,
+    candidate: &ComponentGraphPrincipalTemplate,
 ) -> Result<Vec<ComponentGraphNodeTerminalReport>, ComponentGraphPrincipalLifecycleError> {
     let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
     let result = (|| {
@@ -2120,26 +2572,22 @@ fn c66_semantic_reports(
             .try_reserve_exact(C66_INCARNATION_COUNT)
             .map_err(|_| ComponentGraphPrincipalLifecycleError::Allocation)?;
         reports.push(
-            template
-                .current_graph()
+            current
                 .supervisor_prepared_async_unavailable_report(ComponentGraphNodeId::new(0), 1)
                 .map_err(|_| ComponentGraphPrincipalLifecycleError::NodeReplacementPolicy)?,
         );
         reports.push(
-            template
-                .current_graph()
+            current
                 .supervisor_prepared_async_unavailable_report(ComponentGraphNodeId::new(1), 2)
                 .map_err(|_| ComponentGraphPrincipalLifecycleError::NodeReplacementPolicy)?,
         );
         reports.push(
-            template
-                .candidate_graph()
+            candidate
                 .supervisor_prepared_async_unavailable_report(ComponentGraphNodeId::new(1), 2)
                 .map_err(|_| ComponentGraphPrincipalLifecycleError::NodeReplacementPolicy)?,
         );
         reports.push(
-            template
-                .current_graph()
+            current
                 .supervisor_prepared_async_unavailable_report(ComponentGraphNodeId::new(2), 1)
                 .map_err(|_| ComponentGraphPrincipalLifecycleError::NodeReplacementPolicy)?,
         );
@@ -2220,49 +2668,32 @@ fn c66_prepare_relay(
     .map(|(reader, writer)| (reader.into_authority(), writer.into_authority()))
     .ok_or(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup)
 }
-
-fn start_c66_node_replacement(
-    template: Arc<ComponentGraphNodeReplacementTemplate>,
-) -> Result<C66Run, ComponentGraphPrincipalLifecycleError> {
-    {
+fn stage_c66_current_graph(
+    current: &ComponentGraphPrincipalTemplate,
+) -> Result<C66StagedCurrent, ComponentGraphPrincipalLifecycleError> {
+    let current_seal = {
         let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
-        let validation = exact_c66_template(&template);
+        let seal = exact_c66_stage_graph(current);
         system.restore();
-        validation?;
-    }
-    let reports = c66_semantic_reports(&template)?;
-    let mut current_plans = checked_plan(template.current_graph())?;
-    let candidate_plans = checked_plan(template.candidate_graph())?;
-    if current_plans.len() != C66_NODE_COUNT || candidate_plans.len() != C66_NODE_COUNT {
+        seal?
+    };
+    let mut current_plans = checked_plan(current)?;
+    if current_plans.len() != C66_NODE_COUNT {
         return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementPolicy);
     }
-    let mut candidate_plan = candidate_plans[C66_TARGET_INDEX];
-    let resource_generation = reserve_resource_generations(C66_INCARNATION_COUNT)?;
+    let resource_generation = reserve_resource_generations(C66_NODE_COUNT)?;
     for (index, plan) in current_plans.iter_mut().enumerate() {
         plan.resource_generation = resource_generation
             .checked_add(index as u64)
             .ok_or(ComponentGraphPrincipalLifecycleError::ResourceGenerationExhausted)?;
     }
-    candidate_plan.resource_generation = resource_generation
-        .checked_add(C66_NODE_COUNT as u64)
-        .ok_or(ComponentGraphPrincipalLifecycleError::ResourceGenerationExhausted)?;
-
-    let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
-    let mut all_plans = Vec::new();
-    if all_plans.try_reserve_exact(C66_INCARNATION_COUNT).is_err() {
-        system.restore();
-        return Err(ComponentGraphPrincipalLifecycleError::Allocation);
-    }
-    all_plans.extend_from_slice(&current_plans);
-    all_plans.push(candidate_plan);
-    system.restore();
-    let domains = create_domains(&all_plans)?;
-    if domains.len() != C66_INCARNATION_COUNT {
+    let domains = create_domains(&current_plans)?;
+    if domains.len() != C66_NODE_COUNT {
         let _ = super::release_empty_domains(&domains);
         return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementCapacity);
     }
     let tokens = match reserve_registry_batch(&domains) {
-        Ok(tokens) if tokens.len() == C66_INCARNATION_COUNT => tokens,
+        Ok(tokens) if tokens.len() == C66_NODE_COUNT => tokens,
         Ok(tokens) => {
             let _ = abort_pristine_registry_batch(&tokens, &domains);
             return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementCapacity);
@@ -2272,61 +2703,34 @@ fn start_c66_node_replacement(
             return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementCapacity);
         }
     };
-    let pairs = (|| {
-        let old = publication_pairs(&tokens[..C66_NODE_COUNT], &domains[..C66_NODE_COUNT])?;
-        let candidate = publication_pairs(
-            core::slice::from_ref(&tokens[C66_NODE_COUNT]),
-            core::slice::from_ref(&domains[C66_NODE_COUNT]),
-        )?;
-        Ok((old, candidate))
-    })();
-    let (old_pairs, candidate_pairs) = match pairs {
+    let old_pairs = match publication_pairs(&tokens, &domains) {
         Ok(pairs) => pairs,
         Err(error) => {
             abort_pristine_registry_batch(&tokens, &domains)?;
             return Err(error);
         }
     };
-    let mut candidate_batch = PreparedTaskBatch::new();
     let mut old_batch = PreparedTaskBatch::new();
-    let scheduler_reserved = candidate_batch
-        .reserve_managed_publication(&candidate_pairs, 0)
-        .and_then(|_| candidate_batch.reserve_managed_task_ledgers(1, 0, 0))
-        .is_ok()
-        && old_batch
-            .reserve_managed_publication(&old_pairs, 1)
-            .and_then(|_| old_batch.reserve_managed_task_ledgers(1, 5, 1))
-            .is_ok();
-    if !scheduler_reserved {
-        drop(candidate_batch);
+    if old_batch
+        .reserve_managed_publication(&old_pairs, 1)
+        .and_then(|_| old_batch.reserve_managed_task_ledgers(1, 5, 1))
+        .is_err()
+    {
         drop(old_batch);
         abort_pristine_registry_batch(&tokens, &domains)?;
         return Err(ComponentGraphPrincipalLifecycleError::SchedulerReservation);
     }
 
-    let streams = [
-        ByteStream::new(),
-        ByteStream::new(),
-        ByteStream::new(),
-        ByteStream::new(),
-    ];
-    let supervisors = [
-        streams[0].supervisor(),
-        streams[1].supervisor(),
-        streams[2].supervisor(),
-        streams[3].supervisor(),
-    ];
+    // Stage A allocates exactly the two current incident routes.
+    let streams = [ByteStream::new(), ByteStream::new()];
+    let supervisors = [streams[0].supervisor(), streams[1].supervisor()];
     let old_source_writer = streams[0].writer();
     let old_target_reader = streams[0].reader();
     let old_target_writer = streams[1].writer();
     let old_sink_reader = streams[1].reader();
-    let fresh_source_writer = streams[2].writer();
-    let candidate_reader = streams[2].reader();
-    let candidate_writer = streams[3].writer();
-    let fresh_sink_reader = streams[3].reader();
 
     let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
-    let table_result = (|| {
+    let tables = (|| {
         let mut source = ResourceTable::new(
             current_plans[0].resource_generation,
             current_plans[0].resource_slots,
@@ -2342,46 +2746,34 @@ fn start_c66_node_replacement(
             current_plans[2].resource_slots,
         )
         .map_err(|_| ComponentGraphPrincipalLifecycleError::NodeReplacementSetup)?;
-        let candidate = ResourceTable::new(
-            candidate_plan.resource_generation,
-            candidate_plan.resource_slots,
-        )
-        .map_err(|_| ComponentGraphPrincipalLifecycleError::NodeReplacementSetup)?;
         if !c66_preflight_reusable_slot(&mut source) || !c66_preflight_reusable_slot(&mut sink) {
             return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
         }
-        Ok((source, old_target, sink, candidate))
+        Ok((source, old_target, sink))
     })();
     system.restore();
-    let (mut source_table, mut old_target_table, mut sink_table, mut candidate_table) =
-        match table_result {
-            Ok(tables) => tables,
-            Err(error) => {
-                drop(candidate_batch);
-                drop(old_batch);
-                abort_pristine_registry_batch(&tokens, &domains)?;
-                return Err(error);
-            }
-        };
-
+    let (mut source_table, mut old_target_table, mut sink_table) = match tables {
+        Ok(tables) => tables,
+        Err(error) => {
+            drop(old_batch);
+            abort_pristine_registry_batch(&tokens, &domains)?;
+            return Err(error);
+        }
+    };
     let authorities = (|| {
         let source = c66_prepare_writer(tokens[0], old_source_writer)?;
         let old_target = c66_prepare_relay(tokens[1], old_target_reader, old_target_writer)?;
         let sink = c66_prepare_reader(tokens[2], old_sink_reader)?;
-        let candidate = c66_prepare_relay(tokens[3], candidate_reader, candidate_writer)?;
-        Ok((source, old_target, sink, candidate))
+        Ok((source, old_target, sink))
     })();
-    let (source_authority, old_target_authorities, sink_authority, candidate_authorities) =
-        match authorities {
-            Ok(authorities) => authorities,
-            Err(error) => {
-                drop(candidate_batch);
-                drop(old_batch);
-                abort_pristine_registry_batch(&tokens, &domains)?;
-                return Err(error);
-            }
-        };
-
+    let (source_authority, old_target_authorities, sink_authority) = match authorities {
+        Ok(authorities) => authorities,
+        Err(error) => {
+            drop(old_batch);
+            abort_pristine_registry_batch(&tokens, &domains)?;
+            return Err(error);
+        }
+    };
     let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
     let inserted = (|| {
         let source = source_table
@@ -2396,77 +2788,33 @@ fn start_c66_node_replacement(
         let sink = sink_table
             .insert_owned(C66_SINK_READER_TYPE, sink_authority)
             .map_err(|_| ComponentGraphPrincipalLifecycleError::NodeReplacementSetup)?;
-        let candidate_reader = candidate_table
-            .insert_owned(C66_RELAY_READER_TYPE, candidate_authorities.0)
-            .map_err(|_| ComponentGraphPrincipalLifecycleError::NodeReplacementSetup)?;
-        let candidate_writer = candidate_table
-            .insert_owned(C66_RELAY_WRITER_TYPE, candidate_authorities.1)
-            .map_err(|_| ComponentGraphPrincipalLifecycleError::NodeReplacementSetup)?;
-        Ok((
-            source,
-            old_target_reader,
-            old_target_writer,
-            sink,
-            candidate_reader,
-            candidate_writer,
-        ))
+        Ok((source, old_target_reader, old_target_writer, sink))
     })();
     system.restore();
-    let (
-        source_token,
-        old_target_reader_token,
-        old_target_writer_token,
-        sink_token,
-        candidate_reader_token,
-        candidate_writer_token,
-    ) = match inserted {
-        Ok(tokens) => tokens,
-        Err(error) => {
-            drop(candidate_batch);
-            drop(old_batch);
-            abort_pristine_registry_batch(&tokens, &domains)?;
-            return Err(error);
-        }
-    };
-    let stale_replacement_tokens = candidate_table
-        .contains(old_target_reader_token, C66_RELAY_READER_TYPE)
-        == Err(ResourceError::WrongInstance)
-        && candidate_table.contains(old_target_writer_token, C66_RELAY_WRITER_TYPE)
-            == Err(ResourceError::WrongInstance);
-    let fresh_resources = stale_replacement_tokens
-        && source_table.len() == 1
-        && old_target_table.len() == 2
-        && sink_table.len() == 1
-        && candidate_table.len() == 2
-        && candidate_table.instance_generation() != old_target_table.instance_generation()
-        && !Arc::ptr_eq(&streams[0], &streams[2])
-        && !Arc::ptr_eq(&streams[1], &streams[3]);
-    if !fresh_resources {
-        drop(candidate_batch);
+    let (source_token, old_target_reader_token, old_target_writer_token, sink_token) =
+        match inserted {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                drop(old_batch);
+                abort_pristine_registry_batch(&tokens, &domains)?;
+                return Err(error);
+            }
+        };
+    if source_table.len() != 1 || old_target_table.len() != 2 || sink_table.len() != 1 {
         drop(old_batch);
         abort_pristine_registry_batch(&tokens, &domains)?;
         return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
     }
-
     let probes = (
         super::super::component_instances::registry().acceptance_probe(tokens[0]),
         super::super::component_instances::registry().acceptance_probe(tokens[1]),
         super::super::component_instances::registry().acceptance_probe(tokens[2]),
-        super::super::component_instances::registry().acceptance_probe(tokens[3]),
     );
-    let (Some(source_probe), Some(old_target_probe), Some(sink_probe), Some(candidate_probe)) =
-        probes
-    else {
-        drop(candidate_batch);
+    let (Some(source_probe), Some(old_target_probe), Some(sink_probe)) = probes else {
         drop(old_batch);
         abort_pristine_registry_batch(&tokens, &domains)?;
         return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
     };
-    let fresh_generation = !tokens[1].shares_stable_slot(tokens[3]);
-    let fresh_cspace = !old_target_probe.same_space_object(candidate_probe)
-        && !old_target_probe.same_cspace_lock(candidate_probe)
-        && !old_target_probe.same_cspace_identity(candidate_probe);
-    let fresh_arena = domains[1].arena != domains[3].arena;
 
     let generation =
         match NEXT_C66_GENERATION.try_update(Ordering::AcqRel, Ordering::Acquire, |next| {
@@ -2475,36 +2823,18 @@ fn start_c66_node_replacement(
         }) {
             Ok(generation) => generation,
             Err(_) => {
-                drop(candidate_batch);
                 drop(old_batch);
                 abort_pristine_registry_batch(&tokens, &domains)?;
                 return Err(ComponentGraphPrincipalLifecycleError::ResourceGenerationExhausted);
             }
         };
-    if !C66_AUDIT.reset(generation)
-        || !c66_increment(&C66_AUDIT.stale_replacement_tokens, generation)
-        || !c66_increment(&C66_AUDIT.stale_replacement_tokens, generation)
-    {
-        drop(candidate_batch);
+    if !C66_AUDIT.reset(generation) {
         drop(old_batch);
         abort_pristine_registry_batch(&tokens, &domains)?;
         return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
     }
 
-    drop(template);
     let registry = super::super::component_instances::registry();
-    unsafe {
-        candidate_batch.prepare_managed_instance_owned(
-            tokens[3],
-            domains[3],
-            PRINCIPAL_TASK_NAME,
-            C66Task {
-                token: tokens[3],
-                generation,
-            },
-        );
-    }
-    let candidate_handle = candidate_batch.prepared_handles()[0].clone();
     for index in 0..C66_NODE_COUNT {
         unsafe {
             old_batch.prepare_managed_instance_owned(
@@ -2523,11 +2853,8 @@ fn start_c66_node_replacement(
         old_batch.prepared_handles()[1].clone(),
         old_batch.prepared_handles()[2].clone(),
     ];
-    let fresh_task = old_handles[1].id() != candidate_handle.id()
-        && !old_handles[1].shares_status_with(&candidate_handle);
-    if !fresh_generation || !fresh_cspace || !fresh_task || !fresh_arena {
-        lifecycle_invariant_failed(&tokens, "C6.6 candidate identity was not fresh");
-    }
+    // These empty one-shot cells carry no endpoint. Only Stage B can create
+    // and publish a fresh route into them.
     let (
         fresh_source_publisher,
         fresh_source_receiver,
@@ -2557,6 +2884,12 @@ fn start_c66_node_replacement(
             sink_receiver,
             sink_audit,
         )
+    };
+    let (activation, mut activation_receiver) = {
+        let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+        let activation = c66_supervisor_activation(generation);
+        system.restore();
+        activation
     };
     if unsafe {
         registry.install_payload(tokens[0], || {
@@ -2635,47 +2968,9 @@ fn start_c66_node_replacement(
     {
         lifecycle_invariant_failed(&tokens, "C6.6 sink payload installation failed");
     }
-    if unsafe {
-        registry.install_payload(tokens[3], || {
-            C66Payload::new(
-                generation,
-                tokens[3],
-                candidate_table,
-                [
-                    Some(C66Drain {
-                        token: candidate_reader_token,
-                        resource_type: C66_RELAY_READER_TYPE,
-                    }),
-                    Some(C66Drain {
-                        token: candidate_writer_token,
-                        resource_type: C66_RELAY_WRITER_TYPE,
-                    }),
-                ],
-                C66Role::Candidate {
-                    waiting: None,
-                    stage: C66CandidateStage::Receive,
-                },
-            )
-        })
-    }
-    .is_err()
-    {
-        lifecycle_invariant_failed(&tokens, "C6.6 candidate payload installation failed");
-    }
-
     if registry
         .bind_batch(
-            core::slice::from_ref(&tokens[3]),
-            candidate_batch.prepared_reclaimable_bindings(),
-            candidate_batch.prepared_handles(),
-        )
-        .is_err()
-    {
-        lifecycle_invariant_failed(&tokens, "C6.6 candidate binding failed");
-    }
-    if registry
-        .bind_batch(
-            &tokens[..C66_NODE_COUNT],
+            &tokens,
             old_batch.prepared_reclaimable_bindings(),
             &old_batch.prepared_handles()[..C66_NODE_COUNT],
         )
@@ -2690,36 +2985,14 @@ fn start_c66_node_replacement(
         system.restore();
         completion
     };
-    let supervisor = C66Supervisor {
-        generation,
-        candidate_batch,
-        candidate_token: tokens[3],
-        candidate_handle,
-        old_tokens: [tokens[0], tokens[1], tokens[2]],
-        old_handles: old_handles.clone(),
-        sibling_domains: [domains[0], domains[2]],
-        source_probe,
-        old_target_probe,
-        sink_probe,
-        candidate_probe,
-        streams,
-        supervisors,
-        fresh_source_writer,
-        fresh_sink_reader,
-        fresh_source_publisher,
-        fresh_sink_publisher,
-        fresh_source_handoff_audit,
-        fresh_sink_handoff_audit,
-        reports,
-        completion: completion.clone(),
-        fresh_generation,
-        fresh_cspace,
-        fresh_task,
-        fresh_arena,
-        fresh_resources,
-    };
     let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
     old_batch.prepare("wasm-c66-node-replacement-supervisor", async move {
+        let supervisor = core::future::poll_fn(move |_context| {
+            activation_receiver
+                .try_take(generation)
+                .map_or(Poll::Pending, Poll::Ready)
+        })
+        .await;
         supervisor.run().await;
     });
     system.restore();
@@ -2748,12 +3021,504 @@ fn start_c66_node_replacement(
         .pop()
         .expect("validated C6.6 publication contains its supervisor");
     drop(published);
+    Ok(C66StagedCurrent {
+        current: current_seal,
+        generation,
+        supervisor,
+        completion,
+        activation,
+        old_tokens: [tokens[0], tokens[1], tokens[2]],
+        old_handles,
+        sibling_domains: [domains[0], domains[2]],
+        source_probe,
+        old_target_probe,
+        sink_probe,
+        old_streams: streams,
+        old_supervisors: supervisors,
+        old_target_reader_token,
+        old_target_writer_token,
+        old_target_resource_generation: current_plans[C66_TARGET_INDEX].resource_generation,
+        fresh_source_publisher,
+        fresh_sink_publisher,
+        fresh_source_handoff_audit,
+        fresh_sink_handoff_audit,
+    })
+}
+
+fn start_c66_authorized_replacement(
+    staged: C66StagedCurrent,
+    current: &ComponentGraphPrincipalTemplate,
+    candidate: &ComponentGraphPrincipalTemplate,
+    node_action: ComponentGraphReplacementNodeAction,
+    max_replacements: u16,
+    incident_edges: &[ComponentGraphReplacementEdgePolicy],
+    policy_cancel: C66PolicyCancelPermit,
+) -> Result<C66Run, ComponentGraphPrincipalLifecycleError> {
+    {
+        let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+        let validation = exact_c66_replacement(
+            current,
+            candidate,
+            node_action,
+            max_replacements,
+            incident_edges,
+            staged.current,
+        );
+        system.restore();
+        validation?;
+    }
+    let reports = c66_semantic_reports_for(current, candidate)?;
+    let candidate_plans = checked_plan(candidate)?;
+    if candidate_plans.len() != C66_NODE_COUNT {
+        return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementPolicy);
+    }
+    let mut candidate_plan = candidate_plans[C66_TARGET_INDEX];
+    candidate_plan.resource_generation = reserve_resource_generations(1)?;
+
+    // Stage B begins here: only the move-only durable replacement proof can
+    // reach the first candidate domain/registry allocation.
+    let domains = create_domains(core::slice::from_ref(&candidate_plan))?;
+    if domains.len() != 1 {
+        let _ = super::release_empty_domains(&domains);
+        return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementCapacity);
+    }
+    let tokens = match reserve_registry_batch(&domains) {
+        Ok(tokens) if tokens.len() == 1 => tokens,
+        Ok(tokens) => {
+            let _ = abort_pristine_registry_batch(&tokens, &domains);
+            return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementCapacity);
+        }
+        Err(_) => {
+            let _ = super::release_empty_domains(&domains);
+            return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementCapacity);
+        }
+    };
+    let candidate_pairs = match publication_pairs(&tokens, &domains) {
+        Ok(pairs) => pairs,
+        Err(error) => {
+            abort_pristine_registry_batch(&tokens, &domains)?;
+            return Err(error);
+        }
+    };
+    let mut candidate_batch = PreparedTaskBatch::new();
+    if candidate_batch
+        .reserve_managed_publication(&candidate_pairs, 0)
+        .and_then(|_| candidate_batch.reserve_managed_task_ledgers(1, 0, 0))
+        .is_err()
+    {
+        drop(candidate_batch);
+        abort_pristine_registry_batch(&tokens, &domains)?;
+        return Err(ComponentGraphPrincipalLifecycleError::SchedulerReservation);
+    }
+
+    let fresh_streams = [ByteStream::new(), ByteStream::new()];
+    let fresh_supervisors = [fresh_streams[0].supervisor(), fresh_streams[1].supervisor()];
+    let fresh_source_writer = fresh_streams[0].writer();
+    let candidate_reader = fresh_streams[0].reader();
+    let candidate_writer = fresh_streams[1].writer();
+    let fresh_sink_reader = fresh_streams[1].reader();
+    let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+    let candidate_table = ResourceTable::new(
+        candidate_plan.resource_generation,
+        candidate_plan.resource_slots,
+    )
+    .map_err(|_| ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
+    system.restore();
+    let mut candidate_table = match candidate_table {
+        Ok(table) => table,
+        Err(error) => {
+            drop(candidate_batch);
+            abort_pristine_registry_batch(&tokens, &domains)?;
+            return Err(error);
+        }
+    };
+    let candidate_authorities =
+        match c66_prepare_relay(tokens[0], candidate_reader, candidate_writer) {
+            Ok(authorities) => authorities,
+            Err(error) => {
+                drop(candidate_batch);
+                abort_pristine_registry_batch(&tokens, &domains)?;
+                return Err(error);
+            }
+        };
+    let mut system = crate::heap::enter_owner(OwnerId::SYSTEM);
+    let inserted = (|| {
+        let reader = candidate_table
+            .insert_owned(C66_RELAY_READER_TYPE, candidate_authorities.0)
+            .map_err(|_| ComponentGraphPrincipalLifecycleError::NodeReplacementSetup)?;
+        let writer = candidate_table
+            .insert_owned(C66_RELAY_WRITER_TYPE, candidate_authorities.1)
+            .map_err(|_| ComponentGraphPrincipalLifecycleError::NodeReplacementSetup)?;
+        Ok((reader, writer))
+    })();
+    system.restore();
+    let (candidate_reader_token, candidate_writer_token) = match inserted {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            drop(candidate_batch);
+            abort_pristine_registry_batch(&tokens, &domains)?;
+            return Err(error);
+        }
+    };
+    let stale_replacement_tokens = candidate_table
+        .contains(staged.old_target_reader_token, C66_RELAY_READER_TYPE)
+        == Err(ResourceError::WrongInstance)
+        && candidate_table.contains(staged.old_target_writer_token, C66_RELAY_WRITER_TYPE)
+            == Err(ResourceError::WrongInstance);
+    let fresh_resources = stale_replacement_tokens
+        && candidate_table.len() == 2
+        && candidate_table.instance_generation() != staged.old_target_resource_generation
+        && !Arc::ptr_eq(&staged.old_streams[0], &fresh_streams[0])
+        && !Arc::ptr_eq(&staged.old_streams[1], &fresh_streams[1]);
+    if !fresh_resources {
+        drop(candidate_batch);
+        abort_pristine_registry_batch(&tokens, &domains)?;
+        return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
+    }
+    let Some(candidate_probe) =
+        super::super::component_instances::registry().acceptance_probe(tokens[0])
+    else {
+        drop(candidate_batch);
+        abort_pristine_registry_batch(&tokens, &domains)?;
+        return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
+    };
+    let fresh_generation = !staged.old_tokens[C66_TARGET_INDEX].shares_stable_slot(tokens[0]);
+    let fresh_cspace = !staged.old_target_probe.same_space_object(candidate_probe)
+        && !staged.old_target_probe.same_cspace_lock(candidate_probe)
+        && !staged
+            .old_target_probe
+            .same_cspace_identity(candidate_probe);
+    let fresh_arena = staged.old_handles[C66_TARGET_INDEX]
+        .allocation_domain()
+        .arena
+        != domains[0].arena;
+    if !C66_AUDIT.matches(staged.generation)
+        || !c66_increment(&C66_AUDIT.stale_replacement_tokens, staged.generation)
+        || !c66_increment(&C66_AUDIT.stale_replacement_tokens, staged.generation)
+    {
+        drop(candidate_batch);
+        abort_pristine_registry_batch(&tokens, &domains)?;
+        return Err(ComponentGraphPrincipalLifecycleError::NodeReplacementSetup);
+    }
+
+    let registry = super::super::component_instances::registry();
+    unsafe {
+        candidate_batch.prepare_managed_instance_owned(
+            tokens[0],
+            domains[0],
+            PRINCIPAL_TASK_NAME,
+            C66Task {
+                token: tokens[0],
+                generation: staged.generation,
+            },
+        );
+    }
+    let candidate_handle = candidate_batch.prepared_handles()[0].clone();
+    let fresh_task = staged.old_handles[C66_TARGET_INDEX].id() != candidate_handle.id()
+        && !staged.old_handles[C66_TARGET_INDEX].shares_status_with(&candidate_handle);
+    let lifecycle_tokens = [
+        staged.old_tokens[0],
+        staged.old_tokens[1],
+        staged.old_tokens[2],
+        tokens[0],
+    ];
+    if !fresh_generation || !fresh_cspace || !fresh_task || !fresh_arena {
+        lifecycle_invariant_failed(&lifecycle_tokens, "C6.6 candidate identity was not fresh");
+    }
+    if unsafe {
+        registry.install_payload(tokens[0], || {
+            C66Payload::new(
+                staged.generation,
+                tokens[0],
+                candidate_table,
+                [
+                    Some(C66Drain {
+                        token: candidate_reader_token,
+                        resource_type: C66_RELAY_READER_TYPE,
+                    }),
+                    Some(C66Drain {
+                        token: candidate_writer_token,
+                        resource_type: C66_RELAY_WRITER_TYPE,
+                    }),
+                ],
+                C66Role::Candidate {
+                    waiting: None,
+                    stage: C66CandidateStage::Receive,
+                },
+            )
+        })
+    }
+    .is_err()
+    {
+        lifecycle_invariant_failed(
+            &lifecycle_tokens,
+            "C6.6 candidate payload installation failed",
+        );
+    }
+    if registry
+        .bind_batch(
+            &tokens,
+            candidate_batch.prepared_reclaimable_bindings(),
+            candidate_batch.prepared_handles(),
+        )
+        .is_err()
+    {
+        lifecycle_invariant_failed(&lifecycle_tokens, "C6.6 candidate binding failed");
+    }
+
+    let C66StagedCurrent {
+        current: _,
+        generation,
+        supervisor,
+        completion,
+        activation,
+        old_tokens,
+        old_handles,
+        sibling_domains,
+        source_probe,
+        old_target_probe,
+        sink_probe,
+        old_streams,
+        old_supervisors,
+        old_target_reader_token: _,
+        old_target_writer_token: _,
+        old_target_resource_generation: _,
+        fresh_source_publisher,
+        fresh_sink_publisher,
+        fresh_source_handoff_audit,
+        fresh_sink_handoff_audit,
+    } = staged;
+    let [old_stream_0, old_stream_1] = old_streams;
+    let [fresh_stream_0, fresh_stream_1] = fresh_streams;
+    let [old_supervisor_0, old_supervisor_1] = old_supervisors;
+    let [fresh_supervisor_0, fresh_supervisor_1] = fresh_supervisors;
+    let replacement = C66Supervisor {
+        generation,
+        candidate_batch,
+        candidate_token: tokens[0],
+        candidate_handle,
+        old_tokens,
+        old_handles,
+        sibling_domains,
+        source_probe,
+        old_target_probe,
+        sink_probe,
+        candidate_probe,
+        streams: [old_stream_0, old_stream_1, fresh_stream_0, fresh_stream_1],
+        supervisors: [
+            old_supervisor_0,
+            old_supervisor_1,
+            fresh_supervisor_0,
+            fresh_supervisor_1,
+        ],
+        fresh_source_writer,
+        fresh_sink_reader,
+        fresh_source_publisher,
+        fresh_sink_publisher,
+        fresh_source_handoff_audit,
+        fresh_sink_handoff_audit,
+        reports,
+        completion: Arc::clone(&completion),
+        policy_cancel,
+        fresh_generation,
+        fresh_cspace,
+        fresh_task,
+        fresh_arena,
+        fresh_resources,
+    };
+    if activation.publish(generation, replacement).is_err() {
+        lifecycle_invariant_failed(
+            &lifecycle_tokens,
+            "C6.6 replacement activation published twice",
+        );
+    }
+    if !supervisor.exact_wake().wake_if_exact() {
+        lifecycle_invariant_failed(&lifecycle_tokens, "C6.6 dormant supervisor was not live");
+    }
     Ok(C66Run {
         supervisor,
         completion,
     })
 }
 
+#[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+fn start_c66_node_replacement(
+    template: Arc<ComponentGraphNodeReplacementTemplate>,
+) -> Result<C66Run, ComponentGraphPrincipalLifecycleError> {
+    exact_c66_template(&template)?;
+    let staged = stage_c66_current_graph(template.current_graph())?;
+    let permit = C66PolicyCancelPermit::C66 {
+        generation: staged.generation,
+        target: template.target(),
+    };
+    start_c66_authorized_replacement(
+        staged,
+        template.current_graph(),
+        template.candidate_graph(),
+        template.node_action(),
+        template.max_replacements(),
+        template.incident_edges(),
+        permit,
+    )
+}
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+#[must_use = "hold the current graph lifetime or consume one durable replacement proof"]
+pub(crate) struct C76StagedCurrent(C66StagedCurrent);
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+impl C76StagedCurrent {
+    pub(crate) const fn current_nodes(&self) -> usize {
+        C66_NODE_COUNT
+    }
+
+    pub(crate) const fn current_routes(&self) -> usize {
+        2
+    }
+
+    pub(crate) const fn candidate_lifecycle_objects(&self) -> usize {
+        0
+    }
+
+    pub(crate) const fn runtime_ready(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+pub(crate) fn stage_c76_current_graph(
+    proof: C76SupervisorCurrentGraph,
+) -> Result<C76StagedCurrent, ComponentGraphPrincipalLifecycleError> {
+    proof
+        .consume(|view| stage_c66_current_graph(view.current_graph()))
+        .map(C76StagedCurrent)
+}
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+#[must_use = "the C7.6 replacement run must reach its terminal receipt"]
+pub(crate) struct C76ReplacementRun(C66Run);
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+pub(crate) struct C76ReplacementReceipt(C66ReplacementReceipt);
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+impl C76ReplacementReceipt {
+    pub(crate) const fn candidate_hidden_before_policy_cancel(&self) -> bool {
+        self.0.candidate_hidden_before_policy_cancel
+    }
+
+    pub(crate) const fn old_terminal_before_new_visible(&self) -> bool {
+        self.0.old_terminal_before_new_ready
+    }
+
+    pub(crate) const fn siblings_stable(&self) -> usize {
+        self.0.siblings_stable
+    }
+
+    pub(crate) const fn candidate_identity_is_fresh(&self) -> bool {
+        self.0.fresh_generation && self.0.fresh_cspace && self.0.fresh_task && self.0.fresh_arena
+    }
+
+    pub(crate) const fn fresh_resources_are_distinct(&self) -> bool {
+        self.0.fresh_resources
+    }
+
+    pub(crate) const fn old_routes_retired(&self) -> u64 {
+        self.0.old_routes_retired
+    }
+
+    pub(crate) const fn fresh_routes(&self) -> u64 {
+        self.0.fresh_routes
+    }
+
+    pub(crate) const fn stale_replacement_tokens(&self) -> u64 {
+        self.0.stale_replacement_tokens
+    }
+
+    pub(crate) const fn late_wake_stale(&self) -> u64 {
+        self.0.late_wake_stale
+    }
+
+    pub(crate) const fn policy_cancelled_after_old_terminal(&self) -> bool {
+        self.0.policy_cancelled
+    }
+
+    pub(crate) const fn no_active_poll_at_cutover(&self) -> bool {
+        self.0.no_active_poll
+    }
+
+    pub(crate) const fn graph_version_published(&self) -> bool {
+        self.0.graph_version_published
+    }
+
+    pub(crate) const fn runtime_ready(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn guest_calls(&self) -> u64 {
+        self.0
+            .terminal
+            .iter()
+            .map(|terminal| terminal.guest_calls)
+            .sum()
+    }
+
+    pub(crate) const fn terminal_receipts(&self) -> usize {
+        self.0.terminal.len()
+    }
+
+    pub(crate) fn reports_are_runtime_unavailable(&self) -> bool {
+        self.0.reports.len() == C66_INCARNATION_COUNT
+            && self.0.reports.iter().all(|report| {
+                report.terminal() == ComponentGraphNodeTerminal::RuntimeUnavailable
+                    && report.fuel().consumed() == 0
+                    && report.resources().live_slots() == 0
+            })
+    }
+}
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+impl C76ReplacementRun {
+    pub(crate) async fn wait(
+        self,
+    ) -> Result<C76ReplacementReceipt, ComponentGraphPrincipalLifecycleError> {
+        self.0.wait().await.map(C76ReplacementReceipt)
+    }
+}
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+pub(crate) fn start_c76_durable_replacement(
+    staged: C76StagedCurrent,
+    proof: C76SupervisorGraphReplacement,
+) -> Result<C76ReplacementRun, ComponentGraphPrincipalLifecycleError> {
+    proof
+        .consume(|view, permit| {
+            start_c66_authorized_replacement(
+                staged.0,
+                view.current_graph(),
+                view.successor_graph(),
+                view.node_action(),
+                view.max_replacements(),
+                view.incident_edges(),
+                C66PolicyCancelPermit::C76(permit),
+            )
+        })
+        .map(C76ReplacementRun)
+}
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+const _: fn(
+    C76SupervisorCurrentGraph,
+) -> Result<C76StagedCurrent, ComponentGraphPrincipalLifecycleError> = stage_c76_current_graph;
+
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+const _: fn(
+    C76StagedCurrent,
+    C76SupervisorGraphReplacement,
+) -> Result<C76ReplacementRun, ComponentGraphPrincipalLifecycleError> =
+    start_c76_durable_replacement;
+
+#[cfg(feature = "wasm-c66-node-replacement-acceptance")]
 fn c66_qemu_acceptance_template(
 ) -> Option<(Arc<ComponentGraphNodeReplacementTemplate>, AllocationDomain)> {
     let caller_quota = 12usize.checked_mul(1024)?.checked_mul(1024)?;
@@ -2944,6 +3709,7 @@ fn c66_qemu_acceptance_template(
         let replacement_policy = ComponentGraphNodeReplacementPolicy {
             target: ComponentGraphNodeId::new(C66_TARGET_INDEX as u16),
             max_replacements: 1,
+            node_action: ComponentGraphReplacementNodeAction::PolicyCancel,
             incident_edges: &incident_edges,
         };
         let replacement = admit_component_graph_replacement(
@@ -2970,6 +3736,7 @@ fn c66_qemu_acceptance_template(
 /// image remains validation-only: all transport work is performed by bounded
 /// host streams under exact per-incarnation CSpaces, and no guest entry point
 /// is reachable.
+#[cfg(feature = "wasm-c66-node-replacement-acceptance")]
 pub(crate) async fn run_qemu_acceptance() -> bool {
     if crate::online_hart_count() != 4 || crate::online_hart_mask() & 0x0f != 0x0f {
         return false;
@@ -3003,6 +3770,12 @@ pub(crate) async fn run_qemu_acceptance() -> bool {
         || !receipt.fresh_resources
         || receipt.siblings_stable != 2
         || !receipt.no_active_poll
+        || !receipt.policy_cancelled
+        || receipt.old_routes_retired != 2
+        || receipt.fresh_routes != 2
+        || receipt.stale_replacement_tokens != 2
+        || receipt.late_wake_stale != 1
+        || receipt.graph_version_published
         || receipt.reports.len() != C66_INCARNATION_COUNT
         || receipt.terminal.len() != C66_INCARNATION_COUNT
         || receipt

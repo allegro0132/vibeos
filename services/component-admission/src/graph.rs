@@ -95,6 +95,17 @@ pub enum ComponentGraphReplacementEdgeAction {
     RecreateFresh,
 }
 
+/// Required lifecycle action for the graph principal being replaced.
+///
+/// `PolicyCancel` is an explicit admission decision. It authorizes a later
+/// supervisor to close the target's admitted incident routes and wait for the
+/// exact old incarnation to reach its terminal state; it is not a runtime
+/// cancellation token and cannot itself identify or reach a task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentGraphReplacementNodeAction {
+    PolicyCancel,
+}
+
 /// Trusted replacement action for one exact graph edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ComponentGraphReplacementEdgePolicy {
@@ -111,6 +122,7 @@ pub struct ComponentGraphReplacementEdgePolicy {
 pub struct ComponentGraphNodeReplacementPolicy<'a> {
     pub target: ComponentGraphNodeId,
     pub max_replacements: u16,
+    pub node_action: ComponentGraphReplacementNodeAction,
     pub incident_edges: &'a [ComponentGraphReplacementEdgePolicy],
 }
 
@@ -342,6 +354,13 @@ impl ComponentGraphNodeManifest {
 
     pub const fn limits(&self) -> InstanceLimits {
         self.limits
+    }
+
+    /// Stable semantic commitment to the freshly normalized WIT world. This
+    /// is comparison metadata for a signed graph descriptor, never a lookup
+    /// key or durable authority identifier.
+    pub const fn world_contract_commitment(&self) -> [u8; 32] {
+        self.world_contract.0
     }
 
     pub const fn budget(&self) -> ComponentGraphNodeBudget {
@@ -619,6 +638,7 @@ impl AdmittedComponentGraph {
 pub struct ComponentGraphReplacementManifest {
     target: ComponentGraphNodeId,
     max_replacements: u16,
+    node_action: ComponentGraphReplacementNodeAction,
     incident_edges: Vec<ComponentGraphReplacementEdgePolicy>,
     transient_account: ComponentGraphAccount,
 }
@@ -630,6 +650,10 @@ impl ComponentGraphReplacementManifest {
 
     pub const fn max_replacements(&self) -> u16 {
         self.max_replacements
+    }
+
+    pub const fn node_action(&self) -> ComponentGraphReplacementNodeAction {
+        self.node_action
     }
 
     pub fn incident_edges(&self) -> &[ComponentGraphReplacementEdgePolicy] {
@@ -2429,6 +2453,7 @@ fn derive_component_graph_replacement_manifest(
     policy: &ComponentGraphNodeReplacementPolicy<'_>,
 ) -> Result<ComponentGraphReplacementManifest, ComponentGraphReplacementAdmissionError> {
     if policy.max_replacements != 1
+        || policy.node_action != ComponentGraphReplacementNodeAction::PolicyCancel
         || policy.incident_edges.len() > PROFILE_1_COMPONENT_GRAPH_LIMITS.max_edges as usize
     {
         return Err(ComponentGraphReplacementAdmissionError::InvalidPolicy);
@@ -2526,6 +2551,7 @@ fn derive_component_graph_replacement_manifest(
     Ok(ComponentGraphReplacementManifest {
         target: policy.target,
         max_replacements: policy.max_replacements,
+        node_action: policy.node_action,
         incident_edges: canonical,
         transient_account,
     })
@@ -2572,6 +2598,7 @@ fn revalidate_component_graph_replacement(
     let policy = ComponentGraphNodeReplacementPolicy {
         target: admitted.manifest.target,
         max_replacements: admitted.manifest.max_replacements,
+        node_action: admitted.manifest.node_action,
         incident_edges: &admitted.manifest.incident_edges,
     };
     let observed = derive_component_graph_replacement_manifest(

@@ -12,9 +12,9 @@ use vibeos_component_admission::{
     ComponentGraphInformationFlowPublished, ComponentGraphInformationFlowResourcePolicy,
     ComponentGraphNodeAdmissionPolicy, ComponentGraphNodeReplacementPolicy,
     ComponentGraphReplacementAdmissionError, ComponentGraphReplacementEdgeAction,
-    ComponentGraphReplacementEdgePolicy, ComponentGraphResourceEdgePolicy,
-    ComponentGraphResourceMode, InstanceLimits, InterfaceCeiling, ProfileIdentity,
-    STREAM_FILTER_WORLD,
+    ComponentGraphReplacementEdgePolicy, ComponentGraphReplacementNodeAction,
+    ComponentGraphResourceEdgePolicy, ComponentGraphResourceMode, InstanceLimits, InterfaceCeiling,
+    ProfileIdentity, STREAM_FILTER_WORLD,
 };
 use vibeos_component_format::{LimitKind, PROFILE_1_COMPONENT_GRAPH_LIMITS};
 use vibeos_component_host::{HostResourceKind, STREAM_INTERFACE};
@@ -1873,6 +1873,7 @@ fn replacement_admission_allows_only_target_artifact_change_and_canonicalizes_re
     let policy = ComponentGraphNodeReplacementPolicy {
         target: node(1),
         max_replacements: 1,
+        node_action: ComponentGraphReplacementNodeAction::PolicyCancel,
         incident_edges: &supplied,
     };
 
@@ -1885,6 +1886,10 @@ fn replacement_admission_allows_only_target_artifact_change_and_canonicalizes_re
     assert!(Arc::ptr_eq(admitted.candidate_graph_arc(), &candidate));
     assert_eq!(admitted.manifest().target(), node(1));
     assert_eq!(admitted.manifest().max_replacements(), 1);
+    assert_eq!(
+        admitted.manifest().node_action(),
+        ComponentGraphReplacementNodeAction::PolicyCancel
+    );
     assert_eq!(
         admitted.manifest().incident_edges(),
         [recreate(edge(0, 1)), recreate(edge(1, 2))]
@@ -1973,6 +1978,7 @@ fn replacement_rejects_candidate_overlap_above_the_graph_node_ceiling() {
         &ComponentGraphNodeReplacementPolicy {
             target: node(15),
             max_replacements: 1,
+            node_action: ComponentGraphReplacementNodeAction::PolicyCancel,
             incident_edges: &[],
         },
     )
@@ -2020,6 +2026,7 @@ fn replacement_admission_revalidates_exact_resource_and_async_edge_shapes() {
         &ComponentGraphNodeReplacementPolicy {
             target: node(1),
             max_replacements: 1,
+            node_action: ComponentGraphReplacementNodeAction::PolicyCancel,
             incident_edges: &resource_edges,
         },
     )
@@ -2045,6 +2052,7 @@ fn replacement_admission_revalidates_exact_resource_and_async_edge_shapes() {
         &ComponentGraphNodeReplacementPolicy {
             target: node(1),
             max_replacements: 1,
+            node_action: ComponentGraphReplacementNodeAction::PolicyCancel,
             incident_edges: &async_edges,
         },
     )
@@ -2075,6 +2083,7 @@ fn replacement_policy_rejects_wrong_count_unknown_target_and_incomplete_edge_set
             &ComponentGraphNodeReplacementPolicy {
                 target: node(1),
                 max_replacements: 0,
+                node_action: ComponentGraphReplacementNodeAction::PolicyCancel,
                 incident_edges: &complete,
             },
         )
@@ -2088,6 +2097,7 @@ fn replacement_policy_rejects_wrong_count_unknown_target_and_incomplete_edge_set
             &ComponentGraphNodeReplacementPolicy {
                 target: node(9),
                 max_replacements: 1,
+                node_action: ComponentGraphReplacementNodeAction::PolicyCancel,
                 incident_edges: &[],
             },
         )
@@ -2111,6 +2121,7 @@ fn replacement_policy_rejects_wrong_count_unknown_target_and_incomplete_edge_set
                 &ComponentGraphNodeReplacementPolicy {
                     target: node(1),
                     max_replacements: 1,
+                    node_action: ComponentGraphReplacementNodeAction::PolicyCancel,
                     incident_edges: &incident_edges,
                 },
             )
@@ -2141,6 +2152,7 @@ fn replacement_rejects_non_target_change_and_target_contract_change() {
             &ComponentGraphNodeReplacementPolicy {
                 target: node(1),
                 max_replacements: 1,
+                node_action: ComponentGraphReplacementNodeAction::PolicyCancel,
                 incident_edges: &complete,
             },
         )
@@ -2167,6 +2179,7 @@ fn replacement_rejects_non_target_change_and_target_contract_change() {
             &ComponentGraphNodeReplacementPolicy {
                 target: node(1),
                 max_replacements: 1,
+                node_action: ComponentGraphReplacementNodeAction::PolicyCancel,
                 incident_edges: &complete,
             },
         )
@@ -2203,6 +2216,7 @@ fn replacement_rejects_published_or_nested_target_surface() {
                 &ComponentGraphNodeReplacementPolicy {
                     target: node(1),
                     max_replacements: 1,
+                    node_action: ComponentGraphReplacementNodeAction::PolicyCancel,
                     incident_edges: &complete,
                 },
             )
@@ -2229,6 +2243,7 @@ fn replacement_rejects_published_or_nested_target_surface() {
             &ComponentGraphNodeReplacementPolicy {
                 target: node(0),
                 max_replacements: 1,
+                node_action: ComponentGraphReplacementNodeAction::PolicyCancel,
                 incident_edges: &[],
             },
         )

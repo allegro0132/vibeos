@@ -12,9 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use vibeos_durable_format::{
-    encode_object_transaction, preflight_recovery, preview_grant_transaction, DerivationId,
-    DurableRights, GrantFlags, GrantRecord, ObjectId, ObjectKind, RecordBody, RecordChain,
-    ResourceKind, RootPolicy, SlotIdentity, SpaceId, StoreId, TransactionId, RECORD_SIZE,
+    encode_object_transaction, preflight_recovery, preview_grant_transaction,
+    preview_revoke_transaction, DerivationId, DurableRights, GrantFlags, GrantRecord, ObjectId,
+    ObjectKind, RecordBody, RecordChain, ResourceKind, RootPolicy, SlotIdentity, SpaceId, StoreId,
+    TransactionId, RECORD_SIZE,
 };
 use vibeos_segment_format::{admitted_pages, Page, StoreUuid};
 use vibeos_segment_store::{
@@ -980,6 +981,486 @@ fn c71_max_inline_artifact_storage_v2_fault_effect_matrix_converges() {
     for boundary in boundaries {
         for action in FAULT_ACTIONS {
             run_fault_case(&initial_image, &fixture, boundary, action);
+        }
+    }
+}
+
+// C7.6 reuses the same checkpoint publication engine with a deliberately
+// different logical policy: one fixed graph slot moves from generation zero
+// to generation one, while both versions' complete inline validation inputs
+// remain in the authority stream.
+const C76_GRAPH_SPACE_RAW: u128 = 0x5649_4245_4f53_2d47_5241_5048_2d56_3100;
+const C76_GRAPH_VERSION_KIND_RAW: u32 = 0x4347_5631;
+const C76_GRAPH_EVIDENCE_KIND_RAW: u32 = 0x4347_4531;
+const POLICY_V3: &[u8] = b"vibeos.storage-v2.external-policy.v3\0persistent-space=0x5053,slot=0,generation=0,rights=rgx,kind=0x43535043\0program-space=0x50524f47,slot=0,generation=0,rights=r,kind=0x50524731\0graph-space=0x564942454f532d47524150482d563100,slot=0,generations=0..1,rights=r,kind=0x43475631\0graph-attachments=exact-root-relative,per-generation=3*0x434d5031+3*0x434d4531+1*0x43474531,inline=1,ungranted=1,max-replacement=1";
+
+fn c76_graph_space() -> SpaceId {
+    SpaceId::new(C76_GRAPH_SPACE_RAW).unwrap()
+}
+
+fn c76_object_bytes(tag: u8, index: usize) -> Vec<u8> {
+    let len = match index {
+        0..=2 => 48 + index,
+        3..=5 => 112,
+        6 => 112,
+        7 => 160,
+        _ => unreachable!(),
+    };
+    (0..len)
+        .map(|offset| tag.wrapping_add(index as u8).wrapping_add(offset as u8))
+        .collect()
+}
+
+fn c76_kind(index: usize) -> ObjectKind {
+    ObjectKind::new(match index {
+        0..=2 => ARTIFACT_KIND_RAW,
+        3..=5 => EVIDENCE_KIND_RAW,
+        6 => C76_GRAPH_EVIDENCE_KIND_RAW,
+        7 => C76_GRAPH_VERSION_KIND_RAW,
+        _ => unreachable!(),
+    })
+    .unwrap()
+}
+
+fn append_c76_objects(
+    chain: &mut RecordChain,
+    records: &mut Vec<[u8; RECORD_SIZE]>,
+    base: u128,
+    tag: u8,
+) -> Vec<ObjectId> {
+    let mut ids = Vec::new();
+    for index in 0..8 {
+        let object = ObjectId::new(base + (index * 2) as u128 + 1).unwrap();
+        records.extend(
+            encode_object_transaction(
+                chain,
+                TransactionId::new(base + (index * 2) as u128).unwrap(),
+                object,
+                c76_kind(index),
+                &c76_object_bytes(tag, index),
+            )
+            .unwrap()
+            .records,
+        );
+        ids.push(object);
+    }
+    ids
+}
+
+#[derive(Clone)]
+struct C76GraphFixture {
+    g0: Vec<[u8; RECORD_SIZE]>,
+    g1: Vec<[u8; RECORD_SIZE]>,
+    g0_root: GrantRecord,
+    g1_root: GrantRecord,
+    g0_attachments: Vec<vibeos_durable_format::RecoveredObject>,
+    g1_attachments: Vec<vibeos_durable_format::RecoveredObject>,
+    g0_descriptor: vibeos_durable_format::RecoveredObject,
+    g1_descriptor: vibeos_durable_format::RecoveredObject,
+}
+
+impl C76GraphFixture {
+    fn new() -> Self {
+        let mut g0 = format_records();
+        let empty = preflight_recovery(&g0, store_id()).unwrap();
+        let mut chain =
+            RecordChain::from_checkpoint(store_id(), empty.chain_checkpoint().unwrap()).unwrap();
+        let base0 = empty.id_high_water().max(1);
+        g0.push(
+            chain
+                .append(
+                    None,
+                    RecordBody::IdHighWater {
+                        exclusive_end: (base0 + 18).max(C76_GRAPH_SPACE_RAW + 1),
+                    },
+                )
+                .unwrap(),
+        );
+        let g0_ids = append_c76_objects(&mut chain, &mut g0, base0, 0x10);
+        let g0_root = GrantRecord {
+            derivation_id: DerivationId::new(base0 + 17).unwrap(),
+            parent_id: None,
+            object_id: g0_ids[7],
+            target: SlotIdentity {
+                space: c76_graph_space(),
+                slot: 0,
+                generation: 0,
+            },
+            rights: DurableRights::READ,
+            resource_kind: ResourceKind::new(STORED_OBJECT_KIND_RAW).unwrap(),
+            flags: GrantFlags::ROOT,
+        };
+        let (root, _) = preview_grant_transaction(
+            &chain,
+            TransactionId::new(base0 + 16).unwrap(),
+            g0_root.clone(),
+        )
+        .unwrap();
+        g0.extend(root.records);
+
+        let recovered0 = preflight_recovery(&g0, store_id()).unwrap();
+        let base1 = recovered0.id_high_water();
+        let mut chain =
+            RecordChain::from_checkpoint(store_id(), recovered0.chain_checkpoint().unwrap())
+                .unwrap();
+        let mut g1 = g0.clone();
+        g1.push(
+            chain
+                .append(
+                    None,
+                    RecordBody::IdHighWater {
+                        exclusive_end: base1 + 19,
+                    },
+                )
+                .unwrap(),
+        );
+        let g1_ids = append_c76_objects(&mut chain, &mut g1, base1, 0x80);
+        let (revoke, next) = preview_revoke_transaction(
+            &chain,
+            TransactionId::new(base1 + 16).unwrap(),
+            g0_root.derivation_id,
+        )
+        .unwrap();
+        g1.extend(revoke.records);
+        chain = next;
+        let g1_root = GrantRecord {
+            derivation_id: DerivationId::new(base1 + 18).unwrap(),
+            parent_id: None,
+            object_id: g1_ids[7],
+            target: SlotIdentity {
+                space: c76_graph_space(),
+                slot: 0,
+                generation: 1,
+            },
+            rights: DurableRights::READ,
+            resource_kind: ResourceKind::new(STORED_OBJECT_KIND_RAW).unwrap(),
+            flags: GrantFlags::ROOT,
+        };
+        let (root, _) = preview_grant_transaction(
+            &chain,
+            TransactionId::new(base1 + 17).unwrap(),
+            g1_root.clone(),
+        )
+        .unwrap();
+        g1.extend(root.records);
+
+        let recovered0 = preflight_recovery(&g0, store_id()).unwrap();
+        let recovered1 = preflight_recovery(&g1, store_id()).unwrap();
+        let objects_for = |recovered: &vibeos_durable_format::RecoveryPreflight,
+                           ids: &[ObjectId]| {
+            ids.iter()
+                .map(|id| {
+                    recovered
+                        .committed_objects()
+                        .iter()
+                        .find(|object| object.object_id == *id)
+                        .unwrap()
+                        .clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut objects0 = objects_for(&recovered0, &g0_ids);
+        let g0_descriptor = objects0.pop().unwrap();
+        let mut objects1 = objects_for(&recovered1, &g1_ids);
+        let g1_descriptor = objects1.pop().unwrap();
+        assert_eq!(recovered1.id_high_water(), base1 + 19);
+        assert_eq!(recovered1.slots()[0].max_generation, 1);
+        assert_eq!(
+            recovered1.slots()[0].live_derivation,
+            Some(g1_root.derivation_id)
+        );
+        Self {
+            g0,
+            g1,
+            g0_root,
+            g1_root,
+            g0_attachments: objects0,
+            g1_attachments: objects1,
+            g0_descriptor,
+            g1_descriptor,
+        }
+    }
+
+    fn bytes(records: &[[u8; RECORD_SIZE]]) -> Vec<u8> {
+        records.iter().flatten().copied().collect()
+    }
+
+    fn g0_bytes(&self) -> Vec<u8> {
+        Self::bytes(&self.g0)
+    }
+
+    fn g1_bytes(&self) -> Vec<u8> {
+        Self::bytes(&self.g1)
+    }
+
+    fn import(
+        &self,
+        records: &[[u8; RECORD_SIZE]],
+        root: &GrantRecord,
+        attachments: &[vibeos_durable_format::RecoveredObject],
+    ) -> PersistentAuthorityImport {
+        let preflight = preflight_recovery(records, store_id()).unwrap();
+        PersistentAuthorityImport::from_m4_with_exact_inline_attachments_preflighted(
+            records,
+            store_id(),
+            &[RootPolicy {
+                grant: root.clone(),
+            }],
+            &[],
+            attachments,
+            POLICY_V3,
+            Vec::new(),
+            preflight,
+        )
+        .unwrap()
+        .with_system_principal(LEGACY_SYSTEM_PRINCIPAL, u64::MAX, u64::MAX, false)
+        .unwrap()
+    }
+
+    fn g0_import(&self) -> PersistentAuthorityImport {
+        self.import(&self.g0, &self.g0_root, &self.g0_attachments)
+    }
+
+    fn g1_import(&self) -> PersistentAuthorityImport {
+        let mut attachments = self.g0_attachments.clone();
+        attachments.extend_from_slice(&self.g1_attachments);
+        attachments.sort_unstable_by_key(|object| object.object_id);
+        self.import(&self.g1, &self.g1_root, &attachments)
+    }
+}
+
+fn c76_prepared_image(fixture: &C76GraphFixture) -> BTreeMap<u64, Page> {
+    let device = FaultDevice::from_durable(BTreeMap::new());
+    let (runtime, _quota, provisioner) =
+        StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(&[])
+            .unwrap();
+    let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+    block_on(store.format(FormatOptions {
+        store_uuid: StoreUuid::new(*b"C76-GRAPH-G0!!!!").unwrap(),
+        cleaner_reserve_segments: 4,
+        limits: limits(),
+    }))
+    .unwrap();
+    let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+    let view =
+        block_on(store.import_persistent_authority(&maintenance, fixture.g0_import())).unwrap();
+    assert_eq!(view.record_stream(), fixture.g0_bytes());
+    assert_eq!(view.objects().len(), 1);
+    drop(store);
+    device.durable_image()
+}
+
+fn c76_cold_state(image: BTreeMap<u64, Page>, fixture: &C76GraphFixture) -> LogicalState {
+    let device = FaultDevice::from_durable(image);
+    let (runtime, _quota, _provisioner) =
+        StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(&[])
+            .unwrap();
+    let mut store = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+    block_on(store.mount()).unwrap();
+    let view =
+        block_on(store.recover_persistent_authority(root_policy_commitment(POLICY_V3))).unwrap();
+    assert_eq!(view.objects().len(), 1);
+    for attachment in fixture
+        .g0_attachments
+        .iter()
+        .chain(fixture.g1_attachments.iter())
+    {
+        assert!(view.object_for_recovered(attachment).is_none());
+    }
+    if view.record_stream() == fixture.g0_bytes() {
+        assert!(view.object_for_recovered(&fixture.g0_descriptor).is_some());
+        assert!(view.object_for_recovered(&fixture.g1_descriptor).is_none());
+        return LogicalState::Predecessor;
+    }
+    assert_eq!(view.record_stream(), fixture.g1_bytes());
+    assert!(view.object_for_recovered(&fixture.g0_descriptor).is_none());
+    let descriptor = view.object_for_recovered(&fixture.g1_descriptor).unwrap();
+    assert_eq!(
+        block_on(store.read_persistent_object(descriptor)).unwrap(),
+        fixture.g1_descriptor.bytes
+    );
+    LogicalState::Successor
+}
+
+fn c76_drive_replace(device: &FaultDevice, fixture: &C76GraphFixture) -> InstallOutcome {
+    let (runtime, _quota, provisioner) =
+        StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(&[])
+            .unwrap();
+    let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+    if block_on(store.mount()).is_err() {
+        return InstallOutcome::Failed;
+    }
+    let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+    let writer = store
+        .derive_persistent_authority_writer(&maintenance)
+        .unwrap();
+    let view = match block_on(store.recover_persistent_authority(root_policy_commitment(POLICY_V3)))
+    {
+        Ok(view) => view,
+        Err(_) => return InstallOutcome::Failed,
+    };
+    if view.record_stream() == fixture.g1_bytes() {
+        return InstallOutcome::AlreadyComplete;
+    }
+    if view.record_stream() != fixture.g0_bytes() {
+        return InstallOutcome::Failed;
+    }
+    let principal = view.principals()[0].clone();
+    let mut append = Box::pin(store.append_persistent_authority(
+        &writer,
+        view.checkpoint_generation(),
+        fixture.g1_import(),
+        &principal,
+    ));
+    match poll_once(append.as_mut()) {
+        Poll::Ready(Ok(result)) => {
+            assert_eq!(result.view().record_stream(), fixture.g1_bytes());
+            assert_eq!(result.view().objects().len(), 1);
+            assert!(result
+                .object_for_recovered(&fixture.g0_descriptor)
+                .is_none());
+            assert!(result
+                .object_for_recovered(&fixture.g1_descriptor)
+                .is_some());
+            InstallOutcome::Completed
+        }
+        Poll::Ready(Err(_)) => InstallOutcome::Failed,
+        Poll::Pending => InstallOutcome::Pending,
+    }
+}
+
+fn c76_run_fault_case(
+    initial_image: &BTreeMap<u64, Page>,
+    fixture: &C76GraphFixture,
+    boundary: usize,
+    action: FaultAction,
+) {
+    c76_run_fault_case_with_mode(
+        initial_image,
+        fixture,
+        boundary,
+        action,
+        DeviceMode::PageFallback,
+    );
+}
+
+fn c76_run_fault_case_with_mode(
+    initial_image: &BTreeMap<u64, Page>,
+    fixture: &C76GraphFixture,
+    boundary: usize,
+    action: FaultAction,
+    mode: DeviceMode,
+) {
+    let device = FaultDevice::from_durable_with_mode(initial_image.clone(), mode);
+    device.arm(boundary, action);
+    assert!(matches!(
+        c76_drive_replace(&device, fixture),
+        InstallOutcome::Failed | InstallOutcome::Pending
+    ));
+    assert_eq!(device.mutation_count(), boundary + 1);
+    let crashed = device.durable_image();
+    let recovered = c76_cold_state(crashed.clone(), fixture);
+    let retry = FaultDevice::from_durable_with_mode(crashed, mode);
+    let outcome = c76_drive_replace(&retry, fixture);
+    match recovered {
+        LogicalState::Predecessor => assert_eq!(outcome, InstallOutcome::Completed),
+        LogicalState::Successor => {
+            assert_eq!(outcome, InstallOutcome::AlreadyComplete);
+            assert_eq!(retry.mutation_count(), 0);
+        }
+    }
+    assert_eq!(
+        c76_cold_state(retry.durable_image(), fixture),
+        LogicalState::Successor
+    );
+}
+
+#[test]
+fn c76_same_slot_logical_prefix_never_exposes_two_roots_or_early_g1() {
+    let fixture = C76GraphFixture::new();
+    let delta = &fixture.g1[fixture.g0.len()..];
+    for record_index in 0..delta.len() {
+        for cut in 0..=RECORD_SIZE {
+            let mut image = fixture.g0.clone();
+            image.extend_from_slice(&delta[..record_index]);
+            if cut != 0 {
+                let mut torn = [0_u8; RECORD_SIZE];
+                torn[..cut].copy_from_slice(&delta[record_index][..cut]);
+                image.push(torn);
+            }
+            let recovered = preflight_recovery(&image, store_id()).unwrap();
+            let graph_roots: Vec<_> = recovered
+                .committed_grants()
+                .iter()
+                .filter(|grant| grant.grant.target.space == c76_graph_space())
+                .collect();
+            let complete = record_index + usize::from(cut == RECORD_SIZE) == delta.len();
+            assert_eq!(graph_roots.len(), 1 + usize::from(complete));
+            assert_eq!(
+                graph_roots
+                    .iter()
+                    .filter(|root| root.grant.target.generation == 1)
+                    .count(),
+                usize::from(complete)
+            );
+            let live = recovered
+                .slots()
+                .iter()
+                .find(|slot| slot.space == c76_graph_space())
+                .unwrap()
+                .live_derivation;
+            assert!(live.is_none() || live == Some(fixture.g0_root.derivation_id) || complete);
+        }
+    }
+}
+
+#[test]
+fn c76_g0_to_g1_exhaustive_storage_v2_fault_matrix_recovers_only_two_states() {
+    let fixture = C76GraphFixture::new();
+    let initial_image = c76_prepared_image(&fixture);
+    let baseline = FaultDevice::from_durable(initial_image.clone());
+    assert_eq!(
+        c76_drive_replace(&baseline, &fixture),
+        InstallOutcome::Completed
+    );
+    let trace = baseline.trace();
+    assert!(trace.contains(&MutationKind::Write));
+    assert!(trace.contains(&MutationKind::Flush));
+    assert_eq!(
+        c76_cold_state(baseline.durable_image(), &fixture),
+        LogicalState::Successor
+    );
+    for boundary in 0..trace.len() {
+        for action in FAULT_ACTIONS {
+            c76_run_fault_case(&initial_image, &fixture, boundary, action);
+        }
+    }
+}
+
+#[test]
+fn c76_g0_to_g1_cached_batch_fault_matrix_recovers_only_two_states() {
+    let fixture = C76GraphFixture::new();
+    let initial_image = c76_prepared_image(&fixture);
+    let baseline = FaultDevice::from_durable_cached_batch(initial_image.clone());
+    assert_eq!(
+        c76_drive_replace(&baseline, &fixture),
+        InstallOutcome::Completed
+    );
+    assert!(baseline.batch_write_count() > 0);
+    let trace = baseline.trace();
+    assert_eq!(
+        c76_cold_state(baseline.durable_image(), &fixture),
+        LogicalState::Successor
+    );
+    for boundary in 0..trace.len() {
+        for action in FAULT_ACTIONS {
+            c76_run_fault_case_with_mode(
+                &initial_image,
+                &fixture,
+                boundary,
+                action,
+                DeviceMode::CachedBatch,
+            );
         }
     }
 }

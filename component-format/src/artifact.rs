@@ -105,7 +105,7 @@ macro_rules! redacted_digest {
         pub struct $name([u8; 32]);
 
         impl $name {
-            fn checked(bytes: [u8; 32]) -> Result<Self, ComponentArtifactError> {
+            pub(crate) fn checked(bytes: [u8; 32]) -> Result<Self, ComponentArtifactError> {
                 if bytes.iter().all(|byte| *byte == 0) {
                     Err(ComponentArtifactError::ZeroDigest)
                 } else {
@@ -773,7 +773,7 @@ fn profile_limit_values(
     ])
 }
 
-fn profile_code(profile: ProfileIdentity) -> Option<u16> {
+pub(crate) fn profile_code(profile: ProfileIdentity) -> Option<u16> {
     if profile == ProfileIdentity::PROFILE_1_SYNC {
         Some(1)
     } else if profile == ProfileIdentity::PROFILE_1_ASYNC {
@@ -785,7 +785,7 @@ fn profile_code(profile: ProfileIdentity) -> Option<u16> {
     }
 }
 
-fn profile_from_code(code: u16) -> Option<ProfileIdentity> {
+pub(crate) fn profile_from_code(code: u16) -> Option<ProfileIdentity> {
     match code {
         1 => Some(ProfileIdentity::PROFILE_1_SYNC),
         2 => Some(ProfileIdentity::PROFILE_1_ASYNC),
@@ -794,7 +794,7 @@ fn profile_from_code(code: u16) -> Option<ProfileIdentity> {
     }
 }
 
-const fn profile_stage_raw(stage: ProfileStage) -> u16 {
+pub(crate) const fn profile_stage_raw(stage: ProfileStage) -> u16 {
     match stage {
         ProfileStage::Executable => 1,
         ProfileStage::ValidationOnly => 2,

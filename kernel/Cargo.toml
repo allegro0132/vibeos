@@ -186,6 +186,18 @@ wasm-c75-boot-revalidation-acceptance = [
     "dep:vibeos-component-runtime",
     "vibeos-image-policy/c73-authenticated-admission-qemu-acceptance",
 ]
+# QEMU-only C7.6 proof for one authenticated, durable graph-version
+# replacement. The complete successor graph is committed and physically
+# revalidated before the validation-only C6.6 lifecycle may stage its fresh
+# target or rotate either incident route.
+wasm-c76-graph-version-replacement-acceptance = [
+    "component-durable-publication",
+    "component-graph-principals",
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-runtime",
+    "vibeos-core/wasm-c66-node-replacement-acceptance",
+    "vibeos-image-policy/c76-graph-version-replacement-qemu-acceptance",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

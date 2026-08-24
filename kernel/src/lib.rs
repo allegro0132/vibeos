@@ -122,6 +122,33 @@ compile_error!(
 ))]
 compile_error!("feature `wasm-c75-boot-revalidation-acceptance` requires the QEMU default image");
 #[cfg(all(
+    feature = "wasm-c76-graph-version-replacement-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!(
+    "feature `wasm-c76-graph-version-replacement-acceptance` requires the QEMU default image"
+);
+#[cfg(all(
+    feature = "wasm-c76-graph-version-replacement-acceptance",
+    any(
+        feature = "legacy-shell",
+        feature = "ssh-component-command",
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c73-authenticated-admission-acceptance",
+        feature = "wasm-c74-crash-safe-publication-acceptance",
+        feature = "wasm-c75-boot-revalidation-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c76-graph-version-replacement-acceptance` is isolated from guest, command, and every earlier WASM acceptance root"
+);
+#[cfg(all(
     feature = "wasm-c75-boot-revalidation-acceptance",
     any(
         feature = "legacy-shell",
@@ -359,6 +386,8 @@ mod component_durable_publication;
 mod component_graph_information_flow;
 #[cfg(feature = "component-graph-principals")]
 pub mod component_graph_principals;
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+mod component_graph_version_replacement;
 mod component_instances;
 mod dev;
 #[path = "authority_store_platform.rs"]
@@ -942,6 +971,40 @@ pub extern "C" fn kmain() -> ! {
             }
         }
     });
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    let c76_baseline_component_count = world.c76_component_count();
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    let c76_graph_authority_journal = if online_hart_count() == 4 {
+        world.c76_graph_authority_journal()
+    } else {
+        None
+    };
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    exec::spawn(
+        "wasm-c76-graph-version-replacement-acceptance",
+        async move {
+            match component_graph_version_replacement::run_qemu_acceptance(
+                c76_graph_authority_journal,
+                c76_baseline_component_count,
+            )
+            .await
+            {
+                Some(component_graph_version_replacement::C76BootOutcome::InstalledG0) => {
+                    crate::println!("\nWASM_C76_GRAPH_VERSION_REPLACEMENT PASS durable_state=installed_g0 versions=1 replacements=0 image_candidate=1 physical_readback=1 fresh_graphs=1 current_visible=1 candidate_runtime_objects=0 runtime_ready=0 guest_calls=0 raw_ids=0 ambient_lookup=0 vsh=0");
+                }
+                Some(component_graph_version_replacement::C76BootOutcome::ReplacedG1) => {
+                    crate::println!("\nWASM_C76_GRAPH_VERSION_REPLACEMENT PASS durable_state=replaced_g1 versions=2 replacements=1 image_candidate=1 durable_before_candidate=1 physical_readback=1 fresh_graphs=2 policy_cancel=1 candidate_hidden=1 old_terminal_before_new_visible=1 siblings_stable=2 sibling_restarts=0 old_routes_retired=2 fresh_routes=2 stale_replacement_tokens=2 late_wake_stale=1 visibility_linearizations=1 mixed_versions=0 fail_stop_armed=1 runtime_ready=0 guest_calls=0 raw_ids=0 ambient_lookup=0 vsh=0");
+                }
+                Some(component_graph_version_replacement::C76BootOutcome::ExistingG1) => {
+                    crate::println!("\nWASM_C76_GRAPH_VERSION_REPLACEMENT PASS durable_state=existing_g1 versions=2 replacements=1 image_candidate=0 no_write=1 physical_readback=1 fresh_graphs=2 successor_visible=1 candidate_runtime_objects=0 runtime_ready=0 guest_calls=0 raw_ids=0 ambient_lookup=0 vsh=0");
+                }
+                None => {
+                    crate::println!("WASM_C76_GRAPH_VERSION_REPLACEMENT FAIL");
+                    sbi::shutdown(true);
+                }
+            }
+        },
+    );
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
     exec::spawn(
         "wasm-c54-native-revoke-worker",
@@ -974,7 +1037,8 @@ pub extern "C" fn kmain() -> ! {
         feature = "legacy-shell",
         feature = "wasm-c67-information-flow-acceptance",
         feature = "wasm-c74-crash-safe-publication-acceptance",
-        feature = "wasm-c75-boot-revalidation-acceptance"
+        feature = "wasm-c75-boot-revalidation-acceptance",
+        feature = "wasm-c76-graph-version-replacement-acceptance"
     )))]
     {
         let space = world.spaces["vsh"].clone();

@@ -47,16 +47,20 @@ pub use vibeos_authority_store::{
 
 const STORAGE_V2_EXTERNAL_POLICY_V1: &[u8] = b"vibeos.storage-v2.external-policy.v1\0persistent-space=0x5053,slot=0,generation=0,rights=rgx,kind=0x43535043\0program-space=0x50524f47,slot=0,generation=0,rights=r,kind=0x50524731\0sealed-singleton-optional=0x53534801";
 const STORAGE_V2_EXTERNAL_POLICY_V2: &[u8] = b"vibeos.storage-v2.external-policy.v2\0persistent-space=0x5053,slot=0,generation=0,rights=rgx,kind=0x43535043\0program-space=0x50524f47,slot=0,generation=0,rights=r,kind=0x50524731\0component-space=0x564942454f532d434f4d504f4e454e54,slot=0,generation=0,rights=r,kind=0x434d5031\0component-evidence=exact-root-relative,kind=0x434d4531,len=112,inline=1,ungranted=1\0sealed-singleton-optional=0x53534801";
+const STORAGE_V2_EXTERNAL_POLICY_V3: &[u8] = b"vibeos.storage-v2.external-policy.v3\0persistent-space=0x5053,slot=0,generation=0,rights=rgx,kind=0x43535043\0program-space=0x50524f47,slot=0,generation=0,rights=r,kind=0x50524731\0graph-space=0x564942454f532d47524150482d563100,slot=0,generations=0..1,rights=r,kind=0x43475631\0graph-attachments=exact-root-relative,per-generation=3*0x434d5031+3*0x434d4531+1*0x43474531,inline=1,ungranted=1,max-replacement=1";
 const SSH_CONFIG_OBJECT_KIND_RAW: u32 = 0x5353_4801;
 const COMPONENT_ARTIFACT_SPACE_ID_RAW: u128 = 0x5649_4245_4f53_2d43_4f4d_504f_4e45_4e54;
 const COMPONENT_ARTIFACT_OBJECT_KIND_RAW: u32 = 0x434d_5031;
 const COMPONENT_OPERATOR_EVIDENCE_OBJECT_KIND_RAW: u32 = 0x434d_4531;
+const COMPONENT_GRAPH_SPACE_ID_RAW: u128 = 0x5649_4245_4f53_2d47_5241_5048_2d56_3100;
+const COMPONENT_GRAPH_VERSION_OBJECT_KIND_RAW: u32 = 0x4347_5631;
 const M4_STORE_ID_RAW: u128 = 0x5649_4245_4f53_2d53_544f_5245_2d4d_3401;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StorageV2ExternalPolicy {
     LegacyV1,
     ComponentV2,
+    GraphV3,
 }
 
 impl StorageV2ExternalPolicy {
@@ -64,6 +68,7 @@ impl StorageV2ExternalPolicy {
         match self {
             Self::LegacyV1 => STORAGE_V2_EXTERNAL_POLICY_V1,
             Self::ComponentV2 => STORAGE_V2_EXTERNAL_POLICY_V2,
+            Self::GraphV3 => STORAGE_V2_EXTERNAL_POLICY_V3,
         }
     }
 
@@ -76,6 +81,8 @@ impl StorageV2ExternalPolicy {
             Some(Self::LegacyV1)
         } else if commitment == Self::ComponentV2.commitment() {
             Some(Self::ComponentV2)
+        } else if commitment == Self::GraphV3.commitment() {
+            Some(Self::GraphV3)
         } else {
             None
         }
@@ -83,11 +90,21 @@ impl StorageV2ExternalPolicy {
 }
 
 const fn active_storage_v2_external_policy() -> StorageV2ExternalPolicy {
-    #[cfg(feature = "component-durable-publication")]
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    {
+        StorageV2ExternalPolicy::GraphV3
+    }
+    #[cfg(all(
+        not(feature = "wasm-c76-graph-version-replacement-acceptance"),
+        feature = "component-durable-publication"
+    ))]
     {
         StorageV2ExternalPolicy::ComponentV2
     }
-    #[cfg(not(feature = "component-durable-publication"))]
+    #[cfg(all(
+        not(feature = "wasm-c76-graph-version-replacement-acceptance"),
+        not(feature = "component-durable-publication")
+    ))]
     {
         StorageV2ExternalPolicy::LegacyV1
     }
@@ -101,6 +118,10 @@ pub(crate) fn storage_v2_component_external_policy_sha256() -> [u8; 32] {
     StorageV2ExternalPolicy::ComponentV2.commitment()
 }
 
+pub(crate) fn storage_v2_graph_external_policy_sha256() -> [u8; 32] {
+    StorageV2ExternalPolicy::GraphV3.commitment()
+}
+
 pub(crate) fn storage_v2_legacy_external_policy_sha256() -> [u8; 32] {
     StorageV2ExternalPolicy::LegacyV1.commitment()
 }
@@ -109,7 +130,16 @@ pub(crate) fn storage_v2_recovery_policy_is_recognized(commitment: [u8; 32]) -> 
     if commitment == storage_v2_external_policy_sha256() {
         return true;
     }
-    #[cfg(feature = "component-durable-publication")]
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    {
+        // V3 is an independent C7.6 history profile.  A C7.5 V2 or legacy V1
+        // disk is never migrated, reinterpreted, or selected by this image.
+        false
+    }
+    #[cfg(all(
+        not(feature = "wasm-c76-graph-version-replacement-acceptance"),
+        feature = "component-durable-publication"
+    ))]
     {
         commitment == storage_v2_legacy_external_policy_sha256()
     }
@@ -292,6 +322,129 @@ mod storage_v2_policy_tests {
         );
     }
 
+    #[cfg(all(test, feature = "wasm-c76-graph-version-replacement-acceptance"))]
+    #[test]
+    fn graph_v3_rejects_foreign_object_even_when_an_allowed_space_child_names_it() {
+        let store_id = StoreId::new(M4_STORE_ID_RAW).unwrap();
+        let mut chain = durable::RecordChain::new(store_id);
+        let mut records = vec![chain.append(None, durable::RecordBody::Format).unwrap()];
+        records.push(
+            chain
+                .append(
+                    None,
+                    durable::RecordBody::IdHighWater {
+                        exclusive_end: PERSISTENT_SPACE_ID_RAW + 1,
+                    },
+                )
+                .unwrap(),
+        );
+        let root_object = durable::ObjectId::new(2).unwrap();
+        records.extend(
+            durable::encode_object_transaction(
+                &mut chain,
+                durable::TransactionId::new(1).unwrap(),
+                root_object,
+                persistent_object_kind(),
+                MARKER,
+            )
+            .unwrap()
+            .records,
+        );
+        let root_derivation = durable::DerivationId::new(4).unwrap();
+        let (root, next) = durable::preview_grant_transaction(
+            &chain,
+            durable::TransactionId::new(3).unwrap(),
+            durable::GrantRecord {
+                derivation_id: root_derivation,
+                parent_id: None,
+                object_id: root_object,
+                target: durable::SlotIdentity {
+                    space: persistent_space_id(),
+                    slot: ROOT_SLOT,
+                    generation: 0,
+                },
+                rights: ROOT_RIGHTS,
+                resource_kind: stored_object_resource_kind(),
+                flags: durable::GrantFlags::ROOT,
+            },
+        )
+        .unwrap();
+        records.extend(root.records);
+        chain = next;
+
+        let foreign_object = durable::ObjectId::new(6).unwrap();
+        records.extend(
+            durable::encode_object_transaction(
+                &mut chain,
+                durable::TransactionId::new(5).unwrap(),
+                foreign_object,
+                durable::ObjectKind::new(0x7f00_0076).unwrap(),
+                b"not part of the fixed persistent graph",
+            )
+            .unwrap()
+            .records,
+        );
+        let (child, _) = durable::preview_grant_transaction(
+            &chain,
+            durable::TransactionId::new(7).unwrap(),
+            durable::GrantRecord {
+                derivation_id: durable::DerivationId::new(8).unwrap(),
+                parent_id: Some(root_derivation),
+                object_id: foreign_object,
+                target: durable::SlotIdentity {
+                    space: persistent_space_id(),
+                    slot: CHILD_SLOT,
+                    generation: 0,
+                },
+                rights: CHILD_RIGHTS,
+                resource_kind: stored_object_resource_kind(),
+                flags: durable::GrantFlags::DERIVED,
+            },
+        )
+        .unwrap();
+        records.extend(child.records);
+
+        assert_eq!(
+            validate_storage_v2_record_stream_for_policy(
+                &record_stream(&records),
+                storage_v2_graph_external_policy_sha256(),
+            ),
+            Err(DurableCSpaceError::RootPolicy)
+        );
+    }
+
+    #[cfg(all(test, feature = "wasm-c76-graph-version-replacement-acceptance"))]
+    #[test]
+    fn graph_v3_rejects_instead_of_retaining_an_ssh_singleton() {
+        let store_id = StoreId::new(M4_STORE_ID_RAW).unwrap();
+        let mut chain = durable::RecordChain::new(store_id);
+        let mut records = vec![chain.append(None, durable::RecordBody::Format).unwrap()];
+        records.push(
+            chain
+                .append(None, durable::RecordBody::IdHighWater { exclusive_end: 4 })
+                .unwrap(),
+        );
+        records.extend(
+            durable::encode_object_transaction(
+                &mut chain,
+                durable::TransactionId::new(2).unwrap(),
+                durable::ObjectId::new(3).unwrap(),
+                durable::ObjectKind::new(SSH_CONFIG_OBJECT_KIND_RAW).unwrap(),
+                b"must not cross V3 import",
+            )
+            .unwrap()
+            .records,
+        );
+
+        assert!(matches!(
+            storage_v2_recovery_import_for_policy(
+                &record_stream(&records),
+                storage_v2_graph_external_policy_sha256(),
+            ),
+            Err(DurableCSpaceError::RootPolicy)
+        ));
+    }
+
     #[cfg_attr(test, test)]
     pub(crate) fn v2_stream_policy_accepts_canonical_empty_authority() {
         let store_id = StoreId::new(M4_STORE_ID_RAW).unwrap();
@@ -329,6 +482,10 @@ mod storage_v2_policy_tests {
             storage_v2_legacy_external_policy_sha256(),
             storage_v2_component_external_policy_sha256()
         );
+        assert_ne!(
+            storage_v2_component_external_policy_sha256(),
+            storage_v2_graph_external_policy_sha256()
+        );
         assert!(matches!(
             storage_v2_recovery_import_for_policy(&stream, [0xa5; 32]),
             Err(DurableCSpaceError::RootPolicy)
@@ -349,11 +506,16 @@ mod storage_v2_policy_tests {
                 storage_v2_component_external_policy_sha256(),
                 vibeos_component_loader::C74_STORAGE_V2_EXTERNAL_POLICY_SHA256
             );
+            #[cfg(not(feature = "wasm-c76-graph-version-replacement-acceptance"))]
             assert!(storage_v2_recovery_policy_is_recognized(
                 storage_v2_legacy_external_policy_sha256()
             ));
+            #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+            assert!(!storage_v2_recovery_policy_is_recognized(
+                storage_v2_legacy_external_policy_sha256()
+            ));
             assert!(storage_v2_recovery_policy_is_recognized(
-                storage_v2_component_external_policy_sha256()
+                storage_v2_external_policy_sha256()
             ));
         }
         #[cfg(not(feature = "component-durable-publication"))]
@@ -365,6 +527,30 @@ mod storage_v2_policy_tests {
                 ),
                 Err(DurableCSpaceError::RootPolicy)
             ));
+            assert!(!storage_v2_recovery_policy_is_recognized(
+                storage_v2_component_external_policy_sha256()
+            ));
+        }
+
+        #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+        {
+            let graph = storage_v2_recovery_import_for_policy(
+                &stream,
+                storage_v2_graph_external_policy_sha256(),
+            )
+            .unwrap();
+            assert_eq!(
+                graph.root_policy_sha256(),
+                vibeos_object_store::c76_storage_v2_external_policy_sha256()
+            );
+            assert_eq!(
+                storage_v2_graph_external_policy_sha256(),
+                vibeos_object_store::c76_storage_v2_external_policy_sha256()
+            );
+            assert_eq!(
+                storage_v2_external_policy_sha256(),
+                storage_v2_graph_external_policy_sha256()
+            );
             assert!(!storage_v2_recovery_policy_is_recognized(
                 storage_v2_component_external_policy_sha256()
             ));
@@ -387,20 +573,30 @@ pub(crate) fn run_storage_v2_policy_selftests() {
 pub(crate) fn storage_v2_migration_import(
     records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
 ) -> Result<vibeos_segment_store::PersistentAuthorityImport, DurableCSpaceError> {
-    let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
-    // Frozen M4 is always checked under its historical v1 allowlist. Only
-    // after that proof may the disjoint V2 checkpoint commit to the active
-    // policy. This is an explicit cutover, never an in-place reinterpretation
-    // of v1 media.
-    let preflight = validate_storage_v2_records(records, StorageV2ExternalPolicy::LegacyV1)?;
-    let roots = select_storage_v2_roots(&preflight, StorageV2ExternalPolicy::LegacyV1)?;
-    storage_v2_import_from_parts(
-        records,
-        store_id,
-        preflight,
-        roots,
-        active_storage_v2_external_policy(),
-    )
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    {
+        let _ = records;
+        // V3 is provisioned only as a native-empty store.  C7.6 neither
+        // upgrades legacy M4/V1 nor reinterprets a C7.5 V2 namespace.
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    #[cfg(not(feature = "wasm-c76-graph-version-replacement-acceptance"))]
+    {
+        let store_id = StoreId::new(M4_STORE_ID_RAW).expect("fixed M4 store ID is non-zero");
+        // Frozen M4 is always checked under its historical v1 allowlist. Only
+        // after that proof may the disjoint V2 checkpoint commit to the active
+        // policy. This is an explicit cutover, never an in-place reinterpretation
+        // of v1 media.
+        let preflight = validate_storage_v2_records(records, StorageV2ExternalPolicy::LegacyV1)?;
+        let roots = select_storage_v2_roots(&preflight, StorageV2ExternalPolicy::LegacyV1)?;
+        storage_v2_import_from_parts(
+            records,
+            store_id,
+            preflight,
+            roots,
+            active_storage_v2_external_policy(),
+        )
+    }
 }
 
 fn storage_v2_import_exact_policy(
@@ -431,11 +627,19 @@ fn storage_v2_import_from_parts(
 ) -> Result<vibeos_segment_store::PersistentAuthorityImport, DurableCSpaceError> {
     let ssh_kind = durable::ObjectKind::new(SSH_CONFIG_OBJECT_KIND_RAW)
         .expect("fixed SSH configuration kind is non-zero");
-    let sealed_singletons = preflight
-        .committed_objects()
-        .iter()
-        .any(|object| object.object_kind == ssh_kind)
-        .then_some(ssh_kind);
+    // Graph V3 has no singleton/latest-kind policy seam. In particular an SSH
+    // record cannot survive import merely because an older policy recognized
+    // its kind; the exact V3 preflight rejects it as foreign closure and this
+    // import independently retains no singleton kind.
+    let sealed_singletons = (policy != StorageV2ExternalPolicy::GraphV3)
+        .then(|| {
+            preflight
+                .committed_objects()
+                .iter()
+                .any(|object| object.object_kind == ssh_kind)
+                .then_some(ssh_kind)
+        })
+        .flatten();
     let exact_attachments = exact_component_evidence_attachment(&preflight, &roots, policy)?;
     // The policy pass above selects the exact root-relative attachment. The
     // public import boundary independently re-preflights these same sectors so
@@ -462,6 +666,24 @@ fn exact_component_evidence_attachment(
 ) -> Result<Vec<durable::RecoveredObject>, DurableCSpaceError> {
     if policy == StorageV2ExternalPolicy::LegacyV1 {
         return Ok(Vec::new());
+    }
+    if policy == StorageV2ExternalPolicy::GraphV3 {
+        #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+        {
+            let selected = vibeos_object_store::validate_c76_preflight_policy(preflight)
+                .map_err(|_| DurableCSpaceError::RootPolicy)?;
+            let graph_root = roots
+                .iter()
+                .find(|root| root.grant.target.space == component_graph_space_id());
+            return selected
+                .into_import_attachments_for_root(graph_root)
+                .map_err(|_| DurableCSpaceError::RootPolicy);
+        }
+        #[cfg(not(feature = "wasm-c76-graph-version-replacement-acceptance"))]
+        {
+            let _ = (preflight, roots);
+            return Err(DurableCSpaceError::RootPolicy);
+        }
     }
     #[cfg(not(feature = "component-durable-publication"))]
     {
@@ -665,6 +887,14 @@ pub(crate) fn storage_v2_compact_records_for_policy(
 ) -> Result<Option<Vec<[u8; vibeos_durable_format::RECORD_SIZE]>>, DurableCSpaceError> {
     let policy = StorageV2ExternalPolicy::from_commitment(policy_sha256)
         .ok_or(DurableCSpaceError::RootPolicy)?;
+    if policy == StorageV2ExternalPolicy::GraphV3 {
+        // C7.6 proves an exact two-version append history, including the G0
+        // tombstone immediately before the G1 root.  Rewriting that logical
+        // history is intentionally outside the narrow verifier (C7.8), so a
+        // V3 image validates it but never logically compacts it.
+        let _validated = storage_v2_import_exact_policy(records, policy)?;
+        return Ok(None);
+    }
     let compacted = if drop_ungranted_objects {
         // Constructing the import first performs the complete external-policy
         // pass and freezes its exact admitted set. Segment-store then retains
@@ -1718,10 +1948,33 @@ fn component_artifact_space_id() -> durable::SpaceId {
         .expect("fixed Component artifact space is non-zero")
 }
 
+fn component_graph_space_id() -> durable::SpaceId {
+    durable::SpaceId::new(COMPONENT_GRAPH_SPACE_ID_RAW)
+        .expect("fixed Component graph space is non-zero")
+}
+
 fn component_space_has_live_root(
     preflight: &durable::RecoveryPreflight,
 ) -> Result<bool, DurableCSpaceError> {
     let space = component_artifact_space_id();
+    let has_live = preflight
+        .slots()
+        .iter()
+        .any(|slot| slot.space == space && slot.live_derivation.is_some());
+    if preflight
+        .slots()
+        .iter()
+        .any(|slot| slot.space == space && slot.slot != 0)
+    {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    Ok(has_live)
+}
+
+fn graph_space_has_live_root(
+    preflight: &durable::RecoveryPreflight,
+) -> Result<bool, DurableCSpaceError> {
+    let space = component_graph_space_id();
     let has_live = preflight
         .slots()
         .iter()
@@ -1748,11 +2001,35 @@ fn select_storage_v2_roots(
         slot.space == program_model::program_space_id() && slot.live_derivation.is_some()
     });
     let has_live_component = component_space_has_live_root(preflight)?;
-    if policy == StorageV2ExternalPolicy::LegacyV1 && has_live_component {
+    let has_live_graph = graph_space_has_live_root(preflight)?;
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    let exact_graph_policy = if policy == StorageV2ExternalPolicy::GraphV3 {
+        Some(
+            vibeos_object_store::validate_c76_preflight_policy(preflight)
+                .map_err(|_| DurableCSpaceError::RootPolicy)?,
+        )
+    } else {
+        None
+    };
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    if exact_graph_policy
+        .as_ref()
+        .is_some_and(|selected| has_live_graph != selected.has_graph_root())
+    {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    if (policy == StorageV2ExternalPolicy::LegacyV1 && (has_live_component || has_live_graph))
+        || (policy == StorageV2ExternalPolicy::ComponentV2 && has_live_graph)
+        || (policy == StorageV2ExternalPolicy::GraphV3 && has_live_component)
+    {
         return Err(DurableCSpaceError::RootPolicy);
     }
     #[cfg(not(feature = "component-durable-publication"))]
     if policy == StorageV2ExternalPolicy::ComponentV2 {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    #[cfg(not(feature = "wasm-c76-graph-version-replacement-acceptance"))]
+    if policy == StorageV2ExternalPolicy::GraphV3 {
         return Err(DurableCSpaceError::RootPolicy);
     }
     let persistent_constraints = [RootConstraint {
@@ -1766,6 +2043,8 @@ fn select_storage_v2_roots(
     let program_constraints = [program_model::program_root_constraint()];
     #[cfg(feature = "component-durable-publication")]
     let component_constraints = [vibeos_component_loader::root_constraint()];
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    let graph_constraints = [vibeos_object_store::c76_graph_root_constraint()];
     let mut partitions = Vec::new();
     if has_live_authority {
         partitions.push(RootPolicyPartition {
@@ -1784,6 +2063,13 @@ fn select_storage_v2_roots(
         partitions.push(RootPolicyPartition {
             space: component_artifact_space_id(),
             constraints: &component_constraints,
+        });
+    }
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    if policy == StorageV2ExternalPolicy::GraphV3 && has_live_graph {
+        partitions.push(RootPolicyPartition {
+            space: component_graph_space_id(),
+            constraints: &graph_constraints,
         });
     }
     let roots = durable::select_root_policy_union(preflight, &partitions)
@@ -1815,6 +2101,33 @@ fn select_storage_v2_roots(
         && !roots.iter().any(|root| {
             root.grant.target.space == component_artifact_space_id()
                 && vibeos_component_loader::root_policy_is_exact(root)
+        })
+    {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    if policy == StorageV2ExternalPolicy::GraphV3
+        && has_live_graph
+        && !roots.iter().any(|root| {
+            root.grant.target.space == component_graph_space_id()
+                && root.grant.target.slot == 0
+                && root.grant.target.generation <= 1
+                && root.grant.parent_id.is_none()
+                && root.grant.flags == GrantFlags::ROOT
+                && root.grant.rights == DurableRights::READ
+                && root.grant.resource_kind == stored_object_resource_kind()
+        })
+    {
+        return Err(DurableCSpaceError::RootPolicy);
+    }
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    if policy == StorageV2ExternalPolicy::GraphV3
+        && !exact_graph_policy.as_ref().is_some_and(|selected| {
+            selected.graph_root_matches(
+                roots
+                    .iter()
+                    .find(|root| root.grant.target.space == component_graph_space_id()),
+            )
         })
     {
         return Err(DurableCSpaceError::RootPolicy);
@@ -1891,6 +2204,9 @@ fn authorize_snapshot_with_policy(
     if policy == StorageV2ExternalPolicy::ComponentV2 {
         policy_spaces.push(component_artifact_space_id());
     }
+    if policy == StorageV2ExternalPolicy::GraphV3 {
+        policy_spaces.push(component_graph_space_id());
+    }
     let tombstone_partitions = durable::partition_tombstones_by_space(
         &committed_grants,
         &recovered.tombstones,
@@ -1914,6 +2230,7 @@ fn authorize_snapshot_with_policy(
             || space == program_model::program_space_id()
             || (policy == StorageV2ExternalPolicy::ComponentV2
                 && space == component_artifact_space_id())
+            || (policy == StorageV2ExternalPolicy::GraphV3 && space == component_graph_space_id())
     };
     if recovered
         .grants

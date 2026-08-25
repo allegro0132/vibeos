@@ -1376,6 +1376,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-wasm-aot-profile"
+version = "0.1.0"
+
+[[package]]
 name = "vibeos-wasm-candidates"
 version = "0.1.0"
 dependencies = [

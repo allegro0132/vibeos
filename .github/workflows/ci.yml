@@ -60,6 +60,17 @@ jobs:
               -p vibeos-component-runtime --no-default-features \
               --features c84-profile-hooks \
               --test c84_profile --verbose
+      - name: Test the allocation-free C8.4 phase ledger
+        run: |
+          rustup target add --toolchain "$VIBEOS_TOOLCHAIN" \
+            riscv64imac-unknown-none-elf
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked \
+              -p vibeos-wasm-aot-profile --verbose
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo check --locked \
+              -p vibeos-wasm-aot-profile --target \
+              riscv64imac-unknown-none-elf --verbose
       - name: Test each image policy and the frozen C8.4 capacity preflight
         run: |
           RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \

@@ -78,9 +78,49 @@ jobs:
           python3 -B scripts/verify-storage-v2-migration.py --selftest
           ./scripts/verify-milkv-duo-image.sh --selftest
 
+  c82-preview1-corpus:
+    name: C8.2 source-to-execution evidence
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+      - name: Install repository toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal \
+            --component rust-src --component llvm-tools-preview \
+            --target wasm32-wasip1
+          rustup target add --toolchain "$toolchain" riscv64imac-unknown-none-elf
+          rustup target list --toolchain "$toolchain" --installed | grep -Fx wasm32-wasip1
+          rustup target list --toolchain "$toolchain" --installed \
+            | grep -Fx riscv64imac-unknown-none-elf
+          {
+            echo "VIBEOS_TOOLCHAIN=$toolchain"
+            echo "VIBEOS_RUSTC=$(rustup which --toolchain "$toolchain" rustc)"
+            echo "VIBEOS_RUSTDOC=$(rustup which --toolchain "$toolchain" rustdoc)"
+          } >> "$GITHUB_ENV"
+          rustup run "$toolchain" rustc -Vv
+          rustup run "$toolchain" cargo fetch --locked
+      - name: Install the reviewed wasi-sdk-33 toolchain
+        run: |
+          archive="$RUNNER_TEMP/wasi-sdk-33.0-arm64-macos.tar.gz"
+          curl -L --fail --show-error \
+            --output "$archive" \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-arm64-macos.tar.gz
+          printf '%s  %s\n' \
+            85c997a2665ead91673b5bb88b7d0df3fc8900df3bfa244f720d478187bbdc78 \
+            "$archive" | shasum -a 256 -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "C82_WASI_SDK_PATH=$RUNNER_TEMP/wasi-sdk-33.0-arm64-macos" >> "$GITHUB_ENV"
+      - name: Rebuild and execute the bounded Preview1 corpus
+        run: ./scripts/test-c82-preview1-corpus.sh
+
   differential:
     name: Real-rustc differential oracle
-    needs: host-tests
+    needs: [host-tests, c82-preview1-corpus]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1

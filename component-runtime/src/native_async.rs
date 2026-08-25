@@ -10094,11 +10094,7 @@ mod tests {
                 };
                 let pending = call.handle_host_call(
                     CallAuthority::Run(active),
-                    CoreHostCall {
-                        origin_instance,
-                        id,
-                        arguments: Vec::new(),
-                    },
+                    CoreHostCall::untrusted_description(origin_instance, id, Vec::new()),
                 );
                 assert_eq!(
                     finish_cleanup_turn(&mut call, pending),

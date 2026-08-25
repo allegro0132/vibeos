@@ -352,11 +352,7 @@ fn reusable_group_slot_preserves_host_origin_resume_fuel_and_metrics() {
     assert!(pending_polls > 2);
     assert_eq!(
         host,
-        CoreHostCall {
-            origin_instance: 0,
-            id: 414,
-            arguments: vec![CoreValue::I32(40)],
-        }
+        CoreHostCall::untrusted_description(0, 414, vec![CoreValue::I32(40)])
     );
     assert!(!group.has_active_call(0));
     assert!(group.has_active_call(1));
@@ -668,6 +664,54 @@ fn external_fuel_debit_and_credit_are_atomic_and_conservative() {
 }
 
 #[test]
+fn single_instance_external_fuel_uses_the_same_atomic_ledger() {
+    let module = compile(
+        r#"(module
+              (func (export "identity") (param i32) (result i32)
+                local.get 0))"#,
+    );
+    let mut instance = module.instantiate().unwrap();
+    assert_eq!(instance.debit_call_fuel(1), Err(TrapCode::Validation));
+    assert_eq!(instance.credit_call_fuel(1), Err(TrapCode::Validation));
+    instance
+        .start_call("identity", &[CoreValue::I32(9)], 100, 10)
+        .unwrap();
+
+    instance.debit_call_fuel(40).unwrap();
+    assert_eq!(
+        instance.call_metrics().unwrap(),
+        vibeos_wasm_runtime::CallMetrics {
+            consumed_fuel: 40,
+            remaining_fuel: 60,
+        }
+    );
+    let before_failed_debit = instance.call_metrics().unwrap();
+    assert_eq!(instance.debit_call_fuel(61), Err(TrapCode::FuelExhausted));
+    assert_eq!(instance.call_metrics(), Some(before_failed_debit));
+
+    instance.credit_call_fuel(20).unwrap();
+    assert_eq!(
+        instance.call_metrics().unwrap(),
+        vibeos_wasm_runtime::CallMetrics {
+            consumed_fuel: 20,
+            remaining_fuel: 80,
+        }
+    );
+    let before_over_credit = instance.call_metrics().unwrap();
+    assert_eq!(instance.credit_call_fuel(21), Err(TrapCode::FuelExhausted));
+    assert_eq!(instance.call_metrics(), Some(before_over_credit));
+
+    assert_eq!(
+        poll_instance_to_terminal(&mut instance),
+        PollResult::Ready(vec![CoreValue::I32(9)])
+    );
+    let terminal = instance.call_metrics().unwrap();
+    assert_eq!(terminal.consumed_fuel + terminal.remaining_fuel, 100);
+    assert_eq!(instance.debit_call_fuel(1), Err(TrapCode::Validation));
+    assert_eq!(instance.credit_call_fuel(1), Err(TrapCode::Validation));
+}
+
+#[test]
 fn group_host_ids_are_global_and_transitive_origin_is_definition_exact() {
     let engine = ProfileEngine::new();
     let provider = compile_in(
@@ -717,11 +761,7 @@ fn group_host_ids_are_global_and_transitive_origin_is_definition_exact() {
     group.start_call(1, "run", &[], 1_000, 100).unwrap();
     assert_eq!(
         group.poll_call(1),
-        PollResult::HostCall(CoreHostCall {
-            origin_instance: 0,
-            id: 313,
-            arguments: vec![],
-        })
+        PollResult::HostCall(CoreHostCall::untrusted_description(0, 313, vec![]))
     );
     assert!(!group.has_active_call(0));
     assert!(group.has_active_call(1));
@@ -1037,19 +1077,11 @@ fn component_group_keeps_suspended_host_calls_instance_exact() {
     group.start_call(1, "run", &[], 1_000, 100).unwrap();
     assert_eq!(
         group.poll_call(0),
-        PollResult::HostCall(CoreHostCall {
-            origin_instance: 0,
-            id: 81,
-            arguments: vec![]
-        })
+        PollResult::HostCall(CoreHostCall::untrusted_description(0, 81, vec![]))
     );
     assert_eq!(
         group.poll_call(1),
-        PollResult::HostCall(CoreHostCall {
-            origin_instance: 1,
-            id: 82,
-            arguments: vec![]
-        })
+        PollResult::HostCall(CoreHostCall::untrusted_description(1, 82, vec![]))
     );
 
     assert_eq!(
@@ -1123,11 +1155,7 @@ fn provider_host_reentry_is_exposed_for_the_component_to_reject() {
     group.start_call(1, "run", &[], 1_000, 100).unwrap();
     assert_eq!(
         group.poll_call(1),
-        PollResult::HostCall(CoreHostCall {
-            origin_instance: 1,
-            id: 92,
-            arguments: vec![]
-        })
+        PollResult::HostCall(CoreHostCall::untrusted_description(1, 92, vec![]))
     );
     group
         .start_call(
@@ -1145,11 +1173,7 @@ fn provider_host_reentry_is_exposed_for_the_component_to_reject() {
         .unwrap();
     assert_eq!(
         group.poll_call(0),
-        PollResult::HostCall(CoreHostCall {
-            origin_instance: 0,
-            id: 91,
-            arguments: vec![]
-        })
+        PollResult::HostCall(CoreHostCall::untrusted_description(0, 91, vec![]))
     );
     assert!(group.has_active_call(0));
     assert!(group.has_active_call(1));
@@ -1581,6 +1605,288 @@ fn host_call_yields_outside_wasmi_and_resumes_with_exact_typed_results() {
 }
 
 #[test]
+fn exact_host_termination_is_nonreturning_preserves_metrics_and_clears_the_mailbox() {
+    let module = compile(
+        r#"
+        (module
+          (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+          (memory (export "memory") 1 1)
+          (func (export "_start")
+            i32.const 7
+            call $proc_exit
+            i32.const 0
+            i32.const 99
+            i32.store8))
+        "#,
+    );
+    let params = [CoreValueType::I32];
+    let import = CoreHostImport {
+        id: 77,
+        module: "wasi_snapshot_preview1",
+        name: "proc_exit",
+        params: &params,
+        results: &[],
+    };
+    let mut instance = module.instantiate_with_imports(&[import]).unwrap();
+    instance.start_call("_start", &[], 10_000, 1_000).unwrap();
+    let call = poll_instance_to_host(&mut instance);
+    assert_eq!(
+        call,
+        CoreHostCall::untrusted_description(0, 77, vec![CoreValue::I32(7)])
+    );
+    let suspended = instance.call_metrics().unwrap();
+    assert!(suspended.consumed_fuel > 0);
+    assert_eq!(suspended.consumed_fuel + suspended.remaining_fuel, 10_000);
+
+    let reconstructed =
+        CoreHostCall::untrusted_description(call.origin_instance, call.id, call.arguments.clone());
+    assert!(matches!(
+        instance.host_termination_token(reconstructed),
+        Err(TrapCode::Validation)
+    ));
+    let wrong = CoreHostCall::untrusted_description(0, 78, vec![CoreValue::I32(7)]);
+    assert!(matches!(
+        instance.host_termination_token(wrong),
+        Err(TrapCode::Validation)
+    ));
+    assert!(instance.has_active_call());
+    assert_eq!(instance.call_metrics(), Some(suspended));
+
+    let token = instance.host_termination_token(call).unwrap();
+    instance.terminate_suspended_host_call(token).unwrap();
+    assert!(!instance.has_active_call());
+    assert_eq!(instance.call_metrics(), Some(suspended));
+    let mut byte = [0_u8; 1];
+    instance.read_memory("memory", 0, &mut byte).unwrap();
+    assert_eq!(byte, [0], "guest instructions after proc_exit must not run");
+    assert_eq!(
+        instance.resume_host_call(77, &[]),
+        Err(TrapCode::Validation)
+    );
+
+    // A fresh call reaching the same import proves the terminal transition did
+    // not leave a stale mailbox entry behind.
+    instance.start_call("_start", &[], 10_000, 1_000).unwrap();
+    let call = poll_instance_to_host(&mut instance);
+    assert_eq!(call.id, 77);
+    let token = instance.host_termination_token(call).unwrap();
+    instance.terminate_suspended_host_call(token).unwrap();
+}
+
+#[test]
+fn exact_host_termination_rejects_non_host_and_already_resolved_continuations() {
+    let host_module = compile(
+        r#"
+        (module
+          (import "host" "value" (func $value (result i32)))
+          (func (export "run") (result i32)
+            call $value))
+        "#,
+    );
+    let results = [CoreValueType::I32];
+    let import = CoreHostImport {
+        id: 91,
+        module: "host",
+        name: "value",
+        params: &[],
+        results: &results,
+    };
+    let mut host = host_module.instantiate_with_imports(&[import]).unwrap();
+    host.start_call("run", &[], 10_000, 1_000).unwrap();
+    let call = poll_instance_to_host(&mut host);
+    assert_eq!(call.id, 91);
+    let resolved_token = host.host_termination_token(call).unwrap();
+    host.resume_host_call(91, &[CoreValue::I32(42)]).unwrap();
+    let resolved_metrics = host.call_metrics().unwrap();
+    assert!(matches!(
+        host.terminate_suspended_host_call(resolved_token),
+        Err(TrapCode::Validation)
+    ));
+    assert!(host.has_active_call());
+    assert_eq!(host.call_metrics(), Some(resolved_metrics));
+    assert_eq!(
+        poll_instance_to_terminal(&mut host),
+        PollResult::Ready(vec![CoreValue::I32(42)])
+    );
+
+    // Mint another exact token, finish its rightful call normally, and prove
+    // that the token cannot terminate a non-host continuation in any instance.
+    host.start_call("run", &[], 10_000, 1_000).unwrap();
+    let call = poll_instance_to_host(&mut host);
+    let non_host_token = host.host_termination_token(call).unwrap();
+    host.resume_host_call(91, &[CoreValue::I32(7)]).unwrap();
+    assert_eq!(
+        poll_instance_to_terminal(&mut host),
+        PollResult::Ready(vec![CoreValue::I32(7)])
+    );
+
+    let pending_module = compile(r#"(module (func (export "spin") (loop br 0)))"#);
+    let mut pending = pending_module.instantiate().unwrap();
+    pending.start_call("spin", &[], 1_000, 10).unwrap();
+    assert!(matches!(pending.poll_call(), PollResult::Pending { .. }));
+    let pending_metrics = pending.call_metrics().unwrap();
+    assert!(matches!(
+        pending.terminate_suspended_host_call(non_host_token),
+        Err(TrapCode::Validation)
+    ));
+    assert!(pending.has_active_call());
+    assert_eq!(pending.call_metrics(), Some(pending_metrics));
+    pending.discard_call().unwrap();
+}
+
+#[test]
+fn dropped_event_and_exact_argument_allocation_reuse_cannot_mint_termination() {
+    let module = compile(
+        r#"
+        (module
+          (import "host" "value" (func $value (param i32) (result i32)))
+          (func (export "run") (result i32)
+            i32.const 9
+            call $value))
+        "#,
+    );
+    let values = [CoreValueType::I32];
+    let import = CoreHostImport {
+        id: 119,
+        module: "host",
+        name: "value",
+        params: &values,
+        results: &values,
+    };
+    let mut instance = module.instantiate_with_imports(&[import]).unwrap();
+    instance.start_call("run", &[], 10_000, 1_000).unwrap();
+    let mut genuine = poll_instance_to_host(&mut instance);
+    let origin_instance = genuine.origin_instance;
+    let id = genuine.id;
+    let allocation = core::mem::take(&mut genuine.arguments);
+    let allocation_pointer = allocation.as_ptr();
+    drop(genuine);
+
+    // Reuse the exact allocation which previously held the genuine event's
+    // arguments. Provenance is private evidence, never allocator identity.
+    let reconstructed = CoreHostCall::untrusted_description(origin_instance, id, allocation);
+    assert_eq!(reconstructed.arguments.as_ptr(), allocation_pointer);
+    let suspended = instance.call_metrics().unwrap();
+    assert!(matches!(
+        instance.host_termination_token(reconstructed),
+        Err(TrapCode::Validation)
+    ));
+    assert!(instance.has_active_call());
+    assert_eq!(instance.call_metrics(), Some(suspended));
+
+    instance
+        .resume_host_call(119, &[CoreValue::I32(27)])
+        .unwrap();
+    assert_eq!(
+        poll_instance_to_terminal(&mut instance),
+        PollResult::Ready(vec![CoreValue::I32(27)])
+    );
+}
+
+#[test]
+fn stale_host_termination_token_cannot_terminate_next_same_import_occurrence() {
+    let module = compile(
+        r#"
+        (module
+          (import "host" "same" (func $same (result i32)))
+          (func (export "run") (result i32)
+            call $same))
+        "#,
+    );
+    let results = [CoreValueType::I32];
+    let import = CoreHostImport {
+        id: 123,
+        module: "host",
+        name: "same",
+        params: &[],
+        results: &results,
+    };
+    let mut instance = module.instantiate_with_imports(&[import]).unwrap();
+
+    instance.start_call("run", &[], 10_000, 1_000).unwrap();
+    let first_call = poll_instance_to_host(&mut instance);
+    let reconstructed = CoreHostCall::untrusted_description(
+        first_call.origin_instance,
+        first_call.id,
+        first_call.arguments.clone(),
+    );
+    assert!(matches!(
+        instance.host_termination_token(reconstructed),
+        Err(TrapCode::Validation)
+    ));
+    let stale = instance.host_termination_token(first_call).unwrap();
+    instance
+        .resume_host_call(123, &[CoreValue::I32(1)])
+        .unwrap();
+    assert_eq!(
+        poll_instance_to_terminal(&mut instance),
+        PollResult::Ready(vec![CoreValue::I32(1)])
+    );
+
+    instance.start_call("run", &[], 10_000, 1_000).unwrap();
+    let second_call = poll_instance_to_host(&mut instance);
+    let second_metrics = instance.call_metrics().unwrap();
+    assert!(matches!(
+        instance.terminate_suspended_host_call(stale),
+        Err(TrapCode::Validation)
+    ));
+    assert!(instance.has_active_call());
+    assert_eq!(instance.call_metrics(), Some(second_metrics));
+
+    let current = instance.host_termination_token(second_call).unwrap();
+    instance.terminate_suspended_host_call(current).unwrap();
+    assert!(!instance.has_active_call());
+    assert_eq!(instance.call_metrics(), Some(second_metrics));
+}
+
+#[test]
+fn host_termination_token_is_instance_and_generation_exact() {
+    let module = compile(
+        r#"
+        (module
+          (import "host" "same" (func $same (result i32)))
+          (func (export "run") (result i32)
+            call $same))
+        "#,
+    );
+    let results = [CoreValueType::I32];
+    let import = CoreHostImport {
+        id: 321,
+        module: "host",
+        name: "same",
+        params: &[],
+        results: &results,
+    };
+    let mut first = module.instantiate_with_imports(&[import]).unwrap();
+    let mut second = module.instantiate_with_imports(&[import]).unwrap();
+    first.start_call("run", &[], 10_000, 1_000).unwrap();
+    second.start_call("run", &[], 10_000, 1_000).unwrap();
+    let first_call = poll_instance_to_host(&mut first);
+    let second_call = poll_instance_to_host(&mut second);
+    let first_token = first.host_termination_token(first_call).unwrap();
+    let second_metrics = second.call_metrics().unwrap();
+
+    assert!(matches!(
+        second.terminate_suspended_host_call(first_token),
+        Err(TrapCode::Validation)
+    ));
+    assert!(second.has_active_call());
+    assert_eq!(second.call_metrics(), Some(second_metrics));
+
+    let second_token = second.host_termination_token(second_call).unwrap();
+    second.terminate_suspended_host_call(second_token).unwrap();
+    assert!(!second.has_active_call());
+
+    // Consuming the first instance's token on the wrong instance did not
+    // mutate its continuation; the rightful host may still resolve it.
+    first.resume_host_call(321, &[CoreValue::I32(5)]).unwrap();
+    assert_eq!(
+        poll_instance_to_terminal(&mut first),
+        PollResult::Ready(vec![CoreValue::I32(5)])
+    );
+}
+
+#[test]
 fn sequential_host_yields_cancel_and_drop_preserve_linear_continuations() {
     let module = compile(
         r#"
@@ -1617,20 +1923,12 @@ fn sequential_host_yields_cancel_and_drop_preserve_linear_continuations() {
         .unwrap();
     assert_eq!(
         poll_instance_to_host(&mut instance),
-        CoreHostCall {
-            origin_instance: 0,
-            id: 1,
-            arguments: vec![CoreValue::I32(4)]
-        }
+        CoreHostCall::untrusted_description(0, 1, vec![CoreValue::I32(4)])
     );
     instance.resume_host_call(1, &[CoreValue::I32(7)]).unwrap();
     assert_eq!(
         poll_instance_to_host(&mut instance),
-        CoreHostCall {
-            origin_instance: 0,
-            id: 2,
-            arguments: vec![CoreValue::I32(7)]
-        }
+        CoreHostCall::untrusted_description(0, 2, vec![CoreValue::I32(7)])
     );
     instance.resume_host_call(2, &[CoreValue::I64(99)]).unwrap();
     assert_eq!(

@@ -930,11 +930,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-c82-preview1-corpus"
+version = "0.1.0"
+dependencies = [
+ "vibeos-c81-preview1-componentizer",
+ "vibeos-wasm-runtime",
+ "wasmparser 0.255.0",
+ "wat",
+ "wit-component",
+]
+
+[[package]]
 name = "vibeos-component-admission"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "sha2",
+ "vibeos-c82-preview1-corpus",
  "vibeos-component-format",
  "vibeos-component-host",
  "vibeos-component-runtime",

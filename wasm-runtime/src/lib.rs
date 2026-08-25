@@ -715,13 +715,105 @@ impl<'a> CoreModuleImport<'a> {
 }
 
 /// A suspended Core call requesting one exact host operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The event is move-only and carries private provenance for its dynamic
+/// continuation occurrence. Descriptive fields remain readable, but an
+/// externally reconstructed description can never acquire termination
+/// authority.
+///
+/// ```compile_fail
+/// use vibeos_wasm_runtime::CoreHostCall;
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<CoreHostCall>();
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_wasm_runtime::CoreHostCall;
+/// let _ = CoreHostCall {
+///     origin_instance: 0,
+///     id: 1,
+///     arguments: Vec::new(),
+/// };
+/// ```
 pub struct CoreHostCall {
     /// Instance that defined the host import, which can differ from the outer
     /// active continuation when a prior-instance export calls the host.
     pub origin_instance: usize,
     pub id: u32,
     pub arguments: Vec<CoreValue>,
+    evidence: Option<CoreHostCallEvidence>,
+}
+
+impl CoreHostCall {
+    /// Constructs descriptive, explicitly untrusted host-call data.
+    ///
+    /// This exists for fail-closed validation and fuzz tests which need to
+    /// inject malformed descriptions. It carries no continuation provenance
+    /// and [`CoreInstance::host_termination_token`] always rejects it.
+    pub fn untrusted_description(
+        origin_instance: usize,
+        id: u32,
+        arguments: Vec<CoreValue>,
+    ) -> Self {
+        Self {
+            origin_instance,
+            id,
+            arguments,
+            evidence: None,
+        }
+    }
+}
+
+impl fmt::Debug for CoreHostCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CoreHostCall")
+            .field("origin_instance", &self.origin_instance)
+            .field("id", &self.id)
+            .field("arguments", &self.arguments)
+            .finish()
+    }
+}
+
+impl PartialEq for CoreHostCall {
+    fn eq(&self, other: &Self) -> bool {
+        self.origin_instance == other.origin_instance
+            && self.id == other.id
+            && self.arguments == other.arguments
+    }
+}
+
+impl Eq for CoreHostCall {}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CoreHostCallEvidence {
+    generation: u64,
+    occurrence: u64,
+}
+
+/// A single-use capability for terminating one exact suspended host call.
+///
+/// The token is opaque and intentionally neither cloneable nor copyable. It is
+/// bound to the instance-independent continuation generation and to the exact
+/// host-call occurrence returned by [`CoreInstance::poll_call`].
+///
+/// ```compile_fail
+/// use vibeos_wasm_runtime::CoreHostTerminationToken;
+/// fn requires_clone<T: Clone>() {}
+/// requires_clone::<CoreHostTerminationToken>();
+/// ```
+pub struct CoreHostTerminationToken {
+    evidence: CoreHostCallEvidence,
+    origin_instance: usize,
+    id: u32,
+}
+
+impl fmt::Debug for CoreHostTerminationToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CoreHostTerminationToken")
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -1145,6 +1237,8 @@ impl CoreInstance {
             started: false,
             cancelled: false,
             slot_tag: None,
+            host_generation: None,
+            next_host_occurrence: 1,
         });
         Ok(())
     }
@@ -1199,6 +1293,83 @@ impl CoreInstance {
             .as_mut()
             .ok_or(TrapCode::Validation)?
             .resume_host_call(&self.store, id, results)
+    }
+
+    /// Removes reserved fuel from the active continuation without executing
+    /// guest instructions. Embedding runtimes use this to charge host or ABI
+    /// work to the same ledger as the suspended Core call.
+    pub fn debit_call_fuel(&mut self, amount: u64) -> Result<(), TrapCode> {
+        self.active_call
+            .as_mut()
+            .ok_or(TrapCode::Validation)?
+            .debit_external_fuel(amount)
+    }
+
+    /// Atomically releases unused fuel previously charged by
+    /// [`Self::debit_call_fuel`]. Guest-executed fuel cannot be credited.
+    pub fn credit_call_fuel(&mut self, amount: u64) -> Result<(), TrapCode> {
+        self.active_call
+            .as_mut()
+            .ok_or(TrapCode::Validation)?
+            .credit_external_fuel(amount)
+    }
+
+    /// Consumes one exact host-call event and returns its termination token.
+    ///
+    /// `call` must be the original value returned by the most recent
+    /// [`Self::poll_call`] host yield. Values created through
+    /// [`CoreHostCall::untrusted_description`] carry no occurrence identity and
+    /// are rejected. Failure leaves the active call and continuation untouched.
+    pub fn host_termination_token(
+        &self,
+        call: CoreHostCall,
+    ) -> Result<CoreHostTerminationToken, TrapCode> {
+        let CoreHostCall {
+            origin_instance,
+            id,
+            arguments: _,
+            evidence,
+        } = call;
+        let evidence = evidence.ok_or(TrapCode::Validation)?;
+        self.active_call
+            .as_ref()
+            .ok_or(TrapCode::Validation)?
+            .validate_host_termination_event(origin_instance, id, evidence)?;
+        Ok(CoreHostTerminationToken {
+            evidence,
+            origin_instance,
+            id,
+        })
+    }
+
+    /// Terminates the active call at one exact unresolved host-call boundary.
+    ///
+    /// This is the non-returning counterpart to [`Self::resume_host_call`], for
+    /// imports such as an invocation-scoped exit operation. `token` must have
+    /// been obtained by consuming the exact host-call event for the current
+    /// dynamic continuation generation. A stale, wrong-instance, non-host, or
+    /// already-resolved token is rejected without changing the active call.
+    ///
+    /// On success no guest instruction after the import is executed: the
+    /// resumable continuation and host mailbox are discarded, while the call's
+    /// terminal fuel metrics remain available through [`Self::call_metrics`].
+    /// This method assigns no meaning to the host operation or its arguments;
+    /// the embedding runtime must validate those before terminating the call.
+    pub fn terminate_suspended_host_call(
+        &mut self,
+        token: CoreHostTerminationToken,
+    ) -> Result<(), TrapCode> {
+        self.active_call
+            .as_ref()
+            .ok_or(TrapCode::Validation)?
+            .validate_host_termination_token(&token)?;
+
+        // The mailbox is normally consumed while creating the suspended host
+        // continuation. Clear it defensively in the same terminal transition,
+        // so a non-returning import cannot poison the next invocation.
+        self.store.data_mut().pending_host = None;
+        self.discard_active_call();
+        Ok(())
     }
 
     /// Requests cancellation of the active call. The next poll reports the
@@ -1854,6 +2025,8 @@ impl CoreComponentGroup {
             started: false,
             cancelled: false,
             slot_tag: None,
+            host_generation: None,
+            next_host_occurrence: 1,
         };
         let state = self
             .instances
@@ -1966,6 +2139,8 @@ impl CoreComponentGroup {
             started: false,
             cancelled: false,
             slot_tag: Some(tag),
+            host_generation: None,
+            next_host_occurrence: 1,
         };
         let state = self
             .instances
@@ -2418,23 +2593,8 @@ impl CoreComponentGroup {
         tag: Option<CoreCallSlotTag>,
         amount: u64,
     ) -> Result<(), TrapCode> {
-        let call = self.active_call_mut_tagged(instance, tag)?;
-        let remaining_fuel = call
-            .remaining_fuel
-            .checked_sub(amount)
-            .ok_or(TrapCode::FuelExhausted)?;
-        let consumed_fuel = call
-            .consumed_fuel
-            .checked_add(amount)
-            .ok_or(TrapCode::FuelExhausted)?;
-        let external_debit = call
-            .external_debit
-            .checked_add(amount)
-            .ok_or(TrapCode::FuelExhausted)?;
-        call.remaining_fuel = remaining_fuel;
-        call.consumed_fuel = consumed_fuel;
-        call.external_debit = external_debit;
-        Ok(())
+        self.active_call_mut_tagged(instance, tag)?
+            .debit_external_fuel(amount)
     }
 
     fn credit_call_fuel_tagged(
@@ -2443,23 +2603,8 @@ impl CoreComponentGroup {
         tag: Option<CoreCallSlotTag>,
         amount: u64,
     ) -> Result<(), TrapCode> {
-        let call = self.active_call_mut_tagged(instance, tag)?;
-        let remaining_fuel = call
-            .remaining_fuel
-            .checked_add(amount)
-            .ok_or(TrapCode::FuelExhausted)?;
-        let consumed_fuel = call
-            .consumed_fuel
-            .checked_sub(amount)
-            .ok_or(TrapCode::FuelExhausted)?;
-        let external_debit = call
-            .external_debit
-            .checked_sub(amount)
-            .ok_or(TrapCode::FuelExhausted)?;
-        call.remaining_fuel = remaining_fuel;
-        call.consumed_fuel = consumed_fuel;
-        call.external_debit = external_debit;
-        Ok(())
+        self.active_call_mut_tagged(instance, tag)?
+            .credit_external_fuel(amount)
     }
 
     fn cancel_call_tagged(
@@ -2614,6 +2759,7 @@ fn allocation_error() -> AdmissionError {
 
 static NEXT_GROUP_RESERVATION_OWNER: AtomicU32 = AtomicU32::new(1);
 static NEXT_CORE_CALL_SLOT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static NEXT_HOST_CONTINUATION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 fn next_group_reservation_owner() -> Result<u32, AdmissionError> {
     NEXT_GROUP_RESERVATION_OWNER
@@ -2625,6 +2771,14 @@ fn next_group_reservation_owner() -> Result<u32, AdmissionError> {
 
 fn next_core_call_slot_generation() -> Result<u64, TrapCode> {
     NEXT_CORE_CALL_SLOT_GENERATION
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| TrapCode::LimitExceeded)
+}
+
+fn next_host_continuation_generation() -> Result<u64, TrapCode> {
+    NEXT_HOST_CONTINUATION_GENERATION
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(1)
         })
@@ -2679,12 +2833,16 @@ struct ActiveCall {
     started: bool,
     cancelled: bool,
     slot_tag: Option<CoreCallSlotTag>,
+    host_generation: Option<u64>,
+    next_host_occurrence: u64,
 }
 
 enum ActiveContinuation {
     OutOfFuel(ResumableCallOutOfFuel),
     Host {
         invocation: ResumableCallHostTrap,
+        evidence: CoreHostCallEvidence,
+        origin_instance: usize,
         id: u32,
         response: Vec<Val>,
         response_ready: bool,
@@ -2715,6 +2873,89 @@ impl ActiveCall {
         }
     }
 
+    /// Atomically moves fuel from the executable balance into the externally
+    /// charged balance. Every checked value is computed before state changes.
+    fn debit_external_fuel(&mut self, amount: u64) -> Result<(), TrapCode> {
+        let remaining_fuel = self
+            .remaining_fuel
+            .checked_sub(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        let consumed_fuel = self
+            .consumed_fuel
+            .checked_add(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        let external_debit = self
+            .external_debit
+            .checked_add(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        self.remaining_fuel = remaining_fuel;
+        self.consumed_fuel = consumed_fuel;
+        self.external_debit = external_debit;
+        Ok(())
+    }
+
+    /// Atomically returns only fuel previously charged by the embedding.
+    fn credit_external_fuel(&mut self, amount: u64) -> Result<(), TrapCode> {
+        let remaining_fuel = self
+            .remaining_fuel
+            .checked_add(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        let consumed_fuel = self
+            .consumed_fuel
+            .checked_sub(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        let external_debit = self
+            .external_debit
+            .checked_sub(amount)
+            .ok_or(TrapCode::FuelExhausted)?;
+        self.remaining_fuel = remaining_fuel;
+        self.consumed_fuel = consumed_fuel;
+        self.external_debit = external_debit;
+        Ok(())
+    }
+
+    fn validate_host_termination_event(
+        &self,
+        origin_instance: usize,
+        id: u32,
+        evidence: CoreHostCallEvidence,
+    ) -> Result<(), TrapCode> {
+        if self.cancelled {
+            return Err(TrapCode::Cancelled);
+        }
+        let Some(ActiveContinuation::Host {
+            invocation,
+            evidence: expected_evidence,
+            origin_instance: expected_origin_instance,
+            id: expected_id,
+            response_ready,
+            ..
+        }) = self.continuation.as_ref()
+        else {
+            return Err(TrapCode::Validation);
+        };
+        let marker = invocation
+            .host_error()
+            .downcast_ref::<HostBridgeError>()
+            .ok_or(TrapCode::Validation)?;
+        if marker != &(HostBridgeError::Yield { id: *expected_id })
+            || id != *expected_id
+            || origin_instance != *expected_origin_instance
+            || evidence != *expected_evidence
+            || *response_ready
+        {
+            return Err(TrapCode::Validation);
+        }
+        Ok(())
+    }
+
+    fn validate_host_termination_token(
+        &self,
+        token: &CoreHostTerminationToken,
+    ) -> Result<(), TrapCode> {
+        self.validate_host_termination_event(token.origin_instance, token.id, token.evidence)
+    }
+
     fn resume_host_call(
         &mut self,
         store: &Store<HostState>,
@@ -2729,6 +2970,7 @@ impl ActiveCall {
             id: expected_id,
             response,
             response_ready,
+            ..
         }) = self.continuation.as_mut()
         else {
             return Err(TrapCode::Validation);
@@ -2793,6 +3035,8 @@ impl ActiveCall {
                 }
                 ActiveContinuation::Host {
                     invocation,
+                    evidence: _,
+                    origin_instance: _,
                     id,
                     response,
                     response_ready,
@@ -2890,16 +3134,43 @@ impl ActiveCall {
             return ActivePollResult::Trapped(TrapCode::LimitExceeded);
         }
         response.extend(host_type.results().iter().copied().map(Val::default));
+        let PendingHostCall {
+            origin_instance,
+            id,
+            arguments,
+        } = mailbox;
+        let generation = match self.host_generation {
+            Some(generation) => generation,
+            None => match next_host_continuation_generation() {
+                Ok(generation) => {
+                    self.host_generation = Some(generation);
+                    generation
+                }
+                Err(trap) => return ActivePollResult::Trapped(trap),
+            },
+        };
+        let occurrence = self.next_host_occurrence;
+        self.next_host_occurrence = match occurrence.checked_add(1) {
+            Some(next) => next,
+            None => return ActivePollResult::Trapped(TrapCode::LimitExceeded),
+        };
+        let evidence = CoreHostCallEvidence {
+            generation,
+            occurrence,
+        };
         self.continuation = Some(ActiveContinuation::Host {
             invocation,
-            id: marker_id,
+            evidence,
+            origin_instance,
+            id,
             response,
             response_ready: false,
         });
         ActivePollResult::HostCall(CoreHostCall {
-            origin_instance: mailbox.origin_instance,
-            id: marker_id,
-            arguments: mailbox.arguments,
+            origin_instance,
+            id,
+            arguments,
+            evidence: Some(evidence),
         })
     }
 }
@@ -2919,7 +3190,7 @@ pub struct Invocation<'a> {
     terminal: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum PollResult {
     Pending {
         consumed_fuel: u64,
@@ -2935,7 +3206,7 @@ pub enum PollResult {
 /// The large inline ready variant is deliberate: boxing it would reintroduce
 /// a fallible allocation at the terminal callback boundary.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum CoreSlotPollResult {
     Pending {
         consumed_fuel: u64,

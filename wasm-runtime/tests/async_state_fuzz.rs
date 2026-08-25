@@ -207,11 +207,11 @@ fn apply(
                 CallState::Started => {
                     assert_eq!(
                         observed,
-                        PollResult::HostCall(CoreHostCall {
-                            origin_instance: instance,
-                            id: host_id(instance),
-                            arguments: vec![],
-                        }),
+                        PollResult::HostCall(CoreHostCall::untrusted_description(
+                            instance,
+                            host_id(instance),
+                            vec![],
+                        )),
                         "{}",
                         context(),
                     );

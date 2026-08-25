@@ -22,6 +22,10 @@ cargo test -p vibeos-driver-dwc2-host -p vibeos-bsp-milkv-duo
 ./scripts/status.sh            # derive current test/corpus counts on the host
 C82_WASI_SDK_PATH=/path/to/wasi-sdk-33.0-arm64-macos \
   ./scripts/test-c82-preview1-corpus.sh # C8.2 source-to-execution gate
+python3 -B scripts/verify-c83-runtime-costs.py --selftest --check-manifest
+python3 -B scripts/qemu-c83-runtime-costs.py --allow-dirty-smoke
+python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
+python3 -B scripts/verify-c83-evidence.py --selftest
 ```
 
 The C8.2 gate is intentionally pinned to the reviewed
@@ -33,6 +37,19 @@ byte, independently checks the CMP1 artifacts and named mutations, executes
 both filters through the bounded acceptance broker, and checks the feature-off,
 loader-isolation, and RISC-V `no_std` paths. It does not enable the Preview1
 profile for ordinary loader, graph, VSH, or durable registration.
+
+The C8.3 runtime-cost preparation and physical publication flow is documented
+in [docs/WASM_RUNTIME_COSTS.md](docs/WASM_RUNTIME_COSTS.md). Its dedicated image
+emits target-owned raw `rdtime` samples for validation, startup, Canonical ABI,
+native-async primitives, validation-only composition, host calls, memory, fuel,
+cancellation, and revocation. The independent host verifier owns the closed
+schema and all derived statistics. A dirty QEMU smoke run is useful integration
+evidence but cannot export a baseline; C8.3 remains open until one fixed QEMU
+boot and three real cold Duo boots from the same clean preparation commit are
+published. Physical capture also requires the canonical `package-envelope.json`
+and image-verifier audit emitted by the pinned Linux/amd64 SDK packaging flow;
+the recorded container digest is an operator assertion, not hardware
+attestation.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

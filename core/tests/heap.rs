@@ -5,6 +5,8 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::sync::{Mutex, MutexGuard};
 
 use vibeos_core::arch;
+#[cfg(feature = "wasm-c83-runtime-costs")]
+use vibeos_core::heap::HeapLiveWindowError;
 use vibeos_core::heap::{
     current_domain, current_owner, enter_domain, enter_owner, AllocationDomain, AllocationFailure,
     ArenaError, ArenaId, FreshDomainBatchError, FreshDomainBatchRetireError, Heap, OwnerError,
@@ -157,6 +159,50 @@ fn stats_track_live_and_peak() {
         free0,
         "the aligned test heap capacity is fully accounted"
     );
+}
+
+#[test]
+#[cfg(feature = "wasm-c83-runtime-costs")]
+fn live_window_tracks_short_lived_peak_and_exact_return() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let l = layout(64, 8);
+    let baseline = h.snapshot().live_bytes;
+    let window = h.begin_live_window().unwrap();
+
+    let first = unsafe { h.alloc(l) };
+    let second = unsafe { h.alloc(l) };
+    assert!(!first.is_null() && !second.is_null());
+    let held = h.snapshot().live_bytes;
+    unsafe {
+        h.dealloc(second, l);
+        h.dealloc(first, l);
+    }
+
+    let observation = window.finish();
+    assert_eq!(observation.live_before, baseline);
+    assert_eq!(observation.peak_live_bytes, held);
+    assert_eq!(observation.live_after, baseline);
+}
+
+#[test]
+#[cfg(feature = "wasm-c83-runtime-costs")]
+fn live_window_is_exclusive_and_drop_cancels_it() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let first = h.begin_live_window().unwrap();
+    assert_eq!(
+        h.begin_live_window().err(),
+        Some(HeapLiveWindowError::AlreadyActive)
+    );
+    drop(first);
+
+    let replacement = h
+        .begin_live_window()
+        .expect("dropping an unfinished window must release exclusivity");
+    let observation = replacement.finish();
+    assert_eq!(observation.live_before, observation.peak_live_bytes);
+    assert_eq!(observation.live_before, observation.live_after);
 }
 
 #[test]

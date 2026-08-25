@@ -5,7 +5,7 @@ export LC_ALL=C
 
 usage() {
   echo "usage: $0 --selftest" >&2
-  echo "       $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree] <duo-buildroot-sdk-root>" >&2
+  echo "       $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree | --runtime-costs] <duo-buildroot-sdk-root>" >&2
 }
 
 verify_raw_data_partition() {
@@ -205,6 +205,8 @@ jitterentropy_ssh_probe=false
 selftest=false
 iperf3_server=false
 file_tree=false
+runtime_costs=false
+runtime_costs_sdk_commit=23eb84fecb29585dbb5728d6b7e2475ff273baac
 sdk_arg=
 for arg in "$@"; do
   case "$arg" in
@@ -215,10 +217,11 @@ for arg in "$@"; do
     --selftest) selftest=true ;;
     --iperf3-server) iperf3_server=true ;;
     --file-tree) file_tree=true ;;
-    -*) echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
+    --runtime-costs) runtime_costs=true ;;
+    -*) usage; exit 2 ;;
     *)
       if [[ -n "$sdk_arg" ]]; then
-        echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree] <duo-buildroot-sdk-root>" >&2
+        usage
         exit 2
       fi
       sdk_arg=$arg
@@ -232,9 +235,10 @@ mode_count=0
 [[ "$jitterentropy_ssh_probe" == true ]] && ((mode_count += 1))
 [[ "$iperf3_server" == true ]] && ((mode_count += 1))
 [[ "$file_tree" == true ]] && ((mode_count += 1))
+[[ "$runtime_costs" == true ]] && ((mode_count += 1))
 if ((mode_count > 1)); then
   echo "verify-milkv-duo-image.sh: image mode options are mutually exclusive" >&2
-  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree] <duo-buildroot-sdk-root>" >&2
+  usage
   exit 2
 fi
 if [[ "$selftest" == true ]]; then
@@ -251,13 +255,33 @@ if [[ "$selftest" == true ]]; then
   exit 0
 fi
 if [[ -z "$sdk_arg" ]]; then
-  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree] <duo-buildroot-sdk-root>" >&2
+  usage
   exit 2
 fi
 
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd -P)
 repo_root=$(cd -- "$script_dir/.." && pwd -P)
 sdk_root=$(cd -- "$sdk_arg" && pwd -P)
+if [[ "$runtime_costs" == true ]]; then
+  if ! sdk_git_root=$(git --no-optional-locks -C "$sdk_root" rev-parse --show-toplevel 2>/dev/null) ||
+     ! sdk_head=$(git --no-optional-locks -C "$sdk_root" rev-parse HEAD 2>/dev/null); then
+    echo "verify-milkv-duo-image.sh: runtime-cost SDK root is not a readable Git checkout: $sdk_root" >&2
+    exit 1
+  fi
+  sdk_git_root=$(cd -- "$sdk_git_root" && pwd -P)
+  if [[ "$sdk_git_root" != "$sdk_root" ]]; then
+    echo "verify-milkv-duo-image.sh: runtime-cost SDK path must name its Git root: $sdk_root" >&2
+    exit 1
+  fi
+  if [[ "$sdk_head" != "$runtime_costs_sdk_commit" ]]; then
+    echo "verify-milkv-duo-image.sh: runtime-cost SDK HEAD is $sdk_head, expected $runtime_costs_sdk_commit" >&2
+    exit 1
+  fi
+  if [[ -n $(git --no-optional-locks -C "$sdk_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) ]]; then
+    echo "verify-milkv-duo-image.sh: runtime-cost SDK checkout is not clean" >&2
+    exit 1
+  fi
+fi
 
 output_dir="$repo_root/target/milkv-duo"
 image_name="vibeos-milkv-duo-sd.img"
@@ -279,6 +303,9 @@ elif [[ "$iperf3_server" == true ]]; then
 elif [[ "$file_tree" == true ]]; then
   output_dir="$repo_root/target/milkv-duo-file-tree"
   image_name="vibeos-milkv-duo-file-tree-sd.img"
+elif [[ "$runtime_costs" == true ]]; then
+  output_dir="$repo_root/target/milkv-duo-runtime-costs"
+  image_name="vibeos-milkv-duo-runtime-costs-sd.img"
 fi
 image="$output_dir/$image_name"
 expected_fit="$output_dir/boot.sd"
@@ -460,4 +487,9 @@ print(f"{zlib.crc32(data) & 0xffffffff:08x}")' \
 
 verify_crc32 /images/kernel "$temp_dir/kernel.bin"
 verify_crc32 /images/fdt "$temp_dir/fdt.dtb"
+if [[ "$runtime_costs" == true ]] &&
+   { [[ $(git --no-optional-locks -C "$sdk_root" rev-parse HEAD) != "$runtime_costs_sdk_commit" ]] ||
+     [[ -n $(git --no-optional-locks -C "$sdk_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) ]]; }; then
+  die "runtime-cost SDK checkout changed during image verification"
+fi
 echo "PASS: FAT boot + raw data MBR image, FIP, FIT metadata, and payload CRC32 hashes are valid"

@@ -3316,6 +3316,7 @@ fn map_stream_error(error: StreamError) -> HostError {
         StreamError::Busy
         | StreamError::TokenMismatch
         | StreamError::WakeAlreadyRegistered
+        | StreamError::SealedWakeRequired
         | StreamError::InvalidCommitLength
         | StreamError::TokenExhausted
         | StreamError::FailStopped => {

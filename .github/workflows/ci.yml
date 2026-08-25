@@ -67,6 +67,11 @@ jobs:
         run: ./scripts/status.sh --check
       - name: Exercise SMP benchmark transcript validation
         run: python3 -B scripts/bench.py --selftest
+      - name: Verify the independent C8.3 runtime-cost evidence boundary
+        run: |
+          python3 -B scripts/verify-c83-runtime-costs.py --selftest --check-manifest
+          python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
+          python3 -B scripts/verify-c83-evidence.py --selftest
       - name: Verify the independent ComponentArtifact codec
         run: python3 -B scripts/verify-c71-component-artifact.py --selftest
       - name: Verify the independent Storage V2 image parsers
@@ -163,6 +168,7 @@ jobs:
           } >> "$GITHUB_ENV"
           rustup run "$toolchain" rustc -Vv
           rustup run "$toolchain" cargo -V
+          rustup run "$toolchain" cargo fetch --locked
       - name: Install QEMU and lld
         run: |
           sudo apt-get update
@@ -171,6 +177,17 @@ jobs:
           sudo ln -sf "$(command -v lld)" /usr/local/bin/ld.lld
           qemu-system-riscv64 --version
           ld.lld --version
+      # Keep both closed-source-state gates before the ordinary Duo build,
+      # which applies the reviewed jitterentropy patch inside its submodule.
+      - name: Build the isolated Milk-V Duo C8.3 sampler (CI-only identity)
+        run: |
+          VIBEOS_C83_SOURCE_COMMIT="$(git rev-parse HEAD)" \
+          VIBEOS_C83_CHALLENGE=8383838383838383838383838383838383838383838383838383838383838383 \
+            ./scripts/build-milkv-duo.sh --runtime-costs
+      # This exercises the formal gates with a fresh challenge, but CI does not
+      # retain its outputs and therefore cannot complete the evidence milestone.
+      - name: Exercise the fixed-QEMU C8.3 publication contract
+        run: python3 -B scripts/qemu-c83-runtime-costs.py
       - name: Build the Milk-V Duo kernel
         # FIT/full-card packaging still requires a prebuilt official SDK and
         # remains part of the documented manual hardware acceptance flow.

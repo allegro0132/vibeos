@@ -14,6 +14,7 @@ legacy-shell = ["vibeos-kernel/legacy-shell"]
 milkv-ssh-acceptance = ["vibeos-kernel/milkv-ssh-acceptance"]
 milkv-jitterentropy-probe = ["vibeos-kernel/milkv-jitterentropy-probe"]
 milkv-jitterentropy-ssh-probe = ["vibeos-kernel/milkv-jitterentropy-ssh-probe"]
+wasm-c83-runtime-costs = ["vibeos-kernel/wasm-c83-runtime-costs"]
 
 [[bin]]
 name = "vibeos-milkv-duo"

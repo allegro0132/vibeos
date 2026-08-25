@@ -8,6 +8,9 @@ edition = "2021"
 # acceptance image. Production profiles must not enable this feature.
 wasm-c48-target-acceptance = []
 wasm-c66-node-replacement-acceptance = []
+# Resettable allocator telemetry used only by the isolated C8.3 sampler. Keep
+# the state and successful-allocation branch out of every product image.
+wasm-c83-runtime-costs = []
 
 [dependencies]
 vibeos-durable-format = { path = "../durable-format" }

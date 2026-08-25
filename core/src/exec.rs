@@ -130,11 +130,15 @@ impl TaskDetachTarget {
     }
 }
 
-/// Copy-only proof that one exact current TaskStatus owns a detach callback.
+/// Copy-only proof that one exact TaskStatus owns a detach callback.
 ///
 /// This token owns no task handle, future, queue, allocator, or callback
 /// state. Its private status seal prevents a same-number TaskId or same-domain
-/// task from disarming another incarnation's cleanup entry.
+/// task from disarming another incarnation's cleanup entry. Most leases are
+/// minted for the task currently being polled. Prepared-task publishers receive
+/// the narrower [`PreparedTaskDetachSeal`]
+/// instead, so a hidden child identity cannot be projected into wake or disarm
+/// authority.
 #[derive(Clone, Copy)]
 pub struct CurrentTaskDetachLease {
     task: TaskId,
@@ -278,6 +282,84 @@ impl CurrentTaskDetachLease {
             })
         };
         exact && !matches!(wake_with_disposition(self.task), WakeDisposition::Inactive)
+    }
+}
+
+/// Copy-only identity of one hidden prepared task's armed detach callback.
+///
+/// This seal intentionally exposes only exact identity/current-scope checks.
+/// It cannot wake the prepared task and cannot disarm its callback. Stable
+/// supervisors may therefore bind lineage before scheduler publication without
+/// gaining a task lifecycle operation.
+///
+/// ```compile_fail
+/// # use vibeos_core::exec::PreparedTaskDetachSeal;
+/// # fn cannot_wake(seal: PreparedTaskDetachSeal) {
+/// seal.wake_if_exact();
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// # use vibeos_core::exec::PreparedTaskDetachSeal;
+/// # fn cannot_disarm(seal: PreparedTaskDetachSeal) {
+/// seal.disarm();
+/// # }
+/// ```
+#[derive(Clone, Copy)]
+pub struct PreparedTaskDetachSeal {
+    inner: CurrentTaskDetachLease,
+}
+
+impl PreparedTaskDetachSeal {
+    pub const fn task_id(self) -> TaskId {
+        self.inner.task_id()
+    }
+
+    pub const fn allocation_domain(self) -> AllocationDomain {
+        self.inner.allocation_domain()
+    }
+
+    pub fn matches_exact(self, other: Self) -> bool {
+        self.inner.matches_exact(other.inner)
+    }
+
+    pub fn is_current_running_exact(self) -> bool {
+        self.inner.is_current_running_exact()
+    }
+
+    /// Whether the exact prepared task is inside its first executor poll.
+    /// The executor increments the sealed TaskStatus counter immediately before
+    /// entering the future, so a yield-before-claim cannot later recover this
+    /// predicate on a second poll.
+    pub fn is_current_first_poll_exact(self) -> bool {
+        let lease = self.inner;
+        let Some(hart) = current_scheduler_hart() else {
+            return false;
+        };
+        let Some(status) = CURRENT_TASK_STATUS[hart.index()].lock().clone() else {
+            return false;
+        };
+        if status.polls.load(Ordering::Acquire) != 1 {
+            return false;
+        }
+        let sched = SCHED.lock();
+        sched.harts[hart.index()]
+            .running
+            .as_ref()
+            .is_some_and(|running| {
+                running.id == lease.task
+                    && running.domain == lease.domain
+                    && Arc::ptr_eq(&running.status, &status)
+                    && Arc::as_ptr(&status) as usize == lease.status_identity
+            })
+    }
+
+    pub fn is_current_irq_scope_exact(self) -> bool {
+        self.inner.is_current_irq_scope_exact()
+    }
+
+    pub fn is_current_reclaiming_exact(self) -> bool {
+        self.inner.is_current_reclaiming_exact()
     }
 }
 
@@ -3713,9 +3795,9 @@ impl PreparedTaskBatch {
     ///
     /// This closes the publication-to-first-poll window for a SYSTEM
     /// supervisor: the callback is already part of its `TaskStatus` ledger
-    /// before any raw-reclaimable child in the batch becomes runnable.  The
-    /// future captures the same copy-only `target` and removes it with
-    /// [`disarm_current_task_detach`] only after its stable lifecycle commit.
+    /// before any raw-reclaimable child in the batch becomes runnable. The
+    /// callback remains armed until the exact task disarms that `target` or
+    /// the executor drains it with the task's final detach reason.
     /// Callers that also await a fixed SYSTEM edge install this entry first and
     /// then reserve one additional outbound slot with
     /// [`Self::try_reserve_prepared_task_registrations`].
@@ -3724,8 +3806,25 @@ impl PreparedTaskBatch {
         task_index: usize,
         target: TaskDetachTarget,
     ) -> bool {
+        self.install_prepared_task_detach_seal(task_index, target)
+            .is_some()
+    }
+
+    /// Install a detach callback and return its exact, copy-only identity seal.
+    ///
+    /// The callback is part of the hidden task's `TaskStatus` before scheduler
+    /// publication. The returned seal grants no wake, poll, cancellation,
+    /// disarm, or handle authority. Its current-task checks stay false until the
+    /// exact prepared task incarnation runs after publication. This is the
+    /// narrow handoff primitive used by stable supervisors that must bind
+    /// external lineage state to a child before the child can run.
+    pub fn install_prepared_task_detach_seal(
+        &mut self,
+        task_index: usize,
+        target: TaskDetachTarget,
+    ) -> Option<PreparedTaskDetachSeal> {
         if self.published || self.binding_rejected || task_index >= self.handles.len() {
-            return false;
+            return None;
         }
 
         let handle = &self.handles[task_index];
@@ -3766,7 +3865,15 @@ impl PreparedTaskBatch {
             }
         };
         system.restore();
-        installed
+        installed.then_some(PreparedTaskDetachSeal {
+            inner: CurrentTaskDetachLease {
+                task,
+                domain,
+                status_identity: Arc::as_ptr(status) as usize,
+                registration: token,
+                target,
+            },
+        })
     }
 
     /// Exact, non-owning executor identities for the raw-reclaimable members
@@ -7204,8 +7311,19 @@ mod one_shot_wait_tests {
             );
         });
 
-        assert!(!batch.install_prepared_task_detach(1, detach));
-        assert!(batch.install_prepared_task_detach(0, detach));
+        assert!(batch.install_prepared_task_detach_seal(1, detach).is_none());
+        let prepared_seal = batch
+            .install_prepared_task_detach_seal(0, detach)
+            .expect("hidden prepared task receives an exact detach seal");
+        assert_eq!(prepared_seal.task_id(), batch.prepared_handles()[0].id());
+        assert_eq!(
+            prepared_seal.allocation_domain(),
+            batch.prepared_handles()[0].allocation_domain()
+        );
+        assert!(!prepared_seal.is_current_running_exact());
+        assert!(!prepared_seal.is_current_first_poll_exact());
+        assert!(!prepared_seal.is_current_irq_scope_exact());
+        assert!(!prepared_seal.is_current_reclaiming_exact());
         assert!(!batch.install_prepared_task_detach(0, detach));
         assert!(!batch.try_reserve_prepared_task_registrations(0, 0));
         assert!(!batch.try_reserve_prepared_task_registrations(

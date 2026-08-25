@@ -71,10 +71,38 @@ compile_error!("feature `wasm-c84-core-poll-qemu-acceptance` is QEMU-only");
 compile_error!("feature `wasm-c84-profile-irq-overlay-qemu-acceptance` is QEMU-only");
 
 #[cfg(all(
-    feature = "wasm-c84-profile-slot-qemu-acceptance",
-    feature = "wasm-c84-core-poll-qemu-acceptance"
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance",
+    not(feature = "qemu-virt")
 ))]
-compile_error!("C8.4 profile-slot and Core-poll QEMU acceptances are isolated images");
+compile_error!("feature `wasm-c84-profile-child-delegation-qemu-acceptance` is QEMU-only");
+
+#[cfg(any(
+    all(
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance"
+    ),
+    all(
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance"
+    ),
+    all(
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    ),
+    all(
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance"
+    ),
+    all(
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    ),
+    all(
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
 
 #[cfg(all(
     feature = "wasm-c84-profile-irq-overlay",
@@ -1165,6 +1193,12 @@ pub extern "C" fn kmain() -> ! {
         exec::HartId::BOOT,
         "wasm-c84-profile-irq-overlay-acceptance",
         wasm_aot_profile_slot::run_irq_qemu_acceptance(),
+    );
+    #[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c84-profile-child-delegation-acceptance",
+        wasm_aot_profile_slot::run_child_delegation_qemu_acceptance(),
     );
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
     exec::spawn(

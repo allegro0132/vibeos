@@ -234,6 +234,15 @@ wasm-c84-core-poll-qemu-acceptance = [
 wasm-c84-profile-irq-overlay = ["wasm-c84-profile-slot"]
 # QEMU-only proof using a real supervisor self-IPI on the boot hart.
 wasm-c84-profile-irq-overlay-qemu-acceptance = ["wasm-c84-profile-irq-overlay"]
+# Default-off exact delegation from one request-owned slot lease to one hidden
+# PreparedTaskBatch child. The parent remains the sole terminal/storage owner.
+wasm-c84-profile-child-delegation = ["wasm-c84-profile-slot"]
+# QEMU-only bind-before-publish, exact-child, terminal-reason, and real-SSIP
+# proof. This intentionally remains disconnected from SSH and ordinary Core.
+wasm-c84-profile-child-delegation-qemu-acceptance = [
+    "wasm-c84-profile-child-delegation",
+    "wasm-c84-profile-irq-overlay",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

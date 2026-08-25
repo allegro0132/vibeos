@@ -226,14 +226,20 @@ extern "C" fn __trap_handler(irq_entry: u64) {
         // concurrent publisher's fresh doorbell. No scheduler lock or poll is
         // entered from this path.
         let _ = ipi::acknowledge_current();
-        #[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+        #[cfg(any(
+            feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+            feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+        ))]
         {
             let applied = crate::wasm_aot_profile_slot::profile_irq_exit(profile_irq, sbi::time());
             crate::wasm_aot_profile_slot::profile_irq_acceptance_note_ssip(applied);
         }
         #[cfg(all(
             feature = "wasm-c84-profile-irq-overlay",
-            not(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")
+            not(any(
+                feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+                feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+            ))
         ))]
         let _ = crate::wasm_aot_profile_slot::profile_irq_exit(profile_irq, sbi::time());
         IN_INTERRUPT[hart].store(false, Ordering::Release);

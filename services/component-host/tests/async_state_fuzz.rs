@@ -156,6 +156,7 @@ enum Action {
     ReceiveResume,
     ReceiveRegisterWake,
     ReceiveCommit { wrong_length: bool },
+    ReceiveCommitPrefix { length: u8 },
     ReceiveCancel,
     ReplayStaleReceive,
     TerminalStart,
@@ -268,6 +269,7 @@ impl Harness {
             Action::ReceiveResume => self.receive_resume(),
             Action::ReceiveRegisterWake => self.receive_register_wake(),
             Action::ReceiveCommit { wrong_length } => self.receive_commit(wrong_length),
+            Action::ReceiveCommitPrefix { length } => self.receive_commit_prefix(length),
             Action::ReceiveCancel => self.receive_cancel(),
             Action::ReplayStaleReceive => self.replay_stale_receive(),
             Action::TerminalStart => self.terminal_start(),
@@ -513,6 +515,84 @@ impl Harness {
         self.wake_sender_if_ready();
     }
 
+    fn receive_commit_prefix(&mut self, requested_length: u8) {
+        let Some(ReceiveSlot::Prepared { token, bytes }) = self.model.receive.as_ref() else {
+            self.replay_stale_receive();
+            return;
+        };
+        let token = *token;
+        let expected_bytes = bytes.clone();
+        let length = usize::from(requested_length);
+        let mut output = vec![0xa5; length];
+        let depth_before = self.model.queue.len();
+        let sender_wake_before = self
+            .model
+            .send
+            .and_then(|waiting| waiting.wake)
+            .map(|index| {
+                (
+                    index,
+                    self.wakes[index].disposition,
+                    WAKE_COUNTS[self.wakes[index].index].load(Ordering::SeqCst),
+                )
+            });
+        let actual = self.reader.commit_prefix(token, &mut output);
+
+        if length == 0 || length > expected_bytes.len() {
+            assert_eq!(actual, Err(StreamError::InvalidCommitLength));
+            assert!(output.iter().all(|byte| *byte == 0xa5));
+            return;
+        }
+        if self.model.consumer_stopped {
+            match self.model.final_reason() {
+                Some(reason) => assert_eq!(actual, Ok(StreamReceiveCommit::Closed(reason))),
+                None => assert_eq!(actual, Err(StreamError::EndpointClosed)),
+            }
+            assert!(output.iter().all(|byte| *byte == 0xa5));
+            return;
+        }
+        if let Some(reason) = self.model.final_reason() {
+            if reason != StreamCloseReason::Normal {
+                assert_eq!(actual, Ok(StreamReceiveCommit::Closed(reason)));
+                assert!(output.iter().all(|byte| *byte == 0xa5));
+                return;
+            }
+        }
+
+        assert_eq!(actual, Ok(StreamReceiveCommit::Received(length)));
+        assert_eq!(output, expected_bytes[..length]);
+        let front = self.model.queue.front_mut().unwrap();
+        assert_eq!(front.as_slice(), expected_bytes);
+        front.drain(..length);
+        let exhausted = front.is_empty();
+        if exhausted {
+            assert_eq!(self.model.queue.pop_front(), Some(Vec::new()));
+        } else {
+            assert_eq!(self.model.queue.len(), depth_before);
+            assert_eq!(self.stream.depth(), depth_before);
+            if let Some((index, disposition, wake_count)) = sender_wake_before {
+                assert_eq!(self.wakes[index].disposition, disposition);
+                assert_eq!(
+                    WAKE_COUNTS[self.wakes[index].index].load(Ordering::SeqCst),
+                    wake_count
+                );
+            }
+        }
+
+        let completed = self.model.receive.take().unwrap();
+        self.model.stale_receive.push(completed.token());
+        let mut stale_output = [0xa5];
+        assert_eq!(
+            self.reader.commit_prefix(token, &mut stale_output),
+            Err(StreamError::TokenMismatch)
+        );
+        assert_eq!(stale_output, [0xa5]);
+
+        if exhausted {
+            self.wake_sender_if_ready();
+        }
+    }
+
     fn receive_cancel(&mut self) {
         let Some(current) = self.model.receive.take() else {
             self.replay_stale_receive();
@@ -750,20 +830,21 @@ fn mandatory_prefix() {
         },
     );
 
-    // Fill the exact ring, suspend a producer, register its wake, make one
-    // slot available, and resume the producer back to a full ring.
-    for value in 10..10 + STREAM_BUFFER_CHUNKS as u8 {
-        run(&mut harness, Action::SendStart(payload(value)));
+    // Fill the exact ring with a multi-byte chunk at its front, suspend a
+    // producer, and prove that consuming only a prefix neither releases the
+    // front slot nor wakes that producer. The consumed receive token is stale,
+    // and a fresh prepared token consumes the remainder before the wake fires.
+    run(&mut harness, Action::SendStart(Payload { tag: 10, len: 4 }));
+    for offset in 1..STREAM_BUFFER_CHUNKS {
+        run(&mut harness, Action::SendStart(payload(10 + offset as u8)));
     }
     run(&mut harness, Action::SendStart(payload(99)));
     run(&mut harness, Action::SendRegisterWake);
     run(&mut harness, Action::ReceiveStart);
-    run(
-        &mut harness,
-        Action::ReceiveCommit {
-            wrong_length: false,
-        },
-    );
+    run(&mut harness, Action::ReceiveCommitPrefix { length: 0 });
+    run(&mut harness, Action::ReceiveCommitPrefix { length: 2 });
+    run(&mut harness, Action::ReceiveStart);
+    run(&mut harness, Action::ReceiveCommitPrefix { length: 2 });
     run(&mut harness, Action::SendResume(payload(99)));
 
     // Cancellation revokes an installed wake without invoking it, and both a
@@ -844,10 +925,19 @@ fn choose_action(harness: &Harness, rng: &mut Rng, episode_step: usize) -> Actio
         31..=33 if matches!(harness.model.receive, Some(ReceiveSlot::Waiting(_))) => {
             Action::ReceiveRegisterWake
         }
-        34..=38 if matches!(harness.model.receive, Some(ReceiveSlot::Prepared { .. })) => {
+        34..=36 if matches!(harness.model.receive, Some(ReceiveSlot::Prepared { .. })) => {
             Action::ReceiveCommit {
                 wrong_length: roll == 34,
             }
+        }
+        37..=38 => {
+            let length = match harness.model.receive.as_ref() {
+                Some(ReceiveSlot::Prepared { bytes, .. }) => {
+                    (rng.next() % (bytes.len() as u64 + 2)) as u8
+                }
+                _ => 0,
+            };
+            Action::ReceiveCommitPrefix { length }
         }
         39..=41 if harness.model.receive.is_some() => Action::ReceiveCancel,
         42 if !harness.model.stale_receive.is_empty() => Action::ReplayStaleReceive,

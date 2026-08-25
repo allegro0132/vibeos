@@ -17,7 +17,11 @@ wasmparser = { version = "=0.255.0", default-features = false, features = ["comp
 default = []
 native-async-acceptance = ["vibeos-component-runtime/native-async-acceptance"]
 preview1-wrapped-admission = ["dep:wasmparser"]
+# Default-off C8.2 corpus executor. It consumes only a freshly revalidated
+# Preview1-wrapped artifact and does not activate the profile/runtime-ready bit.
+preview1-corpus-acceptance = ["preview1-wrapped-admission"]
 selected-wasi-admission = []
 
 [dev-dependencies]
+vibeos-c82-preview1-corpus = { path = "../../tools/c82-preview1-corpus" }
 wat = { version = "=1.255.0", features = ["component-model"] }

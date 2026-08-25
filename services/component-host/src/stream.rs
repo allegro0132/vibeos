@@ -5,8 +5,9 @@
 //! token, and readiness transfers a callback-issued move-only signal to the
 //! supervisor. Receive is deliberately two phase. Observing a front chunk
 //! publishes a fresh [`StreamPreparedReceive`], but neither changes depth nor
-//! wakes a writer; only an exact-token [`ByteStreamReader::commit`] copies and
-//! pops it.
+//! wakes a writer. An exact-token [`ByteStreamReader::commit`] consumes the
+//! whole prepared remainder, while [`ByteStreamReader::commit_prefix`] can
+//! consume a bounded prefix without releasing the occupied ring slot.
 
 use alloc::sync::Arc;
 use core::any::Any;
@@ -213,6 +214,7 @@ pub struct StreamPreparedReceive {
     length: u16,
     head: u8,
     incarnation: u64,
+    offset: u16,
 }
 
 impl StreamPreparedReceive {
@@ -302,6 +304,7 @@ impl StreamCloseObservation {
 
 #[derive(Clone, Copy)]
 struct Chunk {
+    offset: u16,
     length: u16,
     incarnation: u64,
     bytes: [u8; MAX_STREAM_CHUNK_BYTES],
@@ -309,6 +312,7 @@ struct Chunk {
 
 impl Chunk {
     const EMPTY: Self = Self {
+        offset: 0,
         length: 0,
         incarnation: 0,
         bytes: [0; MAX_STREAM_CHUNK_BYTES],
@@ -343,6 +347,7 @@ impl ChunkRing {
         }
         let tail = (self.head + self.depth) % STREAM_BUFFER_CHUNKS;
         self.chunks[tail].bytes[..bytes.len()].copy_from_slice(bytes);
+        self.chunks[tail].offset = 0;
         self.chunks[tail].length = bytes.len() as u16;
         self.chunks[tail].incarnation = self.next_incarnation;
         self.next_incarnation = self.next_incarnation.checked_add(1).unwrap_or(0);
@@ -355,30 +360,56 @@ impl ChunkRing {
         (self.depth != 0).then(|| self.chunks[self.head].length as usize)
     }
 
-    fn front_seal(&self) -> Option<(u8, u64, usize)> {
+    fn front_seal(&self) -> Option<(u8, u64, usize, usize)> {
         (self.depth != 0).then(|| {
             let chunk = &self.chunks[self.head];
-            (self.head as u8, chunk.incarnation, chunk.length as usize)
+            (
+                self.head as u8,
+                chunk.incarnation,
+                chunk.offset as usize,
+                chunk.length as usize,
+            )
         })
     }
 
-    fn pop_into(&mut self, output: &mut [u8]) -> bool {
+    /// Copies and consumes a non-empty prefix of the front remainder.
+    ///
+    /// `Some(true)` means the chunk was exhausted and its ring slot released;
+    /// `Some(false)` retains the same slot at a later byte offset. Validation
+    /// happens before copying so an invalid length is inert.
+    fn consume_prefix_into(&mut self, output: &mut [u8]) -> Option<bool> {
         let Some(length) = self.front_length() else {
-            return false;
+            return None;
         };
-        if length != output.len() {
-            return false;
+        if output.is_empty() || output.len() > length {
+            return None;
         }
-        output.copy_from_slice(&self.chunks[self.head].bytes[..length]);
-        self.chunks[self.head].length = 0;
-        self.chunks[self.head].incarnation = 0;
+        let chunk = &mut self.chunks[self.head];
+        let offset = chunk.offset as usize;
+        let end = offset.checked_add(output.len())?;
+        let remainder_end = offset.checked_add(length)?;
+        if end > remainder_end || remainder_end > MAX_STREAM_CHUNK_BYTES {
+            return None;
+        }
+        output.copy_from_slice(&chunk.bytes[offset..end]);
+        if output.len() != length {
+            chunk.offset = end as u16;
+            chunk.length = (length - output.len()) as u16;
+            return Some(false);
+        }
+
+        chunk.bytes[offset..remainder_end].fill(0);
+        chunk.offset = 0;
+        chunk.length = 0;
+        chunk.incarnation = 0;
         self.head = (self.head + 1) % STREAM_BUFFER_CHUNKS;
         self.depth -= 1;
-        true
+        Some(true)
     }
 
     fn clear(&mut self) {
         for chunk in &mut self.chunks {
+            chunk.offset = 0;
             chunk.length = 0;
             chunk.incarnation = 0;
         }
@@ -648,7 +679,7 @@ impl ByteStreamReader {
                 return Ok(StreamReceiveDispatch::Closed(reason));
             }
         }
-        if let Some((head, incarnation, length)) = state.ring.front_seal() {
+        if let Some((head, incarnation, offset, length)) = state.ring.front_seal() {
             let token = match next_operation_token() {
                 Ok(token) => token,
                 Err(error) => {
@@ -663,6 +694,7 @@ impl ByteStreamReader {
                 length: length as u16,
                 head,
                 incarnation,
+                offset: offset as u16,
             };
             state.receive = Some(ReceiveOperation::Prepared(prepared));
             return Ok(StreamReceiveDispatch::Prepared(prepared));
@@ -714,7 +746,7 @@ impl ByteStreamReader {
                 return Ok(StreamReceiveDispatch::Closed(reason));
             }
         }
-        let Some((head, incarnation, length)) = state.ring.front_seal() else {
+        let Some((head, incarnation, offset, length)) = state.ring.front_seal() else {
             let fresh = match next_operation_token() {
                 Ok(token) => token,
                 Err(error) => {
@@ -744,6 +776,7 @@ impl ByteStreamReader {
             length: length as u16,
             head,
             incarnation,
+            offset: offset as u16,
         };
         state.receive = Some(ReceiveOperation::Prepared(prepared));
         Ok(StreamReceiveDispatch::Prepared(prepared))
@@ -846,7 +879,7 @@ impl ByteStreamReader {
                 return Ok(StreamReceiveDispatch::Closed(reason));
             }
         }
-        let Some((head, incarnation, length)) = state.ring.front_seal() else {
+        let Some((head, incarnation, offset, length)) = state.ring.front_seal() else {
             let fresh = match next_operation_token() {
                 Ok(token) => token,
                 Err(error) => {
@@ -876,6 +909,7 @@ impl ByteStreamReader {
             length: length as u16,
             head,
             incarnation,
+            offset: offset as u16,
         };
         state.receive = Some(ReceiveOperation::Prepared(prepared));
         Ok(StreamReceiveDispatch::Prepared(prepared))
@@ -886,6 +920,29 @@ impl ByteStreamReader {
         operation: HostOperationToken,
         output: &mut [u8],
     ) -> Result<StreamReceiveCommit, StreamError> {
+        self.commit_inner(operation, output, true)
+    }
+
+    /// Commits a non-empty prefix of one exact prepared receive.
+    ///
+    /// The consumed operation becomes stale even when bytes remain. A later
+    /// [`Self::start`] returns a fresh operation for that remainder. Partial
+    /// commits retain the occupied ring slot and therefore cannot wake a
+    /// backpressured producer early.
+    pub fn commit_prefix(
+        &self,
+        operation: HostOperationToken,
+        output: &mut [u8],
+    ) -> Result<StreamReceiveCommit, StreamError> {
+        self.commit_inner(operation, output, false)
+    }
+
+    fn commit_inner(
+        &self,
+        operation: HostOperationToken,
+        output: &mut [u8],
+        exact: bool,
+    ) -> Result<StreamReceiveCommit, StreamError> {
         let mut state = self.stream.state.lock();
         state.check_live()?;
         let Some(ReceiveOperation::Prepared(prepared)) = state.receive else {
@@ -894,7 +951,10 @@ impl ByteStreamReader {
         if prepared.operation != operation {
             return Err(StreamError::TokenMismatch);
         }
-        if prepared.length() != output.len() {
+        if output.is_empty()
+            || output.len() > prepared.length()
+            || (exact && prepared.length() != output.len())
+        {
             return Err(StreamError::InvalidCommitLength);
         }
         if state.consumer_stopped {
@@ -908,21 +968,27 @@ impl ByteStreamReader {
                 return Ok(StreamReceiveCommit::Closed(reason));
             }
         }
-        if state.ring.front_seal() != Some((prepared.head, prepared.incarnation, prepared.length()))
+        if state.ring.front_seal()
+            != Some((
+                prepared.head,
+                prepared.incarnation,
+                prepared.offset as usize,
+                prepared.length(),
+            ))
         {
             let wakes = state.fail_stop();
             drop(state);
             wake_all(wakes);
             return Err(StreamError::FailStopped);
         }
-        if !state.ring.pop_into(output) {
+        let Some(popped) = state.ring.consume_prefix_into(output) else {
             let wakes = state.fail_stop();
             drop(state);
             wake_all(wakes);
             return Err(StreamError::FailStopped);
-        }
+        };
         state.receive = None;
-        let sender = state.take_ready_sender_wake();
+        let sender = popped.then(|| state.take_ready_sender_wake()).flatten();
         drop(state);
         wake_one(sender);
         Ok(StreamReceiveCommit::Received(output.len()))
@@ -1848,7 +1914,7 @@ mod tests {
         ring.next_incarnation = u64::MAX;
         ring.push(&[1]).unwrap();
         assert_eq!(ring.next_incarnation, 0);
-        assert!(ring.pop_into(&mut [0]));
+        assert_eq!(ring.consume_prefix_into(&mut [0]), Some(true));
         assert_eq!(ring.push(&[2]), Err(StreamError::TokenExhausted));
         assert_eq!(ring.depth, 0);
     }

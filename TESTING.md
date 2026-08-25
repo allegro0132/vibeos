@@ -20,7 +20,19 @@ cargo test -p vibeos-driver-dwc2-host -p vibeos-bsp-milkv-duo
 ./scripts/bench.py             # fixed QEMU/TCG run checked against the baseline
 ./scripts/bench.py --smp-scaling # equal-work four-hart throughput acceptance
 ./scripts/status.sh            # derive current test/corpus counts on the host
+C82_WASI_SDK_PATH=/path/to/wasi-sdk-33.0-arm64-macos \
+  ./scripts/test-c82-preview1-corpus.sh # C8.2 source-to-execution gate
 ```
+
+The C8.2 gate is intentionally pinned to the reviewed
+`aarch64-apple-darwin` Rust distribution and wasi-sdk 33 macOS arm64 release.
+It fails closed when either toolchain is absent or has a different digest. The
+gate recompiles the checked-in Rust and C filters, verifies the exact compiler
+Core hashes, reproduces the sanitized Core modules and Components byte for
+byte, independently checks the CMP1 artifacts and named mutations, executes
+both filters through the bounded acceptance broker, and checks the feature-off,
+loader-isolation, and RISC-V `no_std` paths. It does not enable the Preview1
+profile for ordinary loader, graph, VSH, or durable registration.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

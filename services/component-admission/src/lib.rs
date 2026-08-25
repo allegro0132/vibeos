@@ -54,6 +54,21 @@ use vibeos_component_admission::Preview1WrappedAdmissionPolicy;
 ```
 "#
 )]
+#![cfg_attr(
+    not(feature = "preview1-corpus-acceptance"),
+    doc = r#"
+The C8.2 Preview1 corpus admission and execution façade is structurally absent
+by default:
+
+```compile_fail
+use vibeos_component_admission::{
+    admit_preview1_corpus_candidate,
+    AdmittedPreview1CorpusCandidate,
+    Preview1CorpusAdmissionPolicy,
+};
+```
+"#
+)]
 #![no_std]
 
 extern crate alloc;
@@ -64,6 +79,8 @@ mod graph_authentication;
 mod information_flow;
 #[cfg(feature = "preview1-wrapped-admission")]
 mod preview1;
+#[cfg(feature = "preview1-corpus-acceptance")]
+mod preview1_corpus;
 
 pub use authentication::*;
 pub use graph::*;
@@ -71,6 +88,8 @@ pub use graph_authentication::*;
 pub use information_flow::*;
 #[cfg(feature = "preview1-wrapped-admission")]
 pub use preview1::*;
+#[cfg(feature = "preview1-corpus-acceptance")]
+pub use preview1_corpus::*;
 
 use alloc::{string::String, vec::Vec};
 use core::fmt;

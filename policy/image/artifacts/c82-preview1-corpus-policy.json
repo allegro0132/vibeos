@@ -1,0 +1,455 @@
+{
+  "schema": "vibeos.c82.preview1-compatibility-corpus-policy",
+  "version": 1,
+  "profile": {
+    "name": "profile-1-preview1-wrapped",
+    "code": 4,
+    "artifact_abi": 4,
+    "component_profile": 1,
+    "core_profile": 1,
+    "runtime_abi": 4,
+    "stage": "validation-only",
+    "core_revision": "webassembly-core-2.0-integer-v1",
+    "component_revision": "wasmparser-component-model-0.255.0",
+    "canonical_abi_revision": "component-model-0.255.0-sync",
+    "wasm_tools_revision": "wasm-tools-v1.255.0-76e20611d1920a7a39ca08983c6c77c3060de380",
+    "wasi_revision": "wasi-v0.2.12",
+    "canonical_features": 7,
+    "runtime_ready": false,
+    "profile_runtime_ready": false,
+    "current_engine_identity": false
+  },
+  "toolchains": {
+    "rust": {
+      "channel": "nightly-2026-08-01",
+      "release": "rustc 1.99.0-nightly",
+      "commit": "ad3d0bc141a02cf446e384136d250a1f6950fed5",
+      "commit_date": "2026-07-31",
+      "host": "aarch64-apple-darwin",
+      "target": "wasm32-wasip1",
+      "llvm": "22.1.8",
+      "rustc_sha256": "fa817099946eee0d4a4ed1d6593b05596f34f92181363e467c6253e84ce431af"
+    },
+    "c": {
+      "release": "wasi-sdk-33",
+      "archive": "wasi-sdk-33.0-arm64-macos.tar.gz",
+      "archive_sha256": "85c997a2665ead91673b5bb88b7d0df3fc8900df3bfa244f720d478187bbdc78",
+      "target": "wasm32-wasip1",
+      "clang": "clang 22.1.0-wasi-sdk",
+      "llvm_commit": "4434dabb69916856b824f68a64b029c67175e532",
+      "clang_sha256": "356b0fdc2006a584582b4958c4ed461813d7492ca412f21727ba7875af93433d"
+    },
+    "linker": {
+      "release": "LLD 22.1.0 wasi-sdk-33",
+      "llvm_commit": "4434dabb69916856b824f68a64b029c67175e532",
+      "wasm_ld_sha256": "1682e0d83e144ce8e9b3d5f9dbb628ffdbe404c374c86b5757c00bce4a4d1f24"
+    }
+  },
+  "transformer": {
+    "location": "off-device-host-only",
+    "implementation": "tools/c82-preview1-corpus",
+    "sanitizer": "remove-proven-unreferenced-stack-pointer-global-section-v1",
+    "stack_pointer_value": 65536,
+    "required_defined_globals_before": 1,
+    "required_global_references": 0,
+    "required_globals_after": 0,
+    "removed_section_bytes": 10,
+    "wit_component_version": "0.255.0",
+    "wit_component_crate_sha256": "b0c8948006f57458ae3b2103f2e0e33847a6cdf4f5c763bbe7540fa89f3039f1",
+    "reference_cli_version": "wasm-tools 1.255.0 (76e20611d 2026-07-30)",
+    "reference_cli_source_commit": "76e20611d1920a7a39ca08983c6c77c3060de380",
+    "reference_cli_binary_sha256": "7578041abd93bc44b436f6c24c8556b0597a5317cb000aec71164b4406de9d8d",
+    "adapter_import_name": "wasi_snapshot_preview1",
+    "validate_compiler_core": true,
+    "validate_sanitized_core": true,
+    "validate_component": true,
+    "allow_disable_validation": false,
+    "allow_import_rename": false,
+    "ambient_adapter_lookup": false,
+    "network_lookup": false
+  },
+  "adapter": {
+    "release": "wasmtime-v48.0.0",
+    "source_commit": "f1412a598f96f3c261a19118d94caffcb0c36235",
+    "asset": "wasi_snapshot_preview1.command.wasm",
+    "fixture": "c81-wasmtime-v48.0.0-preview1-command-adapter.wasm",
+    "manifest_revision": "wasmtime-v48.0.0-f1412a598f96f3c261a19118d94caffcb0c36235/wasi_snapshot_preview1.command.wasm",
+    "source_url": "https://github.com/bytecodealliance/wasmtime/releases/download/v48.0.0/wasi_snapshot_preview1.command.wasm",
+    "byte_len": 51828,
+    "sha256": "316dfbf171591d69ae414efd13b85933ca13526af8d9e0a735ab88ae08fd85f0",
+    "target_wasi_revision": "0.2.12",
+    "published_asset_bytes_are_normative": true,
+    "source_tag_is_bit_reproducibility_claim": false
+  },
+  "guest_contract": {
+    "module": "wasi_snapshot_preview1",
+    "imports_are_exact_set": true,
+    "imports": [
+      {
+        "name": "args_sizes_get",
+        "kind": "func",
+        "params": ["i32", "i32"],
+        "results": ["i32"]
+      },
+      {
+        "name": "args_get",
+        "kind": "func",
+        "params": ["i32", "i32"],
+        "results": ["i32"]
+      },
+      {
+        "name": "fd_read",
+        "kind": "func",
+        "params": ["i32", "i32", "i32", "i32"],
+        "results": ["i32"]
+      },
+      {
+        "name": "fd_write",
+        "kind": "func",
+        "params": ["i32", "i32", "i32", "i32"],
+        "results": ["i32"]
+      },
+      {
+        "name": "proc_exit",
+        "kind": "func",
+        "params": ["i32"],
+        "results": []
+      }
+    ],
+    "exports": [
+      {
+        "name": "memory",
+        "kind": "memory"
+      },
+      {
+        "name": "_start",
+        "kind": "func",
+        "params": [],
+        "results": []
+      }
+    ],
+    "core_start_section": false,
+    "memory_initial_pages": 2,
+    "memory_maximum_pages": 16,
+    "tables": 0,
+    "globals": 0,
+    "forbidden_import_families": [
+      "environ_*",
+      "path_*",
+      "fd_prestat_*",
+      "fd_readdir",
+      "fd_seek",
+      "fd_tell",
+      "fd_close",
+      "fd_sync",
+      "fd_datasync",
+      "fd_advise",
+      "fd_allocate",
+      "fd_renumber",
+      "fd_filestat_*",
+      "fd_fdstat_*",
+      "proc_raise",
+      "clock_*",
+      "random_get",
+      "poll_oneoff",
+      "sched_yield",
+      "sock_*",
+      "thread-spawn"
+    ]
+  },
+  "component_surface": {
+    "imports": [
+      "wasi:cli/environment@0.2.12",
+      "wasi:cli/exit@0.2.12",
+      "wasi:io/error@0.2.12",
+      "wasi:io/streams@0.2.12",
+      "wasi:cli/stdin@0.2.12",
+      "wasi:cli/stdout@0.2.12",
+      "wasi:cli/stderr@0.2.12",
+      "wasi:clocks/wall-clock@0.2.12",
+      "wasi:filesystem/types@0.2.12",
+      "wasi:filesystem/preopens@0.2.12"
+    ],
+    "exports": ["wasi:cli/run@0.2.12"],
+    "outer_host_mappings": [],
+    "top_level_entity_pins": [
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:cli/environment@0.2.12",
+        "raw_byte_len": 31,
+        "raw_entry_sha256": "f50c324187f7f874e62dbd92dd9a4e36da0dab7125535ea9c68ba14129c0bb1a"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:cli/exit@0.2.12",
+        "raw_byte_len": 24,
+        "raw_entry_sha256": "31341d2791b54d10618ae75fbea7c4cd62332d182949aa9f1f34727e480fb3a9"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:cli/stderr@0.2.12",
+        "raw_byte_len": 26,
+        "raw_entry_sha256": "0e79fcc93c0fd2085521539f967723836d6009af3fd6cbbcacd5764445c840dc"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:cli/stdin@0.2.12",
+        "raw_byte_len": 25,
+        "raw_entry_sha256": "e23d2c01fe8d328e7ac1a68f2fae3a29aa4bc0f6ad9b897946f7cf6f1b2ff7c2"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:cli/stdout@0.2.12",
+        "raw_byte_len": 26,
+        "raw_entry_sha256": "a8538002a6ae4a200e4f7d4f5f59e421798f40af522eb3f4b7a61c9b82967252"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:clocks/wall-clock@0.2.12",
+        "raw_byte_len": 33,
+        "raw_entry_sha256": "91c40063026581249faa8b7cd2bff0b678f98797b63d457a5d297719a5601267"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:filesystem/preopens@0.2.12",
+        "raw_byte_len": 35,
+        "raw_entry_sha256": "cf72736292af0d2d9b805ce91fa3cc4e0e977130a87e38414db5b9c02166fd41"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:filesystem/types@0.2.12",
+        "raw_byte_len": 32,
+        "raw_entry_sha256": "2db3e681fb6977d94685e68e6dea5c326101c5c855f8a41252d1cbb4af559590"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:io/error@0.2.12",
+        "raw_byte_len": 24,
+        "raw_entry_sha256": "10869b485aec6a494ac45728b82614a9009e7bbf5fcc95d58b7d86de2f9f6cc5"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:io/streams@0.2.12",
+        "raw_byte_len": 26,
+        "raw_entry_sha256": "f510f599ed7e7115e3dbedd5f06e5fd821a52e467add451ce58bcbc83fbba0a9"
+      },
+      {
+        "direction": "export",
+        "kind": "instance",
+        "name": "wasi:cli/run@0.2.12",
+        "raw_byte_len": 24,
+        "raw_entry_sha256": "08b0fcdf6c81924f182b7781ded22bdb98e4cab91d2a23a9933cdbb875a0f99a"
+      }
+    ],
+    "canonical_lowerings": 18,
+    "canonical_lowering_domain": "vibeos.preview1-wrapped.canonical-lowerings.v1\u0000",
+    "canonical_lowering_sha256": "c369a1b3e12d9d1e2c0c2716496a64912ba5786f9066864fc0d468eeb3820710",
+    "nested_components": 1,
+    "embedded_core_modules": 4
+  },
+  "programs": [
+    {
+      "id": "c82-rust-ascii-filter",
+      "language": "rust",
+      "source": {
+        "fixture": "c82-rust-ascii-filter.rs",
+        "sha256": "9d85748409e086e57c8de799299376a2755422eb9ad0e35a01eea71c3ac71dff",
+        "no_std": true,
+        "no_main": true
+      },
+      "build": {
+        "edition": "2024",
+        "crate_name": "c82_rust_ascii_filter",
+        "target_cpu": "mvp",
+        "link_self_contained": false,
+        "panic": "abort",
+        "opt_level": "z",
+        "lto": "fat",
+        "codegen_units": 1,
+        "stack_bytes": 65536,
+        "initial_memory_bytes": 131072,
+        "maximum_memory_bytes": 1048576
+      },
+      "compiler_core": {
+        "byte_len": 959,
+        "sha256": "5bac5d59d47f51aec03b4704fbb2fcf08277a55603d40febf23cdd126746dd3a",
+        "defined_globals": 1,
+        "global_references": 0
+      },
+      "guest_core": {
+        "fixture": "c82-rust-ascii-filter.core.wasm",
+        "byte_len": 949,
+        "sha256": "631e8a7be7af1e24caddaf3f2b16d6e194efe4111d3afce6c2db16ea16917195",
+        "import_order": ["fd_write", "proc_exit", "args_sizes_get", "args_get", "fd_read"],
+        "data_segments": 1
+      },
+      "component": {
+        "fixture": "c82-rust-ascii-filter.preview1-wrapped.component.wasm",
+        "byte_len": 23364,
+        "sha256": "8688c4740801174eb1f04e964d8f4056a2b06f6f11520f326feb1f55082a2429",
+        "embedded_core_modules": [
+          {"ordinal": 0, "byte_len": 949, "sha256": "631e8a7be7af1e24caddaf3f2b16d6e194efe4111d3afce6c2db16ea16917195"},
+          {"ordinal": 1, "byte_len": 12442, "sha256": "555bbb11ac448f46fa05d5302db203d07ed5ce71f74da580fdc7155d6611fe5e"},
+          {"ordinal": 2, "byte_len": 478, "sha256": "6805d8e030d86c1ceaf4261e433c2776e36b17afa98d4b5f35fb469e13cfb98d"},
+          {"ordinal": 3, "byte_len": 249, "sha256": "e42434400e3b36f97356cf404910cd1979ac88a09924b4c9550728ab76b8a1c1"}
+        ]
+      },
+      "component_artifact": {
+        "fixture": "c82-rust-ascii-filter.preview1-wrapped.cmp1"
+      }
+    },
+    {
+      "id": "c82-c-ascii-filter",
+      "language": "c",
+      "source": {
+        "fixture": "c82-c-ascii-filter.c",
+        "sha256": "fb9b1d6b0c7a80d71a1f0707dc74cdbfc058c8f52f63f5f59e16b049a80fc096",
+        "freestanding": true,
+        "nostdlib": true,
+        "no_builtin": true
+      },
+      "build": {
+        "optimization": "O2",
+        "target": "wasm32-wasip1",
+        "stack_bytes": 65536,
+        "initial_memory_bytes": 131072,
+        "maximum_memory_bytes": 1048576
+      },
+      "compiler_core": {
+        "byte_len": 1186,
+        "sha256": "ccc1ca33e84f4ed8e94a28e65ed5419fb4d8942a4dd5e67fe50fe158fff090e4",
+        "defined_globals": 1,
+        "global_references": 0
+      },
+      "guest_core": {
+        "fixture": "c82-c-ascii-filter.core.wasm",
+        "byte_len": 1176,
+        "sha256": "cc5c7931e9c29d1fbc86f00fe4bace65ac8f6b46f29d154016137eb189d0ce4d",
+        "import_order": ["args_sizes_get", "args_get", "fd_read", "fd_write", "proc_exit"],
+        "data_segments": 0
+      },
+      "component": {
+        "fixture": "c82-c-ascii-filter.preview1-wrapped.component.wasm",
+        "byte_len": 23591,
+        "sha256": "dd0c250f09b55653f0e4a46f326068c1f4df16809e4ff26fbaeb7bf7e7c56d4f",
+        "embedded_core_modules": [
+          {"ordinal": 0, "byte_len": 1176, "sha256": "cc5c7931e9c29d1fbc86f00fe4bace65ac8f6b46f29d154016137eb189d0ce4d"},
+          {"ordinal": 1, "byte_len": 12442, "sha256": "555bbb11ac448f46fa05d5302db203d07ed5ce71f74da580fdc7155d6611fe5e"},
+          {"ordinal": 2, "byte_len": 478, "sha256": "5577039daa5cc20251e33bff1d1b4e660a255b0183d3263b8f18680234218371"},
+          {"ordinal": 3, "byte_len": 249, "sha256": "d3e532ac157520c4bc92f6dde4a3e0df4581f62f3815ac691d6c395fd3db1d18"}
+        ]
+      },
+      "component_artifact": {
+        "fixture": "c82-c-ascii-filter.preview1-wrapped.cmp1"
+      }
+    }
+  ],
+  "component_artifact": {
+    "world": "root:component/root",
+    "wit_package": {
+      "name": "root:component",
+      "version": "0.0.0+c82",
+      "source_fixture": "c82-preview1-ascii-filter.component.wit",
+      "source_sha256": "176596c3552d018200d89d495de16a0d0917ec49c5b440f1e82038dd801a73dd"
+    },
+    "interface_entity_kind": "interface",
+    "interface_diagnostic_shape": "instance(exact-wasi-0.2.12;host-mapping=none)",
+    "adapter_ordinal": 0,
+    "adapter_revision": "wasmtime-v48.0.0-f1412a598f96f3c261a19118d94caffcb0c36235/wasi_snapshot_preview1.command.wasm",
+    "signer_policy_kind": "development-image-pin",
+    "signer_policy_digest": "sha256(exact-policy-file-bytes)",
+    "instance_limits": {
+      "memory_bytes": 1048576,
+      "total_fuel": 2000000,
+      "poll_quantum": 1000,
+      "resources": 16
+    },
+    "runtime_ready": false
+  },
+  "invocation": {
+    "command_name": "c82-ascii-filter",
+    "arguments_include_argv0": true,
+    "max_arguments": 2,
+    "max_argument_bytes_including_nuls": 64,
+    "max_iovecs": 1,
+    "max_io_bytes_per_host_call": 257,
+    "max_stdin_bytes": 4097,
+    "max_stdout_bytes": 4096,
+    "max_host_calls": 64,
+    "stdin_fd": 0,
+    "stdout_fd": 1,
+    "stderr_policy": "closed-ebadf",
+    "other_fd_policy": "closed-ebadf",
+    "environment": [],
+    "preopens": [],
+    "initial_cwd": null,
+    "proc_exit_semantics": "terminate-current-invocation-only",
+    "exit_code_width": 32,
+    "selected_host_imports": ["args_sizes_get", "args_get", "fd_read", "fd_write", "proc_exit"]
+  },
+  "corpus": {
+    "program_count": 2,
+    "source_files_are_executed_without_edits": true,
+    "maximum_filter_input_bytes": 4096,
+    "modes": ["upper", "lower"],
+    "exit_codes": {
+      "success": 0,
+      "usage": 64,
+      "input_too_large": 65,
+      "software": 70,
+      "io": 74
+    },
+    "golden_cases": [
+      {"name": "upper", "arguments": ["upper"], "stdin_hex": "615a210a", "stdout_hex": "415a210a", "exit": 0},
+      {"name": "lower", "arguments": ["lower"], "stdin_hex": "615a210a", "stdout_hex": "617a210a", "exit": 0},
+      {"name": "bad-argument", "arguments": ["bad"], "stdin_hex": "", "stdout_hex": "", "exit": 64},
+      {"name": "oversize", "arguments": ["upper"], "stdin_repeat_byte": 97, "stdin_repeat_count": 4097, "stdout_hex": "", "exit": 65}
+    ]
+  },
+  "admission": {
+    "feature": "preview1-corpus-acceptance",
+    "default_enabled": false,
+    "input_kind": "ComponentArtifactV1",
+    "raw_wasip1_admission": false,
+    "candidate_is_move_only": true,
+    "fresh_revalidation_before_invocation": true,
+    "private_guest_projection_ordinal": 0,
+    "raw_core_accessor": false,
+    "validated_plan_accessor": false,
+    "grant_accessor": false,
+    "ordinary_admission_conversion": false,
+    "production_guest_execution": false,
+    "acceptance_guest_execution": true,
+    "outer_component_host_mappings": [],
+    "runtime_ready": false,
+    "profile_runtime_ready": false,
+    "loader_registration": false,
+    "graph_registration": false,
+    "vsh_registration": false,
+    "durable_registration": false,
+    "ambient_lookup": 0,
+    "raw_durable_ids": 0,
+    "no_grant_direct_move": 0,
+    "preopens": false,
+    "filesystem_authority": false,
+    "environment_authority": false,
+    "process_authority": false,
+    "socket_authority": false,
+    "thread_authority": false,
+    "clock_authority": false,
+    "random_authority": false,
+    "selected_wasi_0_3_mapping": false,
+    "aot": false,
+    "jit": false
+  }
+}

@@ -154,6 +154,86 @@ fn full_ring_applies_backpressure_and_prepared_cancel_preserves_fifo() {
 }
 
 #[test]
+fn prefix_commit_preserves_remainder_and_releases_backpressure_only_at_chunk_end() {
+    for prefix_limit in [1_usize, 257] {
+        let stream = ByteStream::new();
+        let reader = stream.reader();
+        let writer = stream.writer();
+        let probe = Arc::new(WakeProbe {
+            count: AtomicUsize::new(0),
+        });
+        let first = (0..MAX_STREAM_CHUNK_BYTES)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        assert_eq!(writer.start(&first), Ok(StreamSendDispatch::Sent));
+        for value in 1..STREAM_BUFFER_CHUNKS {
+            assert_eq!(writer.start(&[value as u8]), Ok(StreamSendDispatch::Sent));
+        }
+        let blocked = match writer.start(&[0xee]).unwrap() {
+            StreamSendDispatch::Waiting(operation) => operation,
+            other => panic!("full stream must backpressure its writer: {other:?}"),
+        };
+        writer.register_wake(blocked, wake_token(&probe)).unwrap();
+
+        let mut received = Vec::new();
+        while received.len() < first.len() {
+            let prepared = match reader.start().unwrap() {
+                StreamReceiveDispatch::Prepared(prepared) => prepared,
+                other => panic!("front remainder must prepare: {other:?}"),
+            };
+            assert_eq!(prepared.length(), first.len() - received.len());
+
+            if received.is_empty() {
+                assert_eq!(
+                    reader.commit_prefix(prepared.operation(), &mut []),
+                    Err(StreamError::InvalidCommitLength)
+                );
+                let mut oversized = vec![0xcc; prepared.length() + 1];
+                assert_eq!(
+                    reader.commit_prefix(prepared.operation(), &mut oversized),
+                    Err(StreamError::InvalidCommitLength)
+                );
+                assert!(oversized.iter().all(|byte| *byte == 0xcc));
+            }
+
+            let count = prefix_limit.min(prepared.length());
+            let offset = received.len();
+            received.resize(offset + count, 0);
+            assert_eq!(
+                reader.commit_prefix(prepared.operation(), &mut received[offset..]),
+                Ok(StreamReceiveCommit::Received(count))
+            );
+            let mut stale_output = [0xa5];
+            assert_eq!(
+                reader.commit_prefix(prepared.operation(), &mut stale_output),
+                Err(StreamError::TokenMismatch)
+            );
+            assert_eq!(stale_output, [0xa5]);
+
+            if received.len() < first.len() {
+                assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS);
+                assert_eq!(probe.count.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        assert_eq!(received, first);
+        assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS - 1);
+        assert_eq!(probe.count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            writer.resume(blocked, &[0xee]),
+            Ok(StreamSendDispatch::Sent)
+        );
+        assert_eq!(stream.depth(), STREAM_BUFFER_CHUNKS);
+        for expected in 1..STREAM_BUFFER_CHUNKS as u8 {
+            assert_eq!(receive_one(&reader), [expected]);
+        }
+        assert_eq!(receive_one(&reader), [0xee]);
+        assert_eq!(stream.depth(), 0);
+        assert!(!stream.is_fail_stopped());
+    }
+}
+
+#[test]
 fn waiting_to_prepared_uses_fresh_token_and_stale_or_cross_tokens_are_inert() {
     let stream = ByteStream::new();
     let reader = stream.reader();

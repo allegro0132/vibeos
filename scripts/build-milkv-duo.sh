@@ -163,7 +163,7 @@ if [ "$runtime_costs" = true ]; then
   fi
   runtime_costs_linker=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$runtime_costs_linker")
   runtime_costs_rustc_verbose=$("$pinned_rustc" -vV)
-  runtime_costs_expected_rustc=$(sed -n 's/^# rustc //p' "$repo_root/rust-toolchain.toml")
+  runtime_costs_expected_rustc=$(sed -n 's/^# \(rustc .*$\)/\1/p' "$repo_root/rust-toolchain.toml")
   runtime_costs_expected_rustc_commit=$(sed -n 's/^# rustc-commit: //p' "$repo_root/rust-toolchain.toml")
   runtime_costs_actual_rustc=$(printf '%s\n' "$runtime_costs_rustc_verbose" | sed -n '1p')
   runtime_costs_actual_rustc_commit=$(printf '%s\n' "$runtime_costs_rustc_verbose" | sed -n 's/^commit-hash: //p')

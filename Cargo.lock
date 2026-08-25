@@ -1228,6 +1228,7 @@ dependencies = [
  "vibeos-storage-device",
  "vibeos-vsh",
  "vibeos-wasm-runtime",
+ "vibeos-wasm-runtime-costs",
 ]
 
 [[package]]
@@ -1394,6 +1395,18 @@ dependencies = [
  "vibeos-component-format",
  "wasmi",
  "wasmparser 0.255.0",
+ "wat",
+]
+
+[[package]]
+name = "vibeos-wasm-runtime-costs"
+version = "0.1.0"
+dependencies = [
+ "sha2",
+ "vibeos-component-format",
+ "vibeos-component-runtime",
+ "vibeos-core",
+ "vibeos-wasm-runtime",
  "wat",
 ]
 

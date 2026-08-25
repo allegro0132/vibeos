@@ -357,6 +357,25 @@ pub struct HeapSnapshot {
     pub bump_remaining_bytes: usize,
 }
 
+/// Exact global live-byte observation over one exclusive measurement window.
+///
+/// Unlike [`HeapSnapshot::peak_live_bytes`], `peak_live_bytes` here is reset at
+/// the start of the window. It therefore describes only allocations that were
+/// live between `Heap::begin_live_window` and `HeapLiveWindow::finish`.
+#[cfg(feature = "wasm-c83-runtime-costs")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HeapLiveWindowObservation {
+    pub live_before: usize,
+    pub peak_live_bytes: usize,
+    pub live_after: usize,
+}
+
+#[cfg(feature = "wasm-c83-runtime-costs")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeapLiveWindowError {
+    AlreadyActive,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OwnerError {
     SystemOwnerReserved,
@@ -645,6 +664,8 @@ struct HeapInner {
     free: [Option<NonNull<FreeNode>>; NUM_CLASSES],
     live_bytes: usize,
     peak_bytes: usize,
+    #[cfg(feature = "wasm-c83-runtime-costs")]
+    live_window: Option<HeapLiveWindowState>,
     owners: [OwnerAccount; MAX_OWNER_ACCOUNTS],
     arenas: [ArenaRecord; MAX_ALLOCATION_ARENAS],
     next_owner_id: u64,
@@ -652,9 +673,51 @@ struct HeapInner {
     last_failures: [Option<AllocationFailure>; MAX_HARTS],
 }
 
+#[cfg(feature = "wasm-c83-runtime-costs")]
+#[derive(Clone, Copy)]
+struct HeapLiveWindowState {
+    live_before: usize,
+    peak_live_bytes: usize,
+}
+
 unsafe impl Send for HeapInner {}
 
 pub struct Heap(SpinLock<HeapInner>);
+
+/// Exclusive, allocation-free live-byte measurement owned by one [`Heap`].
+///
+/// Dropping an unfinished window cancels it, so a failed benchmark sample
+/// cannot leak measurement state into the next run. The window is global to
+/// the heap: users that need workload-local results must independently ensure
+/// that no unrelated hart or background task allocates during the scope.
+#[cfg(feature = "wasm-c83-runtime-costs")]
+#[must_use = "finish the window to obtain its observation"]
+pub struct HeapLiveWindow<'a> {
+    heap: &'a Heap,
+    active: bool,
+    not_send: PhantomData<*mut ()>,
+}
+
+#[cfg(feature = "wasm-c83-runtime-costs")]
+impl HeapLiveWindow<'_> {
+    /// Close the window and return its exact baseline, scoped peak, and final
+    /// live-byte gauges under one allocator lock.
+    pub fn finish(mut self) -> HeapLiveWindowObservation {
+        let observation = self.heap.finish_live_window();
+        self.active = false;
+        observation
+    }
+}
+
+#[cfg(feature = "wasm-c83-runtime-costs")]
+impl Drop for HeapLiveWindow<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.heap.cancel_live_window();
+            self.active = false;
+        }
+    }
+}
 
 impl Heap {
     pub const fn new() -> Self {
@@ -667,6 +730,8 @@ impl Heap {
             free: [None; NUM_CLASSES],
             live_bytes: 0,
             peak_bytes: 0,
+            #[cfg(feature = "wasm-c83-runtime-costs")]
+            live_window: None,
             owners,
             arenas: [ArenaRecord::EMPTY; MAX_ALLOCATION_ARENAS],
             next_owner_id: 1,
@@ -687,6 +752,10 @@ impl Heap {
         h.free = [None; NUM_CLASSES];
         h.live_bytes = 0;
         h.peak_bytes = 0;
+        #[cfg(feature = "wasm-c83-runtime-costs")]
+        {
+            h.live_window = None;
+        }
         h.owners = [OwnerAccount::EMPTY; MAX_OWNER_ACCOUNTS];
         h.owners[0] = OwnerAccount::SYSTEM;
         h.arenas = [ArenaRecord::EMPTY; MAX_ALLOCATION_ARENAS];
@@ -719,6 +788,49 @@ impl Heap {
             bump_used_bytes: h.cursor.saturating_sub(h.start),
             bump_remaining_bytes: h.end.saturating_sub(h.cursor),
         }
+    }
+
+    /// Begin one resettable global live-byte peak window.
+    ///
+    /// Only one window may be active per heap. Successful allocations update
+    /// its peak under the allocator metadata lock, so short-lived allocations
+    /// that disappear before the next snapshot are still observed exactly.
+    #[cfg(feature = "wasm-c83-runtime-costs")]
+    pub fn begin_live_window(&self) -> Result<HeapLiveWindow<'_>, HeapLiveWindowError> {
+        let mut h = self.0.lock();
+        if h.live_window.is_some() {
+            return Err(HeapLiveWindowError::AlreadyActive);
+        }
+        h.live_window = Some(HeapLiveWindowState {
+            live_before: h.live_bytes,
+            peak_live_bytes: h.live_bytes,
+        });
+        drop(h);
+        Ok(HeapLiveWindow {
+            heap: self,
+            active: true,
+            not_send: PhantomData,
+        })
+    }
+
+    #[cfg(feature = "wasm-c83-runtime-costs")]
+    fn finish_live_window(&self) -> HeapLiveWindowObservation {
+        let mut h = self.0.lock();
+        let window = h
+            .live_window
+            .take()
+            .expect("an active heap live-byte window must finish exactly once");
+        HeapLiveWindowObservation {
+            live_before: window.live_before,
+            peak_live_bytes: window.peak_live_bytes,
+            live_after: h.live_bytes,
+        }
+    }
+
+    #[cfg(feature = "wasm-c83-runtime-costs")]
+    fn cancel_live_window(&self) {
+        let mut h = self.0.lock();
+        let _ = h.live_window.take();
     }
 
     /// Create one fresh owner and one fresh reclaimable arena for every quota.
@@ -1521,6 +1633,12 @@ unsafe impl GlobalAlloc for Heap {
         }
         h.live_bytes = new_global_live;
         h.peak_bytes = h.peak_bytes.max(new_global_live);
+        #[cfg(feature = "wasm-c83-runtime-costs")]
+        {
+            if let Some(window) = &mut h.live_window {
+                window.peak_live_bytes = window.peak_live_bytes.max(new_global_live);
+            }
+        }
         h.last_failures[hart] = None;
         user as *mut u8
     }

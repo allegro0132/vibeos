@@ -45,6 +45,7 @@ wasm-c76-graph-version-replacement-acceptance = [
 wasm-c77-ephemeral-runtime-acceptance = [
     "vibeos-kernel/wasm-c77-ephemeral-runtime-acceptance",
 ]
+wasm-c83-runtime-costs = ["vibeos-kernel/wasm-c83-runtime-costs"]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = [
     "vibeos-kernel/ssh-test",

@@ -205,6 +205,9 @@ wasm-c76-graph-version-replacement-acceptance = [
 wasm-c77-ephemeral-runtime-acceptance = [
     "wasm-c76-graph-version-replacement-acceptance",
 ]
+# Dedicated C8.3 raw runtime-cost image. The target emits only source-bound
+# integer samples; schema verification and summary derivation remain host-owned.
+wasm-c83-runtime-costs = ["dep:vibeos-wasm-runtime-costs"]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.
@@ -312,6 +315,7 @@ vibeos-sshd = { path = "../components/sshd", default-features = false, optional 
 vibeos-ssh-identity = { path = "../services/ssh-identity", optional = true }
 vibeos-vsh = { path = "../components/vsh", default-features = false }
 vibeos-wasm-runtime = { path = "../wasm-runtime", optional = true }
+vibeos-wasm-runtime-costs = { path = "../acceptance/wasm-runtime-costs", optional = true }
 jitterentropy = { package = "jitterentropy-rs", path = "../vendor/jitterentropy-rs", default-features = false, features = ["alloc"], optional = true }
 
 [target.'cfg(all(target_arch = "riscv64", target_os = "none"))'.dependencies]

@@ -106,6 +106,57 @@ static ACCEPTANCE_PARENT_MUTATION_RESUME: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
 static ACCEPTANCE_PARENT_MUTATION_REJECTED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+const MANAGED_TRACE_IDLE: u8 = 0;
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+const MANAGED_TRACE_BOUND: u8 = 1;
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+const MANAGED_TRACE_CLAIMED: u8 = 2;
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+const MANAGED_TRACE_CORE: u8 = 3;
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+const MANAGED_TRACE_PROFILED: u8 = 4;
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+const MANAGED_TRACE_RELEASED: u8 = 5;
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+const MANAGED_TRACE_DETACHED: u8 = 6;
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+#[derive(Clone, Copy)]
+struct ManagedChildTrace {
+    epoch: u64,
+    state: u8,
+    core_pairs: u64,
+    typed_polls: u64,
+    core_polls: u64,
+    detach: Option<TaskDetachReason>,
+    invalid: bool,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+impl ManagedChildTrace {
+    const EMPTY: Self = Self {
+        epoch: 0,
+        state: MANAGED_TRACE_IDLE,
+        core_pairs: 0,
+        typed_polls: 0,
+        core_polls: 0,
+        detach: None,
+        invalid: false,
+    };
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+static MANAGED_CHILD_TRACE: SpinLock<ManagedChildTrace> = SpinLock::new(ManagedChildTrace::EMPTY);
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+#[derive(Clone, Copy)]
+pub(crate) struct ManagedChildCoreObservation {
+    pub(crate) core_pairs: u64,
+    pub(crate) typed_polls: u64,
+    pub(crate) core_polls: u64,
+}
+
 /// Acceptance-only destructor that takes the executor's real task-fault
 /// landing pad without printing a kernel panic. If no pad is armed the call
 /// returns, so the terminal-state assertion remains fail-closed.
@@ -209,6 +260,8 @@ struct DelegatedChild {
     epoch: u64,
     detach: PreparedTaskDetachSeal,
     state: DelegatedChildState,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+    driver_completed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -251,6 +304,7 @@ impl SlotFaults {
     const CHILD_OWNER_NOT_CURRENT: Self = Self(1 << 1);
     const CHILD_ABANDONED: Self = Self(1 << 2);
     const CHILD_DETACHED: Self = Self(1 << 3);
+    const CHILD_ABANDONED_DETACHED: Self = Self((1 << 2) | (1 << 3));
     const CHILD_OBSERVER: Self = Self(1 << 4);
     const CORE_OBSERVER: Self = Self(1 << 5);
 
@@ -638,6 +692,251 @@ pub(crate) fn status() -> SlotStatus {
         SlotState::Rejected { report, .. } => SlotStatus::Rejected(*report),
         SlotState::Poisoned(reason) => SlotStatus::Poisoned(*reason),
     }
+}
+
+/// Require the real managed child to have released and then reached its exact
+/// executor `Exited` callback before an SSH response may close the request.
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+pub(crate) fn managed_child_response_ready(epoch: u64) -> Result<(), ProfileError> {
+    ensure_not_poisoned()?;
+    let slot = SLOT.lock();
+    match &*slot {
+        SlotState::Active {
+            sample,
+            child: None,
+            child_detach: Some(TaskDetachReason::Exited),
+            faults,
+            core_owner,
+            ..
+        } if sample.token().epoch() == epoch
+            && faults.is_empty()
+            && *core_owner == CoreObserverOwner::Closed =>
+        {
+            Ok(())
+        }
+        _ => Err(ProfileError::StateMismatch),
+    }
+}
+
+/// Freeze the only request-Drop child outcomes accepted by the production
+/// composition. This is deliberately not “accept whatever faults are there”:
+/// an open observer, a wrong-owner fault, or any unrelated slot bit remains a
+/// hard mismatch.
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+pub(crate) fn managed_child_drop_faults(epoch: u64) -> Result<SlotFaults, ProfileError> {
+    ensure_not_poisoned()?;
+    let slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child,
+        child_detach,
+        faults,
+        core_owner,
+        ..
+    } = &*slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token().epoch() != epoch || *core_owner != CoreObserverOwner::Closed {
+        return Err(ProfileError::StateMismatch);
+    }
+    let mut detached = SlotFaults::NONE;
+    detached.insert(SlotFaults::CHILD_DETACHED);
+    let mut abandoned = detached;
+    abandoned.insert(SlotFaults::CHILD_ABANDONED);
+    match (child, child_detach, *faults) {
+        (None, None, exact) if exact.is_empty() => Ok(exact),
+        (None, Some(TaskDetachReason::Exited), exact) if exact.is_empty() || exact == abandoned => {
+            Ok(exact)
+        }
+        (None, Some(TaskDetachReason::Cancelled | TaskDetachReason::Faulted), exact)
+            if exact == detached || exact == abandoned =>
+        {
+            Ok(exact)
+        }
+        _ => Err(ProfileError::SlotFault(*faults)),
+    }
+}
+
+/// The QEMU active-kill proof accepts one diagnostic outcome only: the real
+/// child was abandoned by its executor envelope, then detached as Exited with
+/// its Core observer closed. Broader production request-Drop cleanup remains
+/// available above for failures which happen before this acceptance scenario.
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+pub(crate) fn managed_child_active_drop_ready(epoch: u64) -> Result<(), ProfileError> {
+    ensure_not_poisoned()?;
+    let slot = SLOT.lock();
+    match &*slot {
+        SlotState::Active {
+            sample,
+            child: None,
+            child_detach: Some(TaskDetachReason::Exited),
+            faults,
+            core_owner,
+            ..
+        } if sample.token().epoch() == epoch
+            && *faults == SlotFaults::CHILD_ABANDONED_DETACHED
+            && *core_owner == CoreObserverOwner::Closed =>
+        {
+            Ok(())
+        }
+        _ => Err(ProfileError::StateMismatch),
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+pub(crate) fn record_managed_child_bound(epoch: u64) -> Result<(), ProfileError> {
+    let mut trace = MANAGED_CHILD_TRACE.lock();
+    if epoch == 0 || trace.state != MANAGED_TRACE_IDLE {
+        trace.invalid = true;
+        return Err(ProfileError::StateMismatch);
+    }
+    *trace = ManagedChildTrace {
+        epoch,
+        state: MANAGED_TRACE_BOUND,
+        ..ManagedChildTrace::EMPTY
+    };
+    Ok(())
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+pub(crate) fn record_managed_child_claimed(epoch: u64) -> Result<(), ProfileError> {
+    let mut trace = MANAGED_CHILD_TRACE.lock();
+    if trace.epoch != epoch || trace.state != MANAGED_TRACE_BOUND || trace.invalid {
+        trace.invalid = true;
+        return Err(ProfileError::StateMismatch);
+    }
+    trace.state = MANAGED_TRACE_CLAIMED;
+    Ok(())
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+pub(crate) fn record_managed_child_core_pair(
+    epoch: u64,
+    before: u64,
+    after: u64,
+) -> Result<bool, ProfileError> {
+    let mut trace = MANAGED_CHILD_TRACE.lock();
+    let first = trace.core_pairs == 0;
+    if trace.epoch != epoch
+        || !matches!(trace.state, MANAGED_TRACE_CLAIMED | MANAGED_TRACE_CORE)
+        || trace.invalid
+        || before != trace.core_pairs
+        || after != before.checked_add(1).ok_or(ProfileError::Exhausted)?
+    {
+        trace.invalid = true;
+        return Err(ProfileError::StateMismatch);
+    }
+    trace.core_pairs = after;
+    trace.state = MANAGED_TRACE_CORE;
+    Ok(first)
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+pub(crate) fn record_managed_child_core_profile(
+    epoch: u64,
+    profile: vibeos_component_runtime::sync::SyncCallProfile,
+) {
+    let mut trace = MANAGED_CHILD_TRACE.lock();
+    let exact = trace.epoch == epoch
+        && trace.state == MANAGED_TRACE_CORE
+        && !trace.invalid
+        && trace.core_pairs != 0
+        && trace.core_pairs == profile.core_polls
+        && profile.typed_polls >= profile.core_polls
+        && profile.typed_polls != u64::MAX
+        && profile.core_polls != u64::MAX
+        && profile.outer_poll_ticks != u64::MAX
+        && profile.core_interpreter_ticks != u64::MAX
+        && profile.consumed_work != u64::MAX;
+    if exact {
+        trace.typed_polls = profile.typed_polls;
+        trace.core_polls = profile.core_polls;
+        trace.state = MANAGED_TRACE_PROFILED;
+    } else {
+        trace.invalid = true;
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+pub(crate) fn record_managed_child_released(epoch: u64) -> Result<(), ProfileError> {
+    let mut trace = MANAGED_CHILD_TRACE.lock();
+    if trace.epoch != epoch || trace.state != MANAGED_TRACE_PROFILED || trace.invalid {
+        trace.invalid = true;
+        return Err(ProfileError::StateMismatch);
+    }
+    trace.state = MANAGED_TRACE_RELEASED;
+    Ok(())
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+fn record_managed_child_detached(epoch: u64, reason: TaskDetachReason, clean: bool) {
+    let mut trace = MANAGED_CHILD_TRACE.lock();
+    let state_exact = if clean {
+        trace.state == MANAGED_TRACE_RELEASED && reason == TaskDetachReason::Exited
+    } else {
+        matches!(
+            trace.state,
+            MANAGED_TRACE_BOUND | MANAGED_TRACE_CLAIMED | MANAGED_TRACE_CORE
+        ) && reason == TaskDetachReason::Exited
+    };
+    if trace.epoch == epoch && !trace.invalid && state_exact {
+        trace.state = MANAGED_TRACE_DETACHED;
+        trace.detach = Some(reason);
+    } else {
+        trace.invalid = true;
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+pub(crate) fn take_managed_child_response_observation(
+    epoch: u64,
+) -> Result<ManagedChildCoreObservation, ProfileError> {
+    let mut trace = MANAGED_CHILD_TRACE.lock();
+    let exact = trace.epoch == epoch
+        && trace.state == MANAGED_TRACE_DETACHED
+        && trace.detach == Some(TaskDetachReason::Exited)
+        && !trace.invalid
+        && trace.core_pairs != 0
+        && trace.core_pairs == trace.core_polls
+        && trace.typed_polls >= trace.core_polls;
+    if !exact {
+        trace.invalid = true;
+        return Err(ProfileError::StateMismatch);
+    }
+    let observation = ManagedChildCoreObservation {
+        core_pairs: trace.core_pairs,
+        typed_polls: trace.typed_polls,
+        core_polls: trace.core_polls,
+    };
+    *trace = ManagedChildTrace::EMPTY;
+    Ok(observation)
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+pub(crate) fn take_managed_child_drop_observation(
+    epoch: u64,
+) -> Result<(u64, TaskDetachReason), ProfileError> {
+    let mut trace = MANAGED_CHILD_TRACE.lock();
+    let exact = trace.epoch == epoch
+        && trace.state == MANAGED_TRACE_DETACHED
+        && trace.detach == Some(TaskDetachReason::Exited)
+        && !trace.invalid
+        && trace.core_pairs != 0
+        && trace.typed_polls == 0
+        && trace.core_polls == 0;
+    if !exact {
+        trace.invalid = true;
+        return Err(ProfileError::StateMismatch);
+    }
+    let observation = (
+        trace.core_pairs,
+        trace
+            .detach
+            .expect("exact Drop trace has one detach reason"),
+    );
+    *trace = ManagedChildTrace::EMPTY;
+    Ok(observation)
 }
 
 fn next_epoch_for_prepare() -> Result<u64, ProfileError> {
@@ -1400,6 +1699,8 @@ fn attach_prepared_child(
         epoch: token.epoch(),
         detach: child_detach,
         state: DelegatedChildState::Attached,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+        driver_completed: false,
     };
 
     let mut slot = SLOT.lock();
@@ -1434,6 +1735,36 @@ fn attach_prepared_child(
             Err(ProfileError::StateMismatch)
         }
     }
+}
+
+/// Bind the exact production managed child while its authenticated request
+/// parent is still in the synchronous start stack.
+///
+/// This is intentionally narrower than projecting a parent `RunLease`: the
+/// caller receives only the epoch copied into the arena-owned payload. The
+/// slot's complete parent seal remains private, and a different current task
+/// observes no attachable lineage.
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+pub(crate) fn attach_current_request_managed_child(
+    batch: &mut crate::exec::PreparedTaskBatch,
+    task_index: usize,
+) -> Result<Option<u64>, ProfileError> {
+    ensure_not_poisoned()?;
+    let candidate = {
+        let slot = SLOT.lock();
+        match &*slot {
+            SlotState::Active { sample, owner, .. } => Some((sample.token(), owner.detach)),
+            _ => None,
+        }
+    };
+    let Some((token, parent)) = candidate else {
+        return Ok(None);
+    };
+    if !parent.is_current_running_exact() {
+        return Ok(None);
+    }
+    attach_prepared_child(token, parent, batch, task_index)?;
+    Ok(Some(token.epoch()))
 }
 
 #[cfg(feature = "wasm-c84-profile-child-delegation")]
@@ -1900,6 +2231,182 @@ pub(crate) struct ChildRunLease {
     not_sync: PhantomData<Cell<()>>,
 }
 
+/// Claim or revalidate the real managed-child ownership held by the executor
+/// future itself. The returned boolean is true only for the first-poll
+/// Attached -> Claimed transition; no parent `RunLease` enters the child.
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+pub(crate) fn claim_current_request_managed_child() -> Result<Option<(u64, bool)>, ProfileError> {
+    ensure_not_poisoned()?;
+    let candidate = {
+        let slot = SLOT.lock();
+        match &*slot {
+            SlotState::Active {
+                sample,
+                child: Some(child),
+                ..
+            } => Some((sample.token(), child.detach, child.state)),
+            _ => None,
+        }
+    };
+    let Some((token, detach, state)) = candidate else {
+        return Ok(None);
+    };
+    if !detach.is_current_running_exact() {
+        return Ok(None);
+    }
+    match state {
+        DelegatedChildState::Attached => {
+            if !detach.is_current_first_poll_exact() {
+                return Err(ProfileError::DelegatedChildUnavailable);
+            }
+            let mut child = claim_current_child()?;
+            if child.token != token || !child.detach.matches_exact(detach) {
+                return Err(ProfileError::StateMismatch);
+            }
+            // The exact outer ManagedChildFuture is now the linear owner. Its
+            // Drop path below supplies abandonment; suppress only this
+            // temporary full lease's duplicate Drop action.
+            child.live = false;
+            Ok(Some((token.epoch(), true)))
+        }
+        DelegatedChildState::Claimed => Ok(Some((token.epoch(), false))),
+        DelegatedChildState::CompletedPendingDetach | DelegatedChildState::Abandoned => {
+            Err(ProfileError::StateMismatch)
+        }
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+fn managed_child_snapshot(
+    epoch: u64,
+) -> Result<(SampleToken, PreparedTaskDetachSeal), ProfileError> {
+    ensure_not_poisoned()?;
+    {
+        let slot = SLOT.lock();
+        match &*slot {
+            SlotState::Active {
+                sample,
+                child: Some(child),
+                ..
+            } if sample.token().epoch() == epoch
+                && child.epoch == epoch
+                && child.state == DelegatedChildState::Claimed =>
+            {
+                Some((sample.token(), child.detach))
+            }
+            _ => None,
+        }
+    }
+    .ok_or(ProfileError::DelegatedChildUnavailable)
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+fn current_managed_child(
+    epoch: u64,
+) -> Result<(SampleToken, PreparedTaskDetachSeal), ProfileError> {
+    let candidate = managed_child_snapshot(epoch)?;
+    if !candidate.1.is_current_running_exact() {
+        mark_child_fault(candidate.0, candidate.1);
+        return Err(ProfileError::OwnerNotCurrent);
+    }
+    Ok(candidate)
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+pub(crate) fn current_managed_child_driver_state() -> Result<Option<(u64, bool)>, ProfileError> {
+    ensure_not_poisoned()?;
+    let candidate = {
+        let slot = SLOT.lock();
+        match &*slot {
+            SlotState::Active {
+                sample,
+                child: Some(child),
+                ..
+            } if child.state == DelegatedChildState::Claimed => {
+                Some((sample.token(), child.detach, child.driver_completed))
+            }
+            _ => None,
+        }
+    };
+    let Some((token, detach, completed)) = candidate else {
+        return Ok(None);
+    };
+    if !detach.is_current_running_exact() {
+        return Ok(None);
+    }
+    Ok(Some((token.epoch(), completed)))
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+pub(crate) fn release_current_request_managed_child() -> Result<Option<u64>, ProfileError> {
+    let Some((epoch, completed)) = current_managed_child_driver_state()? else {
+        return Ok(None);
+    };
+    if !completed {
+        return Err(ProfileError::StateMismatch);
+    }
+    let (token, detach) = current_managed_child(epoch)?;
+    release_child(token, detach)?;
+    Ok(Some(epoch))
+}
+
+/// ManagedChildFuture's destructor counterpart to the temporary full lease
+/// suppressed at claim. Running and executor-reclaiming scopes are both
+/// accepted, matching `ChildRunLease::Drop`; a wrong task remains inert.
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+pub(crate) fn abandon_current_request_managed_child() {
+    let candidate = {
+        let slot = SLOT.lock();
+        match &*slot {
+            SlotState::Active {
+                sample,
+                child: Some(child),
+                ..
+            } if child.state == DelegatedChildState::Claimed => {
+                Some((sample.token(), child.detach))
+            }
+            _ => None,
+        }
+    };
+    let Some((token, detach)) = candidate else {
+        return;
+    };
+    if detach.is_current_running_exact() || detach.is_current_reclaiming_exact() {
+        abandon_child(token, detach);
+    }
+}
+
+/// Mark the successful target driver return which alone authorizes the outer
+/// executor envelope to convert its compact claim into an explicit release.
+/// Cooperative registry cancellation drops the driver without reaching this
+/// function, so its later Ready word cannot wash cancellation into Exited.
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+pub(crate) fn mark_managed_child_driver_completed(epoch: u64) -> Result<(), ProfileError> {
+    let (token, detach) = current_managed_child(epoch)?;
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        core_owner,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token
+        || !child.matches(epoch, detach)
+        || child.state != DelegatedChildState::Claimed
+        || child.driver_completed
+        || !faults.is_empty()
+        || *core_owner != CoreObserverOwner::Closed
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    child.driver_completed = true;
+    Ok(())
+}
+
 #[cfg(feature = "wasm-c84-profile-child-delegation")]
 impl ChildRunLease {
     pub(crate) const fn token(&self) -> SampleToken {
@@ -2055,6 +2562,109 @@ impl Drop for ChildSlotCorePollClock<'_> {
         if self.owns_open {
             self.owns_open = false;
             mark_child_observer_fault(self.child.token, self.child.detach);
+        }
+    }
+}
+
+/// Lexical Core observer for the compact real-managed-child lease.
+///
+/// Construction revalidates the globally stored prepared-task seal against
+/// the current executor poll. The observer owns no task or request authority;
+/// an open edge is sticky in `SLOT` even if this adapter is forgotten.
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+pub(crate) struct ManagedChildSlotCorePollClock {
+    token: SampleToken,
+    detach: PreparedTaskDetachSeal,
+    first_error: Option<ProfileError>,
+    owns_open: bool,
+    not_send: PhantomData<*mut ()>,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+impl ManagedChildSlotCorePollClock {
+    pub(crate) fn current(epoch: u64) -> Result<Self, ProfileError> {
+        let (token, detach) = current_managed_child(epoch)?;
+        Ok(Self {
+            token,
+            detach,
+            first_error: None,
+            owns_open: false,
+            not_send: PhantomData,
+        })
+    }
+
+    fn latch(&mut self, error: Option<ProfileError>) {
+        if error.is_some() {
+            mark_child_observer_fault(self.token, self.detach);
+        }
+        if self.first_error.is_none() {
+            self.first_error = error;
+        }
+    }
+
+    pub(crate) const fn error(&self) -> Option<ProfileError> {
+        self.first_error
+    }
+
+    pub(crate) fn core_is_closed(&self) -> bool {
+        if !self.detach.is_current_running_exact() {
+            mark_child_fault(self.token, self.detach);
+            mark_child_observer_fault(self.token, self.detach);
+            return false;
+        }
+        matches!(child_core_is_closed(self.token, self.detach), Ok(true))
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+impl ProfileClock for ManagedChildSlotCorePollClock {
+    fn ticks(&mut self) -> u64 {
+        live_tick()
+    }
+
+    fn core_poll_started(&mut self) -> u64 {
+        if !self.detach.is_current_running_exact() {
+            mark_child_fault(self.token, self.detach);
+            self.latch(Some(ProfileError::OwnerNotCurrent));
+            return live_tick();
+        }
+        if self.owns_open {
+            self.latch(Some(ProfileError::StateMismatch));
+            return live_tick();
+        }
+        let error = begin_child_core_phase(self.token, self.detach).err();
+        self.owns_open = error.is_none();
+        self.latch(error);
+        live_tick()
+    }
+
+    fn core_poll_finished(&mut self) -> u64 {
+        if !self.detach.is_current_running_exact() {
+            mark_child_fault(self.token, self.detach);
+            self.latch(Some(ProfileError::OwnerNotCurrent));
+            return live_tick();
+        }
+        if !self.owns_open {
+            self.latch(Some(ProfileError::StateMismatch));
+            return live_tick();
+        }
+        self.owns_open = false;
+        let boundary = end_child_core_phase(self.token, self.detach);
+        self.latch(boundary.error);
+        boundary.tick
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+impl Drop for ManagedChildSlotCorePollClock {
+    fn drop(&mut self) {
+        if self.owns_open {
+            self.owns_open = false;
+            if !self.detach.is_current_running_exact() && !self.detach.is_current_reclaiming_exact()
+            {
+                mark_child_fault(self.token, self.detach);
+            }
+            mark_child_observer_fault(self.token, self.detach);
         }
     }
 }
@@ -2416,6 +3026,9 @@ unsafe fn profile_child_detached(
     }
     *child_detach = Some(reason);
     *child = None;
+    drop(slot);
+    #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+    record_managed_child_detached(epoch, reason, clean);
 }
 
 enum DetachAction {
@@ -2480,7 +3093,7 @@ unsafe fn profile_task_detached(
                 );
                 let SlotState::Active {
                     sample,
-                    mut faults,
+                    faults,
                     #[cfg(feature = "wasm-c84-core-poll-observer")]
                     core_owner,
                     ..
@@ -2489,6 +3102,8 @@ unsafe fn profile_task_detached(
                     poison(SlotPoison::StateMismatch);
                     return;
                 };
+                #[cfg(feature = "wasm-c84-core-poll-observer")]
+                let mut faults = faults;
                 #[cfg(feature = "wasm-c84-core-poll-observer")]
                 record_open_core_fault(&mut faults, core_owner);
                 DetachAction::Cancel {

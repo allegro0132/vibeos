@@ -38,6 +38,8 @@ cargo check --locked -p vibeos-wasm-aot-profile \
 ./scripts/qemu-c84-profile-child-delegation-test.sh # C8.4 prepared-child lineage gate
 python3 -B scripts/verify-c84-ssh-profile-request-parent.py --selftest --check-source
 ./scripts/qemu-c84-ssh-request-parent-test.sh # C8.4 authenticated request-parent/reuse gate
+python3 -B scripts/verify-c84-ssh-managed-child-core.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-core-test.sh # C8.4 real managed-child/ordinary-Core SSH gate
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
@@ -184,9 +186,10 @@ Instantiation, ABI, Interpretation, ABI, Cleanup; the external Interpretation
 total must contain the portable Core aggregate; streaming must complete back
 to ready epoch 2. The two-hart boot must reject topology before Core entry.
 This proves only the explicit Core-observer adapter. The frozen SSH runner
-still calls ordinary `poll`, and child-task delegation, IRQ overlays, SSH
-start/end timing, publication, collection, and physical-Duo evidence remain
-separate gates.
+still calls ordinary `poll` when the managed-child composition feature is off.
+The default-off composition gate below now connects this adapter to the exact
+SSH target child; IRQ overlays, complete SSH phase timing, publication,
+collection, and physical-Duo evidence remain separate work.
 
 The separate default-off `wasm-c84-profile-irq-overlay` feature gives a trap
 preempting the exact active slot owner one linear entry/exit cookie. The trap
@@ -249,10 +252,11 @@ slot, so neither forgotten parent nor child adapters can overlap a later
 observer or produce verified evidence. The generic serial gate still rejects
 every panic. The single-hart boot completes fifteen epochs and returns to ready
 epoch 16; the two-hart boot rejects before epoch 1 starts. This is an isolated
-ownership seam only. It does not modify the frozen ordinary component runner,
-connect the OpenSSH acceptance/response boundary, prove real wasmi Core
+ownership seam only. By itself it does not modify the frozen ordinary component
+runner, connect the OpenSSH acceptance/response boundary, prove real wasmi Core
 attribution, publish the schema, collect physical Duo samples, or make an AOT
-decision.
+decision. The managed-child/Core composition below closes the first three gaps
+for the exact diagnostic SSH target without changing the isolated gate's claim.
 
 The default-off `wasm-c84-ssh-request-parent` seam closes the authenticated
 request-parent ownership boundary without claiming a profile result. Only the
@@ -285,9 +289,54 @@ generation in one poll, accept a queued replacement only on the next poll, and
 hand it to a fresh SSH Runner rather than resetting or reading it through the
 old parent. The exact epoch-4 request follows that successful readiness probe.
 The host accepts only the frozen ordered UART sequence.
-This is QEMU integration evidence for request ownership only: the ordinary
-managed child still uses unprofiled wasmi polling, no sample is finished or
-streamed, and no physical-Duo profiling evidence is produced.
+This request-parent-only gate remains QEMU integration evidence for request
+ownership: its managed child uses unprofiled wasmi polling, no sample is
+finished or streamed, and no physical-Duo profiling evidence is produced. The
+separate composition gate below closes the ordinary-child/Core connection.
+
+The default-off `wasm-c84-ssh-managed-child-core` feature composes the
+authenticated request parent, prepared-child delegation, and portable Core
+observer on the real ordinary Component path. During the exact synchronous
+`case-filter` start, child index 0 reserves its third prepared-task registration
+slot and is attached while the `PreparedTaskBatch` is still unpublished. Only
+its copy-only epoch enters the arena-owned payload; the parent `RunLease`
+remains private.
+The outer `ManagedChildFuture` claims that lineage in its first executor poll,
+before `child_start_gate`. A target driver constructs a fresh lexical
+`ManagedChildSlotCorePollClock` around every `poll_profiled`, then rejects an
+observer error or non-Closed Core owner before any later poll or `.await`.
+Non-target and feature-off drivers continue to call ordinary `call.poll()`.
+
+The driver sets its completion bit only after an exact successful guest result.
+The outer future releases only when that bit is true and the registry payload's
+final word is still exact Success; the armed executor detach callback then
+accepts only `CompletedPendingDetach + Exited` as clean. A cooperative
+cancellation cannot turn its later `Ready` envelope into a release: the
+future's destructor instead records abandonment before detach. Normal SSH
+response therefore requires no attached child, exact `Exited`, an empty fault
+set, and a Closed observer. Active request Drop accepts only the frozen
+detached/abandoned fault lattice. In both cases the request parent still
+cancels the sample, compares the rejection, acknowledges it once, and proves
+`Ready(next_epoch)`; it never finishes or streams the sample.
+
+The independent source verifier and isolated one-hart OpenSSH gate are:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-core.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-core-test.sh
+```
+
+For identical successful requests at epochs 1, 2, and 4, the gate freezes
+1,167 real Core polls, 1,167 observer pairs, and 1,241 typed polls. These are
+QEMU control-flow counts, distinct from the preparation preflight above and
+not timing evidence. Epoch 3 is killed only after the first ordinary Core pair;
+the actual executor detach is `Exited` after 29 closed pairs, with no release
+and exact `abandoned + detached` faults. The parent then performs the same
+cancel/ack closure, an immediate readiness probe succeeds, and epoch 4 proves
+post-Drop reuse. QEMU acceptance adds only guarded transition telemetry. This
+node deliberately does not add Host/Wait/Cleanup sidecars, combine the IRQ
+overlay, call `finish`, expose a verified stream or publisher, or produce
+schema, collector, physical Milk-V Duo, or AOT-decision evidence.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

@@ -256,6 +256,22 @@ wasm-c84-ssh-request-parent = [
 # QEMU gate telemetry for the diagnostic request-parent transitions. The base
 # feature above and every physical image remain silent.
 wasm-c84-ssh-request-parent-qemu-acceptance = ["wasm-c84-ssh-request-parent"]
+# Default-off composition of the authenticated request owner with the exact
+# production managed child and the ordinary synchronous Core observer. This
+# remains diagnostic-only: response handling still cancels the slot, and no
+# verified stream or publisher is enabled.
+wasm-c84-ssh-managed-child-core = [
+    "wasm-c84-ssh-request-parent",
+    "wasm-c84-profile-child-delegation",
+    "wasm-c84-core-poll-observer",
+]
+# Single-hart OpenSSH proof that the real hidden managed child claims the
+# request lineage from its first poll, brackets ordinary wasmi Core polls, and
+# releases before its exact Exited detach edge.
+wasm-c84-ssh-managed-child-core-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-core",
+    "wasm-c84-ssh-request-parent-qemu-acceptance",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

@@ -209,8 +209,31 @@ impl SshExecProfileOwner {
             return Err(());
         };
         let epoch = run.token().epoch();
-        match cancel_and_ack_profile(run) {
-            Ok(ready_epoch) if profile_policy_is_current(self.policy) => {
+        #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+        let child_ready = crate::wasm_aot_profile_slot::managed_child_response_ready(epoch).is_ok();
+        #[cfg(not(feature = "wasm-c84-ssh-managed-child-core"))]
+        let child_ready = true;
+        #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+        let child_observation =
+            crate::wasm_aot_profile_slot::take_managed_child_response_observation(epoch);
+        match cancel_and_ack_profile(run, crate::wasm_aot_profile_slot::SlotFaults::default()) {
+            Ok(ready_epoch) if child_ready && profile_policy_is_current(self.policy) => {
+                #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+                match child_observation {
+                    Ok(observation) => crate::println!(
+                        "WASM_C84_SSH_MANAGED_CHILD_CORE RESPONSE epoch={} status={} claim=1 release=1 detach=exited clean=1 core_polls={} observer_pairs={} typed_polls={} observer_closed=1 cancel=1 ack=1 ready_epoch={}",
+                        epoch,
+                        status,
+                        observation.core_polls,
+                        observation.core_pairs,
+                        observation.typed_polls,
+                        ready_epoch
+                    ),
+                    Err(_) => {
+                        profile_request_failure("managed-child-response-trace", Some(epoch));
+                        return Err(());
+                    }
+                }
                 profile_request_response(epoch, status, ready_epoch);
                 Ok(())
             }
@@ -231,8 +254,46 @@ impl SshExecProfileOwner {
             SshExecProfileOwnerState::Reserved(permit) => drop(permit),
             SshExecProfileOwnerState::Active(run) => {
                 let epoch = run.token().epoch();
-                match cancel_and_ack_profile(run) {
-                    Ok(ready_epoch) => profile_request_drop(epoch, ready_epoch),
+                #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+                let drop_expectation =
+                    crate::wasm_aot_profile_slot::managed_child_drop_faults(epoch);
+                #[cfg(all(
+                    feature = "wasm-c84-ssh-managed-child-core",
+                    not(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")
+                ))]
+                let expectation_exact = drop_expectation.is_ok();
+                #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+                let expectation_exact = drop_expectation.is_ok()
+                    && crate::wasm_aot_profile_slot::managed_child_active_drop_ready(epoch).is_ok();
+                #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+                let expected_faults = drop_expectation.unwrap_or_default();
+                #[cfg(not(feature = "wasm-c84-ssh-managed-child-core"))]
+                let expected_faults = crate::wasm_aot_profile_slot::SlotFaults::default();
+                #[cfg(not(feature = "wasm-c84-ssh-managed-child-core"))]
+                let expectation_exact = true;
+                #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+                let child_drop =
+                    crate::wasm_aot_profile_slot::take_managed_child_drop_observation(epoch);
+                match cancel_and_ack_profile(run, expected_faults) {
+                    Ok(ready_epoch) if expectation_exact => {
+                        #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+                        match child_drop {
+                            Ok((core_pairs, crate::exec::TaskDetachReason::Exited)) => {
+                                crate::println!(
+                                    "WASM_C84_SSH_MANAGED_CHILD_CORE DROP epoch={} claim=1 release=0 detach=exited clean=0 child_faults=abandoned+detached observer_pairs={} observer_closed=1 cancel=1 ack=1 ready_epoch={}",
+                                    epoch,
+                                    core_pairs,
+                                    ready_epoch
+                                )
+                            }
+                            Ok(_) | Err(_) => {
+                                profile_request_failure("managed-child-drop-trace", Some(epoch));
+                                return;
+                            }
+                        }
+                        profile_request_drop(epoch, ready_epoch)
+                    }
+                    Ok(_) => profile_request_failure("managed-child-drop-state", Some(epoch)),
                     Err(()) => profile_request_failure("drop", Some(epoch)),
                 }
             }
@@ -242,9 +303,12 @@ impl SshExecProfileOwner {
 }
 
 #[cfg(feature = "wasm-c84-ssh-request-parent")]
-fn cancel_and_ack_profile(run: crate::wasm_aot_profile_slot::RunLease) -> Result<u64, ()> {
+fn cancel_and_ack_profile(
+    run: crate::wasm_aot_profile_slot::RunLease,
+    expected_slot_faults: crate::wasm_aot_profile_slot::SlotFaults,
+) -> Result<u64, ()> {
     use crate::wasm_aot_profile_slot::{
-        acknowledge_rejection, rejection, RejectionCause, SlotFaults, SlotStatus,
+        acknowledge_rejection, rejection, RejectionCause, SlotStatus,
     };
 
     let epoch = run.token().epoch();
@@ -253,7 +317,7 @@ fn cancel_and_ack_profile(run: crate::wasm_aot_profile_slot::RunLease) -> Result
         && report.cause == RejectionCause::LeaseCancelled
         && report.facade_faults.is_empty()
         && report.ledger_error.is_none()
-        && report.slot_faults == SlotFaults::default()
+        && report.slot_faults == expected_slot_faults
         && report.intervals_emitted == 0;
     let stored_rejection_is_exact = rejection() == Some(report);
     // A successful cancel has already installed one diagnostic rejection.

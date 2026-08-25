@@ -371,11 +371,22 @@ restart cycles, observes no destructor calls, and requires heap use to plateau.
 3.13 publishes a versioned guest JSON stream and a checked-in QEMU/TCG baseline.
 The runner fixes `virt`/`rv64`/one hart/single-threaded TCG plus deterministic
 `icount`, records QEMU and Rust revisions, and refuses silent schema or sample-count
-changes. The 2026-08-08 baseline records IPC p95 110 ticks (257 samples), timer
-IRQ-to-poll p95 24 ticks (129), cap lookup p50 2–4 ticks across derivation depths
-0–32, compile p50 357,646 source B/s (21), a 113,792 B heap high-water, and
-828 B code / 1 B data / 1,862 tick runtime for the fixed generated workload.
-These are regression coordinates for one virtual environment, not a cross-machine
+changes. The initial 2026-08-08 epoch records IPC p95 110 ticks (257 samples),
+timer IRQ-to-poll p95 24 ticks (129), cap lookup p50 2–4 ticks across derivation
+depths 0–32, compile p50 357,646 source B/s (21), a 113,792 B heap high-water,
+and 828 B code / 1 B data / 1,862 tick runtime for the fixed generated workload.
+
+The 2026-08-25 post-safety epoch keeps that original coordinate as historical
+evidence and rebases only after a same-toolchain, QEMU 11.0.3 source bisection.
+Reclaimable-domain dispatch safety first moves IPC from 153/36 to 166/41 at
+`8bed2d0`; the generational instance registry first moves IRQ above its old
+budget at `12f5794` (172/43). The unmodified `b6348d2` runtime then repeats at IPC
+p95 180 and IRQ-to-poll p95 43, with cap lookup p50 2–4 ticks, compile p50
+421,686 source B/s, a 150,400 B heap high-water, and 828 B code / 1 B data /
+1,864 tick runtime. Tightening the IPC/IRQ ratios from 1.40/1.75 to 1.25/1.40
+keeps approximately the original 44/18-tick headroom (effective integer limits
+225/60) instead of silently widening it to nominal limits of 252/75. These are
+regression coordinates for one virtual environment, not a cross-machine
 Linux-pipe comparison.
 
 3.14 makes the evidence reproducible rather than merely repeatable on one laptop.

@@ -12,7 +12,7 @@
   },
   "guest": {
     "clock": "riscv.rdtime",
-    "heap_start_live_bytes": 82176,
+    "heap_start_live_bytes": 121600,
     "profile": "release",
     "schema": "vibeos.bench.meta",
     "target": "riscv64imac-unknown-none-elf",
@@ -155,12 +155,12 @@
     "cap_lookup_depth_8_ticks": {
       "baseline": {
         "direction": "lower",
-        "max": 2,
-        "mean": 2,
-        "min": 2,
+        "max": 3,
+        "mean": 3,
+        "min": 3,
         "name": "cap_lookup_depth_8_ticks",
-        "p50": 2,
-        "p95": 2,
+        "p50": 3,
+        "p95": 3,
         "samples": 41,
         "schema": "vibeos.bench.metric",
         "unit": "ticks_per_lookup",
@@ -177,12 +177,12 @@
     "compile_bytes_per_second": {
       "baseline": {
         "direction": "higher",
-        "max": 357646,
-        "mean": 357637,
-        "min": 357583,
+        "max": 421686,
+        "mean": 421673,
+        "min": 421599,
         "name": "compile_bytes_per_second",
-        "p50": 357646,
-        "p95": 357646,
+        "p50": 421686,
+        "p95": 421686,
         "samples": 21,
         "schema": "vibeos.bench.metric",
         "unit": "source_bytes_per_second",
@@ -243,12 +243,12 @@
     "generated_runtime_ticks": {
       "baseline": {
         "direction": "lower",
-        "max": 1862,
-        "mean": 1862,
-        "min": 1862,
+        "max": 1864,
+        "mean": 1863,
+        "min": 1863,
         "name": "generated_runtime_ticks",
-        "p50": 1862,
-        "p95": 1862,
+        "p50": 1863,
+        "p95": 1864,
         "samples": 41,
         "schema": "vibeos.bench.metric",
         "unit": "ticks",
@@ -265,12 +265,12 @@
     "heap_peak_bytes": {
       "baseline": {
         "direction": "lower",
-        "max": 113792,
-        "mean": 113792,
-        "min": 113792,
+        "max": 150400,
+        "mean": 150400,
+        "min": 150400,
         "name": "heap_peak_bytes",
-        "p50": 113792,
-        "p95": 113792,
+        "p50": 150400,
+        "p95": 150400,
         "samples": 1,
         "schema": "vibeos.bench.metric",
         "unit": "bytes",
@@ -287,12 +287,12 @@
     "ipc_roundtrip_ticks": {
       "baseline": {
         "direction": "lower",
-        "max": 110,
-        "mean": 109,
-        "min": 109,
+        "max": 181,
+        "mean": 179,
+        "min": 179,
         "name": "ipc_roundtrip_ticks",
-        "p50": 110,
-        "p95": 110,
+        "p50": 179,
+        "p95": 180,
         "samples": 257,
         "schema": "vibeos.bench.metric",
         "unit": "ticks",
@@ -302,19 +302,19 @@
       "policy": {
         "absolute": 32,
         "direction": "lower",
-        "ratio": 1.4,
+        "ratio": 1.25,
         "stat": "p95"
       }
     },
     "irq_to_poll_ticks": {
       "baseline": {
         "direction": "lower",
-        "max": 24,
-        "mean": 23,
-        "min": 23,
+        "max": 43,
+        "mean": 42,
+        "min": 42,
         "name": "irq_to_poll_ticks",
-        "p50": 24,
-        "p95": 24,
+        "p50": 42,
+        "p95": 43,
         "samples": 129,
         "schema": "vibeos.bench.metric",
         "unit": "ticks",
@@ -324,7 +324,7 @@
       "policy": {
         "absolute": 8,
         "direction": "lower",
-        "ratio": 1.75,
+        "ratio": 1.4,
         "stat": "p95"
       }
     }

@@ -35,6 +35,7 @@ cargo check --locked -p vibeos-wasm-aot-profile \
 ./scripts/qemu-c84-profile-slot-test.sh # C8.4 slot ownership/topology gate
 ./scripts/qemu-c84-core-poll-test.sh # C8.4 real Core observer/slot gate
 ./scripts/qemu-c84-profile-irq-overlay-test.sh # C8.4 real self-SSIP overlay gate
+./scripts/qemu-c84-profile-child-delegation-test.sh # C8.4 prepared-child lineage gate
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
@@ -200,6 +201,35 @@ arming the sample.
 This gate is evidence for that deliberate self-SSIP only; it does not establish
 targeted timer or PLIC handling, SSH timing, publication/collection, or
 physical Milk-V Duo behaviour.
+
+The default-off `wasm-c84-profile-child-delegation` seam lets an exact
+request-owned `RunLease` bind at most one still-hidden `PreparedTaskBatch`
+member before scheduler publication. The executor returns a copy-only seal for
+the child's already-armed detach callback; it grants no handle, wake, poll,
+cancel, disarm, or recycle authority. The child must claim from its exact first
+poll and may change phases only while claimed. IRQ overlays accept the exact
+child while claimed or while explicitly released and awaiting final detach.
+Release deliberately does not disarm the callback: only the executor's later
+`Exited` reason is clean. Early exit, ordinary lease Drop, post-release
+cancellation or fault, and parent finish with a live child become request-local
+diagnostic rejections. The parent remains the sole owner of finish,
+cancellation, target storage, streaming, and recycle.
+The `vibeos-core` compile-fail doctests independently enforce that the public
+prepared seal has neither wake nor disarm methods.
+
+`scripts/qemu-c84-profile-child-delegation-test.sh` proves bind-before-publish,
+one exact prepared-child identity, first-poll-only claim, duplicate and
+wrong-task inertia, a real child-owned self-SSIP, clean `release + Exited`,
+parent-cancel-first stale callback behavior, forgotten and dropped child
+rejection, `release + Cancelled`, fail-closed parent finish, and rejection of a
+claim attempted after a first-poll yield. A silent destructor fault also proves
+that `release + Faulted` stays diagnostic while the generic serial gate still
+rejects every panic. The single-hart boot completes eight epochs and returns to
+ready epoch 9; the two-hart boot rejects before epoch 1 starts. This is an
+isolated ownership seam only. It does not modify the frozen ordinary component
+runner, connect the OpenSSH acceptance/response boundary, prove real wasmi Core
+attribution, publish the schema, collect physical Duo samples, or make an AOT
+decision.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

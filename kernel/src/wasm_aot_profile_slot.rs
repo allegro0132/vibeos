@@ -13,10 +13,12 @@
 //! additionally checked against the exact task and allocation domain.
 //!
 //! The optional Core-poll observer is a caller-owned adapter over an exact
-//! [`RunLease`]; ordinary runtime `poll()` remains untouched. A separate
-//! default-off trap overlay can bracket an interrupt with a linear cookie;
-//! SSH and publication hooks remain deliberately disconnected. Isolated QEMU
-//! workers prove each boundary without composing their exact transcripts.
+//! [`RunLease`]; ordinary runtime `poll()` remains untouched. A bounded
+//! delegation seam can bind one still-hidden prepared child to the same
+//! request lineage before scheduler publication. A separate default-off trap
+//! overlay can bracket an interrupt with a linear cookie; SSH and publication
+//! hooks remain deliberately disconnected. Isolated QEMU workers prove each
+//! boundary without composing their exact transcripts.
 
 extern crate alloc;
 
@@ -24,15 +26,18 @@ use alloc::boxed::Box;
 use core::cell::Cell;
 use core::marker::PhantomData;
 use core::mem;
-#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+))]
 use core::sync::atomic::AtomicBool;
 #[cfg(feature = "wasm-c84-profile-irq-overlay")]
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::exec::{
-    CurrentTaskDetachLease, TaskDetachDisarm, TaskDetachReason, TaskDetachRegistrationError,
-    TaskDetachTarget, TaskId,
+    CurrentTaskDetachLease, PreparedTaskDetachSeal, TaskDetachDisarm, TaskDetachReason,
+    TaskDetachRegistrationError, TaskDetachTarget, TaskId,
 };
 use crate::heap::AllocationDomain;
 use crate::sync::SpinLock;
@@ -50,14 +55,49 @@ static SLOT: SpinLock<SlotState> = SpinLock::new(SlotState::Uninitialized);
 static POISON: AtomicU8 = AtomicU8::new(0);
 #[cfg(feature = "wasm-c84-profile-irq-overlay")]
 static ACTIVE_EPOCH: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+))]
 static ACCEPTANCE_SSIP_PAIRED: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+))]
 static ACCEPTANCE_SSIP_INACTIVE: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
 static ACCEPTANCE_CHILD_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
 static ACCEPTANCE_CHILD_RELEASE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_CHILD_CLAIMED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_CHILD_RELEASED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_WRONG_TASK_INERT: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_CANCEL_CHILD_INERT: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_RELEASED_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_FINISH_CHILD_INERT: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_LATE_CLAIM_REJECTED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_FAULT_ARMED: AtomicBool = AtomicBool::new(false);
+
+/// Acceptance-only destructor that takes the executor's real task-fault
+/// landing pad without printing a kernel panic. If no pad is armed the call
+/// returns, so the terminal-state assertion remains fail-closed.
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+struct AcceptanceSilentDestructorFault;
+
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+impl Drop for AcceptanceSilentDestructorFault {
+    fn drop(&mut self) {
+        crate::trampoline::unwind_faulted_task();
+    }
+}
 
 #[derive(Clone, Copy)]
 struct OwnerSeal {
@@ -77,6 +117,25 @@ impl OwnerSeal {
     }
 }
 
+impl DelegatedChild {
+    fn matches(self, epoch: u64, detach: PreparedTaskDetachSeal) -> bool {
+        self.epoch == epoch && self.detach.matches_exact(detach)
+    }
+
+    fn callback_matches(self, epoch: u64, task: TaskId, domain: AllocationDomain) -> bool {
+        self.epoch == epoch
+            && self.detach.task_id() == task
+            && self.detach.allocation_domain() == domain
+    }
+
+    fn current_irq_owner(self) -> bool {
+        matches!(
+            self.state,
+            DelegatedChildState::Claimed | DelegatedChildState::CompletedPendingDetach
+        ) && self.detach.is_current_irq_scope_exact()
+    }
+}
+
 enum SlotState {
     Uninitialized,
     Ready(TargetReady<'static>),
@@ -87,6 +146,8 @@ enum SlotState {
     Active {
         sample: TargetActive<'static>,
         owner: OwnerSeal,
+        child: Option<DelegatedChild>,
+        child_detach: Option<TaskDetachReason>,
         faults: SlotFaults,
     },
     Transit {
@@ -103,6 +164,21 @@ enum SlotState {
         report: RejectionReport,
     },
     Poisoned(SlotPoison),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DelegatedChildState {
+    Attached,
+    Claimed,
+    CompletedPendingDetach,
+    Abandoned,
+}
+
+#[derive(Clone, Copy)]
+struct DelegatedChild {
+    epoch: u64,
+    detach: PreparedTaskDetachSeal,
+    state: DelegatedChildState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,6 +218,9 @@ pub(crate) struct SlotFaults(u8);
 impl SlotFaults {
     const NONE: Self = Self(0);
     const OWNER_NOT_CURRENT: Self = Self(1 << 0);
+    const CHILD_OWNER_NOT_CURRENT: Self = Self(1 << 1);
+    const CHILD_ABANDONED: Self = Self(1 << 2);
+    const CHILD_DETACHED: Self = Self(1 << 3);
 
     const fn is_empty(self) -> bool {
         self.0 == 0
@@ -162,6 +241,8 @@ pub(crate) enum RejectionCause {
     StreamAbandoned,
     TargetRejected,
     TaskDetached(TaskDetachReason),
+    DelegatedChildAttached,
+    DelegatedTaskDetached(TaskDetachReason),
     SlotFault,
 }
 
@@ -216,6 +297,10 @@ pub(crate) enum SlotStatus {
     Active {
         epoch: u64,
     },
+    Delegated {
+        epoch: u64,
+        claimed: bool,
+    },
     Transit {
         epoch: u64,
         kind: TransitKind,
@@ -239,6 +324,8 @@ pub(crate) enum ProfileError {
     Registration(TaskDetachRegistrationError),
     Detach(TaskDetachDisarm),
     OwnerNotCurrent,
+    DelegatedChildAttached,
+    DelegatedChildUnavailable,
     StateMismatch,
     Start(TargetStartError),
     Facade(FacadeFaults),
@@ -360,7 +447,9 @@ pub(crate) fn profile_irq_enter(irq_entry: u64) -> TrapIrqCookie {
     let SlotState::Active {
         sample,
         owner,
+        child,
         faults,
+        ..
     } = &mut *slot
     else {
         drop(slot);
@@ -373,7 +462,11 @@ pub(crate) fn profile_irq_enter(irq_entry: u64) -> TrapIrqCookie {
         poison(SlotPoison::IrqStateMismatch);
         return TrapIrqCookie::inactive();
     }
-    if !owner.detach.is_current_irq_scope_exact() {
+    if !owner.detach.is_current_irq_scope_exact()
+        && !child
+            .as_ref()
+            .is_some_and(|child| child.current_irq_owner())
+    {
         return TrapIrqCookie::inactive();
     }
     if !faults.is_empty() {
@@ -401,7 +494,9 @@ pub(crate) fn profile_irq_exit(cookie: TrapIrqCookie, exit_tick: u64) -> bool {
     let SlotState::Active {
         sample,
         owner,
+        child,
         faults,
+        ..
     } = &mut *slot
     else {
         drop(slot);
@@ -414,7 +509,11 @@ pub(crate) fn profile_irq_exit(cookie: TrapIrqCookie, exit_tick: u64) -> bool {
         poison(SlotPoison::IrqStateMismatch);
         return false;
     }
-    if !owner.detach.is_current_irq_scope_exact() {
+    if !owner.detach.is_current_irq_scope_exact()
+        && !child
+            .as_ref()
+            .is_some_and(|child| child.current_irq_owner())
+    {
         faults.insert(SlotFaults::OWNER_NOT_CURRENT);
         drop(slot);
         poison(SlotPoison::IrqStateMismatch);
@@ -428,7 +527,10 @@ pub(crate) fn profile_irq_exit(cookie: TrapIrqCookie, exit_tick: u64) -> bool {
 
 /// Acceptance-only attribution for the code=1 trap branch. Production state
 /// remains limited to the active-epoch gate and the target's linear cookie.
-#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+))]
 pub(crate) fn profile_irq_acceptance_note_ssip(applied: bool) {
     if applied {
         ACCEPTANCE_SSIP_PAIRED.fetch_add(1, Ordering::Relaxed);
@@ -468,6 +570,14 @@ pub(crate) fn status() -> SlotStatus {
             next_epoch: ready.next_epoch(),
         },
         SlotState::Reserved { owner, .. } => SlotStatus::Reserved { epoch: owner.epoch },
+        SlotState::Active {
+            sample,
+            child: Some(child),
+            ..
+        } => SlotStatus::Delegated {
+            epoch: sample.token().epoch(),
+            claimed: child.state != DelegatedChildState::Attached,
+        },
         SlotState::Active { sample, .. } => SlotStatus::Active {
             epoch: sample.token().epoch(),
         },
@@ -507,6 +617,14 @@ fn task_detach_target(epoch: u64) -> TaskDetachTarget {
     // holds the IRQ-masking slot lock for O(1) transitions, and performs the
     // bounded full-buffer clear after releasing that lock.
     unsafe { TaskDetachTarget::new(epoch, profile_task_detached) }
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation")]
+fn child_task_detach_target(epoch: u64) -> TaskDetachTarget {
+    // SAFETY: `profile_child_detached` is a permanent, allocation-free kernel
+    // callback. Its scalar epoch is checked together with the exact prepared
+    // task and allocation domain stored in the active slot.
+    unsafe { TaskDetachTarget::new(epoch, profile_child_detached) }
 }
 
 fn disarm(detach: CurrentTaskDetachLease) -> Result<(), ProfileError> {
@@ -673,6 +791,8 @@ fn start_reserved(epoch: u64, detach: CurrentTaskDetachLease) -> Result<SampleTo
             *slot = SlotState::Active {
                 sample,
                 owner,
+                child: None,
+                child_detach: None,
                 faults: SlotFaults::NONE,
             };
             Ok(token)
@@ -746,6 +866,7 @@ fn mark_owner_fault(token: SampleToken, detach: CurrentTaskDetachLease) {
         sample,
         owner,
         faults,
+        ..
     } = &mut *slot
     {
         if sample.token() == token && owner.matches(token.epoch(), detach) {
@@ -765,6 +886,7 @@ fn apply_phase(
         sample,
         owner,
         faults,
+        ..
     } = &mut *slot
     else {
         return Err(ProfileError::StateMismatch);
@@ -804,6 +926,7 @@ fn end_core_phase(token: SampleToken, detach: CurrentTaskDetachLease) -> PhaseBo
         sample,
         owner,
         faults,
+        ..
     } = &mut *slot
     else {
         return PhaseBoundary {
@@ -904,7 +1027,7 @@ fn reject_target_normal(
 
 fn finish_active(token: SampleToken, detach: CurrentTaskDetachLease) -> Result<(), ProfileError> {
     ensure_not_poisoned()?;
-    let (sample, owner, slot_faults, context, tick) = {
+    let (sample, owner, child_attached, child_detach, slot_faults, context, tick) = {
         let mut slot = SLOT.lock();
         let exact = matches!(
             &*slot,
@@ -939,25 +1062,40 @@ fn finish_active(token: SampleToken, detach: CurrentTaskDetachLease) -> Result<(
         let SlotState::Active {
             sample,
             owner,
+            child,
+            child_detach,
             faults,
         } = previous
         else {
             poison(SlotPoison::StateMismatch);
             return Err(ProfileError::StateMismatch);
         };
-        (sample, owner, faults, context, tick)
+        (
+            sample,
+            owner,
+            child.is_some(),
+            child_detach,
+            faults,
+            context,
+            tick,
+        )
     };
 
-    if !slot_faults.is_empty() {
+    if child_attached
+        || !slot_faults.is_empty()
+        || matches!(child_detach, Some(reason) if reason != TaskDetachReason::Exited)
+    {
         let rejected = sample.cancel(token, context);
-        let report = reject_target_normal(
-            owner,
-            TransitKind::Finish,
-            rejected,
-            RejectionCause::SlotFault,
-            slot_faults,
-            0,
-        )?;
+        let cause = if child_attached {
+            RejectionCause::DelegatedChildAttached
+        } else if slot_faults.contains(SlotFaults::CHILD_DETACHED) {
+            let reason = child_detach.expect("a delegated detach fault records its exact reason");
+            RejectionCause::DelegatedTaskDetached(reason)
+        } else {
+            RejectionCause::SlotFault
+        };
+        let report =
+            reject_target_normal(owner, TransitKind::Finish, rejected, cause, slot_faults, 0)?;
         return Err(ProfileError::Rejected(report));
     }
 
@@ -1032,6 +1170,7 @@ fn cancel_active(
             sample,
             owner,
             faults,
+            ..
         } = previous
         else {
             poison(SlotPoison::StateMismatch);
@@ -1041,6 +1180,255 @@ fn cancel_active(
     };
     let rejected = sample.cancel(token, context);
     reject_target_normal(owner, TransitKind::Cancel, rejected, cause, faults, 0)
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation")]
+fn attach_prepared_child(
+    token: SampleToken,
+    parent: CurrentTaskDetachLease,
+    batch: &mut crate::exec::PreparedTaskBatch,
+    task_index: usize,
+) -> Result<(), ProfileError> {
+    if !parent.is_current_running_exact() {
+        mark_owner_fault(token, parent);
+        return Err(ProfileError::OwnerNotCurrent);
+    }
+    {
+        ensure_not_poisoned()?;
+        let slot = SLOT.lock();
+        match &*slot {
+            SlotState::Active {
+                sample,
+                owner,
+                child: None,
+                child_detach: None,
+                faults,
+            } if sample.token() == token
+                && owner.matches(token.epoch(), parent)
+                && faults.is_empty() => {}
+            SlotState::Active {
+                sample,
+                owner,
+                child: Some(_),
+                ..
+            } if sample.token() == token && owner.matches(token.epoch(), parent) => {
+                return Err(ProfileError::DelegatedChildAttached);
+            }
+            SlotState::Active {
+                sample,
+                owner,
+                child_detach: Some(_),
+                ..
+            } if sample.token() == token && owner.matches(token.epoch(), parent) => {
+                return Err(ProfileError::DelegatedChildAttached);
+            }
+            _ => return Err(ProfileError::StateMismatch),
+        }
+    }
+
+    let target = child_task_detach_target(token.epoch());
+    let child_detach = batch
+        .install_prepared_task_detach_seal(task_index, target)
+        .ok_or(ProfileError::RegistrationReserveFailed)?;
+    if child_detach.task_id() == parent.task_id() {
+        poison(SlotPoison::StateMismatch);
+        return Err(ProfileError::StateMismatch);
+    }
+    let delegated = DelegatedChild {
+        epoch: token.epoch(),
+        detach: child_detach,
+        state: DelegatedChildState::Attached,
+    };
+
+    let mut slot = SLOT.lock();
+    match &mut *slot {
+        SlotState::Active {
+            sample,
+            owner,
+            child,
+            child_detach,
+            faults,
+        } if sample.token() == token
+            && owner.matches(token.epoch(), parent)
+            && child.is_none()
+            && child_detach.is_none()
+            && faults.is_empty()
+            && poison_reason().is_none() =>
+        {
+            *child = Some(delegated);
+            Ok(())
+        }
+        _ => {
+            drop(slot);
+            poison(SlotPoison::StateMismatch);
+            Err(ProfileError::StateMismatch)
+        }
+    }
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation")]
+fn claim_current_child() -> Result<ChildRunLease, ProfileError> {
+    ensure_not_poisoned()?;
+    // Do not invert SLOT -> TaskStatus/SCHED. Copy the scalar exact seal, drop
+    // SLOT, prove the current poll stack, then re-lock and compare the complete
+    // state again. A parent cancellation between the two locks makes the claim
+    // inert rather than reviving a stale child.
+    let (token, detach) = {
+        let slot = SLOT.lock();
+        let SlotState::Active {
+            sample,
+            child: Some(child),
+            faults,
+            ..
+        } = &*slot
+        else {
+            return Err(ProfileError::DelegatedChildUnavailable);
+        };
+        if child.state != DelegatedChildState::Attached {
+            return Err(ProfileError::DelegatedChildUnavailable);
+        }
+        if !faults.is_empty() {
+            return Err(ProfileError::SlotFault(*faults));
+        }
+        (sample.token(), child.detach)
+    };
+    if !detach.is_current_running_exact() {
+        return Err(ProfileError::OwnerNotCurrent);
+    }
+    if !detach.is_current_first_poll_exact() {
+        return Err(ProfileError::DelegatedChildUnavailable);
+    }
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    match &mut *slot {
+        SlotState::Active {
+            sample,
+            child: Some(child),
+            faults,
+            ..
+        } if sample.token() == token
+            && child.matches(token.epoch(), detach)
+            && child.state == DelegatedChildState::Attached
+            && faults.is_empty() =>
+        {
+            child.state = DelegatedChildState::Claimed;
+            Ok(ChildRunLease {
+                token,
+                detach,
+                live: true,
+                not_sync: PhantomData,
+            })
+        }
+        _ => Err(ProfileError::DelegatedChildUnavailable),
+    }
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation")]
+fn mark_child_fault(token: SampleToken, detach: PreparedTaskDetachSeal) {
+    let mut slot = SLOT.lock();
+    if let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        ..
+    } = &mut *slot
+    {
+        if sample.token() == token && child.matches(token.epoch(), detach) {
+            faults.insert(SlotFaults::CHILD_OWNER_NOT_CURRENT);
+        }
+    }
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation")]
+fn apply_child_phase(
+    token: SampleToken,
+    detach: PreparedTaskDetachSeal,
+    phase: Phase,
+) -> Result<(), ProfileError> {
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token
+        || !child.matches(token.epoch(), detach)
+        || child.state != DelegatedChildState::Claimed
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    if !faults.is_empty() {
+        return Err(ProfileError::SlotFault(*faults));
+    }
+    sample.set_phase(token, live_context(), live_tick(), phase);
+    let facade = sample.facade_faults();
+    if facade.is_empty() {
+        Ok(())
+    } else {
+        Err(ProfileError::Facade(facade))
+    }
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation")]
+fn release_child(token: SampleToken, detach: PreparedTaskDetachSeal) -> Result<(), ProfileError> {
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token
+        || !child.matches(token.epoch(), detach)
+        || child.state != DelegatedChildState::Claimed
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    if !faults.is_empty() {
+        return Err(ProfileError::SlotFault(*faults));
+    }
+    // Keep the child's exact detach callback armed across the remainder of
+    // its future and the complete future destructor. Only the executor's
+    // terminal detach pass can distinguish clean Exited from a later Drop
+    // fault or cancellation. The parent cannot finish while this marker is
+    // still present.
+    child.state = DelegatedChildState::CompletedPendingDetach;
+    Ok(())
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation")]
+fn abandon_child(token: SampleToken, detach: PreparedTaskDetachSeal) {
+    if poison_reason().is_some() {
+        return;
+    }
+    // These checks borrow TaskStatus/SCHED. Evaluate them before SLOT so the
+    // executor's detach path and the profiler always retain one lock order.
+    let exact_scope = detach.is_current_running_exact() || detach.is_current_reclaiming_exact();
+    let mut slot = SLOT.lock();
+    if let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        ..
+    } = &mut *slot
+    {
+        if sample.token() == token && child.matches(token.epoch(), detach) {
+            if !exact_scope {
+                faults.insert(SlotFaults::CHILD_OWNER_NOT_CURRENT);
+            }
+            faults.insert(SlotFaults::CHILD_ABANDONED);
+            child.state = DelegatedChildState::Abandoned;
+        }
+    }
 }
 
 /// Storage-free exact owner of one globally resident Active sample.
@@ -1070,6 +1458,19 @@ impl RunLease {
             return Err(ProfileError::OwnerNotCurrent);
         }
         apply_phase(self.token, self.detach, None)
+    }
+
+    /// Bind one still-hidden prepared task to this exact request lineage.
+    /// The child's detach callback is installed before this method publishes
+    /// its seal into the slot, so no scheduler-visible child can precede
+    /// fail-closed cleanup ownership.
+    #[cfg(feature = "wasm-c84-profile-child-delegation")]
+    pub(crate) fn attach_prepared_child(
+        &self,
+        batch: &mut crate::exec::PreparedTaskBatch,
+        task_index: usize,
+    ) -> Result<(), ProfileError> {
+        attach_prepared_child(self.token, self.detach, batch, task_index)
     }
 
     #[cfg(feature = "wasm-c84-core-poll-observer")]
@@ -1121,6 +1522,63 @@ impl RunLease {
         self.live = false;
         cancel_active(self.token, self.detach, RejectionCause::LeaseCancelled)
     }
+}
+
+/// Storage-free exact child borrower for one active request lineage.
+///
+/// A child must claim this inside its first exact poll and explicitly release
+/// it before ordinary completion. Drop, cancellation, or raw task detach while
+/// live latches a request-local diagnostic fault. The parent remains the sole
+/// finish/cancel/recycle owner, and the component lifecycle remains outside the
+/// profiling verdict.
+#[cfg(feature = "wasm-c84-profile-child-delegation")]
+pub(crate) struct ChildRunLease {
+    token: SampleToken,
+    detach: PreparedTaskDetachSeal,
+    live: bool,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation")]
+impl ChildRunLease {
+    pub(crate) const fn token(&self) -> SampleToken {
+        self.token
+    }
+
+    pub(crate) fn set_phase(&self, phase: Phase) -> Result<(), ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            mark_child_fault(self.token, self.detach);
+            return Err(ProfileError::OwnerNotCurrent);
+        }
+        apply_child_phase(self.token, self.detach, phase)
+    }
+
+    pub(crate) fn release(mut self) -> Result<(), ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            mark_child_fault(self.token, self.detach);
+            self.live = false;
+            abandon_child(self.token, self.detach);
+            return Err(ProfileError::OwnerNotCurrent);
+        }
+        let result = release_child(self.token, self.detach);
+        self.live = result.is_err();
+        result
+    }
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation")]
+impl Drop for ChildRunLease {
+    fn drop(&mut self) {
+        if self.live {
+            self.live = false;
+            abandon_child(self.token, self.detach);
+        }
+    }
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation")]
+pub(crate) fn claim_delegated_child() -> Result<ChildRunLease, ProfileError> {
+    claim_current_child()
 }
 
 /// Lexically scoped bridge from portable Core observers to one exact slot
@@ -1409,6 +1867,57 @@ pub(crate) fn acknowledge_rejection(epoch: u64) -> Result<RejectionReport, Profi
     Ok(report)
 }
 
+/// Finalize one delegated child's exact executor lifecycle edge.
+///
+/// This callback deliberately performs only a constant-time slot mutation.
+/// The request parent remains the only party that may finish, cancel, or
+/// recycle target storage. A callback after the parent has already left Active
+/// is stale and therefore inert.
+#[cfg(feature = "wasm-c84-profile-child-delegation")]
+unsafe fn profile_child_detached(
+    epoch: u64,
+    task: TaskId,
+    domain: AllocationDomain,
+    reason: TaskDetachReason,
+) {
+    if poison_reason().is_some() {
+        return;
+    }
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child,
+        child_detach,
+        faults,
+        ..
+    } = &mut *slot
+    else {
+        return;
+    };
+    if sample.token().epoch() != epoch
+        || !child
+            .as_ref()
+            .is_some_and(|child| child.callback_matches(epoch, task, domain))
+    {
+        return;
+    }
+
+    let state = child
+        .as_ref()
+        .expect("exact delegated child was checked above")
+        .state;
+    let clean =
+        state == DelegatedChildState::CompletedPendingDetach && reason == TaskDetachReason::Exited;
+    if !clean {
+        faults.insert(SlotFaults::CHILD_DETACHED);
+        if state == DelegatedChildState::Abandoned {
+            faults.insert(SlotFaults::CHILD_ABANDONED);
+        }
+    }
+    *child_detach = Some(reason);
+    *child = None;
+}
+
 enum DetachAction {
     None,
     Cancel {
@@ -1550,7 +2059,8 @@ unsafe fn profile_task_detached(
 #[cfg(any(
     feature = "wasm-c84-profile-slot-qemu-acceptance",
     feature = "wasm-c84-core-poll-qemu-acceptance",
-    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance"
+    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
 ))]
 fn wait_for_tick_progress() {
     let start = live_tick();
@@ -1587,7 +2097,8 @@ fn start_seven_phase_sample(expected_epoch: u64) -> Result<StreamLease, ProfileE
 
 #[cfg(any(
     feature = "wasm-c84-profile-slot-qemu-acceptance",
-    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance"
+    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
 ))]
 async fn wait_for_rejection(epoch: u64) -> Result<RejectionReport, ProfileError> {
     for _ in 0..128 {
@@ -1680,7 +2191,8 @@ async fn run_positive_acceptance() -> Result<(), ProfileError> {
 #[cfg(any(
     feature = "wasm-c84-profile-slot-qemu-acceptance",
     feature = "wasm-c84-core-poll-qemu-acceptance",
-    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance"
+    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
 ))]
 fn run_topology_rejection() -> Result<(), ProfileError> {
     let permit = prepare_current()?;
@@ -1929,7 +2441,10 @@ pub(crate) async fn run_core_poll_qemu_acceptance() {
 /// Publish one local runnable reason, then deliberately force its pending
 /// doorbell through OpenSBI as a real supervisor self-IPI. The worker remains
 /// in one synchronous poll stack while the trap runs and returns.
-#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+))]
 fn force_boot_self_ssip(expect_profiled: bool) -> Result<(), ProfileError> {
     use crate::ipi::DoorbellDisposition;
 
@@ -1977,6 +2492,461 @@ fn force_boot_self_ssip(expect_profiled: bool) -> Result<(), ProfileError> {
         return Err(ProfileError::StateMismatch);
     }
     Ok(())
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+async fn wait_for_task_state(
+    handle: &crate::exec::TaskHandle,
+    expected: crate::exec::TaskState,
+) -> Result<(), ProfileError> {
+    for _ in 0..1_024 {
+        if let Some(exit) = handle.try_exit() {
+            return if exit.state() == expected {
+                Ok(())
+            } else {
+                Err(ProfileError::StateMismatch)
+            };
+        }
+        crate::exec::yield_now().await;
+    }
+    Err(ProfileError::StateMismatch)
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+async fn wait_for_acceptance_flag(flag: &AtomicBool) -> Result<(), ProfileError> {
+    for _ in 0..1_024 {
+        if flag.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        crate::exec::yield_now().await;
+    }
+    Err(ProfileError::StateMismatch)
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+fn require_delegated_rejection(
+    result: Result<StreamLease, ProfileError>,
+    epoch: u64,
+    reason: TaskDetachReason,
+    abandoned: bool,
+) -> Result<(), ProfileError> {
+    let report = match result {
+        Err(ProfileError::Rejected(report)) => report,
+        Err(error) => return Err(error),
+        Ok(stream) => {
+            drop(stream);
+            return Err(ProfileError::StateMismatch);
+        }
+    };
+    if report.epoch != epoch
+        || report.cause != RejectionCause::DelegatedTaskDetached(reason)
+        || !report.slot_faults.contains(SlotFaults::CHILD_DETACHED)
+        || report.slot_faults.contains(SlotFaults::CHILD_ABANDONED) != abandoned
+        || !report.facade_faults.is_empty()
+        || report.ledger_error.is_some()
+    {
+        return Err(ProfileError::Rejected(report));
+    }
+    acknowledge_rejection(epoch)?;
+    Ok(())
+}
+
+/// Prove the narrow request-parent -> prepared-child lineage without touching
+/// the ordinary component runner. The accepted child is sealed before batch
+/// publication, may mutate phases and receive a real SSIP only while exact,
+/// and must retain its callback through future Drop until the executor reports
+/// the final terminal reason.
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+async fn run_child_delegation_positive_acceptance() -> Result<(), ProfileError> {
+    use crate::exec::{CancelOutcome, PreparedTaskBatch, TaskState};
+
+    ACCEPTANCE_CHILD_CLAIMED.store(false, Ordering::Release);
+    ACCEPTANCE_CHILD_RELEASED.store(false, Ordering::Release);
+    ACCEPTANCE_WRONG_TASK_INERT.store(false, Ordering::Release);
+    ACCEPTANCE_CANCEL_CHILD_INERT.store(false, Ordering::Release);
+    ACCEPTANCE_RELEASED_PENDING.store(false, Ordering::Release);
+    ACCEPTANCE_FINISH_CHILD_INERT.store(false, Ordering::Release);
+    ACCEPTANCE_LATE_CLAIM_REJECTED.store(false, Ordering::Release);
+    ACCEPTANCE_FAULT_ARMED.store(false, Ordering::Release);
+
+    let ready_one = SlotStatus::Ready {
+        next_epoch: Some(1),
+    };
+    if status() != ready_one || ACTIVE_EPOCH.load(Ordering::Acquire) != 0 {
+        return Err(ProfileError::StateMismatch);
+    }
+    force_boot_self_ssip(false)?;
+
+    // Epoch 1: only task index 1 owns the prepared-child seal. Index 0 may
+    // attempt both claim and a real SSIP, but neither operation can mutate the
+    // sample. The exact child explicitly releases, returns normally, and only
+    // its final Exited callback clears the delegation marker.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 1 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    wait_for_tick_progress();
+    run.set_phase(Phase::Instantiation)?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-wrong", async {
+        let claim_inert = matches!(
+            claim_delegated_child(),
+            Err(ProfileError::OwnerNotCurrent | ProfileError::DelegatedChildUnavailable)
+        );
+        let irq_inert = force_boot_self_ssip(false).is_ok();
+        ACCEPTANCE_WRONG_TASK_INERT.store(claim_inert && irq_inert, Ordering::Release);
+    });
+    batch.prepare("c84-delegation-exact", async {
+        let Ok(child) = claim_delegated_child() else {
+            return;
+        };
+        ACCEPTANCE_CHILD_CLAIMED.store(true, Ordering::Release);
+        wait_for_tick_progress();
+        if child.set_phase(Phase::Abi).is_err() {
+            return;
+        }
+        wait_for_tick_progress();
+        if force_boot_self_ssip(true).is_err() {
+            return;
+        }
+        wait_for_tick_progress();
+        if child.set_phase(Phase::Host).is_err() {
+            return;
+        }
+        wait_for_tick_progress();
+        if child.release().is_ok() {
+            ACCEPTANCE_CHILD_RELEASED.store(true, Ordering::Release);
+        }
+    });
+    if !matches!(
+        run.attach_prepared_child(&mut batch, 2),
+        Err(ProfileError::RegistrationReserveFailed)
+    ) || batch
+        .prepared_handles()
+        .iter()
+        .any(|handle| handle.is_published())
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    run.attach_prepared_child(&mut batch, 1)?;
+    if status()
+        != (SlotStatus::Delegated {
+            epoch: 1,
+            claimed: false,
+        })
+        || !matches!(
+            run.attach_prepared_child(&mut batch, 0),
+            Err(ProfileError::DelegatedChildAttached)
+        )
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    if handles.len() != 2 {
+        return Err(ProfileError::StateMismatch);
+    }
+    wait_for_task_state(&handles[0], TaskState::Exited).await?;
+    wait_for_task_state(&handles[1], TaskState::Exited).await?;
+    if !ACCEPTANCE_WRONG_TASK_INERT.load(Ordering::Acquire)
+        || !ACCEPTANCE_CHILD_CLAIMED.load(Ordering::Acquire)
+        || !ACCEPTANCE_CHILD_RELEASED.load(Ordering::Acquire)
+        || status() != (SlotStatus::Active { epoch: 1 })
+        || ACTIVE_EPOCH.load(Ordering::Acquire) != 1
+        || !matches!(
+            run.attach_prepared_child(&mut batch, 0),
+            Err(ProfileError::DelegatedChildAttached)
+        )
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    wait_for_tick_progress();
+    run.set_phase(Phase::Wait)?;
+    wait_for_tick_progress();
+    run.begin_cleanup()?;
+    wait_for_tick_progress();
+    let mut stream = run.finish()?;
+    let summary = stream.summary()?;
+    if !summary.intervals_complete()
+        || summary.phase_ticks().abi == 0
+        || summary.phase_ticks().host == 0
+        || summary.phase_ticks().wait == 0
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    let mut count = 0;
+    let mut previous_end = 0;
+    while let Some(interval) = stream.next_interval()? {
+        if interval.sequence() != count || interval.start_offset_ticks() != previous_end {
+            return Err(ProfileError::StateMismatch);
+        }
+        previous_end = interval.end_offset_ticks();
+        count += 1;
+    }
+    if count != summary.interval_count() || previous_end != summary.total_ticks() {
+        return Err(ProfileError::StateMismatch);
+    }
+    stream.complete()?;
+    if status()
+        != (SlotStatus::Ready {
+            next_epoch: Some(2),
+        })
+        || ACTIVE_EPOCH.load(Ordering::Acquire) != 0
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+
+    // Epoch 2: parent cancellation wins before publication. Its sample is
+    // rejected and acknowledged first; the later child claim and detach
+    // callback are stale and cannot alter the next Ready epoch.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 2 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-cancel-stale", async {
+        let inert = matches!(
+            claim_delegated_child(),
+            Err(ProfileError::DelegatedChildUnavailable)
+        ) && force_boot_self_ssip(false).is_ok();
+        ACCEPTANCE_CANCEL_CHILD_INERT.store(inert, Ordering::Release);
+    });
+    run.attach_prepared_child(&mut batch, 0)?;
+    let report = run.cancel()?;
+    if report.epoch != 2
+        || report.cause != RejectionCause::LeaseCancelled
+        || !report.slot_faults.is_empty()
+    {
+        return Err(ProfileError::Rejected(report));
+    }
+    acknowledge_rejection(2)?;
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_task_state(&handles[0], TaskState::Exited).await?;
+    if !ACCEPTANCE_CANCEL_CHILD_INERT.load(Ordering::Acquire)
+        || status()
+            != (SlotStatus::Ready {
+                next_epoch: Some(3),
+            })
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+
+    // Epoch 3: returning with a claimed lease deliberately forgotten is an
+    // Exited detach without explicit release, hence a request-local rejection.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 3 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-forget", async {
+        let Ok(child) = claim_delegated_child() else {
+            return;
+        };
+        let _ = child.set_phase(Phase::Host);
+        wait_for_tick_progress();
+        core::mem::forget(child);
+    });
+    run.attach_prepared_child(&mut batch, 0)?;
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_task_state(&handles[0], TaskState::Exited).await?;
+    require_delegated_rejection(run.finish(), 3, TaskDetachReason::Exited, false)?;
+
+    // Epoch 4: ordinary ChildRunLease Drop records Abandoned; the final Exited
+    // callback adds the exact terminal reason and clears the child seal.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 4 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-abandon", async {
+        let Ok(child) = claim_delegated_child() else {
+            return;
+        };
+        let _ = child.set_phase(Phase::Host);
+        wait_for_tick_progress();
+        drop(child);
+    });
+    run.attach_prepared_child(&mut batch, 0)?;
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_task_state(&handles[0], TaskState::Exited).await?;
+    require_delegated_rejection(run.finish(), 4, TaskDetachReason::Exited, true)?;
+
+    // Epoch 5: release is not a detach disarm. Cancellation after release must
+    // still be reported as Cancelled rather than mistaken for clean Exited.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 5 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-release-cancel", async {
+        let Ok(child) = claim_delegated_child() else {
+            return;
+        };
+        let _ = child.set_phase(Phase::Host);
+        wait_for_tick_progress();
+        if child.release().is_err() || force_boot_self_ssip(true).is_err() {
+            return;
+        }
+        ACCEPTANCE_RELEASED_PENDING.store(true, Ordering::Release);
+        loop {
+            crate::exec::yield_now().await;
+        }
+    });
+    run.attach_prepared_child(&mut batch, 0)?;
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_acceptance_flag(&ACCEPTANCE_RELEASED_PENDING).await?;
+    if !matches!(handles[0].cancel(), CancelOutcome::Requested) {
+        return Err(ProfileError::StateMismatch);
+    }
+    wait_for_task_state(&handles[0], TaskState::Cancelled).await?;
+    require_delegated_rejection(run.finish(), 5, TaskDetachReason::Cancelled, false)?;
+
+    // Epoch 6: finish itself is fail-closed while a child remains Attached.
+    // The parent emits a diagnostic rejection; a subsequent publication can
+    // neither claim the old seal nor perturb Ready epoch 7.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 6 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-finish-stale", async {
+        let inert = matches!(
+            claim_delegated_child(),
+            Err(ProfileError::DelegatedChildUnavailable)
+        );
+        ACCEPTANCE_FINISH_CHILD_INERT.store(inert, Ordering::Release);
+    });
+    run.attach_prepared_child(&mut batch, 0)?;
+    let report = match run.finish() {
+        Err(ProfileError::Rejected(report)) => report,
+        Err(error) => return Err(error),
+        Ok(stream) => {
+            drop(stream);
+            return Err(ProfileError::StateMismatch);
+        }
+    };
+    if report.epoch != 6
+        || report.cause != RejectionCause::DelegatedChildAttached
+        || !report.slot_faults.is_empty()
+    {
+        return Err(ProfileError::Rejected(report));
+    }
+    acknowledge_rejection(6)?;
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_task_state(&handles[0], TaskState::Exited).await?;
+    let ready_seven = SlotStatus::Ready {
+        next_epoch: Some(7),
+    };
+    if !ACCEPTANCE_FINISH_CHILD_INERT.load(Ordering::Acquire)
+        || status() != ready_seven
+        || ACTIVE_EPOCH.load(Ordering::Acquire) != 0
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    // Epoch 7: claiming after a deliberate first-poll yield is too late. The
+    // child cannot omit its unprofiled prefix and still produce a clean sample.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 7 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-late-claim", async {
+        crate::exec::yield_now().await;
+        ACCEPTANCE_LATE_CLAIM_REJECTED.store(
+            matches!(
+                claim_delegated_child(),
+                Err(ProfileError::DelegatedChildUnavailable)
+            ),
+            Ordering::Release,
+        );
+    });
+    run.attach_prepared_child(&mut batch, 0)?;
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_task_state(&handles[0], TaskState::Exited).await?;
+    if !ACCEPTANCE_LATE_CLAIM_REJECTED.load(Ordering::Acquire) {
+        return Err(ProfileError::StateMismatch);
+    }
+    require_delegated_rejection(run.finish(), 7, TaskDetachReason::Exited, false)?;
+
+    // Epoch 8: the child releases cleanly, then its parked future faults while
+    // the executor drops it for cancellation. The real guarded-reclaim path
+    // must report Faulted to the still-armed detach callback without emitting
+    // a panic or accepting the sample.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 8 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-release-fault", async {
+        let Ok(child) = claim_delegated_child() else {
+            return;
+        };
+        let _ = child.set_phase(Phase::Host);
+        wait_for_tick_progress();
+        if child.release().is_err() {
+            return;
+        }
+        let fault = AcceptanceSilentDestructorFault;
+        ACCEPTANCE_FAULT_ARMED.store(true, Ordering::Release);
+        core::future::pending::<()>().await;
+        core::hint::black_box(&fault);
+    });
+    run.attach_prepared_child(&mut batch, 0)?;
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_acceptance_flag(&ACCEPTANCE_FAULT_ARMED).await?;
+    if !matches!(handles[0].cancel(), CancelOutcome::Requested) {
+        return Err(ProfileError::StateMismatch);
+    }
+    wait_for_task_state(&handles[0], TaskState::Faulted).await?;
+    require_delegated_rejection(run.finish(), 8, TaskDetachReason::Faulted, false)?;
+
+    let ready_nine = SlotStatus::Ready {
+        next_epoch: Some(9),
+    };
+    force_boot_self_ssip(false)?;
+    if status() != ready_nine || ACTIVE_EPOCH.load(Ordering::Acquire) != 0 {
+        return Err(ProfileError::StateMismatch);
+    }
+    Ok(())
+}
+
+/// QEMU-only proof of the bounded prepared-child seam. This marker says
+/// nothing about SSH acceptance, the frozen component runner, ordinary Core
+/// polling, publication, or physical Milk-V timing evidence.
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+pub(crate) async fn run_child_delegation_qemu_acceptance() {
+    if crate::online_hart_mask() == 1 {
+        match run_child_delegation_positive_acceptance().await {
+            Ok(()) => crate::println!(
+                "WASM_C84_PROFILE_CHILD_DELEGATION PASS bind_before_publish=1 exact_prepared=1 first_poll_only=1 duplicate_inert=1 wrong_task_inert=1 child_irq_pair=1 clean_detach=1 complete=1 cancel_stale_inert=1 forget_rejected=1 abandoned_rejected=1 release_cancelled=1 finish_attached_rejected=1 late_claim_rejected=1 release_faulted=1 gate_cleared=1 epochs=1,2,3,4,5,6,7,8 ready_epoch=9"
+            ),
+            Err(error) => crate::println!("WASM_C84_PROFILE_CHILD_DELEGATION FAIL {:?}", error),
+        }
+    } else {
+        let result = run_topology_rejection().and_then(|()| {
+            if ACTIVE_EPOCH.load(Ordering::Acquire) == 0 {
+                Ok(())
+            } else {
+                Err(ProfileError::StateMismatch)
+            }
+        });
+        match result {
+            Ok(()) => crate::println!(
+                "WASM_C84_PROFILE_CHILD_DELEGATION TOPOLOGY_REJECT mask={:#x} logical={} physical={} epoch=1",
+                crate::online_hart_mask(),
+                crate::ipi::current_logical_hart().map_or(usize::MAX, crate::exec::HartId::index),
+                crate::sbi::current_hart_id(),
+            ),
+            Err(error) => crate::println!("WASM_C84_PROFILE_CHILD_DELEGATION FAIL {:?}", error),
+        }
+    }
 }
 
 #[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]

@@ -227,6 +227,8 @@ jobs:
         run: ./scripts/qemu-c84-core-poll-test.sh
       - name: Exercise the C8.4 real self-SSIP profile overlay boundary
         run: ./scripts/qemu-c84-profile-irq-overlay-test.sh
+      - name: Exercise the C8.4 prepared-child lineage boundary
+        run: ./scripts/qemu-c84-profile-child-delegation-test.sh
       # Keep these closed-source-state gates before the ordinary Duo build,
       # which applies the reviewed jitterentropy patch inside its submodule.
       - name: Build the isolated Milk-V Duo C8.3 sampler (CI-only identity)

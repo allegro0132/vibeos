@@ -55,6 +55,9 @@ wasm-c84-core-poll-qemu-acceptance = [
 wasm-c84-profile-irq-overlay-qemu-acceptance = [
     "vibeos-kernel/wasm-c84-profile-irq-overlay-qemu-acceptance",
 ]
+wasm-c84-profile-child-delegation-qemu-acceptance = [
+    "vibeos-kernel/wasm-c84-profile-child-delegation-qemu-acceptance",
+]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = [
     "vibeos-kernel/ssh-test",

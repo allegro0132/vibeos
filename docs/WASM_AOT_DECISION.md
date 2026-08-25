@@ -142,6 +142,29 @@ semantics. Because no evidence existed when this feasibility error was found,
 the schema remains version 1 and the workload remains revision 1; artifact,
 input, budget, sampling, phases, and decision predicates are unchanged.
 
+## Prepared-child ownership seam
+
+The default-off kernel profile slot can bind at most one exact member of a
+still-hidden `PreparedTaskBatch` to its request parent before scheduler
+publication. The executor installs the child's final-reason callback first and
+returns only a copy-only identity seal; the request parent keeps exclusive
+finish, cancel, storage, stream, and recycle authority. The seal itself has no
+wake or disarm operation. A child can claim only from its exact first poll;
+yielding before claim is permanently too late. Explicit release leaves the
+callback armed across the remainder of the future and its destructor, so only
+`release + Exited` is clean. `Cancelled`, `Faulted`, exit without release,
+child-lease abandonment, or parent finish while the child is live is
+diagnostic-only and cannot produce verified evidence. The isolated gate drives
+the executor's real guarded destructor-fault path without emitting or allowing
+a serial panic.
+
+The isolated QEMU gate proves this bind/claim/release/detach state machine,
+including a real child-owned self-SSIP and a multi-hart start rejection. It does
+not edit the frozen `kernel/src/component_instances.rs`, and therefore does not
+connect the real managed component child or ordinary wasmi `poll()` path. It
+also does not prove the authenticated SSH boundary, response-end publication,
+schema output, cold-boot collection, or physical timing eligibility.
+
 ## Decision rule
 
 Let `T` be each retained sample's `total_ticks`, `I` its `interpretation`

@@ -105,9 +105,15 @@ intervals, merges only adjacent equal phases, latches cleanup, overlays
 interrupt time as wait, and freezes stored bytes after a sticky failure. Only a
 finished sample that passes an independent full rescan can expose the
 schema-shaped summary and exact-size interval iterator; rejected or
-capacity-overflow samples remain diagnostic-only. The RISC-V check proves that
-this foundation stays dependency-free and `no_std`; target hook wiring is a
-later gate.
+capacity-overflow samples remain diagnostic-only. Its linear handles are
+`Send` but not `Sync`: this permits exclusive ownership to move inside the
+kernel's required `Send` future, including across suspension, without allowing
+the active sample or its hooks to be shared. `Send` is not a measurement-hart
+claim. Every formal target sample must still keep that future pinned to hart 0,
+and later target wiring must dynamically reject a hook observed on any other
+hart. The RISC-V check proves that this foundation stays dependency-free and
+`no_std`; target hook, pinning, and dynamic-hart verification remain later
+gates.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

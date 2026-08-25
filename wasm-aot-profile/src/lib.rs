@@ -7,10 +7,14 @@
 //! handle exposes a publishable summary or interval iterator. Rejected and
 //! unverified samples can only be inspected as diagnostics and recycled.
 //!
-//! Every storage-bearing handle deliberately stays on one thread or hart. The
-//! following compile-fail checks pin both halves of that contract:
+//! Every handle is linearly owned. It may move with one exclusive `Send`
+//! future, but cannot be shared through `Sync`; moving ownership does not
+//! duplicate the active sample or permit concurrent hooks. A formal target
+//! collector must still pin that future to hart 0 and dynamically reject any
+//! hook observed on another hart. The following checks pin both halves of that
+//! type contract:
 //!
-//! ```compile_fail
+//! ```
 //! fn require_send<T: Send>() {}
 //! require_send::<vibeos_wasm_aot_profile::Storage<'static>>();
 //! ```
@@ -18,7 +22,7 @@
 //! fn require_sync<T: Sync>() {}
 //! require_sync::<vibeos_wasm_aot_profile::Storage<'static>>();
 //! ```
-//! ```compile_fail
+//! ```
 //! fn require_send<T: Send>() {}
 //! require_send::<vibeos_wasm_aot_profile::Active<'static>>();
 //! ```
@@ -26,7 +30,7 @@
 //! fn require_sync<T: Sync>() {}
 //! require_sync::<vibeos_wasm_aot_profile::Active<'static>>();
 //! ```
-//! ```compile_fail
+//! ```
 //! fn require_send<T: Send>() {}
 //! require_send::<vibeos_wasm_aot_profile::Finished<'static>>();
 //! ```
@@ -34,7 +38,7 @@
 //! fn require_sync<T: Sync>() {}
 //! require_sync::<vibeos_wasm_aot_profile::Finished<'static>>();
 //! ```
-//! ```compile_fail
+//! ```
 //! fn require_send<T: Send>() {}
 //! require_send::<vibeos_wasm_aot_profile::Verified<'static>>();
 //! ```
@@ -42,7 +46,7 @@
 //! fn require_sync<T: Sync>() {}
 //! require_sync::<vibeos_wasm_aot_profile::Verified<'static>>();
 //! ```
-//! ```compile_fail
+//! ```
 //! fn require_send<T: Send>() {}
 //! require_send::<vibeos_wasm_aot_profile::Rejected<'static>>();
 //! ```
@@ -50,7 +54,7 @@
 //! fn require_sync<T: Sync>() {}
 //! require_sync::<vibeos_wasm_aot_profile::Rejected<'static>>();
 //! ```
-//! ```compile_fail
+//! ```
 //! fn require_send<T: Send>() {}
 //! require_send::<vibeos_wasm_aot_profile::Intervals<'static>>();
 //! ```
@@ -61,6 +65,7 @@
 
 #![no_std]
 
+use core::cell::Cell;
 use core::fmt;
 use core::iter::FusedIterator;
 use core::marker::PhantomData;
@@ -348,7 +353,7 @@ impl Drop for Buffers<'_> {
 /// Caller-owned, cleared storage ready to start exactly one sample.
 pub struct Storage<'a> {
     buffers: Buffers<'a>,
-    not_send_or_sync: PhantomData<*mut ()>,
+    not_sync: PhantomData<Cell<()>>,
 }
 
 impl<'a> Storage<'a> {
@@ -368,7 +373,7 @@ impl<'a> Storage<'a> {
         buffers.clear();
         Ok(Self {
             buffers,
-            not_send_or_sync: PhantomData,
+            not_sync: PhantomData,
         })
     }
 
@@ -396,7 +401,7 @@ impl<'a> Storage<'a> {
                 faults,
                 storage_frozen,
             },
-            not_send_or_sync: PhantomData,
+            not_sync: PhantomData,
         }
     }
 }
@@ -500,7 +505,7 @@ impl<'a> LedgerCore<'a> {
         self.buffers.clear();
         Storage {
             buffers: self.buffers,
-            not_send_or_sync: PhantomData,
+            not_sync: PhantomData,
         }
     }
 }
@@ -509,7 +514,7 @@ impl<'a> LedgerCore<'a> {
 /// every hook so target code can serialize the one-active-sample invariant.
 pub struct Active<'a> {
     core: LedgerCore<'a>,
-    not_send_or_sync: PhantomData<*mut ()>,
+    not_sync: PhantomData<Cell<()>>,
 }
 
 impl<'a> Active<'a> {
@@ -600,7 +605,7 @@ impl<'a> Active<'a> {
         Finished {
             core: self.core,
             end_tick,
-            not_send_or_sync: PhantomData,
+            not_sync: PhantomData,
         }
     }
 }
@@ -609,7 +614,7 @@ impl<'a> Active<'a> {
 pub struct Finished<'a> {
     core: LedgerCore<'a>,
     end_tick: u64,
-    not_send_or_sync: PhantomData<*mut ()>,
+    not_sync: PhantomData<Cell<()>>,
 }
 
 impl<'a> Finished<'a> {
@@ -637,13 +642,13 @@ impl<'a> Finished<'a> {
             Ok(summary) => Ok(Verified {
                 core: self.core,
                 summary,
-                not_send_or_sync: PhantomData,
+                not_sync: PhantomData,
             }),
             Err(error) => Err(Rejected {
                 core: self.core,
                 end_tick: self.end_tick,
                 error,
-                not_send_or_sync: PhantomData,
+                not_sync: PhantomData,
             }),
         }
     }
@@ -872,7 +877,7 @@ pub struct Rejected<'a> {
     core: LedgerCore<'a>,
     end_tick: u64,
     error: VerificationError,
-    not_send_or_sync: PhantomData<*mut ()>,
+    not_sync: PhantomData<Cell<()>>,
 }
 
 impl fmt::Debug for Rejected<'_> {
@@ -991,7 +996,7 @@ impl Interval {
 pub struct Verified<'a> {
     core: LedgerCore<'a>,
     summary: Summary,
-    not_send_or_sync: PhantomData<*mut ()>,
+    not_sync: PhantomData<Cell<()>>,
 }
 
 impl fmt::Debug for Verified<'_> {
@@ -1013,7 +1018,7 @@ impl<'a> Verified<'a> {
             endpoints: &self.core.buffers.endpoints[..self.summary.interval_count],
             phases: &self.core.buffers.phases[..self.summary.interval_count],
             front: 0,
-            not_send_or_sync: PhantomData,
+            not_sync: PhantomData,
         }
     }
 
@@ -1027,7 +1032,7 @@ pub struct Intervals<'a> {
     endpoints: &'a [u64],
     phases: &'a [u8],
     front: usize,
-    not_send_or_sync: PhantomData<*mut ()>,
+    not_sync: PhantomData<Cell<()>>,
 }
 
 impl Iterator for Intervals<'_> {
@@ -1068,6 +1073,9 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use core::future::Future;
+    use core::pin::Pin;
+    use std::boxed::Box;
     use std::vec;
     use std::vec::Vec;
 
@@ -1076,6 +1084,45 @@ mod tests {
             vec![u64::MAX; INTERVAL_CAPACITY],
             vec![u8::MAX; INTERVAL_CAPACITY],
         )
+    }
+
+    fn require_send<T: Send>() {}
+
+    fn active_kernel_driver(active: Active<'static>) -> Pin<Box<dyn Future<Output = u64> + Send>> {
+        Box::pin(async move {
+            core::future::pending::<()>().await;
+            drop(active);
+            0
+        })
+    }
+
+    fn verified_kernel_driver(
+        verified: Verified<'static>,
+    ) -> Pin<Box<dyn Future<Output = u64> + Send>> {
+        Box::pin(async move {
+            core::future::pending::<()>().await;
+            drop(verified);
+            0
+        })
+    }
+
+    #[test]
+    fn linear_handles_fit_the_pinned_send_future_contract() {
+        require_send::<Storage<'static>>();
+        require_send::<Active<'static>>();
+        require_send::<Finished<'static>>();
+        require_send::<Verified<'static>>();
+        require_send::<Rejected<'static>>();
+        require_send::<Intervals<'static>>();
+
+        // These function-pointer witnesses force the same erased future type
+        // used by the kernel driver. Their async bodies retain the handle
+        // after an await, but no permanently-pending future is constructed or
+        // polled by this test.
+        let _: fn(Active<'static>) -> Pin<Box<dyn Future<Output = u64> + Send>> =
+            active_kernel_driver;
+        let _: fn(Verified<'static>) -> Pin<Box<dyn Future<Output = u64> + Send>> =
+            verified_kernel_driver;
     }
 
     #[test]

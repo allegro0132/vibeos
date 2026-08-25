@@ -91,7 +91,12 @@ impl fmt::Display for TaskId {
 /// detach and after every ordinary wait/timer/join registration in the same
 /// ledger has been removed. `context` is deliberately opaque: it commonly
 /// carries a generational index into a fixed SYSTEM registry, never a pointer
-/// into the task's allocation domain.
+/// into the task's allocation domain. Destroying a never-staged exclusive
+/// batch while its task is still held by the batch-local `Prepared` envelope
+/// is also a permanent administrative detach: the callback receives
+/// [`TaskDetachReason::Cancelled`] even though the hidden `TaskStatus` never
+/// publishes a terminal state. Once staging succeeds, the activated task must
+/// instead be published or explicitly quarantined by its caller.
 #[derive(Clone, Copy)]
 pub struct TaskDetachTarget {
     context: u64,
@@ -4753,6 +4758,15 @@ impl Drop for PreparedTaskBatch {
         for prepared in &mut self.tasks {
             if let Some(task) = prepared.task.take() {
                 if prepared.exclusive_reclaimable {
+                    // The raw-arena future cannot run Drop until a stable
+                    // registry has authorized reclamation, but its SYSTEM-owned
+                    // TaskStatus ledger is still live and exact. Drain every
+                    // never-staged edge while the future's arena bytes remain
+                    // intact. In particular, a prepared TaskDetach callback must
+                    // observe the administrative Cancelled rollback instead of
+                    // being silently lost when the batch-local status object is
+                    // abandoned.
+                    drain_task_registrations(&task.status, TaskDetachReason::Cancelled);
                     abandon_task_without_drop(task);
                 } else {
                     rollback_unpublished_task(task);
@@ -7369,6 +7383,113 @@ mod one_shot_wait_tests {
             0,
             "normal supervisor exit disarmed its preinstalled callback"
         );
+    }
+
+    unsafe fn accept_unpublished_detach_reclaim(
+        _witness: ReclaimableFaultWitness,
+    ) -> FaultReclaimOutcome {
+        FaultReclaimOutcome::Reclaimed
+    }
+
+    #[test]
+    fn never_staged_exclusive_drop_drains_prepared_detach_as_cancelled() {
+        struct TrackedDrop(Arc<AtomicUsize>);
+
+        impl Drop for TrackedDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let _serial = EXECUTOR_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::arch::set_test_hart_id(0);
+        run_until_idle(10_000);
+        set_fault_reclaimer(accept_unpublished_detach_reclaim);
+        DETACH_CALLS.store(0, Ordering::SeqCst);
+        DETACH_CONTEXT.store(0, Ordering::SeqCst);
+        DETACH_TASK.store(0, Ordering::SeqCst);
+        DETACH_REASON.store(0, Ordering::SeqCst);
+        DETACH_QUEUE.store(0, Ordering::SeqCst);
+
+        let domain = AllocationDomain::new(OwnerId::new(701), ArenaId::new(702));
+        let detach = unsafe { TaskDetachTarget::new(703, record_task_detach) };
+        let future_drops = Arc::new(AtomicUsize::new(0));
+        let tracked_drop = TrackedDrop(future_drops.clone());
+        let mut batch = PreparedTaskBatch::new();
+        unsafe {
+            batch.prepare_exclusive_reclaimable_owned(
+                domain,
+                "never-staged-exclusive-detach",
+                async move {
+                    let _tracked_drop = tracked_drop;
+                    core::future::pending::<()>().await;
+                },
+            );
+        }
+        let handle = batch.prepared_handles()[0].clone();
+        let seal = batch
+            .install_prepared_task_detach_seal(0, detach)
+            .expect("hidden exclusive task receives its detach callback");
+        assert_eq!(seal.task_id(), handle.id());
+        assert_eq!(seal.allocation_domain(), domain);
+
+        let queue = Arc::new(OneShotWaitQueue::new());
+        let waker_drops = Arc::new(AtomicUsize::new(0));
+        let waiter_count_at_drop = Arc::new(AtomicUsize::new(usize::MAX));
+        let waker = Waker::from(Arc::new(QueueInspectDrop {
+            queue: queue.clone(),
+            drops: waker_drops.clone(),
+            waiters_seen: waiter_count_at_drop.clone(),
+        }));
+        {
+            let mut inner = queue.inner.lock();
+            inner.next_generation = 2;
+            inner.waiter = Some(OneShotWaiter {
+                registration_generation: 1,
+                event_generation: 1,
+                waker,
+                exact_wake: Some(handle.exact_wake()),
+            });
+        }
+        let registered = handle
+            .status
+            .register_owned(OwnedRegistration::OneShotWait {
+                queue: Arc::as_ptr(&queue) as usize,
+                generation: 1,
+            });
+        assert!(
+            registered.is_ok(),
+            "hidden task records its ordinary wait edge"
+        );
+        DETACH_QUEUE.store(Arc::as_ptr(&queue) as usize, Ordering::SeqCst);
+        assert_eq!(queue.waiter_count(), 1);
+        assert_eq!(handle.status.registrations.lock().len(), 2);
+
+        drop(batch);
+
+        assert_eq!(DETACH_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(DETACH_CONTEXT.load(Ordering::SeqCst), 703);
+        assert_eq!(DETACH_TASK.load(Ordering::SeqCst), handle.id().0 as usize);
+        assert_eq!(
+            DETACH_REASON.load(Ordering::SeqCst),
+            2,
+            "a never-staged exclusive task has an administrative Cancelled edge"
+        );
+        assert_eq!(queue.waiter_count(), 0);
+        assert_eq!(waker_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(waiter_count_at_drop.load(Ordering::SeqCst), 0);
+        assert_eq!(future_drops.load(Ordering::SeqCst), 0);
+        assert!(handle.status.registrations.lock().is_empty());
+        assert!(!handle.is_published());
+        assert!(handle.try_exit().is_none());
+        assert!(task_report().iter().all(|task| task.id != handle.id()));
+        assert_eq!(
+            wake_with_disposition(handle.id()),
+            WakeDisposition::Inactive
+        );
+        DETACH_QUEUE.store(0, Ordering::SeqCst);
     }
 
     #[test]

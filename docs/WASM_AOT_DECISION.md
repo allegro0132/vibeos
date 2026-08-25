@@ -214,6 +214,17 @@ connect the real managed component child or ordinary wasmi `poll()` path. It
 also does not prove the authenticated SSH boundary, response-end publication,
 schema output, cold-boot collection, or physical timing eligibility.
 
+Before that seam can be attached to the production managed batch, the executor
+also guarantees one exact pre-staging rollback edge. Dropping a hidden
+raw-reclaimable task while it is still held by the batch-local `Prepared`
+envelope drains its SYSTEM-owned detach ledger with reason `Cancelled` while
+the arena bytes are intact, then abandons the future without running its
+destructor. A profile child bound before staging therefore cannot remain
+silently `Attached` after a later pre-staging setup failure. Once staging
+succeeds, the activated batch must instead be published or explicitly
+quarantined; this rollback makes no broader promise. This prerequisite still
+does not connect or enable the production path.
+
 ## Decision rule
 
 Let `T` be each retained sample's `total_ticks`, `I` its `interpretation`

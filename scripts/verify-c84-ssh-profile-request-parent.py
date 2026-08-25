@@ -467,6 +467,7 @@ def verify_kernel(source: str, root_source: str, manifest: bytes) -> None:
     require(qemu_only in root_code, "request-parent telemetry is not guarded as QEMU-only")
     isolated = (
         f'#[cfg(all(feature="{QEMU_FEATURE}",any('
+        'feature="wasm-c48-qemu-acceptance",'
         'feature="wasm-c84-profile-slot-qemu-acceptance",'
         'feature="wasm-c84-core-poll-qemu-acceptance",'
         'feature="wasm-c84-profile-irq-overlay-qemu-acceptance",'
@@ -547,14 +548,21 @@ def verify_kernel(source: str, root_source: str, manifest: bytes) -> None:
     response_code = compact(owner_response.code)
     require(
         "Active(run)" in owner_response.code
-        and response_code.count("cancel_and_ack_profile(run)") == 1
+        and response_code.count(
+            "cancel_and_ack_profile(run,crate::wasm_aot_profile_slot::SlotFaults::default())"
+        )
+        == 1
         and response_code.count("profile_request_response(epoch,status,ready_epoch)") == 1,
         "response boundary does not close and report one exact active run",
     )
     cancel_code = compact(owner_cancel.code)
     require(
         cancel_code.count("Reserved(permit)=>drop(permit)") == 1
-        and cancel_code.count("cancel_and_ack_profile(run)") == 1
+        and cancel_code.count("cancel_and_ack_profile(run,expected_faults)") == 1
+        and cancel_code.count(
+            "letexpected_faults=crate::wasm_aot_profile_slot::SlotFaults::default();"
+        )
+        == 1
         and "Closed=>{}" in cancel_code,
         "permit/run Drop cleanup is not exactly-once and closed-idempotent",
     )
@@ -578,6 +586,10 @@ def verify_kernel(source: str, root_source: str, manifest: bytes) -> None:
 
     close = find_scope(production, r"\bfn\s+cancel_and_ack_profile\b", "kernel profile close path")
     close_code = compact(close.code)
+    require(
+        "expected_slot_faults:crate::wasm_aot_profile_slot::SlotFaults" in close_code,
+        "kernel close path does not bind one exact expected child-fault set",
+    )
     ordered(
         close_code,
         [
@@ -596,6 +608,10 @@ def verify_kernel(source: str, root_source: str, manifest: bytes) -> None:
     require(
         "stored_rejection_is_exact=rejection()==Some(report)" in close_code,
         "kernel close path does not compare the stored rejection with the cancel report",
+    )
+    require(
+        "report.slot_faults==expected_slot_faults" in close_code,
+        "kernel close path does not compare the returned child faults exactly",
     )
     require("acknowledged==report" in close_code, "kernel close path does not compare acknowledged and returned rejection")
     require(
@@ -759,6 +775,7 @@ def remove_acceptance_isolation_guard(data: Inputs) -> Inputs:
         '#[cfg(all(\n'
         '    feature = "wasm-c84-ssh-request-parent-qemu-acceptance",\n'
         '    any(\n'
+        '        feature = "wasm-c48-qemu-acceptance",\n'
         '        feature = "wasm-c84-profile-slot-qemu-acceptance",\n'
         '        feature = "wasm-c84-core-poll-qemu-acceptance",\n'
         '        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",\n'

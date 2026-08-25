@@ -101,6 +101,8 @@ use vibeos_component_runtime::host::{
 };
 #[cfg(feature = "ssh-component-command")]
 use vibeos_component_runtime::resource::{ResourceTable, ResourceTypeId};
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+use vibeos_component_runtime::sync::SyncCallProfile;
 #[cfg(feature = "ssh-component-command")]
 use vibeos_component_runtime::sync::{SyncError, SynchronousComponent, TypedPoll};
 #[cfg(feature = "ssh-component-command")]
@@ -2180,6 +2182,8 @@ struct LazyComponentPayload {
     resource_generation: u64,
     streams: RegistryStreamBindings,
     mode: PayloadMode,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+    profile_epoch: u64,
     driver: Option<Pin<Box<dyn Future<Output = u64> + Send>>>,
     ready: Option<u64>,
 }
@@ -2312,14 +2316,45 @@ impl Future for ManagedChildFuture {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
         let Some(witness) = crate::exec::current_reclaimable_task_witness() else {
             return Poll::Ready(());
         };
-        if witness.instance_token() != Some(self.token) {
+        if witness.instance_token() != Some(this.token) {
             lifecycle_fail_stop();
             return Poll::Ready(());
         }
-        match child_start_gate(self.control, self.token, witness) {
+        // Claim before even the Prepared/AwaitStart gate. The first published
+        // poll is allowed to park while the request parent commits activation;
+        // delaying this edge until the payload would permanently miss the
+        // executor's sealed first-poll predicate.
+        #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+        match crate::wasm_aot_profile_slot::claim_current_request_managed_child() {
+            Ok(claim) => {
+                if let Some((epoch, claimed)) = claim {
+                    #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+                    if claimed {
+                        if crate::wasm_aot_profile_slot::record_managed_child_claimed(epoch).is_ok()
+                        {
+                            crate::println!(
+                                "WASM_C84_SSH_MANAGED_CHILD_CORE CLAIM epoch={} child_index=0 first_poll=1",
+                                epoch
+                            );
+                        }
+                    }
+                    #[cfg(not(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance"))]
+                    let _ = (epoch, claimed);
+                }
+            }
+            Err(_) => {
+                CONTROL.child_shadow[this.control.slot as usize].quarantine(this.control);
+                CONTROL.supervisor_shadow[this.control.slot as usize].quarantine(this.control);
+                let _ = registry().quarantine(this.token);
+                lifecycle_fail_stop();
+                return Poll::Ready(());
+            }
+        }
+        match child_start_gate(this.control, this.token, witness) {
             ChildStartGate::Active => {}
             ChildStartGate::AwaitStart => return Poll::Pending,
             ChildStartGate::RetryBusy => {
@@ -2330,15 +2365,60 @@ impl Future for ManagedChildFuture {
                 // Only the copy-token executor envelope terminates. The
                 // registry payload, arena, Space, and CSpace remain untouched
                 // and permanently quarantined by the stable SYSTEM records.
-                let _ = registry().quarantine(self.token);
+                let _ = registry().quarantine(this.token);
                 lifecycle_fail_stop();
                 return Poll::Ready(());
             }
         }
         let (permit, expected) = lifecycle_poll_permit();
         match unsafe { registry().poll_payload_if(witness, context, permit, expected) } {
-            Ok(Poll::Ready(_)) => Poll::Ready(()),
-            Ok(Poll::Pending) => match child_start_gate(self.control, self.token, witness) {
+            Ok(Poll::Ready(completion)) => {
+                #[cfg(not(feature = "wasm-c84-ssh-managed-child-core"))]
+                let _ = completion;
+                #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+                match (
+                    crate::wasm_aot_profile_slot::current_managed_child_driver_state(),
+                    completion == terminal_word(ComponentTerminal::Success),
+                ) {
+                    (Ok(Some((epoch, true))), true) => {
+                        if crate::wasm_aot_profile_slot::release_current_request_managed_child()
+                            == Ok(Some(epoch))
+                        {
+                            #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+                            if crate::wasm_aot_profile_slot::record_managed_child_released(epoch)
+                                .is_ok()
+                            {
+                                crate::println!(
+                                        "WASM_C84_SSH_MANAGED_CHILD_CORE RELEASE epoch={} normal_driver=1",
+                                        epoch
+                                    );
+                            }
+                        } else {
+                            CONTROL.child_shadow[this.control.slot as usize]
+                                .quarantine(this.control);
+                            CONTROL.supervisor_shadow[this.control.slot as usize]
+                                .quarantine(this.control);
+                            let _ = registry().quarantine(this.token);
+                            lifecycle_fail_stop();
+                        }
+                    }
+                    // A cooperative registry cancellation can either drop the
+                    // driver before its marker or override the payload's word
+                    // after poll. In both cases keep Claimed: only the exact
+                    // final Success word plus the driver marker may release,
+                    // and ManagedChildFuture::drop records Abandoned.
+                    (Ok(Some((_, _))), false) | (Ok(Some((_, false))), true) | (Ok(None), _) => {}
+                    (Err(_), _) => {
+                        CONTROL.child_shadow[this.control.slot as usize].quarantine(this.control);
+                        CONTROL.supervisor_shadow[this.control.slot as usize]
+                            .quarantine(this.control);
+                        let _ = registry().quarantine(this.token);
+                        lifecycle_fail_stop();
+                    }
+                }
+                Poll::Ready(())
+            }
+            Ok(Poll::Pending) => match child_start_gate(this.control, this.token, witness) {
                 ChildStartGate::Active | ChildStartGate::AwaitStart => Poll::Pending,
                 // The inner payload has already returned Pending and therefore
                 // owns the exact wake which makes its next poll useful. A
@@ -2349,19 +2429,26 @@ impl Future for ManagedChildFuture {
                 // strand this generation.
                 ChildStartGate::RetryBusy => Poll::Pending,
                 ChildStartGate::Isolated => {
-                    let _ = registry().quarantine(self.token);
+                    let _ = registry().quarantine(this.token);
                     lifecycle_fail_stop();
                     Poll::Ready(())
                 }
             },
             Err(_) => {
-                CONTROL.child_shadow[self.control.slot as usize].quarantine(self.control);
-                CONTROL.supervisor_shadow[self.control.slot as usize].quarantine(self.control);
-                let _ = registry().quarantine(self.token);
+                CONTROL.child_shadow[this.control.slot as usize].quarantine(this.control);
+                CONTROL.supervisor_shadow[this.control.slot as usize].quarantine(this.control);
+                let _ = registry().quarantine(this.token);
                 lifecycle_fail_stop();
                 Poll::Ready(())
             }
         }
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+impl Drop for ManagedChildFuture {
+    fn drop(&mut self) {
+        crate::wasm_aot_profile_slot::abandon_current_request_managed_child();
     }
 }
 
@@ -2376,6 +2463,7 @@ impl LazyComponentPayload {
         resource_generation: u64,
         streams: RegistryStreamBindings,
         mode: PayloadMode,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-core")] profile_epoch: u64,
     ) -> Self {
         Self {
             root,
@@ -2386,6 +2474,8 @@ impl LazyComponentPayload {
             resource_generation,
             streams,
             mode,
+            #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+            profile_epoch,
             driver: None,
             ready: None,
         }
@@ -2453,6 +2543,8 @@ unsafe impl InstancePayload for LazyComponentPayload {
                 self.resource_generation,
                 self.streams,
                 self.mode,
+                #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+                self.profile_epoch,
             )));
         }
         if self.ready.is_none() {
@@ -3752,6 +3844,7 @@ async fn run_image_component(
     generation: u64,
     streams: RegistryStreamBindings,
     mode: PayloadMode,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-core")] profile_epoch: u64,
 ) -> u64 {
     #[cfg(not(any(
         feature = "wasm-c53-native-async-qemu-acceptance",
@@ -3840,8 +3933,50 @@ async fn run_image_component(
         Ok(call) => call,
         Err(error) => return terminal_word(sync_error_terminal(error)),
     };
+    #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+    let mut core_profile = SyncCallProfile::default();
     let value = loop {
-        match call.poll() {
+        #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+        let polled = if profile_epoch == 0 {
+            call.poll()
+        } else {
+            let core_before = core_profile.core_polls;
+            let mut clock =
+                match crate::wasm_aot_profile_slot::ManagedChildSlotCorePollClock::current(
+                    profile_epoch,
+                ) {
+                    Ok(clock) => clock,
+                    Err(_) => return terminal_word(ComponentTerminal::RunnerFault),
+                };
+            let result = call.poll_profiled(&mut clock, &mut core_profile);
+            if clock.error().is_some() || !clock.core_is_closed() {
+                return terminal_word(ComponentTerminal::RunnerFault);
+            }
+            if core_profile.core_polls < core_before
+                || core_profile.core_polls.saturating_sub(core_before) > 1
+            {
+                return terminal_word(ComponentTerminal::RunnerFault);
+            }
+            #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+            if core_profile.core_polls == core_before.saturating_add(1) {
+                match crate::wasm_aot_profile_slot::record_managed_child_core_pair(
+                    profile_epoch,
+                    core_before,
+                    core_profile.core_polls,
+                ) {
+                    Ok(true) => crate::println!(
+                        "WASM_C84_SSH_MANAGED_CHILD_CORE CORE epoch={} ordinary=1 first_pair=1",
+                        profile_epoch
+                    ),
+                    Ok(false) => {}
+                    Err(_) => return terminal_word(ComponentTerminal::RunnerFault),
+                }
+            }
+            result
+        };
+        #[cfg(not(feature = "wasm-c84-ssh-managed-child-core"))]
+        let polled = call.poll();
+        match polled {
             TypedPoll::Pending(_) => {
                 let continuation = match registry().yield_continuation_current(token) {
                     Ok(continuation) => continuation,
@@ -3896,6 +4031,13 @@ async fn run_image_component(
             TypedPoll::Trapped(trap) => return terminal_word(trap_terminal(trap)),
         }
     };
+    #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+    if profile_epoch != 0 {
+        crate::wasm_aot_profile_slot::record_managed_child_core_profile(
+            profile_epoch,
+            core_profile,
+        );
+    }
     #[cfg(feature = "wasm-c48-qemu-acceptance")]
     if let PayloadMode::AcceptanceFault { round, hart } = mode {
         acceptance::fault_with_pending_continuation(token, round, hart).await;
@@ -3908,12 +4050,18 @@ async fn run_image_component(
     if let PayloadMode::AcceptanceTerminalRace { terminal, .. } = mode {
         return terminal_word(terminal);
     }
-    match value {
-        CanonicalValue::Tuple(values) if values.is_empty() => {
-            terminal_word(ComponentTerminal::Success)
-        }
-        _ => terminal_word(ComponentTerminal::BackendFault),
+    let terminal = match value {
+        CanonicalValue::Tuple(values) if values.is_empty() => ComponentTerminal::Success,
+        _ => ComponentTerminal::BackendFault,
+    };
+    #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+    if profile_epoch != 0
+        && terminal == ComponentTerminal::Success
+        && crate::wasm_aot_profile_slot::mark_managed_child_driver_completed(profile_epoch).is_err()
+    {
+        return terminal_word(ComponentTerminal::RunnerFault);
     }
+    terminal_word(terminal)
 }
 
 #[cfg(feature = "ssh-component-command")]
@@ -4460,7 +4608,11 @@ fn start_image_instance_under_control(
         batch.prepare_managed_instance_owned(core_token, domain, command_name, child);
     }
     batch.prepare("wasm-instance-supervisor", supervise_instance(key));
-    if !batch.try_reserve_prepared_task_registrations(0, 2)
+    #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+    let child_registration_reserve = 3;
+    #[cfg(not(feature = "wasm-c84-ssh-managed-child-core"))]
+    let child_registration_reserve = 2;
+    if !batch.try_reserve_prepared_task_registrations(0, child_registration_reserve)
         || !batch.try_reserve_prepared_task_registrations(1, 2)
     {
         control
@@ -4473,6 +4625,40 @@ fn start_image_instance_under_control(
         drop(control);
         return Err(input.abort_unpublished(ComponentTerminal::RunnerFault));
     }
+    // The third child slot is reserved before installing the profile detach
+    // callback. Existing lifecycle detach and continuation registration keep
+    // their two allocation-free entries after the new bind.
+    #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+    let profile_epoch = if gate == StartPolicyGate::Sync
+        && mode == PayloadMode::CommandSync
+        && input.kind() == ControlStartKind::ManagedSync
+    {
+        match crate::wasm_aot_profile_slot::attach_current_request_managed_child(&mut batch, 0) {
+            Ok(Some(epoch)) => {
+                #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
+                if crate::wasm_aot_profile_slot::record_managed_child_bound(epoch).is_ok() {
+                    crate::println!(
+                        "WASM_C84_SSH_MANAGED_CHILD_CORE BIND epoch={} child_index=0 before_publish=1",
+                        epoch
+                    );
+                }
+                epoch
+            }
+            Ok(None) | Err(_) => {
+                control
+                    .exact_mut(key)
+                    .expect("reserved control slot exists")
+                    .quarantine();
+                let _ = registry().quarantine(core_token);
+                lifecycle_fail_stop();
+                system.restore();
+                drop(control);
+                return Err(input.abort_unpublished(ComponentTerminal::RunnerFault));
+            }
+        }
+    } else {
+        0
+    };
     let prepared_child = batch
         .prepared_handles()
         .first()
@@ -4615,6 +4801,8 @@ fn start_image_instance_under_control(
                 key.generation,
                 streams,
                 mode,
+                #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+                profile_epoch,
             )
         })
     }

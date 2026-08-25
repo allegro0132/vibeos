@@ -66,6 +66,13 @@ wasm-c84-ssh-request-parent-qemu-acceptance = [
     "vibeos-kernel/ssh-test",
     "vibeos-kernel/wasm-c84-ssh-request-parent-qemu-acceptance",
 ]
+# Single-hart OpenSSH composition gate for the real managed child and its
+# ordinary synchronous Core observer. It deliberately reuses the narrow SSH
+# fixture rather than the four-hart C4.8 acceptance composite.
+wasm-c84-ssh-managed-child-core-qemu-acceptance = [
+    "vibeos-kernel/ssh-test",
+    "vibeos-kernel/wasm-c84-ssh-managed-child-core-qemu-acceptance",
+]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = [
     "vibeos-kernel/ssh-test",

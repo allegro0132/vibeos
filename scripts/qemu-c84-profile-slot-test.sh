@@ -18,6 +18,7 @@ FAMILY_MARKER=${C84_FAMILY_MARKER:-'WASM_C84_PROFILE_SLOT'}
 TEST_TMP=$(mktemp -d)
 SMP1_LOG="$TEST_TMP/smp1.log"
 SMP2_LOG="$TEST_TMP/smp2.log"
+MARKER_SNAPSHOT="$TEST_TMP/marker-snapshot.log"
 QEMU_PID=""
 KILLER_PID=""
 RESULT_REPORTED=0
@@ -33,7 +34,7 @@ cleanup() {
         kill "$QEMU_PID" 2>/dev/null || true
         wait "$QEMU_PID" 2>/dev/null || true
     fi
-    rm -f "$SMP1_LOG" "$SMP2_LOG"
+    rm -f "$SMP1_LOG" "$SMP2_LOG" "$MARKER_SNAPSHOT"
     rmdir "$TEST_TMP" 2>/dev/null || true
     if [ "$status" -ne 0 ] && [ "$RESULT_REPORTED" -eq 0 ]; then
         echo "$C84_TEST_LABEL: FAIL (unexpected exit)" >&2
@@ -58,20 +59,49 @@ fail() {
 count_exact_marker() {
     log=$1
     marker=$2
-    LC_ALL=C tr '\r' '\n' < "$log" | awk -v marker="$marker" '
+    frozen=${3:-0}
+    cp "$log" "$MARKER_SNAPSHOT"
+    if [ "$frozen" -eq 1 ]; then
+        ignore_tail=0
+    else
+        ignore_tail=$(incomplete_uart_tail "$MARKER_SNAPSHOT")
+    fi
+    LC_ALL=C tr '\r' '\n' < "$MARKER_SNAPSHOT" | awk -v marker="$marker" -v ignore_tail="$ignore_tail" '
+        function inspect(line) {
+            if (line == marker || line == clear_line marker) {
+                count++
+            }
+        }
         BEGIN { clear_line = sprintf("%c", 27) "[2K" }
-        $0 == marker || $0 == clear_line marker { count++ }
-        END { print count + 0 }
+        {
+            if (have_previous) {
+                inspect(previous)
+            }
+            previous = $0
+            have_previous = 1
+        }
+        END {
+            if (have_previous && !ignore_tail) {
+                inspect(previous)
+            }
+            print count + 0
+        }
     '
 }
 
 count_unexpected_markers() {
     log=$1
     expected=$2
-    LC_ALL=C tr '\r' '\n' < "$log" | awk -v family="$FAMILY_MARKER" -v expected="$expected" '
-        BEGIN { clear_line = sprintf("%c", 27) "[2K" }
-        {
-            line = $0
+    frozen=${3:-0}
+    cp "$log" "$MARKER_SNAPSHOT"
+    if [ "$frozen" -eq 1 ]; then
+        ignore_tail=0
+    else
+        ignore_tail=$(incomplete_uart_tail "$MARKER_SNAPSHOT")
+    fi
+    LC_ALL=C tr '\r' '\n' < "$MARKER_SNAPSHOT" | awk -v family="$FAMILY_MARKER" -v expected="$expected" -v ignore_tail="$ignore_tail" '
+        function inspect(raw, line) {
+            line = raw
             if (index(line, clear_line) == 1) {
                 line = substr(line, length(clear_line) + 1)
             }
@@ -79,8 +109,34 @@ count_unexpected_markers() {
                 count++
             }
         }
-        END { print count + 0 }
+        BEGIN { clear_line = sprintf("%c", 27) "[2K" }
+        {
+            if (have_previous) {
+                inspect(previous)
+            }
+            previous = $0
+            have_previous = 1
+        }
+        END {
+            if (have_previous && !ignore_tail) {
+                inspect(previous)
+            }
+            print count + 0
+        }
     '
+}
+
+incomplete_uart_tail() {
+    log=$1
+    if [ ! -s "$log" ]; then
+        echo 0
+        return
+    fi
+    last_byte=$(LC_ALL=C tail -c 1 "$log" | od -An -tu1 | tr -d '[:space:]')
+    case "$last_byte" in
+        10|13) echo 0 ;;
+        *) echo 1 ;;
+    esac
 }
 
 stop_qemu() {
@@ -147,23 +203,24 @@ boot_and_require() {
         if [ "$expected_count" -eq 1 ]; then
             sleep 0.1
 
+            stop_qemu
+
             if grep -a -F "$FAIL_MARKER" "$log" >/dev/null 2>&1; then
                 fail "$scenario guest reported a FAIL marker after PASS"
             fi
             if grep -a -E '\[!\] (fatal|panic)|panicked at' "$log" >/dev/null 2>&1; then
                 fail "$scenario guest panicked after PASS"
             fi
-            if [ "$(count_exact_marker "$log" "$expected")" -ne 1 ]; then
+            if [ "$(count_exact_marker "$log" "$expected" 1)" -ne 1 ]; then
                 fail "$scenario emitted the expected marker more than once"
             fi
-            if [ "$(count_exact_marker "$log" "$forbidden")" -ne 0 ]; then
+            if [ "$(count_exact_marker "$log" "$forbidden" 1)" -ne 0 ]; then
                 fail "$scenario emitted the other scenario marker"
             fi
-            if [ "$(count_unexpected_markers "$log" "$expected")" -ne 0 ]; then
+            if [ "$(count_unexpected_markers "$log" "$expected" 1)" -ne 0 ]; then
                 fail "$scenario emitted an unexpected profile-slot marker"
             fi
 
-            stop_qemu
             return 0
         fi
 

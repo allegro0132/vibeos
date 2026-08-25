@@ -214,11 +214,13 @@ request-wide slot owner rejects parent/child Core overlap, parent phase
 mutation during child Core, malformed pairing, open release, adapter Drop, and
 single or double `forget`, including raw owner-task detach after both a parent
 observer and its RunLease are forgotten. The gate also proves a real
-child-owned self-SSIP and a multi-hart start rejection. It does not edit the frozen
-`kernel/src/component_instances.rs`, and therefore does not connect the real
-managed component child or ordinary wasmi `poll()` path. It also does not
-prove the authenticated SSH boundary, response-end publication, schema output,
-cold-boot collection, or physical timing eligibility.
+child-owned self-SSIP and a multi-hart start rejection. By itself it does not
+edit the frozen `kernel/src/component_instances.rs`, connect the real managed
+component child or ordinary wasmi `poll()` path, prove the authenticated SSH
+boundary, publish schema output, collect cold boots, or establish physical
+timing eligibility. The managed-child/Core composition below now closes the
+child, ordinary-Core, and authenticated-response gaps for one exact diagnostic
+target.
 
 Before that seam can be attached to the production managed batch, the executor
 also guarantees one exact pre-staging rollback edge. Dropping a hidden
@@ -228,8 +230,9 @@ the arena bytes are intact, then abandons the future without running its
 destructor. A profile child bound before staging therefore cannot remain
 silently `Attached` after a later pre-staging setup failure. Once staging
 succeeds, the activated batch must instead be published or explicitly
-quarantined; this rollback makes no broader promise. This prerequisite still
-does not connect or enable the production path.
+quarantined; this rollback makes no broader promise. The default-off
+composition below consumes this prerequisite on the real ordinary managed-child
+path without enabling it in default images.
 
 ## Authenticated SSH request-parent seam
 
@@ -272,11 +275,68 @@ authenticated readiness probe after DROP, then requires a fourth successful
 request reusing the slot. The capability transport closes the old TCP
 generation in one poll and accepts a queued replacement only on a later poll,
 so each connection receives fresh entropy and a fresh SSH Runner.
-Non-target probes must emit no request-parent marker. This proves the
-request boundary and diagnostic recycling only. It does not attach the real
-managed child to the lease, route ordinary wasmi Core polls through the
-observer, finish or stream a ledger, publish a C8.4 sample, or establish any
+Non-target probes must emit no request-parent marker. This proves the request
+boundary and diagnostic recycling only. In this request-parent-only image the
+real managed child is not attached to the lease and ordinary wasmi Core polls
+remain unprofiled. The separate composition below closes those two gaps without
+finishing or streaming a ledger, publishing a C8.4 sample, or establishing
 physical Milk-V Duo evidence.
+
+## Managed-child ordinary-Core composition seam
+
+The default-off `wasm-c84-ssh-managed-child-core` feature composes the exact
+authenticated request parent, prepared-child delegation, and ordinary Core
+observer. The only target is the synchronous, unparameterized `case-filter`
+managed child. Before scheduler publication, child index 0 reserves three
+prepared-task registration slots and attaches to the current request; only its
+copy-only epoch is stored in the arena-owned payload. The complete parent seal
+and `RunLease` never enter the child.
+
+On the outer future's first executor poll, the child claims before
+`child_start_gate`, preserving the executor's sealed first-poll predicate even
+when activation is not yet visible. Each target driver poll constructs one
+lexical `ManagedChildSlotCorePollClock` and calls the ordinary runtime's
+`poll_profiled`; that portable path brackets the real wasmi `poll_call`. The
+driver checks both the clock's sticky error and globally stored Closed state
+before the next poll or any `.await`. A zero epoch and every feature-off path
+still call `call.poll()`.
+
+An exact successful guest result alone sets `driver_completed`. The outer
+future requires both that bit and the registry payload's exact final Success
+word before release, leaves the detach callback armed, and accepts only the
+later `CompletedPendingDetach + Exited` callback as clean. If registry
+cancellation drops the driver or overrides its completion word, its later
+outer `Ready` cannot wash cancellation into a release:
+`ManagedChildFuture::drop` records abandonment and the callback records the
+exact detach fault. Normal response requires `child = None`, `Exited`, no slot
+faults, and a Closed Core owner. Request Drop accepts only the enumerated
+detached/abandoned fault sets. Both boundaries retain the diagnostic parent's
+`cancel -> exact rejection -> one acknowledgement -> Ready(next_epoch)`
+closure.
+
+The static source gate and isolated single-hart OpenSSH integration gate are:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-core.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-core-test.sh
+```
+
+Successful epochs 1, 2, and 4 each freeze exactly 1,167 real Core polls,
+1,167 observer pairs, and 1,241 typed polls. Those are control-flow counts from
+the isolated QEMU image, not target timing or formal profile evidence; they do
+not replace the distinct frozen preparation preflight. Epoch 3 is killed after
+its first ordinary Core pair. Its real executor callback reports `Exited`
+after 29 closed observer pairs, while the missing successful-driver bit keeps
+release false and produces exact `CHILD_ABANDONED + CHILD_DETACHED` faults.
+The parent still cancels and acknowledges the epoch, an immediate readiness
+probe succeeds, and epoch 4 proves post-Drop reuse.
+
+This closes the previously explicit gap between the real managed child and the
+ordinary Core observer for the exact SSH target. The reusable base feature is
+default-off; QEMU acceptance contributes only guarded transition telemetry and
+is integration evidence. There is still no Host/Wait/Cleanup sidecar, IRQ
+composition, `finish`, verified stream, schema publisher, collector, physical
+Milk-V Duo sample, or AOT decision.
 
 ## Decision rule
 
@@ -307,8 +367,10 @@ cargo test --locked -p vibeos-image-policy --no-default-features \
 python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
 python3 -B scripts/verify-c84-ssh-profile-request-parent.py --selftest --check-source
 ./scripts/qemu-c84-ssh-request-parent-test.sh
+python3 -B scripts/verify-c84-ssh-managed-child-core.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-core-test.sh
 ```
 
-This check validates the preparation contract and adversarial single-boot
-transcript semantics only; it cannot manufacture the missing physical C8.3 or
-C8.4 evidence.
+These checks validate the preparation contract, diagnostic ownership, and
+single-hart QEMU integration transcript semantics only; they cannot manufacture
+the missing physical C8.3 or C8.4 evidence.

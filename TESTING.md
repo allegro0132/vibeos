@@ -67,10 +67,12 @@ the documented physical-Duo sample set.
 The portable C8.4 hook gate above exercises the default-off, caller-clocked
 boundary around the real synchronous Core poll. It proves ordinary and
 profiled typed-call results stay identical and locks the exact observer/tick
-ordering, inclusive outer totals, wrapping subtraction, and saturating
-counters. It is only the interpreter-boundary primitive: the target-side
-seven-phase ledger, interrupt attribution, and SSH integration remain separate
-gates.
+ordering: the start observer returns its post-observer sample, while the finish
+observer owns one end sample, atomically closes interpretation with that same
+sample, and returns it to the runtime aggregate. The gate also covers inclusive
+outer totals, wrapping subtraction, and saturating counters. It is only the
+interpreter-boundary primitive: the target-side seven-phase ledger, interrupt
+attribution, and SSH integration remain separate gates.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

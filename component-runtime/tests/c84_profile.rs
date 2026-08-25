@@ -62,12 +62,17 @@ impl TraceClock {
             events: Vec::new(),
         }
     }
+
+    fn sample(&mut self) -> u64 {
+        let tick = self.next;
+        self.next = self.next.wrapping_add(1);
+        tick
+    }
 }
 
 impl ProfileClock for TraceClock {
     fn ticks(&mut self) -> u64 {
-        let tick = self.next;
-        self.next = self.next.wrapping_add(1);
+        let tick = self.sample();
         self.events.push(ClockEvent::Tick(tick));
         tick
     }
@@ -77,8 +82,14 @@ impl ProfileClock for TraceClock {
         self.ticks()
     }
 
-    fn core_poll_finished(&mut self, tick: u64) {
+    fn core_poll_finished(&mut self) -> u64 {
+        // Model the platform's trap-aware operation as one observer event: the
+        // same sample both closes interpretation and is returned to the runtime
+        // aggregate. A runtime-owned `ticks()` call would add an unexpected
+        // `ClockEvent::Tick` before this event and fail the ordering assertion.
+        let tick = self.sample();
         self.events.push(ClockEvent::CoreFinished(tick));
+        tick
     }
 }
 
@@ -154,7 +165,6 @@ fn profiled_poll_matches_plain_poll_and_uses_exact_phase_buckets() {
                 ClockEvent::Tick(first_tick),
                 ClockEvent::CoreStarting,
                 ClockEvent::Tick(first_tick + 1),
-                ClockEvent::Tick(first_tick + 2),
                 ClockEvent::CoreFinished(first_tick + 2),
                 ClockEvent::Tick(first_tick + 3),
             ]
@@ -194,7 +204,7 @@ fn profiled_poll_matches_plain_poll_and_uses_exact_phase_buckets() {
     );
     assert_eq!(
         clock.events.len() as u64,
-        profile.typed_polls * 2 + profile.core_polls * 4
+        profile.typed_polls * 2 + profile.core_polls * 3
     );
 
     // The post-Ready terminal poll has no Core work, consumes no fuel, and is

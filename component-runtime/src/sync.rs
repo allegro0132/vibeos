@@ -947,9 +947,18 @@ pub trait ProfileClock {
         self.ticks()
     }
 
-    /// Observes the exact tick sampled immediately after leaving the Core
-    /// interpreter.
-    fn core_poll_finished(&mut self, _tick: u64) {}
+    /// Atomically closes an external Core-interpretation interval and returns
+    /// the exact tick used for that boundary. The runtime uses this returned
+    /// tick for its aggregate rather than taking a separate sample first.
+    ///
+    /// An override must take exactly one end sample, close interpretation with
+    /// that same value under the platform's trap/interrupt synchronization, and
+    /// return it. This prevents an interrupt between sampling and observation
+    /// from being attributed to the interval that was already sampled closed.
+    /// Clocks interested only in totals may use this default implementation.
+    fn core_poll_finished(&mut self) -> u64 {
+        self.ticks()
+    }
 }
 
 /// Cumulative timing and work buckets for profiled synchronous typed polls.
@@ -1012,8 +1021,7 @@ impl<C: ProfileClock + ?Sized> SyncPollProfiler for ProfileSession<'_, C> {
     }
 
     fn end_core_poll(&mut self, started: Self::CoreStart) {
-        let finished = self.clock.ticks();
-        self.clock.core_poll_finished(finished);
+        let finished = self.clock.core_poll_finished();
         let elapsed = finished.wrapping_sub(started);
         self.profile.core_polls = self.profile.core_polls.saturating_add(1);
         self.profile.core_interpreter_ticks =
@@ -1258,8 +1266,10 @@ impl<'a, A> TypedCall<'a, A> {
     /// C8.4 timing buckets with a caller-owned clock.
     ///
     /// The outer bucket inclusively spans the complete typed poll, including
-    /// interpreter time. The interpreter bucket spans the two clock samples
-    /// immediately bracketing `CoreComponentGroup::poll_call`; setup,
+    /// interpreter time. The interpreter bucket spans the ticks returned by the
+    /// start and finish observers immediately bracketing
+    /// `CoreComponentGroup::poll_call`; the finish observer owns both its one
+    /// end sample and the same-sample external interval closure. Setup,
     /// Canonical ABI work, and result handling remain exclusively in the outer
     /// bucket. Subtracting `core_interpreter_ticks` from `outer_poll_ticks`
     /// therefore yields non-interpreter overhead for the same samples.

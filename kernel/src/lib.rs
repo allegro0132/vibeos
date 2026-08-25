@@ -65,10 +65,25 @@ compile_error!("feature `wasm-c84-profile-slot-qemu-acceptance` is QEMU-only");
 compile_error!("feature `wasm-c84-core-poll-qemu-acceptance` is QEMU-only");
 
 #[cfg(all(
+    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-profile-irq-overlay-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
     feature = "wasm-c84-profile-slot-qemu-acceptance",
     feature = "wasm-c84-core-poll-qemu-acceptance"
 ))]
 compile_error!("C8.4 profile-slot and Core-poll QEMU acceptances are isolated images");
+
+#[cfg(all(
+    feature = "wasm-c84-profile-irq-overlay",
+    any(
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 IRQ overlay cannot modify an exact-transcript QEMU acceptance image");
 
 #[cfg(all(feature = "tcp-echo", not(feature = "qemu-virt")))]
 compile_error!("feature `tcp-echo` is the QEMU-only N1 acceptance image");
@@ -1144,6 +1159,12 @@ pub extern "C" fn kmain() -> ! {
         exec::HartId::BOOT,
         "wasm-c84-core-poll-acceptance",
         wasm_aot_profile_slot::run_core_poll_qemu_acceptance(),
+    );
+    #[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c84-profile-irq-overlay-acceptance",
+        wasm_aot_profile_slot::run_irq_qemu_acceptance(),
     );
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
     exec::spawn(

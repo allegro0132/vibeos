@@ -19,6 +19,7 @@ wasm-c84-profile-slot = ["vibeos-kernel/wasm-c84-profile-slot"]
 wasm-c84-core-poll-observer = ["vibeos-kernel/wasm-c84-core-poll-observer"]
 wasm-c84-profile-irq-overlay = ["vibeos-kernel/wasm-c84-profile-irq-overlay"]
 wasm-c84-profile-child-delegation = ["vibeos-kernel/wasm-c84-profile-child-delegation"]
+wasm-c84-ssh-request-parent = ["vibeos-kernel/wasm-c84-ssh-request-parent"]
 
 [[bin]]
 name = "vibeos-milkv-duo"

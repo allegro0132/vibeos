@@ -76,6 +76,23 @@ compile_error!("feature `wasm-c84-profile-irq-overlay-qemu-acceptance` is QEMU-o
 ))]
 compile_error!("feature `wasm-c84-profile-child-delegation-qemu-acceptance` is QEMU-only");
 
+#[cfg(all(
+    feature = "wasm-c84-ssh-request-parent-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-ssh-request-parent-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-request-parent-qemu-acceptance",
+    any(
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
+
 #[cfg(any(
     all(
         feature = "wasm-c84-profile-slot-qemu-acceptance",
@@ -108,7 +125,8 @@ compile_error!("C8.4 QEMU acceptances are isolated images");
     feature = "wasm-c84-profile-irq-overlay",
     any(
         feature = "wasm-c84-profile-slot-qemu-acceptance",
-        feature = "wasm-c84-core-poll-qemu-acceptance"
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-ssh-request-parent-qemu-acceptance"
     )
 ))]
 compile_error!("C8.4 IRQ overlay cannot modify an exact-transcript QEMU acceptance image");

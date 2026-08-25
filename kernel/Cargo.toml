@@ -245,6 +245,17 @@ wasm-c84-profile-child-delegation-qemu-acceptance = [
     "wasm-c84-core-poll-observer",
     "wasm-c84-profile-irq-overlay",
 ]
+# Default-off authenticated SSH request-parent owner. The adapter is
+# diagnostic-only: every response/Drop path cancels and acknowledges the
+# sample, and no finish, stream, or publication surface is enabled.
+wasm-c84-ssh-request-parent = [
+    "ssh-component-command",
+    "wasm-c84-profile-slot",
+    "vibeos-sshd/c84-profile-request-parent",
+]
+# QEMU gate telemetry for the diagnostic request-parent transitions. The base
+# feature above and every physical image remain silent.
+wasm-c84-ssh-request-parent-qemu-acceptance = ["wasm-c84-ssh-request-parent"]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

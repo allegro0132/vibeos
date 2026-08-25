@@ -231,6 +231,53 @@ succeeds, the activated batch must instead be published or explicitly
 quarantined; this rollback makes no broader promise. This prerequisite still
 does not connect or enable the production path.
 
+## Authenticated SSH request-parent seam
+
+The next default-off seam binds the exact authenticated OpenSSH request parent
+to the kernel slot without finishing a sample. The only arming route is a
+public-key-authenticated `SessionExec` whose current Component descriptor and
+raw command are the exact, unparameterized `case-filter` target. Builtins,
+onboarding credentials, `native-case-filter`, parameterized commands, revoked
+or rotated descriptors, and feature-off builds remain inert.
+
+After credential, current-policy, and grammar revalidation, `PreparedExec`
+owns the slot reservation. Its acceptance transition calls Sunset's exec
+success response first and starts the lease immediately afterward, before
+returning `ProtocolSignal::Exec(AcceptedExec)`. Failure to send success drops
+the still-unstarted permit. `serve_connection` retains the resulting run as
+request-parent state; it is not passed into the managed child. Pre-response
+execution, network, reset, rebind, timeout, and disconnect failures therefore
+cancel through the same linear Drop path; normal completion uses the explicit
+response boundary below.
+
+On the normal path, the response boundary is the predicate that exit status,
+EOF, server CLOSE, peer CLOSE acknowledgement, and all encoded output have
+drained. The run is consumed once at that predicate before processing a
+potentially destructive next protocol event and before TCP teardown. The
+kernel then performs `RunLease::cancel`, compares the returned report with the
+independently stored rejection, acknowledges that exact epoch once, and
+requires `Ready(next_epoch)`. This diagnostic adapter intentionally exposes no
+`finish`, verified stream, schema publisher, collector, or evidence API.
+
+The static verifier and isolated single-hart OpenSSH gate are:
+
+```sh
+python3 -B scripts/verify-c84-ssh-profile-request-parent.py --selftest --check-source
+./scripts/qemu-c84-ssh-request-parent-test.sh
+```
+
+The QEMU gate requires two consecutive exact responses and one connection
+killed after START with exact DROP cleanup. It immediately starts an
+authenticated readiness probe after DROP, then requires a fourth successful
+request reusing the slot. The capability transport closes the old TCP
+generation in one poll and accepts a queued replacement only on a later poll,
+so each connection receives fresh entropy and a fresh SSH Runner.
+Non-target probes must emit no request-parent marker. This proves the
+request boundary and diagnostic recycling only. It does not attach the real
+managed child to the lease, route ordinary wasmi Core polls through the
+observer, finish or stream a ledger, publish a C8.4 sample, or establish any
+physical Milk-V Duo evidence.
+
 ## Decision rule
 
 Let `T` be each retained sample's `total_ticks`, `I` its `interpretation`
@@ -258,6 +305,8 @@ cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
 python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
+python3 -B scripts/verify-c84-ssh-profile-request-parent.py --selftest --check-source
+./scripts/qemu-c84-ssh-request-parent-test.sh
 ```
 
 This check validates the preparation contract and adversarial single-boot

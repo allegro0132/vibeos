@@ -208,11 +208,17 @@ the executor's real guarded destructor-fault path without emitting or allowing
 a serial panic.
 
 The isolated QEMU gate proves this bind/claim/release/detach state machine,
-including a real child-owned self-SSIP and a multi-hart start rejection. It does
-not edit the frozen `kernel/src/component_instances.rs`, and therefore does not
-connect the real managed component child or ordinary wasmi `poll()` path. It
-also does not prove the authenticated SSH boundary, response-end publication,
-schema output, cold-boot collection, or physical timing eligibility.
+including an exact child-owned Core start/end observer pair whose returned end
+tick is independently matched against the final streamed ledger boundary. Its
+request-wide slot owner rejects parent/child Core overlap, parent phase
+mutation during child Core, malformed pairing, open release, adapter Drop, and
+single or double `forget`, including raw owner-task detach after both a parent
+observer and its RunLease are forgotten. The gate also proves a real
+child-owned self-SSIP and a multi-hart start rejection. It does not edit the frozen
+`kernel/src/component_instances.rs`, and therefore does not connect the real
+managed component child or ordinary wasmi `poll()` path. It also does not
+prove the authenticated SSH boundary, response-end publication, schema output,
+cold-boot collection, or physical timing eligibility.
 
 Before that seam can be attached to the production managed batch, the executor
 also guarantees one exact pre-staging rollback edge. Dropping a hidden

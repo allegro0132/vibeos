@@ -230,15 +230,25 @@ prepared seal has neither wake nor disarm methods.
 
 `scripts/qemu-c84-profile-child-delegation-test.sh` proves bind-before-publish,
 one exact prepared-child identity, first-poll-only claim, duplicate and
-wrong-task inertia, a real child-owned self-SSIP, clean `release + Exited`,
-parent-cancel-first stale callback behavior, forgotten and dropped child
-rejection, `release + Cancelled`, fail-closed parent finish, and rejection of a
-claim attempted after a first-poll yield. A silent destructor fault also proves
-that `release + Faulted` stays diagnostic while the generic serial gate still
-rejects every panic. The single-hart boot completes eight epochs and returns to
-ready epoch 9; the two-hart boot rejects before epoch 1 starts. This is an
-isolated ownership seam only. It does not modify the frozen ordinary component
-runner, connect the OpenSSH acceptance/response boundary, prove real wasmi Core
+wrong-task inertia, an exact child-owned Core observer pair, a real child-owned
+self-SSIP, clean `release + Exited`, parent-cancel-first stale callback
+behavior, forgotten and dropped child rejection, `release + Cancelled`,
+fail-closed parent finish, and rejection of a claim attempted after a first-poll
+yield. A silent destructor fault proves that `release + Faulted` stays
+diagnostic. The successful Core epoch compares the exact ledger end tick with
+the tick returned to the portable observer by reconstructing that boundary
+from the final streamed interval. Seven additional epochs independently prove
+finish-without-start, observer Drop, open-child release, direct phase mutation
+and replacement rejection, simultaneous observer/child `forget`, and
+request-parent mutation rejection while child Core is open. A final
+parent-observer/RunLease double-`forget` epoch proves that raw owner detach
+preserves the global observer fault. The request-wide Core owner lives in the
+slot, so neither forgotten parent nor child adapters can overlap a later
+observer or produce verified evidence. The generic serial gate still rejects
+every panic. The single-hart boot completes fifteen epochs and returns to ready
+epoch 16; the two-hart boot rejects before epoch 1 starts. This is an isolated
+ownership seam only. It does not modify the frozen ordinary component runner,
+connect the OpenSSH acceptance/response boundary, prove real wasmi Core
 attribution, publish the schema, collect physical Duo samples, or make an AOT
 decision.
 

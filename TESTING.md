@@ -91,6 +91,17 @@ target sample, not a mathematical worst case.
 Formal samples must be complete and self-consistent; overflow or truncation is
 diagnostic-only.
 
+The C8.4 verifier self-test also closes one raw cold-boot transcript at a time:
+one metadata record, three warmups, 21 retained samples, and one end record. It
+rejects malformed JSON, wrong coordinates or campaign identity, incomplete or
+unmerged phase intervals, invalid fuel/poll counters, unstable retained data,
+and a stale ordered accumulator. Its host-file tests cover bounded stable reads,
+symlink and hardlink alias rejection, no-clobber summary creation, explicit
+overwrite, exact reread, and protected verifier inputs. A passing single-boot
+check reports physical and cold-boot provenance as unverified; a later evidence
+gate must bind three distinct host boot indexes and prove C8.3 before any C8.4
+decision can exist.
+
 The portable C8.4 hook gate above exercises the default-off, caller-clocked
 boundary around the real synchronous Core poll. It proves ordinary and
 profiled typed-call results stay identical and locks the exact observer/tick

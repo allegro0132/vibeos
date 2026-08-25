@@ -2,19 +2,28 @@
 
 `workloads-v1.json` freezes the one product workload, physical-Duo budget,
 seven-phase attribution ledger, and fail-closed decision rule. `schema-v1.json`
-defines the future physical decision transcript.
+defines the records for exactly one future physical cold-boot transcript. A
+raw transcript contains one metadata record, 24 samples, and one end record;
+the host, not the target, later assigns its boot index.
 
 These files contain no result. They neither complete C8.3 nor authorize AOT.
 QEMU is integration-only and cannot contribute to the 25 MHz physical-Duo
 budget decision. See
 [`docs/WASM_AOT_DECISION.md`](../../docs/WASM_AOT_DECISION.md).
 
-The closed schema and required semantic publication verifier together admit
-complete successful physical samples only. The verifier must enforce the
-cross-field `interval_count == len(intervals)` relation which JSON Schema
-cannot express. Timeout, trap, failure, truncation, wrong-output, and leak
-attempts are diagnostic and cannot enter the decision population or authorize
-AOT.
+The preparation verifier now semantically closes one raw transcript and derives
+one deterministic boot summary. It checks the cross-field
+`interval_count == len(intervals)` relation which JSON Schema cannot express,
+the complete gap-free phase partition, ordered 64-bit accumulator, exact sample
+coordinates, output and fuel/poll bounds, and per-boot stability. Timeout,
+trap, failure, truncation, wrong-output, and leak attempts are diagnostic and
+cannot enter the decision population or authorize AOT.
+
+This verifier does not attest physical provenance or a power cycle, aggregate
+three boots, prove the C8.3 precondition, or produce an AOT decision. Those
+remain responsibilities of a later capture and evidence verifier. Its raw
+input is a stable non-empty regular file capped at 268,435,456 bytes; derived
+summary creation is no-clobber unless `--overwrite` is supplied explicitly.
 
 Before the first evidence was collected, the exact frozen workload's portable
 profile preflight proved that the former 4,096-interval limit could not hold

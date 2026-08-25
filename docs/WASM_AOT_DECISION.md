@@ -60,12 +60,61 @@ must not be converted, combined with Duo ticks, or used to meet or miss this
 budget.
 
 Only complete success samples enter the formal dataset: each records 13 reads,
-13 writes, fuel, poll quanta, terminal `success`, zero logical live state after
-cleanup, `timed_out = false`, timeout phase `none`, and a complete interval
-transcript with capacity 65,536 and an exact declared count. A timeout, trap,
-failed status, truncated stream or interval ledger, wrong output, leak, or
-interval overflow is diagnostic evidence outside the decision population and
-can never authorize AOT.
+13 writes, fuel consumption in the inclusive range 1 through 500,000, positive
+poll quanta, terminal `success`, zero logical live state after cleanup,
+`timed_out = false`, timeout phase `none`, and a complete interval transcript
+with capacity 65,536 and an exact declared count. A timeout, trap, failed
+status, truncated stream or interval ledger, wrong output, leak, or interval
+overflow is diagnostic evidence outside the decision population and can never
+authorize AOT.
+
+## Single-cold-boot transcript closure
+
+Each cold boot has its own raw serial transcript, capped at 268,435,456 bytes.
+One raw contains exactly one `VIBE_WASM_AOT_META` record, 24 ordered
+`VIBE_WASM_AOT_SAMPLE` records with sequence and sample index 0 through 23,
+and one `VIBE_WASM_AOT_END` record. Samples 0 through 2 are warmups and samples
+3 through 23 are retained. Target records deliberately contain no boot index:
+only host evidence assigns indexes 0 through 2 after each raw has passed
+independent verification. A later evidence verifier must prove all three
+indexes occur once and share one campaign identity.
+
+The shared `run_id` is SHA-256 over the ASCII campaign domain followed by the
+source commit, challenge, artifact/input/output hashes, manifest hash, and
+schema hash as NUL-separated fields with no trailing NUL. It binds those
+values but does not prove that a board was power-cycled. The `END` record's
+64-bit rotate-and-add accumulator folds every ordered sample and interval word,
+including the stdout digest. It helps detect accidental ordering, truncation,
+and corruption; it is not authentication and has no collision-resistance
+claim.
+
+The host verifier accepts only a non-empty stable regular file, rejects
+symlinks and special files, parses strict UTF-8 JSON without duplicate members
+or oversized integers, requires record markers at column zero, and enforces the
+complete per-sample semantics: identity, coordinates, successful output,
+fuel/poll bounds, exact interval count, non-empty gap-free phase partition,
+adjacent-phase merging, phase sums, accumulator, and per-boot stability. It
+derives a deterministic single-boot summary that carries the raw byte hash and
+explicitly has scope
+`single-boot-transcript-semantics-only-no-aot-decision`; the artifact also
+records both physical and cold-boot provenance as `unverified`.
+
+```sh
+python3 -B scripts/verify-c84-aot-decision.py \
+  --transcript evidence/wasm-aot-decision/duo/boot-0/uart.log \
+  --expect-source "$PREPARATION_COMMIT" \
+  --expect-challenge "$CAMPAIGN_CHALLENGE" \
+  --boot-index 0 \
+  --summary-out evidence/wasm-aot-decision/duo/boot-0/summary.json
+```
+
+Summary creation is no-clobber by default; `--overwrite` is explicit and only
+replaces an existing regular output after all input checks pass. The verifier
+then rereads the summary and revalidates every preparation input. A passing
+command verifies transcript bytes only: physical provenance and the cold-boot
+operation remain unverified until a separate capture/evidence closure exists.
+One raw or one derived summary cannot satisfy the three-boot publication gate,
+complete C8.3, decide C8.4, or authorize AOT.
 
 ## Exclusive phase ledger
 
@@ -194,5 +243,6 @@ cargo test --locked -p vibeos-image-policy --no-default-features \
 python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
 ```
 
-This check validates the preparation contract only; it cannot manufacture the
-missing physical C8.3 or C8.4 evidence.
+This check validates the preparation contract and adversarial single-boot
+transcript semantics only; it cannot manufacture the missing physical C8.3 or
+C8.4 evidence.

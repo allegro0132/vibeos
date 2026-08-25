@@ -29,6 +29,9 @@ python3 -B scripts/verify-c83-evidence.py --selftest
 python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
 cargo test --locked -p vibeos-component-runtime --no-default-features \
   --features c84-profile-hooks --test c84_profile
+cargo test --locked -p vibeos-wasm-aot-profile
+cargo check --locked -p vibeos-wasm-aot-profile \
+  --target riscv64imac-unknown-none-elf
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
@@ -93,6 +96,18 @@ sample, and returns it to the runtime aggregate. The gate also covers inclusive
 outer totals, wrapping subtraction, and saturating counters. It is only the
 interpreter-boundary primitive: the target-side seven-phase ledger, interrupt
 attribution, and SSH integration remain separate gates.
+
+The standalone `vibeos-wasm-aot-profile` gate covers the target-side ledger
+state machine without connecting it to kernel, trap, executor, or SSH code. It
+borrows one exact 65,536-entry endpoint array and one packed phase array,
+for exactly 589,824 bytes (576 KiB) of caller storage, suppresses zero-duration
+intervals, merges only adjacent equal phases, latches cleanup, overlays
+interrupt time as wait, and freezes stored bytes after a sticky failure. Only a
+finished sample that passes an independent full rescan can expose the
+schema-shaped summary and exact-size interval iterator; rejected or
+capacity-overflow samples remain diagnostic-only. The RISC-V check proves that
+this foundation stays dependency-free and `no_std`; target hook wiring is a
+later gate.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

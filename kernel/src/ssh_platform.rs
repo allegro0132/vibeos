@@ -56,6 +56,11 @@ use vibeos_sshd::{
     Ipv4RuntimeStatus, NetworkBindError, NetworkInfo, Platform as SshdPlatform, PlatformFuture,
     SecretBytes, SshExecComponentSessionPolicy, SshServicePolicy, StaticIpv4Address,
 };
+#[cfg(feature = "wasm-c84-ssh-request-parent")]
+use vibeos_sshd::{
+    SshExecProfilePermit, SshExecProfilePermitBackend, SshExecProfileRunBackend,
+    SshExecProfileTarget,
+};
 
 #[cfg(any(
     feature = "ssh-test",
@@ -141,6 +146,226 @@ impl SshPlatform {
     const fn new(space: &'static Space) -> Self {
         Self { space }
     }
+}
+
+/// Kernel-private request-parent owner retained inside one SSHD-allocated box.
+///
+/// `start` mutates this object from Reserved to Active before SSHD moves that
+/// same box between its public typestates. Every terminal path is deliberately
+/// diagnostic-only: Active can only cancel the sample, validate the exact
+/// rejection, and acknowledge it once. There is no finish or stream method in
+/// this adapter.
+#[cfg(feature = "wasm-c84-ssh-request-parent")]
+struct SshExecProfileOwner {
+    policy: SshExecComponentSessionPolicy,
+    state: SshExecProfileOwnerState,
+}
+
+#[cfg(feature = "wasm-c84-ssh-request-parent")]
+enum SshExecProfileOwnerState {
+    Reserved(crate::wasm_aot_profile_slot::StartPermit),
+    Active(crate::wasm_aot_profile_slot::RunLease),
+    Closed,
+}
+
+#[cfg(feature = "wasm-c84-ssh-request-parent")]
+impl SshExecProfileOwner {
+    const fn reserved(
+        policy: SshExecComponentSessionPolicy,
+        permit: crate::wasm_aot_profile_slot::StartPermit,
+    ) -> Self {
+        Self {
+            policy,
+            state: SshExecProfileOwnerState::Reserved(permit),
+        }
+    }
+
+    fn start(&mut self) -> Result<(), ()> {
+        let previous = core::mem::replace(&mut self.state, SshExecProfileOwnerState::Closed);
+        let SshExecProfileOwnerState::Reserved(permit) = previous else {
+            self.state = previous;
+            profile_request_failure("start-state", None);
+            return Err(());
+        };
+        match permit.start() {
+            Ok(run) => {
+                let epoch = run.token().epoch();
+                self.state = SshExecProfileOwnerState::Active(run);
+                profile_request_start(epoch);
+                Ok(())
+            }
+            Err(_) => {
+                profile_request_failure("start", None);
+                Err(())
+            }
+        }
+    }
+
+    fn response_boundary(&mut self, status: u32) -> Result<(), ()> {
+        let previous = core::mem::replace(&mut self.state, SshExecProfileOwnerState::Closed);
+        let SshExecProfileOwnerState::Active(run) = previous else {
+            self.state = previous;
+            profile_request_failure("response-state", None);
+            return Err(());
+        };
+        let epoch = run.token().epoch();
+        match cancel_and_ack_profile(run) {
+            Ok(ready_epoch) if profile_policy_is_current(self.policy) => {
+                profile_request_response(epoch, status, ready_epoch);
+                Ok(())
+            }
+            Ok(_) => {
+                profile_request_failure("response-policy", Some(epoch));
+                Err(())
+            }
+            Err(()) => {
+                profile_request_failure("response", Some(epoch));
+                Err(())
+            }
+        }
+    }
+
+    fn cancel(&mut self) {
+        let previous = core::mem::replace(&mut self.state, SshExecProfileOwnerState::Closed);
+        match previous {
+            SshExecProfileOwnerState::Reserved(permit) => drop(permit),
+            SshExecProfileOwnerState::Active(run) => {
+                let epoch = run.token().epoch();
+                match cancel_and_ack_profile(run) {
+                    Ok(ready_epoch) => profile_request_drop(epoch, ready_epoch),
+                    Err(()) => profile_request_failure("drop", Some(epoch)),
+                }
+            }
+            SshExecProfileOwnerState::Closed => {}
+        }
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-request-parent")]
+fn cancel_and_ack_profile(run: crate::wasm_aot_profile_slot::RunLease) -> Result<u64, ()> {
+    use crate::wasm_aot_profile_slot::{
+        acknowledge_rejection, rejection, RejectionCause, SlotFaults, SlotStatus,
+    };
+
+    let epoch = run.token().epoch();
+    let report = run.cancel().map_err(|_| ())?;
+    let report_is_exact = report.epoch == epoch
+        && report.cause == RejectionCause::LeaseCancelled
+        && report.facade_faults.is_empty()
+        && report.ledger_error.is_none()
+        && report.slot_faults == SlotFaults::default()
+        && report.intervals_emitted == 0;
+    let stored_rejection_is_exact = rejection() == Some(report);
+    // A successful cancel has already installed one diagnostic rejection.
+    // Attempt its exact acknowledgement once even when local validation finds
+    // an unexpected returned or independently stored field; otherwise a
+    // recoverable request would strand the global slot in Rejected. Cancel
+    // failure is the only path with no known rejection to acknowledge.
+    let acknowledged = acknowledge_rejection(epoch).map_err(|_| ())?;
+    let acknowledgement_is_exact = acknowledged == report;
+    let ready_epoch = epoch.checked_add(1).ok_or(())?;
+    let ready_is_exact = crate::wasm_aot_profile_slot::status()
+        == (SlotStatus::Ready {
+            next_epoch: Some(ready_epoch),
+        });
+    if !report_is_exact
+        || !stored_rejection_is_exact
+        || !acknowledgement_is_exact
+        || !ready_is_exact
+    {
+        return Err(());
+    }
+    Ok(ready_epoch)
+}
+
+#[cfg(feature = "wasm-c84-ssh-request-parent")]
+fn profile_policy_is_current(accepted: SshExecComponentSessionPolicy) -> bool {
+    crate::component_instances::select_ssh_exec_component_policy(accepted.profile(), "case-filter")
+        == Some(accepted)
+}
+
+#[cfg(feature = "wasm-c84-ssh-request-parent")]
+impl SshExecProfilePermitBackend for SshExecProfileOwner {
+    fn start(&mut self) -> Result<(), ()> {
+        SshExecProfileOwner::start(self)
+    }
+
+    fn into_run(self: Box<Self>) -> Box<dyn SshExecProfileRunBackend> {
+        self
+    }
+
+    fn cancel(&mut self) {
+        SshExecProfileOwner::cancel(self);
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-request-parent")]
+impl SshExecProfileRunBackend for SshExecProfileOwner {
+    fn response_boundary(&mut self, status: u32) -> Result<(), ()> {
+        SshExecProfileOwner::response_boundary(self, status)
+    }
+
+    fn cancel(&mut self) {
+        SshExecProfileOwner::cancel(self);
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-request-parent")]
+impl Drop for SshExecProfileOwner {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-request-parent")]
+fn profile_request_failure(stage: &'static str, epoch: Option<u64>) {
+    #[cfg(feature = "wasm-c84-ssh-request-parent-qemu-acceptance")]
+    match epoch {
+        Some(epoch) => crate::println!(
+            "WASM_C84_SSH_REQUEST_PARENT FAIL stage={} epoch={}",
+            stage,
+            epoch
+        ),
+        None => crate::println!(
+            "WASM_C84_SSH_REQUEST_PARENT FAIL stage={} epoch=none",
+            stage
+        ),
+    }
+    #[cfg(not(feature = "wasm-c84-ssh-request-parent-qemu-acceptance"))]
+    let _ = (stage, epoch);
+}
+
+#[cfg(feature = "wasm-c84-ssh-request-parent")]
+fn profile_request_start(epoch: u64) {
+    #[cfg(feature = "wasm-c84-ssh-request-parent-qemu-acceptance")]
+    crate::println!("WASM_C84_SSH_REQUEST_PARENT START epoch={}", epoch);
+    #[cfg(not(feature = "wasm-c84-ssh-request-parent-qemu-acceptance"))]
+    let _ = epoch;
+}
+
+#[cfg(feature = "wasm-c84-ssh-request-parent")]
+fn profile_request_response(epoch: u64, status: u32, ready_epoch: u64) {
+    #[cfg(feature = "wasm-c84-ssh-request-parent-qemu-acceptance")]
+    crate::println!(
+        "WASM_C84_SSH_REQUEST_PARENT RESPONSE epoch={} status={} cancel=1 ack=1 ready_epoch={}",
+        epoch,
+        status,
+        ready_epoch
+    );
+    #[cfg(not(feature = "wasm-c84-ssh-request-parent-qemu-acceptance"))]
+    let _ = (epoch, status, ready_epoch);
+}
+
+#[cfg(feature = "wasm-c84-ssh-request-parent")]
+fn profile_request_drop(epoch: u64, ready_epoch: u64) {
+    #[cfg(feature = "wasm-c84-ssh-request-parent-qemu-acceptance")]
+    crate::println!(
+        "WASM_C84_SSH_REQUEST_PARENT DROP epoch={} cancel=1 ack=1 ready_epoch={}",
+        epoch,
+        ready_epoch
+    );
+    #[cfg(not(feature = "wasm-c84-ssh-request-parent-qemu-acceptance"))]
+    let _ = (epoch, ready_epoch);
 }
 
 #[cfg(any(
@@ -451,6 +676,42 @@ impl SshdPlatform for SshPlatform {
         source: &str,
     ) -> Option<SshExecComponentSessionPolicy> {
         crate::component_instances::select_ssh_exec_component_policy(profile, source)
+    }
+
+    #[cfg(feature = "wasm-c84-ssh-request-parent")]
+    fn prepare_ssh_exec_profile(
+        &self,
+        target: SshExecProfileTarget<'_>,
+    ) -> Result<Option<SshExecProfilePermit>, ()> {
+        let source = target.source();
+        if source != "case-filter" {
+            return Ok(None);
+        }
+
+        let accepted = target.policy();
+        let Some(current) = crate::component_instances::select_ssh_exec_component_policy(
+            accepted.profile(),
+            source,
+        ) else {
+            profile_request_failure("policy-missing", None);
+            return Err(());
+        };
+        if accepted.command_name() != "case-filter"
+            || current.profile() != accepted.profile()
+            || current.command_name() != accepted.command_name()
+            || current.incarnation() != accepted.incarnation()
+            || current.artifact_sha256() != accepted.artifact_sha256()
+        {
+            profile_request_failure("policy-mismatch", None);
+            return Err(());
+        }
+
+        let permit = crate::wasm_aot_profile_slot::prepare_current().map_err(|_| {
+            profile_request_failure("prepare", None);
+        })?;
+        Ok(Some(SshExecProfilePermit::new(
+            SshExecProfileOwner::reserved(accepted, permit),
+        )))
     }
 
     #[cfg(any(

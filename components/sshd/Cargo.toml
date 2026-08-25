@@ -6,6 +6,9 @@ edition = "2021"
 [features]
 default = []
 qualification-stream = []
+# Default-off ownership seam for one exact authenticated SSH Component request
+# parent. This exposes no profile publication or interpretation policy.
+c84-profile-request-parent = []
 # Target-only coordination for the C5.4c managed-native revoke gate. The
 # production/Milk-V Platform surface remains default-open when this is absent.
 native-revoke-target-acceptance = []

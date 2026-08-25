@@ -67,6 +67,110 @@ use vibeos_vsh::terminal::{
 /// Boxed kernel-service operation used at the narrow component/platform seam.
 pub type PlatformFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Opaque backend retained by an unstarted SSH request-parent permit.
+///
+/// The SSH component owns the only public transition. A backend may reserve
+/// diagnostic storage or task lineage, but this seam neither finishes nor
+/// publishes a profile. `into_run` moves the same allocation into the run
+/// typestate after `start` succeeds.
+#[cfg(feature = "c84-profile-request-parent")]
+pub trait SshExecProfilePermitBackend: Send {
+    /// Start in place. On error the backend must remain cancellable; the
+    /// wrapper performs that cancellation exactly once.
+    fn start(&mut self) -> Result<(), ()>;
+    /// Re-type this same `Box` allocation after a successful start.
+    fn into_run(self: Box<Self>) -> Box<dyn SshExecProfileRunBackend>;
+    /// Cancel one still-prepared request.
+    fn cancel(&mut self);
+}
+
+/// Opaque backend retained while the accepted SSH request parent is live.
+///
+/// `response_boundary` records only the SSH response boundary. It is not a
+/// finish, verification, publication, or profile-content decision.
+#[cfg(feature = "c84-profile-request-parent")]
+pub trait SshExecProfileRunBackend: Send {
+    /// Record the first complete response boundary. On error the backend must
+    /// remain cancellable; the wrapper performs that cancellation exactly once.
+    fn response_boundary(&mut self, status: u32) -> Result<(), ()>;
+    /// Cancel one run which has not crossed its response boundary.
+    fn cancel(&mut self);
+}
+
+/// Linear, unstarted ownership for one exact SSH Component request.
+#[cfg(feature = "c84-profile-request-parent")]
+pub struct SshExecProfilePermit {
+    backend: Option<Box<dyn SshExecProfilePermitBackend>>,
+}
+
+#[cfg(feature = "c84-profile-request-parent")]
+impl SshExecProfilePermit {
+    /// Seal one platform backend behind the request-parent typestate.
+    pub fn new<B>(backend: B) -> Self
+    where
+        B: SshExecProfilePermitBackend + 'static,
+    {
+        Self {
+            backend: Some(Box::new(backend)),
+        }
+    }
+
+    /// Consume the permit and transfer its exact backend allocation to a run.
+    pub fn start(mut self) -> Result<SshExecProfileRun, ()> {
+        let mut backend = self
+            .backend
+            .take()
+            .expect("SSH exec profile permit was consumed twice");
+        if backend.start().is_err() {
+            backend.cancel();
+            return Err(());
+        }
+        Ok(SshExecProfileRun {
+            backend: Some(backend.into_run()),
+        })
+    }
+}
+
+#[cfg(feature = "c84-profile-request-parent")]
+impl Drop for SshExecProfilePermit {
+    fn drop(&mut self) {
+        if let Some(backend) = self.backend.as_mut() {
+            backend.cancel();
+        }
+    }
+}
+
+/// Linear ownership held by the SSH request parent until its response boundary.
+#[cfg(feature = "c84-profile-request-parent")]
+pub struct SshExecProfileRun {
+    backend: Option<Box<dyn SshExecProfileRunBackend>>,
+}
+
+#[cfg(feature = "c84-profile-request-parent")]
+impl SshExecProfileRun {
+    /// Consume the run at the first complete SSH response boundary.
+    pub fn response_boundary(mut self, status: u32) -> Result<(), ()> {
+        let mut backend = self
+            .backend
+            .take()
+            .expect("SSH exec profile run was consumed twice");
+        if backend.response_boundary(status).is_err() {
+            backend.cancel();
+            return Err(());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "c84-profile-request-parent")]
+impl Drop for SshExecProfileRun {
+    fn drop(&mut self) {
+        if let Some(backend) = self.backend.as_mut() {
+            backend.cancel();
+        }
+    }
+}
+
 #[cfg(feature = "qualification-stream")]
 pub trait StreamingExec: Send {
     /// Produce one bounded stdout chunk, or `None` with the SSH exit status.
@@ -312,6 +416,17 @@ pub trait Platform: Sync {
                 == Ok(true)
         })
     }
+    /// Optionally reserve diagnostic ownership for this exact accepted target.
+    /// The hook runs only after public-key authentication and the complete
+    /// Component policy/grammar gate, but before the exec success response.
+    /// Its default is inert, and the returned permit has no publication API.
+    #[cfg(feature = "c84-profile-request-parent")]
+    fn prepare_ssh_exec_profile(
+        &self,
+        _target: SshExecProfileTarget<'_>,
+    ) -> Result<Option<SshExecProfilePermit>, ()> {
+        Ok(None)
+    }
     /// Observe one exact policy-selected Component only after VSH shutdown and
     /// the SSH exit-status/EOF/CLOSE exchange have fully drained. Production
     /// platforms need no completion observer; target gates can correlate this
@@ -408,6 +523,33 @@ impl fmt::Debug for SshExecComponentSessionPolicy {
             .field("command_name", &self.command_name)
             .field("artifact_sha256", &"<redacted>")
             .finish()
+    }
+}
+
+/// Read-only identity of the exact authenticated Component exec request which
+/// may receive diagnostic request-parent ownership.
+///
+/// Construction stays inside the SSH protocol gate. A platform can compare
+/// the raw source and immutable accepted policy, but cannot replace either.
+#[cfg(feature = "c84-profile-request-parent")]
+#[derive(Clone, Copy)]
+pub struct SshExecProfileTarget<'a> {
+    source: &'a str,
+    policy: SshExecComponentSessionPolicy,
+}
+
+#[cfg(feature = "c84-profile-request-parent")]
+impl<'a> SshExecProfileTarget<'a> {
+    fn new(source: &'a str, policy: SshExecComponentSessionPolicy) -> Self {
+        Self { source, policy }
+    }
+
+    pub const fn source(self) -> &'a str {
+        self.source
+    }
+
+    pub const fn policy(self) -> SshExecComponentSessionPolicy {
+        self.policy
     }
 }
 
@@ -546,17 +688,81 @@ struct ProtocolState {
     start_seen: bool,
 }
 
+/// Exact exec request after every authentication/policy/grammar gate and, when
+/// enabled, after diagnostic ownership preparation, but before SSH acceptance.
+struct PreparedExec {
+    command: String,
+    component: Option<SshExecComponentSessionPolicy>,
+    #[cfg(feature = "c84-profile-request-parent")]
+    profile: Option<SshExecProfilePermit>,
+}
+
+impl PreparedExec {
+    fn prepare(
+        space: &Space,
+        command: String,
+        component: Option<SshExecComponentSessionPolicy>,
+    ) -> Result<Self, &'static str> {
+        #[cfg(feature = "c84-profile-request-parent")]
+        let profile = match component {
+            Some(policy) => space
+                .prepare_ssh_exec_profile(SshExecProfileTarget::new(&command, policy))
+                .map_err(|_| "SSH exec profile preparation failed")?,
+            None => None,
+        };
+        #[cfg(not(feature = "c84-profile-request-parent"))]
+        let _ = space;
+
+        Ok(Self {
+            command,
+            component,
+            #[cfg(feature = "c84-profile-request-parent")]
+            profile,
+        })
+    }
+
+    /// Send the success response first, then immediately consume the prepared
+    /// permit into request-parent run ownership. A failed response drops and
+    /// cancels the still-unstarted permit.
+    fn accept<F>(self, succeed: F) -> Result<AcceptedExec, &'static str>
+    where
+        F: FnOnce() -> Result<(), &'static str>,
+    {
+        succeed()?;
+        #[cfg(feature = "c84-profile-request-parent")]
+        let profile = self
+            .profile
+            .map(SshExecProfilePermit::start)
+            .transpose()
+            .map_err(|_| "SSH exec profile start failed")?;
+        Ok(AcceptedExec {
+            command: self.command,
+            component: self.component,
+            #[cfg(feature = "c84-profile-request-parent")]
+            profile,
+        })
+    }
+}
+
+/// Accepted exec request whose optional run remains owned by the SSH parent.
+struct AcceptedExec {
+    command: String,
+    component: Option<SshExecComponentSessionPolicy>,
+    #[cfg(feature = "c84-profile-request-parent")]
+    profile: Option<SshExecProfileRun>,
+}
+
 enum ProtocolSignal {
     Idle,
     Progressed,
-    Exec(String, Option<SshExecComponentSessionPolicy>),
+    Exec(AcceptedExec),
     Shell,
     Interrupt,
     Defunct,
 }
 
 enum SessionStart {
-    Exec(String, Option<SshExecComponentSessionPolicy>),
+    Exec(AcceptedExec),
     Shell,
 }
 
@@ -666,11 +872,28 @@ impl<'a> CapabilityTcpTransport<'a> {
     }
 }
 
+fn connection_generation_replaced(
+    connection: Option<TcpConnectionToken>,
+    snapshot: &TcpListenerSnapshot,
+) -> bool {
+    connection.is_some_and(|connection| connection.generation() != snapshot.connection_generation)
+}
+
 impl TcpTransport for CapabilityTcpTransport<'_> {
     fn poll_network(&mut self, _now_ms: u64) -> Result<TcpPollReport, ()> {
         let mut snapshot = self.snapshot().ok_or(())?;
+        // The netstack can close, re-listen, and accept a queued SYN between
+        // two application polls. Retire the old generation first, but never
+        // accept the replacement in that same poll: an old SSH Runner must
+        // observe `connection_ended` and unwind before a fresh Runner receives
+        // the new token.
+        let generation_replaced = connection_generation_replaced(self.connection, &snapshot);
+        if generation_replaced {
+            self.connection = None;
+        }
         let mut connection_started = false;
-        if self.connection.is_none()
+        if !generation_replaced
+            && self.connection.is_none()
             && matches!(
                 snapshot.state,
                 TcpStreamState::Established | TcpStreamState::PeerClosed
@@ -680,13 +903,21 @@ impl TcpTransport for CapabilityTcpTransport<'_> {
             connection_started = self.connection.is_some();
             snapshot = self.snapshot().ok_or(())?;
         }
-        let connection_ended = self.connection.is_some()
-            && matches!(
-                snapshot.state,
-                TcpStreamState::Listening | TcpStreamState::Reset | TcpStreamState::Closed
-            );
+        // Accept itself is capability-checked, but the independent netstack
+        // can still roll again before the refreshed snapshot. Retire that
+        // just-accepted token in this poll and leave its successor untouched.
+        let generation_replaced_after_accept =
+            connection_started && connection_generation_replaced(self.connection, &snapshot);
+        let connection_ended = generation_replaced
+            || generation_replaced_after_accept
+            || (self.connection.is_some()
+                && matches!(
+                    snapshot.state,
+                    TcpStreamState::Listening | TcpStreamState::Reset | TcpStreamState::Closed
+                ));
         if connection_ended {
             self.connection = None;
+            connection_started = false;
         }
         Ok(TcpPollReport {
             ingress_frames: 0,
@@ -1946,10 +2177,12 @@ async fn wait_for_connection(
         // moves the socket to ESTABLISHED. Entering the bridge on the earlier
         // `connection_started` edge would misread that temporary send state as
         // a closed stream and reset every real OpenSSH connection.
-        if matches!(
-            stack.stream_status().state,
-            TcpStreamState::Established | TcpStreamState::PeerClosed
-        ) {
+        if !report.connection_ended
+            && matches!(
+                stack.stream_status().state,
+                TcpStreamState::Established | TcpStreamState::PeerClosed
+            )
+        {
             return Ok(());
         }
         cooperate(
@@ -1962,6 +2195,7 @@ async fn wait_for_connection(
 
 async fn rearm_listener(stack: &mut dyn TcpTransport) -> Result<(), &'static str> {
     let started = monotonic_ms();
+    let mut fallback_started = None;
     loop {
         // A successfully completed connection may already have rearmed the
         // passive socket. Do not poll in that state: an immediately queued SYN
@@ -1973,21 +2207,25 @@ async fn rearm_listener(stack: &mut dyn TcpTransport) -> Result<(), &'static str
         let report = stack
             .poll_network(now)
             .map_err(|_| "network listener rearm poll failed")?;
-        if stack.is_listening() {
+        // A queued SYN can cross LISTEN before this task observes it. The
+        // accepted edge is equally strong rearm evidence; return so the outer
+        // loop supplies fresh entropy and a fresh SSH Runner for that token.
+        if report.connection_started || stack.is_listening() {
             return Ok(());
         }
-        if now.saturating_sub(started) > CLOSE_TIMEOUT_MS {
+        if fallback_started.is_none() && now.saturating_sub(started) > CLOSE_TIMEOUT_MS {
             stack
                 .reset()
                 .map_err(|_| "TCP listener fallback reset failed")?;
-            stack
-                .poll_network(now)
-                .map_err(|_| "TCP listener fallback reset poll failed")?;
-            return if stack.is_listening() {
-                Ok(())
-            } else {
-                Err("TCP listener did not rearm after fallback reset")
-            };
+            // Capability-backed reset is an asynchronous request consumed by
+            // the independent netstack task. Give it one bounded close window
+            // and keep recognizing both LISTEN and a queued connection-start
+            // edge on the normal poll path above.
+            fallback_started = Some(now);
+        } else if fallback_started
+            .is_some_and(|reset_at| now.saturating_sub(reset_at) > CLOSE_TIMEOUT_MS)
+        {
+            return Err("TCP listener did not rearm after fallback reset");
         }
         cooperate(
             report.more_work || report.ingress_frames != 0,
@@ -2096,9 +2334,7 @@ async fn serve_connection(
             Err(reason) => return reset_connection(stack, reason),
         };
         match signal {
-            ProtocolSignal::Exec(command, component) => {
-                break SessionStart::Exec(command, component);
-            }
+            ProtocolSignal::Exec(accepted) => break SessionStart::Exec(accepted),
             ProtocolSignal::Shell => break SessionStart::Shell,
             ProtocolSignal::Interrupt => pending_input.signal_interrupt = true,
             ProtocolSignal::Defunct => {
@@ -2132,7 +2368,13 @@ async fn serve_connection(
     };
 
     match start {
-        SessionStart::Exec(command, accepted_component) => {
+        SessionStart::Exec(accepted) => {
+            let AcceptedExec {
+                command,
+                component: accepted_component,
+                #[cfg(feature = "c84-profile-request-parent")]
+                    profile: mut profile_run,
+            } = accepted;
             #[cfg(feature = "qualification-stream")]
             if let Some(opened) = accepted_component
                 .is_none()
@@ -2173,6 +2415,8 @@ async fn serve_connection(
                     stack,
                     &mut bridge,
                     &mut protocol,
+                    #[cfg(feature = "c84-profile-request-parent")]
+                    &mut profile_run,
                     &[],
                     status,
                     require_carrier,
@@ -2215,6 +2459,8 @@ async fn serve_connection(
                 stack,
                 &mut bridge,
                 &mut protocol,
+                #[cfg(feature = "c84-profile-request-parent")]
+                &mut profile_run,
                 &output,
                 status,
                 require_carrier,
@@ -2468,7 +2714,7 @@ fn progress_protocol(
                     .channel
                     .as_ref()
                     .is_some_and(|channel| channel.num() == event.channel());
-                let mut command = None;
+                let mut prepared = None;
                 if ours && state.authenticated && !state.start_seen {
                     state.start_seen = true;
                     let candidate = state
@@ -2503,15 +2749,18 @@ fn progress_protocol(
                                 }
                             }
                         {
-                            command = Some((value, accepted_component));
+                            prepared =
+                                Some(PreparedExec::prepare(space, value, accepted_component)?);
                         }
                     }
                 }
-                if let Some((command, accepted_component)) = command {
-                    event
-                        .succeed()
-                        .map_err(|_| "exec acceptance response failed")?;
-                    return Ok(ProtocolSignal::Exec(command, accepted_component));
+                if let Some(prepared) = prepared {
+                    let accepted = prepared.accept(|| {
+                        event
+                            .succeed()
+                            .map_err(|_| "exec acceptance response failed")
+                    })?;
+                    return Ok(ProtocolSignal::Exec(accepted));
                 }
                 event.fail().map_err(|_| "exec rejection failed")?;
                 progressed = true;
@@ -2980,7 +3229,7 @@ fn drive_shell_turn(
         ProtocolSignal::Defunct => {
             return Err(ConnectionEnd::Reset("SSH shell became defunct"));
         }
-        ProtocolSignal::Exec(_, _) | ProtocolSignal::Shell => {
+        ProtocolSignal::Exec(_) | ProtocolSignal::Shell => {
             return Err(ConnectionEnd::Reset(
                 "duplicate SSH session start was accepted",
             ));
@@ -3276,7 +3525,7 @@ async fn execute_shell_command(
                 ));
                 continue;
             }
-            ProtocolSignal::Exec(_, _) | ProtocolSignal::Shell => {
+            ProtocolSignal::Exec(_) | ProtocolSignal::Shell => {
                 cancel.cancel();
                 cancellation = Some((
                     ExecutionCancellation::Reset("duplicate SSH session start during command"),
@@ -3680,6 +3929,8 @@ async fn serve_interactive_shell(
 
     // Frontend bytes are fully drained before the common completion path sends
     // exit-status, EOF, CLOSE, waits for peer CLOSE, and releases the channel.
+    #[cfg(feature = "c84-profile-request-parent")]
+    let mut profile_run = None;
     finish_exec(
         runner,
         signer,
@@ -3690,6 +3941,8 @@ async fn serve_interactive_shell(
         stack,
         bridge,
         protocol,
+        #[cfg(feature = "c84-profile-request-parent")]
+        &mut profile_run,
         &[],
         status,
         require_carrier,
@@ -4340,6 +4593,18 @@ fn ssh_exit_status(status: vibeos_vsh::Status) -> u32 {
     }
 }
 
+#[cfg(feature = "c84-profile-request-parent")]
+fn reach_profile_response_boundary(
+    profile_run: &mut Option<SshExecProfileRun>,
+    status: u32,
+) -> Result<(), ConnectionEnd> {
+    let Some(run) = profile_run.take() else {
+        return Ok(());
+    };
+    run.response_boundary(status)
+        .map_err(|_| ConnectionEnd::Reset("SSH exec profile response boundary failed"))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn finish_exec(
     runner: &mut Runner<'_, Server>,
@@ -4351,6 +4616,7 @@ async fn finish_exec(
     stack: &mut dyn TcpTransport,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
+    #[cfg(feature = "c84-profile-request-parent")] profile_run: &mut Option<SshExecProfileRun>,
     output: &[u8],
     status: u32,
     require_carrier: bool,
@@ -4382,6 +4648,10 @@ async fn finish_exec(
 
         let completion_confirmed_before_progress =
             close_sent && protocol.channel.is_none() && runner.is_output_drained();
+        #[cfg(feature = "c84-profile-request-parent")]
+        if completion_confirmed_before_progress {
+            reach_profile_response_boundary(profile_run, status)?;
+        }
         let signal = progress_protocol(runner, signer, space, policy, protocol)
             .map_err(ConnectionEnd::Reset)?;
         if matches!(signal, ProtocolSignal::Defunct) {
@@ -4469,6 +4739,8 @@ async fn finish_exec(
         }
 
         if close_sent && protocol.channel.is_none() && runner.is_output_drained() {
+            #[cfg(feature = "c84-profile-request-parent")]
+            reach_profile_response_boundary(profile_run, status)?;
             return finish_tcp_after_ssh(
                 space,
                 control,
@@ -4512,7 +4784,11 @@ async fn finish_tcp_after_ssh(
         let network = stack
             .poll_network(now)
             .map_err(|_| ConnectionEnd::Reset("network stack poll failed during TCP close"))?;
-        if stack.is_listening() {
+        // The passive socket may already have crossed LISTEN into a queued
+        // replacement generation. `connection_ended` retires only the old
+        // token; the outer rearm loop will hand the replacement to a fresh
+        // Runner and fresh entropy.
+        if network.connection_ended || stack.is_listening() {
             return Ok(());
         }
 
@@ -4638,6 +4914,563 @@ mod tests {
         ManagedComponentLifecycle, ManagedComponentStartLease, ManagedComponentState,
         ManagedComponentStateFuture, ManagedComponentToken, StageReport, Status, TerminalDetail,
     };
+
+    struct StartedDuringRearmTransport {
+        polls: usize,
+    }
+
+    impl TcpTransport for StartedDuringRearmTransport {
+        fn poll_network(&mut self, _now_ms: u64) -> Result<TcpPollReport, ()> {
+            self.polls += 1;
+            Ok(TcpPollReport {
+                ingress_frames: 0,
+                connection_started: true,
+                connection_ended: false,
+                more_work: false,
+                next_poll_delay_ms: Some(1),
+            })
+        }
+
+        fn stream_status(&self) -> TcpStreamStatus {
+            TcpStreamStatus {
+                state: TcpStreamState::Established,
+                readable_bytes: 0,
+                queued_send_bytes: 0,
+                writable_bytes: 0,
+            }
+        }
+
+        fn try_recv(&mut self, _output: &mut [u8]) -> Result<TcpIoResult, ()> {
+            Ok(TcpIoResult::WouldBlock)
+        }
+
+        fn try_send(&mut self, _input: &[u8]) -> Result<TcpIoResult, ()> {
+            Ok(TcpIoResult::WouldBlock)
+        }
+
+        fn close(&mut self) -> Result<TcpStreamState, ()> {
+            Ok(TcpStreamState::Closing)
+        }
+
+        fn reset(&mut self) -> Result<TcpStreamState, ()> {
+            Ok(TcpStreamState::Reset)
+        }
+
+        fn is_listening(&self) -> bool {
+            false
+        }
+
+        fn ipv4_status(&self) -> Ipv4RuntimeStatus {
+            Ipv4RuntimeStatus::Unconfigured
+        }
+    }
+
+    struct GenerationRacePlatform {
+        listener: Arc<vibeos_net_api::TcpListener>,
+        roll_after_accept: AtomicBool,
+    }
+
+    impl Platform for GenerationRacePlatform {
+        fn packet_endpoints(
+            &self,
+            _outbound: Cap,
+            _inbound: Cap,
+        ) -> Option<(
+            Revocable<Endpoint<StampedPacket>>,
+            Revocable<Endpoint<StampedPacket>>,
+        )> {
+            None
+        }
+
+        fn bind_stack(&self, _control: Cap) -> Result<PacketStamp, NetworkBindError> {
+            Err(NetworkBindError::Denied)
+        }
+
+        fn network_info(&self, _control: Cap) -> Option<NetworkInfo> {
+            None
+        }
+
+        fn tcp_listener_snapshot(&self, _listener: Cap) -> Option<TcpListenerSnapshot> {
+            Some(self.listener.snapshot())
+        }
+
+        fn tcp_accept(&self, _listener: Cap) -> Result<Option<TcpConnectionToken>, ()> {
+            let connection = self.listener.try_accept();
+            if connection.is_some() && self.roll_after_accept.swap(false, AtomicOrdering::SeqCst) {
+                self.listener
+                    .network_update_state(TcpStreamState::Listening)
+                    .unwrap();
+                self.listener
+                    .network_update_state(TcpStreamState::Established)
+                    .unwrap();
+            }
+            Ok(connection)
+        }
+
+        fn entropy<'a>(
+            &'a self,
+            _random: Cap,
+            _length: usize,
+        ) -> PlatformFuture<'a, Result<SecretBytes, ()>> {
+            Box::pin(async { Err(()) })
+        }
+
+        fn host_public_key(&self, _read: Cap) -> Result<HostPublicKeySnapshot, ()> {
+            Err(())
+        }
+
+        fn sign_exchange_hash(
+            &self,
+            _invoke: Cap,
+            _exchange_hash: &[u8; 32],
+        ) -> Result<HostSignatureResult, ()> {
+            Err(())
+        }
+
+        fn authorized_profile(
+            &self,
+            _policy: Cap,
+            _key: &SshEd25519PublicKey,
+        ) -> Result<Option<AuthorizedProfile>, ()> {
+            Ok(None)
+        }
+
+        fn install_vsh_commands(&self, _session: &mut vibeos_vsh::Session, _onboarding: bool) {}
+
+        fn log(&self, _args: fmt::Arguments<'_>) {}
+    }
+
+    #[test]
+    fn capability_connection_generation_detects_replacement() {
+        let listener = vibeos_net_api::TcpListener::new(
+            "sshd-generation-test",
+            vibeos_net_api::TcpListenerId::new(84).unwrap(),
+            2222,
+            256,
+            256,
+        )
+        .unwrap();
+        listener
+            .network_update_state(TcpStreamState::Established)
+            .unwrap();
+        let old = listener.try_accept().unwrap();
+        assert!(!connection_generation_replaced(
+            Some(old),
+            &listener.snapshot()
+        ));
+
+        listener
+            .network_update_state(TcpStreamState::Listening)
+            .unwrap();
+        listener
+            .network_update_state(TcpStreamState::Established)
+            .unwrap();
+        let replacement = listener.snapshot();
+        assert_ne!(old.generation(), replacement.connection_generation);
+        assert!(connection_generation_replaced(Some(old), &replacement));
+    }
+
+    #[test]
+    fn capability_accept_rechecks_generation_before_starting_a_fresh_runner() {
+        let listener = vibeos_net_api::TcpListener::new(
+            "sshd-accept-rollover-test",
+            vibeos_net_api::TcpListenerId::new(85).unwrap(),
+            2223,
+            256,
+            256,
+        )
+        .unwrap();
+        listener
+            .network_update_state(TcpStreamState::Established)
+            .unwrap();
+        let platform = GenerationRacePlatform {
+            listener: listener.clone(),
+            roll_after_accept: AtomicBool::new(true),
+        };
+        let mut cspace = CSpace::new("sshd-accept-rollover-test");
+        let listener_cap = cspace.mint(listener.clone(), vibeos_core::cap::Rights::ALL);
+        let mut transport =
+            CapabilityTcpTransport::new(&platform, listener_cap, Ipv4RuntimeStatus::Unconfigured)
+                .unwrap();
+
+        let retired = transport.poll_network(0).unwrap();
+        assert!(retired.connection_ended);
+        assert!(!retired.connection_started);
+        assert!(transport.connection.is_none());
+        assert!(!listener.snapshot().accepted);
+        assert_eq!(transport.reset(), Ok(TcpStreamState::Reset));
+        assert_eq!(listener.snapshot().close_request, None);
+
+        let started = transport.poll_network(1).unwrap();
+        assert!(!started.connection_ended);
+        assert!(started.connection_started);
+        let current = transport.connection.unwrap();
+        assert_eq!(
+            current.generation(),
+            listener.snapshot().connection_generation
+        );
+    }
+
+    #[test]
+    fn rearm_hands_an_already_started_connection_to_the_fresh_runner() {
+        let mut transport = StartedDuringRearmTransport { polls: 0 };
+        let mut future = Box::pin(rearm_listener(&mut transport));
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(
+            future.as_mut().poll(&mut context),
+            Poll::Ready(Ok(()))
+        ));
+        drop(future);
+        assert_eq!(transport.polls, 1);
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ProfileEvent {
+        Prepare,
+        Succeed,
+        Start,
+        Boundary(u32),
+        Cancel,
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    struct ProfileTrace {
+        events: SpinLock<Vec<ProfileEvent>>,
+        fail_start: AtomicBool,
+        fail_boundary: AtomicBool,
+        start_backend: AtomicUsize,
+        boundary_backend: AtomicUsize,
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    impl ProfileTrace {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                events: SpinLock::new(Vec::new()),
+                fail_start: AtomicBool::new(false),
+                fail_boundary: AtomicBool::new(false),
+                start_backend: AtomicUsize::new(0),
+                boundary_backend: AtomicUsize::new(0),
+            })
+        }
+
+        fn push(&self, event: ProfileEvent) {
+            self.events.lock().push(event);
+        }
+
+        fn snapshot(&self) -> Vec<ProfileEvent> {
+            self.events.lock().clone()
+        }
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    struct TestProfileBackend {
+        trace: Arc<ProfileTrace>,
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    impl SshExecProfilePermitBackend for TestProfileBackend {
+        fn start(&mut self) -> Result<(), ()> {
+            let backend = self as *mut Self as usize;
+            self.trace
+                .start_backend
+                .store(backend, AtomicOrdering::SeqCst);
+            self.trace.push(ProfileEvent::Start);
+            if self.trace.fail_start.load(AtomicOrdering::SeqCst) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn into_run(self: Box<Self>) -> Box<dyn SshExecProfileRunBackend> {
+            self
+        }
+
+        fn cancel(&mut self) {
+            self.trace.push(ProfileEvent::Cancel);
+        }
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    impl SshExecProfileRunBackend for TestProfileBackend {
+        fn response_boundary(&mut self, status: u32) -> Result<(), ()> {
+            let backend = self as *mut Self as usize;
+            self.trace
+                .boundary_backend
+                .store(backend, AtomicOrdering::SeqCst);
+            self.trace.push(ProfileEvent::Boundary(status));
+            if self.trace.fail_boundary.load(AtomicOrdering::SeqCst) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn cancel(&mut self) {
+            self.trace.push(ProfileEvent::Cancel);
+        }
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    struct TestProfilePlatform {
+        target: SshExecComponentSessionPolicy,
+        trace: Arc<ProfileTrace>,
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    impl Platform for TestProfilePlatform {
+        fn packet_endpoints(
+            &self,
+            _outbound: Cap,
+            _inbound: Cap,
+        ) -> Option<(
+            Revocable<Endpoint<StampedPacket>>,
+            Revocable<Endpoint<StampedPacket>>,
+        )> {
+            None
+        }
+
+        fn bind_stack(&self, _control: Cap) -> Result<PacketStamp, NetworkBindError> {
+            Err(NetworkBindError::Denied)
+        }
+
+        fn network_info(&self, _control: Cap) -> Option<NetworkInfo> {
+            None
+        }
+
+        fn entropy<'a>(
+            &'a self,
+            _random: Cap,
+            _length: usize,
+        ) -> PlatformFuture<'a, Result<SecretBytes, ()>> {
+            Box::pin(async { Err(()) })
+        }
+
+        fn host_public_key(&self, _read: Cap) -> Result<HostPublicKeySnapshot, ()> {
+            Err(())
+        }
+
+        fn sign_exchange_hash(
+            &self,
+            _invoke: Cap,
+            _exchange_hash: &[u8; 32],
+        ) -> Result<HostSignatureResult, ()> {
+            Err(())
+        }
+
+        fn authorized_profile(
+            &self,
+            _policy: Cap,
+            _key: &SshEd25519PublicKey,
+        ) -> Result<Option<AuthorizedProfile>, ()> {
+            Ok(None)
+        }
+
+        fn install_vsh_commands(&self, _session: &mut vibeos_vsh::Session, _onboarding: bool) {}
+
+        fn ssh_exec_component_policy(
+            &self,
+            profile: AuthorizedProfile,
+        ) -> Option<SshExecComponentSessionPolicy> {
+            self.target.matches(profile).then_some(self.target)
+        }
+
+        fn prepare_ssh_exec_profile(
+            &self,
+            target: SshExecProfileTarget<'_>,
+        ) -> Result<Option<SshExecProfilePermit>, ()> {
+            self.trace.push(ProfileEvent::Prepare);
+            Ok(
+                (target.source() == "case-filter" && target.policy() == self.target).then(|| {
+                    SshExecProfilePermit::new(TestProfileBackend {
+                        trace: self.trace.clone(),
+                    })
+                }),
+            )
+        }
+
+        fn log(&self, _args: fmt::Arguments<'_>) {}
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    fn profile_fixture() -> (
+        TestProfilePlatform,
+        AuthorizedProfile,
+        SshExecComponentSessionPolicy,
+        Arc<ProfileTrace>,
+    ) {
+        let profile = AuthorizedProfile {
+            generation: 84,
+            profile: CapabilityProfileId::new(8).unwrap(),
+        };
+        let target = SshExecComponentSessionPolicy::new(
+            profile,
+            NonZeroU64::new(84).unwrap(),
+            "case-filter",
+            [0x84; 32],
+        );
+        let trace = ProfileTrace::new();
+        (
+            TestProfilePlatform {
+                target,
+                trace: trace.clone(),
+            },
+            profile,
+            target,
+            trace,
+        )
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    #[test]
+    fn profile_request_parent_orders_prepare_succeed_start_and_one_boundary() {
+        let (platform, profile, target, trace) = profile_fixture();
+        let selected = accepted_ssh_component_policy(&platform, profile, true, "case-filter");
+        assert_eq!(selected, Some(target));
+
+        let prepared =
+            PreparedExec::prepare(&platform, "case-filter".to_string(), selected).unwrap();
+        assert_eq!(trace.snapshot(), vec![ProfileEvent::Prepare]);
+        let accepted = prepared
+            .accept(|| {
+                trace.push(ProfileEvent::Succeed);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                ProfileEvent::Prepare,
+                ProfileEvent::Succeed,
+                ProfileEvent::Start,
+            ]
+        );
+
+        let ProtocolSignal::Exec(accepted) = ProtocolSignal::Exec(accepted) else {
+            unreachable!()
+        };
+        let SessionStart::Exec(mut accepted) = SessionStart::Exec(accepted) else {
+            unreachable!()
+        };
+        assert!(reach_profile_response_boundary(&mut accepted.profile, 37).is_ok());
+        assert!(reach_profile_response_boundary(&mut accepted.profile, 99).is_ok());
+        drop(accepted);
+
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                ProfileEvent::Prepare,
+                ProfileEvent::Succeed,
+                ProfileEvent::Start,
+                ProfileEvent::Boundary(37),
+            ]
+        );
+        assert_ne!(trace.start_backend.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            trace.start_backend.load(AtomicOrdering::SeqCst),
+            trace.boundary_backend.load(AtomicOrdering::SeqCst),
+            "permit and run did not retain the same backend allocation"
+        );
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    #[test]
+    fn profile_request_parent_cancels_when_exec_succeed_fails() {
+        let (platform, profile, _target, trace) = profile_fixture();
+        let selected = accepted_ssh_component_policy(&platform, profile, true, "case-filter");
+        let prepared =
+            PreparedExec::prepare(&platform, "case-filter".to_string(), selected).unwrap();
+        let result = prepared.accept(|| {
+            trace.push(ProfileEvent::Succeed);
+            Err("injected exec acceptance failure")
+        });
+        assert!(matches!(result, Err("injected exec acceptance failure")));
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                ProfileEvent::Prepare,
+                ProfileEvent::Succeed,
+                ProfileEvent::Cancel,
+            ]
+        );
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    #[test]
+    fn profile_request_parent_cancels_start_boundary_errors_and_live_drop() {
+        let (platform, profile, _target, trace) = profile_fixture();
+        let selected = accepted_ssh_component_policy(&platform, profile, true, "case-filter");
+        trace.fail_start.store(true, AtomicOrdering::SeqCst);
+        let prepared =
+            PreparedExec::prepare(&platform, "case-filter".to_string(), selected).unwrap();
+        assert!(prepared.accept(|| Ok(())).is_err());
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                ProfileEvent::Prepare,
+                ProfileEvent::Start,
+                ProfileEvent::Cancel
+            ]
+        );
+
+        let (platform, profile, _target, trace) = profile_fixture();
+        let selected = accepted_ssh_component_policy(&platform, profile, true, "case-filter");
+        let accepted = PreparedExec::prepare(&platform, "case-filter".to_string(), selected)
+            .unwrap()
+            .accept(|| Ok(()))
+            .unwrap();
+        drop(accepted);
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                ProfileEvent::Prepare,
+                ProfileEvent::Start,
+                ProfileEvent::Cancel
+            ]
+        );
+
+        let (platform, profile, _target, trace) = profile_fixture();
+        let selected = accepted_ssh_component_policy(&platform, profile, true, "case-filter");
+        let mut accepted = PreparedExec::prepare(&platform, "case-filter".to_string(), selected)
+            .unwrap()
+            .accept(|| Ok(()))
+            .unwrap();
+        trace.fail_boundary.store(true, AtomicOrdering::SeqCst);
+        assert!(reach_profile_response_boundary(&mut accepted.profile, 125).is_err());
+        assert!(reach_profile_response_boundary(&mut accepted.profile, 0).is_ok());
+        drop(accepted);
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                ProfileEvent::Prepare,
+                ProfileEvent::Start,
+                ProfileEvent::Boundary(125),
+                ProfileEvent::Cancel,
+            ]
+        );
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    #[test]
+    fn profile_request_parent_does_not_arm_non_target_execs() {
+        let (platform, profile, _target, trace) = profile_fixture();
+        for (public_key, source) in [
+            (false, "case-filter"),
+            (true, "true"),
+            (true, "case-filter | true"),
+        ] {
+            let selected = accepted_ssh_component_policy(&platform, profile, public_key, source);
+            assert!(selected.is_none());
+            let accepted = PreparedExec::prepare(&platform, source.to_string(), selected)
+                .unwrap()
+                .accept(|| Ok(()))
+                .unwrap();
+            assert!(accepted.profile.is_none());
+        }
+        assert!(trace.snapshot().is_empty());
+    }
 
     #[test]
     fn component_wake_protocol_errors_have_exact_fail_closed_diagnostics() {

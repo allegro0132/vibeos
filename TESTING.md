@@ -36,6 +36,8 @@ cargo check --locked -p vibeos-wasm-aot-profile \
 ./scripts/qemu-c84-core-poll-test.sh # C8.4 real Core observer/slot gate
 ./scripts/qemu-c84-profile-irq-overlay-test.sh # C8.4 real self-SSIP overlay gate
 ./scripts/qemu-c84-profile-child-delegation-test.sh # C8.4 prepared-child lineage gate
+python3 -B scripts/verify-c84-ssh-profile-request-parent.py --selftest --check-source
+./scripts/qemu-c84-ssh-request-parent-test.sh # C8.4 authenticated request-parent/reuse gate
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
@@ -251,6 +253,41 @@ ownership seam only. It does not modify the frozen ordinary component runner,
 connect the OpenSSH acceptance/response boundary, prove real wasmi Core
 attribution, publish the schema, collect physical Duo samples, or make an AOT
 decision.
+
+The default-off `wasm-c84-ssh-request-parent` seam closes the authenticated
+request-parent ownership boundary without claiming a profile result. Only the
+public-key-authenticated, current-policy, exact-grammar `case-filter` descriptor
+can reserve the kernel slot. `PreparedExec` owns that reservation before the
+SSH success response; `PreparedExec::accept` sends success first and only then
+starts the slot lease, so a failed response drops the unstarted reservation.
+The resulting `AcceptedExec` keeps the run in `serve_connection`, outside the
+managed child. Every post-start, pre-response execution/reset/rebind failure
+therefore reaches the same linear Drop cleanup. A complete response instead
+consumes the run through the explicit response boundary, only after exit
+status, EOF, peer CLOSE acknowledgement, and Sunset output drain, before the
+next protocol event or TCP teardown.
+
+The kernel adapter deliberately cancels rather than finishes. It compares the
+cancel report with the independently stored rejection, acknowledges that exact
+epoch once, and requires `Ready(next_epoch)` before reporting RESPONSE or DROP.
+It has no finish, stream, publisher, or evidence surface. The independent
+source verifier mutation-checks the admission/order/ownership boundary and the
+exact cancel/rejection/acknowledge/reuse closure.
+
+`scripts/qemu-c84-ssh-request-parent-test.sh` boots the isolated OpenSSH image
+with one canonical hart. Builtin, unavailable native, parameterized target,
+and rejected-key probes must emit no profile marker. Two exact `case-filter`
+requests must close epochs 1 and 2; a third request is killed after its START
+marker and must emit one DROP cleanup marker; epoch 4 must then succeed, proving
+post-Drop slot reuse. The authenticated readiness probe starts immediately
+after DROP: the capability TCP adapter must retire the old connection
+generation in one poll, accept a queued replacement only on the next poll, and
+hand it to a fresh SSH Runner rather than resetting or reading it through the
+old parent. The exact epoch-4 request follows that successful readiness probe.
+The host accepts only the frozen ordered UART sequence.
+This is QEMU integration evidence for request ownership only: the ordinary
+managed child still uses unprofiled wasmi polling, no sample is finished or
+streamed, and no physical-Duo profiling evidence is produced.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

@@ -58,6 +58,14 @@ wasm-c84-profile-irq-overlay-qemu-acceptance = [
 wasm-c84-profile-child-delegation-qemu-acceptance = [
     "vibeos-kernel/wasm-c84-profile-child-delegation-qemu-acceptance",
 ]
+# Single-hart OpenSSH gate for the diagnostic-only C8.4 request-parent owner.
+# This deliberately selects the reusable SSH fixture without the four-hart
+# C4.8 acceptance composite, because the formal profile facade accepts only
+# the canonical one-hart topology.
+wasm-c84-ssh-request-parent-qemu-acceptance = [
+    "vibeos-kernel/ssh-test",
+    "vibeos-kernel/wasm-c84-ssh-request-parent-qemu-acceptance",
+]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = [
     "vibeos-kernel/ssh-test",

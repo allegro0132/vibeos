@@ -162,6 +162,89 @@
       "aot_attributable": false
     }
   ],
+  "transcript": {
+    "framing": {
+      "raw_scope": "one independently booted physical Milk-V Duo session",
+      "required_raw_transcripts": 3,
+      "meta_records_per_raw": 1,
+      "sample_records_per_raw": 24,
+      "end_records_per_raw": 1,
+      "warmups_per_raw": 3,
+      "retained_per_raw": 21,
+      "maximum_raw_bytes": 268435456,
+      "record_order": "META, SAMPLE sequence 0 through 23, END",
+      "boot_index_binding": "host evidence assigns boot_index 0 through 2 after independent raw verification; target records contain no boot index",
+      "prefixes": {
+        "meta": "VIBE_WASM_AOT_META ",
+        "sample": "VIBE_WASM_AOT_SAMPLE ",
+        "end": "VIBE_WASM_AOT_END "
+      }
+    },
+    "run_id": {
+      "domain": "vibeos.c84.aot-decision.run-id.v1",
+      "algorithm": "sha256",
+      "encoding": "domain followed by fields as NUL-separated ASCII values with no trailing NUL",
+      "fields": [
+        "source_commit",
+        "challenge",
+        "artifact_sha256",
+        "input_sha256",
+        "output_sha256",
+        "manifest_sha256",
+        "transcript_schema_sha256"
+      ],
+      "meaning": "shared campaign identity only; it does not prove a cold boot"
+    },
+    "accumulator": {
+      "width_bits": 64,
+      "initial": 0,
+      "update": "acc = rotl64(acc, 7).wrapping_add(word)",
+      "sample_domain_word": 4843678931419484236,
+      "interval_domain_word": 4843678888688374358,
+      "sample_prefix_words": [
+        "sample_domain_word",
+        "sequence",
+        "sample_index",
+        "warmup(0|1)",
+        "total_ticks",
+        "phase_ticks in canonical phase order",
+        "interval_capacity",
+        "interval_count",
+        "intervals_complete(0|1)"
+      ],
+      "interval_words": [
+        "interval_domain_word",
+        "sequence",
+        "phase_code",
+        "start_offset_ticks",
+        "end_offset_ticks"
+      ],
+      "sample_suffix_words": [
+        "read_chunks",
+        "write_chunks",
+        "fuel_consumed",
+        "poll_quanta",
+        "terminal_code(success=1)",
+        "logical_live_after",
+        "timed_out(0|1)",
+        "timeout_phase_code(none=0)",
+        "exit_status",
+        "stdout_bytes",
+        "stdout_sha256 as four big-endian u64 words",
+        "stderr_bytes"
+      ],
+      "phase_codes": {
+        "validation": 1,
+        "instantiation": 2,
+        "abi": 3,
+        "interpretation": 4,
+        "host": 5,
+        "wait": 6,
+        "cleanup": 7
+      },
+      "purpose": "ordered truncation and corruption check, not authentication"
+    }
+  },
   "decision_rule": {
     "preconditions": "C8.3 is complete and every C8.4 publication gate passes on the eligible physical-Duo dataset",
     "budget_miss": "p95(total_ticks) > 2500000",
@@ -173,10 +256,10 @@
   "publication_gates": {
     "precondition": "C8.3 fixed-QEMU and three-cold-boot physical-Duo publication is complete",
     "identity": "source commit, manifest, schema, artifact, WAT, input, output, command, world, entrypoint, image policy, and platform envelope match exactly",
-    "completeness": "each of three physical cold boots has exactly three warmups then twenty-one retained samples; every coordinate occurs once",
-    "correctness": "every sample exits zero, emits the exact 12325-byte output hash, and emits empty stderr",
+    "completeness": "three independently verified single-cold-boot raw transcripts each contain one META, exactly three warmups then twenty-one retained samples, and one END; host evidence binds distinct boot indexes 0 through 2",
+    "correctness": "every sample exits zero, emits the exact 12325-byte output hash, emits empty stderr, consumes 1 through 500000 fuel, and reports positive poll quanta",
     "successful_samples_only": "timed-out, trapped, failed, truncated, or otherwise non-successful attempts are diagnostic records outside the formal dataset and can never authorize AOT",
-    "phase_partition": "intervals are ordered, gap-free, non-overlapping, and labeled with exactly one of seven phases; total_ticks equals both the response interval and the sum of phase_ticks",
+    "phase_partition": "intervals are non-empty, ordered, gap-free, non-overlapping, and labeled with exactly one of seven phases; adjacent intervals have different phases; total_ticks equals both the response interval and the sum of phase_ticks",
     "interval_capacity": "every formal sample pins interval_capacity to 65536, requires interval_count == len(intervals), and sets intervals_complete true; interval overflow or truncation is diagnostic-only and cannot enter the decision population",
     "duo_stability": "within each boot retained p95(total_ticks) divided by p50(total_ticks) is at most 1.50",
     "qemu_exclusion": "QEMU records are integration-only and absent from every budget and attribution statistic",

@@ -90,7 +90,7 @@ jobs:
           python3 -B scripts/verify-c83-runtime-costs.py --selftest --check-manifest
           python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
           python3 -B scripts/verify-c83-evidence.py --selftest
-      - name: Verify the revised C8.4 interval-capacity contract
+      - name: Verify the C8.4 single-boot transcript contract
         run: python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
       - name: Verify the independent ComponentArtifact codec
         run: python3 -B scripts/verify-c71-component-artifact.py --selftest

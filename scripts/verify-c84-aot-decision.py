@@ -2,9 +2,12 @@
 """Independently verify the frozen C8.4 AOT-decision preparation contract.
 
 This host-only verifier uses only Python's standard library.  It does not run
-the guest, compile WAT, or accept profiling results.  It binds the checked-in
-contract to the executable image policy and to the exact OpenSSH product
-fixture, then checks the closed manifest and transcript-schema descriptions.
+the guest or compile WAT. It binds the checked-in contract to the executable
+image policy and exact OpenSSH product fixture, checks the closed manifest and
+schema, and semantically verifies one raw transcript claiming a physical cold
+boot. It does not attest the transcript's hardware provenance or the cold-boot
+operation. A later evidence verifier must aggregate three independently
+verified boots and prove the C8.3 precondition before deriving any AOT decision.
 """
 
 from __future__ import annotations
@@ -14,14 +17,19 @@ import ast
 import copy
 import hashlib
 import json
+import os
 import pathlib
 import re
+import secrets
+import stat
 import sys
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Callable
 
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+SCRIPT_PATH = pathlib.Path(__file__).resolve()
+ROOT = SCRIPT_PATH.parent.parent
 MANIFEST_PATH = ROOT / "benchmarks/wasm-aot-decision/workloads-v1.json"
 SCHEMA_PATH = ROOT / "benchmarks/wasm-aot-decision/schema-v1.json"
 BUILD_PATH = ROOT / "policy/image/build.rs"
@@ -32,11 +40,24 @@ OPENSSH_PEER_PATH = ROOT / "scripts/openssh-peer.py"
 VSH_ENGINE_PATH = ROOT / "components/vsh/src/engine.rs"
 COMPONENT_HOST_STREAM_PATH = ROOT / "services/component-host/src/stream.rs"
 KERNEL_COMPONENT_INSTANCES_PATH = ROOT / "kernel/src/component_instances.rs"
+VERIFIER_INPUT_PATHS = (
+    MANIFEST_PATH,
+    SCHEMA_PATH,
+    BUILD_PATH,
+    POLICY_PATH,
+    PROFILE_PATH,
+    WAT_PATH,
+    OPENSSH_PEER_PATH,
+    VSH_ENGINE_PATH,
+    COMPONENT_HOST_STREAM_PATH,
+    KERNEL_COMPONENT_INSTANCES_PATH,
+    SCRIPT_PATH,
+)
 
 # Filled from the reviewed files below.  Byte identity is intentionally
 # independent of JSON parsing and makes formatting changes review-visible.
-EXPECTED_MANIFEST_SHA256 = "5eb32eaec43b456b8c5fa1428464e27d869419e79d4eb29a5512182d04b5e8e5"
-EXPECTED_SCHEMA_SHA256 = "ea0646f06f0f0b03d0e9b6286e802de9138e6b5cd085cd4e8d7648d8c1bf4d33"
+EXPECTED_MANIFEST_SHA256 = "87026895f2207d85a04f5c04f11420530f1c8f922391f71915f173b18dcfd9d8"
+EXPECTED_SCHEMA_SHA256 = "b608aa3de46aac1a73fb321babdcd4ad18ec43c60b54760f53b9e5e8d317bf3a"
 EXPECTED_WAT_SHA256 = "6db36b58350c4de22077fba4dd9dd1166f0808e2adc8488ba086d91c6f659cc1"
 EXPECTED_COMPONENT_SHA256 = "180ed444de8b6c9ecd828b369d4c8b9f783758ef22c0b17170682d71f2fd0e72"
 EXPECTED_COMPONENT_BYTES = 2012
@@ -70,6 +91,7 @@ TOP_KEYS = {
     "sampling",
     "budget",
     "phases",
+    "transcript",
     "decision_rule",
     "publication_gates",
 }
@@ -102,10 +124,10 @@ DECISION_RULE = {
 PUBLICATION_GATES = {
     "precondition": "C8.3 fixed-QEMU and three-cold-boot physical-Duo publication is complete",
     "identity": "source commit, manifest, schema, artifact, WAT, input, output, command, world, entrypoint, image policy, and platform envelope match exactly",
-    "completeness": "each of three physical cold boots has exactly three warmups then twenty-one retained samples; every coordinate occurs once",
-    "correctness": "every sample exits zero, emits the exact 12325-byte output hash, and emits empty stderr",
+    "completeness": "three independently verified single-cold-boot raw transcripts each contain one META, exactly three warmups then twenty-one retained samples, and one END; host evidence binds distinct boot indexes 0 through 2",
+    "correctness": "every sample exits zero, emits the exact 12325-byte output hash, emits empty stderr, consumes 1 through 500000 fuel, and reports positive poll quanta",
     "successful_samples_only": "timed-out, trapped, failed, truncated, or otherwise non-successful attempts are diagnostic records outside the formal dataset and can never authorize AOT",
-    "phase_partition": "intervals are ordered, gap-free, non-overlapping, and labeled with exactly one of seven phases; total_ticks equals both the response interval and the sum of phase_ticks",
+    "phase_partition": "intervals are non-empty, ordered, gap-free, non-overlapping, and labeled with exactly one of seven phases; adjacent intervals have different phases; total_ticks equals both the response interval and the sum of phase_ticks",
     "interval_capacity": "every formal sample pins interval_capacity to 65536, requires interval_count == len(intervals), and sets intervals_complete true; interval overflow or truncation is diagnostic-only and cannot enter the decision population",
     "duo_stability": "within each boot retained p95(total_ticks) divided by p50(total_ticks) is at most 1.50",
     "qemu_exclusion": "QEMU records are integration-only and absent from every budget and attribution statistic",
@@ -124,8 +146,183 @@ PROFILE_IDENTITY = {
     "canonical_features": 7,
     "stage": "executable",
 }
+TRANSCRIPT_CONTRACT = {
+    "framing": {
+        "raw_scope": "one independently booted physical Milk-V Duo session",
+        "required_raw_transcripts": 3,
+        "meta_records_per_raw": 1,
+        "sample_records_per_raw": 24,
+        "end_records_per_raw": 1,
+        "warmups_per_raw": 3,
+        "retained_per_raw": 21,
+        "maximum_raw_bytes": 268_435_456,
+        "record_order": "META, SAMPLE sequence 0 through 23, END",
+        "boot_index_binding": "host evidence assigns boot_index 0 through 2 after independent raw verification; target records contain no boot index",
+        "prefixes": {
+            "meta": "VIBE_WASM_AOT_META ",
+            "sample": "VIBE_WASM_AOT_SAMPLE ",
+            "end": "VIBE_WASM_AOT_END ",
+        },
+    },
+    "run_id": {
+        "domain": "vibeos.c84.aot-decision.run-id.v1",
+        "algorithm": "sha256",
+        "encoding": "domain followed by fields as NUL-separated ASCII values with no trailing NUL",
+        "fields": [
+            "source_commit",
+            "challenge",
+            "artifact_sha256",
+            "input_sha256",
+            "output_sha256",
+            "manifest_sha256",
+            "transcript_schema_sha256",
+        ],
+        "meaning": "shared campaign identity only; it does not prove a cold boot",
+    },
+    "accumulator": {
+        "width_bits": 64,
+        "initial": 0,
+        "update": "acc = rotl64(acc, 7).wrapping_add(word)",
+        "sample_domain_word": 4_843_678_931_419_484_236,
+        "interval_domain_word": 4_843_678_888_688_374_358,
+        "sample_prefix_words": [
+            "sample_domain_word",
+            "sequence",
+            "sample_index",
+            "warmup(0|1)",
+            "total_ticks",
+            "phase_ticks in canonical phase order",
+            "interval_capacity",
+            "interval_count",
+            "intervals_complete(0|1)",
+        ],
+        "interval_words": [
+            "interval_domain_word",
+            "sequence",
+            "phase_code",
+            "start_offset_ticks",
+            "end_offset_ticks",
+        ],
+        "sample_suffix_words": [
+            "read_chunks",
+            "write_chunks",
+            "fuel_consumed",
+            "poll_quanta",
+            "terminal_code(success=1)",
+            "logical_live_after",
+            "timed_out(0|1)",
+            "timeout_phase_code(none=0)",
+            "exit_status",
+            "stdout_bytes",
+            "stdout_sha256 as four big-endian u64 words",
+            "stderr_bytes",
+        ],
+        "phase_codes": {
+            "validation": 1,
+            "instantiation": 2,
+            "abi": 3,
+            "interpretation": 4,
+            "host": 5,
+            "wait": 6,
+            "cleanup": 7,
+        },
+        "purpose": "ordered truncation and corruption check, not authentication",
+    },
+}
 U64_MAX = (1 << 64) - 1
+HEX_COMMIT = re.compile(r"[0-9a-f]{40}\Z")
 HEX_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+META_PREFIX = "VIBE_WASM_AOT_META "
+SAMPLE_PREFIX = "VIBE_WASM_AOT_SAMPLE "
+END_PREFIX = "VIBE_WASM_AOT_END "
+SAMPLES_PER_BOOT = 24
+WARMUPS_PER_BOOT = 3
+RETAINED_PER_BOOT = 21
+INTERVAL_CAPACITY = 65_536
+MAX_RAW_TRANSCRIPT_BYTES = 268_435_456
+MAX_BOOT_SUMMARY_BYTES = 1_048_576
+MAX_CONTRACT_FILE_BYTES = 1_048_576
+SAMPLE_DOMAIN_WORD = 4_843_678_931_419_484_236
+INTERVAL_DOMAIN_WORD = 4_843_678_888_688_374_358
+PHASE_CODES = {phase: index + 1 for index, phase in enumerate(PHASE_IDS)}
+FAILURE_MARKERS = (
+    "[!] fatal",
+    "[!] panic",
+    "panicked at",
+    "WASM_C84_PROFILE_SLOT FAIL",
+    "WASM_C84_CORE_POLL FAIL",
+    "WASM_C84_PROFILE_IRQ_OVERLAY FAIL",
+    "WASM_C84_PROFILE_CHILD_DELEGATION FAIL",
+)
+META_KEYS = {
+    "schema",
+    "version",
+    "suite_id",
+    "workload_revision",
+    "source_commit",
+    "challenge",
+    "run_id",
+    "manifest_sha256",
+    "transcript_schema_sha256",
+    "platform",
+    "decision_eligible",
+    "clock",
+    "timebase_hz",
+    "hart_id",
+    "hart_count",
+    "transcript_scope",
+    "required_cold_boots",
+    "samples_per_boot",
+    "warmup_per_boot",
+    "retained_per_boot",
+    "workload_id",
+    "artifact_sha256",
+    "artifact_bytes",
+    "input_sha256",
+    "input_bytes",
+    "output_sha256",
+    "output_bytes",
+    "budget_ticks",
+}
+SAMPLE_KEYS = {
+    "schema",
+    "version",
+    "run_id",
+    "challenge",
+    "sequence",
+    "sample_index",
+    "warmup",
+    "workload_id",
+    "total_ticks",
+    "phase_ticks",
+    "interval_capacity",
+    "interval_count",
+    "intervals_complete",
+    "intervals",
+    "read_chunks",
+    "write_chunks",
+    "fuel_consumed",
+    "poll_quanta",
+    "terminal",
+    "logical_live_after",
+    "timed_out",
+    "timeout_phase",
+    "exit_status",
+    "stdout_bytes",
+    "stdout_sha256",
+    "stderr_bytes",
+}
+INTERVAL_KEYS = {"sequence", "phase", "start_offset_ticks", "end_offset_ticks"}
+END_KEYS = {
+    "schema",
+    "version",
+    "run_id",
+    "challenge",
+    "samples",
+    "warmups",
+    "retained",
+    "accumulator",
+}
 
 
 class VerificationError(RuntimeError):
@@ -160,17 +357,23 @@ def reject_duplicate_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def strict_json_bytes(raw: bytes, label: str) -> Any:
-    def reject_number(token: str) -> Any:
-        raise VerificationError(f"{label} contains unsupported JSON number {token}")
+    def reject_number(_token: str) -> Any:
+        raise VerificationError(f"{label} contains an unsupported JSON number")
+
+    def parse_integer(token: str) -> int:
+        digits = token[1:] if token.startswith("-") else token
+        require(len(digits) <= 20, f"{label} contains an oversized JSON integer")
+        return int(token, 10)
 
     try:
         return json.loads(
             raw.decode("utf-8"),
             object_pairs_hook=reject_duplicate_members,
+            parse_int=parse_integer,
             parse_float=reject_number,
             parse_constant=reject_number,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise VerificationError(f"invalid strict UTF-8 {label} JSON: {error}") from error
 
 
@@ -221,6 +424,15 @@ def exact_sha256(value: Any, label: str) -> str:
         f"{label} must be a lowercase SHA-256",
     )
     require(value != "0" * 64, f"{label} uses the all-zero sentinel")
+    return value
+
+
+def exact_commit(value: Any, label: str) -> str:
+    require(
+        type(value) is str and HEX_COMMIT.fullmatch(value) is not None,
+        f"{label} must be a lowercase 40-hex commit",
+    )
+    require(value != "0" * 40, f"{label} uses the all-zero sentinel")
     return value
 
 
@@ -286,6 +498,25 @@ class ImageIdentity:
     total_fuel: int
     poll_quantum: int
     resources: int
+
+
+@dataclass(frozen=True)
+class VerifiedBootTranscript:
+    metadata: dict[str, Any]
+    samples: list[dict[str, Any]]
+    ending: dict[str, Any]
+    raw_sha256: str
+    raw_bytes: int
+
+
+@dataclass(frozen=True)
+class SummaryOutputTarget:
+    directory_path: pathlib.Path
+    basename: str
+    directory_fd: int
+    directory_device: int
+    directory_inode: int
+    overwrite: bool
 
 
 def image_identity() -> ImageIdentity:
@@ -974,10 +1205,26 @@ def openssh_fixture_identity() -> None:
 def load_contract_files() -> tuple[dict[str, Any], dict[str, Any]]:
     require(EXPECTED_MANIFEST_SHA256 != "", "verifier manifest identity is not pinned")
     require(EXPECTED_SCHEMA_SHA256 != "", "verifier schema identity is not pinned")
-    require(sha256_file(MANIFEST_PATH) == EXPECTED_MANIFEST_SHA256, "manifest byte identity differs")
-    require(sha256_file(SCHEMA_PATH) == EXPECTED_SCHEMA_SHA256, "schema byte identity differs")
-    manifest = strict_json_bytes(MANIFEST_PATH.read_bytes(), "manifest")
-    schema = strict_json_bytes(SCHEMA_PATH.read_bytes(), "schema")
+    manifest_raw, _manifest_path = read_stable_regular_file(
+        MANIFEST_PATH,
+        maximum_bytes=MAX_CONTRACT_FILE_BYTES,
+        label="manifest",
+    )
+    schema_raw, _schema_path = read_stable_regular_file(
+        SCHEMA_PATH,
+        maximum_bytes=MAX_CONTRACT_FILE_BYTES,
+        label="schema",
+    )
+    require(
+        hashlib.sha256(manifest_raw).hexdigest() == EXPECTED_MANIFEST_SHA256,
+        "manifest byte identity differs",
+    )
+    require(
+        hashlib.sha256(schema_raw).hexdigest() == EXPECTED_SCHEMA_SHA256,
+        "schema byte identity differs",
+    )
+    manifest = strict_json_bytes(manifest_raw, "manifest")
+    schema = strict_json_bytes(schema_raw, "schema")
     require(type(manifest) is dict, "manifest must be an object")
     require(type(schema) is dict, "schema must be an object")
     return manifest, schema
@@ -1253,6 +1500,7 @@ def validate_manifest(value: dict[str, Any]) -> None:
     require(tuple(phase["id"] for phase in phases) == PHASE_IDS, "canonical phase order differs")
     require(attributable == ["interpretation"], "AOT-attributable phase differs")
 
+    exact_literal(value["transcript"], TRANSCRIPT_CONTRACT, "manifest.transcript")
     exact_literal(value["decision_rule"], DECISION_RULE, "manifest.decision_rule")
     exact_literal(value["publication_gates"], PUBLICATION_GATES, "manifest.publication_gates")
 
@@ -1268,14 +1516,12 @@ def validate_schema(value: dict[str, Any]) -> None:
             "required": required,
         }
 
-    phase_tick_properties = {
-        phase: {"type": "integer", "minimum": 0} for phase in PHASE_IDS
-    }
+    phase_tick_properties = {phase: {"$ref": "#/$defs/u64"} for phase in PHASE_IDS}
     interval_properties = {
-        "sequence": {"type": "integer", "minimum": 0},
+        "sequence": {"type": "integer", "minimum": 0, "maximum": 65_535},
         "phase": {"$ref": "#/$defs/phase"},
-        "start_offset_ticks": {"type": "integer", "minimum": 0},
-        "end_offset_ticks": {"type": "integer", "minimum": 1},
+        "start_offset_ticks": {"$ref": "#/$defs/u64"},
+        "end_offset_ticks": {"$ref": "#/$defs/positiveU64"},
     }
     meta_properties = {
         "schema": {"const": "vibeos.wasm-aot-decision.meta"},
@@ -1293,7 +1539,9 @@ def validate_schema(value: dict[str, Any]) -> None:
         "timebase_hz": {"const": 25_000_000},
         "hart_id": {"const": 0},
         "hart_count": {"const": 1},
-        "cold_boots": {"const": 3},
+        "transcript_scope": {"const": "single-cold-boot"},
+        "required_cold_boots": {"const": 3},
+        "samples_per_boot": {"const": 24},
         "warmup_per_boot": {"const": 3},
         "retained_per_boot": {"const": 21},
         "workload_id": {"const": "ssh-case-filter-12k-v1"},
@@ -1310,12 +1558,11 @@ def validate_schema(value: dict[str, Any]) -> None:
         "version": {"const": 1},
         "run_id": {"$ref": "#/$defs/hex64"},
         "challenge": {"$ref": "#/$defs/hex64"},
-        "sequence": {"type": "integer", "minimum": 0},
-        "cold_boot_index": {"type": "integer", "minimum": 0, "maximum": 2},
+        "sequence": {"type": "integer", "minimum": 0, "maximum": 23},
         "sample_index": {"type": "integer", "minimum": 0, "maximum": 23},
         "warmup": {"type": "boolean"},
         "workload_id": {"const": "ssh-case-filter-12k-v1"},
-        "total_ticks": {"type": "integer", "minimum": 1},
+        "total_ticks": {"$ref": "#/$defs/positiveU64"},
         "phase_ticks": {"$ref": "#/$defs/phaseTicks"},
         "interval_capacity": {"const": 65536},
         "interval_count": {"type": "integer", "minimum": 1, "maximum": 65536},
@@ -1328,8 +1575,8 @@ def validate_schema(value: dict[str, Any]) -> None:
         },
         "read_chunks": {"const": 13},
         "write_chunks": {"const": 13},
-        "fuel_consumed": {"type": "integer", "minimum": 0},
-        "poll_quanta": {"type": "integer", "minimum": 0},
+        "fuel_consumed": {"type": "integer", "minimum": 1, "maximum": 500_000},
+        "poll_quanta": {"$ref": "#/$defs/positiveU64"},
         "terminal": {"const": "success"},
         "logical_live_after": {"const": 0},
         "timed_out": {"const": False},
@@ -1344,16 +1591,15 @@ def validate_schema(value: dict[str, Any]) -> None:
         "version": {"const": 1},
         "run_id": {"$ref": "#/$defs/hex64"},
         "challenge": {"$ref": "#/$defs/hex64"},
-        "cold_boots": {"const": 3},
-        "samples": {"const": 72},
-        "warmups": {"const": 9},
-        "retained": {"const": 63},
-        "accumulator": {"type": "integer", "minimum": 0},
+        "samples": {"const": 24},
+        "warmups": {"const": 3},
+        "retained": {"const": 21},
+        "accumulator": {"$ref": "#/$defs/u64"},
     }
     expected = {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://vibeos.invalid/schemas/wasm-aot-decision-v1.json",
-        "title": "VibeOS C8.4 physical AOT-decision transcript records",
+        "title": "VibeOS C8.4 single-cold-boot physical AOT-decision transcript records",
         "oneOf": [
             {"$ref": "#/$defs/meta"},
             {"$ref": "#/$defs/sample"},
@@ -1362,6 +1608,8 @@ def validate_schema(value: dict[str, Any]) -> None:
         "$defs": {
             "hex40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
             "hex64": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "u64": {"type": "integer", "minimum": 0, "maximum": U64_MAX},
+            "positiveU64": {"type": "integer", "minimum": 1, "maximum": U64_MAX},
             "phase": {"type": "string", "enum": list(PHASE_IDS)},
             "phaseTicks": closed(phase_tick_properties, list(PHASE_IDS)),
             "interval": closed(interval_properties, list(interval_properties)),
@@ -1371,6 +1619,499 @@ def validate_schema(value: dict[str, Any]) -> None:
         },
     }
     exact_literal(value, expected, "transcript schema")
+
+
+def parse_record(line: str, prefix: str, label: str) -> dict[str, Any] | None:
+    position = line.find(prefix)
+    if position < 0:
+        return None
+    require(position == 0, f"{label} marker must begin at column zero")
+    payload = line[len(prefix) :]
+    require(payload != "" and payload == payload.strip(), f"{label} payload is empty or padded")
+    value = strict_json_bytes(payload.encode("utf-8"), label)
+    require(type(value) is dict, f"{label} must be an object")
+    return value
+
+
+def rotate_left(value: int, amount: int) -> int:
+    value &= U64_MAX
+    return ((value << amount) | (value >> (64 - amount))) & U64_MAX
+
+
+def fold_word(accumulator: int, word: int) -> int:
+    exact_int(accumulator, "accumulator")
+    exact_int(word, "accumulator word")
+    return (rotate_left(accumulator, 7) + word) & U64_MAX
+
+
+def stdout_digest_words(value: str) -> list[int]:
+    raw = bytes.fromhex(exact_sha256(value, "sample.stdout_sha256"))
+    return [int.from_bytes(raw[offset : offset + 8], "big") for offset in range(0, 32, 8)]
+
+
+def transcript_accumulator(samples: list[dict[str, Any]]) -> int:
+    accumulator = 0
+    for sample in samples:
+        prefix_words = [
+            SAMPLE_DOMAIN_WORD,
+            sample["sequence"],
+            sample["sample_index"],
+            int(sample["warmup"]),
+            sample["total_ticks"],
+            *(sample["phase_ticks"][phase] for phase in PHASE_IDS),
+            sample["interval_capacity"],
+            sample["interval_count"],
+            int(sample["intervals_complete"]),
+        ]
+        for word in prefix_words:
+            accumulator = fold_word(accumulator, word)
+        for interval in sample["intervals"]:
+            for word in (
+                INTERVAL_DOMAIN_WORD,
+                interval["sequence"],
+                PHASE_CODES[interval["phase"]],
+                interval["start_offset_ticks"],
+                interval["end_offset_ticks"],
+            ):
+                accumulator = fold_word(accumulator, word)
+        suffix_words = [
+            sample["read_chunks"],
+            sample["write_chunks"],
+            sample["fuel_consumed"],
+            sample["poll_quanta"],
+            1,
+            sample["logical_live_after"],
+            int(sample["timed_out"]),
+            0,
+            sample["exit_status"],
+            sample["stdout_bytes"],
+            *stdout_digest_words(sample["stdout_sha256"]),
+            sample["stderr_bytes"],
+        ]
+        for word in suffix_words:
+            accumulator = fold_word(accumulator, word)
+    return accumulator
+
+
+def expected_run_id(meta: dict[str, Any]) -> str:
+    contract = TRANSCRIPT_CONTRACT["run_id"]
+    values = [contract["domain"], *(meta[field] for field in contract["fields"])]
+    require(all(type(value) is str and "\0" not in value for value in values), "run-id field is not plain ASCII text")
+    try:
+        payload = "\0".join(values).encode("ascii")
+    except UnicodeEncodeError as error:
+        raise VerificationError("run-id field is not ASCII") from error
+    return hashlib.sha256(payload).hexdigest()
+
+
+def verify_transcript_meta(
+    meta: dict[str, Any],
+    *,
+    expected_source: str,
+    expected_challenge: str,
+) -> None:
+    exact_keys(meta, META_KEYS, "metadata")
+    fixed = {
+        "schema": "vibeos.wasm-aot-decision.meta",
+        "version": 1,
+        "suite_id": "vibeos.c84.aot-decision",
+        "workload_revision": 1,
+        "manifest_sha256": EXPECTED_MANIFEST_SHA256,
+        "transcript_schema_sha256": EXPECTED_SCHEMA_SHA256,
+        "platform": "milkv-duo-cv1800b",
+        "decision_eligible": True,
+        "clock": "riscv.rdtime",
+        "timebase_hz": 25_000_000,
+        "hart_id": 0,
+        "hart_count": 1,
+        "transcript_scope": "single-cold-boot",
+        "required_cold_boots": 3,
+        "samples_per_boot": SAMPLES_PER_BOOT,
+        "warmup_per_boot": WARMUPS_PER_BOOT,
+        "retained_per_boot": RETAINED_PER_BOOT,
+        "workload_id": "ssh-case-filter-12k-v1",
+        "artifact_sha256": EXPECTED_COMPONENT_SHA256,
+        "artifact_bytes": EXPECTED_COMPONENT_BYTES,
+        "input_sha256": INPUT_SHA256,
+        "input_bytes": len(INPUT_BYTES),
+        "output_sha256": OUTPUT_SHA256,
+        "output_bytes": len(OUTPUT_BYTES),
+        "budget_ticks": 2_500_000,
+    }
+    for field, expected in fixed.items():
+        exact_literal(meta[field], expected, f"metadata.{field}")
+    source = exact_commit(meta["source_commit"], "metadata.source_commit")
+    challenge = exact_sha256(meta["challenge"], "metadata.challenge")
+    exact_literal(source, exact_commit(expected_source, "expected source"), "metadata.source_commit")
+    exact_literal(
+        challenge,
+        exact_sha256(expected_challenge, "expected challenge"),
+        "metadata.challenge",
+    )
+    run_id = exact_sha256(meta["run_id"], "metadata.run_id")
+    require(run_id == expected_run_id(meta), "metadata run id does not bind the campaign")
+
+
+def verify_transcript_sample(
+    sample: dict[str, Any],
+    *,
+    position: int,
+    meta: dict[str, Any],
+) -> None:
+    label = f"sample[{position}]"
+    exact_keys(sample, SAMPLE_KEYS, label)
+    fixed = {
+        "schema": "vibeos.wasm-aot-decision.sample",
+        "version": 1,
+        "workload_id": "ssh-case-filter-12k-v1",
+        "interval_capacity": INTERVAL_CAPACITY,
+        "intervals_complete": True,
+        "read_chunks": 13,
+        "write_chunks": 13,
+        "terminal": "success",
+        "logical_live_after": 0,
+        "timed_out": False,
+        "timeout_phase": "none",
+        "exit_status": 0,
+        "stdout_bytes": len(OUTPUT_BYTES),
+        "stdout_sha256": OUTPUT_SHA256,
+        "stderr_bytes": 0,
+    }
+    for field, expected in fixed.items():
+        exact_literal(sample[field], expected, f"{label}.{field}")
+    exact_literal(exact_sha256(sample["run_id"], f"{label}.run_id"), meta["run_id"], f"{label}.run_id")
+    exact_literal(
+        exact_sha256(sample["challenge"], f"{label}.challenge"),
+        meta["challenge"],
+        f"{label}.challenge",
+    )
+    exact_literal(exact_int(sample["sequence"], f"{label}.sequence", maximum=23), position, f"{label}.sequence")
+    exact_literal(
+        exact_int(sample["sample_index"], f"{label}.sample_index", maximum=23),
+        position,
+        f"{label}.sample_index",
+    )
+    exact_literal(
+        exact_bool(sample["warmup"], f"{label}.warmup"),
+        position < WARMUPS_PER_BOOT,
+        f"{label}.warmup",
+    )
+    total_ticks = exact_int(sample["total_ticks"], f"{label}.total_ticks", minimum=1)
+    exact_int(sample["fuel_consumed"], f"{label}.fuel_consumed", minimum=1, maximum=500_000)
+    exact_int(sample["poll_quanta"], f"{label}.poll_quanta", minimum=1)
+
+    phase_ticks = exact_keys(sample["phase_ticks"], set(PHASE_IDS), f"{label}.phase_ticks")
+    declared_phase_ticks = {
+        phase: exact_int(phase_ticks[phase], f"{label}.phase_ticks.{phase}") for phase in PHASE_IDS
+    }
+    require(sum(declared_phase_ticks.values()) == total_ticks, f"{label} phase ticks do not sum to total")
+
+    intervals = sample["intervals"]
+    require(type(intervals) is list, f"{label}.intervals must be an array")
+    require(1 <= len(intervals) <= INTERVAL_CAPACITY, f"{label}.intervals length is out of range")
+    interval_count = exact_int(
+        sample["interval_count"],
+        f"{label}.interval_count",
+        minimum=1,
+        maximum=INTERVAL_CAPACITY,
+    )
+    require(interval_count == len(intervals), f"{label} interval count differs from array length")
+
+    observed_phase_ticks = {phase: 0 for phase in PHASE_IDS}
+    previous_end = 0
+    previous_phase: str | None = None
+    for interval_index, interval in enumerate(intervals):
+        interval_label = f"{label}.intervals[{interval_index}]"
+        exact_keys(interval, INTERVAL_KEYS, interval_label)
+        exact_literal(
+            exact_int(interval["sequence"], f"{interval_label}.sequence", maximum=65_535),
+            interval_index,
+            f"{interval_label}.sequence",
+        )
+        phase = exact_text(interval["phase"], f"{interval_label}.phase")
+        require(phase in PHASE_CODES, f"{interval_label}.phase is not canonical")
+        require(phase != previous_phase, f"{interval_label} repeats an adjacent phase")
+        start = exact_int(interval["start_offset_ticks"], f"{interval_label}.start_offset_ticks")
+        end = exact_int(interval["end_offset_ticks"], f"{interval_label}.end_offset_ticks", minimum=1)
+        require(start == previous_end, f"{interval_label} has a gap or overlap")
+        require(end > start, f"{interval_label} is empty or reversed")
+        observed_phase_ticks[phase] += end - start
+        require(observed_phase_ticks[phase] <= U64_MAX, f"{interval_label} phase total overflows u64")
+        previous_end = end
+        previous_phase = phase
+    require(previous_end == total_ticks, f"{label} intervals do not cover total_ticks")
+    require(observed_phase_ticks == declared_phase_ticks, f"{label} interval phase totals differ")
+
+
+def nearest_rank(values: list[int], percentile: int) -> int:
+    require(values, "nearest-rank input is empty")
+    exact_int(percentile, "percentile", minimum=1, maximum=100)
+    ordered = sorted(values)
+    return ordered[(percentile * len(ordered) + 99) // 100 - 1]
+
+
+def retained_stability_passes(values: list[int]) -> bool:
+    return nearest_rank(values, 95) * 100 <= nearest_rank(values, 50) * 150
+
+
+def verify_transcript_end(
+    ending: dict[str, Any],
+    *,
+    samples: list[dict[str, Any]],
+    meta: dict[str, Any],
+) -> None:
+    exact_keys(ending, END_KEYS, "end")
+    fixed = {
+        "schema": "vibeos.wasm-aot-decision.end",
+        "version": 1,
+        "samples": SAMPLES_PER_BOOT,
+        "warmups": WARMUPS_PER_BOOT,
+        "retained": RETAINED_PER_BOOT,
+    }
+    for field, expected in fixed.items():
+        exact_literal(ending[field], expected, f"end.{field}")
+    exact_literal(exact_sha256(ending["run_id"], "end.run_id"), meta["run_id"], "end.run_id")
+    exact_literal(
+        exact_sha256(ending["challenge"], "end.challenge"),
+        meta["challenge"],
+        "end.challenge",
+    )
+    observed = exact_int(ending["accumulator"], "end.accumulator")
+    require(observed == transcript_accumulator(samples), "end accumulator differs")
+
+
+def verify_transcript_bytes(
+    raw: bytes,
+    *,
+    expected_source: str,
+    expected_challenge: str,
+) -> VerifiedBootTranscript:
+    require(
+        0 < len(raw) <= MAX_RAW_TRANSCRIPT_BYTES,
+        f"transcript byte length is outside [1, {MAX_RAW_TRANSCRIPT_BYTES}]",
+    )
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise VerificationError(f"transcript is not strict UTF-8: {error}") from error
+    lowered = text.lower()
+    for marker in FAILURE_MARKERS:
+        require(marker.lower() not in lowered, f"transcript contains failure marker {marker!r}")
+
+    records: list[tuple[str, dict[str, Any]]] = []
+    for line in text.splitlines():
+        matched = 0
+        for kind, prefix in (("meta", META_PREFIX), ("sample", SAMPLE_PREFIX), ("end", END_PREFIX)):
+            record = parse_record(line, prefix, kind)
+            if record is not None:
+                records.append((kind, record))
+                matched += 1
+        require(matched <= 1, "one serial line contains multiple record markers")
+
+    expected_kinds = ["meta", *(["sample"] * SAMPLES_PER_BOOT), "end"]
+    require([kind for kind, _ in records] == expected_kinds, "record count or order differs")
+    meta = records[0][1]
+    samples = [record for kind, record in records if kind == "sample"]
+    ending = records[-1][1]
+    verify_transcript_meta(
+        meta,
+        expected_source=expected_source,
+        expected_challenge=expected_challenge,
+    )
+    for position, sample in enumerate(samples):
+        verify_transcript_sample(sample, position=position, meta=meta)
+    retained_ticks = [sample["total_ticks"] for sample in samples if not sample["warmup"]]
+    require(len(retained_ticks) == RETAINED_PER_BOOT, "retained sample count differs")
+    require(
+        retained_stability_passes(retained_ticks),
+        "single-boot retained stability exceeds 1.50",
+    )
+    verify_transcript_end(ending, samples=samples, meta=meta)
+    return VerifiedBootTranscript(
+        metadata=meta,
+        samples=samples,
+        ending=ending,
+        raw_sha256=hashlib.sha256(raw).hexdigest(),
+        raw_bytes=len(raw),
+    )
+
+
+def distribution(values: list[int]) -> dict[str, int]:
+    require(values, "distribution input is empty")
+    ordered = sorted(values)
+    return {
+        "min": ordered[0],
+        "p50": nearest_rank(ordered, 50),
+        "p95": nearest_rank(ordered, 95),
+        "max": ordered[-1],
+        "mean": sum(ordered) // len(ordered),
+    }
+
+
+def derive_boot_summary(verified: VerifiedBootTranscript, *, boot_index: int) -> dict[str, Any]:
+    exact_int(boot_index, "boot index", maximum=2)
+    retained = [sample for sample in verified.samples if not sample["warmup"]]
+    retained_samples = [
+        {
+            "sample_index": sample["sample_index"],
+            "total_ticks": sample["total_ticks"],
+            "interpretation_ticks": sample["phase_ticks"]["interpretation"],
+            "non_interpretation_ticks": sample["total_ticks"]
+            - sample["phase_ticks"]["interpretation"],
+        }
+        for sample in retained
+    ]
+    totals = [sample["total_ticks"] for sample in retained_samples]
+    interpretation = [sample["interpretation_ticks"] for sample in retained_samples]
+    non_interpretation = [sample["non_interpretation_ticks"] for sample in retained_samples]
+    total_distribution = distribution(totals)
+    return {
+        "schema": "vibeos.wasm-aot-decision.boot-summary",
+        "version": 1,
+        "suite_id": "vibeos.c84.aot-decision",
+        "workload_revision": 1,
+        "scope": "single-boot-transcript-semantics-only-no-aot-decision",
+        "physical_provenance": "unverified",
+        "cold_boot_provenance": "unverified",
+        "source_commit": verified.metadata["source_commit"],
+        "challenge": verified.metadata["challenge"],
+        "run_id": verified.metadata["run_id"],
+        "manifest_sha256": verified.metadata["manifest_sha256"],
+        "transcript_schema_sha256": verified.metadata["transcript_schema_sha256"],
+        "platform": verified.metadata["platform"],
+        "boot_index": boot_index,
+        "required_cold_boots": 3,
+        "warmups": WARMUPS_PER_BOOT,
+        "retained": RETAINED_PER_BOOT,
+        "timebase_hz": verified.metadata["timebase_hz"],
+        "raw_transcript_sha256": verified.raw_sha256,
+        "raw_transcript_bytes": verified.raw_bytes,
+        "end_accumulator": verified.ending["accumulator"],
+        "retained_samples": retained_samples,
+        "statistics": {
+            "total_ticks": total_distribution,
+            "interpretation_ticks": distribution(interpretation),
+            "non_interpretation_ticks": distribution(non_interpretation),
+            "stability": {
+                "criterion": "p95(total_ticks) * 100 <= p50(total_ticks) * 150",
+                "passed": retained_stability_passes(totals),
+            },
+        },
+    }
+
+
+def verify_derived_summary(value: Any, expected: dict[str, Any]) -> None:
+    exact_literal(value, expected, "checked boot summary")
+
+
+def serialize_transcript(
+    meta: dict[str, Any],
+    samples: list[dict[str, Any]],
+    ending: dict[str, Any],
+) -> bytes:
+    def compact(value: dict[str, Any]) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+    lines = ["VibeOS C8.4 synthetic boot"]
+    lines.append(META_PREFIX + compact(meta))
+    lines.extend(SAMPLE_PREFIX + compact(sample) for sample in samples)
+    lines.append(END_PREFIX + compact(ending))
+    lines.append("VibeOS C8.4 synthetic trailer")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def synthetic_transcript_records() -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    source = "a" * 40
+    challenge = "b" * 64
+    meta = {
+        "schema": "vibeos.wasm-aot-decision.meta",
+        "version": 1,
+        "suite_id": "vibeos.c84.aot-decision",
+        "workload_revision": 1,
+        "source_commit": source,
+        "challenge": challenge,
+        "run_id": "1" * 64,
+        "manifest_sha256": EXPECTED_MANIFEST_SHA256,
+        "transcript_schema_sha256": EXPECTED_SCHEMA_SHA256,
+        "platform": "milkv-duo-cv1800b",
+        "decision_eligible": True,
+        "clock": "riscv.rdtime",
+        "timebase_hz": 25_000_000,
+        "hart_id": 0,
+        "hart_count": 1,
+        "transcript_scope": "single-cold-boot",
+        "required_cold_boots": 3,
+        "samples_per_boot": SAMPLES_PER_BOOT,
+        "warmup_per_boot": WARMUPS_PER_BOOT,
+        "retained_per_boot": RETAINED_PER_BOOT,
+        "workload_id": "ssh-case-filter-12k-v1",
+        "artifact_sha256": EXPECTED_COMPONENT_SHA256,
+        "artifact_bytes": EXPECTED_COMPONENT_BYTES,
+        "input_sha256": INPUT_SHA256,
+        "input_bytes": len(INPUT_BYTES),
+        "output_sha256": OUTPUT_SHA256,
+        "output_bytes": len(OUTPUT_BYTES),
+        "budget_ticks": 2_500_000,
+    }
+    meta["run_id"] = expected_run_id(meta)
+    samples: list[dict[str, Any]] = []
+    for sample_index in range(SAMPLES_PER_BOOT):
+        durations = [10, 20, 30, 40, 50, 60, 70 + sample_index]
+        phase_ticks = dict(zip(PHASE_IDS, durations, strict=True))
+        intervals: list[dict[str, Any]] = []
+        start = 0
+        for interval_index, (phase, duration) in enumerate(zip(PHASE_IDS, durations, strict=True)):
+            end = start + duration
+            intervals.append(
+                {
+                    "sequence": interval_index,
+                    "phase": phase,
+                    "start_offset_ticks": start,
+                    "end_offset_ticks": end,
+                }
+            )
+            start = end
+        samples.append(
+            {
+                "schema": "vibeos.wasm-aot-decision.sample",
+                "version": 1,
+                "run_id": meta["run_id"],
+                "challenge": challenge,
+                "sequence": sample_index,
+                "sample_index": sample_index,
+                "warmup": sample_index < WARMUPS_PER_BOOT,
+                "workload_id": "ssh-case-filter-12k-v1",
+                "total_ticks": start,
+                "phase_ticks": phase_ticks,
+                "interval_capacity": INTERVAL_CAPACITY,
+                "interval_count": len(intervals),
+                "intervals_complete": True,
+                "intervals": intervals,
+                "read_chunks": 13,
+                "write_chunks": 13,
+                "fuel_consumed": 1000 + sample_index,
+                "poll_quanta": 2000 + sample_index,
+                "terminal": "success",
+                "logical_live_after": 0,
+                "timed_out": False,
+                "timeout_phase": "none",
+                "exit_status": 0,
+                "stdout_bytes": len(OUTPUT_BYTES),
+                "stdout_sha256": OUTPUT_SHA256,
+                "stderr_bytes": 0,
+            }
+        )
+    ending = {
+        "schema": "vibeos.wasm-aot-decision.end",
+        "version": 1,
+        "run_id": meta["run_id"],
+        "challenge": challenge,
+        "samples": SAMPLES_PER_BOOT,
+        "warmups": WARMUPS_PER_BOOT,
+        "retained": RETAINED_PER_BOOT,
+        "accumulator": transcript_accumulator(samples),
+    }
+    return meta, samples, ending
 
 
 def selftest(manifest: dict[str, Any], schema: dict[str, Any]) -> None:
@@ -1383,6 +2124,21 @@ def selftest(manifest: dict[str, Any], schema: dict[str, Any]) -> None:
         ("missing-policy-field", lambda value: value["fixture"]["policy"].pop("world")),
         ("extra-policy-field", lambda value: value["fixture"]["policy"].update(extra=1)),
         ("bool-as-integer", lambda value: value["sampling"].update(cold_boots=True)),
+        ("missing-transcript-contract", lambda value: value.pop("transcript")),
+        (
+            "transcript-framing-drift",
+            lambda value: value["transcript"]["framing"].update(sample_records_per_raw=72),
+        ),
+        (
+            "transcript-run-id-drift",
+            lambda value: value["transcript"]["run_id"].update(algorithm="sha512"),
+        ),
+        (
+            "transcript-accumulator-drift",
+            lambda value: value["transcript"]["accumulator"].update(
+                update="acc = acc + word"
+            ),
+        ),
         ("integer-as-boolean", lambda value: value["scope"].update(aot_authorized=0)),
         ("budget-drift", lambda value: value["budget"].update(ticks=2_500_001)),
         ("budget-timebase-drift", lambda value: value["budget"].update(timebase_hz=1_000_000)),
@@ -1435,11 +2191,21 @@ def selftest(manifest: dict[str, Any], schema: dict[str, Any]) -> None:
                 interval_capacity="truncated intervals are accepted"
             ),
         ),
+        (
+            "publication-fuel-bound-drift",
+            lambda value: value["publication_gates"].update(
+                correctness="fuel and poll counters are unchecked"
+            ),
+        ),
     ]
     schema_mutations: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
         ("schema-id-drift", lambda value: value.update({"$id": "https://example.invalid/other"})),
         ("schema-extra-field", lambda value: value.update(extra=True)),
         ("schema-missing-def", lambda value: value["$defs"].pop("interval")),
+        (
+            "schema-u64-bound-drift",
+            lambda value: value["$defs"]["u64"].update(maximum=U64_MAX - 1),
+        ),
         ("schema-phase-drift", lambda value: value["$defs"]["phase"]["enum"].reverse()),
         (
             "schema-bool-integer",
@@ -1480,6 +2246,30 @@ def selftest(manifest: dict[str, Any], schema: dict[str, Any]) -> None:
         (
             "schema-terminal-drift",
             lambda value: value["$defs"]["sample"]["properties"]["terminal"].update(const="failed"),
+        ),
+        (
+            "schema-fuel-maximum-drift",
+            lambda value: value["$defs"]["sample"]["properties"]["fuel_consumed"].update(
+                maximum=500_001
+            ),
+        ),
+        (
+            "schema-poll-minimum-drift",
+            lambda value: value["$defs"]["sample"]["properties"].update(
+                poll_quanta={"$ref": "#/$defs/u64"}
+            ),
+        ),
+        (
+            "schema-sample-boot-index",
+            lambda value: value["$defs"]["sample"]["properties"].update(
+                cold_boot_index={"type": "integer", "minimum": 0, "maximum": 2}
+            ),
+        ),
+        (
+            "schema-meta-scope-drift",
+            lambda value: value["$defs"]["meta"]["properties"]["transcript_scope"].update(
+                const="three-cold-boots"
+            ),
         ),
         (
             "schema-required-drift",
@@ -1820,19 +2610,852 @@ def selftest(manifest: dict[str, Any], schema: dict[str, Any]) -> None:
         else:
             raise VerificationError(f"selftest accepted kernel charge mutation {name}")
 
+    synthetic_meta, synthetic_samples, synthetic_end = synthetic_transcript_records()
+    rank_vector = list(range(21))
+    require(nearest_rank(rank_vector, 50) == 10, "nearest-rank p50 vector differs")
+    require(nearest_rank(rank_vector, 95) == 19, "nearest-rank p95 vector differs")
+    require(
+        retained_stability_passes([100] * 19 + [150] * 2),
+        "stability equality boundary was rejected",
+    )
+    require(
+        not retained_stability_passes([100] * 19 + [151] * 2),
+        "stability over-boundary vector was accepted",
+    )
+    require(
+        synthetic_meta["run_id"]
+        == "89be700330cb0f73f57ea5a18a8924b4ae356b7733e45c2335dbca7a80d6601a",
+        "run-id known-answer vector differs",
+    )
+    require(
+        synthetic_end["accumulator"] == 3_004_087_110_682_629_508,
+        "accumulator known-answer vector differs",
+    )
+    synthetic_raw = serialize_transcript(synthetic_meta, synthetic_samples, synthetic_end)
+    verified = verify_transcript_bytes(
+        synthetic_raw,
+        expected_source="a" * 40,
+        expected_challenge="b" * 64,
+    )
+    summary = derive_boot_summary(verified, boot_index=0)
+    verify_derived_summary(copy.deepcopy(summary), summary)
+
+    maximum_meta, maximum_samples, maximum_end = synthetic_transcript_records()
+    for sample in maximum_samples:
+        sample["total_ticks"] = U64_MAX
+        sample["phase_ticks"] = {phase: 0 for phase in PHASE_IDS}
+        sample["phase_ticks"]["validation"] = U64_MAX
+        sample["interval_count"] = 1
+        sample["intervals"] = [
+            {
+                "sequence": 0,
+                "phase": "validation",
+                "start_offset_ticks": 0,
+                "end_offset_ticks": U64_MAX,
+            }
+        ]
+    maximum_end["accumulator"] = transcript_accumulator(maximum_samples)
+    maximum_verified = verify_transcript_bytes(
+        serialize_transcript(maximum_meta, maximum_samples, maximum_end),
+        expected_source="a" * 40,
+        expected_challenge="b" * 64,
+    )
+    maximum_summary = derive_boot_summary(maximum_verified, boot_index=2)
+    maximum_summary_bytes = (
+        json.dumps(maximum_summary, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    verify_derived_summary(
+        strict_json_bytes(maximum_summary_bytes, "maximum-u64 boot summary"),
+        maximum_summary,
+    )
+
+    def mutate_transcript(
+        mutation: Callable[[dict[str, Any], list[dict[str, Any]], dict[str, Any]], None],
+        *,
+        refresh_accumulator: bool = False,
+    ) -> bytes:
+        meta, samples, ending = synthetic_transcript_records()
+        mutation(meta, samples, ending)
+        if refresh_accumulator:
+            ending["accumulator"] = transcript_accumulator(samples)
+        return serialize_transcript(meta, samples, ending)
+
+    def swap_samples(
+        _meta: dict[str, Any], samples: list[dict[str, Any]], _ending: dict[str, Any]
+    ) -> None:
+        samples[3], samples[4] = samples[4], samples[3]
+
+    def adjacent_same_phase(
+        _meta: dict[str, Any], samples: list[dict[str, Any]], _ending: dict[str, Any]
+    ) -> None:
+        sample = samples[3]
+        interval = sample["intervals"][1]
+        duration = interval["end_offset_ticks"] - interval["start_offset_ticks"]
+        interval["phase"] = "validation"
+        sample["phase_ticks"]["validation"] += duration
+        sample["phase_ticks"]["instantiation"] = 0
+
+    def valid_interval_change_with_stale_accumulator(
+        _meta: dict[str, Any], samples: list[dict[str, Any]], _ending: dict[str, Any]
+    ) -> None:
+        sample = samples[3]
+        sample["total_ticks"] += 1
+        sample["phase_ticks"]["cleanup"] += 1
+        sample["intervals"][-1]["end_offset_ticks"] += 1
+
+    def unstable_retained(
+        _meta: dict[str, Any], samples: list[dict[str, Any]], _ending: dict[str, Any]
+    ) -> None:
+        for index in (22, 23):
+            sample = samples[index]
+            interval = sample["intervals"][-1]
+            interval["end_offset_ticks"] = 10_000
+            sample["total_ticks"] = 10_000
+            sample["phase_ticks"]["cleanup"] = 10_000 - interval["start_offset_ticks"]
+
+    transcript_mutations: list[
+        tuple[
+            str,
+            Callable[[dict[str, Any], list[dict[str, Any]], dict[str, Any]], None],
+            bool,
+        ]
+    ] = [
+        ("metadata-missing-field", lambda meta, _samples, _end: meta.pop("clock"), False),
+        ("metadata-extra-field", lambda meta, _samples, _end: meta.update(extra=1), False),
+        ("metadata-run-id", lambda meta, _samples, _end: meta.update(run_id="c" * 64), False),
+        (
+            "metadata-source",
+            lambda meta, _samples, _end: meta.update(source_commit="c" * 40),
+            False,
+        ),
+        (
+            "metadata-challenge",
+            lambda meta, _samples, _end: meta.update(challenge="c" * 64),
+            False,
+        ),
+        (
+            "metadata-manifest-hash",
+            lambda meta, _samples, _end: meta.update(manifest_sha256="c" * 64),
+            False,
+        ),
+        (
+            "metadata-schema-hash",
+            lambda meta, _samples, _end: meta.update(transcript_schema_sha256="c" * 64),
+            False,
+        ),
+        (
+            "metadata-scope",
+            lambda meta, _samples, _end: meta.update(transcript_scope="three-cold-boots"),
+            False,
+        ),
+        ("missing-sample", lambda _meta, samples, _end: samples.pop(), False),
+        (
+            "extra-sample",
+            lambda _meta, samples, _end: samples.append(copy.deepcopy(samples[-1])),
+            False,
+        ),
+        ("reordered-samples", swap_samples, False),
+        (
+            "sample-sequence",
+            lambda _meta, samples, _end: samples[3].update(sequence=4),
+            False,
+        ),
+        (
+            "sample-index",
+            lambda _meta, samples, _end: samples[3].update(sample_index=4),
+            False,
+        ),
+        (
+            "sample-warmup",
+            lambda _meta, samples, _end: samples[3].update(warmup=True),
+            False,
+        ),
+        (
+            "sample-bool-as-int",
+            lambda _meta, samples, _end: samples[3].update(warmup=0),
+            False,
+        ),
+        (
+            "sample-run-id",
+            lambda _meta, samples, _end: samples[3].update(run_id="c" * 64),
+            False,
+        ),
+        (
+            "sample-challenge",
+            lambda _meta, samples, _end: samples[3].update(challenge="c" * 64),
+            False,
+        ),
+        (
+            "sample-float",
+            lambda _meta, samples, _end: samples[3].update(total_ticks=1.5),
+            False,
+        ),
+        (
+            "phase-total",
+            lambda _meta, samples, _end: samples[3]["phase_ticks"].update(host=51),
+            False,
+        ),
+        (
+            "interval-count",
+            lambda _meta, samples, _end: samples[3].update(interval_count=6),
+            False,
+        ),
+        (
+            "empty-intervals",
+            lambda _meta, samples, _end: samples[3].update(interval_count=0, intervals=[]),
+            False,
+        ),
+        (
+            "interval-sequence",
+            lambda _meta, samples, _end: samples[3]["intervals"][1].update(sequence=2),
+            False,
+        ),
+        (
+            "interval-gap",
+            lambda _meta, samples, _end: samples[3]["intervals"][1].update(
+                start_offset_ticks=11
+            ),
+            True,
+        ),
+        (
+            "interval-overlap",
+            lambda _meta, samples, _end: samples[3]["intervals"][1].update(
+                start_offset_ticks=9
+            ),
+            True,
+        ),
+        (
+            "interval-reversed",
+            lambda _meta, samples, _end: samples[3]["intervals"][1].update(
+                end_offset_ticks=10
+            ),
+            True,
+        ),
+        (
+            "interval-phase",
+            lambda _meta, samples, _end: samples[3]["intervals"][1].update(phase="other"),
+            False,
+        ),
+        ("adjacent-same-phase", adjacent_same_phase, True),
+        (
+            "interval-tail",
+            lambda _meta, samples, _end: samples[3]["intervals"][-1].update(
+                end_offset_ticks=282
+            ),
+            True,
+        ),
+        (
+            "interval-change-stale-accumulator",
+            valid_interval_change_with_stale_accumulator,
+            False,
+        ),
+        (
+            "sample-incomplete",
+            lambda _meta, samples, _end: samples[3].update(intervals_complete=False),
+            False,
+        ),
+        (
+            "sample-capacity",
+            lambda _meta, samples, _end: samples[3].update(interval_capacity=4096),
+            False,
+        ),
+        (
+            "sample-fuel-zero",
+            lambda _meta, samples, _end: samples[3].update(fuel_consumed=0),
+            False,
+        ),
+        (
+            "sample-fuel-over-budget",
+            lambda _meta, samples, _end: samples[3].update(fuel_consumed=500_001),
+            False,
+        ),
+        (
+            "sample-polls-zero",
+            lambda _meta, samples, _end: samples[3].update(poll_quanta=0),
+            False,
+        ),
+        (
+            "sample-output-hash",
+            lambda _meta, samples, _end: samples[3].update(stdout_sha256="c" * 64),
+            False,
+        ),
+        ("end-count", lambda _meta, _samples, end: end.update(samples=23), False),
+        ("end-run-id", lambda _meta, _samples, end: end.update(run_id="c" * 64), False),
+        (
+            "end-challenge",
+            lambda _meta, _samples, end: end.update(challenge="c" * 64),
+            False,
+        ),
+        (
+            "end-accumulator",
+            lambda _meta, _samples, end: end.update(accumulator=end["accumulator"] ^ 1),
+            False,
+        ),
+        (
+            "end-accumulator-overflow",
+            lambda _meta, _samples, end: end.update(accumulator=U64_MAX + 1),
+            False,
+        ),
+        ("unstable-retained", unstable_retained, True),
+    ]
+    for name, mutation, refresh_accumulator in transcript_mutations:
+        candidate = mutate_transcript(mutation, refresh_accumulator=refresh_accumulator)
+        try:
+            verify_transcript_bytes(
+                candidate,
+                expected_source="a" * 40,
+                expected_challenge="b" * 64,
+            )
+        except VerificationError:
+            rejected += 1
+        else:
+            raise VerificationError(f"selftest accepted transcript mutation {name}")
+
+    raw_mutations = {
+        "missing-meta": synthetic_raw.replace(
+            next(line for line in synthetic_raw.splitlines(keepends=True) if line.startswith(META_PREFIX.encode())),
+            b"",
+            1,
+        ),
+        "missing-end": synthetic_raw.replace(
+            next(line for line in synthetic_raw.splitlines(keepends=True) if line.startswith(END_PREFIX.encode())),
+            b"",
+            1,
+        ),
+        "duplicate-end": synthetic_raw
+        + next(line for line in synthetic_raw.splitlines(keepends=True) if line.startswith(END_PREFIX.encode())),
+        "prefixed-sample-marker": synthetic_raw.replace(
+            SAMPLE_PREFIX.encode(), b"noise " + SAMPLE_PREFIX.encode(), 1
+        ),
+        "duplicate-json-member": synthetic_raw.replace(
+            META_PREFIX.encode() + b"{",
+            META_PREFIX.encode() + b'{"schema":"duplicate",',
+            1,
+        ),
+        "fatal-after-end": synthetic_raw + b"[!] panic: after end\n",
+        "non-utf8": synthetic_raw + b"\xff\n",
+        "empty": b"",
+        "oversized-integer": synthetic_raw.replace(
+            b'"version":1',
+            b'"version":' + b"1" * 5_000,
+            1,
+        ),
+        "excessive-json-depth": synthetic_raw.replace(
+            b'"version":1',
+            b'"version":' + b"[" * 2_000 + b"1" + b"]" * 2_000,
+            1,
+        ),
+    }
+    for marker in FAILURE_MARKERS:
+        raw_mutations[f"failure-marker-{marker}"] = synthetic_raw + marker.encode("ascii") + b"\n"
+    for name, candidate in raw_mutations.items():
+        try:
+            verify_transcript_bytes(
+                candidate,
+                expected_source="a" * 40,
+                expected_challenge="b" * 64,
+            )
+        except VerificationError:
+            rejected += 1
+        else:
+            raise VerificationError(f"selftest accepted raw transcript mutation {name}")
+
+    for name, source, challenge in (
+        ("wrong-expected-source", "c" * 40, "b" * 64),
+        ("wrong-expected-challenge", "a" * 40, "c" * 64),
+    ):
+        try:
+            verify_transcript_bytes(
+                synthetic_raw,
+                expected_source=source,
+                expected_challenge=challenge,
+            )
+        except VerificationError:
+            rejected += 1
+        else:
+            raise VerificationError(f"selftest accepted {name}")
+
+    changed_summary = copy.deepcopy(summary)
+    changed_summary["statistics"]["total_ticks"]["p95"] += 1
+    try:
+        verify_derived_summary(changed_summary, summary)
+    except VerificationError:
+        rejected += 1
+    else:
+        raise VerificationError("selftest accepted changed boot summary")
+
+    with tempfile.TemporaryDirectory(prefix="vibeos-c84-transcript-selftest-", dir="/tmp") as name:
+        temporary_root = pathlib.Path(name)
+        transcript_path = temporary_root / "uart.log"
+        transcript_path.write_bytes(synthetic_raw)
+        observed_raw, resolved_transcript = read_stable_regular_file(
+            transcript_path,
+            maximum_bytes=MAX_RAW_TRANSCRIPT_BYTES,
+            label="selftest transcript",
+        )
+        require(observed_raw == synthetic_raw, "selftest stable transcript read differs")
+
+        summary_path = temporary_root / "summary.json"
+        summary_target = prepare_summary_output_target(
+            summary_path,
+            transcript=resolved_transcript,
+            overwrite=False,
+        )
+        try:
+            write_json_atomic(summary_target, summary)
+            checked_raw = read_stable_regular_at(
+                summary_target,
+                maximum_bytes=MAX_BOOT_SUMMARY_BYTES,
+                label="selftest summary",
+            )
+            verify_derived_summary(strict_json_bytes(checked_raw, "selftest summary"), summary)
+        finally:
+            os.close(summary_target.directory_fd)
+        overwrite_target = prepare_summary_output_target(
+            summary_path,
+            transcript=resolved_transcript,
+            overwrite=True,
+        )
+        try:
+            write_json_atomic(overwrite_target, summary)
+            overwritten_raw = read_stable_regular_at(
+                overwrite_target,
+                maximum_bytes=MAX_BOOT_SUMMARY_BYTES,
+                label="selftest overwritten summary",
+            )
+            verify_derived_summary(
+                strict_json_bytes(overwritten_raw, "selftest overwritten summary"),
+                summary,
+            )
+        finally:
+            os.close(overwrite_target.directory_fd)
+
+        def reject_no_clobber_publish_race() -> None:
+            race_path = temporary_root / "raced-summary.json"
+            race_target = prepare_summary_output_target(
+                race_path,
+                transcript=resolved_transcript,
+                overwrite=False,
+            )
+            sentinel = b"preexisting-race-winner\n"
+            try:
+                race_path.write_bytes(sentinel)
+                try:
+                    write_json_atomic(race_target, summary)
+                except VerificationError:
+                    if race_path.read_bytes() != sentinel:
+                        raise RuntimeError("no-clobber race modified the winning file")
+                    raise
+            finally:
+                os.close(race_target.directory_fd)
+
+        def reject_replaced_output_parent() -> None:
+            output_parent = temporary_root / "checked-output-parent"
+            output_path = output_parent / "summary.json"
+            target = prepare_summary_output_target(
+                output_path,
+                transcript=resolved_transcript,
+                overwrite=True,
+            )
+            moved_parent = temporary_root / "moved-output-parent"
+            replacement_parent = temporary_root / "replacement-output-parent"
+            output_parent.rename(moved_parent)
+            replacement_parent.mkdir()
+            output_parent.symlink_to(replacement_parent, target_is_directory=True)
+            try:
+                try:
+                    write_json_atomic(target, summary)
+                except VerificationError:
+                    if (replacement_parent / "summary.json").exists():
+                        raise RuntimeError("replaced output parent received summary bytes")
+                    raise
+            finally:
+                os.close(target.directory_fd)
+
+        def reject_dirfd_fifo_read() -> None:
+            fifo_output = temporary_root / "summary-output.fifo"
+            target = prepare_summary_output_target(
+                fifo_output,
+                transcript=resolved_transcript,
+                overwrite=False,
+            )
+            os.mkfifo(fifo_output, 0o600)
+            try:
+                read_stable_regular_at(
+                    target,
+                    maximum_bytes=MAX_BOOT_SUMMARY_BYTES,
+                    label="selftest dirfd FIFO summary",
+                )
+            finally:
+                os.close(target.directory_fd)
+
+        rejection_checks: list[tuple[str, Callable[[], Any]]] = []
+        transcript_alias = temporary_root / "transcript-alias.json"
+        os.link(transcript_path, transcript_alias)
+        rejection_checks.append(
+            (
+                "hardlink-output-alias",
+                lambda: prepare_summary_output_target(
+                    transcript_alias,
+                    transcript=resolved_transcript,
+                    overwrite=True,
+                ),
+            )
+        )
+        transcript_symlink = temporary_root / "transcript-symlink.log"
+        transcript_symlink.symlink_to(transcript_path)
+        rejection_checks.append(
+            (
+                "symlink-transcript",
+                lambda: read_stable_regular_file(
+                    transcript_symlink,
+                    maximum_bytes=MAX_RAW_TRANSCRIPT_BYTES,
+                    label="selftest symlink transcript",
+                ),
+            )
+        )
+        summary_symlink = temporary_root / "summary-symlink.json"
+        summary_symlink.symlink_to(summary_path)
+        rejection_checks.append(
+            (
+                "symlink-summary-output",
+                lambda: prepare_summary_output_target(
+                    summary_symlink,
+                    transcript=resolved_transcript,
+                    overwrite=True,
+                ),
+            )
+        )
+        empty_path = temporary_root / "empty.log"
+        empty_path.touch()
+        fifo_path = temporary_root / "serial.fifo"
+        os.mkfifo(fifo_path, 0o600)
+        rejection_checks.extend(
+            [
+                (
+                    "existing-summary-no-clobber",
+                    lambda: prepare_summary_output_target(
+                        summary_path,
+                        transcript=resolved_transcript,
+                        overwrite=False,
+                    ),
+                ),
+                ("no-clobber-publish-race", reject_no_clobber_publish_race),
+                ("replaced-output-parent", reject_replaced_output_parent),
+                ("dirfd-fifo-read", reject_dirfd_fifo_read),
+                (
+                    "stable-read-size-bound",
+                    lambda: read_stable_regular_file(
+                        transcript_path,
+                        maximum_bytes=len(synthetic_raw) - 1,
+                        label="selftest oversized transcript",
+                    ),
+                ),
+                (
+                    "empty-stable-input",
+                    lambda: read_stable_regular_file(
+                        empty_path,
+                        maximum_bytes=MAX_RAW_TRANSCRIPT_BYTES,
+                        label="selftest empty transcript",
+                    ),
+                ),
+                (
+                    "fifo-stable-input",
+                    lambda: read_stable_regular_file(
+                        fifo_path,
+                        maximum_bytes=MAX_RAW_TRANSCRIPT_BYTES,
+                        label="selftest FIFO transcript",
+                    ),
+                ),
+            ]
+        )
+        for protected in VERIFIER_INPUT_PATHS:
+            rejection_checks.append(
+                (
+                    f"protected-output-{protected.relative_to(ROOT)}",
+                    lambda protected=protected: prepare_summary_output_target(
+                        protected,
+                        transcript=resolved_transcript,
+                        overwrite=True,
+                    ),
+                )
+            )
+        for name, check in rejection_checks:
+            try:
+                check()
+            except VerificationError:
+                rejected += 1
+            else:
+                raise VerificationError(f"selftest accepted host-file mutation {name}")
+
     print(
         "verify-c84-aot-decision.py selftest: "
         f"PASS ({rejected} mutations rejected)"
     )
 
 
+def file_stat_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def read_stable_regular_file(
+    path: pathlib.Path,
+    *,
+    maximum_bytes: int,
+    label: str,
+) -> tuple[bytes, pathlib.Path]:
+    resolved = path.resolve(strict=True)
+    initial = os.lstat(path)
+    require(stat.S_ISREG(initial.st_mode), f"{label} must be a regular file, not a symlink or special file")
+    require(0 < initial.st_size <= maximum_bytes, f"{label} byte length is outside [1, {maximum_bytes}]")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+    )
+    with os.fdopen(descriptor, "rb") as source:
+        opened = os.fstat(source.fileno())
+        require(
+            file_stat_identity(opened) == file_stat_identity(initial),
+            f"{label} changed while it was opened",
+        )
+        raw = source.read(maximum_bytes + 1)
+        after_read = os.fstat(source.fileno())
+    final = os.lstat(path)
+    expected_identity = file_stat_identity(initial)
+    require(file_stat_identity(after_read) == expected_identity, f"{label} changed while it was read")
+    require(file_stat_identity(final) == expected_identity, f"{label} path changed while it was read")
+    require(
+        file_stat_identity(os.stat(resolved, follow_symlinks=False)) == expected_identity,
+        f"{label} resolved path changed while it was read",
+    )
+    require(len(raw) == initial.st_size, f"{label} read length differs from its stable size")
+    return raw, resolved
+
+
+def inode_identity(value: os.stat_result) -> tuple[int, int]:
+    return value.st_dev, value.st_ino
+
+
+def require_output_directory_binding(target: SummaryOutputTarget) -> None:
+    opened = os.fstat(target.directory_fd)
+    require(
+        inode_identity(opened) == (target.directory_device, target.directory_inode),
+        "pinned summary output directory identity changed",
+    )
+    current = os.stat(target.directory_path, follow_symlinks=False)
+    require(stat.S_ISDIR(current.st_mode), "summary output directory path is no longer a directory")
+    require(
+        inode_identity(current) == (target.directory_device, target.directory_inode),
+        "summary output directory path was replaced",
+    )
+
+
+def read_stable_regular_at(
+    target: SummaryOutputTarget,
+    *,
+    maximum_bytes: int,
+    label: str,
+) -> bytes:
+    initial = os.stat(target.basename, dir_fd=target.directory_fd, follow_symlinks=False)
+    require(stat.S_ISREG(initial.st_mode), f"{label} must be a regular file")
+    require(0 < initial.st_size <= maximum_bytes, f"{label} byte length is outside [1, {maximum_bytes}]")
+    descriptor = os.open(
+        target.basename,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+        dir_fd=target.directory_fd,
+    )
+    with os.fdopen(descriptor, "rb") as source:
+        opened = os.fstat(source.fileno())
+        require(
+            file_stat_identity(opened) == file_stat_identity(initial),
+            f"{label} changed while it was opened",
+        )
+        raw = source.read(maximum_bytes + 1)
+        after_read = os.fstat(source.fileno())
+    final = os.stat(target.basename, dir_fd=target.directory_fd, follow_symlinks=False)
+    expected_identity = file_stat_identity(initial)
+    require(file_stat_identity(after_read) == expected_identity, f"{label} changed while it was read")
+    require(file_stat_identity(final) == expected_identity, f"{label} path changed while it was read")
+    require(len(raw) == initial.st_size, f"{label} read length differs from its stable size")
+    return raw
+
+
+def write_json_atomic(target: SummaryOutputTarget, value: Any) -> None:
+    require_output_directory_binding(target)
+    rendered = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    require(len(rendered) <= MAX_BOOT_SUMMARY_BYTES, "derived boot summary exceeds its host bound")
+    temporary_name: str | None = None
+    descriptor: int | None = None
+    for _attempt in range(128):
+        candidate = f".vibeos-c84-summary-{os.getpid()}-{secrets.token_hex(12)}.tmp"
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+                dir_fd=target.directory_fd,
+            )
+        except FileExistsError:
+            continue
+        temporary_name = candidate
+        break
+    require(descriptor is not None and temporary_name is not None, "cannot allocate summary temporary file")
+    try:
+        output_descriptor = descriptor
+        descriptor = None
+        with os.fdopen(output_descriptor, "wb") as output:
+            output.write(rendered)
+            output.flush()
+            os.fsync(output.fileno())
+        if target.overwrite:
+            os.replace(
+                temporary_name,
+                target.basename,
+                src_dir_fd=target.directory_fd,
+                dst_dir_fd=target.directory_fd,
+            )
+        else:
+            try:
+                os.link(
+                    temporary_name,
+                    target.basename,
+                    src_dir_fd=target.directory_fd,
+                    dst_dir_fd=target.directory_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as error:
+                raise VerificationError(
+                    "summary output already exists; use --overwrite to replace a verified regular file"
+                ) from error
+            os.unlink(temporary_name, dir_fd=target.directory_fd)
+            temporary_name = None
+        os.fsync(target.directory_fd)
+        require_output_directory_binding(target)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=target.directory_fd)
+            except FileNotFoundError:
+                pass
+
+
+def prepare_summary_output_target(
+    path: pathlib.Path,
+    *,
+    transcript: pathlib.Path,
+    overwrite: bool,
+) -> SummaryOutputTarget:
+    require(path.name not in {"", ".", ".."}, "summary output must name a file")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    parent = path.parent.resolve(strict=True)
+    require(stat.S_ISDIR(os.lstat(parent).st_mode), "summary output parent is not a directory")
+    directory_fd = os.open(
+        parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        directory_status = os.fstat(directory_fd)
+        current_parent = os.stat(parent, follow_symlinks=False)
+        require(
+            stat.S_ISDIR(directory_status.st_mode)
+            and inode_identity(directory_status) == inode_identity(current_parent),
+            "summary output parent changed while it was opened",
+        )
+        forbidden_paths = {transcript, *(item.resolve(strict=True) for item in VERIFIER_INPUT_PATHS)}
+        require(parent / path.name not in forbidden_paths, "summary output aliases a protected input")
+        forbidden_identities = {
+            inode_identity(os.stat(protected, follow_symlinks=False)) for protected in forbidden_paths
+        }
+        try:
+            output_status = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            output_status = None
+        if output_status is not None:
+            require(
+                stat.S_ISREG(output_status.st_mode),
+                "existing summary output must be a regular file, not a symlink or special file",
+            )
+            require(
+                inode_identity(output_status) not in forbidden_identities,
+                "summary output aliases a protected input",
+            )
+            require(overwrite, "summary output already exists; use --overwrite to replace it")
+        return SummaryOutputTarget(
+            directory_path=parent,
+            basename=path.name,
+            directory_fd=directory_fd,
+            directory_device=directory_status.st_dev,
+            directory_inode=directory_status.st_ino,
+            overwrite=overwrite,
+        )
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check-manifest", action="store_true")
     parser.add_argument("--selftest", action="store_true")
+    parser.add_argument(
+        "--transcript",
+        type=pathlib.Path,
+        help="semantically verify one raw transcript claiming the frozen physical-Duo envelope",
+    )
+    parser.add_argument(
+        "--expect-source",
+        help="40-hex preparation commit required with --transcript",
+    )
+    parser.add_argument(
+        "--expect-challenge",
+        help="fresh 256-bit campaign challenge required with --transcript",
+    )
+    parser.add_argument(
+        "--boot-index",
+        type=int,
+        choices=range(3),
+        metavar="{0,1,2}",
+        help="host-assigned cold-boot index required with --transcript",
+    )
+    summary_group = parser.add_mutually_exclusive_group()
+    summary_group.add_argument(
+        "--summary-in",
+        type=pathlib.Path,
+        help="require a checked boot summary to exactly match fresh derivation",
+    )
+    summary_group.add_argument(
+        "--summary-out",
+        type=pathlib.Path,
+        help="atomically write and recheck the derived single-boot summary",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace an existing regular --summary-out after all input checks pass",
+    )
     arguments = parser.parse_args()
-    if not arguments.check_manifest and not arguments.selftest:
-        parser.error("choose --check-manifest and/or --selftest")
+    transcript_options = (
+        arguments.expect_source,
+        arguments.expect_challenge,
+        arguments.boot_index,
+        arguments.summary_in,
+        arguments.summary_out,
+        True if arguments.overwrite else None,
+    )
+    if arguments.transcript is None and any(value is not None for value in transcript_options):
+        parser.error("transcript-only options require --transcript")
+    if arguments.overwrite and arguments.summary_out is None:
+        parser.error("--overwrite requires --summary-out")
+    if not arguments.check_manifest and not arguments.selftest and arguments.transcript is None:
+        parser.error("choose --check-manifest, --selftest, and/or --transcript")
     try:
         manifest, schema = load_contract_files()
         validate_manifest(manifest)
@@ -1841,6 +3464,75 @@ def main() -> int:
         openssh_fixture_identity()
         if arguments.selftest:
             selftest(manifest, schema)
+        if arguments.transcript is not None:
+            require(arguments.expect_source is not None, "--expect-source is required with --transcript")
+            require(
+                arguments.expect_challenge is not None,
+                "--expect-challenge is required with --transcript",
+            )
+            require(arguments.boot_index is not None, "--boot-index is required with --transcript")
+            raw, transcript_path = read_stable_regular_file(
+                arguments.transcript,
+                maximum_bytes=MAX_RAW_TRANSCRIPT_BYTES,
+                label="raw transcript",
+            )
+            verified = verify_transcript_bytes(
+                raw,
+                expected_source=arguments.expect_source,
+                expected_challenge=arguments.expect_challenge,
+            )
+            derived = derive_boot_summary(verified, boot_index=arguments.boot_index)
+            summary_status = "derived-only"
+            if arguments.summary_in is not None:
+                checked_raw, _checked_path = read_stable_regular_file(
+                    arguments.summary_in,
+                    maximum_bytes=MAX_BOOT_SUMMARY_BYTES,
+                    label="checked boot summary",
+                )
+                checked = strict_json_bytes(
+                    checked_raw,
+                    "checked boot summary",
+                )
+                verify_derived_summary(checked, derived)
+                summary_status = "checked"
+            if arguments.summary_out is not None:
+                summary_target = prepare_summary_output_target(
+                    arguments.summary_out,
+                    transcript=transcript_path,
+                    overwrite=arguments.overwrite,
+                )
+                try:
+                    write_json_atomic(summary_target, derived)
+                    written_raw = read_stable_regular_at(
+                        summary_target,
+                        maximum_bytes=MAX_BOOT_SUMMARY_BYTES,
+                        label="written boot summary",
+                    )
+                    written = strict_json_bytes(
+                        written_raw,
+                        "written boot summary",
+                    )
+                    verify_derived_summary(written, derived)
+                    post_manifest, post_schema = load_contract_files()
+                    validate_manifest(post_manifest)
+                    validate_schema(post_schema)
+                    image_identity()
+                    openssh_fixture_identity()
+                    require_output_directory_binding(summary_target)
+                finally:
+                    os.close(summary_target.directory_fd)
+                summary_status = "written"
+            print(
+                "PASS C8.4 single-raw transcript-semantics "
+                "scope=single-boot-transcript-semantics-only-no-aot-decision "
+                "physical_provenance=unverified cold_boot_provenance=unverified "
+                f"source={verified.metadata['source_commit']} "
+                f"challenge={verified.metadata['challenge']} "
+                f"run_id={verified.metadata['run_id']} "
+                f"boot_index={arguments.boot_index} "
+                f"samples={len(verified.samples)} retained={RETAINED_PER_BOOT} "
+                f"raw_sha256={verified.raw_sha256} summary={summary_status}"
+            )
         if arguments.check_manifest:
             print(
                 "PASS C8.4 AOT decision manifest "

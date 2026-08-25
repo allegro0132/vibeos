@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://vibeos.invalid/schemas/wasm-aot-decision-v1.json",
-  "title": "VibeOS C8.4 physical AOT-decision transcript records",
+  "title": "VibeOS C8.4 single-cold-boot physical AOT-decision transcript records",
   "oneOf": [
     { "$ref": "#/$defs/meta" },
     { "$ref": "#/$defs/sample" },
@@ -15,6 +15,16 @@
     "hex64": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "positiveU64": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
     },
     "phase": {
       "type": "string",
@@ -32,13 +42,13 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "validation": { "type": "integer", "minimum": 0 },
-        "instantiation": { "type": "integer", "minimum": 0 },
-        "abi": { "type": "integer", "minimum": 0 },
-        "interpretation": { "type": "integer", "minimum": 0 },
-        "host": { "type": "integer", "minimum": 0 },
-        "wait": { "type": "integer", "minimum": 0 },
-        "cleanup": { "type": "integer", "minimum": 0 }
+        "validation": { "$ref": "#/$defs/u64" },
+        "instantiation": { "$ref": "#/$defs/u64" },
+        "abi": { "$ref": "#/$defs/u64" },
+        "interpretation": { "$ref": "#/$defs/u64" },
+        "host": { "$ref": "#/$defs/u64" },
+        "wait": { "$ref": "#/$defs/u64" },
+        "cleanup": { "$ref": "#/$defs/u64" }
       },
       "required": [
         "validation",
@@ -54,10 +64,10 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "sequence": { "type": "integer", "minimum": 0 },
+        "sequence": { "type": "integer", "minimum": 0, "maximum": 65535 },
         "phase": { "$ref": "#/$defs/phase" },
-        "start_offset_ticks": { "type": "integer", "minimum": 0 },
-        "end_offset_ticks": { "type": "integer", "minimum": 1 }
+        "start_offset_ticks": { "$ref": "#/$defs/u64" },
+        "end_offset_ticks": { "$ref": "#/$defs/positiveU64" }
       },
       "required": [
         "sequence",
@@ -85,7 +95,9 @@
         "timebase_hz": { "const": 25000000 },
         "hart_id": { "const": 0 },
         "hart_count": { "const": 1 },
-        "cold_boots": { "const": 3 },
+        "transcript_scope": { "const": "single-cold-boot" },
+        "required_cold_boots": { "const": 3 },
+        "samples_per_boot": { "const": 24 },
         "warmup_per_boot": { "const": 3 },
         "retained_per_boot": { "const": 21 },
         "workload_id": { "const": "ssh-case-filter-12k-v1" },
@@ -113,7 +125,9 @@
         "timebase_hz",
         "hart_id",
         "hart_count",
-        "cold_boots",
+        "transcript_scope",
+        "required_cold_boots",
+        "samples_per_boot",
         "warmup_per_boot",
         "retained_per_boot",
         "workload_id",
@@ -134,12 +148,11 @@
         "version": { "const": 1 },
         "run_id": { "$ref": "#/$defs/hex64" },
         "challenge": { "$ref": "#/$defs/hex64" },
-        "sequence": { "type": "integer", "minimum": 0 },
-        "cold_boot_index": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "sequence": { "type": "integer", "minimum": 0, "maximum": 23 },
         "sample_index": { "type": "integer", "minimum": 0, "maximum": 23 },
         "warmup": { "type": "boolean" },
         "workload_id": { "const": "ssh-case-filter-12k-v1" },
-        "total_ticks": { "type": "integer", "minimum": 1 },
+        "total_ticks": { "$ref": "#/$defs/positiveU64" },
         "phase_ticks": { "$ref": "#/$defs/phaseTicks" },
         "interval_capacity": { "const": 65536 },
         "interval_count": { "type": "integer", "minimum": 1, "maximum": 65536 },
@@ -152,8 +165,8 @@
         },
         "read_chunks": { "const": 13 },
         "write_chunks": { "const": 13 },
-        "fuel_consumed": { "type": "integer", "minimum": 0 },
-        "poll_quanta": { "type": "integer", "minimum": 0 },
+        "fuel_consumed": { "type": "integer", "minimum": 1, "maximum": 500000 },
+        "poll_quanta": { "$ref": "#/$defs/positiveU64" },
         "terminal": { "const": "success" },
         "logical_live_after": { "const": 0 },
         "timed_out": { "const": false },
@@ -169,7 +182,6 @@
         "run_id",
         "challenge",
         "sequence",
-        "cold_boot_index",
         "sample_index",
         "warmup",
         "workload_id",
@@ -201,18 +213,16 @@
         "version": { "const": 1 },
         "run_id": { "$ref": "#/$defs/hex64" },
         "challenge": { "$ref": "#/$defs/hex64" },
-        "cold_boots": { "const": 3 },
-        "samples": { "const": 72 },
-        "warmups": { "const": 9 },
-        "retained": { "const": 63 },
-        "accumulator": { "type": "integer", "minimum": 0 }
+        "samples": { "const": 24 },
+        "warmups": { "const": 3 },
+        "retained": { "const": 21 },
+        "accumulator": { "$ref": "#/$defs/u64" }
       },
       "required": [
         "schema",
         "version",
         "run_id",
         "challenge",
-        "cold_boots",
         "samples",
         "warmups",
         "retained",

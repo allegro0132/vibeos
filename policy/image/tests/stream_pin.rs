@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use vibeos_component_admission::{
     admit, AdmissionError, AdmissionPolicy, ArtifactTrust, CallerAuthority, CommandStreamMode,
     ComponentArtifact, ComponentIdentity, InstanceLimits,
@@ -12,7 +13,7 @@ use vibeos_component_runtime::{
         HostPrepared, HostRequest, HostResponse, HostWakeToken,
     },
     resource::{ResourceTable, ResourceTypeId},
-    sync::{SynchronousComponent, TypedPoll},
+    sync::{ProfileClock, SyncCallProfile, SynchronousComponent, TypedPoll},
     value::{CanonicalValue, ResourceOwnership, ValueType},
     world::{WorldContract, WorldError},
     HostImportInfo,
@@ -25,6 +26,21 @@ use vibeos_wasm_runtime::{OwnerAllocationReservation, ProfileEngine};
 const SOURCE: &str = include_str!("../artifacts/c53-stream-filter.component.wat");
 const STREAM_INTERFACE: &str = "vibe:stream/streams@1.0.0";
 const MAX_CHUNK: u32 = 1024;
+// These product charges mirror the private RegistryStreamDispatcher constants
+// in kernel/src/component_instances.rs. The C8.4 preflight selects them
+// explicitly; existing LoopDispatcher tests retain their original synthetic
+// 7/5/3 work model.
+const PRODUCT_STREAM_READ_WORK: u64 = MAX_CHUNK as u64 + 4;
+const PRODUCT_STREAM_WRITE_BASE_WORK: u64 = 4;
+const PRODUCT_STREAM_CLOSE_WORK: u64 = 1;
+const FROZEN_INPUT_LEN: usize = 12 * 1024 + 37;
+const C84_ENGINEERING_INTERVAL_CAPACITY: u64 = 65_536;
+const FROZEN_ARTIFACT_SHA256: &str =
+    "180ed444de8b6c9ecd828b369d4c8b9f783758ef22c0b17170682d71f2fd0e72";
+const FROZEN_INPUT_SHA256: &str =
+    "6b6054d492e00e68a93bc9b657a69577c7c44f5a48f169adb4124df0a50f6b3c";
+const FROZEN_OUTPUT_SHA256: &str =
+    "791f3fe1339984e8a8489c12ea5ff479ac7caa07c87be451134d3af0f526bb27";
 
 fn admission_mode(mode: ComponentStreamMode) -> CommandStreamMode {
     match mode {
@@ -253,6 +269,37 @@ enum Endpoint {
     Writer,
 }
 
+#[derive(Clone, Copy)]
+enum LoopWorkModel {
+    Synthetic,
+    FrozenProduct,
+}
+
+impl LoopWorkModel {
+    const fn read(self) -> u64 {
+        match self {
+            Self::Synthetic => 7,
+            Self::FrozenProduct => PRODUCT_STREAM_READ_WORK,
+        }
+    }
+
+    fn write(self, bytes: usize) -> Result<u64, HostError> {
+        match self {
+            Self::Synthetic => Ok(5),
+            Self::FrozenProduct => PRODUCT_STREAM_WRITE_BASE_WORK
+                .checked_add(bytes as u64)
+                .ok_or(HostError::Exhausted),
+        }
+    }
+
+    const fn close(self) -> u64 {
+        match self {
+            Self::Synthetic => 3,
+            Self::FrozenProduct => PRODUCT_STREAM_CLOSE_WORK,
+        }
+    }
+}
+
 struct LoopDispatcher {
     chunks: Vec<Vec<u8>>,
     next_read: usize,
@@ -260,14 +307,24 @@ struct LoopDispatcher {
     next_generation: u64,
     active: Option<(HostOperationToken, usize)>,
     output: Vec<u8>,
+    starts: usize,
     reads: usize,
     commits: usize,
     closes: usize,
     cancels: usize,
+    work_model: LoopWorkModel,
 }
 
 impl LoopDispatcher {
     fn new(chunks: Vec<Vec<u8>>) -> Self {
+        Self::with_work_model(chunks, LoopWorkModel::Synthetic)
+    }
+
+    fn frozen_product(chunks: Vec<Vec<u8>>) -> Self {
+        Self::with_work_model(chunks, LoopWorkModel::FrozenProduct)
+    }
+
+    fn with_work_model(chunks: Vec<Vec<u8>>, work_model: LoopWorkModel) -> Self {
         Self {
             chunks,
             next_read: 0,
@@ -275,10 +332,12 @@ impl LoopDispatcher {
             next_generation: 1,
             active: None,
             output: Vec::new(),
+            starts: 0,
             reads: 0,
             commits: 0,
             closes: 0,
             cancels: 0,
+            work_model,
         }
     }
 
@@ -305,14 +364,29 @@ impl HostDispatcher<Endpoint> for LoopDispatcher {
     fn required_work(
         &self,
         import: &HostImportInfo,
-        _arguments: &[CanonicalValue],
+        arguments: &[CanonicalValue],
     ) -> Result<u64, HostError> {
-        Ok(match import.function.as_str() {
-            "read" => 7,
-            "write" => 5,
-            "close-reader" | "close-writer" => 3,
-            _ => return Err(HostError::Denied),
-        })
+        match import.function.as_str() {
+            "read" => match (self.work_model, arguments) {
+                (LoopWorkModel::Synthetic, _) => Ok(self.work_model.read()),
+                (LoopWorkModel::FrozenProduct, [CanonicalValue::Resource(_)]) => {
+                    Ok(self.work_model.read())
+                }
+                (LoopWorkModel::FrozenProduct, _) => Err(HostError::InvalidArgument),
+            },
+            "write" => match (self.work_model, arguments) {
+                (LoopWorkModel::Synthetic, _) => self.work_model.write(0),
+                (
+                    LoopWorkModel::FrozenProduct,
+                    [CanonicalValue::Resource(_), CanonicalValue::List(bytes)],
+                ) if !bytes.is_empty() && bytes.len() <= MAX_CHUNK as usize => {
+                    self.work_model.write(bytes.len())
+                }
+                (LoopWorkModel::FrozenProduct, _) => Err(HostError::InvalidArgument),
+            },
+            "close-reader" | "close-writer" => Ok(self.work_model.close()),
+            _ => Err(HostError::Denied),
+        }
     }
 
     fn result_allocations(
@@ -331,6 +405,7 @@ impl HostDispatcher<Endpoint> for LoopDispatcher {
     }
 
     fn start(&mut self, request: HostRequest<'_, Endpoint>) -> Result<HostDispatch, HostError> {
+        self.starts += 1;
         assert_eq!(request.import().interface, STREAM_INTERFACE);
         match request.import().function.as_str() {
             "read" => {
@@ -339,7 +414,7 @@ impl HostDispatcher<Endpoint> for LoopDispatcher {
                 let Some(chunk) = self.chunks.get(self.next_read) else {
                     return Ok(HostDispatch::Ready(HostResponse::one(
                         CanonicalValue::List(Vec::new()),
-                        7,
+                        self.work_model.read(),
                     )?));
                 };
                 let operation = HostOperationToken::from_generation(self.next_generation)
@@ -374,19 +449,25 @@ impl HostDispatcher<Endpoint> for LoopDispatcher {
                 );
                 self.output.extend_from_slice(&bytes);
                 self.next_write += 1;
-                Ok(HostDispatch::Ready(HostResponse::unit(5)?))
+                Ok(HostDispatch::Ready(HostResponse::unit(
+                    self.work_model.write(bytes.len())?,
+                )?))
             }
             "close-reader" => {
                 Self::endpoint(&request, Endpoint::Reader)?;
                 assert_eq!(request.arguments().get(1), Some(&CanonicalValue::Enum(0)));
                 self.closes += 1;
-                Ok(HostDispatch::Ready(HostResponse::unit(3)?))
+                Ok(HostDispatch::Ready(HostResponse::unit(
+                    self.work_model.close(),
+                )?))
             }
             "close-writer" => {
                 Self::endpoint(&request, Endpoint::Writer)?;
                 assert_eq!(request.arguments().get(1), Some(&CanonicalValue::Enum(0)));
                 self.closes += 1;
-                Ok(HostDispatch::Ready(HostResponse::unit(3)?))
+                Ok(HostDispatch::Ready(HostResponse::unit(
+                    self.work_model.close(),
+                )?))
             }
             _ => Err(HostError::Denied),
         }
@@ -425,7 +506,7 @@ impl HostDispatcher<Endpoint> for LoopDispatcher {
             .try_reserve_exact(self.chunks[index].len())
             .map_err(|_| HostError::Exhausted)?;
         values.extend(self.chunks[index].iter().copied().map(CanonicalValue::U8));
-        let response = HostResponse::reserve_one(7)?;
+        let response = HostResponse::reserve_one(self.work_model.read())?;
 
         // Everything which can allocate or fail precedes the simulated
         // destructive reservation commit.
@@ -481,6 +562,34 @@ fn test_chunks(full_chunks: usize) -> Vec<Vec<u8>> {
     }
     chunks.push((0..37).map(|offset| (offset * 7 + 3) as u8).collect());
     chunks
+}
+
+fn frozen_case_filter_chunks() -> Vec<Vec<u8>> {
+    let input: Vec<u8> = (0..FROZEN_INPUT_LEN)
+        .map(|index| ((index * 17 + 3) % 251) as u8)
+        .collect();
+    input
+        .chunks(MAX_CHUNK as usize)
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[derive(Default)]
+struct ProfileCounterClock(u64);
+
+impl ProfileClock for ProfileCounterClock {
+    fn ticks(&mut self) -> u64 {
+        let tick = self.0;
+        self.0 = self.0.wrapping_add(1);
+        tick
+    }
 }
 
 fn execute_chunks(chunks: Vec<Vec<u8>>, total_fuel: u64, poll_quantum: u64) {
@@ -574,6 +683,106 @@ fn execute_chunks(chunks: Vec<Vec<u8>>, total_fuel: u64, poll_quantum: u64) {
 fn production_pin_streams_twelve_full_chunks_and_exact_final_37_bytes() {
     let limits = SSH_EXEC_COMPONENT.limits();
     execute_chunks(test_chunks(12), limits.total_fuel, limits.poll_quantum);
+}
+
+#[test]
+fn frozen_case_filter_profile_preflight_proves_interval_capacity() {
+    let pin = SSH_EXEC_COMPONENT;
+    let limits = pin.limits();
+    let chunks = frozen_case_filter_chunks();
+    let input: Vec<u8> = chunks.iter().flatten().copied().collect();
+    let expected_output: Vec<u8> = input.iter().map(|byte| byte ^ 0x20).collect();
+
+    assert_eq!(pin.artifact_bytes().len(), 2012);
+    assert_eq!(sha256_hex(pin.artifact_bytes()), FROZEN_ARTIFACT_SHA256);
+    assert_eq!(input.len(), FROZEN_INPUT_LEN);
+    assert_eq!(sha256_hex(&input), FROZEN_INPUT_SHA256);
+    assert_eq!(expected_output.len(), FROZEN_INPUT_LEN);
+    assert_eq!(sha256_hex(&expected_output), FROZEN_OUTPUT_SHA256);
+    assert_eq!(chunks.len(), 13);
+    assert_eq!(chunks.last().map(Vec::len), Some(37));
+
+    let plan = inspect_component(pin.artifact_bytes()).unwrap();
+    let mut component = SynchronousComponent::instantiate_with_memory_limit(
+        &plan,
+        &ProfileEngine::new(),
+        OwnerAllocationReservation::new(limits.memory_bytes),
+        limits.memory_bytes,
+    )
+    .unwrap();
+    let (reader_type, writer_type) = resource_types(&component);
+    let mut resources = ResourceTable::new(0xc84, limits.resources).unwrap();
+    let reader = resources
+        .insert_owned(reader_type, Endpoint::Reader)
+        .unwrap();
+    let writer = resources
+        .insert_owned(writer_type, Endpoint::Writer)
+        .unwrap();
+    let mut dispatcher = LoopDispatcher::frozen_product(chunks);
+    let mut call = component
+        .start_typed_call_with_host(
+            &mut resources,
+            &mut dispatcher,
+            pin.entrypoint(),
+            vec![
+                CanonicalValue::Resource(reader),
+                CanonicalValue::Resource(writer),
+            ],
+            limits.total_fuel,
+            limits.poll_quantum,
+        )
+        .unwrap();
+    let planning_work = call.metrics().consumed_work;
+    let mut clock = ProfileCounterClock::default();
+    let mut profile = SyncCallProfile::default();
+    let mut pending_polls = 0_u64;
+    let mut completed = false;
+    for _ in 0..100_000 {
+        match call.poll_profiled(&mut clock, &mut profile) {
+            TypedPoll::Pending(_) => pending_polls += 1,
+            TypedPoll::Ready(value) => {
+                assert_eq!(value, CanonicalValue::Tuple(Vec::new()));
+                completed = true;
+                break;
+            }
+            TypedPoll::HostPending(operation) => {
+                panic!("frozen buffered dispatcher unexpectedly waited: {operation:?}")
+            }
+            TypedPoll::HostFailed(error) => panic!("frozen stream host failed: {error:?}"),
+            TypedPoll::Trapped(trap) => panic!("frozen stream component trapped: {trap:?}"),
+        }
+    }
+    assert!(completed, "frozen stream exceeded the bounded poll loop");
+    let terminal_work = call.metrics().consumed_work;
+    drop(call);
+
+    assert_eq!(dispatcher.output, expected_output);
+    assert_eq!(profile.typed_polls, 1251);
+    assert_eq!(pending_polls, 1250);
+    assert_eq!(profile.core_polls, 1165);
+    assert_eq!(profile.consumed_work, 188_121);
+    assert_eq!(planning_work, 2);
+    assert_eq!(terminal_work, 188_123);
+    assert_eq!(dispatcher.starts, 29);
+    assert_eq!(dispatcher.commits, 13);
+    let host_entries = dispatcher.starts + dispatcher.commits;
+    assert_eq!(host_entries, 42);
+
+    // Strict adjacent-same-phase merging leaves four fixed intervals
+    // (validation, instantiation, initial ABI, cleanup), plus interpretation
+    // then ABI for every Core poll and host then ABI for every dispatcher
+    // entry. The managed runner additionally enters wait and resumes ABI after
+    // every non-terminal quantum poll.
+    let no_wait_intervals = 4_u64 + 2 * (profile.core_polls + host_entries as u64);
+    let managed_minimum = no_wait_intervals + 2 * pending_polls;
+    assert_eq!(no_wait_intervals, 2418);
+    assert_eq!(managed_minimum, 4918);
+    assert!(
+        managed_minimum > 4096,
+        "the retired schema cap was too small"
+    );
+    assert!(managed_minimum <= C84_ENGINEERING_INTERVAL_CAPACITY);
+    assert_eq!(C84_ENGINEERING_INTERVAL_CAPACITY - managed_minimum, 60_618);
 }
 
 #[test]

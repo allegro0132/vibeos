@@ -115,6 +115,24 @@ hart. The RISC-V check proves that this foundation stays dependency-free and
 `no_std`; target hook, pinning, and dynamic-hart verification remain later
 gates.
 
+The same crate's portable target-session facade is the next allocation-free,
+`no_std`, and `unsafe`-free boundary above that ledger. Within one continuously
+recycled `TargetReady` lineage, it gives each armed sample a private non-zero
+checked epoch, rejects any active hook whose token or trusted-kernel-supplied
+single-hart online mask, logical hart, or physical hart is wrong, and binds IRQ
+exit to the epoch captured by its entry cookie. Epochs are not globally unique
+across separately constructed lineages, so the later kernel slot must initialize
+exactly one lineage and preserve it only through recycle transitions. Only a
+facade-clean closed sample may proceed to the explicit independent ledger
+rescan; the formal target publisher must accept `TargetVerified`, not the raw
+ledger's `Verified`. Cancellation, facade faults, ledger faults, and epoch
+exhaustion remain diagnostic-only and clear storage before reuse. This facade
+intentionally contains no lock, callback, allocator, target clock access, or
+hardware topology reader. It is the portable session layer that a later
+kernel-owned `SpinLock`, tombstone, and executor RAII lease may contain; it does
+not claim that kernel, trap, executor, IRQ, SSH, QEMU, or physical-Duo
+collection has been wired.
+
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The
 golden and benchmark runners explicitly build the kernel with

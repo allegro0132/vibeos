@@ -53,6 +53,13 @@ jobs:
               -p vibeos-component-runtime \
               --features native-async-acceptance \
               --test native_async_fuzz --verbose
+      - name: Test the default-off C8.4 Core profiling boundary
+        run: |
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked \
+              -p vibeos-component-runtime --no-default-features \
+              --features c84-profile-hooks \
+              --test c84_profile --verbose
       - name: Test each image policy independently
         run: |
           RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \

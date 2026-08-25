@@ -928,6 +928,99 @@ pub struct TypedCallMetrics {
     pub remaining_work: u64,
 }
 
+/// Caller-supplied monotonic tick source for the portable C8.4 profiler.
+///
+/// The runtime deliberately assigns no unit or platform implementation to a
+/// tick. Tick subtraction is wrapping, so one hardware-counter wrap remains a
+/// valid interval. A clock that moves backwards for any other reason produces
+/// a conservatively large interval which saturates the corresponding counter.
+#[cfg(feature = "c84-profile-hooks")]
+pub trait ProfileClock {
+    fn ticks(&mut self) -> u64;
+
+    /// Switches an external phase recorder to Core interpretation and returns
+    /// the tick sampled after that observer work, immediately before entering
+    /// the interpreter. An override must sample the returned tick as its final
+    /// operation. Clocks interested only in totals need only implement
+    /// [`ProfileClock::ticks`].
+    fn core_poll_started(&mut self) -> u64 {
+        self.ticks()
+    }
+
+    /// Observes the exact tick sampled immediately after leaving the Core
+    /// interpreter.
+    fn core_poll_finished(&mut self, _tick: u64) {}
+}
+
+/// Cumulative timing and work buckets for profiled synchronous typed polls.
+///
+/// Every field uses saturating accumulation. `consumed_work` includes only
+/// work charged while calling [`TypedCall::poll_profiled`], not construction
+/// and Canonical ABI planning performed before the call is returned. A formal
+/// whole-call `fuel_consumed` value must therefore come from terminal
+/// [`TypedCallMetrics::consumed_work`], not this profiling delta.
+///
+/// These five counters are not an exhaustive platform phase ledger. Without
+/// additional trap hooks, `core_interpreter_ticks` includes interrupt/trap
+/// service that occurs inside `poll_call`; outer-minus-core combines Canonical
+/// ABI, host-dispatch, and portable runtime work. The clock observer callbacks
+/// expose real Core boundaries so a platform collector can refine those
+/// phases instead of reconstructing intervals from aggregate totals.
+///
+/// A field that reaches `u64::MAX` is a fail-closed, unpublishable sample. The
+/// saturated value prevents under-reporting but must not be emitted as a valid
+/// formal measurement.
+#[cfg(feature = "c84-profile-hooks")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncCallProfile {
+    pub typed_polls: u64,
+    pub core_polls: u64,
+    pub outer_poll_ticks: u64,
+    pub core_interpreter_ticks: u64,
+    pub consumed_work: u64,
+}
+
+trait SyncPollProfiler {
+    type CoreStart;
+
+    fn begin_core_poll(&mut self) -> Self::CoreStart;
+    fn end_core_poll(&mut self, started: Self::CoreStart);
+}
+
+struct Unprofiled;
+
+impl SyncPollProfiler for Unprofiled {
+    type CoreStart = ();
+
+    fn begin_core_poll(&mut self) {}
+
+    fn end_core_poll(&mut self, (): ()) {}
+}
+
+#[cfg(feature = "c84-profile-hooks")]
+struct ProfileSession<'a, C: ProfileClock + ?Sized> {
+    clock: &'a mut C,
+    profile: &'a mut SyncCallProfile,
+}
+
+#[cfg(feature = "c84-profile-hooks")]
+impl<C: ProfileClock + ?Sized> SyncPollProfiler for ProfileSession<'_, C> {
+    type CoreStart = u64;
+
+    fn begin_core_poll(&mut self) -> Self::CoreStart {
+        self.clock.core_poll_started()
+    }
+
+    fn end_core_poll(&mut self, started: Self::CoreStart) {
+        let finished = self.clock.ticks();
+        self.clock.core_poll_finished(finished);
+        let elapsed = finished.wrapping_sub(started);
+        self.profile.core_polls = self.profile.core_polls.saturating_add(1);
+        self.profile.core_interpreter_ticks =
+            self.profile.core_interpreter_ticks.saturating_add(elapsed);
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum TypedPoll {
     Pending(TypedCallMetrics),
@@ -1158,6 +1251,43 @@ impl<'a, A> TypedCall<'a, A> {
     }
 
     pub fn poll(&mut self) -> TypedPoll {
+        self.poll_with_profiler(&mut Unprofiled)
+    }
+
+    /// Polls through the ordinary synchronous path while recording portable
+    /// C8.4 timing buckets with a caller-owned clock.
+    ///
+    /// The outer bucket inclusively spans the complete typed poll, including
+    /// interpreter time. The interpreter bucket spans the two clock samples
+    /// immediately bracketing `CoreComponentGroup::poll_call`; setup,
+    /// Canonical ABI work, and result handling remain exclusively in the outer
+    /// bucket. Subtracting `core_interpreter_ticks` from `outer_poll_ticks`
+    /// therefore yields non-interpreter overhead for the same samples.
+    #[cfg(feature = "c84-profile-hooks")]
+    pub fn poll_profiled<C: ProfileClock + ?Sized>(
+        &mut self,
+        clock: &mut C,
+        profile: &mut SyncCallProfile,
+    ) -> TypedPoll {
+        let work_before = self.metrics().consumed_work;
+        let outer_started = clock.ticks();
+        let mut session = ProfileSession { clock, profile };
+        let result = self.poll_with_profiler(&mut session);
+        let outer_elapsed = session.clock.ticks().wrapping_sub(outer_started);
+        let work_after = self.metrics().consumed_work;
+        // A decreasing work ledger is an invariant violation. Charge the
+        // maximum rather than silently under-reporting the sample.
+        let consumed = work_after.checked_sub(work_before).unwrap_or(u64::MAX);
+        session.profile.typed_polls = session.profile.typed_polls.saturating_add(1);
+        session.profile.outer_poll_ticks = session
+            .profile
+            .outer_poll_ticks
+            .saturating_add(outer_elapsed);
+        session.profile.consumed_work = session.profile.consumed_work.saturating_add(consumed);
+        result
+    }
+
+    fn poll_with_profiler<P: SyncPollProfiler>(&mut self, profile: &mut P) -> TypedPoll {
         if self.cancelled {
             self.stage = TypedStage::Terminal(TrapCode::Cancelled);
         }
@@ -1170,22 +1300,22 @@ impl<'a, A> TypedCall<'a, A> {
                 TypedPoll::Trapped(trap)
             }
             TypedStage::Complete => TypedPoll::Trapped(TrapCode::Cancelled),
-            TypedStage::Allocate => self.poll_allocate(),
+            TypedStage::Allocate => self.poll_allocate(profile),
             TypedStage::Replay => self.replay(),
-            TypedStage::Transform => self.poll_transform(),
-            TypedStage::HostAllocate => self.poll_host_allocate(),
+            TypedStage::Transform => self.poll_transform(profile),
+            TypedStage::HostAllocate => self.poll_host_allocate(profile),
             TypedStage::HostDispatch => self.dispatch_host_call(),
-            TypedStage::HostShrink => self.poll_host_shrink(),
+            TypedStage::HostShrink => self.poll_host_shrink(profile),
             TypedStage::HostCommit => self.commit_prepared_host_call(),
             TypedStage::HostWaiting => self.poll_host_waiting(),
-            TypedStage::HostFreeUnused => self.poll_host_free_unused(),
+            TypedStage::HostFreeUnused => self.poll_host_free_unused(profile),
             TypedStage::Lift => self.lift(),
-            TypedStage::PostReturn => self.poll_post_return(),
-            TypedStage::Cleanup => self.poll_cleanup(),
+            TypedStage::PostReturn => self.poll_post_return(profile),
+            TypedStage::Cleanup => self.poll_cleanup(profile),
         }
     }
 
-    fn poll_allocate(&mut self) -> TypedPoll {
+    fn poll_allocate<P: SyncPollProfiler>(&mut self, profile: &mut P) -> TypedPoll {
         if self.active_instance().is_none() {
             if self.allocation_index >= self.allocations.len() {
                 self.stage = TypedStage::Replay;
@@ -1202,7 +1332,7 @@ impl<'a, A> TypedCall<'a, A> {
                 return self.finish_trap(trap);
             }
         }
-        match self.poll_subcall() {
+        match self.poll_subcall(profile) {
             PollResult::Pending { .. } => TypedPoll::Pending(self.metrics()),
             PollResult::HostCall(_) => self.finish_trap(TrapCode::Validation),
             PollResult::Trapped(trap) => self.finish_trap(trap),
@@ -1269,7 +1399,7 @@ impl<'a, A> TypedCall<'a, A> {
         TypedPoll::Pending(self.metrics())
     }
 
-    fn poll_transform(&mut self) -> TypedPoll {
+    fn poll_transform<P: SyncPollProfiler>(&mut self, profile: &mut P) -> TypedPoll {
         if self.active_instance().is_none() {
             let Some(arguments) = self.replay_arguments.take() else {
                 return self.finish_trap(TrapCode::Validation);
@@ -1278,7 +1408,7 @@ impl<'a, A> TypedCall<'a, A> {
                 return self.finish_trap(trap);
             }
         }
-        match self.poll_subcall() {
+        match self.poll_subcall(profile) {
             PollResult::Pending { .. } => TypedPoll::Pending(self.metrics()),
             PollResult::HostCall(call) => self.handle_host_call(call),
             PollResult::Trapped(trap) => self.finish_trap(trap),
@@ -1579,7 +1709,7 @@ impl<'a, A> TypedCall<'a, A> {
         Ok(())
     }
 
-    fn poll_host_allocate(&mut self) -> TypedPoll {
+    fn poll_host_allocate<P: SyncPollProfiler>(&mut self, profile: &mut P) -> TypedPoll {
         let Some(pending) = self.host_lower.as_ref() else {
             return self.finish_trap(TrapCode::Validation);
         };
@@ -1620,7 +1750,7 @@ impl<'a, A> TypedCall<'a, A> {
             *baseline = 0;
             self.guest_started = true;
         }
-        let (result, consumed) = self.poll_instance_measured(provider_instance, true);
+        let (result, consumed) = self.poll_instance_measured(provider_instance, true, profile);
         let pending = self.host_lower.as_mut().expect("pending host lower");
         pending.provider_consumed = match pending.provider_consumed.checked_add(consumed) {
             Some(consumed) => consumed,
@@ -1777,7 +1907,7 @@ impl<'a, A> TypedCall<'a, A> {
         TypedPoll::Pending(self.metrics())
     }
 
-    fn poll_host_shrink(&mut self) -> TypedPoll {
+    fn poll_host_shrink<P: SyncPollProfiler>(&mut self, profile: &mut P) -> TypedPoll {
         let (index, old, exact, provider_instance) = {
             let Some(pending) = self.host_lower.as_ref() else {
                 return self.finish_trap(TrapCode::Validation);
@@ -1855,7 +1985,7 @@ impl<'a, A> TypedCall<'a, A> {
             *baseline = 0;
             self.guest_started = true;
         }
-        let (result, consumed) = self.poll_instance_measured(provider_instance, true);
+        let (result, consumed) = self.poll_instance_measured(provider_instance, true, profile);
         let pending = self.host_lower.as_mut().expect("pending host lower");
         pending.provider_consumed = match pending.provider_consumed.checked_add(consumed) {
             Some(consumed) => consumed,
@@ -2065,7 +2195,7 @@ impl<'a, A> TypedCall<'a, A> {
         result
     }
 
-    fn poll_host_free_unused(&mut self) -> TypedPoll {
+    fn poll_host_free_unused<P: SyncPollProfiler>(&mut self, profile: &mut P) -> TypedPoll {
         let cleanup_complete = match self.host_lower.as_ref() {
             Some(pending) => pending.free_index <= pending.allocation_index,
             None => return self.finish_trap(TrapCode::Validation),
@@ -2144,7 +2274,7 @@ impl<'a, A> TypedCall<'a, A> {
             }
             provider_instance
         };
-        let (result, consumed) = self.poll_instance_measured(provider_instance, true);
+        let (result, consumed) = self.poll_instance_measured(provider_instance, true, profile);
         let pending = self.host_lower.as_mut().expect("pending host lower");
         pending.provider_consumed = match pending.provider_consumed.checked_add(consumed) {
             Some(consumed) => consumed,
@@ -2252,7 +2382,7 @@ impl<'a, A> TypedCall<'a, A> {
         TypedPoll::Pending(self.metrics())
     }
 
-    fn poll_post_return(&mut self) -> TypedPoll {
+    fn poll_post_return<P: SyncPollProfiler>(&mut self, profile: &mut P) -> TypedPoll {
         if self.active_instance().is_none() {
             let Some(results) = self.core_results.as_ref() else {
                 return self.finish_trap(TrapCode::Validation);
@@ -2266,7 +2396,7 @@ impl<'a, A> TypedCall<'a, A> {
                 return self.finish_trap(trap);
             }
         }
-        match self.poll_subcall() {
+        match self.poll_subcall(profile) {
             PollResult::Pending { .. } => TypedPoll::Pending(self.metrics()),
             PollResult::HostCall(_) => self.finish_trap(TrapCode::Validation),
             PollResult::Trapped(trap) => self.finish_trap(trap),
@@ -2278,7 +2408,7 @@ impl<'a, A> TypedCall<'a, A> {
         }
     }
 
-    fn poll_cleanup(&mut self) -> TypedPoll {
+    fn poll_cleanup<P: SyncPollProfiler>(&mut self, profile: &mut P) -> TypedPoll {
         if self.active_instance().is_none() {
             if self.allocation_index == 0 {
                 if self.close_resources(true).is_err() {
@@ -2299,7 +2429,7 @@ impl<'a, A> TypedCall<'a, A> {
                 return self.finish_trap(trap);
             }
         }
-        match self.poll_subcall() {
+        match self.poll_subcall(profile) {
             PollResult::Pending { .. } => TypedPoll::Pending(self.metrics()),
             PollResult::HostCall(_) => self.finish_trap(TrapCode::Validation),
             PollResult::Trapped(trap) => self.finish_trap(trap),
@@ -2341,19 +2471,31 @@ impl<'a, A> TypedCall<'a, A> {
         Ok(())
     }
 
-    fn poll_subcall(&mut self) -> PollResult {
+    fn poll_subcall<P: SyncPollProfiler>(&mut self, profile: &mut P) -> PollResult {
         let Some(instance) = self.active_instance() else {
             return PollResult::Trapped(TrapCode::Validation);
         };
-        self.poll_instance(instance, false)
+        self.poll_instance(instance, false, profile)
     }
 
-    fn poll_instance(&mut self, instance: usize, precharged: bool) -> PollResult {
-        self.poll_instance_measured(instance, precharged).0
+    fn poll_instance<P: SyncPollProfiler>(
+        &mut self,
+        instance: usize,
+        precharged: bool,
+        profile: &mut P,
+    ) -> PollResult {
+        self.poll_instance_measured(instance, precharged, profile).0
     }
 
-    fn poll_instance_measured(&mut self, instance: usize, precharged: bool) -> (PollResult, u64) {
+    fn poll_instance_measured<P: SyncPollProfiler>(
+        &mut self,
+        instance: usize,
+        precharged: bool,
+        profile: &mut P,
+    ) -> (PollResult, u64) {
+        let core_started = profile.begin_core_poll();
         let result = self.component.modules.poll_call(instance);
+        profile.end_core_poll(core_started);
         let baseline = self.active_baselines.get_mut(instance);
         let Some(baseline) = baseline else {
             return (PollResult::Trapped(TrapCode::Validation), 0);

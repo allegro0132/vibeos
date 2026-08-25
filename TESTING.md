@@ -27,6 +27,8 @@ python3 -B scripts/qemu-c83-runtime-costs.py --allow-dirty-smoke
 python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
 python3 -B scripts/verify-c83-evidence.py --selftest
 python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
+cargo test --locked -p vibeos-component-runtime --no-default-features \
+  --features c84-profile-hooks --test c84_profile
 ```
 
 The C8.2 gate is intentionally pinned to the reviewed
@@ -61,6 +63,14 @@ checked-in workload/schema bytes against the executable image pin and OpenSSH
 fixture. This preparation gate neither completes C8.3 nor authorizes AOT;
 fixed-QEMU runs are integration evidence only, and a final decision requires
 the documented physical-Duo sample set.
+
+The portable C8.4 hook gate above exercises the default-off, caller-clocked
+boundary around the real synchronous Core poll. It proves ordinary and
+profiled typed-call results stay identical and locks the exact observer/tick
+ordering, inclusive outer totals, wrapping subtraction, and saturating
+counters. It is only the interpreter-boundary primitive: the target-side
+seven-phase ledger, interrupt attribution, and SSH integration remain separate
+gates.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

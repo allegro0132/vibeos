@@ -213,10 +213,12 @@ and requires the checked `RESULTS.md` to equal its deterministic rendering.
 
 The QEMU envelope binds the clean Git state, exact command/version, pinned Rust
 toolchain, kernel ELF, raw transcript, derived summary, UTC interval, and runner
-hash. The Duo envelope additionally binds the kernel binary, FIT, full-card
-image, fixed SDK commit, operator-declared container digest, package/build
-envelopes and verifier audit, UART path/contract, three raw transcript hashes,
-and three derived summaries.
+hash. Its linker record keeps both the absolute `ld.lld` entry selected through
+the closed build `PATH` and the resolved executable path/hash, including when
+the entry is a symlink to a differently named `lld` binary. The Duo envelope
+additionally binds the kernel binary, FIT, full-card image, fixed SDK commit,
+operator-declared container digest, package/build envelopes and verifier audit,
+UART path/contract, three raw transcript hashes, and three derived summaries.
 
 The fresh challenge prevents accidental replay of an old log. It is not hardware
 attestation. The Duo operator statement and artifact hashes establish an

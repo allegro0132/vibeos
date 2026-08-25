@@ -205,6 +205,29 @@ def identity_record(value: Any, label: str, *, key: str = "path") -> dict[str, A
     return record
 
 
+def linker_identity_record(value: Any, label: str) -> dict[str, Any]:
+    record = exact(
+        value, {"invocation_path", "resolved_path", "sha256", "bytes"}, label
+    )
+    invocation = record["invocation_path"]
+    resolved = record["resolved_path"]
+    require(
+        isinstance(invocation, str) and pathlib.PurePath(invocation).is_absolute(),
+        f"{label}.invocation_path is not absolute",
+    )
+    require(
+        pathlib.PurePath(invocation).name == "ld.lld",
+        f"{label}.invocation_path is not an ld.lld entry",
+    )
+    require(
+        isinstance(resolved, str) and pathlib.PurePath(resolved).is_absolute(),
+        f"{label}.resolved_path is not absolute",
+    )
+    canonical_sha(record["sha256"], f"{label}.sha256")
+    integer(record["bytes"], f"{label}.bytes", minimum=1)
+    return record
+
+
 def bare_identity(value: Any, label: str) -> dict[str, Any]:
     record = exact(value, {"sha256", "bytes"}, label)
     canonical_sha(record["sha256"], f"{label}.sha256")
@@ -408,7 +431,7 @@ def validate_qemu_envelope(path: pathlib.Path, pair: VerifiedPair, source: str, 
         },
         "QEMU evidence envelope",
     )
-    require(envelope["schema"] == "vibeos.wasm-runtime-cost.qemu-environment" and envelope["version"] == 1, "QEMU envelope identity differs")
+    require(envelope["schema"] == "vibeos.wasm-runtime-cost.qemu-environment" and envelope["version"] == 2, "QEMU envelope identity differs")
     require(envelope["suite_id"] == "vibeos.c83.runtime-costs" and envelope["mode"] == "formal-publication", "QEMU envelope mode differs")
     require(envelope["source_commit"] == source and envelope["challenge"] == challenge, "QEMU envelope source/challenge differs")
     require(envelope["run_id"] == pair.summary["run_id"], "QEMU envelope run id differs")
@@ -453,10 +476,10 @@ def validate_qemu_envelope(path: pathlib.Path, pair: VerifiedPair, source: str, 
     require(bool(rustc_lines) and rustc_lines[0] == f"rustc {contract['rustc']}", "QEMU rustc version differs")
     require(f"commit-hash: {toolchain['pinned_rustc_commit']}" in rustc_lines, "QEMU rustc verbose identity differs")
     require(isinstance(toolchain["cargo_version"], str) and toolchain["cargo_version"].startswith("cargo "), "QEMU Cargo identity differs")
-    for key in ("rustup", "cargo", "rustc", "rustdoc", "linker"):
+    for key in ("rustup", "cargo", "rustc", "rustdoc"):
         tool = identity_record(toolchain[key], f"QEMU tool {key}")
         require(pathlib.PurePath(tool["path"]).is_absolute(), f"QEMU tool {key} path is not absolute")
-    require(pathlib.PurePath(toolchain["linker"]["path"]).name == "ld.lld", "QEMU linker identity differs")
+    linker = linker_identity_record(toolchain["linker"], "QEMU tool linker")
     expected_cargo = [toolchain["rustup"]["path"], "run", toolchain["channel"], "cargo", "build", "--release", "--locked", "--offline", "--no-default-features", "--features", "wasm-c83-runtime-costs"]
     require(toolchain["cargo_command"] == expected_cargo, "QEMU build command differs")
     policy = exact(toolchain["build_environment_policy"], {"ambient_variables", "cargo_home", "cargo_net_offline", "path_entries", "allowed_names", "normalized_values"}, "QEMU build environment")
@@ -465,7 +488,7 @@ def validate_qemu_envelope(path: pathlib.Path, pair: VerifiedPair, source: str, 
     require(policy["allowed_names"] == QEMU_BUILD_ALLOWED_NAMES, "QEMU build environment allowlist differs")
     expected_path = []
     for entry in (
-        str(pathlib.PurePath(toolchain["linker"]["path"]).parent),
+        str(pathlib.PurePath(linker["invocation_path"]).parent),
         str(pathlib.PurePath(toolchain["rustup"]["path"]).parent),
         "/usr/bin",
         "/bin",
@@ -903,6 +926,15 @@ def load_runtime_verifier_module() -> Any:
     return module
 
 
+def load_qemu_runner_module() -> Any:
+    spec = importlib.util.spec_from_file_location("c83_qemu_runner_selftest", QEMU_RUNNER)
+    require(spec is not None and spec.loader is not None, "cannot load QEMU runner for selftest")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def synthetic_duo_transcript(module: Any, manifest: dict[str, Any], boot_index: int) -> bytes:
     metadata, samples, ending = module.decoded_synthetic(manifest)
     metadata["platform"] = DUO_PLATFORM
@@ -913,7 +945,9 @@ def synthetic_duo_transcript(module: Any, manifest: dict[str, Any], boot_index: 
     return module.encode_synthetic(metadata, samples, ending)
 
 
-def make_synthetic_evidence(root: pathlib.Path) -> tuple[str, str]:
+def make_synthetic_evidence(
+    root: pathlib.Path, qemu_linker: dict[str, Any]
+) -> tuple[str, str]:
     module = load_runtime_verifier_module()
     manifest = module.load_manifest(MANIFEST_PATH)
     source = "a" * 40
@@ -961,9 +995,18 @@ def make_synthetic_evidence(root: pathlib.Path) -> tuple[str, str]:
     qemu_executable = "/opt/qemu/bin/qemu-system-riscv64"
     bios_path = "/opt/qemu/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin"
     kernel_path = "target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt"
+    qemu_path_entries = []
+    for entry in (
+        str(pathlib.PurePath(qemu_linker["invocation_path"]).parent),
+        "/tools/bin",
+        "/usr/bin",
+        "/bin",
+    ):
+        if entry not in qemu_path_entries:
+            qemu_path_entries.append(entry)
     qemu_envelope = {
         "schema": "vibeos.wasm-runtime-cost.qemu-environment",
-        "version": 1,
+        "version": 2,
         "suite_id": "vibeos.c83.runtime-costs",
         "mode": "formal-publication",
         "source_commit": source,
@@ -984,13 +1027,13 @@ def make_synthetic_evidence(root: pathlib.Path) -> tuple[str, str]:
             "cargo": fake("/toolchain/bin/cargo", "2"),
             "rustc": fake("/toolchain/bin/rustc", "3"),
             "rustdoc": fake("/toolchain/bin/rustdoc", "4"),
-            "linker": fake("/llvm/bin/ld.lld", "5"),
+            "linker": qemu_linker,
             "cargo_command": ["/tools/bin/rustup", "run", pinned["channel"], "cargo", "build", "--release", "--locked", "--offline", "--no-default-features", "--features", "wasm-c83-runtime-costs"],
             "build_environment_policy": {
                 "ambient_variables": "denied-by-default",
                 "cargo_home": "ephemeral-config-free registry/git cache links only",
                 "cargo_net_offline": True,
-                "path_entries": ["/llvm/bin", "/tools/bin", "/usr/bin", "/bin"],
+                "path_entries": qemu_path_entries,
                 "allowed_names": QEMU_BUILD_ALLOWED_NAMES,
                 "normalized_values": {
                     "CARGO_HOME": "<temporary-root>/cargo-home",
@@ -1000,7 +1043,7 @@ def make_synthetic_evidence(root: pathlib.Path) -> tuple[str, str]:
                     "HOME": "<temporary-root>/home",
                     "LANG": "C",
                     "LC_ALL": "C",
-                    "PATH": "/llvm/bin:/tools/bin:/usr/bin:/bin",
+                    "PATH": os.pathsep.join(qemu_path_entries),
                     "RUSTC": "/toolchain/bin/rustc",
                     "RUSTDOC": "/toolchain/bin/rustdoc",
                     "RUSTUP_HOME": "/rustup",
@@ -1222,8 +1265,41 @@ def selftest() -> None:
             fail(f"selftest accepted {label}")
 
     with tempfile.TemporaryDirectory(prefix="vibeos-c83-evidence-selftest-", dir="/tmp") as name:
+        fixture = pathlib.Path(name) / "linker-fixture"
+        fixture.mkdir()
+        linker_binary = fixture / "lld"
+        linker_binary.write_bytes(b"synthetic lld fixture\n")
+        linker_binary.chmod(0o755)
+        linker_entry = fixture / "ld.lld"
+        os.symlink(linker_binary.name, linker_entry)
+        runner = load_qemu_runner_module()
+        qemu_linker = runner.resolve_linker(search_path=str(fixture))
+        require(
+            pathlib.PurePath(qemu_linker["invocation_path"]).name == "ld.lld"
+            and pathlib.PurePath(qemu_linker["resolved_path"]).name == "lld",
+            "linker symlink selftest did not preserve entry and resolved identities",
+        )
+        generic_tool = runner.tool_record(str(pathlib.Path(sys.executable).resolve()))
+        closure_toolchain = {
+            **{name: generic_tool for name in ("rustup", "cargo", "rustc", "rustdoc")},
+            "linker": qemu_linker,
+        }
+        runner.recheck_toolchain_tools(closure_toolchain)
+        replacement = fixture / "lld-replaced"
+        replacement.write_bytes(linker_binary.read_bytes())
+        replacement.chmod(0o755)
+        linker_entry.unlink()
+        os.symlink(replacement.name, linker_entry)
+        try:
+            runner.recheck_toolchain_tools(closure_toolchain)
+        except runner.RunnerError:
+            rejected += 1
+        else:
+            fail("QEMU runner selftest accepted a redirected linker entry")
+        linker_entry.unlink()
+        os.symlink(linker_binary.name, linker_entry)
         base = pathlib.Path(name) / "base"
-        source, challenge = make_synthetic_evidence(base)
+        source, challenge = make_synthetic_evidence(base, qemu_linker)
         verify_evidence(base, source, challenge)
 
         mutations: list[tuple[str, Callable[[pathlib.Path], None]]] = []
@@ -1249,6 +1325,8 @@ def selftest() -> None:
             ("qemu-toolchain-pin", mutate_json("qemu/evidence.json", lambda value: value["toolchain"].update(pinned_rustc_commit="9" * 40))),
             ("qemu-build-allowlist", mutate_json("qemu/evidence.json", lambda value: value["toolchain"]["build_environment_policy"]["allowed_names"].pop())),
             ("qemu-rustup-identity", mutate_json("qemu/evidence.json", lambda value: value["toolchain"]["rustup"].update(path="rustup"))),
+            ("qemu-linker-entry-name", mutate_json("qemu/evidence.json", lambda value: value["toolchain"]["linker"].update(invocation_path=value["toolchain"]["linker"]["resolved_path"]))),
+            ("qemu-linker-resolved-path", mutate_json("qemu/evidence.json", lambda value: value["toolchain"]["linker"].update(resolved_path="lld"))),
             ("qemu-build-path", mutate_json("qemu/evidence.json", lambda value: value["toolchain"]["build_environment_policy"]["path_entries"].append("/ambient/bin"))),
             ("qemu-ambient-home", mutate_json("qemu/evidence.json", lambda value: value["toolchain"]["build_environment_policy"]["normalized_values"].update(HOME="/Users/operator"))),
             ("qemu-incremental-build", mutate_json("qemu/evidence.json", lambda value: value["toolchain"]["build_environment_policy"]["normalized_values"].update(CARGO_INCREMENTAL="1"))),
@@ -1292,7 +1370,7 @@ def selftest() -> None:
         else:
             fail("selftest accepted duplicate envelope member")
 
-    require(rejected == 26, f"selftest rejection count differs: {rejected}")
+    require(rejected == 29, f"selftest rejection count differs: {rejected}")
     print(f"verify-c83-evidence.py selftest: PASS ({rejected} mutations rejected)")
 
 

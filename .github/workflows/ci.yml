@@ -173,14 +173,26 @@ jobs:
           test -n "$toolchain"
           rustup toolchain install "$toolchain" --profile minimal \
             --component rust-src --component llvm-tools-preview
+          rustc_bin="$(rustup which --toolchain "$toolchain" rustc)"
+          rustdoc_bin="$(rustup which --toolchain "$toolchain" rustdoc)"
           {
             echo "VIBEOS_TOOLCHAIN=$toolchain"
-            echo "VIBEOS_RUSTC=$(rustup which --toolchain "$toolchain" rustc)"
-            echo "VIBEOS_RUSTDOC=$(rustup which --toolchain "$toolchain" rustdoc)"
+            echo "VIBEOS_RUSTC=$rustc_bin"
+            echo "VIBEOS_RUSTDOC=$rustdoc_bin"
           } >> "$GITHUB_ENV"
           rustup run "$toolchain" rustc -Vv
           rustup run "$toolchain" cargo -V
-          rustup run "$toolchain" cargo fetch --locked
+          env RUSTC="$rustc_bin" RUSTDOC="$rustdoc_bin" \
+            rustup run "$toolchain" cargo fetch --locked
+          # The QEMU and Duo builds inherit firmware/.cargo/config.toml's
+          # build-std graph. Populate its target-aware sysroot dependencies
+          # before every later build proves the source closure offline.
+          (
+            cd firmware/qemu-virt
+            env RUSTC="$rustc_bin" RUSTDOC="$rustdoc_bin" \
+              rustup run "$toolchain" cargo fetch --locked \
+                --target riscv64imac-unknown-none-elf
+          )
       - name: Install QEMU and lld
         run: |
           sudo apt-get update

@@ -270,6 +270,31 @@ def resolve_executable(name: str, label: str) -> str:
     return str(path)
 
 
+def linker_tool_record(path: str | pathlib.Path, label: str) -> dict[str, object]:
+    """Bind both the selected ld.lld entry and the binary it resolves to."""
+    invocation = pathlib.Path(os.path.abspath(os.fspath(path)))
+    try:
+        resolved = invocation.resolve(strict=True)
+    except OSError as error:
+        fail(f"cannot resolve {label} entry {invocation}: {error}")
+    if invocation.name != "ld.lld":
+        fail(f"{label} entry is not named ld.lld: {invocation}")
+    if not resolved.is_file() or not os.access(invocation, os.X_OK):
+        fail(f"{label} is not an executable regular file: {invocation}")
+    return {
+        "invocation_path": str(invocation),
+        "resolved_path": str(resolved),
+        **file_identity(resolved),
+    }
+
+
+def resolve_linker(*, search_path: str | None = None) -> dict[str, object]:
+    selected = shutil.which("ld.lld", path=search_path)
+    if selected is None:
+        fail("bare-metal linker was not found on PATH: ld.lld")
+    return linker_tool_record(selected, "bare-metal linker")
+
+
 def pinned_tool(rustup: str, channel: str, executable: str) -> str:
     resolved = run_text(
         [rustup, "which", "--toolchain", channel, executable]
@@ -325,13 +350,15 @@ def build_kernel(source_commit: str, challenge: str) -> dict[str, object]:
     cargo_path = pinned_tool(rustup_path, channel, "cargo")
     rustc_path = pinned_tool(rustup_path, channel, "rustc")
     rustdoc_path = pinned_tool(rustup_path, channel, "rustdoc")
-    linker_path = resolve_executable("ld.lld", "bare-metal linker")
+    linker = resolve_linker()
+    linker_path = str(linker["invocation_path"])
+    linker_resolved_path = str(linker["resolved_path"])
     tool_records = {
         "rustup": tool_record(rustup_path),
         "cargo": tool_record(cargo_path),
         "rustc": tool_record(rustc_path),
         "rustdoc": tool_record(rustdoc_path),
-        "linker": tool_record(linker_path),
+        "linker": linker,
     }
     version = run_text([rustc_path, "-Vv"])
     actual = re.search(r"^commit-hash: ([0-9a-f]{40})$", version, re.MULTILINE)
@@ -377,7 +404,12 @@ def build_kernel(source_commit: str, challenge: str) -> dict[str, object]:
         fail("preparation commit has no valid positive timestamp")
     path_entries = minimal_build_path(rustup_path, linker_path)
     sanitized_linker = shutil.which("ld.lld", path=os.pathsep.join(path_entries))
-    if sanitized_linker is None or str(pathlib.Path(sanitized_linker).resolve()) != linker_path:
+    if (
+        sanitized_linker is None
+        or os.path.abspath(sanitized_linker) != linker_path
+        or str(pathlib.Path(sanitized_linker).resolve(strict=True))
+        != linker_resolved_path
+    ):
         fail("sanitized build PATH does not resolve the recorded ld.lld first")
     temporary_root = pathlib.Path(os.environ.get("TMPDIR", "/tmp"))
     try:
@@ -710,7 +742,7 @@ def invoke_verifier(
 
 
 def recheck_toolchain_tools(toolchain: dict[str, object]) -> None:
-    for name in ("rustup", "cargo", "rustc", "rustdoc", "linker"):
+    for name in ("rustup", "cargo", "rustc", "rustdoc"):
         record = toolchain.get(name)
         if not isinstance(record, dict) or set(record) != {"path", "sha256", "bytes"}:
             fail(f"recorded {name} identity is malformed at closure")
@@ -722,6 +754,19 @@ def recheck_toolchain_tools(toolchain: dict[str, object]) -> None:
             "bytes": record.get("bytes"),
         }:
             fail(f"recorded {name} changed during build/capture")
+    linker = toolchain.get("linker")
+    if not isinstance(linker, dict) or set(linker) != {
+        "invocation_path",
+        "resolved_path",
+        "sha256",
+        "bytes",
+    }:
+        fail("recorded linker identity is malformed at closure")
+    linker_path = linker.get("invocation_path")
+    if not isinstance(linker_path, str):
+        fail("recorded linker path is malformed at closure")
+    if linker_tool_record(linker_path, "recorded bare-metal linker") != linker:
+        fail("recorded linker changed during build/capture")
 
 
 def read_summary_identity(
@@ -776,7 +821,7 @@ def write_envelope(
     summary_identity = file_identity(summary)
     envelope = {
         "schema": "vibeos.wasm-runtime-cost.qemu-environment",
-        "version": 1,
+        "version": 2,
         "suite_id": "vibeos.c83.runtime-costs",
         "mode": "formal-publication",
         "source_commit": source_commit,

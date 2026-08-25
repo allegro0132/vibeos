@@ -1,0 +1,217 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vibeos.invalid/schemas/wasm-aot-decision-v1.json",
+  "title": "VibeOS C8.4 physical AOT-decision transcript records",
+  "oneOf": [
+    { "$ref": "#/$defs/meta" },
+    { "$ref": "#/$defs/sample" },
+    { "$ref": "#/$defs/end" }
+  ],
+  "$defs": {
+    "hex40": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "hex64": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "phase": {
+      "type": "string",
+      "enum": [
+        "validation",
+        "instantiation",
+        "abi",
+        "interpretation",
+        "host",
+        "wait",
+        "cleanup"
+      ]
+    },
+    "phaseTicks": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "validation": { "type": "integer", "minimum": 0 },
+        "instantiation": { "type": "integer", "minimum": 0 },
+        "abi": { "type": "integer", "minimum": 0 },
+        "interpretation": { "type": "integer", "minimum": 0 },
+        "host": { "type": "integer", "minimum": 0 },
+        "wait": { "type": "integer", "minimum": 0 },
+        "cleanup": { "type": "integer", "minimum": 0 }
+      },
+      "required": [
+        "validation",
+        "instantiation",
+        "abi",
+        "interpretation",
+        "host",
+        "wait",
+        "cleanup"
+      ]
+    },
+    "interval": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 0 },
+        "phase": { "$ref": "#/$defs/phase" },
+        "start_offset_ticks": { "type": "integer", "minimum": 0 },
+        "end_offset_ticks": { "type": "integer", "minimum": 1 }
+      },
+      "required": [
+        "sequence",
+        "phase",
+        "start_offset_ticks",
+        "end_offset_ticks"
+      ]
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": { "const": "vibeos.wasm-aot-decision.meta" },
+        "version": { "const": 1 },
+        "suite_id": { "const": "vibeos.c84.aot-decision" },
+        "workload_revision": { "const": 1 },
+        "source_commit": { "$ref": "#/$defs/hex40" },
+        "challenge": { "$ref": "#/$defs/hex64" },
+        "run_id": { "$ref": "#/$defs/hex64" },
+        "manifest_sha256": { "$ref": "#/$defs/hex64" },
+        "transcript_schema_sha256": { "$ref": "#/$defs/hex64" },
+        "platform": { "const": "milkv-duo-cv1800b" },
+        "decision_eligible": { "const": true },
+        "clock": { "const": "riscv.rdtime" },
+        "timebase_hz": { "const": 25000000 },
+        "hart_id": { "const": 0 },
+        "hart_count": { "const": 1 },
+        "cold_boots": { "const": 3 },
+        "warmup_per_boot": { "const": 3 },
+        "retained_per_boot": { "const": 21 },
+        "workload_id": { "const": "ssh-case-filter-12k-v1" },
+        "artifact_sha256": { "const": "180ed444de8b6c9ecd828b369d4c8b9f783758ef22c0b17170682d71f2fd0e72" },
+        "artifact_bytes": { "const": 2012 },
+        "input_sha256": { "const": "6b6054d492e00e68a93bc9b657a69577c7c44f5a48f169adb4124df0a50f6b3c" },
+        "input_bytes": { "const": 12325 },
+        "output_sha256": { "const": "791f3fe1339984e8a8489c12ea5ff479ac7caa07c87be451134d3af0f526bb27" },
+        "output_bytes": { "const": 12325 },
+        "budget_ticks": { "const": 2500000 }
+      },
+      "required": [
+        "schema",
+        "version",
+        "suite_id",
+        "workload_revision",
+        "source_commit",
+        "challenge",
+        "run_id",
+        "manifest_sha256",
+        "transcript_schema_sha256",
+        "platform",
+        "decision_eligible",
+        "clock",
+        "timebase_hz",
+        "hart_id",
+        "hart_count",
+        "cold_boots",
+        "warmup_per_boot",
+        "retained_per_boot",
+        "workload_id",
+        "artifact_sha256",
+        "artifact_bytes",
+        "input_sha256",
+        "input_bytes",
+        "output_sha256",
+        "output_bytes",
+        "budget_ticks"
+      ]
+    },
+    "sample": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": { "const": "vibeos.wasm-aot-decision.sample" },
+        "version": { "const": 1 },
+        "run_id": { "$ref": "#/$defs/hex64" },
+        "challenge": { "$ref": "#/$defs/hex64" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "cold_boot_index": { "type": "integer", "minimum": 0, "maximum": 2 },
+        "sample_index": { "type": "integer", "minimum": 0, "maximum": 23 },
+        "warmup": { "type": "boolean" },
+        "workload_id": { "const": "ssh-case-filter-12k-v1" },
+        "total_ticks": { "type": "integer", "minimum": 1 },
+        "phase_ticks": { "$ref": "#/$defs/phaseTicks" },
+        "intervals": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/interval" }
+        },
+        "read_chunks": { "const": 13 },
+        "write_chunks": { "const": 13 },
+        "fuel_consumed": { "type": "integer", "minimum": 0 },
+        "poll_quanta": { "type": "integer", "minimum": 0 },
+        "terminal": { "const": "success" },
+        "logical_live_after": { "const": 0 },
+        "timed_out": { "const": false },
+        "timeout_phase": { "const": "none" },
+        "exit_status": { "const": 0 },
+        "stdout_bytes": { "const": 12325 },
+        "stdout_sha256": { "const": "791f3fe1339984e8a8489c12ea5ff479ac7caa07c87be451134d3af0f526bb27" },
+        "stderr_bytes": { "const": 0 }
+      },
+      "required": [
+        "schema",
+        "version",
+        "run_id",
+        "challenge",
+        "sequence",
+        "cold_boot_index",
+        "sample_index",
+        "warmup",
+        "workload_id",
+        "total_ticks",
+        "phase_ticks",
+        "intervals",
+        "read_chunks",
+        "write_chunks",
+        "fuel_consumed",
+        "poll_quanta",
+        "terminal",
+        "logical_live_after",
+        "timed_out",
+        "timeout_phase",
+        "exit_status",
+        "stdout_bytes",
+        "stdout_sha256",
+        "stderr_bytes"
+      ]
+    },
+    "end": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": { "const": "vibeos.wasm-aot-decision.end" },
+        "version": { "const": 1 },
+        "run_id": { "$ref": "#/$defs/hex64" },
+        "challenge": { "$ref": "#/$defs/hex64" },
+        "cold_boots": { "const": 3 },
+        "samples": { "const": 72 },
+        "warmups": { "const": 9 },
+        "retained": { "const": 63 },
+        "accumulator": { "type": "integer", "minimum": 0 }
+      },
+      "required": [
+        "schema",
+        "version",
+        "run_id",
+        "challenge",
+        "cold_boots",
+        "samples",
+        "warmups",
+        "retained",
+        "accumulator"
+      ]
+    }
+  }
+}

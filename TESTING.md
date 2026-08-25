@@ -26,6 +26,7 @@ python3 -B scripts/verify-c83-runtime-costs.py --selftest --check-manifest
 python3 -B scripts/qemu-c83-runtime-costs.py --allow-dirty-smoke
 python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
 python3 -B scripts/verify-c83-evidence.py --selftest
+python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
 ```
 
 The C8.2 gate is intentionally pinned to the reviewed
@@ -50,6 +51,16 @@ published. Physical capture also requires the canonical `package-envelope.json`
 and image-verifier audit emitted by the pinned Linux/amd64 SDK packaging flow;
 the recorded container digest is an operator assertion, not hardware
 attestation.
+
+The C8.4 AOT-decision preparation contract is documented in
+[docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md). It freezes the exact
+authorized SSH `case-filter` product workload, its physical-Duo response
+budget, the mutually exclusive profiling phases, and the fail-closed decision
+rule before any profiling result exists. The independent verifier checks the
+checked-in workload/schema bytes against the executable image pin and OpenSSH
+fixture. This preparation gate neither completes C8.3 nor authorizes AOT;
+fixed-QEMU runs are integration evidence only, and a final decision requires
+the documented physical-Duo sample set.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

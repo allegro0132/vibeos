@@ -1,0 +1,184 @@
+{
+  "schema": "vibeos.wasm-aot-decision.manifest",
+  "version": 1,
+  "suite_id": "vibeos.c84.aot-decision",
+  "workload_revision": 1,
+  "scope": {
+    "roadmap_item": "C8.4",
+    "state": "preparation-only",
+    "c83_status": "incomplete-until-three-physical-duo-cold-boots-are-published",
+    "aot_authorized": false,
+    "native_code_accepted": false
+  },
+  "fixture": {
+    "id": "ssh-case-filter-12k-v1",
+    "product_path": "authenticated OpenSSH SessionExec of the image-pinned case-filter command",
+    "transport": "authenticated-openssh-exec",
+    "command": "case-filter",
+    "profile": {
+      "artifact_abi": 1,
+      "component_profile": 1,
+      "core_profile": 1,
+      "runtime_abi": 1,
+      "core_revision": "webassembly-core-2.0-integer-v1",
+      "component_revision": "wasmparser-component-model-0.255.0",
+      "canonical_abi_revision": "component-model-0.255.0-sync",
+      "wasm_tools_revision": "wasm-tools-v1.255.0-76e20611d1920a7a39ca08983c6c77c3060de380",
+      "wasi_revision": "wasi-not-selected-sync",
+      "canonical_features": 7,
+      "stage": "executable"
+    },
+    "policy": {
+      "path": "policy/image/src/lib.rs",
+      "symbol": "SSH_EXEC_COMPONENT",
+      "world": "vibe:stream/filter@1.0.0",
+      "entrypoint": "run",
+      "args": {
+        "minimum": 0,
+        "maximum": 0
+      },
+      "streams": {
+        "stdin": "required",
+        "stdout": "required",
+        "stderr": "optional"
+      },
+      "limits": {
+        "memory_bytes": 524288,
+        "total_fuel": 500000,
+        "poll_quantum": 100,
+        "resources": 4
+      }
+    },
+    "artifact": {
+      "wat_path": "policy/image/artifacts/c53-stream-filter.component.wat",
+      "wat_sha256": "6db36b58350c4de22077fba4dd9dd1166f0808e2adc8488ba086d91c6f659cc1",
+      "builder_path": "policy/image/build.rs",
+      "byte_len": 2012,
+      "sha256": "180ed444de8b6c9ecd828b369d4c8b9f783758ef22c0b17170682d71f2fd0e72"
+    },
+    "input": {
+      "source_path": "scripts/openssh-peer.py",
+      "source_symbol": "CASE_FILTER_INPUT",
+      "generator": "bytes((index * 17 + 3) % 251 for index in range(12 * 1024 + 37))",
+      "byte_len": 12325,
+      "sha256": "6b6054d492e00e68a93bc9b657a69577c7c44f5a48f169adb4124df0a50f6b3c"
+    },
+    "output": {
+      "source_path": "scripts/openssh-peer.py",
+      "source_symbol": "CASE_FILTER_OUTPUT",
+      "transform": "bytes(byte ^ 0x20 for byte in CASE_FILTER_INPUT)",
+      "byte_len": 12325,
+      "sha256": "791f3fe1339984e8a8489c12ea5ff479ac7caa07c87be451134d3af0f526bb27",
+      "exit_status": 0,
+      "stderr_bytes": 0
+    },
+    "chunking": {
+      "maximum_chunk_bytes": 1024,
+      "full_chunks": 12,
+      "final_chunk_bytes": 37,
+      "total_chunks": 13
+    }
+  },
+  "platforms": {
+    "milkv-duo-cv1800b": {
+      "role": "physical-budget-decision",
+      "decision_eligible": true,
+      "board": "Milk-V Duo CV1800B",
+      "cpu": "C906B",
+      "hart_id": 0,
+      "hart_count": 1,
+      "clock": "riscv.rdtime",
+      "timebase_hz": 25000000
+    },
+    "qemu-virt": {
+      "role": "instrumentation-and-integration-only",
+      "decision_eligible": false,
+      "budget_use": "forbidden; QEMU ticks are not converted, combined, or compared with the physical-Duo budget"
+    }
+  },
+  "sampling": {
+    "cold_boots": 3,
+    "warmup_per_boot": 3,
+    "retained_per_boot": 21,
+    "retained_total": 63,
+    "order": "three discarded warmups followed by twenty-one retained samples on each cold boot",
+    "statistics": {
+      "p50": "nearest-rank index ceil(0.50*n)-1 after ascending sort",
+      "p95": "nearest-rank index ceil(0.95*n)-1 after ascending sort",
+      "decision_population": "all 63 retained physical-Duo samples only",
+      "timer_overhead_subtracted": false
+    }
+  },
+  "budget": {
+    "metric": "retained end-to-end response p95",
+    "clock": "riscv.rdtime",
+    "timebase_hz": 25000000,
+    "ticks": 2500000,
+    "milliseconds": 100,
+    "comparison": "miss iff p95(total_ticks) > 2500000",
+    "eligible_platform": "milkv-duo-cv1800b"
+  },
+  "phases": [
+    {
+      "id": "validation",
+      "order": 1,
+      "boundary": "after authenticated SessionExec(case-filter) acceptance through exact credential, policy, manifest, image-root, and plan revalidation, including validator/compiler work and excluding Core/adapter instruction execution",
+      "aot_attributable": false
+    },
+    {
+      "id": "instantiation",
+      "order": 2,
+      "boundary": "owner, arena, CSpace, task envelope, ProfileEngine, SynchronousComponent, ResourceTable, and typed-call construction",
+      "aot_attributable": false
+    },
+    {
+      "id": "abi",
+      "order": 3,
+      "boundary": "Canonical lower/lift, realloc, resource-token, return-pointer, and value encoding/decoding",
+      "aot_attributable": false
+    },
+    {
+      "id": "interpretation",
+      "order": 4,
+      "boundary": "only wasmi Core or adapter instruction execution; validation and compilation are excluded",
+      "aot_attributable": true
+    },
+    {
+      "id": "host",
+      "order": 5,
+      "boundary": "runnable stream read/write/close and SSH pump/protocol transport work",
+      "aot_attributable": false
+    },
+    {
+      "id": "wait",
+      "order": 6,
+      "boundary": "yield, HostPending, backpressure, scheduler, and network waiting",
+      "aot_attributable": false
+    },
+    {
+      "id": "cleanup",
+      "order": 7,
+      "boundary": "after guest Ready or trap through terminal/stream finalization, CSpace/registry/arena/owner reclaim, VSH reaper acknowledgement, and stdout drain",
+      "aot_attributable": false
+    }
+  ],
+  "decision_rule": {
+    "preconditions": "C8.3 is complete and every C8.4 publication gate passes on the eligible physical-Duo dataset",
+    "budget_miss": "p95(total_ticks) > 2500000",
+    "interpretation_attribution": "p95(total_ticks - phase_ticks.interpretation) <= 2500000",
+    "candidate_outcome": "only when both predicates are true, AOT becomes eligible for C8.5 design review",
+    "otherwise": "AOT is not justified for ssh-case-filter-12k-v1",
+    "authorization": "no outcome here authorizes JIT, RWX, external native bytes, or bypass of authoritative component bytes, profile, WIT, CSpace, and admission policy"
+  },
+  "publication_gates": {
+    "precondition": "C8.3 fixed-QEMU and three-cold-boot physical-Duo publication is complete",
+    "identity": "source commit, manifest, schema, artifact, WAT, input, output, command, world, entrypoint, image policy, and platform envelope match exactly",
+    "completeness": "each of three physical cold boots has exactly three warmups then twenty-one retained samples; every coordinate occurs once",
+    "correctness": "every sample exits zero, emits the exact 12325-byte output hash, and emits empty stderr",
+    "successful_samples_only": "timed-out, trapped, failed, truncated, or otherwise non-successful attempts are diagnostic records outside the formal dataset and can never authorize AOT",
+    "phase_partition": "intervals are ordered, gap-free, non-overlapping, and labeled with exactly one of seven phases; total_ticks equals both the response interval and the sum of phase_ticks",
+    "duo_stability": "within each boot retained p95(total_ticks) divided by p50(total_ticks) is at most 1.50",
+    "qemu_exclusion": "QEMU records are integration-only and absent from every budget and attribution statistic",
+    "preparation_only": "this manifest contains no measurement result and does not complete C8.3 or authorize AOT"
+  }
+}

@@ -299,6 +299,16 @@ larger byte allowances.
 ./scripts/bench.py --selftest      # positive and fail-closed SMP parser fixtures
 ```
 
+Replacing the one-hart baseline is an architecture-epoch operation, not a way
+to waive a red comparison. Start from an otherwise clean source tree, use the
+pinned compiler, record the exact QEMU revision used, and rebuild once. Then
+repeat the exact binary with at least three `--no-build` runs. Review every
+metric and the policy-derived limits before committing the JSON. The
+2026-08-25 epoch followed that procedure on QEMU 11.0.3 after a source bisection
+attributed the old IPC/IRQ crossings to reclaimable-dispatch and generational
+instance safety. Its IPC/IRQ ratios were tightened so the larger coordinate
+retains approximately the old absolute regression headroom.
+
 The scaling mode intentionally does not share the deterministic one-hart
 baseline. It boots `-smp 4` with multithreaded TCG, waits for all three remote
 workers before releasing the boot hart, and compares identical integer work run

@@ -12,13 +12,14 @@
 //! skips the future's `Drop`. The callback context is the lineage epoch and is
 //! additionally checked against the exact task and allocation domain.
 //!
-//! The optional Core-poll observer is a caller-owned adapter over an exact
-//! [`RunLease`]; ordinary runtime `poll()` remains untouched. A bounded
-//! delegation seam can bind one still-hidden prepared child to the same
-//! request lineage before scheduler publication. A separate default-off trap
-//! overlay can bracket an interrupt with a linear cookie; SSH and publication
-//! hooks remain deliberately disconnected. Isolated QEMU workers prove each
-//! boundary without composing their exact transcripts.
+//! The optional Core-poll observers are caller-owned adapters over either an
+//! exact [`RunLease`] or a claimed `ChildRunLease`; ordinary runtime `poll()`
+//! remains untouched. A bounded delegation seam can bind one still-hidden
+//! prepared child to the same request lineage before scheduler publication. A
+//! separate default-off trap overlay can bracket an interrupt with a linear
+//! cookie; SSH and publication hooks remain deliberately disconnected.
+//! Isolated QEMU workers prove each boundary without composing their exact
+//! transcripts.
 
 extern crate alloc;
 
@@ -31,7 +32,10 @@ use core::mem;
     feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
 ))]
 use core::sync::atomic::AtomicBool;
-#[cfg(feature = "wasm-c84-profile-irq-overlay")]
+#[cfg(any(
+    feature = "wasm-c84-profile-irq-overlay",
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+))]
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicU8, Ordering};
 
@@ -85,6 +89,22 @@ static ACCEPTANCE_FINISH_CHILD_INERT: AtomicBool = AtomicBool::new(false);
 static ACCEPTANCE_LATE_CLAIM_REJECTED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
 static ACCEPTANCE_FAULT_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_CHILD_CORE_RETURN_TICK: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_OBSERVER_DROP_STICKY: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_OPEN_RELEASE_REJECTED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_OPEN_PHASE_REJECTED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_REPLACEMENT_REJECTED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_CHILD_CORE_OPEN: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_PARENT_MUTATION_RESUME: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+static ACCEPTANCE_PARENT_MUTATION_REJECTED: AtomicBool = AtomicBool::new(false);
 
 /// Acceptance-only destructor that takes the executor's real task-fault
 /// landing pad without printing a kernel panic. If no pad is armed the call
@@ -149,6 +169,8 @@ enum SlotState {
         child: Option<DelegatedChild>,
         child_detach: Option<TaskDetachReason>,
         faults: SlotFaults,
+        #[cfg(feature = "wasm-c84-core-poll-observer")]
+        core_owner: CoreObserverOwner,
     },
     Transit {
         owner: OwnerSeal,
@@ -172,6 +194,14 @@ enum DelegatedChildState {
     Claimed,
     CompletedPendingDetach,
     Abandoned,
+}
+
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoreObserverOwner {
+    Closed,
+    Parent,
+    Child,
 }
 
 #[derive(Clone, Copy)]
@@ -221,6 +251,8 @@ impl SlotFaults {
     const CHILD_OWNER_NOT_CURRENT: Self = Self(1 << 1);
     const CHILD_ABANDONED: Self = Self(1 << 2);
     const CHILD_DETACHED: Self = Self(1 << 3);
+    const CHILD_OBSERVER: Self = Self(1 << 4);
+    const CORE_OBSERVER: Self = Self(1 << 5);
 
     const fn is_empty(self) -> bool {
         self.0 == 0
@@ -232,6 +264,15 @@ impl SlotFaults {
 
     fn insert(&mut self, other: Self) {
         self.0 |= other.0;
+    }
+}
+
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+fn record_open_core_fault(faults: &mut SlotFaults, owner: CoreObserverOwner) {
+    match owner {
+        CoreObserverOwner::Closed => {}
+        CoreObserverOwner::Parent => faults.insert(SlotFaults::CORE_OBSERVER),
+        CoreObserverOwner::Child => faults.insert(SlotFaults::CHILD_OBSERVER),
     }
 }
 
@@ -794,6 +835,8 @@ fn start_reserved(epoch: u64, detach: CurrentTaskDetachLease) -> Result<SampleTo
                 child: None,
                 child_detach: None,
                 faults: SlotFaults::NONE,
+                #[cfg(feature = "wasm-c84-core-poll-observer")]
+                core_owner: CoreObserverOwner::Closed,
             };
             Ok(token)
         }
@@ -875,6 +918,44 @@ fn mark_owner_fault(token: SampleToken, detach: CurrentTaskDetachLease) {
     }
 }
 
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+fn mark_core_observer_fault(token: SampleToken, detach: CurrentTaskDetachLease) {
+    let mut slot = SLOT.lock();
+    if let SlotState::Active {
+        sample,
+        owner,
+        faults,
+        ..
+    } = &mut *slot
+    {
+        if sample.token() == token && owner.matches(token.epoch(), detach) {
+            faults.insert(SlotFaults::CORE_OBSERVER);
+        }
+    }
+}
+
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+fn parent_core_is_closed(
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+) -> Result<bool, ProfileError> {
+    ensure_not_poisoned()?;
+    let slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        owner,
+        core_owner,
+        ..
+    } = &*slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token || !owner.matches(token.epoch(), detach) {
+        return Err(ProfileError::StateMismatch);
+    }
+    Ok(*core_owner == CoreObserverOwner::Closed)
+}
+
 fn apply_phase(
     token: SampleToken,
     detach: CurrentTaskDetachLease,
@@ -886,12 +967,19 @@ fn apply_phase(
         sample,
         owner,
         faults,
+        #[cfg(feature = "wasm-c84-core-poll-observer")]
+        core_owner,
         ..
     } = &mut *slot
     else {
         return Err(ProfileError::StateMismatch);
     };
     if sample.token() != token || !owner.matches(token.epoch(), detach) {
+        return Err(ProfileError::StateMismatch);
+    }
+    #[cfg(feature = "wasm-c84-core-poll-observer")]
+    if *core_owner != CoreObserverOwner::Closed {
+        faults.insert(SlotFaults::CORE_OBSERVER);
         return Err(ProfileError::StateMismatch);
     }
     if !faults.is_empty() {
@@ -903,6 +991,46 @@ fn apply_phase(
         Some(phase) => sample.set_phase(token, context, tick, phase),
         None => sample.begin_cleanup(token, context, tick),
     }
+    let facade = sample.facade_faults();
+    if facade.is_empty() {
+        Ok(())
+    } else {
+        Err(ProfileError::Facade(facade))
+    }
+}
+
+/// Opens parent-owned Interpretation only while no delegated child or other
+/// Core observer owns the request-wide ledger boundary.
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+fn begin_core_phase(
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+) -> Result<(), ProfileError> {
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        owner,
+        child,
+        faults,
+        core_owner,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token || !owner.matches(token.epoch(), detach) {
+        return Err(ProfileError::StateMismatch);
+    }
+    if child.is_some() || *core_owner != CoreObserverOwner::Closed {
+        faults.insert(SlotFaults::CORE_OBSERVER);
+        return Err(ProfileError::StateMismatch);
+    }
+    if !faults.is_empty() {
+        return Err(ProfileError::SlotFault(*faults));
+    }
+    *core_owner = CoreObserverOwner::Parent;
+    sample.set_phase(token, live_context(), live_tick(), Phase::Interpretation);
     let facade = sample.facade_faults();
     if facade.is_empty() {
         Ok(())
@@ -926,6 +1054,7 @@ fn end_core_phase(token: SampleToken, detach: CurrentTaskDetachLease) -> PhaseBo
         sample,
         owner,
         faults,
+        core_owner,
         ..
     } = &mut *slot
     else {
@@ -940,6 +1069,13 @@ fn end_core_phase(token: SampleToken, detach: CurrentTaskDetachLease) -> PhaseBo
             error: Some(ProfileError::StateMismatch),
         };
     }
+    if *core_owner != CoreObserverOwner::Parent {
+        faults.insert(SlotFaults::CORE_OBSERVER);
+        return PhaseBoundary {
+            tick: live_tick(),
+            error: Some(ProfileError::StateMismatch),
+        };
+    }
     if !faults.is_empty() {
         return PhaseBoundary {
             tick: live_tick(),
@@ -949,6 +1085,7 @@ fn end_core_phase(token: SampleToken, detach: CurrentTaskDetachLease) -> PhaseBo
     let context = live_context();
     let tick = live_tick();
     sample.set_phase(token, context, tick, Phase::Abi);
+    *core_owner = CoreObserverOwner::Closed;
     let facade = sample.facade_faults();
     PhaseBoundary {
         tick,
@@ -1037,6 +1174,13 @@ fn finish_active(token: SampleToken, detach: CurrentTaskDetachLease) -> Result<(
         if !exact {
             return Err(ProfileError::StateMismatch);
         }
+        #[cfg(feature = "wasm-c84-core-poll-observer")]
+        if let SlotState::Active {
+            core_owner, faults, ..
+        } = &mut *slot
+        {
+            record_open_core_fault(faults, *core_owner);
+        }
         let context = live_context();
         let tick = live_tick();
         let owner = OwnerSeal {
@@ -1065,6 +1209,7 @@ fn finish_active(token: SampleToken, detach: CurrentTaskDetachLease) -> Result<(
             child,
             child_detach,
             faults,
+            ..
         } = previous
         else {
             poison(SlotPoison::StateMismatch);
@@ -1145,6 +1290,13 @@ fn cancel_active(
         if !exact {
             return Err(ProfileError::StateMismatch);
         }
+        #[cfg(feature = "wasm-c84-core-poll-observer")]
+        if let SlotState::Active {
+            core_owner, faults, ..
+        } = &mut *slot
+        {
+            record_open_core_fault(faults, *core_owner);
+        }
         let context = live_context();
         let owner = OwnerSeal {
             epoch: token.epoch(),
@@ -1195,17 +1347,27 @@ fn attach_prepared_child(
     }
     {
         ensure_not_poisoned()?;
-        let slot = SLOT.lock();
-        match &*slot {
+        let mut slot = SLOT.lock();
+        match &mut *slot {
             SlotState::Active {
                 sample,
                 owner,
                 child: None,
                 child_detach: None,
                 faults,
+                #[cfg(feature = "wasm-c84-core-poll-observer")]
+                core_owner,
+                ..
             } if sample.token() == token
                 && owner.matches(token.epoch(), parent)
-                && faults.is_empty() => {}
+                && faults.is_empty() =>
+            {
+                #[cfg(feature = "wasm-c84-core-poll-observer")]
+                if *core_owner != CoreObserverOwner::Closed {
+                    faults.insert(SlotFaults::CORE_OBSERVER);
+                    return Err(ProfileError::StateMismatch);
+                }
+            }
             SlotState::Active {
                 sample,
                 owner,
@@ -1248,6 +1410,9 @@ fn attach_prepared_child(
             child,
             child_detach,
             faults,
+            #[cfg(feature = "wasm-c84-core-poll-observer")]
+            core_owner,
+            ..
         } if sample.token() == token
             && owner.matches(token.epoch(), parent)
             && child.is_none()
@@ -1255,6 +1420,11 @@ fn attach_prepared_child(
             && faults.is_empty()
             && poison_reason().is_none() =>
         {
+            #[cfg(feature = "wasm-c84-core-poll-observer")]
+            if *core_owner != CoreObserverOwner::Closed {
+                faults.insert(SlotFaults::CORE_OBSERVER);
+                return Err(ProfileError::StateMismatch);
+            }
             *child = Some(delegated);
             Ok(())
         }
@@ -1279,6 +1449,8 @@ fn claim_current_child() -> Result<ChildRunLease, ProfileError> {
             sample,
             child: Some(child),
             faults,
+            #[cfg(feature = "wasm-c84-core-poll-observer")]
+            core_owner,
             ..
         } = &*slot
         else {
@@ -1289,6 +1461,10 @@ fn claim_current_child() -> Result<ChildRunLease, ProfileError> {
         }
         if !faults.is_empty() {
             return Err(ProfileError::SlotFault(*faults));
+        }
+        #[cfg(feature = "wasm-c84-core-poll-observer")]
+        if *core_owner != CoreObserverOwner::Closed {
+            return Err(ProfileError::DelegatedChildUnavailable);
         }
         (sample.token(), child.detach)
     };
@@ -1305,12 +1481,18 @@ fn claim_current_child() -> Result<ChildRunLease, ProfileError> {
             sample,
             child: Some(child),
             faults,
+            #[cfg(feature = "wasm-c84-core-poll-observer")]
+            core_owner,
             ..
         } if sample.token() == token
             && child.matches(token.epoch(), detach)
             && child.state == DelegatedChildState::Attached
             && faults.is_empty() =>
         {
+            #[cfg(feature = "wasm-c84-core-poll-observer")]
+            if *core_owner != CoreObserverOwner::Closed {
+                return Err(ProfileError::DelegatedChildUnavailable);
+            }
             child.state = DelegatedChildState::Claimed;
             Ok(ChildRunLease {
                 token,
@@ -1339,6 +1521,53 @@ fn mark_child_fault(token: SampleToken, detach: PreparedTaskDetachSeal) {
     }
 }
 
+#[cfg(all(
+    feature = "wasm-c84-profile-child-delegation",
+    feature = "wasm-c84-core-poll-observer"
+))]
+fn mark_child_observer_fault(token: SampleToken, detach: PreparedTaskDetachSeal) {
+    let mut slot = SLOT.lock();
+    if let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        ..
+    } = &mut *slot
+    {
+        if sample.token() == token && child.matches(token.epoch(), detach) {
+            faults.insert(SlotFaults::CHILD_OBSERVER);
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "wasm-c84-profile-child-delegation",
+    feature = "wasm-c84-core-poll-observer"
+))]
+fn child_core_is_closed(
+    token: SampleToken,
+    detach: PreparedTaskDetachSeal,
+) -> Result<bool, ProfileError> {
+    ensure_not_poisoned()?;
+    let slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        core_owner,
+        ..
+    } = &*slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token
+        || !child.matches(token.epoch(), detach)
+        || child.state != DelegatedChildState::Claimed
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    Ok(*core_owner == CoreObserverOwner::Closed)
+}
+
 #[cfg(feature = "wasm-c84-profile-child-delegation")]
 fn apply_child_phase(
     token: SampleToken,
@@ -1351,6 +1580,8 @@ fn apply_child_phase(
         sample,
         child: Some(child),
         faults,
+        #[cfg(feature = "wasm-c84-core-poll-observer")]
+        core_owner,
         ..
     } = &mut *slot
     else {
@@ -1360,6 +1591,11 @@ fn apply_child_phase(
         || !child.matches(token.epoch(), detach)
         || child.state != DelegatedChildState::Claimed
     {
+        return Err(ProfileError::StateMismatch);
+    }
+    #[cfg(feature = "wasm-c84-core-poll-observer")]
+    if *core_owner != CoreObserverOwner::Closed {
+        faults.insert(SlotFaults::CHILD_OBSERVER);
         return Err(ProfileError::StateMismatch);
     }
     if !faults.is_empty() {
@@ -1374,14 +1610,24 @@ fn apply_child_phase(
     }
 }
 
-#[cfg(feature = "wasm-c84-profile-child-delegation")]
-fn release_child(token: SampleToken, detach: PreparedTaskDetachSeal) -> Result<(), ProfileError> {
+/// Opens child-owned Interpretation in the globally resident lineage before
+/// the portable runtime enters Core. Keeping the bit in `SLOT` makes an open
+/// edge observable even if both storage-free owner objects are forgotten.
+#[cfg(all(
+    feature = "wasm-c84-profile-child-delegation",
+    feature = "wasm-c84-core-poll-observer"
+))]
+fn begin_child_core_phase(
+    token: SampleToken,
+    detach: PreparedTaskDetachSeal,
+) -> Result<(), ProfileError> {
     ensure_not_poisoned()?;
     let mut slot = SLOT.lock();
     let SlotState::Active {
         sample,
         child: Some(child),
         faults,
+        core_owner,
         ..
     } = &mut *slot
     else {
@@ -1391,6 +1637,115 @@ fn release_child(token: SampleToken, detach: PreparedTaskDetachSeal) -> Result<(
         || !child.matches(token.epoch(), detach)
         || child.state != DelegatedChildState::Claimed
     {
+        return Err(ProfileError::StateMismatch);
+    }
+    if *core_owner != CoreObserverOwner::Closed {
+        faults.insert(SlotFaults::CHILD_OBSERVER);
+        return Err(ProfileError::StateMismatch);
+    }
+    if !faults.is_empty() {
+        return Err(ProfileError::SlotFault(*faults));
+    }
+    *core_owner = CoreObserverOwner::Child;
+    sample.set_phase(token, live_context(), live_tick(), Phase::Interpretation);
+    let facade = sample.facade_faults();
+    if facade.is_empty() {
+        Ok(())
+    } else {
+        Err(ProfileError::Facade(facade))
+    }
+}
+
+/// Closes child-owned Interpretation with the same exact tick returned to the
+/// portable runtime observer. The parent lease is deliberately absent: the
+/// complete prepared-task seal and `Claimed` state are the only authority for
+/// mutating a delegated child's Core boundary.
+#[cfg(all(
+    feature = "wasm-c84-profile-child-delegation",
+    feature = "wasm-c84-core-poll-observer"
+))]
+fn end_child_core_phase(token: SampleToken, detach: PreparedTaskDetachSeal) -> PhaseBoundary {
+    if let Err(error) = ensure_not_poisoned() {
+        return PhaseBoundary {
+            tick: live_tick(),
+            error: Some(error),
+        };
+    }
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        core_owner,
+        ..
+    } = &mut *slot
+    else {
+        return PhaseBoundary {
+            tick: live_tick(),
+            error: Some(ProfileError::StateMismatch),
+        };
+    };
+    if sample.token() != token
+        || !child.matches(token.epoch(), detach)
+        || child.state != DelegatedChildState::Claimed
+    {
+        return PhaseBoundary {
+            tick: live_tick(),
+            error: Some(ProfileError::StateMismatch),
+        };
+    }
+    if *core_owner != CoreObserverOwner::Child {
+        faults.insert(SlotFaults::CHILD_OBSERVER);
+        return PhaseBoundary {
+            tick: live_tick(),
+            error: Some(ProfileError::StateMismatch),
+        };
+    }
+    if !faults.is_empty() {
+        return PhaseBoundary {
+            tick: live_tick(),
+            error: Some(ProfileError::SlotFault(*faults)),
+        };
+    }
+    let context = live_context();
+    let tick = live_tick();
+    sample.set_phase(token, context, tick, Phase::Abi);
+    *core_owner = CoreObserverOwner::Closed;
+    let facade = sample.facade_faults();
+    PhaseBoundary {
+        tick,
+        error: if facade.is_empty() {
+            None
+        } else {
+            Some(ProfileError::Facade(facade))
+        },
+    }
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation")]
+fn release_child(token: SampleToken, detach: PreparedTaskDetachSeal) -> Result<(), ProfileError> {
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        #[cfg(feature = "wasm-c84-core-poll-observer")]
+        core_owner,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token
+        || !child.matches(token.epoch(), detach)
+        || child.state != DelegatedChildState::Claimed
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    #[cfg(feature = "wasm-c84-core-poll-observer")]
+    if *core_owner != CoreObserverOwner::Closed {
+        faults.insert(SlotFaults::CHILD_OBSERVER);
         return Err(ProfileError::StateMismatch);
     }
     if !faults.is_empty() {
@@ -1418,12 +1773,18 @@ fn abandon_child(token: SampleToken, detach: PreparedTaskDetachSeal) {
         sample,
         child: Some(child),
         faults,
+        #[cfg(feature = "wasm-c84-core-poll-observer")]
+        core_owner,
         ..
     } = &mut *slot
     {
         if sample.token() == token && child.matches(token.epoch(), detach) {
             if !exact_scope {
                 faults.insert(SlotFaults::CHILD_OWNER_NOT_CURRENT);
+            }
+            #[cfg(feature = "wasm-c84-core-poll-observer")]
+            if *core_owner == CoreObserverOwner::Child {
+                faults.insert(SlotFaults::CHILD_OBSERVER);
             }
             faults.insert(SlotFaults::CHILD_ABANDONED);
             child.state = DelegatedChildState::Abandoned;
@@ -1479,7 +1840,7 @@ impl RunLease {
             mark_owner_fault(self.token, self.detach);
             Some(ProfileError::OwnerNotCurrent)
         } else {
-            apply_phase(self.token, self.detach, Some(Phase::Interpretation)).err()
+            begin_core_phase(self.token, self.detach).err()
         }
     }
 
@@ -1553,6 +1914,28 @@ impl ChildRunLease {
         apply_child_phase(self.token, self.detach, phase)
     }
 
+    #[cfg(feature = "wasm-c84-core-poll-observer")]
+    fn begin_core_interpretation(&self) -> Option<ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            mark_child_fault(self.token, self.detach);
+            Some(ProfileError::OwnerNotCurrent)
+        } else {
+            begin_child_core_phase(self.token, self.detach).err()
+        }
+    }
+
+    #[cfg(feature = "wasm-c84-core-poll-observer")]
+    fn end_core_interpretation(&self) -> PhaseBoundary {
+        if !self.detach.is_current_running_exact() {
+            mark_child_fault(self.token, self.detach);
+            return PhaseBoundary {
+                tick: live_tick(),
+                error: Some(ProfileError::OwnerNotCurrent),
+            };
+        }
+        end_child_core_phase(self.token, self.detach)
+    }
+
     pub(crate) fn release(mut self) -> Result<(), ProfileError> {
         if !self.detach.is_current_running_exact() {
             mark_child_fault(self.token, self.detach);
@@ -1581,27 +1964,39 @@ pub(crate) fn claim_delegated_child() -> Result<ChildRunLease, ProfileError> {
     claim_current_child()
 }
 
-/// Lexically scoped bridge from portable Core observers to one exact slot
-/// owner. Construct one around each `poll_profiled` call and inspect its sticky
-/// error and closed state before the next poll or any `.await`.
-#[cfg(feature = "wasm-c84-core-poll-observer")]
-pub(crate) struct SlotCorePollClock<'a> {
-    run: &'a RunLease,
+/// Lexically scoped Core observer owned by one exact claimed child.
+///
+/// The observer borrows no parent `RunLease`, so it cannot finish, cancel,
+/// stream, or recycle the request. Any local start/finish protocol violation
+/// is copied into the slot's sticky child-fault ledger; ignoring `error()` can
+/// therefore never turn a malformed observer sequence into verified evidence.
+#[cfg(all(
+    feature = "wasm-c84-profile-child-delegation",
+    feature = "wasm-c84-core-poll-observer"
+))]
+pub(crate) struct ChildSlotCorePollClock<'a> {
+    child: &'a mut ChildRunLease,
     first_error: Option<ProfileError>,
-    core_open: bool,
+    owns_open: bool,
 }
 
-#[cfg(feature = "wasm-c84-core-poll-observer")]
-impl<'a> SlotCorePollClock<'a> {
-    pub(crate) const fn new(run: &'a RunLease) -> Self {
+#[cfg(all(
+    feature = "wasm-c84-profile-child-delegation",
+    feature = "wasm-c84-core-poll-observer"
+))]
+impl<'a> ChildSlotCorePollClock<'a> {
+    pub(crate) const fn new(child: &'a mut ChildRunLease) -> Self {
         Self {
-            run,
+            child,
             first_error: None,
-            core_open: false,
+            owns_open: false,
         }
     }
 
     fn latch(&mut self, error: Option<ProfileError>) {
+        if error.is_some() {
+            mark_child_observer_fault(self.child.token, self.child.detach);
+        }
         if self.first_error.is_none() {
             self.first_error = error;
         }
@@ -1611,8 +2006,97 @@ impl<'a> SlotCorePollClock<'a> {
         self.first_error
     }
 
-    pub(crate) const fn core_is_closed(&self) -> bool {
-        !self.core_open
+    pub(crate) fn core_is_closed(&self) -> bool {
+        matches!(
+            child_core_is_closed(self.child.token, self.child.detach),
+            Ok(true)
+        )
+    }
+}
+
+#[cfg(all(
+    feature = "wasm-c84-profile-child-delegation",
+    feature = "wasm-c84-core-poll-observer"
+))]
+impl ProfileClock for ChildSlotCorePollClock<'_> {
+    fn ticks(&mut self) -> u64 {
+        live_tick()
+    }
+
+    fn core_poll_started(&mut self) -> u64 {
+        if self.owns_open {
+            self.latch(Some(ProfileError::StateMismatch));
+            return live_tick();
+        }
+        let error = self.child.begin_core_interpretation();
+        self.owns_open = error.is_none();
+        self.latch(error);
+        live_tick()
+    }
+
+    fn core_poll_finished(&mut self) -> u64 {
+        if !self.owns_open {
+            self.latch(Some(ProfileError::StateMismatch));
+            return live_tick();
+        }
+        self.owns_open = false;
+        let boundary = self.child.end_core_interpretation();
+        self.latch(boundary.error);
+        boundary.tick
+    }
+}
+
+#[cfg(all(
+    feature = "wasm-c84-profile-child-delegation",
+    feature = "wasm-c84-core-poll-observer"
+))]
+impl Drop for ChildSlotCorePollClock<'_> {
+    fn drop(&mut self) {
+        if self.owns_open {
+            self.owns_open = false;
+            mark_child_observer_fault(self.child.token, self.child.detach);
+        }
+    }
+}
+
+/// Lexically scoped bridge from portable Core observers to one exact slot
+/// owner. Construct one around each `poll_profiled` call and inspect its sticky
+/// error and closed state before the next poll or any `.await`.
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+pub(crate) struct SlotCorePollClock<'a> {
+    run: &'a RunLease,
+    first_error: Option<ProfileError>,
+    owns_open: bool,
+}
+
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+impl<'a> SlotCorePollClock<'a> {
+    pub(crate) const fn new(run: &'a RunLease) -> Self {
+        Self {
+            run,
+            first_error: None,
+            owns_open: false,
+        }
+    }
+
+    fn latch(&mut self, error: Option<ProfileError>) {
+        if error.is_some() {
+            mark_core_observer_fault(self.run.token, self.run.detach);
+        }
+        if self.first_error.is_none() {
+            self.first_error = error;
+        }
+    }
+
+    pub(crate) const fn error(&self) -> Option<ProfileError> {
+        self.first_error
+    }
+
+    pub(crate) fn core_is_closed(&self) -> bool {
+        matches!(
+            parent_core_is_closed(self.run.token, self.run.detach),
+            Ok(true)
+        )
     }
 }
 
@@ -1623,26 +2107,36 @@ impl ProfileClock for SlotCorePollClock<'_> {
     }
 
     fn core_poll_started(&mut self) -> u64 {
-        if self.core_open {
+        if self.owns_open {
             self.latch(Some(ProfileError::StateMismatch));
             return live_tick();
         }
-        self.core_open = true;
         let error = self.run.begin_core_interpretation();
+        self.owns_open = error.is_none();
         self.latch(error);
         // The portable contract requires this to be the final observer work.
         live_tick()
     }
 
     fn core_poll_finished(&mut self) -> u64 {
-        if !self.core_open {
+        if !self.owns_open {
             self.latch(Some(ProfileError::StateMismatch));
             return live_tick();
         }
-        self.core_open = false;
+        self.owns_open = false;
         let boundary = self.run.end_core_interpretation();
         self.latch(boundary.error);
         boundary.tick
+    }
+}
+
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+impl Drop for SlotCorePollClock<'_> {
+    fn drop(&mut self) {
+        if self.owns_open {
+            self.owns_open = false;
+            mark_core_observer_fault(self.run.token, self.run.detach);
+        }
     }
 }
 
@@ -1889,6 +2383,8 @@ unsafe fn profile_child_detached(
         child,
         child_detach,
         faults,
+        #[cfg(feature = "wasm-c84-core-poll-observer")]
+        core_owner,
         ..
     } = &mut *slot
     else {
@@ -1902,10 +2398,14 @@ unsafe fn profile_child_detached(
         return;
     }
 
-    let state = child
+    let exact_child = child
         .as_ref()
-        .expect("exact delegated child was checked above")
-        .state;
+        .expect("exact delegated child was checked above");
+    let state = exact_child.state;
+    #[cfg(feature = "wasm-c84-core-poll-observer")]
+    if *core_owner == CoreObserverOwner::Child {
+        faults.insert(SlotFaults::CHILD_OBSERVER);
+    }
     let clean =
         state == DelegatedChildState::CompletedPendingDetach && reason == TaskDetachReason::Exited;
     if !clean {
@@ -1978,10 +2478,19 @@ unsafe fn profile_task_detached(
                         kind: TransitKind::Cancel,
                     },
                 );
-                let SlotState::Active { sample, faults, .. } = previous else {
+                let SlotState::Active {
+                    sample,
+                    mut faults,
+                    #[cfg(feature = "wasm-c84-core-poll-observer")]
+                    core_owner,
+                    ..
+                } = previous
+                else {
                     poison(SlotPoison::StateMismatch);
                     return;
                 };
+                #[cfg(feature = "wasm-c84-core-poll-observer")]
+                record_open_core_fault(&mut faults, core_owner);
                 DetachAction::Cancel {
                     sample,
                     owner,
@@ -2551,6 +3060,60 @@ fn require_delegated_rejection(
     Ok(())
 }
 
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+fn require_child_observer_rejection(
+    result: Result<StreamLease, ProfileError>,
+    epoch: u64,
+    abandoned: bool,
+    parent_observer: bool,
+) -> Result<(), ProfileError> {
+    let report = match result {
+        Err(ProfileError::Rejected(report)) => report,
+        Err(error) => return Err(error),
+        Ok(stream) => {
+            drop(stream);
+            return Err(ProfileError::StateMismatch);
+        }
+    };
+    let mut expected_faults = SlotFaults::NONE;
+    expected_faults.insert(SlotFaults::CHILD_OBSERVER);
+    if abandoned {
+        expected_faults.insert(SlotFaults::CHILD_ABANDONED);
+    }
+    if parent_observer {
+        expected_faults.insert(SlotFaults::CORE_OBSERVER);
+    }
+    expected_faults.insert(SlotFaults::CHILD_DETACHED);
+    if report.epoch != epoch
+        || report.cause != RejectionCause::DelegatedTaskDetached(TaskDetachReason::Exited)
+        || report.slot_faults != expected_faults
+        || !report.facade_faults.is_empty()
+        || report.ledger_error.is_some()
+    {
+        return Err(ProfileError::Rejected(report));
+    }
+    acknowledge_rejection(epoch)?;
+    Ok(())
+}
+
+#[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+fn acceptance_child_observer_drop_is_sticky(child: &ChildRunLease) -> bool {
+    let slot = SLOT.lock();
+    matches!(
+        &*slot,
+        SlotState::Active {
+            sample,
+            child: Some(exact),
+            faults,
+            core_owner: CoreObserverOwner::Child,
+            ..
+        } if sample.token() == child.token
+            && exact.matches(child.token.epoch(), child.detach)
+            && exact.state == DelegatedChildState::Claimed
+            && faults.contains(SlotFaults::CHILD_OBSERVER)
+    )
+}
+
 /// Prove the narrow request-parent -> prepared-child lineage without touching
 /// the ordinary component runner. The accepted child is sealed before batch
 /// publication, may mutate phases and receive a real SSIP only while exact,
@@ -2568,6 +3131,14 @@ async fn run_child_delegation_positive_acceptance() -> Result<(), ProfileError> 
     ACCEPTANCE_FINISH_CHILD_INERT.store(false, Ordering::Release);
     ACCEPTANCE_LATE_CLAIM_REJECTED.store(false, Ordering::Release);
     ACCEPTANCE_FAULT_ARMED.store(false, Ordering::Release);
+    ACCEPTANCE_CHILD_CORE_RETURN_TICK.store(0, Ordering::Release);
+    ACCEPTANCE_OBSERVER_DROP_STICKY.store(false, Ordering::Release);
+    ACCEPTANCE_OPEN_RELEASE_REJECTED.store(false, Ordering::Release);
+    ACCEPTANCE_OPEN_PHASE_REJECTED.store(false, Ordering::Release);
+    ACCEPTANCE_REPLACEMENT_REJECTED.store(false, Ordering::Release);
+    ACCEPTANCE_CHILD_CORE_OPEN.store(false, Ordering::Release);
+    ACCEPTANCE_PARENT_MUTATION_RESUME.store(false, Ordering::Release);
+    ACCEPTANCE_PARENT_MUTATION_REJECTED.store(false, Ordering::Release);
 
     let ready_one = SlotStatus::Ready {
         next_epoch: Some(1),
@@ -2598,7 +3169,7 @@ async fn run_child_delegation_positive_acceptance() -> Result<(), ProfileError> 
         ACCEPTANCE_WRONG_TASK_INERT.store(claim_inert && irq_inert, Ordering::Release);
     });
     batch.prepare("c84-delegation-exact", async {
-        let Ok(child) = claim_delegated_child() else {
+        let Ok(mut child) = claim_delegated_child() else {
             return;
         };
         ACCEPTANCE_CHILD_CLAIMED.store(true, Ordering::Release);
@@ -2606,6 +3177,18 @@ async fn run_child_delegation_positive_acceptance() -> Result<(), ProfileError> 
         if child.set_phase(Phase::Abi).is_err() {
             return;
         }
+        let mut clock = ChildSlotCorePollClock::new(&mut child);
+        let core_started = clock.core_poll_started();
+        wait_for_tick_progress();
+        let core_finished = clock.core_poll_finished();
+        if core_finished.wrapping_sub(core_started) == 0
+            || clock.error().is_some()
+            || !clock.core_is_closed()
+        {
+            return;
+        }
+        ACCEPTANCE_CHILD_CORE_RETURN_TICK.store(core_finished, Ordering::Release);
+        drop(clock);
         wait_for_tick_progress();
         if force_boot_self_ssip(true).is_err() {
             return;
@@ -2669,6 +3252,7 @@ async fn run_child_delegation_positive_acceptance() -> Result<(), ProfileError> 
     let summary = stream.summary()?;
     if !summary.intervals_complete()
         || summary.phase_ticks().abi == 0
+        || summary.phase_ticks().interpretation == 0
         || summary.phase_ticks().host == 0
         || summary.phase_ticks().wait == 0
     {
@@ -2676,14 +3260,27 @@ async fn run_child_delegation_positive_acceptance() -> Result<(), ProfileError> 
     }
     let mut count = 0;
     let mut previous_end = 0;
+    let mut interpretation_end_tick = None;
     while let Some(interval) = stream.next_interval()? {
         if interval.sequence() != count || interval.start_offset_ticks() != previous_end {
             return Err(ProfileError::StateMismatch);
         }
+        if interval.phase() == Phase::Interpretation {
+            interpretation_end_tick = Some(
+                summary
+                    .start_tick()
+                    .wrapping_add(interval.end_offset_ticks()),
+            );
+        }
         previous_end = interval.end_offset_ticks();
         count += 1;
     }
-    if count != summary.interval_count() || previous_end != summary.total_ticks() {
+    let returned_core_end = ACCEPTANCE_CHILD_CORE_RETURN_TICK.load(Ordering::Acquire);
+    if returned_core_end == 0
+        || interpretation_end_tick != Some(returned_core_end)
+        || count != summary.interval_count()
+        || previous_end != summary.total_ticks()
+    {
         return Err(ProfileError::StateMismatch);
     }
     stream.complete()?;
@@ -2907,11 +3504,243 @@ async fn run_child_delegation_positive_acceptance() -> Result<(), ProfileError> 
     wait_for_task_state(&handles[0], TaskState::Faulted).await?;
     require_delegated_rejection(run.finish(), 8, TaskDetachReason::Faulted, false)?;
 
-    let ready_nine = SlotStatus::Ready {
-        next_epoch: Some(9),
+    // Epoch 9: a child-side Core observer finish without a matching start is
+    // sticky even if the immediate error is ignored. The child cannot complete
+    // cleanly, and the parent must reject the otherwise ordinary Exited edge.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 9 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-observer-fault", async {
+        let Ok(mut child) = claim_delegated_child() else {
+            return;
+        };
+        let mut clock = ChildSlotCorePollClock::new(&mut child);
+        let _ = clock.core_poll_finished();
+        if clock.error() != Some(ProfileError::StateMismatch) || !clock.core_is_closed() {
+            return;
+        }
+        drop(clock);
+        drop(child);
+    });
+    run.attach_prepared_child(&mut batch, 0)?;
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_task_state(&handles[0], TaskState::Exited).await?;
+    require_child_observer_rejection(run.finish(), 9, true, false)?;
+
+    // Epoch 10: dropping an open child observer is independently sticky. No
+    // immediate return value exists for the caller to inspect, so the final
+    // parent rejection is the only acceptable outcome.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 10 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-observer-drop-open", async {
+        let Ok(mut child) = claim_delegated_child() else {
+            return;
+        };
+        let mut clock = ChildSlotCorePollClock::new(&mut child);
+        let _ = clock.core_poll_started();
+        wait_for_tick_progress();
+        drop(clock);
+        ACCEPTANCE_OBSERVER_DROP_STICKY.store(
+            acceptance_child_observer_drop_is_sticky(&child),
+            Ordering::Release,
+        );
+        drop(child);
+    });
+    run.attach_prepared_child(&mut batch, 0)?;
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_task_state(&handles[0], TaskState::Exited).await?;
+    if !ACCEPTANCE_OBSERVER_DROP_STICKY.load(Ordering::Acquire) {
+        return Err(ProfileError::StateMismatch);
+    }
+    require_child_observer_rejection(run.finish(), 10, true, false)?;
+
+    // Epoch 11: forgetting an open observer leaves the request-wide Core edge
+    // latched in SLOT. Release itself must reject before ChildRunLease Drop can
+    // contribute an abandonment fault.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 11 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-observer-release-open", async {
+        let Ok(mut child) = claim_delegated_child() else {
+            return;
+        };
+        let mut clock = ChildSlotCorePollClock::new(&mut child);
+        let _ = clock.core_poll_started();
+        wait_for_tick_progress();
+        core::mem::forget(clock);
+        ACCEPTANCE_OPEN_RELEASE_REJECTED.store(
+            matches!(child.release(), Err(ProfileError::StateMismatch)),
+            Ordering::Release,
+        );
+    });
+    run.attach_prepared_child(&mut batch, 0)?;
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_task_state(&handles[0], TaskState::Exited).await?;
+    if !ACCEPTANCE_OPEN_RELEASE_REJECTED.load(Ordering::Acquire) {
+        return Err(ProfileError::StateMismatch);
+    }
+    require_child_observer_rejection(run.finish(), 11, true, false)?;
+
+    // Epoch 12: direct phase mutation and a replacement observer are each
+    // checked independently while the forgotten observer still owns Core.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 12 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-observer-forget-open", async {
+        let Ok(mut child) = claim_delegated_child() else {
+            return;
+        };
+        let mut clock = ChildSlotCorePollClock::new(&mut child);
+        let _ = clock.core_poll_started();
+        wait_for_tick_progress();
+        core::mem::forget(clock);
+        ACCEPTANCE_OPEN_PHASE_REJECTED.store(
+            matches!(
+                child.set_phase(Phase::Abi),
+                Err(ProfileError::StateMismatch)
+            ),
+            Ordering::Release,
+        );
+        let mut replacement = ChildSlotCorePollClock::new(&mut child);
+        let _ = replacement.core_poll_started();
+        ACCEPTANCE_REPLACEMENT_REJECTED.store(
+            replacement.error() == Some(ProfileError::StateMismatch)
+                && !replacement.core_is_closed(),
+            Ordering::Release,
+        );
+        drop(replacement);
+        let _ = child.release();
+    });
+    run.attach_prepared_child(&mut batch, 0)?;
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_task_state(&handles[0], TaskState::Exited).await?;
+    if !ACCEPTANCE_OPEN_PHASE_REJECTED.load(Ordering::Acquire)
+        || !ACCEPTANCE_REPLACEMENT_REJECTED.load(Ordering::Acquire)
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    require_child_observer_rejection(run.finish(), 12, true, false)?;
+
+    // Epoch 13: forgetting both the open observer and its child owner still
+    // leaves the Core edge in SLOT. The exact terminal callback must preserve
+    // CHILD_OBSERVER without fabricating a ChildRunLease Drop.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 13 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-observer-double-forget", async {
+        let Ok(mut child) = claim_delegated_child() else {
+            return;
+        };
+        let mut clock = ChildSlotCorePollClock::new(&mut child);
+        let _ = clock.core_poll_started();
+        wait_for_tick_progress();
+        core::mem::forget(clock);
+        core::mem::forget(child);
+    });
+    run.attach_prepared_child(&mut batch, 0)?;
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_task_state(&handles[0], TaskState::Exited).await?;
+    require_child_observer_rejection(run.finish(), 13, false, false)?;
+
+    // Epoch 14: while child Core is open, the parent cannot mutate the ledger.
+    // Its rejected phase write becomes a parent-observer fault; the child's
+    // subsequent close also fails closed and records the child side.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 14 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-delegation-parent-mutation", async {
+        let Ok(mut child) = claim_delegated_child() else {
+            return;
+        };
+        let mut clock = ChildSlotCorePollClock::new(&mut child);
+        let _ = clock.core_poll_started();
+        if clock.error().is_some() || clock.core_is_closed() {
+            return;
+        }
+        ACCEPTANCE_CHILD_CORE_OPEN.store(true, Ordering::Release);
+        for _ in 0..1_024 {
+            if ACCEPTANCE_PARENT_MUTATION_RESUME.load(Ordering::Acquire) {
+                break;
+            }
+            crate::exec::yield_now().await;
+        }
+        if !ACCEPTANCE_PARENT_MUTATION_RESUME.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = clock.core_poll_finished();
+        drop(clock);
+        drop(child);
+    });
+    run.attach_prepared_child(&mut batch, 0)?;
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_acceptance_flag(&ACCEPTANCE_CHILD_CORE_OPEN).await?;
+    let parent_rejected = matches!(run.set_phase(Phase::Host), Err(ProfileError::StateMismatch));
+    ACCEPTANCE_PARENT_MUTATION_REJECTED.store(parent_rejected, Ordering::Release);
+    ACCEPTANCE_PARENT_MUTATION_RESUME.store(true, Ordering::Release);
+    wait_for_task_state(&handles[0], TaskState::Exited).await?;
+    if !ACCEPTANCE_PARENT_MUTATION_REJECTED.load(Ordering::Acquire) {
+        return Err(ProfileError::StateMismatch);
+    }
+    require_child_observer_rejection(run.finish(), 14, true, true)?;
+
+    // Epoch 15: forgetting both a parent-owned open observer and its RunLease
+    // leaves only the exact owner-task detach callback. It must preserve the
+    // global Core owner fault while cancelling and recycling the sample.
+    let mut batch = PreparedTaskBatch::new();
+    batch.prepare("c84-parent-observer-double-forget", async {
+        let Ok(permit) = prepare_current() else {
+            return;
+        };
+        if permit.expected_epoch() != 15 {
+            return;
+        }
+        let Ok(run) = permit.start() else {
+            return;
+        };
+        let mut clock = SlotCorePollClock::new(&run);
+        let _ = clock.core_poll_started();
+        wait_for_tick_progress();
+        core::mem::forget(clock);
+        core::mem::forget(run);
+    });
+    let handles = batch.publish().map_err(|_| ProfileError::StateMismatch)?;
+    wait_for_task_state(&handles[0], TaskState::Exited).await?;
+    let report = rejection().ok_or(ProfileError::StateMismatch)?;
+    if report.epoch != 15
+        || report.cause != RejectionCause::TaskDetached(TaskDetachReason::Exited)
+        || report.slot_faults != SlotFaults::CORE_OBSERVER
+        || !report.facade_faults.is_empty()
+        || report.ledger_error.is_some()
+        || report.intervals_emitted != 0
+    {
+        return Err(ProfileError::Rejected(report));
+    }
+    acknowledge_rejection(15)?;
+
+    let ready_sixteen = SlotStatus::Ready {
+        next_epoch: Some(16),
     };
     force_boot_self_ssip(false)?;
-    if status() != ready_nine || ACTIVE_EPOCH.load(Ordering::Acquire) != 0 {
+    if status() != ready_sixteen || ACTIVE_EPOCH.load(Ordering::Acquire) != 0 {
         return Err(ProfileError::StateMismatch);
     }
     Ok(())
@@ -2925,7 +3754,7 @@ pub(crate) async fn run_child_delegation_qemu_acceptance() {
     if crate::online_hart_mask() == 1 {
         match run_child_delegation_positive_acceptance().await {
             Ok(()) => crate::println!(
-                "WASM_C84_PROFILE_CHILD_DELEGATION PASS bind_before_publish=1 exact_prepared=1 first_poll_only=1 duplicate_inert=1 wrong_task_inert=1 child_irq_pair=1 clean_detach=1 complete=1 cancel_stale_inert=1 forget_rejected=1 abandoned_rejected=1 release_cancelled=1 finish_attached_rejected=1 late_claim_rejected=1 release_faulted=1 gate_cleared=1 epochs=1,2,3,4,5,6,7,8 ready_epoch=9"
+                "WASM_C84_PROFILE_CHILD_DELEGATION PASS bind_before_publish=1 exact_prepared=1 first_poll_only=1 duplicate_inert=1 wrong_task_inert=1 child_core_pair=1 same_end_tick=1 child_irq_pair=1 clean_detach=1 complete=1 cancel_stale_inert=1 forget_rejected=1 abandoned_rejected=1 release_cancelled=1 finish_attached_rejected=1 late_claim_rejected=1 release_faulted=1 observer_fault_sticky=1 observer_drop_open=1 observer_release_open=1 observer_forget_open=1 observer_double_forget=1 parent_double_forget=1 open_phase_rejected=1 replacement_rejected=1 parent_mutation_rejected=1 gate_cleared=1 epochs=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 ready_epoch=16"
             ),
             Err(error) => crate::println!("WASM_C84_PROFILE_CHILD_DELEGATION FAIL {:?}", error),
         }

@@ -44,12 +44,19 @@
         feature = "wasm-c75-boot-revalidation-acceptance",
         feature = "wasm-c76-graph-version-replacement-acceptance",
         feature = "wasm-c77-ephemeral-runtime-acceptance",
+        feature = "wasm-c84-profile-slot",
         feature = "ssh-native-async-command",
         feature = "ssh-native-async-qemu-acceptance",
         feature = "ssh-native-async-revoke-qemu-acceptance"
     )
 ))]
 compile_error!("feature `wasm-c83-runtime-costs` is an isolated benchmark image");
+
+#[cfg(all(
+    feature = "wasm-c84-profile-slot-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-profile-slot-qemu-acceptance` is QEMU-only");
 
 #[cfg(all(feature = "tcp-echo", not(feature = "qemu-virt")))]
 compile_error!("feature `tcp-echo` is the QEMU-only N1 acceptance image");
@@ -501,6 +508,8 @@ mod ssh_key_format;
 mod ssh_platform;
 #[cfg(feature = "milkv-ssh")]
 mod ssh_provisioning;
+#[cfg(feature = "wasm-c84-profile-slot")]
+mod wasm_aot_profile_slot;
 #[cfg(feature = "wasm-c83-runtime-costs")]
 mod wasm_runtime_costs;
 pub use vibeos_object_store as store;
@@ -750,6 +759,9 @@ pub extern "C" fn kmain() -> ! {
         component_graph_principals::run_host_model_selftest(),
         "component graph principal host model failed"
     );
+
+    #[cfg(feature = "wasm-c84-profile-slot")]
+    wasm_aot_profile_slot::init();
 
     let online = start_secondary_harts();
     println!("  smp       {} hart(s) online", online);
@@ -1109,6 +1121,12 @@ pub extern "C" fn kmain() -> ! {
     });
     #[cfg(feature = "wasm-c83-runtime-costs")]
     exec::spawn("wasm-c83-runtime-costs", wasm_runtime_costs::run());
+    #[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c84-profile-slot-acceptance",
+        wasm_aot_profile_slot::run_qemu_acceptance(),
+    );
     #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
     exec::spawn(
         "wasm-c54-native-revoke-worker",

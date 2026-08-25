@@ -1030,6 +1030,29 @@ impl<'a> Verified<'a> {
         self.summary
     }
 
+    /// Copies one verified interval in constant time.
+    ///
+    /// This indexed surface lets a kernel-owned streaming slot retain the
+    /// storage-bearing verified handle globally while an async publisher owns
+    /// only a cursor. Out-of-range indices return `None`.
+    pub fn interval(&self, sequence: usize) -> Option<Interval> {
+        if sequence >= self.summary.interval_count {
+            return None;
+        }
+        let start_offset_ticks = if sequence == 0 {
+            0
+        } else {
+            self.core.buffers.endpoints[sequence - 1]
+        };
+        Some(Interval {
+            sequence,
+            // Verified construction already decoded every byte.
+            phase: Phase::from_code(self.core.buffers.phases[sequence])?,
+            start_offset_ticks,
+            end_offset_ticks: self.core.buffers.endpoints[sequence],
+        })
+    }
+
     pub fn intervals(&self) -> Intervals<'_> {
         Intervals {
             endpoints: &self.core.buffers.endpoints[..self.summary.interval_count],
@@ -1208,6 +1231,7 @@ mod tests {
         let mut previous_phase = None;
         while let Some(interval) = intervals.next() {
             assert_eq!(interval.sequence(), expected_sequence);
+            assert_eq!(verified.interval(expected_sequence), Some(interval));
             assert_eq!(interval.start_offset_ticks(), previous_end);
             assert!(interval.end_offset_ticks() > interval.start_offset_ticks());
             assert_ne!(previous_phase, Some(interval.phase()));
@@ -1221,6 +1245,8 @@ mod tests {
         }
         assert_eq!(expected_sequence, summary.interval_count());
         assert_eq!(previous_end, summary.total_ticks());
+        assert_eq!(verified.interval(summary.interval_count()), None);
+        assert_eq!(verified.interval(usize::MAX), None);
     }
 
     #[test]

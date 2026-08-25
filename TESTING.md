@@ -32,6 +32,7 @@ cargo test --locked -p vibeos-component-runtime --no-default-features \
 cargo test --locked -p vibeos-wasm-aot-profile
 cargo check --locked -p vibeos-wasm-aot-profile \
   --target riscv64imac-unknown-none-elf
+./scripts/qemu-c84-profile-slot-test.sh # C8.4 slot ownership/topology gate
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
@@ -94,8 +95,8 @@ ordering: the start observer returns its post-observer sample, while the finish
 observer owns one end sample, atomically closes interpretation with that same
 sample, and returns it to the runtime aggregate. The gate also covers inclusive
 outer totals, wrapping subtraction, and saturating counters. It is only the
-interpreter-boundary primitive: the target-side seven-phase ledger, interrupt
-attribution, and SSH integration remain separate gates.
+interpreter-boundary primitive: connecting that Core hook to the kernel slot,
+interrupt attribution, and SSH integration remain separate gates.
 
 The standalone `vibeos-wasm-aot-profile` gate covers the target-side ledger
 state machine without connecting it to kernel, trap, executor, or SSH code. It
@@ -121,17 +122,36 @@ recycled `TargetReady` lineage, it gives each armed sample a private non-zero
 checked epoch, rejects any active hook whose token or trusted-kernel-supplied
 single-hart online mask, logical hart, or physical hart is wrong, and binds IRQ
 exit to the epoch captured by its entry cookie. Epochs are not globally unique
-across separately constructed lineages, so the later kernel slot must initialize
-exactly one lineage and preserve it only through recycle transitions. Only a
+across separately constructed lineages, so the kernel slot initializes
+exactly one lineage and preserves it only through recycle transitions. Only a
 facade-clean closed sample may proceed to the explicit independent ledger
 rescan; the formal target publisher must accept `TargetVerified`, not the raw
 ledger's `Verified`. Cancellation, facade faults, ledger faults, and epoch
 exhaustion remain diagnostic-only and clear storage before reuse. This facade
 intentionally contains no lock, callback, allocator, target clock access, or
-hardware topology reader. It is the portable session layer that a later
-kernel-owned `SpinLock`, tombstone, and executor RAII lease may contain; it does
-not claim that kernel, trap, executor, IRQ, SSH, QEMU, or physical-Duo
-collection has been wired.
+hardware topology reader.
+
+The default-off `wasm-c84-profile-slot` boundary allocates one exact 576 KiB
+backing store once before secondary-hart release and preserves that one
+`TargetReady` lineage behind the IRQ-masking kernel `SpinLock`. Storage-bearing
+active and verified states remain global; task-bound run and stream leases carry
+only exact epoch/task/domain identity across suspension. Task-detach capacity is
+reserved and the callback is armed before the start tick. Normal reuse requires
+complete indexed streaming and explicit recycle. An active or verified task
+detach, explicit cancellation, or an abandoned stream instead creates a
+diagnostic rejection which must be acknowledged before reuse. Full
+verification, clearing, and recycling run outside the slot lock.
+
+`scripts/qemu-c84-profile-slot-test.sh` builds one isolated image and boots it
+with `-smp 1` and `-smp 2`. The single-hart case intentionally forgets an active
+lease and a partially streamed verified lease in normally exiting pinned tasks,
+requires exact detach recovery for epochs 1 and 2, then streams all seven
+synthetic intervals and explicitly completes epoch 3 back to ready epoch 4. The
+two-hart case requires start-time rejection of online mask `0x3` without
+consuming epoch 1. This is ownership, detach, recycle, and topology integration
+evidence only. It does not connect the Core observer, trap/IRQ entry and exit,
+SSH timing boundary, schema publisher, collector, or physical-Duo path, and it
+does not inject the executor raw-fault or cancellation detach reasons.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

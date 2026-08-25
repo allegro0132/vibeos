@@ -523,6 +523,12 @@ impl<'a> TargetVerified<'a> {
         self.ledger.summary()
     }
 
+    /// Copies one verified interval in constant time without moving the
+    /// storage-bearing handle out of its owner.
+    pub fn interval(&self, sequence: usize) -> Option<crate::Interval> {
+        self.ledger.interval(sequence)
+    }
+
     pub fn intervals(&self) -> Intervals<'_> {
         self.ledger.intervals()
     }

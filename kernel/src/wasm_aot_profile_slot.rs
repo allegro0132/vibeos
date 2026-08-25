@@ -1,0 +1,1366 @@
+//! Kernel-owned single-slot boundary for the C8.4 target profiler.
+//!
+//! The two storage-bearing typestates always live in [`SLOT`] while an async
+//! task is allowed to suspend. `RunLease` and `StreamLease` carry only sealed
+//! task/sample identity. Finish, verification, cancellation, and recycling
+//! move a handle through an exact synchronous tombstone, release the
+//! IRQ-masking [`SpinLock`], do the O(n) work, then reinstall only into that
+//! same tombstone. No storage-bearing handle is held across `.await`.
+//!
+//! A task-detach callback is registered before the start tick. It can recover
+//! an `Active` or `Verified` handle even when the executor's raw-fault path
+//! skips the future's `Drop`. The callback context is the lineage epoch and is
+//! additionally checked against the exact task and allocation domain.
+//!
+//! This module deliberately does not connect Core, trap, SSH, or publication
+//! hooks. The QEMU-only worker proves the ownership and topology boundary.
+
+extern crate alloc;
+
+use alloc::boxed::Box;
+use core::cell::Cell;
+use core::marker::PhantomData;
+use core::mem;
+use core::sync::atomic::{AtomicU8, Ordering};
+
+use crate::exec::{
+    CurrentTaskDetachLease, TaskDetachDisarm, TaskDetachReason, TaskDetachRegistrationError,
+    TaskDetachTarget, TaskId,
+};
+use crate::heap::AllocationDomain;
+use crate::sync::SpinLock;
+use vibeos_wasm_aot_profile::{
+    FacadeFaults, Interval, Phase, SampleToken, Storage, Summary, TargetActive, TargetContext,
+    TargetReady, TargetRejected, TargetStartError, TargetVerified, VerificationError,
+    INTERVAL_CAPACITY,
+};
+
+static SLOT: SpinLock<SlotState> = SpinLock::new(SlotState::Uninitialized);
+static POISON: AtomicU8 = AtomicU8::new(0);
+
+#[derive(Clone, Copy)]
+struct OwnerSeal {
+    epoch: u64,
+    detach: CurrentTaskDetachLease,
+}
+
+impl OwnerSeal {
+    fn matches(self, epoch: u64, detach: CurrentTaskDetachLease) -> bool {
+        self.epoch == epoch && self.detach.matches_exact(detach)
+    }
+
+    fn callback_matches(self, epoch: u64, task: TaskId, domain: AllocationDomain) -> bool {
+        self.epoch == epoch
+            && self.detach.task_id() == task
+            && self.detach.allocation_domain() == domain
+    }
+}
+
+enum SlotState {
+    Uninitialized,
+    Ready(TargetReady<'static>),
+    Reserved {
+        ready: TargetReady<'static>,
+        owner: OwnerSeal,
+    },
+    Active {
+        sample: TargetActive<'static>,
+        owner: OwnerSeal,
+        faults: SlotFaults,
+    },
+    Transit {
+        owner: OwnerSeal,
+        kind: TransitKind,
+    },
+    Verified {
+        sample: TargetVerified<'static>,
+        owner: OwnerSeal,
+        cursor: usize,
+    },
+    Rejected {
+        ready: TargetReady<'static>,
+        report: RejectionReport,
+    },
+    Poisoned(SlotPoison),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TransitKind {
+    Start,
+    Finish,
+    Cancel,
+    Recycle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum SlotPoison {
+    DuplicateInitialization = 1,
+    StateMismatch = 2,
+    DetachDisarm = 3,
+    DetachedDuringTransit = 4,
+}
+
+impl SlotPoison {
+    fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::DuplicateInitialization),
+            2 => Some(Self::StateMismatch),
+            3 => Some(Self::DetachDisarm),
+            4 => Some(Self::DetachedDuringTransit),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SlotFaults(u8);
+
+impl SlotFaults {
+    const NONE: Self = Self(0);
+    const OWNER_NOT_CURRENT: Self = Self(1 << 0);
+
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RejectionCause {
+    LeaseCancelled,
+    StreamAbandoned,
+    TargetRejected,
+    TaskDetached(TaskDetachReason),
+    SlotFault,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RejectionReport {
+    pub epoch: u64,
+    pub cause: RejectionCause,
+    pub facade_faults: FacadeFaults,
+    pub ledger_error: Option<VerificationError>,
+    pub slot_faults: SlotFaults,
+    pub intervals_emitted: usize,
+}
+
+impl RejectionReport {
+    fn from_target(
+        target: &TargetRejected<'_>,
+        cause: RejectionCause,
+        slot_faults: SlotFaults,
+        intervals_emitted: usize,
+    ) -> Self {
+        Self {
+            epoch: target.token().epoch(),
+            cause,
+            facade_faults: target.facade_faults(),
+            ledger_error: target.ledger_error(),
+            slot_faults,
+            intervals_emitted,
+        }
+    }
+
+    fn detached_verified(epoch: u64, reason: TaskDetachReason, cursor: usize) -> Self {
+        Self {
+            epoch,
+            cause: RejectionCause::TaskDetached(reason),
+            facade_faults: FacadeFaults::NONE,
+            ledger_error: None,
+            slot_faults: SlotFaults::NONE,
+            intervals_emitted: cursor,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SlotStatus {
+    Uninitialized,
+    Ready {
+        next_epoch: Option<u64>,
+    },
+    Reserved {
+        epoch: u64,
+    },
+    Active {
+        epoch: u64,
+    },
+    Transit {
+        epoch: u64,
+        kind: TransitKind,
+    },
+    Verified {
+        epoch: u64,
+        cursor: usize,
+        intervals: usize,
+    },
+    Rejected(RejectionReport),
+    Poisoned(SlotPoison),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProfileError {
+    Uninitialized,
+    Busy,
+    Exhausted,
+    RejectionPending,
+    RegistrationReserveFailed,
+    Registration(TaskDetachRegistrationError),
+    Detach(TaskDetachDisarm),
+    OwnerNotCurrent,
+    StateMismatch,
+    Start(TargetStartError),
+    Facade(FacadeFaults),
+    SlotFault(SlotFaults),
+    IncompleteStream { emitted: usize, required: usize },
+    Rejected(RejectionReport),
+    Poisoned(SlotPoison),
+}
+
+fn poison(reason: SlotPoison) {
+    let _ = POISON.compare_exchange(0, reason as u8, Ordering::AcqRel, Ordering::Acquire);
+}
+
+fn poison_reason() -> Option<SlotPoison> {
+    SlotPoison::from_code(POISON.load(Ordering::Acquire))
+}
+
+fn ensure_not_poisoned() -> Result<(), ProfileError> {
+    match poison_reason() {
+        Some(reason) => Err(ProfileError::Poisoned(reason)),
+        None => Ok(()),
+    }
+}
+
+fn live_context() -> TargetContext {
+    TargetContext::new(
+        u64::try_from(crate::online_hart_mask()).unwrap_or(u64::MAX),
+        crate::ipi::current_logical_hart().map_or(usize::MAX, crate::exec::HartId::index),
+        crate::sbi::current_hart_id(),
+    )
+}
+
+fn live_tick() -> u64 {
+    crate::sbi::time()
+}
+
+/// Allocates and installs the exact packed storage once, before secondary
+/// harts are released. Box leaking is deliberate: the unique mutable borrows
+/// then live only inside the single target lineage for the life of the kernel.
+pub(crate) fn init() {
+    let endpoints = Box::leak(alloc::vec![0_u64; INTERVAL_CAPACITY].into_boxed_slice());
+    let phases = Box::leak(alloc::vec![0_u8; INTERVAL_CAPACITY].into_boxed_slice());
+    let storage = Storage::new(endpoints, phases).expect("C8.4 slot storage has exact capacity");
+    let ready = TargetReady::new(storage);
+
+    let mut slot = SLOT.lock();
+    if matches!(&*slot, SlotState::Uninitialized) && poison_reason().is_none() {
+        *slot = SlotState::Ready(ready);
+        return;
+    }
+    drop(slot);
+    drop(ready);
+    poison(SlotPoison::DuplicateInitialization);
+    panic!("C8.4 profile slot initialized more than once");
+}
+
+pub(crate) fn status() -> SlotStatus {
+    if let Some(reason) = poison_reason() {
+        return SlotStatus::Poisoned(reason);
+    }
+    let slot = SLOT.lock();
+    match &*slot {
+        SlotState::Uninitialized => SlotStatus::Uninitialized,
+        SlotState::Ready(ready) => SlotStatus::Ready {
+            next_epoch: ready.next_epoch(),
+        },
+        SlotState::Reserved { owner, .. } => SlotStatus::Reserved { epoch: owner.epoch },
+        SlotState::Active { sample, .. } => SlotStatus::Active {
+            epoch: sample.token().epoch(),
+        },
+        SlotState::Transit { owner, kind } => SlotStatus::Transit {
+            epoch: owner.epoch,
+            kind: *kind,
+        },
+        SlotState::Verified {
+            sample,
+            owner,
+            cursor,
+        } => SlotStatus::Verified {
+            epoch: owner.epoch,
+            cursor: *cursor,
+            intervals: sample.summary().interval_count(),
+        },
+        SlotState::Rejected { report, .. } => SlotStatus::Rejected(*report),
+        SlotState::Poisoned(reason) => SlotStatus::Poisoned(*reason),
+    }
+}
+
+fn next_epoch_for_prepare() -> Result<u64, ProfileError> {
+    ensure_not_poisoned()?;
+    let slot = SLOT.lock();
+    match &*slot {
+        SlotState::Ready(ready) => ready.next_epoch().ok_or(ProfileError::Exhausted),
+        SlotState::Uninitialized => Err(ProfileError::Uninitialized),
+        SlotState::Rejected { .. } => Err(ProfileError::RejectionPending),
+        SlotState::Poisoned(reason) => Err(ProfileError::Poisoned(*reason)),
+        _ => Err(ProfileError::Busy),
+    }
+}
+
+fn task_detach_target(epoch: u64) -> TaskDetachTarget {
+    // SAFETY: `profile_task_detached` is a permanent kernel function. Its
+    // context is a scalar epoch; it allocates nothing, never awaits, only
+    // holds the IRQ-masking slot lock for O(1) transitions, and performs the
+    // bounded full-buffer clear after releasing that lock.
+    unsafe { TaskDetachTarget::new(epoch, profile_task_detached) }
+}
+
+fn disarm(detach: CurrentTaskDetachLease) -> Result<(), ProfileError> {
+    let result = detach.disarm();
+    if result == TaskDetachDisarm::Disarmed {
+        Ok(())
+    } else {
+        poison(SlotPoison::DetachDisarm);
+        Err(ProfileError::Detach(result))
+    }
+}
+
+fn reserve_ready(epoch: u64, detach: CurrentTaskDetachLease) -> Result<(), ProfileError> {
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    match &*slot {
+        SlotState::Ready(ready) if ready.next_epoch() == Some(epoch) => {}
+        SlotState::Ready(ready) if ready.is_exhausted() => return Err(ProfileError::Exhausted),
+        SlotState::Ready(_) => return Err(ProfileError::Busy),
+        SlotState::Rejected { .. } => return Err(ProfileError::RejectionPending),
+        SlotState::Uninitialized => return Err(ProfileError::Uninitialized),
+        SlotState::Poisoned(reason) => return Err(ProfileError::Poisoned(*reason)),
+        _ => return Err(ProfileError::Busy),
+    }
+
+    let owner = OwnerSeal { epoch, detach };
+    let previous = mem::replace(
+        &mut *slot,
+        SlotState::Transit {
+            owner,
+            kind: TransitKind::Start,
+        },
+    );
+    let SlotState::Ready(ready) = previous else {
+        poison(SlotPoison::StateMismatch);
+        return Err(ProfileError::StateMismatch);
+    };
+    *slot = SlotState::Reserved { ready, owner };
+    Ok(())
+}
+
+/// Preallocates one detach-ledger entry and reserves the current Ready epoch.
+/// This must run before the request acceptance/start tick boundary.
+pub(crate) fn prepare_current() -> Result<StartPermit, ProfileError> {
+    let epoch = next_epoch_for_prepare()?;
+    if !crate::exec::try_reserve_current_task_registrations(1) {
+        return Err(ProfileError::RegistrationReserveFailed);
+    }
+    let target = task_detach_target(epoch);
+    // SAFETY: `target` satisfies TaskDetachTarget's permanent SYSTEM callback
+    // contract, and the returned exact lease remains both in the reservation
+    // state and in the storage-free permit until one side disarms or detaches.
+    let detach = unsafe { crate::exec::register_current_task_detach(target) }
+        .map_err(ProfileError::Registration)?;
+    if !detach.is_current_running_exact() {
+        let _ = disarm(detach);
+        return Err(ProfileError::OwnerNotCurrent);
+    }
+    if let Err(error) = reserve_ready(epoch, detach) {
+        disarm(detach)?;
+        return Err(error);
+    }
+    Ok(StartPermit {
+        epoch,
+        detach,
+        live: true,
+        not_sync: PhantomData,
+    })
+}
+
+fn owner_matches(owner: OwnerSeal, epoch: u64, detach: CurrentTaskDetachLease) -> bool {
+    owner.matches(epoch, detach)
+}
+
+fn release_reservation(epoch: u64, detach: CurrentTaskDetachLease) -> Result<(), ProfileError> {
+    ensure_not_poisoned()?;
+    let owner = OwnerSeal { epoch, detach };
+    let ready = {
+        let mut slot = SLOT.lock();
+        let exact = matches!(
+            &*slot,
+            SlotState::Reserved { owner, .. } if owner_matches(*owner, epoch, detach)
+        );
+        if !exact {
+            poison(SlotPoison::StateMismatch);
+            return Err(ProfileError::StateMismatch);
+        }
+        let previous = mem::replace(
+            &mut *slot,
+            SlotState::Transit {
+                owner,
+                kind: TransitKind::Start,
+            },
+        );
+        let SlotState::Reserved { ready, .. } = previous else {
+            poison(SlotPoison::StateMismatch);
+            return Err(ProfileError::StateMismatch);
+        };
+        ready
+    };
+
+    if let Err(error) = disarm(detach) {
+        drop(ready);
+        return Err(error);
+    }
+
+    let mut slot = SLOT.lock();
+    let exact = matches!(
+        &*slot,
+        SlotState::Transit { owner: actual, kind: TransitKind::Start }
+            if actual.matches(owner.epoch, owner.detach)
+    );
+    if exact && ready.next_epoch() == Some(epoch) && poison_reason().is_none() {
+        *slot = SlotState::Ready(ready);
+        return Ok(());
+    }
+    drop(slot);
+    drop(ready);
+    poison(SlotPoison::StateMismatch);
+    Err(ProfileError::StateMismatch)
+}
+
+fn start_reserved(epoch: u64, detach: CurrentTaskDetachLease) -> Result<SampleToken, ProfileError> {
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    let exact = matches!(
+        &*slot,
+        SlotState::Reserved { owner, .. } if owner_matches(*owner, epoch, detach)
+    );
+    if !exact {
+        return Err(ProfileError::StateMismatch);
+    }
+
+    let context = live_context();
+    let tick = live_tick();
+    let owner = OwnerSeal { epoch, detach };
+    let previous = mem::replace(
+        &mut *slot,
+        SlotState::Transit {
+            owner,
+            kind: TransitKind::Start,
+        },
+    );
+    let SlotState::Reserved { ready, .. } = previous else {
+        poison(SlotPoison::StateMismatch);
+        return Err(ProfileError::StateMismatch);
+    };
+    match ready.start(context, tick) {
+        Ok(sample) => {
+            let token = sample.token();
+            if token.epoch() != epoch {
+                poison(SlotPoison::StateMismatch);
+                drop(slot);
+                let rejected = sample.cancel(token, context);
+                drop(rejected);
+                return Err(ProfileError::StateMismatch);
+            }
+            *slot = SlotState::Active {
+                sample,
+                owner,
+                faults: SlotFaults::NONE,
+            };
+            Ok(token)
+        }
+        Err(failure) => {
+            let error = failure.error();
+            *slot = SlotState::Reserved {
+                ready: failure.into_ready(),
+                owner,
+            };
+            Err(ProfileError::Start(error))
+        }
+    }
+}
+
+/// Storage-free reservation proof. It is `Send` but deliberately not `Sync`.
+pub(crate) struct StartPermit {
+    epoch: u64,
+    detach: CurrentTaskDetachLease,
+    live: bool,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+impl StartPermit {
+    pub(crate) const fn expected_epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub(crate) fn start(mut self) -> Result<RunLease, ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            let error = release_reservation(self.epoch, self.detach)
+                .err()
+                .unwrap_or(ProfileError::OwnerNotCurrent);
+            self.live = false;
+            return Err(error);
+        }
+        match start_reserved(self.epoch, self.detach) {
+            Ok(token) => {
+                self.live = false;
+                Ok(RunLease {
+                    token,
+                    detach: self.detach,
+                    live: true,
+                    not_sync: PhantomData,
+                })
+            }
+            Err(error) => {
+                let release = release_reservation(self.epoch, self.detach);
+                self.live = false;
+                match release {
+                    Ok(()) => Err(error),
+                    Err(release_error) => Err(release_error),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for StartPermit {
+    fn drop(&mut self) {
+        if self.live {
+            self.live = false;
+            let _ = release_reservation(self.epoch, self.detach);
+        }
+    }
+}
+
+fn mark_owner_fault(token: SampleToken, detach: CurrentTaskDetachLease) {
+    let mut slot = SLOT.lock();
+    if let SlotState::Active {
+        sample,
+        owner,
+        faults,
+    } = &mut *slot
+    {
+        if sample.token() == token && owner.matches(token.epoch(), detach) {
+            faults.insert(SlotFaults::OWNER_NOT_CURRENT);
+        }
+    }
+}
+
+fn apply_phase(
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+    phase: Option<Phase>,
+) -> Result<(), ProfileError> {
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        owner,
+        faults,
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token || !owner.matches(token.epoch(), detach) {
+        return Err(ProfileError::StateMismatch);
+    }
+    if !faults.is_empty() {
+        return Err(ProfileError::SlotFault(*faults));
+    }
+    let context = live_context();
+    let tick = live_tick();
+    match phase {
+        Some(phase) => sample.set_phase(token, context, tick, phase),
+        None => sample.begin_cleanup(token, context, tick),
+    }
+    let facade = sample.facade_faults();
+    if facade.is_empty() {
+        Ok(())
+    } else {
+        Err(ProfileError::Facade(facade))
+    }
+}
+
+fn install_verified(owner: OwnerSeal, sample: TargetVerified<'static>) -> Result<(), ProfileError> {
+    let mut slot = SLOT.lock();
+    let exact = matches!(
+        &*slot,
+        SlotState::Transit { owner: actual, kind: TransitKind::Finish }
+            if actual.matches(owner.epoch, owner.detach)
+    );
+    if exact && sample.token().epoch() == owner.epoch && poison_reason().is_none() {
+        *slot = SlotState::Verified {
+            sample,
+            owner,
+            cursor: 0,
+        };
+        return Ok(());
+    }
+    drop(slot);
+    drop(sample);
+    poison(SlotPoison::StateMismatch);
+    Err(ProfileError::StateMismatch)
+}
+
+fn install_rejected(
+    owner: OwnerSeal,
+    expected_kind: TransitKind,
+    ready: TargetReady<'static>,
+    report: RejectionReport,
+) -> Result<(), ProfileError> {
+    let mut slot = SLOT.lock();
+    let exact = matches!(
+        &*slot,
+        SlotState::Transit { owner: actual, kind }
+            if actual.matches(owner.epoch, owner.detach) && *kind == expected_kind
+    );
+    if exact
+        && report.epoch == owner.epoch
+        && ready.next_epoch() == owner.epoch.checked_add(1)
+        && poison_reason().is_none()
+    {
+        *slot = SlotState::Rejected { ready, report };
+        return Ok(());
+    }
+    drop(slot);
+    drop(ready);
+    poison(SlotPoison::StateMismatch);
+    Err(ProfileError::StateMismatch)
+}
+
+fn reject_target_normal(
+    owner: OwnerSeal,
+    expected_kind: TransitKind,
+    rejected: TargetRejected<'static>,
+    cause: RejectionCause,
+    slot_faults: SlotFaults,
+    intervals_emitted: usize,
+) -> Result<RejectionReport, ProfileError> {
+    let report = RejectionReport::from_target(&rejected, cause, slot_faults, intervals_emitted);
+    let ready = rejected.recycle();
+    if let Err(error) = disarm(owner.detach) {
+        drop(ready);
+        return Err(error);
+    }
+    install_rejected(owner, expected_kind, ready, report)?;
+    Ok(report)
+}
+
+fn finish_active(token: SampleToken, detach: CurrentTaskDetachLease) -> Result<(), ProfileError> {
+    ensure_not_poisoned()?;
+    let (sample, owner, slot_faults, context, tick) = {
+        let mut slot = SLOT.lock();
+        let exact = matches!(
+            &*slot,
+            SlotState::Active { sample, owner, .. }
+                if sample.token() == token && owner.matches(token.epoch(), detach)
+        );
+        if !exact {
+            return Err(ProfileError::StateMismatch);
+        }
+        let context = live_context();
+        let tick = live_tick();
+        let owner = OwnerSeal {
+            epoch: token.epoch(),
+            detach,
+        };
+        let previous = mem::replace(
+            &mut *slot,
+            SlotState::Transit {
+                owner,
+                kind: TransitKind::Finish,
+            },
+        );
+        let SlotState::Active {
+            sample,
+            owner,
+            faults,
+        } = previous
+        else {
+            poison(SlotPoison::StateMismatch);
+            return Err(ProfileError::StateMismatch);
+        };
+        (sample, owner, faults, context, tick)
+    };
+
+    if !slot_faults.is_empty() {
+        let rejected = sample.cancel(token, context);
+        let report = reject_target_normal(
+            owner,
+            TransitKind::Finish,
+            rejected,
+            RejectionCause::SlotFault,
+            slot_faults,
+            0,
+        )?;
+        return Err(ProfileError::Rejected(report));
+    }
+
+    let finished = match sample.finish(token, context, tick) {
+        Ok(finished) => finished,
+        Err(rejected) => {
+            let report = reject_target_normal(
+                owner,
+                TransitKind::Finish,
+                rejected,
+                RejectionCause::TargetRejected,
+                slot_faults,
+                0,
+            )?;
+            return Err(ProfileError::Rejected(report));
+        }
+    };
+    match finished.verify() {
+        Ok(verified) => install_verified(owner, verified),
+        Err(rejected) => {
+            let report = reject_target_normal(
+                owner,
+                TransitKind::Finish,
+                rejected,
+                RejectionCause::TargetRejected,
+                slot_faults,
+                0,
+            )?;
+            Err(ProfileError::Rejected(report))
+        }
+    }
+}
+
+fn cancel_active(
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+    cause: RejectionCause,
+) -> Result<RejectionReport, ProfileError> {
+    ensure_not_poisoned()?;
+    let (sample, owner, faults, context) = {
+        let mut slot = SLOT.lock();
+        let exact = matches!(
+            &*slot,
+            SlotState::Active { sample, owner, .. }
+                if sample.token() == token && owner.matches(token.epoch(), detach)
+        );
+        if !exact {
+            return Err(ProfileError::StateMismatch);
+        }
+        let context = live_context();
+        let owner = OwnerSeal {
+            epoch: token.epoch(),
+            detach,
+        };
+        let previous = mem::replace(
+            &mut *slot,
+            SlotState::Transit {
+                owner,
+                kind: TransitKind::Cancel,
+            },
+        );
+        let SlotState::Active {
+            sample,
+            owner,
+            faults,
+        } = previous
+        else {
+            poison(SlotPoison::StateMismatch);
+            return Err(ProfileError::StateMismatch);
+        };
+        (sample, owner, faults, context)
+    };
+    let rejected = sample.cancel(token, context);
+    reject_target_normal(owner, TransitKind::Cancel, rejected, cause, faults, 0)
+}
+
+/// Storage-free exact owner of one globally resident Active sample.
+pub(crate) struct RunLease {
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+    live: bool,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+impl RunLease {
+    pub(crate) const fn token(&self) -> SampleToken {
+        self.token
+    }
+
+    pub(crate) fn set_phase(&self, phase: Phase) -> Result<(), ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            mark_owner_fault(self.token, self.detach);
+            return Err(ProfileError::OwnerNotCurrent);
+        }
+        apply_phase(self.token, self.detach, Some(phase))
+    }
+
+    pub(crate) fn begin_cleanup(&self) -> Result<(), ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            mark_owner_fault(self.token, self.detach);
+            return Err(ProfileError::OwnerNotCurrent);
+        }
+        apply_phase(self.token, self.detach, None)
+    }
+
+    pub(crate) fn finish(mut self) -> Result<StreamLease, ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            mark_owner_fault(self.token, self.detach);
+        }
+        let result = finish_active(self.token, self.detach);
+        match result {
+            Ok(()) => {
+                self.live = false;
+                Ok(StreamLease {
+                    token: self.token,
+                    detach: self.detach,
+                    live: true,
+                    not_sync: PhantomData,
+                })
+            }
+            Err(error @ ProfileError::Rejected(_)) => {
+                self.live = false;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn cancel(mut self) -> Result<RejectionReport, ProfileError> {
+        self.live = false;
+        cancel_active(self.token, self.detach, RejectionCause::LeaseCancelled)
+    }
+}
+
+impl Drop for RunLease {
+    fn drop(&mut self) {
+        if self.live {
+            self.live = false;
+            let _ = cancel_active(self.token, self.detach, RejectionCause::LeaseCancelled);
+        }
+    }
+}
+
+fn stream_summary(
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+) -> Result<Summary, ProfileError> {
+    ensure_not_poisoned()?;
+    let slot = SLOT.lock();
+    match &*slot {
+        SlotState::Verified { sample, owner, .. }
+            if sample.token() == token && owner.matches(token.epoch(), detach) =>
+        {
+            Ok(sample.summary())
+        }
+        _ => Err(ProfileError::StateMismatch),
+    }
+}
+
+fn stream_next(
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+) -> Result<Option<Interval>, ProfileError> {
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    match &mut *slot {
+        SlotState::Verified {
+            sample,
+            owner,
+            cursor,
+        } if sample.token() == token && owner.matches(token.epoch(), detach) => {
+            let interval = sample.interval(*cursor);
+            if interval.is_some() {
+                *cursor += 1;
+            }
+            Ok(interval)
+        }
+        _ => Err(ProfileError::StateMismatch),
+    }
+}
+
+fn take_verified(
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+    require_complete: bool,
+) -> Result<(TargetVerified<'static>, OwnerSeal, usize), ProfileError> {
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    let (required, emitted) = match &*slot {
+        SlotState::Verified {
+            sample,
+            owner,
+            cursor,
+        } if sample.token() == token && owner.matches(token.epoch(), detach) => {
+            (sample.summary().interval_count(), *cursor)
+        }
+        _ => return Err(ProfileError::StateMismatch),
+    };
+    if require_complete && emitted != required {
+        return Err(ProfileError::IncompleteStream { emitted, required });
+    }
+    let owner = OwnerSeal {
+        epoch: token.epoch(),
+        detach,
+    };
+    let previous = mem::replace(
+        &mut *slot,
+        SlotState::Transit {
+            owner,
+            kind: TransitKind::Recycle,
+        },
+    );
+    let SlotState::Verified {
+        sample,
+        owner,
+        cursor,
+    } = previous
+    else {
+        poison(SlotPoison::StateMismatch);
+        return Err(ProfileError::StateMismatch);
+    };
+    Ok((sample, owner, cursor))
+}
+
+fn complete_stream(token: SampleToken, detach: CurrentTaskDetachLease) -> Result<(), ProfileError> {
+    let (sample, owner, _) = take_verified(token, detach, true)?;
+    let ready = sample.recycle();
+    if let Err(error) = disarm(owner.detach) {
+        drop(ready);
+        return Err(error);
+    }
+    let mut slot = SLOT.lock();
+    let exact = matches!(
+        &*slot,
+        SlotState::Transit { owner: actual, kind: TransitKind::Recycle }
+            if actual.matches(owner.epoch, owner.detach)
+    );
+    if exact && ready.next_epoch() == owner.epoch.checked_add(1) && poison_reason().is_none() {
+        *slot = SlotState::Ready(ready);
+        return Ok(());
+    }
+    drop(slot);
+    drop(ready);
+    poison(SlotPoison::StateMismatch);
+    Err(ProfileError::StateMismatch)
+}
+
+fn discard_stream(
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+) -> Result<RejectionReport, ProfileError> {
+    let (sample, owner, cursor) = take_verified(token, detach, false)?;
+    let report = RejectionReport {
+        epoch: token.epoch(),
+        cause: RejectionCause::StreamAbandoned,
+        facade_faults: FacadeFaults::NONE,
+        ledger_error: None,
+        slot_faults: SlotFaults::NONE,
+        intervals_emitted: cursor,
+    };
+    let ready = sample.recycle();
+    if let Err(error) = disarm(owner.detach) {
+        drop(ready);
+        return Err(error);
+    }
+    install_rejected(owner, TransitKind::Recycle, ready, report)?;
+    Ok(report)
+}
+
+/// Storage-free cursor for one globally resident verified sample.
+pub(crate) struct StreamLease {
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+    live: bool,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+impl StreamLease {
+    pub(crate) const fn token(&self) -> SampleToken {
+        self.token
+    }
+
+    pub(crate) fn summary(&self) -> Result<Summary, ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            return Err(ProfileError::OwnerNotCurrent);
+        }
+        stream_summary(self.token, self.detach)
+    }
+
+    pub(crate) fn next_interval(&mut self) -> Result<Option<Interval>, ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            return Err(ProfileError::OwnerNotCurrent);
+        }
+        stream_next(self.token, self.detach)
+    }
+
+    pub(crate) fn complete(mut self) -> Result<(), ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            return Err(ProfileError::OwnerNotCurrent);
+        }
+        match complete_stream(self.token, self.detach) {
+            Ok(()) => {
+                self.live = false;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn discard(mut self) -> Result<RejectionReport, ProfileError> {
+        self.live = false;
+        discard_stream(self.token, self.detach)
+    }
+}
+
+impl Drop for StreamLease {
+    fn drop(&mut self) {
+        if self.live {
+            self.live = false;
+            let _ = discard_stream(self.token, self.detach);
+        }
+    }
+}
+
+pub(crate) fn rejection() -> Option<RejectionReport> {
+    if poison_reason().is_some() {
+        return None;
+    }
+    let slot = SLOT.lock();
+    match &*slot {
+        SlotState::Rejected { report, .. } => Some(*report),
+        _ => None,
+    }
+}
+
+pub(crate) fn acknowledge_rejection(epoch: u64) -> Result<RejectionReport, ProfileError> {
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    let report = match &*slot {
+        SlotState::Rejected { report, .. } if report.epoch == epoch => *report,
+        SlotState::Rejected { .. } => return Err(ProfileError::StateMismatch),
+        _ => return Err(ProfileError::StateMismatch),
+    };
+    // Rejected has no armed detach callback. `Uninitialized` is therefore a
+    // private move placeholder which cannot be observed while this lock is
+    // held; the slot is restored to Ready before unlocking.
+    let previous = mem::replace(&mut *slot, SlotState::Uninitialized);
+    let SlotState::Rejected { ready, .. } = previous else {
+        poison(SlotPoison::StateMismatch);
+        return Err(ProfileError::StateMismatch);
+    };
+    *slot = SlotState::Ready(ready);
+    Ok(report)
+}
+
+enum DetachAction {
+    None,
+    Cancel {
+        sample: TargetActive<'static>,
+        owner: OwnerSeal,
+        faults: SlotFaults,
+        context: TargetContext,
+        reason: TaskDetachReason,
+    },
+    Recycle {
+        sample: TargetVerified<'static>,
+        owner: OwnerSeal,
+        cursor: usize,
+        reason: TaskDetachReason,
+    },
+}
+
+unsafe fn profile_task_detached(
+    epoch: u64,
+    task: TaskId,
+    domain: AllocationDomain,
+    reason: TaskDetachReason,
+) {
+    if poison_reason().is_some() {
+        return;
+    }
+    let action = {
+        let mut slot = SLOT.lock();
+        match &*slot {
+            SlotState::Reserved { owner, .. } if owner.callback_matches(epoch, task, domain) => {
+                let previous = mem::replace(&mut *slot, SlotState::Uninitialized);
+                let SlotState::Reserved { ready, .. } = previous else {
+                    poison(SlotPoison::StateMismatch);
+                    return;
+                };
+                *slot = SlotState::Ready(ready);
+                DetachAction::None
+            }
+            SlotState::Active { sample, owner, .. }
+                if sample.token().epoch() == epoch
+                    && owner.callback_matches(epoch, task, domain) =>
+            {
+                let owner = *owner;
+                let context = live_context();
+                let previous = mem::replace(
+                    &mut *slot,
+                    SlotState::Transit {
+                        owner,
+                        kind: TransitKind::Cancel,
+                    },
+                );
+                let SlotState::Active { sample, faults, .. } = previous else {
+                    poison(SlotPoison::StateMismatch);
+                    return;
+                };
+                DetachAction::Cancel {
+                    sample,
+                    owner,
+                    faults,
+                    context,
+                    reason,
+                }
+            }
+            SlotState::Verified {
+                sample,
+                owner,
+                cursor,
+            } if sample.token().epoch() == epoch && owner.callback_matches(epoch, task, domain) => {
+                let owner = *owner;
+                let previous = mem::replace(
+                    &mut *slot,
+                    SlotState::Transit {
+                        owner,
+                        kind: TransitKind::Recycle,
+                    },
+                );
+                let SlotState::Verified { sample, cursor, .. } = previous else {
+                    poison(SlotPoison::StateMismatch);
+                    return;
+                };
+                DetachAction::Recycle {
+                    sample,
+                    owner,
+                    cursor,
+                    reason,
+                }
+            }
+            SlotState::Transit { owner, .. } if owner.callback_matches(epoch, task, domain) => {
+                *slot = SlotState::Poisoned(SlotPoison::DetachedDuringTransit);
+                poison(SlotPoison::DetachedDuringTransit);
+                DetachAction::None
+            }
+            _ => DetachAction::None,
+        }
+    };
+
+    match action {
+        DetachAction::None => {}
+        DetachAction::Cancel {
+            sample,
+            owner,
+            faults,
+            context,
+            reason,
+        } => {
+            let token = sample.token();
+            let rejected = sample.cancel(token, context);
+            let report = RejectionReport::from_target(
+                &rejected,
+                RejectionCause::TaskDetached(reason),
+                faults,
+                0,
+            );
+            let ready = rejected.recycle();
+            let _ = install_rejected(owner, TransitKind::Cancel, ready, report);
+        }
+        DetachAction::Recycle {
+            sample,
+            owner,
+            cursor,
+            reason,
+        } => {
+            let report = RejectionReport::detached_verified(owner.epoch, reason, cursor);
+            let ready = sample.recycle();
+            let _ = install_rejected(owner, TransitKind::Recycle, ready, report);
+        }
+    }
+}
+
+#[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
+fn wait_for_tick_progress() {
+    let start = live_tick();
+    while live_tick().wrapping_sub(start) < 32 {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
+fn start_seven_phase_sample(expected_epoch: u64) -> Result<StreamLease, ProfileError> {
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != expected_epoch {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    if run.token().epoch() != expected_epoch {
+        return Err(ProfileError::StateMismatch);
+    }
+    wait_for_tick_progress();
+    run.set_phase(Phase::Instantiation)?;
+    wait_for_tick_progress();
+    run.set_phase(Phase::Abi)?;
+    wait_for_tick_progress();
+    run.set_phase(Phase::Interpretation)?;
+    wait_for_tick_progress();
+    run.set_phase(Phase::Host)?;
+    wait_for_tick_progress();
+    run.set_phase(Phase::Wait)?;
+    wait_for_tick_progress();
+    run.begin_cleanup()?;
+    wait_for_tick_progress();
+    run.finish()
+}
+
+#[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
+async fn wait_for_rejection(epoch: u64) -> Result<RejectionReport, ProfileError> {
+    for _ in 0..128 {
+        if let Some(report) = rejection() {
+            if report.epoch == epoch {
+                return Ok(report);
+            }
+        }
+        crate::exec::yield_now().await;
+    }
+    Err(ProfileError::StateMismatch)
+}
+
+#[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
+async fn run_positive_acceptance() -> Result<(), ProfileError> {
+    let active =
+        crate::exec::spawn_pinned_on(crate::exec::HartId::BOOT, "c84-detach-active", async {
+            let permit = prepare_current().expect("C8.4 active detach permit");
+            assert_eq!(permit.expected_epoch(), 1);
+            let run = permit.start().expect("C8.4 active detach start");
+            wait_for_tick_progress();
+            run.set_phase(Phase::Host)
+                .expect("C8.4 active detach phase");
+            core::mem::forget(run);
+        });
+    if active.join().await.state() != crate::exec::TaskState::Exited {
+        return Err(ProfileError::StateMismatch);
+    }
+    let active_report = wait_for_rejection(1).await?;
+    if active_report.cause != RejectionCause::TaskDetached(TaskDetachReason::Exited) {
+        return Err(ProfileError::Rejected(active_report));
+    }
+    acknowledge_rejection(1)?;
+
+    let streaming =
+        crate::exec::spawn_pinned_on(crate::exec::HartId::BOOT, "c84-detach-stream", async {
+            let mut stream = start_seven_phase_sample(2).expect("C8.4 stream detach sample");
+            assert_eq!(
+                stream
+                    .summary()
+                    .expect("C8.4 stream summary")
+                    .interval_count(),
+                7
+            );
+            assert!(stream
+                .next_interval()
+                .expect("C8.4 first interval")
+                .is_some());
+            core::mem::forget(stream);
+        });
+    if streaming.join().await.state() != crate::exec::TaskState::Exited {
+        return Err(ProfileError::StateMismatch);
+    }
+    let stream_report = wait_for_rejection(2).await?;
+    if stream_report.cause != RejectionCause::TaskDetached(TaskDetachReason::Exited)
+        || stream_report.intervals_emitted != 1
+    {
+        return Err(ProfileError::Rejected(stream_report));
+    }
+    acknowledge_rejection(2)?;
+
+    let mut stream = start_seven_phase_sample(3)?;
+    let summary = stream.summary()?;
+    if summary.interval_count() != 7 || stream.token().epoch() != 3 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let mut previous_end = 0;
+    let mut count = 0;
+    while let Some(interval) = stream.next_interval()? {
+        if interval.sequence() != count || interval.start_offset_ticks() != previous_end {
+            return Err(ProfileError::StateMismatch);
+        }
+        previous_end = interval.end_offset_ticks();
+        count += 1;
+    }
+    if count != 7 || previous_end != summary.total_ticks() {
+        return Err(ProfileError::StateMismatch);
+    }
+    stream.complete()?;
+    if status()
+        != (SlotStatus::Ready {
+            next_epoch: Some(4),
+        })
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
+fn run_topology_rejection() -> Result<(), ProfileError> {
+    let permit = prepare_current()?;
+    let epoch = permit.expected_epoch();
+    match permit.start() {
+        Err(ProfileError::Start(TargetStartError::InvalidContext(faults)))
+            if faults.contains(FacadeFaults::WRONG_ONLINE_MASK)
+                && !faults.contains(FacadeFaults::WRONG_LOGICAL_HART)
+                && !faults.contains(FacadeFaults::WRONG_PHYSICAL_HART)
+                && epoch == 1
+                && status()
+                    == (SlotStatus::Ready {
+                        next_epoch: Some(1),
+                    }) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+        Ok(run) => {
+            drop(run);
+            Err(ProfileError::StateMismatch)
+        }
+    }
+}
+
+/// QEMU-only positive single-hart and negative multi-hart ownership proof.
+#[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
+pub(crate) async fn run_qemu_acceptance() {
+    if crate::online_hart_mask() == 1 {
+        match run_positive_acceptance().await {
+            Ok(()) => crate::println!(
+                "WASM_C84_PROFILE_SLOT PASS detached_active=1 detached_stream=1 epochs=1,2,3 intervals=7 indexed=1 complete=1 ready_epoch=4"
+            ),
+            Err(error) => crate::println!("WASM_C84_PROFILE_SLOT FAIL {:?}", error),
+        }
+    } else {
+        match run_topology_rejection() {
+            Ok(()) => crate::println!(
+                "WASM_C84_PROFILE_SLOT TOPOLOGY_REJECT mask={:#x} logical={} physical={} epoch=1",
+                crate::online_hart_mask(),
+                crate::ipi::current_logical_hart().map_or(usize::MAX, crate::exec::HartId::index),
+                crate::sbi::current_hart_id(),
+            ),
+            Err(error) => crate::println!("WASM_C84_PROFILE_SLOT FAIL {:?}", error),
+        }
+    }
+}

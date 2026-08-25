@@ -1227,6 +1227,7 @@ dependencies = [
  "vibeos-sshd",
  "vibeos-storage-device",
  "vibeos-vsh",
+ "vibeos-wasm-aot-profile",
  "vibeos-wasm-runtime",
  "vibeos-wasm-runtime-costs",
 ]

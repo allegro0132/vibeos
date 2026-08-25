@@ -6,6 +6,9 @@
 //! [`Active`] and [`Finished`]. Only an independently rescanned [`Verified`]
 //! handle exposes a publishable summary or interval iterator. Rejected and
 //! unverified samples can only be inspected as diagnostics and recycled.
+//! These raw ledger primitives do not establish target identity or topology;
+//! a formal target publisher must accept only [`TargetVerified`], which is
+//! obtainable only through the target-session facade.
 //!
 //! Every handle is linearly owned. It may move with one exclusive `Send`
 //! future, but cannot be shared through `Sync`; moving ownership does not
@@ -64,6 +67,13 @@
 //! ```
 
 #![no_std]
+
+mod target;
+
+pub use target::{
+    FacadeFaults, IrqCookie, SampleToken, TargetActive, TargetContext, TargetFinished, TargetReady,
+    TargetRejected, TargetStartError, TargetStartFailure, TargetVerified,
+};
 
 use core::cell::Cell;
 use core::fmt;
@@ -518,6 +528,13 @@ pub struct Active<'a> {
 }
 
 impl<'a> Active<'a> {
+    /// Abandons an in-progress sample, clears the complete caller-owned
+    /// buffers, and returns them as fresh storage. No closed or publishable
+    /// handle is created by this recovery path.
+    pub fn abort(self) -> Storage<'a> {
+        self.core.recycle()
+    }
+
     /// Changes the base phase at `tick`.
     ///
     /// `Cleanup` is a latch: after it is requested, later base-phase hooks are

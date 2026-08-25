@@ -13,9 +13,10 @@
 //! additionally checked against the exact task and allocation domain.
 //!
 //! The optional Core-poll observer is a caller-owned adapter over an exact
-//! [`RunLease`]; ordinary runtime `poll()` remains untouched. Trap, SSH, and
-//! publication hooks remain deliberately disconnected. Separate QEMU workers
-//! prove the ownership boundary and the real Core observer bracket.
+//! [`RunLease`]; ordinary runtime `poll()` remains untouched. A separate
+//! default-off trap overlay can bracket an interrupt with a linear cookie;
+//! SSH and publication hooks remain deliberately disconnected. Isolated QEMU
+//! workers prove each boundary without composing their exact transcripts.
 
 extern crate alloc;
 
@@ -23,6 +24,10 @@ use alloc::boxed::Box;
 use core::cell::Cell;
 use core::marker::PhantomData;
 use core::mem;
+#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+use core::sync::atomic::AtomicBool;
+#[cfg(feature = "wasm-c84-profile-irq-overlay")]
+use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::exec::{
@@ -33,6 +38,8 @@ use crate::heap::AllocationDomain;
 use crate::sync::SpinLock;
 #[cfg(feature = "wasm-c84-core-poll-observer")]
 use vibeos_component_runtime::sync::ProfileClock;
+#[cfg(feature = "wasm-c84-profile-irq-overlay")]
+use vibeos_wasm_aot_profile::IrqCookie;
 use vibeos_wasm_aot_profile::{
     FacadeFaults, Interval, Phase, SampleToken, Storage, Summary, TargetActive, TargetContext,
     TargetReady, TargetRejected, TargetStartError, TargetVerified, VerificationError,
@@ -41,6 +48,16 @@ use vibeos_wasm_aot_profile::{
 
 static SLOT: SpinLock<SlotState> = SpinLock::new(SlotState::Uninitialized);
 static POISON: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "wasm-c84-profile-irq-overlay")]
+static ACTIVE_EPOCH: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+static ACCEPTANCE_SSIP_PAIRED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+static ACCEPTANCE_SSIP_INACTIVE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+static ACCEPTANCE_CHILD_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+static ACCEPTANCE_CHILD_RELEASE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct OwnerSeal {
@@ -103,6 +120,7 @@ pub(crate) enum SlotPoison {
     StateMismatch = 2,
     DetachDisarm = 3,
     DetachedDuringTransit = 4,
+    IrqStateMismatch = 5,
 }
 
 impl SlotPoison {
@@ -112,6 +130,7 @@ impl SlotPoison {
             2 => Some(Self::StateMismatch),
             3 => Some(Self::DetachDisarm),
             4 => Some(Self::DetachedDuringTransit),
+            5 => Some(Self::IrqStateMismatch),
             _ => None,
         }
     }
@@ -242,6 +261,8 @@ struct PhaseBoundary {
 
 fn poison(reason: SlotPoison) {
     let _ = POISON.compare_exchange(0, reason as u8, Ordering::AcqRel, Ordering::Acquire);
+    #[cfg(feature = "wasm-c84-profile-irq-overlay")]
+    ACTIVE_EPOCH.store(0, Ordering::Release);
 }
 
 fn poison_reason() -> Option<SlotPoison> {
@@ -265,6 +286,155 @@ fn live_context() -> TargetContext {
 
 fn live_tick() -> u64 {
     crate::sbi::time()
+}
+
+#[cfg(feature = "wasm-c84-profile-irq-overlay")]
+fn publish_active_epoch(epoch: u64) -> Result<(), ProfileError> {
+    if let Some(reason) = poison_reason() {
+        ACTIVE_EPOCH.store(0, Ordering::Release);
+        return Err(ProfileError::Poisoned(reason));
+    }
+    if epoch == 0
+        || ACTIVE_EPOCH
+            .compare_exchange(0, epoch, Ordering::Release, Ordering::Acquire)
+            .is_err()
+    {
+        poison(SlotPoison::IrqStateMismatch);
+        return Err(ProfileError::Poisoned(SlotPoison::IrqStateMismatch));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wasm-c84-profile-irq-overlay")]
+fn clear_active_epoch(epoch: u64) -> Result<(), ProfileError> {
+    if let Some(reason) = poison_reason() {
+        ACTIVE_EPOCH.store(0, Ordering::Release);
+        return Err(ProfileError::Poisoned(reason));
+    }
+    if epoch == 0
+        || ACTIVE_EPOCH
+            .compare_exchange(epoch, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        poison(SlotPoison::IrqStateMismatch);
+        return Err(ProfileError::Poisoned(SlotPoison::IrqStateMismatch));
+    }
+    Ok(())
+}
+
+/// Linear trap-stack witness for one target interrupt overlay. The inactive
+/// value keeps trap exit unconditional without exposing the facade cookie.
+#[cfg(feature = "wasm-c84-profile-irq-overlay")]
+#[must_use]
+pub(crate) struct TrapIrqCookie {
+    epoch: u64,
+    inner: IrqCookie,
+}
+
+#[cfg(feature = "wasm-c84-profile-irq-overlay")]
+impl TrapIrqCookie {
+    const fn inactive() -> Self {
+        Self {
+            epoch: 0,
+            inner: IrqCookie::inactive(),
+        }
+    }
+}
+
+/// Opens a Wait overlay at the assembly-captured trap-entry tick. Only an IRQ
+/// preempting the exact current slot owner may mutate the sample.
+#[cfg(feature = "wasm-c84-profile-irq-overlay")]
+pub(crate) fn profile_irq_enter(irq_entry: u64) -> TrapIrqCookie {
+    if poison_reason().is_some() {
+        return TrapIrqCookie::inactive();
+    }
+    let epoch = ACTIVE_EPOCH.load(Ordering::Acquire);
+    if epoch == 0 {
+        return TrapIrqCookie::inactive();
+    }
+
+    let mut slot = SLOT.lock();
+    if poison_reason().is_some() {
+        return TrapIrqCookie::inactive();
+    }
+    let SlotState::Active {
+        sample,
+        owner,
+        faults,
+    } = &mut *slot
+    else {
+        drop(slot);
+        poison(SlotPoison::IrqStateMismatch);
+        return TrapIrqCookie::inactive();
+    };
+    let token = sample.token();
+    if token.epoch() != epoch {
+        drop(slot);
+        poison(SlotPoison::IrqStateMismatch);
+        return TrapIrqCookie::inactive();
+    }
+    if !owner.detach.is_current_irq_scope_exact() {
+        return TrapIrqCookie::inactive();
+    }
+    if !faults.is_empty() {
+        return TrapIrqCookie::inactive();
+    }
+    let context = live_context();
+    let inner = sample.interrupt_enter(token, context, irq_entry);
+    TrapIrqCookie { epoch, inner }
+}
+
+/// Closes one active overlay at the trap-supplied exit boundary. The caller
+/// samples that boundary after handler work and allocation-owner restoration,
+/// before this function can wait for the slot lock.
+#[cfg(feature = "wasm-c84-profile-irq-overlay")]
+pub(crate) fn profile_irq_exit(cookie: TrapIrqCookie, exit_tick: u64) -> bool {
+    if cookie.epoch == 0 {
+        return false;
+    }
+    if poison_reason().is_some() || ACTIVE_EPOCH.load(Ordering::Acquire) != cookie.epoch {
+        poison(SlotPoison::IrqStateMismatch);
+        return false;
+    }
+
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        owner,
+        faults,
+    } = &mut *slot
+    else {
+        drop(slot);
+        poison(SlotPoison::IrqStateMismatch);
+        return false;
+    };
+    let token = sample.token();
+    if token.epoch() != cookie.epoch {
+        drop(slot);
+        poison(SlotPoison::IrqStateMismatch);
+        return false;
+    }
+    if !owner.detach.is_current_irq_scope_exact() {
+        faults.insert(SlotFaults::OWNER_NOT_CURRENT);
+        drop(slot);
+        poison(SlotPoison::IrqStateMismatch);
+        return false;
+    }
+    let context = live_context();
+    let applied = cookie.inner.is_active();
+    sample.interrupt_exit(cookie.inner, context, exit_tick);
+    applied
+}
+
+/// Acceptance-only attribution for the code=1 trap branch. Production state
+/// remains limited to the active-epoch gate and the target's linear cookie.
+#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+pub(crate) fn profile_irq_acceptance_note_ssip(applied: bool) {
+    if applied {
+        ACCEPTANCE_SSIP_PAIRED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        ACCEPTANCE_SSIP_INACTIVE.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Allocates and installs the exact packed storage once, before secondary
@@ -493,6 +663,12 @@ fn start_reserved(epoch: u64, detach: CurrentTaskDetachLease) -> Result<SampleTo
                 let rejected = sample.cancel(token, context);
                 drop(rejected);
                 return Err(ProfileError::StateMismatch);
+            }
+            #[cfg(feature = "wasm-c84-profile-irq-overlay")]
+            if let Err(error) = publish_active_epoch(token.epoch()) {
+                *slot = SlotState::Poisoned(SlotPoison::IrqStateMismatch);
+                drop(sample);
+                return Err(error);
             }
             *slot = SlotState::Active {
                 sample,
@@ -744,6 +920,15 @@ fn finish_active(token: SampleToken, detach: CurrentTaskDetachLease) -> Result<(
             epoch: token.epoch(),
             detach,
         };
+        #[cfg(feature = "wasm-c84-profile-irq-overlay")]
+        if let Err(error) = clear_active_epoch(token.epoch()) {
+            let previous = mem::replace(
+                &mut *slot,
+                SlotState::Poisoned(SlotPoison::IrqStateMismatch),
+            );
+            drop(previous);
+            return Err(error);
+        }
         let previous = mem::replace(
             &mut *slot,
             SlotState::Transit {
@@ -827,6 +1012,15 @@ fn cancel_active(
             epoch: token.epoch(),
             detach,
         };
+        #[cfg(feature = "wasm-c84-profile-irq-overlay")]
+        if let Err(error) = clear_active_epoch(token.epoch()) {
+            let previous = mem::replace(
+                &mut *slot,
+                SlotState::Poisoned(SlotPoison::IrqStateMismatch),
+            );
+            drop(previous);
+            return Err(error);
+        }
         let previous = mem::replace(
             &mut *slot,
             SlotState::Transit {
@@ -1259,6 +1453,15 @@ unsafe fn profile_task_detached(
             {
                 let owner = *owner;
                 let context = live_context();
+                #[cfg(feature = "wasm-c84-profile-irq-overlay")]
+                if clear_active_epoch(epoch).is_err() {
+                    let previous = mem::replace(
+                        &mut *slot,
+                        SlotState::Poisoned(SlotPoison::IrqStateMismatch),
+                    );
+                    drop(previous);
+                    return;
+                }
                 let previous = mem::replace(
                     &mut *slot,
                     SlotState::Transit {
@@ -1346,7 +1549,8 @@ unsafe fn profile_task_detached(
 
 #[cfg(any(
     feature = "wasm-c84-profile-slot-qemu-acceptance",
-    feature = "wasm-c84-core-poll-qemu-acceptance"
+    feature = "wasm-c84-core-poll-qemu-acceptance",
+    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance"
 ))]
 fn wait_for_tick_progress() {
     let start = live_tick();
@@ -1381,7 +1585,10 @@ fn start_seven_phase_sample(expected_epoch: u64) -> Result<StreamLease, ProfileE
     run.finish()
 }
 
-#[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c84-profile-slot-qemu-acceptance",
+    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance"
+))]
 async fn wait_for_rejection(epoch: u64) -> Result<RejectionReport, ProfileError> {
     for _ in 0..128 {
         if let Some(report) = rejection() {
@@ -1472,7 +1679,8 @@ async fn run_positive_acceptance() -> Result<(), ProfileError> {
 
 #[cfg(any(
     feature = "wasm-c84-profile-slot-qemu-acceptance",
-    feature = "wasm-c84-core-poll-qemu-acceptance"
+    feature = "wasm-c84-core-poll-qemu-acceptance",
+    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance"
 ))]
 fn run_topology_rejection() -> Result<(), ProfileError> {
     let permit = prepare_current()?;
@@ -1714,6 +1922,312 @@ pub(crate) async fn run_core_poll_qemu_acceptance() {
                 crate::sbi::current_hart_id(),
             ),
             Err(error) => crate::println!("WASM_C84_CORE_POLL FAIL {:?}", error),
+        }
+    }
+}
+
+/// Publish one local runnable reason, then deliberately force its pending
+/// doorbell through OpenSBI as a real supervisor self-IPI. The worker remains
+/// in one synchronous poll stack while the trap runs and returns.
+#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+fn force_boot_self_ssip(expect_profiled: bool) -> Result<(), ProfileError> {
+    use crate::ipi::DoorbellDisposition;
+
+    let hart = crate::exec::HartId::BOOT;
+    let before = crate::ipi::stats(hart);
+    let paired_before = ACCEPTANCE_SSIP_PAIRED.load(Ordering::Acquire);
+    let inactive_before = ACCEPTANCE_SSIP_INACTIVE.load(Ordering::Acquire);
+    if crate::ipi::publish_runnable(hart) != DoorbellDisposition::Local
+        || crate::ipi::retry_pending(hart) != DoorbellDisposition::Sent
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+
+    let start = live_tick();
+    let after = loop {
+        let observed = crate::ipi::stats(hart);
+        if observed.acknowledged.wrapping_sub(before.acknowledged) == 1
+            && observed.pending_reasons == 0
+        {
+            break observed;
+        }
+        if live_tick().wrapping_sub(start) >= crate::exec::timebase_hz() {
+            return Err(ProfileError::StateMismatch);
+        }
+        core::hint::spin_loop();
+    };
+
+    if after.notifications.wrapping_sub(before.notifications) < 1
+        || after.doorbells.wrapping_sub(before.doorbells) != 1
+        || after.send_failures != before.send_failures
+        || after.idle_consumed != before.idle_consumed
+        || after.stale != before.stale
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    let paired_delta = ACCEPTANCE_SSIP_PAIRED
+        .load(Ordering::Acquire)
+        .wrapping_sub(paired_before);
+    let inactive_delta = ACCEPTANCE_SSIP_INACTIVE
+        .load(Ordering::Acquire)
+        .wrapping_sub(inactive_before);
+    if (expect_profiled && (paired_delta != 1 || inactive_delta != 0))
+        || (!expect_profiled && (paired_delta != 0 || inactive_delta != 1))
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+async fn run_irq_positive_acceptance() -> Result<(), ProfileError> {
+    let ready_epoch_one = SlotStatus::Ready {
+        next_epoch: Some(1),
+    };
+    if status() != ready_epoch_one || ACTIVE_EPOCH.load(Ordering::Acquire) != 0 {
+        return Err(ProfileError::StateMismatch);
+    }
+
+    // A real SSIP before Active must remain observationally inert.
+    force_boot_self_ssip(false)?;
+    if status() != ready_epoch_one || ACTIVE_EPOCH.load(Ordering::Acquire) != 0 {
+        return Err(ProfileError::StateMismatch);
+    }
+
+    // Hold epoch 1 across suspension. The parent then receives a real SSIP
+    // while it is not the sample owner; that trap must be a total no-op. The
+    // child's ordinary RunLease Drop independently proves gate clearing.
+    ACCEPTANCE_CHILD_ACTIVE.store(false, Ordering::Release);
+    ACCEPTANCE_CHILD_RELEASE.store(false, Ordering::Release);
+    let suspended =
+        crate::exec::spawn_pinned_on(crate::exec::HartId::BOOT, "c84-irq-non-owner-drop", async {
+            let permit = prepare_current().expect("C8.4 IRQ suspended permit");
+            assert_eq!(permit.expected_epoch(), 1);
+            let run = permit.start().expect("C8.4 IRQ suspended start");
+            assert_eq!(run.token().epoch(), 1);
+            assert_eq!(ACTIVE_EPOCH.load(Ordering::Acquire), 1);
+            ACCEPTANCE_CHILD_ACTIVE.store(true, Ordering::Release);
+            while !ACCEPTANCE_CHILD_RELEASE.load(Ordering::Acquire) {
+                crate::exec::yield_now().await;
+            }
+            drop(run);
+        });
+    for _ in 0..128 {
+        if ACCEPTANCE_CHILD_ACTIVE.load(Ordering::Acquire) {
+            break;
+        }
+        crate::exec::yield_now().await;
+    }
+    if !ACCEPTANCE_CHILD_ACTIVE.load(Ordering::Acquire)
+        || status() != (SlotStatus::Active { epoch: 1 })
+        || ACTIVE_EPOCH.load(Ordering::Acquire) != 1
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    force_boot_self_ssip(false)?;
+    if status() != (SlotStatus::Active { epoch: 1 }) || ACTIVE_EPOCH.load(Ordering::Acquire) != 1 {
+        return Err(ProfileError::StateMismatch);
+    }
+    ACCEPTANCE_CHILD_RELEASE.store(true, Ordering::Release);
+    if suspended.join().await.state() != crate::exec::TaskState::Exited {
+        return Err(ProfileError::StateMismatch);
+    }
+    let drop_report = wait_for_rejection(1).await?;
+    if drop_report.cause != RejectionCause::LeaseCancelled
+        || !drop_report.slot_faults.is_empty()
+        || !drop_report.facade_faults.is_empty()
+        || drop_report.ledger_error.is_some()
+        || ACTIVE_EPOCH.load(Ordering::Acquire) != 0
+    {
+        return Err(ProfileError::Rejected(drop_report));
+    }
+    acknowledge_rejection(1)?;
+
+    // Explicit cancel is a distinct public exit through the shared cancel
+    // transition and must clear epoch 2 before installing Rejected.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 2 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    if run.token().epoch() != 2 || ACTIVE_EPOCH.load(Ordering::Acquire) != 2 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let cancel_report = run.cancel()?;
+    if cancel_report.cause != RejectionCause::LeaseCancelled
+        || !cancel_report.slot_faults.is_empty()
+        || !cancel_report.facade_faults.is_empty()
+        || cancel_report.ledger_error.is_some()
+        || ACTIVE_EPOCH.load(Ordering::Acquire) != 0
+    {
+        return Err(ProfileError::Rejected(cancel_report));
+    }
+    acknowledge_rejection(2)?;
+
+    // Forget epoch 3 so only the executor's exact task-detach callback can
+    // recover Active and clear the gate.
+    let detached =
+        crate::exec::spawn_pinned_on(crate::exec::HartId::BOOT, "c84-irq-detach", async {
+            let permit = prepare_current().expect("C8.4 IRQ detach permit");
+            assert_eq!(permit.expected_epoch(), 3);
+            let run = permit.start().expect("C8.4 IRQ detach start");
+            assert_eq!(run.token().epoch(), 3);
+            assert_eq!(ACTIVE_EPOCH.load(Ordering::Acquire), 3);
+            core::mem::forget(run);
+        });
+    if detached.join().await.state() != crate::exec::TaskState::Exited {
+        return Err(ProfileError::StateMismatch);
+    }
+    let detach_report = wait_for_rejection(3).await?;
+    if detach_report.cause != RejectionCause::TaskDetached(TaskDetachReason::Exited)
+        || !detach_report.slot_faults.is_empty()
+        || !detach_report.facade_faults.is_empty()
+        || detach_report.ledger_error.is_some()
+        || ACTIVE_EPOCH.load(Ordering::Acquire) != 0
+    {
+        return Err(ProfileError::Rejected(detach_report));
+    }
+    acknowledge_rejection(3)?;
+
+    // Epoch 4 is the publishable sample. The SSIP-specific acceptance counter
+    // proves the forced doorbell, rather than a periodic timer, supplied one
+    // successfully closed active cookie.
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 4 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    if run.token().epoch() != 4 || ACTIVE_EPOCH.load(Ordering::Acquire) != 4 {
+        return Err(ProfileError::StateMismatch);
+    }
+
+    wait_for_tick_progress();
+    run.set_phase(Phase::Host)?;
+    wait_for_tick_progress();
+    force_boot_self_ssip(true)?;
+    // Make the restored Host interval independently non-zero before Cleanup.
+    wait_for_tick_progress();
+    run.begin_cleanup()?;
+    wait_for_tick_progress();
+
+    let mut stream = run.finish()?;
+    let summary = stream.summary()?;
+    if !summary.intervals_complete() || summary.phase_ticks().wait == 0 {
+        return Err(ProfileError::StateMismatch);
+    }
+
+    let mut count = 0;
+    let mut previous_end = 0;
+    let mut previous_phase = None;
+    let mut phase_before_previous = None;
+    let mut previous_nonzero = false;
+    let mut wait_count = 0;
+    let mut paired_count = 0;
+    let mut restored_host = false;
+    while let Some(interval) = stream.next_interval()? {
+        if interval.sequence() != count || interval.start_offset_ticks() != previous_end {
+            return Err(ProfileError::StateMismatch);
+        }
+        let phase = interval.phase();
+        if phase == Phase::Wait {
+            wait_count += 1;
+        }
+        if previous_phase == Some(Phase::Wait) {
+            let Some(base) = phase_before_previous else {
+                return Err(ProfileError::StateMismatch);
+            };
+            if base == Phase::Wait || phase != base || !previous_nonzero {
+                return Err(ProfileError::StateMismatch);
+            }
+            paired_count += 1;
+            restored_host |= base == Phase::Host;
+        }
+        previous_nonzero = interval.end_offset_ticks() > interval.start_offset_ticks();
+        phase_before_previous = previous_phase;
+        previous_phase = Some(phase);
+        previous_end = interval.end_offset_ticks();
+        count += 1;
+    }
+    if count != summary.interval_count()
+        || previous_end != summary.total_ticks()
+        || previous_phase == Some(Phase::Wait)
+        || wait_count == 0
+        || paired_count != wait_count
+        || !restored_host
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+
+    stream.complete()?;
+    let ready_epoch_five = SlotStatus::Ready {
+        next_epoch: Some(5),
+    };
+    if status() != ready_epoch_five || ACTIVE_EPOCH.load(Ordering::Acquire) != 0 {
+        return Err(ProfileError::StateMismatch);
+    }
+
+    // A final real SSIP proves the gate was cleared by Active -> Verified
+    // before streaming and remains inert after Verified -> Ready recycling.
+    force_boot_self_ssip(false)?;
+    if status() != ready_epoch_five || ACTIVE_EPOCH.load(Ordering::Acquire) != 0 {
+        return Err(ProfileError::StateMismatch);
+    }
+
+    // Acceptance-only mismatch injection proves the first poison remains
+    // stable, forcibly clears the fast gate, makes inactive-cookie exit a
+    // no-op, and prevents either helper or prepare from re-arming the slot.
+    ACTIVE_EPOCH.store(77, Ordering::Release);
+    if publish_active_epoch(88) != Err(ProfileError::Poisoned(SlotPoison::IrqStateMismatch))
+        || poison_reason() != Some(SlotPoison::IrqStateMismatch)
+        || ACTIVE_EPOCH.load(Ordering::Acquire) != 0
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    poison(SlotPoison::StateMismatch);
+    let inactive = profile_irq_enter(live_tick());
+    if profile_irq_exit(inactive, live_tick())
+        || publish_active_epoch(99) != Err(ProfileError::Poisoned(SlotPoison::IrqStateMismatch))
+        || clear_active_epoch(99) != Err(ProfileError::Poisoned(SlotPoison::IrqStateMismatch))
+        || !matches!(
+            prepare_current(),
+            Err(ProfileError::Poisoned(SlotPoison::IrqStateMismatch))
+        )
+        || poison_reason() != Some(SlotPoison::IrqStateMismatch)
+        || ACTIVE_EPOCH.load(Ordering::Acquire) != 0
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    Ok(())
+}
+
+/// QEMU-only proof of the default-off trap overlay using real OpenSBI
+/// self-SSIPs, exactly one of which is an active-owner profiled pair. Timer,
+/// PLIC, SSH, and publication integration remain separate.
+#[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+pub(crate) async fn run_irq_qemu_acceptance() {
+    if crate::online_hart_mask() == 1 {
+        match run_irq_positive_acceptance().await {
+            Ok(()) => crate::println!(
+                "WASM_C84_PROFILE_IRQ_OVERLAY PASS inactive_before=1 forced_ssip=4 causal_ssip_pair=1 non_owner_inert=1 cleared_cancel=1 cleared_drop=1 cleared_detach=1 wait_nonzero=1 restored=1 paired=1 complete=1 ready_epoch=5 inactive_after=1 poison_fail_closed=1"
+            ),
+            Err(error) => crate::println!("WASM_C84_PROFILE_IRQ_OVERLAY FAIL {:?}", error),
+        }
+    } else {
+        let result = run_topology_rejection().and_then(|()| {
+            if ACTIVE_EPOCH.load(Ordering::Acquire) == 0 {
+                Ok(())
+            } else {
+                Err(ProfileError::StateMismatch)
+            }
+        });
+        match result {
+            Ok(()) => crate::println!(
+                "WASM_C84_PROFILE_IRQ_OVERLAY TOPOLOGY_REJECT mask={:#x} logical={} physical={} epoch=1",
+                crate::online_hart_mask(),
+                crate::ipi::current_logical_hart().map_or(usize::MAX, crate::exec::HartId::index),
+                crate::sbi::current_hart_id(),
+            ),
+            Err(error) => crate::println!("WASM_C84_PROFILE_IRQ_OVERLAY FAIL {:?}", error),
         }
     }
 }

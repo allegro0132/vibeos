@@ -190,6 +190,22 @@ impl CurrentTaskDetachLease {
             })
     }
 
+    /// Whether a synchronous interrupt preempted this lease's task scope.
+    ///
+    /// Unlike [`Self::is_current_running_exact`], this IRQ-only check never
+    /// borrows task-status or scheduler locks: the interrupted poll stack may
+    /// already own either one. Callers must hold the private exact lease and
+    /// invoke this before replacing the task's ambient allocation domain.
+    /// Task identifiers are monotonic and are never reused, so the hart-local
+    /// id plus allocation domain are sufficient while that lease remains live.
+    pub fn is_current_irq_scope_exact(self) -> bool {
+        let Some(hart) = current_scheduler_hart() else {
+            return false;
+        };
+        CURRENT_TASK_ID[hart.index()].load(Ordering::Acquire) == self.task.0
+            && heap::current_domain() == self.domain
+    }
+
     /// Whether Drop is reclaiming this exact whole task after its running slot
     /// was detached. In this state callers must leave the detach callback
     /// armed until the executor determines the final destructor outcome.
@@ -7347,6 +7363,16 @@ mod one_shot_wait_tests {
             registration,
             target,
         };
+        assert!(lease.is_current_irq_scope_exact());
+        let mut other_owner = heap::enter_owner(OwnerId::new(90_001));
+        assert!(!lease.is_current_irq_scope_exact());
+        other_owner.restore();
+        assert!(lease.is_current_irq_scope_exact());
+        let wrong_task = CurrentTaskDetachLease {
+            task: TaskId(task.0 + 1),
+            ..lease
+        };
+        assert!(!wrong_task.is_current_irq_scope_exact());
         assert_eq!(lease.disarm(), TaskDetachDisarm::Disarmed);
 
         // A copied stale token cannot consume a later registration even when

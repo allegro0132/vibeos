@@ -34,6 +34,7 @@ cargo check --locked -p vibeos-wasm-aot-profile \
   --target riscv64imac-unknown-none-elf
 ./scripts/qemu-c84-profile-slot-test.sh # C8.4 slot ownership/topology gate
 ./scripts/qemu-c84-core-poll-test.sh # C8.4 real Core observer/slot gate
+./scripts/qemu-c84-profile-irq-overlay-test.sh # C8.4 real self-SSIP overlay gate
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
@@ -172,6 +173,33 @@ This proves only the explicit Core-observer adapter. The frozen SSH runner
 still calls ordinary `poll`, and child-task delegation, IRQ overlays, SSH
 start/end timing, publication, collection, and physical-Duo evidence remain
 separate gates.
+
+The separate default-off `wasm-c84-profile-irq-overlay` feature gives a trap
+preempting the exact active slot owner one linear entry/exit cookie. The trap
+briefly borrows the slot at each boundary but never holds it across the handler;
+an inactive slot or a different current task remains observationally inert.
+The entry endpoint is the trap assembly's early timestamp, and the paired exit
+restores the interrupted base phase after accounting the intervening time as
+Wait.
+
+`scripts/qemu-c84-profile-irq-overlay-test.sh` builds the isolated
+`wasm-c84-profile-irq-overlay-qemu-acceptance` image and uses the parameterized
+profile-slot harness for both `-smp 1` and `-smp 2`. The single-hart worker
+forces four real boot-hart self-IPIs through OpenSBI and the SSIP early-return
+path. An acceptance-only SSIP counter proves exactly one active-owner
+entry/exit pair and causally distinguishes it from timer traffic. While the
+sample owner is suspended, the current non-owner task must remain inert;
+explicit cancellation, ordinary `RunLease` Drop, and exact task-detach recovery
+must each clear the active fast gate before the next epoch. The publishable
+sample requires a paired non-zero Wait overlay with the base phase restored and
+completes back to ready epoch 5; real SSIPs before and after Active must remain
+inert. Finally, an
+acceptance-only mismatch injection must preserve the first poison, clear the
+fast gate, and prevent re-arming. The two-hart boot must reject topology before
+arming the sample.
+This gate is evidence for that deliberate self-SSIP only; it does not establish
+targeted timer or PLIC handling, SSH timing, publication/collection, or
+physical Milk-V Duo behaviour.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

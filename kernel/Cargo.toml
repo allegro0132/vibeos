@@ -229,6 +229,11 @@ wasm-c84-core-poll-qemu-acceptance = [
     "wasm-c84-core-poll-observer",
     "dep:vibeos-wasm-runtime",
 ]
+# Default-off trap overlay for the one active target sample. Entry and exit
+# briefly borrow the slot but never hold it across timer, SSIP, or PLIC work.
+wasm-c84-profile-irq-overlay = ["wasm-c84-profile-slot"]
+# QEMU-only proof using a real supervisor self-IPI on the boot hart.
+wasm-c84-profile-irq-overlay-qemu-acceptance = ["wasm-c84-profile-irq-overlay"]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

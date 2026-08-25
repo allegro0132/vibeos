@@ -102,13 +102,25 @@ jobs:
           rustup target list --toolchain "$toolchain" --installed | grep -Fx wasm32-wasip1
           rustup target list --toolchain "$toolchain" --installed \
             | grep -Fx riscv64imac-unknown-none-elf
+          rustc_bin="$(rustup which --toolchain "$toolchain" rustc)"
+          rustdoc_bin="$(rustup which --toolchain "$toolchain" rustdoc)"
           {
             echo "VIBEOS_TOOLCHAIN=$toolchain"
-            echo "VIBEOS_RUSTC=$(rustup which --toolchain "$toolchain" rustc)"
-            echo "VIBEOS_RUSTDOC=$(rustup which --toolchain "$toolchain" rustdoc)"
+            echo "VIBEOS_RUSTC=$rustc_bin"
+            echo "VIBEOS_RUSTDOC=$rustdoc_bin"
           } >> "$GITHUB_ENV"
           rustup run "$toolchain" rustc -Vv
-          rustup run "$toolchain" cargo fetch --locked
+          env RUSTC="$rustc_bin" RUSTDOC="$rustdoc_bin" \
+            rustup run "$toolchain" cargo fetch --locked
+          # The firmware config enables build-std. Its sysroot dependency graph
+          # is target-aware and is not populated by the workspace fetch above.
+          # Fetch both graphs before the corpus gate proves the build offline.
+          (
+            cd firmware/qemu-virt
+            env RUSTC="$rustc_bin" RUSTDOC="$rustdoc_bin" \
+              rustup run "$toolchain" cargo fetch --locked \
+                --target riscv64imac-unknown-none-elf
+          )
       - name: Install the reviewed wasi-sdk-33 toolchain
         run: |
           archive="$RUNNER_TEMP/wasi-sdk-33.0-arm64-macos.tar.gz"

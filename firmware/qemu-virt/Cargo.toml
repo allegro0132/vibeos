@@ -49,6 +49,9 @@ wasm-c83-runtime-costs = ["vibeos-kernel/wasm-c83-runtime-costs"]
 wasm-c84-profile-slot-qemu-acceptance = [
     "vibeos-kernel/wasm-c84-profile-slot-qemu-acceptance",
 ]
+wasm-c84-core-poll-qemu-acceptance = [
+    "vibeos-kernel/wasm-c84-core-poll-qemu-acceptance",
+]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = [
     "vibeos-kernel/ssh-test",

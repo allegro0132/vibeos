@@ -12,8 +12,10 @@
 //! skips the future's `Drop`. The callback context is the lineage epoch and is
 //! additionally checked against the exact task and allocation domain.
 //!
-//! This module deliberately does not connect Core, trap, SSH, or publication
-//! hooks. The QEMU-only worker proves the ownership and topology boundary.
+//! The optional Core-poll observer is a caller-owned adapter over an exact
+//! [`RunLease`]; ordinary runtime `poll()` remains untouched. Trap, SSH, and
+//! publication hooks remain deliberately disconnected. Separate QEMU workers
+//! prove the ownership boundary and the real Core observer bracket.
 
 extern crate alloc;
 
@@ -29,6 +31,8 @@ use crate::exec::{
 };
 use crate::heap::AllocationDomain;
 use crate::sync::SpinLock;
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+use vibeos_component_runtime::sync::ProfileClock;
 use vibeos_wasm_aot_profile::{
     FacadeFaults, Interval, Phase, SampleToken, Storage, Summary, TargetActive, TargetContext,
     TargetReady, TargetRejected, TargetStartError, TargetVerified, VerificationError,
@@ -223,6 +227,17 @@ pub(crate) enum ProfileError {
     IncompleteStream { emitted: usize, required: usize },
     Rejected(RejectionReport),
     Poisoned(SlotPoison),
+}
+
+/// One Core-finish boundary even when the slot operation latched a failure.
+///
+/// `ProfileClock` is infallible. Keeping the original tick beside the sticky
+/// error lets the runtime close its aggregate with the exact tick already used
+/// by the target ledger instead of taking an unsound replacement sample.
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+struct PhaseBoundary {
+    tick: u64,
+    error: Option<ProfileError>,
 }
 
 fn poison(reason: SlotPoison) {
@@ -598,6 +613,54 @@ fn apply_phase(
     }
 }
 
+/// Closes Interpretation with one tick that is both recorded in the ledger
+/// and returned to the portable runtime observer.
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+fn end_core_phase(token: SampleToken, detach: CurrentTaskDetachLease) -> PhaseBoundary {
+    if let Err(error) = ensure_not_poisoned() {
+        return PhaseBoundary {
+            tick: live_tick(),
+            error: Some(error),
+        };
+    }
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        owner,
+        faults,
+    } = &mut *slot
+    else {
+        return PhaseBoundary {
+            tick: live_tick(),
+            error: Some(ProfileError::StateMismatch),
+        };
+    };
+    if sample.token() != token || !owner.matches(token.epoch(), detach) {
+        return PhaseBoundary {
+            tick: live_tick(),
+            error: Some(ProfileError::StateMismatch),
+        };
+    }
+    if !faults.is_empty() {
+        return PhaseBoundary {
+            tick: live_tick(),
+            error: Some(ProfileError::SlotFault(*faults)),
+        };
+    }
+    let context = live_context();
+    let tick = live_tick();
+    sample.set_phase(token, context, tick, Phase::Abi);
+    let facade = sample.facade_faults();
+    PhaseBoundary {
+        tick,
+        error: if facade.is_empty() {
+            None
+        } else {
+            Some(ProfileError::Facade(facade))
+        },
+    }
+}
+
 fn install_verified(owner: OwnerSeal, sample: TargetVerified<'static>) -> Result<(), ProfileError> {
     let mut slot = SLOT.lock();
     let exact = matches!(
@@ -815,6 +878,28 @@ impl RunLease {
         apply_phase(self.token, self.detach, None)
     }
 
+    #[cfg(feature = "wasm-c84-core-poll-observer")]
+    fn begin_core_interpretation(&self) -> Option<ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            mark_owner_fault(self.token, self.detach);
+            Some(ProfileError::OwnerNotCurrent)
+        } else {
+            apply_phase(self.token, self.detach, Some(Phase::Interpretation)).err()
+        }
+    }
+
+    #[cfg(feature = "wasm-c84-core-poll-observer")]
+    fn end_core_interpretation(&self) -> PhaseBoundary {
+        if !self.detach.is_current_running_exact() {
+            mark_owner_fault(self.token, self.detach);
+            return PhaseBoundary {
+                tick: live_tick(),
+                error: Some(ProfileError::OwnerNotCurrent),
+            };
+        }
+        end_core_phase(self.token, self.detach)
+    }
+
     pub(crate) fn finish(mut self) -> Result<StreamLease, ProfileError> {
         if !self.detach.is_current_running_exact() {
             mark_owner_fault(self.token, self.detach);
@@ -841,6 +926,71 @@ impl RunLease {
     pub(crate) fn cancel(mut self) -> Result<RejectionReport, ProfileError> {
         self.live = false;
         cancel_active(self.token, self.detach, RejectionCause::LeaseCancelled)
+    }
+}
+
+/// Lexically scoped bridge from portable Core observers to one exact slot
+/// owner. Construct one around each `poll_profiled` call and inspect its sticky
+/// error and closed state before the next poll or any `.await`.
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+pub(crate) struct SlotCorePollClock<'a> {
+    run: &'a RunLease,
+    first_error: Option<ProfileError>,
+    core_open: bool,
+}
+
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+impl<'a> SlotCorePollClock<'a> {
+    pub(crate) const fn new(run: &'a RunLease) -> Self {
+        Self {
+            run,
+            first_error: None,
+            core_open: false,
+        }
+    }
+
+    fn latch(&mut self, error: Option<ProfileError>) {
+        if self.first_error.is_none() {
+            self.first_error = error;
+        }
+    }
+
+    pub(crate) const fn error(&self) -> Option<ProfileError> {
+        self.first_error
+    }
+
+    pub(crate) const fn core_is_closed(&self) -> bool {
+        !self.core_open
+    }
+}
+
+#[cfg(feature = "wasm-c84-core-poll-observer")]
+impl ProfileClock for SlotCorePollClock<'_> {
+    fn ticks(&mut self) -> u64 {
+        live_tick()
+    }
+
+    fn core_poll_started(&mut self) -> u64 {
+        if self.core_open {
+            self.latch(Some(ProfileError::StateMismatch));
+            return live_tick();
+        }
+        self.core_open = true;
+        let error = self.run.begin_core_interpretation();
+        self.latch(error);
+        // The portable contract requires this to be the final observer work.
+        live_tick()
+    }
+
+    fn core_poll_finished(&mut self) -> u64 {
+        if !self.core_open {
+            self.latch(Some(ProfileError::StateMismatch));
+            return live_tick();
+        }
+        self.core_open = false;
+        let boundary = self.run.end_core_interpretation();
+        self.latch(boundary.error);
+        boundary.tick
     }
 }
 
@@ -1194,7 +1344,10 @@ unsafe fn profile_task_detached(
     }
 }
 
-#[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c84-profile-slot-qemu-acceptance",
+    feature = "wasm-c84-core-poll-qemu-acceptance"
+))]
 fn wait_for_tick_progress() {
     let start = live_tick();
     while live_tick().wrapping_sub(start) < 32 {
@@ -1317,7 +1470,10 @@ async fn run_positive_acceptance() -> Result<(), ProfileError> {
     Ok(())
 }
 
-#[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c84-profile-slot-qemu-acceptance",
+    feature = "wasm-c84-core-poll-qemu-acceptance"
+))]
 fn run_topology_rejection() -> Result<(), ProfileError> {
     let permit = prepare_current()?;
     let epoch = permit.expected_epoch();
@@ -1361,6 +1517,203 @@ pub(crate) async fn run_qemu_acceptance() {
                 crate::sbi::current_hart_id(),
             ),
             Err(error) => crate::println!("WASM_C84_PROFILE_SLOT FAIL {:?}", error),
+        }
+    }
+}
+
+#[cfg(feature = "wasm-c84-core-poll-qemu-acceptance")]
+fn exact_stream_resource_types(
+    component: &vibeos_component_runtime::sync::SynchronousComponent,
+    entrypoint: &str,
+) -> Option<(
+    vibeos_component_runtime::resource::ResourceTypeId,
+    vibeos_component_runtime::resource::ResourceTypeId,
+)> {
+    use vibeos_component_runtime::value::{ResourceOwnership, ValueType};
+
+    let function = component.function_type(entrypoint)?;
+    let [reader, writer] = function.parameters.as_slice() else {
+        return None;
+    };
+    let borrowed = |value: &ValueType| match value {
+        ValueType::Resource {
+            resource_type,
+            ownership: ResourceOwnership::Borrow,
+        } => Some(*resource_type),
+        _ => None,
+    };
+    Some((borrowed(&reader.value)?, borrowed(&writer.value)?))
+}
+
+#[cfg(feature = "wasm-c84-core-poll-qemu-acceptance")]
+fn profile_is_publishable(profile: &vibeos_component_runtime::sync::SyncCallProfile) -> bool {
+    profile.typed_polls != u64::MAX
+        && profile.core_polls != u64::MAX
+        && profile.outer_poll_ticks != u64::MAX
+        && profile.core_interpreter_ticks != u64::MAX
+        && profile.consumed_work != u64::MAX
+}
+
+#[cfg(feature = "wasm-c84-core-poll-qemu-acceptance")]
+fn run_core_poll_positive_acceptance() -> Result<(), ProfileError> {
+    use alloc::vec::Vec;
+    use vibeos_component_runtime::{
+        decode::inspect_component,
+        resource::ResourceTable,
+        sync::{SyncCallProfile, SynchronousComponent, TypedPoll},
+        value::CanonicalValue,
+    };
+    use vibeos_wasm_runtime::{OwnerAllocationReservation, ProfileEngine};
+
+    let permit = prepare_current()?;
+    if permit.expected_epoch() != 1 {
+        return Err(ProfileError::StateMismatch);
+    }
+    let run = permit.start()?;
+    let pin = vibeos_image_policy::SSH_EXEC_COMPONENT;
+    let limits = pin.limits();
+
+    wait_for_tick_progress();
+    let plan = inspect_component(pin.artifact_bytes()).map_err(|_| ProfileError::StateMismatch)?;
+    if !plan.runtime_ready() {
+        return Err(ProfileError::StateMismatch);
+    }
+
+    run.set_phase(Phase::Instantiation)?;
+    let engine = ProfileEngine::new();
+    let mut component = SynchronousComponent::instantiate_with_memory_limit(
+        &plan,
+        &engine,
+        OwnerAllocationReservation::new(limits.memory_bytes),
+        limits.memory_bytes,
+    )
+    .map_err(|_| ProfileError::StateMismatch)?;
+    let (reader_type, writer_type) = exact_stream_resource_types(&component, pin.entrypoint())
+        .ok_or(ProfileError::StateMismatch)?;
+
+    run.set_phase(Phase::Abi)?;
+    let mut resources =
+        ResourceTable::<u8>::new(1, limits.resources).map_err(|_| ProfileError::StateMismatch)?;
+    let reader = resources
+        .insert_owned(reader_type, 1)
+        .map_err(|_| ProfileError::StateMismatch)?;
+    let writer = resources
+        .insert_owned(writer_type, 2)
+        .map_err(|_| ProfileError::StateMismatch)?;
+    let mut arguments = Vec::new();
+    arguments
+        .try_reserve_exact(2)
+        .map_err(|_| ProfileError::StateMismatch)?;
+    arguments.push(CanonicalValue::Resource(reader));
+    arguments.push(CanonicalValue::Resource(writer));
+    let mut call = component
+        .start_typed_call(
+            &mut resources,
+            pin.entrypoint(),
+            arguments,
+            limits.total_fuel,
+            limits.poll_quantum,
+        )
+        .map_err(|_| ProfileError::StateMismatch)?;
+    let mut profile = SyncCallProfile::default();
+    let mut observed_core = false;
+
+    for _ in 0..4_096 {
+        let before = profile.core_polls;
+        let mut clock = SlotCorePollClock::new(&run);
+        let result = call.poll_profiled(&mut clock, &mut profile);
+        if clock.error().is_some() || !clock.core_is_closed() {
+            return Err(clock.error().unwrap_or(ProfileError::StateMismatch));
+        }
+        if !profile_is_publishable(&profile) {
+            return Err(ProfileError::StateMismatch);
+        }
+        if profile.core_polls > before {
+            if profile.core_polls - before != 1 {
+                return Err(ProfileError::StateMismatch);
+            }
+            observed_core = true;
+            break;
+        }
+        if !matches!(result, TypedPoll::Pending(_)) {
+            return Err(ProfileError::StateMismatch);
+        }
+    }
+    if !observed_core || profile.core_interpreter_ticks == 0 {
+        return Err(ProfileError::StateMismatch);
+    }
+
+    wait_for_tick_progress();
+    run.begin_cleanup()?;
+    drop(call);
+    drop(resources);
+    drop(component);
+    drop(engine);
+    wait_for_tick_progress();
+
+    let mut stream = run.finish()?;
+    let summary = stream.summary()?;
+    if summary.phase_ticks().interpretation < profile.core_interpreter_ticks
+        || !summary.intervals_complete()
+        || summary.interval_count() != 6
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    let expected_phases = [
+        Phase::Validation,
+        Phase::Instantiation,
+        Phase::Abi,
+        Phase::Interpretation,
+        Phase::Abi,
+        Phase::Cleanup,
+    ];
+    let mut count = 0;
+    let mut previous_end = 0;
+    while let Some(interval) = stream.next_interval()? {
+        if interval.sequence() != count
+            || interval.start_offset_ticks() != previous_end
+            || expected_phases.get(count) != Some(&interval.phase())
+        {
+            return Err(ProfileError::StateMismatch);
+        }
+        previous_end = interval.end_offset_ticks();
+        count += 1;
+    }
+    if count != expected_phases.len() || previous_end != summary.total_ticks() {
+        return Err(ProfileError::StateMismatch);
+    }
+    stream.complete()?;
+    if status()
+        != (SlotStatus::Ready {
+            next_epoch: Some(2),
+        })
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    Ok(())
+}
+
+/// QEMU-only proof that the explicit portable observer drives a real wasmi
+/// Core poll into the exact task-owned slot. It does not modify ordinary
+/// `TypedCall::poll` or claim SSH/trap/publication integration.
+#[cfg(feature = "wasm-c84-core-poll-qemu-acceptance")]
+pub(crate) async fn run_core_poll_qemu_acceptance() {
+    if crate::online_hart_mask() == 1 {
+        match run_core_poll_positive_acceptance() {
+            Ok(()) => crate::println!(
+                "WASM_C84_CORE_POLL PASS exact_artifact=1 real_core=1 observer_paired=1 interpretation_nonzero=1 complete=1 ready_epoch=2"
+            ),
+            Err(error) => crate::println!("WASM_C84_CORE_POLL FAIL {:?}", error),
+        }
+    } else {
+        match run_topology_rejection() {
+            Ok(()) => crate::println!(
+                "WASM_C84_CORE_POLL TOPOLOGY_REJECT mask={:#x} logical={} physical={} epoch=1",
+                crate::online_hart_mask(),
+                crate::ipi::current_logical_hart().map_or(usize::MAX, crate::exec::HartId::index),
+                crate::sbi::current_hart_id(),
+            ),
+            Err(error) => crate::println!("WASM_C84_CORE_POLL FAIL {:?}", error),
         }
     }
 }

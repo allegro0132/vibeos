@@ -215,6 +215,20 @@ wasm-c84-profile-slot = ["dep:vibeos-wasm-aot-profile"]
 # QEMU-only proof for the slot's single-hart, TaskDetach, tombstone, indexed
 # streaming, rejection, and exact-recycle state machine.
 wasm-c84-profile-slot-qemu-acceptance = ["wasm-c84-profile-slot"]
+# Default-off adapter from the portable Core-poll observers to the exact
+# current-task profile-slot lease. This does not change ordinary `poll()` and
+# does not select any SSH, trap, or publication hook.
+wasm-c84-core-poll-observer = [
+    "wasm-c84-profile-slot",
+    "dep:vibeos-component-runtime",
+    "vibeos-component-runtime/c84-profile-hooks",
+]
+# QEMU-only proof that a real wasmi Core poll enters and leaves Interpretation
+# through the observer adapter while the slot remains exactly task-owned.
+wasm-c84-core-poll-qemu-acceptance = [
+    "wasm-c84-core-poll-observer",
+    "dep:vibeos-wasm-runtime",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

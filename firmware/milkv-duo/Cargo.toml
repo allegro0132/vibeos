@@ -16,6 +16,7 @@ milkv-jitterentropy-probe = ["vibeos-kernel/milkv-jitterentropy-probe"]
 milkv-jitterentropy-ssh-probe = ["vibeos-kernel/milkv-jitterentropy-ssh-probe"]
 wasm-c83-runtime-costs = ["vibeos-kernel/wasm-c83-runtime-costs"]
 wasm-c84-profile-slot = ["vibeos-kernel/wasm-c84-profile-slot"]
+wasm-c84-core-poll-observer = ["vibeos-kernel/wasm-c84-core-poll-observer"]
 
 [[bin]]
 name = "vibeos-milkv-duo"

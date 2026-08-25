@@ -33,6 +33,7 @@ cargo test --locked -p vibeos-wasm-aot-profile
 cargo check --locked -p vibeos-wasm-aot-profile \
   --target riscv64imac-unknown-none-elf
 ./scripts/qemu-c84-profile-slot-test.sh # C8.4 slot ownership/topology gate
+./scripts/qemu-c84-core-poll-test.sh # C8.4 real Core observer/slot gate
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
@@ -152,6 +153,25 @@ consuming epoch 1. This is ownership, detach, recycle, and topology integration
 evidence only. It does not connect the Core observer, trap/IRQ entry and exit,
 SSH timing boundary, schema publisher, collector, or physical-Duo path, and it
 does not inject the executor raw-fault or cancellation detach reasons.
+
+The separate default-off `wasm-c84-core-poll-observer` feature adapts one
+caller-supplied `poll_profiled` invocation to the exact current `RunLease`.
+The clock is lexical, sticky-latches its first slot error, requires each Core
+start/end pair to close before the next poll, and returns the same single end
+tick that changes the target ledger from Interpretation back to ABI. Ordinary
+`TypedCall::poll` is unchanged; this feature does not create an ambient hook or
+weaken task ownership.
+
+`scripts/qemu-c84-core-poll-test.sh` runs the exact image-pinned `case-filter`
+artifact through a real wasmi Core poll in one boot-hart-pinned task. The
+single-hart transcript must verify the exact phase sequence Validation,
+Instantiation, ABI, Interpretation, ABI, Cleanup; the external Interpretation
+total must contain the portable Core aggregate; streaming must complete back
+to ready epoch 2. The two-hart boot must reject topology before Core entry.
+This proves only the explicit Core-observer adapter. The frozen SSH runner
+still calls ordinary `poll`, and child-task delegation, IRQ overlays, SSH
+start/end timing, publication, collection, and physical-Duo evidence remain
+separate gates.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

@@ -223,6 +223,8 @@ jobs:
           ld.lld --version
       - name: Exercise the C8.4 kernel profile-slot ownership boundary
         run: ./scripts/qemu-c84-profile-slot-test.sh
+      - name: Exercise the C8.4 real Core-poll observer boundary
+        run: ./scripts/qemu-c84-core-poll-test.sh
       # Keep both closed-source-state gates before the ordinary Duo build,
       # which applies the reviewed jitterentropy patch inside its submodule.
       - name: Build the isolated Milk-V Duo C8.3 sampler (CI-only identity)

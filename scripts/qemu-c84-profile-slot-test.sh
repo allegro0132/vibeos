@@ -7,11 +7,13 @@ cd "$(dirname "$0")/.."
 KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt
 QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}
 C84_SLOT_TIMEOUT=${C84_SLOT_TIMEOUT:-60}
+C84_ACCEPTANCE_FEATURE=${C84_ACCEPTANCE_FEATURE:-wasm-c84-profile-slot-qemu-acceptance}
+C84_TEST_LABEL=${C84_TEST_LABEL:-qemu-c84-profile-slot-test}
 
-PASS_MARKER='WASM_C84_PROFILE_SLOT PASS detached_active=1 detached_stream=1 epochs=1,2,3 intervals=7 indexed=1 complete=1 ready_epoch=4'
-TOPOLOGY_MARKER='WASM_C84_PROFILE_SLOT TOPOLOGY_REJECT mask=0x3 logical=0 physical=0 epoch=1'
-FAIL_MARKER='WASM_C84_PROFILE_SLOT FAIL'
-FAMILY_MARKER='WASM_C84_PROFILE_SLOT'
+PASS_MARKER=${C84_PASS_MARKER:-'WASM_C84_PROFILE_SLOT PASS detached_active=1 detached_stream=1 epochs=1,2,3 intervals=7 indexed=1 complete=1 ready_epoch=4'}
+TOPOLOGY_MARKER=${C84_TOPOLOGY_MARKER:-'WASM_C84_PROFILE_SLOT TOPOLOGY_REJECT mask=0x3 logical=0 physical=0 epoch=1'}
+FAIL_MARKER=${C84_FAIL_MARKER:-'WASM_C84_PROFILE_SLOT FAIL'}
+FAMILY_MARKER=${C84_FAMILY_MARKER:-'WASM_C84_PROFILE_SLOT'}
 
 TEST_TMP=$(mktemp -d)
 SMP1_LOG="$TEST_TMP/smp1.log"
@@ -34,14 +36,14 @@ cleanup() {
     rm -f "$SMP1_LOG" "$SMP2_LOG"
     rmdir "$TEST_TMP" 2>/dev/null || true
     if [ "$status" -ne 0 ] && [ "$RESULT_REPORTED" -eq 0 ]; then
-        echo "qemu-c84-profile-slot-test: FAIL (unexpected exit)" >&2
+        echo "$C84_TEST_LABEL: FAIL (unexpected exit)" >&2
     fi
     exit "$status"
 }
 
 fail() {
     RESULT_REPORTED=1
-    echo "qemu-c84-profile-slot-test: FAIL ($1)" >&2
+    echo "$C84_TEST_LABEL: FAIL ($1)" >&2
     echo "--- smp=1 serial ---" >&2
     if [ -f "$SMP1_LOG" ]; then
         cat "$SMP1_LOG" >&2
@@ -208,11 +210,11 @@ pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc) || fail "cannot 
         --release \
         --locked \
         --no-default-features \
-        --features wasm-c84-profile-slot-qemu-acceptance
+        --features "$C84_ACCEPTANCE_FEATURE"
 ) >&2
 
 boot_and_require 1 "$SMP1_LOG" "$PASS_MARKER" "$TOPOLOGY_MARKER" "smp=1"
 boot_and_require 2 "$SMP2_LOG" "$TOPOLOGY_MARKER" "$PASS_MARKER" "smp=2"
 
 RESULT_REPORTED=1
-echo "qemu-c84-profile-slot-test: PASS"
+echo "$C84_TEST_LABEL: PASS"

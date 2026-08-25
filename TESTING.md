@@ -29,6 +29,9 @@ python3 -B scripts/verify-c83-evidence.py --selftest
 python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
 cargo test --locked -p vibeos-component-runtime --no-default-features \
   --features c84-profile-hooks --test c84_profile
+cargo test --locked -p vibeos-image-policy --no-default-features \
+  --features milkv-duo-sd --test stream_pin \
+  frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
 ```
 
 The C8.2 gate is intentionally pinned to the reviewed
@@ -63,6 +66,23 @@ checked-in workload/schema bytes against the executable image pin and OpenSSH
 fixture. This preparation gate neither completes C8.3 nor authorizes AOT;
 fixed-QEMU runs are integration evidence only, and a final decision requires
 the documented physical-Duo sample set.
+
+The image-policy command above enables `c84-profile-hooks` only through its
+dev-dependency and replays the exact 12,325-byte frozen input. It locks the
+1,251 typed polls, 1,165 Core polls, work ledger, dispatcher entries, 2,418
+no-wait intervals, and 4,918 managed-runner minimum which disproved the old
+4,096 cap. The verifier independently binds its 1,028/read, `4 + bytes`/write,
+and 1/close declarations, `required_work` branches, and ready/commit response
+sites to the kernel dispatcher and shared 1,024-byte component-host maximum.
+It pins the whole kernel component dispatcher file's reviewed byte identity,
+including attribute literal values, before scope extraction, rejecting module
+binding, `cfg` feature selection, alias, dead-code, and macro drift. It then
+strips comments and literals, and a second digest pins the seven balanced method
+scopes for localized review without accepting decoy text.
+The revised 65,536 capacity is an engineering bound for one packed active
+target sample, not a mathematical worst case.
+Formal samples must be complete and self-consistent; overflow or truncation is
+diagnostic-only.
 
 The portable C8.4 hook gate above exercises the default-off, caller-clocked
 boundary around the real synchronous Core poll. It proves ordinary and

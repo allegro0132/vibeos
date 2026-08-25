@@ -31,11 +31,12 @@ WAT_PATH = ROOT / "policy/image/artifacts/c53-stream-filter.component.wat"
 OPENSSH_PEER_PATH = ROOT / "scripts/openssh-peer.py"
 VSH_ENGINE_PATH = ROOT / "components/vsh/src/engine.rs"
 COMPONENT_HOST_STREAM_PATH = ROOT / "services/component-host/src/stream.rs"
+KERNEL_COMPONENT_INSTANCES_PATH = ROOT / "kernel/src/component_instances.rs"
 
 # Filled from the reviewed files below.  Byte identity is intentionally
 # independent of JSON parsing and makes formatting changes review-visible.
-EXPECTED_MANIFEST_SHA256 = "5b1df04b2182b5206fb56aadbb5959430cf1d03365df2a8f3fd1e174074ba350"
-EXPECTED_SCHEMA_SHA256 = "4e91b75c3f50426ff37446f42c2b268d825933d127760e16971c5dda423f6a84"
+EXPECTED_MANIFEST_SHA256 = "5eb32eaec43b456b8c5fa1428464e27d869419e79d4eb29a5512182d04b5e8e5"
+EXPECTED_SCHEMA_SHA256 = "ea0646f06f0f0b03d0e9b6286e802de9138e6b5cd085cd4e8d7648d8c1bf4d33"
 EXPECTED_WAT_SHA256 = "6db36b58350c4de22077fba4dd9dd1166f0808e2adc8488ba086d91c6f659cc1"
 EXPECTED_COMPONENT_SHA256 = "180ed444de8b6c9ecd828b369d4c8b9f783758ef22c0b17170682d71f2fd0e72"
 EXPECTED_COMPONENT_BYTES = 2012
@@ -43,6 +44,12 @@ EXPECTED_BUILD_SOURCE_SHA256 = "ca0d4f100d136d26c0ac1e1beeb0919b12c8f8a9e2345d15
 EXPECTED_POLICY_SOURCE_SHA256 = "d4912916f8407ddcb4ae7914186f6d567468896c72a39da0ddbbe957d1a7b2e0"
 EXPECTED_OPENSSH_SOURCE_SHA256 = "00d5002a8f2725c275995b1eff5d469f1d1eac1741b1eaef3f3623c3c746ac8c"
 EXPECTED_WIT_SHA256 = "61710f784d4814d87a9a5542edfb2e43bc2844fc04df679fd19490932038039a"
+EXPECTED_KERNEL_STREAM_CHARGE_SCOPES_SHA256 = (
+    "446e14cd17439d5199135f710d91eadb63bc89d4c24a3d1ca60783e3051fef4d"
+)
+EXPECTED_KERNEL_COMPONENT_INSTANCES_SOURCE_SHA256 = (
+    "107061bbffe2886ec48919a0912505858b14242f04bfcf4b0ca5974b8d25fdca"
+)
 
 INPUT_LENGTH = 12 * 1024 + 37
 INPUT_GENERATOR = "bytes((index * 17 + 3) % 251 for index in range(12 * 1024 + 37))"
@@ -99,6 +106,7 @@ PUBLICATION_GATES = {
     "correctness": "every sample exits zero, emits the exact 12325-byte output hash, and emits empty stderr",
     "successful_samples_only": "timed-out, trapped, failed, truncated, or otherwise non-successful attempts are diagnostic records outside the formal dataset and can never authorize AOT",
     "phase_partition": "intervals are ordered, gap-free, non-overlapping, and labeled with exactly one of seven phases; total_ticks equals both the response interval and the sum of phase_ticks",
+    "interval_capacity": "every formal sample pins interval_capacity to 65536, requires interval_count == len(intervals), and sets intervals_complete true; interval overflow or truncation is diagnostic-only and cannot enter the decision population",
     "duo_stability": "within each boot retained p95(total_ticks) divided by p50(total_ticks) is at most 1.50",
     "qemu_exclusion": "QEMU records are integration-only and absent from every budget and attribution statistic",
     "preparation_only": "this manifest contains no measurement result and does not complete C8.3 or authorize AOT",
@@ -523,6 +531,311 @@ def stream_chunk_limit() -> int:
     return values[0]
 
 
+def rust_code_without_comments_and_literals(source: str) -> str:
+    """Blank Rust comments and literals while preserving offsets and newlines."""
+    output = list(source)
+    length = len(source)
+
+    def blank(start: int, end: int) -> None:
+        for index in range(start, end):
+            if source[index] not in "\r\n":
+                output[index] = " "
+
+    def boundary(index: int) -> bool:
+        return index == 0 or not (source[index - 1].isalnum() or source[index - 1] == "_")
+
+    def quoted_end(quote: int, label: str) -> int:
+        cursor = quote + 1
+        while cursor < length:
+            if source[cursor] == "\\":
+                cursor += 2
+                continue
+            if source[cursor] == '"':
+                return cursor + 1
+            cursor += 1
+        raise VerificationError(f"unterminated Rust {label}")
+
+    cursor = 0
+    while cursor < length:
+        if source.startswith("//", cursor):
+            end = source.find("\n", cursor + 2)
+            if end < 0:
+                end = length
+            blank(cursor, end)
+            cursor = end
+            continue
+
+        if source.startswith("/*", cursor):
+            depth = 1
+            end = cursor + 2
+            while end < length and depth:
+                if source.startswith("/*", end):
+                    depth += 1
+                    end += 2
+                elif source.startswith("*/", end):
+                    depth -= 1
+                    end += 2
+                else:
+                    end += 1
+            require(depth == 0, "unterminated nested Rust block comment")
+            blank(cursor, end)
+            cursor = end
+            continue
+
+        raw_prefix = 0
+        if boundary(cursor) and source.startswith(("br", "rb", "cr", "rc"), cursor):
+            raw_prefix = 2
+        elif boundary(cursor) and source[cursor] == "r":
+            raw_prefix = 1
+        if raw_prefix:
+            quote = cursor + raw_prefix
+            while quote < length and source[quote] == "#":
+                quote += 1
+            if quote < length and source[quote] == '"':
+                hashes = source[cursor + raw_prefix : quote]
+                terminator = '"' + hashes
+                end = source.find(terminator, quote + 1)
+                require(end >= 0, "unterminated Rust raw string literal")
+                end += len(terminator)
+                blank(cursor, end)
+                cursor = end
+                continue
+
+        if source[cursor] == '"':
+            end = quoted_end(cursor, "string literal")
+            blank(cursor, end)
+            cursor = end
+            continue
+        if boundary(cursor) and source.startswith('b"', cursor):
+            end = quoted_end(cursor + 1, "byte string literal")
+            blank(cursor, end)
+            cursor = end
+            continue
+        if boundary(cursor) and source.startswith('c"', cursor):
+            end = quoted_end(cursor + 1, "C string literal")
+            blank(cursor, end)
+            cursor = end
+            continue
+
+        char_prefix = 0
+        if boundary(cursor) and source.startswith("b'", cursor):
+            char_prefix = 1
+        elif source[cursor] == "'":
+            char_prefix = 0
+        else:
+            cursor += 1
+            continue
+        quote = cursor + char_prefix
+        candidate_end = quote + 2
+        if quote + 1 < length and source[quote + 1] == "\\":
+            candidate_end = source.find("'", quote + 2)
+            if candidate_end >= 0:
+                candidate_end += 1
+        elif quote + 2 < length and source[quote + 2] == "'":
+            candidate_end = quote + 3
+        else:
+            cursor += 1
+            continue
+        require(candidate_end > quote, "unterminated Rust character literal")
+        blank(cursor, candidate_end)
+        cursor = candidate_end
+
+    return "".join(output)
+
+
+def rust_braced_scope(source: str, opening_brace: int, label: str) -> str:
+    require(
+        0 <= opening_brace < len(source) and source[opening_brace] == "{",
+        f"{label} opening brace differs",
+    )
+    depth = 1
+    cursor = opening_brace + 1
+    while cursor < len(source) and depth:
+        if source[cursor] == "{":
+            depth += 1
+        elif source[cursor] == "}":
+            depth -= 1
+        cursor += 1
+    require(depth == 0, f"unterminated {label}")
+    return source[opening_brace + 1 : cursor - 1]
+
+
+def registry_dispatcher_impl(source: str) -> str:
+    matches = list(
+        re.finditer(
+            r"\bimpl\s+HostDispatcher\s*<\s*ComponentAuthority\s*>\s*"
+            r"for\s+RegistryStreamDispatcher\s*\{",
+            source,
+        )
+    )
+    require(len(matches) == 1, "RegistryStreamDispatcher HostDispatcher impl differs")
+    return rust_braced_scope(source, matches[0].end() - 1, "RegistryStreamDispatcher impl")
+
+
+def registry_dispatcher_inherent_impls(source: str) -> list[str]:
+    matches = list(re.finditer(r"\bimpl\s+RegistryStreamDispatcher\s*\{", source))
+    require(matches, "RegistryStreamDispatcher inherent impls are missing")
+    return [
+        rust_braced_scope(source, match.end() - 1, "RegistryStreamDispatcher inherent impl")
+        for match in matches
+    ]
+
+
+def rust_method_scope(implementation: str, name: str) -> str:
+    matches = list(re.finditer(rf"\bfn\s+{re.escape(name)}\s*\(", implementation))
+    require(len(matches) == 1, f"RegistryStreamDispatcher::{name} definition differs")
+    opening_brace = implementation.find("{", matches[0].end())
+    require(opening_brace >= 0, f"RegistryStreamDispatcher::{name} body differs")
+    return rust_braced_scope(
+        implementation,
+        opening_brace,
+        f"RegistryStreamDispatcher::{name}",
+    )
+
+
+def rust_unique_method_scope(implementations: list[str], name: str) -> str:
+    containing = [
+        implementation
+        for implementation in implementations
+        if re.search(rf"\bfn\s+{re.escape(name)}\s*\(", implementation)
+    ]
+    require(len(containing) == 1, f"RegistryStreamDispatcher::{name} owner impl differs")
+    return rust_method_scope(containing[0], name)
+
+
+def canonical_rust_scopes_sha256(scopes: list[tuple[str, str]]) -> str:
+    records = []
+    for name, scope in scopes:
+        canonical = re.sub(r"\s+", " ", scope).strip()
+        records.append(f"{len(name)}:{name}:{len(canonical)}:{canonical}")
+    return hashlib.sha256("\n".join(records).encode("utf-8")).hexdigest()
+
+
+def kernel_stream_work_charges(
+    maximum_chunk: int, source: str | None = None
+) -> tuple[int, int, int]:
+    """Bind the profile preflight's charges to the product dispatcher source."""
+    if source is None:
+        try:
+            source = KERNEL_COMPONENT_INSTANCES_PATH.read_text(encoding="utf-8")
+        except OSError as error:
+            raise VerificationError(f"cannot load kernel component dispatcher: {error}") from error
+
+    require(
+        EXPECTED_KERNEL_COMPONENT_INSTANCES_SOURCE_SHA256 != "",
+        "kernel component dispatcher reviewed source identity is not pinned",
+    )
+    reviewed_source_identity(
+        source,
+        EXPECTED_KERNEL_COMPONENT_INSTANCES_SOURCE_SHA256,
+        "kernel component dispatcher",
+    )
+    code = rust_code_without_comments_and_literals(source)
+    implementation = registry_dispatcher_impl(code)
+    inherent_implementations = registry_dispatcher_inherent_impls(code)
+    required_work = rust_method_scope(implementation, "required_work")
+    commit_prepared = rust_method_scope(implementation, "commit_prepared")
+    ready_read_closed = rust_unique_method_scope(inherent_implementations, "ready_read_closed")
+    start_write = rust_unique_method_scope(inherent_implementations, "start_write")
+    resume_write = rust_unique_method_scope(inherent_implementations, "resume_write")
+    close_reader = rust_unique_method_scope(inherent_implementations, "close_reader")
+    close_writer = rust_unique_method_scope(inherent_implementations, "close_writer")
+    reviewed_scopes = [
+        ("required_work", required_work),
+        ("commit_prepared", commit_prepared),
+        ("ready_read_closed", ready_read_closed),
+        ("start_write", start_write),
+        ("resume_write", resume_write),
+        ("close_reader", close_reader),
+        ("close_writer", close_writer),
+    ]
+    require(
+        EXPECTED_KERNEL_STREAM_CHARGE_SCOPES_SHA256 != "",
+        "kernel stream charge scope identity is not pinned",
+    )
+    require(
+        canonical_rust_scopes_sha256(reviewed_scopes)
+        == EXPECTED_KERNEL_STREAM_CHARGE_SCOPES_SHA256,
+        "reviewed kernel stream charge method identity differs",
+    )
+
+    import_blocks = re.findall(
+        r"(?ms)^use vibeos_component_host::\{\n(.*?)^\};$",
+        code,
+    )
+    imported_chunk_limits = sum(
+        len(re.findall(r"\bMAX_STREAM_CHUNK_BYTES\b", block)) for block in import_blocks
+    )
+    require(
+        imported_chunk_limits == 1,
+        "kernel dispatcher must import the component-host MAX_STREAM_CHUNK_BYTES exactly once",
+    )
+    require(
+        re.search(r"(?m)^const MAX_STREAM_CHUNK_BYTES\b", code) is None,
+        "kernel dispatcher shadows the component-host stream chunk limit",
+    )
+
+    read_matches = re.findall(
+        r"(?m)^const STREAM_READ_WORK: u64 = MAX_STREAM_CHUNK_BYTES as u64 \+ ([0-9][0-9_]*);$",
+        code,
+    )
+    write_matches = re.findall(
+        r"(?m)^const STREAM_WRITE_BASE_WORK: u64 = ([0-9][0-9_]*);$",
+        code,
+    )
+    close_matches = re.findall(
+        r"(?m)^const STREAM_CLOSE_WORK: u64 = ([0-9][0-9_]*);$",
+        code,
+    )
+    require(len(read_matches) == 1, "kernel STREAM_READ_WORK declaration differs")
+    require(len(write_matches) == 1, "kernel STREAM_WRITE_BASE_WORK declaration differs")
+    require(len(close_matches) == 1, "kernel STREAM_CLOSE_WORK declaration differs")
+    read_overhead = int(read_matches[0].replace("_", ""))
+    write_base = int(write_matches[0].replace("_", ""))
+    close = int(close_matches[0].replace("_", ""))
+    require(
+        (maximum_chunk, read_overhead, write_base, close) == (1024, 4, 4, 1),
+        "kernel product stream work charges differ from the frozen preflight",
+    )
+    require(
+        required_work.count("return Ok(STREAM_READ_WORK);") == 1,
+        "kernel required_work does not return STREAM_READ_WORK exactly once",
+    )
+    require(
+        len(
+            re.findall(
+                r"return STREAM_WRITE_BASE_WORK\s*"
+                r"\.checked_add\(u64::try_from\(values\.len\(\)\)"
+                r"\.map_err\(\|_\| HostError::Exhausted\)\?\)\s*"
+                r"\.ok_or\(HostError::Exhausted\);",
+                required_work,
+            )
+        )
+        == 1,
+        "kernel required_work write charge is not base plus exact value length",
+    )
+    require(
+        required_work.count("return Ok(STREAM_CLOSE_WORK);") == 1,
+        "kernel required_work does not return STREAM_CLOSE_WORK exactly once",
+    )
+    require(
+        commit_prepared.count("HostResponse::reserve_one(STREAM_READ_WORK)?") == 1
+        and ready_read_closed.count("HostResponse::reserve_one(STREAM_READ_WORK)?") == 1,
+        "kernel ready/commit read responses do not each consume STREAM_READ_WORK",
+    )
+    require(
+        start_write.count("STREAM_WRITE_BASE_WORK + bytes.len() as u64") == 1
+        and resume_write.count("STREAM_WRITE_BASE_WORK + bytes.len() as u64") == 1,
+        "kernel start/resume write responses do not each consume base plus exact byte length",
+    )
+    require(
+        close_reader.count("HostResponse::unit(STREAM_CLOSE_WORK)?") == 1
+        and close_writer.count("HostResponse::unit(STREAM_CLOSE_WORK)?") == 1,
+        "kernel reader/writer close responses do not each consume STREAM_CLOSE_WORK",
+    )
+    return maximum_chunk + read_overhead, write_base, close
+
+
 def named_assignment(tree: ast.Module, name: str) -> ast.AST:
     matches = [
         node.value
@@ -825,6 +1138,11 @@ def validate_manifest(value: dict[str, Any]) -> None:
     openssh_fixture_identity()
 
     maximum_chunk = stream_chunk_limit()
+    exact_literal(
+        kernel_stream_work_charges(maximum_chunk),
+        (1028, 4, 1),
+        "kernel product stream work charges",
+    )
     chunking = exact_keys(
         fixture["chunking"],
         {"maximum_chunk_bytes", "full_chunks", "final_chunk_bytes", "total_chunks"},
@@ -999,10 +1317,13 @@ def validate_schema(value: dict[str, Any]) -> None:
         "workload_id": {"const": "ssh-case-filter-12k-v1"},
         "total_ticks": {"type": "integer", "minimum": 1},
         "phase_ticks": {"$ref": "#/$defs/phaseTicks"},
+        "interval_capacity": {"const": 65536},
+        "interval_count": {"type": "integer", "minimum": 1, "maximum": 65536},
+        "intervals_complete": {"const": True},
         "intervals": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 4096,
+            "maxItems": 65536,
             "items": {"$ref": "#/$defs/interval"},
         },
         "read_chunks": {"const": 13},
@@ -1108,6 +1429,12 @@ def selftest(manifest: dict[str, Any], schema: dict[str, Any]) -> None:
             "publication-gate-drift",
             lambda value: value["publication_gates"].update(qemu_exclusion="QEMU is eligible"),
         ),
+        (
+            "publication-interval-capacity-drift",
+            lambda value: value["publication_gates"].update(
+                interval_capacity="truncated intervals are accepted"
+            ),
+        ),
     ]
     schema_mutations: list[tuple[str, Callable[[dict[str, Any]], None]]] = [
         ("schema-id-drift", lambda value: value.update({"$id": "https://example.invalid/other"})),
@@ -1120,7 +1447,31 @@ def selftest(manifest: dict[str, Any], schema: dict[str, Any]) -> None:
         ),
         (
             "schema-interval-bound-drift",
-            lambda value: value["$defs"]["sample"]["properties"]["intervals"].update(maxItems=4097),
+            lambda value: value["$defs"]["sample"]["properties"]["intervals"].update(maxItems=65535),
+        ),
+        (
+            "schema-interval-capacity-drift",
+            lambda value: value["$defs"]["sample"]["properties"]["interval_capacity"].update(
+                const=65535
+            ),
+        ),
+        (
+            "schema-interval-count-minimum-drift",
+            lambda value: value["$defs"]["sample"]["properties"]["interval_count"].update(
+                minimum=0
+            ),
+        ),
+        (
+            "schema-interval-count-maximum-drift",
+            lambda value: value["$defs"]["sample"]["properties"]["interval_count"].update(
+                maximum=65535
+            ),
+        ),
+        (
+            "schema-intervals-complete-drift",
+            lambda value: value["$defs"]["sample"]["properties"]["intervals_complete"].update(
+                const=False
+            ),
         ),
         (
             "schema-timeout-drift",
@@ -1130,7 +1481,10 @@ def selftest(manifest: dict[str, Any], schema: dict[str, Any]) -> None:
             "schema-terminal-drift",
             lambda value: value["$defs"]["sample"]["properties"]["terminal"].update(const="failed"),
         ),
-        ("schema-required-drift", lambda value: value["$defs"]["sample"]["required"].pop()),
+        (
+            "schema-required-drift",
+            lambda value: value["$defs"]["sample"]["required"].remove("interval_count"),
+        ),
         (
             "schema-count-drift",
             lambda value: value["$defs"]["end"]["properties"]["retained"].update(const=62),
@@ -1222,6 +1576,249 @@ def selftest(manifest: dict[str, Any], schema: dict[str, Any]) -> None:
             rejected += 1
         else:
             raise VerificationError(f"selftest accepted source mutation {name}")
+
+    kernel_source = KERNEL_COMPONENT_INSTANCES_PATH.read_text(encoding="utf-8")
+    kernel_binding_cfg_alias_decoy = kernel_source.replace(
+        "VibeHostManifest, MAX_STREAM_CHUNK_BYTES,",
+        "VibeHostManifest,",
+        1,
+    ).replace(
+        "static INSTANCES: InstanceRegistry = InstanceRegistry::new();",
+        "#[cfg(feature = \"ssh-component-command\")]\n"
+        "const OTHER_STREAM_CHUNK_BYTES: usize = 2048;\n"
+        "#[cfg(feature = \"ssh-component-command\")]\n"
+        "use self::OTHER_STREAM_CHUNK_BYTES as MAX_STREAM_CHUNK_BYTES;\n"
+        "#[cfg(any())]\n"
+        "use vibeos_component_host::{\n"
+        "    MAX_STREAM_CHUNK_BYTES,\n"
+        "};\n\n"
+        "static INSTANCES: InstanceRegistry = InstanceRegistry::new();",
+        1,
+    )
+    kernel_read_cfg_false_decoy = kernel_source.replace(
+        "#[cfg(feature = \"ssh-component-command\")]\n"
+        "const STREAM_READ_WORK: u64 = MAX_STREAM_CHUNK_BYTES as u64 + 4;",
+        "#[cfg(feature = \"ssh-component-command\")]\n"
+        "const OTHER_STREAM_READ_WORK: u64 = MAX_STREAM_CHUNK_BYTES as u64 + 5;\n"
+        "#[cfg(feature = \"ssh-component-command\")]\n"
+        "use self::OTHER_STREAM_READ_WORK as STREAM_READ_WORK;\n"
+        "#[cfg(any())]\n"
+        "const STREAM_READ_WORK: u64 = MAX_STREAM_CHUNK_BYTES as u64 + 4;",
+        1,
+    )
+    kernel_write_cfg_alias_decoy = kernel_source.replace(
+        "#[cfg(feature = \"ssh-component-command\")]\n"
+        "const STREAM_WRITE_BASE_WORK: u64 = 4;",
+        "#[cfg(feature = \"ssh-component-command\")]\n"
+        "const OTHER_STREAM_WRITE_BASE_WORK: u64 = 5;\n"
+        "#[cfg(feature = \"ssh-component-command\")]\n"
+        "use self::OTHER_STREAM_WRITE_BASE_WORK as STREAM_WRITE_BASE_WORK;\n"
+        "#[cfg(any())]\n"
+        "const STREAM_WRITE_BASE_WORK: u64 = 4;",
+        1,
+    )
+    kernel_cfg_feature_string_drift = kernel_source.replace(
+        "#[cfg(feature = \"ssh-component-command\")]\n"
+        "const STREAM_READ_WORK: u64 = MAX_STREAM_CHUNK_BYTES as u64 + 4;",
+        "#[cfg(feature = \"ssh-component-command-alias\")]\n"
+        "const STREAM_READ_WORK: u64 = MAX_STREAM_CHUNK_BYTES as u64 + 4;",
+        1,
+    )
+    kernel_charge_mutations = [
+        (
+            "kernel-stream-cfg-feature-string-drift",
+            kernel_cfg_feature_string_drift,
+        ),
+        (
+            "kernel-stream-chunk-cfg-alias-import-decoy",
+            kernel_binding_cfg_alias_decoy,
+        ),
+        (
+            "kernel-stream-read-cfg-false-alias-decoy",
+            kernel_read_cfg_false_decoy,
+        ),
+        (
+            "kernel-stream-write-cfg-false-alias-decoy",
+            kernel_write_cfg_alias_decoy,
+        ),
+        (
+            "kernel-stream-chunk-import-drift",
+            kernel_source.replace(
+                "VibeHostManifest, MAX_STREAM_CHUNK_BYTES,",
+                "VibeHostManifest,",
+                1,
+            ),
+        ),
+        (
+            "kernel-stream-read-work-drift",
+            kernel_source.replace(
+                "STREAM_READ_WORK: u64 = MAX_STREAM_CHUNK_BYTES as u64 + 4;",
+                "STREAM_READ_WORK: u64 = MAX_STREAM_CHUNK_BYTES as u64 + 5;",
+                1,
+            ),
+        ),
+        (
+            "kernel-stream-write-work-drift",
+            kernel_source.replace(
+                "STREAM_WRITE_BASE_WORK: u64 = 4;",
+                "STREAM_WRITE_BASE_WORK: u64 = 5;",
+                1,
+            ),
+        ),
+        (
+            "kernel-stream-close-work-drift",
+            kernel_source.replace(
+                "STREAM_CLOSE_WORK: u64 = 1;",
+                "STREAM_CLOSE_WORK: u64 = 2;",
+                1,
+            ),
+        ),
+        (
+            "kernel-required-read-charge-use-drift",
+            kernel_source.replace(
+                "return Ok(STREAM_READ_WORK);",
+                "return Ok(STREAM_READ_WORK + 1);",
+                1,
+            ),
+        ),
+        (
+            "kernel-required-write-charge-use-drift",
+            kernel_source.replace(
+                "return STREAM_WRITE_BASE_WORK\n                .checked_add(",
+                "return STREAM_WRITE_BASE_WORK\n                .saturating_add(",
+                1,
+            ),
+        ),
+        (
+            "kernel-required-close-charge-use-drift",
+            kernel_source.replace(
+                "return Ok(STREAM_CLOSE_WORK);",
+                "return Ok(STREAM_CLOSE_WORK + 1);",
+                1,
+            ),
+        ),
+        (
+            "kernel-ready-read-charge-use-drift",
+            kernel_source.replace(
+                "HostResponse::reserve_one(STREAM_READ_WORK)?",
+                "HostResponse::reserve_one(STREAM_READ_WORK + 1)?",
+                1,
+            ),
+        ),
+        (
+            "kernel-ready-write-charge-use-drift",
+            kernel_source.replace(
+                "STREAM_WRITE_BASE_WORK + bytes.len() as u64",
+                "bytes.len() as u64 + STREAM_WRITE_BASE_WORK",
+                1,
+            ),
+        ),
+        (
+            "kernel-ready-close-charge-use-drift",
+            kernel_source.replace(
+                "HostResponse::unit(STREAM_CLOSE_WORK)?",
+                "HostResponse::unit(STREAM_CLOSE_WORK + 1)?",
+                1,
+            ),
+        ),
+        (
+            "kernel-required-read-line-comment-decoy",
+            kernel_source.replace(
+                "return Ok(STREAM_READ_WORK);",
+                "return Ok(STREAM_READ_WORK + 1); "
+                "// } return Ok(STREAM_READ_WORK); {",
+                1,
+            ),
+        ),
+        (
+            "kernel-required-read-nested-block-comment-decoy",
+            kernel_source.replace(
+                "return Ok(STREAM_READ_WORK);",
+                "return Ok(STREAM_READ_WORK + 1); "
+                "/* outer } /* return Ok(STREAM_READ_WORK); */ { comment */",
+                1,
+            ),
+        ),
+        (
+            "kernel-required-read-string-decoy",
+            kernel_source.replace(
+                "return Ok(STREAM_READ_WORK);",
+                'let _decoy = "} return Ok(STREAM_READ_WORK); {"; '
+                "return Ok(STREAM_READ_WORK + 1);",
+                1,
+            ),
+        ),
+        (
+            "kernel-required-read-byte-string-decoy",
+            kernel_source.replace(
+                "return Ok(STREAM_READ_WORK);",
+                'let _decoy = b"} return Ok(STREAM_READ_WORK); {"; '
+                "return Ok(STREAM_READ_WORK + 1);",
+                1,
+            ),
+        ),
+        (
+            "kernel-required-read-raw-string-decoy",
+            kernel_source.replace(
+                "return Ok(STREAM_READ_WORK);",
+                'let _decoy = r###"} return Ok(STREAM_READ_WORK); {"###; '
+                "return Ok(STREAM_READ_WORK + 1);",
+                1,
+            ),
+        ),
+        (
+            "kernel-required-read-byte-raw-string-decoy",
+            kernel_source.replace(
+                "return Ok(STREAM_READ_WORK);",
+                'let _decoy = br###"} return Ok(STREAM_READ_WORK); {"###; '
+                "return Ok(STREAM_READ_WORK + 1);",
+                1,
+            ),
+        ),
+        (
+            "kernel-required-read-c-string-decoy",
+            kernel_source.replace(
+                "return Ok(STREAM_READ_WORK);",
+                'let _decoy = c"} return Ok(STREAM_READ_WORK); {"; '
+                "return Ok(STREAM_READ_WORK + 1);",
+                1,
+            ),
+        ),
+        (
+            "kernel-required-read-c-raw-string-decoy",
+            kernel_source.replace(
+                "return Ok(STREAM_READ_WORK);",
+                'let _decoy = cr###"} return Ok(STREAM_READ_WORK); {"###; '
+                "return Ok(STREAM_READ_WORK + 1);",
+                1,
+            ),
+        ),
+        (
+            "kernel-required-read-dead-code-decoy",
+            kernel_source.replace(
+                "return Ok(STREAM_READ_WORK);",
+                "if false { return Ok(STREAM_READ_WORK); } "
+                "return Ok(STREAM_READ_WORK + 1);",
+                1,
+            ),
+        ),
+        (
+            "kernel-required-read-stringify-decoy",
+            kernel_source.replace(
+                "return Ok(STREAM_READ_WORK);",
+                "let _decoy = stringify!(return Ok(STREAM_READ_WORK);); "
+                "return Ok(STREAM_READ_WORK + 1);",
+                1,
+            ),
+        ),
+    ]
+    for name, candidate in kernel_charge_mutations:
+        try:
+            kernel_stream_work_charges(stream_chunk_limit(), candidate)
+        except VerificationError:
+            rejected += 1
+        else:
+            raise VerificationError(f"selftest accepted kernel charge mutation {name}")
 
     print(
         "verify-c84-aot-decision.py selftest: "

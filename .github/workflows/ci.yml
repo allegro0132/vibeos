@@ -60,7 +60,7 @@ jobs:
               -p vibeos-component-runtime --no-default-features \
               --features c84-profile-hooks \
               --test c84_profile --verbose
-      - name: Test each image policy independently
+      - name: Test each image policy and the frozen C8.4 capacity preflight
         run: |
           RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
             rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked \
@@ -79,7 +79,7 @@ jobs:
           python3 -B scripts/verify-c83-runtime-costs.py --selftest --check-manifest
           python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
           python3 -B scripts/verify-c83-evidence.py --selftest
-      - name: Verify the frozen C8.4 AOT decision contract
+      - name: Verify the revised C8.4 interval-capacity contract
         run: python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
       - name: Verify the independent ComponentArtifact codec
         run: python3 -B scripts/verify-c71-component-artifact.py --selftest

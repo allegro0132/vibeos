@@ -61,9 +61,11 @@ budget.
 
 Only complete success samples enter the formal dataset: each records 13 reads,
 13 writes, fuel, poll quanta, terminal `success`, zero logical live state after
-cleanup, `timed_out = false`, and timeout phase `none`. A timeout, trap, failed
-status, truncated stream, wrong output, or leak is diagnostic evidence outside
-the decision population and can never authorize AOT.
+cleanup, `timed_out = false`, timeout phase `none`, and a complete interval
+transcript with capacity 65,536 and an exact declared count. A timeout, trap,
+failed status, truncated stream or interval ledger, wrong output, leak, or
+interval overflow is diagnostic evidence outside the decision population and
+can never authorize AOT.
 
 ## Exclusive phase ledger
 
@@ -91,6 +93,55 @@ gap, and each retained sample must satisfy
 The order above is the canonical reporting order, not a claim that each phase
 is one contiguous interval. Only `interpretation` is AOT-attributable.
 
+## Interval capacity and collection completeness
+
+Before any C8.4 evidence was produced, a dev-only `c84-profile-hooks`
+preflight ran the exact frozen artifact and 12,325-byte input through the
+buffered product work model. It locked these complete-call counts:
+
+| Counter | Frozen preflight |
+|---|---:|
+| Typed polls / pending polls | 1,251 / 1,250 |
+| Core polls | 1,165 |
+| Profiled-poll work / typed-call planning / terminal work | 188,121 / 2 / 188,123 |
+| Dispatcher start / prepared commit / total host entries | 29 / 13 / 42 |
+
+The preparation verifier independently parses the real kernel dispatcher's
+declarations, `required_work` branches, and every ready/commit response charge.
+Read must remain `MAX_STREAM_CHUNK_BYTES + 4`, write `4 + bytes`, and close `1`.
+The kernel must also import the same 1,024-byte component-host maximum used by
+the fixture. Before any scope extraction, the verifier pins the reviewed byte
+identity of the entire `kernel/src/component_instances.rs`, including attribute
+literal values. This makes module binding, `cfg` feature selection, alias,
+executable dead-code, and macro drift fail closed. It separately removes nested
+comments and Rust literal forms, extracts the seven reviewed dispatcher methods
+with balanced braces, and pins their combined canonical source digest for
+localized review; decoy text cannot satisfy the semantic checks.
+
+With strict adjacent-same-phase merging and no wait or interrupt episodes, the
+audited interval count is exactly
+`4 + 2 * (1,165 Core polls + 42 host entries) = 2,418`. The managed runner
+yields one executor turn after each of the 1,250 pending polls, so even the
+buffered no-`HostPending`, no-IRQ path requires at least
+`2,418 + 2 * 1,250 = 4,918` intervals. The former schema capacity of 4,096 was
+therefore impossible for the frozen successful path.
+
+The corrected v1 engineering capacity is 65,536 intervals. Each formal sample
+must contain `interval_capacity = 65536`, `interval_count == len(intervals)`,
+and `intervals_complete = true`. The collector must keep one active sample in
+packed target storage and stream it before starting another; a conservative
+17-byte phase/start/end encoding occupies 1,114,112 bytes, about 1.77% of the
+Duo's 60 MiB RAM. Capacity exhaustion, a missing interval, or any truncation
+makes the attempt diagnostic-only and ineligible for publication. The
+collector must never ring-overwrite intervals or merge non-adjacent phases.
+
+The 65,536 value is not a mathematical worst-case upper bound: the frozen
+contract does not bound the number of `HostPending`, network/backpressure, or
+interrupt episodes. It is an engineering cap with fail-closed overflow
+semantics. Because no evidence existed when this feasibility error was found,
+the schema remains version 1 and the workload remains revision 1; artifact,
+input, budget, sampling, phases, and decision predicates are unchanged.
+
 ## Decision rule
 
 Let `T` be each retained sample's `total_ticks`, `I` its `interpretation`
@@ -114,6 +165,9 @@ remain separate C8.5--C8.7 work.
 ## Preparation verification
 
 ```sh
+cargo test --locked -p vibeos-image-policy --no-default-features \
+  --features milkv-duo-sd --test stream_pin \
+  frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
 python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
 ```
 

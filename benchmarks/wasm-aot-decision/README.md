@@ -9,6 +9,38 @@ QEMU is integration-only and cannot contribute to the 25 MHz physical-Duo
 budget decision. See
 [`docs/WASM_AOT_DECISION.md`](../../docs/WASM_AOT_DECISION.md).
 
-The formal schema accepts complete successful physical samples only. Timeout,
-trap, failure, truncation, wrong-output, and leak attempts are diagnostic and
-cannot enter the decision population or authorize AOT.
+The closed schema and required semantic publication verifier together admit
+complete successful physical samples only. The verifier must enforce the
+cross-field `interval_count == len(intervals)` relation which JSON Schema
+cannot express. Timeout, trap, failure, truncation, wrong-output, and leak
+attempts are diagnostic and cannot enter the decision population or authorize
+AOT.
+
+Before the first evidence was collected, the exact frozen workload's portable
+profile preflight proved that the former 4,096-interval limit could not hold
+even the managed runner's 4,918-interval minimum. The corrected engineering
+capacity is 65,536 intervals. Every formal sample self-describes that capacity,
+reports `interval_count == len(intervals)`, and sets `intervals_complete` true.
+The target collector must keep only one active sample in packed storage;
+overflow or truncation remains diagnostic-only and fails closed. This
+feasibility fix does not change the v1 workload, budget, sampling, or decision
+rule, and 65,536 is not claimed as a mathematical worst-case bound.
+
+The verifier also parses the kernel's real stream dispatcher instead of
+trusting a copied test constant: declarations, `required_work`, and every
+ready/commit response must charge `MAX_STREAM_CHUNK_BYTES + 4` for read,
+`4 + bytes` for write, and `1` for close, using the same component-host
+1,024-byte maximum as the fixture. Before extracting those scopes, the verifier
+pins the reviewed byte identity of all of `kernel/src/component_instances.rs`,
+including attribute literal values; module binding, `cfg` feature selection,
+alias, dead-code, and macro drift therefore fail closed. It separately strips
+comments and literals before balanced extraction and pins the seven reviewed
+dispatcher method scopes for localized review, so decoy text cannot satisfy
+the semantic checks.
+
+```sh
+cargo test --locked -p vibeos-image-policy --no-default-features \
+  --features milkv-duo-sd --test stream_pin \
+  frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
+python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
+```

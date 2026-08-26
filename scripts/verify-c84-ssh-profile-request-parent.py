@@ -32,6 +32,9 @@ FINISH_FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
 FINISH_QEMU_FEATURE = f"{FINISH_FEATURE}-qemu-acceptance"
 VERIFIED_STREAM_FEATURE = "wasm-c84-ssh-managed-child-verified-stream"
 VERIFIED_STREAM_QEMU_FEATURE = f"{VERIFIED_STREAM_FEATURE}-qemu-acceptance"
+TRUSTED_SAMPLE_FEATURE = "wasm-c84-ssh-managed-child-trusted-sample"
+TRUSTED_SAMPLE_QEMU_FEATURE = f"{TRUSTED_SAMPLE_FEATURE}-qemu-acceptance"
+SSHD_TRUSTED_SAMPLE_FEATURE = "c84-profile-trusted-sample"
 
 
 class VerificationError(Exception):
@@ -333,9 +336,31 @@ def verify_feature_manifest(raw: bytes, label: str, feature: str) -> None:
     require(feature not in default, f"{label} enables {feature} by default")
 
 
+def local_feature_closure(features: dict[str, list[str]], roots: list[str]) -> set[str]:
+    closure: set[str] = set()
+    pending = list(roots)
+    while pending:
+        name = pending.pop()
+        if name in closure:
+            continue
+        closure.add(name)
+        for member in features.get(name, []):
+            if "/" not in member and not member.startswith("dep:"):
+                pending.append(member)
+    return closure
+
+
 def verify_sshd(source: str, manifest: bytes) -> None:
     verify_feature_manifest(manifest, "vibeos-sshd", FEATURE)
+    verify_feature_manifest(manifest, "vibeos-sshd", SSHD_TRUSTED_SAMPLE_FEATURE)
+    sshd_features = tomllib.loads(manifest.decode("utf-8"))["features"]
+    require(
+        sshd_features.get(SSHD_TRUSTED_SAMPLE_FEATURE)
+        == ["c84-profile-phase-sidecar"],
+        "sshd trusted-sample is not the exact phase-sidecar successor",
+    )
     production = source.split("#[cfg(test)]\nmod tests", 1)[0]
+    production = without_direct_feature_units(production, SSHD_TRUSTED_SAMPLE_FEATURE)
 
     permit_trait = find_scope(production, r"\bpub\s+trait\s+SshExecProfilePermitBackend\b", "permit backend trait")
     run_trait = find_scope(production, r"\bpub\s+trait\s+SshExecProfileRunBackend\b", "run backend trait")
@@ -381,8 +406,16 @@ def verify_sshd(source: str, manifest: bytes) -> None:
     run_impl = find_scope(production, r"\bimpl\s+SshExecProfileRun\b", "run wrapper impl")
     response = find_function(run_impl, "response_boundary", "run response boundary")
     response_code = compact(response.code)
-    ordered(response_code, [".take()", "backend.response_boundary(status)"], "run response boundary")
-    require("ifbackend.response_boundary(status).is_err(){backend.cancel();returnErr(());}" in response_code, "failed response boundary does not cancel the exact run")
+    ordered(
+        response_code,
+        [".take()", "letboundary=backend.response_boundary(status);", "ifboundary.is_err()"],
+        "run response boundary",
+    )
+    require(
+        "letboundary=backend.response_boundary(status);ifboundary.is_err(){backend.cancel();returnErr(());}"
+        in response_code,
+        "failed response boundary does not cancel the exact run",
+    )
 
     run_drop = find_scope(production, r"\bimpl\s+Drop\s+for\s+SshExecProfileRun\b", "run Drop")
     run_drop_fn = find_function(run_drop, "drop", "run Drop body")
@@ -555,6 +588,27 @@ def verify_kernel(source: str, root_source: str, manifest: bytes) -> None:
         kernel_features.get(QEMU_FEATURE) == [KERNEL_FEATURE],
         "QEMU telemetry feature is not a narrow child of the base seam",
     )
+    require(
+        kernel_features.get(TRUSTED_SAMPLE_FEATURE)
+        == [FINISH_FEATURE, "vibeos-sshd/c84-profile-trusted-sample"],
+        "kernel trusted-sample feature closure differs",
+    )
+    require(
+        kernel_features.get(TRUSTED_SAMPLE_QEMU_FEATURE)
+        == [TRUSTED_SAMPLE_FEATURE, FINISH_QEMU_FEATURE],
+        "kernel trusted-sample QEMU closure differs",
+    )
+    trusted_closure = local_feature_closure(kernel_features, [TRUSTED_SAMPLE_FEATURE])
+    verified_closure = local_feature_closure(kernel_features, [VERIFIED_STREAM_FEATURE])
+    require(
+        KERNEL_FEATURE in trusted_closure and FINISH_FEATURE in trusted_closure,
+        "trusted-sample does not inherit the request parent through finish/verify",
+    )
+    require(
+        VERIFIED_STREAM_FEATURE not in trusted_closure
+        and TRUSTED_SAMPLE_FEATURE not in verified_closure,
+        "trusted-sample and verified-stream are not sibling successors",
+    )
 
     root_code = semantic(root_source)
     qemu_only = (
@@ -572,6 +626,16 @@ def verify_kernel(source: str, root_source: str, manifest: bytes) -> None:
         ')))]compile_error!("C8.4QEMUacceptancesareisolatedimages");'
     )
     require(isolated in root_code, "request-parent telemetry is not isolated from other C8.4 acceptances")
+    mutually_exclusive = (
+        f'#[cfg(all(feature="{TRUSTED_SAMPLE_FEATURE}",'
+        f'feature="{VERIFIED_STREAM_FEATURE}"))]compile_error!('
+        f'"features`{TRUSTED_SAMPLE_FEATURE}`and`{VERIFIED_STREAM_FEATURE}`'
+        'aremutuallyexclusivefinish/verifysuccessors");'
+    )
+    require(
+        mutually_exclusive in root_code,
+        "trusted-sample and verified-stream lack their exact mutual-exclusion guard",
+    )
     # The committed request-parent contract remains cancel-only. Ignore only
     # syntax units directly guarded by the exact finish/verify successor; broad
     # or indirect cfg forms remain visible and therefore fail predecessor checks.
@@ -579,6 +643,8 @@ def verify_kernel(source: str, root_source: str, manifest: bytes) -> None:
     production = without_direct_feature_units(production, FINISH_QEMU_FEATURE)
     production = without_direct_feature_units(production, VERIFIED_STREAM_FEATURE)
     production = without_direct_feature_units(production, VERIFIED_STREAM_QEMU_FEATURE)
+    production = without_direct_feature_units(production, TRUSTED_SAMPLE_FEATURE)
+    production = without_direct_feature_units(production, TRUSTED_SAMPLE_QEMU_FEATURE)
 
     prepare_impl = find_scope(
         production,

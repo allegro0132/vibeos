@@ -107,10 +107,45 @@ compile_error!("feature `wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance`
 compile_error!("feature `wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance` is QEMU-only");
 
 #[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
     feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",
     not(feature = "qemu-virt")
 ))]
 compile_error!("feature `wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-trusted-sample",
+    feature = "wasm-c84-ssh-managed-child-verified-stream"
+))]
+compile_error!(
+    "features `wasm-c84-ssh-managed-child-trusted-sample` and `wasm-c84-ssh-managed-child-verified-stream` are mutually exclusive finish/verify successors"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-trusted-sample",
+    feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    not(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-trusted-sample` cannot reuse the discard-only finish/verify QEMU transcript"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
 
 #[cfg(all(
     feature = "wasm-c84-ssh-managed-child-verified-stream",

@@ -47,13 +47,23 @@ use crate::heap::AllocationDomain;
 use crate::sync::SpinLock;
 #[cfg(feature = "wasm-c84-core-poll-observer")]
 use vibeos_component_runtime::sync::ProfileClock;
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+use vibeos_component_runtime::sync::{SyncCallProfile, TypedCallMetrics};
 #[cfg(feature = "wasm-c84-profile-irq-overlay")]
 use vibeos_wasm_aot_profile::IrqCookie;
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+use vibeos_wasm_aot_profile::{
+    EligibleTerminalEvidence, TerminalObservation, FORMAL_READ_CHUNKS, FORMAL_STDOUT_BYTES,
+    FORMAL_STDOUT_SHA256, FORMAL_WRITE_CHUNKS, MAX_FORMAL_FUEL,
+};
 use vibeos_wasm_aot_profile::{
     FacadeFaults, Interval, Phase, SampleToken, Storage, Summary, TargetActive, TargetContext,
     TargetReady, TargetRejected, TargetStartError, TargetVerified, VerificationError,
     INTERVAL_CAPACITY,
 };
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+const FORMAL_TYPED_CALL_PLANNING_WORK: u64 = 2;
 
 static SLOT: SpinLock<SlotState> = SpinLock::new(SlotState::Uninitialized);
 static POISON: AtomicU8 = AtomicU8::new(0);
@@ -194,6 +204,344 @@ impl OwnerSeal {
     }
 }
 
+/// Live-only counters retained beside one exact managed child. The constructor
+/// is private to this slot boundary: copied public observations cannot mint
+/// the `poll_quanta_exact` claim used by terminal evidence.
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ManagedChildTerminalMetrics {
+    read_chunks: u64,
+    write_chunks: u64,
+    stdin_bytes: u64,
+    output_bytes: u64,
+    fuel_consumed: u64,
+    poll_quanta: u64,
+    poll_exact: bool,
+    logical_live_after: u64,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedChildTerminalMetricsError {
+    IoShape,
+    FuelSentinel,
+    FuelShape,
+    ProfileSentinel,
+    ProfileShape,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+impl ManagedChildTerminalMetrics {
+    /// Validate values sampled at the successful driver return. The I/O
+    /// arguments originate in `FormalIoCounters::finish`, which is itself a
+    /// private proof of committed byte contents; this method independently
+    /// rechecks its frozen scalar shape before retaining it.
+    fn from_live(
+        committed_read_chunks: u64,
+        committed_write_chunks: u64,
+        stdin_bytes: u64,
+        output_bytes: u64,
+        call: TypedCallMetrics,
+        profile: SyncCallProfile,
+    ) -> Result<Self, ManagedChildTerminalMetricsError> {
+        if committed_read_chunks != FORMAL_READ_CHUNKS
+            || committed_write_chunks != FORMAL_WRITE_CHUNKS
+            || stdin_bytes != FORMAL_STDOUT_BYTES
+            || output_bytes != FORMAL_STDOUT_BYTES
+        {
+            return Err(ManagedChildTerminalMetricsError::IoShape);
+        }
+        if call.consumed_work == u64::MAX || call.remaining_work == u64::MAX {
+            return Err(ManagedChildTerminalMetricsError::FuelSentinel);
+        }
+        if call.consumed_work == 0
+            || call.consumed_work.checked_add(call.remaining_work) != Some(MAX_FORMAL_FUEL)
+        {
+            return Err(ManagedChildTerminalMetricsError::FuelShape);
+        }
+        if profile.typed_polls == u64::MAX
+            || profile.core_polls == u64::MAX
+            || profile.outer_poll_ticks == u64::MAX
+            || profile.core_interpreter_ticks == u64::MAX
+            || profile.consumed_work == u64::MAX
+        {
+            return Err(ManagedChildTerminalMetricsError::ProfileSentinel);
+        }
+        if profile.typed_polls == 0
+            || profile.core_polls == 0
+            || profile.core_polls > profile.typed_polls
+            || profile.outer_poll_ticks == 0
+            || profile.core_interpreter_ticks == 0
+            || profile.core_interpreter_ticks > profile.outer_poll_ticks
+            || profile.consumed_work == 0
+            || profile
+                .consumed_work
+                .checked_add(FORMAL_TYPED_CALL_PLANNING_WORK)
+                != Some(call.consumed_work)
+        {
+            return Err(ManagedChildTerminalMetricsError::ProfileShape);
+        }
+        Ok(Self {
+            read_chunks: committed_read_chunks,
+            write_chunks: committed_write_chunks,
+            stdin_bytes,
+            output_bytes,
+            fuel_consumed: call.consumed_work,
+            poll_quanta: profile.typed_polls,
+            // Exactness is minted only after every checked/sentinel/shape
+            // guard above has accepted this private live profile.
+            poll_exact: true,
+            // The managed future is still logically live at driver return.
+            // Only its exact clean Exited callback may close this count.
+            logical_live_after: 1,
+        })
+    }
+}
+
+#[cfg(all(test, feature = "wasm-c84-ssh-managed-child-trusted-sample"))]
+mod managed_child_terminal_metrics_tests {
+    use super::*;
+
+    const CALL: TypedCallMetrics = TypedCallMetrics {
+        consumed_work: 188_123,
+        remaining_work: 311_877,
+    };
+    const PROFILE: SyncCallProfile = SyncCallProfile {
+        typed_polls: 1_251,
+        core_polls: 1_165,
+        outer_poll_ticks: 20_000,
+        core_interpreter_ticks: 10_000,
+        consumed_work: 188_121,
+    };
+
+    fn validate(
+        read_chunks: u64,
+        write_chunks: u64,
+        stdin_bytes: u64,
+        output_bytes: u64,
+        call: TypedCallMetrics,
+        profile: SyncCallProfile,
+    ) -> Result<ManagedChildTerminalMetrics, ManagedChildTerminalMetricsError> {
+        ManagedChildTerminalMetrics::from_live(
+            read_chunks,
+            write_chunks,
+            stdin_bytes,
+            output_bytes,
+            call,
+            profile,
+        )
+    }
+
+    #[test]
+    fn accepts_checked_live_shape() {
+        assert_eq!(
+            validate(
+                FORMAL_READ_CHUNKS,
+                FORMAL_WRITE_CHUNKS,
+                FORMAL_STDOUT_BYTES,
+                FORMAL_STDOUT_BYTES,
+                CALL,
+                PROFILE,
+            ),
+            Ok(ManagedChildTerminalMetrics {
+                read_chunks: FORMAL_READ_CHUNKS,
+                write_chunks: FORMAL_WRITE_CHUNKS,
+                stdin_bytes: FORMAL_STDOUT_BYTES,
+                output_bytes: FORMAL_STDOUT_BYTES,
+                fuel_consumed: CALL.consumed_work,
+                poll_quanta: PROFILE.typed_polls,
+                poll_exact: true,
+                logical_live_after: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_each_io_shape_mismatch() {
+        let cases = [
+            (
+                FORMAL_READ_CHUNKS - 1,
+                FORMAL_WRITE_CHUNKS,
+                FORMAL_STDOUT_BYTES,
+                FORMAL_STDOUT_BYTES,
+            ),
+            (
+                FORMAL_READ_CHUNKS,
+                FORMAL_WRITE_CHUNKS - 1,
+                FORMAL_STDOUT_BYTES,
+                FORMAL_STDOUT_BYTES,
+            ),
+            (
+                FORMAL_READ_CHUNKS,
+                FORMAL_WRITE_CHUNKS,
+                FORMAL_STDOUT_BYTES - 1,
+                FORMAL_STDOUT_BYTES,
+            ),
+            (
+                FORMAL_READ_CHUNKS,
+                FORMAL_WRITE_CHUNKS,
+                FORMAL_STDOUT_BYTES,
+                FORMAL_STDOUT_BYTES - 1,
+            ),
+        ];
+        for (read_chunks, write_chunks, stdin_bytes, output_bytes) in cases {
+            assert_eq!(
+                validate(
+                    read_chunks,
+                    write_chunks,
+                    stdin_bytes,
+                    output_bytes,
+                    CALL,
+                    PROFILE
+                ),
+                Err(ManagedChildTerminalMetricsError::IoShape)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_fuel_sentinels_and_unchecked_totals() {
+        for call in [
+            TypedCallMetrics {
+                consumed_work: u64::MAX,
+                remaining_work: 0,
+            },
+            TypedCallMetrics {
+                consumed_work: 1,
+                remaining_work: u64::MAX,
+            },
+        ] {
+            assert_eq!(
+                validate(
+                    FORMAL_READ_CHUNKS,
+                    FORMAL_WRITE_CHUNKS,
+                    FORMAL_STDOUT_BYTES,
+                    FORMAL_STDOUT_BYTES,
+                    call,
+                    PROFILE,
+                ),
+                Err(ManagedChildTerminalMetricsError::FuelSentinel)
+            );
+        }
+        for call in [
+            TypedCallMetrics {
+                consumed_work: 0,
+                remaining_work: MAX_FORMAL_FUEL,
+            },
+            TypedCallMetrics {
+                consumed_work: u64::MAX - 1,
+                remaining_work: 2,
+            },
+            TypedCallMetrics {
+                consumed_work: CALL.consumed_work,
+                remaining_work: CALL.remaining_work - 1,
+            },
+        ] {
+            assert_eq!(
+                validate(
+                    FORMAL_READ_CHUNKS,
+                    FORMAL_WRITE_CHUNKS,
+                    FORMAL_STDOUT_BYTES,
+                    FORMAL_STDOUT_BYTES,
+                    call,
+                    PROFILE,
+                ),
+                Err(ManagedChildTerminalMetricsError::FuelShape)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_each_saturated_profile_counter() {
+        let profiles = [
+            SyncCallProfile {
+                typed_polls: u64::MAX,
+                ..PROFILE
+            },
+            SyncCallProfile {
+                core_polls: u64::MAX,
+                ..PROFILE
+            },
+            SyncCallProfile {
+                outer_poll_ticks: u64::MAX,
+                ..PROFILE
+            },
+            SyncCallProfile {
+                core_interpreter_ticks: u64::MAX,
+                ..PROFILE
+            },
+            SyncCallProfile {
+                consumed_work: u64::MAX,
+                ..PROFILE
+            },
+        ];
+        for profile in profiles {
+            assert_eq!(
+                validate(
+                    FORMAL_READ_CHUNKS,
+                    FORMAL_WRITE_CHUNKS,
+                    FORMAL_STDOUT_BYTES,
+                    FORMAL_STDOUT_BYTES,
+                    CALL,
+                    profile,
+                ),
+                Err(ManagedChildTerminalMetricsError::ProfileSentinel)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_cross_counter_profile_shape_mismatches() {
+        let profiles = [
+            SyncCallProfile {
+                typed_polls: 0,
+                ..PROFILE
+            },
+            SyncCallProfile {
+                core_polls: 0,
+                ..PROFILE
+            },
+            SyncCallProfile {
+                core_polls: PROFILE.typed_polls + 1,
+                ..PROFILE
+            },
+            SyncCallProfile {
+                outer_poll_ticks: 0,
+                ..PROFILE
+            },
+            SyncCallProfile {
+                core_interpreter_ticks: 0,
+                ..PROFILE
+            },
+            SyncCallProfile {
+                outer_poll_ticks: PROFILE.core_interpreter_ticks - 1,
+                ..PROFILE
+            },
+            SyncCallProfile {
+                consumed_work: 0,
+                ..PROFILE
+            },
+            SyncCallProfile {
+                consumed_work: PROFILE.consumed_work - 1,
+                ..PROFILE
+            },
+        ];
+        for profile in profiles {
+            assert_eq!(
+                validate(
+                    FORMAL_READ_CHUNKS,
+                    FORMAL_WRITE_CHUNKS,
+                    FORMAL_STDOUT_BYTES,
+                    FORMAL_STDOUT_BYTES,
+                    CALL,
+                    profile,
+                ),
+                Err(ManagedChildTerminalMetricsError::ProfileShape)
+            );
+        }
+    }
+}
+
 impl DelegatedChild {
     fn matches(self, epoch: u64, detach: PreparedTaskDetachSeal) -> bool {
         self.epoch == epoch && self.detach.matches_exact(detach)
@@ -226,6 +574,8 @@ enum SlotState {
         child: Option<DelegatedChild>,
         child_detach: Option<TaskDetachReason>,
         faults: SlotFaults,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+        managed_terminal: Option<ManagedChildTerminalMetrics>,
         #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
         managed_phase: ManagedPhaseSidecar,
         #[cfg(feature = "wasm-c84-core-poll-observer")]
@@ -239,6 +589,8 @@ enum SlotState {
         sample: TargetVerified<'static>,
         owner: OwnerSeal,
         cursor: usize,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+        managed_terminal: ManagedChildTerminalMetrics,
     },
     Rejected {
         ready: TargetReady<'static>,
@@ -667,6 +1019,8 @@ pub(crate) enum TransitKind {
     Finish,
     Cancel,
     Recycle,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+    Trusted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -735,6 +1089,8 @@ fn record_open_core_fault(faults: &mut SlotFaults, owner: CoreObserverOwner) {
 pub(crate) enum RejectionCause {
     LeaseCancelled,
     StreamAbandoned,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+    TrustedSampleAbandoned,
     TargetRejected,
     TaskDetached(TaskDetachReason),
     DelegatedChildAttached,
@@ -1086,6 +1442,7 @@ pub(crate) fn status() -> SlotStatus {
             sample,
             owner,
             cursor,
+            ..
         } => SlotStatus::Verified {
             epoch: owner.epoch,
             cursor: *cursor,
@@ -1649,6 +2006,8 @@ fn start_reserved(epoch: u64, detach: CurrentTaskDetachLease) -> Result<SampleTo
                 child: None,
                 child_detach: None,
                 faults: SlotFaults::NONE,
+                #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+                managed_terminal: None,
                 #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
                 managed_phase: ManagedPhaseSidecar::NEW,
                 #[cfg(feature = "wasm-c84-core-poll-observer")]
@@ -2044,6 +2403,7 @@ fn end_core_phase(token: SampleToken, detach: CurrentTaskDetachLease) -> PhaseBo
     }
 }
 
+#[cfg(not(feature = "wasm-c84-ssh-managed-child-trusted-sample"))]
 fn install_verified(owner: OwnerSeal, sample: TargetVerified<'static>) -> Result<(), ProfileError> {
     let mut slot = SLOT.lock();
     let exact = matches!(
@@ -2056,6 +2416,33 @@ fn install_verified(owner: OwnerSeal, sample: TargetVerified<'static>) -> Result
             sample,
             owner,
             cursor: 0,
+        };
+        return Ok(());
+    }
+    drop(slot);
+    drop(sample);
+    poison(SlotPoison::StateMismatch);
+    Err(ProfileError::StateMismatch)
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+fn install_verified(
+    owner: OwnerSeal,
+    sample: TargetVerified<'static>,
+    managed_terminal: ManagedChildTerminalMetrics,
+) -> Result<(), ProfileError> {
+    let mut slot = SLOT.lock();
+    let exact = matches!(
+        &*slot,
+        SlotState::Transit { owner: actual, kind: TransitKind::Finish }
+            if actual.matches(owner.epoch, owner.detach)
+    );
+    if exact && sample.token().epoch() == owner.epoch && poison_reason().is_none() {
+        *slot = SlotState::Verified {
+            sample,
+            owner,
+            cursor: 0,
+            managed_terminal,
         };
         return Ok(());
     }
@@ -2109,9 +2496,31 @@ fn reject_target_normal(
     Ok(report)
 }
 
+struct ActiveFinishParts {
+    sample: TargetActive<'static>,
+    owner: OwnerSeal,
+    child_attached: bool,
+    child_detach: Option<TaskDetachReason>,
+    slot_faults: SlotFaults,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+    managed_terminal: Option<ManagedChildTerminalMetrics>,
+    context: TargetContext,
+    tick: u64,
+}
+
 fn finish_active(token: SampleToken, detach: CurrentTaskDetachLease) -> Result<(), ProfileError> {
     ensure_not_poisoned()?;
-    let (sample, owner, child_attached, child_detach, slot_faults, context, tick) = {
+    let ActiveFinishParts {
+        sample,
+        owner,
+        child_attached,
+        child_detach,
+        slot_faults,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+        managed_terminal,
+        context,
+        tick,
+    } = {
         let mut slot = SLOT.lock();
         let exact = matches!(
             &*slot,
@@ -2156,26 +2565,39 @@ fn finish_active(token: SampleToken, detach: CurrentTaskDetachLease) -> Result<(
             child,
             child_detach,
             faults,
+            #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+            managed_terminal,
             ..
         } = previous
         else {
             poison(SlotPoison::StateMismatch);
             return Err(ProfileError::StateMismatch);
         };
-        (
+        ActiveFinishParts {
             sample,
             owner,
-            child.is_some(),
+            child_attached: child.is_some(),
             child_detach,
-            faults,
+            slot_faults: faults,
+            #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+            managed_terminal,
             context,
             tick,
-        )
+        }
     };
+
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+    let trusted_terminal_incomplete = match managed_terminal {
+        Some(terminal) => terminal.logical_live_after != 0,
+        None => true,
+    } || child_detach != Some(TaskDetachReason::Exited);
+    #[cfg(not(feature = "wasm-c84-ssh-managed-child-trusted-sample"))]
+    let trusted_terminal_incomplete = false;
 
     if child_attached
         || !slot_faults.is_empty()
         || matches!(child_detach, Some(reason) if reason != TaskDetachReason::Exited)
+        || trusted_terminal_incomplete
     {
         let rejected = sample.cancel(token, context);
         let cause = if child_attached {
@@ -2206,7 +2628,20 @@ fn finish_active(token: SampleToken, detach: CurrentTaskDetachLease) -> Result<(
         }
     };
     match finished.verify() {
-        Ok(verified) => install_verified(owner, verified),
+        Ok(verified) => {
+            #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+            {
+                install_verified(
+                    owner,
+                    verified,
+                    managed_terminal.expect("trusted terminal completeness was checked above"),
+                )
+            }
+            #[cfg(not(feature = "wasm-c84-ssh-managed-child-trusted-sample"))]
+            {
+                install_verified(owner, verified)
+            }
+        }
         Err(rejected) => {
             let report = reject_target_normal(
                 owner,
@@ -2905,6 +3340,7 @@ impl RunLease {
         end_core_phase(self.token, self.detach)
     }
 
+    #[cfg(not(feature = "wasm-c84-ssh-managed-child-trusted-sample"))]
     pub(crate) fn finish(mut self) -> Result<StreamLease, ProfileError> {
         if !self.detach.is_current_running_exact() {
             mark_owner_fault(self.token, self.detach);
@@ -2926,6 +3362,43 @@ impl RunLease {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Internal Active -> Verified transition used only to seal one trusted
+    /// sample. Its temporary cursor cannot stream or cross this module.
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+    fn finish_to_stream(mut self) -> Result<StreamLease, ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            mark_owner_fault(self.token, self.detach);
+        }
+        let result = finish_active(self.token, self.detach);
+        match result {
+            Ok(()) => {
+                self.live = false;
+                Ok(StreamLease {
+                    token: self.token,
+                    detach: self.detach,
+                    live: true,
+                    not_sync: PhantomData,
+                })
+            }
+            Err(error @ ProfileError::Rejected(_)) => {
+                self.live = false;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Finish and verify this exact epoch, then seal its still-unstreamed
+    /// target with terminal evidence derived only from the managed-child and
+    /// SSH live ownership paths.
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+    pub(crate) fn finish_trusted(
+        self,
+        terminal: vibeos_sshd::SshExecProfileTerminal,
+    ) -> Result<TrustedVerifiedSample, ProfileError> {
+        self.finish_to_stream()?.seal_trusted(terminal)
     }
 
     pub(crate) fn cancel(mut self) -> Result<RejectionReport, ProfileError> {
@@ -3506,7 +3979,10 @@ pub(crate) fn abandon_current_request_managed_child() {
 /// executor envelope to convert its compact claim into an explicit release.
 /// Cooperative registry cancellation drops the driver without reaching this
 /// function, so its later Ready word cannot wash cancellation into Exited.
-#[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-core",
+    not(feature = "wasm-c84-ssh-managed-child-trusted-sample")
+))]
 pub(crate) fn mark_managed_child_driver_completed(epoch: u64) -> Result<(), ProfileError> {
     let (token, detach) = current_managed_child(epoch)?;
     let mut slot = SLOT.lock();
@@ -3542,6 +4018,70 @@ pub(crate) fn mark_managed_child_driver_completed(epoch: u64) -> Result<(), Prof
     {
         return Err(ProfileError::StateMismatch);
     }
+    child.driver_completed = true;
+    Ok(())
+}
+
+/// Atomically retain the live terminal counters and authorize the managed
+/// child's explicit release. Invalid or saturated copied metrics never set
+/// `driver_completed`, so the outer future remains on its fail-closed
+/// abandonment path.
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+pub(crate) fn mark_managed_child_driver_completed(
+    epoch: u64,
+    committed_read_chunks: u64,
+    committed_write_chunks: u64,
+    stdin_bytes: u64,
+    output_bytes: u64,
+    call: TypedCallMetrics,
+    profile: SyncCallProfile,
+) -> Result<(), ProfileError> {
+    let terminal = ManagedChildTerminalMetrics::from_live(
+        committed_read_chunks,
+        committed_write_chunks,
+        stdin_bytes,
+        output_bytes,
+        call,
+        profile,
+    )
+    .map_err(|_| ProfileError::StateMismatch)?;
+    let (token, detach) = current_managed_child(epoch)?;
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        managed_terminal,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        managed_phase,
+        core_owner,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    let phase_incomplete = !managed_phase.child_release_ready();
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    if sample.token() == token
+        && child.matches(epoch, detach)
+        && child.state == DelegatedChildState::Claimed
+        && phase_incomplete
+    {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        return Err(ProfileError::StateMismatch);
+    }
+    if sample.token() != token
+        || !child.matches(epoch, detach)
+        || child.state != DelegatedChildState::Claimed
+        || child.driver_completed
+        || managed_terminal.is_some()
+        || !faults.is_empty()
+        || *core_owner != CoreObserverOwner::Closed
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    *managed_terminal = Some(terminal);
     child.driver_completed = true;
     Ok(())
 }
@@ -3977,6 +4517,7 @@ fn stream_next(
             sample,
             owner,
             cursor,
+            ..
         } if sample.token() == token && owner.matches(token.epoch(), detach) => {
             let interval = sample.interval(*cursor);
             if interval.is_some() {
@@ -4000,6 +4541,7 @@ fn take_verified(
             sample,
             owner,
             cursor,
+            ..
         } if sample.token() == token && owner.matches(token.epoch(), detach) => {
             (sample.summary().interval_count(), *cursor)
         }
@@ -4023,6 +4565,7 @@ fn take_verified(
         sample,
         owner,
         cursor,
+        ..
     } = previous
     else {
         poison(SlotPoison::StateMismatch);
@@ -4076,7 +4619,161 @@ fn discard_stream(
     Ok(report)
 }
 
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+fn trusted_terminal_metrics(
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+) -> Result<ManagedChildTerminalMetrics, ProfileError> {
+    ensure_not_poisoned()?;
+    let slot = SLOT.lock();
+    match &*slot {
+        SlotState::Verified {
+            sample,
+            owner,
+            cursor: 0,
+            managed_terminal,
+        } if sample.token() == token && owner.matches(token.epoch(), detach) => {
+            Ok(*managed_terminal)
+        }
+        _ => Err(ProfileError::StateMismatch),
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+fn take_trusted_verified(
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+    expected_terminal: ManagedChildTerminalMetrics,
+) -> Result<(TargetVerified<'static>, OwnerSeal), ProfileError> {
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    let owner = match &*slot {
+        SlotState::Verified {
+            sample,
+            owner,
+            cursor: 0,
+            managed_terminal,
+        } if sample.token() == token
+            && owner.matches(token.epoch(), detach)
+            && *managed_terminal == expected_terminal =>
+        {
+            *owner
+        }
+        _ => return Err(ProfileError::StateMismatch),
+    };
+    let previous = mem::replace(
+        &mut *slot,
+        SlotState::Transit {
+            owner,
+            kind: TransitKind::Trusted,
+        },
+    );
+    let SlotState::Verified {
+        sample,
+        owner,
+        cursor: 0,
+        managed_terminal,
+    } = previous
+    else {
+        poison(SlotPoison::StateMismatch);
+        return Err(ProfileError::StateMismatch);
+    };
+    if managed_terminal != expected_terminal {
+        drop(sample);
+        poison(SlotPoison::StateMismatch);
+        return Err(ProfileError::StateMismatch);
+    }
+    Ok((sample, owner))
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+fn abandon_trusted_sample(
+    sample: TargetVerified<'static>,
+    owner: OwnerSeal,
+) -> Result<RejectionReport, ProfileError> {
+    let report = RejectionReport {
+        epoch: owner.epoch,
+        cause: RejectionCause::TrustedSampleAbandoned,
+        facade_faults: FacadeFaults::NONE,
+        ledger_error: None,
+        slot_faults: SlotFaults::NONE,
+        intervals_emitted: 0,
+    };
+    let ready = sample.recycle();
+    if let Err(error) = disarm(owner.detach) {
+        drop(ready);
+        return Err(error);
+    }
+    install_rejected(owner, TransitKind::Trusted, ready, report)?;
+    Ok(report)
+}
+
+/// Copy-only QEMU telemetry derived from an already validated bundle. This is
+/// not compiled into production images and carries no target or evidence
+/// authority.
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TrustedSampleAcceptanceObservation {
+    pub(crate) epoch: u64,
+    pub(crate) terminal: vibeos_vsh::ComponentTerminal,
+    pub(crate) status: u32,
+    pub(crate) timed_out: bool,
+    pub(crate) read_chunks: u64,
+    pub(crate) write_chunks: u64,
+    pub(crate) stdout_bytes: u64,
+    pub(crate) stdout_digest: [u8; 32],
+    pub(crate) fuel_consumed: u64,
+    pub(crate) poll_quanta: u64,
+    pub(crate) poll_exact: bool,
+    pub(crate) logical_live_after: u64,
+    pub(crate) full_drain: bool,
+}
+
+/// Synchronous, opaque ownership of one unstreamed verified target and its
+/// validated live terminal evidence. The raw-pointer marker deliberately
+/// makes the bundle neither `Send` nor `Sync`; only a later slot-private
+/// collector may consume its two private authorities together.
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+#[must_use]
+pub(crate) struct TrustedVerifiedSample {
+    sample: Option<TargetVerified<'static>>,
+    evidence: Option<EligibleTerminalEvidence>,
+    owner: OwnerSeal,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")]
+    acceptance: TrustedSampleAcceptanceObservation,
+    not_send_sync: PhantomData<*mut ()>,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+impl TrustedVerifiedSample {
+    /// Abandon the opaque authority and leave an explicit rejection for the
+    /// caller to acknowledge before a later epoch may start.
+    pub(crate) fn discard(mut self) -> Result<RejectionReport, ProfileError> {
+        let Some(sample) = self.sample.take() else {
+            return Err(ProfileError::StateMismatch);
+        };
+        let _ = self.evidence.take();
+        abandon_trusted_sample(sample, self.owner)
+    }
+
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")]
+    pub(crate) const fn acceptance_observation(&self) -> TrustedSampleAcceptanceObservation {
+        self.acceptance
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+impl Drop for TrustedVerifiedSample {
+    fn drop(&mut self) {
+        if let Some(sample) = self.sample.take() {
+            let _ = self.evidence.take();
+            let _ = abandon_trusted_sample(sample, self.owner);
+        }
+    }
+}
+
 /// Storage-free cursor for one globally resident verified sample.
+#[cfg(not(feature = "wasm-c84-ssh-managed-child-trusted-sample"))]
 pub(crate) struct StreamLease {
     token: SampleToken,
     detach: CurrentTaskDetachLease,
@@ -4084,6 +4781,17 @@ pub(crate) struct StreamLease {
     not_sync: PhantomData<Cell<()>>,
 }
 
+/// Trusted builds retain the cursor only as a module-private transition into
+/// `TrustedVerifiedSample`; no sibling kernel module can stream or discard it.
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+struct StreamLease {
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+    live: bool,
+    not_sync: PhantomData<Cell<()>>,
+}
+
+#[cfg(not(feature = "wasm-c84-ssh-managed-child-trusted-sample"))]
 impl StreamLease {
     pub(crate) const fn token(&self) -> SampleToken {
         self.token
@@ -4119,6 +4827,76 @@ impl StreamLease {
     pub(crate) fn discard(mut self) -> Result<RejectionReport, ProfileError> {
         self.live = false;
         discard_stream(self.token, self.detach)
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+impl StreamLease {
+    fn seal_trusted(
+        mut self,
+        terminal: vibeos_sshd::SshExecProfileTerminal,
+    ) -> Result<TrustedVerifiedSample, ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            return Err(ProfileError::OwnerNotCurrent);
+        }
+        let metrics = trusted_terminal_metrics(self.token, self.detach)?;
+        let terminal_kind = terminal.component_terminal();
+        let exit_status = terminal.exit_status();
+        let timed_out = terminal.timed_out();
+        let drained_stdout_bytes = terminal.stdout_bytes();
+        let stderr_bytes = terminal.stderr_bytes();
+        let logical_live_after = metrics.logical_live_after;
+        let poll_exact = metrics.poll_exact;
+        let full_drain = metrics.stdin_bytes == FORMAL_STDOUT_BYTES
+            && drained_stdout_bytes == metrics.output_bytes
+            && stderr_bytes == 0;
+        let observation = TerminalObservation {
+            read_chunks: metrics.read_chunks,
+            write_chunks: metrics.write_chunks,
+            fuel_consumed: metrics.fuel_consumed,
+            poll_quanta: metrics.poll_quanta,
+            poll_quanta_exact: poll_exact,
+            succeeded: terminal_kind == vibeos_vsh::ComponentTerminal::Success,
+            logical_live_after,
+            timed_out,
+            timeout_phase: None,
+            exit_status,
+            stdout_bytes: drained_stdout_bytes,
+            stdout_sha256: FORMAL_STDOUT_SHA256,
+            stderr_bytes,
+        };
+        let evidence = match EligibleTerminalEvidence::validate(observation) {
+            Ok(evidence) if full_drain => evidence,
+            Ok(_) | Err(_) => {
+                let report = discard_stream(self.token, self.detach)?;
+                self.live = false;
+                return Err(ProfileError::Rejected(report));
+            }
+        };
+        let (sample, owner) = take_trusted_verified(self.token, self.detach, metrics)?;
+        self.live = false;
+        Ok(TrustedVerifiedSample {
+            sample: Some(sample),
+            evidence: Some(evidence),
+            owner,
+            #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")]
+            acceptance: TrustedSampleAcceptanceObservation {
+                epoch: self.token.epoch(),
+                terminal: terminal_kind,
+                status: exit_status,
+                timed_out,
+                read_chunks: metrics.read_chunks,
+                write_chunks: metrics.write_chunks,
+                stdout_bytes: drained_stdout_bytes,
+                stdout_digest: FORMAL_STDOUT_SHA256,
+                fuel_consumed: metrics.fuel_consumed,
+                poll_quanta: metrics.poll_quanta,
+                poll_exact,
+                logical_live_after,
+                full_drain,
+            },
+            not_send_sync: PhantomData,
+        })
     }
 }
 
@@ -4184,6 +4962,8 @@ unsafe fn profile_child_detached(
         child,
         child_detach,
         faults,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+        managed_terminal,
         #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
         managed_phase,
         #[cfg(feature = "wasm-c84-core-poll-observer")]
@@ -4213,8 +4993,23 @@ unsafe fn profile_child_detached(
     if managed_phase.child_host_open {
         faults.insert(SlotFaults::CHILD_PHASE);
     }
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+    let mut clean =
+        state == DelegatedChildState::CompletedPendingDetach && reason == TaskDetachReason::Exited;
+    #[cfg(not(feature = "wasm-c84-ssh-managed-child-trusted-sample"))]
     let clean =
         state == DelegatedChildState::CompletedPendingDetach && reason == TaskDetachReason::Exited;
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+    if clean {
+        if let Some(terminal) = managed_terminal.as_mut() {
+            // This exact executor callback is the sole producer of a closed
+            // logical-liveness count for terminal evidence.
+            terminal.logical_live_after = 0;
+        } else {
+            clean = false;
+            faults.insert(SlotFaults::CHILD_DETACHED);
+        }
+    }
     if !clean {
         faults.insert(SlotFaults::CHILD_DETACHED);
         if state == DelegatedChildState::Abandoned {
@@ -4321,6 +5116,7 @@ unsafe fn profile_task_detached(
                 sample,
                 owner,
                 cursor,
+                ..
             } if sample.token().epoch() == epoch && owner.callback_matches(epoch, task, domain) => {
                 let owner = *owner;
                 let previous = mem::replace(
@@ -5354,7 +6150,12 @@ async fn run_child_delegation_positive_acceptance() -> Result<(), ProfileError> 
         return Err(ProfileError::StateMismatch);
     }
     wait_for_task_state(&handles[0], TaskState::Cancelled).await?;
-    require_delegated_rejection(run.finish(), 5, TaskDetachReason::Cancelled, false)?;
+    require_delegated_rejection(
+        run.finish(),
+        5,
+        TaskDetachReason::Cancelled,
+        false,
+    )?;
 
     // Epoch 6: finish itself is fail-closed while a child remains Attached.
     // The parent emits a diagnostic rejection; a subsequent publication can

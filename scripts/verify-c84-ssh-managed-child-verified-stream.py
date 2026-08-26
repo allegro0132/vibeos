@@ -26,6 +26,8 @@ FEATURE = "wasm-c84-ssh-managed-child-verified-stream"
 QEMU_FEATURE = f"{FEATURE}-qemu-acceptance"
 FINISH_FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
 FINISH_QEMU_FEATURE = f"{FINISH_FEATURE}-qemu-acceptance"
+TRUSTED_SAMPLE_FEATURE = "wasm-c84-ssh-managed-child-trusted-sample"
+TRUSTED_SAMPLE_QEMU_FEATURE = f"{TRUSTED_SAMPLE_FEATURE}-qemu-acceptance"
 FAMILY = "WASM_C84_SSH_MANAGED_CHILD_VERIFIED_STREAM"
 FINISH_FAMILY = "WASM_C84_SSH_MANAGED_CHILD_FINISH_VERIFY"
 IRQ_FAMILY = "WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY"
@@ -232,6 +234,16 @@ def verify_features(inputs: Inputs) -> None:
         "Milk-V does not expose only the silent verified-stream base seam",
     )
     require(QEMU_FEATURE not in milkv, "Milk-V exposes the QEMU verified-stream gate")
+    require(
+        kernel.get(TRUSTED_SAMPLE_FEATURE)
+        == [FINISH_FEATURE, "vibeos-sshd/c84-profile-trusted-sample"],
+        "trusted-sample is not the exact sibling finish/verify successor",
+    )
+    require(
+        kernel.get(TRUSTED_SAMPLE_QEMU_FEATURE)
+        == [TRUSTED_SAMPLE_FEATURE, FINISH_QEMU_FEATURE],
+        "kernel trusted-sample QEMU sibling closure differs",
+    )
     for label, features, name in (
         ("kernel", kernel, FEATURE),
         ("kernel", kernel, QEMU_FEATURE),
@@ -252,6 +264,13 @@ def verify_features(inputs: Inputs) -> None:
     require(
         FEATURE in qemu_closure and FINISH_QEMU_FEATURE in qemu_closure,
         "verified-stream QEMU closure omits its base or finish predecessor",
+    )
+    trusted_closure = PHASE.local_feature_closure(kernel, [TRUSTED_SAMPLE_FEATURE])
+    require(
+        FINISH_FEATURE in trusted_closure
+        and FEATURE not in trusted_closure
+        and TRUSTED_SAMPLE_FEATURE not in base_closure,
+        "trusted-sample and verified-stream do not remain sibling successors",
     )
 
     root = semantic(inputs.kernel_root)
@@ -276,12 +295,31 @@ def verify_features(inputs: Inputs) -> None:
         'compile_error!("C8.4QEMUacceptancesareisolatedimages");'
     )
     require(isolation in root, "verified-stream QEMU isolation guard differs")
+    mutually_exclusive = (
+        f'#[cfg(all(feature="{TRUSTED_SAMPLE_FEATURE}",feature="{FEATURE}"))]'
+        f'compile_error!("features`{TRUSTED_SAMPLE_FEATURE}`and`{FEATURE}`'
+        'aremutuallyexclusivefinish/verifysuccessors");'
+    )
+    require(
+        mutually_exclusive in root,
+        "verified-stream lacks exact mutual exclusion from trusted-sample",
+    )
 
 
 def verify_direct_cfg(inputs: Inputs) -> None:
+    ssh = CORE.without_direct_feature_units(inputs.ssh, TRUSTED_SAMPLE_FEATURE)
+    ssh = CORE.without_direct_feature_units(ssh, TRUSTED_SAMPLE_QEMU_FEATURE)
+    kernel_root = CORE.without_direct_feature_units(
+        inputs.kernel_root, TRUSTED_SAMPLE_FEATURE
+    )
+    kernel_root = CORE.without_direct_feature_units(
+        kernel_root, TRUSTED_SAMPLE_QEMU_FEATURE
+    )
     sources = (
-        ("SSH", inputs.ssh, 6, 7, 9, 14),
-        ("kernel root", inputs.kernel_root, 0, 1, 0, 3),
+        ("SSH", ssh, 6, 7, 9, 14),
+        # The second base reference is the exact mutual-exclusion guard shared
+        # with the trusted-sample sibling.
+        ("kernel root", kernel_root, 0, 2, 0, 3),
     )
     for label, source, base_direct, base_all, qemu_direct, qemu_all in sources:
         rust = CORE.rust_mask(source, literals=False)
@@ -312,7 +350,7 @@ def verify_direct_cfg(inputs: Inputs) -> None:
             f"{label} all-form verified-stream QEMU-unit count differs",
         )
 
-    base = masked("\n".join(IRQ.direct_feature_units(inputs.ssh, FEATURE)))
+    base = masked("\n".join(IRQ.direct_feature_units(ssh, FEATURE)))
     for required in (
         "VerifiedStreamEvidence",
         "finish_verify_stream_and_complete_profile",
@@ -332,7 +370,7 @@ def verify_direct_cfg(inputs: Inputs) -> None:
         "mem::forget",
     ):
         require(forbidden not in base, f"verified-stream base units admit {forbidden}")
-    qemu_code = masked("\n".join(IRQ.direct_feature_units(inputs.ssh, QEMU_FEATURE)))
+    qemu_code = masked("\n".join(IRQ.direct_feature_units(ssh, QEMU_FEATURE)))
     for forbidden in (
         ".finish(",
         ".summary(",
@@ -347,6 +385,8 @@ def verify_direct_cfg(inputs: Inputs) -> None:
 
 
 def verify_slot_typestate(source: str) -> None:
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
     status = find_scope(source, r"\bpub\(crate\)\s+enum\s+SlotStatus\b", "SlotStatus")
     require(
         "Verified {\n        epoch: u64,\n        cursor: usize,\n        intervals: usize,\n    }"
@@ -422,6 +462,8 @@ def verify_slot_typestate(source: str) -> None:
 
 
 def verify_ssh(source: str) -> None:
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
     owner = find_scope(source, r"\bimpl\s+SshExecProfileOwner\b", "SSH profile owner")
     response = find_function(owner, "response_boundary", "SSH response boundary")
     cancel = find_function(owner, "cancel", "SSH active Drop")
@@ -978,8 +1020,13 @@ def run_selftest(inputs: Inputs) -> int:
             lambda data: mutate_manifest(
                 data,
                 "qemu_manifest",
-                f'    "{FINISH_QEMU_FEATURE}",\n',
-                "",
+                f'{QEMU_FEATURE} = [\n'
+                f'    "{FINISH_QEMU_FEATURE}",\n'
+                f'    "vibeos-kernel/{QEMU_FEATURE}",\n'
+                "]",
+                f'{QEMU_FEATURE} = [\n'
+                f'    "vibeos-kernel/{QEMU_FEATURE}",\n'
+                "]",
                 "QEMU predecessor",
             ),
         ),

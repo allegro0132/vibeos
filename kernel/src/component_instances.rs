@@ -125,6 +125,8 @@ use vibeos_vsh::{
 };
 #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
 use vibeos_wasm_aot_profile::Phase;
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+use vibeos_wasm_aot_profile::{FORMAL_READ_CHUNKS, FORMAL_STDOUT_BYTES, FORMAL_WRITE_CHUNKS};
 #[cfg(feature = "ssh-component-command")]
 use vibeos_wasm_runtime::{OwnerAllocationReservation, ProfileEngine};
 
@@ -2390,7 +2392,7 @@ impl Future for ManagedChildFuture {
                             if crate::wasm_aot_profile_slot::record_managed_child_released(epoch)
                                 .is_ok()
                             {
-                                    crate::println!(
+                                crate::println!(
                                         "WASM_C84_SSH_MANAGED_CHILD_CORE RELEASE epoch={} normal_driver=1",
                                         epoch
                                     );
@@ -2899,6 +2901,137 @@ fn take_c84_delayed_stdin_pending(epoch: u64, operation: HostOperationToken) -> 
     }
 }
 
+/// Request-local audit of bytes which actually crossed the Component host
+/// boundary. Waiting/prepared operations do not advance this state: reads are
+/// recorded only after an exact receive commit, and writes only after the
+/// backend reports its final `Sent` result.
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+struct FormalIoCounters {
+    read_chunks: u64,
+    read_bytes: u64,
+    write_chunks: u64,
+    write_bytes: u64,
+    invalid: bool,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+#[derive(Clone, Copy)]
+struct FormalIoObservation {
+    read_chunks: u64,
+    write_chunks: u64,
+    stdin_bytes: u64,
+    stdout_bytes: u64,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+impl FormalIoCounters {
+    const fn new() -> Self {
+        Self {
+            read_chunks: 0,
+            read_bytes: 0,
+            write_chunks: 0,
+            write_bytes: 0,
+            invalid: false,
+        }
+    }
+
+    fn fail<T>(&mut self) -> Result<T, HostError> {
+        self.invalid = true;
+        Err(HostError::BackendFault)
+    }
+
+    fn expected_chunk_length(chunks: u64) -> Option<usize> {
+        match chunks {
+            0..=11 => Some(MAX_STREAM_CHUNK_BYTES),
+            12 => Some(37),
+            _ => None,
+        }
+    }
+
+    fn input_byte(offset: u64) -> u8 {
+        (((offset % 251) * 17 + 3) % 251) as u8
+    }
+
+    fn observe_read(&mut self, bytes: &[u8]) -> Result<(), HostError> {
+        if self.invalid || Self::expected_chunk_length(self.read_chunks) != Some(bytes.len()) {
+            return self.fail();
+        }
+        for (index, byte) in bytes.iter().enumerate() {
+            let index = match u64::try_from(index) {
+                Ok(index) => index,
+                Err(_) => return self.fail(),
+            };
+            let Some(offset) = self.read_bytes.checked_add(index) else {
+                return self.fail();
+            };
+            if *byte != Self::input_byte(offset) {
+                return self.fail();
+            }
+        }
+        let length = match u64::try_from(bytes.len()) {
+            Ok(length) => length,
+            Err(_) => return self.fail(),
+        };
+        let Some(next_bytes) = self.read_bytes.checked_add(length) else {
+            return self.fail();
+        };
+        let Some(next_chunks) = self.read_chunks.checked_add(1) else {
+            return self.fail();
+        };
+        self.read_bytes = next_bytes;
+        self.read_chunks = next_chunks;
+        Ok(())
+    }
+
+    fn observe_write(&mut self, bytes: &[u8]) -> Result<(), HostError> {
+        if self.invalid || Self::expected_chunk_length(self.write_chunks) != Some(bytes.len()) {
+            return self.fail();
+        }
+        for (index, byte) in bytes.iter().enumerate() {
+            let index = match u64::try_from(index) {
+                Ok(index) => index,
+                Err(_) => return self.fail(),
+            };
+            let Some(offset) = self.write_bytes.checked_add(index) else {
+                return self.fail();
+            };
+            if *byte != (Self::input_byte(offset) ^ 0x20) {
+                return self.fail();
+            }
+        }
+        let length = match u64::try_from(bytes.len()) {
+            Ok(length) => length,
+            Err(_) => return self.fail(),
+        };
+        let Some(next_bytes) = self.write_bytes.checked_add(length) else {
+            return self.fail();
+        };
+        let Some(next_chunks) = self.write_chunks.checked_add(1) else {
+            return self.fail();
+        };
+        self.write_bytes = next_bytes;
+        self.write_chunks = next_chunks;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<FormalIoObservation, HostError> {
+        let exact = !self.invalid
+            && self.read_chunks == FORMAL_READ_CHUNKS
+            && self.write_chunks == FORMAL_WRITE_CHUNKS
+            && self.read_bytes == FORMAL_STDOUT_BYTES
+            && self.write_bytes == FORMAL_STDOUT_BYTES;
+        if !exact {
+            return self.fail();
+        }
+        Ok(FormalIoObservation {
+            read_chunks: self.read_chunks,
+            write_chunks: self.write_chunks,
+            stdin_bytes: self.read_bytes,
+            stdout_bytes: self.write_bytes,
+        })
+    }
+}
+
 /// The call-scoped dispatcher is arena-local. Every field is copy-only; live
 /// authority is reacquired from the registry-owned CSpace for every method.
 #[cfg(feature = "ssh-component-command")]
@@ -2909,6 +3042,8 @@ struct RegistryStreamDispatcher {
     writer_type: ResourceTypeId,
     #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
     profile_epoch: u64,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+    formal_io: Option<FormalIoCounters>,
     pending: Option<PendingStreamOperation>,
 }
 
@@ -2928,8 +3063,38 @@ impl RegistryStreamDispatcher {
             writer_type,
             #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
             profile_epoch,
+            #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+            formal_io: if profile_epoch == 0 {
+                None
+            } else {
+                Some(FormalIoCounters::new())
+            },
             pending: None,
         }
+    }
+
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+    fn observe_formal_read(&mut self, bytes: &[u8]) -> Result<(), HostError> {
+        self.formal_io
+            .as_mut()
+            .ok_or(HostError::BackendFault)?
+            .observe_read(bytes)
+    }
+
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+    fn observe_formal_write(&mut self, bytes: &[u8]) -> Result<(), HostError> {
+        self.formal_io
+            .as_mut()
+            .ok_or(HostError::BackendFault)?
+            .observe_write(bytes)
+    }
+
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+    fn take_formal_io(&mut self) -> Result<FormalIoObservation, HostError> {
+        self.formal_io
+            .take()
+            .ok_or(HostError::BackendFault)?
+            .finish()
     }
 
     fn exact_authority(&self, authority: ComponentAuthority, endpoint: StreamEndpoint) -> bool {
@@ -3303,14 +3468,17 @@ impl HostDispatcher<ComponentAuthority> for RegistryStreamDispatcher {
                         lifecycle_fail_stop();
                         return Err(HostError::BackendFault);
                     }
-                    for byte in bytes {
-                        values.push(CanonicalValue::U8(byte));
-                    }
                     if !self.exact_authority(authority, StreamEndpoint::Reader) {
                         lifecycle_fail_stop();
                         return Err(HostError::BackendFault);
                     }
-                    response.commit(CanonicalValue::List(values))
+                    for byte in &bytes {
+                        values.push(CanonicalValue::U8(*byte));
+                    }
+                    let response = response.commit(CanonicalValue::List(values))?;
+                    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+                    self.observe_formal_read(&bytes)?;
+                    Ok(response)
                 }
                 // A terminal publisher won before the backend pop. Preserve the
                 // exact prepared token so the runtime's error path can cancel it
@@ -3822,7 +3990,8 @@ impl RegistryStreamDispatcher {
         let dispatch = with_active_writer(self.instance, self.streams, |writer| {
             writer.start(&bytes).map_err(map_stream_error)
         })??;
-        match dispatch {
+        let sent = matches!(&dispatch, StreamSendDispatch::Sent);
+        let dispatch = match dispatch {
             StreamSendDispatch::Sent => Ok(HostDispatch::Ready(HostResponse::unit(
                 STREAM_WRITE_BASE_WORK + bytes.len() as u64,
             )?)),
@@ -3831,15 +4000,18 @@ impl RegistryStreamDispatcher {
                 Ok(HostDispatch::Pending(operation))
             }
             StreamSendDispatch::Closed(reason) => Err(closed_stream_error(reason)),
+        }?;
+        if !self.exact_authority(authority, StreamEndpoint::Writer) {
+            lifecycle_fail_stop();
+            return Err(HostError::BackendFault);
         }
-        .and_then(|dispatch| {
-            if self.exact_authority(authority, StreamEndpoint::Writer) {
-                Ok(dispatch)
-            } else {
-                lifecycle_fail_stop();
-                Err(HostError::BackendFault)
-            }
-        })
+        #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+        if sent {
+            self.observe_formal_write(&bytes)?;
+        }
+        #[cfg(not(feature = "wasm-c84-ssh-managed-child-trusted-sample"))]
+        let _ = sent;
+        Ok(dispatch)
     }
 
     fn close_reader(
@@ -3959,7 +4131,8 @@ impl RegistryStreamDispatcher {
                 .resume(previous.token, &bytes)
                 .map_err(map_stream_error)
         })??;
-        match dispatch {
+        let sent = matches!(&dispatch, StreamSendDispatch::Sent);
+        let dispatch = match dispatch {
             StreamSendDispatch::Sent => {
                 self.pending = None;
                 #[cfg(feature = "wasm-c48-qemu-acceptance")]
@@ -3976,15 +4149,18 @@ impl RegistryStreamDispatcher {
                 self.pending = None;
                 Err(closed_stream_error(reason))
             }
+        }?;
+        if !self.exact_authority(authority, StreamEndpoint::Writer) {
+            lifecycle_fail_stop();
+            return Err(HostError::BackendFault);
         }
-        .and_then(|dispatch| {
-            if self.exact_authority(authority, StreamEndpoint::Writer) {
-                Ok(dispatch)
-            } else {
-                lifecycle_fail_stop();
-                Err(HostError::BackendFault)
-            }
-        })
+        #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+        if sent {
+            self.observe_formal_write(&bytes)?;
+        }
+        #[cfg(not(feature = "wasm-c84-ssh-managed-child-trusted-sample"))]
+        let _ = sent;
+        Ok(dispatch)
     }
 }
 
@@ -4141,6 +4317,8 @@ async fn run_image_component(
     let mut epoch_two_host_pending_reported = false;
     #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
     let mut core_profile = SyncCallProfile::default();
+    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+    let terminal_call_metrics;
     let value = loop {
         #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
         let polled = if profile_epoch == 0 {
@@ -4295,7 +4473,16 @@ async fn run_image_component(
                     return terminal_word(ComponentTerminal::RunnerFault);
                 }
             }
-            TypedPoll::Ready(value) => break value,
+            TypedPoll::Ready(value) => {
+                #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+                {
+                    // Whole-call fuel includes construction and ABI planning;
+                    // it must be sampled while the terminal call is still
+                    // alive, before its borrow of the dispatcher is released.
+                    terminal_call_metrics = call.metrics();
+                }
+                break value;
+            }
             TypedPoll::HostFailed(error) => return terminal_word(host_error_terminal(error)),
             TypedPoll::Trapped(trap) => return terminal_word(trap_terminal(trap)),
         }
@@ -4324,11 +4511,32 @@ async fn run_image_component(
         _ => ComponentTerminal::BackendFault,
     };
     #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
-    if profile_epoch != 0
-        && terminal == ComponentTerminal::Success
-        && crate::wasm_aot_profile_slot::mark_managed_child_driver_completed(profile_epoch).is_err()
-    {
-        return terminal_word(ComponentTerminal::RunnerFault);
+    if profile_epoch != 0 && terminal == ComponentTerminal::Success {
+        #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+        {
+            let io = match dispatcher.take_formal_io() {
+                Ok(io) => io,
+                Err(_) => return terminal_word(ComponentTerminal::RunnerFault),
+            };
+            if crate::wasm_aot_profile_slot::mark_managed_child_driver_completed(
+                profile_epoch,
+                io.read_chunks,
+                io.write_chunks,
+                io.stdin_bytes,
+                io.stdout_bytes,
+                terminal_call_metrics,
+                core_profile,
+            )
+            .is_err()
+            {
+                return terminal_word(ComponentTerminal::RunnerFault);
+            }
+        }
+        #[cfg(not(feature = "wasm-c84-ssh-managed-child-trusted-sample"))]
+        if crate::wasm_aot_profile_slot::mark_managed_child_driver_completed(profile_epoch).is_err()
+        {
+            return terminal_word(ComponentTerminal::RunnerFault);
+        }
     }
     terminal_word(terminal)
 }

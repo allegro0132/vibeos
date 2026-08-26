@@ -760,8 +760,8 @@ def verify_docs(inputs: Inputs) -> None:
         "CI publisher step is not an unconditional exact command",
     )
     require(inputs.ci.count(COMMAND) == 1, "CI publisher verifier command count differs")
-    require(inputs.testing.count(COMMAND) == 2, "TESTING publisher verifier command count differs")
-    require(inputs.decision_doc.count(COMMAND) == 2, "decision doc publisher verifier command count differs")
+    require(inputs.testing.count(COMMAND) == 3, "TESTING publisher verifier command count differs")
+    require(inputs.decision_doc.count(COMMAND) == 3, "decision doc publisher verifier command count differs")
     for source, label in ((inputs.testing, "TESTING"), (inputs.decision_doc, "decision doc")):
         require(
             "single-SAMPLE" in source or "single-record" in source,

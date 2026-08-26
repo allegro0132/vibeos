@@ -60,6 +60,13 @@ jobs:
               -p vibeos-component-runtime --no-default-features \
               --features c84-profile-hooks \
               --test c84_profile --verbose
+      - name: Test the C8.4 trusted SSH terminal seam
+        run: |
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked \
+              -p vibeos-sshd --no-default-features \
+              --features c84-profile-trusted-sample,native-revoke-target-acceptance \
+              --verbose
       - name: Test the allocation-free C8.4 phase ledger
         run: |
           rustup target add --toolchain "$VIBEOS_TOOLCHAIN" \
@@ -94,6 +101,10 @@ jobs:
         run: python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
       - name: Verify the C8.4 formal single-SAMPLE publisher
         run: python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
+      - name: Verify the C8.4 trusted live-sample boundary
+        run: python3 -B scripts/verify-c84-ssh-managed-child-trusted-sample.py --selftest --check-source
+      - name: Test the C8.4 trusted transcript parser
+        run: python3 -B scripts/c84-ssh-managed-child-trusted-sample-peer.py --selftest
       - name: Verify the independent ComponentArtifact codec
         run: python3 -B scripts/verify-c71-component-artifact.py --selftest
       - name: Verify the independent Storage V2 image parsers
@@ -241,6 +252,8 @@ jobs:
         run: ./scripts/qemu-c84-ssh-managed-child-finish-verify-test.sh
       - name: Exercise the C8.4 SSH managed-child verified-stream closure
         run: ./scripts/qemu-c84-ssh-managed-child-verified-stream-test.sh
+      - name: Exercise the C8.4 SSH managed-child trusted-sample closure
+        run: ./scripts/qemu-c84-ssh-managed-child-trusted-sample-test.sh
       # Keep these closed-source-state gates before the ordinary Duo build,
       # which applies the reviewed jitterentropy patch inside its submodule.
       - name: Build the isolated Milk-V Duo C8.3 sampler (CI-only identity)

@@ -92,6 +92,12 @@ wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance = [
     "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance",
     "vibeos-kernel/wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
 ]
+# Alternate finish successor which retains the verified sample behind one
+# trusted terminal-evidence bundle instead of consuming its stream.
+wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    "vibeos-kernel/wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+]
 # Successor-only gate which consumes the verified summary and every interval,
 # then explicitly completes the stream without publishing it.
 wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance = [

@@ -314,6 +314,19 @@ wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance = [
     "wasm-c84-ssh-managed-child-finish-verify",
     "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance",
 ]
+# Default-off trusted-sample successor for the exact authenticated SSH owner.
+# It retains the verified sample and mints one opaque terminal-evidence bundle;
+# it is an alternative to the stream consumer, not an extension of that path.
+wasm-c84-ssh-managed-child-trusted-sample = [
+    "wasm-c84-ssh-managed-child-finish-verify",
+    "vibeos-sshd/c84-profile-trusted-sample",
+]
+# Single-hart OpenSSH proof for the trusted-sample terminal path. The finish
+# predecessor image remains separately selectable with its discard transcript.
+wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-trusted-sample",
+    "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+]
 # Default-off verified-stream consumer for the same exact SSH owner. Successful
 # samples are scanned through the kernel-private cursor and explicitly
 # completed back to Ready; no summary, interval, or publisher authority escapes

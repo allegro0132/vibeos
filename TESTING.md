@@ -40,6 +40,10 @@ python3 -B scripts/verify-c84-ssh-profile-request-parent.py --selftest --check-s
 ./scripts/qemu-c84-ssh-request-parent-test.sh # C8.4 authenticated request-parent/reuse gate
 python3 -B scripts/verify-c84-ssh-managed-child-core.py --selftest --check-source
 ./scripts/qemu-c84-ssh-managed-child-core-test.sh # C8.4 real managed-child/ordinary-Core SSH gate
+python3 -B scripts/verify-c84-ssh-managed-child-phase-sidecar.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-phase-sidecar-test.sh # C8.4 parent/child phase sidecar gate
+python3 -B scripts/verify-c84-ssh-managed-child-irq-overlay.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-irq-overlay-test.sh # C8.4 parent/child causal self-SSIP gate
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
@@ -379,6 +383,50 @@ relationally paired nonzero parent Host/Wait observations, clean detach, and
 response closure. Dynamic parent counts are not timing evidence. This node adds
 no IRQ composition, `finish`, verified stream, publisher, collector, physical
 Milk-V Duo sample, or AOT decision.
+
+The next default-off
+`wasm-c84-ssh-managed-child-irq-overlay` feature composes that same silent
+phase seam with the production IRQ overlay. It does not select the standalone
+IRQ acceptance worker. Its QEMU-only acceptance hooks force exactly two active
+boot-hart self-SSIPs, both in epoch 1: the first only after a real parent Host
+transition has returned and released `SLOT`, and the second only after the real
+managed child has opened its first lexical Core boundary. The child marker is
+withheld until that Core boundary has closed successfully. No active SSIP is
+forced in epochs 2--4.
+
+Every response or active Drop still performs the request parent's exact
+`cancel -> rejection -> acknowledge once -> Ready(next_epoch)` closure. Only
+after `Ready` and `ACTIVE_EPOCH == 0` are established does the acceptance hook
+force one inactive self-SSIP. Thus the cumulative `(paired, inactive,
+active_epoch)` observations are `(2, 1, 0)`, `(2, 2, 0)`, `(2, 3, 0)`, and
+`(2, 4, 0)` at epochs 1--4. The successful UART family is exactly six lines:
+epoch-1 `PARENT_SSIP` and `CHILD_SSIP`, then `RESPONSE` for epochs 1, 2, and 4
+and `DROP` for epoch 3. Epoch 1 alone reports `parent_pair=1 child_pair=1`;
+epochs 2--4 report both as zero. Each terminal reports
+`terminal_inactive=1`, `active_epoch=0`, `cancel=1`, `ack=1`, and the exact
+next ready epoch.
+
+Run the incremental source and live integration gates with:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-irq-overlay.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-irq-overlay-test.sh
+```
+
+The peer reuses the phase-sidecar's real four-request OpenSSH driver and strict
+27/28 phase-marker plus 19 Core-marker parser, and also imports the exact
+eight-marker request-parent parser. It then freezes the six IRQ markers and
+their cross-family order: request start precedes parent SSIP; child ABI and
+Core claim precede child SSIP; child SSIP precedes the original first-Core and
+Wait markers; and each phase, Core, and request terminal precedes the IRQ
+terminal before the next epoch starts. The old standalone IRQ and phase gates
+and their transcripts remain unchanged.
+
+The reusable base feature is UART-silent and is exposed to the Milk-V build
+only as a compile-time seam. This single-hart QEMU result is causal integration
+evidence, not timer/PLIC coverage, target timing, physical-Duo evidence, a
+verified profile, or an AOT decision. The parent still cancels: this node adds
+no `finish`, verified stream, schema publisher, or collector.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

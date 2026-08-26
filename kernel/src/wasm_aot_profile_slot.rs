@@ -61,14 +61,20 @@ static POISON: AtomicU8 = AtomicU8::new(0);
 static ACTIVE_EPOCH: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(
     feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
-    feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance",
+    feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance"
 ))]
 static ACCEPTANCE_SSIP_PAIRED: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(
     feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
-    feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance",
+    feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance"
 ))]
 static ACCEPTANCE_SSIP_INACTIVE: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+static MANAGED_IRQ_ACCEPTANCE_STAGE: AtomicU8 = AtomicU8::new(0);
+#[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+static MANAGED_IRQ_ACCEPTANCE_TERMINAL_EPOCH: AtomicU64 = AtomicU64::new(1);
 #[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
 static ACCEPTANCE_CHILD_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
@@ -1019,7 +1025,8 @@ pub(crate) fn profile_irq_exit(cookie: TrapIrqCookie, exit_tick: u64) -> bool {
 /// remains limited to the active-epoch gate and the target's linear cookie.
 #[cfg(any(
     feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
-    feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance",
+    feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance"
 ))]
 pub(crate) fn profile_irq_acceptance_note_ssip(applied: bool) {
     if applied {
@@ -3709,6 +3716,8 @@ pub(crate) struct ManagedChildSlotCorePollClock {
     detach: PreparedTaskDetachSeal,
     first_error: Option<ProfileError>,
     owns_open: bool,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+    pending_irq_observation: Option<ManagedIrqObservation>,
     not_send: PhantomData<*mut ()>,
 }
 
@@ -3721,6 +3730,8 @@ impl ManagedChildSlotCorePollClock {
             detach,
             first_error: None,
             owns_open: false,
+            #[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+            pending_irq_observation: None,
             not_send: PhantomData,
         })
     }
@@ -3792,6 +3803,13 @@ impl ProfileClock for ManagedChildSlotCorePollClock {
         let error = begin_child_core_phase(self.token, self.detach).err();
         self.owns_open = error.is_none();
         self.latch(error);
+        #[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+        if self.owns_open {
+            match managed_irq_acceptance_child_core_started(self.token.epoch()) {
+                Ok(observation) => self.pending_irq_observation = observation,
+                Err(error) => self.latch(Some(error)),
+            }
+        }
         live_tick()
     }
 
@@ -3807,7 +3825,23 @@ impl ProfileClock for ManagedChildSlotCorePollClock {
         }
         self.owns_open = false;
         let boundary = end_child_core_phase(self.token, self.detach);
+        let core_closed = boundary.error.is_none();
         self.latch(boundary.error);
+        #[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+        if core_closed {
+            if let Some(observation) = self.pending_irq_observation.take() {
+                // Core and SLOT are both closed before UART can take its lock.
+                crate::println!(
+                    "WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY CHILD_SSIP epoch={} causal=1 paired={} inactive={} active_epoch={}",
+                    self.token.epoch(),
+                    observation.paired,
+                    observation.inactive,
+                    observation.active_epoch,
+                );
+            }
+        }
+        #[cfg(not(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance"))]
+        let _ = core_closed;
         boundary.tick
     }
 }
@@ -4736,7 +4770,8 @@ pub(crate) async fn run_core_poll_qemu_acceptance() {
 /// in one synchronous poll stack while the trap runs and returns.
 #[cfg(any(
     feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
-    feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance",
+    feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance"
 ))]
 fn force_boot_self_ssip(expect_profiled: bool) -> Result<(), ProfileError> {
     use crate::ipi::DoorbellDisposition;
@@ -4785,6 +4820,140 @@ fn force_boot_self_ssip(expect_profiled: bool) -> Result<(), ProfileError> {
         return Err(ProfileError::StateMismatch);
     }
     Ok(())
+}
+
+/// Acceptance-only scalar observation for the real SSH IRQ composition.
+/// Production code cannot read the fast gate or the attribution counters.
+#[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedIrqObservation {
+    pub(crate) paired: u64,
+    pub(crate) inactive: u64,
+    pub(crate) active_epoch: u64,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+fn managed_irq_acceptance_observation() -> ManagedIrqObservation {
+    ManagedIrqObservation {
+        paired: ACCEPTANCE_SSIP_PAIRED.load(Ordering::Acquire),
+        inactive: ACCEPTANCE_SSIP_INACTIVE.load(Ordering::Acquire),
+        active_epoch: ACTIVE_EPOCH.load(Ordering::Acquire),
+    }
+}
+
+/// Forces the epoch-1 parent self-SSIP only after its Host transition has
+/// returned and released SLOT. Repeated parent Host transitions are inert.
+#[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+pub(crate) fn managed_irq_acceptance_parent_host(
+    epoch: u64,
+) -> Result<Option<ManagedIrqObservation>, ProfileError> {
+    ensure_not_poisoned()?;
+    if epoch != 1 {
+        return Ok(None);
+    }
+    match MANAGED_IRQ_ACCEPTANCE_STAGE.load(Ordering::Acquire) {
+        2 | 4 => return Ok(None),
+        0 => {}
+        _ => return Err(ProfileError::StateMismatch),
+    }
+    MANAGED_IRQ_ACCEPTANCE_STAGE
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| ProfileError::StateMismatch)?;
+    force_boot_self_ssip(true)?;
+    let observation = managed_irq_acceptance_observation();
+    if observation
+        != (ManagedIrqObservation {
+            paired: 1,
+            inactive: 0,
+            active_epoch: 1,
+        })
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    MANAGED_IRQ_ACCEPTANCE_STAGE
+        .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| ProfileError::StateMismatch)?;
+    Ok(Some(observation))
+}
+
+/// Forces the epoch-1 child self-SSIP after Core has opened and SLOT has been
+/// released. The caller retains the scalar until Core closes before UART.
+#[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+pub(crate) fn managed_irq_acceptance_child_core_started(
+    epoch: u64,
+) -> Result<Option<ManagedIrqObservation>, ProfileError> {
+    ensure_not_poisoned()?;
+    if epoch != 1 {
+        return Ok(None);
+    }
+    match MANAGED_IRQ_ACCEPTANCE_STAGE.load(Ordering::Acquire) {
+        4 => return Ok(None),
+        2 => {}
+        _ => return Err(ProfileError::StateMismatch),
+    }
+    MANAGED_IRQ_ACCEPTANCE_STAGE
+        .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| ProfileError::StateMismatch)?;
+    force_boot_self_ssip(true)?;
+    let observation = managed_irq_acceptance_observation();
+    if observation
+        != (ManagedIrqObservation {
+            paired: 2,
+            inactive: 0,
+            active_epoch: 1,
+        })
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    MANAGED_IRQ_ACCEPTANCE_STAGE
+        .compare_exchange(3, 4, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| ProfileError::StateMismatch)?;
+    Ok(Some(observation))
+}
+
+/// After cancel, exact rejection acknowledgement, and Ready installation,
+/// forces one inactive self-SSIP. This proves the fast gate is clear before
+/// each next epoch without retaining or printing any slot authority here.
+#[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+pub(crate) fn managed_irq_acceptance_terminal_gate(
+    epoch: u64,
+    ready_epoch: u64,
+) -> Result<ManagedIrqObservation, ProfileError> {
+    ensure_not_poisoned()?;
+    if !(1..=4).contains(&epoch)
+        || ready_epoch != epoch.checked_add(1).ok_or(ProfileError::StateMismatch)?
+        || MANAGED_IRQ_ACCEPTANCE_STAGE.load(Ordering::Acquire) != 4
+        || status()
+            != (SlotStatus::Ready {
+                next_epoch: Some(ready_epoch),
+            })
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    let before = managed_irq_acceptance_observation();
+    if before.paired != 2 || before.inactive != epoch - 1 || before.active_epoch != 0 {
+        return Err(ProfileError::StateMismatch);
+    }
+    MANAGED_IRQ_ACCEPTANCE_TERMINAL_EPOCH
+        .compare_exchange(epoch, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| ProfileError::StateMismatch)?;
+    force_boot_self_ssip(false)?;
+    let observation = managed_irq_acceptance_observation();
+    if observation
+        != (ManagedIrqObservation {
+            paired: 2,
+            inactive: epoch,
+            active_epoch: 0,
+        })
+        || status()
+            != (SlotStatus::Ready {
+                next_epoch: Some(ready_epoch),
+            })
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    MANAGED_IRQ_ACCEPTANCE_TERMINAL_EPOCH.store(ready_epoch, Ordering::Release);
+    Ok(observation)
 }
 
 #[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]

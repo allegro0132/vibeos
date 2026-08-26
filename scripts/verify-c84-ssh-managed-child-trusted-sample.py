@@ -610,8 +610,16 @@ def verify_sshd(source: str) -> None:
         production_code.count("structSshExecProfileTerminal{") == 1
         and production_code.count("implSshExecProfileTerminal{") == 1
         and production_code.count("SshExecProfileTerminal{") == 2
+        and production_code.count("SshExecProfileTerminal") == 6
         and semantic(terminal_impl.raw).count("Self{") == 2,
         "SSHD terminal has another production constructor or implementation",
+    )
+    require(
+        not re.search(
+            r"\bimpl\b[^{};]*\bfor\s+(?:(?:self|crate)::)?SshExecProfileTerminal\b",
+            masked(production),
+        ),
+        "SSHD terminal admits a production trait implementation",
     )
     seal = find_function(terminal_impl, "seal", "SSHD terminal private seal")
     require(
@@ -2447,6 +2455,31 @@ def add_terminal_whole_value_writer(data: Inputs) -> Inputs:
     )
 
 
+def add_terminal_manual_clone(data: Inputs) -> Inputs:
+    source = data.sshd
+    terminal_impl = find_scope(
+        source,
+        r"\bimpl\s+SshExecProfileTerminal\b",
+        "manual terminal Clone insertion",
+    )
+    addition = (
+        f'\n\n#[cfg(feature = "{SSHD_FEATURE}")]\n'
+        "impl Clone for SshExecProfileTerminal where Self: Sized {\n"
+        "    fn clone(&self) -> Self {\n"
+        "        Self {\n"
+        "            component_terminal: self.component_terminal,\n"
+        "            exit_status: self.exit_status,\n"
+        "            timed_out: self.timed_out,\n"
+        "            stdout_bytes: self.stdout_bytes,\n"
+        "            stderr_bytes: self.stderr_bytes,\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+    source = source[: terminal_impl.end] + addition + source[terminal_impl.end :]
+    return replace(data, sshd=source)
+
+
 def add_stdout_terminal_external_writer(data: Inputs) -> Inputs:
     source = data.sshd
     helper = (
@@ -2714,6 +2747,10 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
         (
             "sshd-terminal-whole-value-writer",
             add_terminal_whole_value_writer,
+        ),
+        (
+            "sshd-terminal-manual-clone",
+            add_terminal_manual_clone,
         ),
         (
             "sshd-stdout-terminal-external-writer",

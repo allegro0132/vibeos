@@ -46,6 +46,7 @@ fn arguments(token: ResourceToken) -> Vec<CanonicalValue> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClockEvent {
     Tick(u64),
+    CleanupStarted,
     CoreStarting,
     CoreFinished(u64),
 }
@@ -75,6 +76,10 @@ impl ProfileClock for TraceClock {
         let tick = self.sample();
         self.events.push(ClockEvent::Tick(tick));
         tick
+    }
+
+    fn cleanup_started(&mut self) {
+        self.events.push(ClockEvent::CleanupStarted);
     }
 
     fn core_poll_started(&mut self) -> u64 {
@@ -138,6 +143,8 @@ fn profiled_poll_matches_plain_poll_and_uses_exact_phase_buckets() {
     let mut profile = SyncCallProfile::default();
     let mut saw_no_core = false;
     let mut saw_one_core = false;
+    let mut cleanup_started_polls = 0;
+    let mut prior_poll_was_pending = false;
     let mut reached_ready = false;
 
     for _ in 0..50_000 {
@@ -153,22 +160,36 @@ fn profiled_poll_matches_plain_poll_and_uses_exact_phase_buckets() {
 
         let core_polls = profile.core_polls - before_profile.core_polls;
         assert!(core_polls <= 1, "one typed poll drove multiple Core polls");
-        let expected_events = if core_polls == 0 {
+        let cleanup_callbacks = clock.events[before_events..]
+            .iter()
+            .filter(|event| matches!(event, ClockEvent::CleanupStarted))
+            .count();
+        assert!(cleanup_callbacks <= 1);
+        let cleanup_started = cleanup_callbacks == 1;
+        if cleanup_started {
+            assert_eq!(cleanup_started_polls, 0, "cleanup callback repeated");
+            assert!(
+                prior_poll_was_pending,
+                "successful cleanup must start on the poll after the transition"
+            );
+            cleanup_started_polls += 1;
+        }
+        let mut expected_events = vec![ClockEvent::Tick(first_tick)];
+        if cleanup_started {
+            expected_events.push(ClockEvent::CleanupStarted);
+        }
+        if core_polls == 0 {
             saw_no_core = true;
-            vec![
-                ClockEvent::Tick(first_tick),
-                ClockEvent::Tick(first_tick + 1),
-            ]
+            expected_events.push(ClockEvent::Tick(first_tick + 1));
         } else {
             saw_one_core = true;
-            vec![
-                ClockEvent::Tick(first_tick),
+            expected_events.extend_from_slice(&[
                 ClockEvent::CoreStarting,
                 ClockEvent::Tick(first_tick + 1),
                 ClockEvent::CoreFinished(first_tick + 2),
                 ClockEvent::Tick(first_tick + 3),
-            ]
-        };
+            ]);
+        }
         assert_eq!(&clock.events[before_events..], expected_events);
         assert_eq!(
             profile.core_interpreter_ticks - before_profile.core_interpreter_ticks,
@@ -190,10 +211,12 @@ fn profiled_poll_matches_plain_poll_and_uses_exact_phase_buckets() {
             break;
         }
         assert!(matches!(profiled_result, TypedPoll::Pending(_)));
+        prior_poll_was_pending = true;
     }
 
     assert!(reached_ready);
     assert!(saw_no_core && saw_one_core);
+    assert_eq!(cleanup_started_polls, 1);
     assert_eq!(
         profile.consumed_work,
         profiled.metrics().consumed_work - planned
@@ -204,7 +227,7 @@ fn profiled_poll_matches_plain_poll_and_uses_exact_phase_buckets() {
     );
     assert_eq!(
         clock.events.len() as u64,
-        profile.typed_polls * 2 + profile.core_polls * 3
+        profile.typed_polls * 2 + profile.core_polls * 3 + 1
     );
 
     // The post-Ready terminal poll has no Core work, consumes no fuel, and is
@@ -235,6 +258,93 @@ fn profiled_poll_matches_plain_poll_and_uses_exact_phase_buckets() {
             ClockEvent::Tick(first_tick),
             ClockEvent::Tick(first_tick + 1)
         ]
+    );
+}
+
+#[test]
+fn cleanup_callback_is_exactly_once_for_terminal_and_late_cancel_paths() {
+    let mut terminal_component = instantiate();
+    let mut terminal_resources = ResourceTable::new(202, 4).unwrap();
+    let terminal_token = terminal_resources
+        .insert_owned(RANDOM_SOURCE, 0x5a)
+        .unwrap();
+    let mut terminal = terminal_component
+        .start_typed_call(
+            &mut terminal_resources,
+            TRANSFORM,
+            arguments(terminal_token),
+            1,
+            1,
+        )
+        .unwrap();
+    let mut terminal_clock = TraceClock::new(50);
+    let mut terminal_profile = SyncCallProfile::default();
+
+    assert_eq!(
+        terminal.poll_profiled(&mut terminal_clock, &mut terminal_profile),
+        TypedPoll::Trapped(vibeos_component_format::TrapCode::FuelExhausted)
+    );
+    assert_eq!(
+        terminal_clock.events,
+        [
+            ClockEvent::Tick(50),
+            ClockEvent::CleanupStarted,
+            ClockEvent::Tick(51),
+        ],
+        "a terminal constructor must enter cleanup after outer start and before closure"
+    );
+    assert_eq!(
+        terminal.poll_profiled(&mut terminal_clock, &mut terminal_profile),
+        TypedPoll::Trapped(vibeos_component_format::TrapCode::Cancelled)
+    );
+    assert_eq!(
+        &terminal_clock.events[3..],
+        [ClockEvent::Tick(52), ClockEvent::Tick(53)],
+        "a completed call must not repeat the cleanup callback"
+    );
+
+    let mut cancelled_component = instantiate();
+    let mut cancelled_resources = ResourceTable::new(203, 4).unwrap();
+    let cancelled_token = cancelled_resources
+        .insert_owned(RANDOM_SOURCE, 0x5a)
+        .unwrap();
+    let mut cancelled = cancelled_component
+        .start_typed_call(
+            &mut cancelled_resources,
+            TRANSFORM,
+            arguments(cancelled_token),
+            100_000,
+            100,
+        )
+        .unwrap();
+    cancelled.cancel();
+    let mut cancelled_clock = TraceClock::new(70);
+    let mut cancelled_profile = SyncCallProfile::default();
+
+    assert_eq!(
+        cancelled.poll_profiled(&mut cancelled_clock, &mut cancelled_profile),
+        TypedPoll::Trapped(vibeos_component_format::TrapCode::Cancelled)
+    );
+    assert_eq!(
+        cancelled_clock.events,
+        [
+            ClockEvent::Tick(70),
+            ClockEvent::CleanupStarted,
+            ClockEvent::Tick(71),
+        ],
+        "a failure discovered inside the poll must notify before the outer finish sample"
+    );
+    assert_eq!(
+        cancelled.poll_profiled(&mut cancelled_clock, &mut cancelled_profile),
+        TypedPoll::Trapped(vibeos_component_format::TrapCode::Cancelled)
+    );
+    assert_eq!(
+        cancelled_clock
+            .events
+            .iter()
+            .filter(|event| matches!(event, ClockEvent::CleanupStarted))
+            .count(),
+        1
     );
 }
 

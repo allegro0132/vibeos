@@ -209,15 +209,30 @@ impl SshExecProfileOwner {
             return Err(());
         };
         let epoch = run.token().epoch();
-        #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        let child_ready = crate::wasm_aot_profile_slot::managed_phase_response_ready(epoch).is_ok();
+        #[cfg(all(
+            feature = "wasm-c84-ssh-managed-child-core",
+            not(feature = "wasm-c84-ssh-managed-child-phase-sidecar")
+        ))]
         let child_ready = crate::wasm_aot_profile_slot::managed_child_response_ready(epoch).is_ok();
         #[cfg(not(feature = "wasm-c84-ssh-managed-child-core"))]
         let child_ready = true;
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        let phase_observation = crate::wasm_aot_profile_slot::managed_phase_observation(epoch);
         #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
         let child_observation =
             crate::wasm_aot_profile_slot::take_managed_child_response_observation(epoch);
         match cancel_and_ack_profile(run, crate::wasm_aot_profile_slot::SlotFaults::default()) {
             Ok(ready_epoch) if child_ready && profile_policy_is_current(self.policy) => {
+                #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+                profile_phase_response(
+                    epoch,
+                    status,
+                    ready_epoch,
+                    phase_observation,
+                    child_observation,
+                )?;
                 #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
                 match child_observation {
                     Ok(observation) => crate::println!(
@@ -274,8 +289,23 @@ impl SshExecProfileOwner {
                 #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
                 let child_drop =
                     crate::wasm_aot_profile_slot::take_managed_child_drop_observation(epoch);
+                #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+                let phase_observation =
+                    crate::wasm_aot_profile_slot::managed_phase_observation(epoch);
                 match cancel_and_ack_profile(run, expected_faults) {
                     Ok(ready_epoch) if expectation_exact => {
+                        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+                        if profile_phase_drop(
+                            epoch,
+                            ready_epoch,
+                            expected_faults,
+                            phase_observation,
+                            child_drop,
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
                         #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
                         match child_drop {
                             Ok((core_pairs, crate::exec::TaskDetachReason::Exited)) => {
@@ -365,6 +395,28 @@ impl SshExecProfilePermitBackend for SshExecProfileOwner {
 
 #[cfg(feature = "wasm-c84-ssh-request-parent")]
 impl SshExecProfileRunBackend for SshExecProfileOwner {
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    fn phase_host(&mut self) -> Result<(), ()> {
+        let SshExecProfileOwnerState::Active(run) = &mut self.state else {
+            profile_request_failure("host-phase-state", None);
+            return Err(());
+        };
+        run.managed_parent_host().map_err(|_| {
+            profile_request_failure("host-phase", Some(run.token().epoch()));
+        })
+    }
+
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    fn phase_wait(&mut self) -> Result<(), ()> {
+        let SshExecProfileOwnerState::Active(run) = &mut self.state else {
+            profile_request_failure("wait-phase-state", None);
+            return Err(());
+        };
+        run.managed_parent_wait().map_err(|_| {
+            profile_request_failure("wait-phase", Some(run.token().epoch()));
+        })
+    }
+
     fn response_boundary(&mut self, status: u32) -> Result<(), ()> {
         SshExecProfileOwner::response_boundary(self, status)
     }
@@ -430,6 +482,147 @@ fn profile_request_drop(epoch: u64, ready_epoch: u64) {
     );
     #[cfg(not(feature = "wasm-c84-ssh-request-parent-qemu-acceptance"))]
     let _ = (epoch, ready_epoch);
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+fn profile_phase_response(
+    epoch: u64,
+    status: u32,
+    ready_epoch: u64,
+    phase: Result<
+        crate::wasm_aot_profile_slot::ManagedPhaseObservation,
+        crate::wasm_aot_profile_slot::ProfileError,
+    >,
+    child: Result<
+        crate::wasm_aot_profile_slot::ManagedChildCoreObservation,
+        crate::wasm_aot_profile_slot::ProfileError,
+    >,
+) -> Result<(), ()> {
+    use crate::exec::TaskDetachReason;
+    use vibeos_wasm_aot_profile::Phase;
+
+    let (phase, child) = match (phase, child) {
+        (Ok(phase), Ok(child)) => (phase, child),
+        _ => {
+            profile_request_failure("phase-response-observation", Some(epoch));
+            return Err(());
+        }
+    };
+    let exact = phase.parent_host_starts > 0
+        && phase.parent_host_starts == phase.parent_host_finishes
+        && phase.parent_wait_starts > 0
+        && phase.parent_wait_starts == phase.parent_wait_finishes
+        && phase.child_host_starts > 0
+        && phase.child_host_starts == phase.child_host_finishes
+        && phase.child_wait_starts > 0
+        && phase.child_wait_starts == phase.child_wait_finishes
+        && phase.cleanup_count == 1
+        && phase.cleanup_latched
+        && !phase.parent_wait_open
+        && !phase.child_wait_open
+        && !phase.child_host_open
+        && phase.child_base == Phase::Cleanup
+        && !phase.child_phase_fault
+        && !phase.parent_phase_fault
+        && !phase.child_attached
+        && phase.child_detach == Some(TaskDetachReason::Exited)
+        && phase.slot_faults == crate::wasm_aot_profile_slot::SlotFaults::default()
+        && child.core_pairs > 0
+        && child.core_pairs == child.core_polls;
+    if !exact {
+        profile_request_failure("phase-response-state", Some(epoch));
+        return Err(());
+    }
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR EXITED epoch={} detach=exited release=1",
+        epoch
+    );
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR RESPONSE epoch={} status={} child_core_starts={} child_core_finishes={} child_host_starts={} child_host_finishes={} child_wait_starts={} child_wait_finishes={} cleanup_count={} parent_host_starts={} parent_host_finishes={} parent_wait_starts={} parent_wait_finishes={} child_wait_open=0 parent_wait_open=0 late=0 clean=1 cancel=1 ack=1 ready_epoch={}",
+        epoch,
+        status,
+        child.core_pairs,
+        child.core_pairs,
+        phase.child_host_starts,
+        phase.child_host_finishes,
+        phase.child_wait_starts,
+        phase.child_wait_finishes,
+        phase.cleanup_count,
+        phase.parent_host_starts,
+        phase.parent_host_finishes,
+        phase.parent_wait_starts,
+        phase.parent_wait_finishes,
+        ready_epoch
+    );
+    Ok(())
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+fn profile_phase_drop(
+    epoch: u64,
+    ready_epoch: u64,
+    expected_faults: crate::wasm_aot_profile_slot::SlotFaults,
+    phase: Result<
+        crate::wasm_aot_profile_slot::ManagedPhaseObservation,
+        crate::wasm_aot_profile_slot::ProfileError,
+    >,
+    child: Result<(u64, crate::exec::TaskDetachReason), crate::wasm_aot_profile_slot::ProfileError>,
+) -> Result<(), ()> {
+    use crate::exec::TaskDetachReason;
+    use vibeos_wasm_aot_profile::Phase;
+
+    let (phase, (core_pairs, detach)) = match (phase, child) {
+        (Ok(phase), Ok(child)) => (phase, child),
+        _ => {
+            profile_request_failure("phase-drop-observation", Some(epoch));
+            return Err(());
+        }
+    };
+    let parent_open = u64::from(phase.parent_wait_open);
+    let cleanup_exact = match phase.cleanup_count {
+        0 => !phase.cleanup_latched && phase.child_base != Phase::Cleanup,
+        1 => phase.cleanup_latched && phase.child_base == Phase::Cleanup,
+        _ => false,
+    };
+    let exact = phase.parent_host_starts > 0
+        && phase.parent_host_starts == phase.parent_host_finishes
+        && phase.parent_wait_starts > 0
+        && phase.parent_wait_starts == phase.parent_wait_finishes.saturating_add(parent_open)
+        && phase.child_host_starts == phase.child_host_finishes
+        && phase.child_wait_starts > 0
+        && phase.child_wait_starts == phase.child_wait_finishes.saturating_add(1)
+        && phase.child_wait_open
+        && !phase.child_host_open
+        && cleanup_exact
+        && !phase.child_phase_fault
+        && !phase.parent_phase_fault
+        && !phase.child_attached
+        && phase.child_detach == Some(TaskDetachReason::Exited)
+        && phase.slot_faults == expected_faults
+        && detach == TaskDetachReason::Exited
+        && core_pairs > 0;
+    if !exact {
+        profile_request_failure("phase-drop-state", Some(epoch));
+        return Err(());
+    }
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR DROP epoch={} release=0 detach=exited clean=0 child_faults=abandoned+detached child_core_starts={} child_core_finishes={} child_host_starts={} child_host_finishes={} child_wait_starts={} child_wait_finishes={} cleanup_count={} parent_host_starts={} parent_host_finishes={} parent_wait_starts={} parent_wait_finishes={} child_wait_open_at_cancel=1 parent_wait_open_at_cancel={} late=0 cancel=1 ack=1 ready_epoch={}",
+        epoch,
+        core_pairs,
+        core_pairs,
+        phase.child_host_starts,
+        phase.child_host_finishes,
+        phase.child_wait_starts,
+        phase.child_wait_finishes,
+        phase.cleanup_count,
+        phase.parent_host_starts,
+        phase.parent_host_finishes,
+        phase.parent_wait_starts,
+        phase.parent_wait_finishes,
+        parent_open,
+        ready_epoch
+    );
+    Ok(())
 }
 
 #[cfg(any(

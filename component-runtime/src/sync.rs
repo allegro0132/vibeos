@@ -410,6 +410,8 @@ impl SynchronousComponent {
             cancelled: false,
             guest_started: false,
             guest_resources: Some(guest_resources),
+            #[cfg(feature = "c84-profile-hooks")]
+            profile_cleanup_started: false,
         })
     }
 
@@ -938,6 +940,16 @@ pub struct TypedCallMetrics {
 pub trait ProfileClock {
     fn ticks(&mut self) -> u64;
 
+    /// Notifies an external phase recorder that canonical cleanup is starting.
+    ///
+    /// The runtime invokes this at most once per typed call. On the successful
+    /// path it is called after the outer-poll start sample and immediately
+    /// before the first cleanup poll. A terminal call receives the same
+    /// notification before its resources are closed. Failures discovered
+    /// inside a poll receive a diagnostic late notification before the outer
+    /// finish sample.
+    fn cleanup_started(&mut self) {}
+
     /// Switches an external phase recorder to Core interpretation and returns
     /// the tick sampled after that observer work, immediately before entering
     /// the interpreter. An override must sample the returned tick as its final
@@ -1102,6 +1114,8 @@ pub struct TypedCall<'a, A> {
     cancelled: bool,
     guest_started: bool,
     guest_resources: Option<GuestCallResources>,
+    #[cfg(feature = "c84-profile-hooks")]
+    profile_cleanup_started: bool,
 }
 
 struct PendingHostLower {
@@ -1178,6 +1192,8 @@ impl<'a, A> TypedCall<'a, A> {
             cancelled: false,
             guest_started: false,
             guest_resources: None,
+            #[cfg(feature = "c84-profile-hooks")]
+            profile_cleanup_started: false,
         }
     }
 
@@ -1281,8 +1297,20 @@ impl<'a, A> TypedCall<'a, A> {
     ) -> TypedPoll {
         let work_before = self.metrics().consumed_work;
         let outer_started = clock.ticks();
+        if !self.profile_cleanup_started
+            && matches!(self.stage, TypedStage::Cleanup | TypedStage::Terminal(_))
+        {
+            clock.cleanup_started();
+            self.profile_cleanup_started = true;
+        }
         let mut session = ProfileSession { clock, profile };
         let result = self.poll_with_profiler(&mut session);
+        if !self.profile_cleanup_started
+            && matches!(&result, TypedPoll::HostFailed(_) | TypedPoll::Trapped(_))
+        {
+            session.clock.cleanup_started();
+            self.profile_cleanup_started = true;
+        }
         let outer_elapsed = session.clock.ticks().wrapping_sub(outer_started);
         let work_after = self.metrics().consumed_work;
         // A decreasing work ledger is an invariant violation. Charge the

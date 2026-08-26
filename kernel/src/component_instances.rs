@@ -123,6 +123,8 @@ use vibeos_vsh::{
     ManagedComponentState, ManagedComponentStateFuture, ManagedComponentToken, Session,
     SshExecComponentIoInstall, SshExecComponentPolicy, StreamMode, VIBE_STREAM_FILTER_WORLD,
 };
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+use vibeos_wasm_aot_profile::Phase;
 #[cfg(feature = "ssh-component-command")]
 use vibeos_wasm_runtime::{OwnerAllocationReservation, ProfileEngine};
 
@@ -2388,7 +2390,7 @@ impl Future for ManagedChildFuture {
                             if crate::wasm_aot_profile_slot::record_managed_child_released(epoch)
                                 .is_ok()
                             {
-                                crate::println!(
+                                    crate::println!(
                                         "WASM_C84_SSH_MANAGED_CHILD_CORE RELEASE epoch={} normal_driver=1",
                                         epoch
                                     );
@@ -2855,6 +2857,48 @@ struct PendingStreamOperation {
     kind: PendingStreamKind,
 }
 
+/// Acceptance-only proof that the exact HostPending token was registered by
+/// stdin's ReadWaiting backend. The record is copy-only and is consumed after
+/// the child Wait sidecar has opened, before any UART evidence is emitted.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct C84DelayedStdinPending {
+    epoch: u64,
+    operation: HostOperationToken,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+static C84_DELAYED_STDIN_PENDING: SpinLock<Option<C84DelayedStdinPending>> = SpinLock::new(None);
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+fn record_c84_delayed_stdin_pending(
+    epoch: u64,
+    operation: HostOperationToken,
+) -> Result<(), HostError> {
+    if epoch != 2 {
+        return Ok(());
+    }
+    let mut pending = C84_DELAYED_STDIN_PENDING.lock();
+    if pending.is_some() {
+        drop(pending);
+        lifecycle_fail_stop();
+        return Err(HostError::BackendFault);
+    }
+    *pending = Some(C84DelayedStdinPending { epoch, operation });
+    Ok(())
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+fn take_c84_delayed_stdin_pending(epoch: u64, operation: HostOperationToken) -> bool {
+    let mut pending = C84_DELAYED_STDIN_PENDING.lock();
+    if *pending == Some(C84DelayedStdinPending { epoch, operation }) {
+        *pending = None;
+        true
+    } else {
+        false
+    }
+}
+
 /// The call-scoped dispatcher is arena-local. Every field is copy-only; live
 /// authority is reacquired from the registry-owned CSpace for every method.
 #[cfg(feature = "ssh-component-command")]
@@ -2863,6 +2907,8 @@ struct RegistryStreamDispatcher {
     streams: RegistryStreamBindings,
     reader_type: ResourceTypeId,
     writer_type: ResourceTypeId,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    profile_epoch: u64,
     pending: Option<PendingStreamOperation>,
 }
 
@@ -2873,12 +2919,15 @@ impl RegistryStreamDispatcher {
         streams: RegistryStreamBindings,
         reader_type: ResourceTypeId,
         writer_type: ResourceTypeId,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")] profile_epoch: u64,
     ) -> Self {
         Self {
             instance,
             streams,
             reader_type,
             writer_type,
+            #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+            profile_epoch,
             pending: None,
         }
     }
@@ -2935,6 +2984,76 @@ impl RegistryStreamDispatcher {
         }
         self.pending = Some(PendingStreamOperation { token, kind });
         Ok(())
+    }
+
+    fn cancel_exact_pending(
+        &self,
+        pending: PendingStreamOperation,
+    ) -> Result<Result<(), HostError>, HostError> {
+        match pending.kind {
+            PendingStreamKind::ReadWaiting | PendingStreamKind::ReadPrepared { .. } => {
+                with_cleanup_reader(self.instance, self.streams, |reader| {
+                    reader.cancel(pending.token).map_err(map_stream_error)
+                })
+            }
+            PendingStreamKind::WriteWaiting => {
+                with_cleanup_writer(self.instance, self.streams, |writer| {
+                    writer.cancel(pending.token).map_err(map_stream_error)
+                })
+            }
+        }
+    }
+
+    fn cancel_pending(&mut self, operation: HostOperationToken) -> Result<(), HostError> {
+        let Some(pending) = self.pending else {
+            return Err(HostError::BackendFault);
+        };
+        if pending.token != operation {
+            return Err(HostError::BackendFault);
+        }
+        // Consume locally before touching the stable resource. Even an error
+        // cannot cause dispatcher Drop to issue a duplicate cancellation.
+        self.pending = None;
+        self.cancel_exact_pending(pending)?
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+fn with_managed_child_host_phase<T>(
+    epoch: u64,
+    operation: impl FnOnce() -> Result<T, HostError>,
+) -> Result<T, HostError> {
+    if epoch == 0 {
+        return operation();
+    }
+    let phase =
+        crate::wasm_aot_profile_slot::ManagedChildHostPhase::enter(epoch).map_err(|_| {
+            lifecycle_fail_stop();
+            HostError::BackendFault
+        })?;
+    let result = operation();
+    if phase.finish().is_err() {
+        lifecycle_fail_stop();
+        return Err(HostError::BackendFault);
+    }
+    result
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+fn with_managed_child_cancel_phase<T>(
+    epoch: u64,
+    operation: impl FnOnce() -> Result<T, HostError>,
+) -> Result<T, HostError> {
+    if epoch == 0 {
+        return operation();
+    }
+    match crate::wasm_aot_profile_slot::managed_child_cancel_bypasses_host(epoch) {
+        Ok(true) => operation(),
+        Ok(false) => with_managed_child_host_phase(epoch, operation),
+        Err(_) => {
+            lifecycle_fail_stop();
+            Err(HostError::BackendFault)
+        }
     }
 }
 
@@ -2999,7 +3118,9 @@ impl HostDispatcher<ComponentAuthority> for RegistryStreamDispatcher {
         &mut self,
         request: HostRequest<'_, ComponentAuthority>,
     ) -> Result<HostDispatch, HostError> {
-        match (
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        let profile_epoch = self.profile_epoch;
+        let operation = || match (
             request.import().interface.as_str(),
             request.import().function.as_str(),
         ) {
@@ -3008,6 +3129,14 @@ impl HostDispatcher<ComponentAuthority> for RegistryStreamDispatcher {
             (STREAM_INTERFACE, STREAM_CLOSE_READER_FUNCTION) => self.close_reader(request),
             (STREAM_INTERFACE, STREAM_CLOSE_WRITER_FUNCTION) => self.close_writer(request),
             _ => Err(HostError::Denied),
+        };
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        {
+            with_managed_child_host_phase(profile_epoch, operation)
+        }
+        #[cfg(not(feature = "wasm-c84-ssh-managed-child-phase-sidecar"))]
+        {
+            operation()
         }
     }
 
@@ -3016,38 +3145,52 @@ impl HostDispatcher<ComponentAuthority> for RegistryStreamDispatcher {
         operation: HostOperationToken,
         wake: HostWakeToken,
     ) -> Result<(), HostError> {
-        let Some(pending) = self.pending else {
-            lifecycle_fail_stop();
-            return Err(HostError::BackendFault);
-        };
-        if pending.token != operation {
-            lifecycle_fail_stop();
-            return Err(HostError::BackendFault);
-        }
-        match pending.kind {
-            PendingStreamKind::ReadWaiting => {
-                with_active_reader(self.instance, self.streams, |reader, supervisor| {
-                    promote_provisional_eof(supervisor)?;
-                    reader
-                        .register_wake(operation, wake)
-                        .map_err(map_stream_error)
-                })??
-            }
-            PendingStreamKind::WriteWaiting => {
-                with_active_writer(self.instance, self.streams, |writer| {
-                    writer
-                        .register_wake(operation, wake)
-                        .map_err(map_stream_error)
-                })??;
-                #[cfg(feature = "wasm-c48-qemu-acceptance")]
-                acceptance::record_stream_host_pending(self.instance, operation);
-            }
-            PendingStreamKind::ReadPrepared { .. } => {
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        let profile_epoch = self.profile_epoch;
+        let action = || {
+            let Some(pending) = self.pending else {
+                lifecycle_fail_stop();
+                return Err(HostError::BackendFault);
+            };
+            if pending.token != operation {
                 lifecycle_fail_stop();
                 return Err(HostError::BackendFault);
             }
+            match pending.kind {
+                PendingStreamKind::ReadWaiting => {
+                    with_active_reader(self.instance, self.streams, |reader, supervisor| {
+                        promote_provisional_eof(supervisor)?;
+                        reader
+                            .register_wake(operation, wake)
+                            .map_err(map_stream_error)
+                    })??;
+                    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+                    record_c84_delayed_stdin_pending(profile_epoch, operation)?;
+                }
+                PendingStreamKind::WriteWaiting => {
+                    with_active_writer(self.instance, self.streams, |writer| {
+                        writer
+                            .register_wake(operation, wake)
+                            .map_err(map_stream_error)
+                    })??;
+                    #[cfg(feature = "wasm-c48-qemu-acceptance")]
+                    acceptance::record_stream_host_pending(self.instance, operation);
+                }
+                PendingStreamKind::ReadPrepared { .. } => {
+                    lifecycle_fail_stop();
+                    return Err(HostError::BackendFault);
+                }
+            }
+            Ok(())
+        };
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        {
+            with_managed_child_host_phase(profile_epoch, action)
         }
-        Ok(())
+        #[cfg(not(feature = "wasm-c84-ssh-managed-child-phase-sidecar"))]
+        {
+            action()
+        }
     }
 
     fn resume(
@@ -3055,38 +3198,51 @@ impl HostDispatcher<ComponentAuthority> for RegistryStreamDispatcher {
         operation: HostOperationToken,
         request: HostRequest<'_, ComponentAuthority>,
     ) -> Result<HostDispatch, HostError> {
-        let Some(pending) = self.pending else {
-            lifecycle_fail_stop();
-            return Err(HostError::BackendFault);
-        };
-        if pending.token != operation {
-            lifecycle_fail_stop();
-            return Err(HostError::BackendFault);
-        }
-        let result = match pending.kind {
-            PendingStreamKind::ReadWaiting => self.resume_read(pending, request),
-            PendingStreamKind::WriteWaiting => self.resume_write(pending, request),
-            PendingStreamKind::ReadPrepared { .. } => {
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        let profile_epoch = self.profile_epoch;
+        let action = || {
+            let Some(pending) = self.pending else {
                 lifecycle_fail_stop();
-                Err(HostError::BackendFault)
+                return Err(HostError::BackendFault);
+            };
+            if pending.token != operation {
+                lifecycle_fail_stop();
+                return Err(HostError::BackendFault);
             }
-        };
-        if result.is_err() {
-            // `HostDispatcher::resume` consumes its supplied operation on
-            // every return. Preparation/authority/allocation failures may
-            // occur before the backend retry, while a post-retry failure may
-            // leave a fresh Waiting/Prepared token which was never exposed to
-            // the runtime. Detach whichever exact operation remains so Drop
-            // cannot issue a delayed duplicate cancellation or retain a stale
-            // wake edge.
-            if let Some(unexposed) = self.pending {
-                if self.cancel(unexposed.token).is_err() {
+            let result = match pending.kind {
+                PendingStreamKind::ReadWaiting => self.resume_read(pending, request),
+                PendingStreamKind::WriteWaiting => self.resume_write(pending, request),
+                PendingStreamKind::ReadPrepared { .. } => {
                     lifecycle_fail_stop();
-                    return Err(HostError::BackendFault);
+                    Err(HostError::BackendFault)
+                }
+            };
+            if result.is_err() {
+                // `HostDispatcher::resume` consumes its supplied operation on
+                // every return. Preparation/authority/allocation failures may
+                // occur before the backend retry, while a post-retry failure
+                // may leave a fresh Waiting/Prepared token which was never exposed to
+                // the runtime. Detach whichever exact operation remains so Drop
+                // cannot issue a delayed duplicate cancellation or retain a stale
+                // wake edge. This internal cleanup stays inside the one lexical
+                // Host guard instead of recursively opening another guard.
+                if let Some(unexposed) = self.pending {
+                    if self.cancel_pending(unexposed.token).is_err() {
+                        lifecycle_fail_stop();
+                        return Err(HostError::BackendFault);
+                    }
                 }
             }
+            result
+        };
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        {
+            with_managed_child_host_phase(profile_epoch, action)
         }
-        result
+        #[cfg(not(feature = "wasm-c84-ssh-managed-child-phase-sidecar"))]
+        {
+            action()
+        }
     }
 
     fn commit_prepared(
@@ -3094,95 +3250,98 @@ impl HostDispatcher<ComponentAuthority> for RegistryStreamDispatcher {
         operation: HostOperationToken,
         request: HostRequest<'_, ComponentAuthority>,
     ) -> Result<HostResponse, HostError> {
-        let Some(pending) = self.pending else {
-            return Err(HostError::BackendFault);
-        };
-        let PendingStreamKind::ReadPrepared { length } = pending.kind else {
-            return Err(HostError::BackendFault);
-        };
-        // Operation tokens are opaque, non-owning generations. A stale,
-        // duplicate, or cross-stream value fails closed without mutating the
-        // exact live reservation or poisoning unrelated managed instances.
-        if pending.token != operation {
-            return Err(HostError::BackendFault);
-        }
-        if !stream_read_shape(request.import(), self.reader_type)
-            || !matches!(request.arguments(), [CanonicalValue::Resource(_)])
-        {
-            lifecycle_fail_stop();
-            return Err(HostError::BackendFault);
-        }
-        let authority = self.borrow_authority(&request, StreamEndpoint::Reader)?;
-        let length = usize::from(length);
-
-        // All arena allocations precede the backend pop. After `commit`
-        // succeeds, filling both vectors and committing the response cannot
-        // allocate or fail.
-        let response = HostResponse::reserve_one(STREAM_READ_WORK)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(length)
-            .map_err(|_| HostError::Exhausted)?;
-        bytes.resize(length, 0);
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(length)
-            .map_err(|_| HostError::Exhausted)?;
-
-        let committed = with_active_reader(self.instance, self.streams, |reader, _| {
-            reader
-                .commit(operation, &mut bytes)
-                .map_err(map_stream_error)
-        })??;
-        match committed {
-            StreamReceiveCommit::Received(received) => {
-                // The backend pop consumed the reservation even if the
-                // returned length violates our sealed prepared shape. Never
-                // offer an already-published operation to exact cleanup.
-                self.pending = None;
-                if received != length {
-                    lifecycle_fail_stop();
-                    return Err(HostError::BackendFault);
-                }
-                for byte in bytes {
-                    values.push(CanonicalValue::U8(byte));
-                }
-                if !self.exact_authority(authority, StreamEndpoint::Reader) {
-                    lifecycle_fail_stop();
-                    return Err(HostError::BackendFault);
-                }
-                response.commit(CanonicalValue::List(values))
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        let profile_epoch = self.profile_epoch;
+        let action = || {
+            let Some(pending) = self.pending else {
+                return Err(HostError::BackendFault);
+            };
+            let PendingStreamKind::ReadPrepared { length } = pending.kind else {
+                return Err(HostError::BackendFault);
+            };
+            // Operation tokens are opaque, non-owning generations. A stale,
+            // duplicate, or cross-stream value fails closed without mutating the
+            // exact live reservation or poisoning unrelated managed instances.
+            if pending.token != operation {
+                return Err(HostError::BackendFault);
             }
-            // A terminal publisher won before the backend pop. Preserve the
-            // exact prepared token so the runtime's error path can cancel it
-            // once before reclaiming its known guest allocations.
-            StreamReceiveCommit::Closed(reason) => Err(closed_stream_error(reason)),
+            if !stream_read_shape(request.import(), self.reader_type)
+                || !matches!(request.arguments(), [CanonicalValue::Resource(_)])
+            {
+                lifecycle_fail_stop();
+                return Err(HostError::BackendFault);
+            }
+            let authority = self.borrow_authority(&request, StreamEndpoint::Reader)?;
+            let length = usize::from(length);
+
+            // All arena allocations precede the backend pop. After `commit`
+            // succeeds, filling both vectors and committing the response cannot
+            // allocate or fail.
+            let response = HostResponse::reserve_one(STREAM_READ_WORK)?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(length)
+                .map_err(|_| HostError::Exhausted)?;
+            bytes.resize(length, 0);
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(length)
+                .map_err(|_| HostError::Exhausted)?;
+
+            let committed = with_active_reader(self.instance, self.streams, |reader, _| {
+                reader
+                    .commit(operation, &mut bytes)
+                    .map_err(map_stream_error)
+            })??;
+            match committed {
+                StreamReceiveCommit::Received(received) => {
+                    // The backend pop consumed the reservation even if the
+                    // returned length violates our sealed prepared shape. Never
+                    // offer an already-published operation to exact cleanup.
+                    self.pending = None;
+                    if received != length {
+                        lifecycle_fail_stop();
+                        return Err(HostError::BackendFault);
+                    }
+                    for byte in bytes {
+                        values.push(CanonicalValue::U8(byte));
+                    }
+                    if !self.exact_authority(authority, StreamEndpoint::Reader) {
+                        lifecycle_fail_stop();
+                        return Err(HostError::BackendFault);
+                    }
+                    response.commit(CanonicalValue::List(values))
+                }
+                // A terminal publisher won before the backend pop. Preserve the
+                // exact prepared token so the runtime's error path can cancel it
+                // once before reclaiming its known guest allocations.
+                StreamReceiveCommit::Closed(reason) => Err(closed_stream_error(reason)),
+            }
+        };
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        {
+            with_managed_child_host_phase(profile_epoch, action)
+        }
+        #[cfg(not(feature = "wasm-c84-ssh-managed-child-phase-sidecar"))]
+        {
+            let mut action = action;
+            action()
         }
     }
 
     fn cancel(&mut self, operation: HostOperationToken) -> Result<(), HostError> {
-        let Some(pending) = self.pending else {
-            return Err(HostError::BackendFault);
-        };
-        if pending.token != operation {
-            return Err(HostError::BackendFault);
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        let profile_epoch = self.profile_epoch;
+        let action = || self.cancel_pending(operation);
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        {
+            with_managed_child_cancel_phase(profile_epoch, action)
         }
-        // Consume locally before touching the stable resource. Even an error
-        // cannot cause dispatcher Drop to issue a duplicate cancellation.
-        self.pending = None;
-        match pending.kind {
-            PendingStreamKind::ReadWaiting | PendingStreamKind::ReadPrepared { .. } => {
-                with_cleanup_reader(self.instance, self.streams, |reader| {
-                    reader.cancel(operation).map_err(map_stream_error)
-                })??
-            }
-            PendingStreamKind::WriteWaiting => {
-                with_cleanup_writer(self.instance, self.streams, |writer| {
-                    writer.cancel(operation).map_err(map_stream_error)
-                })??
-            }
+        #[cfg(not(feature = "wasm-c84-ssh-managed-child-phase-sidecar"))]
+        {
+            let mut action = action;
+            action()
         }
-        Ok(())
     }
 }
 
@@ -3192,18 +3351,13 @@ impl Drop for RegistryStreamDispatcher {
         let Some(pending) = self.pending.take() else {
             return;
         };
-        let cancelled = match pending.kind {
-            PendingStreamKind::ReadWaiting | PendingStreamKind::ReadPrepared { .. } => {
-                with_cleanup_reader(self.instance, self.streams, |reader| {
-                    reader.cancel(pending.token).map_err(map_stream_error)
-                })
-            }
-            PendingStreamKind::WriteWaiting => {
-                with_cleanup_writer(self.instance, self.streams, |writer| {
-                    writer.cancel(pending.token).map_err(map_stream_error)
-                })
-            }
-        };
+        // Destructor cleanup is also reachable when request cancellation
+        // drops a child whose diagnostic Wait is intentionally still open.
+        // It therefore consumes the backend token directly: opening a fresh
+        // Host guard here would turn that legal cancellation snapshot into a
+        // spurious forgotten-Wait fault. Successful runtime cancellation uses
+        // `HostDispatcher::cancel` above and remains lexically profiled.
+        let cancelled = self.cancel_exact_pending(pending);
         match cancelled {
             Ok(Ok(())) | Err(HostError::Denied) => {}
             Ok(Err(_))
@@ -3858,6 +4012,19 @@ async fn run_image_component(
     if mode.is_native_async() {
         return native_async_acceptance::run(key, token, task, domain, streams).await;
     }
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    if profile_epoch != 0 {
+        if crate::wasm_aot_profile_slot::managed_child_set_phase(profile_epoch, Phase::Validation)
+            .is_err()
+        {
+            return terminal_word(ComponentTerminal::RunnerFault);
+        }
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        crate::println!(
+            "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR CHILD_PHASE epoch={} phase=validation",
+            profile_epoch
+        );
+    }
     let Some(root) = root else {
         lifecycle_fail_stop();
         return terminal_word(ComponentTerminal::BackendFault);
@@ -3877,6 +4044,22 @@ async fn run_image_component(
     let Some((reader_type, writer_type)) = host_manifest.stream_resource_types() else {
         return terminal_word(ComponentTerminal::BackendFault);
     };
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    if profile_epoch != 0 {
+        if crate::wasm_aot_profile_slot::managed_child_set_phase(
+            profile_epoch,
+            Phase::Instantiation,
+        )
+        .is_err()
+        {
+            return terminal_word(ComponentTerminal::RunnerFault);
+        }
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        crate::println!(
+            "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR CHILD_PHASE epoch={} phase=instantiation",
+            profile_epoch
+        );
+    }
     // The engine is deliberately arena-owned. Sharing a static ProfileEngine
     // would let raw fault reclaim skip drops of wasmi Engine Arc clones and
     // monotonically inflate an external strong-reference count.
@@ -3915,7 +4098,14 @@ async fn run_image_component(
             Ok(writer) => writer,
             Err(_) => return terminal_word(ComponentTerminal::BudgetExceeded),
         };
-    let mut dispatcher = RegistryStreamDispatcher::new(token, streams, reader_type, writer_type);
+    let mut dispatcher = RegistryStreamDispatcher::new(
+        token,
+        streams,
+        reader_type,
+        writer_type,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        profile_epoch,
+    );
     let mut arguments = Vec::new();
     if arguments.try_reserve_exact(2).is_err() {
         return terminal_word(ComponentTerminal::BudgetExceeded);
@@ -3933,6 +4123,22 @@ async fn run_image_component(
         Ok(call) => call,
         Err(error) => return terminal_word(sync_error_terminal(error)),
     };
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    if profile_epoch != 0 {
+        if crate::wasm_aot_profile_slot::managed_child_set_phase(profile_epoch, Phase::Abi).is_err()
+        {
+            return terminal_word(ComponentTerminal::RunnerFault);
+        }
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        crate::println!(
+            "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR CHILD_PHASE epoch={} phase=abi",
+            profile_epoch
+        );
+    }
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+    let mut first_wait_reported = false;
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+    let mut epoch_two_host_pending_reported = false;
     #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
     let mut core_profile = SyncCallProfile::default();
     let value = loop {
@@ -3985,7 +4191,32 @@ async fn run_image_component(
                         return terminal_word(ComponentTerminal::RunnerFault);
                     }
                 };
-                if continuation.await.is_err() {
+                #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+                if profile_epoch != 0 {
+                    if crate::wasm_aot_profile_slot::managed_child_enter_wait(profile_epoch)
+                        .is_err()
+                    {
+                        return terminal_word(ComponentTerminal::RunnerFault);
+                    }
+                    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+                    if !first_wait_reported && core_profile.core_polls > 0 {
+                        crate::println!(
+                            "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR CHILD_WAIT epoch={} state=open first=1",
+                            profile_epoch
+                        );
+                        first_wait_reported = true;
+                    }
+                }
+                let consumed = continuation.await;
+                #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+                if profile_epoch != 0
+                    && consumed.is_ok()
+                    && crate::wasm_aot_profile_slot::managed_child_resume_from_wait(profile_epoch)
+                        .is_err()
+                {
+                    return terminal_word(ComponentTerminal::RunnerFault);
+                }
+                if consumed.is_err() {
                     lifecycle_fail_stop();
                     return terminal_word(ComponentTerminal::RunnerFault);
                 }
@@ -4016,7 +4247,45 @@ async fn run_image_component(
                     }
                     return terminal_word(host_error_terminal(error));
                 }
+                #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+                if profile_epoch != 0 {
+                    if crate::wasm_aot_profile_slot::managed_child_enter_wait(profile_epoch)
+                        .is_err()
+                    {
+                        return terminal_word(ComponentTerminal::RunnerFault);
+                    }
+                    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+                    {
+                        let delayed_stdin_pending =
+                            take_c84_delayed_stdin_pending(profile_epoch, operation);
+                        if !first_wait_reported && core_profile.core_polls > 0 {
+                            crate::println!(
+                                "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR CHILD_WAIT epoch={} state=open first=1",
+                                profile_epoch
+                            );
+                            first_wait_reported = true;
+                        }
+                        if profile_epoch == 2
+                            && first_wait_reported
+                            && delayed_stdin_pending
+                            && !epoch_two_host_pending_reported
+                        {
+                            crate::println!(
+                                "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR CHILD_HOST_PENDING epoch=2 state=open delayed_stdin=1"
+                            );
+                            epoch_two_host_pending_reported = true;
+                        }
+                    }
+                }
                 let consumed = continuation.await;
+                #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+                if profile_epoch != 0
+                    && consumed.is_ok()
+                    && crate::wasm_aot_profile_slot::managed_child_resume_from_wait(profile_epoch)
+                        .is_err()
+                {
+                    return terminal_word(ComponentTerminal::RunnerFault);
+                }
                 if !consumed.is_ok_and(|consumed| consumed.matches_token(continuation_token)) {
                     lifecycle_fail_stop();
                     return terminal_word(ComponentTerminal::RunnerFault);
@@ -4529,6 +4798,23 @@ fn start_image_instance_under_control(
         drop(control);
         return Err(input.abort_unpublished(ComponentTerminal::BackendFault));
     }
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    let parent_profile_epoch = if gate == StartPolicyGate::Sync
+        && mode == PayloadMode::CommandSync
+        && input.kind() == ControlStartKind::ManagedSync
+    {
+        match crate::wasm_aot_profile_slot::managed_current_parent_set_instantiation() {
+            Ok(Some(epoch)) => epoch,
+            Ok(None) | Err(_) => {
+                lifecycle_fail_stop();
+                system.restore();
+                drop(control);
+                return Err(input.abort_unpublished(ComponentTerminal::RunnerFault));
+            }
+        }
+    } else {
+        0
+    };
     let Some(key) = control.reserve(&CONTROL) else {
         system.restore();
         drop(control);
@@ -4634,7 +4920,18 @@ fn start_image_instance_under_control(
         && input.kind() == ControlStartKind::ManagedSync
     {
         match crate::wasm_aot_profile_slot::attach_current_request_managed_child(&mut batch, 0) {
-            Ok(Some(epoch)) => {
+            Ok(Some(epoch))
+                if {
+                    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+                    {
+                        epoch == parent_profile_epoch
+                    }
+                    #[cfg(not(feature = "wasm-c84-ssh-managed-child-phase-sidecar"))]
+                    {
+                        true
+                    }
+                } =>
+            {
                 #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
                 if crate::wasm_aot_profile_slot::record_managed_child_bound(epoch).is_ok() {
                     crate::println!(
@@ -4644,7 +4941,7 @@ fn start_image_instance_under_control(
                 }
                 epoch
             }
-            Ok(None) | Err(_) => {
+            Ok(Some(_)) | Ok(None) | Err(_) => {
                 control
                     .exact_mut(key)
                     .expect("reserved control slot exists")

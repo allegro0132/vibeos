@@ -321,13 +321,15 @@ python3 -B scripts/verify-c84-ssh-managed-child-core.py --selftest --check-sourc
 ./scripts/qemu-c84-ssh-managed-child-core-test.sh
 ```
 
-Successful epochs 1, 2, and 4 each freeze exactly 1,167 real Core polls,
-1,167 observer pairs, and 1,241 typed polls. Those are control-flow counts from
-the isolated QEMU image, not target timing or formal profile evidence; they do
-not replace the distinct frozen preparation preflight. Epoch 3 is killed after
-its first ordinary Core pair. Its real executor callback reports `Exited`
-after 29 closed observer pairs, while the missing successful-driver bit keeps
-release false and produces exact `CHILD_ABANDONED + CHILD_DETACHED` faults.
+The standalone gate preserves its original exact 19-marker managed-child/Core
+transcript. Successful epochs 1, 2, and 4 each freeze exactly 1,167 real Core
+polls, 1,167 observer pairs, and 1,241 typed polls. Those are control-flow
+counts from the isolated QEMU image, not target timing or formal profile
+evidence; they do not replace the distinct frozen preparation preflight.
+Epoch 3 is killed after its first ordinary Core pair. Its real executor
+callback reports `Exited` after 29 closed observer pairs, while the missing
+successful-driver bit keeps release false and produces exact
+`CHILD_ABANDONED + CHILD_DETACHED` faults.
 The parent still cancels and acknowledges the epoch, an immediate readiness
 probe succeeds, and epoch 4 proves post-Drop reuse.
 
@@ -337,6 +339,69 @@ default-off; QEMU acceptance contributes only guarded transition telemetry and
 is integration evidence. There is still no Host/Wait/Cleanup sidecar, IRQ
 composition, `finish`, verified stream, schema publisher, collector, physical
 Milk-V Duo sample, or AOT decision.
+
+## Managed-child and SSH phase sidecar seam
+
+The default-off `wasm-c84-ssh-managed-child-phase-sidecar` feature adds the
+next diagnostic layer without changing the request parent's terminal authority.
+At the exact current-policy, authenticated, synchronous, unparameterized
+`case-filter` route, the parent first records Instantiation during preparation,
+then the real child records Validation, Instantiation, and ABI. Ordinary Core
+polls remain lexical Interpretation overlays. The child dispatcher opens a
+non-`Send` Host guard around each synchronous start, wake registration, resume,
+prepared commit, and explicit cancellation; every guard must close before the
+caller can suspend. Destructor cleanup deliberately does not fabricate Host
+while a request cancellation is snapshotting a legal open Wait.
+
+Child Wait is independent of its resumable base phase. Immediately before each
+real continuation `.await`, the driver stores only its copyable epoch and opens
+Wait. A successful resume first revalidates the current prepared-task seal and
+restores ABI or Cleanup before doing more work. An active request cancellation
+may retain an open Wait as diagnostic state; a successful completion may not.
+The parent has a separate Wait bit: `sshd` marks each managed transport, bridge,
+protocol, stdin, stdout, and response-drain turn as Host, and marks real
+execution, cancellation, cooperation, and shutdown suspension points as Wait.
+Both owners may therefore be waiting at once without borrowing either lease
+across an await.
+
+`ProfileClock::cleanup_started` is a default no-op portable hook and is stored
+once per typed call only when the C8.4 runtime hooks are selected. On a normal
+call it fires after the next outer-poll start tick and before canonical cleanup
+work; a preconstructed terminal or direct trap receives the same exactly-once
+diagnostic edge before resource closure or the outer finish sample. The managed
+clock irreversibly latches Cleanup. Release requires Cleanup, closed child
+Wait/Host/Core, and the exact successful driver word. The SSH response further
+requires the clean `Exited` detach and a closed parent Wait. It still consumes
+the parent only through `cancel -> exact rejection -> acknowledge once ->
+Ready(next_epoch)`; no result is finished or retained.
+
+The independent source and single-hart OpenSSH gates are:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-phase-sidecar.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-phase-sidecar-test.sh
+```
+
+The composed QEMU image still strictly parses exactly 19 ordered
+managed-child/Core-family markers. Normal epochs 1 and 4 retain the standalone
+counts of 1,167 Core polls, 1,167 observer pairs, and 1,241 typed polls. Epoch 2
+writes only the first 257 stdin bytes before waiting for the real guest
+HostPending marker, so its frozen combined-image counts are exactly 1,171 Core
+polls, 1,171 observer pairs, and 1,251 typed polls: Core increases by 4 and
+typed polls by 10. The standalone gate and its transcript remain unchanged.
+Epoch 3 is killed at a child Wait that follows the first ordinary Core pair;
+the open Wait is accepted only on the diagnostic Drop path, with no release and
+the exact abandoned/detached faults. Normal epochs require ordered Validation
+-> Instantiation -> ABI -> Cleanup, paired child Host/Core/Wait edges, paired
+nonzero parent Host/Wait observations, clean detach, response, and post-Drop
+epoch reuse. Parent transport counts are scheduler/network dependent and are
+checked relationally, not frozen as target timing evidence.
+
+This closes only the roadmap's real Host/Wait/Cleanup composition gap. The base
+feature is silent and remains available to the Milk-V build as a compile-time
+seam, not physical evidence. IRQ composition, `finish`, verified streaming,
+schema publication, collection, physical-Duo sampling, and the AOT decision
+remain later nodes.
 
 ## Decision rule
 

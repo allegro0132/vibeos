@@ -73,6 +73,12 @@ wasm-c84-ssh-managed-child-core-qemu-acceptance = [
     "vibeos-kernel/ssh-test",
     "vibeos-kernel/wasm-c84-ssh-managed-child-core-qemu-acceptance",
 ]
+# Single-hart diagnostic composition of the exact predecessor transcript with
+# the parent/child Host, Wait, and Cleanup phase sidecar.
+wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-core-qemu-acceptance",
+    "vibeos-kernel/wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance",
+]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = [
     "vibeos-kernel/ssh-test",

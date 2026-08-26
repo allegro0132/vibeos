@@ -326,10 +326,12 @@ python3 -B scripts/verify-c84-ssh-managed-child-core.py --selftest --check-sourc
 ./scripts/qemu-c84-ssh-managed-child-core-test.sh
 ```
 
-For identical successful requests at epochs 1, 2, and 4, the gate freezes
-1,167 real Core polls, 1,167 observer pairs, and 1,241 typed polls. These are
-QEMU control-flow counts, distinct from the preparation preflight above and
-not timing evidence. Epoch 3 is killed only after the first ordinary Core pair;
+The standalone gate preserves its original exact 19-marker managed-child/Core
+transcript. For identical successful requests at epochs 1, 2, and 4, it
+freezes 1,167 real Core polls, 1,167 observer pairs, and 1,241 typed polls.
+These are QEMU control-flow counts, distinct from the preparation preflight
+above and not timing evidence. Epoch 3 is killed only after the first ordinary
+Core pair;
 the actual executor detach is `Exited` after 29 closed pairs, with no release
 and exact `abandoned + detached` faults. The parent then performs the same
 cancel/ack closure, an immediate readiness probe succeeds, and epoch 4 proves
@@ -337,6 +339,46 @@ post-Drop reuse. QEMU acceptance adds only guarded transition telemetry. This
 node deliberately does not add Host/Wait/Cleanup sidecars, combine the IRQ
 overlay, call `finish`, expose a verified stream or publisher, or produce
 schema, collector, physical Milk-V Duo, or AOT-decision evidence.
+
+The default-off `wasm-c84-ssh-managed-child-phase-sidecar` feature extends that
+same exact target with diagnostic Host, Wait, and Cleanup ownership. The parent
+records each real managed SSH pump/transport turn as Host and each execution,
+cooperation, cancellation, response-drain, or shutdown suspension as Wait. The
+child independently records Validation, Instantiation, and ABI; synchronous
+stream-dispatch methods use an explicit non-`Send` Host guard, while each real
+continuation await opens a copy-epoch Wait and revalidates the prepared task
+before restoring ABI or Cleanup. Parent and child Wait bits are independent.
+
+The portable runtime's default-no-op `cleanup_started` callback fires at most
+once per typed call. The managed clock latches Cleanup before canonical cleanup
+work, and a normal release requires closed child Wait/Host/Core plus that latch.
+Response additionally requires clean `Exited` and a closed parent Wait. Request
+Drop may preserve an open Wait as diagnostic state, but cannot acquire an extra
+phase fault; forgotten Host, stale successful Wait, missing Cleanup, or a late
+phase transition fails closed. The parent still cancels and acknowledges rather
+than finishing or streaming the sample.
+
+Run the source and live integration gates with:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-phase-sidecar.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-phase-sidecar-test.sh
+```
+
+The combined one-hart OpenSSH gate still strictly parses exactly 19 ordered
+managed-child/Core-family markers. Epochs 1 and 4 retain the standalone normal
+counts of 1,167 Core polls, 1,167 observer pairs, and 1,241 typed polls. Epoch 2
+writes only the first 257 stdin bytes before waiting for the real HostPending
+marker, so its frozen combined-image counts are exactly 1,171 Core polls,
+1,171 observer pairs, and 1,251 typed polls: Core increases by 4 and typed polls
+by 10. This combined workload does not change the standalone gate's transcript.
+The gate kills epoch 3 while the post-Core child Wait is open, immediately
+probes readiness, and reuses epoch 4. Successful epochs require ordered child
+phases, exactly one Cleanup, paired child Host/Core/Wait observations,
+relationally paired nonzero parent Host/Wait observations, clean detach, and
+response closure. Dynamic parent counts are not timing evidence. This node adds
+no IRQ composition, `finish`, verified stream, publisher, collector, physical
+Milk-V Duo sample, or AOT decision.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

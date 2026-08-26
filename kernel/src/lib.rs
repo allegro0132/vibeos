@@ -89,6 +89,24 @@ compile_error!("feature `wasm-c84-ssh-request-parent-qemu-acceptance` is QEMU-on
 compile_error!("feature `wasm-c84-ssh-managed-child-core-qemu-acceptance` is QEMU-only");
 
 #[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
+
+#[cfg(all(
     feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance",
     any(
         feature = "wasm-c48-qemu-acceptance",

@@ -38,6 +38,8 @@ CHILD_FEATURE = "wasm-c84-profile-child-delegation"
 CORE_FEATURE = "wasm-c84-core-poll-observer"
 IRQ_FEATURE = "wasm-c84-profile-irq-overlay"
 PHASE_SIDECAR_FEATURE = "wasm-c84-ssh-managed-child-phase-sidecar"
+FINISH_FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
+FINISH_QEMU_FEATURE = f"{FINISH_FEATURE}-qemu-acceptance"
 
 
 class VerificationError(Exception):
@@ -943,6 +945,8 @@ def verify_slot(source: str) -> tuple[Scope, ...]:
 
 
 def verify_ssh(source: str) -> tuple[Scope, Scope, Scope]:
+    source = without_direct_feature_units(source, FINISH_FEATURE)
+    source = without_direct_feature_units(source, FINISH_QEMU_FEATURE)
     owner = find_scope(source, r"\bimpl\s+SshExecProfileOwner\b", "SSH profile owner")
     response = find_function(owner, "response_boundary", "SSH response boundary")
     cancel = find_function(owner, "cancel", "SSH request Drop/cancel")

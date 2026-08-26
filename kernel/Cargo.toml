@@ -299,6 +299,21 @@ wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance = [
     "wasm-c84-ssh-managed-child-irq-overlay",
     "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance",
 ]
+# Default-off terminal promotion for the exact authenticated SSH owner. A
+# successful response now finishes and verifies the sample, explicitly
+# discards the zero-cursor stream, validates the stored abandonment rejection,
+# acknowledges it once, and returns the slot to Ready. No stream or publisher
+# authority leaves the kernel adapter.
+wasm-c84-ssh-managed-child-finish-verify = [
+    "wasm-c84-ssh-managed-child-irq-overlay",
+]
+# Single-hart OpenSSH proof for the finish/verify/discard terminal path. The
+# predecessor QEMU image remains separately selectable with its original
+# cancel-only response transcript.
+wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-finish-verify",
+    "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

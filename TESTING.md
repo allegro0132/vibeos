@@ -44,6 +44,8 @@ python3 -B scripts/verify-c84-ssh-managed-child-phase-sidecar.py --selftest --ch
 ./scripts/qemu-c84-ssh-managed-child-phase-sidecar-test.sh # C8.4 parent/child phase sidecar gate
 python3 -B scripts/verify-c84-ssh-managed-child-irq-overlay.py --selftest --check-source
 ./scripts/qemu-c84-ssh-managed-child-irq-overlay-test.sh # C8.4 parent/child causal self-SSIP gate
+python3 -B scripts/verify-c84-ssh-managed-child-finish-verify.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-finish-verify-test.sh # C8.4 response finish/verify/discard gate
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
@@ -427,6 +429,47 @@ only as a compile-time seam. This single-hart QEMU result is causal integration
 evidence, not timer/PLIC coverage, target timing, physical-Duo evidence, a
 verified profile, or an AOT decision. The parent still cancels: this node adds
 no `finish`, verified stream, schema publisher, or collector.
+
+The next default-off
+`wasm-c84-ssh-managed-child-finish-verify` successor changes only the terminal
+policy of successful profiled responses. After the existing child Cleanup,
+release, and exact Exited detach checks, epochs 1, 2, and 4 consume the parent
+`RunLease` with `finish`. The slot closes the target, runs the independent
+`TargetFinished::verify` rescan, and installs `TargetVerified` at cursor zero.
+The SSH adapter then explicitly discards that `StreamLease` without calling
+`summary`, `next_interval`, or `complete`; it checks the exact
+`StreamAbandoned` report with `intervals_emitted=0`, compares the independently
+stored rejection, acknowledges it once, and proves `Ready(next_epoch)`.
+
+Epoch 3 deliberately retains the predecessor active-Drop contract: kill after
+the real child Wait-open edge, observe abandoned+detached with Exited, cancel
+with `LeaseCancelled`, acknowledge once, prove `Ready(4)`, and reuse epoch 4.
+Nonzero status, an unready child, or stale policy is cancelled and recycled
+before finish; a target finish/verify rejection is also acknowledged before
+the response fails so the global slot is not stranded.
+
+Run the incremental source and live integration gates with:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-finish-verify.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-finish-verify-test.sh
+```
+
+The live peer reuses the exact four-request OpenSSH workload, including the
+epoch-2 257-byte delayed-stdin `HostPending` edge, epoch-3 active kill,
+immediate readiness probe, and epoch-4 replacement. In the successor image the
+normal RESPONSE suffix of the phase, Core, request, and IRQ families becomes
+`finish=1 verify=1 discard=stream_abandoned ack=1`; their nonterminal markers,
+epoch-3 DROP lines, counts (27/28 phase, 19 Core, eight request, six IRQ), and
+cross-family order remain frozen. The new family contributes exactly four
+last-in-chain terminals: RESPONSE for epochs 1, 2, and 4 and DROP for epoch 3.
+The separately built predecessor IRQ gate remains byte-for-byte cancel-only
+and runs first in CI.
+
+This proves only the target finish/independent-verify transition and deliberate
+zero-cursor discard/recycle on one QEMU hart. It does not consume or validate a
+profile stream, publish a summary or schema, retain evidence, run a collector,
+produce physical Milk-V Duo evidence, or make the AOT decision.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

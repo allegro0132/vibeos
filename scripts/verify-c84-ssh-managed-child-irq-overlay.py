@@ -30,6 +30,8 @@ PHASE_QEMU_FEATURE = f"{PHASE_FEATURE}-qemu-acceptance"
 IRQ_FEATURE = "wasm-c84-profile-irq-overlay"
 IRQ_QEMU_FEATURE = f"{IRQ_FEATURE}-qemu-acceptance"
 FAMILY = "WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY"
+FINISH_FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
+FINISH_QEMU_FEATURE = f"{FINISH_FEATURE}-qemu-acceptance"
 
 
 def load_phase_verifier():
@@ -352,7 +354,10 @@ def verify_direct_acceptance_units(inputs: Inputs) -> None:
     sources = (
         ("slot", inputs.phase.slot, 11, 16),
         ("SSH", inputs.phase.ssh, 7, 8),
-        ("kernel root", inputs.phase.kernel_root, 0, 3),
+        # The fourth all-form reference is the finish/verify successor's
+        # fail-closed pairing guard; it prevents that base behavior from being
+        # combined with this gate's legacy cancel telemetry.
+        ("kernel root", inputs.phase.kernel_root, 0, 4),
         ("trap", inputs.trap, 0, 2),
     )
     all_units: list[str] = []
@@ -794,6 +799,8 @@ def verify_acceptance_slot(source: str) -> None:
 
 
 def verify_ssh(source: str) -> None:
+    source = CORE.without_direct_feature_units(source, FINISH_FEATURE)
+    source = CORE.without_direct_feature_units(source, FINISH_QEMU_FEATURE)
     backend = find_scope(
         source,
         r"\bimpl\s+SshExecProfileRunBackend\s+for\s+SshExecProfileOwner\b",

@@ -28,6 +28,8 @@ FEATURE = "c84-profile-request-parent"
 KERNEL_FEATURE = "wasm-c84-ssh-request-parent"
 QEMU_FEATURE = "wasm-c84-ssh-request-parent-qemu-acceptance"
 QEMU_FAMILY = "WASM_C84_SSH_REQUEST_PARENT"
+FINISH_FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
+FINISH_QEMU_FEATURE = f"{FINISH_FEATURE}-qemu-acceptance"
 
 
 class VerificationError(Exception):
@@ -186,6 +188,83 @@ def semantic(value: str) -> str:
     """Return compact Rust with comments removed and literals retained."""
 
     return compact(rust_mask(value, literals=False))
+
+
+def without_direct_feature_units(source: str, feature: str) -> str:
+    """Mask only syntax units guarded by one direct, exact feature cfg."""
+
+    masked = rust_mask(source, literals=False)
+    attribute = re.compile(
+        rf'#\s*\[\s*cfg\s*\(\s*feature\s*=\s*"{re.escape(feature)}"\s*\)\s*\]'
+    )
+    spans: list[tuple[int, int]] = []
+
+    def matching(opening: int, left: str, right: str) -> int:
+        depth = 0
+        for cursor in range(opening, len(masked)):
+            if masked[cursor] == left:
+                depth += 1
+            elif masked[cursor] == right:
+                depth -= 1
+                if depth == 0:
+                    return cursor + 1
+        raise VerificationError(f"unbalanced {left}{right} after direct {feature} cfg")
+
+    for match in attribute.finditer(masked):
+        cursor = match.end()
+        while cursor < len(masked) and masked[cursor].isspace():
+            cursor += 1
+        require(cursor < len(masked), f"direct {feature} cfg has no syntax unit")
+        while masked.startswith("#[", cursor):
+            cursor = matching(cursor + 1, "[", "]")
+            while cursor < len(masked) and masked[cursor].isspace():
+                cursor += 1
+
+        parens = brackets = braces = 0
+        first_brace = -1
+        end = -1
+        index = cursor
+        while index < len(masked):
+            character = masked[index]
+            if character == "(":
+                parens += 1
+            elif character == ")":
+                parens -= 1
+            elif character == "[":
+                brackets += 1
+            elif character == "]":
+                brackets -= 1
+            elif character == "{":
+                if parens == 0 and brackets == 0 and braces == 0 and first_brace < 0:
+                    first_brace = index
+                braces += 1
+            elif character == "}":
+                braces -= 1
+                if braces == 0 and first_brace >= 0 and parens == 0 and brackets == 0:
+                    end = index + 1
+                    probe = end
+                    while probe < len(masked) and masked[probe].isspace():
+                        probe += 1
+                    if probe < len(masked) and masked[probe] == ";":
+                        end = probe + 1
+                    break
+            elif character in ";," and parens == 0 and brackets == 0 and braces == 0:
+                end = index + 1
+                break
+            require(
+                parens >= 0 and brackets >= 0 and braces >= 0,
+                f"unbalanced syntax unit after direct {feature} cfg",
+            )
+            index += 1
+        require(end >= 0, f"direct {feature} cfg syntax unit is unterminated")
+        spans.append((match.start(), end))
+
+    output = list(source)
+    for start, end in spans:
+        for cursor in range(start, end):
+            if output[cursor] not in "\r\n":
+                output[cursor] = " "
+    return "".join(output)
 
 
 def ordered(scope: str, needles: list[str], label: str) -> None:
@@ -491,7 +570,11 @@ def verify_kernel(source: str, root_source: str, manifest: bytes) -> None:
         ')))]compile_error!("C8.4QEMUacceptancesareisolatedimages");'
     )
     require(isolated in root_code, "request-parent telemetry is not isolated from other C8.4 acceptances")
-    production = source
+    # The committed request-parent contract remains cancel-only. Ignore only
+    # syntax units directly guarded by the exact finish/verify successor; broad
+    # or indirect cfg forms remain visible and therefore fail predecessor checks.
+    production = without_direct_feature_units(source, FINISH_FEATURE)
+    production = without_direct_feature_units(production, FINISH_QEMU_FEATURE)
 
     prepare_impl = find_scope(
         production,
@@ -678,16 +761,37 @@ def verify(inputs: Inputs) -> None:
     verify_kernel(inputs.kernel, inputs.kernel_root, inputs.kernel_manifest)
 
 
-EXPECTED_QEMU_MARKERS = [
-    "WASM_C84_SSH_REQUEST_PARENT START epoch=1",
-    "WASM_C84_SSH_REQUEST_PARENT RESPONSE epoch=1 status=0 cancel=1 ack=1 ready_epoch=2",
-    "WASM_C84_SSH_REQUEST_PARENT START epoch=2",
-    "WASM_C84_SSH_REQUEST_PARENT RESPONSE epoch=2 status=0 cancel=1 ack=1 ready_epoch=3",
-    "WASM_C84_SSH_REQUEST_PARENT START epoch=3",
-    "WASM_C84_SSH_REQUEST_PARENT DROP epoch=3 cancel=1 ack=1 ready_epoch=4",
-    "WASM_C84_SSH_REQUEST_PARENT START epoch=4",
-    "WASM_C84_SSH_REQUEST_PARENT RESPONSE epoch=4 status=0 cancel=1 ack=1 ready_epoch=5",
-]
+LEGACY_CANCEL = "legacy-cancel"
+FINISH_VERIFY = "finish-verify"
+
+
+def response_terminal_suffix(terminal_mode: str) -> str:
+    require(
+        terminal_mode in (LEGACY_CANCEL, FINISH_VERIFY),
+        f"unknown request-parent terminal mode: {terminal_mode!r}",
+    )
+    if terminal_mode == LEGACY_CANCEL:
+        return "cancel=1 ack=1"
+    return "finish=1 verify=1 discard=stream_abandoned ack=1"
+
+
+def expected_qemu_markers(terminal_mode: str = LEGACY_CANCEL) -> list[str]:
+    suffix = response_terminal_suffix(terminal_mode)
+    return [
+        "WASM_C84_SSH_REQUEST_PARENT START epoch=1",
+        f"WASM_C84_SSH_REQUEST_PARENT RESPONSE epoch=1 status=0 {suffix} ready_epoch=2",
+        "WASM_C84_SSH_REQUEST_PARENT START epoch=2",
+        f"WASM_C84_SSH_REQUEST_PARENT RESPONSE epoch=2 status=0 {suffix} ready_epoch=3",
+        "WASM_C84_SSH_REQUEST_PARENT START epoch=3",
+        "WASM_C84_SSH_REQUEST_PARENT DROP epoch=3 cancel=1 ack=1 ready_epoch=4",
+        "WASM_C84_SSH_REQUEST_PARENT START epoch=4",
+        f"WASM_C84_SSH_REQUEST_PARENT RESPONSE epoch=4 status=0 {suffix} ready_epoch=5",
+    ]
+
+
+# Compatibility export for every already-committed predecessor gate. Successor
+# peers opt into FINISH_VERIFY explicitly and cannot mutate this frozen list.
+EXPECTED_QEMU_MARKERS = expected_qemu_markers()
 
 
 def normalize_serial_line(line: str) -> str:
@@ -695,7 +799,7 @@ def normalize_serial_line(line: str) -> str:
     return line[len(clear) :] if line.startswith(clear) else line
 
 
-def verify_qemu_transcript(raw: bytes) -> None:
+def verify_qemu_transcript(raw: bytes, terminal_mode: str = LEGACY_CANCEL) -> None:
     transcript = raw.decode("utf-8", errors="replace").replace("\r", "\n")
     lines = [normalize_serial_line(line) for line in transcript.splitlines()]
     require(
@@ -707,8 +811,9 @@ def verify_qemu_transcript(raw: bytes) -> None:
         "QEMU guest reported a panic or fatal error",
     )
     family = [line for line in lines if QEMU_FAMILY in line]
+    expected = expected_qemu_markers(terminal_mode)
     require(
-        family == EXPECTED_QEMU_MARKERS,
+        family == expected,
         f"QEMU request-parent marker sequence differs: observed={family!r}",
     )
 
@@ -731,7 +836,31 @@ def run_transcript_selftest() -> int:
         except VerificationError:
             continue
         raise VerificationError(f"QEMU transcript selftest mutation {index} was accepted")
-    return len(mutations)
+
+    successor_markers = expected_qemu_markers(FINISH_VERIFY)
+    successor = "\n".join(["boot", *successor_markers, "listener rearmed", ""])
+    verify_qemu_transcript(successor.encode(), FINISH_VERIFY)
+    successor_mutations = [
+        successor.replace("finish=1 verify=1", "finish=1 verify=0", 1),
+        successor.replace("discard=stream_abandoned", "discard=complete", 1),
+        successor.replace(successor_markers[3], EXPECTED_QEMU_MARKERS[3], 1),
+        successor.replace(successor_markers[5], successor_markers[5].replace("cancel=1", "finish=1"), 1),
+    ]
+    for index, mutation in enumerate(successor_mutations, start=1):
+        try:
+            verify_qemu_transcript(mutation.encode(), FINISH_VERIFY)
+        except VerificationError:
+            continue
+        raise VerificationError(
+            f"successor QEMU transcript selftest mutation {index} was accepted"
+        )
+    try:
+        verify_qemu_transcript(successor.encode(), LEGACY_CANCEL)
+    except VerificationError:
+        pass
+    else:
+        raise VerificationError("legacy terminal mode accepted the successor transcript")
+    return len(mutations) + len(successor_mutations) + 1
 
 
 def replace_once(value: str, old: str, new: str, label: str) -> str:
@@ -894,11 +1023,33 @@ def run_selftest(inputs: Inputs) -> int:
         ),
         (
             "kernel-stored-rejection-forged",
-            lambda data: Inputs(data.sshd, data.sshd_manifest, replace_once(data.kernel, "let stored_rejection_is_exact = rejection() == Some(report);", "let stored_rejection_is_exact = true;", "stored-rejection"), data.kernel_manifest),
+            lambda data: Inputs(
+                data.sshd,
+                data.sshd_manifest,
+                replace_once(
+                    data.kernel,
+                    "let stored_rejection_is_exact = rejection() == Some(report);\n"
+                    "    // A successful cancel has already installed one diagnostic rejection.",
+                    "let stored_rejection_is_exact = true;\n"
+                    "    // A successful cancel has already installed one diagnostic rejection.",
+                    "stored-rejection",
+                ),
+                data.kernel_manifest,
+            ),
         ),
         (
             "kernel-ack-removed",
-            lambda data: Inputs(data.sshd, data.sshd_manifest, replace_once(data.kernel, "acknowledge_rejection(", "forget_rejection(", "kernel-ack"), data.kernel_manifest),
+            lambda data: Inputs(
+                data.sshd,
+                data.sshd_manifest,
+                replace_once(
+                    data.kernel,
+                    "let acknowledged = acknowledge_rejection(epoch).map_err(|_| ())?;",
+                    "let acknowledged = forget_rejection(epoch).map_err(|_| ())?;",
+                    "kernel-ack",
+                ),
+                data.kernel_manifest,
+            ),
         ),
         ("kernel-permit-to-run-reboxed", rebox_permit_to_run),
         ("request-parent-qemu-only-guard-removed", remove_qemu_only_guard),

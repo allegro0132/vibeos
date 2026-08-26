@@ -33,6 +33,8 @@ EXPECTED_CORE_POLLS = 1167
 EXPECTED_TYPED_POLLS = 1241
 EXPECTED_DROP_DETACH = "exited"
 EXPECTED_DROP_OBSERVER_PAIRS = 29
+LEGACY_CANCEL = "legacy-cancel"
+FINISH_VERIFY = "finish-verify"
 
 
 def load_peer():
@@ -70,6 +72,32 @@ class DropObservation:
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise DriverError(message)
+
+
+def response_terminal_suffix(terminal_mode: str) -> str:
+    require(
+        terminal_mode in (LEGACY_CANCEL, FINISH_VERIFY),
+        f"unknown managed-child/Core terminal mode: {terminal_mode!r}",
+    )
+    if terminal_mode == LEGACY_CANCEL:
+        return "cancel=1 ack=1"
+    return "finish=1 verify=1 discard=stream_abandoned ack=1"
+
+
+def normal_response_line(
+    epoch: int,
+    terminal_mode: str = LEGACY_CANCEL,
+    *,
+    core_polls: int = EXPECTED_CORE_POLLS,
+    typed_polls: int = EXPECTED_TYPED_POLLS,
+) -> str:
+    return (
+        f"{FAMILY} RESPONSE epoch={epoch} status=0 claim=1 release=1 "
+        f"detach=exited clean=1 core_polls={core_polls} "
+        f"observer_pairs={core_polls} typed_polls={typed_polls} "
+        f"observer_closed=1 {response_terminal_suffix(terminal_mode)} "
+        f"ready_epoch={epoch + 1}"
+    )
 
 
 def normalized_log(path: Path) -> str:
@@ -208,7 +236,11 @@ def inert_probes(arguments: argparse.Namespace, ssh: str) -> None:
     require_unchanged_family(arguments.qemu_log, before, "inert SSH probes")
 
 
-def parse_normal_transaction(lines: list[str], epoch: int) -> NormalObservation:
+def parse_normal_transaction(
+    lines: list[str],
+    epoch: int,
+    terminal_mode: str = LEGACY_CANCEL,
+) -> NormalObservation:
     fixed = [
         f"{FAMILY} BIND epoch={epoch} child_index=0 before_publish=1",
         f"{FAMILY} CLAIM epoch={epoch} child_index=0 first_poll=1",
@@ -217,12 +249,7 @@ def parse_normal_transaction(lines: list[str], epoch: int) -> NormalObservation:
     ]
     require(len(lines) == 5, f"normal epoch {epoch} marker count differs: {lines!r}")
     require(lines[:4] == fixed, f"normal epoch {epoch} transition sequence differs: {lines!r}")
-    expected_response = (
-        f"{FAMILY} RESPONSE epoch={epoch} status=0 claim=1 release=1 "
-        f"detach=exited clean=1 core_polls={EXPECTED_CORE_POLLS} "
-        f"observer_pairs={EXPECTED_CORE_POLLS} typed_polls={EXPECTED_TYPED_POLLS} "
-        f"observer_closed=1 cancel=1 ack=1 ready_epoch={epoch + 1}"
-    )
+    expected_response = normal_response_line(epoch, terminal_mode)
     require(
         lines[4] == expected_response,
         f"normal epoch {epoch} RESPONSE marker differs: {lines[4]!r}",
@@ -262,6 +289,7 @@ def normal_profiled_request(
     epoch: int,
     *,
     await_readiness: bool = True,
+    terminal_mode: str = LEGACY_CANCEL,
 ) -> NormalObservation:
     if await_readiness:
         wait_ready(arguments, ssh)
@@ -292,7 +320,7 @@ def normal_profiled_request(
     )
     after = family_markers(arguments.qemu_log)
     require(after[: len(before)] == before, f"normal epoch {epoch} rewrote prior markers")
-    return parse_normal_transaction(after[len(before) :], epoch)
+    return parse_normal_transaction(after[len(before) :], epoch, terminal_mode)
 
 
 def active_drop_request(
@@ -370,16 +398,21 @@ def post_drop_readiness(arguments: argparse.Namespace, ssh: str) -> None:
 
 def verify_closed_sequence(
     path: Path,
+    terminal_mode: str = LEGACY_CANCEL,
 ) -> tuple[list[NormalObservation], DropObservation]:
     markers = family_markers(path)
     cursor = 0
     normal: list[NormalObservation] = []
     for epoch in (1, 2):
-        normal.append(parse_normal_transaction(markers[cursor : cursor + 5], epoch))
+        normal.append(
+            parse_normal_transaction(markers[cursor : cursor + 5], epoch, terminal_mode)
+        )
         cursor += 5
     dropped = parse_drop_transaction(markers[cursor : cursor + 4], 3)
     cursor += 4
-    normal.append(parse_normal_transaction(markers[cursor : cursor + 5], 4))
+    normal.append(
+        parse_normal_transaction(markers[cursor : cursor + 5], 4, terminal_mode)
+    )
     cursor += 5
     require(
         cursor == len(markers),
@@ -429,7 +462,26 @@ def run_parser_selftest() -> int:
         except DriverError:
             continue
         raise DriverError(f"parser selftest mutation {index} was accepted")
-    return len(mutations)
+    successor = [*normal[:-1], normal_response_line(1, FINISH_VERIFY)]
+    parse_normal_transaction(successor, 1, FINISH_VERIFY)
+    successor_mutations = [
+        [*successor[:-1], successor[-1].replace("verify=1", "verify=0", 1)],
+        [*successor[:-1], successor[-1].replace("discard=stream_abandoned", "discard=complete", 1)],
+        normal,
+    ]
+    for index, lines in enumerate(successor_mutations, start=1):
+        try:
+            parse_normal_transaction(lines, 1, FINISH_VERIFY)
+        except DriverError:
+            continue
+        raise DriverError(f"successor parser selftest mutation {index} was accepted")
+    try:
+        parse_normal_transaction(successor, 1, LEGACY_CANCEL)
+    except DriverError:
+        pass
+    else:
+        raise DriverError("legacy Core terminal mode accepted the successor RESPONSE")
+    return len(mutations) + len(successor_mutations) + 1
 
 
 def parser() -> argparse.ArgumentParser:

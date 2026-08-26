@@ -6,9 +6,11 @@
 //! [`Active`] and [`Finished`]. Only an independently rescanned [`Verified`]
 //! handle exposes a publishable summary or interval iterator. Rejected and
 //! unverified samples can only be inspected as diagnostics and recycled.
-//! These raw ledger primitives do not establish target identity or topology;
-//! a formal target publisher must accept only [`TargetVerified`], which is
-//! obtainable only through the target-session facade.
+//! These raw ledger primitives do not establish target identity or topology.
+//! The allocation-free [`ProfilePublisher`] implemented here accepts only
+//! [`TargetVerified`], which is obtainable only through the target-session
+//! facade. This boundary validates one SAMPLE's shape; it does not itself
+//! establish live provenance or close a multi-record transcript.
 //!
 //! Every handle is linearly owned. It may move with one exclusive `Send`
 //! future, but cannot be shared through `Sync`; moving ownership does not
@@ -68,7 +70,15 @@
 
 #![no_std]
 
+mod publisher;
 mod target;
+
+pub use publisher::{
+    BindingError, Challenge, EligibleTerminalEvidence, PoisonedPublisher, PreflightError,
+    PreflightFailure, ProfilePublisher, ProfileRecordSink, PublishFailure, Published, RunId,
+    SinkFailure, TerminalEvidenceError, TerminalObservation, TranscriptBinding, FORMAL_READ_CHUNKS,
+    FORMAL_STDOUT_BYTES, FORMAL_STDOUT_SHA256, FORMAL_WRITE_CHUNKS, MAX_FORMAL_FUEL,
+};
 
 pub use target::{
     FacadeFaults, IrqCookie, SampleToken, TargetActive, TargetContext, TargetFinished, TargetReady,

@@ -92,6 +92,8 @@ jobs:
           python3 -B scripts/verify-c83-evidence.py --selftest
       - name: Verify the C8.4 single-boot transcript contract
         run: python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
+      - name: Verify the C8.4 formal single-SAMPLE publisher
+        run: python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
       - name: Verify the independent ComponentArtifact codec
         run: python3 -B scripts/verify-c71-component-artifact.py --selftest
       - name: Verify the independent Storage V2 image parsers

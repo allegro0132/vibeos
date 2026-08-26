@@ -30,6 +30,8 @@ QEMU_FEATURE = "wasm-c84-ssh-request-parent-qemu-acceptance"
 QEMU_FAMILY = "WASM_C84_SSH_REQUEST_PARENT"
 FINISH_FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
 FINISH_QEMU_FEATURE = f"{FINISH_FEATURE}-qemu-acceptance"
+VERIFIED_STREAM_FEATURE = "wasm-c84-ssh-managed-child-verified-stream"
+VERIFIED_STREAM_QEMU_FEATURE = f"{VERIFIED_STREAM_FEATURE}-qemu-acceptance"
 
 
 class VerificationError(Exception):
@@ -575,6 +577,8 @@ def verify_kernel(source: str, root_source: str, manifest: bytes) -> None:
     # or indirect cfg forms remain visible and therefore fail predecessor checks.
     production = without_direct_feature_units(source, FINISH_FEATURE)
     production = without_direct_feature_units(production, FINISH_QEMU_FEATURE)
+    production = without_direct_feature_units(production, VERIFIED_STREAM_FEATURE)
+    production = without_direct_feature_units(production, VERIFIED_STREAM_QEMU_FEATURE)
 
     prepare_impl = find_scope(
         production,
@@ -763,16 +767,19 @@ def verify(inputs: Inputs) -> None:
 
 LEGACY_CANCEL = "legacy-cancel"
 FINISH_VERIFY = "finish-verify"
+VERIFIED_STREAM = "verified-stream"
 
 
 def response_terminal_suffix(terminal_mode: str) -> str:
     require(
-        terminal_mode in (LEGACY_CANCEL, FINISH_VERIFY),
+        terminal_mode in (LEGACY_CANCEL, FINISH_VERIFY, VERIFIED_STREAM),
         f"unknown request-parent terminal mode: {terminal_mode!r}",
     )
     if terminal_mode == LEGACY_CANCEL:
         return "cancel=1 ack=1"
-    return "finish=1 verify=1 discard=stream_abandoned ack=1"
+    if terminal_mode == FINISH_VERIFY:
+        return "finish=1 verify=1 discard=stream_abandoned ack=1"
+    return "finish=1 verify=1 stream=complete ack=0"
 
 
 def expected_qemu_markers(terminal_mode: str = LEGACY_CANCEL) -> list[str]:
@@ -790,7 +797,7 @@ def expected_qemu_markers(terminal_mode: str = LEGACY_CANCEL) -> list[str]:
 
 
 # Compatibility export for every already-committed predecessor gate. Successor
-# peers opt into FINISH_VERIFY explicitly and cannot mutate this frozen list.
+# peers opt into a successor mode explicitly and cannot mutate this frozen list.
 EXPECTED_QEMU_MARKERS = expected_qemu_markers()
 
 
@@ -860,7 +867,31 @@ def run_transcript_selftest() -> int:
         pass
     else:
         raise VerificationError("legacy terminal mode accepted the successor transcript")
-    return len(mutations) + len(successor_mutations) + 1
+
+    stream_markers = expected_qemu_markers(VERIFIED_STREAM)
+    stream = "\n".join(["boot", *stream_markers, "listener rearmed", ""])
+    verify_qemu_transcript(stream.encode(), VERIFIED_STREAM)
+    stream_mutations = [
+        stream.replace("stream=complete", "stream=partial", 1),
+        stream.replace("ack=0", "ack=1", 1),
+        stream.replace(stream_markers[3], successor_markers[3], 1),
+        stream.replace(stream_markers[5], stream_markers[5].replace("cancel=1", "complete=1"), 1),
+    ]
+    for index, mutation in enumerate(stream_mutations, start=1):
+        try:
+            verify_qemu_transcript(mutation.encode(), VERIFIED_STREAM)
+        except VerificationError:
+            continue
+        raise VerificationError(
+            f"verified-stream QEMU transcript selftest mutation {index} was accepted"
+        )
+    for wrong_mode in (LEGACY_CANCEL, FINISH_VERIFY):
+        try:
+            verify_qemu_transcript(stream.encode(), wrong_mode)
+        except VerificationError:
+            continue
+        raise VerificationError(f"{wrong_mode} accepted the verified-stream transcript")
+    return len(mutations) + len(successor_mutations) + len(stream_mutations) + 3
 
 
 def replace_once(value: str, old: str, new: str, label: str) -> str:

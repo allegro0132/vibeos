@@ -39,6 +39,7 @@ PHASE = load_module("vibeos_c84_managed_child_irq_phase_peer", PHASE_PEER_PATH)
 REQUEST = load_module("vibeos_c84_managed_child_irq_request_verifier", REQUEST_VERIFIER_PATH)
 LEGACY_CANCEL = REQUEST.LEGACY_CANCEL
 FINISH_VERIFY = REQUEST.FINISH_VERIFY
+VERIFIED_STREAM = REQUEST.VERIFIED_STREAM
 
 
 class DriverError(Exception):
@@ -434,7 +435,28 @@ def run_parser_selftest() -> int:
             not accepted(mixed, FINISH_VERIFY),
             "finish/verify IRQ mode accepted a legacy epoch-2 terminal",
         )
-    return len(mutations) + 5
+
+        stream = synthetic_closed_lines(
+            VERIFIED_STREAM,
+            drop_observer_pairs=drop_observer_pairs,
+        )
+        require(
+            accepted(stream, VERIFIED_STREAM),
+            "synthetic verified-stream IRQ transcript was rejected",
+        )
+        for wrong_mode in (LEGACY_CANCEL, FINISH_VERIFY):
+            require(
+                not accepted(stream, wrong_mode),
+                f"{wrong_mode} accepted the verified-stream IRQ transcript",
+            )
+        mixed_stream = list(stream)
+        stream_irq = expected_irq_markers(VERIFIED_STREAM)
+        mixed_stream[mixed_stream.index(stream_irq[3])] = successor_irq[3]
+        require(
+            not accepted(mixed_stream, VERIFIED_STREAM),
+            "verified-stream IRQ mode accepted a finish/discard epoch-2 terminal",
+        )
+    return len(mutations) + 9
 
 
 def parser() -> argparse.ArgumentParser:

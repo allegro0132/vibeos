@@ -152,9 +152,9 @@ impl SshPlatform {
 ///
 /// `start` mutates this object from Reserved to Active before SSHD moves that
 /// same box between its public typestates. The base owner remains cancel-only.
-/// Its explicit finish/verify successor consumes a successful response through
-/// an internal zero-cursor stream discard and acknowledges that exact
-/// diagnostic rejection; no stream or publisher authority leaves this adapter.
+/// Its terminal successors either discard a newly verified stream or consume
+/// its summary and every interval before explicit completion. No storage-bearing
+/// stream or publisher authority leaves this synchronous adapter.
 #[cfg(feature = "wasm-c84-ssh-request-parent")]
 struct SshExecProfileOwner {
     policy: SshExecComponentSessionPolicy,
@@ -166,6 +166,14 @@ enum SshExecProfileOwnerState {
     Reserved(crate::wasm_aot_profile_slot::StartPermit),
     Active(crate::wasm_aot_profile_slot::RunLease),
     Closed,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VerifiedStreamEvidence {
+    ready_epoch: u64,
+    total_ticks: u64,
+    interval_count: usize,
 }
 
 #[cfg(feature = "wasm-c84-ssh-request-parent")]
@@ -235,17 +243,23 @@ impl SshExecProfileOwner {
         #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
         let child_observation =
             crate::wasm_aot_profile_slot::take_managed_child_response_observation(epoch);
+        #[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream")]
+        let terminal = finish_verify_stream_and_complete_profile(run)
+            .map(|evidence| (evidence.ready_epoch, evidence));
         #[cfg(feature = "wasm-c84-ssh-managed-child-finish-verify")]
-        let terminal = finish_verify_discard_and_ack_profile(run);
+        #[cfg(not(feature = "wasm-c84-ssh-managed-child-verified-stream"))]
+        let terminal =
+            finish_verify_discard_and_ack_profile(run).map(|ready_epoch| (ready_epoch, ()));
         #[cfg(not(feature = "wasm-c84-ssh-managed-child-finish-verify"))]
         let terminal =
-            cancel_and_ack_profile(run, crate::wasm_aot_profile_slot::SlotFaults::default());
+            cancel_and_ack_profile(run, crate::wasm_aot_profile_slot::SlotFaults::default())
+                .map(|ready_epoch| (ready_epoch, ()));
         #[cfg(feature = "wasm-c84-ssh-managed-child-finish-verify")]
         let terminal_prerequisite_exact = true;
         #[cfg(not(feature = "wasm-c84-ssh-managed-child-finish-verify"))]
         let terminal_prerequisite_exact = child_ready && profile_policy_is_current(self.policy);
         match terminal {
-            Ok(ready_epoch) if terminal_prerequisite_exact => {
+            Ok((ready_epoch, _terminal_evidence)) if terminal_prerequisite_exact => {
                 #[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
                 let irq_observation =
                     match crate::wasm_aot_profile_slot::managed_irq_acceptance_terminal_gate(
@@ -282,8 +296,23 @@ impl SshExecProfileOwner {
                             ready_epoch
                         );
                         #[cfg(feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance")]
+                        #[cfg(not(
+                            feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance"
+                        ))]
                         crate::println!(
                             "WASM_C84_SSH_MANAGED_CHILD_CORE RESPONSE epoch={} status={} claim=1 release=1 detach=exited clean=1 core_polls={} observer_pairs={} typed_polls={} observer_closed=1 finish=1 verify=1 discard=stream_abandoned ack=1 ready_epoch={}",
+                            epoch,
+                            status,
+                            observation.core_polls,
+                            observation.core_pairs,
+                            observation.typed_polls,
+                            ready_epoch
+                        );
+                        #[cfg(
+                            feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance"
+                        )]
+                        crate::println!(
+                            "WASM_C84_SSH_MANAGED_CHILD_CORE RESPONSE epoch={} status={} claim=1 release=1 detach=exited clean=1 core_polls={} observer_pairs={} typed_polls={} observer_closed=1 finish=1 verify=1 stream=complete ack=0 ready_epoch={}",
                             epoch,
                             status,
                             observation.core_polls,
@@ -302,6 +331,8 @@ impl SshExecProfileOwner {
                 managed_irq_response(epoch, status, ready_epoch, irq_observation);
                 #[cfg(feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance")]
                 finish_verify_response(epoch, status, ready_epoch);
+                #[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance")]
+                verified_stream_response(epoch, _terminal_evidence);
                 Ok(())
             }
             Ok(_) => {
@@ -392,6 +423,10 @@ impl SshExecProfileOwner {
                             feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance"
                         )]
                         finish_verify_drop(epoch, ready_epoch);
+                        #[cfg(
+                            feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance"
+                        )]
+                        verified_stream_drop(epoch, ready_epoch);
                     }
                     Ok(_) => profile_request_failure("managed-child-drop-state", Some(epoch)),
                     Err(()) => profile_request_failure("drop", Some(epoch)),
@@ -496,6 +531,227 @@ fn finish_verify_discard_and_ack_profile(
         return Err(());
     }
     Ok(ready_epoch)
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream")]
+fn finish_verify_stream_and_complete_profile(
+    run: crate::wasm_aot_profile_slot::RunLease,
+) -> Result<VerifiedStreamEvidence, ()> {
+    use crate::wasm_aot_profile_slot::{rejection, ProfileError, SlotStatus};
+    use vibeos_wasm_aot_profile::{PhaseTicks, INTERVAL_CAPACITY};
+
+    let epoch = run.token().epoch();
+    let mut stream = match run.finish() {
+        Ok(stream) => stream,
+        Err(ProfileError::Rejected(report)) => {
+            // finish/verify has already installed the rejection. Recycle it
+            // before propagating the failed response.
+            let _ = acknowledge_finish_verify_rejection(epoch, report)?;
+            return Err(());
+        }
+        Err(_) => {
+            // RunLease Drop may have installed a fail-closed cancellation.
+            // Recycle only an independently observable report for this epoch.
+            if let Some(report) = rejection().filter(|report| report.epoch == epoch) {
+                let _ = acknowledge_finish_verify_rejection(epoch, report);
+            }
+            return Err(());
+        }
+    };
+
+    if stream.token().epoch() != epoch {
+        discard_and_ack_verified_stream(stream, epoch, 0)?;
+        return Err(());
+    }
+    let initial_interval_count = match crate::wasm_aot_profile_slot::status() {
+        SlotStatus::Verified {
+            epoch: verified_epoch,
+            cursor: 0,
+            intervals,
+        } if verified_epoch == epoch => intervals,
+        _ => {
+            discard_and_ack_verified_stream(stream, epoch, 0)?;
+            return Err(());
+        }
+    };
+    let summary = match stream.summary() {
+        Ok(summary) => summary,
+        Err(_) => {
+            discard_and_ack_verified_stream(stream, epoch, 0)?;
+            return Err(());
+        }
+    };
+    let summary_phase_ticks = summary.phase_ticks();
+    let summary_is_exact = summary.interval_capacity() == INTERVAL_CAPACITY
+        && summary.intervals_complete()
+        && summary.interval_count() != 0
+        && summary.interval_count() <= summary.interval_capacity()
+        && summary.interval_count() == initial_interval_count
+        && summary.total_ticks() != 0
+        && summary.end_tick().checked_sub(summary.start_tick()) == Some(summary.total_ticks())
+        && summary_phase_ticks.checked_total() == Some(summary.total_ticks());
+    if !summary_is_exact {
+        discard_and_ack_verified_stream(stream, epoch, 0)?;
+        return Err(());
+    }
+
+    let mut emitted = 0_usize;
+    let mut previous_end = 0_u64;
+    let mut previous_phase = None;
+    let mut rescanned_phase_ticks = PhaseTicks::ZERO;
+    loop {
+        let interval = match stream.next_interval() {
+            Ok(interval) => interval,
+            Err(_) => {
+                discard_and_ack_verified_stream(stream, epoch, emitted)?;
+                return Err(());
+            }
+        };
+        let Some(interval) = interval else {
+            break;
+        };
+        let expected_sequence = emitted;
+        let Some(next_emitted) = emitted.checked_add(1) else {
+            discard_and_ack_verified_stream(stream, epoch, emitted)?;
+            return Err(());
+        };
+        emitted = next_emitted;
+        let duration = match interval
+            .end_offset_ticks()
+            .checked_sub(interval.start_offset_ticks())
+        {
+            Some(duration) if duration != 0 => duration,
+            _ => {
+                discard_and_ack_verified_stream(stream, epoch, emitted)?;
+                return Err(());
+            }
+        };
+        if emitted > summary.interval_count()
+            || interval.sequence() != expected_sequence
+            || interval.start_offset_ticks() != previous_end
+            || previous_phase == Some(interval.phase())
+            || !add_verified_stream_phase_ticks(
+                &mut rescanned_phase_ticks,
+                interval.phase(),
+                duration,
+            )
+        {
+            discard_and_ack_verified_stream(stream, epoch, emitted)?;
+            return Err(());
+        }
+        previous_end = interval.end_offset_ticks();
+        previous_phase = Some(interval.phase());
+    }
+
+    let final_cursor_is_exact = matches!(
+        crate::wasm_aot_profile_slot::status(),
+        SlotStatus::Verified {
+            epoch: verified_epoch,
+            cursor,
+            intervals,
+        } if verified_epoch == epoch
+            && cursor == emitted
+            && intervals == summary.interval_count()
+    );
+    if emitted != summary.interval_count()
+        || previous_end != summary.total_ticks()
+        || rescanned_phase_ticks != summary_phase_ticks
+        || !final_cursor_is_exact
+    {
+        discard_and_ack_verified_stream(stream, epoch, emitted)?;
+        return Err(());
+    }
+
+    if stream.complete().is_err() {
+        acknowledge_consumed_stream_error(epoch, emitted)?;
+        return Err(());
+    }
+    let ready_epoch = epoch.checked_add(1).ok_or(())?;
+    let ready_is_exact = crate::wasm_aot_profile_slot::status()
+        == (SlotStatus::Ready {
+            next_epoch: Some(ready_epoch),
+        });
+    if !ready_is_exact || rejection().is_some() {
+        return Err(());
+    }
+    Ok(VerifiedStreamEvidence {
+        ready_epoch,
+        total_ticks: summary.total_ticks(),
+        interval_count: summary.interval_count(),
+    })
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream")]
+fn add_verified_stream_phase_ticks(
+    phase_ticks: &mut vibeos_wasm_aot_profile::PhaseTicks,
+    phase: vibeos_wasm_aot_profile::Phase,
+    ticks: u64,
+) -> bool {
+    use vibeos_wasm_aot_profile::Phase;
+
+    let phase_ticks = match phase {
+        Phase::Validation => &mut phase_ticks.validation,
+        Phase::Instantiation => &mut phase_ticks.instantiation,
+        Phase::Abi => &mut phase_ticks.abi,
+        Phase::Interpretation => &mut phase_ticks.interpretation,
+        Phase::Host => &mut phase_ticks.host,
+        Phase::Wait => &mut phase_ticks.wait,
+        Phase::Cleanup => &mut phase_ticks.cleanup,
+    };
+    let Some(total) = (*phase_ticks).checked_add(ticks) else {
+        return false;
+    };
+    if total == u64::MAX {
+        return false;
+    }
+    *phase_ticks = total;
+    true
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream")]
+fn discard_and_ack_verified_stream(
+    stream: crate::wasm_aot_profile_slot::StreamLease,
+    epoch: u64,
+    expected_emitted: usize,
+) -> Result<(), ()> {
+    use crate::wasm_aot_profile_slot::{RejectionCause, SlotFaults};
+
+    let report = stream.discard().map_err(|_| ())?;
+    let report_is_exact = report.epoch == epoch
+        && report.cause == RejectionCause::StreamAbandoned
+        && report.facade_faults.is_empty()
+        && report.ledger_error.is_none()
+        && report.slot_faults == SlotFaults::default()
+        && report.intervals_emitted == expected_emitted;
+    // Discard has installed a known rejection. Acknowledge it even if local
+    // comparison fails, then report the response failure to the caller.
+    let _ = acknowledge_finish_verify_rejection(epoch, report)?;
+    if !report_is_exact {
+        return Err(());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream")]
+fn acknowledge_consumed_stream_error(epoch: u64, expected_emitted: usize) -> Result<(), ()> {
+    use crate::wasm_aot_profile_slot::{rejection, RejectionCause, SlotFaults};
+
+    // StreamLease::complete consumes the handle. On an error its Drop path may
+    // have installed an abandonment report; only that independently visible,
+    // same-epoch rejection is safe to acknowledge here.
+    let report = rejection()
+        .filter(|report| report.epoch == epoch)
+        .ok_or(())?;
+    let report_is_exact = report.cause == RejectionCause::StreamAbandoned
+        && report.facade_faults.is_empty()
+        && report.ledger_error.is_none()
+        && report.slot_faults == SlotFaults::default()
+        && report.intervals_emitted == expected_emitted;
+    let _ = acknowledge_finish_verify_rejection(epoch, report)?;
+    if !report_is_exact {
+        return Err(());
+    }
+    Ok(())
 }
 
 #[cfg(feature = "wasm-c84-ssh-managed-child-finish-verify")]
@@ -648,8 +904,16 @@ fn profile_request_response(epoch: u64, status: u32, ready_epoch: u64) {
         ready_epoch
     );
     #[cfg(feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance")]
+    #[cfg(not(feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance"))]
     crate::println!(
         "WASM_C84_SSH_REQUEST_PARENT RESPONSE epoch={} status={} finish=1 verify=1 discard=stream_abandoned ack=1 ready_epoch={}",
+        epoch,
+        status,
+        ready_epoch
+    );
+    #[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance")]
+    crate::println!(
+        "WASM_C84_SSH_REQUEST_PARENT RESPONSE epoch={} status={} finish=1 verify=1 stream=complete ack=0 ready_epoch={}",
         epoch,
         status,
         ready_epoch
@@ -691,8 +955,21 @@ fn managed_irq_response(
         ready_epoch,
     );
     #[cfg(feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance")]
+    #[cfg(not(feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance"))]
     crate::println!(
         "WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY RESPONSE epoch={} status={} parent_pair={} child_pair={} terminal_inactive=1 paired={} inactive={} active_epoch={} finish=1 verify=1 discard=stream_abandoned ack=1 ready_epoch={}",
+        epoch,
+        status,
+        causal_pair,
+        causal_pair,
+        observation.paired,
+        observation.inactive,
+        observation.active_epoch,
+        ready_epoch,
+    );
+    #[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance")]
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY RESPONSE epoch={} status={} parent_pair={} child_pair={} terminal_inactive=1 paired={} inactive={} active_epoch={} finish=1 verify=1 stream=complete ack=0 ready_epoch={}",
         epoch,
         status,
         causal_pair,
@@ -792,8 +1069,27 @@ fn profile_phase_response(
         ready_epoch
     );
     #[cfg(feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance")]
+    #[cfg(not(feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance"))]
     crate::println!(
         "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR RESPONSE epoch={} status={} child_core_starts={} child_core_finishes={} child_host_starts={} child_host_finishes={} child_wait_starts={} child_wait_finishes={} cleanup_count={} parent_host_starts={} parent_host_finishes={} parent_wait_starts={} parent_wait_finishes={} child_wait_open=0 parent_wait_open=0 late=0 clean=1 finish=1 verify=1 discard=stream_abandoned ack=1 ready_epoch={}",
+        epoch,
+        status,
+        child.core_pairs,
+        child.core_pairs,
+        phase.child_host_starts,
+        phase.child_host_finishes,
+        phase.child_wait_starts,
+        phase.child_wait_finishes,
+        phase.cleanup_count,
+        phase.parent_host_starts,
+        phase.parent_host_finishes,
+        phase.parent_wait_starts,
+        phase.parent_wait_finishes,
+        ready_epoch
+    );
+    #[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance")]
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR RESPONSE epoch={} status={} child_core_starts={} child_core_finishes={} child_host_starts={} child_host_finishes={} child_wait_starts={} child_wait_finishes={} cleanup_count={} parent_host_starts={} parent_host_finishes={} parent_wait_starts={} parent_wait_finishes={} child_wait_open=0 parent_wait_open=0 late=0 clean=1 finish=1 verify=1 stream=complete ack=0 ready_epoch={}",
         epoch,
         status,
         child.core_pairs,
@@ -814,8 +1110,16 @@ fn profile_phase_response(
 
 #[cfg(feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance")]
 fn finish_verify_response(epoch: u64, status: u32, ready_epoch: u64) {
+    #[cfg(not(feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance"))]
     crate::println!(
         "WASM_C84_SSH_MANAGED_CHILD_FINISH_VERIFY RESPONSE epoch={} status={} finish=1 verify=1 cursor=0 discard=stream_abandoned emitted=0 stored=1 ack=1 ready_epoch={}",
+        epoch,
+        status,
+        ready_epoch
+    );
+    #[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance")]
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_FINISH_VERIFY RESPONSE epoch={} status={} finish=1 verify=1 stream=complete ack=0 ready_epoch={}",
         epoch,
         status,
         ready_epoch
@@ -826,6 +1130,28 @@ fn finish_verify_response(epoch: u64, status: u32, ready_epoch: u64) {
 fn finish_verify_drop(epoch: u64, ready_epoch: u64) {
     crate::println!(
         "WASM_C84_SSH_MANAGED_CHILD_FINISH_VERIFY DROP epoch={} cancel=lease_cancelled finish=0 verify=0 stream=0 emitted=0 stored=1 ack=1 ready_epoch={}",
+        epoch,
+        ready_epoch
+    );
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance")]
+fn verified_stream_response(epoch: u64, evidence: VerifiedStreamEvidence) {
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_VERIFIED_STREAM RESPONSE epoch={} status=0 finish=1 verify=1 summary=1 initial_cursor=0 total_ticks={} interval_capacity=65536 interval_count={} intervals_complete=1 emitted={} cursor={} sequence=exact contiguous=1 nonempty=1 adjacent_distinct=1 phase_sum=total_ticks phase_rescan=summary final_end=total_ticks stream=complete stored=0 ack=0 ready_epoch={}",
+        epoch,
+        evidence.total_ticks,
+        evidence.interval_count,
+        evidence.interval_count,
+        evidence.interval_count,
+        evidence.ready_epoch
+    );
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance")]
+fn verified_stream_drop(epoch: u64, ready_epoch: u64) {
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_VERIFIED_STREAM DROP epoch={} cancel=lease_cancelled finish=0 verify=0 summary=0 stream=0 emitted=0 stored=1 ack=1 ready_epoch={}",
         epoch,
         ready_epoch
     );

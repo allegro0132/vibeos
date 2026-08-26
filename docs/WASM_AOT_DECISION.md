@@ -653,6 +653,96 @@ particular, the exact-`u64::MAX` poll vector proves decimal and accumulator
 handling only. A later live adapter must mint exactness from a private checked
 counter and must reject the existing saturating profile value at its sentinel.
 
+## Trusted live terminal and opaque-sample closure
+
+The default-off `wasm-c84-ssh-managed-child-trusted-sample` feature is the
+live-producer sibling of verified-stream. Both directly succeed
+finish/verify, and they are mutually exclusive: verified-stream consumes the
+cursor to completion, whereas the trusted producer must preserve the
+storage-bearing `TargetVerified` while attaching live terminal evidence. The
+base also selects SSHD's private `c84-profile-trusted-sample` seam. Its QEMU
+acceptance pairs with the finish/verify predecessor, never with the separate
+verified-stream transcript; Milk-V exposes only the UART-silent base seam.
+
+SSHD constructs a linear `SshExecProfileTerminal` only after the exact managed
+Component terminal agrees with lifecycle shutdown, pending Component stdout is
+empty, and Component session shutdown has returned. It retains the seal inside
+the live SSH request and transfers it to the kernel only at the later response
+boundary, after peer channel-close acknowledgement and complete Sunset output
+drain. The kernel requires the terminal enum itself to be `Success`, numeric
+status zero, no timeout, zero stderr, and exactly 12,325 forwarded stdout bytes;
+`ComponentTerminal::Returned(0)` is not an alias for success. The terminal
+seal's constructor and fields remain private and the token is neither Clone nor
+Copy.
+
+SSHD coalesces arbitrary Sunset channel-data slices into exactly twelve
+1,024-byte Component sends plus the 37-byte EOF tail. The trusted feature fixes
+that staging limit even if the target-only native-revoke feature is also
+present, so transport packetization cannot alter the formal input transcript.
+
+The call-local dispatcher maintains a sticky-invalid checked audit of actual
+host transfers. A read advances only after the exact prepared token commits a
+`Received(length)` result; a write advances only on immediate `Sent` or the
+final resumed `Sent`. Waiting, retries, EOF, and prepared-only work contribute
+nothing. It verifies the frozen 12 full 1,024-byte chunks plus one 37-byte
+chunk, the input formula, and every XOR-transformed output byte before binding
+the frozen stdout SHA-256. Fuel is sampled from the still-live terminal call
+before `drop(call)`. The private metrics validator rejects zero or over-budget
+fuel, inconsistent remaining work, all five `SyncCallProfile` sentinels,
+cross-counter mismatches, and empty or saturated poll quanta; exactness is
+derived from those checked facts rather than a public boolean assertion.
+
+After independent ledger verification, the slot validates the complete live
+observation into `EligibleTerminalEvidence` and atomically removes the matching
+cursor-zero `TargetVerified`. Both authorities are held in one kernel-private
+`TrustedVerifiedSample` with private fields and an owner seal. It is non-copyable,
+has no constructor or `into_parts`, and a raw-pointer marker makes it neither
+`Send` nor `Sync`; the SSH platform cannot publish or separately retain either
+half. This closes provenance only for the exact live route. The portable public
+validator by itself continues to prove field eligibility, not origin.
+
+Epochs 1, 2, and 4 form one opaque bundle and then intentionally discard it in
+this foundation node. The discard must install `TrustedSampleAbandoned` with
+empty facade/ledger/slot faults and zero emitted intervals; the adapter compares
+that stored rejection, acknowledges it once, and proves `Ready(E + 1)`. Epoch 3
+uses the unchanged active-Drop closure and must never form a bundle. The source
+gate attacks status-only success, `Returned(0)`, public seals, counter placement
+and saturation, after-drop metrics, profile deltas and sentinels, forged exact
+flags, split authority, `into_parts`, Send/Sync widening, missing validation,
+discard/ack bypasses, marker decoys, cfg pairing, and CI bypasses.
+
+```sh
+python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
+python3 -B scripts/verify-c84-ssh-managed-child-finish-verify.py --selftest --check-source
+python3 -B scripts/verify-c84-ssh-managed-child-verified-stream.py --selftest --check-source
+python3 -B scripts/verify-c84-ssh-managed-child-trusted-sample.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-trusted-sample-test.sh
+```
+
+All five predecessor families preserve their marker formats and field
+contracts, with the exact 27/28 phase, 19 Core, eight request, six IRQ, and four
+finish/verify counts. The epoch-3 phase/Core observer count is parsed
+dynamically and must agree across those two families; no byte identity with a
+separate predecessor run is claimed. Each predecessor success RESPONSE ends in
+`finish=1 verify=1 bundle=trusted discard=trusted_sample_abandoned ack=1
+ready_epoch=...`. The trusted family follows finish/verify last and has exactly
+three success records plus one Drop:
+
+```text
+WASM_C84_SSH_MANAGED_CHILD_TRUSTED_SAMPLE RESPONSE epoch=E status=0 exact_success=1 full_drain=1 read_chunks=13 write_chunks=13 stdout_bytes=12325 stdout_sha256=791f3fe1339984e8a8489c12ea5ff479ac7caa07c87be451134d3af0f526bb27 fuel_consumed=F poll_quanta=P poll_exact=1 logical_live_after=0 timed_out=0 bundle=trusted finish=1 verify=1 discard=trusted_sample_abandoned emitted=0 stored=1 ack=1 ready_epoch=R
+WASM_C84_SSH_MANAGED_CHILD_TRUSTED_SAMPLE DROP epoch=E cancel=lease_cancelled bundle=0 finish=0 verify=0 discard=0 emitted=0 stored=1 ack=1 ready_epoch=R
+```
+
+The peer requires canonical decimal `1 <= F <= 500000`,
+`1 <= P < u64::MAX`, and `R = E + 1`; it does not freeze scheduler-dependent
+values. Each trusted `P` must equal the same epoch's dynamically parsed Core
+`typed_polls`, and phase/Core counts must agree. Terminal order is phase, Core,
+request, IRQ, finish/verify, then trusted-sample, before the next START. The
+family is diagnostic log evidence, not serialized JSON. This node calls no
+`ProfilePublisher`, emits no META/SAMPLE/END, stores no dataset, establishes no
+24-sample collector chain, performs no physical Milk-V Duo capture or cold
+boot, and makes no AOT decision.
+
 ## Decision rule
 
 Let `T` be each retained sample's `total_ticks`, `I` its `interpretation`
@@ -693,6 +783,8 @@ python3 -B scripts/verify-c84-ssh-managed-child-finish-verify.py --selftest --ch
 ./scripts/qemu-c84-ssh-managed-child-finish-verify-test.sh
 python3 -B scripts/verify-c84-ssh-managed-child-verified-stream.py --selftest --check-source
 ./scripts/qemu-c84-ssh-managed-child-verified-stream-test.sh
+python3 -B scripts/verify-c84-ssh-managed-child-trusted-sample.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-trusted-sample-test.sh
 ```
 
 These checks validate the preparation contract, portable single-SAMPLE

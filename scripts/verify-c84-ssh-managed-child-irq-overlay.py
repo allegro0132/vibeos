@@ -34,6 +34,8 @@ FINISH_FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
 FINISH_QEMU_FEATURE = f"{FINISH_FEATURE}-qemu-acceptance"
 VERIFIED_STREAM_FEATURE = "wasm-c84-ssh-managed-child-verified-stream"
 VERIFIED_STREAM_QEMU_FEATURE = f"{VERIFIED_STREAM_FEATURE}-qemu-acceptance"
+TRUSTED_SAMPLE_FEATURE = "wasm-c84-ssh-managed-child-trusted-sample"
+TRUSTED_SAMPLE_QEMU_FEATURE = f"{TRUSTED_SAMPLE_FEATURE}-qemu-acceptance"
 
 
 def load_phase_verifier():
@@ -320,6 +322,13 @@ def verify_features(inputs: Inputs) -> None:
     qemu_closure = PHASE.local_feature_closure(kernel, [QEMU_FEATURE])
     require(PHASE_QEMU_FEATURE in qemu_closure, "IRQ QEMU feature omits the phase QEMU predecessor")
     require(IRQ_QEMU_FEATURE not in qemu_closure, "IRQ composition selects the standalone IRQ worker")
+    trusted_closure = PHASE.local_feature_closure(kernel, [TRUSTED_SAMPLE_FEATURE])
+    trusted_qemu_closure = PHASE.local_feature_closure(kernel, [TRUSTED_SAMPLE_QEMU_FEATURE])
+    require(FEATURE in trusted_closure, "trusted-sample omits the managed-child IRQ predecessor")
+    require(
+        QEMU_FEATURE in trusted_qemu_closure,
+        "trusted-sample QEMU omits the managed-child IRQ QEMU predecessor",
+    )
 
     root = semantic(inputs.phase.kernel_root)
     qemu_only = (
@@ -805,6 +814,8 @@ def verify_ssh(source: str) -> None:
     source = CORE.without_direct_feature_units(source, FINISH_QEMU_FEATURE)
     source = CORE.without_direct_feature_units(source, VERIFIED_STREAM_FEATURE)
     source = CORE.without_direct_feature_units(source, VERIFIED_STREAM_QEMU_FEATURE)
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
     backend = find_scope(
         source,
         r"\bimpl\s+SshExecProfileRunBackend\s+for\s+SshExecProfileOwner\b",

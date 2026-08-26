@@ -86,8 +86,10 @@ pub trait SshExecProfilePermitBackend: Send {
 
 /// Opaque backend retained while the accepted SSH request parent is live.
 ///
-/// `response_boundary` records only the SSH response boundary. It is not a
-/// finish, verification, publication, or profile-content decision.
+/// `response_boundary` records only the SSH response boundary. Under the
+/// trusted-sample successor it also consumes the sealed managed-Component
+/// terminal observation. It is not a finish, verification, publication, or
+/// profile-content decision.
 #[cfg(feature = "c84-profile-request-parent")]
 pub trait SshExecProfileRunBackend: Send {
     /// Observe one runnable SSH transport/pump turn without consuming the run.
@@ -98,9 +100,70 @@ pub trait SshExecProfileRunBackend: Send {
     fn phase_wait(&mut self) -> Result<(), ()>;
     /// Record the first complete response boundary. On error the backend must
     /// remain cancellable; the wrapper performs that cancellation exactly once.
+    #[cfg(not(feature = "c84-profile-trusted-sample"))]
     fn response_boundary(&mut self, status: u32) -> Result<(), ()>;
+    /// Consume the exact managed-Component terminal observation only after the
+    /// peer acknowledged channel close and Sunset drained all response bytes.
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    fn response_boundary(&mut self, terminal: SshExecProfileTerminal) -> Result<(), ()>;
     /// Cancel one run which has not crossed its response boundary.
     fn cancel(&mut self);
+}
+
+/// Linear terminal observation for one managed Component SSH execution.
+///
+/// Construction is private to SSHD. The token distinguishes the exact
+/// Component terminal from the numeric SSH exit status: in particular,
+/// `ComponentTerminal::Returned(0)` remains distinct from `Success`. Holding
+/// this token alone does not assert profile eligibility; the platform must
+/// still validate the terminal, timeout, content, and runtime metrics.
+#[cfg(feature = "c84-profile-trusted-sample")]
+pub struct SshExecProfileTerminal {
+    component_terminal: vibeos_vsh::ComponentTerminal,
+    exit_status: u32,
+    timed_out: bool,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
+}
+
+#[cfg(feature = "c84-profile-trusted-sample")]
+impl SshExecProfileTerminal {
+    fn seal(
+        component_terminal: vibeos_vsh::ComponentTerminal,
+        exit_status: u32,
+        timed_out: bool,
+        stdout_bytes: u64,
+    ) -> Self {
+        Self {
+            component_terminal,
+            exit_status,
+            timed_out,
+            stdout_bytes,
+            // Managed Component output has only the stdout stream routed to
+            // SSH ChanData::Normal. Its exact JobReport output is empty.
+            stderr_bytes: 0,
+        }
+    }
+
+    pub fn component_terminal(&self) -> vibeos_vsh::ComponentTerminal {
+        self.component_terminal
+    }
+
+    pub fn exit_status(&self) -> u32 {
+        self.exit_status
+    }
+
+    pub fn timed_out(&self) -> bool {
+        self.timed_out
+    }
+
+    pub fn stdout_bytes(&self) -> u64 {
+        self.stdout_bytes
+    }
+
+    pub fn stderr_bytes(&self) -> u64 {
+        self.stderr_bytes
+    }
 }
 
 /// Linear, unstarted ownership for one exact SSH Component request.
@@ -133,6 +196,8 @@ impl SshExecProfilePermit {
         }
         Ok(SshExecProfileRun {
             backend: Some(backend.into_run()),
+            #[cfg(feature = "c84-profile-trusted-sample")]
+            terminal: None,
         })
     }
 }
@@ -150,6 +215,8 @@ impl Drop for SshExecProfilePermit {
 #[cfg(feature = "c84-profile-request-parent")]
 pub struct SshExecProfileRun {
     backend: Option<Box<dyn SshExecProfileRunBackend>>,
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    terminal: Option<SshExecProfileTerminal>,
 }
 
 #[cfg(feature = "c84-profile-request-parent")]
@@ -172,13 +239,31 @@ impl SshExecProfileRun {
             .phase_wait()
     }
 
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    fn seal_terminal(&mut self, terminal: SshExecProfileTerminal) -> Result<(), ()> {
+        if self.terminal.is_some() {
+            return Err(());
+        }
+        self.terminal = Some(terminal);
+        Ok(())
+    }
+
     /// Consume the run at the first complete SSH response boundary.
     pub fn response_boundary(mut self, status: u32) -> Result<(), ()> {
+        #[cfg(feature = "c84-profile-trusted-sample")]
+        let terminal = match self.terminal.take() {
+            Some(terminal) if terminal.exit_status() == status => terminal,
+            Some(_) | None => return Err(()),
+        };
         let mut backend = self
             .backend
             .take()
             .expect("SSH exec profile run was consumed twice");
-        if backend.response_boundary(status).is_err() {
+        #[cfg(not(feature = "c84-profile-trusted-sample"))]
+        let boundary = backend.response_boundary(status);
+        #[cfg(feature = "c84-profile-trusted-sample")]
+        let boundary = backend.response_boundary(terminal);
+        if boundary.is_err() {
             backend.cancel();
             return Err(());
         }
@@ -1241,13 +1326,21 @@ struct ComponentStreamPump {
     stdin_source_closed: bool,
     #[cfg(feature = "native-revoke-target-acceptance")]
     stdin_accepted_bytes: usize,
-    #[cfg(feature = "native-revoke-target-acceptance")]
+    #[cfg(any(
+        feature = "native-revoke-target-acceptance",
+        feature = "c84-profile-trusted-sample"
+    ))]
     stdin_staging: [u8; MAX_STREAM_CHUNK_BYTES],
-    #[cfg(feature = "native-revoke-target-acceptance")]
+    #[cfg(any(
+        feature = "native-revoke-target-acceptance",
+        feature = "c84-profile-trusted-sample"
+    ))]
     stdin_staging_length: usize,
     stdout_waiting: Option<HostOperationToken>,
     stdout_pending: Option<PendingComponentOutput>,
     stdout_terminal: Option<StreamCloseReason>,
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    forwarded_stdout_bytes: u64,
     #[cfg(feature = "native-revoke-target-acceptance")]
     stdout_ring_prefetched: bool,
     #[cfg(feature = "native-revoke-target-acceptance")]
@@ -1267,13 +1360,21 @@ impl ComponentStreamPump {
             stdin_source_closed: false,
             #[cfg(feature = "native-revoke-target-acceptance")]
             stdin_accepted_bytes: 0,
-            #[cfg(feature = "native-revoke-target-acceptance")]
+            #[cfg(any(
+                feature = "native-revoke-target-acceptance",
+                feature = "c84-profile-trusted-sample"
+            ))]
             stdin_staging: [0; MAX_STREAM_CHUNK_BYTES],
-            #[cfg(feature = "native-revoke-target-acceptance")]
+            #[cfg(any(
+                feature = "native-revoke-target-acceptance",
+                feature = "c84-profile-trusted-sample"
+            ))]
             stdin_staging_length: 0,
             stdout_waiting: None,
             stdout_pending: None,
             stdout_terminal: None,
+            #[cfg(feature = "c84-profile-trusted-sample")]
+            forwarded_stdout_bytes: 0,
             #[cfg(feature = "native-revoke-target-acceptance")]
             stdout_ring_prefetched: false,
             #[cfg(feature = "native-revoke-target-acceptance")]
@@ -1289,7 +1390,10 @@ impl ComponentStreamPump {
         self.stdin_source_closed
     }
 
-    #[cfg(feature = "native-revoke-target-acceptance")]
+    #[cfg(all(
+        feature = "native-revoke-target-acceptance",
+        not(feature = "c84-profile-trusted-sample")
+    ))]
     fn stdin_accepted_bytes(&self) -> usize {
         self.stdin_accepted_bytes
     }
@@ -1305,6 +1409,71 @@ impl ComponentStreamPump {
         #[cfg(not(feature = "native-revoke-target-acceptance"))]
         let _ = length;
         Ok(())
+    }
+
+    #[cfg(any(
+        feature = "native-revoke-target-acceptance",
+        feature = "c84-profile-trusted-sample"
+    ))]
+    fn read_into_stdin_staging<F>(
+        &mut self,
+        maximum: usize,
+        ready: usize,
+        read: F,
+    ) -> Result<usize, &'static str>
+    where
+        F: FnOnce(&mut [u8]) -> Result<usize, &'static str>,
+    {
+        if maximum == 0 || maximum > MAX_STREAM_CHUNK_BYTES {
+            return Err("SSH Component stdin chunk limit was invalid");
+        }
+        if self.stdin_staging_length > maximum {
+            return Err("SSH Component stdin staging exceeded its exact chunk");
+        }
+        let remaining = maximum.saturating_sub(self.stdin_staging_length);
+        let length = ready.min(remaining);
+        if length == 0 {
+            return Ok(0);
+        }
+        let start = self.stdin_staging_length;
+        let accepted = read(&mut self.stdin_staging[start..start + length])?;
+        if accepted > length {
+            return Err("SSH Component stdin read exceeded its staging window");
+        }
+        self.stdin_staging_length += accepted;
+        Ok(accepted)
+    }
+
+    #[cfg(any(
+        feature = "native-revoke-target-acceptance",
+        feature = "c84-profile-trusted-sample"
+    ))]
+    fn finish_stdin_staging_turn(
+        &mut self,
+        maximum: usize,
+        eof: bool,
+    ) -> Result<bool, &'static str> {
+        if maximum == 0 || maximum > MAX_STREAM_CHUNK_BYTES {
+            return Err("SSH Component stdin chunk limit was invalid");
+        }
+        if self.stdin_staging_length > maximum {
+            return Err("SSH Component stdin staging exceeded its exact chunk");
+        }
+        let mut worked = false;
+        if self.stdin_staging_length == maximum || (eof && self.stdin_staging_length != 0) {
+            let length = self.stdin_staging_length;
+            let staged = self.stdin_staging;
+            worked |= self.send_stdin(&staged[..length])?;
+            self.stdin_staging_length = 0;
+        }
+        if !self.stdin_source_closed()
+            && !self.has_pending_stdin()
+            && self.stdin_staging_length == 0
+            && eof
+        {
+            worked |= self.close_stdin_normal()?;
+        }
+        Ok(worked)
     }
 
     fn send_stdin(&mut self, bytes: &[u8]) -> Result<bool, &'static str> {
@@ -1569,6 +1738,27 @@ impl ComponentStreamPump {
         } else {
             Ok(false)
         }
+    }
+
+    /// Account one prefix only after Sunset accepted it for ChanData::Normal.
+    /// A checked overflow leaves both the retained prefix and counter intact;
+    /// the enclosing connection then fails closed.
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    fn consume_forwarded_stdout(&mut self, length: usize) -> Result<bool, &'static str> {
+        let forwarded_length = u64::try_from(length)
+            .map_err(|_| "SSH Component stdout byte accounting exceeded u64")?;
+        let next = self
+            .forwarded_stdout_bytes
+            .checked_add(forwarded_length)
+            .ok_or("SSH Component stdout byte accounting overflowed")?;
+        let consumed = self.consume_stdout(length)?;
+        self.forwarded_stdout_bytes = next;
+        Ok(consumed)
+    }
+
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    fn forwarded_stdout_bytes(&self) -> u64 {
+        self.forwarded_stdout_bytes
     }
 
     fn stdout_terminal(&self) -> Option<StreamCloseReason> {
@@ -2977,7 +3167,7 @@ fn pump_component_stdin_turn(
     runner: &mut Runner<'_, Server>,
     state: &ProtocolState,
     maximum: usize,
-    one_send_attempt: bool,
+    stage_exact_stdin: bool,
 ) -> Result<bool, &'static str> {
     if maximum == 0 || maximum > MAX_STREAM_CHUNK_BYTES {
         return Err("SSH Component stdin chunk limit was invalid");
@@ -3002,16 +3192,16 @@ fn pump_component_stdin_turn(
             // Cancelled terminal cannot be downgraded to a transport reset.
             return Ok(true);
         }
-        if one_send_attempt {
+        if stage_exact_stdin {
             return Ok(true);
         }
     }
 
-    #[cfg(feature = "native-revoke-target-acceptance")]
-    if one_send_attempt {
-        if pump.stdin_staging_length > maximum {
-            return Err("SSH Component stdin staging exceeded its exact chunk");
-        }
+    #[cfg(any(
+        feature = "native-revoke-target-acceptance",
+        feature = "c84-profile-trusted-sample"
+    ))]
+    if stage_exact_stdin {
         for _ in 0..MAX_CHANNEL_DISCARDS_PER_TURN {
             let remaining = maximum.saturating_sub(pump.stdin_staging_length);
             if remaining == 0 {
@@ -3030,19 +3220,14 @@ fn pump_component_stdin_turn(
             if data != ChanData::Normal {
                 return Err("extended data is not valid Component stdin");
             }
-            let length = ready.min(remaining);
-            let read = runner
-                .read_channel(
-                    channel,
-                    ChanData::Normal,
-                    &mut pump.stdin_staging
-                        [pump.stdin_staging_length..pump.stdin_staging_length + length],
-                )
-                .map_err(|_| "failed to read SSH Component stdin")?;
+            let read = pump.read_into_stdin_staging(maximum, ready, |staging| {
+                runner
+                    .read_channel(channel, ChanData::Normal, staging)
+                    .map_err(|_| "failed to read SSH Component stdin")
+            })?;
             if read == 0 {
                 break;
             }
-            pump.stdin_staging_length += read;
             worked = true;
         }
 
@@ -3051,23 +3236,14 @@ fn pump_component_stdin_turn(
             .as_ref()
             .ok_or("accepted Component session lost its channel")?;
         let eof = runner.read_channel_ready().is_none() && runner.is_channel_eof(channel);
-        if pump.stdin_staging_length == maximum || (eof && pump.stdin_staging_length != 0) {
-            let length = pump.stdin_staging_length;
-            let staged = pump.stdin_staging;
-            worked |= pump.send_stdin(&staged[..length])?;
-            pump.stdin_staging_length = 0;
-        }
-        if !pump.stdin_source_closed()
-            && !pump.has_pending_stdin()
-            && pump.stdin_staging_length == 0
-            && eof
-        {
-            worked |= pump.close_stdin_normal()?;
-        }
+        worked |= pump.finish_stdin_staging_turn(maximum, eof)?;
         return Ok(worked);
     }
-    #[cfg(not(feature = "native-revoke-target-acceptance"))]
-    let _ = one_send_attempt;
+    #[cfg(not(any(
+        feature = "native-revoke-target-acceptance",
+        feature = "c84-profile-trusted-sample"
+    )))]
+    let _ = stage_exact_stdin;
 
     let mut chunk = [0u8; MAX_STREAM_CHUNK_BYTES];
     for _ in 0..MAX_CHANNEL_DISCARDS_PER_TURN {
@@ -3130,7 +3306,10 @@ fn pump_component_stdout_turn(
         match runner.write_channel(channel, ChanData::Normal, pump.pending_stdout()) {
             Ok(0) => {}
             Ok(written) => {
+                #[cfg(not(feature = "c84-profile-trusted-sample"))]
                 pump.consume_stdout(written)?;
+                #[cfg(feature = "c84-profile-trusted-sample")]
+                pump.consume_forwarded_stdout(written)?;
                 worked = true;
             }
             Err(sunset::Error::NoRoom { .. } | sunset::Error::BusySend { .. }) => {}
@@ -4197,6 +4376,8 @@ async fn execute_managed_component_with_network(
     let mut completed = None;
     let mut expected_terminal = None;
     let mut drain_deadline = None;
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    let mut timeout_observed = false;
 
     let outcome = loop {
         #[cfg(feature = "c84-profile-phase-sidecar")]
@@ -4245,6 +4426,12 @@ async fn execute_managed_component_with_network(
         }
 
         if completed.is_none() && now >= execution_deadline {
+            #[cfg(feature = "c84-profile-trusted-sample")]
+            {
+                // Never clear this bit when immutable completion later wins
+                // the cancellation race.
+                timeout_observed = true;
+            }
             request_managed_component_cancel(&cancel);
             cancellation = Some((ExecutionCancellation::Timeout, now + CANCEL_GRACE_MS));
             continue;
@@ -4346,7 +4533,10 @@ async fn execute_managed_component_with_network(
             continue;
         }
 
-        #[cfg(feature = "native-revoke-target-acceptance")]
+        #[cfg(all(
+            feature = "native-revoke-target-acceptance",
+            not(feature = "c84-profile-trusted-sample")
+        ))]
         let stdin_chunk_limit = match space
             .ssh_exec_component_stdin_chunk_limit(_accepted_policy, pump.stdin_accepted_bytes())
         {
@@ -4364,15 +4554,29 @@ async fn execute_managed_component_with_network(
                 continue;
             }
         };
-        #[cfg(not(feature = "native-revoke-target-acceptance"))]
+        #[cfg(any(
+            not(feature = "native-revoke-target-acceptance"),
+            feature = "c84-profile-trusted-sample"
+        ))]
+        // The trusted formal call observes exactly 12 full 1 KiB reads and one
+        // 37-byte EOF tail, independent of any target-only revoke policy which
+        // happens to be compiled into the same SSHD crate.
         let stdin_chunk_limit = MAX_STREAM_CHUNK_BYTES;
         #[cfg(feature = "native-revoke-target-acceptance")]
         let drain_permitted = space.ssh_exec_component_stdout_drain_permitted(_accepted_policy);
         #[cfg(not(feature = "native-revoke-target-acceptance"))]
         let drain_permitted = true;
-        #[cfg(feature = "native-revoke-target-acceptance")]
+        #[cfg(feature = "c84-profile-trusted-sample")]
+        let stage_exact_stdin = true;
+        #[cfg(all(
+            not(feature = "c84-profile-trusted-sample"),
+            feature = "native-revoke-target-acceptance"
+        ))]
         let stage_exact_stdin = stdin_chunk_limit < MAX_STREAM_CHUNK_BYTES || !drain_permitted;
-        #[cfg(not(feature = "native-revoke-target-acceptance"))]
+        #[cfg(not(any(
+            feature = "c84-profile-trusted-sample",
+            feature = "native-revoke-target-acceptance"
+        )))]
         let stage_exact_stdin = false;
         #[cfg(feature = "c84-profile-phase-sidecar")]
         if reach_profile_host_phase(profile_run).is_err() {
@@ -4493,6 +4697,12 @@ async fn execute_managed_component_with_network(
     }
     #[cfg(not(feature = "c84-profile-phase-sidecar"))]
     shutdown.await;
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    if let Err(reason) =
+        seal_managed_component_profile_terminal(profile_run, &outcome, &pump, timeout_observed)
+    {
+        return ExecutionEnd::Reset(reason);
+    }
     outcome
 }
 
@@ -4521,6 +4731,50 @@ fn validated_managed_component_terminal(
     reports: &Result<Vec<vibeos_vsh::JobReport>, vibeos_vsh::Diagnostic>,
 ) -> Result<vibeos_vsh::ComponentTerminal, &'static str> {
     managed_component_terminal(reports).ok_or("SSH Component execution published no exact terminal")
+}
+
+/// Seal only the facts which remain true after managed execution, complete
+/// Component stdout drain, and `Session::shutdown`. The caller deliberately
+/// invokes this helper after the shutdown future returns.
+#[cfg(feature = "c84-profile-trusted-sample")]
+fn seal_managed_component_profile_terminal(
+    profile_run: &mut Option<SshExecProfileRun>,
+    outcome: &ExecutionEnd,
+    pump: &ComponentStreamPump,
+    timeout_observed: bool,
+) -> Result<(), &'static str> {
+    let Some(run) = profile_run.as_mut() else {
+        return Ok(());
+    };
+    let ExecutionEnd::Complete {
+        reports,
+        timed_out: reported_timed_out,
+    } = outcome
+    else {
+        return Ok(());
+    };
+    let terminal = validated_managed_component_terminal(reports)?;
+    if !pump.pending_stdout().is_empty() {
+        return Err("SSH Component profile terminal retained pending stdout");
+    }
+    if pump.stdout_terminal() != Some(terminal.stream_close_reason()) {
+        return Err("SSH Component profile terminal did not match stdout closure");
+    }
+    if *reported_timed_out && !timeout_observed {
+        return Err("SSH Component profile terminal lost its timeout observation");
+    }
+    let exit_status = if *reported_timed_out {
+        124
+    } else {
+        ssh_exit_status(terminal.status())
+    };
+    run.seal_terminal(SshExecProfileTerminal::seal(
+        terminal,
+        exit_status,
+        timeout_observed || *reported_timed_out,
+        pump.forwarded_stdout_bytes(),
+    ))
+    .map_err(|_| "SSH Component profile terminal was sealed twice")
 }
 
 #[derive(Debug)]
@@ -5315,12 +5569,28 @@ mod tests {
             Ok(())
         }
 
+        #[cfg(not(feature = "c84-profile-trusted-sample"))]
         fn response_boundary(&mut self, status: u32) -> Result<(), ()> {
             let backend = self as *mut Self as usize;
             self.trace
                 .boundary_backend
                 .store(backend, AtomicOrdering::SeqCst);
             self.trace.push(ProfileEvent::Boundary(status));
+            if self.trace.fail_boundary.load(AtomicOrdering::SeqCst) {
+                Err(())
+            } else {
+                Ok(())
+            }
+        }
+
+        #[cfg(feature = "c84-profile-trusted-sample")]
+        fn response_boundary(&mut self, terminal: SshExecProfileTerminal) -> Result<(), ()> {
+            let backend = self as *mut Self as usize;
+            self.trace
+                .boundary_backend
+                .store(backend, AtomicOrdering::SeqCst);
+            self.trace
+                .push(ProfileEvent::Boundary(terminal.exit_status()));
             if self.trace.fail_boundary.load(AtomicOrdering::SeqCst) {
                 Err(())
             } else {
@@ -5444,6 +5714,124 @@ mod tests {
     }
 
     #[cfg(feature = "c84-profile-request-parent")]
+    fn reach_test_profile_response_boundary(
+        profile_run: &mut Option<SshExecProfileRun>,
+        status: u32,
+    ) -> Result<(), ConnectionEnd> {
+        #[cfg(feature = "c84-profile-trusted-sample")]
+        if let Some(run) = profile_run.as_mut() {
+            let terminal = if status == 0 {
+                ComponentTerminal::Success
+            } else {
+                ComponentTerminal::Returned(
+                    u8::try_from(status).expect("test profile status exceeded u8"),
+                )
+            };
+            run.seal_terminal(SshExecProfileTerminal::seal(terminal, status, false, 0))
+                .expect("test profile terminal was sealed twice");
+        }
+        reach_profile_response_boundary(profile_run, status)
+    }
+
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct CapturedProfileTerminal {
+        component_terminal: ComponentTerminal,
+        exit_status: u32,
+        timed_out: bool,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
+    }
+
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    struct ProfileTerminalCapture {
+        terminal: SpinLock<Option<CapturedProfileTerminal>>,
+        cancels: AtomicUsize,
+    }
+
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    struct ProfileTerminalCaptureBackend {
+        capture: Arc<ProfileTerminalCapture>,
+    }
+
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    impl SshExecProfilePermitBackend for ProfileTerminalCaptureBackend {
+        fn start(&mut self) -> Result<(), ()> {
+            Ok(())
+        }
+
+        fn into_run(self: Box<Self>) -> Box<dyn SshExecProfileRunBackend> {
+            self
+        }
+
+        fn cancel(&mut self) {
+            self.capture.cancels.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    impl SshExecProfileRunBackend for ProfileTerminalCaptureBackend {
+        fn phase_host(&mut self) -> Result<(), ()> {
+            Ok(())
+        }
+
+        fn phase_wait(&mut self) -> Result<(), ()> {
+            Ok(())
+        }
+
+        fn response_boundary(&mut self, terminal: SshExecProfileTerminal) -> Result<(), ()> {
+            let captured = CapturedProfileTerminal {
+                component_terminal: terminal.component_terminal(),
+                exit_status: terminal.exit_status(),
+                timed_out: terminal.timed_out(),
+                stdout_bytes: terminal.stdout_bytes(),
+                stderr_bytes: terminal.stderr_bytes(),
+            };
+            let mut slot = self.capture.terminal.lock();
+            if slot.is_some() {
+                return Err(());
+            }
+            *slot = Some(captured);
+            Ok(())
+        }
+
+        fn cancel(&mut self) {
+            self.capture.cancels.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    fn profile_terminal_capture_run() -> (SshExecProfileRun, Arc<ProfileTerminalCapture>) {
+        let capture = Arc::new(ProfileTerminalCapture {
+            terminal: SpinLock::new(None),
+            cancels: AtomicUsize::new(0),
+        });
+        let run = SshExecProfilePermit::new(ProfileTerminalCaptureBackend {
+            capture: capture.clone(),
+        })
+        .start()
+        .unwrap();
+        (run, capture)
+    }
+
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    fn exact_component_reports(
+        terminal: ComponentTerminal,
+    ) -> Result<Vec<JobReport>, vibeos_vsh::Diagnostic> {
+        Ok(vec![JobReport {
+            id: 1,
+            status: terminal.status(),
+            stages: vec![StageReport {
+                stage: 0,
+                status: terminal.status(),
+                detail: TerminalDetail::Component(terminal),
+            }],
+            output: String::new(),
+            peak_pipe_depth: 0,
+        }])
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
     #[test]
     fn profile_request_parent_orders_prepare_succeed_start_and_one_boundary() {
         let (platform, profile, target, trace) = profile_fixture();
@@ -5474,8 +5862,8 @@ mod tests {
         let SessionStart::Exec(mut accepted) = SessionStart::Exec(accepted) else {
             unreachable!()
         };
-        assert!(reach_profile_response_boundary(&mut accepted.profile, 37).is_ok());
-        assert!(reach_profile_response_boundary(&mut accepted.profile, 99).is_ok());
+        assert!(reach_test_profile_response_boundary(&mut accepted.profile, 37).is_ok());
+        assert!(reach_test_profile_response_boundary(&mut accepted.profile, 99).is_ok());
         drop(accepted);
 
         assert_eq!(
@@ -5511,7 +5899,7 @@ mod tests {
         assert!(run.phase_host().is_ok());
         assert!(run.phase_wait().is_ok());
         assert!(run.phase_host().is_ok());
-        assert!(reach_profile_response_boundary(&mut accepted.profile, 41).is_ok());
+        assert!(reach_test_profile_response_boundary(&mut accepted.profile, 41).is_ok());
         drop(accepted);
 
         assert_eq!(
@@ -5592,8 +5980,8 @@ mod tests {
             .accept(|| Ok(()))
             .unwrap();
         trace.fail_boundary.store(true, AtomicOrdering::SeqCst);
-        assert!(reach_profile_response_boundary(&mut accepted.profile, 125).is_err());
-        assert!(reach_profile_response_boundary(&mut accepted.profile, 0).is_ok());
+        assert!(reach_test_profile_response_boundary(&mut accepted.profile, 125).is_err());
+        assert!(reach_test_profile_response_boundary(&mut accepted.profile, 0).is_ok());
         drop(accepted);
         assert_eq!(
             trace.snapshot(),
@@ -5626,6 +6014,145 @@ mod tests {
         assert!(trace.snapshot().is_empty());
     }
 
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    #[test]
+    fn profile_trusted_terminal_keeps_returned_zero_distinct_from_success() {
+        let success = SshExecProfileTerminal::seal(ComponentTerminal::Success, 0, false, 7);
+        let returned = SshExecProfileTerminal::seal(ComponentTerminal::Returned(0), 0, false, 7);
+
+        assert_eq!(success.exit_status(), 0);
+        assert_eq!(returned.exit_status(), 0);
+        assert_eq!(success.component_terminal(), ComponentTerminal::Success);
+        assert_eq!(
+            returned.component_terminal(),
+            ComponentTerminal::Returned(0)
+        );
+        assert_ne!(success.component_terminal(), returned.component_terminal());
+        assert!(!success.timed_out());
+        assert_eq!(success.stdout_bytes(), 7);
+        assert_eq!(success.stderr_bytes(), 0);
+    }
+
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    #[test]
+    fn profile_trusted_terminal_is_held_until_response_boundary() {
+        let (mut run, capture) = profile_terminal_capture_run();
+        run.seal_terminal(SshExecProfileTerminal::seal(
+            ComponentTerminal::Returned(0),
+            0,
+            true,
+            12_325,
+        ))
+        .unwrap();
+        assert_eq!(*capture.terminal.lock(), None);
+
+        assert!(run.response_boundary(0).is_ok());
+        assert_eq!(
+            *capture.terminal.lock(),
+            Some(CapturedProfileTerminal {
+                component_terminal: ComponentTerminal::Returned(0),
+                exit_status: 0,
+                timed_out: true,
+                stdout_bytes: 12_325,
+                stderr_bytes: 0,
+            })
+        );
+        assert_eq!(capture.cancels.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    #[test]
+    fn profile_trusted_response_requires_one_matching_seal() {
+        let (run, missing_capture) = profile_terminal_capture_run();
+        assert!(run.response_boundary(0).is_err());
+        assert_eq!(missing_capture.cancels.load(AtomicOrdering::SeqCst), 1);
+
+        let (mut run, mismatch_capture) = profile_terminal_capture_run();
+        run.seal_terminal(SshExecProfileTerminal::seal(
+            ComponentTerminal::Success,
+            0,
+            false,
+            0,
+        ))
+        .unwrap();
+        assert!(run.response_boundary(37).is_err());
+        assert_eq!(*mismatch_capture.terminal.lock(), None);
+        assert_eq!(mismatch_capture.cancels.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    #[test]
+    fn profile_trusted_completion_winner_retains_timeout_after_exact_shutdown_seal() {
+        let stdin_stream = ByteStream::new();
+        let stdout_stream = ByteStream::new();
+        let component_output = stdout_stream.writer();
+        let stdout_supervisor = stdout_stream.supervisor();
+        let mut pump =
+            ComponentStreamPump::from_endpoints(stdin_stream.writer(), stdout_stream.reader());
+        assert!(matches!(
+            component_output.close(StreamCloseReason::Normal),
+            StreamCloseOutcome::Published
+        ));
+        assert!(matches!(
+            stdout_supervisor.finalize(StreamCloseReason::Normal),
+            StreamCloseOutcome::Published | StreamCloseOutcome::AlreadyPublished
+        ));
+        assert!(pump.poll_stdout().unwrap());
+
+        let (run, capture) = profile_terminal_capture_run();
+        let mut profile_run = Some(run);
+        let outcome = ExecutionEnd::Complete {
+            reports: exact_component_reports(ComponentTerminal::Success),
+            timed_out: false,
+        };
+        seal_managed_component_profile_terminal(&mut profile_run, &outcome, &pump, true).unwrap();
+        profile_run.take().unwrap().response_boundary(0).unwrap();
+        assert!(capture.terminal.lock().as_ref().unwrap().timed_out);
+
+        let (mismatch, mismatch_capture) = profile_terminal_capture_run();
+        let mut mismatch = Some(mismatch);
+        let returned_zero = ExecutionEnd::Complete {
+            reports: exact_component_reports(ComponentTerminal::Returned(0)),
+            timed_out: false,
+        };
+        assert!(seal_managed_component_profile_terminal(
+            &mut mismatch,
+            &returned_zero,
+            &pump,
+            false,
+        )
+        .is_err());
+        drop(mismatch);
+        assert_eq!(mismatch_capture.cancels.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "c84-profile-trusted-sample")]
+    #[test]
+    fn component_profile_stdout_forwarding_uses_checked_accounting() {
+        let stdin_stream = ByteStream::new();
+        let stdout_stream = ByteStream::new();
+        let component_output = stdout_stream.writer();
+        let mut pump =
+            ComponentStreamPump::from_endpoints(stdin_stream.writer(), stdout_stream.reader());
+        assert_eq!(
+            component_output.start(&[0x53, 0x37, 0x84]),
+            Ok(StreamSendDispatch::Sent)
+        );
+        assert!(pump.poll_stdout().unwrap());
+
+        assert!(!pump.consume_forwarded_stdout(2).unwrap());
+        assert_eq!(pump.forwarded_stdout_bytes(), 2);
+        assert_eq!(pump.pending_stdout(), &[0x84]);
+
+        pump.forwarded_stdout_bytes = u64::MAX;
+        assert_eq!(
+            pump.consume_forwarded_stdout(1),
+            Err("SSH Component stdout byte accounting overflowed")
+        );
+        assert_eq!(pump.forwarded_stdout_bytes(), u64::MAX);
+        assert_eq!(pump.pending_stdout(), &[0x84]);
+    }
+
     #[test]
     fn component_wake_protocol_errors_have_exact_fail_closed_diagnostics() {
         assert_eq!(
@@ -5643,6 +6170,92 @@ mod tests {
         assert_eq!(
             reader.commit(prepared.operation(), &mut output[start..]),
             Ok(StreamReceiveCommit::Received(prepared.length()))
+        );
+    }
+
+    #[cfg(all(
+        feature = "c84-profile-trusted-sample",
+        feature = "native-revoke-target-acceptance"
+    ))]
+    #[test]
+    fn trusted_stdin_staging_coalesces_sunset_1000_plus_24_and_eof_37() {
+        fn stage_slice(pump: &mut ComponentStreamPump, slice: &[u8]) {
+            let read = pump
+                .read_into_stdin_staging(MAX_STREAM_CHUNK_BYTES, slice.len(), |destination| {
+                    assert_eq!(destination.len(), slice.len());
+                    destination.copy_from_slice(slice);
+                    Ok(slice.len())
+                })
+                .unwrap();
+            assert_eq!(read, slice.len());
+        }
+
+        let stdin_stream = ByteStream::new();
+        let stdout_stream = ByteStream::new();
+        let guest_stdin = stdin_stream.reader();
+        let stdin_supervisor = stdin_stream.supervisor();
+        let mut pump =
+            ComponentStreamPump::from_endpoints(stdin_stream.writer(), stdout_stream.reader());
+        let canonical: Vec<u8> = (0..MAX_STREAM_CHUNK_BYTES)
+            .map(|index| ((index * 17 + 3) % 251) as u8)
+            .collect();
+        let tail: Vec<u8> = (0..37).map(|index| (0xa0 + index) as u8).collect();
+
+        // Sunset exposes OpenSSH's first payload as 1000 bytes. It must remain
+        // staged until the following 24 bytes complete one canonical chunk.
+        stage_slice(&mut pump, &canonical[..1000]);
+        assert!(!pump
+            .finish_stdin_staging_turn(MAX_STREAM_CHUNK_BYTES, false)
+            .unwrap());
+        assert_eq!(pump.stdin_staging_length, 1000);
+        assert_eq!(stdin_stream.depth(), 0);
+
+        stage_slice(&mut pump, &canonical[1000..]);
+        assert!(pump
+            .finish_stdin_staging_turn(MAX_STREAM_CHUNK_BYTES, false)
+            .unwrap());
+        assert_eq!(pump.stdin_staging_length, 0);
+        assert_eq!(stdin_stream.depth(), 1);
+        let StreamReceiveDispatch::Prepared(full) = guest_stdin.start().unwrap() else {
+            panic!("coalesced stdin chunk was not prepared");
+        };
+        assert_eq!(full.length(), MAX_STREAM_CHUNK_BYTES);
+        let mut full_bytes = [0u8; MAX_STREAM_CHUNK_BYTES];
+        assert_eq!(
+            guest_stdin.commit(full.operation(), &mut full_bytes),
+            Ok(StreamReceiveCommit::Received(MAX_STREAM_CHUNK_BYTES))
+        );
+        assert_eq!(full_bytes.as_slice(), canonical.as_slice());
+
+        // A final short payload is emitted exactly once at EOF, then stdin is
+        // provisionally closed Normal for lifecycle-owned finalization.
+        stage_slice(&mut pump, &tail);
+        assert!(pump
+            .finish_stdin_staging_turn(MAX_STREAM_CHUNK_BYTES, true)
+            .unwrap());
+        assert_eq!(pump.stdin_staging_length, 0);
+        assert_eq!(stdin_stream.depth(), 1);
+        assert!(pump.stdin_source_closed());
+        assert!(stdin_stream.is_normal_provisional());
+        assert_eq!(pump.stdin_accepted_bytes, MAX_STREAM_CHUNK_BYTES + 37);
+        let StreamReceiveDispatch::Prepared(final_chunk) = guest_stdin.start().unwrap() else {
+            panic!("EOF stdin tail was not prepared");
+        };
+        assert_eq!(final_chunk.length(), 37);
+        let mut final_bytes = [0u8; 37];
+        assert_eq!(
+            guest_stdin.commit(final_chunk.operation(), &mut final_bytes),
+            Ok(StreamReceiveCommit::Received(37))
+        );
+        assert_eq!(final_bytes.as_slice(), tail.as_slice());
+        assert_eq!(stdin_stream.depth(), 0);
+        assert!(matches!(
+            stdin_supervisor.finalize(StreamCloseReason::Normal),
+            StreamCloseOutcome::Published
+        ));
+        assert_eq!(
+            guest_stdin.start(),
+            Ok(StreamReceiveDispatch::Closed(StreamCloseReason::Normal))
         );
     }
 

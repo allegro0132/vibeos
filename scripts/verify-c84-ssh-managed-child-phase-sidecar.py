@@ -38,6 +38,9 @@ FINISH_FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
 FINISH_QEMU_FEATURE = f"{FINISH_FEATURE}-qemu-acceptance"
 VERIFIED_STREAM_FEATURE = "wasm-c84-ssh-managed-child-verified-stream"
 VERIFIED_STREAM_QEMU_FEATURE = f"{VERIFIED_STREAM_FEATURE}-qemu-acceptance"
+TRUSTED_SAMPLE_FEATURE = "wasm-c84-ssh-managed-child-trusted-sample"
+TRUSTED_SAMPLE_QEMU_FEATURE = f"{TRUSTED_SAMPLE_FEATURE}-qemu-acceptance"
+SSHD_TRUSTED_SAMPLE_FEATURE = "c84-profile-trusted-sample"
 
 
 def load_core_verifier():
@@ -187,6 +190,10 @@ def verify_features(inputs: Inputs) -> None:
         sshd.get(SSHD_FEATURE) == [SSHD_PARENT_FEATURE],
         "sshd phase-sidecar feature does not extend only the request parent",
     )
+    require(
+        sshd.get(SSHD_TRUSTED_SAMPLE_FEATURE) == [SSHD_FEATURE],
+        "sshd trusted-sample feature does not extend only the phase sidecar",
+    )
 
     for label, features, name in (
         ("kernel", kernel, FEATURE),
@@ -224,6 +231,13 @@ def verify_features(inputs: Inputs) -> None:
     require(
         not any(name.endswith("-qemu-acceptance") for name in base_closure),
         "base phase sidecar enables acceptance-only telemetry",
+    )
+    trusted_closure = local_feature_closure(kernel, [TRUSTED_SAMPLE_FEATURE])
+    trusted_qemu_closure = local_feature_closure(kernel, [TRUSTED_SAMPLE_QEMU_FEATURE])
+    require(FEATURE in trusted_closure, "trusted-sample omits the phase-sidecar predecessor")
+    require(
+        QEMU_FEATURE in trusted_qemu_closure,
+        "trusted-sample QEMU omits the phase-sidecar QEMU predecessor",
     )
 
     root = semantic(inputs.kernel_root)
@@ -293,6 +307,7 @@ def verify_runtime(source: str) -> None:
 
 
 def verify_sshd(source: str) -> None:
+    source = CORE.without_direct_feature_units(source, SSHD_TRUSTED_SAMPLE_FEATURE)
     poll_import = "use core::future::{poll_fn, Future};"
     require(
         source.count(poll_import) == 1,
@@ -712,6 +727,8 @@ def verify_sshd(source: str) -> None:
 
 
 def verify_slot(source: str) -> None:
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
     sidecar = find_scope(source, r"\bstruct\s+ManagedPhaseSidecar\b", "phase sidecar storage")
     cfg_guarded(source, sidecar.start, "phase sidecar storage")
     sidecar_code = semantic(sidecar.raw)
@@ -1032,6 +1049,8 @@ def verify_slot(source: str) -> None:
 
 
 def verify_component(source: str) -> None:
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
     start = find_scope(source, r"\bfn\s+start_image_instance_under_control\b", "managed instance start")
     start_code = semantic(start.raw)
     ordered(
@@ -1415,6 +1434,8 @@ def verify_ssh(source: str) -> None:
     source = CORE.without_direct_feature_units(source, FINISH_QEMU_FEATURE)
     source = CORE.without_direct_feature_units(source, VERIFIED_STREAM_FEATURE)
     source = CORE.without_direct_feature_units(source, VERIFIED_STREAM_QEMU_FEATURE)
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
     backend = find_scope(
         source,
         r"\bimpl\s+SshExecProfileRunBackend\s+for\s+SshExecProfileOwner\b",

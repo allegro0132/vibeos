@@ -28,6 +28,9 @@ FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
 QEMU_FEATURE = f"{FEATURE}-qemu-acceptance"
 VERIFIED_STREAM_FEATURE = "wasm-c84-ssh-managed-child-verified-stream"
 VERIFIED_STREAM_QEMU_FEATURE = f"{VERIFIED_STREAM_FEATURE}-qemu-acceptance"
+TRUSTED_SAMPLE_FEATURE = "wasm-c84-ssh-managed-child-trusted-sample"
+TRUSTED_SAMPLE_QEMU_FEATURE = f"{TRUSTED_SAMPLE_FEATURE}-qemu-acceptance"
+SSHD_TRUSTED_SAMPLE_FEATURE = "c84-profile-trusted-sample"
 IRQ_FEATURE = "wasm-c84-ssh-managed-child-irq-overlay"
 IRQ_QEMU_FEATURE = f"{IRQ_FEATURE}-qemu-acceptance"
 STANDALONE_IRQ_QEMU_FEATURE = "wasm-c84-profile-irq-overlay-qemu-acceptance"
@@ -108,6 +111,18 @@ def cfg_guarded(source: str, offset: int, label: str, feature: str) -> None:
         raise VerificationError(str(error)) from error
 
 
+def cfg_guarded_finish_without_trusted(source: str, offset: int, label: str) -> None:
+    attributes = semantic(CORE.adjacent_outer_attributes(source, offset))
+    expected = semantic(
+        f'#[cfg(all(feature = "{FEATURE}", '
+        f'not(feature = "{TRUSTED_SAMPLE_FEATURE}")))]'
+    )
+    require(
+        attributes == expected,
+        f"{label} is not guarded by exact finish/verify minus trusted-sample",
+    )
+
+
 def ordered(value: str, needles: tuple[str, ...], label: str) -> None:
     positions: list[int] = []
     for needle in needles:
@@ -167,6 +182,26 @@ def verify_features(inputs: Inputs) -> None:
         "Milk-V does not expose only the silent finish/verify base seam",
     )
     require(QEMU_FEATURE not in milkv, "Milk-V exposes the QEMU finish/verify gate")
+    require(
+        kernel.get(TRUSTED_SAMPLE_FEATURE)
+        == [FEATURE, "vibeos-sshd/c84-profile-trusted-sample"],
+        "trusted-sample base is not the exact finish/verify successor",
+    )
+    require(
+        kernel.get(TRUSTED_SAMPLE_QEMU_FEATURE)
+        == [TRUSTED_SAMPLE_FEATURE, QEMU_FEATURE],
+        "kernel trusted-sample QEMU closure differs",
+    )
+    require(
+        qemu.get(TRUSTED_SAMPLE_QEMU_FEATURE)
+        == [QEMU_FEATURE, f"vibeos-kernel/{TRUSTED_SAMPLE_QEMU_FEATURE}"],
+        "QEMU firmware does not compose the exact finish predecessor and trusted successor",
+    )
+    require(
+        milkv.get(TRUSTED_SAMPLE_FEATURE)
+        == [f"vibeos-kernel/{TRUSTED_SAMPLE_FEATURE}"],
+        "Milk-V does not expose only the silent trusted-sample base seam",
+    )
 
     for label, features, name in (
         ("kernel", kernel, FEATURE),
@@ -194,6 +229,16 @@ def verify_features(inputs: Inputs) -> None:
         STANDALONE_IRQ_QEMU_FEATURE not in qemu_closure,
         "finish/verify composition selects the standalone IRQ worker",
     )
+    trusted_closure = PHASE.local_feature_closure(kernel, [TRUSTED_SAMPLE_FEATURE])
+    trusted_qemu_closure = PHASE.local_feature_closure(kernel, [TRUSTED_SAMPLE_QEMU_FEATURE])
+    verified_closure = PHASE.local_feature_closure(kernel, [VERIFIED_STREAM_FEATURE])
+    require(FEATURE in trusted_closure, "trusted-sample omits finish/verify")
+    require(QEMU_FEATURE in trusted_qemu_closure, "trusted-sample QEMU omits finish/verify QEMU")
+    require(
+        VERIFIED_STREAM_FEATURE not in trusted_closure
+        and TRUSTED_SAMPLE_FEATURE not in verified_closure,
+        "trusted-sample and verified-stream are not sibling finish successors",
+    )
 
     root = semantic(inputs.kernel_root)
     qemu_only = (
@@ -217,6 +262,16 @@ def verify_features(inputs: Inputs) -> None:
         'compile_error!("C8.4QEMUacceptancesareisolatedimages");'
     )
     require(isolation in root, "finish/verify QEMU isolation guard differs")
+    mutually_exclusive = (
+        f'#[cfg(all(feature="{TRUSTED_SAMPLE_FEATURE}",'
+        f'feature="{VERIFIED_STREAM_FEATURE}"))]compile_error!('
+        f'"features`{TRUSTED_SAMPLE_FEATURE}`and`{VERIFIED_STREAM_FEATURE}`'
+        'aremutuallyexclusivefinish/verifysuccessors");'
+    )
+    require(
+        mutually_exclusive in root,
+        "trusted-sample and verified-stream lack their exact mutual-exclusion guard",
+    )
     require(
         f'#[cfg(feature="{QEMU_FEATURE}")]exec::spawn' not in root,
         "finish/verify acceptance adds a standalone worker",
@@ -226,15 +281,25 @@ def verify_features(inputs: Inputs) -> None:
 def verify_direct_cfg(inputs: Inputs) -> None:
     ssh = CORE.without_direct_feature_units(inputs.ssh, VERIFIED_STREAM_FEATURE)
     ssh = CORE.without_direct_feature_units(ssh, VERIFIED_STREAM_QEMU_FEATURE)
+    ssh = CORE.without_direct_feature_units(ssh, TRUSTED_SAMPLE_FEATURE)
+    ssh = CORE.without_direct_feature_units(ssh, TRUSTED_SAMPLE_QEMU_FEATURE)
     kernel_root = CORE.without_direct_feature_units(
         inputs.kernel_root, VERIFIED_STREAM_FEATURE
     )
     kernel_root = CORE.without_direct_feature_units(
         kernel_root, VERIFIED_STREAM_QEMU_FEATURE
     )
+    kernel_root = CORE.without_direct_feature_units(
+        kernel_root, TRUSTED_SAMPLE_FEATURE
+    )
+    kernel_root = CORE.without_direct_feature_units(
+        kernel_root, TRUSTED_SAMPLE_QEMU_FEATURE
+    )
     sources = (
-        ("SSH", ssh, 5, 7, 8, 12),
-        ("kernel root", kernel_root, 0, 1, 0, 4),
+        ("SSH", ssh, 4, 7, 8, 12),
+        # The fifth all-form QEMU reference is the trusted sibling's pairing
+        # guard against reuse of this predecessor's discard transcript.
+        ("kernel root", kernel_root, 0, 1, 0, 5),
     )
     for label, source, base_direct, base_all, qemu_direct, qemu_all in sources:
         rust = CORE.rust_mask(source, literals=False)
@@ -318,6 +383,8 @@ def verify_target_typestate(source: str) -> None:
 
 
 def verify_slot_typestate(source: str) -> None:
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
     finish_active = find_scope(source, r"\bfn\s+finish_active\b", "slot finish_active")
     finish_code = semantic(finish_active.raw)
     ordered(
@@ -393,6 +460,7 @@ def verify_slot_typestate(source: str) -> None:
 
 
 def verify_sshd_boundary(source: str) -> None:
+    source = CORE.without_direct_feature_units(source, SSHD_TRUSTED_SAMPLE_FEATURE)
     backend = find_scope(
         source,
         r"\btrait\s+SshExecProfileRunBackend\b",
@@ -408,8 +476,26 @@ def verify_sshd_boundary(source: str) -> None:
 
 
 def verify_ssh(source: str) -> None:
+    trusted_owner = find_scope(
+        source, r"\bimpl\s+SshExecProfileOwner\b", "trusted SSH profile owner"
+    )
+    trusted_response = find_function(
+        trusted_owner, "response_boundary", "trusted SSH response boundary"
+    )
+    trusted_response_code = semantic(trusted_response.raw)
+    trusted_prerequisite = (
+        f'#[cfg(feature="{TRUSTED_SAMPLE_FEATURE}")]'
+        "lettrusted_terminal_prerequisite=terminal_seal.component_terminal()=="
+        "vibeos_vsh::ComponentTerminal::Success&&!terminal_seal.timed_out();"
+    )
+    require(
+        trusted_prerequisite in trusted_response_code,
+        "trusted sibling does not preserve exact Success plus no-timeout prerequisite",
+    )
     source = CORE.without_direct_feature_units(source, VERIFIED_STREAM_FEATURE)
     source = CORE.without_direct_feature_units(source, VERIFIED_STREAM_QEMU_FEATURE)
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
+    source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
     owner = find_scope(source, r"\bimpl\s+SshExecProfileOwner\b", "SSH profile owner")
     response = find_function(owner, "response_boundary", "SSH response boundary")
     cancel = find_function(owner, "cancel", "SSH active Drop")
@@ -421,7 +507,8 @@ def verify_ssh(source: str) -> None:
     )
     require(
         f'#[cfg(feature="{FEATURE}")]'
-        f'#[cfg(not(feature="{VERIFIED_STREAM_FEATURE}"))]'
+        f'#[cfg(not(any(feature="{VERIFIED_STREAM_FEATURE}",'
+        f'feature="{TRUSTED_SAMPLE_FEATURE}")))]'
         "letterminal=finish_verify_discard_and_ack_profile(run)"
         ".map(|ready_epoch|(ready_epoch,()));"
         in response_code,
@@ -433,7 +520,11 @@ def verify_ssh(source: str) -> None:
         "legacy cancel terminal is not the exact complement of finish/verify",
     )
     prerequisite = (
-        "ifstatus!=0||!child_ready||!profile_policy_is_current(self.policy){"
+        f'#[cfg(not(feature="{TRUSTED_SAMPLE_FEATURE}"))]'
+        "lettrusted_terminal_prerequisite=true;"
+        f'#[cfg(feature="{FEATURE}")]'
+        "ifstatus!=0||!trusted_terminal_prerequisite||!child_ready||"
+        "!profile_policy_is_current(self.policy){"
         "letrecycled=cancel_and_ack_profile(run,"
         "crate::wasm_aot_profile_slot::SlotFaults::default());"
     )
@@ -490,7 +581,9 @@ def verify_ssh(source: str) -> None:
         r"\bfn\s+finish_verify_discard_and_ack_profile\b",
         "finish/verify/discard helper",
     )
-    cfg_guarded(source, finish_helper.start, "finish/verify/discard helper", FEATURE)
+    cfg_guarded_finish_without_trusted(
+        source, finish_helper.start, "finish/verify/discard helper"
+    )
     helper_code = semantic(finish_helper.raw)
     ordered(
         helper_code,
@@ -741,8 +834,15 @@ def run_selftest(inputs: Inputs) -> int:
             lambda data: mutate_text(
                 data,
                 "ssh",
-                "if status != 0 || !child_ready || !profile_policy_is_current(self.policy) {",
-                "if !child_ready || !profile_policy_is_current(self.policy) {",
+                "if status != 0\n"
+                "            || !trusted_terminal_prerequisite\n"
+                "            || !child_ready\n"
+                "            || !profile_policy_is_current(self.policy)\n"
+                "        {",
+                "if !trusted_terminal_prerequisite\n"
+                "            || !child_ready\n"
+                "            || !profile_policy_is_current(self.policy)\n"
+                "        {",
                 "response status prerequisite",
             ),
         ),
@@ -761,8 +861,13 @@ def run_selftest(inputs: Inputs) -> int:
             lambda data: mutate_text(
                 data,
                 "ssh",
-                f'#[cfg(feature = "{FEATURE}")]\nfn finish_verify_discard_and_ack_profile',
-                f'#[cfg(any(feature = "{FEATURE}"))]\nfn finish_verify_discard_and_ack_profile',
+                "#[cfg(all(\n"
+                f'    feature = "{FEATURE}",\n'
+                f'    not(feature = "{TRUSTED_SAMPLE_FEATURE}")\n'
+                "))]\n"
+                "fn finish_verify_discard_and_ack_profile",
+                f'#[cfg(feature = "{FEATURE}")]\n'
+                "fn finish_verify_discard_and_ack_profile",
                 "finish helper guard",
             ),
         ),
@@ -772,7 +877,10 @@ def run_selftest(inputs: Inputs) -> int:
                 data,
                 "ssh",
                 f'#[cfg(feature = "{FEATURE}")]\n'
-                f'        #[cfg(not(feature = "{VERIFIED_STREAM_FEATURE}"))]\n'
+                "        #[cfg(not(any(\n"
+                f'            feature = "{VERIFIED_STREAM_FEATURE}",\n'
+                f'            feature = "{TRUSTED_SAMPLE_FEATURE}"\n'
+                "        )))]\n"
                 "        let terminal =\n"
                 "            finish_verify_discard_and_ack_profile(run)"
                 ".map(|ready_epoch| (ready_epoch, ()));",

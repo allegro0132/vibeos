@@ -24,6 +24,7 @@ wasm-c84-ssh-managed-child-core = ["vibeos-kernel/wasm-c84-ssh-managed-child-cor
 wasm-c84-ssh-managed-child-phase-sidecar = ["vibeos-kernel/wasm-c84-ssh-managed-child-phase-sidecar"]
 wasm-c84-ssh-managed-child-irq-overlay = ["vibeos-kernel/wasm-c84-ssh-managed-child-irq-overlay"]
 wasm-c84-ssh-managed-child-finish-verify = ["vibeos-kernel/wasm-c84-ssh-managed-child-finish-verify"]
+wasm-c84-ssh-managed-child-trusted-sample = ["vibeos-kernel/wasm-c84-ssh-managed-child-trusted-sample"]
 wasm-c84-ssh-managed-child-verified-stream = ["vibeos-kernel/wasm-c84-ssh-managed-child-verified-stream"]
 
 [[bin]]

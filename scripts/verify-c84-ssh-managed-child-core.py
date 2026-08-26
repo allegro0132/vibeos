@@ -42,6 +42,9 @@ FINISH_FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
 FINISH_QEMU_FEATURE = f"{FINISH_FEATURE}-qemu-acceptance"
 VERIFIED_STREAM_FEATURE = "wasm-c84-ssh-managed-child-verified-stream"
 VERIFIED_STREAM_QEMU_FEATURE = f"{VERIFIED_STREAM_FEATURE}-qemu-acceptance"
+TRUSTED_SAMPLE_FEATURE = "wasm-c84-ssh-managed-child-trusted-sample"
+TRUSTED_SAMPLE_QEMU_FEATURE = f"{TRUSTED_SAMPLE_FEATURE}-qemu-acceptance"
+TRUSTED_SAMPLE_SSHD_MEMBER = "vibeos-sshd/c84-profile-trusted-sample"
 
 
 class VerificationError(Exception):
@@ -353,6 +356,20 @@ def cfg_guarded(source: str, offset: int, label: str, feature: str = FEATURE) ->
     )
 
 
+def cfg_guarded_predecessor_with_trusted_exclusion(
+    source: str, offset: int, label: str, feature: str = FEATURE
+) -> None:
+    attributes = semantic(adjacent_outer_attributes(source, offset))
+    expected = semantic(
+        f'#[cfg(all(feature = "{feature}", '
+        f'not(feature = "{TRUSTED_SAMPLE_FEATURE}")))]'
+    )
+    require(
+        expected in attributes,
+        f"{label} is not guarded by exact {feature} minus trusted-sample",
+    )
+
+
 def parse_features(raw: bytes, label: str) -> dict[str, list[str]]:
     manifest = tomllib.loads(raw.decode("utf-8"))
     features = manifest.get("features")
@@ -430,6 +447,54 @@ def verify_features(inputs: "Inputs") -> None:
         "Milk-V enables the managed-child composition by default",
     )
 
+    require(
+        kernel.get(TRUSTED_SAMPLE_FEATURE)
+        == [FINISH_FEATURE, TRUSTED_SAMPLE_SSHD_MEMBER],
+        "kernel trusted-sample base closure differs",
+    )
+    require(
+        kernel.get(TRUSTED_SAMPLE_QEMU_FEATURE)
+        == [TRUSTED_SAMPLE_FEATURE, FINISH_QEMU_FEATURE],
+        "kernel trusted-sample QEMU closure differs",
+    )
+    require(
+        qemu.get(TRUSTED_SAMPLE_QEMU_FEATURE)
+        == [FINISH_QEMU_FEATURE, f"vibeos-kernel/{TRUSTED_SAMPLE_QEMU_FEATURE}"],
+        "QEMU firmware trusted-sample closure differs",
+    )
+    require(
+        milkv.get(TRUSTED_SAMPLE_FEATURE)
+        == [f"vibeos-kernel/{TRUSTED_SAMPLE_FEATURE}"],
+        "Milk-V does not expose only the silent trusted-sample base",
+    )
+    for label, features, name in (
+        ("kernel", kernel, TRUSTED_SAMPLE_FEATURE),
+        ("kernel", kernel, TRUSTED_SAMPLE_QEMU_FEATURE),
+        ("QEMU firmware", qemu, TRUSTED_SAMPLE_QEMU_FEATURE),
+        ("Milk-V firmware", milkv, TRUSTED_SAMPLE_FEATURE),
+    ):
+        require(
+            name not in local_feature_closure(features, features.get("default", [])),
+            f"{label} enables {name} by default",
+        )
+    trusted_closure = local_feature_closure(kernel, [TRUSTED_SAMPLE_FEATURE])
+    trusted_qemu_closure = local_feature_closure(kernel, [TRUSTED_SAMPLE_QEMU_FEATURE])
+    verified_closure = local_feature_closure(kernel, [VERIFIED_STREAM_FEATURE])
+    require(
+        FEATURE in trusted_closure and FINISH_FEATURE in trusted_closure,
+        "trusted-sample omits the managed-child Core or finish predecessor",
+    )
+    require(
+        QEMU_FEATURE in trusted_qemu_closure
+        and FINISH_QEMU_FEATURE in trusted_qemu_closure,
+        "trusted-sample QEMU omits the Core or finish QEMU predecessor",
+    )
+    require(
+        VERIFIED_STREAM_FEATURE not in trusted_closure
+        and TRUSTED_SAMPLE_FEATURE not in verified_closure,
+        "trusted-sample and verified-stream are not sibling successors",
+    )
+
     root = semantic(inputs.kernel_root)
     qemu_only = (
         f'#[cfg(all(feature="{QEMU_FEATURE}",not(feature="qemu-virt")))]'
@@ -455,6 +520,28 @@ def verify_features(inputs: "Inputs") -> None:
         'compile_error!("C8.4IRQoverlaycannotmodifyanexact-transcriptQEMUacceptanceimage");'
     )
     require(irq_guard in root, "request-backed QEMU gate is not protected from the IRQ overlay")
+    trusted_qemu_only = (
+        f'#[cfg(all(feature="{TRUSTED_SAMPLE_QEMU_FEATURE}",not(feature="qemu-virt")))]'
+        f'compile_error!("feature`{TRUSTED_SAMPLE_QEMU_FEATURE}`isQEMU-only");'
+    )
+    require(trusted_qemu_only in root, "trusted-sample acceptance lacks its QEMU-only guard")
+    mutually_exclusive = (
+        f'#[cfg(all(feature="{TRUSTED_SAMPLE_FEATURE}",'
+        f'feature="{VERIFIED_STREAM_FEATURE}"))]compile_error!('
+        f'"features`{TRUSTED_SAMPLE_FEATURE}`and`{VERIFIED_STREAM_FEATURE}`'
+        'aremutuallyexclusivefinish/verifysuccessors");'
+    )
+    require(
+        mutually_exclusive in root,
+        "trusted-sample and verified-stream lack their exact mutual-exclusion guard",
+    )
+    trusted_pairing = (
+        f'#[cfg(all(feature="{TRUSTED_SAMPLE_FEATURE}",'
+        f'feature="{FINISH_QEMU_FEATURE}",'
+        f'not(feature="{TRUSTED_SAMPLE_QEMU_FEATURE}")))]compile_error!('
+        f'"feature`{TRUSTED_SAMPLE_FEATURE}`cannotreusethediscard-onlyfinish/verifyQEMUtranscript");'
+    )
+    require(trusted_pairing in root, "trusted-sample can reuse discard-only finish telemetry")
 
 
 def verify_runtime(source: str) -> Scope:
@@ -490,6 +577,8 @@ def verify_runtime(source: str) -> Scope:
 
 
 def verify_component(source: str) -> tuple[Scope, Scope, Scope]:
+    source = without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
+    source = without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
     start = find_scope(
         source,
         r"\bfn\s+start_image_instance_under_control\b",
@@ -629,15 +718,16 @@ def verify_component(source: str) -> tuple[Scope, Scope, Scope]:
         "feature-off driver no longer uses ordinary call.poll",
     )
     success_gate = (
-        "ifprofile_epoch!=0&&terminal==ComponentTerminal::Success&&"
-        "crate::wasm_aot_profile_slot::mark_managed_child_driver_completed(profile_epoch).is_err()"
-        "{returnterminal_word(ComponentTerminal::RunnerFault);}"
+        "ifprofile_epoch!=0&&terminal==ComponentTerminal::Success{"
+        f'#[cfg(not(feature="{TRUSTED_SAMPLE_FEATURE}"))]'
+        "ifcrate::wasm_aot_profile_slot::mark_managed_child_driver_completed(profile_epoch).is_err()"
+        "{returnterminal_word(ComponentTerminal::RunnerFault);}}"
     )
     require(success_gate in run_code, "successful driver bit is not gated by exact Success")
     ordered(
         run_code,
         [
-            "TypedPoll::Ready(value)=>breakvalue",
+            "TypedPoll::Ready(value)=>{breakvalue;}",
             "letterminal=matchvalue",
             "terminal==ComponentTerminal::Success",
             "mark_managed_child_driver_completed(profile_epoch)",
@@ -669,6 +759,8 @@ def verify_component(source: str) -> tuple[Scope, Scope, Scope]:
 
 
 def verify_slot(source: str) -> tuple[Scope, ...]:
+    source = without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
+    source = without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
     attach = find_scope(
         source,
         r"\bpub\(crate\)\s+fn\s+attach_current_request_managed_child\b",
@@ -899,7 +991,6 @@ def verify_slot(source: str) -> tuple[Scope, ...]:
         (state, "managed-child driver state"),
         (release, "current managed-child release"),
         (abandon, "current managed-child abandonment"),
-        (mark, "managed-child successful driver marker"),
         (clock_struct, "managed-child clock storage"),
         (clock_impl, "managed-child clock impl"),
         (clock, "managed-child ProfileClock"),
@@ -908,6 +999,9 @@ def verify_slot(source: str) -> tuple[Scope, ...]:
         (drop_faults, "managed-child Drop fault set"),
     ):
         cfg_guarded(source, item.start, label)
+    cfg_guarded_predecessor_with_trusted_exclusion(
+        source, mark.start, "managed-child successful driver marker"
+    )
 
     integration = "".join(
         item.raw
@@ -951,6 +1045,8 @@ def verify_ssh(source: str) -> tuple[Scope, Scope, Scope]:
     source = without_direct_feature_units(source, FINISH_QEMU_FEATURE)
     source = without_direct_feature_units(source, VERIFIED_STREAM_FEATURE)
     source = without_direct_feature_units(source, VERIFIED_STREAM_QEMU_FEATURE)
+    source = without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
+    source = without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
     owner = find_scope(source, r"\bimpl\s+SshExecProfileOwner\b", "SSH profile owner")
     response = find_function(owner, "response_boundary", "SSH response boundary")
     cancel = find_function(owner, "cancel", "SSH request Drop/cancel")
@@ -1340,8 +1436,8 @@ def run_selftest(inputs: Inputs) -> int:
                 data,
                 component=replace_once(
                     data.component,
-                    "        && terminal == ComponentTerminal::Success\n",
-                    "        && true\n",
+                    "if profile_epoch != 0 && terminal == ComponentTerminal::Success {",
+                    "if profile_epoch != 0 && true {",
                     "driver-success-bit-unconditional",
                 ),
             ),

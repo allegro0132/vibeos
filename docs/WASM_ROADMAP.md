@@ -6,10 +6,13 @@ VibeOS. It complements [BLUEPRINT.md](BLUEPRINT.md),
 [CAPABILITY_SHELL.md](CAPABILITY_SHELL.md), and
 [PROGRAM_PERSISTENCE.md](PROGRAM_PERSISTENCE.md).
 
-**Status (2026-08-12): planned.** VibeOS does not currently contain a Core
-WebAssembly validator or interpreter, a Component Model decoder, a Canonical
-ABI implementation, a WASI adapter, or a component loader. Everything below is
-a roadmap, not an implementation claim.
+**Status (2026-08-27): implementation in progress.** The repository now contains
+bounded Core validation/execution, Component decoding and Canonical ABI,
+admission/loading, compatibility, and C8 profiling evidence. The dependency
+sequence and acceptance text below remain the roadmap rather than a claim that
+every milestone is complete. Current C8.3/C8.4 evidence and its explicit
+remaining gaps are tracked in [WASM_AOT_DECISION.md](WASM_AOT_DECISION.md) and
+[TESTING.md](../TESTING.md).
 
 ---
 
@@ -511,6 +514,12 @@ component security boundary is measured and stable.
 | C8.6 | Reuse the sealed W^X lifecycle | Link RW-NX, validate imports/relocations, seal X-only, execute, quiesce, unseal, zero and reclaim; no JIT or RWX page exists |
 | C8.7 | Regenerate or verify native output | A pinned trusted compiler reproduces native bytes, or an equivalently reviewed verifier proves the accepted surface before execution |
 | C8.8 | Widen profiles one feature at a time | Float, SIMD, references, exceptions, memory64, multiple memories, GC, threads or broader WASI each require separate semantics and evidence |
+
+As of 2026-08-27, the C8.4 chain has reached the live trusted-terminal and
+opaque verified-sample closure. The private 24-sample collector, retained
+physical-Duo/cold-boot evidence, and the final workload-specific AOT decision
+remain open; the implementation must not infer them from the QEMU diagnostic
+records.
 
 ## 10. Test and evidence matrix
 

@@ -13,6 +13,10 @@ c84-profile-request-parent = []
 # parent. This adds only non-consuming Host/Wait observations to the ownership
 # seam; it does not finish, verify, stream, or publish a profile.
 c84-profile-phase-sidecar = ["c84-profile-request-parent"]
+# Default-off trusted terminal sample for the exact managed Component request.
+# This seals terminal/drain observations into the live request parent but does
+# not interpret eligibility, finish verification, or publish a profile.
+c84-profile-trusted-sample = ["c84-profile-phase-sidecar"]
 # Target-only coordination for the C5.4c managed-native revoke gate. The
 # production/Milk-V Platform surface remains default-open when this is absent.
 native-revoke-target-acceptance = []

@@ -235,6 +235,8 @@ jobs:
         run: ./scripts/qemu-c84-ssh-managed-child-phase-sidecar-test.sh
       - name: Exercise the C8.4 SSH managed-child IRQ-overlay composition
         run: ./scripts/qemu-c84-ssh-managed-child-irq-overlay-test.sh
+      - name: Exercise the C8.4 SSH managed-child finish/verify closure
+        run: ./scripts/qemu-c84-ssh-managed-child-finish-verify-test.sh
       # Keep these closed-source-state gates before the ordinary Duo build,
       # which applies the reviewed jitterentropy patch inside its submodule.
       - name: Build the isolated Milk-V Duo C8.3 sampler (CI-only identity)

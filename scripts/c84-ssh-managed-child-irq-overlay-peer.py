@@ -37,6 +37,8 @@ def load_module(name: str, path: Path):
 
 PHASE = load_module("vibeos_c84_managed_child_irq_phase_peer", PHASE_PEER_PATH)
 REQUEST = load_module("vibeos_c84_managed_child_irq_request_verifier", REQUEST_VERIFIER_PATH)
+LEGACY_CANCEL = REQUEST.LEGACY_CANCEL
+FINISH_VERIFY = REQUEST.FINISH_VERIFY
 
 
 class DriverError(Exception):
@@ -48,12 +50,13 @@ def require(condition: bool, message: str) -> None:
         raise DriverError(message)
 
 
-def response_line(epoch: int) -> str:
+def response_line(epoch: int, terminal_mode: str = LEGACY_CANCEL) -> str:
     first = int(epoch == 1)
     return (
         f"{FAMILY} RESPONSE epoch={epoch} status=0 "
         f"parent_pair={first} child_pair={first} terminal_inactive=1 "
-        f"paired=2 inactive={epoch} active_epoch=0 cancel=1 ack=1 "
+        f"paired=2 inactive={epoch} active_epoch=0 "
+        f"{REQUEST.response_terminal_suffix(terminal_mode)} "
         f"ready_epoch={epoch + 1}"
     )
 
@@ -66,14 +69,19 @@ def drop_line(epoch: int) -> str:
     )
 
 
-EXPECTED_IRQ_MARKERS = [
-    f"{FAMILY} PARENT_SSIP epoch=1 causal=1 paired=1 inactive=0 active_epoch=1",
-    f"{FAMILY} CHILD_SSIP epoch=1 causal=1 paired=2 inactive=0 active_epoch=1",
-    response_line(1),
-    response_line(2),
-    drop_line(3),
-    response_line(4),
-]
+def expected_irq_markers(terminal_mode: str = LEGACY_CANCEL) -> list[str]:
+    return [
+        f"{FAMILY} PARENT_SSIP epoch=1 causal=1 paired=1 inactive=0 active_epoch=1",
+        f"{FAMILY} CHILD_SSIP epoch=1 causal=1 paired=2 inactive=0 active_epoch=1",
+        response_line(1, terminal_mode),
+        response_line(2, terminal_mode),
+        drop_line(3),
+        response_line(4, terminal_mode),
+    ]
+
+
+# Frozen compatibility export for the committed IRQ-overlay gate.
+EXPECTED_IRQ_MARKERS = expected_irq_markers()
 
 
 def normalized_snapshot(raw: bytes, *, ignore_incomplete_tail: bool = False) -> list[str]:
@@ -115,7 +123,7 @@ def require_unique_order(lines: list[str], needles: list[str], label: str) -> No
     require(positions == sorted(positions), f"{label} marker order differs: {needles!r}")
 
 
-def verify_global_order(path: Path) -> None:
+def verify_global_order(path: Path, terminal_mode: str = LEGACY_CANCEL) -> None:
     lines = normalized_lines(path)
     require_unique_order(
         lines,
@@ -138,7 +146,7 @@ def verify_global_order(path: Path) -> None:
                 f"{PHASE_FAMILY} RESPONSE epoch={epoch} status=0 ",
                 f"{CORE_FAMILY} RESPONSE epoch={epoch} status=0 ",
                 f"{REQUEST_FAMILY} RESPONSE epoch={epoch} status=0 ",
-                response_line(epoch),
+                response_line(epoch, terminal_mode),
             ],
             f"normal epoch {epoch} terminal chain",
         )
@@ -153,7 +161,9 @@ def verify_global_order(path: Path) -> None:
         "Drop epoch 3 terminal chain",
     )
     for epoch in (1, 2, 3):
-        terminal = response_line(epoch) if epoch != 3 else drop_line(epoch)
+        terminal = (
+            response_line(epoch, terminal_mode) if epoch != 3 else drop_line(epoch)
+        )
         require_unique_order(
             lines,
             [terminal, f"{REQUEST_FAMILY} START epoch={epoch + 1}"],
@@ -161,20 +171,26 @@ def verify_global_order(path: Path) -> None:
         )
 
 
-def verify_closed_sequence(path: Path):
-    phase = PHASE.verify_closed_sequence(path)
-    REQUEST.verify_qemu_transcript(path.read_bytes())
+def verify_closed_sequence(path: Path, terminal_mode: str = LEGACY_CANCEL):
+    phase = PHASE.verify_closed_sequence(path, terminal_mode)
+    REQUEST.verify_qemu_transcript(path.read_bytes(), terminal_mode)
     observed = family_markers(path)
+    expected = expected_irq_markers(terminal_mode)
     require(
-        observed == EXPECTED_IRQ_MARKERS,
+        observed == expected,
         f"IRQ-overlay marker sequence differs: observed={observed!r}",
     )
-    verify_global_order(path)
+    verify_global_order(path, terminal_mode)
     return phase
 
 
-def wait_for_irq_prefix(path: Path, expected_count: int, timeout: float) -> None:
-    expected = EXPECTED_IRQ_MARKERS[:expected_count]
+def wait_for_irq_prefix(
+    path: Path,
+    expected_count: int,
+    timeout: float,
+    terminal_mode: str = LEGACY_CANCEL,
+) -> None:
+    expected = expected_irq_markers(terminal_mode)[:expected_count]
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         observed = family_markers(path, ignore_incomplete_tail=True)
@@ -192,7 +208,7 @@ def wait_for_irq_prefix(path: Path, expected_count: int, timeout: float) -> None
     raise DriverError(f"timed out waiting for IRQ-overlay marker {expected_count}")
 
 
-def core_normal_lines(epoch: int) -> list[str]:
+def core_normal_lines(epoch: int, terminal_mode: str = LEGACY_CANCEL) -> list[str]:
     core_polls = PHASE.DELAYED_CORE_POLLS if epoch == 2 else PHASE.CORE.EXPECTED_CORE_POLLS
     typed_polls = PHASE.DELAYED_TYPED_POLLS if epoch == 2 else PHASE.CORE.EXPECTED_TYPED_POLLS
     return [
@@ -200,30 +216,34 @@ def core_normal_lines(epoch: int) -> list[str]:
         f"{CORE_FAMILY} CLAIM epoch={epoch} child_index=0 first_poll=1",
         f"{CORE_FAMILY} CORE epoch={epoch} ordinary=1 first_pair=1",
         f"{CORE_FAMILY} RELEASE epoch={epoch} normal_driver=1",
-        f"{CORE_FAMILY} RESPONSE epoch={epoch} status=0 claim=1 release=1 "
-        f"detach=exited clean=1 core_polls={core_polls} observer_pairs={core_polls} "
-        f"typed_polls={typed_polls} observer_closed=1 cancel=1 ack=1 ready_epoch={epoch + 1}",
+        PHASE.CORE.normal_response_line(
+            epoch,
+            terminal_mode,
+            core_polls=core_polls,
+            typed_polls=typed_polls,
+        ),
     ]
 
 
-def synthetic_closed_lines() -> list[str]:
+def synthetic_closed_lines(terminal_mode: str = LEGACY_CANCEL) -> list[str]:
     output: list[str] = []
-    request = REQUEST.EXPECTED_QEMU_MARKERS
+    request = REQUEST.expected_qemu_markers(terminal_mode)
+    irq = expected_irq_markers(terminal_mode)
     request_cursor = 0
     irq_cursor = 0
     for epoch in (1, 2):
-        phase = PHASE.normal_lines(epoch)
-        core = core_normal_lines(epoch)
+        phase = PHASE.normal_lines(epoch, terminal_mode)
+        core = core_normal_lines(epoch, terminal_mode)
         output.append(request[request_cursor])
         request_cursor += 1
         if epoch == 1:
-            output.append(EXPECTED_IRQ_MARKERS[irq_cursor])
+            output.append(irq[irq_cursor])
             irq_cursor += 1
         output.extend(core[:2])
         prefix = 5 if epoch == 2 else 4
         output.extend(phase[:3])
         if epoch == 1:
-            output.append(EXPECTED_IRQ_MARKERS[irq_cursor])
+            output.append(irq[irq_cursor])
             irq_cursor += 1
         output.append(core[2])
         output.extend(phase[3:prefix])
@@ -233,7 +253,7 @@ def synthetic_closed_lines() -> list[str]:
         output.append(core[4])
         output.append(request[request_cursor])
         request_cursor += 1
-        output.append(EXPECTED_IRQ_MARKERS[irq_cursor])
+        output.append(irq[irq_cursor])
         irq_cursor += 1
 
     output.append(request[request_cursor])
@@ -261,12 +281,12 @@ def synthetic_closed_lines() -> list[str]:
     output.append(core_drop[3])
     output.append(request[request_cursor])
     request_cursor += 1
-    output.append(EXPECTED_IRQ_MARKERS[irq_cursor])
+    output.append(irq[irq_cursor])
     irq_cursor += 1
 
     epoch = 4
-    phase = PHASE.normal_lines(epoch)
-    core = core_normal_lines(epoch)
+    phase = PHASE.normal_lines(epoch, terminal_mode)
+    core = core_normal_lines(epoch, terminal_mode)
     output.append(request[request_cursor])
     request_cursor += 1
     output.extend(core[:2])
@@ -278,7 +298,7 @@ def synthetic_closed_lines() -> list[str]:
     output.extend(phase[5:])
     output.append(core[4])
     output.append(request[request_cursor])
-    output.append(EXPECTED_IRQ_MARKERS[irq_cursor])
+    output.append(irq[irq_cursor])
     return output
 
 
@@ -301,10 +321,12 @@ def run_parser_selftest() -> int:
             "live parser discarded a complete IRQ UART record",
         )
 
-        def accepted(lines: list[str]) -> bool:
+        def accepted(
+            lines: list[str], terminal_mode: str = LEGACY_CANCEL
+        ) -> bool:
             log.write_text("\n".join(lines) + "\n", encoding="utf-8")
             try:
-                verify_closed_sequence(log)
+                verify_closed_sequence(log, terminal_mode)
             except (DriverError, PHASE.DriverError, PHASE.CORE.DriverError, REQUEST.VerificationError):
                 return False
             return True
@@ -376,7 +398,24 @@ def run_parser_selftest() -> int:
 
         for label, mutated in mutations:
             require(not accepted(mutated), f"parser selftest mutation was accepted: {label}")
-    return len(mutations) + 2
+
+        successor = synthetic_closed_lines(FINISH_VERIFY)
+        require(
+            accepted(successor, FINISH_VERIFY),
+            "synthetic finish/verify IRQ transcript was rejected",
+        )
+        require(
+            not accepted(successor, LEGACY_CANCEL),
+            "legacy IRQ mode accepted the finish/verify transcript",
+        )
+        mixed = list(successor)
+        successor_irq = expected_irq_markers(FINISH_VERIFY)
+        mixed[mixed.index(successor_irq[3])] = EXPECTED_IRQ_MARKERS[3]
+        require(
+            not accepted(mixed, FINISH_VERIFY),
+            "finish/verify IRQ mode accepted a legacy epoch-2 terminal",
+        )
+    return len(mutations) + 5
 
 
 def parser() -> argparse.ArgumentParser:

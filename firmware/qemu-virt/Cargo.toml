@@ -86,6 +86,12 @@ wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance = [
     "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance",
     "vibeos-kernel/wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance",
 ]
+# Successor-only OpenSSH terminal gate. It inherits the exact IRQ transcript
+# image and promotes successful responses to finish/verify/explicit discard.
+wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance",
+    "vibeos-kernel/wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
 ssh-test = [
     "vibeos-kernel/ssh-test",

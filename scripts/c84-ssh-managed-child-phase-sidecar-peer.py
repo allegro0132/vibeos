@@ -46,6 +46,8 @@ CORE = load_core_peer()
 PEER = CORE.PEER
 DELAYED_CORE_POLLS = CORE.EXPECTED_CORE_POLLS + 4
 DELAYED_TYPED_POLLS = CORE.EXPECTED_TYPED_POLLS + 10
+LEGACY_CANCEL = CORE.LEGACY_CANCEL
+FINISH_VERIFY = CORE.FINISH_VERIFY
 
 
 class DriverError(Exception):
@@ -253,22 +255,28 @@ def require_normal_counters(counters: PhaseCounters, epoch: int) -> None:
     )
 
 
-NORMAL_RESPONSE = re.compile(
-    rf"^{FAMILY} RESPONSE epoch=(?P<epoch>{NUMBER}) status=0 "
-    rf"child_core_starts=(?P<child_core_starts>{NUMBER}) "
-    rf"child_core_finishes=(?P<child_core_finishes>{NUMBER}) "
-    rf"child_host_starts=(?P<child_host_starts>{NUMBER}) "
-    rf"child_host_finishes=(?P<child_host_finishes>{NUMBER}) "
-    rf"child_wait_starts=(?P<child_wait_starts>{NUMBER}) "
-    rf"child_wait_finishes=(?P<child_wait_finishes>{NUMBER}) "
-    rf"cleanup_count=(?P<cleanup_count>{NUMBER}) "
-    rf"parent_host_starts=(?P<parent_host_starts>{NUMBER}) "
-    rf"parent_host_finishes=(?P<parent_host_finishes>{NUMBER}) "
-    rf"parent_wait_starts=(?P<parent_wait_starts>{NUMBER}) "
-    rf"parent_wait_finishes=(?P<parent_wait_finishes>{NUMBER}) "
-    rf"child_wait_open=0 parent_wait_open=0 late=0 clean=1 cancel=1 ack=1 "
-    rf"ready_epoch=(?P<ready_epoch>{NUMBER})$"
-)
+def normal_response_pattern(terminal_mode: str = LEGACY_CANCEL) -> re.Pattern[str]:
+    suffix = re.escape(CORE.response_terminal_suffix(terminal_mode))
+    return re.compile(
+        rf"^{FAMILY} RESPONSE epoch=(?P<epoch>{NUMBER}) status=0 "
+        rf"child_core_starts=(?P<child_core_starts>{NUMBER}) "
+        rf"child_core_finishes=(?P<child_core_finishes>{NUMBER}) "
+        rf"child_host_starts=(?P<child_host_starts>{NUMBER}) "
+        rf"child_host_finishes=(?P<child_host_finishes>{NUMBER}) "
+        rf"child_wait_starts=(?P<child_wait_starts>{NUMBER}) "
+        rf"child_wait_finishes=(?P<child_wait_finishes>{NUMBER}) "
+        rf"cleanup_count=(?P<cleanup_count>{NUMBER}) "
+        rf"parent_host_starts=(?P<parent_host_starts>{NUMBER}) "
+        rf"parent_host_finishes=(?P<parent_host_finishes>{NUMBER}) "
+        rf"parent_wait_starts=(?P<parent_wait_starts>{NUMBER}) "
+        rf"parent_wait_finishes=(?P<parent_wait_finishes>{NUMBER}) "
+        rf"child_wait_open=0 parent_wait_open=0 late=0 clean=1 {suffix} "
+        rf"ready_epoch=(?P<ready_epoch>{NUMBER})$"
+    )
+
+
+# Compatibility export used by predecessor callers.
+NORMAL_RESPONSE = normal_response_pattern()
 
 
 DROP_RESPONSE = re.compile(
@@ -291,7 +299,11 @@ DROP_RESPONSE = re.compile(
 )
 
 
-def parse_normal_transaction(lines: list[str], epoch: int) -> NormalObservation:
+def parse_normal_transaction(
+    lines: list[str],
+    epoch: int,
+    terminal_mode: str = LEGACY_CANCEL,
+) -> NormalObservation:
     expected_prefix = [
         f"{FAMILY} CHILD_PHASE epoch={epoch} phase=validation",
         f"{FAMILY} CHILD_PHASE epoch={epoch} phase=instantiation",
@@ -313,7 +325,7 @@ def parse_normal_transaction(lines: list[str], epoch: int) -> NormalObservation:
         f"normal epoch {epoch} marker count differs: {lines!r}",
     )
     require(lines[:-1] == expected_prefix, f"normal epoch {epoch} phase sequence differs: {lines!r}")
-    response = NORMAL_RESPONSE.fullmatch(lines[-1])
+    response = normal_response_pattern(terminal_mode).fullmatch(lines[-1])
     require(response is not None, f"normal epoch {epoch} RESPONSE differs: {lines[-1]!r}")
     assert response is not None
     require(int(response.group("epoch")) == epoch, f"normal epoch {epoch} RESPONSE epoch differs")
@@ -371,9 +383,13 @@ def parse_drop_transaction(lines: list[str], epoch: int) -> DropObservation:
     return DropObservation(epoch, counters)
 
 
-def parse_core_normal_transaction(lines: list[str], epoch: int):
+def parse_core_normal_transaction(
+    lines: list[str],
+    epoch: int,
+    terminal_mode: str = LEGACY_CANCEL,
+):
     if epoch != 2:
-        return CORE.parse_normal_transaction(lines, epoch)
+        return CORE.parse_normal_transaction(lines, epoch, terminal_mode)
     fixed = [
         f"{CORE_FAMILY} BIND epoch=2 child_index=0 before_publish=1",
         f"{CORE_FAMILY} CLAIM epoch=2 child_index=0 first_poll=1",
@@ -382,26 +398,32 @@ def parse_core_normal_transaction(lines: list[str], epoch: int):
     ]
     require(len(lines) == 5, f"delayed epoch 2 Core marker count differs: {lines!r}")
     require(lines[:4] == fixed, f"delayed epoch 2 Core sequence differs: {lines!r}")
-    expected_response = (
-        f"{CORE_FAMILY} RESPONSE epoch=2 status=0 claim=1 release=1 "
-        f"detach=exited clean=1 core_polls={DELAYED_CORE_POLLS} "
-        f"observer_pairs={DELAYED_CORE_POLLS} typed_polls={DELAYED_TYPED_POLLS} "
-        "observer_closed=1 cancel=1 ack=1 ready_epoch=3"
+    expected_response = CORE.normal_response_line(
+        2,
+        terminal_mode,
+        core_polls=DELAYED_CORE_POLLS,
+        typed_polls=DELAYED_TYPED_POLLS,
     )
     require(lines[4] == expected_response, f"delayed epoch 2 Core RESPONSE differs: {lines[4]!r}")
     return CORE.NormalObservation(2, DELAYED_CORE_POLLS, DELAYED_CORE_POLLS, DELAYED_TYPED_POLLS)
 
 
-def verify_combined_core_sequence(path: Path):
+def verify_combined_core_sequence(path: Path, terminal_mode: str = LEGACY_CANCEL):
     markers = family_markers(path, CORE_FAMILY)
     cursor = 0
     normal = []
     for epoch in (1, 2):
-        normal.append(parse_core_normal_transaction(markers[cursor : cursor + 5], epoch))
+        normal.append(
+            parse_core_normal_transaction(
+                markers[cursor : cursor + 5], epoch, terminal_mode
+            )
+        )
         cursor += 5
     dropped = CORE.parse_drop_transaction(markers[cursor : cursor + 4], 3)
     cursor += 4
-    normal.append(parse_core_normal_transaction(markers[cursor : cursor + 5], 4))
+    normal.append(
+        parse_core_normal_transaction(markers[cursor : cursor + 5], 4, terminal_mode)
+    )
     cursor += 5
     require(
         cursor == len(markers),
@@ -481,6 +503,7 @@ def normal_profiled_request(
     epoch: int,
     *,
     await_readiness: bool = True,
+    terminal_mode: str = LEGACY_CANCEL,
 ) -> NormalObservation:
     if await_readiness:
         wait_ready(arguments, ssh)
@@ -519,8 +542,12 @@ def normal_profiled_request(
     core_after = family_markers(arguments.qemu_log, CORE_FAMILY)
     require(phase_after[: len(phase_before)] == phase_before, f"normal epoch {epoch} rewrote phase markers")
     require(core_after[: len(core_before)] == core_before, f"normal epoch {epoch} rewrote Core markers")
-    observation = parse_normal_transaction(phase_after[len(phase_before) :], epoch)
-    parse_core_normal_transaction(core_after[len(core_before) :], epoch)
+    observation = parse_normal_transaction(
+        phase_after[len(phase_before) :], epoch, terminal_mode
+    )
+    parse_core_normal_transaction(
+        core_after[len(core_before) :], epoch, terminal_mode
+    )
     require_global_normal_order(arguments.qemu_log, epoch)
     return observation
 
@@ -578,20 +605,29 @@ def post_drop_readiness(arguments: argparse.Namespace, ssh: str) -> None:
     require_unchanged_families(arguments.qemu_log, phase_before, core_before, "post-Drop readiness")
 
 
-def verify_closed_sequence(path: Path) -> tuple[list[NormalObservation], DropObservation]:
+def verify_closed_sequence(
+    path: Path,
+    terminal_mode: str = LEGACY_CANCEL,
+) -> tuple[list[NormalObservation], DropObservation]:
     markers = family_markers(path)
     cursor = 0
     normal: list[NormalObservation] = []
     for epoch, count in ((1, 7), (2, 8)):
-        normal.append(parse_normal_transaction(markers[cursor : cursor + count], epoch))
+        normal.append(
+            parse_normal_transaction(
+                markers[cursor : cursor + count], epoch, terminal_mode
+            )
+        )
         cursor += count
     drop_count = 6 if markers[cursor + 4 : cursor + 5] == [f"{FAMILY} CHILD_PHASE epoch=3 phase=cleanup"] else 5
     dropped = parse_drop_transaction(markers[cursor : cursor + drop_count], 3)
     cursor += drop_count
-    normal.append(parse_normal_transaction(markers[cursor : cursor + 7], 4))
+    normal.append(
+        parse_normal_transaction(markers[cursor : cursor + 7], 4, terminal_mode)
+    )
     cursor += 7
     require(cursor == len(markers), f"late or unexpected phase markers followed epoch 4: {markers[cursor:]!r}")
-    core_normal, core_dropped = verify_combined_core_sequence(path)
+    core_normal, core_dropped = verify_combined_core_sequence(path, terminal_mode)
     for phase, core in zip(normal, core_normal, strict=True):
         require(
             phase.counters.child_core_starts == core.core_polls
@@ -608,7 +644,12 @@ def verify_closed_sequence(path: Path) -> tuple[list[NormalObservation], DropObs
     return normal, dropped
 
 
-def response_line(epoch: int, *, skew: str = "") -> str:
+def response_line(
+    epoch: int,
+    terminal_mode: str = LEGACY_CANCEL,
+    *,
+    skew: str = "",
+) -> str:
     core_polls = DELAYED_CORE_POLLS if epoch == 2 else CORE.EXPECTED_CORE_POLLS
     return (
         f"{FAMILY} RESPONSE epoch={epoch} status=0 "
@@ -617,7 +658,8 @@ def response_line(epoch: int, *, skew: str = "") -> str:
         f"child_host_starts=3 child_host_finishes=3 child_wait_starts=2 child_wait_finishes=2 "
         f"cleanup_count=1 parent_host_starts=9 parent_host_finishes=9 "
         f"parent_wait_starts=4 parent_wait_finishes=4 child_wait_open=0 parent_wait_open=0 "
-        f"late={skew or '0'} clean=1 cancel=1 ack=1 ready_epoch={epoch + 1}"
+        f"late={skew or '0'} clean=1 {CORE.response_terminal_suffix(terminal_mode)} "
+        f"ready_epoch={epoch + 1}"
     )
 
 
@@ -634,7 +676,7 @@ def drop_line(epoch: int) -> str:
     )
 
 
-def normal_lines(epoch: int) -> list[str]:
+def normal_lines(epoch: int, terminal_mode: str = LEGACY_CANCEL) -> list[str]:
     lines = [
         f"{FAMILY} CHILD_PHASE epoch={epoch} phase=validation",
         f"{FAMILY} CHILD_PHASE epoch={epoch} phase=instantiation",
@@ -647,7 +689,7 @@ def normal_lines(epoch: int) -> list[str]:
         [
             f"{FAMILY} CHILD_PHASE epoch={epoch} phase=cleanup",
             f"{FAMILY} EXITED epoch={epoch} detach=exited release=1",
-            response_line(epoch),
+            response_line(epoch, terminal_mode),
         ]
     )
     return lines
@@ -695,6 +737,27 @@ def run_parser_selftest() -> int:
         except DriverError:
             continue
         raise DriverError(f"parser selftest mutation {index} was accepted")
+
+    successor = normal_lines(1, FINISH_VERIFY)
+    parse_normal_transaction(successor, 1, FINISH_VERIFY)
+    successor_mutations = [
+        successor[:-1] + [successor[-1].replace("verify=1", "verify=0", 1)],
+        successor[:-1]
+        + [successor[-1].replace("discard=stream_abandoned", "discard=complete", 1)],
+        normal,
+    ]
+    for index, lines in enumerate(successor_mutations, start=1):
+        try:
+            parse_normal_transaction(lines, 1, FINISH_VERIFY)
+        except DriverError:
+            continue
+        raise DriverError(f"successor parser selftest mutation {index} was accepted")
+    try:
+        parse_normal_transaction(successor, 1, LEGACY_CANCEL)
+    except DriverError:
+        pass
+    else:
+        raise DriverError("legacy phase terminal mode accepted the successor RESPONSE")
 
     def core_normal_lines(epoch: int) -> list[str]:
         core_polls = DELAYED_CORE_POLLS if epoch == 2 else CORE.EXPECTED_CORE_POLLS
@@ -810,7 +873,7 @@ def run_parser_selftest() -> int:
             except (DriverError, CORE.DriverError):
                 continue
             raise DriverError(f"frozen-log {label} mutation was accepted")
-    return len(mutations) + len(frozen_mutations)
+    return len(mutations) + len(successor_mutations) + 1 + len(frozen_mutations)
 
 
 def parser() -> argparse.ArgumentParser:

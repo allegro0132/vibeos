@@ -34,6 +34,8 @@ SSHD_FEATURE = "c84-profile-phase-sidecar"
 SSHD_PARENT_FEATURE = "c84-profile-request-parent"
 IRQ_FEATURE = "wasm-c84-profile-irq-overlay"
 FAMILY = "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR"
+FINISH_FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
+FINISH_QEMU_FEATURE = f"{FINISH_FEATURE}-qemu-acceptance"
 
 
 def load_core_verifier():
@@ -1407,6 +1409,8 @@ def verify_component(source: str) -> None:
 
 
 def verify_ssh(source: str) -> None:
+    source = CORE.without_direct_feature_units(source, FINISH_FEATURE)
+    source = CORE.without_direct_feature_units(source, FINISH_QEMU_FEATURE)
     backend = find_scope(
         source,
         r"\bimpl\s+SshExecProfileRunBackend\s+for\s+SshExecProfileOwner\b",
@@ -2348,8 +2352,12 @@ def run_selftest(inputs: Inputs) -> int:
             lambda data: mutate_text(
                 data,
                 "ssh",
-                "cancel_and_ack_profile(run, crate::wasm_aot_profile_slot::SlotFaults::default())",
-                "finish_and_ack_profile(run, crate::wasm_aot_profile_slot::SlotFaults::default())",
+                f'#[cfg(not(feature = "{FINISH_FEATURE}"))]\n'
+                "        let terminal =\n"
+                "            cancel_and_ack_profile(run, crate::wasm_aot_profile_slot::SlotFaults::default());",
+                f'#[cfg(not(feature = "{FINISH_FEATURE}"))]\n'
+                "        let terminal =\n"
+                "            finish_and_ack_profile(run, crate::wasm_aot_profile_slot::SlotFaults::default());",
                 "ssh-response-finish",
             ),
         ),

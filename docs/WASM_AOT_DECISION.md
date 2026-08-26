@@ -455,6 +455,61 @@ not timer or PLIC coverage, target timing evidence, a physical Milk-V Duo
 sample, a verified stream, schema publication, collection, or an AOT decision.
 The parent continues to cancel; there is still no `finish` or publisher.
 
+## Managed-child finish and independent verification closure
+
+The default-off `wasm-c84-ssh-managed-child-finish-verify` successor retains
+the authenticated request parent, real managed child, phase/Core accounting,
+and IRQ-overlay topology while changing only successful response termination.
+After child Cleanup, release, and exact Exited detach are proven, epochs 1, 2,
+and 4 consume `RunLease::finish`. The slot closes the target, performs the
+independent `TargetFinished::verify` rescan, and installs `TargetVerified` with
+cursor zero. The kernel-private SSH adapter observes that typestate and then
+explicitly calls `StreamLease::discard`; it does not call `summary`,
+`next_interval`, or `complete` and does not let the storage-bearing lease escape.
+
+The returned rejection must have cause `StreamAbandoned`, empty facade and
+slot faults, no ledger error, and `intervals_emitted=0`. The adapter separately
+compares the stored rejection, acknowledges it once, compares the acknowledged
+report, and proves `Ready(next_epoch)`. A nonzero response status, unready child,
+or stale policy is instead cancelled and recycled before finish. A target
+finish/verify rejection is also acknowledged before returning the response
+failure, preventing a global Rejected slot from being stranded.
+
+Epoch 3 intentionally remains the existing active-Drop proof. The peer kills
+the connection after the exact child Wait-open marker; the child is abandoned,
+detaches as Exited, and the parent records `LeaseCancelled`, acknowledges it
+once, proves `Ready(4)`, forces the terminal inactive SSIP, and admits epoch 4.
+Thus Drop never creates a finished or verified stream.
+
+The source and live gates are:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-finish-verify.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-finish-verify-test.sh
+```
+
+The successor UART family has exactly four lines:
+`WASM_C84_SSH_MANAGED_CHILD_FINISH_VERIFY RESPONSE` for epochs 1, 2, and 4,
+and `DROP` for epoch 3. Normal lines freeze `finish=1 verify=1 cursor=0`, exact
+`discard=stream_abandoned emitted=0`, stored comparison, one acknowledgement,
+and the next Ready epoch. The Drop line freezes `cancel=lease_cancelled`,
+`finish=0 verify=0 stream=0`, zero emitted intervals, stored comparison, one
+acknowledgement, and `ready_epoch=4`.
+
+The four predecessor families retain their nonterminal and epoch-3 DROP bytes,
+counts, and order. Their successful RESPONSE suffix truthfully changes from
+`cancel=1` to
+`finish=1 verify=1 discard=stream_abandoned ack=1`; terminal order is phase,
+Core, request, IRQ, then finish/verify, and each last terminal precedes the next
+request START. The predecessor image remains separately selectable and its IRQ
+gate runs first in CI, preserving the exact cancel-only six IRQ, 27/28 phase,
+19 Core, and eight request transcript.
+
+This is diagnostic single-hart integration evidence only. Deliberately
+abandoning a verified stream proves neither interval enumeration nor profile
+content. This node adds no summary validation, schema, publisher, collector,
+retained evidence, physical Milk-V Duo sample, or AOT decision.
+
 ## Decision rule
 
 Let `T` be each retained sample's `total_ticks`, `I` its `interpretation`
@@ -486,6 +541,12 @@ python3 -B scripts/verify-c84-ssh-profile-request-parent.py --selftest --check-s
 ./scripts/qemu-c84-ssh-request-parent-test.sh
 python3 -B scripts/verify-c84-ssh-managed-child-core.py --selftest --check-source
 ./scripts/qemu-c84-ssh-managed-child-core-test.sh
+python3 -B scripts/verify-c84-ssh-managed-child-phase-sidecar.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-phase-sidecar-test.sh
+python3 -B scripts/verify-c84-ssh-managed-child-irq-overlay.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-irq-overlay-test.sh
+python3 -B scripts/verify-c84-ssh-managed-child-finish-verify.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-finish-verify-test.sh
 ```
 
 These checks validate the preparation contract, diagnostic ownership, and

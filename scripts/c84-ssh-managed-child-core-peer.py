@@ -36,6 +36,7 @@ EXPECTED_TYPED_POLLS = 1241
 EXPECTED_DROP_DETACH = "exited"
 LEGACY_CANCEL = "legacy-cancel"
 FINISH_VERIFY = "finish-verify"
+VERIFIED_STREAM = "verified-stream"
 
 
 def load_peer():
@@ -77,12 +78,14 @@ def require(condition: bool, message: str) -> None:
 
 def response_terminal_suffix(terminal_mode: str) -> str:
     require(
-        terminal_mode in (LEGACY_CANCEL, FINISH_VERIFY),
+        terminal_mode in (LEGACY_CANCEL, FINISH_VERIFY, VERIFIED_STREAM),
         f"unknown managed-child/Core terminal mode: {terminal_mode!r}",
     )
     if terminal_mode == LEGACY_CANCEL:
         return "cancel=1 ack=1"
-    return "finish=1 verify=1 discard=stream_abandoned ack=1"
+    if terminal_mode == FINISH_VERIFY:
+        return "finish=1 verify=1 discard=stream_abandoned ack=1"
+    return "finish=1 verify=1 stream=complete ack=0"
 
 
 def normal_response_line(
@@ -532,7 +535,30 @@ def run_parser_selftest() -> int:
         pass
     else:
         raise DriverError("legacy Core terminal mode accepted the successor RESPONSE")
-    return len(mutations) + len(successor_mutations) + 1
+
+    stream_successor = [*normal[:-1], normal_response_line(1, VERIFIED_STREAM)]
+    parse_normal_transaction(stream_successor, 1, VERIFIED_STREAM)
+    stream_mutations = [
+        [
+            *stream_successor[:-1],
+            stream_successor[-1].replace("stream=complete", "stream=partial", 1),
+        ],
+        [*stream_successor[:-1], stream_successor[-1].replace("ack=0", "ack=1", 1)],
+        successor,
+    ]
+    for index, lines in enumerate(stream_mutations, start=1):
+        try:
+            parse_normal_transaction(lines, 1, VERIFIED_STREAM)
+        except DriverError:
+            continue
+        raise DriverError(f"verified-stream parser selftest mutation {index} was accepted")
+    for wrong_mode in (LEGACY_CANCEL, FINISH_VERIFY):
+        try:
+            parse_normal_transaction(stream_successor, 1, wrong_mode)
+        except DriverError:
+            continue
+        raise DriverError(f"{wrong_mode} accepted the verified-stream Core RESPONSE")
+    return len(mutations) + len(successor_mutations) + len(stream_mutations) + 3
 
 
 def parser() -> argparse.ArgumentParser:

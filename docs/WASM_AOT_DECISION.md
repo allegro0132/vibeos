@@ -515,6 +515,88 @@ abandoning a verified stream proves neither interval enumeration nor profile
 content. This node adds no summary validation, schema, publisher, collector,
 retained evidence, physical Milk-V Duo sample, or AOT decision.
 
+## Managed-child verified-stream completion closure
+
+The default-off `wasm-c84-ssh-managed-child-verified-stream` successor retains
+the authenticated request parent, real managed child, phase/Core accounting,
+IRQ topology, and independent finish/verify boundary. It changes only the
+successful handling of the kernel-private `StreamLease`: instead of discarding
+it at cursor zero, the SSH adapter reads the verified `Summary`, consumes every
+indexed `Interval`, and calls `StreamLease::complete` only after validating the
+complete schema-v1 phase partition. Neither `TargetVerified` nor the
+storage-bearing stream authority leaves the adapter.
+
+For successful epochs 1, 2, and 4, the adapter requires positive
+`total_ticks`, exact `interval_capacity=65536`, `intervals_complete=true`, and a
+dynamic `interval_count` in `1..=min(65536, total_ticks)`. The
+`interval_count <= total_ticks` bound follows from positive interval lengths
+and contiguous coverage. The seven summary phase totals must add without
+overflow to `total_ticks`. Interval sequence numbers must be exactly
+zero-based; every interval must be nonempty; starts must equal the preceding
+end; adjacent phases must differ; checked per-phase accumulation must exactly
+reproduce the summary; and the final end must equal `total_ticks`. Only after
+`interval_count == emitted == cursor` and the next read returns `None` may the
+lease be completed and the slot compared with `Ready(next_epoch)`. This is a
+semantic contract, not a frozen control-flow count: it does not require all
+seven phases to be nonzero, prescribe the first or last emitted phase, freeze a
+phase sequence, or freeze the scheduler-dependent interval count.
+
+A local summary or interval invariant failure detected before completion keeps
+the lease in hand. That path explicitly discards it, requires the exact
+same-epoch `StreamAbandoned` report with empty facade/slot faults, no ledger
+error, and `intervals_emitted` equal to the current cursor, then compares the
+stored rejection, acknowledges it once, and proves Ready reuse before returning
+response failure. By contrast, `StreamLease::complete(self)` consumes the
+handle. If it returns an error, the handle's Drop may attempt the abandonment;
+the caller can only inspect and acknowledge an installed rejection for that
+epoch and cannot call `discard` again. Poison, `OwnerNotCurrent`, or
+`StateMismatch` without a confirmable rejection remains fail-closed; this node
+does not promise recovery from those paths. The normal path proves full cursor
+coverage before calling `complete` and never relies on Drop.
+
+Epoch 3 remains the existing active-Drop proof. All five predecessor DROP bytes
+and field contracts are unchanged, including the dynamically parsed equal
+phase/Core observer count. The new family mirrors that terminal without
+creating a verified lease:
+
+```text
+WASM_C84_SSH_MANAGED_CHILD_VERIFIED_STREAM DROP epoch=E cancel=lease_cancelled finish=0 verify=0 summary=0 stream=0 emitted=0 stored=1 ack=1 ready_epoch=R
+```
+
+The source and live gates are:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-verified-stream.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-verified-stream-test.sh
+```
+
+In the successor image, the successful RESPONSE suffix of each of the five
+predecessor families is exactly
+`finish=1 verify=1 stream=complete ack=0 ready_epoch=...`. Those predecessor
+markers do not repeat or freeze the interval count, and retain exact family
+counts of 27/28 phase, 19 Core, eight request, six IRQ, and four finish/verify.
+The new UART family has exactly four lines, with RESPONSE for epochs 1, 2, and
+4 and DROP for epoch 3. Its successful line is:
+
+```text
+WASM_C84_SSH_MANAGED_CHILD_VERIFIED_STREAM RESPONSE epoch=E status=0 finish=1 verify=1 summary=1 initial_cursor=0 total_ticks=T interval_capacity=65536 interval_count=N intervals_complete=1 emitted=N cursor=N sequence=exact contiguous=1 nonempty=1 adjacent_distinct=1 phase_sum=total_ticks phase_rescan=summary final_end=total_ticks stream=complete stored=0 ack=0 ready_epoch=R
+```
+
+The peer accepts only a canonical positive-u64 `T`,
+`1 <= N <= min(65536, T)`, `N == emitted == cursor`, and `R == E + 1`. The
+`N <= T` bound is derived from positive-length contiguous coverage; it does not
+freeze `T` or `N` as timing evidence. Normal and Drop terminal order is phase,
+Core, request, IRQ, finish/verify, then verified-stream, and every last terminal
+precedes the next request START. The separately built finish/verify predecessor
+remains discard-only and runs first in CI.
+
+This remains one-hart diagnostic integration evidence. The compact UART flags
+are not JSON or a published schema record, and the gate emits no per-interval
+evidence stream. It introduces no `ProfilePublisher`, `publish_profile`,
+collector, retained sample, physical Milk-V Duo evidence, or AOT decision. A
+later formal publisher must still accept the storage-bearing `TargetVerified`
+authority, not copied `Summary`/`Interval` values or this success marker.
+
 ## Decision rule
 
 Let `T` be each retained sample's `total_ticks`, `I` its `interpretation`
@@ -552,6 +634,8 @@ python3 -B scripts/verify-c84-ssh-managed-child-irq-overlay.py --selftest --chec
 ./scripts/qemu-c84-ssh-managed-child-irq-overlay-test.sh
 python3 -B scripts/verify-c84-ssh-managed-child-finish-verify.py --selftest --check-source
 ./scripts/qemu-c84-ssh-managed-child-finish-verify-test.sh
+python3 -B scripts/verify-c84-ssh-managed-child-verified-stream.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-verified-stream-test.sh
 ```
 
 These checks validate the preparation contract, diagnostic ownership, and

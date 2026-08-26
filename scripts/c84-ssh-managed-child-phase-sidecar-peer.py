@@ -48,6 +48,7 @@ DELAYED_CORE_POLLS = CORE.EXPECTED_CORE_POLLS + 4
 DELAYED_TYPED_POLLS = CORE.EXPECTED_TYPED_POLLS + 10
 LEGACY_CANCEL = CORE.LEGACY_CANCEL
 FINISH_VERIFY = CORE.FINISH_VERIFY
+VERIFIED_STREAM = CORE.VERIFIED_STREAM
 
 
 class DriverError(Exception):
@@ -798,6 +799,27 @@ def run_parser_selftest() -> int:
     else:
         raise DriverError("legacy phase terminal mode accepted the successor RESPONSE")
 
+    stream_successor = normal_lines(1, VERIFIED_STREAM)
+    parse_normal_transaction(stream_successor, 1, VERIFIED_STREAM)
+    stream_mutations = [
+        stream_successor[:-1]
+        + [stream_successor[-1].replace("stream=complete", "stream=partial", 1)],
+        stream_successor[:-1] + [stream_successor[-1].replace("ack=0", "ack=1", 1)],
+        successor,
+    ]
+    for index, lines in enumerate(stream_mutations, start=1):
+        try:
+            parse_normal_transaction(lines, 1, VERIFIED_STREAM)
+        except DriverError:
+            continue
+        raise DriverError(f"verified-stream parser selftest mutation {index} was accepted")
+    for wrong_mode in (LEGACY_CANCEL, FINISH_VERIFY):
+        try:
+            parse_normal_transaction(stream_successor, 1, wrong_mode)
+        except DriverError:
+            continue
+        raise DriverError(f"{wrong_mode} accepted the verified-stream phase RESPONSE")
+
     def core_normal_lines(epoch: int) -> list[str]:
         core_polls = DELAYED_CORE_POLLS if epoch == 2 else CORE.EXPECTED_CORE_POLLS
         typed_polls = DELAYED_TYPED_POLLS if epoch == 2 else CORE.EXPECTED_TYPED_POLLS
@@ -925,7 +947,13 @@ def run_parser_selftest() -> int:
             except (DriverError, CORE.DriverError):
                 continue
             raise DriverError(f"frozen-log {label} mutation was accepted")
-    return len(mutations) + len(successor_mutations) + 1 + len(frozen_mutations)
+    return (
+        len(mutations)
+        + len(successor_mutations)
+        + len(stream_mutations)
+        + 3
+        + len(frozen_mutations)
+    )
 
 
 def parser() -> argparse.ArgumentParser:

@@ -26,6 +26,8 @@ MILKV_MANIFEST = ROOT / "firmware/milkv-duo/Cargo.toml"
 
 FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
 QEMU_FEATURE = f"{FEATURE}-qemu-acceptance"
+VERIFIED_STREAM_FEATURE = "wasm-c84-ssh-managed-child-verified-stream"
+VERIFIED_STREAM_QEMU_FEATURE = f"{VERIFIED_STREAM_FEATURE}-qemu-acceptance"
 IRQ_FEATURE = "wasm-c84-ssh-managed-child-irq-overlay"
 IRQ_QEMU_FEATURE = f"{IRQ_FEATURE}-qemu-acceptance"
 STANDALONE_IRQ_QEMU_FEATURE = "wasm-c84-profile-irq-overlay-qemu-acceptance"
@@ -222,9 +224,17 @@ def verify_features(inputs: Inputs) -> None:
 
 
 def verify_direct_cfg(inputs: Inputs) -> None:
+    ssh = CORE.without_direct_feature_units(inputs.ssh, VERIFIED_STREAM_FEATURE)
+    ssh = CORE.without_direct_feature_units(ssh, VERIFIED_STREAM_QEMU_FEATURE)
+    kernel_root = CORE.without_direct_feature_units(
+        inputs.kernel_root, VERIFIED_STREAM_FEATURE
+    )
+    kernel_root = CORE.without_direct_feature_units(
+        kernel_root, VERIFIED_STREAM_QEMU_FEATURE
+    )
     sources = (
-        ("SSH", inputs.ssh, 5, 7, 8, 12),
-        ("kernel root", inputs.kernel_root, 0, 1, 0, 3),
+        ("SSH", ssh, 5, 7, 8, 12),
+        ("kernel root", kernel_root, 0, 1, 0, 4),
     )
     for label, source, base_direct, base_all, qemu_direct, qemu_all in sources:
         rust = CORE.rust_mask(source, literals=False)
@@ -255,7 +265,7 @@ def verify_direct_cfg(inputs: Inputs) -> None:
             f"{label} all-form finish/verify QEMU-unit count differs",
         )
 
-    base_units = IRQ.direct_feature_units(inputs.ssh, FEATURE)
+    base_units = IRQ.direct_feature_units(ssh, FEATURE)
     base_code = masked("\n".join(base_units))
     for forbidden in (
         ".summary(",
@@ -271,7 +281,7 @@ def verify_direct_cfg(inputs: Inputs) -> None:
         "exec::spawn(",
     ):
         require(forbidden not in base_code, f"finish/verify base unit admits {forbidden}")
-    qemu_code = masked("\n".join(IRQ.direct_feature_units(inputs.ssh, QEMU_FEATURE)))
+    qemu_code = masked("\n".join(IRQ.direct_feature_units(ssh, QEMU_FEATURE)))
     for forbidden in (
         ".finish(",
         ".discard(",
@@ -398,6 +408,8 @@ def verify_sshd_boundary(source: str) -> None:
 
 
 def verify_ssh(source: str) -> None:
+    source = CORE.without_direct_feature_units(source, VERIFIED_STREAM_FEATURE)
+    source = CORE.without_direct_feature_units(source, VERIFIED_STREAM_QEMU_FEATURE)
     owner = find_scope(source, r"\bimpl\s+SshExecProfileOwner\b", "SSH profile owner")
     response = find_function(owner, "response_boundary", "SSH response boundary")
     cancel = find_function(owner, "cancel", "SSH active Drop")
@@ -408,7 +420,10 @@ def verify_ssh(source: str) -> None:
         "normal successor does not call the finish/verify helper exactly once",
     )
     require(
-        f'#[cfg(feature="{FEATURE}")]letterminal=finish_verify_discard_and_ack_profile(run);'
+        f'#[cfg(feature="{FEATURE}")]'
+        f'#[cfg(not(feature="{VERIFIED_STREAM_FEATURE}"))]'
+        "letterminal=finish_verify_discard_and_ack_profile(run)"
+        ".map(|ready_epoch|(ready_epoch,()));"
         in response_code,
         "normal finish terminal is not directly feature-selected",
     )
@@ -622,6 +637,20 @@ def mutate_text(data: Inputs, field: str, old: str, new: str, label: str) -> Inp
     return replace(data, **{field: replace_once(getattr(data, field), old, new, label)})
 
 
+def mutate_function_text(
+    data: Inputs,
+    field: str,
+    function: str,
+    old: str,
+    new: str,
+    label: str,
+) -> Inputs:
+    source = getattr(data, field)
+    scope = find_scope(source, rf"\bfn\s+{re.escape(function)}\b", function)
+    mutated = replace_once(scope.raw, old, new, label)
+    return replace(data, **{field: source[: scope.start] + mutated + source[scope.end :]})
+
+
 def mutate_manifest(data: Inputs, field: str, old: str, new: str, label: str) -> Inputs:
     raw = getattr(data, field).decode("utf-8")
     return replace(
@@ -698,8 +727,12 @@ def run_selftest(inputs: Inputs) -> int:
             lambda data: mutate_text(
                 data,
                 "ssh",
-                "let terminal = finish_verify_discard_and_ack_profile(run);",
-                "let terminal = cancel_and_ack_profile(run, crate::wasm_aot_profile_slot::SlotFaults::default());",
+                "let terminal =\n"
+                "            finish_verify_discard_and_ack_profile(run)"
+                ".map(|ready_epoch| (ready_epoch, ()));",
+                "let terminal = cancel_and_ack_profile(\n"
+                "            run, crate::wasm_aot_profile_slot::SlotFaults::default(),\n"
+                "        ).map(|ready_epoch| (ready_epoch, ()));",
                 "normal terminal",
             ),
         ),
@@ -738,20 +771,35 @@ def run_selftest(inputs: Inputs) -> int:
             lambda data: mutate_text(
                 data,
                 "ssh",
-                f'#[cfg(feature = "{FEATURE}")]\n        let terminal = finish_verify_discard_and_ack_profile(run);',
-                f'let terminal = if cfg!(feature = "{FEATURE}") {{ finish_verify_discard_and_ack_profile(run) }} else {{ unreachable!() }};',
+                f'#[cfg(feature = "{FEATURE}")]\n'
+                f'        #[cfg(not(feature = "{VERIFIED_STREAM_FEATURE}"))]\n'
+                "        let terminal =\n"
+                "            finish_verify_discard_and_ack_profile(run)"
+                ".map(|ready_epoch| (ready_epoch, ()));",
+                f'let terminal = if cfg!(feature = "{FEATURE}") {{\n'
+                "            finish_verify_discard_and_ack_profile(run)"
+                ".map(|ready_epoch| (ready_epoch, ()))\n"
+                "        } else { unreachable!() };",
                 "finish cfg!",
             ),
         ),
         (
             "run-finish-replaced",
-            lambda data: mutate_text(data, "ssh", "match run.finish()", "match run.cancel()", "run finish"),
+            lambda data: mutate_function_text(
+                data,
+                "ssh",
+                "finish_verify_discard_and_ack_profile",
+                "let stream = match run.finish() {",
+                "let stream = match run.cancel() {",
+                "run finish",
+            ),
         ),
         (
             "finish-rejection-ack-removed",
-            lambda data: mutate_text(
+            lambda data: mutate_function_text(
                 data,
                 "ssh",
+                "finish_verify_discard_and_ack_profile",
                 "let _ = acknowledge_finish_verify_rejection(epoch, report)?;\n            return Err(());",
                 "let _ = report;\n            return Err(());",
                 "finish rejection acknowledgement",
@@ -759,9 +807,10 @@ def run_selftest(inputs: Inputs) -> int:
         ),
         (
             "implicit-stream-drop",
-            lambda data: mutate_text(
+            lambda data: mutate_function_text(
                 data,
                 "ssh",
+                "finish_verify_discard_and_ack_profile",
                 "let report = stream.discard().map_err(|_| ())?;",
                 "drop(stream); return Err(());",
                 "explicit stream discard",
@@ -769,13 +818,21 @@ def run_selftest(inputs: Inputs) -> int:
         ),
         (
             "stream-complete",
-            lambda data: mutate_text(data, "ssh", "stream.discard()", "stream.complete()", "stream complete"),
+            lambda data: mutate_function_text(
+                data,
+                "ssh",
+                "finish_verify_discard_and_ack_profile",
+                "stream.discard()",
+                "stream.complete()",
+                "stream complete",
+            ),
         ),
         (
             "summary-read",
-            lambda data: mutate_text(
+            lambda data: mutate_function_text(
                 data,
                 "ssh",
+                "finish_verify_discard_and_ack_profile",
                 "let report = stream.discard().map_err(|_| ())?;",
                 "let _ = stream.summary(); let report = stream.discard().map_err(|_| ())?;",
                 "summary read",
@@ -783,9 +840,10 @@ def run_selftest(inputs: Inputs) -> int:
         ),
         (
             "wrong-abandonment-cause",
-            lambda data: mutate_text(
+            lambda data: mutate_function_text(
                 data,
                 "ssh",
+                "finish_verify_discard_and_ack_profile",
                 "report.cause == RejectionCause::StreamAbandoned",
                 "report.cause == RejectionCause::LeaseCancelled",
                 "abandonment cause",
@@ -793,9 +851,10 @@ def run_selftest(inputs: Inputs) -> int:
         ),
         (
             "nonzero-emitted",
-            lambda data: mutate_text(
+            lambda data: mutate_function_text(
                 data,
                 "ssh",
+                "finish_verify_discard_and_ack_profile",
                 "report.slot_faults == SlotFaults::default()\n        && report.intervals_emitted == 0",
                 "report.slot_faults == SlotFaults::default()\n        && report.intervals_emitted == 1",
                 "zero emitted",
@@ -803,7 +862,14 @@ def run_selftest(inputs: Inputs) -> int:
         ),
         (
             "verified-cursor-forged",
-            lambda data: mutate_text(data, "ssh", "cursor: 0,", "cursor: 1,", "verified cursor"),
+            lambda data: mutate_function_text(
+                data,
+                "ssh",
+                "finish_verify_discard_and_ack_profile",
+                "cursor: 0,",
+                "cursor: 1,",
+                "verified cursor",
+            ),
         ),
         (
             "stored-rejection-forged",
@@ -857,9 +923,10 @@ def run_selftest(inputs: Inputs) -> int:
         ),
         (
             "publisher-added",
-            lambda data: mutate_text(
+            lambda data: mutate_function_text(
                 data,
                 "ssh",
+                "finish_verify_discard_and_ack_profile",
                 "let report = stream.discard().map_err(|_| ())?;",
                 "publish_profile(&stream); let report = stream.discard().map_err(|_| ())?;",
                 "publisher",

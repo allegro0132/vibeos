@@ -4911,10 +4911,10 @@ pub(crate) fn managed_irq_acceptance_child_core_started(
     Ok(Some(observation))
 }
 
-/// After an exact terminal rejection acknowledgement and Ready installation,
-/// forces one inactive self-SSIP. This covers both Active cancellation and a
-/// verified stream's explicit discard, proving the fast gate is clear before
-/// each next epoch without retaining or printing any slot authority here.
+/// After an exact terminal recycle and Ready installation, forces one inactive
+/// self-SSIP. This covers Active cancellation, verified-stream discard, and
+/// complete verified streaming, proving the fast gate is clear before each
+/// next epoch without retaining or printing any slot authority here.
 #[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
 pub(crate) fn managed_irq_acceptance_terminal_gate(
     epoch: u64,

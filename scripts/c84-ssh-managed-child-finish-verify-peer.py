@@ -41,6 +41,7 @@ IRQ = load_irq_peer()
 PHASE = IRQ.PHASE
 REQUEST = IRQ.REQUEST
 TERMINAL_MODE = IRQ.FINISH_VERIFY
+VERIFIED_STREAM = IRQ.VERIFIED_STREAM
 
 
 class DriverError(Exception):
@@ -52,10 +53,20 @@ def require(condition: bool, message: str) -> None:
         raise DriverError(message)
 
 
-def response_line(epoch: int) -> str:
+def response_line(epoch: int, terminal_mode: str = TERMINAL_MODE) -> str:
+    require(
+        terminal_mode in (TERMINAL_MODE, VERIFIED_STREAM),
+        f"unknown finish/verify terminal mode: {terminal_mode!r}",
+    )
+    if terminal_mode == TERMINAL_MODE:
+        return (
+            f"{FAMILY} RESPONSE epoch={epoch} status=0 finish=1 verify=1 cursor=0 "
+            "discard=stream_abandoned emitted=0 stored=1 ack=1 "
+            f"ready_epoch={epoch + 1}"
+        )
     return (
-        f"{FAMILY} RESPONSE epoch={epoch} status=0 finish=1 verify=1 cursor=0 "
-        "discard=stream_abandoned emitted=0 stored=1 ack=1 "
+        f"{FAMILY} RESPONSE epoch={epoch} status=0 "
+        "finish=1 verify=1 stream=complete ack=0 "
         f"ready_epoch={epoch + 1}"
     )
 
@@ -68,12 +79,16 @@ def drop_line(epoch: int) -> str:
     )
 
 
-EXPECTED_FINISH_MARKERS = [
-    response_line(1),
-    response_line(2),
-    drop_line(3),
-    response_line(4),
-]
+def expected_finish_markers(terminal_mode: str = TERMINAL_MODE) -> list[str]:
+    return [
+        response_line(1, terminal_mode),
+        response_line(2, terminal_mode),
+        drop_line(3),
+        response_line(4, terminal_mode),
+    ]
+
+
+EXPECTED_FINISH_MARKERS = expected_finish_markers()
 
 
 def normalized_lines(path: Path, *, ignore_incomplete_tail: bool = False) -> list[str]:
@@ -97,11 +112,11 @@ def require_unique_order(lines: list[str], needles: list[str], label: str) -> No
     require(positions == sorted(positions), f"{label} marker order differs: {needles!r}")
 
 
-def verify_global_order(path: Path) -> None:
+def verify_global_order(path: Path, terminal_mode: str = TERMINAL_MODE) -> None:
     lines = normalized_lines(path)
-    request = REQUEST.expected_qemu_markers(TERMINAL_MODE)
+    request = REQUEST.expected_qemu_markers(terminal_mode)
     request_responses = {1: request[1], 2: request[3], 4: request[7]}
-    irq = IRQ.expected_irq_markers(TERMINAL_MODE)
+    irq = IRQ.expected_irq_markers(terminal_mode)
     irq_responses = {1: irq[2], 2: irq[3], 4: irq[5]}
     for epoch in (1, 2, 4):
         require_unique_order(
@@ -111,7 +126,7 @@ def verify_global_order(path: Path) -> None:
                 f"{CORE_FAMILY} RESPONSE epoch={epoch} status=0 ",
                 request_responses[epoch],
                 irq_responses[epoch],
-                response_line(epoch),
+                response_line(epoch, terminal_mode),
             ],
             f"finish/verify normal epoch {epoch} terminal chain",
         )
@@ -127,7 +142,7 @@ def verify_global_order(path: Path) -> None:
         "finish/verify Drop epoch 3 terminal chain",
     )
     for epoch in (1, 2, 3):
-        terminal = response_line(epoch) if epoch != 3 else drop_line(epoch)
+        terminal = response_line(epoch, terminal_mode) if epoch != 3 else drop_line(epoch)
         require_unique_order(
             lines,
             [terminal, f"{REQUEST_FAMILY} START epoch={epoch + 1}"],
@@ -135,19 +150,25 @@ def verify_global_order(path: Path) -> None:
         )
 
 
-def verify_closed_sequence(path: Path):
-    predecessor = IRQ.verify_closed_sequence(path, TERMINAL_MODE)
+def verify_closed_sequence(path: Path, terminal_mode: str = TERMINAL_MODE):
+    predecessor = IRQ.verify_closed_sequence(path, terminal_mode)
     observed = family_markers(path)
+    expected = expected_finish_markers(terminal_mode)
     require(
-        observed == EXPECTED_FINISH_MARKERS,
+        observed == expected,
         f"finish/verify marker sequence differs: observed={observed!r}",
     )
-    verify_global_order(path)
+    verify_global_order(path, terminal_mode)
     return predecessor
 
 
-def wait_for_finish_prefix(path: Path, expected_count: int, timeout: float) -> None:
-    expected = EXPECTED_FINISH_MARKERS[:expected_count]
+def wait_for_finish_prefix(
+    path: Path,
+    expected_count: int,
+    timeout: float,
+    terminal_mode: str = TERMINAL_MODE,
+) -> None:
+    expected = expected_finish_markers(terminal_mode)[:expected_count]
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         observed = family_markers(path, ignore_incomplete_tail=True)
@@ -165,16 +186,20 @@ def wait_for_finish_prefix(path: Path, expected_count: int, timeout: float) -> N
     raise DriverError(f"timed out waiting for finish/verify marker {expected_count}")
 
 
-def synthetic_closed_lines(*, drop_observer_pairs: int) -> list[str]:
+def synthetic_closed_lines(
+    terminal_mode: str = TERMINAL_MODE,
+    *,
+    drop_observer_pairs: int,
+) -> list[str]:
     predecessor = IRQ.synthetic_closed_lines(
-        TERMINAL_MODE,
+        terminal_mode,
         drop_observer_pairs=drop_observer_pairs,
     )
     irq_terminals = {
-        IRQ.response_line(1, TERMINAL_MODE): response_line(1),
-        IRQ.response_line(2, TERMINAL_MODE): response_line(2),
+        IRQ.response_line(1, terminal_mode): response_line(1, terminal_mode),
+        IRQ.response_line(2, terminal_mode): response_line(2, terminal_mode),
         IRQ.drop_line(3): drop_line(3),
-        IRQ.response_line(4, TERMINAL_MODE): response_line(4),
+        IRQ.response_line(4, terminal_mode): response_line(4, terminal_mode),
     }
     output: list[str] = []
     for line in predecessor:
@@ -204,10 +229,10 @@ def run_parser_selftest() -> int:
             "live parser discarded a complete finish/verify UART record",
         )
 
-        def accepted(lines: list[str]) -> bool:
+        def accepted(lines: list[str], terminal_mode: str = TERMINAL_MODE) -> bool:
             log.write_text("\n".join(lines) + "\n", encoding="utf-8")
             try:
-                verify_closed_sequence(log)
+                verify_closed_sequence(log, terminal_mode)
             except (
                 DriverError,
                 IRQ.DriverError,
@@ -295,7 +320,38 @@ def run_parser_selftest() -> int:
 
         for label, mutated in mutations:
             require(not accepted(mutated), f"parser selftest mutation was accepted: {label}")
-    return len(mutations) + 2
+
+        stream = synthetic_closed_lines(
+            VERIFIED_STREAM,
+            drop_observer_pairs=drop_observer_pairs,
+        )
+        require(
+            accepted(stream, VERIFIED_STREAM),
+            "synthetic verified-stream predecessor transcript was rejected",
+        )
+        require(
+            accepted(
+                synthetic_closed_lines(
+                    VERIFIED_STREAM,
+                    drop_observer_pairs=drop_observer_pairs + 1,
+                ),
+                VERIFIED_STREAM,
+            ),
+            "matching dynamic Drop counts were rejected in verified-stream mode",
+        )
+        for wrong_mode in (IRQ.LEGACY_CANCEL, TERMINAL_MODE):
+            require(
+                not accepted(stream, wrong_mode),
+                f"{wrong_mode} accepted the verified-stream predecessor transcript",
+            )
+        mixed_stream = list(stream)
+        stream_response = response_line(2, VERIFIED_STREAM)
+        mixed_stream[mixed_stream.index(stream_response)] = response_line(2, TERMINAL_MODE)
+        require(
+            not accepted(mixed_stream, VERIFIED_STREAM),
+            "verified-stream mode accepted a finish/discard predecessor terminal",
+        )
+    return len(mutations) + 7
 
 
 def parser() -> argparse.ArgumentParser:

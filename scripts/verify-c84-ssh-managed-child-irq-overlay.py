@@ -32,6 +32,8 @@ IRQ_QEMU_FEATURE = f"{IRQ_FEATURE}-qemu-acceptance"
 FAMILY = "WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY"
 FINISH_FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
 FINISH_QEMU_FEATURE = f"{FINISH_FEATURE}-qemu-acceptance"
+VERIFIED_STREAM_FEATURE = "wasm-c84-ssh-managed-child-verified-stream"
+VERIFIED_STREAM_QEMU_FEATURE = f"{VERIFIED_STREAM_FEATURE}-qemu-acceptance"
 
 
 def load_phase_verifier():
@@ -801,6 +803,8 @@ def verify_acceptance_slot(source: str) -> None:
 def verify_ssh(source: str) -> None:
     source = CORE.without_direct_feature_units(source, FINISH_FEATURE)
     source = CORE.without_direct_feature_units(source, FINISH_QEMU_FEATURE)
+    source = CORE.without_direct_feature_units(source, VERIFIED_STREAM_FEATURE)
+    source = CORE.without_direct_feature_units(source, VERIFIED_STREAM_QEMU_FEATURE)
     backend = find_scope(
         source,
         r"\bimpl\s+SshExecProfileRunBackend\s+for\s+SshExecProfileOwner\b",

@@ -443,7 +443,8 @@ def verify_features(inputs: "Inputs") -> None:
     )
     require(isolation in root, "managed-child acceptance isolation guard differs")
     irq_guard = (
-        '#[cfg(all(feature="wasm-c84-profile-irq-overlay",any('
+        '#[cfg(all(feature="wasm-c84-profile-irq-overlay",'
+        'not(feature="wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance"),any('
         'feature="wasm-c84-profile-slot-qemu-acceptance",'
         'feature="wasm-c84-core-poll-qemu-acceptance",'
         f'feature="{REQUEST_QEMU_FEATURE}")))]'

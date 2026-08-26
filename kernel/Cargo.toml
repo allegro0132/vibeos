@@ -286,6 +286,19 @@ wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance = [
     "wasm-c84-ssh-managed-child-phase-sidecar",
     "wasm-c84-ssh-managed-child-core-qemu-acceptance",
 ]
+# Default-off composition of the real authenticated parent/managed child phase
+# path with the existing allocation-free trap IRQ overlay. The parent remains
+# cancel-only and no verified stream or publisher authority is exposed.
+wasm-c84-ssh-managed-child-irq-overlay = [
+    "wasm-c84-ssh-managed-child-phase-sidecar",
+    "wasm-c84-profile-irq-overlay",
+]
+# Single-hart OpenSSH proof for one causal parent Host self-SSIP, one causal
+# child Core self-SSIP, and an inactive gate after every terminal recycle.
+wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-irq-overlay",
+    "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

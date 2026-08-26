@@ -403,6 +403,58 @@ seam, not physical evidence. IRQ composition, `finish`, verified streaming,
 schema publication, collection, physical-Duo sampling, and the AOT decision
 remain later nodes.
 
+## Managed-child parent/child IRQ-overlay composition
+
+The default-off `wasm-c84-ssh-managed-child-irq-overlay` successor composes the
+same authenticated request parent, real managed child, ordinary Core observer,
+and phase sidecar with the production profile IRQ overlay. The base feature is
+silent, contains no acceptance worker, and is exposed to Milk-V only as a
+compile-time seam. The separate QEMU acceptance feature retains the phase,
+Core, and request predecessor telemetry and adds one narrow causal self-SSIP
+state machine; it does not enable the standalone profile-IRQ acceptance image.
+
+Epoch 1 forces the only two active self-SSIPs. The parent injection occurs only
+after `managed_parent_host` has returned, so `SLOT` is no longer held and the
+current request parent is the active owner. The child injection occurs only
+after `begin_child_core_phase` has returned for the exact current prepared-task
+seal. Its observation stays in the lexical managed-child clock until
+`end_child_core_phase` has succeeded and Core is Closed; only then may the
+`CHILD_SSIP` marker be printed. The start tick is sampled after the injected
+interrupt, so acceptance work is not charged to the portable Core aggregate.
+No active self-SSIP is forced in epochs 2--4.
+
+The response and active-Drop paths retain the existing terminal authority and
+order. They first cancel the parent, compare the exact rejection, acknowledge
+it once, and prove `Ready(next_epoch)`. With `ACTIVE_EPOCH == 0`, the acceptance
+state machine then forces exactly one inactive self-SSIP and confirms that the
+slot status and active epoch did not change. Existing phase, Core, and request
+terminals remain in their original order; the new terminal marker is printed
+last and must precede the next request start. The cumulative observations at
+the four terminals are respectively `(paired, inactive, active_epoch) =`
+`(2, 1, 0)`, `(2, 2, 0)`, `(2, 3, 0)`, and `(2, 4, 0)`.
+
+The source and live gates are:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-irq-overlay.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-irq-overlay-test.sh
+```
+
+The frozen UART contract has exactly six
+`WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY` lines: epoch-1 `PARENT_SSIP` and
+`CHILD_SSIP`; normal `RESPONSE` terminals for epochs 1, 2, and 4; and the epoch-3
+`DROP` terminal. Only epoch 1 reports `parent_pair=1 child_pair=1`; every later
+epoch reports zero active pairs. All four terminals report one causal inactive
+self-SSIP, `active_epoch=0`, exact cumulative counters, cancel/ack, and the next
+ready epoch. The peer independently preserves the phase-sidecar's exact 27/28
+markers, the managed-child/Core 19-marker transcript, and the request parent's
+eight markers, including the delayed-stdin epoch and active-Drop reuse.
+
+This closes only the parent/child SSIP composition gap on one QEMU hart. It is
+not timer or PLIC coverage, target timing evidence, a physical Milk-V Duo
+sample, a verified stream, schema publication, collection, or an AOT decision.
+The parent continues to cancel; there is still no `finish` or publisher.
+
 ## Decision rule
 
 Let `T` be each retained sample's `total_ticks`, `I` its `interpretation`

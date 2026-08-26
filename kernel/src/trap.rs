@@ -228,7 +228,8 @@ extern "C" fn __trap_handler(irq_entry: u64) {
         let _ = ipi::acknowledge_current();
         #[cfg(any(
             feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
-            feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+            feature = "wasm-c84-profile-child-delegation-qemu-acceptance",
+            feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance"
         ))]
         {
             let applied = crate::wasm_aot_profile_slot::profile_irq_exit(profile_irq, sbi::time());
@@ -238,7 +239,8 @@ extern "C" fn __trap_handler(irq_entry: u64) {
             feature = "wasm-c84-profile-irq-overlay",
             not(any(
                 feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
-                feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+                feature = "wasm-c84-profile-child-delegation-qemu-acceptance",
+                feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance"
             ))
         ))]
         let _ = crate::wasm_aot_profile_slot::profile_irq_exit(profile_irq, sbi::time());

@@ -225,6 +225,18 @@ impl SshExecProfileOwner {
             crate::wasm_aot_profile_slot::take_managed_child_response_observation(epoch);
         match cancel_and_ack_profile(run, crate::wasm_aot_profile_slot::SlotFaults::default()) {
             Ok(ready_epoch) if child_ready && profile_policy_is_current(self.policy) => {
+                #[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+                let irq_observation =
+                    match crate::wasm_aot_profile_slot::managed_irq_acceptance_terminal_gate(
+                        epoch,
+                        ready_epoch,
+                    ) {
+                        Ok(observation) => observation,
+                        Err(_) => {
+                            profile_request_failure("irq-response-terminal", Some(epoch));
+                            return Err(());
+                        }
+                    };
                 #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
                 profile_phase_response(
                     epoch,
@@ -250,6 +262,8 @@ impl SshExecProfileOwner {
                     }
                 }
                 profile_request_response(epoch, status, ready_epoch);
+                #[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+                managed_irq_response(epoch, status, ready_epoch, irq_observation);
                 Ok(())
             }
             Ok(_) => {
@@ -294,6 +308,18 @@ impl SshExecProfileOwner {
                     crate::wasm_aot_profile_slot::managed_phase_observation(epoch);
                 match cancel_and_ack_profile(run, expected_faults) {
                     Ok(ready_epoch) if expectation_exact => {
+                        #[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+                        let irq_observation =
+                            match crate::wasm_aot_profile_slot::managed_irq_acceptance_terminal_gate(
+                                epoch,
+                                ready_epoch,
+                            ) {
+                                Ok(observation) => observation,
+                                Err(_) => {
+                                    profile_request_failure("irq-drop-terminal", Some(epoch));
+                                    return;
+                                }
+                            };
                         #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
                         if profile_phase_drop(
                             epoch,
@@ -321,7 +347,9 @@ impl SshExecProfileOwner {
                                 return;
                             }
                         }
-                        profile_request_drop(epoch, ready_epoch)
+                        profile_request_drop(epoch, ready_epoch);
+                        #[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+                        managed_irq_drop(epoch, ready_epoch, irq_observation);
                     }
                     Ok(_) => profile_request_failure("managed-child-drop-state", Some(epoch)),
                     Err(()) => profile_request_failure("drop", Some(epoch)),
@@ -401,9 +429,32 @@ impl SshExecProfileRunBackend for SshExecProfileOwner {
             profile_request_failure("host-phase-state", None);
             return Err(());
         };
+        let epoch = run.token().epoch();
         run.managed_parent_host().map_err(|_| {
             profile_request_failure("host-phase", Some(run.token().epoch()));
-        })
+        })?;
+        #[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+        match crate::wasm_aot_profile_slot::managed_irq_acceptance_parent_host(epoch) {
+            Ok(Some(observation)) => {
+                // The Host transition and self-SSIP trap have both returned;
+                // neither SLOT nor the trap stack is held while UART prints.
+                crate::println!(
+                    "WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY PARENT_SSIP epoch={} causal=1 paired={} inactive={} active_epoch={}",
+                    epoch,
+                    observation.paired,
+                    observation.inactive,
+                    observation.active_epoch,
+                );
+            }
+            Ok(None) => {}
+            Err(_) => {
+                profile_request_failure("irq-parent-host", Some(epoch));
+                return Err(());
+            }
+        }
+        #[cfg(not(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance"))]
+        let _ = epoch;
+        Ok(())
     }
 
     #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
@@ -482,6 +533,43 @@ fn profile_request_drop(epoch: u64, ready_epoch: u64) {
     );
     #[cfg(not(feature = "wasm-c84-ssh-request-parent-qemu-acceptance"))]
     let _ = (epoch, ready_epoch);
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+fn managed_irq_response(
+    epoch: u64,
+    status: u32,
+    ready_epoch: u64,
+    observation: crate::wasm_aot_profile_slot::ManagedIrqObservation,
+) {
+    let causal_pair = u8::from(epoch == 1);
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY RESPONSE epoch={} status={} parent_pair={} child_pair={} terminal_inactive=1 paired={} inactive={} active_epoch={} cancel=1 ack=1 ready_epoch={}",
+        epoch,
+        status,
+        causal_pair,
+        causal_pair,
+        observation.paired,
+        observation.inactive,
+        observation.active_epoch,
+        ready_epoch,
+    );
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance")]
+fn managed_irq_drop(
+    epoch: u64,
+    ready_epoch: u64,
+    observation: crate::wasm_aot_profile_slot::ManagedIrqObservation,
+) {
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY DROP epoch={} parent_pair=0 child_pair=0 terminal_inactive=1 paired={} inactive={} active_epoch={} cancel=1 ack=1 ready_epoch={}",
+        epoch,
+        observation.paired,
+        observation.inactive,
+        observation.active_epoch,
+        ready_epoch,
+    );
 }
 
 #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]

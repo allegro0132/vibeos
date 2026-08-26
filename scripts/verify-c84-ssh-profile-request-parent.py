@@ -365,11 +365,27 @@ def verify_sshd(source: str, manifest: bytes) -> None:
 
     serve = find_scope(production, r"\basync\s+fn\s+serve_connection\b", "SSH request parent")
     serve_code = compact(serve.code)
+    serve_semantic = semantic(serve.raw)
     require("SessionStart::Exec(accepted)" in serve_code, "request parent does not receive AcceptedExec")
     require("profile:mutprofile_run" in serve_code, "request parent does not retain the run")
-    require(serve_code.count("&mutprofile_run") == 2, "request parent does not pass its run to both exec completion paths")
-    execute_call = re.search(r"execute_with_network\((.*?)\)\.await", serve_code)
-    require(execute_call is not None and "profile_run" not in execute_call.group(1), "request run leaked into the managed child execution call")
+    phase_sidecar_borrow = '#[cfg(feature="c84-profile-phase-sidecar")]&mutprofile_run'
+    require(
+        serve_semantic.count(phase_sidecar_borrow) == 1,
+        "request parent phase-sidecar borrow is not one exact guarded transport borrow",
+    )
+    completion_code = serve_semantic.replace(phase_sidecar_borrow, "")
+    require(
+        completion_code.count("&mutprofile_run") == 2,
+        "request parent does not pass its run to both exec completion paths",
+    )
+    execute_call = re.search(r"execute_with_network\((.*?)\)\.await", serve_semantic)
+    require(execute_call is not None, "managed execution call is missing")
+    execute_arguments = execute_call.group(1)
+    require(
+        execute_arguments.count(phase_sidecar_borrow) == 1
+        and "profile_run" not in execute_arguments.replace(phase_sidecar_borrow, ""),
+        "request run escaped its exact guarded phase-sidecar transport borrow",
+    )
 
     reach = find_scope(production, r"\bfn\s+reach_profile_response_boundary\b", "response-boundary take helper")
     cfg_guarded(production, reach.start, "response-boundary take helper")
@@ -824,6 +840,21 @@ def run_selftest(inputs: Inputs) -> int:
         (
             "response-not-consume-once",
             lambda data: Inputs(replace_once(data.sshd, "let Some(run) = profile_run.take()", "let Some(run) = profile_run.as_mut()", "response-take"), data.sshd_manifest, data.kernel, data.kernel_manifest),
+        ),
+        (
+            "phase-sidecar-run-borrow-widened",
+            lambda data: Inputs(
+                replace_once(
+                    data.sshd,
+                    '                #[cfg(feature = "c84-profile-phase-sidecar")]\n'
+                    "                &mut profile_run,\n",
+                    "                &mut profile_run,\n",
+                    "phase-sidecar-run-borrow-widened",
+                ),
+                data.sshd_manifest,
+                data.kernel,
+                data.kernel_manifest,
+            ),
         ),
         (
             "pre-progress-boundary-removed",

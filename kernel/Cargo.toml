@@ -272,6 +272,20 @@ wasm-c84-ssh-managed-child-core-qemu-acceptance = [
     "wasm-c84-ssh-managed-child-core",
     "wasm-c84-ssh-request-parent-qemu-acceptance",
 ]
+# Default-off diagnostic phase sidecar for the same authenticated request and
+# real managed child. It accounts Host/Wait/Cleanup ownership but still leaves
+# the parent on the cancel/ack path and exposes no stream or publisher.
+wasm-c84-ssh-managed-child-phase-sidecar = [
+    "wasm-c84-ssh-managed-child-core",
+    "vibeos-sshd/c84-profile-phase-sidecar",
+]
+# Single-hart OpenSSH proof for the parent transport plus child phase sidecar.
+# The predecessor family remains enabled; CI first freezes its original gate,
+# then checks the composed image's exact delayed-stdin delta separately.
+wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-phase-sidecar",
+    "wasm-c84-ssh-managed-child-core-qemu-acceptance",
+]
 # QEMU-only C4.8 proof image.  This is intentionally separate from both the
 # reusable SSH image feature and every Milk-V feature: only its target harness
 # may exercise fault injection and publish the one Closed -> Passed SSH gate.

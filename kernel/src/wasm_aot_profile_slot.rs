@@ -220,6 +220,8 @@ enum SlotState {
         child: Option<DelegatedChild>,
         child_detach: Option<TaskDetachReason>,
         faults: SlotFaults,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        managed_phase: ManagedPhaseSidecar,
         #[cfg(feature = "wasm-c84-core-poll-observer")]
         core_owner: CoreObserverOwner,
     },
@@ -253,6 +255,395 @@ enum CoreObserverOwner {
     Closed,
     Parent,
     Child,
+}
+
+/// The managed child's resumable base phase. Wait and Host are lexical
+/// overlays and therefore cannot replace this state. Cleanup is irreversible.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedChildBasePhase {
+    Validation,
+    Instantiation,
+    Abi,
+    Cleanup,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+impl ManagedChildBasePhase {
+    const fn phase(self) -> Phase {
+        match self {
+            Self::Validation => Phase::Validation,
+            Self::Instantiation => Phase::Instantiation,
+            Self::Abi => Phase::Abi,
+            Self::Cleanup => Phase::Cleanup,
+        }
+    }
+}
+
+/// Storage-resident diagnostic state for the exact SSH parent and its one
+/// managed child. No guard or wait future owns this state across suspension.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ManagedPhaseSidecar {
+    parent_waiting: bool,
+    parent_host_active: bool,
+    child_waiting: bool,
+    child_host_open: bool,
+    child_base: ManagedChildBasePhase,
+    cleanup_latched: bool,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+    parent_host_starts: u64,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+    parent_host_finishes: u64,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+    parent_wait_starts: u64,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+    parent_wait_finishes: u64,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+    child_host_starts: u64,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+    child_host_finishes: u64,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+    child_wait_starts: u64,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+    child_wait_finishes: u64,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+    cleanup_count: u64,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+impl ManagedPhaseSidecar {
+    const NEW: Self = Self {
+        parent_waiting: false,
+        parent_host_active: false,
+        child_waiting: false,
+        child_host_open: false,
+        child_base: ManagedChildBasePhase::Validation,
+        cleanup_latched: false,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        parent_host_starts: 0,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        parent_host_finishes: 0,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        parent_wait_starts: 0,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        parent_wait_finishes: 0,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        child_host_starts: 0,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        child_host_finishes: 0,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        child_wait_starts: 0,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        child_wait_finishes: 0,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        cleanup_count: 0,
+    };
+
+    /// Returns whether the ledger needs a real phase transition. Repeated
+    /// runnable work in an already-open parent Host interval is a no-op.
+    fn parent_host(&mut self) -> bool {
+        let changed = self.parent_waiting || !self.parent_host_active;
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        let closed_wait = self.parent_waiting;
+        self.parent_waiting = false;
+        self.parent_host_active = true;
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        {
+            self.parent_host_starts = self.parent_host_starts.saturating_add(1);
+            self.parent_host_finishes = self.parent_host_finishes.saturating_add(1);
+            if closed_wait {
+                self.parent_wait_finishes = self.parent_wait_finishes.saturating_add(1);
+            }
+        }
+        changed
+    }
+
+    fn parent_wait(&mut self) -> Result<(), ()> {
+        if self.parent_waiting {
+            return Err(());
+        }
+        self.parent_waiting = true;
+        self.parent_host_active = false;
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        {
+            self.parent_wait_starts = self.parent_wait_starts.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn parent_instantiation(&mut self) -> Result<(), ()> {
+        if self.parent_waiting {
+            return Err(());
+        }
+        self.parent_host_active = false;
+        Ok(())
+    }
+
+    fn child_set_phase(&mut self, phase: Phase) -> Result<(), ()> {
+        if self.child_waiting || self.child_host_open || self.cleanup_latched {
+            return Err(());
+        }
+        let next = match (self.child_base, phase) {
+            (ManagedChildBasePhase::Validation, Phase::Validation) => {
+                ManagedChildBasePhase::Validation
+            }
+            (
+                ManagedChildBasePhase::Validation | ManagedChildBasePhase::Instantiation,
+                Phase::Instantiation,
+            ) => ManagedChildBasePhase::Instantiation,
+            (ManagedChildBasePhase::Instantiation | ManagedChildBasePhase::Abi, Phase::Abi) => {
+                ManagedChildBasePhase::Abi
+            }
+            _ => return Err(()),
+        };
+        self.child_base = next;
+        Ok(())
+    }
+
+    fn child_enter_wait(&mut self) -> Result<(), ()> {
+        if self.child_waiting || self.child_host_open {
+            return Err(());
+        }
+        self.child_waiting = true;
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        {
+            self.child_wait_starts = self.child_wait_starts.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn child_resume_from_wait(&mut self) -> Result<Phase, ()> {
+        if !self.child_waiting || self.child_host_open {
+            return Err(());
+        }
+        self.child_waiting = false;
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        {
+            self.child_wait_finishes = self.child_wait_finishes.saturating_add(1);
+        }
+        Ok(self.child_base.phase())
+    }
+
+    fn child_enter_host(&mut self) -> Result<(), ()> {
+        if self.child_waiting || self.child_host_open {
+            return Err(());
+        }
+        self.child_host_open = true;
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        {
+            self.child_host_starts = self.child_host_starts.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn child_finish_host(&mut self) -> Result<Phase, ()> {
+        if !self.child_host_open || self.child_waiting {
+            return Err(());
+        }
+        self.child_host_open = false;
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        {
+            self.child_host_finishes = self.child_host_finishes.saturating_add(1);
+        }
+        Ok(self.child_base.phase())
+    }
+
+    fn child_begin_cleanup(&mut self) -> Result<(), ()> {
+        if self.cleanup_latched || self.child_waiting || self.child_host_open {
+            return Err(());
+        }
+        self.cleanup_latched = true;
+        self.child_base = ManagedChildBasePhase::Cleanup;
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        {
+            self.cleanup_count = self.cleanup_count.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    const fn child_release_ready(self) -> bool {
+        self.cleanup_latched
+            && matches!(self.child_base, ManagedChildBasePhase::Cleanup)
+            && !self.child_waiting
+            && !self.child_host_open
+    }
+}
+
+#[cfg(all(test, feature = "wasm-c84-ssh-managed-child-phase-sidecar"))]
+mod managed_phase_sidecar_tests {
+    use super::*;
+
+    #[test]
+    fn child_wait_and_host_restore_the_stored_base() {
+        let mut state = ManagedPhaseSidecar::NEW;
+        state.child_set_phase(Phase::Validation).unwrap();
+        state.child_set_phase(Phase::Instantiation).unwrap();
+        state.child_set_phase(Phase::Abi).unwrap();
+
+        state.child_enter_wait().unwrap();
+        assert!(state.child_waiting);
+        assert_eq!(state.child_resume_from_wait(), Ok(Phase::Abi));
+        assert!(!state.child_waiting);
+
+        state.child_begin_cleanup().unwrap();
+        assert!(state.cleanup_latched);
+        state.child_enter_host().unwrap();
+        assert_eq!(state.child_finish_host(), Ok(Phase::Cleanup));
+        state.child_enter_wait().unwrap();
+        assert_eq!(state.child_resume_from_wait(), Ok(Phase::Cleanup));
+        assert!(state.child_release_ready());
+    }
+
+    #[test]
+    fn malformed_or_regressive_transitions_fail_closed() {
+        let mut state = ManagedPhaseSidecar::NEW;
+        assert_eq!(state.child_set_phase(Phase::Abi), Err(()));
+        state.child_set_phase(Phase::Instantiation).unwrap();
+        assert_eq!(state.child_set_phase(Phase::Validation), Err(()));
+
+        state.child_enter_wait().unwrap();
+        assert_eq!(state.child_enter_wait(), Err(()));
+        assert_eq!(state.child_enter_host(), Err(()));
+        state.child_resume_from_wait().unwrap();
+        assert_eq!(state.child_resume_from_wait(), Err(()));
+
+        state.child_set_phase(Phase::Abi).unwrap();
+        state.child_begin_cleanup().unwrap();
+        assert_eq!(state.child_begin_cleanup(), Err(()));
+        assert_eq!(state.child_set_phase(Phase::Abi), Err(()));
+
+        assert!(state.parent_host());
+        assert!(!state.parent_host());
+        state.parent_wait().unwrap();
+        assert_eq!(state.parent_wait(), Err(()));
+        assert!(state.parent_host());
+        assert!(!state.parent_waiting);
+    }
+
+    #[test]
+    fn parent_phase_only_bypasses_exact_wait_open_child_drop() {
+        let exact = |change| {
+            managed_parent_phase_bypasses_child_drop(
+                change,
+                false,
+                Some(TaskDetachReason::Exited),
+                SlotFaults::CHILD_ABANDONED_DETACHED,
+                CoreObserverOwner::Closed,
+                true,
+                true,
+                false,
+            )
+        };
+        assert!(exact(ManagedParentPhaseChange::Host));
+        assert!(exact(ManagedParentPhaseChange::Wait));
+        assert!(!exact(ManagedParentPhaseChange::Instantiation));
+
+        assert!(!managed_parent_phase_bypasses_child_drop(
+            ManagedParentPhaseChange::Host,
+            true,
+            Some(TaskDetachReason::Exited),
+            SlotFaults::CHILD_ABANDONED_DETACHED,
+            CoreObserverOwner::Closed,
+            true,
+            true,
+            false,
+        ));
+        assert!(!managed_parent_phase_bypasses_child_drop(
+            ManagedParentPhaseChange::Host,
+            false,
+            Some(TaskDetachReason::Cancelled),
+            SlotFaults::CHILD_ABANDONED_DETACHED,
+            CoreObserverOwner::Closed,
+            true,
+            true,
+            false,
+        ));
+        assert!(!managed_parent_phase_bypasses_child_drop(
+            ManagedParentPhaseChange::Host,
+            false,
+            Some(TaskDetachReason::Exited),
+            SlotFaults::CHILD_ABANDONED,
+            CoreObserverOwner::Closed,
+            true,
+            true,
+            false,
+        ));
+        assert!(!managed_parent_phase_bypasses_child_drop(
+            ManagedParentPhaseChange::Host,
+            false,
+            Some(TaskDetachReason::Exited),
+            SlotFaults::CHILD_ABANDONED_DETACHED,
+            CoreObserverOwner::Child,
+            true,
+            true,
+            false,
+        ));
+        assert!(!managed_parent_phase_bypasses_child_drop(
+            ManagedParentPhaseChange::Host,
+            false,
+            Some(TaskDetachReason::Exited),
+            SlotFaults::CHILD_ABANDONED_DETACHED,
+            CoreObserverOwner::Closed,
+            false,
+            true,
+            false,
+        ));
+        assert!(!managed_parent_phase_bypasses_child_drop(
+            ManagedParentPhaseChange::Host,
+            false,
+            Some(TaskDetachReason::Exited),
+            SlotFaults::CHILD_ABANDONED_DETACHED,
+            CoreObserverOwner::Closed,
+            true,
+            false,
+            false,
+        ));
+        assert!(!managed_parent_phase_bypasses_child_drop(
+            ManagedParentPhaseChange::Host,
+            false,
+            Some(TaskDetachReason::Exited),
+            SlotFaults::CHILD_ABANDONED_DETACHED,
+            CoreObserverOwner::Closed,
+            true,
+            true,
+            true,
+        ));
+        let mut extra_fault = SlotFaults::CHILD_ABANDONED_DETACHED;
+        extra_fault.insert(SlotFaults::PARENT_PHASE);
+        assert!(!managed_parent_phase_bypasses_child_drop(
+            ManagedParentPhaseChange::Host,
+            false,
+            Some(TaskDetachReason::Exited),
+            extra_fault,
+            CoreObserverOwner::Closed,
+            true,
+            true,
+            false,
+        ));
+    }
+
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+    #[test]
+    fn acceptance_counters_track_entries_and_exact_closures() {
+        let mut state = ManagedPhaseSidecar::NEW;
+        state.parent_host();
+        state.parent_wait().unwrap();
+        state.parent_host();
+        state.child_enter_host().unwrap();
+        state.child_finish_host().unwrap();
+        state.child_enter_wait().unwrap();
+
+        assert_eq!(state.parent_host_starts, 2);
+        assert_eq!(state.parent_host_finishes, 2);
+        assert_eq!(state.parent_wait_starts, 1);
+        assert_eq!(state.parent_wait_finishes, 1);
+        assert_eq!(state.child_host_starts, 1);
+        assert_eq!(state.child_host_finishes, 1);
+        assert_eq!(state.child_wait_starts, 1);
+        assert_eq!(state.child_wait_finishes, 0);
+        assert!(state.child_waiting);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -307,6 +698,10 @@ impl SlotFaults {
     const CHILD_ABANDONED_DETACHED: Self = Self((1 << 2) | (1 << 3));
     const CHILD_OBSERVER: Self = Self(1 << 4);
     const CORE_OBSERVER: Self = Self(1 << 5);
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    const CHILD_PHASE: Self = Self(1 << 6);
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    const PARENT_PHASE: Self = Self(1 << 7);
 
     const fn is_empty(self) -> bool {
         self.0 == 0
@@ -716,6 +1111,119 @@ pub(crate) fn managed_child_response_ready(epoch: u64) -> Result<(), ProfileErro
         }
         _ => Err(ProfileError::StateMismatch),
     }
+}
+
+/// Require the complete phase sidecar closure before the authenticated parent
+/// emits its response. Unlike cancellation, a stale Wait is a successful-path
+/// protocol violation and becomes a sticky request-local fault.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+pub(crate) fn managed_phase_response_ready(epoch: u64) -> Result<(), ProfileError> {
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child,
+        child_detach,
+        faults,
+        managed_phase,
+        core_owner,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token().epoch() != epoch {
+        return Err(ProfileError::StateMismatch);
+    }
+    if managed_phase.parent_waiting {
+        faults.insert(SlotFaults::PARENT_PHASE);
+    }
+    if managed_phase.child_waiting
+        || managed_phase.child_host_open
+        || !managed_phase.cleanup_latched
+    {
+        faults.insert(SlotFaults::CHILD_PHASE);
+    }
+    if !faults.is_empty() {
+        return Err(ProfileError::SlotFault(*faults));
+    }
+    if child.is_none()
+        && *child_detach == Some(TaskDetachReason::Exited)
+        && *core_owner == CoreObserverOwner::Closed
+    {
+        Ok(())
+    } else {
+        Err(ProfileError::StateMismatch)
+    }
+}
+
+/// Acceptance-only non-consuming snapshot. Reading it neither repairs an
+/// open wait nor advances the existing managed-child trace state.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedPhaseObservation {
+    pub(crate) parent_host_starts: u64,
+    pub(crate) parent_host_finishes: u64,
+    pub(crate) parent_wait_starts: u64,
+    pub(crate) parent_wait_finishes: u64,
+    pub(crate) child_host_starts: u64,
+    pub(crate) child_host_finishes: u64,
+    pub(crate) child_wait_starts: u64,
+    pub(crate) child_wait_finishes: u64,
+    pub(crate) cleanup_count: u64,
+    pub(crate) cleanup_latched: bool,
+    pub(crate) parent_wait_open: bool,
+    pub(crate) child_wait_open: bool,
+    pub(crate) child_host_open: bool,
+    pub(crate) child_base: Phase,
+    pub(crate) child_phase_fault: bool,
+    pub(crate) parent_phase_fault: bool,
+    pub(crate) child_attached: bool,
+    pub(crate) child_detach: Option<TaskDetachReason>,
+    pub(crate) slot_faults: SlotFaults,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+pub(crate) fn managed_phase_observation(
+    epoch: u64,
+) -> Result<ManagedPhaseObservation, ProfileError> {
+    ensure_not_poisoned()?;
+    let slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child,
+        child_detach,
+        faults,
+        managed_phase,
+        ..
+    } = &*slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token().epoch() != epoch {
+        return Err(ProfileError::StateMismatch);
+    }
+    Ok(ManagedPhaseObservation {
+        parent_host_starts: managed_phase.parent_host_starts,
+        parent_host_finishes: managed_phase.parent_host_finishes,
+        parent_wait_starts: managed_phase.parent_wait_starts,
+        parent_wait_finishes: managed_phase.parent_wait_finishes,
+        child_host_starts: managed_phase.child_host_starts,
+        child_host_finishes: managed_phase.child_host_finishes,
+        child_wait_starts: managed_phase.child_wait_starts,
+        child_wait_finishes: managed_phase.child_wait_finishes,
+        cleanup_count: managed_phase.cleanup_count,
+        cleanup_latched: managed_phase.cleanup_latched,
+        parent_wait_open: managed_phase.parent_waiting,
+        child_wait_open: managed_phase.child_waiting,
+        child_host_open: managed_phase.child_host_open,
+        child_base: managed_phase.child_base.phase(),
+        child_phase_fault: faults.contains(SlotFaults::CHILD_PHASE),
+        parent_phase_fault: faults.contains(SlotFaults::PARENT_PHASE),
+        child_attached: child.is_some(),
+        child_detach: *child_detach,
+        slot_faults: *faults,
+    })
 }
 
 /// Freeze the only request-Drop child outcomes accepted by the production
@@ -1134,6 +1642,8 @@ fn start_reserved(epoch: u64, detach: CurrentTaskDetachLease) -> Result<SampleTo
                 child: None,
                 child_detach: None,
                 faults: SlotFaults::NONE,
+                #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+                managed_phase: ManagedPhaseSidecar::NEW,
                 #[cfg(feature = "wasm-c84-core-poll-observer")]
                 core_owner: CoreObserverOwner::Closed,
             };
@@ -1296,6 +1806,137 @@ fn apply_phase(
     } else {
         Err(ProfileError::Facade(facade))
     }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+#[derive(Clone, Copy)]
+enum ManagedParentPhaseChange {
+    Host,
+    Wait,
+    Instantiation,
+}
+
+/// Once the exact active child has been abandoned and detached while its
+/// Wait remains open, waking the parent is part of cancellation diagnosis,
+/// not a new transport phase. Keep both Wait ledgers untouched so the parent
+/// Drop path can report the precise open-at-cancel state.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+fn managed_parent_phase_bypasses_child_drop(
+    change: ManagedParentPhaseChange,
+    child_attached: bool,
+    child_detach: Option<TaskDetachReason>,
+    faults: SlotFaults,
+    core_owner: CoreObserverOwner,
+    parent_waiting: bool,
+    child_waiting: bool,
+    child_host_open: bool,
+) -> bool {
+    matches!(change, ManagedParentPhaseChange::Host | ManagedParentPhaseChange::Wait)
+        && !child_attached
+        && child_detach == Some(TaskDetachReason::Exited)
+        && faults == SlotFaults::CHILD_ABANDONED_DETACHED
+        && core_owner == CoreObserverOwner::Closed
+        && parent_waiting
+        && child_waiting
+        && !child_host_open
+}
+
+/// Apply one parent transport transition after the caller has proved the
+/// current task outside SLOT. The sidecar mutation and ledger tick are one
+/// synchronous critical section; no async or telemetry edge is reachable.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+fn apply_managed_parent_phase(
+    token: SampleToken,
+    detach: CurrentTaskDetachLease,
+    change: ManagedParentPhaseChange,
+) -> Result<(), ProfileError> {
+    ensure_not_poisoned()?;
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        owner,
+        child,
+        child_detach,
+        faults,
+        managed_phase,
+        core_owner,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token || !owner.matches(token.epoch(), detach) {
+        return Err(ProfileError::StateMismatch);
+    }
+    if *core_owner != CoreObserverOwner::Closed {
+        faults.insert(SlotFaults::PARENT_PHASE);
+        return Err(ProfileError::StateMismatch);
+    }
+    if managed_parent_phase_bypasses_child_drop(
+        change,
+        child.is_some(),
+        *child_detach,
+        *faults,
+        *core_owner,
+        managed_phase.parent_waiting,
+        managed_phase.child_waiting,
+        managed_phase.child_host_open,
+    ) {
+        return Ok(());
+    }
+    if !faults.is_empty() {
+        return Err(ProfileError::SlotFault(*faults));
+    }
+
+    let (phase, changed) = match change {
+        ManagedParentPhaseChange::Host => (Phase::Host, managed_phase.parent_host()),
+        ManagedParentPhaseChange::Wait => {
+            if managed_phase.parent_wait().is_err() {
+                faults.insert(SlotFaults::PARENT_PHASE);
+                return Err(ProfileError::StateMismatch);
+            }
+            (Phase::Wait, true)
+        }
+        ManagedParentPhaseChange::Instantiation => {
+            if managed_phase.parent_instantiation().is_err() {
+                faults.insert(SlotFaults::PARENT_PHASE);
+                return Err(ProfileError::StateMismatch);
+            }
+            (Phase::Instantiation, true)
+        }
+    };
+    if changed {
+        sample.set_phase(token, live_context(), live_tick(), phase);
+    }
+    let facade = sample.facade_faults();
+    if facade.is_empty() {
+        Ok(())
+    } else {
+        faults.insert(SlotFaults::PARENT_PHASE);
+        Err(ProfileError::Facade(facade))
+    }
+}
+
+/// Set the exact current SSH request parent to Instantiation without lending
+/// its RunLease to component preparation. A non-parent task is inert.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+pub(crate) fn managed_current_parent_set_instantiation() -> Result<Option<u64>, ProfileError> {
+    ensure_not_poisoned()?;
+    let candidate = {
+        let slot = SLOT.lock();
+        match &*slot {
+            SlotState::Active { sample, owner, .. } => Some((sample.token(), owner.detach)),
+            _ => None,
+        }
+    };
+    let Some((token, detach)) = candidate else {
+        return Ok(None);
+    };
+    if !detach.is_current_running_exact() {
+        return Ok(None);
+    }
+    apply_managed_parent_phase(token, detach, ManagedParentPhaseChange::Instantiation)?;
+    Ok(Some(token.epoch()))
 }
 
 /// Opens parent-owned Interpretation only while no delegated child or other
@@ -1588,6 +2229,19 @@ fn cancel_active(
         );
         if !exact {
             return Err(ProfileError::StateMismatch);
+        }
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        if let SlotState::Active {
+            managed_phase,
+            faults,
+            ..
+        } = &mut *slot
+        {
+            // Wait is an expected cancellation snapshot. A synchronous Host
+            // guard cannot legally survive to this boundary.
+            if managed_phase.child_host_open {
+                faults.insert(SlotFaults::CHILD_PHASE);
+            }
         }
         #[cfg(feature = "wasm-c84-core-poll-observer")]
         if let SlotState::Active {
@@ -1958,6 +2612,8 @@ fn begin_child_core_phase(
         sample,
         child: Some(child),
         faults,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        managed_phase,
         core_owner,
         ..
     } = &mut *slot
@@ -1972,6 +2628,17 @@ fn begin_child_core_phase(
     }
     if *core_owner != CoreObserverOwner::Closed {
         faults.insert(SlotFaults::CHILD_OBSERVER);
+        return Err(ProfileError::StateMismatch);
+    }
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    if managed_phase.child_waiting
+        || managed_phase.child_host_open
+        || !matches!(
+            managed_phase.child_base,
+            ManagedChildBasePhase::Abi | ManagedChildBasePhase::Cleanup
+        )
+    {
+        faults.insert(SlotFaults::CHILD_PHASE);
         return Err(ProfileError::StateMismatch);
     }
     if !faults.is_empty() {
@@ -2008,6 +2675,8 @@ fn end_child_core_phase(token: SampleToken, detach: PreparedTaskDetachSeal) -> P
         child: Some(child),
         faults,
         core_owner,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        managed_phase,
         ..
     } = &mut *slot
     else {
@@ -2038,9 +2707,21 @@ fn end_child_core_phase(token: SampleToken, detach: PreparedTaskDetachSeal) -> P
             error: Some(ProfileError::SlotFault(*faults)),
         };
     }
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    if managed_phase.child_waiting || managed_phase.child_host_open {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        return PhaseBoundary {
+            tick: live_tick(),
+            error: Some(ProfileError::StateMismatch),
+        };
+    }
     let context = live_context();
     let tick = live_tick();
-    sample.set_phase(token, context, tick, Phase::Abi);
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    let restore_phase = managed_phase.child_base.phase();
+    #[cfg(not(feature = "wasm-c84-ssh-managed-child-phase-sidecar"))]
+    let restore_phase = Phase::Abi;
+    sample.set_phase(token, context, tick, restore_phase);
     *core_owner = CoreObserverOwner::Closed;
     let facade = sample.facade_faults();
     PhaseBoundary {
@@ -2061,6 +2742,8 @@ fn release_child(token: SampleToken, detach: PreparedTaskDetachSeal) -> Result<(
         sample,
         child: Some(child),
         faults,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        managed_phase,
         #[cfg(feature = "wasm-c84-core-poll-observer")]
         core_owner,
         ..
@@ -2077,6 +2760,11 @@ fn release_child(token: SampleToken, detach: PreparedTaskDetachSeal) -> Result<(
     #[cfg(feature = "wasm-c84-core-poll-observer")]
     if *core_owner != CoreObserverOwner::Closed {
         faults.insert(SlotFaults::CHILD_OBSERVER);
+        return Err(ProfileError::StateMismatch);
+    }
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    if !managed_phase.child_release_ready() {
+        faults.insert(SlotFaults::CHILD_PHASE);
         return Err(ProfileError::StateMismatch);
     }
     if !faults.is_empty() {
@@ -2150,6 +2838,29 @@ impl RunLease {
             return Err(ProfileError::OwnerNotCurrent);
         }
         apply_phase(self.token, self.detach, None)
+    }
+
+    /// Mark synchronous SSH transport/protocol work. This also resumes a
+    /// parent Wait, but repeated work in the same Host turn does not create a
+    /// synthetic zero-length transition.
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    pub(crate) fn managed_parent_host(&self) -> Result<(), ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            mark_owner_fault(self.token, self.detach);
+            return Err(ProfileError::OwnerNotCurrent);
+        }
+        apply_managed_parent_phase(self.token, self.detach, ManagedParentPhaseChange::Host)
+    }
+
+    /// Open the parent's independent Wait state immediately before one real
+    /// suspension. The RunLease itself remains exclusively parent-owned.
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    pub(crate) fn managed_parent_wait(&self) -> Result<(), ProfileError> {
+        if !self.detach.is_current_running_exact() {
+            mark_owner_fault(self.token, self.detach);
+            return Err(ProfileError::OwnerNotCurrent);
+        }
+        apply_managed_parent_phase(self.token, self.detach, ManagedParentPhaseChange::Wait)
     }
 
     /// Bind one still-hidden prepared task to this exact request lineage.
@@ -2312,6 +3023,414 @@ fn current_managed_child(
     Ok(candidate)
 }
 
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+fn mark_managed_child_phase_fault(token: SampleToken, detach: PreparedTaskDetachSeal) {
+    let mut slot = SLOT.lock();
+    if let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        ..
+    } = &mut *slot
+    {
+        if sample.token() == token && child.matches(token.epoch(), detach) {
+            faults.insert(SlotFaults::CHILD_PHASE);
+        }
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+fn managed_child_phase_parts(
+    epoch: u64,
+) -> Result<(SampleToken, PreparedTaskDetachSeal), ProfileError> {
+    // `current_managed_child` performs its TaskStatus/SCHED proof after
+    // dropping SLOT. Every caller then re-locks and compares the copied seal.
+    current_managed_child(epoch)
+}
+
+/// Report whether exact runtime cancellation must bypass a new Host overlay.
+/// A live operation owned by an open Wait is cancelled without contradicting
+/// that Wait. Once the executor has already marked this exact child Abandoned,
+/// every destructor cancellation also bypasses Host because the linear child
+/// owner is gone. Neither case closes or repairs phase state.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+pub(crate) fn managed_child_cancel_bypasses_host(epoch: u64) -> Result<bool, ProfileError> {
+    ensure_not_poisoned()?;
+    let candidate = {
+        let slot = SLOT.lock();
+        match &*slot {
+            SlotState::Active {
+                sample,
+                child: Some(child),
+                ..
+            } if sample.token().epoch() == epoch
+                && child.epoch == epoch
+                && matches!(
+                    child.state,
+                    DelegatedChildState::Claimed | DelegatedChildState::Abandoned
+                ) => Some((sample.token(), child.detach)),
+            _ => None,
+        }
+    }
+    .ok_or(ProfileError::DelegatedChildUnavailable)?;
+    let (token, detach) = candidate;
+    if !detach.is_current_running_exact() && !detach.is_current_reclaiming_exact() {
+        mark_child_fault(token, detach);
+        return Err(ProfileError::OwnerNotCurrent);
+    }
+    let slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        managed_phase,
+        core_owner,
+        ..
+    } = &*slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token
+        || !child.matches(epoch, detach)
+        || *core_owner != CoreObserverOwner::Closed
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    match child.state {
+        DelegatedChildState::Claimed if faults.is_empty() => Ok(managed_phase.child_waiting),
+        DelegatedChildState::Abandoned if *faults == SlotFaults::CHILD_ABANDONED => Ok(true),
+        _ => Err(ProfileError::SlotFault(*faults)),
+    }
+}
+
+/// Change the claimed child's resumable base phase. Host, Wait, Cleanup, and
+/// Interpretation have dedicated linear entry points and are rejected here.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+pub(crate) fn managed_child_set_phase(epoch: u64, phase: Phase) -> Result<(), ProfileError> {
+    if !matches!(phase, Phase::Validation | Phase::Instantiation | Phase::Abi) {
+        return Err(ProfileError::StateMismatch);
+    }
+    let (token, detach) = managed_child_phase_parts(epoch)?;
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        managed_phase,
+        core_owner,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token
+        || !child.matches(epoch, detach)
+        || child.state != DelegatedChildState::Claimed
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    if *core_owner != CoreObserverOwner::Closed || !faults.is_empty() {
+        if *core_owner != CoreObserverOwner::Closed {
+            faults.insert(SlotFaults::CHILD_PHASE);
+        }
+        return Err(if faults.is_empty() {
+            ProfileError::StateMismatch
+        } else {
+            ProfileError::SlotFault(*faults)
+        });
+    }
+    if managed_phase.child_set_phase(phase).is_err() {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        return Err(ProfileError::StateMismatch);
+    }
+    sample.set_phase(token, live_context(), live_tick(), phase);
+    let facade = sample.facade_faults();
+    if facade.is_empty() {
+        Ok(())
+    } else {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        Err(ProfileError::Facade(facade))
+    }
+}
+
+/// Open the child's independent Wait immediately before suspension. This
+/// function receives only the copyable epoch and never returns a live guard.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+pub(crate) fn managed_child_enter_wait(epoch: u64) -> Result<(), ProfileError> {
+    let (token, detach) = managed_child_phase_parts(epoch)?;
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        managed_phase,
+        core_owner,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token
+        || !child.matches(epoch, detach)
+        || child.state != DelegatedChildState::Claimed
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    if *core_owner != CoreObserverOwner::Closed {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        return Err(ProfileError::StateMismatch);
+    }
+    if !faults.is_empty() {
+        return Err(ProfileError::SlotFault(*faults));
+    }
+    if managed_phase.child_enter_wait().is_err() {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        return Err(ProfileError::StateMismatch);
+    }
+    sample.set_phase(token, live_context(), live_tick(), Phase::Wait);
+    let facade = sample.facade_faults();
+    if facade.is_empty() {
+        Ok(())
+    } else {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        Err(ProfileError::Facade(facade))
+    }
+}
+
+/// Revalidate the resumed child and restore its stored base phase. Cleanup is
+/// therefore preserved across Wait rather than being inferred by the caller.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+pub(crate) fn managed_child_resume_from_wait(epoch: u64) -> Result<(), ProfileError> {
+    let (token, detach) = managed_child_phase_parts(epoch)?;
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        managed_phase,
+        core_owner,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token
+        || !child.matches(epoch, detach)
+        || child.state != DelegatedChildState::Claimed
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    if *core_owner != CoreObserverOwner::Closed {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        return Err(ProfileError::StateMismatch);
+    }
+    if !faults.is_empty() {
+        return Err(ProfileError::SlotFault(*faults));
+    }
+    let phase = match managed_phase.child_resume_from_wait() {
+        Ok(phase) => phase,
+        Err(()) => {
+            faults.insert(SlotFaults::CHILD_PHASE);
+            return Err(ProfileError::StateMismatch);
+        }
+    };
+    sample.set_phase(token, live_context(), live_tick(), phase);
+    let facade = sample.facade_faults();
+    if facade.is_empty() {
+        Ok(())
+    } else {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        Err(ProfileError::Facade(facade))
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+fn managed_child_open_host(
+    token: SampleToken,
+    detach: PreparedTaskDetachSeal,
+) -> Result<(), ProfileError> {
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        managed_phase,
+        core_owner,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token
+        || !child.matches(token.epoch(), detach)
+        || child.state != DelegatedChildState::Claimed
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    if *core_owner != CoreObserverOwner::Closed {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        return Err(ProfileError::StateMismatch);
+    }
+    if !faults.is_empty() {
+        return Err(ProfileError::SlotFault(*faults));
+    }
+    if managed_phase.child_enter_host().is_err() {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        return Err(ProfileError::StateMismatch);
+    }
+    sample.set_phase(token, live_context(), live_tick(), Phase::Host);
+    let facade = sample.facade_faults();
+    if facade.is_empty() {
+        Ok(())
+    } else {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        Err(ProfileError::Facade(facade))
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+fn managed_child_close_host(
+    token: SampleToken,
+    detach: PreparedTaskDetachSeal,
+) -> Result<(), ProfileError> {
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        managed_phase,
+        core_owner,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token
+        || !child.matches(token.epoch(), detach)
+        || child.state != DelegatedChildState::Claimed
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    if *core_owner != CoreObserverOwner::Closed {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        return Err(ProfileError::StateMismatch);
+    }
+    if !faults.is_empty() {
+        return Err(ProfileError::SlotFault(*faults));
+    }
+    let phase = match managed_phase.child_finish_host() {
+        Ok(phase) => phase,
+        Err(()) => {
+            faults.insert(SlotFaults::CHILD_PHASE);
+            return Err(ProfileError::StateMismatch);
+        }
+    };
+    sample.set_phase(token, live_context(), live_tick(), phase);
+    let facade = sample.facade_faults();
+    if facade.is_empty() {
+        Ok(())
+    } else {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        Err(ProfileError::Facade(facade))
+    }
+}
+
+/// Synchronous, non-Send sentinel for one child Host entry. Explicit finish
+/// is required; Drop or forget is recorded in the storage-resident state and
+/// can never pass release.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+#[must_use]
+pub(crate) struct ManagedChildHostPhase {
+    token: SampleToken,
+    detach: PreparedTaskDetachSeal,
+    live: bool,
+    not_send: PhantomData<*mut ()>,
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+impl ManagedChildHostPhase {
+    pub(crate) fn enter(epoch: u64) -> Result<Self, ProfileError> {
+        let (token, detach) = managed_child_phase_parts(epoch)?;
+        managed_child_open_host(token, detach)?;
+        Ok(Self {
+            token,
+            detach,
+            live: true,
+            not_send: PhantomData,
+        })
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(), ProfileError> {
+        let result = if self.detach.is_current_running_exact() {
+            managed_child_close_host(self.token, self.detach)
+        } else {
+            mark_child_fault(self.token, self.detach);
+            mark_managed_child_phase_fault(self.token, self.detach);
+            Err(ProfileError::OwnerNotCurrent)
+        };
+        self.live = false;
+        result
+    }
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+impl Drop for ManagedChildHostPhase {
+    fn drop(&mut self) {
+        if self.live {
+            self.live = false;
+            let exact_scope =
+                self.detach.is_current_running_exact() || self.detach.is_current_reclaiming_exact();
+            if !exact_scope {
+                mark_child_fault(self.token, self.detach);
+            }
+            mark_managed_child_phase_fault(self.token, self.detach);
+        }
+    }
+}
+
+/// Irreversibly latch Cleanup once, before the runtime performs cleanup work.
+#[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+pub(crate) fn managed_child_begin_cleanup(epoch: u64) -> Result<(), ProfileError> {
+    let (token, detach) = managed_child_phase_parts(epoch)?;
+    let mut slot = SLOT.lock();
+    let SlotState::Active {
+        sample,
+        child: Some(child),
+        faults,
+        managed_phase,
+        core_owner,
+        ..
+    } = &mut *slot
+    else {
+        return Err(ProfileError::StateMismatch);
+    };
+    if sample.token() != token
+        || !child.matches(epoch, detach)
+        || child.state != DelegatedChildState::Claimed
+    {
+        return Err(ProfileError::StateMismatch);
+    }
+    if *core_owner != CoreObserverOwner::Closed {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        return Err(ProfileError::StateMismatch);
+    }
+    if !faults.is_empty() {
+        return Err(ProfileError::SlotFault(*faults));
+    }
+    if managed_phase.child_begin_cleanup().is_err() {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        return Err(ProfileError::StateMismatch);
+    }
+    sample.begin_cleanup(token, live_context(), live_tick());
+    let facade = sample.facade_faults();
+    if facade.is_empty() {
+        Ok(())
+    } else {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        Err(ProfileError::Facade(facade))
+    }
+}
+
 #[cfg(feature = "wasm-c84-ssh-managed-child-core")]
 pub(crate) fn current_managed_child_driver_state() -> Result<Option<(u64, bool)>, ProfileError> {
     ensure_not_poisoned()?;
@@ -2388,12 +3507,25 @@ pub(crate) fn mark_managed_child_driver_completed(epoch: u64) -> Result<(), Prof
         sample,
         child: Some(child),
         faults,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        managed_phase,
         core_owner,
         ..
     } = &mut *slot
     else {
         return Err(ProfileError::StateMismatch);
     };
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    let phase_incomplete = !managed_phase.child_release_ready();
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    if sample.token() == token
+        && child.matches(epoch, detach)
+        && child.state == DelegatedChildState::Claimed
+        && phase_incomplete
+    {
+        faults.insert(SlotFaults::CHILD_PHASE);
+        return Err(ProfileError::StateMismatch);
+    }
     if sample.token() != token
         || !child.matches(epoch, detach)
         || child.state != DelegatedChildState::Claimed
@@ -2602,6 +3734,16 @@ impl ManagedChildSlotCorePollClock {
         }
     }
 
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    fn latch_phase(&mut self, error: Option<ProfileError>) {
+        if error.is_some() {
+            mark_managed_child_phase_fault(self.token, self.detach);
+        }
+        if self.first_error.is_none() {
+            self.first_error = error;
+        }
+    }
+
     pub(crate) const fn error(&self) -> Option<ProfileError> {
         self.first_error
     }
@@ -2620,6 +3762,21 @@ impl ManagedChildSlotCorePollClock {
 impl ProfileClock for ManagedChildSlotCorePollClock {
     fn ticks(&mut self) -> u64 {
         live_tick()
+    }
+
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    fn cleanup_started(&mut self) {
+        let epoch = self.token.epoch();
+        let error = managed_child_begin_cleanup(epoch).err();
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance")]
+        if error.is_none() {
+            // SLOT is no longer held: telemetry can never invert SLOT -> UART.
+            crate::println!(
+                "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR CHILD_PHASE epoch={} phase=cleanup",
+                epoch
+            );
+        }
+        self.latch_phase(error);
     }
 
     fn core_poll_started(&mut self) -> u64 {
@@ -2993,6 +4150,8 @@ unsafe fn profile_child_detached(
         child,
         child_detach,
         faults,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+        managed_phase,
         #[cfg(feature = "wasm-c84-core-poll-observer")]
         core_owner,
         ..
@@ -3015,6 +4174,10 @@ unsafe fn profile_child_detached(
     #[cfg(feature = "wasm-c84-core-poll-observer")]
     if *core_owner == CoreObserverOwner::Child {
         faults.insert(SlotFaults::CHILD_OBSERVER);
+    }
+    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+    if managed_phase.child_host_open {
+        faults.insert(SlotFaults::CHILD_PHASE);
     }
     let clean =
         state == DelegatedChildState::CompletedPendingDetach && reason == TaskDetachReason::Exited;
@@ -3094,6 +4257,8 @@ unsafe fn profile_task_detached(
                 let SlotState::Active {
                     sample,
                     faults,
+                    #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+                    managed_phase,
                     #[cfg(feature = "wasm-c84-core-poll-observer")]
                     core_owner,
                     ..
@@ -3106,6 +4271,10 @@ unsafe fn profile_task_detached(
                 let mut faults = faults;
                 #[cfg(feature = "wasm-c84-core-poll-observer")]
                 record_open_core_fault(&mut faults, core_owner);
+                #[cfg(feature = "wasm-c84-ssh-managed-child-phase-sidecar")]
+                if managed_phase.child_host_open {
+                    faults.insert(SlotFaults::CHILD_PHASE);
+                }
                 DetachAction::Cancel {
                     sample,
                     owner,

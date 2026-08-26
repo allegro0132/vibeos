@@ -37,6 +37,7 @@ REQUEST_QEMU_FEATURE = f"{REQUEST_FEATURE}-qemu-acceptance"
 CHILD_FEATURE = "wasm-c84-profile-child-delegation"
 CORE_FEATURE = "wasm-c84-core-poll-observer"
 IRQ_FEATURE = "wasm-c84-profile-irq-overlay"
+PHASE_SIDECAR_FEATURE = "wasm-c84-ssh-managed-child-phase-sidecar"
 
 
 class VerificationError(Exception):
@@ -203,6 +204,99 @@ def compact(value: str) -> str:
 
 def semantic(value: str) -> str:
     return compact(rust_mask(value, literals=False))
+
+
+@lru_cache(maxsize=256)
+def without_direct_feature_units(source: str, feature: str) -> str:
+    """Mask only syntax units directly guarded by one exact feature cfg.
+
+    The managed-child/Core predecessor must keep rejecting phase-sidecar code
+    in its own path.  Its successor is allowed to add Host/Wait/Cleanup code,
+    but only behind a direct, exact cfg on the affected Rust statement or
+    item.  This small scanner deliberately does not understand cfg(any(...)),
+    cfg_attr, or an enclosing module: those broader forms remain visible to
+    the predecessor's forbidden-token checks.
+    """
+
+    masked = rust_mask(source, literals=False)
+    attribute = re.compile(
+        rf'#\s*\[\s*cfg\s*\(\s*feature\s*=\s*"{re.escape(feature)}"\s*\)\s*\]'
+    )
+    spans: list[tuple[int, int]] = []
+
+    def matching(opening: int, left: str, right: str) -> int:
+        depth = 0
+        for cursor in range(opening, len(masked)):
+            if masked[cursor] == left:
+                depth += 1
+            elif masked[cursor] == right:
+                depth -= 1
+                if depth == 0:
+                    return cursor + 1
+        raise VerificationError(f"unbalanced {left}{right} after direct {feature} cfg")
+
+    for match in attribute.finditer(masked):
+        cursor = match.end()
+        while cursor < len(masked) and masked[cursor].isspace():
+            cursor += 1
+        require(cursor < len(masked), f"direct {feature} cfg has no syntax unit")
+
+        # Permit harmless secondary attributes only after the exact feature
+        # guard. They are part of the same directly guarded syntax unit.
+        while masked.startswith("#[", cursor):
+            bracket = matching(cursor + 1, "[", "]")
+            cursor = bracket
+            while cursor < len(masked) and masked[cursor].isspace():
+                cursor += 1
+
+        parens = brackets = braces = 0
+        first_brace = -1
+        end = -1
+        index = cursor
+        while index < len(masked):
+            character = masked[index]
+            if character == "(":
+                parens += 1
+            elif character == ")":
+                # A directly guarded parameter lives inside parentheses that
+                # started before the attribute. Its own unit must have ended
+                # at the preceding comma; reaching this delimiter is invalid.
+                parens -= 1
+            elif character == "[":
+                brackets += 1
+            elif character == "]":
+                brackets -= 1
+            elif character == "{":
+                if parens == 0 and brackets == 0 and braces == 0 and first_brace < 0:
+                    first_brace = index
+                braces += 1
+            elif character == "}":
+                braces -= 1
+                if braces == 0 and first_brace >= 0 and parens == 0 and brackets == 0:
+                    end = index + 1
+                    probe = end
+                    while probe < len(masked) and masked[probe].isspace():
+                        probe += 1
+                    if probe < len(masked) and masked[probe] == ";":
+                        end = probe + 1
+                    break
+            elif character in ";," and parens == 0 and brackets == 0 and braces == 0:
+                end = index + 1
+                break
+            require(
+                parens >= 0 and brackets >= 0 and braces >= 0,
+                f"unbalanced syntax unit after direct {feature} cfg",
+            )
+            index += 1
+        require(end >= 0, f"direct {feature} cfg syntax unit is unterminated")
+        spans.append((match.start(), end))
+
+    output = list(source)
+    for start, end in spans:
+        for cursor in range(start, end):
+            if output[cursor] not in "\r\n":
+                output[cursor] = " "
+    return "".join(output)
 
 
 def ordered(scope: str, needles: list[str], label: str) -> None:
@@ -396,7 +490,12 @@ def verify_component(source: str) -> tuple[Scope, Scope, Scope]:
         r"\bfn\s+start_image_instance_under_control\b",
         "managed instance start",
     )
-    start_code = semantic(start.raw)
+    # The successor may add its own directly guarded parent phase predicate.
+    # Remove only that syntax unit so it cannot satisfy or hide the exact
+    # predecessor target predicate below.
+    start_code = semantic(
+        without_direct_feature_units(start.raw, PHASE_SIDECAR_FEATURE)
+    )
     for exact in (
         f'#[cfg(feature="{FEATURE}")]letchild_registration_reserve=3;',
         f'#[cfg(not(feature="{FEATURE}"))]letchild_registration_reserve=2;',
@@ -556,7 +655,9 @@ def verify_component(source: str) -> tuple[Scope, Scope, Scope]:
         "TrapIrqCookie",
     )
     integration = start.raw + future_impl.raw + future_drop.raw + run.raw
-    integration_code = rust_mask(integration)
+    integration_code = rust_mask(
+        without_direct_feature_units(integration, PHASE_SIDECAR_FEATURE)
+    )
     for token in forbidden:
         require(token not in integration_code, f"managed child integration admits forbidden {token}")
     return start, poll, run
@@ -820,6 +921,9 @@ def verify_slot(source: str) -> tuple[Scope, ...]:
             detached,
         )
     )
+    predecessor_integration = rust_mask(
+        without_direct_feature_units(integration, PHASE_SIDECAR_FEATURE)
+    )
     for forbidden in (
         ".finish(",
         "StreamLease",
@@ -833,7 +937,7 @@ def verify_slot(source: str) -> tuple[Scope, ...]:
         "profile_irq_",
         "TrapIrqCookie",
     ):
-        require(forbidden not in rust_mask(integration), f"slot composition admits forbidden {forbidden}")
+        require(forbidden not in predecessor_integration, f"slot composition admits forbidden {forbidden}")
     return attach, claim, release, abandon, mark, clock, response, drop_faults, detached
 
 
@@ -908,6 +1012,9 @@ def verify_ssh(source: str) -> tuple[Scope, Scope, Scope]:
         "parent acknowledgement count differs",
     )
     integration = owner.raw + close.raw
+    predecessor_integration = rust_mask(
+        without_direct_feature_units(integration, PHASE_SIDECAR_FEATURE)
+    )
     for forbidden in (
         ".finish(",
         "StreamLease",
@@ -921,7 +1028,7 @@ def verify_ssh(source: str) -> tuple[Scope, Scope, Scope]:
         "profile_irq_",
         "TrapIrqCookie",
     ):
-        require(forbidden not in rust_mask(integration), f"SSH parent admits forbidden {forbidden}")
+        require(forbidden not in predecessor_integration, f"SSH parent admits forbidden {forbidden}")
     return response, cancel, close
 
 
@@ -1033,6 +1140,18 @@ def remove_c48_from_acceptance_isolation(data: Inputs) -> Inputs:
 
 def run_selftest(inputs: Inputs) -> int:
     verify(inputs)
+    guarded_successor = replace(
+        inputs,
+        component=replace_once(
+            inputs.component,
+            "            let result = call.poll_profiled(&mut clock, &mut core_profile);",
+            f'            #[cfg(feature = "{PHASE_SIDECAR_FEATURE}")]\n'
+            "            let _successor_only = Phase::Host;\n"
+            "            let result = call.poll_profiled(&mut clock, &mut core_profile);",
+            "direct-successor-cfg-allowance",
+        ),
+    )
+    verify(guarded_successor)
     mutations: list[tuple[str, Callable[[Inputs], Inputs]]] = [
         (
             "kernel-feature-default-on",
@@ -1308,8 +1427,8 @@ def run_selftest(inputs: Inputs) -> int:
                 data,
                 slot=replace_once(
                     data.slot,
-                    "        _ => Err(ProfileError::SlotFault(*faults)),\n",
-                    "        _ => Ok(*faults),\n",
+                    "        {\n            Ok(exact)\n        }\n        _ => Err(ProfileError::SlotFault(*faults)),\n    }\n}\n\n/// The QEMU active-kill proof",
+                    "        {\n            Ok(exact)\n        }\n        _ => Ok(*faults),\n    }\n}\n\n/// The QEMU active-kill proof",
                     "drop-fault-lattice-widened",
                 ),
             ),
@@ -1347,6 +1466,20 @@ def run_selftest(inputs: Inputs) -> int:
                     "let result = call.poll_profiled(&mut clock, &mut core_profile);",
                     "let _ = Phase::Host; let result = call.poll_profiled(&mut clock, &mut core_profile);",
                     "sidecar-host-phase-added",
+                ),
+            ),
+        ),
+        (
+            "sidecar-host-phase-broad-cfg",
+            lambda data: replace(
+                data,
+                component=replace_once(
+                    data.component,
+                    "            let result = call.poll_profiled(&mut clock, &mut core_profile);",
+                    f'            #[cfg(any(feature = "{PHASE_SIDECAR_FEATURE}"))]\n'
+                    "            let _successor_only = Phase::Host;\n"
+                    "            let result = call.poll_profiled(&mut clock, &mut core_profile);",
+                    "sidecar-host-phase-broad-cfg",
                 ),
             ),
         ),

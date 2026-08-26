@@ -90,6 +90,12 @@ pub trait SshExecProfilePermitBackend: Send {
 /// finish, verification, publication, or profile-content decision.
 #[cfg(feature = "c84-profile-request-parent")]
 pub trait SshExecProfileRunBackend: Send {
+    /// Observe one runnable SSH transport/pump turn without consuming the run.
+    #[cfg(feature = "c84-profile-phase-sidecar")]
+    fn phase_host(&mut self) -> Result<(), ()>;
+    /// Observe one real SSH parent suspension without consuming the run.
+    #[cfg(feature = "c84-profile-phase-sidecar")]
+    fn phase_wait(&mut self) -> Result<(), ()>;
     /// Record the first complete response boundary. On error the backend must
     /// remain cancellable; the wrapper performs that cancellation exactly once.
     fn response_boundary(&mut self, status: u32) -> Result<(), ()>;
@@ -148,6 +154,24 @@ pub struct SshExecProfileRun {
 
 #[cfg(feature = "c84-profile-request-parent")]
 impl SshExecProfileRun {
+    /// Mark the accepted request parent runnable for one transport/pump turn.
+    #[cfg(feature = "c84-profile-phase-sidecar")]
+    pub fn phase_host(&mut self) -> Result<(), ()> {
+        self.backend
+            .as_mut()
+            .expect("SSH exec profile run was consumed twice")
+            .phase_host()
+    }
+
+    /// Mark the accepted request parent suspended at one real await boundary.
+    #[cfg(feature = "c84-profile-phase-sidecar")]
+    pub fn phase_wait(&mut self) -> Result<(), ()> {
+        self.backend
+            .as_mut()
+            .expect("SSH exec profile run was consumed twice")
+            .phase_wait()
+    }
+
     /// Consume the run at the first complete SSH response boundary.
     pub fn response_boundary(mut self, status: u32) -> Result<(), ()> {
         let mut backend = self
@@ -2439,6 +2463,8 @@ async fn serve_connection(
                 stack,
                 &mut bridge,
                 &mut protocol,
+                #[cfg(feature = "c84-profile-phase-sidecar")]
+                &mut profile_run,
                 require_carrier,
                 accepted_component,
             )
@@ -3963,6 +3989,7 @@ async fn execute_with_network(
     stack: &mut dyn TcpTransport,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
+    #[cfg(feature = "c84-profile-phase-sidecar")] profile_run: &mut Option<SshExecProfileRun>,
     require_carrier: bool,
     accepted_component: Option<SshExecComponentSessionPolicy>,
 ) -> ExecutionEnd {
@@ -4020,6 +4047,8 @@ async fn execute_with_network(
             stack,
             bridge,
             protocol,
+            #[cfg(feature = "c84-profile-phase-sidecar")]
+            profile_run,
             require_carrier,
         )
         .await;
@@ -4156,6 +4185,7 @@ async fn execute_managed_component_with_network(
     stack: &mut dyn TcpTransport,
     bridge: &mut WireBridge,
     protocol: &mut ProtocolState,
+    #[cfg(feature = "c84-profile-phase-sidecar")] profile_run: &mut Option<SshExecProfileRun>,
     require_carrier: bool,
 ) -> ExecutionEnd {
     let mut pump = ComponentStreamPump::new(io);
@@ -4169,17 +4199,27 @@ async fn execute_managed_component_with_network(
     let mut drain_deadline = None;
 
     let outcome = loop {
+        #[cfg(feature = "c84-profile-phase-sidecar")]
+        if reach_profile_host_phase(profile_run).is_err() {
+            break ExecutionEnd::Reset("SSH exec profile Host phase failed");
+        }
         let now = monotonic_ms();
         if let Some((kind, deadline)) = cancellation {
             if completed.is_some() {
                 break kind.after_managed_completion();
             }
-            match wait_for_execution_or(
+            let wait = wait_for_execution_or(
                 execution.as_mut(),
                 vibeos_core::exec::sleep_ms(deadline.saturating_sub(now)),
-            )
-            .await
-            {
+            );
+            #[cfg(feature = "c84-profile-phase-sidecar")]
+            let waited = match wait_with_profile(wait, profile_run).await {
+                Ok(waited) => waited,
+                Err(()) => break ExecutionEnd::Reset("SSH exec profile Wait phase failed"),
+            };
+            #[cfg(not(feature = "c84-profile-phase-sidecar"))]
+            let waited = wait.await;
+            match waited {
                 ExecutionWait::Complete(reports) => {
                     match complete_managed_component_cancel(kind, reports, &mut pump) {
                         ManagedComponentCancelCompletion::End(end) => break end,
@@ -4234,6 +4274,10 @@ async fn execute_managed_component_with_network(
             }
             continue;
         }
+        #[cfg(feature = "c84-profile-phase-sidecar")]
+        if reach_profile_host_phase(profile_run).is_err() {
+            break ExecutionEnd::Reset("SSH exec profile Host phase failed");
+        }
         let wire = match bridge.drive(runner, stack, now) {
             Ok(turn) => turn,
             Err(reason) => {
@@ -4260,6 +4304,10 @@ async fn execute_managed_component_with_network(
                 break end;
             }
             continue;
+        }
+        #[cfg(feature = "c84-profile-phase-sidecar")]
+        if reach_profile_host_phase(profile_run).is_err() {
+            break ExecutionEnd::Reset("SSH exec profile Host phase failed");
         }
         let signal = match progress_protocol(runner, signer, space, policy, protocol) {
             Ok(signal) => signal,
@@ -4326,6 +4374,10 @@ async fn execute_managed_component_with_network(
         let stage_exact_stdin = stdin_chunk_limit < MAX_STREAM_CHUNK_BYTES || !drain_permitted;
         #[cfg(not(feature = "native-revoke-target-acceptance"))]
         let stage_exact_stdin = false;
+        #[cfg(feature = "c84-profile-phase-sidecar")]
+        if reach_profile_host_phase(profile_run).is_err() {
+            break ExecutionEnd::Reset("SSH exec profile Host phase failed");
+        }
         let input_work = match pump_component_stdin_turn(
             &mut pump,
             runner,
@@ -4348,6 +4400,10 @@ async fn execute_managed_component_with_network(
             }
         };
         let output_work = if drain_permitted {
+            #[cfg(feature = "c84-profile-phase-sidecar")]
+            if reach_profile_host_phase(profile_run).is_err() {
+                break ExecutionEnd::Reset("SSH exec profile Host phase failed");
+            }
             match pump_component_stdout_turn(&mut pump, runner, protocol) {
                 Ok(worked) => worked,
                 Err(reason) => {
@@ -4393,36 +4449,24 @@ async fn execute_managed_component_with_network(
                 ProtocolSignal::Progressed | ProtocolSignal::Interrupt
             );
         #[cfg(feature = "native-revoke-target-acceptance")]
-        if completed.is_none() {
-            if let Some(reports) = wait_for_execution_turn(
-                execution.as_mut(),
-                worked && drain_permitted,
-                wire.next_poll_delay_ms,
-                Some(execution_deadline),
-            )
-            .await
-            {
-                let terminal = match validated_managed_component_terminal(&reports) {
-                    Ok(terminal) => terminal,
-                    Err(reason) => break ExecutionEnd::Reset(reason),
-                };
-                expected_terminal = Some(terminal.stream_close_reason());
-                drain_deadline = Some(monotonic_ms().saturating_add(CLOSE_TIMEOUT_MS));
-                completed = Some(reports);
-            }
-        } else {
-            cooperate(worked && drain_permitted, wire.next_poll_delay_ms).await;
-        }
+        let wait_worked = worked && drain_permitted;
         #[cfg(not(feature = "native-revoke-target-acceptance"))]
+        let wait_worked = worked;
         if completed.is_none() {
-            if let Some(reports) = wait_for_execution_turn(
+            let wait = wait_for_execution_turn(
                 execution.as_mut(),
-                worked,
+                wait_worked,
                 wire.next_poll_delay_ms,
                 Some(execution_deadline),
-            )
-            .await
-            {
+            );
+            #[cfg(feature = "c84-profile-phase-sidecar")]
+            let reports = match wait_with_profile(wait, profile_run).await {
+                Ok(reports) => reports,
+                Err(()) => break ExecutionEnd::Reset("SSH exec profile Wait phase failed"),
+            };
+            #[cfg(not(feature = "c84-profile-phase-sidecar"))]
+            let reports = wait.await;
+            if let Some(reports) = reports {
                 let terminal = match validated_managed_component_terminal(&reports) {
                     Ok(terminal) => terminal,
                     Err(reason) => break ExecutionEnd::Reset(reason),
@@ -4432,11 +4476,23 @@ async fn execute_managed_component_with_network(
                 completed = Some(reports);
             }
         } else {
-            cooperate(worked, wire.next_poll_delay_ms).await;
+            let wait = cooperate(wait_worked, wire.next_poll_delay_ms);
+            #[cfg(feature = "c84-profile-phase-sidecar")]
+            if wait_with_profile(wait, profile_run).await.is_err() {
+                break ExecutionEnd::Reset("SSH exec profile Wait phase failed");
+            }
+            #[cfg(not(feature = "c84-profile-phase-sidecar"))]
+            wait.await;
         }
     };
     drop(execution);
-    session.shutdown().await;
+    let shutdown = session.shutdown();
+    #[cfg(feature = "c84-profile-phase-sidecar")]
+    if wait_with_profile(shutdown, profile_run).await.is_err() {
+        return ExecutionEnd::Reset("SSH exec profile Wait phase failed");
+    }
+    #[cfg(not(feature = "c84-profile-phase-sidecar"))]
+    shutdown.await;
     outcome
 }
 
@@ -4605,6 +4661,46 @@ fn reach_profile_response_boundary(
         .map_err(|_| ConnectionEnd::Reset("SSH exec profile response boundary failed"))
 }
 
+#[cfg(feature = "c84-profile-phase-sidecar")]
+fn reach_profile_host_phase(profile_run: &mut Option<SshExecProfileRun>) -> Result<(), ()> {
+    let Some(run) = profile_run.as_mut() else {
+        return Ok(());
+    };
+    run.phase_host()
+}
+
+#[cfg(feature = "c84-profile-phase-sidecar")]
+fn reach_profile_wait_phase(profile_run: &mut Option<SshExecProfileRun>) -> Result<(), ()> {
+    let Some(run) = profile_run.as_mut() else {
+        return Ok(());
+    };
+    run.phase_wait()
+}
+
+/// Attribute synchronous work performed by a future's poll to Host and open
+/// Wait only after that poll has actually suspended. No phase guard or task
+/// authority is retained by the wrapper across the suspension.
+#[cfg(feature = "c84-profile-phase-sidecar")]
+async fn wait_with_profile<F: Future>(
+    future: F,
+    profile_run: &mut Option<SshExecProfileRun>,
+) -> Result<F::Output, ()> {
+    let mut future = core::pin::pin!(future);
+    poll_fn(|cx| {
+        if reach_profile_host_phase(profile_run).is_err() {
+            return Poll::Ready(Err(()));
+        }
+        match future.as_mut().poll(cx) {
+            Poll::Ready(output) => Poll::Ready(Ok(output)),
+            Poll::Pending => match reach_profile_wait_phase(profile_run) {
+                Ok(()) => Poll::Pending,
+                Err(()) => Poll::Ready(Err(())),
+            },
+        }
+    })
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn finish_exec(
     runner: &mut Runner<'_, Server>,
@@ -4628,6 +4724,9 @@ async fn finish_exec(
     let mut close_sent = false;
 
     loop {
+        #[cfg(feature = "c84-profile-phase-sidecar")]
+        reach_profile_host_phase(profile_run)
+            .map_err(|_| ConnectionEnd::Reset("SSH exec profile Host phase failed"))?;
         let now = monotonic_ms();
         if now.saturating_sub(started) > CLOSE_TIMEOUT_MS {
             return Err(ConnectionEnd::Reset("SSH completion drain timed out"));
@@ -4752,11 +4851,16 @@ async fn finish_exec(
             .await;
         }
 
-        cooperate(
+        let wait = cooperate(
             wire.worked || application_work || matches!(signal, ProtocolSignal::Progressed),
             wire.next_poll_delay_ms,
-        )
-        .await;
+        );
+        #[cfg(feature = "c84-profile-phase-sidecar")]
+        wait_with_profile(wait, profile_run)
+            .await
+            .map_err(|_| ConnectionEnd::Reset("SSH exec profile Wait phase failed"))?;
+        #[cfg(not(feature = "c84-profile-phase-sidecar"))]
+        wait.await;
     }
 }
 
@@ -5130,6 +5234,10 @@ mod tests {
         Prepare,
         Succeed,
         Start,
+        #[cfg(feature = "c84-profile-phase-sidecar")]
+        Host,
+        #[cfg(feature = "c84-profile-phase-sidecar")]
+        Wait,
         Boundary(u32),
         Cancel,
     }
@@ -5195,6 +5303,18 @@ mod tests {
 
     #[cfg(feature = "c84-profile-request-parent")]
     impl SshExecProfileRunBackend for TestProfileBackend {
+        #[cfg(feature = "c84-profile-phase-sidecar")]
+        fn phase_host(&mut self) -> Result<(), ()> {
+            self.trace.push(ProfileEvent::Host);
+            Ok(())
+        }
+
+        #[cfg(feature = "c84-profile-phase-sidecar")]
+        fn phase_wait(&mut self) -> Result<(), ()> {
+            self.trace.push(ProfileEvent::Wait);
+            Ok(())
+        }
+
         fn response_boundary(&mut self, status: u32) -> Result<(), ()> {
             let backend = self as *mut Self as usize;
             self.trace
@@ -5372,6 +5492,40 @@ mod tests {
             trace.start_backend.load(AtomicOrdering::SeqCst),
             trace.boundary_backend.load(AtomicOrdering::SeqCst),
             "permit and run did not retain the same backend allocation"
+        );
+    }
+
+    #[cfg(feature = "c84-profile-phase-sidecar")]
+    #[test]
+    fn profile_phase_sidecar_restores_host_after_the_final_wait_before_response() {
+        let (platform, profile, _target, trace) = profile_fixture();
+        let selected = accepted_ssh_component_policy(&platform, profile, true, "case-filter");
+        let mut accepted = PreparedExec::prepare(&platform, "case-filter".to_string(), selected)
+            .unwrap()
+            .accept(|| Ok(()))
+            .unwrap();
+
+        let run = accepted.profile.as_mut().unwrap();
+        assert!(run.phase_host().is_ok());
+        assert!(run.phase_wait().is_ok());
+        assert!(run.phase_host().is_ok());
+        assert!(run.phase_wait().is_ok());
+        assert!(run.phase_host().is_ok());
+        assert!(reach_profile_response_boundary(&mut accepted.profile, 41).is_ok());
+        drop(accepted);
+
+        assert_eq!(
+            trace.snapshot(),
+            vec![
+                ProfileEvent::Prepare,
+                ProfileEvent::Start,
+                ProfileEvent::Host,
+                ProfileEvent::Wait,
+                ProfileEvent::Host,
+                ProfileEvent::Wait,
+                ProfileEvent::Host,
+                ProfileEvent::Boundary(41),
+            ]
         );
     }
 

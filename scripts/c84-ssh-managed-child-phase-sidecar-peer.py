@@ -354,8 +354,12 @@ def parse_drop_transaction(lines: list[str], epoch: int) -> DropObservation:
     require(int(response.group("ready_epoch")) == epoch + 1, f"Drop epoch {epoch} reuse differs")
     counters = counters_from_match(response)
     require(
-        counters.child_core_starts == counters.child_core_finishes > 0,
-        f"Drop epoch {epoch} has an unpaired or empty child Core boundary",
+        counters.child_core_starts == counters.child_core_finishes,
+        f"Drop epoch {epoch} has an unpaired child Core boundary",
+    )
+    require(
+        1 <= counters.child_core_starts <= CORE.U64_MAX,
+        f"Drop epoch {epoch} child Core count is not a positive u64",
     )
     require(
         counters.child_host_starts == counters.child_host_finishes,
@@ -663,12 +667,12 @@ def response_line(
     )
 
 
-def drop_line(epoch: int) -> str:
+def drop_line(epoch: int, child_core_pairs: int) -> str:
     return (
         f"{FAMILY} DROP epoch={epoch} release=0 detach=exited clean=0 "
         f"child_faults=abandoned+detached "
-        f"child_core_starts={CORE.EXPECTED_DROP_OBSERVER_PAIRS} "
-        f"child_core_finishes={CORE.EXPECTED_DROP_OBSERVER_PAIRS} "
+        f"child_core_starts={child_core_pairs} "
+        f"child_core_finishes={child_core_pairs} "
         f"child_host_starts=1 child_host_finishes=1 child_wait_starts=2 child_wait_finishes=1 "
         f"cleanup_count=0 parent_host_starts=6 parent_host_finishes=6 "
         f"parent_wait_starts=3 parent_wait_finishes=3 child_wait_open_at_cancel=1 "
@@ -696,13 +700,14 @@ def normal_lines(epoch: int, terminal_mode: str = LEGACY_CANCEL) -> list[str]:
 
 
 def run_parser_selftest() -> int:
+    drop_observer_pairs = 14
     normal = normal_lines(1)
     dropped = [
         f"{FAMILY} CHILD_PHASE epoch=3 phase=validation",
         f"{FAMILY} CHILD_PHASE epoch=3 phase=instantiation",
         f"{FAMILY} CHILD_PHASE epoch=3 phase=abi",
         f"{FAMILY} CHILD_WAIT epoch=3 state=open first=1",
-        drop_line(3),
+        drop_line(3, drop_observer_pairs),
     ]
     parse_normal_transaction(normal, 1)
     parse_normal_transaction(normal_lines(2), 2)
@@ -727,6 +732,40 @@ def run_parser_selftest() -> int:
         (dropped[:-1] + [dropped[-1].replace("child_wait_finishes=1", "child_wait_finishes=2")], True),
         (dropped[:-1] + [dropped[-1].replace("release=0", "release=1")], True),
         (dropped[:-1] + [dropped[-1].replace("ready_epoch=4", "ready_epoch=04")], True),
+        (
+            dropped[:-1]
+            + [
+                dropped[-1]
+                .replace(
+                    f"child_core_starts={drop_observer_pairs}",
+                    "child_core_starts=0",
+                    1,
+                )
+                .replace(
+                    f"child_core_finishes={drop_observer_pairs}",
+                    "child_core_finishes=0",
+                    1,
+                )
+            ],
+            True,
+        ),
+        (
+            dropped[:-1]
+            + [
+                dropped[-1]
+                .replace(
+                    f"child_core_starts={drop_observer_pairs}",
+                    f"child_core_starts={CORE.U64_MAX + 1}",
+                    1,
+                )
+                .replace(
+                    f"child_core_finishes={drop_observer_pairs}",
+                    f"child_core_finishes={CORE.U64_MAX + 1}",
+                    1,
+                )
+            ],
+            True,
+        ),
     ]
     for index, (lines, is_drop) in enumerate(mutations, start=1):
         try:
@@ -777,9 +816,7 @@ def run_parser_selftest() -> int:
         f"{CORE_FAMILY} BIND epoch=3 child_index=0 before_publish=1",
         f"{CORE_FAMILY} CLAIM epoch=3 child_index=0 first_poll=1",
         f"{CORE_FAMILY} CORE epoch=3 ordinary=1 first_pair=1",
-        f"{CORE_FAMILY} DROP epoch=3 claim=1 release=0 detach=exited clean=0 "
-        f"child_faults=abandoned+detached observer_pairs={CORE.EXPECTED_DROP_OBSERVER_PAIRS} "
-        "observer_closed=1 cancel=1 ack=1 ready_epoch=4",
+        CORE.drop_response_line(3, drop_observer_pairs),
     ]
     frozen: list[str] = []
     for epoch in (1, 2):
@@ -808,6 +845,16 @@ def run_parser_selftest() -> int:
         log = Path(directory) / "frozen.log"
         log.write_text("\n".join(frozen) + "\n", encoding="utf-8")
         verify_closed_sequence(log)
+
+        varied_drop_pairs = drop_observer_pairs + 1
+        varied_drop = list(frozen)
+        phase_drop_index = varied_drop.index(drop_line(3, drop_observer_pairs))
+        core_drop_index = varied_drop.index(CORE.drop_response_line(3, drop_observer_pairs))
+        varied_drop[phase_drop_index] = drop_line(3, varied_drop_pairs)
+        varied_drop[core_drop_index] = CORE.drop_response_line(3, varied_drop_pairs)
+        log.write_text("\n".join(varied_drop) + "\n", encoding="utf-8")
+        verify_closed_sequence(log)
+
         frozen_mutations: list[tuple[str, list[str]]] = []
 
         cross_family = list(frozen)
@@ -824,6 +871,11 @@ def run_parser_selftest() -> int:
             1,
         )
         frozen_mutations.append(("phase/Core paired-count mismatch", cross_family))
+
+        drop_cross_family = list(frozen)
+        drop_response_index = drop_cross_family.index(drop_line(3, drop_observer_pairs))
+        drop_cross_family[drop_response_index] = drop_line(3, drop_observer_pairs + 1)
+        frozen_mutations.append(("Drop phase/Core paired-count mismatch", drop_cross_family))
 
         host_pending = f"{FAMILY} CHILD_HOST_PENDING epoch=2 state=open delayed_stdin=1"
         frozen_mutations.append(

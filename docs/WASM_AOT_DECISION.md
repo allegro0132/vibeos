@@ -321,13 +321,15 @@ python3 -B scripts/verify-c84-ssh-managed-child-core.py --selftest --check-sourc
 ./scripts/qemu-c84-ssh-managed-child-core-test.sh
 ```
 
-The standalone gate preserves its original exact 19-marker managed-child/Core
-transcript. Successful epochs 1, 2, and 4 each freeze exactly 1,167 real Core
-polls, 1,167 observer pairs, and 1,241 typed polls. Those are control-flow
-counts from the isolated QEMU image, not target timing or formal profile
-evidence; they do not replace the distinct frozen preparation preflight.
+The standalone gate preserves its original 19-marker managed-child/Core
+sequence and field contract. Successful epochs 1, 2, and 4 each freeze exactly
+1,167 real Core polls, 1,167 observer pairs, and 1,241 typed polls. Those are
+control-flow counts from the isolated QEMU image, not target timing or formal
+profile evidence; they do not replace the distinct frozen preparation preflight.
 Epoch 3 is killed after its first ordinary Core pair. Its real executor
-callback reports `Exited` after 29 closed observer pairs, while the missing
+callback reports `Exited` after a canonical positive-u64 count of closed
+observer pairs (the run that exposed the latent scheduling variation reported
+14). That partial-run count is deliberately not frozen. The missing
 successful-driver bit keeps release false and produces exact
 `CHILD_ABANDONED + CHILD_DETACHED` faults.
 The parent still cancels and acknowledges the epoch, an immediate readiness
@@ -391,8 +393,9 @@ polls, 1,171 observer pairs, and 1,251 typed polls: Core increases by 4 and
 typed polls by 10. The standalone gate and its transcript remain unchanged.
 Epoch 3 is killed at a child Wait that follows the first ordinary Core pair;
 the open Wait is accepted only on the diagnostic Drop path, with no release and
-the exact abandoned/detached faults. Normal epochs require ordered Validation
--> Instantiation -> ABI -> Cleanup, paired child Host/Core/Wait edges, paired
+the exact abandoned/detached faults. Its canonical positive-u64 child Core
+start/finish count must equal the dynamically parsed Core-family closed-observer
+count. Normal epochs require ordered Validation -> Instantiation -> ABI -> Cleanup, paired child Host/Core/Wait edges, paired
 nonzero parent Host/Wait observations, clean detach, response, and post-Drop
 epoch reuse. Parent transport counts are scheduler/network dependent and are
 checked relationally, not frozen as target timing evidence.
@@ -496,8 +499,10 @@ and the next Ready epoch. The Drop line freezes `cancel=lease_cancelled`,
 `finish=0 verify=0 stream=0`, zero emitted intervals, stored comparison, one
 acknowledgement, and `ready_epoch=4`.
 
-The four predecessor families retain their nonterminal and epoch-3 DROP bytes,
-counts, and order. Their successful RESPONSE suffix truthfully changes from
+The four predecessor families retain their nonterminal bytes and epoch-3 DROP
+field/order contracts. Successful counts remain frozen; the scheduler-dependent
+phase/Core Drop observer count is parsed dynamically as a canonical positive
+u64 and must match across both families. Their successful RESPONSE suffix truthfully changes from
 `cancel=1` to
 `finish=1 verify=1 discard=stream_abandoned ack=1`; terminal order is phase,
 Core, request, IRQ, then finish/verify, and each last terminal precedes the next

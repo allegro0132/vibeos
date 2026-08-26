@@ -225,7 +225,11 @@ def core_normal_lines(epoch: int, terminal_mode: str = LEGACY_CANCEL) -> list[st
     ]
 
 
-def synthetic_closed_lines(terminal_mode: str = LEGACY_CANCEL) -> list[str]:
+def synthetic_closed_lines(
+    terminal_mode: str = LEGACY_CANCEL,
+    *,
+    drop_observer_pairs: int,
+) -> list[str]:
     output: list[str] = []
     request = REQUEST.expected_qemu_markers(terminal_mode)
     irq = expected_irq_markers(terminal_mode)
@@ -263,15 +267,13 @@ def synthetic_closed_lines(terminal_mode: str = LEGACY_CANCEL) -> list[str]:
         f"{PHASE_FAMILY} CHILD_PHASE epoch=3 phase=instantiation",
         f"{PHASE_FAMILY} CHILD_PHASE epoch=3 phase=abi",
         f"{PHASE_FAMILY} CHILD_WAIT epoch=3 state=open first=1",
-        PHASE.drop_line(3),
+        PHASE.drop_line(3, drop_observer_pairs),
     ]
     core_drop = [
         f"{CORE_FAMILY} BIND epoch=3 child_index=0 before_publish=1",
         f"{CORE_FAMILY} CLAIM epoch=3 child_index=0 first_poll=1",
         f"{CORE_FAMILY} CORE epoch=3 ordinary=1 first_pair=1",
-        f"{CORE_FAMILY} DROP epoch=3 claim=1 release=0 detach=exited clean=0 "
-        f"child_faults=abandoned+detached observer_pairs={PHASE.CORE.EXPECTED_DROP_OBSERVER_PAIRS} "
-        "observer_closed=1 cancel=1 ack=1 ready_epoch=4",
+        PHASE.CORE.drop_response_line(3, drop_observer_pairs),
     ]
     output.extend(core_drop[:2])
     output.extend(drop_phase[:3])
@@ -303,7 +305,8 @@ def synthetic_closed_lines(terminal_mode: str = LEGACY_CANCEL) -> list[str]:
 
 
 def run_parser_selftest() -> int:
-    valid = synthetic_closed_lines()
+    drop_observer_pairs = 14
+    valid = synthetic_closed_lines(drop_observer_pairs=drop_observer_pairs)
     with tempfile.TemporaryDirectory(prefix="vibeos-c84-irq-peer-") as directory:
         log = Path(directory) / "frozen.log"
 
@@ -332,6 +335,14 @@ def run_parser_selftest() -> int:
             return True
 
         require(accepted(valid), "synthetic closed transcript was rejected")
+        require(
+            accepted(
+                synthetic_closed_lines(
+                    drop_observer_pairs=drop_observer_pairs + 1
+                )
+            ),
+            "matching dynamic Drop counts were rejected",
+        )
         mutations: list[tuple[str, list[str]]] = []
 
         def replace_line(label: str, old: str, new: str) -> None:
@@ -350,6 +361,11 @@ def run_parser_selftest() -> int:
         replace_line("epoch-2 active parent leak", response_line(2), response_line(2).replace("parent_pair=0", "parent_pair=1"))
         replace_line("epoch-2 inactive total", response_line(2), response_line(2).replace("inactive=2", "inactive=1"))
         replace_line("Drop terminal kind", drop_line(3), drop_line(3).replace(" DROP ", " RESPONSE epoch=3 status=0 ").replace("epoch=3 epoch=3 ", "epoch=3 "))
+        replace_line(
+            "Drop phase/Core paired-count mismatch",
+            PHASE.drop_line(3, drop_observer_pairs),
+            PHASE.drop_line(3, drop_observer_pairs + 1),
+        )
         replace_line("epoch-4 ready reuse", response_line(4), response_line(4).replace("ready_epoch=5", "ready_epoch=4"))
 
         wrong_parent_child = list(valid)
@@ -399,7 +415,10 @@ def run_parser_selftest() -> int:
         for label, mutated in mutations:
             require(not accepted(mutated), f"parser selftest mutation was accepted: {label}")
 
-        successor = synthetic_closed_lines(FINISH_VERIFY)
+        successor = synthetic_closed_lines(
+            FINISH_VERIFY,
+            drop_observer_pairs=drop_observer_pairs,
+        )
         require(
             accepted(successor, FINISH_VERIFY),
             "synthetic finish/verify IRQ transcript was rejected",

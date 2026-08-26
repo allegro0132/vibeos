@@ -19,6 +19,8 @@ ROOT = Path(__file__).resolve().parent.parent
 OPENSSH_PEER = ROOT / "scripts/openssh-peer.py"
 FAMILY = "WASM_C84_SSH_MANAGED_CHILD_CORE"
 REQUEST_PARENT_FAMILY = "WASM_C84_SSH_REQUEST_PARENT"
+NUMBER = r"(?:0|[1-9][0-9]*)"
+U64_MAX = (1 << 64) - 1
 FORMAL_PUBLISHER_MARKERS = (
     "WASM_C48_ACCEPTANCE PASS",
     "WASM_C53_NATIVE_SSH_ACCEPTANCE PASS",
@@ -32,7 +34,6 @@ FORMAL_PUBLISHER_MARKERS = (
 EXPECTED_CORE_POLLS = 1167
 EXPECTED_TYPED_POLLS = 1241
 EXPECTED_DROP_DETACH = "exited"
-EXPECTED_DROP_OBSERVER_PAIRS = 29
 LEGACY_CANCEL = "legacy-cancel"
 FINISH_VERIFY = "finish-verify"
 
@@ -98,6 +99,23 @@ def normal_response_line(
         f"observer_closed=1 {response_terminal_suffix(terminal_mode)} "
         f"ready_epoch={epoch + 1}"
     )
+
+
+def drop_response_line(epoch: int, observer_pairs: int) -> str:
+    return (
+        f"{FAMILY} DROP epoch={epoch} claim=1 release=0 "
+        f"detach={EXPECTED_DROP_DETACH} clean=0 child_faults=abandoned+detached "
+        f"observer_pairs={observer_pairs} observer_closed=1 "
+        f"cancel=1 ack=1 ready_epoch={epoch + 1}"
+    )
+
+
+DROP_RESPONSE = re.compile(
+    rf"^{FAMILY} DROP epoch=(?P<epoch>{NUMBER}) claim=1 release=0 "
+    rf"detach={EXPECTED_DROP_DETACH} clean=0 child_faults=abandoned\+detached "
+    rf"observer_pairs=(?P<observer_pairs>{NUMBER}) observer_closed=1 "
+    rf"cancel=1 ack=1 ready_epoch=(?P<ready_epoch>{NUMBER})$"
+)
 
 
 def normalized_log(path: Path) -> str:
@@ -270,17 +288,20 @@ def parse_drop_transaction(lines: list[str], epoch: int) -> DropObservation:
     ]
     require(len(lines) == 4, f"Drop epoch {epoch} marker count differs: {lines!r}")
     require(lines[:3] == fixed, f"Drop epoch {epoch} transition sequence differs: {lines!r}")
-    expected_drop = (
-        f"{FAMILY} DROP epoch={epoch} claim=1 release=0 "
-        f"detach={EXPECTED_DROP_DETACH} clean=0 child_faults=abandoned+detached "
-        f"observer_pairs={EXPECTED_DROP_OBSERVER_PAIRS} observer_closed=1 "
-        f"cancel=1 ack=1 ready_epoch={epoch + 1}"
-    )
+    response = DROP_RESPONSE.fullmatch(lines[3])
+    require(response is not None, f"Drop epoch {epoch} marker differs: {lines[3]!r}")
+    assert response is not None
+    require(int(response.group("epoch")) == epoch, f"Drop epoch {epoch} marker epoch differs")
     require(
-        lines[3] == expected_drop,
-        f"Drop epoch {epoch} marker differs: {lines[3]!r}",
+        int(response.group("ready_epoch")) == epoch + 1,
+        f"Drop epoch {epoch} reuse differs",
     )
-    return DropObservation(epoch, EXPECTED_DROP_DETACH, EXPECTED_DROP_OBSERVER_PAIRS)
+    observer_pairs = int(response.group("observer_pairs"))
+    require(
+        1 <= observer_pairs <= U64_MAX,
+        f"Drop epoch {epoch} observer-pair count is not a positive u64",
+    )
+    return DropObservation(epoch, EXPECTED_DROP_DETACH, observer_pairs)
 
 
 def normal_profiled_request(
@@ -427,6 +448,7 @@ def verify_closed_sequence(
 
 
 def run_parser_selftest() -> int:
+    drop_observer_pairs = 14
     normal = [
         f"{FAMILY} BIND epoch=1 child_index=0 before_publish=1",
         f"{FAMILY} CLAIM epoch=1 child_index=0 first_poll=1",
@@ -440,18 +462,47 @@ def run_parser_selftest() -> int:
         f"{FAMILY} BIND epoch=3 child_index=0 before_publish=1",
         f"{FAMILY} CLAIM epoch=3 child_index=0 first_poll=1",
         f"{FAMILY} CORE epoch=3 ordinary=1 first_pair=1",
-        f"{FAMILY} DROP epoch=3 claim=1 release=0 detach=exited clean=0 "
-        f"child_faults=abandoned+detached observer_pairs={EXPECTED_DROP_OBSERVER_PAIRS} "
-        f"observer_closed=1 cancel=1 ack=1 ready_epoch=4",
+        drop_response_line(3, drop_observer_pairs),
     ]
     parse_normal_transaction(normal, 1)
     parse_drop_transaction(dropped, 3)
+    varied_drop = [*dropped[:-1], drop_response_line(3, drop_observer_pairs + 1)]
+    require(
+        parse_drop_transaction(varied_drop, 3).observer_pairs == drop_observer_pairs + 1,
+        "Drop parser froze a scheduler-dependent partial-run count",
+    )
     mutations = [
         (normal[:-1] + [normal[-1].replace("epoch=1", "epoch=01", 1)], False),
         (normal[:-1] + [normal[-1].replace("core_polls=1167", "core_polls=1166", 1)], False),
         (normal[:-1] + [normal[-1].replace("typed_polls=1241", "typed_polls=01241", 1)], False),
         (dropped[:-1] + [dropped[-1].replace("detach=exited", "detach=faulted", 1)], True),
-        (dropped[:-1] + [dropped[-1].replace("observer_pairs=29", "observer_pairs=029", 1)], True),
+        (
+            dropped[:-1]
+            + [
+                dropped[-1].replace(
+                    f"observer_pairs={drop_observer_pairs}",
+                    f"observer_pairs=0{drop_observer_pairs}",
+                    1,
+                )
+            ],
+            True,
+        ),
+        (
+            dropped[:-1]
+            + [dropped[-1].replace(f"observer_pairs={drop_observer_pairs}", "observer_pairs=0", 1)],
+            True,
+        ),
+        (
+            dropped[:-1]
+            + [
+                dropped[-1].replace(
+                    f"observer_pairs={drop_observer_pairs}",
+                    f"observer_pairs={U64_MAX + 1}",
+                    1,
+                )
+            ],
+            True,
+        ),
     ]
     for index, (lines, is_drop) in enumerate(mutations, start=1):
         try:

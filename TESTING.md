@@ -332,19 +332,22 @@ python3 -B scripts/verify-c84-ssh-managed-child-core.py --selftest --check-sourc
 ./scripts/qemu-c84-ssh-managed-child-core-test.sh
 ```
 
-The standalone gate preserves its original exact 19-marker managed-child/Core
-transcript. For identical successful requests at epochs 1, 2, and 4, it
+The standalone gate preserves its original 19-marker managed-child/Core
+sequence and field contract. For identical successful requests at epochs 1, 2,
+and 4, it
 freezes 1,167 real Core polls, 1,167 observer pairs, and 1,241 typed polls.
 These are QEMU control-flow counts, distinct from the preparation preflight
 above and not timing evidence. Epoch 3 is killed only after the first ordinary
 Core pair;
-the actual executor detach is `Exited` after 29 closed pairs, with no release
-and exact `abandoned + detached` faults. The parent then performs the same
-cancel/ack closure, an immediate readiness probe succeeds, and epoch 4 proves
-post-Drop reuse. QEMU acceptance adds only guarded transition telemetry. This
-node deliberately does not add Host/Wait/Cleanup sidecars, combine the IRQ
-overlay, call `finish`, expose a verified stream or publisher, or produce
-schema, collector, physical Milk-V Duo, or AOT-decision evidence.
+the actual executor detach is `Exited` after a canonical positive-u64 count of
+closed pairs (14 in the run that exposed the latent scheduling variation),
+with no release and exact `abandoned + detached` faults. That partial-run count
+is not frozen. The parent then performs the same cancel/ack closure, an
+immediate readiness probe succeeds, and epoch 4 proves post-Drop reuse. QEMU
+acceptance adds only guarded transition telemetry. This node deliberately does
+not add Host/Wait/Cleanup sidecars, combine the IRQ overlay, call `finish`,
+expose a verified stream or publisher, or produce schema, collector, physical
+Milk-V Duo, or AOT-decision evidence.
 
 The default-off `wasm-c84-ssh-managed-child-phase-sidecar` feature extends that
 same exact target with diagnostic Host, Wait, and Cleanup ownership. The parent
@@ -382,9 +385,11 @@ The gate kills epoch 3 while the post-Core child Wait is open, immediately
 probes readiness, and reuses epoch 4. Successful epochs require ordered child
 phases, exactly one Cleanup, paired child Host/Core/Wait observations,
 relationally paired nonzero parent Host/Wait observations, clean detach, and
-response closure. Dynamic parent counts are not timing evidence. This node adds
-no IRQ composition, `finish`, verified stream, publisher, collector, physical
-Milk-V Duo sample, or AOT decision.
+response closure. On Drop, the canonical positive-u64 child Core start/finish
+count must exactly match the dynamically parsed Core-family closed-observer
+count. Dynamic partial-run and parent counts are not timing evidence. This node
+adds no IRQ composition, `finish`, verified stream, publisher, collector,
+physical Milk-V Duo sample, or AOT decision.
 
 The next default-off
 `wasm-c84-ssh-managed-child-irq-overlay` feature composes that same silent
@@ -460,8 +465,10 @@ epoch-2 257-byte delayed-stdin `HostPending` edge, epoch-3 active kill,
 immediate readiness probe, and epoch-4 replacement. In the successor image the
 normal RESPONSE suffix of the phase, Core, request, and IRQ families becomes
 `finish=1 verify=1 discard=stream_abandoned ack=1`; their nonterminal markers,
-epoch-3 DROP lines, counts (27/28 phase, 19 Core, eight request, six IRQ), and
-cross-family order remain frozen. The new family contributes exactly four
+epoch-3 DROP field/order contracts, family marker counts (27/28 phase, 19 Core,
+eight request, six IRQ), and cross-family order remain frozen. The
+scheduler-dependent phase/Core Drop observer count is parsed dynamically and
+must match across those two families. The new family contributes exactly four
 last-in-chain terminals: RESPONSE for epochs 1, 2, and 4 and DROP for epoch 3.
 The separately built predecessor IRQ gate remains byte-for-byte cancel-only
 and runs first in CI.

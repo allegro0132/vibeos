@@ -165,8 +165,11 @@ def wait_for_finish_prefix(path: Path, expected_count: int, timeout: float) -> N
     raise DriverError(f"timed out waiting for finish/verify marker {expected_count}")
 
 
-def synthetic_closed_lines() -> list[str]:
-    predecessor = IRQ.synthetic_closed_lines(TERMINAL_MODE)
+def synthetic_closed_lines(*, drop_observer_pairs: int) -> list[str]:
+    predecessor = IRQ.synthetic_closed_lines(
+        TERMINAL_MODE,
+        drop_observer_pairs=drop_observer_pairs,
+    )
     irq_terminals = {
         IRQ.response_line(1, TERMINAL_MODE): response_line(1),
         IRQ.response_line(2, TERMINAL_MODE): response_line(2),
@@ -182,7 +185,8 @@ def synthetic_closed_lines() -> list[str]:
 
 
 def run_parser_selftest() -> int:
-    valid = synthetic_closed_lines()
+    drop_observer_pairs = 14
+    valid = synthetic_closed_lines(drop_observer_pairs=drop_observer_pairs)
     with tempfile.TemporaryDirectory(prefix="vibeos-c84-finish-peer-") as directory:
         log = Path(directory) / "frozen.log"
 
@@ -215,6 +219,14 @@ def run_parser_selftest() -> int:
             return True
 
         require(accepted(valid), "synthetic finish/verify transcript was rejected")
+        require(
+            accepted(
+                synthetic_closed_lines(
+                    drop_observer_pairs=drop_observer_pairs + 1
+                )
+            ),
+            "matching dynamic predecessor Drop counts were rejected",
+        )
         mutations: list[tuple[str, list[str]]] = []
 
         def replace_line(label: str, old: str, new: str) -> None:

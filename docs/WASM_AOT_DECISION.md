@@ -597,6 +597,62 @@ collector, retained sample, physical Milk-V Duo evidence, or AOT decision. A
 later formal publisher must still accept the storage-bearing `TargetVerified`
 authority, not copied `Summary`/`Interval` values or this success marker.
 
+## Portable single-SAMPLE publisher foundation
+
+The allocation-free `vibeos-wasm-aot-profile` crate now contains the narrow
+formal publisher that the verified-stream node deliberately lacked.
+`ProfilePublisher::publish_profile` consumes a storage-bearing
+`TargetVerified` authority by value. Before its first sink call it independently
+checks positive total ticks, the exact 65,536 interval capacity, completeness,
+the dynamic `1 <= N <= min(65536, T)` bound, checked phase totals, exact
+zero-based interval sequence, contiguous nonempty coverage, distinct adjacent
+phases, a full checked phase rescan, the final endpoint, and the absence of an
+interval after `N`. It computes the complete candidate rotate-and-add
+accumulator during that same zero-write preflight.
+
+The publisher then streams exactly one LF-terminated
+`VIBE_WASM_AOT_SAMPLE` record using recursively ASCII-sorted object keys,
+compact JSON separators, lowercase hexadecimal identities and digest, and
+strict decimal u64 encoding. It uses fixed scratch storage and has no allocator
+or serialization dependency. `RunId` and `Challenge` are separate branded
+non-zero types. A public `TerminalObservation` must validate into private,
+non-copyable eligible fields before publication; both the serializer and
+accumulator consume the retained validated values. This validation establishes
+schema eligibility only. It does not authenticate the caller or prove live
+terminal provenance.
+
+Preflight rejection makes zero sink calls and returns the same publisher,
+original accumulator, and recycled target lineage. After the first sink call,
+any write or commit error is treated as possibly partial: the target lineage is
+still recycled, the original accumulator remains diagnostic-only, and the sink
+is permanently held in `ManuallyDrop` with no recovery or republish surface.
+The sink is quarantined before the first call, so unwinding cannot run a
+destructor that flushes a partial record. The publisher itself writes the sole
+line feed; `commit_record` is a commit/flush boundary and may not append bytes.
+
+The known-answer record uses run-id bytes `00..1f`, challenge bytes `20..3f`,
+sample index 3, phase durations 1 through 7, exact maximum-u64 poll quanta, and
+prior accumulator `0x0123456789abcdef`. Its 1,392 bytes have SHA-256
+`dc0aafe23554862c3941a06440ff404aebf19aaf2ce5358694625beb0bdf8955`
+and derive accumulator `0x0ce24a87033663a1`. The independent gate validates
+that golden against the frozen manifest/schema and attacks the Rust authority,
+preflight, field source, ordering, poison, and accumulator paths:
+
+```sh
+python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
+cargo test --locked -p vibeos-wasm-aot-profile
+cargo check --locked -p vibeos-wasm-aot-profile \
+  --target riscv64imac-unknown-none-elf
+```
+
+This node is deliberately not a collector. The raw prior accumulator and
+successful sink can still be forked by a caller; no META or END is emitted; no
+24-sample order, rollback protection, trusted checked-counter producer,
+physical-Duo provenance, retained dataset, or AOT decision is claimed. In
+particular, the exact-`u64::MAX` poll vector proves decimal and accumulator
+handling only. A later live adapter must mint exactness from a private checked
+counter and must reject the existing saturating profile value at its sentinel.
+
 ## Decision rule
 
 Let `T` be each retained sample's `total_ticks`, `I` its `interpretation`
@@ -624,6 +680,7 @@ cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
 python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
+python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
 python3 -B scripts/verify-c84-ssh-profile-request-parent.py --selftest --check-source
 ./scripts/qemu-c84-ssh-request-parent-test.sh
 python3 -B scripts/verify-c84-ssh-managed-child-core.py --selftest --check-source
@@ -638,6 +695,7 @@ python3 -B scripts/verify-c84-ssh-managed-child-verified-stream.py --selftest --
 ./scripts/qemu-c84-ssh-managed-child-verified-stream-test.sh
 ```
 
-These checks validate the preparation contract, diagnostic ownership, and
-single-hart QEMU integration transcript semantics only; they cannot manufacture
-the missing physical C8.3 or C8.4 evidence.
+These checks validate the preparation contract, portable single-SAMPLE
+ownership/serialization, diagnostic ownership, and single-hart QEMU
+integration transcript semantics only; they cannot manufacture the missing
+physical C8.3 or C8.4 evidence.

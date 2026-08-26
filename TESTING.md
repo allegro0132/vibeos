@@ -27,6 +27,7 @@ python3 -B scripts/qemu-c83-runtime-costs.py --allow-dirty-smoke
 python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
 python3 -B scripts/verify-c83-evidence.py --selftest
 python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
+python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
 cargo test --locked -p vibeos-component-runtime --no-default-features \
   --features c84-profile-hooks --test c84_profile
 cargo test --locked -p vibeos-wasm-aot-profile
@@ -548,6 +549,37 @@ kernel adapter, and this node introduces no `ProfilePublisher`, schema
 publication, collector, retained evidence, physical Milk-V Duo evidence, or AOT
 decision; a later formal publisher must still accept `TargetVerified` rather
 than copied summary data or a UART success flag.
+
+The portable `vibeos-wasm-aot-profile` successor now provides that narrow
+single-record boundary. `ProfilePublisher::publish_profile` consumes one
+storage-bearing `TargetVerified` by value, rescans the complete profile and
+computes the chained accumulator before the first sink call, then streams one
+recursively ASCII-key-sorted, compact `VIBE_WASM_AOT_SAMPLE` JSON record without
+allocation. `RunId` and `Challenge` are distinct non-zero branded values;
+terminal observations must first become non-copyable eligible fields. That
+validation proves the frozen field values only, not live provenance.
+
+Zero-write preflight failures return the recycled `TargetReady` lineage and a
+retryable publisher with the original accumulator. Any possibly partial write
+or commit failure also recycles the lineage but permanently quarantines the
+sink in `ManuallyDrop`, including across unwinding, so its destructor cannot
+flush a truncated record. Only a committed record returns the sink, binding,
+recycled lineage, and derived accumulator. The checked-in golden is exactly one
+SAMPLE line; it intentionally contains no META or END.
+
+```sh
+python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
+cargo test --locked -p vibeos-wasm-aot-profile
+cargo check --locked -p vibeos-wasm-aot-profile \
+  --target riscv64imac-unknown-none-elf
+```
+
+This is still a portable serialization and ownership primitive. Its public
+terminal input can assert exactness but cannot prove where a counter came from;
+the exact-`u64::MAX` case is a serializer KAT, not permission to relabel a
+saturated live counter. The node adds no trusted SSH evidence producer,
+24-sample ordering, META/END closure, rollback resistance, physical-Duo
+capture, retained dataset, or AOT decision. Those remain collector/live nodes.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

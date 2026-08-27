@@ -140,10 +140,14 @@ These invariants are release-blocking. Violating one is a security bug.
 9. **Memory is bounded before allocation.** Component and Core decoding have
    independent byte, nesting, definition, type, instance, alias, canonical
    function, adapter, resource, memory, table, and custom-section limits.
-10. **Execution is temporally bounded.** Total fuel limits an invocation. A
-    smaller poll quantum forces the Core interpreter and Canonical ABI machinery
-    to save continuations and return `Pending`, so component code cannot wedge a
-    hart.
+10. **Execution is temporally bounded.** Total fuel limits charged execution. A
+    smaller poll quantum is a hard ceiling on newly granted fuel: resumable Core
+    interpreter and Canonical ABI work saves continuations and returns `Pending`.
+    Together with finite code, nesting, and call-depth limits this prevents
+    unbounded interpreter work. An indivisible engine metering unit larger than
+    the quantum fails closed instead of silently widening that grant:
+    insufficient remaining total fuel takes priority, otherwise it is a quantum
+    policy failure. A fuel grant is not itself a wall-clock preemption guarantee.
 11. **Admission is atomic.** Validation, graph planning, candidate CSpaces,
     resource tables, memories, streams, accounts, and task envelopes are complete
     before any start function or exported operation executes. Failure publishes
@@ -282,9 +286,18 @@ The component owns two independent execution budgets:
 
 - **Total fuel** bounds the complete invocation, including adapter Core Wasm and
   charged Canonical ABI work. Exhaustion maps to VSH `BudgetExceeded`.
-- **Poll quantum** bounds one executor poll. Quantum exhaustion saves all needed
-  Core/component continuations, self-wakes once, and returns `Pending`; it does
-  not reset total fuel.
+- **Poll quantum** bounds the newly granted fuel in one executor poll. For a
+  resumable metering unit, quantum exhaustion saves the Core/component
+  continuation, the owning executor self-wakes once, and returns `Pending`; it
+  does not reset total fuel.
+
+That `Pending` rule applies to resumable metering units. When the remaining
+total can cover it, an indivisible engine charge larger than the configured
+quantum terminates with stable `LimitExceeded` before its side effect. If the
+remaining total is also insufficient, `FuelExhausted` takes priority. Neither
+the Core wrapper nor a higher layer may grant extra fuel to force the operation
+through. C1.4 pins this boundary for the Core engine. Canonical ABI charging and
+executor wake integration close in their own later nodes.
 
 C2 initially supports synchronous Canonical ABI calls. C5 adds the exact native
 async Component Model revision associated with the selected WASI 0.3 profile:
@@ -380,7 +393,7 @@ without recollecting timings.
 | C1.1 | Add the pinned Core engine wrapper and exact Core profile validator | `cargo check` passes for the VibeOS target; every disabled proposal fails before instantiation |
 | C1.2 | Enforce decode limits before attacker-controlled allocation | Length, count, nesting, locals, types, tables, memories, data, elements and custom-section mutations never exceed the validation account |
 | C1.3 | Enforce mandatory effective maxima | `memory.grow`, table growth, call depth and engine allocation fail deterministically without charging another owner |
-| C1.4 | Implement total fuel and resumable poll quantum | An infinite loop returns after one bounded quantum and terminates only when total fuel or cancellation wins |
+| C1.4 | Implement total fuel and resumable poll quantum | An infinite loop returns after one bounded fuel grant and terminates only when total fuel or cancellation wins |
 | C1.5 | Freeze stable Core trap diagnostics | Arithmetic, unreachable, out-of-bounds, bad indirect call, call depth, validation and fuel failures have exact tested codes |
 | C1.6 | Add differential and specification evidence | The complete pinned `wg-1.0` `fac.wast` baseline agrees across its official assertions, Vibe, and DLR; profile rejections remain separately asserted |
 | C1.7 | Fuzz decode, validate, instantiate and execute | The pinned local corpus remains panic-free, respects configured allocation/execution bounds, reaches every stage, and produces stable terminals |
@@ -447,6 +460,53 @@ pre-engine allocation policy gate with active-scope request attribution.
 Authentic kernel owner capabilities, exact full-lifecycle charging/reclamation,
 and aggregate memory across all Core instances in a Component principal remain
 C4.2/C6 boundaries. No QEMU or physical-Duo allocation claim is made here.
+
+**C1.4 total fuel and resumable poll quantum (2026-08-28):**
+`wasm-runtime/tests/fuel_quantum.rs` pins the production Core wrapper to enabled
+fuel consumption and Wasmi 1.1's versioned default cost schedule. It rejects
+zero total fuel, zero quantum, either Profile-1 ceiling plus one, and a quantum
+larger than its total, while the exact maximum pair remains executable. A
+preemptible infinite loop with total 41 and quantum 10 returns four exact
+`Pending` states `(consumed, remaining) = (9, 32), (19, 22), (29, 12), (39,
+2)`, followed by the single `FuelExhausted` terminal at `(41, 0)`. Thus each
+poll consumes no more than its grant, the logical total remains monotonic across
+Wasmi store-fuel resets, and exhaustion does not leave a runnable continuation.
+
+Cancellation after the first yield consumes no additional guest fuel. It also
+wins when a checked external debit has already reduced the remaining balance to
+zero, because cancellation is observed before another interpreter step. Both
+terminal paths clear active state and permit immediate reuse. The legacy
+borrowed invocation now delivers `Ready`, `FuelExhausted`, or `Cancelled` once;
+a later poll returns `Validation` without relabeling the prior terminal or
+changing its metrics.
+
+The grant quantum has an explicit fail-closed edge. Wasmi meters some translated
+blocks and dynamic operations as indivisible units; under its pinned
+64-bytes-per-fuel default, a ten-page `memory.grow` has a 10,240-fuel dynamic
+charge, larger than Profile 1's maximum 10,000-fuel quantum. With 20,000 total
+fuel the gate repeats that operation and requires exact `(4, 19,996)` metrics,
+`LimitExceeded`, unchanged one-page memory, cleared active state, and reuse.
+With only 10,000 total fuel the same request is instead `FuelExhausted` at `(4,
+9,996)`, so remaining total-budget insufficiency wins when both ceilings are
+insufficient.
+
+The adjacent nine-page charge is 9,216 fuel. Quantum 9,220 completes it in one
+poll at exact `(9,220, 10,780)` metrics; quantum 9,219 and the exact charge
+quantum 9,216 first return `Pending` at `(4, 19,996)`, then resume to the same
+final metrics and memory. Quantum 9,215 returns `LimitExceeded`, while a 9,219
+total returns `FuelExhausted`; neither path mutates memory.
+The runtime never widens the grant to force either operation through. Therefore
+the row's “only total fuel or cancellation wins” is the acceptance result for
+the preemptible spin fixture, while an oversized indivisible metering unit is a
+separate stable policy failure.
+
+This closes the portable Core fuel-ledger and continuation substrate, not a
+wall-clock or cycle bound. Wasmi precharges translated blocks, so a resumed
+poll can execute a suffix charged by an earlier poll; the gate bounds newly
+debited fuel, not an exact source-instruction count per poll. Host/adapter/
+Canonical ABI charging remains C2.6, and executor self-wake, target latency,
+exhaustive opcode fuel coverage, and physical-Duo execution are not claimed by
+this host gate.
 
 **C1.6 selected baseline (2026-08-27):** the offline fixture is the complete
 official [`test/core/fac.wast`](https://github.com/WebAssembly/spec/blob/977f97014c962f7bd1291fcc6d28b41a924882bf/test/core/fac.wast)

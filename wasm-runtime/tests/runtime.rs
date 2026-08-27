@@ -2111,7 +2111,7 @@ fn dropping_legacy_invocation_discards_its_instance_owned_continuation() {
     drop(call);
 
     assert!(!instance.has_active_call());
-    instance.start_call("spin", &[], 10, 10).unwrap();
+    instance.start_call("spin", &[], 12, 10).unwrap();
     assert!(matches!(instance.poll_call(), PollResult::Pending { .. }));
     assert_eq!(
         instance.poll_call(),

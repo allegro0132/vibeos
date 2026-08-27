@@ -10,6 +10,8 @@ cargo test --locked --offline -p vibeos-wasm-runtime \
   --test decode_limits -- --test-threads=1 # C1.2 no attacker-scaled decode allocation
 cargo test --locked --offline -p vibeos-wasm-runtime \
   --test effective_maxima -- --test-threads=1 # C1.3 adjacent execution/allocation maxima
+cargo test --locked --offline -p vibeos-wasm-runtime \
+  --test fuel_quantum -- --test-threads=1 # C1.4 total fuel/resumable quantum
 cargo test --locked --offline -p vibeos-wasm-runtime --test core_spec # C1.6 pinned official integer semantics
 cargo test --locked --offline -p vibeos-wasm-runtime --test core_robustness # C1.7 deterministic bounded corpus
 cargo test --locked --offline -p vibeos-component-runtime \
@@ -144,6 +146,51 @@ total or live/high-water memory.
 Live/high-water/denial accounting, an unforgeable kernel owner, aggregate memory
 across a multi-module Component principal, and lifecycle reclamation remain
 C4.2/C6 evidence. The gate performs no QEMU or Duo work.
+
+`wasm-runtime/tests/fuel_quantum.rs` is the portable C1.4 total-fuel and poll-
+quantum gate. It first pins the current engine identity to enabled Wasmi fuel
+consumption and the versioned `Wasmi110Default` cost schedule. Runtime starts
+reject zero fuel, zero quantum, either Profile-1 maximum plus one, and a quantum
+larger than its total; the exact Profile maxima remain executable.
+
+The preemptible spin fixture uses total fuel 41 and quantum 10. Its four
+`Pending` states have exact `(consumed, remaining)` values `(9, 32)`, `(19,
+22)`, `(29, 12)`, and `(39, 2)` under the pinned engine, so every poll advances
+by at most one quantum without resetting the logical total. The fifth poll is
+the single `FuelExhausted` terminal with `(41, 0)`. Cancellation after the first
+`Pending` consumes no more guest fuel, and cancellation also wins when an
+explicit host-side debit has already reduced remaining fuel to zero. Every
+terminal clears the active continuation, a later instance poll is invalid, and
+the same instance is immediately reusable. The legacy borrowed invocation now
+also delivers `Ready`, `FuelExhausted`, or `Cancelled` exactly once; later polls
+return `Validation` without changing metrics.
+
+Wasmi 1.1 meters some translated basic blocks and dynamic operations as
+indivisible units. With its pinned 64-bytes-per-fuel default, growing ten pages
+has a 10,240-fuel dynamic charge, already above Profile 1's maximum 10,000-fuel
+quantum. With 20,000 total fuel the gate repeats that admitted operation and
+requires exact `(4, 19,996)` metrics, stable `LimitExceeded`, unchanged memory,
+and immediate instance reuse. With 10,000 total fuel, insufficiency of the
+remaining total budget takes priority and produces `FuelExhausted` at `(4,
+9,996)`. The adjacent
+nine-page charge is 9,216 fuel: quantum 9,220 completes it in one poll, while
+9,219 and the exact dynamic-charge quantum 9,216 both save and resume it with
+the same final `(9,220, 10,780)` metrics. Quantum 9,215 returns `LimitExceeded`,
+and a 9,219 total returns `FuelExhausted`, both before growth. This is an
+intentional fail-closed
+exception to the spin fixture's `Pending` path: the runtime never silently
+widens a fuel grant to execute an indivisible charge.
+
+Wasmi precharges translated basic blocks, so a resumed poll may execute a
+suffix whose fuel was debited by an earlier poll. The gate therefore bounds new
+fuel granted and debited per poll; it does not assert an exact source-opcode,
+wall-clock, or CPU-cycle bound for each poll.
+
+This gate closes the portable Core fuel ledger and continuation behavior only.
+Automatic charging of host, adapter, and Canonical ABI work remains C2.6;
+component-executor wake behavior and target latency require their own
+integration evidence. The gate does not claim exhaustive opcode fuel coverage,
+a QEMU timing bound, or physical-Duo execution.
 
 The C1.6 specification gate is deliberately offline and byte-pinned. It vendors
 the complete official [`test/core/fac.wast`](https://github.com/WebAssembly/spec/blob/977f97014c962f7bd1291fcc6d28b41a924882bf/test/core/fac.wast)

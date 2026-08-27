@@ -1,0 +1,184 @@
+{
+  "schema": "vibeos.c07.workloads",
+  "version": 1,
+  "epoch": "2026-08-28",
+  "static_target": "riscv64imac-unknown-none-elf",
+  "probe_heap_bytes": 262144,
+  "subjects": [
+    {
+      "id": "wasmi=1.1.0",
+      "kind": "core-engine",
+      "probe": "c0_static_wasmi"
+    },
+    {
+      "id": "dlr-wasm-interpreter=0.2.0",
+      "kind": "core-engine",
+      "probe": "c0_static_dlr"
+    },
+    {
+      "id": "component-frontend=0.255.0",
+      "kind": "component-frontend",
+      "probe": "c0_static_frontend"
+    }
+  ],
+  "applicability": [
+    {
+      "subject": "wasmi=1.1.0",
+      "metric": "code-static-size",
+      "status": "measured",
+      "measurement_ids": ["riscv64-linked-probe"]
+    },
+    {
+      "subject": "wasmi=1.1.0",
+      "metric": "validator-peak-memory",
+      "status": "measured",
+      "measurement_ids": ["validator-accepted-peak", "validator-rejected-peak"]
+    },
+    {
+      "subject": "wasmi=1.1.0",
+      "metric": "empty-instance-cost",
+      "status": "measured",
+      "measurement_ids": ["empty-instance"]
+    },
+    {
+      "subject": "wasmi=1.1.0",
+      "metric": "startup",
+      "status": "measured",
+      "measurement_ids": ["cold-startup"]
+    },
+    {
+      "subject": "wasmi=1.1.0",
+      "metric": "core-fuel-throughput",
+      "status": "measured",
+      "measurement_ids": ["core-fuel-throughput"]
+    },
+    {
+      "subject": "wasmi=1.1.0",
+      "metric": "canonical-lift-lower",
+      "status": "not-applicable",
+      "reason": "Canonical ABI lift/lower belongs to the shared Component frontend and is independent of the Core interpreter."
+    },
+    {
+      "subject": "dlr-wasm-interpreter=0.2.0",
+      "metric": "code-static-size",
+      "status": "measured",
+      "measurement_ids": ["riscv64-linked-probe"]
+    },
+    {
+      "subject": "dlr-wasm-interpreter=0.2.0",
+      "metric": "validator-peak-memory",
+      "status": "measured",
+      "measurement_ids": ["validator-accepted-peak", "validator-rejected-peak"]
+    },
+    {
+      "subject": "dlr-wasm-interpreter=0.2.0",
+      "metric": "empty-instance-cost",
+      "status": "measured",
+      "measurement_ids": ["empty-instance"]
+    },
+    {
+      "subject": "dlr-wasm-interpreter=0.2.0",
+      "metric": "startup",
+      "status": "measured",
+      "measurement_ids": ["cold-startup"]
+    },
+    {
+      "subject": "dlr-wasm-interpreter=0.2.0",
+      "metric": "core-fuel-throughput",
+      "status": "measured",
+      "measurement_ids": ["core-fuel-throughput"]
+    },
+    {
+      "subject": "dlr-wasm-interpreter=0.2.0",
+      "metric": "canonical-lift-lower",
+      "status": "not-applicable",
+      "reason": "Canonical ABI lift/lower belongs to the shared Component frontend and is independent of the Core interpreter."
+    },
+    {
+      "subject": "component-frontend=0.255.0",
+      "metric": "code-static-size",
+      "status": "measured",
+      "measurement_ids": ["riscv64-linked-probe"]
+    },
+    {
+      "subject": "component-frontend=0.255.0",
+      "metric": "validator-peak-memory",
+      "status": "measured",
+      "measurement_ids": [
+        "component-validator-accepted-peak",
+        "component-validator-rejected-peak",
+        "wit-validator-peak"
+      ]
+    },
+    {
+      "subject": "component-frontend=0.255.0",
+      "metric": "empty-instance-cost",
+      "status": "not-applicable",
+      "reason": "The selected frontend decodes and plans Components but owns no Core Store or instance."
+    },
+    {
+      "subject": "component-frontend=0.255.0",
+      "metric": "startup",
+      "status": "measured",
+      "measurement_ids": ["frontend-prepare"]
+    },
+    {
+      "subject": "component-frontend=0.255.0",
+      "metric": "core-fuel-throughput",
+      "status": "not-applicable",
+      "reason": "The frontend does not execute Core instructions or define a fuel schedule."
+    },
+    {
+      "subject": "component-frontend=0.255.0",
+      "metric": "canonical-lift-lower",
+      "status": "measured",
+      "measurement_ids": ["canonical-lift-lower-peak", "canonical-lift-lower"]
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "empty-core-v1",
+      "source": "wasm-candidates/fixtures/empty.wat",
+      "source_sha256": "3584af5e1ab0b1da09b5326237be4b178de0bb388d6093efd94e6aec56c20a74",
+      "compiled_sha256": "93a44bbb96c751218e4c00d479e4c14358122a389acca16205b1e4d0dc5f9476",
+      "compiled_bytes": 8
+    },
+    {
+      "id": "fuel-core-v1",
+      "source": "wasm-candidates/fixtures/fuel.wat",
+      "source_sha256": "6028b6d4da58bfe88f60e4f95b902a7dc3a91e7f21beddbf58ec54992299e1ea",
+      "compiled_sha256": "d776b28ba480fbf6b3c458bf89f31a503f1966903fd5d2b5299eeb1f1e9e80f6",
+      "compiled_bytes": 89
+    },
+    {
+      "id": "typed-component-v1",
+      "source": "component-format/tests/corpus/component/typed.component.wat",
+      "source_sha256": "31158becb0fed35520ad70f0bcf4258f4ac1f2f523294b84cd3448d5cf10f7a8",
+      "compiled_sha256": "14f4f6728ca7b017764957a9bd2af179ab78c0161b15aead0baec9bf86debd81",
+      "compiled_bytes": 178
+    },
+    {
+      "id": "typed-world-v1",
+      "source": "component-format/tests/corpus/wit/world.wit",
+      "source_sha256": "9d70cb7172cb39f93a1642a4cc760c316a3347f7cb73420032c8d46d6b087e7e"
+    }
+  ],
+  "sampling": {
+    "timing_samples": 9,
+    "startup_operations_per_sample": 256,
+    "fuel_operations_per_sample": 32,
+    "frontend_operations_per_sample": 256,
+    "canonical_operations_per_sample": 512,
+    "startup_input": 1,
+    "fuel_input": 32768,
+    "fuel_budget": 10000000,
+    "canonical_text_bytes": 256,
+    "canonical_list_elements": 64
+  },
+  "statistics": {
+    "mean": "integer floor of sum divided by sample count",
+    "p50": "nearest-rank index ceil(0.50*n)-1",
+    "p95": "nearest-rank index ceil(0.95*n)-1",
+    "thresholds": "none; every baseline change requires explicit review"
+  }
+}

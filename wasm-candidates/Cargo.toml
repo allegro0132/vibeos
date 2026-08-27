@@ -2,13 +2,56 @@
 name = "vibeos-wasm-candidates"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
+
+[features]
+default = []
+c0-baseline = ["dep:vibeos-component-runtime"]
+c0-static-probes = ["dep:vibeos-component-runtime"]
 
 [dependencies]
 vibeos-component-format = { path = "../component-format" }
+vibeos-component-runtime = { path = "../component-runtime", optional = true }
 wasmi = { version = "=1.1.0", default-features = false, features = ["extra-checks", "prefer-btree-collections"] }
 dlr-wasm-interpreter = { version = "=0.2.0", default-features = false }
 wasmparser = { version = "=0.255.0", default-features = false, features = ["component-model", "features", "prefer-btree-collections", "validate"] }
 wit-parser = { version = "=0.255.0", default-features = false }
 
+[build-dependencies]
+serde_json = "=1.0.151"
+wat = { version = "=1.255.0", features = ["component-model"] }
+
 [dev-dependencies]
 wat = { version = "=1.255.0", features = ["component-model"] }
+
+[[example]]
+name = "c0_baseline"
+required-features = ["c0-baseline"]
+
+[[bin]]
+name = "c0_static_control"
+path = "src/bin/c0_static_control.rs"
+required-features = ["c0-static-probes"]
+test = false
+bench = false
+
+[[bin]]
+name = "c0_static_wasmi"
+path = "src/bin/c0_static_wasmi.rs"
+required-features = ["c0-static-probes"]
+test = false
+bench = false
+
+[[bin]]
+name = "c0_static_dlr"
+path = "src/bin/c0_static_dlr.rs"
+required-features = ["c0-static-probes"]
+test = false
+bench = false
+
+[[bin]]
+name = "c0_static_frontend"
+path = "src/bin/c0_static_frontend.rs"
+required-features = ["c0-static-probes"]
+test = false
+bench = false

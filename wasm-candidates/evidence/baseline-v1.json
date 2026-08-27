@@ -1,0 +1,1237 @@
+{
+  "applicability": [
+    {
+      "measurement_ids": [
+        "riscv64-linked-probe"
+      ],
+      "metric": "code-static-size",
+      "status": "measured",
+      "subject": "wasmi=1.1.0"
+    },
+    {
+      "measurement_ids": [
+        "validator-accepted-peak",
+        "validator-rejected-peak"
+      ],
+      "metric": "validator-peak-memory",
+      "status": "measured",
+      "subject": "wasmi=1.1.0"
+    },
+    {
+      "measurement_ids": [
+        "empty-instance"
+      ],
+      "metric": "empty-instance-cost",
+      "status": "measured",
+      "subject": "wasmi=1.1.0"
+    },
+    {
+      "measurement_ids": [
+        "cold-startup"
+      ],
+      "metric": "startup",
+      "status": "measured",
+      "subject": "wasmi=1.1.0"
+    },
+    {
+      "measurement_ids": [
+        "core-fuel-throughput"
+      ],
+      "metric": "core-fuel-throughput",
+      "status": "measured",
+      "subject": "wasmi=1.1.0"
+    },
+    {
+      "metric": "canonical-lift-lower",
+      "reason": "Canonical ABI lift/lower belongs to the shared Component frontend and is independent of the Core interpreter.",
+      "status": "not-applicable",
+      "subject": "wasmi=1.1.0"
+    },
+    {
+      "measurement_ids": [
+        "riscv64-linked-probe"
+      ],
+      "metric": "code-static-size",
+      "status": "measured",
+      "subject": "dlr-wasm-interpreter=0.2.0"
+    },
+    {
+      "measurement_ids": [
+        "validator-accepted-peak",
+        "validator-rejected-peak"
+      ],
+      "metric": "validator-peak-memory",
+      "status": "measured",
+      "subject": "dlr-wasm-interpreter=0.2.0"
+    },
+    {
+      "measurement_ids": [
+        "empty-instance"
+      ],
+      "metric": "empty-instance-cost",
+      "status": "measured",
+      "subject": "dlr-wasm-interpreter=0.2.0"
+    },
+    {
+      "measurement_ids": [
+        "cold-startup"
+      ],
+      "metric": "startup",
+      "status": "measured",
+      "subject": "dlr-wasm-interpreter=0.2.0"
+    },
+    {
+      "measurement_ids": [
+        "core-fuel-throughput"
+      ],
+      "metric": "core-fuel-throughput",
+      "status": "measured",
+      "subject": "dlr-wasm-interpreter=0.2.0"
+    },
+    {
+      "metric": "canonical-lift-lower",
+      "reason": "Canonical ABI lift/lower belongs to the shared Component frontend and is independent of the Core interpreter.",
+      "status": "not-applicable",
+      "subject": "dlr-wasm-interpreter=0.2.0"
+    },
+    {
+      "measurement_ids": [
+        "riscv64-linked-probe"
+      ],
+      "metric": "code-static-size",
+      "status": "measured",
+      "subject": "component-frontend=0.255.0"
+    },
+    {
+      "measurement_ids": [
+        "component-validator-accepted-peak",
+        "component-validator-rejected-peak",
+        "wit-validator-peak"
+      ],
+      "metric": "validator-peak-memory",
+      "status": "measured",
+      "subject": "component-frontend=0.255.0"
+    },
+    {
+      "metric": "empty-instance-cost",
+      "reason": "The selected frontend decodes and plans Components but owns no Core Store or instance.",
+      "status": "not-applicable",
+      "subject": "component-frontend=0.255.0"
+    },
+    {
+      "measurement_ids": [
+        "frontend-prepare"
+      ],
+      "metric": "startup",
+      "status": "measured",
+      "subject": "component-frontend=0.255.0"
+    },
+    {
+      "metric": "core-fuel-throughput",
+      "reason": "The frontend does not execute Core instructions or define a fuel schedule.",
+      "status": "not-applicable",
+      "subject": "component-frontend=0.255.0"
+    },
+    {
+      "measurement_ids": [
+        "canonical-lift-lower-peak",
+        "canonical-lift-lower"
+      ],
+      "metric": "canonical-lift-lower",
+      "status": "measured",
+      "subject": "component-frontend=0.255.0"
+    }
+  ],
+  "build_environment": {
+    "cargo_home": "isolated cache-only",
+    "cargo_incremental": false,
+    "cargo_net_offline": true,
+    "locale": "C",
+    "rustc_wrapper": null,
+    "rustdocflags": [],
+    "rustflags": [],
+    "source_date_epoch": "0",
+    "target_dir": "fresh temporary directory"
+  },
+  "epoch": "2026-08-28",
+  "fixtures": [
+    {
+      "compiled_bytes": 8,
+      "compiled_sha256": "93a44bbb96c751218e4c00d479e4c14358122a389acca16205b1e4d0dc5f9476",
+      "id": "empty-core-v1",
+      "source": "wasm-candidates/fixtures/empty.wat",
+      "source_sha256": "3584af5e1ab0b1da09b5326237be4b178de0bb388d6093efd94e6aec56c20a74"
+    },
+    {
+      "compiled_bytes": 89,
+      "compiled_sha256": "d776b28ba480fbf6b3c458bf89f31a503f1966903fd5d2b5299eeb1f1e9e80f6",
+      "id": "fuel-core-v1",
+      "source": "wasm-candidates/fixtures/fuel.wat",
+      "source_sha256": "6028b6d4da58bfe88f60e4f95b902a7dc3a91e7f21beddbf58ec54992299e1ea"
+    },
+    {
+      "compiled_bytes": 178,
+      "compiled_sha256": "14f4f6728ca7b017764957a9bd2af179ab78c0161b15aead0baec9bf86debd81",
+      "id": "typed-component-v1",
+      "source": "component-format/tests/corpus/component/typed.component.wat",
+      "source_sha256": "31158becb0fed35520ad70f0bcf4258f4ac1f2f523294b84cd3448d5cf10f7a8"
+    },
+    {
+      "id": "typed-world-v1",
+      "source": "component-format/tests/corpus/wit/world.wit",
+      "source_sha256": "9d70cb7172cb39f93a1642a4cc760c316a3347f7cb73420032c8d46d6b087e7e"
+    }
+  ],
+  "host": {
+    "machine": "arm64",
+    "python": "3.14.6",
+    "release": "25.5.0",
+    "system": "Darwin",
+    "triple": "aarch64-apple-darwin"
+  },
+  "host_measurements": [
+    {
+      "after_bytes": 1020,
+      "baseline_bytes": 1020,
+      "kind": "memory",
+      "metric": "validator-accepted-peak",
+      "operations": 1,
+      "peak_delta_bytes": 6606,
+      "result": 1,
+      "retained_bytes": 0,
+      "subject": "wasmi=1.1.0",
+      "workload": "fuel-core-v1"
+    },
+    {
+      "after_bytes": 1500,
+      "baseline_bytes": 1500,
+      "kind": "memory",
+      "metric": "validator-rejected-peak",
+      "operations": 1,
+      "peak_delta_bytes": 6678,
+      "result": 1,
+      "retained_bytes": 0,
+      "subject": "wasmi=1.1.0",
+      "workload": "malformed-core-v1"
+    },
+    {
+      "after_bytes": 1860,
+      "baseline_bytes": 1860,
+      "kind": "memory",
+      "metric": "empty-instance",
+      "operations": 1,
+      "peak_delta_bytes": 592,
+      "result": 1,
+      "retained_bytes": 576,
+      "subject": "wasmi=1.1.0",
+      "workload": "empty-core-v1"
+    },
+    {
+      "kind": "timing",
+      "metric": "cold-startup",
+      "ns_per_operation": [
+        13680,
+        12099,
+        12059,
+        11440,
+        10917,
+        8849,
+        8833,
+        8652,
+        8292
+      ],
+      "ns_per_operation_statistics": {
+        "max": 13680,
+        "mean": 10535,
+        "min": 8292,
+        "p50": 10917,
+        "p95": 13680
+      },
+      "operations_per_sample": 256,
+      "operations_per_second": [
+        73098,
+        82649,
+        82919,
+        87410,
+        91597,
+        113005,
+        113209,
+        115575,
+        120593
+      ],
+      "operations_per_second_statistics": {
+        "max": 120593,
+        "mean": 97783,
+        "min": 73098,
+        "p50": 91597,
+        "p95": 120593
+      },
+      "results": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples_ns": [
+        3502125,
+        3097416,
+        3087333,
+        2928709,
+        2794833,
+        2265375,
+        2261291,
+        2215000,
+        2122833
+      ],
+      "subject": "wasmi=1.1.0",
+      "workload": "fuel-core-first-call-v1"
+    },
+    {
+      "fuel_per_operation": 131079,
+      "fuel_per_second": [
+        617625738,
+        727716614,
+        838968522,
+        891409627,
+        944438690,
+        979944046,
+        993679534,
+        1034579054,
+        1109712225
+      ],
+      "fuel_per_second_statistics": {
+        "max": 1109712225,
+        "mean": 904230450,
+        "min": 617625738,
+        "p50": 944438690,
+        "p95": 1109712225
+      },
+      "fuel_samples": [
+        4194528,
+        4194528,
+        4194528,
+        4194528,
+        4194528,
+        4194528,
+        4194528,
+        4194528,
+        4194528
+      ],
+      "kind": "fuel",
+      "metric": "core-fuel-throughput",
+      "ns_per_operation": [
+        212230,
+        180123,
+        156238,
+        147046,
+        138790,
+        133761,
+        131912,
+        126697,
+        118119
+      ],
+      "ns_per_operation_statistics": {
+        "max": 212230,
+        "mean": 149435,
+        "min": 118119,
+        "p50": 138790,
+        "p95": 212230
+      },
+      "operations_per_sample": 32,
+      "operations_per_second": [
+        4711,
+        5551,
+        6400,
+        6800,
+        7205,
+        7475,
+        7580,
+        7892,
+        8465
+      ],
+      "operations_per_second_statistics": {
+        "max": 8465,
+        "mean": 6897,
+        "min": 4711,
+        "p50": 7205,
+        "p95": 8465
+      },
+      "results": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples_ns": [
+        6791375,
+        5763958,
+        4999625,
+        4705500,
+        4441292,
+        4280375,
+        4221208,
+        4054333,
+        3779834
+      ],
+      "subject": "wasmi=1.1.0",
+      "workload": "burn-32768-v1"
+    },
+    {
+      "after_bytes": 7480,
+      "baseline_bytes": 7480,
+      "kind": "memory",
+      "metric": "validator-accepted-peak",
+      "operations": 1,
+      "peak_delta_bytes": 780,
+      "result": 1,
+      "retained_bytes": 0,
+      "subject": "dlr-wasm-interpreter=0.2.0",
+      "workload": "fuel-core-v1"
+    },
+    {
+      "after_bytes": 7480,
+      "baseline_bytes": 7480,
+      "kind": "memory",
+      "metric": "validator-rejected-peak",
+      "operations": 1,
+      "peak_delta_bytes": 780,
+      "result": 1,
+      "retained_bytes": 0,
+      "subject": "dlr-wasm-interpreter=0.2.0",
+      "workload": "malformed-core-v1"
+    },
+    {
+      "after_bytes": 7480,
+      "baseline_bytes": 7480,
+      "kind": "memory",
+      "metric": "empty-instance",
+      "operations": 1,
+      "peak_delta_bytes": 704,
+      "result": 1,
+      "retained_bytes": 704,
+      "subject": "dlr-wasm-interpreter=0.2.0",
+      "workload": "empty-core-v1"
+    },
+    {
+      "kind": "timing",
+      "metric": "cold-startup",
+      "ns_per_operation": [
+        1993,
+        1931,
+        1921,
+        1916,
+        1910,
+        1901,
+        1876,
+        1882,
+        1812
+      ],
+      "ns_per_operation_statistics": {
+        "max": 1993,
+        "mean": 1904,
+        "min": 1812,
+        "p50": 1910,
+        "p95": 1993
+      },
+      "operations_per_sample": 256,
+      "operations_per_second": [
+        501714,
+        517781,
+        520546,
+        521650,
+        523293,
+        525937,
+        532916,
+        531258,
+        551724
+      ],
+      "operations_per_second_statistics": {
+        "max": 551724,
+        "mean": 525202,
+        "min": 501714,
+        "p50": 523293,
+        "p95": 551724
+      },
+      "results": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples_ns": [
+        510250,
+        494417,
+        491791,
+        490750,
+        489209,
+        486750,
+        480375,
+        481875,
+        464000
+      ],
+      "subject": "dlr-wasm-interpreter=0.2.0",
+      "workload": "fuel-core-first-call-v1"
+    },
+    {
+      "fuel_per_operation": 262153,
+      "fuel_per_second": [
+        167536948,
+        168656902,
+        170666303,
+        170320522,
+        170133993,
+        170392881,
+        170500239,
+        170373128,
+        170260747
+      ],
+      "fuel_per_second_statistics": {
+        "max": 170666303,
+        "mean": 169871295,
+        "min": 167536948,
+        "p50": 170320522,
+        "p95": 170666303
+      },
+      "fuel_samples": [
+        8388896,
+        8388896,
+        8388896,
+        8388896,
+        8388896,
+        8388896,
+        8388896,
+        8388896,
+        8388896
+      ],
+      "kind": "fuel",
+      "metric": "core-fuel-throughput",
+      "ns_per_operation": [
+        1564747,
+        1554356,
+        1536056,
+        1539174,
+        1540861,
+        1538520,
+        1537552,
+        1538699,
+        1539714
+      ],
+      "ns_per_operation_statistics": {
+        "max": 1564747,
+        "mean": 1543297,
+        "min": 1536056,
+        "p50": 1539174,
+        "p95": 1564747
+      },
+      "operations_per_sample": 32,
+      "operations_per_second": [
+        639,
+        643,
+        651,
+        649,
+        648,
+        649,
+        650,
+        649,
+        649
+      ],
+      "operations_per_second_statistics": {
+        "max": 651,
+        "mean": 647,
+        "min": 639,
+        "p50": 649,
+        "p95": 651
+      },
+      "results": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "samples_ns": [
+        50071916,
+        49739417,
+        49153792,
+        49253583,
+        49307583,
+        49232667,
+        49201667,
+        49238375,
+        49270875
+      ],
+      "subject": "dlr-wasm-interpreter=0.2.0",
+      "workload": "burn-32768-v1"
+    },
+    {
+      "after_bytes": 10692,
+      "baseline_bytes": 10692,
+      "kind": "memory",
+      "metric": "component-validator-accepted-peak",
+      "operations": 1,
+      "peak_delta_bytes": 11200,
+      "result": 1,
+      "retained_bytes": 0,
+      "subject": "component-frontend=0.255.0",
+      "workload": "typed-component-v1"
+    },
+    {
+      "after_bytes": 10692,
+      "baseline_bytes": 10692,
+      "kind": "memory",
+      "metric": "component-validator-rejected-peak",
+      "operations": 1,
+      "peak_delta_bytes": 10648,
+      "result": 1,
+      "retained_bytes": 0,
+      "subject": "component-frontend=0.255.0",
+      "workload": "malformed-component-v1"
+    },
+    {
+      "after_bytes": 10692,
+      "baseline_bytes": 10692,
+      "kind": "memory",
+      "metric": "wit-validator-peak",
+      "operations": 1,
+      "peak_delta_bytes": 26361,
+      "result": 1,
+      "retained_bytes": 0,
+      "subject": "component-frontend=0.255.0",
+      "workload": "typed-world-v1"
+    },
+    {
+      "kind": "timing",
+      "metric": "frontend-prepare",
+      "ns_per_operation": [
+        40323,
+        40461,
+        40209,
+        39907,
+        40303,
+        39723,
+        39787,
+        39969,
+        40152
+      ],
+      "ns_per_operation_statistics": {
+        "max": 40461,
+        "mean": 40092,
+        "min": 39723,
+        "p50": 40152,
+        "p95": 40461
+      },
+      "operations_per_sample": 256,
+      "operations_per_second": [
+        24799,
+        24714,
+        24869,
+        25058,
+        24811,
+        25174,
+        25133,
+        25019,
+        24904
+      ],
+      "operations_per_second_statistics": {
+        "max": 25174,
+        "mean": 24942,
+        "min": 24714,
+        "p50": 24904,
+        "p95": 25174
+      },
+      "results": [
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512,
+        512
+      ],
+      "samples_ns": [
+        10322875,
+        10358208,
+        10293583,
+        10216250,
+        10317667,
+        10169166,
+        10185708,
+        10232167,
+        10279084
+      ],
+      "subject": "component-frontend=0.255.0",
+      "workload": "typed-component-world-v1"
+    },
+    {
+      "after_bytes": 76492,
+      "baseline_bytes": 76492,
+      "kind": "memory",
+      "metric": "canonical-lift-lower-peak",
+      "operations": 1,
+      "peak_delta_bytes": 768,
+      "result": 320,
+      "retained_bytes": 0,
+      "subject": "component-frontend=0.255.0",
+      "workload": "canonical-256b-64u32-v1"
+    },
+    {
+      "kind": "timing",
+      "metric": "canonical-lift-lower",
+      "ns_per_operation": [
+        505,
+        486,
+        486,
+        484,
+        484,
+        484,
+        484,
+        484,
+        484
+      ],
+      "ns_per_operation_statistics": {
+        "max": 505,
+        "mean": 486,
+        "min": 484,
+        "p50": 484,
+        "p95": 505
+      },
+      "operations_per_sample": 512,
+      "operations_per_second": [
+        1977146,
+        2056910,
+        2057604,
+        2063476,
+        2063825,
+        2063476,
+        2064174,
+        2064516,
+        2065215
+      ],
+      "operations_per_second_statistics": {
+        "max": 2065215,
+        "mean": 2052926,
+        "min": 1977146,
+        "p50": 2063476,
+        "p95": 2065215
+      },
+      "results": [
+        163840,
+        163840,
+        163840,
+        163840,
+        163840,
+        163840,
+        163840,
+        163840,
+        163840
+      ],
+      "samples_ns": [
+        258959,
+        248917,
+        248833,
+        248125,
+        248083,
+        248125,
+        248041,
+        248000,
+        247916
+      ],
+      "subject": "component-frontend=0.255.0",
+      "workload": "canonical-256b-64u32-v1"
+    }
+  ],
+  "sampling": {
+    "canonical_list_elements": 64,
+    "canonical_operations_per_sample": 512,
+    "canonical_text_bytes": 256,
+    "frontend_operations_per_sample": 256,
+    "fuel_budget": 10000000,
+    "fuel_input": 32768,
+    "fuel_operations_per_sample": 32,
+    "startup_input": 1,
+    "startup_operations_per_sample": 256,
+    "timing_samples": 9
+  },
+  "schema": "vibeos.c07.baseline",
+  "source_inputs": [
+    {
+      "path": "Cargo.lock",
+      "sha256": "ca1ed8424b4e21ba8844a7f426077e811097760a2d59c21c5c711d4927c2ec9d"
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "eca76f85d61feab73fab591eb3c4dae851ef321bf1989924e5757d1e544e7c35"
+    },
+    {
+      "path": "component-format/Cargo.toml",
+      "sha256": "68b6512e656aa1149508f225d361b5826a67349dbda4157a4c09d0cb88a335d1"
+    },
+    {
+      "path": "component-format/src/artifact.rs",
+      "sha256": "53aa734f29d69ca00c5f01c43837622e775ba37afa33ccc50598aaaadf036e5a"
+    },
+    {
+      "path": "component-format/src/authentication.rs",
+      "sha256": "a85ed73b084a32083486667b424698d91ef55c8137b24066c1aa2f426ec4240f"
+    },
+    {
+      "path": "component-format/src/engine.rs",
+      "sha256": "1fb6a6fafdb206d58acaf0635d58f7176339ad0a0e3403267add9c577adf04fc"
+    },
+    {
+      "path": "component-format/src/graph_authentication.rs",
+      "sha256": "a43c98958ade083b64db9080e94bc5bd58e8498a23a290697467c41a780203fb"
+    },
+    {
+      "path": "component-format/src/graph_version.rs",
+      "sha256": "6c612e0923d3bbcf3146372303d8a8b1295b24149151461b53ab1753b8406c61"
+    },
+    {
+      "path": "component-format/src/lib.rs",
+      "sha256": "051010c1f58b2956964090687624456e757377d9676be49ad776fbcbf06fc3fa"
+    },
+    {
+      "path": "component-format/tests/corpus/component/typed.component.wat",
+      "sha256": "31158becb0fed35520ad70f0bcf4258f4ac1f2f523294b84cd3448d5cf10f7a8"
+    },
+    {
+      "path": "component-format/tests/corpus/wit/world.wit",
+      "sha256": "9d70cb7172cb39f93a1642a4cc760c316a3347f7cb73420032c8d46d6b087e7e"
+    },
+    {
+      "path": "component-runtime/Cargo.toml",
+      "sha256": "d96db29dc25abe891c1aef3ef8074cd57dc87dee974b3307477a30eebc30eebf"
+    },
+    {
+      "path": "component-runtime/src/abi_value.rs",
+      "sha256": "4811da5501eea4460f8113ec71d85bbe9e31c5ba3c41bb81bdc0b0dafebdb9b6"
+    },
+    {
+      "path": "component-runtime/src/async_abi.rs",
+      "sha256": "bf9dcbc8bd1f3a0409e5d447d2a75a08121f663cf44655fb2263253c9ce3de31"
+    },
+    {
+      "path": "component-runtime/src/async_state.rs",
+      "sha256": "dfde3661518bb91d25ea213d246cc23cfddca796b0b7407c3fed49ce08d6e91a"
+    },
+    {
+      "path": "component-runtime/src/buffer_registry.rs",
+      "sha256": "e1e0e3eee6eb740ae8334d54d86b6924cbdfe1dab5514762461bdb4e23e7ce76"
+    },
+    {
+      "path": "component-runtime/src/canonical.rs",
+      "sha256": "d8131949cee4dfdac272adddf9c9827dd34cf4a6b5c1eaa215f46d4ff81a01e0"
+    },
+    {
+      "path": "component-runtime/src/decode.rs",
+      "sha256": "7edb29af450d70950afe85ed41574498224f05e7777d6b79615dde625ca70b5b"
+    },
+    {
+      "path": "component-runtime/src/execution.rs",
+      "sha256": "1af797a642a2533ae6747ea72b14e4f0d4fa85b1327b98040661cd50ba0da600"
+    },
+    {
+      "path": "component-runtime/src/graph.rs",
+      "sha256": "8ca70e0f13d93d2fe638bc6f2c70eaf118bfcaecae6a5962d16a5d485437529b"
+    },
+    {
+      "path": "component-runtime/src/host.rs",
+      "sha256": "7ca0febca439245c9b7048d6c1388996b15d1b036fb596f6fc73a219b376419d"
+    },
+    {
+      "path": "component-runtime/src/lib.rs",
+      "sha256": "6702276acab2381379b8eee4739a1ea623d35a4c313b4fced857433c005a5847"
+    },
+    {
+      "path": "component-runtime/src/memory.rs",
+      "sha256": "b73e3cf3bb3eb15e5c1735a836aa3186e6523f8c2c6a9d83a0ce7adb546c8306"
+    },
+    {
+      "path": "component-runtime/src/native_async.rs",
+      "sha256": "a30dfa0437c2f63a1add816d889c3ac3f86d314cd36e3e79bba3bc6d87284b6c"
+    },
+    {
+      "path": "component-runtime/src/predecode.rs",
+      "sha256": "4a788a5699065ce399534c5a43e9de33056fb95a178542cef7bd8c84ef8ee043"
+    },
+    {
+      "path": "component-runtime/src/resource.rs",
+      "sha256": "ca0bfdafd0f56a247e195da1bf70288d3969ffd7617eab090bcf9f894f9d86e3"
+    },
+    {
+      "path": "component-runtime/src/sync.rs",
+      "sha256": "6b1337a91dcaa11dd0af7ad79070d9aba9dac2f12e1f3f1a83244b16790bb6c8"
+    },
+    {
+      "path": "component-runtime/src/types.rs",
+      "sha256": "0d1fbcf9f200eeedcb2f62c203f415a2837f6be8fb0b870ac49d2155c8d26868"
+    },
+    {
+      "path": "component-runtime/src/value.rs",
+      "sha256": "790ba3f6b43a2f102d85e628bbbadab25973eb0d632c01458b498effa15d0821"
+    },
+    {
+      "path": "component-runtime/src/world.rs",
+      "sha256": "40899fe87dd593871860cf4851ca4dd6c78ef907cf23e9371a1c6c843d5b8efd"
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "sha256": "aac4c0b9d7f8d6677de6b396d51beac9adf7847af968d2e8aa376fadec961c9a"
+    },
+    {
+      "path": "scripts/collect-c0-baseline.py",
+      "sha256": "22d66d2b204a6148f5181f5419f412d7ac013e986991c3f21ebc2367df1fea8c"
+    },
+    {
+      "path": "scripts/verify-c0-baseline.py",
+      "sha256": "d16d4ef952b3e9b92886b235690e97866506066b2200a0cea3a7916e4cdca968"
+    },
+    {
+      "path": "wasm-candidates/Cargo.toml",
+      "sha256": "57e15cf9acd1c6eae92e7c3c83cd7dbdbbcb778eaad2a3caf6fa2128e727a15f"
+    },
+    {
+      "path": "wasm-candidates/build.rs",
+      "sha256": "311b5752d47804f75f3575bb32ae9f2f5cee21f7c9db246c12152959a66203a9"
+    },
+    {
+      "path": "wasm-candidates/evidence/workloads-v1.json",
+      "sha256": "297564a485b2fd8f123001dc3739a5a5a3948e6a6c3ba59c8a27b427b9a7fdf1"
+    },
+    {
+      "path": "wasm-candidates/examples/c0_baseline.rs",
+      "sha256": "a13914a236403c1b1877dd2661a8d47f897cd9d98aac0c5d34f748e7f8beefda"
+    },
+    {
+      "path": "wasm-candidates/fixtures/empty.wat",
+      "sha256": "3584af5e1ab0b1da09b5326237be4b178de0bb388d6093efd94e6aec56c20a74"
+    },
+    {
+      "path": "wasm-candidates/fixtures/fuel.wat",
+      "sha256": "6028b6d4da58bfe88f60e4f95b902a7dc3a91e7f21beddbf58ec54992299e1ea"
+    },
+    {
+      "path": "wasm-candidates/src/bin/c0_static_control.rs",
+      "sha256": "5d710489743c5dc95ef8cefeed5a1433b5cc084bd630788f62111573e9444b1e"
+    },
+    {
+      "path": "wasm-candidates/src/bin/c0_static_dlr.rs",
+      "sha256": "549e710af996d2ee516969aa84da7b42ba9f509c90f27c29c3171a8e3f152192"
+    },
+    {
+      "path": "wasm-candidates/src/bin/c0_static_frontend.rs",
+      "sha256": "bcb931b2156612dc2bc75c1bf17b61400e52b0322297b25ca2161d12f26af56d"
+    },
+    {
+      "path": "wasm-candidates/src/bin/c0_static_wasmi.rs",
+      "sha256": "2ed189d1beed294e80640db88d039d97015574b79ef1a30c45067d0abdc9ac66"
+    },
+    {
+      "path": "wasm-candidates/src/bin/support/mod.rs",
+      "sha256": "e2c15e8fc8a976b44be298f3bc652fece2d215a27cfa814a84bab144880743ca"
+    },
+    {
+      "path": "wasm-candidates/src/lib.rs",
+      "sha256": "a09bfc3bcbe1552a58facbf64d3f5a2d5dd46e5f9d61a5c6823716be9f2d62ac"
+    },
+    {
+      "path": "wasm-runtime/Cargo.toml",
+      "sha256": "33d667a5ada84e86980348f04c9815992a724f8f94d5a5fc515147407022a34c"
+    },
+    {
+      "path": "wasm-runtime/src/lib.rs",
+      "sha256": "59579f61538d9d19f40f2dea64381b823ab80a142c8d713ebc01b1dc8048944c"
+    }
+  ],
+  "static_target": {
+    "control": {
+      "artifact": "target/riscv64imac-unknown-none-elf/release/c0_static_control",
+      "code_static_bytes": 436,
+      "executable_bytes": 208,
+      "probe_heap_symbol": {
+        "bytes": 262144,
+        "name": "C0_PROBE_HEAP",
+        "section": ".bss"
+      },
+      "read_only_bytes": 228,
+      "sections": [
+        {
+          "bytes": 8,
+          "category": "read-only",
+          "flags": [
+            "SHF_ALLOC",
+            "SHF_MERGE"
+          ],
+          "index": 1,
+          "name": ".rodata",
+          "type": "SHT_PROGBITS"
+        },
+        {
+          "bytes": 220,
+          "category": "read-only",
+          "flags": [
+            "SHF_ALLOC"
+          ],
+          "index": 2,
+          "name": ".eh_frame",
+          "type": "SHT_PROGBITS"
+        },
+        {
+          "bytes": 208,
+          "category": "executable",
+          "flags": [
+            "SHF_ALLOC",
+            "SHF_EXECINSTR"
+          ],
+          "index": 3,
+          "name": ".text",
+          "type": "SHT_PROGBITS"
+        },
+        {
+          "bytes": 262168,
+          "category": "zero-fill",
+          "flags": [
+            "SHF_ALLOC",
+            "SHF_WRITE"
+          ],
+          "index": 4,
+          "name": ".bss",
+          "type": "SHT_NOBITS"
+        }
+      ],
+      "static_ram_bytes_excluding_probe_heap": 24,
+      "writable_file_bytes": 0,
+      "zero_fill_bytes": 262168
+    },
+    "measurements": [
+      {
+        "artifact": "target/riscv64imac-unknown-none-elf/release/c0_static_wasmi",
+        "code_static_bytes": 482444,
+        "executable_bytes": 343424,
+        "incremental_code_static_bytes_over_control": 482008,
+        "measurement": "riscv64-linked-probe",
+        "probe_heap_symbol": {
+          "bytes": 262144,
+          "name": "C0_PROBE_HEAP",
+          "section": ".bss"
+        },
+        "read_only_bytes": 139020,
+        "sections": [
+          {
+            "bytes": 64496,
+            "category": "read-only",
+            "flags": [
+              "SHF_ALLOC",
+              "SHF_MERGE",
+              "SHF_STRINGS"
+            ],
+            "index": 1,
+            "name": ".rodata",
+            "type": "SHT_PROGBITS"
+          },
+          {
+            "bytes": 74524,
+            "category": "read-only",
+            "flags": [
+              "SHF_ALLOC"
+            ],
+            "index": 2,
+            "name": ".eh_frame",
+            "type": "SHT_PROGBITS"
+          },
+          {
+            "bytes": 343424,
+            "category": "executable",
+            "flags": [
+              "SHF_ALLOC",
+              "SHF_EXECINSTR"
+            ],
+            "index": 3,
+            "name": ".text",
+            "type": "SHT_PROGBITS"
+          },
+          {
+            "bytes": 262176,
+            "category": "zero-fill",
+            "flags": [
+              "SHF_ALLOC",
+              "SHF_WRITE"
+            ],
+            "index": 4,
+            "name": ".bss",
+            "type": "SHT_NOBITS"
+          }
+        ],
+        "static_ram_bytes_excluding_probe_heap": 32,
+        "subject": "wasmi=1.1.0",
+        "writable_file_bytes": 0,
+        "zero_fill_bytes": 262176
+      },
+      {
+        "artifact": "target/riscv64imac-unknown-none-elf/release/c0_static_dlr",
+        "code_static_bytes": 240004,
+        "executable_bytes": 190992,
+        "incremental_code_static_bytes_over_control": 239568,
+        "measurement": "riscv64-linked-probe",
+        "probe_heap_symbol": {
+          "bytes": 262144,
+          "name": "C0_PROBE_HEAP",
+          "section": ".bss"
+        },
+        "read_only_bytes": 49012,
+        "sections": [
+          {
+            "bytes": 9412,
+            "category": "read-only",
+            "flags": [
+              "SHF_ALLOC",
+              "SHF_MERGE",
+              "SHF_STRINGS"
+            ],
+            "index": 1,
+            "name": ".rodata",
+            "type": "SHT_PROGBITS"
+          },
+          {
+            "bytes": 39600,
+            "category": "read-only",
+            "flags": [
+              "SHF_ALLOC"
+            ],
+            "index": 2,
+            "name": ".eh_frame",
+            "type": "SHT_PROGBITS"
+          },
+          {
+            "bytes": 190992,
+            "category": "executable",
+            "flags": [
+              "SHF_ALLOC",
+              "SHF_EXECINSTR"
+            ],
+            "index": 3,
+            "name": ".text",
+            "type": "SHT_PROGBITS"
+          },
+          {
+            "bytes": 262160,
+            "category": "zero-fill",
+            "flags": [
+              "SHF_ALLOC",
+              "SHF_WRITE"
+            ],
+            "index": 4,
+            "name": ".bss",
+            "type": "SHT_NOBITS"
+          }
+        ],
+        "static_ram_bytes_excluding_probe_heap": 16,
+        "subject": "dlr-wasm-interpreter=0.2.0",
+        "writable_file_bytes": 0,
+        "zero_fill_bytes": 262160
+      },
+      {
+        "artifact": "target/riscv64imac-unknown-none-elf/release/c0_static_frontend",
+        "code_static_bytes": 644858,
+        "executable_bytes": 464530,
+        "incremental_code_static_bytes_over_control": 644422,
+        "measurement": "riscv64-linked-probe",
+        "probe_heap_symbol": {
+          "bytes": 262144,
+          "name": "C0_PROBE_HEAP",
+          "section": ".bss"
+        },
+        "read_only_bytes": 180328,
+        "sections": [
+          {
+            "bytes": 96632,
+            "category": "read-only",
+            "flags": [
+              "SHF_ALLOC",
+              "SHF_MERGE",
+              "SHF_STRINGS"
+            ],
+            "index": 1,
+            "name": ".rodata",
+            "type": "SHT_PROGBITS"
+          },
+          {
+            "bytes": 83696,
+            "category": "read-only",
+            "flags": [
+              "SHF_ALLOC"
+            ],
+            "index": 2,
+            "name": ".eh_frame",
+            "type": "SHT_PROGBITS"
+          },
+          {
+            "bytes": 464530,
+            "category": "executable",
+            "flags": [
+              "SHF_ALLOC",
+              "SHF_EXECINSTR"
+            ],
+            "index": 3,
+            "name": ".text",
+            "type": "SHT_PROGBITS"
+          },
+          {
+            "bytes": 262248,
+            "category": "zero-fill",
+            "flags": [
+              "SHF_ALLOC",
+              "SHF_WRITE"
+            ],
+            "index": 4,
+            "name": ".bss",
+            "type": "SHT_NOBITS"
+          }
+        ],
+        "static_ram_bytes_excluding_probe_heap": 104,
+        "subject": "component-frontend=0.255.0",
+        "writable_file_bytes": 0,
+        "zero_fill_bytes": 262248
+      }
+    ],
+    "probe_heap_bytes": 262144,
+    "profile": "workspace release (opt-level=z,lto=true,debug=true); debug sections excluded by SHF_ALLOC classification",
+    "triple": "riscv64imac-unknown-none-elf"
+  },
+  "threshold_policy": "none; this records measurements before any budget is selected",
+  "toolchain": {
+    "cargo_sha256": "0708e47bfb74142d930fc57546e26b99772d3491759f3bada32c8c070ad1c8f3",
+    "cargo_version": "cargo 1.99.0-nightly (7c83d4cc0 2026-07-29)\nrelease: 1.99.0-nightly\ncommit-hash: 7c83d4cc0953b81d823e47d640c64da9b8bd4fac\ncommit-date: 2026-07-29\nhost: aarch64-apple-darwin\nlibgit2: 1.9.6 (sys:0.21.0 vendored)\nlibcurl: 8.7.1 (sys:0.4.90+curl-8.21.0 system ssl:(SecureTransport) LibreSSL/3.3.6)\nssl: OpenSSL 3.6.3 9 Jun 2026\nos: Mac OS 26.5.2 [64-bit]",
+    "channel": "nightly-2026-08-01",
+    "llvm_readobj_sha256": "5c388043b0ce7698cbce64e9ca94c2d397bad0018b7a104c4da5a0b8348053a4",
+    "llvm_readobj_version": "LLVM (http://llvm.org/):\n  LLVM version 22.1.8-rust-1.99.0-nightly\n  Optimized build.",
+    "rustc_commit": "ad3d0bc141a02cf446e384136d250a1f6950fed5",
+    "rustc_sha256": "fa817099946eee0d4a4ed1d6593b05596f34f92181363e467c6253e84ce431af",
+    "rustc_verbose": "rustc 1.99.0-nightly (ad3d0bc14 2026-07-31)\nbinary: rustc\ncommit-hash: ad3d0bc141a02cf446e384136d250a1f6950fed5\ncommit-date: 2026-07-31\nhost: aarch64-apple-darwin\nrelease: 1.99.0-nightly\nLLVM version: 22.1.8",
+    "rustdoc_sha256": "31483e89389e87370faf2d09fbfaa9127cae0156212056ce836c0d102a09a785"
+  },
+  "update_policy": "explicit --update only; ordinary tests and verification never rewrite this file",
+  "version": 1,
+  "workload_manifest_sha256": "297564a485b2fd8f123001dc3739a5a5a3948e6a6c3ba59c8a27b427b9a7fdf1"
+}

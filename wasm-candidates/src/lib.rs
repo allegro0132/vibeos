@@ -9,11 +9,20 @@
 extern crate alloc;
 
 use vibeos_component_format::{
-    ASYNC_CANONICAL_ABI_REVISION, ASYNC_COMPONENT_MODEL_REVISION, ASYNC_WASM_TOOLS_REVISION,
-    CANONICAL_ABI_REVISION, PROFILE_1_LIMITS, WASI_API_REVISION,
+    current_validation_engine_identity, ProfileIdentity, WasmiCompilationMode, WasmiEnforcedLimits,
+    WasmiFuelCosts, ASYNC_CANONICAL_ABI_REVISION, ASYNC_COMPONENT_MODEL_REVISION,
+    ASYNC_WASM_TOOLS_REVISION, CANONICAL_ABI_REVISION, PROFILE_1_LIMITS, WASI_API_REVISION,
 };
+use wasmi::{CompilationMode, Config, EnforcedLimits, Engine};
 use wasmparser::{Encoding, Parser, Payload, Validator, WasmFeatures};
 use wit_parser::Resolve;
+
+/// Constants generated from the reviewed C0.7 workload manifest. Keeping the
+/// probes and host collector on this single source prevents silent workload
+/// drift between measured code and checked-in evidence.
+pub mod baseline_contract {
+    include!(concat!(env!("OUT_DIR"), "/c0_contract.rs"));
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Candidate {
@@ -121,6 +130,47 @@ pub enum FloatDecision {
 }
 
 pub const FLOAT_DECISION: FloatDecision = FloatDecision::IntegerOnly;
+
+/// Builds the exact Wasmi configuration frozen by the current Profile-1
+/// validation/runtime identity. C0 probes use this instead of a nearby but
+/// weaker benchmark-only configuration.
+pub fn configured_wasmi_engine() -> Engine {
+    let identity = current_validation_engine_identity(ProfileIdentity::PROFILE_1_SYNC)
+        .expect("the compiled Profile-1 identity must exist");
+    let runtime = identity.runtime();
+    let mut config = Config::default();
+    config
+        .floats(runtime.floats())
+        .wasm_mutable_global(runtime.mutable_global())
+        .wasm_sign_extension(runtime.sign_extension())
+        .wasm_saturating_float_to_int(runtime.saturating_float_to_int())
+        .wasm_multi_value(runtime.multi_value())
+        .wasm_multi_memory(runtime.multi_memory())
+        .wasm_bulk_memory(runtime.bulk_memory())
+        .wasm_reference_types(runtime.reference_types())
+        .wasm_tail_call(runtime.tail_call())
+        .wasm_extended_const(runtime.extended_const())
+        .wasm_custom_page_sizes(runtime.custom_page_sizes())
+        .wasm_memory64(runtime.memory64())
+        .wasm_wide_arithmetic(runtime.wide_arithmetic())
+        .consume_fuel(runtime.consume_fuel())
+        .ignore_custom_sections(runtime.ignore_custom_sections())
+        .compilation_mode(match runtime.compilation_mode() {
+            WasmiCompilationMode::Eager => CompilationMode::Eager,
+        })
+        .set_max_recursion_depth(runtime.max_recursion_depth())
+        .set_min_stack_height(runtime.min_stack_height())
+        .set_max_stack_height(runtime.max_stack_height())
+        .set_max_cached_stacks(runtime.max_cached_stacks())
+        .enforced_limits(match runtime.enforced_limits() {
+            WasmiEnforcedLimits::Strict => EnforcedLimits::strict(),
+        });
+    assert!(!runtime.simd_compiled() && !runtime.relaxed_simd_compiled());
+    match runtime.fuel_costs() {
+        WasmiFuelCosts::Wasmi110Default => {}
+    }
+    Engine::new(&config)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrontendError {

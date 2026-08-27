@@ -6,6 +6,8 @@ Four layers, cheapest first. Run them all before pushing.
 cargo test --workspace --exclude vibeos-sshd # VibeOS portable tests, no QEMU
 cargo test --manifest-path vendor/sunset/Cargo.toml -p sunset \
   --no-default-features --features alloc # audited Sunset fork tests
+cargo test --locked --offline -p vibeos-wasm-runtime \
+  --test decode_limits -- --test-threads=1 # C1.2 no attacker-scaled decode allocation
 cargo test --locked --offline -p vibeos-wasm-runtime --test core_spec # C1.6 pinned official integer semantics
 cargo test --locked --offline -p vibeos-wasm-runtime --test core_robustness # C1.7 deterministic bounded corpus
 cargo test --locked --offline -p vibeos-component-runtime \
@@ -77,6 +79,36 @@ cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
 ```
+
+`wasm-runtime/tests/decode_limits.rs` is the C1.2 Core decode-account gate. It
+builds raw modules locally at every applicable enabled Profile-1 ceiling and at
+the adjacent limit-plus-one mutation. The hostile matrix covers raw and
+declared lengths, bounded and imported-plus-defined counts, compact-import
+expansion, materialization-capable disabled type/operator vectors, signature
+arities, compressed locals, structured-control depth, table and memory maxima,
+data lengths/segments, element segments/items, and aggregate encoded custom
+names plus data. Enabled exact ceilings must be admitted; fields modeled by
+`CoreSummary` must also report the exact count. Disabled multi-value remains
+rejected even when its numeric result arity is within the configured ceiling.
+
+The test installs a thread-local-enabled wrapper around the host `System`
+allocator. Inputs are constructed outside the measured interval. Inside it,
+the test records allocation-call count, cumulative requested bytes, and largest
+single request for the current test thread; these are request-envelope metrics,
+not live/high-water memory or kernel-owner attribution. Every hostile rejection
+runs through both `inspect_core` and `ValidatedCore::new_in` with one prebuilt
+engine and a zero compile reservation. The stable error and request envelope
+must match, proving that the production entrypoint does not reach Wasmi
+compilation. Both absolute small bounds and shallow-versus-materialization-size
+comparisons prevent a hostile declaration from amplifying predecode allocation.
+
+`CoreSummary` plus the checked counters is the Core decoder's structural
+account. Type, table, global, data and MVP element framing is predecoded before
+attacker-sized vectors can be materialized, and function control frames use a
+fixed Profile-1 stack. This host gate does not measure Component decoding,
+successful Wasmi compilation, instantiation, growth, call-depth enforcement,
+kernel allocator ownership, QEMU or Duo allocation, or exhaustive fuzzing;
+those have separate gates or later roadmap nodes.
 
 The C1.6 specification gate is deliberately offline and byte-pinned. It vendors
 the complete official [`test/core/fac.wast`](https://github.com/WebAssembly/spec/blob/977f97014c962f7bd1291fcc6d28b41a924882bf/test/core/fac.wast)

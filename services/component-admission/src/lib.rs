@@ -1719,11 +1719,12 @@ fn native_async_memory_provider_matches(bytes: &[u8]) -> bool {
         && summary.tables == 0
         && summary.data_segments == 0
         && summary.element_segments == 0
+        && summary.element_items == 0
         // The version-pinned WAT encoder emits one name section for the
         // provider's symbolic module/memory labels. No other custom payload
         // is admitted by this exact artifact topology.
         && summary.custom_sections == 1
-        && summary.custom_section_bytes == 18
+        && summary.custom_section_bytes == 23
         && summary.max_control_depth == 0
 }
 

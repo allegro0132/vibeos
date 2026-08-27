@@ -220,6 +220,7 @@ fn assert_summary_within_profile(summary: CoreSummary, byte_len: usize) {
     assert!(summary.tables <= PROFILE_1_LIMITS.max_tables);
     assert!(summary.data_segments <= PROFILE_1_LIMITS.max_data_segments);
     assert!(summary.element_segments <= PROFILE_1_LIMITS.max_element_segments);
+    assert!(summary.element_items <= PROFILE_1_LIMITS.max_table_elements);
     assert!(summary.custom_sections <= PROFILE_1_LIMITS.max_custom_sections);
     assert!(summary.custom_section_bytes as usize <= PROFILE_1_LIMITS.max_custom_section_bytes);
     assert!(summary.max_control_depth <= PROFILE_1_LIMITS.max_core_nesting);

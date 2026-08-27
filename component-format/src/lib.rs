@@ -533,6 +533,8 @@ pub struct ProfileLimits {
     pub max_data_segments: u32,
     pub max_element_segments: u32,
     pub max_custom_sections: u32,
+    /// Aggregate encoded custom-section payload bytes, including each name's
+    /// length prefix, name, and data.
     pub max_custom_section_bytes: usize,
     pub max_embedded_modules: u32,
     pub max_component_instances: u32,

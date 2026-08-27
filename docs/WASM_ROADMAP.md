@@ -385,6 +385,37 @@ without recollecting timings.
 | C1.6 | Add differential and specification evidence | The complete pinned `wg-1.0` `fac.wast` baseline agrees across its official assertions, Vibe, and DLR; profile rejections remain separately asserted |
 | C1.7 | Fuzz decode, validate, instantiate and execute | The pinned local corpus remains panic-free, respects configured allocation/execution bounds, reaches every stage, and produces stable terminals |
 
+**C1.2 bounded decode account (2026-08-28):**
+`wasm-runtime/tests/decode_limits.rs` constructs raw Core modules locally and
+pins both sides of every applicable enabled Profile-1 ceiling: raw/declared
+lengths, bounded and imported-plus-defined counts, compact-import expansion,
+materialization-capable disabled recursive-type and operator vectors, parameter
+and result arities, compressed locals, structured-control nesting, table/memory
+declarations, data lengths/segments, element segments/items, and aggregate
+encoded custom names plus data. Enabled exact ceilings are admitted; fields
+modeled by `CoreSummary`, the Core decoder's structural account, also report the
+exact count. Limit-plus-one cases return their stable `AdmissionError`, while
+the numeric result ceiling does not enable disabled multi-value.
+
+Inputs are built outside the measured interval. A host `System`-allocator
+wrapper then records, for the current test thread, allocation calls, cumulative
+requested bytes and the largest individual request around both `inspect_core`
+and the production `ValidatedCore::new_in` entrypoint. These are request-envelope
+metrics, not live/high-water memory or kernel-owner attribution. Rejected inputs
+must produce identical errors and envelopes through both paths, proving that
+the zero-reservation entrypoint does not reach Wasmi compilation. Absolute small
+bounds plus shallow-versus-materialization-size comparisons prevent hostile
+declarations from amplifying predecode allocation.
+
+Type, table, global, data and MVP element framing is predecoded before
+attacker-sized vectors can be materialized, and function control nesting uses a
+fixed 129-frame stack. Core raw bytes bound data payload storage; segment and
+element-item counters provide independent structural ceilings. This closes
+C1.2 for the frozen Core Profile-1 grammar. Component decoding, successful Wasmi
+compilation, instantiation, growth/call-depth enforcement, kernel allocator
+ownership, QEMU/Duo allocation and exhaustive fuzzing remain separate evidence
+boundaries or later roadmap nodes.
+
 **C1.6 selected baseline (2026-08-27):** the offline fixture is the complete
 official [`test/core/fac.wast`](https://github.com/WebAssembly/spec/blob/977f97014c962f7bd1291fcc6d28b41a924882bf/test/core/fac.wast)
 from WebAssembly/spec `wg-1.0` commit

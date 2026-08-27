@@ -691,6 +691,12 @@ pub enum TrapCode {
 }
 
 impl TrapCode {
+    /// Returns the stable 16-bit diagnostic projection for Component ABI and
+    /// supervisor boundaries.
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+
     pub const fn name(self) -> &'static str {
         match self {
             Self::Validation => "validation",

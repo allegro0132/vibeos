@@ -508,6 +508,46 @@ Canonical ABI charging remains C2.6, and executor self-wake, target latency,
 exhaustive opcode fuel coverage, and physical-Duo execution are not claimed by
 this host gate.
 
+**C1.5 stable Core trap diagnostics (2026-08-28):**
+`component-format/tests/profile.rs` freezes the numeric value and exact
+kebab-case name of all fourteen `TrapCode` variants. The public `code()` method
+defines the stable 16-bit diagnostic projection for Component ABI and
+supervisor boundaries. `wasm-runtime/tests/trap_diagnostics.rs` separately classifies the
+twelve Core-facing codes, excluding the later `CanonicalAbi` and
+`ResourceMisuse` categories, and pins every Wasmi 1.1 Core trap variant through
+the production typed mapping. It also fixes the complete Wasmi memory and table
+error families, whether direct or wrapped by instantiation. Null indirect
+targets and numeric table bounds both intentionally become
+`TableOutOfBounds`; wrong target signatures remain
+`IndirectCallTypeMismatch`. The disabled-profile float-to-integer conversion
+trap maps fail-closed to `Validation` but is not guest-reachable in Profile 1.
+
+The production fixtures cover adjacent successful and failing signed division,
+conditional `unreachable`, the first invalid four-byte memory load, and the
+valid, null, wrong-signature, and first-out-of-range indirect-call cases. They
+also pin 128 active frames versus the rejected 129th, plus short-fuel
+exhaustion. Each execution trap repeats with the same identity, removes its
+terminal continuation, and leaves the instance reusable. Missing exports,
+wrong arity, and wrong scalar input types return exact `Validation` before
+installing active state; C1.5 fixed the single-instance start path to enforce
+the parameter type as well as its count.
+
+The admission matrix repeats exact malformed `Validation`, disabled-feature
+`UnsupportedFeature`, and module-size `LimitExceeded` results through both the
+bounded inspector and compiler. Active data placement at the first byte beyond
+memory maps to `MemoryOutOfBounds`; active element placement at the first slot
+beyond a table maps Wasmi's typed instantiation error to `TableOutOfBounds`.
+Both standalone and Component-group paths repeat those results, and adjacent
+placements instantiate successfully. A Component-group policy one byte below
+the module's initial memory maps to `LimitExceeded` instead of generic
+validation. No diagnostic relies on Wasmi display or debug text.
+
+This closes the stable diagnostics named by C1.5 for the portable Profile-1
+Core boundary. The gate is not full Core conformance, differential or fuzz
+coverage, a Canonical ABI/resource taxonomy result, a timing guarantee, or a
+QEMU/physical-Duo execution claim; those remain C1.6, C1.7, C2+, and target
+integration work.
+
 **C1.6 selected baseline (2026-08-27):** the offline fixture is the complete
 official [`test/core/fac.wast`](https://github.com/WebAssembly/spec/blob/977f97014c962f7bd1291fcc6d28b41a924882bf/test/core/fac.wast)
 from WebAssembly/spec `wg-1.0` commit

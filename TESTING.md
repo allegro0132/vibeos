@@ -12,6 +12,8 @@ cargo test --locked --offline -p vibeos-wasm-runtime \
   --test effective_maxima -- --test-threads=1 # C1.3 adjacent execution/allocation maxima
 cargo test --locked --offline -p vibeos-wasm-runtime \
   --test fuel_quantum -- --test-threads=1 # C1.4 total fuel/resumable quantum
+cargo test --locked --offline -p vibeos-wasm-runtime \
+  --test trap_diagnostics -- --test-threads=1 # C1.5 stable Core trap diagnostics
 cargo test --locked --offline -p vibeos-wasm-runtime --test core_spec # C1.6 pinned official integer semantics
 cargo test --locked --offline -p vibeos-wasm-runtime --test core_robustness # C1.7 deterministic bounded corpus
 cargo test --locked --offline -p vibeos-component-runtime \
@@ -191,6 +193,44 @@ Automatic charging of host, adapter, and Canonical ABI work remains C2.6;
 component-executor wake behavior and target latency require their own
 integration evidence. The gate does not claim exhaustive opcode fuel coverage,
 a QEMU timing bound, or physical-Duo execution.
+
+`wasm-runtime/tests/trap_diagnostics.rs` is the portable C1.5 stable Core-trap
+gate. Together with the exact full-enum table in
+`component-format/tests/profile.rs`, it freezes every `TrapCode` numeric value
+and kebab-case name and classifies the twelve Core-facing codes separately from
+the later Canonical ABI and resource codes. It also directly pins all eleven
+Wasmi 1.1 Core trap variants, the complete typed memory and table error
+families including their instantiation wrappers, and selected typed
+instantiation limits and segment bounds. An indirect call through a null entry
+and a numeric table-index overflow intentionally share
+`TableOutOfBounds`; a present target with the wrong signature remains the
+distinct `IndirectCallTypeMismatch`. Wasmi's float-to-integer conversion trap
+maps fail-closed to `Validation`, but admitted Profile-1 modules cannot produce
+it because floating-point types and operators are disabled.
+
+Production execution fixtures cover signed division by zero and overflow,
+conditional `unreachable`, the first invalid four-byte load, valid/null/wrong-
+signature/first-out-of-range indirect calls, the exact 128/129 active-frame
+boundary, and short-fuel exhaustion. Every execution trap is delivered twice,
+clears active state, preserves its exact code and name, and is followed by a
+safe call on the same instance. Runtime API validation separately fixes missing
+exports, wrong arity, and wrong scalar argument type; a rejected start is
+failure-atomic and the instance remains callable.
+
+Admission fixtures distinguish malformed `Validation`, disabled-feature
+`UnsupportedFeature`, and module-size `LimitExceeded` through both structural
+inspection and the production compiler. Instantiation additionally fixes an
+active data segment's first invalid byte as `MemoryOutOfBounds` and an active
+element segment's first invalid table slot as `TableOutOfBounds`, with adjacent
+valid placements through both standalone and Component-group instantiation. A
+group policy one byte below a module's initial memory maps to `LimitExceeded`,
+not generic validation. These mappings inspect Wasmi's typed errors, not its
+display or debug strings.
+
+This gate freezes the selected Profile-1 Core diagnostic contract. It is not a
+full Core specification or opcode suite, differential-runtime evidence, a fuzz
+campaign, a Canonical ABI/resource diagnostic claim, a wall-clock bound, or a
+physical-Duo result; those belong to C1.6, C1.7, C2+, and target integration.
 
 The C1.6 specification gate is deliberately offline and byte-pinned. It vendors
 the complete official [`test/core/fac.wast`](https://github.com/WebAssembly/spec/blob/977f97014c962f7bd1291fcc6d28b41a924882bf/test/core/fac.wast)

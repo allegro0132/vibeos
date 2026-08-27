@@ -21,7 +21,7 @@ use vibeos_component_format::{
     WasmiEnforcedLimits, WasmiFuelCosts, PROFILE_1_LIMITS,
 };
 use wasmi::{
-    errors::{HostError, TableError},
+    errors::{ErrorKind, HostError, InstantiationError, MemoryError, TableError},
     CompilationMode, Config, EnforcedLimits, Engine, Error as WasmiError, ExternType, Func,
     FuncType, Instance, Linker, Memory, Module, ResumableCall, ResumableCallHostTrap,
     ResumableCallOutOfFuel, Store, StoreLimits, StoreLimitsBuilder, Table, Val, ValType,
@@ -1675,11 +1675,7 @@ impl CoreInstance {
             .get_func(&self.store, export)
             .ok_or(TrapCode::Validation)?;
         let ty = function.ty(&self.store);
-        if ty.params().len() != inputs.len()
-            || ty
-                .params()
-                .iter()
-                .any(|ty| !matches!(ty, wasmi::ValType::I32 | wasmi::ValType::I64))
+        if !core_values_match(inputs, ty.params())
             || ty
                 .results()
                 .iter()
@@ -1971,7 +1967,7 @@ impl CoreInstance {
             .ok_or(TrapCode::LimitExceeded)?;
         table
             .grow(&mut self.store, additional, Val::default(ValType::FuncRef))
-            .map_err(map_table_growth_error)?;
+            .map_err(map_table_error)?;
         Ok(())
     }
 
@@ -3799,20 +3795,65 @@ impl Drop for Invocation<'_> {
     }
 }
 
-fn map_table_growth_error(error: TableError) -> TrapCode {
+fn map_memory_error(error: MemoryError) -> TrapCode {
+    match error {
+        MemoryError::OutOfSystemMemory
+        | MemoryError::ResourceLimiterDeniedAllocation
+        | MemoryError::MinimumSizeOverflow
+        | MemoryError::MaximumSizeOverflow => TrapCode::LimitExceeded,
+        MemoryError::OutOfBoundsGrowth | MemoryError::OutOfBoundsAccess => {
+            TrapCode::MemoryOutOfBounds
+        }
+        MemoryError::OutOfFuel { .. } => TrapCode::FuelExhausted,
+        MemoryError::InvalidMemoryType | MemoryError::InvalidStaticBufferSize => {
+            TrapCode::Validation
+        }
+    }
+}
+
+fn map_table_error(error: TableError) -> TrapCode {
     match error {
         TableError::OutOfSystemMemory
         | TableError::MinimumSizeOverflow
         | TableError::MaximumSizeOverflow
         | TableError::ResourceLimiterDeniedAllocation => TrapCode::LimitExceeded,
-        TableError::GrowOutOfBounds => TrapCode::TableOutOfBounds,
+        TableError::GrowOutOfBounds
+        | TableError::InitOutOfBounds
+        | TableError::FillOutOfBounds
+        | TableError::SetOutOfBounds
+        | TableError::CopyOutOfBounds => TrapCode::TableOutOfBounds,
+        TableError::ElementTypeMismatch => TrapCode::IndirectCallTypeMismatch,
         TableError::OutOfFuel { .. } => TrapCode::FuelExhausted,
         _ => TrapCode::Validation,
     }
 }
 
+fn map_instantiation_error(error: &InstantiationError) -> TrapCode {
+    match error {
+        InstantiationError::InvalidNumberOfImports { .. }
+        | InstantiationError::ImportsExternalsMismatch { .. }
+        | InstantiationError::GlobalTypeMismatch { .. }
+        | InstantiationError::FuncTypeMismatch { .. }
+        | InstantiationError::TableTypeMismatch { .. }
+        | InstantiationError::MemoryTypeMismatch { .. }
+        | InstantiationError::UnexpectedStartFn { .. } => TrapCode::Validation,
+        InstantiationError::ElementSegmentDoesNotFit { .. } => TrapCode::TableOutOfBounds,
+        InstantiationError::TooManyInstances
+        | InstantiationError::TooManyTables
+        | InstantiationError::TooManyMemories => TrapCode::LimitExceeded,
+        InstantiationError::FailedToInstantiateMemory(error) => map_memory_error(*error),
+        InstantiationError::FailedToInstantiateTable(error) => map_table_error(*error),
+    }
+}
+
 pub fn map_wasmi_error(error: &WasmiError) -> TrapCode {
     use wasmi::TrapCode as W;
+    match error.kind() {
+        ErrorKind::Instantiation(error) => return map_instantiation_error(error),
+        ErrorKind::Memory(error) => return map_memory_error(*error),
+        ErrorKind::Table(error) => return map_table_error(*error),
+        _ => {}
+    }
     match error.kind().as_trap_code() {
         Some(W::UnreachableCodeReached) => TrapCode::Unreachable,
         Some(W::IntegerDivisionByZero) => TrapCode::IntegerDivisionByZero,

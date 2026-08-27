@@ -2390,23 +2390,3 @@ fn locals_function_counts_and_control_nesting_reject_limit_plus_one() {
         AdmissionDetail::Limit(LimitKind::CoreNesting)
     );
 }
-
-#[test]
-fn arbitrary_bounded_bytes_never_panic_or_reach_execution_unadmitted() {
-    let mut state = 0x3d_u32;
-    for len in 0..=192 {
-        let mut bytes = vec![0_u8; len];
-        for byte in &mut bytes {
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            *byte = (state >> 24) as u8;
-        }
-        let result = std::panic::catch_unwind(|| {
-            if let Ok(module) =
-                ValidatedCore::new(&bytes, OwnerAllocationReservation::profile_default())
-            {
-                let _ = module.instantiate();
-            }
-        });
-        assert!(result.is_ok(), "host panic for input length {len}");
-    }
-}

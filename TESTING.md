@@ -12,6 +12,12 @@ cargo test --locked --offline -p vibeos-component-runtime \
   --test canonical_language_fixtures # C2.3 Rust/C rich-value round-trip
 C2_WASI_SDK_PATH=/path/to/wasi-sdk-33.0-arm64-macos \
   ./scripts/rebuild-c2-language-fixtures.sh # C2.3 exact source/Core gate
+cargo test --locked --offline -p vibeos-component-runtime \
+  --test c27_component_reference # C2.7 pinned Component reference differential
+cargo test --locked --offline -p vibeos-component-runtime \
+  --test c27_component_bytes # C2.7 bounded Component-byte corpus
+cargo test --locked --offline -p vibeos-component-runtime \
+  --test c27_canonical_values # C2.7 bounded Canonical-value corpus
 cargo check -p vibeos-sshd --features qemu-virt
 cargo check -p vibeos-sshd --features milkv-ssh-acceptance
 cargo test -p vibeos-driver-dwc2-host -p vibeos-bsp-milkv-duo
@@ -146,6 +152,49 @@ sanitizer to remove only each linker's private, unreferenced mutable stack
 global before requiring byte-identical Profile-1 fixtures. This closes C2.3
 for the selected Rust/C language evidence; it neither claims every compiler
 nor supplies the separate C2.7 differential/fuzz evidence.
+
+The three C2.7 gates keep reference execution, Component bytes, and Canonical
+values as separate evidence. `c27_component_reference.rs` first requires Vibe
+Profile-1 admission, zero imports, and the exact C2.3 WIT world, then executes
+the byte-pinned Rust and C Components through both Vibe and Wasmtime 48.0.0.
+An empty Wasmtime linker supplies no ambient host authority. Each engine runs
+the same four cases for both fixtures; all 16 engine/case executions are
+compared with a neutral named representation as well as with each other. The
+test also retains the C2.3 pins of 276 aggregate dynamic bytes and corpus FNV
+`0x5a3e5d03338a9be3`, gives each reference call finite fuel, and proves that
+fuel was consumed without exhaustion. Wasmtime is an exact dev dependency with
+default features disabled and is used only by host tests; it is neither linked
+into the VibeOS target nor used as an admission oracle. Its release commit,
+crates.io digest, direct features, license, and Rust-version declaration are
+recorded in the adjacent
+[`PROVENANCE.md`](component-runtime/tests/reference/PROVENANCE.md).
+
+`c27_component_bytes.rs` uses seed `0x243f6a8885a308d3` and pins 4,323 inputs,
+4,604,005 aggregate bytes, maximum length 1,048,577, and corpus FNV
+`0x9edc2bd8460d97a4`. The cases comprise 512 arbitrary byte strings, 512 exact
+Component-header-prefixed strings, two admitted fixture originals, all 1,648
+proper-prefix truncations of those fixtures, one deterministic single-bit
+mutation at each of their 1,648 byte positions, and one limit-plus-one input.
+Every inspection is panic-contained. The gate pins all public decoder outcomes:
+863 accepted, 520 non-Components, 2,528 malformed, 134 unsupported, 10 limit
+failures, 267 invalid embedded Core modules, and one invalid wiring result,
+with zero allocation, duplicate-name, type-graph, or callback-signature
+failures for this exact corpus.
+
+`c27_canonical_values.rs` independently uses the same numeric seed for 512
+valid generated values spanning all 19 non-resource value families. Every
+case validates its generated type and value, lowers to bounded memory32, lifts
+it back under alternating parameter/result rules, and requires the exact value,
+usage accounting, allocation count, and encoded-memory digest inside a panic
+boundary. The pins are 799 type nodes, 772 value nodes, 1,026 dynamic bytes,
+88 list elements, 65 lower allocations, type/value depth 6/5, and corpus FNV
+`0xbf10e036e7750d0b`. A separate mutation pass requires exactly 512
+`TypeMismatch` results with digest `0x4cc0bcd2afdc82bc`; 32 named invalid
+type/value/memory cases pin digest `0x974017feed8c1e42` and the exact bool,
+character, UTF-8, bounds, alignment, limit, flags, discriminant, shape, and
+nesting errors. This is deterministic bounded CI fuzz evidence, not exhaustive
+coverage-guided fuzzing. Resource, stream, and future handles remain outside
+this corpus and resource/Canonical-ABI state fuzzing remains C3.6.
 
 The C8.2 gate is intentionally pinned to the reviewed
 `aarch64-apple-darwin` Rust distribution and wasi-sdk 33 macOS arm64 release.

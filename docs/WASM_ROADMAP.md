@@ -456,6 +456,31 @@ provenance and the offline reproduction command are documented in
 This closes the selected C2.3 cross-language acceptance evidence without
 claiming C2.7 reference-runtime agreement or fuzz coverage.
 
+**Selected C2.7 evidence (2026-08-27):** the same byte-pinned Rust and C
+Components are now admitted by Vibe against Profile 1 and the exact WIT world,
+then executed through both Vibe and pinned Wasmtime 48.0.0 with an empty linker
+and finite fuel. Both engines run all four C2.3 cases for both fixtures and
+agree with each other and with a neutral named representation, while retaining
+the 276-dynamic-byte and `0x5a3e5d03338a9be3` corpus pins. Wasmtime is a
+host-test-only, default-feature-disabled dev dependency whose release commit,
+crates.io package digest, features, license, and Rust version are recorded in
+`component-runtime/tests/reference/PROVENANCE.md`; it is not a Profile-1
+admission oracle and is not linked into the target.
+
+Component bytes and Canonical values have separate deterministic bounded
+corpora. The byte gate fixes seed `0x243f6a8885a308d3`, 4,323 inputs,
+4,604,005 aggregate bytes, all proper-prefix truncations and one-bit-per-byte
+mutations of two admitted fixtures, a 1,048,577-byte limit-plus-one case, exact
+decoder classifications, and digest `0x9edc2bd8460d97a4`; every decode is
+panic-contained. The value gate fixes 512 valid cases across all 19
+non-resource families, 799 type nodes, 772 value nodes, 1,026 dynamic bytes,
+88 list elements, 65 allocations, depth 6/5, and digest
+`0xbf10e036e7750d0b`. It independently requires exact memory32 lower/lift
+round-trips and accounting, 512 stable type-mismatch mutations, and 32 named
+invalid type/value/memory rejections. These gates close the selected C2.7
+differential and separate-fuzz acceptance evidence without claiming exhaustive
+coverage-guided fuzzing; resource/Canonical-ABI state fuzzing remains C3.6.
+
 **Demo:** a host-only component accepts a record containing strings and lists,
 uses an inert borrowed resource, and returns a typed variant with exact output
 matching the reference runtime.

@@ -1721,7 +1721,8 @@ impl CoreInstance {
         Ok(())
     }
 
-    /// Polls the active call for at most its configured quantum.
+    /// Polls the active call with at most its configured quantum of newly
+    /// granted interpreter fuel.
     ///
     /// A terminal result removes the call and its continuation before this
     /// method returns. A subsequent call can then be started immediately.
@@ -3538,14 +3539,12 @@ impl ActiveCall {
         let call = if let Some(continuation) = self.continuation.take() {
             match continuation {
                 ActiveContinuation::OutOfFuel(continuation) => {
-                    if continuation.required_fuel() > grant {
-                        return ActivePollResult::Trapped(
-                            if continuation.required_fuel() > self.remaining_fuel {
-                                TrapCode::FuelExhausted
-                            } else {
-                                TrapCode::LimitExceeded
-                            },
-                        );
+                    if let Some(trap) = out_of_fuel_terminal(
+                        continuation.required_fuel(),
+                        self.remaining_fuel,
+                        self.poll_quantum,
+                    ) {
+                        return ActivePollResult::Trapped(trap);
                     }
                     continuation.resume(&mut *store, &mut self.outputs)
                 }
@@ -3592,16 +3591,17 @@ impl ActiveCall {
                 ActivePollResult::Ready
             }
             Ok(ResumableCall::OutOfFuel(continuation)) => {
-                if self.remaining_fuel == 0 {
-                    ActivePollResult::Trapped(TrapCode::FuelExhausted)
-                } else if continuation.required_fuel() > self.poll_quantum {
-                    ActivePollResult::Trapped(TrapCode::LimitExceeded)
-                } else {
-                    self.continuation = Some(ActiveContinuation::OutOfFuel(continuation));
-                    ActivePollResult::Pending {
-                        consumed_fuel: self.consumed_fuel,
-                        remaining_fuel: self.remaining_fuel,
-                    }
+                if let Some(trap) = out_of_fuel_terminal(
+                    continuation.required_fuel(),
+                    self.remaining_fuel,
+                    self.poll_quantum,
+                ) {
+                    return ActivePollResult::Trapped(trap);
+                }
+                self.continuation = Some(ActiveContinuation::OutOfFuel(continuation));
+                ActivePollResult::Pending {
+                    consumed_fuel: self.consumed_fuel,
+                    remaining_fuel: self.remaining_fuel,
                 }
             }
             Ok(ResumableCall::HostTrap(invocation)) => self.suspend_host(store, invocation),
@@ -3691,6 +3691,23 @@ impl ActiveCall {
     }
 }
 
+/// Classifies an interpreter metering unit that cannot execute with the
+/// current store balance. An insufficient remaining invocation-wide budget
+/// takes precedence over the narrower per-poll policy ceiling.
+fn out_of_fuel_terminal(
+    required_fuel: u64,
+    remaining_fuel: u64,
+    poll_quantum: u64,
+) -> Option<TrapCode> {
+    if required_fuel > remaining_fuel {
+        Some(TrapCode::FuelExhausted)
+    } else if required_fuel > poll_quantum {
+        Some(TrapCode::LimitExceeded)
+    } else {
+        None
+    }
+}
+
 fn core_values_match(values: &[CoreValue], expected: &[ValType]) -> bool {
     values.len() == expected.len()
         && values
@@ -3755,9 +3772,14 @@ impl Invocation<'_> {
         self.instance.resume_host_call(id, results)
     }
 
+    /// Advances this invocation once.
+    ///
+    /// A terminal result is delivered exactly once. Later polls are invalid
+    /// API use and return [`TrapCode::Validation`] without executing guest
+    /// code or changing the terminal fuel metrics.
     pub fn poll(&mut self) -> PollResult {
         if self.terminal {
-            return PollResult::Trapped(TrapCode::Cancelled);
+            return PollResult::Trapped(TrapCode::Validation);
         }
         let result = self.instance.poll_call();
         if let Some(metrics) = self.instance.call_metrics() {

@@ -6,6 +6,7 @@ Four layers, cheapest first. Run them all before pushing.
 cargo test --workspace --exclude vibeos-sshd # VibeOS portable tests, no QEMU
 cargo test --manifest-path vendor/sunset/Cargo.toml -p sunset \
   --no-default-features --features alloc # audited Sunset fork tests
+cargo test --locked --offline -p vibeos-wasm-runtime --test core_spec # C1.6 pinned official integer semantics
 cargo check -p vibeos-sshd --features qemu-virt
 cargo check -p vibeos-sshd --features milkv-ssh-acceptance
 cargo test -p vibeos-driver-dwc2-host -p vibeos-bsp-milkv-duo
@@ -58,6 +59,33 @@ cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
 ```
+
+The C1.6 specification gate is deliberately offline and byte-pinned. It vendors
+the complete official [`test/core/fac.wast`](https://github.com/WebAssembly/spec/blob/977f97014c962f7bd1291fcc6d28b41a924882bf/test/core/fac.wast)
+from the WebAssembly/spec `wg-1.0` commit
+`977f97014c962f7bd1291fcc6d28b41a924882bf` at
+`wasm-runtime/tests/spec/core-wg-1.0/fac.wast`: 2,602 bytes with SHA-256
+`7bf27b090f6533865acc79a37e0331b27fa11d7a3ab27b02e32e2efddfb405e7`.
+The adjacent `LICENSE` is also pinned at 11,358 bytes and SHA-256
+`c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08`;
+[`PROVENANCE.md`](wasm-runtime/tests/spec/core-wg-1.0/PROVENANCE.md) records the
+repository, tag, immutable commit, source path, download URL, sizes, and
+digests. The test performs no network fetch and fails if either vendored byte
+sequence changes.
+
+`wasm-runtime/tests/core_spec.rs` consumes the whole script, not selected
+hand-transcribed cases. It requires exactly one anonymous module, five
+`assert_return` directives, and one `assert_exhaustion`, and rejects every
+unknown directive. Each factorial return is compared three ways: the official
+WAST result, the Vibe Profile-1 runtime, and pinned
+`dlr-wasm-interpreter` 0.2.0. The exhaustion action must map to Vibe's stable
+`CallDepthExceeded` trap and DLR's `StackExhaustion`. This closes the selected
+Profile-1 integer baseline for indexed and named calls, recursion, locals,
+blocks, loops, branches, the fixture's non-negative factorial comparisons,
+and wrapping `i64` arithmetic
+under Vibe's configured bounds. It is not full WebAssembly Core 2.0
+conformance, does not enable any disabled Profile-1 feature, and does not close
+C1.7; decode/validate/instantiate/execute fuzzing remains open.
 
 The C8.2 gate is intentionally pinned to the reviewed
 `aarch64-apple-darwin` Rust distribution and wasi-sdk 33 macOS arm64 release.

@@ -8,6 +8,10 @@ cargo test --manifest-path vendor/sunset/Cargo.toml -p sunset \
   --no-default-features --features alloc # audited Sunset fork tests
 cargo test --locked --offline -p vibeos-wasm-runtime --test core_spec # C1.6 pinned official integer semantics
 cargo test --locked --offline -p vibeos-wasm-runtime --test core_robustness # C1.7 deterministic bounded corpus
+cargo test --locked --offline -p vibeos-component-runtime \
+  --test canonical_language_fixtures # C2.3 Rust/C rich-value round-trip
+C2_WASI_SDK_PATH=/path/to/wasi-sdk-33.0-arm64-macos \
+  ./scripts/rebuild-c2-language-fixtures.sh # C2.3 exact source/Core gate
 cargo check -p vibeos-sshd --features qemu-virt
 cargo check -p vibeos-sshd --features milkv-ssh-acceptance
 cargo test -p vibeos-driver-dwc2-host -p vibeos-bsp-milkv-duo
@@ -114,6 +118,34 @@ terminal result. This closes the selected deterministic C1.7 evidence for
 decode, validation, instantiation, and execution under configured bounds. It
 is a reproducible bounded CI corpus, not coverage-guided or exhaustive fuzzing,
 and does not claim enumeration of all byte sequences.
+
+`component-runtime/tests/canonical_language_fixtures.rs` is the C2.3
+cross-language execution gate. The same exact
+`vibe:fixture/canonical-language@1.0.0` WIT world is implemented by
+freestanding Rust and C guests compiled for `wasm32-wasip1`. Their import-free
+Core modules are checked into
+`component-runtime/tests/fixtures/language/`, inspected under Vibe Profile 1,
+and embedded in deterministic import-free Components. The test pins the Rust
+Core/Component at 557/950 bytes and SHA-256
+`79e1eb3f2043c4ae224da6057279f80f32ec171106ad2112e8f7d2bf62e96f52` /
+`1826aef365bbc0c1061bd8f23eaea5883ed052220f711243cd7c29c335975cfe`,
+and the C Core/Component at 1,030/1,423 bytes and SHA-256
+`20e26c154f2fc3d0892a2175dd85912ea2df77ff43e22200864eba7e6d3f7e8e` /
+`2ee8f6154c6069d46d726e922a1d07979982d022dd8c02e035dcd244a9248b78`.
+
+Both Components execute the same four-case typed corpus covering booleans,
+signed and wide integers, Unicode scalar values, UTF-8 strings, byte lists,
+flags, enums, options, results, records, tuples, and both variant arms. The
+corpus pins 276 aggregate dynamic bytes and FNV-1a64
+`0x5a3e5d03338a9be3`. Each call has 1,000,000 total work, a 10,000-work poll
+quantum, and a 101-poll hard bound; host suspension, host failure, traps,
+poisoning, or a retained continuation fail the test. The adjacent provenance
+records exact compiler binaries and digests. The offline rebuild gate first
+reproduces both compiler outputs, then uses a digest-allowlisted structural
+sanitizer to remove only each linker's private, unreferenced mutable stack
+global before requiring byte-identical Profile-1 fixtures. This closes C2.3
+for the selected Rust/C language evidence; it neither claims every compiler
+nor supplies the separate C2.7 differential/fuzz evidence.
 
 The C8.2 gate is intentionally pinned to the reviewed
 `aarch64-apple-darwin` Rust distribution and wasi-sdk 33 macOS arm64 release.

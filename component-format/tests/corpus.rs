@@ -4,6 +4,7 @@ const CLOCK: &str = include_str!("corpus/wit/clock.wit");
 const BLOB: &str = include_str!("corpus/wit/blob.wit");
 const LOG: &str = include_str!("corpus/wit/log.wit");
 const STREAM: &str = include_str!("corpus/wit/stream.wit");
+const CANONICAL_VALUES: &str = include_str!("corpus/wit/canonical-values.wit");
 const VALID_CORE: &str = include_str!("corpus/core/integer.wat");
 const LIMIT_CORE: &str = include_str!("corpus/core/limits.wat");
 const UNSUPPORTED_CORE: &str = include_str!("corpus/core/unsupported-float.wat");
@@ -86,6 +87,30 @@ fn corpus_covers_the_profile_contract() {
     ] {
         assert!(STREAM.contains(reason), "{reason}");
     }
+    for marker in [
+        "package vibe:fixture@1.0.0",
+        "interface canonical-values",
+        "flags attributes { urgent, audited, traced }",
+        "enum error-code { denied, invalid, exhausted }",
+        "record request",
+        "truth: bool",
+        "signed: s32",
+        "wide: u64",
+        "symbol: char",
+        "label: string",
+        "payload: list<u8>",
+        "attributes: attributes",
+        "maybe: option<u16>",
+        "outcome: result<u32, u8>",
+        "variant response",
+        "accepted(tuple<request, error-code>)",
+        "rejected(error-code)",
+        "transform: func(value: request) -> response",
+        "world canonical-language",
+        "export canonical-values;",
+    ] {
+        assert!(CANONICAL_VALUES.contains(marker), "{marker}");
+    }
     assert!(VALID_CORE.contains("i32.add"));
     assert!(LIMIT_CORE.contains("memory 1 256"));
     assert!(UNSUPPORTED_CORE.contains("f32.const"));
@@ -121,8 +146,42 @@ fn corpus_covers_the_profile_contract() {
         assert!(NATIVE_ASYNC_SMOKE_COMPONENT.contains(marker), "{marker}");
     }
     assert!(MALFORMED_COMPONENT.contains("truncated-section"));
-    assert!(RUST_GUEST.contains("extern \"C\""));
-    assert!(C_GUEST.contains("uint32_t"));
+    for marker in [
+        "#![no_std]",
+        "#![no_main]",
+        "wasm32-wasip1",
+        "static mut BUMP_POINTER: u32 = 69_632",
+        "#[unsafe(no_mangle)]",
+        "pub unsafe extern \"C\" fn cabi_realloc",
+        "pub unsafe extern \"C\" fn transform",
+        "maybe_discriminant: u32",
+        "outcome_discriminant: u32",
+        "const RESULT_POINTER: u32 = 1_024",
+        "const LABEL_OUTPUT_POINTER: u32 = 16_384",
+        "const PAYLOAD_OUTPUT_POINTER: u32 = 32_768",
+        "pub extern \"C\" fn cabi_post_transform",
+        "#[panic_handler]",
+    ] {
+        assert!(RUST_GUEST.contains(marker), "Rust guest marker: {marker}");
+    }
+    for marker in [
+        "wasm32-wasip1 with wasi-sdk-33",
+        "-ffreestanding, -fno-builtin",
+        "-nostdlib",
+        "static uint32_t bump_pointer = 69632u",
+        "WASM_EXPORT(\"cabi_realloc\")",
+        "WASM_EXPORT(\"transform\")",
+        "uint32_t maybe_discriminant",
+        "uint32_t outcome_discriminant",
+        "RESULT_POINTER = 1024u",
+        "LABEL_OUTPUT_POINTER = 16384u",
+        "PAYLOAD_OUTPUT_POINTER = 32768u",
+        "WASM_EXPORT(\"cabi_post_transform\")",
+    ] {
+        assert!(C_GUEST.contains(marker), "C guest marker: {marker}");
+    }
+    assert!(!RUST_GUEST.contains(" fn add("));
+    assert!(!C_GUEST.contains(" add("));
 }
 
 #[test]

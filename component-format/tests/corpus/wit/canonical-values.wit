@@ -1,0 +1,30 @@
+package vibe:fixture@1.0.0;
+
+interface canonical-values {
+    flags attributes { urgent, audited, traced }
+
+    enum error-code { denied, invalid, exhausted }
+
+    record request {
+        truth: bool,
+        signed: s32,
+        wide: u64,
+        symbol: char,
+        label: string,
+        payload: list<u8>,
+        attributes: attributes,
+        maybe: option<u16>,
+        outcome: result<u32, u8>,
+    }
+
+    variant response {
+        accepted(tuple<request, error-code>),
+        rejected(error-code),
+    }
+
+    transform: func(value: request) -> response;
+}
+
+world canonical-language {
+    export canonical-values;
+}

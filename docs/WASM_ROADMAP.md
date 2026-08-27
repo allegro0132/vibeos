@@ -437,6 +437,25 @@ semantics before adding live authority or async behavior.
 | C2.6 | Charge adapters and ABI work | Embedded adapter instructions consume Core fuel; host lift/lower allocation and work consume component budgets |
 | C2.7 | Differential and fuzz evidence | Accepted components agree with a pinned reference implementation; component bytes and canonical values are fuzzed separately |
 
+**Selected C2.3 evidence (2026-08-27):** the exact
+`vibe:fixture/canonical-language@1.0.0` world now executes through two
+independently authored freestanding guests, one Rust and one C. Both implement
+the same Canonical ABI function whose input/output type graph covers every
+Profile-1 non-resource value family and return both arms of a typed variant.
+The import-free compiler outputs are rebuilt with byte-pinned toolchains, passed
+through a digest-allowlisted transform that removes only the linkers' private,
+unreferenced mutable stack global, and revalidated as Profile-1 Core before
+being embedded in import-free Components. The test pins both Core and derived
+Component byte identities, the exact WIT world, four typed boundary cases, 276
+aggregate dynamic bytes, and corpus digest `0x5a3e5d03338a9be3`. Both languages
+produce the exact same typed values under a 1,000,000-work budget,
+10,000-work quantum, and 101-poll ceiling without a host operation, trap,
+poisoned instance, or retained continuation. Exact source/tool/artifact
+provenance and the offline reproduction command are documented in
+`component-runtime/tests/fixtures/language/PROVENANCE.md` and `TESTING.md`.
+This closes the selected C2.3 cross-language acceptance evidence without
+claiming C2.7 reference-runtime agreement or fuzz coverage.
+
 **Demo:** a host-only component accepts a record containing strings and lists,
 uses an inert borrowed resource, and returns a typed variant with exact output
 matching the reference runtime.

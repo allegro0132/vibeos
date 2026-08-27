@@ -416,6 +416,38 @@ compilation, instantiation, growth/call-depth enforcement, kernel allocator
 ownership, QEMU/Duo allocation and exhaustive fuzzing remain separate evidence
 boundaries or later roadmap nodes.
 
+**C1.3 effective maxima (2026-08-28):**
+`wasm-runtime/tests/effective_maxima.rs` pins adjacent runtime boundaries through
+the production wrappers. A two-page image/store policy admits the guest growth
+that reaches page two, then repeatedly traps page three as `LimitExceeded`
+without changing memory. A smaller module-declared maximum remains a distinct
+Core bounds failure. The controlled host table seam reaches exactly 4,096 MVP
+function-table elements and rejects 4,097 with stable size and diagnostics,
+while guest `table.grow` remains rejected before compilation because reference
+types stay disabled. A countdown call accepts 128 active frames, rejects the
+129th as `CallDepthExceeded`, repeats the same terminal, and remains reusable.
+
+`ValidatedCore::required_compile_bytes` performs bounded structural inspection
+without constructing a Wasmi engine or module. Both constructors check the
+caller-provided per-compilation policy ceiling before engine creation, clone,
+or `Module::new`; the calculator-reported charge succeeds and charge-minus-one
+returns the stable allocation-reservation admission error. A 27-byte raw probe
+compactly declares 4,096 locals; `CoreSummary::max_locals` records that count,
+and the charge includes the corresponding pointer-sized per-function
+expansion. A thread-local host allocator probe labels two synthetic caller owner
+scopes. The rejected constructor has exactly the inspector's
+allocation-request fingerprint, successful selected-scope compilation observes
+a request at least as large as that expansion, and the other label is unchanged.
+This deterministic policy charge is not an upper bound on Wasmi's
+allocation-request total or live/high-water memory; the copyable reservation is
+neither an owner credential nor a ledger debit.
+
+This closes C1.3 for one portable Profile-1 Core memory/table/call stack and the
+pre-engine allocation policy gate with active-scope request attribution.
+Authentic kernel owner capabilities, exact full-lifecycle charging/reclamation,
+and aggregate memory across all Core instances in a Component principal remain
+C4.2/C6 boundaries. No QEMU or physical-Duo allocation claim is made here.
+
 **C1.6 selected baseline (2026-08-27):** the offline fixture is the complete
 official [`test/core/fac.wast`](https://github.com/WebAssembly/spec/blob/977f97014c962f7bd1291fcc6d28b41a924882bf/test/core/fac.wast)
 from WebAssembly/spec `wg-1.0` commit

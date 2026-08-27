@@ -892,6 +892,7 @@ fn enabled_profile_ceilings_are_admitted_and_reported() {
     locals_body.extend([0x7f, 0x0b]);
     let locals = inspect_core(&module_with_one_function(&locals_body)).unwrap();
     assert_eq!(locals.locals, PROFILE_1_LIMITS.max_locals_per_function);
+    assert_eq!(locals.max_locals, PROFILE_1_LIMITS.max_locals_per_function);
 
     let mut nesting_body = vec![0x00];
     for _ in 0..PROFILE_1_LIMITS.max_core_nesting {

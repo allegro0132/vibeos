@@ -1070,7 +1070,7 @@ fn validate_guest_module(
             }
             Payload::CustomSection(section) => {
                 if section.name() != "name"
-                    || section.data().len() > PROFILE_1_LIMITS.max_custom_section_bytes
+                    || section.range().len() > PROFILE_1_LIMITS.max_custom_section_bytes
                 {
                     return Err(mismatch);
                 }

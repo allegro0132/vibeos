@@ -1225,7 +1225,7 @@ fn inspect_component_for_profile_impl<'a>(
                 )?;
                 add_u64(
                     &mut summary.custom_section_bytes,
-                    reader.data().len(),
+                    reader.range().len(),
                     PROFILE_1_LIMITS.max_custom_section_bytes,
                 )?;
             }

@@ -26,7 +26,10 @@ use wasmi::{
     ResumableCallHostTrap, ResumableCallOutOfFuel, Store, StoreLimits, StoreLimitsBuilder, Val,
     ValType,
 };
-use wasmparser::{Encoding, Operator, Parser, Payload, TypeRef, Validator, WasmFeatures};
+use wasmparser::{
+    Encoding, FrameKind, FrameStack, Parser, Payload, TypeRef, Validator, VisitOperator,
+    WasmFeatures,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmissionDetail {
@@ -69,6 +72,10 @@ impl AdmissionError {
     }
 }
 
+/// The Core decoder's successful structural validation account.
+///
+/// Every represented count is charged before the validating frontend may
+/// materialize storage for that declaration.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CoreSummary {
     pub bytes: u32,
@@ -84,7 +91,10 @@ pub struct CoreSummary {
     pub tables: u32,
     pub data_segments: u32,
     pub element_segments: u32,
+    pub element_items: u32,
     pub custom_sections: u32,
+    /// Aggregate encoded custom-section payload bytes, including each name's
+    /// length prefix, name, and data. Wasmi retains the names and data.
     pub custom_section_bytes: u32,
     pub max_control_depth: u32,
 }
@@ -270,6 +280,401 @@ fn inspect_function_types(
     Ok(())
 }
 
+fn skip_i32_leb(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<(), AdmissionError> {
+    for index in 0..5 {
+        let byte = *bytes
+            .get(*cursor)
+            .filter(|_| *cursor < end)
+            .ok_or_else(|| AdmissionError::validation(AdmissionDetail::Malformed))?;
+        *cursor += 1;
+        if byte & 0x80 == 0 {
+            if index == 4 {
+                let sign_extension = if byte & 0x08 == 0 { 0x00 } else { 0x70 };
+                if byte & 0x70 != sign_extension {
+                    return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+                }
+            }
+            return Ok(());
+        }
+    }
+    Err(AdmissionError::validation(AdmissionDetail::Malformed))
+}
+
+fn skip_i64_leb(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<(), AdmissionError> {
+    for index in 0..10 {
+        let byte = *bytes
+            .get(*cursor)
+            .filter(|_| *cursor < end)
+            .ok_or_else(|| AdmissionError::validation(AdmissionDetail::Malformed))?;
+        *cursor += 1;
+        if byte & 0x80 == 0 {
+            if index == 9 {
+                let sign_extension = if byte & 0x01 == 0 { 0x00 } else { 0x7e };
+                if byte & 0x7e != sign_extension {
+                    return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+                }
+            }
+            return Ok(());
+        }
+    }
+    Err(AdmissionError::validation(AdmissionDetail::Malformed))
+}
+
+fn next_byte(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<u8, AdmissionError> {
+    let byte = *bytes
+        .get(*cursor)
+        .filter(|_| *cursor < end)
+        .ok_or_else(|| AdmissionError::validation(AdmissionDetail::Malformed))?;
+    *cursor += 1;
+    Ok(byte)
+}
+
+fn inspect_i32_const_expr(
+    bytes: &[u8],
+    cursor: &mut usize,
+    end: usize,
+) -> Result<(), AdmissionError> {
+    let opcode = next_byte(bytes, cursor, end)?;
+    match opcode {
+        0x41 => skip_i32_leb(bytes, cursor, end)?,
+        0x23 => {
+            read_u32_leb(bytes, cursor, end)?;
+        }
+        _ => return Err(AdmissionError::unsupported()),
+    }
+    match next_byte(bytes, cursor, end)? {
+        0x0b => Ok(()),
+        _ => Err(AdmissionError::unsupported()),
+    }
+}
+
+fn inspect_integer_const_expr(
+    bytes: &[u8],
+    cursor: &mut usize,
+    end: usize,
+) -> Result<(), AdmissionError> {
+    match next_byte(bytes, cursor, end)? {
+        0x41 => skip_i32_leb(bytes, cursor, end)?,
+        0x42 => skip_i64_leb(bytes, cursor, end)?,
+        0x23 => {
+            read_u32_leb(bytes, cursor, end)?;
+        }
+        _ => return Err(AdmissionError::unsupported()),
+    }
+    match next_byte(bytes, cursor, end)? {
+        0x0b => Ok(()),
+        _ => Err(AdmissionError::unsupported()),
+    }
+}
+
+fn inspect_tables(
+    bytes: &[u8],
+    range: core::ops::Range<usize>,
+    count: u32,
+    limits: &ProfileLimits,
+) -> Result<(), AdmissionError> {
+    let mut cursor = range.start;
+    if read_u32_leb(bytes, &mut cursor, range.end)? != count {
+        return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+    }
+    for _ in 0..count {
+        if cursor < range.end && bytes.get(cursor) == Some(&0x40) {
+            // The table-init-expression encoding can contain an arbitrary
+            // operator sequence and is outside the Profile-1 MVP grammar.
+            return Err(AdmissionError::unsupported());
+        }
+        if next_byte(bytes, &mut cursor, range.end)? != 0x70 {
+            return Err(AdmissionError::unsupported());
+        }
+        let flags = next_byte(bytes, &mut cursor, range.end)?;
+        if flags & !0b111 != 0 {
+            return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+        }
+        if flags & 0b110 != 0 {
+            return Err(AdmissionError::unsupported());
+        }
+        let initial = u64::from(read_u32_leb(bytes, &mut cursor, range.end)?);
+        let maximum = if flags & 0b001 == 0 {
+            return Err(AdmissionError::validation(AdmissionDetail::MissingMaximum));
+        } else {
+            u64::from(read_u32_leb(bytes, &mut cursor, range.end)?)
+        };
+        if initial > u64::from(limits.max_table_elements)
+            || maximum > u64::from(limits.max_table_elements)
+            || initial > maximum
+        {
+            return Err(AdmissionError::limit(LimitKind::TableElements));
+        }
+    }
+    if cursor != range.end {
+        return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+    }
+    Ok(())
+}
+
+fn inspect_globals(
+    bytes: &[u8],
+    range: core::ops::Range<usize>,
+    count: u32,
+) -> Result<(), AdmissionError> {
+    let mut cursor = range.start;
+    if read_u32_leb(bytes, &mut cursor, range.end)? != count {
+        return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+    }
+    for _ in 0..count {
+        match next_byte(bytes, &mut cursor, range.end)? {
+            0x7f | 0x7e => {}
+            _ => return Err(AdmissionError::unsupported()),
+        }
+        match next_byte(bytes, &mut cursor, range.end)? {
+            0 => {}
+            1..=3 => return Err(AdmissionError::unsupported()),
+            _ => return Err(AdmissionError::validation(AdmissionDetail::Malformed)),
+        }
+        inspect_integer_const_expr(bytes, &mut cursor, range.end)?;
+    }
+    if cursor != range.end {
+        return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+    }
+    Ok(())
+}
+
+fn inspect_data_segments(
+    bytes: &[u8],
+    range: core::ops::Range<usize>,
+    count: u32,
+) -> Result<(), AdmissionError> {
+    let mut cursor = range.start;
+    if read_u32_leb(bytes, &mut cursor, range.end)? != count {
+        return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+    }
+    for _ in 0..count {
+        match read_u32_leb(bytes, &mut cursor, range.end)? {
+            0 => {}
+            1 | 2 => return Err(AdmissionError::unsupported()),
+            _ => return Err(AdmissionError::validation(AdmissionDetail::Malformed)),
+        }
+        inspect_i32_const_expr(bytes, &mut cursor, range.end)?;
+        let length = usize::try_from(read_u32_leb(bytes, &mut cursor, range.end)?)
+            .map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?;
+        cursor = cursor
+            .checked_add(length)
+            .filter(|next| *next <= range.end)
+            .ok_or_else(|| AdmissionError::validation(AdmissionDetail::Malformed))?;
+    }
+    if cursor != range.end {
+        return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+    }
+    Ok(())
+}
+
+/// Predecode the Profile-1 MVP element grammar so the inner item vector is
+/// charged before wasmparser or wasmi can materialize function references.
+fn inspect_element_segments(
+    bytes: &[u8],
+    range: core::ops::Range<usize>,
+    count: u32,
+    limits: &ProfileLimits,
+    summary: &mut CoreSummary,
+) -> Result<(), AdmissionError> {
+    let mut cursor = range.start;
+    let encoded_count = read_u32_leb(bytes, &mut cursor, range.end)?;
+    if encoded_count != count {
+        return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+    }
+    for _ in 0..count {
+        // Non-zero flags select passive/declared segments, explicit table
+        // indices, or expression elements from proposals disabled by Profile 1.
+        let flags = read_u32_leb(bytes, &mut cursor, range.end)?;
+        if flags & !0b111 != 0 {
+            return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+        }
+        if flags != 0 {
+            return Err(AdmissionError::unsupported());
+        }
+        inspect_i32_const_expr(bytes, &mut cursor, range.end)?;
+        let items = read_u32_leb(bytes, &mut cursor, range.end)?;
+        checked_add(
+            &mut summary.element_items,
+            items,
+            limits.max_table_elements,
+            LimitKind::TableElements,
+        )?;
+        for _ in 0..items {
+            read_u32_leb(bytes, &mut cursor, range.end)?;
+        }
+    }
+    if cursor != range.end {
+        return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+    }
+    Ok(())
+}
+
+const CONTROL_STACK_CAPACITY: usize = PROFILE_1_LIMITS.max_core_nesting as usize + 1;
+
+struct BoundedControlVisitor {
+    frames: [FrameKind; CONTROL_STACK_CAPACITY],
+    len: usize,
+    limit: usize,
+    max_depth: u32,
+}
+
+impl BoundedControlVisitor {
+    fn new(limit: u32) -> Self {
+        let mut visitor = Self {
+            frames: [FrameKind::Block; CONTROL_STACK_CAPACITY],
+            len: 0,
+            limit: limit.min(PROFILE_1_LIMITS.max_core_nesting) as usize,
+            max_depth: 0,
+        };
+        // The implicit function frame is not part of the profile nesting
+        // count, but BinaryReader requires it for `else`/`end` syntax.
+        visitor.frames[0] = FrameKind::Block;
+        visitor.len = 1;
+        visitor
+    }
+
+    fn push(&mut self, frame: FrameKind) -> Result<(), AdmissionError> {
+        let depth = self.len;
+        if depth > self.limit || self.len >= self.frames.len() {
+            return Err(AdmissionError::limit(LimitKind::CoreNesting));
+        }
+        self.frames[self.len] = frame;
+        self.len += 1;
+        self.max_depth = self.max_depth.max(depth as u32);
+        Ok(())
+    }
+
+    fn enter_else(&mut self) -> Result<(), AdmissionError> {
+        let frame = self
+            .frames
+            .get_mut(self.len.saturating_sub(1))
+            .ok_or_else(|| AdmissionError::validation(AdmissionDetail::Malformed))?;
+        *frame = FrameKind::Else;
+        Ok(())
+    }
+
+    fn end(&mut self) -> Result<(), AdmissionError> {
+        if self.len == 0 {
+            return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+        }
+        self.len -= 1;
+        Ok(())
+    }
+
+    const fn complete(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl FrameStack for BoundedControlVisitor {
+    fn current_frame(&self) -> Option<FrameKind> {
+        self.len.checked_sub(1).map(|index| self.frames[index])
+    }
+}
+
+macro_rules! define_bounded_control_visit {
+    ($( @$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident ($($ann:tt)*))*) => {
+        $(
+            define_bounded_control_visit!(@one @$proposal $op $({ $($arg: $argty),* })? => $visit);
+        )*
+    };
+    (@one @mvp Block { $($arg:ident: $argty:ty),* } => $visit:ident) => {
+        fn $visit(&mut self, $($arg: $argty),*) -> Self::Output {
+            $(let _ = $arg;)*
+            self.push(FrameKind::Block)
+        }
+    };
+    (@one @mvp Loop { $($arg:ident: $argty:ty),* } => $visit:ident) => {
+        fn $visit(&mut self, $($arg: $argty),*) -> Self::Output {
+            $(let _ = $arg;)*
+            self.push(FrameKind::Loop)
+        }
+    };
+    (@one @mvp If { $($arg:ident: $argty:ty),* } => $visit:ident) => {
+        fn $visit(&mut self, $($arg: $argty),*) -> Self::Output {
+            $(let _ = $arg;)*
+            self.push(FrameKind::If)
+        }
+    };
+    (@one @mvp Else => $visit:ident) => {
+        fn $visit(&mut self) -> Self::Output {
+            self.enter_else()
+        }
+    };
+    (@one @mvp End => $visit:ident) => {
+        fn $visit(&mut self) -> Self::Output {
+            self.end()
+        }
+    };
+    (@one @mvp $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident) => {
+        fn $visit(&mut self $($(, $arg: $argty)*)?) -> Self::Output {
+            $( $(let _ = $arg;)* )?
+            Ok(())
+        }
+    };
+    (@one @$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident) => {
+        fn $visit(&mut self $($(, $arg: $argty)*)?) -> Self::Output {
+            $( $(let _ = $arg;)* )?
+            Err(AdmissionError::unsupported())
+        }
+    };
+}
+
+impl<'a> VisitOperator<'a> for BoundedControlVisitor {
+    type Output = Result<(), AdmissionError>;
+
+    wasmparser::for_each_visit_operator!(define_bounded_control_visit);
+}
+
+fn inspect_function_body(
+    bytes: &[u8],
+    body: &wasmparser::FunctionBody<'_>,
+    limits: &ProfileLimits,
+    summary: &mut CoreSummary,
+) -> Result<(), AdmissionError> {
+    let mut locals = 0_u32;
+    let reader = body
+        .get_locals_reader()
+        .map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?;
+    for local in reader {
+        let (count, _) =
+            local.map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?;
+        checked_add(
+            &mut locals,
+            count,
+            limits.max_locals_per_function,
+            LimitKind::Locals,
+        )?;
+    }
+    summary.locals = summary.locals.saturating_add(locals);
+
+    let mut reader = body
+        .get_binary_reader_for_operators()
+        .map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?;
+    let mut visitor = BoundedControlVisitor::new(limits.max_core_nesting);
+    while !reader.eof() {
+        let position = reader.original_position();
+        let opcode = *bytes
+            .get(position)
+            .ok_or_else(|| AdmissionError::validation(AdmissionDetail::Malformed))?;
+        // Typed-select, try-table, and resume-table can decode attacker-sized
+        // vectors before invoking a visitor. Reject their leading opcodes and
+        // the adjacent disabled prefix/family opcodes before that decode.
+        if matches!(opcode, 0x1c | 0x1f | 0xfb..=0xfe | 0xe0..=0xe6) {
+            return Err(AdmissionError::unsupported());
+        }
+        reader
+            .visit_operator(&mut visitor)
+            .map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))??;
+    }
+    if !visitor.complete() {
+        return Err(AdmissionError::validation(AdmissionDetail::Malformed));
+    }
+    summary.max_control_depth = summary.max_control_depth.max(visitor.max_depth);
+    Ok(())
+}
+
 /// Performs an allocation-light structural pass before invoking a validating
 /// frontend.  Section counts and declared storage are rejected at the exact
 /// Profile-1 boundary.
@@ -339,15 +744,33 @@ fn inspect_core_with_limits_and_current_engine(
                 )?;
             }
             Payload::ImportSection(reader) => {
+                // The outer count is the exact import count for the baseline
+                // encoding, but compact-import groups can flatten to more
+                // imports than this declaration. Charge the outer count first
+                // so a truncated count mutation fails before entry decoding,
+                // then charge every flattened entry beyond that lower bound.
+                let declared_groups = reader.count();
                 checked_add(
                     &mut summary.imports,
-                    reader.count(),
+                    declared_groups,
                     limits.max_imports,
                     LimitKind::Imports,
                 )?;
+                let mut flattened_imports = 0_u32;
                 for import in reader.into_imports() {
                     let import = import
                         .map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?;
+                    flattened_imports = flattened_imports
+                        .checked_add(1)
+                        .ok_or_else(|| AdmissionError::limit(LimitKind::Imports))?;
+                    if flattened_imports > declared_groups {
+                        checked_add(
+                            &mut summary.imports,
+                            1,
+                            limits.max_imports,
+                            LimitKind::Imports,
+                        )?;
+                    }
                     match import.ty {
                         TypeRef::Func(_) => checked_add(
                             &mut summary.functions,
@@ -398,14 +821,7 @@ fn inspect_core_with_limits_and_current_engine(
                     limits.max_tables,
                     LimitKind::Tables,
                 )?;
-                for table in reader {
-                    check_table(
-                        table
-                            .map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?
-                            .ty,
-                        limits,
-                    )?;
-                }
+                inspect_tables(bytes, reader.range(), reader.count(), limits)?;
             }
             Payload::MemorySection(reader) => {
                 checked_add(
@@ -430,13 +846,7 @@ fn inspect_core_with_limits_and_current_engine(
                     limits.max_globals,
                     LimitKind::Globals,
                 )?;
-                for global in reader {
-                    let global = global
-                        .map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?;
-                    if global.ty.mutable || global.ty.shared {
-                        return Err(AdmissionError::unsupported());
-                    }
-                }
+                inspect_globals(bytes, reader.range(), reader.count())?;
             }
             Payload::ExportSection(reader) => checked_add(
                 &mut summary.exports,
@@ -444,66 +854,42 @@ fn inspect_core_with_limits_and_current_engine(
                 limits.max_exports,
                 LimitKind::Exports,
             )?,
-            Payload::ElementSection(reader) => checked_add(
-                &mut summary.element_segments,
-                reader.count(),
-                limits.max_element_segments,
-                LimitKind::ElementSegments,
-            )?,
+            Payload::ElementSection(reader) => {
+                checked_add(
+                    &mut summary.element_segments,
+                    reader.count(),
+                    limits.max_element_segments,
+                    LimitKind::ElementSegments,
+                )?;
+                inspect_element_segments(
+                    bytes,
+                    reader.range(),
+                    reader.count(),
+                    limits,
+                    &mut summary,
+                )?;
+            }
             Payload::DataCountSection { count, .. } => {
                 if count > limits.max_data_segments {
                     return Err(AdmissionError::limit(LimitKind::DataSegments));
                 }
             }
-            Payload::DataSection(reader) => checked_add(
-                &mut summary.data_segments,
-                reader.count(),
-                limits.max_data_segments,
-                LimitKind::DataSegments,
-            )?,
+            Payload::DataSection(reader) => {
+                checked_add(
+                    &mut summary.data_segments,
+                    reader.count(),
+                    limits.max_data_segments,
+                    LimitKind::DataSegments,
+                )?;
+                inspect_data_segments(bytes, reader.range(), reader.count())?;
+            }
             Payload::CodeSectionStart { count, .. } => {
                 if count > limits.max_functions {
                     return Err(AdmissionError::limit(LimitKind::Functions));
                 }
             }
             Payload::CodeSectionEntry(body) => {
-                let mut locals = 0_u32;
-                let reader = body
-                    .get_locals_reader()
-                    .map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?;
-                for local in reader {
-                    let (count, _) = local
-                        .map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?;
-                    checked_add(
-                        &mut locals,
-                        count,
-                        limits.max_locals_per_function,
-                        LimitKind::Locals,
-                    )?;
-                }
-                summary.locals = summary.locals.saturating_add(locals);
-
-                let mut depth = 0_u32;
-                let operators = body
-                    .get_operators_reader()
-                    .map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?;
-                for operator in operators {
-                    match operator
-                        .map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?
-                    {
-                        Operator::Block { .. } | Operator::Loop { .. } | Operator::If { .. } => {
-                            depth = depth
-                                .checked_add(1)
-                                .ok_or_else(|| AdmissionError::limit(LimitKind::Functions))?;
-                            if depth > limits.max_core_nesting {
-                                return Err(AdmissionError::limit(LimitKind::CoreNesting));
-                            }
-                            summary.max_control_depth = summary.max_control_depth.max(depth);
-                        }
-                        Operator::End => depth = depth.saturating_sub(1),
-                        _ => {}
-                    }
-                }
+                inspect_function_body(bytes, &body, limits, &mut summary)?;
             }
             Payload::CustomSection(reader) => {
                 checked_add(
@@ -512,12 +898,16 @@ fn inspect_core_with_limits_and_current_engine(
                     limits.max_custom_sections,
                     LimitKind::CustomSections,
                 )?;
-                let amount = u32::try_from(reader.data().len())
+                // The engine stores both the name and data, and the serialized
+                // name-length prefix is attacker controlled too. Account the
+                // complete payload rather than only `reader.data()`.
+                let amount = u32::try_from(reader.range().len())
                     .map_err(|_| AdmissionError::limit(LimitKind::CustomSectionBytes))?;
+                let maximum = u32::try_from(limits.max_custom_section_bytes).unwrap_or(u32::MAX);
                 checked_add(
                     &mut summary.custom_section_bytes,
                     amount,
-                    limits.max_custom_section_bytes as u32,
+                    maximum,
                     LimitKind::CustomSectionBytes,
                 )?;
             }

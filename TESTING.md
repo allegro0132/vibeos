@@ -7,6 +7,7 @@ cargo test --workspace --exclude vibeos-sshd # VibeOS portable tests, no QEMU
 cargo test --manifest-path vendor/sunset/Cargo.toml -p sunset \
   --no-default-features --features alloc # audited Sunset fork tests
 cargo test --locked --offline -p vibeos-wasm-runtime --test core_spec # C1.6 pinned official integer semantics
+cargo test --locked --offline -p vibeos-wasm-runtime --test core_robustness # C1.7 deterministic bounded corpus
 cargo check -p vibeos-sshd --features qemu-virt
 cargo check -p vibeos-sshd --features milkv-ssh-acceptance
 cargo test -p vibeos-driver-dwc2-host -p vibeos-bsp-milkv-duo
@@ -84,8 +85,35 @@ Profile-1 integer baseline for indexed and named calls, recursion, locals,
 blocks, loops, branches, the fixture's non-negative factorial comparisons,
 and wrapping `i64` arithmetic
 under Vibe's configured bounds. It is not full WebAssembly Core 2.0
-conformance, does not enable any disabled Profile-1 feature, and does not close
-C1.7; decode/validate/instantiate/execute fuzzing remains open.
+conformance and does not enable any disabled Profile-1 feature. C1.6 does not
+itself supply C1.7 robustness evidence; that separate gate is described below.
+
+`wasm-runtime/tests/core_robustness.rs` is the C1.7 deterministic bounded CI
+corpus. Its in-process xorshift64* generator uses the fixed seed
+`0x6a09_e667_f3bc_c909`; the test pins exactly 679 inputs, 575,262 aggregate
+input bytes, and the length-and-tag-bound FNV-1a digest
+`0xbe6b2c8ae635595a`. The corpus contains raw inputs at every length from 0
+through 192, the same tail lengths after an exact Core magic/version prefix,
+and 96 valid generated Profile-1 modules plus one truncation and one bit flip
+of each. The valid modules cover integer arithmetic, direct calls, `if`, loops,
+bounded memory, and `unreachable`. Dedicated cases additionally cover a
+disabled float signature, a validated but unlinked import, fuel-bounded
+nontermination, call-depth exhaustion, the exact 524,289-byte module-size
+limit-plus-one input, and a compile reservation one byte below the measured
+requirement. Every ordinary structured input is at most 4,096 bytes.
+
+Each pipeline exercise is enclosed by `catch_unwind`, checks every admitted
+summary and compile reservation against Profile 1, then drives any runnable
+module with exactly 50,000 total fuel and a 10,000-fuel quantum. At most six
+polls may occur. The 96 unmodified generated modules and the dedicated spin
+and recursion cases require exact `Ready`, `Unreachable`, `FuelExhausted`, and
+`CallDepthExceeded` outcomes. Mutated or arbitrary inputs may reject at any
+earlier stage or terminate with another bounded result, but they may not panic,
+reach a host call, exceed the poll bound, or leave an active call after a
+terminal result. This closes the selected deterministic C1.7 evidence for
+decode, validation, instantiation, and execution under configured bounds. It
+is a reproducible bounded CI corpus, not coverage-guided or exhaustive fuzzing,
+and does not claim enumeration of all byte sequences.
 
 The C8.2 gate is intentionally pinned to the reviewed
 `aarch64-apple-darwin` Rust distribution and wasi-sdk 33 macOS arm64 release.

@@ -372,7 +372,7 @@ public Core-Wasm ABI.
 | C1.4 | Implement total fuel and resumable poll quantum | An infinite loop returns after one bounded quantum and terminates only when total fuel or cancellation wins |
 | C1.5 | Freeze stable Core trap diagnostics | Arithmetic, unreachable, out-of-bounds, bad indirect call, call depth, validation and fuel failures have exact tested codes |
 | C1.6 | Add differential and specification evidence | The complete pinned `wg-1.0` `fac.wast` baseline agrees across its official assertions, Vibe, and DLR; profile rejections remain separately asserted |
-| C1.7 | Fuzz decode, validate, instantiate and execute | Arbitrary bytes never panic the host and cannot allocate or run without configured bounds |
+| C1.7 | Fuzz decode, validate, instantiate and execute | The pinned local corpus remains panic-free, respects configured allocation/execution bounds, reaches every stage, and produces stable terminals |
 
 **C1.6 selected baseline (2026-08-27):** the offline fixture is the complete
 official [`test/core/fac.wast`](https://github.com/WebAssembly/spec/blob/977f97014c962f7bd1291fcc6d28b41a924882bf/test/core/fac.wast)
@@ -391,9 +391,32 @@ pinned DLR reference runtime; the exhaustion action must classify as Vibe
 semantic baseline covering calls/recursion, locals, structured control flow,
 the fixture's non-negative factorial comparisons, and wrapping `i64`
 arithmetic. It is not a claim of full
-WebAssembly Core 2.0 conformance and does not widen Profile 1. C1.7 remains
-open until bounded decode, validation, instantiation, and execution fuzzing
-lands.
+WebAssembly Core 2.0 conformance and does not widen Profile 1. C1.6 did not by
+itself close C1.7; the independent bounded gate below now supplies that selected
+deterministic evidence.
+
+**C1.7 selected robustness evidence (2026-08-27):**
+`wasm-runtime/tests/core_robustness.rs` generates its corpus locally with fixed
+xorshift64* seed `0x6a09_e667_f3bc_c909`. It pins 679 inputs, 575,262 total
+bytes, and FNV-1a digest `0xbe6b2c8ae635595a`: raw lengths 0--192, equal-length
+tails after the exact Core magic/version, and 96 valid Profile-1 modules plus
+one truncation and one bit flip of each. The accepted modules cover integer
+arithmetic, direct calls, `if`, loops, bounded memory, and `unreachable`;
+separate cases cover a disabled float signature, an unlinked import, bounded
+nontermination and recursion, a tight compile reservation, and the exact
+524,289-byte module-size limit-plus-one input. Ordinary structured inputs never
+exceed 4,096 bytes. Every corpus pipeline exercise is protected by
+`catch_unwind`; every admitted summary/reservation is checked against Profile
+1, and execution uses
+50,000 total fuel with a 10,000-fuel quantum and at most six polls. The 96
+unmodified generated modules and dedicated spin/recursion cases require exact
+`Ready`, `Unreachable`, `FuelExhausted`, and `CallDepthExceeded` outcomes.
+Mutated or arbitrary inputs may reject earlier or terminate differently, but
+must remain panic-free and bounded, may not reach a host call, and must clear
+the active call on every terminal result. This closes the C1.7 criterion for
+the selected deterministic bounded CI evidence. It is not coverage-guided or
+exhaustive fuzzing, and it does not assert that all possible Core byte
+sequences have been enumerated.
 
 **Demo:** a host test invokes exported integer functions, grows bounded memory,
 observes exact traps, and resumes an infinite loop across multiple quanta. This

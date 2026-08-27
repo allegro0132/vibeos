@@ -1,9 +1,15 @@
 # C8.4 AOT decision preparation contract
 
 This document freezes the workload, measurement boundary, physical budget, and
-decision rule for C8.4. It is **preparation only**: no C8.4 result has been
-collected, C8.3 is still incomplete until its three physical-Duo cold boots are
-published, and this contract does not authorize AOT or native component bytes.
+decision rule for C8.4. It is **preparation only**: no physical C8.4 result has
+been collected, C8.3 is still incomplete until its three physical-Duo cold
+boots are published, and this contract does not authorize AOT or native
+component bytes.
+The build/package/image/capture/final-verifier software path is implemented and
+has host-only synthetic coverage. Current execution status (2026-08-27):
+Milk-V Duo physical testing is paused at operator request, so none of those
+software gates is evidence that a board booted and both C8.3 and C8.4 remain
+open.
 
 The machine-readable contract is
 [`benchmarks/wasm-aot-decision/workloads-v1.json`](../benchmarks/wasm-aot-decision/workloads-v1.json).
@@ -76,7 +82,7 @@ One raw contains exactly one `VIBE_WASM_AOT_META` record, 24 ordered
 and one `VIBE_WASM_AOT_END` record. Samples 0 through 2 are warmups and samples
 3 through 23 are retained. Target records deliberately contain no boot index:
 only host evidence assigns indexes 0 through 2 after each raw has passed
-independent verification. A later evidence verifier must prove all three
+independent verification. The final evidence verifier must prove all three
 indexes occur once and share one campaign identity.
 
 The shared `run_id` is SHA-256 over the ASCII campaign domain followed by the
@@ -827,37 +833,235 @@ python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py \
 ./scripts/qemu-c84-ssh-managed-child-single-boot-collector-test.sh
 ```
 
-A physical collector image must be produced from a clean preparation checkout
-with a fresh non-zero challenge. The build command rejects the QEMU-only test
-sentinels, requires the bound source to equal HEAD, verifies the recorded
-jitterentropy patch, and invokes Cargo locked and offline inside a sanitized
-`env -i` envelope. The envelope uses an isolated Cargo home, pinned Rust tools,
-a fixed `ld.lld`, commit-derived `SOURCE_DATE_EPOCH`, and isolated objcopy, so
-ambient wrappers, rustflags, and profile overrides cannot alter the timing
-image:
+### Closed build, package, and image verification
+
+A formal collector image starts in a dedicated clean preparation checkout with
+a fresh non-zero challenge. The full 40-hex preparation commit must contain the
+four C8.4 preparation contracts and the complete checked-in C8.3 evidence tree;
+an abbreviated, dirty, replacement-object, QEMU-sentinel, or all-zero identity
+is ineligible. Cargo dependencies must already be cached before the locked,
+offline build starts.
+
+The build applies and verifies the recorded `jitterentropy-rs` patch and runs
+inside a sanitized `env -i` envelope with an isolated Cargo home, pinned Rust
+tools, fixed `ld.lld`, commit-derived `SOURCE_DATE_EPOCH`, and isolated objcopy.
+It publishes the ELF, raw kernel binary, and a content-addressed
+`build-envelope.json` under `target/milkv-duo-wasm-aot-profile` without
+replacing an existing campaign:
+
+This preparation implementation attests a clean checkout at `prep`; it does
+not yet materialize that build from an independent immutable local clone. The
+packaging envelope likewise records the container digest as operator-declared
+and does not attest the host-observed runtime container identity. Until both
+provenance gaps are closed, the commands below are software-pipeline checks
+only and must not be used to publish decision-eligible physical evidence.
 
 ```sh
+repo_root=$(pwd -P)
 prep=$(git rev-parse HEAD)
 challenge=$(openssl rand -hex 32)
+sdk_root=/absolute/path/to/duo-buildroot-sdk
+sdk_digest=sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679
+sdk_image="milkvtech/milkv-duo@$sdk_digest"
+artifact_root="$repo_root/target/milkv-duo-wasm-aot-profile"
+
 test -z "$(git status --porcelain=v1 --untracked-files=all \
   --ignore-submodules=none)"
 cargo fetch --locked
-
 VIBEOS_C84_SOURCE_COMMIT="$prep" \
 VIBEOS_C84_CHALLENGE="$challenge" \
-  ./scripts/build-milkv-duo.sh --wasm-aot-profile \
-  /absolute/path/to/duo-buildroot-sdk
+  ./scripts/build-milkv-duo.sh --wasm-aot-profile
 ```
 
-This closes only the private single-boot collection mechanism. It does not
-package or capture physical evidence, attest a power cycle, assign boot indexes
-0 through 2, publish three independently verified raw transcripts, supply the
-63 retained physical samples, complete C8.3, or make the final C8.4 decision.
-CI additionally builds and links this physical Milk-V feature with a freshly
-generated challenge while the checkout is clean. It deliberately injects
-hostile ambient wrapper, rustflag, and profile values to prove the sanitized
-envelope ignores them, but neither runs nor retains the artifact; that compile
-gate is not a capture, a cold-boot attestation, or decision input.
+Run packaging in the pinned Linux/amd64 environment that built the clean
+official Duo SDK at commit
+`23eb84fecb29585dbb5728d6b7e2475ff273baac`. The required container digest is
+recorded as operator-declared provenance; it is not hardware or runtime
+attestation. Packaging reconstructs FIT and full-card images, invokes the image
+verifier before publication, and atomically adds `boot.sd`, the SDK DTB, the
+full SD image, `image-verifier-audit.log`, and a content-addressed
+`package-envelope.json` without replacing any existing output. The exact image
+must already exist locally; this offline example records `/home/vibeos` and
+`/home/work` as the package source and SDK roots:
+
+```sh
+docker run --rm --platform linux/amd64 --network none --pull never \
+  --user "$(id -u):$(id -g)" \
+  -e VIBEOS_C84_SOURCE_COMMIT="$prep" \
+  -e VIBEOS_C84_CHALLENGE="$challenge" \
+  -e VIBEOS_C84_SDK_CONTAINER_DIGEST="$sdk_digest" \
+  --mount type=bind,src="$repo_root/scripts/c84-docker.gitconfig",dst=/etc/vibeos-c84.gitconfig,readonly \
+  -v "$repo_root:/home/vibeos:ro" \
+  -v "$repo_root/target:/home/vibeos/target" \
+  -v "$sdk_root:/home/work:ro" \
+  -w /home/vibeos \
+  "$sdk_image" \
+  ./scripts/package-milkv-duo-sdk.sh --wasm-aot-profile /home/work
+
+docker run --rm --platform linux/amd64 --network none --pull never \
+  --user "$(id -u):$(id -g)" \
+  -e VIBEOS_C84_SOURCE_COMMIT="$prep" \
+  -e VIBEOS_C84_CHALLENGE="$challenge" \
+  -e VIBEOS_C84_SDK_CONTAINER_DIGEST="$sdk_digest" \
+  --mount type=bind,src="$repo_root/scripts/c84-docker.gitconfig",dst=/etc/vibeos-c84.gitconfig,readonly \
+  -v "$repo_root:/home/vibeos:ro" \
+  -v "$sdk_root:/home/work:ro" \
+  -w /home/vibeos \
+  "$sdk_image" \
+  ./scripts/verify-milkv-duo-image.sh --wasm-aot-profile \
+    --artifact-root=/home/vibeos/target/milkv-duo-wasm-aot-profile \
+    /home/work
+```
+
+The source and SDK mounts are read-only during packaging; only the already
+created `target/` tree is over-mounted writable. The container runs as the host
+UID/GID. The committed, exact-byte Git configuration is mounted read-only and
+permits only `/home/vibeos`, its two reviewed submodules, and `/home/work`; its
+identity is included in both the image-audit and package tool closures. The
+independent verifier parses the MBR directly with its pinned Python interpreter,
+extracts the FAT boot partition, FIP, FIT kernel and DTB payloads, checks the
+raw-data partition geometry and seed/zero regions, and compares those bytes
+with the selected artifact root and pinned SDK. The package closure binds that
+audit and those artifact identities to the build/package envelopes. The
+verifier's exact terminal marker is retained in
+`image-verifier-audit.log`. After packaging, a dedicated preparation checkout
+must return the patched submodule to its pinned clean state before the stricter
+physical-capture preflight; the packaged artifacts and envelopes remain
+unchanged:
+
+```sh
+git submodule update --checkout -- vendor/jitterentropy-rs
+test -z "$(git status --porcelain=v1 --untracked-files=all \
+  --ignore-submodules=none)"
+```
+
+CI does not package an SDK image or contact a board. Its software-only gate is:
+
+```sh
+bash -n scripts/build-milkv-duo.sh
+bash -n scripts/package-milkv-duo-sdk.sh
+bash -n scripts/verify-milkv-duo-image.sh
+./scripts/verify-milkv-duo-image.sh --selftest
+python3 -B scripts/capture-c84-duo-aot-decision.py --selftest
+python3 -B scripts/verify-c84-evidence.py --selftest
+```
+
+The two Python self-tests use synthetic streams and temporary regular files.
+They never open a UART; these commands also require no SDK, Docker, network,
+flash, reset, or physical cold boot and produce no decision-eligible evidence.
+
+### Deferred physical capture and final evidence publication
+
+Physical execution is intentionally paused at operator request. The following
+commands document the frozen resumption procedure; they are not a report that
+the procedure has run. First create an evidence root outside the clean checkout
+and copy the exact committed preparation files into it. The capture program
+will publish its `duo` child atomically and no-clobber:
+
+```sh
+evidence_root=/absolute/path/to/c84-evidence
+mkdir -m 0700 "$evidence_root"
+cp benchmarks/wasm-aot-decision/README.md "$evidence_root/"
+cp benchmarks/wasm-aot-decision/schema-v1.json "$evidence_root/"
+cp benchmarks/wasm-aot-decision/workloads-v1.json "$evidence_root/"
+cp benchmarks/wasm-aot-decision/evidence-schema-v1.json "$evidence_root/"
+
+c83_source=${C83_SOURCE_COMMIT:?set the full 40-hex C8.3 source commit}
+c83_challenge=${C83_CHALLENGE:?set the 64-hex C8.3 challenge}
+c83_root="$repo_root/benchmarks/wasm-runtime"
+duo_uart=${DUO_UART:?set the explicit absolute Duo UART path}
+
+python3 -B scripts/capture-c84-duo-aot-decision.py \
+  --port "$duo_uart" \
+  --output-dir "$evidence_root/duo" \
+  --source-commit "$prep" \
+  --challenge "$challenge" \
+  --expect-c83-source "$c83_source" \
+  --expect-c83-challenge "$c83_challenge" \
+  --c83-evidence-root "$c83_root" \
+  --kernel "$artifact_root/vibeos-milkv-duo.bin" \
+  --fit "$artifact_root/boot.sd" \
+  --image "$artifact_root/vibeos-milkv-duo-wasm-aot-profile-sd.img" \
+  --package-envelope "$artifact_root/package-envelope.json"
+```
+
+The collector requires an explicit absolute character-device path, refuses any
+requested or resolved `usbmodem` monitor/control path, opens the UART read-only,
+and has no flash, reset, auto-discovery, or serial-write operation. It requires
+the operator to perform and acknowledge `COLD BOOT 1`, `COLD BOOT 2`, and
+`COLD BOOT 3`; each raw is closed by the independent single-boot verifier
+before the next boot can begin.
+
+Only after that capture exists may the final verifier materialize the exact
+`prep` commit with Git replacement objects disabled, prove the current C8.3
+tree byte-for-byte against that snapshot, and rerun the snapshot's complete
+C8.3 evidence verifier. It then independently rechecks the package closure and
+all three raw transcripts, pools exactly 63 retained samples, and computes
+nearest-rank p50 at sorted index 31 and p95 at index 59. Non-interpretation time
+is computed per sample as `N = T - I` before sorting; it is never percentile
+subtraction. First publication and subsequent no-write verification are:
+
+The image verifier deliberately requires the recorded jitterentropy delta.
+Capture required the submodule to be clean, so first reapply and recheck the
+exact committed patch. This intentionally leaves only that reviewed submodule
+delta; the superproject must remain clean when submodule contents are ignored:
+
+```sh
+./scripts/prepare-jitterentropy-rs.sh
+test -z "$(git status --porcelain=v1 --untracked-files=all \
+  --ignore-submodules=all)"
+```
+
+Both final-verifier invocations must then run inside the same exact pinned
+Linux/amd64 image and tool environment as packaging. The checkout and SDK must
+be mounted at the package-recorded `/home/vibeos` and `/home/work` roots so the
+immutable image-verifier rerun sees the same tool bytes; the evidence mount is
+the only writable input. This is an offline verification step:
+
+```sh
+docker run --rm --platform linux/amd64 --network none --pull never \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,src="$repo_root/scripts/c84-docker.gitconfig",dst=/etc/vibeos-c84.gitconfig,readonly \
+  -v "$repo_root:/home/vibeos:ro" \
+  -v "$sdk_root:/home/work:ro" \
+  -v "$evidence_root:/evidence" \
+  -w /home/vibeos \
+  "$sdk_image" \
+  python3 -B scripts/verify-c84-evidence.py \
+  --evidence-root /evidence \
+  --c83-evidence-root /home/vibeos/benchmarks/wasm-runtime \
+  --artifact-root /home/vibeos/target/milkv-duo-wasm-aot-profile \
+  --sdk-root /home/work \
+  --expect-c84-source "$prep" \
+  --expect-c84-challenge "$challenge" \
+  --expect-c83-source "$c83_source" \
+  --expect-c83-challenge "$c83_challenge" \
+  --write-decision
+
+docker run --rm --platform linux/amd64 --network none --pull never \
+  --user "$(id -u):$(id -g)" \
+  --mount type=bind,src="$repo_root/scripts/c84-docker.gitconfig",dst=/etc/vibeos-c84.gitconfig,readonly \
+  -v "$repo_root:/home/vibeos:ro" \
+  -v "$sdk_root:/home/work:ro" \
+  -v "$evidence_root:/evidence:ro" \
+  -w /home/vibeos \
+  "$sdk_image" \
+  python3 -B scripts/verify-c84-evidence.py \
+  --evidence-root /evidence \
+  --c83-evidence-root /home/vibeos/benchmarks/wasm-runtime \
+  --artifact-root /home/vibeos/target/milkv-duo-wasm-aot-profile \
+  --sdk-root /home/work \
+  --expect-c84-source "$prep" \
+  --expect-c84-challenge "$challenge" \
+  --expect-c83-source "$c83_source" \
+  --expect-c83-challenge "$c83_challenge"
+```
+
+`DECISION.json` is no-clobber. A malformed or incomplete C8.3/C8.4 input
+prevents its creation; failure is never relabelled `aot-not-justified`. A
+passing dual-threshold result may say only
+`aot-eligible-for-c85-design-review`. Every outcome keeps
+`aot_authorized=false` and `native_code_accepted=false`.
 
 ## Decision rule
 
@@ -904,9 +1108,16 @@ python3 -B scripts/verify-c84-ssh-managed-child-trusted-sample.py --selftest --c
 python3 -B scripts/verify-c84-ssh-managed-child-single-boot-collector.py --selftest --check-source
 python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py --selftest
 ./scripts/qemu-c84-ssh-managed-child-single-boot-collector-test.sh
+bash -n scripts/build-milkv-duo.sh scripts/package-milkv-duo-sdk.sh \
+  scripts/verify-milkv-duo-image.sh
+./scripts/verify-milkv-duo-image.sh --selftest
+python3 -B scripts/capture-c84-duo-aot-decision.py --selftest
+python3 -B scripts/verify-c84-evidence.py --selftest
 ```
 
 These checks validate the preparation contract, portable single-SAMPLE
 ownership/serialization, trusted producer, private single-boot collector, and
-single-hart QEMU integration transcript semantics only; they cannot
-manufacture the missing physical C8.3 or C8.4 evidence.
+single-hart QEMU integration transcript semantics, plus the software-side
+package/capture/evidence failure boundaries. They cannot manufacture the
+missing physical C8.3 or C8.4 evidence. The paused hardware commands above
+remain deliberately unexecuted.

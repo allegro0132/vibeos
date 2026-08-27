@@ -608,9 +608,22 @@ and the private 24-sample collector, now a build-bound single-cold-boot
 protocol. The collector closes META + 24 SAMPLE + END locally, with three warmups, 21
 retained samples, an absorbing Failed/Closed state, atomic physical UART
 records, and a separate QEMU audit sink whose markers explicitly carry
-`decision_eligible=0 formal_uart=0`. Physical packaging/capture, three attested
-cold boots, the 63 retained physical-Duo samples, and the final workload-specific AOT decision
-remain open; none may be inferred from QEMU diagnostics.
+`decision_eligible=0 formal_uart=0`. The software-side build/package envelopes,
+full-SD-image verifier, read-only three-boot capture program, immutable C8.3
+precondition, and final 63-sample evidence verifier are implemented and covered
+by host-only synthetic tests. Those tests use no device, Docker, network,
+flash, reset, or physical cold boot.
+
+Milk-V Duo physical testing is paused at operator request. Consequently, C8.3
+still lacks its three physical-Duo cold boots, C8.4 still lacks three attested
+cold boots and 63 retained physical samples, and neither row is complete. No
+workload-specific AOT decision exists; the final workload-specific AOT decision
+remains open and may not be inferred from software self-tests or QEMU
+diagnostics. The current software preparation also remains clean-worktree
+attested, with an operator-declared rather than host-runtime-attested container
+identity; immutable source materialization and runtime-container attestation
+must precede decision-eligible publication. C8.5 remains gated on a future
+verified C8.4 result.
 
 ## 10. Test and evidence matrix
 

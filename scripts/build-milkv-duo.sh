@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the Milk-V Duo kernel image and, when an SDK is supplied, its FIT.
+# Build the Milk-V Duo kernel image and, for legacy modes with an SDK, its FIT.
 set -eu
 
 script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
@@ -14,8 +14,11 @@ file_tree=false
 runtime_costs=false
 wasm_aot_profile=false
 runtime_costs_sdk_commit=23eb84fecb29585dbb5728d6b7e2475ff273baac
+wasm_aot_profile_sdk_commit=23eb84fecb29585dbb5728d6b7e2475ff273baac
 runtime_costs_cargo_home_sandbox=
 wasm_aot_profile_cargo_home_sandbox=
+wasm_aot_profile_registry_cache=false
+wasm_aot_profile_git_cache=false
 wasm_aot_profile_stage_dir=
 wasm_aot_profile_publish_lock=
 wasm_aot_profile_publish_lock_held=false
@@ -30,10 +33,11 @@ for arg in "$@"; do
     --file-tree) file_tree=true ;;
     --runtime-costs) runtime_costs=true ;;
     --wasm-aot-profile) wasm_aot_profile=true ;;
-    -*) echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree|--runtime-costs|--wasm-aot-profile] [duo-buildroot-sdk-root]" >&2; exit 2 ;;
+    -*) echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree|--runtime-costs] [duo-buildroot-sdk-root]" >&2; echo "       $0 --wasm-aot-profile" >&2; exit 2 ;;
     *)
       if [ -n "$sdk_arg" ]; then
-        echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree|--runtime-costs|--wasm-aot-profile] [duo-buildroot-sdk-root]" >&2
+        echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree|--runtime-costs] [duo-buildroot-sdk-root]" >&2
+        echo "       $0 --wasm-aot-profile" >&2
         exit 2
       fi
       sdk_arg=$arg
@@ -52,6 +56,10 @@ mode_count=0
 [ "$wasm_aot_profile" = true ] && mode_count=$((mode_count + 1))
 if [ "$mode_count" -gt 1 ]; then
   echo "build-milkv-duo.sh: image mode options are mutually exclusive" >&2
+  exit 2
+fi
+if [ "$wasm_aot_profile" = true ] && [ -n "$sdk_arg" ]; then
+  echo "build-milkv-duo.sh: --wasm-aot-profile does not accept an SDK argument; run package-milkv-duo-sdk.sh --wasm-aot-profile separately" >&2
   exit 2
 fi
 
@@ -146,8 +154,23 @@ cleanup_wasm_aot_profile_build() {
   if [ -n "$wasm_aot_profile_stage_dir" ] &&
      [ -d "$wasm_aot_profile_stage_dir" ]; then
     case "$wasm_aot_profile_stage_dir" in
-      "$repo_root/target/.milkv-duo-wasm-aot-profile.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge."??????)
-        rm -rf -- "$wasm_aot_profile_stage_dir"
+      "$repo_root/target/.milkv-duo-wasm-aot-profile.stage.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge")
+        for staged_name in \
+          .build-envelope.*.tmp build-envelope.json \
+          vibeos-milkv-duo-wasm-aot-profile.elf vibeos-milkv-duo.bin; do
+          for staged_path in "$wasm_aot_profile_stage_dir"/$staged_name; do
+            if [ -e "$staged_path" ] || [ -L "$staged_path" ]; then
+              if [ -f "$staged_path" ] && [ ! -L "$staged_path" ]; then
+                rm -f -- "$staged_path"
+              else
+                echo "build-milkv-duo.sh: refusing to remove unexpected C8.4 staging entry: $staged_path" >&2
+              fi
+            fi
+          done
+        done
+        if ! rmdir -- "$wasm_aot_profile_stage_dir" 2>/dev/null; then
+          echo "build-milkv-duo.sh: preserving non-empty C8.4 staging directory: $wasm_aot_profile_stage_dir" >&2
+        fi
         ;;
       *)
         echo "build-milkv-duo.sh: refusing to remove unexpected WebAssembly AOT profile staging directory: $wasm_aot_profile_stage_dir" >&2
@@ -174,6 +197,9 @@ cleanup_build() {
   cleanup_wasm_aot_profile_build
 }
 trap cleanup_build EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [ "$runtime_costs" = true ]; then
   require_runtime_identity VIBEOS_C83_SOURCE_COMMIT \
@@ -247,6 +273,7 @@ if [ "$wasm_aot_profile" = true ]; then
   wasm_aot_profile_cache_cargo_home=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).expanduser().resolve())' "$wasm_aot_profile_cache_cargo_home")
   wasm_aot_profile_tmpdir=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).expanduser().resolve())' "$wasm_aot_profile_tmpdir")
   wasm_aot_profile_source_date_epoch=$(git -C "$repo_root" show -s --format=%ct "$wasm_aot_profile_source_commit")
+  wasm_aot_profile_build_started_utc=$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"))')
   wasm_aot_profile_publish_dir="$repo_root/target/milkv-duo-wasm-aot-profile"
   wasm_aot_profile_publish_lock="$repo_root/target/.milkv-duo-wasm-aot-profile.publish.lock"
   case "$wasm_aot_profile_target_dir" in
@@ -263,32 +290,34 @@ if [ "$wasm_aot_profile" = true ]; then
       exit 1
       ;;
   esac
+  if [ -L "$repo_root/target" ]; then
+    echo "build-milkv-duo.sh: refusing symlink target directory: $repo_root/target" >&2
+    exit 1
+  fi
   mkdir -p "$repo_root/target"
+  if [ ! -d "$repo_root/target" ] || [ -L "$repo_root/target" ]; then
+    echo "build-milkv-duo.sh: C8.4 target parent is not a fixed directory: $repo_root/target" >&2
+    exit 1
+  fi
   if ! mkdir "$wasm_aot_profile_publish_lock"; then
     echo "build-milkv-duo.sh: another WebAssembly AOT profile publication is active" >&2
     exit 1
   fi
   wasm_aot_profile_publish_lock_held=true
-  if [ -L "$wasm_aot_profile_publish_dir" ] ||
-     { [ -e "$wasm_aot_profile_publish_dir" ] && [ ! -d "$wasm_aot_profile_publish_dir" ]; }; then
-    echo "build-milkv-duo.sh: refusing to clear non-directory WebAssembly AOT profile publication path: $wasm_aot_profile_publish_dir" >&2
+  if [ -e "$wasm_aot_profile_publish_dir" ] || [ -L "$wasm_aot_profile_publish_dir" ]; then
+    echo "build-milkv-duo.sh: WebAssembly AOT profile publication is no-clobber: $wasm_aot_profile_publish_dir already exists" >&2
     exit 1
   fi
-  if [ -d "$wasm_aot_profile_publish_dir" ]; then
-    rm -f -- \
-      "$wasm_aot_profile_publish_dir/vibeos-milkv-duo-wasm-aot-profile.elf" \
-      "$wasm_aot_profile_publish_dir/vibeos-milkv-duo.bin" \
-      "$wasm_aot_profile_publish_dir/boot.sd" \
-      "$wasm_aot_profile_publish_dir/milkv-duo.its" \
-      "$wasm_aot_profile_publish_dir/cv1800b_milkv_duo_sd.dtb"
-    if ! rmdir -- "$wasm_aot_profile_publish_dir"; then
-      echo "build-milkv-duo.sh: refusing to clear WebAssembly AOT profile publication directory with unexpected entries" >&2
-      exit 1
-    fi
+  if [ -e "$wasm_aot_profile_target_dir" ] || [ -L "$wasm_aot_profile_target_dir" ]; then
+    echo "build-milkv-duo.sh: WebAssembly AOT profile target is no-clobber: $wasm_aot_profile_target_dir already exists" >&2
+    exit 1
   fi
-  rm -rf -- "$wasm_aot_profile_target_dir"
-  wasm_aot_profile_stage_dir=$(mktemp -d \
-    "$repo_root/target/.milkv-duo-wasm-aot-profile.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge.XXXXXX")
+  wasm_aot_profile_stage_dir="$repo_root/target/.milkv-duo-wasm-aot-profile.stage.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge"
+  if [ -e "$wasm_aot_profile_stage_dir" ] || [ -L "$wasm_aot_profile_stage_dir" ] ||
+     ! mkdir "$wasm_aot_profile_stage_dir"; then
+    echo "build-milkv-duo.sh: WebAssembly AOT profile staging is no-clobber: $wasm_aot_profile_stage_dir" >&2
+    exit 1
+  fi
   export VIBEOS_C84_SOURCE_COMMIT VIBEOS_C84_CHALLENGE
 fi
 
@@ -394,9 +423,11 @@ if [ "$wasm_aot_profile" = true ]; then
   ln -s "$wasm_aot_profile_linker" "$wasm_aot_profile_cargo_home_sandbox/closed-bin/ld.lld"
   if [ -d "$wasm_aot_profile_cache_cargo_home/registry" ]; then
     ln -s "$wasm_aot_profile_cache_cargo_home/registry" "$wasm_aot_profile_cargo_home_sandbox/registry"
+    wasm_aot_profile_registry_cache=true
   fi
   if [ -d "$wasm_aot_profile_cache_cargo_home/git" ]; then
     ln -s "$wasm_aot_profile_cache_cargo_home/git" "$wasm_aot_profile_cargo_home_sandbox/git"
+    wasm_aot_profile_git_cache=true
   fi
   if [ -e "$wasm_aot_profile_cargo_home_sandbox/config" ] ||
      [ -e "$wasm_aot_profile_cargo_home_sandbox/config.toml" ]; then
@@ -415,23 +446,39 @@ if [ -n "$sdk_arg" ]; then
     exit 1
   fi
   sdk_root=$(cd -- "$sdk_arg" && pwd)
-  if [ "$runtime_costs" = true ]; then
+  if [ "$runtime_costs" = true ] || [ "$wasm_aot_profile" = true ]; then
     if ! sdk_git_root=$(git --no-optional-locks -C "$sdk_root" rev-parse --show-toplevel 2>/dev/null) ||
        ! sdk_head=$(git --no-optional-locks -C "$sdk_root" rev-parse HEAD 2>/dev/null); then
-      echo "build-milkv-duo.sh: runtime-cost SDK root is not a readable Git checkout: $sdk_root" >&2
+      if [ "$runtime_costs" = true ]; then
+        echo "build-milkv-duo.sh: runtime-cost SDK root is not a readable Git checkout: $sdk_root" >&2
+      else
+        echo "build-milkv-duo.sh: WebAssembly AOT profile SDK root is not a readable Git checkout: $sdk_root" >&2
+      fi
       exit 1
     fi
     sdk_git_root=$(cd -- "$sdk_git_root" && pwd)
     if [ "$sdk_git_root" != "$sdk_root" ]; then
-      echo "build-milkv-duo.sh: runtime-cost SDK path must name its Git root: $sdk_root" >&2
+      if [ "$runtime_costs" = true ]; then
+        echo "build-milkv-duo.sh: runtime-cost SDK path must name its Git root: $sdk_root" >&2
+      else
+        echo "build-milkv-duo.sh: WebAssembly AOT profile SDK path must name its Git root: $sdk_root" >&2
+      fi
       exit 1
     fi
-    if [ "$sdk_head" != "$runtime_costs_sdk_commit" ]; then
+    if [ "$runtime_costs" = true ] && [ "$sdk_head" != "$runtime_costs_sdk_commit" ]; then
       echo "build-milkv-duo.sh: runtime-cost SDK HEAD is $sdk_head, expected $runtime_costs_sdk_commit" >&2
       exit 1
     fi
+    if [ "$wasm_aot_profile" = true ] && [ "$sdk_head" != "$wasm_aot_profile_sdk_commit" ]; then
+      echo "build-milkv-duo.sh: WebAssembly AOT profile SDK HEAD is $sdk_head, expected $wasm_aot_profile_sdk_commit" >&2
+      exit 1
+    fi
     if [ -n "$(git --no-optional-locks -C "$sdk_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none)" ]; then
-      echo "build-milkv-duo.sh: runtime-cost SDK checkout is not clean" >&2
+      if [ "$runtime_costs" = true ]; then
+        echo "build-milkv-duo.sh: runtime-cost SDK checkout is not clean" >&2
+      else
+        echo "build-milkv-duo.sh: WebAssembly AOT profile SDK checkout is not clean" >&2
+      fi
       exit 1
     fi
   fi
@@ -668,25 +715,749 @@ if [ "$wasm_aot_profile" = true ]; then
       exit 1
     fi
   fi
+  wasm_aot_profile_build_completed_utc=$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"))')
+  wasm_aot_profile_build_envelope="$output_dir/build-envelope.json"
+  wasm_aot_profile_temp_envelope="$output_dir/.build-envelope.$$.tmp"
+  jitterentropy_submodule="$repo_root/vendor/jitterentropy-rs"
+  jitterentropy_patch="$repo_root/patches/jitterentropy-rs/0001-vibeos-qualification.patch"
+  jitterentropy_head=$(git -C "$jitterentropy_submodule" rev-parse HEAD)
+  if [ "$jitterentropy_head" != c5bd2e17194fe3a04d17f74027bb67622579405f ]; then
+    echo "build-milkv-duo.sh: jitterentropy-rs HEAD changed during the WebAssembly AOT profile build" >&2
+    exit 1
+  fi
+  jitterentropy_diff_record=$(python3 - "$jitterentropy_submodule" "$jitterentropy_patch" <<'PY'
+import hashlib
+import pathlib
+import subprocess
+import sys
+
+submodule = pathlib.Path(sys.argv[1]).resolve(strict=True)
+patch = pathlib.Path(sys.argv[2]).resolve(strict=True).read_bytes()
+observed = subprocess.run(
+    ["git", "-C", str(submodule), "diff", "--unified=0", "--binary"],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout
+if observed != patch:
+    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs diff differs from the recorded patch")
+cached = subprocess.run(
+    ["git", "-C", str(submodule), "diff", "--cached", "--binary"],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout
+if cached:
+    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs has staged changes")
+untracked = subprocess.run(
+    ["git", "-C", str(submodule), "ls-files", "--others", "--exclude-standard", "-z"],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout
+if untracked:
+    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs has untracked files")
+print(f"{hashlib.sha256(observed).hexdigest()}:{len(observed)}")
+PY
+  )
+  jitterentropy_diff_sha256=${jitterentropy_diff_record%:*}
+  jitterentropy_diff_bytes=${jitterentropy_diff_record#*:}
+  sunset_submodule="$repo_root/vendor/sunset"
+  sunset_head=$(git -C "$sunset_submodule" rev-parse HEAD)
+  if [ "$sunset_head" != f686eaaaba8b2eda3f83e23b4bb3005cae31ce5e ] ||
+     [ -n "$(git -C "$sunset_submodule" status --porcelain=v1 --untracked-files=all --ignore-submodules=none)" ]; then
+    echo "build-milkv-duo.sh: sunset submodule changed during the WebAssembly AOT profile build" >&2
+    exit 1
+  fi
+  python3 - \
+    "$wasm_aot_profile_temp_envelope" "$wasm_aot_profile_source_commit" \
+    "$wasm_aot_profile_challenge" "$repo_root" "$output_elf" "$output_bin" \
+    "$script_dir/build-milkv-duo.sh" "$script_dir/prepare-jitterentropy-rs.sh" \
+    "$jitterentropy_patch" "$jitterentropy_submodule" "$jitterentropy_head" \
+    "$jitterentropy_diff_sha256" "$jitterentropy_diff_bytes" \
+    "$sunset_submodule" "$sunset_head" "$repo_root/.gitmodules" \
+    "$repo_root/firmware/milkv-duo/Cargo.toml" \
+    "$repo_root/firmware/milkv-duo/build.rs" \
+    "$repo_root/firmware/milkv-duo/linker.ld" \
+    "$repo_root/firmware/.cargo/config.toml" "$repo_root/kernel/Cargo.toml" \
+    "$repo_root/Cargo.toml" "$repo_root/Cargo.lock" \
+    "$repo_root/benchmarks/wasm-aot-decision/workloads-v1.json" \
+    "$repo_root/benchmarks/wasm-aot-decision/schema-v1.json" \
+    "$repo_root/rust-toolchain.toml" "$wasm_aot_profile_rustup" \
+    "$pinned_cargo" "$pinned_rustc" "$pinned_rustdoc" "$rust_objcopy" \
+    "$wasm_aot_profile_linker" "$toolchain" "$wasm_aot_profile_rustc_verbose" \
+    "$wasm_aot_profile_target_dir" "$wasm_aot_profile_cache_cargo_home" \
+    "$wasm_aot_profile_registry_cache" "$wasm_aot_profile_git_cache" \
+    "$wasm_aot_profile_build_path" "$wasm_aot_profile_rustup_home" \
+    "$wasm_aot_profile_source_date_epoch" "$wasm_aot_profile_objcopy_os" \
+    "$sysroot" "$wasm_aot_profile_build_started_utc" \
+    "$wasm_aot_profile_build_completed_utc" <<'PY'
+import datetime
+import hashlib
+import json
+import pathlib
+import stat
+import sys
+
+(
+    destination,
+    source_commit,
+    challenge,
+    source_root,
+    kernel_elf,
+    kernel_bin,
+    build_script,
+    prepare_jitterentropy_script,
+    jitterentropy_patch,
+    jitterentropy_submodule,
+    jitterentropy_head,
+    jitterentropy_diff_sha256,
+    jitterentropy_diff_bytes,
+    sunset_submodule,
+    sunset_head,
+    gitmodules,
+    firmware_manifest,
+    firmware_build_script,
+    firmware_linker_script,
+    firmware_cargo_config,
+    kernel_manifest,
+    workspace_manifest,
+    cargo_lock,
+    workload_manifest,
+    transcript_schema,
+    toolchain_contract,
+    rustup,
+    cargo,
+    rustc,
+    rustdoc,
+    rust_objcopy,
+    linker,
+    toolchain_channel,
+    rustc_verbose,
+    target_dir,
+    cache_cargo_home,
+    registry_cache,
+    git_cache,
+    build_path,
+    rustup_home,
+    source_date_epoch,
+    objcopy_os,
+    sysroot,
+    build_started_utc,
+    build_completed_utc,
+) = sys.argv[1:]
+
+
+def fail(message):
+    raise SystemExit(f"build-milkv-duo.sh: {message}")
+
+
+source_root_path = pathlib.Path(source_root).resolve(strict=True)
+
+
+def logical_repo_path(path):
+    resolved = pathlib.Path(path).resolve(strict=True)
+    try:
+        relative = resolved.relative_to(source_root_path)
+    except ValueError:
+        fail(f"repository input escapes source root: {resolved}")
+    if not relative.parts:
+        fail(f"repository input has no logical role: {resolved}")
+    return relative.as_posix()
+
+
+def identity(path, *, require_build_identity=False, repository_input=False):
+    resolved = pathlib.Path(path).resolve(strict=True)
+    before = resolved.stat()
+    if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+        fail(f"cannot attest non-regular or empty file: {resolved}")
+    digest = hashlib.sha256()
+    needles = (source_commit.encode("ascii"), challenge.encode("ascii"))
+    found = [False, False]
+    overlap = max(map(len, needles)) - 1
+    tail = b""
+    with resolved.open("rb") as source:
+        while chunk := source.read(4 * 1024 * 1024):
+            digest.update(chunk)
+            if require_build_identity:
+                window = tail + chunk
+                found = [seen or needle in window for seen, needle in zip(found, needles)]
+                tail = window[-overlap:]
+    after = resolved.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        fail(f"file changed while hashing: {resolved}")
+    if require_build_identity and not all(found):
+        fail(f"built artifact does not embed source/challenge: {resolved}")
+    recorded_path = logical_repo_path(resolved) if repository_input else str(resolved)
+    return {"path": recorded_path, "sha256": digest.hexdigest(), "bytes": before.st_size}
+
+
+artifacts = {
+    "kernel_elf": identity(kernel_elf, require_build_identity=True, repository_input=True),
+    "kernel_binary": identity(kernel_bin, require_build_identity=True, repository_input=True),
+}
+tools = {
+    "build_script": identity(build_script, repository_input=True),
+    "prepare_jitterentropy_script": identity(prepare_jitterentropy_script, repository_input=True),
+    "jitterentropy_patch": identity(jitterentropy_patch, repository_input=True),
+    "gitmodules": identity(gitmodules, repository_input=True),
+    "firmware_manifest": identity(firmware_manifest, repository_input=True),
+    "firmware_build_script": identity(firmware_build_script, repository_input=True),
+    "firmware_linker_script": identity(firmware_linker_script, repository_input=True),
+    "firmware_cargo_config": identity(firmware_cargo_config, repository_input=True),
+    "kernel_manifest": identity(kernel_manifest, repository_input=True),
+    "workspace_manifest": identity(workspace_manifest, repository_input=True),
+    "cargo_lock": identity(cargo_lock, repository_input=True),
+    "workload_manifest": identity(workload_manifest, repository_input=True),
+    "transcript_schema": identity(transcript_schema, repository_input=True),
+    "toolchain_contract": identity(toolchain_contract, repository_input=True),
+}
+toolchain = {
+    "provenance": "build-runner-self-measured; package cross-platform live rehash unavailable",
+    "channel": toolchain_channel,
+    "rustc_verbose": rustc_verbose,
+    "rustup": identity(rustup),
+    "cargo": identity(cargo),
+    "rustc": identity(rustc),
+    "rustdoc": identity(rustdoc),
+    "rust_objcopy": identity(rust_objcopy),
+    "linker": identity(linker),
+}
+allowed_keys = [
+    "CARGO_HOME",
+    "CARGO_INCREMENTAL",
+    "CARGO_NET_OFFLINE",
+    "CARGO_TARGET_DIR",
+    "HOME",
+    "LC_ALL",
+    "PATH",
+    "RUSTC",
+    "RUSTDOC",
+    "RUSTUP_HOME",
+    "SOURCE_DATE_EPOCH",
+    "TMPDIR",
+    "TZ",
+    "VIBEOS_C84_CHALLENGE",
+    "VIBEOS_C84_SOURCE_COMMIT",
+]
+environment = {
+    "mode": "env -i",
+    "allowed_keys": allowed_keys,
+    "values": {
+        "CARGO_HOME": "<isolated-cargo-home>",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_NET_OFFLINE": "true",
+        "CARGO_TARGET_DIR": str(pathlib.Path(target_dir).resolve()),
+        "HOME": "<isolated-cargo-home>/home",
+        "LC_ALL": "C",
+        "PATH": build_path,
+        "RUSTC": str(pathlib.Path(rustc).resolve(strict=True)),
+        "RUSTDOC": str(pathlib.Path(rustdoc).resolve(strict=True)),
+        "RUSTUP_HOME": str(pathlib.Path(rustup_home).expanduser().resolve()),
+        "SOURCE_DATE_EPOCH": source_date_epoch,
+        "TMPDIR": "<isolated-cargo-home>/tmp",
+        "TZ": "UTC",
+        "VIBEOS_C84_CHALLENGE": challenge,
+        "VIBEOS_C84_SOURCE_COMMIT": source_commit,
+    },
+    "cargo_home_isolation": {
+        "ambient_config_loaded": False,
+        "temporary": True,
+        "cache_source": str(pathlib.Path(cache_cargo_home).expanduser().resolve()),
+        "registry_cache_symlinked": registry_cache == "true",
+        "git_cache_symlinked": git_cache == "true",
+    },
+}
+command = [
+    str(pathlib.Path(rustup).resolve(strict=True)),
+    "run",
+    toolchain_channel,
+    "cargo",
+    "build",
+    "--release",
+    "--locked",
+    "--offline",
+    "--no-default-features",
+    "--features",
+    "wasm-c84-ssh-managed-child-single-boot-collector",
+]
+objcopy_command = [
+    toolchain["rust_objcopy"]["path"],
+    "-O",
+    "binary",
+    artifacts["kernel_elf"]["path"],
+    artifacts["kernel_binary"]["path"],
+]
+objcopy_allowed_keys = ["LC_ALL", "PATH", "TZ"]
+objcopy_values = {"LC_ALL": "C", "PATH": "/usr/bin:/bin", "TZ": "UTC"}
+if objcopy_os == "Darwin":
+    objcopy_allowed_keys.insert(0, "DYLD_LIBRARY_PATH")
+    objcopy_values["DYLD_LIBRARY_PATH"] = str(pathlib.Path(sysroot).resolve(strict=True) / "lib")
+patch_identity = tools["jitterentropy_patch"]
+try:
+    workload = json.loads(pathlib.Path(workload_manifest).read_text(encoding="utf-8"))
+except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    fail(f"cannot decode C8.4 workload manifest: {error}")
+fixture = workload.get("fixture") if isinstance(workload, dict) else None
+if not isinstance(fixture, dict):
+    fail("C8.4 workload fixture is missing")
+artifact = fixture.get("artifact")
+input_fixture = fixture.get("input")
+output_fixture = fixture.get("output")
+if not all(isinstance(value, dict) for value in (artifact, input_fixture, output_fixture)):
+    fail("C8.4 workload fixture hashes are missing")
+run_fields = [
+    "vibeos.c84.aot-decision.run-id.v1",
+    source_commit,
+    challenge,
+    artifact.get("sha256"),
+    input_fixture.get("sha256"),
+    output_fixture.get("sha256"),
+    tools["workload_manifest"]["sha256"],
+    tools["transcript_schema"]["sha256"],
+]
+if not all(isinstance(value, str) and "\0" not in value for value in run_fields):
+    fail("C8.4 run-id fields are malformed")
+try:
+    run_id = hashlib.sha256("\0".join(run_fields).encode("ascii")).hexdigest()
+except UnicodeEncodeError as error:
+    fail(f"C8.4 run-id field is not ASCII: {error}")
+closed_utc = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+timestamp_values = [build_started_utc, build_completed_utc, closed_utc]
+parsed_timestamps = []
+for name, value in zip(("build_started", "build_completed", "envelope_closed"), timestamp_values):
+    if not isinstance(value, str) or not value.endswith("Z"):
+        fail(f"build timestamp {name} is not UTC")
+    try:
+        parsed_timestamps.append(datetime.datetime.fromisoformat(value[:-1] + "+00:00"))
+    except ValueError as error:
+        fail(f"build timestamp {name} is invalid: {error}")
+if parsed_timestamps != sorted(parsed_timestamps):
+    fail("build timestamps are reversed")
+content = {
+    "platform": "milkv-duo-cv1800b",
+    "source_commit": source_commit,
+    "challenge": challenge,
+    "run_id": run_id,
+    "source": {
+        "root": ".",
+        "head": source_commit,
+        "superproject_clean": True,
+        "status_policy": "git status --porcelain=v1 --untracked-files=all --ignore-submodules=all",
+        "jitterentropy": {
+            "path": logical_repo_path(jitterentropy_submodule),
+            "head": jitterentropy_head,
+            "patch_sha256": patch_identity["sha256"],
+            "patch_bytes": patch_identity["bytes"],
+            "observed_diff_sha256": jitterentropy_diff_sha256,
+            "observed_diff_bytes": int(jitterentropy_diff_bytes),
+            "policy": "exact recorded patch verified by prepare-jitterentropy-rs.sh",
+        },
+        "sunset": {
+            "path": logical_repo_path(sunset_submodule),
+            "head": sunset_head,
+            "worktree_clean": True,
+            "status_policy": "git status --porcelain=v1 --untracked-files=all --ignore-submodules=none",
+        },
+    },
+    "command": command,
+    "objcopy_command": objcopy_command,
+    "objcopy_environment": {
+        "mode": "env -i",
+        "allowed_keys": objcopy_allowed_keys,
+        "values": objcopy_values,
+    },
+    "environment": environment,
+    "toolchain": toolchain,
+    "artifacts": artifacts,
+    "tools": tools,
+    "timestamps_utc": {
+        "build_started": build_started_utc,
+        "build_completed": build_completed_utc,
+        "envelope_closed": closed_utc,
+    },
+}
+canonical = json.dumps(content, sort_keys=True, separators=(",", ":")).encode("utf-8")
+envelope = {
+    "schema": "vibeos.c84.duo-wasm-aot-profile.build-envelope",
+    "version": 1,
+    "status": "closed",
+    "content_sha256": hashlib.sha256(canonical).hexdigest(),
+    "content": content,
+}
+with pathlib.Path(destination).open("x", encoding="utf-8") as output:
+    json.dump(envelope, output, indent=2, sort_keys=True)
+    output.write("\n")
+PY
+  mv "$wasm_aot_profile_temp_envelope" "$wasm_aot_profile_build_envelope"
+  python3 - "$wasm_aot_profile_build_envelope" \
+    "$wasm_aot_profile_source_commit" "$wasm_aot_profile_challenge" \
+    "$repo_root" <<'PY'
+import datetime
+import hashlib
+import json
+import pathlib
+import stat
+import sys
+
+envelope_path = pathlib.Path(sys.argv[1]).resolve(strict=True)
+source_commit, challenge = sys.argv[2:4]
+source_root_path = pathlib.Path(sys.argv[4]).resolve(strict=True)
+
+
+def fail(message):
+    raise SystemExit(f"build-milkv-duo.sh: C8.4 closure rehash failed: {message}")
+
+
+def reject_duplicate_members(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail(f"duplicate JSON member {key!r}")
+        result[key] = value
+    return result
+
+
+before_envelope = envelope_path.stat()
+try:
+    envelope = json.loads(
+        envelope_path.read_text(encoding="utf-8"),
+        object_pairs_hook=reject_duplicate_members,
+    )
+except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    fail(f"cannot decode build envelope: {error}")
+if set(envelope) != {"schema", "version", "status", "content_sha256", "content"}:
+    fail("build envelope fields are not closed")
+if (
+    envelope["schema"] != "vibeos.c84.duo-wasm-aot-profile.build-envelope"
+    or type(envelope["version"]) is not int
+    or envelope["version"] != 1
+    or envelope["status"] != "closed"
+):
+    fail("build envelope identity/status differs")
+content = envelope.get("content")
+if not isinstance(content, dict) or set(content) != {
+    "platform", "source_commit", "challenge", "run_id", "source", "command",
+    "objcopy_command", "objcopy_environment", "environment", "toolchain",
+    "artifacts", "tools", "timestamps_utc",
+}:
+    fail("build content fields are not closed")
+canonical = json.dumps(content, sort_keys=True, separators=(",", ":")).encode("utf-8")
+if hashlib.sha256(canonical).hexdigest() != envelope["content_sha256"]:
+    fail("content address differs")
+if content.get("source_commit") != source_commit or content.get("challenge") != challenge:
+    fail("build identity differs")
+if content.get("platform") != "milkv-duo-cv1800b":
+    fail("build platform differs")
+source = content.get("source")
+if not isinstance(source, dict) or set(source) != {
+    "root", "head", "superproject_clean", "status_policy", "jitterentropy", "sunset",
+}:
+    fail("source fields are not closed")
+if (
+    source["root"] != "."
+    or source["head"] != source_commit
+    or source["superproject_clean"] is not True
+    or source["status_policy"] != "git status --porcelain=v1 --untracked-files=all --ignore-submodules=all"
+):
+    fail("superproject source attestation differs")
+jitter = source["jitterentropy"]
+if not isinstance(jitter, dict) or set(jitter) != {
+    "path", "head", "patch_sha256", "patch_bytes", "observed_diff_sha256",
+    "observed_diff_bytes", "policy",
+}:
+    fail("jitterentropy source fields are not closed")
+if (
+    jitter["path"] != "vendor/jitterentropy-rs"
+    or jitter["head"] != "c5bd2e17194fe3a04d17f74027bb67622579405f"
+    or not isinstance(jitter["patch_sha256"], str)
+    or len(jitter["patch_sha256"]) != 64
+    or any(character not in "0123456789abcdef" for character in jitter["patch_sha256"])
+    or jitter["patch_sha256"] != jitter["observed_diff_sha256"]
+    or type(jitter["patch_bytes"]) is not int
+    or jitter["patch_bytes"] <= 0
+    or jitter["patch_bytes"] != jitter["observed_diff_bytes"]
+    or jitter["policy"] != "exact recorded patch verified by prepare-jitterentropy-rs.sh"
+):
+    fail("jitterentropy source attestation differs")
+sunset = source["sunset"]
+if not isinstance(sunset, dict) or set(sunset) != {
+    "path", "head", "worktree_clean", "status_policy",
+}:
+    fail("sunset source fields are not closed")
+if (
+    sunset["path"] != "vendor/sunset"
+    or sunset["head"] != "f686eaaaba8b2eda3f83e23b4bb3005cae31ce5e"
+    or sunset["worktree_clean"] is not True
+    or sunset["status_policy"] != "git status --porcelain=v1 --untracked-files=all --ignore-submodules=none"
+):
+    fail("sunset source attestation differs")
+stage_root = (
+    pathlib.PurePosixPath("target")
+    / f".milkv-duo-wasm-aot-profile.stage.{source_commit}.{challenge}"
+)
+expected_repo_paths = {
+    "artifacts.kernel_elf": str(stage_root / "vibeos-milkv-duo-wasm-aot-profile.elf"),
+    "artifacts.kernel_binary": str(stage_root / "vibeos-milkv-duo.bin"),
+    "tools.build_script": "scripts/build-milkv-duo.sh",
+    "tools.prepare_jitterentropy_script": "scripts/prepare-jitterentropy-rs.sh",
+    "tools.jitterentropy_patch": "patches/jitterentropy-rs/0001-vibeos-qualification.patch",
+    "tools.gitmodules": ".gitmodules",
+    "tools.firmware_manifest": "firmware/milkv-duo/Cargo.toml",
+    "tools.firmware_build_script": "firmware/milkv-duo/build.rs",
+    "tools.firmware_linker_script": "firmware/milkv-duo/linker.ld",
+    "tools.firmware_cargo_config": "firmware/.cargo/config.toml",
+    "tools.kernel_manifest": "kernel/Cargo.toml",
+    "tools.workspace_manifest": "Cargo.toml",
+    "tools.cargo_lock": "Cargo.lock",
+    "tools.workload_manifest": "benchmarks/wasm-aot-decision/workloads-v1.json",
+    "tools.transcript_schema": "benchmarks/wasm-aot-decision/schema-v1.json",
+    "tools.toolchain_contract": "rust-toolchain.toml",
+}
+artifacts = content.get("artifacts")
+tools = content.get("tools")
+if not isinstance(artifacts, dict) or set(artifacts) != {"kernel_elf", "kernel_binary"}:
+    fail("artifacts fields are not closed")
+expected_tool_names = {label.split(".", 1)[1] for label in expected_repo_paths if label.startswith("tools.")}
+if not isinstance(tools, dict) or set(tools) != expected_tool_names:
+    fail("tools fields are not closed")
+records = [
+    (label, artifacts[label.split(".", 1)[1]] if label.startswith("artifacts.") else tools[label.split(".", 1)[1]], True)
+    for label in expected_repo_paths
+]
+toolchain = content.get("toolchain")
+if not isinstance(toolchain, dict) or set(toolchain) != {
+    "provenance", "channel", "rustc_verbose", "rustup", "cargo", "rustc",
+    "rustdoc", "rust_objcopy", "linker",
+}:
+    fail("toolchain fields are not closed")
+if toolchain["provenance"] != "build-runner-self-measured; package cross-platform live rehash unavailable":
+    fail("toolchain provenance differs")
+for name in ("rustup", "cargo", "rustc", "rustdoc", "rust_objcopy", "linker"):
+    records.append((f"toolchain.{name}", toolchain.get(name), False))
+snapshots = {}
+for label, record, is_repo_input in records:
+    if not isinstance(record, dict) or set(record) != {"path", "sha256", "bytes"}:
+        fail(f"{label} identity is malformed")
+    if (
+        not isinstance(record["path"], str)
+        or not isinstance(record["sha256"], str)
+        or len(record["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in record["sha256"])
+        or type(record["bytes"]) is not int
+        or record["bytes"] <= 0
+    ):
+        fail(f"{label} identity values are malformed")
+    if is_repo_input:
+        if record["path"] != expected_repo_paths[label]:
+            fail(f"{label} logical path differs")
+        pure = pathlib.PurePosixPath(record["path"])
+        if pure.is_absolute() or ".." in pure.parts or "." in pure.parts:
+            fail(f"{label} logical path escapes the source root")
+        path = (source_root_path / pathlib.Path(*pure.parts)).resolve(strict=True)
+        try:
+            path.relative_to(source_root_path)
+        except ValueError:
+            fail(f"{label} resolved outside the source root")
+    else:
+        if not pathlib.PurePath(record["path"]).is_absolute():
+            fail(f"{label} build-runner path is not absolute")
+        path = pathlib.Path(record["path"]).resolve(strict=True)
+    before = path.stat()
+    if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+        fail(f"{label} is not a non-empty regular file")
+    snapshots[label] = (path, before)
+needles = (source_commit.encode("ascii"), challenge.encode("ascii"))
+for label, record, _ in records:
+    path, before = snapshots[label]
+    digest = hashlib.sha256()
+    found = [False, False]
+    overlap = max(map(len, needles)) - 1
+    tail = b""
+    with path.open("rb") as source:
+        while chunk := source.read(4 * 1024 * 1024):
+            digest.update(chunk)
+            if label.startswith("artifacts."):
+                window = tail + chunk
+                found = [seen or needle in window for seen, needle in zip(found, needles)]
+                tail = window[-overlap:]
+    if before.st_size != record["bytes"] or digest.hexdigest() != record["sha256"]:
+        fail(f"{label} no longer matches the build envelope")
+    if label.startswith("artifacts.") and not all(found):
+        fail(f"{label} no longer embeds source/challenge")
+workload_record = tools.get("workload_manifest") if isinstance(tools, dict) else None
+schema_record = tools.get("transcript_schema") if isinstance(tools, dict) else None
+if not isinstance(workload_record, dict) or not isinstance(schema_record, dict):
+    fail("run-id contract records are missing")
+try:
+    workload = json.loads((source_root_path / workload_record["path"]).read_text(encoding="utf-8"))
+except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError) as error:
+    fail(f"cannot decode run-id workload: {error}")
+fixture = workload.get("fixture") if isinstance(workload, dict) else None
+try:
+    fields = [
+        "vibeos.c84.aot-decision.run-id.v1",
+        source_commit,
+        challenge,
+        fixture["artifact"]["sha256"],
+        fixture["input"]["sha256"],
+        fixture["output"]["sha256"],
+        workload_record["sha256"],
+        schema_record["sha256"],
+    ]
+except (KeyError, TypeError) as error:
+    fail(f"run-id workload fields are missing: {error}")
+expected_run_id = hashlib.sha256("\0".join(fields).encode("ascii")).hexdigest()
+if content.get("run_id") != expected_run_id:
+    fail("run id does not bind the C8.4 campaign")
+timestamps = content.get("timestamps_utc")
+if not isinstance(timestamps, dict) or set(timestamps) != {
+    "build_started", "build_completed", "envelope_closed",
+}:
+    fail("build timestamp fields are not closed")
+parsed_timestamps = []
+for name in ("build_started", "build_completed", "envelope_closed"):
+    value = timestamps[name]
+    if not isinstance(value, str) or not value.endswith("Z"):
+        fail(f"build timestamp {name} is not UTC")
+    try:
+        parsed_timestamps.append(datetime.datetime.fromisoformat(value[:-1] + "+00:00"))
+    except ValueError as error:
+        fail(f"build timestamp {name} is invalid: {error}")
+if parsed_timestamps != sorted(parsed_timestamps):
+    fail("build timestamps are reversed")
+for label, (path, before) in snapshots.items():
+    after = path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        fail(f"{label} changed during closure rehash")
+after_envelope = envelope_path.stat()
+if (
+    before_envelope.st_dev,
+    before_envelope.st_ino,
+    before_envelope.st_size,
+    before_envelope.st_mtime_ns,
+) != (
+    after_envelope.st_dev,
+    after_envelope.st_ino,
+    after_envelope.st_size,
+    after_envelope.st_mtime_ns,
+):
+    fail("build envelope changed during closure rehash")
+print("build-milkv-duo.sh C8.4 build closure rehash: PASS")
+PY
   if [ "$(git -C "$repo_root" rev-parse HEAD)" != "$wasm_aot_profile_source_commit" ] ||
      [ -n "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" ]; then
     echo "build-milkv-duo.sh: tracked source changed before WebAssembly AOT profile publication" >&2
     exit 1
   fi
+  python3 - "$jitterentropy_submodule" "$jitterentropy_patch" <<'PY'
+import pathlib
+import subprocess
+import sys
+
+submodule = pathlib.Path(sys.argv[1]).resolve(strict=True)
+patch = pathlib.Path(sys.argv[2]).resolve(strict=True).read_bytes()
+observed = subprocess.run(
+    ["git", "-C", str(submodule), "diff", "--unified=0", "--binary"],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout
+if observed != patch:
+    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs changed before publication")
+if subprocess.run(
+    ["git", "-C", str(submodule), "diff", "--cached", "--quiet", "--exit-code"],
+).returncode != 0:
+    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs gained staged changes before publication")
+untracked = subprocess.run(
+    ["git", "-C", str(submodule), "ls-files", "--others", "--exclude-standard", "-z"],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout
+if untracked:
+    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs gained untracked files before publication")
+PY
   if [ -e "$wasm_aot_profile_publish_dir" ] || [ -L "$wasm_aot_profile_publish_dir" ]; then
     echo "build-milkv-duo.sh: WebAssembly AOT profile publication path reappeared during the build" >&2
     exit 1
   fi
-  mv -- "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir"
+  python3 - "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir" "$repo_root/target" <<'PY'
+import ctypes
+import errno
+import os
+import pathlib
+import platform
+import stat
+import sys
+
+source = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+parent = pathlib.Path(sys.argv[3]).resolve(strict=True)
+if source.is_symlink() or not source.is_dir():
+    raise SystemExit("build-milkv-duo.sh: C8.4 publication source is not a fixed directory")
+if destination.parent.resolve(strict=True) != parent or destination.name != "milkv-duo-wasm-aot-profile":
+    raise SystemExit("build-milkv-duo.sh: C8.4 publication destination differs")
+if stat.S_ISLNK(destination.parent.lstat().st_mode):
+    raise SystemExit("build-milkv-duo.sh: C8.4 publication parent is a symlink")
+if destination.exists() or destination.is_symlink():
+    raise SystemExit("build-milkv-duo.sh: C8.4 publication destination already exists")
+children = list(source.iterdir())
+if {child.name for child in children} != {
+    "vibeos-milkv-duo-wasm-aot-profile.elf", "vibeos-milkv-duo.bin", "build-envelope.json",
+}:
+    raise SystemExit("build-milkv-duo.sh: C8.4 staged publication entries are not closed")
+for child in children:
+    if child.is_symlink() or not child.is_file():
+        raise SystemExit(f"build-milkv-duo.sh: C8.4 staged publication entry differs: {child}")
+    descriptor = os.open(child, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+source_descriptor = os.open(source, os.O_RDONLY)
+try:
+    os.fsync(source_descriptor)
+finally:
+    os.close(source_descriptor)
+
+system = platform.system()
+libc = ctypes.CDLL(None, use_errno=True)
+source_bytes = os.fsencode(source)
+destination_bytes = os.fsencode(destination)
+if system == "Linux" and hasattr(libc, "renameat2"):
+    libc.renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    libc.renameat2.restype = ctypes.c_int
+    result = libc.renameat2(-100, source_bytes, -100, destination_bytes, 1)
+elif system == "Darwin" and hasattr(libc, "renamex_np"):
+    libc.renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    libc.renamex_np.restype = ctypes.c_int
+    result = libc.renamex_np(source_bytes, destination_bytes, 0x00000004)
+else:
+    raise SystemExit(f"build-milkv-duo.sh: atomic no-replace directory publication is unsupported on {system}")
+if result != 0:
+    error = ctypes.get_errno()
+    if error in (errno.EEXIST, errno.ENOTEMPTY):
+        raise SystemExit("build-milkv-duo.sh: C8.4 publication destination appeared concurrently")
+    raise OSError(error, os.strerror(error), str(destination))
+parent_descriptor = os.open(parent, os.O_RDONLY)
+try:
+    os.fsync(parent_descriptor)
+finally:
+    os.close(parent_descriptor)
+PY
   wasm_aot_profile_stage_dir=
   output_dir=$wasm_aot_profile_publish_dir
   output_elf="$output_dir/vibeos-milkv-duo-wasm-aot-profile.elf"
   output_bin="$output_dir/vibeos-milkv-duo.bin"
   echo "Milk-V Duo ELF: $output_elf"
   echo "Milk-V Duo binary: $output_bin"
-  if [ -n "$sdk_root" ]; then
-    echo "Milk-V Duo FIT: $output_dir/boot.sd"
-  fi
+  echo "Milk-V Duo WebAssembly AOT profile build envelope: $output_dir/build-envelope.json"
 fi
 
 if [ "$runtime_costs" = true ]; then

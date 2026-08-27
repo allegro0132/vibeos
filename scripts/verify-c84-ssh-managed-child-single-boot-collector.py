@@ -2465,8 +2465,13 @@ def verify_milkv_build_script(raw: bytes) -> None:
         'if [ "$identity_value" = "$test_value" ]',
     ):
         require(required in identity, f"Milk-V collector identity validation omits {required!r}")
-    branch_start = source.index('if [ "$wasm_aot_profile" = true ]; then')
-    branch_end = source.index("\nfi\n", branch_start) + len("\nfi\n")
+    branch_start = source.index(
+        'if [ "$wasm_aot_profile" = true ]; then\n'
+        "  require_wasm_aot_profile_identity VIBEOS_C84_SOURCE_COMMIT"
+    )
+    branch_end = source.index(
+        '\n\nif [ "$diagnostic" = false ]', branch_start
+    )
     branch = source[branch_start:branch_end]
     for required in (
         'git -C "$repo_root" rev-parse HEAD',
@@ -2477,13 +2482,28 @@ def verify_milkv_build_script(raw: bytes) -> None:
     ):
         require(required in branch, f"Milk-V collector pre-build binding omits {required!r}")
     require(
-        source.count('"$script_dir/prepare-jitterentropy-rs.sh"') == 2,
+        source.count('"$script_dir/prepare-jitterentropy-rs.sh"') == 3
+        and source.count('  "$script_dir/prepare-jitterentropy-rs.sh"\n') == 1
+        and source.count('  "$script_dir/prepare-jitterentropy-rs.sh" >/dev/null\n') == 1,
         "Milk-V collector does not verify/apply the recorded jitterentropy patch both before and after build",
     )
     require(
         '1111111111111111111111111111111111111111' in branch
         and '2222222222222222222222222222222222222222222222222222222222222222' in branch,
         "Milk-V collector build does not reject both QEMU sentinels",
+    )
+    require(
+        source.count(
+            'if [ "$wasm_aot_profile" = true ] && [ -n "$sdk_arg" ]; then'
+        )
+        == 1
+        and
+        source.count(
+            "build-milkv-duo.sh: --wasm-aot-profile does not accept an SDK argument; "
+            "run package-milkv-duo-sdk.sh --wasm-aot-profile separately"
+        )
+        == 1,
+        "Milk-V collector build does not give the package script exclusive SDK ownership",
     )
     mode_start = source.index('elif [ "$wasm_aot_profile" = true ]; then', source.index("features=milkv-ssh"))
     mode_end = source.index("\nfi\noutput_bin=", mode_start)
@@ -2543,8 +2563,12 @@ def verify_milkv_build_script(raw: bytes) -> None:
         and objcopy.count('"$rust_objcopy" -O binary "$output_elf" "$output_bin"') == 2,
         "Milk-V collector objcopy is not isolated on both host branches",
     )
-    post_start = source.rindex('if [ "$wasm_aot_profile" = true ]; then')
-    post = source[post_start:]
+    post_start = source.index(
+        'if [ "$wasm_aot_profile" = true ]; then\n'
+        "  # The production SSH image needs the repository-recorded jitterentropy"
+    )
+    post_end = source.index('\n\nif [ "$runtime_costs" = true ]; then', post_start)
+    post = source[post_start:post_end]
     ordered = (
         '"$script_dir/prepare-jitterentropy-rs.sh"',
         'git -C "$repo_root" rev-parse HEAD',
@@ -2581,66 +2605,54 @@ def verify_milkv_build_script(raw: bytes) -> None:
         '"${wasm_aot_profile_tmpdir-}"/vibeos-c84-cargo-home.*)',
         'rm -rf -- "$wasm_aot_profile_cargo_home_sandbox"',
         'if [ -n "$wasm_aot_profile_stage_dir" ]',
-        '"$repo_root/target/.milkv-duo-wasm-aot-profile.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge."??????)',
-        'rm -rf -- "$wasm_aot_profile_stage_dir"',
+        '"$repo_root/target/.milkv-duo-wasm-aot-profile.stage.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge")',
+        'vibeos-milkv-duo-wasm-aot-profile.elf vibeos-milkv-duo.bin',
+        'rm -f -- "$staged_path"',
+        'rmdir -- "$wasm_aot_profile_stage_dir"',
         'if [ "$wasm_aot_profile_publish_lock_held" = true ]',
         '"$repo_root/target/.milkv-duo-wasm-aot-profile.publish.lock")',
         'rmdir -- "$wasm_aot_profile_publish_lock"',
     ):
         require(required in cleanup, f"Milk-V collector failure cleanup omits {required!r}")
-    require(cleanup.count("rm -rf --") == 2, "Milk-V collector sandbox/staging cleanup has a broad or duplicate recursive removal")
+    require(
+        cleanup.count("rm -rf --") == 1,
+        "Milk-V collector staging cleanup contains a recursive removal",
+    )
     require(source.count("trap cleanup_build EXIT") == 1, "Milk-V collector failure cleanup is not installed exactly once")
+    for signal, code in (("HUP", "129"), ("INT", "130"), ("TERM", "143")):
+        require(
+            source.count(f"trap 'exit {code}' {signal}") == 1,
+            f"Milk-V collector cleanup lacks its {signal} signal trap",
+        )
     require(
         source.count("cleanup_wasm_aot_profile_build") == 2
         and "cleanup_runtime_costs_build\n  cleanup_wasm_aot_profile_build" in source,
         "Milk-V collector cleanup is not joined to the existing build cleanup",
     )
 
-    fixed_artifacts = (
-        "vibeos-milkv-duo-wasm-aot-profile.elf",
-        "vibeos-milkv-duo.bin",
-        "boot.sd",
-        "milkv-duo.its",
-        "cv1800b_milkv_duo_sd.dtb",
-    )
-    fixed_clear_start = branch.index("    rm -f -- \\\n")
-    fixed_clear_end = branch.index("\n    if ! rmdir --", fixed_clear_start)
-    fixed_clear = branch[fixed_clear_start:fixed_clear_end]
-    for artifact in fixed_artifacts:
-        require(
-            fixed_clear.count(f'"$wasm_aot_profile_publish_dir/{artifact}"') == 1,
-            f"Milk-V collector fixed-set cleanup omits or duplicates {artifact}",
-        )
-    require(
-        fixed_clear.count('"$wasm_aot_profile_publish_dir/') == len(fixed_artifacts)
-        and "*" not in fixed_clear
-        and "?" not in fixed_clear,
-        "Milk-V collector fixed-set cleanup is broad or admits extra paths",
-    )
-    require(
-        branch.count('rm -rf -- "$wasm_aot_profile_target_dir"') == 1 and branch.count("rm -rf --") == 1,
-        "Milk-V collector identity target cleanup is broad or duplicated",
-    )
     for required in (
         'wasm_aot_profile_publish_dir="$repo_root/target/milkv-duo-wasm-aot-profile"',
         'wasm_aot_profile_publish_lock="$repo_root/target/.milkv-duo-wasm-aot-profile.publish.lock"',
         'case "$wasm_aot_profile_target_dir" in',
         '"$repo_root/target/c84-milkv-build/$wasm_aot_profile_source_commit/$wasm_aot_profile_challenge")',
         'if ! mkdir "$wasm_aot_profile_publish_lock"; then',
-        'if [ -L "$wasm_aot_profile_publish_dir" ]',
-        'if [ -d "$wasm_aot_profile_publish_dir" ]; then',
-        'if ! rmdir -- "$wasm_aot_profile_publish_dir"; then',
-        'rm -rf -- "$wasm_aot_profile_target_dir"',
-        '"$repo_root/target/.milkv-duo-wasm-aot-profile.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge.XXXXXX"',
+        'if [ -e "$wasm_aot_profile_publish_dir" ] || [ -L "$wasm_aot_profile_publish_dir" ]; then',
+        'if [ -e "$wasm_aot_profile_target_dir" ] || [ -L "$wasm_aot_profile_target_dir" ]; then',
+        'wasm_aot_profile_stage_dir="$repo_root/target/.milkv-duo-wasm-aot-profile.stage.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge"',
+        '! mkdir "$wasm_aot_profile_stage_dir"; then',
     ):
-        require(required in branch, f"Milk-V collector narrow pre-build staging omits {required!r}")
+        require(required in branch, f"Milk-V collector no-clobber pre-build staging omits {required!r}")
+    require(
+        'rm -rf -- "$wasm_aot_profile_target_dir"' not in branch
+        and "mktemp -d" not in branch,
+        "Milk-V collector clears or randomizes its identity-bound build/staging path",
+    )
     prebuild_order = (
         branch.index('if ! mkdir "$wasm_aot_profile_publish_lock"; then'),
-        branch.index('if [ -L "$wasm_aot_profile_publish_dir" ]'),
-        fixed_clear_start,
-        branch.index('if ! rmdir -- "$wasm_aot_profile_publish_dir"; then'),
-        branch.index('rm -rf -- "$wasm_aot_profile_target_dir"'),
-        branch.index("wasm_aot_profile_stage_dir=$(mktemp -d"),
+        branch.index('if [ -e "$wasm_aot_profile_publish_dir" ] || [ -L "$wasm_aot_profile_publish_dir" ]; then'),
+        branch.index('if [ -e "$wasm_aot_profile_target_dir" ] || [ -L "$wasm_aot_profile_target_dir" ]; then'),
+        branch.index('wasm_aot_profile_stage_dir="$repo_root/target/.milkv-duo-wasm-aot-profile.stage.'),
+        branch.index('! mkdir "$wasm_aot_profile_stage_dir"; then'),
     )
     require(prebuild_order == tuple(sorted(prebuild_order)), "Milk-V collector pre-build cleanup/staging order differs")
 
@@ -2656,12 +2668,6 @@ def verify_milkv_build_script(raw: bytes) -> None:
     copy_start = source.index('mkdir -p "$output_dir"', stage_select_end)
     require(stage_select_end < copy_start, "Milk-V collector writes an artifact before selecting private staging")
 
-    package_start = source.index('if [ -n "$sdk_root" ]; then', copy_start)
-    package_end = source.index('\nfi\n\nif [ "$wasm_aot_profile" = true ]; then', package_start) + len("\nfi\n")
-    package = source[package_start:package_end]
-    for artifact in ("boot.sd", "milkv-duo.its", "cv1800b_milkv_duo_sd.dtb"):
-        require(artifact in package, f"Milk-V collector SDK packaging omits staged {artifact}")
-    require("else" not in package, "Milk-V collector no-SDK path can inherit package artifacts")
     require(
         '''if [ "$wasm_aot_profile" = false ]; then
   echo "Milk-V Duo ELF: $output_elf"
@@ -2670,50 +2676,27 @@ fi'''
         in source,
         "Milk-V collector prints private staging paths before publication",
     )
-    require(
-        '''  if [ "$wasm_aot_profile" = false ]; then
-    echo "Milk-V Duo FIT: $output_dir/boot.sd"
-  fi'''
-        in package,
-        "Milk-V collector prints its staged FIT before publication",
-    )
-    require(
-        source.count('echo "Milk-V Duo ELF: $output_elf"') == 2
-        and source.count('echo "Milk-V Duo binary: $output_bin"') == 2
-        and source.count('echo "Milk-V Duo FIT: $output_dir/boot.sd"') == 2,
-        "Milk-V collector artifact path publication count differs",
-    )
-
-    post_sdk_start = post.index('  if [ -n "$sdk_root" ]; then')
-    post_sdk_end = post.index("\n  fi\n", post_sdk_start) + len("\n  fi\n")
-    post_sdk = post[post_sdk_start:post_sdk_end]
-    for required in (
-        'for artifact in "$output_dtb" "$output_its" "$output_fit"',
-        '[ -L "$artifact" ] || [ ! -f "$artifact" ] || [ ! -s "$artifact" ]',
-        'cmp -s "$sdk_dtb" "$output_dtb"',
-        'cmp -s "$script_dir/milkv-duo.its" "$output_its"',
-        'grep -a -F -q "$wasm_aot_profile_source_commit" "$output_fit"',
-        'grep -a -F -q "$wasm_aot_profile_challenge" "$output_fit"',
-    ):
-        require(required in post_sdk, f"Milk-V collector staged package postcheck omits {required!r}")
     for required in (
         '[ -L "$artifact" ] || [ ! -f "$artifact" ] || [ ! -s "$artifact" ]',
         'if [ "$(git -C "$repo_root" rev-parse HEAD)" != "$wasm_aot_profile_source_commit" ] ||',
         '[ -n "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" ]; then',
         'if [ -e "$wasm_aot_profile_publish_dir" ] || [ -L "$wasm_aot_profile_publish_dir" ]; then',
-        'mv -- "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir"',
+        'if system == "Linux" and hasattr(libc, "renameat2"):',
+        'elif system == "Darwin" and hasattr(libc, "renamex_np"):',
+        '"vibeos-milkv-duo-wasm-aot-profile.elf", "vibeos-milkv-duo.bin", "build-envelope.json",',
         "wasm_aot_profile_stage_dir=",
         "output_dir=$wasm_aot_profile_publish_dir",
     ):
         require(required in post, f"Milk-V collector atomic publication closure omits {required!r}")
-    publish_move = post.index('  mv -- "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir"')
+    publish_move = post.index('  python3 - "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir" "$repo_root/target"')
     require(
-        post.count('mv -- "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir"') == 1,
-        "Milk-V collector atomic publication is duplicated",
+        post.count('  python3 - "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir" "$repo_root/target"') == 1
+        and 'mv -- "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir"' not in post,
+        "Milk-V collector no-replace publication is duplicated or bypassed",
     )
     publication_order = (
         post.index('  for artifact in "$output_elf" "$output_bin"; do'),
-        post_sdk_start,
+        post.index("build-milkv-duo.sh C8.4 build closure rehash: PASS"),
         post.index("tracked source changed before WebAssembly AOT profile publication"),
         post.index('  if [ -e "$wasm_aot_profile_publish_dir" ] || [ -L "$wasm_aot_profile_publish_dir" ]; then'),
         publish_move,
@@ -2721,11 +2704,69 @@ fi'''
         post.index("  output_dir=$wasm_aot_profile_publish_dir", publish_move),
         post.index('  echo "Milk-V Duo ELF: $output_elf"', publish_move),
         post.index('  echo "Milk-V Duo binary: $output_bin"', publish_move),
-        post.index('    echo "Milk-V Duo FIT: $output_dir/boot.sd"', publish_move),
     )
     require(publication_order == tuple(sorted(publication_order)), "Milk-V collector postcheck/publication/printing order differs")
     require("Milk-V Duo ELF:" not in post[:publish_move], "Milk-V collector exposes a path before atomic publication")
-    require("package-envelope" not in mode and "build-envelope" not in mode, "collector node incorrectly claims a sealed package/capture envelope")
+    require(
+        'echo "Milk-V Duo FIT: $output_dir/boot.sd"' not in post[publish_move:],
+        "Milk-V collector build still claims ownership of FIT packaging",
+    )
+
+    envelope_start = post.index('  python3 - \\\n    "$wasm_aot_profile_temp_envelope"')
+    closure_start = post.index('  python3 - "$wasm_aot_profile_build_envelope"', envelope_start)
+    envelope = post[envelope_start:closure_start]
+    for required in (
+        '"root": "."',
+        '"path": logical_repo_path(jitterentropy_submodule)',
+        '"path": logical_repo_path(sunset_submodule)',
+        '"provenance": "build-runner-self-measured; package cross-platform live rehash unavailable"',
+        '"kernel_elf": identity(kernel_elf, require_build_identity=True, repository_input=True)',
+        '"kernel_binary": identity(kernel_bin, require_build_identity=True, repository_input=True)',
+        '"transcript_schema": identity(transcript_schema, repository_input=True)',
+        'for name, value in zip(("build_started", "build_completed", "envelope_closed"), timestamp_values)',
+    ):
+        require(required in envelope, f"Milk-V collector build envelope omits {required!r}")
+    repository_tool_inputs = {
+        "build_script": "build_script",
+        "prepare_jitterentropy_script": "prepare_jitterentropy_script",
+        "jitterentropy_patch": "jitterentropy_patch",
+        "gitmodules": "gitmodules",
+        "firmware_manifest": "firmware_manifest",
+        "firmware_build_script": "firmware_build_script",
+        "firmware_linker_script": "firmware_linker_script",
+        "firmware_cargo_config": "firmware_cargo_config",
+        "kernel_manifest": "kernel_manifest",
+        "workspace_manifest": "workspace_manifest",
+        "cargo_lock": "cargo_lock",
+        "workload_manifest": "workload_manifest",
+        "transcript_schema": "transcript_schema",
+        "toolchain_contract": "toolchain_contract",
+    }
+    for role, variable in repository_tool_inputs.items():
+        require(
+            f'"{role}": identity({variable}, repository_input=True)' in envelope,
+            f"Milk-V collector build envelope does not normalize repository tool {role}",
+        )
+    closure = post[closure_start:publish_move]
+    for required in (
+        'source["root"] != "."',
+        'jitter["path"] != "vendor/jitterentropy-rs"',
+        'sunset["path"] != "vendor/sunset"',
+        'toolchain["provenance"] != "build-runner-self-measured; package cross-platform live rehash unavailable"',
+        'path = (source_root_path / pathlib.Path(*pure.parts)).resolve(strict=True)',
+        'for name in ("build_started", "build_completed", "envelope_closed"):',
+    ):
+        require(required in closure, f"Milk-V collector build closure omits {required!r}")
+    require(
+        source.count('["git", "-C", str(submodule), "diff", "--cached", "--binary"]') == 1
+        and source.count('["git", "-C", str(submodule), "diff", "--cached", "--quiet", "--exit-code"]') == 1
+        and source.count('["git", "-C", str(submodule), "ls-files", "--others", "--exclude-standard", "-z"]') == 2,
+        "Milk-V collector does not reject staged/untracked jitterentropy drift twice",
+    )
+    require(
+        "package-envelope" not in mode,
+        "collector build mode incorrectly claims a sealed package envelope",
+    )
 
 
 def verify_docs_ci(inputs: Inputs) -> None:
@@ -2806,27 +2847,68 @@ def verify_docs_ci(inputs: Inputs) -> None:
             "env -i",
             "isolated Cargo home",
             "SOURCE_DATE_EPOCH",
-            "hostile ambient",
         ):
             require(phrase in doc, f"{label} omits the closed physical-build fact {phrase!r}")
+    require(
+        "hostile ambient" in inputs.testing
+        and "sanitized `env -i` envelope" in inputs.decision_doc,
+        "software-only closed-build environment description differs",
+    )
     require("34,386" in inputs.decision_doc and KNOWN_TRANSCRIPT_SHA256 in inputs.decision_doc, "decision doc known-answer transcript differs")
-    for doc, label in ((inputs.testing, "TESTING"), (inputs.decision_doc, "decision doc")):
-        lower = doc.lower()
-        normalized = re.sub(r"\s+", " ", lower).replace("cold-boot", "cold boot")
+    testing_status = re.sub(r"\s+", " ", inputs.testing.lower()).replace(
+        "cold-boot", "cold boot"
+    )
+    require(
+        "compile" in testing_status
+        and "link" in testing_status
+        and "freshly" in testing_status
+        and "challenge" in testing_status
+        and "neither runs nor retains" in testing_status
+        and "physical cold boot" in testing_status,
+        "TESTING overclaims the CI physical type/link gate",
+    )
+    decision_status = re.sub(r"\s+", " ", inputs.decision_doc.lower()).replace(
+        "cold-boot", "cold boot"
+    )
+    for phrase in (
+        "ci does not package an sdk image or contact a board",
+        "never open a uart",
+        "no sdk, docker, network, flash, reset, or physical cold boot",
+        "produce no decision-eligible evidence",
+    ):
         require(
-            "compile" in normalized
-            and "link" in normalized
-            and "freshly" in normalized
-            and "challenge" in normalized
-            and "neither runs nor retains" in normalized
-            and "physical cold boot" in normalized
-            and (
-                "not a capture" in normalized
-                or "none is supplied by this compile gate" in normalized
-            ),
-            f"{label} overclaims the CI physical type/link gate",
+            phrase in decision_status,
+            f"decision doc software-only CI boundary omits {phrase!r}",
         )
     require("implementation in progress" in inputs.roadmap, "roadmap no longer reports the remaining physical evidence work")
+    for doc, label in (
+        (inputs.testing, "TESTING"),
+        (inputs.decision_doc, "decision doc"),
+        (inputs.roadmap, "roadmap"),
+    ):
+        normalized = re.sub(r"\s+", " ", doc.lower()).replace("cold-boot", "cold boot")
+        require(
+            "physical testing is paused at operator request" in normalized,
+            f"{label} omits the operator-paused physical status",
+        )
+        synthetic_boundary = (
+            "synthetic host files"
+            if label == "TESTING"
+            else "host-only synthetic"
+        )
+        require(
+            synthetic_boundary in normalized,
+            f"{label} omits the software-only synthetic coverage boundary",
+        )
+        incomplete_decision = (
+            "no physical c8.4 result"
+            if label == "decision doc"
+            else "no workload-specific aot decision"
+        )
+        require(
+            incomplete_decision in normalized,
+            f"{label} overclaims a workload-specific AOT decision",
+        )
 
 
 def verify_collector(inputs: Inputs) -> None:
@@ -2852,7 +2934,19 @@ def verify_collector(inputs: Inputs) -> None:
 def verify(inputs: Inputs, *, predecessors: bool = True) -> None:
     if predecessors:
         try:
-            TRUSTED.verify(inputs.trusted_predecessor)
+            trusted = inputs.trusted_predecessor
+            TRUSTED.STREAM.verify(trusted.stream_predecessor)
+            TRUSTED.PUBLISHER.verify(
+                trusted.publisher_predecessor,
+                predecessor=False,
+                contract=False,
+            )
+            TRUSTED.verify_features(trusted)
+            TRUSTED.verify_sshd(trusted.sshd)
+            TRUSTED.verify_runtime(trusted.runtime)
+            TRUSTED.verify_component(trusted.component)
+            TRUSTED.verify_slot(trusted.slot)
+            TRUSTED.verify_ssh(trusted)
         except Exception as error:
             raise VerificationError(f"trusted-sample predecessor failed: {error}") from error
         try:
@@ -4485,7 +4579,7 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'rm -rf -- "$wasm_aot_profile_stage_dir"',
+                b'rm -f -- "$staged_path"',
                 b": # staged failure artifacts retained",
                 "Milk-V staging failure cleanup",
             ),
@@ -4495,7 +4589,7 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'"$repo_root/target/.milkv-duo-wasm-aot-profile.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge."??????)',
+                b'"$repo_root/target/.milkv-duo-wasm-aot-profile.stage.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge")',
                 b'"$repo_root/target"/*)',
                 "Milk-V narrow staging cleanup",
             ),
@@ -4511,33 +4605,33 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             ),
         ),
         (
-            "milkv-old-fit-not-cleared",
+            "milkv-sdk-positional-accepted",
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'      "$wasm_aot_profile_publish_dir/boot.sd" \\\n',
-                b"",
-                "Milk-V stale FIT cleanup",
+                b'if [ "$wasm_aot_profile" = true ] && [ -n "$sdk_arg" ]; then',
+                b"if false; then",
+                "Milk-V exclusive SDK packaging ownership",
             ),
         ),
         (
-            "milkv-old-its-not-cleared",
+            "milkv-target-clobber-restored",
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'      "$wasm_aot_profile_publish_dir/milkv-duo.its" \\\n',
-                b"",
-                "Milk-V stale ITS cleanup",
+                b'if [ -e "$wasm_aot_profile_target_dir" ] || [ -L "$wasm_aot_profile_target_dir" ]; then\n    echo "build-milkv-duo.sh: WebAssembly AOT profile target is no-clobber:',
+                b'if false; then\n    echo "build-milkv-duo.sh: WebAssembly AOT profile target is no-clobber:',
+                "Milk-V identity target no-clobber gate",
             ),
         ),
         (
-            "milkv-old-dtb-not-cleared",
+            "milkv-stage-no-clobber-bypassed",
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'      "$wasm_aot_profile_publish_dir/cv1800b_milkv_duo_sd.dtb"\n',
-                b'      "$wasm_aot_profile_publish_dir/obsolete.dtb"\n',
-                "Milk-V stale DTB cleanup",
+                b'! mkdir "$wasm_aot_profile_stage_dir"; then',
+                b'mkdir -p "$wasm_aot_profile_stage_dir"; then',
+                "Milk-V staging no-clobber gate",
             ),
         ),
         (
@@ -4545,8 +4639,8 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'"$repo_root/target/.milkv-duo-wasm-aot-profile.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge.XXXXXX"',
-                b'"$repo_root/target/.milkv-duo-wasm-aot-profile.$wasm_aot_profile_source_commit.XXXXXX"',
+                b'wasm_aot_profile_stage_dir="$repo_root/target/.milkv-duo-wasm-aot-profile.stage.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge"',
+                b'wasm_aot_profile_stage_dir="$repo_root/target/.milkv-duo-wasm-aot-profile.stage.$wasm_aot_profile_source_commit"',
                 "Milk-V identity-keyed staging",
             ),
         ),
@@ -4561,33 +4655,73 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             ),
         ),
         (
-            "milkv-dtb-postcheck-bypassed",
+            "milkv-envelope-source-root-absolute",
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'    if ! cmp -s "$sdk_dtb" "$output_dtb"; then',
-                b"    if false; then",
-                "Milk-V staged DTB postcheck",
+                b'        "root": ".",',
+                b'        "root": str(source_root_path),',
+                "Milk-V portable build source role",
             ),
         ),
         (
-            "milkv-its-postcheck-bypassed",
+            "milkv-envelope-artifact-host-path",
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'    if ! cmp -s "$script_dir/milkv-duo.its" "$output_its"; then',
-                b"    if false; then",
-                "Milk-V staged ITS postcheck",
+                b'"kernel_binary": identity(kernel_bin, require_build_identity=True, repository_input=True)',
+                b'"kernel_binary": identity(kernel_bin, require_build_identity=True)',
+                "Milk-V portable artifact role",
             ),
         ),
         (
-            "milkv-fit-identity-postcheck-bypassed",
+            "milkv-toolchain-provenance-removed",
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'    if ! grep -a -F -q "$wasm_aot_profile_source_commit" "$output_fit" ||',
-                b"    if false ||",
-                "Milk-V staged FIT identity postcheck",
+                b'    "provenance": "build-runner-self-measured; package cross-platform live rehash unavailable",\n',
+                b"",
+                "Milk-V build-runner tool provenance",
+            ),
+        ),
+        (
+            "milkv-timestamp-order-genericized",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'for name, value in zip(("build_started", "build_completed", "envelope_closed"), timestamp_values):',
+                b"for name, value in zip(sorted((\"build_started\", \"build_completed\", \"envelope_closed\")), timestamp_values):",
+                "Milk-V semantic timestamp order",
+            ),
+        ),
+        (
+            "milkv-jitter-staged-gate-removed",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'["git", "-C", str(submodule), "diff", "--cached", "--binary"],',
+                b'["git", "-C", str(submodule), "diff", "--binary"],',
+                "Milk-V staged jitterentropy rejection",
+            ),
+        ),
+        (
+            "milkv-jitter-untracked-gate-removed",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'''["git", "-C", str(submodule), "ls-files", "--others", "--exclude-standard", "-z"],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout
+if untracked:
+    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs has untracked files")''',
+                b'''["git", "-C", str(submodule), "ls-files", "-z"],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout
+if untracked:
+    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs has untracked files")''',
+                "Milk-V untracked jitterentropy rejection",
             ),
         ),
         (
@@ -4605,9 +4739,19 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'  mv -- "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir"',
-                b'  cp -R "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir"',
-                "Milk-V atomic publication",
+                b'if system == "Linux" and hasattr(libc, "renameat2"):',
+                b'if system == "Linux" and False:',
+                "Milk-V Linux atomic no-replace publication",
+            ),
+        ),
+        (
+            "milkv-darwin-noreplace-removed",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'elif system == "Darwin" and hasattr(libc, "renamex_np"):',
+                b'elif system == "Darwin" and False:',
+                "Milk-V Darwin atomic no-replace publication",
             ),
         ),
         (
@@ -4726,9 +4870,40 @@ echo "Milk-V Duo binary: $output_bin"''',
             lambda data: mutate_text(
                 data,
                 "decision_doc",
-                "but neither runs nor retains the artifact",
-                "and runs and retains the artifact",
+                "They never open a UART; these commands also require no SDK, Docker, network,\n"
+                "flash, reset, or physical cold boot and produce no decision-eligible evidence.",
+                "They open a UART and produce decision-eligible physical evidence.",
                 "decision CI evidence claim",
+            ),
+        ),
+        (
+            "roadmap-physical-pause-removed",
+            lambda data: mutate_text(
+                data,
+                "roadmap",
+                "Milk-V Duo physical testing is paused at operator request.",
+                "Milk-V Duo physical testing is complete.",
+                "roadmap operator-paused physical status",
+            ),
+        ),
+        (
+            "testing-aot-decision-overclaimed",
+            lambda data: mutate_text(
+                data,
+                "testing",
+                "and no\nworkload-specific AOT decision.",
+                "and a complete\nworkload-specific AOT decision.",
+                "TESTING incomplete AOT decision status",
+            ),
+        ),
+        (
+            "decision-synthetic-boundary-removed",
+            lambda data: mutate_text(
+                data,
+                "decision_doc",
+                "has host-only synthetic coverage.",
+                "has no synthetic coverage.",
+                "decision software-only synthetic boundary",
             ),
         ),
     ]

@@ -30,6 +30,8 @@ VERIFIED_STREAM_FEATURE = "wasm-c84-ssh-managed-child-verified-stream"
 VERIFIED_STREAM_QEMU_FEATURE = f"{VERIFIED_STREAM_FEATURE}-qemu-acceptance"
 TRUSTED_SAMPLE_FEATURE = "wasm-c84-ssh-managed-child-trusted-sample"
 TRUSTED_SAMPLE_QEMU_FEATURE = f"{TRUSTED_SAMPLE_FEATURE}-qemu-acceptance"
+COLLECTOR_FEATURE = "wasm-c84-ssh-managed-child-single-boot-collector"
+COLLECTOR_QEMU_FEATURE = f"{COLLECTOR_FEATURE}-qemu-acceptance"
 SSHD_TRUSTED_SAMPLE_FEATURE = "c84-profile-trusted-sample"
 IRQ_FEATURE = "wasm-c84-ssh-managed-child-irq-overlay"
 IRQ_QEMU_FEATURE = f"{IRQ_FEATURE}-qemu-acceptance"
@@ -283,6 +285,8 @@ def verify_direct_cfg(inputs: Inputs) -> None:
     ssh = CORE.without_direct_feature_units(ssh, VERIFIED_STREAM_QEMU_FEATURE)
     ssh = CORE.without_direct_feature_units(ssh, TRUSTED_SAMPLE_FEATURE)
     ssh = CORE.without_direct_feature_units(ssh, TRUSTED_SAMPLE_QEMU_FEATURE)
+    ssh = CORE.without_direct_feature_units(ssh, COLLECTOR_FEATURE)
+    ssh = CORE.without_direct_feature_units(ssh, COLLECTOR_QEMU_FEATURE)
     kernel_root = CORE.without_direct_feature_units(
         inputs.kernel_root, VERIFIED_STREAM_FEATURE
     )
@@ -295,11 +299,14 @@ def verify_direct_cfg(inputs: Inputs) -> None:
     kernel_root = CORE.without_direct_feature_units(
         kernel_root, TRUSTED_SAMPLE_QEMU_FEATURE
     )
+    kernel_root = CORE.without_direct_feature_units(kernel_root, COLLECTOR_FEATURE)
+    kernel_root = CORE.without_direct_feature_units(kernel_root, COLLECTOR_QEMU_FEATURE)
     sources = (
         ("SSH", ssh, 4, 7, 8, 12),
-        # The fifth all-form QEMU reference is the trusted sibling's pairing
-        # guard against reuse of this predecessor's discard transcript.
-        ("kernel root", kernel_root, 0, 1, 0, 5),
+        # The fifth and sixth all-form QEMU references are the trusted sibling
+        # and its private collector successor pairing guards against reuse of
+        # this predecessor's discard transcript.
+        ("kernel root", kernel_root, 0, 1, 0, 6),
     )
     for label, source, base_direct, base_all, qemu_direct, qemu_all in sources:
         rust = CORE.rust_mask(source, literals=False)
@@ -385,6 +392,8 @@ def verify_target_typestate(source: str) -> None:
 def verify_slot_typestate(source: str) -> None:
     source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
     source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
+    source = CORE.without_direct_feature_units(source, COLLECTOR_FEATURE)
+    source = CORE.without_direct_feature_units(source, COLLECTOR_QEMU_FEATURE)
     finish_active = find_scope(source, r"\bfn\s+finish_active\b", "slot finish_active")
     finish_code = semantic(finish_active.raw)
     ordered(
@@ -476,6 +485,8 @@ def verify_sshd_boundary(source: str) -> None:
 
 
 def verify_ssh(source: str) -> None:
+    source = CORE.without_direct_feature_units(source, COLLECTOR_FEATURE)
+    source = CORE.without_direct_feature_units(source, COLLECTOR_QEMU_FEATURE)
     trusted_owner = find_scope(
         source, r"\bimpl\s+SshExecProfileOwner\b", "trusted SSH profile owner"
     )

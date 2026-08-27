@@ -84,6 +84,19 @@ pub trait SshExecProfilePermitBackend: Send {
     fn cancel(&mut self);
 }
 
+/// Failure returned while preparing diagnostic ownership for one SSH exec.
+///
+/// `Failed` is an internal preparation failure and terminates the connection,
+/// preserving the predecessor behavior. `Reject` is a deliberate, terminal
+/// pre-start refusal: SSHD accepts the exec request but starts no permit or
+/// command and completes the channel with the fixed status 126.
+#[cfg(feature = "c84-profile-request-parent")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshExecProfilePrepareError {
+    Failed,
+    Reject,
+}
+
 /// Opaque backend retained while the accepted SSH request parent is live.
 ///
 /// `response_boundary` records only the SSH response boundary. Under the
@@ -533,7 +546,7 @@ pub trait Platform: Sync {
     fn prepare_ssh_exec_profile(
         &self,
         _target: SshExecProfileTarget<'_>,
-    ) -> Result<Option<SshExecProfilePermit>, ()> {
+    ) -> Result<Option<SshExecProfilePermit>, SshExecProfilePrepareError> {
         Ok(None)
     }
     /// Observe one exact policy-selected Component only after VSH shutdown and
@@ -797,13 +810,21 @@ struct ProtocolState {
     start_seen: bool,
 }
 
+#[cfg(feature = "c84-profile-request-parent")]
+const SSH_EXEC_PRESTART_REJECT_STATUS: u32 = 126;
+
 /// Exact exec request after every authentication/policy/grammar gate and, when
 /// enabled, after diagnostic ownership preparation, but before SSH acceptance.
-struct PreparedExec {
-    command: String,
-    component: Option<SshExecComponentSessionPolicy>,
+enum PreparedExec {
+    Execute {
+        command: String,
+        component: Option<SshExecComponentSessionPolicy>,
+        #[cfg(feature = "c84-profile-request-parent")]
+        profile: Option<SshExecProfilePermit>,
+    },
+    /// Deliberate terminal refusal with no permit or command execution surface.
     #[cfg(feature = "c84-profile-request-parent")]
-    profile: Option<SshExecProfilePermit>,
+    Reject,
 }
 
 impl PreparedExec {
@@ -814,15 +835,21 @@ impl PreparedExec {
     ) -> Result<Self, &'static str> {
         #[cfg(feature = "c84-profile-request-parent")]
         let profile = match component {
-            Some(policy) => space
-                .prepare_ssh_exec_profile(SshExecProfileTarget::new(&command, policy))
-                .map_err(|_| "SSH exec profile preparation failed")?,
+            Some(policy) => {
+                match space.prepare_ssh_exec_profile(SshExecProfileTarget::new(&command, policy)) {
+                    Ok(profile) => profile,
+                    Err(SshExecProfilePrepareError::Failed) => {
+                        return Err("SSH exec profile preparation failed")
+                    }
+                    Err(SshExecProfilePrepareError::Reject) => return Ok(Self::Reject),
+                }
+            }
             None => None,
         };
         #[cfg(not(feature = "c84-profile-request-parent"))]
         let _ = space;
 
-        Ok(Self {
+        Ok(Self::Execute {
             command,
             component,
             #[cfg(feature = "c84-profile-request-parent")]
@@ -838,27 +865,45 @@ impl PreparedExec {
         F: FnOnce() -> Result<(), &'static str>,
     {
         succeed()?;
-        #[cfg(feature = "c84-profile-request-parent")]
-        let profile = self
-            .profile
-            .map(SshExecProfilePermit::start)
-            .transpose()
-            .map_err(|_| "SSH exec profile start failed")?;
-        Ok(AcceptedExec {
-            command: self.command,
-            component: self.component,
+        match self {
+            Self::Execute {
+                command,
+                component,
+                #[cfg(feature = "c84-profile-request-parent")]
+                profile,
+            } => {
+                #[cfg(feature = "c84-profile-request-parent")]
+                let profile = profile
+                    .map(SshExecProfilePermit::start)
+                    .transpose()
+                    .map_err(|_| "SSH exec profile start failed")?;
+                Ok(AcceptedExec::Execute {
+                    command,
+                    component,
+                    #[cfg(feature = "c84-profile-request-parent")]
+                    profile,
+                })
+            }
             #[cfg(feature = "c84-profile-request-parent")]
-            profile,
-        })
+            Self::Reject => Ok(AcceptedExec::Reject {
+                status: SSH_EXEC_PRESTART_REJECT_STATUS,
+            }),
+        }
     }
 }
 
 /// Accepted exec request whose optional run remains owned by the SSH parent.
-struct AcceptedExec {
-    command: String,
-    component: Option<SshExecComponentSessionPolicy>,
+enum AcceptedExec {
+    Execute {
+        command: String,
+        component: Option<SshExecComponentSessionPolicy>,
+        #[cfg(feature = "c84-profile-request-parent")]
+        profile: Option<SshExecProfileRun>,
+    },
+    /// Accepted only so the existing completion drain can return status 126.
+    /// This variant intentionally contains neither a command nor a run permit.
     #[cfg(feature = "c84-profile-request-parent")]
-    profile: Option<SshExecProfileRun>,
+    Reject { status: u32 },
 }
 
 enum ProtocolSignal {
@@ -2583,11 +2628,45 @@ async fn serve_connection(
 
     match start {
         SessionStart::Exec(accepted) => {
-            let AcceptedExec {
+            #[cfg(feature = "c84-profile-request-parent")]
+            if let AcceptedExec::Reject { status } = &accepted {
+                let status = *status;
+                let mut profile_run = None;
+                return match finish_exec(
+                    &mut runner,
+                    &mut signer,
+                    space,
+                    control,
+                    bound_epoch,
+                    policy,
+                    stack,
+                    &mut bridge,
+                    &mut protocol,
+                    &mut profile_run,
+                    &[],
+                    status,
+                    require_carrier,
+                )
+                .await
+                {
+                    Ok(()) => ConnectionEnd::ExecComplete(status),
+                    Err(ConnectionEnd::Reset(reason)) => reset_connection(stack, reason),
+                    Err(other) => other,
+                };
+            }
+            #[cfg(feature = "c84-profile-request-parent")]
+            let AcceptedExec::Execute {
                 command,
                 component: accepted_component,
-                #[cfg(feature = "c84-profile-request-parent")]
-                    profile: mut profile_run,
+                profile: mut profile_run,
+            } = accepted
+            else {
+                unreachable!("rejected SSH exec returned before command execution")
+            };
+            #[cfg(not(feature = "c84-profile-request-parent"))]
+            let AcceptedExec::Execute {
+                command,
+                component: accepted_component,
             } = accepted;
             #[cfg(feature = "qualification-stream")]
             if let Some(opened) = accepted_component
@@ -5607,6 +5686,7 @@ mod tests {
     struct TestProfilePlatform {
         target: SshExecComponentSessionPolicy,
         trace: Arc<ProfileTrace>,
+        prepare_error: SpinLock<Option<SshExecProfilePrepareError>>,
     }
 
     #[cfg(feature = "c84-profile-request-parent")]
@@ -5670,8 +5750,11 @@ mod tests {
         fn prepare_ssh_exec_profile(
             &self,
             target: SshExecProfileTarget<'_>,
-        ) -> Result<Option<SshExecProfilePermit>, ()> {
+        ) -> Result<Option<SshExecProfilePermit>, SshExecProfilePrepareError> {
             self.trace.push(ProfileEvent::Prepare);
+            if let Some(error) = *self.prepare_error.lock() {
+                return Err(error);
+            }
             Ok(
                 (target.source() == "case-filter" && target.policy() == self.target).then(|| {
                     SshExecProfilePermit::new(TestProfileBackend {
@@ -5706,6 +5789,7 @@ mod tests {
             TestProfilePlatform {
                 target,
                 trace: trace.clone(),
+                prepare_error: SpinLock::new(None),
             },
             profile,
             target,
@@ -5859,12 +5943,19 @@ mod tests {
         let ProtocolSignal::Exec(accepted) = ProtocolSignal::Exec(accepted) else {
             unreachable!()
         };
-        let SessionStart::Exec(mut accepted) = SessionStart::Exec(accepted) else {
+        let SessionStart::Exec(accepted) = SessionStart::Exec(accepted) else {
             unreachable!()
         };
-        assert!(reach_test_profile_response_boundary(&mut accepted.profile, 37).is_ok());
-        assert!(reach_test_profile_response_boundary(&mut accepted.profile, 99).is_ok());
-        drop(accepted);
+        let AcceptedExec::Execute {
+            profile: mut profile_run,
+            ..
+        } = accepted
+        else {
+            unreachable!()
+        };
+        assert!(reach_test_profile_response_boundary(&mut profile_run, 37).is_ok());
+        assert!(reach_test_profile_response_boundary(&mut profile_run, 99).is_ok());
+        drop(profile_run);
 
         assert_eq!(
             trace.snapshot(),
@@ -5883,24 +5974,75 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "c84-profile-request-parent")]
+    #[test]
+    fn profile_prepare_reject_accepts_only_a_fixed_terminal_126() {
+        let (platform, profile, _target, trace) = profile_fixture();
+        *platform.prepare_error.lock() = Some(SshExecProfilePrepareError::Reject);
+        let selected = accepted_ssh_component_policy(&platform, profile, true, "case-filter");
+
+        let prepared =
+            PreparedExec::prepare(&platform, "case-filter".to_string(), selected).unwrap();
+        assert!(matches!(prepared, PreparedExec::Reject));
+        assert_eq!(trace.snapshot(), vec![ProfileEvent::Prepare]);
+
+        let accepted = prepared
+            .accept(|| {
+                trace.push(ProfileEvent::Succeed);
+                Ok(())
+            })
+            .unwrap();
+        let AcceptedExec::Reject { status } = accepted else {
+            panic!("terminal prepare rejection exposed a command execution path")
+        };
+        assert_eq!(status, 126);
+        assert_eq!(status, SSH_EXEC_PRESTART_REJECT_STATUS);
+        assert_eq!(
+            trace.snapshot(),
+            vec![ProfileEvent::Prepare, ProfileEvent::Succeed],
+            "terminal rejection must not start or cancel a profile permit"
+        );
+    }
+
+    #[cfg(feature = "c84-profile-request-parent")]
+    #[test]
+    fn profile_prepare_failure_remains_fatal_before_exec_acceptance() {
+        let (platform, profile, _target, trace) = profile_fixture();
+        *platform.prepare_error.lock() = Some(SshExecProfilePrepareError::Failed);
+        let selected = accepted_ssh_component_policy(&platform, profile, true, "case-filter");
+
+        assert!(matches!(
+            PreparedExec::prepare(&platform, "case-filter".to_string(), selected),
+            Err("SSH exec profile preparation failed")
+        ));
+        assert_eq!(trace.snapshot(), vec![ProfileEvent::Prepare]);
+    }
+
     #[cfg(feature = "c84-profile-phase-sidecar")]
     #[test]
     fn profile_phase_sidecar_restores_host_after_the_final_wait_before_response() {
         let (platform, profile, _target, trace) = profile_fixture();
         let selected = accepted_ssh_component_policy(&platform, profile, true, "case-filter");
-        let mut accepted = PreparedExec::prepare(&platform, "case-filter".to_string(), selected)
+        let accepted = PreparedExec::prepare(&platform, "case-filter".to_string(), selected)
             .unwrap()
             .accept(|| Ok(()))
             .unwrap();
+        let AcceptedExec::Execute {
+            profile: mut profile_run,
+            ..
+        } = accepted
+        else {
+            unreachable!()
+        };
 
-        let run = accepted.profile.as_mut().unwrap();
+        let run = profile_run.as_mut().unwrap();
         assert!(run.phase_host().is_ok());
         assert!(run.phase_wait().is_ok());
         assert!(run.phase_host().is_ok());
         assert!(run.phase_wait().is_ok());
         assert!(run.phase_host().is_ok());
-        assert!(reach_test_profile_response_boundary(&mut accepted.profile, 41).is_ok());
-        drop(accepted);
+        assert!(reach_test_profile_response_boundary(&mut profile_run, 41).is_ok());
+        drop(profile_run);
 
         assert_eq!(
             trace.snapshot(),
@@ -5975,14 +6117,21 @@ mod tests {
 
         let (platform, profile, _target, trace) = profile_fixture();
         let selected = accepted_ssh_component_policy(&platform, profile, true, "case-filter");
-        let mut accepted = PreparedExec::prepare(&platform, "case-filter".to_string(), selected)
+        let accepted = PreparedExec::prepare(&platform, "case-filter".to_string(), selected)
             .unwrap()
             .accept(|| Ok(()))
             .unwrap();
+        let AcceptedExec::Execute {
+            profile: mut profile_run,
+            ..
+        } = accepted
+        else {
+            unreachable!()
+        };
         trace.fail_boundary.store(true, AtomicOrdering::SeqCst);
-        assert!(reach_test_profile_response_boundary(&mut accepted.profile, 125).is_err());
-        assert!(reach_test_profile_response_boundary(&mut accepted.profile, 0).is_ok());
-        drop(accepted);
+        assert!(reach_test_profile_response_boundary(&mut profile_run, 125).is_err());
+        assert!(reach_test_profile_response_boundary(&mut profile_run, 0).is_ok());
+        drop(profile_run);
         assert_eq!(
             trace.snapshot(),
             vec![
@@ -6009,7 +6158,10 @@ mod tests {
                 .unwrap()
                 .accept(|| Ok(()))
                 .unwrap();
-            assert!(accepted.profile.is_none());
+            let AcceptedExec::Execute { profile, .. } = accepted else {
+                unreachable!()
+            };
+            assert!(profile.is_none());
         }
         assert!(trace.snapshot().is_empty());
     }

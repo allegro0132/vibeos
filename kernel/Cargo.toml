@@ -327,6 +327,22 @@ wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance = [
     "wasm-c84-ssh-managed-child-trusted-sample",
     "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
 ]
+# Default-off physical single-cold-boot collector. The exact SSH trusted
+# sample is consumed synchronously into the portable META + 24 SAMPLE + END
+# chain; no collector index, prior accumulator, or record factory escapes the
+# kernel slot boundary.
+wasm-c84-ssh-managed-child-single-boot-collector = [
+    "wasm-c84-ssh-managed-child-trusted-sample",
+]
+# Diagnostic-only QEMU projection of the same collector. It deliberately
+# reuses the finish/verify predecessor telemetry rather than the trusted-sample
+# discard transcript, and absorbs every formal record into a hash/length audit
+# sink instead of forwarding decision evidence to UART.
+wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-single-boot-collector",
+    "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    "dep:sha2",
+]
 # Default-off verified-stream consumer for the same exact SSH owner. Successful
 # samples are scanned through the kernel-private cursor and explicitly
 # completed back to Ready; no summary, interval, or publisher authority escapes
@@ -449,6 +465,7 @@ vibeos-vsh = { path = "../components/vsh", default-features = false }
 vibeos-wasm-runtime = { path = "../wasm-runtime", optional = true }
 vibeos-wasm-runtime-costs = { path = "../acceptance/wasm-runtime-costs", optional = true }
 vibeos-wasm-aot-profile = { path = "../wasm-aot-profile", optional = true }
+sha2 = { version = "=0.11.0", default-features = false, optional = true }
 jitterentropy = { package = "jitterentropy-rs", path = "../vendor/jitterentropy-rs", default-features = false, features = ["alloc"], optional = true }
 
 [target.'cfg(all(target_arch = "riscv64", target_os = "none"))'.dependencies]

@@ -113,6 +113,42 @@ compile_error!("feature `wasm-c84-ssh-managed-child-finish-verify-qemu-acceptanc
 compile_error!("feature `wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance` is QEMU-only");
 
 #[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance` is QEMU-only"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector",
+    feature = "qemu-virt",
+    not(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-single-boot-collector` cannot expose physical formal records on QEMU"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector",
+    not(any(
+        feature = "milkv-duo",
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
+    ))
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-single-boot-collector` requires Milk-V Duo or its absorbing QEMU acceptance"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector",
+    feature = "legacy-shell"
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-single-boot-collector` excludes the local legacy shell"
+);
+
+#[cfg(all(
     feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",
     not(feature = "qemu-virt")
 ))]
@@ -127,13 +163,45 @@ compile_error!(
 );
 
 #[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector",
+    feature = "wasm-c84-ssh-managed-child-verified-stream"
+))]
+compile_error!(
+    "features `wasm-c84-ssh-managed-child-single-boot-collector` and `wasm-c84-ssh-managed-child-verified-stream` are mutually exclusive trusted-sample consumers"
+);
+
+#[cfg(all(
     feature = "wasm-c84-ssh-managed-child-trusted-sample",
     feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
-    not(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")
+    not(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance"),
+    not(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")
 ))]
 compile_error!(
     "feature `wasm-c84-ssh-managed-child-trusted-sample` cannot reuse the discard-only finish/verify QEMU transcript"
 );
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector",
+    feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    not(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-single-boot-collector` cannot reuse the discard-only finish/verify QEMU transcript"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
 
 #[cfg(all(
     feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
@@ -1384,7 +1452,10 @@ pub extern "C" fn kmain() -> ! {
     world::start_ipv4_stack_supervisor();
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     world::start_ssh_test_supervisor();
-    #[cfg(feature = "legacy-shell")]
+    #[cfg(all(
+        feature = "legacy-shell",
+        not(feature = "wasm-c84-ssh-managed-child-single-boot-collector")
+    ))]
     world.spawn_component(
         "shell",
         world.spaces["init"].clone(),
@@ -1397,7 +1468,8 @@ pub extern "C" fn kmain() -> ! {
         feature = "wasm-c74-crash-safe-publication-acceptance",
         feature = "wasm-c75-boot-revalidation-acceptance",
         feature = "wasm-c76-graph-version-replacement-acceptance",
-        feature = "wasm-c83-runtime-costs"
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector"
     )))]
     {
         let space = world.spaces["vsh"].clone();
@@ -1642,6 +1714,13 @@ unsafe fn cleanup_faulted_task_after_component_gate(
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
+    if uart::raw_record_active() {
+        // A physical formal record may already own TTY/TX and have emitted a
+        // prefix. SBI console output bypasses both locks, so the only framing-
+        // safe panic path is a silent machine stop.
+        sbi::shutdown(true);
+    }
     // Deliberately bypasses the UART driver: a panic may already hold its lock.
     let mut w = SbiWriter;
     let _ = core::fmt::write(&mut w, format_args!("\n[!] panic: {}\n", info));
@@ -1679,6 +1758,12 @@ impl core::fmt::Write for SbiWriter {
 
 #[alloc_error_handler]
 fn oom(layout: core::alloc::Layout) -> ! {
+    #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
+    if uart::raw_record_active() {
+        // This check precedes both quota diagnostics and the fatal allocator
+        // writer: neither may splice bytes into an in-flight formal record.
+        sbi::shutdown(true);
+    }
     match HEAP.take_last_failure() {
         Some(heap::AllocationFailure::QuotaExceeded {
             owner,

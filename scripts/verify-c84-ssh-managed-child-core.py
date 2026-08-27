@@ -44,6 +44,9 @@ VERIFIED_STREAM_FEATURE = "wasm-c84-ssh-managed-child-verified-stream"
 VERIFIED_STREAM_QEMU_FEATURE = f"{VERIFIED_STREAM_FEATURE}-qemu-acceptance"
 TRUSTED_SAMPLE_FEATURE = "wasm-c84-ssh-managed-child-trusted-sample"
 TRUSTED_SAMPLE_QEMU_FEATURE = f"{TRUSTED_SAMPLE_FEATURE}-qemu-acceptance"
+COLLECTOR_QEMU_FEATURE = (
+    "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
+)
 TRUSTED_SAMPLE_SSHD_MEMBER = "vibeos-sshd/c84-profile-trusted-sample"
 
 
@@ -256,7 +259,7 @@ def without_direct_feature_units(source: str, feature: str) -> str:
             while cursor < len(masked) and masked[cursor].isspace():
                 cursor += 1
 
-        parens = brackets = braces = 0
+        parens = brackets = braces = angles = 0
         first_brace = -1
         end = -1
         index = cursor
@@ -273,13 +276,37 @@ def without_direct_feature_units(source: str, feature: str) -> str:
                 brackets += 1
             elif character == "]":
                 brackets -= 1
+            elif character == "<" and braces == 0:
+                # A directly guarded item may carry generic parameters or a
+                # generic return type.  Their commas are not syntax-unit
+                # delimiters (for example `Result<T, E>`).
+                angles += 1
+            elif (
+                character == ">"
+                and braces == 0
+                and angles > 0
+                and (index == 0 or masked[index - 1] != "-")
+            ):
+                angles -= 1
             elif character == "{":
-                if parens == 0 and brackets == 0 and braces == 0 and first_brace < 0:
+                if (
+                    parens == 0
+                    and brackets == 0
+                    and braces == 0
+                    and angles == 0
+                    and first_brace < 0
+                ):
                     first_brace = index
                 braces += 1
             elif character == "}":
                 braces -= 1
-                if braces == 0 and first_brace >= 0 and parens == 0 and brackets == 0:
+                if (
+                    braces == 0
+                    and first_brace >= 0
+                    and parens == 0
+                    and brackets == 0
+                    and angles == 0
+                ):
                     end = index + 1
                     probe = end
                     while probe < len(masked) and masked[probe].isspace():
@@ -287,11 +314,17 @@ def without_direct_feature_units(source: str, feature: str) -> str:
                     if probe < len(masked) and masked[probe] == ";":
                         end = probe + 1
                     break
-            elif character in ";," and parens == 0 and brackets == 0 and braces == 0:
+            elif (
+                character in ";,"
+                and parens == 0
+                and brackets == 0
+                and braces == 0
+                and angles == 0
+            ):
                 end = index + 1
                 break
             require(
-                parens >= 0 and brackets >= 0 and braces >= 0,
+                parens >= 0 and brackets >= 0 and braces >= 0 and angles >= 0,
                 f"unbalanced syntax unit after direct {feature} cfg",
             )
             index += 1
@@ -538,10 +571,14 @@ def verify_features(inputs: "Inputs") -> None:
     trusted_pairing = (
         f'#[cfg(all(feature="{TRUSTED_SAMPLE_FEATURE}",'
         f'feature="{FINISH_QEMU_FEATURE}",'
-        f'not(feature="{TRUSTED_SAMPLE_QEMU_FEATURE}")))]compile_error!('
+        f'not(feature="{TRUSTED_SAMPLE_QEMU_FEATURE}"),'
+        f'not(feature="{COLLECTOR_QEMU_FEATURE}")))]compile_error!('
         f'"feature`{TRUSTED_SAMPLE_FEATURE}`cannotreusethediscard-onlyfinish/verifyQEMUtranscript");'
     )
-    require(trusted_pairing in root, "trusted-sample can reuse discard-only finish telemetry")
+    require(
+        trusted_pairing in root,
+        "trusted-sample QEMU pairing differs from its two exact acceptance exemptions",
+    )
 
 
 def verify_runtime(source: str) -> Scope:

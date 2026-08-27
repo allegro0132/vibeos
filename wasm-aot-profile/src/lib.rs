@@ -10,7 +10,11 @@
 //! The allocation-free [`ProfilePublisher`] implemented here accepts only
 //! [`TargetVerified`], which is obtainable only through the target-session
 //! facade. This boundary validates one SAMPLE's shape; it does not itself
-//! establish live provenance or close a multi-record transcript.
+//! establish live provenance. [`BootCollector`] privately chains that
+//! primitive into one build-bound physical-Duo transcript containing one META,
+//! 24 ordered SAMPLE records, and one END. The target adapter must still prove
+//! live provenance, one physical cold boot, and exclusive ownership of the
+//! target lineage supplied to the collector.
 //!
 //! Every handle is linearly owned. It may move with one exclusive `Send`
 //! future, but cannot be shared through `Sync`; moving ownership does not
@@ -70,8 +74,15 @@
 
 #![no_std]
 
+mod collector;
 mod publisher;
 mod target;
+
+pub use collector::{
+    BootCollector, BootReceipt, Campaign, CampaignError, CollectionFailure, CollectionProgress,
+    CollectorAbort, CollectorFault, CollectorReady, CompletedTranscript, PoisonedTranscript,
+    ProfileRecordSinkFactory, RecordStage, BOOT_RETAINED, BOOT_SAMPLES, BOOT_WARMUPS,
+};
 
 pub use publisher::{
     BindingError, Challenge, EligibleTerminalEvidence, PoisonedPublisher, PreflightError,

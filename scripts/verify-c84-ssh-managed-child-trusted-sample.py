@@ -49,6 +49,10 @@ FINISH_FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
 FINISH_QEMU_FEATURE = f"{FINISH_FEATURE}-qemu-acceptance"
 VERIFIED_FEATURE = "wasm-c84-ssh-managed-child-verified-stream"
 VERIFIED_QEMU_FEATURE = f"{VERIFIED_FEATURE}-qemu-acceptance"
+COLLECTOR_FEATURE = "wasm-c84-ssh-managed-child-single-boot-collector"
+COLLECTOR_QEMU_FEATURE = (
+    f"{COLLECTOR_FEATURE}-qemu-acceptance"
+)
 FAMILY = "WASM_C84_SSH_MANAGED_CHILD_TRUSTED_SAMPLE"
 SUCCESSOR_SUFFIX = (
     "finish=1 verify=1 bundle=trusted discard=trusted_sample_abandoned "
@@ -276,10 +280,14 @@ def verify_features(inputs: Inputs) -> None:
     require(mutual in root, "trusted and verified-stream bases are not mutually exclusive")
     pairing = (
         f'#[cfg(all(feature="{FEATURE}",feature="{FINISH_QEMU_FEATURE}",'
-        f'not(feature="{QEMU_FEATURE}")))]compile_error!('
+        f'not(feature="{QEMU_FEATURE}"),'
+        f'not(feature="{COLLECTOR_QEMU_FEATURE}")))]compile_error!('
         f'"feature`{FEATURE}`cannotreusethediscard-onlyfinish/verifyQEMUtranscript");'
     )
-    require(pairing in root, "trusted base can reuse predecessor QEMU telemetry")
+    require(
+        pairing in root,
+        "trusted base QEMU pairing guard differs from its two exact acceptance exemptions",
+    )
     isolation = (
         f'#[cfg(all(feature="{QEMU_FEATURE}",any('
         'feature="wasm-c48-qemu-acceptance",'
@@ -1154,6 +1162,8 @@ def verify_component(source: str) -> None:
 
 
 def verify_slot(source: str) -> None:
+    source = PHASE.CORE.without_direct_feature_units(source, COLLECTOR_FEATURE)
+    source = PHASE.CORE.without_direct_feature_units(source, COLLECTOR_QEMU_FEATURE)
     source_code = semantic(source)
     trusted_cfg = f'#[cfg(feature="{FEATURE}")]'
     nontrusted_cfg = f'#[cfg(not(feature="{FEATURE}"))]'
@@ -1604,7 +1614,7 @@ def verify_slot(source: str) -> None:
         "stderr_bytes,};"
     )
     acceptance_mapping = (
-        f'#[cfg(feature="{QEMU_FEATURE}")]'
+        f'#[cfg(any(feature="{QEMU_FEATURE}",feature="{COLLECTOR_QEMU_FEATURE}"))]'
         "acceptance:TrustedSampleAcceptanceObservation{"
         "epoch:self.token.epoch(),terminal:terminal_kind,status:exit_status,timed_out,"
         "read_chunks:metrics.read_chunks,write_chunks:metrics.write_chunks,"
@@ -1646,7 +1656,7 @@ def verify_slot(source: str) -> None:
             "let(sample,owner)=take_trusted_verified(self.token,self.detach,metrics)?;"
             "self.live=false;Ok(TrustedVerifiedSample{sample:Some(sample),evidence:Some(evidence),"
             "owner,"
-            f'#[cfg(feature="{QEMU_FEATURE}")]'
+            f'#[cfg(any(feature="{QEMU_FEATURE}",feature="{COLLECTOR_QEMU_FEATURE}"))]'
             "acceptance:TrustedSampleAcceptanceObservation{epoch:self.token.epoch(),"
             "terminal:terminal_kind,status:exit_status,timed_out,read_chunks:metrics.read_chunks,"
             "write_chunks:metrics.write_chunks,stdout_bytes:drained_stdout_bytes,stdout_digest:"
@@ -1712,7 +1722,9 @@ def verify_slot(source: str) -> None:
         == (
             "pub(crate)fndiscard(mutself)->Result<RejectionReport,ProfileError>{"
             "letSome(sample)=self.sample.take()else{returnErr(ProfileError::StateMismatch);};"
-            "let_=self.evidence.take();abandon_trusted_sample(sample,self.owner)}"
+            "let_=self.evidence.take();"
+            f'#[cfg(not(feature="{COLLECTOR_FEATURE}"))]'
+            "abandon_trusted_sample(sample,self.owner)}"
         ),
         "trusted bundle discard does not consume both authorities",
     )
@@ -1725,7 +1737,9 @@ def verify_slot(source: str) -> None:
         semantic(bundle_drop.raw)
         == (
             "implDropforTrustedVerifiedSample{fndrop(&mutself){ifletSome(sample)="
-            "self.sample.take(){let_=self.evidence.take();let_=abandon_trusted_sample("
+            "self.sample.take(){let_=self.evidence.take();"
+            f'#[cfg(not(feature="{COLLECTOR_FEATURE}"))]'
+            "let_=abandon_trusted_sample("
             "sample,self.owner);}}}"
         ),
         "trusted bundle Drop does not consume both authorities together",
@@ -1826,6 +1840,9 @@ def exact_print_call(scope, marker: str, arguments: str, label: str) -> None:
 
 
 def verify_ssh(inputs: Inputs) -> None:
+    source = PHASE.CORE.without_direct_feature_units(inputs.ssh, COLLECTOR_FEATURE)
+    source = PHASE.CORE.without_direct_feature_units(source, COLLECTOR_QEMU_FEATURE)
+    inputs = replace(inputs, ssh=source)
     ssh_code = semantic(inputs.ssh)
     predecessor_helper_guard = (
         f'#[cfg(all(feature="{FINISH_FEATURE}",not(feature="{FEATURE}")))]'
@@ -1858,7 +1875,7 @@ def verify_ssh(inputs: Inputs) -> None:
         "trusted terminal marker is detached from the returned evidence",
     )
     trusted_terminal_mapping = (
-        f'#[cfg(feature="{FEATURE}")]'
+        f'#[cfg(all(feature="{FEATURE}",not(feature="{COLLECTOR_FEATURE}")))]'
         "letterminal=finish_verify_trusted_discard_and_ack_profile(run,terminal_seal)"
         ".map(|evidence|(evidence.ready_epoch,evidence));"
     )
@@ -2621,6 +2638,29 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
                 f'{QEMU_FEATURE} = [\n    "{FEATURE}",\n    "{FINISH_QEMU_FEATURE}",\n]',
                 f'{QEMU_FEATURE} = [\n    "{FEATURE}",\n]',
                 "trusted QEMU predecessor",
+            ),
+        ),
+        (
+            "collector-qemu-root-exemption-removed",
+            lambda data: mutate_text(
+                data,
+                "kernel_root",
+                f'    not(feature = "{QEMU_FEATURE}"),\n'
+                f'    not(feature = "{COLLECTOR_QEMU_FEATURE}")\n',
+                f'    not(feature = "{QEMU_FEATURE}")\n',
+                "collector QEMU trusted-pairing exemption",
+            ),
+        ),
+        (
+            "collector-qemu-root-exemption-broadened",
+            lambda data: mutate_text(
+                data,
+                "kernel_root",
+                f'    not(feature = "{QEMU_FEATURE}"),\n'
+                f'    not(feature = "{COLLECTOR_QEMU_FEATURE}")\n',
+                f'    not(feature = "{QEMU_FEATURE}"),\n'
+                '    not(feature = "wasm-c84-ssh-managed-child-single-boot-collector")\n',
+                "collector QEMU trusted-pairing exemption scope",
             ),
         ),
         (

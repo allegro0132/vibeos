@@ -98,6 +98,13 @@ wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance = [
     "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
     "vibeos-kernel/wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
 ]
+# Diagnostic-only two-boot proof for the private 24-sample collector. The
+# kernel sink hashes and counts the formal records but never forwards their
+# bytes to QEMU UART, so this image cannot contribute decision evidence.
+wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    "vibeos-kernel/wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+]
 # Successor-only gate which consumes the verified summary and every interval,
 # then explicitly completes the stream without publishing it.
 wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance = [

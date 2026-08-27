@@ -60,8 +60,8 @@ use vibeos_sshd::{
 };
 #[cfg(feature = "wasm-c84-ssh-request-parent")]
 use vibeos_sshd::{
-    SshExecProfilePermit, SshExecProfilePermitBackend, SshExecProfileRunBackend,
-    SshExecProfileTarget,
+    SshExecProfilePermit, SshExecProfilePermitBackend, SshExecProfilePrepareError,
+    SshExecProfileRunBackend, SshExecProfileTarget,
 };
 
 #[cfg(any(
@@ -183,8 +183,13 @@ struct VerifiedStreamEvidence {
 #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
 struct TrustedSampleEvidence {
     ready_epoch: u64,
-    #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")]
+    #[cfg(any(
+        feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
+    ))]
     acceptance: crate::wasm_aot_profile_slot::TrustedSampleAcceptanceObservation,
+    #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
+    collector: crate::wasm_aot_profile_slot::CollectorTerminalReceipt,
 }
 
 #[cfg(feature = "wasm-c84-ssh-request-parent")]
@@ -271,8 +276,14 @@ impl SshExecProfileOwner {
         #[cfg(feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance")]
         let child_observation =
             crate::wasm_aot_profile_slot::take_managed_child_response_observation(epoch);
-        #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+        #[cfg(all(
+            feature = "wasm-c84-ssh-managed-child-trusted-sample",
+            not(feature = "wasm-c84-ssh-managed-child-single-boot-collector")
+        ))]
         let terminal = finish_verify_trusted_discard_and_ack_profile(run, terminal_seal)
+            .map(|evidence| (evidence.ready_epoch, evidence));
+        #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
+        let terminal = finish_verify_trusted_collect_profile(run, terminal_seal)
             .map(|evidence| (evidence.ready_epoch, evidence));
         #[cfg(feature = "wasm-c84-ssh-managed-child-verified-stream")]
         let terminal = finish_verify_stream_and_complete_profile(run)
@@ -332,7 +343,8 @@ impl SshExecProfileOwner {
                         #[cfg(feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance")]
                         #[cfg(not(any(
                             feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",
-                            feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance"
+                            feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+                            feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
                         )))]
                         crate::println!(
                             "WASM_C84_SSH_MANAGED_CHILD_CORE RESPONSE epoch={} status={} claim=1 release=1 detach=exited clean=1 core_polls={} observer_pairs={} typed_polls={} observer_closed=1 finish=1 verify=1 discard=stream_abandoned ack=1 ready_epoch={}",
@@ -348,6 +360,18 @@ impl SshExecProfileOwner {
                         )]
                         crate::println!(
                             "WASM_C84_SSH_MANAGED_CHILD_CORE RESPONSE epoch={} status={} claim=1 release=1 detach=exited clean=1 core_polls={} observer_pairs={} typed_polls={} observer_closed=1 finish=1 verify=1 bundle=trusted discard=trusted_sample_abandoned ack=1 ready_epoch={}",
+                            epoch,
+                            status,
+                            observation.core_polls,
+                            observation.core_pairs,
+                            observation.typed_polls,
+                            ready_epoch
+                        );
+                        #[cfg(
+                            feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
+                        )]
+                        crate::println!(
+                            "WASM_C84_SSH_MANAGED_CHILD_CORE RESPONSE epoch={} status={} claim=1 release=1 detach=exited clean=1 core_polls={} observer_pairs={} typed_polls={} observer_closed=1 finish=1 verify=1 bundle=trusted collector=consumed ack=0 ready_epoch={}",
                             epoch,
                             status,
                             observation.core_polls,
@@ -382,6 +406,12 @@ impl SshExecProfileOwner {
                 verified_stream_response(epoch, _terminal_evidence);
                 #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")]
                 trusted_sample_response(epoch, _terminal_evidence)?;
+                #[cfg(
+                    feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
+                )]
+                collector_trusted_sample_response(epoch, &_terminal_evidence)?;
+                #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
+                crate::wasm_aot_profile_slot::collector_emit_success(_terminal_evidence.collector);
                 Ok(())
             }
             Ok(_) => {
@@ -480,6 +510,21 @@ impl SshExecProfileOwner {
                             feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance"
                         )]
                         trusted_sample_drop(epoch, ready_epoch);
+                        #[cfg(
+                            feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
+                        )]
+                        {
+                            trusted_sample_drop(epoch, ready_epoch);
+                            if crate::wasm_aot_profile_slot::collector_emit_failed_after_drop(
+                                epoch,
+                                ready_epoch,
+                            )
+                            .is_err()
+                            {
+                                profile_request_failure("collector-drop-observation", Some(epoch));
+                                return;
+                            }
+                        }
                     }
                     Ok(_) => profile_request_failure("managed-child-drop-state", Some(epoch)),
                     Err(()) => profile_request_failure("drop", Some(epoch)),
@@ -589,7 +634,10 @@ fn finish_verify_discard_and_ack_profile(
     Ok(ready_epoch)
 }
 
-#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-trusted-sample",
+    not(feature = "wasm-c84-ssh-managed-child-single-boot-collector")
+))]
 fn finish_verify_trusted_discard_and_ack_profile(
     run: crate::wasm_aot_profile_slot::RunLease,
     terminal: SshExecProfileTerminal,
@@ -641,6 +689,40 @@ fn finish_verify_trusted_discard_and_ack_profile(
         ready_epoch,
         #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")]
         acceptance,
+    })
+}
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
+fn finish_verify_trusted_collect_profile(
+    run: crate::wasm_aot_profile_slot::RunLease,
+    terminal: SshExecProfileTerminal,
+) -> Result<TrustedSampleEvidence, ()> {
+    use crate::wasm_aot_profile_slot::{rejection, ProfileError};
+
+    let epoch = run.token().epoch();
+    let bundle = match run.finish_trusted(terminal) {
+        Ok(bundle) => bundle,
+        Err(ProfileError::Rejected(report)) => {
+            let _ = acknowledge_finish_verify_rejection(epoch, report)?;
+            return Err(());
+        }
+        Err(_) => {
+            if let Some(report) = rejection().filter(|report| report.epoch == epoch) {
+                let _ = acknowledge_finish_verify_rejection(epoch, report);
+            }
+            return Err(());
+        }
+    };
+
+    #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
+    let acceptance = bundle.acceptance_observation();
+    let collector = crate::wasm_aot_profile_slot::collect_trusted_sample(bundle).map_err(|_| ())?;
+    let ready_epoch = collector.ready_epoch();
+    Ok(TrustedSampleEvidence {
+        ready_epoch,
+        #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
+        acceptance,
+        collector,
     })
 }
 
@@ -1023,7 +1105,8 @@ fn profile_request_response(epoch: u64, status: u32, ready_epoch: u64) {
     #[cfg(feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance")]
     #[cfg(not(any(
         feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",
-        feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance"
+        feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
     )))]
     crate::println!(
         "WASM_C84_SSH_REQUEST_PARENT RESPONSE epoch={} status={} finish=1 verify=1 discard=stream_abandoned ack=1 ready_epoch={}",
@@ -1034,6 +1117,13 @@ fn profile_request_response(epoch: u64, status: u32, ready_epoch: u64) {
     #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")]
     crate::println!(
         "WASM_C84_SSH_REQUEST_PARENT RESPONSE epoch={} status={} finish=1 verify=1 bundle=trusted discard=trusted_sample_abandoned ack=1 ready_epoch={}",
+        epoch,
+        status,
+        ready_epoch
+    );
+    #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
+    crate::println!(
+        "WASM_C84_SSH_REQUEST_PARENT RESPONSE epoch={} status={} finish=1 verify=1 bundle=trusted collector=consumed ack=0 ready_epoch={}",
         epoch,
         status,
         ready_epoch
@@ -1084,7 +1174,8 @@ fn managed_irq_response(
     #[cfg(feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance")]
     #[cfg(not(any(
         feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",
-        feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance"
+        feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
     )))]
     crate::println!(
         "WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY RESPONSE epoch={} status={} parent_pair={} child_pair={} terminal_inactive=1 paired={} inactive={} active_epoch={} finish=1 verify=1 discard=stream_abandoned ack=1 ready_epoch={}",
@@ -1100,6 +1191,18 @@ fn managed_irq_response(
     #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")]
     crate::println!(
         "WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY RESPONSE epoch={} status={} parent_pair={} child_pair={} terminal_inactive=1 paired={} inactive={} active_epoch={} finish=1 verify=1 bundle=trusted discard=trusted_sample_abandoned ack=1 ready_epoch={}",
+        epoch,
+        status,
+        causal_pair,
+        causal_pair,
+        observation.paired,
+        observation.inactive,
+        observation.active_epoch,
+        ready_epoch,
+    );
+    #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY RESPONSE epoch={} status={} parent_pair={} child_pair={} terminal_inactive=1 paired={} inactive={} active_epoch={} finish=1 verify=1 bundle=trusted collector=consumed ack=0 ready_epoch={}",
         epoch,
         status,
         causal_pair,
@@ -1213,7 +1316,8 @@ fn profile_phase_response(
     #[cfg(feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance")]
     #[cfg(not(any(
         feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",
-        feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance"
+        feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
     )))]
     crate::println!(
         "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR RESPONSE epoch={} status={} child_core_starts={} child_core_finishes={} child_host_starts={} child_host_finishes={} child_wait_starts={} child_wait_finishes={} cleanup_count={} parent_host_starts={} parent_host_finishes={} parent_wait_starts={} parent_wait_finishes={} child_wait_open=0 parent_wait_open=0 late=0 clean=1 finish=1 verify=1 discard=stream_abandoned ack=1 ready_epoch={}",
@@ -1235,6 +1339,24 @@ fn profile_phase_response(
     #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")]
     crate::println!(
         "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR RESPONSE epoch={} status={} child_core_starts={} child_core_finishes={} child_host_starts={} child_host_finishes={} child_wait_starts={} child_wait_finishes={} cleanup_count={} parent_host_starts={} parent_host_finishes={} parent_wait_starts={} parent_wait_finishes={} child_wait_open=0 parent_wait_open=0 late=0 clean=1 finish=1 verify=1 bundle=trusted discard=trusted_sample_abandoned ack=1 ready_epoch={}",
+        epoch,
+        status,
+        child.core_pairs,
+        child.core_pairs,
+        phase.child_host_starts,
+        phase.child_host_finishes,
+        phase.child_wait_starts,
+        phase.child_wait_finishes,
+        phase.cleanup_count,
+        phase.parent_host_starts,
+        phase.parent_host_finishes,
+        phase.parent_wait_starts,
+        phase.parent_wait_finishes,
+        ready_epoch
+    );
+    #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_PHASE_SIDECAR RESPONSE epoch={} status={} child_core_starts={} child_core_finishes={} child_host_starts={} child_host_finishes={} child_wait_starts={} child_wait_finishes={} cleanup_count={} parent_host_starts={} parent_host_finishes={} parent_wait_starts={} parent_wait_finishes={} child_wait_open=0 parent_wait_open=0 late=0 clean=1 finish=1 verify=1 bundle=trusted collector=consumed ack=0 ready_epoch={}",
         epoch,
         status,
         child.core_pairs,
@@ -1275,7 +1397,8 @@ fn profile_phase_response(
 fn finish_verify_response(epoch: u64, status: u32, ready_epoch: u64) {
     #[cfg(not(any(
         feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",
-        feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance"
+        feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
     )))]
     crate::println!(
         "WASM_C84_SSH_MANAGED_CHILD_FINISH_VERIFY RESPONSE epoch={} status={} finish=1 verify=1 cursor=0 discard=stream_abandoned emitted=0 stored=1 ack=1 ready_epoch={}",
@@ -1286,6 +1409,13 @@ fn finish_verify_response(epoch: u64, status: u32, ready_epoch: u64) {
     #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")]
     crate::println!(
         "WASM_C84_SSH_MANAGED_CHILD_FINISH_VERIFY RESPONSE epoch={} status={} finish=1 verify=1 bundle=trusted discard=trusted_sample_abandoned ack=1 ready_epoch={}",
+        epoch,
+        status,
+        ready_epoch
+    );
+    #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_FINISH_VERIFY RESPONSE epoch={} status={} finish=1 verify=1 bundle=trusted collector=consumed ack=0 ready_epoch={}",
         epoch,
         status,
         ready_epoch
@@ -1369,7 +1499,52 @@ fn trusted_sample_response(epoch: u64, evidence: TrustedSampleEvidence) -> Resul
     Ok(())
 }
 
-#[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance")]
+#[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
+fn collector_trusted_sample_response(
+    epoch: u64,
+    evidence: &TrustedSampleEvidence,
+) -> Result<(), ()> {
+    use vibeos_wasm_aot_profile::{
+        FORMAL_READ_CHUNKS, FORMAL_STDOUT_BYTES, FORMAL_STDOUT_SHA256, FORMAL_WRITE_CHUNKS,
+    };
+
+    let observation = evidence.acceptance;
+    let exact = observation.epoch == epoch
+        && observation.terminal == vibeos_vsh::ComponentTerminal::Success
+        && observation.status == 0
+        && !observation.timed_out
+        && observation.read_chunks == FORMAL_READ_CHUNKS
+        && observation.write_chunks == FORMAL_WRITE_CHUNKS
+        && observation.stdout_bytes == FORMAL_STDOUT_BYTES
+        && observation.stdout_digest == FORMAL_STDOUT_SHA256
+        && observation.fuel_consumed != 0
+        && observation.fuel_consumed <= vibeos_wasm_aot_profile::MAX_FORMAL_FUEL
+        && observation.poll_quanta != 0
+        && observation.poll_quanta != u64::MAX
+        && observation.poll_exact
+        && observation.logical_live_after == 0
+        && observation.full_drain;
+    if !exact {
+        profile_request_failure("trusted-sample-observation", Some(epoch));
+        return Err(());
+    }
+    crate::println!(
+        "WASM_C84_SSH_MANAGED_CHILD_TRUSTED_SAMPLE RESPONSE epoch={} status=0 exact_success=1 full_drain=1 read_chunks={} write_chunks={} stdout_bytes={} stdout_sha256=791f3fe1339984e8a8489c12ea5ff479ac7caa07c87be451134d3af0f526bb27 fuel_consumed={} poll_quanta={} poll_exact=1 logical_live_after=0 timed_out=0 bundle=trusted finish=1 verify=1 collector=consumed ack=0 ready_epoch={}",
+        epoch,
+        observation.read_chunks,
+        observation.write_chunks,
+        observation.stdout_bytes,
+        observation.fuel_consumed,
+        observation.poll_quanta,
+        evidence.ready_epoch
+    );
+    Ok(())
+}
+
+#[cfg(any(
+    feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
+))]
 fn trusted_sample_drop(epoch: u64, ready_epoch: u64) {
     crate::println!(
         "WASM_C84_SSH_MANAGED_CHILD_TRUSTED_SAMPLE DROP epoch={} cancel=lease_cancelled bundle=0 finish=0 verify=0 discard=0 emitted=0 stored=1 ack=1 ready_epoch={}",
@@ -1760,7 +1935,7 @@ impl SshdPlatform for SshPlatform {
     fn prepare_ssh_exec_profile(
         &self,
         target: SshExecProfileTarget<'_>,
-    ) -> Result<Option<SshExecProfilePermit>, ()> {
+    ) -> Result<Option<SshExecProfilePermit>, SshExecProfilePrepareError> {
         let source = target.source();
         if source != "case-filter" {
             return Ok(None);
@@ -1772,7 +1947,7 @@ impl SshdPlatform for SshPlatform {
             source,
         ) else {
             profile_request_failure("policy-missing", None);
-            return Err(());
+            return Err(SshExecProfilePrepareError::Failed);
         };
         if accepted.command_name() != "case-filter"
             || current.profile() != accepted.profile()
@@ -1781,12 +1956,20 @@ impl SshdPlatform for SshPlatform {
             || current.artifact_sha256() != accepted.artifact_sha256()
         {
             profile_request_failure("policy-mismatch", None);
-            return Err(());
+            return Err(SshExecProfilePrepareError::Failed);
         }
 
-        let permit = crate::wasm_aot_profile_slot::prepare_current().map_err(|_| {
-            profile_request_failure("prepare", None);
-        })?;
+        let permit = match crate::wasm_aot_profile_slot::prepare_current() {
+            Ok(permit) => permit,
+            #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
+            Err(error) if crate::wasm_aot_profile_slot::collector_terminal_reject(error) => {
+                return Err(SshExecProfilePrepareError::Reject);
+            }
+            Err(_) => {
+                profile_request_failure("prepare", None);
+                return Err(SshExecProfilePrepareError::Failed);
+            }
+        };
         Ok(Some(SshExecProfilePermit::new(
             SshExecProfileOwner::reserved(accepted, permit),
         )))

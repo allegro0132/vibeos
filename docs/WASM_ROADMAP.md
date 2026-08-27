@@ -515,11 +515,14 @@ component security boundary is measured and stable.
 | C8.7 | Regenerate or verify native output | A pinned trusted compiler reproduces native bytes, or an equivalently reviewed verifier proves the accepted surface before execution |
 | C8.8 | Widen profiles one feature at a time | Float, SIMD, references, exceptions, memory64, multiple memories, GC, threads or broader WASI each require separate semantics and evidence |
 
-As of 2026-08-27, the C8.4 chain has reached the live trusted-terminal and
-opaque verified-sample closure. The private 24-sample collector, retained
-physical-Duo/cold-boot evidence, and the final workload-specific AOT decision
-remain open; the implementation must not infer them from the QEMU diagnostic
-records.
+As of 2026-08-27, the C8.4 chain includes the live trusted-terminal boundary
+and the private 24-sample collector, now a build-bound single-cold-boot
+protocol. The collector closes META + 24 SAMPLE + END locally, with three warmups, 21
+retained samples, an absorbing Failed/Closed state, atomic physical UART
+records, and a separate QEMU audit sink whose markers explicitly carry
+`decision_eligible=0 formal_uart=0`. Physical packaging/capture, three attested
+cold boots, the 63 retained physical-Duo samples, and the final workload-specific AOT decision
+remain open; none may be inferred from QEMU diagnostics.
 
 ## 10. Test and evidence matrix
 

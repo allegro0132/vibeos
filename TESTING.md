@@ -40,6 +40,11 @@ python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
 python3 -B scripts/verify-c83-evidence.py --selftest
 python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
 python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
+bash -n scripts/build-milkv-duo.sh scripts/package-milkv-duo-sdk.sh \
+  scripts/verify-milkv-duo-image.sh
+./scripts/verify-milkv-duo-image.sh --selftest
+python3 -B scripts/capture-c84-duo-aot-decision.py --selftest
+python3 -B scripts/verify-c84-evidence.py --selftest
 cargo test --locked -p vibeos-component-runtime --no-default-features \
   --features c84-profile-hooks --test c84_profile
 cargo test --locked -p vibeos-wasm-aot-profile
@@ -246,16 +251,38 @@ target sample, not a mathematical worst case.
 Formal samples must be complete and self-consistent; overflow or truncation is
 diagnostic-only.
 
-The C8.4 verifier self-test also closes one raw cold-boot transcript at a time:
+The C8.4 single-boot verifier self-test also closes one synthetic raw
+cold-boot transcript at a time:
 one metadata record, three warmups, 21 retained samples, and one end record. It
 rejects malformed JSON, wrong coordinates or campaign identity, incomplete or
 unmerged phase intervals, invalid fuel/poll counters, unstable retained data,
 and a stale ordered accumulator. Its host-file tests cover bounded stable reads,
 symlink and hardlink alias rejection, no-clobber summary creation, explicit
 overwrite, exact reread, and protected verifier inputs. A passing single-boot
-check reports physical and cold-boot provenance as unverified; a later evidence
-gate must bind three distinct host boot indexes and prove C8.3 before any C8.4
-decision can exist.
+check reports physical and cold-boot provenance as unverified.
+
+The C8.4 software-side closure now also has content-addressed build/package
+envelopes, a full-SD-image verifier, a deliberately read-only three-boot UART
+capture program, and a final evidence verifier. The CI-safe commands listed
+above exercise shell syntax, raw-image parser mutations, capture stream/tree/
+no-clobber mutations, exact three-boot aggregation, and final evidence closure
+using synthetic host files. `capture-c84-duo-aot-decision.py --selftest` never
+opens a serial device; neither self-test invokes Docker, downloads an SDK,
+flashes media, resets a board, or claims a physical boot.
+
+The final evidence gate binds three distinct boot indexes, reruns the complete
+C8.3 evidence verifier from an immutable snapshot of the explicit full C8.4
+preparation commit, and independently derives nearest-rank p50/p95 from all 63
+retained samples. A C8.4 result cannot exist unless that committed C8.3 tree is
+complete and byte-identical. Current execution status (2026-08-27): Milk-V Duo
+physical testing is paused at operator request, so C8.3 and C8.4 remain open;
+there is no complete three-cold-boot physical capture set and no
+workload-specific AOT decision. The software-preparation build currently proves
+a clean checkout rather than an independently materialized immutable clone,
+and its container digest is operator-declared rather than host-runtime-attested;
+both provenance gaps remain prerequisites for decision-eligible publication.
+See [docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md) for the deferred
+formal build, package, image-verification, capture, and publication commands.
 
 The portable C8.4 hook gate above exercises the default-off, caller-clocked
 boundary around the real synchronous Core poll. It proves ordinary and

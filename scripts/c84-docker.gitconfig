@@ -1,0 +1,5 @@
+[safe]
+	directory = /home/vibeos
+	directory = /home/vibeos/vendor/jitterentropy-rs
+	directory = /home/vibeos/vendor/sunset
+	directory = /home/work

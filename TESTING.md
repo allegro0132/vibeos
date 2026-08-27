@@ -42,6 +42,8 @@ python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
 python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
 bash -n scripts/build-milkv-duo.sh scripts/package-milkv-duo-sdk.sh \
   scripts/verify-milkv-duo-image.sh
+python3 -B scripts/c84-source-materialization.py --selftest --check-source
+python3 -B scripts/c84-docker-runtime.py --selftest
 ./scripts/verify-milkv-duo-image.sh --selftest
 python3 -B scripts/capture-c84-duo-aot-decision.py --selftest
 python3 -B scripts/verify-c84-evidence.py --selftest
@@ -221,7 +223,7 @@ evidence but cannot export a baseline; C8.3 remains open until one fixed QEMU
 boot and three real cold Duo boots from the same clean preparation commit are
 published. Physical capture also requires the canonical `package-envelope.json`
 and image-verifier audit emitted by the pinned Linux/amd64 SDK packaging flow;
-the recorded container digest is an operator assertion, not hardware
+the C8.3 record's container digest is an operator assertion, not hardware
 attestation.
 
 The C8.4 AOT-decision preparation contract is documented in
@@ -261,26 +263,39 @@ symlink and hardlink alias rejection, no-clobber summary creation, explicit
 overwrite, exact reread, and protected verifier inputs. A passing single-boot
 check reports physical and cold-boot provenance as unverified.
 
-The C8.4 software-side closure now also has content-addressed build/package
-envelopes, a full-SD-image verifier, a deliberately read-only three-boot UART
-capture program, and a final evidence verifier. The CI-safe commands listed
-above exercise shell syntax, raw-image parser mutations, capture stream/tree/
-no-clobber mutations, exact three-boot aggregation, and final evidence closure
-using synthetic host files. `capture-c84-duo-aot-decision.py --selftest` never
-opens a serial device; neither self-test invokes Docker, downloads an SDK,
+The C8.4 software-side closure now also has independent immutable source
+materialization, content-addressed build/package envelopes, host-observed
+Docker runtime custody, a full-SD-image verifier, a deliberately read-only
+three-boot UART capture program, and a final evidence verifier. The CI-safe
+commands listed above exercise source/config/path replacement attacks, runtime
+inspect/namespace mutations, shell syntax, raw-image parser mutations, capture
+stream/tree/no-clobber mutations, exact three-boot aggregation, and final
+evidence closure using synthetic host files. The source and runtime self-tests
+use only local fixtures, and `capture-c84-duo-aot-decision.py --selftest` never
+opens a serial device; no listed self-test invokes Docker, downloads an SDK,
 flashes media, resets a board, or claims a physical boot.
 
-The final evidence gate binds three distinct boot indexes, reruns the complete
-C8.3 evidence verifier from an immutable snapshot of the explicit full C8.4
-preparation commit, and independently derives nearest-rank p50/p95 from all 63
-retained samples. A C8.4 result cannot exist unless that committed C8.3 tree is
-complete and byte-identical. Current execution status (2026-08-27): Milk-V Duo
-physical testing is paused at operator request, so C8.3 and C8.4 remain open;
-there is no complete three-cold-boot physical capture set and no
-workload-specific AOT decision. The software-preparation build currently proves
-a clean checkout rather than an independently materialized immutable clone,
-and its container digest is operator-declared rather than host-runtime-attested;
-both provenance gaps remain prerequisites for decision-eligible publication.
+The source proof deliberately separates namespaces: host materialization and
+offline verification bind the exact device/inode sets, while the fixed
+`/home/vibeos` read-only container mount rechecks content, Git administration,
+permissions, single-link counts, and clone disjointness after its runtime
+attestation is validated. Package preflight validates the package-mode
+attestation; the independent image verifier validates its own verify-mode
+attestation and separately runs the complete package-mode verifier because its
+image report still binds the package attestation. This accommodates Docker
+Desktop inode remapping without weakening the host-side independence proof.
+
+The final evidence gate binds three distinct boot indexes, revalidates the
+independently frozen C8.4 source and offline container-runtime closure, reruns
+the complete C8.3 evidence verifier from that explicit full preparation
+commit, and independently derives nearest-rank p50/p95 from all 63 retained
+samples. A C8.4 result cannot exist unless that committed C8.3 tree is complete
+and byte-identical. Current execution status (2026-08-27): Milk-V Duo physical
+testing is paused at operator request, so C8.3 and C8.4 remain open; there is no
+complete three-cold-boot physical capture set and no workload-specific AOT
+decision. Source immutability and Docker runtime custody are closed in the
+software pipeline, but the runtime record remains local software evidence, not
+hardware, TPM, remote-attestation, or physical-cold-boot proof.
 See [docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md) for the deferred
 formal build, package, image-verification, capture, and publication commands.
 
@@ -859,13 +874,14 @@ python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py \
 ```
 
 CI also cross-compiles and links the physical Milk-V collector with a freshly
-generated challenge while the checkout is still clean. The build runs in a
-sanitized `env -i` envelope with an isolated Cargo home, the pinned Rust tools,
-a fixed `ld.lld`, commit-derived `SOURCE_DATE_EPOCH`, and isolated objcopy. CI
-injects hostile ambient wrapper, profile, and rustflag values; the build must
-ignore all three. It neither runs nor retains that artifact. A
-decision-eligible capture additionally requires a clean preparation checkout,
-a real physical cold boot, and the documented three-boot/63-retained-sample
+generated challenge from an independently materialized and verified frozen
+source tree. The build runs in a sanitized `env -i` envelope with an isolated
+Cargo home, the pinned Rust tools, a fixed `ld.lld`, commit-derived
+`SOURCE_DATE_EPOCH`, and isolated objcopy. CI injects hostile ambient wrapper,
+profile, and rustflag values; the build must ignore all three. It neither runs
+nor retains that artifact. A decision-eligible capture additionally requires
+that same frozen-source materialization and host-observed runtime closure, a
+real physical cold boot, and the documented three-boot/63-retained-sample
 verification flow; none is supplied by this compile gate.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority

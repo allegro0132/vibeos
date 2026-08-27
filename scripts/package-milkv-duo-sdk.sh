@@ -219,7 +219,7 @@ if [[ "$wasm_aot_profile" == true ]]; then
   }
   wasm_aot_profile_source_commit=${VIBEOS_C84_SOURCE_COMMIT-}
   wasm_aot_profile_challenge=${VIBEOS_C84_CHALLENGE-}
-  wasm_aot_profile_declared_container=${VIBEOS_C84_SDK_CONTAINER_DIGEST-}
+  wasm_aot_profile_container_digest_pin=${VIBEOS_C84_SDK_CONTAINER_DIGEST-}
   require_wasm_aot_profile_identity VIBEOS_C84_SOURCE_COMMIT \
     "$wasm_aot_profile_source_commit" 40 \
     0000000000000000000000000000000000000000 \
@@ -228,7 +228,28 @@ if [[ "$wasm_aot_profile" == true ]]; then
     "$wasm_aot_profile_challenge" 64 \
     0000000000000000000000000000000000000000000000000000000000000000 \
     2222222222222222222222222222222222222222222222222222222222222222
-  if [[ "$wasm_aot_profile_declared_container" != "$wasm_aot_profile_sdk_container_digest" ]]; then
+  c84_source_materializer="$script_dir/c84-source-materialization.py"
+  c84_source_envelope="$repo_root/target/c84-source-materialization/$wasm_aot_profile_source_commit/$wasm_aot_profile_challenge/source-materialization-envelope.json"
+  c84_docker_runtime="$script_dir/c84-docker-runtime.py"
+  c84_runtime_attestation="$repo_root/target/milkv-duo-wasm-aot-profile/container-runtime-attestation.json"
+  verify_c84_frozen_source() {
+    python3 -B "$c84_source_materializer" verify \
+      --destination "$repo_root" \
+      --source-commit "$wasm_aot_profile_source_commit" \
+      --challenge "$wasm_aot_profile_challenge" \
+      --container-mounted-read-only
+  }
+  verify_c84_runtime_attestation() {
+    python3 -B "$c84_docker_runtime" verify-attestation \
+      --attestation "$c84_runtime_attestation" \
+      --source-root "$repo_root" \
+      --source-commit "$wasm_aot_profile_source_commit" \
+      --challenge "$wasm_aot_profile_challenge" \
+      --expect-mode package
+  }
+  verify_c84_runtime_attestation
+  verify_c84_frozen_source
+  if [[ "$wasm_aot_profile_container_digest_pin" != "$wasm_aot_profile_sdk_container_digest" ]]; then
     echo "package-milkv-duo-sdk.sh: VIBEOS_C84_SDK_CONTAINER_DIGEST must equal $wasm_aot_profile_sdk_container_digest" >&2
     exit 2
   fi
@@ -246,69 +267,11 @@ if [[ "$wasm_aot_profile" == true ]]; then
     echo "package-milkv-duo-sdk.sh: WebAssembly AOT profile SDK HEAD is $sdk_head, expected $wasm_aot_profile_sdk_commit" >&2
     exit 1
   fi
-  if [[ -n $(git --no-optional-locks -C "$sdk_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) ]]; then
+  if [[ -n $(git --no-optional-locks -c core.fsmonitor=false -C "$sdk_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) ]]; then
     echo "package-milkv-duo-sdk.sh: WebAssembly AOT profile SDK checkout is not clean" >&2
     exit 1
   fi
-  if ! vibe_head=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null); then
-    echo "package-milkv-duo-sdk.sh: cannot read VibeOS source HEAD" >&2
-    exit 1
-  fi
-  if [[ "$vibe_head" != "$wasm_aot_profile_source_commit" ]]; then
-    echo "package-milkv-duo-sdk.sh: VibeOS HEAD is $vibe_head, expected $wasm_aot_profile_source_commit" >&2
-    exit 1
-  fi
-  if [[ -n $(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=all) ]]; then
-    echo "package-milkv-duo-sdk.sh: WebAssembly AOT profile superproject is not clean" >&2
-    exit 1
-  fi
-  "$script_dir/prepare-jitterentropy-rs.sh" >/dev/null
-  jitterentropy_submodule="$repo_root/vendor/jitterentropy-rs"
   jitterentropy_patch="$repo_root/patches/jitterentropy-rs/0001-vibeos-qualification.patch"
-  jitterentropy_head=$(git -C "$jitterentropy_submodule" rev-parse HEAD)
-  if [[ "$jitterentropy_head" != c5bd2e17194fe3a04d17f74027bb67622579405f ]]; then
-    echo "package-milkv-duo-sdk.sh: jitterentropy-rs HEAD differs" >&2
-    exit 1
-  fi
-  jitterentropy_diff_record=$(python3 - "$jitterentropy_submodule" "$jitterentropy_patch" <<'PY'
-import datetime
-import hashlib
-import pathlib
-import subprocess
-import sys
-
-submodule = pathlib.Path(sys.argv[1]).resolve(strict=True)
-patch = pathlib.Path(sys.argv[2]).resolve(strict=True).read_bytes()
-observed = subprocess.run(
-    ["git", "-C", str(submodule), "diff", "--unified=0", "--binary"],
-    check=True,
-    stdout=subprocess.PIPE,
-).stdout
-if observed != patch:
-    raise SystemExit("package-milkv-duo-sdk.sh: jitterentropy-rs diff differs from the recorded patch")
-if subprocess.run(
-    ["git", "-C", str(submodule), "diff", "--cached", "--quiet", "--exit-code"],
-).returncode != 0:
-    raise SystemExit("package-milkv-duo-sdk.sh: jitterentropy-rs has staged changes")
-untracked = subprocess.run(
-    ["git", "-C", str(submodule), "ls-files", "--others", "--exclude-standard", "-z"],
-    check=True,
-    stdout=subprocess.PIPE,
-).stdout
-if untracked:
-    raise SystemExit("package-milkv-duo-sdk.sh: jitterentropy-rs has untracked files")
-print(f"{hashlib.sha256(observed).hexdigest()}:{len(observed)}")
-PY
-  )
-  jitterentropy_diff_sha256=${jitterentropy_diff_record%:*}
-  jitterentropy_diff_bytes=${jitterentropy_diff_record#*:}
-  sunset_submodule="$repo_root/vendor/sunset"
-  sunset_head=$(git -C "$sunset_submodule" rev-parse HEAD)
-  if [[ "$sunset_head" != f686eaaaba8b2eda3f83e23b4bb3005cae31ce5e ]] ||
-     [[ -n $(git -C "$sunset_submodule" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) ]]; then
-    echo "package-milkv-duo-sdk.sh: sunset submodule differs" >&2
-    exit 1
-  fi
   package_started_utc=$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"))')
 fi
 
@@ -848,13 +811,12 @@ PY
   echo "package-milkv-duo-sdk.sh runtime-cost build-envelope preflight: PASS content=$validated_build_content_sha256"
 fi
 if [[ "$wasm_aot_profile" == true ]]; then
+  verify_c84_frozen_source >/dev/null
   validated_build_record=$(python3 - \
     "$build_envelope" "$wasm_aot_profile_source_commit" \
     "$wasm_aot_profile_challenge" "$repo_root" "$kernel_elf" "$kernel_bin" \
-    "$script_dir/build-milkv-duo.sh" "$script_dir/prepare-jitterentropy-rs.sh" \
-    "$jitterentropy_patch" "$jitterentropy_submodule" "$jitterentropy_head" \
-    "$jitterentropy_diff_sha256" "$jitterentropy_diff_bytes" \
-    "$sunset_submodule" "$sunset_head" "$repo_root/.gitmodules" \
+    "$script_dir/build-milkv-duo.sh" "$c84_source_materializer" \
+    "$c84_source_envelope" "$jitterentropy_patch" "$repo_root/.gitmodules" \
     "$repo_root/firmware/milkv-duo/Cargo.toml" \
     "$repo_root/firmware/milkv-duo/build.rs" \
     "$repo_root/firmware/milkv-duo/linker.ld" \
@@ -879,14 +841,9 @@ import sys
     kernel_elf,
     kernel_bin,
     build_script,
-    prepare_jitterentropy_script,
+    source_materializer_script,
+    source_materialization_envelope,
     jitterentropy_patch,
-    jitterentropy_submodule,
-    jitterentropy_head,
-    jitterentropy_diff_sha256,
-    jitterentropy_diff_bytes,
-    sunset_submodule,
-    sunset_head,
     gitmodules,
     firmware_manifest,
     firmware_build_script,
@@ -918,6 +875,82 @@ def exact(value, keys, label):
     if not isinstance(value, dict) or set(value) != set(keys):
         fail(f"{label} fields are not closed")
     return value
+
+
+source_root_path = pathlib.Path(source_root).resolve(strict=True)
+
+
+def load_source_materialization(path_text):
+    path = pathlib.Path(path_text)
+    expected = (
+        source_root_path
+        / "target"
+        / "c84-source-materialization"
+        / source_commit
+        / challenge
+        / "source-materialization-envelope.json"
+    )
+    if path != expected or path.resolve(strict=True) != path:
+        fail("source materialization envelope path differs")
+    before_lstat = path.lstat()
+    before = path.stat()
+    if (
+        stat.S_ISLNK(before_lstat.st_mode)
+        or not stat.S_ISREG(before_lstat.st_mode)
+        or before.st_size <= 0
+        or before.st_size > 16_777_216
+        or before.st_nlink != 1
+    ):
+        fail("source materialization envelope is not a bounded single-link regular file")
+    raw = path.read_bytes()
+    after = path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+    ):
+        fail("source materialization envelope changed while reading")
+    try:
+        root = json.loads(raw, object_pairs_hook=reject_duplicate_members)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"cannot decode source materialization envelope: {error}")
+    root = exact(
+        root,
+        {"content", "content_sha256", "schema", "status", "version"},
+        "source materialization envelope",
+    )
+    if (
+        root["schema"] != "vibeos.c84.source-materialization-envelope"
+        or type(root["version"]) is not int
+        or root["version"] != 1
+        or root["status"] != "closed"
+    ):
+        fail("source materialization envelope identity/status differs")
+    content = exact(
+        root["content"],
+        {
+            "bundles", "challenge", "clone_git_admin", "command", "frozen", "git",
+            "independence", "materialization", "patch", "snapshot", "source",
+            "source_commit", "submodules", "timestamps_utc",
+        },
+        "source materialization content",
+    )
+    canonical_content = json.dumps(
+        content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    digest = root.get("content_sha256")
+    if (
+        content["source_commit"] != source_commit
+        or content["challenge"] != challenge
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or hashlib.sha256(canonical_content).hexdigest() != digest
+    ):
+        fail("source materialization identity/content address differs")
+    canonical_root = json.dumps(
+        root, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8") + b"\n"
+    if raw != canonical_root:
+        fail("source materialization envelope is not canonical JSON")
+    return root
 
 
 def identity_record(value, label):
@@ -981,7 +1014,7 @@ root = exact(root, {"schema", "version", "status", "content_sha256", "content"},
 if (
     root["schema"] != "vibeos.c84.duo-wasm-aot-profile.build-envelope"
     or type(root["version"]) is not int
-    or root["version"] != 1
+    or root["version"] != 2
     or root["status"] != "closed"
     or not isinstance(root["content_sha256"], str)
     or re.fullmatch(r"[0-9a-f]{64}", root["content_sha256"]) is None
@@ -1005,40 +1038,16 @@ if content["source_commit"] != source_commit or content["challenge"] != challeng
     fail("build source/challenge differs")
 source = exact(
     content["source"],
-    {"root", "head", "superproject_clean", "status_policy", "jitterentropy", "sunset"},
+    {"root", "head", "materialization"},
     "build source",
 )
+live_source_materialization = load_source_materialization(source_materialization_envelope)
 if (
-    source["head"] != source_commit
-    or source["superproject_clean"] is not True
-    or source["status_policy"] != "git status --porcelain=v1 --untracked-files=all --ignore-submodules=all"
-    or source["root"] != "."
+    source["root"] != "."
+    or source["head"] != source_commit
+    or source["materialization"] != live_source_materialization
 ):
-    fail("build source checkout attestation differs")
-jitter = exact(
-    source["jitterentropy"],
-    {"path", "head", "patch_sha256", "patch_bytes", "observed_diff_sha256", "observed_diff_bytes", "policy"},
-    "jitterentropy source",
-)
-patch_local = local_identity(jitterentropy_patch)
-if (
-    jitter["path"] != "vendor/jitterentropy-rs"
-    or jitter["head"] != jitterentropy_head
-    or jitter["patch_sha256"] != patch_local["sha256"]
-    or jitter["patch_bytes"] != patch_local["bytes"]
-    or jitter["observed_diff_sha256"] != jitterentropy_diff_sha256
-    or jitter["observed_diff_bytes"] != int(jitterentropy_diff_bytes)
-    or jitter["policy"] != "exact recorded patch verified by prepare-jitterentropy-rs.sh"
-):
-    fail("jitterentropy patch attestation differs")
-sunset = exact(source["sunset"], {"path", "head", "worktree_clean", "status_policy"}, "sunset source")
-if (
-    sunset["path"] != "vendor/sunset"
-    or sunset["head"] != sunset_head
-    or sunset["worktree_clean"] is not True
-    or sunset["status_policy"] != "git status --porcelain=v1 --untracked-files=all --ignore-submodules=none"
-):
-    fail("sunset source attestation differs")
+    fail("build frozen-source attestation differs")
 
 toolchain = exact(
     content["toolchain"],
@@ -1157,7 +1166,7 @@ if type(isolation["registry_cache_symlinked"]) is not bool or type(isolation["gi
     fail("Cargo cache attestations are not boolean")
 expected_tools = {
     "build_script": (build_script, "scripts/build-milkv-duo.sh"),
-    "prepare_jitterentropy_script": (prepare_jitterentropy_script, "scripts/prepare-jitterentropy-rs.sh"),
+    "source_materializer_script": (source_materializer_script, "scripts/c84-source-materialization.py"),
     "jitterentropy_patch": (jitterentropy_patch, "patches/jitterentropy-rs/0001-vibeos-qualification.patch"),
     "gitmodules": (gitmodules, ".gitmodules"),
     "firmware_manifest": (firmware_manifest, "firmware/milkv-duo/Cargo.toml"),
@@ -1210,6 +1219,7 @@ if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
 print(f'{root["content_sha256"]}:{artifact_records["kernel_binary"]["sha256"]}:{artifact_records["kernel_binary"]["bytes"]}')
 PY
   )
+  verify_c84_frozen_source >/dev/null
   IFS=: read -r validated_build_content_sha256 validated_kernel_sha256 validated_kernel_bytes <<<"$validated_build_record"
   if [[ ! "$validated_build_content_sha256" =~ ^[0-9a-f]{64}$ ]] ||
      [[ ! "$validated_kernel_sha256" =~ ^[0-9a-f]{64}$ ]] ||
@@ -1338,7 +1348,7 @@ elif [[ "$file_tree" == true ]]; then
 elif [[ "$runtime_costs" == true ]]; then
   verify_args=(--runtime-costs "$sdk_root")
 elif [[ "$wasm_aot_profile" == true ]]; then
-  verify_args=(--wasm-aot-profile "--artifact-root=$package_work_dir" "$sdk_root")
+  verify_args=(--wasm-aot-profile --package-preflight "--artifact-root=$package_work_dir" "$sdk_root")
 fi
 if [[ "$runtime_costs" == true ]]; then
   if ! "$script_dir/verify-milkv-duo-image.sh" "${verify_args[@]}" >"$temp_audit" 2>&1; then
@@ -1693,24 +1703,27 @@ elif [[ "$wasm_aot_profile" == true ]]; then
     verifier_tool_path=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$verifier_tool_path")
     verifier_tool_paths+=("$verifier_tool_path")
   done
+  verify_c84_runtime_attestation >/dev/null
   if ! env -i \
     GIT_CONFIG_GLOBAL="$c84_docker_git_config" GIT_CONFIG_NOSYSTEM=1 \
     GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 HOME=/nonexistent \
     LC_ALL=C PATH="$c84_verify_path" TZ=UTC \
     VIBEOS_C84_CHALLENGE="$wasm_aot_profile_challenge" \
-    VIBEOS_C84_SDK_CONTAINER_DIGEST="$wasm_aot_profile_declared_container" \
+    VIBEOS_C84_SDK_CONTAINER_DIGEST="$wasm_aot_profile_container_digest_pin" \
     VIBEOS_C84_SOURCE_COMMIT="$wasm_aot_profile_source_commit" \
     "$script_dir/verify-milkv-duo-image.sh" "${verify_args[@]}" >"$temp_audit" 2>&1; then
     cat "$temp_audit" >&2
     echo "package-milkv-duo-sdk.sh: refusing to publish an unverified C8.4 SD image" >&2
     exit 1
   fi
+  verify_c84_runtime_attestation >/dev/null
   validated_audit_report_sha256=$(python3 - \
     "$temp_audit" "$c84_pass_marker" "$c84_report_schema" \
     "$wasm_aot_profile_source_commit" "$wasm_aot_profile_challenge" \
+    "$c84_source_envelope" "$c84_runtime_attestation" \
     "$staged_kernel_bin" "$output_its" "$output_dtb" "$sdk_dtb" \
     "$output_fit" "$output_image" "$sdk_fip" "$mkimage" "$dumpimage" \
-    "$c84_docker_git_config_template" \
+    "$c84_docker_git_config_template" "$c84_source_materializer" "$c84_docker_runtime" \
     "${verifier_tool_paths[@]}" <<'PY'
 import hashlib
 import json
@@ -1724,16 +1737,19 @@ marker = sys.argv[2]
 report_schema = sys.argv[3]
 source_commit = sys.argv[4]
 challenge = sys.argv[5]
+source_envelope_path = pathlib.Path(sys.argv[6])
+runtime_attestation_path = pathlib.Path(sys.argv[7])
 artifact_names = (
     "kernel_binary", "fit_source", "packaged_dtb", "sdk_dtb",
     "fit_boot_sd", "full_sd_image", "sdk_fip",
 )
 tool_names = (
-    "sdk_mkimage", "sdk_dumpimage", "git_config", "mdir", "mcopy",
-    "cmp", "sha256sum", "fdtget", "python3", "tr",
+    "sdk_mkimage", "sdk_dumpimage", "git_config", "source_materializer_script",
+    "docker_runtime_script", "mdir", "mcopy", "cmp", "sha256sum", "fdtget",
+    "python3", "tr",
 )
-artifact_paths = sys.argv[6:13]
-tool_paths = sys.argv[13:23]
+artifact_paths = sys.argv[8:15]
+tool_paths = sys.argv[15:27]
 data = path.read_bytes()
 try:
     text = data.decode("utf-8")
@@ -1744,8 +1760,13 @@ if not data.endswith((marker + "\n").encode("utf-8")) or len(lines) < 2 or lines
     raise SystemExit("package-milkv-duo-sdk.sh: C8.4 verifier audit lacks the exact terminal PASS marker")
 if text.count(marker) != 1 or text.count(f'"schema":"{report_schema}"') != 1:
     raise SystemExit("package-milkv-duo-sdk.sh: C8.4 verifier audit marker/report is not unique")
-if re.search(r"\b(?:panic|fatal|fail|failed|failure)\b", text, re.IGNORECASE):
-    raise SystemExit("package-milkv-duo-sdk.sh: C8.4 verifier audit contains a forbidden failure token")
+transcript_text = "\n".join(lines[:-2])
+if re.search(
+    r"\b(?:panic|fatal|fail|failed|failure)\b", transcript_text, re.IGNORECASE
+):
+    raise SystemExit(
+        "package-milkv-duo-sdk.sh: C8.4 verifier audit transcript contains a forbidden failure token"
+    )
 report_line = lines[-2]
 
 
@@ -1758,20 +1779,209 @@ def reject_duplicate_members(pairs):
     return result
 
 
+def load_live_source():
+    source_materializer = pathlib.Path(tool_paths[3]).resolve(strict=True)
+    source_root = source_materializer.parent.parent
+    expected = (
+        source_root
+        / "target"
+        / "c84-source-materialization"
+        / source_commit
+        / challenge
+        / "source-materialization-envelope.json"
+    )
+    if source_envelope_path != expected or source_envelope_path.resolve(strict=True) != source_envelope_path:
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 source envelope path differs")
+    before_lstat = source_envelope_path.lstat()
+    before = source_envelope_path.stat()
+    if (
+        stat.S_ISLNK(before_lstat.st_mode)
+        or not stat.S_ISREG(before_lstat.st_mode)
+        or before.st_size <= 0
+        or before.st_size > 16_777_216
+        or before.st_nlink != 1
+    ):
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 source envelope is not a bounded single-link regular file")
+    raw = source_envelope_path.read_bytes()
+    after = source_envelope_path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+    ):
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 source envelope changed while reading")
+    try:
+        root = json.loads(raw, object_pairs_hook=reject_duplicate_members)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"package-milkv-duo-sdk.sh: cannot decode C8.4 source envelope: {error}")
+    if not isinstance(root, dict) or set(root) != {
+        "content", "content_sha256", "schema", "status", "version",
+    }:
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 source envelope fields are not closed")
+    content = root.get("content")
+    if (
+        root["schema"] != "vibeos.c84.source-materialization-envelope"
+        or type(root["version"]) is not int
+        or root["version"] != 1
+        or root["status"] != "closed"
+        or not isinstance(content, dict)
+        or set(content) != {
+            "bundles", "challenge", "clone_git_admin", "command", "frozen", "git",
+            "independence", "materialization", "patch", "snapshot", "source",
+            "source_commit", "submodules", "timestamps_utc",
+        }
+        or content.get("source_commit") != source_commit
+        or content.get("challenge") != challenge
+    ):
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 source envelope identity differs")
+    canonical_content = json.dumps(
+        content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if (
+        not isinstance(root["content_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", root["content_sha256"]) is None
+        or hashlib.sha256(canonical_content).hexdigest() != root["content_sha256"]
+        or raw != json.dumps(root, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    ):
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 source envelope canonical/content address differs")
+    return root
+
+
+def load_live_runtime(live_source):
+    docker_runtime = pathlib.Path(tool_paths[4]).resolve(strict=True)
+    source_materializer = pathlib.Path(tool_paths[3]).resolve(strict=True)
+    source_root = docker_runtime.parent.parent
+    if (
+        docker_runtime != source_root / "scripts" / "c84-docker-runtime.py"
+        or source_materializer.parent.parent != source_root
+    ):
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 Docker runtime tool path differs")
+    expected = (
+        source_root
+        / "target"
+        / "milkv-duo-wasm-aot-profile"
+        / "container-runtime-attestation.json"
+    )
+    if runtime_attestation_path != expected or runtime_attestation_path.resolve(strict=True) != runtime_attestation_path:
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 runtime attestation path differs")
+    before_lstat = runtime_attestation_path.lstat()
+    before = runtime_attestation_path.stat()
+    if (
+        stat.S_ISLNK(before_lstat.st_mode)
+        or not stat.S_ISREG(before_lstat.st_mode)
+        or before.st_size <= 0
+        or before.st_size > 67_108_864
+        or before.st_nlink != 1
+    ):
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 runtime attestation is not a bounded single-link regular file")
+    raw = runtime_attestation_path.read_bytes()
+    after = runtime_attestation_path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+    ):
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 runtime attestation changed while reading")
+    try:
+        root = json.loads(raw, object_pairs_hook=reject_duplicate_members)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SystemExit(f"package-milkv-duo-sdk.sh: cannot decode C8.4 runtime attestation: {error}")
+    if not isinstance(root, dict) or set(root) != {
+        "content", "content_sha256", "schema", "status", "version",
+    }:
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 runtime attestation fields are not closed")
+    content = root.get("content")
+    if (
+        root["schema"] != "vibeos.c84.docker-runtime-attestation"
+        or type(root["version"]) is not int
+        or root["version"] != 1
+        or root["status"] != "closed"
+        or not isinstance(content, dict)
+        or set(content) != {
+            "capability", "challenge", "host_preinspect", "host_preinspect_identity",
+            "mode", "source_commit", "source_materialization_content_sha256", "witness",
+        }
+        or content.get("capability") != "host Docker daemon inspect plus in-container namespace witness; software custody only"
+        or content.get("source_commit") != source_commit
+        or content.get("challenge") != challenge
+        or content.get("mode") != "package"
+        or content.get("source_materialization_content_sha256") != live_source["content_sha256"]
+    ):
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 runtime attestation identity differs")
+    canonical_content = json.dumps(
+        content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if (
+        not isinstance(root["content_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", root["content_sha256"]) is None
+        or hashlib.sha256(canonical_content).hexdigest() != root["content_sha256"]
+        or raw != json.dumps(root, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    ):
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 runtime attestation canonical/content address differs")
+    preinspect = content["host_preinspect"]
+    if not isinstance(preinspect, dict) or set(preinspect) != {
+        "content", "content_sha256", "schema", "status", "version",
+    }:
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 host preinspect fields are not closed")
+    pre_content = preinspect.get("content")
+    canonical_pre_content = json.dumps(
+        pre_content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8") if isinstance(pre_content, dict) else b""
+    if (
+        preinspect["schema"] != "vibeos.c84.docker-host-preinspect"
+        or type(preinspect["version"]) is not int
+        or preinspect["version"] != 1
+        or preinspect["status"] != "closed"
+        or not isinstance(pre_content, dict)
+        or set(pre_content) != {
+            "challenge", "container_preinspect", "contract", "image_inspect", "mode",
+            "sdk_volume_inspect", "source_commit",
+        }
+        or pre_content.get("source_commit") != source_commit
+        or pre_content.get("challenge") != challenge
+        or pre_content.get("mode") != "package"
+        or not isinstance(preinspect["content_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", preinspect["content_sha256"]) is None
+        or hashlib.sha256(canonical_pre_content).hexdigest() != preinspect["content_sha256"]
+    ):
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 host preinspect identity differs")
+    pre_raw = json.dumps(preinspect, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    pre_identity = content["host_preinspect_identity"]
+    if pre_identity != {"bytes": len(pre_raw), "sha256": hashlib.sha256(pre_raw).hexdigest()}:
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 host preinspect content identity differs")
+    image = pre_content["image_inspect"]
+    contract = pre_content["contract"]
+    if (
+        not isinstance(image, dict)
+        or not isinstance(image.get("Id"), str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image["Id"]) is None
+        or not isinstance(contract, dict)
+        or contract.get("capability") != content["capability"]
+        or contract.get("image_digest") != "sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679"
+        or contract.get("platform") != "linux/amd64"
+    ):
+        raise SystemExit("package-milkv-duo-sdk.sh: C8.4 runtime image custody differs")
+    return root
+
+
 try:
     report = json.loads(report_line, object_pairs_hook=reject_duplicate_members)
 except json.JSONDecodeError as error:
     raise SystemExit(f"package-milkv-duo-sdk.sh: C8.4 canonical audit report is invalid: {error}")
 if not isinstance(report, dict) or set(report) != {
-    "schema", "version", "source_commit", "challenge", "artifacts", "tools",
+    "schema", "version", "source_commit", "challenge", "source_materialization",
+    "runtime_attestation", "artifacts", "tools",
 }:
     raise SystemExit("package-milkv-duo-sdk.sh: C8.4 audit report fields are not closed")
 if (
     report["schema"] != report_schema or type(report["version"]) is not int
-    or report["version"] != 1 or report["source_commit"] != source_commit
+    or report["version"] != 2 or report["source_commit"] != source_commit
     or report["challenge"] != challenge
 ):
     raise SystemExit("package-milkv-duo-sdk.sh: C8.4 audit report identity differs")
+live_source_materialization = load_live_source()
+live_runtime_attestation = load_live_runtime(live_source_materialization)
+if (
+    report["source_materialization"] != live_source_materialization
+    or report["runtime_attestation"] != live_runtime_attestation
+):
+    raise SystemExit("package-milkv-duo-sdk.sh: C8.4 audit report source/runtime attestation differs")
 canonical = json.dumps(report, sort_keys=True, separators=(",", ":"))
 if canonical != report_line:
     raise SystemExit("package-milkv-duo-sdk.sh: C8.4 audit report is not canonical JSON")
@@ -1813,45 +2023,18 @@ PY
 
   verify_c84_input_state() {
     if [[ $(git --no-optional-locks -C "$sdk_root" rev-parse HEAD) != "$wasm_aot_profile_sdk_commit" ]] ||
-       [[ -n $(git --no-optional-locks -C "$sdk_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) ]]; then
+       [[ -n $(git --no-optional-locks -c core.fsmonitor=false -C "$sdk_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) ]]; then
       echo "package-milkv-duo-sdk.sh: C8.4 SDK checkout changed during packaging" >&2
       return 1
     fi
-    if [[ $(git -C "$repo_root" rev-parse HEAD) != "$wasm_aot_profile_source_commit" ]] ||
-       [[ -n $(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=all) ]]; then
-      echo "package-milkv-duo-sdk.sh: C8.4 superproject changed during packaging" >&2
+    if ! verify_c84_frozen_source >/dev/null; then
+      echo "package-milkv-duo-sdk.sh: C8.4 frozen source changed during packaging" >&2
       return 1
     fi
-    if [[ $(git -C "$jitterentropy_submodule" rev-parse HEAD) != c5bd2e17194fe3a04d17f74027bb67622579405f ]] ||
-       [[ $(git -C "$sunset_submodule" rev-parse HEAD) != f686eaaaba8b2eda3f83e23b4bb3005cae31ce5e ]] ||
-       [[ -n $(git -C "$sunset_submodule" status --porcelain=v1 --untracked-files=all --ignore-submodules=none) ]]; then
-      echo "package-milkv-duo-sdk.sh: C8.4 reviewed submodule state changed during packaging" >&2
+    if ! verify_c84_runtime_attestation >/dev/null; then
+      echo "package-milkv-duo-sdk.sh: C8.4 runtime attestation changed during packaging" >&2
       return 1
     fi
-    python3 - "$jitterentropy_submodule" "$jitterentropy_patch" <<'PY'
-import pathlib
-import subprocess
-import sys
-
-observed = subprocess.run(
-    ["git", "-C", sys.argv[1], "diff", "--unified=0", "--binary"],
-    check=True,
-    stdout=subprocess.PIPE,
-).stdout
-if observed != pathlib.Path(sys.argv[2]).read_bytes():
-    raise SystemExit("package-milkv-duo-sdk.sh: C8.4 jitterentropy-rs diff changed during packaging")
-if subprocess.run(
-    ["git", "-C", sys.argv[1], "diff", "--cached", "--quiet", "--exit-code"],
-).returncode != 0:
-    raise SystemExit("package-milkv-duo-sdk.sh: C8.4 jitterentropy-rs gained staged changes during packaging")
-untracked = subprocess.run(
-    ["git", "-C", sys.argv[1], "ls-files", "--others", "--exclude-standard", "-z"],
-    check=True,
-    stdout=subprocess.PIPE,
-).stdout
-if untracked:
-    raise SystemExit("package-milkv-duo-sdk.sh: C8.4 jitterentropy-rs gained untracked files during packaging")
-PY
     python3 - "$kernel_bin" "$staged_kernel_bin" "$validated_kernel_sha256" "$validated_kernel_bytes" <<'PY'
 import hashlib
 import pathlib
@@ -1882,17 +2065,16 @@ PY
 
   python3 - \
     "$temp_envelope" "$wasm_aot_profile_source_commit" "$wasm_aot_profile_challenge" \
-    "$sdk_root" "$wasm_aot_profile_sdk_commit" "$wasm_aot_profile_declared_container" \
-    "$repo_root" "$jitterentropy_submodule" "$jitterentropy_patch" \
-    "$jitterentropy_head" "$jitterentropy_diff_sha256" "$jitterentropy_diff_bytes" \
-    "$sunset_submodule" "$sunset_head" \
+    "$sdk_root" "$wasm_aot_profile_sdk_commit" "$wasm_aot_profile_container_digest_pin" \
+    "$repo_root" "$c84_source_materializer" "$c84_source_envelope" \
+    "$c84_docker_runtime" "$c84_runtime_attestation" "$jitterentropy_patch" \
     "$kernel_elf" "$kernel_bin" "$staged_kernel_bin" \
     "$output_its" "$final_output_its" "$output_dtb" "$final_output_dtb" \
     "$output_fit" "$final_output_fit" "$output_image" "$final_output_image" \
     "$sdk_fip" "$sdk_dtb" "$output_audit" "$final_output_audit" \
     "$script_dir/package-milkv-duo-sdk.sh" "$script_dir/verify-milkv-duo-image.sh" \
     "$c84_docker_git_config_template" \
-    "$script_dir/build-milkv-duo.sh" "$script_dir/prepare-jitterentropy-rs.sh" \
+    "$script_dir/build-milkv-duo.sh" \
     "$repo_root/.gitmodules" "$script_dir/milkv-duo.its" \
     "$script_dir/milkv-duo-genimage.cfg" \
     "$repo_root/benchmarks/wasm-aot-decision/workloads-v1.json" \
@@ -1912,14 +2094,13 @@ import stat
 import sys
 
 (
-    destination, source_commit, challenge, sdk_root, sdk_commit, container_digest,
-    source_root, jitterentropy_submodule, jitterentropy_patch, jitterentropy_head,
-    jitterentropy_diff_sha256, jitterentropy_diff_bytes, sunset_submodule, sunset_head,
+    destination, source_commit, challenge, sdk_root, sdk_commit, image_digest,
+    source_root, source_materializer_script, source_materialization_envelope,
+    docker_runtime_script, runtime_attestation_envelope, jitterentropy_patch,
     kernel_elf, kernel_bin, staged_kernel_bin, staged_its, final_its, staged_dtb, final_dtb,
     staged_fit, final_fit, staged_image, final_image, sdk_fip, sdk_dtb,
     staged_audit, final_audit, package_script, image_verifier, docker_git_config,
-    build_script,
-    prepare_jitterentropy_script, gitmodules, its_source, genimage_config,
+    build_script, gitmodules, its_source, genimage_config,
     workload_manifest, transcript_schema, toolchain_contract, evidence_checker,
     mkimage, dumpimage, genimage, genimage_lib, build_envelope,
     validated_build_content_sha256, packaging_started_utc, image_verified_utc,
@@ -1946,6 +2127,193 @@ def exact(value, keys, label):
     if not isinstance(value, dict) or set(value) != set(keys):
         fail(f"{label} fields are not closed")
     return value
+
+
+source_root_path = pathlib.Path(source_root).resolve(strict=True)
+
+
+def load_source_materialization(path_text):
+    path = pathlib.Path(path_text)
+    expected = (
+        source_root_path
+        / "target"
+        / "c84-source-materialization"
+        / source_commit
+        / challenge
+        / "source-materialization-envelope.json"
+    )
+    if path != expected or path.resolve(strict=True) != path:
+        fail("source materialization envelope path differs")
+    before_lstat = path.lstat()
+    before = path.stat()
+    if (
+        stat.S_ISLNK(before_lstat.st_mode)
+        or not stat.S_ISREG(before_lstat.st_mode)
+        or before.st_size <= 0
+        or before.st_size > 16_777_216
+        or before.st_nlink != 1
+    ):
+        fail("source materialization envelope is not a bounded single-link regular file")
+    raw = path.read_bytes()
+    after = path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+    ):
+        fail("source materialization envelope changed while reading")
+    try:
+        root = json.loads(raw, object_pairs_hook=reject_duplicate_members)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"cannot decode source materialization envelope: {error}")
+    root = exact(
+        root,
+        {"content", "content_sha256", "schema", "status", "version"},
+        "source materialization envelope",
+    )
+    if (
+        root["schema"] != "vibeos.c84.source-materialization-envelope"
+        or type(root["version"]) is not int
+        or root["version"] != 1
+        or root["status"] != "closed"
+    ):
+        fail("source materialization envelope identity/status differs")
+    source_content = exact(
+        root["content"],
+        {
+            "bundles", "challenge", "clone_git_admin", "command", "frozen", "git",
+            "independence", "materialization", "patch", "snapshot", "source",
+            "source_commit", "submodules", "timestamps_utc",
+        },
+        "source materialization content",
+    )
+    canonical_content = json.dumps(
+        source_content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    digest = root.get("content_sha256")
+    if (
+        source_content["source_commit"] != source_commit
+        or source_content["challenge"] != challenge
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or hashlib.sha256(canonical_content).hexdigest() != digest
+        or raw != json.dumps(root, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    ):
+        fail("source materialization canonical identity differs")
+    return root
+
+
+def load_runtime_attestation(path_text):
+    docker_runtime_path = pathlib.Path(docker_runtime_script).resolve(strict=True)
+    if docker_runtime_path != source_root_path / "scripts" / "c84-docker-runtime.py":
+        fail("Docker runtime tool path differs")
+    path = pathlib.Path(path_text)
+    expected = (
+        source_root_path
+        / "target"
+        / "milkv-duo-wasm-aot-profile"
+        / "container-runtime-attestation.json"
+    )
+    if path != expected or path.resolve(strict=True) != path:
+        fail("runtime attestation path differs")
+    before_lstat = path.lstat()
+    before = path.stat()
+    if (
+        stat.S_ISLNK(before_lstat.st_mode)
+        or not stat.S_ISREG(before_lstat.st_mode)
+        or before.st_size <= 0
+        or before.st_size > 67_108_864
+        or before.st_nlink != 1
+    ):
+        fail("runtime attestation is not a bounded single-link regular file")
+    raw = path.read_bytes()
+    after = path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+    ):
+        fail("runtime attestation changed while reading")
+    try:
+        root = json.loads(raw, object_pairs_hook=reject_duplicate_members)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"cannot decode runtime attestation: {error}")
+    root = exact(
+        root,
+        {"content", "content_sha256", "schema", "status", "version"},
+        "runtime attestation",
+    )
+    content = exact(
+        root["content"],
+        {
+            "capability", "challenge", "host_preinspect", "host_preinspect_identity",
+            "mode", "source_commit", "source_materialization_content_sha256", "witness",
+        },
+        "runtime attestation content",
+    )
+    capability = "host Docker daemon inspect plus in-container namespace witness; software custody only"
+    canonical_content = json.dumps(
+        content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if (
+        root["schema"] != "vibeos.c84.docker-runtime-attestation"
+        or type(root["version"]) is not int
+        or root["version"] != 1
+        or root["status"] != "closed"
+        or content["capability"] != capability
+        or content["source_commit"] != source_commit
+        or content["challenge"] != challenge
+        or content["mode"] != "package"
+        or content["source_materialization_content_sha256"] != live_source_materialization["content_sha256"]
+        or not isinstance(root["content_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", root["content_sha256"]) is None
+        or hashlib.sha256(canonical_content).hexdigest() != root["content_sha256"]
+        or raw != json.dumps(root, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    ):
+        fail("runtime attestation canonical identity/content address differs")
+    preinspect = exact(
+        content["host_preinspect"],
+        {"content", "content_sha256", "schema", "status", "version"},
+        "host preinspect",
+    )
+    pre_content = exact(
+        preinspect["content"],
+        {
+            "challenge", "container_preinspect", "contract", "image_inspect", "mode",
+            "sdk_volume_inspect", "source_commit",
+        },
+        "host preinspect content",
+    )
+    canonical_pre_content = json.dumps(
+        pre_content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if (
+        preinspect["schema"] != "vibeos.c84.docker-host-preinspect"
+        or type(preinspect["version"]) is not int
+        or preinspect["version"] != 1
+        or preinspect["status"] != "closed"
+        or pre_content["source_commit"] != source_commit
+        or pre_content["challenge"] != challenge
+        or pre_content["mode"] != "package"
+        or not isinstance(preinspect["content_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", preinspect["content_sha256"]) is None
+        or hashlib.sha256(canonical_pre_content).hexdigest() != preinspect["content_sha256"]
+    ):
+        fail("host preinspect identity/content address differs")
+    pre_raw = json.dumps(preinspect, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    if content["host_preinspect_identity"] != {
+        "bytes": len(pre_raw), "sha256": hashlib.sha256(pre_raw).hexdigest(),
+    }:
+        fail("host preinspect file identity differs")
+    image = pre_content["image_inspect"]
+    contract = pre_content["contract"]
+    image_id = image.get("Id") if isinstance(image, dict) else None
+    if (
+        not isinstance(image_id, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+        or not isinstance(contract, dict)
+        or contract.get("capability") != capability
+        or contract.get("image_digest") != image_digest
+        or contract.get("platform") != "linux/amd64"
+    ):
+        fail("runtime image custody differs")
+    return root, image_id
 
 
 def identity(measured_path, recorded_path=None, *, scan=False, reject_symlink=False):
@@ -1988,6 +2356,8 @@ def match(left, right, label):
         fail(f"{label} differs")
 
 
+live_source_materialization = load_source_materialization(source_materialization_envelope)
+live_runtime_attestation, runtime_image_id = load_runtime_attestation(runtime_attestation_envelope)
 audit_data = pathlib.Path(staged_audit).read_bytes()
 try:
     audit_text = audit_data.decode("utf-8")
@@ -1998,8 +2368,11 @@ if not audit_data.endswith((pass_marker + "\n").encode("utf-8")) or len(audit_li
     fail("verifier audit exact terminal marker differs")
 if audit_text.count(pass_marker) != 1 or audit_text.count(f'"schema":"{report_schema}"') != 1:
     fail("verifier audit marker/report is not unique")
-if re.search(r"\b(?:panic|fatal|fail|failed|failure)\b", audit_text, re.IGNORECASE):
-    fail("verifier audit contains a forbidden failure token")
+audit_transcript = "\n".join(audit_lines[:-2])
+if re.search(
+    r"\b(?:panic|fatal|fail|failed|failure)\b", audit_transcript, re.IGNORECASE
+):
+    fail("verifier audit transcript contains a forbidden failure token")
 report_line = audit_lines[-2]
 try:
     audit_report = json.loads(report_line, object_pairs_hook=reject_duplicate_members)
@@ -2007,15 +2380,20 @@ except json.JSONDecodeError as error:
     fail(f"cannot decode canonical audit report: {error}")
 audit_report = exact(
     audit_report,
-    {"schema", "version", "source_commit", "challenge", "artifacts", "tools"},
+    {
+        "schema", "version", "source_commit", "challenge", "source_materialization",
+        "runtime_attestation", "artifacts", "tools",
+    },
     "image audit report",
 )
 if (
     audit_report["schema"] != report_schema
     or type(audit_report["version"]) is not int
-    or audit_report["version"] != 1
+    or audit_report["version"] != 2
     or audit_report["source_commit"] != source_commit
     or audit_report["challenge"] != challenge
+    or audit_report["source_materialization"] != live_source_materialization
+    or audit_report["runtime_attestation"] != live_runtime_attestation
 ):
     fail("image audit report identity differs")
 canonical_report = json.dumps(audit_report, sort_keys=True, separators=(",", ":"))
@@ -2039,7 +2417,8 @@ tools = {
     "image_verifier_script": identity(image_verifier),
     "docker_git_config": identity(docker_git_config),
     "build_script": identity(build_script),
-    "prepare_jitterentropy_script": identity(prepare_jitterentropy_script),
+    "source_materializer_script": identity(source_materializer_script),
+    "docker_runtime_script": identity(docker_runtime_script),
     "jitterentropy_patch": identity(jitterentropy_patch),
     "gitmodules": identity(gitmodules),
     "fit_source": identity(its_source),
@@ -2071,6 +2450,8 @@ report_artifact_roles = {
 report_tool_roles = {
     "sdk_mkimage": "sdk_mkimage", "sdk_dumpimage": "sdk_dumpimage",
     "git_config": "docker_git_config",
+    "source_materializer_script": "source_materializer_script",
+    "docker_runtime_script": "docker_runtime_script",
     "mdir": "verifier_mdir", "mcopy": "verifier_mcopy",
     "cmp": "verifier_cmp", "sha256sum": "verifier_sha256sum",
     "fdtget": "verifier_fdtget", "python3": "verifier_python3", "tr": "verifier_tr",
@@ -2098,19 +2479,55 @@ build_root = exact(build_root, {"schema", "version", "status", "content_sha256",
 if (
     build_root["schema"] != "vibeos.c84.duo-wasm-aot-profile.build-envelope"
     or type(build_root["version"]) is not int
-    or build_root["version"] != 1
+    or build_root["version"] != 2
     or build_root["status"] != "closed"
     or build_root["content_sha256"] != validated_build_content_sha256
 ):
     fail("build envelope identity/status differs")
-build_content = build_root["content"]
-if not isinstance(build_content, dict):
-    fail("build content is missing")
+build_content = exact(
+    build_root["content"],
+    {
+        "platform", "source_commit", "challenge", "run_id", "source", "command",
+        "objcopy_command", "objcopy_environment", "environment", "toolchain",
+        "artifacts", "tools", "timestamps_utc",
+    },
+    "build content",
+)
 canonical_build = json.dumps(build_content, sort_keys=True, separators=(",", ":")).encode("utf-8")
 if hashlib.sha256(canonical_build).hexdigest() != build_root["content_sha256"]:
     fail("build content address differs")
 if build_content.get("source_commit") != source_commit or build_content.get("challenge") != challenge:
     fail("build source/challenge differs")
+build_source = exact(
+    build_content.get("source"), {"root", "head", "materialization"}, "build source"
+)
+if (
+    build_source["root"] != "."
+    or build_source["head"] != source_commit
+    or build_source["materialization"] != live_source_materialization
+):
+    fail("build frozen-source proof differs")
+build_tools = exact(
+    build_content.get("tools"),
+    {
+        "build_script", "source_materializer_script", "jitterentropy_patch", "gitmodules",
+        "firmware_manifest", "firmware_build_script", "firmware_linker_script",
+        "firmware_cargo_config", "kernel_manifest", "workspace_manifest", "cargo_lock",
+        "workload_manifest", "transcript_schema", "toolchain_contract",
+    },
+    "build tools",
+)
+build_source_tool = exact(
+    build_tools["source_materializer_script"],
+    {"path", "sha256", "bytes"},
+    "build source materializer tool",
+)
+if (
+    build_source_tool["path"] != "scripts/c84-source-materialization.py"
+    or build_source_tool["sha256"] != tools["source_materializer_script"]["sha256"]
+    or build_source_tool["bytes"] != tools["source_materializer_script"]["bytes"]
+):
+    fail("build source materializer tool differs")
 run_id = build_content.get("run_id")
 if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{64}", run_id) is None:
     fail("build run_id is malformed")
@@ -2145,30 +2562,23 @@ closed_utc = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+
 source = {
     "root": str(pathlib.Path(source_root).resolve(strict=True)),
     "head": source_commit,
-    "superproject_clean": True,
-    "status_policy": "git status --porcelain=v1 --untracked-files=all --ignore-submodules=all",
-    "jitterentropy": {
-        "path": str(pathlib.Path(jitterentropy_submodule).resolve(strict=True)),
-        "head": jitterentropy_head,
-        "patch_sha256": tools["jitterentropy_patch"]["sha256"],
-        "patch_bytes": tools["jitterentropy_patch"]["bytes"],
-        "observed_diff_sha256": jitterentropy_diff_sha256,
-        "observed_diff_bytes": int(jitterentropy_diff_bytes),
-        "policy": "exact recorded patch verified by prepare-jitterentropy-rs.sh",
-    },
-    "sunset": {
-        "path": str(pathlib.Path(sunset_submodule).resolve(strict=True)),
-        "head": sunset_head,
-        "worktree_clean": True,
-        "status_policy": "git status --porcelain=v1 --untracked-files=all --ignore-submodules=none",
-    },
+    "materialization": live_source_materialization,
 }
+sdk_root_path = pathlib.Path(sdk_root).resolve(strict=True)
+if (
+    str(sdk_root_path) != "/home/work"
+    or sdk_commit != "23eb84fecb29585dbb5728d6b7e2475ff273baac"
+    or image_digest != "sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679"
+):
+    fail("SDK runtime custody pin differs")
 sdk = {
-    "root": str(pathlib.Path(sdk_root).resolve(strict=True)),
+    "root": str(sdk_root_path),
     "commit": sdk_commit,
-    "commit_provenance": "operator-declared; local checkout HEAD equality verified",
-    "declared_container_digest": container_digest,
-    "container_digest_provenance": "operator-declared; runtime container identity not attested",
+    "commit_provenance": "host-observed read-only SDK mount; in-container Git HEAD and clean worktree verified",
+    "image_digest": image_digest,
+    "image_id": runtime_image_id,
+    "platform": "linux/amd64",
+    "runtime_provenance": "host Docker daemon inspect plus in-container namespace witness; software custody only",
     "worktree_clean": True,
     "status_policy": "git status --porcelain=v1 --untracked-files=all --ignore-submodules=none",
 }
@@ -2203,7 +2613,7 @@ environment = {
             "HOME": "/nonexistent",
             "LC_ALL": "C", "PATH": verifier_path, "TZ": "UTC",
             "VIBEOS_C84_CHALLENGE": challenge,
-            "VIBEOS_C84_SDK_CONTAINER_DIGEST": container_digest,
+            "VIBEOS_C84_SDK_CONTAINER_DIGEST": image_digest,
             "VIBEOS_C84_SOURCE_COMMIT": source_commit,
         },
     },
@@ -2215,6 +2625,7 @@ content = {
     "run_id": run_id,
     "source": source,
     "sdk": sdk,
+    "runtime_attestation": live_runtime_attestation,
     "build": {"content_sha256": build_root["content_sha256"], "envelope": build_identity},
     "command": ["scripts/package-milkv-duo-sdk.sh", "--wasm-aot-profile", "<sdk-root>"],
     "environment": environment,
@@ -2224,7 +2635,7 @@ content = {
         "report": audit_report, "report_sha256": validated_audit_report_sha256,
         "audit_log": identity(staged_audit, final_audit, reject_symlink=True),
         "invocation": [
-            "scripts/verify-milkv-duo-image.sh", "--wasm-aot-profile",
+            "scripts/verify-milkv-duo-image.sh", "--wasm-aot-profile", "--package-preflight",
             "--artifact-root=<staging-artifact-root>", "<sdk-root>",
         ],
     },
@@ -2238,7 +2649,7 @@ content = {
 canonical = json.dumps(content, sort_keys=True, separators=(",", ":")).encode("utf-8")
 envelope = {
     "schema": "vibeos.c84.duo-wasm-aot-profile.package-envelope",
-    "version": 1,
+    "version": 2,
     "status": "closed",
     "content_sha256": hashlib.sha256(canonical).hexdigest(),
     "content": content,
@@ -2256,7 +2667,9 @@ PY
     "$output_fit" "$final_output_fit" "$output_image" "$final_output_image" \
     "$output_audit" "$final_output_audit" "$output_envelope" "$final_output_envelope" \
     "$c84_pass_marker" "$validated_build_content_sha256" \
-    "$wasm_aot_profile_source_commit" "$wasm_aot_profile_challenge" <<'PY'
+    "$wasm_aot_profile_source_commit" "$wasm_aot_profile_challenge" \
+    "$c84_source_envelope" "$c84_source_materializer" \
+    "$c84_runtime_attestation" "$c84_docker_runtime" <<'PY'
 import datetime
 import hashlib
 import json
@@ -2267,7 +2680,16 @@ import stat
 import sys
 
 pairs = [(pathlib.Path(a), pathlib.Path(b)) for a, b in zip(sys.argv[1:13:2], sys.argv[2:13:2])]
-pass_marker, build_content_sha256, source_commit, challenge = sys.argv[13:]
+(
+    pass_marker, build_content_sha256, source_commit, challenge,
+    source_envelope_name, source_materializer_name,
+    runtime_attestation_name, docker_runtime_name,
+) = sys.argv[13:]
+source_envelope_path = pathlib.Path(source_envelope_name)
+source_materializer_path = pathlib.Path(source_materializer_name).resolve(strict=True)
+runtime_attestation_path = pathlib.Path(runtime_attestation_name)
+docker_runtime_path = pathlib.Path(docker_runtime_name).resolve(strict=True)
+source_root_path = source_materializer_path.parent.parent
 created = []
 
 
@@ -2288,6 +2710,193 @@ def exact(value, keys, label):
     if not isinstance(value, dict) or set(value) != set(keys):
         fail(f"{label} fields are not closed")
     return value
+
+
+def load_source_materialization():
+    expected = (
+        source_root_path
+        / "target"
+        / "c84-source-materialization"
+        / source_commit
+        / challenge
+        / "source-materialization-envelope.json"
+    )
+    if (
+        source_envelope_path != expected
+        or source_envelope_path.resolve(strict=True) != source_envelope_path
+    ):
+        fail("source materialization envelope path differs")
+    before_lstat = source_envelope_path.lstat()
+    before = source_envelope_path.stat()
+    if (
+        stat.S_ISLNK(before_lstat.st_mode)
+        or not stat.S_ISREG(before_lstat.st_mode)
+        or before.st_size <= 0
+        or before.st_size > 16_777_216
+        or before.st_nlink != 1
+    ):
+        fail("source materialization envelope is not a bounded single-link regular file")
+    raw = source_envelope_path.read_bytes()
+    after = source_envelope_path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+    ):
+        fail("source materialization envelope changed while reading")
+    try:
+        root = json.loads(raw, object_pairs_hook=reject_duplicate_members)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"cannot decode source materialization envelope: {error}")
+    root = exact(
+        root,
+        {"content", "content_sha256", "schema", "status", "version"},
+        "source materialization envelope",
+    )
+    if (
+        root["schema"] != "vibeos.c84.source-materialization-envelope"
+        or type(root["version"]) is not int
+        or root["version"] != 1
+        or root["status"] != "closed"
+    ):
+        fail("source materialization envelope identity/status differs")
+    source_content = exact(
+        root["content"],
+        {
+            "bundles", "challenge", "clone_git_admin", "command", "frozen", "git",
+            "independence", "materialization", "patch", "snapshot", "source",
+            "source_commit", "submodules", "timestamps_utc",
+        },
+        "source materialization content",
+    )
+    canonical_content = json.dumps(
+        source_content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    digest = root.get("content_sha256")
+    if (
+        source_content["source_commit"] != source_commit
+        or source_content["challenge"] != challenge
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or hashlib.sha256(canonical_content).hexdigest() != digest
+        or raw != json.dumps(root, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    ):
+        fail("source materialization canonical identity differs")
+    return root
+
+
+def load_runtime_attestation():
+    if docker_runtime_path != source_root_path / "scripts" / "c84-docker-runtime.py":
+        fail("Docker runtime tool path differs")
+    expected = (
+        source_root_path
+        / "target"
+        / "milkv-duo-wasm-aot-profile"
+        / "container-runtime-attestation.json"
+    )
+    if (
+        runtime_attestation_path != expected
+        or runtime_attestation_path.resolve(strict=True) != runtime_attestation_path
+    ):
+        fail("runtime attestation path differs")
+    before_lstat = runtime_attestation_path.lstat()
+    before = runtime_attestation_path.stat()
+    if (
+        stat.S_ISLNK(before_lstat.st_mode)
+        or not stat.S_ISREG(before_lstat.st_mode)
+        or before.st_size <= 0
+        or before.st_size > 67_108_864
+        or before.st_nlink != 1
+    ):
+        fail("runtime attestation is not a bounded single-link regular file")
+    raw = runtime_attestation_path.read_bytes()
+    after = runtime_attestation_path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+    ):
+        fail("runtime attestation changed while reading")
+    try:
+        root = json.loads(raw, object_pairs_hook=reject_duplicate_members)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"cannot decode runtime attestation: {error}")
+    root = exact(
+        root,
+        {"content", "content_sha256", "schema", "status", "version"},
+        "runtime attestation",
+    )
+    content = exact(
+        root["content"],
+        {
+            "capability", "challenge", "host_preinspect", "host_preinspect_identity",
+            "mode", "source_commit", "source_materialization_content_sha256", "witness",
+        },
+        "runtime attestation content",
+    )
+    capability = "host Docker daemon inspect plus in-container namespace witness; software custody only"
+    canonical_content = json.dumps(
+        content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if (
+        root["schema"] != "vibeos.c84.docker-runtime-attestation"
+        or type(root["version"]) is not int
+        or root["version"] != 1
+        or root["status"] != "closed"
+        or content["capability"] != capability
+        or content["source_commit"] != source_commit
+        or content["challenge"] != challenge
+        or content["mode"] != "package"
+        or content["source_materialization_content_sha256"] != live_source_materialization["content_sha256"]
+        or not isinstance(root["content_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", root["content_sha256"]) is None
+        or hashlib.sha256(canonical_content).hexdigest() != root["content_sha256"]
+        or raw != json.dumps(root, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    ):
+        fail("runtime attestation canonical identity/content address differs")
+    preinspect = exact(
+        content["host_preinspect"],
+        {"content", "content_sha256", "schema", "status", "version"},
+        "host preinspect",
+    )
+    pre_content = exact(
+        preinspect["content"],
+        {
+            "challenge", "container_preinspect", "contract", "image_inspect", "mode",
+            "sdk_volume_inspect", "source_commit",
+        },
+        "host preinspect content",
+    )
+    canonical_pre_content = json.dumps(
+        pre_content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if (
+        preinspect["schema"] != "vibeos.c84.docker-host-preinspect"
+        or type(preinspect["version"]) is not int
+        or preinspect["version"] != 1
+        or preinspect["status"] != "closed"
+        or pre_content["source_commit"] != source_commit
+        or pre_content["challenge"] != challenge
+        or pre_content["mode"] != "package"
+        or not isinstance(preinspect["content_sha256"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", preinspect["content_sha256"]) is None
+        or hashlib.sha256(canonical_pre_content).hexdigest() != preinspect["content_sha256"]
+    ):
+        fail("host preinspect identity/content address differs")
+    pre_raw = json.dumps(preinspect, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    if content["host_preinspect_identity"] != {
+        "bytes": len(pre_raw), "sha256": hashlib.sha256(pre_raw).hexdigest(),
+    }:
+        fail("host preinspect file identity differs")
+    image = pre_content["image_inspect"]
+    contract = pre_content["contract"]
+    image_id = image.get("Id") if isinstance(image, dict) else None
+    if (
+        not isinstance(image_id, str)
+        or re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
+        or not isinstance(contract, dict)
+        or contract.get("capability") != capability
+        or contract.get("image_digest") != "sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679"
+        or contract.get("platform") != "linux/amd64"
+    ):
+        fail("runtime image custody differs")
+    return root, image_id
 
 
 def identity_record(value, label):
@@ -2337,6 +2946,8 @@ def rehash(record, label):
 
 
 try:
+    live_source_materialization = load_source_materialization()
+    live_runtime_attestation, runtime_image_id = load_runtime_attestation()
     destination_parent = pairs[0][1].parent
     if stat.S_ISLNK(destination_parent.lstat().st_mode) or not destination_parent.is_dir():
         fail("publication parent is not a fixed non-symlink directory")
@@ -2370,7 +2981,7 @@ try:
     root = exact(root, {"schema", "version", "status", "content_sha256", "content"}, "package envelope")
     if (
         root["schema"] != "vibeos.c84.duo-wasm-aot-profile.package-envelope"
-        or type(root["version"]) is not int or root["version"] != 1
+        or type(root["version"]) is not int or root["version"] != 2
         or root["status"] != "closed"
         or not isinstance(root["content_sha256"], str)
         or re.fullmatch(r"[0-9a-f]{64}", root["content_sha256"]) is None
@@ -2378,7 +2989,7 @@ try:
         fail("package envelope identity/status differs")
     content = exact(
         root["content"],
-        {"platform", "source_commit", "challenge", "run_id", "source", "sdk", "build", "command", "environment", "artifacts", "verifier", "tools", "timestamps_utc"},
+        {"platform", "source_commit", "challenge", "run_id", "source", "sdk", "runtime_attestation", "build", "command", "environment", "artifacts", "verifier", "tools", "timestamps_utc"},
         "package content",
     )
     canonical = json.dumps(content, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -2392,40 +3003,32 @@ try:
         or re.fullmatch(r"[0-9a-f]{64}", content["run_id"]) is None
     ):
         fail("package campaign identity differs")
-    source = exact(content["source"], {"root", "head", "superproject_clean", "status_policy", "jitterentropy", "sunset"}, "source")
+    source = exact(content["source"], {"root", "head", "materialization"}, "source")
     if (
-        source["head"] != source_commit or source["superproject_clean"] is not True
-        or source["status_policy"] != "git status --porcelain=v1 --untracked-files=all --ignore-submodules=all"
+        source["root"] != str(source_root_path)
+        or source["head"] != source_commit
+        or source["materialization"] != live_source_materialization
     ):
-        fail("source attestation differs")
-    jitter = exact(source["jitterentropy"], {"path", "head", "patch_sha256", "patch_bytes", "observed_diff_sha256", "observed_diff_bytes", "policy"}, "jitterentropy")
-    for key in ("patch_bytes", "observed_diff_bytes"):
-        if type(jitter[key]) is not int or jitter[key] <= 0:
-            fail(f"jitterentropy {key} is malformed")
-    if (
-        jitter["head"] != "c5bd2e17194fe3a04d17f74027bb67622579405f"
-        or jitter["patch_sha256"] != jitter["observed_diff_sha256"]
-        or jitter["patch_bytes"] != jitter["observed_diff_bytes"]
-        or jitter["policy"] != "exact recorded patch verified by prepare-jitterentropy-rs.sh"
-    ):
-        fail("jitterentropy reviewed delta differs")
-    sunset = exact(source["sunset"], {"path", "head", "worktree_clean", "status_policy"}, "sunset")
-    if (
-        sunset["head"] != "f686eaaaba8b2eda3f83e23b4bb3005cae31ce5e"
-        or sunset["worktree_clean"] is not True
-        or sunset["status_policy"] != "git status --porcelain=v1 --untracked-files=all --ignore-submodules=none"
-    ):
-        fail("sunset clean state differs")
-    sdk = exact(content["sdk"], {"root", "commit", "commit_provenance", "declared_container_digest", "container_digest_provenance", "worktree_clean", "status_policy"}, "SDK")
-    if (
-        sdk["commit"] != "23eb84fecb29585dbb5728d6b7e2475ff273baac"
-        or sdk["declared_container_digest"] != "sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679"
-        or sdk["commit_provenance"] != "operator-declared; local checkout HEAD equality verified"
-        or sdk["container_digest_provenance"] != "operator-declared; runtime container identity not attested"
-        or sdk["worktree_clean"] is not True
-        or sdk["status_policy"] != "git status --porcelain=v1 --untracked-files=all --ignore-submodules=none"
-    ):
-        fail("SDK declared provenance differs")
+        fail("frozen-source attestation differs")
+    if content["runtime_attestation"] != live_runtime_attestation:
+        fail("package runtime attestation differs")
+    sdk = exact(
+        content["sdk"],
+        {"commit", "commit_provenance", "image_digest", "image_id", "platform", "root", "runtime_provenance", "status_policy", "worktree_clean"},
+        "SDK",
+    )
+    if sdk != {
+        "commit": "23eb84fecb29585dbb5728d6b7e2475ff273baac",
+        "commit_provenance": "host-observed read-only SDK mount; in-container Git HEAD and clean worktree verified",
+        "image_digest": "sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679",
+        "image_id": runtime_image_id,
+        "platform": "linux/amd64",
+        "root": "/home/work",
+        "runtime_provenance": "host Docker daemon inspect plus in-container namespace witness; software custody only",
+        "status_policy": "git status --porcelain=v1 --untracked-files=all --ignore-submodules=none",
+        "worktree_clean": True,
+    }:
+        fail("SDK runtime custody differs")
     build = exact(content["build"], {"content_sha256", "envelope"}, "build reference")
     if build["content_sha256"] != build_content_sha256:
         fail("build content reference differs")
@@ -2463,32 +3066,118 @@ try:
         or verifier_values["TZ"] != "UTC"
         or verifier_values["VIBEOS_C84_SOURCE_COMMIT"] != source_commit
         or verifier_values["VIBEOS_C84_CHALLENGE"] != challenge
-        or verifier_values["VIBEOS_C84_SDK_CONTAINER_DIGEST"] != sdk["declared_container_digest"]
+        or verifier_values["VIBEOS_C84_SDK_CONTAINER_DIGEST"] != sdk["image_digest"]
     ):
         fail("image-verifier environment values differ")
     artifacts = exact(content["artifacts"], {"kernel_elf", "kernel_binary", "packaged_fit_source", "packaged_dtb", "fit_boot_sd", "full_sd_image", "sdk_fip", "sdk_dtb"}, "artifacts")
-    tools = exact(content["tools"], {"package_script", "image_verifier_script", "docker_git_config", "build_script", "prepare_jitterentropy_script", "jitterentropy_patch", "gitmodules", "fit_source", "genimage_config", "workload_manifest", "transcript_schema", "toolchain_contract", "evidence_checker", "sdk_mkimage", "sdk_dumpimage", "sdk_genimage", "verifier_mdir", "verifier_mcopy", "verifier_cmp", "verifier_sha256sum", "verifier_fdtget", "verifier_python3", "verifier_tr"}, "tools")
+    tools = exact(content["tools"], {"package_script", "image_verifier_script", "docker_git_config", "build_script", "source_materializer_script", "docker_runtime_script", "jitterentropy_patch", "gitmodules", "fit_source", "genimage_config", "workload_manifest", "transcript_schema", "toolchain_contract", "evidence_checker", "sdk_mkimage", "sdk_dumpimage", "sdk_genimage", "verifier_mdir", "verifier_mcopy", "verifier_cmp", "verifier_sha256sum", "verifier_fdtget", "verifier_python3", "verifier_tr"}, "tools")
+    source_tool = identity_record(tools["source_materializer_script"], "tools.source_materializer_script")
+    if source_tool["path"] != str(source_materializer_path):
+        fail("source materializer tool path differs")
+    docker_runtime_tool = identity_record(tools["docker_runtime_script"], "tools.docker_runtime_script")
+    if docker_runtime_tool["path"] != str(docker_runtime_path):
+        fail("Docker runtime tool path differs")
+    build_envelope_record = identity_record(build["envelope"], "build.envelope")
+    build_path = pathlib.Path(build_envelope_record["path"])
+    build_lstat = build_path.lstat()
+    build_before = build_path.stat()
+    if stat.S_ISLNK(build_lstat.st_mode) or not stat.S_ISREG(build_before.st_mode):
+        fail("build envelope is not a regular non-symlink file")
+    build_raw = build_path.read_bytes()
+    build_after = build_path.stat()
     if (
-        jitter["patch_sha256"] != tools["jitterentropy_patch"].get("sha256")
-        or jitter["patch_bytes"] != tools["jitterentropy_patch"].get("bytes")
+        build_before.st_dev, build_before.st_ino, build_before.st_size,
+        build_before.st_mtime_ns,
+    ) != (
+        build_after.st_dev, build_after.st_ino, build_after.st_size,
+        build_after.st_mtime_ns,
     ):
-        fail("jitterentropy source record differs from pinned patch tool")
+        fail("build envelope changed while reading")
+    try:
+        build_root = json.loads(build_raw, object_pairs_hook=reject_duplicate_members)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"cannot decode build envelope: {error}")
+    build_root = exact(
+        build_root,
+        {"schema", "version", "status", "content_sha256", "content"},
+        "build envelope",
+    )
+    if (
+        build_root["schema"] != "vibeos.c84.duo-wasm-aot-profile.build-envelope"
+        or type(build_root["version"]) is not int
+        or build_root["version"] != 2
+        or build_root["status"] != "closed"
+        or build_root["content_sha256"] != build_content_sha256
+        or build_root["content_sha256"] != build["content_sha256"]
+    ):
+        fail("build envelope identity/status differs")
+    build_content = exact(
+        build_root["content"],
+        {
+            "platform", "source_commit", "challenge", "run_id", "source", "command",
+            "objcopy_command", "objcopy_environment", "environment", "toolchain",
+            "artifacts", "tools", "timestamps_utc",
+        },
+        "build content",
+    )
+    canonical_build = json.dumps(
+        build_content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    if (
+        hashlib.sha256(canonical_build).hexdigest() != build_root["content_sha256"]
+        or build_content["platform"] != "milkv-duo-cv1800b"
+        or build_content["source_commit"] != source_commit
+        or build_content["challenge"] != challenge
+        or build_content["run_id"] != content["run_id"]
+    ):
+        fail("build content identity/address differs")
+    build_source = exact(
+        build_content["source"], {"root", "head", "materialization"}, "build source"
+    )
+    if (
+        build_source["root"] != "."
+        or build_source["head"] != source_commit
+        or build_source["materialization"] != live_source_materialization
+    ):
+        fail("build frozen-source attestation differs")
+    build_tools = exact(
+        build_content["tools"],
+        {
+            "build_script", "source_materializer_script", "jitterentropy_patch", "gitmodules",
+            "firmware_manifest", "firmware_build_script", "firmware_linker_script",
+            "firmware_cargo_config", "kernel_manifest", "workspace_manifest", "cargo_lock",
+            "workload_manifest", "transcript_schema", "toolchain_contract",
+        },
+        "build tools",
+    )
+    build_source_tool = identity_record(
+        build_tools["source_materializer_script"],
+        "build tools.source_materializer_script",
+    )
+    if (
+        build_source_tool["path"] != "scripts/c84-source-materialization.py"
+        or build_source_tool["sha256"] != source_tool["sha256"]
+        or build_source_tool["bytes"] != source_tool["bytes"]
+    ):
+        fail("build source materializer tool differs")
     verifier = exact(content["verifier"], {"status", "exit_code", "exact_pass_marker", "report", "report_sha256", "audit_log", "invocation"}, "verifier")
     if (
         verifier["status"] != "PASS" or type(verifier["exit_code"]) is not int
         or verifier["exit_code"] != 0 or verifier["exact_pass_marker"] != pass_marker
-        or verifier["invocation"] != ["scripts/verify-milkv-duo-image.sh", "--wasm-aot-profile", "--artifact-root=<staging-artifact-root>", "<sdk-root>"]
+        or verifier["invocation"] != ["scripts/verify-milkv-duo-image.sh", "--wasm-aot-profile", "--package-preflight", "--artifact-root=<staging-artifact-root>", "<sdk-root>"]
     ):
         fail("verifier attestation differs")
     report = exact(
         verifier["report"],
-        {"schema", "version", "source_commit", "challenge", "artifacts", "tools"},
+        {"schema", "version", "source_commit", "challenge", "source_materialization", "runtime_attestation", "artifacts", "tools"},
         "image audit report",
     )
     if (
         report["schema"] != "vibeos.c84.duo-wasm-aot-profile.image-audit-report"
-        or type(report["version"]) is not int or report["version"] != 1
+        or type(report["version"]) is not int or report["version"] != 2
         or report["source_commit"] != source_commit or report["challenge"] != challenge
+        or report["source_materialization"] != live_source_materialization
+        or report["runtime_attestation"] != live_runtime_attestation
     ):
         fail("image audit report identity differs")
     canonical_report = json.dumps(report, sort_keys=True, separators=(",", ":"))
@@ -2506,6 +3195,8 @@ try:
     report_tool_roles = {
         "sdk_mkimage": "sdk_mkimage", "sdk_dumpimage": "sdk_dumpimage",
         "git_config": "docker_git_config",
+        "source_materializer_script": "source_materializer_script",
+        "docker_runtime_script": "docker_runtime_script",
         "mdir": "verifier_mdir", "mcopy": "verifier_mcopy",
         "cmp": "verifier_cmp", "sha256sum": "verifier_sha256sum",
         "fdtget": "verifier_fdtget", "python3": "verifier_python3", "tr": "verifier_tr",
@@ -2551,19 +3242,34 @@ try:
     rehash(build["envelope"], "build.envelope")
     audit = pathlib.Path(verifier["audit_log"]["path"]).read_bytes()
     try:
-        audit_lines = audit.decode("utf-8").splitlines()
+        audit_text = audit.decode("utf-8")
+        audit_lines = audit_text.splitlines()
     except UnicodeDecodeError as error:
         fail(f"published audit is not UTF-8: {error}")
     if (
         not audit.endswith((pass_marker + "\n").encode("utf-8"))
         or len(audit_lines) < 2 or audit_lines[-1] != pass_marker
         or audit_lines[-2] != canonical_report
-        or audit.decode("utf-8").count(pass_marker) != 1
-        or audit.decode("utf-8").count('"schema":"vibeos.c84.duo-wasm-aot-profile.image-audit-report"') != 1
+        or audit_text.count(pass_marker) != 1
+        or audit_text.count(
+            '"schema":"vibeos.c84.duo-wasm-aot-profile.image-audit-report"'
+        )
+        != 1
     ):
         fail("published audit exact PASS marker differs")
-    if re.search(rb"\b(?:panic|fatal|fail|failed|failure)\b", audit, re.IGNORECASE):
-        fail("published audit contains a forbidden failure token")
+    audit_transcript = "\n".join(audit_lines[:-2])
+    if re.search(
+        r"\b(?:panic|fatal|fail|failed|failure)\b",
+        audit_transcript,
+        re.IGNORECASE,
+    ):
+        fail("published audit transcript contains a forbidden failure token")
+    runtime_after, runtime_image_id_after = load_runtime_attestation()
+    if (
+        runtime_after != live_runtime_attestation
+        or runtime_image_id_after != runtime_image_id
+    ):
+        fail("runtime attestation changed during final closure")
     envelope_after = envelope_path.stat()
     if (envelope_before.st_dev, envelope_before.st_ino, envelope_before.st_size, envelope_before.st_mtime_ns) != (
         envelope_after.st_dev, envelope_after.st_ino, envelope_after.st_size, envelope_after.st_mtime_ns,

@@ -22,6 +22,7 @@ wasm_aot_profile_git_cache=false
 wasm_aot_profile_stage_dir=
 wasm_aot_profile_publish_lock=
 wasm_aot_profile_publish_lock_held=false
+wasm_aot_profile_source_envelope=
 sdk_arg=
 for arg in "$@"; do
   case "$arg" in
@@ -123,6 +124,13 @@ require_wasm_aot_profile_identity() {
     echo "build-milkv-duo.sh: $identity_name must not use the QEMU-only test sentinel" >&2
     exit 2
   fi
+}
+
+verify_wasm_aot_profile_source() {
+  python3 -B "$script_dir/c84-source-materialization.py" verify \
+    --destination "$repo_root" \
+    --source-commit "$wasm_aot_profile_source_commit" \
+    --challenge "$wasm_aot_profile_challenge"
 }
 
 cleanup_runtime_costs_build() {
@@ -249,19 +257,9 @@ if [ "$wasm_aot_profile" = true ]; then
     2222222222222222222222222222222222222222222222222222222222222222
   wasm_aot_profile_source_commit=$VIBEOS_C84_SOURCE_COMMIT
   wasm_aot_profile_challenge=$VIBEOS_C84_CHALLENGE
+  verify_wasm_aot_profile_source
+  wasm_aot_profile_source_envelope="$repo_root/target/c84-source-materialization/$wasm_aot_profile_source_commit/$wasm_aot_profile_challenge/source-materialization-envelope.json"
   wasm_aot_profile_target_dir="$repo_root/target/c84-milkv-build/$wasm_aot_profile_source_commit/$wasm_aot_profile_challenge"
-  if ! wasm_aot_profile_head=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null); then
-    echo "build-milkv-duo.sh: cannot read VibeOS source HEAD" >&2
-    exit 1
-  fi
-  if [ "$wasm_aot_profile_head" != "$wasm_aot_profile_source_commit" ]; then
-    echo "build-milkv-duo.sh: VibeOS HEAD is $wasm_aot_profile_head, expected $wasm_aot_profile_source_commit" >&2
-    exit 1
-  fi
-  if [ -n "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none)" ]; then
-    echo "build-milkv-duo.sh: WebAssembly AOT profile build requires a clean VibeOS worktree" >&2
-    exit 1
-  fi
   if [ -z "${HOME-}" ] || [ -z "${PATH-}" ]; then
     echo "build-milkv-duo.sh: HOME and PATH are required for the sanitized WebAssembly AOT profile build" >&2
     exit 1
@@ -321,7 +319,9 @@ if [ "$wasm_aot_profile" = true ]; then
   export VIBEOS_C84_SOURCE_COMMIT VIBEOS_C84_CHALLENGE
 fi
 
-if [ "$diagnostic" = false ] && [ "$ssh_acceptance" = false ] && [ "$iperf3_server" = false ] && [ "$runtime_costs" = false ]; then
+if [ "$diagnostic" = false ] && [ "$ssh_acceptance" = false ] &&
+   [ "$iperf3_server" = false ] && [ "$runtime_costs" = false ] &&
+   [ "$wasm_aot_profile" = false ]; then
   "$script_dir/prepare-jitterentropy-rs.sh"
 fi
 
@@ -616,6 +616,9 @@ if [ ! -f "$built_elf" ]; then
   echo "build-milkv-duo.sh: kernel ELF not found after build: $built_elf" >&2
   exit 1
 fi
+if [ "$wasm_aot_profile" = true ]; then
+  verify_wasm_aot_profile_source
+fi
 
 mkdir -p "$output_dir"
 cp "$built_elf" "$output_elf"
@@ -665,18 +668,6 @@ if [ -n "$sdk_root" ]; then
 fi
 
 if [ "$wasm_aot_profile" = true ]; then
-  # The production SSH image needs the repository-recorded jitterentropy
-  # patch. Re-running its verifier proves the only permitted submodule delta;
-  # every superproject file must still match the bound source commit.
-  "$script_dir/prepare-jitterentropy-rs.sh" >/dev/null
-  if [ "$(git -C "$repo_root" rev-parse HEAD)" != "$wasm_aot_profile_source_commit" ]; then
-    echo "build-milkv-duo.sh: VibeOS HEAD changed during the WebAssembly AOT profile build" >&2
-    exit 1
-  fi
-  if [ -n "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" ]; then
-    echo "build-milkv-duo.sh: tracked source changed during the WebAssembly AOT profile build" >&2
-    exit 1
-  fi
   for artifact in "$output_elf" "$output_bin"; do
     if [ -L "$artifact" ] || [ ! -f "$artifact" ] || [ ! -s "$artifact" ]; then
       echo "build-milkv-duo.sh: staged artifact is not a non-empty regular file: $artifact" >&2
@@ -718,61 +709,13 @@ if [ "$wasm_aot_profile" = true ]; then
   wasm_aot_profile_build_completed_utc=$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"))')
   wasm_aot_profile_build_envelope="$output_dir/build-envelope.json"
   wasm_aot_profile_temp_envelope="$output_dir/.build-envelope.$$.tmp"
-  jitterentropy_submodule="$repo_root/vendor/jitterentropy-rs"
   jitterentropy_patch="$repo_root/patches/jitterentropy-rs/0001-vibeos-qualification.patch"
-  jitterentropy_head=$(git -C "$jitterentropy_submodule" rev-parse HEAD)
-  if [ "$jitterentropy_head" != c5bd2e17194fe3a04d17f74027bb67622579405f ]; then
-    echo "build-milkv-duo.sh: jitterentropy-rs HEAD changed during the WebAssembly AOT profile build" >&2
-    exit 1
-  fi
-  jitterentropy_diff_record=$(python3 - "$jitterentropy_submodule" "$jitterentropy_patch" <<'PY'
-import hashlib
-import pathlib
-import subprocess
-import sys
-
-submodule = pathlib.Path(sys.argv[1]).resolve(strict=True)
-patch = pathlib.Path(sys.argv[2]).resolve(strict=True).read_bytes()
-observed = subprocess.run(
-    ["git", "-C", str(submodule), "diff", "--unified=0", "--binary"],
-    check=True,
-    stdout=subprocess.PIPE,
-).stdout
-if observed != patch:
-    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs diff differs from the recorded patch")
-cached = subprocess.run(
-    ["git", "-C", str(submodule), "diff", "--cached", "--binary"],
-    check=True,
-    stdout=subprocess.PIPE,
-).stdout
-if cached:
-    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs has staged changes")
-untracked = subprocess.run(
-    ["git", "-C", str(submodule), "ls-files", "--others", "--exclude-standard", "-z"],
-    check=True,
-    stdout=subprocess.PIPE,
-).stdout
-if untracked:
-    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs has untracked files")
-print(f"{hashlib.sha256(observed).hexdigest()}:{len(observed)}")
-PY
-  )
-  jitterentropy_diff_sha256=${jitterentropy_diff_record%:*}
-  jitterentropy_diff_bytes=${jitterentropy_diff_record#*:}
-  sunset_submodule="$repo_root/vendor/sunset"
-  sunset_head=$(git -C "$sunset_submodule" rev-parse HEAD)
-  if [ "$sunset_head" != f686eaaaba8b2eda3f83e23b4bb3005cae31ce5e ] ||
-     [ -n "$(git -C "$sunset_submodule" status --porcelain=v1 --untracked-files=all --ignore-submodules=none)" ]; then
-    echo "build-milkv-duo.sh: sunset submodule changed during the WebAssembly AOT profile build" >&2
-    exit 1
-  fi
   python3 - \
     "$wasm_aot_profile_temp_envelope" "$wasm_aot_profile_source_commit" \
     "$wasm_aot_profile_challenge" "$repo_root" "$output_elf" "$output_bin" \
-    "$script_dir/build-milkv-duo.sh" "$script_dir/prepare-jitterentropy-rs.sh" \
-    "$jitterentropy_patch" "$jitterentropy_submodule" "$jitterentropy_head" \
-    "$jitterentropy_diff_sha256" "$jitterentropy_diff_bytes" \
-    "$sunset_submodule" "$sunset_head" "$repo_root/.gitmodules" \
+    "$script_dir/build-milkv-duo.sh" "$script_dir/c84-source-materialization.py" \
+    "$wasm_aot_profile_source_envelope" "$jitterentropy_patch" \
+    "$repo_root/.gitmodules" \
     "$repo_root/firmware/milkv-duo/Cargo.toml" \
     "$repo_root/firmware/milkv-duo/build.rs" \
     "$repo_root/firmware/milkv-duo/linker.ld" \
@@ -804,14 +747,9 @@ import sys
     kernel_elf,
     kernel_bin,
     build_script,
-    prepare_jitterentropy_script,
+    source_materializer_script,
+    source_materialization_envelope,
     jitterentropy_patch,
-    jitterentropy_submodule,
-    jitterentropy_head,
-    jitterentropy_diff_sha256,
-    jitterentropy_diff_bytes,
-    sunset_submodule,
-    sunset_head,
     gitmodules,
     firmware_manifest,
     firmware_build_script,
@@ -894,13 +832,95 @@ def identity(path, *, require_build_identity=False, repository_input=False):
     return {"path": recorded_path, "sha256": digest.hexdigest(), "bytes": before.st_size}
 
 
+def reject_duplicate_members(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail(f"duplicate source materialization envelope member {key!r}")
+        result[key] = value
+    return result
+
+
+def load_source_materialization(path):
+    supplied = pathlib.Path(path)
+    expected = (
+        source_root_path
+        / "target"
+        / "c84-source-materialization"
+        / source_commit
+        / challenge
+        / "source-materialization-envelope.json"
+    )
+    if supplied != expected or expected.resolve(strict=True) != expected:
+        fail("source materialization envelope path differs")
+    before = expected.lstat()
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_size <= 0
+        or before.st_size > 16_777_216
+        or before.st_nlink != 1
+    ):
+        fail("source materialization envelope is not a bounded single-link regular file")
+    raw = expected.read_bytes()
+    after = expected.lstat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        fail("source materialization envelope changed while reading")
+    try:
+        root = json.loads(raw, object_pairs_hook=reject_duplicate_members)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"cannot decode source materialization envelope: {error}")
+    if not isinstance(root, dict) or set(root) != {
+        "content", "content_sha256", "schema", "status", "version",
+    }:
+        fail("source materialization envelope fields are not closed")
+    if (
+        root["schema"] != "vibeos.c84.source-materialization-envelope"
+        or type(root["version"]) is not int
+        or root["version"] != 1
+        or root["status"] != "closed"
+    ):
+        fail("source materialization envelope identity/status differs")
+    content = root.get("content")
+    if not isinstance(content, dict) or set(content) != {
+        "bundles", "challenge", "clone_git_admin", "command", "frozen", "git",
+        "independence", "materialization", "patch", "snapshot", "source",
+        "source_commit", "submodules", "timestamps_utc",
+    }:
+        fail("source materialization content fields are not closed")
+    if content.get("source_commit") != source_commit or content.get("challenge") != challenge:
+        fail("source materialization identity differs")
+    canonical_content = json.dumps(
+        content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    digest = root.get("content_sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or hashlib.sha256(canonical_content).hexdigest() != digest
+    ):
+        fail("source materialization content address differs")
+    canonical_root = json.dumps(
+        root, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8") + b"\n"
+    if raw != canonical_root:
+        fail("source materialization envelope is not canonical JSON")
+    return root
+
+
 artifacts = {
     "kernel_elf": identity(kernel_elf, require_build_identity=True, repository_input=True),
     "kernel_binary": identity(kernel_bin, require_build_identity=True, repository_input=True),
 }
+source_materialization = load_source_materialization(source_materialization_envelope)
 tools = {
     "build_script": identity(build_script, repository_input=True),
-    "prepare_jitterentropy_script": identity(prepare_jitterentropy_script, repository_input=True),
+    "source_materializer_script": identity(source_materializer_script, repository_input=True),
     "jitterentropy_patch": identity(jitterentropy_patch, repository_input=True),
     "gitmodules": identity(gitmodules, repository_input=True),
     "firmware_manifest": identity(firmware_manifest, repository_input=True),
@@ -995,7 +1015,6 @@ objcopy_values = {"LC_ALL": "C", "PATH": "/usr/bin:/bin", "TZ": "UTC"}
 if objcopy_os == "Darwin":
     objcopy_allowed_keys.insert(0, "DYLD_LIBRARY_PATH")
     objcopy_values["DYLD_LIBRARY_PATH"] = str(pathlib.Path(sysroot).resolve(strict=True) / "lib")
-patch_identity = tools["jitterentropy_patch"]
 try:
     workload = json.loads(pathlib.Path(workload_manifest).read_text(encoding="utf-8"))
 except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -1044,23 +1063,7 @@ content = {
     "source": {
         "root": ".",
         "head": source_commit,
-        "superproject_clean": True,
-        "status_policy": "git status --porcelain=v1 --untracked-files=all --ignore-submodules=all",
-        "jitterentropy": {
-            "path": logical_repo_path(jitterentropy_submodule),
-            "head": jitterentropy_head,
-            "patch_sha256": patch_identity["sha256"],
-            "patch_bytes": patch_identity["bytes"],
-            "observed_diff_sha256": jitterentropy_diff_sha256,
-            "observed_diff_bytes": int(jitterentropy_diff_bytes),
-            "policy": "exact recorded patch verified by prepare-jitterentropy-rs.sh",
-        },
-        "sunset": {
-            "path": logical_repo_path(sunset_submodule),
-            "head": sunset_head,
-            "worktree_clean": True,
-            "status_policy": "git status --porcelain=v1 --untracked-files=all --ignore-submodules=none",
-        },
+        "materialization": source_materialization,
     },
     "command": command,
     "objcopy_command": objcopy_command,
@@ -1082,7 +1085,7 @@ content = {
 canonical = json.dumps(content, sort_keys=True, separators=(",", ":")).encode("utf-8")
 envelope = {
     "schema": "vibeos.c84.duo-wasm-aot-profile.build-envelope",
-    "version": 1,
+    "version": 2,
     "status": "closed",
     "content_sha256": hashlib.sha256(canonical).hexdigest(),
     "content": content,
@@ -1092,6 +1095,7 @@ with pathlib.Path(destination).open("x", encoding="utf-8") as output:
     output.write("\n")
 PY
   mv "$wasm_aot_profile_temp_envelope" "$wasm_aot_profile_build_envelope"
+  verify_wasm_aot_profile_source
   python3 - "$wasm_aot_profile_build_envelope" \
     "$wasm_aot_profile_source_commit" "$wasm_aot_profile_challenge" \
     "$repo_root" <<'PY'
@@ -1120,6 +1124,72 @@ def reject_duplicate_members(pairs):
     return result
 
 
+def load_source_materialization(path):
+    if path.resolve(strict=True) != path:
+        fail("source materialization envelope path is not canonical")
+    before = path.lstat()
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_size <= 0
+        or before.st_size > 16_777_216
+        or before.st_nlink != 1
+    ):
+        fail("source materialization envelope is not a bounded single-link regular file")
+    raw = path.read_bytes()
+    after = path.lstat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        fail("source materialization envelope changed while reading")
+    try:
+        root = json.loads(raw, object_pairs_hook=reject_duplicate_members)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        fail(f"cannot decode source materialization envelope: {error}")
+    if not isinstance(root, dict) or set(root) != {
+        "content", "content_sha256", "schema", "status", "version",
+    }:
+        fail("source materialization envelope fields are not closed")
+    if (
+        root["schema"] != "vibeos.c84.source-materialization-envelope"
+        or type(root["version"]) is not int
+        or root["version"] != 1
+        or root["status"] != "closed"
+    ):
+        fail("source materialization envelope identity/status differs")
+    materialization_content = root.get("content")
+    if not isinstance(materialization_content, dict) or set(materialization_content) != {
+        "bundles", "challenge", "clone_git_admin", "command", "frozen", "git",
+        "independence", "materialization", "patch", "snapshot", "source",
+        "source_commit", "submodules", "timestamps_utc",
+    }:
+        fail("source materialization content fields are not closed")
+    if (
+        materialization_content.get("source_commit") != source_commit
+        or materialization_content.get("challenge") != challenge
+    ):
+        fail("source materialization identity differs")
+    canonical_content = json.dumps(
+        materialization_content, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    digest = root.get("content_sha256")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or hashlib.sha256(canonical_content).hexdigest() != digest
+    ):
+        fail("source materialization content address differs")
+    canonical_root = json.dumps(
+        root, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8") + b"\n"
+    if raw != canonical_root:
+        fail("source materialization envelope is not canonical JSON")
+    return root
+
+
 before_envelope = envelope_path.stat()
 try:
     envelope = json.loads(
@@ -1133,7 +1203,7 @@ if set(envelope) != {"schema", "version", "status", "content_sha256", "content"}
 if (
     envelope["schema"] != "vibeos.c84.duo-wasm-aot-profile.build-envelope"
     or type(envelope["version"]) is not int
-    or envelope["version"] != 1
+    or envelope["version"] != 2
     or envelope["status"] != "closed"
 ):
     fail("build envelope identity/status differs")
@@ -1153,47 +1223,21 @@ if content.get("platform") != "milkv-duo-cv1800b":
     fail("build platform differs")
 source = content.get("source")
 if not isinstance(source, dict) or set(source) != {
-    "root", "head", "superproject_clean", "status_policy", "jitterentropy", "sunset",
+    "root", "head", "materialization",
 }:
     fail("source fields are not closed")
-if (
-    source["root"] != "."
-    or source["head"] != source_commit
-    or source["superproject_clean"] is not True
-    or source["status_policy"] != "git status --porcelain=v1 --untracked-files=all --ignore-submodules=all"
-):
+if source["root"] != "." or source["head"] != source_commit:
     fail("superproject source attestation differs")
-jitter = source["jitterentropy"]
-if not isinstance(jitter, dict) or set(jitter) != {
-    "path", "head", "patch_sha256", "patch_bytes", "observed_diff_sha256",
-    "observed_diff_bytes", "policy",
-}:
-    fail("jitterentropy source fields are not closed")
-if (
-    jitter["path"] != "vendor/jitterentropy-rs"
-    or jitter["head"] != "c5bd2e17194fe3a04d17f74027bb67622579405f"
-    or not isinstance(jitter["patch_sha256"], str)
-    or len(jitter["patch_sha256"]) != 64
-    or any(character not in "0123456789abcdef" for character in jitter["patch_sha256"])
-    or jitter["patch_sha256"] != jitter["observed_diff_sha256"]
-    or type(jitter["patch_bytes"]) is not int
-    or jitter["patch_bytes"] <= 0
-    or jitter["patch_bytes"] != jitter["observed_diff_bytes"]
-    or jitter["policy"] != "exact recorded patch verified by prepare-jitterentropy-rs.sh"
-):
-    fail("jitterentropy source attestation differs")
-sunset = source["sunset"]
-if not isinstance(sunset, dict) or set(sunset) != {
-    "path", "head", "worktree_clean", "status_policy",
-}:
-    fail("sunset source fields are not closed")
-if (
-    sunset["path"] != "vendor/sunset"
-    or sunset["head"] != "f686eaaaba8b2eda3f83e23b4bb3005cae31ce5e"
-    or sunset["worktree_clean"] is not True
-    or sunset["status_policy"] != "git status --porcelain=v1 --untracked-files=all --ignore-submodules=none"
-):
-    fail("sunset source attestation differs")
+source_materialization_path = (
+    source_root_path
+    / "target"
+    / "c84-source-materialization"
+    / source_commit
+    / challenge
+    / "source-materialization-envelope.json"
+)
+if source["materialization"] != load_source_materialization(source_materialization_path):
+    fail("embedded source materialization envelope differs from the live closure")
 stage_root = (
     pathlib.PurePosixPath("target")
     / f".milkv-duo-wasm-aot-profile.stage.{source_commit}.{challenge}"
@@ -1202,7 +1246,7 @@ expected_repo_paths = {
     "artifacts.kernel_elf": str(stage_root / "vibeos-milkv-duo-wasm-aot-profile.elf"),
     "artifacts.kernel_binary": str(stage_root / "vibeos-milkv-duo.bin"),
     "tools.build_script": "scripts/build-milkv-duo.sh",
-    "tools.prepare_jitterentropy_script": "scripts/prepare-jitterentropy-rs.sh",
+    "tools.source_materializer_script": "scripts/c84-source-materialization.py",
     "tools.jitterentropy_patch": "patches/jitterentropy-rs/0001-vibeos-qualification.patch",
     "tools.gitmodules": ".gitmodules",
     "tools.firmware_manifest": "firmware/milkv-duo/Cargo.toml",
@@ -1352,37 +1396,7 @@ if (
     fail("build envelope changed during closure rehash")
 print("build-milkv-duo.sh C8.4 build closure rehash: PASS")
 PY
-  if [ "$(git -C "$repo_root" rev-parse HEAD)" != "$wasm_aot_profile_source_commit" ] ||
-     [ -n "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" ]; then
-    echo "build-milkv-duo.sh: tracked source changed before WebAssembly AOT profile publication" >&2
-    exit 1
-  fi
-  python3 - "$jitterentropy_submodule" "$jitterentropy_patch" <<'PY'
-import pathlib
-import subprocess
-import sys
-
-submodule = pathlib.Path(sys.argv[1]).resolve(strict=True)
-patch = pathlib.Path(sys.argv[2]).resolve(strict=True).read_bytes()
-observed = subprocess.run(
-    ["git", "-C", str(submodule), "diff", "--unified=0", "--binary"],
-    check=True,
-    stdout=subprocess.PIPE,
-).stdout
-if observed != patch:
-    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs changed before publication")
-if subprocess.run(
-    ["git", "-C", str(submodule), "diff", "--cached", "--quiet", "--exit-code"],
-).returncode != 0:
-    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs gained staged changes before publication")
-untracked = subprocess.run(
-    ["git", "-C", str(submodule), "ls-files", "--others", "--exclude-standard", "-z"],
-    check=True,
-    stdout=subprocess.PIPE,
-).stdout
-if untracked:
-    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs gained untracked files before publication")
-PY
+  verify_wasm_aot_profile_source
   if [ -e "$wasm_aot_profile_publish_dir" ] || [ -L "$wasm_aot_profile_publish_dir" ]; then
     echo "build-milkv-duo.sh: WebAssembly AOT profile publication path reappeared during the build" >&2
     exit 1

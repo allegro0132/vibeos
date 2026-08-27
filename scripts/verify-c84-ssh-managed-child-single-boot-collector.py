@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from dataclasses import dataclass, replace
 from functools import lru_cache
 import hashlib
@@ -1295,6 +1296,11 @@ def verify_sshd_terminal_reject(inputs: Inputs) -> None:
     )
 
     serve = find_scope(source, r"\basync\s+fn\s+serve_connection\b", "SSHD connection service")
+    serve_code = re.sub(r"\s+", "", serve.code)
+    require(
+        serve_code.count("AcceptedExec::Reject") == 1,
+        "terminal Reject has an additional early or duplicate handling path",
+    )
     reject = find_scope(
         serve.raw,
         r"\bif\s+let\s+AcceptedExec::Reject\s*\{\s*status\s*\}\s*=\s*&accepted",
@@ -2449,6 +2455,19 @@ def verify_milkv_build_script(raw: bytes) -> None:
     except UnicodeDecodeError as error:
         raise VerificationError(f"Milk-V build script is not UTF-8: {error}") from error
     require(source.startswith("#!/bin/sh\n") and source.count("\nset -eu\n") == 1, "Milk-V builder is not fail-fast")
+    require(
+        re.search(
+            r"\bset[ \t]+\+(?:[A-Za-z]*[eu][A-Za-z]*|o[ \t]+(?:errexit|nounset))\b",
+            source,
+        )
+        is None,
+        "Milk-V builder disables errexit or nounset after enabling fail-fast mode",
+    )
+    exit_codes = re.findall(r"\bexit\b(?:[ \t]+([0-9]+))?", source)
+    require(
+        exit_codes and all(code and int(code) != 0 for code in exit_codes),
+        "Milk-V builder contains a successful, implicit, or dynamic early exit",
+    )
     require(source.count("--wasm-aot-profile") >= 3, "Milk-V builder does not expose/document the collector mode")
     require(source.count("wasm_aot_profile=true") == 1, "Milk-V collector mode parser differs")
     require(
@@ -2465,6 +2484,52 @@ def verify_milkv_build_script(raw: bytes) -> None:
         'if [ "$identity_value" = "$test_value" ]',
     ):
         require(required in identity, f"Milk-V collector identity validation omits {required!r}")
+    source_verifier = '''verify_wasm_aot_profile_source() {
+  python3 -B "$script_dir/c84-source-materialization.py" verify \\
+    --destination "$repo_root" \\
+    --source-commit "$wasm_aot_profile_source_commit" \\
+    --challenge "$wasm_aot_profile_challenge"
+}'''
+    source_verifier_symbol = "verify_wasm_aot_profile_source"
+    source_verifier_definitions = re.findall(
+        rf"(?m)^{re.escape(source_verifier_symbol)}\(\) \{{$", source
+    )
+    source_verifier_calls = re.findall(
+        rf"(?m)^  {re.escape(source_verifier_symbol)}$", source
+    )
+    require(
+        source.count(source_verifier) == 1
+        and len(source_verifier_definitions) == 1
+        and len(source_verifier_calls) == 4
+        and source.count(source_verifier_symbol) == 5,
+        "Milk-V collector frozen-source verifier definition/call count differs",
+    )
+    source_gate_contexts = (
+        '''  wasm_aot_profile_source_commit=$VIBEOS_C84_SOURCE_COMMIT
+  wasm_aot_profile_challenge=$VIBEOS_C84_CHALLENGE
+  verify_wasm_aot_profile_source
+  wasm_aot_profile_source_envelope="$repo_root/target/c84-source-materialization/$wasm_aot_profile_source_commit/$wasm_aot_profile_challenge/source-materialization-envelope.json"''',
+        '''if [ ! -f "$built_elf" ]; then
+  echo "build-milkv-duo.sh: kernel ELF not found after build: $built_elf" >&2
+  exit 1
+fi
+if [ "$wasm_aot_profile" = true ]; then
+  verify_wasm_aot_profile_source
+fi
+
+mkdir -p "$output_dir"''',
+        '''  mv "$wasm_aot_profile_temp_envelope" "$wasm_aot_profile_build_envelope"
+  verify_wasm_aot_profile_source
+  python3 - "$wasm_aot_profile_build_envelope" \\''',
+        '''print("build-milkv-duo.sh C8.4 build closure rehash: PASS")
+PY
+  verify_wasm_aot_profile_source
+  if [ -e "$wasm_aot_profile_publish_dir" ] || [ -L "$wasm_aot_profile_publish_dir" ]; then''',
+    )
+    require(
+        all(source.count(context) == 1 for context in source_gate_contexts),
+        "Milk-V collector frozen-source gates are not adjacent to all four protected boundaries",
+    )
     branch_start = source.index(
         'if [ "$wasm_aot_profile" = true ]; then\n'
         "  require_wasm_aot_profile_identity VIBEOS_C84_SOURCE_COMMIT"
@@ -2474,18 +2539,35 @@ def verify_milkv_build_script(raw: bytes) -> None:
     )
     branch = source[branch_start:branch_end]
     for required in (
-        'git -C "$repo_root" rev-parse HEAD',
-        'if [ "$wasm_aot_profile_head" != "$wasm_aot_profile_source_commit" ]',
-        'status --porcelain=v1 --untracked-files=all --ignore-submodules=none',
+        "  verify_wasm_aot_profile_source\n",
+        'wasm_aot_profile_source_envelope="$repo_root/target/c84-source-materialization/$wasm_aot_profile_source_commit/$wasm_aot_profile_challenge/source-materialization-envelope.json"',
         'wasm_aot_profile_target_dir="$repo_root/target/c84-milkv-build/$wasm_aot_profile_source_commit/$wasm_aot_profile_challenge"',
         'export VIBEOS_C84_SOURCE_COMMIT VIBEOS_C84_CHALLENGE',
     ):
         require(required in branch, f"Milk-V collector pre-build binding omits {required!r}")
+    prebuild_source_order = tuple(
+        branch.index(item)
+        for item in (
+            "  wasm_aot_profile_source_commit=$VIBEOS_C84_SOURCE_COMMIT",
+            "  wasm_aot_profile_challenge=$VIBEOS_C84_CHALLENGE",
+            "  verify_wasm_aot_profile_source\n",
+            '  wasm_aot_profile_source_envelope="$repo_root/target/c84-source-materialization/$wasm_aot_profile_source_commit/$wasm_aot_profile_challenge/source-materialization-envelope.json"',
+            '  wasm_aot_profile_target_dir="$repo_root/target/c84-milkv-build/$wasm_aot_profile_source_commit/$wasm_aot_profile_challenge"',
+        )
+    )
     require(
-        source.count('"$script_dir/prepare-jitterentropy-rs.sh"') == 3
-        and source.count('  "$script_dir/prepare-jitterentropy-rs.sh"\n') == 1
-        and source.count('  "$script_dir/prepare-jitterentropy-rs.sh" >/dev/null\n') == 1,
-        "Milk-V collector does not verify/apply the recorded jitterentropy patch both before and after build",
+        prebuild_source_order == tuple(sorted(prebuild_source_order)),
+        "Milk-V collector frozen-source pre-build binding order differs",
+    )
+    require(
+        source.count('"$script_dir/prepare-jitterentropy-rs.sh"') == 1
+        and '''if [ "$diagnostic" = false ] && [ "$ssh_acceptance" = false ] &&
+   [ "$iperf3_server" = false ] && [ "$runtime_costs" = false ] &&
+   [ "$wasm_aot_profile" = false ]; then
+  "$script_dir/prepare-jitterentropy-rs.sh"
+fi'''
+        in source,
+        "Milk-V collector formal build still applies the operator-tree jitterentropy patch",
     )
     require(
         '1111111111111111111111111111111111111111' in branch
@@ -2563,29 +2645,22 @@ def verify_milkv_build_script(raw: bytes) -> None:
         and objcopy.count('"$rust_objcopy" -O binary "$output_elf" "$output_bin"') == 2,
         "Milk-V collector objcopy is not isolated on both host branches",
     )
+    built_check = source.index('if [ ! -f "$built_elf" ]; then')
+    copy_start = source.index('mkdir -p "$output_dir"', built_check)
+    post_build_source_check = source[built_check:copy_start]
+    require(
+        '''if [ "$wasm_aot_profile" = true ]; then
+  verify_wasm_aot_profile_source
+fi'''
+        in post_build_source_check,
+        "Milk-V collector does not reverify the frozen source after Cargo and before artifact copy",
+    )
     post_start = source.index(
-        'if [ "$wasm_aot_profile" = true ]; then\n'
-        "  # The production SSH image needs the repository-recorded jitterentropy"
+        'if [ "$wasm_aot_profile" = true ]; then\n',
+        source.index('if [ -n "$sdk_root" ]; then'),
     )
     post_end = source.index('\n\nif [ "$runtime_costs" = true ]; then', post_start)
     post = source[post_start:post_end]
-    ordered = (
-        '"$script_dir/prepare-jitterentropy-rs.sh"',
-        'git -C "$repo_root" rev-parse HEAD',
-        'status --porcelain=v1 --untracked-files=all --ignore-submodules=all',
-    )
-    positions = [post.find(item) for item in ordered]
-    require(all(position >= 0 for position in positions) and positions == sorted(positions), "Milk-V post-build source revalidation differs")
-    require(
-        'if [ "$(git -C "$repo_root" rev-parse HEAD)" != "$wasm_aot_profile_source_commit" ]; then'
-        in post,
-        "Milk-V collector does not rebind HEAD after the build",
-    )
-    require(
-        'if [ -n "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" ]; then'
-        in post,
-        "Milk-V collector does not reject post-build superproject source drift",
-    )
     require(
         'built_elf="$wasm_aot_profile_target_dir/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo"' in source,
         "Milk-V collector does not consume only its identity-isolated Cargo target",
@@ -2618,7 +2693,22 @@ def verify_milkv_build_script(raw: bytes) -> None:
         cleanup.count("rm -rf --") == 1,
         "Milk-V collector staging cleanup contains a recursive removal",
     )
-    require(source.count("trap cleanup_build EXIT") == 1, "Milk-V collector failure cleanup is not installed exactly once")
+    trap_lines = [
+        line.strip()
+        for line in source.splitlines()
+        if re.match(r"^[ \t]*trap\b", line)
+    ]
+    require(
+        source.count("trap") == 4
+        and trap_lines
+        == [
+            "trap cleanup_build EXIT",
+            "trap 'exit 129' HUP",
+            "trap 'exit 130' INT",
+            "trap 'exit 143' TERM",
+        ],
+        "Milk-V collector signal/EXIT trap set is not exact and unique",
+    )
     for signal, code in (("HUP", "129"), ("INT", "130"), ("TERM", "143")):
         require(
             source.count(f"trap 'exit {code}' {signal}") == 1,
@@ -2678,8 +2768,6 @@ fi'''
     )
     for required in (
         '[ -L "$artifact" ] || [ ! -f "$artifact" ] || [ ! -s "$artifact" ]',
-        'if [ "$(git -C "$repo_root" rev-parse HEAD)" != "$wasm_aot_profile_source_commit" ] ||',
-        '[ -n "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" ]; then',
         'if [ -e "$wasm_aot_profile_publish_dir" ] || [ -L "$wasm_aot_profile_publish_dir" ]; then',
         'if system == "Linux" and hasattr(libc, "renameat2"):',
         'elif system == "Darwin" and hasattr(libc, "renamex_np"):',
@@ -2688,16 +2776,35 @@ fi'''
         "output_dir=$wasm_aot_profile_publish_dir",
     ):
         require(required in post, f"Milk-V collector atomic publication closure omits {required!r}")
+    require(
+        post.count("  verify_wasm_aot_profile_source\n") == 2,
+        "Milk-V collector does not reverify the frozen source around build-envelope closure",
+    )
     publish_move = post.index('  python3 - "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir" "$repo_root/target"')
     require(
         post.count('  python3 - "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir" "$repo_root/target"') == 1
         and 'mv -- "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir"' not in post,
         "Milk-V collector no-replace publication is duplicated or bypassed",
     )
+    envelope_move = post.index(
+        '  mv "$wasm_aot_profile_temp_envelope" "$wasm_aot_profile_build_envelope"'
+    )
+    closure_start = post.index(
+        '  python3 - "$wasm_aot_profile_build_envelope"', envelope_move
+    )
+    before_closure_verify = post.index(
+        "  verify_wasm_aot_profile_source\n", envelope_move
+    )
+    after_closure_verify = post.index(
+        "  verify_wasm_aot_profile_source\n", closure_start
+    )
     publication_order = (
         post.index('  for artifact in "$output_elf" "$output_bin"; do'),
+        envelope_move,
+        before_closure_verify,
+        closure_start,
         post.index("build-milkv-duo.sh C8.4 build closure rehash: PASS"),
-        post.index("tracked source changed before WebAssembly AOT profile publication"),
+        after_closure_verify,
         post.index('  if [ -e "$wasm_aot_profile_publish_dir" ] || [ -L "$wasm_aot_profile_publish_dir" ]; then'),
         publish_move,
         post.index("  wasm_aot_profile_stage_dir=", publish_move),
@@ -2713,12 +2820,23 @@ fi'''
     )
 
     envelope_start = post.index('  python3 - \\\n    "$wasm_aot_profile_temp_envelope"')
-    closure_start = post.index('  python3 - "$wasm_aot_profile_build_envelope"', envelope_start)
     envelope = post[envelope_start:closure_start]
     for required in (
         '"root": "."',
-        '"path": logical_repo_path(jitterentropy_submodule)',
-        '"path": logical_repo_path(sunset_submodule)',
+        '"version": 2,',
+        "if supplied != expected or expected.resolve(strict=True) != expected:",
+        "before = expected.lstat()",
+        "after = expected.lstat()",
+        "if not isinstance(root, dict) or set(root) != {",
+        "if not isinstance(content, dict) or set(content) != {",
+        'source_materialization = load_source_materialization(source_materialization_envelope)',
+        '"materialization": source_materialization,',
+        '"source_materializer_script": identity(source_materializer_script, repository_input=True)',
+        'root["schema"] != "vibeos.c84.source-materialization-envelope"',
+        'root["version"] != 1',
+        'content.get("source_commit") != source_commit or content.get("challenge") != challenge',
+        'hashlib.sha256(canonical_content).hexdigest() != digest',
+        'if raw != canonical_root:',
         '"provenance": "build-runner-self-measured; package cross-platform live rehash unavailable"',
         '"kernel_elf": identity(kernel_elf, require_build_identity=True, repository_input=True)',
         '"kernel_binary": identity(kernel_bin, require_build_identity=True, repository_input=True)',
@@ -2728,7 +2846,7 @@ fi'''
         require(required in envelope, f"Milk-V collector build envelope omits {required!r}")
     repository_tool_inputs = {
         "build_script": "build_script",
-        "prepare_jitterentropy_script": "prepare_jitterentropy_script",
+        "source_materializer_script": "source_materializer_script",
         "jitterentropy_patch": "jitterentropy_patch",
         "gitmodules": "gitmodules",
         "firmware_manifest": "firmware_manifest",
@@ -2748,20 +2866,142 @@ fi'''
             f"Milk-V collector build envelope does not normalize repository tool {role}",
         )
     closure = post[closure_start:publish_move]
+    closure_python_marker = '    "$repo_root" <<\'PY\'\n'
+    require(
+        closure.count(closure_python_marker) == 1,
+        "Milk-V collector closure Python heredoc boundary differs",
+    )
+    closure_python_start = closure.index(closure_python_marker) + len(
+        closure_python_marker
+    )
+    closure_python_end = closure.index(
+        "\nPY\n  verify_wasm_aot_profile_source", closure_python_start
+    )
+    closure_python = closure[closure_python_start:closure_python_end]
+    try:
+        closure_tree = ast.parse(closure_python)
+    except SyntaxError as error:
+        raise VerificationError(
+            f"Milk-V collector closure Python is not valid: {error}"
+        ) from error
+
+    class ClosureReachability(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.forbidden: list[str] = []
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return
+
+        def visit_Raise(self, node: ast.Raise) -> None:
+            self.forbidden.append("raise")
+
+        def visit_Call(self, node: ast.Call) -> None:
+            function = node.func
+            name = function.id if isinstance(function, ast.Name) else None
+            attribute = function.attr if isinstance(function, ast.Attribute) else None
+            if name in {
+                "SystemExit",
+                "exit",
+                "quit",
+                "exec",
+                "eval",
+                "compile",
+                "__import__",
+                "getattr",
+            } or attribute in {"exit", "_exit"}:
+                self.forbidden.append(name or attribute or "dynamic exit")
+            self.generic_visit(node)
+
+    reachability = ClosureReachability()
+    reachability.visit(closure_tree)
+    fail_functions = [
+        node
+        for node in ast.walk(closure_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "fail"
+    ]
+    expected_fail = ast.parse(
+        '''def fail(message):
+    raise SystemExit(f"build-milkv-duo.sh: C8.4 closure rehash failed: {message}")
+'''
+    ).body[0]
+    fail_rebindings = [
+        node
+        for node in ast.walk(closure_tree)
+        if isinstance(node, ast.Name)
+        and node.id == "fail"
+        and isinstance(node.ctx, (ast.Store, ast.Del))
+    ]
+    final_statement = closure_tree.body[-1] if closure_tree.body else None
+    require(
+        len(closure_tree.body) == 60
+        and len(fail_functions) == 1
+        and fail_functions[0] in closure_tree.body
+        and ast.dump(fail_functions[0], include_attributes=False)
+        == ast.dump(expected_fail, include_attributes=False)
+        and not fail_rebindings
+        and isinstance(final_statement, ast.Expr)
+        and isinstance(final_statement.value, ast.Call)
+        and isinstance(final_statement.value.func, ast.Name)
+        and final_statement.value.func.id == "print"
+        and len(final_statement.value.args) == 1
+        and isinstance(final_statement.value.args[0], ast.Constant)
+        and final_statement.value.args[0].value
+        == "build-milkv-duo.sh C8.4 build closure rehash: PASS"
+        and not final_statement.value.keywords
+        and not reachability.forbidden,
+        "Milk-V collector closure Python has an early exit or non-terminal PASS flow",
+    )
+    common_source_loader_requirements = (
+        "before.st_nlink != 1",
+        "before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns",
+        '"content", "content_sha256", "schema", "status", "version"',
+        'root["schema"] != "vibeos.c84.source-materialization-envelope"',
+        'root["version"] != 1',
+        'root["status"] != "closed"',
+        '"bundles", "challenge", "clone_git_admin", "command", "frozen", "git"',
+        '"source_commit", "submodules", "timestamps_utc"',
+        "hashlib.sha256(canonical_content).hexdigest() != digest",
+        "if raw != canonical_root:",
+    )
+    for scope, label in ((envelope, "build-envelope writer"), (closure, "build closure")):
+        for required in common_source_loader_requirements:
+            require(
+                required in scope,
+                f"Milk-V collector {label} source-envelope loader omits {required!r}",
+            )
     for required in (
+        'envelope["version"] != 2',
+        "if path.resolve(strict=True) != path:",
+        "before = path.lstat()",
+        "after = path.lstat()",
+        "if not isinstance(root, dict) or set(root) != {",
+        "if not isinstance(materialization_content, dict) or set(materialization_content) != {",
+        'materialization_content.get("source_commit") != source_commit',
+        'materialization_content.get("challenge") != challenge',
         'source["root"] != "."',
-        'jitter["path"] != "vendor/jitterentropy-rs"',
-        'sunset["path"] != "vendor/sunset"',
+        '"root", "head", "materialization"',
+        '/ "c84-source-materialization"',
+        '/ "source-materialization-envelope.json"',
+        'if source["materialization"] != load_source_materialization(source_materialization_path):',
+        '"tools.source_materializer_script": "scripts/c84-source-materialization.py"',
         'toolchain["provenance"] != "build-runner-self-measured; package cross-platform live rehash unavailable"',
         'path = (source_root_path / pathlib.Path(*pure.parts)).resolve(strict=True)',
         'for name in ("build_started", "build_completed", "envelope_closed"):',
     ):
         require(required in closure, f"Milk-V collector build closure omits {required!r}")
     require(
-        source.count('["git", "-C", str(submodule), "diff", "--cached", "--binary"]') == 1
-        and source.count('["git", "-C", str(submodule), "diff", "--cached", "--quiet", "--exit-code"]') == 1
-        and source.count('["git", "-C", str(submodule), "ls-files", "--others", "--exclude-standard", "-z"]') == 2,
-        "Milk-V collector does not reject staged/untracked jitterentropy drift twice",
+        source.count("def load_source_materialization(path):") == 2
+        and source.count('"vibeos.c84.source-materialization-envelope"') == 2,
+        "Milk-V collector build/envelope closure does not deeply load the frozen source twice",
     )
     require(
         "package-envelope" not in mode,
@@ -2775,6 +3015,94 @@ def verify_docs_ci(inputs: Inputs) -> None:
     qemu_step_name = "      - name: Exercise the C8.4 private single-boot collector closure"
     physical_step_name = "      - name: Type/link-check the C8.4 physical single-boot collector"
     ci_lines = inputs.ci.splitlines()
+    checkout_block = [
+        "      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1",
+        "        with:",
+        "          submodules: recursive",
+        "          fetch-depth: 0",
+        "          persist-credentials: false",
+    ]
+    host_job_header = [
+        "  host-tests:",
+        "    name: Host unit tests",
+        "    runs-on: ubuntu-24.04",
+        "    steps:",
+    ]
+    qemu_job_header = [
+        "  qemu-tests:",
+        "    name: QEMU integration",
+        "    needs: differential",
+        "    runs-on: ubuntu-24.04",
+        "    steps:",
+    ]
+    ref_mutating_git_command = re.compile(
+        r"\bgit\b[^\n;&|]*?\b(?:checkout|switch|reset|restore|clean|update-ref|"
+        r"symbolic-ref|read-tree|merge|rebase|cherry-pick|revert|am|apply|pull|commit)\b"
+    )
+
+    def exact_checkout(
+        job: str,
+        next_job: str | None,
+        label: str,
+        job_header: list[str],
+    ) -> int:
+        job_index = ci_lines.index(f"  {job}:")
+        job_end = (
+            ci_lines.index(f"  {next_job}:", job_index + 1)
+            if next_job is not None
+            else len(ci_lines)
+        )
+        job_level_lines = [
+            line
+            for line in ci_lines[job_index + 1 : job_end]
+            if line.startswith("    ") and not line.startswith("      ")
+        ]
+        require(
+            ci_lines[job_index : job_index + len(job_header)] == job_header
+            and job_level_lines == job_header[1:],
+            f"CI {label} job header has an if, continue-on-error, or other bypass key",
+        )
+        job_source = "\n".join(ci_lines[job_index:job_end])
+        matches = [
+            index
+            for index in range(job_index, job_end)
+            if ci_lines[index : index + len(checkout_block)] == checkout_block
+        ]
+        require(
+            len(matches) == 1 and job_source.count("actions/checkout@") == 1,
+            f"CI {label} checkout is not the unique pinned, recursive, full-depth, credential-free checkout",
+        )
+        logical_job_source = job_source.replace("\\\n", " ")
+        require(
+            ref_mutating_git_command.search(logical_job_source) is None,
+            f"CI {label} job contains a ref- or worktree-mutating Git command",
+        )
+        return matches[0]
+
+    host_checkout_index = exact_checkout(
+        "host-tests", "c82-preview1-corpus", "host selftest", host_job_header
+    )
+    qemu_checkout_index = exact_checkout(
+        "qemu-tests", None, "QEMU collector", qemu_job_header
+    )
+    source_materializer_selftest = (
+        "          python3 -B scripts/c84-source-materialization.py --selftest --check-source"
+    )
+    source_materializer_indices = [
+        index
+        for index, line in enumerate(ci_lines)
+        if line == source_materializer_selftest
+    ]
+    require(
+        len(source_materializer_indices) == 1,
+        "CI host source-materializer selftest is not exact and unique",
+    )
+    require(
+        host_checkout_index
+        < source_materializer_indices[0]
+        < ci_lines.index("  c82-preview1-corpus:"),
+        "CI host source selftests run before their pinned full checkout",
+    )
 
     def exact_run_step(name: str, command: str, label: str) -> int:
         require(ci_lines.count(name) == 1, f"CI {label} step count differs")
@@ -2796,11 +3124,20 @@ def verify_docs_ci(inputs: Inputs) -> None:
     physical_block = [
         physical_step_name,
         "        run: |",
+        '          source_commit="$GITHUB_SHA"',
+        '          test "$(git rev-parse HEAD)" = "$source_commit"',
         '          challenge="$(openssl rand -hex 32)"',
+        '          frozen="$RUNNER_TEMP/vibeos-c84-frozen-$challenge"',
+        "          python3 -B scripts/c84-source-materialization.py materialize \\",
+        "            --source \"$GITHUB_WORKSPACE\" \\",
+        "            --destination \"$frozen\" \\",
+        "            --source-commit \"$source_commit\" \\",
+        '            --challenge "$challenge"',
+        '          cd "$frozen"',
         '          RUSTC_WRAPPER="$(command -v false)" \\',
         "          CARGO_PROFILE_RELEASE_OPT_LEVEL=0 \\",
         "          RUSTFLAGS='--c84-ambient-rustflags-must-not-leak' \\",
-        '          VIBEOS_C84_SOURCE_COMMIT="$(git rev-parse HEAD)" \\',
+        '          VIBEOS_C84_SOURCE_COMMIT="$source_commit" \\',
         '          VIBEOS_C84_CHALLENGE="$challenge" \\',
         "            ./scripts/build-milkv-duo.sh --wasm-aot-profile",
     ]
@@ -2808,12 +3145,23 @@ def verify_docs_ci(inputs: Inputs) -> None:
         ci_lines[physical_index : physical_index + len(physical_block)] == physical_block,
         "CI physical collector type/link command, hostile ambient proof, or non-evidence identity differs",
     )
+    c83_build_index = ci_lines.index(
+        "      - name: Build the isolated Milk-V Duo C8.3 sampler (CI-only identity)"
+    )
     c83_index = ci_lines.index("      - name: Exercise the fixed-QEMU C8.3 publication contract")
     ordinary_duo_index = ci_lines.index("      - name: Build the Milk-V Duo kernel")
-    require(qemu_index < c83_index < physical_index < ordinary_duo_index, "CI physical collector gate runs after the dirtying ordinary Duo build")
+    require(
+        qemu_checkout_index
+        < qemu_index
+        < physical_index
+        < c83_build_index
+        < c83_index
+        < ordinary_duo_index,
+        "CI frozen physical collector gate order differs",
+    )
     comments = "\n".join(ci_lines[max(0, physical_index - 3) : physical_index]).lower()
     require(
-        "compile and link" in comments
+        "materialize" in comments
         and "not retained or executed" in comments
         and "evidence" in comments
         and "cold boot" in comments,
@@ -2837,18 +3185,50 @@ def verify_docs_ci(inputs: Inputs) -> None:
         require(COMMAND in doc and QEMU_COMMAND in doc, f"{label} omits collector validation commands")
         require("decision_eligible=0" in doc and "formal_uart=0" in doc, f"{label} overclaims QEMU audit evidence")
         require("three" in doc.lower() and "63" in doc, f"{label} does not leave three-boot/63-retained evidence open")
-        require("package" in doc.lower() and "capture" in doc.lower(), f"{label} omits the still-open package/capture boundary")
+        normalized = re.sub(r"\s+", " ", doc.lower())
+        require(
+            "package" in normalized and "capture" in normalized,
+            f"{label} omits the closed software-package/open physical-capture boundary",
+        )
+        require(
+            "materializ" in normalized and "frozen" in normalized,
+            f"{label} omits the independently frozen source boundary",
+        )
     require(
         "./scripts/build-milkv-duo.sh --wasm-aot-profile" in inputs.decision_doc,
-        "decision doc omits the clean build-bound Milk-V command",
+        "decision doc omits the frozen-source-bound Milk-V command",
+    )
+    for snippet in (
+        "python3 -B scripts/c84-source-materialization.py materialize",
+        '--source "$operator_source"',
+        '--destination "$frozen"',
+        '--source-commit "$prep"',
+        '--challenge "$challenge"',
+        'cd "$frozen"',
+        'VIBEOS_C84_SOURCE_COMMIT="$prep"',
+        'VIBEOS_C84_CHALLENGE="$challenge"',
+    ):
+        require(
+            snippet in inputs.decision_doc,
+            f"decision doc frozen build command omits {snippet!r}",
+        )
+    require(
+        inputs.decision_doc.index("python3 -B scripts/c84-source-materialization.py materialize")
+        < inputs.decision_doc.index('cd "$frozen"')
+        < inputs.decision_doc.index("./scripts/build-milkv-duo.sh --wasm-aot-profile"),
+        "decision doc materialize/frozen-build order differs",
     )
     for doc, label in ((inputs.testing, "TESTING"), (inputs.decision_doc, "decision doc")):
+        normalized = re.sub(r"\s+", " ", doc.lower())
         for phrase in (
             "env -i",
             "isolated Cargo home",
             "SOURCE_DATE_EPOCH",
         ):
-            require(phrase in doc, f"{label} omits the closed physical-build fact {phrase!r}")
+            require(
+                phrase.lower() in normalized,
+                f"{label} omits the closed physical-build fact {phrase!r}",
+            )
     require(
         "hostile ambient" in inputs.testing
         and "sanitized `env -i` envelope" in inputs.decision_doc,
@@ -2863,6 +3243,8 @@ def verify_docs_ci(inputs: Inputs) -> None:
         and "link" in testing_status
         and "freshly" in testing_status
         and "challenge" in testing_status
+        and "independently materialized and verified frozen source tree" in testing_status
+        and "host-observed runtime closure" in testing_status
         and "neither runs nor retains" in testing_status
         and "physical cold boot" in testing_status,
         "TESTING overclaims the CI physical type/link gate",
@@ -2881,12 +3263,30 @@ def verify_docs_ci(inputs: Inputs) -> None:
             f"decision doc software-only CI boundary omits {phrase!r}",
         )
     require("implementation in progress" in inputs.roadmap, "roadmap no longer reports the remaining physical evidence work")
+    roadmap_status = re.sub(r"\s+", " ", inputs.roadmap.lower()).replace(
+        "cold-boot", "cold boot"
+    )
+    for phrase in (
+        "software-side independent frozen-source envelope, build/package envelopes, host-observed docker runtime closure",
+        "independent source materialization and local docker runtime custody are now closed prerequisites",
+    ):
+        require(
+            phrase in roadmap_status,
+            f"roadmap software provenance status omits {phrase!r}",
+        )
     for doc, label in (
         (inputs.testing, "TESTING"),
         (inputs.decision_doc, "decision doc"),
         (inputs.roadmap, "roadmap"),
     ):
         normalized = re.sub(r"\s+", " ", doc.lower()).replace("cold-boot", "cold boot")
+        require(
+            "materializ" in normalized
+            and "frozen" in normalized
+            and "runtime" in normalized
+            and ("closure" in normalized or "custody" in normalized),
+            f"{label} omits the frozen-source/runtime-custody software boundary",
+        )
         require(
             "physical testing is paused at operator request" in normalized,
             f"{label} omits the operator-paused physical status",
@@ -3038,6 +3438,58 @@ def expect_rejected(inputs: Inputs, mutation: Callable[[Inputs], Inputs], label:
 
 def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
     verify(inputs, predecessors=predecessors)
+    milkv_source_verifier = b'''verify_wasm_aot_profile_source() {
+  python3 -B "$script_dir/c84-source-materialization.py" verify \\
+    --destination "$repo_root" \\
+    --source-commit "$wasm_aot_profile_source_commit" \\
+    --challenge "$wasm_aot_profile_challenge"
+}'''
+    ci_host_checkout = '''  host-tests:
+    name: Host unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install repository toolchain'''
+    ci_qemu_checkout = '''  qemu-tests:
+    name: QEMU integration
+    needs: differential
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install repository toolchain'''
+    ci_physical_block = '''      - name: Type/link-check the C8.4 physical single-boot collector
+        run: |
+          source_commit="$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$source_commit"
+          challenge="$(openssl rand -hex 32)"
+          frozen="$RUNNER_TEMP/vibeos-c84-frozen-$challenge"
+          python3 -B scripts/c84-source-materialization.py materialize \\
+            --source "$GITHUB_WORKSPACE" \\
+            --destination "$frozen" \\
+            --source-commit "$source_commit" \\
+            --challenge "$challenge"
+          cd "$frozen"
+          RUSTC_WRAPPER="$(command -v false)" \\
+          CARGO_PROFILE_RELEASE_OPT_LEVEL=0 \\
+          RUSTFLAGS='--c84-ambient-rustflags-must-not-leak' \\
+          VIBEOS_C84_SOURCE_COMMIT="$source_commit" \\
+          VIBEOS_C84_CHALLENGE="$challenge" \\
+            ./scripts/build-milkv-duo.sh --wasm-aot-profile
+'''
+    ci_c83_build_block = '''      - name: Build the isolated Milk-V Duo C8.3 sampler (CI-only identity)
+        run: |
+          VIBEOS_C83_SOURCE_COMMIT="$(git rev-parse HEAD)" \\
+          VIBEOS_C83_CHALLENGE=8383838383838383838383838383838383838383838383838383838383838383 \\
+            ./scripts/build-milkv-duo.sh --runtime-costs
+'''
     mutations: list[tuple[str, Callable[[Inputs], Inputs]]] = [
         ("sample-count-25", lambda data: mutate_text(data, "collector", "pub const BOOT_SAMPLES: u8 = 24;", "pub const BOOT_SAMPLES: u8 = 25;", "sample count")),
         ("warmup-count-2", lambda data: mutate_text(data, "collector", "pub const BOOT_WARMUPS: u8 = 3;", "pub const BOOT_WARMUPS: u8 = 2;", "warmup count")),
@@ -3991,6 +4443,22 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
                 "Reject execution",
             ),
         ),
+        (
+            "sshd-reject-early-bypass",
+            lambda data: mutate_scoped_text(
+                data,
+                "sshd",
+                r"\basync\s+fn\s+serve_connection\b",
+                "        SessionStart::Exec(accepted) => {\n",
+                '''        SessionStart::Exec(accepted) => {
+            #[cfg(feature = "c84-profile-request-parent")]
+            if matches!(&accepted, AcceptedExec::Reject { .. }) {
+                return ConnectionEnd::ExecComplete(SSH_EXEC_PRESTART_REJECT_STATUS);
+            }
+''',
+                "Reject early bypass",
+            ),
+        ),
         ("audit-uart-forward", lambda data: mutate_text(data, "slot", "        self.hasher.update(bytes);", "        crate::uart::early_write(core::str::from_utf8(bytes).unwrap());\n        self.hasher.update(bytes);", "audit UART forwarding")),
         ("audit-buffer-store", lambda data: mutate_text(data, "slot", "struct AuditRecord {\n    hasher: Sha256,", "struct AuditRecord {\n    leaked: alloc::vec::Vec<u8>,\n    hasher: Sha256,", "audit buffer storage")),
         ("audit-token-copy", lambda data: mutate_text(data, "slot", "struct AuditCommit", "#[derive(Clone, Copy)]\nstruct AuditCommit", "AuditCommit Copy")),
@@ -4427,8 +4895,101 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
                 "QEMU zero source",
             ),
         ),
-        ("milkv-source-unbound", lambda data: mutate_bytes(data, "milkv_build_script", b'if [ "$wasm_aot_profile_head" != "$wasm_aot_profile_source_commit" ]; then', b"if false; then", "Milk-V source binding")),
-        ("milkv-dirty-allowed", lambda data: mutate_bytes(data, "milkv_build_script", b'if [ -n "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none)" ]; then\n    echo "build-milkv-duo.sh: WebAssembly AOT profile build requires a clean VibeOS worktree"', b'if false; then\n    echo "build-milkv-duo.sh: WebAssembly AOT profile build requires a clean VibeOS worktree"', "Milk-V clean tree")),
+        (
+            "milkv-source-verifier-materializes",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'  python3 -B "$script_dir/c84-source-materialization.py" verify \\\n',
+                b'  python3 -B "$script_dir/c84-source-materialization.py" materialize \\\n',
+                "Milk-V frozen-source verifier mode",
+            ),
+        ),
+        (
+            "milkv-source-verifier-override",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                milkv_source_verifier,
+                milkv_source_verifier
+                + b'''\n\nverify_wasm_aot_profile_source() {
+  :
+}''',
+                "Milk-V frozen-source verifier override",
+            ),
+        ),
+        (
+            "milkv-source-verifier-comment-decoy",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                milkv_source_verifier,
+                milkv_source_verifier + b"\n# verify_wasm_aot_profile_source",
+                "Milk-V frozen-source verifier comment decoy",
+            ),
+        ),
+        (
+            "milkv-source-verifier-string-decoy",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                milkv_source_verifier,
+                milkv_source_verifier
+                + b"\nsource_verifier_decoy='verify_wasm_aot_profile_source'",
+                "Milk-V frozen-source verifier string decoy",
+            ),
+        ),
+        (
+            "milkv-source-verifier-destination-unbound",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'    --destination "$repo_root" \\\n',
+                b'    --destination "$repo_root/target" \\\n',
+                "Milk-V frozen-source verifier destination",
+            ),
+        ),
+        (
+            "milkv-fail-fast-disabled",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b"set -eu\n",
+                b"set -eu\nset +e\n",
+                "Milk-V fail-fast option continuity",
+            ),
+        ),
+        (
+            "milkv-formal-early-success",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'''    2222222222222222222222222222222222222222222222222222222222222222
+  wasm_aot_profile_source_commit=$VIBEOS_C84_SOURCE_COMMIT''',
+                b'''    2222222222222222222222222222222222222222222222222222222222222222
+  if [ "$wasm_aot_profile" = true ]; then
+    exit 0
+  fi
+  wasm_aot_profile_source_commit=$VIBEOS_C84_SOURCE_COMMIT''',
+                "Milk-V formal early success",
+            ),
+        ),
+        (
+            "milkv-prebuild-source-gate-removed",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'''  wasm_aot_profile_source_commit=$VIBEOS_C84_SOURCE_COMMIT
+  wasm_aot_profile_challenge=$VIBEOS_C84_CHALLENGE
+  verify_wasm_aot_profile_source
+  wasm_aot_profile_source_envelope=''',
+                b'''  wasm_aot_profile_source_commit=$VIBEOS_C84_SOURCE_COMMIT
+  wasm_aot_profile_challenge=$VIBEOS_C84_CHALLENGE
+  : # frozen-source pre-build gate bypassed
+  wasm_aot_profile_source_envelope=''',
+                "Milk-V pre-build frozen-source gate",
+            ),
+        ),
         (
             "milkv-ambient-environment-inherited",
             lambda data: mutate_bytes(
@@ -4525,23 +5086,35 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             ),
         ),
         (
-            "milkv-post-head-bypassed",
+            "milkv-post-cargo-source-gate-removed",
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'if [ "$(git -C "$repo_root" rev-parse HEAD)" != "$wasm_aot_profile_source_commit" ]; then',
-                b"if false; then",
-                "Milk-V post-build HEAD",
+                b'''if [ "$wasm_aot_profile" = true ]; then
+  verify_wasm_aot_profile_source
+fi
+
+mkdir -p "$output_dir"''',
+                b'''if [ "$wasm_aot_profile" = true ]; then
+  : # post-Cargo frozen-source gate bypassed
+fi
+
+mkdir -p "$output_dir"''',
+                "Milk-V post-Cargo frozen-source gate",
             ),
         ),
         (
-            "milkv-post-clean-bypassed",
+            "milkv-pre-closure-source-gate-removed",
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'if [ -n "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" ]; then',
-                b"if false; then",
-                "Milk-V post-build clean tree",
+                b'''  mv "$wasm_aot_profile_temp_envelope" "$wasm_aot_profile_build_envelope"
+  verify_wasm_aot_profile_source
+  python3 - "$wasm_aot_profile_build_envelope" \\''',
+                b'''  mv "$wasm_aot_profile_temp_envelope" "$wasm_aot_profile_build_envelope"
+  : # pre-closure frozen-source gate bypassed
+  python3 - "$wasm_aot_profile_build_envelope" \\''',
+                "Milk-V pre-closure frozen-source gate",
             ),
         ),
         (
@@ -4602,6 +5175,18 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
                 b"trap cleanup_build EXIT",
                 b"trap cleanup_runtime_costs_build EXIT",
                 "Milk-V EXIT cleanup",
+            ),
+        ),
+        (
+            "milkv-exit-trap-overridden",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b"trap cleanup_build EXIT\ntrap 'exit 129' HUP",
+                b'''trap cleanup_build EXIT
+trap "exit 0" EXIT
+trap 'exit 129' HUP''',
+                "Milk-V unique EXIT trap",
             ),
         ),
         (
@@ -4695,43 +5280,187 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             ),
         ),
         (
-            "milkv-jitter-staged-gate-removed",
+            "milkv-source-envelope-path-omits-challenge",
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'["git", "-C", str(submodule), "diff", "--cached", "--binary"],',
-                b'["git", "-C", str(submodule), "diff", "--binary"],',
-                "Milk-V staged jitterentropy rejection",
+                b'wasm_aot_profile_source_envelope="$repo_root/target/c84-source-materialization/$wasm_aot_profile_source_commit/$wasm_aot_profile_challenge/source-materialization-envelope.json"',
+                b'wasm_aot_profile_source_envelope="$repo_root/target/c84-source-materialization/$wasm_aot_profile_source_commit/source-materialization-envelope.json"',
+                "Milk-V source-envelope challenge path",
             ),
         ),
         (
-            "milkv-jitter-untracked-gate-removed",
+            "milkv-envelope-materialization-omitted",
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'''["git", "-C", str(submodule), "ls-files", "--others", "--exclude-standard", "-z"],
-    check=True,
-    stdout=subprocess.PIPE,
-).stdout
-if untracked:
-    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs has untracked files")''',
-                b'''["git", "-C", str(submodule), "ls-files", "-z"],
-    check=True,
-    stdout=subprocess.PIPE,
-).stdout
-if untracked:
-    raise SystemExit("build-milkv-duo.sh: jitterentropy-rs has untracked files")''',
-                "Milk-V untracked jitterentropy rejection",
+                b'        "materialization": source_materialization,',
+                b'        "materialization": source_materialization["content"],',
+                "Milk-V embedded source materialization",
             ),
         ),
         (
-            "milkv-final-source-postcheck-bypassed",
+            "milkv-final-source-gate-wrapper-bypassed",
             lambda data: mutate_bytes(
                 data,
                 "milkv_build_script",
-                b'  if [ "$(git -C "$repo_root" rev-parse HEAD)" != "$wasm_aot_profile_source_commit" ] ||',
-                b"  if false ||",
-                "Milk-V pre-publication source postcheck",
+                b'''print("build-milkv-duo.sh C8.4 build closure rehash: PASS")
+PY
+  verify_wasm_aot_profile_source
+  if [ -e "$wasm_aot_profile_publish_dir" ] || [ -L "$wasm_aot_profile_publish_dir" ]; then''',
+                b'''print("build-milkv-duo.sh C8.4 build closure rehash: PASS")
+PY
+  if false; then
+    verify_wasm_aot_profile_source
+  fi
+  if [ -e "$wasm_aot_profile_publish_dir" ] || [ -L "$wasm_aot_profile_publish_dir" ]; then''',
+                "Milk-V pre-publication frozen-source gate wrapper",
+            ),
+        ),
+        (
+            "milkv-build-envelope-version-regressed",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'    "version": 2,\n',
+                b'    "version": 1,\n',
+                "Milk-V build-envelope v2",
+            ),
+        ),
+        (
+            "milkv-source-materializer-tool-swapped",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'    "source_materializer_script": identity(source_materializer_script, repository_input=True),',
+                b'    "source_materializer_script": identity(jitterentropy_patch, repository_input=True),',
+                "Milk-V source-materializer tool identity",
+            ),
+        ),
+        (
+            "milkv-source-envelope-single-link-bypassed",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'''before = expected.lstat()
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_size <= 0
+        or before.st_size > 16_777_216
+        or before.st_nlink != 1''',
+                b'''before = expected.lstat()
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_size <= 0
+        or before.st_size > 16_777_216
+        or False''',
+                "Milk-V source-envelope single-link gate",
+            ),
+        ),
+        (
+            "milkv-source-envelope-lstat-bypassed",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b"before = expected.lstat()",
+                b"before = expected.stat()",
+                "Milk-V source-envelope lstat snapshot",
+            ),
+        ),
+        (
+            "milkv-source-envelope-identity-bypassed",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'''    if content.get("source_commit") != source_commit or content.get("challenge") != challenge:
+        fail("source materialization identity differs")''',
+                b'''    if False:
+        fail("source materialization identity differs")''',
+                "Milk-V source-envelope identity gate",
+            ),
+        ),
+        (
+            "milkv-closure-source-content-opened",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b"if not isinstance(materialization_content, dict) or set(materialization_content) != {",
+                b"if not isinstance(materialization_content, dict) or set(materialization_content) >= {",
+                "Milk-V closure source-envelope content keys",
+            ),
+        ),
+        (
+            "milkv-closure-early-success",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'''source_root_path = pathlib.Path(sys.argv[4]).resolve(strict=True)
+
+
+def fail(message):''',
+                b'''source_root_path = pathlib.Path(sys.argv[4]).resolve(strict=True)
+raise SystemExit(0)
+
+
+def fail(message):''',
+                "Milk-V closure Python early success",
+            ),
+        ),
+        (
+            "milkv-closure-fail-success",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'''raise SystemExit(f"build-milkv-duo.sh: C8.4 closure rehash failed: {message}")''',
+                b"raise SystemExit(0)",
+                "Milk-V closure failure success status",
+            ),
+        ),
+        (
+            "milkv-closure-source-identity-bypassed",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'''    if (
+        materialization_content.get("source_commit") != source_commit
+        or materialization_content.get("challenge") != challenge
+    ):
+        fail("source materialization identity differs")''',
+                b'''    if False:
+        fail("source materialization identity differs")''',
+                "Milk-V closure source-envelope identity",
+            ),
+        ),
+        (
+            "milkv-source-envelope-canonical-bypassed",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'''    if raw != canonical_root:
+        fail("source materialization envelope is not canonical JSON")
+    return root
+
+
+artifacts = {''',
+                b'''    if False:
+        fail("source materialization envelope is not canonical JSON")
+    return root
+
+
+artifacts = {''',
+                "Milk-V source-envelope canonical encoding",
+            ),
+        ),
+        (
+            "milkv-closure-materialization-equality-bypassed",
+            lambda data: mutate_bytes(
+                data,
+                "milkv_build_script",
+                b'''if source["materialization"] != load_source_materialization(source_materialization_path):
+    fail("embedded source materialization envelope differs from the live closure")''',
+                b'''if False:
+    fail("embedded source materialization envelope differs from the live closure")''',
+                "Milk-V live source-materialization equality",
             ),
         ),
         (
@@ -4786,6 +5515,176 @@ echo "Milk-V Duo binary: $output_bin"''',
         ("ci-peer-ignored", lambda data: mutate_text(data, "ci", f"        run: {PEER_COMMAND}\n", f"        run: {PEER_COMMAND} || true\n", "CI peer ignored")),
         ("ci-qemu-ignored", lambda data: mutate_text(data, "ci", f"        run: {QEMU_COMMAND}\n", f"        run: {QEMU_COMMAND} || true\n", "CI QEMU ignored")),
         (
+            "ci-host-job-continue-on-error",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                ci_host_checkout,
+                ci_host_checkout.replace(
+                    "    runs-on: ubuntu-24.04\n    steps:",
+                    "    runs-on: ubuntu-24.04\n    continue-on-error: true\n    steps:",
+                ),
+                "CI host job continue-on-error bypass",
+            ),
+        ),
+        (
+            "ci-host-job-if-false",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                ci_host_checkout,
+                ci_host_checkout.replace(
+                    "    runs-on: ubuntu-24.04\n    steps:",
+                    "    runs-on: ubuntu-24.04\n    if: false\n    steps:",
+                ),
+                "CI host job if:false bypass",
+            ),
+        ),
+        (
+            "ci-qemu-job-continue-on-error",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                ci_qemu_checkout,
+                ci_qemu_checkout.replace(
+                    "    runs-on: ubuntu-24.04\n    steps:",
+                    "    runs-on: ubuntu-24.04\n    continue-on-error: true\n    steps:",
+                ),
+                "CI QEMU job continue-on-error bypass",
+            ),
+        ),
+        (
+            "ci-qemu-job-if-false",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                ci_qemu_checkout,
+                ci_qemu_checkout.replace(
+                    "    runs-on: ubuntu-24.04\n    steps:",
+                    "    runs-on: ubuntu-24.04\n    if: false\n    steps:",
+                ),
+                "CI QEMU job if:false bypass",
+            ),
+        ),
+        (
+            "ci-host-second-checkout",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                ci_host_checkout,
+                ci_host_checkout.replace(
+                    "      - name: Install repository toolchain",
+                    '''      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+      - name: Install repository toolchain''',
+                ),
+                "CI host second checkout",
+            ),
+        ),
+        (
+            "ci-qemu-second-checkout",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                ci_qemu_checkout,
+                ci_qemu_checkout.replace(
+                    "      - name: Install repository toolchain",
+                    '''      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: main
+      - name: Install repository toolchain''',
+                ),
+                "CI QEMU second checkout",
+            ),
+        ),
+        (
+            "ci-host-git-checkout",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                ci_host_checkout,
+                ci_host_checkout.replace(
+                    "      - name: Install repository toolchain",
+                    '''      - name: Mutate the protected host ref
+        run: git checkout main
+      - name: Install repository toolchain''',
+                ),
+                "CI host Git checkout",
+            ),
+        ),
+        (
+            "ci-qemu-git-checkout",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                ci_qemu_checkout,
+                ci_qemu_checkout.replace(
+                    "      - name: Install repository toolchain",
+                    '''      - name: Mutate the protected QEMU ref
+        run: git checkout main
+      - name: Install repository toolchain''',
+                ),
+                "CI QEMU Git checkout",
+            ),
+        ),
+        (
+            "ci-host-checkout-shallow",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                ci_host_checkout,
+                ci_host_checkout.replace("          fetch-depth: 0", "          fetch-depth: 1"),
+                "CI host full-depth checkout",
+            ),
+        ),
+        (
+            "ci-host-checkout-persists-credentials",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                ci_host_checkout,
+                ci_host_checkout.replace(
+                    "          persist-credentials: false",
+                    "          persist-credentials: true",
+                ),
+                "CI host credential-free checkout",
+            ),
+        ),
+        (
+            "ci-qemu-checkout-shallow",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                ci_qemu_checkout,
+                ci_qemu_checkout.replace("          fetch-depth: 0", "          fetch-depth: 1"),
+                "CI QEMU full-depth checkout",
+            ),
+        ),
+        (
+            "ci-qemu-checkout-persists-credentials",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                ci_qemu_checkout,
+                ci_qemu_checkout.replace(
+                    "          persist-credentials: false",
+                    "          persist-credentials: true",
+                ),
+                "CI QEMU credential-free checkout",
+            ),
+        ),
+        (
+            "ci-host-source-materializer-selftest-removed",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                "          python3 -B scripts/c84-source-materialization.py --selftest --check-source",
+                "          python3 -B scripts/c84-source-materialization.py --check-source",
+                "CI host source-materializer selftest",
+            ),
+        ),
+        (
             "ci-physical-disabled",
             lambda data: mutate_text(
                 data,
@@ -4806,6 +5705,77 @@ echo "Milk-V Duo binary: $output_bin"''',
             ),
         ),
         (
+            "ci-physical-live-head-self-binding",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                '''          source_commit="$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$source_commit"''',
+                '          source_commit="$(git rev-parse HEAD)"',
+                "CI physical workflow-SHA binding",
+            ),
+        ),
+        (
+            "ci-physical-head-equality-bypassed",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                '          test "$(git rev-parse HEAD)" = "$source_commit"',
+                "          true # live HEAD equality bypassed",
+                "CI physical live-HEAD equality",
+            ),
+        ),
+        (
+            "ci-physical-materialization-bypassed",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                "          python3 -B scripts/c84-source-materialization.py materialize \\\n",
+                "          true \\\n",
+                "CI physical source materialization",
+            ),
+        ),
+        (
+            "ci-physical-materialization-destination-unbound",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                '            --destination "$frozen" \\\n',
+                '            --destination "$GITHUB_WORKSPACE" \\\n',
+                "CI physical frozen destination",
+            ),
+        ),
+        (
+            "ci-physical-materialization-source-unbound",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                '            --source-commit "$source_commit" \\\n',
+                "            --source-commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \\\n",
+                "CI physical materialization source identity",
+            ),
+        ),
+        (
+            "ci-physical-materialization-challenge-unbound",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                '            --challenge "$challenge"',
+                "            --challenge aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "CI physical materialization challenge identity",
+            ),
+        ),
+        (
+            "ci-physical-build-outside-frozen-source",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                '          cd "$frozen"',
+                '          cd "$GITHUB_WORKSPACE"',
+                "CI physical frozen build root",
+            ),
+        ),
+        (
             "ci-physical-hostile-env-proof-removed",
             lambda data: mutate_text(
                 data,
@@ -4813,6 +5783,16 @@ echo "Milk-V Duo binary: $output_bin"''',
                 '          RUSTC_WRAPPER="$(command -v false)" \\\n',
                 "",
                 "CI hostile ambient build proof",
+            ),
+        ),
+        (
+            "ci-physical-source-unbound",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                '          VIBEOS_C84_SOURCE_COMMIT="$source_commit" \\',
+                "          VIBEOS_C84_SOURCE_COMMIT=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \\",
+                "CI physical build source binding",
             ),
         ),
         (
@@ -4840,18 +5820,18 @@ echo "Milk-V Duo binary: $output_bin"''',
             lambda data: mutate_text(
                 data,
                 "ci",
-                "            ./scripts/build-milkv-duo.sh --wasm-aot-profile\n      - name: Build the Milk-V Duo kernel",
-                "            ./scripts/build-milkv-duo.sh --wasm-aot-profile\n        uses: actions/upload-artifact@v4\n      - name: Build the Milk-V Duo kernel",
+                "            ./scripts/build-milkv-duo.sh --wasm-aot-profile\n      - name: Build the isolated Milk-V Duo C8.3 sampler (CI-only identity)",
+                "            ./scripts/build-milkv-duo.sh --wasm-aot-profile\n        uses: actions/upload-artifact@v4\n      - name: Build the isolated Milk-V Duo C8.3 sampler (CI-only identity)",
                 "CI physical artifact retention",
             ),
         ),
         (
-            "ci-physical-after-ordinary-build",
+            "ci-physical-after-c83-build",
             lambda data: swap_text(
                 data,
                 "ci",
-                "      - name: Type/link-check the C8.4 physical single-boot collector\n        run: |\n          challenge=\"$(openssl rand -hex 32)\"\n          RUSTC_WRAPPER=\"$(command -v false)\" \\\n          CARGO_PROFILE_RELEASE_OPT_LEVEL=0 \\\n          RUSTFLAGS='--c84-ambient-rustflags-must-not-leak' \\\n          VIBEOS_C84_SOURCE_COMMIT=\"$(git rev-parse HEAD)\" \\\n          VIBEOS_C84_CHALLENGE=\"$challenge\" \\\n            ./scripts/build-milkv-duo.sh --wasm-aot-profile\n",
-                "      - name: Build the Milk-V Duo kernel\n        # FIT/full-card packaging still requires a prebuilt official SDK and\n        # remains part of the documented manual hardware acceptance flow.\n        run: ./scripts/build-milkv-duo.sh\n",
+                ci_physical_block,
+                ci_c83_build_block,
                 "CI physical step order",
             ),
         ),
@@ -4860,7 +5840,7 @@ echo "Milk-V Duo binary: $output_bin"''',
             lambda data: mutate_text(
                 data,
                 "testing",
-                "It neither runs nor retains that artifact.",
+                "It neither runs\nnor retains that artifact.",
                 "It runs and retains that artifact.",
                 "TESTING CI evidence claim",
             ),
@@ -4870,8 +5850,9 @@ echo "Milk-V Duo binary: $output_bin"''',
             lambda data: mutate_text(
                 data,
                 "decision_doc",
-                "They never open a UART; these commands also require no SDK, Docker, network,\n"
-                "flash, reset, or physical cold boot and produce no decision-eligible evidence.",
+                "They never open a UART; the commands also require no SDK,\n"
+                "Docker, network, flash, reset, or physical cold boot and produce no\n"
+                "decision-eligible evidence.",
                 "They open a UART and produce decision-eligible physical evidence.",
                 "decision CI evidence claim",
             ),
@@ -4891,8 +5872,8 @@ echo "Milk-V Duo binary: $output_bin"''',
             lambda data: mutate_text(
                 data,
                 "testing",
-                "and no\nworkload-specific AOT decision.",
-                "and a complete\nworkload-specific AOT decision.",
+                "and no workload-specific AOT\ndecision.",
+                "and a complete workload-specific AOT\ndecision.",
                 "TESTING incomplete AOT decision status",
             ),
         ),
@@ -4901,9 +5882,40 @@ echo "Milk-V Duo binary: $output_bin"''',
             lambda data: mutate_text(
                 data,
                 "decision_doc",
-                "has host-only synthetic coverage.",
-                "has no synthetic coverage.",
+                "has host-only synthetic coverage, including an independent frozen-source\n"
+                "envelope and local Docker runtime custody.",
+                "has no synthetic coverage or frozen-source/runtime custody.",
                 "decision software-only synthetic boundary",
+            ),
+        ),
+        (
+            "testing-frozen-build-boundary-removed",
+            lambda data: mutate_text(
+                data,
+                "testing",
+                "independently materialized and verified frozen\nsource tree",
+                "operator checkout",
+                "TESTING frozen build boundary",
+            ),
+        ),
+        (
+            "decision-materialization-command-removed",
+            lambda data: mutate_text(
+                data,
+                "decision_doc",
+                "python3 -B scripts/c84-source-materialization.py materialize",
+                "python3 -B scripts/c84-source-materialization.py verify",
+                "decision materialization command",
+            ),
+        ),
+        (
+            "roadmap-frozen-source-boundary-removed",
+            lambda data: mutate_text(
+                data,
+                "roadmap",
+                "frozen-source envelope, build/package envelopes, host-observed Docker runtime\nclosure",
+                "operator-source assertion, build/package envelopes, Docker runtime\nrecord",
+                "roadmap frozen-source/runtime closure",
             ),
         ),
     ]

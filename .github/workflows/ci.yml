@@ -94,6 +94,10 @@ jobs:
         run: ./scripts/status.sh --check
       - name: Exercise SMP benchmark transcript validation
         run: python3 -B scripts/bench.py --selftest
+      - name: Verify the C0.7 candidate baseline contract
+        run: |
+          python3 -B scripts/verify-c0-baseline.py --selftest --check-toolchain
+          python3 -B scripts/collect-c0-baseline.py --check-build
       - name: Verify the independent C8.3 runtime-cost evidence boundary
         run: |
           python3 -B scripts/verify-c83-runtime-costs.py --selftest --check-manifest

@@ -3,12 +3,11 @@ use dlr_wasm_interpreter::{
     Value,
 };
 use vibeos_wasm_candidates::{
-    allocation_shape, bounded_core_candidate, inspect_component, validate_wit_world, Candidate,
-    FrontendError, ENGINE_EVIDENCE, FLOAT_DECISION, FRONTEND_DECISION, SELECTED_CORE_ENGINE,
+    allocation_shape, bounded_core_candidate, configured_wasmi_engine, inspect_component,
+    validate_wit_world, Candidate, FrontendError, ENGINE_EVIDENCE, FLOAT_DECISION,
+    FRONTEND_DECISION, SELECTED_CORE_ENGINE,
 };
-use wasmi::{
-    CompilationMode, Config, Engine, Linker, Module, Store as WasmiStore, TypedResumableCall,
-};
+use wasmi::{Engine, Linker, Module, Store as WasmiStore, TypedResumableCall};
 
 const ADD: &str = include_str!("../../component-format/tests/corpus/core/integer.wat");
 const COUNTDOWN: &str = r#"
@@ -37,25 +36,7 @@ const COMPONENT: &str =
 const WORLD: &str = include_str!("../../component-format/tests/corpus/wit/world.wit");
 
 fn wasmi_engine() -> Engine {
-    let mut config = Config::default();
-    config
-        .floats(false)
-        .wasm_mutable_global(false)
-        .wasm_sign_extension(false)
-        .wasm_saturating_float_to_int(false)
-        .wasm_multi_value(false)
-        .wasm_multi_memory(false)
-        .wasm_bulk_memory(false)
-        .wasm_reference_types(false)
-        .wasm_tail_call(false)
-        .wasm_extended_const(false)
-        .wasm_custom_page_sizes(false)
-        .wasm_memory64(false)
-        .wasm_wide_arithmetic(false)
-        .consume_fuel(true)
-        .compilation_mode(CompilationMode::Eager)
-        .set_max_recursion_depth(128);
-    Engine::new(&config)
+    configured_wasmi_engine()
 }
 
 fn run_wasmi_add(bytes: &[u8]) -> i32 {

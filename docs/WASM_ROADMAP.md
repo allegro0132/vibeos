@@ -359,6 +359,17 @@ If the complete frontend cannot meet the measured TCB/footprint budget, the
 profile is narrowed; the project does not silently fall back to an untyped
 public Core-Wasm ABI.
 
+**C0.7 baseline (2026-08-28):** the reproducible evidence contract lives in
+`wasm-candidates/evidence/`. It records the closed candidate/metric
+applicability matrix, pinned fixtures and toolchain, RISC-V allocated
+code/static size, host validator and empty-instance memory, cold startup, exact
+Core fuel consumption, and Canonical ABI lift/lower cost. Baseline replacement
+requires the explicit `scripts/collect-c0-baseline.py --update` command. CI
+never rewrites it: CI verifies the checked-in record, its source hashes,
+derived statistics, heap cleanup invariants, and rejection mutations, then
+rebuilds the host collector, all four RISC-V probes, and generated fixtures
+without recollecting timings.
+
 ### C1 — Portable bounded Core Wasm execution
 
 **Goal:** provide the mandatory private execution substrate in a host-testable

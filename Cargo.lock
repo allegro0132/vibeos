@@ -1922,7 +1922,9 @@ name = "vibeos-wasm-candidates"
 version = "0.1.0"
 dependencies = [
  "dlr-wasm-interpreter",
+ "serde_json",
  "vibeos-component-format",
+ "vibeos-component-runtime",
  "wasmi",
  "wasmparser 0.255.0",
  "wat",

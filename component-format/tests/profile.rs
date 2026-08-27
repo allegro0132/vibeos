@@ -559,27 +559,36 @@ fn every_counter_accepts_exact_limit_and_rejects_one_more_atomically() {
 }
 
 #[test]
-fn stable_trap_codes_do_not_alias() {
+fn stable_trap_codes_and_names_are_exact() {
     let traps = [
-        TrapCode::Validation,
-        TrapCode::UnsupportedFeature,
-        TrapCode::LimitExceeded,
-        TrapCode::Unreachable,
-        TrapCode::IntegerDivisionByZero,
-        TrapCode::IntegerOverflow,
-        TrapCode::MemoryOutOfBounds,
-        TrapCode::TableOutOfBounds,
-        TrapCode::IndirectCallTypeMismatch,
-        TrapCode::CallDepthExceeded,
-        TrapCode::FuelExhausted,
-        TrapCode::Cancelled,
-        TrapCode::CanonicalAbi,
-        TrapCode::ResourceMisuse,
+        (TrapCode::Validation, 0x0100, "validation"),
+        (TrapCode::UnsupportedFeature, 0x0101, "unsupported-feature"),
+        (TrapCode::LimitExceeded, 0x0102, "limit-exceeded"),
+        (TrapCode::Unreachable, 0x0200, "unreachable"),
+        (
+            TrapCode::IntegerDivisionByZero,
+            0x0201,
+            "integer-division-by-zero",
+        ),
+        (TrapCode::IntegerOverflow, 0x0202, "integer-overflow"),
+        (TrapCode::MemoryOutOfBounds, 0x0203, "memory-out-of-bounds"),
+        (TrapCode::TableOutOfBounds, 0x0204, "table-out-of-bounds"),
+        (
+            TrapCode::IndirectCallTypeMismatch,
+            0x0205,
+            "indirect-call-type-mismatch",
+        ),
+        (TrapCode::CallDepthExceeded, 0x0206, "call-depth-exceeded"),
+        (TrapCode::FuelExhausted, 0x0300, "fuel-exhausted"),
+        (TrapCode::Cancelled, 0x0301, "cancelled"),
+        (TrapCode::CanonicalAbi, 0x0400, "canonical-abi"),
+        (TrapCode::ResourceMisuse, 0x0401, "resource-misuse"),
     ];
-    for (index, trap) in traps.iter().enumerate() {
-        assert!(!trap.name().is_empty());
+    for (index, (trap, code, name)) in traps.iter().copied().enumerate() {
+        assert_eq!(trap.code(), code);
+        assert_eq!(trap.name(), name);
         assert!(traps[index + 1..]
             .iter()
-            .all(|other| *trap as u16 != *other as u16));
+            .all(|(other, _, _)| trap.code() != other.code()));
     }
 }

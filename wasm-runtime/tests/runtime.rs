@@ -135,7 +135,9 @@ fn component_group_enforces_the_image_memory_ceiling_at_runtime() {
     // A non-page-aligned ceiling below the module's initial page also fails
     // closed during instantiation.
     let mut too_small = CoreComponentGroup::new_with_memory_limit(&engine, 1, 65_535).unwrap();
-    assert!(too_small.add_instance(&module, &[]).is_err());
+    let error = too_small.add_instance(&module, &[]).unwrap_err();
+    assert_eq!(error.trap, TrapCode::LimitExceeded);
+    assert_eq!(error.detail, AdmissionDetail::Malformed);
 
     assert!(CoreComponentGroup::new_with_memory_limit(&engine, 1, 0).is_err());
     assert!(CoreComponentGroup::new_with_memory_limit(

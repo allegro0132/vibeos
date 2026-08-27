@@ -37,9 +37,11 @@ SCRIPT_PATH = pathlib.Path(__file__).resolve()
 C84_VERIFIER = ROOT / "scripts/verify-c84-aot-decision.py"
 C84_EVIDENCE_VERIFIER = ROOT / "scripts/verify-c84-evidence.py"
 C83_EVIDENCE_VERIFIER = ROOT / "scripts/verify-c83-evidence.py"
+C84_SOURCE_MATERIALIZER = ROOT / "scripts/c84-source-materialization.py"
+C84_DOCKER_RUNTIME = ROOT / "scripts/c84-docker-runtime.py"
 C84_MANIFEST = ROOT / "benchmarks/wasm-aot-decision/workloads-v1.json"
 C84_TRANSCRIPT_SCHEMA = ROOT / "benchmarks/wasm-aot-decision/schema-v1.json"
-C84_EVIDENCE_SCHEMA = ROOT / "benchmarks/wasm-aot-decision/evidence-schema-v1.json"
+C84_EVIDENCE_SCHEMA = ROOT / "benchmarks/wasm-aot-decision/evidence-schema-v2.json"
 DEFAULT_C83_ROOT = ROOT / "benchmarks/wasm-runtime"
 
 TARGET_ROOT = ROOT / "target/milkv-duo-wasm-aot-profile"
@@ -52,6 +54,13 @@ CANONICAL_ARTIFACTS = {
 CANONICAL_BUILD_ENVELOPE = TARGET_ROOT / "build-envelope.json"
 CANONICAL_PACKAGE_ENVELOPE = TARGET_ROOT / "package-envelope.json"
 CANONICAL_IMAGE_AUDIT = TARGET_ROOT / "image-verifier-audit.log"
+CANONICAL_PACKAGE_RUNTIME_ATTESTATION = (
+    TARGET_ROOT / "container-runtime-attestation.json"
+)
+CANONICAL_VERIFIER_RUNTIME_ATTESTATION = (
+    TARGET_ROOT / "container-runtime-verifier-attestation.json"
+)
+CANONICAL_CONTAINER_RUNTIME_CLOSURE = TARGET_ROOT / "container-runtime-closure.json"
 
 PLATFORM = "milkv-duo-cv1800b"
 WORKLOAD_ID = "ssh-case-filter-12k-v1"
@@ -72,6 +81,18 @@ SDK_COMMIT = "23eb84fecb29585dbb5728d6b7e2475ff273baac"
 SDK_CONTAINER_DIGEST = (
     "sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679"
 )
+SDK_CONTAINER_REFERENCE = f"milkvtech/milkv-duo@{SDK_CONTAINER_DIGEST}"
+SDK_CONTAINER_PLATFORM = "linux/amd64"
+RUNTIME_SOURCE_ROOT = "/home/vibeos"
+RUNTIME_SDK_ROOT = "/home/work"
+RUNTIME_CAPABILITY = (
+    "host Docker daemon inspect plus in-container namespace witness; "
+    "software custody only"
+)
+SOURCE_MATERIALIZATION_SCHEMA = "vibeos.c84.source-materialization-envelope"
+RUNTIME_ATTESTATION_SCHEMA = "vibeos.c84.docker-runtime-attestation"
+RUNTIME_CLOSURE_SCHEMA = "vibeos.c84.docker-runtime-closure"
+CAPTURE_ENVELOPE_SCHEMA = "vibeos.c84.duo-aot-decision.capture-envelope"
 TEST_SOURCE = "1" * 40
 TEST_CHALLENGE = "2" * 64
 META_PREFIX = b"VIBE_WASM_AOT_META "
@@ -81,9 +102,6 @@ MARKER_PREFIX = b"VIBE_WASM_AOT_"
 FAILURE_MARKERS = (b"panic", b"fatal", b"vibe_wasm_aot_failed")
 STRICT_STATUS_POLICY = (
     "git status --porcelain=v1 --untracked-files=all --ignore-submodules=none"
-)
-BUILD_STATUS_POLICY = (
-    "git status --porcelain=v1 --untracked-files=all --ignore-submodules=all"
 )
 BUILD_ENVIRONMENT_KEYS = [
     "CARGO_HOME",
@@ -104,7 +122,7 @@ BUILD_ENVIRONMENT_KEYS = [
 ]
 BUILD_TOOL_KEYS = {
     "build_script",
-    "prepare_jitterentropy_script",
+    "source_materializer_script",
     "jitterentropy_patch",
     "gitmodules",
     "firmware_manifest",
@@ -123,7 +141,8 @@ PACKAGE_TOOL_KEYS = {
     "image_verifier_script",
     "docker_git_config",
     "build_script",
-    "prepare_jitterentropy_script",
+    "source_materializer_script",
+    "docker_runtime_script",
     "jitterentropy_patch",
     "gitmodules",
     "fit_source",
@@ -143,8 +162,6 @@ PACKAGE_TOOL_KEYS = {
     "verifier_python3",
     "verifier_tr",
 }
-JITTERENTROPY_HEAD = "c5bd2e17194fe3a04d17f74027bb67622579405f"
-SUNSET_HEAD = "f686eaaaba8b2eda3f83e23b4bb3005cae31ce5e"
 C84_IMAGE_PASS = "PASS: C8.4 FAT boot + raw data MBR image, FIP, FIT metadata, kernel/DTB payloads, and CRC32 hashes are valid"
 C84_IMAGE_REPORT_SCHEMA = "vibeos.c84.duo-wasm-aot-profile.image-audit-report"
 RUN_ID_DOMAIN = "vibeos.c84.aot-decision.run-id.v1"
@@ -170,6 +187,8 @@ IMAGE_REPORT_TOOL_ROLES = {
     "sdk_mkimage": "sdk_mkimage",
     "sdk_dumpimage": "sdk_dumpimage",
     "git_config": "docker_git_config",
+    "source_materializer_script": "source_materializer_script",
+    "docker_runtime_script": "docker_runtime_script",
     "mdir": "verifier_mdir",
     "mcopy": "verifier_mcopy",
     "cmp": "verifier_cmp",
@@ -180,7 +199,7 @@ IMAGE_REPORT_TOOL_ROLES = {
 }
 REPOSITORY_BUILD_TOOLS = {
     "build_script": "scripts/build-milkv-duo.sh",
-    "prepare_jitterentropy_script": "scripts/prepare-jitterentropy-rs.sh",
+    "source_materializer_script": "scripts/c84-source-materialization.py",
     "jitterentropy_patch": "patches/jitterentropy-rs/0001-vibeos-qualification.patch",
     "gitmodules": ".gitmodules",
     "firmware_manifest": "firmware/milkv-duo/Cargo.toml",
@@ -199,7 +218,8 @@ REPOSITORY_PACKAGE_TOOLS = {
     "image_verifier_script": "scripts/verify-milkv-duo-image.sh",
     "docker_git_config": "scripts/c84-docker.gitconfig",
     "build_script": "scripts/build-milkv-duo.sh",
-    "prepare_jitterentropy_script": "scripts/prepare-jitterentropy-rs.sh",
+    "source_materializer_script": "scripts/c84-source-materialization.py",
+    "docker_runtime_script": "scripts/c84-docker-runtime.py",
     "jitterentropy_patch": "patches/jitterentropy-rs/0001-vibeos-qualification.patch",
     "gitmodules": ".gitmodules",
     "fit_source": "scripts/milkv-duo.its",
@@ -228,6 +248,33 @@ C83_RELATIVE_FILES = tuple(
         )
     )
 )
+RUNTIME_ARTIFACT_FILES = {
+    "boot_sd": "boot.sd",
+    "build_envelope": "build-envelope.json",
+    "full_sd_image": "vibeos-milkv-duo-wasm-aot-profile-sd.img",
+    "image_verifier_audit": "image-verifier-audit.log",
+    "kernel_binary": "vibeos-milkv-duo.bin",
+    "kernel_elf": "vibeos-milkv-duo-wasm-aot-profile.elf",
+    "package_envelope": "package-envelope.json",
+    "packaged_dtb": "cv1800b_milkv_duo_sd.dtb",
+    "packaged_fit_source": "milkv-duo.its",
+    "package_attestation": "container-runtime-attestation.json",
+    "verifier_attestation": "container-runtime-verifier-attestation.json",
+}
+CAPTURE_FIXED_FILES = {
+    "build-envelope.json",
+    "package-envelope.json",
+    "package-image-verifier-audit.log",
+    "source-materialization-envelope.json",
+    "container-runtime-attestation.json",
+    "container-runtime-verifier-attestation.json",
+    "container-runtime-closure.json",
+    "capture-envelope.json",
+}
+CAPTURE_OUTPUT_FILES = CAPTURE_FIXED_FILES | {
+    *(f"boot-{index}.uart.log" for index in range(BOOT_COUNT)),
+    *(f"boot-{index}.summary.json" for index in range(BOOT_COUNT)),
+}
 _ACTIVE_CAPTURE_STAGE: pathlib.Path | None = None
 
 
@@ -614,11 +661,24 @@ def measurement_record(value: Any, label: str) -> dict[str, Any]:
     return record
 
 
+def image_audit_transcript_has_failure(lines: list[str]) -> bool:
+    return (
+        re.search(
+            r"\b(?:panic|fatal|fail|failed|failure)\b",
+            "\n".join(lines[:-2]),
+            re.IGNORECASE,
+        )
+        is not None
+    )
+
+
 def validate_image_audit(
     raw: bytes,
     *,
     source: str,
     challenge: str,
+    source_materialization: dict[str, Any],
+    runtime_attestation: dict[str, Any],
     artifacts: dict[str, dict[str, Any]],
     tools: dict[str, dict[str, Any]],
     label: str,
@@ -640,23 +700,39 @@ def validate_image_audit(
         f"{label} report/PASS is not unique",
     )
     require(
-        re.search(r"\b(?:panic|fatal|fail|failed|failure)\b", text, re.IGNORECASE)
-        is None,
-        f"{label} contains a failure token",
+        not image_audit_transcript_has_failure(lines),
+        f"{label} transcript contains a failure token",
     )
     report_line = lines[-2]
     report = exact(
         strict_json_bytes(report_line.encode("utf-8"), f"{label} report"),
-        {"schema", "version", "source_commit", "challenge", "artifacts", "tools"},
+        {
+            "schema",
+            "version",
+            "source_commit",
+            "challenge",
+            "source_materialization",
+            "runtime_attestation",
+            "artifacts",
+            "tools",
+        },
         f"{label} report",
     )
     require(
         report["schema"] == C84_IMAGE_REPORT_SCHEMA
         and type(report["version"]) is int
-        and report["version"] == 1
+        and report["version"] == 2
         and report["source_commit"] == source
         and report["challenge"] == challenge,
         f"{label} report identity differs",
+    )
+    require(
+        report["source_materialization"] == source_materialization,
+        f"{label} source materialization differs",
+    )
+    require(
+        report["runtime_attestation"] == runtime_attestation,
+        f"{label} runtime attestation differs",
     )
     require(
         json.dumps(report, sort_keys=True, separators=(",", ":")) == report_line,
@@ -688,7 +764,7 @@ def validate_image_audit(
 
 
 def canonical_content_envelope(
-    value: Any, schema: str, label: str
+    value: Any, schema: str, label: str, *, version: int = 1
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     root = exact(
         value, {"schema", "version", "status", "content_sha256", "content"}, label
@@ -696,7 +772,7 @@ def canonical_content_envelope(
     require(
         root["schema"] == schema
         and type(root["version"]) is int
-        and root["version"] == 1
+        and root["version"] == version
         and root["status"] == "closed",
         f"{label} identity/status differs",
     )
@@ -712,14 +788,16 @@ def canonical_content_envelope(
     return root, root["content"]
 
 
-def make_content_envelope(schema: str, content: dict[str, Any]) -> dict[str, Any]:
+def make_content_envelope(
+    schema: str, content: dict[str, Any], *, version: int = 1
+) -> dict[str, Any]:
     require_finite_json(content, f"{schema} content")
     rendered = json.dumps(content, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
     )
     return {
         "schema": schema,
-        "version": 1,
+        "version": version,
         "status": "closed",
         "content_sha256": sha256_bytes(rendered),
         "content": content,
@@ -750,70 +828,426 @@ def run_checked(command: list[str], *, label: str, cwd: pathlib.Path = ROOT) -> 
     return completed.stdout
 
 
-def git_bytes(arguments: list[str], label: str) -> bytes:
+def canonical_root_file(
+    path: pathlib.Path,
+    *,
+    schema: str,
+    version: int,
+    label: str,
+) -> tuple[dict[str, Any], bytes, dict[str, Any]]:
+    raw = stable_regular_bytes(path, label, maximum=64 * 1024 * 1024)
+    root, _content = canonical_content_envelope(
+        strict_json_bytes(raw, label), schema, label, version=version
+    )
+    canonical = (
+        json.dumps(root, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    )
+    require(raw == canonical, f"{label} is not canonical JSON")
+    return root, raw, {"sha256": sha256_bytes(raw), "bytes": len(raw)}
+
+
+def source_materialization_path(source: str, challenge: str) -> pathlib.Path:
+    return (
+        ROOT
+        / "target/c84-source-materialization"
+        / source
+        / challenge
+        / "source-materialization-envelope.json"
+    )
+
+
+def runtime_file_record(
+    value: Any,
+    *,
+    filename: str,
+    identity: dict[str, Any],
+    label: str,
+) -> dict[str, Any]:
+    record = identity_record(value, label)
+    require(record["path"] == filename, f"{label} path differs")
+    same_identity(identity, record, label)
+    return record
+
+
+def validate_provenance_roots(
+    *,
+    source: str,
+    challenge: str,
+    source_root: dict[str, Any],
+    package_attestation: dict[str, Any],
+    verifier_attestation: dict[str, Any],
+    closure_root: dict[str, Any],
+    package_attestation_identity: dict[str, Any],
+    verifier_attestation_identity: dict[str, Any],
+) -> None:
+    source_root, _ = canonical_content_envelope(
+        source_root,
+        SOURCE_MATERIALIZATION_SCHEMA,
+        "C8.4 source materialization envelope",
+        version=1,
+    )
+    package_attestation, _ = canonical_content_envelope(
+        package_attestation,
+        RUNTIME_ATTESTATION_SCHEMA,
+        "C8.4 package runtime attestation",
+        version=1,
+    )
+    verifier_attestation, _ = canonical_content_envelope(
+        verifier_attestation,
+        RUNTIME_ATTESTATION_SCHEMA,
+        "C8.4 verifier runtime attestation",
+        version=1,
+    )
+    closure_root, _ = canonical_content_envelope(
+        closure_root,
+        RUNTIME_CLOSURE_SCHEMA,
+        "C8.4 container runtime closure",
+        version=1,
+    )
+    source_content = exact(
+        source_root["content"],
+        {
+            "bundles",
+            "challenge",
+            "clone_git_admin",
+            "command",
+            "frozen",
+            "git",
+            "independence",
+            "materialization",
+            "patch",
+            "snapshot",
+            "source",
+            "source_commit",
+            "submodules",
+            "timestamps_utc",
+        },
+        "C8.4 source materialization content",
+    )
+    require(
+        source_content["source_commit"] == source
+        and source_content["challenge"] == challenge,
+        "C8.4 source materialization campaign identity differs",
+    )
+
+    def attestation(value: dict[str, Any], mode: str) -> dict[str, Any]:
+        content = exact(
+            value["content"],
+            {
+                "capability",
+                "challenge",
+                "host_preinspect",
+                "host_preinspect_identity",
+                "mode",
+                "source_commit",
+                "source_materialization_content_sha256",
+                "witness",
+            },
+            f"C8.4 {mode} runtime attestation content",
+        )
+        require(
+            content["capability"] == RUNTIME_CAPABILITY
+            and content["source_commit"] == source
+            and content["challenge"] == challenge
+            and content["mode"] == mode
+            and content["source_materialization_content_sha256"]
+            == source_root["content_sha256"],
+            f"C8.4 {mode} runtime attestation identity differs",
+        )
+        require(
+            isinstance(content["host_preinspect"], dict)
+            and isinstance(content["witness"], dict),
+            f"C8.4 {mode} runtime attestation witness is malformed",
+        )
+        measurement_record(
+            content["host_preinspect_identity"],
+            f"C8.4 {mode} host-preinspect identity",
+        )
+        return content
+
+    attestation(package_attestation, "package")
+    attestation(verifier_attestation, "verify")
+    measurement_record(
+        package_attestation_identity, "C8.4 package runtime-attestation file"
+    )
+    measurement_record(
+        verifier_attestation_identity, "C8.4 verifier runtime-attestation file"
+    )
+
+    closure = exact(
+        closure_root["content"],
+        {
+            "artifacts",
+            "capability",
+            "challenge",
+            "image",
+            "package",
+            "platform",
+            "runs",
+            "sdk_mount",
+            "source",
+            "source_commit",
+        },
+        "C8.4 container runtime closure content",
+    )
+    require(
+        closure["capability"] == RUNTIME_CAPABILITY
+        and closure["source_commit"] == source
+        and closure["challenge"] == challenge
+        and closure["platform"] == SDK_CONTAINER_PLATFORM,
+        "C8.4 container runtime closure campaign identity differs",
+    )
+    closure_source = exact(
+        closure["source"],
+        {"materialization_content_sha256", "root"},
+        "C8.4 container runtime closure source",
+    )
+    require(
+        closure_source
+        == {
+            "materialization_content_sha256": source_root["content_sha256"],
+            "root": str(ROOT),
+        },
+        "C8.4 container runtime closure source differs",
+    )
+    image = exact(
+        closure["image"],
+        {
+            "architecture",
+            "descriptor",
+            "id",
+            "inspect",
+            "os",
+            "reference",
+            "repo_digest",
+        },
+        "C8.4 container runtime closure image",
+    )
+    require(
+        image["architecture"] == "amd64"
+        and image["os"] == "linux"
+        and image["reference"] == SDK_CONTAINER_REFERENCE
+        and image["repo_digest"] == SDK_CONTAINER_REFERENCE
+        and isinstance(image["id"], str)
+        and CONTAINER_DIGEST.fullmatch(image["id"]) is not None
+        and isinstance(image["inspect"], dict),
+        "C8.4 container runtime closure image differs",
+    )
+    exact(
+        closure["sdk_mount"],
+        {"destination", "kind", "read_only", "source"},
+        "C8.4 container runtime SDK mount",
+    )
+    closure_package = exact(
+        closure["package"],
+        {"build_envelope", "image_verifier_audit", "package_envelope"},
+        "C8.4 container runtime package records",
+    )
+    for name, record in closure_package.items():
+        identity_record(record, f"C8.4 container runtime package {name}")
+    runs = exact(
+        closure["runs"], {"package", "verifier"}, "C8.4 container runtime runs"
+    )
+    expected_runs = {
+        "package": (package_attestation, package_attestation_identity),
+        "verifier": (verifier_attestation, verifier_attestation_identity),
+    }
+    container_ids: list[str] = []
+    for mode, (expected_root, expected_identity) in expected_runs.items():
+        run = exact(
+            runs[mode],
+            {
+                "attestation",
+                "attestation_identity",
+                "container_id",
+                "container_postinspect",
+                "container_preinspect",
+                "host_preinspect",
+                "host_preinspect_identity",
+                "operations",
+                "wait_exit_code",
+            },
+            f"C8.4 container runtime {mode} run",
+        )
+        require(
+            run["attestation"] == expected_root
+            and run["attestation_identity"] == expected_identity
+            and type(run["wait_exit_code"]) is int
+            and run["wait_exit_code"] == 0,
+            f"C8.4 container runtime {mode} attestation/exit differs",
+        )
+        container_id = run["container_id"]
+        require(
+            isinstance(container_id, str)
+            and re.fullmatch(r"[0-9a-f]{64}", container_id) is not None,
+            f"C8.4 container runtime {mode} container id is malformed",
+        )
+        container_ids.append(container_id)
+    require(
+        len(set(container_ids)) == 2,
+        "C8.4 package and verifier reused one runtime container",
+    )
+    closure_artifacts = exact(
+        closure["artifacts"],
+        set(RUNTIME_ARTIFACT_FILES),
+        "C8.4 container runtime artifacts",
+    )
+    runtime_file_record(
+        closure_artifacts["package_attestation"],
+        filename=RUNTIME_ARTIFACT_FILES["package_attestation"],
+        identity=package_attestation_identity,
+        label="C8.4 closure package runtime attestation",
+    )
+    runtime_file_record(
+        closure_artifacts["verifier_attestation"],
+        filename=RUNTIME_ARTIFACT_FILES["verifier_attestation"],
+        identity=verifier_attestation_identity,
+        label="C8.4 closure verifier runtime attestation",
+    )
+    require(
+        "operator-declared"
+        not in json.dumps(closure_root, sort_keys=True, separators=(",", ":")),
+        "C8.4 container runtime closure contains old operator-declared provenance",
+    )
+
+
+@dataclass(frozen=True)
+class ProvenanceEvidence:
+    source_path: pathlib.Path
+    source_root: dict[str, Any]
+    source_bytes: bytes
+    source_identity: dict[str, Any]
+    package_attestation_root: dict[str, Any]
+    package_attestation_bytes: bytes
+    package_attestation_identity: dict[str, Any]
+    verifier_attestation_root: dict[str, Any]
+    verifier_attestation_bytes: bytes
+    verifier_attestation_identity: dict[str, Any]
+    closure_root: dict[str, Any]
+    closure_bytes: bytes
+    closure_identity: dict[str, Any]
+
+
+def validate_live_provenance(source: str, challenge: str) -> ProvenanceEvidence:
+    source_path = source_materialization_path(source, challenge)
+    run_checked(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            str(C84_SOURCE_MATERIALIZER),
+            "verify",
+            "--destination",
+            str(ROOT),
+            "--source-commit",
+            source,
+            "--challenge",
+            challenge,
+        ],
+        label="C8.4 frozen source materialization verifier",
+    )
+    run_checked(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            str(C84_DOCKER_RUNTIME),
+            "verify",
+            "--closure",
+            str(CANONICAL_CONTAINER_RUNTIME_CLOSURE),
+            "--source-commit",
+            source,
+            "--challenge",
+            challenge,
+        ],
+        label="C8.4 Docker runtime closure verifier",
+    )
+    source_root, source_raw, source_identity = canonical_root_file(
+        source_path,
+        schema=SOURCE_MATERIALIZATION_SCHEMA,
+        version=1,
+        label="C8.4 source materialization envelope",
+    )
+    package_root, package_raw, package_identity = canonical_root_file(
+        CANONICAL_PACKAGE_RUNTIME_ATTESTATION,
+        schema=RUNTIME_ATTESTATION_SCHEMA,
+        version=1,
+        label="C8.4 package runtime attestation",
+    )
+    verifier_root, verifier_raw, verifier_identity = canonical_root_file(
+        CANONICAL_VERIFIER_RUNTIME_ATTESTATION,
+        schema=RUNTIME_ATTESTATION_SCHEMA,
+        version=1,
+        label="C8.4 verifier runtime attestation",
+    )
+    closure_root, closure_raw, closure_identity = canonical_root_file(
+        CANONICAL_CONTAINER_RUNTIME_CLOSURE,
+        schema=RUNTIME_CLOSURE_SCHEMA,
+        version=1,
+        label="C8.4 container runtime closure",
+    )
+    validate_provenance_roots(
+        source=source,
+        challenge=challenge,
+        source_root=source_root,
+        package_attestation=package_root,
+        verifier_attestation=verifier_root,
+        closure_root=closure_root,
+        package_attestation_identity=package_identity,
+        verifier_attestation_identity=verifier_identity,
+    )
+    return ProvenanceEvidence(
+        source_path=source_path,
+        source_root=source_root,
+        source_bytes=source_raw,
+        source_identity=source_identity,
+        package_attestation_root=package_root,
+        package_attestation_bytes=package_raw,
+        package_attestation_identity=package_identity,
+        verifier_attestation_root=verifier_root,
+        verifier_attestation_bytes=verifier_raw,
+        verifier_attestation_identity=verifier_identity,
+        closure_root=closure_root,
+        closure_bytes=closure_raw,
+        closure_identity=closure_identity,
+    )
+
+
+def frozen_git_bytes(arguments: list[str], label: str) -> bytes:
     environment = {
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
         "LC_ALL": "C",
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
     }
     try:
         completed = subprocess.run(
-            ["git", "--no-optional-locks", "-C", str(ROOT), *arguments],
+            [
+                "git",
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "protocol.file.allow=only",
+                "-C",
+                str(ROOT),
+                *arguments,
+            ],
             env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
         )
     except OSError as error:
-        fail(f"cannot invoke Git for {label}: {error}")
+        fail(f"cannot invoke frozen-source Git for {label}: {error}")
     require(
         completed.returncode == 0,
-        f"Git {label} failed: {completed.stderr.decode(errors='replace').strip()}",
+        f"frozen-source Git {label} failed: "
+        f"{completed.stderr.decode(errors='replace').strip()}",
     )
     return completed.stdout
-
-
-def git_head() -> str:
-    return canonical_source(
-        git_bytes(["rev-parse", "HEAD"], "HEAD").decode().strip(), "Git HEAD"
-    )
-
-
-def resolve_full_commit(value: str, label: str) -> str:
-    commit = canonical_source(value, label)
-    resolved = (
-        git_bytes(["rev-parse", "--verify", f"{commit}^{{commit}}"], label)
-        .decode()
-        .strip()
-    )
-    require(
-        resolved == commit,
-        f"{label} does not resolve to the exact supplied full commit",
-    )
-    return commit
-
-
-def git_status() -> str:
-    return git_bytes(
-        [
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ],
-        "status",
-    ).decode()
-
-
-def git_preflight(source: str) -> str:
-    head = git_head()
-    require(head == source, f"source commit must equal current HEAD {head}")
-    status = git_status()
-    require(
-        not status,
-        f"formal physical capture requires a clean worktree:\n{status[:2000]}",
-    )
-    return head
 
 
 def validate_real_directory_tree(
@@ -974,116 +1408,13 @@ def canonical_tree_digest(files: dict[str, bytes]) -> str:
     return digest.hexdigest()
 
 
-def parse_ls_tree_records(
-    raw: bytes, expected_paths: set[str], label: str
-) -> dict[str, tuple[str, str]]:
-    records: dict[str, tuple[str, str]] = {}
-    for encoded in raw.split(b"\0"):
-        if not encoded:
-            continue
-        try:
-            header, path_raw = encoded.split(b"\t", 1)
-            mode_raw, kind_raw, oid_raw = header.split(b" ", 2)
-            path = path_raw.decode("utf-8")
-            mode = mode_raw.decode("ascii")
-            kind = kind_raw.decode("ascii")
-            oid = oid_raw.decode("ascii")
-        except (ValueError, UnicodeDecodeError) as error:
-            fail(f"cannot parse {label} ls-tree record: {error}")
-        require(path not in records, f"{label} contains duplicate Git path {path}")
-        require(path in expected_paths, f"{label} contains unexpected Git path {path}")
-        require(
-            mode in {"100644", "100755"} and kind == "blob",
-            f"{label} contains non-regular Git entry {path}: {mode} {kind}",
-        )
-        require(
-            re.fullmatch(r"[0-9a-f]{40,64}", oid) is not None,
-            f"{label} blob id is malformed for {path}",
-        )
-        records[path] = (mode, oid)
+def require_matching_c83_trees(
+    external: dict[str, bytes], frozen: dict[str, bytes]
+) -> None:
     require(
-        set(records) == expected_paths,
-        f"{label} Git members differ: {sorted(set(records) ^ expected_paths)}",
+        external == frozen,
+        "C8.3 evidence differs byte-for-byte from the frozen C8.4 source",
     )
-    return records
-
-
-def committed_c83_files(c84_source: str) -> tuple[dict[str, bytes], str]:
-    c84_source = resolve_full_commit(c84_source, "C8.4 preparation commit")
-    prefix = "benchmarks/wasm-runtime/"
-    expected_paths = {prefix + relative for relative in C83_RELATIVE_FILES}
-    records = parse_ls_tree_records(
-        git_bytes(
-            [
-                "ls-tree",
-                "-rz",
-                "--full-tree",
-                c84_source,
-                "--",
-                "benchmarks/wasm-runtime",
-            ],
-            "C8.3 tree listing",
-        ),
-        expected_paths,
-        "C8.3 tree listing",
-    )
-    tree_oid = (
-        git_bytes(
-            ["rev-parse", "--verify", f"{c84_source}:benchmarks/wasm-runtime"],
-            "C8.3 Git tree identity",
-        )
-        .decode()
-        .strip()
-    )
-    require(
-        re.fullmatch(r"[0-9a-f]{40,64}", tree_oid) is not None,
-        "C8.3 Git tree id is malformed",
-    )
-    result: dict[str, bytes] = {}
-    for relative in C83_RELATIVE_FILES:
-        _mode, oid = records[prefix + relative]
-        result[relative] = git_bytes(
-            ["cat-file", "blob", oid], f"C8.3 committed blob {relative}"
-        )
-    return result, tree_oid
-
-
-def materialize_commit_snapshot(c84_source: str, destination: pathlib.Path) -> None:
-    import io
-    import tarfile
-
-    archive = git_bytes(
-        ["archive", "--format=tar", c84_source], "C8.4 preparation archive"
-    )
-    root = destination.resolve(strict=True)
-    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
-        for member in bundle.getmembers():
-            path = pathlib.PurePosixPath(member.name)
-            require(
-                not path.is_absolute() and ".." not in path.parts,
-                f"Git archive contains unsafe path {member.name!r}",
-            )
-            target = root.joinpath(*path.parts)
-            require(
-                target == root or root in target.parents,
-                f"Git archive path escapes snapshot: {member.name!r}",
-            )
-            if member.isdir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-            require(
-                member.isreg(),
-                f"Git archive contains non-regular entry {member.name!r}",
-            )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            source = bundle.extractfile(member)
-            require(
-                source is not None, f"cannot read Git archive member {member.name!r}"
-            )
-            raw = source.read()
-            with target.open("xb") as output:
-                output.write(raw)
-            target.chmod(member.mode & 0o777)
 
 
 def verify_c83_precondition(
@@ -1093,44 +1424,65 @@ def verify_c83_precondition(
     c83_source: str,
     c83_challenge: str,
 ) -> dict[str, Any]:
+    c84_source = canonical_source(c84_source, "C8.4 preparation commit")
     c83_source = canonical_source(c83_source, "expected C8.3 source")
     c83_challenge = canonical_challenge(c83_challenge, "expected C8.3 challenge")
-    current = validate_real_directory_tree(root, C83_RELATIVE_FILES, "C8.3 evidence")
-    committed, tree_oid = committed_c83_files(c84_source)
-    for relative in C83_RELATIVE_FILES:
-        require(
-            current[relative] == committed[relative],
-            f"C8.3 {relative} differs from C8.4 preparation commit",
+    frozen_root = ROOT / "benchmarks/wasm-runtime"
+    external = validate_real_directory_tree(root, C83_RELATIVE_FILES, "C8.3 evidence")
+    frozen = validate_real_directory_tree(
+        frozen_root, C83_RELATIVE_FILES, "frozen-source C8.3 evidence"
+    )
+    require_matching_c83_trees(external, frozen)
+    head = frozen_git_bytes(["rev-parse", "HEAD"], "C8.4 source HEAD")
+    require(
+        head.decode().strip() == c84_source,
+        "frozen C8.4 source HEAD differs from the supplied commit",
+    )
+    tree_oid = (
+        frozen_git_bytes(
+            ["rev-parse", "--verify", f"{c84_source}:benchmarks/wasm-runtime"],
+            "C8.3 tree identity",
         )
-    import tempfile
-
-    trusted_temp = pathlib.Path(tempfile.gettempdir()).resolve(strict=True)
-    with tempfile.TemporaryDirectory(
-        prefix="vibeos-c84-c83-snapshot-", dir=trusted_temp
-    ) as name:
-        snapshot = pathlib.Path(name)
-        materialize_commit_snapshot(c84_source, snapshot)
-        snapshot_verifier = snapshot / "scripts/verify-c83-evidence.py"
-        committed_verifier = stable_regular_bytes(
-            snapshot_verifier, "snapshot C8.3 evidence verifier"
-        )
-        run_checked(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(snapshot_verifier),
-                "--evidence-root",
-                str(snapshot / "benchmarks/wasm-runtime"),
-                "--expect-source",
-                c83_source,
-                "--expect-challenge",
-                c83_challenge,
-            ],
-            cwd=snapshot,
-            label="independent immutable-snapshot C8.3 evidence verifier",
-        )
-    summary = strict_json_bytes(current["qemu/summary.json"], "C8.3 QEMU summary")
+        .decode()
+        .strip()
+    )
+    require(
+        re.fullmatch(r"[0-9a-f]{40,64}", tree_oid) is not None,
+        "frozen-source C8.3 Git tree id is malformed",
+    )
+    verifier = C83_EVIDENCE_VERIFIER
+    verifier_raw = stable_regular_bytes(verifier, "frozen-source C8.3 verifier")
+    run_checked(
+        [
+            sys.executable,
+            "-I",
+            "-B",
+            str(verifier),
+            "--evidence-root",
+            str(frozen_root),
+            "--expect-source",
+            c83_source,
+            "--expect-challenge",
+            c83_challenge,
+        ],
+        cwd=ROOT,
+        label="frozen-source complete C8.3 evidence verifier",
+    )
+    external_closed = validate_real_directory_tree(
+        root, C83_RELATIVE_FILES, "closed C8.3 evidence"
+    )
+    frozen_closed = validate_real_directory_tree(
+        frozen_root, C83_RELATIVE_FILES, "closed frozen-source C8.3 evidence"
+    )
+    require(external_closed == external, "C8.3 evidence changed during verification")
+    require(frozen_closed == frozen, "frozen C8.3 evidence changed during verification")
+    require_matching_c83_trees(external_closed, frozen_closed)
+    require(
+        stable_regular_bytes(verifier, "closed frozen-source C8.3 verifier")
+        == verifier_raw,
+        "frozen C8.3 verifier changed during verification",
+    )
+    summary = strict_json_bytes(frozen["qemu/summary.json"], "C8.3 QEMU summary")
     require(isinstance(summary, dict), "C8.3 QEMU summary is not an object")
     require(summary.get("source_commit") == c83_source, "C8.3 summary source differs")
     require(summary.get("challenge") == c83_challenge, "C8.3 summary challenge differs")
@@ -1141,16 +1493,16 @@ def verify_c83_precondition(
         "challenge": c83_challenge,
         "run_id": run_id,
         "tree_digest_algorithm": "sha256(domain-NUL,path-NUL,length-NUL,bytes)*",
-        "tree_sha256": canonical_tree_digest(current),
+        "tree_sha256": canonical_tree_digest(frozen),
         "git_tree_oid": tree_oid,
         "results": {
-            "sha256": sha256_bytes(current["RESULTS.md"]),
-            "bytes": len(current["RESULTS.md"]),
+            "sha256": sha256_bytes(frozen["RESULTS.md"]),
+            "bytes": len(frozen["RESULTS.md"]),
         },
         "verifier": {
             "path": "scripts/verify-c83-evidence.py",
-            "sha256": sha256_bytes(committed_verifier),
-            "bytes": len(committed_verifier),
+            "sha256": sha256_bytes(verifier_raw),
+            "bytes": len(verifier_raw),
         },
         "c84_preparation_commit": c84_source,
         "commit_tree_byte_match": True,
@@ -1205,24 +1557,6 @@ def load_campaign_contract() -> tuple[dict[str, Any], dict[str, Any]]:
     return manifest, schema
 
 
-def validate_source_attestation(value: Any, source: str, label: str) -> dict[str, Any]:
-    record = exact(value, {"root", "head", "worktree_clean", "status_policy"}, label)
-    require(
-        isinstance(record["root"], str)
-        and pathlib.PurePath(record["root"]).is_absolute(),
-        f"{label}.root is not absolute",
-    )
-    require(
-        record["head"] == source and record["worktree_clean"] is True,
-        f"{label} is not clean/exact",
-    )
-    require(
-        record["status_policy"] == STRICT_STATUS_POLICY,
-        f"{label} status policy differs",
-    )
-    return record
-
-
 def validate_timestamp_record(value: Any, keys: set[str], label: str) -> dict[str, Any]:
     record = exact(value, keys, label)
     parsed: list[datetime.datetime] = []
@@ -1246,7 +1580,10 @@ def validate_timestamp_record(value: Any, keys: set[str], label: str) -> dict[st
 
 
 def validate_build_content(
-    build: dict[str, Any], source: str, challenge: str
+    build: dict[str, Any],
+    source: str,
+    challenge: str,
+    source_materialization: dict[str, Any],
 ) -> tuple[str, dict[str, dict[str, Any]]]:
     exact(
         build,
@@ -1275,66 +1612,14 @@ def validate_build_content(
     run_id = canonical_sha(build["run_id"], "C8.4 build run id")
     source_record = exact(
         build["source"],
-        {
-            "root",
-            "head",
-            "superproject_clean",
-            "status_policy",
-            "jitterentropy",
-            "sunset",
-        },
+        {"root", "head", "materialization"},
         "C8.4 build source",
     )
     require(
         source_record["root"] == "."
         and source_record["head"] == source
-        and source_record["superproject_clean"] is True
-        and source_record["status_policy"] == BUILD_STATUS_POLICY,
+        and source_record["materialization"] == source_materialization,
         "C8.4 build source attestation differs",
-    )
-    jitter = exact(
-        source_record["jitterentropy"],
-        {
-            "path",
-            "head",
-            "patch_sha256",
-            "patch_bytes",
-            "observed_diff_sha256",
-            "observed_diff_bytes",
-            "policy",
-        },
-        "C8.4 build jitterentropy source",
-    )
-    require(
-        jitter["path"] == "vendor/jitterentropy-rs"
-        and jitter["head"] == JITTERENTROPY_HEAD,
-        "C8.4 jitterentropy path/head differs",
-    )
-    canonical_sha(jitter["patch_sha256"], "C8.4 jitterentropy patch")
-    canonical_sha(jitter["observed_diff_sha256"], "C8.4 jitterentropy observed diff")
-    integer(jitter["patch_bytes"], "C8.4 jitterentropy patch bytes", minimum=1)
-    integer(jitter["observed_diff_bytes"], "C8.4 jitterentropy diff bytes", minimum=1)
-    require(
-        jitter["patch_sha256"] == jitter["observed_diff_sha256"]
-        and jitter["patch_bytes"] == jitter["observed_diff_bytes"],
-        "C8.4 jitterentropy reviewed delta differs",
-    )
-    require(
-        jitter["policy"]
-        == "exact recorded patch verified by prepare-jitterentropy-rs.sh",
-        "C8.4 jitterentropy policy differs",
-    )
-    sunset = exact(
-        source_record["sunset"],
-        {"path", "head", "worktree_clean", "status_policy"},
-        "C8.4 build sunset source",
-    )
-    require(
-        sunset["path"] == "vendor/sunset"
-        and sunset["head"] == SUNSET_HEAD
-        and sunset["worktree_clean"] is True
-        and sunset["status_policy"] == STRICT_STATUS_POLICY,
-        "C8.4 sunset attestation differs",
     )
 
     toolchain = exact(
@@ -1518,69 +1803,20 @@ def validate_build_content(
     return run_id, artifacts
 
 
-def validate_package_source(value: Any, source: str) -> dict[str, Any]:
+def validate_package_source(
+    value: Any, source: str, source_materialization: dict[str, Any]
+) -> dict[str, Any]:
     record = exact(
         value,
-        {
-            "root",
-            "head",
-            "superproject_clean",
-            "status_policy",
-            "jitterentropy",
-            "sunset",
-        },
+        {"root", "head", "materialization"},
         "C8.4 package source",
     )
     canonical_absolute_recorded_path(record["root"], "C8.4 package source root")
     require(
-        record["head"] == source
-        and record["superproject_clean"] is True
-        and record["status_policy"] == BUILD_STATUS_POLICY,
+        record["root"] == RUNTIME_SOURCE_ROOT
+        and record["head"] == source
+        and record["materialization"] == source_materialization,
         "C8.4 package source attestation differs",
-    )
-    jitter = exact(
-        record["jitterentropy"],
-        {
-            "path",
-            "head",
-            "patch_sha256",
-            "patch_bytes",
-            "observed_diff_sha256",
-            "observed_diff_bytes",
-            "policy",
-        },
-        "C8.4 package jitterentropy source",
-    )
-    canonical_absolute_recorded_path(jitter["path"], "C8.4 package jitterentropy path")
-    require(
-        jitter["head"] == JITTERENTROPY_HEAD, "C8.4 package jitterentropy head differs"
-    )
-    canonical_sha(jitter["patch_sha256"], "C8.4 package jitterentropy patch")
-    canonical_sha(jitter["observed_diff_sha256"], "C8.4 package jitterentropy diff")
-    integer(jitter["patch_bytes"], "C8.4 package jitterentropy patch bytes", minimum=1)
-    integer(
-        jitter["observed_diff_bytes"],
-        "C8.4 package jitterentropy diff bytes",
-        minimum=1,
-    )
-    require(
-        jitter["patch_sha256"] == jitter["observed_diff_sha256"]
-        and jitter["patch_bytes"] == jitter["observed_diff_bytes"]
-        and jitter["policy"]
-        == "exact recorded patch verified by prepare-jitterentropy-rs.sh",
-        "C8.4 package reviewed delta differs",
-    )
-    sunset = exact(
-        record["sunset"],
-        {"path", "head", "worktree_clean", "status_policy"},
-        "C8.4 package sunset source",
-    )
-    canonical_absolute_recorded_path(sunset["path"], "C8.4 package sunset path")
-    require(
-        sunset["head"] == SUNSET_HEAD
-        and sunset["worktree_clean"] is True
-        and sunset["status_policy"] == STRICT_STATUS_POLICY,
-        "C8.4 package sunset attestation differs",
     )
     return record
 
@@ -1666,13 +1902,6 @@ def validate_package_recorded_paths(
     )
     recorded_sdk_root = canonical_absolute_recorded_path(
         sdk["root"], "C8.4 package SDK root"
-    )
-    require(
-        package_source["jitterentropy"]["path"]
-        == str(recorded_source_root / "vendor/jitterentropy-rs")
-        and package_source["sunset"]["path"]
-        == str(recorded_source_root / "vendor/sunset"),
-        "C8.4 package submodule paths are not closed under the source root",
     )
     recorded_kernel_elf = canonical_absolute_recorded_path(
         artifacts["kernel_elf"]["path"], "C8.4 package kernel ELF path"
@@ -1769,7 +1998,9 @@ class PackageEvidence:
     run_id: str
 
 
-def validate_package_evidence(source: str, challenge: str) -> PackageEvidence:
+def validate_package_evidence(
+    source: str, challenge: str, provenance: ProvenanceEvidence
+) -> PackageEvidence:
     package_raw = stable_regular_bytes(
         CANONICAL_PACKAGE_ENVELOPE, "C8.4 package envelope", maximum=16_777_216
     )
@@ -1783,13 +2014,17 @@ def validate_package_evidence(source: str, challenge: str) -> PackageEvidence:
         strict_json_bytes(package_raw, "C8.4 package envelope"),
         "vibeos.c84.duo-wasm-aot-profile.package-envelope",
         "C8.4 package envelope",
+        version=2,
     )
     build_root, build = canonical_content_envelope(
         strict_json_bytes(build_raw, "C8.4 build envelope"),
         "vibeos.c84.duo-wasm-aot-profile.build-envelope",
         "C8.4 build envelope",
+        version=2,
     )
-    run_id, build_artifacts = validate_build_content(build, source, challenge)
+    run_id, build_artifacts = validate_build_content(
+        build, source, challenge, provenance.source_root
+    )
     expected_run_id = campaign_run_id(
         source,
         challenge,
@@ -1811,6 +2046,7 @@ def validate_package_evidence(source: str, challenge: str) -> PackageEvidence:
             "challenge",
             "run_id",
             "source",
+            "runtime_attestation",
             "sdk",
             "build",
             "command",
@@ -1828,15 +2064,23 @@ def validate_package_evidence(source: str, challenge: str) -> PackageEvidence:
         "C8.4 package identity differs",
     )
     require_run_id_binding(expected_run_id, build=run_id, package=package["run_id"])
-    package_source = validate_package_source(package["source"], source)
+    package_source = validate_package_source(
+        package["source"], source, provenance.source_root
+    )
+    require(
+        package["runtime_attestation"] == provenance.package_attestation_root,
+        "C8.4 package runtime attestation differs from the live attestation",
+    )
     sdk = exact(
         package["sdk"],
         {
             "root",
             "commit",
             "commit_provenance",
-            "declared_container_digest",
-            "container_digest_provenance",
+            "image_digest",
+            "image_id",
+            "platform",
+            "runtime_provenance",
             "worktree_clean",
             "status_policy",
         },
@@ -1845,14 +2089,16 @@ def validate_package_evidence(source: str, challenge: str) -> PackageEvidence:
     canonical_absolute_recorded_path(sdk["root"], "C8.4 SDK root")
     require(sdk["commit"] == SDK_COMMIT, f"C8.4 SDK commit must be {SDK_COMMIT}")
     require(
-        sdk["declared_container_digest"] == SDK_CONTAINER_DIGEST,
+        sdk["image_digest"] == SDK_CONTAINER_DIGEST,
         f"C8.4 SDK container digest must be {SDK_CONTAINER_DIGEST}",
     )
     require(
-        sdk["commit_provenance"]
-        == "operator-declared; local checkout HEAD equality verified"
-        and sdk["container_digest_provenance"]
-        == "operator-declared; runtime container identity not attested",
+        sdk["root"] == RUNTIME_SDK_ROOT
+        and sdk["commit_provenance"]
+        == "host-observed read-only SDK mount; in-container Git HEAD and clean worktree verified"
+        and sdk["runtime_provenance"] == RUNTIME_CAPABILITY
+        and sdk["image_id"] == provenance.closure_root["content"]["image"]["id"]
+        and sdk["platform"] == SDK_CONTAINER_PLATFORM,
         "C8.4 SDK provenance differs",
     )
     require(
@@ -1922,6 +2168,7 @@ def validate_package_evidence(source: str, challenge: str) -> PackageEvidence:
         == [
             "scripts/verify-milkv-duo-image.sh",
             "--wasm-aot-profile",
+            "--package-preflight",
             "--artifact-root=<staging-artifact-root>",
             "<sdk-root>",
         ],
@@ -1946,6 +2193,8 @@ def validate_package_evidence(source: str, challenge: str) -> PackageEvidence:
         audit_raw,
         source=source,
         challenge=challenge,
+        source_materialization=provenance.source_root,
+        runtime_attestation=provenance.package_attestation_root,
         artifacts=artifacts,
         tools=tools,
         label="C8.4 package image audit",
@@ -1954,13 +2203,6 @@ def validate_package_evidence(source: str, challenge: str) -> PackageEvidence:
         verifier["report"] == audit_report
         and verifier["report_sha256"] == audit_report_sha256,
         "C8.4 package verifier report binding differs",
-    )
-    require(
-        package_source["jitterentropy"]["patch_sha256"]
-        == tools["jitterentropy_patch"]["sha256"]
-        and package_source["jitterentropy"]["patch_bytes"]
-        == tools["jitterentropy_patch"]["bytes"],
-        "C8.4 package source/tool patch binding differs",
     )
     timestamps = exact(
         package["timestamps_utc"],
@@ -2664,6 +2906,30 @@ def atomic_publish_directory(stage: pathlib.Path, final: pathlib.Path) -> None:
         os.close(parent_fd)
 
 
+def validate_capture_output_tree(root: pathlib.Path) -> None:
+    try:
+        root_info = root.lstat()
+        entries = list(root.iterdir())
+    except OSError as error:
+        fail(f"cannot inspect C8.4 capture output tree {root}: {error}")
+    require(
+        stat.S_ISDIR(root_info.st_mode) and not stat.S_ISLNK(root_info.st_mode),
+        "C8.4 capture output root is not a fixed directory",
+    )
+    require(
+        {entry.name for entry in entries} == CAPTURE_OUTPUT_FILES,
+        "C8.4 capture output file set is not closed",
+    )
+    for entry in entries:
+        info = entry.lstat()
+        require(
+            stat.S_ISREG(info.st_mode)
+            and not stat.S_ISLNK(info.st_mode)
+            and info.st_nlink == 1,
+            f"C8.4 capture output entry is not a single-link regular file: {entry}",
+        )
+
+
 def output_directory(path: pathlib.Path) -> pathlib.Path:
     absolute = absolute_no_symlink_path(
         path, "capture output", leaf_may_be_missing=True
@@ -2678,7 +2944,7 @@ def output_directory(path: pathlib.Path) -> pathlib.Path:
     except ValueError:
         pass
     else:
-        fail(f"capture output must be outside the clean checkout: {absolute}")
+        fail(f"capture output must be outside the frozen source tree: {absolute}")
     return absolute
 
 
@@ -2697,12 +2963,13 @@ def positive_timeout(value: Any) -> float:
 
 def run_capture(arguments: argparse.Namespace) -> pathlib.Path:
     global _ACTIVE_CAPTURE_STAGE
+    source = canonical_source(arguments.source_commit, "C8.4 source commit")
+    challenge = canonical_challenge(arguments.challenge, "C8.4 challenge")
+    provenance = validate_live_provenance(source, challenge)
     require(
         sys.stdin.isatty(),
         "physical cold-boot confirmations require an interactive terminal",
     )
-    source = canonical_source(arguments.source_commit, "C8.4 source commit")
-    challenge = canonical_challenge(arguments.challenge, "C8.4 challenge")
     c83_source = canonical_source(arguments.expect_c83_source, "expected C8.3 source")
     c83_challenge = canonical_challenge(
         arguments.expect_c83_challenge, "expected C8.3 challenge"
@@ -2714,7 +2981,6 @@ def run_capture(arguments: argparse.Namespace) -> pathlib.Path:
     timeout = positive_timeout(arguments.timeout_seconds)
     final_output = output_directory(arguments.output_dir)
     canonical_artifact_arguments(arguments)
-    head = git_preflight(source)
     load_campaign_contract()
     requested_port, resolved_port = validate_serial_path(arguments.port)
     c83_root = absolute_no_symlink_path(
@@ -2726,12 +2992,14 @@ def run_capture(arguments: argparse.Namespace) -> pathlib.Path:
         c83_source=c83_source,
         c83_challenge=c83_challenge,
     )
-    package = validate_package_evidence(source, challenge)
+    package = validate_package_evidence(source, challenge, provenance)
     tool_identities = {
         "capture_script": file_identity(SCRIPT_PATH),
         "single_boot_verifier": file_identity(C84_VERIFIER),
         "final_evidence_verifier": file_identity(C84_EVIDENCE_VERIFIER),
         "c83_evidence_verifier": file_identity(C83_EVIDENCE_VERIFIER),
+        "source_materializer_script": file_identity(C84_SOURCE_MATERIALIZER),
+        "docker_runtime_script": file_identity(C84_DOCKER_RUNTIME),
         "manifest": file_identity(C84_MANIFEST),
         "transcript_schema": file_identity(C84_TRANSCRIPT_SCHEMA),
         "evidence_schema": file_identity(C84_EVIDENCE_SCHEMA),
@@ -2752,6 +3020,29 @@ def run_capture(arguments: argparse.Namespace) -> pathlib.Path:
     copied_audit = write_bytes_exclusive(
         output / "package-image-verifier-audit.log", package.audit_bytes
     )
+    copied_source = write_bytes_exclusive(
+        output / "source-materialization-envelope.json", provenance.source_bytes
+    )
+    copied_package_attestation = write_bytes_exclusive(
+        output / "container-runtime-attestation.json",
+        provenance.package_attestation_bytes,
+    )
+    copied_verifier_attestation = write_bytes_exclusive(
+        output / "container-runtime-verifier-attestation.json",
+        provenance.verifier_attestation_bytes,
+    )
+    copied_runtime_closure = write_bytes_exclusive(
+        output / "container-runtime-closure.json", provenance.closure_bytes
+    )
+    copied_custody = {
+        "build-envelope.json": copied_build,
+        "package-envelope.json": copied_package,
+        "package-image-verifier-audit.log": copied_audit,
+        "source-materialization-envelope.json": copied_source,
+        "container-runtime-attestation.json": copied_package_attestation,
+        "container-runtime-verifier-attestation.json": copied_verifier_attestation,
+        "container-runtime-closure.json": copied_runtime_closure,
+    }
     boots: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
     run_id: str | None = None
@@ -2807,12 +3098,16 @@ def run_capture(arguments: argparse.Namespace) -> pathlib.Path:
     require(run_id is not None, "capture has no run id")
     require_distinct_boot_files(boots)
     cross, pooled = aggregate_summaries(summaries)
-    package_closed = validate_package_evidence(source, challenge)
+    provenance_closed = validate_live_provenance(source, challenge)
+    require(
+        provenance_closed == provenance,
+        "source materialization or container runtime custody changed during capture",
+    )
+    package_closed = validate_package_evidence(source, challenge, provenance_closed)
     require(
         package_closed == package,
         "package evidence or artifacts changed during capture",
     )
-    require(git_preflight(source) == head, "C8.4 source changed during capture")
     c83_closed = verify_c83_precondition(
         c83_root,
         c84_source=source,
@@ -2825,11 +3120,19 @@ def run_capture(arguments: argparse.Namespace) -> pathlib.Path:
             file_identity(path) == artifacts[key],
             f"C8.4 artifact {key} changed during capture",
         )
+    for filename, expected in copied_custody.items():
+        same_identity(
+            file_identity(output / filename, f"copied C8.4 custody file {filename}"),
+            expected,
+            f"copied C8.4 custody file {filename}",
+        )
     for key, path in {
         "capture_script": SCRIPT_PATH,
         "single_boot_verifier": C84_VERIFIER,
         "final_evidence_verifier": C84_EVIDENCE_VERIFIER,
         "c83_evidence_verifier": C83_EVIDENCE_VERIFIER,
+        "source_materializer_script": C84_SOURCE_MATERIALIZER,
+        "docker_runtime_script": C84_DOCKER_RUNTIME,
         "manifest": C84_MANIFEST,
         "transcript_schema": C84_TRANSCRIPT_SCHEMA,
         "evidence_schema": C84_EVIDENCE_SCHEMA,
@@ -2841,7 +3144,7 @@ def run_capture(arguments: argparse.Namespace) -> pathlib.Path:
     content = {
         "platform": PLATFORM,
         "source_commit": source,
-        "git_head": head,
+        "git_head": source,
         "challenge": challenge,
         "run_id": run_id,
         "workload_id": WORKLOAD_ID,
@@ -2862,6 +3165,32 @@ def run_capture(arguments: argparse.Namespace) -> pathlib.Path:
                 "file": "package-image-verifier-audit.log",
                 **copied_audit,
             },
+            "source_materialization_envelope": {
+                "file": "source-materialization-envelope.json",
+                "content_sha256": provenance.source_root["content_sha256"],
+                **copied_source,
+            },
+            "package_runtime_attestation": {
+                "file": "container-runtime-attestation.json",
+                "content_sha256": provenance.package_attestation_root["content_sha256"],
+                **copied_package_attestation,
+            },
+            "verifier_runtime_attestation": {
+                "file": "container-runtime-verifier-attestation.json",
+                "content_sha256": provenance.verifier_attestation_root[
+                    "content_sha256"
+                ],
+                **copied_verifier_attestation,
+            },
+            "container_runtime_closure": {
+                "file": "container-runtime-closure.json",
+                "content_sha256": provenance.closure_root["content_sha256"],
+                **copied_runtime_closure,
+            },
+        },
+        "provenance": {
+            "source_materialization": provenance.source_root,
+            "container_runtime": provenance.closure_root,
         },
         "capture": {
             "started_utc": started_utc,
@@ -2884,13 +3213,37 @@ def run_capture(arguments: argparse.Namespace) -> pathlib.Path:
         },
         "evidence_tools": tool_identities,
     }
-    envelope = make_content_envelope(
-        "vibeos.c84.duo-aot-decision.capture-envelope", content
-    )
+    envelope = make_content_envelope(CAPTURE_ENVELOPE_SCHEMA, content, version=2)
     envelope_identity = write_json_exclusive_atomic(
         output / "capture-envelope.json", envelope
     )
+    validate_capture_output_tree(output)
+    for filename, expected in copied_custody.items():
+        same_identity(
+            file_identity(output / filename, f"copied C8.4 custody file {filename}"),
+            expected,
+            f"copied C8.4 custody file {filename}",
+        )
+    require(
+        validate_live_provenance(source, challenge) == provenance,
+        "source materialization or container runtime custody changed before publication",
+    )
+    for filename, expected in copied_custody.items():
+        same_identity(
+            file_identity(output / filename, f"copied C8.4 custody file {filename}"),
+            expected,
+            f"copied C8.4 custody file {filename}",
+        )
     atomic_publish_directory(output, final_output)
+    validate_capture_output_tree(final_output)
+    for filename, expected in copied_custody.items():
+        same_identity(
+            file_identity(
+                final_output / filename, f"published C8.4 custody file {filename}"
+            ),
+            expected,
+            f"published C8.4 custody file {filename}",
+        )
     _ACTIVE_CAPTURE_STAGE = None
     print(
         f"PASS C8.4 physical capture boots=3 retained=63 source={source} challenge={challenge} "
@@ -2937,6 +3290,18 @@ def synthetic_stream_lines() -> bytes:
 
 
 def selftest() -> None:
+    require(
+        not image_audit_transcript_has_failure(
+            ["normal verifier output", '{"path":"/tmp/fail/source"}', C84_IMAGE_PASS]
+        ),
+        "structured image audit status word was treated as transcript failure",
+    )
+    require(
+        image_audit_transcript_has_failure(
+            ["fatal: verifier crashed", "{}", C84_IMAGE_PASS]
+        ),
+        "non-structured image audit failure was not detected",
+    )
     good = synthetic_stream_lines()
     parser = TranscriptStream("a" * 40, "b" * 64)
     midpoint = len(good) // 2
@@ -3178,6 +3543,18 @@ def selftest() -> None:
         pass
     else:
         fail("selftest accepted boolean content-envelope version")
+    v2_envelope = make_content_envelope("vibeos.test-v2", {"answer": 42}, version=2)
+    canonical_content_envelope(
+        v2_envelope, "vibeos.test-v2", "v2 selftest envelope", version=2
+    )
+    try:
+        canonical_content_envelope(
+            v2_envelope, "vibeos.test-v2", "v2-as-v1 selftest envelope"
+        )
+    except CaptureError:
+        pass
+    else:
+        fail("selftest accepted a v2 content envelope as v1")
     try:
         strict_json_bytes(b'{"value":1e999}', "infinite-number selftest JSON")
     except CaptureError:
@@ -3197,16 +3574,195 @@ def selftest() -> None:
         "tree digest ignored changed bytes",
     )
 
+    provenance_source = "a" * 40
+    provenance_challenge = "b" * 64
+    source_root = make_content_envelope(
+        SOURCE_MATERIALIZATION_SCHEMA,
+        {
+            "bundles": [],
+            "challenge": provenance_challenge,
+            "clone_git_admin": {},
+            "command": [],
+            "frozen": {},
+            "git": {"path": "/opt/failure-tools/git"},
+            "independence": {},
+            "materialization": {},
+            "patch": {},
+            "snapshot": {},
+            "source": {},
+            "source_commit": provenance_source,
+            "submodules": [],
+            "timestamps_utc": {},
+        },
+    )
+
+    def synthetic_attestation(mode: str, marker: str) -> dict[str, Any]:
+        return make_content_envelope(
+            RUNTIME_ATTESTATION_SCHEMA,
+            {
+                "capability": RUNTIME_CAPABILITY,
+                "challenge": provenance_challenge,
+                "host_preinspect": {"marker": marker},
+                "host_preinspect_identity": {"sha256": marker * 64, "bytes": 1},
+                "mode": mode,
+                "source_commit": provenance_source,
+                "source_materialization_content_sha256": source_root["content_sha256"],
+                "witness": {"marker": marker},
+            },
+        )
+
+    package_attestation = synthetic_attestation("package", "c")
+    verifier_attestation = synthetic_attestation("verify", "d")
+
+    def root_file_identity(root: dict[str, Any]) -> dict[str, Any]:
+        raw = (
+            json.dumps(root, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            + b"\n"
+        )
+        return {"sha256": sha256_bytes(raw), "bytes": len(raw)}
+
+    package_attestation_identity = root_file_identity(package_attestation)
+    verifier_attestation_identity = root_file_identity(verifier_attestation)
+
+    def runtime_record(filename: str, marker: str) -> dict[str, Any]:
+        return {"path": filename, "sha256": marker * 64, "bytes": 1}
+
+    runtime_artifacts = {
+        role: runtime_record(filename, f"{index + 1:x}")
+        for index, (role, filename) in enumerate(RUNTIME_ARTIFACT_FILES.items())
+    }
+    runtime_artifacts["package_attestation"] = {
+        "path": RUNTIME_ARTIFACT_FILES["package_attestation"],
+        **package_attestation_identity,
+    }
+    runtime_artifacts["verifier_attestation"] = {
+        "path": RUNTIME_ARTIFACT_FILES["verifier_attestation"],
+        **verifier_attestation_identity,
+    }
+
+    def synthetic_run(
+        mode: str,
+        container_id: str,
+        root: dict[str, Any],
+        identity: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "attestation": root,
+            "attestation_identity": identity,
+            "container_id": container_id,
+            "container_postinspect": {},
+            "container_preinspect": {},
+            "host_preinspect": {},
+            "host_preinspect_identity": {"sha256": "e" * 64, "bytes": 1},
+            "operations": {},
+            "wait_exit_code": 0,
+        }
+
+    closure_root = make_content_envelope(
+        RUNTIME_CLOSURE_SCHEMA,
+        {
+            "artifacts": runtime_artifacts,
+            "capability": RUNTIME_CAPABILITY,
+            "challenge": provenance_challenge,
+            "image": {
+                "architecture": "amd64",
+                "descriptor": {},
+                "id": "sha256:" + "9" * 64,
+                "inspect": {},
+                "os": "linux",
+                "reference": SDK_CONTAINER_REFERENCE,
+                "repo_digest": SDK_CONTAINER_REFERENCE,
+            },
+            "package": {
+                "build_envelope": runtime_record("build-envelope.json", "5"),
+                "image_verifier_audit": runtime_record("image-verifier-audit.log", "6"),
+                "package_envelope": runtime_record("package-envelope.json", "7"),
+            },
+            "platform": SDK_CONTAINER_PLATFORM,
+            "runs": {
+                "package": synthetic_run(
+                    "package",
+                    "a" * 64,
+                    package_attestation,
+                    package_attestation_identity,
+                ),
+                "verifier": synthetic_run(
+                    "verify",
+                    "b" * 64,
+                    verifier_attestation,
+                    verifier_attestation_identity,
+                ),
+            },
+            "sdk_mount": {
+                "destination": RUNTIME_SDK_ROOT,
+                "kind": "volume",
+                "read_only": True,
+                "source": "synthetic-sdk",
+            },
+            "source": {
+                "materialization_content_sha256": source_root["content_sha256"],
+                "root": str(ROOT),
+            },
+            "source_commit": provenance_source,
+        },
+    )
+    provenance_arguments = {
+        "source": provenance_source,
+        "challenge": provenance_challenge,
+        "source_root": source_root,
+        "package_attestation": package_attestation,
+        "verifier_attestation": verifier_attestation,
+        "closure_root": closure_root,
+        "package_attestation_identity": package_attestation_identity,
+        "verifier_attestation_identity": verifier_attestation_identity,
+    }
+    validate_provenance_roots(**provenance_arguments)
+    provenance_rejected = 0
+    provenance_mutations: list[tuple[str, dict[str, Any]]] = []
+    wrong_source = json.loads(json.dumps(source_root))
+    wrong_source["content"]["challenge"] = "f" * 64
+    wrong_source = make_content_envelope(
+        SOURCE_MATERIALIZATION_SCHEMA, wrong_source["content"]
+    )
+    provenance_mutations.append(("source campaign", {"source_root": wrong_source}))
+    wrong_package = json.loads(json.dumps(package_attestation))
+    wrong_package["content"]["mode"] = "verify"
+    wrong_package = make_content_envelope(
+        RUNTIME_ATTESTATION_SCHEMA, wrong_package["content"]
+    )
+    provenance_mutations.append(
+        ("package attestation mode", {"package_attestation": wrong_package})
+    )
+    reused = json.loads(json.dumps(closure_root))
+    reused["content"]["runs"]["verifier"]["container_id"] = "a" * 64
+    reused = make_content_envelope(RUNTIME_CLOSURE_SCHEMA, reused["content"])
+    provenance_mutations.append(("reused container", {"closure_root": reused}))
+    swapped = json.loads(json.dumps(closure_root))
+    swapped["content"]["runs"]["verifier"]["attestation"] = package_attestation
+    swapped = make_content_envelope(RUNTIME_CLOSURE_SCHEMA, swapped["content"])
+    provenance_mutations.append(("swapped attestation", {"closure_root": swapped}))
+    old_runtime = json.loads(json.dumps(closure_root))
+    old_runtime["content"]["capability"] = (
+        "operator-declared; runtime container identity not attested"
+    )
+    old_runtime = make_content_envelope(RUNTIME_CLOSURE_SCHEMA, old_runtime["content"])
+    provenance_mutations.append(("old runtime proof", {"closure_root": old_runtime}))
+    for label, changes in provenance_mutations:
+        try:
+            validate_provenance_roots(**{**provenance_arguments, **changes})
+        except CaptureError:
+            provenance_rejected += 1
+        else:
+            fail(f"selftest accepted provenance mutation {label}")
+    require(
+        provenance_rejected == len(provenance_mutations),
+        "provenance mutation rejection count differs",
+    )
+
     recorded_source_root = pathlib.PurePosixPath("/producer/vibeos")
     recorded_sdk_root = pathlib.PurePosixPath("/producer/sdk")
     recorded_artifact_root = recorded_source_root / "target/milkv-duo-wasm-aot-profile"
-    package_source_paths = {
-        "root": str(recorded_source_root),
-        "jitterentropy": {
-            "path": str(recorded_source_root / "vendor/jitterentropy-rs")
-        },
-        "sunset": {"path": str(recorded_source_root / "vendor/sunset")},
-    }
+    package_source_paths = {"root": str(recorded_source_root)}
     sdk_paths = {"root": str(recorded_sdk_root)}
     artifact_names = {
         "kernel_elf": "vibeos-milkv-duo-wasm-aot-profile.elf",
@@ -3344,13 +3900,112 @@ def selftest() -> None:
             fail(f"selftest accepted {label}")
     require(path_rejected == 3, "package path-closure rejection count differs")
 
+    import ast
     import tempfile
+
+    module = ast.parse(
+        stable_regular_bytes(SCRIPT_PATH, "capture selftest source").decode("utf-8")
+    )
+    definitions = {
+        node.name for node in module.body if isinstance(node, ast.FunctionDef)
+    }
+    forbidden_definitions = {
+        "committed_c83_files",
+        "materialize_commit_snapshot",
+        "parse_ls_tree_records",
+        "resolve_full_commit",
+    }
+    require(
+        definitions.isdisjoint(forbidden_definitions),
+        "formal C8.3 gate retains a legacy Git-object snapshot helper",
+    )
+    formal_c83 = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == "verify_c83_precondition"
+    )
+
+    def call_name(node: ast.Call) -> str | None:
+        if isinstance(node.func, ast.Name):
+            return node.func.id
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr
+        return None
+
+    formal_calls = {
+        name
+        for node in ast.walk(formal_c83)
+        if isinstance(node, ast.Call) and (name := call_name(node)) is not None
+    }
+    require(
+        formal_calls.isdisjoint(
+            forbidden_definitions | {"TemporaryDirectory", "mkdtemp"}
+        ),
+        "formal C8.3 gate retains a temporary/Git-object snapshot call",
+    )
+    git_calls = [
+        node
+        for node in ast.walk(formal_c83)
+        if isinstance(node, ast.Call) and call_name(node) == "frozen_git_bytes"
+    ]
+    command_signatures: set[tuple[str, ...]] = set()
+    for call in git_calls:
+        require(
+            bool(call.args) and isinstance(call.args[0], ast.List),
+            "formal C8.3 frozen Git command is not a closed list",
+        )
+        signature: list[str] = []
+        for item in call.args[0].elts:
+            if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                signature.append(item.value)
+            elif isinstance(item, ast.JoinedStr):
+                signature.append("<formatted>")
+            else:
+                fail("formal C8.3 frozen Git command contains a dynamic argument")
+        command_signatures.add(tuple(signature))
+    require(
+        command_signatures
+        == {
+            ("rev-parse", "HEAD"),
+            ("rev-parse", "--verify", "<formatted>"),
+        },
+        "formal C8.3 gate uses a Git command beyond HEAD/tree identity",
+    )
 
     trusted_temp = pathlib.Path(tempfile.gettempdir()).resolve(strict=True)
     with tempfile.TemporaryDirectory(
         prefix="vibeos-c84-capture-selftest-", dir=trusted_temp
     ) as name:
         root = pathlib.Path(name)
+        frozen_c83_fixture = root / "frozen-c83"
+        external_c83_fixture = root / "external-c83"
+        for relative in C83_RELATIVE_FILES:
+            raw = f"synthetic C8.3 {relative}\n".encode("utf-8")
+            for fixture in (frozen_c83_fixture, external_c83_fixture):
+                destination = fixture.joinpath(*pathlib.PurePosixPath(relative).parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                write_bytes_exclusive(destination, raw)
+        frozen_c83_files = validate_real_directory_tree(
+            frozen_c83_fixture, C83_RELATIVE_FILES, "selftest frozen C8.3 tree"
+        )
+        external_c83_files = validate_real_directory_tree(
+            external_c83_fixture, C83_RELATIVE_FILES, "selftest external C8.3 tree"
+        )
+        require_matching_c83_trees(external_c83_files, frozen_c83_files)
+        (external_c83_fixture / "README.md").write_bytes(b"external mismatch\n")
+        try:
+            require_matching_c83_trees(
+                validate_real_directory_tree(
+                    external_c83_fixture,
+                    C83_RELATIVE_FILES,
+                    "mismatched external C8.3 tree",
+                ),
+                frozen_c83_files,
+            )
+        except CaptureError:
+            pass
+        else:
+            fail("selftest accepted an external C8.3 byte mismatch")
         output = root / "capture"
         require(output_directory(output) == output, "outside output path rejected")
         output.mkdir()
@@ -3360,6 +4015,40 @@ def selftest() -> None:
             pass
         else:
             fail("selftest accepted existing output directory")
+        canonical_source_path = root / "canonical-source-envelope.json"
+        canonical_source_raw = (
+            json.dumps(source_root, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+            + b"\n"
+        )
+        write_bytes_exclusive(canonical_source_path, canonical_source_raw)
+        loaded_source, loaded_raw, _loaded_identity = canonical_root_file(
+            canonical_source_path,
+            schema=SOURCE_MATERIALIZATION_SCHEMA,
+            version=1,
+            label="canonical source selftest",
+        )
+        require(
+            loaded_source == source_root and loaded_raw == canonical_source_raw,
+            "canonical source-envelope loader baseline differs",
+        )
+        noncanonical_source_path = root / "noncanonical-source-envelope.json"
+        write_bytes_exclusive(
+            noncanonical_source_path,
+            (json.dumps(source_root, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+        )
+        try:
+            canonical_root_file(
+                noncanonical_source_path,
+                schema=SOURCE_MATERIALIZATION_SCHEMA,
+                version=1,
+                label="noncanonical source selftest",
+            )
+        except CaptureError:
+            pass
+        else:
+            fail("selftest accepted a noncanonical source materialization root")
         target = root / "atomic.json"
         write_json_exclusive_atomic(target, {"ok": True})
         try:
@@ -3393,10 +4082,23 @@ def selftest() -> None:
             cleanup_capture_stage(blocked_stage)
         else:
             fail("selftest replaced an existing final capture directory")
+        closed_tree = root / "closed-capture-tree"
+        closed_tree.mkdir()
+        for filename in sorted(CAPTURE_OUTPUT_FILES):
+            write_bytes_exclusive(closed_tree / filename, b"synthetic\n")
+        validate_capture_output_tree(closed_tree)
+        write_bytes_exclusive(closed_tree / "unexpected", b"rogue\n")
+        try:
+            validate_capture_output_tree(closed_tree)
+        except CaptureError:
+            pass
+        else:
+            fail("selftest accepted an extra capture output file")
     print(
         "capture-c84-duo-aot-decision.py selftest: PASS "
         f"({rejected} stream, {aggregate_rejected} aggregate, {replay_rejected} replay/swap, "
-        "3 UART, 3 package-path, percentile/content/tree/no-clobber gates)"
+        f"{provenance_rejected} provenance, 3 UART, 3 package-path, "
+        "C8.3 call-graph/mismatch, percentile/content/tree/no-clobber gates)"
     )
 
 

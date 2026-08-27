@@ -100,7 +100,7 @@ PEER_DEPENDENCY_SHA256 = (
     "f0a9b77bab25c57428ed111f4c8e9531e7486c46e5d4a4b7cc2c011d970f4fa9",
     "11e792ab2dadd67653ba2c4fbfb79c5424cf47ea71e8ed87bdbf67c815c7ea0a",
     "00d5002a8f2725c275995b1eff5d469f1d1eac1741b1eaef3f3623c3c746ac8c",
-    "a45b1ced38ced134f3948a77b678cfa50bae74db3d7e0576e7d54a7a6718b302",
+    "b4d7316f66b96e4742cddaf12ae0904d79b982af98b7e3c32e24ac986dcf07f5",
 )
 
 
@@ -3731,6 +3731,16 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
                 "            require(True, "
                 'f"parser selftest mutation was accepted: {label}")',
                 "finish peer selftest guard",
+            ),
+        ),
+        (
+            "request-parent-parser-dependency-mutated",
+            lambda data: mutate_peer_dependency(
+                data,
+                5,
+                '"""Verify the default-off C8.4 authenticated SSH request-parent seam.',
+                '"""Verify the default-off C8.4 authenticated SSH request-parent contract.',
+                "request-parent parser dependency",
             ),
         ),
         (

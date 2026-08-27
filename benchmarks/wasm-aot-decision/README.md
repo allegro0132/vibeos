@@ -3,9 +3,11 @@
 `workloads-v1.json` freezes the one product workload, physical-Duo budget,
 seven-phase attribution ledger, and fail-closed decision rule. `schema-v1.json`
 defines the records for exactly one future physical cold-boot transcript, and
-`evidence-schema-v1.json` closes the three-boot capture and final decision
-envelopes. A raw transcript contains one metadata record, 24 samples, and one
-end record; the host, not the target, later assigns its boot index.
+`evidence-schema-v2.json` closes the three-boot capture and final decision
+envelopes, including the independently materialized source and host-observed
+container-runtime custody roots. A raw transcript contains one metadata record,
+24 samples, and one end record; the host, not the target, later assigns its
+boot index.
 
 These files contain no result. They neither complete C8.3 nor authorize AOT.
 QEMU is integration-only and cannot contribute to the 25 MHz physical-Duo
@@ -20,16 +22,27 @@ coordinates, output and fuel/poll bounds, and per-boot stability. Timeout,
 trap, failure, truncation, wrong-output, and leak attempts are diagnostic and
 cannot enter the decision population or authorize AOT.
 
-The software-side chain now includes content-addressed build and package
-envelopes, an independent full-SD-image verifier, a read-only three-cold-boot
-UART collector, and a final evidence verifier. The final verifier resolves the
-full C8.4 preparation commit with replacement objects disabled, materializes
-an immutable snapshot, proves the complete checked-in C8.3 evidence tree
-byte-for-byte, reruns its verifier, and only then pools the 63 retained C8.4
-samples. It computes nearest-rank p50/p95 after sorting the 63 values and
-computes non-interpretation time per sample as `N = T - I` before sorting.
-Neither a failed precondition nor malformed evidence is converted into a
-negative AOT decision.
+The software-side chain now includes an independently cloned and frozen source
+tree, content-addressed build and package envelopes, host-observed Docker
+runtime custody, an independent full-SD-image verifier, a read-only
+three-cold-boot UART collector, and a final evidence verifier. The final
+verifier starts by revalidating the frozen source envelope and the offline
+runtime closure, proves the complete checked-in C8.3 evidence tree
+byte-for-byte against that source, reruns its verifier, and only then pools the
+63 retained C8.4 samples. It computes nearest-rank p50/p95 after sorting the 63
+values and computes non-interpretation time per sample as `N = T - I` before
+sorting. Neither a failed precondition nor malformed evidence is converted
+into a negative AOT decision.
+
+Host verification binds exact source/admin inodes. Because Docker Desktop may
+remap inode numbers across a bind mount, the attested read-only guest verifier
+retains that host proof and independently rechecks bytes, Git closure,
+permissions, single links, file counts, and clone/clone disjointness in the
+container namespace. Package preflight and the independent image verifier each
+validate their own mode-specific runtime attestation before that check; the
+independent verifier also completely validates the package attestation that
+its image report continues to bind. The final offline verifier repeats the
+full host check.
 
 The single-boot verifier alone still does not attest physical provenance or a
 power cycle, aggregate three boots, prove the C8.3 precondition, or produce an
@@ -38,12 +51,12 @@ AOT decision. Its raw input is a stable non-empty regular file capped at
 is supplied explicitly.
 
 Current execution status (2026-08-27): Milk-V Duo physical testing is paused
-at operator request. The software tooling and host-only synthetic gates are
-ready, but no C8.3/C8.4 physical capture or C8.4 decision is claimed and both
-roadmap nodes remain open. The current build is attested from a clean checkout,
-not an independent immutable local clone, and the packaging container identity
-is operator-declared rather than host-runtime-attested. Those provenance gaps
-must close before decision-eligible physical publication. These CI-safe
+at operator request. The software tooling closes independent immutable source
+materialization and Docker runtime custody, and its host-only synthetic gates
+are ready, but no C8.3/C8.4 physical capture or C8.4 decision is claimed and
+both roadmap nodes remain open. The runtime evidence is software custody from
+the local Docker daemon plus an in-container namespace witness; it is not a
+TPM, remote-attestation, hardware, or physical-cold-boot proof. These CI-safe
 commands do not open a UART, invoke Docker, access the network, flash media,
 reset a board, or require an SDK:
 
@@ -51,6 +64,8 @@ reset a board, or require an SDK:
 bash -n scripts/build-milkv-duo.sh
 bash -n scripts/package-milkv-duo-sdk.sh
 bash -n scripts/verify-milkv-duo-image.sh
+python3 -B scripts/c84-source-materialization.py --selftest --check-source
+python3 -B scripts/c84-docker-runtime.py --selftest
 ./scripts/verify-milkv-duo-image.sh --selftest
 python3 -B scripts/capture-c84-duo-aot-decision.py --selftest
 python3 -B scripts/verify-c84-evidence.py --selftest

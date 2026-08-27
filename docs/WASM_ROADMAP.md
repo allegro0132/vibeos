@@ -608,22 +608,26 @@ and the private 24-sample collector, now a build-bound single-cold-boot
 protocol. The collector closes META + 24 SAMPLE + END locally, with three warmups, 21
 retained samples, an absorbing Failed/Closed state, atomic physical UART
 records, and a separate QEMU audit sink whose markers explicitly carry
-`decision_eligible=0 formal_uart=0`. The software-side build/package envelopes,
-full-SD-image verifier, read-only three-boot capture program, immutable C8.3
-precondition, and final 63-sample evidence verifier are implemented and covered
-by host-only synthetic tests. Those tests use no device, Docker, network,
-flash, reset, or physical cold boot.
+`decision_eligible=0 formal_uart=0`. The software-side independent
+frozen-source envelope, build/package envelopes, host-observed Docker runtime
+closure, full-SD-image verifier, read-only three-boot capture program,
+immutable C8.3 precondition, and final 63-sample evidence verifier are
+implemented and covered by host-only synthetic tests. Those tests use no
+device, Docker, network, flash, reset, or physical cold boot. Package preflight
+and the independent image verifier validate their own package/verify runtime
+attestations before using the container-mounted source verifier; the
+independent verifier also completely validates the package attestation to
+which its image audit remains bound.
 
 Milk-V Duo physical testing is paused at operator request. Consequently, C8.3
 still lacks its three physical-Duo cold boots, C8.4 still lacks three attested
 cold boots and 63 retained physical samples, and neither row is complete. No
 workload-specific AOT decision exists; the final workload-specific AOT decision
 remains open and may not be inferred from software self-tests or QEMU
-diagnostics. The current software preparation also remains clean-worktree
-attested, with an operator-declared rather than host-runtime-attested container
-identity; immutable source materialization and runtime-container attestation
-must precede decision-eligible publication. C8.5 remains gated on a future
-verified C8.4 result.
+diagnostics. Independent source materialization and local Docker runtime
+custody are now closed prerequisites in the software path. They remain
+software evidence only and do not attest hardware identity, a remote host, or
+a physical cold boot. C8.5 remains gated on a future verified C8.4 result.
 
 ## 10. Test and evidence matrix
 

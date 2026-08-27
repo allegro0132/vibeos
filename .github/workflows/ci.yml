@@ -12,6 +12,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
       - name: Install repository toolchain
         run: |
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
@@ -104,6 +106,8 @@ jobs:
           bash -n scripts/build-milkv-duo.sh
           bash -n scripts/package-milkv-duo-sdk.sh
           bash -n scripts/verify-milkv-duo-image.sh
+          python3 -B scripts/c84-source-materialization.py --selftest --check-source
+          python3 -B scripts/c84-docker-runtime.py --selftest
           ./scripts/verify-milkv-duo-image.sh --selftest
           python3 -B scripts/capture-c84-duo-aot-decision.py --selftest
           python3 -B scripts/verify-c84-evidence.py --selftest
@@ -211,6 +215,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
       - name: Install repository toolchain
         run: |
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
@@ -253,6 +259,8 @@ jobs:
         run: ./scripts/qemu-c84-profile-irq-overlay-test.sh
       - name: Exercise the C8.4 prepared-child lineage boundary
         run: ./scripts/qemu-c84-profile-child-delegation-test.sh
+      - name: Exercise the C8.4 authenticated SSH request-parent boundary
+        run: ./scripts/qemu-c84-ssh-request-parent-test.sh
       - name: Exercise the C8.4 authenticated managed-child/Core boundary
         run: ./scripts/qemu-c84-ssh-managed-child-core-test.sh
       - name: Exercise the C8.4 SSH managed-child phase sidecar
@@ -269,6 +277,27 @@ jobs:
         run: ./scripts/qemu-c84-ssh-managed-child-single-boot-collector-test.sh
       # Keep these closed-source-state gates before the ordinary Duo build,
       # which applies the reviewed jitterentropy patch inside its submodule.
+      # Materialize C8.4 before C8.3 changes the operator checkout's submodule.
+      # The artifact is not retained or executed; physical evidence additionally
+      # requires a real board capture and cold boot.
+      - name: Type/link-check the C8.4 physical single-boot collector
+        run: |
+          source_commit="$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$source_commit"
+          challenge="$(openssl rand -hex 32)"
+          frozen="$RUNNER_TEMP/vibeos-c84-frozen-$challenge"
+          python3 -B scripts/c84-source-materialization.py materialize \
+            --source "$GITHUB_WORKSPACE" \
+            --destination "$frozen" \
+            --source-commit "$source_commit" \
+            --challenge "$challenge"
+          cd "$frozen"
+          RUSTC_WRAPPER="$(command -v false)" \
+          CARGO_PROFILE_RELEASE_OPT_LEVEL=0 \
+          RUSTFLAGS='--c84-ambient-rustflags-must-not-leak' \
+          VIBEOS_C84_SOURCE_COMMIT="$source_commit" \
+          VIBEOS_C84_CHALLENGE="$challenge" \
+            ./scripts/build-milkv-duo.sh --wasm-aot-profile
       - name: Build the isolated Milk-V Duo C8.3 sampler (CI-only identity)
         run: |
           VIBEOS_C83_SOURCE_COMMIT="$(git rev-parse HEAD)" \
@@ -278,18 +307,6 @@ jobs:
       # retain its outputs and therefore cannot complete the evidence milestone.
       - name: Exercise the fixed-QEMU C8.3 publication contract
         run: python3 -B scripts/qemu-c83-runtime-costs.py
-      # Compile and link the physical collector policy while the checkout is
-      # still clean. The artifact is not retained or executed; physical
-      # evidence additionally requires a real board capture and cold boot.
-      - name: Type/link-check the C8.4 physical single-boot collector
-        run: |
-          challenge="$(openssl rand -hex 32)"
-          RUSTC_WRAPPER="$(command -v false)" \
-          CARGO_PROFILE_RELEASE_OPT_LEVEL=0 \
-          RUSTFLAGS='--c84-ambient-rustflags-must-not-leak' \
-          VIBEOS_C84_SOURCE_COMMIT="$(git rev-parse HEAD)" \
-          VIBEOS_C84_CHALLENGE="$challenge" \
-            ./scripts/build-milkv-duo.sh --wasm-aot-profile
       - name: Build the Milk-V Duo kernel
         # FIT/full-card packaging still requires a prebuilt official SDK and
         # remains part of the documented manual hardware acceptance flow.

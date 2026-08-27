@@ -38,6 +38,12 @@ EXPECTED_PRIOR_ACCUMULATOR = 0x0CE2_4A87_0336_63A1
 EXPECTED_RUN_ID = bytes(range(32)).hex()
 EXPECTED_CHALLENGE = bytes(range(32, 64)).hex()
 COMMAND = "python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source"
+EXPECTED_DEPENDENCIES = {
+    "sha2": {
+        "version": "=0.11.0",
+        "default-features": False,
+    },
+}
 
 
 def load_module(path: Path, name: str):
@@ -273,8 +279,14 @@ def verify_manifest(raw: bytes) -> None:
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise VerificationError(f"publisher crate manifest is invalid: {error}") from error
     require(manifest.get("package", {}).get("name") == "vibeos-wasm-aot-profile", "publisher crate name differs")
-    require(manifest.get("dependencies") == {}, "publisher crate gained a dependency")
+    require(
+        manifest.get("dependencies") == EXPECTED_DEPENDENCIES,
+        "publisher crate dependencies differ from the exact pinned no-default sha2 dependency",
+    )
     require("dev-dependencies" not in manifest, "publisher crate gained a dev dependency")
+    require("build-dependencies" not in manifest, "publisher crate gained a build dependency")
+    require("target" not in manifest, "publisher crate gained a target-specific dependency")
+    require("features" not in manifest, "publisher crate gained a Cargo feature")
 
 
 def verify_lib(source: str) -> None:
@@ -822,6 +834,12 @@ def mutate_golden(inputs: Inputs, mutation: Callable[[dict[str, Any]], None]) ->
     return replace(inputs, golden=raw)
 
 
+def mutate_manifest(inputs: Inputs, old: bytes, new: bytes, label: str) -> Inputs:
+    count = inputs.cargo_manifest.count(old)
+    require(count == 1, f"selftest {label} manifest count differs: {count}")
+    return replace(inputs, cargo_manifest=inputs.cargo_manifest.replace(old, new, 1))
+
+
 def expect_rejected(inputs: Inputs, label: str) -> None:
     try:
         verify(inputs, predecessor=False, contract=False)
@@ -834,6 +852,42 @@ def run_selftest(inputs: Inputs) -> int:
     verify(inputs, predecessor=True, contract=True)
     mutations: list[tuple[str, Inputs]] = []
     add = mutations.append
+    dependency = b'sha2 = { version = "=0.11.0", default-features = false }'
+    add(("sha2-dependency-removed", mutate_manifest(inputs, dependency, b"", "sha2-remove")))
+    add(("sha2-version-drift", mutate_manifest(
+        inputs,
+        dependency,
+        b'sha2 = { version = "=0.11.1", default-features = false }',
+        "sha2-version",
+    )))
+    add(("sha2-default-features-enabled", mutate_manifest(
+        inputs,
+        dependency,
+        b'sha2 = { version = "=0.11.0", default-features = true }',
+        "sha2-default-features",
+    )))
+    add(("sha2-default-features-implicit", mutate_manifest(
+        inputs,
+        dependency,
+        b'sha2 = { version = "=0.11.0" }',
+        "sha2-implicit-default-features",
+    )))
+    add(("sha2-feature-enabled", mutate_manifest(
+        inputs,
+        dependency,
+        b'sha2 = { version = "=0.11.0", default-features = false, features = ["asm"] }',
+        "sha2-feature",
+    )))
+    add(("extra-dependency", mutate_manifest(
+        inputs,
+        dependency,
+        dependency + b'\nserde = "1"',
+        "extra-dependency",
+    )))
+    add(("cargo-feature-added", replace(
+        inputs,
+        cargo_manifest=inputs.cargo_manifest + b"\n[features]\ndefault = []\n",
+    )))
     add(("authority-by-reference", mutate_text(inputs, "publisher", "verified: TargetVerified<'a>,", "verified: &TargetVerified<'a>,", "authority-by-reference")))
     add(("authority-summary", mutate_text(inputs, "publisher", "verified: TargetVerified<'a>,", "verified: Summary,", "authority-summary")))
     add(("sample-index-bypass", mutate_text(inputs, "publisher", "if sample_index > MAX_SAMPLE_INDEX {", "if false {", "sample-index-bypass")))

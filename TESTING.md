@@ -51,6 +51,9 @@ python3 -B scripts/verify-c84-ssh-managed-child-verified-stream.py --selftest --
 ./scripts/qemu-c84-ssh-managed-child-verified-stream-test.sh # C8.4 verified summary/stream completion gate
 python3 -B scripts/verify-c84-ssh-managed-child-trusted-sample.py --selftest --check-source
 ./scripts/qemu-c84-ssh-managed-child-trusted-sample-test.sh # C8.4 live terminal evidence/opaque bundle gate
+python3 -B scripts/verify-c84-ssh-managed-child-single-boot-collector.py --selftest --check-source
+python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py --selftest
+./scripts/qemu-c84-ssh-managed-child-single-boot-collector-test.sh # C8.4 private single-boot collector/audit gate
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
@@ -659,6 +662,47 @@ request START. These are log-only single-hart integration facts, not a SAMPLE
 record. No `ProfilePublisher`, META/SAMPLE/END transcript, collector ordering,
 retained dataset, physical Milk-V Duo capture, physical cold-boot provenance,
 or AOT decision is created or claimed.
+
+The default-off
+`wasm-c84-ssh-managed-child-single-boot-collector` successor consumes that
+opaque trusted bundle inside the kernel. A build-bound portable campaign owns
+the factory, sequence, accumulator, and 24-sample chain; after one META it
+accepts epochs 1 through 24, discards three warmups, retains 21 samples, checks
+nearest-rank p50/p95 stability, and commits END before Ready epoch 25 becomes
+visible. Complete/Failed states (diagnostic `closed`/`failed`) reject before
+target start, and every failure after META is absorbing. The physical Milk-V
+sink holds TTY then TX across each
+raw-LF formal record. Framing, write, commit, panic, or allocator failure keeps
+the record fail-stopped; only a fully drained commit releases TX then TTY.
+For a terminal collector state, SSHD accepts the exec request only far enough
+to drain empty stdout plus exit status 126, EOF, and CLOSE; the rejection owns
+no command, Component, profile permit, or target-start path.
+
+The QEMU acceptance uses the same collector and serializer with an absorbing
+SHA-256/byte-count audit sink. It performs one failed boot and one successful
+24-request boot, but writes no formal record bytes to UART and marks every
+diagnostic line `decision_eligible=0 formal_uart=0`. The host parser freezes
+both logs, validates all predecessor/collector counts and order, and rejects
+formal prefixes or schema payloads anywhere in the raw logs. Run the static,
+parser, and two-boot gates with:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-single-boot-collector.py \
+  --selftest --check-source
+python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py \
+  --selftest
+./scripts/qemu-c84-ssh-managed-child-single-boot-collector-test.sh
+```
+
+CI also cross-compiles and links the physical Milk-V collector with a freshly
+generated challenge while the checkout is still clean. The build runs in a
+sanitized `env -i` envelope with an isolated Cargo home, the pinned Rust tools,
+a fixed `ld.lld`, commit-derived `SOURCE_DATE_EPOCH`, and isolated objcopy. CI
+injects hostile ambient wrapper, profile, and rustflag values; the build must
+ignore all three. It neither runs nor retains that artifact. A
+decision-eligible capture additionally requires a clean preparation checkout,
+a real physical cold boot, and the documented three-boot/63-retained-sample
+verification flow; none is supplied by this compile gate.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

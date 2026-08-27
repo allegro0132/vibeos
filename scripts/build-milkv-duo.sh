@@ -12,8 +12,13 @@ jitterentropy_ssh_probe=false
 iperf3_server=false
 file_tree=false
 runtime_costs=false
+wasm_aot_profile=false
 runtime_costs_sdk_commit=23eb84fecb29585dbb5728d6b7e2475ff273baac
 runtime_costs_cargo_home_sandbox=
+wasm_aot_profile_cargo_home_sandbox=
+wasm_aot_profile_stage_dir=
+wasm_aot_profile_publish_lock=
+wasm_aot_profile_publish_lock_held=false
 sdk_arg=
 for arg in "$@"; do
   case "$arg" in
@@ -24,10 +29,11 @@ for arg in "$@"; do
     --iperf3-server) iperf3_server=true ;;
     --file-tree) file_tree=true ;;
     --runtime-costs) runtime_costs=true ;;
-    -*) echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree|--runtime-costs] [duo-buildroot-sdk-root]" >&2; exit 2 ;;
+    --wasm-aot-profile) wasm_aot_profile=true ;;
+    -*) echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree|--runtime-costs|--wasm-aot-profile] [duo-buildroot-sdk-root]" >&2; exit 2 ;;
     *)
       if [ -n "$sdk_arg" ]; then
-        echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree|--runtime-costs] [duo-buildroot-sdk-root]" >&2
+        echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree|--runtime-costs|--wasm-aot-profile] [duo-buildroot-sdk-root]" >&2
         exit 2
       fi
       sdk_arg=$arg
@@ -43,6 +49,7 @@ mode_count=0
 [ "$iperf3_server" = true ] && mode_count=$((mode_count + 1))
 [ "$file_tree" = true ] && mode_count=$((mode_count + 1))
 [ "$runtime_costs" = true ] && mode_count=$((mode_count + 1))
+[ "$wasm_aot_profile" = true ] && mode_count=$((mode_count + 1))
 if [ "$mode_count" -gt 1 ]; then
   echo "build-milkv-duo.sh: image mode options are mutually exclusive" >&2
   exit 2
@@ -80,6 +87,36 @@ require_runtime_identity() {
   fi
 }
 
+require_wasm_aot_profile_identity() {
+  identity_name=$1
+  identity_value=$2
+  identity_length=$3
+  zero_value=$4
+  test_value=$5
+  if [ -z "$identity_value" ]; then
+    echo "build-milkv-duo.sh: $identity_name is required with --wasm-aot-profile" >&2
+    exit 2
+  fi
+  if [ "${#identity_value}" -ne "$identity_length" ]; then
+    echo "build-milkv-duo.sh: $identity_name must be exactly $identity_length lowercase hexadecimal characters" >&2
+    exit 2
+  fi
+  case "$identity_value" in
+    *[!0123456789abcdef]*)
+      echo "build-milkv-duo.sh: $identity_name must be exactly $identity_length lowercase hexadecimal characters" >&2
+      exit 2
+      ;;
+  esac
+  if [ "$identity_value" = "$zero_value" ]; then
+    echo "build-milkv-duo.sh: $identity_name must not use the unbound all-zero sentinel" >&2
+    exit 2
+  fi
+  if [ "$identity_value" = "$test_value" ]; then
+    echo "build-milkv-duo.sh: $identity_name must not use the QEMU-only test sentinel" >&2
+    exit 2
+  fi
+}
+
 cleanup_runtime_costs_build() {
   if [ -n "$runtime_costs_cargo_home_sandbox" ] &&
      [ -d "$runtime_costs_cargo_home_sandbox" ]; then
@@ -93,7 +130,50 @@ cleanup_runtime_costs_build() {
     esac
   fi
 }
-trap cleanup_runtime_costs_build EXIT
+
+cleanup_wasm_aot_profile_build() {
+  if [ -n "$wasm_aot_profile_cargo_home_sandbox" ] &&
+     [ -d "$wasm_aot_profile_cargo_home_sandbox" ]; then
+    case "$wasm_aot_profile_cargo_home_sandbox" in
+      "${wasm_aot_profile_tmpdir-}"/vibeos-c84-cargo-home.*)
+        rm -rf -- "$wasm_aot_profile_cargo_home_sandbox"
+        ;;
+      *)
+        echo "build-milkv-duo.sh: refusing to remove unexpected temporary C8.4 Cargo home: $wasm_aot_profile_cargo_home_sandbox" >&2
+        ;;
+    esac
+  fi
+  if [ -n "$wasm_aot_profile_stage_dir" ] &&
+     [ -d "$wasm_aot_profile_stage_dir" ]; then
+    case "$wasm_aot_profile_stage_dir" in
+      "$repo_root/target/.milkv-duo-wasm-aot-profile.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge."??????)
+        rm -rf -- "$wasm_aot_profile_stage_dir"
+        ;;
+      *)
+        echo "build-milkv-duo.sh: refusing to remove unexpected WebAssembly AOT profile staging directory: $wasm_aot_profile_stage_dir" >&2
+        ;;
+    esac
+  fi
+  if [ "$wasm_aot_profile_publish_lock_held" = true ] &&
+     [ -d "$wasm_aot_profile_publish_lock" ]; then
+    case "$wasm_aot_profile_publish_lock" in
+      "$repo_root/target/.milkv-duo-wasm-aot-profile.publish.lock")
+        if ! rmdir -- "$wasm_aot_profile_publish_lock"; then
+          echo "build-milkv-duo.sh: cannot release WebAssembly AOT profile publication lock: $wasm_aot_profile_publish_lock" >&2
+        fi
+        ;;
+      *)
+        echo "build-milkv-duo.sh: refusing to remove unexpected WebAssembly AOT profile publication lock: $wasm_aot_profile_publish_lock" >&2
+        ;;
+    esac
+  fi
+}
+
+cleanup_build() {
+  cleanup_runtime_costs_build
+  cleanup_wasm_aot_profile_build
+}
+trap cleanup_build EXIT
 
 if [ "$runtime_costs" = true ]; then
   require_runtime_identity VIBEOS_C83_SOURCE_COMMIT \
@@ -130,6 +210,86 @@ if [ "$runtime_costs" = true ]; then
   runtime_costs_source_date_epoch=$(git -C "$repo_root" show -s --format=%ct "$runtime_costs_source_commit")
   runtime_costs_build_started_utc=$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"))')
   export VIBEOS_C83_SOURCE_COMMIT VIBEOS_C83_CHALLENGE
+fi
+
+if [ "$wasm_aot_profile" = true ]; then
+  require_wasm_aot_profile_identity VIBEOS_C84_SOURCE_COMMIT \
+    "${VIBEOS_C84_SOURCE_COMMIT-}" 40 \
+    0000000000000000000000000000000000000000 \
+    1111111111111111111111111111111111111111
+  require_wasm_aot_profile_identity VIBEOS_C84_CHALLENGE \
+    "${VIBEOS_C84_CHALLENGE-}" 64 \
+    0000000000000000000000000000000000000000000000000000000000000000 \
+    2222222222222222222222222222222222222222222222222222222222222222
+  wasm_aot_profile_source_commit=$VIBEOS_C84_SOURCE_COMMIT
+  wasm_aot_profile_challenge=$VIBEOS_C84_CHALLENGE
+  wasm_aot_profile_target_dir="$repo_root/target/c84-milkv-build/$wasm_aot_profile_source_commit/$wasm_aot_profile_challenge"
+  if ! wasm_aot_profile_head=$(git -C "$repo_root" rev-parse HEAD 2>/dev/null); then
+    echo "build-milkv-duo.sh: cannot read VibeOS source HEAD" >&2
+    exit 1
+  fi
+  if [ "$wasm_aot_profile_head" != "$wasm_aot_profile_source_commit" ]; then
+    echo "build-milkv-duo.sh: VibeOS HEAD is $wasm_aot_profile_head, expected $wasm_aot_profile_source_commit" >&2
+    exit 1
+  fi
+  if [ -n "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=none)" ]; then
+    echo "build-milkv-duo.sh: WebAssembly AOT profile build requires a clean VibeOS worktree" >&2
+    exit 1
+  fi
+  if [ -z "${HOME-}" ] || [ -z "${PATH-}" ]; then
+    echo "build-milkv-duo.sh: HOME and PATH are required for the sanitized WebAssembly AOT profile build" >&2
+    exit 1
+  fi
+  wasm_aot_profile_rustup_home=${RUSTUP_HOME-"$HOME/.rustup"}
+  wasm_aot_profile_cache_cargo_home=${CARGO_HOME-"$HOME/.cargo"}
+  wasm_aot_profile_tmpdir=${TMPDIR-/tmp}
+  wasm_aot_profile_rustup_home=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).expanduser().resolve())' "$wasm_aot_profile_rustup_home")
+  wasm_aot_profile_cache_cargo_home=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).expanduser().resolve())' "$wasm_aot_profile_cache_cargo_home")
+  wasm_aot_profile_tmpdir=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).expanduser().resolve())' "$wasm_aot_profile_tmpdir")
+  wasm_aot_profile_source_date_epoch=$(git -C "$repo_root" show -s --format=%ct "$wasm_aot_profile_source_commit")
+  wasm_aot_profile_publish_dir="$repo_root/target/milkv-duo-wasm-aot-profile"
+  wasm_aot_profile_publish_lock="$repo_root/target/.milkv-duo-wasm-aot-profile.publish.lock"
+  case "$wasm_aot_profile_target_dir" in
+    "$repo_root/target/c84-milkv-build/$wasm_aot_profile_source_commit/$wasm_aot_profile_challenge") ;;
+    *)
+      echo "build-milkv-duo.sh: refusing to clear unexpected WebAssembly AOT profile target directory" >&2
+      exit 1
+      ;;
+  esac
+  case "$wasm_aot_profile_publish_dir" in
+    "$repo_root/target/milkv-duo-wasm-aot-profile") ;;
+    *)
+      echo "build-milkv-duo.sh: refusing to clear unexpected WebAssembly AOT profile publication directory" >&2
+      exit 1
+      ;;
+  esac
+  mkdir -p "$repo_root/target"
+  if ! mkdir "$wasm_aot_profile_publish_lock"; then
+    echo "build-milkv-duo.sh: another WebAssembly AOT profile publication is active" >&2
+    exit 1
+  fi
+  wasm_aot_profile_publish_lock_held=true
+  if [ -L "$wasm_aot_profile_publish_dir" ] ||
+     { [ -e "$wasm_aot_profile_publish_dir" ] && [ ! -d "$wasm_aot_profile_publish_dir" ]; }; then
+    echo "build-milkv-duo.sh: refusing to clear non-directory WebAssembly AOT profile publication path: $wasm_aot_profile_publish_dir" >&2
+    exit 1
+  fi
+  if [ -d "$wasm_aot_profile_publish_dir" ]; then
+    rm -f -- \
+      "$wasm_aot_profile_publish_dir/vibeos-milkv-duo-wasm-aot-profile.elf" \
+      "$wasm_aot_profile_publish_dir/vibeos-milkv-duo.bin" \
+      "$wasm_aot_profile_publish_dir/boot.sd" \
+      "$wasm_aot_profile_publish_dir/milkv-duo.its" \
+      "$wasm_aot_profile_publish_dir/cv1800b_milkv_duo_sd.dtb"
+    if ! rmdir -- "$wasm_aot_profile_publish_dir"; then
+      echo "build-milkv-duo.sh: refusing to clear WebAssembly AOT profile publication directory with unexpected entries" >&2
+      exit 1
+    fi
+  fi
+  rm -rf -- "$wasm_aot_profile_target_dir"
+  wasm_aot_profile_stage_dir=$(mktemp -d \
+    "$repo_root/target/.milkv-duo-wasm-aot-profile.$wasm_aot_profile_source_commit.$wasm_aot_profile_challenge.XXXXXX")
+  export VIBEOS_C84_SOURCE_COMMIT VIBEOS_C84_CHALLENGE
 fi
 
 if [ "$diagnostic" = false ] && [ "$ssh_acceptance" = false ] && [ "$iperf3_server" = false ] && [ "$runtime_costs" = false ]; then
@@ -200,6 +360,50 @@ if [ "$runtime_costs" = true ]; then
     exit 1
   fi
   runtime_costs_build_path="$runtime_costs_cargo_home_sandbox/closed-bin:/usr/bin:/bin:/usr/sbin:/sbin"
+fi
+
+if [ "$wasm_aot_profile" = true ]; then
+  wasm_aot_profile_rustup=$(command -v rustup)
+  wasm_aot_profile_rustup=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$wasm_aot_profile_rustup")
+  if ! wasm_aot_profile_linker=$(command -v ld.lld 2>/dev/null); then
+    echo "build-milkv-duo.sh: ld.lld is required for the closed WebAssembly AOT profile build" >&2
+    exit 1
+  fi
+  wasm_aot_profile_linker=$(python3 -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]).resolve(strict=True))' "$wasm_aot_profile_linker")
+  wasm_aot_profile_rustc_verbose=$("$pinned_rustc" -vV)
+  wasm_aot_profile_expected_rustc=$(sed -n 's/^# \(rustc .*$\)/\1/p' "$repo_root/rust-toolchain.toml")
+  wasm_aot_profile_expected_rustc_commit=$(sed -n 's/^# rustc-commit: //p' "$repo_root/rust-toolchain.toml")
+  wasm_aot_profile_actual_rustc=$(printf '%s\n' "$wasm_aot_profile_rustc_verbose" | sed -n '1p')
+  wasm_aot_profile_actual_rustc_commit=$(printf '%s\n' "$wasm_aot_profile_rustc_verbose" | sed -n 's/^commit-hash: //p')
+  if [ -z "$wasm_aot_profile_expected_rustc" ] ||
+     [ -z "$wasm_aot_profile_expected_rustc_commit" ] ||
+     [ "$wasm_aot_profile_actual_rustc" != "$wasm_aot_profile_expected_rustc" ] ||
+     [ "$wasm_aot_profile_actual_rustc_commit" != "$wasm_aot_profile_expected_rustc_commit" ]; then
+    echo "build-milkv-duo.sh: installed WebAssembly AOT profile rustc differs from rust-toolchain.toml" >&2
+    exit 1
+  fi
+  if [ ! -d "$wasm_aot_profile_tmpdir" ]; then
+    echo "build-milkv-duo.sh: TMPDIR is not a directory: $wasm_aot_profile_tmpdir" >&2
+    exit 1
+  fi
+  wasm_aot_profile_cargo_home_sandbox=$(mktemp -d "$wasm_aot_profile_tmpdir/vibeos-c84-cargo-home.XXXXXX")
+  mkdir -p \
+    "$wasm_aot_profile_cargo_home_sandbox/home" \
+    "$wasm_aot_profile_cargo_home_sandbox/tmp" \
+    "$wasm_aot_profile_cargo_home_sandbox/closed-bin"
+  ln -s "$wasm_aot_profile_linker" "$wasm_aot_profile_cargo_home_sandbox/closed-bin/ld.lld"
+  if [ -d "$wasm_aot_profile_cache_cargo_home/registry" ]; then
+    ln -s "$wasm_aot_profile_cache_cargo_home/registry" "$wasm_aot_profile_cargo_home_sandbox/registry"
+  fi
+  if [ -d "$wasm_aot_profile_cache_cargo_home/git" ]; then
+    ln -s "$wasm_aot_profile_cache_cargo_home/git" "$wasm_aot_profile_cargo_home_sandbox/git"
+  fi
+  if [ -e "$wasm_aot_profile_cargo_home_sandbox/config" ] ||
+     [ -e "$wasm_aot_profile_cargo_home_sandbox/config.toml" ]; then
+    echo "build-milkv-duo.sh: isolated C8.4 Cargo home unexpectedly contains a config" >&2
+    exit 1
+  fi
+  wasm_aot_profile_build_path="$wasm_aot_profile_cargo_home_sandbox/closed-bin:/usr/bin:/bin:/usr/sbin:/sbin"
 fi
 
 sdk_root=
@@ -280,8 +484,18 @@ elif [ "$runtime_costs" = true ]; then
   features=wasm-c83-runtime-costs
   output_dir="$repo_root/target/milkv-duo-runtime-costs"
   output_elf="$output_dir/vibeos-milkv-duo-runtime-costs.elf"
+elif [ "$wasm_aot_profile" = true ]; then
+  features=wasm-c84-ssh-managed-child-single-boot-collector
+  output_dir="$repo_root/target/milkv-duo-wasm-aot-profile"
+  output_elf="$output_dir/vibeos-milkv-duo-wasm-aot-profile.elf"
 fi
 output_bin="$output_dir/vibeos-milkv-duo.bin"
+
+if [ "$wasm_aot_profile" = true ]; then
+  output_dir=$wasm_aot_profile_stage_dir
+  output_elf="$output_dir/vibeos-milkv-duo-wasm-aot-profile.elf"
+  output_bin="$output_dir/vibeos-milkv-duo.bin"
+fi
 
 if [ "$runtime_costs" = true ]; then
   runtime_costs_build_envelope="$output_dir/build-envelope.json"
@@ -320,6 +534,22 @@ fi
       CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true \
       "$runtime_costs_rustup" run "$toolchain" cargo build \
         --release --locked --offline --no-default-features --features "$features"
+  elif [ "$wasm_aot_profile" = true ]; then
+    env -i \
+      PATH="$wasm_aot_profile_build_path" \
+      HOME="$wasm_aot_profile_cargo_home_sandbox/home" \
+      RUSTUP_HOME="$wasm_aot_profile_rustup_home" \
+      CARGO_HOME="$wasm_aot_profile_cargo_home_sandbox" \
+      TMPDIR="$wasm_aot_profile_cargo_home_sandbox/tmp" \
+      LC_ALL=C TZ=UTC SOURCE_DATE_EPOCH="$wasm_aot_profile_source_date_epoch" \
+      VIBEOS_C84_SOURCE_COMMIT="$wasm_aot_profile_source_commit" \
+      VIBEOS_C84_CHALLENGE="$wasm_aot_profile_challenge" \
+      RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
+      CARGO_TARGET_DIR="$wasm_aot_profile_target_dir" \
+      CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true \
+      "$wasm_aot_profile_rustup" run "$toolchain" cargo build \
+        --release --locked --offline \
+        --no-default-features --features "$features"
   else
     RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
       rustup run "$toolchain" cargo build --release --no-default-features \
@@ -329,6 +559,8 @@ fi
 
 if [ "$runtime_costs" = true ]; then
   built_elf="$runtime_costs_target_dir/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo"
+elif [ "$wasm_aot_profile" = true ]; then
+  built_elf="$wasm_aot_profile_target_dir/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo"
 else
   built_elf="$repo_root/target/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo"
 fi
@@ -349,6 +581,15 @@ if [ "$runtime_costs" = true ]; then
     env -i PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
       "$rust_objcopy" -O binary "$output_elf" "$output_bin"
   fi
+elif [ "$wasm_aot_profile" = true ]; then
+  wasm_aot_profile_objcopy_os=$(uname -s)
+  if [ "$wasm_aot_profile_objcopy_os" = Darwin ]; then
+    env -i PATH=/usr/bin:/bin LC_ALL=C TZ=UTC DYLD_LIBRARY_PATH="$sysroot/lib" \
+      "$rust_objcopy" -O binary "$output_elf" "$output_bin"
+  else
+    env -i PATH=/usr/bin:/bin LC_ALL=C TZ=UTC \
+      "$rust_objcopy" -O binary "$output_elf" "$output_bin"
+  fi
 elif [ "$(uname -s)" = Darwin ]; then
   DYLD_LIBRARY_PATH="$sysroot/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" \
     "$rust_objcopy" -O binary "$output_elf" "$output_bin"
@@ -356,8 +597,10 @@ else
   "$rust_objcopy" -O binary "$output_elf" "$output_bin"
 fi
 
-echo "Milk-V Duo ELF: $output_elf"
-echo "Milk-V Duo binary: $output_bin"
+if [ "$wasm_aot_profile" = false ]; then
+  echo "Milk-V Duo ELF: $output_elf"
+  echo "Milk-V Duo binary: $output_bin"
+fi
 
 if [ -n "$sdk_root" ]; then
   output_dtb="$output_dir/cv1800b_milkv_duo_sd.dtb"
@@ -369,7 +612,81 @@ if [ -n "$sdk_root" ]; then
     "$mkimage" -f milkv-duo.its boot.sd
     "$mkimage" -l boot.sd
   )
-  echo "Milk-V Duo FIT: $output_dir/boot.sd"
+  if [ "$wasm_aot_profile" = false ]; then
+    echo "Milk-V Duo FIT: $output_dir/boot.sd"
+  fi
+fi
+
+if [ "$wasm_aot_profile" = true ]; then
+  # The production SSH image needs the repository-recorded jitterentropy
+  # patch. Re-running its verifier proves the only permitted submodule delta;
+  # every superproject file must still match the bound source commit.
+  "$script_dir/prepare-jitterentropy-rs.sh" >/dev/null
+  if [ "$(git -C "$repo_root" rev-parse HEAD)" != "$wasm_aot_profile_source_commit" ]; then
+    echo "build-milkv-duo.sh: VibeOS HEAD changed during the WebAssembly AOT profile build" >&2
+    exit 1
+  fi
+  if [ -n "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" ]; then
+    echo "build-milkv-duo.sh: tracked source changed during the WebAssembly AOT profile build" >&2
+    exit 1
+  fi
+  for artifact in "$output_elf" "$output_bin"; do
+    if [ -L "$artifact" ] || [ ! -f "$artifact" ] || [ ! -s "$artifact" ]; then
+      echo "build-milkv-duo.sh: staged artifact is not a non-empty regular file: $artifact" >&2
+      exit 1
+    fi
+    if ! grep -a -F -q "$wasm_aot_profile_source_commit" "$artifact"; then
+      echo "build-milkv-duo.sh: bound source commit is absent from $artifact" >&2
+      exit 1
+    fi
+    if ! grep -a -F -q "$wasm_aot_profile_challenge" "$artifact"; then
+      echo "build-milkv-duo.sh: bound challenge is absent from $artifact" >&2
+      exit 1
+    fi
+  done
+  if [ -n "$sdk_root" ]; then
+    output_dtb="$output_dir/cv1800b_milkv_duo_sd.dtb"
+    output_its="$output_dir/milkv-duo.its"
+    output_fit="$output_dir/boot.sd"
+    for artifact in "$output_dtb" "$output_its" "$output_fit"; do
+      if [ -L "$artifact" ] || [ ! -f "$artifact" ] || [ ! -s "$artifact" ]; then
+        echo "build-milkv-duo.sh: staged package artifact is not a non-empty regular file: $artifact" >&2
+        exit 1
+      fi
+    done
+    if ! cmp -s "$sdk_dtb" "$output_dtb"; then
+      echo "build-milkv-duo.sh: staged device tree differs from the selected SDK input" >&2
+      exit 1
+    fi
+    if ! cmp -s "$script_dir/milkv-duo.its" "$output_its"; then
+      echo "build-milkv-duo.sh: staged FIT recipe differs from the repository input" >&2
+      exit 1
+    fi
+    if ! grep -a -F -q "$wasm_aot_profile_source_commit" "$output_fit" ||
+       ! grep -a -F -q "$wasm_aot_profile_challenge" "$output_fit"; then
+      echo "build-milkv-duo.sh: staged FIT does not contain the bound kernel identity" >&2
+      exit 1
+    fi
+  fi
+  if [ "$(git -C "$repo_root" rev-parse HEAD)" != "$wasm_aot_profile_source_commit" ] ||
+     [ -n "$(git -C "$repo_root" status --porcelain=v1 --untracked-files=all --ignore-submodules=all)" ]; then
+    echo "build-milkv-duo.sh: tracked source changed before WebAssembly AOT profile publication" >&2
+    exit 1
+  fi
+  if [ -e "$wasm_aot_profile_publish_dir" ] || [ -L "$wasm_aot_profile_publish_dir" ]; then
+    echo "build-milkv-duo.sh: WebAssembly AOT profile publication path reappeared during the build" >&2
+    exit 1
+  fi
+  mv -- "$wasm_aot_profile_stage_dir" "$wasm_aot_profile_publish_dir"
+  wasm_aot_profile_stage_dir=
+  output_dir=$wasm_aot_profile_publish_dir
+  output_elf="$output_dir/vibeos-milkv-duo-wasm-aot-profile.elf"
+  output_bin="$output_dir/vibeos-milkv-duo.bin"
+  echo "Milk-V Duo ELF: $output_elf"
+  echo "Milk-V Duo binary: $output_bin"
+  if [ -n "$sdk_root" ]; then
+    echo "Milk-V Duo FIT: $output_dir/boot.sd"
+  fi
 fi
 
 if [ "$runtime_costs" = true ]; then

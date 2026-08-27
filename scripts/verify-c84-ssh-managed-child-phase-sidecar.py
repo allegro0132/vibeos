@@ -40,6 +40,8 @@ VERIFIED_STREAM_FEATURE = "wasm-c84-ssh-managed-child-verified-stream"
 VERIFIED_STREAM_QEMU_FEATURE = f"{VERIFIED_STREAM_FEATURE}-qemu-acceptance"
 TRUSTED_SAMPLE_FEATURE = "wasm-c84-ssh-managed-child-trusted-sample"
 TRUSTED_SAMPLE_QEMU_FEATURE = f"{TRUSTED_SAMPLE_FEATURE}-qemu-acceptance"
+COLLECTOR_FEATURE = "wasm-c84-ssh-managed-child-single-boot-collector"
+COLLECTOR_QEMU_FEATURE = f"{COLLECTOR_FEATURE}-qemu-acceptance"
 SSHD_TRUSTED_SAMPLE_FEATURE = "c84-profile-trusted-sample"
 
 
@@ -729,6 +731,8 @@ def verify_sshd(source: str) -> None:
 def verify_slot(source: str) -> None:
     source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
     source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
+    source = CORE.without_direct_feature_units(source, COLLECTOR_FEATURE)
+    source = CORE.without_direct_feature_units(source, COLLECTOR_QEMU_FEATURE)
     sidecar = find_scope(source, r"\bstruct\s+ManagedPhaseSidecar\b", "phase sidecar storage")
     cfg_guarded(source, sidecar.start, "phase sidecar storage")
     sidecar_code = semantic(sidecar.raw)
@@ -1436,6 +1440,8 @@ def verify_ssh(source: str) -> None:
     source = CORE.without_direct_feature_units(source, VERIFIED_STREAM_QEMU_FEATURE)
     source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
     source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
+    source = CORE.without_direct_feature_units(source, COLLECTOR_FEATURE)
+    source = CORE.without_direct_feature_units(source, COLLECTOR_QEMU_FEATURE)
     backend = find_scope(
         source,
         r"\bimpl\s+SshExecProfileRunBackend\s+for\s+SshExecProfileOwner\b",

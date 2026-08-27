@@ -28,6 +28,8 @@ FINISH_FEATURE = "wasm-c84-ssh-managed-child-finish-verify"
 FINISH_QEMU_FEATURE = f"{FINISH_FEATURE}-qemu-acceptance"
 TRUSTED_SAMPLE_FEATURE = "wasm-c84-ssh-managed-child-trusted-sample"
 TRUSTED_SAMPLE_QEMU_FEATURE = f"{TRUSTED_SAMPLE_FEATURE}-qemu-acceptance"
+COLLECTOR_FEATURE = "wasm-c84-ssh-managed-child-single-boot-collector"
+COLLECTOR_QEMU_FEATURE = f"{COLLECTOR_FEATURE}-qemu-acceptance"
 FAMILY = "WASM_C84_SSH_MANAGED_CHILD_VERIFIED_STREAM"
 FINISH_FAMILY = "WASM_C84_SSH_MANAGED_CHILD_FINISH_VERIFY"
 IRQ_FAMILY = "WASM_C84_SSH_MANAGED_CHILD_IRQ_OVERLAY"
@@ -309,17 +311,22 @@ def verify_features(inputs: Inputs) -> None:
 def verify_direct_cfg(inputs: Inputs) -> None:
     ssh = CORE.without_direct_feature_units(inputs.ssh, TRUSTED_SAMPLE_FEATURE)
     ssh = CORE.without_direct_feature_units(ssh, TRUSTED_SAMPLE_QEMU_FEATURE)
+    ssh = CORE.without_direct_feature_units(ssh, COLLECTOR_FEATURE)
+    ssh = CORE.without_direct_feature_units(ssh, COLLECTOR_QEMU_FEATURE)
     kernel_root = CORE.without_direct_feature_units(
         inputs.kernel_root, TRUSTED_SAMPLE_FEATURE
     )
     kernel_root = CORE.without_direct_feature_units(
         kernel_root, TRUSTED_SAMPLE_QEMU_FEATURE
     )
+    kernel_root = CORE.without_direct_feature_units(kernel_root, COLLECTOR_FEATURE)
+    kernel_root = CORE.without_direct_feature_units(kernel_root, COLLECTOR_QEMU_FEATURE)
     sources = (
         ("SSH", ssh, 6, 7, 9, 14),
-        # The second base reference is the exact mutual-exclusion guard shared
-        # with the trusted-sample sibling.
-        ("kernel root", kernel_root, 0, 2, 0, 3),
+        # The second and third base references are the exact mutual-exclusion
+        # guards shared with the trusted-sample and collector siblings. The
+        # fourth QEMU reference is the collector image's isolation guard.
+        ("kernel root", kernel_root, 0, 3, 0, 4),
     )
     for label, source, base_direct, base_all, qemu_direct, qemu_all in sources:
         rust = CORE.rust_mask(source, literals=False)
@@ -387,6 +394,8 @@ def verify_direct_cfg(inputs: Inputs) -> None:
 def verify_slot_typestate(source: str) -> None:
     source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
     source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
+    source = CORE.without_direct_feature_units(source, COLLECTOR_FEATURE)
+    source = CORE.without_direct_feature_units(source, COLLECTOR_QEMU_FEATURE)
     status = find_scope(source, r"\bpub\(crate\)\s+enum\s+SlotStatus\b", "SlotStatus")
     require(
         "Verified {\n        epoch: u64,\n        cursor: usize,\n        intervals: usize,\n    }"
@@ -464,6 +473,8 @@ def verify_slot_typestate(source: str) -> None:
 def verify_ssh(source: str) -> None:
     source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
     source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
+    source = CORE.without_direct_feature_units(source, COLLECTOR_FEATURE)
+    source = CORE.without_direct_feature_units(source, COLLECTOR_QEMU_FEATURE)
     owner = find_scope(source, r"\bimpl\s+SshExecProfileOwner\b", "SSH profile owner")
     response = find_function(owner, "response_boundary", "SSH response boundary")
     cancel = find_function(owner, "cancel", "SSH active Drop")

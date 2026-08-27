@@ -743,6 +743,122 @@ family is diagnostic log evidence, not serialized JSON. This node calls no
 24-sample collector chain, performs no physical Milk-V Duo capture or cold
 boot, and makes no AOT decision.
 
+## Private single-cold-boot collector closure
+
+The default-off
+`wasm-c84-ssh-managed-child-single-boot-collector` successor now consumes the
+opaque trusted bundle inside the kernel profile slot. It never exposes the
+verified target, terminal evidence, record factory, sample index, or prior
+accumulator to the SSH adapter. A build-bound `Campaign` reads only the
+compile-time `VIBEOS_C84_SOURCE_COMMIT` and `VIBEOS_C84_CHALLENGE`, validates
+their canonical lowercase hexadecimal encodings, and derives the frozen
+run-id with pinned no-std SHA-256. Kernel initialization commits META once and
+then splits the portable `CollectorReady`: the storage-bearing `TargetReady`
+returns to `SLOT`, while the opaque `BootCollector` remains in a second private
+slot. Their only lock order is target slot then collector slot.
+
+Each accepted target is bound to the exact task/allocation/epoch `OwnerSeal`.
+After finish, independent ledger verification, live terminal validation, and
+opaque-bundle creation, the adapter installs matching Publishing tombstones in
+both slots. It then releases both locks, proves the exact owner is still
+current, and disarms the detach callback before acquiring any record sink. The
+portable collector supplies its own private checked sequence and accumulator;
+the kernel cannot skip, repeat, roll back, or substitute either value. The
+global Ready lineage is not reinstalled until every synchronous publication
+transition has completed.
+
+One successful boot commits exactly 26 records:
+
+- one META;
+- SAMPLE sequence/index 0 through 23, with 0 through 2 marked warmup and 3
+  through 23 retained; and
+- one END immediately after SAMPLE 23.
+
+The collector retains only the 21 total-tick values needed for its per-boot
+guard. After SAMPLE 23 commits, it computes nearest-rank p50 at sorted index 10
+and p95 at index 19 and accepts stability only when the checked `u128`
+comparison `p95 * 100 <= p50 * 150` holds. Only then may it acquire, write, and
+commit END. `TargetReady` epoch 25 becomes globally visible after that END
+commit; no public early-finish or 25th-sample surface exists. The portable
+known-answer transcript is 34,386 bytes with SHA-256
+`10df3a084b5817ee998c11e3eab0326fc2f16bdeba6644ce7e29e57c7bbc9da2`.
+
+The physical sink acquires the console renderer and UART transmitter only in
+TTY-to-TX order. A temporary non-Send record holds both guards over every
+`write_all`, writes raw LF without CRLF translation, requires the record to
+begin at column zero and contain one final LF, and releases TX then TTY only
+after a successful commit observes the transmitter fully empty. A write,
+framing, commit, or panic failure retains the guards through `ManuallyDrop` so
+a partial formal record cannot be followed by ordinary UART output. The
+persistent factory is Send but not Sync and stores no guard.
+
+Every failure after META is absorbing. Registration, reservation, start,
+owner, terminal, target, cancellation, sink, stability, state, and concurrent
+attempt failures permanently move the campaign to Failed. The sole recycled
+Ready remains in the target slot for ownership closure, but Failed and Closed
+are checked before detach registration or target start. They admit no reset,
+retry, second META, later SAMPLE, or END and do not consume another epoch.
+SSHD accepts such a rejected exec request only to drain empty stdout, status
+126, EOF, and CLOSE. Its rejection variant carries no command, Component,
+profile permit, or execution path, so neither VSH nor the target can start.
+
+The QEMU acceptance feature deliberately selects a different absorbing audit
+sink. It runs the identical campaign, serializer, 24 SSH calls, and collector
+state machine, but keeps only each committed record's byte count and SHA-256;
+formal bytes are never buffered, recovered, or written to UART. Every audit
+marker consumes a private post-commit token and ends with
+`decision_eligible=0 formal_uart=0`. One boot commits META and then loses its
+active epoch-1 target, proving an absorbing Failed state with one audit commit
+and a pre-start rejection at Ready epoch 2. A fresh boot commits META, 24
+SAMPLE records, and END, then rejects attempt 25 at Ready epoch 25. The runner
+freezes two independent UART logs and OpenSSH fixtures, checks all predecessor
+families and terminal order, and scans the complete raw logs for zero
+occurrences of `VIBE_WASM_AOT_META`, `VIBE_WASM_AOT_SAMPLE`,
+`VIBE_WASM_AOT_END`, or any formal schema payload. These audit logs are
+integration evidence only and can never enter the physical decision dataset.
+
+The source, parser, and live gates are:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-single-boot-collector.py \
+  --selftest --check-source
+python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py \
+  --selftest
+./scripts/qemu-c84-ssh-managed-child-single-boot-collector-test.sh
+```
+
+A physical collector image must be produced from a clean preparation checkout
+with a fresh non-zero challenge. The build command rejects the QEMU-only test
+sentinels, requires the bound source to equal HEAD, verifies the recorded
+jitterentropy patch, and invokes Cargo locked and offline inside a sanitized
+`env -i` envelope. The envelope uses an isolated Cargo home, pinned Rust tools,
+a fixed `ld.lld`, commit-derived `SOURCE_DATE_EPOCH`, and isolated objcopy, so
+ambient wrappers, rustflags, and profile overrides cannot alter the timing
+image:
+
+```sh
+prep=$(git rev-parse HEAD)
+challenge=$(openssl rand -hex 32)
+test -z "$(git status --porcelain=v1 --untracked-files=all \
+  --ignore-submodules=none)"
+cargo fetch --locked
+
+VIBEOS_C84_SOURCE_COMMIT="$prep" \
+VIBEOS_C84_CHALLENGE="$challenge" \
+  ./scripts/build-milkv-duo.sh --wasm-aot-profile \
+  /absolute/path/to/duo-buildroot-sdk
+```
+
+This closes only the private single-boot collection mechanism. It does not
+package or capture physical evidence, attest a power cycle, assign boot indexes
+0 through 2, publish three independently verified raw transcripts, supply the
+63 retained physical samples, complete C8.3, or make the final C8.4 decision.
+CI additionally builds and links this physical Milk-V feature with a freshly
+generated challenge while the checkout is clean. It deliberately injects
+hostile ambient wrapper, rustflag, and profile values to prove the sanitized
+envelope ignores them, but neither runs nor retains the artifact; that compile
+gate is not a capture, a cold-boot attestation, or decision input.
+
 ## Decision rule
 
 Let `T` be each retained sample's `total_ticks`, `I` its `interpretation`
@@ -785,9 +901,12 @@ python3 -B scripts/verify-c84-ssh-managed-child-verified-stream.py --selftest --
 ./scripts/qemu-c84-ssh-managed-child-verified-stream-test.sh
 python3 -B scripts/verify-c84-ssh-managed-child-trusted-sample.py --selftest --check-source
 ./scripts/qemu-c84-ssh-managed-child-trusted-sample-test.sh
+python3 -B scripts/verify-c84-ssh-managed-child-single-boot-collector.py --selftest --check-source
+python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py --selftest
+./scripts/qemu-c84-ssh-managed-child-single-boot-collector-test.sh
 ```
 
 These checks validate the preparation contract, portable single-SAMPLE
-ownership/serialization, diagnostic ownership, and single-hart QEMU
-integration transcript semantics only; they cannot manufacture the missing
-physical C8.3 or C8.4 evidence.
+ownership/serialization, trusted producer, private single-boot collector, and
+single-hart QEMU integration transcript semantics only; they cannot
+manufacture the missing physical C8.3 or C8.4 evidence.

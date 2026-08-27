@@ -1185,6 +1185,7 @@ name = "vibeos-kernel"
 version = "0.1.0"
 dependencies = [
  "jitterentropy-rs",
+ "sha2",
  "vibeos-authority-store",
  "vibeos-bsp-milkv-duo",
  "vibeos-bsp-qemu-virt",
@@ -1379,6 +1380,9 @@ dependencies = [
 [[package]]
 name = "vibeos-wasm-aot-profile"
 version = "0.1.0"
+dependencies = [
+ "sha2",
+]
 
 [[package]]
 name = "vibeos-wasm-candidates"

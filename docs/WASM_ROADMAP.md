@@ -371,8 +371,29 @@ public Core-Wasm ABI.
 | C1.3 | Enforce mandatory effective maxima | `memory.grow`, table growth, call depth and engine allocation fail deterministically without charging another owner |
 | C1.4 | Implement total fuel and resumable poll quantum | An infinite loop returns after one bounded quantum and terminates only when total fuel or cancellation wins |
 | C1.5 | Freeze stable Core trap diagnostics | Arithmetic, unreachable, out-of-bounds, bad indirect call, call depth, validation and fuel failures have exact tested codes |
-| C1.6 | Add differential and specification evidence | Accepted modules match a pinned reference runtime and selected official Core spec tests; profile rejections are separately asserted |
+| C1.6 | Add differential and specification evidence | The complete pinned `wg-1.0` `fac.wast` baseline agrees across its official assertions, Vibe, and DLR; profile rejections remain separately asserted |
 | C1.7 | Fuzz decode, validate, instantiate and execute | Arbitrary bytes never panic the host and cannot allocate or run without configured bounds |
+
+**C1.6 selected baseline (2026-08-27):** the offline fixture is the complete
+official [`test/core/fac.wast`](https://github.com/WebAssembly/spec/blob/977f97014c962f7bd1291fcc6d28b41a924882bf/test/core/fac.wast)
+from WebAssembly/spec `wg-1.0` commit
+`977f97014c962f7bd1291fcc6d28b41a924882bf`, not a rewritten subset. Its exact
+2,602 bytes are pinned by SHA-256
+`7bf27b090f6533865acc79a37e0331b27fa11d7a3ab27b02e32e2efddfb405e7`; the
+vendored license is independently pinned, and
+[`PROVENANCE.md`](../wasm-runtime/tests/spec/core-wg-1.0/PROVENANCE.md) records
+the immutable source URL, path, commit, sizes, and digests. The runner requires
+the file's one module, all five `assert_return` actions, and its one
+`assert_exhaustion`, rejecting any extra directive. For every return it compares
+the official WAST result with both Vibe's bounded Profile-1 engine and the
+pinned DLR reference runtime; the exhaustion action must classify as Vibe
+`CallDepthExceeded` and DLR `StackExhaustion`. This closes a selected integer
+semantic baseline covering calls/recursion, locals, structured control flow,
+the fixture's non-negative factorial comparisons, and wrapping `i64`
+arithmetic. It is not a claim of full
+WebAssembly Core 2.0 conformance and does not widen Profile 1. C1.7 remains
+open until bounded decode, validation, instantiation, and execution fuzzing
+lands.
 
 **Demo:** a host test invokes exported integer functions, grows bounded memory,
 observes exact traps, and resumes an infinite loop across multiple quanta. This

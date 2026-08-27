@@ -1,0 +1,2 @@
+# Preserve the byte-pinned upstream Apache-2.0 text, including its final blank line.
+wasm-runtime/tests/spec/core-wg-1.0/LICENSE whitespace=-blank-at-eof

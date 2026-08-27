@@ -1401,9 +1401,11 @@ name = "vibeos-wasm-runtime"
 version = "0.1.0"
 dependencies = [
  "dlr-wasm-interpreter",
+ "sha2",
  "vibeos-component-format",
  "wasmi",
  "wasmparser 0.255.0",
+ "wast",
  "wat",
 ]
 

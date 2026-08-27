@@ -105,7 +105,7 @@ fn component_group_enforces_the_image_memory_ceiling_at_runtime() {
     let module = compile_in(
         &engine,
         r#"(module
-              (memory 1 4)
+              (memory (export "memory") 1 4)
               (func (export "grow") (param i32) (result i32)
                 local.get 0
                 memory.grow))"#,
@@ -126,10 +126,11 @@ fn component_group_enforces_the_image_memory_ceiling_at_runtime() {
     group
         .start_call(0, "grow", &[CoreValue::I32(1)], 100_000, 10_000)
         .unwrap();
-    assert!(matches!(
+    assert_eq!(
         poll_group_to_terminal(&mut group, 0),
-        PollResult::Trapped(_)
-    ));
+        PollResult::Trapped(TrapCode::LimitExceeded)
+    );
+    assert_eq!(group.memory_size(0, "memory"), Ok(2 * 65_536));
 
     // A non-page-aligned ceiling below the module's initial page also fails
     // closed during instantiation.

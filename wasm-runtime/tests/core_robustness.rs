@@ -216,6 +216,8 @@ fn assert_summary_within_profile(summary: CoreSummary, byte_len: usize) {
                 .max_locals_per_function
                 .saturating_mul(summary.functions)
     );
+    assert!(summary.max_locals <= PROFILE_1_LIMITS.max_locals_per_function);
+    assert!(summary.max_locals <= summary.locals);
     assert!(summary.memories <= PROFILE_1_LIMITS.max_memories);
     assert!(summary.tables <= PROFILE_1_LIMITS.max_tables);
     assert!(summary.data_segments <= PROFILE_1_LIMITS.max_data_segments);

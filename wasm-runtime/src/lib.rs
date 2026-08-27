@@ -21,10 +21,10 @@ use vibeos_component_format::{
     WasmiEnforcedLimits, WasmiFuelCosts, PROFILE_1_LIMITS,
 };
 use wasmi::{
-    errors::HostError, CompilationMode, Config, EnforcedLimits, Engine, Error as WasmiError,
-    ExternType, Func, FuncType, Instance, Linker, Memory, Module, ResumableCall,
-    ResumableCallHostTrap, ResumableCallOutOfFuel, Store, StoreLimits, StoreLimitsBuilder, Val,
-    ValType,
+    errors::{HostError, TableError},
+    CompilationMode, Config, EnforcedLimits, Engine, Error as WasmiError, ExternType, Func,
+    FuncType, Instance, Linker, Memory, Module, ResumableCall, ResumableCallHostTrap,
+    ResumableCallOutOfFuel, Store, StoreLimits, StoreLimitsBuilder, Table, Val, ValType,
 };
 use wasmparser::{
     Encoding, FrameKind, FrameStack, Parser, Payload, TypeRef, Validator, VisitOperator,
@@ -86,7 +86,10 @@ pub struct CoreSummary {
     pub imports: u32,
     pub exports: u32,
     pub globals: u32,
+    /// Aggregate declared locals across all defined functions.
     pub locals: u32,
+    /// Largest declared-local count in any one defined function.
+    pub max_locals: u32,
     pub memories: u32,
     pub tables: u32,
     pub data_segments: u32,
@@ -648,6 +651,7 @@ fn inspect_function_body(
         )?;
     }
     summary.locals = summary.locals.saturating_add(locals);
+    summary.max_locals = summary.max_locals.max(locals);
 
     let mut reader = body
         .get_binary_reader_for_operators()
@@ -1020,8 +1024,13 @@ pub struct OwnerAllocationReservation {
 }
 
 impl OwnerAllocationReservation {
-    /// Creates a reservation already charged to the prospective instance
-    /// owner. C4 must enter that owner's allocator scope while compiling.
+    /// Creates a per-compilation ceiling that the caller asserts it has charged
+    /// to the prospective instance owner.
+    ///
+    /// This copyable value records that assertion; it is not an owner credential
+    /// or the ledger itself. Every invocation that uses it must be charged
+    /// separately, and C4 must enter that exact owner's allocator scope while
+    /// compiling.
     pub const fn new(bytes: usize) -> Self {
         Self { bytes }
     }
@@ -1206,6 +1215,40 @@ impl fmt::Debug for CoreHostTerminationToken {
     }
 }
 
+fn compile_reservation_bytes(input_bytes: usize, summary: CoreSummary) -> usize {
+    // Wasmi reuses its translator allocations between functions. Its locals
+    // head nevertheless expands one pointer-sized slot per parameter/local for
+    // the largest function, even when a compact local group occupies only a
+    // few input bytes. Include that peak explicitly in the policy charge.
+    let local_slots = (summary.max_locals as usize).saturating_add(summary.max_params as usize);
+    let structural = (summary.functions as usize)
+        .saturating_mul(64)
+        .saturating_add((summary.types as usize).saturating_mul(32))
+        .saturating_add((summary.globals as usize).saturating_mul(16))
+        .saturating_add(local_slots.saturating_mul(core::mem::size_of::<usize>()));
+    input_bytes.saturating_mul(32).saturating_add(structural)
+}
+
+fn inspect_compile_reservation(
+    bytes: &[u8],
+    reservation: OwnerAllocationReservation,
+) -> Result<(CoreSummary, usize), AdmissionError> {
+    let summary = inspect_core(bytes)?;
+    // Wasmi does not expose exact fallible allocation callbacks. This
+    // deterministic policy charge is checked before either engine creation or
+    // Module::new, so a short caller reservation cannot start compilation in
+    // an ambient fallback owner. It is not an upper bound on Wasmi's actual
+    // allocation-request total or live/high-water memory.
+    let reserved_compile_bytes = compile_reservation_bytes(bytes.len(), summary);
+    if reserved_compile_bytes > reservation.bytes() {
+        return Err(AdmissionError {
+            trap: TrapCode::LimitExceeded,
+            detail: AdmissionDetail::AllocationReservation,
+        });
+    }
+    Ok((summary, reserved_compile_bytes))
+}
+
 #[derive(Debug)]
 pub struct ValidatedCore {
     engine: Engine,
@@ -1215,11 +1258,27 @@ pub struct ValidatedCore {
 }
 
 impl ValidatedCore {
+    /// Returns the deterministic policy charge required by the compilation
+    /// reservation gate for `bytes`.
+    ///
+    /// This performs the bounded structural admission pass but does not create
+    /// a Wasmi engine or module. The charge includes compact declarations that
+    /// Wasmi expands, such as the largest function's locals. It is not an upper
+    /// bound on Wasmi's actual allocation-request total or live/high-water
+    /// memory. Callers can debit the selected policy owner before entering
+    /// [`Self::new`] or [`Self::new_in`].
+    pub fn required_compile_bytes(bytes: &[u8]) -> Result<usize, AdmissionError> {
+        let summary = inspect_core(bytes)?;
+        Ok(compile_reservation_bytes(bytes.len(), summary))
+    }
+
     pub fn new(
         bytes: &[u8],
         reservation: OwnerAllocationReservation,
     ) -> Result<Self, AdmissionError> {
-        Self::new_in(&ProfileEngine::new(), bytes, reservation)
+        let (summary, reserved_compile_bytes) = inspect_compile_reservation(bytes, reservation)?;
+        let engine = ProfileEngine::new().inner;
+        Self::compile_inspected(engine, bytes, summary, reserved_compile_bytes)
     }
 
     pub fn new_in(
@@ -1227,22 +1286,17 @@ impl ValidatedCore {
         bytes: &[u8],
         reservation: OwnerAllocationReservation,
     ) -> Result<Self, AdmissionError> {
-        let summary = inspect_core(bytes)?;
-        // This is a deliberately conservative pre-charge, not a claim that
-        // wasmi exposes exact allocation callbacks. The reservation belongs to
-        // one owner and is consumed before any engine allocation is attempted.
-        let structural = (summary.functions as usize)
-            .saturating_mul(64)
-            .saturating_add((summary.types as usize).saturating_mul(32))
-            .saturating_add((summary.globals as usize).saturating_mul(16));
-        let reserved_compile_bytes = bytes.len().saturating_mul(32).saturating_add(structural);
-        if reserved_compile_bytes > reservation.bytes() {
-            return Err(AdmissionError {
-                trap: TrapCode::LimitExceeded,
-                detail: AdmissionDetail::AllocationReservation,
-            });
-        }
+        let (summary, reserved_compile_bytes) = inspect_compile_reservation(bytes, reservation)?;
         let engine = profile_engine.inner.clone();
+        Self::compile_inspected(engine, bytes, summary, reserved_compile_bytes)
+    }
+
+    fn compile_inspected(
+        engine: Engine,
+        bytes: &[u8],
+        summary: CoreSummary,
+        reserved_compile_bytes: usize,
+    ) -> Result<Self, AdmissionError> {
         let module = Module::new(&engine, bytes)
             .map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?;
         Ok(Self {
@@ -1257,6 +1311,10 @@ impl ValidatedCore {
         self.summary
     }
 
+    /// Returns the deterministic policy charge admitted for this compilation.
+    ///
+    /// This is not Wasmi's actual allocation-request total or a measured
+    /// live/high-water byte count.
     pub const fn reserved_compile_bytes(&self) -> usize {
         self.reserved_compile_bytes
     }
@@ -1291,11 +1349,13 @@ impl ValidatedCore {
         imports: &[CoreHostImport<'_>],
     ) -> Result<CoreInstance, AdmissionError> {
         self.check_host_imports(imports)?;
+        let memory_limit_bytes = PROFILE_1_LIMITS.max_memory_pages as usize * 65_536;
         let limits = profile_store_limits(1);
         let mut store = Store::new(
             &self.engine,
             HostState {
                 limits,
+                memory_limit_bytes,
                 pending_host: None,
             },
         );
@@ -1439,9 +1499,37 @@ pub fn profile_store_limits_with_memory(
         .build())
 }
 
+fn additional_memory_pages(
+    current_bytes: usize,
+    minimum_bytes: usize,
+    policy_bytes: usize,
+) -> Result<Option<u64>, TrapCode> {
+    if minimum_bytes <= current_bytes {
+        return Ok(None);
+    }
+    let additional_bytes = minimum_bytes
+        .checked_sub(current_bytes)
+        .ok_or(TrapCode::LimitExceeded)?;
+    let additional_pages = additional_bytes
+        .checked_add(65_535)
+        .ok_or(TrapCode::LimitExceeded)?
+        / 65_536;
+    let desired_bytes = additional_pages
+        .checked_mul(65_536)
+        .and_then(|bytes| current_bytes.checked_add(bytes))
+        .ok_or(TrapCode::LimitExceeded)?;
+    if desired_bytes > policy_bytes {
+        return Err(TrapCode::LimitExceeded);
+    }
+    Ok(Some(
+        u64::try_from(additional_pages).map_err(|_| TrapCode::LimitExceeded)?,
+    ))
+}
+
 #[derive(Debug)]
 struct HostState {
     limits: StoreLimits,
+    memory_limit_bytes: usize,
     pending_host: Option<PendingHostCall>,
 }
 
@@ -1847,23 +1935,57 @@ impl CoreInstance {
         Ok(self.memory(export)?.data_size(&self.store))
     }
 
+    /// Returns the current size of an exported Profile-1 function table.
+    pub fn table_size(&self, export: &str) -> Result<usize, TrapCode> {
+        usize::try_from(self.table(export)?.size(&self.store)).map_err(|_| TrapCode::LimitExceeded)
+    }
+
+    /// Grows an exported function table to `minimum_elements`.
+    ///
+    /// This host-side seam does not enable the disabled reference-types
+    /// `table.grow` instruction. It exercises the same lifetime store limiter
+    /// that guards engine-driven growth and initializes new MVP slots to null.
+    pub fn grow_table_to(&mut self, export: &str, minimum_elements: usize) -> Result<(), TrapCode> {
+        let table = self.table(export)?;
+        if minimum_elements > PROFILE_1_LIMITS.max_table_elements as usize {
+            return Err(TrapCode::LimitExceeded);
+        }
+        let minimum_elements_u64 =
+            u64::try_from(minimum_elements).map_err(|_| TrapCode::LimitExceeded)?;
+        if table
+            .ty(&self.store)
+            .maximum()
+            .is_some_and(|maximum| minimum_elements_u64 > maximum)
+        {
+            return Err(TrapCode::TableOutOfBounds);
+        }
+        let current =
+            usize::try_from(table.size(&self.store)).map_err(|_| TrapCode::LimitExceeded)?;
+        if minimum_elements <= current {
+            return Ok(());
+        }
+        let additional = minimum_elements
+            .checked_sub(current)
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(TrapCode::LimitExceeded)?;
+        table
+            .grow(&mut self.store, additional, Val::default(ValType::FuncRef))
+            .map_err(map_table_growth_error)?;
+        Ok(())
+    }
+
     /// Grows an exported memory to cover `minimum_bytes`, preserving the Core
     /// module's declared maximum and the store's owner limits.
     pub fn grow_memory_to(&mut self, export: &str, minimum_bytes: usize) -> Result<(), TrapCode> {
         let memory = self.memory(export)?;
         let current = memory.data_size(&self.store);
-        if minimum_bytes <= current {
+        let Some(additional_pages) =
+            additional_memory_pages(current, minimum_bytes, self.store.data().memory_limit_bytes)?
+        else {
             return Ok(());
-        }
-        let additional_bytes = minimum_bytes
-            .checked_sub(current)
-            .ok_or(TrapCode::MemoryOutOfBounds)?;
-        let additional_pages = additional_bytes
-            .checked_add(65_535)
-            .ok_or(TrapCode::MemoryOutOfBounds)?
-            / 65_536;
+        };
         memory
-            .grow(&mut self.store, additional_pages as u64)
+            .grow(&mut self.store, additional_pages)
             .map_err(|_| TrapCode::MemoryOutOfBounds)?;
         Ok(())
     }
@@ -1871,6 +1993,12 @@ impl CoreInstance {
     fn memory(&self, export: &str) -> Result<Memory, TrapCode> {
         self.instance
             .get_memory(&self.store, export)
+            .ok_or(TrapCode::Validation)
+    }
+
+    fn table(&self, export: &str) -> Result<Table, TrapCode> {
+        self.instance
+            .get_table(&self.store, export)
             .ok_or(TrapCode::Validation)
     }
 
@@ -2019,6 +2147,7 @@ impl CoreComponentGroup {
             &engine.inner,
             HostState {
                 limits: profile_store_limits_with_memory(instance_limit.max(1), memory_bytes)?,
+                memory_limit_bytes: memory_bytes,
                 pending_host: None,
             },
         );
@@ -3095,16 +3224,13 @@ impl CoreComponentGroup {
     ) -> Result<(), TrapCode> {
         let memory = self.authorized_memory(authority)?;
         let current = memory.data_size(&self.store);
-        if minimum_bytes <= current {
+        let Some(additional_pages) =
+            additional_memory_pages(current, minimum_bytes, self.store.data().memory_limit_bytes)?
+        else {
             return Ok(());
-        }
-        let additional_pages = minimum_bytes
-            .checked_sub(current)
-            .and_then(|bytes| bytes.checked_add(65_535))
-            .ok_or(TrapCode::MemoryOutOfBounds)?
-            / 65_536;
+        };
         memory
-            .grow(&mut self.store, additional_pages as u64)
+            .grow(&mut self.store, additional_pages)
             .map_err(|_| TrapCode::MemoryOutOfBounds)?;
         Ok(())
     }
@@ -3648,6 +3774,18 @@ impl Drop for Invocation<'_> {
         if !self.terminal {
             let _ = self.instance.discard_call();
         }
+    }
+}
+
+fn map_table_growth_error(error: TableError) -> TrapCode {
+    match error {
+        TableError::OutOfSystemMemory
+        | TableError::MinimumSizeOverflow
+        | TableError::MaximumSizeOverflow
+        | TableError::ResourceLimiterDeniedAllocation => TrapCode::LimitExceeded,
+        TableError::GrowOutOfBounds => TrapCode::TableOutOfBounds,
+        TableError::OutOfFuel { .. } => TrapCode::FuelExhausted,
+        _ => TrapCode::Validation,
     }
 }
 

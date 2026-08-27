@@ -8,6 +8,8 @@ cargo test --manifest-path vendor/sunset/Cargo.toml -p sunset \
   --no-default-features --features alloc # audited Sunset fork tests
 cargo test --locked --offline -p vibeos-wasm-runtime \
   --test decode_limits -- --test-threads=1 # C1.2 no attacker-scaled decode allocation
+cargo test --locked --offline -p vibeos-wasm-runtime \
+  --test effective_maxima -- --test-threads=1 # C1.3 adjacent execution/allocation maxima
 cargo test --locked --offline -p vibeos-wasm-runtime --test core_spec # C1.6 pinned official integer semantics
 cargo test --locked --offline -p vibeos-wasm-runtime --test core_robustness # C1.7 deterministic bounded corpus
 cargo test --locked --offline -p vibeos-component-runtime \
@@ -109,6 +111,39 @@ fixed Profile-1 stack. This host gate does not measure Component decoding,
 successful Wasmi compilation, instantiation, growth, call-depth enforcement,
 kernel allocator ownership, QEMU or Duo allocation, or exhaustive fuzzing;
 those have separate gates or later roadmap nodes.
+
+`wasm-runtime/tests/effective_maxima.rs` is the portable C1.3 adjacent-boundary
+gate. An image-selected two-page store ceiling admits the first guest
+`memory.grow`, then repeatedly returns exact `LimitExceeded` without changing
+the two-page memory; a smaller module-declared maximum remains the distinct Core
+`MemoryOutOfBounds` path for host-directed growth. The production host table
+seam grows an MVP function table to exactly 4,096 elements, then rejects 4,097
+twice with `LimitExceeded` and an unchanged size. Guest `table.grow` remains an
+`UnsupportedFeature`; the gate does not enable reference types.
+
+The recursive countdown pins Wasmi's configured call-stack interpretation:
+argument 127 succeeds with 128 active frames, while argument 128 attempts the
+129th frame and repeatedly returns `CallDepthExceeded`; a shallow call succeeds
+afterward. The compile-reservation case pins the calculator-reported policy
+charge and charge-minus-one behavior. Its 27-byte raw module declares 4,096
+locals in one compact group; `CoreSummary::max_locals` records that count, and
+the policy charge includes the corresponding pointer-sized per-function
+expansion. A short reservation through `ValidatedCore::new` must have the same
+allocation-request fingerprint as `inspect_core`, proving rejection occurs
+before engine creation and `Module::new`.
+
+That allocation probe labels two synthetic caller-selected owner scopes and
+records calls, cumulative requested bytes, and largest requests for the current
+test thread. It proves the portable runtime does not switch a rejected or
+accepted compilation into the other label and observes, during selected-scope
+compilation, an allocation request at least as large as the compressed-locals
+expansion. `OwnerAllocationReservation` is a caller-provided per-compilation
+policy-ceiling assertion, not an owner credential or ledger debit. The
+deterministic policy charge is not an upper bound on Wasmi's allocation-request
+total or live/high-water memory.
+Live/high-water/denial accounting, an unforgeable kernel owner, aggregate memory
+across a multi-module Component principal, and lifecycle reclamation remain
+C4.2/C6 evidence. The gate performs no QEMU or Duo work.
 
 The C1.6 specification gate is deliberately offline and byte-pinned. It vendors
 the complete official [`test/core/fac.wast`](https://github.com/WebAssembly/spec/blob/977f97014c962f7bd1291fcc6d28b41a924882bf/test/core/fac.wast)

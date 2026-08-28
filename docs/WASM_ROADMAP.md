@@ -571,26 +571,38 @@ deterministic evidence.
 
 **C1.7 selected robustness evidence (2026-08-27):**
 `wasm-runtime/tests/core_robustness.rs` generates its corpus locally with fixed
-xorshift64* seed `0x6a09_e667_f3bc_c909`. It pins 679 inputs, 575,262 total
-bytes, and FNV-1a digest `0xbe6b2c8ae635595a`: raw lengths 0--192, equal-length
-tails after the exact Core magic/version, and 96 valid Profile-1 modules plus
-one truncation and one bit flip of each. The accepted modules cover integer
-arithmetic, direct calls, `if`, loops, bounded memory, and `unreachable`;
-separate cases cover a disabled float signature, an unlinked import, bounded
-nontermination and recursion, a tight compile reservation, and the exact
-524,289-byte module-size limit-plus-one input. Ordinary structured inputs never
-exceed 4,096 bytes. Every corpus pipeline exercise is protected by
-`catch_unwind`; every admitted summary/reservation is checked against Profile
-1, and execution uses
-50,000 total fuel with a 10,000-fuel quantum and at most six polls. The 96
+xorshift64* seed `0x6a09_e667_f3bc_c909`. It pins 679 execution inputs and
+575,262 total module bytes. FNV-1a digest `0x7fc98ac32e54fb64` commits every
+case tag, module length and byte, and `i32` invocation argument: raw lengths
+0--192, equal-length tails after the exact Core magic/version, and 96 valid
+Profile-1 modules plus one truncation and one bit flip of each. The accepted
+modules cover integer arithmetic, direct calls, `if`, loops, bounded memory,
+and `unreachable`; separate cases cover a disabled float signature, an
+unlinked import, bounded nontermination and recursion, a tight compile
+reservation, and the exact 524,289-byte module-size limit-plus-one input.
+Ordinary structured inputs never exceed 4,096 bytes.
+
+Every corpus pipeline exercise is protected by `catch_unwind`, repeated from a
+fresh pipeline, and required to produce the same full result. Every admitted
+summary/reservation is checked against Profile 1. Execution uses 50,000 total
+fuel with a 10,000-fuel quantum and at most six polls; pending and terminal
+metrics conserve the ledger and advance by no more than one quantum. The 96
 unmodified generated modules and dedicated spin/recursion cases require exact
 `Ready`, `Unreachable`, `FuelExhausted`, and `CallDepthExceeded` outcomes.
-Mutated or arbitrary inputs may reject earlier or terminate differently, but
-must remain panic-free and bounded, may not reach a host call, and must clear
-the active call on every terminal result. This closes the C1.7 criterion for
-the selected deterministic bounded CI evidence. It is not coverage-guided or
-exhaustive fuzzing, and it does not assert that all possible Core byte
-sequences have been enumerated.
+
+The normalized ordered outcome digest `0x2e7b93e373f2c522` commits complete
+admission/instantiation errors, start/execution trap codes, and typed ready
+vectors for all 679 inputs. Exact counts pin 552 admission rejections, 127
+admissions, 126 instantiations, 111 starts, 101 ready terminals, 10 trapped
+terminals, one instantiation rejection, and 15 start rejections. No arbitrary
+or mutated input may silently change stage or terminal, panic, reach a host
+call, exceed its poll bound, or retain an active call after termination.
+
+This closes the C1.7 criterion for the selected deterministic bounded CI
+evidence. It is not coverage-guided or exhaustive fuzzing, and it does not
+claim every possible Core byte sequence, actual cumulative/live allocator
+measurements, kernel-owner attribution, wall-clock bounds, or exhaustive opcode
+coverage.
 
 **Demo:** a host test invokes exported integer functions, grows bounded memory,
 observes exact traps, and resumes an infinite loop across multiple quanta. This

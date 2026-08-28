@@ -261,9 +261,10 @@ itself supply C1.7 robustness evidence; that separate gate is described below.
 
 `wasm-runtime/tests/core_robustness.rs` is the C1.7 deterministic bounded CI
 corpus. Its in-process xorshift64* generator uses the fixed seed
-`0x6a09_e667_f3bc_c909`; the test pins exactly 679 inputs, 575,262 aggregate
-input bytes, and the length-and-tag-bound FNV-1a digest
-`0xbe6b2c8ae635595a`. The corpus contains raw inputs at every length from 0
+`0x6a09_e667_f3bc_c909`; the test pins exactly 679 execution inputs and 575,262
+aggregate module bytes. The input FNV-1a digest `0x7fc98ac32e54fb64`
+commits each case tag, module length and bytes, and little-endian `i32`
+invocation argument. The corpus contains raw inputs at every length from 0
 through 192, the same tail lengths after an exact Core magic/version prefix,
 and 96 valid generated Profile-1 modules plus one truncation and one bit flip
 of each. The valid modules cover integer arithmetic, direct calls, `if`, loops,
@@ -273,18 +274,30 @@ nontermination, call-depth exhaustion, the exact 524,289-byte module-size
 limit-plus-one input, and a compile reservation one byte below the measured
 requirement. Every ordinary structured input is at most 4,096 bytes.
 
-Each pipeline exercise is enclosed by `catch_unwind`, checks every admitted
-summary and compile reservation against Profile 1, then drives any runnable
-module with exactly 50,000 total fuel and a 10,000-fuel quantum. At most six
-polls may occur. The 96 unmodified generated modules and the dedicated spin
-and recursion cases require exact `Ready`, `Unreachable`, `FuelExhausted`, and
-`CallDepthExceeded` outcomes. Mutated or arbitrary inputs may reject at any
-earlier stage or terminate with another bounded result, but they may not panic,
-reach a host call, exceed the poll bound, or leave an active call after a
-terminal result. This closes the selected deterministic C1.7 evidence for
-decode, validation, instantiation, and execution under configured bounds. It
-is a reproducible bounded CI corpus, not coverage-guided or exhaustive fuzzing,
-and does not claim enumeration of all byte sequences.
+Each pipeline exercise is enclosed by `catch_unwind`, repeated from a fresh
+pipeline, and required to return the same full outcome. Every admitted summary
+and compile reservation is checked against Profile 1. Runnable modules receive
+exactly 50,000 total fuel and a 10,000-fuel quantum for at most six polls; every
+pending or terminal poll preserves the fuel ledger and consumes no more than
+one quantum. The 96 unmodified generated modules and the dedicated spin and
+recursion cases additionally require exact `Ready`, `Unreachable`,
+`FuelExhausted`, and `CallDepthExceeded` outcomes.
+
+The ordered normalized outcome digest `0x2e7b93e373f2c522` commits every full
+admission or instantiation error (trap, detail, and Core limit kind), start or
+execution trap code, and typed ready vector. Exact stage counts are 552
+admission rejections (506 malformed, 42 unsupported, and 4 limited), 127
+admissions, 126 instantiations, 111 starts, 101 ready terminals, and 10 trapped
+terminals; the remaining paths are one instantiation rejection and 15 start
+rejections. Thus arbitrary and mutated cases may have different kinds of
+pinned outcomes, but none may drift, panic, reach a host call, exceed the poll
+bound, or leave an active call after a terminal result.
+
+This closes the selected deterministic C1.7 evidence for decode, validation,
+instantiation, and execution under configured bounds. It is a reproducible
+bounded CI corpus, not coverage-guided or exhaustive fuzzing, and does not
+claim all byte sequences, actual cumulative/live allocator measurements,
+kernel-owner attribution, wall-clock bounds, or exhaustive opcode coverage.
 
 `component-runtime/tests/canonical_language_fixtures.rs` is the C2.3
 cross-language execution gate. The same exact

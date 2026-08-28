@@ -2,7 +2,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use vibeos_component_format::{LimitKind, TrapCode, PROFILE_1_LIMITS};
 use vibeos_wasm_runtime::{
-    AdmissionDetail, CoreSummary, CoreValue, OwnerAllocationReservation, PollResult, ValidatedCore,
+    AdmissionDetail, AdmissionError, CoreSummary, CoreValue, OwnerAllocationReservation,
+    PollResult, ValidatedCore,
 };
 
 const SEED: u64 = 0x6a09_e667_f3bc_c909;
@@ -11,7 +12,8 @@ const STRUCTURED_CASES: usize = 96;
 const TOTAL_FUEL: u64 = 50_000;
 const EXPECTED_INPUTS: usize = (RAW_MAX_LEN + 1) * 2 + STRUCTURED_CASES * 3 + 5;
 const EXPECTED_TOTAL_INPUT_BYTES: usize = 575_262;
-const EXPECTED_CORPUS_FNV64: u64 = 0xbe6b_2c8a_e635_595a;
+const EXPECTED_CORPUS_FNV64: u64 = 0x7fc9_8ac3_2e54_fb64;
+const EXPECTED_OUTCOME_FNV64: u64 = 0x2e7b_93e3_73f2_c522;
 
 struct Generator(u64);
 
@@ -35,7 +37,7 @@ impl Generator {
 
     fn index(&mut self, upper: usize) -> usize {
         assert!(upper != 0);
-        (self.next_u64() as usize) % upper
+        (self.next_u64() % upper as u64) as usize
     }
 
     fn fill(&mut self, bytes: &mut [u8]) {
@@ -194,8 +196,8 @@ fn structured_case(index: usize, generator: &mut Generator) -> StructuredCase {
 
 #[derive(Debug, PartialEq, Eq)]
 enum PipelineOutcome {
-    AdmissionRejected(AdmissionDetail),
-    InstantiationRejected(AdmissionDetail),
+    AdmissionRejected(AdmissionError),
+    InstantiationRejected(AdmissionError),
     StartRejected(TrapCode),
     Ready(Vec<CoreValue>),
     Trapped(TrapCode),
@@ -234,14 +236,14 @@ fn exercise(bytes: &[u8], input: i32) -> PipelineOutcome {
     let reservation = OwnerAllocationReservation::profile_default();
     let module = match ValidatedCore::new(bytes, reservation) {
         Ok(module) => module,
-        Err(error) => return PipelineOutcome::AdmissionRejected(error.detail),
+        Err(error) => return PipelineOutcome::AdmissionRejected(error),
     };
     assert_summary_within_profile(module.summary(), bytes.len());
     assert!(module.reserved_compile_bytes() <= reservation.bytes());
 
     let mut instance = match module.instantiate() {
         Ok(instance) => instance,
-        Err(error) => return PipelineOutcome::InstantiationRejected(error.detail),
+        Err(error) => return PipelineOutcome::InstantiationRejected(error),
     };
     if let Err(trap) = instance.start_call("run", &[CoreValue::I32(input)], TOTAL_FUEL, quantum) {
         assert!(!instance.has_active_call());
@@ -251,15 +253,26 @@ fn exercise(bytes: &[u8], input: i32) -> PipelineOutcome {
     let max_polls = TOTAL_FUEL.div_ceil(quantum).saturating_add(1);
     let mut previous_consumed = 0;
     for _ in 0..max_polls {
-        match instance.poll_call() {
+        let result = instance.poll_call();
+        let metrics = instance
+            .call_metrics()
+            .expect("a started or terminal call retains its fuel metrics");
+        assert_eq!(
+            metrics.consumed_fuel.saturating_add(metrics.remaining_fuel),
+            TOTAL_FUEL
+        );
+        assert!(metrics.consumed_fuel >= previous_consumed);
+        assert!(metrics.consumed_fuel - previous_consumed <= quantum);
+        previous_consumed = metrics.consumed_fuel;
+
+        match result {
             PollResult::Pending {
                 consumed_fuel,
                 remaining_fuel,
             } => {
                 assert!(instance.has_active_call());
-                assert_eq!(consumed_fuel.saturating_add(remaining_fuel), TOTAL_FUEL);
-                assert!(consumed_fuel >= previous_consumed);
-                previous_consumed = consumed_fuel;
+                assert_eq!(consumed_fuel, metrics.consumed_fuel);
+                assert_eq!(remaining_fuel, metrics.remaining_fuel);
             }
             PollResult::Ready(values) => {
                 assert!(!instance.has_active_call());
@@ -278,13 +291,22 @@ fn exercise(bytes: &[u8], input: i32) -> PipelineOutcome {
 }
 
 fn checked_exercise(label: &str, bytes: &[u8], input: i32) -> PipelineOutcome {
-    match catch_unwind(AssertUnwindSafe(|| exercise(bytes, input))) {
+    let first = match catch_unwind(AssertUnwindSafe(|| exercise(bytes, input))) {
         Ok(outcome) => outcome,
         Err(_) => panic!("host panic while exercising deterministic input {label}"),
-    }
+    };
+    let repeated = match catch_unwind(AssertUnwindSafe(|| exercise(bytes, input))) {
+        Ok(outcome) => outcome,
+        Err(_) => panic!("host panic while repeating deterministic input {label}"),
+    };
+    assert_eq!(
+        repeated, first,
+        "pipeline outcome was not repeatable for deterministic input {label}"
+    );
+    first
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct Coverage {
     inputs: usize,
     total_input_bytes: usize,
@@ -302,18 +324,35 @@ struct Coverage {
     trapped: usize,
 }
 
+const EXPECTED_COVERAGE: Coverage = Coverage {
+    inputs: 679,
+    total_input_bytes: 575_262,
+    max_input_bytes: 524_289,
+    admitted: 127,
+    instantiated: 126,
+    started: 111,
+    malformed: 506,
+    unsupported: 42,
+    limited: 4,
+    other_admission_rejections: 0,
+    instantiation_rejections: 1,
+    start_rejections: 15,
+    ready: 101,
+    trapped: 10,
+};
+
 impl Coverage {
     fn record(&mut self, input_bytes: usize, outcome: &PipelineOutcome) {
         self.inputs += 1;
         self.total_input_bytes = self.total_input_bytes.saturating_add(input_bytes);
         self.max_input_bytes = self.max_input_bytes.max(input_bytes);
         match outcome {
-            PipelineOutcome::AdmissionRejected(AdmissionDetail::Malformed) => self.malformed += 1,
-            PipelineOutcome::AdmissionRejected(AdmissionDetail::UnsupportedFeature) => {
-                self.unsupported += 1;
-            }
-            PipelineOutcome::AdmissionRejected(AdmissionDetail::Limit(_)) => self.limited += 1,
-            PipelineOutcome::AdmissionRejected(_) => self.other_admission_rejections += 1,
+            PipelineOutcome::AdmissionRejected(error) => match error.detail {
+                AdmissionDetail::Malformed => self.malformed += 1,
+                AdmissionDetail::UnsupportedFeature => self.unsupported += 1,
+                AdmissionDetail::Limit(_) => self.limited += 1,
+                _ => self.other_admission_rejections += 1,
+            },
             PipelineOutcome::InstantiationRejected(_) => {
                 self.admitted += 1;
                 self.instantiation_rejections += 1;
@@ -344,7 +383,7 @@ fn hash_byte(hash: &mut u64, byte: u8) {
     *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
 }
 
-fn hash_input(hash: &mut u64, tag: u8, bytes: &[u8]) {
+fn hash_input(hash: &mut u64, tag: u8, bytes: &[u8], input: i32) {
     hash_byte(hash, tag);
     for byte in (bytes.len() as u64).to_le_bytes() {
         hash_byte(hash, byte);
@@ -352,6 +391,121 @@ fn hash_input(hash: &mut u64, tag: u8, bytes: &[u8]) {
     for byte in bytes {
         hash_byte(hash, *byte);
     }
+    for byte in input.to_le_bytes() {
+        hash_byte(hash, byte);
+    }
+}
+
+fn hash_u64(hash: &mut u64, value: u64) {
+    for byte in value.to_le_bytes() {
+        hash_byte(hash, byte);
+    }
+}
+
+fn core_limit_tag(kind: LimitKind) -> u8 {
+    match kind {
+        LimitKind::CoreModuleBytes => 0,
+        LimitKind::Types => 1,
+        LimitKind::Functions => 2,
+        LimitKind::Parameters => 3,
+        LimitKind::Results => 4,
+        LimitKind::Imports => 5,
+        LimitKind::Exports => 6,
+        LimitKind::Globals => 7,
+        LimitKind::Locals => 8,
+        LimitKind::Memories => 9,
+        LimitKind::InitialMemoryPages => 10,
+        LimitKind::MemoryPages => 11,
+        LimitKind::Tables => 12,
+        LimitKind::TableElements => 13,
+        LimitKind::DataSegments => 14,
+        LimitKind::ElementSegments => 15,
+        LimitKind::CustomSections => 16,
+        LimitKind::CustomSectionBytes => 17,
+        LimitKind::CoreNesting => 18,
+        LimitKind::EngineAllocationBytes => 19,
+        other => panic!("Core corpus reached a non-Core limit: {other:?}"),
+    }
+}
+
+fn hash_admission_detail(hash: &mut u64, detail: AdmissionDetail) {
+    let tag = match detail {
+        AdmissionDetail::Malformed => 0,
+        AdmissionDetail::UnsupportedFeature => 1,
+        AdmissionDetail::ComponentInsteadOfCore => 2,
+        AdmissionDetail::ImportRequiresLinker => 3,
+        AdmissionDetail::MissingMaximum => 4,
+        AdmissionDetail::Limit(kind) => {
+            hash_byte(hash, 5);
+            hash_byte(hash, core_limit_tag(kind));
+            return;
+        }
+        AdmissionDetail::AllocationReservation => 6,
+        AdmissionDetail::HostImportMismatch => 7,
+    };
+    hash_byte(hash, tag);
+}
+
+fn hash_admission_error(hash: &mut u64, error: AdmissionError) {
+    for byte in error.trap.code().to_le_bytes() {
+        hash_byte(hash, byte);
+    }
+    hash_admission_detail(hash, error.detail);
+}
+
+fn hash_outcome(hash: &mut u64, outcome: &PipelineOutcome) {
+    match outcome {
+        PipelineOutcome::AdmissionRejected(error) => {
+            hash_byte(hash, 0);
+            hash_admission_error(hash, *error);
+        }
+        PipelineOutcome::InstantiationRejected(error) => {
+            hash_byte(hash, 1);
+            hash_admission_error(hash, *error);
+        }
+        PipelineOutcome::StartRejected(trap) => {
+            hash_byte(hash, 2);
+            for byte in trap.code().to_le_bytes() {
+                hash_byte(hash, byte);
+            }
+        }
+        PipelineOutcome::Ready(values) => {
+            hash_byte(hash, 3);
+            hash_u64(hash, values.len() as u64);
+            for value in values {
+                match value {
+                    CoreValue::I32(value) => {
+                        hash_byte(hash, 0);
+                        for byte in value.to_le_bytes() {
+                            hash_byte(hash, byte);
+                        }
+                    }
+                    CoreValue::I64(value) => {
+                        hash_byte(hash, 1);
+                        for byte in value.to_le_bytes() {
+                            hash_byte(hash, byte);
+                        }
+                    }
+                }
+            }
+        }
+        PipelineOutcome::Trapped(trap) => {
+            hash_byte(hash, 4);
+            for byte in trap.code().to_le_bytes() {
+                hash_byte(hash, byte);
+            }
+        }
+    }
+}
+
+fn record_outcome(
+    coverage: &mut Coverage,
+    outcome_hash: &mut u64,
+    input_bytes: usize,
+    outcome: &PipelineOutcome,
+) {
+    coverage.record(input_bytes, outcome);
+    hash_outcome(outcome_hash, outcome);
 }
 
 #[test]
@@ -359,70 +513,92 @@ fn seeded_bounded_core_pipeline_reaches_every_stage_without_host_panics() {
     let mut generator = Generator::new(SEED);
     let mut coverage = Coverage::default();
     let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    let mut outcome_digest = 0xcbf2_9ce4_8422_2325_u64;
 
     for len in 0..=RAW_MAX_LEN {
         let mut bytes = vec![0_u8; len];
         generator.fill(&mut bytes);
-        hash_input(&mut digest, 0, &bytes);
+        hash_input(&mut digest, 0, &bytes, 0);
         let outcome = checked_exercise(&format!("raw-{len}"), &bytes, 0);
-        coverage.record(bytes.len(), &outcome);
+        record_outcome(&mut coverage, &mut outcome_digest, bytes.len(), &outcome);
     }
 
     for tail_len in 0..=RAW_MAX_LEN {
         let mut bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
         bytes.resize(bytes.len() + tail_len, 0);
         generator.fill(&mut bytes[8..]);
-        hash_input(&mut digest, 1, &bytes);
+        hash_input(&mut digest, 1, &bytes, 0);
         let outcome = checked_exercise(&format!("magic-tail-{tail_len}"), &bytes, 0);
-        coverage.record(bytes.len(), &outcome);
+        record_outcome(&mut coverage, &mut outcome_digest, bytes.len(), &outcome);
     }
 
     let disabled_float =
         wat::parse_str("(module (func (export \"run\") (param i32) (result f32) f32.const 0))")
             .unwrap();
-    hash_input(&mut digest, 2, &disabled_float);
+    hash_input(&mut digest, 2, &disabled_float, 0);
     let outcome = checked_exercise("disabled-float", &disabled_float, 0);
     assert_eq!(
         outcome,
-        PipelineOutcome::AdmissionRejected(AdmissionDetail::UnsupportedFeature)
+        PipelineOutcome::AdmissionRejected(AdmissionError {
+            trap: TrapCode::UnsupportedFeature,
+            detail: AdmissionDetail::UnsupportedFeature,
+        })
     );
-    coverage.record(disabled_float.len(), &outcome);
+    record_outcome(
+        &mut coverage,
+        &mut outcome_digest,
+        disabled_float.len(),
+        &outcome,
+    );
 
     let unlinked_import = wat::parse_str(
         "(module (import \"env\" \"host\" (func)) \
          (func (export \"run\") (param i32) (result i32) call 0 local.get 0))",
     )
     .unwrap();
-    hash_input(&mut digest, 3, &unlinked_import);
+    hash_input(&mut digest, 3, &unlinked_import, 0);
     let outcome = checked_exercise("unlinked-import", &unlinked_import, 0);
     assert_eq!(
         outcome,
-        PipelineOutcome::InstantiationRejected(AdmissionDetail::ImportRequiresLinker)
+        PipelineOutcome::InstantiationRejected(AdmissionError {
+            trap: TrapCode::Validation,
+            detail: AdmissionDetail::ImportRequiresLinker,
+        })
     );
-    coverage.record(unlinked_import.len(), &outcome);
+    record_outcome(
+        &mut coverage,
+        &mut outcome_digest,
+        unlinked_import.len(),
+        &outcome,
+    );
 
     let spin = wat::parse_str(
         "(module (func (export \"run\") (param i32) (result i32) \
          (loop $spin (br $spin)) unreachable))",
     )
     .unwrap();
-    hash_input(&mut digest, 7, &spin);
+    hash_input(&mut digest, 7, &spin, 0);
     let outcome = checked_exercise("fuel-bounded-spin", &spin, 0);
     assert_eq!(outcome, PipelineOutcome::Trapped(TrapCode::FuelExhausted));
-    coverage.record(spin.len(), &outcome);
+    record_outcome(&mut coverage, &mut outcome_digest, spin.len(), &outcome);
 
     let recursion = wat::parse_str(
         "(module (func $recurse (export \"run\") (param i32) (result i32) \
          local.get 0 call $recurse))",
     )
     .unwrap();
-    hash_input(&mut digest, 8, &recursion);
+    hash_input(&mut digest, 8, &recursion, 0);
     let outcome = checked_exercise("depth-bounded-recursion", &recursion, 0);
     assert_eq!(
         outcome,
         PipelineOutcome::Trapped(TrapCode::CallDepthExceeded)
     );
-    coverage.record(recursion.len(), &outcome);
+    record_outcome(
+        &mut coverage,
+        &mut outcome_digest,
+        recursion.len(),
+        &outcome,
+    );
 
     let mut reservation_probe = None;
     let mut structured_ready = 0;
@@ -433,7 +609,7 @@ fn seeded_bounded_core_pipeline_reaches_every_stage_without_host_panics() {
         if reservation_probe.is_none() {
             reservation_probe = Some(case.bytes.clone());
         }
-        hash_input(&mut digest, 4, &case.bytes);
+        hash_input(&mut digest, 4, &case.bytes, case.input);
         let outcome = checked_exercise(&format!("structured-{index}"), &case.bytes, case.input);
         match case.expected {
             Expected::Ready(value) => {
@@ -445,31 +621,49 @@ fn seeded_bounded_core_pipeline_reaches_every_stage_without_host_panics() {
                 structured_trapped += 1;
             }
         }
-        coverage.record(case.bytes.len(), &outcome);
+        record_outcome(
+            &mut coverage,
+            &mut outcome_digest,
+            case.bytes.len(),
+            &outcome,
+        );
 
         let truncated_len = generator.index(case.bytes.len());
         let truncated = case.bytes[..truncated_len].to_vec();
-        hash_input(&mut digest, 5, &truncated);
+        hash_input(&mut digest, 5, &truncated, case.input);
         let outcome = checked_exercise(&format!("truncated-{index}"), &truncated, case.input);
-        coverage.record(truncated.len(), &outcome);
+        record_outcome(
+            &mut coverage,
+            &mut outcome_digest,
+            truncated.len(),
+            &outcome,
+        );
 
         let mut flipped = case.bytes.clone();
         let byte_index = generator.index(flipped.len());
         let bit = 1_u8 << generator.index(8);
         flipped[byte_index] ^= bit;
-        hash_input(&mut digest, 6, &flipped);
+        hash_input(&mut digest, 6, &flipped, case.input);
         let outcome = checked_exercise(&format!("flipped-{index}"), &flipped, case.input);
-        coverage.record(flipped.len(), &outcome);
+        record_outcome(&mut coverage, &mut outcome_digest, flipped.len(), &outcome);
     }
 
     let oversized = vec![0_u8; PROFILE_1_LIMITS.max_core_module_bytes + 1];
-    hash_input(&mut digest, 9, &oversized);
+    hash_input(&mut digest, 9, &oversized, 0);
     let outcome = checked_exercise("oversized", &oversized, 0);
     assert_eq!(
         outcome,
-        PipelineOutcome::AdmissionRejected(AdmissionDetail::Limit(LimitKind::CoreModuleBytes))
+        PipelineOutcome::AdmissionRejected(AdmissionError {
+            trap: TrapCode::LimitExceeded,
+            detail: AdmissionDetail::Limit(LimitKind::CoreModuleBytes),
+        })
     );
-    coverage.record(oversized.len(), &outcome);
+    record_outcome(
+        &mut coverage,
+        &mut outcome_digest,
+        oversized.len(),
+        &outcome,
+    );
 
     let reservation_probe = reservation_probe.unwrap();
     let reservation_result = catch_unwind(AssertUnwindSafe(|| {
@@ -515,4 +709,9 @@ fn seeded_bounded_core_pipeline_reaches_every_stage_without_host_panics() {
     assert!(coverage.ready >= structured_ready, "{coverage:?}");
     assert!(coverage.trapped >= structured_trapped + 2, "{coverage:?}");
     assert_eq!(digest, EXPECTED_CORPUS_FNV64, "corpus drift: {coverage:?}");
+    assert_eq!(
+        outcome_digest, EXPECTED_OUTCOME_FNV64,
+        "pipeline outcome drift: {coverage:?}"
+    );
+    assert_eq!(coverage, EXPECTED_COVERAGE);
 }

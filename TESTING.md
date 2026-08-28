@@ -112,7 +112,7 @@ python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py --selftes
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
-# C8.8-F1 host-only contract gate; no Float execution, QEMU, or physical device
+# C8.8-F1 immutable contract gate
 cargo test --locked --offline -p vibeos-component-format
 cargo test --locked --offline -p vibeos-wasm-runtime --test current_engine
 cargo test --locked --offline -p vibeos-component-runtime --test current_engine
@@ -120,7 +120,23 @@ cargo test --locked --offline -p vibeos-wasm-runtime --test runtime \
   profile_rejects_disabled_proposals_before_compilation -- --exact
 cargo test --locked --offline -p vibeos-wasm-runtime --test trap_diagnostics \
   validation_unsupported_and_limit_admission_codes_are_exact -- --exact
+# C8.8-F2 acceptance-only Core validator/software-float gates
+cargo check --locked --offline -p vibeos-wasm-float-candidate --no-default-features
+cargo test --locked --offline -p vibeos-wasm-runtime \
+  --test profile_2_candidate_inspection
+cargo test --locked --offline -p vibeos-wasm-float-candidate \
+  --features c88-f2-acceptance
+python3 scripts/verify-c88-f2-supply-chain.py --self-test
+# Pinned RISC-V compile gate; this is not target execution.
+RUSTC="$(rustup which --toolchain nightly-2026-08-01 rustc)" \
+"$(rustup which --toolchain nightly-2026-08-01 cargo)" check --locked \
+  -p vibeos-wasm-float-candidate --features c88-f2-acceptance \
+  --target riscv64imac-unknown-none-elf
+# Fresh release build plus candidate-specific LLVM/object audit.
+python3 scripts/verify-c88-f2-riscv-object.py
 cargo fmt -p vibeos-component-format -- --check
+cargo fmt -p vibeos-wasm-runtime -- --check
+cargo fmt -p vibeos-wasm-float-candidate -- --check
 git diff --check
 ```
 
@@ -246,12 +262,14 @@ distinct `IndirectCallTypeMismatch`. Wasmi's float-to-integer conversion trap
 maps fail-closed to `Validation`, but admitted Profile-1 modules cannot produce
 it because floating-point types and operators are disabled.
 
-C8.8-F1 does not make that trap guest-reachable. Before the F2 candidate
-executes any Float instruction, it must choose and ABI-version a stable guest
-execution trap for NaN and out-of-range float-to-integer truncation, with exact
-coverage for every width, integer signedness, NaN, and positive/negative
-overflow case. Continuing to report the static `Validation` trap after Float
-becomes reachable fails the F2 gate.
+C8.8-F1 does not make that trap guest-reachable. The acceptance-only F2
+candidate maps quiet and signaling NaN truncation to stable
+`InvalidConversionToInteger` (`0x0207`), while finite out-of-range values and
+positive or negative infinity remain `IntegerOverflow` (`0x0202`). Runtime and
+translator-fold tests cover all eight widths and signedness combinations,
+exact valid boundaries, adjacent positive and negative overflow, signed NaNs,
+and infinities. Production Profile 1 remains unchanged and guest-unreachable
+for these operations.
 
 Production execution fixtures cover signed division by zero and overflow,
 conditional `unreachable`, the first invalid four-byte load, valid/null/wrong-
@@ -596,15 +614,28 @@ C8.8. The evidence records `platform_class=emulator`,
 remain local software evidence, not hardware, TPM, remote-attestation, or
 physical-cold-boot proof.
 
-The C8.8-F1 commands above are host-only and prove only the exact code-5
-artifact identity and codec, strict NaN-policy metadata, unchanged integer-only
-Profile 1, absence from the current engine resolver, and fail-closed durable
-graph behavior. Code 5 is permanently `ValidationOnly`; it has no current
-validation-engine, runtime, admission, publication, or invocation activation
-path. These tests do not execute Float and provide no differential,
-cross-target, fixed-QEMU, or
-physical evidence. F1 is Float increment 1 of 5, C8.8-F2 is next, and Float and
-C8.8 remain incomplete. The full contract and F2 dependency/trap gates are in
+The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
+strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
+current engine resolver, and fail-closed durable graph behavior. Code 5 is
+permanently `ValidationOnly`; it has no current validation-engine, runtime,
+admission, publication, or invocation activation path.
+
+The F2 commands execute Float only through the opt-in acceptance crate. They
+cover scalar runtime and translator-fold paths, strict NaN and bit transport,
+all conversion traps, fused paths, candidate trap recovery, limits, import
+denial, and repeatable fuel/quantum behavior. The fixed-seed 50,000-case host
+differential corpus is pinned by digest `0x05e1fa8e3d779f53`; 4,096 end-to-end
+candidate-Wasmi cases are pinned by `0xee61731687e8c81d`; hostile byte mutations
+and random modules are pinned by `0xb8eca6402ca6a5df`. The offline provenance
+verifier binds the renamed fork, backend, licenses, dependency closure, patch
+digests, unchanged Profile 1, and five fail-closed mutations. The RISC-V
+release-object audit distinguishes the candidate fork from stock Profile 1 and
+rejects semantic FP LLVM operations, compiler float helpers, and target F/D
+instructions; sign-only LLVM forms must lower to integer bit operations.
+
+F1 and F2 are complete, and C8.8-F3 is next. F2 provides no WIT/Canonical ABI,
+production activation, fixed-QEMU execution, or physical evidence, so Float
+and C8.8 remain incomplete. The full contract is in
 [docs/WASM_FLOAT_PROFILE.md](docs/WASM_FLOAT_PROFILE.md). Milk-V Duo physical
 testing remains paused.
 

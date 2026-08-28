@@ -1,0 +1,110 @@
+format_version = 1
+roadmap_node = "C8.8-F2"
+reviewed_delta_paths = [
+  "crates/collections/README.md",
+  "crates/core/README.md",
+  "crates/core/src/float.rs",
+  "crates/core/src/lib.rs",
+  "crates/core/src/softfloat.rs",
+  "crates/core/src/value.rs",
+  "crates/core/src/wasm.rs",
+  "crates/ir/README.md",
+  "crates/ir/src/immeditate.rs",
+  "crates/ir/src/primitive.rs",
+  "crates/wasmi/README.md",
+  "crates/wasmi/src/engine/executor/instrs/branch.rs",
+  "crates/wasmi/src/func/into_func.rs",
+]
+
+[wasmi_upstream]
+repository = "https://github.com/wasmi-labs/wasmi"
+commit = "8273dfb09d493971b7bb12fe614d740cdc857175"
+version = "1.1.0"
+license_expression = "MIT OR Apache-2.0"
+license_mit_url = "https://raw.githubusercontent.com/wasmi-labs/wasmi/8273dfb09d493971b7bb12fe614d740cdc857175/LICENSE-MIT"
+license_apache_url = "https://raw.githubusercontent.com/wasmi-labs/wasmi/8273dfb09d493971b7bb12fe614d740cdc857175/LICENSE-APACHE"
+
+[[wasmi_archive]]
+package = "wasmi"
+version = "1.1.0"
+path_in_vcs = "crates/wasmi"
+archive_sha256 = "2300d0f78cba12f14e29e8dd157ea64050c0a688179aefdb2050105805594a0c"
+
+[[wasmi_archive]]
+package = "wasmi_core"
+version = "1.1.0"
+path_in_vcs = "crates/core"
+archive_sha256 = "9013136083d988725953390bf668b64b7a218fabf26f8b913bbc59546b97ee27"
+
+[[wasmi_archive]]
+package = "wasmi_ir"
+version = "1.1.0"
+path_in_vcs = "crates/ir"
+archive_sha256 = "ba1fa003f79156f406d62ef0e1464dc03e11ace37170e9fa7524299a75ad8f68"
+
+[[wasmi_archive]]
+package = "wasmi_collections"
+version = "1.1.0"
+path_in_vcs = "crates/collections"
+archive_sha256 = "f8a8c42a2a76148d43097b1d7cc2a5bf33d5c23bd4dd69015fc887e311767884"
+
+[rustc_apfloat]
+repository = "https://github.com/rust-lang/rustc_apfloat"
+version = "0.2.3+llvm-462a31f5a5ab"
+manifest_requirement = "=0.2.3"
+archive_sha256 = "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad"
+git_revision = "eeaacad81247af65d4043cb3e32d023a652d7951"
+llvm_baseline_revision = "462a31f5a5abb905869ea93cc49b096079b11aa4"
+license_expression = "Apache-2.0 WITH LLVM-exception"
+license_file = "third-party/rustc_apfloat/LICENSE.txt"
+license_details_file = "third-party/rustc_apfloat/LICENSE-DETAILS.md"
+direct_normal_dependencies = ["bitflags 2.13.1", "smallvec 1.15.2"]
+smallvec_features = ["const_generics", "union"]
+
+# Exact registry packages selected for the reviewed no-default-features,
+# extra-checks, prefer-btree candidate closure. Optional SIMD/libm, hash
+# collections, and WAT edges are manifest-pinned but are not selected.
+[[selected_external]]
+package = "rustc_apfloat"
+version = "0.2.3+llvm-462a31f5a5ab"
+checksum = "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad"
+
+[[selected_external]]
+package = "bitflags"
+version = "2.13.1"
+checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
+
+[[selected_external]]
+package = "smallvec"
+version = "1.15.2"
+checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+
+[[selected_external]]
+package = "wasmparser"
+version = "0.239.0"
+checksum = "8c9d90bb93e764f6beabf1d02028c70a2156a6583e63ac4218dd07ef733368b0"
+
+[[selected_external]]
+package = "spin"
+version = "0.9.9"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
+
+[manifest_only_external.libm]
+version_requirement = "=0.2.16"
+archive_sha256 = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+selected = false
+reason = "optional compatibility edge for the forbidden SIMD feature"
+
+[tree]
+algorithm = "sha256-content-manifest-v1"
+upstream_files_sha256 = "2ed5dc8e1548b3b84f74fcb713d45583bfecd123fcccd41782bdacc782873f0a"
+pristine_manifest_sha256 = "7abb362a9de9a40e24e7626ccea7a2954afdd9114e211a191a76132db6ecdbc9"
+patched_manifest_sha256 = "2d94218e4fa5eea30b8e516e055fae8f72465dbc1ef75f8b1df3495cbcd0432f"
+patch_delta_sha256 = "3d2aec1d7e510fc3b3edb87dcacb2d4ed34eb448356704a027841b047938ec64"
+fork_manifests_sha256 = "f78a26c86b00068d1bb9b8f7d499697d3a0f9b638c6d2051df249362a0006dfd"
+
+[license_file]
+"vendor/wasmi-softfloat/LICENSE-MIT" = "172bc1497507c1c363496bc23b0f16de8fa8e94befa85db6c8d9fa790e0a8657"
+"vendor/wasmi-softfloat/LICENSE-APACHE" = "f031c1608e4a19e8cbcc3394cdba838067e79189610227459e8ffcd669e6f52d"
+"vendor/wasmi-softfloat/third-party/rustc_apfloat/LICENSE.txt" = "981f4155fbd55dcf13745e2ed508e6fa30aa90f9f668c4ef0f7686980e5d8521"
+"vendor/wasmi-softfloat/third-party/rustc_apfloat/LICENSE-DETAILS.md" = "5998f303e26191363f591e04bdd0f829b2000afc843c67326a9b7efd66850416"

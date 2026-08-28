@@ -1,16 +1,17 @@
 # C8.8 deterministic scalar-float profile
 
-**Status (2026-08-29): C8.8-F1 complete as contract metadata only.** F1 is
-the first of five ordered Float increments. It freezes an immutable
-validation-only artifact identity and the semantic requirements for a future
-deterministic software-float implementation. It does not validate or execute a
-Float instruction, expose a Float value through WIT, activate admission, or
-claim that cross-target determinism has been demonstrated. C8.8-F2 is next;
-Float and C8.8 remain incomplete.
+**Status (2026-08-29): C8.8-F1 and C8.8-F2 complete.** F1 freezes the
+immutable validation-only artifact identity and deterministic semantic
+contract. F2 supplies an independently identified, acceptance-only Core
+validator and software-float executor behind `c88-f2-acceptance`; it does not
+bind profile code 5 to a current engine or production activation path.
+C8.8-F3, WIT and Canonical ABI floats, is next. Float and C8.8 remain
+incomplete.
 
 Milk-V Duo physical testing remains paused at operator request. Fixed QEMU is
-the selected target for the later F5 emulator qualification; it is not needed
-and was not used for F1.
+the selected target for the later F5 emulator qualification; it was not used
+for F1 or F2. F2's RISC-V evidence is compile- and object-level evidence, not a
+QEMU or physical execution claim.
 
 ## 1. Frozen identity
 
@@ -102,8 +103,8 @@ allowed set, canonicalizing transported Core values, preserving an arbitrary
 payload across a Component/Canonical ABI boundary, or changing a sign-only
 operation's payload fails the profile.
 
-For non-NaN values, the future implementation must provide WebAssembly's exact
-rounding behavior, including round-to-nearest ties-to-even, signed zero,
+For non-NaN values, the F2 candidate provides WebAssembly's exact rounding
+behavior, including round-to-nearest ties-to-even, signed zero,
 `min`/`max`, and subnormals. Fast-math, fused-operation contraction, FTZ/DAZ,
 and dependence on ambient host-FPU state are forbidden. Numeric comparison,
 integer conversion, and finite promote/demote must use the same reviewed
@@ -123,45 +124,70 @@ disabled adjacent features.
 
 An increment is not complete merely because a later layer can be sketched or
 compiled. Each increment is verified, committed, and pushed independently.
+F1 and F2 have closed their respective gates; F3 through F5 have not.
 
-## 5. F2 dependency and trap gates
+## 5. Closed F2 dependency and trap gates
 
-F2 must not use a workspace-wide `[patch.crates-io]` replacement for Wasmi.
+F2 does not use a workspace-wide `[patch.crates-io]` replacement for Wasmi.
 Profile 1 must continue to resolve its existing crates.io `wasmi` 1.1.0 package
-and checksum. The software-float candidate must have a disjoint dependency
-identity, preferably a renamed package or a dependency alias backed by a
-separate reviewed Git/vendor source.
+and checksum. The candidate uses separately renamed, vendored Wasmi packages
+at upstream commit `8273dfb09d493971b7bb12fe614d740cdc857175`, fork version
+`1.1.0-vibeos-f2.1`, patched content-manifest SHA-256
+`2d94218e4fa5eea30b8e516e055fae8f72465dbc1ef75f8b1df3495cbcd0432f`,
+and patch-delta SHA-256
+`3d2aec1d7e510fc3b3edb87dcacb2d4ed34eb448356704a027841b047938ec64`.
+The exact archive, manifest, license, dependency, source, and Profile-1
+isolation identities are frozen in `vendor/wasmi-softfloat/PROVENANCE.toml`.
 
-The F2 candidate identity must record at least the package name and version,
-source URL or vendored provenance, exact commit/tree or content checksum,
-feature set, patch/diff digest, software-float backend and checksum, and the
-transitive `wasmi_core`, IR, and parser identities. This identity is added in
-F2; it is deliberately absent from the sealed F1 metadata and must not enter
-the production current-engine resolver while code 5 remains inert.
+The backend is `rustc_apfloat 0.2.3+llvm-462a31f5a5ab` at Git revision
+`eeaacad81247af65d4043cb3e32d023a652d7951`, with archive SHA-256
+`486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad`.
+Square root is a pure-integer, fixed 24-round (`f32`) or 53-round (`f64`)
+restoring algorithm with exact midpoint comparison. The selected fork closure
+has SIMD disabled and no selected `libm` edge. Profile 1 continues to use the
+unchanged stock crates.io Wasmi identity.
 
-The F1 target setting vector freezes the Wasmi 1.1.0 default fuel schedule as
-the candidate schedule. F2 must prove that the independent fork preserves it.
-A different schedule requires a new reviewed contract and cannot silently
-reinterpret code 5.
+The independent fork preserves the F1 target setting vector and Wasmi 1.1.0
+default fuel schedule. Float and integer instructions use the same base-cost
+schedule, and deterministic resumable-call tests pin repeated quantum traces,
+total fuel, terminal cleanup, and recovery after a Float trap.
 
-The current Profile-1-only runtime maps Wasmi's
-`BadConversionToInteger` to the static `Validation` trap because Float is
-guest-unreachable. Before any F2 candidate executes Float, it must select and
-ABI-version a stable guest execution trap for NaN and out-of-range
-float-to-integer truncation. Tests must cover positive and negative overflow
-and NaN for every `f32`/`f64` to `i32`/`i64`, signed and unsigned truncating
-instruction. The saturating-conversion proposal remains rejected. This trap
-gate must close before F2 can complete.
+The current Profile-1-only runtime still maps Wasmi's
+`BadConversionToInteger` to static `Validation` because Float is
+guest-unreachable there. The F2 candidate maps quiet and signaling NaN
+truncation to the new stable `InvalidConversionToInteger` trap (`0x0207`) and
+keeps finite overflow and positive or negative infinity on `IntegerOverflow`
+(`0x0202`). Runtime and translator-fold fixtures cover all eight
+`f32`/`f64` to `i32`/`i64`, signed and unsigned truncating instructions,
+including exact valid boundaries and adjacent overflow. The
+saturating-conversion proposal remains rejected.
 
-## 6. F1 evidence and non-claims
+## 6. F1/F2 evidence and non-claims
 
 The F1 host gate proves the exact profile/codec metadata, NaN constants and
 operation classification, Profile-1 non-widening, absence from the current
 engine resolver, and graph fail-closed behavior. Mutations of code, stage, ABI,
 revision, feature bit, or adjacent profile fields are rejected.
 
-F1 provides no reviewed software-float backend, Float validator or executor,
-runtime values, WIT/Canonical ABI implementation, execution trap, differential
-or fuzz corpus, fuel proof, QEMU result, or physical result.
-`cross_target_bit_determinism_required=true` is a future acceptance
-requirement, not current evidence.
+The F2 host gate covers every scalar arithmetic, comparison, rounding,
+conversion, reinterpretation, and sign-only instruction in runtime and
+translator-fold paths; constant/local/global/load/store/select/call transport;
+strict canonical NaNs; fused compare/branch/select paths; Profile-1 limits;
+import denial; stable traps; and fuel/quantum behavior. A fixed-seed 50,000-case
+host IEEE differential corpus has digest `0x05e1fa8e3d779f53`. A separate
+4,096-case end-to-end candidate-Wasmi fuzz corpus has digest
+`0xee61731687e8c81d`; mutated and random hostile Core bytes have digest
+`0xb8eca6402ca6a5df`. The offline supply-chain verifier also proves five
+fail-closed mutations.
+
+The pinned `riscv64imac-unknown-none-elf` release build passes an object-level
+audit of the candidate fork, `rustc_apfloat`, and acceptance crate: no semantic
+FP arithmetic, comparison, conversion, `sqrt`, compiler float helper, or
+RISC-V F/D instruction remains. LLVM sign-only `fneg`, `fabs`, and `copysign`
+forms lower exclusively to integer bit operations. This is cross-target
+implementation evidence, but exact-bit execution on fixed QEMU remains F5.
+
+F2 provides no WIT/Canonical ABI Float values, production loader or image
+admission, durable publication, guest activation, QEMU execution, or physical
+result. Code 5 remains permanently `ValidationOnly`; any executable successor
+still requires a separately numbered identity after F3 through F5 close.

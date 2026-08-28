@@ -1,6 +1,7 @@
 # C8.8 deterministic scalar-float profile
 
-**Status (2026-08-29): C8.8-F1 through C8.8-F4 complete.** F1 freezes the
+**Status (2026-08-29): C8.8-F1 through C8.8-F4 complete; F5 host/fixed-QEMU
+qualification complete.** F1 freezes the
 immutable validation-only artifact identity and deterministic semantic
 contract. F2 supplies an independently identified, acceptance-only Core
 validator and software-float executor behind `c88-f2-acceptance`; it does not
@@ -12,13 +13,16 @@ replayed through the existing cleanup machine, not runtime wiring. F4 adds a
 separate default-off candidate admission and lifecycle behind acceptance-only
 feature gates; the image adapter binds that lifecycle to one exact image pin.
 It does not add a production command, durable object/publication, or
-current-engine binding. C8.8-F5 target qualification is next. Float and C8.8
-remain incomplete.
+current-engine binding. The non-physical F5 qualification passes at pushed
+commit `feddae65ee499a0b4b5d9b603c9bac0e4374e800`. Milk-V Duo physical
+qualification remains paused and unclaimed, so F5, Float, and C8.8 are not
+fully closed and no executable successor is authorized.
 
 Milk-V Duo physical testing remains paused at operator request. Fixed QEMU is
-the selected target for F5 emulator qualification; it was not used for F1
-through F4. F4 evidence is host-only. The RISC-V evidence through F3 is
-compile- and object-level evidence, not a QEMU or physical execution claim.
+the selected target for F5 emulator qualification and now has formal evidence;
+it was not used for F1 through F4. F4 evidence remains host-only. The RISC-V
+evidence through F3 remains compile- and object-level evidence rather than a
+QEMU or physical execution claim.
 
 ## 1. Frozen identity
 
@@ -133,7 +137,8 @@ disabled adjacent features.
 
 An increment is not complete merely because a later layer can be sketched or
 compiled. Each increment is verified, committed, and pushed independently.
-F1 through F4 have closed their respective gates; F5 has not.
+F1 through F4 have closed their respective gates. F5's host/fixed-QEMU sub-gate
+has passed, while its paused physical-Duo sub-gate prevents full closure.
 
 ## 5. Closed F2 dependency and trap gates
 
@@ -171,7 +176,7 @@ keeps finite overflow and positive or negative infinity on `IntegerOverflow`
 including exact valid boundaries and adjacent overflow. The
 saturating-conversion proposal remains rejected.
 
-## 6. F1/F2/F3/F4 evidence and non-claims
+## 6. F1/F2/F3/F4/F5 evidence and non-claims
 
 The F1 host gate proves the exact profile/codec metadata, NaN constants and
 operation classification, Profile-1 non-widening, absence from the current
@@ -194,7 +199,8 @@ audit of the candidate fork, `rustc_apfloat`, and acceptance crate: no semantic
 FP arithmetic, comparison, conversion, `sqrt`, compiler float helper, or
 RISC-V F/D instruction remains. LLVM sign-only `fneg`, `fabs`, and `copysign`
 forms lower exclusively to integer bit operations. This is cross-target
-implementation evidence, but exact-bit execution on fixed QEMU remains F5.
+implementation evidence; exact-bit target execution is separately supplied by
+the F5 qualification in section 7.
 
 F3 adds `CanonicalF32`/`CanonicalF64` and a separate
 `CandidateFlatValue::{F32Bits,F64Bits}` representation; production
@@ -274,14 +280,65 @@ constructor/decoder reject it before command or publication creation.
 F4 is explicit candidate-only activation evidence. Code 5 remains permanently
 `ValidationOnly`, `execution_enabled() == false`, absent from both current
 engine resolvers, and unavailable to production loading, durable
-installation/publication, command construction, or guest invocation. F4 makes
-no fixed-QEMU execution claim: host plus fixed-QEMU exact-bit/fuel
-qualification remains F5, and physical-Duo qualification remains paused. Any
-executable successor still requires a separately numbered identity after F5
-closes.
+installation/publication, command construction, or guest invocation. F4 made
+no fixed-QEMU execution claim; F5 owns that separate evidence. Physical-Duo
+qualification remains paused. Any executable successor still requires a
+separately numbered identity after F5 fully closes.
 
 F4 does not establish a system-wide admission or concurrency ledger. The
 memory, fuel, compile, resource, and one-live-instance ceilings are scoped to
 each explicitly constructed acceptance lifecycle. A future production
 successor must add and review any global owner/concurrency accounting under its
 new identity rather than inferring it from this candidate harness.
+
+## 7. F5 host and fixed-QEMU qualification
+
+F5 executes the same `no_std` qualification routine in a host test and an
+isolated `riscv64imac-unknown-none-elf` QEMU image. The image feature
+`wasm-c88-f5-float-qemu-acceptance` is default-off, QEMU-only, and mutually
+exclusive with Milk-V, production, command, storage, SSH, and earlier
+acceptance-image features. It does not register code 5 with a current engine or
+production resolver.
+
+The formal runner accepts only a clean `codex/wasm` worktree whose HEAD is
+already equal to `refs/remotes/origin/codex/wasm`. It builds offline in a
+private Cargo home and target directory, binds all 190 `Cargo.lock` registry
+archives, rejects Git dependencies and ambient ancestor Cargo configuration,
+disables Git replace objects, and records the exact pinned 3,603-file
+`rust-src` tree. Its fixed platform is QEMU 11.0.3 plus the pinned OpenSBI image,
+one RV64 CPU, one hart, 128 MiB, single-thread TCG, deterministic `icount`, and
+no network device. Dirty smoke mode cannot export or verify formal evidence.
+
+At pushed source commit
+`feddae65ee499a0b4b5d9b603c9bac0e4374e800` (tree
+`7bb1c07a74c19178b17a94df57becb9f2898d704`), the formal run ID
+`91b662adb335d286759ca7131b28b351710c3c598efc45aeef01610038468db8`
+accepted 1,176 records: 146 Core, 13 F3, 12 F4, 1,000 fuel, and 5 lifecycle.
+The semantic SHA-256 is
+`51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`.
+The exact retained identities are:
+
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| Audited/booted kernel ELF | 40,447,896 | `095e01ea516766a3d7684aaa46a511c3096c1c8bb4d18a205eb8f5234e3c0f52` |
+| UART transcript | 384,916 | `0c75cba0182fe07208b66460b1c9e4bec4724809b96bea9f19318cafb1d17f4e` |
+| Final-ELF audit | 2,031 | `e12ae44227968752c1adc5627a5c226e2b8867e0f93a8ecb12fa755cdfacffc6` |
+| Canonical environment | 84,787 | `554f3d6ad540ec1249246ed1809c14562773bac87475f2979b1ba5990ae86e5e` |
+
+The environment's complete evidence digest is
+`11b6778d60ea774d2087254f6e149adf146a73e9595004ecf80b676d8412996b`.
+Both normal and optimized independent verifier runs accept the four retained
+artifacts, and an optimized standalone audit regenerates the retained ELF
+report byte-for-byte.
+
+The final ELF is static, relocation-free, W^X, RV64 IMAC, RVC, and soft ABI.
+The auditor finds 381,943 decoded instructions, 381,944 canonical boundaries,
+42,010 trusted direct targets, 128,653 code symbols, and zero F/D opcodes,
+undefined symbols, or forbidden Float helpers. Its native scan guarantee is
+limited to trusted control flow at canonical decoder boundaries. It makes no
+claim about arbitrary-PC redirection or hardware NX.
+
+The fixed-QEMU result is emulator evidence with
+`physical_provenance=not-claimed`. Milk-V Duo qualification remains deferred;
+therefore this section does not close F5, Float, or C8.8 and does not allocate
+or authorize a separately numbered executable successor.

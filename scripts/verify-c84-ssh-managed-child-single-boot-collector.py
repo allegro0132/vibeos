@@ -3790,13 +3790,30 @@ def verify_docs_ci(inputs: Inputs) -> None:
             and ("host-only" in normalized or "self-tests" in normalized),
             f"{label} omits the software-only synthetic coverage boundary",
         )
+        for phrase in (
+            "aot-not-justified-on-fixed-qemu",
+            "e950a2facb6a6c230e67becb186bddf34a5924bb",
+            "a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f",
+            "current implementation node is c8.8",
+            "platform_class=emulator",
+            "physical_provenance=not-claimed",
+        ):
+            require(
+                phrase in normalized,
+                f"{label} omits published fixed-QEMU status {phrase!r}",
+            )
         require(
-            (
-                "preparation only" in normalized
-                if label == "decision doc"
-                else "no workload-specific aot decision" in normalized
-            ),
-            f"{label} overclaims a workload-specific AOT decision",
+            re.search(r"(?:formally )?completes c8\.4\b", normalized) is not None,
+            f"{label} omits completed C8.4 status",
+        )
+        require(
+            re.search(
+                r"c8\.5 through c8\.7 (?:were not entered|are skipped) for "
+                r"(?:this|that) workload and remain globally deferred",
+                normalized,
+            )
+            is not None,
+            f"{label} omits the C8.5-C8.7 skipped/deferred disposition",
         )
     require(
         "operator request" in inputs.decision_doc.lower()
@@ -6642,13 +6659,35 @@ echo "Milk-V Duo binary: $output_bin"''',
             ),
         ),
         (
-            "testing-aot-decision-overclaimed",
+            "testing-fixed-qemu-outcome-overclaimed",
             lambda data: mutate_text(
                 data,
                 "testing",
-                "No workload-specific AOT decision\nis claimed yet.",
-                "A complete workload-specific AOT decision\nis claimed.",
-                "TESTING incomplete AOT decision status",
+                "aot-not-justified-on-fixed-qemu",
+                "aot-eligible-for-c85-design-review-on-fixed-qemu",
+                "TESTING fixed-QEMU outcome",
+            ),
+        ),
+        (
+            "testing-c84-completion-removed",
+            lambda data: mutate_text(
+                data,
+                "testing",
+                "fixed-QEMU evidence completes C8.4 for",
+                "fixed-QEMU evidence prepares C8.4 for",
+                "TESTING C8.4 completion",
+            ),
+        ),
+        (
+            "testing-c85-c87-disposition-overclaimed",
+            lambda data: mutate_text(
+                data,
+                "testing",
+                "C8.5 through C8.7 were not entered for this\n"
+                "workload and remain globally deferred",
+                "C8.5 through C8.7 were entered for this\n"
+                "workload and remain globally deferred",
+                "TESTING C8.5-C8.7 disposition",
             ),
         ),
         (

@@ -1,16 +1,21 @@
 # C8.4 AOT decision contracts
 
-As of 2026-08-28, the decision-bearing C8.4 contract is the independent
-fixed-QEMU v1 contract. C1 through C8.3 are accepted as complete by the
-project's historical-evidence policy. Milk-V Duo execution remains paused at
-operator request and is not a prerequisite for this decision. The QEMU result
-will be explicitly emulator-scoped: it cannot claim, imply, or be renamed into
-physical-Duo performance evidence.
+As of 2026-08-28, the independent fixed-QEMU v1 campaign formally completes
+C8.4 for `ssh-case-filter-12k-v1`. C1 through C8.3 remain accepted as complete
+by the project's historical-evidence policy. Milk-V Duo execution remains
+paused at operator request and was not a prerequisite for this decision. The
+published QEMU result is explicitly emulator-scoped: it cannot claim, imply,
+or be renamed into physical-Duo performance evidence.
 
-The new contract is still **preparation only** until its runner and verifier
-are committed and one clean-source QEMU transcript passes the publication
-gate. Neither possible outcome authorizes AOT or accepts native component
-bytes. It only determines whether C8.5 becomes the next design-review node.
+The published bundle is
+[`benchmarks/wasm-aot-decision/qemu-v1/`](../benchmarks/wasm-aot-decision/qemu-v1/).
+It binds source commit
+`e950a2facb6a6c230e67becb186bddf34a5924bb`, run ID
+`a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f`,
+and outcome `aot-not-justified-on-fixed-qemu`. C8.5 through C8.7 were not
+entered for this workload and remain globally deferred; the current
+implementation node is C8.8. The result does not authorize AOT or accept
+native component bytes.
 
 The decision-bearing machine-readable contracts are
 [`benchmarks/wasm-aot-decision/workloads-qemu-v1.json`](../benchmarks/wasm-aot-decision/workloads-qemu-v1.json)
@@ -181,6 +186,28 @@ case `aot_authorized=false`, `native_code_accepted=false`,
 `platform_class=emulator`, and `physical_provenance=not-claimed`. A malformed,
 incomplete, incorrect, or unstable run produces no decision at all.
 
+## Published fixed-QEMU result
+
+The formal campaign used one QEMU process, discarded three warmups, and
+retained 21 samples. Its nearest-rank statistics are:
+
+| Distribution | p50 ticks | p95 ticks | p50 ms | p95 ms |
+|---|---:|---:|---:|---:|
+| Total | 2,899,765 | 2,901,632 | 289.9765 | 290.1632 |
+| Interpretation | 97,260 | 97,318 | 9.7260 | 9.7318 |
+| Non-interpretation | 2,802,541 | 2,804,417 | 280.2541 | 280.4417 |
+
+Stability passed because
+`2,901,632 * 100 = 290,163,200 <= 2,899,765 * 110 = 318,974,150`.
+The total p95 exceeds the 1,000,000-tick budget, so `budget_miss=true`.
+However, the independently sorted non-interpretation p95 also exceeds that
+budget, so `interpretation_attribution=false`. The evidence therefore records
+`candidate_for_c85_design_review=false`, `aot_authorized=false`,
+`native_code_accepted=false`, and next node
+`C8.8-skip-or-defer-C8.5-C8.7`. Non-interpretation percentiles are derived by
+subtracting interpretation from total per sample and then sorting; they are
+not differences between independently selected percentiles.
+
 The CI-safe contract and transport checks do not boot QEMU:
 
 ```sh
@@ -199,16 +226,15 @@ rejected by `--publication`. Its recorded Cargo command names
 fetch and push origin to be exactly the frozen repository origin, although it
 does not perform the formal live remote-advertisement proof. The formal feature instead records
 `capture_mode=formal-publication`, `decision_eligible=true`, and the formal-only
-run-ID domain. After the preparation commit is pushed, the formal no-clobber
-publication command is:
+run-ID domain. The published campaign used this formal no-clobber command:
 
 ```sh
 ./scripts/run-c84-qemu-aot-decision.sh \
   --evidence-dir benchmarks/wasm-aot-decision/qemu-v1
 ```
 
-It writes `uart.log`, `summary.json`, `environment.json`, and `DECISION.json`
-only after the independent verifier accepts both the transcript and the
+It wrote `uart.log`, `summary.json`, `environment.json`, and `DECISION.json`
+only after the independent verifier accepted both the transcript and the
 source/tool/platform envelope. Formal verification also requires live branch
 `codex/wasm`, a clean HEAD equal to the bound source, local and tracking refs at
 that commit, no assume-unchanged, skip-worktree, or fsmonitor-valid index state,

@@ -194,6 +194,7 @@ impl FloatCandidateComponent {
                 peak_live_instances: 1,
                 ..FloatCandidateLifecycleMetrics::default()
             },
+            last_call_metrics: None,
         })
     }
 }
@@ -210,6 +211,7 @@ pub struct FloatCandidateLifecycle {
     limits: FloatCandidateLimits,
     state: FloatCandidateState,
     metrics: FloatCandidateLifecycleMetrics,
+    last_call_metrics: Option<CandidateCallMetrics>,
 }
 
 impl FloatCandidateLifecycle {
@@ -227,6 +229,16 @@ impl FloatCandidateLifecycle {
 
     pub fn live_instances(&self) -> u8 {
         u8::from(self.instance.is_some())
+    }
+
+    /// Most recent candidate-engine fuel observation for this lifecycle.
+    ///
+    /// The value is reset before each call and retained across terminal
+    /// reclamation so target qualification can prove the exact final fuel
+    /// state without exposing the underlying engine instance. This remains an
+    /// acceptance-only observation surface behind `c88-f4-acceptance`.
+    pub const fn last_call_metrics(&self) -> Option<CandidateCallMetrics> {
+        self.last_call_metrics
     }
 
     /// Canonically lowers one exact `(u32, f32, f64) -> f64` call and starts
@@ -273,6 +285,7 @@ impl FloatCandidateLifecycle {
                 self.limits.poll_quantum,
             )
             .map_err(FloatCandidateError::Instantiation)?;
+        self.last_call_metrics = None;
         self.metrics.calls_started = self.metrics.calls_started.saturating_add(1);
         self.state = FloatCandidateState::Running;
         Ok(())
@@ -290,6 +303,10 @@ impl FloatCandidateLifecycle {
             .as_mut()
             .ok_or(FloatCandidateError::RecoveryUnavailable)?
             .poll_call();
+        self.last_call_metrics = self
+            .instance
+            .as_ref()
+            .and_then(CandidateInstance::call_metrics);
         match poll {
             CandidatePoll::Pending(metrics) => Ok(FloatCandidateLifecyclePoll::Pending(metrics)),
             CandidatePoll::Ready(values) => match self.lift_result(values) {
@@ -379,7 +396,8 @@ impl FloatCandidateLifecycle {
     }
 
     fn reclaim_instance(&mut self) {
-        if self.instance.take().is_some() {
+        if let Some(instance) = self.instance.take() {
+            self.last_call_metrics = instance.call_metrics().or(self.last_call_metrics);
             self.metrics.reclaimed_instances = self.metrics.reclaimed_instances.saturating_add(1);
         }
     }

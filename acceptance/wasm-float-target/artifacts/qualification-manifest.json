@@ -1,0 +1,56 @@
+{
+  "schema": "vibeos.c88.f5.float-target.manifest",
+  "version": 1,
+  "suite_id": "vibeos.c88.f5.float-target",
+  "scope": "host-and-fixed-qemu-emulator",
+  "platform": "qemu-virt-rv64-tcg-icount-v1",
+  "target": "riscv64imac-unknown-none-elf",
+  "physical_provenance": "not-claimed",
+  "physical_milkv_duo_status": "deferred",
+  "native_control_flow_scope": "trusted-native-control-flow",
+  "native_instruction_boundaries": "canonical-decoder-boundaries",
+  "arbitrary_pc_redirection": "not-claimed",
+  "hardware_nx": "not-claimed",
+  "artifact_profile_code": 5,
+  "artifact_stage": "validation-only",
+  "execution_enabled": false,
+  "current_validation_engine": false,
+  "current_component_engine": false,
+  "executable_successor_authorized": false,
+  "core_corpus": {
+    "path": "acceptance/wasm-float-target/artifacts/scalar-target.wat",
+    "wasm_sha256": "6e1cb23543bdfbbb9397c3dd5ad69b2f023d23cf292f652029da838d098121ba",
+    "wasm_bytes": 4179,
+    "runtime_ops": 72,
+    "runtime_and_fold_cases": 144,
+    "repeatability_cases": 2,
+    "total_cases": 146
+  },
+  "canonical_abi": {
+    "vector_cases": 12,
+    "summary_records": 1,
+    "total_records": 13
+  },
+  "component_lifecycle": {
+    "component_sha256": "5fdb9dc9a48a9c54e899a5dc724445083c055dbf0d664927ba55d9780cc9996a",
+    "component_bytes": 291,
+    "wit_sha256": "4c2b4d994caee3755671b89a0dfe92136fd3d130f001d5ac660aa988371f31ac",
+    "world": "vibe:float-acceptance/lifecycle@1.0.0",
+    "export": "run",
+    "vector_records": 12,
+    "fuel_records": 1000,
+    "lifecycle_records": 5
+  },
+  "requirements": [
+    "same-no-std-routine-on-host-and-target",
+    "exact-integer-bit-float-observations",
+    "runtime-and-literal-fold-core-paths",
+    "deterministic-fuel-and-repeatability",
+    "canonical-abi-flat-memory-nested-hostile-cases",
+    "image-pin-adapter-lifecycle-cancel-trap-recover-revoke",
+    "independent-fail-closed-uart-verifier",
+    "no-riscv-f-or-d-at-canonical-native-control-flow-boundaries",
+    "no-forbidden-native-float-helper-symbols",
+    "default-off-and-qemu-only-image-isolation"
+  ]
+}

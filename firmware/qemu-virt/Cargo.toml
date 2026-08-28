@@ -46,6 +46,9 @@ wasm-c77-ephemeral-runtime-acceptance = [
     "vibeos-kernel/wasm-c77-ephemeral-runtime-acceptance",
 ]
 wasm-c83-runtime-costs = ["vibeos-kernel/wasm-c83-runtime-costs"]
+wasm-c88-f5-float-qemu-acceptance = [
+    "vibeos-kernel/wasm-c88-f5-float-qemu-acceptance",
+]
 wasm-c84-profile-slot-qemu-acceptance = [
     "vibeos-kernel/wasm-c84-profile-slot-qemu-acceptance",
 ]

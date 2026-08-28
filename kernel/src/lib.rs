@@ -45,12 +45,67 @@
         feature = "wasm-c76-graph-version-replacement-acceptance",
         feature = "wasm-c77-ephemeral-runtime-acceptance",
         feature = "wasm-c84-profile-slot",
+        feature = "wasm-c88-f5-float-qemu-acceptance",
         feature = "ssh-native-async-command",
         feature = "ssh-native-async-qemu-acceptance",
         feature = "ssh-native-async-revoke-qemu-acceptance"
     )
 ))]
 compile_error!("feature `wasm-c83-runtime-costs` is an isolated benchmark image");
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c88-f5-float-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-qemu-acceptance",
+    not(feature = "qemu-default-image")
+))]
+compile_error!("feature `wasm-c88-f5-float-qemu-acceptance` requires the QEMU image policy");
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-qemu-acceptance",
+    any(
+        feature = "milkv-duo",
+        feature = "milkv-duo-sd-image",
+        feature = "legacy-shell",
+        feature = "storage-bench",
+        feature = "file-tree",
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server",
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "component-graph-principals",
+        feature = "component-durable-publication",
+        feature = "ssh-component-command",
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c73-authenticated-admission-acceptance",
+        feature = "wasm-c74-crash-safe-publication-acceptance",
+        feature = "wasm-c75-boot-revalidation-acceptance",
+        feature = "wasm-c76-graph-version-replacement-acceptance",
+        feature = "wasm-c77-ephemeral-runtime-acceptance",
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c84-profile-slot",
+        feature = "ssh-native-async-command",
+        feature = "ssh-native-async-qemu-acceptance",
+        feature = "ssh-native-async-revoke-qemu-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c88-f5-float-qemu-acceptance` is an isolated emulator qualification image"
+);
 
 #[cfg(all(
     feature = "wasm-c84-profile-slot-qemu-acceptance",
@@ -847,6 +902,8 @@ mod ssh_platform;
 mod ssh_provisioning;
 #[cfg(feature = "wasm-c84-profile-slot")]
 mod wasm_aot_profile_slot;
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+mod wasm_float_target;
 #[cfg(feature = "wasm-c83-runtime-costs")]
 mod wasm_runtime_costs;
 pub use vibeos_object_store as store;
@@ -1111,7 +1168,13 @@ pub extern "C" fn kmain() -> ! {
         "  mmu       Sv39 single address space, hart mask {:#x}",
         mmu::enabled_hart_mask()
     );
-    #[cfg(all(feature = "qemu-virt", not(feature = "wasm-c83-runtime-costs")))]
+    #[cfg(all(
+        feature = "qemu-virt",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance"
+        ))
+    ))]
     {
         let functions = pci::init().expect("QEMU PCI resource assignment must succeed");
         println!(
@@ -1132,7 +1195,13 @@ pub extern "C" fn kmain() -> ! {
             );
         }
     }
-    #[cfg(all(feature = "milkv-duo", not(feature = "wasm-c83-runtime-costs")))]
+    #[cfg(all(
+        feature = "milkv-duo",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance"
+        ))
+    ))]
     match dwc2_host::init() {
         Ok(info) => println!(
             "  usb       DWC2 {:#06x} @ {:#x}, IRQ {}, {} channel(s), port {}",
@@ -1148,7 +1217,13 @@ pub extern "C" fn kmain() -> ! {
         ),
         Err(error) => println!("  usb       DWC2 bring-up FAILED: {:?}", error),
     }
-    #[cfg(all(feature = "milkv-duo", not(feature = "wasm-c83-runtime-costs")))]
+    #[cfg(all(
+        feature = "milkv-duo",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance"
+        ))
+    ))]
     if let Some(usb) = dwc2_host::telemetry() {
         println!(
             "  usb regs  clocks {:#010x}/{:#010x}, role {:#010x}, GUSBCFG {:#010x}, HPRT {:#010x}, PHY14 {:#010x}",
@@ -1160,7 +1235,13 @@ pub extern "C" fn kmain() -> ! {
             usb.phy_utmi_control,
         );
     }
-    #[cfg(all(feature = "milkv-duo", not(feature = "wasm-c83-runtime-costs")))]
+    #[cfg(all(
+        feature = "milkv-duo",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance"
+        ))
+    ))]
     if dwc2_host::connected() {
         match dwc2_host::enumerate_device() {
             Ok(Some(device)) => {
@@ -1265,20 +1346,50 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(feature = "ssh-component-command")]
     component_instances::init();
 
-    #[cfg(not(feature = "wasm-c83-runtime-costs"))]
+    #[cfg(not(any(
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance"
+    )))]
     world::build();
 
-    #[cfg(not(feature = "wasm-c83-runtime-costs"))]
+    #[cfg(not(any(
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance"
+    )))]
     let world = world::world();
-    #[cfg(not(feature = "wasm-c83-runtime-costs"))]
+    #[cfg(not(any(
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance"
+    )))]
     world::start_block_supervisor();
-    #[cfg(not(feature = "wasm-c83-runtime-costs"))]
+    #[cfg(not(any(
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance"
+    )))]
     world::start_net_supervisor();
-    #[cfg(all(feature = "milkv-duo", not(feature = "wasm-c83-runtime-costs")))]
+    #[cfg(all(
+        feature = "milkv-duo",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance"
+        ))
+    ))]
     world::start_usb_net_supervisor();
-    #[cfg(all(feature = "qemu-virt", not(feature = "wasm-c83-runtime-costs")))]
+    #[cfg(all(
+        feature = "qemu-virt",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance"
+        ))
+    ))]
     world::start_rng_supervisor();
-    #[cfg(all(feature = "qemu-virt", not(feature = "wasm-c83-runtime-costs")))]
+    #[cfg(all(
+        feature = "qemu-virt",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance"
+        ))
+    ))]
     if xhci::info().is_some() {
         exec::spawn("usb-host", xhci::service_task());
     }
@@ -1458,6 +1569,12 @@ pub extern "C" fn kmain() -> ! {
     });
     #[cfg(feature = "wasm-c83-runtime-costs")]
     exec::spawn("wasm-c83-runtime-costs", wasm_runtime_costs::run());
+    #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c88-f5-float-target",
+        wasm_float_target::run(),
+    );
     #[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
     exec::spawn_pinned_on(
         exec::HartId::BOOT,
@@ -1487,7 +1604,13 @@ pub extern "C" fn kmain() -> ! {
         "wasm-c54-native-revoke-worker",
         component_instances::run_native_async_revoke_worker(),
     );
-    #[cfg(all(feature = "milkv-duo", not(feature = "wasm-c83-runtime-costs")))]
+    #[cfg(all(
+        feature = "milkv-duo",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance"
+        ))
+    ))]
     if dwc2_host::info().is_some() {
         exec::spawn("usb-hid", dwc2_host::service_task());
     }
@@ -1520,6 +1643,7 @@ pub extern "C" fn kmain() -> ! {
         feature = "wasm-c75-boot-revalidation-acceptance",
         feature = "wasm-c76-graph-version-replacement-acceptance",
         feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance",
         feature = "wasm-c84-ssh-managed-child-single-boot-collector"
     )))]
     {
@@ -1551,13 +1675,19 @@ pub extern "C" fn kmain() -> ! {
             vsh_platform::task(space, world.vsh_console, session),
         );
     }
-    #[cfg(not(feature = "wasm-c83-runtime-costs"))]
+    #[cfg(not(any(
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance"
+    )))]
     let typed_channels = if world.net_outbound.is_some() {
         "3 typed channels"
     } else {
         "1 typed channel"
     };
-    #[cfg(not(feature = "wasm-c83-runtime-costs"))]
+    #[cfg(not(any(
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance"
+    )))]
     println!(
         "  world     {} capability spaces, {}, {} components",
         world.spaces.len(),
@@ -1566,6 +1696,8 @@ pub extern "C" fn kmain() -> ! {
     );
     #[cfg(feature = "wasm-c83-runtime-costs")]
     println!("  image     isolated C8.3 WebAssembly runtime-cost sampler");
+    #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+    println!("  image     isolated C8.8-F5 fixed-QEMU float qualification");
     println!("  sched     async executor, no threads, no preemption");
 
     trap::enable_interrupts();

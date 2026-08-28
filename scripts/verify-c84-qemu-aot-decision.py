@@ -1548,6 +1548,25 @@ def validate_private_checksum_encoder_source_bytes(raw: bytes) -> None:
             f"QEMU verifier {name} compact checksum payload differs",
         )
 
+    local_configs = ast_unique_function(module, "live_local_config_records")
+    expected_local_config_hash = ast.parse(
+        "hashlib.sha256(canonical_compact_json(parsed)).hexdigest()",
+        mode="eval",
+    ).body
+    local_config_hashes = [
+        node
+        for node in ast.walk(local_configs)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "hexdigest"
+    ]
+    require(
+        len(local_config_hashes) == 1
+        and ast.dump(local_config_hashes[0], include_attributes=False)
+        == ast.dump(expected_local_config_hash, include_attributes=False),
+        "QEMU verifier local Git config must use the compact evidence encoder",
+    )
+
 
 def validate_private_checksum_encoder_source_closure() -> None:
     raw = read_regular(
@@ -3516,7 +3535,9 @@ def live_local_config_records() -> list[dict[str, Any]]:
                 "policy": GIT_LOCAL_CONFIG_POLICY,
                 **identity_for(before_raw),
                 "entries": len(parsed),
-                "parsed_sha256": hashlib.sha256(canonical_json(parsed)).hexdigest(),
+                "parsed_sha256": hashlib.sha256(
+                    canonical_compact_json(parsed)
+                ).hexdigest(),
             }
         )
     return records
@@ -7621,6 +7642,13 @@ def selftest(contracts: Contracts) -> int:
             b"        checksum_raw = canonical_compact_json(\n",
             b"        checksum_raw = canonical_json(\n",
             "archive-pretty-checksum",
+        ),
+        replace_verifier_unique(
+            b'                "parsed_sha256": hashlib.sha256(\n'
+            b"                    canonical_compact_json(parsed)\n",
+            b'                "parsed_sha256": hashlib.sha256(\n'
+            b"                    canonical_json(parsed)\n",
+            "local-config-pretty-checksum",
         ),
         replace_verifier_unique(
             b'        + "\\n"\n    ).encode("ascii")\n',

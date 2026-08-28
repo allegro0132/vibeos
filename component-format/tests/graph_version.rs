@@ -534,18 +534,20 @@ fn three_root_node_current_and_candidate_accounts_match_runtime_nesting() {
 }
 
 #[test]
-fn c81_preview1_wrapped_profile_is_artifact_only_and_graph_codec_rejects_it() {
+fn validation_only_artifact_profiles_do_not_enter_the_durable_graph_codec() {
     let incident_edge = edges()[0];
-    let replacement = ComponentGraphVersionReplacementV1::new(
-        1,
-        1,
-        ComponentGraphVersionRetirementActionV1::PolicyCancel,
-        vec![ComponentGraphVersionIncidentEdgeV1::new(
-            incident_edge,
-            ComponentGraphVersionIncidentEdgeActionV1::RecreateFresh,
-        )],
-    )
-    .unwrap();
+    let replacement = || {
+        ComponentGraphVersionReplacementV1::new(
+            1,
+            1,
+            ComponentGraphVersionRetirementActionV1::PolicyCancel,
+            vec![ComponentGraphVersionIncidentEdgeV1::new(
+                incident_edge,
+                ComponentGraphVersionIncidentEdgeActionV1::RecreateFresh,
+            )],
+        )
+        .unwrap()
+    };
     assert_eq!(
         ComponentGraphVersionV1::new(
             "preview1-wrapped-must-not-enter-cgv1",
@@ -559,17 +561,38 @@ fn c81_preview1_wrapped_profile_is_artifact_only_and_graph_codec_rejects_it() {
             vec![],
             vec![],
             vec![],
-            replacement,
+            replacement(),
         ),
         Err(ComponentGraphVersionError::Profile)
     );
 
-    let mut encoded = fixture(0, None, 1).descriptor.encode().unwrap();
-    encoded[PROFILE_CODE_OFFSET..PROFILE_CODE_OFFSET + 2].copy_from_slice(&4_u16.to_le_bytes());
     assert_eq!(
-        ComponentGraphVersionV1::decode(&encoded),
+        ComponentGraphVersionV1::new(
+            "sync-float-code5-must-not-enter-cgv1",
+            ProfileIdentity::PROFILE_2_SYNC_FLOAT,
+            0,
+            None,
+            ComponentGraphVersionPolicyDigest::from_bytes(GRAPH_POLICY).unwrap(),
+            ComponentGraphAccount::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            replacement(),
+        ),
         Err(ComponentGraphVersionError::Profile)
     );
+
+    for code in [4_u16, 5_u16] {
+        let mut encoded = fixture(0, None, 1).descriptor.encode().unwrap();
+        encoded[PROFILE_CODE_OFFSET..PROFILE_CODE_OFFSET + 2].copy_from_slice(&code.to_le_bytes());
+        assert_eq!(
+            ComponentGraphVersionV1::decode(&encoded),
+            Err(ComponentGraphVersionError::Profile),
+            "accepted artifact-only profile code {code}"
+        );
+    }
 }
 
 #[test]

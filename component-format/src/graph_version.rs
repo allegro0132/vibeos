@@ -76,8 +76,9 @@ const VERSION_COMMITMENT_OFFSET: usize = 192;
 const HEADER_RESERVED1_OFFSET: usize = 224;
 
 /// CGV1 remains limited to the three C0-C7 profiles. C8.1's Preview1-wrapped
-/// identity is intentionally an artifact-only validation surface and must not
-/// become durable graph-version input merely because CMP1 assigns it code 4.
+/// identity and C8.8-F1's scalar-float identity are intentionally artifact-only
+/// validation surfaces and must not become durable graph-version input merely
+/// because CMP1 assigns them codes 4 and 5.
 fn graph_profile_code(profile: ProfileIdentity) -> Option<u16> {
     let code = profile_code(profile)?;
     matches!(code, 1 | 2 | 3).then_some(code)

@@ -50,4 +50,8 @@ fn c75_async_selection_is_distinct_and_adjacent_profile_has_no_gate() {
     let mut adjacent = ProfileIdentity::PROFILE_1_SYNC;
     adjacent.wasm_tools_revision = "wasm-tools-adjacent";
     assert!(current_component_validation_engine(adjacent).is_none());
+    assert!(
+        current_component_validation_engine(ProfileIdentity::PROFILE_2_SYNC_FLOAT).is_none(),
+        "C8.8-F1 code 5 must never enter the current Component engine resolver"
+    );
 }

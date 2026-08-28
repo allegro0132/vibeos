@@ -1,10 +1,12 @@
 use vibeos_component_format::{
-    current_validation_engine_identity, ProfileIdentity, WasmParserFeatureSelection,
-    WasmiCompilationMode, WasmiEnforcedLimits, WasmiFuelCosts, COMPONENT_WASMPARSER_FEATURES,
-    CORE_WASMPARSER_FEATURES, PROFILE_1_LIMITS, WASMI_1_1_0_CHECKSUM, WASMI_1_1_0_VERSION,
-    WASMI_FEATURES, WASMI_WASMPARSER_0_239_0_CHECKSUM, WASMI_WASMPARSER_0_239_0_VERSION,
-    WASMI_WASMPARSER_FEATURES, WASMPARSER_0_255_0_CHECKSUM, WASMPARSER_0_255_0_VERSION,
-    WIT_PARSER_0_255_0_CHECKSUM, WIT_PARSER_0_255_0_VERSION, WIT_PARSER_FEATURES,
+    current_validation_engine_identity, profile_2_sync_float_validation_contract,
+    ComponentValidationMode, CoreNumericProfile, ProfileIdentity, ScalarFloatType,
+    WasmParserFeatureSelection, WasmiCompilationMode, WasmiEnforcedLimits, WasmiFuelCosts,
+    COMPONENT_WASMPARSER_FEATURES, CORE_WASMPARSER_FEATURES, PROFILE_1_LIMITS,
+    PROFILE_2_SYNC_FLOAT_NAN_POLICY, WASMI_1_1_0_CHECKSUM, WASMI_1_1_0_VERSION, WASMI_FEATURES,
+    WASMI_WASMPARSER_0_239_0_CHECKSUM, WASMI_WASMPARSER_0_239_0_VERSION, WASMI_WASMPARSER_FEATURES,
+    WASMPARSER_0_255_0_CHECKSUM, WASMPARSER_0_255_0_VERSION, WIT_PARSER_0_255_0_CHECKSUM,
+    WIT_PARSER_0_255_0_VERSION, WIT_PARSER_FEATURES,
 };
 
 #[test]
@@ -19,6 +21,7 @@ fn c81_preview1_wrapped_profile_has_no_current_engine_or_activation_path() {
         ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE
     )
     .is_some());
+    assert!(current_validation_engine_identity(ProfileIdentity::PROFILE_2_SYNC_FLOAT).is_none());
 }
 
 #[test]
@@ -57,6 +60,7 @@ fn c75_current_engine_identity_is_exact_and_profile_bound() {
     assert_eq!(internal.features(), WASMI_WASMPARSER_FEATURES);
 
     let component_validator = identity.component_validator();
+    assert_eq!(component_validator.mode(), ComponentValidationMode::Sync);
     assert!(!component_validator.predecode_async());
     assert_eq!(
         component_validator.structural_features(),
@@ -84,6 +88,97 @@ fn c75_current_engine_identity_is_exact_and_profile_bound() {
         core_validator.diagnostic_features(),
         WasmParserFeatureSelection::All
     );
+    assert_eq!(
+        core_validator.numeric_profile(),
+        CoreNumericProfile::Profile1IntegerOnly
+    );
+    assert!(core_validator.scalar_float_types().is_empty());
+    assert_eq!(core_validator.nan_policy(), None);
+}
+
+#[test]
+fn c88_f1_float_contract_is_exact_sync_validation_metadata_not_a_current_engine() {
+    let profile = ProfileIdentity::PROFILE_2_SYNC_FLOAT;
+    assert!(!profile.execution_enabled());
+    // Code 5 is permanently validation-only and is never promoted in place to
+    // the current engine resolver. An executable successor needs a new code.
+    assert!(current_validation_engine_identity(profile).is_none());
+
+    let contract = profile_2_sync_float_validation_contract();
+    assert_eq!(contract.profile(), profile);
+    assert!(!contract.runtime_ready());
+    assert_eq!(contract.nan_policy(), PROFILE_2_SYNC_FLOAT_NAN_POLICY);
+
+    let component = contract.component_validator();
+    assert_eq!(component.mode(), ComponentValidationMode::Sync);
+    assert!(!component.predecode_async());
+    assert_eq!(
+        component.structural_features(),
+        WasmParserFeatureSelection::All
+    );
+    assert_eq!(
+        component.strict_features(),
+        WasmParserFeatureSelection::ComponentModel
+    );
+    assert_eq!(
+        component.diagnostic_features(),
+        WasmParserFeatureSelection::All
+    );
+
+    let core = contract.core_validator();
+    assert_eq!(core.structural_features(), WasmParserFeatureSelection::All);
+    assert_eq!(core.strict_features(), WasmParserFeatureSelection::Empty);
+    assert_eq!(core.diagnostic_features(), WasmParserFeatureSelection::All);
+    assert_eq!(
+        core.numeric_profile(),
+        CoreNumericProfile::Profile2ScalarF32F64
+    );
+    assert_eq!(
+        core.scalar_float_types(),
+        &[ScalarFloatType::F32, ScalarFloatType::F64]
+    );
+    assert_eq!(core.nan_policy(), Some(PROFILE_2_SYNC_FLOAT_NAN_POLICY));
+
+    let runtime = contract.target_wasmi_configuration();
+    assert!(runtime.floats());
+    assert!(!runtime.mutable_global());
+    assert!(!runtime.sign_extension());
+    assert!(!runtime.saturating_float_to_int());
+    assert!(!runtime.multi_value());
+    assert!(!runtime.multi_memory());
+    assert!(!runtime.bulk_memory());
+    assert!(!runtime.reference_types());
+    assert!(!runtime.tail_call());
+    assert!(!runtime.extended_const());
+    assert!(!runtime.custom_page_sizes());
+    assert!(!runtime.memory64());
+    assert!(!runtime.wide_arithmetic());
+    assert!(!runtime.simd_compiled());
+    assert!(!runtime.relaxed_simd_compiled());
+    assert!(runtime.consume_fuel());
+    assert!(!runtime.ignore_custom_sections());
+    assert_eq!(runtime.compilation_mode(), WasmiCompilationMode::Eager);
+    assert_eq!(runtime.max_recursion_depth(), 128);
+    assert_eq!(runtime.min_stack_height(), 4 * 1024);
+    assert_eq!(runtime.max_stack_height(), 128 * 1024);
+    assert_eq!(runtime.max_cached_stacks(), 0);
+    assert_eq!(runtime.enforced_limits(), WasmiEnforcedLimits::Strict);
+    assert_eq!(runtime.fuel_costs(), WasmiFuelCosts::Wasmi110Default);
+
+    let async_ = current_validation_engine_identity(ProfileIdentity::PROFILE_1_ASYNC).unwrap();
+    assert_eq!(
+        async_.component_validator().mode(),
+        ComponentValidationMode::Async
+    );
+    assert!(async_.component_validator().predecode_async());
+    let native =
+        current_validation_engine_identity(ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE)
+            .unwrap();
+    assert_eq!(
+        native.component_validator().mode(),
+        ComponentValidationMode::Async
+    );
+    assert!(native.component_validator().predecode_async());
 }
 
 #[test]
@@ -162,7 +257,10 @@ fn c75_engine_payloads_match_actual_cargo_pins_and_lock_checksums() {
         "name = \"wasmparser\"\nversion = \"0.255.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"e8e329ef4b5d46e73b91d3ac6924417cad55a8cbbf869c199283383427c3320b\"",
         "name = \"wit-parser\"\nversion = \"0.255.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"ab5f6371fc71f15730b756c1dea3562a67adab1a7e519c4ca010173d883695bb\"",
     ] {
-        assert!(lock.contains(exact_entry), "missing lock entry: {exact_entry}");
+        assert!(
+            lock.contains(exact_entry),
+            "missing lock entry: {exact_entry}"
+        );
     }
     let wasmi_entry = lock
         .split("[[package]]")

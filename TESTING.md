@@ -112,6 +112,16 @@ python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py --selftes
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
+# C8.8-F1 host-only contract gate; no Float execution, QEMU, or physical device
+cargo test --locked --offline -p vibeos-component-format
+cargo test --locked --offline -p vibeos-wasm-runtime --test current_engine
+cargo test --locked --offline -p vibeos-component-runtime --test current_engine
+cargo test --locked --offline -p vibeos-wasm-runtime --test runtime \
+  profile_rejects_disabled_proposals_before_compilation -- --exact
+cargo test --locked --offline -p vibeos-wasm-runtime --test trap_diagnostics \
+  validation_unsupported_and_limit_admission_codes_are_exact -- --exact
+cargo fmt -p vibeos-component-format -- --check
+git diff --check
 ```
 
 `wasm-runtime/tests/decode_limits.rs` is the C1.2 Core decode-account gate. It
@@ -235,6 +245,13 @@ and a numeric table-index overflow intentionally share
 distinct `IndirectCallTypeMismatch`. Wasmi's float-to-integer conversion trap
 maps fail-closed to `Validation`, but admitted Profile-1 modules cannot produce
 it because floating-point types and operators are disabled.
+
+C8.8-F1 does not make that trap guest-reachable. Before the F2 candidate
+executes any Float instruction, it must choose and ABI-version a stable guest
+execution trap for NaN and out-of-range float-to-integer truncation, with exact
+coverage for every width, integer signedness, NaN, and positive/negative
+overflow case. Continuing to report the static `Validation` trap after Float
+becomes reachable fails the F2 gate.
 
 Production execution fixtures cover signed division by zero and overflow,
 conditional `unreachable`, the first invalid four-byte load, valid/null/wrong-
@@ -578,6 +595,19 @@ C8.8. The evidence records `platform_class=emulator`,
 `native_code_accepted=false`. Source immutability and Docker runtime custody
 remain local software evidence, not hardware, TPM, remote-attestation, or
 physical-cold-boot proof.
+
+The C8.8-F1 commands above are host-only and prove only the exact code-5
+artifact identity and codec, strict NaN-policy metadata, unchanged integer-only
+Profile 1, absence from the current engine resolver, and fail-closed durable
+graph behavior. Code 5 is permanently `ValidationOnly`; it has no current
+validation-engine, runtime, admission, publication, or invocation activation
+path. These tests do not execute Float and provide no differential,
+cross-target, fixed-QEMU, or
+physical evidence. F1 is Float increment 1 of 5, C8.8-F2 is next, and Float and
+C8.8 remain incomplete. The full contract and F2 dependency/trap gates are in
+[docs/WASM_FLOAT_PROFILE.md](docs/WASM_FLOAT_PROFILE.md). Milk-V Duo physical
+testing remains paused.
+
 See [docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md) for the deferred
 Duo-v1 physical formal build, package, image-verification, capture, and
 publication commands.

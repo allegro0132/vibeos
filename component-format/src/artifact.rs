@@ -784,6 +784,8 @@ pub(crate) fn profile_code(profile: ProfileIdentity) -> Option<u16> {
         Some(3)
     } else if profile == ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED {
         Some(4)
+    } else if profile == ProfileIdentity::PROFILE_2_SYNC_FLOAT {
+        Some(crate::PROFILE_2_SYNC_FLOAT_PROFILE_CODE)
     } else {
         None
     }
@@ -795,6 +797,7 @@ pub(crate) fn profile_from_code(code: u16) -> Option<ProfileIdentity> {
         2 => Some(ProfileIdentity::PROFILE_1_ASYNC),
         3 => Some(ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE),
         4 => Some(ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED),
+        crate::PROFILE_2_SYNC_FLOAT_PROFILE_CODE => Some(ProfileIdentity::PROFILE_2_SYNC_FLOAT),
         _ => None,
     }
 }

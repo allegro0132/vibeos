@@ -2,7 +2,7 @@
 
 `workloads-qemu-v1.json`, `schema-qemu-v1.json`, and
 `evidence-schema-qemu-v1.json` are the authoritative
-decision-bearing C8.4 preparation contract. They freeze one fresh
+decision-bearing C8.4 contract. They freeze one fresh
 `qemu-virt-rv64-tcg-icount-v1` process, 3 warmups plus 21 retained samples, a
 10 MHz `riscv.rdtime` clock, a pre-frozen 1,000,000-tick/100 ms budget, and a
 retained `p95/p50 <= 1.10` stability gate. The evidence is emulator-scoped and
@@ -17,11 +17,23 @@ container-runtime custody roots. A raw transcript contains one metadata record,
 24 samples, and one end record; the host, not the target, later assigns its
 boot index.
 
-These preparation files contain no result and do not authorize AOT. C1 through
-C8.3 are accepted complete by historical-evidence policy. The QEMU-v1 result
-may decide only whether C8.5 merits design review; it never accepts native
-bytes. The retained Duo-v1 tooling is non-blocking and physical execution stays
-paused. See
+These contract files contain no result and do not authorize AOT. The published
+formal result is in [`qemu-v1/`](qemu-v1/). It binds source commit
+`e950a2facb6a6c230e67becb186bddf34a5924bb` and run ID
+`a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f`.
+Total p50/p95 are 2,899,765/2,901,632 ticks, interpretation p50/p95 are
+97,260/97,318, and per-sample-derived non-interpretation p50/p95 are
+2,802,541/2,804,417. Stability passed; `budget_miss=true` but
+`interpretation_attribution=false`, so the outcome is
+`aot-not-justified-on-fixed-qemu` and the next node is
+`C8.8-skip-or-defer-C8.5-C8.7`. It records `platform_class=emulator`,
+`physical_provenance=not-claimed`, `aot_authorized=false`, and
+`native_code_accepted=false`.
+
+C1 through C8.3 are accepted complete by historical-evidence policy. C8.4 is
+complete for the selected workload; C8.5 through C8.7 were not entered for it
+and remain globally deferred. The retained Duo-v1 tooling is non-blocking and
+physical execution stays paused. See
 [`docs/WASM_AOT_DECISION.md`](../../docs/WASM_AOT_DECISION.md).
 
 The QEMU-v1 host gates are:
@@ -32,9 +44,9 @@ The QEMU-v1 host gates are:
 ./scripts/run-c84-qemu-aot-decision.sh --selftest
 ```
 
-After committing and pushing this preparation, a formal clean-tree run uses
+The published formal clean-tree campaign used
 `./scripts/run-c84-qemu-aot-decision.sh --evidence-dir benchmarks/wasm-aot-decision/qemu-v1`.
-It creates `uart.log`, `summary.json`, `environment.json`, and `DECISION.json`
+It created `uart.log`, `summary.json`, `environment.json`, and `DECISION.json`
 with strict no-clobber semantics. Formal publication requires a clean
 `codex/wasm` branch whose local and tracking refs equal the bound source commit,
 whose index contains no assume-unchanged, skip-worktree, or fsmonitor-valid
@@ -161,10 +173,12 @@ AOT decision. Its raw input is a stable non-empty regular file capped at
 268,435,456 bytes; derived summary creation is no-clobber unless `--overwrite`
 is supplied explicitly.
 
-Current execution status (2026-08-28): the fixed-QEMU decision contract is
-being prepared; no C8.4 result is claimed yet. Milk-V Duo physical testing is
-paused and the retained physical toolchain remains available for future
-qualification. Its runtime evidence is software custody from the local Docker
+Current execution status (2026-08-28): the fixed-QEMU formal result completes
+C8.4 for the selected workload with outcome
+`aot-not-justified-on-fixed-qemu`; C8.5 through C8.7 are skipped for that
+workload and remain globally deferred, and work continues at C8.8. Milk-V Duo
+physical testing is paused and the retained physical toolchain remains
+available for future qualification. Its runtime evidence is software custody from the local Docker
 daemon plus an in-container namespace witness; it is not a TPM,
 remote-attestation, hardware, or physical-cold-boot proof. These CI-safe
 commands do not open a UART, invoke Docker, access the network, flash media,

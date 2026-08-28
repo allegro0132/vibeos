@@ -2210,9 +2210,23 @@ def verify_docs_ci(inputs: Inputs) -> None:
     for text in (
         "live trusted-terminal",
         "private 24-sample collector",
-        "no workload-specific AOT decision exists yet",
+        "aot-not-justified-on-fixed-qemu",
+        "e950a2facb6a6c230e67becb186bddf34a5924bb",
+        "a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f",
+        "physical_provenance=not-claimed",
     ):
         require(text in inputs.roadmap, f"WASM roadmap trusted status omits {text!r}")
+    normalized_roadmap_status = " ".join(inputs.roadmap.split())
+    for text in (
+        "completes C8.4 at source commit",
+        "C8.5 through C8.7 are skipped for this workload and remain globally deferred; "
+        "they are not marked complete.",
+        "The current implementation node is C8.8.",
+    ):
+        require(
+            text in normalized_roadmap_status,
+            f"WASM roadmap trusted disposition omits {text!r}",
+        )
     normalized_docs = {
         "TESTING": " ".join(inputs.testing.split()),
         "decision doc": " ".join(inputs.decision_doc.split()),
@@ -3839,6 +3853,38 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
                 "**Status (2026-08-28): implementation in progress.**",
                 "**Status (2026-08-28): planned.**",
                 "WASM roadmap implementation status",
+            ),
+        ),
+        (
+            "roadmap-fixed-qemu-outcome-overclaimed",
+            lambda data: mutate_text(
+                data,
+                "roadmap",
+                "aot-not-justified-on-fixed-qemu",
+                "aot-eligible-for-c85-design-review-on-fixed-qemu",
+                "WASM roadmap fixed-QEMU outcome",
+            ),
+        ),
+        (
+            "roadmap-c84-completion-removed",
+            lambda data: mutate_text(
+                data,
+                "roadmap",
+                "completes C8.4 at source commit",
+                "prepares C8.4 at source commit",
+                "WASM roadmap C8.4 completion",
+            ),
+        ),
+        (
+            "roadmap-c85-c87-disposition-overclaimed",
+            lambda data: mutate_text(
+                data,
+                "roadmap",
+                "C8.5 through C8.7 are skipped for this workload and remain\n"
+                "globally deferred; they are not marked complete.",
+                "C8.5 through C8.7 are opened for this workload and remain\n"
+                "globally deferred; they are not marked complete.",
+                "WASM roadmap C8.5-C8.7 disposition",
             ),
         ),
     ]

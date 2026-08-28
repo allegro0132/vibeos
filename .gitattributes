@@ -1,2 +1,5 @@
 # Preserve the byte-pinned upstream Apache-2.0 text, including its final blank line.
 wasm-runtime/tests/spec/core-wg-1.0/LICENSE whitespace=-blank-at-eof
+
+# Preserve the byte-exact formal QEMU UART transcript, including device CRLF.
+benchmarks/wasm-aot-decision/qemu-v1/uart.log binary

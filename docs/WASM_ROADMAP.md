@@ -11,8 +11,10 @@ bounded Core validation/execution, Component decoding and Canonical ABI,
 admission/loading, compatibility, and C8 profiling evidence. The dependency
 sequence and acceptance text below remain the roadmap rather than a claim that
 every milestone is complete. C1 through C8.3 are accepted complete under the
-historical-evidence policy; C8.4 onward remains active. Its fixed-QEMU decision
-contract and explicit gaps are tracked in
+historical-evidence policy, and formal fixed-QEMU evidence completes C8.4 for
+the selected workload. C8.5 through C8.7 were not entered for that workload
+and remain globally deferred; C8.8 onward remains active. The decision contract
+and explicit gaps are tracked in
 [WASM_AOT_DECISION.md](WASM_AOT_DECISION.md) and [TESTING.md](../TESTING.md).
 
 ---
@@ -816,14 +818,14 @@ component security boundary is measured and stable.
 | C8.8 | Widen profiles one feature at a time | Float, SIMD, references, exceptions, memory64, multiple memories, GC, threads or broader WASI each require separate semantics and evidence |
 
 As of 2026-08-28, C1 through C8.3 are accepted complete by historical-evidence
-policy. The current C8.4 decision-bearing chain is the fixed-QEMU contract
+policy. The completed C8.4 decision-bearing chain is the fixed-QEMU contract
 below. It reuses the live trusted-terminal boundary and private 24-sample collector
 to emit META + 24 SAMPLE + END through the platform-neutral atomic UART sink,
 with three warmups and 21 retained samples. Formal and dirty-smoke builds are
 compile-time and wire-distinct; an independent host verifier closes the exact
 workload, transcript, source, helper, QEMU, OpenSBI, OpenSSH, and publication
 envelopes. Formal builds use an exact commit-plus-gitlink object export and a
-fresh private Cargo target; a sanitized remote query proves the preparation
+fresh private Cargo target; a sanitized remote query proves the bound source
 commit is actually advertised. Only byte-identical private copies of frozen
 QEMU/OpenSBI plus the kernel are executed; pinned `/usr/bin/ssh` executes in
 place only after repeated Darwin sealed/read-only APFS, ownership, mode, link,
@@ -873,9 +875,18 @@ retained samples, 10 MHz `rdtime`, a pre-frozen 1,000,000-tick budget, and a
 1.10 retained stability ceiling. It uses a separate suite, schema, and run-id
 domain and explicitly records `platform_class=emulator` and
 `physical_provenance=not-claimed`; it cannot be presented as Duo evidence.
-Preparation is in progress and no workload-specific AOT decision exists yet.
-C8.5 remains gated on the future verified fixed-QEMU result and, even then,
-would be authorized only as a design review rather than native execution.
+Formal fixed-QEMU evidence in
+[`benchmarks/wasm-aot-decision/qemu-v1/`](../benchmarks/wasm-aot-decision/qemu-v1/)
+completes C8.4 at source commit
+`e950a2facb6a6c230e67becb186bddf34a5924bb` and run ID
+`a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f`.
+Its stable p95 total is 2,901,632 ticks and p95 non-interpretation is 2,804,417
+ticks, both above the 1,000,000-tick budget. The miss is therefore not
+attributable to interpretation and the outcome is
+`aot-not-justified-on-fixed-qemu`; AOT remains unauthorized and no native code
+is accepted. C8.5 through C8.7 are skipped for this workload and remain
+globally deferred; they are not marked complete.
+The current implementation node is C8.8.
 
 ## 10. Test and evidence matrix
 

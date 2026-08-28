@@ -52,7 +52,7 @@ python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
 python3 -B scripts/verify-c83-evidence.py --selftest
 # Retained Duo-v1 physical transcript contract
 python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
-# Current fixed-QEMU decision contract
+# Published fixed-QEMU C8.4 contract self-tests
 /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -I -B -S -X pycache_prefix=/var/empty/vibeos-c84-python-pyc scripts/verify-c84-qemu-aot-decision.py --selftest --check-manifest
 /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -I -B -S -X pycache_prefix=/var/empty/vibeos-c84-python-pyc scripts/c84-qemu-aot-decision-peer.py --selftest
 ./scripts/run-c84-qemu-aot-decision.sh --selftest
@@ -450,10 +450,10 @@ attestation.
 The C8.4 AOT-decision contracts are documented in
 [docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md). They freeze the exact
 authorized SSH `case-filter` product workload, mutually exclusive profiling
-phases, and fail-closed rules before any result exists. The decision-bearing
-QEMU-v1 contract fixes one fresh `virt`/RV64/TCG single-thread process with
-instruction counting, 3 warmups plus 21 retained samples, a 10 MHz clock, a
-1,000,000-tick budget, and a 1.10 stability ceiling. C1 through C8.3 are
+phases, and fail-closed rules frozen before the published result. The
+decision-bearing QEMU-v1 contract fixes one fresh `virt`/RV64/TCG single-thread
+process with instruction counting, 3 warmups plus 21 retained samples, a 10 MHz
+clock, a 1,000,000-tick budget, and a 1.10 stability ceiling. C1 through C8.3 are
 accepted complete by historical-evidence policy. The retained Duo contract is
 non-blocking while physical testing stays paused. Neither possible fixed-QEMU
 outcome authorizes AOT or accepts native code.
@@ -562,10 +562,21 @@ the complete C8.3 evidence verifier from that explicit full preparation
 commit, and independently derives nearest-rank p50/p95 from all 63 retained
 samples. It remains available for future qualification but no longer blocks
 C8.4. Current execution status (2026-08-28): Milk-V Duo physical testing is
-paused, C1 through C8.3 are accepted by historical evidence, and the disjoint
-fixed-QEMU C8.4 contract is being prepared. No workload-specific AOT decision
-is claimed yet. Source immutability and Docker runtime custody remain local
-software evidence, not hardware, TPM, remote-attestation, or
+paused, C1 through C8.3 are accepted by historical evidence, and formal
+fixed-QEMU evidence completes C8.4 for `ssh-case-filter-12k-v1`. The published
+bundle at `benchmarks/wasm-aot-decision/qemu-v1/` binds source commit
+`e950a2facb6a6c230e67becb186bddf34a5924bb` and run ID
+`a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f`.
+Total p50/p95 are 2,899,765/2,901,632 ticks, interpretation p50/p95 are
+97,260/97,318, and per-sample-derived non-interpretation p50/p95 are
+2,802,541/2,804,417. Stability passes and `budget_miss=true`, but
+`interpretation_attribution=false`; the formal outcome is
+`aot-not-justified-on-fixed-qemu`. C8.5 through C8.7 were not entered for this
+workload and remain globally deferred, so the current implementation node is
+C8.8. The evidence records `platform_class=emulator`,
+`physical_provenance=not-claimed`, `aot_authorized=false`, and
+`native_code_accepted=false`. Source immutability and Docker runtime custody
+remain local software evidence, not hardware, TPM, remote-attestation, or
 physical-cold-boot proof.
 See [docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md) for the deferred
 Duo-v1 physical formal build, package, image-verification, capture, and

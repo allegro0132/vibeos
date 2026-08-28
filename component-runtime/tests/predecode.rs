@@ -72,6 +72,44 @@ fn rejects_declared_million_entry_vectors_before_the_truncated_body() {
 }
 
 #[test]
+fn aliases_and_adapters_are_aggregated_before_truncated_entries() {
+    let alias_over_limit = leb(PROFILE_1_LIMITS.max_aliases + 1);
+    assert_eq!(
+        predecode_component(&component_with_section(6, &alias_over_limit)),
+        Err(PredecodeError::Limit)
+    );
+
+    let mut top_level_aliases = leb(PROFILE_1_LIMITS.max_aliases);
+    for _ in 0..PROFILE_1_LIMITS.max_aliases {
+        // Component-function export from instance zero, with an empty name.
+        top_level_aliases.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+    }
+    // One instance-type alias declaration with its alias body omitted. The
+    // aggregate alias ceiling must win before that truncated body is read.
+    let nested_alias = [0x01, 0x42, 0x01, 0x02];
+    assert_eq!(
+        predecode_component(&component_with_sections(&[
+            (6, &top_level_aliases),
+            (7, &nested_alias),
+        ])),
+        Err(PredecodeError::Limit)
+    );
+
+    let mut canonical = leb(PROFILE_1_LIMITS.max_adapters + 1);
+    for _ in 0..PROFILE_1_LIMITS.max_adapters {
+        // canonical lower, function zero, no options.
+        canonical.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+    }
+    // The next lower omits its function index and option vector. Adapter
+    // accounting must reject it before either field could be materialized.
+    canonical.extend_from_slice(&[0x01, 0x00]);
+    assert_eq!(
+        predecode_component(&component_with_section(8, &canonical)),
+        Err(PredecodeError::Limit)
+    );
+}
+
+#[test]
 fn caps_all_boxed_component_type_vectors() {
     for opcode in [0x72, 0x71, 0x6f, 0x6e, 0x6d] {
         let mut body = vec![1, opcode];
@@ -231,10 +269,16 @@ fn canonical_options_and_more_async_forms_fail_closed() {
 }
 
 fn component_with_section(id: u8, body: &[u8]) -> Vec<u8> {
+    component_with_sections(&[(id, body)])
+}
+
+fn component_with_sections(sections: &[(u8, &[u8])]) -> Vec<u8> {
     let mut bytes = b"\0asm\x0d\0\x01\0".to_vec();
-    bytes.push(id);
-    bytes.extend_from_slice(&leb(body.len() as u32));
-    bytes.extend_from_slice(body);
+    for (id, body) in sections {
+        bytes.push(*id);
+        bytes.extend_from_slice(&leb(body.len() as u32));
+        bytes.extend_from_slice(body);
+    }
     bytes
 }
 

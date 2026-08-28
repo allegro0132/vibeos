@@ -52,9 +52,9 @@ struct StageCounts {
 const EXPECTED_STAGES: StageCounts = StageCounts {
     accepted: 863,
     not_component: 520,
-    malformed: 2_528,
+    malformed: 2_527,
     unsupported: 134,
-    limit: 10,
+    limit: 11,
     allocation: 0,
     invalid_embedded_core: 267,
     duplicate_name: 0,

@@ -1773,6 +1773,7 @@ dependencies = [
  "vibeos-storage-device",
  "vibeos-vsh",
  "vibeos-wasm-aot-profile",
+ "vibeos-wasm-float-target",
  "vibeos-wasm-runtime",
  "vibeos-wasm-runtime-costs",
 ]
@@ -1950,6 +1951,20 @@ dependencies = [
  "vibeos-wasm-runtime",
  "vibeos-wasmi-core-softfloat",
  "vibeos-wasmi-softfloat",
+ "wat",
+]
+
+[[package]]
+name = "vibeos-wasm-float-target"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.11.0",
+ "vibeos-component-format",
+ "vibeos-component-image-adapter",
+ "vibeos-component-runtime",
+ "vibeos-image-policy",
+ "vibeos-wasm-float-candidate",
+ "vibeos-wasm-runtime",
  "wat",
 ]
 

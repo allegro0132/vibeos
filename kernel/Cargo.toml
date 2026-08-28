@@ -208,6 +208,15 @@ wasm-c77-ephemeral-runtime-acceptance = [
 # Dedicated C8.3 raw runtime-cost image. The target emits only source-bound
 # integer samples; schema verification and summary derivation remain host-owned.
 wasm-c83-runtime-costs = ["dep:vibeos-wasm-runtime-costs"]
+# Isolated C8.8-F5 host-equivalent target qualification. This links only the
+# acceptance candidate stack and never registers a current engine or command.
+wasm-c88-f5-float-qemu-acceptance = [
+    "dep:sha2",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-wasm-float-target",
+    "vibeos-wasm-float-target/c88-f5-acceptance",
+]
 # Default-off C8.4 kernel ownership boundary. It installs exactly one
 # target-session lineage behind the IRQ-masking kernel SpinLock; no runtime,
 # trap, SSH, or publisher hook is selected merely by enabling this feature.
@@ -480,6 +489,7 @@ vibeos-ssh-identity = { path = "../services/ssh-identity", optional = true }
 vibeos-vsh = { path = "../components/vsh", default-features = false }
 vibeos-wasm-runtime = { path = "../wasm-runtime", optional = true }
 vibeos-wasm-runtime-costs = { path = "../acceptance/wasm-runtime-costs", optional = true }
+vibeos-wasm-float-target = { path = "../acceptance/wasm-float-target", default-features = false, optional = true }
 vibeos-wasm-aot-profile = { path = "../wasm-aot-profile", optional = true }
 sha2 = { version = "=0.11.0", default-features = false, optional = true }
 jitterentropy = { package = "jitterentropy-rs", path = "../vendor/jitterentropy-rs", default-features = false, features = ["alloc"], optional = true }

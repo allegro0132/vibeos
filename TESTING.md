@@ -17,6 +17,10 @@ cargo test --locked --offline -p vibeos-wasm-runtime \
 cargo test --locked --offline -p vibeos-wasm-runtime --test core_spec # C1.6 pinned official integer semantics
 cargo test --locked --offline -p vibeos-wasm-runtime --test core_robustness # C1.7 deterministic bounded corpus
 cargo test --locked --offline -p vibeos-component-runtime \
+  --test component_profile_limits -- --test-threads=1 # C2.1 adjacent Profile-1 limits
+cargo test --locked --offline -p vibeos-component-runtime \
+  --test predecode -- --test-threads=1 # C2.1 allocation-free structural preflight
+cargo test --locked --offline -p vibeos-component-runtime \
   --test canonical_language_fixtures # C2.3 Rust/C rich-value round-trip
 C2_WASI_SDK_PATH=/path/to/wasi-sdk-33.0-arm64-macos \
   ./scripts/rebuild-c2-language-fixtures.sh # C2.3 exact source/Core gate
@@ -299,6 +303,31 @@ bounded CI corpus, not coverage-guided or exhaustive fuzzing, and does not
 claim all byte sequences, actual cumulative/live allocator measurements,
 kernel-owner attribution, wall-clock bounds, or exhaustive opcode coverage.
 
+`component-runtime/tests/component_profile_limits.rs` is the C2.1 adjacent
+Profile-1 boundary gate. It first requires successful inert inspection at the
+exact ceilings, including 256 definitions, 256 aliases, 16 Core instances and
+16 Component instances in their independent namespaces, 256 canonical
+functions, 16 lowering adapters, type depth 16, eight embedded Core modules,
+and one exactly 524,288-byte embedded Core module. It then requires
+`DecodeError::Limit` at each adjacent value. The 524,289-byte Core case remains
+well below the 1,048,576-byte Component ceiling, so that rejection specifically
+pins the embedded-module boundary rather than the enclosing artifact boundary.
+No rejected input yields the sealed `ComponentPlan` required by an
+instantiation API.
+
+The companion `component-runtime/tests/predecode.rs` gate exercises the
+allocation-free structural pass. Top-level and nested aliases share one
+artifact-wide account, and every canonical lower is charged to the adapter
+account before its index or option vector is read. Truncated-entry cases pin
+that both ceilings take precedence once the excess declaration is known. The
+regular decoder still performs the same independent checks before reserving
+plan storage. This intentional precedence change leaves the C2.7 byte-corpus
+identity unchanged and reclassifies exactly one header-prefixed input from
+malformed to limit. Nested Component sections remain fail-closed as unsupported.
+This closes the selected C2.1 structural evidence; exact WIT-world resolution,
+Canonical ABI execution, and differential/fuzz evidence remain separate C2.2,
+C2.3--C2.6, and C2.7 gates.
+
 `component-runtime/tests/canonical_language_fixtures.rs` is the C2.3
 cross-language execution gate. The same exact
 `vibe:fixture/canonical-language@1.0.0` WIT world is implemented by
@@ -350,7 +379,7 @@ Component-header-prefixed strings, two admitted fixture originals, all 1,648
 proper-prefix truncations of those fixtures, one deterministic single-bit
 mutation at each of their 1,648 byte positions, and one limit-plus-one input.
 Every inspection is panic-contained. The gate pins all public decoder outcomes:
-863 accepted, 520 non-Components, 2,528 malformed, 134 unsupported, 10 limit
+863 accepted, 520 non-Components, 2,527 malformed, 134 unsupported, 11 limit
 failures, 267 invalid embedded Core modules, and one invalid wiring result,
 with zero allocation, duplicate-name, type-graph, or callback-signature
 failures for this exact corpus.

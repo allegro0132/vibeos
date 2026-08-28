@@ -77,8 +77,7 @@ pub(crate) fn predecode_component_for_profile(
         let length = reader.var_u32()? as usize;
         let mut section = reader.subreader(length)?;
         match id {
-            CUSTOM_SECTION | CORE_MODULE_SECTION | ALIAS_SECTION | IMPORT_SECTION
-            | EXPORT_SECTION => {}
+            CUSTOM_SECTION | CORE_MODULE_SECTION | IMPORT_SECTION | EXPORT_SECTION => {}
             CORE_INSTANCE_SECTION => scan_core_instances(&mut section, &mut budget)?,
             CORE_TYPE_SECTION => {
                 // Profile 1 rejects component-level core type declarations.
@@ -91,6 +90,7 @@ pub(crate) fn predecode_component_for_profile(
             }
             COMPONENT_SECTION | START_SECTION => return Err(PredecodeError::Unsupported),
             COMPONENT_INSTANCE_SECTION => scan_component_instances(&mut section, &mut budget)?,
+            ALIAS_SECTION => charge_component_aliases(&mut section, &mut budget)?,
             COMPONENT_TYPE_SECTION => {
                 scan_component_types(&mut section, &mut budget, async_profile)?
             }
@@ -109,6 +109,7 @@ struct Budget {
     core_instances: u32,
     component_instances: u32,
     aliases: u32,
+    adapters: u32,
     resources: u32,
     canonical_functions: u32,
     canonical_options: u32,
@@ -142,8 +143,12 @@ impl Budget {
         )
     }
 
-    fn alias(&mut self) -> Result<(), PredecodeError> {
-        charge(&mut self.aliases, 1, PROFILE_1_LIMITS.max_aliases)
+    fn aliases(&mut self, amount: u32) -> Result<(), PredecodeError> {
+        charge(&mut self.aliases, amount, PROFILE_1_LIMITS.max_aliases)
+    }
+
+    fn adapter(&mut self) -> Result<(), PredecodeError> {
+        charge(&mut self.adapters, 1, PROFILE_1_LIMITS.max_adapters)
     }
 
     fn resource(&mut self) -> Result<(), PredecodeError> {
@@ -268,6 +273,7 @@ fn scan_canonical_function(
             if reader.byte()? != 0x00 {
                 return Err(PredecodeError::Malformed);
             }
+            budget.adapter()?;
             reader.var_u32()?;
             let options = scan_canonical_options(reader, budget)?;
             validate_lower_options(options, async_profile)
@@ -467,6 +473,17 @@ fn scan_component_instances(
     reader.finish()
 }
 
+fn charge_component_aliases(
+    reader: &mut Reader<'_>,
+    budget: &mut Budget,
+) -> Result<(), PredecodeError> {
+    let count = reader.limited_count(PROFILE_1_LIMITS.max_aliases)?;
+    // Top-level alias entries are streamed by wasmparser and contain no
+    // allocation-bearing vectors. Charge their declared count here, then let
+    // the regular decoder retain exact syntax/index diagnostics.
+    budget.aliases(count)
+}
+
 fn scan_component_types(
     reader: &mut Reader<'_>,
     budget: &mut Budget,
@@ -613,7 +630,7 @@ fn scan_instance_type_declaration(
             scan_component_type(reader, budget, async_profile, next_depth)
         }
         0x02 => {
-            budget.alias()?;
+            budget.aliases(1)?;
             scan_component_alias(reader)
         }
         0x04 => {

@@ -623,6 +623,29 @@ semantics before adding live authority or async behavior.
 | C2.6 | Charge adapters and ABI work | Embedded adapter instructions consume Core fuel; host lift/lower allocation and work consume component budgets |
 | C2.7 | Differential and fuzz evidence | Accepted components agree with a pinned reference implementation; component bytes and canonical values are fuzzed separately |
 
+**Selected C2.1 evidence (2026-08-28):**
+`component-runtime/tests/component_profile_limits.rs` pins adjacent Profile-1
+inspection boundaries. Exact maxima succeed with sealed inert plans and exact
+summaries: 256 definitions, 256 aliases, 16 Core instances and 16 Component
+instances in independent namespaces, 256 canonical functions, 16 lowering
+adapters, type depth 16, eight embedded modules, and one 524,288-byte embedded
+Core module. Every maximum-plus-one input returns `DecodeError::Limit` without
+yielding the `ComponentPlan` required for instantiation. The 524,289-byte Core
+case remains below the enclosing 1 MiB Component ceiling, independently
+proving the embedded-module limit rather than the artifact limit. Nested
+Component sections remain unsupported and inert.
+
+The allocation-free predecoder now aggregates top-level and instance-type
+aliases under the same 256-entry account and charges each canonical lower to
+the 16-adapter account before reading its remaining fields. Dedicated
+truncated-entry tests require those known excess counts to win before the
+regular parser can materialize data, while the regular decoder retains the
+same limits before reserving plan storage. The C2.7 byte corpus and digest are
+unchanged; one header-prefixed input is intentionally reclassified from
+malformed to limit by this earlier alias-count check. This closes the selected
+C2.1 structural acceptance evidence without claiming C2.2 WIT resolution,
+C2.3--C2.6 runtime ABI semantics, or C2.7 differential/fuzz coverage.
+
 **Selected C2.3 evidence (2026-08-27):** the exact
 `vibe:fixture/canonical-language@1.0.0` world now executes through two
 independently authored freestanding guests, one Rust and one C. Both implement
@@ -657,7 +680,9 @@ Component bytes and Canonical values have separate deterministic bounded
 corpora. The byte gate fixes seed `0x243f6a8885a308d3`, 4,323 inputs,
 4,604,005 aggregate bytes, all proper-prefix truncations and one-bit-per-byte
 mutations of two admitted fixtures, a 1,048,577-byte limit-plus-one case, exact
-decoder classifications, and digest `0x9edc2bd8460d97a4`; every decode is
+decoder classifications (863 accepted, 520 non-Components, 2,527 malformed,
+134 unsupported, 11 limited, 267 invalid embedded Core, and one invalid
+wiring), and digest `0x9edc2bd8460d97a4`; every decode is
 panic-contained. The value gate fixes 512 valid cases across all 19
 non-resource families, 799 type nodes, 772 value nodes, 1,026 dynamic bytes,
 88 list elements, 65 allocations, depth 6/5, and digest

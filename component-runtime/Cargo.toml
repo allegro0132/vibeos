@@ -8,6 +8,9 @@ default = []
 # Narrow acceptance-only access to the validation-candidate native async
 # executor. This does not activate the profile identity or runtime-ready bit.
 native-async-acceptance = []
+# Acceptance-only WIT/Canonical ABI scalar-float codec. This never binds
+# artifact profile code 5 to the current validator, loader, or executor.
+c88-f3-acceptance = []
 # Portable, caller-clocked timing hooks used only by the frozen C8.4
 # interpreter/AOT decision harness. Production builds leave this disabled.
 c84-profile-hooks = []

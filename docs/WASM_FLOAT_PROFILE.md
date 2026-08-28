@@ -1,17 +1,21 @@
 # C8.8 deterministic scalar-float profile
 
-**Status (2026-08-29): C8.8-F1 and C8.8-F2 complete.** F1 freezes the
+**Status (2026-08-29): C8.8-F1 through C8.8-F3 complete.** F1 freezes the
 immutable validation-only artifact identity and deterministic semantic
 contract. F2 supplies an independently identified, acceptance-only Core
 validator and software-float executor behind `c88-f2-acceptance`; it does not
 bind profile code 5 to a current engine or production activation path.
-C8.8-F3, WIT and Canonical ABI floats, is next. Float and C8.8 remain
-incomplete.
+F3 supplies an acceptance-only, bit-represented WIT and Canonical ABI codec
+behind `c88-f3-acceptance`; the production Profile-1 codec still rejects every
+scalar-float shape. Its allocation evidence is a codec request/byte trace
+replayed through the existing cleanup machine, not runtime wiring. C8.8-F4,
+default-off admission and lifecycle, is next.
+Float and C8.8 remain incomplete.
 
 Milk-V Duo physical testing remains paused at operator request. Fixed QEMU is
 the selected target for the later F5 emulator qualification; it was not used
-for F1 or F2. F2's RISC-V evidence is compile- and object-level evidence, not a
-QEMU or physical execution claim.
+for F1 through F3. The RISC-V evidence through F3 is compile- and object-level
+evidence, not a QEMU or physical execution claim.
 
 ## 1. Frozen identity
 
@@ -124,7 +128,7 @@ disabled adjacent features.
 
 An increment is not complete merely because a later layer can be sketched or
 compiled. Each increment is verified, committed, and pushed independently.
-F1 and F2 have closed their respective gates; F3 through F5 have not.
+F1 through F3 have closed their respective gates; F4 and F5 have not.
 
 ## 5. Closed F2 dependency and trap gates
 
@@ -162,7 +166,7 @@ keeps finite overflow and positive or negative infinity on `IntegerOverflow`
 including exact valid boundaries and adjacent overflow. The
 saturating-conversion proposal remains rejected.
 
-## 6. F1/F2 evidence and non-claims
+## 6. F1/F2/F3 evidence and non-claims
 
 The F1 host gate proves the exact profile/codec metadata, NaN constants and
 operation classification, Profile-1 non-widening, absence from the current
@@ -187,7 +191,40 @@ RISC-V F/D instruction remains. LLVM sign-only `fneg`, `fabs`, and `copysign`
 forms lower exclusively to integer bit operations. This is cross-target
 implementation evidence, but exact-bit execution on fixed QEMU remains F5.
 
-F2 provides no WIT/Canonical ABI Float values, production loader or image
-admission, durable publication, guest activation, QEMU execution, or physical
-result. Code 5 remains permanently `ValidationOnly`; any executable successor
-still requires a separately numbered identity after F3 through F5 close.
+F3 adds `CanonicalF32`/`CanonicalF64` and a separate
+`CandidateFlatValue::{F32Bits,F64Bits}` representation; production
+`CoreValue`, current engine bindings, and the Profile-1 codec are unchanged.
+All NaNs collapse by integer masks to the fixed positive quiet-NaN bits at
+flat and memory Component boundaries, while finite values, infinities, signed
+zero, and subnormals retain their exact bits. The candidate covers direct and
+indirect calls, variant joins, nested record/list/result values, bounds and
+alignment, protected return areas, and fixed-capacity allocation journals. Its
+exact payload request/byte trace is replayed through the unchanged
+`CanonicalMachine`, covering successful cleanup, abort, uncertain realloc,
+and failed free/discard paths without claiming a runtime connection.
+
+The pinned Wasmtime 48 differential fixture executes import-free scalar and
+nested-record Component boundaries in both bit directions. It observes the
+reference raw bits and compares the candidate after an independent integer
+NaN oracle. A 4,096-case scalar bit corpus is pinned by digest
+`0x8ebf9db2d4472f51`; a separate 4,096-case nested hostile-memory corpus is
+pinned by `0x93ce1dbfabf6b333`. The candidate Component plan has no imports,
+host imports, executable exports, or runtime-ready state. The same build also
+proves that default WIT parsing and the production Canonical ABI continue to
+reject scalar Float, while the synchronous candidate rejects adjacent async
+functions, futures, and streams.
+
+The F3-specific offline RISC-V verifier binds a 29-rlib target closure by
+digest `c2295c33c17e489953cf014cb7f5acef9b0f674b4fd09142ba2dcc492736f618`
+and scans 126 LLVM/native objects. The complete closure has no RISC-V F/D
+opcode; the three workspace-owned artifacts must remain 29 LLVM-bitcode
+objects and have no LLVM floating-point type or transport, semantic operation,
+float helper, or float symbol. The stock
+Profile-1 `libm`/Wasmi software-float objects are recorded as an unchanged
+inherited baseline rather than attributed to the dependency-free F3 feature.
+
+F3 provides no direct candidate-to-runtime allocator wiring, production loader
+or image admission, durable publication, guest activation, fixed-QEMU
+execution, or physical result. The default-off lifecycle connection is F4
+work. Code 5 remains permanently `ValidationOnly`; any executable successor
+still requires a separately numbered identity after F4 and F5 close.

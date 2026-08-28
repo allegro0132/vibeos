@@ -265,6 +265,10 @@ fn generated_value(rng: &mut DeterministicRng, ty: &ValueType) -> CanonicalValue
                     .map(|ty| Box::new(generated_value(rng, ty))),
             }
         }
+        #[cfg(feature = "c88-f3-acceptance")]
+        ValueType::F32 | ValueType::F64 => {
+            unreachable!("the frozen C2.7 integer corpus excludes scalar floats")
+        }
         ValueType::Resource { .. } | ValueType::Stream { .. } | ValueType::Future { .. } => {
             unreachable!("the C2.7 corpus excludes resource and endpoint handles")
         }
@@ -297,6 +301,10 @@ fn family_mask(ty: &ValueType) -> u32 {
             (17, children)
         }
         ValueType::Variant(cases) => (18, cases.iter().flatten().collect()),
+        #[cfg(feature = "c88-f3-acceptance")]
+        ValueType::F32 | ValueType::F64 => {
+            panic!("the frozen C2.7 integer corpus excludes scalar floats")
+        }
         ValueType::Resource { .. } | ValueType::Stream { .. } | ValueType::Future { .. } => {
             panic!("resource and endpoint families are not part of this corpus")
         }
@@ -357,6 +365,10 @@ fn hash_type(hash: &mut Fnv64, ty: &ValueType) {
             for case in cases {
                 hash_optional_type(hash, case.as_ref());
             }
+        }
+        #[cfg(feature = "c88-f3-acceptance")]
+        ValueType::F32 | ValueType::F64 => {
+            panic!("the frozen C2.7 integer corpus excludes scalar floats")
         }
         ValueType::Resource { .. } | ValueType::Stream { .. } | ValueType::Future { .. } => {
             panic!("resource and endpoint families are not part of this corpus")
@@ -470,6 +482,10 @@ fn hash_value(hash: &mut Fnv64, value: &CanonicalValue) {
             hash.byte(18);
             hash.u32(*case);
             hash_optional_value(hash, payload.as_deref());
+        }
+        #[cfg(feature = "c88-f3-acceptance")]
+        CanonicalValue::F32(_) | CanonicalValue::F64(_) => {
+            panic!("the frozen C2.7 integer corpus excludes scalar floats")
         }
         CanonicalValue::Resource(_) | CanonicalValue::Stream(_) | CanonicalValue::Future(_) => {
             panic!("resource and endpoint values are not part of this corpus")

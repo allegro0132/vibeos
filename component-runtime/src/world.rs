@@ -39,6 +39,10 @@ pub enum ValueShape {
     S16,
     S32,
     S64,
+    #[cfg(feature = "c88-f3-acceptance")]
+    F32,
+    #[cfg(feature = "c88-f3-acceptance")]
+    F64,
     Char,
     String,
     List(Box<ValueShape>),
@@ -128,6 +132,32 @@ impl WorldContract {
     /// Resolves one fully-qualified world such as
     /// `vibe:fixture/typed-filter@1.0.0`.
     pub fn parse(source: &str, exact_world: &str) -> Result<Self, WorldError> {
+        Self::parse_with_features(source, exact_world, ShapeFeatures::PROFILE_1)
+    }
+
+    /// Acceptance-only WIT frontend for the sealed synchronous scalar-float
+    /// contract. This method does not resolve code 5 to a current engine and
+    /// returns only an owned, inert world shape.
+    #[cfg(feature = "c88-f3-acceptance")]
+    pub fn parse_profile_2_sync_float_candidate(
+        source: &str,
+        exact_world: &str,
+    ) -> Result<Self, WorldError> {
+        let contract = vibeos_component_format::profile_2_sync_float_validation_contract();
+        if contract.profile() != vibeos_component_format::ProfileIdentity::PROFILE_2_SYNC_FLOAT
+            || contract.runtime_ready()
+            || contract.component_validator().predecode_async()
+        {
+            return Err(WorldError::UnsupportedType);
+        }
+        Self::parse_with_features(source, exact_world, ShapeFeatures::PROFILE_2_FLOAT)
+    }
+
+    fn parse_with_features(
+        source: &str,
+        exact_world: &str,
+        features: ShapeFeatures,
+    ) -> Result<Self, WorldError> {
         if source.len() > PROFILE_1_LIMITS.max_component_bytes || exact_world.len() > 256 {
             return Err(WorldError::SourceTooLarge);
         }
@@ -183,10 +213,20 @@ impl WorldContract {
             world.imports.iter().chain(world.exports.iter()),
         )?;
         let mut budget = ShapeBudget::default();
-        let imports =
-            normalize_wit_entities(&resolve, world.imports.iter(), &resources, &mut budget)?;
-        let exports =
-            normalize_wit_entities(&resolve, world.exports.iter(), &resources, &mut budget)?;
+        let imports = normalize_wit_entities(
+            &resolve,
+            world.imports.iter(),
+            &resources,
+            &mut budget,
+            features,
+        )?;
+        let exports = normalize_wit_entities(
+            &resolve,
+            world.exports.iter(),
+            &resources,
+            &mut budget,
+            features,
+        )?;
         Ok(Self {
             identity,
             imports,
@@ -257,6 +297,27 @@ struct ShapeBudget {
     nodes: u32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct ShapeFeatures {
+    async_values: bool,
+    #[cfg(feature = "c88-f3-acceptance")]
+    scalar_float: bool,
+}
+
+impl ShapeFeatures {
+    const PROFILE_1: Self = Self {
+        async_values: true,
+        #[cfg(feature = "c88-f3-acceptance")]
+        scalar_float: false,
+    };
+
+    #[cfg(feature = "c88-f3-acceptance")]
+    pub(crate) const PROFILE_2_FLOAT: Self = Self {
+        async_values: false,
+        scalar_float: true,
+    };
+}
+
 impl ShapeBudget {
     fn enter(&mut self, depth: u32) -> Result<(), WorldError> {
         if depth > PROFILE_1_LIMITS.max_canonical_nesting {
@@ -313,6 +374,7 @@ fn normalize_wit_entities<'a>(
     items: impl Iterator<Item = (&'a wit_parser::WorldKey, &'a WorldItem)>,
     resources: &[(TypeId, String)],
     budget: &mut ShapeBudget,
+    features: ShapeFeatures,
 ) -> Result<Vec<NamedEntityShape>, WorldError> {
     let mut items = items;
     let mut entries = Vec::new();
@@ -344,13 +406,13 @@ fn normalize_wit_entities<'a>(
         }
         let entity = match item {
             WorldItem::Interface { id, .. } => {
-                EntityShape::Interface(normalize_wit_interface(resolve, *id, budget, 1)?)
+                EntityShape::Interface(normalize_wit_interface(resolve, *id, budget, 1, features)?)
             }
             WorldItem::Function(function) => EntityShape::Function(normalize_wit_function(
-                resolve, function, resources, budget, 1,
+                resolve, function, resources, budget, 1, features,
             )?),
             WorldItem::Type { id, .. } => EntityShape::Type(normalize_wit_type_entity(
-                resolve, *id, resources, budget, 1,
+                resolve, *id, resources, budget, 1, features,
             )?),
         };
         push_named_entity(&mut result, &name, entity)?;
@@ -401,6 +463,7 @@ fn normalize_wit_interface(
     interface_id: wit_parser::InterfaceId,
     budget: &mut ShapeBudget,
     depth: u32,
+    features: ShapeFeatures,
 ) -> Result<Vec<NamedEntityShape>, WorldError> {
     budget.enter(depth)?;
     let interface = &resolve.interfaces[interface_id];
@@ -426,11 +489,13 @@ fn normalize_wit_interface(
         .try_reserve_exact(total)
         .map_err(|_| WorldError::Allocation)?;
     for (name, id) in &interface.types {
-        let entity = normalize_wit_type_entity(resolve, *id, &resources, budget, depth + 1)?;
+        let entity =
+            normalize_wit_type_entity(resolve, *id, &resources, budget, depth + 1, features)?;
         push_named_entity(&mut result, name, EntityShape::Type(entity))?;
     }
     for (name, function) in &interface.functions {
-        let shape = normalize_wit_function(resolve, function, &resources, budget, depth + 1)?;
+        let shape =
+            normalize_wit_function(resolve, function, &resources, budget, depth + 1, features)?;
         push_named_entity(&mut result, name, EntityShape::Function(shape))?;
     }
     Ok(result)
@@ -442,8 +507,12 @@ fn normalize_wit_function(
     resources: &[(TypeId, String)],
     budget: &mut ShapeBudget,
     depth: u32,
+    features: ShapeFeatures,
 ) -> Result<FunctionShape, WorldError> {
     budget.enter(depth)?;
+    if function.kind.is_async() && !features.async_values {
+        return Err(WorldError::UnsupportedType);
+    }
     if function.params.len() > PROFILE_1_LIMITS.max_params_per_function as usize {
         return Err(WorldError::UnsupportedType);
     }
@@ -452,12 +521,19 @@ fn normalize_wit_function(
         .try_reserve_exact(function.params.len())
         .map_err(|_| WorldError::Allocation)?;
     for parameter in &function.params {
-        let value = normalize_wit_value(resolve, parameter.ty, resources, budget, depth + 1)?;
+        let value = normalize_wit_value(
+            resolve,
+            parameter.ty,
+            resources,
+            budget,
+            depth + 1,
+            features,
+        )?;
         push_named_value(&mut parameters, &parameter.name, value)?;
     }
     let result = function
         .result
-        .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1))
+        .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1, features))
         .transpose()?;
     Ok(FunctionShape {
         effect: if function.kind.is_async() {
@@ -476,13 +552,14 @@ fn normalize_wit_type_entity(
     resources: &[(TypeId, String)],
     budget: &mut ShapeBudget,
     depth: u32,
+    features: ShapeFeatures,
 ) -> Result<TypeShape, WorldError> {
     if resolve_wit_resource_alias(resolve, id)?.is_some() {
         budget.enter(depth)?;
         Ok(TypeShape::Resource)
     } else {
         Ok(TypeShape::Value(normalize_wit_type_id(
-            resolve, id, resources, budget, depth,
+            resolve, id, resources, budget, depth, features,
         )?))
     }
 }
@@ -507,6 +584,7 @@ fn normalize_wit_value(
     resources: &[(TypeId, String)],
     budget: &mut ShapeBudget,
     depth: u32,
+    features: ShapeFeatures,
 ) -> Result<ValueShape, WorldError> {
     budget.enter(depth)?;
     match ty {
@@ -521,8 +599,12 @@ fn normalize_wit_value(
         Type::S64 => Ok(ValueShape::S64),
         Type::Char => Ok(ValueShape::Char),
         Type::String => Ok(ValueShape::String),
+        #[cfg(feature = "c88-f3-acceptance")]
+        Type::F32 if features.scalar_float => Ok(ValueShape::F32),
+        #[cfg(feature = "c88-f3-acceptance")]
+        Type::F64 if features.scalar_float => Ok(ValueShape::F64),
         Type::F32 | Type::F64 | Type::ErrorContext => Err(WorldError::UnsupportedType),
-        Type::Id(id) => normalize_wit_type_id(resolve, id, resources, budget, depth + 1),
+        Type::Id(id) => normalize_wit_type_id(resolve, id, resources, budget, depth + 1, features),
     }
 }
 
@@ -532,6 +614,7 @@ fn normalize_wit_type_id(
     resources: &[(TypeId, String)],
     budget: &mut ShapeBudget,
     depth: u32,
+    features: ShapeFeatures,
 ) -> Result<ValueShape, WorldError> {
     budget.enter(depth)?;
     match &resolve.types[id].kind {
@@ -541,7 +624,8 @@ fn normalize_wit_type_id(
                 .try_reserve_exact(record.fields.len())
                 .map_err(|_| WorldError::Allocation)?;
             for field in &record.fields {
-                let value = normalize_wit_value(resolve, field.ty, resources, budget, depth + 1)?;
+                let value =
+                    normalize_wit_value(resolve, field.ty, resources, budget, depth + 1, features)?;
                 push_named_value(&mut fields, &field.name, value)?;
             }
             Ok(ValueShape::Record(fields))
@@ -588,6 +672,7 @@ fn normalize_wit_type_id(
                     resources,
                     budget,
                     depth + 1,
+                    features,
                 )?);
             }
             Ok(ValueShape::Tuple(types))
@@ -602,7 +687,9 @@ fn normalize_wit_type_id(
                     name: copied(&case.name)?,
                     value: case
                         .ty
-                        .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1))
+                        .map(|ty| {
+                            normalize_wit_value(resolve, ty, resources, budget, depth + 1, features)
+                        })
                         .transpose()?,
                 });
             }
@@ -624,16 +711,17 @@ fn normalize_wit_type_id(
             resources,
             budget,
             depth + 1,
+            features,
         )?))),
         TypeDefKind::Result(result) => Ok(ValueShape::Result {
             ok: result
                 .ok
-                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1))
+                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1, features))
                 .transpose()?
                 .map(Box::new),
             error: result
                 .err
-                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1))
+                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1, features))
                 .transpose()?
                 .map(Box::new),
         }),
@@ -643,20 +731,24 @@ fn normalize_wit_type_id(
             resources,
             budget,
             depth + 1,
+            features,
         )?))),
-        TypeDefKind::Type(ty) => normalize_wit_value(resolve, *ty, resources, budget, depth + 1),
-        TypeDefKind::Future(payload) => Ok(ValueShape::Future(
+        TypeDefKind::Type(ty) => {
+            normalize_wit_value(resolve, *ty, resources, budget, depth + 1, features)
+        }
+        TypeDefKind::Future(payload) if features.async_values => Ok(ValueShape::Future(
             payload
-                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1))
+                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1, features))
                 .transpose()?
                 .map(Box::new),
         )),
-        TypeDefKind::Stream(payload) => Ok(ValueShape::Stream(
+        TypeDefKind::Stream(payload) if features.async_values => Ok(ValueShape::Stream(
             payload
-                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1))
+                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1, features))
                 .transpose()?
                 .map(Box::new),
         )),
+        TypeDefKind::Future(_) | TypeDefKind::Stream(_) => Err(WorldError::UnsupportedType),
         TypeDefKind::Resource
         | TypeDefKind::Map(_, _)
         | TypeDefKind::FixedLengthList(_, _)
@@ -669,11 +761,41 @@ pub(crate) fn normalize_component_world_entities(
     import_names: &[String],
     export_names: &[String],
 ) -> Result<(Vec<NamedEntityShape>, Vec<NamedEntityShape>), WorldError> {
+    normalize_component_world_entities_with_features(
+        types,
+        import_names,
+        export_names,
+        ShapeFeatures::PROFILE_1,
+    )
+}
+
+#[cfg(feature = "c88-f3-acceptance")]
+pub(crate) fn normalize_component_world_entities_float_candidate(
+    types: &Types,
+    import_names: &[String],
+    export_names: &[String],
+) -> Result<(Vec<NamedEntityShape>, Vec<NamedEntityShape>), WorldError> {
+    normalize_component_world_entities_with_features(
+        types,
+        import_names,
+        export_names,
+        ShapeFeatures::PROFILE_2_FLOAT,
+    )
+}
+
+fn normalize_component_world_entities_with_features(
+    types: &Types,
+    import_names: &[String],
+    export_names: &[String],
+    features: ShapeFeatures,
+) -> Result<(Vec<NamedEntityShape>, Vec<NamedEntityShape>), WorldError> {
     let mut resource_names = Vec::new();
     collect_component_resource_names(types, import_names, true, &mut resource_names)?;
     collect_component_resource_names(types, export_names, false, &mut resource_names)?;
-    let imports = normalize_component_entities(types, import_names, true, &resource_names)?;
-    let exports = normalize_component_entities(types, export_names, false, &resource_names)?;
+    let imports =
+        normalize_component_entities(types, import_names, true, &resource_names, features)?;
+    let exports =
+        normalize_component_entities(types, export_names, false, &resource_names, features)?;
     Ok((imports, exports))
 }
 
@@ -735,6 +857,7 @@ fn normalize_component_entities(
     names: &[String],
     imports: bool,
     resource_names: &[(ResourceId, String)],
+    features: ShapeFeatures,
 ) -> Result<Vec<NamedEntityShape>, WorldError> {
     let mut budget = ShapeBudget::default();
     let mut result = Vec::new();
@@ -748,7 +871,8 @@ fn normalize_component_entities(
             types.component_item_for_export(name)
         }
         .ok_or(WorldError::TypeMismatch)?;
-        let entity = normalize_component_entity(types, item.ty, resource_names, &mut budget, 1)?;
+        let entity =
+            normalize_component_entity(types, item.ty, resource_names, &mut budget, 1, features)?;
         push_named_entity(&mut result, name, entity)?;
     }
     Ok(result)
@@ -760,11 +884,15 @@ fn normalize_component_entity(
     outer_resources: &[(ResourceId, String)],
     budget: &mut ShapeBudget,
     depth: u32,
+    features: ShapeFeatures,
 ) -> Result<EntityShape, WorldError> {
     budget.enter(depth)?;
     match entity {
         ComponentEntityType::Func(id) => {
             let function = &types[id];
+            if function.async_ && !features.async_values {
+                return Err(WorldError::UnsupportedType);
+            }
             if function.params.len() > PROFILE_1_LIMITS.max_params_per_function as usize {
                 return Err(WorldError::UnsupportedType);
             }
@@ -773,13 +901,28 @@ fn normalize_component_entity(
                 .try_reserve_exact(function.params.len())
                 .map_err(|_| WorldError::Allocation)?;
             for (name, ty) in function.params.iter() {
-                let value =
-                    normalize_component_value(types, *ty, outer_resources, budget, depth + 1)?;
+                let value = normalize_component_value(
+                    types,
+                    *ty,
+                    outer_resources,
+                    budget,
+                    depth + 1,
+                    features,
+                )?;
                 push_named_value(&mut parameters, name.as_str(), value)?;
             }
             let result = function
                 .result
-                .map(|ty| normalize_component_value(types, ty, outer_resources, budget, depth + 1))
+                .map(|ty| {
+                    normalize_component_value(
+                        types,
+                        ty,
+                        outer_resources,
+                        budget,
+                        depth + 1,
+                        features,
+                    )
+                })
                 .transpose()?;
             Ok(EntityShape::Function(FunctionShape {
                 effect: if function.async_ {
@@ -819,8 +962,14 @@ fn normalize_component_entity(
                 .try_reserve_exact(instance.exports.len())
                 .map_err(|_| WorldError::Allocation)?;
             for (name, item) in &instance.exports {
-                let entity =
-                    normalize_component_entity(types, item.ty, &resources, budget, depth + 1)?;
+                let entity = normalize_component_entity(
+                    types,
+                    item.ty,
+                    &resources,
+                    budget,
+                    depth + 1,
+                    features,
+                )?;
                 push_named_entity(&mut exports, name, entity)?;
             }
             Ok(EntityShape::Interface(exports))
@@ -828,7 +977,14 @@ fn normalize_component_entity(
         ComponentEntityType::Type { referenced, .. } => match referenced {
             ComponentAnyTypeId::Resource(_) => Ok(EntityShape::Type(TypeShape::Resource)),
             ComponentAnyTypeId::Defined(id) => Ok(EntityShape::Type(TypeShape::Value(
-                normalize_component_defined(types, id, outer_resources, budget, depth + 1)?,
+                normalize_component_defined(
+                    types,
+                    id,
+                    outer_resources,
+                    budget,
+                    depth + 1,
+                    features,
+                )?,
             ))),
             _ => Err(WorldError::UnsupportedType),
         },
@@ -844,17 +1000,23 @@ fn normalize_component_value(
     resources: &[(ResourceId, String)],
     budget: &mut ShapeBudget,
     depth: u32,
+    features: ShapeFeatures,
 ) -> Result<ValueShape, WorldError> {
     budget.enter(depth)?;
     match ty {
-        ComponentValType::Primitive(primitive) => primitive_shape(primitive),
+        ComponentValType::Primitive(primitive) => primitive_shape(primitive, features),
         ComponentValType::Type(id) => {
-            normalize_component_defined(types, id, resources, budget, depth + 1)
+            normalize_component_defined(types, id, resources, budget, depth + 1, features)
         }
     }
 }
 
-fn primitive_shape(primitive: PrimitiveValType) -> Result<ValueShape, WorldError> {
+fn primitive_shape(
+    primitive: PrimitiveValType,
+    features: ShapeFeatures,
+) -> Result<ValueShape, WorldError> {
+    #[cfg(not(feature = "c88-f3-acceptance"))]
+    let _ = features;
     match primitive {
         PrimitiveValType::Bool => Ok(ValueShape::Bool),
         PrimitiveValType::U8 => Ok(ValueShape::U8),
@@ -867,6 +1029,10 @@ fn primitive_shape(primitive: PrimitiveValType) -> Result<ValueShape, WorldError
         PrimitiveValType::S64 => Ok(ValueShape::S64),
         PrimitiveValType::Char => Ok(ValueShape::Char),
         PrimitiveValType::String => Ok(ValueShape::String),
+        #[cfg(feature = "c88-f3-acceptance")]
+        PrimitiveValType::F32 if features.scalar_float => Ok(ValueShape::F32),
+        #[cfg(feature = "c88-f3-acceptance")]
+        PrimitiveValType::F64 if features.scalar_float => Ok(ValueShape::F64),
         PrimitiveValType::F32 | PrimitiveValType::F64 | PrimitiveValType::ErrorContext => {
             Err(WorldError::UnsupportedType)
         }
@@ -879,17 +1045,19 @@ fn normalize_component_defined(
     resources: &[(ResourceId, String)],
     budget: &mut ShapeBudget,
     depth: u32,
+    features: ShapeFeatures,
 ) -> Result<ValueShape, WorldError> {
     budget.enter(depth)?;
     match &types[id] {
-        ComponentDefinedType::Primitive(primitive) => primitive_shape(*primitive),
+        ComponentDefinedType::Primitive(primitive) => primitive_shape(*primitive, features),
         ComponentDefinedType::Record(record) => {
             let mut fields = Vec::new();
             fields
                 .try_reserve_exact(record.fields.len())
                 .map_err(|_| WorldError::Allocation)?;
             for (name, ty) in &record.fields {
-                let value = normalize_component_value(types, *ty, resources, budget, depth + 1)?;
+                let value =
+                    normalize_component_value(types, *ty, resources, budget, depth + 1, features)?;
                 push_named_value(&mut fields, name.as_str(), value)?;
             }
             Ok(ValueShape::Record(fields))
@@ -905,7 +1073,14 @@ fn normalize_component_defined(
                     value: case
                         .ty
                         .map(|ty| {
-                            normalize_component_value(types, ty, resources, budget, depth + 1)
+                            normalize_component_value(
+                                types,
+                                ty,
+                                resources,
+                                budget,
+                                depth + 1,
+                                features,
+                            )
                         })
                         .transpose()?,
                 });
@@ -913,7 +1088,7 @@ fn normalize_component_defined(
             Ok(ValueShape::Variant(cases))
         }
         ComponentDefinedType::List { element, .. } => Ok(ValueShape::List(Box::new(
-            normalize_component_value(types, *element, resources, budget, depth + 1)?,
+            normalize_component_value(types, *element, resources, budget, depth + 1, features)?,
         ))),
         ComponentDefinedType::Tuple(tuple) => {
             let mut result = Vec::new();
@@ -927,6 +1102,7 @@ fn normalize_component_defined(
                     resources,
                     budget,
                     depth + 1,
+                    features,
                 )?);
             }
             Ok(ValueShape::Tuple(result))
@@ -952,15 +1128,19 @@ fn normalize_component_defined(
             Ok(ValueShape::Enum(names))
         }
         ComponentDefinedType::Option { ty, .. } => Ok(ValueShape::Option(Box::new(
-            normalize_component_value(types, *ty, resources, budget, depth + 1)?,
+            normalize_component_value(types, *ty, resources, budget, depth + 1, features)?,
         ))),
         ComponentDefinedType::Result { ok, err, .. } => Ok(ValueShape::Result {
             ok: ok
-                .map(|ty| normalize_component_value(types, ty, resources, budget, depth + 1))
+                .map(|ty| {
+                    normalize_component_value(types, ty, resources, budget, depth + 1, features)
+                })
                 .transpose()?
                 .map(Box::new),
             error: err
-                .map(|ty| normalize_component_value(types, ty, resources, budget, depth + 1))
+                .map(|ty| {
+                    normalize_component_value(types, ty, resources, budget, depth + 1, features)
+                })
                 .transpose()?
                 .map(Box::new),
         }),
@@ -975,16 +1155,23 @@ fn normalize_component_defined(
                 ValueShape::Borrow(copied(name)?)
             })
         }
-        ComponentDefinedType::Future { ty, .. } => Ok(ValueShape::Future(
-            ty.map(|ty| normalize_component_value(types, ty, resources, budget, depth + 1))
-                .transpose()?
-                .map(Box::new),
+        ComponentDefinedType::Future { ty, .. } if features.async_values => Ok(ValueShape::Future(
+            ty.map(|ty| {
+                normalize_component_value(types, ty, resources, budget, depth + 1, features)
+            })
+            .transpose()?
+            .map(Box::new),
         )),
-        ComponentDefinedType::Stream { ty, .. } => Ok(ValueShape::Stream(
-            ty.map(|ty| normalize_component_value(types, ty, resources, budget, depth + 1))
-                .transpose()?
-                .map(Box::new),
+        ComponentDefinedType::Stream { ty, .. } if features.async_values => Ok(ValueShape::Stream(
+            ty.map(|ty| {
+                normalize_component_value(types, ty, resources, budget, depth + 1, features)
+            })
+            .transpose()?
+            .map(Box::new),
         )),
+        ComponentDefinedType::Future { .. } | ComponentDefinedType::Stream { .. } => {
+            Err(WorldError::UnsupportedType)
+        }
         ComponentDefinedType::Map { .. } | ComponentDefinedType::FixedLengthList { .. } => {
             Err(WorldError::UnsupportedType)
         }

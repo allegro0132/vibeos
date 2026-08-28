@@ -19,6 +19,9 @@ use core::{alloc::Layout, ptr::NonNull};
 use vibeos_component_format::PROFILE_1_LIMITS;
 use vibeos_wasm_runtime::CoreValue;
 
+#[cfg(feature = "c88-f3-acceptance")]
+pub mod float_candidate;
+
 pub const MAX_FLAT_PARAMS: usize = 16;
 pub const MAX_FLAT_RESULTS: usize = 1;
 
@@ -377,6 +380,10 @@ fn lower_at<M: GuestMemory, A: PayloadAllocator<M>>(
         (ValueType::S32, CanonicalValue::S32(value)) => write_u32(memory, pointer, *value as u32),
         (ValueType::U64, CanonicalValue::U64(value)) => write_u64(memory, pointer, *value),
         (ValueType::S64, CanonicalValue::S64(value)) => write_u64(memory, pointer, *value as u64),
+        #[cfg(feature = "c88-f3-acceptance")]
+        (ValueType::F32, CanonicalValue::F32(value)) => write_u32(memory, pointer, value.to_bits()),
+        #[cfg(feature = "c88-f3-acceptance")]
+        (ValueType::F64, CanonicalValue::F64(value)) => write_u64(memory, pointer, value.to_bits()),
         (ValueType::Char, CanonicalValue::Char(value)) => {
             write_u32(memory, pointer, u32::from(*value))
         }
@@ -529,6 +536,14 @@ fn lift_at<M: GuestMemory, B: ResourceBinder>(
         ValueType::S32 => Ok(CanonicalValue::S32(read_u32(memory, pointer)? as i32)),
         ValueType::U64 => Ok(CanonicalValue::U64(read_u64(memory, pointer)?)),
         ValueType::S64 => Ok(CanonicalValue::S64(read_u64(memory, pointer)? as i64)),
+        #[cfg(feature = "c88-f3-acceptance")]
+        ValueType::F32 => Ok(CanonicalValue::F32(crate::value::CanonicalF32::from_bits(
+            read_u32(memory, pointer)?,
+        ))),
+        #[cfg(feature = "c88-f3-acceptance")]
+        ValueType::F64 => Ok(CanonicalValue::F64(crate::value::CanonicalF64::from_bits(
+            read_u64(memory, pointer)?,
+        ))),
         ValueType::Char => char::from_u32(read_u32(memory, pointer)?)
             .map(CanonicalValue::Char)
             .ok_or(CodecError::InvalidChar),
@@ -860,6 +875,8 @@ fn validate_position(ty: &ValueType, position: ValuePosition) -> Result<(), Code
 
 fn ensure_codec_supported(ty: &ValueType) -> Result<(), CodecError> {
     match ty {
+        #[cfg(feature = "c88-f3-acceptance")]
+        ValueType::F32 | ValueType::F64 => Err(CodecError::Unsupported),
         ValueType::Stream { .. } | ValueType::Future { .. } => Err(CodecError::Unsupported),
         ValueType::List(item) | ValueType::Option(item) => ensure_codec_supported(item),
         ValueType::Tuple(types) | ValueType::Record(types) => {
@@ -1317,6 +1334,8 @@ fn lift_flat_value<M: GuestMemory, B: ResourceBinder>(
                 position,
             )
             .map(CanonicalValue::Resource),
+        #[cfg(feature = "c88-f3-acceptance")]
+        ValueType::F32 | ValueType::F64 => Err(CodecError::Unsupported),
         ValueType::Stream { .. } | ValueType::Future { .. } => Err(CodecError::Unsupported),
     }
 }

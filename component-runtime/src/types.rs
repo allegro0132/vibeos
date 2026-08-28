@@ -79,6 +79,10 @@ fn try_clone_value_type(value: &ValueType) -> Result<ValueType, TypeError> {
         ValueType::S16 => ValueType::S16,
         ValueType::S32 => ValueType::S32,
         ValueType::S64 => ValueType::S64,
+        #[cfg(feature = "c88-f3-acceptance")]
+        ValueType::F32 => ValueType::F32,
+        #[cfg(feature = "c88-f3-acceptance")]
+        ValueType::F64 => ValueType::F64,
         ValueType::Char => ValueType::Char,
         ValueType::String => ValueType::String,
         ValueType::List(item) => ValueType::List(try_box(try_clone_value_type(item)?)?),
@@ -144,6 +148,7 @@ fn try_clone_types(values: &[ValueType]) -> Result<Vec<ValueType>, TypeError> {
 
 #[derive(Default)]
 pub(crate) struct TypeBuilder {
+    allow_scalar_float: bool,
     resources: Vec<AliasableResourceId>,
     async_values: Vec<AsyncValueRepresentative>,
     future_values: u32,
@@ -171,6 +176,14 @@ impl From<ComponentValType> for ComponentValueKey {
 }
 
 impl TypeBuilder {
+    #[cfg(feature = "c88-f3-acceptance")]
+    pub(crate) fn profile_2_float_candidate() -> Self {
+        Self {
+            allow_scalar_float: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn component_value(
         &mut self,
         types: &Types,
@@ -230,9 +243,13 @@ impl TypeBuilder {
         self.materialize()?;
         self.enter(value, depth)?;
         match value {
-            ComponentValType::Primitive(primitive) => primitive_type(primitive),
+            ComponentValType::Primitive(primitive) => {
+                primitive_type(primitive, self.allow_scalar_float)
+            }
             ComponentValType::Type(id) => match &types[id] {
-                ComponentDefinedType::Primitive(primitive) => primitive_type(*primitive),
+                ComponentDefinedType::Primitive(primitive) => {
+                    primitive_type(*primitive, self.allow_scalar_float)
+                }
                 ComponentDefinedType::Record(record) => {
                     let mut fields = Vec::new();
                     fields
@@ -448,7 +465,12 @@ fn component_values_are_equivalent(
         && ComponentEntityType::is_subtype_of(&right, types, &left, types)
 }
 
-fn primitive_type(primitive: PrimitiveValType) -> Result<ValueType, TypeError> {
+fn primitive_type(
+    primitive: PrimitiveValType,
+    allow_scalar_float: bool,
+) -> Result<ValueType, TypeError> {
+    #[cfg(not(feature = "c88-f3-acceptance"))]
+    let _ = allow_scalar_float;
     Ok(match primitive {
         PrimitiveValType::Bool => ValueType::Bool,
         PrimitiveValType::S8 => ValueType::S8,
@@ -461,6 +483,10 @@ fn primitive_type(primitive: PrimitiveValType) -> Result<ValueType, TypeError> {
         PrimitiveValType::U64 => ValueType::U64,
         PrimitiveValType::Char => ValueType::Char,
         PrimitiveValType::String => ValueType::String,
+        #[cfg(feature = "c88-f3-acceptance")]
+        PrimitiveValType::F32 if allow_scalar_float => ValueType::F32,
+        #[cfg(feature = "c88-f3-acceptance")]
+        PrimitiveValType::F64 if allow_scalar_float => ValueType::F64,
         PrimitiveValType::F32 | PrimitiveValType::F64 | PrimitiveValType::ErrorContext => {
             return Err(TypeError::Unsupported);
         }

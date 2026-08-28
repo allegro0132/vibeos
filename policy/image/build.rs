@@ -18,6 +18,8 @@ mod build_c76;
 
 const SOURCE: &str = include_str!("artifacts/c53-stream-filter.component.wat");
 const NATIVE_ASYNC_SOURCE: &str = include_str!("artifacts/c53-native-async-filter.component.wat");
+const C88_FLOAT_CANDIDATE_SOURCE: &str =
+    include_str!("artifacts/c88-float-candidate.component.wat");
 const C64_RESOURCE_PROVIDER_SOURCE: &str =
     include_str!("artifacts/c64-resource-provider.component.wat");
 const C64_RESOURCE_CONSUMER_SOURCE: &str =
@@ -81,6 +83,13 @@ const EXPECTED_SHA256: [u8; 32] = [
 const NATIVE_ASYNC_EXPECTED_SHA256: [u8; 32] = [
     0x8c, 0xff, 0xb5, 0xbc, 0xce, 0x06, 0x22, 0xc6, 0x4a, 0xff, 0xec, 0xd8, 0xc1, 0xa1, 0xee, 0xcc,
     0x57, 0xf3, 0x06, 0xbe, 0x08, 0xc7, 0x6c, 0xc0, 0x46, 0x21, 0xd8, 0x2d, 0x67, 0x8b, 0x10, 0xf3,
+];
+
+// F4's candidate-only Component identity. This digest is intentionally
+// independent of every command, durable artifact, and production profile pin.
+const C88_FLOAT_CANDIDATE_EXPECTED_SHA256: [u8; 32] = [
+    0x5f, 0xdb, 0x9d, 0xc9, 0xa4, 0x8a, 0x9c, 0x54, 0xe8, 0x99, 0xa5, 0xdc, 0x72, 0x44, 0x45, 0x08,
+    0x3c, 0x05, 0x5d, 0xbf, 0x0d, 0x66, 0x49, 0x27, 0xba, 0x55, 0xd9, 0x78, 0x0c, 0xc9, 0x99, 0x6a,
 ];
 
 const C64_RESOURCE_PROVIDER_EXPECTED_SHA256: [u8; 32] = [
@@ -795,6 +804,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build_c76.rs");
     println!("cargo:rerun-if-changed=artifacts/c53-stream-filter.component.wat");
     println!("cargo:rerun-if-changed=artifacts/c53-native-async-filter.component.wat");
+    println!("cargo:rerun-if-changed=artifacts/c88-float-candidate.component.wat");
+    println!("cargo:rerun-if-changed=artifacts/c88-float-candidate.wit");
     println!("cargo:rerun-if-changed=artifacts/c64-resource-provider.component.wat");
     println!("cargo:rerun-if-changed=artifacts/c64-resource-consumer.component.wat");
     println!("cargo:rerun-if-changed=artifacts/c64-resource-route.wit");
@@ -850,6 +861,23 @@ fn main() {
             format!("{NATIVE_ASYNC_EXPECTED_SHA256:?}"),
         )
         .expect("write checked native async Component identity constant");
+    }
+
+    if env::var_os("CARGO_FEATURE_C88_F4_FLOAT_CANDIDATE").is_some() {
+        let bytes = wat::parse_str(C88_FLOAT_CANDIDATE_SOURCE)
+            .expect("pinned C8.8-F4 float candidate Component WAT must parse");
+        let observed: [u8; 32] = Sha256::digest(&bytes).into();
+        assert_eq!(
+            observed, C88_FLOAT_CANDIDATE_EXPECTED_SHA256,
+            "pinned C8.8-F4 float candidate Component digest changed: {observed:02x?}"
+        );
+        fs::write(output.join("c88-float-candidate.component.wasm"), bytes)
+            .expect("write pinned C8.8-F4 float candidate Component artifact");
+        fs::write(
+            output.join("c88-float-candidate.sha256.rs"),
+            format!("{C88_FLOAT_CANDIDATE_EXPECTED_SHA256:?}"),
+        )
+        .expect("write checked C8.8-F4 float candidate identity constant");
     }
 
     if env::var_os("CARGO_FEATURE_C64_RESOURCE_ROUTE_QEMU_ACCEPTANCE").is_some() {

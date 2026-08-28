@@ -1044,6 +1044,38 @@ fn candidate_store_limits_and_core_trap_mapping_are_execution_exact_and_reusable
 }
 
 #[test]
+fn candidate_store_limit_allows_growth_to_ceiling_and_traps_beyond_it() {
+    let module = compile(
+        r#"(module
+            (memory 1 3)
+            (func (export "size") (result i32) memory.size)
+            (func (export "grow") (param i32) (result i32) local.get 0 memory.grow)
+        )"#,
+    );
+    let mut instance = module.instantiate_with_memory_limit(2 * 65_536).unwrap();
+    assert_eq!(
+        run(&mut instance, "size", &[]),
+        Ok(vec![CandidateValue::I32(1)])
+    );
+    assert_eq!(
+        run(&mut instance, "grow", &[CandidateValue::I32(1)]),
+        Ok(vec![CandidateValue::I32(1)])
+    );
+    assert_eq!(
+        run(&mut instance, "size", &[]),
+        Ok(vec![CandidateValue::I32(2)])
+    );
+    assert_eq!(
+        run(&mut instance, "grow", &[CandidateValue::I32(1)]),
+        Err(TrapCode::LimitExceeded)
+    );
+    assert_eq!(
+        run(&mut instance, "size", &[]),
+        Ok(vec![CandidateValue::I32(2)])
+    );
+}
+
+#[test]
 fn imports_are_denied_before_candidate_engine_instantiation() {
     let bytes = wat::parse_str("(module (import \"host\" \"f\" (func (param f32))))").unwrap();
     let error = CandidateModule::compile(&bytes, OwnerAllocationReservation::profile_default())

@@ -1,6 +1,6 @@
 # C8.8 deterministic scalar-float profile
 
-**Status (2026-08-29): C8.8-F1 through C8.8-F3 complete.** F1 freezes the
+**Status (2026-08-29): C8.8-F1 through C8.8-F4 complete.** F1 freezes the
 immutable validation-only artifact identity and deterministic semantic
 contract. F2 supplies an independently identified, acceptance-only Core
 validator and software-float executor behind `c88-f2-acceptance`; it does not
@@ -8,14 +8,17 @@ bind profile code 5 to a current engine or production activation path.
 F3 supplies an acceptance-only, bit-represented WIT and Canonical ABI codec
 behind `c88-f3-acceptance`; the production Profile-1 codec still rejects every
 scalar-float shape. Its allocation evidence is a codec request/byte trace
-replayed through the existing cleanup machine, not runtime wiring. C8.8-F4,
-default-off admission and lifecycle, is next.
-Float and C8.8 remain incomplete.
+replayed through the existing cleanup machine, not runtime wiring. F4 adds a
+separate default-off candidate admission and lifecycle behind acceptance-only
+feature gates; the image adapter binds that lifecycle to one exact image pin.
+It does not add a production command, durable object/publication, or
+current-engine binding. C8.8-F5 target qualification is next. Float and C8.8
+remain incomplete.
 
 Milk-V Duo physical testing remains paused at operator request. Fixed QEMU is
-the selected target for the later F5 emulator qualification; it was not used
-for F1 through F3. The RISC-V evidence through F3 is compile- and object-level
-evidence, not a QEMU or physical execution claim.
+the selected target for F5 emulator qualification; it was not used for F1
+through F4. F4 evidence is host-only. The RISC-V evidence through F3 is
+compile- and object-level evidence, not a QEMU or physical execution claim.
 
 ## 1. Frozen identity
 
@@ -57,8 +60,10 @@ permanent change-control requirements:
 - the metadata contract names a target configuration but contains no frontend
   or runtime package, source, revision, or checksum identity;
 - the CGV1 durable graph constructor and decoder reject code 5;
-- loader admission, durable installation/publication, command construction,
-  and guest invocation have no code-5 activation path.
+- production loader admission, durable installation/publication, command
+  construction, and production guest invocation have no code-5 activation
+  path. Explicit default-off acceptance harnesses do not alter this identity
+  or register it with a production resolver.
 
 F2 through F5 must not promote code 5 in place. If the complete Float evidence
 eventually passes, an executable successor must receive a new profile code,
@@ -128,7 +133,7 @@ disabled adjacent features.
 
 An increment is not complete merely because a later layer can be sketched or
 compiled. Each increment is verified, committed, and pushed independently.
-F1 through F3 have closed their respective gates; F4 and F5 have not.
+F1 through F4 have closed their respective gates; F5 has not.
 
 ## 5. Closed F2 dependency and trap gates
 
@@ -166,7 +171,7 @@ keeps finite overflow and positive or negative infinity on `IntegerOverflow`
 including exact valid boundaries and adjacent overflow. The
 saturating-conversion proposal remains rejected.
 
-## 6. F1/F2/F3 evidence and non-claims
+## 6. F1/F2/F3/F4 evidence and non-claims
 
 The F1 host gate proves the exact profile/codec metadata, NaN constants and
 operation classification, Profile-1 non-widening, absence from the current
@@ -223,8 +228,60 @@ float helper, or float symbol. The stock
 Profile-1 `libm`/Wasmi software-float objects are recorded as an unchanged
 inherited baseline rather than attributed to the dependency-free F3 feature.
 
-F3 provides no direct candidate-to-runtime allocator wiring, production loader
-or image admission, durable publication, guest activation, fixed-QEMU
-execution, or physical result. The default-off lifecycle connection is F4
-work. Code 5 remains permanently `ValidationOnly`; any executable successor
-still requires a separately numbered identity after F4 and F5 close.
+F3 itself provides no direct candidate-to-runtime allocator wiring or image
+admission. F4 closes that separate acceptance boundary with one immutable
+image pin:
+
+- component SHA-256
+  `5fdb9dc9a48a9c54e899a5dc724445083c055dbf0d664927ba55d9780cc9996a`;
+- WIT world `vibe:float-acceptance/lifecycle@1.0.0` and sole synchronous export
+  `run(mode: u32, left: f32, right: f64) -> f64`;
+- image/adapter feature `c88-f4-float-candidate` and admission/runtime feature
+  `c88-f4-acceptance`, all default-off;
+- exactly one embedded module, one Core instance, one Canonical function, no
+  imports or host imports, no resources, and no caller authority;
+- a 131,072-byte memory ceiling, 100,000 total fuel, 100-fuel poll quantum,
+  zero resources, and a fresh exact compile reservation derived from the sole
+  embedded module.
+
+The activation label `c88-f4-float-candidate` is candidate metadata, not a
+command name or command manifest. The sealed image projection reparses the
+independently pinned WIT, obtains a move-only candidate admission receipt,
+revalidates a fresh plan, derives the compile reservation, and connects the F3
+bit-only Canonical values to the F2 candidate executor. A sealed decoder
+sidecar independently resolves the sole Component `run` through its synchronous
+Canonical lift to module 0, instance 0, and Core export `run`; it remains
+separate from the empty ordinary execution plan. Same-signature lift-to-other
+and unused-extra-wiring mutations fail before candidate compilation. The
+projection exposes no artifact bytes, grants, durable graph,
+`AdmittedComponent` conversion, VSH command, or production resolver
+registration.
+
+Host lifecycle tests preserve nonzero finite, signed-zero, subnormal, and NaN
+boundary behavior. Each move-only lifecycle enforces at most one live instance
+and rejects insufficient compile reservation, a below-minimum memory limit, zero or
+adjacent-invalid fuel/quantum limits, nonzero resources, and adjacent image,
+world, profile, label, topology, import, and authority inputs. Store-limit
+tests grow memory exactly to the policy ceiling and trap the next growth;
+finite-fuel execution checks every pending quantum, exhausts deterministically,
+reclaims, and cold-recovers. Cancellation and other traps likewise drop the
+complete candidate instance and require a cold `recover`; revocation is
+absorbing and cannot recover. Reclamation counters prove one reclaim per
+cancelled, faulted, or revoked live instance. The ordinary admission path still
+rejects code 5, and both the durable production loader and CGV1
+constructor/decoder reject it before command or publication creation.
+
+F4 is explicit candidate-only activation evidence. Code 5 remains permanently
+`ValidationOnly`, `execution_enabled() == false`, absent from both current
+engine resolvers, and unavailable to production loading, durable
+installation/publication, command construction, or guest invocation. F4 makes
+no fixed-QEMU execution claim: host plus fixed-QEMU exact-bit/fuel
+qualification remains F5, and physical-Duo qualification remains paused. Any
+executable successor still requires a separately numbered identity after F5
+closes.
+
+F4 does not establish a system-wide admission or concurrency ledger. The
+memory, fuel, compile, resource, and one-live-instance ceilings are scoped to
+each explicitly constructed acceptance lifecycle. A future production
+successor must add and review any global owner/concurrency accounting under its
+new identity rather than inferring it from this candidate harness.

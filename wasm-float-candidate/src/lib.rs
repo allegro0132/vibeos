@@ -198,8 +198,27 @@ mod acceptance {
         }
 
         pub fn instantiate(&self) -> Result<CandidateInstance, TrapCode> {
+            self.instantiate_with_memory_limit(PROFILE_1_LIMITS.max_memory_pages as usize * 65_536)
+        }
+
+        /// Instantiates the acceptance candidate beneath one exact owner
+        /// memory ceiling.
+        ///
+        /// The ceiling is installed in Wasmi's store limiter before the
+        /// module is instantiated, so both the declared minimum and every
+        /// later `memory.grow` are charged to the same candidate lifecycle.
+        /// It is not a production profile selector and does not make artifact
+        /// profile code 5 current or runtime-ready.
+        pub fn instantiate_with_memory_limit(
+            &self,
+            memory_bytes: usize,
+        ) -> Result<CandidateInstance, TrapCode> {
+            let maximum = PROFILE_1_LIMITS.max_memory_pages as usize * 65_536;
+            if memory_bytes == 0 || memory_bytes > maximum {
+                return Err(TrapCode::LimitExceeded);
+            }
             let limits = StoreLimitsBuilder::new()
-                .memory_size(PROFILE_1_LIMITS.max_memory_pages as usize * 65_536)
+                .memory_size(memory_bytes)
                 .table_elements(PROFILE_1_LIMITS.max_table_elements as usize)
                 .instances(1)
                 .tables(PROFILE_1_LIMITS.max_tables as usize)

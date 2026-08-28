@@ -15,6 +15,7 @@ wasmparser = { version = "=0.255.0", default-features = false, features = ["comp
 
 [features]
 default = []
+c88-f4-acceptance = ["vibeos-component-runtime/c88-f4-acceptance"]
 native-async-acceptance = ["vibeos-component-runtime/native-async-acceptance"]
 preview1-wrapped-admission = ["dep:wasmparser"]
 # Default-off C8.2 corpus executor. It consumes only a freshly revalidated

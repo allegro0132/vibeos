@@ -931,6 +931,8 @@ fn value_is_resource_free(value: &ValueShape) -> bool {
             value.as_deref().is_none_or(value_is_resource_free)
         }
         ValueShape::Own(_) | ValueShape::Borrow(_) => false,
+        #[cfg(feature = "c88-f4-acceptance")]
+        ValueShape::F32 | ValueShape::F64 => false,
         ValueShape::Bool
         | ValueShape::U8
         | ValueShape::U16
@@ -1196,6 +1198,10 @@ fn encode_value_shape(
     value: &ValueShape,
 ) -> Result<(), ArtifactAuthenticationError> {
     match value {
+        #[cfg(feature = "c88-f4-acceptance")]
+        ValueShape::F32 | ValueShape::F64 => {
+            return Err(ArtifactAuthenticationError::InvalidPolicy);
+        }
         ValueShape::Bool => put_u8(hasher, 0),
         ValueShape::U8 => put_u8(hasher, 1),
         ValueShape::U16 => put_u8(hasher, 2),

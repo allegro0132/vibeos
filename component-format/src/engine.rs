@@ -3,10 +3,13 @@
 //! Artifact profile fields are necessary but are not, by themselves, proof
 //! that the booting kernel is using the same frontend and engine build.  This
 //! module supplies the other half of that comparison.  All fields are private,
-//! and the only identities returned to downstream crates are the three exact
-//! identities constructed here.
+//! and the only identities returned to downstream crates are exact identities
+//! constructed here.
 
-use crate::{ProfileIdentity, PROFILE_1_LIMITS};
+use crate::{
+    FloatNaNPolicy, ProfileIdentity, ScalarFloatType, PROFILE_1_LIMITS,
+    PROFILE_2_SYNC_FLOAT_NAN_POLICY, PROFILE_2_SYNC_FLOAT_SCALAR_TYPES,
+};
 
 pub const WASMPARSER_0_255_0_VERSION: &str = "0.255.0";
 pub const WIT_PARSER_0_255_0_VERSION: &str = "0.255.0";
@@ -83,31 +86,41 @@ pub enum WasmParserFeatureSelection {
     ComponentModelAsync,
 }
 
+/// Explicit Component validation mode. It is selected by each closed engine
+/// contract instead of being inferred from an unrelated ABI number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ComponentValidationMode {
+    Sync,
+    Async,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ComponentValidatorConfiguration {
-    predecode_async: bool,
+    mode: ComponentValidationMode,
     structural: WasmParserFeatureSelection,
     strict: WasmParserFeatureSelection,
     diagnostic: WasmParserFeatureSelection,
 }
 
 impl ComponentValidatorConfiguration {
-    const fn for_profile(profile: ProfileIdentity) -> Self {
-        let async_enabled = profile.runtime_abi != ProfileIdentity::PROFILE_1_SYNC.runtime_abi;
+    const fn for_mode(mode: ComponentValidationMode) -> Self {
         Self {
-            predecode_async: async_enabled,
+            mode,
             structural: WasmParserFeatureSelection::All,
-            strict: if async_enabled {
-                WasmParserFeatureSelection::ComponentModelAsync
-            } else {
-                WasmParserFeatureSelection::ComponentModel
+            strict: match mode {
+                ComponentValidationMode::Sync => WasmParserFeatureSelection::ComponentModel,
+                ComponentValidationMode::Async => WasmParserFeatureSelection::ComponentModelAsync,
             },
             diagnostic: WasmParserFeatureSelection::All,
         }
     }
 
+    pub const fn mode(self) -> ComponentValidationMode {
+        self.mode
+    }
+
     pub const fn predecode_async(self) -> bool {
-        self.predecode_async
+        matches!(self.mode, ComponentValidationMode::Async)
     }
 
     pub const fn structural_features(self) -> WasmParserFeatureSelection {
@@ -124,17 +137,38 @@ impl ComponentValidatorConfiguration {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CoreNumericProfile {
+    Profile1IntegerOnly,
+    Profile2ScalarF32F64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CoreValidatorConfiguration {
     structural: WasmParserFeatureSelection,
     strict: WasmParserFeatureSelection,
     diagnostic: WasmParserFeatureSelection,
+    numeric_profile: CoreNumericProfile,
+    nan_policy: Option<FloatNaNPolicy>,
 }
 
 impl CoreValidatorConfiguration {
-    const CURRENT: Self = Self {
+    const PROFILE_1: Self = Self {
         structural: WasmParserFeatureSelection::All,
         strict: WasmParserFeatureSelection::Empty,
         diagnostic: WasmParserFeatureSelection::All,
+        numeric_profile: CoreNumericProfile::Profile1IntegerOnly,
+        nan_policy: None,
+    };
+
+    const PROFILE_2_SYNC_FLOAT: Self = Self {
+        structural: WasmParserFeatureSelection::All,
+        // Scalar f32/f64 are part of the Core baseline rather than a
+        // wasmparser proposal bit. The separate numeric profile below is the
+        // Vibe inspection contract that distinguishes this from Profile 1.
+        strict: WasmParserFeatureSelection::Empty,
+        diagnostic: WasmParserFeatureSelection::All,
+        numeric_profile: CoreNumericProfile::Profile2ScalarF32F64,
+        nan_policy: Some(PROFILE_2_SYNC_FLOAT_NAN_POLICY),
     };
 
     pub const fn structural_features(self) -> WasmParserFeatureSelection {
@@ -147,6 +181,21 @@ impl CoreValidatorConfiguration {
 
     pub const fn diagnostic_features(self) -> WasmParserFeatureSelection {
         self.diagnostic
+    }
+
+    pub const fn numeric_profile(self) -> CoreNumericProfile {
+        self.numeric_profile
+    }
+
+    pub const fn scalar_float_types(self) -> &'static [ScalarFloatType] {
+        match self.numeric_profile {
+            CoreNumericProfile::Profile1IntegerOnly => &[],
+            CoreNumericProfile::Profile2ScalarF32F64 => &PROFILE_2_SYNC_FLOAT_SCALAR_TYPES,
+        }
+    }
+
+    pub const fn nan_policy(self) -> Option<FloatNaNPolicy> {
+        self.nan_policy
     }
 }
 
@@ -165,9 +214,10 @@ pub enum WasmiFuelCosts {
     Wasmi110Default,
 }
 
-/// Every explicit `wasmi::Config` setting used by [`vibeos-wasm-runtime`].
-/// Settings which wasmi exposes only through its defaults are still bound by
-/// the pinned wasmi version/checksum and the named default fuel schedule.
+/// Every explicit target `wasmi::Config` setting selected by Vibe. A current
+/// [`ValidationEngineIdentity`] additionally binds these settings to exact
+/// package bytes. A future validation contract may use this setting vector
+/// without claiming a package, source, or checksum identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WasmiRuntimeConfiguration {
     floats: bool,
@@ -197,7 +247,7 @@ pub struct WasmiRuntimeConfiguration {
 }
 
 impl WasmiRuntimeConfiguration {
-    const CURRENT: Self = Self {
+    const PROFILE_1: Self = Self {
         floats: false,
         mutable_global: false,
         sign_extension: false,
@@ -222,6 +272,15 @@ impl WasmiRuntimeConfiguration {
         max_cached_stacks: 0,
         enforced_limits: WasmiEnforcedLimits::Strict,
         fuel_costs: WasmiFuelCosts::Wasmi110Default,
+    };
+
+    /// Future F2 implementation target. F1 records this exact setting vector,
+    /// including `Wasmi110Default` fuel costs, but does not expose it as a
+    /// current runtime binding. A candidate with a different schedule requires
+    /// a new reviewed contract; it cannot silently reinterpret code 5.
+    const PROFILE_2_SYNC_FLOAT: Self = Self {
+        floats: true,
+        ..Self::PROFILE_1
     };
 
     pub const fn floats(self) -> bool {
@@ -343,7 +402,12 @@ pub struct ValidationEngineIdentity {
 }
 
 impl ValidationEngineIdentity {
-    const fn for_profile(profile: ProfileIdentity) -> Self {
+    const fn for_contract(
+        profile: ProfileIdentity,
+        component_mode: ComponentValidationMode,
+        core_validator: CoreValidatorConfiguration,
+        runtime: WasmiRuntimeConfiguration,
+    ) -> Self {
         Self {
             profile,
             component_wasmparser: ValidationCrateIdentity::new(
@@ -376,9 +440,9 @@ impl ValidationEngineIdentity {
                 WASMI_WASMPARSER_0_239_0_CHECKSUM,
                 WASMI_WASMPARSER_FEATURES,
             ),
-            component_validator: ComponentValidatorConfiguration::for_profile(profile),
-            core_validator: CoreValidatorConfiguration::CURRENT,
-            runtime: WasmiRuntimeConfiguration::CURRENT,
+            component_validator: ComponentValidatorConfiguration::for_mode(component_mode),
+            core_validator,
+            runtime,
         }
     }
 
@@ -419,12 +483,97 @@ impl ValidationEngineIdentity {
     }
 }
 
-const PROFILE_1_SYNC_ENGINE: ValidationEngineIdentity =
-    ValidationEngineIdentity::for_profile(ProfileIdentity::PROFILE_1_SYNC);
-const PROFILE_1_ASYNC_ENGINE: ValidationEngineIdentity =
-    ValidationEngineIdentity::for_profile(ProfileIdentity::PROFILE_1_ASYNC);
+const PROFILE_1_SYNC_ENGINE: ValidationEngineIdentity = ValidationEngineIdentity::for_contract(
+    ProfileIdentity::PROFILE_1_SYNC,
+    ComponentValidationMode::Sync,
+    CoreValidatorConfiguration::PROFILE_1,
+    WasmiRuntimeConfiguration::PROFILE_1,
+);
+const PROFILE_1_ASYNC_ENGINE: ValidationEngineIdentity = ValidationEngineIdentity::for_contract(
+    ProfileIdentity::PROFILE_1_ASYNC,
+    ComponentValidationMode::Async,
+    CoreValidatorConfiguration::PROFILE_1,
+    WasmiRuntimeConfiguration::PROFILE_1,
+);
 const PROFILE_1_NATIVE_ASYNC_ENGINE: ValidationEngineIdentity =
-    ValidationEngineIdentity::for_profile(ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE);
+    ValidationEngineIdentity::for_contract(
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+        ComponentValidationMode::Async,
+        CoreValidatorConfiguration::PROFILE_1,
+        WasmiRuntimeConfiguration::PROFILE_1,
+    );
+/// Sealed C8.8-F1 contract metadata. It deliberately contains no frontend or
+/// runtime crate/package/source/checksum identity: F2 must review and bind its
+/// software-float candidate independently, without rewriting code 5's format
+/// contract.
+///
+/// ```compile_fail
+/// use vibeos_component_format::Profile2SyncFloatValidationContract;
+/// let _forged = Profile2SyncFloatValidationContract {};
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_format::profile_2_sync_float_validation_contract;
+/// let contract = profile_2_sync_float_validation_contract();
+/// let _package_identity = contract.wasmi();
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Profile2SyncFloatValidationContract {
+    profile: ProfileIdentity,
+    component_validator: ComponentValidatorConfiguration,
+    core_validator: CoreValidatorConfiguration,
+    target_wasmi_configuration: WasmiRuntimeConfiguration,
+    nan_policy: FloatNaNPolicy,
+    runtime_ready: bool,
+}
+
+impl Profile2SyncFloatValidationContract {
+    pub const fn profile(self) -> ProfileIdentity {
+        self.profile
+    }
+
+    pub const fn component_validator(self) -> ComponentValidatorConfiguration {
+        self.component_validator
+    }
+
+    pub const fn core_validator(self) -> CoreValidatorConfiguration {
+        self.core_validator
+    }
+
+    pub const fn target_wasmi_configuration(self) -> WasmiRuntimeConfiguration {
+        self.target_wasmi_configuration
+    }
+
+    pub const fn nan_policy(self) -> FloatNaNPolicy {
+        self.nan_policy
+    }
+
+    pub const fn runtime_ready(self) -> bool {
+        self.runtime_ready
+    }
+}
+
+const PROFILE_2_SYNC_FLOAT_VALIDATION_CONTRACT: Profile2SyncFloatValidationContract =
+    Profile2SyncFloatValidationContract {
+        profile: ProfileIdentity::PROFILE_2_SYNC_FLOAT,
+        component_validator: ComponentValidatorConfiguration::for_mode(
+            ComponentValidationMode::Sync,
+        ),
+        core_validator: CoreValidatorConfiguration::PROFILE_2_SYNC_FLOAT,
+        target_wasmi_configuration: WasmiRuntimeConfiguration::PROFILE_2_SYNC_FLOAT,
+        nan_policy: PROFILE_2_SYNC_FLOAT_NAN_POLICY,
+        runtime_ready: false,
+    };
+
+/// Exact future validator/wasmi setting vector frozen by C8.8-F1. This is
+/// contract metadata, not a current validation-engine or execution binding;
+/// [`current_validation_engine_identity`] intentionally returns `None` for its
+/// profile. Code 5 remains validation-only permanently; a future executable
+/// float profile must receive a new profile code and ABI identity.
+pub const fn profile_2_sync_float_validation_contract(
+) -> &'static Profile2SyncFloatValidationContract {
+    &PROFILE_2_SYNC_FLOAT_VALIDATION_CONTRACT
+}
 
 /// Resolve only a byte-for-byte supported profile to the engine identity that
 /// is compiled into this boot. An artifact-provided adjacent profile returns
@@ -432,7 +581,11 @@ const PROFILE_1_NATIVE_ASYNC_ENGINE: ValidationEngineIdentity =
 pub fn current_validation_engine_identity(
     profile: ProfileIdentity,
 ) -> Option<&'static ValidationEngineIdentity> {
-    if profile == ProfileIdentity::PROFILE_1_SYNC {
+    // Change-control invariant: code 5 is format/contract metadata only and is
+    // never promoted in place to a current engine binding.
+    if profile == ProfileIdentity::PROFILE_2_SYNC_FLOAT {
+        None
+    } else if profile == ProfileIdentity::PROFILE_1_SYNC {
         Some(&PROFILE_1_SYNC_ENGINE)
     } else if profile == ProfileIdentity::PROFILE_1_ASYNC {
         Some(&PROFILE_1_ASYNC_ENGINE)
@@ -546,7 +699,7 @@ mod tests {
         let expected = PROFILE_1_SYNC_ENGINE;
 
         let mut adjacent = expected;
-        adjacent.component_validator.predecode_async = true;
+        adjacent.component_validator.mode = ComponentValidationMode::Async;
         differs(expected, adjacent);
         let mut adjacent = expected;
         adjacent.component_validator.structural = WasmParserFeatureSelection::Empty;
@@ -566,6 +719,12 @@ mod tests {
         differs(expected, adjacent);
         let mut adjacent = expected;
         adjacent.core_validator.diagnostic = WasmParserFeatureSelection::Empty;
+        differs(expected, adjacent);
+        let mut adjacent = expected;
+        adjacent.core_validator.numeric_profile = CoreNumericProfile::Profile2ScalarF32F64;
+        differs(expected, adjacent);
+        let mut adjacent = expected;
+        adjacent.core_validator.nan_policy = Some(PROFILE_2_SYNC_FLOAT_NAN_POLICY);
         differs(expected, adjacent);
     }
 
@@ -663,6 +822,14 @@ mod tests {
         adjacent.stage = ProfileStage::ValidationOnly;
         assert!(current_validation_engine_identity(adjacent).is_none());
 
+        assert!(
+            current_validation_engine_identity(ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED)
+                .is_none()
+        );
+        assert!(
+            current_validation_engine_identity(ProfileIdentity::PROFILE_2_SYNC_FLOAT).is_none()
+        );
+
         let sync = current_validation_engine_identity(expected).unwrap();
         let async_ = current_validation_engine_identity(ProfileIdentity::PROFILE_1_ASYNC).unwrap();
         let native = current_validation_engine_identity(
@@ -672,5 +839,43 @@ mod tests {
         assert_eq!(sync.profile(), expected);
         assert_ne!(sync, async_);
         assert_ne!(async_, native);
+
+        let float = profile_2_sync_float_validation_contract();
+        // Exhaustive destructuring is a compile-time schema lock: adding any
+        // package/source/checksum field requires this contract audit to change.
+        let Profile2SyncFloatValidationContract {
+            profile,
+            component_validator,
+            core_validator,
+            target_wasmi_configuration,
+            nan_policy,
+            runtime_ready,
+        } = *float;
+        assert_eq!(profile, ProfileIdentity::PROFILE_2_SYNC_FLOAT);
+        assert_eq!(component_validator, float.component_validator());
+        assert_eq!(core_validator, float.core_validator());
+        assert_eq!(
+            target_wasmi_configuration,
+            float.target_wasmi_configuration()
+        );
+        assert_eq!(nan_policy, PROFILE_2_SYNC_FLOAT_NAN_POLICY);
+        assert!(!runtime_ready);
+        assert_eq!(float.profile(), ProfileIdentity::PROFILE_2_SYNC_FLOAT);
+        assert!(!float.runtime_ready());
+        assert!(!float.component_validator().predecode_async());
+        assert_eq!(
+            float.component_validator().mode(),
+            ComponentValidationMode::Sync
+        );
+        assert_eq!(
+            float.core_validator().numeric_profile(),
+            CoreNumericProfile::Profile2ScalarF32F64
+        );
+        assert_eq!(
+            float.core_validator().nan_policy(),
+            Some(PROFILE_2_SYNC_FLOAT_NAN_POLICY)
+        );
+        assert_eq!(float.nan_policy(), PROFILE_2_SYNC_FLOAT_NAN_POLICY);
+        assert!(float.target_wasmi_configuration().floats());
     }
 }

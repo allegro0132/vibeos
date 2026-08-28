@@ -1,4 +1,4 @@
-//! Versioned, inert contracts for Vibe Component Profile 1.
+//! Versioned, inert contracts for Vibe Component profiles.
 //!
 //! This crate deliberately contains no engine, host service, capability, or
 //! filesystem integration.  It is usable by admission tooling and the kernel's
@@ -54,8 +54,7 @@ pub const ASYNC_CANONICAL_ABI_REVISION: &str =
 /// upstream Component Model and wasm-tools revisions as the C5.1 validator.
 pub const NATIVE_ASYNC_RESOURCE_FREE_ARTIFACT_ABI_VERSION: u16 = 3;
 pub const NATIVE_ASYNC_RESOURCE_FREE_RUNTIME_ABI_VERSION: u16 = 3;
-pub const NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_ABI_REVISION: &str =
-    "canonical-abi-73b7ad51d3b5d6f1ef53c923d8c585e28b242bcc-vibe-async-callback-1-resource-free-exec-1";
+pub const NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_ABI_REVISION: &str = "canonical-abi-73b7ad51d3b5d6f1ef53c923d8c585e28b242bcc-vibe-async-callback-1-resource-free-exec-1";
 pub const NATIVE_ASYNC_RESOURCE_FREE_WASI_REVISION: &str =
     "wasi-not-selected-native-async-resource-free";
 
@@ -67,6 +66,20 @@ pub const PREVIEW1_WRAPPED_RUNTIME_ABI_VERSION: u16 = 4;
 pub const PREVIEW1_WRAPPED_WASM_TOOLS_REVISION: &str =
     "wasm-tools-v1.255.0-76e20611d1920a7a39ca08983c6c77c3060de380";
 pub const PREVIEW1_WRAPPED_WASI_REVISION: &str = "wasi-v0.2.12";
+
+/// C8.8-F1's validation-only synchronous scalar-float contract. Code 5 is
+/// deliberately disjoint from every Profile 1 artifact/runtime ABI, while the
+/// Component and Core profile numbers advance together to 2.
+pub const PROFILE_2_SYNC_FLOAT_PROFILE_CODE: u16 = 5;
+pub const PROFILE_2_SYNC_FLOAT_ARTIFACT_ABI_VERSION: u16 = 5;
+pub const PROFILE_2_SYNC_FLOAT_COMPONENT_PROFILE_VERSION: u16 = 2;
+pub const PROFILE_2_SYNC_FLOAT_CORE_PROFILE_VERSION: u16 = 2;
+pub const PROFILE_2_SYNC_FLOAT_RUNTIME_ABI_VERSION: u16 = 5;
+pub const PROFILE_2_SYNC_FLOAT_CORE_SPEC_REVISION: &str =
+    "webassembly-core-2.0-scalar-f32-f64-deterministic-software-float-v1";
+pub const PROFILE_2_SYNC_FLOAT_CANONICAL_ABI_REVISION: &str =
+    "component-model-0.255.0-sync-float-values-deterministic-software-float-v1";
+pub const PROFILE_2_SYNC_FLOAT_WASI_REVISION: &str = "wasi-not-selected-sync-float";
 
 /// Exact Wasmtime release asset admitted as the C8.1 command adapter. These
 /// values describe provenance only; the asset bytes are never bundled or
@@ -82,8 +95,7 @@ pub const PREVIEW1_WRAPPED_ADAPTER_ASSET_SHA256: [u8; 32] = [
     0x31, 0x6d, 0xfb, 0xf1, 0x71, 0x59, 0x1d, 0x69, 0xae, 0x41, 0x4e, 0xfd, 0x13, 0xb8, 0x59, 0x33,
     0xca, 0x13, 0x52, 0x6a, 0xf8, 0xd9, 0xe0, 0xa7, 0x35, 0xab, 0x88, 0xae, 0x08, 0xfd, 0x85, 0xf0,
 ];
-pub const PREVIEW1_WRAPPED_ADAPTER_ASSET_PROVENANCE: &str =
-    "https://github.com/bytecodealliance/wasmtime/releases/download/v48.0.0/wasi_snapshot_preview1.command.wasm";
+pub const PREVIEW1_WRAPPED_ADAPTER_ASSET_PROVENANCE: &str = "https://github.com/bytecodealliance/wasmtime/releases/download/v48.0.0/wasi_snapshot_preview1.command.wasm";
 
 pub const SYNC_WASM_TOOLS_REVISION: &str =
     "wasm-tools-v1.255.0-76e20611d1920a7a39ca08983c6c77c3060de380";
@@ -134,6 +146,7 @@ pub enum CanonicalAbiFeature {
     Gc = 18,
     Component64 = 19,
     Utf16 = 20,
+    FloatValues = 21,
 }
 
 impl CanonicalAbiFeature {
@@ -152,13 +165,29 @@ impl CanonicalAbiFeature {
     pub const fn enabled_in_preview1_wrapped_profile(self) -> bool {
         PREVIEW1_WRAPPED_CANONICAL_FEATURES & self.bit() != 0
     }
+
+    pub const fn enabled_in_profile_2_sync_float(self) -> bool {
+        PROFILE_2_SYNC_FLOAT_CANONICAL_FEATURES & self.bit() != 0
+    }
 }
+
+/// Exact synchronous Canonical ABI baseline shared by identities which do not
+/// select async or any adjacent Component proposal.
+pub const SYNC_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
+    | CanonicalAbiFeature::SyncLiftLower.bit()
+    | CanonicalAbiFeature::Resources.bit();
 
 /// C8.1 uses the synchronous Canonical ABI plus nominal resources. Wrapping a
 /// WASIp1 module does not implicitly enable any async or adjacent proposal.
-pub const PREVIEW1_WRAPPED_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
+pub const PREVIEW1_WRAPPED_CANONICAL_FEATURES: u64 = SYNC_CANONICAL_FEATURES;
+
+/// Profile 2 adds only scalar float values to the unchanged synchronous
+/// Canonical ABI surface. Async and all adjacent Component proposals remain
+/// disabled.
+pub const PROFILE_2_SYNC_FLOAT_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
     | CanonicalAbiFeature::SyncLiftLower.bit()
-    | CanonicalAbiFeature::Resources.bit();
+    | CanonicalAbiFeature::Resources.bit()
+    | CanonicalAbiFeature::FloatValues.bit();
 
 pub const ASYNC_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
     | CanonicalAbiFeature::SyncLiftLower.bit()
@@ -282,6 +311,25 @@ impl ProfileIdentity {
         stage: ProfileStage::ValidationOnly,
     };
 
+    /// C8.8-F1's independently versioned synchronous scalar-float identity.
+    /// Code 5 is permanently validation-only: it freezes format and future
+    /// validator metadata, but can never gain execution authority in place.
+    /// Any executable successor must allocate a new profile code and ABIs so a
+    /// historical code-5 artifact cannot become runnable after an upgrade.
+    pub const PROFILE_2_SYNC_FLOAT: Self = Self {
+        artifact_abi: PROFILE_2_SYNC_FLOAT_ARTIFACT_ABI_VERSION,
+        component_profile: PROFILE_2_SYNC_FLOAT_COMPONENT_PROFILE_VERSION,
+        core_profile: PROFILE_2_SYNC_FLOAT_CORE_PROFILE_VERSION,
+        runtime_abi: PROFILE_2_SYNC_FLOAT_RUNTIME_ABI_VERSION,
+        core_revision: PROFILE_2_SYNC_FLOAT_CORE_SPEC_REVISION,
+        component_revision: COMPONENT_MODEL_REVISION,
+        canonical_abi_revision: PROFILE_2_SYNC_FLOAT_CANONICAL_ABI_REVISION,
+        wasm_tools_revision: SYNC_WASM_TOOLS_REVISION,
+        wasi_revision: PROFILE_2_SYNC_FLOAT_WASI_REVISION,
+        canonical_features: PROFILE_2_SYNC_FLOAT_CANONICAL_FEATURES,
+        stage: ProfileStage::ValidationOnly,
+    };
+
     pub const PROFILE_1: Self = Self::PROFILE_1_SYNC;
 
     pub const fn execution_enabled(self) -> bool {
@@ -301,6 +349,18 @@ const _: () = assert!(
 const _: () = assert!(
     ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED.runtime_abi == PREVIEW1_WRAPPED_RUNTIME_ABI_VERSION
 );
+const _: () = assert!(SYNC_CANONICAL_FEATURES & CanonicalAbiFeature::FloatValues.bit() == 0);
+const _: () = assert!(PREVIEW1_WRAPPED_CANONICAL_FEATURES == SYNC_CANONICAL_FEATURES);
+const _: () = assert!(matches!(
+    ProfileIdentity::PROFILE_2_SYNC_FLOAT.stage,
+    ProfileStage::ValidationOnly
+));
+const _: () = assert!(!ProfileIdentity::PROFILE_2_SYNC_FLOAT.execution_enabled());
+const _: () = assert!(
+    ProfileIdentity::PROFILE_2_SYNC_FLOAT.artifact_abi == PROFILE_2_SYNC_FLOAT_PROFILE_CODE
+);
+const _: () =
+    assert!(ProfileIdentity::PROFILE_2_SYNC_FLOAT.runtime_abi == PROFILE_2_SYNC_FLOAT_PROFILE_CODE);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WitPackage {
@@ -457,6 +517,112 @@ pub const SELECTED_WASI_INTERFACE_MAPPINGS: [SelectedWasiInterfaceMapping; 5] = 
     },
 ];
 
+/// Scalar float value types selected by Profile 2's validation-only contract.
+/// SIMD lanes and every adjacent numeric proposal remain outside this list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ScalarFloatType {
+    F32 = 1,
+    F64 = 2,
+}
+
+pub const PROFILE_2_SYNC_FLOAT_SCALAR_TYPES: [ScalarFloatType; 2] =
+    [ScalarFloatType::F32, ScalarFloatType::F64];
+
+/// Closed instruction-path classes for deterministic scalar NaN handling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum FloatNaNOperationClass {
+    /// Scalar arithmetic that creates or propagates a NaN.
+    Arithmetic = 1,
+    MinimumMaximum = 2,
+    SquareRoot = 3,
+    /// `ceil`, `floor`, `trunc`, and `nearest`.
+    Rounding = 4,
+    PromoteDemote = 5,
+    /// Constant folding of an operation in one of the canonicalizing classes
+    /// above. Folding value transport or sign-only operations remains in their
+    /// respective classes.
+    ConstantFold = 6,
+    /// Bit-preserving Core value transport: constants, loads, stores,
+    /// reinterpret, locals, globals, `select`, and Core calls/returns.
+    ValueTransport = 7,
+    /// `abs`, `neg`, and `copysign`.
+    AbsoluteNegateCopySign = 8,
+    /// Crossing the Component/Canonical ABI boundary, including scalar or
+    /// nested values and Component calls/returns. Component-level floats have
+    /// one abstract NaN, so lift collapses every Core NaN and lower emits the
+    /// fixed canonical bits.
+    CanonicalAbiBoundary = 9,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum FloatNaNDisposition {
+    /// Produce the fixed positive canonical quiet NaN for the result width.
+    FixedPositiveCanonicalQuiet = 1,
+    /// Preserve every input bit, including sign and NaN payload.
+    PreserveAllBits = 2,
+    /// Preserve the payload and modify only the sign bit required by the op.
+    PreservePayloadAndApplyOnlySpecifiedSign = 3,
+}
+
+/// Profile 2's strict deterministic software-float NaN contract. F1 freezes
+/// this policy as validation metadata; a later node must implement and prove
+/// every path before the profile may become runtime-ready.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum FloatNaNPolicy {
+    DeterministicCanonicalV1 = 1,
+}
+
+pub const PROFILE_2_SYNC_FLOAT_NAN_POLICY: FloatNaNPolicy =
+    FloatNaNPolicy::DeterministicCanonicalV1;
+pub const PROFILE_2_SYNC_FLOAT_F32_CANONICAL_NAN_BITS: u32 = 0x7fc0_0000;
+pub const PROFILE_2_SYNC_FLOAT_F64_CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
+
+impl FloatNaNPolicy {
+    pub const fn disposition(self, class: FloatNaNOperationClass) -> FloatNaNDisposition {
+        match self {
+            Self::DeterministicCanonicalV1 => match class {
+                FloatNaNOperationClass::Arithmetic
+                | FloatNaNOperationClass::MinimumMaximum
+                | FloatNaNOperationClass::SquareRoot
+                | FloatNaNOperationClass::Rounding
+                | FloatNaNOperationClass::PromoteDemote
+                | FloatNaNOperationClass::ConstantFold
+                | FloatNaNOperationClass::CanonicalAbiBoundary => {
+                    FloatNaNDisposition::FixedPositiveCanonicalQuiet
+                }
+                FloatNaNOperationClass::ValueTransport => FloatNaNDisposition::PreserveAllBits,
+                FloatNaNOperationClass::AbsoluteNegateCopySign => {
+                    FloatNaNDisposition::PreservePayloadAndApplyOnlySpecifiedSign
+                }
+            },
+        }
+    }
+
+    pub const fn canonical_f32_bits(self) -> u32 {
+        match self {
+            Self::DeterministicCanonicalV1 => PROFILE_2_SYNC_FLOAT_F32_CANONICAL_NAN_BITS,
+        }
+    }
+
+    pub const fn canonical_f64_bits(self) -> u64 {
+        match self {
+            Self::DeterministicCanonicalV1 => PROFILE_2_SYNC_FLOAT_F64_CANONICAL_NAN_BITS,
+        }
+    }
+
+    pub const fn software_float_required(self) -> bool {
+        matches!(self, Self::DeterministicCanonicalV1)
+    }
+
+    pub const fn cross_target_bit_determinism_required(self) -> bool {
+        matches!(self, Self::DeterministicCanonicalV1)
+    }
+}
+
 /// Proposals and baseline value classes reviewed for the private Core profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoreFeature {
@@ -490,7 +656,13 @@ pub enum CoreFeature {
 }
 
 impl CoreFeature {
+    /// Permanently frozen Profile 1 feature decision. This method remains an
+    /// alias for Profile 1 so adding later profiles cannot silently widen it.
     pub const fn enabled(self) -> bool {
+        self.enabled_in_profile_1()
+    }
+
+    pub const fn enabled_in_profile_1(self) -> bool {
         matches!(
             self,
             Self::IntegerArithmetic
@@ -503,6 +675,10 @@ impl CoreFeature {
                 | Self::ImportsExports
                 | Self::DataElements
         )
+    }
+
+    pub const fn enabled_in_profile_2_sync_float(self) -> bool {
+        self.enabled_in_profile_1() || matches!(self, Self::Float)
     }
 }
 

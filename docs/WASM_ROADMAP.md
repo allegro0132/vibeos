@@ -17,6 +17,15 @@ and remain globally deferred; C8.8 onward remains active. The decision contract
 and explicit gaps are tracked in
 [WASM_AOT_DECISION.md](WASM_AOT_DECISION.md) and [TESTING.md](../TESTING.md).
 
+**C8.8 status (2026-08-29):** F1, the first of five ordered Float
+increments, is complete only for an immutable validation-only profile identity
+and deterministic software-float semantic contract. Artifact profile code 5 is
+permanently inert: it has no current validation-engine/runtime, admission,
+execution, or durable-graph activation path and can never be promoted in place. F1 does
+not enable Float and does not complete either the Float workstream or C8.8.
+C8.8-F2 is next. F2 through F5 remain incomplete, and Milk-V Duo physical
+testing remains paused.
+
 ---
 
 ## 1. Outcome
@@ -206,6 +215,12 @@ The following start disabled:
 Features are enabled one at a time only with component validation, Core
 execution, Canonical ABI, differential, fuel, target, quota, revocation, and
 fault-containment evidence. Profile widening is an explicit ABI revision.
+
+C8.8-F1 selects only the deterministic-software-float branch for future work
+and freezes its exact semantics. It does not close C0.6's enablement gate:
+Profile 1 stays integer-only, while the reviewed backend and provenance,
+runtime conversion trap, Canonical ABI implementation, differential and fuel
+proof, and target evidence remain outstanding.
 
 ## 5. WIT and CSpace mapping
 
@@ -817,6 +832,24 @@ component security boundary is measured and stable.
 | C8.7 | Regenerate or verify native output | A pinned trusted compiler reproduces native bytes, or an equivalently reviewed verifier proves the accepted surface before execution |
 | C8.8 | Widen profiles one feature at a time | Float, SIMD, references, exceptions, memory64, multiple memories, GC, threads or broader WASI each require separate semantics and evidence |
 
+The Float widening is itself divided into five ordered increments. Completion
+of one increment does not activate code from the next:
+
+| # | Float increment | Acceptance |
+|---|---|---|
+| C8.8-F1 | Freeze contract and identity | Code 5, exact revisions and feature vector, scalar `f32`/`f64`, strict exact-bit NaN policy, Profile-1 non-widening, artifact mutation coverage, no current engine, and CGV1 rejection are frozen as metadata only |
+| C8.8-F2 | Implement deterministic Core validation and execution | A reviewed software-float Wasmi candidate with an independent package/source/checksum identity covers every scalar instruction and translator fold, stable conversion traps, limits, differential/fuzz corpus, and fuel/quantum behavior; code 5 remains inert |
+| C8.8-F3 | Implement WIT and Canonical ABI floats | `f32`/`f64` flat values and lift/lower paths close exact-bit, memory-bounds, nested-value, realloc/cleanup, hostile-input, and differential evidence without adding authority |
+| C8.8-F4 | Close default-off admission and lifecycle | Candidate-only loader/image policy, quota, revoke/cancel, fault reclamation, and durable-rejection tests pass; production code 5 remains inert |
+| C8.8-F5 | Qualify targets and review activation | Host and fixed-QEMU exact-bit/fuel evidence pass; physical-Duo qualification follows when resumed; only then may a separately numbered executable successor be reviewed |
+
+The complete F1 contract and the F2 dependency/trap gates are specified in
+[WASM_FLOAT_PROFILE.md](WASM_FLOAT_PROFILE.md). A workspace-wide
+`[patch.crates-io]` must not replace Profile 1's frozen crates.io Wasmi 1.1.0;
+F2 uses a disjoint candidate dependency identity. Before candidate Float
+execution, the currently unreachable `BadConversionToInteger` mapping must be
+replaced by a stable, ABI-versioned guest execution trap.
+
 As of 2026-08-28, C1 through C8.3 are accepted complete by historical-evidence
 policy. The completed C8.4 decision-bearing chain is the fixed-QEMU contract
 below. It reuses the live trusted-terminal boundary and private 24-sample collector
@@ -887,6 +920,8 @@ attributable to interpretation and the outcome is
 is accepted. C8.5 through C8.7 are skipped for this workload and remain
 globally deferred; they are not marked complete.
 The current implementation node is C8.8.
+C8.8-F1 is complete only as contract metadata; the current increment is
+C8.8-F2. Float and C8.8 remain incomplete.
 
 ## 10. Test and evidence matrix
 
@@ -913,6 +948,17 @@ Security-sensitive mutations must prove that the gates are live:
 - publish an async result after cancellation;
 - omit one component/module/adapter/WIT/manifest hash binding;
 - enable one unsupported component or Core feature;
+- change either fixed canonical NaN bit pattern or weaken exact-bit checking to
+  a WebAssembly allowed-set check;
+- classify a canonicalizing Float operation as transport/sign-only, canonicalize
+  a transported Core value, preserve an arbitrary NaN payload across the
+  Component/Canonical ABI boundary, or let `abs`/`neg`/`copysign` alter a
+  NaN payload;
+- make profile code 5 executable, bind it to the current engine, or admit it to
+  CGV1, durable publication, or guest invocation;
+- replace Profile 1's Wasmi dependency with a workspace-wide Cargo patch;
+- expose `BadConversionToInteger` to a Float guest while still reporting the
+  static `Validation` trap;
 - alter one durable root, graph edge, or crash-order record;
 - expose one ambient clock, random source, path, or endpoint.
 
@@ -956,7 +1002,7 @@ explicit review action, never a normal test side effect.
 | Composition hides authority flow inside adapters or nested modules | **High** | One principal before C6, typed graph inspection, per-node CSpaces, adapter import audits and atomic graph admission |
 | Broad WASI reintroduces POSIX ambient authority | **High** | Vibe WIT packages first, exact standard-interface allowlist, no global preopens/fallback namespace and negative tests |
 | Component Model and WASI revisions drift | **High** | Bind exact binary/Canonical ABI/WIT/adapter versions; revalidate on boot; version packages rather than silently upgrading |
-| Floating point conflicts with the integer-only kernel ABI | Medium | Keep the Core profile integer-only until software-float or complete target-context and differential evidence lands |
+| Floating point conflicts with the integer-only kernel ABI | Medium | Keep Profile 1 integer-only and code 5 inert until the reviewed deterministic software-float backend, strict exact-bit NaN behavior, dedicated conversion trap, Canonical ABI, differential/fuel proof, fixed-QEMU evidence, and later physical evidence all land |
 | AOT becomes unaudited native authority | **High** | Interpreter remains normative, component bytes remain authoritative, regenerate/reverify cache, sealed W^X, never accept external native bytes |
 | Content hash is mistaken for publisher authenticity | **High** | Separate integrity from signer/operator admission and document rollback limits until a hardware root exists |
 | Dynamic component state violates audited-arena no-escape | **High** | Only copied values, opaque caps and SYSTEM-owned registrations cross arenas; complete fault-reclaim evidence before C4 |

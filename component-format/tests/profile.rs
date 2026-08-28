@@ -1,11 +1,11 @@
 use vibeos_component_format::{
-    CanonicalAbiFeature, CoreFeature, LimitError, LimitKind, ProfileIdentity, ProfileStage,
-    SelectedWasiCapability, SelectedWasiInterfaceDirection, SelectedWasiMappingCategory, TrapCode,
-    ValidationAccount, ARTIFACT_ABI_VERSION, ARTIFACT_MAGIC, ASYNC_ARTIFACT_ABI_VERSION,
-    ASYNC_CANONICAL_ABI_REVISION, ASYNC_COMPONENT_MODEL_REVISION, ASYNC_RUNTIME_ABI_VERSION,
-    ASYNC_WASM_TOOLS_REVISION, CANONICAL_ABI_REVISION, COMPONENT_MODEL_REVISION,
-    COMPONENT_PROFILE_VERSION, CORE_PROFILE_VERSION,
-    NATIVE_ASYNC_RESOURCE_FREE_ARTIFACT_ABI_VERSION,
+    CanonicalAbiFeature, CoreFeature, FloatNaNDisposition, FloatNaNOperationClass, FloatNaNPolicy,
+    LimitError, LimitKind, ProfileIdentity, ProfileStage, ScalarFloatType, SelectedWasiCapability,
+    SelectedWasiInterfaceDirection, SelectedWasiMappingCategory, TrapCode, ValidationAccount,
+    ARTIFACT_ABI_VERSION, ARTIFACT_MAGIC, ASYNC_ARTIFACT_ABI_VERSION, ASYNC_CANONICAL_ABI_REVISION,
+    ASYNC_COMPONENT_MODEL_REVISION, ASYNC_RUNTIME_ABI_VERSION, ASYNC_WASM_TOOLS_REVISION,
+    CANONICAL_ABI_REVISION, COMPONENT_MODEL_REVISION, COMPONENT_PROFILE_VERSION,
+    CORE_PROFILE_VERSION, NATIVE_ASYNC_RESOURCE_FREE_ARTIFACT_ABI_VERSION,
     NATIVE_ASYNC_RESOURCE_FREE_CANONICAL_ABI_REVISION,
     NATIVE_ASYNC_RESOURCE_FREE_RUNTIME_ABI_VERSION, NATIVE_ASYNC_RESOURCE_FREE_WASI_REVISION,
     PREVIEW1_WRAPPED_ADAPTER_ASSET_BYTE_LEN, PREVIEW1_WRAPPED_ADAPTER_ASSET_NAME,
@@ -14,11 +14,18 @@ use vibeos_component_format::{
     PREVIEW1_WRAPPED_ADAPTER_REVISION, PREVIEW1_WRAPPED_ARTIFACT_ABI_VERSION,
     PREVIEW1_WRAPPED_CANONICAL_FEATURES, PREVIEW1_WRAPPED_RUNTIME_ABI_VERSION,
     PREVIEW1_WRAPPED_WASI_REVISION, PREVIEW1_WRAPPED_WASM_TOOLS_REVISION, PROFILE_1_LIMITS,
-    RUNTIME_ABI_VERSION, SELECTED_WASI_CLI_TYPES_INTERFACE, SELECTED_WASI_CLOCK_TYPES_INTERFACE,
-    SELECTED_WASI_COMMAND_STDIN_INTERFACE, SELECTED_WASI_COMMAND_STDOUT_INTERFACE,
-    SELECTED_WASI_COMMAND_WIT, SELECTED_WASI_COMMAND_WORLD, SELECTED_WASI_INTERFACE_MAPPINGS,
-    SELECTED_WASI_INVOCATION_LIFECYCLE_INTERFACE, SELECTED_WASI_MONOTONIC_CLOCK_INTERFACE,
-    SELECTED_WASI_PACKAGES, SELECTED_WASI_SECURE_RANDOM_INTERFACE, SYNC_WASM_TOOLS_REVISION,
+    PROFILE_2_SYNC_FLOAT_ARTIFACT_ABI_VERSION, PROFILE_2_SYNC_FLOAT_CANONICAL_ABI_REVISION,
+    PROFILE_2_SYNC_FLOAT_CANONICAL_FEATURES, PROFILE_2_SYNC_FLOAT_COMPONENT_PROFILE_VERSION,
+    PROFILE_2_SYNC_FLOAT_CORE_PROFILE_VERSION, PROFILE_2_SYNC_FLOAT_CORE_SPEC_REVISION,
+    PROFILE_2_SYNC_FLOAT_F32_CANONICAL_NAN_BITS, PROFILE_2_SYNC_FLOAT_F64_CANONICAL_NAN_BITS,
+    PROFILE_2_SYNC_FLOAT_NAN_POLICY, PROFILE_2_SYNC_FLOAT_PROFILE_CODE,
+    PROFILE_2_SYNC_FLOAT_RUNTIME_ABI_VERSION, PROFILE_2_SYNC_FLOAT_SCALAR_TYPES,
+    PROFILE_2_SYNC_FLOAT_WASI_REVISION, RUNTIME_ABI_VERSION, SELECTED_WASI_CLI_TYPES_INTERFACE,
+    SELECTED_WASI_CLOCK_TYPES_INTERFACE, SELECTED_WASI_COMMAND_STDIN_INTERFACE,
+    SELECTED_WASI_COMMAND_STDOUT_INTERFACE, SELECTED_WASI_COMMAND_WIT, SELECTED_WASI_COMMAND_WORLD,
+    SELECTED_WASI_INTERFACE_MAPPINGS, SELECTED_WASI_INVOCATION_LIFECYCLE_INTERFACE,
+    SELECTED_WASI_MONOTONIC_CLOCK_INTERFACE, SELECTED_WASI_PACKAGES,
+    SELECTED_WASI_SECURE_RANDOM_INTERFACE, SYNC_CANONICAL_FEATURES, SYNC_WASM_TOOLS_REVISION,
     WASI_API_REVISION, WASMPARSER_0_255_0_CHECKSUM, WASM_ENCODER_0_255_0_CHECKSUM, WIT_PACKAGES,
     WIT_PARSER_0_255_0_CHECKSUM,
 };
@@ -247,6 +254,7 @@ fn c51_validation_identity_and_feature_vector_are_exact() {
         CanonicalAbiFeature::Gc,
         CanonicalAbiFeature::Component64,
         CanonicalAbiFeature::Utf16,
+        CanonicalAbiFeature::FloatValues,
     ] {
         assert!(!feature.enabled_in_async_profile(), "{feature:?}");
     }
@@ -323,6 +331,7 @@ fn c53_native_async_resource_free_identity_and_feature_vector_are_exact() {
         CanonicalAbiFeature::Gc,
         CanonicalAbiFeature::Component64,
         CanonicalAbiFeature::Utf16,
+        CanonicalAbiFeature::FloatValues,
     ] {
         assert!(
             !feature.enabled_in_native_async_resource_free_profile(),
@@ -406,6 +415,7 @@ fn c81_preview1_wrapped_identity_adapter_and_feature_vector_are_exact() {
         CanonicalAbiFeature::Gc,
         CanonicalAbiFeature::Component64,
         CanonicalAbiFeature::Utf16,
+        CanonicalAbiFeature::FloatValues,
     ] {
         assert!(
             !feature.enabled_in_preview1_wrapped_profile(),
@@ -442,7 +452,157 @@ fn c81_preview1_wrapped_identity_adapter_and_feature_vector_are_exact() {
 }
 
 #[test]
-fn profile_starts_integer_only_and_proposal_closed() {
+fn c88_f1_sync_float_identity_and_deterministic_nan_contract_are_exact() {
+    let identity = ProfileIdentity::PROFILE_2_SYNC_FLOAT;
+
+    assert_eq!(PROFILE_2_SYNC_FLOAT_PROFILE_CODE, 5);
+    assert_eq!(PROFILE_2_SYNC_FLOAT_ARTIFACT_ABI_VERSION, 5);
+    assert_eq!(PROFILE_2_SYNC_FLOAT_RUNTIME_ABI_VERSION, 5);
+    assert_eq!(PROFILE_2_SYNC_FLOAT_COMPONENT_PROFILE_VERSION, 2);
+    assert_eq!(PROFILE_2_SYNC_FLOAT_CORE_PROFILE_VERSION, 2);
+    assert_eq!(identity.artifact_abi, 5);
+    assert_eq!(identity.runtime_abi, 5);
+    assert_eq!(identity.component_profile, 2);
+    assert_eq!(identity.core_profile, 2);
+    assert_eq!(
+        identity.core_revision,
+        PROFILE_2_SYNC_FLOAT_CORE_SPEC_REVISION
+    );
+    assert_eq!(
+        PROFILE_2_SYNC_FLOAT_CORE_SPEC_REVISION,
+        "webassembly-core-2.0-scalar-f32-f64-deterministic-software-float-v1"
+    );
+    assert_eq!(identity.component_revision, COMPONENT_MODEL_REVISION);
+    assert_eq!(
+        identity.canonical_abi_revision,
+        PROFILE_2_SYNC_FLOAT_CANONICAL_ABI_REVISION
+    );
+    assert_eq!(
+        PROFILE_2_SYNC_FLOAT_CANONICAL_ABI_REVISION,
+        "component-model-0.255.0-sync-float-values-deterministic-software-float-v1"
+    );
+    assert_eq!(identity.wasm_tools_revision, SYNC_WASM_TOOLS_REVISION);
+    assert_eq!(identity.wasi_revision, PROFILE_2_SYNC_FLOAT_WASI_REVISION);
+    assert_eq!(
+        PROFILE_2_SYNC_FLOAT_WASI_REVISION,
+        "wasi-not-selected-sync-float"
+    );
+    assert_eq!(identity.stage, ProfileStage::ValidationOnly);
+    assert!(!identity.execution_enabled());
+    assert_ne!(identity, ProfileIdentity::PROFILE_1_SYNC);
+    assert_ne!(identity, ProfileIdentity::PROFILE_1_ASYNC);
+    assert_ne!(
+        identity,
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE
+    );
+    assert_ne!(identity, ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED);
+
+    assert_eq!(
+        identity.canonical_features,
+        PROFILE_2_SYNC_FLOAT_CANONICAL_FEATURES
+    );
+    assert_eq!(identity.canonical_features.count_ones(), 4);
+    assert_eq!(
+        ProfileIdentity::PROFILE_1_SYNC.canonical_features,
+        SYNC_CANONICAL_FEATURES
+    );
+    assert_eq!(
+        SYNC_CANONICAL_FEATURES & CanonicalAbiFeature::FloatValues.bit(),
+        0
+    );
+    for feature in [
+        CanonicalAbiFeature::Utf8,
+        CanonicalAbiFeature::SyncLiftLower,
+        CanonicalAbiFeature::Resources,
+        CanonicalAbiFeature::FloatValues,
+    ] {
+        assert!(feature.enabled_in_profile_2_sync_float(), "{feature:?}");
+    }
+    for feature in [
+        CanonicalAbiFeature::AsyncFunctions,
+        CanonicalAbiFeature::CallbackLift,
+        CanonicalAbiFeature::AsyncLower,
+        CanonicalAbiFeature::Futures,
+        CanonicalAbiFeature::Streams,
+        CanonicalAbiFeature::TaskBuiltins,
+        CanonicalAbiFeature::ContextI32,
+        CanonicalAbiFeature::Subtasks,
+        CanonicalAbiFeature::CooperativeYield,
+        CanonicalAbiFeature::WaitableSets,
+        CanonicalAbiFeature::Backpressure,
+        CanonicalAbiFeature::StackfulAsync,
+        CanonicalAbiFeature::MoreAsyncBuiltins,
+        CanonicalAbiFeature::Threading,
+        CanonicalAbiFeature::ErrorContext,
+        CanonicalAbiFeature::Gc,
+        CanonicalAbiFeature::Component64,
+        CanonicalAbiFeature::Utf16,
+    ] {
+        assert!(!feature.enabled_in_profile_2_sync_float(), "{feature:?}");
+    }
+    for profile in [
+        ProfileIdentity::PROFILE_1_SYNC,
+        ProfileIdentity::PROFILE_1_ASYNC,
+        ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE,
+        ProfileIdentity::PROFILE_1_PREVIEW1_WRAPPED,
+    ] {
+        assert_eq!(
+            profile.canonical_features & CanonicalAbiFeature::FloatValues.bit(),
+            0,
+            "Profile 1 float widening: {profile:?}"
+        );
+    }
+
+    assert_eq!(
+        PROFILE_2_SYNC_FLOAT_SCALAR_TYPES,
+        [ScalarFloatType::F32, ScalarFloatType::F64]
+    );
+    assert_eq!(
+        PROFILE_2_SYNC_FLOAT_NAN_POLICY,
+        FloatNaNPolicy::DeterministicCanonicalV1
+    );
+    assert!(PROFILE_2_SYNC_FLOAT_NAN_POLICY.software_float_required());
+    assert!(PROFILE_2_SYNC_FLOAT_NAN_POLICY.cross_target_bit_determinism_required());
+    assert_eq!(PROFILE_2_SYNC_FLOAT_F32_CANONICAL_NAN_BITS, 0x7fc0_0000);
+    assert_eq!(
+        PROFILE_2_SYNC_FLOAT_NAN_POLICY.canonical_f32_bits(),
+        0x7fc0_0000
+    );
+    assert_eq!(
+        PROFILE_2_SYNC_FLOAT_F64_CANONICAL_NAN_BITS,
+        0x7ff8_0000_0000_0000
+    );
+    assert_eq!(
+        PROFILE_2_SYNC_FLOAT_NAN_POLICY.canonical_f64_bits(),
+        0x7ff8_0000_0000_0000
+    );
+    for class in [
+        FloatNaNOperationClass::Arithmetic,
+        FloatNaNOperationClass::MinimumMaximum,
+        FloatNaNOperationClass::SquareRoot,
+        FloatNaNOperationClass::Rounding,
+        FloatNaNOperationClass::PromoteDemote,
+        FloatNaNOperationClass::ConstantFold,
+        FloatNaNOperationClass::CanonicalAbiBoundary,
+    ] {
+        assert_eq!(
+            PROFILE_2_SYNC_FLOAT_NAN_POLICY.disposition(class),
+            FloatNaNDisposition::FixedPositiveCanonicalQuiet,
+            "{class:?}"
+        );
+    }
+    assert_eq!(
+        PROFILE_2_SYNC_FLOAT_NAN_POLICY.disposition(FloatNaNOperationClass::ValueTransport),
+        FloatNaNDisposition::PreserveAllBits
+    );
+    assert_eq!(
+        PROFILE_2_SYNC_FLOAT_NAN_POLICY.disposition(FloatNaNOperationClass::AbsoluteNegateCopySign),
+        FloatNaNDisposition::PreservePayloadAndApplyOnlySpecifiedSign
+    );
+}
+
+#[test]
+fn profile_1_stays_integer_only_and_profile_2_adds_only_scalar_float() {
     for feature in [
         CoreFeature::IntegerArithmetic,
         CoreFeature::StructuredControl,
@@ -455,6 +615,8 @@ fn profile_starts_integer_only_and_proposal_closed() {
         CoreFeature::DataElements,
     ] {
         assert!(feature.enabled(), "{feature:?}");
+        assert!(feature.enabled_in_profile_1(), "{feature:?}");
+        assert!(feature.enabled_in_profile_2_sync_float(), "{feature:?}");
     }
     for feature in [
         CoreFeature::Float,
@@ -477,6 +639,12 @@ fn profile_starts_integer_only_and_proposal_closed() {
         CoreFeature::Start,
     ] {
         assert!(!feature.enabled(), "{feature:?}");
+        assert!(!feature.enabled_in_profile_1(), "{feature:?}");
+        assert_eq!(
+            feature.enabled_in_profile_2_sync_float(),
+            matches!(feature, CoreFeature::Float),
+            "{feature:?}"
+        );
     }
 }
 

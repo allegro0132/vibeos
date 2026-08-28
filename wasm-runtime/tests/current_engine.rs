@@ -30,4 +30,8 @@ fn c75_core_gate_rejects_an_adjacent_profile_without_fallback() {
     let mut adjacent = ProfileIdentity::PROFILE_1_SYNC;
     adjacent.core_revision = "webassembly-core-adjacent";
     assert!(current_core_validation_engine(adjacent).is_none());
+    assert!(
+        current_core_validation_engine(ProfileIdentity::PROFILE_2_SYNC_FLOAT).is_none(),
+        "C8.8-F1 code 5 must never enter the current Core engine resolver"
+    );
 }

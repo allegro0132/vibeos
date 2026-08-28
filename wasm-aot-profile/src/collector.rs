@@ -1,8 +1,9 @@
-//! Private, allocation-free closure of one frozen physical-Duo C8.4 boot.
+//! Private, allocation-free closure of one frozen C8.4 measurement run.
 //!
-//! This module deliberately serializes only the decision-eligible physical
-//! schema. A QEMU adapter may drive the same state machine through an absorbing
-//! audit factory, but must never forward these formal bytes to its UART.
+//! The default contract serializes the decision-eligible physical-Duo schema.
+//! The explicit `qemu-decision-v1` feature selects a disjoint fixed-QEMU
+//! contract. The diagnostic QEMU adapter remains an absorbing audit factory and
+//! never forwards either contract's formal bytes to its UART.
 
 use core::cell::Cell;
 use core::marker::PhantomData;
@@ -15,22 +16,46 @@ use crate::{
     ProfileRecordSink, PublishFailure, RunId, TargetReady, TargetVerified, TranscriptBinding,
 };
 
-/// Exact number of formal samples in one cold-boot transcript.
+/// Exact number of formal samples in one measurement transcript.
 pub const BOOT_SAMPLES: u8 = 24;
-/// Exact discarded prefix in one cold-boot transcript.
+/// Exact discarded prefix in one measurement transcript.
 pub const BOOT_WARMUPS: u8 = 3;
-/// Exact retained population in one cold-boot transcript.
+/// Exact retained population in one measurement transcript.
 pub const BOOT_RETAINED: usize = 21;
 
 const META_PREFIX: &[u8] = b"VIBE_WASM_AOT_META ";
 const END_PREFIX: &[u8] = b"VIBE_WASM_AOT_END ";
+#[cfg(not(feature = "qemu-decision-v1"))]
 const RUN_ID_DOMAIN: &[u8] = b"vibeos.c84.aot-decision.run-id.v1";
+#[cfg(all(feature = "qemu-decision-v1", not(feature = "qemu-decision-v1-smoke")))]
+const RUN_ID_DOMAIN: &[u8] = b"vibeos.c84.qemu-aot-decision.run-id.v1";
+#[cfg(feature = "qemu-decision-v1-smoke")]
+const RUN_ID_DOMAIN: &[u8] = b"vibeos.c84.qemu-aot-decision.smoke.run-id.v1";
+#[cfg(not(feature = "qemu-decision-v1"))]
 const MANIFEST_SHA256: &str = "87026895f2207d85a04f5c04f11420530f1c8f922391f71915f173b18dcfd9d8";
+#[cfg(feature = "qemu-decision-v1")]
+const MANIFEST_SHA256: &str = "339bb27af9a4d24cf5440349777a2113c7ac815bc0289c2fc233426aac3402ef";
+#[cfg(not(feature = "qemu-decision-v1"))]
 const TRANSCRIPT_SCHEMA_SHA256: &str =
     "b608aa3de46aac1a73fb321babdcd4ad18ec43c60b54760f53b9e5e8d317bf3a";
+#[cfg(feature = "qemu-decision-v1")]
+const TRANSCRIPT_SCHEMA_SHA256: &str =
+    "0df879bea905ac1967685fdb411f017acf0136a69999ee031f71af76509eb520";
 const ARTIFACT_SHA256: &str = "180ed444de8b6c9ecd828b369d4c8b9f783758ef22c0b17170682d71f2fd0e72";
 const INPUT_SHA256: &str = "6b6054d492e00e68a93bc9b657a69577c7c44f5a48f169adb4124df0a50f6b3c";
 const OUTPUT_SHA256: &str = "791f3fe1339984e8a8489c12ea5ff479ac7caa07c87be451134d3af0f526bb27";
+#[cfg(not(feature = "qemu-decision-v1"))]
+const STABILITY_PERCENT: u128 = 150;
+#[cfg(feature = "qemu-decision-v1")]
+const STABILITY_PERCENT: u128 = 110;
+#[cfg(all(feature = "qemu-decision-v1", not(feature = "qemu-decision-v1-smoke")))]
+const CAPTURE_MODE: &[u8] = b"formal-publication";
+#[cfg(all(feature = "qemu-decision-v1", not(feature = "qemu-decision-v1-smoke")))]
+const DECISION_ELIGIBLE: &[u8] = b"true";
+#[cfg(feature = "qemu-decision-v1-smoke")]
+const CAPTURE_MODE: &[u8] = b"dirty-smoke-not-publication";
+#[cfg(feature = "qemu-decision-v1-smoke")]
+const DECISION_ELIGIBLE: &[u8] = b"false";
 
 /// Factory for one exclusive, initially empty formal-record sink.
 ///
@@ -60,7 +85,7 @@ pub enum CampaignError {
     ZeroRunId,
 }
 
-/// Build-bound identity shared by the three later physical cold boots.
+/// Build-bound identity shared by the selected contract's measurement run.
 ///
 /// The only public constructor reads `VIBEOS_C84_SOURCE_COMMIT` and
 /// `VIBEOS_C84_CHALLENGE` through `option_env!`. It independently derives the
@@ -322,7 +347,10 @@ pub struct BootCollector<F: ProfileRecordSinkFactory> {
 
 impl<F: ProfileRecordSinkFactory> BootCollector<F> {
     /// Publishes the next internally numbered SAMPLE. Sample 23 immediately
-    /// checks retained stability and, only on success, commits END.
+    /// checks retained stability and, only on success, returns a pending
+    /// terminal handle. END is committed only by
+    /// [`PendingEnd::commit_terminal`] after the target adapter has
+    /// completed its remaining acceptance checks.
     pub fn collect<'a>(
         mut self,
         verified: TargetVerified<'a>,
@@ -461,35 +489,12 @@ impl<F: ProfileRecordSinkFactory> BootCollector<F> {
             ));
         }
         let (p50, p95) = retained_percentiles(self.retained_ticks);
-        if u128::from(p95) * 100 > u128::from(p50) * 150 {
+        if u128::from(p95) * 100 > u128::from(p50) * STABILITY_PERCENT {
             return Err(self.poison(
                 ready,
                 RecordStage::End,
                 committed_after,
                 CollectionFailure::Fault(CollectorFault::Stability { p50, p95 }),
-            ));
-        }
-
-        let end_record = match (&mut *self.factory).begin_record() {
-            Ok(record) => record,
-            Err(error) => {
-                return Err(self.poison(
-                    ready,
-                    RecordStage::End,
-                    committed_after,
-                    CollectionFailure::Record(error),
-                ));
-            }
-        };
-        let mut end_record = ManuallyDrop::new(end_record);
-        let result = write_end(&mut *end_record, self.campaign.binding, self.accumulator)
-            .and_then(|()| end_record.commit_record());
-        if let Err(error) = result {
-            return Err(self.poison(
-                ready,
-                RecordStage::End,
-                committed_after,
-                CollectionFailure::Record(error),
             ));
         }
 
@@ -501,9 +506,13 @@ impl<F: ProfileRecordSinkFactory> BootCollector<F> {
             retained_p50: p50,
             retained_p95: p95,
         };
-        Ok(CollectionProgress::Complete(CompletedTranscript {
+        Ok(CollectionProgress::PendingTerminal(PendingTerminal {
             ready: Some(ready),
-            factory: self.factory,
+            pending_end: Some(PendingEnd {
+                factory: self.factory,
+                binding: self.campaign.binding,
+                receipt,
+            }),
             receipt,
         }))
     }
@@ -577,10 +586,10 @@ impl<'a, F: ProfileRecordSinkFactory> CollectorReady<'a, F> {
 /// Result of one successful SAMPLE publication.
 pub enum CollectionProgress<'a, F: ProfileRecordSinkFactory> {
     More(CollectorReady<'a, F>),
-    Complete(CompletedTranscript<'a, F>),
+    PendingTerminal(PendingTerminal<'a, F>),
 }
 
-/// Copy-only diagnostic receipt for a closed single-boot transcript.
+/// Copy-only diagnostic receipt for a validated single-boot sample set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BootReceipt {
     samples: u8,
@@ -617,25 +626,20 @@ impl BootReceipt {
     }
 }
 
-/// Closed transcript. The factory remains permanently inaccessible so no
-/// caller can append a second END or a 25th SAMPLE.
-#[must_use = "the recycled target Ready must be installed exactly once"]
-pub struct CompletedTranscript<'a, F: ProfileRecordSinkFactory> {
+/// A validated META + 24 SAMPLE prefix whose END is not yet committed.
+///
+/// The target adapter must split this handle, reinstall the target Ready, and
+/// retain the returned [`PendingEnd`] until all remaining acceptance checks
+/// succeed. Dropping either terminal handle permanently quarantines the record
+/// factory without writing END.
+#[must_use = "reinstall the Ready and retain the pending END exactly once"]
+pub struct PendingTerminal<'a, F: ProfileRecordSinkFactory> {
     ready: Option<TargetReady<'a>>,
-    factory: ManuallyDrop<F>,
+    pending_end: Option<PendingEnd<F>>,
     receipt: BootReceipt,
 }
 
-/// A closed transcript cannot return its factory for another record.
-///
-/// ```compile_fail
-/// fn append<F: vibeos_wasm_aot_profile::ProfileRecordSinkFactory>(
-///     completed: vibeos_wasm_aot_profile::CompletedTranscript<'_, F>,
-/// ) {
-///     let _ = completed.into_factory();
-/// }
-/// ```
-impl<'a, F: ProfileRecordSinkFactory> CompletedTranscript<'a, F> {
+impl<'a, F: ProfileRecordSinkFactory> PendingTerminal<'a, F> {
     pub const fn ready_next_epoch(&self) -> Option<u64> {
         match &self.ready {
             Some(ready) => ready.next_epoch(),
@@ -647,12 +651,132 @@ impl<'a, F: ProfileRecordSinkFactory> CompletedTranscript<'a, F> {
         self.receipt
     }
 
-    /// Recycles the target lineage while intentionally retaining the closed
-    /// factory in `ManuallyDrop`.
-    pub fn into_ready(mut self) -> TargetReady<'a> {
-        let ready = self.ready.take().expect("completed Ready consumed once");
+    /// Splits the recycled target lineage from the still-uncommitted END.
+    /// The target adapter can reinstall Ready before running fallible tail
+    /// checks without granting those checks access to the record factory.
+    pub fn into_parts(mut self) -> (TargetReady<'a>, PendingEnd<F>) {
+        let ready = self
+            .ready
+            .take()
+            .expect("pending terminal Ready consumed once");
+        let pending_end = self.pending_end.take().expect("pending END consumed once");
+        (ready, pending_end)
+    }
+}
+
+/// Exclusive authority to either commit or discard the sole terminal record.
+#[must_use = "commit or explicitly discard the pending END exactly once"]
+pub struct PendingEnd<F: ProfileRecordSinkFactory> {
+    factory: ManuallyDrop<F>,
+    binding: TranscriptBinding,
+    receipt: BootReceipt,
+}
+
+impl<F: ProfileRecordSinkFactory> PendingEnd<F> {
+    pub const fn receipt(&self) -> BootReceipt {
+        self.receipt
+    }
+
+    /// Commits the sole END record and closes the transcript.
+    ///
+    /// Any sink failure poisons the terminal authority and leaves its factory
+    /// permanently quarantined; END is never retried.
+    pub fn commit_terminal(mut self) -> Result<CompletedTerminal<F>, PoisonedTerminal<F>> {
+        let end_record = match (&mut *self.factory).begin_record() {
+            Ok(record) => record,
+            Err(error) => {
+                return Err(PoisonedTerminal::new(
+                    self.factory,
+                    CollectionFailure::Record(error),
+                    self.receipt,
+                ));
+            }
+        };
+        let mut end_record = ManuallyDrop::new(end_record);
+        let result = write_end(&mut *end_record, self.binding, self.receipt.accumulator)
+            .and_then(|()| end_record.commit_record());
+        if let Err(error) = result {
+            return Err(PoisonedTerminal::new(
+                self.factory,
+                CollectionFailure::Record(error),
+                self.receipt,
+            ));
+        }
+
+        Ok(CompletedTerminal {
+            _factory: self.factory,
+            receipt: self.receipt,
+        })
+    }
+
+    /// Abandons the incomplete transcript without acquiring or writing an END
+    /// record. The returned receipt describes only the validated sample set;
+    /// it is not proof that a complete transcript was emitted.
+    pub fn discard_terminal(self) -> BootReceipt {
         let _factory = self.factory;
-        ready
+        self.receipt
+    }
+}
+
+/// Closed terminal authority. The factory remains permanently inaccessible so
+/// no caller can append a second END.
+#[must_use = "retain the terminal receipt until acceptance is recorded"]
+pub struct CompletedTerminal<F: ProfileRecordSinkFactory> {
+    _factory: ManuallyDrop<F>,
+    receipt: BootReceipt,
+}
+
+/// A closed terminal cannot return its factory for another record.
+///
+/// ```compile_fail
+/// fn append<F: vibeos_wasm_aot_profile::ProfileRecordSinkFactory>(
+///     completed: vibeos_wasm_aot_profile::CompletedTerminal<F>,
+/// ) {
+///     let _ = completed.into_factory();
+/// }
+/// ```
+impl<F: ProfileRecordSinkFactory> CompletedTerminal<F> {
+    pub const fn receipt(&self) -> BootReceipt {
+        self.receipt
+    }
+}
+
+/// Permanently failed terminal authority. It has no retry or factory recovery
+/// surface and does not require ownership of the already-reinstalled Ready.
+#[must_use = "terminal publication failure must remain quarantined"]
+pub struct PoisonedTerminal<F: ProfileRecordSinkFactory> {
+    _factory: ManuallyDrop<F>,
+    failure: CollectionFailure<F::Error>,
+    receipt: BootReceipt,
+}
+
+impl<F: ProfileRecordSinkFactory> PoisonedTerminal<F> {
+    fn new(
+        factory: ManuallyDrop<F>,
+        failure: CollectionFailure<F::Error>,
+        receipt: BootReceipt,
+    ) -> Self {
+        Self {
+            _factory: factory,
+            failure,
+            receipt,
+        }
+    }
+
+    pub const fn stage(&self) -> RecordStage {
+        RecordStage::End
+    }
+
+    pub const fn committed_records(&self) -> u8 {
+        BOOT_SAMPLES + 1
+    }
+
+    pub const fn failure(&self) -> &CollectionFailure<F::Error> {
+        &self.failure
+    }
+
+    pub const fn receipt(&self) -> BootReceipt {
+        self.receipt
     }
 }
 
@@ -769,6 +893,7 @@ fn retained_percentiles(mut ticks: [u64; BOOT_RETAINED]) -> (u64, u64) {
     (ticks[10], ticks[19])
 }
 
+#[cfg(not(feature = "qemu-decision-v1"))]
 fn write_meta<S: ProfileRecordSink>(sink: &mut S, campaign: &Campaign) -> Result<(), S::Error> {
     sink.write_all(META_PREFIX)?;
     sink.write_all(b"{\"artifact_bytes\":2012,\"artifact_sha256\":\"")?;
@@ -788,6 +913,32 @@ fn write_meta<S: ProfileRecordSink>(sink: &mut S, campaign: &Campaign) -> Result
     sink.write_all(b"\",\"suite_id\":\"vibeos.c84.aot-decision\",\"timebase_hz\":25000000,\"transcript_schema_sha256\":\"")?;
     sink.write_all(TRANSCRIPT_SCHEMA_SHA256.as_bytes())?;
     sink.write_all(b"\",\"transcript_scope\":\"single-cold-boot\",\"version\":1,\"warmup_per_boot\":3,\"workload_id\":\"ssh-case-filter-12k-v1\",\"workload_revision\":1}\n")
+}
+
+#[cfg(feature = "qemu-decision-v1")]
+fn write_meta<S: ProfileRecordSink>(sink: &mut S, campaign: &Campaign) -> Result<(), S::Error> {
+    sink.write_all(META_PREFIX)?;
+    sink.write_all(b"{\"artifact_bytes\":2012,\"artifact_sha256\":\"")?;
+    sink.write_all(ARTIFACT_SHA256.as_bytes())?;
+    sink.write_all(b"\",\"budget_ticks\":1000000,\"capture_mode\":\"")?;
+    sink.write_all(CAPTURE_MODE)?;
+    sink.write_all(b"\",\"challenge\":\"")?;
+    write_hex(sink, &campaign.binding.challenge().bytes())?;
+    sink.write_all(b"\",\"clock\":\"riscv.rdtime\",\"decision_eligible\":")?;
+    sink.write_all(DECISION_ELIGIBLE)?;
+    sink.write_all(b",\"hart_count\":1,\"hart_id\":0,\"input_bytes\":12325,\"input_sha256\":\"")?;
+    sink.write_all(INPUT_SHA256.as_bytes())?;
+    sink.write_all(b"\",\"manifest_sha256\":\"")?;
+    sink.write_all(MANIFEST_SHA256.as_bytes())?;
+    sink.write_all(b"\",\"output_bytes\":12325,\"output_sha256\":\"")?;
+    sink.write_all(OUTPUT_SHA256.as_bytes())?;
+    sink.write_all(b"\",\"physical_provenance\":\"not-claimed\",\"platform\":\"qemu-virt-rv64-tcg-icount-v1\",\"platform_class\":\"emulator\",\"required_qemu_boots\":1,\"retained_per_boot\":21,\"run_id\":\"")?;
+    write_hex(sink, &campaign.binding.run_id().bytes())?;
+    sink.write_all(b"\",\"samples_per_boot\":24,\"schema\":\"vibeos.wasm-aot-decision.meta\",\"source_commit\":\"")?;
+    write_hex(sink, &campaign.source_commit)?;
+    sink.write_all(b"\",\"suite_id\":\"vibeos.c84.qemu-aot-decision\",\"timebase_hz\":10000000,\"transcript_schema_sha256\":\"")?;
+    sink.write_all(TRANSCRIPT_SCHEMA_SHA256.as_bytes())?;
+    sink.write_all(b"\",\"transcript_scope\":\"one-fresh-fixed-qemu-process-no-physical-claim\",\"version\":1,\"warmup_per_boot\":3,\"workload_id\":\"ssh-case-filter-12k-v1\",\"workload_revision\":1}\n")
 }
 
 fn write_end<S: ProfileRecordSink>(
@@ -847,7 +998,31 @@ mod tests {
 
     const TEST_SOURCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const TEST_CHALLENGE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    #[cfg(not(feature = "qemu-decision-v1"))]
     const TEST_RUN_ID: &str = "89be700330cb0f73f57ea5a18a8924b4ae356b7733e45c2335dbca7a80d6601a";
+    #[cfg(all(feature = "qemu-decision-v1", not(feature = "qemu-decision-v1-smoke")))]
+    const TEST_RUN_ID: &str = "778d0d6347155998628068092e55ce527fe2049b01082a0099f61d62138e047c";
+    #[cfg(feature = "qemu-decision-v1-smoke")]
+    const TEST_RUN_ID: &str = "8e196b877e4dcf562e6788ab0516c218b53959862b3b0b0bab4de758cf78d906";
+    #[cfg(not(feature = "qemu-decision-v1"))]
+    const TEST_TRANSCRIPT_BYTES: usize = 34_386;
+    #[cfg(all(feature = "qemu-decision-v1", not(feature = "qemu-decision-v1-smoke")))]
+    const TEST_TRANSCRIPT_BYTES: usize = 34_532;
+    #[cfg(feature = "qemu-decision-v1-smoke")]
+    const TEST_TRANSCRIPT_BYTES: usize = 34_542;
+    #[cfg(not(feature = "qemu-decision-v1"))]
+    const TEST_TRANSCRIPT_SHA256: &str =
+        "10df3a084b5817ee998c11e3eab0326fc2f16bdeba6644ce7e29e57c7bbc9da2";
+    #[cfg(all(feature = "qemu-decision-v1", not(feature = "qemu-decision-v1-smoke")))]
+    const TEST_TRANSCRIPT_SHA256: &str =
+        "ee94947964ea80cdbfd4df6abdcaac1bcfe65a6e397348e6728bddada64d3cdd";
+    #[cfg(feature = "qemu-decision-v1-smoke")]
+    const TEST_TRANSCRIPT_SHA256: &str =
+        "6f5dee3156f8950defd10e17a163a7919afbe90ec0249bfac17e74b498b33b69";
+    #[cfg(not(feature = "qemu-decision-v1"))]
+    const TEST_STABLE_P95: u64 = 150;
+    #[cfg(feature = "qemu-decision-v1")]
+    const TEST_STABLE_P95: u64 = 110;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum TestError {
@@ -1121,11 +1296,11 @@ mod tests {
         (ready, collector)
     }
 
-    fn run_boot<'a>(
+    fn collect_boot<'a>(
         ready: TargetReady<'a>,
         factory: TestFactory,
         totals: [u64; BOOT_SAMPLES as usize],
-    ) -> Result<CompletedTranscript<'a, TestFactory>, PoisonedTranscript<'a, TestFactory>> {
+    ) -> Result<PendingTerminal<'a, TestFactory>, PoisonedTranscript<'a, TestFactory>> {
         let (mut ready, mut collector) = begin_boot(ready, factory);
         for (index, total_ticks) in totals.into_iter().enumerate() {
             let result = collector.collect(
@@ -1137,16 +1312,81 @@ mod tests {
                     (ready, collector) = next.into_next();
                     assert_eq!(collector.next_sample, index as u8 + 1);
                 }
-                Ok(CollectionProgress::Complete(completed))
+                Ok(CollectionProgress::PendingTerminal(pending))
                     if index + 1 == usize::from(BOOT_SAMPLES) =>
                 {
-                    return Ok(completed);
+                    return Ok(pending);
                 }
                 Ok(_) => panic!("collector completed at the wrong sample"),
                 Err(poisoned) => return Err(poisoned),
             }
         }
-        panic!("24 samples did not close the transcript")
+        panic!("24 samples did not reach the pending END")
+    }
+
+    enum TestRunFailure<'a> {
+        Collection(PoisonedTranscript<'a, TestFactory>),
+        Terminal {
+            ready: TargetReady<'a>,
+            poisoned: PoisonedTerminal<TestFactory>,
+        },
+    }
+
+    impl<'a> TestRunFailure<'a> {
+        fn stage(&self) -> RecordStage {
+            match self {
+                Self::Collection(poisoned) => poisoned.stage(),
+                Self::Terminal { poisoned, .. } => poisoned.stage(),
+            }
+        }
+
+        fn committed_records(&self) -> u8 {
+            match self {
+                Self::Collection(poisoned) => poisoned.committed_records(),
+                Self::Terminal { poisoned, .. } => poisoned.committed_records(),
+            }
+        }
+
+        fn failure(&self) -> &CollectionFailure<TestError> {
+            match self {
+                Self::Collection(poisoned) => poisoned.failure(),
+                Self::Terminal { poisoned, .. } => poisoned.failure(),
+            }
+        }
+
+        fn ready_next_epoch(&self) -> Option<u64> {
+            match self {
+                Self::Collection(poisoned) => poisoned.ready_next_epoch(),
+                Self::Terminal { ready, .. } => ready.next_epoch(),
+            }
+        }
+
+        fn into_ready(self) -> TargetReady<'a> {
+            match self {
+                Self::Collection(poisoned) => poisoned.into_ready(),
+                Self::Terminal { ready, poisoned } => {
+                    drop(poisoned);
+                    ready
+                }
+            }
+        }
+    }
+
+    fn run_boot<'a>(
+        ready: TargetReady<'a>,
+        factory: TestFactory,
+        totals: [u64; BOOT_SAMPLES as usize],
+    ) -> Result<(TargetReady<'a>, CompletedTerminal<TestFactory>), TestRunFailure<'a>> {
+        match collect_boot(ready, factory, totals) {
+            Ok(pending) => {
+                let (ready, pending_end) = pending.into_parts();
+                match pending_end.commit_terminal() {
+                    Ok(completed) => Ok((ready, completed)),
+                    Err(poisoned) => Err(TestRunFailure::Terminal { ready, poisoned }),
+                }
+            }
+            Err(poisoned) => Err(TestRunFailure::Collection(poisoned)),
+        }
     }
 
     fn lower_hex(bytes: &[u8]) -> String {
@@ -1207,13 +1447,17 @@ mod tests {
             }
         }
         require_send::<BootCollector<SendFactory>>();
+        require_send::<PendingTerminal<'static, SendFactory>>();
+        require_send::<PendingEnd<SendFactory>>();
+        require_send::<CompletedTerminal<SendFactory>>();
+        require_send::<PoisonedTerminal<SendFactory>>();
     }
 
     #[test]
     fn complete_boot_emits_one_meta_twenty_four_samples_and_one_end() {
         let (mut endpoints, mut phases) = storage();
         let (factory, audit) = TestFactory::new(FailurePlan::None);
-        let completed = match run_boot(
+        let (recycled, completed) = match run_boot(
             ready(&mut endpoints, &mut phases),
             factory,
             [100; BOOT_SAMPLES as usize],
@@ -1221,7 +1465,7 @@ mod tests {
             Ok(completed) => completed,
             Err(_) => panic!("stable test boot was poisoned"),
         };
-        assert_eq!(completed.ready_next_epoch(), Some(25));
+        assert_eq!(recycled.next_epoch(), Some(25));
         let receipt = completed.receipt();
         assert_eq!(receipt.samples(), BOOT_SAMPLES);
         assert_eq!(receipt.warmups(), BOOT_WARMUPS);
@@ -1239,19 +1483,31 @@ mod tests {
         let transcript_sha256: [u8; 32] = Sha256::digest(&observed.bytes).into();
         assert_eq!(
             (observed.bytes.len(), lower_hex(&transcript_sha256)),
-            (
-                34_386,
-                String::from("10df3a084b5817ee998c11e3eab0326fc2f16bdeba6644ce7e29e57c7bbc9da2",),
-            ),
+            (TEST_TRANSCRIPT_BYTES, String::from(TEST_TRANSCRIPT_SHA256),),
         );
         let text = String::from_utf8(observed.bytes.clone())
             .unwrap_or_else(|_| panic!("formal transcript must be UTF-8"));
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 26);
+        #[cfg(not(feature = "qemu-decision-v1"))]
         let expected_meta = format!(
             "VIBE_WASM_AOT_META {{\"artifact_bytes\":2012,\"artifact_sha256\":\"{}\",\"budget_ticks\":2500000,\"challenge\":\"{}\",\"clock\":\"riscv.rdtime\",\"decision_eligible\":true,\"hart_count\":1,\"hart_id\":0,\"input_bytes\":12325,\"input_sha256\":\"{}\",\"manifest_sha256\":\"{}\",\"output_bytes\":12325,\"output_sha256\":\"{}\",\"platform\":\"milkv-duo-cv1800b\",\"required_cold_boots\":3,\"retained_per_boot\":21,\"run_id\":\"{}\",\"samples_per_boot\":24,\"schema\":\"vibeos.wasm-aot-decision.meta\",\"source_commit\":\"{}\",\"suite_id\":\"vibeos.c84.aot-decision\",\"timebase_hz\":25000000,\"transcript_schema_sha256\":\"{}\",\"transcript_scope\":\"single-cold-boot\",\"version\":1,\"warmup_per_boot\":3,\"workload_id\":\"ssh-case-filter-12k-v1\",\"workload_revision\":1}}",
             ARTIFACT_SHA256,
             TEST_CHALLENGE,
+            INPUT_SHA256,
+            MANIFEST_SHA256,
+            OUTPUT_SHA256,
+            TEST_RUN_ID,
+            TEST_SOURCE,
+            TRANSCRIPT_SCHEMA_SHA256,
+        );
+        #[cfg(feature = "qemu-decision-v1")]
+        let expected_meta = format!(
+            "VIBE_WASM_AOT_META {{\"artifact_bytes\":2012,\"artifact_sha256\":\"{}\",\"budget_ticks\":1000000,\"capture_mode\":\"{}\",\"challenge\":\"{}\",\"clock\":\"riscv.rdtime\",\"decision_eligible\":{},\"hart_count\":1,\"hart_id\":0,\"input_bytes\":12325,\"input_sha256\":\"{}\",\"manifest_sha256\":\"{}\",\"output_bytes\":12325,\"output_sha256\":\"{}\",\"physical_provenance\":\"not-claimed\",\"platform\":\"qemu-virt-rv64-tcg-icount-v1\",\"platform_class\":\"emulator\",\"required_qemu_boots\":1,\"retained_per_boot\":21,\"run_id\":\"{}\",\"samples_per_boot\":24,\"schema\":\"vibeos.wasm-aot-decision.meta\",\"source_commit\":\"{}\",\"suite_id\":\"vibeos.c84.qemu-aot-decision\",\"timebase_hz\":10000000,\"transcript_schema_sha256\":\"{}\",\"transcript_scope\":\"one-fresh-fixed-qemu-process-no-physical-claim\",\"version\":1,\"warmup_per_boot\":3,\"workload_id\":\"ssh-case-filter-12k-v1\",\"workload_revision\":1}}",
+            ARTIFACT_SHA256,
+            core::str::from_utf8(CAPTURE_MODE).expect("capture mode is ASCII"),
+            TEST_CHALLENGE,
+            core::str::from_utf8(DECISION_ELIGIBLE).expect("eligibility is ASCII"),
             INPUT_SHA256,
             MANIFEST_SHA256,
             OUTPUT_SHA256,
@@ -1280,29 +1536,132 @@ mod tests {
         assert_eq!(lines[25], expected_end);
         drop(observed);
 
-        let recycled = completed.into_ready();
         assert_eq!(recycled.next_epoch(), Some(25));
+        drop(completed);
+        drop(recycled);
         assert_eq!(audit.borrow().factory_drops, 0);
+    }
+
+    #[test]
+    fn final_sample_defers_end_until_explicit_terminal_commit() {
+        let (mut endpoints, mut phases) = storage();
+        let (factory, audit) = TestFactory::new(FailurePlan::None);
+        let pending = match collect_boot(
+            ready(&mut endpoints, &mut phases),
+            factory,
+            [100; BOOT_SAMPLES as usize],
+        ) {
+            Ok(pending) => pending,
+            Err(_) => panic!("stable sample set was poisoned"),
+        };
+        assert_eq!(pending.ready_next_epoch(), Some(25));
+        assert_eq!(pending.receipt().samples(), BOOT_SAMPLES);
+        {
+            let observed = audit.borrow();
+            assert_eq!(observed.begin_calls, 25);
+            assert_eq!(observed.commits, 25);
+            assert!(!observed
+                .bytes
+                .windows(END_PREFIX.len())
+                .any(|window| window == END_PREFIX));
+        }
+
+        let (recycled, pending_end) = pending.into_parts();
+        assert_eq!(recycled.next_epoch(), Some(25));
+        let completed = match pending_end.commit_terminal() {
+            Ok(completed) => completed,
+            Err(_) => panic!("explicit END commit failed"),
+        };
+        let observed = audit.borrow();
+        assert_eq!(observed.begin_calls, 26);
+        assert_eq!(observed.commits, 26);
+        assert_eq!(
+            observed
+                .bytes
+                .windows(END_PREFIX.len())
+                .filter(|window| *window == END_PREFIX)
+                .count(),
+            1
+        );
+        drop(observed);
+        drop(completed);
+        drop(recycled);
+    }
+
+    #[test]
+    fn discarding_or_dropping_pending_terminal_never_writes_end() {
+        let (mut endpoints, mut phases) = storage();
+        let (factory, audit) = TestFactory::new(FailurePlan::None);
+        let pending = match collect_boot(
+            ready(&mut endpoints, &mut phases),
+            factory,
+            [100; BOOT_SAMPLES as usize],
+        ) {
+            Ok(pending) => pending,
+            Err(_) => panic!("stable sample set was poisoned"),
+        };
+        let (recycled, pending_end) = pending.into_parts();
+        let receipt = pending_end.discard_terminal();
+        assert_eq!(recycled.next_epoch(), Some(25));
+        assert_eq!(receipt.samples(), BOOT_SAMPLES);
+        drop(recycled);
+        {
+            let observed = audit.borrow();
+            assert_eq!(observed.begin_calls, 25);
+            assert_eq!(observed.commits, 25);
+            assert_eq!(observed.record_drops, 0);
+            assert_eq!(observed.factory_drops, 0);
+            assert!(!observed
+                .bytes
+                .windows(END_PREFIX.len())
+                .any(|window| window == END_PREFIX));
+        }
+
+        let (mut endpoints, mut phases) = storage();
+        let (factory, dropped_audit) = TestFactory::new(FailurePlan::None);
+        let pending = match collect_boot(
+            ready(&mut endpoints, &mut phases),
+            factory,
+            [100; BOOT_SAMPLES as usize],
+        ) {
+            Ok(pending) => pending,
+            Err(_) => panic!("stable sample set was poisoned"),
+        };
+        let (recycled, pending_end) = pending.into_parts();
+        assert_eq!(recycled.next_epoch(), Some(25));
+        drop(pending_end);
+        drop(recycled);
+        let observed = dropped_audit.borrow();
+        assert_eq!(observed.begin_calls, 25);
+        assert_eq!(observed.commits, 25);
+        assert_eq!(observed.record_drops, 0);
+        assert_eq!(observed.factory_drops, 0);
+        assert!(!observed
+            .bytes
+            .windows(END_PREFIX.len())
+            .any(|window| window == END_PREFIX));
     }
 
     #[test]
     fn stability_uses_only_twenty_one_retained_nearest_rank_samples() {
         let mut passing = [100_u64; BOOT_SAMPLES as usize];
         passing[..usize::from(BOOT_WARMUPS)].fill(u64::MAX - 1);
-        passing[22] = 150;
+        passing[22] = TEST_STABLE_P95;
         passing[23] = 1_000;
         let (mut endpoints, mut phases) = storage();
         let (factory, _) = TestFactory::new(FailurePlan::None);
-        let completed = match run_boot(ready(&mut endpoints, &mut phases), factory, passing) {
-            Ok(completed) => completed,
-            Err(_) => panic!("exact 1.50 stability boundary failed"),
-        };
+        let (recycled, completed) =
+            match run_boot(ready(&mut endpoints, &mut phases), factory, passing) {
+                Ok(completed) => completed,
+                Err(_) => panic!("exact contract stability boundary failed"),
+            };
         assert_eq!(completed.receipt().retained_p50(), 100);
-        assert_eq!(completed.receipt().retained_p95(), 150);
-        drop(completed.into_ready());
+        assert_eq!(completed.receipt().retained_p95(), TEST_STABLE_P95);
+        drop(completed);
+        drop(recycled);
 
         let mut failing = [100_u64; BOOT_SAMPLES as usize];
-        failing[22] = 151;
+        failing[22] = TEST_STABLE_P95 + 1;
         failing[23] = 1_000;
         let (mut endpoints, mut phases) = storage();
         let (factory, audit) = TestFactory::new(FailurePlan::None);
@@ -1314,7 +1673,10 @@ mod tests {
         assert_eq!(poisoned.committed_records(), 25);
         assert_eq!(
             poisoned.failure(),
-            &CollectionFailure::Fault(CollectorFault::Stability { p50: 100, p95: 151 })
+            &CollectionFailure::Fault(CollectorFault::Stability {
+                p50: 100,
+                p95: TEST_STABLE_P95 + 1,
+            })
         );
         assert_eq!(poisoned.ready_next_epoch(), Some(25));
         let audit = audit.borrow();

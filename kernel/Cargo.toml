@@ -327,10 +327,11 @@ wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance = [
     "wasm-c84-ssh-managed-child-trusted-sample",
     "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
 ]
-# Default-off physical single-cold-boot collector. The exact SSH trusted
-# sample is consumed synchronously into the portable META + 24 SAMPLE + END
+# Default-off decision-record collector. The exact SSH trusted sample is
+# consumed synchronously into the selected contract's META + 24 SAMPLE + END
 # chain; no collector index, prior accumulator, or record factory escapes the
-# kernel slot boundary.
+# kernel slot boundary. Physical Duo-v1 is the profile crate's default; the
+# formal QEMU feature below selects its disjoint QEMU-v1 contract.
 wasm-c84-ssh-managed-child-single-boot-collector = [
     "wasm-c84-ssh-managed-child-trusted-sample",
 ]
@@ -342,6 +343,21 @@ wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance = [
     "wasm-c84-ssh-managed-child-single-boot-collector",
     "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
     "dep:sha2",
+]
+# Formal C8.4 fixed-QEMU decision image. It selects the narrow OpenSSH fixture,
+# the production C8.4 workload path, the disjoint QEMU-v1 wire contract, and the
+# atomic UART sink. No `*-qemu-acceptance` telemetry or acceptance-only SSIP
+# injection is inherited into the timed image.
+wasm-c84-qemu-aot-decision = [
+    "ssh-test",
+    "wasm-c84-ssh-managed-child-single-boot-collector",
+    "vibeos-wasm-aot-profile/qemu-decision-v1",
+]
+# Compile-time dirty-smoke marker layered on the complete formal QEMU image.
+# Its profile feature changes META eligibility and the run-id domain.
+wasm-c84-qemu-aot-decision-smoke = [
+    "wasm-c84-qemu-aot-decision",
+    "vibeos-wasm-aot-profile/qemu-decision-v1-smoke",
 ]
 # Default-off verified-stream consumer for the same exact SSH owner. Successful
 # samples are scanned through the kernel-private cursor and explicitly

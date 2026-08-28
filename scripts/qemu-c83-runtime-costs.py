@@ -22,6 +22,7 @@ import pathlib
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -248,11 +249,12 @@ def check_repository_state(source_commit: str, *, allow_dirty: bool) -> None:
         fail(f"formal publication requires a clean worktree:\n{preview}")
 
 
-def toolchain_pin() -> tuple[str, str]:
+def toolchain_pin(toolchain_file: pathlib.Path | None = None) -> tuple[str, str]:
+    selected = toolchain_file or TOOLCHAIN_FILE
     try:
-        document = TOOLCHAIN_FILE.read_text(encoding="utf-8")
+        document = selected.read_text(encoding="utf-8")
     except OSError as error:
-        fail(f"cannot read {TOOLCHAIN_FILE}: {error}")
+        fail(f"cannot read {selected}: {error}")
     channel = re.search(r'^channel = "([^"]+)"$', document, re.MULTILINE)
     commit = re.search(r"^# rustc-commit: ([0-9a-f]{40})$", document, re.MULTILINE)
     if channel is None or commit is None:
@@ -344,12 +346,540 @@ def link_offline_cargo_caches(source: pathlib.Path, destination: pathlib.Path) -
                 fail(f"cannot link the offline Cargo {name} cache: {error}")
 
 
-def build_kernel(source_commit: str, challenge: str) -> dict[str, object]:
-    channel, expected_rustc = toolchain_pin()
-    rustup_path = resolve_executable("rustup", "rustup")
-    cargo_path = pinned_tool(rustup_path, channel, "cargo")
-    rustc_path = pinned_tool(rustup_path, channel, "rustc")
-    rustdoc_path = pinned_tool(rustup_path, channel, "rustdoc")
+def strict_tree_identity(path: pathlib.Path, label: str) -> dict[str, object]:
+    """Hash one directory tree including names, types, modes, and file bytes."""
+
+    try:
+        requested = pathlib.Path(os.path.abspath(os.fspath(path)))
+        requested_metadata = requested.lstat()
+        if stat.S_ISLNK(requested_metadata.st_mode):
+            fail(f"{label} root cannot itself be a symbolic link: {requested}")
+        root = requested.resolve(strict=True)
+        root_metadata = root.lstat()
+    except OSError as error:
+        fail(f"cannot resolve {label} tree {path}: {error}")
+    if not stat.S_ISDIR(root_metadata.st_mode) or root.is_symlink():
+        fail(f"{label} root is not one regular directory: {root}")
+    entries: list[tuple[bytes, str, pathlib.Path, os.stat_result]] = []
+    for directory, directory_names, filenames in os.walk(root, followlinks=False):
+        base = pathlib.Path(directory)
+        for name in (*directory_names, *filenames):
+            candidate = base / name
+            try:
+                metadata = candidate.lstat()
+                relative = candidate.relative_to(root).as_posix()
+                encoded = relative.encode("utf-8", errors="strict")
+            except (OSError, UnicodeError, ValueError) as error:
+                fail(f"cannot inventory {label} entry {candidate}: {error}")
+            if stat.S_ISDIR(metadata.st_mode):
+                kind = "d"
+            elif stat.S_ISREG(metadata.st_mode):
+                if metadata.st_nlink != 1:
+                    fail(f"{label} file has multiple links: {relative}")
+                kind = "f"
+            else:
+                fail(f"{label} contains a link or special entry: {relative}")
+            entries.append((encoded, kind, candidate, metadata))
+    digest = hashlib.sha256()
+    files = 0
+    directories = 1
+    byte_count = 0
+    root_mode = stat.S_IMODE(root_metadata.st_mode)
+    digest.update((f"d\0.\0{root_mode:04o}\0" + "0\0-\n").encode("ascii"))
+    for _, kind, candidate, opened_metadata in sorted(entries, key=lambda item: item[0]):
+        relative = candidate.relative_to(root).as_posix()
+        mode = stat.S_IMODE(opened_metadata.st_mode)
+        if kind == "d":
+            directories += 1
+            size = 0
+            content_digest = "-"
+        else:
+            file_digest = hashlib.sha256()
+            size = 0
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+                os, "O_NOFOLLOW", 0
+            )
+            try:
+                descriptor = os.open(candidate, flags)
+                try:
+                    before = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(before.st_mode)
+                        or before.st_nlink != 1
+                        or before.st_dev != opened_metadata.st_dev
+                        or before.st_ino != opened_metadata.st_ino
+                    ):
+                        fail(f"{label} file changed before hashing: {relative}")
+                    while True:
+                        chunk = os.read(descriptor, 1024 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        file_digest.update(chunk)
+                    after = os.fstat(descriptor)
+                finally:
+                    os.close(descriptor)
+            except OSError as error:
+                fail(f"cannot hash {label} file {relative}: {error}")
+            if (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_nlink,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            ) != (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_nlink,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            ) or size != after.st_size:
+                fail(f"{label} file changed while hashing: {relative}")
+            content_digest = file_digest.hexdigest()
+            files += 1
+            byte_count += size
+        digest.update(
+            (
+                f"{kind}\0{relative}\0{mode:04o}\0{size}\0"
+                f"{content_digest}\n"
+            ).encode("utf-8")
+        )
+    return {
+        "policy": "strict-tree-content-mode-v1",
+        "sha256": digest.hexdigest(),
+        "files": files,
+        "directories": directories,
+        "bytes": byte_count,
+    }
+
+
+def canonical_direct_directory(path: pathlib.Path, label: str) -> pathlib.Path:
+    """Resolve a directory while rejecting an alias at the supplied leaf."""
+
+    try:
+        requested = pathlib.Path(os.path.abspath(os.fspath(path)))
+        metadata = requested.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            fail(f"{label} must be one direct non-link directory: {requested}")
+        return requested.resolve(strict=True)
+    except OSError as error:
+        fail(f"cannot resolve {label} {path}: {error}")
+
+
+def private_cargo_home_identity(
+    cargo_home: pathlib.Path, generated_config: dict[str, object]
+) -> dict[str, object]:
+    """Require the private Cargo home to contain exactly its immutable config."""
+
+    try:
+        requested = pathlib.Path(os.path.abspath(os.fspath(cargo_home)))
+        requested_metadata = requested.lstat()
+        if stat.S_ISLNK(requested_metadata.st_mode):
+            fail(f"private Cargo home cannot itself be a symbolic link: {requested}")
+        root = requested.resolve(strict=True)
+        root_metadata = root.lstat()
+        entries = tuple(root.iterdir())
+    except OSError as error:
+        fail(f"cannot inspect private Cargo home {cargo_home}: {error}")
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        fail(f"private Cargo home is not a directory: {root}")
+    if stat.S_IMODE(root_metadata.st_mode) != 0o700:
+        fail("private Cargo home must have mode 0700")
+    if [entry.name for entry in entries] != ["config.toml"]:
+        fail("private Cargo home must contain exactly config.toml")
+    config = entries[0]
+    try:
+        metadata = config.lstat()
+    except OSError as error:
+        fail(f"cannot inspect private Cargo configuration: {error}")
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o400
+    ):
+        fail("private Cargo configuration must be one 0400 regular file")
+    current = {"path": "<private-cargo-home>/config.toml", **file_identity(config)}
+    if current != generated_config:
+        fail("private Cargo configuration differs from its generated identity")
+    return {
+        "policy": "exact-private-cargo-home-config-only-v1",
+        "root_mode": "0700",
+        "entries": [
+            {
+                **current,
+                "mode": "0400",
+                "links": 1,
+            }
+        ],
+    }
+
+
+def read_direct_regular(path: pathlib.Path, label: str, expected_size: int) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or before.st_size != expected_size
+            ):
+                fail(f"{label} is not one exact-size regular file")
+            chunks: list[bytes] = []
+            remaining = expected_size
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+                if not chunk:
+                    fail(f"{label} ended before its recorded size")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if os.read(descriptor, 1):
+                fail(f"{label} exceeds its recorded size")
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        fail(f"cannot read {label}: {error}")
+    if (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    ) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
+        fail(f"{label} changed while being read")
+    return b"".join(chunks)
+
+
+def remove_private_cargo_transient_outputs(cargo_home: pathlib.Path) -> dict[str, object]:
+    """Validate, record, then remove Cargo outputs that were proven absent pre-build."""
+
+    tag_raw = (
+        b"Signature: 8a477f597d28d172789f06886806bc55\n"
+        b"# This file is a cache directory tag created by cargo.\n"
+        b"# For information about cache directory tags see "
+        b"https://bford.info/cachedir/\n"
+    )
+    try:
+        root = pathlib.Path(os.path.abspath(os.fspath(cargo_home))).resolve(strict=True)
+        observed = {candidate.name: candidate for candidate in root.iterdir()}
+        expected = {
+            "config.toml",
+            ".global-cache",
+            ".package-cache",
+            ".package-cache-mutate",
+            "registry",
+        }
+        if set(observed) != expected:
+            fail(
+                "private Cargo home post-build entry set differs: "
+                f"expected {sorted(expected)}, got {sorted(observed)}"
+            )
+        package_cache = observed[".package-cache"]
+        package_metadata = package_cache.lstat()
+        if (
+            not stat.S_ISREG(package_metadata.st_mode)
+            or package_metadata.st_nlink != 1
+            or stat.S_IMODE(package_metadata.st_mode) != 0o600
+            or package_metadata.st_size != 0
+        ):
+            fail("private Cargo .package-cache output differs")
+        if read_direct_regular(package_cache, "private Cargo .package-cache", 0):
+            fail("private Cargo .package-cache is not empty")
+        package_cache_mutate = observed[".package-cache-mutate"]
+        mutate_metadata = package_cache_mutate.lstat()
+        if (
+            not stat.S_ISREG(mutate_metadata.st_mode)
+            or mutate_metadata.st_nlink != 1
+            or stat.S_IMODE(mutate_metadata.st_mode) != 0o600
+            or mutate_metadata.st_size != 0
+        ):
+            fail("private Cargo .package-cache-mutate output differs")
+        if read_direct_regular(
+            package_cache_mutate, "private Cargo .package-cache-mutate", 0
+        ):
+            fail("private Cargo .package-cache-mutate is not empty")
+        global_cache = observed[".global-cache"]
+        global_metadata = global_cache.lstat()
+        if stat.S_IMODE(global_metadata.st_mode) != 0o600:
+            fail("private Cargo .global-cache mode differs")
+        global_raw = read_direct_regular(
+            global_cache, "private Cargo .global-cache", 57_344
+        )
+        global_sha256 = hashlib.sha256(global_raw).hexdigest()
+        if not (
+            global_raw[:16] == b"SQLite format 3\0"
+            and int.from_bytes(global_raw[16:18], "big") == 4096
+            and global_raw[18:24] == b"\x01\x01\x00\x40\x20\x20"
+            and int.from_bytes(global_raw[28:32], "big") == 14
+            and global_raw[32:40] == b"\0" * 8
+            and int.from_bytes(global_raw[44:48], "big") == 4
+            and global_raw[48:56] == b"\0" * 8
+            and int.from_bytes(global_raw[56:60], "big") == 1
+            and int.from_bytes(global_raw[60:64], "big") == 7
+            and int.from_bytes(global_raw[96:100], "big") == 3_053_002
+        ):
+            fail("private Cargo .global-cache SQLite header differs")
+        if (
+            global_sha256
+            != "66d946720de0afd44c2d5748698b700ce812830bd8a3dedaa589831610948d9d"
+        ):
+            fail("private Cargo .global-cache deterministic identity differs")
+        registry = observed["registry"]
+        registry_metadata = registry.lstat()
+        if (
+            not stat.S_ISDIR(registry_metadata.st_mode)
+            or stat.S_ISLNK(registry_metadata.st_mode)
+            or stat.S_IMODE(registry_metadata.st_mode) != 0o700
+        ):
+            fail("private Cargo registry output directory differs")
+        registry_entries = tuple(registry.iterdir())
+        if [entry.name for entry in registry_entries] != ["CACHEDIR.TAG"]:
+            fail("private Cargo registry output entry set differs")
+        tag = registry_entries[0]
+        tag_metadata = tag.lstat()
+        if stat.S_IMODE(tag_metadata.st_mode) != 0o600:
+            fail("private Cargo registry CACHEDIR.TAG mode differs")
+        observed_tag = read_direct_regular(
+            tag, "private Cargo registry CACHEDIR.TAG", len(tag_raw)
+        )
+        if observed_tag != tag_raw:
+            fail("private Cargo registry CACHEDIR.TAG bytes differ")
+        record = {
+            "policy": "fresh-pinned-cargo-runtime-outputs-validated-recorded-removed-v1",
+            "precondition": "private-home-config-only-before-cargo",
+            "entries": [
+                {
+                    "path": "<private-cargo-home>/.global-cache",
+                    "kind": "sqlite3-global-cache",
+                    "mode": "0600",
+                    "links": 1,
+                    "sha256": global_sha256,
+                    "bytes": len(global_raw),
+                    "header": {
+                        "magic": "SQLite format 3 NUL",
+                        "page_size": 4096,
+                        "write_version": 1,
+                        "read_version": 1,
+                        "database_pages": 14,
+                        "schema_format": 4,
+                        "encoding": 1,
+                        "user_version": 7,
+                        "sqlite_version": 3_053_002,
+                    },
+                },
+                {
+                    "path": "<private-cargo-home>/.package-cache",
+                    "kind": "empty-advisory-lock",
+                    "mode": "0600",
+                    "links": 1,
+                    "sha256": hashlib.sha256(b"").hexdigest(),
+                    "bytes": 0,
+                },
+                {
+                    "path": "<private-cargo-home>/.package-cache-mutate",
+                    "kind": "empty-advisory-lock",
+                    "mode": "0600",
+                    "links": 1,
+                    "sha256": hashlib.sha256(b"").hexdigest(),
+                    "bytes": 0,
+                },
+                {
+                    "path": "<private-cargo-home>/registry",
+                    "kind": "directory",
+                    "mode": "0700",
+                    "entries": [
+                        {
+                            "path": "<private-cargo-home>/registry/CACHEDIR.TAG",
+                            "kind": "cargo-cache-directory-tag",
+                            "mode": "0600",
+                            "links": 1,
+                            "sha256": hashlib.sha256(tag_raw).hexdigest(),
+                            "bytes": len(tag_raw),
+                        }
+                    ],
+                },
+            ],
+        }
+        # Nothing is removed until the complete exact output set has passed.
+        tag.unlink()
+        registry.rmdir()
+        global_cache.unlink()
+        package_cache.unlink()
+        package_cache_mutate.unlink()
+        descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        fail(f"cannot remove validated private Cargo transient outputs: {error}")
+    return record
+
+
+def root_cargo_config_absence() -> dict[str, object]:
+    candidates = (pathlib.Path("/.cargo/config"), pathlib.Path("/.cargo/config.toml"))
+    present = [str(path) for path in candidates if os.path.lexists(path)]
+    if present:
+        fail(f"Cargo filesystem-root configuration is present: {present}")
+    return {
+        "cwd": "/",
+        "candidates": [str(path) for path in candidates],
+        "all_absent": True,
+    }
+
+
+def generated_cargo_config(
+    firmware_config: pathlib.Path, private_sources: pathlib.Path
+) -> tuple[bytes, dict[str, object]]:
+    try:
+        metadata = firmware_config.lstat()
+        raw = firmware_config.read_bytes()
+    except OSError as error:
+        fail(f"cannot read materialized firmware Cargo config: {error}")
+    if not stat.S_ISREG(metadata.st_mode) or firmware_config.is_symlink():
+        fail("materialized firmware Cargo config is not a regular file")
+    if not raw.endswith(b"\n"):
+        fail("materialized firmware Cargo config must end with one newline")
+    try:
+        private_text = str(private_sources).encode("utf-8", errors="strict")
+    except UnicodeError as error:
+        fail(f"private Cargo source path is not UTF-8: {error}")
+    if any(byte < 0x20 or byte in (0x22, 0x5C, 0x7F) for byte in private_text):
+        fail("private Cargo source path cannot be encoded as a literal TOML string")
+    suffix = (
+        b"\n[cache]\n"
+        b'auto-clean-frequency = "never"\n\n'
+        b"[source.crates-io]\n"
+        b'replace-with = "vibeos-c84-private"\n\n'
+        b"[source.vibeos-c84-private]\n"
+        + b'directory = "'
+        + private_text
+        + b'"\n'
+    )
+    generated = raw + suffix
+    return generated, {
+        "path": "firmware/.cargo/config.toml",
+        **file_identity(firmware_config),
+    }
+
+
+def build_kernel(
+    source_commit: str,
+    challenge: str,
+    *,
+    firmware: pathlib.Path | None = None,
+    toolchain_file: pathlib.Path | None = None,
+    cargo_target_dir: pathlib.Path | None = None,
+    kernel_path: pathlib.Path | None = None,
+    commit_timestamp: str | None = None,
+    private_cargo_home: pathlib.Path | None = None,
+    private_cargo_sources: pathlib.Path | None = None,
+    private_crate_archives: pathlib.Path | None = None,
+    private_cargo_record: dict[str, object] | None = None,
+    expected_toolchain_tree: dict[str, object] | None = None,
+    expected_rust_src: dict[str, object] | None = None,
+    formal_rustup_home: pathlib.Path | None = None,
+    formal_host_triple: str | None = None,
+    formal_rustup_path: pathlib.Path | None = None,
+) -> dict[str, object]:
+    selected_firmware = firmware or FIRMWARE
+    selected_kernel = kernel_path or KERNEL
+    channel, expected_rustc = toolchain_pin(toolchain_file)
+    formal_values = (
+        private_cargo_home,
+        private_cargo_sources,
+        private_crate_archives,
+        private_cargo_record,
+        expected_toolchain_tree,
+        expected_rust_src,
+        formal_rustup_home,
+        formal_host_triple,
+        formal_rustup_path,
+    )
+    formal_private_build = any(value is not None for value in formal_values)
+    if formal_private_build and not all(value is not None for value in formal_values):
+        fail("formal private Cargo build options must be supplied together")
+    if formal_private_build:
+        assert expected_toolchain_tree is not None
+        assert expected_rust_src is not None
+        assert formal_rustup_home is not None
+        assert formal_host_triple is not None
+        assert formal_rustup_path is not None
+        if re.fullmatch(r"[A-Za-z0-9_-]+", formal_host_triple) is None:
+            fail("formal Rust host triple is not canonical")
+        try:
+            fixed_rustup_home = canonical_direct_directory(
+                formal_rustup_home, "formal RUSTUP_HOME"
+            )
+            toolchain_root = (
+                fixed_rustup_home
+                / "toolchains"
+                / f"{channel}-{formal_host_triple}"
+            )
+            toolchain_before = strict_tree_identity(
+                toolchain_root, "pinned Rust toolchain"
+            )
+        except OSError as error:
+            fail(f"cannot derive the formal Rust toolchain: {error}")
+        if toolchain_before != expected_toolchain_tree:
+            fail("pinned Rust toolchain tree differs from the frozen contract")
+        toolchain_root = toolchain_root.resolve(strict=True)
+        rust_src = toolchain_root / "lib/rustlib/src/rust/library"
+        rust_src_before = strict_tree_identity(rust_src, "pinned rust-src library")
+        if rust_src_before != expected_rust_src:
+            fail("pinned rust-src library differs from the frozen contract")
+        fixed_tools: dict[str, str] = {}
+        for name in ("cargo", "rustc", "rustdoc"):
+            candidate = toolchain_root / "bin" / name
+            try:
+                metadata = candidate.lstat()
+            except OSError as error:
+                fail(f"cannot inspect formal pinned {name}: {error}")
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or not os.access(candidate, os.X_OK)
+            ):
+                fail(f"formal pinned {name} is not a direct executable file")
+            fixed_tools[name] = str(candidate)
+        cargo_path = fixed_tools["cargo"]
+        rustc_path = fixed_tools["rustc"]
+        rustdoc_path = fixed_tools["rustdoc"]
+        try:
+            rustup_candidate = pathlib.Path(
+                os.path.abspath(os.fspath(formal_rustup_path))
+            ).resolve(strict=True)
+            rustup_metadata = rustup_candidate.lstat()
+        except OSError as error:
+            fail(f"cannot inspect statically recorded rustup: {error}")
+        if (
+            not stat.S_ISREG(rustup_metadata.st_mode)
+            or stat.S_ISLNK(rustup_metadata.st_mode)
+            or not os.access(rustup_candidate, os.X_OK)
+        ):
+            fail("statically recorded rustup is not an executable regular file")
+        rustup_path = str(rustup_candidate)
+    else:
+        rustup_path = resolve_executable("rustup", "rustup")
+        cargo_path = pinned_tool(rustup_path, channel, "cargo")
+        rustc_path = pinned_tool(rustup_path, channel, "rustc")
+        rustdoc_path = pinned_tool(rustup_path, channel, "rustdoc")
+        toolchain_root = pathlib.Path(cargo_path).parent.parent.resolve(strict=True)
+        toolchain_before = None
+        rust_src = None
+        rust_src_before = None
     linker = resolve_linker()
     linker_path = str(linker["invocation_path"])
     linker_resolved_path = str(linker["resolved_path"])
@@ -360,6 +890,8 @@ def build_kernel(source_commit: str, challenge: str) -> dict[str, object]:
         "rustdoc": tool_record(rustdoc_path),
         "linker": linker,
     }
+    # In formal mode the complete toolchain and rust-src trees were attested
+    # before this first Rust-tool execution. Rustup is never executed there.
     version = run_text([rustc_path, "-Vv"])
     actual = re.search(r"^commit-hash: ([0-9a-f]{40})$", version, re.MULTILINE)
     if actual is None or actual.group(1) != expected_rustc:
@@ -368,19 +900,68 @@ def build_kernel(source_commit: str, challenge: str) -> dict[str, object]:
             f"expected {expected_rustc}, got {actual.group(1) if actual else 'unavailable'}"
         )
 
-    command = [
-        rustup_path,
-        "run",
-        channel,
-        "cargo",
-        "build",
-        "--release",
-        "--locked",
-        "--offline",
-        "--no-default-features",
-        "--features",
-        FEATURE,
-    ]
+    if formal_private_build:
+        if cargo_target_dir is None:
+            fail("formal private Cargo build requires a private target directory")
+        selected_firmware = canonical_direct_directory(
+            selected_firmware, "formal firmware root"
+        )
+        cargo_target_dir = canonical_direct_directory(
+            cargo_target_dir, "formal Cargo target"
+        )
+        selected_kernel = pathlib.Path(
+            os.path.abspath(os.fspath(selected_kernel))
+        ).resolve(strict=False)
+        try:
+            selected_kernel.relative_to(cargo_target_dir)
+        except ValueError:
+            fail("formal kernel output must remain below the private target directory")
+        manifest = (selected_firmware / "Cargo.toml").resolve(strict=True)
+        firmware_config = (
+            selected_firmware.parent / ".cargo/config.toml"
+        ).resolve(strict=True)
+        source_root = selected_firmware.parent.parent.resolve(strict=True)
+        if not manifest.is_file() or not firmware_config.is_file():
+            fail("formal private Cargo build is missing its materialized configuration")
+        command = [
+            cargo_path,
+            "build",
+            "--manifest-path",
+            str(manifest),
+            "--release",
+            "--locked",
+            "--offline",
+            "--no-default-features",
+            "--features",
+            FEATURE,
+        ]
+        normalized_command = [
+            cargo_path,
+            "build",
+            "--manifest-path",
+            "<materialized-source>/firmware/qemu-virt/Cargo.toml",
+            "--release",
+            "--locked",
+            "--offline",
+            "--no-default-features",
+            "--features",
+            FEATURE,
+        ]
+    else:
+        command = [
+            rustup_path,
+            "run",
+            channel,
+            "cargo",
+            "build",
+            "--release",
+            "--locked",
+            "--offline",
+            "--no-default-features",
+            "--features",
+            FEATURE,
+        ]
+        normalized_command = command
     print(f"C8.3: building dedicated {FEATURE} image", file=sys.stderr)
     # Cargo otherwise merges $CARGO_HOME/config.toml with the reviewed local
     # configuration. Use an ephemeral, config-free home that exposes only the
@@ -388,21 +969,33 @@ def build_kernel(source_commit: str, challenge: str) -> dict[str, object]:
     # environment. This closes ambient wrappers, rustflags, profile overrides,
     # source replacement, and target-directory overrides while retaining a
     # browser-free/offline build.
-    source_cargo_home = ambient_cargo_home()
-    host_home = os.environ.get("HOME")
-    if not host_home:
-        fail("HOME is required for the sanitized Cargo build")
-    rustup_home = str(
-        pathlib.Path(
-            os.environ.get("RUSTUP_HOME", str(pathlib.Path(host_home) / ".rustup"))
-        ).expanduser().resolve(strict=True)
-    )
-    source_date_epoch = run_text(
-        ["git", "show", "-s", "--format=%ct", source_commit]
-    )
+    source_cargo_home = None if formal_private_build else ambient_cargo_home()
+    if formal_private_build:
+        if commit_timestamp is None:
+            fail("formal private Cargo build requires the attested commit timestamp")
+        source_date_epoch = commit_timestamp
+        rustup_home = None
+    else:
+        host_home = os.environ.get("HOME")
+        if not host_home:
+            fail("HOME is required for the sanitized Cargo build")
+        rustup_home = str(
+            pathlib.Path(
+                os.environ.get(
+                    "RUSTUP_HOME", str(pathlib.Path(host_home) / ".rustup")
+                )
+            ).expanduser().resolve(strict=True)
+        )
+        source_date_epoch = commit_timestamp or run_text(
+            ["git", "show", "-s", "--format=%ct", source_commit]
+        )
     if not source_date_epoch.isdigit() or int(source_date_epoch) <= 0:
         fail("preparation commit has no valid positive timestamp")
-    path_entries = minimal_build_path(rustup_path, linker_path)
+    path_entries = (
+        [str(pathlib.Path(linker_path).parent), "/usr/bin", "/bin"]
+        if formal_private_build
+        else minimal_build_path(rustup_path, linker_path)
+    )
     sanitized_linker = shutil.which("ld.lld", path=os.pathsep.join(path_entries))
     if (
         sanitized_linker is None
@@ -412,20 +1005,85 @@ def build_kernel(source_commit: str, challenge: str) -> dict[str, object]:
     ):
         fail("sanitized build PATH does not resolve the recorded ld.lld first")
     temporary_root = pathlib.Path(os.environ.get("TMPDIR", "/tmp"))
+    build_input_closure: dict[str, object] | None = None
     try:
-        with tempfile.TemporaryDirectory(
-            prefix="vibeos-c83-cargo-home-", dir=temporary_root
-        ) as temporary_name:
-            cargo_home = pathlib.Path(temporary_name) / "cargo-home"
-            isolated_home = pathlib.Path(temporary_name) / "home"
-            isolated_tmp = pathlib.Path(temporary_name) / "tmp"
-            link_offline_cargo_caches(source_cargo_home, cargo_home)
+        if formal_private_build:
+            assert private_cargo_home is not None
+            assert private_cargo_sources is not None
+            assert private_crate_archives is not None
+            assert private_cargo_record is not None
+            assert expected_toolchain_tree is not None
+            assert expected_rust_src is not None
+            cargo_home = canonical_direct_directory(
+                private_cargo_home, "private Cargo home"
+            )
+            private_sources = canonical_direct_directory(
+                private_cargo_sources, "private Cargo sources"
+            )
+            private_archives = canonical_direct_directory(
+                private_crate_archives, "private crate archives"
+            )
+            if stat.S_IMODE(cargo_home.lstat().st_mode) != 0o700:
+                fail("private Cargo home must have mode 0700")
+            if tuple(cargo_home.iterdir()):
+                fail("private Cargo home must begin empty")
+            expected_private_tree = private_cargo_record.get("tree")
+            private_before = strict_tree_identity(
+                private_sources, "private Cargo registry sources"
+            )
+            archives_before = strict_tree_identity(
+                private_archives, "private crate archives"
+            )
+            if private_before != expected_private_tree:
+                fail("private Cargo source tree differs from its lock attestation")
+            for tool in (cargo_path, rustc_path, rustdoc_path):
+                try:
+                    pathlib.Path(tool).relative_to(toolchain_root)
+                except ValueError:
+                    fail("pinned Rust tools do not share one toolchain root")
+            assert toolchain_before is not None
+            assert rust_src is not None
+            assert rust_src_before is not None
+            root_config_before = root_cargo_config_absence()
+            generated, firmware_config_record = generated_cargo_config(
+                firmware_config, private_sources
+            )
+            generated_path = cargo_home / "config.toml"
+            flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            descriptor = os.open(generated_path, flags, 0o400)
+            try:
+                view = memoryview(generated)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        fail("cannot write private Cargo configuration")
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            generated_record = {
+                "path": "<private-cargo-home>/config.toml",
+                **file_identity(generated_path),
+            }
+            cargo_home_before = private_cargo_home_identity(
+                cargo_home, generated_record
+            )
+            isolated_home = cargo_home.parent / "cargo-build-home"
+            isolated_tmp = cargo_home.parent / "cargo-build-tmp"
             isolated_home.mkdir(mode=0o700)
             isolated_tmp.mkdir(mode=0o700)
             environment = {
+                "__CARGO_TEST_LAST_USE_NOW": "1234567890",
                 "CARGO_HOME": str(cargo_home),
                 "CARGO_INCREMENTAL": "0",
                 "CARGO_NET_OFFLINE": "true",
+                "CARGO_TARGET_DIR": str(cargo_target_dir),
                 "CARGO_TERM_COLOR": "never",
                 "HOME": str(isolated_home),
                 "LANG": "C",
@@ -433,7 +1091,6 @@ def build_kernel(source_commit: str, challenge: str) -> dict[str, object]:
                 "PATH": os.pathsep.join(path_entries),
                 "RUSTC": rustc_path,
                 "RUSTDOC": rustdoc_path,
-                "RUSTUP_HOME": rustup_home,
                 "SOURCE_DATE_EPOCH": source_date_epoch,
                 "TMPDIR": str(isolated_tmp),
                 "TZ": "UTC",
@@ -441,34 +1098,172 @@ def build_kernel(source_commit: str, challenge: str) -> dict[str, object]:
                 CHALLENGE_ENV: challenge,
             }
             normalized_environment = dict(environment)
-            normalized_environment["CARGO_HOME"] = "<temporary-root>/cargo-home"
-            normalized_environment["HOME"] = "<temporary-root>/home"
-            normalized_environment["TMPDIR"] = "<temporary-root>/tmp"
+            normalized_environment["CARGO_HOME"] = "<private-cargo-home>"
+            normalized_environment["CARGO_TARGET_DIR"] = "<private-target>"
+            normalized_environment["HOME"] = "<private-build-home>"
+            normalized_environment["TMPDIR"] = "<private-build-tmp>"
             completed = subprocess.run(
-                command, cwd=FIRMWARE, env=environment, check=False
+                command,
+                cwd="/",
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                check=False,
+                umask=0o077,
             )
+            root_config_after = root_cargo_config_absence()
+            transient_outputs = remove_private_cargo_transient_outputs(cargo_home)
+            cargo_home_after = private_cargo_home_identity(
+                cargo_home, generated_record
+            )
+            private_after = strict_tree_identity(
+                private_sources, "private Cargo registry sources"
+            )
+            archives_after = strict_tree_identity(
+                private_archives, "private crate archives"
+            )
+            toolchain_after = strict_tree_identity(
+                toolchain_root, "pinned Rust toolchain"
+            )
+            rust_src_after = strict_tree_identity(rust_src, "pinned rust-src library")
+            if private_after != private_before:
+                fail("private Cargo source tree changed during build")
+            if archives_after != archives_before:
+                fail("private crate archives changed during build")
+            if toolchain_after != toolchain_before:
+                fail("pinned Rust toolchain changed during build")
+            if rust_src_after != rust_src_before:
+                fail("pinned rust-src library changed during build")
+            if file_identity(generated_path) != {
+                "sha256": generated_record["sha256"],
+                "bytes": generated_record["bytes"],
+            }:
+                fail("private Cargo configuration changed during build")
+            build_input_closure = {
+                "policy": "c84-private-build-input-closure-v1",
+                "normalized_paths": {
+                    "policy": "canonical-realpath-no-leaf-symlink-v1",
+                    "source_root": str(source_root),
+                    "manifest": str(manifest),
+                    "cargo_home": str(cargo_home),
+                    "private_crate_sources": str(private_sources),
+                    "private_crate_archives": str(private_archives),
+                    "cargo_target": str(cargo_target_dir),
+                    "toolchain_root": str(toolchain_root),
+                    "rust_src": str(rust_src),
+                },
+                "cargo_locks": private_cargo_record["cargo_locks"],
+                "private_crate_sources": {
+                    **{
+                        key: value
+                        for key, value in private_cargo_record.items()
+                        if key not in {"cargo_locks", "tree"}
+                    },
+                    "before": private_before,
+                    "after": private_after,
+                },
+                "private_crate_archives": {
+                    "root": str(private_archives),
+                    "before": archives_before,
+                    "after": archives_after,
+                },
+                "cargo_configuration": {
+                    "discovery_policy": "filesystem-root-plus-private-cargo-home-v1",
+                    "root_before": root_config_before,
+                    "root_after": root_config_after,
+                    "materialized_firmware": firmware_config_record,
+                    "generated": generated_record,
+                    "private_home_before": cargo_home_before,
+                    "private_home_after": cargo_home_after,
+                    "cargo_subprocess_umask": "0077",
+                    "transient_outputs": transient_outputs,
+                },
+                "toolchain_tree": {
+                    "root": str(toolchain_root),
+                    "before": toolchain_before,
+                    "after": toolchain_after,
+                },
+                "rust_src": {
+                    "root": str(rust_src),
+                    "relative_path": "lib/rustlib/src/rust/library",
+                    "before": rust_src_before,
+                    "after": rust_src_after,
+                    "cargo_toml": file_identity(rust_src / "Cargo.toml"),
+                    "cargo_lock": file_identity(rust_src / "Cargo.lock"),
+                },
+            }
+        else:
+            with tempfile.TemporaryDirectory(
+                prefix="vibeos-c83-cargo-home-", dir=temporary_root
+            ) as temporary_name:
+                cargo_home = pathlib.Path(temporary_name) / "cargo-home"
+                isolated_home = pathlib.Path(temporary_name) / "home"
+                isolated_tmp = pathlib.Path(temporary_name) / "tmp"
+                assert source_cargo_home is not None
+                link_offline_cargo_caches(source_cargo_home, cargo_home)
+                isolated_home.mkdir(mode=0o700)
+                isolated_tmp.mkdir(mode=0o700)
+                environment = {
+                    "CARGO_HOME": str(cargo_home),
+                    "CARGO_INCREMENTAL": "0",
+                    "CARGO_NET_OFFLINE": "true",
+                    "CARGO_TERM_COLOR": "never",
+                    "HOME": str(isolated_home),
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "PATH": os.pathsep.join(path_entries),
+                    "RUSTC": rustc_path,
+                    "RUSTDOC": rustdoc_path,
+                    "RUSTUP_HOME": rustup_home,
+                    "SOURCE_DATE_EPOCH": source_date_epoch,
+                    "TMPDIR": str(isolated_tmp),
+                    "TZ": "UTC",
+                    SOURCE_ENV: source_commit,
+                    CHALLENGE_ENV: challenge,
+                }
+                if cargo_target_dir is not None:
+                    environment["CARGO_TARGET_DIR"] = str(cargo_target_dir)
+                normalized_environment = dict(environment)
+                normalized_environment["CARGO_HOME"] = "<temporary-root>/cargo-home"
+                normalized_environment["HOME"] = "<temporary-root>/home"
+                normalized_environment["TMPDIR"] = "<temporary-root>/tmp"
+                if cargo_target_dir is not None:
+                    normalized_environment["CARGO_TARGET_DIR"] = "<private-target>"
+                completed = subprocess.run(
+                    command,
+                    cwd=selected_firmware,
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    check=False,
+                )
     except OSError as error:
         fail(f"cannot start sanitized pinned Cargo build: {error}")
     if completed.returncode != 0:
         fail(f"pinned Cargo build failed with exit {completed.returncode}")
-    if not KERNEL.is_file() or KERNEL.stat().st_size == 0:
-        fail(f"Cargo did not produce the expected kernel: {KERNEL}")
-    return {
+    if not selected_kernel.is_file() or selected_kernel.stat().st_size == 0:
+        fail(f"Cargo did not produce the expected kernel: {selected_kernel}")
+    result = {
         "channel": channel,
         "pinned_rustc_commit": expected_rustc,
         "rustc_vv": version,
         "cargo_version": run_text([cargo_path, "-V"]),
         **tool_records,
-        "cargo_command": command,
+        "cargo_command": normalized_command,
         "build_environment_policy": {
             "ambient_variables": "denied-by-default",
-            "cargo_home": "ephemeral-config-free registry/git cache links only",
+            "cargo_home": (
+                "private-generated-config-directory-source-only"
+                if formal_private_build
+                else "ephemeral-config-free registry/git cache links only"
+            ),
             "cargo_net_offline": True,
             "path_entries": path_entries,
             "allowed_names": sorted(environment),
             "normalized_values": normalized_environment,
         },
     }
+    if build_input_closure is not None:
+        result["build_input_closure"] = build_input_closure
+    return result
 
 
 def resolve_qemu(name: str) -> str:

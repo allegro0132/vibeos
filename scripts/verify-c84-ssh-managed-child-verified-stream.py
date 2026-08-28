@@ -325,8 +325,9 @@ def verify_direct_cfg(inputs: Inputs) -> None:
         ("SSH", ssh, 6, 7, 9, 14),
         # The second and third base references are the exact mutual-exclusion
         # guards shared with the trusted-sample and collector siblings. The
-        # fourth QEMU reference is the collector image's isolation guard.
-        ("kernel root", kernel_root, 0, 3, 0, 4),
+        # fourth and fifth QEMU references are the collector image's isolation
+        # guard and the disjoint formal-QEMU image guard.
+        ("kernel root", kernel_root, 0, 3, 0, 5),
     )
     for label, source, base_direct, base_all, qemu_direct, qemu_all in sources:
         rust = CORE.rust_mask(source, literals=False)
@@ -471,10 +472,10 @@ def verify_slot_typestate(source: str) -> None:
 
 
 def verify_ssh(source: str) -> None:
+    source = CORE.without_direct_feature_units(source, COLLECTOR_QEMU_FEATURE)
     source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_FEATURE)
     source = CORE.without_direct_feature_units(source, TRUSTED_SAMPLE_QEMU_FEATURE)
     source = CORE.without_direct_feature_units(source, COLLECTOR_FEATURE)
-    source = CORE.without_direct_feature_units(source, COLLECTOR_QEMU_FEATURE)
     owner = find_scope(source, r"\bimpl\s+SshExecProfileOwner\b", "SSH profile owner")
     response = find_function(owner, "response_boundary", "SSH response boundary")
     cancel = find_function(owner, "cancel", "SSH active Drop")

@@ -888,7 +888,7 @@ def verify_slot(source: str) -> None:
         "SlotState::Active{sample,child:Some(child),..}if"
         "sample.token().epoch()==epoch&&child.epoch==epoch&&matches!("
         "child.state,DelegatedChildState::Claimed|DelegatedChildState::Abandoned)"
-        "=>Some((sample.token(),child.detach)),_=>None,}}"
+        "=>{Some((sample.token(),child.detach))}_=>None,}}"
         ".ok_or(ProfileError::DelegatedChildUnavailable)?;"
         "let(token,detach)=candidate;"
         "if!detach.is_current_running_exact()&&!detach.is_current_reclaiming_exact(){"

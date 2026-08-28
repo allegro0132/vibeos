@@ -60,8 +60,8 @@ use vibeos_wasm_aot_profile::IrqCookie;
 use vibeos_wasm_aot_profile::BOOT_WARMUPS;
 #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
 use vibeos_wasm_aot_profile::{
-    BootCollector, BootReceipt, Campaign, CollectionProgress, CollectorAbort, ProfileRecordSink,
-    ProfileRecordSinkFactory, BOOT_SAMPLES,
+    BootCollector, BootReceipt, Campaign, CollectionProgress, CollectorAbort, PendingEnd,
+    ProfileRecordSink, ProfileRecordSinkFactory, BOOT_SAMPLES,
 };
 #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
 use vibeos_wasm_aot_profile::{
@@ -222,7 +222,11 @@ impl OwnerSeal {
     feature = "wasm-c84-ssh-managed-child-single-boot-collector",
     not(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")
 ))]
-struct PhysicalRecordFactory {
+/// Platform-neutral atomic UART sink for decision-bearing records.
+///
+/// The selected profile crate feature determines whether the bytes implement
+/// the retained Duo-v1 contract or the disjoint fixed-QEMU-v1 contract.
+struct AtomicUartRecordFactory {
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -230,7 +234,7 @@ struct PhysicalRecordFactory {
     feature = "wasm-c84-ssh-managed-child-single-boot-collector",
     not(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")
 ))]
-impl PhysicalRecordFactory {
+impl AtomicUartRecordFactory {
     const fn new() -> Self {
         Self {
             not_sync: PhantomData,
@@ -242,7 +246,7 @@ impl PhysicalRecordFactory {
     feature = "wasm-c84-ssh-managed-child-single-boot-collector",
     not(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")
 ))]
-impl ProfileRecordSinkFactory for PhysicalRecordFactory {
+impl ProfileRecordSinkFactory for AtomicUartRecordFactory {
     type Error = crate::tty::RawUartRecordError;
     type Record = crate::tty::RawUartRecord;
 
@@ -452,12 +456,15 @@ impl ProfileRecordSink for AuditRecord {
     feature = "wasm-c84-ssh-managed-child-single-boot-collector",
     not(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")
 ))]
-type CollectorFactory = PhysicalRecordFactory;
+type CollectorFactory = AtomicUartRecordFactory;
 #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
 type CollectorFactory = AuditRecordFactory;
 
 #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
 type KernelBootCollector = BootCollector<CollectorFactory>;
+
+#[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
+type KernelPendingEnd = PendingEnd<CollectorFactory>;
 
 #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
 enum CollectorState {
@@ -470,6 +477,31 @@ enum CollectorState {
     },
     Publishing {
         owner: OwnerSeal,
+    },
+    /// One non-final SAMPLE is durable, but the request adapter has not yet
+    /// accepted every fallible predecessor-tail gate. The recycled target and
+    /// collector remain mutually sealed so another SSH request cannot start
+    /// the next epoch before this sample is accepted.
+    PendingAcceptance {
+        collector: KernelBootCollector,
+        epoch: u64,
+        ready_epoch: u64,
+        committed_records: u8,
+    },
+    /// SAMPLE 23 and its stability gate are complete, but END remains sealed
+    /// until the request adapter finishes every fallible predecessor-tail gate.
+    PendingTerminal {
+        pending_end: KernelPendingEnd,
+        epoch: u64,
+        ready_epoch: u64,
+        committed_records: u8,
+    },
+    /// Private move tombstone while the sole pending END is being committed.
+    /// No independent path may fail or replace this state.
+    FinalizingTerminal {
+        epoch: u64,
+        ready_epoch: u64,
+        committed_records: u8,
     },
     Complete {
         receipt: BootReceipt,
@@ -1802,7 +1834,7 @@ pub(crate) fn profile_irq_acceptance_note_ssip(applied: bool) {
     not(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")
 ))]
 fn collector_factory() -> CollectorFactory {
-    PhysicalRecordFactory::new()
+    AtomicUartRecordFactory::new()
 }
 
 #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
@@ -1902,11 +1934,22 @@ fn fail_collector_state(
 ) {
     if matches!(
         state,
-        CollectorState::Failed(_) | CollectorState::Complete { .. }
+        CollectorState::Failed(_)
+            | CollectorState::FinalizingTerminal { .. }
+            | CollectorState::Complete { .. }
     ) {
         return;
     }
-    let failure = collector_failure_receipt(epoch, ready_epoch, reason);
+    let committed_records = match state {
+        CollectorState::PendingAcceptance {
+            committed_records, ..
+        }
+        | CollectorState::PendingTerminal {
+            committed_records, ..
+        } => *committed_records,
+        _ => collector_audit_commit_count(),
+    };
+    let failure = CollectorFailureReceipt::new(epoch, ready_epoch, reason, committed_records);
     let previous = mem::replace(state, CollectorState::Failed(failure));
     drop(previous);
 }
@@ -2504,12 +2547,20 @@ fn next_epoch_for_prepare() -> Result<u64, ProfileError> {
         (SlotState::Ready(_), CollectorState::Complete { .. }) => {
             Err(ProfileError::CollectorClosed)
         }
+        (SlotState::Ready(_), CollectorState::PendingAcceptance { .. })
+        | (SlotState::Ready(_), CollectorState::PendingTerminal { .. })
+        | (SlotState::Ready(_), CollectorState::FinalizingTerminal { .. }) => {
+            Err(ProfileError::Busy)
+        }
         (SlotState::Ready(_), CollectorState::Failed(_)) => Err(ProfileError::CollectorFailed),
         (SlotState::Uninitialized | SlotState::CollectorInitializing, _) => {
             Err(ProfileError::Uninitialized)
         }
         (SlotState::Poisoned(reason), _) => Err(ProfileError::Poisoned(*reason)),
         (_, CollectorState::Complete { .. }) => Err(ProfileError::CollectorClosed),
+        (_, CollectorState::PendingAcceptance { .. })
+        | (_, CollectorState::PendingTerminal { .. })
+        | (_, CollectorState::FinalizingTerminal { .. }) => Err(ProfileError::Busy),
         (_, CollectorState::Failed(_)) => Err(ProfileError::CollectorFailed),
         _ => {
             let epoch = match &*collector_slot {
@@ -4678,7 +4729,10 @@ pub(crate) fn managed_child_cancel_bypasses_host(epoch: u64) -> Result<bool, Pro
                 && matches!(
                     child.state,
                     DelegatedChildState::Claimed | DelegatedChildState::Abandoned
-                ) => Some((sample.token(), child.detach)),
+                ) =>
+            {
+                Some((sample.token(), child.detach))
+            }
             _ => None,
         }
     }
@@ -5992,7 +6046,7 @@ impl TrustedVerifiedSample {
 pub(crate) struct CollectorTerminalReceipt {
     epoch: u64,
     ready_epoch: u64,
-    audit_commits: u8,
+    committed_records: u8,
     armed: bool,
     #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
     audit: Option<CollectorAuditTerminal>,
@@ -6010,7 +6064,11 @@ impl Drop for CollectorTerminalReceipt {
     fn drop(&mut self) {
         if self.armed {
             self.armed = false;
-            collector_fail_unfinalized_terminal(self.epoch, self.ready_epoch, self.audit_commits);
+            collector_fail_unfinalized_terminal(
+                self.epoch,
+                self.ready_epoch,
+                self.committed_records,
+            );
         }
     }
 }
@@ -6020,15 +6078,16 @@ struct CollectorAuditTerminal {
     epoch: u64,
     sequence: u8,
     sample: AuditCommit,
-    end: Option<(AuditCommit, BootReceipt)>,
+    pending_boot: Option<BootReceipt>,
 }
 
-/// A successful portable commit is not a successful SSH acceptance until all
-/// frozen predecessor observations have been emitted. If that infallible tail
-/// is abandoned, consume the private receipt and permanently close the
-/// campaign as Failed while preserving its already-recycled Ready authority.
+/// A successful SAMPLE commit is not a successful SSH acceptance until all
+/// frozen predecessor observations have passed. If that fallible tail is
+/// abandoned, consume the private receipt and its sealed collector/END
+/// authority, emit no later record, and permanently close the campaign as
+/// Failed while preserving its already-recycled Ready authority.
 #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
-fn collector_fail_unfinalized_terminal(epoch: u64, ready_epoch: u64, audit_commits: u8) {
+fn collector_fail_unfinalized_terminal(epoch: u64, ready_epoch: u64, committed_records: u8) {
     let slot = SLOT.lock();
     let mut collector_slot = COLLECTOR.lock();
     let exact_ready = matches!(
@@ -6047,19 +6106,57 @@ fn collector_fail_unfinalized_terminal(epoch: u64, ready_epoch: u64, audit_commi
     if let CollectorState::Failed(receipt) = &mut *collector_slot {
         if receipt.epoch == epoch {
             receipt.ready_epoch = ready_epoch;
-            receipt.absorb_committed_records(audit_commits);
+            receipt.absorb_committed_records(committed_records);
         }
         return;
     }
-    // The SAMPLE (and, for the final target, END) was already committed before
-    // the frozen predecessor tail received this receipt. Its committed-record
-    // count, not the attempted epoch, is therefore the sole next-sequence
-    // authority for a terminal-tail failure.
+    let final_prefix_records = BOOT_SAMPLES
+        .checked_add(1)
+        .expect("META plus 24 samples fits u8");
+    let exact_pending = match &*collector_slot {
+        CollectorState::PendingAcceptance {
+            epoch: pending_epoch,
+            ready_epoch: pending_ready_epoch,
+            committed_records: pending_records,
+            ..
+        } => {
+            *pending_epoch == epoch
+                && *pending_ready_epoch == ready_epoch
+                && *pending_records == committed_records
+                && *pending_records < final_prefix_records
+        }
+        CollectorState::PendingTerminal {
+            epoch: pending_epoch,
+            ready_epoch: pending_ready_epoch,
+            committed_records: pending_records,
+            ..
+        } => {
+            *pending_epoch == epoch
+                && *pending_ready_epoch == ready_epoch
+                && *pending_records == committed_records
+                && *pending_records == final_prefix_records
+        }
+        _ => false,
+    };
+    if !exact_pending {
+        fail_collector_state(
+            &mut collector_slot,
+            epoch,
+            ready_epoch,
+            CollectorFailureReason::StateMismatch,
+        );
+        return;
+    }
+    // The SAMPLE was already committed before the frozen predecessor tail
+    // received this receipt. PendingAcceptance owns the only collector that
+    // can write the next SAMPLE; PendingTerminal owns the still-unwritten END.
+    // Replacing either state below drops that authority without another sink
+    // call. The committed-record count remains the sole next-sequence seal.
     let failed = CollectorState::Failed(CollectorFailureReceipt::new(
         epoch,
         ready_epoch,
         CollectorFailureReason::StateMismatch,
-        audit_commits,
+        committed_records,
     ));
     let previous = mem::replace(&mut *collector_slot, failed);
     drop(previous);
@@ -6291,7 +6388,7 @@ pub(crate) fn collect_trusted_sample(
                     epoch: owner.epoch,
                     sequence,
                     sample,
-                    end: None,
+                    pending_boot: None,
                 }
             };
             let mut slot = SLOT.lock();
@@ -6314,12 +6411,20 @@ pub(crate) fn collect_trusted_sample(
                     CollectorFailureReason::StateMismatch,
                 );
             }
+            let committed_records = sequence
+                .checked_add(2)
+                .expect("C8.4 sample commit count remains within 25 records");
             *slot = SlotState::Ready(ready);
-            *collector_slot = CollectorState::Ready(collector);
+            *collector_slot = CollectorState::PendingAcceptance {
+                collector,
+                epoch: owner.epoch,
+                ready_epoch,
+                committed_records,
+            };
             Ok(CollectorTerminalReceipt {
                 epoch: owner.epoch,
                 ready_epoch,
-                audit_commits: collector_audit_commit_count(),
+                committed_records,
                 armed: true,
                 #[cfg(
                     feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
@@ -6327,14 +6432,18 @@ pub(crate) fn collect_trusted_sample(
                 audit: Some(audit),
             })
         }
-        Ok(CollectionProgress::Complete(completed)) => {
-            let ready_epoch = completed.ready_next_epoch();
-            let receipt = completed.receipt();
-            let ready = completed.into_ready();
+        Ok(CollectionProgress::PendingTerminal(pending)) => {
+            let ready_epoch = pending.ready_next_epoch();
+            #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
+            let boot_receipt = pending.receipt();
+            let (ready, pending_end) = pending.into_parts();
+            let committed_records = BOOT_SAMPLES
+                .checked_add(1)
+                .expect("META plus 24 samples fits u8");
             let ready_epoch = match ready_epoch {
                 Some(ready_epoch) => ready_epoch,
                 None => {
-                    let committed_records = collector_audit_commit_count();
+                    let _ = pending_end.discard_terminal();
                     return match install_collector_failure(
                         owner,
                         ready,
@@ -6351,7 +6460,7 @@ pub(crate) fn collect_trusted_sample(
                 let expected_commit = match sequence.checked_add(2) {
                     Some(expected) => expected,
                     None => {
-                        let committed_records = collector_audit_commit_count();
+                        let _ = pending_end.discard_terminal();
                         return match install_collector_failure(
                             owner,
                             ready,
@@ -6366,22 +6475,7 @@ pub(crate) fn collect_trusted_sample(
                 let sample = match collector_take_audit(expected_commit) {
                     Ok(sample) => sample,
                     Err(_) => {
-                        let committed_records = collector_audit_commit_count();
-                        return match install_collector_failure(
-                            owner,
-                            ready,
-                            committed_records,
-                            CollectorFailureReason::StateMismatch,
-                        ) {
-                            Ok(()) => Err(ProfileError::CollectorFailed),
-                            Err(error) => Err(error),
-                        };
-                    }
-                };
-                let end = match collector_take_audit(26) {
-                    Ok(end) => end,
-                    Err(_) => {
-                        let committed_records = collector_audit_commit_count();
+                        let _ = pending_end.discard_terminal();
                         return match install_collector_failure(
                             owner,
                             ready,
@@ -6397,10 +6491,9 @@ pub(crate) fn collect_trusted_sample(
                     epoch: owner.epoch,
                     sequence,
                     sample,
-                    end: Some((end, receipt)),
+                    pending_boot: Some(boot_receipt),
                 }
             };
-            let audit_commits = collector_audit_commit_count();
             let mut slot = SLOT.lock();
             let mut collector_slot = COLLECTOR.lock();
             let exact = matches!(
@@ -6414,10 +6507,11 @@ pub(crate) fn collect_trusted_sample(
             if !exact || ready.next_epoch() != Some(ready_epoch) {
                 drop(collector_slot);
                 drop(slot);
+                let _ = pending_end.discard_terminal();
                 return match install_collector_failure(
                     owner,
                     ready,
-                    audit_commits,
+                    committed_records,
                     CollectorFailureReason::StateMismatch,
                 ) {
                     Ok(()) => Err(ProfileError::CollectorFailed),
@@ -6425,15 +6519,16 @@ pub(crate) fn collect_trusted_sample(
                 };
             }
             *slot = SlotState::Ready(ready);
-            *collector_slot = CollectorState::Complete {
-                receipt,
+            *collector_slot = CollectorState::PendingTerminal {
+                pending_end,
+                epoch: owner.epoch,
                 ready_epoch,
-                audit_commits,
+                committed_records,
             };
             Ok(CollectorTerminalReceipt {
                 epoch: owner.epoch,
                 ready_epoch,
-                audit_commits,
+                committed_records,
                 armed: true,
                 #[cfg(
                     feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
@@ -6458,7 +6553,9 @@ pub(crate) fn collect_trusted_sample(
 }
 
 #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
-pub(crate) fn collector_emit_success(mut receipt: CollectorTerminalReceipt) {
+pub(crate) fn collector_emit_success(
+    mut receipt: CollectorTerminalReceipt,
+) -> Result<(), ProfileError> {
     #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
     let audit = receipt
         .audit
@@ -6471,11 +6568,127 @@ pub(crate) fn collector_emit_success(mut receipt: CollectorTerminalReceipt) {
         audit.sequence,
         receipt.ready_epoch,
     );
-    #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
-    if let Some((end, boot)) = audit.end {
-        collector_audit_end(end, boot, receipt.ready_epoch);
+
+    let final_prefix_records = BOOT_SAMPLES
+        .checked_add(1)
+        .expect("META plus 24 samples fits u8");
+    let slot = SLOT.lock();
+    let mut collector_slot = COLLECTOR.lock();
+    let exact_ready = matches!(
+        &*slot,
+        SlotState::Ready(ready) if ready.next_epoch() == Some(receipt.ready_epoch)
+    );
+    if !exact_ready {
+        drop(collector_slot);
+        drop(slot);
+        return Err(ProfileError::StateMismatch);
     }
+
+    if receipt.committed_records < final_prefix_records {
+        let exact_pending = matches!(
+            &*collector_slot,
+            CollectorState::PendingAcceptance {
+                epoch,
+                ready_epoch,
+                committed_records,
+                ..
+            } if *epoch == receipt.epoch
+                && *ready_epoch == receipt.ready_epoch
+                && *committed_records == receipt.committed_records
+        );
+        if !exact_pending {
+            drop(collector_slot);
+            drop(slot);
+            return Err(ProfileError::StateMismatch);
+        }
+        let previous = mem::replace(&mut *collector_slot, CollectorState::Initializing);
+        let CollectorState::PendingAcceptance { collector, .. } = previous else {
+            unreachable!("exact pending acceptance was checked under the same lock");
+        };
+        *collector_slot = CollectorState::Ready(collector);
+        receipt.armed = false;
+        drop(collector_slot);
+        drop(slot);
+        return Ok(());
+    }
+
+    let exact_pending = matches!(
+        &*collector_slot,
+        CollectorState::PendingTerminal {
+            epoch,
+            ready_epoch,
+            committed_records,
+            ..
+        } if *epoch == receipt.epoch
+            && *ready_epoch == receipt.ready_epoch
+            && *committed_records == receipt.committed_records
+            && *committed_records == final_prefix_records
+    );
+    if !exact_pending {
+        drop(collector_slot);
+        drop(slot);
+        return Err(ProfileError::StateMismatch);
+    }
+
+    let previous = mem::replace(
+        &mut *collector_slot,
+        CollectorState::FinalizingTerminal {
+            epoch: receipt.epoch,
+            ready_epoch: receipt.ready_epoch,
+            committed_records: receipt.committed_records,
+        },
+    );
+    let CollectorState::PendingTerminal { pending_end, .. } = previous else {
+        unreachable!("exact pending END was checked under the same lock");
+    };
+
+    let completed = match pending_end.commit_terminal() {
+        Ok(completed) => completed,
+        Err(poisoned) => {
+            let committed_records = poisoned.committed_records();
+            drop(poisoned);
+            *collector_slot = CollectorState::Failed(CollectorFailureReceipt::new(
+                receipt.epoch,
+                receipt.ready_epoch,
+                CollectorFailureReason::Collection,
+                committed_records,
+            ));
+            receipt.armed = false;
+            return Err(ProfileError::CollectorFailed);
+        }
+    };
+    let boot = completed.receipt();
+    drop(completed);
+    let committed_records = final_prefix_records
+        .checked_add(1)
+        .expect("META, 24 samples, and END fit u8");
+    #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
+    let end = match collector_take_audit(committed_records) {
+        Ok(end) if audit.pending_boot == Some(boot) => end,
+        _ => {
+            *collector_slot = CollectorState::Failed(CollectorFailureReceipt::new(
+                receipt.epoch,
+                receipt.ready_epoch,
+                CollectorFailureReason::StateMismatch,
+                committed_records,
+            ));
+            receipt.armed = false;
+            return Err(ProfileError::CollectorFailed);
+        }
+    };
+    *collector_slot = CollectorState::Complete {
+        receipt: boot,
+        ready_epoch: receipt.ready_epoch,
+        audit_commits: committed_records,
+    };
+    // From this point the state and UART transcript are both closed. Disarm
+    // before releasing either lock or emitting diagnostic-only audit telemetry.
     receipt.armed = false;
+    drop(collector_slot);
+    drop(slot);
+    #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]
+    collector_audit_end(end, boot, receipt.ready_epoch);
+    Ok(())
 }
 
 #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")]

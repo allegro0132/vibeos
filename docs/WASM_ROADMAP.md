@@ -6,13 +6,14 @@ VibeOS. It complements [BLUEPRINT.md](BLUEPRINT.md),
 [CAPABILITY_SHELL.md](CAPABILITY_SHELL.md), and
 [PROGRAM_PERSISTENCE.md](PROGRAM_PERSISTENCE.md).
 
-**Status (2026-08-27): implementation in progress.** The repository now contains
+**Status (2026-08-28): implementation in progress.** The repository now contains
 bounded Core validation/execution, Component decoding and Canonical ABI,
 admission/loading, compatibility, and C8 profiling evidence. The dependency
 sequence and acceptance text below remain the roadmap rather than a claim that
-every milestone is complete. Current C8.3/C8.4 evidence and its explicit
-remaining gaps are tracked in [WASM_AOT_DECISION.md](WASM_AOT_DECISION.md) and
-[TESTING.md](../TESTING.md).
+every milestone is complete. C1 through C8.3 are accepted complete under the
+historical-evidence policy; C8.4 onward remains active. Its fixed-QEMU decision
+contract and explicit gaps are tracked in
+[WASM_AOT_DECISION.md](WASM_AOT_DECISION.md) and [TESTING.md](../TESTING.md).
 
 ---
 
@@ -808,37 +809,73 @@ component security boundary is measured and stable.
 | C8.1 | Adapt legacy WASIp1 off-device | A pinned Preview-1 adapter wraps a Core module into an admitted component; VibeOS still accepts the component artifact, not a raw ambient WASIp1 process |
 | C8.2 | Support a bounded compatibility corpus | Checked-in Rust and C stdin/stdout filters run unchanged through selected CLI streams/arguments/exit; paths, processes, mutable environment, threads and raw sockets remain absent |
 | C8.3 | Publish runtime costs | Report validation, startup, lift/lower, async, composition, host-call, memory, fuel and cancellation/revocation costs on fixed QEMU and physical-Duo baselines |
-| C8.4 | Decide whether AOT is justified per workload | AOT proceeds only when a named product workload misses a frozen budget and profiling attributes the miss to interpretation |
+| C8.4 | Decide whether AOT is justified per workload | A verified miss attributed to interpretation may open C8.5 design review only; C8.4 never authorizes AOT or accepts native bytes |
 | C8.5 | Treat AOT as a rebuildable cache | Original component/Core bytes and policy remain authoritative; cache mismatch discards native code and never widens WIT imports or rights |
 | C8.6 | Reuse the sealed W^X lifecycle | Link RW-NX, validate imports/relocations, seal X-only, execute, quiesce, unseal, zero and reclaim; no JIT or RWX page exists |
 | C8.7 | Regenerate or verify native output | A pinned trusted compiler reproduces native bytes, or an equivalently reviewed verifier proves the accepted surface before execution |
 | C8.8 | Widen profiles one feature at a time | Float, SIMD, references, exceptions, memory64, multiple memories, GC, threads or broader WASI each require separate semantics and evidence |
 
-As of 2026-08-27, the C8.4 chain includes the live trusted-terminal boundary
-and the private 24-sample collector, now a build-bound single-cold-boot
-protocol. The collector closes META + 24 SAMPLE + END locally, with three warmups, 21
-retained samples, an absorbing Failed/Closed state, atomic physical UART
-records, and a separate QEMU audit sink whose markers explicitly carry
-`decision_eligible=0 formal_uart=0`. The software-side independent
-frozen-source envelope, build/package envelopes, host-observed Docker runtime
-closure, full-SD-image verifier, read-only three-boot capture program,
-immutable C8.3 precondition, and final 63-sample evidence verifier are
-implemented and covered by host-only synthetic tests. Those tests use no
-device, Docker, network, flash, reset, or physical cold boot. Package preflight
-and the independent image verifier validate their own package/verify runtime
-attestations before using the container-mounted source verifier; the
-independent verifier also completely validates the package attestation to
-which its image audit remains bound.
+As of 2026-08-28, C1 through C8.3 are accepted complete by historical-evidence
+policy. The current C8.4 decision-bearing chain is the fixed-QEMU contract
+below. It reuses the live trusted-terminal boundary and private 24-sample collector
+to emit META + 24 SAMPLE + END through the platform-neutral atomic UART sink,
+with three warmups and 21 retained samples. Formal and dirty-smoke builds are
+compile-time and wire-distinct; an independent host verifier closes the exact
+workload, transcript, source, helper, QEMU, OpenSBI, OpenSSH, and publication
+envelopes. Formal builds use an exact commit-plus-gitlink object export and a
+fresh private Cargo target; a sanitized remote query proves the preparation
+commit is actually advertised. Only byte-identical private copies of frozen
+QEMU/OpenSBI plus the kernel are executed; pinned `/usr/bin/ssh` executes in
+place only after repeated Darwin sealed/read-only APFS, ownership, mode, link,
+`SF_RESTRICTED`, same-device, version, hash, and byte-length attestation.
+The formal build additionally audits the project and pinned rust-src
+`Cargo.lock` files into a conflict-free 213-package union and consumes only
+checksum/inventory-verified sources through one private read-only directory
+source. It runs absolute Cargo from `/`, never executes rustup, and closes the
+complete nightly toolchain, rust-src, crate-source, and non-system `ld.lld`
+Mach-O runtime trees before and after compilation. Its private Cargo home is
+config-only before and after: deterministic `.global-cache`, package-lock, and
+cache-tag runtime outputs are exact-gated, recorded, removed, and fsynced;
+unknown entries fail closed.
+Each committed non-final SAMPLE is fenced by `PendingAcceptance`. SAMPLE 23
+and the stability gate split Ready25 from the sole PendingEnd authority, but
+`PendingTerminal` keeps Ready25 unstartable until all remaining fallible
+request-tail checks pass and the finalizer commits END; abandonment or END
+failure is absorbing and never retries.
+The firmware search, QEMU version probe, and live process share one manifest-frozen,
+deny-by-default environment with exact locale, timezone, and `PATH` values and
+fresh private campaign-local `HOME`, `TMPDIR`, and `XDG_CONFIG_HOME`; ambient
+`DYLD_*`, `QEMU_*`, and user configuration are absent. OpenSSH is not resolved
+through `PATH`. A dedicated `/bin/sh` launcher pins CPython 3.14.6 with
+`-I -B -S`, an absent `/var/empty` pycache sink, a deterministic reachable
+stdlib/lib-dynload inventory, the Framework and Python.app executable, and
+exact `_hashlib`/libcrypto, `_lzma`/liblzma, and `_zstd`/libzstd identities;
+fixed empty OpenSSL configuration/provider inputs prevent ambient loading.
+Dynamic maintained helpers execute only stable UTF-8 source snapshots and
+propagate their actual hashes through the peer closure; ignored bytecode and
+site customization cannot become decision inputs. The 10 MHz decision clock
+is statically closed through `live_tick -> sbi::time -> rdtime` and the QEMU
+board constant. The earlier absorbing QEMU audit sink remains a separate
+integration-only test and cannot enter either decision dataset.
 
-Milk-V Duo physical testing is paused at operator request. Consequently, C8.3
-still lacks its three physical-Duo cold boots, C8.4 still lacks three attested
-cold boots and 63 retained physical samples, and neither row is complete. No
-workload-specific AOT decision exists; the final workload-specific AOT decision
-remains open and may not be inferred from software self-tests or QEMU
-diagnostics. Independent source materialization and local Docker runtime
-custody are now closed prerequisites in the software path. They remain
-software evidence only and do not attest hardware identity, a remote host, or
-a physical cold boot. C8.5 remains gated on a future verified C8.4 result.
+The retained physical-Duo chain remains implemented but non-blocking: it has
+the build-bound single-cold-boot protocol, three-boot/63-sample aggregation,
+independent frozen-source and build/package envelopes, host-observed Docker
+runtime closure, full-SD-image verifier, read-only capture program, and final
+evidence verifier. Its host-only synthetic tests use no device, network, flash,
+reset, or physical cold boot and establish no physical provenance.
+
+Milk-V Duo physical testing is paused at operator request. The retained
+physical contract and tooling remain available but are no longer a C8.4
+prerequisite. The decision-bearing replacement is the disjoint
+`qemu-virt-rv64-tcg-icount-v1` contract: one fresh QEMU process, 3 warmups, 21
+retained samples, 10 MHz `rdtime`, a pre-frozen 1,000,000-tick budget, and a
+1.10 retained stability ceiling. It uses a separate suite, schema, and run-id
+domain and explicitly records `platform_class=emulator` and
+`physical_provenance=not-claimed`; it cannot be presented as Duo evidence.
+Preparation is in progress and no workload-specific AOT decision exists yet.
+C8.5 remains gated on the future verified fixed-QEMU result and, even then,
+would be authorized only as a design review rather than native execution.
 
 ## 10. Test and evidence matrix
 

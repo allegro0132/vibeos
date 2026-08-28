@@ -47,6 +47,7 @@ TRUSTED_SAMPLE_QEMU_FEATURE = f"{TRUSTED_SAMPLE_FEATURE}-qemu-acceptance"
 COLLECTOR_QEMU_FEATURE = (
     "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
 )
+QEMU_DECISION_FEATURE = "wasm-c84-qemu-aot-decision"
 TRUSTED_SAMPLE_SSHD_MEMBER = "vibeos-sshd/c84-profile-trusted-sample"
 
 
@@ -216,6 +217,109 @@ def semantic(value: str) -> str:
     return compact(rust_mask(value, literals=False))
 
 
+def syntax_unit_end(masked: str, cursor: int, label: str) -> int:
+    """Return the end of one Rust syntax unit in a fully lexical-masked source."""
+
+    def matching(opening: int, left: str, right: str) -> int:
+        depth = 0
+        for index in range(opening, len(masked)):
+            if masked[index] == left:
+                depth += 1
+            elif masked[index] == right:
+                depth -= 1
+                if depth == 0:
+                    return index + 1
+        raise VerificationError(f"unbalanced {left}{right} after {label}")
+
+    while cursor < len(masked) and masked[cursor].isspace():
+        cursor += 1
+    require(cursor < len(masked), f"{label} has no syntax unit")
+
+    # Permit harmless secondary attributes only after the exact feature guard.
+    # They are part of the same directly guarded syntax unit.
+    while masked.startswith("#[", cursor):
+        cursor = matching(cursor + 1, "[", "]")
+        while cursor < len(masked) and masked[cursor].isspace():
+            cursor += 1
+
+    parens = brackets = braces = angles = 0
+    first_brace = -1
+    index = cursor
+    while index < len(masked):
+        character = masked[index]
+        if character == "(":
+            parens += 1
+        elif character == ")":
+            # A directly guarded parameter lives inside parentheses that
+            # started before the attribute. Its own unit must have ended at
+            # the preceding comma; reaching this delimiter is invalid.
+            parens -= 1
+        elif character == "[":
+            brackets += 1
+        elif character == "]":
+            brackets -= 1
+        elif character == "<" and braces == 0:
+            # A directly guarded item may carry generic parameters or a
+            # generic return type. Their commas are not unit delimiters.
+            angles += 1
+        elif (
+            character == ">"
+            and braces == 0
+            and angles > 0
+            and (index == 0 or masked[index - 1] != "-")
+        ):
+            angles -= 1
+        elif character == "{":
+            if (
+                parens == 0
+                and brackets == 0
+                and braces == 0
+                and angles == 0
+                and first_brace < 0
+            ):
+                first_brace = index
+            braces += 1
+        elif character == "}":
+            braces -= 1
+            if (
+                braces == 0
+                and first_brace >= 0
+                and parens == 0
+                and brackets == 0
+                and angles == 0
+            ):
+                end = index + 1
+                probe = end
+                while probe < len(masked) and masked[probe].isspace():
+                    probe += 1
+                if probe < len(masked) and masked[probe] == ";":
+                    end = probe + 1
+                return end
+        elif (
+            character in ";,"
+            and parens == 0
+            and brackets == 0
+            and braces == 0
+            and angles == 0
+        ):
+            return index + 1
+        require(
+            parens >= 0 and brackets >= 0 and braces >= 0 and angles >= 0,
+            f"unbalanced syntax unit after {label}",
+        )
+        index += 1
+    raise VerificationError(f"{label} syntax unit is unterminated")
+
+
+def mask_spans(source: str, spans: list[tuple[int, int]]) -> str:
+    output = list(source)
+    for start, end in spans:
+        for cursor in range(start, end):
+            if output[cursor] not in "\r\n":
+                output[cursor] = " "
+    return "".join(output)
+
+
 @lru_cache(maxsize=256)
 def without_direct_feature_units(source: str, feature: str) -> str:
     """Mask only syntax units directly guarded by one exact feature cfg.
@@ -228,115 +332,66 @@ def without_direct_feature_units(source: str, feature: str) -> str:
     the predecessor's forbidden-token checks.
     """
 
-    masked = rust_mask(source, literals=False)
-    attribute = re.compile(
+    # The structural matcher runs over a fully masked token stream, so cfg-like
+    # text in comments, ordinary strings, characters, and raw strings is never
+    # eligible. The raw slice must then match the exact feature spelling.
+    masked = rust_mask(source)
+    structural_attribute = re.compile(
+        r'#\s*\[\s*cfg\s*\(\s*feature\s*=\s+\)\s*\]'
+    )
+    exact_attribute = re.compile(
         rf'#\s*\[\s*cfg\s*\(\s*feature\s*=\s*"{re.escape(feature)}"\s*\)\s*\]'
     )
     spans: list[tuple[int, int]] = []
-
-    def matching(opening: int, left: str, right: str) -> int:
-        depth = 0
-        for cursor in range(opening, len(masked)):
-            if masked[cursor] == left:
-                depth += 1
-            elif masked[cursor] == right:
-                depth -= 1
-                if depth == 0:
-                    return cursor + 1
-        raise VerificationError(f"unbalanced {left}{right} after direct {feature} cfg")
-
-    for match in attribute.finditer(masked):
-        cursor = match.end()
-        while cursor < len(masked) and masked[cursor].isspace():
-            cursor += 1
-        require(cursor < len(masked), f"direct {feature} cfg has no syntax unit")
-
-        # Permit harmless secondary attributes only after the exact feature
-        # guard. They are part of the same directly guarded syntax unit.
-        while masked.startswith("#[", cursor):
-            bracket = matching(cursor + 1, "[", "]")
-            cursor = bracket
-            while cursor < len(masked) and masked[cursor].isspace():
-                cursor += 1
-
-        parens = brackets = braces = angles = 0
-        first_brace = -1
-        end = -1
-        index = cursor
-        while index < len(masked):
-            character = masked[index]
-            if character == "(":
-                parens += 1
-            elif character == ")":
-                # A directly guarded parameter lives inside parentheses that
-                # started before the attribute. Its own unit must have ended
-                # at the preceding comma; reaching this delimiter is invalid.
-                parens -= 1
-            elif character == "[":
-                brackets += 1
-            elif character == "]":
-                brackets -= 1
-            elif character == "<" and braces == 0:
-                # A directly guarded item may carry generic parameters or a
-                # generic return type.  Their commas are not syntax-unit
-                # delimiters (for example `Result<T, E>`).
-                angles += 1
-            elif (
-                character == ">"
-                and braces == 0
-                and angles > 0
-                and (index == 0 or masked[index - 1] != "-")
-            ):
-                angles -= 1
-            elif character == "{":
-                if (
-                    parens == 0
-                    and brackets == 0
-                    and braces == 0
-                    and angles == 0
-                    and first_brace < 0
-                ):
-                    first_brace = index
-                braces += 1
-            elif character == "}":
-                braces -= 1
-                if (
-                    braces == 0
-                    and first_brace >= 0
-                    and parens == 0
-                    and brackets == 0
-                    and angles == 0
-                ):
-                    end = index + 1
-                    probe = end
-                    while probe < len(masked) and masked[probe].isspace():
-                        probe += 1
-                    if probe < len(masked) and masked[probe] == ";":
-                        end = probe + 1
-                    break
-            elif (
-                character in ";,"
-                and parens == 0
-                and brackets == 0
-                and braces == 0
-                and angles == 0
-            ):
-                end = index + 1
-                break
-            require(
-                parens >= 0 and brackets >= 0 and braces >= 0 and angles >= 0,
-                f"unbalanced syntax unit after direct {feature} cfg",
-            )
-            index += 1
-        require(end >= 0, f"direct {feature} cfg syntax unit is unterminated")
+    for match in structural_attribute.finditer(masked):
+        if exact_attribute.fullmatch(source[match.start() : match.end()]) is None:
+            continue
+        end = syntax_unit_end(masked, match.end(), f"direct {feature} cfg")
         spans.append((match.start(), end))
+    return mask_spans(source, spans)
 
-    output = list(source)
-    for start, end in spans:
-        for cursor in range(start, end):
-            if output[cursor] not in "\r\n":
-                output[cursor] = " "
-    return "".join(output)
+
+def without_exact_any_feature_unit(
+    source: str, features: tuple[str, ...], label: str
+) -> str:
+    """Mask one successor unit behind one frozen ``cfg(any(...))`` set.
+
+    The ordinary predecessor helper intentionally rejects broad cfg forms.  A
+    shared successor marker is the one exception: two explicitly named
+    successor images may emit the same consumed marker. An extra, missing,
+    reordered, or widened feature must remain visible and fail.
+    """
+
+    require(len(features) >= 2, f"{label} exact cfg(any) set is too small")
+    assignments = r"\s*,\s*".join(
+        rf'feature\s*=\s*"{re.escape(feature)}"' for feature in features
+    )
+    exact_attribute = re.compile(
+        r"#\s*\[\s*cfg\s*\(\s*any\s*\(\s*"
+        + assignments
+        + r"\s*\)\s*\)\s*\]"
+    )
+    structural_assignments = r"\s*,\s*".join(
+        r"feature\s*=\s+" for _feature in features
+    )
+    structural_attribute = re.compile(
+        r"#\s*\[\s*cfg\s*\(\s*any\s*\(\s*"
+        + structural_assignments
+        + r"\s*\)\s*\)\s*\]"
+    )
+    masked = rust_mask(source)
+    matches = [
+        match
+        for match in structural_attribute.finditer(masked)
+        if exact_attribute.fullmatch(source[match.start() : match.end()]) is not None
+    ]
+    require(
+        len(matches) == 1,
+        f"{label} exact cfg(any) syntax-unit count differs: {len(matches)}",
+    )
+    match = matches[0]
+    end = syntax_unit_end(masked, match.end(), f"{label} exact cfg(any)")
+    return mask_spans(source, [(match.start(), end)])
 
 
 def ordered(scope: str, needles: list[str], label: str) -> None:
@@ -572,12 +627,13 @@ def verify_features(inputs: "Inputs") -> None:
         f'#[cfg(all(feature="{TRUSTED_SAMPLE_FEATURE}",'
         f'feature="{FINISH_QEMU_FEATURE}",'
         f'not(feature="{TRUSTED_SAMPLE_QEMU_FEATURE}"),'
-        f'not(feature="{COLLECTOR_QEMU_FEATURE}")))]compile_error!('
+        f'not(feature="{COLLECTOR_QEMU_FEATURE}"),'
+        f'not(feature="{QEMU_DECISION_FEATURE}")))]compile_error!('
         f'"feature`{TRUSTED_SAMPLE_FEATURE}`cannotreusethediscard-onlyfinish/verifyQEMUtranscript");'
     )
     require(
         trusted_pairing in root,
-        "trusted-sample QEMU pairing differs from its two exact acceptance exemptions",
+        "trusted-sample QEMU pairing differs from its three exact acceptance exemptions",
     )
 
 
@@ -1229,6 +1285,16 @@ def expect_rejected(inputs: Inputs, mutate: Callable[[Inputs], Inputs], label: s
     raise VerificationError(f"selftest mutation unexpectedly accepted: {label}")
 
 
+def expect_exact_any_decoy_rejected(
+    source: str, features: tuple[str, ...], label: str
+) -> None:
+    try:
+        without_exact_any_feature_unit(source, features, label)
+    except VerificationError:
+        return
+    raise VerificationError(f"selftest cfg(any) decoy unexpectedly accepted: {label}")
+
+
 def move_attach_after_publish(data: Inputs) -> Inputs:
     component = replace_once(
         data.component,
@@ -1282,6 +1348,54 @@ def remove_c48_from_acceptance_isolation(data: Inputs) -> Inputs:
 
 def run_selftest(inputs: Inputs) -> int:
     verify(inputs)
+    lexical_features = ("vibeos-c84-lexical-a", "vibeos-c84-lexical-b")
+    exact_any = (
+        '#[cfg(any(feature = "vibeos-c84-lexical-a", '
+        'feature = "vibeos-c84-lexical-b"))]'
+    )
+    escaped_any = exact_any.replace('"', r'\"')
+    lexical_decoys = (
+        ("cfg-any-line-comment-decoy", f"// {exact_any}\nfn visible() {{}}\n"),
+        (
+            "cfg-any-nested-block-comment-decoy",
+            f"/* outer /* {exact_any} */ outer */\nfn visible() {{}}\n",
+        ),
+        (
+            "cfg-any-string-decoy",
+            f'const DECOY: &str = "{escaped_any}";\nfn visible() {{}}\n',
+        ),
+        (
+            "cfg-any-raw-string-decoy",
+            f'const DECOY: &str = r###"{exact_any}"###;\nfn visible() {{}}\n',
+        ),
+    )
+    for label, source in lexical_decoys:
+        expect_exact_any_decoy_rejected(source, lexical_features, label)
+
+    real_with_decoys = (
+        f"// {exact_any}\n"
+        f'const STRING_DECOY: &str = "{escaped_any}";\n'
+        f'const RAW_DECOY: &str = r###"{exact_any}"###;\n'
+        f"{exact_any}\n"
+        "#[allow(dead_code)]\n"
+        "fn successor_only() {\n"
+        '    let _syntax_noise = r###"};,<>"###;\n'
+        "}\n"
+        "fn predecessor_visible() {}\n"
+    )
+    lexical_result = without_exact_any_feature_unit(
+        real_with_decoys, lexical_features, "cfg(any) lexical positive control"
+    )
+    lexical_code = rust_mask(lexical_result)
+    require(
+        "successor_only" not in lexical_code,
+        "real cfg(any) successor syntax unit was not masked",
+    )
+    require(
+        "predecessor_visible" in lexical_code,
+        "cfg(any) masking consumed the following visible syntax unit",
+    )
+
     guarded_successor = replace(
         inputs,
         component=replace_once(
@@ -1355,6 +1469,34 @@ def run_selftest(inputs: Inputs) -> int:
             ),
         ),
         ("managed-child-c48-isolation-removed", remove_c48_from_acceptance_isolation),
+        (
+            "qemu-decision-trusted-exemption-removed",
+            lambda data: replace(
+                data,
+                kernel_root=replace_once(
+                    data.kernel_root,
+                    f'    not(feature = "{COLLECTOR_QEMU_FEATURE}"),\n'
+                    f'    not(feature = "{QEMU_DECISION_FEATURE}")',
+                    f'    not(feature = "{COLLECTOR_QEMU_FEATURE}")',
+                    "qemu-decision-trusted-exemption-removed",
+                ),
+            ),
+        ),
+        (
+            "qemu-decision-trusted-exemption-widened",
+            lambda data: replace(
+                data,
+                kernel_root=replace_once(
+                    data.kernel_root,
+                    f'    not(feature = "{COLLECTOR_QEMU_FEATURE}"),\n'
+                    f'    not(feature = "{QEMU_DECISION_FEATURE}")',
+                    f'    not(feature = "{COLLECTOR_QEMU_FEATURE}"),\n'
+                    f'    not(any(feature = "{QEMU_DECISION_FEATURE}", '
+                    'feature = "wasm-c84-profile-slot-qemu-acceptance"))',
+                    "qemu-decision-trusted-exemption-widened",
+                ),
+            ),
+        ),
         (
             "qemu-firmware-default-on",
             lambda data: mutate_manifest(
@@ -1628,7 +1770,7 @@ def run_selftest(inputs: Inputs) -> int:
     ]
     for label, mutation in mutations:
         expect_rejected(inputs, mutation, label)
-    return len(mutations)
+    return len(mutations) + len(lexical_decoys)
 
 
 def main() -> int:

@@ -11,10 +11,13 @@
 //! [`TargetVerified`], which is obtainable only through the target-session
 //! facade. This boundary validates one SAMPLE's shape; it does not itself
 //! establish live provenance. [`BootCollector`] privately chains that
-//! primitive into one build-bound physical-Duo transcript containing one META,
-//! 24 ordered SAMPLE records, and one END. The target adapter must still prove
-//! live provenance, one physical cold boot, and exclusive ownership of the
-//! target lineage supplied to the collector.
+//! primitive into one build-bound META + 24 SAMPLE prefix, then exposes the
+//! sole [`PendingEnd`] authority so the target adapter can append END only
+//! after its remaining acceptance checks pass. The default record contract is
+//! Duo-v1; the explicit `qemu-decision-v1` feature selects a disjoint
+//! emulator-scoped contract. The target adapter must still prove the selected
+//! platform envelope and exclusive ownership of the lineage supplied to the
+//! collector.
 //!
 //! Every handle is linearly owned. It may move with one exclusive `Send`
 //! future, but cannot be shared through `Sync`; moving ownership does not
@@ -80,8 +83,9 @@ mod target;
 
 pub use collector::{
     BootCollector, BootReceipt, Campaign, CampaignError, CollectionFailure, CollectionProgress,
-    CollectorAbort, CollectorFault, CollectorReady, CompletedTranscript, PoisonedTranscript,
-    ProfileRecordSinkFactory, RecordStage, BOOT_RETAINED, BOOT_SAMPLES, BOOT_WARMUPS,
+    CollectorAbort, CollectorFault, CollectorReady, CompletedTerminal, PendingEnd, PendingTerminal,
+    PoisonedTerminal, PoisonedTranscript, ProfileRecordSinkFactory, RecordStage, BOOT_RETAINED,
+    BOOT_SAMPLES, BOOT_WARMUPS,
 };
 
 pub use publisher::{

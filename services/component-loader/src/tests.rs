@@ -676,6 +676,22 @@ fn profile_instance_limits_and_exact_wit_are_revalidated() {
         Some(ComponentLoadError::Profile)
     );
 
+    // CMP1 intentionally preserves validation-only code 5 as inert artifact
+    // metadata, but the durable production loader must reject it before a
+    // publication candidate or command projection can be minted.
+    let mut float_candidate = ArtifactSpec::exact();
+    float_candidate.profile = ProfileIdentity::PROFILE_2_SYNC_FLOAT;
+    assert_eq!(
+        load_exact(
+            artifact_bytes(float_candidate),
+            WIT,
+            SIGNER_DIGEST,
+            &admission,
+        )
+        .err(),
+        Some(ComponentLoadError::Profile)
+    );
+
     let mut limits = ArtifactSpec::exact();
     limits.memory_bytes = 256 * 1024;
     assert_eq!(

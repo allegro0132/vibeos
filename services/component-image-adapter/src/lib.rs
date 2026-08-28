@@ -11,6 +11,20 @@ use vibeos_component_image_adapter::{
 ```
 "#
 )]
+#![cfg_attr(
+    not(feature = "c88-f4-float-candidate"),
+    doc = r#"
+The C8.8-F4 image-pinned scalar-float candidate is structurally absent by
+default:
+
+```compile_fail
+use vibeos_component_image_adapter::{
+    project_float_candidate,
+    FloatCandidateProjection,
+};
+```
+"#
+)]
 #![no_std]
 
 #[cfg(feature = "native-async-command-projection")]
@@ -35,9 +49,227 @@ use vibeos_image_policy::{ComponentInstanceLimits, ComponentStreamMode, NativeAs
 #[cfg(feature = "native-async-command-projection")]
 use vibeos_vsh::{ComponentArtifactIdentity, ComponentCommandManifest, StreamMode};
 
-#[cfg(feature = "native-async-command-projection")]
+#[cfg(feature = "c88-f4-float-candidate")]
+use vibeos_component_admission::{
+    admit_float_acceptance_candidate, AdmissionError as FloatAdmissionError,
+    ArtifactTrust as FloatArtifactTrust, CallerAuthority as FloatCallerAuthority,
+    ComponentArtifact as FloatArtifact, FloatAcceptanceAdmissionPolicy,
+    InstanceLimits as FloatAdmissionLimits, FLOAT_ACCEPTANCE_ACTIVATION_LABEL,
+};
+#[cfg(feature = "c88-f4-float-candidate")]
+use vibeos_component_format::{
+    ProfileIdentity as FloatProfileIdentity, ProfileStage as FloatStage,
+};
+#[cfg(feature = "c88-f4-float-candidate")]
+use vibeos_component_runtime::{
+    decode::{current_component_validation_engine, ComponentPlan as FloatComponentPlan},
+    float_candidate::{
+        FloatCandidateComponent, FloatCandidateError as FloatRuntimeError, FloatCandidateLifecycle,
+        FloatCandidateLimits,
+    },
+    world::{WorldContract as FloatWorldContract, WorldError as FloatWorldError},
+};
+#[cfg(feature = "c88-f4-float-candidate")]
+use vibeos_image_policy::{ComponentInstanceLimits as FloatImageLimits, FloatCandidatePin};
+
+#[cfg(any(
+    feature = "native-async-command-projection",
+    feature = "c88-f4-float-candidate"
+))]
 mod private {
     pub struct Seal;
+}
+
+/// Stable failures from the image-pinned F4 candidate projection.
+#[cfg(feature = "c88-f4-float-candidate")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloatCandidateProjectionError {
+    Artifact(FloatAdmissionError),
+    DigestMismatch,
+    Wit(FloatWorldError),
+    Admission(FloatAdmissionError),
+    Runtime(FloatRuntimeError),
+    RevalidationMismatch,
+}
+
+/// Move-only join of the exact image pin and sealed float admission receipt.
+///
+/// This value is neither a command projection nor durable publication input.
+/// It has no manifest, artifact-byte getter, command name, or conversion to
+/// ordinary admission:
+///
+/// ```compile_fail
+/// # use vibeos_component_image_adapter::project_float_candidate;
+/// # use vibeos_image_policy::C88_F4_FLOAT_CANDIDATE;
+/// let projection = project_float_candidate(C88_F4_FLOAT_CANDIDATE).unwrap();
+/// let _: vibeos_component_admission::AdmittedComponent = projection.into();
+/// ```
+///
+/// ```compile_fail
+/// # use vibeos_component_image_adapter::project_float_candidate;
+/// # use vibeos_image_policy::C88_F4_FLOAT_CANDIDATE;
+/// let projection = project_float_candidate(C88_F4_FLOAT_CANDIDATE).unwrap();
+/// let _ = projection.manifest();
+/// ```
+///
+/// ```compile_fail
+/// # use vibeos_component_image_adapter::project_float_candidate;
+/// # use vibeos_image_policy::C88_F4_FLOAT_CANDIDATE;
+/// let projection = project_float_candidate(C88_F4_FLOAT_CANDIDATE).unwrap();
+/// let _ = projection.artifact_bytes();
+/// ```
+///
+/// ```compile_fail
+/// # use vibeos_component_image_adapter::project_float_candidate;
+/// # use vibeos_image_policy::C88_F4_FLOAT_CANDIDATE;
+/// let projection = project_float_candidate(C88_F4_FLOAT_CANDIDATE).unwrap();
+/// let _ = projection.clone();
+/// ```
+#[cfg(feature = "c88-f4-float-candidate")]
+pub struct FloatCandidateProjection {
+    pin: FloatCandidatePin,
+    candidate: vibeos_component_admission::AdmittedFloatAcceptanceCandidate,
+    world: FloatWorldContract,
+    _sealed: private::Seal,
+}
+
+#[cfg(feature = "c88-f4-float-candidate")]
+impl FloatCandidateProjection {
+    pub fn activation_label(&self) -> &str {
+        self.candidate.activation_label()
+    }
+
+    pub const fn profile(&self) -> FloatProfileIdentity {
+        self.candidate.profile()
+    }
+
+    pub const fn limits(&self) -> FloatAdmissionLimits {
+        self.candidate.limits()
+    }
+
+    /// Freshly revalidates the immutable bytes and independent WIT policy.
+    /// The resulting plan is still validation-only and has no executable
+    /// exports in the ordinary runtime.
+    pub fn validated_plan(&self) -> Result<FloatComponentPlan<'_>, FloatCandidateProjectionError> {
+        let reparsed_world = FloatWorldContract::parse_profile_2_sync_float_candidate(
+            self.pin.wit_source(),
+            self.pin.world(),
+        )
+        .map_err(FloatCandidateProjectionError::Wit)?;
+        let plan = self
+            .candidate
+            .validated_plan()
+            .map_err(FloatCandidateProjectionError::Admission)?;
+        let pin_limits = float_admission_limits(self.pin.limits());
+        let profile = self.candidate.profile();
+        if self.pin.profile() != FloatProfileIdentity::PROFILE_2_SYNC_FLOAT
+            || self.pin.profile().stage != FloatStage::ValidationOnly
+            || self.pin.profile().execution_enabled()
+            || profile != self.pin.profile()
+            || profile.stage != FloatStage::ValidationOnly
+            || profile.execution_enabled()
+            || current_component_validation_engine(profile).is_some()
+            || plan.profile() != profile
+            || plan.runtime_ready()
+            || plan.native_async_runtime_ready()
+            || plan.executable_exports().next().is_some()
+            || plan.host_imports().next().is_some()
+            || self.candidate.identity().as_bytes() != &self.pin.expected_sha256()
+            || self.candidate.activation_label() != self.pin.activation_label()
+            || self.candidate.activation_label() != FLOAT_ACCEPTANCE_ACTIVATION_LABEL
+            || self.candidate.world() != self.pin.world()
+            || self.candidate.entrypoint() != self.pin.export_name()
+            || self.candidate.limits() != pin_limits
+            || pin_limits.resources != 0
+            || reparsed_world != self.world
+            || reparsed_world
+                .check_component(plan.imports(), plan.exports())
+                .is_err()
+        {
+            return Err(FloatCandidateProjectionError::RevalidationMismatch);
+        }
+        Ok(plan)
+    }
+
+    /// Consumes the sole projection and explicitly activates the default-off
+    /// candidate lifecycle. No ordinary engine resolver or command registry is
+    /// consulted. Compilation receives the exact deterministic charge derived
+    /// from the freshly revalidated pinned Core bytes.
+    pub fn activate_candidate(
+        self,
+    ) -> Result<FloatCandidateLifecycle, FloatCandidateProjectionError> {
+        let component = {
+            let plan = self.validated_plan()?;
+            let compile_reservation = FloatCandidateComponent::required_compile_reservation(&plan)
+                .map_err(FloatCandidateProjectionError::Runtime)?;
+            let policy = self.pin.limits();
+            FloatCandidateComponent::compile(
+                &plan,
+                FloatCandidateLimits {
+                    compile_reservation_bytes: compile_reservation,
+                    memory_bytes: policy.memory_bytes,
+                    total_fuel: policy.total_fuel,
+                    poll_quantum: policy.poll_quantum,
+                },
+            )
+            .map_err(FloatCandidateProjectionError::Runtime)?
+        };
+        component
+            .activate()
+            .map_err(FloatCandidateProjectionError::Runtime)
+    }
+}
+
+/// The sole image-to-admission construction path for the F4 candidate.
+#[cfg(feature = "c88-f4-float-candidate")]
+pub fn project_float_candidate(
+    pin: FloatCandidatePin,
+) -> Result<FloatCandidateProjection, FloatCandidateProjectionError> {
+    let artifact = FloatArtifact::copy_from(pin.artifact_bytes(), pin.profile())
+        .map_err(FloatCandidateProjectionError::Artifact)?;
+    if artifact.identity().as_bytes() != &pin.expected_sha256() {
+        return Err(FloatCandidateProjectionError::DigestMismatch);
+    }
+    let world =
+        FloatWorldContract::parse_profile_2_sync_float_candidate(pin.wit_source(), pin.world())
+            .map_err(FloatCandidateProjectionError::Wit)?;
+    let identity = artifact.identity();
+    let policy = FloatAcceptanceAdmissionPolicy {
+        activation_label: pin.activation_label(),
+        exact_world: &world,
+        trust: FloatArtifactTrust::ImagePinned(identity),
+        limits: float_admission_limits(pin.limits()),
+    };
+    let candidate =
+        admit_float_acceptance_candidate(artifact, &policy, &FloatCallerAuthority { offers: &[] })
+            .map_err(FloatCandidateProjectionError::Admission)?;
+    if candidate.identity().as_bytes() != &pin.expected_sha256()
+        || candidate.activation_label() != pin.activation_label()
+        || candidate.profile() != pin.profile()
+        || candidate.world() != pin.world()
+        || candidate.entrypoint() != pin.export_name()
+        || candidate.limits() != float_admission_limits(pin.limits())
+    {
+        return Err(FloatCandidateProjectionError::RevalidationMismatch);
+    }
+    let projection = FloatCandidateProjection {
+        pin,
+        candidate,
+        world,
+        _sealed: private::Seal,
+    };
+    projection.validated_plan()?;
+    Ok(projection)
+}
+
+#[cfg(feature = "c88-f4-float-candidate")]
+const fn float_admission_limits(limits: FloatImageLimits) -> FloatAdmissionLimits {
+    FloatAdmissionLimits {
+        memory_bytes: limits.memory_bytes,
+        total_fuel: limits.total_fuel,
+        poll_quantum: limits.poll_quantum,
+        resources: limits.resources,
+    }
 }
 
 /// Stable construction and revalidation failures for the sealed projection.

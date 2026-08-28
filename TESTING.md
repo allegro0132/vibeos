@@ -141,10 +141,29 @@ python3 -B scripts/verify-c88-f3-riscv-object.py --self-test
 # Fresh release build plus F3 workspace-owned LLVM/object audit. This is not
 # QEMU or physical-target execution.
 python3 -B scripts/verify-c88-f3-riscv-object.py
+# C8.8-F4 default-off exact-image admission and lifecycle host gates
+cargo test --locked --offline -p vibeos-image-policy \
+  --features c88-f4-float-candidate
+cargo test --locked --offline -p vibeos-component-admission \
+  --features c88-f4-acceptance
+cargo test --locked --offline -p vibeos-component-runtime \
+  --features c88-f4-acceptance
+cargo test --locked --offline -p vibeos-component-image-adapter \
+  --features c88-f4-float-candidate
+# Production durable paths must still reject validation-only profile code 5.
+cargo test --locked --offline -p vibeos-component-loader \
+  profile_instance_limits_and_exact_wit_are_revalidated
+cargo test --locked --offline -p vibeos-component-format \
+  --test graph_version \
+  validation_only_artifact_profiles_do_not_enter_the_durable_graph_codec \
+  -- --exact
 cargo fmt -p vibeos-component-format -- --check
 cargo fmt -p vibeos-wasm-runtime -- --check
 cargo fmt -p vibeos-wasm-float-candidate -- --check
 cargo fmt -p vibeos-component-runtime -- --check
+cargo fmt -p vibeos-component-admission -- --check
+cargo fmt -p vibeos-component-image-adapter -- --check
+cargo fmt -p vibeos-image-policy -- --check
 git diff --check
 ```
 
@@ -625,8 +644,9 @@ physical-cold-boot proof.
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
 current engine resolver, and fail-closed durable graph behavior. Code 5 is
-permanently `ValidationOnly`; it has no current validation-engine, runtime,
-admission, publication, or invocation activation path.
+permanently `ValidationOnly`; it has no current validation-engine, production
+runtime/admission, command, durable publication, or production invocation
+activation path.
 
 The F2 commands execute Float only through the opt-in acceptance crate. They
 cover scalar runtime and translator-fold paths, strict NaN and bit transport,
@@ -641,9 +661,36 @@ release-object audit distinguishes the candidate fork from stock Profile 1 and
 rejects semantic FP LLVM operations, compiler float helpers, and target F/D
 instructions; sign-only LLVM forms must lower to integer bit operations.
 
-F1 through F3 are complete, and C8.8-F4 is next. F3 provides no production
-admission, fixed-QEMU execution, or physical evidence, so Float and C8.8
-remain incomplete. The full contract is in
+The F3 commands cover bit-only WIT/Canonical ABI scalar and nested-value
+boundaries, allocation-request/cleanup-model replay, fixed-seed differential
+and hostile-memory corpora, and the RISC-V object audit. That evidence remains
+separate from runtime wiring.
+
+The F4 commands enable only the default-off candidate features. The image pin
+binds SHA-256
+`5fdb9dc9a48a9c54e899a5dc724445083c055dbf0d664927ba55d9780cc9996a`, world
+`vibe:float-acceptance/lifecycle@1.0.0`, one synchronous
+`run(u32, f32, f64) -> f64` export, 131,072 bytes of memory, 100,000 total
+fuel, a 100-fuel poll quantum, and zero resources. Admission rejects every
+adjacent hash, world, profile, label, quota, topology, import, resource, and
+caller-authority input. The runtime derives and enforces the exact compile
+reservation, preserves exact finite bits, canonicalizes Component-boundary
+NaNs, permits at most one live instance per move-only lifecycle, and reclaims
+the whole instance after cancel, trap, or revoke. Cancel and trap require cold
+recovery; revoke is absorbing. These are per-lifecycle ceilings, not a global
+admission or concurrency ledger. The adapter test covers the complete
+exact-pin-to-admission-to-candidate-lifecycle chain without constructing a
+production command or durable value. A separate hostile fixture keeps both same-signature Core
+exports `run` and `other` but lifts `other` as Component `run`; admission and
+runtime reject that mismatch before compilation. The quota tests also grow
+memory exactly to its ceiling, reject the next page, and drive a finite-fuel
+loop through bounded pending quanta to deterministic reclamation and cold
+recovery. The loader and graph-codec tests independently keep code 5 out of
+production durable loading and CGV1.
+
+F1 through F4 are complete, and C8.8-F5 is next. All F4 evidence above is host
+evidence; no fixed-QEMU F5 exact-bit/fuel run or physical evidence is claimed,
+so Float and C8.8 remain incomplete. The full contract is in
 [docs/WASM_FLOAT_PROFILE.md](docs/WASM_FLOAT_PROFILE.md). Milk-V Duo physical
 testing remains paused.
 

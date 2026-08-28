@@ -1566,6 +1566,7 @@ version = "0.1.0"
 dependencies = [
  "dlr-wasm-interpreter",
  "vibeos-component-format",
+ "vibeos-wasm-float-candidate",
  "vibeos-wasm-runtime",
  "wasm-encoder 0.255.0",
  "wasmparser 0.255.0",

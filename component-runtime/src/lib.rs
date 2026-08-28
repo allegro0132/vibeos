@@ -20,6 +20,16 @@ use vibeos_component_runtime::abi_value::float_candidate;
 ```
 "#
 )]
+#![cfg_attr(
+    not(feature = "c88-f4-acceptance"),
+    doc = r#"
+The C8.8-F4 scalar-float candidate lifecycle is structurally absent by default:
+
+```compile_fail
+use vibeos_component_runtime::float_candidate;
+```
+"#
+)]
 #![no_std]
 
 extern crate alloc;
@@ -31,6 +41,8 @@ pub(crate) mod buffer_registry;
 pub mod canonical;
 pub mod decode;
 mod execution;
+#[cfg(feature = "c88-f4-acceptance")]
+pub mod float_candidate;
 pub mod graph;
 pub mod host;
 pub mod memory;

@@ -221,7 +221,39 @@ pub struct ComponentPlan<'a> {
     async_lowers: Vec<AsyncLowerInfo>,
     async_canonical: Vec<AsyncCanonicalPlan>,
     native_async_execution: Option<NativeAsyncExecutionPlan>,
+    #[cfg(feature = "c88-f4-acceptance")]
+    float_candidate_execution: Option<FloatCandidateExecutionBinding>,
     pub(crate) execution: ComponentExecutionPlan,
+}
+
+/// Private proof that the validation-only Float candidate's sole Component
+/// export resolves to the exact Core function that the acceptance lifecycle
+/// will invoke. This is deliberately separate from `ComponentExecutionPlan`:
+/// code 5 remains inert to every ordinary executor and resolver.
+#[cfg(feature = "c88-f4-acceptance")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FloatCandidateExecutionBinding {
+    module: usize,
+    core_export: FloatCandidateCoreExport,
+}
+
+#[cfg(feature = "c88-f4-acceptance")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FloatCandidateCoreExport {
+    Run,
+}
+
+#[cfg(feature = "c88-f4-acceptance")]
+impl FloatCandidateExecutionBinding {
+    pub(crate) const fn module(self) -> usize {
+        self.module
+    }
+
+    pub(crate) const fn core_export(self) -> &'static str {
+        match self.core_export {
+            FloatCandidateCoreExport::Run => "run",
+        }
+    }
 }
 
 impl ComponentPlan<'_> {
@@ -272,6 +304,21 @@ impl ComponentPlan<'_> {
     /// the presence of this plan never makes [`Self::runtime_ready`] true.
     pub fn native_async_execution_plan(&self) -> Option<&NativeAsyncExecutionPlan> {
         self.native_async_execution.as_ref()
+    }
+
+    /// Reports only whether the F4 decoder retained an exact candidate-only
+    /// Component-to-Core binding. It does not expose executable wiring and is
+    /// absent unless the default-off F4 feature is selected.
+    #[cfg(feature = "c88-f4-acceptance")]
+    pub const fn has_exact_float_candidate_execution_binding(&self) -> bool {
+        self.float_candidate_execution.is_some()
+    }
+
+    #[cfg(feature = "c88-f4-acceptance")]
+    pub(crate) const fn float_candidate_execution_binding(
+        &self,
+    ) -> Option<FloatCandidateExecutionBinding> {
+        self.float_candidate_execution
     }
 
     pub fn executable_exports(&self) -> impl Iterator<Item = &ExecutableExportInfo> {
@@ -1420,6 +1467,18 @@ fn inspect_component_for_profile_impl<'a>(
     } else {
         None
     };
+    #[cfg(feature = "c88-f4-acceptance")]
+    let float_candidate_execution = if mode.allows_scalar_float() {
+        build_float_candidate_execution_binding(
+            &modules,
+            &core_instances,
+            &core_functions,
+            &component_functions,
+            &function_exports,
+        )
+    } else {
+        None
+    };
     let build_runtime = matches!(mode, InspectionMode::SyncExecutable);
     let (instances, component_to_runtime, host_imports) = if build_runtime {
         build_execution_instances(
@@ -1518,6 +1577,8 @@ fn inspect_component_for_profile_impl<'a>(
             async_lowers,
             async_canonical,
             native_async_execution,
+            #[cfg(feature = "c88-f4-acceptance")]
+            float_candidate_execution,
             execution: ComponentExecutionPlan {
                 instances,
                 exports: executable_exports,
@@ -1526,6 +1587,61 @@ fn inspect_component_for_profile_impl<'a>(
         },
         graph_resources,
     ))
+}
+
+/// Resolve the one accepted Float Component export without populating the
+/// ordinary execution plan. Other valid F3 shapes remain inspectable and
+/// simply carry no F4 binding.
+#[cfg(feature = "c88-f4-acceptance")]
+fn build_float_candidate_execution_binding(
+    modules: &[&[u8]],
+    core_instances: &[Option<CoreInstanceDraft>],
+    core_functions: &[Option<CoreFunctionDraft>],
+    component_functions: &[Option<ComponentFunctionDraft>],
+    function_exports: &[(String, u32)],
+) -> Option<FloatCandidateExecutionBinding> {
+    if modules.len() != 1 || core_instances.len() != 1 || function_exports.len() != 1 {
+        return None;
+    }
+    let (component_name, component_function) = &function_exports[0];
+    if component_name != "run" {
+        return None;
+    }
+    let Some(ComponentFunctionDraft::Lift(lift)) = component_functions
+        .get(*component_function as usize)
+        .and_then(Option::as_ref)
+    else {
+        return None;
+    };
+    if lift.canonical_index != 0
+        || lift.string_encoding.is_some()
+        || lift.memory.is_some()
+        || lift.realloc.is_some()
+        || lift.post_return.is_some()
+    {
+        return None;
+    }
+    let Some(CoreFunctionDraft::Export(core_function)) = core_functions
+        .get(lift.core_function as usize)
+        .and_then(Option::as_ref)
+    else {
+        return None;
+    };
+    if core_function.instance != 0 || core_function.name != "run" {
+        return None;
+    }
+    let Some(CoreInstanceDraft::Instantiate { module, arguments }) =
+        core_instances.first().and_then(Option::as_ref)
+    else {
+        return None;
+    };
+    if *module != 0 || !arguments.is_empty() {
+        return None;
+    }
+    Some(FloatCandidateExecutionBinding {
+        module: *module,
+        core_export: FloatCandidateCoreExport::Run,
+    })
 }
 
 fn check_canonical_effects(

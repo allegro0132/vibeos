@@ -1,0 +1,5 @@
+package vibe:float-acceptance@1.0.0;
+
+world lifecycle {
+    export run: func(mode: u32, left: f32, right: f64) -> f64;
+}

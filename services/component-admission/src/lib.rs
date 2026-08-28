@@ -7,6 +7,20 @@
 //! CSpace identity, or a guest resource token.
 
 #![cfg_attr(
+    not(feature = "c88-f4-acceptance"),
+    doc = r#"
+The C8.8-F4 scalar-float admission candidate is structurally absent by default:
+
+```compile_fail
+use vibeos_component_admission::{
+    admit_float_acceptance_candidate,
+    AdmittedFloatAcceptanceCandidate,
+    FloatAcceptanceAdmissionPolicy,
+};
+```
+"#
+)]
+#![cfg_attr(
     not(feature = "native-async-acceptance"),
     doc = r#"
 The validation-only native async admission surface is structurally absent by
@@ -96,6 +110,7 @@ use core::fmt;
 use sha2::{Digest, Sha256};
 pub use vibeos_component_format::ProfileIdentity;
 #[cfg(any(
+    feature = "c88-f4-acceptance",
     feature = "native-async-acceptance",
     feature = "selected-wasi-admission"
 ))]
@@ -114,6 +129,11 @@ use vibeos_component_format::{
 use vibeos_component_host::{
     HostManifestError, HostResourceKind, VibeHostManifest, VibeHostRequirement,
 };
+#[cfg(feature = "c88-f4-acceptance")]
+use vibeos_component_runtime::{
+    decode::inspect_component_for_profile_2_candidate,
+    world::{EntityShape, FunctionEffect, ValueShape},
+};
 use vibeos_component_runtime::{
     decode::{
         current_component_validation_engine, inspect_component_for_profile,
@@ -124,6 +144,8 @@ use vibeos_component_runtime::{
     world::{NamedEntityShape, WorldContract, WorldError},
 };
 use vibeos_core::cap::Rights;
+#[cfg(feature = "c88-f4-acceptance")]
+use vibeos_wasm_runtime::inspect_core_for_profile_2_candidate;
 use vibeos_wasm_runtime::{
     current_core_validation_engine, inspect_core, inspect_core_with_current_engine,
     AdmissionError as CoreAdmissionError, CoreSummary, CurrentCoreValidationEngine,
@@ -132,6 +154,12 @@ use vibeos_wasm_runtime::{
 /// Exact Profile-1 command world that binds shell byte streams to the nominal
 /// `reader` and `writer` resources in `vibe:stream/streams@1.0.0`.
 pub const STREAM_FILTER_WORLD: &str = "vibe:stream/filter@1.0.0";
+
+/// Exact non-command label for the isolated C8.8-F4 activation harness.
+///
+/// This string is diagnostic image policy, not a VSH name or routing key.
+#[cfg(feature = "c88-f4-acceptance")]
+pub const FLOAT_ACCEPTANCE_ACTIVATION_LABEL: &str = "c88-f4-float-candidate";
 
 /// Exact validation-only native async stream world used by the isolated C5.3
 /// acceptance candidate. This does not replace [`STREAM_FILTER_WORLD`] and is
@@ -382,6 +410,25 @@ impl InstanceLimits {
         }
         Ok(())
     }
+
+    #[cfg(feature = "c88-f4-acceptance")]
+    fn validate_float_acceptance(self) -> Result<(), AdmissionError> {
+        let maximum_memory = (PROFILE_1_LIMITS.max_memory_pages as usize)
+            .checked_mul(65_536)
+            .ok_or(AdmissionError::InvalidLimits)?;
+        if self.memory_bytes == 0
+            || self.memory_bytes > maximum_memory
+            || self.total_fuel == 0
+            || self.total_fuel > PROFILE_1_LIMITS.total_fuel
+            || self.poll_quantum == 0
+            || self.poll_quantum > PROFILE_1_LIMITS.poll_quantum
+            || self.poll_quantum > self.total_fuel
+            || self.resources != 0
+        {
+            return Err(AdmissionError::InvalidLimits);
+        }
+        Ok(())
+    }
 }
 
 /// Image ceiling for one exact versioned host interface.
@@ -428,6 +475,21 @@ pub struct AdmissionPolicy<'a> {
     pub stdout: CommandStreamMode,
     pub stderr: CommandStreamMode,
     pub interfaces: &'a [InterfaceCeiling<'a>],
+}
+
+/// Trusted image inputs for the isolated C8.8-F4 admission candidate.
+///
+/// The profile and sole `run(mode: u32, left: f32, right: f64) -> f64` export
+/// are fixed by this API rather than caller-selected fields. There is no
+/// command metadata, interface-ceiling, or stream-routing table: the admitted
+/// shape is import-free, resource-free, and carries a zero resource ceiling.
+#[cfg(feature = "c88-f4-acceptance")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FloatAcceptanceAdmissionPolicy<'a> {
+    pub activation_label: &'a str,
+    pub exact_world: &'a WorldContract,
+    pub trust: ArtifactTrust,
+    pub limits: InstanceLimits,
 }
 
 /// Capability-free admission rules after an external trust gate has proved
@@ -768,6 +830,97 @@ const SELECTED_WASI_CAPABILITY_REQUIREMENTS: [SelectedWasiCapabilityRequirement;
 
 mod private {
     pub struct Seal;
+}
+
+/// Sealed, authority-free C8.8-F4 scalar-float admission candidate.
+///
+/// This type is deliberately disjoint from [`AdmittedComponent`]. It owns no
+/// capability or grant table, exposes no raw artifact bytes, and cannot enter
+/// the production command/runtime path. [`Self::validated_plan`] only repeats
+/// candidate validation of the immutable bytes; the returned plan remains
+/// `ValidationOnly` and `runtime_ready=false`.
+///
+/// ```compile_fail
+/// use vibeos_component_admission::{
+///     AdmittedComponent, AdmittedFloatAcceptanceCandidate,
+/// };
+///
+/// fn executable(candidate: AdmittedFloatAcceptanceCandidate) -> AdmittedComponent {
+///     candidate.into()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_admission::AdmittedFloatAcceptanceCandidate;
+///
+/// fn raw_bytes(candidate: &AdmittedFloatAcceptanceCandidate) {
+///     let _ = candidate.bytes();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_admission::AdmittedFloatAcceptanceCandidate;
+///
+/// fn grants(candidate: &AdmittedFloatAcceptanceCandidate) {
+///     let _ = candidate.grants();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_component_admission::AdmittedFloatAcceptanceCandidate;
+///
+/// fn duplicate(candidate: AdmittedFloatAcceptanceCandidate) {
+///     let _ = candidate.clone();
+/// }
+/// ```
+#[cfg(feature = "c88-f4-acceptance")]
+pub struct AdmittedFloatAcceptanceCandidate {
+    artifact: ComponentArtifact,
+    inspection: InspectionSummary,
+    activation_label: String,
+    limits: InstanceLimits,
+    _sealed: private::Seal,
+}
+
+#[cfg(feature = "c88-f4-acceptance")]
+impl AdmittedFloatAcceptanceCandidate {
+    pub const fn identity(&self) -> ComponentIdentity {
+        self.artifact.identity
+    }
+
+    pub fn inspection(&self) -> &InspectionSummary {
+        &self.inspection
+    }
+
+    pub fn activation_label(&self) -> &str {
+        &self.activation_label
+    }
+
+    pub const fn profile(&self) -> ProfileIdentity {
+        self.inspection.profile
+    }
+
+    pub const fn abi(&self) -> u16 {
+        self.inspection.profile.runtime_abi
+    }
+
+    pub fn world(&self) -> &str {
+        &self.inspection.world
+    }
+
+    pub const fn entrypoint(&self) -> &'static str {
+        "run"
+    }
+
+    pub const fn limits(&self) -> InstanceLimits {
+        self.limits
+    }
+
+    /// Freshly validate the exact immutable bytes using only the Profile-2
+    /// scalar-float candidate inspector. No current-engine resolver is queried.
+    pub fn validated_plan(&self) -> Result<ComponentPlan<'_>, AdmissionError> {
+        revalidate_float_acceptance_candidate(self)
+    }
 }
 
 /// Sealed, validation-only result for the exact C5.6 selected WASI surface.
@@ -1363,6 +1516,167 @@ pub(crate) fn admit_under_exact_rules_with_current_engine(
         grants,
         _sealed: private::Seal,
     })
+}
+
+/// Admit one exact, import-free C8.8-F4 scalar-float validation candidate.
+///
+/// This entrypoint never resolves a current engine, binds authority, creates a
+/// resource table, or marks profile code 5 executable. The trusted policy fixes
+/// the artifact hash, WIT world, and complete activation ceilings; the only
+/// admitted Component export is the synchronous scalar-float function `run`.
+#[cfg(feature = "c88-f4-acceptance")]
+pub fn admit_float_acceptance_candidate(
+    artifact: ComponentArtifact,
+    policy: &FloatAcceptanceAdmissionPolicy<'_>,
+    caller: &CallerAuthority<'_>,
+) -> Result<AdmittedFloatAcceptanceCandidate, AdmissionError> {
+    let profile = ProfileIdentity::PROFILE_2_SYNC_FLOAT;
+    if artifact.profile != profile
+        || profile.stage != ProfileStage::ValidationOnly
+        || profile.execution_enabled()
+    {
+        return Err(AdmissionError::BadProfile);
+    }
+    if policy.trust != ArtifactTrust::ImagePinned(artifact.identity) {
+        return Err(AdmissionError::UntrustedArtifact);
+    }
+    policy.limits.validate_float_acceptance()?;
+    if policy.activation_label != FLOAT_ACCEPTANCE_ACTIVATION_LABEL
+        || !valid_manifest_text(&policy.exact_world.identity, 256)
+        || !caller.offers.is_empty()
+    {
+        return Err(AdmissionError::InvalidPolicy);
+    }
+
+    let (component, modules, imports, exports) = {
+        let plan = inspect_component_for_profile_2_candidate(&artifact.bytes)
+            .map_err(AdmissionError::Decode)?;
+        plan.check_world(policy.exact_world)
+            .map_err(AdmissionError::World)?;
+        if !float_acceptance_plan_matches(&plan) {
+            return Err(AdmissionError::InvalidPolicy);
+        }
+
+        let mut modules = Vec::new();
+        modules
+            .try_reserve_exact(plan.embedded_modules().len())
+            .map_err(|_| AdmissionError::Allocation)?;
+        for bytes in plan.embedded_modules() {
+            let summary =
+                inspect_core_for_profile_2_candidate(bytes).map_err(AdmissionError::Core)?;
+            if summary.imports != 0 {
+                return Err(AdmissionError::InvalidPolicy);
+            }
+            modules.push(summary);
+        }
+        let summary = plan.summary();
+        let (imports, exports) = plan.into_world_shapes();
+        (summary, modules, imports, exports)
+    };
+
+    Ok(AdmittedFloatAcceptanceCandidate {
+        artifact,
+        inspection: InspectionSummary {
+            profile,
+            world: copied(&policy.exact_world.identity)?,
+            component,
+            modules,
+            imports,
+            exports,
+        },
+        activation_label: copied(policy.activation_label)?,
+        limits: policy.limits,
+        _sealed: private::Seal,
+    })
+}
+
+#[cfg(feature = "c88-f4-acceptance")]
+fn revalidate_float_acceptance_candidate(
+    candidate: &AdmittedFloatAcceptanceCandidate,
+) -> Result<ComponentPlan<'_>, AdmissionError> {
+    let identity = ComponentIdentity(Sha256::digest(&candidate.artifact.bytes).into());
+    if identity != candidate.artifact.identity
+        || candidate.artifact.profile != ProfileIdentity::PROFILE_2_SYNC_FLOAT
+        || candidate.inspection.profile != candidate.artifact.profile
+        || candidate.inspection.profile.stage != ProfileStage::ValidationOnly
+        || candidate.inspection.profile.execution_enabled()
+        || !valid_manifest_text(&candidate.inspection.world, 256)
+        || candidate.activation_label != FLOAT_ACCEPTANCE_ACTIVATION_LABEL
+        || candidate.limits.validate_float_acceptance().is_err()
+    {
+        return Err(AdmissionError::RevalidationMismatch);
+    }
+
+    let plan = inspect_component_for_profile_2_candidate(&candidate.artifact.bytes)
+        .map_err(AdmissionError::Decode)?;
+    if plan.summary() != candidate.inspection.component
+        || plan.profile() != candidate.inspection.profile
+        || plan.imports() != candidate.inspection.imports
+        || plan.exports() != candidate.inspection.exports
+        || plan.embedded_modules().len() != candidate.inspection.modules.len()
+        || !float_acceptance_plan_matches(&plan)
+    {
+        return Err(AdmissionError::RevalidationMismatch);
+    }
+    for (bytes, expected) in plan
+        .embedded_modules()
+        .iter()
+        .zip(&candidate.inspection.modules)
+    {
+        if inspect_core_for_profile_2_candidate(bytes).map_err(AdmissionError::Core)? != *expected
+            || expected.imports != 0
+        {
+            return Err(AdmissionError::RevalidationMismatch);
+        }
+    }
+    Ok(plan)
+}
+
+#[cfg(feature = "c88-f4-acceptance")]
+fn float_acceptance_plan_matches(plan: &ComponentPlan<'_>) -> bool {
+    let summary = plan.summary();
+    if plan.profile() != ProfileIdentity::PROFILE_2_SYNC_FLOAT
+        || plan.profile().stage != ProfileStage::ValidationOnly
+        || plan.profile().execution_enabled()
+        || plan.runtime_ready()
+        || plan.native_async_runtime_ready()
+        || !summary.async_abi.is_empty()
+        || summary.embedded_modules != 1
+        || summary.core_instances != 1
+        || summary.component_instances != 0
+        || summary.definitions != 1
+        || summary.aliases != 1
+        || summary.canonical_functions != 1
+        || summary.adapters != 0
+        || summary.resources != 0
+        || summary.imports != 0
+        || summary.exports != 1
+        || plan.embedded_modules().len() != 1
+        || !plan.imports().is_empty()
+        || plan.host_imports().next().is_some()
+        || plan.executable_exports().next().is_some()
+        || plan.native_async_execution_plan().is_some()
+        || !plan.has_exact_float_candidate_execution_binding()
+        || plan.exports().len() != 1
+    {
+        return false;
+    }
+    let export = &plan.exports()[0];
+    if export.name != "run" {
+        return false;
+    }
+    let EntityShape::Function(function) = &export.entity else {
+        return false;
+    };
+    function.effect == FunctionEffect::Sync
+        && function.parameters.len() == 3
+        && function.parameters[0].name == "mode"
+        && function.parameters[0].value == ValueShape::U32
+        && function.parameters[1].name == "left"
+        && function.parameters[1].value == ValueShape::F32
+        && function.parameters[2].name == "right"
+        && function.parameters[2].value == ValueShape::F64
+        && function.result == Some(ValueShape::F64)
 }
 
 /// Admit the one closed, validation-only WASI command surface selected by

@@ -17,16 +17,19 @@ and remain globally deferred; C8.8 onward remains active. The decision contract
 and explicit gaps are tracked in
 [WASM_AOT_DECISION.md](WASM_AOT_DECISION.md) and [TESTING.md](../TESTING.md).
 
-**C8.8 status (2026-08-29):** F1 through F3 are complete. F1 freezes the immutable
+**C8.8 status (2026-08-29):** F1 through F4 are complete. F1 freezes the immutable
 validation-only identity and deterministic scalar-float contract; F2 closes
 the independently identified, acceptance-only Core validator/software-float
 executor, differential, fuzz, trap, limit, fuel, supply-chain, and RISC-V
 object gates. F3 closes the acceptance-only WIT and Canonical ABI scalar-float
 value, memory, nested-value, allocation-request/cleanup-model, differential,
-and hostile-input gates. Artifact profile code 5 remains permanently inert: it has no
-current validation-engine/runtime, admission, execution, or durable-graph
-activation path and can never be promoted in place. C8.8-F4 is next. F4 and
-F5, Float, and C8.8 remain incomplete, and Milk-V Duo physical testing remains
+and hostile-input gates. F4 closes the default-off, exact-image-pinned
+candidate admission/lifecycle path, including quota, cancel/revoke, fault
+reclamation/recovery, and durable-rejection gates. Artifact profile code 5
+remains permanently `ValidationOnly` and inert: it has no production
+admission, command, durable/publication, current-engine, or production
+execution path and can never be promoted in place. C8.8-F5 is next. F5,
+Float, and C8.8 remain incomplete, and Milk-V Duo physical testing remains
 paused.
 
 ---
@@ -223,11 +226,12 @@ C8.8-F1 selects the deterministic-software-float branch and freezes its exact
 semantics. F2 closes the acceptance-only Core backend, provenance, conversion
 trap, host differential/fuzz, fuel, and RISC-V object gates. F3 closes the
 acceptance-only WIT and Canonical ABI boundary, including nested values and an
-exact allocation trace replayed through the existing cleanup model. Direct
-candidate/runtime lifecycle wiring remains F4. These increments do not close C0.6's enablement gate:
-Profile 1 stays integer-only, while default-off admission and lifecycle,
-fixed-QEMU exact-bit/fuel proof, and the paused physical-target qualification
-remain outstanding in F4–F5.
+exact allocation trace replayed through the existing cleanup model. F4 closes
+the separately gated, exact-image-pinned candidate admission/runtime lifecycle
+without registering code 5 as a current engine or exposing it as a command or
+durable object. These increments do not close C0.6's enablement gate: Profile 1
+stays integer-only, while fixed-QEMU exact-bit/fuel proof and the paused
+physical-target qualification remain outstanding in F5.
 
 ## 5. WIT and CSpace mapping
 
@@ -850,7 +854,7 @@ of one increment does not activate code from the next:
 | C8.8-F4 | Close default-off admission and lifecycle | Candidate-only loader/image policy, quota, revoke/cancel, fault reclamation, and durable-rejection tests pass; production code 5 remains inert |
 | C8.8-F5 | Qualify targets and review activation | Host and fixed-QEMU exact-bit/fuel evidence pass; physical-Duo qualification follows when resumed; only then may a separately numbered executable successor be reviewed |
 
-The complete F1/F2/F3 contract and evidence are specified in
+The complete F1/F2/F3/F4 contract and evidence are specified in
 [WASM_FLOAT_PROFILE.md](WASM_FLOAT_PROFILE.md). F2 uses the renamed, vendored
 `vibeos-wasmi-*-softfloat` package family only behind the
 `c88-f2-acceptance` feature. `rustc_apfloat` implements deterministic
@@ -872,12 +876,28 @@ state machine, fixed-seed bit and hostile-memory corpora, and an import-free
 Wasmtime 48 scalar/nested differential fixture. Its offline
 RISC-V audit binds the 29-rlib target closure and finds no F/D opcode in 126
 objects; all 29 workspace-owned objects remain LLVM-auditable and have no
-host-float type/transport, semantic FP, helper, or symbol. Default WIT, the production Profile-1 codec,
-current engines, runtime wiring, and durable graphs remain unchanged; the
-synchronous candidate rejects adjacent async WIT shapes. The replay is
-cleanup-model evidence, not direct candidate/runtime wiring; that default-off
-lifecycle connection is F4.
-This is not admission, QEMU-execution, activation, or physical-Duo evidence.
+host-float type/transport, semantic FP, helper, or symbol. Default WIT and the
+production Profile-1 codec remain unchanged, and the synchronous candidate
+rejects adjacent async WIT shapes. The F3 replay remains cleanup-model
+evidence rather than runtime wiring.
+
+F4 adds one default-off image pin behind `c88-f4-float-candidate`. Its exact
+component SHA-256 is
+`5fdb9dc9a48a9c54e899a5dc724445083c055dbf0d664927ba55d9780cc9996a`, its
+world is `vibe:float-acceptance/lifecycle@1.0.0`, and its sole export is
+`run(mode: u32, left: f32, right: f64) -> f64`. The separately gated admission
+and runtime path admits no imports, host imports, resources, caller authority,
+command manifest, durable graph, or publication authority. The image fixes a
+two-page memory ceiling, 100,000 total fuel, a 100-fuel poll quantum, and zero
+resources; compile reservation is freshly derived and exact. Host tests cover
+exact Float bits and NaN normalization, one-live-instance enforcement,
+exact Component-to-Core `run` binding, under-reservation and adjacent quota
+rejection, grow-to-memory-ceiling enforcement, finite-fuel exhaustion,
+cancellation, absorbing revocation, trap reclamation, cold recovery, and
+durable loader/CGV1 rejection.
+This is explicit candidate-only activation evidence, not a current-engine or
+production activation path. It is also not fixed-QEMU F5 execution or physical
+Duo evidence.
 
 As of 2026-08-28, C1 through C8.3 are accepted complete by historical-evidence
 policy. The completed C8.4 decision-bearing chain is the fixed-QEMU contract
@@ -949,7 +969,7 @@ attributable to interpretation and the outcome is
 is accepted. C8.5 through C8.7 are skipped for this workload and remain
 globally deferred; they are not marked complete.
 The current implementation node is C8.8.
-C8.8-F1 through C8.8-F3 are complete; the current increment is C8.8-F4. Float
+C8.8-F1 through C8.8-F4 are complete; the current increment is C8.8-F5. Float
 and C8.8 remain incomplete.
 
 ## 10. Test and evidence matrix

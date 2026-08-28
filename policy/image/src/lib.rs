@@ -1,4 +1,14 @@
 #![no_std]
+#![cfg_attr(
+    not(feature = "c88-f4-float-candidate"),
+    doc = r#"
+The C8.8-F4 scalar-float image candidate is structurally absent by default:
+
+```compile_fail
+use vibeos_image_policy::{FloatCandidatePin, C88_F4_FLOAT_CANDIDATE};
+```
+"#
+)]
 
 //! Compile-time logical resource and storage-layout policy selected by final
 //! firmware images. Physical hardware descriptions remain in the BSP/HAL.
@@ -40,6 +50,9 @@ compile_error!("exactly one image policy must be selected");
     not(feature = "qemu-default")
 ))]
 compile_error!("feature `c53-native-async-qemu-acceptance` requires `qemu-default`");
+
+#[cfg(all(feature = "c88-f4-float-candidate", not(feature = "qemu-default")))]
+compile_error!("feature `c88-f4-float-candidate` requires `qemu-default`");
 
 #[cfg(all(
     feature = "c64-resource-route-qemu-acceptance",
@@ -1430,6 +1443,95 @@ impl core::fmt::Debug for NativeAsyncAcceptancePin {
     }
 }
 
+/// Isolated image-policy root for the C8.8-F4 scalar-float candidate.
+///
+/// This pin identifies immutable validation-only input for the explicitly
+/// feature-gated F4 lifecycle harness. It is not a [`ComponentCommandPin`], a
+/// durable artifact policy, a graph-version policy, or guest invocation
+/// authority. In particular there is no command projection counterpart and no
+/// conversion into the production command pin. Its `activation_label` is an
+/// acceptance-lifecycle policy label, not a command name or route:
+///
+/// ```compile_fail
+/// # use vibeos_image_policy::{ComponentCommandPin, C88_F4_FLOAT_CANDIDATE};
+/// let _: ComponentCommandPin = C88_F4_FLOAT_CANDIDATE.into();
+/// ```
+///
+/// Command metadata is deliberately absent:
+///
+/// ```compile_fail
+/// # use vibeos_image_policy::C88_F4_FLOAT_CANDIDATE;
+/// let _ = C88_F4_FLOAT_CANDIDATE.command_name();
+/// ```
+#[cfg(feature = "c88-f4-float-candidate")]
+#[derive(Clone, Copy)]
+pub struct FloatCandidatePin {
+    artifact_bytes: &'static [u8],
+    expected_sha256: [u8; 32],
+    activation_label: &'static str,
+    profile: ProfileIdentity,
+    wit_source: &'static str,
+    world: &'static str,
+    export_name: &'static str,
+    limits: ComponentInstanceLimits,
+}
+
+#[cfg(feature = "c88-f4-float-candidate")]
+impl FloatCandidatePin {
+    pub const fn artifact_bytes(self) -> &'static [u8] {
+        self.artifact_bytes
+    }
+
+    pub const fn expected_sha256(self) -> [u8; 32] {
+        self.expected_sha256
+    }
+
+    /// Candidate-only lifecycle label. This is neither a command name nor a
+    /// lookup key, route, manifest, or invocation authority.
+    pub const fn activation_label(self) -> &'static str {
+        self.activation_label
+    }
+
+    pub const fn profile(self) -> ProfileIdentity {
+        self.profile
+    }
+
+    pub const fn artifact_abi(self) -> u16 {
+        self.profile.artifact_abi
+    }
+
+    pub const fn wit_source(self) -> &'static str {
+        self.wit_source
+    }
+
+    pub const fn world(self) -> &'static str {
+        self.world
+    }
+
+    pub const fn export_name(self) -> &'static str {
+        self.export_name
+    }
+
+    pub const fn limits(self) -> ComponentInstanceLimits {
+        self.limits
+    }
+}
+
+#[cfg(feature = "c88-f4-float-candidate")]
+impl core::fmt::Debug for FloatCandidatePin {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("FloatCandidatePin")
+            .field("artifact", &"<redacted>")
+            .field("activation_label", &self.activation_label)
+            .field("profile", &self.profile)
+            .field("world", &self.world)
+            .field("export_name", &self.export_name)
+            .field("limits", &self.limits)
+            .finish()
+    }
+}
+
 /// Image-policy authority for projecting the pinned native async artifact into
 /// an inert VSH command manifest.
 ///
@@ -1806,6 +1908,23 @@ const C53_NATIVE_ASYNC_FILTER_SHA256: [u8; 32] = include!(concat!(
     "/c53-native-async-filter.sha256.rs"
 ));
 
+#[cfg(feature = "c88-f4-float-candidate")]
+const C88_FLOAT_CANDIDATE_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/c88-float-candidate.component.wasm"
+));
+
+#[cfg(feature = "c88-f4-float-candidate")]
+const C88_FLOAT_CANDIDATE_SHA256: [u8; 32] =
+    include!(concat!(env!("OUT_DIR"), "/c88-float-candidate.sha256.rs"));
+
+#[cfg(feature = "c88-f4-float-candidate")]
+const C88_FLOAT_CANDIDATE_WIT: &str = include_str!("../artifacts/c88-float-candidate.wit");
+
+/// Exact normalized world selected by the F4 candidate-only image policy.
+#[cfg(feature = "c88-f4-float-candidate")]
+pub const C88_FLOAT_CANDIDATE_WORLD: &str = "vibe:float-acceptance/lifecycle@1.0.0";
+
 const C53_STREAM_FILTER_WIT: &str = r#"
 package vibe:%stream@1.0.0;
 
@@ -1919,6 +2038,29 @@ pub const C53_NATIVE_ASYNC_QEMU_ACCEPTANCE: NativeAsyncAcceptancePin = NativeAsy
         total_fuel: 500_000,
         poll_quantum: 100,
         resources: 8,
+    },
+};
+
+/// The sole image-pinned input for C8.8-F4 candidate-only lifecycle evidence.
+///
+/// Linking this constant does not bind profile code 5 to a current engine,
+/// install durable bytes, publish a command, or authorize production guest
+/// invocation. The fixed memory/fuel ceilings are acceptance-harness inputs;
+/// all runtime state remains invocation-local and revocable.
+#[cfg(feature = "c88-f4-float-candidate")]
+pub const C88_F4_FLOAT_CANDIDATE: FloatCandidatePin = FloatCandidatePin {
+    artifact_bytes: C88_FLOAT_CANDIDATE_BYTES,
+    expected_sha256: C88_FLOAT_CANDIDATE_SHA256,
+    activation_label: "c88-f4-float-candidate",
+    profile: ProfileIdentity::PROFILE_2_SYNC_FLOAT,
+    wit_source: C88_FLOAT_CANDIDATE_WIT,
+    world: C88_FLOAT_CANDIDATE_WORLD,
+    export_name: "run",
+    limits: ComponentInstanceLimits {
+        memory_bytes: 2 * 65_536,
+        total_fuel: 100_000,
+        poll_quantum: 100,
+        resources: 0,
     },
 };
 
@@ -2334,6 +2476,74 @@ mod tests {
         assert!(pin
             .wit_source()
             .contains("export run: async func(input: byte-stream) -> byte-stream;"));
+    }
+
+    #[cfg(feature = "c88-f4-float-candidate")]
+    #[test]
+    fn float_candidate_pin_is_exact_validation_only_and_authority_free() {
+        let pin = C88_F4_FLOAT_CANDIDATE;
+        assert!(!pin.artifact_bytes().is_empty());
+        assert_ne!(pin.artifact_bytes(), SSH_EXEC_COMPONENT.artifact_bytes());
+        assert_ne!(pin.expected_sha256(), SSH_EXEC_COMPONENT.expected_sha256());
+        assert_eq!(
+            <[u8; 32]>::from(Sha256::digest(pin.artifact_bytes())),
+            pin.expected_sha256()
+        );
+        assert_eq!(pin.activation_label(), "c88-f4-float-candidate");
+        assert_eq!(pin.profile(), ProfileIdentity::PROFILE_2_SYNC_FLOAT);
+        assert_eq!(
+            pin.profile().stage,
+            vibeos_component_format::ProfileStage::ValidationOnly
+        );
+        assert!(!pin.profile().execution_enabled());
+        assert_eq!(pin.artifact_abi(), 5);
+        assert!(
+            vibeos_component_format::current_validation_engine_identity(pin.profile()).is_none()
+        );
+        assert_eq!(pin.world(), C88_FLOAT_CANDIDATE_WORLD);
+        assert_eq!(pin.export_name(), "run");
+        assert_eq!(
+            pin.limits(),
+            ComponentInstanceLimits {
+                memory_bytes: 2 * 65_536,
+                total_fuel: 100_000,
+                poll_quantum: 100,
+                resources: 0,
+            }
+        );
+        assert_eq!(pin.wit_source(), C88_FLOAT_CANDIDATE_WIT);
+        assert!(pin
+            .wit_source()
+            .contains("export run: func(mode: u32, left: f32, right: f64) -> f64;"));
+        let debug = std::format!("{pin:?}");
+        assert!(debug.contains("artifact: \"<redacted>\""));
+        assert!(debug.contains("activation_label: \"c88-f4-float-candidate\""));
+        assert!(!debug.contains("artifact_bytes"));
+        assert!(!debug.contains("command_name"));
+    }
+
+    #[cfg(feature = "c88-f4-float-candidate")]
+    #[test]
+    fn float_candidate_pin_does_not_match_adjacent_inputs() {
+        let pin = C88_F4_FLOAT_CANDIDATE;
+        let mut mutated = pin.artifact_bytes().to_vec();
+        let last = mutated.len() - 1;
+        mutated[last] ^= 1;
+        assert_ne!(
+            <[u8; 32]>::from(Sha256::digest(&mutated)),
+            pin.expected_sha256()
+        );
+        assert_ne!(pin.profile(), ProfileIdentity::PROFILE_1_SYNC);
+        assert_ne!(pin.activation_label(), "c88-f4-float-command");
+        assert_ne!(pin.world(), "vibe:float-acceptance/lifecycle@1.0.1");
+        assert_ne!(pin.export_name(), "run-adjacent");
+        assert_ne!(
+            pin.limits(),
+            ComponentInstanceLimits {
+                memory_bytes: 3 * 65_536,
+                ..pin.limits()
+            }
+        );
     }
 
     #[cfg(feature = "c64-resource-route-qemu-acceptance")]

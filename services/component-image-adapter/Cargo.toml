@@ -17,6 +17,16 @@ native-async-command-projection = [
     "vibeos-component-runtime/native-async-acceptance",
     "vibeos-image-policy/c53-native-async-command-projection",
 ]
+c88-f4-float-candidate = [
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-image-policy",
+    "vibeos-component-admission/c88-f4-acceptance",
+    "vibeos-component-runtime/c88-f4-acceptance",
+    "vibeos-image-policy/c88-f4-float-candidate",
+    "vibeos-image-policy/qemu-default",
+]
 
 [dependencies]
 vibeos-component-admission = { path = "../component-admission", optional = true }

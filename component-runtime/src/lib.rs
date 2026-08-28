@@ -10,6 +10,16 @@ use vibeos_component_runtime::native_async_acceptance;
 ```
 "#
 )]
+#![cfg_attr(
+    not(feature = "c88-f3-acceptance"),
+    doc = r#"
+The C8.8-F3 scalar-float acceptance codec is structurally absent by default:
+
+```compile_fail
+use vibeos_component_runtime::abi_value::float_candidate;
+```
+"#
+)]
 #![no_std]
 
 extern crate alloc;

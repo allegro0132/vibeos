@@ -4,6 +4,56 @@ use crate::resource::{ResourceTable, ResourceToken, ResourceTypeId};
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::{fmt, num::NonZeroU32};
 use vibeos_component_format::PROFILE_1_LIMITS;
+#[cfg(feature = "c88-f3-acceptance")]
+use vibeos_component_format::{
+    PROFILE_2_SYNC_FLOAT_F32_CANONICAL_NAN_BITS, PROFILE_2_SYNC_FLOAT_F64_CANONICAL_NAN_BITS,
+};
+
+/// One Component-level `f32` value represented without using the host FPU.
+///
+/// Component values have one abstract NaN. Construction therefore collapses
+/// every quiet or signaling NaN, including negative NaNs, to the exact fixed
+/// positive quiet-NaN bits selected by the Profile-2 candidate contract.
+#[cfg(feature = "c88-f3-acceptance")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanonicalF32(u32);
+
+#[cfg(feature = "c88-f3-acceptance")]
+impl CanonicalF32 {
+    pub const fn from_bits(bits: u32) -> Self {
+        if bits & 0x7f80_0000 == 0x7f80_0000 && bits & 0x007f_ffff != 0 {
+            Self(PROFILE_2_SYNC_FLOAT_F32_CANONICAL_NAN_BITS)
+        } else {
+            Self(bits)
+        }
+    }
+
+    pub const fn to_bits(self) -> u32 {
+        self.0
+    }
+}
+
+/// One Component-level `f64` value represented without using the host FPU.
+#[cfg(feature = "c88-f3-acceptance")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanonicalF64(u64);
+
+#[cfg(feature = "c88-f3-acceptance")]
+impl CanonicalF64 {
+    pub const fn from_bits(bits: u64) -> Self {
+        if bits & 0x7ff0_0000_0000_0000 == 0x7ff0_0000_0000_0000
+            && bits & 0x000f_ffff_ffff_ffff != 0
+        {
+            Self(PROFILE_2_SYNC_FLOAT_F64_CANONICAL_NAN_BITS)
+        } else {
+            Self(bits)
+        }
+    }
+
+    pub const fn to_bits(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResourceOwnership {
@@ -144,6 +194,10 @@ pub enum ValueType {
     S16,
     S32,
     S64,
+    #[cfg(feature = "c88-f3-acceptance")]
+    F32,
+    #[cfg(feature = "c88-f3-acceptance")]
+    F64,
     Char,
     String,
     List(Box<ValueType>),
@@ -184,6 +238,10 @@ pub enum CanonicalValue {
     S16(i16),
     S32(i32),
     S64(i64),
+    #[cfg(feature = "c88-f3-acceptance")]
+    F32(CanonicalF32),
+    #[cfg(feature = "c88-f3-acceptance")]
+    F64(CanonicalF64),
     Char(char),
     String(String),
     List(Vec<CanonicalValue>),
@@ -345,7 +403,11 @@ fn type_at(
         ValueType::Bool | ValueType::U8 | ValueType::S8 => CanonicalLayout::scalar(1),
         ValueType::U16 | ValueType::S16 => CanonicalLayout::scalar(2),
         ValueType::U32 | ValueType::S32 | ValueType::Char => CanonicalLayout::scalar(4),
+        #[cfg(feature = "c88-f3-acceptance")]
+        ValueType::F32 => CanonicalLayout::scalar(4),
         ValueType::U64 | ValueType::S64 => CanonicalLayout::scalar(8),
+        #[cfg(feature = "c88-f3-acceptance")]
+        ValueType::F64 => CanonicalLayout::scalar(8),
         ValueType::String => CanonicalLayout {
             size: 8,
             alignment: 4,
@@ -709,6 +771,10 @@ fn validate_at(
         account.charge_bytes(layout.size)?;
     }
     match (ty, value) {
+        #[cfg(feature = "c88-f3-acceptance")]
+        (ValueType::F32, CanonicalValue::F32(_)) | (ValueType::F64, CanonicalValue::F64(_)) => {
+            Ok(())
+        }
         (ValueType::Bool, CanonicalValue::Bool(_))
         | (ValueType::U8, CanonicalValue::U8(_))
         | (ValueType::U16, CanonicalValue::U16(_))

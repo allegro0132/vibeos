@@ -11,6 +11,8 @@ pub use crate::execution::{
     NativeAsyncCoreSignature, NativeAsyncExecutionPlan, NativeAsyncExportPlan,
     NativeAsyncFuturePlan, NativeAsyncStreamPlan, NativeAsyncWaitablePlan,
 };
+#[cfg(feature = "c88-f3-acceptance")]
+use crate::world::normalize_component_world_entities_float_candidate;
 use crate::{
     abi_value::{flat_signature, MAX_FLAT_PARAMS, MAX_FLAT_RESULTS},
     execution::{
@@ -36,6 +38,8 @@ use vibeos_component_format::{
     current_validation_engine_identity, LimitKind, ProfileIdentity, ValidationEngineIdentity,
     WasmParserFeatureSelection, PROFILE_1_LIMITS,
 };
+#[cfg(feature = "c88-f3-acceptance")]
+use vibeos_wasm_runtime::inspect_core_for_profile_2_candidate;
 use vibeos_wasm_runtime::{
     current_core_validation_engine, inspect_core_with_current_engine, CurrentCoreValidationEngine,
 };
@@ -316,6 +320,8 @@ enum InspectionMode {
     SyncExecutable,
     AsyncValidation,
     NativeAsyncResourceFree,
+    #[cfg(feature = "c88-f3-acceptance")]
+    SyncFloatCandidate,
 }
 
 impl InspectionMode {
@@ -338,6 +344,34 @@ impl InspectionMode {
     const fn is_native_async(self) -> bool {
         matches!(self, Self::NativeAsyncResourceFree)
     }
+
+    const fn allows_scalar_float(self) -> bool {
+        #[cfg(feature = "c88-f3-acceptance")]
+        if matches!(self, Self::SyncFloatCandidate) {
+            return true;
+        }
+        false
+    }
+}
+
+enum ComponentInspectionSource<'a> {
+    Current(&'a CurrentComponentValidationEngine),
+    #[cfg(feature = "c88-f3-acceptance")]
+    Profile2FloatCandidate,
+}
+
+impl ComponentInspectionSource<'_> {
+    fn validate_embedded_core(&self, bytes: &[u8]) -> Result<(), DecodeError> {
+        match self {
+            Self::Current(engine) => inspect_core_with_current_engine(bytes, &engine.core)
+                .map(|_| ())
+                .map_err(|_| DecodeError::InvalidEmbeddedCore),
+            #[cfg(feature = "c88-f3-acceptance")]
+            Self::Profile2FloatCandidate => inspect_core_for_profile_2_candidate(bytes)
+                .map(|_| ())
+                .map_err(|_| DecodeError::InvalidEmbeddedCore),
+        }
+    }
 }
 
 fn parser_features(selection: WasmParserFeatureSelection) -> WasmFeatures {
@@ -356,6 +390,17 @@ fn parser_features(selection: WasmParserFeatureSelection) -> WasmFeatures {
             features
         }
     }
+}
+
+fn parser_features_for_mode(
+    selection: WasmParserFeatureSelection,
+    mode: InspectionMode,
+) -> WasmFeatures {
+    let mut features = parser_features(selection);
+    if mode.allows_scalar_float() {
+        features.set(WasmFeatures::FLOATS, true);
+    }
+    features
 }
 
 fn add(value: &mut u32, amount: u32, maximum: u32, _kind: LimitKind) -> Result<(), DecodeError> {
@@ -437,8 +482,37 @@ pub fn inspect_component_with_current_engine<'a>(
     bytes: &'a [u8],
     engine: &CurrentComponentValidationEngine,
 ) -> Result<ComponentPlan<'a>, DecodeError> {
-    inspect_component_for_profile_impl(bytes, engine.identity.profile(), false, engine)
-        .map(|(plan, _)| plan)
+    let mode =
+        InspectionMode::for_profile(engine.identity.profile()).ok_or(DecodeError::Unsupported)?;
+    inspect_component_for_profile_impl(
+        bytes,
+        engine.identity.profile(),
+        false,
+        mode,
+        ComponentInspectionSource::Current(engine),
+    )
+    .map(|(plan, _)| plan)
+}
+
+/// Structurally validates one Component under the sealed Profile-2 scalar-
+/// float contract and returns an inert plan. This acceptance-only seam never
+/// resolves code 5 to a current engine and never constructs runtime wiring.
+#[cfg(feature = "c88-f3-acceptance")]
+pub fn inspect_component_for_profile_2_candidate(
+    bytes: &[u8],
+) -> Result<ComponentPlan<'_>, DecodeError> {
+    let contract = vibeos_component_format::profile_2_sync_float_validation_contract();
+    if contract.profile() != ProfileIdentity::PROFILE_2_SYNC_FLOAT || contract.runtime_ready() {
+        return Err(DecodeError::Unsupported);
+    }
+    inspect_component_for_profile_impl(
+        bytes,
+        contract.profile(),
+        false,
+        InspectionMode::SyncFloatCandidate,
+        ComponentInspectionSource::Profile2FloatCandidate,
+    )
+    .map(|(plan, _)| plan)
 }
 
 /// Inspect a Component and additionally capture narrow, graph-only nominal
@@ -460,8 +534,15 @@ pub fn inspect_component_graph_with_current_engine<'a>(
     bytes: &'a [u8],
     engine: &CurrentComponentValidationEngine,
 ) -> Result<ComponentGraphInspection<'a>, DecodeError> {
-    let (plan, resources) =
-        inspect_component_for_profile_impl(bytes, engine.identity.profile(), true, engine)?;
+    let mode =
+        InspectionMode::for_profile(engine.identity.profile()).ok_or(DecodeError::Unsupported)?;
+    let (plan, resources) = inspect_component_for_profile_impl(
+        bytes,
+        engine.identity.profile(),
+        true,
+        mode,
+        ComponentInspectionSource::Current(engine),
+    )?;
     let resources = resources.ok_or(DecodeError::InvalidWiring)?;
     Ok(ComponentGraphInspection::new(plan, resources))
 }
@@ -475,13 +556,30 @@ fn inspect_component_for_profile_impl<'a>(
     bytes: &'a [u8],
     profile: ProfileIdentity,
     collect_graph_resources: bool,
-    engine: &CurrentComponentValidationEngine,
+    mode: InspectionMode,
+    source: ComponentInspectionSource<'_>,
 ) -> Result<(ComponentPlan<'a>, Option<ComponentGraphResourceProvenance>), DecodeError> {
-    let mode = InspectionMode::for_profile(profile).ok_or(DecodeError::Unsupported)?;
-    if engine.identity.profile() != profile {
-        return Err(DecodeError::Unsupported);
-    }
-    let validator = engine.identity.component_validator();
+    let validator = match &source {
+        ComponentInspectionSource::Current(engine) => {
+            if engine.identity.profile() != profile
+                || InspectionMode::for_profile(profile) != Some(mode)
+            {
+                return Err(DecodeError::Unsupported);
+            }
+            engine.identity.component_validator()
+        }
+        #[cfg(feature = "c88-f3-acceptance")]
+        ComponentInspectionSource::Profile2FloatCandidate => {
+            let contract = vibeos_component_format::profile_2_sync_float_validation_contract();
+            if profile != contract.profile()
+                || !mode.allows_scalar_float()
+                || contract.runtime_ready()
+            {
+                return Err(DecodeError::Unsupported);
+            }
+            contract.component_validator()
+        }
+    };
     if validator.predecode_async() != mode.async_enabled() {
         return Err(DecodeError::Unsupported);
     }
@@ -514,7 +612,10 @@ fn inspect_component_for_profile_impl<'a>(
     // The structural pass recognizes every proposal so it can return the
     // profile's stable `Unsupported` diagnostic itself. The strict validator
     // below receives only the Component Model base feature.
-    parser.set_features(parser_features(validator.structural_features()));
+    parser.set_features(parser_features_for_mode(
+        validator.structural_features(),
+        mode,
+    ));
 
     for payload in parser.parse_all(bytes) {
         let payload = payload.map_err(|_| DecodeError::Malformed)?;
@@ -1238,18 +1339,23 @@ fn inspect_component_for_profile_impl<'a>(
     }
 
     for module in &modules {
-        inspect_core_with_current_engine(module, &engine.core)
-            .map_err(|_| DecodeError::InvalidEmbeddedCore)?;
+        source.validate_embedded_core(module)?;
     }
 
-    let types = match Validator::new_with_features(parser_features(validator.strict_features()))
-        .validate_all(bytes)
+    let types = match Validator::new_with_features(parser_features_for_mode(
+        validator.strict_features(),
+        mode,
+    ))
+    .validate_all(bytes)
     {
         Ok(types) => types,
         Err(_) => {
-            if Validator::new_with_features(parser_features(validator.diagnostic_features()))
-                .validate_all(bytes)
-                .is_ok()
+            if Validator::new_with_features(parser_features_for_mode(
+                validator.diagnostic_features(),
+                mode,
+            ))
+            .validate_all(bytes)
+            .is_ok()
             {
                 return Err(DecodeError::Unsupported);
             }
@@ -1258,6 +1364,13 @@ fn inspect_component_for_profile_impl<'a>(
     };
     check_canonical_effects(&types, &canonical_effect_checks)?;
     check_async_callback_signatures(&types, &async_canonical_drafts)?;
+    #[cfg(feature = "c88-f3-acceptance")]
+    let mut type_builder = if mode.allows_scalar_float() {
+        TypeBuilder::profile_2_float_candidate()
+    } else {
+        TypeBuilder::default()
+    };
+    #[cfg(not(feature = "c88-f3-acceptance"))]
     let mut type_builder = TypeBuilder::default();
     let async_canonical = build_async_canonical_plans(
         &async_canonical_drafts,
@@ -1267,6 +1380,14 @@ fn inspect_component_for_profile_impl<'a>(
         &types,
         &mut type_builder,
     )?;
+    #[cfg(feature = "c88-f3-acceptance")]
+    let (imports, exports) = if mode.allows_scalar_float() {
+        normalize_component_world_entities_float_candidate(&types, &import_names, &export_names)
+    } else {
+        normalize_component_world_entities(&types, &import_names, &export_names)
+    }
+    .map_err(shape_error)?;
+    #[cfg(not(feature = "c88-f3-acceptance"))]
     let (imports, exports) =
         normalize_component_world_entities(&types, &import_names, &export_names)
             .map_err(shape_error)?;
@@ -3394,10 +3515,10 @@ fn inspect_type(
                 )?;
             }
             for (_, ty) in function.params.iter() {
-                inspect_primitive(raw_primitive(*ty))?;
+                inspect_primitive(raw_primitive(*ty), mode)?;
             }
             if let Some(ty) = function.result {
-                inspect_primitive(raw_primitive(ty))?;
+                inspect_primitive(raw_primitive(ty), mode)?;
             }
             Ok(())
         }
@@ -3458,11 +3579,11 @@ fn inspect_defined_type(
     mode: InspectionMode,
 ) -> Result<(), DecodeError> {
     match defined {
-        RawDefinedType::Primitive(primitive) => inspect_primitive(Some(*primitive)),
+        RawDefinedType::Primitive(primitive) => inspect_primitive(Some(*primitive), mode),
         RawDefinedType::Record(fields) => {
             check_shape_len(fields.len())?;
             for (_, ty) in fields.iter() {
-                inspect_primitive(raw_primitive(*ty))?;
+                inspect_primitive(raw_primitive(*ty), mode)?;
             }
             Ok(())
         }
@@ -3470,28 +3591,28 @@ fn inspect_defined_type(
             check_shape_len(cases.len())?;
             for case in cases.iter() {
                 if let Some(ty) = case.ty {
-                    inspect_primitive(raw_primitive(ty))?;
+                    inspect_primitive(raw_primitive(ty), mode)?;
                 }
             }
             Ok(())
         }
         RawDefinedType::List(ty) | RawDefinedType::Option(ty) => {
-            inspect_primitive(raw_primitive(*ty))
+            inspect_primitive(raw_primitive(*ty), mode)
         }
         RawDefinedType::Tuple(types) => {
             check_shape_len(types.len())?;
             for ty in types.iter() {
-                inspect_primitive(raw_primitive(*ty))?;
+                inspect_primitive(raw_primitive(*ty), mode)?;
             }
             Ok(())
         }
         RawDefinedType::Flags(names) | RawDefinedType::Enum(names) => check_shape_len(names.len()),
         RawDefinedType::Result { ok, err } => {
             if let Some(ty) = ok {
-                inspect_primitive(raw_primitive(*ty))?;
+                inspect_primitive(raw_primitive(*ty), mode)?;
             }
             if let Some(ty) = err {
-                inspect_primitive(raw_primitive(*ty))?;
+                inspect_primitive(raw_primitive(*ty), mode)?;
             }
             Ok(())
         }
@@ -3505,7 +3626,7 @@ fn inspect_defined_type(
         RawDefinedType::Future(payload) => {
             require_async(mode)?;
             if let Some(payload) = payload {
-                inspect_primitive(raw_primitive(*payload))?;
+                inspect_primitive(raw_primitive(*payload), mode)?;
             }
             add(
                 &mut summary.async_abi.future_types,
@@ -3517,7 +3638,7 @@ fn inspect_defined_type(
         RawDefinedType::Stream(payload) => {
             require_async(mode)?;
             if let Some(payload) = payload {
-                inspect_primitive(raw_primitive(*payload))?;
+                inspect_primitive(raw_primitive(*payload), mode)?;
             }
             add(
                 &mut summary.async_abi.stream_types,
@@ -3540,8 +3661,12 @@ fn check_shape_len(length: usize) -> Result<(), DecodeError> {
     }
 }
 
-fn inspect_primitive(primitive: Option<PrimitiveValType>) -> Result<(), DecodeError> {
+fn inspect_primitive(
+    primitive: Option<PrimitiveValType>,
+    mode: InspectionMode,
+) -> Result<(), DecodeError> {
     match primitive {
+        Some(PrimitiveValType::F32 | PrimitiveValType::F64) if mode.allows_scalar_float() => Ok(()),
         Some(PrimitiveValType::F32 | PrimitiveValType::F64 | PrimitiveValType::ErrorContext) => {
             Err(DecodeError::Unsupported)
         }

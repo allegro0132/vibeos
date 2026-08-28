@@ -134,9 +134,17 @@ RUSTC="$(rustup which --toolchain nightly-2026-08-01 rustc)" \
   --target riscv64imac-unknown-none-elf
 # Fresh release build plus candidate-specific LLVM/object audit.
 python3 scripts/verify-c88-f2-riscv-object.py
+# C8.8-F3 acceptance-only WIT/Canonical ABI scalar-float gates
+cargo test --locked --offline -p vibeos-component-runtime \
+  --features c88-f3-acceptance
+python3 -B scripts/verify-c88-f3-riscv-object.py --self-test
+# Fresh release build plus F3 workspace-owned LLVM/object audit. This is not
+# QEMU or physical-target execution.
+python3 -B scripts/verify-c88-f3-riscv-object.py
 cargo fmt -p vibeos-component-format -- --check
 cargo fmt -p vibeos-wasm-runtime -- --check
 cargo fmt -p vibeos-wasm-float-candidate -- --check
+cargo fmt -p vibeos-component-runtime -- --check
 git diff --check
 ```
 
@@ -633,9 +641,9 @@ release-object audit distinguishes the candidate fork from stock Profile 1 and
 rejects semantic FP LLVM operations, compiler float helpers, and target F/D
 instructions; sign-only LLVM forms must lower to integer bit operations.
 
-F1 and F2 are complete, and C8.8-F3 is next. F2 provides no WIT/Canonical ABI,
-production activation, fixed-QEMU execution, or physical evidence, so Float
-and C8.8 remain incomplete. The full contract is in
+F1 through F3 are complete, and C8.8-F4 is next. F3 provides no production
+admission, fixed-QEMU execution, or physical evidence, so Float and C8.8
+remain incomplete. The full contract is in
 [docs/WASM_FLOAT_PROFILE.md](docs/WASM_FLOAT_PROFILE.md). Milk-V Duo physical
 testing remains paused.
 

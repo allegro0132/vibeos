@@ -50,7 +50,31 @@ python3 -B scripts/verify-c83-runtime-costs.py --selftest --check-manifest
 python3 -B scripts/qemu-c83-runtime-costs.py --allow-dirty-smoke
 python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
 python3 -B scripts/verify-c83-evidence.py --selftest
+# Retained Duo-v1 physical transcript contract
 python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
+# Current fixed-QEMU decision contract
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -I -B -S -X pycache_prefix=/var/empty/vibeos-c84-python-pyc scripts/verify-c84-qemu-aot-decision.py --selftest --check-manifest
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -I -B -S -X pycache_prefix=/var/empty/vibeos-c84-python-pyc scripts/c84-qemu-aot-decision-peer.py --selftest
+./scripts/run-c84-qemu-aot-decision.sh --selftest
+# Formal mode additionally requires the clean pushed codex/wasm commit, a live
+# fixed-remote query, raw cat-file export of exact commit/gitlink blobs with
+# safe byte-identified local configs, no filters/rewrite, GIT_NO_LAZY_FETCH,
+# and a fresh private Cargo target,
+# plus private QEMU/OpenSBI/kernel copies and pinned /usr/bin/ssh on Darwin SSV.
+# Cargo runs from / with an absolute manifest and the checksum-verified
+# 213-package union of project plus pinned rust-src Cargo.lock inputs. Its
+# private CARGO_HOME is config-only before/after; fixed-clock `.global-cache`,
+# two empty package locks, and the registry tag are exact-gated then removed
+# and fsynced. PATH/tools, SOURCE_DATE_EPOCH, the direct archive path, and
+# pre/post full-toolchain/rust-src/crate/ld.lld closure are independently bound.
+# Firmware search, QEMU version, and live QEMU share one exact deny-by-default
+# environment. One actual argv reaches the process and evidence; the verifier
+# independently normalizes it. Source/custody QEMU have pre/post/final Mach-O
+# closure plus absent module-search dirs on the exact Darwin SSV/build.
+# The formal launcher also pins CPython 3.14.6, disables site and bytecode
+# loading, and verifies Python.app, stdlib, _hashlib/_lzma/_zstd, linked libs,
+# and OPENSSL_CONF=/dev/null plus OPENSSL_MODULES=/var/empty.
+# Shared publisher plus retained Duo-v1 software custody gates
 python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
 bash -n scripts/build-milkv-duo.sh scripts/package-milkv-duo-sdk.sh \
   scripts/verify-milkv-duo-image.sh
@@ -414,23 +438,73 @@ in [docs/WASM_RUNTIME_COSTS.md](docs/WASM_RUNTIME_COSTS.md). Its dedicated image
 emits target-owned raw `rdtime` samples for validation, startup, Canonical ABI,
 native-async primitives, validation-only composition, host calls, memory, fuel,
 cancellation, and revocation. The independent host verifier owns the closed
-schema and all derived statistics. A dirty QEMU smoke run is useful integration
-evidence but cannot export a baseline; C8.3 remains open until one fixed QEMU
-boot and three real cold Duo boots from the same clean preparation commit are
-published. Physical capture also requires the canonical `package-envelope.json`
+schema and all derived statistics. The original publication contract required
+one fixed QEMU boot and three real cold Duo boots from the same clean
+preparation commit; that tooling remains available, but C8.3 is accepted
+complete by historical-evidence policy and is not being rerun. Physical capture
+would also require the canonical `package-envelope.json`
 and image-verifier audit emitted by the pinned Linux/amd64 SDK packaging flow;
 the C8.3 record's container digest is an operator assertion, not hardware
 attestation.
 
-The C8.4 AOT-decision preparation contract is documented in
-[docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md). It freezes the exact
-authorized SSH `case-filter` product workload, its physical-Duo response
-budget, the mutually exclusive profiling phases, and the fail-closed decision
-rule before any profiling result exists. The independent verifier checks the
-checked-in workload/schema bytes against the executable image pin and OpenSSH
-fixture. This preparation gate neither completes C8.3 nor authorizes AOT;
-fixed-QEMU runs are integration evidence only, and a final decision requires
-the documented physical-Duo sample set.
+The C8.4 AOT-decision contracts are documented in
+[docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md). They freeze the exact
+authorized SSH `case-filter` product workload, mutually exclusive profiling
+phases, and fail-closed rules before any result exists. The decision-bearing
+QEMU-v1 contract fixes one fresh `virt`/RV64/TCG single-thread process with
+instruction counting, 3 warmups plus 21 retained samples, a 10 MHz clock, a
+1,000,000-tick budget, and a 1.10 stability ceiling. C1 through C8.3 are
+accepted complete by historical-evidence policy. The retained Duo contract is
+non-blocking while physical testing stays paused. Neither possible fixed-QEMU
+outcome authorizes AOT or accepts native code.
+
+Formal source custody inventories the superproject commit and both exact
+gitlinks, then writes only raw, independently OID-checked `git cat-file
+--batch` blob bytes with reviewed modes. It does not use checkout or Git
+clean/smudge conversion. Every Git command disables replacement objects and
+lazy fetching (`GIT_NO_LAZY_FETCH=1`) and ignores system/global configuration.
+The superproject and submodule local config files are byte-identified and
+parsed explicitly with `--no-includes` through a default-deny safe-key/value
+policy; filter configuration, URL rewrites, includes, and unknown keys fail
+closed. The formal fixed-remote query runs from `/` with no `/.git`. Dirty
+smoke still requires the fixed configured origin, but records its Cargo source
+as `<dirty-worktree>/firmware/qemu-virt/Cargo.toml` and can never claim the
+formal `<materialized-source>` provenance.
+
+The formal build uses exact PATH `/opt/homebrew/bin:/usr/bin:/bin`, the exact
+`cargo`, `rustc`, and `rustdoc` under the pinned toolchain root,
+`SOURCE_DATE_EPOCH` equal to the attested commit timestamp, and a canonical
+direct private crate-archive path distinct from the extracted source tree. It
+audits both the project and pinned rust-src locks into the fixed 213-package
+private directory source. Cargo's fixed cache clock and umask make the required
+SQLite cache, two empty package locks, and registry tag exact outputs; they are
+validated and recorded before removal/fsync, and an unknown private-home entry
+fails rather than being cleaned away.
+Firmware search, the version probe, and the live QEMU process all receive the
+same deny-by-default QEMU environment. The runner constructs one immutable
+actual argv and gives that value to the only QEMU process launch and evidence
+writer; the independent verifier validates the custody paths/host port and
+normalizes it independently before comparison with the fixed semantic argv.
+
+Both the source QEMU and byte-identical execution-custody copy carry identical
+before/after/final recursive non-system Mach-O closures. Homebrew edges remain
+inside the Cellar; system edges are limited to `/System/Library/` and
+`/usr/lib/` and bind the sealed read-only APFS root plus macOS 26.5.2, build
+`25F84`, Darwin `25.5.0`. Plugin argv and `QEMU_MODULE_DIR` are absent and the
+frozen module-search directories must not exist. This evidence accepts an
+explicit operational limit: same-UID host exclusivity is required because
+snapshots cannot exclude a swap-and-restore during the live process. It also
+makes no generic library-internal `dlopen` claim beyond the recursive Mach-O
+load-command graph.
+
+The pinned Python closure includes the Framework and Python.app executable,
+the reachable stdlib, `_hashlib`/libcrypto, `_lzma`/liblzma,
+`_zstd`/libzstd, and the xz/zstd symlink chains. Its empty-then-exact launch
+environment sets `OPENSSL_CONF=/dev/null` and `OPENSSL_MODULES=/var/empty`;
+the null device, empty provider directory, and SHA-256 known-answer result are
+verified. Finally, transcript parsing rejects every occurrence matching
+`WASM_[A-Z0-9_]+ FAIL`, including unknown future markers, before accepting the
+finite expected marker set.
 
 The image-policy command above enables `c84-profile-hooks` only through its
 dev-dependency and replays the exact 12,325-byte frozen input. It locks the
@@ -449,8 +523,8 @@ target sample, not a mathematical worst case.
 Formal samples must be complete and self-consistent; overflow or truncation is
 diagnostic-only.
 
-The C8.4 single-boot verifier self-test also closes one synthetic raw
-cold-boot transcript at a time:
+The retained physical C8.4 single-boot verifier self-test also closes one
+synthetic raw cold-boot transcript at a time:
 one metadata record, three warmups, 21 retained samples, and one end record. It
 rejects malformed JSON, wrong coordinates or campaign identity, incomplete or
 unmerged phase intervals, invalid fuel/poll counters, unstable retained data,
@@ -459,17 +533,18 @@ symlink and hardlink alias rejection, no-clobber summary creation, explicit
 overwrite, exact reread, and protected verifier inputs. A passing single-boot
 check reports physical and cold-boot provenance as unverified.
 
-The C8.4 software-side closure now also has independent immutable source
-materialization, content-addressed build/package envelopes, host-observed
-Docker runtime custody, a full-SD-image verifier, a deliberately read-only
-three-boot UART capture program, and a final evidence verifier. The CI-safe
-commands listed above exercise source/config/path replacement attacks, runtime
-inspect/namespace mutations, shell syntax, raw-image parser mutations, capture
-stream/tree/no-clobber mutations, exact three-boot aggregation, and final
-evidence closure using synthetic host files. The source and runtime self-tests
-use only local fixtures, and `capture-c84-duo-aot-decision.py --selftest` never
-opens a serial device; no listed self-test invokes Docker, downloads an SDK,
-flashes media, resets a board, or claims a physical boot.
+The retained Duo-v1 physical C8.4 software-side closure has independent
+immutable source materialization, content-addressed build/package envelopes,
+host-observed Docker runtime custody, a full-SD-image verifier, a deliberately
+read-only three-boot UART capture program, and a final evidence verifier. The
+CI-safe commands listed above exercise source/config/path replacement attacks,
+runtime inspect/namespace mutations, shell syntax, raw-image parser mutations,
+capture stream/tree/no-clobber mutations, exact three-boot aggregation, and
+final evidence closure using synthetic host files. The source and runtime
+self-tests use only local fixtures, and
+`capture-c84-duo-aot-decision.py --selftest` never opens a serial device; no
+listed self-test invokes Docker, downloads an SDK, flashes media, resets a
+board, or claims a physical boot.
 
 The source proof deliberately separates namespaces: host materialization and
 offline verification bind the exact device/inode sets, while the fixed
@@ -481,19 +556,20 @@ attestation and separately runs the complete package-mode verifier because its
 image report still binds the package attestation. This accommodates Docker
 Desktop inode remapping without weakening the host-side independence proof.
 
-The final evidence gate binds three distinct boot indexes, revalidates the
+The retained physical evidence gate binds three distinct boot indexes, revalidates the
 independently frozen C8.4 source and offline container-runtime closure, reruns
 the complete C8.3 evidence verifier from that explicit full preparation
 commit, and independently derives nearest-rank p50/p95 from all 63 retained
-samples. A C8.4 result cannot exist unless that committed C8.3 tree is complete
-and byte-identical. Current execution status (2026-08-27): Milk-V Duo physical
-testing is paused at operator request, so C8.3 and C8.4 remain open; there is no
-complete three-cold-boot physical capture set and no workload-specific AOT
-decision. Source immutability and Docker runtime custody are closed in the
-software pipeline, but the runtime record remains local software evidence, not
-hardware, TPM, remote-attestation, or physical-cold-boot proof.
+samples. It remains available for future qualification but no longer blocks
+C8.4. Current execution status (2026-08-28): Milk-V Duo physical testing is
+paused, C1 through C8.3 are accepted by historical evidence, and the disjoint
+fixed-QEMU C8.4 contract is being prepared. No workload-specific AOT decision
+is claimed yet. Source immutability and Docker runtime custody remain local
+software evidence, not hardware, TPM, remote-attestation, or
+physical-cold-boot proof.
 See [docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md) for the deferred
-formal build, package, image-verification, capture, and publication commands.
+Duo-v1 physical formal build, package, image-verification, capture, and
+publication commands.
 
 The portable C8.4 hook gate above exercises the default-off, caller-clocked
 boundary around the real synchronous Core poll. It proves ordinary and
@@ -1043,18 +1119,24 @@ The default-off
 opaque trusted bundle inside the kernel. A build-bound portable campaign owns
 the factory, sequence, accumulator, and 24-sample chain; after one META it
 accepts epochs 1 through 24, discards three warmups, retains 21 samples, checks
-nearest-rank p50/p95 stability, and commits END before Ready epoch 25 becomes
-visible. Complete/Failed states (diagnostic `closed`/`failed`) reject before
-target start, and every failure after META is absorbing. The physical Milk-V
-sink holds TTY then TX across each
-raw-LF formal record. Framing, write, commit, panic, or allocator failure keeps
-the record fail-stopped; only a fully drained commit releases TX then TTY.
+nearest-rank p50/p95 stability, then splits Ready epoch 25 from the sole
+PendingEnd authority. Ready25 is already back in the target slot, but
+`PendingTerminal` makes every prepare Busy until all fallible request-tail
+gates succeed and the finalizer commits END. A non-final SAMPLE is similarly
+fenced by `PendingAcceptance`. Abandonment or END acquire/write/commit failure
+is absorbing and never retries; Complete/Failed states (diagnostic
+`closed`/`failed`) reject before target start. The platform-neutral
+formal UART sink holds TTY then TX across each raw-LF record for either the
+retained Milk-V contract or the disjoint fixed-QEMU contract. Framing, write,
+commit, panic, or allocator failure keeps the record fail-stopped; only a fully
+drained commit releases TX then TTY.
 For a terminal collector state, SSHD accepts the exec request only far enough
 to drain empty stdout plus exit status 126, EOF, and CLOSE; the rejection owns
 no command, Component, profile permit, or target-start path.
 
-The QEMU acceptance uses the same collector and serializer with an absorbing
-SHA-256/byte-count audit sink. It performs one failed boot and one successful
+The older diagnostic single-boot-collector QEMU acceptance uses the same
+collector and serializer with an absorbing SHA-256/byte-count audit sink. It
+performs one failed boot and one successful
 24-request boot, but writes no formal record bytes to UART and marks every
 diagnostic line `decision_eligible=0 formal_uart=0`. The host parser freezes
 both logs, validates all predecessor/collector counts and order, and rejects
@@ -1075,10 +1157,11 @@ source tree. The build runs in a sanitized `env -i` envelope with an isolated
 Cargo home, the pinned Rust tools, a fixed `ld.lld`, commit-derived
 `SOURCE_DATE_EPOCH`, and isolated objcopy. CI injects hostile ambient wrapper,
 profile, and rustflag values; the build must ignore all three. It neither runs
-nor retains that artifact. A decision-eligible capture additionally requires
-that same frozen-source materialization and host-observed runtime closure, a
-real physical cold boot, and the documented three-boot/63-retained-sample
-verification flow; none is supplied by this compile gate.
+nor retains that artifact. A Duo-v1 physical decision capture additionally
+requires that same frozen-source materialization and host-observed runtime
+closure, a real physical cold boot, and the documented
+three-boot/63-retained-sample verification flow; none is supplied by this
+compile gate and none is required by the disjoint fixed-QEMU decision contract.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The

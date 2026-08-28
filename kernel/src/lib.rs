@@ -123,7 +123,10 @@ compile_error!(
 #[cfg(all(
     feature = "wasm-c84-ssh-managed-child-single-boot-collector",
     feature = "qemu-virt",
-    not(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")
+    not(any(
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+        feature = "wasm-c84-qemu-aot-decision"
+    ))
 ))]
 compile_error!(
     "feature `wasm-c84-ssh-managed-child-single-boot-collector` cannot expose physical formal records on QEMU"
@@ -133,12 +136,55 @@ compile_error!(
     feature = "wasm-c84-ssh-managed-child-single-boot-collector",
     not(any(
         feature = "milkv-duo",
-        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+        feature = "wasm-c84-qemu-aot-decision"
     ))
 ))]
 compile_error!(
-    "feature `wasm-c84-ssh-managed-child-single-boot-collector` requires Milk-V Duo or its absorbing QEMU acceptance"
+    "feature `wasm-c84-ssh-managed-child-single-boot-collector` requires Milk-V Duo, its absorbing QEMU acceptance, or the formal QEMU contract"
 );
+
+#[cfg(all(feature = "wasm-c84-qemu-aot-decision", not(feature = "qemu-virt")))]
+compile_error!("feature `wasm-c84-qemu-aot-decision` is QEMU-only");
+
+#[cfg(all(feature = "wasm-c84-qemu-aot-decision", feature = "milkv-duo"))]
+compile_error!("feature `wasm-c84-qemu-aot-decision` cannot claim Milk-V Duo provenance");
+
+#[cfg(all(
+    feature = "wasm-c84-qemu-aot-decision-smoke",
+    not(feature = "wasm-c84-qemu-aot-decision")
+))]
+compile_error!("feature `wasm-c84-qemu-aot-decision-smoke` must layer on the formal QEMU image");
+
+#[cfg(all(
+    feature = "wasm-c84-qemu-aot-decision",
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
+))]
+compile_error!("formal and absorbing C8.4 QEMU collectors are mutually exclusive");
+
+// The decision image measures the production workload path. Diagnostic
+// acceptance features add UART formatting and synthetic SSIPs inside active
+// intervals, so Cargo feature unification must fail instead of silently
+// contaminating a formal or dirty-smoke transcript.
+#[cfg(all(
+    feature = "wasm-c84-qemu-aot-decision",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance",
+        feature = "wasm-c84-ssh-request-parent-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance"
+    )
+))]
+compile_error!("formal C8.4 QEMU decision images exclude diagnostic QEMU acceptance telemetry");
 
 #[cfg(all(
     feature = "wasm-c84-ssh-managed-child-single-boot-collector",
@@ -174,7 +220,8 @@ compile_error!(
     feature = "wasm-c84-ssh-managed-child-trusted-sample",
     feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
     not(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance"),
-    not(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")
+    not(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"),
+    not(feature = "wasm-c84-qemu-aot-decision")
 ))]
 compile_error!(
     "feature `wasm-c84-ssh-managed-child-trusted-sample` cannot reuse the discard-only finish/verify QEMU transcript"
@@ -183,7 +230,10 @@ compile_error!(
 #[cfg(all(
     feature = "wasm-c84-ssh-managed-child-single-boot-collector",
     feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
-    not(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance")
+    not(any(
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+        feature = "wasm-c84-qemu-aot-decision"
+    ))
 ))]
 compile_error!(
     "feature `wasm-c84-ssh-managed-child-single-boot-collector` cannot reuse the discard-only finish/verify QEMU transcript"
@@ -198,7 +248,8 @@ compile_error!(
         feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
         feature = "wasm-c84-profile-child-delegation-qemu-acceptance",
         feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
-        feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance"
+        feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",
+        feature = "wasm-c84-qemu-aot-decision"
     )
 ))]
 compile_error!("C8.4 QEMU acceptances are isolated images");

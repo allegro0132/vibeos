@@ -303,10 +303,10 @@ def verify_direct_cfg(inputs: Inputs) -> None:
     kernel_root = CORE.without_direct_feature_units(kernel_root, COLLECTOR_QEMU_FEATURE)
     sources = (
         ("SSH", ssh, 4, 7, 8, 12),
-        # The fifth and sixth all-form QEMU references are the trusted sibling
-        # and its private collector successor pairing guards against reuse of
-        # this predecessor's discard transcript.
-        ("kernel root", kernel_root, 0, 1, 0, 6),
+        # The fifth through seventh all-form QEMU references are the trusted
+        # sibling, its private collector successor, and the disjoint formal
+        # QEMU image guards against reuse of this predecessor's transcript.
+        ("kernel root", kernel_root, 0, 1, 0, 7),
     )
     for label, source, base_direct, base_all, qemu_direct, qemu_all in sources:
         rust = CORE.rust_mask(source, literals=False)
@@ -485,8 +485,8 @@ def verify_sshd_boundary(source: str) -> None:
 
 
 def verify_ssh(source: str) -> None:
-    source = CORE.without_direct_feature_units(source, COLLECTOR_FEATURE)
     source = CORE.without_direct_feature_units(source, COLLECTOR_QEMU_FEATURE)
+    source = CORE.without_direct_feature_units(source, COLLECTOR_FEATURE)
     trusted_owner = find_scope(
         source, r"\bimpl\s+SshExecProfileOwner\b", "trusted SSH profile owner"
     )

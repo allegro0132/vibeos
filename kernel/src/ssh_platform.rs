@@ -411,7 +411,8 @@ impl SshExecProfileOwner {
                 )]
                 collector_trusted_sample_response(epoch, &_terminal_evidence)?;
                 #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
-                crate::wasm_aot_profile_slot::collector_emit_success(_terminal_evidence.collector);
+                crate::wasm_aot_profile_slot::collector_emit_success(_terminal_evidence.collector)
+                    .map_err(|_| ())?;
                 Ok(())
             }
             Ok(_) => {

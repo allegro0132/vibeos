@@ -53,6 +53,7 @@ COLLECTOR_FEATURE = "wasm-c84-ssh-managed-child-single-boot-collector"
 COLLECTOR_QEMU_FEATURE = (
     f"{COLLECTOR_FEATURE}-qemu-acceptance"
 )
+QEMU_DECISION_FEATURE = "wasm-c84-qemu-aot-decision"
 FAMILY = "WASM_C84_SSH_MANAGED_CHILD_TRUSTED_SAMPLE"
 SUCCESSOR_SUFFIX = (
     "finish=1 verify=1 bundle=trusted discard=trusted_sample_abandoned "
@@ -93,12 +94,12 @@ PEER_CI_STEP = (
     "        run: python3 -B scripts/c84-ssh-managed-child-trusted-sample-peer.py --selftest"
 )
 QEMU_SCRIPT_SHA256 = "696bd95b286808e0f9c732258ba86caa46d81f75ce7ebd41fc30d0922a6e0f76"
-PEER_SCRIPT_SHA256 = "928931ae0f2fbbc3ad769546037a41f0301dac872899bfa5e40c77dc8953ac68"
+PEER_SCRIPT_SHA256 = "04bd24f476b8d9b4bef9d0e90be04f76f19c2f116aece45edb8eb32fdc47dd37"
 PEER_DEPENDENCY_SHA256 = (
-    "41b7e03a52fec285c3a5d35967047d708c683334890fb52e3f31db64cbf2c6b6",
-    "6814a9c66a5b5d678b47181a5607537697c8ac8349c59acc79d5ef6291f0972d",
-    "f0a9b77bab25c57428ed111f4c8e9531e7486c46e5d4a4b7cc2c011d970f4fa9",
-    "11e792ab2dadd67653ba2c4fbfb79c5424cf47ea71e8ed87bdbf67c815c7ea0a",
+    "ae8e87dd47acdab4b6e7bc6fcdfd78ba0ee8240ce1576eea9e19b8d73e2f51a2",
+    "d12fbd9144aee264ce39048fc7fac9b5ba34e7685a7f26cab96b7b9f8889a72e",
+    "82ebcc586f848d6c8d3eb4e5ab38c8645a7e2ca52b126690d55d3969650323d5",
+    "8127b38245565581c540ee6ba264ffb184728861aba43a595a191b6f33463935",
     "00d5002a8f2725c275995b1eff5d469f1d1eac1741b1eaef3f3623c3c746ac8c",
     "b4d7316f66b96e4742cddaf12ae0904d79b982af98b7e3c32e24ac986dcf07f5",
 )
@@ -281,12 +282,13 @@ def verify_features(inputs: Inputs) -> None:
     pairing = (
         f'#[cfg(all(feature="{FEATURE}",feature="{FINISH_QEMU_FEATURE}",'
         f'not(feature="{QEMU_FEATURE}"),'
-        f'not(feature="{COLLECTOR_QEMU_FEATURE}")))]compile_error!('
+        f'not(feature="{COLLECTOR_QEMU_FEATURE}"),'
+        f'not(feature="{QEMU_DECISION_FEATURE}")))]compile_error!('
         f'"feature`{FEATURE}`cannotreusethediscard-onlyfinish/verifyQEMUtranscript");'
     )
     require(
         pairing in root,
-        "trusted base QEMU pairing guard differs from its two exact acceptance exemptions",
+        "trusted base QEMU pairing guard differs from its three exact acceptance exemptions",
     )
     isolation = (
         f'#[cfg(all(feature="{QEMU_FEATURE}",any('
@@ -1840,8 +1842,16 @@ def exact_print_call(scope, marker: str, arguments: str, label: str) -> None:
 
 
 def verify_ssh(inputs: Inputs) -> None:
-    source = PHASE.CORE.without_direct_feature_units(inputs.ssh, COLLECTOR_FEATURE)
-    source = PHASE.CORE.without_direct_feature_units(source, COLLECTOR_QEMU_FEATURE)
+    try:
+        # Only the diagnostic collector emits the predecessor response marker.
+        # The formal-QEMU decision path deliberately carries no diagnostic
+        # qemu-acceptance telemetry.
+        source = PHASE.CORE.without_direct_feature_units(
+            inputs.ssh, COLLECTOR_QEMU_FEATURE
+        )
+        source = PHASE.CORE.without_direct_feature_units(source, COLLECTOR_FEATURE)
+    except CORE.VerificationError as error:
+        raise VerificationError(str(error)) from error
     inputs = replace(inputs, ssh=source)
     ssh_code = semantic(inputs.ssh)
     predecessor_helper_guard = (
@@ -2194,13 +2204,13 @@ def verify_docs_ci(inputs: Inputs) -> None:
         "CI trusted SSHD feature-test command count differs",
     )
     require(
-        "**Status (2026-08-27): implementation in progress.**" in inputs.roadmap,
+        "**Status (2026-08-28): implementation in progress.**" in inputs.roadmap,
         "WASM roadmap still presents the implementation as wholly planned",
     )
     for text in (
         "live trusted-terminal",
         "private 24-sample collector",
-        "final workload-specific AOT decision",
+        "no workload-specific AOT decision exists yet",
     ):
         require(text in inputs.roadmap, f"WASM roadmap trusted status omits {text!r}")
     normalized_docs = {
@@ -2646,8 +2656,10 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
                 data,
                 "kernel_root",
                 f'    not(feature = "{QEMU_FEATURE}"),\n'
-                f'    not(feature = "{COLLECTOR_QEMU_FEATURE}")\n',
-                f'    not(feature = "{QEMU_FEATURE}")\n',
+                f'    not(feature = "{COLLECTOR_QEMU_FEATURE}"),\n'
+                f'    not(feature = "{QEMU_DECISION_FEATURE}")\n',
+                f'    not(feature = "{QEMU_FEATURE}"),\n'
+                f'    not(feature = "{QEMU_DECISION_FEATURE}")\n',
                 "collector QEMU trusted-pairing exemption",
             ),
         ),
@@ -2657,10 +2669,66 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
                 data,
                 "kernel_root",
                 f'    not(feature = "{QEMU_FEATURE}"),\n'
-                f'    not(feature = "{COLLECTOR_QEMU_FEATURE}")\n',
+                f'    not(feature = "{COLLECTOR_QEMU_FEATURE}"),\n'
+                f'    not(feature = "{QEMU_DECISION_FEATURE}")\n',
                 f'    not(feature = "{QEMU_FEATURE}"),\n'
-                '    not(feature = "wasm-c84-ssh-managed-child-single-boot-collector")\n',
+                '    not(feature = "wasm-c84-ssh-managed-child-single-boot-collector"),\n'
+                f'    not(feature = "{QEMU_DECISION_FEATURE}")\n',
                 "collector QEMU trusted-pairing exemption scope",
+            ),
+        ),
+        (
+            "qemu-decision-root-exemption-removed",
+            lambda data: mutate_text(
+                data,
+                "kernel_root",
+                f'    not(feature = "{COLLECTOR_QEMU_FEATURE}"),\n'
+                f'    not(feature = "{QEMU_DECISION_FEATURE}")\n',
+                f'    not(feature = "{COLLECTOR_QEMU_FEATURE}")\n',
+                "formal QEMU trusted-pairing exemption",
+            ),
+        ),
+        (
+            "qemu-decision-root-exemption-broadened",
+            lambda data: mutate_text(
+                data,
+                "kernel_root",
+                f'    not(feature = "{COLLECTOR_QEMU_FEATURE}"),\n'
+                f'    not(feature = "{QEMU_DECISION_FEATURE}")\n',
+                f'    not(feature = "{COLLECTOR_QEMU_FEATURE}"),\n'
+                f'    not(any(feature = "{QEMU_DECISION_FEATURE}", '
+                'feature = "wasm-c84-profile-slot-qemu-acceptance"))\n',
+                "formal QEMU trusted-pairing exemption scope",
+            ),
+        ),
+        (
+            "collector-marker-diagnostic-cfg-removed",
+            lambda data: mutate_text(
+                data,
+                "ssh",
+                '                #[cfg(\n'
+                f'                    feature = "{COLLECTOR_QEMU_FEATURE}"\n'
+                "                )]\n"
+                "                collector_trusted_sample_response(epoch, &_terminal_evidence)?;",
+                "                collector_trusted_sample_response(epoch, &_terminal_evidence)?;",
+                "collector marker diagnostic cfg",
+            ),
+        ),
+        (
+            "collector-marker-inherits-formal-qemu",
+            lambda data: mutate_text(
+                data,
+                "ssh",
+                '                #[cfg(\n'
+                f'                    feature = "{COLLECTOR_QEMU_FEATURE}"\n'
+                "                )]\n"
+                "                collector_trusted_sample_response(epoch, &_terminal_evidence)?;",
+                '                #[cfg(any(\n'
+                f'                    feature = "{COLLECTOR_QEMU_FEATURE}",\n'
+                f'                    feature = "{QEMU_DECISION_FEATURE}"\n'
+                "                ))]\n"
+                "                collector_trusted_sample_response(epoch, &_terminal_evidence)?;",
+                "collector marker formal-QEMU inheritance",
             ),
         ),
         (
@@ -3768,8 +3836,8 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             lambda data: mutate_text(
                 data,
                 "roadmap",
-                "**Status (2026-08-27): implementation in progress.**",
-                "**Status (2026-08-27): planned.**",
+                "**Status (2026-08-28): implementation in progress.**",
+                "**Status (2026-08-28): planned.**",
                 "WASM roadmap implementation status",
             ),
         ),

@@ -1,20 +1,238 @@
-# C8.4 AOT decision preparation contract
+# C8.4 AOT decision contracts
 
-This document freezes the workload, measurement boundary, physical budget, and
-decision rule for C8.4. It is **preparation only**: no physical C8.4 result has
-been collected, C8.3 is still incomplete until its three physical-Duo cold
-boots are published, and this contract does not authorize AOT or native
-component bytes.
-The build/package/image/capture/final-verifier software path is implemented and
-has host-only synthetic coverage, including an independent frozen-source
-envelope and local Docker runtime custody. Current execution status
-(2026-08-27): Milk-V Duo physical testing is paused at operator request, so
-none of those software gates is evidence that a board booted and both C8.3 and
-C8.4 remain open. The Docker closure is software provenance, not hardware or
-remote attestation.
+As of 2026-08-28, the decision-bearing C8.4 contract is the independent
+fixed-QEMU v1 contract. C1 through C8.3 are accepted as complete by the
+project's historical-evidence policy. Milk-V Duo execution remains paused at
+operator request and is not a prerequisite for this decision. The QEMU result
+will be explicitly emulator-scoped: it cannot claim, imply, or be renamed into
+physical-Duo performance evidence.
 
-The machine-readable contract is
+The new contract is still **preparation only** until its runner and verifier
+are committed and one clean-source QEMU transcript passes the publication
+gate. Neither possible outcome authorizes AOT or accepts native component
+bytes. It only determines whether C8.5 becomes the next design-review node.
+
+The decision-bearing machine-readable contracts are
+[`benchmarks/wasm-aot-decision/workloads-qemu-v1.json`](../benchmarks/wasm-aot-decision/workloads-qemu-v1.json)
+and
+[`benchmarks/wasm-aot-decision/schema-qemu-v1.json`](../benchmarks/wasm-aot-decision/schema-qemu-v1.json).
+The strict summary, environment, and final-decision envelopes are defined by
+[`benchmarks/wasm-aot-decision/evidence-schema-qemu-v1.json`](../benchmarks/wasm-aot-decision/evidence-schema-qemu-v1.json);
+that evidence schema is deliberately not part of the target transcript run ID.
+The earlier physical contract is retained, unchanged and non-blocking, in
 [`benchmarks/wasm-aot-decision/workloads-v1.json`](../benchmarks/wasm-aot-decision/workloads-v1.json).
+
+## Fixed-QEMU decision envelope
+
+The platform ID is `qemu-virt-rv64-tcg-icount-v1`: `virt`, RV64, one hart,
+128 MiB, `tcg,thread=single`, and
+`-icount shift=0,align=off,sleep=off`. The runner must name an explicit
+`opensbi-riscv64-generic-fw_dynamic.bin`; `-bios default` is forbidden. QEMU,
+OpenSBI, OpenSSH, kernel, toolchain, the complete QEMU argv, and every Python
+helper reachable from the runner/peer chain are recorded in the evidence
+envelope. The canonical SSH host public key and fingerprint are embedded
+rather than referring to a deleted temporary file. For formal verification,
+QEMU is frozen to version `11.0.3`, SHA-256
+`ef5c714232320c22561daa0998546b73672e21a2801404714dfbd4982ac7b3c0`
+and 13,511,488 bytes; OpenSBI is frozen to SHA-256
+`49bdf7b939bda11321132d1042bf99d7324fb190f1feef423171fed3573f8705`
+and 273,048 bytes. QEMU, BIOS, and the private kernel are re-hashed, copied into
+one randomized private directory, sealed to `0500`/`0400` with a `0500`
+directory, and executed only from those byte-identical copies.
+
+The runner constructs the absolute, custody-bearing QEMU argv once as an
+immutable tuple. That same tuple is passed directly to the sole `Popen` call
+and to the evidence writer; no second command reconstruction is allowed. The
+evidence retains both the actual argv and its path/port-normalized form. The
+independent verifier starts from the actual argv, validates the three shared
+custody paths and unique host-forward port, independently performs the only
+permitted normalization, and requires the result to equal the frozen semantic
+argv contract.
+
+The formal build has a separate closed input envelope. It audits the 189
+crates.io packages in the exact project `Cargo.lock` and the 30 in pinned
+rust-src `library/Cargo.lock`, rejects a same-name/version checksum conflict,
+and materializes their deterministic 213-package union. Project packages are
+checksum-verified safe extractions from the fixed launcher cache; the 24
+rust-src-only packages are copied from pinned `library/vendor` only after its
+checksum inventory, file types, paths, bytes, and modes are independently
+verified. Cargo is then invoked by its absolute toolchain path from cwd `/`,
+with an absolute manifest and a `0700` private `CARGO_HOME` containing exactly
+one immutable generated `config.toml`; the reviewed
+`firmware/.cargo/config.toml` bytes are preserved and fixed cache-GC plus
+private source-replacement sections are appended. This prevents an ancestor
+such as `/tmp/.cargo` from participating. Before any Rust tool is
+executed, the fixed RUSTUP_HOME/channel/host triple is used to derive and hash
+the complete nightly toolchain and rust-src trees without executing rustup.
+Those trees, the private crate tree and Cargo home, root-config absence, and
+the recursive non-system `ld.lld` Mach-O closure are checked again after build
+and by both independent-verifier passes. The build PATH is exactly
+`/opt/homebrew/bin:/usr/bin:/bin`; `cargo`, `rustc`, and `rustdoc` must be the
+exact files under the manifest-pinned toolchain root's `bin/` directory.
+`SOURCE_DATE_EPOCH` is the decimal timestamp read from the attested source
+commit, not a caller-supplied epoch. The private crate-archive directory is
+also recorded as a canonical direct path with no leaf symlink, alongside the
+separately extracted private crate-source tree.
+
+Pinned Cargo 1.99 necessarily creates runtime cache metadata even for this
+directory source. The formal environment fixes only Cargo's cache last-use
+clock (`__CARGO_TEST_LAST_USE_NOW=1234567890`), disables automatic cache GC,
+and launches Cargo with umask `0077`. The private home must start config-only;
+after a successful full build its complete additional set must be exactly the
+pinned 57,344-byte `.global-cache`, the empty `.package-cache` and
+`.package-cache-mutate` locks, and `registry/CACHEDIR.TAG`. Their types, modes,
+link counts, bytes, SQLite header and hashes are verified and recorded before
+they are removed and the directory is fsynced; the final home must again be
+exactly config-only. No unknown entry is removed or ignored.
+
+The firmware-search probe, QEMU `--version` probe, and sole live QEMU process
+receive the same single explicit deny-by-default environment. Its complete
+allowlist is `HOME`,
+`LANG`, `LC_ALL`, `PATH`, `TMPDIR`, `TZ`, and `XDG_CONFIG_HOME`; the four fixed
+values are `LANG=C`, `LC_ALL=C`, `PATH=/usr/bin:/bin`, and `TZ=UTC`. `HOME`,
+`TMPDIR`, and `XDG_CONFIG_HOME` name fresh `0700` directories beneath the
+private campaign root. The runner does not copy the ambient environment, so
+`DYLD_*`, `QEMU_*`, additional locale variables, and host user configuration
+cannot enter either process. The manifest freezes this normalized policy and
+the evidence records it under `environment.qemu.environment`; the independent
+verifier also closes the runner source edges that feed the one created mapping
+to all three subprocesses.
+
+The source QEMU binary and its byte-identical execution-custody copy each have
+a recursive non-system Mach-O load-command closure recorded before capture,
+after QEMU exits, and immediately before evidence creation. All three records
+must remain identical within a role, and the source/custody normalized graph
+hashes must match. Non-system edges must resolve inside the Homebrew Cellar;
+only install names under `/System/Library/` or `/usr/lib/` are classified as
+system edges. Those system edges are bound to the sealed, read-only APFS root
+record and the exact host tuple macOS 26.5.2, build `25F84`, Darwin `25.5.0`.
+The contract also forbids `-plugin`, omits `QEMU_MODULE_DIR`, and requires all
+four frozen QEMU module-search locations under the Cellar/Homebrew prefix to be
+absent. This closes QEMU's module/plugin search, but does not claim arbitrary
+library-internal `dlopen` behavior beyond the recursive Mach-O load-command
+graph.
+
+The only formal entry point is `scripts/run-c84-qemu-aot-decision.sh`. It
+resolves the reviewed CPython 3.14.6 Cellar executable and verifies its exact
+52,448-byte identity plus the Framework binary and the 51,392-byte
+`Python.app/Contents/MacOS/Python` executable before using `-I -B -S -X
+pycache_prefix=/var/empty/vibeos-c84-python-pyc` under an empty-then-exact
+environment. The runner removes the normally absent zip entry from effective
+`sys.path`, excludes unreachable `site-packages` and `__pycache__`, inventories
+the full reachable stdlib/lib-dynload tree, and rechecks it at closure. The
+non-system Mach-O closure also pins `_hashlib`, `_lzma`, and `_zstd`, their
+exact extension modules, the resolved Homebrew libcrypto/liblzma/libzstd
+bytes, and the xz/zstd symlink chains. `OPENSSL_CONF=/dev/null` and
+`OPENSSL_MODULES=/var/empty` are part of the exact launch environment; the
+configuration device, empty provider directory, and an OpenSSL-backed SHA-256
+known-answer test are verified. System dylibs remain covered by the Darwin
+sealed-system policy. Maintained dynamic helpers are never loaded through importlib or
+bytecode: each stable UTF-8 source snapshot is compiled directly, tagged with
+its executed hash/length, merged through the nested peer chain, and compared
+to the evidence helper identities for both live and frozen verification.
+
+OpenSSH uses a separate Darwin sealed-system-volume custody rule because a
+byte-identical copy of an Apple platform binary can be killed when executed off
+the sealed system volume. The only accepted path is `/usr/bin/ssh`, version
+`OpenSSH_10.2p1, LibreSSL 3.3.6`, SHA-256
+`470f812f6e71ee4ca1b49c79f9c2982c054493e22502d4648bd010feb4b2a9b2`, and
+1,555,472 bytes. Before and after capture, and again at both independent
+verification boundaries, the tools require a root-owned `0755` regular
+non-symlink with one link, `SF_RESTRICTED`, the same device as `/`, a read-only
+filesystem flag, and an APFS root mount marked both `sealed` and `read-only`.
+They execute that original path in place; no ad-hoc signing transformation or
+`PATH` lookup is permitted. Pinned byte identity binds the reviewed Apple
+binary while avoiding a host-dependent `codesign --verify` trust-chain result.
+
+Local QEMU/BIOS/kernel paths and the fixed OpenSSH host path remain custody
+provenance and are excluded from the guest platform identity. This software
+custody closes ordinary path swap-and-restore races, but does not claim
+isolation from a privileged attacker able to alter or remount the sealed system
+volume. The accepted host-side limit is explicit: the operator must provide
+same-UID host exclusivity for the campaign, because pre/post/final identity
+checks cannot exclude a same-UID swap-and-restore while QEMU is live. The
+contract also makes no broader `dlopen` claim beyond the recorded QEMU
+load-command graph and explicitly frozen CPython runtime inputs.
+
+One fresh QEMU process executes three discarded warmups and 21 retained
+samples. The guest clock is `riscv.rdtime` at 10 MHz. The pre-frozen 100 ms
+budget is therefore 1,000,000 ticks; this is a unit conversion fixed before
+measurement, not post-result calibration. Retained stability requires
+nearest-rank `p95(total_ticks) / p50(total_ticks) <= 1.10`; for 21 sorted
+samples p50 is index 10 and p95 is index 19. The independent verifier closes
+the source path from profile `live_tick()` through `sbi::time()` to `rdtime`,
+and the QEMU board's exact 10 MHz constant, so metadata alone cannot relabel a
+different tick source or scale.
+
+Transcript parsing also has a generic fail-closed sentinel: any occurrence
+matching `WASM_[A-Z0-9_]+ FAIL`, including a previously unknown failure marker,
+invalidates the capture before the finite expected success-marker checks. It
+cannot be ignored merely because it is not named by the workload schema.
+
+Both predicates must hold to produce
+`aot-eligible-for-c85-design-review-on-fixed-qemu`:
+
+1. `p95(total_ticks) > 1_000_000`;
+2. `p95(total_ticks - interpretation_ticks) <= 1_000_000`.
+
+Otherwise the result is `aot-not-justified-on-fixed-qemu`, conditional C8.5
+through C8.7 are skipped or deferred, and work continues at C8.8. In either
+case `aot_authorized=false`, `native_code_accepted=false`,
+`platform_class=emulator`, and `physical_provenance=not-claimed`. A malformed,
+incomplete, incorrect, or unstable run produces no decision at all.
+
+The CI-safe contract and transport checks do not boot QEMU:
+
+```sh
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -I -B -S -X pycache_prefix=/var/empty/vibeos-c84-python-pyc scripts/verify-c84-qemu-aot-decision.py --selftest --check-manifest
+/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -I -B -S -X pycache_prefix=/var/empty/vibeos-c84-python-pyc scripts/c84-qemu-aot-decision-peer.py --selftest
+./scripts/run-c84-qemu-aot-decision.sh --selftest
+```
+
+A development run may use `--allow-dirty-smoke`, but that mode selects a
+compile-time smoke-only feature. Its META records
+`capture_mode=dirty-smoke-not-publication`, `decision_eligible=false`, and a
+smoke-only run-ID domain. It is therefore wire-distinct and is categorically
+rejected by `--publication`. Its recorded Cargo command names
+`<dirty-worktree>/firmware/qemu-virt/Cargo.toml`, never the formal
+`<materialized-source>` provenance. Smoke mode still requires the configured
+fetch and push origin to be exactly the frozen repository origin, although it
+does not perform the formal live remote-advertisement proof. The formal feature instead records
+`capture_mode=formal-publication`, `decision_eligible=true`, and the formal-only
+run-ID domain. After the preparation commit is pushed, the formal no-clobber
+publication command is:
+
+```sh
+./scripts/run-c84-qemu-aot-decision.sh \
+  --evidence-dir benchmarks/wasm-aot-decision/qemu-v1
+```
+
+It writes `uart.log`, `summary.json`, `environment.json`, and `DECISION.json`
+only after the independent verifier accepts both the transcript and the
+source/tool/platform envelope. Formal verification also requires live branch
+`codex/wasm`, a clean HEAD equal to the bound source, local and tracking refs at
+that commit, no assume-unchanged, skip-worktree, or fsmonitor-valid index state,
+and a direct sanitized query proving that
+`https://github.com/allegro0132/vibeos.git` advertises the same
+`refs/heads/codex/wasm`. The build does not consume the current working tree or
+its ignored `target/`: it inventories the exact superproject commit and the
+exact `vendor/jitterentropy-rs` and `vendor/sunset` gitlink commits with
+`ls-tree`, then exports each already-verified blob through raw `git cat-file
+--batch` bytes. It recomputes every Git blob object ID and materializes only
+reviewed `0644`/`0755` modes; checkout, clean/smudge filters, and working-tree
+conversion never participate. Every Git subprocess uses
+`GIT_NO_LAZY_FETCH=1`, replacement objects disabled, no system/global config,
+and a fixed sanitized PATH. The superproject and both submodule local config
+files are read explicitly with `--no-includes`, byte-identified before and
+after, and parsed through a default-deny key/value allowlist. Filter drivers,
+URL rewrite rules, includes, and any other unreviewed local key therefore fail
+closed. Fixed-remote queries run from `/`, where `/.git` must be absent, so
+repository-local discovery cannot alter the URL. The build uses a new private
+`CARGO_TARGET_DIR`. Publication verifies all bytes before one atomic
+no-replace directory rename; the final directory and files are read-only. A
+failure to fsync the parent after that commit point is reported explicitly as
+complete verified bytes with uncertain crash durability, not as a retryable
+absence.
 
 ## Frozen product workload
 
@@ -47,7 +265,11 @@ The artifact and SSH fixture identities are checked independently against
 `scripts/openssh-peer.py`; a similarly behaving replacement is not the frozen
 workload.
 
-## Physical platform, sampling, and budget
+## Deferred legacy physical platform, sampling, and budget
+
+This section documents the retained Duo-v1 contract for historical audit and
+possible future qualification. It no longer blocks C8.4 and is not mixed with
+the fixed-QEMU decision population.
 
 The decision platform is a Milk-V Duo CV1800B/C906B running hart 0 only. The
 clock is `riscv.rdtime` at 25 MHz. Collection requires three separate physical
@@ -63,9 +285,10 @@ The 100 ms threshold is a product-response requirement selected before any
 C8.4 profiling result exists. It is not inferred from C8.3 observations and
 must not be moved to make a later result pass.
 
-Fixed-QEMU measurements may test instrumentation and integration. QEMU ticks
-must not be converted, combined with Duo ticks, or used to meet or miss this
-budget.
+Under this retained physical contract, the older diagnostic QEMU gate remains
+integration-only. Its ticks must not be converted, combined with Duo ticks, or
+used to meet or miss the 25 MHz Duo budget. The separate QEMU-v1 contract above
+uses its own 10 MHz population and never mixes the two datasets.
 
 Only complete success samples enter the formal dataset: each records 13 reads,
 13 writes, fuel consumption in the inclusive range 1 through 500,000, positive
@@ -76,7 +299,7 @@ status, truncated stream or interval ledger, wrong output, leak, or interval
 overflow is diagnostic evidence outside the decision population and can never
 authorize AOT.
 
-## Single-cold-boot transcript closure
+## Deferred physical single-cold-boot transcript closure
 
 Each cold boot has its own raw serial transcript, capped at 268,435,456 bytes.
 One raw contains exactly one `VIBE_WASM_AOT_META` record, 24 ordered
@@ -152,9 +375,10 @@ is one contiguous interval. Only `interpretation` is AOT-attributable.
 
 ## Interval capacity and collection completeness
 
-Before any C8.4 evidence was produced, a dev-only `c84-profile-hooks`
-preflight ran the exact frozen artifact and 12,325-byte input through the
-buffered product work model. It locked these complete-call counts:
+During preparation, before any decision-bearing C8.4 capture may be produced,
+a dev-only `c84-profile-hooks` preflight ran the exact frozen artifact and
+12,325-byte input through the buffered product work model. It locked these
+complete-call counts:
 
 | Counter | Frozen preflight |
 |---|---:|
@@ -345,8 +569,9 @@ probe succeeds, and epoch 4 proves post-Drop reuse.
 
 This closes the previously explicit gap between the real managed child and the
 ordinary Core observer for the exact SSH target. The reusable base feature is
-default-off; QEMU acceptance contributes only guarded transition telemetry and
-is integration evidence. There is still no Host/Wait/Cleanup sidecar, IRQ
+default-off; this predecessor's diagnostic QEMU acceptance contributes only
+guarded transition telemetry and is integration evidence. There is still no
+Host/Wait/Cleanup sidecar, IRQ
 composition, `finish`, verified stream, schema publisher, collector, physical
 Milk-V Duo sample, or AOT decision.
 
@@ -420,9 +645,10 @@ The default-off `wasm-c84-ssh-managed-child-irq-overlay` successor composes the
 same authenticated request parent, real managed child, ordinary Core observer,
 and phase sidecar with the production profile IRQ overlay. The base feature is
 silent, contains no acceptance worker, and is exposed to Milk-V only as a
-compile-time seam. The separate QEMU acceptance feature retains the phase,
-Core, and request predecessor telemetry and adds one narrow causal self-SSIP
-state machine; it does not enable the standalone profile-IRQ acceptance image.
+compile-time seam. The separate diagnostic IRQ-overlay QEMU-acceptance feature
+retains the phase, Core, and request predecessor telemetry and adds one narrow
+causal self-SSIP state machine; it does not enable the standalone profile-IRQ
+acceptance image.
 
 Epoch 1 forces the only two active self-SSIPs. The parent injection occurs only
 after `managed_parent_host` has returned, so `SLOT` is no longer held and the
@@ -751,7 +977,7 @@ family is diagnostic log evidence, not serialized JSON. This node calls no
 24-sample collector chain, performs no physical Milk-V Duo capture or cold
 boot, and makes no AOT decision.
 
-## Private single-cold-boot collector closure
+## Private single-transcript collector closure
 
 The default-off
 `wasm-c84-ssh-managed-child-single-boot-collector` successor now consumes the
@@ -772,27 +998,47 @@ both slots. It then releases both locks, proves the exact owner is still
 current, and disarms the detach callback before acquiring any record sink. The
 portable collector supplies its own private checked sequence and accumulator;
 the kernel cannot skip, repeat, roll back, or substitute either value. The
-global Ready lineage is not reinstalled until every synchronous publication
-transition has completed.
+target Ready lineage is reinstalled after each SAMPLE commit, but the collector
+simultaneously enters `PendingAcceptance` (or `PendingTerminal` after SAMPLE
+23). Those states make every new prepare return Busy until the request adapter
+has passed the remaining fallible tail gates.
 
-One successful boot commits exactly 26 records:
+One successful process or boot transcript commits exactly 26 records:
 
 - one META;
 - SAMPLE sequence/index 0 through 23, with 0 through 2 marked warmup and 3
   through 23 retained; and
-- one END immediately after SAMPLE 23.
+- one END as the next wire record after SAMPLE 23, with no intervening record.
 
-The collector retains only the 21 total-tick values needed for its per-boot
+The collector retains only the 21 total-tick values needed for its transcript
 guard. After SAMPLE 23 commits, it computes nearest-rank p50 at sorted index 10
-and p95 at index 19 and accepts stability only when the checked `u128`
-comparison `p95 * 100 <= p50 * 150` holds. Only then may it acquire, write, and
-commit END. `TargetReady` epoch 25 becomes globally visible after that END
-commit; no public early-finish or 25th-sample surface exists. The portable
-known-answer transcript is 34,386 bytes with SHA-256
+and p95 at index 19. The default retained Duo-v1 contract accepts stability at
+the checked `u128` boundary `p95 * 100 <= p50 * 150`; its portable known-answer
+transcript is 34,386 bytes with SHA-256
 `10df3a084b5817ee998c11e3eab0326fc2f16bdeba6644ce7e29e57c7bbc9da2`.
+The disjoint `qemu-decision-v1` contract instead requires
+`p95 * 100 <= p50 * 110`; its formal known-answer transcript is 34,532 bytes
+with SHA-256
+`ee94947964ea80cdbfd4df6abdcaac1bcfe65a6e397348e6728bddada64d3cdd`,
+while the wire-distinct ineligible smoke transcript is 34,542 bytes with
+SHA-256
+`6f5dee3156f8950defd10e17a163a7919afbe90ec0249bfac17e74b498b33b69`.
+After SAMPLE 23 and the selected stability guard pass, the portable collector
+splits out `TargetReady` epoch 25 and the sole `PendingEnd` authority. The
+kernel stores them as Ready plus `PendingTerminal`, so Ready25 exists for
+ownership closure but cannot start. Only after every remaining fallible
+request-tail gate succeeds does `collector_emit_success` enter
+`FinalizingTerminal` and acquire, write, and commit END. Any abandonment or END
+acquire/write/commit failure is absorbing, emits no later record, and never
+retries; success moves the campaign to Complete, where Ready25 is retained only
+for closed-rejection lineage. There is no public early-finish or 25th-sample
+surface.
 
-The physical sink acquires the console renderer and UART transmitter only in
-TTY-to-TX order. A temporary non-Send record holds both guards over every
+The platform-neutral formal UART sink acquires the console renderer and UART
+transmitter only in TTY-to-TX order. It is used by both the retained physical
+image and the disjoint fixed-QEMU decision image; provenance comes from the
+surrounding platform and host-evidence contract, never from this sink. A
+temporary non-Send record holds both guards over every
 `write_all`, writes raw LF without CRLF translation, requires the record to
 begin at column zero and contain one final LF, and releases TX then TTY only
 after a successful commit observes the transmitter fully empty. A write,
@@ -810,8 +1056,8 @@ SSHD accepts such a rejected exec request only to drain empty stdout, status
 126, EOF, and CLOSE. Its rejection variant carries no command, Component,
 profile permit, or execution path, so neither VSH nor the target can start.
 
-The QEMU acceptance feature deliberately selects a different absorbing audit
-sink. It runs the identical campaign, serializer, 24 SSH calls, and collector
+The older diagnostic QEMU acceptance feature deliberately selects a different
+absorbing audit sink. It runs the identical campaign, serializer, 24 SSH calls, and collector
 state machine, but keeps only each committed record's byte count and SHA-256;
 formal bytes are never buffered, recovered, or written to UART. Every audit
 marker consumes a private post-commit token and ends with
@@ -822,8 +1068,9 @@ SAMPLE records, and END, then rejects attempt 25 at Ready epoch 25. The runner
 freezes two independent UART logs and OpenSSH fixtures, checks all predecessor
 families and terminal order, and scans the complete raw logs for zero
 occurrences of `VIBE_WASM_AOT_META`, `VIBE_WASM_AOT_SAMPLE`,
-`VIBE_WASM_AOT_END`, or any formal schema payload. These audit logs are
-integration evidence only and can never enter the physical decision dataset.
+`VIBE_WASM_AOT_END`, or any formal schema payload. These legacy audit logs are
+integration evidence only: they can enter neither the retained physical
+dataset nor the new fixed-QEMU decision dataset.
 
 The source, parser, and live gates are:
 
@@ -835,7 +1082,7 @@ python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py \
 ./scripts/qemu-c84-ssh-managed-child-single-boot-collector-test.sh
 ```
 
-### Closed build, package, and image verification
+### Deferred physical build, package, and image verification
 
 A formal collector image starts in an independently materialized and frozen
 source tree with a fresh non-zero challenge. The full 40-hex preparation commit
@@ -1070,7 +1317,7 @@ passing dual-threshold result may say only
 `aot-eligible-for-c85-design-review`. Every outcome keeps
 `aot_authorized=false` and `native_code_accepted=false`.
 
-## Decision rule
+## Deferred physical-Duo decision rule
 
 Let `T` be each retained sample's `total_ticks`, `I` its `interpretation`
 ticks, and `B = 2_500_000`. A dataset is eligible only after C8.3 is complete
@@ -1090,7 +1337,7 @@ result does not admit external native bytes, add a JIT/RWX path, or bypass the
 authoritative component, profile, WIT, CSpace, and admission policy. Those
 remain separate C8.5--C8.7 work.
 
-## Preparation verification
+## Retained physical-toolchain preparation verification
 
 ```sh
 cargo test --locked -p vibeos-image-policy --no-default-features \
@@ -1122,9 +1369,10 @@ python3 -B scripts/capture-c84-duo-aot-decision.py --selftest
 python3 -B scripts/verify-c84-evidence.py --selftest
 ```
 
-These checks validate the preparation contract, portable single-SAMPLE
-ownership/serialization, trusted producer, private single-boot collector, and
+These checks validate the retained physical preparation contract, portable
+single-SAMPLE ownership/serialization, trusted producer, private single-boot collector, and
 single-hart QEMU integration transcript semantics, plus the software-side
-package/capture/evidence failure boundaries. They cannot manufacture the
-missing physical C8.3 or C8.4 evidence. The paused hardware commands above
-remain deliberately unexecuted.
+package/capture/evidence failure boundaries. They cannot manufacture physical
+C8.3 or C8.4 evidence; those optional legacy datasets remain absent and do not
+block the fixed-QEMU C8.4 path. The paused hardware commands above remain
+deliberately unexecuted.

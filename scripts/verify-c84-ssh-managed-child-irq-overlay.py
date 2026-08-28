@@ -365,10 +365,10 @@ def verify_direct_acceptance_units(inputs: Inputs) -> None:
     sources = (
         ("slot", inputs.phase.slot, 11, 16),
         ("SSH", inputs.phase.ssh, 7, 8),
-        # The fourth all-form reference is the finish/verify successor's
-        # fail-closed pairing guard; it prevents that base behavior from being
-        # combined with this gate's legacy cancel telemetry.
-        ("kernel root", inputs.phase.kernel_root, 0, 4),
+        # The fourth and fifth all-form references are the finish/verify
+        # successor's fail-closed pairing guard and the disjoint formal-QEMU
+        # image guard; neither may reuse this gate's legacy cancel telemetry.
+        ("kernel root", inputs.phase.kernel_root, 0, 5),
         ("trap", inputs.trap, 0, 2),
     )
     all_units: list[str] = []
@@ -989,8 +989,10 @@ def run_selftest(inputs: Inputs) -> int:
             lambda data: mutate_phase_text(
                 data,
                 "slot",
-                ".compare_exchange(0, epoch, Ordering::Release, Ordering::Acquire)",
-                ".compare_exchange(0, epoch, Ordering::Relaxed, Ordering::Acquire)",
+                "if epoch == 0\n        || ACTIVE_EPOCH\n"
+                "            .compare_exchange(0, epoch, Ordering::Release, Ordering::Acquire)",
+                "if epoch == 0\n        || ACTIVE_EPOCH\n"
+                "            .compare_exchange(0, epoch, Ordering::Relaxed, Ordering::Acquire)",
                 "active-publish-relaxed",
             ),
         ),
@@ -999,8 +1001,10 @@ def run_selftest(inputs: Inputs) -> int:
             lambda data: mutate_phase_text(
                 data,
                 "slot",
-                ".compare_exchange(epoch, 0, Ordering::AcqRel, Ordering::Acquire)",
-                ".compare_exchange(epoch, 0, Ordering::Relaxed, Ordering::Acquire)",
+                "if epoch == 0\n        || ACTIVE_EPOCH\n"
+                "            .compare_exchange(epoch, 0, Ordering::AcqRel, Ordering::Acquire)",
+                "if epoch == 0\n        || ACTIVE_EPOCH\n"
+                "            .compare_exchange(epoch, 0, Ordering::Relaxed, Ordering::Acquire)",
                 "active-clear-relaxed",
             ),
         ),

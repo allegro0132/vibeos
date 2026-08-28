@@ -41,6 +41,10 @@ MILKV_BUILD_SCRIPT = ROOT / "scripts/build-milkv-duo.sh"
 
 FEATURE = "wasm-c84-ssh-managed-child-single-boot-collector"
 QEMU_FEATURE = f"{FEATURE}-qemu-acceptance"
+QEMU_DECISION_FEATURE = "wasm-c84-qemu-aot-decision"
+QEMU_DECISION_SMOKE_FEATURE = f"{QEMU_DECISION_FEATURE}-smoke"
+QEMU_PROFILE_FEATURE = "qemu-decision-v1"
+QEMU_PROFILE_SMOKE_FEATURE = f"{QEMU_PROFILE_FEATURE}-smoke"
 TRUSTED_FEATURE = "wasm-c84-ssh-managed-child-trusted-sample"
 TRUSTED_QEMU_FEATURE = f"{TRUSTED_FEATURE}-qemu-acceptance"
 FINISH_QEMU_FEATURE = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance"
@@ -56,13 +60,21 @@ COMMAND = (
 )
 QEMU_COMMAND = "./scripts/qemu-c84-ssh-managed-child-single-boot-collector-test.sh"
 PEER_COMMAND = "python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py --selftest"
-PEER_SCRIPT_SHA256 = "30d7705b00220740c33bcfef604ba83d74173807da3361c1408afa84be1bf98b"
+PEER_SCRIPT_SHA256 = "ea942d9676d21f9ce0025cf0940b1b5f3838511f5405cd42a4b714e91c3217ca"
 QEMU_SCRIPT_SHA256 = "b48a0048551bb90f144e5a4dbc66c938e9692a57931b324c1f03dc3a3647ef21"
 KNOWN_TRANSCRIPT_BYTES = 34_386
 KNOWN_TRANSCRIPT_SHA256 = "10df3a084b5817ee998c11e3eab0326fc2f16bdeba6644ce7e29e57c7bbc9da2"
+QEMU_KNOWN_TRANSCRIPT_BYTES = 34_532
+QEMU_KNOWN_TRANSCRIPT_SHA256 = "ee94947964ea80cdbfd4df6abdcaac1bcfe65a6e397348e6728bddada64d3cdd"
+QEMU_SMOKE_KNOWN_TRANSCRIPT_BYTES = 34_542
+QEMU_SMOKE_KNOWN_TRANSCRIPT_SHA256 = "6f5dee3156f8950defd10e17a163a7919afbe90ec0249bfac17e74b498b33b69"
+QEMU_TEST_RUN_ID = "778d0d6347155998628068092e55ce527fe2049b01082a0099f61d62138e047c"
+QEMU_SMOKE_TEST_RUN_ID = "8e196b877e4dcf562e6788ab0516c218b53959862b3b0b0bab4de758cf78d906"
 
 MANIFEST_SHA256 = "87026895f2207d85a04f5c04f11420530f1c8f922391f71915f173b18dcfd9d8"
 SCHEMA_SHA256 = "b608aa3de46aac1a73fb321babdcd4ad18ec43c60b54760f53b9e5e8d317bf3a"
+QEMU_MANIFEST_SHA256 = "339bb27af9a4d24cf5440349777a2113c7ac815bc0289c2fc233426aac3402ef"
+QEMU_SCHEMA_SHA256 = "0df879bea905ac1967685fdb411f017acf0136a69999ee031f71af76509eb520"
 ARTIFACT_SHA256 = "180ed444de8b6c9ecd828b369d4c8b9f783758ef22c0b17170682d71f2fd0e72"
 INPUT_SHA256 = "6b6054d492e00e68a93bc9b657a69577c7c44f5a48f169adb4124df0a50f6b3c"
 OUTPUT_SHA256 = "791f3fe1339984e8a8489c12ea5ff479ac7caa07c87be451134d3af0f526bb27"
@@ -410,12 +422,26 @@ def verify_manifest(raw: bytes) -> None:
         == {"sha2": {"version": "=0.11.0", "default-features": False}},
         "collector dependency set is not exact no_std sha2 0.11.0",
     )
+    require(
+        manifest.get("features")
+        == {
+            "default": [],
+            QEMU_PROFILE_FEATURE: [],
+            QEMU_PROFILE_SMOKE_FEATURE: [QEMU_PROFILE_FEATURE],
+        },
+        "collector crate feature table is not the exact default Duo/formal-QEMU/smoke selector",
+    )
     require("build" not in manifest.get("package", {}), "collector gained a build script")
     require(not (ROOT / "wasm-aot-profile/build.rs").exists(), "collector has an ambient build.rs")
 
 
 def verify_lib(source: str) -> None:
     code = semantic(source)
+    docs = " ".join(
+        line.removeprefix("//!").strip()
+        for line in source.splitlines()
+        if line.startswith("//!")
+    )
     require(code.count("modcollector;") == 1, "collector module declaration differs")
     require(code.count("pubusecollector::{") == 1, "collector re-export group differs")
     for name in (
@@ -428,7 +454,10 @@ def verify_lib(source: str) -> None:
         "CollectorAbort",
         "CollectorFault",
         "CollectorReady",
-        "CompletedTranscript",
+        "CompletedTerminal",
+        "PendingEnd",
+        "PendingTerminal",
+        "PoisonedTerminal",
         "PoisonedTranscript",
         "ProfileRecordSinkFactory",
         "RecordStage",
@@ -438,10 +467,16 @@ def verify_lib(source: str) -> None:
     ):
         require(name in code, f"collector export {name} is missing")
     require(
-        "one META," in source and "24 ordered SAMPLE records" in source and "one END" in source,
-        "crate docs omit exact 26-record closure",
+        "build-bound META + 24 SAMPLE prefix" in docs
+        and "sole [`PendingEnd`] authority" in docs
+        and "append END only after its remaining acceptance checks pass" in docs,
+        "crate docs omit the deferred 26-record closure",
     )
-    require("one physical cold boot" in source, "crate docs omit physical cold-boot adapter duty")
+    require(
+        "default record contract is Duo-v1" in docs
+        and "`qemu-decision-v1` feature selects a disjoint emulator-scoped" in docs,
+        "crate docs do not separate the default Duo and formal-QEMU record contracts",
+    )
 
 
 def verify_collector_types(source: str) -> str:
@@ -468,6 +503,70 @@ def verify_collector_types(source: str) -> str:
     exact_semantic(code, 'const END_PREFIX: &[u8] = b"VIBE_WASM_AOT_END ";', "END prefix")
     for digest in (MANIFEST_SHA256, SCHEMA_SHA256, ARTIFACT_SHA256, INPUT_SHA256, OUTPUT_SHA256):
         require(masked.count(digest) == 1, f"frozen collector digest {digest} count differs")
+    for digest in (QEMU_MANIFEST_SHA256, QEMU_SCHEMA_SHA256):
+        require(masked.count(digest) == 1, f"formal-QEMU collector digest {digest} count differs")
+    for exact, label in (
+        (
+            '#[cfg(not(feature="qemu-decision-v1"))]constRUN_ID_DOMAIN:&[u8]='
+            'b"vibeos.c84.aot-decision.run-id.v1";',
+            "default Duo run-id domain",
+        ),
+        (
+            '#[cfg(all(feature="qemu-decision-v1",not(feature="qemu-decision-v1-smoke")))]'
+            'constRUN_ID_DOMAIN:&[u8]='
+            'b"vibeos.c84.qemu-aot-decision.run-id.v1";',
+            "formal-QEMU run-id domain",
+        ),
+        (
+            '#[cfg(feature="qemu-decision-v1-smoke")]constRUN_ID_DOMAIN:&[u8]='
+            'b"vibeos.c84.qemu-aot-decision.smoke.run-id.v1";',
+            "dirty-smoke QEMU run-id domain",
+        ),
+        (
+            f'#[cfg(not(feature="qemu-decision-v1"))]constMANIFEST_SHA256:&str="{MANIFEST_SHA256}";',
+            "default Duo manifest identity",
+        ),
+        (
+            f'#[cfg(feature="qemu-decision-v1")]constMANIFEST_SHA256:&str="{QEMU_MANIFEST_SHA256}";',
+            "formal-QEMU manifest identity",
+        ),
+        (
+            f'#[cfg(not(feature="qemu-decision-v1"))]constTRANSCRIPT_SCHEMA_SHA256:&str="{SCHEMA_SHA256}";',
+            "default Duo schema identity",
+        ),
+        (
+            f'#[cfg(feature="qemu-decision-v1")]constTRANSCRIPT_SCHEMA_SHA256:&str="{QEMU_SCHEMA_SHA256}";',
+            "formal-QEMU schema identity",
+        ),
+        (
+            '#[cfg(not(feature="qemu-decision-v1"))]constSTABILITY_PERCENT:u128=150;',
+            "default Duo stability ceiling",
+        ),
+        (
+            '#[cfg(feature="qemu-decision-v1")]constSTABILITY_PERCENT:u128=110;',
+            "formal-QEMU stability ceiling",
+        ),
+        (
+            '#[cfg(all(feature="qemu-decision-v1",not(feature="qemu-decision-v1-smoke")))]'
+            'constCAPTURE_MODE:&[u8]=b"formal-publication";',
+            "formal-QEMU capture mode",
+        ),
+        (
+            '#[cfg(all(feature="qemu-decision-v1",not(feature="qemu-decision-v1-smoke")))]'
+            'constDECISION_ELIGIBLE:&[u8]=b"true";',
+            "formal-QEMU decision eligibility",
+        ),
+        (
+            '#[cfg(feature="qemu-decision-v1-smoke")]constCAPTURE_MODE:&[u8]='
+            'b"dirty-smoke-not-publication";',
+            "dirty-smoke capture mode",
+        ),
+        (
+            '#[cfg(feature="qemu-decision-v1-smoke")]constDECISION_ELIGIBLE:&[u8]=b"false";',
+            "dirty-smoke decision eligibility",
+        ),
+    ):
+        require(exact in semantic(code), f"{label} differs")
 
     exact_semantic(
         code,
@@ -548,22 +647,72 @@ def verify_collector_types(source: str) -> str:
     require(visible_methods(collector_impl.raw) == ("collect", "quarantine_attempt"), "collector public method surface differs")
     for forbidden_method in ("finish", "reset", "retry", "rollback", "skip", "sink", "factory", "set_index", "set_accumulator"):
         require(not re.search(rf"\bpub(?:\([^)]*\))?\s+fn\s+{forbidden_method}\b", masked), f"collector exposes {forbidden_method}")
-    for type_name in ("Campaign", "BootCollector", "CollectorReady", "CompletedTranscript", "PoisonedTranscript"):
+    for type_name in (
+        "Campaign",
+        "BootCollector",
+        "CollectorReady",
+        "PendingTerminal",
+        "PendingEnd",
+        "CompletedTerminal",
+        "PoisonedTerminal",
+        "PoisonedTranscript",
+    ):
         require(
             not re.search(rf"#\s*\[\s*derive[^]]*(Clone|Copy)[^]]*\]\s*pub\s+struct\s+{type_name}\b", masked),
             f"linear collector type became Clone/Copy: {type_name}",
         )
     ready_impl = find_scope(code, r"\bimpl<'a,\s*F:\s*ProfileRecordSinkFactory>\s+CollectorReady", "CollectorReady impl")
     require(visible_methods(ready_impl.raw) == ("ready_next_epoch", "into_next"), "CollectorReady leaks index/factory state")
-    complete_impl = find_scope(code, r"\bimpl<'a,\s*F:\s*ProfileRecordSinkFactory>\s+CompletedTranscript", "CompletedTranscript impl")
-    require(visible_methods(complete_impl.raw) == ("ready_next_epoch", "receipt", "into_ready"), "completed surface differs")
+    pending_impl = find_scope(code, r"\bimpl<'a,\s*F:\s*ProfileRecordSinkFactory>\s+PendingTerminal", "PendingTerminal impl")
+    require(
+        visible_methods(pending_impl.raw) == ("ready_next_epoch", "receipt", "into_parts"),
+        "pending terminal leaks or omits Ready/END authority",
+    )
+    pending_end_impl = find_scope(
+        code,
+        r"\bimpl<F:\s*ProfileRecordSinkFactory>\s+PendingEnd",
+        "PendingEnd impl",
+    )
+    require(
+        visible_methods(pending_end_impl.raw)
+        == ("receipt", "commit_terminal", "discard_terminal"),
+        "pending END exposes retry/factory state or omits explicit disposal",
+    )
+    complete_impl = find_scope(
+        code,
+        r"\bimpl<F:\s*ProfileRecordSinkFactory>\s+CompletedTerminal",
+        "CompletedTerminal impl",
+    )
+    require(visible_methods(complete_impl.raw) == ("receipt",), "completed terminal surface differs")
+    terminal_poison_impl = find_scope(
+        code,
+        r"\bimpl<F:\s*ProfileRecordSinkFactory>\s+PoisonedTerminal",
+        "PoisonedTerminal impl",
+    )
+    require(
+        visible_methods(terminal_poison_impl.raw)
+        == ("stage", "committed_records", "failure", "receipt"),
+        "terminal poison exposes retry/factory state",
+    )
     poison_impl = find_scope(code, r"\bimpl<'a,\s*F:\s*ProfileRecordSinkFactory>\s+PoisonedTranscript", "PoisonedTranscript impl")
     require(
         visible_methods(poison_impl.raw) == ("stage", "committed_records", "failure", "ready_next_epoch", "into_ready"),
         "poison surface exposes retry/factory/END",
     )
-    require("factory:ManuallyDrop<F>" in semantic(complete_impl.raw) or "factory:ManuallyDrop<F>" in semantic(code), "closed factory is not quarantined")
-    for type_name in ("BootCollector", "CollectorReady", "CompletedTranscript", "PoisonedTranscript"):
+    require(
+        "factory:ManuallyDrop<F>" in semantic(code)
+        and "_factory:ManuallyDrop<F>" in semantic(code),
+        "pending/closed factory is not quarantined",
+    )
+    for type_name in (
+        "BootCollector",
+        "CollectorReady",
+        "PendingTerminal",
+        "PendingEnd",
+        "CompletedTerminal",
+        "PoisonedTerminal",
+        "PoisonedTranscript",
+    ):
         require(
             not re.search(rf"\bimpl(?:<[^{{}};]*>)?\s+Drop\s+for\s+{type_name}\b", masked),
             f"linear collector type gained a recovery Drop impl: {type_name}",
@@ -582,9 +731,9 @@ def verify_collector_types(source: str) -> str:
         semantic(progress.raw)
         == (
             "pubenumCollectionProgress<'a,F:ProfileRecordSinkFactory>{"
-            "More(CollectorReady<'a,F>),Complete(CompletedTranscript<'a,F>),}"
+            "More(CollectorReady<'a,F>),PendingTerminal(PendingTerminal<'a,F>),}"
         ),
-        "collector can expose a third/retry progress state",
+        "collector progress does not expose exactly More or PendingTerminal",
     )
     return code
 
@@ -645,20 +794,23 @@ def verify_collect_flow(code: str) -> None:
             "self.expected_epoch = expected_next_epoch.unwrap_or(u64::MAX)",
             "if self.next_sample < BOOT_SAMPLES",
             "retained_percentiles(self.retained_ticks)",
-            "u128::from(p95) * 100 > u128::from(p50) * 150",
-            "let end_record = match (&mut *self.factory).begin_record()",
-            "write_end(&mut *end_record, self.campaign.binding, self.accumulator)",
-            "end_record.commit_record()",
+            "u128::from(p95) * 100 > u128::from(p50) * STABILITY_PERCENT",
             "let receipt = BootReceipt",
-            "CollectionProgress::Complete",
+            "CollectionProgress::PendingTerminal",
+            "pending_end: Some(PendingEnd",
         ),
-        "checked SAMPLE chain and END closure",
+        "checked SAMPLE chain and pending-END handoff",
     )
     for forbidden in ("wrapping_add", "saturating_add", "wrapping_sub", "saturating_sub"):
         require(forbidden not in collect_code, f"collector uses lossy sequence arithmetic {forbidden}")
     require(collect_code.count("ProfilePublisher::new(") == 1, "collector bypasses or duplicates publisher")
     require(collect_code.count("publish_profile(") == 1, "collector bypasses or duplicates SAMPLE publication")
-    require(collect_code.count("write_end(") == 1 and collect_code.count("CollectionProgress::Complete(") == 1, "END/Complete path count differs")
+    require(
+        "write_end(" not in collect_code
+        and "commit_terminal(" not in collect_code
+        and collect_code.count("CollectionProgress::PendingTerminal(") == 1,
+        "SAMPLE collection can commit END or duplicate the pending terminal",
+    )
     require("ManuallyDrop::new(record)" in collect_code, "successful SAMPLE record destructor is not suppressed")
     require("ManuallyDrop::new(publisher)" in collect_code, "preflight-acquired record is not quarantined")
     exact_semantic(
@@ -674,6 +826,55 @@ def verify_collect_flow(code: str) -> None:
         };
         """,
         "closed receipt values",
+    )
+
+    pending_terminal_impl = find_scope(
+        code,
+        r"\bimpl<'a,\s*F:\s*ProfileRecordSinkFactory>\s+PendingTerminal",
+        "pending terminal split",
+    )
+    into_parts = find_function(pending_terminal_impl, "into_parts", "pending terminal split")
+    ordered_semantic(
+        into_parts.raw,
+        (
+            'self.ready.take().expect("pending terminal Ready consumed once")',
+            'self.pending_end.take().expect("pending END consumed once")',
+            "(ready, pending_end)",
+        ),
+        "Ready/pending-END authority split",
+    )
+
+    pending_end_impl = find_scope(
+        code,
+        r"\bimpl<F:\s*ProfileRecordSinkFactory>\s+PendingEnd",
+        "pending END impl",
+    )
+    commit_terminal = find_function(pending_end_impl, "commit_terminal", "terminal END commit")
+    ordered_semantic(
+        commit_terminal.raw,
+        (
+            "(&mut *self.factory).begin_record()",
+            "let mut end_record = ManuallyDrop::new(end_record)",
+            "write_end(&mut *end_record, self.binding, self.receipt.accumulator)",
+            "end_record.commit_record()",
+            "Ok(CompletedTerminal",
+        ),
+        "sole deferred END commit",
+    )
+    terminal_code = semantic(commit_terminal.raw)
+    require(
+        terminal_code.count("begin_record()") == 1
+        and terminal_code.count("write_end(") == 1
+        and terminal_code.count("commit_record()") == 1,
+        "pending END can acquire, write, or commit more than one record",
+    )
+    discard_terminal = find_function(pending_end_impl, "discard_terminal", "terminal END discard")
+    require(
+        not any(
+            operation in semantic(discard_terminal.raw)
+            for operation in ("begin_record(", "write_end(", "commit_record(")
+        ),
+        "discarding pending END can touch the sink",
     )
 
     quarantine = find_function(impl, "quarantine_attempt", "collector attempt quarantine")
@@ -705,11 +906,31 @@ def verify_collect_flow(code: str) -> None:
 
 
 def verify_serializers(code: str) -> None:
-    meta = find_scope(code, r"\bfn\s+write_meta\b", "META serializer")
+    serializers = semantic(code)
+    require(
+        serializers.count("fnwrite_meta<") == 2
+        and '#[cfg(not(feature="qemu-decision-v1"))]fnwrite_meta<' in serializers
+        and '#[cfg(feature="qemu-decision-v1")]fnwrite_meta<' in serializers,
+        "default Duo and formal-QEMU META serializers are not exactly disjoint",
+    )
+    meta = find_scope(
+        code,
+        r'#\[cfg\(not\(feature\s*=\s*"qemu-decision-v1"\)\)\]\s*fn\s+write_meta\b',
+        "default Duo META serializer",
+        match_literals=True,
+    )
+    qemu_meta = find_scope(
+        code,
+        r'#\[cfg\(feature\s*=\s*"qemu-decision-v1"\)\]\s*fn\s+write_meta\b',
+        "formal-QEMU META serializer",
+        match_literals=True,
+    )
     end = find_scope(code, r"\bfn\s+write_end\b", "END serializer")
     meta_code = semantic(meta.raw)
+    qemu_meta_code = semantic(qemu_meta.raw)
     end_code = semantic(end.raw)
-    require(meta_code.count("sink.write_all(") == 15, "META serializer fragment count differs")
+    require(meta_code.count("sink.write_all(") == 15, "default Duo META serializer fragment count differs")
+    require(qemu_meta_code.count("sink.write_all(") == 19, "formal-QEMU META serializer fragment count differs")
     require(end_code.count("sink.write_all(") == 5, "END serializer fragment count differs")
     for required in (
         '"artifact_bytes":2012',
@@ -735,6 +956,37 @@ def verify_serializers(code: str) -> None:
     ):
         require(required.replace('"', '\\"') in meta.raw, f"META frozen field differs: {required}")
     for required in (
+        '"artifact_bytes":2012',
+        '"budget_ticks":1000000',
+        '"capture_mode":"',
+        '"clock":"riscv.rdtime"',
+        '"decision_eligible":',
+        '"hart_count":1',
+        '"hart_id":0',
+        '"input_bytes":12325',
+        '"output_bytes":12325',
+        '"physical_provenance":"not-claimed"',
+        '"platform":"qemu-virt-rv64-tcg-icount-v1"',
+        '"platform_class":"emulator"',
+        '"required_qemu_boots":1',
+        '"retained_per_boot":21',
+        '"samples_per_boot":24',
+        '"schema":"vibeos.wasm-aot-decision.meta"',
+        '"suite_id":"vibeos.c84.qemu-aot-decision"',
+        '"timebase_hz":10000000',
+        '"transcript_scope":"one-fresh-fixed-qemu-process-no-physical-claim"',
+        '"version":1',
+        '"warmup_per_boot":3',
+        '"workload_id":"ssh-case-filter-12k-v1"',
+        '"workload_revision":1',
+    ):
+        require(required.replace('"', '\\"') in qemu_meta.raw, f"formal-QEMU META frozen field differs: {required}")
+    require(
+        qemu_meta_code.count("sink.write_all(CAPTURE_MODE)") == 1
+        and qemu_meta_code.count("sink.write_all(DECISION_ELIGIBLE)") == 1,
+        "formal-QEMU META does not source its capture/eligibility fields exactly once",
+    )
+    for required in (
         '"retained":21',
         '"samples":24',
         '"schema":"vibeos.wasm-aot-decision.end"',
@@ -742,9 +994,22 @@ def verify_serializers(code: str) -> None:
         '"warmups":3',
     ):
         require(required.replace('"', '\\"') in end.raw, f"END frozen field differs: {required}")
-    require("commit_record" not in meta_code and "commit_record" not in end_code, "serializer independently commits a record")
-    require(meta_code.endswith('\\n")}') and end_code.endswith('\\n")}'), "META/END do not terminate with one raw LF")
-    require("\\r" not in meta.raw and "\\r" not in end.raw, "META/END serializer can emit carriage return bytes")
+    require(
+        "commit_record" not in meta_code
+        and "commit_record" not in qemu_meta_code
+        and "commit_record" not in end_code,
+        "serializer independently commits a record",
+    )
+    require(
+        meta_code.endswith('\\n")}')
+        and qemu_meta_code.endswith('\\n")}')
+        and end_code.endswith('\\n")}'),
+        "META/END do not terminate with one raw LF",
+    )
+    require(
+        "\\r" not in meta.raw and "\\r" not in qemu_meta.raw and "\\r" not in end.raw,
+        "META/END serializer can emit carriage return bytes",
+    )
     write_hex = find_scope(code, r"\bfn\s+write_hex\b", "canonical lowercase hex serializer")
     exact_semantic(
         write_hex.raw,
@@ -790,6 +1055,8 @@ def verify_portable_tests(source: str) -> None:
     for name in (
         "campaign_validation_and_run_id_are_exact",
         "complete_boot_emits_one_meta_twenty_four_samples_and_one_end",
+        "final_sample_defers_end_until_explicit_terminal_commit",
+        "discarding_or_dropping_pending_terminal_never_writes_end",
         "stability_uses_only_twenty_one_retained_nearest_rank_samples",
         "meta_acquire_write_and_commit_failures_quarantine_without_drop",
         "sample_and_end_failures_never_retry_or_run_destructors",
@@ -801,6 +1068,40 @@ def verify_portable_tests(source: str) -> None:
     require(source.count("#[ignore]") == 0 and source.count("#[should_panic]") == 0, "collector regression is disabled")
     require("34_386" in source, "collector known-answer transcript byte count differs")
     require(KNOWN_TRANSCRIPT_SHA256 in source, "collector known-answer transcript SHA-256 differs")
+    tests = semantic(source)
+    for exact, label in (
+        (
+            '#[cfg(all(feature="qemu-decision-v1",not(feature="qemu-decision-v1-smoke")))]'
+            f'constTEST_RUN_ID:&str="{QEMU_TEST_RUN_ID}";',
+            "formal-QEMU known-answer run-id",
+        ),
+        (
+            '#[cfg(feature="qemu-decision-v1-smoke")]'
+            f'constTEST_RUN_ID:&str="{QEMU_SMOKE_TEST_RUN_ID}";',
+            "dirty-smoke known-answer run-id",
+        ),
+        (
+            '#[cfg(all(feature="qemu-decision-v1",not(feature="qemu-decision-v1-smoke")))]'
+            f'constTEST_TRANSCRIPT_BYTES:usize={QEMU_KNOWN_TRANSCRIPT_BYTES:_};',
+            "formal-QEMU known-answer transcript byte count",
+        ),
+        (
+            '#[cfg(feature="qemu-decision-v1-smoke")]'
+            f'constTEST_TRANSCRIPT_BYTES:usize={QEMU_SMOKE_KNOWN_TRANSCRIPT_BYTES:_};',
+            "dirty-smoke known-answer transcript byte count",
+        ),
+        (
+            '#[cfg(all(feature="qemu-decision-v1",not(feature="qemu-decision-v1-smoke")))]'
+            f'constTEST_TRANSCRIPT_SHA256:&str="{QEMU_KNOWN_TRANSCRIPT_SHA256}";',
+            "formal-QEMU known-answer transcript SHA-256",
+        ),
+        (
+            '#[cfg(feature="qemu-decision-v1-smoke")]'
+            f'constTEST_TRANSCRIPT_SHA256:&str="{QEMU_SMOKE_KNOWN_TRANSCRIPT_SHA256}";',
+            "dirty-smoke known-answer transcript SHA-256",
+        ),
+    ):
+        require(exact in tests, f"{label} differs")
     for compile_fail_probe in (
         "require_sync::<BootCollector<Factory>>()",
         "collector.clone()",
@@ -813,7 +1114,10 @@ def verify_portable_tests(source: str) -> None:
     for evidence in (
         "assert_eq!(observed.begin_calls, 26)",
         "assert_eq!(observed.commits, 26)",
-        "assert_eq!(completed.ready_next_epoch(), Some(25))",
+        "assert_eq!(pending.ready_next_epoch(), Some(25))",
+        "assert_eq!(observed.begin_calls, 25)",
+        "assert_eq!(observed.commits, 25)",
+        "let receipt = pending_end.discard_terminal()",
         "assert_eq!(poisoned.ready_next_epoch(), Some(25))",
         "assert!(!audit.bytes.windows(END_PREFIX.len()).any(|w| w == END_PREFIX))",
         "assert_eq!(observed.record_drops, 0)",
@@ -1009,13 +1313,42 @@ def verify_features(inputs: Inputs) -> None:
     milkv = PHASE.parse_features(inputs.milkv_manifest, "Milk-V firmware")
     require(kernel.get(FEATURE) == [TRUSTED_FEATURE], "collector base is not the exact trusted-sample successor")
     require(kernel.get(QEMU_FEATURE) == [FEATURE, FINISH_QEMU_FEATURE, "dep:sha2"], "kernel collector QEMU closure differs")
+    require(
+        kernel.get(QEMU_DECISION_FEATURE)
+        == ["ssh-test", FEATURE, f"vibeos-wasm-aot-profile/{QEMU_PROFILE_FEATURE}"],
+        "kernel formal-QEMU decision closure differs",
+    )
+    require(
+        kernel.get(QEMU_DECISION_SMOKE_FEATURE)
+        == [
+            QEMU_DECISION_FEATURE,
+            f"vibeos-wasm-aot-profile/{QEMU_PROFILE_SMOKE_FEATURE}",
+        ],
+        "kernel dirty-smoke QEMU decision closure differs",
+    )
     require(qemu.get(QEMU_FEATURE) == [FINISH_QEMU_FEATURE, f"vibeos-kernel/{QEMU_FEATURE}"], "QEMU collector forwarding differs")
+    require(
+        qemu.get(QEMU_DECISION_FEATURE)
+        == [f"vibeos-kernel/{QEMU_DECISION_FEATURE}"],
+        "QEMU firmware formal-decision forwarding differs",
+    )
+    require(
+        qemu.get(QEMU_DECISION_SMOKE_FEATURE)
+        == [QEMU_DECISION_FEATURE, f"vibeos-kernel/{QEMU_DECISION_SMOKE_FEATURE}"],
+        "QEMU firmware dirty-smoke forwarding differs",
+    )
     require(milkv.get(FEATURE) == ["milkv-ssh", f"vibeos-kernel/{FEATURE}"], "Milk-V collector forwarding differs")
     require(QEMU_FEATURE not in milkv, "Milk-V exposes the audit-only QEMU gate")
+    require(QEMU_DECISION_FEATURE not in milkv, "Milk-V exposes the formal-QEMU decision gate")
+    require(QEMU_DECISION_SMOKE_FEATURE not in milkv, "Milk-V exposes the dirty-smoke QEMU gate")
     for label, features, name in (
         ("kernel", kernel, FEATURE),
         ("kernel", kernel, QEMU_FEATURE),
+        ("kernel", kernel, QEMU_DECISION_FEATURE),
+        ("kernel", kernel, QEMU_DECISION_SMOKE_FEATURE),
         ("QEMU firmware", qemu, QEMU_FEATURE),
+        ("QEMU firmware", qemu, QEMU_DECISION_FEATURE),
+        ("QEMU firmware", qemu, QEMU_DECISION_SMOKE_FEATURE),
         ("Milk-V firmware", milkv, FEATURE),
     ):
         require(name not in PHASE.local_feature_closure(features, features.get("default", [])), f"{label} enables {name} by default")
@@ -1025,6 +1358,25 @@ def verify_features(inputs: Inputs) -> None:
     qemu_closure = PHASE.local_feature_closure(kernel, [QEMU_FEATURE])
     require(FEATURE in qemu_closure and FINISH_QEMU_FEATURE in qemu_closure, "QEMU collector omits base/finish predecessor")
     require(TRUSTED_QEMU_FEATURE not in qemu_closure, "QEMU collector inherits the discard-only trusted-sample transcript")
+    formal_qemu_closure = PHASE.local_feature_closure(kernel, [QEMU_DECISION_FEATURE])
+    require(
+        FEATURE in formal_qemu_closure
+        and "ssh-test" in formal_qemu_closure
+        and FINISH_QEMU_FEATURE not in formal_qemu_closure
+        and QEMU_FEATURE not in formal_qemu_closure
+        and TRUSTED_QEMU_FEATURE not in formal_qemu_closure,
+        "formal-QEMU decision inherits diagnostic QEMU telemetry or omits its narrow SSH fixture",
+    )
+    smoke_qemu_closure = PHASE.local_feature_closure(kernel, [QEMU_DECISION_SMOKE_FEATURE])
+    require(
+        QEMU_DECISION_FEATURE in smoke_qemu_closure
+        and FEATURE in smoke_qemu_closure
+        and "ssh-test" in smoke_qemu_closure
+        and FINISH_QEMU_FEATURE not in smoke_qemu_closure
+        and QEMU_FEATURE not in smoke_qemu_closure
+        and TRUSTED_QEMU_FEATURE not in smoke_qemu_closure,
+        "dirty-smoke QEMU decision does not layer exactly on the formal image",
+    )
     try:
         kernel_toml = tomllib.loads(inputs.kernel_manifest.decode("utf-8"))
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
@@ -1039,22 +1391,47 @@ def verify_features(inputs: Inputs) -> None:
     qemu_only = f'#[cfg(all(feature="{QEMU_FEATURE}",not(feature="qemu-virt")))]compile_error!("feature`{QEMU_FEATURE}`isQEMU-only");'
     require(qemu_only in root, "collector acceptance lacks its QEMU-only guard")
     physical_qemu = (
-        f'#[cfg(all(feature="{FEATURE}",feature="qemu-virt",not(feature="{QEMU_FEATURE}")))]'
+        f'#[cfg(all(feature="{FEATURE}",feature="qemu-virt",not(any('
+        f'feature="{QEMU_FEATURE}",feature="{QEMU_DECISION_FEATURE}"))))]'
         f'compile_error!("feature`{FEATURE}`cannotexposephysicalformalrecordsonQEMU");'
     )
     require(physical_qemu in root, "physical formal collector can run on QEMU outside the absorbing audit gate")
     physical_platform = (
-        f'#[cfg(all(feature="{FEATURE}",not(any(feature="milkv-duo",feature="{QEMU_FEATURE}"))))]'
-        f'compile_error!("feature`{FEATURE}`requiresMilk-VDuooritsabsorbingQEMUacceptance");'
+        f'#[cfg(all(feature="{FEATURE}",not(any(feature="milkv-duo",'
+        f'feature="{QEMU_FEATURE}",feature="{QEMU_DECISION_FEATURE}"))))]'
+        f'compile_error!("feature`{FEATURE}`requiresMilk-VDuo,itsabsorbingQEMUacceptance,'
+        'ortheformalQEMUcontract");'
     )
     require(physical_platform in root, "physical formal collector can run outside Milk-V Duo")
+    formal_qemu_only = (
+        f'#[cfg(all(feature="{QEMU_DECISION_FEATURE}",not(feature="qemu-virt")))]'
+        f'compile_error!("feature`{QEMU_DECISION_FEATURE}`isQEMU-only");'
+    )
+    require(formal_qemu_only in root, "formal-QEMU decision lacks its QEMU-only guard")
+    formal_no_milkv = (
+        f'#[cfg(all(feature="{QEMU_DECISION_FEATURE}",feature="milkv-duo"))]'
+        f'compile_error!("feature`{QEMU_DECISION_FEATURE}`cannotclaimMilk-VDuoprovenance");'
+    )
+    require(formal_no_milkv in root, "formal-QEMU decision can claim Milk-V provenance")
+    smoke_layer = (
+        f'#[cfg(all(feature="{QEMU_DECISION_SMOKE_FEATURE}",'
+        f'not(feature="{QEMU_DECISION_FEATURE}")))]'
+        f'compile_error!("feature`{QEMU_DECISION_SMOKE_FEATURE}`mustlayerontheformalQEMUimage");'
+    )
+    require(smoke_layer in root, "dirty-smoke marker need not layer on the formal QEMU image")
+    formal_audit_mutual = (
+        f'#[cfg(all(feature="{QEMU_DECISION_FEATURE}",feature="{QEMU_FEATURE}"))]'
+        'compile_error!("formalandabsorbingC8.4QEMUcollectorsaremutuallyexclusive");'
+    )
+    require(formal_audit_mutual in root, "formal and absorbing QEMU collectors can be combined")
     legacy_shell = (
         f'#[cfg(all(feature="{FEATURE}",feature="legacy-shell"))]'
         f'compile_error!("feature`{FEATURE}`excludesthelocallegacyshell");'
     )
     require(legacy_shell in root, "physical collector can re-enable the local legacy shell")
     pairing = (
-        f'#[cfg(all(feature="{FEATURE}",feature="{FINISH_QEMU_FEATURE}",not(feature="{QEMU_FEATURE}")))]'
+        f'#[cfg(all(feature="{FEATURE}",feature="{FINISH_QEMU_FEATURE}",not(any('
+        f'feature="{QEMU_FEATURE}",feature="{QEMU_DECISION_FEATURE}"))))]'
         f'compile_error!("feature`{FEATURE}`cannotreusethediscard-onlyfinish/verifyQEMUtranscript");'
     )
     require(pairing in root, "collector base can reuse predecessor QEMU telemetry")
@@ -1065,13 +1442,27 @@ def verify_features(inputs: Inputs) -> None:
     require(mutual in root, "collector and verified-stream consumers are not mutually exclusive")
     trusted_exemption = (
         f'feature="{TRUSTED_FEATURE}",feature="{FINISH_QEMU_FEATURE}",'
-        f'not(feature="{TRUSTED_QEMU_FEATURE}"),not(feature="{QEMU_FEATURE}")'
+        f'not(feature="{TRUSTED_QEMU_FEATURE}"),not(feature="{QEMU_FEATURE}"),'
+        f'not(feature="{QEMU_DECISION_FEATURE}")'
     )
     require(trusted_exemption in root, "trusted predecessor does not narrowly exempt collector QEMU")
     require(
         f'feature="{QEMU_FEATURE}"' in root and "C8.4QEMUacceptancesareisolatedimages" in root,
         "collector QEMU isolation guard is missing",
     )
+    absorbing_isolation = (
+        f'#[cfg(all(feature="{QEMU_FEATURE}",any('
+        'feature="wasm-c48-qemu-acceptance",'
+        'feature="wasm-c84-profile-slot-qemu-acceptance",'
+        'feature="wasm-c84-core-poll-qemu-acceptance",'
+        'feature="wasm-c84-profile-irq-overlay-qemu-acceptance",'
+        'feature="wasm-c84-profile-child-delegation-qemu-acceptance",'
+        f'feature="{TRUSTED_QEMU_FEATURE}",'
+        'feature="wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",'
+        f'feature="{QEMU_DECISION_FEATURE}")))]'
+        'compile_error!("C8.4QEMUacceptancesareisolatedimages");'
+    )
+    require(absorbing_isolation in root, "absorbing QEMU collector isolation set differs")
 
 
 def verify_irq_long_run(inputs: Inputs) -> None:
@@ -1112,8 +1503,12 @@ def verify_irq_long_run(inputs: Inputs) -> None:
         "terminal IRQ range has an extra, runtime-selected, or missing bound",
     )
     require(
-        f'#[cfg(feature="{FEATURE}")]if!(1..=' not in terminal_code,
-        "24-epoch IRQ exemption is exposed by the physical collector base feature",
+        f'feature="{FEATURE}"' not in terminal_code,
+        "24-epoch IRQ range is exposed by the reusable physical/base collector",
+    )
+    require(
+        f'feature="{QEMU_DECISION_FEATURE}"' not in terminal_code,
+        "formal-QEMU image inherits diagnostic IRQ range selection",
     )
     ordered_semantic(
         terminal.raw,
@@ -1343,7 +1738,18 @@ def verify_kernel_integration(inputs: Inputs) -> None:
     slot = inputs.slot
     slot_code = semantic(slot)
     require(f'#[cfg(feature="{FEATURE}")]' in slot_code, "collector slot integration is not feature-isolated")
-    for state in ("Uninitialized", "Initializing", "Ready", "Bound", "Publishing", "Complete", "Failed"):
+    for state in (
+        "Uninitialized",
+        "Initializing",
+        "Ready",
+        "Bound",
+        "Publishing",
+        "PendingAcceptance",
+        "PendingTerminal",
+        "FinalizingTerminal",
+        "Complete",
+        "Failed",
+    ):
         require(state in slot, f"collector slot state {state} is missing")
     require("SpinLock" in slot and "COLLECTOR" in slot, "collector is not retained behind a kernel SpinLock")
     require("OwnerSeal" in slot, "collector binding does not retain the exact owner seal")
@@ -1371,6 +1777,10 @@ def verify_kernel_integration(inputs: Inputs) -> None:
         == (
             "enumCollectorState{Uninitialized,Initializing,Ready(KernelBootCollector),"
             "Bound{collector:KernelBootCollector,owner:OwnerSeal,},Publishing{owner:OwnerSeal,},"
+            "PendingAcceptance{collector:KernelBootCollector,epoch:u64,ready_epoch:u64,"
+            "committed_records:u8,},PendingTerminal{pending_end:KernelPendingEnd,epoch:u64,"
+            "ready_epoch:u64,committed_records:u8,},FinalizingTerminal{epoch:u64,"
+            "ready_epoch:u64,committed_records:u8,},"
             "Complete{receipt:BootReceipt,ready_epoch:u64,audit_commits:u8,},"
             "Failed(CollectorFailureReceipt),}"
         ),
@@ -1425,32 +1835,35 @@ def verify_kernel_integration(inputs: Inputs) -> None:
     fail_state = find_scope(slot, r"\bfn\s+fail_collector_state\b", "absorbing collector failure transition")
     fail_state_code = semantic(fail_state.raw)
     require(
-        "CollectorState::Failed(_)|CollectorState::Complete{..}" in fail_state_code
-        and fail_state_code.find("CollectorState::Failed(_)|CollectorState::Complete{..}")
+        "CollectorState::Failed(_)|CollectorState::FinalizingTerminal{..}|CollectorState::Complete{..}"
+        in fail_state_code
+        and fail_state_code.find(
+            "CollectorState::Failed(_)|CollectorState::FinalizingTerminal{..}|CollectorState::Complete{..}"
+        )
         < fail_state_code.find("mem::replace(state,CollectorState::Failed(failure))"),
-        "Failed/Complete collector state can be reset or overwritten",
+        "Failed/finalizing/Complete collector state can be reset or overwritten",
     )
 
-    physical_factory = find_scope(slot, r"\bstruct\s+PhysicalRecordFactory\b", "physical record factory")
+    physical_factory = find_scope(slot, r"\bstruct\s+AtomicUartRecordFactory\b", "atomic UART record factory")
     require(
-        semantic(physical_factory.raw) == "structPhysicalRecordFactory{not_sync:PhantomData<Cell<()>>,}",
-        "persistent physical factory is not guard-free Send + !Sync",
+        semantic(physical_factory.raw) == "structAtomicUartRecordFactory{not_sync:PhantomData<Cell<()>>,}",
+        "persistent atomic UART factory is not guard-free Send + !Sync",
     )
     physical_impl = find_scope(
         slot,
-        r"\bimpl\s+ProfileRecordSinkFactory\s+for\s+PhysicalRecordFactory\b",
-        "physical record factory impl",
+        r"\bimpl\s+ProfileRecordSinkFactory\s+for\s+AtomicUartRecordFactory\b",
+        "atomic UART record factory impl",
     )
     require(
         semantic(physical_impl.raw)
         == (
-            "implProfileRecordSinkFactoryforPhysicalRecordFactory{"
+            "implProfileRecordSinkFactoryforAtomicUartRecordFactory{"
             "typeError=crate::tty::RawUartRecordError;typeRecord=crate::tty::RawUartRecord;"
             "fnbegin_record(&mutself)->Result<Self::Record,Self::Error>{crate::tty::begin_raw_uart_record()}}"
         ),
-        "physical factory no longer acquires exactly one temporary raw record",
+        "atomic UART factory no longer acquires exactly one temporary raw record",
     )
-    require("unsafeimplSyncforPhysicalRecordFactory" not in slot_code, "physical factory gained an unsafe Sync impl")
+    require("unsafeimplSyncforAtomicUartRecordFactory" not in slot_code, "atomic UART factory gained an unsafe Sync impl")
     require("unsafeimplSendforcrate::tty::RawUartRecord" not in slot_code, "physical record gained an unsafe Send impl")
     physical_sink = find_scope(
         slot,
@@ -1472,8 +1885,25 @@ def verify_kernel_integration(inputs: Inputs) -> None:
     physical_cfg = (
         f'#[cfg(all(feature="{FEATURE}",not(feature="{QEMU_FEATURE}")))]'
     )
-    prefix = semantic(slot[max(0, physical_factory.start - 240) : physical_factory.start])
-    require(prefix.endswith(physical_cfg), "physical factory is not excluded from QEMU audit images")
+    prefix = semantic(slot[max(0, physical_factory.start - 640) : physical_factory.start])
+    require(prefix.endswith(physical_cfg), "atomic UART factory is not excluded from QEMU audit images")
+    require(
+        "typeCollectorFactory=AtomicUartRecordFactory;" in slot_code,
+        "non-absorbing collector no longer selects the atomic UART factory",
+    )
+    factory_constructor = find_scope(
+        slot,
+        rf'#\[cfg\(all\(\s*feature\s*=\s*"{FEATURE}",\s*'
+        rf'not\(feature\s*=\s*"{QEMU_FEATURE}"\)\s*\)\)\]\s*'
+        r'fn\s+collector_factory\b',
+        "atomic UART collector factory constructor",
+        match_literals=True,
+    )
+    require(
+        semantic(factory_constructor.raw)
+        == physical_cfg + "fncollector_factory()->CollectorFactory{AtomicUartRecordFactory::new()}",
+        "non-absorbing collector factory constructor differs",
+    )
 
     initialize = find_scope(slot, r"\bfn\s+init_collector\b", "collector initialization")
     initialize_code = semantic(initialize.raw)
@@ -1558,6 +1988,9 @@ def verify_kernel_integration(inputs: Inputs) -> None:
     # source ordering must show both state tombstones before external work and
     # owner detachment before the first record factory acquisition.
     require(slot_code.count("CollectorState::Publishing") >= 1, "collector lacks a Publishing tombstone")
+    require(slot_code.count("CollectorState::PendingAcceptance") >= 4, "collector lacks a sealed post-SAMPLE acceptance state")
+    require(slot_code.count("CollectorState::PendingTerminal") >= 4, "collector lacks a sealed pending-END state")
+    require(slot_code.count("CollectorState::FinalizingTerminal") >= 3, "collector lacks an END-commit tombstone")
     require(slot_code.count("CollectorState::Failed") >= 2, "collector failure is not absorbing")
     require(slot_code.count("CollectorState::Complete") >= 2, "collector completion is not absorbing")
     require("CollectorAbort::TerminalRejected" in slot and "quarantine_attempt(" in slot, "terminal rejection can escape without collector poison")
@@ -1598,10 +2031,10 @@ def verify_kernel_integration(inputs: Inputs) -> None:
         (
             "collector_take_audit(expected_commit)",
             "*slot = SlotState::Ready(ready)",
-            "*collector_slot = CollectorState::Ready(collector)",
+            "*collector_slot = CollectorState::PendingAcceptance",
             "armed: true",
         ),
-        "SAMPLE audit capability before Ready reinstall",
+        "SAMPLE audit capability before Ready/PendingAcceptance reinstall",
     )
     more_code = semantic(more.raw)
     require(
@@ -1610,30 +2043,39 @@ def verify_kernel_integration(inputs: Inputs) -> None:
         and "if!exact||ready.next_epoch()!=Some(ready_epoch)" in more_code,
         "SAMPLE reinstall accepts stale owner lineage or a changed Ready epoch",
     )
-    complete = find_scope(
+    require(
+        "CollectorState::Ready(collector)" not in more_code,
+        "next collector epoch becomes reusable before SSH tail acceptance",
+    )
+    pending = find_scope(
         collect.raw,
-        r"Ok\(CollectionProgress::Complete\(completed\)\)\s*=>",
-        "collector Complete reinstall",
+        r"Ok\(CollectionProgress::PendingTerminal\(pending\)\)\s*=>",
+        "collector pending-END reinstall",
     )
     ordered_semantic(
-        complete.raw,
+        pending.raw,
         (
-            "completed.ready_next_epoch()",
-            "completed.into_ready()",
+            "pending.ready_next_epoch()",
+            "pending.receipt()",
+            "pending.into_parts()",
             "collector_take_audit(expected_commit)",
-            "collector_take_audit(26)",
             "*slot = SlotState::Ready(ready)",
-            "*collector_slot = CollectorState::Complete",
+            "*collector_slot = CollectorState::PendingTerminal",
             "armed: true",
         ),
-        "sample-23 END capability before Ready25/Closed reinstall",
+        "sample-23 capability before Ready25/pending-END reinstall",
     )
-    complete_code = semantic(complete.raw)
+    pending_code = semantic(pending.raw)
     require(
         "slot_owner.matches(owner.epoch,owner.detach)&&collector_owner.matches(owner.epoch,owner.detach)"
-        in complete_code
-        and "if!exact||ready.next_epoch()!=Some(ready_epoch)" in complete_code,
-        "Closed reinstall accepts stale owner lineage or a changed Ready25",
+        in pending_code
+        and "if!exact||ready.next_epoch()!=Some(ready_epoch)" in pending_code,
+        "pending-END reinstall accepts stale owner lineage or a changed Ready25",
+    )
+    require(
+        "commit_terminal(" not in collect_code
+        and "CollectorState::Complete" not in pending_code,
+        "sample-23 path commits END or closes before SSH tail acceptance",
     )
 
     next_epoch = find_scope(
@@ -1647,8 +2089,12 @@ def verify_kernel_integration(inputs: Inputs) -> None:
         "(SlotState::Ready(_),CollectorState::Complete{..})=>{Err(ProfileError::CollectorClosed)}"
         in next_code
         and "(SlotState::Ready(_),CollectorState::Failed(_))=>Err(ProfileError::CollectorFailed)"
-        in next_code,
-        "Closed/Failed do not reject against the still-preserved Ready slot",
+        in next_code
+        and "CollectorState::PendingAcceptance{..}" in next_code
+        and "CollectorState::PendingTerminal{..}" in next_code
+        and "CollectorState::FinalizingTerminal{..}" in next_code
+        and next_code.count("Err(ProfileError::Busy)") >= 2,
+        "pending/closed/failed states do not gate preparation against the preserved Ready slot",
     )
     prepare_current = find_scope(
         slot,
@@ -1744,13 +2190,16 @@ def verify_kernel_integration(inputs: Inputs) -> None:
     require(
         semantic(terminal_receipt.raw)
         == (
-            "pub(crate)structCollectorTerminalReceipt{epoch:u64,ready_epoch:u64,audit_commits:u8,"
+            "pub(crate)structCollectorTerminalReceipt{epoch:u64,ready_epoch:u64,committed_records:u8,"
             "armed:bool,"
             f'#[cfg(feature="{QEMU_FEATURE}")]audit:Option<CollectorAuditTerminal>,}}'
         ),
         "collector terminal receipt can be copied or dropped without an armed fail-close",
     )
-    require(slot_code.count("armed:true") == 2 and slot_code.count("receipt.armed=false") == 1, "terminal receipt arm/disarm graph differs")
+    require(
+        slot_code.count("armed:true") == 2 and slot_code.count("receipt.armed=false") == 4,
+        "terminal receipt arm/disarm graph differs",
+    )
     receipt_drop = find_scope(slot, r"\bimpl\s+Drop\s+for\s+CollectorTerminalReceipt\b", "collector terminal receipt Drop")
     ordered_semantic(
         receipt_drop.raw,
@@ -1767,7 +2216,9 @@ def verify_kernel_integration(inputs: Inputs) -> None:
         "SlotState::Ready(ready)ifready.next_epoch()==Some(ready_epoch)" in fail_unfinalized_code
         and "CollectorState::Failed(CollectorFailureReceipt::new(" in fail_unfinalized_code
         and "CollectorFailureReason::StateMismatch" in fail_unfinalized_code
-        and "receipt.absorb_committed_records(audit_commits)" in fail_unfinalized_code,
+        and "receipt.absorb_committed_records(committed_records)" in fail_unfinalized_code
+        and "CollectorState::PendingAcceptance" in fail_unfinalized_code
+        and "CollectorState::PendingTerminal" in fail_unfinalized_code,
         "dropped terminal receipt can leave a closed campaign reusable",
     )
     install_failure = find_scope(slot, r"\bfn\s+install_collector_failure\b", "collector failure install")
@@ -1779,18 +2230,41 @@ def verify_kernel_integration(inputs: Inputs) -> None:
         "absorbing Failed reinstall can roll back or stale its next sequence",
     )
     emit_success = find_scope(slot, r"\bpub\(crate\)\s+fn\s+collector_emit_success\b", "collector success finalizer")
+    emit_success_code = semantic(emit_success.raw)
+    require(
+        "pub(crate)fncollector_emit_success(mutreceipt:CollectorTerminalReceipt,)->Result<(),ProfileError>"
+        in emit_success_code,
+        "collector success finalizer cannot report a failed END commit",
+    )
     ordered_semantic(
         emit_success.raw,
         (
             "receipt.audit.take()",
             "collector_audit_sample(",
-            "if let Some((end, boot)) = audit.end",
+            "let final_prefix_records = BOOT_SAMPLES.checked_add(1)",
+            "let slot = SLOT.lock()",
+            "let mut collector_slot = COLLECTOR.lock()",
+            "if receipt.committed_records < final_prefix_records",
+            "let CollectorState::PendingAcceptance { collector, .. } = previous else",
+            "*collector_slot = CollectorState::Ready(collector)",
+            "return Ok(())",
+            "CollectorState::FinalizingTerminal",
+            "let CollectorState::PendingTerminal { pending_end, .. } = previous else",
+            "pending_end.commit_terminal()",
+            "let committed_records = poisoned.committed_records()",
+            "let boot = completed.receipt()",
+            "collector_take_audit(committed_records)",
+            "*collector_slot = CollectorState::Complete",
             "collector_audit_end(end, boot, receipt.ready_epoch)",
-            "receipt.armed = false",
         ),
-        "SAMPLE/optional-END marker before terminal receipt disarm",
+        "post-tail SAMPLE acceptance and sole END finalization",
     )
-    require(semantic(emit_success.raw).count("receipt.armed=false") == 1, "collector success can disarm without one finalizer")
+    require(
+        emit_success_code.count("pending_end.commit_terminal()") == 1
+        and slot_code.count("pending_end.commit_terminal()") == 1
+        and emit_success_code.count("receipt.armed=false") == 4,
+        "END authority can be committed elsewhere or a finalizer outcome stays armed",
+    )
 
     # Every acquisition of the collector slot must have a still-live SLOT
     # acquisition earlier in the same top-level function. This admits multiple
@@ -1927,9 +2401,9 @@ def verify_kernel_integration(inputs: Inputs) -> None:
         inputs.ssh,
         (
             f'#[cfg(feature = "{QEMU_FEATURE}")] collector_trusted_sample_response(epoch, &_terminal_evidence)?',
-            f'#[cfg(feature = "{FEATURE}")] crate::wasm_aot_profile_slot::collector_emit_success(_terminal_evidence.collector);',
+            f'#[cfg(feature = "{FEATURE}")] crate::wasm_aot_profile_slot::collector_emit_success(_terminal_evidence.collector).map_err(|_| ())?;',
         ),
-        "QEMU predecessor terminal before collector audit",
+        "diagnostic predecessor marker before fallible collector finalization",
     )
     response_success = find_scope(
         inputs.ssh,
@@ -1939,14 +2413,18 @@ def verify_kernel_integration(inputs: Inputs) -> None:
     response_code = semantic(response_success.raw)
     finalizer_position = response_code.find("collector_emit_success(")
     require(finalizer_position >= 0, "SSH success drops the armed collector terminal receipt")
+    finalizer_tail = response_code[finalizer_position:]
     require(
-        "?" not in response_success.raw[response_success.raw.find("collector_emit_success(") :]
-        and "return Err" not in response_success.raw[response_success.raw.find("collector_emit_success(") :],
-        "SSH can fail after disarming/finalizing the collector receipt",
+        "collector_emit_success(_terminal_evidence.collector).map_err(|_|())?;Ok(())"
+        in finalizer_tail
+        and finalizer_tail.count("?") == 1
+        and "returnErr" not in finalizer_tail,
+        "SSH does not propagate END failure or can fail after collector finalization",
     )
     require(
-        finalizer_position > max((match.start() for match in re.finditer(r"\?", response_code)), default=-1),
-        "collector receipt is finalized before a fallible predecessor observation",
+        response_code.rfind("?") > finalizer_position
+        and response_code.rfind("?") == response_code.find("?", finalizer_position),
+        "collector finalization is not the last fallible SSH-tail operation",
     )
     qemu_failure = semantic(
         f"""
@@ -2308,7 +2786,10 @@ def verify_peer_script(raw: bytes) -> None:
         'EXPECTED_META_SHA256 = "6d46aa52ca9155cfed4eae230a00175f4247d950a8a686a8bdb3657dc6954b4b"' in source,
         "collector peer META SHA-256 KAT differs",
     )
-    require(source.count('getattr(os, "O_NOFOLLOW", 0)') == 2, "stable/live peer readers do not both reject symlinks")
+    require(
+        source.count('getattr(os, "O_NOFOLLOW", 0)') == 3,
+        "stable/live/source peer readers do not all reject symlinks",
+    )
     require(source.count("stat.S_ISREG(") >= 3, "stable/live peer readers do not both require regular files")
     require(source.count("total <= MAX_QEMU_LOG_BYTES") == 2, "stable/live peer readers do not both enforce streaming size bounds")
     require(
@@ -3234,7 +3715,15 @@ def verify_docs_ci(inputs: Inputs) -> None:
         and "sanitized `env -i` envelope" in inputs.decision_doc,
         "software-only closed-build environment description differs",
     )
-    require("34,386" in inputs.decision_doc and KNOWN_TRANSCRIPT_SHA256 in inputs.decision_doc, "decision doc known-answer transcript differs")
+    require(
+        "34,386" in inputs.decision_doc
+        and KNOWN_TRANSCRIPT_SHA256 in inputs.decision_doc
+        and "34,532" in inputs.decision_doc
+        and QEMU_KNOWN_TRANSCRIPT_SHA256 in inputs.decision_doc
+        and "34,542" in inputs.decision_doc
+        and QEMU_SMOKE_KNOWN_TRANSCRIPT_SHA256 in inputs.decision_doc,
+        "decision doc known-answer transcript differs",
+    )
     testing_status = re.sub(r"\s+", " ", inputs.testing.lower()).replace(
         "cold-boot", "cold boot"
     )
@@ -3263,12 +3752,15 @@ def verify_docs_ci(inputs: Inputs) -> None:
             f"decision doc software-only CI boundary omits {phrase!r}",
         )
     require("implementation in progress" in inputs.roadmap, "roadmap no longer reports the remaining physical evidence work")
-    roadmap_status = re.sub(r"\s+", " ", inputs.roadmap.lower()).replace(
-        "cold-boot", "cold boot"
+    roadmap_status = (
+        re.sub(r"\s+", " ", inputs.roadmap.lower())
+        .replace("cold-boot", "cold boot")
+        .replace("`", "")
     )
     for phrase in (
-        "software-side independent frozen-source envelope, build/package envelopes, host-observed docker runtime closure",
-        "independent source materialization and local docker runtime custody are now closed prerequisites",
+        "independent frozen-source and build/package envelopes, host-observed docker runtime closure",
+        "retained physical contract and tooling remain available but are no longer a c8.4 prerequisite",
+        "decision-bearing replacement is the disjoint qemu-virt-rv64-tcg-icount-v1 contract",
     ):
         require(
             phrase in roadmap_status,
@@ -3288,27 +3780,34 @@ def verify_docs_ci(inputs: Inputs) -> None:
             f"{label} omits the frozen-source/runtime-custody software boundary",
         )
         require(
-            "physical testing is paused at operator request" in normalized,
-            f"{label} omits the operator-paused physical status",
-        )
-        synthetic_boundary = (
-            "synthetic host files"
-            if label == "TESTING"
-            else "host-only synthetic"
+            "milk-v duo" in normalized
+            and "paused" in normalized
+            and ("physical testing" in normalized or "physical execution" in normalized),
+            f"{label} omits the paused Milk-V Duo physical status",
         )
         require(
-            synthetic_boundary in normalized,
+            "synthetic" in normalized
+            and ("host-only" in normalized or "self-tests" in normalized),
             f"{label} omits the software-only synthetic coverage boundary",
         )
-        incomplete_decision = (
-            "no physical c8.4 result"
-            if label == "decision doc"
-            else "no workload-specific aot decision"
-        )
         require(
-            incomplete_decision in normalized,
+            (
+                "preparation only" in normalized
+                if label == "decision doc"
+                else "no workload-specific aot decision" in normalized
+            ),
             f"{label} overclaims a workload-specific AOT decision",
         )
+    require(
+        "operator request" in inputs.decision_doc.lower()
+        and "operator request" in inputs.roadmap.lower(),
+        "operator-paused physical status is not retained in the governing docs",
+    )
+    require(
+        "These self-tests use local synthetic repositories, records, streams, and\n"
+        "temporary files." in inputs.decision_doc,
+        "decision doc no longer states the exact local-synthetic selftest boundary",
+    )
 
 
 def verify_collector(inputs: Inputs) -> None:
@@ -3491,6 +3990,56 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             ./scripts/build-milkv-duo.sh --runtime-costs
 '''
     mutations: list[tuple[str, Callable[[Inputs], Inputs]]] = [
+        (
+            "collector-crate-default-selects-qemu",
+            lambda data: mutate_bytes(
+                data,
+                "crate_manifest",
+                b"default = []",
+                b'default = ["qemu-decision-v1"]',
+                "collector crate default feature",
+            ),
+        ),
+        (
+            "collector-crate-qemu-feature-widened",
+            lambda data: mutate_bytes(
+                data,
+                "crate_manifest",
+                b"qemu-decision-v1 = []",
+                b'qemu-decision-v1 = ["sha2/asm"]',
+                "collector crate formal-QEMU feature",
+            ),
+        ),
+        (
+            "collector-crate-smoke-feature-detached",
+            lambda data: mutate_bytes(
+                data,
+                "crate_manifest",
+                b'qemu-decision-v1-smoke = ["qemu-decision-v1"]',
+                b"qemu-decision-v1-smoke = []",
+                "collector crate dirty-smoke feature",
+            ),
+        ),
+        (
+            "collector-crate-smoke-feature-widened",
+            lambda data: mutate_bytes(
+                data,
+                "crate_manifest",
+                b'qemu-decision-v1-smoke = ["qemu-decision-v1"]',
+                b'qemu-decision-v1-smoke = ["qemu-decision-v1", "sha2/asm"]',
+                "collector crate dirty-smoke feature width",
+            ),
+        ),
+        (
+            "collector-crate-extra-feature",
+            lambda data: mutate_bytes(
+                data,
+                "crate_manifest",
+                b"qemu-decision-v1 = []",
+                b"qemu-decision-v1 = []\nunreviewed = []",
+                "collector crate extra feature",
+            ),
+        ),
         ("sample-count-25", lambda data: mutate_text(data, "collector", "pub const BOOT_SAMPLES: u8 = 24;", "pub const BOOT_SAMPLES: u8 = 25;", "sample count")),
         ("warmup-count-2", lambda data: mutate_text(data, "collector", "pub const BOOT_WARMUPS: u8 = 3;", "pub const BOOT_WARMUPS: u8 = 2;", "warmup count")),
         ("retained-count-20", lambda data: mutate_text(data, "collector", "pub const BOOT_RETAINED: usize = 21;", "pub const BOOT_RETAINED: usize = 20;", "retained count")),
@@ -3501,7 +4050,7 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
         ("warmup-off-by-one", lambda data: mutate_text(data, "collector", "self.next_sample >= BOOT_WARMUPS", "self.next_sample > BOOT_WARMUPS", "warmup split")),
         ("p50-index-9", lambda data: mutate_text(data, "collector", "(ticks[10], ticks[19])", "(ticks[9], ticks[19])", "p50 index")),
         ("p95-index-20", lambda data: mutate_text(data, "collector", "(ticks[10], ticks[19])", "(ticks[10], ticks[20])", "p95 index")),
-        ("stability-overflow", lambda data: mutate_text(data, "collector", "u128::from(p95) * 100 > u128::from(p50) * 150", "p95 * 100 > p50 * 150", "stability width")),
+        ("stability-overflow", lambda data: mutate_text(data, "collector", "u128::from(p95) * 100 > u128::from(p50) * STABILITY_PERCENT", "p95 * 100 > p50 * STABILITY_PERCENT", "stability width")),
         ("end-before-stability", lambda data: mutate_text(data, "collector", "let (p50, p95) = retained_percentiles(self.retained_ticks);", "let (p50, p95) = (0, 0);", "stability bypass")),
         ("extra-meta", lambda data: mutate_text(data, "collector", "write_meta(&mut *record, &self)", "write_meta(&mut *record, &self).and_then(|()| write_meta(&mut *record, &self))", "extra META")),
         ("meta-retry-surface", lambda data: mutate_text(data, "collector", "    pub fn begin<'a, F: ProfileRecordSinkFactory>(", "    pub fn retry_meta(&self) {}\n\n    pub fn begin<'a, F: ProfileRecordSinkFactory>(", "META retry surface")),
@@ -3510,6 +4059,118 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
         ("poison-factory-recovery", lambda data: mutate_text(data, "collector", "impl<'a, F: ProfileRecordSinkFactory> PoisonedTranscript<'a, F> {", "impl<'a, F: ProfileRecordSinkFactory> PoisonedTranscript<'a, F> {\n    pub fn recover_factory(self) -> F { ManuallyDrop::into_inner(self.factory) }", "factory recovery")),
         ("uppercase-build-id", lambda data: mutate_text(data, "collector", "b'a'..=b'f' => Some(value - b'a' + 10),", "b'a'..=b'f' => Some(value - b'a' + 10), b'A'..=b'F' => Some(value - b'A' + 10),", "uppercase build identity")),
         ("run-id-field-swap", lambda data: mutate_text(data, "collector", "source_commit,\n            challenge_text,", "challenge_text,\n            source_commit,", "run-id fields")),
+        (
+            "formal-qemu-manifest-digest-drift",
+            lambda data: mutate_text(
+                data,
+                "collector",
+                QEMU_MANIFEST_SHA256,
+                "0" + QEMU_MANIFEST_SHA256[1:],
+                "formal QEMU manifest digest",
+            ),
+        ),
+        (
+            "formal-qemu-schema-digest-drift",
+            lambda data: mutate_text(
+                data,
+                "collector",
+                QEMU_SCHEMA_SHA256,
+                "1" + QEMU_SCHEMA_SHA256[1:],
+                "formal QEMU schema digest",
+            ),
+        ),
+        (
+            "formal-qemu-run-domain-includes-smoke",
+            lambda data: mutate_text(
+                data,
+                "collector",
+                '#[cfg(all(feature = "qemu-decision-v1", not(feature = "qemu-decision-v1-smoke")))]\n'
+                'const RUN_ID_DOMAIN: &[u8] = b"vibeos.c84.qemu-aot-decision.run-id.v1";',
+                '#[cfg(feature = "qemu-decision-v1")]\n'
+                'const RUN_ID_DOMAIN: &[u8] = b"vibeos.c84.qemu-aot-decision.run-id.v1";',
+                "formal QEMU run-id smoke exclusion",
+            ),
+        ),
+        (
+            "smoke-qemu-run-domain-collides-formal",
+            lambda data: mutate_text(
+                data,
+                "collector",
+                'b"vibeos.c84.qemu-aot-decision.smoke.run-id.v1"',
+                'b"vibeos.c84.qemu-aot-decision.run-id.v1"',
+                "dirty-smoke QEMU run-id domain",
+            ),
+        ),
+        (
+            "formal-qemu-capture-made-dirty",
+            lambda data: mutate_text(
+                data,
+                "collector",
+                'const CAPTURE_MODE: &[u8] = b"formal-publication";',
+                'const CAPTURE_MODE: &[u8] = b"dirty-smoke-not-publication";',
+                "formal QEMU capture mode",
+            ),
+        ),
+        (
+            "formal-qemu-made-ineligible",
+            lambda data: mutate_text(
+                data,
+                "collector",
+                'const DECISION_ELIGIBLE: &[u8] = b"true";',
+                'const DECISION_ELIGIBLE: &[u8] = b"false";',
+                "formal QEMU eligibility",
+            ),
+        ),
+        (
+            "smoke-qemu-made-eligible",
+            lambda data: mutate_text(
+                data,
+                "collector",
+                '#[cfg(feature = "qemu-decision-v1-smoke")]\nconst DECISION_ELIGIBLE: &[u8] = b"false";',
+                '#[cfg(feature = "qemu-decision-v1-smoke")]\nconst DECISION_ELIGIBLE: &[u8] = b"true";',
+                "dirty-smoke QEMU eligibility",
+            ),
+        ),
+        (
+            "formal-qemu-run-id-answer-drift",
+            lambda data: mutate_text(
+                data,
+                "collector",
+                QEMU_TEST_RUN_ID,
+                "0" + QEMU_TEST_RUN_ID[1:],
+                "formal QEMU run-id known answer",
+            ),
+        ),
+        (
+            "smoke-qemu-run-id-answer-drift",
+            lambda data: mutate_text(
+                data,
+                "collector",
+                QEMU_SMOKE_TEST_RUN_ID,
+                "0" + QEMU_SMOKE_TEST_RUN_ID[1:],
+                "dirty-smoke QEMU run-id known answer",
+            ),
+        ),
+        (
+            "formal-qemu-transcript-answer-drift",
+            lambda data: mutate_text(
+                data,
+                "collector",
+                QEMU_KNOWN_TRANSCRIPT_SHA256,
+                "0" + QEMU_KNOWN_TRANSCRIPT_SHA256[1:],
+                "formal QEMU transcript known answer",
+            ),
+        ),
+        (
+            "smoke-qemu-transcript-answer-drift",
+            lambda data: mutate_text(
+                data,
+                "collector",
+                QEMU_SMOKE_KNOWN_TRANSCRIPT_SHA256,
+                "0" + QEMU_SMOKE_KNOWN_TRANSCRIPT_SHA256[1:],
+                "dirty-smoke QEMU transcript known answer",
+            ),
+        ),
         (
             "retained-counter-wrapping",
             lambda data: mutate_scoped_text(
@@ -3548,7 +4209,7 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             lambda data: mutate_scoped_text(
                 data,
                 "collector",
-                r"\bpub\s+fn\s+collect\b",
+                r"\bpub\s+fn\s+commit_terminal\b",
                 ".and_then(|()| end_record.commit_record());",
                 ";",
                 "END commit omitted",
@@ -3603,9 +4264,9 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             lambda data: mutate_scoped_text(
                 data,
                 "collector",
-                r"\bimpl<'a,\s*F:\s*ProfileRecordSinkFactory>\s+CompletedTranscript",
-                "    pub fn into_ready(mut self) -> TargetReady<'a> {",
-                "    pub fn into_factory(self) -> F { ManuallyDrop::into_inner(self.factory) }\n\n    pub fn into_ready(mut self) -> TargetReady<'a> {",
+                r"\bimpl<F:\s*ProfileRecordSinkFactory>\s+CompletedTerminal",
+                "    pub const fn receipt(&self) -> BootReceipt {",
+                "    pub fn into_factory(self) -> F { ManuallyDrop::into_inner(self._factory) }\n\n    pub const fn receipt(&self) -> BootReceipt {",
                 "completed factory recovery",
             ),
         ),
@@ -3633,12 +4294,14 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
         ),
         (
             "meta-crlf",
-            lambda data: mutate_text(
+            lambda data: mutate_scoped_text(
                 data,
                 "collector",
+                r'#\[cfg\(not\(feature\s*=\s*"qemu-decision-v1"\)\)\]\s*fn\s+write_meta\b',
                 '"workload_revision\\\":1}\\n")',
                 '"workload_revision\\\":1}\\r\\n")',
                 "META CRLF",
+                match_literals=True,
             ),
         ),
         (
@@ -3899,9 +4562,9 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
                 data,
                 "slot",
                 r"\bfn\s+fail_collector_state\b",
-                "CollectorState::Failed(_) | CollectorState::Complete { .. }",
+                "CollectorState::Failed(_)\n            | CollectorState::FinalizingTerminal { .. }\n            | CollectorState::Complete { .. }",
                 "CollectorState::Failed(_)",
-                "Complete overwrite",
+                "finalizing/Complete overwrite",
             ),
         ),
         (
@@ -3949,14 +4612,47 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             ),
         ),
         (
-            "collector-irq-range-base-exemption",
+            "collector-irq-range-inherits-formal-policy",
             lambda data: mutate_scoped_text(
                 data,
                 "slot",
                 r"\bpub\(crate\)\s+fn\s+managed_irq_acceptance_terminal_gate\b",
                 f'#[cfg(feature = "{QEMU_FEATURE}")]\n    if !(1..=u64::from(BOOT_SAMPLES)).contains(&epoch)',
-                f'#[cfg(feature = "{FEATURE}")]\n    if !(1..=u64::from(BOOT_SAMPLES)).contains(&epoch)',
-                "collector IRQ physical-base exemption",
+                f'#[cfg(any(\n        feature = "{QEMU_FEATURE}",\n        feature = "{QEMU_DECISION_FEATURE}"\n    ))]\n    if !(1..=u64::from(BOOT_SAMPLES)).contains(&epoch)',
+                "collector IRQ formal-policy inheritance",
+            ),
+        ),
+        (
+            "collector-irq-range-formal-policy-only",
+            lambda data: mutate_scoped_text(
+                data,
+                "slot",
+                r"\bpub\(crate\)\s+fn\s+managed_irq_acceptance_terminal_gate\b",
+                f'#[cfg(feature = "{QEMU_FEATURE}")]\n    if !(1..=u64::from(BOOT_SAMPLES)).contains(&epoch)',
+                f'#[cfg(feature = "{QEMU_DECISION_FEATURE}")]\n    if !(1..=u64::from(BOOT_SAMPLES)).contains(&epoch)',
+                "collector IRQ formal-policy coupling",
+            ),
+        ),
+        (
+            "collector-irq-range-names-smoke-policy",
+            lambda data: mutate_scoped_text(
+                data,
+                "slot",
+                r"\bpub\(crate\)\s+fn\s+managed_irq_acceptance_terminal_gate\b",
+                f'#[cfg(feature = "{QEMU_FEATURE}")]\n    if !(1..=u64::from(BOOT_SAMPLES)).contains(&epoch)',
+                f'#[cfg(any(\n        feature = "{QEMU_FEATURE}",\n        feature = "{QEMU_DECISION_SMOKE_FEATURE}"\n    ))]\n    if !(1..=u64::from(BOOT_SAMPLES)).contains(&epoch)',
+                "collector IRQ smoke-policy coupling",
+            ),
+        ),
+        (
+            "collector-irq-predecessor-formal-exemption-added",
+            lambda data: mutate_scoped_text(
+                data,
+                "slot",
+                r"\bpub\(crate\)\s+fn\s+managed_irq_acceptance_terminal_gate\b",
+                f'#[cfg(not(feature = "{QEMU_FEATURE}"))]\n    if !(1..=4).contains(&epoch)',
+                f'#[cfg(not(any(\n        feature = "{QEMU_FEATURE}",\n        feature = "{QEMU_DECISION_FEATURE}"\n    )))]\n    if !(1..=4).contains(&epoch)',
+                "collector IRQ predecessor formal-QEMU exemption",
             ),
         ),
         (
@@ -4117,8 +4813,8 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
                 data,
                 "slot",
                 r"\bfn\s+collector_fail_unfinalized_terminal\b",
-                "receipt.absorb_committed_records(audit_commits);",
-                "receipt.audit_commits = audit_commits;",
+                "receipt.absorb_committed_records(committed_records);",
+                "receipt.audit_commits = committed_records;",
                 "Failed finalizer sequence refresh",
             ),
         ),
@@ -4189,14 +4885,14 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             ),
         ),
         (
-            "closed-ready-check-weakened",
+            "pending-end-ready-check-weakened",
             lambda data: mutate_scoped_text(
                 data,
                 "slot",
-                r"Ok\(CollectionProgress::Complete\(completed\)\)\s*=>",
+                r"Ok\(CollectionProgress::PendingTerminal\(pending\)\)\s*=>",
                 "if !exact || ready.next_epoch() != Some(ready_epoch) {",
                 "if !exact && ready.next_epoch() != Some(ready_epoch) {",
-                "Closed Ready check",
+                "pending-END Ready check",
             ),
         ),
         (
@@ -4204,20 +4900,20 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             lambda data: mutate_scoped_text(
                 data,
                 "slot",
-                r"Ok\(CollectionProgress::Complete\(completed\)\)\s*=>",
+                r"Ok\(CollectionProgress::PendingTerminal\(pending\)\)\s*=>",
                 "sequence.checked_add(2)",
                 "sequence.saturating_add(2).into()",
                 "audit commit saturation",
             ),
         ),
         (
-            "end-audit-commit-25",
+            "end-audit-commit-uses-prefix-count",
             lambda data: mutate_scoped_text(
                 data,
                 "slot",
-                r"Ok\(CollectionProgress::Complete\(completed\)\)\s*=>",
-                "collector_take_audit(26)",
-                "collector_take_audit(25)",
+                r"\bpub\(crate\)\s+fn\s+collector_emit_success\b",
+                "collector_take_audit(committed_records)",
+                "collector_take_audit(final_prefix_records)",
                 "END audit commit",
             ),
         ),
@@ -4226,7 +4922,7 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             lambda data: mutate_scoped_text(
                 data,
                 "slot",
-                r"Ok\(CollectionProgress::Complete\(completed\)\)\s*=>",
+                r"Ok\(CollectionProgress::PendingTerminal\(pending\)\)\s*=>",
                 "armed: true,",
                 "armed: false,",
                 "terminal receipt arm",
@@ -4238,19 +4934,19 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
                 data,
                 "slot",
                 r"\bimpl\s+Drop\s+for\s+CollectorTerminalReceipt\b",
-                "collector_fail_unfinalized_terminal(self.epoch, self.ready_epoch, self.audit_commits);",
-                "let _ = (self.epoch, self.ready_epoch, self.audit_commits);",
+                "collector_fail_unfinalized_terminal(\n                self.epoch,\n                self.ready_epoch,\n                self.committed_records,\n            );",
+                "let _ = (self.epoch, self.ready_epoch, self.committed_records);",
                 "terminal Drop fail-close",
             ),
         ),
         (
             "terminal-disarm-before-audit",
-            lambda data: swap_scoped_text(
+            lambda data: mutate_scoped_text(
                 data,
                 "slot",
                 r"\bpub\(crate\)\s+fn\s+collector_emit_success\b",
                 "    #[cfg(feature = \"wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance\")]\n    let audit = receipt",
-                "    receipt.armed = false;",
+                "    receipt.armed = false;\n    #[cfg(feature = \"wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance\")]\n    let audit = receipt",
                 "terminal disarm before audit",
             ),
         ),
@@ -4462,6 +5158,7 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
         ("audit-uart-forward", lambda data: mutate_text(data, "slot", "        self.hasher.update(bytes);", "        crate::uart::early_write(core::str::from_utf8(bytes).unwrap());\n        self.hasher.update(bytes);", "audit UART forwarding")),
         ("audit-buffer-store", lambda data: mutate_text(data, "slot", "struct AuditRecord {\n    hasher: Sha256,", "struct AuditRecord {\n    leaked: alloc::vec::Vec<u8>,\n    hasher: Sha256,", "audit buffer storage")),
         ("audit-token-copy", lambda data: mutate_text(data, "slot", "struct AuditCommit", "#[derive(Clone, Copy)]\nstruct AuditCommit", "AuditCommit Copy")),
+        ("atomic-uart-factory-alias-replaced", lambda data: mutate_text(data, "slot", "type CollectorFactory = AtomicUartRecordFactory;", "type CollectorFactory = AuditRecordFactory;", "atomic UART factory alias")),
         ("audit-borrowed-token", lambda data: mutate_text(data, "slot", "fn collector_audit_meta(commit: AuditCommit)", "fn collector_audit_meta(commit: &AuditCommit)", "borrowed AuditCommit")),
         ("qemu-formal-prefix", lambda data: mutate_text(data, "slot", "next_sequence=0 state=collecting ready_epoch=1 decision_eligible=0 formal_uart=0", "next_sequence=0 state=collecting ready_epoch=1 VIBE_WASM_AOT_SAMPLE decision_eligible=0 formal_uart=0", "formal UART leak")),
         ("qemu-eligible", lambda data: mutate_text(data, "slot", "next_sequence=0 state=collecting ready_epoch=1 decision_eligible=0 formal_uart=0", "next_sequence=0 state=collecting ready_epoch=1 decision_eligible=1 formal_uart=0", "QEMU eligibility")),
@@ -4639,9 +5336,46 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
         ),
         ("base-inherits-qemu", lambda data: mutate_bytes(data, "kernel_manifest", f'{FEATURE} = [\n    "{TRUSTED_FEATURE}",\n]'.encode(), f'{FEATURE} = [\n    "{TRUSTED_QEMU_FEATURE}",\n]'.encode(), "physical QEMU inheritance")),
         ("qemu-inherits-trusted-transcript", lambda data: mutate_bytes(data, "kernel_manifest", f'{QEMU_FEATURE} = [\n    "{FEATURE}",\n    "{FINISH_QEMU_FEATURE}",\n    "dep:sha2",\n]'.encode(), f'{QEMU_FEATURE} = [\n    "{FEATURE}",\n    "{TRUSTED_QEMU_FEATURE}",\n    "dep:sha2",\n]'.encode(), "collector QEMU predecessor")),
+        ("formal-qemu-profile-selector-removed", lambda data: mutate_bytes(data, "kernel_manifest", f'    "vibeos-wasm-aot-profile/{QEMU_PROFILE_FEATURE}",\n'.encode(), b"", "formal QEMU profile selector")),
+        ("formal-qemu-firmware-inherits-diagnostic-finish", lambda data: mutate_bytes(data, "qemu_manifest", f'{QEMU_DECISION_FEATURE} = [\n    "vibeos-kernel/{QEMU_DECISION_FEATURE}",\n]'.encode(), f'{QEMU_DECISION_FEATURE} = [\n    "{FINISH_QEMU_FEATURE}",\n    "vibeos-kernel/{QEMU_DECISION_FEATURE}",\n]'.encode(), "formal QEMU firmware diagnostic finish predecessor")),
+        (
+            "smoke-qemu-kernel-formal-layer-removed",
+            lambda data: mutate_bytes(
+                data,
+                "kernel_manifest",
+                f'{QEMU_DECISION_SMOKE_FEATURE} = [\n    "{QEMU_DECISION_FEATURE}",\n    "vibeos-wasm-aot-profile/{QEMU_PROFILE_SMOKE_FEATURE}",\n]'.encode(),
+                f'{QEMU_DECISION_SMOKE_FEATURE} = [\n    "vibeos-wasm-aot-profile/{QEMU_PROFILE_SMOKE_FEATURE}",\n]'.encode(),
+                "kernel dirty-smoke formal layer",
+            ),
+        ),
+        (
+            "smoke-qemu-kernel-profile-selector-removed",
+            lambda data: mutate_bytes(
+                data,
+                "kernel_manifest",
+                f'    "vibeos-wasm-aot-profile/{QEMU_PROFILE_SMOKE_FEATURE}",\n'.encode(),
+                b"",
+                "kernel dirty-smoke profile selector",
+            ),
+        ),
+        (
+            "smoke-qemu-firmware-formal-layer-removed",
+            lambda data: mutate_bytes(
+                data,
+                "qemu_manifest",
+                f'{QEMU_DECISION_SMOKE_FEATURE} = [\n    "{QEMU_DECISION_FEATURE}",\n    "vibeos-kernel/{QEMU_DECISION_SMOKE_FEATURE}",\n]'.encode(),
+                f'{QEMU_DECISION_SMOKE_FEATURE} = [\n    "vibeos-kernel/{QEMU_DECISION_SMOKE_FEATURE}",\n]'.encode(),
+                "firmware dirty-smoke formal layer",
+            ),
+        ),
+        ("formal-qemu-default-on", lambda data: mutate_bytes(data, "qemu_manifest", b"default = []", f'default = ["{QEMU_DECISION_FEATURE}"]'.encode(), "formal QEMU default")),
+        ("smoke-qemu-default-on", lambda data: mutate_bytes(data, "qemu_manifest", b"default = []", f'default = ["{QEMU_DECISION_SMOKE_FEATURE}"]'.encode(), "dirty-smoke QEMU default")),
         ("milkv-audit-feature", lambda data: mutate_bytes(data, "milkv_manifest", f'    "vibeos-kernel/{FEATURE}",'.encode(), f'    "vibeos-kernel/{QEMU_FEATURE}",'.encode(), "Milk-V audit")),
-        ("collector-qemu-exemption-removed", lambda data: mutate_text(data, "kernel_root", f'    not(feature = "{TRUSTED_QEMU_FEATURE}"),\n    not(feature = "{QEMU_FEATURE}")', f'    not(feature = "{TRUSTED_QEMU_FEATURE}")', "trusted collector exemption")),
-        ("collector-qemu-exemption-widened", lambda data: mutate_text(data, "kernel_root", f'    not(feature = "{TRUSTED_QEMU_FEATURE}"),\n    not(feature = "{QEMU_FEATURE}")', f'    not(feature = "{TRUSTED_QEMU_FEATURE}"),\n    not(any(feature = "{QEMU_FEATURE}", feature = "wasm-c84-profile-slot-qemu-acceptance"))', "trusted collector exemption width")),
+        ("milkv-formal-qemu-feature", lambda data: mutate_bytes(data, "milkv_manifest", f'    "vibeos-kernel/{FEATURE}",'.encode(), f'    "vibeos-kernel/{QEMU_DECISION_FEATURE}",'.encode(), "Milk-V formal QEMU")),
+        ("milkv-smoke-qemu-feature", lambda data: mutate_bytes(data, "milkv_manifest", f'    "vibeos-kernel/{FEATURE}",'.encode(), f'    "vibeos-kernel/{QEMU_DECISION_SMOKE_FEATURE}",'.encode(), "Milk-V dirty-smoke QEMU")),
+        ("collector-qemu-exemption-removed", lambda data: mutate_text(data, "kernel_root", f'    not(feature = "{TRUSTED_QEMU_FEATURE}"),\n    not(feature = "{QEMU_FEATURE}"),\n    not(feature = "{QEMU_DECISION_FEATURE}")', f'    not(feature = "{TRUSTED_QEMU_FEATURE}"),\n    not(feature = "{QEMU_DECISION_FEATURE}")', "trusted collector exemption")),
+        ("collector-qemu-exemption-widened", lambda data: mutate_text(data, "kernel_root", f'    not(feature = "{TRUSTED_QEMU_FEATURE}"),\n    not(feature = "{QEMU_FEATURE}"),\n    not(feature = "{QEMU_DECISION_FEATURE}")', f'    not(feature = "{TRUSTED_QEMU_FEATURE}"),\n    not(any(feature = "{QEMU_FEATURE}", feature = "wasm-c84-profile-slot-qemu-acceptance")),\n    not(feature = "{QEMU_DECISION_FEATURE}")', "trusted collector exemption width")),
+        ("absorbing-isolation-loses-formal-qemu", lambda data: mutate_text(data, "kernel_root", f'        feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",\n        feature = "{QEMU_DECISION_FEATURE}"', '        feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance"', "absorbing/formal QEMU isolation")),
         (
             "firmware-qemu-inherits-trusted-transcript",
             lambda data: mutate_bytes(
@@ -4693,12 +5427,52 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             ),
         ),
         (
+            "formal-qemu-only-guard-removed",
+            lambda data: mutate_text(
+                data,
+                "kernel_root",
+                f'#[cfg(all(feature = "{QEMU_DECISION_FEATURE}", not(feature = "qemu-virt")))]',
+                f'#[cfg(all(feature = "{QEMU_DECISION_FEATURE}", feature = "qemu-virt"))]',
+                "formal QEMU-only guard",
+            ),
+        ),
+        (
+            "formal-qemu-milkv-guard-removed",
+            lambda data: mutate_text(
+                data,
+                "kernel_root",
+                f'#[cfg(all(feature = "{QEMU_DECISION_FEATURE}", feature = "milkv-duo"))]',
+                f'#[cfg(all(feature = "{QEMU_DECISION_FEATURE}", not(feature = "milkv-duo")))]',
+                "formal QEMU Milk-V exclusion",
+            ),
+        ),
+        (
+            "smoke-qemu-layer-guard-removed",
+            lambda data: mutate_text(
+                data,
+                "kernel_root",
+                f'    feature = "{QEMU_DECISION_SMOKE_FEATURE}",\n    not(feature = "{QEMU_DECISION_FEATURE}")',
+                f'    feature = "{QEMU_DECISION_SMOKE_FEATURE}",\n    not(feature = "qemu-virt")',
+                "dirty-smoke formal layer guard",
+            ),
+        ),
+        (
+            "formal-absorbing-mutual-removed",
+            lambda data: mutate_text(
+                data,
+                "kernel_root",
+                f'    feature = "{QEMU_DECISION_FEATURE}",\n    feature = "{QEMU_FEATURE}"',
+                f'    feature = "{QEMU_DECISION_FEATURE}",\n    feature = "{FEATURE}"',
+                "formal/absorbing mutual exclusion",
+            ),
+        ),
+        (
             "physical-qemu-guard-removed",
             lambda data: mutate_text(
                 data,
                 "kernel_root",
-                f'    feature = "{FEATURE}",\n    feature = "qemu-virt",\n    not(feature = "{QEMU_FEATURE}")',
-                f'    feature = "{FEATURE}",\n    feature = "qemu-virt",\n    not(feature = "qemu-virt")',
+                f'    feature = "{FEATURE}",\n    feature = "qemu-virt",\n    not(any(\n        feature = "{QEMU_FEATURE}",\n        feature = "{QEMU_DECISION_FEATURE}"\n    ))',
+                f'    feature = "{FEATURE}",\n    feature = "qemu-virt",\n    not(any(\n        feature = "qemu-virt",\n        feature = "{QEMU_DECISION_FEATURE}"\n    ))',
                 "physical QEMU guard",
             ),
         ),
@@ -4707,8 +5481,8 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             lambda data: mutate_text(
                 data,
                 "kernel_root",
-                f'    not(feature = "{QEMU_FEATURE}")\n))]\ncompile_error!(\n    "feature `{FEATURE}` cannot expose physical formal records on QEMU"',
-                f'    not(any(feature = "{QEMU_FEATURE}", feature = "{FINISH_QEMU_FEATURE}"))\n))]\ncompile_error!(\n    "feature `{FEATURE}` cannot expose physical formal records on QEMU"',
+                f'    not(any(\n        feature = "{QEMU_FEATURE}",\n        feature = "{QEMU_DECISION_FEATURE}"\n    ))\n))]\ncompile_error!(\n    "feature `{FEATURE}` cannot expose physical formal records on QEMU"',
+                f'    not(any(\n        feature = "{QEMU_FEATURE}",\n        feature = "{FINISH_QEMU_FEATURE}"\n    ))\n))]\ncompile_error!(\n    "feature `{FEATURE}` cannot expose physical formal records on QEMU"',
                 "physical QEMU exemption width",
             ),
         ),
@@ -4737,8 +5511,8 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             lambda data: mutate_text(
                 data,
                 "kernel_root",
-                f'    feature = "{FEATURE}",\n    feature = "{FINISH_QEMU_FEATURE}",\n    not(feature = "{QEMU_FEATURE}")',
-                f'    feature = "{FEATURE}",\n    feature = "{FINISH_QEMU_FEATURE}",\n    not(feature = "{FINISH_QEMU_FEATURE}")',
+                f'    feature = "{FEATURE}",\n    feature = "{FINISH_QEMU_FEATURE}",\n    not(any(\n        feature = "{QEMU_FEATURE}",\n        feature = "{QEMU_DECISION_FEATURE}"\n    ))',
+                f'    feature = "{FEATURE}",\n    feature = "{FINISH_QEMU_FEATURE}",\n    not(any(\n        feature = "{FINISH_QEMU_FEATURE}",\n        feature = "{QEMU_DECISION_FEATURE}"\n    ))',
                 "collector finish pairing guard",
             ),
         ),
@@ -5872,8 +6646,8 @@ echo "Milk-V Duo binary: $output_bin"''',
             lambda data: mutate_text(
                 data,
                 "testing",
-                "and no workload-specific AOT\ndecision.",
-                "and a complete workload-specific AOT\ndecision.",
+                "No workload-specific AOT decision\nis claimed yet.",
+                "A complete workload-specific AOT decision\nis claimed.",
                 "TESTING incomplete AOT decision status",
             ),
         ),
@@ -5882,9 +6656,9 @@ echo "Milk-V Duo binary: $output_bin"''',
             lambda data: mutate_text(
                 data,
                 "decision_doc",
-                "has host-only synthetic coverage, including an independent frozen-source\n"
-                "envelope and local Docker runtime custody.",
-                "has no synthetic coverage or frozen-source/runtime custody.",
+                "These self-tests use local synthetic repositories, records, streams, and\n"
+                "temporary files.",
+                "These self-tests use no synthetic repositories, records, streams, or files.",
                 "decision software-only synthetic boundary",
             ),
         ),
@@ -5913,8 +6687,10 @@ echo "Milk-V Duo binary: $output_bin"''',
             lambda data: mutate_text(
                 data,
                 "roadmap",
-                "frozen-source envelope, build/package envelopes, host-observed Docker runtime\nclosure",
-                "operator-source assertion, build/package envelopes, Docker runtime\nrecord",
+                "independent frozen-source and build/package envelopes, host-observed Docker\n"
+                "runtime closure",
+                "operator-source assertion and build/package envelopes, Docker runtime\n"
+                "record",
                 "roadmap frozen-source/runtime closure",
             ),
         ),

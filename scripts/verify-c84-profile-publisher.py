@@ -286,7 +286,15 @@ def verify_manifest(raw: bytes) -> None:
     require("dev-dependencies" not in manifest, "publisher crate gained a dev dependency")
     require("build-dependencies" not in manifest, "publisher crate gained a build dependency")
     require("target" not in manifest, "publisher crate gained a target-specific dependency")
-    require("features" not in manifest, "publisher crate gained a Cargo feature")
+    require(
+        manifest.get("features")
+        == {
+            "default": [],
+            "qemu-decision-v1": [],
+            "qemu-decision-v1-smoke": ["qemu-decision-v1"],
+        },
+        "publisher crate feature table is not the exact default-off formal/smoke QEMU selector",
+    )
 
 
 def verify_lib(source: str) -> None:
@@ -884,9 +892,35 @@ def run_selftest(inputs: Inputs) -> int:
         dependency + b'\nserde = "1"',
         "extra-dependency",
     )))
-    add(("cargo-feature-added", replace(
+    add(("cargo-default-feature-enabled", mutate_manifest(
         inputs,
-        cargo_manifest=inputs.cargo_manifest + b"\n[features]\ndefault = []\n",
+        b"default = []",
+        b'default = ["qemu-decision-v1"]',
+        "cargo-default-feature",
+    )))
+    add(("cargo-qemu-feature-enabled", mutate_manifest(
+        inputs,
+        b"qemu-decision-v1 = []",
+        b'qemu-decision-v1 = ["sha2/asm"]',
+        "cargo-qemu-feature",
+    )))
+    add(("cargo-smoke-feature-detached", mutate_manifest(
+        inputs,
+        b'qemu-decision-v1-smoke = ["qemu-decision-v1"]',
+        b"qemu-decision-v1-smoke = []",
+        "cargo-smoke-feature",
+    )))
+    add(("cargo-smoke-feature-widened", mutate_manifest(
+        inputs,
+        b'qemu-decision-v1-smoke = ["qemu-decision-v1"]',
+        b'qemu-decision-v1-smoke = ["qemu-decision-v1", "sha2/asm"]',
+        "cargo-smoke-feature-width",
+    )))
+    add(("cargo-feature-added", mutate_manifest(
+        inputs,
+        b"qemu-decision-v1 = []",
+        b"qemu-decision-v1 = []\nunreviewed = []",
+        "cargo-extra-feature",
     )))
     add(("authority-by-reference", mutate_text(inputs, "publisher", "verified: TargetVerified<'a>,", "verified: &TargetVerified<'a>,", "authority-by-reference")))
     add(("authority-summary", mutate_text(inputs, "publisher", "verified: TargetVerified<'a>,", "verified: Summary,", "authority-summary")))
@@ -929,8 +963,9 @@ def run_selftest(inputs: Inputs) -> int:
     add(("testing-command-drift", mutate_text(
         inputs,
         "testing",
-        "python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest\n" + COMMAND,
-        "python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest\n" + COMMAND.replace("--check-source", "--check-docs"),
+        "# Shared publisher plus retained Duo-v1 software custody gates\n" + COMMAND,
+        "# Shared publisher plus retained Duo-v1 software custody gates\n"
+        + COMMAND.replace("--check-source", "--check-docs"),
         "testing-command",
     )))
     add(("record-leading-noise", replace(inputs, golden=b"noise " + inputs.golden)))

@@ -5,14 +5,17 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import importlib.util
+import hashlib
 import math
+import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
+import types
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -39,14 +42,85 @@ FINISH_VERIFY = "finish-verify"
 VERIFIED_STREAM = "verified-stream"
 
 
-def load_peer():
-    spec = importlib.util.spec_from_file_location("vibeos_openssh_peer", OPENSSH_PEER)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("cannot load the maintained OpenSSH peer")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+def load_source_module(name: str, path: Path) -> types.ModuleType:
+    """Compile one stable UTF-8 source snapshot without consulting ``.pyc``."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+                raise RuntimeError(f"source helper is not one regular file: {path}")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 16 * 1024 * 1024:
+                    raise RuntimeError(f"source helper exceeds 16 MiB: {path}")
+                chunks.append(chunk)
+            closed = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        current = path.lstat()
+    except OSError as error:
+        raise RuntimeError(f"cannot read source helper {path}: {error}") from error
+
+    def identity(value: os.stat_result) -> tuple[int, ...]:
+        return (
+            value.st_dev,
+            value.st_ino,
+            value.st_mode,
+            value.st_nlink,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+
+    if identity(opened) != identity(closed) or identity(closed) != identity(current):
+        raise RuntimeError(f"source helper changed while reading: {path}")
+    raw = b"".join(chunks)
+    if len(raw) != opened.st_size:
+        raise RuntimeError(f"source helper byte length changed: {path}")
+    try:
+        source = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise RuntimeError(f"source helper is not strict UTF-8: {path}") from error
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    module.__package__ = name.rpartition(".")[0]
+    previous = sys.modules.get(name)
+    sys.modules[name] = module
+    try:
+        code = compile(source, str(path), "exec", dont_inherit=True, optimize=0)
+        exec(code, module.__dict__)
+    except BaseException:
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+        raise
+    executed_identity = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw)}
+    executed_closure: dict[str, dict[str, object]] = {str(path): executed_identity}
+    for value in tuple(module.__dict__.values()):
+        nested = getattr(value, "__vibeos_executed_source_closure__", None)
+        if not isinstance(nested, dict):
+            continue
+        for nested_path, nested_identity in nested.items():
+            prior = executed_closure.get(nested_path)
+            if prior is not None and prior != nested_identity:
+                raise RuntimeError(f"conflicting executed source identity: {nested_path}")
+            executed_closure[nested_path] = nested_identity
+    module.__vibeos_executed_source_identity__ = executed_identity
+    module.__vibeos_executed_source_closure__ = executed_closure
     return module
+
+
+def load_peer() -> types.ModuleType:
+    return load_source_module("vibeos_openssh_peer", OPENSSH_PEER)
 
 
 PEER = load_peer()

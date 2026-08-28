@@ -1,0 +1,1083 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vibeos.invalid/schemas/wasm-aot-decision-qemu-evidence-v1.json",
+  "title": "VibeOS C8.4 fixed-QEMU AOT-decision summary, environment, and decision evidence",
+  "oneOf": [
+    {"$ref": "#/$defs/summary"},
+    {"$ref": "#/$defs/environment"},
+    {"$ref": "#/$defs/decisionEnvelope"}
+  ],
+  "$defs": {
+    "hex40": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "hex64": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "positiveInteger": {"type": "integer", "minimum": 1},
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {"$ref": "#/$defs/hex64"},
+        "bytes": {"$ref": "#/$defs/positiveInteger"}
+      },
+      "required": ["sha256", "bytes"]
+    },
+    "pathIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/hex64"},
+        "bytes": {"$ref": "#/$defs/positiveInteger"}
+      },
+      "required": ["path", "sha256", "bytes"]
+    },
+    "distribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "min": {"type": "integer", "minimum": 0},
+        "p50": {"type": "integer", "minimum": 0},
+        "p95": {"type": "integer", "minimum": 0},
+        "max": {"type": "integer", "minimum": 0},
+        "mean": {"type": "integer", "minimum": 0}
+      },
+      "required": ["min", "p50", "p95", "max", "mean"]
+    },
+    "statistics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "total_ticks": {"$ref": "#/$defs/distribution"},
+        "interpretation_ticks": {"$ref": "#/$defs/distribution"},
+        "non_interpretation_ticks": {"$ref": "#/$defs/distribution"},
+        "nearest_rank_sorted_indices": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "population": {"const": 21},
+            "p50": {"const": 10},
+            "p95": {"const": 19}
+          },
+          "required": ["population", "p50", "p95"]
+        },
+        "stability": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "criterion": {"const": "p95(total_ticks) * 100 <= p50(total_ticks) * 110"},
+            "passed": {"const": true}
+          },
+          "required": ["criterion", "passed"]
+        }
+      },
+      "required": ["total_ticks", "interpretation_ticks", "non_interpretation_ticks", "nearest_rank_sorted_indices", "stability"]
+    },
+    "derivedDecision": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "budget_ticks": {"const": 1000000},
+        "budget_miss": {"type": "boolean"},
+        "interpretation_attribution": {"type": "boolean"},
+        "candidate_for_c85_design_review": {"type": "boolean"},
+        "outcome": {
+          "enum": [
+            "aot-eligible-for-c85-design-review-on-fixed-qemu",
+            "aot-not-justified-on-fixed-qemu"
+          ]
+        },
+        "aot_authorized": {"const": false},
+        "native_code_accepted": {"const": false}
+      },
+      "required": ["budget_ticks", "budget_miss", "interpretation_attribution", "candidate_for_c85_design_review", "outcome", "aot_authorized", "native_code_accepted"]
+    },
+    "retainedSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sample_index": {"type": "integer", "minimum": 3, "maximum": 23},
+        "total_ticks": {"$ref": "#/$defs/positiveInteger"},
+        "interpretation_ticks": {"type": "integer", "minimum": 0},
+        "non_interpretation_ticks": {"type": "integer", "minimum": 0}
+      },
+      "required": ["sample_index", "total_ticks", "interpretation_ticks", "non_interpretation_ticks"]
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {"const": "vibeos.c84.qemu-aot-decision.summary"},
+        "version": {"const": 1},
+        "suite_id": {"const": "vibeos.c84.qemu-aot-decision"},
+        "scope": {"const": "one-fresh-fixed-qemu-process-no-physical-claim"},
+        "platform": {"const": "qemu-virt-rv64-tcg-icount-v1"},
+        "platform_class": {"const": "emulator"},
+        "physical_provenance": {"const": "not-claimed"},
+        "capture_mode": {"enum": ["formal-publication", "dirty-smoke-not-publication"]},
+        "source_commit": {"$ref": "#/$defs/hex40"},
+        "challenge": {"$ref": "#/$defs/hex64"},
+        "run_id": {"$ref": "#/$defs/hex64"},
+        "manifest_sha256": {"$ref": "#/$defs/hex64"},
+        "transcript_schema_sha256": {"$ref": "#/$defs/hex64"},
+        "fresh_qemu_processes": {"const": 1},
+        "warmups": {"const": 3},
+        "retained": {"const": 21},
+        "timebase_hz": {"const": 10000000},
+        "raw_transcript_sha256": {"$ref": "#/$defs/hex64"},
+        "raw_transcript_bytes": {"$ref": "#/$defs/positiveInteger"},
+        "end_accumulator": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "retained_samples": {
+          "type": "array",
+          "minItems": 21,
+          "maxItems": 21,
+          "items": {"$ref": "#/$defs/retainedSample"}
+        },
+        "statistics": {"$ref": "#/$defs/statistics"},
+        "decision": {"$ref": "#/$defs/derivedDecision"}
+      },
+      "required": ["schema", "version", "suite_id", "scope", "platform", "platform_class", "physical_provenance", "capture_mode", "source_commit", "challenge", "run_id", "manifest_sha256", "transcript_schema_sha256", "fresh_qemu_processes", "warmups", "retained", "timebase_hz", "raw_transcript_sha256", "raw_transcript_bytes", "end_accumulator", "retained_samples", "statistics", "decision"]
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "head": {"$ref": "#/$defs/hex40"},
+        "commit_timestamp": {"type": "string", "pattern": "^[1-9][0-9]*$"},
+        "clean": {"type": "boolean"},
+        "branch": {"oneOf": [{"type": "string", "minLength": 1}, {"type": "null"}]},
+        "local_codex_wasm_head": {"oneOf": [{"$ref": "#/$defs/hex40"}, {"type": "null"}]},
+        "local_tracking_codex_wasm_head": {"oneOf": [{"$ref": "#/$defs/hex40"}, {"type": "null"}]},
+        "configured_fetch_url": {"const": "git@github.com:allegro0132/vibeos.git"},
+        "configured_push_url": {"const": "git@github.com:allegro0132/vibeos.git"},
+        "remote_query_url": {"const": "https://github.com/allegro0132/vibeos.git"},
+        "remote_ref": {"const": "refs/heads/codex/wasm"},
+        "advertised_remote_head": {"oneOf": [{"$ref": "#/$defs/hex40"}, {"type": "null"}]},
+        "status_command": {"type": "array", "items": {"type": "string"}},
+        "diff_command": {"type": "array", "items": {"type": "string"}},
+        "index_flags_command": {"type": "array", "items": {"type": "string"}},
+        "fsmonitor_flags_command": {"type": "array", "items": {"type": "string"}},
+        "remote_query_command": {"type": "array", "items": {"type": "string"}},
+        "status_porcelain_v1_z_sha256": {"$ref": "#/$defs/hex64"},
+        "tracked_diff_head_binary_sha256": {"$ref": "#/$defs/hex64"},
+        "index_flags_sha256": {"$ref": "#/$defs/hex64"},
+        "fsmonitor_flags_sha256": {"$ref": "#/$defs/hex64"},
+        "index_entries": {"$ref": "#/$defs/positiveInteger"},
+        "index_flags_all_h": {"type": "boolean"},
+        "fsmonitor_flags_all_h": {"type": "boolean"},
+        "remote_response_sha256": {"$ref": "#/$defs/hex64"},
+        "local_configs": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {"$ref": "#/$defs/localGitConfig"}
+        }
+      },
+      "required": ["head", "commit_timestamp", "clean", "branch", "local_codex_wasm_head", "local_tracking_codex_wasm_head", "configured_fetch_url", "configured_push_url", "remote_query_url", "remote_ref", "advertised_remote_head", "status_command", "diff_command", "index_flags_command", "fsmonitor_flags_command", "remote_query_command", "status_porcelain_v1_z_sha256", "tracked_diff_head_binary_sha256", "index_flags_sha256", "fsmonitor_flags_sha256", "index_entries", "index_flags_all_h", "fsmonitor_flags_all_h", "remote_response_sha256", "local_configs"]
+    },
+    "localGitConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": {"enum": [".", "vendor/jitterentropy-rs", "vendor/sunset"]},
+        "path": {"type": "string", "minLength": 1},
+        "policy": {"const": "raw-identity-safe-key-allowlist-v1"},
+        "sha256": {"$ref": "#/$defs/hex64"},
+        "bytes": {"$ref": "#/$defs/positiveInteger"},
+        "entries": {"$ref": "#/$defs/positiveInteger"},
+        "parsed_sha256": {"$ref": "#/$defs/hex64"}
+      },
+      "required": ["repository", "path", "policy", "sha256", "bytes", "entries", "parsed_sha256"]
+    },
+    "inventoryRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "commit": {"$ref": "#/$defs/hex40"},
+        "tree": {"$ref": "#/$defs/hex40"},
+        "inventory_sha256": {"$ref": "#/$defs/hex64"},
+        "entries": {"$ref": "#/$defs/positiveInteger"}
+      },
+      "required": ["commit", "tree", "inventory_sha256", "entries"]
+    },
+    "submoduleInventory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {"enum": ["vendor/jitterentropy-rs", "vendor/sunset"]},
+        "commit": {"$ref": "#/$defs/hex40"},
+        "tree": {"$ref": "#/$defs/hex40"},
+        "inventory_sha256": {"$ref": "#/$defs/hex64"},
+        "entries": {"$ref": "#/$defs/positiveInteger"}
+      },
+      "required": ["path", "commit", "tree", "inventory_sha256", "entries"]
+    },
+    "sourceMaterialization": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "method": {"enum": ["exact-commit-raw-blob-export-v1", "dirty-worktree-smoke-not-evidence"]},
+        "decision_eligible": {"type": "boolean"},
+        "superproject": {"$ref": "#/$defs/inventoryRecord"},
+        "submodules": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/submoduleInventory"}},
+        "ignored_worktree_inputs": {"enum": ["excluded-not-copied", "not-excluded-smoke-only"]},
+        "cargo_target": {"const": "fresh-private"},
+        "materialized_files": {"$ref": "#/$defs/positiveInteger"}
+      },
+      "required": ["method", "decision_eligible", "superproject", "submodules", "ignored_worktree_inputs", "cargo_target", "materialized_files"]
+    },
+    "custodyIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "mode": {"enum": ["0400", "0500"]},
+        "sha256": {"$ref": "#/$defs/hex64"},
+        "bytes": {"$ref": "#/$defs/positiveInteger"}
+      },
+      "required": ["name", "mode", "sha256", "bytes"]
+    },
+    "darwinRootVolume": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "filesystem": {"const": "apfs"},
+        "sealed": {"const": true},
+        "read_only": {"const": true}
+      },
+      "required": ["filesystem", "sealed", "read_only"]
+    },
+    "darwinHostBuild": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "product_name": {"const": "macOS"},
+        "product_version": {"const": "26.5.2"},
+        "build_version": {"const": "25F84"},
+        "darwin_release": {"const": "25.5.0"}
+      },
+      "required": ["product_name", "product_version", "build_version", "darwin_release"]
+    },
+    "darwinSystemOpenSsh": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "method": {"const": "darwin-sealed-system-volume-v1"},
+        "path": {"const": "/usr/bin/ssh"},
+        "mode": {"const": "0755"},
+        "uid": {"const": 0},
+        "gid": {"const": 0},
+        "nlink": {"const": 1},
+        "sf_restricted": {"const": true},
+        "same_device_as_root": {"const": true},
+        "root_volume": {"$ref": "#/$defs/darwinRootVolume"},
+        "version": {"const": "OpenSSH_10.2p1, LibreSSL 3.3.6"},
+        "sha256": {"const": "470f812f6e71ee4ca1b49c79f9c2982c054493e22502d4648bd010feb4b2a9b2"},
+        "bytes": {"const": 1555472}
+      },
+      "required": ["method", "path", "mode", "uid", "gid", "nlink", "sf_restricted", "same_device_as_root", "root_volume", "version", "sha256", "bytes"]
+    },
+    "executionCustody": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scheme": {"const": "private-qemu-bios-kernel-plus-darwin-system-openssh-v1"},
+        "private_directory_mode": {"const": "0500"},
+        "qemu": {"$ref": "#/$defs/custodyIdentity"},
+        "bios": {"$ref": "#/$defs/custodyIdentity"},
+        "kernel_elf": {"$ref": "#/$defs/custodyIdentity"},
+        "openssh": {"$ref": "#/$defs/darwinSystemOpenSsh"}
+      },
+      "required": ["scheme", "private_directory_mode", "qemu", "bios", "kernel_elf", "openssh"]
+    },
+    "helpers": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "qemu_c83_base_runner": {"$ref": "#/$defs/pathIdentity"},
+        "qemu_peer": {"$ref": "#/$defs/pathIdentity"},
+        "collector_peer": {"$ref": "#/$defs/pathIdentity"},
+        "trusted_sample_peer": {"$ref": "#/$defs/pathIdentity"},
+        "finish_verify_peer": {"$ref": "#/$defs/pathIdentity"},
+        "irq_overlay_peer": {"$ref": "#/$defs/pathIdentity"},
+        "phase_sidecar_peer": {"$ref": "#/$defs/pathIdentity"},
+        "core_peer": {"$ref": "#/$defs/pathIdentity"},
+        "openssh_peer_port_helper": {"$ref": "#/$defs/pathIdentity"},
+        "request_parent_verifier": {"$ref": "#/$defs/pathIdentity"},
+        "physical_contract_verifier": {"$ref": "#/$defs/pathIdentity"},
+        "openssh_test_key": {"$ref": "#/$defs/pathIdentity"}
+      },
+      "required": ["qemu_c83_base_runner", "qemu_peer", "collector_peer", "trusted_sample_peer", "finish_verify_peer", "irq_overlay_peer", "phase_sidecar_peer", "core_peer", "openssh_peer_port_helper", "request_parent_verifier", "physical_contract_verifier", "openssh_test_key"]
+    },
+    "hostKeyEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {"$ref": "#/$defs/hex64"},
+        "bytes": {"$ref": "#/$defs/positiveInteger"},
+        "public_key": {"const": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICnlgzqRWmQppOOnlIR1wzjvQ264K+ickvBZcEQD251V"},
+        "fingerprint_sha256": {"const": "SHA256:Tpigy/2zLGErAlymNq6E6LHkGOIA5S1+gJsEi5VteN8"}
+      },
+      "required": ["sha256", "bytes", "public_key", "fingerprint_sha256"]
+    },
+    "linkerIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "invocation_path": {"type": "string", "minLength": 1},
+        "resolved_path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/hex64"},
+        "bytes": {"$ref": "#/$defs/positiveInteger"}
+      },
+      "required": ["invocation_path", "resolved_path", "sha256", "bytes"]
+    },
+    "treeIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {"const": "strict-tree-content-mode-v1"},
+        "sha256": {"$ref": "#/$defs/hex64"},
+        "files": {"type": "integer", "minimum": 0},
+        "directories": {"$ref": "#/$defs/positiveInteger"},
+        "bytes": {"type": "integer", "minimum": 0}
+      },
+      "required": ["policy", "sha256", "files", "directories", "bytes"]
+    },
+    "privateCargoHome": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {"const": "exact-private-cargo-home-config-only-v1"},
+        "root_mode": {"const": "0700"},
+        "entries": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "path": {"const": "<private-cargo-home>/config.toml"},
+              "sha256": {"$ref": "#/$defs/hex64"},
+              "bytes": {"$ref": "#/$defs/positiveInteger"},
+              "mode": {"const": "0400"},
+              "links": {"const": 1}
+            },
+            "required": ["path", "sha256", "bytes", "mode", "links"]
+          }
+        }
+      },
+      "required": ["policy", "root_mode", "entries"]
+    },
+    "rootCargoConfigAbsence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cwd": {"const": "/"},
+        "candidates": {"const": ["/.cargo/config", "/.cargo/config.toml"]},
+        "all_absent": {"const": true}
+      },
+      "required": ["cwd", "candidates", "all_absent"]
+    },
+    "machoSymlink": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {"type": "string", "pattern": "^/"},
+        "target": {"type": "string", "minLength": 1}
+      },
+      "required": ["path", "target"]
+    },
+    "machoDependency": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "install_name": {"type": "string", "minLength": 1},
+            "class": {"const": "sealed-system"}
+          },
+          "required": ["install_name", "class"]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "install_name": {"type": "string", "minLength": 1},
+            "class": {"const": "pinned-homebrew"},
+            "resolved_path": {"type": "string", "pattern": "^/opt/homebrew/Cellar/"}
+          },
+          "required": ["install_name", "class", "resolved_path"]
+        }
+      ]
+    },
+    "machoNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {"type": "string", "pattern": "^/opt/homebrew/Cellar/"},
+        "sha256": {"$ref": "#/$defs/hex64"},
+        "bytes": {"$ref": "#/$defs/positiveInteger"},
+        "rpaths": {"type": "array", "items": {"type": "string"}},
+        "dependencies": {"type": "array", "items": {"$ref": "#/$defs/machoDependency"}}
+      },
+      "required": ["path", "sha256", "bytes", "rpaths", "dependencies"]
+    },
+    "otoolCustody": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {"const": "direct-command-line-tools-symlink-and-identity-v1"},
+        "invocation_path": {"const": "/Library/Developer/CommandLineTools/usr/bin/otool"},
+        "resolved_path": {"const": "/Library/Developer/CommandLineTools/usr/bin/llvm-otool"},
+        "symlinks": {"const": [{"path": "/Library/Developer/CommandLineTools/usr/bin/otool", "target": "llvm-otool"}]},
+        "sha256": {"const": "61ff2c63cf68eeeadf9c4700dadb8271740ff4960f98500f30db82b31521c0de"},
+        "bytes": {"const": 138208},
+        "package_id": {"const": "com.apple.pkg.CLTools_Executables"},
+        "package_version": {"const": "26.6.0.0.1781586589"}
+      },
+      "required": ["policy", "invocation_path", "resolved_path", "symlinks", "sha256", "bytes", "package_id", "package_version"]
+    },
+    "linkerRuntimeClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {"const": "darwin-recursive-nonsystem-macho-closure-v1"},
+        "otool": {"const": "/Library/Developer/CommandLineTools/usr/bin/otool"},
+        "otool_custody": {"$ref": "#/$defs/otoolCustody"},
+        "system_policy": {"const": "darwin-sealed-system-volume"},
+        "invocation_path": {"type": "string", "pattern": "^/"},
+        "resolved_path": {"type": "string", "pattern": "^/opt/homebrew/Cellar/"},
+        "symlinks": {"type": "array", "items": {"$ref": "#/$defs/machoSymlink"}},
+        "nodes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/machoNode"}},
+        "sha256": {"const": "9b5885317dd8ea18a789427356d4258352222f0c218422f5d224f387e9888cb8"}
+      },
+      "required": ["policy", "otool", "otool_custody", "system_policy", "invocation_path", "resolved_path", "symlinks", "nodes", "sha256"]
+    },
+    "qemuMachoNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {"type": "string", "pattern": "^/"},
+        "sha256": {"$ref": "#/$defs/hex64"},
+        "bytes": {"$ref": "#/$defs/positiveInteger"},
+        "rpaths": {"type": "array", "items": {"type": "string"}},
+        "dependencies": {"type": "array", "items": {"$ref": "#/$defs/machoDependency"}}
+      },
+      "required": ["path", "sha256", "bytes", "rpaths", "dependencies"]
+    },
+    "qemuRuntimeClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {"const": "darwin-qemu-recursive-nonsystem-macho-closure-v1"},
+        "otool": {"const": "/Library/Developer/CommandLineTools/usr/bin/otool"},
+        "otool_custody": {"$ref": "#/$defs/otoolCustody"},
+        "system_policy": {"const": "darwin-sealed-system-volume"},
+        "system_dependency_prefixes": {"const": ["/System/Library/", "/usr/lib/"]},
+        "system_volume": {"$ref": "#/$defs/darwinRootVolume"},
+        "system_build": {"$ref": "#/$defs/darwinHostBuild"},
+        "host_exclusivity_limit": {"const": "same-uid-host-exclusivity-required; pre/post/final identity checks cannot exclude a same-UID swap-and-restore during a live process"},
+        "invocation_path": {"type": "string", "pattern": "^/"},
+        "resolved_path": {"type": "string", "pattern": "^/"},
+        "symlinks": {"type": "array", "items": {"$ref": "#/$defs/machoSymlink"}},
+        "nodes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/qemuMachoNode"}},
+        "node_count": {"const": 29},
+        "load_edge_count": {"const": 147},
+        "pinned_homebrew_edge_count": {"const": 68},
+        "sealed_system_edge_count": {"const": 79},
+        "graph_sha256": {"const": "4b410b796467f972fdf4f55113dad8c6edbe964cb921ff1271faf2439a737855"},
+        "sha256": {"$ref": "#/$defs/hex64"}
+      },
+      "required": ["policy", "otool", "otool_custody", "system_policy", "system_dependency_prefixes", "system_volume", "system_build", "host_exclusivity_limit", "invocation_path", "resolved_path", "symlinks", "nodes", "node_count", "load_edge_count", "pinned_homebrew_edge_count", "sealed_system_edge_count", "graph_sha256", "sha256"]
+    },
+    "qemuRuntimePhaseSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "before": {"$ref": "#/$defs/qemuRuntimeClosure"},
+        "after": {"$ref": "#/$defs/qemuRuntimeClosure"},
+        "final": {"$ref": "#/$defs/qemuRuntimeClosure"}
+      },
+      "required": ["before", "after", "final"]
+    },
+    "qemuModuleSearch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {"const": "no-plugin-argv-and-absent-qemu-module-directories-v1"},
+        "qemu_prefix": {"const": "/opt/homebrew/Cellar/qemu/11.0.3"},
+        "environment_override": {"const": "QEMU_MODULE_DIR"},
+        "environment_override_absent": {"const": true},
+        "plugin_argv_absent": {"const": true},
+        "user_config_disabled": {"const": true},
+        "data_directory": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": {"type": "string", "pattern": "^/"},
+            "mode": {"const": "0500"},
+            "empty": {"const": true}
+          },
+          "required": ["path", "mode", "empty"]
+        },
+        "candidate_directories": {
+          "const": [
+            {"path": "/opt/homebrew/Cellar/qemu/11.0.3/lib/qemu", "absent": true},
+            {"path": "/opt/homebrew/lib/qemu", "absent": true},
+            {"path": "/opt/homebrew/Cellar/qemu/11.0.3/qemu-bundle", "absent": true},
+            {"path": "/opt/homebrew/Cellar/qemu/11.0.3/libexec/qemu", "absent": true}
+          ]
+        },
+        "scope_limit": {"const": "closes QEMU module/plugin search; generic library-internal dlopen is not claimed beyond the recursive Mach-O load-command graph"}
+      },
+      "required": ["policy", "qemu_prefix", "environment_override", "environment_override_absent", "plugin_argv_absent", "user_config_disabled", "data_directory", "candidate_directories", "scope_limit"]
+    },
+    "qemuRuntimeClosures": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {"const": "source-and-execution-custody-pre-post-final-v1"},
+        "host_exclusivity_limit": {"const": "same-uid-host-exclusivity-required; pre/post/final identity checks cannot exclude a same-UID swap-and-restore during a live process"},
+        "module_search": {"$ref": "#/$defs/qemuModuleSearch"},
+        "source": {"$ref": "#/$defs/qemuRuntimePhaseSet"},
+        "execution_custody": {"$ref": "#/$defs/qemuRuntimePhaseSet"}
+      },
+      "required": ["policy", "host_exclusivity_limit", "module_search", "source", "execution_custody"]
+    },
+    "buildInputClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {"const": "c84-private-build-input-closure-v1"},
+        "normalized_paths": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "policy": {"const": "canonical-realpath-no-leaf-symlink-v1"},
+            "source_root": {"type": "string", "pattern": "^/"},
+            "manifest": {"type": "string", "pattern": "^/"},
+            "cargo_home": {"type": "string", "pattern": "^/"},
+            "private_crate_sources": {"type": "string", "pattern": "^/"},
+            "private_crate_archives": {"type": "string", "pattern": "^/"},
+            "cargo_target": {"type": "string", "pattern": "^/"},
+            "toolchain_root": {"type": "string", "pattern": "^/"},
+            "rust_src": {"type": "string", "pattern": "^/"}
+          },
+          "required": ["policy", "source_root", "manifest", "cargo_home", "private_crate_sources", "private_crate_archives", "cargo_target", "toolchain_root", "rust_src"]
+        },
+        "cargo_locks": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "policy": {"const": "project-plus-pinned-rust-src-lock-union-v1"},
+            "project": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "path": {"const": "Cargo.lock"},
+                "sha256": {"const": "ca1ed8424b4e21ba8844a7f426077e811097760a2d59c21c5c711d4927c2ec9d"},
+                "bytes": {"const": 56970},
+                "registry_source": {"const": "registry+https://github.com/rust-lang/crates.io-index"},
+                "packages": {"const": 189},
+                "package_set_sha256": {"const": "a327b577ce3f0b4591afa2451f6ad0ea3c8900e3b64677fae98581dc4f2be190"}
+              },
+              "required": ["path", "sha256", "bytes", "registry_source", "packages", "package_set_sha256"]
+            },
+            "rust_src": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "path": {"const": "lib/rustlib/src/rust/library/Cargo.lock"},
+                "sha256": {"const": "0cd31e4d5c49d7cfbfc479e5cb63001a60c8fdca365677e8ee92137a2b5aaeeb"},
+                "bytes": {"const": 9835},
+                "registry_source": {"const": "registry+https://github.com/rust-lang/crates.io-index"},
+                "packages": {"const": 30},
+                "package_set_sha256": {"const": "c13441213110ae29eb2f814ca77627f2f3a43501b7e7d3d6e9337567a1572c8f"}
+              },
+              "required": ["path", "sha256", "bytes", "registry_source", "packages", "package_set_sha256"]
+            },
+            "union": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "packages": {"const": 213},
+                "exact_overlap": {"const": 6},
+                "project_only": {"const": 183},
+                "rust_src_only": {"const": 24},
+                "package_set_sha256": {"const": "395c4f3063d7d5c0db59ffa15cb1e58e48272837ac97386616a40e8bf3f9c5b2"}
+              },
+              "required": ["packages", "exact_overlap", "project_only", "rust_src_only", "package_set_sha256"]
+            }
+          },
+          "required": ["policy", "project", "rust_src", "union"]
+        },
+        "private_crate_sources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "method": {"const": "verified-project-lock-archives-plus-rust-src-vendor-union-v1"},
+            "archive_source": {"const": "fixed-launcher-cargo-home-registry-cache"},
+            "rust_src_vendor_source": {"const": "pinned-rust-src-library-vendor"},
+            "archive_count": {"const": 189},
+            "rust_src_vendor_count": {"const": 24},
+            "archive_bytes": {"const": 23706909},
+            "source_files": {"const": 11391},
+            "source_bytes": {"const": 137564030},
+            "mode_policy": {"const": "directories-0500-files-0400-preserve-owner-execute-0500-v1"},
+            "checksum_file_policy": {"const": "canonical-cargo-directory-source-json-v1"},
+            "rust_src_materialization_before": {"$ref": "#/$defs/treeIdentity"},
+            "rust_src_materialization_after": {"$ref": "#/$defs/treeIdentity"},
+            "before": {"$ref": "#/$defs/treeIdentity"},
+            "after": {"$ref": "#/$defs/treeIdentity"}
+          },
+          "required": ["method", "archive_source", "rust_src_vendor_source", "archive_count", "rust_src_vendor_count", "archive_bytes", "source_files", "source_bytes", "mode_policy", "checksum_file_policy", "rust_src_materialization_before", "rust_src_materialization_after", "before", "after"]
+        },
+        "private_crate_archives": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {"type": "string", "pattern": "^/"},
+            "before": {"$ref": "#/$defs/treeIdentity"},
+            "after": {"$ref": "#/$defs/treeIdentity"}
+          },
+          "required": ["root", "before", "after"]
+        },
+        "cargo_configuration": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "discovery_policy": {"const": "filesystem-root-plus-private-cargo-home-v1"},
+            "root_before": {"$ref": "#/$defs/rootCargoConfigAbsence"},
+            "root_after": {"$ref": "#/$defs/rootCargoConfigAbsence"},
+            "materialized_firmware": {"$ref": "#/$defs/pathIdentity"},
+            "generated": {"$ref": "#/$defs/pathIdentity"},
+            "private_home_before": {"$ref": "#/$defs/privateCargoHome"},
+            "private_home_after": {"$ref": "#/$defs/privateCargoHome"},
+            "cargo_subprocess_umask": {"const": "0077"},
+            "transient_outputs": {
+              "const": {
+                "policy": "fresh-pinned-cargo-runtime-outputs-validated-recorded-removed-v1",
+                "precondition": "private-home-config-only-before-cargo",
+                "entries": [
+                  {
+                    "path": "<private-cargo-home>/.global-cache",
+                    "kind": "sqlite3-global-cache",
+                    "mode": "0600",
+                    "links": 1,
+                    "sha256": "66d946720de0afd44c2d5748698b700ce812830bd8a3dedaa589831610948d9d",
+                    "bytes": 57344,
+                    "header": {
+                      "magic": "SQLite format 3 NUL",
+                      "page_size": 4096,
+                      "write_version": 1,
+                      "read_version": 1,
+                      "database_pages": 14,
+                      "schema_format": 4,
+                      "encoding": 1,
+                      "user_version": 7,
+                      "sqlite_version": 3053002
+                    }
+                  },
+                  {
+                    "path": "<private-cargo-home>/.package-cache",
+                    "kind": "empty-advisory-lock",
+                    "mode": "0600",
+                    "links": 1,
+                    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "bytes": 0
+                  },
+                  {
+                    "path": "<private-cargo-home>/.package-cache-mutate",
+                    "kind": "empty-advisory-lock",
+                    "mode": "0600",
+                    "links": 1,
+                    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                    "bytes": 0
+                  },
+                  {
+                    "path": "<private-cargo-home>/registry",
+                    "kind": "directory",
+                    "mode": "0700",
+                    "entries": [
+                      {
+                        "path": "<private-cargo-home>/registry/CACHEDIR.TAG",
+                        "kind": "cargo-cache-directory-tag",
+                        "mode": "0600",
+                        "links": 1,
+                        "sha256": "6d9d1d216e0f83abc5e5662ca62c92b4f23009466b54fa27321a69acdb778bb2",
+                        "bytes": 177
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          "required": ["discovery_policy", "root_before", "root_after", "materialized_firmware", "generated", "private_home_before", "private_home_after", "cargo_subprocess_umask", "transient_outputs"]
+        },
+        "toolchain_tree": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {"type": "string", "pattern": "^/"},
+            "before": {"$ref": "#/$defs/treeIdentity"},
+            "after": {"$ref": "#/$defs/treeIdentity"}
+          },
+          "required": ["root", "before", "after"]
+        },
+        "rust_src": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "root": {"type": "string", "pattern": "^/"},
+            "relative_path": {"const": "lib/rustlib/src/rust/library"},
+            "before": {"$ref": "#/$defs/treeIdentity"},
+            "after": {"$ref": "#/$defs/treeIdentity"},
+            "cargo_toml": {"$ref": "#/$defs/identity"},
+            "cargo_lock": {"$ref": "#/$defs/identity"}
+          },
+          "required": ["root", "relative_path", "before", "after", "cargo_toml", "cargo_lock"]
+        },
+        "linker_runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "before": {"$ref": "#/$defs/linkerRuntimeClosure"},
+            "after": {"$ref": "#/$defs/linkerRuntimeClosure"}
+          },
+          "required": ["before", "after"]
+        }
+      },
+      "required": ["policy", "normalized_paths", "cargo_locks", "private_crate_sources", "private_crate_archives", "cargo_configuration", "toolchain_tree", "rust_src", "linker_runtime"]
+    },
+    "buildEnvironment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ambient_variables": {"const": "denied-by-default"},
+        "cargo_home": {"const": "private-generated-config-directory-source-only"},
+        "cargo_net_offline": {"const": true},
+        "path_entries": {"type": "array", "items": {"type": "string"}},
+        "allowed_names": {"type": "array", "items": {"type": "string"}},
+        "normalized_values": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "__CARGO_TEST_LAST_USE_NOW": {"const": "1234567890"},
+            "CARGO_HOME": {"type": "string"},
+            "CARGO_TARGET_DIR": {"type": "string"},
+            "CARGO_INCREMENTAL": {"type": "string"},
+            "CARGO_NET_OFFLINE": {"type": "string"},
+            "CARGO_TERM_COLOR": {"type": "string"},
+            "HOME": {"type": "string"},
+            "LANG": {"type": "string"},
+            "LC_ALL": {"type": "string"},
+            "PATH": {"type": "string"},
+            "RUSTC": {"type": "string"},
+            "RUSTDOC": {"type": "string"},
+            "SOURCE_DATE_EPOCH": {"type": "string"},
+            "TMPDIR": {"type": "string"},
+            "TZ": {"type": "string"},
+            "VIBEOS_C84_CHALLENGE": {"$ref": "#/$defs/hex64"},
+            "VIBEOS_C84_SOURCE_COMMIT": {"$ref": "#/$defs/hex40"}
+          },
+          "required": ["__CARGO_TEST_LAST_USE_NOW", "CARGO_HOME", "CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "CARGO_NET_OFFLINE", "CARGO_TERM_COLOR", "HOME", "LANG", "LC_ALL", "PATH", "RUSTC", "RUSTDOC", "SOURCE_DATE_EPOCH", "TMPDIR", "TZ", "VIBEOS_C84_CHALLENGE", "VIBEOS_C84_SOURCE_COMMIT"]
+        }
+      },
+      "required": ["ambient_variables", "cargo_home", "cargo_net_offline", "path_entries", "allowed_names", "normalized_values"]
+    },
+    "qemuEnvironment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "policy": {"const": "deny-by-default-private-campaign-v1"},
+        "applies_to": {"const": ["firmware-search-probe", "version-probe", "live-campaign"]},
+        "private_directory_mode": {"const": "0700"},
+        "private_directories_must_remain_empty": {"const": true},
+        "allowed_names": {"const": ["HOME", "LANG", "LC_ALL", "PATH", "TMPDIR", "TZ", "XDG_CONFIG_HOME"]},
+        "normalized_values": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "HOME": {"const": "<campaign-root>/qemu-environment/home"},
+            "LANG": {"const": "C"},
+            "LC_ALL": {"const": "C"},
+            "PATH": {"const": "/usr/bin:/bin"},
+            "TMPDIR": {"const": "<campaign-root>/qemu-environment/tmp"},
+            "TZ": {"const": "UTC"},
+            "XDG_CONFIG_HOME": {"const": "<campaign-root>/qemu-environment/xdg-config"}
+          },
+          "required": ["HOME", "LANG", "LC_ALL", "PATH", "TMPDIR", "TZ", "XDG_CONFIG_HOME"]
+        },
+        "live_data_directory": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": {"const": "<campaign-root>/qemu-environment/data"},
+            "mode": {"const": "0500"},
+            "must_remain_empty": {"const": true}
+          },
+          "required": ["path", "mode", "must_remain_empty"]
+        }
+      },
+      "required": ["policy", "applies_to", "private_directory_mode", "private_directories_must_remain_empty", "allowed_names", "normalized_values", "live_data_directory"]
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "channel": {"type": "string", "minLength": 1},
+        "pinned_rustc_commit": {"$ref": "#/$defs/hex40"},
+        "rustc_vv": {"type": "string", "minLength": 1},
+        "cargo_version": {"type": "string", "minLength": 1},
+        "rustup": {"$ref": "#/$defs/pathIdentity"},
+        "cargo": {"$ref": "#/$defs/pathIdentity"},
+        "rustc": {"$ref": "#/$defs/pathIdentity"},
+        "rustdoc": {"$ref": "#/$defs/pathIdentity"},
+        "linker": {"$ref": "#/$defs/linkerIdentity"},
+        "cargo_command": {"type": "array", "items": {"type": "string"}},
+        "build_environment_policy": {"$ref": "#/$defs/buildEnvironment"},
+        "build_input_closure": {"$ref": "#/$defs/buildInputClosure"}
+      },
+      "required": ["channel", "pinned_rustc_commit", "rustc_vv", "cargo_version", "rustup", "cargo", "rustc", "rustdoc", "linker", "cargo_command", "build_environment_policy", "build_input_closure"]
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {"const": "vibeos.c84.qemu-aot-decision.environment"},
+        "version": {"const": 1},
+        "suite_id": {"const": "vibeos.c84.qemu-aot-decision"},
+        "mode": {"enum": ["formal-publication", "dirty-smoke-not-publication"]},
+        "platform": {"const": "qemu-virt-rv64-tcg-icount-v1"},
+        "platform_class": {"const": "emulator"},
+        "physical_provenance": {"const": "not-claimed"},
+        "source_commit": {"$ref": "#/$defs/hex40"},
+        "challenge": {"$ref": "#/$defs/hex64"},
+        "run_id": {"$ref": "#/$defs/hex64"},
+        "started_at_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z$"},
+        "ended_at_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z$"},
+        "repository": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "before": {"$ref": "#/$defs/repository"},
+            "after": {"$ref": "#/$defs/repository"}
+          },
+          "required": ["before", "after"]
+        },
+        "source_materialization": {"$ref": "#/$defs/sourceMaterialization"},
+        "contract": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fresh_qemu_processes": {"const": 1},
+            "warmups": {"const": 3},
+            "retained": {"const": 21},
+            "timebase_hz": {"const": 10000000},
+            "budget_ticks": {"const": 1000000}
+          },
+          "required": ["fresh_qemu_processes", "warmups", "retained", "timebase_hz", "budget_ticks"]
+        },
+        "runner": {"$ref": "#/$defs/pathIdentity"},
+        "verifier": {"$ref": "#/$defs/pathIdentity"},
+        "helpers": {"$ref": "#/$defs/helpers"},
+        "executed_peer_sources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "scripts/qemu-c83-runtime-costs.py": {"$ref": "#/$defs/identity"},
+            "scripts/c84-qemu-aot-decision-peer.py": {"$ref": "#/$defs/identity"},
+            "scripts/c84-ssh-managed-child-single-boot-collector-peer.py": {"$ref": "#/$defs/identity"},
+            "scripts/c84-ssh-managed-child-trusted-sample-peer.py": {"$ref": "#/$defs/identity"},
+            "scripts/c84-ssh-managed-child-finish-verify-peer.py": {"$ref": "#/$defs/identity"},
+            "scripts/c84-ssh-managed-child-irq-overlay-peer.py": {"$ref": "#/$defs/identity"},
+            "scripts/c84-ssh-managed-child-phase-sidecar-peer.py": {"$ref": "#/$defs/identity"},
+            "scripts/c84-ssh-managed-child-core-peer.py": {"$ref": "#/$defs/identity"},
+            "scripts/openssh-peer.py": {"$ref": "#/$defs/identity"},
+            "scripts/verify-c84-ssh-profile-request-parent.py": {"$ref": "#/$defs/identity"}
+          },
+          "required": ["scripts/qemu-c83-runtime-costs.py", "scripts/c84-qemu-aot-decision-peer.py", "scripts/c84-ssh-managed-child-single-boot-collector-peer.py", "scripts/c84-ssh-managed-child-trusted-sample-peer.py", "scripts/c84-ssh-managed-child-finish-verify-peer.py", "scripts/c84-ssh-managed-child-irq-overlay-peer.py", "scripts/c84-ssh-managed-child-phase-sidecar-peer.py", "scripts/c84-ssh-managed-child-core-peer.py", "scripts/openssh-peer.py", "scripts/verify-c84-ssh-profile-request-parent.py"]
+        },
+        "python_runtime": {"minProperties": 1},
+        "toolchain": {"$ref": "#/$defs/toolchain"},
+        "kernel_elf": {"$ref": "#/$defs/pathIdentity"},
+        "qemu": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "version": {"type": "string", "minLength": 1},
+            "cwd": {"const": "/"},
+            "actual_argv": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+            "normalized_argv": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+            "path": {"type": "string", "minLength": 1},
+            "sha256": {"$ref": "#/$defs/hex64"},
+            "bytes": {"$ref": "#/$defs/positiveInteger"},
+            "environment": {"$ref": "#/$defs/qemuEnvironment"},
+            "runtime_closures": {"$ref": "#/$defs/qemuRuntimeClosures"}
+          },
+          "required": ["path", "version", "cwd", "actual_argv", "normalized_argv", "sha256", "bytes", "environment", "runtime_closures"]
+        },
+        "bios": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {"const": "opensbi-riscv64-generic-fw_dynamic.bin"},
+            "path": {"type": "string", "minLength": 1},
+            "sha256": {"$ref": "#/$defs/hex64"},
+            "bytes": {"$ref": "#/$defs/positiveInteger"}
+          },
+          "required": ["path", "name", "sha256", "bytes"]
+        },
+        "openssh": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "version": {"const": "OpenSSH_10.2p1, LibreSSL 3.3.6"},
+            "path": {"const": "/usr/bin/ssh"},
+            "sha256": {"const": "470f812f6e71ee4ca1b49c79f9c2982c054493e22502d4648bd010feb4b2a9b2"},
+            "bytes": {"const": 1555472}
+          },
+          "required": ["path", "version", "sha256", "bytes"]
+        },
+        "execution_custody": {"$ref": "#/$defs/executionCustody"},
+        "host_key_evidence": {"$ref": "#/$defs/hostKeyEvidence"},
+        "transcript": {"$ref": "#/$defs/identity"},
+        "summary": {"$ref": "#/$defs/identity"}
+      },
+      "required": ["schema", "version", "suite_id", "mode", "platform", "platform_class", "physical_provenance", "source_commit", "challenge", "run_id", "started_at_utc", "ended_at_utc", "repository", "source_materialization", "contract", "runner", "verifier", "helpers", "executed_peer_sources", "python_runtime", "toolchain", "kernel_elf", "qemu", "bios", "openssh", "execution_custody", "host_key_evidence", "transcript", "summary"]
+    },
+    "contractIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "manifest": {"$ref": "#/$defs/pathIdentity"},
+        "transcript_schema": {"$ref": "#/$defs/pathIdentity"},
+        "evidence_schema": {"$ref": "#/$defs/pathIdentity"}
+      },
+      "required": ["manifest", "transcript_schema", "evidence_schema"]
+    },
+    "decisionEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {"const": "vibeos.c84.qemu-aot-decision.evidence"},
+        "version": {"const": 1},
+        "suite_id": {"const": "vibeos.c84.qemu-aot-decision"},
+        "mode": {"enum": ["formal-publication", "dirty-smoke-not-publication"]},
+        "scope": {"const": "one-fresh-fixed-qemu-process-no-physical-claim"},
+        "platform": {"const": "qemu-virt-rv64-tcg-icount-v1"},
+        "platform_class": {"const": "emulator"},
+        "physical_provenance": {"const": "not-claimed"},
+        "source_commit": {"$ref": "#/$defs/hex40"},
+        "challenge": {"$ref": "#/$defs/hex64"},
+        "run_id": {"$ref": "#/$defs/hex64"},
+        "contract": {"$ref": "#/$defs/contractIdentity"},
+        "evidence": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "transcript": {"$ref": "#/$defs/identity"},
+            "summary": {"$ref": "#/$defs/identity"},
+            "environment": {"$ref": "#/$defs/identity"}
+          },
+          "required": ["transcript", "summary", "environment"]
+        },
+        "environment_identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "source_materialization": {"$ref": "#/$defs/sourceMaterialization"},
+            "qemu": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "version": {"type": "string", "minLength": 1},
+                "cwd": {"const": "/"},
+                "sha256": {"$ref": "#/$defs/hex64"},
+                "bytes": {"$ref": "#/$defs/positiveInteger"},
+                "actual_argv": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+                "normalized_argv": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+                "runtime_closures": {"$ref": "#/$defs/qemuRuntimeClosures"}
+              },
+              "required": ["version", "cwd", "sha256", "bytes", "actual_argv", "normalized_argv", "runtime_closures"]
+            },
+            "bios": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {"const": "opensbi-riscv64-generic-fw_dynamic.bin"},
+                "sha256": {"$ref": "#/$defs/hex64"},
+                "bytes": {"$ref": "#/$defs/positiveInteger"}
+              },
+              "required": ["name", "sha256", "bytes"]
+            },
+            "openssh": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "version": {"const": "OpenSSH_10.2p1, LibreSSL 3.3.6"},
+                "sha256": {"const": "470f812f6e71ee4ca1b49c79f9c2982c054493e22502d4648bd010feb4b2a9b2"},
+                "bytes": {"const": 1555472}
+              },
+              "required": ["version", "sha256", "bytes"]
+            },
+            "kernel_elf": {"$ref": "#/$defs/identity"},
+            "toolchain": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "channel": {"type": "string", "minLength": 1},
+                "pinned_rustc_commit": {"$ref": "#/$defs/hex40"},
+                "rustc_sha256": {"$ref": "#/$defs/hex64"},
+                "linker_sha256": {"$ref": "#/$defs/hex64"},
+                "build_input_closure": {"$ref": "#/$defs/buildInputClosure"}
+              },
+              "required": ["channel", "pinned_rustc_commit", "rustc_sha256", "linker_sha256", "build_input_closure"]
+            },
+            "helpers": {"$ref": "#/$defs/helpers"},
+            "executed_peer_sources": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "scripts/qemu-c83-runtime-costs.py": {"$ref": "#/$defs/identity"},
+                "scripts/c84-qemu-aot-decision-peer.py": {"$ref": "#/$defs/identity"},
+                "scripts/c84-ssh-managed-child-single-boot-collector-peer.py": {"$ref": "#/$defs/identity"},
+                "scripts/c84-ssh-managed-child-trusted-sample-peer.py": {"$ref": "#/$defs/identity"},
+                "scripts/c84-ssh-managed-child-finish-verify-peer.py": {"$ref": "#/$defs/identity"},
+                "scripts/c84-ssh-managed-child-irq-overlay-peer.py": {"$ref": "#/$defs/identity"},
+                "scripts/c84-ssh-managed-child-phase-sidecar-peer.py": {"$ref": "#/$defs/identity"},
+                "scripts/c84-ssh-managed-child-core-peer.py": {"$ref": "#/$defs/identity"},
+                "scripts/openssh-peer.py": {"$ref": "#/$defs/identity"},
+                "scripts/verify-c84-ssh-profile-request-parent.py": {"$ref": "#/$defs/identity"}
+              },
+              "required": ["scripts/qemu-c83-runtime-costs.py", "scripts/c84-qemu-aot-decision-peer.py", "scripts/c84-ssh-managed-child-single-boot-collector-peer.py", "scripts/c84-ssh-managed-child-trusted-sample-peer.py", "scripts/c84-ssh-managed-child-finish-verify-peer.py", "scripts/c84-ssh-managed-child-irq-overlay-peer.py", "scripts/c84-ssh-managed-child-phase-sidecar-peer.py", "scripts/c84-ssh-managed-child-core-peer.py", "scripts/openssh-peer.py", "scripts/verify-c84-ssh-profile-request-parent.py"]
+            },
+            "python_runtime": {"minProperties": 1},
+            "host_key_evidence": {"$ref": "#/$defs/hostKeyEvidence"},
+            "execution_custody": {"$ref": "#/$defs/executionCustody"}
+          },
+          "required": ["source_materialization", "qemu", "bios", "openssh", "kernel_elf", "toolchain", "helpers", "executed_peer_sources", "python_runtime", "host_key_evidence", "execution_custody"]
+        },
+        "population": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fresh_qemu_processes": {"const": 1},
+            "warmups": {"const": 3},
+            "retained": {"const": 21},
+            "p50_sorted_index": {"const": 10},
+            "p95_sorted_index": {"const": 19},
+            "physical_inputs": {"const": 0},
+            "audit_inputs": {"const": 0}
+          },
+          "required": ["fresh_qemu_processes", "warmups", "retained", "p50_sorted_index", "p95_sorted_index", "physical_inputs", "audit_inputs"]
+        },
+        "statistics": {"$ref": "#/$defs/statistics"},
+        "decision": {"$ref": "#/$defs/derivedDecision"},
+        "next_node": {"enum": ["C8.5-design-review-only", "C8.8-skip-or-defer-C8.5-C8.7", "none-smoke-only"]},
+        "limitations": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "string"}}
+      },
+      "required": ["schema", "version", "suite_id", "mode", "scope", "platform", "platform_class", "physical_provenance", "source_commit", "challenge", "run_id", "contract", "evidence", "environment_identity", "population", "statistics", "decision", "next_node", "limitations"]
+    }
+  }
+}

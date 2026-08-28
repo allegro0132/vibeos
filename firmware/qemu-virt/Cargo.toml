@@ -105,6 +105,19 @@ wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance = [
     "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
     "vibeos-kernel/wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
 ]
+# Formal one-process C8.4 decision image for the frozen TCG/icount envelope.
+# The kernel feature selects the narrow real-OpenSSH fixture, the production
+# workload path, a disjoint record contract, and the atomic UART sink without
+# inheriting any diagnostic C8.4 QEMU-acceptance telemetry.
+wasm-c84-qemu-aot-decision = [
+    "vibeos-kernel/wasm-c84-qemu-aot-decision",
+]
+# Compile-time non-publication marker; the kernel feature includes the full
+# formal image and makes its smoke-only wire identity explicit.
+wasm-c84-qemu-aot-decision-smoke = [
+    "wasm-c84-qemu-aot-decision",
+    "vibeos-kernel/wasm-c84-qemu-aot-decision-smoke",
+]
 # Successor-only gate which consumes the verified summary and every interval,
 # then explicitly completes the stream without publishing it.
 wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance = [

@@ -157,9 +157,48 @@ cargo test --locked --offline -p vibeos-component-format \
   --test graph_version \
   validation_only_artifact_profiles_do_not_enter_the_durable_graph_codec \
   -- --exact
+# C8.8-F5 shared host and fixed-QEMU qualification gates
+cargo check --locked --offline -p vibeos-wasm-float-target \
+  --no-default-features
+cargo test --locked --offline -p vibeos-wasm-float-target \
+  --features c88-f5-acceptance
+python3 -B scripts/qemu-c88-f5-float-target.py --selftest
+python3 -O -B scripts/qemu-c88-f5-float-target.py --selftest
+python3 -B scripts/verify-c88-f5-float-target.py --selftest
+python3 -O -B scripts/verify-c88-f5-float-target.py --selftest
+python3 -B scripts/verify-c88-f5-riscv-elf.py --self-test
+python3 -O -B scripts/verify-c88-f5-riscv-elf.py --self-test
+# Development boot only; cannot export or count as formal evidence.
+python3 -B scripts/qemu-c88-f5-float-target.py \
+  --allow-dirty-smoke --timeout-seconds 300
+# Formal mode requires clean codex/wasm, HEAD == origin/codex/wasm, and four
+# absent output paths outside the worktree.
+f5_evidence_dir="$(mktemp -d /private/tmp/vibeos-c88-f5-formal.XXXXXX)"
+python3 -B scripts/qemu-c88-f5-float-target.py \
+  --timeout-seconds 300 \
+  --kernel-out "$f5_evidence_dir/kernel.elf" \
+  --elf-audit-out "$f5_evidence_dir/elf-audit.json" \
+  --uart-out "$f5_evidence_dir/qemu-uart.log" \
+  --environment-out "$f5_evidence_dir/environment.json"
+python3 -B scripts/verify-c88-f5-float-target.py \
+  --kernel "$f5_evidence_dir/kernel.elf" \
+  --elf-audit "$f5_evidence_dir/elf-audit.json" \
+  --uart "$f5_evidence_dir/qemu-uart.log" \
+  --environment "$f5_evidence_dir/environment.json"
+python3 -O -B scripts/verify-c88-f5-float-target.py \
+  --kernel "$f5_evidence_dir/kernel.elf" \
+  --elf-audit "$f5_evidence_dir/elf-audit.json" \
+  --uart "$f5_evidence_dir/qemu-uart.log" \
+  --environment "$f5_evidence_dir/environment.json"
+python3 -O -B scripts/verify-c88-f5-riscv-elf.py \
+  --elf "$f5_evidence_dir/kernel.elf" \
+  --output "$f5_evidence_dir/elf-audit-replay-o.json"
+cmp "$f5_evidence_dir/elf-audit.json" \
+  "$f5_evidence_dir/elf-audit-replay-o.json"
 cargo fmt -p vibeos-component-format -- --check
 cargo fmt -p vibeos-wasm-runtime -- --check
 cargo fmt -p vibeos-wasm-float-candidate -- --check
+cargo fmt -p vibeos-wasm-float-target -- --check
 cargo fmt -p vibeos-component-runtime -- --check
 cargo fmt -p vibeos-component-admission -- --check
 cargo fmt -p vibeos-component-image-adapter -- --check
@@ -688,11 +727,28 @@ loop through bounded pending quanta to deterministic reclamation and cold
 recovery. The loader and graph-codec tests independently keep code 5 out of
 production durable loading and CGV1.
 
-F1 through F4 are complete, and C8.8-F5 is next. All F4 evidence above is host
-evidence; no fixed-QEMU F5 exact-bit/fuel run or physical evidence is claimed,
-so Float and C8.8 remain incomplete. The full contract is in
-[docs/WASM_FLOAT_PROFILE.md](docs/WASM_FLOAT_PROFILE.md). Milk-V Duo physical
-testing remains paused.
+F1 through F4 are complete. F4 evidence above remains host evidence; F5 owns the
+separate target claim. The F5 host/fixed-QEMU sub-gate now passes from clean,
+already-pushed commit `feddae65ee499a0b4b5d9b603c9bac0e4374e800`. The formal
+run accepted 1,176 records with semantic SHA-256
+`51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`
+and run ID
+`91b662adb335d286759ca7131b28b351710c3c598efc45aeef01610038468db8`.
+The audited kernel/UART/ELF-report/environment SHA-256 values are respectively
+`095e01ea516766a3d7684aaa46a511c3096c1c8bb4d18a205eb8f5234e3c0f52`,
+`0c75cba0182fe07208b66460b1c9e4bec4724809b96bea9f19318cafb1d17f4e`,
+`e12ae44227968752c1adc5627a5c226e2b8867e0f93a8ecb12fa755cdfacffc6`,
+and `554f3d6ad540ec1249246ed1809c14562773bac87475f2979b1ba5990ae86e5e`.
+Normal and optimized independent replays pass, including a byte-identical
+standalone ELF audit.
+
+The final ELF audit covers trusted native control flow at canonical decoder
+boundaries and finds zero RISC-V F/D opcodes, undefined symbols, or forbidden
+Float helpers. It does not claim arbitrary-PC redirection or hardware NX. The
+platform is an emulator and records `physical_provenance=not-claimed`.
+Milk-V Duo physical qualification remains paused, so F5, Float, and C8.8 are
+not fully closed and no executable successor is authorized. The full contract
+is in [docs/WASM_FLOAT_PROFILE.md](docs/WASM_FLOAT_PROFILE.md).
 
 See [docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md) for the deferred
 Duo-v1 physical formal build, package, image-verification, capture, and

@@ -58,6 +58,7 @@ fn identity(trap: TrapCode) -> (u16, &'static str) {
         TrapCode::TableOutOfBounds => (0x0204, "table-out-of-bounds"),
         TrapCode::IndirectCallTypeMismatch => (0x0205, "indirect-call-type-mismatch"),
         TrapCode::CallDepthExceeded => (0x0206, "call-depth-exceeded"),
+        TrapCode::InvalidConversionToInteger => (0x0207, "invalid-conversion-to-integer"),
         TrapCode::FuelExhausted => (0x0300, "fuel-exhausted"),
         TrapCode::Cancelled => (0x0301, "cancelled"),
         TrapCode::CanonicalAbi => (0x0400, "canonical-abi"),
@@ -77,6 +78,7 @@ fn is_core_facing(trap: TrapCode) -> bool {
         | TrapCode::TableOutOfBounds
         | TrapCode::IndirectCallTypeMismatch
         | TrapCode::CallDepthExceeded
+        | TrapCode::InvalidConversionToInteger
         | TrapCode::FuelExhausted
         | TrapCode::Cancelled => true,
         TrapCode::CanonicalAbi | TrapCode::ResourceMisuse => false,
@@ -118,6 +120,7 @@ fn core_trap_code_and_name_identity_is_frozen() {
         TrapCode::TableOutOfBounds,
         TrapCode::IndirectCallTypeMismatch,
         TrapCode::CallDepthExceeded,
+        TrapCode::InvalidConversionToInteger,
         TrapCode::FuelExhausted,
         TrapCode::Cancelled,
     ];

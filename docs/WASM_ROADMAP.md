@@ -6,7 +6,7 @@ VibeOS. It complements [BLUEPRINT.md](BLUEPRINT.md),
 [CAPABILITY_SHELL.md](CAPABILITY_SHELL.md), and
 [PROGRAM_PERSISTENCE.md](PROGRAM_PERSISTENCE.md).
 
-**Status (2026-08-28): implementation in progress.** The repository now contains
+**Status (2026-08-29): implementation in progress.** The repository now contains
 bounded Core validation/execution, Component decoding and Canonical ABI,
 admission/loading, compatibility, and C8 profiling evidence. The dependency
 sequence and acceptance text below remain the roadmap rather than a claim that
@@ -17,14 +17,15 @@ and remain globally deferred; C8.8 onward remains active. The decision contract
 and explicit gaps are tracked in
 [WASM_AOT_DECISION.md](WASM_AOT_DECISION.md) and [TESTING.md](../TESTING.md).
 
-**C8.8 status (2026-08-29):** F1, the first of five ordered Float
-increments, is complete only for an immutable validation-only profile identity
-and deterministic software-float semantic contract. Artifact profile code 5 is
-permanently inert: it has no current validation-engine/runtime, admission,
-execution, or durable-graph activation path and can never be promoted in place. F1 does
-not enable Float and does not complete either the Float workstream or C8.8.
-C8.8-F2 is next. F2 through F5 remain incomplete, and Milk-V Duo physical
-testing remains paused.
+**C8.8 status (2026-08-29):** F1 and F2 are complete. F1 freezes the immutable
+validation-only identity and deterministic scalar-float contract; F2 closes
+the independently identified, acceptance-only Core validator/software-float
+executor, differential, fuzz, trap, limit, fuel, supply-chain, and RISC-V
+object gates. Artifact profile code 5 remains permanently inert: it has no
+current validation-engine/runtime, admission, execution, or durable-graph
+activation path and can never be promoted in place. C8.8-F3 is next. F3
+through F5, Float, and C8.8 remain incomplete, and Milk-V Duo physical testing
+remains paused.
 
 ---
 
@@ -216,11 +217,12 @@ Features are enabled one at a time only with component validation, Core
 execution, Canonical ABI, differential, fuel, target, quota, revocation, and
 fault-containment evidence. Profile widening is an explicit ABI revision.
 
-C8.8-F1 selects only the deterministic-software-float branch for future work
-and freezes its exact semantics. It does not close C0.6's enablement gate:
-Profile 1 stays integer-only, while the reviewed backend and provenance,
-runtime conversion trap, Canonical ABI implementation, differential and fuel
-proof, and target evidence remain outstanding.
+C8.8-F1 selects the deterministic-software-float branch and freezes its exact
+semantics. F2 closes the acceptance-only Core backend, provenance, conversion
+trap, host differential/fuzz, fuel, and RISC-V object gates. Neither increment
+closes C0.6's enablement gate: Profile 1 stays integer-only, while Canonical ABI
+support, default-off admission and lifecycle, fixed-QEMU exact-bit/fuel proof,
+and the paused physical-target qualification remain outstanding in F3–F5.
 
 ## 5. WIT and CSpace mapping
 
@@ -843,12 +845,21 @@ of one increment does not activate code from the next:
 | C8.8-F4 | Close default-off admission and lifecycle | Candidate-only loader/image policy, quota, revoke/cancel, fault reclamation, and durable-rejection tests pass; production code 5 remains inert |
 | C8.8-F5 | Qualify targets and review activation | Host and fixed-QEMU exact-bit/fuel evidence pass; physical-Duo qualification follows when resumed; only then may a separately numbered executable successor be reviewed |
 
-The complete F1 contract and the F2 dependency/trap gates are specified in
-[WASM_FLOAT_PROFILE.md](WASM_FLOAT_PROFILE.md). A workspace-wide
-`[patch.crates-io]` must not replace Profile 1's frozen crates.io Wasmi 1.1.0;
-F2 uses a disjoint candidate dependency identity. Before candidate Float
-execution, the currently unreachable `BadConversionToInteger` mapping must be
-replaced by a stable, ABI-versioned guest execution trap.
+The complete F1/F2 contract and evidence are specified in
+[WASM_FLOAT_PROFILE.md](WASM_FLOAT_PROFILE.md). F2 uses the renamed, vendored
+`vibeos-wasmi-*-softfloat` package family only behind the
+`c88-f2-acceptance` feature. `rustc_apfloat` implements deterministic
+arithmetic and conversions; a fixed 24/53-round pure-integer algorithm
+implements square root. Strict NaN canonicalization and bit-preserving
+transport, every scalar runtime and translator-fold path, fused branches,
+stable conversion traps, Profile-1 limits, import denial, deterministic
+fuel/quantum traces, fixed-seed differential and end-to-end fuzz corpora,
+hostile byte mutations, and offline supply-chain checks pass. A pinned RISC-V
+release-object audit finds no semantic FP instruction, compiler FP helper, or
+target F/D opcode; remaining sign-only LLVM forms lower to integer bit
+operations. Stock Profile 1 and permanent code-5 inertness remain unchanged.
+This is not WIT/Canonical ABI, QEMU-execution, activation, or physical-Duo
+evidence.
 
 As of 2026-08-28, C1 through C8.3 are accepted complete by historical-evidence
 policy. The completed C8.4 decision-bearing chain is the fixed-QEMU contract
@@ -920,8 +931,8 @@ attributable to interpretation and the outcome is
 is accepted. C8.5 through C8.7 are skipped for this workload and remain
 globally deferred; they are not marked complete.
 The current implementation node is C8.8.
-C8.8-F1 is complete only as contract metadata; the current increment is
-C8.8-F2. Float and C8.8 remain incomplete.
+C8.8-F1 and C8.8-F2 are complete; the current increment is C8.8-F3. Float and
+C8.8 remain incomplete.
 
 ## 10. Test and evidence matrix
 
@@ -958,7 +969,8 @@ Security-sensitive mutations must prove that the gates are live:
   CGV1, durable publication, or guest invocation;
 - replace Profile 1's Wasmi dependency with a workspace-wide Cargo patch;
 - expose `BadConversionToInteger` to a Float guest while still reporting the
-  static `Validation` trap;
+  static `Validation` trap, conflate NaN conversion (`0x0207`) with finite or
+  infinite overflow (`0x0202`), or widen the saturating-conversion proposal;
 - alter one durable root, graph edge, or crash-order record;
 - expose one ambient clock, random source, path, or endpoint.
 

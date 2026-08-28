@@ -16,8 +16,9 @@ use core::{
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 use vibeos_component_format::{
-    current_validation_engine_identity, LimitKind, ProfileIdentity, ProfileLimits, TrapCode,
-    ValidationEngineIdentity, WasmParserFeatureSelection, WasmiCompilationMode,
+    current_validation_engine_identity, profile_2_sync_float_validation_contract,
+    CoreNumericProfile, CoreValidatorConfiguration, LimitKind, ProfileIdentity, ProfileLimits,
+    TrapCode, ValidationEngineIdentity, WasmParserFeatureSelection, WasmiCompilationMode,
     WasmiEnforcedLimits, WasmiFuelCosts, PROFILE_1_LIMITS,
 };
 use wasmi::{
@@ -229,14 +230,45 @@ fn read_u32_leb(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<u32, Adm
     Err(AdmissionError::validation(AdmissionDetail::Malformed))
 }
 
-/// Predecodes the deliberately tiny Profile-1 type grammar. This is separate
-/// from `TypeSectionReader`: parsing an explicit GC rec-group would allocate
-/// its declared inner vector before the disabled-feature validator rejects it.
+const fn allows_scalar_float(validator: CoreValidatorConfiguration) -> bool {
+    matches!(
+        validator.numeric_profile(),
+        CoreNumericProfile::Profile2ScalarF32F64
+    )
+}
+
+fn supports_encoded_value_type(byte: u8, validator: CoreValidatorConfiguration) -> bool {
+    match byte {
+        0x7f | 0x7e => true,
+        0x7d | 0x7c => allows_scalar_float(validator),
+        _ => false,
+    }
+}
+
+fn core_parser_features(
+    selection: WasmParserFeatureSelection,
+    validator: CoreValidatorConfiguration,
+) -> WasmFeatures {
+    let mut features = parser_features(selection);
+    if allows_scalar_float(validator) {
+        // wasmparser models scalar floats as a pseudo-feature so its empty
+        // proposal set can represent an integer-only MVP subset. The sealed
+        // Profile-2 numeric contract is the authority for enabling that bit.
+        features.set(WasmFeatures::FLOATS, true);
+    }
+    features
+}
+
+/// Predecodes the deliberately tiny profile-selected numeric type grammar.
+/// This is separate from `TypeSectionReader`: parsing an explicit GC rec-group
+/// would allocate its declared inner vector before the disabled-feature
+/// validator rejects it.
 fn inspect_function_types(
     bytes: &[u8],
     range: core::ops::Range<usize>,
     count: u32,
     limits: &ProfileLimits,
+    validator: CoreValidatorConfiguration,
     summary: &mut CoreSummary,
 ) -> Result<(), AdmissionError> {
     let mut cursor = range.start;
@@ -267,13 +299,15 @@ fn inspect_function_types(
                 summary.max_results = summary.max_results.max(arity);
             }
             for _ in 0..arity {
-                match bytes.get(cursor).filter(|_| cursor < range.end) {
-                    Some(0x7f | 0x7e) => cursor += 1,
-                    Some(_) => return Err(AdmissionError::unsupported()),
-                    None => {
-                        return Err(AdmissionError::validation(AdmissionDetail::Malformed));
-                    }
+                let value_type = bytes
+                    .get(cursor)
+                    .filter(|_| cursor < range.end)
+                    .copied()
+                    .ok_or_else(|| AdmissionError::validation(AdmissionDetail::Malformed))?;
+                if !supports_encoded_value_type(value_type, validator) {
+                    return Err(AdmissionError::unsupported());
                 }
+                cursor += 1;
             }
         }
     }
@@ -332,6 +366,20 @@ fn next_byte(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<u8, Admissi
     Ok(byte)
 }
 
+fn skip_fixed_width(
+    bytes: &[u8],
+    cursor: &mut usize,
+    end: usize,
+    width: usize,
+) -> Result<(), AdmissionError> {
+    let next = cursor
+        .checked_add(width)
+        .filter(|next| *next <= end && *next <= bytes.len())
+        .ok_or_else(|| AdmissionError::validation(AdmissionDetail::Malformed))?;
+    *cursor = next;
+    Ok(())
+}
+
 fn inspect_i32_const_expr(
     bytes: &[u8],
     cursor: &mut usize,
@@ -351,14 +399,17 @@ fn inspect_i32_const_expr(
     }
 }
 
-fn inspect_integer_const_expr(
+fn inspect_numeric_const_expr(
     bytes: &[u8],
     cursor: &mut usize,
     end: usize,
+    validator: CoreValidatorConfiguration,
 ) -> Result<(), AdmissionError> {
     match next_byte(bytes, cursor, end)? {
         0x41 => skip_i32_leb(bytes, cursor, end)?,
         0x42 => skip_i64_leb(bytes, cursor, end)?,
+        0x43 if allows_scalar_float(validator) => skip_fixed_width(bytes, cursor, end, 4)?,
+        0x44 if allows_scalar_float(validator) => skip_fixed_width(bytes, cursor, end, 8)?,
         0x23 => {
             read_u32_leb(bytes, cursor, end)?;
         }
@@ -419,22 +470,23 @@ fn inspect_globals(
     bytes: &[u8],
     range: core::ops::Range<usize>,
     count: u32,
+    validator: CoreValidatorConfiguration,
 ) -> Result<(), AdmissionError> {
     let mut cursor = range.start;
     if read_u32_leb(bytes, &mut cursor, range.end)? != count {
         return Err(AdmissionError::validation(AdmissionDetail::Malformed));
     }
     for _ in 0..count {
-        match next_byte(bytes, &mut cursor, range.end)? {
-            0x7f | 0x7e => {}
-            _ => return Err(AdmissionError::unsupported()),
+        let value_type = next_byte(bytes, &mut cursor, range.end)?;
+        if !supports_encoded_value_type(value_type, validator) {
+            return Err(AdmissionError::unsupported());
         }
         match next_byte(bytes, &mut cursor, range.end)? {
             0 => {}
             1..=3 => return Err(AdmissionError::unsupported()),
             _ => return Err(AdmissionError::validation(AdmissionDetail::Malformed)),
         }
-        inspect_integer_const_expr(bytes, &mut cursor, range.end)?;
+        inspect_numeric_const_expr(bytes, &mut cursor, range.end, validator)?;
     }
     if cursor != range.end {
         return Err(AdmissionError::validation(AdmissionDetail::Malformed));
@@ -709,6 +761,23 @@ fn inspect_core_with_limits_and_current_engine(
     limits: &ProfileLimits,
     engine: &CurrentCoreValidationEngine,
 ) -> Result<CoreSummary, AdmissionError> {
+    inspect_core_with_limits_and_validator(bytes, limits, engine.identity.core_validator())
+}
+
+/// Performs the bounded Core structural and strict-validation pass selected by
+/// the sealed Profile-2 scalar-float contract. This is an F2 candidate
+/// acceptance seam only: it does not resolve code 5 to a current engine,
+/// construct an execution engine, or make an artifact executable.
+pub fn inspect_core_for_profile_2_candidate(bytes: &[u8]) -> Result<CoreSummary, AdmissionError> {
+    let contract = profile_2_sync_float_validation_contract();
+    inspect_core_with_limits_and_validator(bytes, &PROFILE_1_LIMITS, contract.core_validator())
+}
+
+fn inspect_core_with_limits_and_validator(
+    bytes: &[u8],
+    limits: &ProfileLimits,
+    validator: CoreValidatorConfiguration,
+) -> Result<CoreSummary, AdmissionError> {
     if bytes.len() > limits.max_core_module_bytes || bytes.len() > u32::MAX as usize {
         return Err(AdmissionError::limit(LimitKind::CoreModuleBytes));
     }
@@ -717,9 +786,11 @@ fn inspect_core_with_limits_and_current_engine(
         ..CoreSummary::default()
     };
     let mut saw_core = false;
-    let validator = engine.identity.core_validator();
     let mut parser = Parser::new(0);
-    parser.set_features(parser_features(validator.structural_features()));
+    parser.set_features(core_parser_features(
+        validator.structural_features(),
+        validator,
+    ));
     for payload in parser.parse_all(bytes) {
         let payload =
             payload.map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?;
@@ -744,6 +815,7 @@ fn inspect_core_with_limits_and_current_engine(
                     reader.range(),
                     reader.count(),
                     limits,
+                    validator,
                     &mut summary,
                 )?;
             }
@@ -850,7 +922,7 @@ fn inspect_core_with_limits_and_current_engine(
                     limits.max_globals,
                     LimitKind::Globals,
                 )?;
-                inspect_globals(bytes, reader.range(), reader.count())?;
+                inspect_globals(bytes, reader.range(), reader.count(), validator)?;
             }
             Payload::ExportSection(reader) => checked_add(
                 &mut summary.exports,
@@ -925,14 +997,16 @@ fn inspect_core_with_limits_and_current_engine(
         return Err(AdmissionError::validation(AdmissionDetail::Malformed));
     }
 
-    if Validator::new_with_features(parser_features(validator.strict_features()))
+    if Validator::new_with_features(core_parser_features(validator.strict_features(), validator))
         .validate_all(bytes)
         .is_err()
     {
-        let broadly_valid =
-            Validator::new_with_features(parser_features(validator.diagnostic_features()))
-                .validate_all(bytes)
-                .is_ok();
+        let broadly_valid = Validator::new_with_features(core_parser_features(
+            validator.diagnostic_features(),
+            validator,
+        ))
+        .validate_all(bytes)
+        .is_ok();
         return Err(if broadly_valid {
             AdmissionError::unsupported()
         } else {
@@ -1229,6 +1303,21 @@ fn compile_reservation_bytes(input_bytes: usize, summary: CoreSummary) -> usize 
     input_bytes.saturating_mul(32).saturating_add(structural)
 }
 
+fn enforce_compile_reservation(
+    bytes: &[u8],
+    summary: CoreSummary,
+    reservation: OwnerAllocationReservation,
+) -> Result<(CoreSummary, usize), AdmissionError> {
+    let reserved_compile_bytes = compile_reservation_bytes(bytes.len(), summary);
+    if reserved_compile_bytes > reservation.bytes() {
+        return Err(AdmissionError {
+            trap: TrapCode::LimitExceeded,
+            detail: AdmissionDetail::AllocationReservation,
+        });
+    }
+    Ok((summary, reserved_compile_bytes))
+}
+
 fn inspect_compile_reservation(
     bytes: &[u8],
     reservation: OwnerAllocationReservation,
@@ -1239,14 +1328,28 @@ fn inspect_compile_reservation(
     // Module::new, so a short caller reservation cannot start compilation in
     // an ambient fallback owner. It is not an upper bound on Wasmi's actual
     // allocation-request total or live/high-water memory.
-    let reserved_compile_bytes = compile_reservation_bytes(bytes.len(), summary);
-    if reserved_compile_bytes > reservation.bytes() {
-        return Err(AdmissionError {
-            trap: TrapCode::LimitExceeded,
-            detail: AdmissionDetail::AllocationReservation,
-        });
-    }
-    Ok((summary, reserved_compile_bytes))
+    enforce_compile_reservation(bytes, summary, reservation)
+}
+
+/// Returns the deterministic compilation policy charge for bytes admitted by
+/// the sealed Profile-2 scalar-float candidate inspector. No Wasmi engine or
+/// module is created, and code 5 remains absent from the current-engine
+/// resolver.
+pub fn profile_2_candidate_required_compile_bytes(bytes: &[u8]) -> Result<usize, AdmissionError> {
+    let summary = inspect_core_for_profile_2_candidate(bytes)?;
+    Ok(compile_reservation_bytes(bytes.len(), summary))
+}
+
+/// Applies the existing owner reservation gate to bytes admitted by the sealed
+/// Profile-2 scalar-float candidate inspector. This returns inspection evidence
+/// and the exact policy debit only; the F2 acceptance crate remains responsible
+/// for constructing its independently identified candidate engine.
+pub fn inspect_profile_2_candidate_compile_reservation(
+    bytes: &[u8],
+    reservation: OwnerAllocationReservation,
+) -> Result<(CoreSummary, usize), AdmissionError> {
+    let summary = inspect_core_for_profile_2_candidate(bytes)?;
+    enforce_compile_reservation(bytes, summary, reservation)
 }
 
 #[derive(Debug)]

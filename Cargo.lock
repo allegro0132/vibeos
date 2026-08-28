@@ -1067,6 +1067,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
+name = "rustc_apfloat"
+version = "0.2.3+llvm-462a31f5a5ab"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad"
+dependencies = [
+ "bitflags 2.13.1",
+ "smallvec",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1932,6 +1942,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-wasm-float-candidate"
+version = "0.1.0"
+dependencies = [
+ "vibeos-component-format",
+ "vibeos-wasm-runtime",
+ "vibeos-wasmi-core-softfloat",
+ "vibeos-wasmi-softfloat",
+ "wat",
+]
+
+[[package]]
 name = "vibeos-wasm-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1954,6 +1975,35 @@ dependencies = [
  "vibeos-core",
  "vibeos-wasm-runtime",
  "wat",
+]
+
+[[package]]
+name = "vibeos-wasmi-collections-softfloat"
+version = "1.1.0-vibeos-f2.1"
+
+[[package]]
+name = "vibeos-wasmi-core-softfloat"
+version = "1.1.0-vibeos-f2.1"
+dependencies = [
+ "rustc_apfloat",
+]
+
+[[package]]
+name = "vibeos-wasmi-ir-softfloat"
+version = "1.1.0-vibeos-f2.1"
+dependencies = [
+ "vibeos-wasmi-core-softfloat",
+]
+
+[[package]]
+name = "vibeos-wasmi-softfloat"
+version = "1.1.0-vibeos-f2.1"
+dependencies = [
+ "spin",
+ "vibeos-wasmi-collections-softfloat",
+ "vibeos-wasmi-core-softfloat",
+ "vibeos-wasmi-ir-softfloat",
+ "wasmparser 0.239.0",
 ]
 
 [[package]]

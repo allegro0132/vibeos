@@ -747,6 +747,11 @@ fn stable_trap_codes_and_names_are_exact() {
             "indirect-call-type-mismatch",
         ),
         (TrapCode::CallDepthExceeded, 0x0206, "call-depth-exceeded"),
+        (
+            TrapCode::InvalidConversionToInteger,
+            0x0207,
+            "invalid-conversion-to-integer",
+        ),
         (TrapCode::FuelExhausted, 0x0300, "fuel-exhausted"),
         (TrapCode::Cancelled, 0x0301, "cancelled"),
         (TrapCode::CanonicalAbi, 0x0400, "canonical-abi"),

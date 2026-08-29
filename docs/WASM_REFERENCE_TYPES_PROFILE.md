@@ -1,6 +1,6 @@
 # Reference Types validation profile
 
-Status: `c812-r1-reference-types-validation-design-frozen-pre-implementation`.
+Status: `c812-r2-reference-types-validation-implemented-pre-fixed-qemu`.
 
 C8.12 is the next one-feature widening after the released code-8 SIMD runtime.
 C8.12-R1 allocates a fresh validation-only identity; it does not reinterpret or
@@ -37,12 +37,13 @@ threads/shared memory, bulk memory, tail calls, and extended const remain
 disabled.
 
 The engine identity is frozen as a new facade derived from the pinned
-`vibeos-wasmi-softfloat@1.1.0-vibeos-f2.1` source, with floats disabled. R1 does
+`vibeos-wasmi-softfloat@1.1.0-vibeos-f2.1` source, with floats disabled. R1 did
 not materialize that facade, bind a current engine, admit code 9, or execute it.
-R2 must implement the codec, isolated candidate validator, syntax containment,
-negative/differential corpora, default-off rejection boundaries, supply-chain
-closure, and RISC-V object audit. Code 9 remains non-current, non-executable,
-non-durable, and non-migratable throughout C8.12.
+R2 now implements the codec, isolated dual-pass candidate validator, syntax
+containment, negative and fixed mutation corpora, Component confinement,
+default-off rejection boundaries, supply-chain closure, and RISC-V object
+audit. Code 9 remains non-current, non-executable, non-durable, and
+non-migratable throughout C8.12.
 
 The ordered nodes are:
 
@@ -51,6 +52,23 @@ The ordered nodes are:
 | C8.12-R1 | Freeze code/ABIs 9, profile 6, revisions, engine, bounded semantics, authority boundaries, and fixed-QEMU policy |
 | C8.12-R2 | Implement and audit the validation-only engine, containment, corpus, and rejection paths |
 | C8.12-R3 | Pass fresh normal and optimized `qemu-virt-rv64-tcg-icount-v1` evidence and become eligible only for an independently numbered executable-successor design review |
+
+R2 materializes the new two-file facade and the default-off
+`vibeos-wasm-reference-candidate` crate. The exact validator enables only
+`REFERENCE_TYPES` plus the parser-required `GC_TYPES`, then rejects every GC
+composite type with `into_iter_err_on_gc_types`, every non-`funcref` reference,
+more than one table, passive/declarative elements, reference-valued exports,
+and all imports. A second Wasmi translation pass must accept the same bytes.
+The Component path reuses the synchronous integer-only boundary and delegates
+each embedded Core module to this validator; ordinary inspection and durable
+loading still reject code 9.
+
+The fixed corpus covers four candidate tests, three Component containment
+tests, and 256 deterministic byte mutations (208 structural/semantic
+rejections; the remaining name/non-semantic mutations retain zero current
+engine authority). The offline `riscv64imac-unknown-none-elf` closure audit
+covers seven rlibs and finds no F/D/V opcode, semantic native-float helper, or
+reachable `libm`.
 
 Fixed QEMU is the formal C8.12 qualification target. It is emulator-scoped and
 claims no physical equivalence. Milk-V Duo supplies zero inputs and remains a

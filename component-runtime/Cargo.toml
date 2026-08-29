@@ -42,6 +42,13 @@ c811-simd-executable = [
     "c810-s3-acceptance",
     "vibeos-wasm-runtime/c811-simd-executable",
 ]
+# Acceptance-only C8.12-R2 Component containment for validation code 9.
+# Core references remain confined to embedded modules and never become
+# Component, Canonical ABI, WIT, or host values.
+c812-r2-reference-validation = [
+    "dep:vibeos-wasm-reference-candidate",
+    "vibeos-wasm-reference-candidate/c812-r2-acceptance",
+]
 # Portable, caller-clocked timing hooks used only by the frozen C8.4
 # interpreter/AOT decision harness. Production builds leave this disabled.
 c84-profile-hooks = []
@@ -50,6 +57,7 @@ c84-profile-hooks = []
 vibeos-component-format = { path = "../component-format" }
 vibeos-wasm-runtime = { path = "../wasm-runtime" }
 vibeos-wasm-float-candidate = { path = "../wasm-float-candidate", default-features = false, optional = true }
+vibeos-wasm-reference-candidate = { path = "../wasm-reference-candidate", default-features = false, optional = true }
 vibeos-wasm-simd-candidate = { path = "../wasm-simd-candidate", default-features = false, optional = true }
 wasmparser = { version = "=0.255.0", default-features = false, features = ["component-model", "features", "prefer-btree-collections", "validate"] }
 wit-parser = { version = "=0.255.0", default-features = false }

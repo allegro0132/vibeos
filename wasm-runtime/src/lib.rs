@@ -174,6 +174,14 @@ fn parser_features(selection: WasmParserFeatureSelection) -> WasmFeatures {
             features.set(WasmFeatures::SIMD, true);
             features
         }
+        WasmParserFeatureSelection::ReferenceTypes => {
+            let mut features = WasmFeatures::empty();
+            features.set(WasmFeatures::REFERENCE_TYPES, true);
+            // wasmparser requires heap-type parsing support for Reference Types;
+            // the C8.12 candidate inspection layer still rejects GC semantics.
+            features.set(WasmFeatures::GC_TYPES, true);
+            features
+        }
     }
 }
 
@@ -265,6 +273,10 @@ fn supports_encoded_value_type(byte: u8, validator: CoreValidatorConfiguration) 
         0x7f | 0x7e => true,
         0x7d | 0x7c => allows_scalar_float(validator),
         0x7b => allows_fixed_simd(validator),
+        0x70 => matches!(
+            validator.numeric_profile(),
+            CoreNumericProfile::Profile6IntegerReferences
+        ),
         _ => false,
     }
 }

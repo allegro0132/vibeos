@@ -393,6 +393,8 @@ enum InspectionMode {
     SyncSimdCandidate,
     #[cfg(feature = "c811-simd-executable")]
     SyncSimdExecutable,
+    #[cfg(feature = "c812-r2-reference-validation")]
+    SyncReferenceCandidate,
 }
 
 impl InspectionMode {
@@ -457,6 +459,14 @@ impl InspectionMode {
         }
         false
     }
+
+    const fn allows_reference_types(self) -> bool {
+        #[cfg(feature = "c812-r2-reference-validation")]
+        if matches!(self, Self::SyncReferenceCandidate) {
+            return true;
+        }
+        false
+    }
 }
 
 enum ComponentInspectionSource<'a> {
@@ -465,6 +475,8 @@ enum ComponentInspectionSource<'a> {
     Profile2FloatCandidate,
     #[cfg(feature = "c810-s3-acceptance")]
     Profile4SimdCandidate,
+    #[cfg(feature = "c812-r2-reference-validation")]
+    Profile6ReferenceCandidate,
 }
 
 impl ComponentInspectionSource<'_> {
@@ -479,6 +491,10 @@ impl ComponentInspectionSource<'_> {
                 .map_err(|_| DecodeError::InvalidEmbeddedCore),
             #[cfg(feature = "c810-s3-acceptance")]
             Self::Profile4SimdCandidate => inspect_core_for_profile_4_candidate(bytes)
+                .map(|_| ())
+                .map_err(|_| DecodeError::InvalidEmbeddedCore),
+            #[cfg(feature = "c812-r2-reference-validation")]
+            Self::Profile6ReferenceCandidate => vibeos_wasm_reference_candidate::validate(bytes)
                 .map(|_| ())
                 .map_err(|_| DecodeError::InvalidEmbeddedCore),
         }
@@ -506,6 +522,12 @@ fn parser_features(selection: WasmParserFeatureSelection) -> WasmFeatures {
             features.set(WasmFeatures::SIMD, true);
             features
         }
+        WasmParserFeatureSelection::ReferenceTypes => {
+            let mut features = WasmFeatures::empty();
+            features.set(WasmFeatures::REFERENCE_TYPES, true);
+            features.set(WasmFeatures::GC_TYPES, true);
+            features
+        }
     }
 }
 
@@ -519,6 +541,10 @@ fn parser_features_for_mode(
     }
     if mode.allows_fixed_simd() {
         features.set(WasmFeatures::SIMD, true);
+    }
+    if mode.allows_reference_types() {
+        features.set(WasmFeatures::REFERENCE_TYPES, true);
+        features.set(WasmFeatures::GC_TYPES, true);
     }
     features
 }
@@ -658,6 +684,29 @@ pub fn inspect_component_for_profile_4_candidate(
     .map(|(plan, _)| plan)
 }
 
+/// Structurally validates a Component under the sealed code-9 Reference Types
+/// profile. Core `funcref` values remain confined to embedded modules; this
+/// path constructs no executable wiring and never resolves a current engine.
+#[cfg(feature = "c812-r2-reference-validation")]
+pub fn inspect_component_for_profile_6_candidate(
+    bytes: &[u8],
+) -> Result<ComponentPlan<'_>, DecodeError> {
+    let contract = vibeos_component_format::profile_6_sync_reference_types_validation_contract();
+    if contract.profile() != ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION
+        || contract.runtime_ready()
+    {
+        return Err(DecodeError::Unsupported);
+    }
+    inspect_component_for_profile_impl(
+        bytes,
+        contract.profile(),
+        false,
+        InspectionMode::SyncReferenceCandidate,
+        ComponentInspectionSource::Profile6ReferenceCandidate,
+    )
+    .map(|(plan, _)| plan)
+}
+
 /// Inspect a Component and additionally capture narrow, graph-only nominal
 /// resource provenance from the validator's live type graph.
 ///
@@ -728,6 +777,18 @@ fn inspect_component_for_profile_impl<'a>(
             if profile != contract.profile()
                 || !mode.allows_scalar_float()
                 || !mode.allows_fixed_simd()
+                || contract.runtime_ready()
+            {
+                return Err(DecodeError::Unsupported);
+            }
+            contract.component_validator()
+        }
+        #[cfg(feature = "c812-r2-reference-validation")]
+        ComponentInspectionSource::Profile6ReferenceCandidate => {
+            let contract =
+                vibeos_component_format::profile_6_sync_reference_types_validation_contract();
+            if profile != contract.profile()
+                || !matches!(mode, InspectionMode::SyncReferenceCandidate)
                 || contract.runtime_ready()
             {
                 return Err(DecodeError::Unsupported);

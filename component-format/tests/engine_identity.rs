@@ -1,12 +1,13 @@
 use vibeos_component_format::{
     current_validation_engine_identity, profile_2_sync_float_validation_contract,
-    ComponentValidationMode, CoreNumericProfile, ProfileIdentity, ScalarFloatType,
-    WasmParserFeatureSelection, WasmiCompilationMode, WasmiEnforcedLimits, WasmiFuelCosts,
-    COMPONENT_WASMPARSER_FEATURES, CORE_WASMPARSER_FEATURES, PROFILE_1_LIMITS,
-    PROFILE_2_SYNC_FLOAT_NAN_POLICY, WASMI_1_1_0_CHECKSUM, WASMI_1_1_0_VERSION, WASMI_FEATURES,
-    WASMI_WASMPARSER_0_239_0_CHECKSUM, WASMI_WASMPARSER_0_239_0_VERSION, WASMI_WASMPARSER_FEATURES,
-    WASMPARSER_0_255_0_CHECKSUM, WASMPARSER_0_255_0_VERSION, WIT_PARSER_0_255_0_CHECKSUM,
-    WIT_PARSER_0_255_0_VERSION, WIT_PARSER_FEATURES,
+    profile_6_sync_reference_types_validation_contract, ComponentValidationMode,
+    CoreNumericProfile, ProfileIdentity, ScalarFloatType, WasmParserFeatureSelection,
+    WasmiCompilationMode, WasmiEnforcedLimits, WasmiFuelCosts, COMPONENT_WASMPARSER_FEATURES,
+    CORE_WASMPARSER_FEATURES, PROFILE_1_LIMITS, PROFILE_2_SYNC_FLOAT_NAN_POLICY,
+    WASMI_1_1_0_CHECKSUM, WASMI_1_1_0_VERSION, WASMI_FEATURES, WASMI_WASMPARSER_0_239_0_CHECKSUM,
+    WASMI_WASMPARSER_0_239_0_VERSION, WASMI_WASMPARSER_FEATURES, WASMPARSER_0_255_0_CHECKSUM,
+    WASMPARSER_0_255_0_VERSION, WIT_PARSER_0_255_0_CHECKSUM, WIT_PARSER_0_255_0_VERSION,
+    WIT_PARSER_FEATURES,
 };
 
 #[test]
@@ -326,4 +327,34 @@ fn c811_code8_binds_the_independent_simd_engine_and_code7_stays_non_current() {
             .is_none()
     );
     assert!(current_validation_engine_identity(ProfileIdentity::PROFILE_2_SYNC_FLOAT).is_none());
+}
+
+#[test]
+fn c812_code9_contract_is_exact_and_never_current() {
+    let profile = ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION;
+    let contract = profile_6_sync_reference_types_validation_contract();
+    assert_eq!(contract.profile(), profile);
+    assert!(!contract.runtime_ready());
+    assert_eq!(contract.package(), "vibeos-wasmi-reference-validation");
+    assert_eq!(contract.version(), "1.1.0-vibeos-ref1.1");
+    assert_eq!(
+        contract.core_validator().strict_features(),
+        WasmParserFeatureSelection::ReferenceTypes
+    );
+    assert_eq!(
+        contract.core_validator().numeric_profile(),
+        CoreNumericProfile::Profile6IntegerReferences
+    );
+    let runtime = contract.target_wasmi_configuration();
+    assert!(!runtime.floats());
+    assert!(runtime.reference_types());
+    assert!(!runtime.bulk_memory());
+    assert!(!runtime.multi_memory());
+    assert!(!runtime.simd_compiled());
+    assert!(current_validation_engine_identity(profile).is_none());
+    assert!(current_validation_engine_identity(ProfileIdentity::PROFILE_2_SYNC_FLOAT).is_none());
+    assert!(
+        current_validation_engine_identity(ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION)
+            .is_none()
+    );
 }

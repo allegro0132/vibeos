@@ -266,6 +266,25 @@ jobs:
           python3 -O -B scripts/verify-c812-reference-types-design.py --check-contract
           python3 -B scripts/verify-c812-reference-types-design.py --selftest
           python3 -O -B scripts/verify-c812-reference-types-design.py --selftest
+      - name: Verify the C8.12-R2 Reference Types implementation
+        # Host/static/RISC-V validation closure only. Fixed QEMU is R3;
+        # physical hardware remains paused and is never consumed here.
+        run: |
+          python3 -B scripts/verify-c812-reference-types-implementation.py --check-contract
+          python3 -O -B scripts/verify-c812-reference-types-implementation.py --check-contract
+          python3 -B scripts/verify-c812-reference-types-implementation.py --selftest
+          python3 -O -B scripts/verify-c812-reference-types-implementation.py --selftest
+          python3 -B scripts/verify-c812-r2-supply-chain.py
+          python3 -O -B scripts/verify-c812-r2-supply-chain.py --self-test
+          python3 -B scripts/verify-c812-r2-riscv-object.py
+          cargo test --locked --offline -p vibeos-component-format
+          cargo test --locked --offline -p vibeos-wasm-reference-candidate \
+            --features c812-r2-acceptance
+          cargo test --locked --offline -p vibeos-component-runtime \
+            --features c812-r2-reference-validation \
+            --test c812_r2_reference_containment
+          cargo test --locked --offline -p vibeos-component-loader \
+            profile_instance_limits_and_exact_wit_are_revalidated
       - name: Verify the prospective fixed-QEMU WASM target/release policy
         # Policy/contract integrity only: this step runs no QEMU or Duo and
         # itself satisfies no gate. C8.9 qualification is verified separately.

@@ -131,6 +131,24 @@ pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_CANONICAL_ABI_REVISION: &str =
 pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_WASI_REVISION: &str = "wasi-not-selected-c811-sync-simd";
 pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_WORLD: &str = "vibe:simd/runtime@1.0.0";
 
+/// C8.12's independently numbered Reference Types validation identity. Code 9
+/// is candidate metadata only and cannot become executable under this identity.
+pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_PROFILE_CODE: u16 = 9;
+pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_ARTIFACT_ABI_VERSION: u16 = 9;
+pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_COMPONENT_PROFILE_VERSION: u16 = 6;
+pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_CORE_PROFILE_VERSION: u16 = 6;
+pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_RUNTIME_ABI_VERSION: u16 = 9;
+pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_CORE_SPEC_REVISION: &str =
+    "webassembly-core-2.0-reference-types-1.0-nullable-funcref-c812-validation-v1";
+pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_COMPONENT_MODEL_REVISION: &str =
+    "wasmparser-component-model-0.255.0-c812-ref-validation-v1";
+pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_CANONICAL_ABI_REVISION: &str =
+    "component-model-0.255.0-sync-no-core-reference-boundary-c812-ref-validation-v1";
+pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_WASI_REVISION: &str =
+    "wasi-not-selected-c812-reference-types";
+pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_WORLD: &str =
+    "vibe:references/validation@1.0.0";
+
 /// Exact Wasmtime release asset admitted as the C8.1 command adapter. These
 /// values describe provenance only; the asset bytes are never bundled or
 /// selected by this `no_std` format crate.
@@ -249,6 +267,11 @@ pub const PROFILE_4_SYNC_SIMD_VALIDATION_CANONICAL_FEATURES: u64 =
 
 pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_CANONICAL_FEATURES: u64 =
     PROFILE_4_SYNC_SIMD_VALIDATION_CANONICAL_FEATURES;
+
+/// Core references never cross the Component boundary, so code 9 retains the
+/// integer-only synchronous Canonical ABI surface.
+pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_CANONICAL_FEATURES: u64 =
+    SYNC_CANONICAL_FEATURES;
 
 pub const ASYNC_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
     | CanonicalAbiFeature::SyncLiftLower.bit()
@@ -439,6 +462,22 @@ impl ProfileIdentity {
         stage: ProfileStage::Executable,
     };
 
+    /// C8.12's bounded Reference Types validator identity. A separately
+    /// numbered successor is required for any future execution authority.
+    pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION: Self = Self {
+        artifact_abi: PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_ARTIFACT_ABI_VERSION,
+        component_profile: PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_COMPONENT_PROFILE_VERSION,
+        core_profile: PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_CORE_PROFILE_VERSION,
+        runtime_abi: PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_RUNTIME_ABI_VERSION,
+        core_revision: PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_CORE_SPEC_REVISION,
+        component_revision: PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_COMPONENT_MODEL_REVISION,
+        canonical_abi_revision: PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_CANONICAL_ABI_REVISION,
+        wasm_tools_revision: SYNC_WASM_TOOLS_REVISION,
+        wasi_revision: PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_WASI_REVISION,
+        canonical_features: PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_CANONICAL_FEATURES,
+        stage: ProfileStage::ValidationOnly,
+    };
+
     pub const PROFILE_1: Self = Self::PROFILE_1_SYNC;
 
     pub const fn execution_enabled(self) -> bool {
@@ -500,6 +539,20 @@ const _: () = assert!(
 const _: () = assert!(
     ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE.runtime_abi
         == PROFILE_5_SYNC_SIMD_EXECUTABLE_PROFILE_CODE
+);
+const _: () = assert!(matches!(
+    ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION.stage,
+    ProfileStage::ValidationOnly
+));
+const _: () =
+    assert!(!ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION.execution_enabled());
+const _: () = assert!(
+    ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION.artifact_abi
+        == PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_PROFILE_CODE
+);
+const _: () = assert!(
+    ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION.runtime_abi
+        == PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_PROFILE_CODE
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

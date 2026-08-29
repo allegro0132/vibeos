@@ -676,6 +676,21 @@ fn profile_instance_limits_and_exact_wit_are_revalidated() {
         Some(ComponentLoadError::Profile)
     );
 
+    // C8.12-R2 materializes validation-only code 9. It has no ordinary or
+    // durable loader route and remains non-current and non-migratable.
+    let mut reference_candidate = ArtifactSpec::exact();
+    reference_candidate.profile = ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION;
+    assert_eq!(
+        load_exact(
+            artifact_bytes(reference_candidate),
+            WIT,
+            SIGNER_DIGEST,
+            &admission,
+        )
+        .err(),
+        Some(ComponentLoadError::Profile)
+    );
+
     // CMP1 intentionally preserves validation-only code 5 as inert artifact
     // metadata, but the durable production loader must reject it before a
     // publication candidate or command projection can be minted.

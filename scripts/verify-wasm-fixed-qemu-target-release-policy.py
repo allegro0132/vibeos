@@ -32,9 +32,9 @@ CONTRACT_PATH = (
     "fixed-qemu-target-release-policy-v1-contract.json"
 )
 
-EXPECTED_CONTRACT_BYTES = 20_642
+EXPECTED_CONTRACT_BYTES = 21_665
 EXPECTED_CONTRACT_SHA256 = (
-    "8e378ff8bb731bb97a25bb48a907fc08b37bf94ecaddf82ce25ed5293c3c3aa7"
+    "9837f904c2801ccb210e3970e4442e534119983f75cba6c7dec6fd5402f2396d"
 )
 MAX_CONTRACT_BYTES = 64 * 1024
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
@@ -71,7 +71,7 @@ EXPECTED_APPLICATION_STATUS = {
         "c89-float-successor-design-v1-contract.json"
     ),
     "allocation_contract_schema": "vibeos.c89.float-successor-design-v1.contract",
-    "current_roadmap_position": "c89-s2-implemented-pre-fixed-qemu-qualification",
+    "current_roadmap_position": "c89-s3-qualified-sealed-float-runtime-released",
     "design_node": "C8.9-S1",
     "design_node_complete": True,
     "implementation_node": "C8.9-S2",
@@ -82,8 +82,19 @@ EXPECTED_APPLICATION_STATUS = {
     "implementation_contract_schema": "vibeos.c89.float-successor-implementation-v1.contract",
     "implementation_node_complete": True,
     "policy_checkpoint_remains_nonallocating": True,
+    "qualification_contract_path": (
+        "acceptance/wasm-float-target/artifacts/"
+        "c89-s3-fixed-qemu-qualification-v1-contract.json"
+    ),
+    "qualification_contract_schema": (
+        "vibeos.c89.s3.fixed-qemu-qualification-v1.contract"
+    ),
     "qualification_node": "C8.9-S3",
-    "qualification_node_complete": False,
+    "qualification_node_complete": True,
+    "release_decision_path": (
+        "acceptance/wasm-float-target/artifacts/c89-s3-release-decision.json"
+    ),
+    "release_decision_schema": "vibeos.c89.s3.float-executable.release-decision",
     "successor_design_review_passed": True,
     "target_policy_applies_to_qualification": True,
 }
@@ -156,12 +167,12 @@ EXPECTED_DUO_OBSERVATION = {
 EXPECTED_EFFECTIVITY = {
     "contract_is_target_evidence": False,
     "contract_satisfies_target_release_gate": False,
-    "current_target_release_gate_satisfied": False,
+    "current_target_release_gate_satisfied": True,
     "policy_effective": True,
     "policy_effective_condition": (
         "exact-contract-verifier-docs-testing-and-ci-integrated-on-codex-wasm"
     ),
-    "release_authorized": False,
+    "release_authorized": True,
     "retroactive_evidence_reclassification": False,
     "successor_review_passed_by_policy": False,
 }
@@ -276,32 +287,43 @@ VERIFICATION_COMMANDS = [
 
 EXPECTED_REPOSITORY_FILES = {
     ".github/workflows/ci.yml": {
-        "bytes": 25_314,
-        "sha256": "0323cc019d428a03adb467820e8b5646b0aab69e5c1db8e8619d948b8c1e3b95",
+        "bytes": 25_861,
+        "sha256": "6c4c1e586fac50ccb6901e6889804bb14d24f1ccee2f27065c13b0cd54b55dea",
     },
     "TESTING.md": {
-        "bytes": 128_981,
-        "sha256": "0ba5030d47d3dd1edeca4f76769f2298dac34fccb9e04c56c6247c01d75a1372",
+        "bytes": 129_997,
+        "sha256": "058f9b163676c088a7a1765d9e120c44c9dc835466b47199c32d21e030b4dffb",
+    },
+    (
+        "acceptance/wasm-float-target/artifacts/"
+        "c89-s3-fixed-qemu-qualification-v1-contract.json"
+    ): {
+        "bytes": 4_457,
+        "sha256": "f105699b87c4f05eb90c2afe22a2a46002b7f5a1d32a1bac7cc46878a81edbb8",
+    },
+    "acceptance/wasm-float-target/artifacts/c89-s3-release-decision.json": {
+        "bytes": 2_117,
+        "sha256": "67bc213ddfc0d9044cd347c0f7aa3792909de4e7ae0074e6f546f0e4905d8593",
     },
     "benchmarks/wasm-aot-decision/README.md": {
-        "bytes": 16_378,
-        "sha256": "ed2748b5ca5bb2bd6b445c773a6682d90b3983cd8738374bb04b4401339cc991",
+        "bytes": 16_543,
+        "sha256": "781a10d553cdb14d80ddcd23d6f80b0088206dda47dae10de7ee6eea1eb8cd5f",
     },
     "benchmarks/wasm-runtime/README.md": {
         "bytes": 1_200,
         "sha256": "5e1e1bd8c21dc2f1badecc2f29dc52209cfa4682744c0677abdba604df1dd5b1",
     },
     "docs/WASM_AOT_DECISION.md": {
-        "bytes": 84_021,
-        "sha256": "7a07dd3d7c1251684cbf5fa49b05a067947fef80197aeea559c629819f1e4900",
+        "bytes": 84_064,
+        "sha256": "b85b12447d6e2bc1c8a6e8761e4e24bd4e0a69d87111ca820f03bf865ba6b4a0",
     },
     "docs/WASM_FLOAT_PROFILE.md": {
-        "bytes": 35_711,
-        "sha256": "8e5f2bc049ac53434cd6f950a574c62271b623b2844c8da9e0f6dbd3e70b0bd6",
+        "bytes": 36_202,
+        "sha256": "2bb44db35be235df63d330df96f5c05123fe1f93a4bc4214f6d28e99e17fc5dc",
     },
     "docs/WASM_ROADMAP.md": {
-        "bytes": 96_108,
-        "sha256": "8c73f1495330c6af10e0c91fa78cfb1f9ed529958e84866a3fa5eaa6ac03e226",
+        "bytes": 96_473,
+        "sha256": "a7e8fab7a40c8b6e2aa7b1053c1861bc1dd48804dad558352b2e1dea35a220f8",
     },
     "docs/WASM_RUNTIME_COSTS.md": {
         "bytes": 12_908,
@@ -315,6 +337,13 @@ EXPECTED_REPOSITORY_INTEGRATION = {
     "ci": ".github/workflows/ci.yml",
     "ci_step_name": "Verify the prospective fixed-QEMU WASM target/release policy",
     "float_profile_doc": "docs/WASM_FLOAT_PROFILE.md",
+    "qualification_contract": (
+        "acceptance/wasm-float-target/artifacts/"
+        "c89-s3-fixed-qemu-qualification-v1-contract.json"
+    ),
+    "release_decision": (
+        "acceptance/wasm-float-target/artifacts/c89-s3-release-decision.json"
+    ),
     "pinned_files": EXPECTED_REPOSITORY_FILES,
     "roadmap": "docs/WASM_ROADMAP.md",
     "runtime_costs_doc": "docs/WASM_RUNTIME_COSTS.md",
@@ -413,9 +442,9 @@ CHECK_OUTPUT = (
     "check_scope=prospective-wasm-roadmap-target-and-release-gates\n"
     "policy_effective=true\n"
     "contract_is_target_evidence=false\n"
-    "current_target_release_gate_satisfied=false\n"
+    "current_target_release_gate_satisfied=true\n"
     "policy_checkpoint_successor_state=unallocated\n"
-    "current_roadmap_position=c89-s2-implemented-pre-fixed-qemu-qualification\n"
+    "current_roadmap_position=c89-s3-qualified-sealed-float-runtime-released\n"
     "physical_inputs_required=0\n"
     "physical_inputs_permitted=0\n"
     "duo_gate_effect=false\n"
@@ -1274,8 +1303,8 @@ TESTING_POLICY_BLOCK = (
 CI_STEP_NAME = "Verify the prospective fixed-QEMU WASM target/release policy"
 CI_POLICY_STEP = (
     f"      - name: {CI_STEP_NAME}\n"
-    "        # Policy/contract integrity only: no QEMU or Duo is run, no target or\n"
-    "        # release gate is satisfied. C8.9 allocation is verified separately.\n"
+    "        # Policy/contract integrity only: this step runs no QEMU or Duo and\n"
+    "        # itself satisfies no gate. C8.9 qualification is verified separately.\n"
     "        run: |\n"
     f"          {VERIFICATION_COMMANDS[0]}\n"
     f"          {VERIFICATION_COMMANDS[1]}\n"
@@ -1300,7 +1329,7 @@ C84_HISTORICAL_NEXT_MARKER = (
     "`C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position."
 )
 CURRENT_POSITION_MARKER = (
-    "The current roadmap position is `c89-s2-implemented-pre-fixed-qemu-qualification`."
+    "The current roadmap position is `c89-s3-qualified-sealed-float-runtime-released`."
 )
 FLOAT_NON_PROMOTION_MARKER = (
     "The C8.8-F5 replacement remains scoped to F5 only; the independent "
@@ -1830,8 +1859,8 @@ def run_contract_selftests(contract: dict[str, Any]) -> int:
         ),
         (
             ("effectivity", "current_target_release_gate_satisfied"),
-            True,
-            "gate-falsely-satisfied",
+            False,
+            "gate-satisfaction-regressed",
             "effectivity.current_target_release_gate_satisfied differs",
         ),
         (
@@ -2001,8 +2030,8 @@ def run_contract_selftests(contract: dict[str, Any]) -> int:
         ),
         (
             ("application_status", "qualification_node_complete"),
-            True,
-            "c89-qualification-falsely-complete",
+            False,
+            "c89-qualification-regressed-incomplete",
             "application_status.qualification_node_complete differs",
         ),
         (

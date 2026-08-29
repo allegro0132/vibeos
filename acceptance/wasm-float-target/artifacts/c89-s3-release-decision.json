@@ -1,0 +1,60 @@
+{
+  "schema": "vibeos.c89.s3.float-executable.release-decision",
+  "version": 1,
+  "status": "pass",
+  "node": "C8.9-S3",
+  "decision": "release-code6-sealed-float-runtime",
+  "identity": {
+    "name": "PROFILE_3_SYNC_FLOAT_EXECUTABLE",
+    "profile_code": 6,
+    "artifact_abi": 6,
+    "runtime_abi": 6,
+    "component_profile": 3,
+    "core_profile": 3,
+    "stage": "executable",
+    "engine": "vibeos-wasmi-softfloat@1.1.0-vibeos-f2.1"
+  },
+  "qualification": {
+    "platform": "qemu-virt-rv64-tcg-icount-v1",
+    "source_commit": "2e9bc0c3648656cca8e4d198cbb6a7350975090a",
+    "source_tree": "3de024ef329db9d15678a5f9d98ad152e28fa5d4",
+    "challenge": "12dd535668ec11d17925fbe56eeeb665e5c73737a4c665db0651cce6f31b5f3d",
+    "run_id": "d627c608da149a1324eea5a605ebd5caf4020fde48d75f0a21bea98d1873bd72",
+    "records": 1176,
+    "semantic_sha256": "44cb0a12c01906b31a42fc6550d485496206ea23a08bc073a685e1b893fb94b8",
+    "normal_verified": true,
+    "optimized_verified": true,
+    "elf_no_riscv_f_or_d": true,
+    "elf_no_native_float_helpers": true,
+    "physical_inputs": 0,
+    "physical_provenance": "not-claimed",
+    "physical_equivalence_claimed": false
+  },
+  "authority": {
+    "sealed_authority_free_float_admission_released": true,
+    "code6_release_authorized": true,
+    "code6_production_authorized": true,
+    "ordinary_command_admission_authorized": false,
+    "durable_publication_authorized": false,
+    "aot_authorized": false,
+    "jit_authorized": false,
+    "native_bytes_authorized": false,
+    "rwx_authorized": false,
+    "physical_duo_gate_effect": false
+  },
+  "code5": {
+    "profile_code": 5,
+    "stage": "validation-only",
+    "permanently_inert": true,
+    "current_engine": false,
+    "execution_authorized": false,
+    "promotion_authorized": false,
+    "migration_authorized": false
+  },
+  "limitations": [
+    "emulator qualification is not physical hardware equivalence",
+    "Milk-V Duo remains paused and optional with zero gate effect",
+    "durable publication and ordinary command routing remain closed",
+    "AOT, JIT, native bytes, and RWX remain unauthorized"
+  ]
+}

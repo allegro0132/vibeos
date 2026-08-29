@@ -545,7 +545,7 @@ JIT, RWX, migration, or in-place promotion.
 
 ## 9. C8.9 executable Float successor
 
-The live roadmap position is `c89-s2-implemented-pre-fixed-qemu-qualification`.
+The live roadmap position is `c89-s3-qualified-sealed-float-runtime-released`.
 C8.9 is independently numbered and is divided into three ordered nodes:
 
 1. C8.9-S1 freezes the successor design and identity.
@@ -569,7 +569,8 @@ S2 now binds this source only to code 6. The artifact codec, current Core and
 Component engine resolvers, exact import-free admission surface, bit-only
 Canonical ABI, quota-controlled move-only executor, cancellation, revocation,
 fault reclamation, and cold recovery are implemented. Ordinary command and
-durable-loader routes continue to reject code 6 pending S3 release authority.
+durable-loader routes continue to reject code 6. S3 releases only the sealed
+authority-free Float admission surface.
 
 The canonical machine contract is
 [`c89-float-successor-design-v1-contract.json`](../acceptance/wasm-float-target/artifacts/c89-float-successor-design-v1-contract.json),
@@ -577,13 +578,19 @@ verified by
 [`verify-c89-float-successor-design.py`](../scripts/verify-c89-float-successor-design.py).
 The S2 result is frozen separately by
 [`c89-float-successor-implementation-v1-contract.json`](../acceptance/wasm-float-target/artifacts/c89-float-successor-implementation-v1-contract.json).
-Admission is limited to the sealed authority-free Float activation type;
-durable publication, release, and production remain false until later gates.
+Admission is limited to the sealed authority-free Float activation type. The
+S3 release decision grants release and production authority only to that
+surface; durable publication and ordinary command routing remain false.
 Code 5 remains permanently `ValidationOnly`, inert, non-migratable, and
 ineligible for execution under code 6. Historical F1--F5 evidence cannot be
 relabelled as C8.9 evidence.
 
-C8.9-S3 uses the prospective formal gate:
-`qemu-virt-rv64-tcg-icount-v1`, fresh source/tree, challenge, run ID, capture,
-node-specific predicates, and normal/optimized verification. Milk-V Duo stays
-paused and optional and has no gate, completion, or release effect.
+C8.9-S3 passed the prospective formal gate on fresh source commit
+`2e9bc0c3648656cca8e4d198cbb6a7350975090a`, run ID
+`d627c608da149a1324eea5a605ebd5caf4020fde48d75f0a21bea98d1873bd72`,
+with 1,176 records and semantic SHA-256
+`44cb0a12c01906b31a42fc6550d485496206ea23a08bc073a685e1b893fb94b8`
+under normal and optimized verification. The canonical result is
+[`c89-s3-fixed-qemu-qualification-v1-contract.json`](../acceptance/wasm-float-target/artifacts/c89-s3-fixed-qemu-qualification-v1-contract.json).
+Milk-V Duo stays paused and optional and has no gate, completion, or release
+effect; emulator qualification is not a physical-equivalence claim.

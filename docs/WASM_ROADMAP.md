@@ -20,10 +20,11 @@ fixed-QEMU F5 decision below; every other C8.8 feature widening remains
 separately unallocated and incomplete. The independently numbered C8.9 Float
 successor is now allocated. C8.9-S1 froze its new code-6 identity, ABIs,
 revisions, software-float engine, non-promotion rules, and fixed-QEMU policy;
-C8.9-S2 now implements and verifies its codec, current-engine binding, exact
-authority-free admission, executor, lifecycle, and durable rejection. The live
-position is `c89-s2-implemented-pre-fixed-qemu-qualification`; C8.9-S3 remains
-incomplete. The earlier non-numbered fixed-QEMU
+C8.9-S2 implements and verifies its codec, current-engine binding, exact
+authority-free admission, executor, lifecycle, and durable rejection. C8.9-S3
+now closes the fresh fixed-QEMU gate and releases only that sealed Float
+runtime. The live position is `c89-s3-qualified-sealed-float-runtime-released`.
+The earlier non-numbered fixed-QEMU
 target/release policy checkpoint makes fresh source-bound
 `qemu-virt-rv64-tcg-icount-v1` evidence the prospective generic WASM
 target/release gate. Milk-V Duo remains a paused optional observation with no
@@ -64,7 +65,7 @@ blocking review questions and allocated or authorized nothing. Explicit user
 authorization on 2026-08-29 subsequently opened the separately versioned C8.9
 design/implementation/qualification sequence; it does not rewrite that charter.
 
-**C8.9 status (2026-08-29): C8.9-S1 and C8.9-S2 complete; C8.9-S3 incomplete.**
+**C8.9 status (2026-08-29): C8.9-S1 through C8.9-S3 complete.**
 
 ---
 
@@ -1246,13 +1247,18 @@ ABI 6, Component/Core profile 3, deterministic scalar-float revision suffix
 [`c89-float-successor-implementation-v1-contract.json`](../acceptance/wasm-float-target/artifacts/c89-float-successor-implementation-v1-contract.json): code 6 now has an exact artifact codec, current software-float engine proof,
 closed import-free admission, bit-only Canonical ABI, bounded move-only
 lifecycle, cold recovery, and explicit ordinary-command/durable rejection.
-Code 5 remains outside every current-engine and executable path. Release and
-production remain unauthorized pending S3. F1--F5 semantics may be referenced,
-but none of their artifacts, receipts, or target evidence satisfies a C8.9 gate.
+Code 5 remains outside every current-engine and executable path. C8.9-S3 is
+complete under
+[`c89-s3-fixed-qemu-qualification-v1-contract.json`](../acceptance/wasm-float-target/artifacts/c89-s3-fixed-qemu-qualification-v1-contract.json):
+the fresh pushed source `2e9bc0c3648656cca8e4d198cbb6a7350975090a`
+passed 1,176 records under normal and optimized verification on fixed QEMU.
+Release and production authority apply only to the sealed, authority-free
+Float admission. Ordinary command routing, durable publication, AOT, JIT,
+native bytes, and RWX remain unauthorized.
 
-The live roadmap position is `c89-s2-implemented-pre-fixed-qemu-qualification`.
-Milk-V Duo remains paused and optional with zero gate effect. C8.9-S3 must use
-fresh fixed-QEMU evidence; historical C8.8-F5 evidence is not reusable.
+The live roadmap position is `c89-s3-qualified-sealed-float-runtime-released`.
+Milk-V Duo remains paused and optional with zero gate effect; no physical
+equivalence is claimed. Historical C8.8-F5 evidence was not reused.
 
 ## 10. Test and evidence matrix
 

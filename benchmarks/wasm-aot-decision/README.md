@@ -192,8 +192,9 @@ individually rewalked. The fixed-QEMU formal
 result completes C8.4 for the selected workload with outcome
 `aot-not-justified-on-fixed-qemu`; C8.5 through C8.7 are skipped for that
 workload and remain globally deferred. The stored next-node value remains
-`C8.8-skip-or-defer-C8.5-C8.7`; the live roadmap position is
-`c811-s3-qualified-sealed-simd-runtime-released`, which does not rewrite this
+`C8.8-skip-or-defer-C8.5-C8.7`; the C8.11 closure position was
+`c811-s3-qualified-sealed-simd-runtime-released`, while the live position is
+`c812-r1-reference-types-validation-design-frozen-pre-implementation`, neither of which rewrites this
 historical decision.
 Milk-V Duo physical testing is paused and the retained physical toolchain
 remains available for future qualification. Its runtime evidence is software
@@ -208,8 +209,9 @@ Float successor. Its fixed-QEMU release authority is limited to sealed,
 authority-free Float admission; code 5 remains permanently inert and Milk-V Duo
 observations remain optional and non-gating.
 The current roadmap position is
-`c811-s3-qualified-sealed-simd-runtime-released`; C8.11-S3 releases the sealed
-SIMD successor but does not authorize AOT.
+`c812-r1-reference-types-validation-design-frozen-pre-implementation`;
+C8.11-S3 released the sealed SIMD successor and C8.12-R1 freezes only a
+Reference Types validation design. Neither authorizes AOT.
 
 These CI-safe commands do not open a UART, invoke Docker, access the network,
 flash media, reset a board, or require an SDK:

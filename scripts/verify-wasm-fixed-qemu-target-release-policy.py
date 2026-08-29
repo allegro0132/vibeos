@@ -32,9 +32,9 @@ CONTRACT_PATH = (
     "fixed-qemu-target-release-policy-v1-contract.json"
 )
 
-EXPECTED_CONTRACT_BYTES = 28_531
+EXPECTED_CONTRACT_BYTES = 28_552
 EXPECTED_CONTRACT_SHA256 = (
-    "90cbbe6346ef44db1a84c3e4a09ea10694c67da2192f5c63b583586b478e896f"
+    "f4781035be9d6382d13e32c8cb9359c5546aa126ebf64a85a8e22c3fc5c184d6"
 )
 MAX_CONTRACT_BYTES = 64 * 1024
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
@@ -71,7 +71,7 @@ EXPECTED_APPLICATION_STATUS = {
         "c89-float-successor-design-v1-contract.json"
     ),
     "allocation_contract_schema": "vibeos.c89.float-successor-design-v1.contract",
-    "current_roadmap_position": "c811-s3-qualified-sealed-simd-runtime-released",
+    "current_roadmap_position": "c812-r1-reference-types-validation-design-frozen-pre-implementation",
     "design_node": "C8.9-S1",
     "design_node_complete": True,
     "implementation_node": "C8.9-S2",
@@ -345,12 +345,12 @@ VERIFICATION_COMMANDS = [
 
 EXPECTED_REPOSITORY_FILES = {
     ".github/workflows/ci.yml": {
-        "bytes": 32_279,
-        "sha256": "e95f079f210383c757014f340d959773e4be844a91da55f5b883b3b1daf5015b",
+        "bytes": 32_835,
+        "sha256": "2c81852df19aa36d3cc9c07d4f0e25c30559c38d2a17c8176fb7d3799abd16df",
     },
     "TESTING.md": {
-        "bytes": 140_404,
-        "sha256": "9c2b175e56a0bdad19735a2d202e21ecb2b35492de8617170174b63a4d782252",
+        "bytes": 141_744,
+        "sha256": "615044d254a5fc531ec5269481e039be4c996e79753966d4df725a1d6c9d4435",
     },
     (
         "acceptance/wasm-float-target/artifacts/"
@@ -429,36 +429,36 @@ EXPECTED_REPOSITORY_FILES = {
     "acceptance/wasm-simd-target/artifacts/c811-s3-optimized-receipt.json": {"bytes": 1_049, "sha256": "da74242e314b1bdcccc5d57b73ee4dd76c0cecbaf76c45d9f8bb6fc0fe8bee8b"},
     "acceptance/wasm-simd-target/artifacts/c811-s3-release-decision.json": {"bytes": 2_200, "sha256": "b4f0f757292039a44f28f103691b8976d25986ece1012b9c7204451f929a7e3a"},
     "benchmarks/wasm-aot-decision/README.md": {
-        "bytes": 16_694,
-        "sha256": "9ef15be82e6b36d1d0ddd794d4cc9e4734b8393fa29a998ee63d715e84cfbacb",
+        "bytes": 16_877,
+        "sha256": "8be9d319caadbec3905c438eb10680afd47576f31bffd52f67a1cd6807e087a3",
     },
     "benchmarks/wasm-runtime/README.md": {
         "bytes": 1_200,
         "sha256": "5e1e1bd8c21dc2f1badecc2f29dc52209cfa4682744c0677abdba604df1dd5b1",
     },
     "docs/WASM_AOT_DECISION.md": {
-        "bytes": 84_218,
-        "sha256": "072e2387e54bd4f4bbd9bab86d60125ce07074a511cc71fb458c8bf03a15a993",
+        "bytes": 84_380,
+        "sha256": "bed16fb7c641b27a3a6807cd3e8887a28dd7b3a7e2b956ddcee6691f28003c85",
     },
     "docs/WASM_FLOAT_PROFILE.md": {
-        "bytes": 36_469,
-        "sha256": "447c0d9e9800556e3f570cfd8baf6b85a4754325bab73113b3aaf070702d0df6",
+        "bytes": 36_571,
+        "sha256": "0609e449c5fc5ff91d77fdbd452e49a1495663f42145b473d56c1c99e92a6d50",
     },
     "docs/WASM_ROADMAP.md": {
-        "bytes": 103_218,
-        "sha256": "6eccd10f8ad14cdc0f924f177bc37a7aadfd94660422bdf2a49e6ccd222662ea",
+        "bytes": 106_240,
+        "sha256": "8b6d7f92a33011ac2ad55e8e3b43991f20b601ed86053adaa50b83fa548fb6c7",
     },
     "docs/WASM_RUNTIME_COSTS.md": {
         "bytes": 12_908,
         "sha256": "3eb717ad1d6681ae073b1ba10f872cc05830911ae7204a078ec64ad87b7534ac",
     },
     "docs/WASM_SIMD_EXECUTABLE_PROFILE.md": {
-        "bytes": 5_998,
-        "sha256": "e835430b622be54615fdcbfa4c730dc309869d33ed6301bb4e541322a26cd056",
+        "bytes": 6_105,
+        "sha256": "c14016fed9698e3fbe4bcb057fcc49f6aebfc17e7c927f4217dfe980200d51a7",
     },
     "docs/WASM_SIMD_PROFILE.md": {
-        "bytes": 8_597,
-        "sha256": "87c4706520ae66a6afb0c2b55d86dc92fe7ba2bf20a7077067a73cd74da69ce1",
+        "bytes": 8_704,
+        "sha256": "20e243b5cdf6137678bdcaa709a592730cc687fca8970c5bc1b0b15330b7e67c",
     },
 }
 
@@ -610,7 +610,7 @@ CHECK_OUTPUT = (
     "contract_is_target_evidence=false\n"
     "current_target_release_gate_satisfied=false\n"
     "policy_checkpoint_successor_state=unallocated\n"
-    "current_roadmap_position=c811-s3-qualified-sealed-simd-runtime-released\n"
+    "current_roadmap_position=c812-r1-reference-types-validation-design-frozen-pre-implementation\n"
     "physical_inputs_required=0\n"
     "physical_inputs_permitted=0\n"
     "duo_gate_effect=false\n"
@@ -1496,7 +1496,7 @@ C84_HISTORICAL_NEXT_MARKER = (
 )
 CURRENT_POSITION_MARKER = (
     "The current roadmap position is "
-    "`c811-s3-qualified-sealed-simd-runtime-released`;"
+    "`c812-r1-reference-types-validation-design-frozen-pre-implementation`;"
 )
 FLOAT_NON_PROMOTION_MARKER = (
     "The C8.8-F5 replacement remains scoped to F5 only; the independent "

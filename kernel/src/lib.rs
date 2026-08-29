@@ -1022,7 +1022,12 @@ mod wasm_aot_profile_slot;
 mod wasm_float_target;
 #[cfg(feature = "wasm-c83-runtime-costs")]
 mod wasm_runtime_costs;
-#[cfg(feature = "wasm-c810-s5-simd-qemu-qualification")]
+#[cfg(feature = "wasm-c811-s3-simd-qemu-qualification")]
+mod wasm_simd_executable_target;
+#[cfg(all(
+    feature = "wasm-c810-s5-simd-qemu-qualification",
+    not(feature = "wasm-c811-s3-simd-qemu-qualification")
+))]
 mod wasm_simd_target;
 pub use vibeos_object_store as store;
 #[cfg(any(
@@ -1718,11 +1723,20 @@ pub extern "C" fn kmain() -> ! {
         "wasm-c88-f5-float-target",
         wasm_float_target::run(),
     );
-    #[cfg(feature = "wasm-c810-s5-simd-qemu-qualification")]
+    #[cfg(all(
+        feature = "wasm-c810-s5-simd-qemu-qualification",
+        not(feature = "wasm-c811-s3-simd-qemu-qualification")
+    ))]
     exec::spawn_pinned_on(
         exec::HartId::BOOT,
         "wasm-c810-s5-simd-target",
         wasm_simd_target::run(),
+    );
+    #[cfg(feature = "wasm-c811-s3-simd-qemu-qualification")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c811-s3-simd-target",
+        wasm_simd_executable_target::run(),
     );
     #[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
     exec::spawn_pinned_on(

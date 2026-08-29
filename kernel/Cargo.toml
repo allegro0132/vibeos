@@ -233,6 +233,12 @@ wasm-c810-s5-simd-qemu-qualification = [
     "dep:vibeos-wasm-simd-target",
     "vibeos-wasm-simd-target/c810-s5-qemu-qualification",
 ]
+# C8.11-S3 independently numbered code-8 fixed-QEMU qualification. It reuses
+# the emulator isolation shell but selects a distinct producer and runtime.
+wasm-c811-s3-simd-qemu-qualification = [
+    "wasm-c810-s5-simd-qemu-qualification",
+    "vibeos-wasm-simd-target/c811-s3-qemu-qualification",
+]
 # Isolated Milk-V Duo compile-readiness image for the same portable F5
 # qualification. It carries a reserved non-evidence sentinel identity behind
 # an immutable runtime-opaque arm byte of zero; no physical capture or evidence

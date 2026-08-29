@@ -1,0 +1,68 @@
+{
+  "artifact_abi": 8,
+  "artifact_profile": "PROFILE_5_SYNC_SIMD_EXECUTABLE",
+  "artifact_profile_code": 8,
+  "authority": {
+    "code8_volatile_admission_authorized": true,
+    "durable_publication_authorized": false,
+    "ordinary_command_authorized": false,
+    "production_authorized_before_decision": false,
+    "release_authorized_before_decision": false
+  },
+  "component_profile": 5,
+  "core_profile": 5,
+  "corpus": {
+    "case_ids": [
+      "integer-lanes",
+      "float-lanes",
+      "nan-canonical",
+      "saturation-memory",
+      "fuel-adjacent",
+      "component-binding"
+    ],
+    "expected_semantic_sha256": "ddab9d539744523b332787be6f8a101de00108479c9644136538524f20cd4514",
+    "lifecycle_records": 1,
+    "semantic_records": 7
+  },
+  "engine": {
+    "package": "vibeos-wasmi-simd-executable-softfloat",
+    "relaxed_simd": false,
+    "version": "1.1.0-vibeos-simd2.1"
+  },
+  "hardware": {
+    "physical_equivalence_claimed": false,
+    "physical_inputs_permitted": 0,
+    "physical_inputs_required": 0,
+    "physical_milkv_duo_status": "paused-optional-no-gate-effect",
+    "physical_provenance": "not-claimed"
+  },
+  "isolation": {
+    "code5_permanently_inert": true,
+    "code5_promoted": false,
+    "code7_current_engine": false,
+    "code7_migrated": false,
+    "code7_promoted": false,
+    "ordinary_loader_accepts_code8": false
+  },
+  "node": "C8.11-S3",
+  "platform": "qemu-virt-rv64-tcg-icount-v1",
+  "qualification": {
+    "elf_no_native_float_helpers": true,
+    "elf_no_riscv_f_d_or_v": true,
+    "fresh_capture": true,
+    "fresh_challenge": true,
+    "fresh_run_id": true,
+    "fresh_source_commit": true,
+    "fresh_source_tree": true,
+    "normal_verification": true,
+    "optimized_verification": true,
+    "qemu_boots": 1
+  },
+  "runtime_abi": 8,
+  "schema": "vibeos.c811.s3.simd-fixed-qemu.manifest",
+  "scope": "fresh-fixed-qemu-emulator-only",
+  "stage": "executable",
+  "target": "riscv64imac-unknown-none-elf",
+  "version": 1,
+  "world": "vibe:simd/runtime@1.0.0"
+}

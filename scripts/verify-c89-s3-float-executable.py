@@ -26,6 +26,7 @@ SPEC.loader.exec_module(BASE)
 
 ORIGINAL_VALIDATE_ENVIRONMENT = BASE.validate_environment
 ORIGINAL_VALIDATE_META = BASE.validate_meta
+ORIGINAL_VERIFY_UART_BYTES = BASE.verify_uart_bytes
 ORIGINAL_META_KEYS = set(BASE.META_KEYS)
 
 BASE.__file__ = str(HERE)
@@ -234,6 +235,21 @@ def validate_meta(
     return value, counts
 
 
+def verify_uart_bytes(
+    uart: bytes,
+    environment_value: object,
+    *,
+    verify_self_identity: bool = True,
+    expected_semantic_sha256: str = BASE.EXPECTED_SEMANTIC_SHA256,
+) -> BASE.VerifiedTranscript:
+    return ORIGINAL_VERIFY_UART_BYTES(
+        uart,
+        environment_value,
+        verify_self_identity=verify_self_identity,
+        expected_semantic_sha256=expected_semantic_sha256,
+    )
+
+
 def selftest() -> None:
     uart, environment = BASE.synthetic_fixture()
     fixture_semantic = str(environment["expected_semantic_sha256"])
@@ -305,6 +321,7 @@ def selftest() -> None:
 
 BASE.validate_environment = validate_environment
 BASE.validate_meta = validate_meta
+BASE.verify_uart_bytes = verify_uart_bytes
 BASE.selftest = selftest
 
 

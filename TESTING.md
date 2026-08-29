@@ -128,7 +128,18 @@ cargo test --locked --offline -p vibeos-wasm-runtime \
   --test profile_2_candidate_inspection
 cargo test --locked --offline -p vibeos-wasm-float-candidate \
   --features c88-f2-acceptance
-python3 scripts/verify-c88-f2-supply-chain.py --self-test
+# Offline source/dependency and exact transitive F4/F5 candidate closure.
+# Recursively audits repo-local normal/dev/build/target path dependencies,
+# implicit members reached by actual path edges. Scope priority is exact:
+# invocation root when it can claim; otherwise the nearest workspace found from
+# the target itself outward, skipping excludes. A nested package+workspace is
+# rejected only when the invocation root can claim its non-excluded target.
+# Inherited templates are expanded only for discovered packages. Acceptance-only:
+# every package default is F2-inert and code 5 stays inert.
+python3 -B scripts/verify-c88-f2-supply-chain.py
+python3 -O -B scripts/verify-c88-f2-supply-chain.py
+python3 -B scripts/verify-c88-f2-supply-chain.py --self-test
+python3 -O -B scripts/verify-c88-f2-supply-chain.py --self-test
 # Pinned RISC-V compile gate; this is not target execution.
 RUSTC="$(rustup which --toolchain nightly-2026-08-01 rustc)" \
 "$(rustup which --toolchain nightly-2026-08-01 cargo)" check --locked \
@@ -760,7 +771,8 @@ differential corpus is pinned by digest `0x05e1fa8e3d779f53`; 4,096 end-to-end
 candidate-Wasmi cases are pinned by `0xee61731687e8c81d`; hostile byte mutations
 and random modules are pinned by `0xb8eca6402ca6a5df`. The offline provenance
 verifier binds the renamed fork, backend, licenses, dependency closure, patch
-digests, unchanged Profile 1, and five fail-closed mutations. The RISC-V
+digests, unchanged Profile 1, and fail-closed source, consumer, feature-route,
+workspace-scope, path, alias, and code-5 mutation classes. The RISC-V
 release-object audit distinguishes the candidate fork from stock Profile 1 and
 rejects semantic FP LLVM operations, compiler float helpers, and target F/D
 instructions; sign-only LLVM forms must lower to integer bit operations.

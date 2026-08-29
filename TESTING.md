@@ -773,9 +773,9 @@ physical-cold-boot proof.
 
 The immutable historical C8.4 `next_node` value is
 `C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position.
-The current roadmap position is `c89-s2-implemented-pre-fixed-qemu-qualification`.
+The current roadmap position is `c89-s3-qualified-sealed-float-runtime-released`.
 C8.9-S1 allocates and freezes the independent code-6 Float successor design;
-C8.9-S2 implementation is complete and C8.9-S3 qualification remains incomplete.
+C8.9-S2 implementation and C8.9-S3 fixed-QEMU qualification are complete.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -969,6 +969,26 @@ python3 -B scripts/verify-c89-float-successor-implementation.py --selftest
 python3 -O -B scripts/verify-c89-float-successor-implementation.py --selftest
 cargo test --locked --offline -p vibeos-component-runtime --features c89-float-executable --test c89_float_executable
 cargo test --locked --offline -p vibeos-component-admission --features c89-float-executable --test c89_float_executable
+```
+
+## C8.9-S3 fixed-QEMU qualification and release contract
+
+Fresh pushed source commit `2e9bc0c3648656cca8e4d198cbb6a7350975090a`
+produced one fixed-QEMU 11.0.3/TCG capture with run ID
+`d627c608da149a1324eea5a605ebd5caf4020fde48d75f0a21bea98d1873bd72`.
+Both normal and optimized independent verification accept all 1,176 records
+with semantic SHA-256
+`44cb0a12c01906b31a42fc6550d485496206ea23a08bc073a685e1b893fb94b8`.
+The result releases only the sealed authority-free code-6 Float runtime;
+ordinary command routing, durable publication, AOT, JIT, native bytes, and RWX
+remain closed. Code 5 is permanently inert. Milk-V Duo remains paused and
+supplies no gate input; no physical-equivalence claim is made.
+
+```sh
+python3 -B scripts/verify-c89-s3-fixed-qemu-qualification.py --check-contract
+python3 -O -B scripts/verify-c89-s3-fixed-qemu-qualification.py --check-contract
+python3 -B scripts/verify-c89-s3-fixed-qemu-qualification.py --selftest
+python3 -O -B scripts/verify-c89-s3-fixed-qemu-qualification.py --selftest
 ```
 
 ## Fixed-QEMU target/release policy v1

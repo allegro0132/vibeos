@@ -1,0 +1,124 @@
+{
+  "schema": "vibeos.c89.s3.fixed-qemu-qualification-v1.contract",
+  "version": 1,
+  "status": "qualified-released-sealed-float-runtime",
+  "node": "C8.9-S3",
+  "predecessors": {
+    "design_commit": "f2976a0ae0a88ea2e834c4eedb6f7221bdc6b2e3",
+    "implementation_commit": "23fb452a6b3a026b0846c60a2c2c383a0fd2b6ba",
+    "harness_commit": "2e9bc0c3648656cca8e4d198cbb6a7350975090a",
+    "harness_tree": "3de024ef329db9d15678a5f9d98ad152e28fa5d4"
+  },
+  "identity": {
+    "name": "PROFILE_3_SYNC_FLOAT_EXECUTABLE",
+    "profile_code": 6,
+    "artifact_abi": 6,
+    "runtime_abi": 6,
+    "component_profile": 3,
+    "core_profile": 3,
+    "stage": "executable",
+    "world": "vibe:float/runtime@1.0.0",
+    "engine_package": "vibeos-wasmi-softfloat",
+    "engine_version": "1.1.0-vibeos-f2.1"
+  },
+  "campaign": {
+    "platform": "qemu-virt-rv64-tcg-icount-v1",
+    "qemu_version": "11.0.3",
+    "qemu_sha256": "ef5c714232320c22561daa0998546b73672e21a2801404714dfbd4982ac7b3c0",
+    "opensbi_sha256": "49bdf7b939bda11321132d1042bf99d7324fb190f1feef423171fed3573f8705",
+    "challenge": "12dd535668ec11d17925fbe56eeeb665e5c73737a4c665db0651cce6f31b5f3d",
+    "run_id": "d627c608da149a1324eea5a605ebd5caf4020fde48d75f0a21bea98d1873bd72",
+    "records": 1176,
+    "semantic_sha256": "44cb0a12c01906b31a42fc6550d485496206ea23a08bc073a685e1b893fb94b8",
+    "normal_verified": true,
+    "optimized_verified": true,
+    "physical_inputs_required": 0,
+    "physical_inputs_permitted": 0,
+    "physical_provenance": "not-claimed",
+    "physical_equivalence_claimed": false
+  },
+  "evidence": {
+    "kernel": {
+      "bytes": 34297336,
+      "sha256": "5706e2ff80600f8be002029f8c56723cf90c7547b593718bf9b9ec2186e21037"
+    },
+    "elf_audit": {
+      "bytes": 2031,
+      "sha256": "c528267c33632f1179511b9d721fb7d633da1e2c0ec52181712dc1b99b9451d0"
+    },
+    "uart": {
+      "bytes": 389709,
+      "sha256": "38e23c94a7f7d91013e4e8e6d0f4fe7c865183359f9240c39f9cddbe46938d02"
+    },
+    "environment": {
+      "bytes": 84814,
+      "sha256": "8fee68de7c2824687cdebad131e3fd18cb3b7251abc7eb8b7ecc0980f22bd3c7",
+      "evidence_sha256": "fd2bc3741f82cab7414ffb3838e809e6c81f3bae15a31ba0cb0e0fa0bb9faeb1"
+    }
+  },
+  "published_artifacts": {
+    "manifest": {
+      "path": "acceptance/wasm-float-target/artifacts/c89-s3-qualification-manifest.json",
+      "bytes": 2467,
+      "sha256": "a9e25bcadfac2b839ae90cad0fb20e40b4a9682a7ec12e2264a0daddbec25fd4"
+    },
+    "normal_receipt": {
+      "path": "acceptance/wasm-float-target/artifacts/c89-s3-normal-receipt.json",
+      "bytes": 1529,
+      "sha256": "6c6c456255b897e0dddf5048f433e2051866f65c54000c363b7c319e1bc9ae05"
+    },
+    "optimized_receipt": {
+      "path": "acceptance/wasm-float-target/artifacts/c89-s3-optimized-receipt.json",
+      "bytes": 1531,
+      "sha256": "6906d27087033c9c84206757111885964253bd3a1b09902d185eb365a1da2989"
+    },
+    "release_decision": {
+      "path": "acceptance/wasm-float-target/artifacts/c89-s3-release-decision.json",
+      "bytes": 2117,
+      "sha256": "67bc213ddfc0d9044cd347c0f7aa3792909de4e7ae0074e6f546f0e4905d8593"
+    }
+  },
+  "harness": {
+    "runner": {
+      "path": "scripts/qemu-c89-s3-float-executable.py",
+      "bytes": 3963,
+      "sha256": "33420165c33f5c465270cfa19c8dff5f6c5f9487c9c946f64a6fa5465b5a065b"
+    },
+    "verifier": {
+      "path": "scripts/verify-c89-s3-float-executable.py",
+      "bytes": 11655,
+      "sha256": "862843ec508fd964e00fb0752a370ec10a22b2a5bb107f5788fe73c1af462734"
+    },
+    "elf_auditor": {
+      "path": "scripts/verify-c88-f5-riscv-elf.py",
+      "bytes": 92051,
+      "sha256": "3e7d9670c020de2e7ab274eb74b46d13153a0ca553f04d92134bde191e289f1b"
+    }
+  },
+  "authority": {
+    "sealed_authority_free_float_admission_released": true,
+    "code6_release_authorized": true,
+    "code6_production_authorized": true,
+    "ordinary_command_admission_authorized": false,
+    "durable_publication_authorized": false,
+    "aot_authorized": false,
+    "jit_authorized": false,
+    "native_bytes_authorized": false,
+    "rwx_authorized": false
+  },
+  "code5_boundary": {
+    "profile_code": 5,
+    "stage": "validation-only",
+    "permanently_inert": true,
+    "current_engine": false,
+    "executable": false,
+    "promotion_authorized": false,
+    "migration_authorized": false
+  },
+  "physical_duo": {
+    "status": "paused-optional",
+    "gate_effect": false,
+    "completion_effect": false,
+    "release_effect": false
+  }
+}

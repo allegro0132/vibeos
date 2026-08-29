@@ -1,0 +1,44 @@
+{
+  "schema": "vibeos.c89.s3.float-executable.mode-receipt",
+  "version": 1,
+  "status": "pass",
+  "node": "C8.9-S3",
+  "optimization_mode": "optimized",
+  "python_optimized": true,
+  "suite_id": "vibeos.c89.s3.float-executable",
+  "source": {
+    "commit": "2e9bc0c3648656cca8e4d198cbb6a7350975090a",
+    "tree": "3de024ef329db9d15678a5f9d98ad152e28fa5d4"
+  },
+  "challenge": "12dd535668ec11d17925fbe56eeeb665e5c73737a4c665db0651cce6f31b5f3d",
+  "run_id": "d627c608da149a1324eea5a605ebd5caf4020fde48d75f0a21bea98d1873bd72",
+  "platform": "qemu-virt-rv64-tcg-icount-v1",
+  "physical_inputs": 0,
+  "physical_provenance": "not-claimed",
+  "records": 1176,
+  "semantic_sha256": "44cb0a12c01906b31a42fc6550d485496206ea23a08bc073a685e1b893fb94b8",
+  "evidence": {
+    "kernel": {
+      "bytes": 34297336,
+      "sha256": "5706e2ff80600f8be002029f8c56723cf90c7547b593718bf9b9ec2186e21037"
+    },
+    "elf_audit": {
+      "bytes": 2031,
+      "sha256": "c528267c33632f1179511b9d721fb7d633da1e2c0ec52181712dc1b99b9451d0"
+    },
+    "uart": {
+      "bytes": 389709,
+      "sha256": "38e23c94a7f7d91013e4e8e6d0f4fe7c865183359f9240c39f9cddbe46938d02"
+    },
+    "environment": {
+      "bytes": 84814,
+      "sha256": "8fee68de7c2824687cdebad131e3fd18cb3b7251abc7eb8b7ecc0980f22bd3c7",
+      "evidence_sha256": "fd2bc3741f82cab7414ffb3838e809e6c81f3bae15a31ba0cb0e0fa0bb9faeb1"
+    }
+  },
+  "verifier": {
+    "bytes": 11655,
+    "sha256": "862843ec508fd964e00fb0752a370ec10a22b2a5bb107f5788fe73c1af462734"
+  },
+  "result": "code6-qualified"
+}

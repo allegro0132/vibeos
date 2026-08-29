@@ -157,9 +157,17 @@ jobs:
             --features c89-float-executable --test c89_float_executable
           cargo test --locked --offline -p vibeos-component-admission \
             --features c89-float-executable --test c89_float_executable
+      - name: Verify the C8.9-S3 fixed-QEMU qualification decision
+        # Published receipt/authority integrity only; CI does not rerun QEMU
+        # and consumes no physical input.
+        run: |
+          python3 -B scripts/verify-c89-s3-fixed-qemu-qualification.py --check-contract
+          python3 -O -B scripts/verify-c89-s3-fixed-qemu-qualification.py --check-contract
+          python3 -B scripts/verify-c89-s3-fixed-qemu-qualification.py --selftest
+          python3 -O -B scripts/verify-c89-s3-fixed-qemu-qualification.py --selftest
       - name: Verify the prospective fixed-QEMU WASM target/release policy
-        # Policy/contract integrity only: no QEMU or Duo is run, no target or
-        # release gate is satisfied. C8.9 allocation is verified separately.
+        # Policy/contract integrity only: this step runs no QEMU or Duo and
+        # itself satisfies no gate. C8.9 qualification is verified separately.
         run: |
           python3 -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract
           python3 -O -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract

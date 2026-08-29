@@ -1,6 +1,6 @@
 # Deterministic SIMD profile
 
-Status: `c810-s5-fixed-qemu-qualified-successor-review-eligible`.
+Status: `c811-s1-simd-executable-design-frozen-pre-implementation`.
 
 This document defines the independently numbered C8.10 widening. It is the
 first unfinished non-Float C8.8 feature selected after C8.9 closure. C8.10-S1
@@ -142,7 +142,10 @@ Normal and optimized verification passed, and the final ELF audit found no
 forbidden helper or RISC-V F/D/V opcode. The decision makes only a later,
 currently unallocated successor design review eligible. It does not make code
 7 executable/current, authorize durable or production use, or allocate the
-next profile, ABI, revision, or engine.
+next profile, ABI, revision, or engine. The later C8.11-S1 design now allocates
+that successor independently as code/ABIs 8; it does not rewrite this C8.10
+decision or promote code 7. See
+[WASM_SIMD_EXECUTABLE_PROFILE.md](WASM_SIMD_EXECUTABLE_PROFILE.md).
 
 ```sh
 python3 -B scripts/verify-c810-s5-fixed-qemu-qualification.py --check-contract

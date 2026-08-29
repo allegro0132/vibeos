@@ -24,6 +24,7 @@ SOURCE_TREE = "f7ad8fba9912ddfda878ebf974266bf8befc19bb"
 RUN_ID = "ca57bdf2af07484ef48e8ef09e51700e1f5b7a169de04c58594b66a96c7c8b61"
 SEMANTIC_SHA256 = "6b34b541a42fdf838eccd55e43473a4154421eadc0e3b4292a5a89fde54ae1c6"
 POSITION = "c810-s5-fixed-qemu-qualified-successor-review-eligible"
+LIVE_POSITION = "c811-s1-simd-executable-design-frozen-pre-implementation"
 
 
 class Failure(RuntimeError):
@@ -142,7 +143,7 @@ def verify_repository() -> None:
     ci = read_regular(ROOT / ".github/workflows/ci.yml").decode()
     testing = read_regular(ROOT / "TESTING.md").decode()
     for text, label in ((docs, "roadmap"), (simd, "SIMD profile"), (testing, "TESTING")):
-        require(POSITION in text, f"missing live position: {label}")
+        require(LIVE_POSITION in text, f"missing live position: {label}")
     require("Verify the C8.10-S5 fixed-QEMU qualification decision" in ci, "missing CI decision step")
 
 

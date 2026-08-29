@@ -30,10 +30,11 @@ implements and audits its isolated deterministic fixed-SIMD engine. C8.10-S3
 closes Component containment and fixed differential/mutation corpora. C8.10-S4
 closes the default-off volatile admission/lifecycle, one-instance quota,
 explicit recovery/revocation, and durable loader rejection. C8.10-S5 now
-passes a fresh normal/optimized fixed-QEMU campaign and makes only an
-unallocated successor design review eligible. The current position is
-`c810-s5-fixed-qemu-qualified-successor-review-eligible`.
-Every later non-Float widening remains separately unallocated and incomplete.
+passes a fresh normal/optimized fixed-QEMU campaign and makes only a successor
+design review eligible. C8.11-S1 now allocates that successor as a distinct
+code-8 executable SIMD design without promoting code 7. The current position
+is `c811-s1-simd-executable-design-frozen-pre-implementation`.
+Every later feature widening remains separately unallocated and incomplete.
 The earlier non-numbered fixed-QEMU
 target/release policy checkpoint makes fresh source-bound
 `qemu-virt-rv64-tcg-icount-v1` evidence the prospective generic WASM
@@ -78,6 +79,9 @@ design/implementation/qualification sequence; it does not rewrite that charter.
 **C8.9 status (2026-08-29): C8.9-S1 through C8.9-S3 complete.**
 
 **C8.10 status (2026-08-29): C8.10-S1 through C8.10-S5 complete.**
+
+**C8.11 status (2026-08-29): C8.11-S1 design freeze complete; C8.11-S2 and
+C8.11-S3 incomplete.**
 
 ---
 
@@ -894,6 +898,7 @@ component security boundary is measured and stable.
 | C8.8 | Widen profiles one feature at a time | Float, SIMD, references, exceptions, memory64, multiple memories, GC, threads or broader WASI each require separate semantics and evidence |
 | C8.9 | Activate Float under an independent identity | A new code-6 executable identity must pass separately frozen design, implementation/admission, and fresh fixed-QEMU qualification nodes; code 5 remains permanently inert |
 | C8.10 | Widen fixed-width SIMD under an independent validation identity | New code 7 freezes fixed SIMD 1.0 with deterministic software-float lanes, no public `v128` boundary, no relaxed SIMD, and staged engine, containment, admission/lifecycle, and fixed-QEMU gates before any successor review |
+| C8.11 | Allocate an independent executable SIMD successor | New code 8 and ABIs 8 freeze fixed SIMD semantics, an exact engine identity, closed authority-free world, code-7 non-promotion, implementation gates, and fresh fixed-QEMU qualification before release |
 
 The C8.3 row above is retained verbatim as the historical v1 acceptance text.
 C1 through C8.3 are treated as complete under the project's historical-evidence
@@ -1299,13 +1304,45 @@ uses fresh fixed-QEMU evidence to decide successor-review eligibility only.
 S5 passed fresh fixed-QEMU evidence at source commit
 `4b2add7ccf9dee18891b89548ee24a3e6d828f98`, run ID
 `ca57bdf2af07484ef48e8ef09e51700e1f5b7a169de04c58594b66a96c7c8b61`,
-under normal and optimized verification. The current roadmap position is
-`c810-s5-fixed-qemu-qualified-successor-review-eligible`. The next step is an
-unallocated successor design review, not an automatically authorized design.
+under normal and optimized verification. This made a successor design review
+eligible but did not itself allocate or authorize one.
 Code 5 remains permanently inert, code 6 gains no SIMD, and code 7 remains
 validation-only, non-current, non-durable, unreleased, and non-production.
 Milk-V Duo remains paused, optional, non-gating, and supplies zero input.
 See [WASM_SIMD_PROFILE.md](WASM_SIMD_PROFILE.md) for the frozen design.
+
+## 9.3 C8.11 independent executable SIMD successor
+
+C8.11 follows the same non-promotion rule used by the Float successor. It does
+not reinterpret code 7. C8.11-S1 allocates
+`PROFILE_5_SYNC_SIMD_EXECUTABLE`, profile code 8, artifact/runtime ABI 8,
+Component/Core profile 5, and stage `Executable`. It freezes exact Core,
+Component, Canonical ABI, wasm-tools, WIT-world, semantic, engine, authority,
+and fixed-QEMU identities under
+[`c811-simd-successor-design-v1-contract.json`](../acceptance/wasm-simd-target/artifacts/c811-simd-successor-design-v1-contract.json).
+
+The selected S2 engine is
+`vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd2.1`, derived from the qualified
+C8.10 engine tree but independently named and not yet materialized or bound.
+Fixed-width SIMD 1.0 and deterministic software-float lanes are retained;
+relaxed SIMD and every adjacent proposal remain forbidden. `v128` remains
+Core-internal and cannot cross WIT, Canonical ABI, or host boundaries.
+
+The ordered nodes are:
+
+| # | Scope | Exit gate |
+|---|---|---|
+| C8.11-S1 | Freeze independent design | Code/ABIs 8, profile 5, exact revisions, world, engine, semantics, code-5/code-7 non-promotion, and target policy are frozen |
+| C8.11-S2 | Implement runtime and admission | Code-8 codec, exact current engine, validator/executor, authority-free admission, lifecycle/accounting, durable rejection, supply-chain closure, and RISC-V audit pass |
+| C8.11-S3 | Qualify and decide release | Fresh source-bound normal and optimized fixed-QEMU evidence passes the node-specific contract before any release or production authority is granted |
+
+The current roadmap position is
+`c811-s1-simd-executable-design-frozen-pre-implementation`; C8.11-S2 is next.
+S1 grants no current-engine binding, admission, durable publication, release,
+or production authority. Code 5 remains permanently inert, code 7 remains
+validation-only and non-migratable, and historical C8.10 evidence cannot
+satisfy C8.11. Milk-V Duo remains paused with zero gate input. See
+[WASM_SIMD_EXECUTABLE_PROFILE.md](WASM_SIMD_EXECUTABLE_PROFILE.md).
 
 ## 10. Test and evidence matrix
 

@@ -1,7 +1,8 @@
 # C8.8 deterministic scalar-float profile
 
 **Status (2026-08-29): C8.8-F1 through C8.8-F4 are complete. F5 remains open;
-its host/fixed-QEMU sub-gate and Duo compile-readiness slice pass.** F1 freezes
+its host/fixed-QEMU sub-gate, Duo compile-readiness slice, and disjoint
+physical-v1 host-verifier contract pass.** F1 freezes
 the immutable validation-only artifact identity and deterministic semantic
 contract. F2 supplies an independently identified, acceptance-only Core
 validator and software-float executor behind `c88-f2-acceptance`; it does not
@@ -13,10 +14,13 @@ replayed through the existing cleanup machine, not runtime wiring. F4 adds a
 separate default-off candidate admission and lifecycle behind acceptance-only
 feature gates; the image adapter binds that lifecycle to one exact image pin.
 It does not add a production command, durable object/publication, or
-current-engine binding. The latest non-physical F5 work passes at pushed
-implementation commit `c4ea5e5ca1de622884f33c01bf06653f498360aa`.
-Milk-V Duo physical qualification remains paused and unclaimed, so F5, Float,
-and C8.8 are not fully closed and no executable successor is authorized.
+current-engine binding. The fixed-QEMU and readiness implementation passes at
+pushed commit `c4ea5e5ca1de622884f33c01bf06653f498360aa`; the later host-only
+physical transcript/campaign verifier contract passes at pushed commit
+`f502240a88eeb218ca923276675d7b6dec3e4030`, tree
+`d63a2a1ff68ab84586a1b53ee24982e232bc5b0f`. Milk-V Duo physical
+qualification remains paused and unclaimed, so F5, Float, and C8.8 are not
+fully closed and no executable successor is authorized.
 
 Milk-V Duo physical testing remains paused at operator request. Fixed QEMU is
 the selected target for F5 emulator qualification and has formal execution
@@ -371,17 +375,41 @@ because source-build provenance is not claimed. Its result remains
 `source_build_provenance=not-claimed`.
 
 The sentinel ELF and run ID can never satisfy the physical gate, and patching
-the readiness image is not an arming procedure. Resumed testing requires a
-separately reviewed physical feature/arm contract with formal, non-sentinel
-bindings. The same-identity rule below applies only across the three captures
-of that future physical run.
+the readiness image is not an arming procedure. The subsequent, fully disjoint
+host-verifier node at pushed commit
+`f502240a88eeb218ca923276675d7b6dec3e4030`, tree
+`d63a2a1ff68ab84586a1b53ee24982e232bc5b0f`, freezes these identities:
+
+| Duo physical-v1 verifier artifact | Bytes | SHA-256 |
+|---|---:|---|
+| Transcript/campaign contract | 5,605 | `01284fa4bb76a24e0a40e39fddec109e98ff36ec8912bb806f7a52a520a6617e` |
+| Transcript schema | 5,923 | `08007a5e68e53181592dd9eaecf124a630b2eddfdc20c146504ff1d4df8811f5` |
+| Host-only verifier | 56,129 | `09a98255b9deb8c5d14b19ecb4c0c5725cfbef25a60b1d84f2f4bbfbda649928` |
+| Independent shared semantic oracle | 134,348 | `36451c3c614486a714b3466b77b329fee8a1368603ffaa9d2925b75b3f666686` |
+
+Suite `vibeos.c88.f5.float-target.duo-physical-v1` has a separate run-ID
+domain, UART family, schemas, and future arm marker. Its verifier rejects
+readiness, QEMU, and C8.4 families, validates exactly 146 Core, 13 F3, 12 F4,
+1,000 fuel, and 5 lifecycle records, and recomputes the frozen 1,176-record
+semantic digest. Normal and optimized contract checks and a 53-mutation
+synthetic self-test produce byte-identical results; an in-memory translation
+of the retained formal-QEMU records independently exercises the normal
+`51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`
+branch without claiming physical origin.
+
+This is a transcript/campaign verifier contract only. It does not add the
+reserved future feature, arm, producer, image, package, serial/device access,
+capture, or physical evidence. A future separately reviewed producer must use
+formal non-sentinel bindings, and the three-capture campaign must externally
+bind the build environment, package envelope, kernel ELF, and full SD image.
 
 The future physical gate requires three operator-confirmed independent power
 cycles and cold boots of one byte-identical kernel/challenge/run ID, unique
 capture boot IDs with ordinals 0 through 2, and strict metadata, 1,176 records,
 END, PASS, terminal quiescence, and operator power-off ordering. All present
 counters are zero and `gate_satisfied=false`. The fixed-QEMU result remains
-emulator evidence with `physical_provenance=not-claimed`; the Duo result is
-compile/static evidence only. Milk-V Duo qualification remains deferred, so
-this section does not close F5, Float, or C8.8 and does not allocate or
-authorize a separately numbered executable successor.
+emulator evidence with `physical_provenance=not-claimed`; the Duo readiness
+result remains compile/static evidence, while physical-v1 remains a
+host-verifier-only non-evidence contract. Milk-V Duo qualification remains
+deferred, so this section does not close F5, Float, or C8.8 and does not
+allocate or authorize a separately numbered executable successor.

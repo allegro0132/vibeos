@@ -316,6 +316,17 @@ jobs:
             --features c813-e2-acceptance
           cargo test --locked --offline -p vibeos-component-admission \
             --features c813-reference-executable --lib
+      - name: Verify the C8.13-E3 fixed-QEMU qualification closure
+        # Replays sealed evidence/contracts only; CI does not boot a second
+        # formal QEMU instance and never consumes physical inputs.
+        run: |
+          python3 -B scripts/qemu-c813-e3-reference.py --selftest
+          python3 -B scripts/verify-c813-e3-reference-evidence.py --selftest
+          python3 -O -B scripts/verify-c813-e3-reference-evidence.py --selftest
+          python3 -B scripts/verify-c813-e3-fixed-qemu-qualification.py --check-contract
+          python3 -O -B scripts/verify-c813-e3-fixed-qemu-qualification.py --selftest
+          cargo test --locked --offline -p vibeos-wasm-reference-target \
+            --features c813-e3-qemu-qualification
       - name: Verify the prospective fixed-QEMU WASM target/release policy
         # Policy/contract integrity only: this step runs no QEMU or Duo and
         # itself satisfies no gate. C8.9 qualification is verified separately.

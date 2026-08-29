@@ -780,8 +780,8 @@ The previous roadmap position was
 `c811-s1-simd-executable-design-frozen-pre-implementation`. The implementation
 position was `c811-s2-simd-executable-implemented-pre-fixed-qemu`, and C8.11
 closed at `c811-s3-qualified-sealed-simd-runtime-released`. The current roadmap
-position is `c813-e2-reference-executable-implemented-pre-qemu`;
-C8.10-S1 through C8.10-S5, C8.11-S1 through C8.11-S3, C8.12-R1/R2/R3, and C8.13-E1/E2 are complete.
+position is `c813-e3-qualified-sealed-reference-runtime-released`;
+C8.10-S1 through C8.10-S5, C8.11-S1 through C8.11-S3, C8.12-R1/R2/R3, and C8.13-E1/E2/E3 are complete.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -1210,8 +1210,8 @@ python3 -B scripts/verify-c813-reference-executable-design.py --selftest
 python3 -O -B scripts/verify-c813-reference-executable-design.py --selftest
 ```
 
-Code 5 remains permanently inert. Fixed QEMU is reserved for C8.13-E3;
-Milk-V Duo remains paused and supplies zero inputs.
+Code 5 remains permanently inert. The fixed-QEMU qualification reserved for
+C8.13-E3 is complete; Milk-V Duo remains paused and supplied zero inputs.
 
 ## C8.13-E2 Reference Types executable implementation
 
@@ -1226,6 +1226,24 @@ python3 -B scripts/verify-c813-reference-executable-implementation.py
 python3 -O -B scripts/verify-c813-reference-executable-implementation.py --selftest
 cargo test --locked --offline -p vibeos-wasm-reference-executable --features c813-e2-acceptance
 cargo test --locked --offline -p vibeos-component-admission --features c813-reference-executable --lib
+```
+
+## C8.13-E3 fixed-QEMU qualification
+
+E3 binds one clean source commit and tree to one fresh challenge/run ID and one
+fixed QEMU 11.0.3 boot. The same retained UART, environment, kernel, and ELF
+audit pass normal and optimized verification. This releases only the sealed,
+authority-free, volatile code-10 runtime. Code 5 remains permanently inert;
+code 9 remains validation-only and non-migratable. Milk-V Duo contributes zero
+inputs and has zero gate effect.
+
+```sh
+python3 -B scripts/qemu-c813-e3-reference.py --selftest
+python3 -B scripts/verify-c813-e3-reference-evidence.py --selftest
+python3 -O -B scripts/verify-c813-e3-reference-evidence.py --selftest
+python3 -B scripts/verify-c813-e3-fixed-qemu-qualification.py --check-contract
+python3 -O -B scripts/verify-c813-e3-fixed-qemu-qualification.py --selftest
+cargo test --locked --offline -p vibeos-wasm-reference-target --features c813-e3-qemu-qualification
 ```
 
 ## C8.10-S5 fixed-QEMU qualification

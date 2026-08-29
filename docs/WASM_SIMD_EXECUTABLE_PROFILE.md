@@ -1,7 +1,7 @@
 # Executable SIMD successor profile
 
 Status: C8.11 closed at `c811-s3-qualified-sealed-simd-runtime-released`; the
-live roadmap is `c813-e2-reference-executable-implemented-pre-qemu`.
+live roadmap is `c813-e3-qualified-sealed-reference-runtime-released`.
 
 C8.11 allocates an executable successor to the completed code-7 fixed-width
 SIMD validation program. It is a new identity, not an in-place promotion or

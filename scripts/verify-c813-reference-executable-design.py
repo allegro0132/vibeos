@@ -24,7 +24,7 @@ CONTRACT = (
 BYTES = 4_616
 SHA256 = "a1f20d7ebc64bd9bfdc32eade9728eb727ef4c92af4fc58fcca541280a694363"
 POSITION = "c813-e1-reference-executable-design-frozen-pre-implementation"
-LIVE_POSITION = "c813-e2-reference-executable-implemented-pre-qemu"
+LIVE_POSITION = "c813-e3-qualified-sealed-reference-runtime-released"
 AUTHORIZATION = (
     ROOT
     / "acceptance/wasm-reference-target/artifacts/"

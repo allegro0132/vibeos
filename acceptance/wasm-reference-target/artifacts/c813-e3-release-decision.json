@@ -1,0 +1,41 @@
+{
+  "authority": {
+    "durable_publication": false,
+    "migration": false,
+    "ordinary_command": false,
+    "production_general": false,
+    "sealed_volatile_code10_runtime": true
+  },
+  "basis": {
+    "challenge": "084259602489bf4b64a4dcee876bdd064bb0174509349387bb05afeb3a55c0eb",
+    "normal_verified": true,
+    "optimized_verified": true,
+    "qemu_boots": 1,
+    "run_id": "11f097eaa1ab51be766811018d0955ccc722f83feba7b37d0f095a31ae3d85b7",
+    "semantic_sha256": "6a654a8428f4f4479db637ab90d391c989c43b2c67dfc51570bd4ac617cc1a49",
+    "source_commit": "cdeefb93564ad0269306d27fabe879a8d88ac1df",
+    "source_tree": "e27f0978db7b1ed70c9dcae028b6109d2717cf4e"
+  },
+  "boundaries": {
+    "code5_permanently_inert": true,
+    "code9_current": false,
+    "code9_executable": false,
+    "code9_migratable": false,
+    "physical_duo_gate_effect": false,
+    "physical_inputs": 0
+  },
+  "decision": "release-sealed-volatile-code10-reference-runtime",
+  "identity": {
+    "artifact_abi": 10,
+    "artifact_profile_code": 10,
+    "component_profile": 7,
+    "core_profile": 7,
+    "engine": "vibeos-wasmi-reference-executable@1.1.0-vibeos-ref2.1",
+    "runtime_abi": 10,
+    "world": "vibe:references/runtime@1.0.0"
+  },
+  "node": "C8.13-E3",
+  "schema": "vibeos.c813.e3.reference-release-decision",
+  "status": "qualified-released-sealed-volatile-only",
+  "version": 1
+}

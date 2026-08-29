@@ -1,6 +1,6 @@
 # Reference Types executable successor profile
 
-Status: `c813-e2-reference-executable-implemented-pre-qemu`.
+Status: `c813-e3-qualified-sealed-reference-runtime-released`.
 
 C8.13 is the independently numbered executable successor made eligible by the
 C8.12-R3 fixed-QEMU decision. It does not promote or reinterpret validation-only
@@ -31,7 +31,9 @@ binding, fuel-bounded executor, and sealed authority-free volatile admission
 lifecycle. The executor has no imports and exposes only integer values; Core
 references remain internal. Cancellation, fault, recovery, and revocation are
 explicit. Durable graph publication, migration, ordinary command admission,
-production authority, and release remain unavailable pending E3.
+production authority remain unavailable. E3 releases only this sealed volatile
+runtime after one fixed-QEMU boot and normal/optimized verification of the same
+capture; it grants no durable, migration, or ordinary-command authority.
 
 | Node | Exit gate |
 |---|---|
@@ -44,7 +46,15 @@ remains validation-only, non-current, non-executable, and non-migratable. Code
 8 retains exactly its prior SIMD scope. Fixed QEMU is emulator-only; Milk-V
 Duo remains paused, optional, and has zero gate effect.
 
+The E3 evidence is source-bound to commit `cdeefb93564ad0269306d27fabe879a8d88ac1df`
+and tree `e27f0978db7b1ed70c9dcae028b6109d2717cf4e`; run ID
+`11f097eaa1ab51be766811018d0955ccc722f83feba7b37d0f095a31ae3d85b7`
+produced semantic SHA-256
+`6a654a8428f4f4479db637ab90d391c989c43b2c67dfc51570bd4ac617cc1a49`.
+
 The canonical design contract is
 [`c813-reference-executable-design-v1-contract.json`](../acceptance/wasm-reference-target/artifacts/c813-reference-executable-design-v1-contract.json).
 The implementation contract is
 [`c813-reference-executable-implementation-v1-contract.json`](../acceptance/wasm-reference-target/artifacts/c813-reference-executable-implementation-v1-contract.json).
+The qualification contract is
+[`c813-e3-fixed-qemu-qualification-v1-contract.json`](../acceptance/wasm-reference-target/artifacts/c813-e3-fixed-qemu-qualification-v1-contract.json).

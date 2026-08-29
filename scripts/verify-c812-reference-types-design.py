@@ -22,7 +22,7 @@ CONTRACT_SHA256 = "ed8fdbe4964b7a42967258dabb5871c360899d1006666a7f9ab54c6b5f33d
 BASIS_COMMIT = "4402f76fa2adb690ee591f81bbca0f3588dd089e"
 BASIS_TREE = "d7049e03b9c6a212b2a86377b42c752e9da5977d"
 POSITION = "c812-r1-reference-types-validation-design-frozen-pre-implementation"
-LIVE_POSITION = "c813-e2-reference-executable-implemented-pre-qemu"
+LIVE_POSITION = "c813-e3-qualified-sealed-reference-runtime-released"
 COMMANDS = (
     "python3 -B scripts/verify-c812-reference-types-design.py --check-contract",
     "python3 -O -B scripts/verify-c812-reference-types-design.py --check-contract",

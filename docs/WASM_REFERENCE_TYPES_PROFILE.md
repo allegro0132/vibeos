@@ -1,6 +1,6 @@
 # Reference Types validation profile
 
-Status: `c812-r2-reference-types-validation-implemented-pre-fixed-qemu`.
+Status: `c812-r3-qualified-reference-validation-successor-review-eligible`.
 
 C8.12 is the next one-feature widening after the released code-8 SIMD runtime.
 C8.12-R1 allocates a fresh validation-only identity; it does not reinterpret or
@@ -74,9 +74,23 @@ Fixed QEMU is the formal C8.12 qualification target. It is emulator-scoped and
 claims no physical equivalence. Milk-V Duo supplies zero inputs and remains a
 paused optional observation; unrelated hardware gates are unchanged.
 
+R3 binds pushed source commit
+`43516cd6fe4d88c583f681714950884dc8660d4c` and tree
+`89ca3d099ef3981cc2d760a8993d47d5a6585cc7` to one QEMU 11.0.3 rv64
+TCG/icount boot. All eight exact cases and the containment record pass, with
+208 mutations rejected and 48 accepted only as inert nonsemantic/name changes.
+The nine-record semantic SHA-256 is
+`bf33470617822af905ab8877797416e79aed3cde5a257689b3bbdda4df156279`.
+Normal and optimized verification and the final-ELF no-F/D/V/no-native-float
+audit pass. This opens only design review for a separately numbered executable
+successor; it allocates nothing and grants code 9 no current engine, execution,
+admission, durable, migration, production, or release authority.
+
 Code 5 remains permanently inert. Code 7 remains validation-only and
 non-migratable. Code 8 retains exactly its already released sealed,
 authority-free volatile SIMD scope and gains no reference-types support.
 
 The canonical R1 contract is
 [`c812-reference-types-design-v1-contract.json`](../acceptance/wasm-reference-target/artifacts/c812-reference-types-design-v1-contract.json).
+The canonical R3 qualification contract is
+[`c812-r3-fixed-qemu-qualification-v1-contract.json`](../acceptance/wasm-reference-target/artifacts/c812-r3-fixed-qemu-qualification-v1-contract.json).

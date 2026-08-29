@@ -34,7 +34,7 @@ CONTRACT_PATH = (
 
 EXPECTED_CONTRACT_BYTES = 26_768
 EXPECTED_CONTRACT_SHA256 = (
-    "9fa8f635f7a1102e5d545b2d085c96f81c980d1e4ee038e0da41d8392db338c1"
+    "c4d972dd97b4db068afca1702c61b9b98c511acd43392bc892eaa91088b3d19b"
 )
 MAX_CONTRACT_BYTES = 64 * 1024
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
@@ -340,8 +340,8 @@ EXPECTED_REPOSITORY_FILES = {
         "sha256": "43938f5b95113c2159bc1d13254c3bdb83f823c4961d14f72e46c9ab3e17fa79",
     },
     "TESTING.md": {
-        "bytes": 137_371,
-        "sha256": "d179637cf1296207e18b7b6fda6b457bc8f6ddc1134189c13b87d8b0df72b10e",
+        "bytes": 137_382,
+        "sha256": "4cd0428f68b299a437930939f8c30d464473f58683ec4e9d7d6b81fb56e1395b",
     },
     (
         "acceptance/wasm-float-target/artifacts/"
@@ -405,8 +405,8 @@ EXPECTED_REPOSITORY_FILES = {
         "acceptance/wasm-simd-target/artifacts/"
         "c811-simd-successor-design-v1-contract.json"
     ): {
-        "bytes": 8_256,
-        "sha256": "1495fed63f6fbfe275a1079e0177e5e924b1bd2532c997450a9410d4332a72af",
+        "bytes": 8_267,
+        "sha256": "5995b8513f182d891c30d95530d31f6b571c14b0649c39c438f99990f58133ee",
     },
     "benchmarks/wasm-aot-decision/README.md": {
         "bytes": 16_720,
@@ -425,16 +425,16 @@ EXPECTED_REPOSITORY_FILES = {
         "sha256": "e7a38e4ee97dcee6e3f0327f58e161235c42a45d8934e49d825b66f158a6f253",
     },
     "docs/WASM_ROADMAP.md": {
-        "bytes": 102_110,
-        "sha256": "5c699a1a1e1630aba3c4f1c5f5e86b5e6f0f5a9cff885374dc54fb6c2377970c",
+        "bytes": 102_121,
+        "sha256": "923b8e664955ed74033c653e4f474fd51453e0daa3bc7a6325895643db54a5a1",
     },
     "docs/WASM_RUNTIME_COSTS.md": {
         "bytes": 12_908,
         "sha256": "3eb717ad1d6681ae073b1ba10f872cc05830911ae7204a078ec64ad87b7534ac",
     },
     "docs/WASM_SIMD_EXECUTABLE_PROFILE.md": {
-        "bytes": 3_882,
-        "sha256": "bc668d0c31c9c213927fe10fb85b647403c82ae2160a4e9bf3a303ea788f46cf",
+        "bytes": 3_893,
+        "sha256": "9b9e020c65375a2c408b158b5094f400918c2b5c224fc5bf36ebc61d60305c72",
     },
     "docs/WASM_SIMD_PROFILE.md": {
         "bytes": 8_503,

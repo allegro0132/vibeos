@@ -47,7 +47,7 @@ flat values, host imports, or host exports. The byte-list world is an
 authority-free envelope and does not widen the Component boundary.
 
 C8.11-S1 selects
-`vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd2.1`, derived from the qualified
+`vibeos-wasmi-simd-executable-softfloat@1.1.0-vibeos-simd2.1`, derived from the qualified
 `1.1.0-vibeos-simd1.1` tree at predecessor commit
 `2038c3134fe94d1ca297764c9fd8ee7d39a24123`. S2 must materialize and audit the
 new package identity without changing the frozen SIMD semantics or fuel

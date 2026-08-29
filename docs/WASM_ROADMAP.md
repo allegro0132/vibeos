@@ -1322,7 +1322,7 @@ and fixed-QEMU identities under
 [`c811-simd-successor-design-v1-contract.json`](../acceptance/wasm-simd-target/artifacts/c811-simd-successor-design-v1-contract.json).
 
 The selected S2 engine is
-`vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd2.1`, derived from the qualified
+`vibeos-wasmi-simd-executable-softfloat@1.1.0-vibeos-simd2.1`, derived from the qualified
 C8.10 engine tree but independently named and not yet materialized or bound.
 Fixed-width SIMD 1.0 and deterministic software-float lanes are retained;
 relaxed SIMD and every adjacent proposal remain forbidden. `v128` remains

@@ -1,0 +1,19 @@
+[package]
+name = "vibeos-wasm-reference-executable"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "C8.13-E2 independently numbered executable Reference Types runtime"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+c813-e2-acceptance = ["dep:wasmi-reference-executable", "dep:vibeos-wasm-reference-candidate", "vibeos-wasm-reference-candidate/c812-r2-acceptance"]
+
+[dependencies]
+vibeos-component-format = { path = "../component-format" }
+vibeos-wasm-reference-candidate = { path = "../wasm-reference-candidate", default-features = false, optional = true }
+wasmi-reference-executable = { package = "vibeos-wasmi-reference-executable", path = "../wasmi-reference-executable", version = "=1.1.0-vibeos-ref2.1", default-features = false, features = ["extra-checks", "prefer-btree-collections"], optional = true }
+
+[dev-dependencies]
+wat = { version = "=1.255.0", default-features = false }

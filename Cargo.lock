@@ -1518,6 +1518,7 @@ dependencies = [
  "vibeos-component-host",
  "vibeos-component-runtime",
  "vibeos-core",
+ "vibeos-wasm-reference-executable",
  "vibeos-wasm-runtime",
  "vibeos-wasm-simd-candidate",
  "vibeos-wasm-simd-executable",
@@ -2010,6 +2011,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-wasm-reference-executable"
+version = "0.1.0"
+dependencies = [
+ "vibeos-component-format",
+ "vibeos-wasm-reference-candidate",
+ "vibeos-wasmi-reference-executable",
+ "wat",
+]
+
+[[package]]
 name = "vibeos-wasm-reference-target"
 version = "0.1.0"
 dependencies = [
@@ -2118,6 +2129,13 @@ name = "vibeos-wasmi-ir-softfloat"
 version = "1.1.0-vibeos-f2.1"
 dependencies = [
  "vibeos-wasmi-core-softfloat",
+]
+
+[[package]]
+name = "vibeos-wasmi-reference-executable"
+version = "1.1.0-vibeos-ref2.1"
+dependencies = [
+ "vibeos-wasmi-softfloat",
 ]
 
 [[package]]

@@ -105,6 +105,8 @@ mod information_flow;
 mod preview1;
 #[cfg(feature = "preview1-corpus-acceptance")]
 mod preview1_corpus;
+#[cfg(feature = "c813-reference-executable")]
+mod reference_executable;
 #[cfg(feature = "c811-simd-executable")]
 mod simd_executable;
 
@@ -116,6 +118,8 @@ pub use information_flow::*;
 pub use preview1::*;
 #[cfg(feature = "preview1-corpus-acceptance")]
 pub use preview1_corpus::*;
+#[cfg(feature = "c813-reference-executable")]
+pub use reference_executable::*;
 #[cfg(feature = "c811-simd-executable")]
 pub use simd_executable::*;
 
@@ -455,7 +459,8 @@ impl InstanceLimits {
         feature = "c88-f4-acceptance",
         feature = "c89-float-executable",
         feature = "c810-s4-acceptance",
-        feature = "c811-simd-executable"
+        feature = "c811-simd-executable",
+        feature = "c813-reference-executable"
     ))]
     fn validate_float_acceptance(self) -> Result<(), AdmissionError> {
         let maximum_memory = (PROFILE_1_LIMITS.max_memory_pages as usize)

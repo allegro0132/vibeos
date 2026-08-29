@@ -24,6 +24,7 @@ CONTRACT = (
 BYTES = 4_616
 SHA256 = "a1f20d7ebc64bd9bfdc32eade9728eb727ef4c92af4fc58fcca541280a694363"
 POSITION = "c813-e1-reference-executable-design-frozen-pre-implementation"
+LIVE_POSITION = "c813-e2-reference-executable-implemented-pre-qemu"
 AUTHORIZATION = (
     ROOT
     / "acceptance/wasm-reference-target/artifacts/"
@@ -286,24 +287,20 @@ def verify_files(value: dict[str, Any]) -> None:
             "component-format/src/artifact.rs",
         )
     )
-    require(
-        "PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE" not in rust
-        and "PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_PROFILE_CODE" not in rust,
-        "code 10 was materialized during design-only E1",
-    )
+    require("PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE" in rust, "code 10 E2 materialization missing")
     cargo = read(ROOT / "Cargo.toml").decode()
     lock = read(ROOT / "Cargo.lock").decode()
     require(
-        "wasmi-reference-executable" not in cargo
-        and "vibeos-wasmi-reference-executable" not in lock,
-        "selected E2 facade was materialized during E1",
+        "wasmi-reference-executable" in cargo
+        and "vibeos-wasmi-reference-executable" in lock,
+        "selected E2 facade missing",
     )
     for path in (
         "docs/WASM_ROADMAP.md",
         "docs/WASM_REFERENCE_TYPES_EXECUTABLE_PROFILE.md",
         "TESTING.md",
     ):
-        require(POSITION in read(ROOT / path).decode(), f"live position missing: {path}")
+        require(LIVE_POSITION in read(ROOT / path).decode(), f"live position missing: {path}")
     ci = read(ROOT / ".github/workflows/ci.yml").decode()
     require(
         "Verify the C8.13-E1 Reference Types executable successor design" in ci,

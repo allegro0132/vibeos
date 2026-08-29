@@ -8,6 +8,7 @@ default = []
 c89-float-executable = []
 c810-simd-candidate-inspection = ["wasmparser/simd"]
 c811-simd-executable = ["c810-simd-candidate-inspection"]
+c813-reference-executable = []
 
 [dependencies]
 vibeos-component-format = { path = "../component-format" }

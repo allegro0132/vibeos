@@ -1,7 +1,7 @@
 # Deterministic SIMD profile
 
 Status: C8.11 closed at `c811-s3-qualified-sealed-simd-runtime-released`; the
-live roadmap is `c813-e1-reference-executable-design-frozen-pre-implementation`
+live roadmap is `c813-e2-reference-executable-implemented-pre-qemu`
 (the previous successor-design position was
 `c811-s1-simd-executable-design-frozen-pre-implementation`).
 

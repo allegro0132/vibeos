@@ -149,6 +149,23 @@ pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_WASI_REVISION: &str =
 pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_WORLD: &str =
     "vibe:references/validation@1.0.0";
 
+/// C8.13's independently numbered executable Reference Types successor.
+/// Code 9 remains validation-only and is never reinterpreted as this identity.
+pub const PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_PROFILE_CODE: u16 = 10;
+pub const PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_ARTIFACT_ABI_VERSION: u16 = 10;
+pub const PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_COMPONENT_PROFILE_VERSION: u16 = 7;
+pub const PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_CORE_PROFILE_VERSION: u16 = 7;
+pub const PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_RUNTIME_ABI_VERSION: u16 = 10;
+pub const PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_CORE_SPEC_REVISION: &str =
+    "webassembly-core-2.0-reference-types-1.0-nullable-funcref-c813-executable-v1";
+pub const PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_COMPONENT_MODEL_REVISION: &str =
+    "wasmparser-component-model-0.255.0-c813-reference-executable-v1";
+pub const PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_CANONICAL_ABI_REVISION: &str =
+    "component-model-0.255.0-sync-no-core-reference-boundary-c813-reference-executable-v1";
+pub const PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_WASI_REVISION: &str =
+    "wasi-not-selected-c813-reference-types";
+pub const PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_WORLD: &str = "vibe:references/runtime@1.0.0";
+
 /// Exact Wasmtime release asset admitted as the C8.1 command adapter. These
 /// values describe provenance only; the asset bytes are never bundled or
 /// selected by this `no_std` format crate.
@@ -271,6 +288,8 @@ pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_CANONICAL_FEATURES: u64 =
 /// Core references never cross the Component boundary, so code 9 retains the
 /// integer-only synchronous Canonical ABI surface.
 pub const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_CANONICAL_FEATURES: u64 =
+    SYNC_CANONICAL_FEATURES;
+pub const PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_CANONICAL_FEATURES: u64 =
     SYNC_CANONICAL_FEATURES;
 
 pub const ASYNC_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
@@ -476,6 +495,20 @@ impl ProfileIdentity {
         wasi_revision: PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_WASI_REVISION,
         canonical_features: PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_CANONICAL_FEATURES,
         stage: ProfileStage::ValidationOnly,
+    };
+
+    pub const PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE: Self = Self {
+        artifact_abi: PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_ARTIFACT_ABI_VERSION,
+        component_profile: PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_COMPONENT_PROFILE_VERSION,
+        core_profile: PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_CORE_PROFILE_VERSION,
+        runtime_abi: PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_RUNTIME_ABI_VERSION,
+        core_revision: PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_CORE_SPEC_REVISION,
+        component_revision: PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_COMPONENT_MODEL_REVISION,
+        canonical_abi_revision: PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_CANONICAL_ABI_REVISION,
+        wasm_tools_revision: SYNC_WASM_TOOLS_REVISION,
+        wasi_revision: PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_WASI_REVISION,
+        canonical_features: PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_CANONICAL_FEATURES,
+        stage: ProfileStage::Executable,
     };
 
     pub const PROFILE_1: Self = Self::PROFILE_1_SYNC;

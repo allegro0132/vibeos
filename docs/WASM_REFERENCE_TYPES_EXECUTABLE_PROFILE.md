@@ -1,6 +1,6 @@
 # Reference Types executable successor profile
 
-Status: `c813-e1-reference-executable-design-frozen-pre-implementation`.
+Status: `c813-e2-reference-executable-implemented-pre-qemu`.
 
 C8.13 is the independently numbered executable successor made eligible by the
 C8.12-R3 fixed-QEMU decision. It does not promote or reinterpret validation-only
@@ -26,10 +26,12 @@ host boundary. `externref`, typed function references, GC objects, passive or
 declarative elements, bulk memory, floats, SIMD, memory64, threads, and every
 Component/Canonical/WIT reference value remain forbidden.
 
-The selected engine is a new, separately named facade over the pinned Wasmi
-source. E1 freezes its identity and configuration only; no package, current
-engine, executor, admission path, migration, production authority, or release
-exists yet.
+E2 materializes the separately named Wasmi facade, code-10 current-engine
+binding, fuel-bounded executor, and sealed authority-free volatile admission
+lifecycle. The executor has no imports and exposes only integer values; Core
+references remain internal. Cancellation, fault, recovery, and revocation are
+explicit. Durable graph publication, migration, ordinary command admission,
+production authority, and release remain unavailable pending E3.
 
 | Node | Exit gate |
 |---|---|
@@ -44,3 +46,5 @@ Duo remains paused, optional, and has zero gate effect.
 
 The canonical design contract is
 [`c813-reference-executable-design-v1-contract.json`](../acceptance/wasm-reference-target/artifacts/c813-reference-executable-design-v1-contract.json).
+The implementation contract is
+[`c813-reference-executable-implementation-v1-contract.json`](../acceptance/wasm-reference-target/artifacts/c813-reference-executable-implementation-v1-contract.json).

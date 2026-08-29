@@ -228,6 +228,10 @@ pub fn current_core_validation_engine(
         #[cfg(not(feature = "c811-simd-executable"))]
         return None;
     }
+    if profile == ProfileIdentity::PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE {
+        #[cfg(not(feature = "c813-reference-executable"))]
+        return None;
+    }
     let identity = current_validation_engine_identity(profile)?;
     Some(CurrentCoreValidationEngine {
         identity,

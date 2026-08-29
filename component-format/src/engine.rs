@@ -50,6 +50,11 @@ pub const C812_REFERENCE_ENGINE_PACKAGE: &str = "vibeos-wasmi-reference-validati
 pub const C812_REFERENCE_ENGINE_VERSION: &str = "1.1.0-vibeos-ref1.1";
 pub const C812_REFERENCE_ENGINE_FEATURES: &str =
     "default-features=false;extra-checks,prefer-btree-collections;simd=false";
+pub const C813_REFERENCE_ENGINE_PACKAGE: &str = "vibeos-wasmi-reference-executable";
+pub const C813_REFERENCE_ENGINE_VERSION: &str = "1.1.0-vibeos-ref2.1";
+pub const C813_REFERENCE_ENGINE_FEATURES: &str = C812_REFERENCE_ENGINE_FEATURES;
+pub const C813_REFERENCE_ENGINE_MANIFEST_SHA256: &str =
+    "1cd48cdf8897bee4d20a4bd29355f6309b7b4bb699063b1a5cd180534e733f32";
 
 /// Cargo resolves the two direct wasmparser 0.255 users to one package
 /// instance. Consequently both the Component and Core validator roles are
@@ -595,6 +600,22 @@ impl ValidationEngineIdentity {
         identity
     }
 
+    const fn for_c813_reference_contract(profile: ProfileIdentity) -> Self {
+        let mut identity = Self::for_contract(
+            profile,
+            ComponentValidationMode::Sync,
+            CoreValidatorConfiguration::PROFILE_6_SYNC_REFERENCE_TYPES,
+            WasmiRuntimeConfiguration::PROFILE_6_SYNC_REFERENCE_TYPES,
+        );
+        identity.wasmi = ValidationCrateIdentity::new(
+            C813_REFERENCE_ENGINE_PACKAGE,
+            C813_REFERENCE_ENGINE_VERSION,
+            C813_REFERENCE_ENGINE_MANIFEST_SHA256,
+            C813_REFERENCE_ENGINE_FEATURES,
+        );
+        identity
+    }
+
     pub const fn profile(self) -> ProfileIdentity {
         self.profile
     }
@@ -662,6 +683,10 @@ const PROFILE_3_SYNC_FLOAT_EXECUTABLE_ENGINE: ValidationEngineIdentity =
 const PROFILE_5_SYNC_SIMD_EXECUTABLE_ENGINE: ValidationEngineIdentity =
     ValidationEngineIdentity::for_c811_simd_contract(
         ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE,
+    );
+const PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_ENGINE: ValidationEngineIdentity =
+    ValidationEngineIdentity::for_c813_reference_contract(
+        ProfileIdentity::PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE,
     );
 /// Sealed C8.8-F1 contract metadata. It deliberately contains no frontend or
 /// runtime crate/package/source/checksum identity: F2 must review and bind its
@@ -870,6 +895,8 @@ pub fn current_validation_engine_identity(
         None
     } else if profile == ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION {
         None
+    } else if profile == ProfileIdentity::PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE {
+        Some(&PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE_ENGINE)
     } else if profile == ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE {
         Some(&PROFILE_5_SYNC_SIMD_EXECUTABLE_ENGINE)
     } else if profile == ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE {

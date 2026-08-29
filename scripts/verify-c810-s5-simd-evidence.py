@@ -43,7 +43,9 @@ SEMANTIC_DOMAIN = b"vibeos.c810.s5.simd.fixed-qemu.semantic.v1\0"
 BASE.__file__ = str(HERE)
 BASE.SUITE_ID = "vibeos.c810.s5.simd-fixed-qemu"
 BASE.RUN_ID_DOMAIN = b"vibeos.c810.s5.simd-fixed-qemu.run.v1\0"
-BASE.COMPONENT_SHA256 = "217c1eb45d78d7cc4a267ae9b1c3e0b366f281e4b8048a86b6ce4f5a0990186f"
+BASE.EXPECTED_COMPONENT_SHA256 = (
+    "217c1eb45d78d7cc4a267ae9b1c3e0b366f281e4b8048a86b6ce4f5a0990186f"
+)
 BASE.EXPECTED_MANIFEST_SHA256 = EXPECTED_MANIFEST_SHA256
 BASE.EXPECTED_MANIFEST_BYTES = EXPECTED_MANIFEST_BYTES
 BASE.EXPECTED_SEMANTIC_SHA256 = EXPECTED_SEMANTIC
@@ -274,6 +276,21 @@ def selftest() -> None:
         "transcript_schema_sha256": "6" * 64,
         "expected_semantic_sha256": EXPECTED_SEMANTIC,
     }
+    run_fields = (
+        source["commit"],
+        source["tree"],
+        expected["challenge"],
+        expected["manifest_sha256"],
+        expected["transcript_schema_sha256"],
+        BASE.EXPECTED_COMPONENT_SHA256,
+    )
+    direct_run_id = hashlib.sha256(
+        BASE.RUN_ID_DOMAIN
+        + b"\0".join(str(field).encode("ascii") for field in run_fields)
+    ).hexdigest()
+    run_environment = {**expected, "source": source}
+    if BASE.expected_run_id(run_environment) != direct_run_id:
+        BASE.fail("selftest run-ID component binding differs")
     meta = {
         "artifact_abi": 7,
         "artifact_profile_code": 7,

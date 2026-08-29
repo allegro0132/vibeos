@@ -3,10 +3,19 @@
 This document defines the reproducible collection and publication contract for
 C8.3 of the [Component Model roadmap](WASM_ROADMAP.md). The target-side harness,
 closed manifest/schema, independent verifier, and dedicated QEMU/Duo images are
-the preparation stage. **C8.3 is not complete until results from one fixed QEMU
-boot and three real, cold Milk-V Duo boots are checked in and independently
-verified against the same clean preparation commit.** A host model, a dirty
-QEMU smoke run, or an old Duo image is never physical evidence.
+the historical v1 preparation stage. C1 through C8.2 remain accepted complete
+by historical-evidence policy; none is reopened, rerun, or individually
+rewalked. C8.3 is accepted complete by
+historical-evidence policy and is not being rerun. The fixed-QEMU plus
+three-cold-boot Duo text below is the original v1 publication contract, not a
+current physical prerequisite or a new publication claim. Under that original
+contract, **C8.3 was not complete until results from one fixed QEMU boot and
+three real, cold Milk-V Duo boots were checked in and independently verified
+against the same clean preparation commit.** That policy status does not assert
+that an absent
+physical publication exists, does not backfill or fabricate one, and does not
+convert a host model, dirty QEMU smoke run, old Duo image, or emulator result
+into physical evidence.
 
 ## Measured surface
 
@@ -50,7 +59,7 @@ validation-candidate primitives. They are not claims of production guest-async
 or cross-component execution. Adapted Preview1 artifacts remain validation-only
 and are excluded from runtime throughput.
 
-## Fixed platforms and publication gates
+## Historical v1 fixed platforms and publication gates
 
 | Platform | Fixed contract | Fresh boots |
 |---|---|---:|
@@ -68,9 +77,10 @@ justify AOT.
 QEMU `icount` ticks and physical 25 MHz ticks are published in separate columns.
 They must not be divided to claim a hardware speed ratio.
 
-## Preparation checks
+## Archived v1 preparation checks
 
-Run these before making the preparation commit:
+These were the checks required before making the historical preparation
+commit. They are retained for audit and are not a request to rerun C8.3:
 
 ```sh
 python3 -B scripts/verify-c83-runtime-costs.py --selftest --check-manifest
@@ -90,10 +100,10 @@ The all-ones/all-twos identity above is a test binding only. It must never be
 published as evidence. The dirty QEMU mode cannot export files and disables the
 publication gates by construction.
 
-## Evidence collection
+## Archived v1 evidence collection
 
-Evidence uses two commits so that the measured source does not refer to a commit
-that contains its own measurement:
+The historical procedure used two commits so that the measured source did not
+refer to a commit that contained its own measurement:
 
 1. Verify, commit, and push the harness/tooling preparation commit.
 2. With that exact commit checked out in a separate clean checkout/worktree and
@@ -103,7 +113,8 @@ that contains its own measurement:
    not honor `.gitmodules` `ignore` settings for this check.
 3. Copy only verified raw logs, summaries, envelopes, and the derived results
    document into `benchmarks/wasm-runtime/`; verify them again; then make the
-   separate evidence commit. C8.3 completes only at this step.
+   separate evidence commit. Under the historical v1 policy, C8.3 completed
+   only at this step.
 
 One challenge may bind both platform captures:
 
@@ -226,3 +237,11 @@ auditable collection record, but VibeOS currently has no trusted unique board
 identity or hardware signing root. FIT and FAT construction also contains
 timestamps, so publication binds the produced hashes rather than claiming
 byte-for-byte reproducible full images.
+
+The repository retains this procedure as historical contract text. Milk-V Duo
+testing remains paused; any later voluntary capture is an optional, separately
+labelled observation and has no gate, completion, or release effect. The
+prospective generic WASM target/release gate is governed instead by the
+non-numbered fixed-QEMU policy checkpoint in the roadmap. That prospective
+policy does not rewrite this v1 contract, manufacture a C8.3 publication, or
+satisfy any hardware-specific gate.

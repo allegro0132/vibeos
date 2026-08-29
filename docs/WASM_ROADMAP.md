@@ -10,13 +10,20 @@ VibeOS. It complements [BLUEPRINT.md](BLUEPRINT.md),
 bounded Core validation/execution, Component decoding and Canonical ABI,
 admission/loading, compatibility, and C8 profiling evidence. The dependency
 sequence and acceptance text below remain the roadmap rather than a claim that
-every milestone is complete. C1 through C8.3 are accepted complete under the
-historical-evidence policy, and formal fixed-QEMU evidence completes C8.4 for
-the selected workload. C8.5 through C8.7 were not entered for that workload
+every milestone is complete. C1 through C8.2 remain accepted complete by
+historical-evidence policy; none is reopened, rerun, or individually rewalked.
+C8.3 is accepted complete by historical-evidence policy and is not being
+rerun. Formal fixed-QEMU evidence completes C8.4 for the selected workload.
+C8.5 through C8.7 were not entered for that workload
 and remain globally deferred. The C8.8 Float widening is closed by the formal
 fixed-QEMU F5 decision below; every other C8.8 feature widening remains
-separately unallocated and incomplete. The decision contracts and explicit
-gaps are tracked in
+separately unallocated and incomplete. At the live
+`post-c88-f5-pre-allocation` position, the non-numbered fixed-QEMU
+target/release policy checkpoint below makes fresh source-bound
+`qemu-virt-rv64-tcg-icount-v1` evidence the prospective generic WASM
+target/release gate. Milk-V Duo remains a paused optional observation with no
+gate, completion, or release effect. The decision contracts and explicit gaps
+are tracked in
 [WASM_AOT_DECISION.md](WASM_AOT_DECISION.md) and [TESTING.md](../TESTING.md).
 
 **C8.8 Float status (2026-08-29):** F1 through F5 are complete for the Float
@@ -863,6 +870,12 @@ component security boundary is measured and stable.
 | C8.7 | Regenerate or verify native output | A pinned trusted compiler reproduces native bytes, or an equivalently reviewed verifier proves the accepted surface before execution |
 | C8.8 | Widen profiles one feature at a time | Float, SIMD, references, exceptions, memory64, multiple memories, GC, threads or broader WASI each require separate semantics and evidence |
 
+The C8.3 row above is retained verbatim as the historical v1 acceptance text.
+C1 through C8.3 are treated as complete under the project's historical-evidence
+policy and are not rerun. This status does not assert that absent physical
+publication files exist, does not synthesize or backfill a Duo publication,
+and does not turn fixed-QEMU output into physical provenance.
+
 The Float widening is itself divided into five ordered increments. Completion
 of one increment does not activate code from the next:
 
@@ -1002,7 +1015,7 @@ compile-readiness run; the verifier intentionally freezes structure and
 payload rather than globally pinning whole ELF bytes because source-build
 provenance is not claimed.
 
-The sentinel ELF and run ID can never satisfy the physical gate, and patching
+The sentinel ELF and run ID can never satisfy the retained physical-v1 contract, and patching
 the readiness image is not an arming procedure. A separate host-side wire and
 campaign-verifier contract now exists at pushed commit
 `f502240a88eeb218ca923276675d7b6dec3e4030`, tree
@@ -1156,7 +1169,47 @@ activation, admission, or release evidence.
 The fixed-QEMU replacement remains scoped to C8.8-F5. Milk-V Duo stays paused,
 retained, non-blocking, and non-evidence; this charter takes zero physical
 inputs and changes no unrelated hardware gate. C8.5--C8.7 remain globally
-deferred and every other C8.8 widening remains incomplete.
+deferred and every other C8.8 widening remains incomplete. The separate
+prospective target/release policy below does not broaden or rewrite this
+historical decision.
+
+### Fixed-QEMU target/release policy v1 (policy checkpoint; not a roadmap implementation node)
+
+This non-C-numbered checkpoint is a governance policy. The policy checkpoint
+roadmap position is `post-c88-f5-pre-allocation`. The policy scope is
+`prospective-wasm-roadmap-target-and-release-gates`. The policy contract is not
+target evidence and satisfies no target or release gate. The normative generic
+WASM target/release gate is fresh, source-bound fixed QEMU on
+`qemu-virt-rv64-tcg-icount-v1`. Fresh node-specific source, suite, challenge,
+run, capture, acceptance predicates, and evidence remain mandatory. Historical
+C8.4 and C8.8-F5 QEMU evidence cannot satisfy a future gate.
+
+The policy has `physical_inputs_required=0`,
+`physical_inputs_permitted=0`, `physical_provenance=not-claimed`, and
+`physical_equivalence_claimed=false`. Fixed QEMU is emulator evidence, not a
+claim about Milk-V Duo performance, physical provenance, cache behavior, or
+board equivalence. Milk-V Duo remains paused and optional; any later
+observation is separate and has no gate, completion, or release effect. Its
+machine fields are `gate_effect=false`, `completion_effect=false`, and
+`release_effect=false`; resuming it voluntarily cannot replace or mutate the
+formal QEMU evidence set.
+
+This replacement is limited to the prospective generic WASM target/release
+gate. Any acceptance claim that is intrinsically about real hardware remains a
+separate physical gate, including microSD persistence, DWMAC networking, USB,
+entropy, cache/DMA coherency, thermal and electrical behavior, and
+certification. Those gates are neither satisfied nor weakened by QEMU.
+Unrelated board, device, entropy, physical-security, and certification gates
+remain unchanged.
+
+The canonical policy contract is
+[`fixed-qemu-target-release-policy-v1-contract.json`](../acceptance/wasm-roadmap/artifacts/fixed-qemu-target-release-policy-v1-contract.json).
+Passing its verifier proves policy integrity only. Code 5 remains permanently
+`ValidationOnly` and inert. No successor identity, roadmap number, profile,
+ABI, engine, implementation, execution, admission, release, or production
+authority is allocated by this policy. It also authorizes no durable
+publication, migration, native bytes, AOT, JIT, RWX, rollout, or in-place
+promotion.
 
 ## 10. Test and evidence matrix
 
@@ -1169,7 +1222,13 @@ The existing VibeOS evidence layers remain mandatory:
 | Fuzzing | Component/Core decoders, validators, canonical values, resources, adapters, async resumptions and malformed artifacts | Exhaustive target interleavings and hardware DMA |
 | In-kernel self-test | Live CSpace use/revoke, ownership, quotas, quantum yield, cancellation, arena reclamation and W^X if AOT exists | Complete remote and persistent workflows |
 | QEMU acceptance | VSH/SSH component invocation, multicore progress, async chains, composition, fault/restart, two-boot persistence and raw-disk evidence | Physical Duo cache, storage, entropy and long-duration behavior |
-| Physical Duo gate | Target runtime, memory pressure, microSD persistence, network streams, repeated install/run/revoke/restart and soak | Other boards and certification |
+| Formal fixed-QEMU WASM target/release gate | Fresh source-bound, node-specific validation, execution, lifecycle, quota, fault, restart, and soak evidence on pinned emulator profiles | Physical cache/DMA, native microSD/DWMAC/USB/entropy, thermal/electrical behavior, physical security, and certification |
+| Optional Milk-V Duo observation (paused) | Separately scoped observations only; never a target/release gate input or completion condition | No generic WASM gate, completion, or release effect |
+
+The formal fixed-QEMU row replaces only the former generic mandatory physical
+Duo row. Real-hardware requirements for microSD, DWMAC, USB, entropy,
+cache/DMA coherency, thermal/electrical behavior, certification, or another
+explicit board property remain independent physical gates.
 
 Security-sensitive mutations must prove that the gates are live:
 
@@ -1217,7 +1276,8 @@ C0 measures candidates before freezing thresholds. Every release then reports:
 - revocation-to-denial and cancellation-to-terminal latency in poll quanta;
 - normal, cancellation, trap and restart heap return-to-baseline;
 - native-component and adapted-WASIp1 corpus pass counts with explicit exclusions;
-- QEMU and physical-Duo soak duration and restart count;
+- fixed-QEMU target/release soak duration, restart count, and exact baseline identity;
+- optional physical-Duo observations, if collected, reported separately with no gate effect;
 - dependency, source-line, unsafe-site, proposal-version and fuzz-corpus inventory
   added to the TCB.
 
@@ -1274,8 +1334,9 @@ Component v1 comprises C0--C7 and is complete only when:
     identities and exact reconstructed least authority; independent disk evidence
     rejects every documented mutation and crash prefix.
 11. Host tests, selected Core and Component reference tests, differential corpus,
-    fuzzers, self-tests, four-hart QEMU gates, and the physical-Duo gate are green
-    on pinned tools.
+    fuzzers, self-tests, four-hart QEMU gates, and every applicable fresh
+    fixed-QEMU target/release gate are green on pinned tools. Optional Milk-V
+    Duo observation does not block completion or release.
 12. The trust model names the exact Core/Component/Canonical ABI/WIT versions,
     engines, adapters, dependencies, unsafe sites, unsupported surface,
     performance costs, physical-security limits and rollback limits.

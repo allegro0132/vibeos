@@ -23,6 +23,19 @@ the normative F5 exit gate and replaces the physical-Duo requirement for
 C8.8-F5 only. It accepts 1,176 records with semantic SHA-256
 `51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`.
 No other C8.8 feature widening or hardware gate is closed by this decision.
+C1 through C8.2 remain accepted complete by historical-evidence policy; none
+is reopened, rerun, or individually rewalked.
+
+Separately, the non-numbered
+[`Fixed-QEMU target/release policy v1`](../acceptance/wasm-roadmap/artifacts/fixed-qemu-target-release-policy-v1-contract.json)
+checkpoint at `post-c88-f5-pre-allocation` governs future generic WASM
+target/release gates. It requires a fresh source-bound
+`qemu-virt-rv64-tcg-icount-v1` campaign for each future allocated node and
+cannot promote this F5 campaign into that node's evidence. The prospective
+policy does not broaden or rewrite the historical F5-only decision.
+
+The C8.8-F5 replacement remains scoped to F5 only; the independent prospective
+fixed-QEMU target/release policy does not reclassify or promote F5 evidence.
 
 Milk-V Duo physical testing remains paused at operator request. Fixed QEMU is
 the formal target for F5 qualification and has emulator execution evidence
@@ -439,7 +452,7 @@ because source-build provenance is not claimed. Its result remains
 `physical_evidence_present=false`, and
 `source_build_provenance=not-claimed`.
 
-The sentinel ELF and run ID can never satisfy the physical gate, and patching
+The sentinel ELF and run ID can never satisfy the retained physical-v1 contract, and patching
 the readiness image is not an arming procedure. The subsequent, fully disjoint
 host-verifier node at pushed commit
 `f502240a88eeb218ca923276675d7b6dec3e4030`, tree
@@ -519,8 +532,11 @@ with `state=unresolved`, `blocking=true`, `answer_selected=false`, and
 8. `final_authorization_rollout`: Which separate versioned review would be
    required before any final authorization or rollout decision?
 
-Code 5 remains permanently `ValidationOnly` and inert. The formal fixed-QEMU
-replacement remains scoped to C8.8-F5 only. Milk-V Duo stays paused, retained,
-non-blocking, and non-evidence; this review boundary permits and requires zero
-physical inputs, changes no unrelated hardware gate, and leaves every other
-C8.8 feature widening incomplete.
+Code 5 remains permanently `ValidationOnly` and inert. The historical formal
+fixed-QEMU decision remains scoped to C8.8-F5 only. Milk-V Duo stays paused,
+retained, non-blocking, and non-evidence; this review boundary permits and
+requires zero physical inputs, changes no unrelated hardware gate, and leaves
+every other C8.8 feature widening incomplete. The separate prospective policy
+checkpoint allocates no successor and authorizes no implementation, execution,
+admission, durable publication, release, production use, native bytes, AOT,
+JIT, RWX, migration, or in-place promotion.

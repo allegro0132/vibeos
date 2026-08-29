@@ -138,6 +138,14 @@ jobs:
             --selftest
           python3 -O -B scripts/verify-c88-float-successor-review-boundary.py \
             --selftest
+      - name: Verify the prospective fixed-QEMU WASM target/release policy
+        # Policy/contract integrity only: no QEMU or Duo is run, no target or
+        # release gate is satisfied, and no successor is allocated.
+        run: |
+          python3 -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract
+          python3 -O -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract
+          python3 -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --selftest
+          python3 -O -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --selftest
       - name: Verify the retained C8.8-F5 Duo non-evidence contracts
         # Retained compile/schema integrity only. Physical Duo completion is
         # paused and is not a C8.8-F5 roadmap gate.
@@ -434,10 +442,6 @@ jobs:
           VIBEOS_C83_SOURCE_COMMIT="$(git rev-parse HEAD)" \
           VIBEOS_C83_CHALLENGE=8383838383838383838383838383838383838383838383838383838383838383 \
             ./scripts/build-milkv-duo.sh --runtime-costs
-      # This exercises the formal gates with a fresh challenge, but CI does not
-      # retain its outputs and therefore cannot complete the evidence milestone.
-      - name: Exercise the fixed-QEMU C8.3 publication contract
-        run: python3 -B scripts/qemu-c83-runtime-costs.py
       - name: Build the Milk-V Duo kernel
         # FIT/full-card packaging still requires a prebuilt official SDK and
         # remains part of the documented manual hardware acceptance flow.

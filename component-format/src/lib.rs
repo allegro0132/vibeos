@@ -81,6 +81,23 @@ pub const PROFILE_2_SYNC_FLOAT_CANONICAL_ABI_REVISION: &str =
     "component-model-0.255.0-sync-float-values-deterministic-software-float-v1";
 pub const PROFILE_2_SYNC_FLOAT_WASI_REVISION: &str = "wasi-not-selected-sync-float";
 
+/// C8.9's independently numbered executable successor. Code 5 is never
+/// reinterpreted: every durable and runtime ABI coordinate advances to 6 and
+/// both Component and Core profile coordinates advance to 3.
+pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_PROFILE_CODE: u16 = 6;
+pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_ARTIFACT_ABI_VERSION: u16 = 6;
+pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_COMPONENT_PROFILE_VERSION: u16 = 3;
+pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_CORE_PROFILE_VERSION: u16 = 3;
+pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_RUNTIME_ABI_VERSION: u16 = 6;
+pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_CORE_SPEC_REVISION: &str =
+    "webassembly-core-2.0-scalar-f32-f64-deterministic-software-float-v1-c89-exec-v1";
+pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_COMPONENT_MODEL_REVISION: &str =
+    "wasmparser-component-model-0.255.0-c89-sync-float-exec-v1";
+pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_CANONICAL_ABI_REVISION: &str =
+    "component-model-0.255.0-sync-float-values-deterministic-software-float-v1-c89-exec-v1";
+pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_WASI_REVISION: &str = "wasi-not-selected-c89-sync-float";
+pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_WORLD: &str = "vibe:float/runtime@1.0.0";
+
 /// Exact Wasmtime release asset admitted as the C8.1 command adapter. These
 /// values describe provenance only; the asset bytes are never bundled or
 /// selected by this `no_std` format crate.
@@ -188,6 +205,9 @@ pub const PROFILE_2_SYNC_FLOAT_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Ut
     | CanonicalAbiFeature::SyncLiftLower.bit()
     | CanonicalAbiFeature::Resources.bit()
     | CanonicalAbiFeature::FloatValues.bit();
+
+pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_CANONICAL_FEATURES: u64 =
+    PROFILE_2_SYNC_FLOAT_CANONICAL_FEATURES;
 
 pub const ASYNC_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
     | CanonicalAbiFeature::SyncLiftLower.bit()
@@ -330,6 +350,22 @@ impl ProfileIdentity {
         stage: ProfileStage::ValidationOnly,
     };
 
+    /// C8.9's executable scalar-float identity. This is intentionally not an
+    /// alias of code 5 even though the closed numeric semantics are reused.
+    pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE: Self = Self {
+        artifact_abi: PROFILE_3_SYNC_FLOAT_EXECUTABLE_ARTIFACT_ABI_VERSION,
+        component_profile: PROFILE_3_SYNC_FLOAT_EXECUTABLE_COMPONENT_PROFILE_VERSION,
+        core_profile: PROFILE_3_SYNC_FLOAT_EXECUTABLE_CORE_PROFILE_VERSION,
+        runtime_abi: PROFILE_3_SYNC_FLOAT_EXECUTABLE_RUNTIME_ABI_VERSION,
+        core_revision: PROFILE_3_SYNC_FLOAT_EXECUTABLE_CORE_SPEC_REVISION,
+        component_revision: PROFILE_3_SYNC_FLOAT_EXECUTABLE_COMPONENT_MODEL_REVISION,
+        canonical_abi_revision: PROFILE_3_SYNC_FLOAT_EXECUTABLE_CANONICAL_ABI_REVISION,
+        wasm_tools_revision: SYNC_WASM_TOOLS_REVISION,
+        wasi_revision: PROFILE_3_SYNC_FLOAT_EXECUTABLE_WASI_REVISION,
+        canonical_features: PROFILE_3_SYNC_FLOAT_EXECUTABLE_CANONICAL_FEATURES,
+        stage: ProfileStage::Executable,
+    };
+
     pub const PROFILE_1: Self = Self::PROFILE_1_SYNC;
 
     pub const fn execution_enabled(self) -> bool {
@@ -361,6 +397,15 @@ const _: () = assert!(
 );
 const _: () =
     assert!(ProfileIdentity::PROFILE_2_SYNC_FLOAT.runtime_abi == PROFILE_2_SYNC_FLOAT_PROFILE_CODE);
+const _: () = assert!(ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE.execution_enabled());
+const _: () = assert!(
+    ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE.artifact_abi
+        == PROFILE_3_SYNC_FLOAT_EXECUTABLE_PROFILE_CODE
+);
+const _: () = assert!(
+    ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE.runtime_abi
+        == PROFILE_3_SYNC_FLOAT_EXECUTABLE_PROFILE_CODE
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WitPackage {

@@ -3,6 +3,10 @@ name = "vibeos-wasm-runtime"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+c89-float-executable = []
+
 [dependencies]
 vibeos-component-format = { path = "../component-format" }
 wasmi = { version = "=1.1.0", default-features = false, features = ["extra-checks", "prefer-btree-collections"] }

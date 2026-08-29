@@ -221,7 +221,7 @@ pub struct ComponentPlan<'a> {
     async_lowers: Vec<AsyncLowerInfo>,
     async_canonical: Vec<AsyncCanonicalPlan>,
     native_async_execution: Option<NativeAsyncExecutionPlan>,
-    #[cfg(feature = "c88-f4-acceptance")]
+    #[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
     float_candidate_execution: Option<FloatCandidateExecutionBinding>,
     pub(crate) execution: ComponentExecutionPlan,
 }
@@ -230,20 +230,20 @@ pub struct ComponentPlan<'a> {
 /// export resolves to the exact Core function that the acceptance lifecycle
 /// will invoke. This is deliberately separate from `ComponentExecutionPlan`:
 /// code 5 remains inert to every ordinary executor and resolver.
-#[cfg(feature = "c88-f4-acceptance")]
+#[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FloatCandidateExecutionBinding {
     module: usize,
     core_export: FloatCandidateCoreExport,
 }
 
-#[cfg(feature = "c88-f4-acceptance")]
+#[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FloatCandidateCoreExport {
     Run,
 }
 
-#[cfg(feature = "c88-f4-acceptance")]
+#[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
 impl FloatCandidateExecutionBinding {
     pub(crate) const fn module(self) -> usize {
         self.module
@@ -309,12 +309,12 @@ impl ComponentPlan<'_> {
     /// Reports only whether the F4 decoder retained an exact candidate-only
     /// Component-to-Core binding. It does not expose executable wiring and is
     /// absent unless the default-off F4 feature is selected.
-    #[cfg(feature = "c88-f4-acceptance")]
+    #[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
     pub const fn has_exact_float_candidate_execution_binding(&self) -> bool {
         self.float_candidate_execution.is_some()
     }
 
-    #[cfg(feature = "c88-f4-acceptance")]
+    #[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
     pub(crate) const fn float_candidate_execution_binding(
         &self,
     ) -> Option<FloatCandidateExecutionBinding> {
@@ -330,7 +330,10 @@ impl ComponentPlan<'_> {
     /// every plan containing an async construct remains inert here. This also
     /// rejects a sync-only payload mislabeled with the async descriptor.
     pub fn runtime_ready(&self) -> bool {
-        self.profile == ProfileIdentity::PROFILE_1_SYNC && self.summary.async_abi.is_empty()
+        matches!(
+            self.profile,
+            ProfileIdentity::PROFILE_1_SYNC | ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE
+        ) && self.summary.async_abi.is_empty()
     }
 
     /// C5.3 exposes complete native async wiring for review and executor
@@ -365,6 +368,8 @@ impl ComponentPlan<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InspectionMode {
     SyncExecutable,
+    #[cfg(feature = "c89-float-executable")]
+    SyncFloatExecutable,
     AsyncValidation,
     NativeAsyncResourceFree,
     #[cfg(feature = "c88-f3-acceptance")]
@@ -375,6 +380,11 @@ impl InspectionMode {
     fn for_profile(profile: ProfileIdentity) -> Option<Self> {
         if profile == ProfileIdentity::PROFILE_1_SYNC {
             Some(Self::SyncExecutable)
+        } else if profile == ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE {
+            #[cfg(feature = "c89-float-executable")]
+            return Some(Self::SyncFloatExecutable);
+            #[cfg(not(feature = "c89-float-executable"))]
+            return None;
         } else if profile == ProfileIdentity::PROFILE_1_ASYNC {
             Some(Self::AsyncValidation)
         } else if profile == ProfileIdentity::PROFILE_1_NATIVE_ASYNC_RESOURCE_FREE {
@@ -393,6 +403,10 @@ impl InspectionMode {
     }
 
     const fn allows_scalar_float(self) -> bool {
+        #[cfg(feature = "c89-float-executable")]
+        if matches!(self, Self::SyncFloatExecutable) {
+            return true;
+        }
         #[cfg(feature = "c88-f3-acceptance")]
         if matches!(self, Self::SyncFloatCandidate) {
             return true;
@@ -1467,7 +1481,7 @@ fn inspect_component_for_profile_impl<'a>(
     } else {
         None
     };
-    #[cfg(feature = "c88-f4-acceptance")]
+    #[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
     let float_candidate_execution = if mode.allows_scalar_float() {
         build_float_candidate_execution_binding(
             &modules,
@@ -1577,7 +1591,7 @@ fn inspect_component_for_profile_impl<'a>(
             async_lowers,
             async_canonical,
             native_async_execution,
-            #[cfg(feature = "c88-f4-acceptance")]
+            #[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
             float_candidate_execution,
             execution: ComponentExecutionPlan {
                 instances,
@@ -1592,7 +1606,7 @@ fn inspect_component_for_profile_impl<'a>(
 /// Resolve the one accepted Float Component export without populating the
 /// ordinary execution plan. Other valid F3 shapes remain inspectable and
 /// simply carry no F4 binding.
-#[cfg(feature = "c88-f4-acceptance")]
+#[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
 fn build_float_candidate_execution_binding(
     modules: &[&[u8]],
     core_instances: &[Option<CoreInstanceDraft>],

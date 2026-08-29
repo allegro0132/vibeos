@@ -19,6 +19,13 @@ c88-f4-acceptance = [
     "dep:vibeos-wasm-float-candidate",
     "vibeos-wasm-float-candidate/c88-f2-acceptance",
 ]
+# Executable C8.9 successor. This selects the same audited engine sources
+# through a new code-6 current binding; it does not activate code 5.
+c89-float-executable = [
+    "c88-f3-acceptance",
+    "dep:vibeos-wasm-float-candidate",
+    "vibeos-wasm-float-candidate/c89-executable",
+]
 # Portable, caller-clocked timing hooks used only by the frozen C8.4
 # interpreter/AOT decision harness. Production builds leave this disabled.
 c84-profile-hooks = []

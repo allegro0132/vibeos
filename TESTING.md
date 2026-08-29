@@ -764,7 +764,7 @@ Total p50/p95 are 2,899,765/2,901,632 ticks, interpretation p50/p95 are
 `aot-not-justified-on-fixed-qemu`. C8.5 through C8.7 were not entered for this
 workload and remain globally deferred. The stored next-node value remains
 `C8.8-skip-or-defer-C8.5-C8.7`; the live roadmap position is
-`c89-s1-design-frozen-pre-implementation`. This does not rewrite the historical C8.4
+`c89-s2-implemented-pre-fixed-qemu-qualification`. This does not rewrite the historical C8.4
 decision. The evidence records `platform_class=emulator`,
 `physical_provenance=not-claimed`, `aot_authorized=false`, and
 `native_code_accepted=false`. Source immutability and Docker runtime custody
@@ -773,9 +773,9 @@ physical-cold-boot proof.
 
 The immutable historical C8.4 `next_node` value is
 `C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position.
-The current roadmap position is `c89-s1-design-frozen-pre-implementation`.
+The current roadmap position is `c89-s2-implemented-pre-fixed-qemu-qualification`.
 C8.9-S1 allocates and freezes the independent code-6 Float successor design;
-C8.9-S2 implementation and C8.9-S3 qualification remain incomplete.
+C8.9-S2 implementation is complete and C8.9-S3 qualification remains incomplete.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -947,11 +947,29 @@ review charter and fixed-QEMU policy, validates the selected engine provenance,
 checks every security-sensitive design field under normal and optimized Python,
 and rejects design mutations.
 
-Passing S1 proves design identity only. Code 6 remains absent from the artifact
-codec and current engine resolver until S2; admission, durable publication,
-release, and production authority remain false. Code 5 stays permanently
+S1 is retained as the immutable design checkpoint. C8.9-S2 now materializes
+code 6 and is verified by the separate implementation contract below; durable
+publication, release, and production authority remain false. Code 5 stays permanently
 `ValidationOnly` and inert. S3 requires fresh source-bound normal/optimized
 fixed-QEMU evidence. Milk-V Duo remains paused and optional with no gate effect.
+
+## C8.9-S2 Float successor implementation contract
+
+This node verifies the exact code-6 artifact identity and round-trip, current
+software-float Core/Component engine proof, closed `vibe:float/runtime@1.0.0`
+world, authority-free admission, bit-only execution, quotas, cancellation,
+revocation, fault reclamation and cold recovery. It also proves that code 5
+remains inert and that the ordinary command/durable loader still rejects code
+6. These commands run no QEMU and no physical hardware:
+
+```sh
+python3 -B scripts/verify-c89-float-successor-implementation.py --check-contract
+python3 -O -B scripts/verify-c89-float-successor-implementation.py --check-contract
+python3 -B scripts/verify-c89-float-successor-implementation.py --selftest
+python3 -O -B scripts/verify-c89-float-successor-implementation.py --selftest
+cargo test --locked --offline -p vibeos-component-runtime --features c89-float-executable --test c89_float_executable
+cargo test --locked --offline -p vibeos-component-admission --features c89-float-executable --test c89_float_executable
+```
 
 ## Fixed-QEMU target/release policy v1
 

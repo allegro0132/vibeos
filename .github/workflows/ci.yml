@@ -139,13 +139,24 @@ jobs:
           python3 -O -B scripts/verify-c88-float-successor-review-boundary.py \
             --selftest
       - name: Verify the C8.9-S1 Float successor design
-        # Design identity only: code 5 remains inert, code 6 is not yet
-        # materialized, and neither QEMU nor physical hardware is run here.
+        # Historical design identity; neither QEMU nor hardware is run here.
         run: |
           python3 -B scripts/verify-c89-float-successor-design.py --check-contract
           python3 -O -B scripts/verify-c89-float-successor-design.py --check-contract
           python3 -B scripts/verify-c89-float-successor-design.py --selftest
           python3 -O -B scripts/verify-c89-float-successor-design.py --selftest
+      - name: Verify the C8.9-S2 Float successor implementation
+        # Host-only implementation and isolation checks. QEMU belongs to S3;
+        # physical Duo remains paused and supplies no input.
+        run: |
+          python3 -B scripts/verify-c89-float-successor-implementation.py --check-contract
+          python3 -O -B scripts/verify-c89-float-successor-implementation.py --check-contract
+          python3 -B scripts/verify-c89-float-successor-implementation.py --selftest
+          python3 -O -B scripts/verify-c89-float-successor-implementation.py --selftest
+          cargo test --locked --offline -p vibeos-component-runtime \
+            --features c89-float-executable --test c89_float_executable
+          cargo test --locked --offline -p vibeos-component-admission \
+            --features c89-float-executable --test c89_float_executable
       - name: Verify the prospective fixed-QEMU WASM target/release policy
         # Policy/contract integrity only: no QEMU or Duo is run, no target or
         # release gate is satisfied. C8.9 allocation is verified separately.

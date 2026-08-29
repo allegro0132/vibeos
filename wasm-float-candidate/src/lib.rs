@@ -43,14 +43,29 @@ pub const CANDIDATE_IDENTITY: CandidateIdentity = CandidateIdentity {
     production_ready: false,
 };
 
-#[cfg(feature = "c88-f2-acceptance")]
+/// The same audited source payload under the independently frozen C8.9
+/// executable binding. This is not an activation bit for code 5.
+pub const EXECUTABLE_IDENTITY: CandidateIdentity = CandidateIdentity {
+    acceptance_feature: "c89-executable",
+    production_ready: true,
+    ..CANDIDATE_IDENTITY
+};
+
+#[cfg(any(feature = "c88-f2-acceptance", feature = "c89-executable"))]
 mod acceptance {
     use alloc::vec::Vec;
     use core::cmp::min;
+    #[cfg(feature = "c89-executable")]
+    use vibeos_component_format::{
+        current_validation_engine_identity, ProfileIdentity, C89_SOFTFLOAT_ENGINE_PACKAGE,
+        C89_SOFTFLOAT_ENGINE_VERSION,
+    };
     use vibeos_component_format::{
         profile_2_sync_float_validation_contract, TrapCode, WasmiCompilationMode,
-        WasmiEnforcedLimits, WasmiFuelCosts, PROFILE_1_LIMITS,
+        WasmiEnforcedLimits, WasmiFuelCosts, WasmiRuntimeConfiguration, PROFILE_1_LIMITS,
     };
+    #[cfg(feature = "c89-executable")]
+    use vibeos_wasm_runtime::{current_core_validation_engine, inspect_core_with_current_engine};
     use vibeos_wasm_runtime::{
         inspect_profile_2_candidate_compile_reservation, AdmissionDetail, AdmissionError,
         CoreSummary, OwnerAllocationReservation,
@@ -113,6 +128,25 @@ mod acceptance {
 
     fn build_candidate_engine() -> Result<Engine, AdmissionError> {
         let runtime = profile_2_sync_float_validation_contract().target_wasmi_configuration();
+        build_engine(runtime)
+    }
+
+    #[cfg(feature = "c89-executable")]
+    fn build_executable_engine() -> Result<Engine, AdmissionError> {
+        let identity =
+            current_validation_engine_identity(ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE)
+                .ok_or_else(|| admission(AdmissionDetail::UnsupportedFeature))?;
+        let package = identity.wasmi();
+        if package.name() != C89_SOFTFLOAT_ENGINE_PACKAGE
+            || package.version() != C89_SOFTFLOAT_ENGINE_VERSION
+            || identity.profile() != ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE
+        {
+            return Err(admission(AdmissionDetail::UnsupportedFeature));
+        }
+        build_engine(identity.runtime())
+    }
+
+    fn build_engine(runtime: WasmiRuntimeConfiguration) -> Result<Engine, AdmissionError> {
         if !runtime.floats() || runtime.simd_compiled() || runtime.relaxed_simd_compiled() {
             return Err(AdmissionError {
                 trap: TrapCode::UnsupportedFeature,
@@ -189,6 +223,33 @@ mod acceptance {
             })
         }
 
+        /// Compile code 6 only after resolving its opaque current-engine
+        /// proof. Code 5 continues to use the acceptance-only constructor.
+        #[cfg(feature = "c89-executable")]
+        pub fn compile_executable(
+            bytes: &[u8],
+            reservation: OwnerAllocationReservation,
+        ) -> Result<Self, AdmissionError> {
+            let proof =
+                current_core_validation_engine(ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE)
+                    .ok_or_else(|| admission(AdmissionDetail::UnsupportedFeature))?;
+            let summary = inspect_core_with_current_engine(bytes, &proof)?;
+            let (_, reserved_compile_bytes) =
+                super_compile_reservation(bytes, summary, reservation)?;
+            if summary.imports != 0 {
+                return Err(admission(AdmissionDetail::ImportRequiresLinker));
+            }
+            let engine = build_executable_engine()?;
+            let module =
+                Module::new(&engine, bytes).map_err(|_| admission(AdmissionDetail::Malformed))?;
+            Ok(Self {
+                engine,
+                module,
+                summary,
+                reserved_compile_bytes,
+            })
+        }
+
         pub const fn summary(&self) -> CoreSummary {
             self.summary
         }
@@ -238,6 +299,24 @@ mod acceptance {
                 last_metrics: None,
             })
         }
+    }
+
+    #[cfg(feature = "c89-executable")]
+    fn super_compile_reservation(
+        bytes: &[u8],
+        summary: CoreSummary,
+        reservation: OwnerAllocationReservation,
+    ) -> Result<(CoreSummary, usize), AdmissionError> {
+        // The policy charge is frozen by the predecessor and intentionally
+        // shared by the semantically identical code-6 numeric surface.
+        let required = vibeos_wasm_runtime::profile_2_candidate_required_compile_bytes(bytes)?;
+        if reservation.bytes() < required {
+            return Err(AdmissionError {
+                trap: TrapCode::LimitExceeded,
+                detail: AdmissionDetail::AllocationReservation,
+            });
+        }
+        Ok((summary, required))
     }
 
     #[derive(Debug)]
@@ -525,7 +604,7 @@ mod acceptance {
     }
 }
 
-#[cfg(feature = "c88-f2-acceptance")]
+#[cfg(any(feature = "c88-f2-acceptance", feature = "c89-executable"))]
 pub use acceptance::{
     CandidateCallMetrics, CandidateInstance, CandidateModule, CandidatePoll, CandidateValue,
 };

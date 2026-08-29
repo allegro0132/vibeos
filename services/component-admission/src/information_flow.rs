@@ -749,7 +749,7 @@ fn append_value_shape(
 ) -> Result<(), ComponentGraphInformationFlowError> {
     use ValueShape::*;
     match value {
-        #[cfg(feature = "c88-f4-acceptance")]
+        #[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
         F32 | F64 => Err(ComponentGraphInformationFlowError::ProjectionMismatch),
         Bool => append(output, "bool"),
         U8 => append(output, "u8"),

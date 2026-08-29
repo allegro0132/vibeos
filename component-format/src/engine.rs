@@ -19,6 +19,20 @@ pub const WASMI_1_1_0_CHECKSUM: &str =
 pub const WASMI_WASMPARSER_0_239_0_VERSION: &str = "0.239.0";
 pub const WASMI_WASMPARSER_0_239_0_CHECKSUM: &str =
     "8c9d90bb93e764f6beabf1d02028c70a2156a6583e63ac4218dd07ef733368b0";
+pub const C89_SOFTFLOAT_ENGINE_PACKAGE: &str = "vibeos-wasmi-softfloat";
+pub const C89_SOFTFLOAT_ENGINE_VERSION: &str = "1.1.0-vibeos-f2.1";
+pub const C89_SOFTFLOAT_ENGINE_UPSTREAM_REVISION: &str = "8273dfb09d493971b7bb12fe614d740cdc857175";
+pub const C89_SOFTFLOAT_ENGINE_PATCHED_MANIFEST_SHA256: &str =
+    "2d94218e4fa5eea30b8e516e055fae8f72465dbc1ef75f8b1df3495cbcd0432f";
+pub const C89_SOFTFLOAT_ENGINE_PATCH_DELTA_SHA256: &str =
+    "3d2aec1d7e510fc3b3edb87dcacb2d4ed34eb448356704a027841b047938ec64";
+pub const C89_SOFTFLOAT_ENGINE_SOURCE_TREE: &str = "c55904f72c70f9a0d807a13e678fec01b7c78f5a";
+pub const C89_SOFTFLOAT_BACKEND_PACKAGE: &str = "rustc_apfloat";
+pub const C89_SOFTFLOAT_BACKEND_VERSION: &str = "0.2.3+llvm-462a31f5a5ab";
+pub const C89_SOFTFLOAT_BACKEND_ARCHIVE_SHA256: &str =
+    "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad";
+pub const C89_SOFTFLOAT_ENGINE_FEATURES: &str =
+    "default-features=false;extra-checks,prefer-btree-collections;simd=false";
 
 /// Cargo resolves the two direct wasmparser 0.255 users to one package
 /// instance. Consequently both the Component and Core validator roles are
@@ -42,6 +56,39 @@ pub struct ValidationCrateIdentity {
     version: &'static str,
     checksum: &'static str,
     features: &'static str,
+}
+
+/// Audited non-registry source and arithmetic backend bound to the C8.9
+/// executable engine. The value is constructed only in this module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SoftwareFloatSourceIdentity {
+    upstream_revision: &'static str,
+    patch_delta_sha256: &'static str,
+    source_tree: &'static str,
+    backend_package: &'static str,
+    backend_version: &'static str,
+    backend_archive_sha256: &'static str,
+}
+
+impl SoftwareFloatSourceIdentity {
+    pub const fn upstream_revision(self) -> &'static str {
+        self.upstream_revision
+    }
+    pub const fn patch_delta_sha256(self) -> &'static str {
+        self.patch_delta_sha256
+    }
+    pub const fn source_tree(self) -> &'static str {
+        self.source_tree
+    }
+    pub const fn backend_package(self) -> &'static str {
+        self.backend_package
+    }
+    pub const fn backend_version(self) -> &'static str {
+        self.backend_version
+    }
+    pub const fn backend_archive_sha256(self) -> &'static str {
+        self.backend_archive_sha256
+    }
 }
 
 impl ValidationCrateIdentity {
@@ -399,6 +446,7 @@ pub struct ValidationEngineIdentity {
     component_validator: ComponentValidatorConfiguration,
     core_validator: CoreValidatorConfiguration,
     runtime: WasmiRuntimeConfiguration,
+    software_float_source: Option<SoftwareFloatSourceIdentity>,
 }
 
 impl ValidationEngineIdentity {
@@ -443,7 +491,32 @@ impl ValidationEngineIdentity {
             component_validator: ComponentValidatorConfiguration::for_mode(component_mode),
             core_validator,
             runtime,
+            software_float_source: None,
         }
+    }
+
+    const fn for_c89_software_float_contract(profile: ProfileIdentity) -> Self {
+        let mut identity = Self::for_contract(
+            profile,
+            ComponentValidationMode::Sync,
+            CoreValidatorConfiguration::PROFILE_2_SYNC_FLOAT,
+            WasmiRuntimeConfiguration::PROFILE_2_SYNC_FLOAT,
+        );
+        identity.wasmi = ValidationCrateIdentity::new(
+            C89_SOFTFLOAT_ENGINE_PACKAGE,
+            C89_SOFTFLOAT_ENGINE_VERSION,
+            C89_SOFTFLOAT_ENGINE_PATCHED_MANIFEST_SHA256,
+            C89_SOFTFLOAT_ENGINE_FEATURES,
+        );
+        identity.software_float_source = Some(SoftwareFloatSourceIdentity {
+            upstream_revision: C89_SOFTFLOAT_ENGINE_UPSTREAM_REVISION,
+            patch_delta_sha256: C89_SOFTFLOAT_ENGINE_PATCH_DELTA_SHA256,
+            source_tree: C89_SOFTFLOAT_ENGINE_SOURCE_TREE,
+            backend_package: C89_SOFTFLOAT_BACKEND_PACKAGE,
+            backend_version: C89_SOFTFLOAT_BACKEND_VERSION,
+            backend_archive_sha256: C89_SOFTFLOAT_BACKEND_ARCHIVE_SHA256,
+        });
+        identity
     }
 
     pub const fn profile(self) -> ProfileIdentity {
@@ -481,6 +554,10 @@ impl ValidationEngineIdentity {
     pub const fn runtime(self) -> WasmiRuntimeConfiguration {
         self.runtime
     }
+
+    pub const fn software_float_source(self) -> Option<SoftwareFloatSourceIdentity> {
+        self.software_float_source
+    }
 }
 
 const PROFILE_1_SYNC_ENGINE: ValidationEngineIdentity = ValidationEngineIdentity::for_contract(
@@ -501,6 +578,10 @@ const PROFILE_1_NATIVE_ASYNC_ENGINE: ValidationEngineIdentity =
         ComponentValidationMode::Async,
         CoreValidatorConfiguration::PROFILE_1,
         WasmiRuntimeConfiguration::PROFILE_1,
+    );
+const PROFILE_3_SYNC_FLOAT_EXECUTABLE_ENGINE: ValidationEngineIdentity =
+    ValidationEngineIdentity::for_c89_software_float_contract(
+        ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE,
     );
 /// Sealed C8.8-F1 contract metadata. It deliberately contains no frontend or
 /// runtime crate/package/source/checksum identity: F2 must review and bind its
@@ -585,6 +666,8 @@ pub fn current_validation_engine_identity(
     // never promoted in place to a current engine binding.
     if profile == ProfileIdentity::PROFILE_2_SYNC_FLOAT {
         None
+    } else if profile == ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE {
+        Some(&PROFILE_3_SYNC_FLOAT_EXECUTABLE_ENGINE)
     } else if profile == ProfileIdentity::PROFILE_1_SYNC {
         Some(&PROFILE_1_SYNC_ENGINE)
     } else if profile == ProfileIdentity::PROFILE_1_ASYNC {

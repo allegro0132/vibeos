@@ -1,0 +1,129 @@
+{
+  "schema": "vibeos.c88.f5.float-target.duo-v1.transcript-schema",
+  "version": 1,
+  "suite_id": "vibeos.c88.f5.float-target.duo-v1",
+  "run_id": {
+    "algorithm": "sha256",
+    "domain_ascii": "vibeos.c88.f5.float-target.duo-v1.run.v1",
+    "domain_nul_terminated": true,
+    "nul_separated_fields": [
+      "source_commit",
+      "source_tree",
+      "challenge",
+      "manifest_sha256",
+      "transcript_schema_sha256",
+      "candidate_sha256"
+    ]
+  },
+  "semantic_digest": {
+    "algorithm": "sha256",
+    "domain_ascii": "vibeos.c88.f5.float-target.semantic.v1",
+    "domain_nul_terminated": true,
+    "expected_sha256": "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1",
+    "family_order": [
+      "CORE_CASE",
+      "F3_CASE",
+      "F4_VECTOR",
+      "FUEL",
+      "LIFECYCLE"
+    ],
+    "record_encoding": "family-nul-canonical-semantic-json-newline"
+  },
+  "uart": {
+    "prefixes": {
+      "metadata": "VIBE_C88_F5_DUO_META ",
+      "core": "VIBE_C88_F5_DUO_CORE_CASE ",
+      "canonical_abi": "VIBE_C88_F5_DUO_F3_CASE ",
+      "component_vector": "VIBE_C88_F5_DUO_F4_VECTOR ",
+      "fuel": "VIBE_C88_F5_DUO_FUEL ",
+      "lifecycle": "VIBE_C88_F5_DUO_LIFECYCLE ",
+      "end": "VIBE_C88_F5_DUO_END ",
+      "pass": "VIBE_C88_F5_DUO_PASS ",
+      "fail": "VIBE_C88_F5_DUO_FAIL "
+    },
+    "schema_ids": {
+      "metadata": "vibeos.c88.f5.float-target.duo-v1.meta",
+      "core": "vibeos.c88.f5.float-target.duo-v1.core-case",
+      "canonical_abi": "vibeos.c88.f5.float-target.duo-v1.f3-case",
+      "component_vector": "vibeos.c88.f5.float-target.duo-v1.f4-vector",
+      "fuel": "vibeos.c88.f5.float-target.duo-v1.fuel",
+      "lifecycle": "vibeos.c88.f5.float-target.duo-v1.lifecycle",
+      "end": "vibeos.c88.f5.float-target.duo-v1.end",
+      "pass": "vibeos.c88.f5.float-target.duo-v1.pass",
+      "fail": "vibeos.c88.f5.float-target.duo-v1.fail"
+    }
+  },
+  "records": {
+    "core": 146,
+    "canonical_abi": 13,
+    "component_vectors": 12,
+    "fuel": 1000,
+    "lifecycle": 5,
+    "total": 1176
+  },
+  "evidence_contract": {
+    "readiness_stage": "compile-only-inert-sentinel",
+    "physical_status": "deferred",
+    "physical_provenance": "not-claimed",
+    "binding_mode": "reserved-non-evidence-sentinel",
+    "runtime_bindings_required": true,
+    "sentinel_bindings_present": true,
+    "formal_physical_bindings_present": false,
+    "execution_armed": false,
+    "capture_present": false,
+    "physical_evidence_present": false,
+    "future_operator_confirmed_cold_boots_required": 3,
+    "same_semantic_sha256_required": true
+  },
+  "compile_readiness_sentinel": {
+    "kind": "reserved-non-evidence-sentinel",
+    "source_commit": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+    "source_tree": "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2",
+    "challenge": "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
+    "candidate_sha256": "5fdb9dc9a48a9c54e899a5dc724445083c055dbf0d664927ba55d9780cc9996a",
+    "manifest_sha256_source": "sha256-of-this-checked-in-manifest-bytes",
+    "transcript_schema_sha256_source": "sha256-of-checked-in-transcript-schema-bytes",
+    "run_id_source": "sha256-per-run-id-contract-with-these-sentinels",
+    "arm_marker": "vibeos.c88.f5.duo.compile-readiness.arm=0",
+    "arm_byte": 0
+  },
+  "future_physical_gate": {
+    "each_boot_operator_confirmed_power_cycle_required": true,
+    "each_boot_operator_confirmed_cold_boot_required": true,
+    "operator_confirmed_power_cycles_required": 3,
+    "operator_confirmed_power_cycles_present": 0,
+    "operator_confirmed_cold_boots_required": 3,
+    "operator_confirmed_cold_boots_present": 0,
+    "independent_cold_boots_required": true,
+    "same_challenge_required": true,
+    "same_run_id_required": true,
+    "unique_capture_boot_id_required": true,
+    "required_boot_ordinals": [0, 1, 2],
+    "same_identity_fields_required": [
+      "source_commit",
+      "source_tree",
+      "challenge",
+      "run_id",
+      "manifest_sha256",
+      "transcript_schema_sha256",
+      "candidate_sha256",
+      "kernel_elf_sha256"
+    ],
+    "per_boot_transcript_order": [
+      "metadata",
+      "data-records:1176",
+      "end",
+      "pass"
+    ],
+    "complete_transcripts_present": 0,
+    "no_fail_record_required": true,
+    "terminal_quiescence_after_pass_required": true,
+    "terminal_quiescences_present": 0,
+    "unexpected_uart_after_pass_forbidden": true,
+    "operator_power_off_after_pass_required": true,
+    "operator_power_off_confirmations_present": 0,
+    "same_semantic_sha256_required": true,
+    "required_semantic_sha256": "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1",
+    "gate_satisfied": false
+  }
+}

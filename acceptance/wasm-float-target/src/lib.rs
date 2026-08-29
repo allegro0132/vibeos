@@ -1,6 +1,9 @@
 #![no_std]
 #![cfg_attr(
-    not(feature = "c88-f5-acceptance"),
+    not(any(
+        feature = "c88-f5-acceptance",
+        feature = "c88-f5-duo-compile-readiness"
+    )),
     doc = r#"
 The C8.8-F5 target qualification runner is structurally absent by default:
 
@@ -13,14 +16,30 @@ use vibeos_wasm_float_target::{qualify, QualificationReport};
 //! Shared C8.8-F5 host and target scalar-float qualification.
 //!
 //! The same `no_std` routine runs in host tests and in the isolated fixed-QEMU
-//! image. It consumes the exact F4 image pin and exercises the F2/F3/F4
-//! candidate stack. It does not publish a command, bind a current engine,
-//! create a durable object, or allocate an executable successor profile.
+//! image, and is compile-wired into the isolated Milk-V Duo readiness image.
+//! Platform and evidence envelopes remain kernel-adapter concerns. This crate
+//! consumes the exact F4 image pin and exercises the F2/F3/F4 candidate stack.
+//! It does not publish a command, bind a current engine, create a durable
+//! object, or allocate an executable successor profile.
 
-#[cfg(feature = "c88-f5-acceptance")]
+#[cfg(all(
+    feature = "c88-f5-acceptance",
+    feature = "c88-f5-duo-compile-readiness"
+))]
+compile_error!(
+    "features `c88-f5-acceptance` and `c88-f5-duo-compile-readiness` are mutually exclusive platform selections"
+);
+
+#[cfg(any(
+    feature = "c88-f5-acceptance",
+    feature = "c88-f5-duo-compile-readiness"
+))]
 extern crate alloc;
 
-#[cfg(feature = "c88-f5-acceptance")]
+#[cfg(any(
+    feature = "c88-f5-acceptance",
+    feature = "c88-f5-duo-compile-readiness"
+))]
 mod acceptance {
     use alloc::{boxed::Box, vec, vec::Vec};
     use sha2::{Digest, Sha256};
@@ -54,9 +73,12 @@ mod acceptance {
 
     include!(concat!(env!("OUT_DIR"), "/scalar_target_identity.rs"));
 
-    pub const PLATFORM: &str = "qemu-virt-rv64-tcg-icount-v1";
-    pub const PLATFORM_CLASS: &str = "emulator";
-    pub const PHYSICAL_PROVENANCE: &str = "not-claimed";
+    #[cfg(feature = "c88-f5-duo-compile-readiness")]
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/qualification_duo_v1_manifest_identity.rs"
+    ));
+
     pub const CANDIDATE_SHA256: &str =
         "5fdb9dc9a48a9c54e899a5dc724445083c055dbf0d664927ba55d9780cc9996a";
     pub const CANDIDATE_SHA256_BYTES: [u8; 32] = [
@@ -1804,10 +1826,19 @@ mod acceptance {
     }
 }
 
-#[cfg(feature = "c88-f5-acceptance")]
+#[cfg(any(
+    feature = "c88-f5-acceptance",
+    feature = "c88-f5-duo-compile-readiness"
+))]
 pub use acceptance::*;
 
-#[cfg(all(test, feature = "c88-f5-acceptance"))]
+#[cfg(all(
+    test,
+    any(
+        feature = "c88-f5-acceptance",
+        feature = "c88-f5-duo-compile-readiness"
+    )
+))]
 mod tests {
     extern crate std;
 

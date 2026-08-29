@@ -51,8 +51,13 @@ compile_error!("exactly one image policy must be selected");
 ))]
 compile_error!("feature `c53-native-async-qemu-acceptance` requires `qemu-default`");
 
-#[cfg(all(feature = "c88-f4-float-candidate", not(feature = "qemu-default")))]
-compile_error!("feature `c88-f4-float-candidate` requires `qemu-default`");
+#[cfg(all(
+    feature = "c88-f4-float-candidate",
+    not(any(feature = "qemu-default", feature = "milkv-duo-sd"))
+))]
+compile_error!(
+    "feature `c88-f4-float-candidate` requires an explicit QEMU or Milk-V Duo image policy"
+);
 
 #[cfg(all(
     feature = "c64-resource-route-qemu-acceptance",

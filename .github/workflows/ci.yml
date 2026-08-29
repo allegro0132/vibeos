@@ -118,6 +118,18 @@ jobs:
             acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-normal-receipt.json \
             --optimized-receipt \
             acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-optimized-receipt.json
+      - name: Verify the unallocated Float successor review boundary
+        # Charter integrity only: no successor identity or engine is selected,
+        # and no implementation, execution, admission, or production is authorized.
+        run: |
+          python3 -B scripts/verify-c88-float-successor-review-boundary.py \
+            --check-contract
+          python3 -O -B scripts/verify-c88-float-successor-review-boundary.py \
+            --check-contract
+          python3 -B scripts/verify-c88-float-successor-review-boundary.py \
+            --selftest
+          python3 -O -B scripts/verify-c88-float-successor-review-boundary.py \
+            --selftest
       - name: Verify the retained C8.8-F5 Duo non-evidence contracts
         # Retained compile/schema integrity only. Physical Duo completion is
         # paused and is not a C8.8-F5 roadmap gate.

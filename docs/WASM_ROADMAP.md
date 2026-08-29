@@ -47,6 +47,8 @@ closes another C8.8 feature widening nor authorizes an engine, execution,
 production admission, native bytes, AOT, or in-place promotion. It opens only
 design review for a separately numbered successor whose identity remains
 unallocated and whose implementation is not authorized.
+The neutral `post-c88-f5-pre-allocation` charter freezes only eight unresolved,
+blocking review questions and allocates or authorizes nothing.
 
 ---
 
@@ -1124,6 +1126,37 @@ remains permanently `ValidationOnly` and inert, and the closed Float evidence
 only makes design review eligible for a separately numbered, unallocated
 successor. No successor implementation, engine binding, execution, production
 admission, native-byte acceptance, AOT, or in-place promotion is authorized.
+
+### Post-C8.8-F5 successor review boundary (not an allocated node)
+
+The neutral
+[`float-successor-review-boundary-v1-contract.json`](../acceptance/wasm-float-target/artifacts/float-successor-review-boundary-v1-contract.json)
+turns design-review eligibility into a fail-closed charter without selecting a
+design. Its verifier checks canonical contract bytes plus the exact historical
+F5 contract, verifier, decision, and normal/optimized receipt members. Passing
+means `review-charter-integrity-only`: it neither replays F5 evidence nor
+establishes that the review passed.
+
+The successor identity is still `unallocated`. Its roadmap number, profile
+code, artifact/runtime ABIs, Core/Component revisions, stage, engine, supply
+chain, production admission path, durable format, and target/release evidence
+gate are all unselected. Code 5 remains permanently `ValidationOnly`, inert,
+and ineligible for migration or promotion in place. Every implementation,
+execution, current-engine, native-byte, AOT/JIT/RWX, command, admission,
+durable-publication, release, and production authorization remains false.
+
+Eight review questions remain unresolved and blocking for later, separately
+versioned work: identity/version allocation; engine/supply-chain selection;
+semantic and evidence inheritance; production admission/authority; durability,
+upgrade and rollback; global accounting/concurrency/lifecycle; target/release
+evidence; and final authorization/rollout. F5 evidence may be referenced only
+for the closed F5 identity and cannot automatically become successor engine,
+activation, admission, or release evidence.
+
+The fixed-QEMU replacement remains scoped to C8.8-F5. Milk-V Duo stays paused,
+retained, non-blocking, and non-evidence; this charter takes zero physical
+inputs and changes no unrelated hardware gate. C8.5--C8.7 remain globally
+deferred and every other C8.8 widening remains incomplete.
 
 ## 10. Test and evidence matrix
 

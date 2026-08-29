@@ -28,11 +28,15 @@ candidate admission/lifecycle path, including quota, cancel/revoke, fault
 reclamation/recovery, and durable-rejection gates. Artifact profile code 5
 remains permanently `ValidationOnly` and inert: it has no production
 admission, command, durable/publication, current-engine, or production
-execution path and can never be promoted in place. The host and fixed-QEMU
-portion of C8.8-F5 now passes at pushed source commit
-`feddae65ee499a0b4b5d9b603c9bac0e4374e800`; Milk-V Duo physical qualification
-remains paused and is not claimed. Consequently F5, Float, and C8.8 are not
-fully closed, and no separately numbered executable successor is authorized.
+execution path and can never be promoted in place. The host/fixed-QEMU portion
+of C8.8-F5 passes at pushed implementation commit
+`c4ea5e5ca1de622884f33c01bf06653f498360aa`. The same commit adds a separate,
+default-off Milk-V Duo compile-readiness slice whose host contract, cross-link,
+and static ELF audit pass. That inert sentinel is compile/static evidence only:
+`execution_armed=false`, `physical_provenance=not-claimed`, and no capture or
+source-build provenance is claimed. Milk-V Duo physical qualification remains
+paused. Consequently F5, Float, and C8.8 are not fully closed, and no
+separately numbered executable successor is authorized.
 
 ---
 
@@ -901,40 +905,78 @@ This is explicit candidate-only activation evidence, not a current-engine or
 production activation path. F4 itself made no fixed-QEMU or physical-Duo
 execution claim; those remain separately attributed to F5.
 
-The non-physical portion of F5 now reuses one `no_std` qualification routine on
-the host and in an isolated, default-off QEMU firmware image. The frozen corpus
-contains 146 Core runtime/fold/repeatability observations, 13 Canonical ABI
-records, 12 image/lifecycle vectors, 1,000 fuel records, and 5 terminal
-lifecycle snapshots. A formal run from clean, already-pushed commit
-`feddae65ee499a0b4b5d9b603c9bac0e4374e800` on
-`qemu-virt-rv64-tcg-icount-v1` accepted all 1,176 data records and reproduced
-semantic SHA-256
+The non-physical portion of F5 reuses one `no_std` qualification routine on the
+host and in isolated, default-off target images. The frozen corpus contains 146
+Core runtime/fold/repeatability observations, 13 Canonical ABI records, 12
+image/lifecycle vectors, 1,000 fuel records, and 5 terminal lifecycle
+snapshots. A formal fixed-QEMU regression from clean, already-pushed
+implementation commit `c4ea5e5ca1de622884f33c01bf06653f498360aa`, source tree
+`ec7e1195b1a8ba4a88d37a817a9e0f64c4432016`, and challenge
+`8fb4bba646b9755b897d5dcbab0cb5724f0c2821b30ee99bbfe76c9a470fce9a`
+used the fixed QEMU 11.0.3 `qemu-virt-rv64-tcg-icount-v1` contract. It accepted
+all 1,176 data records and reproduced semantic SHA-256
 `51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`.
 The source-bound run ID is
-`91b662adb335d286759ca7131b28b351710c3c598efc45aeef01610038468db8`.
+`08cf7c906917fb6a9d1b482f461f12abfc30339bd7136124ae609fa5568c1caa`.
 
-The retained kernel is 40,447,896 bytes with SHA-256
-`095e01ea516766a3d7684aaa46a511c3096c1c8bb4d18a205eb8f5234e3c0f52`;
+The retained QEMU kernel is 40,449,184 bytes with SHA-256
+`0ef0ce1bf8f9aad1a5f35bbd783c94ea2fcfbc0fffc72285d5fe5efd781f146e`;
 the UART transcript is 384,916 bytes with SHA-256
-`0c75cba0182fe07208b66460b1c9e4bec4724809b96bea9f19318cafb1d17f4e`.
+`ede6c9fc7b68982f372762af51d4a786224c6a54c115ac50be7f7e5a4d8de621`.
 The byte-reproducible final-ELF report is 2,031 bytes with SHA-256
-`e12ae44227968752c1adc5627a5c226e2b8867e0f93a8ecb12fa755cdfacffc6`;
-the canonical environment envelope is 84,787 bytes with file SHA-256
-`554f3d6ad540ec1249246ed1809c14562773bac87475f2979b1ba5990ae86e5e`
+`cc70f99f265eb1fa767407b555d7324a7e49a4ed8d24b856859416f3557896af`;
+the canonical environment envelope is 84,839 bytes with file SHA-256
+`3307451b5273f00d455ca95cea58e13e78dbcbea5e752a11274cc1abcff48fe6`
 and whole-envelope evidence digest
-`11b6778d60ea774d2087254f6e149adf146a73e9595004ecf80b676d8412996b`.
-Normal and optimized independent verifier replays both pass, and an optimized
-standalone ELF audit produces the exact retained report bytes.
+`6ad5d168efc32abf88bf982ef59decdd6eaa53f2c1a25d38f2d732c2a2eac8df`.
+Normal and optimized independent verifier replays pass, and standalone ELF
+audits reproduce the retained report bytes.
 
-The final RV64 IMAC ELF is static, relocation-free, W^X, soft-ABI/RVC, and has
-zero forbidden F/D opcodes, undefined symbols, or Float helper symbols at its
-381,944 canonical decoder boundaries. It contains 381,943 decoded
-instructions, 42,010 trusted direct control-flow targets, and 128,653 code
+The final QEMU RV64 IMAC ELF is static, relocation-free, W^X, soft-ABI/RVC, and
+has zero forbidden F/D opcodes, undefined symbols, or Float helper symbols at
+381,935 canonical decoder boundaries. It contains 381,934 decoded
+instructions, 42,010 trusted direct control-flow targets, and 128,657 code
 symbols. This audit is deliberately limited to trusted native control flow at
 canonical decoder boundaries; arbitrary-PC redirection and hardware NX are not
-claimed. The build envelope also closes 190 Cargo registry archives and the
+claimed. The build envelope still closes 190 Cargo registry archives and the
 exact 3,603-file, 71,790,604-byte pinned `rust-src` tree. These are emulator
 and local software-custody facts only: `physical_provenance=not-claimed`.
+
+Separately, the same pushed implementation commit freezes the Duo suite
+`vibeos.c88.f5.float-target.duo-v1` for platform
+`milkv-duo-cv1800b-c906-v1`. Its 4,159-byte manifest has SHA-256
+`1c85f22cacee7c8eb7693578052fe0452169eace99f1dab06e08aa0e42771b11`;
+its 4,692-byte transcript schema has SHA-256
+`e25d9a38d194993906b7fe5ec9708654ea31e2386ac61f0fa360ed8ad1eb7439`.
+The reserved non-evidence sentinel run ID is
+`c5c8ec42e56fbeaf38106965e5ec6735cb86a93af530cd37f5002dba1971b4ac`,
+with immutable arm marker `vibeos.c88.f5.duo.compile-readiness.arm=0`. The
+build only cross-links; it does not package, flash, connect to serial, or
+execute.
+
+The locally audited Duo RV64 IMAC ELF is 40,331,520 bytes with SHA-256
+`e9a58e681c4d3e073dbeb1d15f569600e0ab2a97c07f13ed1dc0c676b5d62b1e`.
+Its 2,031-byte audit report has SHA-256
+`0b3384b35d85fdee970b98f523b7bd814102611549c08e7915625310954beac4`;
+it contains 380,650 decoded instructions, 380,651 canonical boundaries, 41,883
+trusted direct targets, and 128,210 code symbols, with zero forbidden opcodes,
+Float helpers, or undefined symbols. This ELF identity records the local
+compile-readiness run; the verifier intentionally freezes structure and
+payload rather than globally pinning whole ELF bytes because source-build
+provenance is not claimed.
+
+The sentinel ELF and run ID can never satisfy the physical gate, and patching
+the readiness image is not an arming procedure. Resumed testing requires a
+separately reviewed physical feature/arm contract with formal, non-sentinel
+bindings. The same-identity rule below applies only across the three captures
+of that future physical run.
+
+The future physical gate remains frozen but unsatisfied. It requires three
+operator-confirmed power cycles and cold boots of one byte-identical
+kernel/challenge/run ID, distinct capture boot IDs with ordinals 0, 1, and 2,
+exact metadata followed by 1,176 records, END and PASS, terminal quiescence,
+and operator power-off confirmation. Every physical counter is zero and
+`gate_satisfied=false`; no physical evidence is claimed.
 
 As of 2026-08-28, C1 through C8.3 are accepted complete by historical-evidence
 policy. The completed C8.4 decision-bearing chain is the fixed-QEMU contract
@@ -1005,10 +1047,12 @@ attributable to interpretation and the outcome is
 `aot-not-justified-on-fixed-qemu`; AOT remains unauthorized and no native code
 is accepted. C8.5 through C8.7 are skipped for this workload and remain
 globally deferred; they are not marked complete.
-The current implementation node is C8.8. C8.8-F1 through C8.8-F4 are complete,
-and C8.8-F5's host/fixed-QEMU portion is complete. Its physical-Duo sub-gate is
-deferred at operator request, so F5, Float, and C8.8 remain not fully complete.
-There is no authorized executable successor to enter while that state holds.
+The current implementation node is C8.8. C8.8-F1 through C8.8-F4 are complete;
+C8.8-F5's host/fixed-QEMU portion and inert Duo compile-readiness slice are
+complete. Compile readiness is not physical qualification. The physical-Duo
+evidence sub-gate remains deferred at operator request, so F5, Float, and C8.8
+remain not fully complete. There is no authorized executable successor to
+enter while that state holds.
 
 ## 10. Test and evidence matrix
 

@@ -195,6 +195,26 @@ python3 -O -B scripts/verify-c88-f5-riscv-elf.py \
   --output "$f5_evidence_dir/elf-audit-replay-o.json"
 cmp "$f5_evidence_dir/elf-audit.json" \
   "$f5_evidence_dir/elf-audit-replay-o.json"
+# C8.8-F5 Milk-V Duo contract and compile-readiness gates.
+# Compile/static inspection only: no packaging, flashing, serial access, boot,
+# capture, or physical-evidence claim.
+cargo test --locked --offline -p vibeos-wasm-float-target \
+  --no-default-features \
+  --features c88-f5-duo-compile-readiness
+python3 -B scripts/verify-c88-f5-duo-readiness.py
+python3 -O -B scripts/verify-c88-f5-duo-readiness.py
+python3 -B scripts/verify-c88-f5-duo-readiness.py --selftest
+python3 -O -B scripts/verify-c88-f5-duo-readiness.py --selftest
+./scripts/build-c88-f5-duo-readiness.sh
+duo_readiness_elf="target/c88-f5-duo-readiness/build/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo"
+duo_audit_dir="$(mktemp -d /private/tmp/vibeos-c88-f5-duo-audit.XXXXXX)"
+python3 -B scripts/verify-c88-f5-duo-readiness.py \
+  --elf "$duo_readiness_elf" \
+  --audit-output "$duo_audit_dir/normal.json"
+python3 -O -B scripts/verify-c88-f5-duo-readiness.py \
+  --elf "$duo_readiness_elf" \
+  --audit-output "$duo_audit_dir/optimized.json"
+cmp "$duo_audit_dir/normal.json" "$duo_audit_dir/optimized.json"
 cargo fmt -p vibeos-component-format -- --check
 cargo fmt -p vibeos-wasm-runtime -- --check
 cargo fmt -p vibeos-wasm-float-candidate -- --check
@@ -727,32 +747,69 @@ loop through bounded pending quanta to deterministic reclamation and cold
 recovery. The loader and graph-codec tests independently keep code 5 out of
 production durable loading and CGV1.
 
-F1 through F4 are complete. F4 evidence above remains host evidence; F5 owns the
-separate target claim. The F5 host/fixed-QEMU sub-gate now passes from clean,
-already-pushed commit `feddae65ee499a0b4b5d9b603c9bac0e4374e800`. The formal
-run accepted 1,176 records with semantic SHA-256
-`51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`
-and run ID
-`91b662adb335d286759ca7131b28b351710c3c598efc45aeef01610038468db8`.
-The audited kernel/UART/ELF-report/environment SHA-256 values are respectively
-`095e01ea516766a3d7684aaa46a511c3096c1c8bb4d18a205eb8f5234e3c0f52`,
-`0c75cba0182fe07208b66460b1c9e4bec4724809b96bea9f19318cafb1d17f4e`,
-`e12ae44227968752c1adc5627a5c226e2b8867e0f93a8ecb12fa755cdfacffc6`,
-and `554f3d6ad540ec1249246ed1809c14562773bac87475f2979b1ba5990ae86e5e`.
-Normal and optimized independent replays pass, including a byte-identical
-standalone ELF audit.
+F1 through F4 are complete. F4 evidence above remains host evidence; F5 owns
+the separate target claim. The F5 host/fixed-QEMU sub-gate passes from clean,
+already-pushed implementation commit
+`c4ea5e5ca1de622884f33c01bf06653f498360aa` (tree
+`ec7e1195b1a8ba4a88d37a817a9e0f64c4432016`). The formal QEMU regression used
+challenge
+`8fb4bba646b9755b897d5dcbab0cb5724f0c2821b30ee99bbfe76c9a470fce9a`,
+accepted 1,176 records with semantic SHA-256
+`51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`,
+and produced run ID
+`08cf7c906917fb6a9d1b482f461f12abfc30339bd7136124ae609fa5568c1caa`.
+The audited QEMU kernel, UART, ELF-report, and environment identities are:
 
-The final ELF audit covers trusted native control flow at canonical decoder
-boundaries and finds zero RISC-V F/D opcodes, undefined symbols, or forbidden
-Float helpers. It does not claim arbitrary-PC redirection or hardware NX. The
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| QEMU kernel ELF | 40,449,184 | `0ef0ce1bf8f9aad1a5f35bbd783c94ea2fcfbc0fffc72285d5fe5efd781f146e` |
+| QEMU UART | 384,916 | `ede6c9fc7b68982f372762af51d4a786224c6a54c115ac50be7f7e5a4d8de621` |
+| QEMU final-ELF report | 2,031 | `cc70f99f265eb1fa767407b555d7324a7e49a4ed8d24b856859416f3557896af` |
+| QEMU environment | 84,839 | `3307451b5273f00d455ca95cea58e13e78dbcbea5e752a11274cc1abcff48fe6` |
+
+The environment evidence digest is
+`6ad5d168efc32abf88bf982ef59decdd6eaa53f2c1a25d38f2d732c2a2eac8df`.
+Normal and optimized independent replays pass, including byte-identical
+standalone ELF audits. The QEMU ELF contains 381,934 decoded instructions,
+381,935 canonical boundaries, 42,010 trusted direct targets, and 128,657 code
+symbols, with zero RISC-V F/D opcodes, undefined symbols, or forbidden Float
+helpers. The audit covers trusted native control flow at canonical decoder
+boundaries; it does not claim arbitrary-PC redirection or hardware NX. The
 platform is an emulator and records `physical_provenance=not-claimed`.
-Milk-V Duo physical qualification remains paused, so F5, Float, and C8.8 are
-not fully closed and no executable successor is authorized. The full contract
-is in [docs/WASM_FLOAT_PROFILE.md](docs/WASM_FLOAT_PROFILE.md).
 
-See [docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md) for the deferred
-Duo-v1 physical formal build, package, image-verification, capture, and
-publication commands.
+The same commit's separate Duo compile-readiness slice freezes suite
+`vibeos.c88.f5.float-target.duo-v1`, platform
+`milkv-duo-cv1800b-c906-v1`, and an immutable unarmed sentinel. Its 4,159-byte
+manifest has SHA-256
+`1c85f22cacee7c8eb7693578052fe0452169eace99f1dab06e08aa0e42771b11`;
+its 4,692-byte transcript schema has SHA-256
+`e25d9a38d194993906b7fe5ec9708654ea31e2386ac61f0fa360ed8ad1eb7439`.
+The locally observed cross-linked ELF is 40,331,520 bytes with SHA-256
+`e9a58e681c4d3e073dbeb1d15f569600e0ab2a97c07f13ed1dc0c676b5d62b1e`;
+its 2,031-byte audit is SHA-256
+`0b3384b35d85fdee970b98f523b7bd814102611549c08e7915625310954beac4`.
+It contains 380,650 decoded instructions, 380,651 canonical boundaries,
+41,883 trusted direct targets, and 128,210 code symbols, with zero forbidden
+opcodes, Float helpers, or undefined symbols. Normal and optimized Duo
+verifier/auditor runs pass and produce byte-identical audit reports.
+
+The Duo result is compile readiness only. It was not packaged, flashed, run, or
+captured and does not establish physical or source-build provenance. Its
+contract records `execution_armed=false`, `physical_evidence_present=false`,
+and three required physical cold boots with every present counter at zero. The
+sentinel ELF and run ID can never satisfy that gate, and patching this readiness
+image is not an arming procedure. Resumed testing requires a separately
+reviewed physical feature/arm contract with formal, non-sentinel bindings; its
+same-identity rule applies only across that future run's three captures.
+Milk-V Duo physical qualification remains paused; therefore F5, Float, and
+C8.8 remain open and no executable successor is authorized. The C8.8-F5
+contract is in [docs/WASM_FLOAT_PROFILE.md](docs/WASM_FLOAT_PROFILE.md), and
+the frozen readiness gate is in
+[qualification-duo-v1-manifest.json](acceptance/wasm-float-target/artifacts/qualification-duo-v1-manifest.json).
+
+For the historical C8.4 Duo/AOT flow only, see
+[docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md). It is not the C8.8-F5
+physical qualification contract.
 
 The portable C8.4 hook gate above exercises the default-off, caller-clocked
 boundary around the real synchronous Core poll. It proves ordinary and

@@ -247,6 +247,12 @@ wasm-c812-r3-reference-qemu-qualification = [
     "dep:vibeos-wasm-reference-target",
     "vibeos-wasm-reference-target/c812-r3-qemu-qualification",
 ]
+# C8.13-E3 independently numbered code-10 fixed-QEMU qualification.
+wasm-c813-e3-reference-qemu-qualification = [
+    "dep:sha2",
+    "dep:vibeos-wasm-reference-target",
+    "vibeos-wasm-reference-target/c813-e3-qemu-qualification",
+]
 # Isolated Milk-V Duo compile-readiness image for the same portable F5
 # qualification. It carries a reserved non-evidence sentinel identity behind
 # an immutable runtime-opaque arm byte of zero; no physical capture or evidence

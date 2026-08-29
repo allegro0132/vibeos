@@ -1,4 +1,7 @@
-#[cfg(feature = "c812-r3-qemu-qualification")]
+#[cfg(any(
+    feature = "c812-r3-qemu-qualification",
+    feature = "c813-e3-qemu-qualification"
+))]
 use std::{env, fs, path::PathBuf};
 
 const SOURCES: &[(&str, &str)] = &[
@@ -16,11 +19,17 @@ fn main() {
     for (_, source) in SOURCES {
         println!("cargo:rerun-if-changed={source}");
     }
-    #[cfg(feature = "c812-r3-qemu-qualification")]
+    #[cfg(any(
+        feature = "c812-r3-qemu-qualification",
+        feature = "c813-e3-qemu-qualification"
+    ))]
     build_inputs();
 }
 
-#[cfg(feature = "c812-r3-qemu-qualification")]
+#[cfg(any(
+    feature = "c812-r3-qemu-qualification",
+    feature = "c813-e3-qemu-qualification"
+))]
 fn build_inputs() {
     use sha2::{Digest, Sha256};
 

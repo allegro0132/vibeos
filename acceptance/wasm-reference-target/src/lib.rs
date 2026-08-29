@@ -144,3 +144,113 @@ mod qualification {
 
 #[cfg(feature = "c812-r3-qemu-qualification")]
 pub use qualification::{qualify, QualificationReport, CASE_IDS};
+
+#[cfg(feature = "c813-e3-qemu-qualification")]
+mod executable_qualification {
+    use vibeos_component_format::{
+        current_validation_engine_identity, ProfileIdentity, ProfileStage, TrapCode,
+    };
+    use vibeos_component_runtime::decode::current_component_validation_engine;
+    use vibeos_wasm_reference_candidate::validate;
+    use vibeos_wasm_reference_executable::{execute, ExecutableValue};
+    use vibeos_wasm_runtime::current_core_validation_engine;
+
+    #[allow(dead_code)]
+    mod inputs {
+        include!(concat!(env!("OUT_DIR"), "/inputs.rs"));
+    }
+    use inputs::*;
+
+    pub const EXECUTABLE_CASE_IDS: [&str; 8] = [
+        "nullable-funcref-execution",
+        "table-operations-execution",
+        "externref-containment",
+        "reference-boundary-containment",
+        "adjacent-proposals",
+        "current-engine-binding",
+        "predecessor-inertness",
+        "fuel-containment",
+    ];
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ExecutableQualificationReport {
+        pub cases: [bool; 8],
+        pub code5_inert: bool,
+        pub code9_inert: bool,
+        pub durable_authorized: bool,
+        pub migration_authorized: bool,
+        pub release_before_qualification: bool,
+    }
+
+    impl ExecutableQualificationReport {
+        pub fn passed(&self) -> bool {
+            self.cases.iter().all(|v| *v)
+                && self.code5_inert
+                && self.code9_inert
+                && !self.durable_authorized
+                && !self.migration_authorized
+                && !self.release_before_qualification
+        }
+    }
+
+    pub fn qualify_executable() -> ExecutableQualificationReport {
+        let bounded = execute(BOUNDED_WASM, "run", &[], 10_000)
+            .is_ok_and(|(values, used)| values == [ExecutableValue::I32(1)] && used > 0);
+        let table = execute(TABLE_WASM, "run", &[], 10_000)
+            .is_ok_and(|(values, used)| values == [ExecutableValue::I32(3)] && used > 0);
+        let externref = validate(EXTERNREF_WASM) == Err(TrapCode::UnsupportedFeature)
+            && execute(EXTERNREF_WASM, "run", &[], 10_000) == Err(TrapCode::Validation);
+        let boundary = validate(REFERENCE_EXPORT_WASM) == Err(TrapCode::UnsupportedFeature)
+            && execute(REFERENCE_EXPORT_WASM, "leak", &[], 10_000) == Err(TrapCode::Validation);
+        let adjacent = execute(PASSIVE_WASM, "run", &[], 10_000).is_err()
+            && execute(MULTIPLE_TABLES_WASM, "run", &[], 10_000).is_err()
+            && execute(ADJACENT_FLOAT_WASM, "run", &[], 10_000).is_err();
+        let profile = ProfileIdentity::PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE;
+        let engine = current_validation_engine_identity(profile).is_some()
+            && current_component_validation_engine(profile).is_some()
+            && current_core_validation_engine(profile).is_some()
+            && profile.stage == ProfileStage::Executable
+            && profile.execution_enabled();
+        let code5_inert =
+            current_validation_engine_identity(ProfileIdentity::PROFILE_2_SYNC_FLOAT).is_none();
+        let code9 = ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION;
+        let code9_inert = current_validation_engine_identity(code9).is_none()
+            && current_component_validation_engine(code9).is_none()
+            && current_core_validation_engine(code9).is_none()
+            && !code9.execution_enabled();
+        let fuel = execute(BOUNDED_WASM, "run", &[], 0) == Err(TrapCode::FuelExhausted)
+            && execute(BOUNDED_WASM, "run", &[], 1).is_err();
+        ExecutableQualificationReport {
+            cases: [
+                bounded,
+                table,
+                externref,
+                boundary,
+                adjacent,
+                engine,
+                code5_inert && code9_inert,
+                fuel,
+            ],
+            code5_inert,
+            code9_inert,
+            durable_authorized: false,
+            migration_authorized: false,
+            release_before_qualification: false,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn executable_report_is_exact() {
+            let report = qualify_executable();
+            assert!(report.passed(), "{report:?}");
+        }
+    }
+}
+
+#[cfg(feature = "c813-e3-qemu-qualification")]
+pub use executable_qualification::{
+    qualify_executable, ExecutableQualificationReport, EXECUTABLE_CASE_IDS,
+};

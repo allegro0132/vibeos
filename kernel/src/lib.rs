@@ -49,6 +49,7 @@
         feature = "wasm-c88-f5-float-duo-compile-readiness",
         feature = "wasm-c810-s5-simd-qemu-qualification",
         feature = "wasm-c812-r3-reference-qemu-qualification",
+        feature = "wasm-c813-e3-reference-qemu-qualification",
         feature = "ssh-native-async-command",
         feature = "ssh-native-async-qemu-acceptance",
         feature = "ssh-native-async-revoke-qemu-acceptance"
@@ -102,6 +103,20 @@ compile_error!(
     not(feature = "qemu-virt")
 ))]
 compile_error!("feature `wasm-c812-r3-reference-qemu-qualification` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c813-e3-reference-qemu-qualification",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c813-e3-reference-qemu-qualification` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c813-e3-reference-qemu-qualification",
+    not(feature = "qemu-default-image")
+))]
+compile_error!(
+    "feature `wasm-c813-e3-reference-qemu-qualification` requires the QEMU image policy"
+);
 
 #[cfg(all(
     feature = "wasm-c812-r3-reference-qemu-qualification",
@@ -1065,6 +1080,8 @@ mod wasm_aot_profile_slot;
     feature = "wasm-c88-f5-float-duo-compile-readiness"
 ))]
 mod wasm_float_target;
+#[cfg(feature = "wasm-c813-e3-reference-qemu-qualification")]
+mod wasm_reference_executable_target;
 #[cfg(feature = "wasm-c812-r3-reference-qemu-qualification")]
 mod wasm_reference_target;
 #[cfg(feature = "wasm-c83-runtime-costs")]
@@ -1790,6 +1807,12 @@ pub extern "C" fn kmain() -> ! {
         exec::HartId::BOOT,
         "wasm-c812-r3-reference-target",
         wasm_reference_target::run(),
+    );
+    #[cfg(feature = "wasm-c813-e3-reference-qemu-qualification")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c813-e3-reference-target",
+        wasm_reference_executable_target::run(),
     );
     #[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
     exec::spawn_pinned_on(

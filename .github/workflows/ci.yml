@@ -90,6 +90,18 @@ jobs:
             rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked \
               -p vibeos-image-policy --no-default-features \
               --features milkv-duo-sd --verbose
+      - name: Verify the C8.8-F5 Duo compile-readiness contract
+        run: |
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked --offline \
+              -p vibeos-wasm-float-target --no-default-features \
+              --features c88-f5-acceptance --verbose
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked --offline \
+              -p vibeos-wasm-float-target --no-default-features \
+              --features c88-f5-duo-compile-readiness --verbose
+          python3 -B scripts/verify-c88-f5-duo-readiness.py
+          python3 -B scripts/verify-c88-f5-duo-readiness.py --selftest
       - name: Report repository status
         run: ./scripts/status.sh --check
       - name: Exercise SMP benchmark transcript validation
@@ -187,6 +199,52 @@ jobs:
       - name: Rebuild and execute the bounded Preview1 corpus
         run: ./scripts/test-c82-preview1-corpus.sh
 
+  c88-f5-duo-readiness:
+    name: C8.8-F5 Duo static compile readiness
+    needs: host-tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install repository toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal \
+            --component rust-src --component llvm-tools-preview
+          rustc_bin="$(rustup which --toolchain "$toolchain" rustc)"
+          rustdoc_bin="$(rustup which --toolchain "$toolchain" rustdoc)"
+          {
+            echo "VIBEOS_TOOLCHAIN=$toolchain"
+            echo "VIBEOS_RUSTC=$rustc_bin"
+            echo "VIBEOS_RUSTDOC=$rustdoc_bin"
+          } >> "$GITHUB_ENV"
+          env RUSTC="$rustc_bin" RUSTDOC="$rustdoc_bin" \
+            rustup run "$toolchain" cargo fetch --locked
+          (
+            cd firmware/milkv-duo
+            env RUSTC="$rustc_bin" RUSTDOC="$rustdoc_bin" \
+              rustup run "$toolchain" cargo fetch --locked \
+                --target riscv64imac-unknown-none-elf
+          )
+      - name: Install the bare-metal linker
+        run: |
+          brew install lld
+          lld_bin="$(brew --prefix lld)/bin"
+          test -x "$lld_bin/ld.lld"
+          echo "$lld_bin" >> "$GITHUB_PATH"
+          "$lld_bin/ld.lld" --version
+      - name: Cross-link and audit the inert Duo readiness ELF
+        # Static compile readiness only: no packaging, QEMU, serial, or board.
+        run: |
+          ./scripts/build-c88-f5-duo-readiness.sh
+          python3 -B scripts/verify-c88-f5-duo-readiness.py \
+            --elf target/c88-f5-duo-readiness/build/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo \
+            --audit-output "$RUNNER_TEMP/c88-f5-duo-elf-audit.json"
+
   differential:
     name: Real-rustc differential oracle
     needs: [host-tests, c82-preview1-corpus]
@@ -255,6 +313,9 @@ jobs:
           sudo ln -sf "$(command -v lld)" /usr/local/bin/ld.lld
           qemu-system-riscv64 --version
           ld.lld --version
+      - name: Cross-link the inert C8.8-F5 Milk-V Duo readiness ELF
+        # Compile-only: no packaging, serial access, boot, or physical claim.
+        run: ./scripts/build-c88-f5-duo-readiness.sh
       - name: Exercise the C8.4 kernel profile-slot ownership boundary
         run: ./scripts/qemu-c84-profile-slot-test.sh
       - name: Exercise the C8.4 real Core-poll observer boundary

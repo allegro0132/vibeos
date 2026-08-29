@@ -12,7 +12,7 @@ use vibeos_component_image_adapter::{
 "#
 )]
 #![cfg_attr(
-    not(feature = "c88-f4-float-candidate"),
+    not(feature = "c88-f4-float-candidate-core"),
     doc = r#"
 The C8.8-F4 image-pinned scalar-float candidate is structurally absent by
 default:
@@ -26,6 +26,25 @@ use vibeos_component_image_adapter::{
 "#
 )]
 #![no_std]
+
+#[cfg(all(
+    feature = "c88-f4-float-candidate",
+    feature = "c88-f4-float-candidate-duo"
+))]
+compile_error!(
+    "features `c88-f4-float-candidate` and `c88-f4-float-candidate-duo` are mutually exclusive image-policy selections"
+);
+
+#[cfg(all(
+    feature = "c88-f4-float-candidate-core",
+    not(any(
+        feature = "c88-f4-float-candidate",
+        feature = "c88-f4-float-candidate-duo"
+    ))
+))]
+compile_error!(
+    "internal feature `c88-f4-float-candidate-core` requires one explicit platform selector"
+);
 
 #[cfg(feature = "native-async-command-projection")]
 extern crate alloc;
@@ -49,18 +68,18 @@ use vibeos_image_policy::{ComponentInstanceLimits, ComponentStreamMode, NativeAs
 #[cfg(feature = "native-async-command-projection")]
 use vibeos_vsh::{ComponentArtifactIdentity, ComponentCommandManifest, StreamMode};
 
-#[cfg(feature = "c88-f4-float-candidate")]
+#[cfg(feature = "c88-f4-float-candidate-core")]
 use vibeos_component_admission::{
     admit_float_acceptance_candidate, AdmissionError as FloatAdmissionError,
     ArtifactTrust as FloatArtifactTrust, CallerAuthority as FloatCallerAuthority,
     ComponentArtifact as FloatArtifact, FloatAcceptanceAdmissionPolicy,
     InstanceLimits as FloatAdmissionLimits, FLOAT_ACCEPTANCE_ACTIVATION_LABEL,
 };
-#[cfg(feature = "c88-f4-float-candidate")]
+#[cfg(feature = "c88-f4-float-candidate-core")]
 use vibeos_component_format::{
     ProfileIdentity as FloatProfileIdentity, ProfileStage as FloatStage,
 };
-#[cfg(feature = "c88-f4-float-candidate")]
+#[cfg(feature = "c88-f4-float-candidate-core")]
 use vibeos_component_runtime::{
     decode::{current_component_validation_engine, ComponentPlan as FloatComponentPlan},
     float_candidate::{
@@ -69,19 +88,19 @@ use vibeos_component_runtime::{
     },
     world::{WorldContract as FloatWorldContract, WorldError as FloatWorldError},
 };
-#[cfg(feature = "c88-f4-float-candidate")]
+#[cfg(feature = "c88-f4-float-candidate-core")]
 use vibeos_image_policy::{ComponentInstanceLimits as FloatImageLimits, FloatCandidatePin};
 
 #[cfg(any(
     feature = "native-async-command-projection",
-    feature = "c88-f4-float-candidate"
+    feature = "c88-f4-float-candidate-core"
 ))]
 mod private {
     pub struct Seal;
 }
 
 /// Stable failures from the image-pinned F4 candidate projection.
-#[cfg(feature = "c88-f4-float-candidate")]
+#[cfg(feature = "c88-f4-float-candidate-core")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FloatCandidateProjectionError {
     Artifact(FloatAdmissionError),
@@ -125,7 +144,7 @@ pub enum FloatCandidateProjectionError {
 /// let projection = project_float_candidate(C88_F4_FLOAT_CANDIDATE).unwrap();
 /// let _ = projection.clone();
 /// ```
-#[cfg(feature = "c88-f4-float-candidate")]
+#[cfg(feature = "c88-f4-float-candidate-core")]
 pub struct FloatCandidateProjection {
     pin: FloatCandidatePin,
     candidate: vibeos_component_admission::AdmittedFloatAcceptanceCandidate,
@@ -133,7 +152,7 @@ pub struct FloatCandidateProjection {
     _sealed: private::Seal,
 }
 
-#[cfg(feature = "c88-f4-float-candidate")]
+#[cfg(feature = "c88-f4-float-candidate-core")]
 impl FloatCandidateProjection {
     pub fn activation_label(&self) -> &str {
         self.candidate.activation_label()
@@ -221,7 +240,7 @@ impl FloatCandidateProjection {
 }
 
 /// The sole image-to-admission construction path for the F4 candidate.
-#[cfg(feature = "c88-f4-float-candidate")]
+#[cfg(feature = "c88-f4-float-candidate-core")]
 pub fn project_float_candidate(
     pin: FloatCandidatePin,
 ) -> Result<FloatCandidateProjection, FloatCandidateProjectionError> {
@@ -262,7 +281,7 @@ pub fn project_float_candidate(
     Ok(projection)
 }
 
-#[cfg(feature = "c88-f4-float-candidate")]
+#[cfg(feature = "c88-f4-float-candidate-core")]
 const fn float_admission_limits(limits: FloatImageLimits) -> FloatAdmissionLimits {
     FloatAdmissionLimits {
         memory_bytes: limits.memory_bytes,

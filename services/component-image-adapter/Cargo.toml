@@ -17,7 +17,7 @@ native-async-command-projection = [
     "vibeos-component-runtime/native-async-acceptance",
     "vibeos-image-policy/c53-native-async-command-projection",
 ]
-c88-f4-float-candidate = [
+c88-f4-float-candidate-core = [
     "dep:vibeos-component-admission",
     "dep:vibeos-component-format",
     "dep:vibeos-component-runtime",
@@ -25,7 +25,14 @@ c88-f4-float-candidate = [
     "vibeos-component-admission/c88-f4-acceptance",
     "vibeos-component-runtime/c88-f4-acceptance",
     "vibeos-image-policy/c88-f4-float-candidate",
+]
+c88-f4-float-candidate = [
+    "c88-f4-float-candidate-core",
     "vibeos-image-policy/qemu-default",
+]
+c88-f4-float-candidate-duo = [
+    "c88-f4-float-candidate-core",
+    "vibeos-image-policy/milkv-duo-sd",
 ]
 
 [dependencies]

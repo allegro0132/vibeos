@@ -1,8 +1,9 @@
-//! Isolated fixed-QEMU producer for the C8.8-F5 scalar-float qualification.
+//! Isolated target adapter for the C8.8-F5 scalar-float qualification.
 //!
-//! The portable routine lives in `vibeos-wasm-float-target`; this adapter only
-//! binds a formal source/challenge envelope, emits a closed UART grammar, and
-//! shuts the emulator down. It exposes no command or production engine route.
+//! The portable routine lives in `vibeos-wasm-float-target`; this adapter binds
+//! either the existing fixed-QEMU evidence envelope or the independent,
+//! compile-only Milk-V Duo readiness envelope. It exposes no command or
+//! production engine route. Missing runtime bindings always fail closed.
 
 use alloc::{format, string::String};
 use sha2::{Digest, Sha256};
@@ -13,42 +14,128 @@ use vibeos_component_runtime::float_candidate::{
 use vibeos_wasm_float_target::{
     candidate_identity, qualify, CoreObservation, CoreOutcome, CorePath, FuelOutcome,
     LifecycleSnapshot, QualificationReport, CANDIDATE_COMPONENT_BYTES, CANDIDATE_SHA256,
-    CANDIDATE_SHA256_BYTES, CORE_CASES, CORE_MEMORY_BYTES, F3_VECTORS, F4_VECTORS,
-    PHYSICAL_PROVENANCE, PLATFORM, PLATFORM_CLASS, POLL_QUANTUM, TOTAL_FUEL, WIT_SHA256_BYTES,
-    WORLD,
+    CANDIDATE_SHA256_BYTES, CORE_CASES, CORE_MEMORY_BYTES, F3_VECTORS, F4_VECTORS, POLL_QUANTUM,
+    TOTAL_FUEL, WIT_SHA256_BYTES, WORLD,
 };
 
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+use vibeos_wasm_float_target::{
+    DUO_QUALIFICATION_MANIFEST_BYTES, DUO_QUALIFICATION_MANIFEST_SHA256,
+    DUO_TRANSCRIPT_SCHEMA_BYTES, DUO_TRANSCRIPT_SCHEMA_SHA256,
+};
+
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
 const SUITE_ID: &str = "vibeos.c88.f5.float-target";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const SUITE_ID: &str = "vibeos.c88.f5.float-target.duo-v1";
 const TARGET: &str = "riscv64imac-unknown-none-elf";
 const SEMANTIC_DIGEST_DOMAIN: &[u8] = b"vibeos.c88.f5.float-target.semantic.v1\0";
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
 const RUN_ID_DOMAIN: &[u8] = b"vibeos.c88.f5.float-target.run.v1\0";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const RUN_ID_DOMAIN: &[u8] = b"vibeos.c88.f5.float-target.duo-v1.run.v1\0";
 const EXPECTED_SEMANTIC_SHA256: &str =
     "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1";
 
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const PLATFORM: &str = "qemu-virt-rv64-tcg-icount-v1";
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const PLATFORM_CLASS: &str = "emulator";
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const PHYSICAL_PROVENANCE: &str = "not-claimed";
+
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const PLATFORM: &str = "milkv-duo-cv1800b-c906-v1";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const PLATFORM_CLASS: &str = "physical-target";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const PHYSICAL_PROVENANCE: &str = "not-claimed";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const QUALIFICATION_MODE: &str = "physical-candidate";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const READINESS_STAGE: &str = "compile-only-inert-sentinel";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const BINDING_MODE: &str = "reserved-non-evidence-sentinel";
+
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+static DUO_EXECUTION_ARM: u8 = 0;
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+static DUO_EXECUTION_ARM_MARKER: &[u8] = b"vibeos.c88.f5.duo.compile-readiness.arm=0";
+
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+#[inline(never)]
+fn execution_armed() -> bool {
+    // Both reads are deliberately volatile. The readiness image retains the
+    // complete producer behind this runtime-opaque gate, while the immutable
+    // arm byte keeps this feature inert. A future physical runner must use a
+    // separate feature and arm contract; patching this image is not evidence.
+    unsafe {
+        let _ = core::ptr::read_volatile(DUO_EXECUTION_ARM_MARKER.as_ptr());
+        core::ptr::read_volatile(core::ptr::addr_of!(DUO_EXECUTION_ARM)) == 1
+    }
+}
+
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
 const SOURCE_COMMIT: &str = match option_env!("VIBEOS_C88_F5_SOURCE_COMMIT") {
     Some(value) => value,
     None => "",
 };
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const SOURCE_COMMIT: &str = match option_env!("VIBEOS_C88_F5_DUO_SOURCE_COMMIT") {
+    Some(value) => value,
+    None => "",
+};
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
 const SOURCE_TREE: &str = match option_env!("VIBEOS_C88_F5_SOURCE_TREE") {
     Some(value) => value,
     None => "",
 };
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const SOURCE_TREE: &str = match option_env!("VIBEOS_C88_F5_DUO_SOURCE_TREE") {
+    Some(value) => value,
+    None => "",
+};
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
 const CHALLENGE: &str = match option_env!("VIBEOS_C88_F5_CHALLENGE") {
     Some(value) => value,
     None => "",
 };
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const CHALLENGE: &str = match option_env!("VIBEOS_C88_F5_DUO_CHALLENGE") {
+    Some(value) => value,
+    None => "",
+};
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
 const RUN_ID: &str = match option_env!("VIBEOS_C88_F5_RUN_ID") {
     Some(value) => value,
     None => "",
 };
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const RUN_ID: &str = match option_env!("VIBEOS_C88_F5_DUO_RUN_ID") {
+    Some(value) => value,
+    None => "",
+};
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
 const MANIFEST_SHA256: &str = match option_env!("VIBEOS_C88_F5_MANIFEST_SHA256") {
     Some(value) => value,
     None => "",
 };
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const MANIFEST_SHA256: &str = match option_env!("VIBEOS_C88_F5_DUO_MANIFEST_SHA256") {
+    Some(value) => value,
+    None => "",
+};
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
 const TRANSCRIPT_SCHEMA_SHA256: &str = match option_env!("VIBEOS_C88_F5_TRANSCRIPT_SCHEMA_SHA256") {
     Some(value) => value,
     None => "",
 };
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const TRANSCRIPT_SCHEMA_SHA256: &str =
+    match option_env!("VIBEOS_C88_F5_DUO_TRANSCRIPT_SCHEMA_SHA256") {
+        Some(value) => value,
+        None => "",
+    };
 
 const CORE_RECORDS: usize = CORE_CASES;
 const F3_RECORDS: usize = F3_VECTORS.len() + 1;
@@ -57,6 +144,85 @@ const FUEL_RECORDS: usize = 1_000;
 const LIFECYCLE_RECORDS: usize = 5;
 const DATA_RECORDS: usize =
     CORE_RECORDS + F3_RECORDS + F4_RECORDS + FUEL_RECORDS + LIFECYCLE_RECORDS;
+
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const META_PREFIX: &str = "VIBE_C88_F5_META ";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const META_PREFIX: &str = "VIBE_C88_F5_DUO_META ";
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const META_SCHEMA: &str = "vibeos.c88.f5.float-target.meta";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const META_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.meta";
+
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const CORE_PREFIX: &str = "VIBE_C88_F5_CORE_CASE ";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const CORE_PREFIX: &str = "VIBE_C88_F5_DUO_CORE_CASE ";
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const CORE_SCHEMA: &str = "vibeos.c88.f5.float-target.core-case";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const CORE_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.core-case";
+
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const F3_PREFIX: &str = "VIBE_C88_F5_F3_CASE ";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const F3_PREFIX: &str = "VIBE_C88_F5_DUO_F3_CASE ";
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const F3_SCHEMA: &str = "vibeos.c88.f5.float-target.f3-case";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const F3_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.f3-case";
+
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const F4_PREFIX: &str = "VIBE_C88_F5_F4_VECTOR ";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const F4_PREFIX: &str = "VIBE_C88_F5_DUO_F4_VECTOR ";
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const F4_SCHEMA: &str = "vibeos.c88.f5.float-target.f4-vector";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const F4_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.f4-vector";
+
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const FUEL_PREFIX: &str = "VIBE_C88_F5_FUEL ";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const FUEL_PREFIX: &str = "VIBE_C88_F5_DUO_FUEL ";
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const FUEL_SCHEMA: &str = "vibeos.c88.f5.float-target.fuel";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const FUEL_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.fuel";
+
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const LIFECYCLE_PREFIX: &str = "VIBE_C88_F5_LIFECYCLE ";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const LIFECYCLE_PREFIX: &str = "VIBE_C88_F5_DUO_LIFECYCLE ";
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const LIFECYCLE_SCHEMA: &str = "vibeos.c88.f5.float-target.lifecycle";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const LIFECYCLE_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.lifecycle";
+
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const END_PREFIX: &str = "VIBE_C88_F5_END ";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const END_PREFIX: &str = "VIBE_C88_F5_DUO_END ";
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const END_SCHEMA: &str = "vibeos.c88.f5.float-target.end";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const END_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.end";
+
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const PASS_PREFIX: &str = "VIBE_C88_F5_PASS ";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const PASS_PREFIX: &str = "VIBE_C88_F5_DUO_PASS ";
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const PASS_SCHEMA: &str = "vibeos.c88.f5.float-target.pass";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const PASS_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.pass";
+
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const FAIL_PREFIX: &str = "VIBE_C88_F5_FAIL ";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const FAIL_PREFIX: &str = "VIBE_C88_F5_DUO_FAIL ";
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+const FAIL_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.fail";
 
 fn valid_lower_hex(value: &str, width: usize) -> bool {
     value.len() == width
@@ -99,6 +265,7 @@ fn expected_run_id() -> String {
     digest_hex(&digest.finalize())
 }
 
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
 fn bindings_are_valid() -> bool {
     valid_lower_hex(SOURCE_COMMIT, 40)
         && valid_lower_hex(SOURCE_TREE, 40)
@@ -106,6 +273,19 @@ fn bindings_are_valid() -> bool {
         && valid_lower_hex(RUN_ID, 64)
         && valid_lower_hex(MANIFEST_SHA256, 64)
         && valid_lower_hex(TRANSCRIPT_SCHEMA_SHA256, 64)
+        && expected_run_id() == RUN_ID
+}
+
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+fn bindings_are_valid() -> bool {
+    valid_lower_hex(SOURCE_COMMIT, 40)
+        && valid_lower_hex(SOURCE_TREE, 40)
+        && valid_lower_hex(CHALLENGE, 64)
+        && valid_lower_hex(RUN_ID, 64)
+        && valid_lower_hex(MANIFEST_SHA256, 64)
+        && valid_lower_hex(TRANSCRIPT_SCHEMA_SHA256, 64)
+        && MANIFEST_SHA256 == DUO_QUALIFICATION_MANIFEST_SHA256
+        && TRANSCRIPT_SCHEMA_SHA256 == DUO_TRANSCRIPT_SCHEMA_SHA256
         && expected_run_id() == RUN_ID
 }
 
@@ -263,12 +443,7 @@ fn emit_core(emitter: &mut RecordEmitter, observation: CoreObservation) {
         observation.remaining_fuel,
         observation.trace_digest,
     );
-    emitter.emit(
-        "CORE_CASE",
-        "VIBE_C88_F5_CORE_CASE ",
-        "vibeos.c88.f5.float-target.core-case",
-        semantic,
-    );
+    emitter.emit("CORE_CASE", CORE_PREFIX, CORE_SCHEMA, semantic);
 }
 
 fn emit_f3(emitter: &mut RecordEmitter, report: &QualificationReport) {
@@ -283,12 +458,7 @@ fn emit_f3(emitter: &mut RecordEmitter, report: &QualificationReport) {
             vector.raw_f32,
             vector.raw_f64,
         );
-        emitter.emit(
-            "F3_CASE",
-            "VIBE_C88_F5_F3_CASE ",
-            "vibeos.c88.f5.float-target.f3-case",
-            semantic,
-        );
+        emitter.emit("F3_CASE", F3_PREFIX, F3_SCHEMA, semantic);
     }
     let codec = &report.codec;
     let semantic = format!(
@@ -304,12 +474,7 @@ fn emit_f3(emitter: &mut RecordEmitter, report: &QualificationReport) {
         codec.scalar_cases,
         codec.variant_cases,
     );
-    emitter.emit(
-        "F3_CASE",
-        "VIBE_C88_F5_F3_CASE ",
-        "vibeos.c88.f5.float-target.f3-case",
-        semantic,
-    );
+    emitter.emit("F3_CASE", F3_PREFIX, F3_SCHEMA, semantic);
 }
 
 fn emit_f4(emitter: &mut RecordEmitter, report: &QualificationReport) {
@@ -326,12 +491,7 @@ fn emit_f4(emitter: &mut RecordEmitter, report: &QualificationReport) {
             observation.remaining_fuel,
             vector.right_bits,
         );
-        emitter.emit(
-            "F4_VECTOR",
-            "VIBE_C88_F5_F4_VECTOR ",
-            "vibeos.c88.f5.float-target.f4-vector",
-            semantic,
-        );
+        emitter.emit("F4_VECTOR", F4_PREFIX, F4_SCHEMA, semantic);
     }
 }
 
@@ -361,12 +521,7 @@ fn emit_fuel(emitter: &mut RecordEmitter, report: &QualificationReport) {
                 observation.remaining_fuel,
             )
         };
-        emitter.emit(
-            "FUEL",
-            "VIBE_C88_F5_FUEL ",
-            "vibeos.c88.f5.float-target.fuel",
-            semantic,
-        );
+        emitter.emit("FUEL", FUEL_PREFIX, FUEL_SCHEMA, semantic);
     }
 }
 
@@ -410,22 +565,18 @@ fn emit_lifecycle_snapshot(emitter: &mut RecordEmitter, snapshot: LifecycleSnaps
         lifecycle_state(snapshot.state),
         snapshot.id,
     );
-    emitter.emit(
-        "LIFECYCLE",
-        "VIBE_C88_F5_LIFECYCLE ",
-        "vibeos.c88.f5.float-target.lifecycle",
-        semantic,
-    );
+    emitter.emit("LIFECYCLE", LIFECYCLE_PREFIX, LIFECYCLE_SCHEMA, semantic);
 }
 
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
 fn emit_metadata(report: &QualificationReport) {
     let candidate = candidate_identity();
     let component_sha256 = digest_hex(&report.lifecycle.component_sha256_bytes);
     let wit_sha256 = digest_hex(&report.lifecycle.wit_sha256_bytes);
     crate::println!(
         concat!(
-            "VIBE_C88_F5_META {{",
-            "\"schema\":\"vibeos.c88.f5.float-target.meta\",\"version\":1,",
+            "{}{{",
+            "\"schema\":\"{}\",\"version\":1,",
             "\"suite_id\":\"{}\",\"suite_revision\":1,",
             "\"source_commit\":\"{}\",\"source_tree\":\"{}\",",
             "\"challenge\":\"{}\",\"run_id\":\"{}\",",
@@ -459,6 +610,8 @@ fn emit_metadata(report: &QualificationReport) {
             "\"lifecycle_records\":{},\"records\":{}",
             "}}"
         ),
+        META_PREFIX,
+        META_SCHEMA,
         SUITE_ID,
         SOURCE_COMMIT,
         SOURCE_TREE,
@@ -470,6 +623,108 @@ fn emit_metadata(report: &QualificationReport) {
         PLATFORM_CLASS,
         TARGET,
         PHYSICAL_PROVENANCE,
+        candidate.package,
+        candidate.version,
+        candidate.upstream_revision,
+        candidate.patched_manifest_sha256,
+        candidate.patch_delta_sha256,
+        candidate.backend_package,
+        candidate.backend_version,
+        candidate.backend_archive_sha256,
+        candidate.backend_revision,
+        candidate.backend_llvm_revision,
+        candidate.feature_set,
+        candidate.acceptance_feature,
+        report.core.wasm_sha256,
+        report.core.wasm_bytes,
+        report.core.compile_reservation_bytes,
+        CORE_MEMORY_BYTES,
+        report.core.runtime_digest,
+        report.core.fold_digest,
+        report.core.spin_trace_digest,
+        component_sha256,
+        CANDIDATE_COMPONENT_BYTES,
+        wit_sha256,
+        WORLD,
+        TOTAL_FUEL,
+        POLL_QUANTUM,
+        CORE_RECORDS,
+        F3_RECORDS,
+        F4_RECORDS,
+        FUEL_RECORDS,
+        LIFECYCLE_RECORDS,
+        DATA_RECORDS,
+    );
+}
+
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+fn emit_metadata(report: &QualificationReport) {
+    let candidate = candidate_identity();
+    let component_sha256 = digest_hex(&report.lifecycle.component_sha256_bytes);
+    let wit_sha256 = digest_hex(&report.lifecycle.wit_sha256_bytes);
+    crate::println!(
+        concat!(
+            "{}{{",
+            "\"schema\":\"{}\",\"version\":1,",
+            "\"suite_id\":\"{}\",\"suite_revision\":1,",
+            "\"source_commit\":\"{}\",\"source_tree\":\"{}\",",
+            "\"challenge\":\"{}\",\"run_id\":\"{}\",",
+            "\"manifest_sha256\":\"{}\",\"manifest_bytes\":{},",
+            "\"transcript_schema_sha256\":\"{}\",\"transcript_schema_bytes\":{},",
+            "\"platform\":\"{}\",\"platform_class\":\"{}\",\"target\":\"{}\",",
+            "\"physical_provenance\":\"{}\",\"qualification_mode\":\"{}\",",
+            "\"readiness_stage\":\"{}\",\"binding_mode\":\"{}\",",
+            "\"sentinel_bindings_present\":true,",
+            "\"formal_physical_bindings_present\":false,\"execution_armed\":false,",
+            "\"physical_evidence_present\":false,",
+            "\"future_operator_confirmed_cold_boots_required\":3,",
+            "\"f5_complete\":false,\"float_complete\":false,\"c88_complete\":false,",
+            "\"executable_successor_authorized\":false,",
+            "\"artifact_profile_code\":5,\"artifact_abi\":5,\"component_profile\":2,",
+            "\"core_profile\":2,\"runtime_abi\":5,\"stage\":\"validation-only\",",
+            "\"runtime_ready\":false,\"native_async_runtime_ready\":false,",
+            "\"execution_enabled\":false,\"current_validation_engine\":false,",
+            "\"current_component_engine\":false,",
+            "\"candidate_package\":\"{}\",\"candidate_version\":\"{}\",",
+            "\"candidate_upstream_commit\":\"{}\",",
+            "\"candidate_manifest_sha256\":\"{}\",\"candidate_patch_sha256\":\"{}\",",
+            "\"backend_package\":\"{}\",\"backend_version\":\"{}\",",
+            "\"backend_archive_sha256\":\"{}\",\"backend_revision\":\"{}\",",
+            "\"backend_llvm_revision\":\"{}\",\"candidate_feature_set\":\"{}\",",
+            "\"candidate_acceptance_feature\":\"{}\",\"candidate_production_ready\":false,",
+            "\"core_module_sha256\":\"{}\",\"core_module_bytes\":{},",
+            "\"core_compile_reservation_bytes\":{},\"core_memory_bytes\":{},",
+            "\"core_runtime_digest\":\"{:016x}\",\"core_fold_digest\":\"{:016x}\",",
+            "\"core_spin_trace_digest\":\"{:016x}\",",
+            "\"component_sha256\":\"{}\",\"component_bytes\":{},",
+            "\"wit_sha256\":\"{}\",\"world\":\"{}\",\"export\":\"run\",",
+            "\"activation_label\":\"c88-f4-float-candidate\",",
+            "\"memory_bytes\":131072,\"total_fuel\":{},\"poll_quantum\":{},\"resources\":0,",
+            "\"embedded_modules\":1,\"core_instances\":1,\"component_instances\":0,",
+            "\"aliases\":1,\"canonical_functions\":1,\"adapters\":0,\"imports\":0,",
+            "\"host_imports\":0,\"exports\":1,\"executable_exports\":0,\"exact_binding\":true,",
+            "\"core_cases\":{},\"f3_cases\":{},\"f4_vectors\":{},\"fuel_records\":{},",
+            "\"lifecycle_records\":{},\"records\":{}",
+            "}}"
+        ),
+        META_PREFIX,
+        META_SCHEMA,
+        SUITE_ID,
+        SOURCE_COMMIT,
+        SOURCE_TREE,
+        CHALLENGE,
+        RUN_ID,
+        MANIFEST_SHA256,
+        DUO_QUALIFICATION_MANIFEST_BYTES,
+        TRANSCRIPT_SCHEMA_SHA256,
+        DUO_TRANSCRIPT_SCHEMA_BYTES,
+        PLATFORM,
+        PLATFORM_CLASS,
+        TARGET,
+        PHYSICAL_PROVENANCE,
+        QUALIFICATION_MODE,
+        READINESS_STAGE,
+        BINDING_MODE,
         candidate.package,
         candidate.version,
         candidate.upstream_revision,
@@ -521,12 +776,35 @@ fn emit_terminal(prefix: &str, schema: &str, semantic_sha256: &str) {
     );
 }
 
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
 fn fail(code: u16) -> ! {
-    crate::println!("VIBE_C88_F5_FAIL {{\"code\":{}}}", code);
+    crate::println!("{}{{\"code\":{}}}", FAIL_PREFIX, code);
     crate::sbi::shutdown(true)
 }
 
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+fn fail(code: u16) -> ! {
+    crate::println!(
+        "{}{{\"schema\":\"{}\",\"version\":1,\"code\":{}}}",
+        FAIL_PREFIX,
+        FAIL_SCHEMA,
+        code,
+    );
+    terminal_quiesce()
+}
+
+#[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+fn terminal_quiesce() -> ! {
+    loop {
+        crate::sbi::wait_for_interrupt();
+    }
+}
+
 pub async fn run() {
+    #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+    if !execution_armed() {
+        fail(0xff00);
+    }
     if crate::online_hart_count() != 1 || !bindings_are_valid() {
         fail(0xff01);
     }
@@ -551,15 +829,10 @@ pub async fn run() {
     if records != DATA_RECORDS || semantic_sha256 != EXPECTED_SEMANTIC_SHA256 {
         fail(0xff03);
     }
-    emit_terminal(
-        "VIBE_C88_F5_END ",
-        "vibeos.c88.f5.float-target.end",
-        &semantic_sha256,
-    );
-    emit_terminal(
-        "VIBE_C88_F5_PASS ",
-        "vibeos.c88.f5.float-target.pass",
-        &semantic_sha256,
-    );
-    crate::sbi::shutdown(false)
+    emit_terminal(END_PREFIX, END_SCHEMA, &semantic_sha256);
+    emit_terminal(PASS_PREFIX, PASS_SCHEMA, &semantic_sha256);
+    #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+    crate::sbi::shutdown(false);
+    #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+    terminal_quiesce()
 }

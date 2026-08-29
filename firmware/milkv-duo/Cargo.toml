@@ -15,6 +15,9 @@ milkv-ssh-acceptance = ["vibeos-kernel/milkv-ssh-acceptance"]
 milkv-jitterentropy-probe = ["vibeos-kernel/milkv-jitterentropy-probe"]
 milkv-jitterentropy-ssh-probe = ["vibeos-kernel/milkv-jitterentropy-ssh-probe"]
 wasm-c83-runtime-costs = ["vibeos-kernel/wasm-c83-runtime-costs"]
+wasm-c88-f5-float-duo-compile-readiness = [
+    "vibeos-kernel/wasm-c88-f5-float-duo-compile-readiness",
+]
 wasm-c84-profile-slot = ["vibeos-kernel/wasm-c84-profile-slot"]
 wasm-c84-core-poll-observer = ["vibeos-kernel/wasm-c84-core-poll-observer"]
 wasm-c84-profile-irq-overlay = ["vibeos-kernel/wasm-c84-profile-irq-overlay"]

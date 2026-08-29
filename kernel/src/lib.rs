@@ -46,6 +46,7 @@
         feature = "wasm-c77-ephemeral-runtime-acceptance",
         feature = "wasm-c84-profile-slot",
         feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness",
         feature = "ssh-native-async-command",
         feature = "ssh-native-async-qemu-acceptance",
         feature = "ssh-native-async-revoke-qemu-acceptance"
@@ -105,6 +106,76 @@ compile_error!("feature `wasm-c88-f5-float-qemu-acceptance` requires the QEMU im
 ))]
 compile_error!(
     "feature `wasm-c88-f5-float-qemu-acceptance` is an isolated emulator qualification image"
+);
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-qemu-acceptance",
+    feature = "wasm-c88-f5-float-duo-compile-readiness"
+))]
+compile_error!("the QEMU and Milk-V Duo C8.8-F5 image contracts are mutually exclusive");
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-duo-compile-readiness",
+    not(feature = "milkv-duo")
+))]
+compile_error!("feature `wasm-c88-f5-float-duo-compile-readiness` requires the Milk-V Duo board");
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-duo-compile-readiness",
+    not(feature = "milkv-duo-sd-image")
+))]
+compile_error!(
+    "feature `wasm-c88-f5-float-duo-compile-readiness` requires the Milk-V Duo image policy"
+);
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-duo-compile-readiness",
+    any(feature = "qemu-virt", feature = "qemu-default-image")
+))]
+compile_error!(
+    "feature `wasm-c88-f5-float-duo-compile-readiness` cannot select a QEMU board or policy"
+);
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-duo-compile-readiness",
+    any(
+        feature = "legacy-shell",
+        feature = "storage-bench",
+        feature = "file-tree",
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server",
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "milkv-jitterentropy-probe",
+        feature = "milkv-jitterentropy-ssh-probe",
+        feature = "component-graph-principals",
+        feature = "component-durable-publication",
+        feature = "ssh-component-command",
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c73-authenticated-admission-acceptance",
+        feature = "wasm-c74-crash-safe-publication-acceptance",
+        feature = "wasm-c75-boot-revalidation-acceptance",
+        feature = "wasm-c76-graph-version-replacement-acceptance",
+        feature = "wasm-c77-ephemeral-runtime-acceptance",
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c84-profile-slot",
+        feature = "ssh-native-async-command",
+        feature = "ssh-native-async-qemu-acceptance",
+        feature = "ssh-native-async-revoke-qemu-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c88-f5-float-duo-compile-readiness` is an isolated, non-production readiness image"
 );
 
 #[cfg(all(
@@ -902,7 +973,10 @@ mod ssh_platform;
 mod ssh_provisioning;
 #[cfg(feature = "wasm-c84-profile-slot")]
 mod wasm_aot_profile_slot;
-#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+#[cfg(any(
+    feature = "wasm-c88-f5-float-qemu-acceptance",
+    feature = "wasm-c88-f5-float-duo-compile-readiness"
+))]
 mod wasm_float_target;
 #[cfg(feature = "wasm-c83-runtime-costs")]
 mod wasm_runtime_costs;
@@ -1172,7 +1246,8 @@ pub extern "C" fn kmain() -> ! {
         feature = "qemu-virt",
         not(any(
             feature = "wasm-c83-runtime-costs",
-            feature = "wasm-c88-f5-float-qemu-acceptance"
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness"
         ))
     ))]
     {
@@ -1199,7 +1274,8 @@ pub extern "C" fn kmain() -> ! {
         feature = "milkv-duo",
         not(any(
             feature = "wasm-c83-runtime-costs",
-            feature = "wasm-c88-f5-float-qemu-acceptance"
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness"
         ))
     ))]
     match dwc2_host::init() {
@@ -1221,7 +1297,8 @@ pub extern "C" fn kmain() -> ! {
         feature = "milkv-duo",
         not(any(
             feature = "wasm-c83-runtime-costs",
-            feature = "wasm-c88-f5-float-qemu-acceptance"
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness"
         ))
     ))]
     if let Some(usb) = dwc2_host::telemetry() {
@@ -1239,7 +1316,8 @@ pub extern "C" fn kmain() -> ! {
         feature = "milkv-duo",
         not(any(
             feature = "wasm-c83-runtime-costs",
-            feature = "wasm-c88-f5-float-qemu-acceptance"
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness"
         ))
     ))]
     if dwc2_host::connected() {
@@ -1348,30 +1426,35 @@ pub extern "C" fn kmain() -> ! {
 
     #[cfg(not(any(
         feature = "wasm-c83-runtime-costs",
-        feature = "wasm-c88-f5-float-qemu-acceptance"
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness"
     )))]
     world::build();
 
     #[cfg(not(any(
         feature = "wasm-c83-runtime-costs",
-        feature = "wasm-c88-f5-float-qemu-acceptance"
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness"
     )))]
     let world = world::world();
     #[cfg(not(any(
         feature = "wasm-c83-runtime-costs",
-        feature = "wasm-c88-f5-float-qemu-acceptance"
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness"
     )))]
     world::start_block_supervisor();
     #[cfg(not(any(
         feature = "wasm-c83-runtime-costs",
-        feature = "wasm-c88-f5-float-qemu-acceptance"
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness"
     )))]
     world::start_net_supervisor();
     #[cfg(all(
         feature = "milkv-duo",
         not(any(
             feature = "wasm-c83-runtime-costs",
-            feature = "wasm-c88-f5-float-qemu-acceptance"
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness"
         ))
     ))]
     world::start_usb_net_supervisor();
@@ -1379,7 +1462,8 @@ pub extern "C" fn kmain() -> ! {
         feature = "qemu-virt",
         not(any(
             feature = "wasm-c83-runtime-costs",
-            feature = "wasm-c88-f5-float-qemu-acceptance"
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness"
         ))
     ))]
     world::start_rng_supervisor();
@@ -1387,7 +1471,8 @@ pub extern "C" fn kmain() -> ! {
         feature = "qemu-virt",
         not(any(
             feature = "wasm-c83-runtime-costs",
-            feature = "wasm-c88-f5-float-qemu-acceptance"
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness"
         ))
     ))]
     if xhci::info().is_some() {
@@ -1569,7 +1654,10 @@ pub extern "C" fn kmain() -> ! {
     });
     #[cfg(feature = "wasm-c83-runtime-costs")]
     exec::spawn("wasm-c83-runtime-costs", wasm_runtime_costs::run());
-    #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+    #[cfg(any(
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness"
+    ))]
     exec::spawn_pinned_on(
         exec::HartId::BOOT,
         "wasm-c88-f5-float-target",
@@ -1608,7 +1696,8 @@ pub extern "C" fn kmain() -> ! {
         feature = "milkv-duo",
         not(any(
             feature = "wasm-c83-runtime-costs",
-            feature = "wasm-c88-f5-float-qemu-acceptance"
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness"
         ))
     ))]
     if dwc2_host::info().is_some() {
@@ -1644,6 +1733,7 @@ pub extern "C" fn kmain() -> ! {
         feature = "wasm-c76-graph-version-replacement-acceptance",
         feature = "wasm-c83-runtime-costs",
         feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness",
         feature = "wasm-c84-ssh-managed-child-single-boot-collector"
     )))]
     {
@@ -1677,7 +1767,8 @@ pub extern "C" fn kmain() -> ! {
     }
     #[cfg(not(any(
         feature = "wasm-c83-runtime-costs",
-        feature = "wasm-c88-f5-float-qemu-acceptance"
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness"
     )))]
     let typed_channels = if world.net_outbound.is_some() {
         "3 typed channels"
@@ -1686,7 +1777,8 @@ pub extern "C" fn kmain() -> ! {
     };
     #[cfg(not(any(
         feature = "wasm-c83-runtime-costs",
-        feature = "wasm-c88-f5-float-qemu-acceptance"
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness"
     )))]
     println!(
         "  world     {} capability spaces, {}, {} components",
@@ -1698,6 +1790,8 @@ pub extern "C" fn kmain() -> ! {
     println!("  image     isolated C8.3 WebAssembly runtime-cost sampler");
     #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
     println!("  image     isolated C8.8-F5 fixed-QEMU float qualification");
+    #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+    println!("  image     isolated C8.8-F5 Milk-V Duo compile-only readiness");
     println!("  sched     async executor, no threads, no preemption");
 
     trap::enable_interrupts();

@@ -217,6 +217,17 @@ wasm-c88-f5-float-qemu-acceptance = [
     "dep:vibeos-wasm-float-target",
     "vibeos-wasm-float-target/c88-f5-acceptance",
 ]
+# Isolated Milk-V Duo compile-readiness image for the same portable F5
+# qualification. It carries a reserved non-evidence sentinel identity behind
+# an immutable runtime-opaque arm byte of zero; no physical capture or evidence
+# is claimed until a separately reviewed future image supplies its own arm.
+wasm-c88-f5-float-duo-compile-readiness = [
+    "dep:sha2",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-wasm-float-target",
+    "vibeos-wasm-float-target/c88-f5-duo-compile-readiness",
+]
 # Default-off C8.4 kernel ownership boundary. It installs exactly one
 # target-session lineage behind the IRQ-masking kernel SpinLock; no runtime,
 # trap, SSH, or publisher hook is selected merely by enabling this feature.

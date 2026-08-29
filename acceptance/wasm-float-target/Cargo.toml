@@ -23,6 +23,21 @@ c88-f5-acceptance = [
     "vibeos-image-policy/qemu-default",
     "vibeos-wasm-float-candidate/c88-f2-acceptance",
 ]
+c88-f5-duo-compile-readiness = [
+    "dep:sha2",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-image-adapter",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-image-policy",
+    "dep:vibeos-wasm-float-candidate",
+    "dep:vibeos-wasm-runtime",
+    "dep:wat",
+    "vibeos-component-image-adapter/c88-f4-float-candidate-duo",
+    "vibeos-component-runtime/c88-f4-acceptance",
+    "vibeos-image-policy/c88-f4-float-candidate",
+    "vibeos-image-policy/milkv-duo-sd",
+    "vibeos-wasm-float-candidate/c88-f2-acceptance",
+]
 
 [dependencies]
 sha2 = { version = "=0.11.0", default-features = false, optional = true }

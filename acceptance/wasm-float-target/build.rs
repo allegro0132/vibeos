@@ -1,19 +1,38 @@
-#[cfg(feature = "c88-f5-acceptance")]
+#[cfg(any(
+    feature = "c88-f5-acceptance",
+    feature = "c88-f5-duo-compile-readiness"
+))]
 use std::{env, fs, path::PathBuf};
 
-#[cfg(feature = "c88-f5-acceptance")]
+#[cfg(any(
+    feature = "c88-f5-acceptance",
+    feature = "c88-f5-duo-compile-readiness"
+))]
 use sha2::{Digest, Sha256};
 
 const SOURCE: &str = "artifacts/scalar-target.wat";
+const DUO_MANIFEST: &str = "artifacts/qualification-duo-v1-manifest.json";
+const DUO_TRANSCRIPT_SCHEMA: &str = "artifacts/qualification-duo-v1-transcript-schema.json";
 
 fn main() {
     println!("cargo:rerun-if-changed={SOURCE}");
+    println!("cargo:rerun-if-changed={DUO_MANIFEST}");
+    println!("cargo:rerun-if-changed={DUO_TRANSCRIPT_SCHEMA}");
 
-    #[cfg(feature = "c88-f5-acceptance")]
+    #[cfg(any(
+        feature = "c88-f5-acceptance",
+        feature = "c88-f5-duo-compile-readiness"
+    ))]
     build_scalar_target();
+
+    #[cfg(feature = "c88-f5-duo-compile-readiness")]
+    build_duo_manifest_identity();
 }
 
-#[cfg(feature = "c88-f5-acceptance")]
+#[cfg(any(
+    feature = "c88-f5-acceptance",
+    feature = "c88-f5-duo-compile-readiness"
+))]
 fn build_scalar_target() {
     let source = fs::read(SOURCE).expect("read C8.8-F5 scalar target WAT");
     let bytes = wat::parse_bytes(&source)
@@ -43,4 +62,36 @@ fn build_scalar_target() {
         ),
     )
     .expect("write C8.8-F5 scalar target identity");
+}
+
+#[cfg(feature = "c88-f5-duo-compile-readiness")]
+fn build_duo_manifest_identity() {
+    let manifest = fs::read(DUO_MANIFEST).expect("read C8.8-F5 Duo readiness manifest");
+    let manifest_digest: [u8; 32] = Sha256::digest(&manifest).into();
+    let manifest_digest_hex = manifest_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let transcript_schema =
+        fs::read(DUO_TRANSCRIPT_SCHEMA).expect("read C8.8-F5 Duo transcript schema");
+    let transcript_schema_digest: [u8; 32] = Sha256::digest(&transcript_schema).into();
+    let transcript_schema_digest_hex = transcript_schema_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
+    fs::write(
+        out.join("qualification_duo_v1_manifest_identity.rs"),
+        format!(
+            "pub const DUO_QUALIFICATION_MANIFEST_SHA256: &str = \
+             \"{manifest_digest_hex}\";\n\
+             pub const DUO_QUALIFICATION_MANIFEST_BYTES: usize = {};\n\
+             pub const DUO_TRANSCRIPT_SCHEMA_SHA256: &str = \
+             \"{transcript_schema_digest_hex}\";\n\
+             pub const DUO_TRANSCRIPT_SCHEMA_BYTES: usize = {};\n",
+            manifest.len(),
+            transcript_schema.len(),
+        ),
+    )
+    .expect("write C8.8-F5 Duo contract identities");
 }

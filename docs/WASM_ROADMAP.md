@@ -34,9 +34,14 @@ of C8.8-F5 passes at pushed implementation commit
 default-off Milk-V Duo compile-readiness slice whose host contract, cross-link,
 and static ELF audit pass. That inert sentinel is compile/static evidence only:
 `execution_armed=false`, `physical_provenance=not-claimed`, and no capture or
-source-build provenance is claimed. Milk-V Duo physical qualification remains
-paused. Consequently F5, Float, and C8.8 are not fully closed, and no
-separately numbered executable successor is authorized.
+source-build provenance is claimed. Pushed verifier-contract commit
+`f502240a88eeb218ca923276675d7b6dec3e4030` (tree
+`d63a2a1ff68ab84586a1b53ee24982e232bc5b0f`) additionally freezes a disjoint
+physical-v1 transcript/campaign contract and host-only verifier. It adds no
+physical feature, arm, producer, image, package, capture, or physical evidence.
+Milk-V Duo physical qualification remains paused. Consequently F5, Float, and
+C8.8 are not fully closed, and no separately numbered executable successor is
+authorized.
 
 ---
 
@@ -966,10 +971,37 @@ payload rather than globally pinning whole ELF bytes because source-build
 provenance is not claimed.
 
 The sentinel ELF and run ID can never satisfy the physical gate, and patching
-the readiness image is not an arming procedure. Resumed testing requires a
-separately reviewed physical feature/arm contract with formal, non-sentinel
-bindings. The same-identity rule below applies only across the three captures
-of that future physical run.
+the readiness image is not an arming procedure. A separate host-side wire and
+campaign-verifier contract now exists at pushed commit
+`f502240a88eeb218ca923276675d7b6dec3e4030`, tree
+`d63a2a1ff68ab84586a1b53ee24982e232bc5b0f`. Its checked-in identities are:
+
+| Duo physical-v1 verifier artifact | Bytes | SHA-256 |
+|---|---:|---|
+| Transcript/campaign contract | 5,605 | `01284fa4bb76a24e0a40e39fddec109e98ff36ec8912bb806f7a52a520a6617e` |
+| Transcript schema | 5,923 | `08007a5e68e53181592dd9eaecf124a630b2eddfdc20c146504ff1d4df8811f5` |
+| Host-only verifier | 56,129 | `09a98255b9deb8c5d14b19ecb4c0c5725cfbef25a60b1d84f2f4bbfbda649928` |
+| Independent shared semantic oracle | 134,348 | `36451c3c614486a714b3466b77b329fee8a1368603ffaa9d2925b75b3f666686` |
+
+The suite is `vibeos.c88.f5.float-target.duo-physical-v1`, with a distinct
+NUL-terminated run-ID domain and physical-only UART prefix. The verifier
+rejects readiness, fixed-QEMU, and C8.4 families; validates exact formal
+non-sentinel bindings; enforces `META -> 1176 records -> END -> PASS`; and
+recomputes semantic SHA-256
+`51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`
+through the independently byte-pinned F5 oracle. Normal and optimized contract
+checks and the 53-mutation synthetic self-test are byte-identical. A host-only
+in-memory translation of the retained formal-QEMU records also exercises the
+normal semantic branch under both interpreters, but remains verifier test input
+and never physical evidence.
+
+This verifier node reserves the future feature
+`wasm-c88-f5-float-duo-physical-qualification` and arm marker
+`vibeos.c88.f5.duo.physical-qualification.arm=1`; neither exists as an
+executable producer in this node. Resumed testing still requires a separately
+reviewed feature/arm producer with formal, non-sentinel bindings. The future
+campaign must externally bind one build environment, package envelope, kernel
+ELF, and full SD image across its three captures.
 
 The future physical gate remains frozen but unsatisfied. It requires three
 operator-confirmed power cycles and cold boots of one byte-identical
@@ -978,7 +1010,7 @@ exact metadata followed by 1,176 records, END and PASS, terminal quiescence,
 and operator power-off confirmation. Every physical counter is zero and
 `gate_satisfied=false`; no physical evidence is claimed.
 
-As of 2026-08-28, C1 through C8.3 are accepted complete by historical-evidence
+As of 2026-08-29, C1 through C8.3 are accepted complete by historical-evidence
 policy. The completed C8.4 decision-bearing chain is the fixed-QEMU contract
 below. It reuses the live trusted-terminal boundary and private 24-sample collector
 to emit META + 24 SAMPLE + END through the platform-neutral atomic UART sink,
@@ -1049,10 +1081,12 @@ is accepted. C8.5 through C8.7 are skipped for this workload and remain
 globally deferred; they are not marked complete.
 The current implementation node is C8.8. C8.8-F1 through C8.8-F4 are complete;
 C8.8-F5's host/fixed-QEMU portion and inert Duo compile-readiness slice are
-complete. Compile readiness is not physical qualification. The physical-Duo
-evidence sub-gate remains deferred at operator request, so F5, Float, and C8.8
-remain not fully complete. There is no authorized executable successor to
-enter while that state holds.
+complete, and its separate physical-v1 transcript/campaign verifier contract
+is frozen. Neither compile readiness nor a host-only verifier is physical
+qualification. The physical producer and three-cold-boot evidence sub-gate
+remain deferred at operator request, so F5, Float, and C8.8 remain not fully
+complete. There is no authorized executable successor to enter while that
+state holds.
 
 ## 10. Test and evidence matrix
 

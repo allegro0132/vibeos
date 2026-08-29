@@ -1,0 +1,136 @@
+{
+  "allocation": {
+    "authorization_contract": "acceptance/wasm-reference-target/artifacts/c812-r3-fixed-qemu-qualification-v1-contract.json",
+    "authorization_contract_sha256": "83a78e8fe9a02f9a7b32ab509a7895a89bfca10ce6c76f78d2499b8fac5671f7",
+    "authorized_scope": "independently-numbered-reference-executable-successor-design-only",
+    "code9_promoted": false,
+    "new_artifact_profile_code": 10,
+    "node": "C8.13-E1",
+    "predecessor_validation_profile_code": 9
+  },
+  "authority": {
+    "admission_authorized": false,
+    "durable_publication_authorized": false,
+    "execution_authorized": false,
+    "migration_authorized": false,
+    "ordinary_command_authorized": false,
+    "production_authorized": false,
+    "release_authorized": false,
+    "runtime_ready": false
+  },
+  "basis": {
+    "source_commit": "e7ff1a8435d50e3e627ed7874e8242c76d450bbb",
+    "source_tree": "365d610d735b8785aa43092bdcd371a5b58199dc"
+  },
+  "boundaries": {
+    "aot": false,
+    "bulk_memory": false,
+    "code5_current_engine": false,
+    "code5_permanently_inert": true,
+    "code7_current_engine": false,
+    "code8_scope_changed": false,
+    "code9_current_engine": false,
+    "code9_execution_authorized": false,
+    "code9_migration_authorized": false,
+    "code9_promoted": false,
+    "component_reference_values": false,
+    "externref": false,
+    "gc_semantics": false,
+    "host_reference_values": false,
+    "jit": false,
+    "native_bytes": false,
+    "rwx": false,
+    "typed_function_references": false
+  },
+  "engine": {
+    "candidate_package": "vibeos-wasmi-reference-executable",
+    "candidate_version": "1.1.0-vibeos-ref2.1",
+    "default_features": false,
+    "implementation_status": "selected-for-c813-e2-facade-not-materialized",
+    "package_identity": "vibeos-wasmi-reference-executable@1.1.0-vibeos-ref2.1",
+    "required_features": [
+      "extra-checks",
+      "prefer-btree-collections"
+    ],
+    "source_base": "vibeos-wasmi-softfloat@1.1.0-vibeos-f2.1",
+    "wasmi_configuration": {
+      "bulk_memory": false,
+      "consume_fuel": true,
+      "floats": false,
+      "memory64": false,
+      "multi_memory": false,
+      "reference_types": true,
+      "simd": false,
+      "threads": false
+    }
+  },
+  "identity": {
+    "artifact_abi": 10,
+    "artifact_profile_code": 10,
+    "component_profile": 7,
+    "core_profile": 7,
+    "name": "PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE",
+    "runtime_abi": 10,
+    "stage": "executable"
+  },
+  "nodes": [
+    {
+      "exit_gate": "freeze-independent-code10-executable-design-engine-world-authority-and-qemu-policy",
+      "id": "C8.13-E1"
+    },
+    {
+      "exit_gate": "implement-executor-current-engine-sealed-volatile-admission-lifecycle-durable-rejection-supply-chain-and-riscv-audit",
+      "id": "C8.13-E2"
+    },
+    {
+      "exit_gate": "fresh-source-bound-normal-and-optimized-fixed-qemu-qualification-before-sealed-release",
+      "id": "C8.13-E3"
+    }
+  ],
+  "qualification_policy": {
+    "duo_gate_effect": false,
+    "fixed_qemu_is_hardware_equivalent": false,
+    "physical_inputs_permitted": 0,
+    "physical_inputs_required": 0,
+    "platform": "qemu-virt-rv64-tcg-icount-v1"
+  },
+  "revisions": {
+    "canonical_abi": "component-model-0.255.0-sync-no-core-reference-boundary-c813-reference-executable-v1",
+    "component": "wasmparser-component-model-0.255.0-c813-reference-executable-v1",
+    "core": "webassembly-core-2.0-reference-types-1.0-nullable-funcref-c813-executable-v1"
+  },
+  "roadmap": {
+    "allocated_node": "C8.13",
+    "completed_node": "C8.13-E1",
+    "current_position": "c813-e1-reference-executable-design-frozen-pre-implementation",
+    "next_node": "C8.13-E2"
+  },
+  "schema": "vibeos.c813.reference-executable-design-v1.contract",
+  "semantics": {
+    "active_element_segments": true,
+    "bounded_core_internal_funcref": true,
+    "deterministic_fuel": true,
+    "host_boundary_integer_only": true,
+    "maximum_tables": 1,
+    "nullable_funcref": true,
+    "reference_operations": [
+      "ref.null func",
+      "ref.is_null",
+      "ref.func",
+      "typed-select-single-funcref",
+      "table.get",
+      "table.set",
+      "table.grow",
+      "table.size",
+      "table.fill"
+    ]
+  },
+  "status": "c813-e1-reference-executable-design-frozen-not-implemented-not-qualified-not-released",
+  "version": 1,
+  "world": {
+    "exact_wit": "package vibe:references@1.0.0;\nworld runtime {\n  export run: func(mode: u32, input: list<u8>) -> list<u8>;\n}\n",
+    "identity": "vibe:references/runtime@1.0.0",
+    "resources": 0,
+    "surface": "authority-free-sync-integer-and-byte-boundary"
+  }
+}

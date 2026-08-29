@@ -48,7 +48,11 @@ closure, and RISC-V object audit. C8.12-R3 now closes the fresh source-bound
 fixed-QEMU campaign. Code 9 remains
 validation-only and inert; only an independently numbered executable-successor
 design review is now eligible. The current position is
-`c812-r3-qualified-reference-validation-successor-review-eligible`.
+now allocated as C8.13. C8.13-E1 freezes independent executable code/ABIs 10,
+Component/Core profile 7, exact revisions, a separately named engine, the
+sealed authority-free world, code-9 non-promotion, and the fixed-QEMU policy.
+The current position is
+`c813-e1-reference-executable-design-frozen-pre-implementation`.
 Every feature widening after Reference Types remains separately unallocated and
 incomplete.
 The earlier non-numbered fixed-QEMU
@@ -917,6 +921,7 @@ component security boundary is measured and stable.
 | C8.10 | Widen fixed-width SIMD under an independent validation identity | New code 7 freezes fixed SIMD 1.0 with deterministic software-float lanes, no public `v128` boundary, no relaxed SIMD, and staged engine, containment, admission/lifecycle, and fixed-QEMU gates before any successor review |
 | C8.11 | Allocate an independent executable SIMD successor | New code 8 and ABIs 8 freeze fixed SIMD semantics, an exact engine identity, closed authority-free world, code-7 non-promotion, implementation gates, and fresh fixed-QEMU qualification before release |
 | C8.12 | Widen Reference Types under an independent validation identity | New code 9 and ABIs 9 freeze bounded Core-internal nullable `funcref`, reject `externref`, typed references, GC objects and all host/Component reference boundaries, and require separate implementation and fixed-QEMU qualification before any successor review |
+| C8.13 | Allocate an independent executable Reference Types successor | New code 10 and ABIs 10 preserve the bounded code-9 semantics behind a sealed authority-free integer/byte boundary, forbid in-place promotion, and require separate design, implementation, and fresh fixed-QEMU qualification before release |
 
 The C8.3 row above is retained verbatim as the historical v1 acceptance text.
 C1 through C8.3 are treated as complete under the project's historical-evidence
@@ -1414,6 +1419,36 @@ C8.12. Fixed QEMU is emulator-scoped and makes no physical-equivalence claim;
 Milk-V Duo remains paused and supplies zero inputs. Code 5 remains permanently
 inert, code 7 remains validation-only, and code 8's released scope is unchanged. See
 [WASM_REFERENCE_TYPES_PROFILE.md](WASM_REFERENCE_TYPES_PROFILE.md).
+
+## 9.5 C8.13 independent Reference Types executable successor
+
+C8.12-R3 makes only a separately numbered executable-successor design review
+eligible. C8.13-E1 now allocates
+`PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE`: artifact profile code and
+artifact/runtime ABI 10, Component/Core profile 7, stage `Executable`, and
+engine `vibeos-wasmi-reference-executable@1.1.0-vibeos-ref2.1`. The exact
+world is `vibe:references/runtime@1.0.0` with only integer and byte-list
+parameters/results and zero resources.
+
+The semantic surface is unchanged from C8.12: bounded Core-internal nullable
+`funcref`, one table, active elements, Reference Types 1.0 table operations,
+and deterministic fuel. `externref`, typed references, GC, host/Component
+reference values, bulk memory, floats, SIMD, memory64, threads, AOT/JIT/native
+bytes/RWX, durable publication, and ordinary command routing remain forbidden.
+
+| # | Scope | Exit gate |
+|---|---|---|
+| C8.13-E1 | Freeze independent executable design | Code/ABIs 10, profile 7, revisions, world, exact engine, semantics, code-9 non-promotion, authority boundaries, and target policy are frozen |
+| C8.13-E2 | Implement sealed volatile runtime | Executor, current-engine binding, exact authority-free admission/lifecycle, durable rejection, supply-chain closure, and RISC-V audit pass |
+| C8.13-E3 | Qualify and decide release | Fresh source-bound normal and optimized fixed-QEMU evidence passes before releasing only the sealed volatile code-10 runtime |
+
+The current position is
+`c813-e1-reference-executable-design-frozen-pre-implementation`; the next node
+is C8.13-E2. E1 freezes design metadata only and materializes no code-10
+runtime or facade. Code 9 remains validation-only, non-current,
+non-executable, and non-migratable. Code 5 remains permanently inert. Milk-V
+Duo remains paused with zero gate effect. See
+[WASM_REFERENCE_TYPES_EXECUTABLE_PROFILE.md](WASM_REFERENCE_TYPES_EXECUTABLE_PROFILE.md).
 
 ## 10. Test and evidence matrix
 

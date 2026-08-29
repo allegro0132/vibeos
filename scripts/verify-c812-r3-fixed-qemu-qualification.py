@@ -24,6 +24,7 @@ CONTRACT = (
 BYTES = 3_322
 SHA256 = "83a78e8fe9a02f9a7b32ab509a7895a89bfca10ce6c76f78d2499b8fac5671f7"
 POSITION = "c812-r3-qualified-reference-validation-successor-review-eligible"
+LIVE_POSITION = "c813-e1-reference-executable-design-frozen-pre-implementation"
 
 
 class Failure(RuntimeError):
@@ -257,6 +258,12 @@ def verify_files(value: dict[str, Any]) -> None:
         "TESTING.md",
     ):
         require(POSITION in read(ROOT / path).decode(), f"live position missing: {path}")
+    for path in (
+        "docs/WASM_ROADMAP.md",
+        "docs/WASM_REFERENCE_TYPES_EXECUTABLE_PROFILE.md",
+        "TESTING.md",
+    ):
+        require(LIVE_POSITION in read(ROOT / path).decode(), f"successor position missing: {path}")
     ci = read(ROOT / ".github/workflows/ci.yml").decode()
     require(
         "Verify the C8.12-R3 fixed-QEMU qualification decision" in ci,

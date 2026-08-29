@@ -50,11 +50,13 @@ python3 -B scripts/verify-c83-runtime-costs.py --selftest --check-manifest
 python3 -B scripts/qemu-c83-runtime-costs.py --allow-dirty-smoke
 python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
 python3 -B scripts/verify-c83-evidence.py --selftest
-# Retained Duo-v1 physical transcript contract
-python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
-# Published fixed-QEMU C8.4 contract self-tests
-/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -I -B -S -X pycache_prefix=/var/empty/vibeos-c84-python-pyc scripts/verify-c84-qemu-aot-decision.py --selftest --check-manifest
-/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -I -B -S -X pycache_prefix=/var/empty/vibeos-c84-python-pyc scripts/c84-qemu-aot-decision-peer.py --selftest
+# Published fixed-QEMU C8.4 replacement gate; no QEMU or physical replay
+python3 -B scripts/verify-c84-qemu-published-evidence.py --check-published
+python3 -O -B scripts/verify-c84-qemu-published-evidence.py --check-published
+python3 -B scripts/verify-c84-qemu-published-evidence.py --selftest
+python3 -O -B scripts/verify-c84-qemu-published-evidence.py --selftest
+# Retained capture-time transport tooling; non-evidence on the current tree
+python3 -B scripts/c84-qemu-aot-decision-peer.py --selftest
 ./scripts/run-c84-qemu-aot-decision.sh --selftest
 # Formal mode additionally requires the clean pushed codex/wasm commit, a live
 # fixed-remote query, raw cat-file export of exact commit/gitlink blobs with
@@ -605,6 +607,17 @@ clock, a 1,000,000-tick budget, and a 1.10 stability ceiling. C1 through C8.3 ar
 accepted complete by historical-evidence policy. The retained Duo contract is
 non-blocking while physical testing stays paused. Neither possible fixed-QEMU
 outcome authorizes AOT or accepts native code.
+
+The current CI gate is
+`scripts/verify-c84-qemu-published-evidence.py`. It proves that the exact
+published bundle still matches publication commit `cbb1d0f`, that its source
+and capture-time verifier members still exist in source commit `e950a2f`, and
+that the stored decision remains emulator-only with zero physical inputs and
+no AOT/native-code authority. Its success is historical structure/hash
+integrity only: it does not rerun QEMU, replay publisher execution or ephemeral
+host custody, or establish physical provenance. The capture-time QEMU and
+physical verifiers remain frozen historical members; they are not run against
+later live policy files as a current-tree gate.
 
 Formal source custody inventories the superproject commit and both exact
 gitlinks, then writes only raw, independently OID-checked `git cat-file

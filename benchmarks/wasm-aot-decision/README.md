@@ -36,13 +36,26 @@ and remain globally deferred. The retained Duo-v1 tooling is non-blocking and
 physical execution stays paused. See
 [`docs/WASM_AOT_DECISION.md`](../../docs/WASM_AOT_DECISION.md).
 
-The QEMU-v1 host gates are:
+The neutral machine contract is
+[`qemu-v1-publication-integrity-contract.json`](qemu-v1-publication-integrity-contract.json).
+The current QEMU-v1 publication-integrity gates are:
 
 ```sh
-/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -I -B -S -X pycache_prefix=/var/empty/vibeos-c84-python-pyc scripts/verify-c84-qemu-aot-decision.py --selftest --check-manifest
-/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -I -B -S -X pycache_prefix=/var/empty/vibeos-c84-python-pyc scripts/c84-qemu-aot-decision-peer.py --selftest
+python3 -B scripts/verify-c84-qemu-published-evidence.py --check-published
+python3 -O -B scripts/verify-c84-qemu-published-evidence.py --check-published
+python3 -B scripts/verify-c84-qemu-published-evidence.py --selftest
+python3 -O -B scripts/verify-c84-qemu-published-evidence.py --selftest
+python3 -B scripts/c84-qemu-aot-decision-peer.py --selftest
 ./scripts/run-c84-qemu-aot-decision.sh --selftest
 ```
+
+The first four commands bind the exact published files to publication commit
+`cbb1d0f`, bind the recorded source and capture-time verifier bytes to source
+commit `e950a2f`, and recheck the stored emulator-only/no-AOT decision. They are
+historical structure/hash checks only: they do not boot QEMU, replay the
+publisher or its host custody, or claim physical provenance. The capture-time
+verifiers remain frozen at `e950a2f`; later policy additions are not substituted
+for those historical source members.
 
 The published formal clean-tree campaign used
 `./scripts/run-c84-qemu-aot-decision.sh --evidence-dir benchmarks/wasm-aot-decision/qemu-v1`.
@@ -231,5 +244,10 @@ the semantic checks.
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
-python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
 ```
+
+The capture-time physical verifier is source-bound to `e950a2f` and remains a
+retained historical member, not a current-tree gate. Its reviewed bytes and
+the two policy source members it inspected are covered by the fixed-QEMU
+publication-integrity auditor above. No retained physical command is required
+to complete or preserve C8.4.

@@ -149,9 +149,21 @@ jobs:
           python3 -B scripts/verify-c83-runtime-costs.py --selftest --check-manifest
           python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
           python3 -B scripts/verify-c83-evidence.py --selftest
-      - name: Verify the C8.4 single-boot transcript contract
-        run: python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
-      - name: Verify the C8.4 Duo packaging and three-boot evidence tooling
+      - name: Verify the published fixed-QEMU C8.4 replacement gate
+        # Historical structure/hash integrity only: this neither boots QEMU
+        # nor replays the publication-time host custody.
+        run: |
+          python3 -B scripts/verify-c84-qemu-published-evidence.py \
+            --check-published
+          python3 -O -B scripts/verify-c84-qemu-published-evidence.py \
+            --check-published
+          python3 -B scripts/verify-c84-qemu-published-evidence.py \
+            --selftest
+          python3 -O -B scripts/verify-c84-qemu-published-evidence.py \
+            --selftest
+      - name: Verify the retained C8.4 Duo non-evidence tooling
+        # Tooling integrity only. Physical execution remains paused and is
+        # not a C8.4 roadmap or evidence gate.
         run: |
           bash -n scripts/build-milkv-duo.sh
           bash -n scripts/package-milkv-duo-sdk.sh

@@ -207,6 +207,18 @@ jobs:
             --features c810-s4-acceptance --test c810_s4_simd_admission
           cargo test --locked --offline -p vibeos-component-loader \
             profile_instance_limits_and_exact_wit_are_revalidated
+      - name: Verify the C8.10-S5 fixed-QEMU qualification decision
+        # Published evidence/authority integrity and portable qualifier only.
+        # CI reruns neither QEMU nor physical hardware.
+        run: |
+          python3 -B scripts/verify-c810-s5-fixed-qemu-qualification.py --check-contract
+          python3 -O -B scripts/verify-c810-s5-fixed-qemu-qualification.py --check-contract
+          python3 -B scripts/verify-c810-s5-fixed-qemu-qualification.py --selftest
+          python3 -O -B scripts/verify-c810-s5-fixed-qemu-qualification.py --selftest
+          python3 -B scripts/verify-c810-s5-simd-evidence.py --selftest
+          python3 -O -B scripts/verify-c810-s5-simd-evidence.py --selftest
+          cargo test --locked --offline -p vibeos-wasm-simd-target \
+            --features c810-s5-qemu-qualification
       - name: Verify the prospective fixed-QEMU WASM target/release policy
         # Policy/contract integrity only: this step runs no QEMU or Duo and
         # itself satisfies no gate. C8.9 qualification is verified separately.

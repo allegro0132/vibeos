@@ -596,7 +596,7 @@ Milk-V Duo stays paused and optional and has no gate, completion, or release
 effect; emulator qualification is not a physical-equivalence claim.
 
 The live roadmap position is
-`c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu`.
+`c810-s5-fixed-qemu-qualified-successor-review-eligible`.
 The separately allocated validation-only SIMD widening is defined in
 [WASM_SIMD_PROFILE.md](WASM_SIMD_PROFILE.md); it does not widen code 6 or alter
 the completed Float release boundary.

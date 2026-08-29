@@ -1,6 +1,6 @@
 # Deterministic SIMD profile
 
-Status: `c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu`.
+Status: `c810-s5-fixed-qemu-qualified-successor-review-eligible`.
 
 This document defines the independently numbered C8.10 widening. It is the
 first unfinished non-Float C8.8 feature selected after C8.9 closure. C8.10-S1
@@ -74,7 +74,7 @@ durable loader recovery.
 | C8.10-S2 | Complete: independent deterministic Core SIMD engine, supply chain, fuel, and RISC-V object audit |
 | C8.10-S3 | Complete: Component containment plus fixed differential and fuzz corpora; `v128` remains Core-internal |
 | C8.10-S4 | Complete: default-off candidate admission, quota, lifecycle, recovery, and durable rejection |
-| C8.10-S5 | Pass fresh normal/optimized fixed-QEMU qualification and decide only successor-review eligibility |
+| C8.10-S5 | Complete: fresh normal/optimized fixed-QEMU qualification; successor design review is eligible only |
 
 The fixed target gate is `qemu-virt-rv64-tcg-icount-v1` with fresh source/tree,
 suite, challenge, run ID, capture, predicates, and normal/optimized
@@ -131,4 +131,25 @@ python3 -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
 python3 -O -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
 cargo test --locked --offline -p vibeos-component-admission --features c810-s4-acceptance --test c810_s4_simd_admission
 cargo test --locked --offline -p vibeos-component-loader profile_instance_limits_and_exact_wit_are_revalidated
+```
+
+C8.10-S5 passed one fresh, source-bound fixed-QEMU campaign at commit
+`4b2add7ccf9dee18891b89548ee24a3e6d828f98`, run ID
+`ca57bdf2af07484ef48e8ef09e51700e1f5b7a169de04c58594b66a96c7c8b61`,
+with seven SIMD/containment/lifecycle records and semantic SHA-256
+`6b34b541a42fdf838eccd55e43473a4154421eadc0e3b4292a5a89fde54ae1c6`.
+Normal and optimized verification passed, and the final ELF audit found no
+forbidden helper or RISC-V F/D/V opcode. The decision makes only a later,
+currently unallocated successor design review eligible. It does not make code
+7 executable/current, authorize durable or production use, or allocate the
+next profile, ABI, revision, or engine.
+
+```sh
+python3 -B scripts/verify-c810-s5-fixed-qemu-qualification.py --check-contract
+python3 -O -B scripts/verify-c810-s5-fixed-qemu-qualification.py --check-contract
+python3 -B scripts/verify-c810-s5-fixed-qemu-qualification.py --selftest
+python3 -O -B scripts/verify-c810-s5-fixed-qemu-qualification.py --selftest
+python3 -B scripts/verify-c810-s5-simd-evidence.py --selftest
+python3 -O -B scripts/verify-c810-s5-simd-evidence.py --selftest
+cargo test --locked --offline -p vibeos-wasm-simd-target --features c810-s5-qemu-qualification
 ```

@@ -32,9 +32,9 @@ CONTRACT_PATH = (
     "fixed-qemu-target-release-policy-v1-contract.json"
 )
 
-EXPECTED_CONTRACT_BYTES = 24_329
+EXPECTED_CONTRACT_BYTES = 25_768
 EXPECTED_CONTRACT_SHA256 = (
-    "093270cf9081e4ba1c467a6714bbd2f1da8cbbc3ef816e2a707ebcee9db9548f"
+    "838062894e0d93348891e95da31ca4542d50d8cb871433fe7a6bb42616a161e3"
 )
 MAX_CONTRACT_BYTES = 64 * 1024
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
@@ -71,7 +71,7 @@ EXPECTED_APPLICATION_STATUS = {
         "c89-float-successor-design-v1-contract.json"
     ),
     "allocation_contract_schema": "vibeos.c89.float-successor-design-v1.contract",
-    "current_roadmap_position": "c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu",
+    "current_roadmap_position": "c810-s5-fixed-qemu-qualified-successor-review-eligible",
     "design_node": "C8.9-S1",
     "design_node_complete": True,
     "implementation_node": "C8.9-S2",
@@ -91,6 +91,16 @@ EXPECTED_APPLICATION_STATUS = {
     "next_widening_first_feature": "simd",
     "next_widening_implementation_node": "C8.10-S2",
     "next_widening_implementation_node_complete": True,
+    "next_widening_qualification_contract_path": (
+        "acceptance/wasm-simd-target/artifacts/"
+        "c810-s5-fixed-qemu-qualification-v1-contract.json"
+    ),
+    "next_widening_qualification_contract_schema": (
+        "vibeos.c810.s5.fixed-qemu-qualification-v1.contract"
+    ),
+    "next_widening_qualification_node": "C8.10-S5",
+    "next_widening_qualification_node_complete": True,
+    "next_widening_successor_design_review_eligible": True,
     "next_widening_containment_contract_path": (
         "acceptance/wasm-simd-target/artifacts/"
         "c810-simd-containment-corpus-v1-contract.json"
@@ -315,12 +325,12 @@ VERIFICATION_COMMANDS = [
 
 EXPECTED_REPOSITORY_FILES = {
     ".github/workflows/ci.yml": {
-        "bytes": 28_743,
-        "sha256": "47d09aa3bc4072031fb64a0d77843f2d33d15a39e259280fce84ec25e1687e83",
+        "bytes": 29_576,
+        "sha256": "1974409ecef528518b994187e209fd9b0b1d55f74cff43f9b89997fbcd225640",
     },
     "TESTING.md": {
-        "bytes": 134_791,
-        "sha256": "394d03813f4dfae67c314ff595b10aa4e0a8d3cd45d32aaf342b1b18928e712e",
+        "bytes": 136_287,
+        "sha256": "a8d0a36ec5208e7dcfb2c978f99f9e08088b1c93aca4d07485807400042c542e",
     },
     (
         "acceptance/wasm-float-target/artifacts/"
@@ -356,38 +366,57 @@ EXPECTED_REPOSITORY_FILES = {
     },
     (
         "acceptance/wasm-simd-target/artifacts/"
+        "c810-s5-fixed-qemu-qualification-v1-contract.json"
+    ): {
+        "bytes": 5_518,
+        "sha256": "824bfe30eca3fb923ea5eeecd96963aa134364f0acc56a3db43cb26eb52ad6c8",
+    },
+    "acceptance/wasm-simd-target/artifacts/c810-s5-normal-receipt.json": {
+        "bytes": 1_277,
+        "sha256": "398a415afa8e0fa8ee66f3c94aa574879a3b8d516d066d01c1417216c39162a7",
+    },
+    "acceptance/wasm-simd-target/artifacts/c810-s5-optimized-receipt.json": {
+        "bytes": 1_280,
+        "sha256": "ff11d50409d0e4daabf41132ae04b4435530eaaf912a8fadc0649ece6cef2c48",
+    },
+    "acceptance/wasm-simd-target/artifacts/c810-s5-review-decision.json": {
+        "bytes": 2_174,
+        "sha256": "f20f68bdf0e86e99d0024e6b008903c6bfdbcc4b9e210d6d56f65646ef24b6e0",
+    },
+    (
+        "acceptance/wasm-simd-target/artifacts/"
         "c810-simd-admission-lifecycle-v1-contract.json"
     ): {
         "bytes": 3_694,
         "sha256": "217c1eb45d78d7cc4a267ae9b1c3e0b366f281e4b8048a86b6ce4f5a0990186f",
     },
     "benchmarks/wasm-aot-decision/README.md": {
-        "bytes": 16_722,
-        "sha256": "789f72019783af8afed8a12042bbb0e4edd90fa79f40fc7f688d35b1b8c142ff",
+        "bytes": 16_719,
+        "sha256": "671a5d4a4c9ab75a13584ab184b6a6f0b26884910d6ee673e3ad161a7d95add9",
     },
     "benchmarks/wasm-runtime/README.md": {
         "bytes": 1_200,
         "sha256": "5e1e1bd8c21dc2f1badecc2f29dc52209cfa4682744c0677abdba604df1dd5b1",
     },
     "docs/WASM_AOT_DECISION.md": {
-        "bytes": 84_249,
-        "sha256": "29d2957d9db9633522d99aba7d00c31fb44f77f2ad63e09c3e7e5eb3732d2204",
+        "bytes": 84_235,
+        "sha256": "d4edb5fd7012856432c30246eab3eac3210f1ffdffe7e8c5d5aa60ad8ad7465a",
     },
     "docs/WASM_FLOAT_PROFILE.md": {
         "bytes": 36_477,
-        "sha256": "5cdc869b43b767341afcf637329085d0755156e6448c67ccca6dc14a7b64b726",
+        "sha256": "6c1256ca594bcc9769acedcaed41ef3fdf4cef19dab8213092e0238c2cc38a42",
     },
     "docs/WASM_ROADMAP.md": {
-        "bytes": 99_312,
-        "sha256": "59892008db83233c8c8278a80eef3f9908eeb50a870ccfe9f0f02bbbb24ade97",
+        "bytes": 99_667,
+        "sha256": "4012c0b3cffacd6ac478061d3263bdd57018a5cdc7ce9beea5e3c51e02f1ae24",
     },
     "docs/WASM_RUNTIME_COSTS.md": {
         "bytes": 12_908,
         "sha256": "3eb717ad1d6681ae073b1ba10f872cc05830911ae7204a078ec64ad87b7534ac",
     },
     "docs/WASM_SIMD_PROFILE.md": {
-        "bytes": 7_073,
-        "sha256": "45e7250bb159305f4506f32d014fb06429ed01dadbe14d457aab3a4142b49776",
+        "bytes": 8_285,
+        "sha256": "542b2c47bf764a4e0b4d361c11ee1875257720099b50b3276c6f0a4875a1d099",
     },
 }
 
@@ -425,6 +454,13 @@ EXPECTED_REPOSITORY_INTEGRATION = {
         "c810-simd-admission-lifecycle-v1-contract.json"
     ),
     "simd_profile_doc": "docs/WASM_SIMD_PROFILE.md",
+    "simd_qualification_contract": (
+        "acceptance/wasm-simd-target/artifacts/"
+        "c810-s5-fixed-qemu-qualification-v1-contract.json"
+    ),
+    "simd_review_decision": (
+        "acceptance/wasm-simd-target/artifacts/c810-s5-review-decision.json"
+    ),
     "testing": "TESTING.md",
     "verification_commands": VERIFICATION_COMMANDS,
 }
@@ -521,7 +557,7 @@ CHECK_OUTPUT = (
     "contract_is_target_evidence=false\n"
     "current_target_release_gate_satisfied=false\n"
     "policy_checkpoint_successor_state=unallocated\n"
-    "current_roadmap_position=c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu\n"
+    "current_roadmap_position=c810-s5-fixed-qemu-qualified-successor-review-eligible\n"
     "physical_inputs_required=0\n"
     "physical_inputs_permitted=0\n"
     "duo_gate_effect=false\n"
@@ -1407,7 +1443,7 @@ C84_HISTORICAL_NEXT_MARKER = (
 )
 CURRENT_POSITION_MARKER = (
     "The current roadmap position is "
-    "`c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu`;"
+    "`c810-s5-fixed-qemu-qualified-successor-review-eligible`;"
 )
 FLOAT_NON_PROMOTION_MARKER = (
     "The C8.8-F5 replacement remains scoped to F5 only; the independent "

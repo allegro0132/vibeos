@@ -6,7 +6,7 @@ VibeOS. It complements [BLUEPRINT.md](BLUEPRINT.md),
 [CAPABILITY_SHELL.md](CAPABILITY_SHELL.md), and
 [PROGRAM_PERSISTENCE.md](PROGRAM_PERSISTENCE.md).
 
-**Status (2026-08-29): implementation in progress.** The repository now contains
+**Status (2026-08-30): implementation in progress.** The repository now contains
 bounded Core validation/execution, Component decoding and Canonical ABI,
 admission/loading, compatibility, and C8 profiling evidence. The dependency
 sequence and acceptance text below remain the roadmap rather than a claim that
@@ -31,9 +31,12 @@ closes Component containment and fixed differential/mutation corpora. C8.10-S4
 closes the default-off volatile admission/lifecycle, one-instance quota,
 explicit recovery/revocation, and durable loader rejection. C8.10-S5 now
 passes a fresh normal/optimized fixed-QEMU campaign and makes only a successor
-design review eligible. C8.11-S1 now allocates that successor as a distinct
-code-8 executable SIMD design without promoting code 7. The current position
-is `c811-s1-simd-executable-design-frozen-pre-implementation`.
+design review eligible. C8.11-S1 allocates that successor as a distinct code-8
+executable SIMD design without promoting code 7. C8.11-S2 now implements its
+exact engine, runtime, authority-free volatile admission, lifecycle, durable
+rejection, supply-chain closure, and RISC-V object gate. The previous position
+was `c811-s1-simd-executable-design-frozen-pre-implementation`; the current
+position is `c811-s2-simd-executable-implemented-pre-fixed-qemu`.
 Every later feature widening remains separately unallocated and incomplete.
 The earlier non-numbered fixed-QEMU
 target/release policy checkpoint makes fresh source-bound
@@ -80,8 +83,8 @@ design/implementation/qualification sequence; it does not rewrite that charter.
 
 **C8.10 status (2026-08-29): C8.10-S1 through C8.10-S5 complete.**
 
-**C8.11 status (2026-08-29): C8.11-S1 design freeze complete; C8.11-S2 and
-C8.11-S3 incomplete.**
+**C8.11 status (2026-08-30): C8.11-S1 and C8.11-S2 complete; C8.11-S3 fixed-QEMU
+qualification remains incomplete.**
 
 ---
 
@@ -1323,7 +1326,8 @@ and fixed-QEMU identities under
 
 The selected S2 engine is
 `vibeos-wasmi-simd-executable-softfloat@1.1.0-vibeos-simd2.1`, derived from the qualified
-C8.10 engine tree but independently named and not yet materialized or bound.
+C8.10 engine tree but independently named. C8.11-S2 materializes its two-file
+facade, binds the exact code-8 current engine, and audits the complete closure.
 Fixed-width SIMD 1.0 and deterministic software-float lanes are retained;
 relaxed SIMD and every adjacent proposal remain forbidden. `v128` remains
 Core-internal and cannot cross WIT, Canonical ABI, or host boundaries.
@@ -1336,12 +1340,14 @@ The ordered nodes are:
 | C8.11-S2 | Implement runtime and admission | Code-8 codec, exact current engine, validator/executor, authority-free admission, lifecycle/accounting, durable rejection, supply-chain closure, and RISC-V audit pass |
 | C8.11-S3 | Qualify and decide release | Fresh source-bound normal and optimized fixed-QEMU evidence passes the node-specific contract before any release or production authority is granted |
 
-The current roadmap position is
-`c811-s1-simd-executable-design-frozen-pre-implementation`; C8.11-S2 is next.
-S1 grants no current-engine binding, admission, durable publication, release,
-or production authority. Code 5 remains permanently inert, code 7 remains
-validation-only and non-migratable, and historical C8.10 evidence cannot
-satisfy C8.11. Milk-V Duo remains paused with zero gate input. See
+The previous roadmap position was
+`c811-s1-simd-executable-design-frozen-pre-implementation`. The current
+position is `c811-s2-simd-executable-implemented-pre-fixed-qemu`; C8.11-S3 is
+next. S2 grants only the exact code-8 current-engine binding and sealed
+authority-free volatile admission. It grants no durable publication, ordinary
+command, release, or production authority. Code 5 remains permanently inert,
+code 7 remains validation-only and non-migratable, and historical C8.10
+evidence cannot satisfy C8.11. Milk-V Duo remains paused with zero gate input. See
 [WASM_SIMD_EXECUTABLE_PROFILE.md](WASM_SIMD_EXECUTABLE_PROFILE.md).
 
 ## 10. Test and evidence matrix

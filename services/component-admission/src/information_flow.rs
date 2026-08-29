@@ -752,7 +752,8 @@ fn append_value_shape(
         #[cfg(any(
             feature = "c88-f4-acceptance",
             feature = "c89-float-executable",
-            feature = "c810-s4-acceptance"
+            feature = "c810-s4-acceptance",
+            feature = "c811-simd-executable"
         ))]
         F32 | F64 => Err(ComponentGraphInformationFlowError::ProjectionMismatch),
         Bool => append(output, "bool"),

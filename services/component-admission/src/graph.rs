@@ -788,13 +788,15 @@ fn hash_value(hasher: &mut Sha256, value: &ValueShape) {
         #[cfg(any(
             feature = "c88-f4-acceptance",
             feature = "c89-float-executable",
-            feature = "c810-s4-acceptance"
+            feature = "c810-s4-acceptance",
+            feature = "c811-simd-executable"
         ))]
         F32 => hasher.update([23]),
         #[cfg(any(
             feature = "c88-f4-acceptance",
             feature = "c89-float-executable",
-            feature = "c810-s4-acceptance"
+            feature = "c810-s4-acceptance",
+            feature = "c811-simd-executable"
         ))]
         F64 => hasher.update([24]),
         Bool => hasher.update([0]),
@@ -1138,7 +1140,8 @@ fn contains_resource_value(value: &ValueShape) -> bool {
         #[cfg(any(
             feature = "c88-f4-acceptance",
             feature = "c89-float-executable",
-            feature = "c810-s4-acceptance"
+            feature = "c810-s4-acceptance",
+            feature = "c811-simd-executable"
         ))]
         ValueShape::F32 | ValueShape::F64 => true,
         ValueShape::Own(_) | ValueShape::Borrow(_) => true,
@@ -1229,7 +1232,8 @@ fn collect_value_async_evidence(
         #[cfg(any(
             feature = "c88-f4-acceptance",
             feature = "c89-float-executable",
-            feature = "c810-s4-acceptance"
+            feature = "c810-s4-acceptance",
+            feature = "c811-simd-executable"
         ))]
         F32 | F64 => return None,
         List(value) | Option(value) => collect_value_async_evidence(value, evidence)?,
@@ -1357,7 +1361,8 @@ fn collect_value_resource_modes(
         #[cfg(any(
             feature = "c88-f4-acceptance",
             feature = "c89-float-executable",
-            feature = "c810-s4-acceptance"
+            feature = "c810-s4-acceptance",
+            feature = "c811-simd-executable"
         ))]
         F32 | F64 => return None,
         Own(resource) => {

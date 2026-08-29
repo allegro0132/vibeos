@@ -37,6 +37,15 @@ pub const C810_SIMD_ENGINE_PACKAGE: &str = "vibeos-wasmi-simd-softfloat";
 pub const C810_SIMD_ENGINE_VERSION: &str = "1.1.0-vibeos-simd1.1";
 pub const C810_SIMD_ENGINE_FEATURES: &str =
     "default-features=false;extra-checks,prefer-btree-collections,simd;relaxed-simd=false";
+pub const C811_SIMD_ENGINE_PACKAGE: &str = "vibeos-wasmi-simd-executable-softfloat";
+pub const C811_SIMD_ENGINE_VERSION: &str = "1.1.0-vibeos-simd2.1";
+pub const C811_SIMD_ENGINE_FEATURES: &str = C810_SIMD_ENGINE_FEATURES;
+pub const C811_SIMD_ENGINE_MANIFEST_SHA256: &str =
+    "6bacc9640a19219dc613c568f2538e4f1aa0dce2ba176055f184e573d1afb3ab";
+pub const C811_SIMD_ENGINE_UPSTREAM_REVISION: &str = C89_SOFTFLOAT_ENGINE_UPSTREAM_REVISION;
+pub const C811_SIMD_ENGINE_PATCH_DELTA_SHA256: &str =
+    "99c4953c437aff9c4e40710cb373c54bf419aac1029d93bf9596c82c21be4615";
+pub const C811_SIMD_ENGINE_SOURCE_TREE: &str = "123bb351a40ff7e923523355eb08049a9d6db39b";
 
 /// Cargo resolves the two direct wasmparser 0.255 users to one package
 /// instance. Consequently both the Component and Core validator roles are
@@ -542,6 +551,30 @@ impl ValidationEngineIdentity {
         identity
     }
 
+    const fn for_c811_simd_contract(profile: ProfileIdentity) -> Self {
+        let mut identity = Self::for_contract(
+            profile,
+            ComponentValidationMode::Sync,
+            CoreValidatorConfiguration::PROFILE_4_SYNC_SIMD,
+            WasmiRuntimeConfiguration::PROFILE_4_SYNC_SIMD,
+        );
+        identity.wasmi = ValidationCrateIdentity::new(
+            C811_SIMD_ENGINE_PACKAGE,
+            C811_SIMD_ENGINE_VERSION,
+            C811_SIMD_ENGINE_MANIFEST_SHA256,
+            C811_SIMD_ENGINE_FEATURES,
+        );
+        identity.software_float_source = Some(SoftwareFloatSourceIdentity {
+            upstream_revision: C811_SIMD_ENGINE_UPSTREAM_REVISION,
+            patch_delta_sha256: C811_SIMD_ENGINE_PATCH_DELTA_SHA256,
+            source_tree: C811_SIMD_ENGINE_SOURCE_TREE,
+            backend_package: C89_SOFTFLOAT_BACKEND_PACKAGE,
+            backend_version: C89_SOFTFLOAT_BACKEND_VERSION,
+            backend_archive_sha256: C89_SOFTFLOAT_BACKEND_ARCHIVE_SHA256,
+        });
+        identity
+    }
+
     pub const fn profile(self) -> ProfileIdentity {
         self.profile
     }
@@ -605,6 +638,10 @@ const PROFILE_1_NATIVE_ASYNC_ENGINE: ValidationEngineIdentity =
 const PROFILE_3_SYNC_FLOAT_EXECUTABLE_ENGINE: ValidationEngineIdentity =
     ValidationEngineIdentity::for_c89_software_float_contract(
         ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE,
+    );
+const PROFILE_5_SYNC_SIMD_EXECUTABLE_ENGINE: ValidationEngineIdentity =
+    ValidationEngineIdentity::for_c811_simd_contract(
+        ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE,
     );
 /// Sealed C8.8-F1 contract metadata. It deliberately contains no frontend or
 /// runtime crate/package/source/checksum identity: F2 must review and bind its
@@ -752,6 +789,8 @@ pub fn current_validation_engine_identity(
         None
     } else if profile == ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION {
         None
+    } else if profile == ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE {
+        Some(&PROFILE_5_SYNC_SIMD_EXECUTABLE_ENGINE)
     } else if profile == ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE {
         Some(&PROFILE_3_SYNC_FLOAT_EXECUTABLE_ENGINE)
     } else if profile == ProfileIdentity::PROFILE_1_SYNC {

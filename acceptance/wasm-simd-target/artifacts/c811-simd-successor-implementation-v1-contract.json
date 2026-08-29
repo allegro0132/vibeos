@@ -1,0 +1,106 @@
+{
+  "authority": {
+    "admission_authorized": true,
+    "admission_scope": "exact-image-pinned-authority-free-volatile-only",
+    "command_authorized": false,
+    "current_engine_bound": true,
+    "durable_publication_authorized": false,
+    "implementation_complete": true,
+    "migration_authorized": false,
+    "production_authorized": false,
+    "release_authorized": false
+  },
+  "basis": {
+    "design_commit": "6e4934d88837465da6a256e741bc13185ecd77f7",
+    "design_contract": "acceptance/wasm-simd-target/artifacts/c811-simd-successor-design-v1-contract.json",
+    "design_contract_bytes": 8267,
+    "design_contract_sha256": "5995b8513f182d891c30d95530d31f6b571c14b0649c39c438f99990f58133ee",
+    "design_tree": "4dc7235b529724fae4ea0b3a656e4cce7203cecc"
+  },
+  "boundaries": {
+    "code5_current_engine": false,
+    "code5_executable": false,
+    "code5_inert_permanent": true,
+    "code5_migration_authorized": false,
+    "code7_current_engine": false,
+    "code7_execution_authorized": false,
+    "code7_migration_authorized": false,
+    "code7_stage": "validation-only",
+    "v128_component_boundary": "forbidden"
+  },
+  "engine": {
+    "base_fork_files": 168,
+    "base_fork_sha256": "8f8113e46b928204e957ebcdb472cec13c7aee0b0acebc34c4883d27d9b751cb",
+    "base_package": "vibeos-wasmi-simd-softfloat",
+    "base_version": "1.1.0-vibeos-simd1.1",
+    "facade_files": 2,
+    "facade_sha256": "99c4953c437aff9c4e40710cb373c54bf419aac1029d93bf9596c82c21be4615",
+    "libm_reachable": false,
+    "package": "vibeos-wasmi-simd-executable-softfloat",
+    "relaxed_simd": false,
+    "version": "1.1.0-vibeos-simd2.1"
+  },
+  "hardware_policy": {
+    "duo_gate_effect": false,
+    "duo_inputs_permitted": 0,
+    "duo_inputs_required": 0,
+    "duo_status": "paused-optional-observation-only",
+    "fixed_qemu_is_hardware_equivalent": false,
+    "other_hardware_gates_unchanged": true,
+    "physical_provenance": "not-claimed"
+  },
+  "identity": {
+    "artifact_abi": 8,
+    "artifact_profile_code": 8,
+    "component_profile": 5,
+    "core_profile": 5,
+    "name": "PROFILE_5_SYNC_SIMD_EXECUTABLE",
+    "runtime_abi": 8,
+    "stage": "executable",
+    "world": "vibe:simd/runtime@1.0.0"
+  },
+  "implementation": {
+    "admission": "exact-image-pinned-import-free-resource-free-empty-caller-authority",
+    "compile_reservation": "exact-current-engine-derived",
+    "durable_and_command_conversion": false,
+    "lifecycle": [
+      "activate",
+      "start",
+      "poll",
+      "cancel",
+      "fault",
+      "recover",
+      "revoke"
+    ],
+    "maximum_instances": 1,
+    "memory_bytes": 65536,
+    "riscv64imac_f_d_v_opcodes": 0,
+    "riscv64imac_fp_helpers": 0,
+    "riscv64imac_semantic_llvm_fp": 0,
+    "wrapper_manifest_sha256": "95e2fa9df69e4a3c9f02e8dfd2419326cf41c25e029c9bde8eb5cf045ca41939",
+    "wrapper_source_sha256": "bdbbc8d985a56d53a93ade53990409723ccd53034358695fede003ac5727d6f0"
+  },
+  "qualification": {
+    "fixed_qemu": "not-started-c811-s3",
+    "fresh_normal_and_optimized_required": true,
+    "production": "not-authorized",
+    "release": "not-authorized"
+  },
+  "roadmap": {
+    "completed_node": "C8.11-S2",
+    "current_position": "c811-s2-simd-executable-implemented-pre-fixed-qemu",
+    "next_node": "C8.11-S3"
+  },
+  "schema": "vibeos.c811.simd-successor-implementation-v1.contract",
+  "status": "c811-s2-implemented-not-fixed-qemu-qualified-not-released",
+  "tests": {
+    "component_admission": "c811_simd_executable",
+    "component_format": "full-package",
+    "component_loader_durable_rejection": "profile_instance_limits_and_exact_wit_are_revalidated",
+    "component_runtime": "c811_simd_executable",
+    "riscv_object_audit": "scripts/verify-c811-s2-riscv-object.py",
+    "supply_chain_audit": "scripts/verify-c811-s2-supply-chain.py",
+    "wrapper": "c811-s2-acceptance"
+  },
+  "version": 1
+}

@@ -1,6 +1,7 @@
 # Deterministic SIMD profile
 
-Status: `c811-s1-simd-executable-design-frozen-pre-implementation`.
+Status: `c811-s2-simd-executable-implemented-pre-fixed-qemu` (the previous
+successor-design position was `c811-s1-simd-executable-design-frozen-pre-implementation`).
 
 This document defines the independently numbered C8.10 widening. It is the
 first unfinished non-Float C8.8 feature selected after C8.9 closure. C8.10-S1

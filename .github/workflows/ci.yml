@@ -227,6 +227,26 @@ jobs:
           python3 -O -B scripts/verify-c811-simd-successor-design.py --check-contract
           python3 -B scripts/verify-c811-simd-successor-design.py --selftest
           python3 -O -B scripts/verify-c811-simd-successor-design.py --selftest
+      - name: Verify the C8.11-S2 executable SIMD implementation
+        # Host/static/RISC-V implementation closure only. Fixed QEMU is S3;
+        # physical hardware remains paused and is never consumed here.
+        run: |
+          python3 -B scripts/verify-c811-simd-successor-implementation.py --check-contract
+          python3 -O -B scripts/verify-c811-simd-successor-implementation.py --check-contract
+          python3 -B scripts/verify-c811-simd-successor-implementation.py --selftest
+          python3 -O -B scripts/verify-c811-simd-successor-implementation.py --selftest
+          python3 -B scripts/verify-c811-s2-supply-chain.py
+          python3 -O -B scripts/verify-c811-s2-supply-chain.py --self-test
+          python3 -B scripts/verify-c811-s2-riscv-object.py
+          cargo test --locked --offline -p vibeos-component-format
+          cargo test --locked --offline -p vibeos-wasm-simd-executable \
+            --features c811-s2-acceptance
+          cargo test --locked --offline -p vibeos-component-runtime \
+            --features c811-simd-executable --test c811_simd_executable
+          cargo test --locked --offline -p vibeos-component-admission \
+            --features c811-simd-executable --test c811_simd_executable
+          cargo test --locked --offline -p vibeos-component-loader \
+            profile_instance_limits_and_exact_wit_are_revalidated
       - name: Verify the prospective fixed-QEMU WASM target/release policy
         # Policy/contract integrity only: this step runs no QEMU or Duo and
         # itself satisfies no gate. C8.9 qualification is verified separately.

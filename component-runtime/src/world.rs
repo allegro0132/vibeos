@@ -191,6 +191,26 @@ impl WorldContract {
         Self::parse_with_features(source, exact_world, ShapeFeatures::PROFILE_2_FLOAT)
     }
 
+    /// WIT frontend for the independent code-8 executable SIMD world. SIMD
+    /// remains Core-internal, so the Component boundary is still scalar-float.
+    #[cfg(feature = "c811-simd-executable")]
+    pub fn parse_profile_5_sync_simd_executable(
+        source: &str,
+        exact_world: &str,
+    ) -> Result<Self, WorldError> {
+        if exact_world != vibeos_component_format::PROFILE_5_SYNC_SIMD_EXECUTABLE_WORLD {
+            return Err(WorldError::VersionMismatch);
+        }
+        let identity = vibeos_component_format::current_validation_engine_identity(
+            vibeos_component_format::ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE,
+        )
+        .ok_or(WorldError::UnsupportedType)?;
+        if identity.component_validator().predecode_async() {
+            return Err(WorldError::UnsupportedType);
+        }
+        Self::parse_with_features(source, exact_world, ShapeFeatures::PROFILE_2_FLOAT)
+    }
+
     fn parse_with_features(
         source: &str,
         exact_world: &str,

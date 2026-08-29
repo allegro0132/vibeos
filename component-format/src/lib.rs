@@ -115,6 +115,22 @@ pub const PROFILE_4_SYNC_SIMD_VALIDATION_CANONICAL_ABI_REVISION: &str =
 pub const PROFILE_4_SYNC_SIMD_VALIDATION_WASI_REVISION: &str = "wasi-not-selected-c810-simd";
 pub const PROFILE_4_SYNC_SIMD_VALIDATION_WORLD: &str = "vibe:simd/validation@1.0.0";
 
+/// C8.11's independently numbered executable fixed-width SIMD successor.
+/// Code 7 remains validation-only and is never reinterpreted as this identity.
+pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_PROFILE_CODE: u16 = 8;
+pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_ARTIFACT_ABI_VERSION: u16 = 8;
+pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_COMPONENT_PROFILE_VERSION: u16 = 5;
+pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_CORE_PROFILE_VERSION: u16 = 5;
+pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_RUNTIME_ABI_VERSION: u16 = 8;
+pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_CORE_SPEC_REVISION: &str =
+    "webassembly-core-2.0-fixed-width-simd-1.0-deterministic-software-float-c811-exec-v1";
+pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_COMPONENT_MODEL_REVISION: &str =
+    "wasmparser-component-model-0.255.0-c811-simd-exec-v1";
+pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_CANONICAL_ABI_REVISION: &str =
+    "component-model-0.255.0-sync-float-values-no-v128-boundary-c811-simd-exec-v1";
+pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_WASI_REVISION: &str = "wasi-not-selected-c811-sync-simd";
+pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_WORLD: &str = "vibe:simd/runtime@1.0.0";
+
 /// Exact Wasmtime release asset admitted as the C8.1 command adapter. These
 /// values describe provenance only; the asset bytes are never bundled or
 /// selected by this `no_std` format crate.
@@ -230,6 +246,9 @@ pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_CANONICAL_FEATURES: u64 =
 /// Float Component boundary and confines `v128` to embedded Core modules.
 pub const PROFILE_4_SYNC_SIMD_VALIDATION_CANONICAL_FEATURES: u64 =
     PROFILE_2_SYNC_FLOAT_CANONICAL_FEATURES;
+
+pub const PROFILE_5_SYNC_SIMD_EXECUTABLE_CANONICAL_FEATURES: u64 =
+    PROFILE_4_SYNC_SIMD_VALIDATION_CANONICAL_FEATURES;
 
 pub const ASYNC_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
     | CanonicalAbiFeature::SyncLiftLower.bit()
@@ -404,6 +423,22 @@ impl ProfileIdentity {
         stage: ProfileStage::ValidationOnly,
     };
 
+    /// C8.11's executable SIMD successor. Its fresh code and ABI coordinates
+    /// ensure that code 7 remains validation-only under every upgrade.
+    pub const PROFILE_5_SYNC_SIMD_EXECUTABLE: Self = Self {
+        artifact_abi: PROFILE_5_SYNC_SIMD_EXECUTABLE_ARTIFACT_ABI_VERSION,
+        component_profile: PROFILE_5_SYNC_SIMD_EXECUTABLE_COMPONENT_PROFILE_VERSION,
+        core_profile: PROFILE_5_SYNC_SIMD_EXECUTABLE_CORE_PROFILE_VERSION,
+        runtime_abi: PROFILE_5_SYNC_SIMD_EXECUTABLE_RUNTIME_ABI_VERSION,
+        core_revision: PROFILE_5_SYNC_SIMD_EXECUTABLE_CORE_SPEC_REVISION,
+        component_revision: PROFILE_5_SYNC_SIMD_EXECUTABLE_COMPONENT_MODEL_REVISION,
+        canonical_abi_revision: PROFILE_5_SYNC_SIMD_EXECUTABLE_CANONICAL_ABI_REVISION,
+        wasm_tools_revision: SYNC_WASM_TOOLS_REVISION,
+        wasi_revision: PROFILE_5_SYNC_SIMD_EXECUTABLE_WASI_REVISION,
+        canonical_features: PROFILE_5_SYNC_SIMD_EXECUTABLE_CANONICAL_FEATURES,
+        stage: ProfileStage::Executable,
+    };
+
     pub const PROFILE_1: Self = Self::PROFILE_1_SYNC;
 
     pub const fn execution_enabled(self) -> bool {
@@ -456,6 +491,15 @@ const _: () = assert!(
 const _: () = assert!(
     ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION.runtime_abi
         == PROFILE_4_SYNC_SIMD_VALIDATION_PROFILE_CODE
+);
+const _: () = assert!(ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE.execution_enabled());
+const _: () = assert!(
+    ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE.artifact_abi
+        == PROFILE_5_SYNC_SIMD_EXECUTABLE_PROFILE_CODE
+);
+const _: () = assert!(
+    ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE.runtime_abi
+        == PROFILE_5_SYNC_SIMD_EXECUTABLE_PROFILE_CODE
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

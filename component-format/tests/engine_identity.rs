@@ -297,3 +297,33 @@ fn c89_code6_binds_the_exact_software_float_source_identity() {
     assert_eq!(source.backend_version(), "0.2.3+llvm-462a31f5a5ab");
     assert!(current_validation_engine_identity(ProfileIdentity::PROFILE_2_SYNC_FLOAT).is_none());
 }
+
+#[test]
+fn c811_code8_binds_the_independent_simd_engine_and_code7_stays_non_current() {
+    let identity =
+        current_validation_engine_identity(ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE)
+            .unwrap();
+    assert_eq!(
+        identity.profile(),
+        ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE
+    );
+    assert_eq!(
+        identity.wasmi().name(),
+        "vibeos-wasmi-simd-executable-softfloat"
+    );
+    assert_eq!(identity.wasmi().version(), "1.1.0-vibeos-simd2.1");
+    assert_eq!(
+        identity.wasmi().checksum(),
+        "6bacc9640a19219dc613c568f2538e4f1aa0dce2ba176055f184e573d1afb3ab"
+    );
+    let source = identity.software_float_source().unwrap();
+    assert_eq!(
+        source.source_tree(),
+        "123bb351a40ff7e923523355eb08049a9d6db39b"
+    );
+    assert!(
+        current_validation_engine_identity(ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION)
+            .is_none()
+    );
+    assert!(current_validation_engine_identity(ProfileIdentity::PROFILE_2_SYNC_FLOAT).is_none());
+}

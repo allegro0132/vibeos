@@ -934,7 +934,8 @@ fn value_is_resource_free(value: &ValueShape) -> bool {
         #[cfg(any(
             feature = "c88-f4-acceptance",
             feature = "c89-float-executable",
-            feature = "c810-s4-acceptance"
+            feature = "c810-s4-acceptance",
+            feature = "c811-simd-executable"
         ))]
         ValueShape::F32 | ValueShape::F64 => false,
         ValueShape::Bool
@@ -1205,7 +1206,8 @@ fn encode_value_shape(
         #[cfg(any(
             feature = "c88-f4-acceptance",
             feature = "c89-float-executable",
-            feature = "c810-s4-acceptance"
+            feature = "c810-s4-acceptance",
+            feature = "c811-simd-executable"
         ))]
         ValueShape::F32 | ValueShape::F64 => {
             return Err(ArtifactAuthenticationError::InvalidPolicy);

@@ -724,6 +724,21 @@ fn profile_instance_limits_and_exact_wit_are_revalidated() {
         Some(ComponentLoadError::Profile)
     );
 
+    // C8.11-S2 adds only an authority-free volatile code-8 admission. Durable
+    // install, command projection, and loader recovery remain Profile-1-only.
+    let mut simd_executable = ArtifactSpec::exact();
+    simd_executable.profile = ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE;
+    assert_eq!(
+        load_exact(
+            artifact_bytes(simd_executable),
+            WIT,
+            SIGNER_DIGEST,
+            &admission,
+        )
+        .err(),
+        Some(ComponentLoadError::Profile)
+    );
+
     let mut limits = ArtifactSpec::exact();
     limits.memory_bytes = 256 * 1024;
     assert_eq!(

@@ -216,6 +216,10 @@ pub fn current_core_validation_engine(
         #[cfg(not(feature = "c89-float-executable"))]
         return None;
     }
+    if profile == ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE {
+        #[cfg(not(feature = "c811-simd-executable"))]
+        return None;
+    }
     let identity = current_validation_engine_identity(profile)?;
     Some(CurrentCoreValidationEngine {
         identity,
@@ -843,6 +847,16 @@ pub fn inspect_core_for_profile_4_candidate(bytes: &[u8]) -> Result<CoreSummary,
 #[cfg(feature = "c810-simd-candidate-inspection")]
 pub fn profile_4_candidate_required_compile_bytes(bytes: &[u8]) -> Result<usize, AdmissionError> {
     let summary = inspect_core_for_profile_4_candidate(bytes)?;
+    Ok(compile_reservation_bytes(bytes.len(), summary))
+}
+
+/// Deterministic compilation policy charge for bytes accepted by one exact
+/// current engine. This computes policy evidence only and constructs no module.
+pub fn current_profile_required_compile_bytes(
+    bytes: &[u8],
+    engine: &CurrentCoreValidationEngine,
+) -> Result<usize, AdmissionError> {
+    let summary = inspect_core_with_current_engine(bytes, engine)?;
     Ok(compile_reservation_bytes(bytes.len(), summary))
 }
 

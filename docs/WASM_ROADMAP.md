@@ -35,8 +35,9 @@ design review eligible. C8.11-S1 allocates that successor as a distinct code-8
 executable SIMD design without promoting code 7. C8.11-S2 now implements its
 exact engine, runtime, authority-free volatile admission, lifecycle, durable
 rejection, supply-chain closure, and RISC-V object gate. The previous position
-was `c811-s1-simd-executable-design-frozen-pre-implementation`; the current
-position is `c811-s2-simd-executable-implemented-pre-fixed-qemu`.
+was `c811-s1-simd-executable-design-frozen-pre-implementation`. C8.11-S3 now
+qualifies and releases only the sealed volatile code-8 runtime; the current
+position is `c811-s3-qualified-sealed-simd-runtime-released`.
 Every later feature widening remains separately unallocated and incomplete.
 The earlier non-numbered fixed-QEMU
 target/release policy checkpoint makes fresh source-bound
@@ -83,8 +84,7 @@ design/implementation/qualification sequence; it does not rewrite that charter.
 
 **C8.10 status (2026-08-29): C8.10-S1 through C8.10-S5 complete.**
 
-**C8.11 status (2026-08-30): C8.11-S1 and C8.11-S2 complete; C8.11-S3 fixed-QEMU
-qualification remains incomplete.**
+**C8.11 status (2026-08-30): C8.11-S1 through C8.11-S3 complete.**
 
 ---
 
@@ -1341,14 +1341,23 @@ The ordered nodes are:
 | C8.11-S3 | Qualify and decide release | Fresh source-bound normal and optimized fixed-QEMU evidence passes the node-specific contract before any release or production authority is granted |
 
 The previous roadmap position was
-`c811-s1-simd-executable-design-frozen-pre-implementation`. The current
-position is `c811-s2-simd-executable-implemented-pre-fixed-qemu`; C8.11-S3 is
-next. S2 grants only the exact code-8 current-engine binding and sealed
+`c811-s1-simd-executable-design-frozen-pre-implementation`. The implementation
+position was `c811-s2-simd-executable-implemented-pre-fixed-qemu`. The current
+position is `c811-s3-qualified-sealed-simd-runtime-released`; the next widening
+is unallocated. S2 granted only the exact code-8 current-engine binding and sealed
 authority-free volatile admission. It grants no durable publication, ordinary
 command, release, or production authority. Code 5 remains permanently inert,
 code 7 remains validation-only and non-migratable, and historical C8.10
 evidence cannot satisfy C8.11. Milk-V Duo remains paused with zero gate input. See
 [WASM_SIMD_EXECUTABLE_PROFILE.md](WASM_SIMD_EXECUTABLE_PROFILE.md).
+
+C8.11-S3 binds pushed source commit `90f95df4503a3992067fa68dbcd7d9dd9485ef10`
+to a fresh fixed-QEMU campaign with seven records and semantic SHA-256
+`ddab9d539744523b332787be6f8a101de00108479c9644136538524f20cd4514`.
+Normal and optimized verification and the final-ELF audit pass. The release is
+strictly the sealed authority-free volatile code-8 path; durable publication,
+ordinary commands, AOT/JIT/native bytes/RWX, and every unrelated hardware gate
+remain unchanged.
 
 ## 10. Test and evidence matrix
 

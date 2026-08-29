@@ -1,6 +1,6 @@
 # Deterministic SIMD profile
 
-Status: `c811-s2-simd-executable-implemented-pre-fixed-qemu` (the previous
+Status: `c811-s3-qualified-sealed-simd-runtime-released` (the previous
 successor-design position was `c811-s1-simd-executable-design-frozen-pre-implementation`).
 
 This document defines the independently numbered C8.10 widening. It is the

@@ -32,9 +32,9 @@ CONTRACT_PATH = (
     "fixed-qemu-target-release-policy-v1-contract.json"
 )
 
-EXPECTED_CONTRACT_BYTES = 22_990
+EXPECTED_CONTRACT_BYTES = 23_663
 EXPECTED_CONTRACT_SHA256 = (
-    "8f3d6e8c67d08a761a1516fee28552bb70f83be0c939233dd40d99f1ffb33fb3"
+    "5f20213b5732b23cb7af2b13661016606abd1d7213bfc42dc853461873e79dda"
 )
 MAX_CONTRACT_BYTES = 64 * 1024
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
@@ -71,7 +71,7 @@ EXPECTED_APPLICATION_STATUS = {
         "c89-float-successor-design-v1-contract.json"
     ),
     "allocation_contract_schema": "vibeos.c89.float-successor-design-v1.contract",
-    "current_roadmap_position": "c810-s2-simd-engine-implemented-pre-containment",
+    "current_roadmap_position": "c810-s3-simd-contained-corpora-passed-pre-admission",
     "design_node": "C8.9-S1",
     "design_node_complete": True,
     "implementation_node": "C8.9-S2",
@@ -91,6 +91,15 @@ EXPECTED_APPLICATION_STATUS = {
     "next_widening_first_feature": "simd",
     "next_widening_implementation_node": "C8.10-S2",
     "next_widening_implementation_node_complete": True,
+    "next_widening_containment_contract_path": (
+        "acceptance/wasm-simd-target/artifacts/"
+        "c810-simd-containment-corpus-v1-contract.json"
+    ),
+    "next_widening_containment_contract_schema": (
+        "vibeos.c810.simd-containment-corpus-v1.contract"
+    ),
+    "next_widening_containment_node": "C8.10-S3",
+    "next_widening_containment_node_complete": True,
     "policy_checkpoint_remains_nonallocating": True,
     "qualification_contract_path": (
         "acceptance/wasm-float-target/artifacts/"
@@ -297,12 +306,12 @@ VERIFICATION_COMMANDS = [
 
 EXPECTED_REPOSITORY_FILES = {
     ".github/workflows/ci.yml": {
-        "bytes": 27_219,
-        "sha256": "0589a625a032949f9f15ff7f7401887a7a7b1cf5bea4aad4c7d8d2d6c4256a8b",
+        "bytes": 27_913,
+        "sha256": "56c77aebe6bbe128d2011cf88becc61d62b155d1f0ecb88dee3cf1a2f83fc55f",
     },
     "TESTING.md": {
-        "bytes": 132_479,
-        "sha256": "cf7b84de8ae7fc68fd5045b8ce8a162ac48ac72b7a2fcac0759296e9f75414b9",
+        "bytes": 133_619,
+        "sha256": "79d6596153dce27c2e22cf36d1028d93cffa7bd5f7b5f9862b487ded0171c29f",
     },
     (
         "acceptance/wasm-float-target/artifacts/"
@@ -329,9 +338,16 @@ EXPECTED_REPOSITORY_FILES = {
         "bytes": 5_053,
         "sha256": "6083c0d132df4c2027dd826601dd9ad351ecebe844edf52290fd139a150e7c26",
     },
+    (
+        "acceptance/wasm-simd-target/artifacts/"
+        "c810-simd-containment-corpus-v1-contract.json"
+    ): {
+        "bytes": 3_635,
+        "sha256": "56bfce66eac664e0a28671f3f0b8adb36e1817e09c94519f6bc7edff13051e74",
+    },
     "benchmarks/wasm-aot-decision/README.md": {
-        "bytes": 16_686,
-        "sha256": "118a608f4768388835307960871aad6019d78007a2a0c433ebcd991554214975",
+        "bytes": 16_705,
+        "sha256": "80ccd71709129c9f58accc744df4c98206893cbe698ca76978ce086d4f7e9e0f",
     },
     "benchmarks/wasm-runtime/README.md": {
         "bytes": 1_200,
@@ -339,23 +355,23 @@ EXPECTED_REPOSITORY_FILES = {
     },
     "docs/WASM_AOT_DECISION.md": {
         "bytes": 84_222,
-        "sha256": "ec1c28d17dd2adfe542406b4d704b2e4af8b6562309eaddba8102c962e93c39c",
+        "sha256": "16065be89cd007418e2e1456b7076dc6983821bfc9fd510dd2f8b93a4cfb852b",
     },
     "docs/WASM_FLOAT_PROFILE.md": {
-        "bytes": 36_470,
-        "sha256": "de820c4cc0f4c5e3d91bc44995c2fff0875b0dafbaf924f844f503c3a1b8a09b",
+        "bytes": 36_474,
+        "sha256": "369016862feaa25162c1f481db3a9bf90734b5795510c5e02827e48d4117bab0",
     },
     "docs/WASM_ROADMAP.md": {
-        "bytes": 98_873,
-        "sha256": "b0778676f9f9f65dac6a256fffa86382b38f734c3bedd18c5b74299de435e1c5",
+        "bytes": 98_960,
+        "sha256": "9473a1964609e11936141255889352ff0bd05dc0d5fdf2606c82cf91beff8ae0",
     },
     "docs/WASM_RUNTIME_COSTS.md": {
         "bytes": 12_908,
         "sha256": "3eb717ad1d6681ae073b1ba10f872cc05830911ae7204a078ec64ad87b7534ac",
     },
     "docs/WASM_SIMD_PROFILE.md": {
-        "bytes": 5_231,
-        "sha256": "303902feaf7b4e3c3cdc6ef787418fee40afa7d7123b350a2ac27de4962480e7",
+        "bytes": 5_984,
+        "sha256": "d2500eeccb279c930063c2e05a440292d5177717ddf7d7faa0fd0b06c87daa4c",
     },
 }
 
@@ -383,6 +399,10 @@ EXPECTED_REPOSITORY_INTEGRATION = {
     "simd_implementation_contract": (
         "acceptance/wasm-simd-target/artifacts/"
         "c810-simd-widening-implementation-v1-contract.json"
+    ),
+    "simd_containment_contract": (
+        "acceptance/wasm-simd-target/artifacts/"
+        "c810-simd-containment-corpus-v1-contract.json"
     ),
     "simd_profile_doc": "docs/WASM_SIMD_PROFILE.md",
     "testing": "TESTING.md",
@@ -481,7 +501,7 @@ CHECK_OUTPUT = (
     "contract_is_target_evidence=false\n"
     "current_target_release_gate_satisfied=false\n"
     "policy_checkpoint_successor_state=unallocated\n"
-    "current_roadmap_position=c810-s2-simd-engine-implemented-pre-containment\n"
+    "current_roadmap_position=c810-s3-simd-contained-corpora-passed-pre-admission\n"
     "physical_inputs_required=0\n"
     "physical_inputs_permitted=0\n"
     "duo_gate_effect=false\n"
@@ -1366,7 +1386,7 @@ C84_HISTORICAL_NEXT_MARKER = (
     "`C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position."
 )
 CURRENT_POSITION_MARKER = (
-    "The current roadmap position is `c810-s2-simd-engine-implemented-pre-containment`;"
+    "The current roadmap position is `c810-s3-simd-contained-corpora-passed-pre-admission`;"
 )
 FLOAT_NON_PROMOTION_MARKER = (
     "The C8.8-F5 replacement remains scoped to F5 only; the independent "

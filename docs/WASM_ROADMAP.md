@@ -25,9 +25,11 @@ now closes the fresh fixed-QEMU gate and releases only that sealed Float
 runtime. Its closure position is `c89-s3-qualified-sealed-float-runtime-released`.
 The next listed C8.8 widening, fixed-width SIMD, is now allocated as C8.10.
 C8.10-S1 freezes validation-only code 7, ABI/revisions, deterministic semantics,
-the independent engine plan, and non-authorization boundaries. C8.10-S2 now
-implements and audits its isolated deterministic fixed-SIMD engine. The current
-position is `c810-s2-simd-engine-implemented-pre-containment`; C8.10-S3 is next.
+the independent engine plan, and non-authorization boundaries. C8.10-S2
+implements and audits its isolated deterministic fixed-SIMD engine. C8.10-S3
+now closes Component containment and fixed differential/mutation corpora. The
+current position is `c810-s3-simd-contained-corpora-passed-pre-admission`;
+C8.10-S4 is next.
 Every later non-Float widening remains separately unallocated and incomplete.
 The earlier non-numbered fixed-QEMU
 target/release policy checkpoint makes fresh source-bound
@@ -1290,8 +1292,8 @@ S3 closes Component
 containment and corpora, S4 closes default-off admission/lifecycle, and S5 uses
 fresh fixed-QEMU evidence to decide successor-review eligibility only.
 
-The current roadmap position is `c810-s2-simd-engine-implemented-pre-containment`;
-C8.10-S3 is the next node.
+The current roadmap position is `c810-s3-simd-contained-corpora-passed-pre-admission`;
+C8.10-S4 is the next node.
 Code 5 remains permanently inert, code 6 gains no SIMD, and C8.10 currently
 authorizes no execution, admission, durable publication, release, or production
 path. Milk-V Duo remains paused, optional, non-gating, and supplies zero input.

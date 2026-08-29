@@ -27,6 +27,8 @@ use wasmi::{
     FuncType, Instance, Linker, Memory, Module, ResumableCall, ResumableCallHostTrap,
     ResumableCallOutOfFuel, Store, StoreLimits, StoreLimitsBuilder, Table, Val, ValType,
 };
+#[cfg(feature = "c810-simd-candidate-inspection")]
+use wasmparser::VisitSimdOperator;
 use wasmparser::{
     Encoding, FrameKind, FrameStack, Parser, Payload, TypeRef, Validator, VisitOperator,
     WasmFeatures,
@@ -590,15 +592,21 @@ struct BoundedControlVisitor {
     len: usize,
     limit: usize,
     max_depth: u32,
+    #[cfg(feature = "c810-simd-candidate-inspection")]
+    fixed_simd: bool,
 }
 
 impl BoundedControlVisitor {
-    fn new(limit: u32) -> Self {
+    fn new(limit: u32, fixed_simd: bool) -> Self {
+        #[cfg(not(feature = "c810-simd-candidate-inspection"))]
+        let _ = fixed_simd;
         let mut visitor = Self {
             frames: [FrameKind::Block; CONTROL_STACK_CAPACITY],
             len: 0,
             limit: limit.min(PROFILE_1_LIMITS.max_core_nesting) as usize,
             max_depth: 0,
+            #[cfg(feature = "c810-simd-candidate-inspection")]
+            fixed_simd,
         };
         // The implicit function frame is not part of the profile nesting
         // count, but BinaryReader requires it for `else`/`end` syntax.
@@ -697,7 +705,33 @@ macro_rules! define_bounded_control_visit {
 impl<'a> VisitOperator<'a> for BoundedControlVisitor {
     type Output = Result<(), AdmissionError>;
 
+    #[cfg(feature = "c810-simd-candidate-inspection")]
+    fn simd_visitor(&mut self) -> Option<&mut dyn VisitSimdOperator<'a, Output = Self::Output>> {
+        Some(self)
+    }
+
     wasmparser::for_each_visit_operator!(define_bounded_control_visit);
+}
+
+#[cfg(feature = "c810-simd-candidate-inspection")]
+macro_rules! define_bounded_simd_visit {
+    ($( @$proposal:ident $op:ident $({ $($arg:ident: $argty:ty),* })? => $visit:ident ($($ann:tt)*))*) => {
+        $(
+            fn $visit(&mut self $($(, $arg: $argty)*)?) -> Self::Output {
+                $( $(let _ = $arg;)* )?
+                if stringify!($proposal) == "simd" && self.fixed_simd {
+                    Ok(())
+                } else {
+                    Err(AdmissionError::unsupported())
+                }
+            }
+        )*
+    };
+}
+
+#[cfg(feature = "c810-simd-candidate-inspection")]
+impl VisitSimdOperator<'_> for BoundedControlVisitor {
+    wasmparser::for_each_visit_simd_operator!(define_bounded_simd_visit);
 }
 
 fn inspect_function_body(
@@ -705,6 +739,7 @@ fn inspect_function_body(
     body: &wasmparser::FunctionBody<'_>,
     limits: &ProfileLimits,
     summary: &mut CoreSummary,
+    validator: CoreValidatorConfiguration,
 ) -> Result<(), AdmissionError> {
     let mut locals = 0_u32;
     let reader = body
@@ -726,7 +761,8 @@ fn inspect_function_body(
     let mut reader = body
         .get_binary_reader_for_operators()
         .map_err(|_| AdmissionError::validation(AdmissionDetail::Malformed))?;
-    let mut visitor = BoundedControlVisitor::new(limits.max_core_nesting);
+    let fixed_simd = allows_fixed_simd(validator);
+    let mut visitor = BoundedControlVisitor::new(limits.max_core_nesting, fixed_simd);
     while !reader.eof() {
         let position = reader.original_position();
         let opcode = *bytes
@@ -735,7 +771,9 @@ fn inspect_function_body(
         // Typed-select, try-table, and resume-table can decode attacker-sized
         // vectors before invoking a visitor. Reject their leading opcodes and
         // the adjacent disabled prefix/family opcodes before that decode.
-        if matches!(opcode, 0x1c | 0x1f | 0xfb..=0xfe | 0xe0..=0xe6) {
+        if matches!(opcode, 0x1c | 0x1f | 0xfb | 0xfc | 0xfe | 0xe0..=0xe6)
+            || (opcode == 0xfd && !fixed_simd)
+        {
             return Err(AdmissionError::unsupported());
         }
         reader
@@ -788,6 +826,15 @@ fn inspect_core_with_limits_and_current_engine(
 /// construct an execution engine, or make an artifact executable.
 pub fn inspect_core_for_profile_2_candidate(bytes: &[u8]) -> Result<CoreSummary, AdmissionError> {
     let contract = profile_2_sync_float_validation_contract();
+    inspect_core_with_limits_and_validator(bytes, &PROFILE_1_LIMITS, contract.core_validator())
+}
+
+/// Performs the bounded Core structural and strict-validation pass selected by
+/// the sealed Profile-4 fixed-SIMD contract. This C8.10 acceptance seam does
+/// not make code 7 current or executable through the production runtime.
+#[cfg(feature = "c810-simd-candidate-inspection")]
+pub fn inspect_core_for_profile_4_candidate(bytes: &[u8]) -> Result<CoreSummary, AdmissionError> {
+    let contract = vibeos_component_format::profile_4_sync_simd_validation_contract();
     inspect_core_with_limits_and_validator(bytes, &PROFILE_1_LIMITS, contract.core_validator())
 }
 
@@ -897,7 +944,7 @@ fn inspect_core_with_limits_and_validator(
                             LimitKind::Globals,
                         )?,
                         TypeRef::Tag(_) | TypeRef::FuncExact(_) => {
-                            return Err(AdmissionError::unsupported())
+                            return Err(AdmissionError::unsupported());
                         }
                     }
                 }
@@ -983,7 +1030,7 @@ fn inspect_core_with_limits_and_validator(
                 }
             }
             Payload::CodeSectionEntry(body) => {
-                inspect_function_body(bytes, &body, limits, &mut summary)?;
+                inspect_function_body(bytes, &body, limits, &mut summary, validator)?;
             }
             Payload::CustomSection(reader) => {
                 checked_add(

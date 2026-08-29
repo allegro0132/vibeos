@@ -776,8 +776,8 @@ The immutable historical C8.4 `next_node` value is
 The C8.9 closure position is `c89-s3-qualified-sealed-float-runtime-released`.
 C8.9-S1 allocates and freezes the independent code-6 Float successor design;
 C8.9-S2 implementation and C8.9-S3 fixed-QEMU qualification are complete.
-The current roadmap position is `c810-s2-simd-engine-implemented-pre-containment`;
-C8.10-S2 is next.
+The current roadmap position is `c810-s3-simd-contained-corpora-passed-pre-admission`;
+C8.10-S4 is next.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -1026,8 +1026,8 @@ proves `libm` unreachable. The pinned RISC-V audit rejects semantic LLVM FP,
 float helpers, and F/D/V instructions across the complete candidate closure.
 
 Code 7 remains `ValidationOnly`, non-current, and non-production. Code 5 stays
-permanently inert. C8.10-S3 containment/corpora, C8.10-S4 admission/lifecycle,
-and C8.10-S5 fixed-QEMU qualification remain incomplete. Milk-V Duo remains
+permanently inert. C8.10-S3 containment/corpora is now complete; C8.10-S4
+admission/lifecycle and C8.10-S5 fixed-QEMU qualification remain incomplete. Milk-V Duo remains
 paused and supplies zero gate input.
 
 ```sh
@@ -1038,6 +1038,27 @@ python3 -O -B scripts/verify-c810-simd-widening-implementation.py --selftest
 python3 scripts/verify-c810-s2-supply-chain.py --self-test
 python3 scripts/verify-c810-s2-riscv-object.py
 cargo test --locked --offline -p vibeos-wasm-simd-candidate --features c810-s2-acceptance
+```
+
+## C8.10-S3 SIMD Component containment and corpora
+
+C8.10-S3 adds a default-off code-7 Component inspector. Fixed SIMD is accepted
+only inside embedded Core modules; `v128` remains unrepresentable in Component
+and WIT values and cannot cross a host import/export boundary. Neither code 7
+nor permanently inert code 5 resolves to a current engine.
+
+The fixed 512-case integer/float-lane differential corpus is pinned at FNV-1a64
+`fcb8de3059c13007`. A separate 512-case truncate/bit-flip/append/insert
+Component mutation corpus is panic-free and pinned at `8af29a0ea0a0b294`.
+This closes containment and corpus evidence only; S4 admission/lifecycle and S5
+fixed-QEMU qualification remain pending.
+
+```sh
+python3 -B scripts/verify-c810-simd-containment-corpus.py --check-contract
+python3 -O -B scripts/verify-c810-simd-containment-corpus.py --check-contract
+python3 -B scripts/verify-c810-simd-containment-corpus.py --selftest
+python3 -O -B scripts/verify-c810-simd-containment-corpus.py --selftest
+cargo test --locked --offline -p vibeos-component-runtime --features c810-s3-acceptance --test c810_s3_simd_containment
 ```
 
 ## Fixed-QEMU target/release policy v1

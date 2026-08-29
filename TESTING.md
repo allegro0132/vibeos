@@ -777,7 +777,8 @@ The C8.9 closure position is `c89-s3-qualified-sealed-float-runtime-released`.
 C8.9-S1 allocates and freezes the independent code-6 Float successor design;
 C8.9-S2 implementation and C8.9-S3 fixed-QEMU qualification are complete.
 The current roadmap position is
-`c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu`; C8.10-S5 is next.
+`c810-s5-fixed-qemu-qualified-successor-review-eligible`; C8.10-S1 through
+C8.10-S5 are complete; the next successor design remains unallocated.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -1026,9 +1027,9 @@ proves `libm` unreachable. The pinned RISC-V audit rejects semantic LLVM FP,
 float helpers, and F/D/V instructions across the complete candidate closure.
 
 Code 7 remains `ValidationOnly`, non-current, and non-production. Code 5 stays
-permanently inert. C8.10-S3 containment/corpora and C8.10-S4 default-off
-admission/lifecycle are complete; C8.10-S5 fixed-QEMU qualification remains
-incomplete. Milk-V Duo remains paused and supplies zero gate input.
+permanently inert. C8.10-S3 containment/corpora, C8.10-S4 default-off
+admission/lifecycle, and C8.10-S5 fixed-QEMU qualification are complete.
+Milk-V Duo remains paused and supplies zero gate input.
 
 ```sh
 python3 -B scripts/verify-c810-simd-widening-implementation.py --check-contract
@@ -1050,8 +1051,8 @@ nor permanently inert code 5 resolves to a current engine.
 The fixed 512-case integer/float-lane differential corpus is pinned at FNV-1a64
 `fcb8de3059c13007`. A separate 512-case truncate/bit-flip/append/insert
 Component mutation corpus is panic-free and pinned at `8af29a0ea0a0b294`.
-This closes containment and corpus evidence only; S4 admission/lifecycle and S5
-fixed-QEMU qualification remain pending.
+S3 itself closes containment and corpus evidence only; the later S4
+admission/lifecycle and S5 fixed-QEMU qualification nodes are now complete.
 
 ```sh
 python3 -B scripts/verify-c810-simd-containment-corpus.py --check-contract
@@ -1080,6 +1081,33 @@ python3 -O -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
 cargo test --locked --offline -p vibeos-component-admission --features c810-s4-acceptance --test c810_s4_simd_admission
 cargo test --locked --offline -p vibeos-component-loader profile_instance_limits_and_exact_wit_are_revalidated
 ```
+
+## C8.10-S5 fixed-QEMU qualification
+
+C8.10-S5 uses the frozen `qemu-virt-rv64-tcg-icount-v1` profile with fresh
+source/tree, challenge, run ID, capture, and node-specific predicates. The
+published campaign contains seven semantic records, run ID
+`ca57bdf2af07484ef48e8ef09e51700e1f5b7a169de04c58594b66a96c7c8b61`,
+and semantic SHA-256
+`6b34b541a42fdf838eccd55e43473a4154421eadc0e3b4292a5a89fde54ae1c6`.
+Normal and optimized verification passed. CI verifies the frozen contracts and
+host qualifier; it does not rerun QEMU or consume physical inputs.
+
+```sh
+python3 -B scripts/verify-c810-s5-fixed-qemu-qualification.py --check-contract
+python3 -O -B scripts/verify-c810-s5-fixed-qemu-qualification.py --check-contract
+python3 -B scripts/verify-c810-s5-fixed-qemu-qualification.py --selftest
+python3 -O -B scripts/verify-c810-s5-fixed-qemu-qualification.py --selftest
+python3 -B scripts/verify-c810-s5-simd-evidence.py --selftest
+python3 -O -B scripts/verify-c810-s5-simd-evidence.py --selftest
+cargo test --locked --offline -p vibeos-wasm-simd-target --features c810-s5-qemu-qualification
+```
+
+Passing S5 makes only a later successor design review eligible. It neither
+allocates that successor nor authorizes design, implementation, current-engine
+binding, durable publication, production, or release. Code 5 remains permanently
+inert and code 7 remains validation-only. Milk-V Duo remains paused and has no
+gate effect.
 
 ## Fixed-QEMU target/release policy v1
 

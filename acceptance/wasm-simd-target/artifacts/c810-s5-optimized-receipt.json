@@ -1,0 +1,39 @@
+{
+  "evidence": {
+    "elf_audit": {
+      "bytes": 2031,
+      "sha256": "c36f172a37eaf88e5bf281ec18578aaf84b9ec777dcdf77b6949da90b4655299"
+    },
+    "environment": {
+      "bytes": 84792,
+      "evidence_sha256": "d59dbdcb4b7224d06b2b51bf42a3d67569c94dcfd99cfd0b3a18ce9eda80ac60",
+      "sha256": "d07046e41d4c60dbdd32893bc9d2efa0bde97a80f49777f6c315c3b5ca9dd6b7"
+    },
+    "kernel": {
+      "bytes": 45191584,
+      "sha256": "b9e58b0333af041337aa01d64e5aca3cefaf7fe2d1fec3d9673641a617a6272d"
+    },
+    "uart": {
+      "bytes": 5353,
+      "sha256": "2c0b756a228d5a0c2268057550f163aa01104f013df00348a8fd621c840ed2ca"
+    }
+  },
+  "mode": "optimized-python",
+  "node": "C8.10-S5",
+  "physical_inputs": 0,
+  "physical_provenance": "not-claimed",
+  "records": 7,
+  "run_id": "ca57bdf2af07484ef48e8ef09e51700e1f5b7a169de04c58594b66a96c7c8b61",
+  "schema": "vibeos.c810.s5.simd-fixed-qemu.receipt",
+  "semantic_sha256": "6b34b541a42fdf838eccd55e43473a4154421eadc0e3b4292a5a89fde54ae1c6",
+  "source": {
+    "commit": "4b2add7ccf9dee18891b89548ee24a3e6d828f98",
+    "tree": "f7ad8fba9912ddfda878ebf974266bf8befc19bb"
+  },
+  "status": "pass",
+  "verifier": {
+    "bytes": 13371,
+    "sha256": "ee1ac09b0e68e90ce3eeef1ec14616004eda19899629f20d36ab1e191ce3aee7"
+  },
+  "version": 1
+}

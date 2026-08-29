@@ -1,0 +1,60 @@
+{
+  "authority": {
+    "admission_authorized": false,
+    "current_engine_authorized": false,
+    "design_authorized": false,
+    "durable_publication_authorized": false,
+    "implementation_authorized": false,
+    "production_authorized": false,
+    "profile_allocation_authorized": false,
+    "release_authorized": false,
+    "successor_design_review_eligible": true
+  },
+  "code5": {
+    "current_engine": false,
+    "execution_authorized": false,
+    "migration_authorized": false,
+    "permanently_inert": true,
+    "profile_code": 5,
+    "promotion_authorized": false,
+    "stage": "validation-only"
+  },
+  "code7": {
+    "artifact_abi": 7,
+    "current_engine": false,
+    "durable_authorized": false,
+    "engine": "vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd1.1",
+    "production_authorized": false,
+    "profile_code": 7,
+    "release_authorized": false,
+    "runtime_abi": 7,
+    "stage": "validation-only"
+  },
+  "decision": "successor-design-review-eligible-code7-remains-validation-only",
+  "limitations": [
+    "emulator qualification is not physical hardware equivalence",
+    "Milk-V Duo remains paused and optional with zero gate effect",
+    "code 7 remains default-off, non-current, non-durable, and non-production",
+    "this decision allocates no later successor identity, ABI, revision, or engine"
+  ],
+  "node": "C8.10-S5",
+  "qualification": {
+    "challenge": "b4e86cd03585bd03059d4b643784ae7d722b18f7aca058a8b4ba4017d57b1b4d",
+    "elf_no_native_float_helpers": true,
+    "elf_no_riscv_f_d_or_v": true,
+    "normal_verified": true,
+    "optimized_verified": true,
+    "physical_equivalence_claimed": false,
+    "physical_inputs": 0,
+    "physical_provenance": "not-claimed",
+    "platform": "qemu-virt-rv64-tcg-icount-v1",
+    "records": 7,
+    "run_id": "ca57bdf2af07484ef48e8ef09e51700e1f5b7a169de04c58594b66a96c7c8b61",
+    "semantic_sha256": "6b34b541a42fdf838eccd55e43473a4154421eadc0e3b4292a5a89fde54ae1c6",
+    "source_commit": "4b2add7ccf9dee18891b89548ee24a3e6d828f98",
+    "source_tree": "f7ad8fba9912ddfda878ebf974266bf8befc19bb"
+  },
+  "schema": "vibeos.c810.s5.simd-fixed-qemu.review-decision",
+  "status": "pass",
+  "version": 1
+}

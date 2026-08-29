@@ -1,0 +1,159 @@
+{
+  "authority": {
+    "admission_authorized": false,
+    "current_engine_authorized": false,
+    "design_authorized": false,
+    "durable_publication_authorized": false,
+    "implementation_authorized": false,
+    "production_authorized": false,
+    "profile_allocation_authorized": false,
+    "release_authorized": false,
+    "successor_design_review_eligible": true
+  },
+  "campaign": {
+    "challenge": "b4e86cd03585bd03059d4b643784ae7d722b18f7aca058a8b4ba4017d57b1b4d",
+    "normal_verified": true,
+    "opensbi_sha256": "49bdf7b939bda11321132d1042bf99d7324fb190f1feef423171fed3573f8705",
+    "optimized_verified": true,
+    "physical_equivalence_claimed": false,
+    "physical_inputs_permitted": 0,
+    "physical_inputs_required": 0,
+    "physical_provenance": "not-claimed",
+    "platform": "qemu-virt-rv64-tcg-icount-v1",
+    "qemu_sha256": "ef5c714232320c22561daa0998546b73672e21a2801404714dfbd4982ac7b3c0",
+    "qemu_version": "11.0.3",
+    "records": 7,
+    "run_id": "ca57bdf2af07484ef48e8ef09e51700e1f5b7a169de04c58594b66a96c7c8b61",
+    "semantic_sha256": "6b34b541a42fdf838eccd55e43473a4154421eadc0e3b4292a5a89fde54ae1c6",
+    "source_commit": "4b2add7ccf9dee18891b89548ee24a3e6d828f98",
+    "source_tree": "f7ad8fba9912ddfda878ebf974266bf8befc19bb"
+  },
+  "code5_boundary": {
+    "current_engine": false,
+    "executable": false,
+    "inert": true,
+    "migration_authorized": false,
+    "permanent": true,
+    "profile_code": 5,
+    "promotion_authorized": false,
+    "stage": "validation-only"
+  },
+  "code7_boundary": {
+    "artifact_abi": 7,
+    "current_engine": false,
+    "default_off_acceptance_only": true,
+    "durable_authorized": false,
+    "engine": "vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd1.1",
+    "production_authorized": false,
+    "profile_code": 7,
+    "release_authorized": false,
+    "runtime_abi": 7,
+    "stage": "validation-only",
+    "world": "vibe:simd/validation@1.0.0"
+  },
+  "evidence": {
+    "elf_audit": {
+      "bytes": 2031,
+      "forbidden_helpers": 0,
+      "forbidden_opcodes": 0,
+      "sha256": "c36f172a37eaf88e5bf281ec18578aaf84b9ec777dcdf77b6949da90b4655299"
+    },
+    "environment": {
+      "bytes": 84792,
+      "evidence_sha256": "d59dbdcb4b7224d06b2b51bf42a3d67569c94dcfd99cfd0b3a18ce9eda80ac60",
+      "sha256": "d07046e41d4c60dbdd32893bc9d2efa0bde97a80f49777f6c315c3b5ca9dd6b7"
+    },
+    "kernel": {
+      "bytes": 45191584,
+      "sha256": "b9e58b0333af041337aa01d64e5aca3cefaf7fe2d1fec3d9673641a617a6272d"
+    },
+    "uart": {
+      "bytes": 5353,
+      "sha256": "2c0b756a228d5a0c2268057550f163aa01104f013df00348a8fd621c840ed2ca"
+    }
+  },
+  "harness": {
+    "manifest": {
+      "bytes": 1975,
+      "path": "acceptance/wasm-simd-target/artifacts/c810-s5-qualification-manifest.json",
+      "sha256": "2a76b48905638b0a12bb3277f296a869c736f063331e79bc17fc8ac125a4109c"
+    },
+    "producer": {
+      "bytes": 4317,
+      "path": "kernel/src/wasm_simd_target.rs",
+      "sha256": "1175b741676e3fa08ed3c3fa5e5064fe3f60858753fae909b78e08693d308984"
+    },
+    "qualification": {
+      "bytes": 10471,
+      "path": "acceptance/wasm-simd-target/src/lib.rs",
+      "sha256": "33e8f8dd83b5226ab0a2966e0c393807eae8e1c13da9bf350997c1b3af3fbc07"
+    },
+    "runner": {
+      "bytes": 3748,
+      "path": "scripts/qemu-c810-s5-simd.py",
+      "sha256": "b001d497d9e4e2e26eea4d8561974a8ce9716bf589b77210cfc6e801199a822c"
+    },
+    "verifier": {
+      "bytes": 13371,
+      "path": "scripts/verify-c810-s5-simd-evidence.py",
+      "sha256": "ee1ac09b0e68e90ce3eeef1ec14616004eda19899629f20d36ab1e191ce3aee7"
+    }
+  },
+  "implementation_plan": [
+    {
+      "complete": true,
+      "id": "C8.10-S1"
+    },
+    {
+      "complete": true,
+      "id": "C8.10-S2"
+    },
+    {
+      "complete": true,
+      "id": "C8.10-S3"
+    },
+    {
+      "complete": true,
+      "id": "C8.10-S4"
+    },
+    {
+      "complete": true,
+      "id": "C8.10-S5"
+    }
+  ],
+  "node": "C8.10-S5",
+  "outcome": "fixed-qemu-qualified-successor-design-review-eligible-code7-unreleased",
+  "predecessors": {
+    "admission_commit": "68f8e63b966cb6db8a6d80450c108bcb647cc8f0",
+    "admission_contract": "acceptance/wasm-simd-target/artifacts/c810-simd-admission-lifecycle-v1-contract.json",
+    "admission_tree": "93f1c3f46b89d7456303209ea66de120395dd2a3",
+    "harness_commit": "4b2add7ccf9dee18891b89548ee24a3e6d828f98",
+    "harness_tree": "f7ad8fba9912ddfda878ebf974266bf8befc19bb"
+  },
+  "published_artifacts": {
+    "normal_receipt": {
+      "bytes": 1277,
+      "path": "acceptance/wasm-simd-target/artifacts/c810-s5-normal-receipt.json",
+      "sha256": "398a415afa8e0fa8ee66f3c94aa574879a3b8d516d066d01c1417216c39162a7"
+    },
+    "optimized_receipt": {
+      "bytes": 1280,
+      "path": "acceptance/wasm-simd-target/artifacts/c810-s5-optimized-receipt.json",
+      "sha256": "ff11d50409d0e4daabf41132ae04b4435530eaaf912a8fadc0649ece6cef2c48"
+    },
+    "review_decision": {
+      "bytes": 2174,
+      "path": "acceptance/wasm-simd-target/artifacts/c810-s5-review-decision.json",
+      "sha256": "f20f68bdf0e86e99d0024e6b008903c6bfdbcc4b9e210d6d56f65646ef24b6e0"
+    }
+  },
+  "roadmap": {
+    "completed_node": "C8.10-S5",
+    "current_position": "c810-s5-fixed-qemu-qualified-successor-review-eligible",
+    "next_node": "unallocated-successor-design-review",
+    "state": "simd-widening-complete-code7-validation-only"
+  },
+  "schema": "vibeos.c810.s5.fixed-qemu-qualification-v1.contract",
+  "status": "qualified-successor-review-eligible-not-released",
+  "version": 1
+}

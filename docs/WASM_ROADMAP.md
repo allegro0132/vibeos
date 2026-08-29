@@ -28,10 +28,11 @@ C8.10-S1 freezes validation-only code 7, ABI/revisions, deterministic semantics,
 the independent engine plan, and non-authorization boundaries. C8.10-S2
 implements and audits its isolated deterministic fixed-SIMD engine. C8.10-S3
 closes Component containment and fixed differential/mutation corpora. C8.10-S4
-now closes the default-off volatile admission/lifecycle, one-instance quota,
-explicit recovery/revocation, and durable loader rejection. The current
-position is `c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu`; C8.10-S5
-is next.
+closes the default-off volatile admission/lifecycle, one-instance quota,
+explicit recovery/revocation, and durable loader rejection. C8.10-S5 now
+passes a fresh normal/optimized fixed-QEMU campaign and makes only an
+unallocated successor design review eligible. The current position is
+`c810-s5-fixed-qemu-qualified-successor-review-eligible`.
 Every later non-Float widening remains separately unallocated and incomplete.
 The earlier non-numbered fixed-QEMU
 target/release policy checkpoint makes fresh source-bound
@@ -76,8 +77,7 @@ design/implementation/qualification sequence; it does not rewrite that charter.
 
 **C8.9 status (2026-08-29): C8.9-S1 through C8.9-S3 complete.**
 
-**C8.10 status (2026-08-29): C8.10-S1 through C8.10-S4 complete; C8.10-S5
-incomplete.**
+**C8.10 status (2026-08-29): C8.10-S1 through C8.10-S5 complete.**
 
 ---
 
@@ -1296,12 +1296,15 @@ acceptance lifecycle, including explicit cancel/fault recovery, terminal revoke,
 and ordinary loader rejection. It creates no durable or command conversion. S5
 uses fresh fixed-QEMU evidence to decide successor-review eligibility only.
 
-The current roadmap position is
-`c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu`; C8.10-S5 is the next
-node. Code 5 remains permanently inert, code 6 gains no SIMD, and C8.10
-currently authorizes no current-engine binding, durable publication, release,
-or production path. Milk-V Duo remains paused, optional, non-gating, and
-supplies zero input.
+S5 passed fresh fixed-QEMU evidence at source commit
+`4b2add7ccf9dee18891b89548ee24a3e6d828f98`, run ID
+`ca57bdf2af07484ef48e8ef09e51700e1f5b7a169de04c58594b66a96c7c8b61`,
+under normal and optimized verification. The current roadmap position is
+`c810-s5-fixed-qemu-qualified-successor-review-eligible`. The next step is an
+unallocated successor design review, not an automatically authorized design.
+Code 5 remains permanently inert, code 6 gains no SIMD, and code 7 remains
+validation-only, non-current, non-durable, unreleased, and non-production.
+Milk-V Duo remains paused, optional, non-gating, and supplies zero input.
 See [WASM_SIMD_PROFILE.md](WASM_SIMD_PROFILE.md) for the frozen design.
 
 ## 10. Test and evidence matrix

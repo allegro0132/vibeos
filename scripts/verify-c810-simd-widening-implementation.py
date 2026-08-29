@@ -126,8 +126,8 @@ def verify_repository() -> None:
     require("production_ready: false" in candidate and "wasm_relaxed_simd(false)" in candidate, "candidate authority drift")
     require("assert_eq!(used, 3" in candidate, "exact fuel regression missing")
     markers = {
-        "docs/WASM_ROADMAP.md": "c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu",
-        "docs/WASM_SIMD_PROFILE.md": "c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu",
+        "docs/WASM_ROADMAP.md": "c810-s5-fixed-qemu-qualified-successor-review-eligible",
+        "docs/WASM_SIMD_PROFILE.md": "c810-s5-fixed-qemu-qualified-successor-review-eligible",
         "TESTING.md": "## C8.10-S2 deterministic Core SIMD engine",
         ".github/workflows/ci.yml": "Verify the C8.10-S2 SIMD implementation",
     }

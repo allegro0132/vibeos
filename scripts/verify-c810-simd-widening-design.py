@@ -343,7 +343,7 @@ def verify_repository() -> None:
         "code 7 entered current engine after design",
     )
     markers = {
-        "docs/WASM_ROADMAP.md": "c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu",
+        "docs/WASM_ROADMAP.md": "c810-s5-fixed-qemu-qualified-successor-review-eligible",
         "docs/WASM_SIMD_PROFILE.md": "PROFILE_4_SYNC_SIMD_VALIDATION",
         "TESTING.md": "## C8.10-S1 deterministic SIMD widening design",
         ".github/workflows/ci.yml": "Verify the C8.10-S1 SIMD widening design",

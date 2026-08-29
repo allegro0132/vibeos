@@ -168,11 +168,33 @@ python3 -B scripts/verify-c88-f5-float-target.py --selftest
 python3 -O -B scripts/verify-c88-f5-float-target.py --selftest
 python3 -B scripts/verify-c88-f5-riscv-elf.py --self-test
 python3 -O -B scripts/verify-c88-f5-riscv-elf.py --self-test
+python3 -B scripts/verify-c88-f5-qemu-target-gate.py --check-contract
+python3 -O -B scripts/verify-c88-f5-qemu-target-gate.py --check-contract
+python3 -B scripts/verify-c88-f5-qemu-target-gate.py --selftest
+python3 -O -B scripts/verify-c88-f5-qemu-target-gate.py --selftest
+# This checks the retained triplet's structure, source membership, and hashes.
+# It does not replay the four raw evidence files or publisher execution.
+python3 -B scripts/verify-c88-f5-qemu-target-gate.py \
+  --check-decision \
+  acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-decision.json \
+  --normal-receipt \
+  acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-normal-receipt.json \
+  --optimized-receipt \
+  acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-optimized-receipt.json
+python3 -O -B scripts/verify-c88-f5-qemu-target-gate.py \
+  --check-decision \
+  acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-decision.json \
+  --normal-receipt \
+  acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-normal-receipt.json \
+  --optimized-receipt \
+  acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-optimized-receipt.json
 # Development boot only; cannot export or count as formal evidence.
 python3 -B scripts/qemu-c88-f5-float-target.py \
   --allow-dirty-smoke --timeout-seconds 300
-# Formal mode requires clean codex/wasm, HEAD == origin/codex/wasm, and four
-# absent output paths outside the worktree.
+# A fresh formal replay requires clean codex/wasm, HEAD == the local
+# origin/codex/wasm tracking ref after an operator fetch, and seven absent
+# output paths outside the worktree. The publisher owns both normal and -O
+# workers; callers cannot supply candidates, receipts, or a challenge.
 f5_evidence_dir="$(mktemp -d /private/tmp/vibeos-c88-f5-formal.XXXXXX)"
 python3 -B scripts/qemu-c88-f5-float-target.py \
   --timeout-seconds 300 \
@@ -180,21 +202,19 @@ python3 -B scripts/qemu-c88-f5-float-target.py \
   --elf-audit-out "$f5_evidence_dir/elf-audit.json" \
   --uart-out "$f5_evidence_dir/qemu-uart.log" \
   --environment-out "$f5_evidence_dir/environment.json"
-python3 -B scripts/verify-c88-f5-float-target.py \
+python3 -B scripts/verify-c88-f5-qemu-target-gate.py \
+  --publish-matrix \
   --kernel "$f5_evidence_dir/kernel.elf" \
   --elf-audit "$f5_evidence_dir/elf-audit.json" \
   --uart "$f5_evidence_dir/qemu-uart.log" \
-  --environment "$f5_evidence_dir/environment.json"
-python3 -O -B scripts/verify-c88-f5-float-target.py \
-  --kernel "$f5_evidence_dir/kernel.elf" \
-  --elf-audit "$f5_evidence_dir/elf-audit.json" \
-  --uart "$f5_evidence_dir/qemu-uart.log" \
-  --environment "$f5_evidence_dir/environment.json"
-python3 -O -B scripts/verify-c88-f5-riscv-elf.py \
-  --elf "$f5_evidence_dir/kernel.elf" \
-  --output "$f5_evidence_dir/elf-audit-replay-o.json"
-cmp "$f5_evidence_dir/elf-audit.json" \
-  "$f5_evidence_dir/elf-audit-replay-o.json"
+  --environment "$f5_evidence_dir/environment.json" \
+  --normal-receipt-out "$f5_evidence_dir/normal-receipt.json" \
+  --optimized-receipt-out "$f5_evidence_dir/optimized-receipt.json" \
+  --decision-out "$f5_evidence_dir/decision.json"
+python3 -B scripts/verify-c88-f5-qemu-target-gate.py \
+  --check-decision "$f5_evidence_dir/decision.json" \
+  --normal-receipt "$f5_evidence_dir/normal-receipt.json" \
+  --optimized-receipt "$f5_evidence_dir/optimized-receipt.json"
 # C8.8-F5 Milk-V Duo contract and compile-readiness gates.
 # Compile/static inspection only: no packaging, flashing, serial access, boot,
 # capture, or physical-evidence claim.
@@ -755,36 +775,49 @@ recovery. The loader and graph-codec tests independently keep code 5 out of
 production durable loading and CGV1.
 
 F1 through F4 are complete. F4 evidence above remains host evidence; F5 owns
-the separate target claim. The F5 host/fixed-QEMU sub-gate passes from clean,
-already-pushed implementation commit
-`c4ea5e5ca1de622884f33c01bf06653f498360aa` (tree
-`ec7e1195b1a8ba4a88d37a817a9e0f64c4432016`). The formal QEMU regression used
+the separate target claim. For C8.8-F5 only, the formal fixed-QEMU gate now
+replaces the physical-Duo roadmap gate. The publisher-owned normal/`-O`
+matrix closed from clean, already-pushed implementation commit
+`0f06212f890077b2a3d1b4405a128058cb07c55e` (tree
+`a3a3ef403b80eb51e60dd3cb6a2a5b5a6d3aed6d`). The formal QEMU run used
 challenge
-`8fb4bba646b9755b897d5dcbab0cb5724f0c2821b30ee99bbfe76c9a470fce9a`,
+`40eaeea4c049b02bc48c2cc36323d62ea8e2855c485e57a4bba690012ec68859`,
 accepted 1,176 records with semantic SHA-256
 `51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`,
 and produced run ID
-`08cf7c906917fb6a9d1b482f461f12abfc30339bd7136124ae609fa5568c1caa`.
+`53c9f7ed099c371724867d060c3994cb4b3ad93d46404156f40914d7f3b30254`.
 The audited QEMU kernel, UART, ELF-report, and environment identities are:
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
-| QEMU kernel ELF | 40,449,184 | `0ef0ce1bf8f9aad1a5f35bbd783c94ea2fcfbc0fffc72285d5fe5efd781f146e` |
-| QEMU UART | 384,916 | `ede6c9fc7b68982f372762af51d4a786224c6a54c115ac50be7f7e5a4d8de621` |
-| QEMU final-ELF report | 2,031 | `cc70f99f265eb1fa767407b555d7324a7e49a4ed8d24b856859416f3557896af` |
-| QEMU environment | 84,839 | `3307451b5273f00d455ca95cea58e13e78dbcbea5e752a11274cc1abcff48fe6` |
+| QEMU kernel ELF | 40,449,184 | `266b5e6dcce862938be71775106994bcfd3793832f9e216d43c906c2e35953c8` |
+| QEMU UART | 384,916 | `c484c3cd0dae2479e52a07fcd048887cbe76bfd1f19cbcb43466bed11b1ef1f7` |
+| QEMU final-ELF report | 2,031 | `ba4dec8ec6fca71a84092d0dedfa851649ea1663bdddcba77c1aa306560666f6` |
+| QEMU environment | 84,807 | `fc8202f7245422a8d3688879ca7ad29d64695438105dbb8add7465f0506a4302` |
 
 The environment evidence digest is
-`6ad5d168efc32abf88bf982ef59decdd6eaa53f2c1a25d38f2d732c2a2eac8df`.
-Normal and optimized independent replays pass, including byte-identical
-standalone ELF audits. The QEMU ELF contains 381,934 decoded instructions,
+`890c66df895ceccfafb6345b256c38d503e0f98ae5f357f87ae952313caef821`.
+The publisher directly ran both interpreter modes, required byte-identical
+candidate/shared-verifier/ELF-audit results, removed its private stage before
+publication, and wrote the decision last. Its normal receipt is SHA-256
+`4d70865a6a665829457ee0e9ec34c9fa38de51ed6ee2bcb2be1356d752355c1a`,
+its optimized receipt is
+`4f95fcd2b4d2524b1d27fce7bbf77846f4f7d0030da8ebe277ffc062e53550e0`,
+and its decision is
+`1d118cdb4f5709f4ce93331b1cd6b60435e6c530eb800e9c21e0a3e8569030d4`
+with decision ID
+`1841ae06e4c8bef4842a59bbc65362fa860e37d6d8a1d79cc68e3fc5a87004f9`.
+The retained decision is a hash summary: its checker proves structure, source
+membership, and hash integrity, but does not replay the raw evidence or prove
+publisher execution. The QEMU ELF contains 381,934 decoded instructions,
 381,935 canonical boundaries, 42,010 trusted direct targets, and 128,657 code
 symbols, with zero RISC-V F/D opcodes, undefined symbols, or forbidden Float
 helpers. The audit covers trusted native control flow at canonical decoder
 boundaries; it does not claim arbitrary-PC redirection or hardware NX. The
-platform is an emulator and records `physical_provenance=not-claimed`.
+platform is an emulator and records `physical_provenance=not-claimed` and
+`physical_inputs=0`.
 
-The same commit's separate Duo compile-readiness slice freezes suite
+The retained, disjoint Duo compile-readiness slice freezes suite
 `vibeos.c88.f5.float-target.duo-v1`, platform
 `milkv-duo-cv1800b-c906-v1`, and an immutable unarmed sentinel. Its 4,159-byte
 manifest has SHA-256
@@ -819,11 +852,19 @@ checks and a 53-mutation synthetic self-test pass byte-for-byte. This node adds
 no physical feature, arm, producer, image, package, capture, or physical
 provenance. All three-boot counters remain zero.
 
-Milk-V Duo physical qualification remains paused; therefore F5, Float, and
-C8.8 remain open and no executable successor is authorized. The C8.8-F5
-contract is in [docs/WASM_FLOAT_PROFILE.md](docs/WASM_FLOAT_PROFILE.md), and
-the frozen readiness gate is in
-[qualification-duo-v1-manifest.json](acceptance/wasm-float-target/artifacts/qualification-duo-v1-manifest.json).
+Milk-V Duo physical qualification remains paused, retained, and nonblocking.
+The fixed-QEMU decision closes F5, Float, and the Float-only scope of C8.8; it
+does not close SIMD, references, exceptions, memory64, multiple memories, GC,
+threads, broader WASI, or any unrelated hardware gate. Profile code 5 remains
+permanently `ValidationOnly`: no current engine, execution, production,
+native-byte, AOT, durable-publication, or in-place-promotion authority is
+created. Completion opens design review only for a separately numbered,
+currently unallocated successor. The normative contract and retained decision
+are [qualification-qemu-target-gate-v1-contract.json](acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-contract.json)
+and [qualification-qemu-target-gate-v1-decision.json](acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-decision.json).
+The retained Duo readiness gate remains in
+[qualification-duo-v1-manifest.json](acceptance/wasm-float-target/artifacts/qualification-duo-v1-manifest.json)
+as scoped non-evidence.
 
 For the historical C8.4 Duo/AOT flow only, see
 [docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md). It is not the C8.8-F5

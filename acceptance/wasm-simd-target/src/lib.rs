@@ -2,7 +2,10 @@
 
 #![no_std]
 #![cfg_attr(
-    not(feature = "c810-s5-qemu-qualification"),
+    not(any(
+        feature = "c810-s5-qemu-qualification",
+        feature = "c811-s3-qemu-qualification"
+    )),
     doc = r#"
 The target qualifier is structurally absent by default:
 
@@ -12,7 +15,10 @@ use vibeos_wasm_simd_target::qualify;
 "#
 )]
 
-#[cfg(feature = "c810-s5-qemu-qualification")]
+#[cfg(any(
+    feature = "c810-s5-qemu-qualification",
+    feature = "c811-s3-qemu-qualification"
+))]
 extern crate alloc;
 
 #[cfg(feature = "c810-s5-qemu-qualification")]
@@ -274,3 +280,8 @@ mod qualification {
 
 #[cfg(feature = "c810-s5-qemu-qualification")]
 pub use qualification::*;
+
+#[cfg(feature = "c811-s3-qemu-qualification")]
+mod c811;
+#[cfg(feature = "c811-s3-qemu-qualification")]
+pub use c811::{qualify_c811, C811LifecycleEvidence, C811QualificationReport, C811_CASE_IDS};

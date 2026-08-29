@@ -2050,6 +2050,7 @@ dependencies = [
  "vibeos-component-runtime",
  "vibeos-wasm-runtime",
  "vibeos-wasm-simd-candidate",
+ "vibeos-wasm-simd-executable",
  "wat",
 ]
 

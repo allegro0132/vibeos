@@ -118,6 +118,14 @@ jobs:
             acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-normal-receipt.json \
             --optimized-receipt \
             acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-optimized-receipt.json
+      - name: Verify the C8.8-F2 current candidate-consumer closure
+        # Offline acceptance-only fail-closed proof. This does not activate
+        # profile code 5 or authorize implementation or production.
+        run: |
+          python3 -B scripts/verify-c88-f2-supply-chain.py
+          python3 -O -B scripts/verify-c88-f2-supply-chain.py
+          python3 -B scripts/verify-c88-f2-supply-chain.py --self-test
+          python3 -O -B scripts/verify-c88-f2-supply-chain.py --self-test
       - name: Verify the unallocated Float successor review boundary
         # Charter integrity only: no successor identity or engine is selected,
         # and no implementation, execution, admission, or production is authorized.

@@ -26,7 +26,7 @@ c84-profile-hooks = []
 [dependencies]
 vibeos-component-format = { path = "../component-format" }
 vibeos-wasm-runtime = { path = "../wasm-runtime" }
-vibeos-wasm-float-candidate = { path = "../wasm-float-candidate", optional = true }
+vibeos-wasm-float-candidate = { path = "../wasm-float-candidate", default-features = false, optional = true }
 wasmparser = { version = "=0.255.0", default-features = false, features = ["component-model", "features", "prefer-btree-collections", "validate"] }
 wit-parser = { version = "=0.255.0", default-features = false }
 

@@ -166,6 +166,39 @@ and patch-delta SHA-256
 The exact archive, manifest, license, dependency, source, and Profile-1
 isolation identities are frozen in `vendor/wasmi-softfloat/PROVENANCE.toml`.
 
+The offline verifier also freezes the current direct-consumer closure. It
+recursively audits the repo-local path dependency closure from the root
+workspace members through actual normal/dev/build/target path edges, including
+implicit path-dependency members. Scope priority is exact: the invocation root
+claims an in-root, non-excluded target first; otherwise resolution searches from
+the target itself through its nearest workspace ancestors, moving outward past
+excluded workspace roots. A non-root package that is also a workspace root is
+rejected only when the invocation root can claim that target. Only workspace
+templates inherited by discovered packages are expanded. Explicit
+`[package].workspace` overrides are rejected in this frozen closure. It also
+rejects path/symlink escapes,
+split aliases, and duplicate local package identities. Only
+`component-runtime/Cargo.toml` and
+`acceptance/wasm-float-target/Cargo.toml` may depend directly on the candidate,
+through exact path/package identities with `optional = true` and
+`default-features = false`. The only candidate feature edges are
+`c88-f4-acceptance` in the component runtime and `c88-f5-acceptance` plus
+`c88-f5-duo-compile-readiness` in the target acceptance crate; no default or
+unreviewed feature may reach them. The exact transitive forwarders are frozen
+through admission, the image-adapter core and QEMU route, the target QEMU
+route, the kernel QEMU gate, and the QEMU firmware entry. The parallel Duo
+compile-readiness route is also frozen solely as paused, retained, non-blocking
+and non-evidence tooling; fixed QEMU remains the formal F5 replacement gate.
+The image-policy F4 feature remains an empty marker, and a closure-wide
+feature-graph check proves that no discovered package default reaches F2,
+including dependency-level feature activation. Six vendor-bound path edges and
+their complete effective dependency specs are exact and frozen: the candidate's
+sole normal and test entries plus four internal Wasmi edges. No other
+discovered effective dependency may target the vendor tree or name a renamed
+`vendor/wasmi-softfloat` package. This records the current acceptance consumers
+without creating a production consumer, activating code 5, or authorizing
+implementation or production.
+
 The backend is `rustc_apfloat 0.2.3+llvm-462a31f5a5ab` at Git revision
 `eeaacad81247af65d4043cb3e32d023a652d7951`, with archive SHA-256
 `486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad`.
@@ -204,8 +237,9 @@ import denial; stable traps; and fuel/quantum behavior. A fixed-seed 50,000-case
 host IEEE differential corpus has digest `0x05e1fa8e3d779f53`. A separate
 4,096-case end-to-end candidate-Wasmi fuzz corpus has digest
 `0xee61731687e8c81d`; mutated and random hostile Core bytes have digest
-`0xb8eca6402ca6a5df`. The offline supply-chain verifier also proves five
-fail-closed mutations.
+`0xb8eca6402ca6a5df`. The offline supply-chain verifier also proves fail-closed
+source, dependency, consumer-feature, direct-vendor-bypass, and inertness
+mutations.
 
 The pinned `riscv64imac-unknown-none-elf` release build passes an object-level
 audit of the candidate fork, `rustc_apfloat`, and acceptance crate: no semantic

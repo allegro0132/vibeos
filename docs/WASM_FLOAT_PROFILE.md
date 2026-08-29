@@ -545,7 +545,7 @@ JIT, RWX, migration, or in-place promotion.
 
 ## 9. C8.9 executable Float successor
 
-The live roadmap position is `c89-s3-qualified-sealed-float-runtime-released`.
+The C8.9 closure position is `c89-s3-qualified-sealed-float-runtime-released`.
 C8.9 is independently numbered and is divided into three ordered nodes:
 
 1. C8.9-S1 freezes the successor design and identity.
@@ -594,3 +594,8 @@ under normal and optimized verification. The canonical result is
 [`c89-s3-fixed-qemu-qualification-v1-contract.json`](../acceptance/wasm-float-target/artifacts/c89-s3-fixed-qemu-qualification-v1-contract.json).
 Milk-V Duo stays paused and optional and has no gate, completion, or release
 effect; emulator qualification is not a physical-equivalence claim.
+
+The live roadmap position is `c810-s1-simd-design-frozen-pre-implementation`.
+The separately allocated validation-only SIMD widening is defined in
+[WASM_SIMD_PROFILE.md](WASM_SIMD_PROFILE.md); it does not widen code 6 or alter
+the completed Float release boundary.

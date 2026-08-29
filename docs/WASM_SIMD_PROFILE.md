@@ -1,7 +1,7 @@
 # Deterministic SIMD profile
 
 Status: C8.11 closed at `c811-s3-qualified-sealed-simd-runtime-released`; the
-live roadmap is `c812-r3-qualified-reference-validation-successor-review-eligible`
+live roadmap is `c813-e1-reference-executable-design-frozen-pre-implementation`
 (the previous successor-design position was
 `c811-s1-simd-executable-design-frozen-pre-implementation`).
 

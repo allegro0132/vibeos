@@ -780,8 +780,8 @@ The previous roadmap position was
 `c811-s1-simd-executable-design-frozen-pre-implementation`. The implementation
 position was `c811-s2-simd-executable-implemented-pre-fixed-qemu`, and C8.11
 closed at `c811-s3-qualified-sealed-simd-runtime-released`. The current roadmap
-position is `c812-r3-qualified-reference-validation-successor-review-eligible`;
-C8.10-S1 through C8.10-S5, C8.11-S1 through C8.11-S3, and C8.12-R1/R2/R3 are complete.
+position is `c813-e1-reference-executable-design-frozen-pre-implementation`;
+C8.10-S1 through C8.10-S5, C8.11-S1 through C8.11-S3, C8.12-R1/R2/R3, and C8.13-E1 are complete.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -1162,6 +1162,8 @@ authority. R3 qualification is documented separately below.
 
 ### C8.12-R3 fixed-QEMU qualification
 
+The C8.12 closure position is
+`c812-r3-qualified-reference-validation-successor-review-eligible`.
 The default-off R3 harness binds eight exact validation/containment cases and
 a 256-mutation Component corpus to the isolated
 `wasm-c812-r3-reference-qemu-qualification` image. One formal QEMU 11.0.3
@@ -1189,6 +1191,27 @@ R3 opens only an independently numbered executable-successor design review.
 Code 9 remains non-current, validation-only, non-executable, non-admitted,
 non-durable, non-migratable, non-production, and unreleased. Code 5 remains
 permanently inert. Milk-V Duo remains paused with zero gate effect.
+
+## C8.13-E1 Reference Types executable successor design
+
+E1 allocates code/ABIs 10 and Component/Core profile 7 under
+`PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE`. It freezes the exact bounded
+Reference Types semantics, `vibe:references/runtime@1.0.0` integer/byte-only
+world, and selected
+`vibeos-wasmi-reference-executable@1.1.0-vibeos-ref2.1` engine identity. These
+checks are static and run no QEMU or physical hardware. Success does not
+materialize the facade, bind a current engine, execute/admit code 10, authorize
+durability/migration/production/release, or promote code 9.
+
+```sh
+python3 -B scripts/verify-c813-reference-executable-design.py --check-contract
+python3 -O -B scripts/verify-c813-reference-executable-design.py --check-contract
+python3 -B scripts/verify-c813-reference-executable-design.py --selftest
+python3 -O -B scripts/verify-c813-reference-executable-design.py --selftest
+```
+
+Code 5 remains permanently inert. Fixed QEMU is reserved for C8.13-E3;
+Milk-V Duo remains paused and supplies zero inputs.
 
 ## C8.10-S5 fixed-QEMU qualification
 

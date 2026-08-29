@@ -1,6 +1,7 @@
 # Reference Types validation profile
 
-Status: `c812-r3-qualified-reference-validation-successor-review-eligible`.
+C8.12 closure: `c812-r3-qualified-reference-validation-successor-review-eligible`.
+Live roadmap: `c813-e1-reference-executable-design-frozen-pre-implementation`.
 
 C8.12 is the next one-feature widening after the released code-8 SIMD runtime.
 C8.12-R1 allocates a fresh validation-only identity; it does not reinterpret or

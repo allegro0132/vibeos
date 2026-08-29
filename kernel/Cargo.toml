@@ -217,6 +217,14 @@ wasm-c88-f5-float-qemu-acceptance = [
     "dep:vibeos-wasm-float-target",
     "vibeos-wasm-float-target/c88-f5-acceptance",
 ]
+# C8.9-S3 deliberately layers a new evidence identity over the already
+# isolated QEMU adapter while selecting the independent code-6 executor in the
+# shared qualification crate. The C8.8 feature remains present only to retain
+# the sealed adapter/module topology; C8.9 takes precedence inside that crate.
+wasm-c89-s3-float-qemu-qualification = [
+    "wasm-c88-f5-float-qemu-acceptance",
+    "vibeos-wasm-float-target/c89-s3-qemu-qualification",
+]
 # Isolated Milk-V Duo compile-readiness image for the same portable F5
 # qualification. It carries a reserved non-evidence sentinel identity behind
 # an immutable runtime-opaque arm byte of zero; no physical capture or evidence

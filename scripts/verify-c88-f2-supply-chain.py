@@ -140,7 +140,11 @@ ALLOWED_CANDIDATE_CONSUMERS = {
     PurePosixPath("acceptance/wasm-float-target/Cargo.toml"): {
         "path": "../../wasm-float-candidate",
         "features": frozenset(
-            {"c88-f5-acceptance", "c88-f5-duo-compile-readiness"}
+            {
+                "c88-f5-acceptance",
+                "c88-f5-duo-compile-readiness",
+                "c89-s3-qemu-qualification",
+            }
         ),
     },
 }
@@ -222,6 +226,21 @@ EXPECTED_FLOAT_FEATURE_ROUTES = {
             "vibeos-image-policy/milkv-duo-sd",
             "vibeos-wasm-float-candidate/c88-f2-acceptance",
         ),
+        "c89-s3-qemu-qualification": (
+            "dep:sha2",
+            "dep:vibeos-component-format",
+            "dep:vibeos-component-image-adapter",
+            "dep:vibeos-component-runtime",
+            "dep:vibeos-image-policy",
+            "dep:vibeos-wasm-float-candidate",
+            "dep:vibeos-wasm-runtime",
+            "dep:wat",
+            "vibeos-component-runtime/c89-float-executable",
+            "vibeos-image-policy/c88-f4-float-candidate",
+            "vibeos-image-policy/qemu-default",
+            "vibeos-wasm-float-candidate/c89-executable",
+            "vibeos-wasm-runtime/c89-float-executable",
+        ),
     },
     PurePosixPath("kernel/Cargo.toml"): {
         "wasm-c88-f5-float-qemu-acceptance": (
@@ -238,10 +257,17 @@ EXPECTED_FLOAT_FEATURE_ROUTES = {
             "dep:vibeos-wasm-float-target",
             "vibeos-wasm-float-target/c88-f5-duo-compile-readiness",
         ),
+        "wasm-c89-s3-float-qemu-qualification": (
+            "wasm-c88-f5-float-qemu-acceptance",
+            "vibeos-wasm-float-target/c89-s3-qemu-qualification",
+        ),
     },
     PurePosixPath("firmware/qemu-virt/Cargo.toml"): {
         "wasm-c88-f5-float-qemu-acceptance": (
             "vibeos-kernel/wasm-c88-f5-float-qemu-acceptance",
+        ),
+        "wasm-c89-s3-float-qemu-qualification": (
+            "vibeos-kernel/wasm-c89-s3-float-qemu-qualification",
         ),
     },
     PurePosixPath("firmware/milkv-duo/Cargo.toml"): {
@@ -302,8 +328,16 @@ EXPECTED_CANDIDATE_REACHERS = frozenset(
             "wasm-c88-f5-float-duo-compile-readiness",
         ),
         (
+            PurePosixPath("kernel/Cargo.toml"),
+            "wasm-c89-s3-float-qemu-qualification",
+        ),
+        (
             PurePosixPath("firmware/qemu-virt/Cargo.toml"),
             "wasm-c88-f5-float-qemu-acceptance",
+        ),
+        (
+            PurePosixPath("firmware/qemu-virt/Cargo.toml"),
+            "wasm-c89-s3-float-qemu-qualification",
         ),
         (
             PurePosixPath("firmware/milkv-duo/Cargo.toml"),
@@ -2240,7 +2274,8 @@ def verify_isolation_and_inertness(view: View, errors: list[str]) -> None:
             if feature in allowed_features:
                 expected_references = (
                     CANDIDATE_C89_FEATURE_REFS
-                    if feature == "c89-float-executable"
+                    if feature
+                    in {"c89-float-executable", "c89-s3-qemu-qualification"}
                     else CANDIDATE_ACCEPTANCE_FEATURE_REFS
                 )
                 require(

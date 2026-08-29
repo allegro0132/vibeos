@@ -27,6 +27,8 @@ DESIGN_TREE = "928ae4c343f22dd59448eed64511474f808a5e61"
 DESIGN_CONTRACT = "acceptance/wasm-float-target/artifacts/c89-float-successor-design-v1-contract.json"
 DESIGN_BYTES = 8766
 DESIGN_SHA256 = "8a48c52201f60d05274abadb92d5249761f7852e42209a1d6e80ce94b86a5380"
+IMPLEMENTATION_COMMIT = "23fb452a6b3a026b0846c60a2c2c383a0fd2b6ba"
+IMPLEMENTATION_TREE = "2a194bda15c45493278acc2c818c44c245efa785"
 
 
 class VerificationFailure(RuntimeError):
@@ -96,6 +98,16 @@ def git(*args: str) -> bytes:
             f"git {' '.join(args)} failed: {result.stderr.decode(errors='replace').strip()}"
         )
     return result.stdout
+
+
+def publication_read(view: View, rel: str) -> bytes:
+    if rel in view.overlays:
+        return view.read(rel)
+    return git("show", f"{IMPLEMENTATION_COMMIT}:{rel}")
+
+
+def publication_text(view: View, rel: str) -> str:
+    return publication_read(view, rel).decode("utf-8")
 
 
 def verify(view: View, *, history: bool = True) -> None:
@@ -178,13 +190,16 @@ def verify(view: View, *, history: bool = True) -> None:
     pins = contract["implementation_sources"]
     require(len(pins) == 25, "implementation source pin count drift")
     for rel, expected in pins.items():
-        require(sha256(view.read(rel)) == expected, f"implementation source drift: {rel}")
+        require(
+            sha256(publication_read(view, rel)) == expected,
+            f"implementation source drift: {rel}",
+        )
 
-    format_source = view.text("component-format/src/lib.rs")
-    engine_source = view.text("component-format/src/engine.rs")
-    artifact_source = view.text("component-format/src/artifact.rs")
-    runtime_source = view.text("component-runtime/src/decode.rs")
-    admission_source = view.text("services/component-admission/src/lib.rs")
+    format_source = publication_text(view, "component-format/src/lib.rs")
+    engine_source = publication_text(view, "component-format/src/engine.rs")
+    artifact_source = publication_text(view, "component-format/src/artifact.rs")
+    runtime_source = publication_text(view, "component-runtime/src/decode.rs")
+    admission_source = publication_text(view, "services/component-admission/src/lib.rs")
     require("PROFILE_3_SYNC_FLOAT_EXECUTABLE_PROFILE_CODE: u16 = 6" in format_source, "code-6 profile constant missing")
     require("pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE: Self" in format_source, "code-6 identity missing")
     require("PROFILE_2_SYNC_FLOAT_PROFILE_CODE: u16 = 5" in format_source, "code-5 constant drift")
@@ -193,17 +208,32 @@ def verify(view: View, *, history: bool = True) -> None:
     require("PROFILE_3_SYNC_FLOAT_EXECUTABLE_PROFILE_CODE =>" in artifact_source, "code-6 codec missing")
     require("ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE" in runtime_source, "code-6 Component runtime missing")
     require("pub fn admit_float_executable" in admission_source, "code-6 admission missing")
-    require("ordinary command admission/durable path remains closed" in view.text("services/component-admission/tests/c89_float_executable.rs"), "durable rejection test missing")
-    require("PROFILE_3_SYNC_FLOAT_EXECUTABLE" in view.text("services/component-loader/src/tests.rs"), "production loader code-6 rejection test missing")
+    require("ordinary command admission/durable path remains closed" in publication_text(view, "services/component-admission/tests/c89_float_executable.rs"), "durable rejection test missing")
+    require("PROFILE_3_SYNC_FLOAT_EXECUTABLE" in publication_text(view, "services/component-loader/src/tests.rs"), "production loader code-6 rejection test missing")
 
     for rel in ("docs/WASM_ROADMAP.md", "docs/WASM_FLOAT_PROFILE.md", "docs/WASM_AOT_DECISION.md", "TESTING.md"):
-        text = view.text(rel)
+        text = publication_text(view, rel)
         require("c89-s2-implemented-pre-fixed-qemu-qualification" in text, f"S2 roadmap marker missing: {rel}")
-    ci = view.text(".github/workflows/ci.yml")
+    ci = publication_text(view, ".github/workflows/ci.yml")
     require("verify-c89-float-successor-implementation.py --check-contract" in ci, "S2 CI check missing")
     require("--features c89-float-executable --test c89_float_executable" in ci, "S2 Rust CI gate missing")
 
     if history:
+        require(
+            git("rev-parse", f"{IMPLEMENTATION_COMMIT}^{{tree}}").decode().strip()
+            == IMPLEMENTATION_TREE,
+            "S2 publication tree drift",
+        )
+        require(
+            subprocess.run(
+                ["git", "merge-base", "--is-ancestor", IMPLEMENTATION_COMMIT, "HEAD"],
+                cwd=ROOT,
+                env={"PATH": os.environ.get("PATH", ""), "HOME": str(ROOT), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"},
+                check=False,
+                capture_output=True,
+            ).returncode == 0,
+            "S2 publication is not an ancestor of HEAD",
+        )
         require(git("rev-parse", f"{DESIGN_COMMIT}^{{tree}}").decode().strip() == DESIGN_TREE, "S1 publication tree drift")
         design = git("show", f"{DESIGN_COMMIT}:{DESIGN_CONTRACT}")
         require(len(design) == DESIGN_BYTES and sha256(design) == DESIGN_SHA256, "S1 design contract history drift")

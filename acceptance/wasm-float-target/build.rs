@@ -1,12 +1,14 @@
 #[cfg(any(
     feature = "c88-f5-acceptance",
-    feature = "c88-f5-duo-compile-readiness"
+    feature = "c88-f5-duo-compile-readiness",
+    feature = "c89-s3-qemu-qualification"
 ))]
 use std::{env, fs, path::PathBuf};
 
 #[cfg(any(
     feature = "c88-f5-acceptance",
-    feature = "c88-f5-duo-compile-readiness"
+    feature = "c88-f5-duo-compile-readiness",
+    feature = "c89-s3-qemu-qualification"
 ))]
 use sha2::{Digest, Sha256};
 
@@ -21,7 +23,8 @@ fn main() {
 
     #[cfg(any(
         feature = "c88-f5-acceptance",
-        feature = "c88-f5-duo-compile-readiness"
+        feature = "c88-f5-duo-compile-readiness",
+        feature = "c89-s3-qemu-qualification"
     ))]
     build_scalar_target();
 
@@ -31,7 +34,8 @@ fn main() {
 
 #[cfg(any(
     feature = "c88-f5-acceptance",
-    feature = "c88-f5-duo-compile-readiness"
+    feature = "c88-f5-duo-compile-readiness",
+    feature = "c89-s3-qemu-qualification"
 ))]
 fn build_scalar_target() {
     let source = fs::read(SOURCE).expect("read C8.8-F5 scalar target WAT");

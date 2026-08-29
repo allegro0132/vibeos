@@ -2028,6 +2028,7 @@ dependencies = [
  "vibeos-component-format",
  "vibeos-component-runtime",
  "vibeos-wasm-reference-candidate",
+ "vibeos-wasm-reference-executable",
  "vibeos-wasm-runtime",
  "wat",
 ]

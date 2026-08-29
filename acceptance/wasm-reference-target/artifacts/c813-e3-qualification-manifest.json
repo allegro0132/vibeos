@@ -1,0 +1,71 @@
+{
+  "artifact_abi": 10,
+  "artifact_profile": "PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE",
+  "artifact_profile_code": 10,
+  "authority": {
+    "durable_publication_authorized": false,
+    "migration_authorized": false,
+    "ordinary_loader_authorized": false,
+    "production_authorized_before_qualification": false,
+    "release_authorized_before_qualification": false,
+    "sealed_volatile_execution": true
+  },
+  "component_profile": 7,
+  "core_profile": 7,
+  "corpus": {
+    "case_ids": [
+      "nullable-funcref-execution",
+      "table-operations-execution",
+      "externref-containment",
+      "reference-boundary-containment",
+      "adjacent-proposals",
+      "current-engine-binding",
+      "predecessor-inertness",
+      "fuel-containment"
+    ],
+    "containment_records": 1,
+    "expected_semantic_sha256": "6a654a8428f4f4479db637ab90d391c989c43b2c67dfc51570bd4ac617cc1a49",
+    "semantic_records": 9
+  },
+  "engine": {
+    "package": "vibeos-wasmi-reference-executable",
+    "version": "1.1.0-vibeos-ref2.1"
+  },
+  "hardware": {
+    "physical_equivalence_claimed": false,
+    "physical_inputs_permitted": 0,
+    "physical_inputs_required": 0,
+    "physical_milkv_duo_status": "paused-optional-no-gate-effect",
+    "physical_provenance": "not-claimed"
+  },
+  "isolation": {
+    "code5_permanently_inert": true,
+    "code9_current_engine": false,
+    "code9_execution_authorized": false,
+    "externref": false,
+    "gc_semantics": false,
+    "host_reference_boundary": false,
+    "typed_function_references": false
+  },
+  "node": "C8.13-E3",
+  "platform": "qemu-virt-rv64-tcg-icount-v1",
+  "qualification": {
+    "elf_no_native_float_helpers": true,
+    "elf_no_riscv_f_d_or_v": true,
+    "fresh_capture_required": true,
+    "fresh_challenge_required": true,
+    "fresh_run_id_required": true,
+    "fresh_source_commit_required": true,
+    "fresh_source_tree_required": true,
+    "normal_verification_required": true,
+    "optimized_verification_required": true,
+    "qemu_boots": 1
+  },
+  "runtime_abi": 10,
+  "schema": "vibeos.c813.e3.reference-fixed-qemu.manifest",
+  "scope": "fresh-fixed-qemu-emulator-only-sealed-volatile-execution",
+  "stage": "executable",
+  "target": "riscv64imac-unknown-none-elf",
+  "version": 1,
+  "world": "vibe:references/runtime@1.0.0"
+}

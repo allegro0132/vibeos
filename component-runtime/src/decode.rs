@@ -348,6 +348,7 @@ impl ComponentPlan<'_> {
             ProfileIdentity::PROFILE_1_SYNC
                 | ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE
                 | ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE
+                | ProfileIdentity::PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE
         ) && self.summary.async_abi.is_empty()
     }
 
@@ -395,6 +396,8 @@ enum InspectionMode {
     SyncSimdExecutable,
     #[cfg(feature = "c812-r2-reference-validation")]
     SyncReferenceCandidate,
+    #[cfg(feature = "c813-reference-executable")]
+    SyncReferenceExecutable,
 }
 
 impl InspectionMode {
@@ -410,6 +413,11 @@ impl InspectionMode {
             #[cfg(feature = "c811-simd-executable")]
             return Some(Self::SyncSimdExecutable);
             #[cfg(not(feature = "c811-simd-executable"))]
+            return None;
+        } else if profile == ProfileIdentity::PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE {
+            #[cfg(feature = "c813-reference-executable")]
+            return Some(Self::SyncReferenceExecutable);
+            #[cfg(not(feature = "c813-reference-executable"))]
             return None;
         } else if profile == ProfileIdentity::PROFILE_1_ASYNC {
             Some(Self::AsyncValidation)
@@ -461,6 +469,10 @@ impl InspectionMode {
     }
 
     const fn allows_reference_types(self) -> bool {
+        #[cfg(feature = "c813-reference-executable")]
+        if matches!(self, Self::SyncReferenceExecutable) {
+            return true;
+        }
         #[cfg(feature = "c812-r2-reference-validation")]
         if matches!(self, Self::SyncReferenceCandidate) {
             return true;

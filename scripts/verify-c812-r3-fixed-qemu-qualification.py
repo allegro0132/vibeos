@@ -24,7 +24,7 @@ CONTRACT = (
 BYTES = 3_322
 SHA256 = "83a78e8fe9a02f9a7b32ab509a7895a89bfca10ce6c76f78d2499b8fac5671f7"
 POSITION = "c812-r3-qualified-reference-validation-successor-review-eligible"
-LIVE_POSITION = "c813-e1-reference-executable-design-frozen-pre-implementation"
+LIVE_POSITION = "c813-e2-reference-executable-implemented-pre-qemu"
 
 
 class Failure(RuntimeError):

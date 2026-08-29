@@ -306,6 +306,16 @@ jobs:
           python3 -O -B scripts/verify-c813-reference-executable-design.py --check-contract
           python3 -B scripts/verify-c813-reference-executable-design.py --selftest
           python3 -O -B scripts/verify-c813-reference-executable-design.py --selftest
+      - name: Verify the C8.13-E2 Reference Types executable implementation
+        # Host and RISC-V-static implementation checks only. E3 owns the one
+        # formal fixed-QEMU campaign; physical inputs remain forbidden.
+        run: |
+          python3 -B scripts/verify-c813-reference-executable-implementation.py
+          python3 -O -B scripts/verify-c813-reference-executable-implementation.py --selftest
+          cargo test --locked --offline -p vibeos-wasm-reference-executable \
+            --features c813-e2-acceptance
+          cargo test --locked --offline -p vibeos-component-admission \
+            --features c813-reference-executable --lib
       - name: Verify the prospective fixed-QEMU WASM target/release policy
         # Policy/contract integrity only: this step runs no QEMU or Duo and
         # itself satisfies no gate. C8.9 qualification is verified separately.

@@ -597,7 +597,7 @@ effect; emulator qualification is not a physical-equivalence claim.
 
 The C8.11 closure position was
 `c811-s3-qualified-sealed-simd-runtime-released`; the live roadmap position is
-`c813-e1-reference-executable-design-frozen-pre-implementation`.
+`c813-e2-reference-executable-implemented-pre-qemu`.
 The separately allocated validation-only SIMD widening is defined in
 [WASM_SIMD_PROFILE.md](WASM_SIMD_PROFILE.md); it does not widen code 6 or alter
 the completed Float release boundary.

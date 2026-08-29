@@ -1,0 +1,73 @@
+{
+  "authority": {
+    "durable_publication": false,
+    "migration": false,
+    "ordinary_command": false,
+    "production": false,
+    "release": false,
+    "sealed_volatile_admission": true
+  },
+  "boundaries": {
+    "code5_permanently_inert": true,
+    "code9_current": false,
+    "code9_executable": false,
+    "code9_migratable": false,
+    "externref": false,
+    "gc": false,
+    "physical_inputs": 0,
+    "typed_function_references": false
+  },
+  "engine": {
+    "features": "default-features=false;extra-checks,prefer-btree-collections;simd=false",
+    "manifest_sha256": "1cd48cdf8897bee4d20a4bd29355f6309b7b4bb699063b1a5cd180534e733f32",
+    "package": "vibeos-wasmi-reference-executable",
+    "source_base": "vibeos-wasmi-softfloat@1.1.0-vibeos-f2.1",
+    "version": "1.1.0-vibeos-ref2.1"
+  },
+  "identity": {
+    "artifact_abi": 10,
+    "artifact_profile_code": 10,
+    "component_profile": 7,
+    "core_profile": 7,
+    "runtime_abi": 10,
+    "stage": "executable"
+  },
+  "implementation": {
+    "admission": "services/component-admission/src/reference_executable.rs",
+    "executor": "wasm-reference-executable/src/lib.rs",
+    "facade": "wasmi-reference-executable/src/lib.rs",
+    "fuel_bounded": true,
+    "imports_permitted": 0,
+    "lifecycle": [
+      "idle",
+      "running",
+      "cancelled",
+      "faulted",
+      "revoked"
+    ],
+    "maximum_tables": 1,
+    "volatile_only": true
+  },
+  "node": "C8.13-E2",
+  "qualification": {
+    "fixed_qemu_pending": true,
+    "physical_duo_gate_effect": false,
+    "platform": "qemu-virt-rv64-tcg-icount-v1"
+  },
+  "riscv_object_audit": {
+    "native_float_helpers_reachable": false,
+    "nm_sha256": "29cf970a1e80c6a234ce45d7061568b3d0995b773e4c779c02afc0a79d6991fb",
+    "rlib_sha256": "93dd70b284ef6c220e357365a04d86caf2ab50112f680497773dd934b17286eb",
+    "status": "passed",
+    "target": "riscv64imac-unknown-none-elf"
+  },
+  "roadmap": {
+    "completed_node": "C8.13-E2",
+    "current_position": "c813-e2-reference-executable-implemented-pre-qemu",
+    "next_node": "C8.13-E3"
+  },
+  "schema": "vibeos.c813.reference-executable-implementation-v1.contract",
+  "status": "implemented-not-qemu-qualified-not-released",
+  "version": 1,
+  "world": "vibe:references/runtime@1.0.0"
+}

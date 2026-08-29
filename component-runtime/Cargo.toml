@@ -49,6 +49,11 @@ c812-r2-reference-validation = [
     "dep:vibeos-wasm-reference-candidate",
     "vibeos-wasm-reference-candidate/c812-r2-acceptance",
 ]
+# Independently numbered executable Reference Types successor. Code 9 remains
+# validation-only and is never selected by this feature.
+c813-reference-executable = [
+    "vibeos-wasm-runtime/c813-reference-executable",
+]
 # Portable, caller-clocked timing hooks used only by the frozen C8.4
 # interpreter/AOT decision harness. Production builds leave this disabled.
 c84-profile-hooks = []

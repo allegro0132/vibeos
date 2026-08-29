@@ -358,3 +358,29 @@ fn c812_code9_contract_is_exact_and_never_current() {
             .is_none()
     );
 }
+
+#[test]
+fn c813_code10_binds_reference_executor_while_code9_and_code5_stay_inert() {
+    let identity = current_validation_engine_identity(
+        ProfileIdentity::PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE,
+    )
+    .unwrap();
+    assert_eq!(identity.wasmi().name(), "vibeos-wasmi-reference-executable");
+    assert_eq!(identity.wasmi().version(), "1.1.0-vibeos-ref2.1");
+    assert_eq!(
+        identity.wasmi().checksum(),
+        "1cd48cdf8897bee4d20a4bd29355f6309b7b4bb699063b1a5cd180534e733f32"
+    );
+    assert_eq!(
+        identity.core_validator().strict_features(),
+        WasmParserFeatureSelection::ReferenceTypes
+    );
+    assert!(identity.runtime().reference_types());
+    assert!(!identity.runtime().floats());
+    assert!(!identity.runtime().simd_compiled());
+    assert!(current_validation_engine_identity(
+        ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION
+    )
+    .is_none());
+    assert!(current_validation_engine_identity(ProfileIdentity::PROFILE_2_SYNC_FLOAT).is_none());
+}

@@ -52,7 +52,7 @@ now allocated as C8.13. C8.13-E1 freezes independent executable code/ABIs 10,
 Component/Core profile 7, exact revisions, a separately named engine, the
 sealed authority-free world, code-9 non-promotion, and the fixed-QEMU policy.
 The current position is
-`c813-e1-reference-executable-design-frozen-pre-implementation`.
+`c813-e2-reference-executable-implemented-pre-qemu`.
 Every feature widening after Reference Types remains separately unallocated and
 incomplete.
 The earlier non-numbered fixed-QEMU
@@ -1443,8 +1443,8 @@ bytes/RWX, durable publication, and ordinary command routing remain forbidden.
 | C8.13-E3 | Qualify and decide release | Fresh source-bound normal and optimized fixed-QEMU evidence passes before releasing only the sealed volatile code-10 runtime |
 
 The current position is
-`c813-e1-reference-executable-design-frozen-pre-implementation`; the next node
-is C8.13-E2. E1 freezes design metadata only and materializes no code-10
+`c813-e2-reference-executable-implemented-pre-qemu`; the next node
+is C8.13-E3. E1 freezes design metadata and E2 materializes the code-10
 runtime or facade. Code 9 remains validation-only, non-current,
 non-executable, and non-migratable. Code 5 remains permanently inert. Milk-V
 Duo remains paused with zero gate effect. See

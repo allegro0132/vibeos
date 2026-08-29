@@ -13,6 +13,7 @@ vibeos-core = { path = "../../core" }
 vibeos-wasm-runtime = { path = "../../wasm-runtime" }
 vibeos-wasm-simd-candidate = { path = "../../wasm-simd-candidate", default-features = false, optional = true }
 vibeos-wasm-simd-executable = { path = "../../wasm-simd-executable", default-features = false, optional = true }
+vibeos-wasm-reference-executable = { path = "../../wasm-reference-executable", default-features = false, optional = true }
 wasmparser = { version = "=0.255.0", default-features = false, features = ["component-model", "features", "prefer-btree-collections", "validate"], optional = true }
 
 [features]
@@ -30,6 +31,12 @@ c811-simd-executable = [
     "vibeos-component-runtime/c811-simd-executable",
     "vibeos-wasm-runtime/c811-simd-executable",
     "vibeos-wasm-simd-executable/c811-s2-acceptance",
+]
+c813-reference-executable = [
+    "dep:vibeos-wasm-reference-executable",
+    "vibeos-component-runtime/c813-reference-executable",
+    "vibeos-wasm-runtime/c813-reference-executable",
+    "vibeos-wasm-reference-executable/c813-e2-acceptance",
 ]
 native-async-acceptance = ["vibeos-component-runtime/native-async-acceptance"]
 preview1-wrapped-admission = ["dep:wasmparser"]

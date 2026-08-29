@@ -568,6 +568,24 @@ fn validation_only_artifact_profiles_do_not_enter_the_durable_graph_codec() {
 
     assert_eq!(
         ComponentGraphVersionV1::new(
+            "reference-code10-volatile-must-not-enter-cgv1",
+            ProfileIdentity::PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE,
+            0,
+            None,
+            ComponentGraphVersionPolicyDigest::from_bytes(GRAPH_POLICY).unwrap(),
+            ComponentGraphAccount::default(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            replacement(),
+        ),
+        Err(ComponentGraphVersionError::Profile)
+    );
+
+    assert_eq!(
+        ComponentGraphVersionV1::new(
             "reference-code9-must-not-enter-cgv1",
             ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION,
             0,

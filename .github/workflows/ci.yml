@@ -90,7 +90,7 @@ jobs:
             rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked \
               -p vibeos-image-policy --no-default-features \
               --features milkv-duo-sd --verbose
-      - name: Verify the C8.8-F5 Duo compile-readiness contract
+      - name: Verify the C8.8-F5 Duo readiness and physical transcript contracts
         run: |
           RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
             rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked --offline \
@@ -102,6 +102,14 @@ jobs:
               --features c88-f5-duo-compile-readiness --verbose
           python3 -B scripts/verify-c88-f5-duo-readiness.py
           python3 -B scripts/verify-c88-f5-duo-readiness.py --selftest
+          python3 -B scripts/verify-c88-f5-duo-physical-transcript.py \
+            --check-contract
+          python3 -O -B scripts/verify-c88-f5-duo-physical-transcript.py \
+            --check-contract
+          python3 -B scripts/verify-c88-f5-duo-physical-transcript.py \
+            --selftest
+          python3 -O -B scripts/verify-c88-f5-duo-physical-transcript.py \
+            --selftest
       - name: Report repository status
         run: ./scripts/status.sh --check
       - name: Exercise SMP benchmark transcript validation

@@ -205,6 +205,13 @@ python3 -B scripts/verify-c88-f5-duo-readiness.py
 python3 -O -B scripts/verify-c88-f5-duo-readiness.py
 python3 -B scripts/verify-c88-f5-duo-readiness.py --selftest
 python3 -O -B scripts/verify-c88-f5-duo-readiness.py --selftest
+# Future physical-v1 transcript/campaign contract only. These host checks use a
+# reserved synthetic fixture; they do not build an armed producer or image and
+# never access a package, serial device, board, flash, reset, or boot path.
+python3 -B scripts/verify-c88-f5-duo-physical-transcript.py --check-contract
+python3 -O -B scripts/verify-c88-f5-duo-physical-transcript.py --check-contract
+python3 -B scripts/verify-c88-f5-duo-physical-transcript.py --selftest
+python3 -O -B scripts/verify-c88-f5-duo-physical-transcript.py --selftest
 ./scripts/build-c88-f5-duo-readiness.sh
 duo_readiness_elf="target/c88-f5-duo-readiness/build/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo"
 duo_audit_dir="$(mktemp -d /private/tmp/vibeos-c88-f5-duo-audit.XXXXXX)"
@@ -799,8 +806,19 @@ contract records `execution_armed=false`, `physical_evidence_present=false`,
 and three required physical cold boots with every present counter at zero. The
 sentinel ELF and run ID can never satisfy that gate, and patching this readiness
 image is not an arming procedure. Resumed testing requires a separately
-reviewed physical feature/arm contract with formal, non-sentinel bindings; its
+reviewed physical feature/arm producer with formal, non-sentinel bindings; its
 same-identity rule applies only across that future run's three captures.
+
+The disjoint future wire contract is now frozen as suite
+`vibeos.c88.f5.float-target.duo-physical-v1`, with the independently hashed
+contract and transcript schema verified against the existing F5 semantic
+oracle. Its verifier rejects readiness, fixed-QEMU, and C8.4 families; enforces
+`META -> 1176 records -> END -> PASS`; recomputes the required semantic digest;
+and emits only `verified-transcript-non-evidence`. Normal and optimized contract
+checks and a 53-mutation synthetic self-test pass byte-for-byte. This node adds
+no physical feature, arm, producer, image, package, capture, or physical
+provenance. All three-boot counters remain zero.
+
 Milk-V Duo physical qualification remains paused; therefore F5, Float, and
 C8.8 remain open and no executable successor is authorized. The C8.8-F5
 contract is in [docs/WASM_FLOAT_PROFILE.md](docs/WASM_FLOAT_PROFILE.md), and

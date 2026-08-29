@@ -247,6 +247,17 @@ jobs:
             --features c811-simd-executable --test c811_simd_executable
           cargo test --locked --offline -p vibeos-component-loader \
             profile_instance_limits_and_exact_wit_are_revalidated
+      - name: Verify the C8.11-S3 fixed-QEMU qualification decision
+        # Published evidence integrity only; CI reruns neither QEMU nor Duo.
+        run: |
+          python3 -B scripts/verify-c811-s3-fixed-qemu-qualification.py --check-contract
+          python3 -O -B scripts/verify-c811-s3-fixed-qemu-qualification.py --check-contract
+          python3 -B scripts/verify-c811-s3-fixed-qemu-qualification.py --selftest
+          python3 -O -B scripts/verify-c811-s3-fixed-qemu-qualification.py --selftest
+          python3 -B scripts/verify-c811-s3-simd-evidence.py --selftest
+          python3 -O -B scripts/verify-c811-s3-simd-evidence.py --selftest
+          cargo test --locked --offline -p vibeos-wasm-simd-target \
+            --features c811-s3-qemu-qualification
       - name: Verify the prospective fixed-QEMU WASM target/release policy
         # Policy/contract integrity only: this step runs no QEMU or Duo and
         # itself satisfies no gate. C8.9 qualification is verified separately.

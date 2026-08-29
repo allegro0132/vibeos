@@ -777,9 +777,10 @@ The C8.9 closure position is `c89-s3-qualified-sealed-float-runtime-released`.
 C8.9-S1 allocates and freezes the independent code-6 Float successor design;
 C8.9-S2 implementation and C8.9-S3 fixed-QEMU qualification are complete.
 The previous roadmap position was
-`c811-s1-simd-executable-design-frozen-pre-implementation`. The current
-roadmap position is `c811-s2-simd-executable-implemented-pre-fixed-qemu`; C8.10-S1
-through C8.10-S5 and C8.11-S1 through C8.11-S2 are complete; C8.11-S3 is next.
+`c811-s1-simd-executable-design-frozen-pre-implementation`. The implementation
+position was `c811-s2-simd-executable-implemented-pre-fixed-qemu`. The current
+roadmap position is `c811-s3-qualified-sealed-simd-runtime-released`; C8.10-S1
+through C8.10-S5 and C8.11-S1 through C8.11-S3 are complete.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -1081,6 +1082,26 @@ python3 -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
 python3 -O -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
 cargo test --locked --offline -p vibeos-component-admission --features c810-s4-acceptance --test c810_s4_simd_admission
 cargo test --locked --offline -p vibeos-component-loader profile_instance_limits_and_exact_wit_are_revalidated
+```
+
+## C8.11-S3 fixed-QEMU qualification
+
+The formal `qemu-virt-rv64-tcg-icount-v1` campaign binds pushed source
+`90f95df4503a3992067fa68dbcd7d9dd9485ef10`, run ID
+`c7404023823bea9027e0c55bd564a062dc591974dd7385bd8957a4b4c3d61de8`,
+seven semantic records, and semantic SHA-256
+`ddab9d539744523b332787be6f8a101de00108479c9644136538524f20cd4514`.
+Normal and optimized verification and the final-ELF F/D/V/helper audit pass.
+Milk-V Duo contributes zero inputs and remains paused and non-gating.
+
+```sh
+python3 -B scripts/verify-c811-s3-fixed-qemu-qualification.py --check-contract
+python3 -O -B scripts/verify-c811-s3-fixed-qemu-qualification.py --check-contract
+python3 -B scripts/verify-c811-s3-fixed-qemu-qualification.py --selftest
+python3 -O -B scripts/verify-c811-s3-fixed-qemu-qualification.py --selftest
+python3 -B scripts/verify-c811-s3-simd-evidence.py --selftest
+python3 -O -B scripts/verify-c811-s3-simd-evidence.py --selftest
+cargo test --locked --offline -p vibeos-wasm-simd-target --features c811-s3-qemu-qualification
 ```
 
 ## C8.10-S5 fixed-QEMU qualification

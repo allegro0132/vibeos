@@ -23,6 +23,7 @@ CONTRACT_SHA256 = "7b85b9324409d7cc4484ca9e661a44fce2275e70407338a4f4326f71809a4
 DESIGN_COMMIT = "6e4934d88837465da6a256e741bc13185ecd77f7"
 DESIGN_TREE = "4dc7235b529724fae4ea0b3a656e4cce7203cecc"
 POSITION = "c811-s2-simd-executable-implemented-pre-fixed-qemu"
+LIVE_POSITION = "c811-s3-qualified-sealed-simd-runtime-released"
 COMMANDS = (
     "python3 -B scripts/verify-c811-simd-successor-implementation.py --check-contract",
     "python3 -O -B scripts/verify-c811-simd-successor-implementation.py --check-contract",
@@ -140,7 +141,7 @@ def verify_repository(contract: dict[str, Any]) -> None:
     matches = [item for item in lock.get("package", []) if item.get("name") == "vibeos-wasmi-simd-executable-softfloat"]
     require(len(matches) == 1 and matches[0].get("version") == "1.1.0-vibeos-simd2.1" and "source" not in matches[0], "lock identity drift")
     documents = [read_regular(ROOT / path).decode() for path in ("docs/WASM_ROADMAP.md", "docs/WASM_SIMD_EXECUTABLE_PROFILE.md", "TESTING.md")]
-    require(all(POSITION in document for document in documents), "live position missing")
+    require(all(LIVE_POSITION in document for document in documents), "live position missing")
     testing = documents[-1]
     ci = read_regular(ROOT / ".github/workflows/ci.yml").decode()
     require("## C8.11-S2 executable SIMD implementation" in testing and "Verify the C8.11-S2 executable SIMD implementation" in ci, "S2 integration missing")

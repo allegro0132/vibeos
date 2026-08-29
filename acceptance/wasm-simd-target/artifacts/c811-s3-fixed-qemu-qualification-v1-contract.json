@@ -1,0 +1,82 @@
+{
+  "authority": {
+    "code8_production_authorized": true,
+    "code8_sealed_volatile_admission_released": true,
+    "durable_publication_authorized": false,
+    "ordinary_command_authorized": false,
+    "release_scope": "exact-code8-authority-free-volatile-simd-runtime"
+  },
+  "basis": {
+    "implementation_contract": "acceptance/wasm-simd-target/artifacts/c811-simd-successor-implementation-v1-contract.json",
+    "implementation_contract_sha256": "7b85b9324409d7cc4484ca9e661a44fce2275e70407338a4f4326f71809a40a1",
+    "source_commit": "90f95df4503a3992067fa68dbcd7d9dd9485ef10",
+    "source_tree": "2ab8ca62c1a37dd766c86d2fd8fd9d5f873927cd"
+  },
+  "boundaries": {
+    "code5_current_engine": false,
+    "code5_permanently_inert": true,
+    "code7_current_engine": false,
+    "code7_execution_authorized": false,
+    "code7_migration_authorized": false
+  },
+  "evidence": {
+    "challenge": "8aab535b6b0a348a812f52a8c0c8840dc34271be1af258c0e1398ba62aec1702",
+    "environment_evidence_sha256": "67bffae55ff0638921d4abf1f0244f01eb12bc3f8b84706f5f5d17d2d95137f1",
+    "manifest_bytes": 2012,
+    "manifest_path": "acceptance/wasm-simd-target/artifacts/c811-s3-qualification-manifest.json",
+    "manifest_sha256": "62ac9ba3adba3e6946624cfb4e20a0c7672ed18f7f79775551205a5fc3705c3f",
+    "normal_receipt": {
+      "bytes": 1046,
+      "path": "acceptance/wasm-simd-target/artifacts/c811-s3-normal-receipt.json",
+      "sha256": "95201058962dcc5602149ed5f1dbd2564f3bc0c7757f11a914b5a7945044b253"
+    },
+    "optimized_receipt": {
+      "bytes": 1049,
+      "path": "acceptance/wasm-simd-target/artifacts/c811-s3-optimized-receipt.json",
+      "sha256": "da74242e314b1bdcccc5d57b73ee4dd76c0cecbaf76c45d9f8bb6fc0fe8bee8b"
+    },
+    "records": 7,
+    "release_decision": {
+      "bytes": 2200,
+      "path": "acceptance/wasm-simd-target/artifacts/c811-s3-release-decision.json",
+      "sha256": "b4f0f757292039a44f28f103691b8976d25986ece1012b9c7204451f929a7e3a"
+    },
+    "run_id": "c7404023823bea9027e0c55bd564a062dc591974dd7385bd8957a4b4c3d61de8",
+    "semantic_sha256": "ddab9d539744523b332787be6f8a101de00108479c9644136538524f20cd4514",
+    "uart_bytes": 5375,
+    "uart_sha256": "570c5aa3992f84f79bd14ee5accb6a8d56d8023083cb7cd98bc5b4cb092b526e"
+  },
+  "hardware_policy": {
+    "duo_gate_effect": false,
+    "duo_inputs": 0,
+    "duo_status": "paused-optional-observation-only",
+    "fixed_qemu_is_hardware_equivalent": false,
+    "other_hardware_gates_unchanged": true,
+    "physical_provenance": "not-claimed"
+  },
+  "identity": {
+    "artifact_abi": 8,
+    "artifact_profile_code": 8,
+    "component_profile": 5,
+    "core_profile": 5,
+    "name": "PROFILE_5_SYNC_SIMD_EXECUTABLE",
+    "runtime_abi": 8,
+    "stage": "executable"
+  },
+  "qualification": {
+    "elf_no_native_float_helpers": true,
+    "elf_no_riscv_f_d_or_v": true,
+    "normal_verified": true,
+    "optimized_verified": true,
+    "platform": "qemu-virt-rv64-tcg-icount-v1",
+    "qemu_boots": 1
+  },
+  "roadmap": {
+    "completed_node": "C8.11-S3",
+    "current_position": "c811-s3-qualified-sealed-simd-runtime-released",
+    "next_node": "unallocated-next-wasm-widening"
+  },
+  "schema": "vibeos.c811.s3.fixed-qemu-qualification-v1.contract",
+  "status": "c811-s3-fixed-qemu-qualified-code8-sealed-runtime-released",
+  "version": 1
+}

@@ -1,14 +1,15 @@
 # Executable SIMD successor profile
 
-Status: `c811-s2-simd-executable-implemented-pre-fixed-qemu`.
+Status: `c811-s3-qualified-sealed-simd-runtime-released`.
 
 C8.11 allocates an executable successor to the completed code-7 fixed-width
 SIMD validation program. It is a new identity, not an in-place promotion or
 reinterpretation of code 7. C8.11-S1 froze the design. C8.11-S2 now implements
 the code-8 codec, exact current engine, authority-free volatile admission,
-lifecycle/accounting, and durable rejection. Fixed-QEMU qualification, release,
-durable publication, command integration, and production authority do not yet
-exist.
+lifecycle/accounting, and durable rejection. C8.11-S3 now passes fresh normal
+and optimized fixed-QEMU verification and releases only this sealed volatile
+code-8 admission path. Durable publication and ordinary command integration
+remain closed.
 
 ## Frozen identity
 
@@ -98,3 +99,17 @@ The canonical S2 contract is
 Its verifier, supply-chain audit, RISC-V object audit, and Rust tests are listed
 in [TESTING.md](../TESTING.md). Passing S2 means only “implemented and ready
 for fixed-QEMU qualification”; it does not authorize release or production.
+
+## C8.11-S3 qualification and release
+
+The formal campaign binds pushed source commit
+`90f95df4503a3992067fa68dbcd7d9dd9485ef10`, tree
+`2ab8ca62c1a37dd766c86d2fd8fd9d5f873927cd`, run ID
+`c7404023823bea9027e0c55bd564a062dc591974dd7385bd8957a4b4c3d61de8`,
+seven semantic records, and semantic SHA-256
+`ddab9d539744523b332787be6f8a101de00108479c9644136538524f20cd4514`.
+Normal and optimized verification and the final-ELF audit pass. The release is
+limited to exact-image-pinned, authority-free, volatile code-8 admission. Code
+5 remains permanently inert; code 7 remains validation-only, non-current, and
+non-migratable. Milk-V Duo contributed zero inputs and remains paused and
+non-gating; no physical equivalence is claimed.

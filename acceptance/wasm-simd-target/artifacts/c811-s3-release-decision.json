@@ -1,0 +1,64 @@
+{
+  "authority": {
+    "aot_authorized": false,
+    "code8_production_authorized": true,
+    "code8_sealed_volatile_admission_released": true,
+    "durable_publication_authorized": false,
+    "jit_authorized": false,
+    "native_bytes_authorized": false,
+    "ordinary_command_admission_authorized": false,
+    "physical_duo_gate_effect": false,
+    "rwx_authorized": false
+  },
+  "code5": {
+    "current_engine": false,
+    "migration_authorized": false,
+    "permanently_inert": true,
+    "profile_code": 5,
+    "stage": "validation-only"
+  },
+  "code7": {
+    "current_engine": false,
+    "execution_authorized": false,
+    "migration_authorized": false,
+    "profile_code": 7,
+    "stage": "validation-only"
+  },
+  "decision": "release-code8-sealed-volatile-simd-runtime",
+  "identity": {
+    "artifact_abi": 8,
+    "component_profile": 5,
+    "core_profile": 5,
+    "engine": "vibeos-wasmi-simd-executable-softfloat@1.1.0-vibeos-simd2.1",
+    "name": "PROFILE_5_SYNC_SIMD_EXECUTABLE",
+    "profile_code": 8,
+    "runtime_abi": 8,
+    "stage": "executable"
+  },
+  "limitations": [
+    "emulator qualification is not physical hardware equivalence",
+    "Milk-V Duo remains paused and optional with zero gate effect",
+    "durable publication and ordinary command routing remain closed",
+    "AOT, JIT, native bytes, and RWX remain unauthorized"
+  ],
+  "node": "C8.11-S3",
+  "qualification": {
+    "challenge": "8aab535b6b0a348a812f52a8c0c8840dc34271be1af258c0e1398ba62aec1702",
+    "elf_no_native_float_helpers": true,
+    "elf_no_riscv_f_d_or_v": true,
+    "normal_verified": true,
+    "optimized_verified": true,
+    "physical_equivalence_claimed": false,
+    "physical_inputs": 0,
+    "physical_provenance": "not-claimed",
+    "platform": "qemu-virt-rv64-tcg-icount-v1",
+    "records": 7,
+    "run_id": "c7404023823bea9027e0c55bd564a062dc591974dd7385bd8957a4b4c3d61de8",
+    "semantic_sha256": "ddab9d539744523b332787be6f8a101de00108479c9644136538524f20cd4514",
+    "source_commit": "90f95df4503a3992067fa68dbcd7d9dd9485ef10",
+    "source_tree": "2ab8ca62c1a37dd766c86d2fd8fd9d5f873927cd"
+  },
+  "schema": "vibeos.c811.s3.simd-executable.release-decision",
+  "status": "pass",
+  "version": 1
+}

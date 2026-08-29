@@ -225,6 +225,14 @@ wasm-c89-s3-float-qemu-qualification = [
     "wasm-c88-f5-float-qemu-acceptance",
     "vibeos-wasm-float-target/c89-s3-qemu-qualification",
 ]
+# C8.10-S5 isolated fixed-QEMU qualification. It executes only the sealed
+# code-7 acceptance stack and grants no current-engine, durable, or release
+# authority.
+wasm-c810-s5-simd-qemu-qualification = [
+    "dep:sha2",
+    "dep:vibeos-wasm-simd-target",
+    "vibeos-wasm-simd-target/c810-s5-qemu-qualification",
+]
 # Isolated Milk-V Duo compile-readiness image for the same portable F5
 # qualification. It carries a reserved non-evidence sentinel identity behind
 # an immutable runtime-opaque arm byte of zero; no physical capture or evidence
@@ -509,6 +517,7 @@ vibeos-vsh = { path = "../components/vsh", default-features = false }
 vibeos-wasm-runtime = { path = "../wasm-runtime", optional = true }
 vibeos-wasm-runtime-costs = { path = "../acceptance/wasm-runtime-costs", optional = true }
 vibeos-wasm-float-target = { path = "../acceptance/wasm-float-target", default-features = false, optional = true }
+vibeos-wasm-simd-target = { path = "../acceptance/wasm-simd-target", default-features = false, optional = true }
 vibeos-wasm-aot-profile = { path = "../wasm-aot-profile", optional = true }
 sha2 = { version = "=0.11.0", default-features = false, optional = true }
 jitterentropy = { package = "jitterentropy-rs", path = "../vendor/jitterentropy-rs", default-features = false, features = ["alloc"], optional = true }

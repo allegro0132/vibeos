@@ -1,0 +1,68 @@
+{
+  "artifact_abi": 7,
+  "artifact_profile": "PROFILE_4_SYNC_SIMD_VALIDATION",
+  "artifact_profile_code": 7,
+  "authority": {
+    "admission_authorized": false,
+    "current_engine_authorized": false,
+    "durable_publication_authorized": false,
+    "production_authorized": false,
+    "release_authorized": false,
+    "successor_review_eligibility_only": true
+  },
+  "component_profile": 4,
+  "core_profile": 4,
+  "corpus": {
+    "case_ids": [
+      "integer-lanes",
+      "float-lanes",
+      "nan-canonical",
+      "saturation-memory",
+      "fuel-adjacent",
+      "component-binding"
+    ],
+    "expected_semantic_sha256": "6b34b541a42fdf838eccd55e43473a4154421eadc0e3b4292a5a89fde54ae1c6",
+    "lifecycle_records": 1,
+    "semantic_records": 7
+  },
+  "engine": {
+    "package": "vibeos-wasmi-simd-softfloat",
+    "production_ready": false,
+    "relaxed_simd": false,
+    "version": "1.1.0-vibeos-simd1.1"
+  },
+  "hardware": {
+    "physical_equivalence_claimed": false,
+    "physical_inputs_permitted": 0,
+    "physical_inputs_required": 0,
+    "physical_milkv_duo_status": "paused-optional-no-gate-effect",
+    "physical_provenance": "not-claimed"
+  },
+  "isolation": {
+    "code5_migrated": false,
+    "code5_permanently_inert": true,
+    "code5_promoted": false,
+    "ordinary_loader_accepts_code7": false
+  },
+  "node": "C8.10-S5",
+  "platform": "qemu-virt-rv64-tcg-icount-v1",
+  "qualification": {
+    "elf_no_native_float_helpers": true,
+    "elf_no_riscv_f_d_or_v": true,
+    "fresh_capture": true,
+    "fresh_challenge": true,
+    "fresh_run_id": true,
+    "fresh_source_commit": true,
+    "fresh_source_tree": true,
+    "normal_verification": true,
+    "optimized_verification": true,
+    "qemu_boots": 1
+  },
+  "runtime_abi": 7,
+  "schema": "vibeos.c810.s5.simd-fixed-qemu.manifest",
+  "scope": "fresh-fixed-qemu-emulator-only",
+  "stage": "validation-only",
+  "target": "riscv64imac-unknown-none-elf",
+  "version": 1,
+  "world": "vibe:simd/validation@1.0.0"
+}

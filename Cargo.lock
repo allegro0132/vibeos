@@ -1778,6 +1778,7 @@ dependencies = [
  "vibeos-wasm-float-target",
  "vibeos-wasm-runtime",
  "vibeos-wasm-runtime-costs",
+ "vibeos-wasm-simd-target",
 ]
 
 [[package]]
@@ -2001,6 +2002,19 @@ version = "0.1.0"
 dependencies = [
  "vibeos-component-format",
  "vibeos-wasmi-simd-softfloat",
+ "wat",
+]
+
+[[package]]
+name = "vibeos-wasm-simd-target"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.11.0",
+ "vibeos-component-admission",
+ "vibeos-component-format",
+ "vibeos-component-runtime",
+ "vibeos-wasm-runtime",
+ "vibeos-wasm-simd-candidate",
  "wat",
 ]
 

@@ -1,0 +1,83 @@
+{
+  "authority": {
+    "aot_authorized": false,
+    "code9_production_authorized": false,
+    "durable_publication_authorized": false,
+    "execution_authorized": false,
+    "jit_authorized": false,
+    "migration_authorized": false,
+    "native_bytes_authorized": false,
+    "ordinary_command_admission_authorized": false,
+    "physical_duo_gate_effect": false,
+    "release_authorized": false,
+    "rwx_authorized": false,
+    "successor_design_review_eligible": true
+  },
+  "code5": {
+    "current_engine": false,
+    "migration_authorized": false,
+    "permanently_inert": true,
+    "profile_code": 5,
+    "stage": "validation-only"
+  },
+  "code7": {
+    "current_engine": false,
+    "execution_authorized": false,
+    "migration_authorized": false,
+    "profile_code": 7,
+    "stage": "validation-only"
+  },
+  "code9": {
+    "current_engine": false,
+    "execution_authorized": false,
+    "migration_authorized": false,
+    "profile_code": 9,
+    "promoted": false,
+    "stage": "validation-only"
+  },
+  "decision": "open-independent-reference-executable-successor-design-review",
+  "identity": {
+    "artifact_abi": 9,
+    "component_profile": 6,
+    "core_profile": 6,
+    "engine": "vibeos-wasmi-reference-validation@1.1.0-vibeos-ref1.1",
+    "name": "PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION",
+    "profile_code": 9,
+    "runtime_abi": 9,
+    "stage": "validation-only"
+  },
+  "limitations": [
+    "emulator qualification is not physical hardware equivalence",
+    "Milk-V Duo remains paused and optional with zero gate effect",
+    "code 9 remains validation-only and cannot be promoted in place",
+    "execution, admission, durable publication, migration, production, and release remain closed",
+    "AOT, JIT, native bytes, and RWX remain unauthorized"
+  ],
+  "node": "C8.12-R3",
+  "qualification": {
+    "accepted_inert_mutations": 48,
+    "challenge": "156fb2e70c19c7a8bf09d60f23ad543143bfa803abff9f9563bcf9b942faca74",
+    "elf_no_native_float_helpers": true,
+    "elf_no_riscv_f_d_or_v": true,
+    "normal_verified": true,
+    "optimized_verified": true,
+    "physical_equivalence_claimed": false,
+    "physical_inputs": 0,
+    "physical_provenance": "not-claimed",
+    "platform": "qemu-virt-rv64-tcg-icount-v1",
+    "records": 9,
+    "rejected_mutations": 208,
+    "run_id": "fc40fbd874b274e786ad96f1f88b1b27251c7d9037654599bd30cefa623a8a2e",
+    "semantic_sha256": "bf33470617822af905ab8877797416e79aed3cde5a257689b3bbdda4df156279",
+    "source_commit": "43516cd6fe4d88c583f681714950884dc8660d4c",
+    "source_tree": "89ca3d099ef3981cc2d760a8993d47d5a6585cc7"
+  },
+  "review": {
+    "allocated_successor": false,
+    "eligible_scope": "independently-numbered-reference-executable-successor-design-only",
+    "in_place_promotion": false
+  },
+  "schema": "vibeos.c812.r3.reference-validation.review-decision",
+  "status": "pass",
+  "version": 1
+}

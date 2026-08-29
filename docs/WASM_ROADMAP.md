@@ -44,8 +44,11 @@ bounded nullable-`funcref` semantics, a separately named engine, non-promotion
 rules, and the fixed-QEMU policy. C8.12-R2 now implements the code-9 codec,
 separately named candidate facade, exact dual validation, bounded Core syntax,
 Component containment, fixed mutation corpus, durable rejection, supply-chain
-closure, and RISC-V object audit. The current position is
-`c812-r2-reference-types-validation-implemented-pre-fixed-qemu`.
+closure, and RISC-V object audit. C8.12-R3 now closes the fresh source-bound
+fixed-QEMU campaign. Code 9 remains
+validation-only and inert; only an independently numbered executable-successor
+design review is now eligible. The current position is
+`c812-r3-qualified-reference-validation-successor-review-eligible`.
 Every feature widening after Reference Types remains separately unallocated and
 incomplete.
 The earlier non-numbered fixed-QEMU
@@ -1398,11 +1401,18 @@ semantic authority. All other adjacent proposals remain disabled.
 The R1 position was
 `c812-r1-reference-types-validation-design-frozen-pre-implementation`. The
 current position is
-`c812-r2-reference-types-validation-implemented-pre-fixed-qemu` and the next
-node is C8.12-R3. Historical C8.11 receipts cannot satisfy C8.12. Fixed
-QEMU is emulator-scoped and makes no physical-equivalence claim; Milk-V Duo
-remains paused and supplies zero inputs. Code 5 remains permanently inert,
-code 7 remains validation-only, and code 8's released scope is unchanged. See
+`c812-r3-qualified-reference-validation-successor-review-eligible`. R3 binds
+pushed source commit `43516cd6fe4d88c583f681714950884dc8660d4c` and tree
+`89ca3d099ef3981cc2d760a8993d47d5a6585cc7` to one fresh fixed-QEMU boot,
+nine semantic records, semantic SHA-256
+`bf33470617822af905ab8877797416e79aed3cde5a257689b3bbdda4df156279`,
+and an exact 208-rejected/48-accepted-inert mutation split. Normal and
+optimized verification plus the final-ELF audit pass. The next node is an
+unallocated, independently numbered Reference Types executable-successor
+design; code 9 is not promoted. Historical C8.11 receipts cannot satisfy
+C8.12. Fixed QEMU is emulator-scoped and makes no physical-equivalence claim;
+Milk-V Duo remains paused and supplies zero inputs. Code 5 remains permanently
+inert, code 7 remains validation-only, and code 8's released scope is unchanged. See
 [WASM_REFERENCE_TYPES_PROFILE.md](WASM_REFERENCE_TYPES_PROFILE.md).
 
 ## 10. Test and evidence matrix

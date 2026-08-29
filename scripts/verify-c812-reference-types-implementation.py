@@ -22,6 +22,7 @@ SHA256 = "4a1f216a79a4364d3bd34e4a3bbf4ed98246e5f9a6f31270b7d1dea36045f9dd"
 DESIGN_COMMIT = "d8032d7fab63fe02fb6b53dfe0df5f81a0b83880"
 DESIGN_TREE = "db141307819f17c32a19d772384a67509742b21c"
 POSITION = "c812-r2-reference-types-validation-implemented-pre-fixed-qemu"
+LIVE_POSITION = "c812-r3-qualified-reference-validation-successor-review-eligible"
 COMMANDS = (
     "python3 -B scripts/verify-c812-reference-types-implementation.py --check-contract",
     "python3 -O -B scripts/verify-c812-reference-types-implementation.py --check-contract",
@@ -119,7 +120,12 @@ def verify_repository(value: dict[str, Any]) -> None:
     ci = read(ROOT / ".github/workflows/ci.yml").decode()
     roadmap = read(ROOT / "docs/WASM_ROADMAP.md").decode()
     profile = read(ROOT / "docs/WASM_REFERENCE_TYPES_PROFILE.md").decode()
-    require(POSITION in roadmap and POSITION in profile and POSITION in testing, "live position missing")
+    require(
+        LIVE_POSITION in roadmap
+        and LIVE_POSITION in profile
+        and LIVE_POSITION in testing,
+        "live position missing",
+    )
     require("## C8.12-R2 Reference Types implementation" in testing, "TESTING section missing")
     require("Verify the C8.12-R2 Reference Types implementation" in ci, "CI step missing")
     for command in COMMANDS:

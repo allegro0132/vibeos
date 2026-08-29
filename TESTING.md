@@ -780,8 +780,8 @@ The previous roadmap position was
 `c811-s1-simd-executable-design-frozen-pre-implementation`. The implementation
 position was `c811-s2-simd-executable-implemented-pre-fixed-qemu`, and C8.11
 closed at `c811-s3-qualified-sealed-simd-runtime-released`. The current roadmap
-position is `c812-r2-reference-types-validation-implemented-pre-fixed-qemu`;
-C8.10-S1 through C8.10-S5, C8.11-S1 through C8.11-S3, and C8.12-R1/R2 are complete.
+position is `c812-r3-qualified-reference-validation-successor-review-eligible`;
+C8.10-S1 through C8.10-S5, C8.11-S1 through C8.11-S3, and C8.12-R1/R2/R3 are complete.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -1155,26 +1155,40 @@ cargo test --locked --offline -p vibeos-component-loader profile_instance_limits
 ```
 
 The RISC-V audit covers seven closure rlibs and proves F/D/V opcodes, semantic
-native-float helpers and `libm` reachability absent. These checks run no QEMU or
-physical hardware. R3 remains the separate fresh fixed-QEMU qualification
-node; success here grants no current engine, admission, execution, durable,
-migration, successor-review, production, or release authority.
+native-float helpers and `libm` reachability absent. These R2 checks run no QEMU
+or physical hardware and by themselves grant no current engine, admission,
+execution, durable, migration, successor-review, production, or release
+authority. R3 qualification is documented separately below.
 
-### C8.12-R3 qualification harness (pre-evidence)
+### C8.12-R3 fixed-QEMU qualification
 
 The default-off R3 harness binds eight exact validation/containment cases and
 a 256-mutation Component corpus to the isolated
-`wasm-c812-r3-reference-qemu-qualification` image. Harness self-tests do not
-boot QEMU and do not satisfy R3. A formal run is accepted only from a clean,
-already-pushed source commit and preserves zero physical inputs, zero physical
-provenance, and zero Milk-V Duo gate effect.
+`wasm-c812-r3-reference-qemu-qualification` image. One formal QEMU 11.0.3
+rv64 TCG/icount boot from pushed commit
+`43516cd6fe4d88c583f681714950884dc8660d4c` produced nine records, run ID
+`fc40fbd874b274e786ad96f1f88b1b27251c7d9037654599bd30cefa623a8a2e`,
+semantic SHA-256
+`bf33470617822af905ab8877797416e79aed3cde5a257689b3bbdda4df156279`,
+and the exact 208-rejected/48-accepted-inert mutation split. Normal and
+optimized verification and the final-ELF audit pass. Physical inputs remain
+zero and physical provenance remains unclaimed.
 
 ```sh
 python3 -B scripts/qemu-c812-r3-reference.py --selftest
 python3 -B scripts/verify-c812-r3-reference-evidence.py --selftest
 python3 -O -B scripts/verify-c812-r3-reference-evidence.py --selftest
+python3 -B scripts/verify-c812-r3-fixed-qemu-qualification.py --check-contract
+python3 -O -B scripts/verify-c812-r3-fixed-qemu-qualification.py --check-contract
+python3 -B scripts/verify-c812-r3-fixed-qemu-qualification.py --selftest
+python3 -O -B scripts/verify-c812-r3-fixed-qemu-qualification.py --selftest
 cargo test --locked --offline -p vibeos-wasm-reference-target --features c812-r3-qemu-qualification
 ```
+
+R3 opens only an independently numbered executable-successor design review.
+Code 9 remains non-current, validation-only, non-executable, non-admitted,
+non-durable, non-migratable, non-production, and unreleased. Code 5 remains
+permanently inert. Milk-V Duo remains paused with zero gate effect.
 
 ## C8.10-S5 fixed-QEMU qualification
 

@@ -1,0 +1,156 @@
+{
+  "schema": "vibeos.c88.f5.float-target.duo-physical-v1.transcript-schema",
+  "version": 1,
+  "suite_id": "vibeos.c88.f5.float-target.duo-physical-v1",
+  "scope": "future-physical-transcript-host-verification-only",
+  "status": "non-evidence",
+  "run_id": {
+    "algorithm": "sha256",
+    "domain_ascii": "vibeos.c88.f5.float-target.duo-physical-v1.run.v1",
+    "domain_nul_terminated": true,
+    "nul_separated_fields": [
+      "source_commit",
+      "source_tree",
+      "challenge",
+      "contract_sha256",
+      "transcript_schema_sha256",
+      "candidate_sha256"
+    ]
+  },
+  "semantic_digest": {
+    "algorithm": "sha256",
+    "domain_ascii": "vibeos.c88.f5.float-target.semantic.v1",
+    "domain_nul_terminated": true,
+    "expected_sha256": "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1",
+    "family_order": [
+      "CORE_CASE",
+      "F3_CASE",
+      "F4_VECTOR",
+      "FUEL",
+      "LIFECYCLE"
+    ],
+    "record_encoding": "family-nul-canonical-semantic-json-newline"
+  },
+  "uart": {
+    "family_prefix": "VIBE_C88_F5_DUO_PHYSICAL_",
+    "prefixes": {
+      "metadata": "VIBE_C88_F5_DUO_PHYSICAL_META ",
+      "core": "VIBE_C88_F5_DUO_PHYSICAL_CORE_CASE ",
+      "canonical_abi": "VIBE_C88_F5_DUO_PHYSICAL_F3_CASE ",
+      "component_vector": "VIBE_C88_F5_DUO_PHYSICAL_F4_VECTOR ",
+      "fuel": "VIBE_C88_F5_DUO_PHYSICAL_FUEL ",
+      "lifecycle": "VIBE_C88_F5_DUO_PHYSICAL_LIFECYCLE ",
+      "end": "VIBE_C88_F5_DUO_PHYSICAL_END ",
+      "pass": "VIBE_C88_F5_DUO_PHYSICAL_PASS ",
+      "fail": "VIBE_C88_F5_DUO_PHYSICAL_FAIL "
+    },
+    "schema_ids": {
+      "metadata": "vibeos.c88.f5.float-target.duo-physical-v1.meta",
+      "core": "vibeos.c88.f5.float-target.duo-physical-v1.core-case",
+      "canonical_abi": "vibeos.c88.f5.float-target.duo-physical-v1.f3-case",
+      "component_vector": "vibeos.c88.f5.float-target.duo-physical-v1.f4-vector",
+      "fuel": "vibeos.c88.f5.float-target.duo-physical-v1.fuel",
+      "lifecycle": "vibeos.c88.f5.float-target.duo-physical-v1.lifecycle",
+      "end": "vibeos.c88.f5.float-target.duo-physical-v1.end",
+      "pass": "vibeos.c88.f5.float-target.duo-physical-v1.pass",
+      "fail": "vibeos.c88.f5.float-target.duo-physical-v1.fail"
+    },
+    "closed_family_order": [
+      "metadata",
+      "core",
+      "canonical_abi",
+      "component_vector",
+      "fuel",
+      "lifecycle",
+      "end",
+      "pass"
+    ],
+    "final_newline_required": true,
+    "unknown_family_forbidden": true,
+    "post_pass_bytes_forbidden": true,
+    "qemu_family_forbidden": true,
+    "readiness_family_forbidden": true,
+    "c84_family_forbidden": true,
+    "fatal_marker_forbidden": true
+  },
+  "metadata": {
+    "platform": "milkv-duo-cv1800b-c906-v1",
+    "platform_class": "physical-target",
+    "target": "riscv64imac-unknown-none-elf",
+    "physical_provenance": "not-claimed",
+    "qualification_mode": "physical-qualification",
+    "contract_stage": "physical-run-contract",
+    "binding_mode": "formal-non-sentinel",
+    "producer_feature": "wasm-c88-f5-float-duo-physical-qualification",
+    "arm_marker": "vibeos.c88.f5.duo.physical-qualification.arm=1",
+    "sentinel_bindings_present": false,
+    "formal_physical_bindings_present": true,
+    "execution_armed": true,
+    "physical_evidence_present": false,
+    "operator_power_cycle_claimed_by_target": false,
+    "operator_cold_boot_claimed_by_target": false,
+    "capture_claimed_by_target": false,
+    "terminal_quiescence_claimed_by_target": false,
+    "f5_complete": false,
+    "float_complete": false,
+    "c88_complete": false,
+    "executable_successor_authorized": false
+  },
+  "records": {
+    "core": 146,
+    "canonical_abi": 13,
+    "component_vectors": 12,
+    "fuel": 1000,
+    "lifecycle": 5,
+    "total": 1176
+  },
+  "terminal": {
+    "end_required": 1,
+    "pass_required": 1,
+    "physical_provenance": "not-claimed",
+    "physical_evidence_present": false,
+    "capture_present": false,
+    "terminal_quiescence_verified": false,
+    "f5_complete": false,
+    "exact_record_counts_required": true,
+    "semantic_sha256_required": "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1"
+  },
+  "readiness_non_promotion": {
+    "readiness_suite_id": "vibeos.c88.f5.float-target.duo-v1",
+    "readiness_binding_mode": "reserved-non-evidence-sentinel",
+    "readiness_arm_marker": "vibeos.c88.f5.duo.compile-readiness.arm=0",
+    "readiness_run_id": "c5c8ec42e56fbeaf38106965e5ec6735cb86a93af530cd37f5002dba1971b4ac",
+    "readiness_source_commit": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+    "readiness_source_tree": "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2",
+    "readiness_challenge": "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
+    "all_forbidden_in_physical_transcript": true,
+    "patching_readiness_artifact_is_not_arming": true
+  },
+  "single_boot_result": {
+    "status": "verified-transcript-non-evidence",
+    "physical_provenance": "not-claimed",
+    "operator_power_cycle_confirmed": false,
+    "operator_cold_boot_confirmed": false,
+    "capture_boot_id_present": false,
+    "terminal_quiescence_verified": false,
+    "operator_power_off_confirmed": false,
+    "physical_evidence_present": false,
+    "f5_complete": false
+  },
+  "future_three_boot_gate": {
+    "operator_confirmed_power_cycles_required": 3,
+    "operator_confirmed_cold_boots_required": 3,
+    "required_boot_ordinals": [0, 1, 2],
+    "unique_capture_boot_id_required": true,
+    "same_source_tree_challenge_run_id_required": true,
+    "same_build_environment_sha256_required": true,
+    "same_package_envelope_sha256_required": true,
+    "same_kernel_elf_sha256_required": true,
+    "same_full_sd_image_sha256_required": true,
+    "external_build_package_custody_required": true,
+    "complete_transcripts_required": 3,
+    "terminal_quiescences_required": 3,
+    "operator_power_off_confirmations_required": 3,
+    "gate_satisfied": false
+  }
+}

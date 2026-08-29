@@ -26,6 +26,7 @@ CONTRACT_SHA256 = "5995b8513f182d891c30d95530d31f6b571c14b0649c39c438f99990f5813
 BASIS_COMMIT = "2038c3134fe94d1ca297764c9fd8ee7d39a24123"
 BASIS_TREE = "4332275a81379b68e6daddaab7599a942054e9e1"
 POSITION = "c811-s1-simd-executable-design-frozen-pre-implementation"
+LIVE_POSITION = "c811-s2-simd-executable-implemented-pre-fixed-qemu"
 CHECK_COMMANDS = (
     "python3 -B scripts/verify-c811-simd-successor-design.py --check-contract",
     "python3 -O -B scripts/verify-c811-simd-successor-design.py --check-contract",
@@ -304,7 +305,7 @@ def verify_repository(value: dict[str, Any]) -> None:
     profile = read_regular(ROOT / "docs/WASM_SIMD_EXECUTABLE_PROFILE.md").decode()
     testing = read_regular(ROOT / "TESTING.md").decode()
     ci = read_regular(ROOT / ".github/workflows/ci.yml").decode()
-    require(POSITION in roadmap and POSITION in profile and POSITION in testing, "live position missing")
+    require(LIVE_POSITION in roadmap and LIVE_POSITION in profile and LIVE_POSITION in testing, "live position missing")
     require("## 9.3 C8.11 independent executable SIMD successor" in roadmap, "roadmap C8.11 section missing")
     require("# Executable SIMD successor profile" in profile, "profile document missing")
     require("## C8.11-S1 SIMD successor design contract" in testing, "TESTING section missing")

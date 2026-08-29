@@ -32,9 +32,9 @@ CONTRACT_PATH = (
     "fixed-qemu-target-release-policy-v1-contract.json"
 )
 
-EXPECTED_CONTRACT_BYTES = 26_768
+EXPECTED_CONTRACT_BYTES = 27_430
 EXPECTED_CONTRACT_SHA256 = (
-    "c4d972dd97b4db068afca1702c61b9b98c511acd43392bc892eaa91088b3d19b"
+    "9ef11618f2804971a2f24083bc5205c219cc920b8d142f3ec60a7846ab62678d"
 )
 MAX_CONTRACT_BYTES = 64 * 1024
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
@@ -71,7 +71,7 @@ EXPECTED_APPLICATION_STATUS = {
         "c89-float-successor-design-v1-contract.json"
     ),
     "allocation_contract_schema": "vibeos.c89.float-successor-design-v1.contract",
-    "current_roadmap_position": "c811-s1-simd-executable-design-frozen-pre-implementation",
+    "current_roadmap_position": "c811-s2-simd-executable-implemented-pre-fixed-qemu",
     "design_node": "C8.9-S1",
     "design_node_complete": True,
     "implementation_node": "C8.9-S2",
@@ -90,7 +90,15 @@ EXPECTED_APPLICATION_STATUS = {
     ),
     "next_successor_design_node": "C8.11-S1",
     "next_successor_design_node_complete": True,
+    "next_successor_implementation_contract_path": (
+        "acceptance/wasm-simd-target/artifacts/"
+        "c811-simd-successor-implementation-v1-contract.json"
+    ),
+    "next_successor_implementation_contract_schema": (
+        "vibeos.c811.simd-successor-implementation-v1.contract"
+    ),
     "next_successor_implementation_node": "C8.11-S2",
+    "next_successor_implementation_node_complete": True,
     "next_successor_qualification_node": "C8.11-S3",
     "next_widening_contract_path": (
         "acceptance/wasm-simd-target/artifacts/"
@@ -336,12 +344,12 @@ VERIFICATION_COMMANDS = [
 
 EXPECTED_REPOSITORY_FILES = {
     ".github/workflows/ci.yml": {
-        "bytes": 30_120,
-        "sha256": "43938f5b95113c2159bc1d13254c3bdb83f823c4961d14f72e46c9ab3e17fa79",
+        "bytes": 31_503,
+        "sha256": "04a7fa8c49586ee111c9c7b2b3b0a3adbb4adfc936f1a772d05d7c5d598a7d8b",
     },
     "TESTING.md": {
-        "bytes": 137_382,
-        "sha256": "4cd0428f68b299a437930939f8c30d464473f58683ec4e9d7d6b81fb56e1395b",
+        "bytes": 139_308,
+        "sha256": "808a1fa7b8cf1604852a966404c3b2da56cb5b190a95cc63cfe197caa880b765",
     },
     (
         "acceptance/wasm-float-target/artifacts/"
@@ -408,37 +416,44 @@ EXPECTED_REPOSITORY_FILES = {
         "bytes": 8_267,
         "sha256": "5995b8513f182d891c30d95530d31f6b571c14b0649c39c438f99990f58133ee",
     },
+    (
+        "acceptance/wasm-simd-target/artifacts/"
+        "c811-simd-successor-implementation-v1-contract.json"
+    ): {
+        "bytes": 3_842,
+        "sha256": "7b85b9324409d7cc4484ca9e661a44fce2275e70407338a4f4326f71809a40a1",
+    },
     "benchmarks/wasm-aot-decision/README.md": {
-        "bytes": 16_720,
-        "sha256": "3826e2fb938fac02a4e2a4a9bbe0a84dcad7efea13f3f93d8117295ea555b3f3",
+        "bytes": 16_701,
+        "sha256": "aa82dec152bd8718a54588ebed24429b2fa86ddd4c05aa81be8b3f03a8393a00",
     },
     "benchmarks/wasm-runtime/README.md": {
         "bytes": 1_200,
         "sha256": "5e1e1bd8c21dc2f1badecc2f29dc52209cfa4682744c0677abdba604df1dd5b1",
     },
     "docs/WASM_AOT_DECISION.md": {
-        "bytes": 84_241,
-        "sha256": "1a4b3792f5f7edfacca757772ae646a3d0a9a76a96c0d4c7d98a24750c29650c",
+        "bytes": 84_229,
+        "sha256": "59787190df51e13fe198b6b0cd10046f90b924940c9e7c4a8b475f2b9be91737",
     },
     "docs/WASM_FLOAT_PROFILE.md": {
-        "bytes": 36_479,
-        "sha256": "e7a38e4ee97dcee6e3f0327f58e161235c42a45d8934e49d825b66f158a6f253",
+        "bytes": 36_473,
+        "sha256": "772821ecd66eda99a546532c7bfa97fc0fa087c89936c3135bcc3f4daf39bfb2",
     },
     "docs/WASM_ROADMAP.md": {
-        "bytes": 102_121,
-        "sha256": "923b8e664955ed74033c653e4f474fd51453e0daa3bc7a6325895643db54a5a1",
+        "bytes": 102_623,
+        "sha256": "a7165d0db6e3dcd3cd96a8a2f83475e402630a436718b177c6af7f9f9b0c359c",
     },
     "docs/WASM_RUNTIME_COSTS.md": {
         "bytes": 12_908,
         "sha256": "3eb717ad1d6681ae073b1ba10f872cc05830911ae7204a078ec64ad87b7534ac",
     },
     "docs/WASM_SIMD_EXECUTABLE_PROFILE.md": {
-        "bytes": 3_893,
-        "sha256": "9b9e020c65375a2c408b158b5094f400918c2b5c224fc5bf36ebc61d60305c72",
+        "bytes": 5_195,
+        "sha256": "1428de58231f3bde6aa7bc6b49161ebff048551443809efeacf388970390f6ab",
     },
     "docs/WASM_SIMD_PROFILE.md": {
-        "bytes": 8_503,
-        "sha256": "8c683e06d48c4d48d911c3cb51fec6a025f29378c8631304681d5f11d32989b6",
+        "bytes": 8_601,
+        "sha256": "f0fcd7c8747bb83a5c0c5c6bbe0f30216cc88d1a119899a1e5945365361c68a1",
     },
 }
 
@@ -487,6 +502,10 @@ EXPECTED_REPOSITORY_INTEGRATION = {
     "simd_successor_design_contract": (
         "acceptance/wasm-simd-target/artifacts/"
         "c811-simd-successor-design-v1-contract.json"
+    ),
+    "simd_successor_implementation_contract": (
+        "acceptance/wasm-simd-target/artifacts/"
+        "c811-simd-successor-implementation-v1-contract.json"
     ),
     "testing": "TESTING.md",
     "verification_commands": VERIFICATION_COMMANDS,
@@ -584,7 +603,7 @@ CHECK_OUTPUT = (
     "contract_is_target_evidence=false\n"
     "current_target_release_gate_satisfied=false\n"
     "policy_checkpoint_successor_state=unallocated\n"
-    "current_roadmap_position=c811-s1-simd-executable-design-frozen-pre-implementation\n"
+    "current_roadmap_position=c811-s2-simd-executable-implemented-pre-fixed-qemu\n"
     "physical_inputs_required=0\n"
     "physical_inputs_permitted=0\n"
     "duo_gate_effect=false\n"
@@ -1335,7 +1354,7 @@ POLICY_CONTRACT_LINK = (
     "(../acceptance/wasm-roadmap/artifacts/"
     "fixed-qemu-target-release-policy-v1-contract.json)"
 )
-ROADMAP_STATUS = "**Status (2026-08-29): implementation in progress.**"
+ROADMAP_STATUS = "**Status (2026-08-30): implementation in progress.**"
 ROADMAP_STATUS_PREFIX = (
     "# Component Model admitted-code roadmap\n\n"
     "This document defines the dependency order, security invariants, acceptance\n"
@@ -1470,7 +1489,7 @@ C84_HISTORICAL_NEXT_MARKER = (
 )
 CURRENT_POSITION_MARKER = (
     "The current roadmap position is "
-    "`c811-s1-simd-executable-design-frozen-pre-implementation`;"
+    "`c811-s2-simd-executable-implemented-pre-fixed-qemu`;"
 )
 FLOAT_NON_PROMOTION_MARKER = (
     "The C8.8-F5 replacement remains scoped to F5 only; the independent "
@@ -2389,7 +2408,7 @@ def run_repository_selftests() -> int:
                     replace_once(
                         value.roadmap,
                         ROADMAP_STATUS,
-                        "**Status (2026-08-29): planned.**",
+                        "**Status (2026-08-30): planned.**",
                         "roadmap status",
                     )
                     + "\nThe words implementation in progress are only a decoy.\n"

@@ -345,7 +345,9 @@ impl ComponentPlan<'_> {
     pub fn runtime_ready(&self) -> bool {
         matches!(
             self.profile,
-            ProfileIdentity::PROFILE_1_SYNC | ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE
+            ProfileIdentity::PROFILE_1_SYNC
+                | ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE
+                | ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE
         ) && self.summary.async_abi.is_empty()
     }
 
@@ -389,6 +391,8 @@ enum InspectionMode {
     SyncFloatCandidate,
     #[cfg(feature = "c810-s3-acceptance")]
     SyncSimdCandidate,
+    #[cfg(feature = "c811-simd-executable")]
+    SyncSimdExecutable,
 }
 
 impl InspectionMode {
@@ -399,6 +403,11 @@ impl InspectionMode {
             #[cfg(feature = "c89-float-executable")]
             return Some(Self::SyncFloatExecutable);
             #[cfg(not(feature = "c89-float-executable"))]
+            return None;
+        } else if profile == ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE {
+            #[cfg(feature = "c811-simd-executable")]
+            return Some(Self::SyncSimdExecutable);
+            #[cfg(not(feature = "c811-simd-executable"))]
             return None;
         } else if profile == ProfileIdentity::PROFILE_1_ASYNC {
             Some(Self::AsyncValidation)
@@ -430,12 +439,20 @@ impl InspectionMode {
         if matches!(self, Self::SyncSimdCandidate) {
             return true;
         }
+        #[cfg(feature = "c811-simd-executable")]
+        if matches!(self, Self::SyncSimdExecutable) {
+            return true;
+        }
         false
     }
 
     const fn allows_fixed_simd(self) -> bool {
         #[cfg(feature = "c810-s3-acceptance")]
         if matches!(self, Self::SyncSimdCandidate) {
+            return true;
+        }
+        #[cfg(feature = "c811-simd-executable")]
+        if matches!(self, Self::SyncSimdExecutable) {
             return true;
         }
         false

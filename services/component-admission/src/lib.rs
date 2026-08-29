@@ -105,6 +105,8 @@ mod information_flow;
 mod preview1;
 #[cfg(feature = "preview1-corpus-acceptance")]
 mod preview1_corpus;
+#[cfg(feature = "c811-simd-executable")]
+mod simd_executable;
 
 pub use authentication::*;
 pub use graph::*;
@@ -114,6 +116,8 @@ pub use information_flow::*;
 pub use preview1::*;
 #[cfg(feature = "preview1-corpus-acceptance")]
 pub use preview1_corpus::*;
+#[cfg(feature = "c811-simd-executable")]
+pub use simd_executable::*;
 
 use alloc::{string::String, vec::Vec};
 use core::fmt;
@@ -154,7 +158,8 @@ use vibeos_component_runtime::float_candidate::{
 #[cfg(any(
     feature = "c88-f4-acceptance",
     feature = "c89-float-executable",
-    feature = "c810-s4-acceptance"
+    feature = "c810-s4-acceptance",
+    feature = "c811-simd-executable"
 ))]
 use vibeos_component_runtime::world::{EntityShape, FunctionEffect, ValueShape};
 use vibeos_component_runtime::{
@@ -449,7 +454,8 @@ impl InstanceLimits {
     #[cfg(any(
         feature = "c88-f4-acceptance",
         feature = "c89-float-executable",
-        feature = "c810-s4-acceptance"
+        feature = "c810-s4-acceptance",
+        feature = "c811-simd-executable"
     ))]
     fn validate_float_acceptance(self) -> Result<(), AdmissionError> {
         let maximum_memory = (PROFILE_1_LIMITS.max_memory_pages as usize)

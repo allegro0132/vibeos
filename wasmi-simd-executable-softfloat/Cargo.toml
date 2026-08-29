@@ -1,0 +1,25 @@
+[package]
+name = "vibeos-wasmi-simd-executable-softfloat"
+version = "1.1.0-vibeos-simd2.1"
+edition = "2021"
+rust-version = "1.86"
+publish = false
+description = "C8.11 executable identity facade for the qualified deterministic SIMD engine"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "wasmi"
+path = "src/lib.rs"
+
+[features]
+default = []
+extra-checks = ["wasmi-simd-base/extra-checks"]
+prefer-btree-collections = ["wasmi-simd-base/prefer-btree-collections"]
+simd = ["wasmi-simd-base/simd"]
+std = ["wasmi-simd-base/std"]
+
+[dependencies.wasmi-simd-base]
+package = "vibeos-wasmi-simd-softfloat"
+path = "../vendor/wasmi-simd-softfloat/crates/wasmi"
+version = "=1.1.0-vibeos-simd1.1"
+default-features = false

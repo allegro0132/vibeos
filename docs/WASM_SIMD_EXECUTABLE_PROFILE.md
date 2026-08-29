@@ -1,12 +1,14 @@
 # Executable SIMD successor profile
 
-Status: `c811-s1-simd-executable-design-frozen-pre-implementation`.
+Status: `c811-s2-simd-executable-implemented-pre-fixed-qemu`.
 
 C8.11 allocates an executable successor to the completed code-7 fixed-width
 SIMD validation program. It is a new identity, not an in-place promotion or
-reinterpretation of code 7. C8.11-S1 freezes design only; the code-8 codec,
-engine binding, admission path, implementation evidence, fixed-QEMU
-qualification, release, and production authority do not yet exist.
+reinterpretation of code 7. C8.11-S1 froze the design. C8.11-S2 now implements
+the code-8 codec, exact current engine, authority-free volatile admission,
+lifecycle/accounting, and durable rejection. Fixed-QEMU qualification, release,
+durable publication, command integration, and production authority do not yet
+exist.
 
 ## Frozen identity
 
@@ -46,12 +48,24 @@ shared memory remain disabled.
 flat values, host imports, or host exports. The byte-list world is an
 authority-free envelope and does not widen the Component boundary.
 
-C8.11-S1 selects
+C8.11-S1 selected
 `vibeos-wasmi-simd-executable-softfloat@1.1.0-vibeos-simd2.1`, derived from the qualified
 `1.1.0-vibeos-simd1.1` tree at predecessor commit
-`2038c3134fe94d1ca297764c9fd8ee7d39a24123`. S2 must materialize and audit the
-new package identity without changing the frozen SIMD semantics or fuel
-schedule. Selection at S1 is not a current-engine binding.
+`2038c3134fe94d1ca297764c9fd8ee7d39a24123`. S2 materializes it as a two-file,
+no-std facade over that exact 168-file audited base closure and binds only code
+8 to the current engine. The separate `vibeos-wasm-simd-executable` wrapper
+keeps relaxed SIMD disabled and remains `production_ready: false` until S3.
+The `riscv64imac-unknown-none-elf` object audit finds no semantic LLVM floating
+operations, FP helpers, or F/D/V instructions in the complete executable
+closure.
+
+Admission is exact-image-pinned, import-free, resource-free, and caller-
+authority-free. It accepts only `vibe:simd/runtime@1.0.0`, one 64-KiB Core
+instance, the exact compile reservation, and the canonical `run` lift. The
+admitted token is move-only and exposes neither durable nor ordinary-command
+conversion. Fuel exhaustion, cancellation, fault recovery, revocation, and
+instance reclamation are covered by the S2 lifecycle tests. Code 5 remains
+permanently inert; code 7 remains non-current and non-migratable.
 
 ## Ordered nodes
 
@@ -78,3 +92,9 @@ python3 -O -B scripts/verify-c811-simd-successor-design.py --check-contract
 python3 -B scripts/verify-c811-simd-successor-design.py --selftest
 python3 -O -B scripts/verify-c811-simd-successor-design.py --selftest
 ```
+
+The canonical S2 contract is
+[`c811-simd-successor-implementation-v1-contract.json`](../acceptance/wasm-simd-target/artifacts/c811-simd-successor-implementation-v1-contract.json).
+Its verifier, supply-chain audit, RISC-V object audit, and Rust tests are listed
+in [TESTING.md](../TESTING.md). Passing S2 means only “implemented and ready
+for fixed-QEMU qualification”; it does not authorize release or production.

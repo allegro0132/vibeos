@@ -36,6 +36,12 @@ c810-s3-acceptance = [
     "vibeos-wasm-runtime/c810-simd-candidate-inspection",
     "wasmparser/simd",
 ]
+# Executable code-8 successor. It reuses the qualified fixed-SIMD semantics
+# under a fresh current profile and engine identity; code 7 stays non-current.
+c811-simd-executable = [
+    "c810-s3-acceptance",
+    "vibeos-wasm-runtime/c811-simd-executable",
+]
 # Portable, caller-clocked timing hooks used only by the frozen C8.4
 # interpreter/AOT decision harness. Production builds leave this disabled.
 c84-profile-hooks = []

@@ -776,9 +776,10 @@ The immutable historical C8.4 `next_node` value is
 The C8.9 closure position is `c89-s3-qualified-sealed-float-runtime-released`.
 C8.9-S1 allocates and freezes the independent code-6 Float successor design;
 C8.9-S2 implementation and C8.9-S3 fixed-QEMU qualification are complete.
-The current roadmap position is
-`c811-s1-simd-executable-design-frozen-pre-implementation`; C8.10-S1 through
-C8.10-S5 and C8.11-S1 are complete; C8.11-S2 is next.
+The previous roadmap position was
+`c811-s1-simd-executable-design-frozen-pre-implementation`. The current
+roadmap position is `c811-s2-simd-executable-implemented-pre-fixed-qemu`; C8.10-S1
+through C8.10-S5 and C8.11-S1 through C8.11-S2 are complete; C8.11-S3 is next.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -1130,6 +1131,35 @@ python3 -B scripts/verify-c811-simd-successor-design.py --check-contract
 python3 -O -B scripts/verify-c811-simd-successor-design.py --check-contract
 python3 -B scripts/verify-c811-simd-successor-design.py --selftest
 python3 -O -B scripts/verify-c811-simd-successor-design.py --selftest
+```
+
+## C8.11-S2 executable SIMD implementation
+
+C8.11-S2 implements the independently numbered code-8 codec, exact current
+Component/Core engine identity, fixed-SIMD executor, exact-image-pinned
+authority-free volatile admission, lifecycle/accounting, and durable rejection.
+The new engine facade reexports the exact qualified C8.10 software-float base;
+its two-file digest and the 168-file base closure are audited offline. The
+RISC-V object audit builds the complete code-8 closure for
+`riscv64imac-unknown-none-elf` and rejects semantic LLVM floating operations,
+FP helpers, and F/D/V instructions. Code 5 remains permanently inert and code
+7 remains non-current and non-migratable. Passing this node authorizes neither
+ordinary command/durable publication nor release/production; fresh fixed-QEMU
+qualification remains C8.11-S3.
+
+```sh
+python3 -B scripts/verify-c811-simd-successor-implementation.py --check-contract
+python3 -O -B scripts/verify-c811-simd-successor-implementation.py --check-contract
+python3 -B scripts/verify-c811-simd-successor-implementation.py --selftest
+python3 -O -B scripts/verify-c811-simd-successor-implementation.py --selftest
+python3 -B scripts/verify-c811-s2-supply-chain.py
+python3 -O -B scripts/verify-c811-s2-supply-chain.py --self-test
+python3 -B scripts/verify-c811-s2-riscv-object.py
+cargo test --locked --offline -p vibeos-component-format
+cargo test --locked --offline -p vibeos-wasm-simd-executable --features c811-s2-acceptance
+cargo test --locked --offline -p vibeos-component-runtime --features c811-simd-executable --test c811_simd_executable
+cargo test --locked --offline -p vibeos-component-admission --features c811-simd-executable --test c811_simd_executable
+cargo test --locked --offline -p vibeos-component-loader profile_instance_limits_and_exact_wit_are_revalidated
 ```
 
 ## Fixed-QEMU target/release policy v1

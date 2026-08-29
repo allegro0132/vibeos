@@ -208,13 +208,30 @@ budget, so `interpretation_attribution=false`. The evidence therefore records
 subtracting interpretation from total per sample and then sorting; they are
 not differences between independently selected percentiles.
 
-The CI-safe contract and transport checks do not boot QEMU:
+The neutral
+[`qemu-v1-publication-integrity-contract.json`](../benchmarks/wasm-aot-decision/qemu-v1-publication-integrity-contract.json)
+is policy, not evidence. The current CI-safe publication-integrity and
+transport checks do not boot QEMU:
 
 ```sh
-/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -I -B -S -X pycache_prefix=/var/empty/vibeos-c84-python-pyc scripts/verify-c84-qemu-aot-decision.py --selftest --check-manifest
-/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14 -I -B -S -X pycache_prefix=/var/empty/vibeos-c84-python-pyc scripts/c84-qemu-aot-decision-peer.py --selftest
+python3 -B scripts/verify-c84-qemu-published-evidence.py --check-published
+python3 -O -B scripts/verify-c84-qemu-published-evidence.py --check-published
+python3 -B scripts/verify-c84-qemu-published-evidence.py --selftest
+python3 -O -B scripts/verify-c84-qemu-published-evidence.py --selftest
+python3 -B scripts/c84-qemu-aot-decision-peer.py --selftest
 ./scripts/run-c84-qemu-aot-decision.sh --selftest
 ```
+
+The publication auditor verifies the exact four checked-in evidence files at
+publication commit `cbb1d0f`, the full recorded source tree at `e950a2f`, and
+the historical Git membership of the capture-time QEMU verifier, physical
+helper, policy source, and three decision contracts. It also rechecks the
+stored emulator-only/no-AOT/no-native-code outcome and zero physical inputs.
+This is structure/hash integrity only: it does not replay the QEMU process,
+publisher execution, or ephemeral host custody and does not establish physical
+provenance. The old capture-time verifiers remain byte-frozen historical
+members rather than current-tree gates; later policy files must never be
+substituted for the `e950a2f` members they reviewed.
 
 A development run may use `--allow-dirty-smoke`, but that mode selects a
 compile-time smoke-only feature. Its META records
@@ -1369,7 +1386,6 @@ remain separate C8.5--C8.7 work.
 cargo test --locked -p vibeos-image-policy --no-default-features \
   --features milkv-duo-sd --test stream_pin \
   frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
-python3 -B scripts/verify-c84-aot-decision.py --selftest --check-manifest
 python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
 python3 -B scripts/verify-c84-ssh-profile-request-parent.py --selftest --check-source
 ./scripts/qemu-c84-ssh-request-parent-test.sh
@@ -1394,6 +1410,12 @@ bash -n scripts/build-milkv-duo.sh scripts/package-milkv-duo-sdk.sh \
 python3 -B scripts/capture-c84-duo-aot-decision.py --selftest
 python3 -B scripts/verify-c84-evidence.py --selftest
 ```
+
+The capture-time physical transcript verifier is source-bound to `e950a2f`.
+Its reviewed bytes and historical policy inputs are checked by the current
+fixed-QEMU publication auditor above; it is retained for historical inspection
+and future separately authorized qualification, not run against later live
+policy files and not required by the C8.4 gate.
 
 These checks validate the retained physical preparation contract, portable
 single-SAMPLE ownership/serialization, trusted producer, private single-boot collector, and

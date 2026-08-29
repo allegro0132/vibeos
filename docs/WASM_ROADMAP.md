@@ -1106,6 +1106,14 @@ attributable to interpretation and the outcome is
 `aot-not-justified-on-fixed-qemu`; AOT remains unauthorized and no native code
 is accepted. C8.5 through C8.7 are skipped for this workload and remain
 globally deferred; they are not marked complete.
+The current C8.4 gate is the fixed-QEMU publication-integrity auditor: it binds
+the four checked-in evidence files to publication commit `cbb1d0f`, binds the
+recorded source/capture-time verifier members to source commit `e950a2f`, and
+rechecks the stored emulator-only/no-AOT decision with zero physical inputs.
+It is a structure/hash check and does not replay QEMU, publisher execution, or
+ephemeral host custody. The source-bound physical-Duo verifier and tooling stay
+retained, paused, non-blocking, and non-evidence; no current physical input is
+required, and unrelated hardware gates are unchanged.
 The C8.8 Float widening is complete through F5 under decision
 `1841ae06e4c8bef4842a59bbc65362fa860e37d6d8a1d79cc68e3fc5a87004f9`.
 That decision formally substitutes fixed QEMU for the physical-Duo gate only

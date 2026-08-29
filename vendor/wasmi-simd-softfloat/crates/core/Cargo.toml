@@ -1,0 +1,21 @@
+[package]
+name = "vibeos-wasmi-core-simd-softfloat"
+version = "1.1.0-vibeos-simd1.1"
+edition = "2021"
+rust-version = "1.86"
+publish = false
+description = "C8.10-S2 deterministic fixed-SIMD software-float fork of wasmi_core 1.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/wasmi-labs/wasmi"
+
+[lib]
+name = "wasmi_core"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+simd = []
+
+[dependencies]
+rustc_apfloat = { version = "=0.2.3", default-features = false }

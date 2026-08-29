@@ -25,8 +25,9 @@ now closes the fresh fixed-QEMU gate and releases only that sealed Float
 runtime. Its closure position is `c89-s3-qualified-sealed-float-runtime-released`.
 The next listed C8.8 widening, fixed-width SIMD, is now allocated as C8.10.
 C8.10-S1 freezes validation-only code 7, ABI/revisions, deterministic semantics,
-the independent engine plan, and non-authorization boundaries. The current
-position is `c810-s1-simd-design-frozen-pre-implementation`; C8.10-S2 is next.
+the independent engine plan, and non-authorization boundaries. C8.10-S2 now
+implements and audits its isolated deterministic fixed-SIMD engine. The current
+position is `c810-s2-simd-engine-implemented-pre-containment`; C8.10-S3 is next.
 Every later non-Float widening remains separately unallocated and incomplete.
 The earlier non-numbered fixed-QEMU
 target/release policy checkpoint makes fresh source-bound
@@ -71,8 +72,8 @@ design/implementation/qualification sequence; it does not rewrite that charter.
 
 **C8.9 status (2026-08-29): C8.9-S1 through C8.9-S3 complete.**
 
-**C8.10 status (2026-08-29): C8.10-S1 SIMD design freeze complete; C8.10-S2
-through C8.10-S5 incomplete.**
+**C8.10 status (2026-08-29): C8.10-S1 and C8.10-S2 complete; C8.10-S3 through
+C8.10-S5 incomplete.**
 
 ---
 
@@ -1279,15 +1280,18 @@ ABI 7, Component/Core profile 4, and stage `ValidationOnly`. Fixed-width SIMD
 `v128` is Core-internal and cannot cross WIT, Canonical ABI, or host-call
 boundaries.
 
-The selected but not yet materialized S2 engine is
-`vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd1.1`. Its implementation must
-remove host-float and `libm` dependence from SIMD lane semantics, freeze fuel,
-and prove RISC-V output has no F, D, or V instructions. S3 closes Component
+The S2 engine is now materialized as
+`vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd1.1`. It removes host-float and
+`libm` dependence from SIMD lane semantics, freezes
+fuel, and passes a complete RISC-V object audit with no F, D, or V instructions.
+The closure is recorded by
+[`c810-simd-widening-implementation-v1-contract.json`](../acceptance/wasm-simd-target/artifacts/c810-simd-widening-implementation-v1-contract.json).
+S3 closes Component
 containment and corpora, S4 closes default-off admission/lifecycle, and S5 uses
 fresh fixed-QEMU evidence to decide successor-review eligibility only.
 
-The current roadmap position is `c810-s1-simd-design-frozen-pre-implementation`;
-C8.10-S2 is the next node.
+The current roadmap position is `c810-s2-simd-engine-implemented-pre-containment`;
+C8.10-S3 is the next node.
 Code 5 remains permanently inert, code 6 gains no SIMD, and C8.10 currently
 authorizes no execution, admission, durable publication, release, or production
 path. Milk-V Duo remains paused, optional, non-gating, and supplies zero input.

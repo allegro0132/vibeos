@@ -33,6 +33,10 @@ pub const C89_SOFTFLOAT_BACKEND_ARCHIVE_SHA256: &str =
     "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad";
 pub const C89_SOFTFLOAT_ENGINE_FEATURES: &str =
     "default-features=false;extra-checks,prefer-btree-collections;simd=false";
+pub const C810_SIMD_ENGINE_PACKAGE: &str = "vibeos-wasmi-simd-softfloat";
+pub const C810_SIMD_ENGINE_VERSION: &str = "1.1.0-vibeos-simd1.1";
+pub const C810_SIMD_ENGINE_FEATURES: &str =
+    "default-features=false;extra-checks,prefer-btree-collections,simd;relaxed-simd=false";
 
 /// Cargo resolves the two direct wasmparser 0.255 users to one package
 /// instance. Consequently both the Component and Core validator roles are
@@ -131,6 +135,7 @@ pub enum WasmParserFeatureSelection {
     All,
     ComponentModel,
     ComponentModelAsync,
+    FixedSimd,
 }
 
 /// Explicit Component validation mode. It is selected by each closed engine
@@ -187,6 +192,7 @@ impl ComponentValidatorConfiguration {
 pub enum CoreNumericProfile {
     Profile1IntegerOnly,
     Profile2ScalarF32F64,
+    Profile4FixedSimd,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -218,6 +224,14 @@ impl CoreValidatorConfiguration {
         nan_policy: Some(PROFILE_2_SYNC_FLOAT_NAN_POLICY),
     };
 
+    const PROFILE_4_SYNC_SIMD: Self = Self {
+        structural: WasmParserFeatureSelection::All,
+        strict: WasmParserFeatureSelection::FixedSimd,
+        diagnostic: WasmParserFeatureSelection::All,
+        numeric_profile: CoreNumericProfile::Profile4FixedSimd,
+        nan_policy: Some(PROFILE_2_SYNC_FLOAT_NAN_POLICY),
+    };
+
     pub const fn structural_features(self) -> WasmParserFeatureSelection {
         self.structural
     }
@@ -237,7 +251,9 @@ impl CoreValidatorConfiguration {
     pub const fn scalar_float_types(self) -> &'static [ScalarFloatType] {
         match self.numeric_profile {
             CoreNumericProfile::Profile1IntegerOnly => &[],
-            CoreNumericProfile::Profile2ScalarF32F64 => &PROFILE_2_SYNC_FLOAT_SCALAR_TYPES,
+            CoreNumericProfile::Profile2ScalarF32F64 | CoreNumericProfile::Profile4FixedSimd => {
+                &PROFILE_2_SYNC_FLOAT_SCALAR_TYPES
+            }
         }
     }
 
@@ -327,6 +343,13 @@ impl WasmiRuntimeConfiguration {
     /// a new reviewed contract; it cannot silently reinterpret code 5.
     const PROFILE_2_SYNC_FLOAT: Self = Self {
         floats: true,
+        ..Self::PROFILE_1
+    };
+
+    const PROFILE_4_SYNC_SIMD: Self = Self {
+        floats: true,
+        simd_compiled: true,
+        relaxed_simd_compiled: false,
         ..Self::PROFILE_1
     };
 
@@ -656,6 +679,67 @@ pub const fn profile_2_sync_float_validation_contract(
     &PROFILE_2_SYNC_FLOAT_VALIDATION_CONTRACT
 }
 
+/// Sealed C8.10-S2 implementation candidate. The exact code-7 profile and
+/// engine settings are reviewable here, but remain non-current until later
+/// containment, corpus, and fixed-QEMU qualification nodes complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Profile4SyncSimdValidationContract {
+    profile: ProfileIdentity,
+    component_validator: ComponentValidatorConfiguration,
+    core_validator: CoreValidatorConfiguration,
+    target_wasmi_configuration: WasmiRuntimeConfiguration,
+    package: &'static str,
+    version: &'static str,
+    features: &'static str,
+    runtime_ready: bool,
+}
+
+impl Profile4SyncSimdValidationContract {
+    pub const fn profile(self) -> ProfileIdentity {
+        self.profile
+    }
+    pub const fn component_validator(self) -> ComponentValidatorConfiguration {
+        self.component_validator
+    }
+    pub const fn core_validator(self) -> CoreValidatorConfiguration {
+        self.core_validator
+    }
+    pub const fn target_wasmi_configuration(self) -> WasmiRuntimeConfiguration {
+        self.target_wasmi_configuration
+    }
+    pub const fn package(self) -> &'static str {
+        self.package
+    }
+    pub const fn version(self) -> &'static str {
+        self.version
+    }
+    pub const fn features(self) -> &'static str {
+        self.features
+    }
+    pub const fn runtime_ready(self) -> bool {
+        self.runtime_ready
+    }
+}
+
+const PROFILE_4_SYNC_SIMD_VALIDATION_CONTRACT: Profile4SyncSimdValidationContract =
+    Profile4SyncSimdValidationContract {
+        profile: ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION,
+        component_validator: ComponentValidatorConfiguration::for_mode(
+            ComponentValidationMode::Sync,
+        ),
+        core_validator: CoreValidatorConfiguration::PROFILE_4_SYNC_SIMD,
+        target_wasmi_configuration: WasmiRuntimeConfiguration::PROFILE_4_SYNC_SIMD,
+        package: C810_SIMD_ENGINE_PACKAGE,
+        version: C810_SIMD_ENGINE_VERSION,
+        features: C810_SIMD_ENGINE_FEATURES,
+        runtime_ready: false,
+    };
+
+pub const fn profile_4_sync_simd_validation_contract() -> &'static Profile4SyncSimdValidationContract
+{
+    &PROFILE_4_SYNC_SIMD_VALIDATION_CONTRACT
+}
+
 /// Resolve only a byte-for-byte supported profile to the engine identity that
 /// is compiled into this boot. An artifact-provided adjacent profile returns
 /// `None`; there is no fallback or caller-supplied engine descriptor.
@@ -665,6 +749,8 @@ pub fn current_validation_engine_identity(
     // Change-control invariant: code 5 is format/contract metadata only and is
     // never promoted in place to a current engine binding.
     if profile == ProfileIdentity::PROFILE_2_SYNC_FLOAT {
+        None
+    } else if profile == ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION {
         None
     } else if profile == ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE {
         Some(&PROFILE_3_SYNC_FLOAT_EXECUTABLE_ENGINE)
@@ -912,6 +998,10 @@ mod tests {
         assert!(
             current_validation_engine_identity(ProfileIdentity::PROFILE_2_SYNC_FLOAT).is_none()
         );
+        assert!(current_validation_engine_identity(
+            ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION
+        )
+        .is_none());
 
         let sync = current_validation_engine_identity(expected).unwrap();
         let async_ = current_validation_engine_identity(ProfileIdentity::PROFILE_1_ASYNC).unwrap();
@@ -960,5 +1050,27 @@ mod tests {
         );
         assert_eq!(float.nan_policy(), PROFILE_2_SYNC_FLOAT_NAN_POLICY);
         assert!(float.target_wasmi_configuration().floats());
+
+        let simd = profile_4_sync_simd_validation_contract();
+        assert_eq!(
+            simd.profile(),
+            ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION
+        );
+        assert_eq!(simd.package(), C810_SIMD_ENGINE_PACKAGE);
+        assert_eq!(simd.version(), C810_SIMD_ENGINE_VERSION);
+        assert_eq!(simd.features(), C810_SIMD_ENGINE_FEATURES);
+        assert!(!simd.runtime_ready());
+        assert!(!simd.component_validator().predecode_async());
+        assert_eq!(
+            simd.core_validator().numeric_profile(),
+            CoreNumericProfile::Profile4FixedSimd
+        );
+        assert_eq!(
+            simd.core_validator().strict_features(),
+            WasmParserFeatureSelection::FixedSimd
+        );
+        assert!(simd.target_wasmi_configuration().floats());
+        assert!(simd.target_wasmi_configuration().simd_compiled());
+        assert!(!simd.target_wasmi_configuration().relaxed_simd_compiled());
     }
 }

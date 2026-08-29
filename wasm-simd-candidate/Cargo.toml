@@ -1,0 +1,18 @@
+[package]
+name = "vibeos-wasm-simd-candidate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "C8.10-S2 acceptance-only deterministic fixed-SIMD candidate"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+c810-s2-acceptance = ["dep:wasmi-simd-softfloat"]
+
+[dependencies]
+vibeos-component-format = { path = "../component-format" }
+wasmi-simd-softfloat = { package = "vibeos-wasmi-simd-softfloat", path = "../vendor/wasmi-simd-softfloat/crates/wasmi", default-features = false, features = ["extra-checks", "prefer-btree-collections", "simd"], optional = true }
+
+[dev-dependencies]
+wat = { version = "=1.255.0", default-features = false }

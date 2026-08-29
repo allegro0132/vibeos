@@ -776,7 +776,7 @@ The immutable historical C8.4 `next_node` value is
 The C8.9 closure position is `c89-s3-qualified-sealed-float-runtime-released`.
 C8.9-S1 allocates and freezes the independent code-6 Float successor design;
 C8.9-S2 implementation and C8.9-S3 fixed-QEMU qualification are complete.
-The current roadmap position is `c810-s1-simd-design-frozen-pre-implementation`;
+The current roadmap position is `c810-s2-simd-engine-implemented-pre-containment`;
 C8.10-S2 is next.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
@@ -1013,6 +1013,31 @@ python3 -B scripts/verify-c810-simd-widening-design.py --check-contract
 python3 -O -B scripts/verify-c810-simd-widening-design.py --check-contract
 python3 -B scripts/verify-c810-simd-widening-design.py --selftest
 python3 -O -B scripts/verify-c810-simd-widening-design.py --selftest
+```
+
+## C8.10-S2 deterministic Core SIMD engine
+
+C8.10-S2 materializes the independently named
+`vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd1.1` fork and a default-off
+acceptance candidate. Fixed integer and floating SIMD lanes, saturation,
+shuffle, V128 memory, repeatability, adjacent-feature rejection, and exact fuel
+boundaries are covered. The supply-chain verifier binds 168 fork files and
+proves `libm` unreachable. The pinned RISC-V audit rejects semantic LLVM FP,
+float helpers, and F/D/V instructions across the complete candidate closure.
+
+Code 7 remains `ValidationOnly`, non-current, and non-production. Code 5 stays
+permanently inert. C8.10-S3 containment/corpora, C8.10-S4 admission/lifecycle,
+and C8.10-S5 fixed-QEMU qualification remain incomplete. Milk-V Duo remains
+paused and supplies zero gate input.
+
+```sh
+python3 -B scripts/verify-c810-simd-widening-implementation.py --check-contract
+python3 -O -B scripts/verify-c810-simd-widening-implementation.py --check-contract
+python3 -B scripts/verify-c810-simd-widening-implementation.py --selftest
+python3 -O -B scripts/verify-c810-simd-widening-implementation.py --selftest
+python3 scripts/verify-c810-s2-supply-chain.py --self-test
+python3 scripts/verify-c810-s2-riscv-object.py
+cargo test --locked --offline -p vibeos-wasm-simd-candidate --features c810-s2-acceptance
 ```
 
 ## Fixed-QEMU target/release policy v1

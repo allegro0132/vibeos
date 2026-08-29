@@ -166,6 +166,12 @@ fn parser_features(selection: WasmParserFeatureSelection) -> WasmFeatures {
             features.set(WasmFeatures::CM_ASYNC, true);
             features
         }
+        WasmParserFeatureSelection::FixedSimd => {
+            let mut features = WasmFeatures::empty();
+            features.set(WasmFeatures::FLOATS, true);
+            features.set(WasmFeatures::SIMD, true);
+            features
+        }
     }
 }
 
@@ -237,7 +243,14 @@ fn read_u32_leb(bytes: &[u8], cursor: &mut usize, end: usize) -> Result<u32, Adm
 const fn allows_scalar_float(validator: CoreValidatorConfiguration) -> bool {
     matches!(
         validator.numeric_profile(),
-        CoreNumericProfile::Profile2ScalarF32F64
+        CoreNumericProfile::Profile2ScalarF32F64 | CoreNumericProfile::Profile4FixedSimd
+    )
+}
+
+const fn allows_fixed_simd(validator: CoreValidatorConfiguration) -> bool {
+    matches!(
+        validator.numeric_profile(),
+        CoreNumericProfile::Profile4FixedSimd
     )
 }
 
@@ -245,6 +258,7 @@ fn supports_encoded_value_type(byte: u8, validator: CoreValidatorConfiguration) 
     match byte {
         0x7f | 0x7e => true,
         0x7d | 0x7c => allows_scalar_float(validator),
+        0x7b => allows_fixed_simd(validator),
         _ => false,
     }
 }

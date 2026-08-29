@@ -1,0 +1,55 @@
+[package]
+name = "vibeos-wasmi-simd-softfloat"
+version = "1.1.0-vibeos-simd1.1"
+edition = "2021"
+rust-version = "1.86"
+publish = false
+description = "C8.10-S2 deterministic SIMD software-float fork of Wasmi 1.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/wasmi-labs/wasmi"
+
+[lib]
+name = "wasmi"
+path = "src/lib.rs"
+
+[features]
+default = ["std", "wat"]
+extra-checks = []
+hash-collections = ["wasmi_collections/hash-collections", "wasmparser/hash-collections"]
+prefer-btree-collections = ["wasmi_collections/prefer-btree-collections", "wasmparser/prefer-btree-collections"]
+simd = ["wasmi_core/simd", "wasmi_ir/simd", "wasmparser/simd"]
+std = ["wasmi_core/std", "wasmi_collections/std", "wasmparser/std", "spin/std"]
+wat = ["dep:wat", "std"]
+
+[dependencies.spin]
+version = "=0.9.9"
+features = ["mutex", "spin_mutex", "rwlock"]
+default-features = false
+
+[dependencies.wasmi_collections]
+package = "vibeos-wasmi-collections-simd-softfloat"
+path = "../collections"
+version = "=1.1.0-vibeos-simd1.1"
+default-features = false
+
+[dependencies.wasmi_core]
+package = "vibeos-wasmi-core-simd-softfloat"
+path = "../core"
+version = "=1.1.0-vibeos-simd1.1"
+default-features = false
+
+[dependencies.wasmi_ir]
+package = "vibeos-wasmi-ir-simd-softfloat"
+path = "../ir"
+version = "=1.1.0-vibeos-simd1.1"
+default-features = false
+
+[dependencies.wasmparser]
+version = "=0.239.0"
+features = ["validate", "features"]
+default-features = false
+
+[dependencies.wat]
+version = "=1.239.0"
+optional = true
+default-features = false

@@ -788,6 +788,8 @@ pub(crate) fn profile_code(profile: ProfileIdentity) -> Option<u16> {
         Some(crate::PROFILE_2_SYNC_FLOAT_PROFILE_CODE)
     } else if profile == ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE {
         Some(crate::PROFILE_3_SYNC_FLOAT_EXECUTABLE_PROFILE_CODE)
+    } else if profile == ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION {
+        Some(crate::PROFILE_4_SYNC_SIMD_VALIDATION_PROFILE_CODE)
     } else {
         None
     }
@@ -802,6 +804,9 @@ pub(crate) fn profile_from_code(code: u16) -> Option<ProfileIdentity> {
         crate::PROFILE_2_SYNC_FLOAT_PROFILE_CODE => Some(ProfileIdentity::PROFILE_2_SYNC_FLOAT),
         crate::PROFILE_3_SYNC_FLOAT_EXECUTABLE_PROFILE_CODE => {
             Some(ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE)
+        }
+        crate::PROFILE_4_SYNC_SIMD_VALIDATION_PROFILE_CODE => {
+            Some(ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION)
         }
         _ => None,
     }

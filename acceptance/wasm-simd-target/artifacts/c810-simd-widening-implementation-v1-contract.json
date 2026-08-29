@@ -1,0 +1,160 @@
+{
+  "authority": {
+    "acceptance_candidate_execution": true,
+    "admission_authorized": false,
+    "aot_authorized": false,
+    "command_authorized": false,
+    "current_engine_bound": false,
+    "durable_publication_authorized": false,
+    "implementation_authorized": true,
+    "migration_authorized": false,
+    "production_authorized": false,
+    "release_authorized": false,
+    "rwx_authorized": false
+  },
+  "basis": {
+    "design_commit": "409ca79114ffe5b52cafa2669a1e9a61dd9a15f0",
+    "design_contract": "acceptance/wasm-simd-target/artifacts/c810-simd-widening-design-v1-contract.json",
+    "design_tree": "c2124cd6328c490eaf96524ca8fa68076d5d79a8"
+  },
+  "candidate": {
+    "acceptance_feature": "c810-s2-acceptance",
+    "crate": "vibeos-wasm-simd-candidate",
+    "default_features": [],
+    "imports_allowed": false,
+    "production_ready": false,
+    "v128_boundary": "u128-bit-pattern-little-endian"
+  },
+  "code5_boundary": {
+    "artifact_profile_code": 5,
+    "current_engine": false,
+    "executable": false,
+    "inert": true,
+    "migration_authorized": false,
+    "permanent": true,
+    "promotion_authorized": false,
+    "stage": "validation-only"
+  },
+  "engine": {
+    "feature_set": "default-features=false;extra-checks,prefer-btree-collections,simd;relaxed-simd=false",
+    "fixed_simd": true,
+    "fork_sha256": "8f8113e46b928204e957ebcdb472cec13c7aee0b0acebc34c4883d27d9b751cb",
+    "libm_reachable": false,
+    "package": "vibeos-wasmi-simd-softfloat",
+    "path": "vendor/wasmi-simd-softfloat",
+    "relaxed_simd_compiled_deterministically": true,
+    "relaxed_simd_validation": false,
+    "rustc_apfloat_archive_sha256": "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad",
+    "rustc_apfloat_version": "0.2.3+llvm-462a31f5a5ab",
+    "upstream_revision": "8273dfb09d493971b7bb12fe614d740cdc857175",
+    "version": "1.1.0-vibeos-simd1.1"
+  },
+  "fuel": {
+    "base": 1,
+    "bytes_per_fuel": 64,
+    "call": 1,
+    "fixed_simd": 1,
+    "instance": 1,
+    "load": 1,
+    "sample_i64x2_add_consumed": 3,
+    "schedule": "wasmi-1.1.0-default",
+    "store": 1
+  },
+  "hardware_policy": {
+    "duo_gate_effect": false,
+    "duo_inputs_permitted": 0,
+    "duo_inputs_required": 0,
+    "duo_status": "paused-optional-observation-only",
+    "fixed_qemu_is_hardware_equivalent": false,
+    "fixed_qemu_qualification_node": "C8.10-S5",
+    "other_hardware_gates_unchanged": true,
+    "physical_provenance": "not-claimed"
+  },
+  "identity": {
+    "artifact_abi": 7,
+    "artifact_profile_code": 7,
+    "component_profile": 4,
+    "core_profile": 4,
+    "name": "PROFILE_4_SYNC_SIMD_VALIDATION",
+    "runtime_abi": 7,
+    "stage": "validation-only"
+  },
+  "implementation_plan": [
+    {
+      "complete": true,
+      "id": "C8.10-S1"
+    },
+    {
+      "complete": true,
+      "id": "C8.10-S2"
+    },
+    {
+      "complete": false,
+      "id": "C8.10-S3"
+    },
+    {
+      "complete": false,
+      "id": "C8.10-S4"
+    },
+    {
+      "complete": false,
+      "id": "C8.10-S5"
+    }
+  ],
+  "qualification": {
+    "component_containment": "not-started-c810-s3",
+    "differential_and_fuzz_corpus": "not-started-c810-s3",
+    "fixed_qemu": "not-started-c810-s5",
+    "production_admission_and_lifecycle": "not-started-c810-s4",
+    "release": "not-authorized"
+  },
+  "riscv_object_audit": {
+    "forbidden_instruction_extensions": [
+      "f",
+      "d",
+      "v"
+    ],
+    "forbidden_semantic_float_helpers": true,
+    "llvm_version": "22.1.8",
+    "script": "scripts/verify-c810-s2-riscv-object.py",
+    "status": "passed",
+    "target": "riscv64imac-unknown-none-elf",
+    "toolchain": "nightly-2026-08-01"
+  },
+  "roadmap": {
+    "completed_node": "C8.10-S2",
+    "current_position": "c810-s2-simd-engine-implemented-pre-containment",
+    "next_node": "C8.10-S3",
+    "state": "implementation-complete-validation-only"
+  },
+  "schema": "vibeos.c810.simd-widening-implementation-v1.contract",
+  "semantics": {
+    "fixed_simd_proposal": "webassembly-fixed-width-simd-1.0",
+    "float_lane_backend": "rustc-apfloat-bit-oriented",
+    "float_lane_nan_policy": "canonical-positive-quiet-nan-after-numeric-operation",
+    "host_float_arithmetic_allowed": false,
+    "integer_lane_semantics": "webassembly-wrapping-saturating-and-lane-index-rules",
+    "relaxed_simd_enabled": false,
+    "v128_component_or_wit_value_allowed": false,
+    "v128_host_import_or_export_allowed": false
+  },
+  "status": "c810-s2-simd-engine-implemented-not-contained-not-qualified-not-released",
+  "supply_chain": {
+    "content_files": 168,
+    "provenance": "vendor/wasmi-simd-softfloat/PROVENANCE.toml",
+    "script": "scripts/verify-c810-s2-supply-chain.py",
+    "selftest_mutations": 3,
+    "status": "passed"
+  },
+  "tests": {
+    "candidate_unit_tests": 4,
+    "core_fork_doc_tests": 1,
+    "core_fork_unit_tests": 21,
+    "fixed_integer_float_repeatability": true,
+    "fuel_exact_boundary": true,
+    "memory_load_store": true,
+    "relaxed_and_adjacent_rejection": true,
+    "saturating_and_shuffle": true
+  },
+  "version": 1
+}

@@ -450,6 +450,12 @@ fn parser_features(selection: WasmParserFeatureSelection) -> WasmFeatures {
             features.set(WasmFeatures::CM_ASYNC, true);
             features
         }
+        WasmParserFeatureSelection::FixedSimd => {
+            let mut features = WasmFeatures::empty();
+            features.set(WasmFeatures::FLOATS, true);
+            features.set(WasmFeatures::SIMD, true);
+            features
+        }
     }
 }
 

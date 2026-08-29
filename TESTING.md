@@ -773,9 +773,11 @@ physical-cold-boot proof.
 
 The immutable historical C8.4 `next_node` value is
 `C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position.
-The current roadmap position is `c89-s3-qualified-sealed-float-runtime-released`.
+The C8.9 closure position is `c89-s3-qualified-sealed-float-runtime-released`.
 C8.9-S1 allocates and freezes the independent code-6 Float successor design;
 C8.9-S2 implementation and C8.9-S3 fixed-QEMU qualification are complete.
+The current roadmap position is `c810-s1-simd-design-frozen-pre-implementation`;
+C8.10-S2 is next.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -989,6 +991,28 @@ python3 -B scripts/verify-c89-s3-fixed-qemu-qualification.py --check-contract
 python3 -O -B scripts/verify-c89-s3-fixed-qemu-qualification.py --check-contract
 python3 -B scripts/verify-c89-s3-fixed-qemu-qualification.py --selftest
 python3 -O -B scripts/verify-c89-s3-fixed-qemu-qualification.py --selftest
+```
+
+## C8.10-S1 deterministic SIMD widening design
+
+C8.10-S1 allocates validation-only `PROFILE_4_SYNC_SIMD_VALIDATION`: profile
+code 7, artifact/runtime ABI 7, and Component/Core profile 4. It selects fixed
+SIMD 1.0 with deterministic software-float lanes and forbids relaxed SIMD.
+`v128` remains Core-internal and cannot cross WIT, Canonical ABI, or host-call
+boundaries. The selected S2 engine is
+`vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd1.1`, but it is not materialized
+or bound by S1.
+
+This design node grants no execution, admission, command, durable publication,
+release, or production authority. Code 5 remains permanently inert and code 6
+gains no SIMD. C8.10-S2 is the next node. Milk-V Duo remains paused and
+non-gating with zero inputs.
+
+```sh
+python3 -B scripts/verify-c810-simd-widening-design.py --check-contract
+python3 -O -B scripts/verify-c810-simd-widening-design.py --check-contract
+python3 -B scripts/verify-c810-simd-widening-design.py --selftest
+python3 -O -B scripts/verify-c810-simd-widening-design.py --selftest
 ```
 
 ## Fixed-QEMU target/release policy v1

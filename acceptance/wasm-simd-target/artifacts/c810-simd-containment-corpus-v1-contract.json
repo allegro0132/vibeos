@@ -1,0 +1,124 @@
+{
+  "authority": {
+    "acceptance_candidate_execution": true,
+    "admission_authorized": false,
+    "current_engine_bound": false,
+    "durable_publication_authorized": false,
+    "production_authorized": false,
+    "release_authorized": false
+  },
+  "basis": {
+    "implementation_commit": "15495794fae82100b18ad55b5e141d4abdcc065e",
+    "implementation_contract": "acceptance/wasm-simd-target/artifacts/c810-simd-widening-implementation-v1-contract.json",
+    "implementation_tree": "b9582cc377409a3c2db880c171affb248c30f2b3"
+  },
+  "code5_boundary": {
+    "artifact_profile_code": 5,
+    "current_engine": false,
+    "executable": false,
+    "inert": true,
+    "migration_authorized": false,
+    "permanent": true,
+    "stage": "validation-only"
+  },
+  "containment": {
+    "acceptance_feature": "c810-s3-acceptance",
+    "candidate_inspector": "inspect_component_for_profile_4_candidate",
+    "component_or_wit_v128": "unrepresentable",
+    "current_engine_resolution": false,
+    "embedded_core_fixed_simd": true,
+    "host_import_or_export_v128": false,
+    "profile_code": 7,
+    "v128_scope": "embedded-core-only"
+  },
+  "corpora": {
+    "differential": {
+      "cases": 512,
+      "domain": "vibeos-c810-s3-simd-differential-v1",
+      "fnv1a64": "fcb8de3059c13007",
+      "operations": [
+        "i32x4.add",
+        "f32x4.add"
+      ],
+      "oracles": [
+        "independent-lane-wrapping-integer",
+        "host-ieee-f32-with-profile-nan-canonicalization"
+      ]
+    },
+    "mutation": {
+      "cases": 512,
+      "classifications": "success-malformed-unsupported-limit-invalid-embedded-core-other",
+      "domain": "vibeos-c810-s3-component-mutations-v1",
+      "fnv1a64": "8af29a0ea0a0b294",
+      "panic_free": true,
+      "strategies": [
+        "truncate",
+        "bit-flip",
+        "append",
+        "insert"
+      ]
+    }
+  },
+  "hardware_policy": {
+    "duo_gate_effect": false,
+    "duo_inputs_permitted": 0,
+    "duo_inputs_required": 0,
+    "duo_status": "paused-optional-observation-only",
+    "fixed_qemu_is_hardware_equivalent": false,
+    "fixed_qemu_qualification_node": "C8.10-S5",
+    "physical_provenance": "not-claimed"
+  },
+  "identity": {
+    "artifact_abi": 7,
+    "artifact_profile_code": 7,
+    "component_profile": 4,
+    "core_profile": 4,
+    "name": "PROFILE_4_SYNC_SIMD_VALIDATION",
+    "runtime_abi": 7,
+    "stage": "validation-only"
+  },
+  "implementation_plan": [
+    {
+      "complete": true,
+      "id": "C8.10-S1"
+    },
+    {
+      "complete": true,
+      "id": "C8.10-S2"
+    },
+    {
+      "complete": true,
+      "id": "C8.10-S3"
+    },
+    {
+      "complete": false,
+      "id": "C8.10-S4"
+    },
+    {
+      "complete": false,
+      "id": "C8.10-S5"
+    }
+  ],
+  "qualification": {
+    "component_containment": "passed-c810-s3",
+    "differential_and_fuzz_corpus": "passed-c810-s3",
+    "fixed_qemu": "not-started-c810-s5",
+    "production_admission_and_lifecycle": "not-started-c810-s4",
+    "release": "not-authorized"
+  },
+  "roadmap": {
+    "completed_node": "C8.10-S3",
+    "current_position": "c810-s3-simd-contained-corpora-passed-pre-admission",
+    "next_node": "C8.10-S4",
+    "state": "containment-and-corpus-complete-validation-only"
+  },
+  "schema": "vibeos.c810.simd-containment-corpus-v1.contract",
+  "status": "c810-s3-simd-contained-corpora-passed-not-admitted-not-qualified-not-released",
+  "tests": {
+    "component_runtime_test": "component-runtime/tests/c810_s3_simd_containment.rs",
+    "fixed_simd_cannot_enter_current_profile1": true,
+    "public_v128_type_rejected": true,
+    "repeatable_normal_and_optimized_verifier": true
+  },
+  "version": 1
+}

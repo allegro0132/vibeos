@@ -6,6 +6,7 @@ edition = "2021"
 [features]
 default = []
 c89-float-executable = []
+c810-simd-candidate-inspection = ["wasmparser/simd"]
 
 [dependencies]
 vibeos-component-format = { path = "../component-format" }

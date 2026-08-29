@@ -1568,6 +1568,7 @@ dependencies = [
  "vibeos-component-format",
  "vibeos-wasm-float-candidate",
  "vibeos-wasm-runtime",
+ "vibeos-wasm-simd-candidate",
  "wasm-encoder 0.255.0",
  "wasmparser 0.255.0",
  "wasmtime",

@@ -26,6 +26,16 @@ c89-float-executable = [
     "dep:vibeos-wasm-float-candidate",
     "vibeos-wasm-float-candidate/c89-executable",
 ]
+# Acceptance-only C8.10-S3 Component containment for code 7. This permits
+# fixed SIMD solely inside embedded Core modules; v128 is not a Component/WIT
+# value and code 7 remains absent from current-engine resolution.
+c810-s3-acceptance = [
+    "c88-f3-acceptance",
+    "dep:vibeos-wasm-simd-candidate",
+    "vibeos-wasm-simd-candidate/c810-s2-acceptance",
+    "vibeos-wasm-runtime/c810-simd-candidate-inspection",
+    "wasmparser/simd",
+]
 # Portable, caller-clocked timing hooks used only by the frozen C8.4
 # interpreter/AOT decision harness. Production builds leave this disabled.
 c84-profile-hooks = []
@@ -34,6 +44,7 @@ c84-profile-hooks = []
 vibeos-component-format = { path = "../component-format" }
 vibeos-wasm-runtime = { path = "../wasm-runtime" }
 vibeos-wasm-float-candidate = { path = "../wasm-float-candidate", default-features = false, optional = true }
+vibeos-wasm-simd-candidate = { path = "../wasm-simd-candidate", default-features = false, optional = true }
 wasmparser = { version = "=0.255.0", default-features = false, features = ["component-model", "features", "prefer-btree-collections", "validate"] }
 wit-parser = { version = "=0.255.0", default-features = false }
 

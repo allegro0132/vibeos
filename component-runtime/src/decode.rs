@@ -40,6 +40,8 @@ use vibeos_component_format::{
 };
 #[cfg(feature = "c88-f3-acceptance")]
 use vibeos_wasm_runtime::inspect_core_for_profile_2_candidate;
+#[cfg(feature = "c810-s3-acceptance")]
+use vibeos_wasm_runtime::inspect_core_for_profile_4_candidate;
 use vibeos_wasm_runtime::{
     current_core_validation_engine, inspect_core_with_current_engine, CurrentCoreValidationEngine,
 };
@@ -374,6 +376,8 @@ enum InspectionMode {
     NativeAsyncResourceFree,
     #[cfg(feature = "c88-f3-acceptance")]
     SyncFloatCandidate,
+    #[cfg(feature = "c810-s3-acceptance")]
+    SyncSimdCandidate,
 }
 
 impl InspectionMode {
@@ -411,6 +415,18 @@ impl InspectionMode {
         if matches!(self, Self::SyncFloatCandidate) {
             return true;
         }
+        #[cfg(feature = "c810-s3-acceptance")]
+        if matches!(self, Self::SyncSimdCandidate) {
+            return true;
+        }
+        false
+    }
+
+    const fn allows_fixed_simd(self) -> bool {
+        #[cfg(feature = "c810-s3-acceptance")]
+        if matches!(self, Self::SyncSimdCandidate) {
+            return true;
+        }
         false
     }
 }
@@ -419,6 +435,8 @@ enum ComponentInspectionSource<'a> {
     Current(&'a CurrentComponentValidationEngine),
     #[cfg(feature = "c88-f3-acceptance")]
     Profile2FloatCandidate,
+    #[cfg(feature = "c810-s3-acceptance")]
+    Profile4SimdCandidate,
 }
 
 impl ComponentInspectionSource<'_> {
@@ -429,6 +447,10 @@ impl ComponentInspectionSource<'_> {
                 .map_err(|_| DecodeError::InvalidEmbeddedCore),
             #[cfg(feature = "c88-f3-acceptance")]
             Self::Profile2FloatCandidate => inspect_core_for_profile_2_candidate(bytes)
+                .map(|_| ())
+                .map_err(|_| DecodeError::InvalidEmbeddedCore),
+            #[cfg(feature = "c810-s3-acceptance")]
+            Self::Profile4SimdCandidate => inspect_core_for_profile_4_candidate(bytes)
                 .map(|_| ())
                 .map_err(|_| DecodeError::InvalidEmbeddedCore),
         }
@@ -466,6 +488,9 @@ fn parser_features_for_mode(
     let mut features = parser_features(selection);
     if mode.allows_scalar_float() {
         features.set(WasmFeatures::FLOATS, true);
+    }
+    if mode.allows_fixed_simd() {
+        features.set(WasmFeatures::SIMD, true);
     }
     features
 }
@@ -582,6 +607,29 @@ pub fn inspect_component_for_profile_2_candidate(
     .map(|(plan, _)| plan)
 }
 
+/// Structurally validates a Component under the sealed code-7 profile while
+/// confining `v128` to embedded Core modules. This acceptance-only seam never
+/// resolves code 7 to a current engine or constructs production execution.
+#[cfg(feature = "c810-s3-acceptance")]
+pub fn inspect_component_for_profile_4_candidate(
+    bytes: &[u8],
+) -> Result<ComponentPlan<'_>, DecodeError> {
+    let contract = vibeos_component_format::profile_4_sync_simd_validation_contract();
+    if contract.profile() != ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION
+        || contract.runtime_ready()
+    {
+        return Err(DecodeError::Unsupported);
+    }
+    inspect_component_for_profile_impl(
+        bytes,
+        contract.profile(),
+        false,
+        InspectionMode::SyncSimdCandidate,
+        ComponentInspectionSource::Profile4SimdCandidate,
+    )
+    .map(|(plan, _)| plan)
+}
+
 /// Inspect a Component and additionally capture narrow, graph-only nominal
 /// resource provenance from the validator's live type graph.
 ///
@@ -640,6 +688,18 @@ fn inspect_component_for_profile_impl<'a>(
             let contract = vibeos_component_format::profile_2_sync_float_validation_contract();
             if profile != contract.profile()
                 || !mode.allows_scalar_float()
+                || contract.runtime_ready()
+            {
+                return Err(DecodeError::Unsupported);
+            }
+            contract.component_validator()
+        }
+        #[cfg(feature = "c810-s3-acceptance")]
+        ComponentInspectionSource::Profile4SimdCandidate => {
+            let contract = vibeos_component_format::profile_4_sync_simd_validation_contract();
+            if profile != contract.profile()
+                || !mode.allows_scalar_float()
+                || !mode.allows_fixed_simd()
                 || contract.runtime_ready()
             {
                 return Err(DecodeError::Unsupported);

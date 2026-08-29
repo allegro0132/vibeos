@@ -98,6 +98,23 @@ pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_CANONICAL_ABI_REVISION: &str =
 pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_WASI_REVISION: &str = "wasi-not-selected-c89-sync-float";
 pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_WORLD: &str = "vibe:float/runtime@1.0.0";
 
+/// C8.10's independently versioned fixed-width SIMD validation identity.
+/// Code 7 is candidate metadata only: `v128` remains Core-internal and this
+/// identity has no current engine, admission, or execution authority.
+pub const PROFILE_4_SYNC_SIMD_VALIDATION_PROFILE_CODE: u16 = 7;
+pub const PROFILE_4_SYNC_SIMD_VALIDATION_ARTIFACT_ABI_VERSION: u16 = 7;
+pub const PROFILE_4_SYNC_SIMD_VALIDATION_COMPONENT_PROFILE_VERSION: u16 = 4;
+pub const PROFILE_4_SYNC_SIMD_VALIDATION_CORE_PROFILE_VERSION: u16 = 4;
+pub const PROFILE_4_SYNC_SIMD_VALIDATION_RUNTIME_ABI_VERSION: u16 = 7;
+pub const PROFILE_4_SYNC_SIMD_VALIDATION_CORE_SPEC_REVISION: &str =
+    "webassembly-core-2.0-fixed-width-simd-1.0-deterministic-software-float-c810-v1";
+pub const PROFILE_4_SYNC_SIMD_VALIDATION_COMPONENT_MODEL_REVISION: &str =
+    "wasmparser-component-model-0.255.0-c810-simd-validation-v1";
+pub const PROFILE_4_SYNC_SIMD_VALIDATION_CANONICAL_ABI_REVISION: &str =
+    "component-model-0.255.0-sync-float-values-no-v128-boundary-c810-simd-validation-v1";
+pub const PROFILE_4_SYNC_SIMD_VALIDATION_WASI_REVISION: &str = "wasi-not-selected-c810-simd";
+pub const PROFILE_4_SYNC_SIMD_VALIDATION_WORLD: &str = "vibe:simd/validation@1.0.0";
+
 /// Exact Wasmtime release asset admitted as the C8.1 command adapter. These
 /// values describe provenance only; the asset bytes are never bundled or
 /// selected by this `no_std` format crate.
@@ -207,6 +224,11 @@ pub const PROFILE_2_SYNC_FLOAT_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Ut
     | CanonicalAbiFeature::FloatValues.bit();
 
 pub const PROFILE_3_SYNC_FLOAT_EXECUTABLE_CANONICAL_FEATURES: u64 =
+    PROFILE_2_SYNC_FLOAT_CANONICAL_FEATURES;
+
+/// SIMD is deliberately not a Canonical ABI feature. Code 7 uses the scalar
+/// Float Component boundary and confines `v128` to embedded Core modules.
+pub const PROFILE_4_SYNC_SIMD_VALIDATION_CANONICAL_FEATURES: u64 =
     PROFILE_2_SYNC_FLOAT_CANONICAL_FEATURES;
 
 pub const ASYNC_CANONICAL_FEATURES: u64 = CanonicalAbiFeature::Utf8.bit()
@@ -366,6 +388,22 @@ impl ProfileIdentity {
         stage: ProfileStage::Executable,
     };
 
+    /// C8.10's fixed-width SIMD candidate identity. It is never an alias of
+    /// code 6 and remains validation-only throughout C8.10.
+    pub const PROFILE_4_SYNC_SIMD_VALIDATION: Self = Self {
+        artifact_abi: PROFILE_4_SYNC_SIMD_VALIDATION_ARTIFACT_ABI_VERSION,
+        component_profile: PROFILE_4_SYNC_SIMD_VALIDATION_COMPONENT_PROFILE_VERSION,
+        core_profile: PROFILE_4_SYNC_SIMD_VALIDATION_CORE_PROFILE_VERSION,
+        runtime_abi: PROFILE_4_SYNC_SIMD_VALIDATION_RUNTIME_ABI_VERSION,
+        core_revision: PROFILE_4_SYNC_SIMD_VALIDATION_CORE_SPEC_REVISION,
+        component_revision: PROFILE_4_SYNC_SIMD_VALIDATION_COMPONENT_MODEL_REVISION,
+        canonical_abi_revision: PROFILE_4_SYNC_SIMD_VALIDATION_CANONICAL_ABI_REVISION,
+        wasm_tools_revision: SYNC_WASM_TOOLS_REVISION,
+        wasi_revision: PROFILE_4_SYNC_SIMD_VALIDATION_WASI_REVISION,
+        canonical_features: PROFILE_4_SYNC_SIMD_VALIDATION_CANONICAL_FEATURES,
+        stage: ProfileStage::ValidationOnly,
+    };
+
     pub const PROFILE_1: Self = Self::PROFILE_1_SYNC;
 
     pub const fn execution_enabled(self) -> bool {
@@ -405,6 +443,19 @@ const _: () = assert!(
 const _: () = assert!(
     ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE.runtime_abi
         == PROFILE_3_SYNC_FLOAT_EXECUTABLE_PROFILE_CODE
+);
+const _: () = assert!(matches!(
+    ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION.stage,
+    ProfileStage::ValidationOnly
+));
+const _: () = assert!(!ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION.execution_enabled());
+const _: () = assert!(
+    ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION.artifact_abi
+        == PROFILE_4_SYNC_SIMD_VALIDATION_PROFILE_CODE
+);
+const _: () = assert!(
+    ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION.runtime_abi
+        == PROFILE_4_SYNC_SIMD_VALIDATION_PROFILE_CODE
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

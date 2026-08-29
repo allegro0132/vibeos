@@ -1,0 +1,31 @@
+[package]
+name = "vibeos-wasmi-collections-simd-softfloat"
+version = "1.1.0-vibeos-simd1.1"
+edition = "2021"
+rust-version = "1.86"
+publish = false
+description = "C8.10-S2 identity-isolated SIMD fork of wasmi_collections 1.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/wasmi-labs/wasmi"
+
+[lib]
+name = "wasmi_collections"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+hash-collections = ["dep:hashbrown", "dep:string-interner"]
+prefer-btree-collections = []
+std = ["string-interner?/std"]
+
+[dependencies.hashbrown]
+version = "=0.15.5"
+features = ["default-hasher", "inline-more"]
+optional = true
+default-features = false
+
+[dependencies.string-interner]
+version = "=0.19.0"
+features = ["inline-more", "backends"]
+optional = true
+default-features = false

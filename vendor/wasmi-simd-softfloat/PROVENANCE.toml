@@ -1,0 +1,46 @@
+format_version = 1
+roadmap_node = "C8.10-S2"
+profile_code = 7
+profile_stage = "ValidationOnly"
+package_version = "1.1.0-vibeos-simd1.1"
+fixed_simd = true
+relaxed_simd_validation = false
+libm_selected = false
+
+[wasmi_upstream]
+repository = "https://github.com/wasmi-labs/wasmi"
+commit = "8273dfb09d493971b7bb12fe614d740cdc857175"
+version = "1.1.0"
+license_expression = "MIT OR Apache-2.0"
+
+[[wasmi_archive]]
+package = "wasmi"
+path_in_vcs = "crates/wasmi"
+archive_sha256 = "2300d0f78cba12f14e29e8dd157ea64050c0a688179aefdb2050105805594a0c"
+
+[[wasmi_archive]]
+package = "wasmi_core"
+path_in_vcs = "crates/core"
+archive_sha256 = "9013136083d988725953390bf668b64b7a218fabf26f8b913bbc59546b97ee27"
+
+[[wasmi_archive]]
+package = "wasmi_ir"
+path_in_vcs = "crates/ir"
+archive_sha256 = "ba1fa003f79156f406d62ef0e1464dc03e11ace37170e9fa7524299a75ad8f68"
+
+[[wasmi_archive]]
+package = "wasmi_collections"
+path_in_vcs = "crates/collections"
+archive_sha256 = "f8a8c42a2a76148d43097b1d7cc2a5bf33d5c23bd4dd69015fc887e311767884"
+
+[rustc_apfloat]
+version = "0.2.3+llvm-462a31f5a5ab"
+archive_sha256 = "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad"
+git_revision = "eeaacad81247af65d4043cb3e32d023a652d7951"
+llvm_baseline_revision = "462a31f5a5abb905869ea93cc49b096079b11aa4"
+license_expression = "Apache-2.0 WITH LLVM-exception"
+
+[tree]
+algorithm = "vibeos-c810-s2-simd-fork-sha256-v1"
+fork_sha256 = "8f8113e46b928204e957ebcdb472cec13c7aee0b0acebc34c4883d27d9b751cb"
+upstream_files_sha256 = "2ed5dc8e1548b3b84f74fcb713d45583bfecd123fcccd41782bdacc782873f0a"

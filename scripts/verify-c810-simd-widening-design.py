@@ -25,6 +25,7 @@ CONTRACT_SHA256 = "6e0728ed4d9c0452a5c895b17a87bb8c90a1fa30fee0eb751dbfb8b52f995
 PREDECESSOR_COMMIT = "cf71ce04e6bcfda862f6ebf7944cc9204867561b"
 PREDECESSOR_TREE = "a8364fd5893cb652675ea24f3a0b7cc6a25ff9c0"
 CURRENT_POSITION = "c810-s1-simd-design-frozen-pre-implementation"
+DESIGN_COMMIT = "409ca79114ffe5b52cafa2669a1e9a61dd9a15f0"
 
 
 class VerificationError(RuntimeError):
@@ -322,7 +323,7 @@ def verify_history(contract: dict[str, Any]) -> None:
 
 
 def verify_repository() -> None:
-    component_format = read_regular(ROOT / "component-format/src/lib.rs").decode()
+    component_format = git("show", f"{DESIGN_COMMIT}:component-format/src/lib.rs").decode()
     engine = read_regular(ROOT / "component-format/src/engine.rs").decode()
     require(
         "PROFILE_2_SYNC_FLOAT_PROFILE_CODE: u16 = 5;" in component_format
@@ -336,8 +337,13 @@ def verify_repository() -> None:
         "code 5 entered current engine",
     )
     require("simd_compiled: false" in engine, "existing engine SIMD isolation missing")
+    require(
+        "profile == ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION {\n        None"
+        in engine,
+        "code 7 entered current engine after design",
+    )
     markers = {
-        "docs/WASM_ROADMAP.md": CURRENT_POSITION,
+        "docs/WASM_ROADMAP.md": "c810-s2-simd-engine-implemented-pre-containment",
         "docs/WASM_SIMD_PROFILE.md": "PROFILE_4_SYNC_SIMD_VALIDATION",
         "TESTING.md": "## C8.10-S1 deterministic SIMD widening design",
         ".github/workflows/ci.yml": "Verify the C8.10-S1 SIMD widening design",

@@ -1994,8 +1994,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-wasm-simd-candidate"
+version = "0.1.0"
+dependencies = [
+ "vibeos-component-format",
+ "vibeos-wasmi-simd-softfloat",
+ "wat",
+]
+
+[[package]]
+name = "vibeos-wasmi-collections-simd-softfloat"
+version = "1.1.0-vibeos-simd1.1"
+
+[[package]]
 name = "vibeos-wasmi-collections-softfloat"
 version = "1.1.0-vibeos-f2.1"
+
+[[package]]
+name = "vibeos-wasmi-core-simd-softfloat"
+version = "1.1.0-vibeos-simd1.1"
+dependencies = [
+ "rustc_apfloat",
+]
 
 [[package]]
 name = "vibeos-wasmi-core-softfloat"
@@ -2005,10 +2025,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-wasmi-ir-simd-softfloat"
+version = "1.1.0-vibeos-simd1.1"
+dependencies = [
+ "vibeos-wasmi-core-simd-softfloat",
+]
+
+[[package]]
 name = "vibeos-wasmi-ir-softfloat"
 version = "1.1.0-vibeos-f2.1"
 dependencies = [
  "vibeos-wasmi-core-softfloat",
+]
+
+[[package]]
+name = "vibeos-wasmi-simd-softfloat"
+version = "1.1.0-vibeos-simd1.1"
+dependencies = [
+ "spin",
+ "vibeos-wasmi-collections-simd-softfloat",
+ "vibeos-wasmi-core-simd-softfloat",
+ "vibeos-wasmi-ir-simd-softfloat",
+ "wasmparser 0.239.0",
 ]
 
 [[package]]

@@ -193,7 +193,7 @@ result completes C8.4 for the selected workload with outcome
 `aot-not-justified-on-fixed-qemu`; C8.5 through C8.7 are skipped for that
 workload and remain globally deferred. The stored next-node value remains
 `C8.8-skip-or-defer-C8.5-C8.7`; the live roadmap position is
-`c810-s1-simd-design-frozen-pre-implementation`, which does not rewrite this
+`c810-s2-simd-engine-implemented-pre-containment`, which does not rewrite this
 historical decision.
 Milk-V Duo physical testing is paused and the retained physical toolchain
 remains available for future qualification. Its runtime evidence is software
@@ -207,7 +207,7 @@ C8.9-S1 through C8.9-S3 allocate, implement, and qualify the independent code 6
 Float successor. Its fixed-QEMU release authority is limited to sealed,
 authority-free Float admission; code 5 remains permanently inert and Milk-V Duo
 observations remain optional and non-gating.
-The current roadmap position is `c810-s1-simd-design-frozen-pre-implementation`;
+The current roadmap position is `c810-s2-simd-engine-implemented-pre-containment`;
 C8.10-S1 freezes validation-only code 7 and C8.10-S2 is next.
 
 These CI-safe commands do not open a UART, invoke Docker, access the network,

@@ -172,6 +172,25 @@ impl WorldContract {
         Self::parse_with_features(source, exact_world, ShapeFeatures::PROFILE_2_FLOAT)
     }
 
+    /// Acceptance-only WIT frontend for code 7. SIMD adds no Component value
+    /// type, so this intentionally reuses the scalar-float boundary while the
+    /// sealed Core inspector confines `v128` to embedded modules.
+    #[cfg(feature = "c810-s3-acceptance")]
+    pub fn parse_profile_4_sync_simd_candidate(
+        source: &str,
+        exact_world: &str,
+    ) -> Result<Self, WorldError> {
+        let contract = vibeos_component_format::profile_4_sync_simd_validation_contract();
+        if contract.profile()
+            != vibeos_component_format::ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION
+            || contract.runtime_ready()
+            || contract.component_validator().predecode_async()
+        {
+            return Err(WorldError::UnsupportedType);
+        }
+        Self::parse_with_features(source, exact_world, ShapeFeatures::PROFILE_2_FLOAT)
+    }
+
     fn parse_with_features(
         source: &str,
         exact_world: &str,

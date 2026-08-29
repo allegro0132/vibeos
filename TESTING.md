@@ -776,8 +776,8 @@ The immutable historical C8.4 `next_node` value is
 The C8.9 closure position is `c89-s3-qualified-sealed-float-runtime-released`.
 C8.9-S1 allocates and freezes the independent code-6 Float successor design;
 C8.9-S2 implementation and C8.9-S3 fixed-QEMU qualification are complete.
-The current roadmap position is `c810-s3-simd-contained-corpora-passed-pre-admission`;
-C8.10-S4 is next.
+The current roadmap position is
+`c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu`; C8.10-S5 is next.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -1026,9 +1026,9 @@ proves `libm` unreachable. The pinned RISC-V audit rejects semantic LLVM FP,
 float helpers, and F/D/V instructions across the complete candidate closure.
 
 Code 7 remains `ValidationOnly`, non-current, and non-production. Code 5 stays
-permanently inert. C8.10-S3 containment/corpora is now complete; C8.10-S4
-admission/lifecycle and C8.10-S5 fixed-QEMU qualification remain incomplete. Milk-V Duo remains
-paused and supplies zero gate input.
+permanently inert. C8.10-S3 containment/corpora and C8.10-S4 default-off
+admission/lifecycle are complete; C8.10-S5 fixed-QEMU qualification remains
+incomplete. Milk-V Duo remains paused and supplies zero gate input.
 
 ```sh
 python3 -B scripts/verify-c810-simd-widening-implementation.py --check-contract
@@ -1059,6 +1059,26 @@ python3 -O -B scripts/verify-c810-simd-containment-corpus.py --check-contract
 python3 -B scripts/verify-c810-simd-containment-corpus.py --selftest
 python3 -O -B scripts/verify-c810-simd-containment-corpus.py --selftest
 cargo test --locked --offline -p vibeos-component-runtime --features c810-s3-acceptance --test c810_s3_simd_containment
+```
+
+## C8.10-S4 SIMD admission and lifecycle
+
+C8.10-S4 adds only the feature-gated `c810-s4-acceptance` route. Admission
+requires the exact code-7 identity, image SHA-256 pin, exact world and Core
+binding, zero caller offers/imports/resources, the frozen memory ceiling, and
+the exact compile reservation. The move-only volatile token exposes neither a
+command nor durable conversion. Its lifecycle permits exactly one live
+instance, bounds each call by the total fuel ceiling, reclaims on cancel/fault,
+requires explicit recovery, and makes revoke terminal and idempotent. The
+ordinary loader continues to reject code 7.
+
+```sh
+python3 -B scripts/verify-c810-simd-admission-lifecycle.py --check-contract
+python3 -O -B scripts/verify-c810-simd-admission-lifecycle.py --check-contract
+python3 -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
+python3 -O -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
+cargo test --locked --offline -p vibeos-component-admission --features c810-s4-acceptance --test c810_s4_simd_admission
+cargo test --locked --offline -p vibeos-component-loader profile_instance_limits_and_exact_wit_are_revalidated
 ```
 
 ## Fixed-QEMU target/release policy v1

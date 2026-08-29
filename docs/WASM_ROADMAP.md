@@ -27,9 +27,11 @@ The next listed C8.8 widening, fixed-width SIMD, is now allocated as C8.10.
 C8.10-S1 freezes validation-only code 7, ABI/revisions, deterministic semantics,
 the independent engine plan, and non-authorization boundaries. C8.10-S2
 implements and audits its isolated deterministic fixed-SIMD engine. C8.10-S3
-now closes Component containment and fixed differential/mutation corpora. The
-current position is `c810-s3-simd-contained-corpora-passed-pre-admission`;
-C8.10-S4 is next.
+closes Component containment and fixed differential/mutation corpora. C8.10-S4
+now closes the default-off volatile admission/lifecycle, one-instance quota,
+explicit recovery/revocation, and durable loader rejection. The current
+position is `c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu`; C8.10-S5
+is next.
 Every later non-Float widening remains separately unallocated and incomplete.
 The earlier non-numbered fixed-QEMU
 target/release policy checkpoint makes fresh source-bound
@@ -74,8 +76,8 @@ design/implementation/qualification sequence; it does not rewrite that charter.
 
 **C8.9 status (2026-08-29): C8.9-S1 through C8.9-S3 complete.**
 
-**C8.10 status (2026-08-29): C8.10-S1 and C8.10-S2 complete; C8.10-S3 through
-C8.10-S5 incomplete.**
+**C8.10 status (2026-08-29): C8.10-S1 through C8.10-S4 complete; C8.10-S5
+incomplete.**
 
 ---
 
@@ -1288,15 +1290,18 @@ The S2 engine is now materialized as
 fuel, and passes a complete RISC-V object audit with no F, D, or V instructions.
 The closure is recorded by
 [`c810-simd-widening-implementation-v1-contract.json`](../acceptance/wasm-simd-target/artifacts/c810-simd-widening-implementation-v1-contract.json).
-S3 closes Component
-containment and corpora, S4 closes default-off admission/lifecycle, and S5 uses
-fresh fixed-QEMU evidence to decide successor-review eligibility only.
+S3 closes Component containment and corpora. S4 closes a default-off,
+exact-image-pinned, authority-free volatile admission token and single-instance
+acceptance lifecycle, including explicit cancel/fault recovery, terminal revoke,
+and ordinary loader rejection. It creates no durable or command conversion. S5
+uses fresh fixed-QEMU evidence to decide successor-review eligibility only.
 
-The current roadmap position is `c810-s3-simd-contained-corpora-passed-pre-admission`;
-C8.10-S4 is the next node.
-Code 5 remains permanently inert, code 6 gains no SIMD, and C8.10 currently
-authorizes no execution, admission, durable publication, release, or production
-path. Milk-V Duo remains paused, optional, non-gating, and supplies zero input.
+The current roadmap position is
+`c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu`; C8.10-S5 is the next
+node. Code 5 remains permanently inert, code 6 gains no SIMD, and C8.10
+currently authorizes no current-engine binding, durable publication, release,
+or production path. Milk-V Duo remains paused, optional, non-gating, and
+supplies zero input.
 See [WASM_SIMD_PROFILE.md](WASM_SIMD_PROFILE.md) for the frozen design.
 
 ## 10. Test and evidence matrix

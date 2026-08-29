@@ -838,6 +838,14 @@ pub fn inspect_core_for_profile_4_candidate(bytes: &[u8]) -> Result<CoreSummary,
     inspect_core_with_limits_and_validator(bytes, &PROFILE_1_LIMITS, contract.core_validator())
 }
 
+/// Deterministic compilation policy charge for bytes accepted by the sealed
+/// Profile-4 fixed-SIMD inspector. No engine or module is constructed.
+#[cfg(feature = "c810-simd-candidate-inspection")]
+pub fn profile_4_candidate_required_compile_bytes(bytes: &[u8]) -> Result<usize, AdmissionError> {
+    let summary = inspect_core_for_profile_4_candidate(bytes)?;
+    Ok(compile_reservation_bytes(bytes.len(), summary))
+}
+
 fn inspect_core_with_limits_and_validator(
     bytes: &[u8],
     limits: &ProfileLimits,

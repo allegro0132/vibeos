@@ -1,0 +1,124 @@
+{
+  "admission": {
+    "activation_label": "c810-s4-simd-candidate",
+    "artifact_trust": "exact-image-sha256-pin",
+    "authority_offers": 0,
+    "cargo_feature": "c810-s4-acceptance",
+    "command_route": false,
+    "compile_reservation": "exact-profile4-policy-charge",
+    "default_enabled": false,
+    "durable_conversion": false,
+    "entrypoint": "run",
+    "imports": 0,
+    "memory_bytes": 65536,
+    "resource_ceiling": 0,
+    "world": "vibe:simd/validation@1.0.0"
+  },
+  "authority": {
+    "acceptance_candidate_execution": true,
+    "admission_authorized": false,
+    "current_engine_bound": false,
+    "durable_publication_authorized": false,
+    "production_authorized": false,
+    "release_authorized": false
+  },
+  "basis": {
+    "containment_commit": "ff2eb0700efb5fe08ff76476b94a29096ba92b65",
+    "containment_contract": "acceptance/wasm-simd-target/artifacts/c810-simd-containment-corpus-v1-contract.json",
+    "containment_tree": "5c355b0292e13b004c0482aa2cb9799d1acfd0d9"
+  },
+  "code5_boundary": {
+    "artifact_profile_code": 5,
+    "current_engine": false,
+    "executable": false,
+    "inert": true,
+    "migration_authorized": false,
+    "permanent": true,
+    "stage": "validation-only"
+  },
+  "durability": {
+    "ordinary_loader_accepts_code7": false,
+    "persistent_command_projection": false,
+    "profile1_loader_unchanged": true,
+    "volatile_activation_revalidates_before_lifecycle": true,
+    "volatile_recovery_next_poll_recompiles_core": true
+  },
+  "hardware_policy": {
+    "duo_gate_effect": false,
+    "duo_inputs_permitted": 0,
+    "duo_inputs_required": 0,
+    "duo_status": "paused-optional-observation-only",
+    "fixed_qemu_is_hardware_equivalent": false,
+    "fixed_qemu_qualification_node": "C8.10-S5",
+    "physical_provenance": "not-claimed"
+  },
+  "identity": {
+    "artifact_abi": 7,
+    "artifact_profile_code": 7,
+    "component_profile": 4,
+    "core_profile": 4,
+    "name": "PROFILE_4_SYNC_SIMD_VALIDATION",
+    "runtime_abi": 7,
+    "stage": "validation-only"
+  },
+  "implementation_plan": [
+    {
+      "complete": true,
+      "id": "C8.10-S1"
+    },
+    {
+      "complete": true,
+      "id": "C8.10-S2"
+    },
+    {
+      "complete": true,
+      "id": "C8.10-S3"
+    },
+    {
+      "complete": true,
+      "id": "C8.10-S4"
+    },
+    {
+      "complete": false,
+      "id": "C8.10-S5"
+    }
+  ],
+  "lifecycle": {
+    "cancel_reclaims_once": true,
+    "cold_recovery_after_cancel_or_fault": true,
+    "fault_reclaims_once": true,
+    "fuel_exhaustion_bounded": true,
+    "maximum_live_instances": 1,
+    "revocation_idempotent": true,
+    "revoked_recovery": false,
+    "states": [
+      "idle",
+      "running",
+      "cancelled",
+      "faulted",
+      "revoked"
+    ]
+  },
+  "qualification": {
+    "component_containment": "passed-c810-s3",
+    "differential_and_fuzz_corpus": "passed-c810-s3",
+    "fixed_qemu": "not-started-c810-s5",
+    "production_admission_and_lifecycle": "default-off-acceptance-passed-c810-s4",
+    "release": "not-authorized"
+  },
+  "roadmap": {
+    "completed_node": "C8.10-S4",
+    "current_position": "c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu",
+    "next_node": "C8.10-S5",
+    "state": "default-off-admission-lifecycle-complete-validation-only"
+  },
+  "schema": "vibeos.c810.simd-admission-lifecycle-v1.contract",
+  "status": "c810-s4-simd-admission-lifecycle-closed-not-qualified-not-released",
+  "tests": {
+    "admission_test": "services/component-admission/tests/c810_s4_simd_admission.rs",
+    "durable_rejection_test": "services/component-loader/src/tests.rs",
+    "ordinary_admission_rejects_code7": true,
+    "profile4_revalidation_before_activation": true
+  },
+  "version": 1
+}

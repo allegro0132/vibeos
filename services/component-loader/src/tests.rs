@@ -708,6 +708,22 @@ fn profile_instance_limits_and_exact_wit_are_revalidated() {
         Some(ComponentLoadError::Profile)
     );
 
+    // Code 7 has only a default-off volatile acceptance route. Durable
+    // install and loader cold recovery remain Profile-1-only; S4 grants no
+    // durable authority.
+    let mut simd_candidate = ArtifactSpec::exact();
+    simd_candidate.profile = ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION;
+    assert_eq!(
+        load_exact(
+            artifact_bytes(simd_candidate),
+            WIT,
+            SIGNER_DIGEST,
+            &admission,
+        )
+        .err(),
+        Some(ComponentLoadError::Profile)
+    );
+
     let mut limits = ArtifactSpec::exact();
     limits.memory_bytes = 256 * 1024;
     assert_eq!(

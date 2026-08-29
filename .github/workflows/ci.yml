@@ -195,6 +195,18 @@ jobs:
           python3 -O -B scripts/verify-c810-simd-containment-corpus.py --selftest
           cargo test --locked --offline -p vibeos-component-runtime \
             --features c810-s3-acceptance --test c810_s3_simd_containment
+      - name: Verify the C8.10-S4 SIMD admission and lifecycle
+        # Default-off volatile admission/lifecycle and durable rejection only.
+        # This runs neither QEMU nor physical hardware.
+        run: |
+          python3 -B scripts/verify-c810-simd-admission-lifecycle.py --check-contract
+          python3 -O -B scripts/verify-c810-simd-admission-lifecycle.py --check-contract
+          python3 -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
+          python3 -O -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
+          cargo test --locked --offline -p vibeos-component-admission \
+            --features c810-s4-acceptance --test c810_s4_simd_admission
+          cargo test --locked --offline -p vibeos-component-loader \
+            profile_instance_limits_and_exact_wit_are_revalidated
       - name: Verify the prospective fixed-QEMU WASM target/release policy
         # Policy/contract integrity only: this step runs no QEMU or Duo and
         # itself satisfies no gate. C8.9 qualification is verified separately.

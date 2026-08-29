@@ -38,6 +38,21 @@ c88-f5-duo-compile-readiness = [
     "vibeos-image-policy/milkv-duo-sd",
     "vibeos-wasm-float-candidate/c88-f2-acceptance",
 ]
+c89-s3-qemu-qualification = [
+    "dep:sha2",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-image-adapter",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-image-policy",
+    "dep:vibeos-wasm-float-candidate",
+    "dep:vibeos-wasm-runtime",
+    "dep:wat",
+    "vibeos-component-runtime/c89-float-executable",
+    "vibeos-image-policy/c88-f4-float-candidate",
+    "vibeos-image-policy/qemu-default",
+    "vibeos-wasm-float-candidate/c89-executable",
+    "vibeos-wasm-runtime/c89-float-executable",
+]
 
 [dependencies]
 sha2 = { version = "=0.11.0", default-features = false, optional = true }

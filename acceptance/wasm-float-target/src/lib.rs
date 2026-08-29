@@ -2,7 +2,8 @@
 #![cfg_attr(
     not(any(
         feature = "c88-f5-acceptance",
-        feature = "c88-f5-duo-compile-readiness"
+        feature = "c88-f5-duo-compile-readiness",
+        feature = "c89-s3-qemu-qualification"
     )),
     doc = r#"
 The C8.8-F5 target qualification runner is structurally absent by default:
@@ -32,13 +33,15 @@ compile_error!(
 
 #[cfg(any(
     feature = "c88-f5-acceptance",
-    feature = "c88-f5-duo-compile-readiness"
+    feature = "c88-f5-duo-compile-readiness",
+    feature = "c89-s3-qemu-qualification"
 ))]
 extern crate alloc;
 
 #[cfg(any(
     feature = "c88-f5-acceptance",
-    feature = "c88-f5-duo-compile-readiness"
+    feature = "c88-f5-duo-compile-readiness",
+    feature = "c89-s3-qemu-qualification"
 ))]
 mod acceptance {
     use alloc::{boxed::Box, vec, vec::Vec};
@@ -47,6 +50,7 @@ mod acceptance {
         current_validation_engine_identity, ProfileIdentity, ProfileStage, TrapCode,
         PROFILE_2_SYNC_FLOAT_F32_CANONICAL_NAN_BITS, PROFILE_2_SYNC_FLOAT_F64_CANONICAL_NAN_BITS,
     };
+    #[cfg(not(feature = "c89-s3-qemu-qualification"))]
     use vibeos_component_image_adapter::project_float_candidate;
     use vibeos_component_runtime::{
         abi_value::float_candidate::{
@@ -63,9 +67,12 @@ mod acceptance {
         value::{CanonicalF32, CanonicalF64, CanonicalValue, ValuePosition, ValueType},
     };
     use vibeos_image_policy::C88_F4_FLOAT_CANDIDATE;
+    #[cfg(not(feature = "c89-s3-qemu-qualification"))]
+    use vibeos_wasm_float_candidate::CANDIDATE_IDENTITY;
+    #[cfg(feature = "c89-s3-qemu-qualification")]
+    use vibeos_wasm_float_candidate::EXECUTABLE_IDENTITY;
     use vibeos_wasm_float_candidate::{
         CandidateIdentity, CandidateInstance, CandidateModule, CandidatePoll, CandidateValue,
-        CANDIDATE_IDENTITY,
     };
     use vibeos_wasm_runtime::{
         profile_2_candidate_required_compile_bytes, OwnerAllocationReservation,
@@ -86,14 +93,29 @@ mod acceptance {
         0x08, 0x3c, 0x05, 0x5d, 0xbf, 0x0d, 0x66, 0x49, 0x27, 0xba, 0x55, 0xd9, 0x78, 0x0c, 0xc9,
         0x99, 0x6a,
     ];
+    #[cfg(not(feature = "c89-s3-qemu-qualification"))]
     pub const WIT_SHA256: &str = "4c2b4d994caee3755671b89a0dfe92136fd3d130f001d5ac660aa988371f31ac";
+    #[cfg(feature = "c89-s3-qemu-qualification")]
+    pub const WIT_SHA256: &str = "0fed13d57d96685734e622c7b82bf722600974f6a04a6f386a3805682094d80f";
+    #[cfg(not(feature = "c89-s3-qemu-qualification"))]
     pub const WIT_SHA256_BYTES: [u8; 32] = [
         0x4c, 0x2b, 0x4d, 0x99, 0x4c, 0xae, 0xe3, 0x75, 0x56, 0x71, 0xb8, 0x9a, 0x0d, 0xfe, 0x92,
         0x13, 0x6f, 0xd3, 0xd1, 0x30, 0xf0, 0x01, 0xd5, 0xac, 0x66, 0x0a, 0xa9, 0x88, 0x37, 0x1f,
         0x31, 0xac,
     ];
+    #[cfg(feature = "c89-s3-qemu-qualification")]
+    pub const WIT_SHA256_BYTES: [u8; 32] = [
+        0x0f, 0xed, 0x13, 0xd5, 0x7d, 0x96, 0x68, 0x57, 0x34, 0xe6, 0x22, 0xc7, 0xb8, 0x2b, 0xf7,
+        0x22, 0x60, 0x09, 0x74, 0xf6, 0xa0, 0x4a, 0x6f, 0x38, 0x6a, 0x38, 0x05, 0x68, 0x20, 0x94,
+        0xd8, 0x0f,
+    ];
     pub const CANDIDATE_COMPONENT_BYTES: usize = C88_F4_FLOAT_CANDIDATE.artifact_bytes().len();
+    #[cfg(not(feature = "c89-s3-qemu-qualification"))]
     pub const WORLD: &str = "vibe:float-acceptance/lifecycle@1.0.0";
+    #[cfg(feature = "c89-s3-qemu-qualification")]
+    pub const WORLD: &str = "vibe:float/runtime@1.0.0";
+    #[cfg(feature = "c89-s3-qemu-qualification")]
+    const C89_WIT: &str = "package vibe:float@1.0.0;\nworld runtime {\n  export run: func(mode: u32, left: f32, right: f64) -> f64;\n}\n";
     pub const TOTAL_FUEL: u64 = 100_000;
     pub const POLL_QUANTUM: u64 = 100;
     pub const MAX_FUEL_TRACE_POLLS: u32 = 2_000;
@@ -102,7 +124,14 @@ mod acceptance {
     pub const CORE_CASES: usize = CORE_PATH_CASES + 2;
 
     pub const fn candidate_identity() -> CandidateIdentity {
-        CANDIDATE_IDENTITY
+        #[cfg(feature = "c89-s3-qemu-qualification")]
+        {
+            EXECUTABLE_IDENTITY
+        }
+        #[cfg(not(feature = "c89-s3-qemu-qualification"))]
+        {
+            CANDIDATE_IDENTITY
+        }
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -885,9 +914,15 @@ mod acceptance {
     }
 
     fn qualify_core() -> Result<CoreQualificationReport, QualificationError> {
-        if CANDIDATE_IDENTITY.production_ready
-            || CANDIDATE_IDENTITY.acceptance_feature != "c88-f2-acceptance"
-            || CANDIDATE_IDENTITY.package != "vibeos-wasmi-softfloat"
+        let selected_identity = candidate_identity();
+        #[cfg(feature = "c89-s3-qemu-qualification")]
+        let identity_is_wrong = !selected_identity.production_ready
+            || selected_identity.acceptance_feature != "c89-executable";
+        #[cfg(not(feature = "c89-s3-qemu-qualification"))]
+        let identity_is_wrong = selected_identity.production_ready
+            || selected_identity.acceptance_feature != "c88-f2-acceptance";
+        if identity_is_wrong
+            || selected_identity.package != "vibeos-wasmi-softfloat"
             || SCALAR_TARGET_RUNTIME_OP_COUNT as usize != CORE_VECTORS.len()
             || SCALAR_TARGET_WASM_BYTES.len() > u32::MAX as usize
         {
@@ -896,6 +931,13 @@ mod acceptance {
         let compile_reservation_bytes =
             profile_2_candidate_required_compile_bytes(SCALAR_TARGET_WASM_BYTES)
                 .map_err(|_| QualificationError::CoreReservation)?;
+        #[cfg(feature = "c89-s3-qemu-qualification")]
+        let module = CandidateModule::compile_executable(
+            SCALAR_TARGET_WASM_BYTES,
+            OwnerAllocationReservation::new(compile_reservation_bytes),
+        )
+        .map_err(|_| QualificationError::CoreCompile)?;
+        #[cfg(not(feature = "c89-s3-qemu-qualification"))]
         let module = CandidateModule::compile(
             SCALAR_TARGET_WASM_BYTES,
             OwnerAllocationReservation::new(compile_reservation_bytes),
@@ -1195,23 +1237,20 @@ mod acceptance {
     }
 
     fn qualify_lifecycle() -> Result<LifecycleQualificationReport, QualificationError> {
+        #[cfg(feature = "c89-s3-qemu-qualification")]
+        let profile = ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE;
+        #[cfg(not(feature = "c89-s3-qemu-qualification"))]
         let profile = ProfileIdentity::PROFILE_2_SYNC_FLOAT;
-        if profile.stage != ProfileStage::ValidationOnly
-            || profile.execution_enabled()
-            || current_validation_engine_identity(profile).is_some()
-        {
-            return Err(QualificationError::Identity);
-        }
         let pin = C88_F4_FLOAT_CANDIDATE;
         let component_sha256_bytes: [u8; 32] = Sha256::digest(pin.artifact_bytes()).into();
+        #[cfg(feature = "c89-s3-qemu-qualification")]
+        let wit_sha256_bytes: [u8; 32] = Sha256::digest(C89_WIT.as_bytes()).into();
+        #[cfg(not(feature = "c89-s3-qemu-qualification"))]
         let wit_sha256_bytes: [u8; 32] = Sha256::digest(pin.wit_source().as_bytes()).into();
         if component_sha256_bytes != pin.expected_sha256()
             || component_sha256_bytes != CANDIDATE_SHA256_BYTES
             || wit_sha256_bytes != WIT_SHA256_BYTES
-            || pin.profile() != profile
-            || pin.world() != WORLD
             || pin.export_name() != "run"
-            || pin.activation_label() != "c88-f4-float-candidate"
             || pin.limits().memory_bytes != 2 * 65_536
             || pin.limits().total_fuel != TOTAL_FUEL
             || pin.limits().poll_quantum != POLL_QUANTUM
@@ -1219,17 +1258,66 @@ mod acceptance {
         {
             return Err(QualificationError::Limits);
         }
-        let projection =
-            project_float_candidate(pin).map_err(|_| QualificationError::Projection)?;
-        if projection.profile() != profile
-            || projection.activation_label() != "c88-f4-float-candidate"
-            || projection.validated_plan().is_err()
-        {
-            return Err(QualificationError::Projection);
-        }
-        let mut lifecycle = projection
-            .activate_candidate()
-            .map_err(|_| QualificationError::Activation)?;
+        #[cfg(feature = "c89-s3-qemu-qualification")]
+        let mut lifecycle = {
+            use vibeos_component_runtime::{
+                decode::inspect_component_for_profile,
+                float_candidate::{FloatCandidateLimits, FloatExecutableComponent},
+            };
+            if profile.stage != ProfileStage::Executable
+                || !profile.execution_enabled()
+                || current_validation_engine_identity(profile).is_none()
+                || current_validation_engine_identity(ProfileIdentity::PROFILE_2_SYNC_FLOAT)
+                    .is_some()
+            {
+                return Err(QualificationError::Identity);
+            }
+            let plan = inspect_component_for_profile(pin.artifact_bytes(), profile)
+                .map_err(|_| QualificationError::Projection)?;
+            if !plan.runtime_ready()
+                || !plan.has_exact_float_candidate_execution_binding()
+                || !plan.imports().is_empty()
+                || plan.host_imports().next().is_some()
+            {
+                return Err(QualificationError::Projection);
+            }
+            let limits = FloatCandidateLimits {
+                compile_reservation_bytes: FloatExecutableComponent::required_compile_reservation(
+                    &plan,
+                )
+                .map_err(|_| QualificationError::Activation)?,
+                memory_bytes: pin.limits().memory_bytes,
+                total_fuel: pin.limits().total_fuel,
+                poll_quantum: pin.limits().poll_quantum,
+            };
+            FloatExecutableComponent::compile(&plan, limits)
+                .map_err(|_| QualificationError::Activation)?
+                .activate()
+                .map_err(|_| QualificationError::Activation)?
+        };
+        #[cfg(not(feature = "c89-s3-qemu-qualification"))]
+        let mut lifecycle = {
+            if profile.stage != ProfileStage::ValidationOnly
+                || profile.execution_enabled()
+                || current_validation_engine_identity(profile).is_some()
+                || pin.profile() != profile
+                || pin.world() != WORLD
+                || pin.activation_label() != "c88-f4-float-candidate"
+            {
+                return Err(QualificationError::Identity);
+            }
+            let projection =
+                project_float_candidate(pin).map_err(|_| QualificationError::Projection)?;
+            if projection.profile() != profile
+                || projection.activation_label() != "c88-f4-float-candidate"
+                || projection.validated_plan().is_err()
+            {
+                return Err(QualificationError::Projection);
+            }
+            projection
+                .activate_candidate()
+                .map_err(|_| QualificationError::Activation)?
+        };
         if lifecycle.state() != FloatCandidateState::Idle
             || lifecycle.live_instances() != 1
             || lifecycle.limits().total_fuel != TOTAL_FUEL
@@ -1378,6 +1466,10 @@ mod acceptance {
         }
         lifecycle.revoke();
         let lifecycle_metrics = lifecycle.metrics();
+        #[cfg(feature = "c89-s3-qemu-qualification")]
+        let engine_binding_is_wrong = current_validation_engine_identity(profile).is_none();
+        #[cfg(not(feature = "c89-s3-qemu-qualification"))]
+        let engine_binding_is_wrong = current_validation_engine_identity(profile).is_some();
         if recovery.output_bits != 0x3ff0_0000_0000_0000
             || lifecycle.state() != FloatCandidateState::Revoked
             || lifecycle.live_instances() != 0
@@ -1389,7 +1481,7 @@ mod acceptance {
             || lifecycle_metrics.revocations != 1
             || lifecycle_metrics.reclaimed_instances != 4
             || lifecycle_metrics.peak_live_instances != 1
-            || current_validation_engine_identity(profile).is_some()
+            || engine_binding_is_wrong
         {
             return Err(QualificationError::FinalState);
         }
@@ -1828,7 +1920,8 @@ mod acceptance {
 
 #[cfg(any(
     feature = "c88-f5-acceptance",
-    feature = "c88-f5-duo-compile-readiness"
+    feature = "c88-f5-duo-compile-readiness",
+    feature = "c89-s3-qemu-qualification"
 ))]
 pub use acceptance::*;
 
@@ -1836,7 +1929,8 @@ pub use acceptance::*;
     test,
     any(
         feature = "c88-f5-acceptance",
-        feature = "c88-f5-duo-compile-readiness"
+        feature = "c88-f5-duo-compile-readiness",
+        feature = "c89-s3-qemu-qualification"
     )
 ))]
 mod tests {

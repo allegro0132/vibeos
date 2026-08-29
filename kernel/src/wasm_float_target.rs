@@ -25,17 +25,34 @@ use vibeos_wasm_float_target::{
 };
 
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const SUITE_ID: &str = "vibeos.c88.f5.float-target";
+const C89_S3: bool = cfg!(feature = "wasm-c89-s3-float-qemu-qualification");
+#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+const SUITE_ID: &str = if C89_S3 {
+    "vibeos.c89.s3.float-executable"
+} else {
+    "vibeos.c88.f5.float-target"
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const SUITE_ID: &str = "vibeos.c88.f5.float-target.duo-v1";
 const TARGET: &str = "riscv64imac-unknown-none-elf";
-const SEMANTIC_DIGEST_DOMAIN: &[u8] = b"vibeos.c88.f5.float-target.semantic.v1\0";
+const SEMANTIC_DIGEST_DOMAIN: &[u8] = if cfg!(feature = "wasm-c89-s3-float-qemu-qualification") {
+    b"vibeos.c89.s3.float-executable.semantic.v1\0"
+} else {
+    b"vibeos.c88.f5.float-target.semantic.v1\0"
+};
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const RUN_ID_DOMAIN: &[u8] = b"vibeos.c88.f5.float-target.run.v1\0";
+const RUN_ID_DOMAIN: &[u8] = if C89_S3 {
+    b"vibeos.c89.s3.float-executable.run.v1\0"
+} else {
+    b"vibeos.c88.f5.float-target.run.v1\0"
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const RUN_ID_DOMAIN: &[u8] = b"vibeos.c88.f5.float-target.duo-v1.run.v1\0";
-const EXPECTED_SEMANTIC_SHA256: &str =
-    "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1";
+const EXPECTED_SEMANTIC_SHA256: &str = if cfg!(feature = "wasm-c89-s3-float-qemu-qualification") {
+    "44cb0a12c01906b31a42fc6550d485496206ea23a08bc073a685e1b893fb94b8"
+} else {
+    "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1"
+};
 
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
 const PLATFORM: &str = "qemu-virt-rv64-tcg-icount-v1";
@@ -76,9 +93,13 @@ fn execution_armed() -> bool {
 }
 
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const SOURCE_COMMIT: &str = match option_env!("VIBEOS_C88_F5_SOURCE_COMMIT") {
-    Some(value) => value,
-    None => "",
+const SOURCE_COMMIT: &str = match (
+    C89_S3,
+    option_env!("VIBEOS_C89_S3_SOURCE_COMMIT"),
+    option_env!("VIBEOS_C88_F5_SOURCE_COMMIT"),
+) {
+    (true, Some(value), _) | (false, _, Some(value)) => value,
+    _ => "",
 };
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const SOURCE_COMMIT: &str = match option_env!("VIBEOS_C88_F5_DUO_SOURCE_COMMIT") {
@@ -86,9 +107,13 @@ const SOURCE_COMMIT: &str = match option_env!("VIBEOS_C88_F5_DUO_SOURCE_COMMIT")
     None => "",
 };
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const SOURCE_TREE: &str = match option_env!("VIBEOS_C88_F5_SOURCE_TREE") {
-    Some(value) => value,
-    None => "",
+const SOURCE_TREE: &str = match (
+    C89_S3,
+    option_env!("VIBEOS_C89_S3_SOURCE_TREE"),
+    option_env!("VIBEOS_C88_F5_SOURCE_TREE"),
+) {
+    (true, Some(value), _) | (false, _, Some(value)) => value,
+    _ => "",
 };
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const SOURCE_TREE: &str = match option_env!("VIBEOS_C88_F5_DUO_SOURCE_TREE") {
@@ -96,9 +121,13 @@ const SOURCE_TREE: &str = match option_env!("VIBEOS_C88_F5_DUO_SOURCE_TREE") {
     None => "",
 };
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const CHALLENGE: &str = match option_env!("VIBEOS_C88_F5_CHALLENGE") {
-    Some(value) => value,
-    None => "",
+const CHALLENGE: &str = match (
+    C89_S3,
+    option_env!("VIBEOS_C89_S3_CHALLENGE"),
+    option_env!("VIBEOS_C88_F5_CHALLENGE"),
+) {
+    (true, Some(value), _) | (false, _, Some(value)) => value,
+    _ => "",
 };
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const CHALLENGE: &str = match option_env!("VIBEOS_C88_F5_DUO_CHALLENGE") {
@@ -106,9 +135,13 @@ const CHALLENGE: &str = match option_env!("VIBEOS_C88_F5_DUO_CHALLENGE") {
     None => "",
 };
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const RUN_ID: &str = match option_env!("VIBEOS_C88_F5_RUN_ID") {
-    Some(value) => value,
-    None => "",
+const RUN_ID: &str = match (
+    C89_S3,
+    option_env!("VIBEOS_C89_S3_RUN_ID"),
+    option_env!("VIBEOS_C88_F5_RUN_ID"),
+) {
+    (true, Some(value), _) | (false, _, Some(value)) => value,
+    _ => "",
 };
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const RUN_ID: &str = match option_env!("VIBEOS_C88_F5_DUO_RUN_ID") {
@@ -116,9 +149,13 @@ const RUN_ID: &str = match option_env!("VIBEOS_C88_F5_DUO_RUN_ID") {
     None => "",
 };
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const MANIFEST_SHA256: &str = match option_env!("VIBEOS_C88_F5_MANIFEST_SHA256") {
-    Some(value) => value,
-    None => "",
+const MANIFEST_SHA256: &str = match (
+    C89_S3,
+    option_env!("VIBEOS_C89_S3_MANIFEST_SHA256"),
+    option_env!("VIBEOS_C88_F5_MANIFEST_SHA256"),
+) {
+    (true, Some(value), _) | (false, _, Some(value)) => value,
+    _ => "",
 };
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const MANIFEST_SHA256: &str = match option_env!("VIBEOS_C88_F5_DUO_MANIFEST_SHA256") {
@@ -126,9 +163,13 @@ const MANIFEST_SHA256: &str = match option_env!("VIBEOS_C88_F5_DUO_MANIFEST_SHA2
     None => "",
 };
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const TRANSCRIPT_SCHEMA_SHA256: &str = match option_env!("VIBEOS_C88_F5_TRANSCRIPT_SCHEMA_SHA256") {
-    Some(value) => value,
-    None => "",
+const TRANSCRIPT_SCHEMA_SHA256: &str = match (
+    C89_S3,
+    option_env!("VIBEOS_C89_S3_TRANSCRIPT_SCHEMA_SHA256"),
+    option_env!("VIBEOS_C88_F5_TRANSCRIPT_SCHEMA_SHA256"),
+) {
+    (true, Some(value), _) | (false, _, Some(value)) => value,
+    _ => "",
 };
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const TRANSCRIPT_SCHEMA_SHA256: &str =
@@ -146,79 +187,147 @@ const DATA_RECORDS: usize =
     CORE_RECORDS + F3_RECORDS + F4_RECORDS + FUEL_RECORDS + LIFECYCLE_RECORDS;
 
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const META_PREFIX: &str = "VIBE_C88_F5_META ";
+const META_PREFIX: &str = if C89_S3 {
+    "VIBE_C89_S3_META "
+} else {
+    "VIBE_C88_F5_META "
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const META_PREFIX: &str = "VIBE_C88_F5_DUO_META ";
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const META_SCHEMA: &str = "vibeos.c88.f5.float-target.meta";
+const META_SCHEMA: &str = if C89_S3 {
+    "vibeos.c89.s3.float-executable.meta"
+} else {
+    "vibeos.c88.f5.float-target.meta"
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const META_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.meta";
 
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const CORE_PREFIX: &str = "VIBE_C88_F5_CORE_CASE ";
+const CORE_PREFIX: &str = if C89_S3 {
+    "VIBE_C89_S3_CORE_CASE "
+} else {
+    "VIBE_C88_F5_CORE_CASE "
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const CORE_PREFIX: &str = "VIBE_C88_F5_DUO_CORE_CASE ";
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const CORE_SCHEMA: &str = "vibeos.c88.f5.float-target.core-case";
+const CORE_SCHEMA: &str = if C89_S3 {
+    "vibeos.c89.s3.float-executable.core-case"
+} else {
+    "vibeos.c88.f5.float-target.core-case"
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const CORE_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.core-case";
 
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const F3_PREFIX: &str = "VIBE_C88_F5_F3_CASE ";
+const F3_PREFIX: &str = if C89_S3 {
+    "VIBE_C89_S3_F3_CASE "
+} else {
+    "VIBE_C88_F5_F3_CASE "
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const F3_PREFIX: &str = "VIBE_C88_F5_DUO_F3_CASE ";
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const F3_SCHEMA: &str = "vibeos.c88.f5.float-target.f3-case";
+const F3_SCHEMA: &str = if C89_S3 {
+    "vibeos.c89.s3.float-executable.f3-case"
+} else {
+    "vibeos.c88.f5.float-target.f3-case"
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const F3_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.f3-case";
 
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const F4_PREFIX: &str = "VIBE_C88_F5_F4_VECTOR ";
+const F4_PREFIX: &str = if C89_S3 {
+    "VIBE_C89_S3_F4_VECTOR "
+} else {
+    "VIBE_C88_F5_F4_VECTOR "
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const F4_PREFIX: &str = "VIBE_C88_F5_DUO_F4_VECTOR ";
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const F4_SCHEMA: &str = "vibeos.c88.f5.float-target.f4-vector";
+const F4_SCHEMA: &str = if C89_S3 {
+    "vibeos.c89.s3.float-executable.f4-vector"
+} else {
+    "vibeos.c88.f5.float-target.f4-vector"
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const F4_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.f4-vector";
 
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const FUEL_PREFIX: &str = "VIBE_C88_F5_FUEL ";
+const FUEL_PREFIX: &str = if C89_S3 {
+    "VIBE_C89_S3_FUEL "
+} else {
+    "VIBE_C88_F5_FUEL "
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const FUEL_PREFIX: &str = "VIBE_C88_F5_DUO_FUEL ";
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const FUEL_SCHEMA: &str = "vibeos.c88.f5.float-target.fuel";
+const FUEL_SCHEMA: &str = if C89_S3 {
+    "vibeos.c89.s3.float-executable.fuel"
+} else {
+    "vibeos.c88.f5.float-target.fuel"
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const FUEL_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.fuel";
 
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const LIFECYCLE_PREFIX: &str = "VIBE_C88_F5_LIFECYCLE ";
+const LIFECYCLE_PREFIX: &str = if C89_S3 {
+    "VIBE_C89_S3_LIFECYCLE "
+} else {
+    "VIBE_C88_F5_LIFECYCLE "
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const LIFECYCLE_PREFIX: &str = "VIBE_C88_F5_DUO_LIFECYCLE ";
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const LIFECYCLE_SCHEMA: &str = "vibeos.c88.f5.float-target.lifecycle";
+const LIFECYCLE_SCHEMA: &str = if C89_S3 {
+    "vibeos.c89.s3.float-executable.lifecycle"
+} else {
+    "vibeos.c88.f5.float-target.lifecycle"
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const LIFECYCLE_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.lifecycle";
 
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const END_PREFIX: &str = "VIBE_C88_F5_END ";
+const END_PREFIX: &str = if C89_S3 {
+    "VIBE_C89_S3_END "
+} else {
+    "VIBE_C88_F5_END "
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const END_PREFIX: &str = "VIBE_C88_F5_DUO_END ";
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const END_SCHEMA: &str = "vibeos.c88.f5.float-target.end";
+const END_SCHEMA: &str = if C89_S3 {
+    "vibeos.c89.s3.float-executable.end"
+} else {
+    "vibeos.c88.f5.float-target.end"
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const END_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.end";
 
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const PASS_PREFIX: &str = "VIBE_C88_F5_PASS ";
+const PASS_PREFIX: &str = if C89_S3 {
+    "VIBE_C89_S3_PASS "
+} else {
+    "VIBE_C88_F5_PASS "
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const PASS_PREFIX: &str = "VIBE_C88_F5_DUO_PASS ";
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const PASS_SCHEMA: &str = "vibeos.c88.f5.float-target.pass";
+const PASS_SCHEMA: &str = if C89_S3 {
+    "vibeos.c89.s3.float-executable.pass"
+} else {
+    "vibeos.c88.f5.float-target.pass"
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const PASS_SCHEMA: &str = "vibeos.c88.f5.float-target.duo-v1.pass";
 
 #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
-const FAIL_PREFIX: &str = "VIBE_C88_F5_FAIL ";
+const FAIL_PREFIX: &str = if C89_S3 {
+    "VIBE_C89_S3_FAIL "
+} else {
+    "VIBE_C88_F5_FAIL "
+};
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
 const FAIL_PREFIX: &str = "VIBE_C88_F5_DUO_FAIL ";
 #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
@@ -568,7 +677,10 @@ fn emit_lifecycle_snapshot(emitter: &mut RecordEmitter, snapshot: LifecycleSnaps
     emitter.emit("LIFECYCLE", LIFECYCLE_PREFIX, LIFECYCLE_SCHEMA, semantic);
 }
 
-#[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+#[cfg(all(
+    feature = "wasm-c88-f5-float-qemu-acceptance",
+    not(feature = "wasm-c89-s3-float-qemu-qualification")
+))]
 fn emit_metadata(report: &QualificationReport) {
     let candidate = candidate_identity();
     let component_sha256 = digest_hex(&report.lifecycle.component_sha256_bytes);
@@ -648,6 +760,165 @@ fn emit_metadata(report: &QualificationReport) {
         WORLD,
         TOTAL_FUEL,
         POLL_QUANTUM,
+        CORE_RECORDS,
+        F3_RECORDS,
+        F4_RECORDS,
+        FUEL_RECORDS,
+        LIFECYCLE_RECORDS,
+        DATA_RECORDS,
+    );
+}
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-qemu-acceptance",
+    feature = "wasm-c89-s3-float-qemu-qualification"
+))]
+fn emit_metadata(report: &QualificationReport) {
+    let candidate = candidate_identity();
+    let component_sha256 = digest_hex(&report.lifecycle.component_sha256_bytes);
+    let wit_sha256 = digest_hex(&report.lifecycle.wit_sha256_bytes);
+    let (
+        profile_code,
+        artifact_abi,
+        component_profile,
+        core_profile,
+        runtime_abi,
+        stage,
+        runtime_ready,
+        execution_enabled,
+        current_engine,
+        production_ready,
+        activation_label,
+        executable_exports,
+        qualification_node,
+        code5_inert,
+    ) = if C89_S3 {
+        (
+            6,
+            6,
+            3,
+            3,
+            6,
+            "executable",
+            true,
+            true,
+            true,
+            true,
+            "c89-float-runtime",
+            1,
+            "C8.9-S3",
+            true,
+        )
+    } else {
+        (
+            5,
+            5,
+            2,
+            2,
+            5,
+            "validation-only",
+            false,
+            false,
+            false,
+            false,
+            "c88-f4-float-candidate",
+            0,
+            "C8.8-F5",
+            true,
+        )
+    };
+    crate::println!(
+        concat!(
+            "{}{{",
+            "\"schema\":\"{}\",\"version\":1,",
+            "\"suite_id\":\"{}\",\"suite_revision\":1,",
+            "\"source_commit\":\"{}\",\"source_tree\":\"{}\",",
+            "\"challenge\":\"{}\",\"run_id\":\"{}\",",
+            "\"manifest_sha256\":\"{}\",\"transcript_schema_sha256\":\"{}\",",
+            "\"platform\":\"{}\",\"platform_class\":\"{}\",\"target\":\"{}\",",
+            "\"physical_provenance\":\"{}\",",
+            "\"qualification_node\":\"{}\",\"code5_inert\":{},",
+            "\"durable_authorized\":false,\"release_authorized\":false,",
+            "\"artifact_profile_code\":{},\"artifact_abi\":{},\"component_profile\":{},",
+            "\"core_profile\":{},\"runtime_abi\":{},\"stage\":\"{}\",",
+            "\"runtime_ready\":{},\"native_async_runtime_ready\":false,",
+            "\"execution_enabled\":{},\"current_validation_engine\":{},",
+            "\"current_component_engine\":{},",
+            "\"candidate_package\":\"{}\",\"candidate_version\":\"{}\",",
+            "\"candidate_upstream_commit\":\"{}\",",
+            "\"candidate_manifest_sha256\":\"{}\",\"candidate_patch_sha256\":\"{}\",",
+            "\"backend_package\":\"{}\",\"backend_version\":\"{}\",",
+            "\"backend_archive_sha256\":\"{}\",\"backend_revision\":\"{}\",",
+            "\"backend_llvm_revision\":\"{}\",\"candidate_feature_set\":\"{}\",",
+            "\"candidate_acceptance_feature\":\"{}\",\"candidate_production_ready\":{},",
+            "\"core_module_sha256\":\"{}\",\"core_module_bytes\":{},",
+            "\"core_compile_reservation_bytes\":{},\"core_memory_bytes\":{},",
+            "\"core_runtime_digest\":\"{:016x}\",\"core_fold_digest\":\"{:016x}\",",
+            "\"core_spin_trace_digest\":\"{:016x}\",",
+            "\"component_sha256\":\"{}\",\"component_bytes\":{},",
+            "\"wit_sha256\":\"{}\",\"world\":\"{}\",\"export\":\"run\",",
+            "\"activation_label\":\"{}\",",
+            "\"memory_bytes\":131072,\"total_fuel\":{},\"poll_quantum\":{},\"resources\":0,",
+            "\"embedded_modules\":1,\"core_instances\":1,\"component_instances\":0,",
+            "\"aliases\":1,\"canonical_functions\":1,\"adapters\":0,\"imports\":0,",
+            "\"host_imports\":0,\"exports\":1,\"executable_exports\":{},\"exact_binding\":true,",
+            "\"core_cases\":{},\"f3_cases\":{},\"f4_vectors\":{},\"fuel_records\":{},",
+            "\"lifecycle_records\":{},\"records\":{}",
+            "}}"
+        ),
+        META_PREFIX,
+        META_SCHEMA,
+        SUITE_ID,
+        SOURCE_COMMIT,
+        SOURCE_TREE,
+        CHALLENGE,
+        RUN_ID,
+        MANIFEST_SHA256,
+        TRANSCRIPT_SCHEMA_SHA256,
+        PLATFORM,
+        PLATFORM_CLASS,
+        TARGET,
+        PHYSICAL_PROVENANCE,
+        qualification_node,
+        code5_inert,
+        profile_code,
+        artifact_abi,
+        component_profile,
+        core_profile,
+        runtime_abi,
+        stage,
+        runtime_ready,
+        execution_enabled,
+        current_engine,
+        current_engine,
+        candidate.package,
+        candidate.version,
+        candidate.upstream_revision,
+        candidate.patched_manifest_sha256,
+        candidate.patch_delta_sha256,
+        candidate.backend_package,
+        candidate.backend_version,
+        candidate.backend_archive_sha256,
+        candidate.backend_revision,
+        candidate.backend_llvm_revision,
+        candidate.feature_set,
+        candidate.acceptance_feature,
+        production_ready,
+        report.core.wasm_sha256,
+        report.core.wasm_bytes,
+        report.core.compile_reservation_bytes,
+        CORE_MEMORY_BYTES,
+        report.core.runtime_digest,
+        report.core.fold_digest,
+        report.core.spin_trace_digest,
+        component_sha256,
+        CANDIDATE_COMPONENT_BYTES,
+        wit_sha256,
+        WORLD,
+        activation_label,
+        TOTAL_FUEL,
+        POLL_QUANTUM,
+        executable_exports,
         CORE_RECORDS,
         F3_RECORDS,
         F4_RECORDS,
@@ -826,7 +1097,15 @@ pub async fn run() {
         emit_lifecycle_snapshot(&mut emitter, snapshot);
     }
     let (records, semantic_sha256) = emitter.finish();
-    if records != DATA_RECORDS || semantic_sha256 != EXPECTED_SEMANTIC_SHA256 {
+    if records != DATA_RECORDS {
+        fail(0xff03);
+    }
+    if semantic_sha256 != EXPECTED_SEMANTIC_SHA256 {
+        #[cfg(feature = "wasm-c89-s3-float-qemu-qualification")]
+        crate::println!(
+            "VIBE_C89_S3_SEMANTIC_MISMATCH {{\"observed\":\"{}\"}}",
+            semantic_sha256
+        );
         fail(0xff03);
     }
     emit_terminal(END_PREFIX, END_SCHEMA, &semantic_sha256);

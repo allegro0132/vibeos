@@ -49,6 +49,9 @@ wasm-c83-runtime-costs = ["vibeos-kernel/wasm-c83-runtime-costs"]
 wasm-c88-f5-float-qemu-acceptance = [
     "vibeos-kernel/wasm-c88-f5-float-qemu-acceptance",
 ]
+wasm-c89-s3-float-qemu-qualification = [
+    "vibeos-kernel/wasm-c89-s3-float-qemu-qualification",
+]
 wasm-c84-profile-slot-qemu-acceptance = [
     "vibeos-kernel/wasm-c84-profile-slot-qemu-acceptance",
 ]

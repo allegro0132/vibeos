@@ -204,6 +204,10 @@ impl CurrentCoreValidationEngine {
 pub fn current_core_validation_engine(
     profile: ProfileIdentity,
 ) -> Option<CurrentCoreValidationEngine> {
+    if profile == ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE {
+        #[cfg(not(feature = "c89-float-executable"))]
+        return None;
+    }
     let identity = current_validation_engine_identity(profile)?;
     Some(CurrentCoreValidationEngine {
         identity,

@@ -153,6 +153,25 @@ impl WorldContract {
         Self::parse_with_features(source, exact_world, ShapeFeatures::PROFILE_2_FLOAT)
     }
 
+    /// WIT frontend for the independently numbered C8.9 executable world.
+    #[cfg(feature = "c89-float-executable")]
+    pub fn parse_profile_3_sync_float_executable(
+        source: &str,
+        exact_world: &str,
+    ) -> Result<Self, WorldError> {
+        if exact_world != vibeos_component_format::PROFILE_3_SYNC_FLOAT_EXECUTABLE_WORLD {
+            return Err(WorldError::VersionMismatch);
+        }
+        let identity = vibeos_component_format::current_validation_engine_identity(
+            vibeos_component_format::ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE,
+        )
+        .ok_or(WorldError::UnsupportedType)?;
+        if identity.component_validator().predecode_async() {
+            return Err(WorldError::UnsupportedType);
+        }
+        Self::parse_with_features(source, exact_world, ShapeFeatures::PROFILE_2_FLOAT)
+    }
+
     fn parse_with_features(
         source: &str,
         exact_world: &str,

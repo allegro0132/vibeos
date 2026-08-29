@@ -692,6 +692,22 @@ fn profile_instance_limits_and_exact_wit_are_revalidated() {
         Some(ComponentLoadError::Profile)
     );
 
+    // The executable code-6 identity is implemented only for the sealed,
+    // volatile Float admission surface. S3 has not authorized durable
+    // publication, so the production loader remains Profile-1-only.
+    let mut float_executable = ArtifactSpec::exact();
+    float_executable.profile = ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE;
+    assert_eq!(
+        load_exact(
+            artifact_bytes(float_executable),
+            WIT,
+            SIGNER_DIGEST,
+            &admission,
+        )
+        .err(),
+        Some(ComponentLoadError::Profile)
+    );
+
     let mut limits = ArtifactSpec::exact();
     limits.memory_bytes = 256 * 1024;
     assert_eq!(

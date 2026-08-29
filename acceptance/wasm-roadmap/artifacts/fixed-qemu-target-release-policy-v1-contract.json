@@ -2,11 +2,13 @@
   "application_status": {
     "allocation_contract_path": "acceptance/wasm-float-target/artifacts/c89-float-successor-design-v1-contract.json",
     "allocation_contract_schema": "vibeos.c89.float-successor-design-v1.contract",
-    "current_roadmap_position": "c89-s1-design-frozen-pre-implementation",
+    "current_roadmap_position": "c89-s2-implemented-pre-fixed-qemu-qualification",
     "design_node": "C8.9-S1",
     "design_node_complete": true,
+    "implementation_contract_path": "acceptance/wasm-float-target/artifacts/c89-float-successor-implementation-v1-contract.json",
+    "implementation_contract_schema": "vibeos.c89.float-successor-implementation-v1.contract",
     "implementation_node": "C8.9-S2",
-    "implementation_node_complete": false,
+    "implementation_node_complete": true,
     "policy_checkpoint_remains_nonallocating": true,
     "qualification_node": "C8.9-S3",
     "qualification_node_complete": false,
@@ -379,32 +381,32 @@
     "float_profile_doc": "docs/WASM_FLOAT_PROFILE.md",
     "pinned_files": {
       ".github/workflows/ci.yml": {
-        "bytes": 24524,
-        "sha256": "68d71c57c5c230ff7159d573a77dd0799172ef32800d5d0b7c4bca9335c24720"
+        "bytes": 25314,
+        "sha256": "0323cc019d428a03adb467820e8b5646b0aab69e5c1db8e8619d948b8c1e3b95"
       },
       "TESTING.md": {
-        "bytes": 127880,
-        "sha256": "a3e3fa5349abf347ab3eb1ac23a6938564545e15eeb50c2db7803bfb773d9e8d"
+        "bytes": 128981,
+        "sha256": "0ba5030d47d3dd1edeca4f76769f2298dac34fccb9e04c56c6247c01d75a1372"
       },
       "benchmarks/wasm-aot-decision/README.md": {
-        "bytes": 16362,
-        "sha256": "ced8cb9019bdb976b2eef734c74e0273acbc614fa43313aa1187d7027d8c7f9d"
+        "bytes": 16378,
+        "sha256": "ed2748b5ca5bb2bd6b445c773a6682d90b3983cd8738374bb04b4401339cc991"
       },
       "benchmarks/wasm-runtime/README.md": {
         "bytes": 1200,
         "sha256": "5e1e1bd8c21dc2f1badecc2f29dc52209cfa4682744c0677abdba604df1dd5b1"
       },
       "docs/WASM_AOT_DECISION.md": {
-        "bytes": 83972,
-        "sha256": "8048ab8022e167d9ec7332a486ff051827df93408c569c877cf21eb4820d52e6"
+        "bytes": 84021,
+        "sha256": "7a07dd3d7c1251684cbf5fa49b05a067947fef80197aeea559c629819f1e4900"
       },
       "docs/WASM_FLOAT_PROFILE.md": {
-        "bytes": 35282,
-        "sha256": "47d04e75e5a92fe9e0703cea3f1192c57e0e0ae70c17dd95c74942f182f59a84"
+        "bytes": 35711,
+        "sha256": "8e5f2bc049ac53434cd6f950a574c62271b623b2844c8da9e0f6dbd3e70b0bd6"
       },
       "docs/WASM_ROADMAP.md": {
-        "bytes": 95655,
-        "sha256": "cff64fdc658591fa000ca64230d625d587351aa915fde0bd6fe65c667241d273"
+        "bytes": 96108,
+        "sha256": "8c73f1495330c6af10e0c91fa78cfb1f9ed529958e84866a3fa5eaa6ac03e226"
       },
       "docs/WASM_RUNTIME_COSTS.md": {
         "bytes": 12908,

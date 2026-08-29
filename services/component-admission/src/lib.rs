@@ -111,6 +111,7 @@ use sha2::{Digest, Sha256};
 pub use vibeos_component_format::ProfileIdentity;
 #[cfg(any(
     feature = "c88-f4-acceptance",
+    feature = "c89-float-executable",
     feature = "native-async-acceptance",
     feature = "selected-wasi-admission"
 ))]
@@ -130,10 +131,13 @@ use vibeos_component_host::{
     HostManifestError, HostResourceKind, VibeHostManifest, VibeHostRequirement,
 };
 #[cfg(feature = "c88-f4-acceptance")]
-use vibeos_component_runtime::{
-    decode::inspect_component_for_profile_2_candidate,
-    world::{EntityShape, FunctionEffect, ValueShape},
+use vibeos_component_runtime::decode::inspect_component_for_profile_2_candidate;
+#[cfg(feature = "c89-float-executable")]
+use vibeos_component_runtime::float_candidate::{
+    FloatCandidateError, FloatCandidateLifecycle, FloatCandidateLimits, FloatExecutableComponent,
 };
+#[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
+use vibeos_component_runtime::world::{EntityShape, FunctionEffect, ValueShape};
 use vibeos_component_runtime::{
     decode::{
         current_component_validation_engine, inspect_component_for_profile,
@@ -160,6 +164,9 @@ pub const STREAM_FILTER_WORLD: &str = "vibe:stream/filter@1.0.0";
 /// This string is diagnostic image policy, not a VSH name or routing key.
 #[cfg(feature = "c88-f4-acceptance")]
 pub const FLOAT_ACCEPTANCE_ACTIVATION_LABEL: &str = "c88-f4-float-candidate";
+
+#[cfg(feature = "c89-float-executable")]
+pub const FLOAT_EXECUTABLE_ACTIVATION_LABEL: &str = "c89-float-runtime";
 
 /// Exact validation-only native async stream world used by the isolated C5.3
 /// acceptance candidate. This does not replace [`STREAM_FILTER_WORLD`] and is
@@ -411,7 +418,7 @@ impl InstanceLimits {
         Ok(())
     }
 
-    #[cfg(feature = "c88-f4-acceptance")]
+    #[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
     fn validate_float_acceptance(self) -> Result<(), AdmissionError> {
         let maximum_memory = (PROFILE_1_LIMITS.max_memory_pages as usize)
             .checked_mul(65_536)
@@ -486,6 +493,16 @@ pub struct AdmissionPolicy<'a> {
 #[cfg(feature = "c88-f4-acceptance")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FloatAcceptanceAdmissionPolicy<'a> {
+    pub activation_label: &'a str,
+    pub exact_world: &'a WorldContract,
+    pub trust: ArtifactTrust,
+    pub limits: InstanceLimits,
+}
+
+/// Trusted, authority-free policy for the one closed C8.9 world.
+#[cfg(feature = "c89-float-executable")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FloatExecutableAdmissionPolicy<'a> {
     pub activation_label: &'a str,
     pub exact_world: &'a WorldContract,
     pub trust: ArtifactTrust,
@@ -920,6 +937,60 @@ impl AdmittedFloatAcceptanceCandidate {
     /// scalar-float candidate inspector. No current-engine resolver is queried.
     pub fn validated_plan(&self) -> Result<ComponentPlan<'_>, AdmissionError> {
         revalidate_float_acceptance_candidate(self)
+    }
+}
+
+/// Move-only admitted code-6 executable. It has no capability table, raw-byte
+/// accessor, durable conversion, or conversion from the code-5 candidate.
+#[cfg(feature = "c89-float-executable")]
+pub struct AdmittedFloatExecutable {
+    artifact: ComponentArtifact,
+    inspection: InspectionSummary,
+    activation_label: String,
+    limits: InstanceLimits,
+    _sealed: private::Seal,
+}
+
+#[cfg(feature = "c89-float-executable")]
+impl AdmittedFloatExecutable {
+    pub const fn identity(&self) -> ComponentIdentity {
+        self.artifact.identity
+    }
+
+    pub const fn profile(&self) -> ProfileIdentity {
+        self.inspection.profile
+    }
+
+    pub fn world(&self) -> &str {
+        &self.inspection.world
+    }
+
+    pub fn activation_label(&self) -> &str {
+        &self.activation_label
+    }
+
+    pub const fn limits(&self) -> InstanceLimits {
+        self.limits
+    }
+
+    pub fn activate(self) -> Result<FloatCandidateLifecycle, FloatCandidateError> {
+        let plan = inspect_component_for_profile(
+            &self.artifact.bytes,
+            ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE,
+        )
+        .map_err(|_| FloatCandidateError::InvalidPlan)?;
+        let compile_reservation_bytes =
+            FloatExecutableComponent::required_compile_reservation(&plan)?;
+        FloatExecutableComponent::compile(
+            &plan,
+            FloatCandidateLimits {
+                compile_reservation_bytes,
+                memory_bytes: self.limits.memory_bytes,
+                total_fuel: self.limits.total_fuel,
+                poll_quantum: self.limits.poll_quantum,
+            },
+        )?
+        .activate()
     }
 }
 
@@ -1669,6 +1740,125 @@ fn float_acceptance_plan_matches(plan: &ComponentPlan<'_>) -> bool {
         return false;
     };
     function.effect == FunctionEffect::Sync
+        && function.parameters.len() == 3
+        && function.parameters[0].name == "mode"
+        && function.parameters[0].value == ValueShape::U32
+        && function.parameters[1].name == "left"
+        && function.parameters[1].value == ValueShape::F32
+        && function.parameters[2].name == "right"
+        && function.parameters[2].value == ValueShape::F64
+        && function.result == Some(ValueShape::F64)
+}
+
+/// Admit the independently numbered code-6 Float successor. Admission is
+/// authority-free and import-free; it creates only a volatile, move-only
+/// activation token and never a durable command or loader record.
+#[cfg(feature = "c89-float-executable")]
+pub fn admit_float_executable(
+    artifact: ComponentArtifact,
+    policy: &FloatExecutableAdmissionPolicy<'_>,
+    caller: &CallerAuthority<'_>,
+) -> Result<AdmittedFloatExecutable, AdmissionError> {
+    let profile = ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE;
+    if artifact.profile != profile
+        || profile.stage != ProfileStage::Executable
+        || !profile.execution_enabled()
+    {
+        return Err(AdmissionError::BadProfile);
+    }
+    if policy.trust != ArtifactTrust::ImagePinned(artifact.identity) {
+        return Err(AdmissionError::UntrustedArtifact);
+    }
+    policy.limits.validate_float_acceptance()?;
+    if policy.activation_label != FLOAT_EXECUTABLE_ACTIVATION_LABEL
+        || policy.exact_world.identity
+            != vibeos_component_format::PROFILE_3_SYNC_FLOAT_EXECUTABLE_WORLD
+        || !valid_manifest_text(&policy.exact_world.identity, 256)
+        || !caller.offers.is_empty()
+    {
+        return Err(AdmissionError::InvalidPolicy);
+    }
+
+    let engine = current_component_validation_engine(profile).ok_or(AdmissionError::BadProfile)?;
+    let core_engine = current_core_validation_engine(profile).ok_or(AdmissionError::BadProfile)?;
+    if engine.identity() != core_engine.identity() {
+        return Err(AdmissionError::BadProfile);
+    }
+    let (component, modules, imports, exports) = {
+        let plan = inspect_component_with_current_engine(&artifact.bytes, &engine)
+            .map_err(AdmissionError::Decode)?;
+        plan.check_world(policy.exact_world)
+            .map_err(AdmissionError::World)?;
+        if !float_executable_plan_matches(&plan) {
+            return Err(AdmissionError::InvalidPolicy);
+        }
+        let mut modules = Vec::new();
+        modules
+            .try_reserve_exact(plan.embedded_modules().len())
+            .map_err(|_| AdmissionError::Allocation)?;
+        for bytes in plan.embedded_modules() {
+            let summary = inspect_core_with_current_engine(bytes, &core_engine)
+                .map_err(AdmissionError::Core)?;
+            if summary.imports != 0 {
+                return Err(AdmissionError::InvalidPolicy);
+            }
+            modules.push(summary);
+        }
+        let summary = plan.summary();
+        let (imports, exports) = plan.into_world_shapes();
+        (summary, modules, imports, exports)
+    };
+    Ok(AdmittedFloatExecutable {
+        artifact,
+        inspection: InspectionSummary {
+            profile,
+            world: copied(&policy.exact_world.identity)?,
+            component,
+            modules,
+            imports,
+            exports,
+        },
+        activation_label: copied(policy.activation_label)?,
+        limits: policy.limits,
+        _sealed: private::Seal,
+    })
+}
+
+#[cfg(feature = "c89-float-executable")]
+fn float_executable_plan_matches(plan: &ComponentPlan<'_>) -> bool {
+    let summary = plan.summary();
+    if plan.profile() != ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE
+        || plan.profile().stage != ProfileStage::Executable
+        || !plan.profile().execution_enabled()
+        || !plan.runtime_ready()
+        || plan.native_async_runtime_ready()
+        || !summary.async_abi.is_empty()
+        || summary.embedded_modules != 1
+        || summary.core_instances != 1
+        || summary.component_instances != 0
+        || summary.definitions != 1
+        || summary.aliases != 1
+        || summary.canonical_functions != 1
+        || summary.adapters != 0
+        || summary.resources != 0
+        || summary.imports != 0
+        || summary.exports != 1
+        || plan.embedded_modules().len() != 1
+        || !plan.imports().is_empty()
+        || plan.host_imports().next().is_some()
+        || plan.executable_exports().next().is_some()
+        || plan.native_async_execution_plan().is_some()
+        || !plan.has_exact_float_candidate_execution_binding()
+        || plan.exports().len() != 1
+    {
+        return false;
+    }
+    let export = &plan.exports()[0];
+    let EntityShape::Function(function) = &export.entity else {
+        return false;
+    };
+    export.name == "run"
+        && function.effect == FunctionEffect::Sync
         && function.parameters.len() == 3
         && function.parameters[0].name == "mode"
         && function.parameters[0].value == ValueShape::U32

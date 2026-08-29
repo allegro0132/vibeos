@@ -268,3 +268,32 @@ fn c75_engine_payloads_match_actual_cargo_pins_and_lock_checksums() {
         .unwrap();
     assert!(wasmi_entry.contains("\"wasmparser 0.239.0\""));
 }
+
+#[test]
+fn c89_code6_binds_the_exact_software_float_source_identity() {
+    let identity =
+        current_validation_engine_identity(ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE)
+            .unwrap();
+    assert_eq!(
+        identity.profile(),
+        ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE
+    );
+    assert_eq!(identity.wasmi().name(), "vibeos-wasmi-softfloat");
+    assert_eq!(identity.wasmi().version(), "1.1.0-vibeos-f2.1");
+    assert_eq!(
+        identity.wasmi().checksum(),
+        "2d94218e4fa5eea30b8e516e055fae8f72465dbc1ef75f8b1df3495cbcd0432f"
+    );
+    let source = identity.software_float_source().unwrap();
+    assert_eq!(
+        source.upstream_revision(),
+        "8273dfb09d493971b7bb12fe614d740cdc857175"
+    );
+    assert_eq!(
+        source.source_tree(),
+        "c55904f72c70f9a0d807a13e678fec01b7c78f5a"
+    );
+    assert_eq!(source.backend_package(), "rustc_apfloat");
+    assert_eq!(source.backend_version(), "0.2.3+llvm-462a31f5a5ab");
+    assert!(current_validation_engine_identity(ProfileIdentity::PROFILE_2_SYNC_FLOAT).is_none());
+}

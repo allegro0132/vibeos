@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Verify the C8.9-S1 independent Float successor design allocation.
 
-This checker freezes identity and implementation intent only.  It deliberately
-proves that code 5 is still inert, that code 6 is not materialized yet, and that
-neither implementation nor fixed-QEMU qualification is being claimed complete.
-It consumes no physical input and runs no emulator.
+This checker preserves the published S1 design checkpoint. It proves from the
+S1 Git publication that code 5 was inert and code 6 had not yet been
+materialized at that node. Later S2 source is verified by its own contract.
+This checker consumes no physical input and runs no emulator.
 """
 
 from __future__ import annotations
@@ -34,6 +34,8 @@ EXPECTED_CONTRACT_SHA256 = (
 MAX_CONTRACT_BYTES = 64 * 1024
 MAX_TEXT_BYTES = 2 * 1024 * 1024
 READ_CHUNK_BYTES = 64 * 1024
+S1_PUBLICATION_COMMIT = "f2976a0ae0a88ea2e834c4eedb6f7221bdc6b2e3"
+S1_PUBLICATION_TREE = "928ae4c343f22dd59448eed64511474f808a5e61"
 
 ROOT_KEYS = {
     "allocation_authority",
@@ -403,10 +405,11 @@ def verify_source_boundary(contract: dict[str, Any]) -> None:
     )
 
     basis_commit = contract["allocation_authority"]["basis_commit"]
+    verify_commit_tree(S1_PUBLICATION_COMMIT, S1_PUBLICATION_TREE, "S1 publication")
     for relative in SOURCE_BOUNDARY_FILES:
-        current = read_bounded(ROOT / relative, MAX_TEXT_BYTES, relative)
+        published = run_git("show", f"{S1_PUBLICATION_COMMIT}:{relative}")
         historical = run_git("show", f"{basis_commit}:{relative}")
-        strict_equal(current, historical, f"pre-S2 source boundary {relative}")
+        strict_equal(published, historical, f"published pre-S2 source boundary {relative}")
 
     source = read_text("component-format/src/lib.rs", "component profile source")
     for marker in (
@@ -425,20 +428,22 @@ def verify_source_boundary(contract: dict[str, Any]) -> None:
         "services/component-loader",
         "kernel",
     )
+    published_files = run_git("ls-tree", "-r", "--name-only", S1_PUBLICATION_COMMIT).decode("utf-8").splitlines()
     for relative in rust_roots:
-        for path in (ROOT / relative).rglob("*.rs"):
-            text = read_bounded(path, MAX_TEXT_BYTES, str(path)).decode("utf-8")
+        prefix = relative + "/"
+        for path in (path for path in published_files if path.startswith(prefix) and path.endswith(".rs")):
+            text = run_git("show", f"{S1_PUBLICATION_COMMIT}:{path}").decode("utf-8")
             require(
                 "PROFILE_3_SYNC_FLOAT_EXECUTABLE" not in text,
-                f"C8.9 identity materialized before S2: {path.relative_to(ROOT)}",
+                f"C8.9 identity materialized in S1 publication: {path}",
             )
 
 
 def verify_integration() -> None:
-    roadmap = read_text("docs/WASM_ROADMAP.md", "WASM roadmap")
-    float_doc = read_text("docs/WASM_FLOAT_PROFILE.md", "Float profile")
-    testing = read_text("TESTING.md", "TESTING")
-    ci = read_text(".github/workflows/ci.yml", "CI workflow")
+    roadmap = run_git("show", f"{S1_PUBLICATION_COMMIT}:docs/WASM_ROADMAP.md").decode("utf-8")
+    float_doc = run_git("show", f"{S1_PUBLICATION_COMMIT}:docs/WASM_FLOAT_PROFILE.md").decode("utf-8")
+    testing = run_git("show", f"{S1_PUBLICATION_COMMIT}:TESTING.md").decode("utf-8")
+    ci = run_git("show", f"{S1_PUBLICATION_COMMIT}:.github/workflows/ci.yml").decode("utf-8")
 
     require(roadmap.count(ROADMAP_STATUS) == 1, "roadmap C8.9 status differs")
     require(roadmap.count(CURRENT_POSITION) >= 1, "roadmap current position differs")

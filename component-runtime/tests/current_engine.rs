@@ -55,3 +55,17 @@ fn c75_async_selection_is_distinct_and_adjacent_profile_has_no_gate() {
         "C8.8-F1 code 5 must never enter the current Component engine resolver"
     );
 }
+
+#[test]
+fn c89_component_gate_is_absent_without_the_exact_executable_feature() {
+    #[cfg(not(feature = "c89-float-executable"))]
+    assert!(
+        current_component_validation_engine(ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE)
+            .is_none()
+    );
+    #[cfg(feature = "c89-float-executable")]
+    assert!(
+        current_component_validation_engine(ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE)
+            .is_some()
+    );
+}

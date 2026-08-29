@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 [features]
 default = []
 c88-f2-acceptance = ["dep:vibeos-wasm-runtime", "dep:wasmi-softfloat"]
+c89-executable = ["dep:vibeos-wasm-runtime", "dep:wasmi-softfloat", "vibeos-wasm-runtime/c89-float-executable"]
 
 [dependencies]
 vibeos-component-format = { path = "../component-format" }

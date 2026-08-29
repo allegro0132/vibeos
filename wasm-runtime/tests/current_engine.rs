@@ -35,3 +35,13 @@ fn c75_core_gate_rejects_an_adjacent_profile_without_fallback() {
         "C8.8-F1 code 5 must never enter the current Core engine resolver"
     );
 }
+
+#[test]
+fn c89_core_gate_tracks_the_exact_build_feature_while_code5_never_does() {
+    let code6 = current_core_validation_engine(ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE);
+    #[cfg(feature = "c89-float-executable")]
+    assert!(code6.is_some());
+    #[cfg(not(feature = "c89-float-executable"))]
+    assert!(code6.is_none());
+    assert!(current_core_validation_engine(ProfileIdentity::PROFILE_2_SYNC_FLOAT).is_none());
+}

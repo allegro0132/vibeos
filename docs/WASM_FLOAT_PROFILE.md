@@ -545,7 +545,7 @@ JIT, RWX, migration, or in-place promotion.
 
 ## 9. C8.9 executable Float successor
 
-The live roadmap position is `c89-s1-design-frozen-pre-implementation`.
+The live roadmap position is `c89-s2-implemented-pre-fixed-qemu-qualification`.
 C8.9 is independently numbered and is divided into three ordered nodes:
 
 1. C8.9-S1 freezes the successor design and identity.
@@ -565,15 +565,20 @@ The selected engine is the already reviewed but newly bound-for-C8.9
 `vibeos-wasmi-softfloat` `1.1.0-vibeos-f2.1` source at upstream commit
 `8273dfb09d493971b7bb12fe614d740cdc857175`, using `rustc_apfloat`
 `0.2.3+llvm-462a31f5a5ab` and the exact no-default/SIMD-off feature vector.
-Selection is not binding: S1 leaves code 6 absent from the artifact codec and
-current engine resolver. S2 must add those paths and their negative evidence.
+S2 now binds this source only to code 6. The artifact codec, current Core and
+Component engine resolvers, exact import-free admission surface, bit-only
+Canonical ABI, quota-controlled move-only executor, cancellation, revocation,
+fault reclamation, and cold recovery are implemented. Ordinary command and
+durable-loader routes continue to reject code 6 pending S3 release authority.
 
 The canonical machine contract is
 [`c89-float-successor-design-v1-contract.json`](../acceptance/wasm-float-target/artifacts/c89-float-successor-design-v1-contract.json),
 verified by
 [`verify-c89-float-successor-design.py`](../scripts/verify-c89-float-successor-design.py).
-It opens S2 implementation and test execution only. Admission, durable
-publication, release, and production remain false until their later gates.
+The S2 result is frozen separately by
+[`c89-float-successor-implementation-v1-contract.json`](../acceptance/wasm-float-target/artifacts/c89-float-successor-implementation-v1-contract.json).
+Admission is limited to the sealed authority-free Float activation type;
+durable publication, release, and production remain false until later gates.
 Code 5 remains permanently `ValidationOnly`, inert, non-migratable, and
 ineligible for execution under code 6. Historical F1--F5 evidence cannot be
 relabelled as C8.9 evidence.

@@ -37,10 +37,16 @@ RUSTC_APFLOAT_GIT = "eeaacad81247af65d4043cb3e32d023a652d7951"
 LLVM_BASELINE = "462a31f5a5abb905869ea93cc49b096079b11aa4"
 CANDIDATE_PACKAGE = "vibeos-wasm-float-candidate"
 CANDIDATE_MANIFEST = PurePosixPath("wasm-float-candidate/Cargo.toml")
-CANDIDATE_FEATURE_REFS = frozenset(
+CANDIDATE_ACCEPTANCE_FEATURE_REFS = frozenset(
     {
         "dep:vibeos-wasm-float-candidate",
         "vibeos-wasm-float-candidate/c88-f2-acceptance",
+    }
+)
+CANDIDATE_C89_FEATURE_REFS = frozenset(
+    {
+        "dep:vibeos-wasm-float-candidate",
+        "vibeos-wasm-float-candidate/c89-executable",
     }
 )
 MAX_LOCAL_MANIFESTS = 256
@@ -129,7 +135,7 @@ ALLOWED_VENDOR_PATH_EDGES = {
 ALLOWED_CANDIDATE_CONSUMERS = {
     PurePosixPath("component-runtime/Cargo.toml"): {
         "path": "../wasm-float-candidate",
-        "features": frozenset({"c88-f4-acceptance"}),
+        "features": frozenset({"c88-f4-acceptance", "c89-float-executable"}),
     },
     PurePosixPath("acceptance/wasm-float-target/Cargo.toml"): {
         "path": "../../wasm-float-candidate",
@@ -149,10 +155,18 @@ EXPECTED_FLOAT_FEATURE_ROUTES = {
             "dep:vibeos-wasm-float-candidate",
             "vibeos-wasm-float-candidate/c88-f2-acceptance",
         ),
+        "c89-float-executable": (
+            "c88-f3-acceptance",
+            "dep:vibeos-wasm-float-candidate",
+            "vibeos-wasm-float-candidate/c89-executable",
+        ),
     },
     PurePosixPath("services/component-admission/Cargo.toml"): {
         "c88-f4-acceptance": (
             "vibeos-component-runtime/c88-f4-acceptance",
+        ),
+        "c89-float-executable": (
+            "vibeos-component-runtime/c89-float-executable",
         ),
     },
     PurePosixPath("services/component-image-adapter/Cargo.toml"): {
@@ -2224,9 +2238,14 @@ def verify_isolation_and_inertness(view: View, errors: list[str]) -> None:
             )
             references = candidate_feature_references(values)
             if feature in allowed_features:
+                expected_references = (
+                    CANDIDATE_C89_FEATURE_REFS
+                    if feature == "c89-float-executable"
+                    else CANDIDATE_ACCEPTANCE_FEATURE_REFS
+                )
                 require(
                     errors,
-                    references == CANDIDATE_FEATURE_REFS,
+                    references == expected_references,
                     f"candidate feature edge drift: {rel}:{feature}",
                 )
             else:
@@ -2249,8 +2268,9 @@ def verify_isolation_and_inertness(view: View, errors: list[str]) -> None:
     require(errors, candidate.get("package", {}).get("name") == CANDIDATE_PACKAGE, "acceptance candidate identity drift")
     require(errors, candidate.get("package", {}).get("publish") is False, "acceptance candidate must stay publish=false")
     require(errors, candidate.get("features", {}).get("default") == [], "acceptance candidate must be inert by default")
-    require(errors, set(candidate.get("features", {})) == {"default", "c88-f2-acceptance"}, "acceptance candidate feature surface drift")
+    require(errors, set(candidate.get("features", {})) == {"default", "c88-f2-acceptance", "c89-executable"}, "candidate feature surface drift")
     require(errors, candidate.get("features", {}).get("c88-f2-acceptance") == ["dep:vibeos-wasm-runtime", "dep:wasmi-softfloat"], "acceptance feature gate drift")
+    require(errors, candidate.get("features", {}).get("c89-executable") == ["dep:vibeos-wasm-runtime", "dep:wasmi-softfloat", "vibeos-wasm-runtime/c89-float-executable"], "C8.9 executable feature gate drift")
     candidate_dep = candidate.get("dependencies", {}).get("wasmi-softfloat", {})
     require(errors, candidate_dep.get("package") == "vibeos-wasmi-softfloat", "candidate fork package identity drift")
     require(errors, candidate_dep.get("path") == "../vendor/wasmi-softfloat/crates/wasmi", "candidate fork path drift")
@@ -2290,12 +2310,16 @@ def verify_isolation_and_inertness(view: View, errors: list[str]) -> None:
 
     candidate_source = view.text("wasm-float-candidate/src/lib.rs")
     require(errors, "#![no_std]" in candidate_source, "acceptance candidate lost no_std")
-    require(errors, '#[cfg(feature = "c88-f2-acceptance")]' in candidate_source, "candidate runtime lost acceptance feature gate")
+    require(errors, 'feature = "c88-f2-acceptance"' in candidate_source, "candidate runtime lost acceptance feature gate")
+    require(errors, 'feature = "c89-executable"' in candidate_source, "candidate runtime lost C8.9 feature gate")
     require(errors, 'upstream_revision: "8273dfb09d493971b7bb12fe614d740cdc857175",' in candidate_source, "candidate Wasmi revision identity drift")
     require(errors, f'patched_manifest_sha256: "{EXPECTED_PATCHED_MANIFEST_SHA256}",' in candidate_source, "candidate patched-tree identity drift")
     require(errors, f'patch_delta_sha256: "{EXPECTED_PATCH_DELTA_SHA256}",' in candidate_source, "candidate patch-delta identity drift")
     require(errors, 'backend_archive_sha256: "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad",' in candidate_source, "candidate backend archive identity drift")
-    require(errors, "production_ready: false," in candidate_source, "acceptance candidate became production-ready")
+    candidate_identity = re.search(r"pub const CANDIDATE_IDENTITY:.*?\n\};", candidate_source, re.DOTALL)
+    executable_identity = re.search(r"pub const EXECUTABLE_IDENTITY:.*?\n\};", candidate_source, re.DOTALL)
+    require(errors, candidate_identity is not None and "production_ready: false," in candidate_identity.group(0), "acceptance candidate became production-ready")
+    require(errors, executable_identity is not None and 'acceptance_feature: "c89-executable"' in executable_identity.group(0) and "production_ready: true," in executable_identity.group(0), "C8.9 executable identity drift")
 
 
 def verify(view: View) -> None:

@@ -32,9 +32,9 @@ CONTRACT_PATH = (
     "fixed-qemu-target-release-policy-v1-contract.json"
 )
 
-EXPECTED_CONTRACT_BYTES = 20_410
+EXPECTED_CONTRACT_BYTES = 20_642
 EXPECTED_CONTRACT_SHA256 = (
-    "0d79fcc2e96c2a9f74df5de3c8f361792ad81fa2c65396eb48d9392ad7f562a2"
+    "8e378ff8bb731bb97a25bb48a907fc08b37bf94ecaddf82ce25ed5293c3c3aa7"
 )
 MAX_CONTRACT_BYTES = 64 * 1024
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
@@ -71,11 +71,16 @@ EXPECTED_APPLICATION_STATUS = {
         "c89-float-successor-design-v1-contract.json"
     ),
     "allocation_contract_schema": "vibeos.c89.float-successor-design-v1.contract",
-    "current_roadmap_position": "c89-s1-design-frozen-pre-implementation",
+    "current_roadmap_position": "c89-s2-implemented-pre-fixed-qemu-qualification",
     "design_node": "C8.9-S1",
     "design_node_complete": True,
     "implementation_node": "C8.9-S2",
-    "implementation_node_complete": False,
+    "implementation_contract_path": (
+        "acceptance/wasm-float-target/artifacts/"
+        "c89-float-successor-implementation-v1-contract.json"
+    ),
+    "implementation_contract_schema": "vibeos.c89.float-successor-implementation-v1.contract",
+    "implementation_node_complete": True,
     "policy_checkpoint_remains_nonallocating": True,
     "qualification_node": "C8.9-S3",
     "qualification_node_complete": False,
@@ -271,32 +276,32 @@ VERIFICATION_COMMANDS = [
 
 EXPECTED_REPOSITORY_FILES = {
     ".github/workflows/ci.yml": {
-        "bytes": 24_524,
-        "sha256": "68d71c57c5c230ff7159d573a77dd0799172ef32800d5d0b7c4bca9335c24720",
+        "bytes": 25_314,
+        "sha256": "0323cc019d428a03adb467820e8b5646b0aab69e5c1db8e8619d948b8c1e3b95",
     },
     "TESTING.md": {
-        "bytes": 127_880,
-        "sha256": "a3e3fa5349abf347ab3eb1ac23a6938564545e15eeb50c2db7803bfb773d9e8d",
+        "bytes": 128_981,
+        "sha256": "0ba5030d47d3dd1edeca4f76769f2298dac34fccb9e04c56c6247c01d75a1372",
     },
     "benchmarks/wasm-aot-decision/README.md": {
-        "bytes": 16_362,
-        "sha256": "ced8cb9019bdb976b2eef734c74e0273acbc614fa43313aa1187d7027d8c7f9d",
+        "bytes": 16_378,
+        "sha256": "ed2748b5ca5bb2bd6b445c773a6682d90b3983cd8738374bb04b4401339cc991",
     },
     "benchmarks/wasm-runtime/README.md": {
         "bytes": 1_200,
         "sha256": "5e1e1bd8c21dc2f1badecc2f29dc52209cfa4682744c0677abdba604df1dd5b1",
     },
     "docs/WASM_AOT_DECISION.md": {
-        "bytes": 83_972,
-        "sha256": "8048ab8022e167d9ec7332a486ff051827df93408c569c877cf21eb4820d52e6",
+        "bytes": 84_021,
+        "sha256": "7a07dd3d7c1251684cbf5fa49b05a067947fef80197aeea559c629819f1e4900",
     },
     "docs/WASM_FLOAT_PROFILE.md": {
-        "bytes": 35_282,
-        "sha256": "47d04e75e5a92fe9e0703cea3f1192c57e0e0ae70c17dd95c74942f182f59a84",
+        "bytes": 35_711,
+        "sha256": "8e5f2bc049ac53434cd6f950a574c62271b623b2844c8da9e0f6dbd3e70b0bd6",
     },
     "docs/WASM_ROADMAP.md": {
-        "bytes": 95_655,
-        "sha256": "cff64fdc658591fa000ca64230d625d587351aa915fde0bd6fe65c667241d273",
+        "bytes": 96_108,
+        "sha256": "8c73f1495330c6af10e0c91fa78cfb1f9ed529958e84866a3fa5eaa6ac03e226",
     },
     "docs/WASM_RUNTIME_COSTS.md": {
         "bytes": 12_908,
@@ -410,7 +415,7 @@ CHECK_OUTPUT = (
     "contract_is_target_evidence=false\n"
     "current_target_release_gate_satisfied=false\n"
     "policy_checkpoint_successor_state=unallocated\n"
-    "current_roadmap_position=c89-s1-design-frozen-pre-implementation\n"
+    "current_roadmap_position=c89-s2-implemented-pre-fixed-qemu-qualification\n"
     "physical_inputs_required=0\n"
     "physical_inputs_permitted=0\n"
     "duo_gate_effect=false\n"
@@ -1295,7 +1300,7 @@ C84_HISTORICAL_NEXT_MARKER = (
     "`C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position."
 )
 CURRENT_POSITION_MARKER = (
-    "The current roadmap position is `c89-s1-design-frozen-pre-implementation`."
+    "The current roadmap position is `c89-s2-implemented-pre-fixed-qemu-qualification`."
 )
 FLOAT_NON_PROMOTION_MARKER = (
     "The C8.8-F5 replacement remains scoped to F5 only; the independent "
@@ -1990,8 +1995,8 @@ def run_contract_selftests(contract: dict[str, Any]) -> int:
         ),
         (
             ("application_status", "implementation_node_complete"),
-            True,
-            "c89-implementation-falsely-complete",
+            False,
+            "c89-implementation-regressed-incomplete",
             "application_status.implementation_node_complete differs",
         ),
         (

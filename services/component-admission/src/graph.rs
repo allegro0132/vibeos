@@ -785,9 +785,9 @@ fn hash_optional_value(hasher: &mut Sha256, value: Option<&ValueShape>) {
 fn hash_value(hasher: &mut Sha256, value: &ValueShape) {
     use ValueShape::*;
     match value {
-        #[cfg(feature = "c88-f4-acceptance")]
+        #[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
         F32 => hasher.update([23]),
-        #[cfg(feature = "c88-f4-acceptance")]
+        #[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
         F64 => hasher.update([24]),
         Bool => hasher.update([0]),
         U8 => hasher.update([1]),
@@ -1127,7 +1127,7 @@ fn contains_resource_function(function: &FunctionShape) -> bool {
 
 fn contains_resource_value(value: &ValueShape) -> bool {
     match value {
-        #[cfg(feature = "c88-f4-acceptance")]
+        #[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
         ValueShape::F32 | ValueShape::F64 => true,
         ValueShape::Own(_) | ValueShape::Borrow(_) => true,
         ValueShape::List(value) | ValueShape::Option(value) => contains_resource_value(value),
@@ -1214,7 +1214,7 @@ fn collect_value_async_evidence(
 ) -> Option<()> {
     use ValueShape::*;
     match value {
-        #[cfg(feature = "c88-f4-acceptance")]
+        #[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
         F32 | F64 => return None,
         List(value) | Option(value) => collect_value_async_evidence(value, evidence)?,
         Tuple(values) => {
@@ -1338,7 +1338,7 @@ fn collect_value_resource_modes(
     use ValueShape::*;
     let mut modes = ResourceModeSet::default();
     match value {
-        #[cfg(feature = "c88-f4-acceptance")]
+        #[cfg(any(feature = "c88-f4-acceptance", feature = "c89-float-executable"))]
         F32 | F64 => return None,
         Own(resource) => {
             if !declared_resource(resources, resource) {

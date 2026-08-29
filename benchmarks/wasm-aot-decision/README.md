@@ -193,7 +193,7 @@ result completes C8.4 for the selected workload with outcome
 `aot-not-justified-on-fixed-qemu`; C8.5 through C8.7 are skipped for that
 workload and remain globally deferred. The stored next-node value remains
 `C8.8-skip-or-defer-C8.5-C8.7`; the live roadmap position is
-`c89-s1-design-frozen-pre-implementation`, which does not rewrite this
+`c89-s2-implemented-pre-fixed-qemu-qualification`, which does not rewrite this
 historical decision.
 Milk-V Duo physical testing is paused and the retained physical toolchain
 remains available for future qualification. Its runtime evidence is software
@@ -202,7 +202,7 @@ it is not a TPM, remote-attestation, hardware, or physical-cold-boot proof.
 
 The immutable historical C8.4 `next_node` value is
 `C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position.
-The current roadmap position is `c89-s1-design-frozen-pre-implementation`.
+The current roadmap position is `c89-s2-implemented-pre-fixed-qemu-qualification`.
 C8.9-S1 allocates the independent Float successor design; implementation and
 qualification remain incomplete.
 

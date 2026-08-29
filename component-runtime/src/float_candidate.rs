@@ -18,6 +18,8 @@ use crate::{
 };
 use alloc::vec::Vec;
 use vibeos_component_format::{ProfileIdentity, ProfileStage, TrapCode, PROFILE_1_LIMITS};
+#[cfg(feature = "c89-float-executable")]
+use vibeos_wasm_float_candidate::EXECUTABLE_IDENTITY;
 use vibeos_wasm_float_candidate::{
     CandidateCallMetrics, CandidateInstance, CandidateModule, CandidatePoll, CandidateValue,
     CANDIDATE_IDENTITY,
@@ -176,6 +178,87 @@ impl FloatCandidateComponent {
     /// Explicitly activates this default-off candidate. The move consumes the
     /// compiled value, preventing a single policy decision from minting two
     /// live instances.
+    pub fn activate(self) -> Result<FloatCandidateLifecycle, FloatCandidateError> {
+        let instance = self
+            .module
+            .instantiate_with_memory_limit(self.limits.memory_bytes)
+            .map_err(FloatCandidateError::Instantiation)?;
+        let codec_memory = VecMemory::new(0, 8).map_err(|_| FloatCandidateError::InvalidLimits)?;
+        Ok(FloatCandidateLifecycle {
+            module: self.module,
+            binding: self.binding,
+            instance: Some(instance),
+            codec_memory,
+            limits: self.limits,
+            state: FloatCandidateState::Idle,
+            metrics: FloatCandidateLifecycleMetrics {
+                activations: 1,
+                peak_live_instances: 1,
+                ..FloatCandidateLifecycleMetrics::default()
+            },
+            last_call_metrics: None,
+        })
+    }
+}
+
+/// Compiled code-6 successor. It is disjoint from the code-5 candidate
+/// constructor and requires a plan carrying the current executable identity.
+#[cfg(feature = "c89-float-executable")]
+pub struct FloatExecutableComponent {
+    module: CandidateModule,
+    binding: crate::decode::FloatCandidateExecutionBinding,
+    limits: FloatCandidateLimits,
+}
+
+#[cfg(feature = "c89-float-executable")]
+impl FloatExecutableComponent {
+    pub fn required_compile_reservation(
+        plan: &ComponentPlan<'_>,
+    ) -> Result<usize, FloatCandidateError> {
+        if !float_executable_plan_matches(plan) {
+            return Err(FloatCandidateError::InvalidPlan);
+        }
+        let binding = plan
+            .float_candidate_execution_binding()
+            .ok_or(FloatCandidateError::InvalidPlan)?;
+        profile_2_candidate_required_compile_bytes(plan.embedded_modules()[binding.module()])
+            .map_err(FloatCandidateError::CoreAdmission)
+    }
+
+    pub fn compile(
+        plan: &ComponentPlan<'_>,
+        limits: FloatCandidateLimits,
+    ) -> Result<Self, FloatCandidateError> {
+        limits.validate()?;
+        if !float_executable_plan_matches(plan)
+            || !EXECUTABLE_IDENTITY.production_ready
+            || EXECUTABLE_IDENTITY.acceptance_feature != "c89-executable"
+        {
+            return Err(FloatCandidateError::InvalidPlan);
+        }
+        let required = Self::required_compile_reservation(plan)?;
+        if limits.compile_reservation_bytes > required {
+            return Err(FloatCandidateError::InvalidLimits);
+        }
+        let binding = plan
+            .float_candidate_execution_binding()
+            .ok_or(FloatCandidateError::InvalidPlan)?;
+        let module = CandidateModule::compile_executable(
+            plan.embedded_modules()[binding.module()],
+            OwnerAllocationReservation::new(limits.compile_reservation_bytes),
+        )
+        .map_err(FloatCandidateError::CoreAdmission)?;
+        Ok(Self {
+            module,
+            binding,
+            limits,
+        })
+    }
+
+    pub const fn limits(&self) -> FloatCandidateLimits {
+        self.limits
+    }
+
     pub fn activate(self) -> Result<FloatCandidateLifecycle, FloatCandidateError> {
         let instance = self
             .module
@@ -499,6 +582,50 @@ fn float_candidate_plan_matches(plan: &ComponentPlan<'_>) -> bool {
         return false;
     };
     function.effect == FunctionEffect::Sync
+        && function.parameters.len() == 3
+        && function.parameters[0].name == "mode"
+        && function.parameters[0].value == ValueShape::U32
+        && function.parameters[1].name == "left"
+        && function.parameters[1].value == ValueShape::F32
+        && function.parameters[2].name == "right"
+        && function.parameters[2].value == ValueShape::F64
+        && function.result == Some(ValueShape::F64)
+}
+
+#[cfg(feature = "c89-float-executable")]
+fn float_executable_plan_matches(plan: &ComponentPlan<'_>) -> bool {
+    let summary = plan.summary();
+    if plan.profile() != ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE
+        || plan.profile().stage != ProfileStage::Executable
+        || !plan.profile().execution_enabled()
+        || !plan.runtime_ready()
+        || plan.native_async_runtime_ready()
+        || !summary.async_abi.is_empty()
+        || summary.embedded_modules != 1
+        || summary.core_instances != 1
+        || summary.component_instances != 0
+        || summary.definitions != 1
+        || summary.aliases != 1
+        || summary.canonical_functions != 1
+        || summary.adapters != 0
+        || summary.resources != 0
+        || summary.imports != 0
+        || summary.exports != 1
+        || plan.embedded_modules().len() != 1
+        || !plan.imports().is_empty()
+        || plan.exports().len() != 1
+        || plan.host_imports().next().is_some()
+        || plan.executable_exports().next().is_some()
+        || !plan.has_exact_float_candidate_execution_binding()
+    {
+        return false;
+    }
+    let export = &plan.exports()[0];
+    let EntityShape::Function(function) = &export.entity else {
+        return false;
+    };
+    export.name == FLOAT_CANDIDATE_CORE_EXPORT
+        && function.effect == FunctionEffect::Sync
         && function.parameters.len() == 3
         && function.parameters[0].name == "mode"
         && function.parameters[0].value == ValueShape::U32

@@ -11,6 +11,7 @@ use vibeos_component_format::{
     COMPONENT_ARTIFACT_HEADER_LEN, COMPONENT_ARTIFACT_MANIFEST_VERSION,
     COMPONENT_ARTIFACT_OBJECT_KIND_RAW, COMPONENT_ARTIFACT_SIGNER_POLICY_VERSION,
     MAX_COMPONENT_ARTIFACT_ENCODED_BYTES, PROFILE_1_LIMITS, PROFILE_2_SYNC_FLOAT_PROFILE_CODE,
+    PROFILE_3_SYNC_FLOAT_EXECUTABLE_PROFILE_CODE,
 };
 
 const COMPONENT_BYTES: &[u8] = b"\0asm\r\0\x01\0secret-component-body-c71";
@@ -629,6 +630,28 @@ fn c81_preview1_wrapped_profile_code_roundtrips_and_adjacent_identities_fail_clo
             "accepted adjacent profile: {adjacent:?}"
         );
     }
+}
+
+#[test]
+fn c89_code6_roundtrips_without_reinterpreting_code5() {
+    let artifact = artifact(ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE);
+    let encoded = artifact.encode().unwrap();
+    assert_eq!(
+        u16::from_le_bytes(
+            encoded[PROFILE_CODE_OFFSET..PROFILE_CODE_OFFSET + 2]
+                .try_into()
+                .unwrap()
+        ),
+        PROFILE_3_SYNC_FLOAT_EXECUTABLE_PROFILE_CODE
+    );
+    let decoded = ComponentArtifactV1::decode(&encoded).unwrap();
+    assert_eq!(
+        decoded.profile(),
+        ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE
+    );
+    assert!(decoded.profile().execution_enabled());
+    assert_eq!(PROFILE_2_SYNC_FLOAT_PROFILE_CODE, 5);
+    assert!(!ProfileIdentity::PROFILE_2_SYNC_FLOAT.execution_enabled());
 }
 
 #[test]

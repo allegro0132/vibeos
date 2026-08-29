@@ -13,6 +13,7 @@ use vibeos_component_format::{
     MAX_COMPONENT_ARTIFACT_ENCODED_BYTES, PROFILE_1_LIMITS, PROFILE_2_SYNC_FLOAT_PROFILE_CODE,
     PROFILE_3_SYNC_FLOAT_EXECUTABLE_PROFILE_CODE, PROFILE_4_SYNC_SIMD_VALIDATION_PROFILE_CODE,
     PROFILE_5_SYNC_SIMD_EXECUTABLE_PROFILE_CODE,
+    PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_PROFILE_CODE,
 };
 
 const COMPONENT_BYTES: &[u8] = b"\0asm\r\0\x01\0secret-component-body-c71";
@@ -703,6 +704,29 @@ fn c811_code8_roundtrips_without_reinterpreting_code7() {
         ProfileStage::ValidationOnly
     );
     assert!(!ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION.execution_enabled());
+}
+
+#[test]
+fn c812_code9_roundtrips_but_remains_validation_only() {
+    let artifact = artifact(ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION);
+    let encoded = artifact.encode().unwrap();
+    assert_eq!(
+        read_u16(&encoded, PROFILE_CODE_OFFSET),
+        PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_PROFILE_CODE
+    );
+    assert_eq!(read_u16(&encoded, PROFILE_STAGE_OFFSET), 2);
+    assert_eq!(read_u16(&encoded, ARTIFACT_ABI_OFFSET), 9);
+    assert_eq!(read_u16(&encoded, COMPONENT_PROFILE_OFFSET), 6);
+    assert_eq!(read_u16(&encoded, CORE_PROFILE_OFFSET), 6);
+    assert_eq!(read_u16(&encoded, RUNTIME_ABI_OFFSET), 9);
+    let decoded = ComponentArtifactV1::decode(&encoded).unwrap();
+    assert_eq!(
+        decoded.profile(),
+        ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION
+    );
+    assert_eq!(decoded.profile().stage, ProfileStage::ValidationOnly);
+    assert!(!decoded.profile().execution_enabled());
+    assert!(!ProfileIdentity::PROFILE_2_SYNC_FLOAT.execution_enabled());
 }
 
 #[test]

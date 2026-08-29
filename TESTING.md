@@ -780,8 +780,8 @@ The previous roadmap position was
 `c811-s1-simd-executable-design-frozen-pre-implementation`. The implementation
 position was `c811-s2-simd-executable-implemented-pre-fixed-qemu`, and C8.11
 closed at `c811-s3-qualified-sealed-simd-runtime-released`. The current roadmap
-position is `c812-r1-reference-types-validation-design-frozen-pre-implementation`;
-C8.10-S1 through C8.10-S5, C8.11-S1 through C8.11-S3, and C8.12-R1 are complete.
+position is `c812-r2-reference-types-validation-implemented-pre-fixed-qemu`;
+C8.10-S1 through C8.10-S5, C8.11-S1 through C8.11-S3, and C8.12-R1/R2 are complete.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -1128,6 +1128,37 @@ python3 -O -B scripts/verify-c812-reference-types-design.py --check-contract
 python3 -B scripts/verify-c812-reference-types-design.py --selftest
 python3 -O -B scripts/verify-c812-reference-types-design.py --selftest
 ```
+
+## C8.12-R2 Reference Types implementation
+
+R2 materializes the independently named validation facade, code-9 artifact
+codec and exact non-current engine contract. The candidate runs an exact
+wasmparser syntax/feature pass followed by Wasmi translation, allows only
+Core-internal nullable `funcref`, one table and active elements, and rejects
+imports, `externref`, typed references, GC semantics, reference-valued exports,
+bulk memory and every adjacent proposal. The Component containment test keeps
+references out of Component/Canonical/WIT values; ordinary and durable loaders
+continue to reject code 9.
+
+```sh
+python3 -B scripts/verify-c812-reference-types-implementation.py --check-contract
+python3 -O -B scripts/verify-c812-reference-types-implementation.py --check-contract
+python3 -B scripts/verify-c812-reference-types-implementation.py --selftest
+python3 -O -B scripts/verify-c812-reference-types-implementation.py --selftest
+python3 -B scripts/verify-c812-r2-supply-chain.py
+python3 -O -B scripts/verify-c812-r2-supply-chain.py --self-test
+python3 -B scripts/verify-c812-r2-riscv-object.py
+cargo test --locked --offline -p vibeos-component-format
+cargo test --locked --offline -p vibeos-wasm-reference-candidate --features c812-r2-acceptance
+cargo test --locked --offline -p vibeos-component-runtime --features c812-r2-reference-validation --test c812_r2_reference_containment
+cargo test --locked --offline -p vibeos-component-loader profile_instance_limits_and_exact_wit_are_revalidated
+```
+
+The RISC-V audit covers seven closure rlibs and proves F/D/V opcodes, semantic
+native-float helpers and `libm` reachability absent. These checks run no QEMU or
+physical hardware. R3 remains the separate fresh fixed-QEMU qualification
+node; success here grants no current engine, admission, execution, durable,
+migration, successor-review, production, or release authority.
 
 ## C8.10-S5 fixed-QEMU qualification
 

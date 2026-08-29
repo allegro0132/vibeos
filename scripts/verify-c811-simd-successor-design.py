@@ -26,7 +26,7 @@ CONTRACT_SHA256 = "5995b8513f182d891c30d95530d31f6b571c14b0649c39c438f99990f5813
 BASIS_COMMIT = "2038c3134fe94d1ca297764c9fd8ee7d39a24123"
 BASIS_TREE = "4332275a81379b68e6daddaab7599a942054e9e1"
 POSITION = "c811-s1-simd-executable-design-frozen-pre-implementation"
-LIVE_POSITION = "c812-r1-reference-types-validation-design-frozen-pre-implementation"
+LIVE_POSITION = "c812-r2-reference-types-validation-implemented-pre-fixed-qemu"
 CHECK_COMMANDS = (
     "python3 -B scripts/verify-c811-simd-successor-design.py --check-contract",
     "python3 -O -B scripts/verify-c811-simd-successor-design.py --check-contract",

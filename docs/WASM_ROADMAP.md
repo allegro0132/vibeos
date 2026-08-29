@@ -41,8 +41,11 @@ position is `c811-s3-qualified-sealed-simd-runtime-released`. The next listed
 widening, Reference Types, is now allocated as C8.12. C8.12-R1 freezes fresh
 validation-only code/ABIs 9, Component/Core profile 6, exact revisions, the
 bounded nullable-`funcref` semantics, a separately named engine, non-promotion
-rules, and the fixed-QEMU policy. The current position is
-`c812-r1-reference-types-validation-design-frozen-pre-implementation`.
+rules, and the fixed-QEMU policy. C8.12-R2 now implements the code-9 codec,
+separately named candidate facade, exact dual validation, bounded Core syntax,
+Component containment, fixed mutation corpus, durable rejection, supply-chain
+closure, and RISC-V object audit. The current position is
+`c812-r2-reference-types-validation-implemented-pre-fixed-qemu`.
 Every feature widening after Reference Types remains separately unallocated and
 incomplete.
 The earlier non-numbered fixed-QEMU
@@ -92,7 +95,7 @@ design/implementation/qualification sequence; it does not rewrite that charter.
 
 **C8.11 status (2026-08-30): C8.11-S1 through C8.11-S3 complete.**
 
-**C8.12 status (2026-08-30): C8.12-R1 complete; R2 and R3 remain incomplete.**
+**C8.12 status (2026-08-30): C8.12-R1 and R2 complete; R3 remains incomplete.**
 
 ---
 
@@ -1392,9 +1395,11 @@ semantic authority. All other adjacent proposals remain disabled.
 | C8.12-R2 | Implement validation and containment | Code-9 codec, isolated candidate engine, syntax inspection, positive/negative/differential corpora, admission/durable rejection, supply-chain closure, and RISC-V audit pass |
 | C8.12-R3 | Qualify validation widening | Fresh source-bound normal and optimized fixed-QEMU evidence passes before only an independently numbered executable-successor design review becomes eligible |
 
-The current position is
-`c812-r1-reference-types-validation-design-frozen-pre-implementation` and the
-next node is C8.12-R2. Historical C8.11 receipts cannot satisfy C8.12. Fixed
+The R1 position was
+`c812-r1-reference-types-validation-design-frozen-pre-implementation`. The
+current position is
+`c812-r2-reference-types-validation-implemented-pre-fixed-qemu` and the next
+node is C8.12-R3. Historical C8.11 receipts cannot satisfy C8.12. Fixed
 QEMU is emulator-scoped and makes no physical-equivalence claim; Milk-V Duo
 remains paused and supplies zero inputs. Code 5 remains permanently inert,
 code 7 remains validation-only, and code 8's released scope is unchanged. See

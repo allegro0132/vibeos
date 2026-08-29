@@ -46,6 +46,10 @@ pub const C811_SIMD_ENGINE_UPSTREAM_REVISION: &str = C89_SOFTFLOAT_ENGINE_UPSTRE
 pub const C811_SIMD_ENGINE_PATCH_DELTA_SHA256: &str =
     "99c4953c437aff9c4e40710cb373c54bf419aac1029d93bf9596c82c21be4615";
 pub const C811_SIMD_ENGINE_SOURCE_TREE: &str = "123bb351a40ff7e923523355eb08049a9d6db39b";
+pub const C812_REFERENCE_ENGINE_PACKAGE: &str = "vibeos-wasmi-reference-validation";
+pub const C812_REFERENCE_ENGINE_VERSION: &str = "1.1.0-vibeos-ref1.1";
+pub const C812_REFERENCE_ENGINE_FEATURES: &str =
+    "default-features=false;extra-checks,prefer-btree-collections;simd=false";
 
 /// Cargo resolves the two direct wasmparser 0.255 users to one package
 /// instance. Consequently both the Component and Core validator roles are
@@ -145,6 +149,7 @@ pub enum WasmParserFeatureSelection {
     ComponentModel,
     ComponentModelAsync,
     FixedSimd,
+    ReferenceTypes,
 }
 
 /// Explicit Component validation mode. It is selected by each closed engine
@@ -202,6 +207,7 @@ pub enum CoreNumericProfile {
     Profile1IntegerOnly,
     Profile2ScalarF32F64,
     Profile4FixedSimd,
+    Profile6IntegerReferences,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -241,6 +247,14 @@ impl CoreValidatorConfiguration {
         nan_policy: Some(PROFILE_2_SYNC_FLOAT_NAN_POLICY),
     };
 
+    const PROFILE_6_SYNC_REFERENCE_TYPES: Self = Self {
+        structural: WasmParserFeatureSelection::All,
+        strict: WasmParserFeatureSelection::ReferenceTypes,
+        diagnostic: WasmParserFeatureSelection::All,
+        numeric_profile: CoreNumericProfile::Profile6IntegerReferences,
+        nan_policy: None,
+    };
+
     pub const fn structural_features(self) -> WasmParserFeatureSelection {
         self.structural
     }
@@ -259,7 +273,8 @@ impl CoreValidatorConfiguration {
 
     pub const fn scalar_float_types(self) -> &'static [ScalarFloatType] {
         match self.numeric_profile {
-            CoreNumericProfile::Profile1IntegerOnly => &[],
+            CoreNumericProfile::Profile1IntegerOnly
+            | CoreNumericProfile::Profile6IntegerReferences => &[],
             CoreNumericProfile::Profile2ScalarF32F64 | CoreNumericProfile::Profile4FixedSimd => {
                 &PROFILE_2_SYNC_FLOAT_SCALAR_TYPES
             }
@@ -359,6 +374,11 @@ impl WasmiRuntimeConfiguration {
         floats: true,
         simd_compiled: true,
         relaxed_simd_compiled: false,
+        ..Self::PROFILE_1
+    };
+
+    const PROFILE_6_SYNC_REFERENCE_TYPES: Self = Self {
+        reference_types: true,
         ..Self::PROFILE_1
     };
 
@@ -777,6 +797,65 @@ pub const fn profile_4_sync_simd_validation_contract() -> &'static Profile4SyncS
     &PROFILE_4_SYNC_SIMD_VALIDATION_CONTRACT
 }
 
+/// Sealed C8.12-R2 Reference Types validation candidate. Parser support for GC
+/// heap types is an implementation dependency only; the candidate inspection
+/// layer admits nullable `funcref` and rejects GC semantics and `externref`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Profile6SyncReferenceTypesValidationContract {
+    profile: ProfileIdentity,
+    component_validator: ComponentValidatorConfiguration,
+    core_validator: CoreValidatorConfiguration,
+    target_wasmi_configuration: WasmiRuntimeConfiguration,
+    package: &'static str,
+    version: &'static str,
+    features: &'static str,
+    runtime_ready: bool,
+}
+
+impl Profile6SyncReferenceTypesValidationContract {
+    pub const fn profile(self) -> ProfileIdentity {
+        self.profile
+    }
+    pub const fn component_validator(self) -> ComponentValidatorConfiguration {
+        self.component_validator
+    }
+    pub const fn core_validator(self) -> CoreValidatorConfiguration {
+        self.core_validator
+    }
+    pub const fn target_wasmi_configuration(self) -> WasmiRuntimeConfiguration {
+        self.target_wasmi_configuration
+    }
+    pub const fn package(self) -> &'static str {
+        self.package
+    }
+    pub const fn version(self) -> &'static str {
+        self.version
+    }
+    pub const fn features(self) -> &'static str {
+        self.features
+    }
+    pub const fn runtime_ready(self) -> bool {
+        self.runtime_ready
+    }
+}
+
+const PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_CONTRACT:
+    Profile6SyncReferenceTypesValidationContract = Profile6SyncReferenceTypesValidationContract {
+    profile: ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION,
+    component_validator: ComponentValidatorConfiguration::for_mode(ComponentValidationMode::Sync),
+    core_validator: CoreValidatorConfiguration::PROFILE_6_SYNC_REFERENCE_TYPES,
+    target_wasmi_configuration: WasmiRuntimeConfiguration::PROFILE_6_SYNC_REFERENCE_TYPES,
+    package: C812_REFERENCE_ENGINE_PACKAGE,
+    version: C812_REFERENCE_ENGINE_VERSION,
+    features: C812_REFERENCE_ENGINE_FEATURES,
+    runtime_ready: false,
+};
+
+pub const fn profile_6_sync_reference_types_validation_contract(
+) -> &'static Profile6SyncReferenceTypesValidationContract {
+    &PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION_CONTRACT
+}
+
 /// Resolve only a byte-for-byte supported profile to the engine identity that
 /// is compiled into this boot. An artifact-provided adjacent profile returns
 /// `None`; there is no fallback or caller-supplied engine descriptor.
@@ -788,6 +867,8 @@ pub fn current_validation_engine_identity(
     if profile == ProfileIdentity::PROFILE_2_SYNC_FLOAT {
         None
     } else if profile == ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION {
+        None
+    } else if profile == ProfileIdentity::PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION {
         None
     } else if profile == ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE {
         Some(&PROFILE_5_SYNC_SIMD_EXECUTABLE_ENGINE)

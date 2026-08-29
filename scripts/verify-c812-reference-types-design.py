@@ -22,6 +22,7 @@ CONTRACT_SHA256 = "ed8fdbe4964b7a42967258dabb5871c360899d1006666a7f9ab54c6b5f33d
 BASIS_COMMIT = "4402f76fa2adb690ee591f81bbca0f3588dd089e"
 BASIS_TREE = "d7049e03b9c6a212b2a86377b42c752e9da5977d"
 POSITION = "c812-r1-reference-types-validation-design-frozen-pre-implementation"
+LIVE_POSITION = "c812-r2-reference-types-validation-implemented-pre-fixed-qemu"
 COMMANDS = (
     "python3 -B scripts/verify-c812-reference-types-design.py --check-contract",
     "python3 -O -B scripts/verify-c812-reference-types-design.py --check-contract",
@@ -200,12 +201,6 @@ def verify_repository(value: dict[str, Any]) -> None:
     for path in git("ls-tree", "-r", "--name-only", BASIS_COMMIT).decode().splitlines():
         if path.endswith(".rs") and path.startswith(roots):
             require(b"PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION" not in git("show", f"{BASIS_COMMIT}:{path}"), f"code 9 existed at basis: {path}")
-    for root in roots:
-        directory = ROOT / root
-        if directory.exists():
-            for path in directory.rglob("*.rs"):
-                require(b"PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION" not in read_regular(path), f"R1 materialized code 9: {path.relative_to(ROOT)}")
-
     engine_source = read_regular(ROOT / "component-format/src/engine.rs").decode()
     require("ProfileIdentity::PROFILE_2_SYNC_FLOAT {\n        None" in engine_source, "code 5 current-engine rejection missing")
     require("ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION {\n        None" in engine_source, "code 7 current-engine rejection missing")
@@ -215,7 +210,7 @@ def verify_repository(value: dict[str, Any]) -> None:
     profile = read_regular(ROOT / "docs/WASM_REFERENCE_TYPES_PROFILE.md").decode()
     testing = read_regular(ROOT / "TESTING.md").decode()
     ci = read_regular(ROOT / ".github/workflows/ci.yml").decode()
-    require(POSITION in roadmap and POSITION in profile, "live position missing")
+    require(POSITION in roadmap and LIVE_POSITION in roadmap and LIVE_POSITION in profile, "live position missing")
     require("## 9.4 C8.12 independent Reference Types validation widening" in roadmap, "roadmap section missing")
     require("# Reference Types validation profile" in profile, "profile document missing")
     require("## C8.12-R1 Reference Types validation design" in testing, "TESTING section missing")

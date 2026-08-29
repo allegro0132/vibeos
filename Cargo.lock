@@ -1594,6 +1594,7 @@ dependencies = [
  "dlr-wasm-interpreter",
  "vibeos-component-format",
  "vibeos-wasm-float-candidate",
+ "vibeos-wasm-reference-candidate",
  "vibeos-wasm-runtime",
  "vibeos-wasm-simd-candidate",
  "wasm-encoder 0.255.0",
@@ -1998,6 +1999,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-wasm-reference-candidate"
+version = "0.1.0"
+dependencies = [
+ "vibeos-component-format",
+ "vibeos-wasmi-reference-validation",
+ "wasmparser 0.239.0",
+ "wat",
+]
+
+[[package]]
 name = "vibeos-wasm-runtime"
 version = "0.1.0"
 dependencies = [
@@ -2064,6 +2075,9 @@ dependencies = [
 [[package]]
 name = "vibeos-wasmi-collections-softfloat"
 version = "1.1.0-vibeos-f2.1"
+dependencies = [
+ "string-interner",
+]
 
 [[package]]
 name = "vibeos-wasmi-core-simd-softfloat"
@@ -2091,6 +2105,13 @@ name = "vibeos-wasmi-ir-softfloat"
 version = "1.1.0-vibeos-f2.1"
 dependencies = [
  "vibeos-wasmi-core-softfloat",
+]
+
+[[package]]
+name = "vibeos-wasmi-reference-validation"
+version = "1.1.0-vibeos-ref1.1"
+dependencies = [
+ "vibeos-wasmi-softfloat",
 ]
 
 [[package]]

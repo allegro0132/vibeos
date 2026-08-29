@@ -52,6 +52,19 @@ CANDIDATE_C89_FEATURE_REFS = frozenset(
 MAX_LOCAL_MANIFESTS = 256
 ALLOWED_VENDOR_PATH_EDGES = {
     (
+        PurePosixPath("wasmi-reference-validation/Cargo.toml"),
+        "dependencies",
+        "wasmi-reference-base",
+    ): {
+        "target": PurePosixPath("vendor/wasmi-softfloat/crates/wasmi/Cargo.toml"),
+        "spec": {
+            "package": "vibeos-wasmi-softfloat",
+            "path": "../vendor/wasmi-softfloat/crates/wasmi",
+            "version": "=1.1.0-vibeos-f2.1",
+            "default-features": False,
+        },
+    },
+    (
         CANDIDATE_MANIFEST,
         "dependencies",
         "wasmi-softfloat",
@@ -1687,7 +1700,7 @@ def verify_lock_and_profile1(view: View, errors: list[str]) -> None:
         require(errors, rustc.get("dependencies") == ["bitflags 2.13.1", "smallvec"], "rustc_apfloat locked direct dependency closure drift")
 
     expected_lock_dependencies = {
-        "vibeos-wasmi-collections-softfloat": [],
+        "vibeos-wasmi-collections-softfloat": ["string-interner"],
         "vibeos-wasmi-core-softfloat": ["rustc_apfloat"],
         "vibeos-wasmi-ir-softfloat": ["vibeos-wasmi-core-softfloat"],
         "vibeos-wasmi-softfloat": [
@@ -2333,7 +2346,12 @@ def verify_isolation_and_inertness(view: View, errors: list[str]) -> None:
     require(errors, "pub const PROFILE_2_SYNC_FLOAT_RUNTIME_ABI_VERSION: u16 = 5;" in component, "code-5 runtime ABI drift")
     profile_block = re.search(r"pub const PROFILE_2_SYNC_FLOAT: Self = Self \{(?P<body>.*?)\n    \};", component, re.DOTALL)
     require(errors, profile_block is not None and "stage: ProfileStage::ValidationOnly" in profile_block.group("body"), "code 5 must remain ValidationOnly")
-    require(errors, "runtime_ready: false," in engine, "code-5 validation contract must remain runtime_ready=false")
+    require(
+        errors,
+        "nan_policy: PROFILE_2_SYNC_FLOAT_NAN_POLICY,\n        runtime_ready: false,"
+        in engine,
+        "code-5 validation contract must remain runtime_ready=false",
+    )
     resolver = re.search(r"pub fn current_validation_engine_identity\(.*?\n\}", engine, re.DOTALL)
     require(errors, resolver is not None, "current engine resolver missing")
     if resolver is not None:
@@ -2434,8 +2452,10 @@ def verify_recursive_closure_self_test(base: View) -> None:
         PurePosixPath("vendor/wasmi-softfloat/crates/core/Cargo.toml"),
         PurePosixPath("vendor/wasmi-softfloat/crates/ir/Cargo.toml"),
         PurePosixPath("vendor/wasmi-softfloat/crates/wasmi/Cargo.toml"),
+        PurePosixPath("wasm-reference-candidate/Cargo.toml"),
+        PurePosixPath("wasmi-reference-validation/Cargo.toml"),
     }
-    if len(parsed) != 64 or len(packages) != 63 or not required_implicit <= packages:
+    if len(parsed) != 74 or len(packages) != 73 or not required_implicit <= packages:
         missing = sorted(required_implicit - packages, key=str)
         raise RuntimeError(
             "self-test FAILED: recursive manifest closure drift: "
@@ -2443,7 +2463,7 @@ def verify_recursive_closure_self_test(base: View) -> None:
         )
     print(
         "self-test PASS: recursive repo-local closure covers "
-        "64 manifests and 63 packages"
+        "74 manifests and 73 packages"
     )
 
     scope_errors: list[str] = []
@@ -2490,8 +2510,8 @@ def verify_recursive_closure_self_test(base: View) -> None:
 
     dotted_root = replace_once(
         base.read("Cargo.toml"),
-        b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat"]',
-        b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "./orphan"]',
+        b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat"]',
+        b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat", "./orphan"]',
         "dotted workspace exclude",
     )
     dotted_view = View(
@@ -2617,8 +2637,8 @@ def self_test(base: View) -> None:
             "component-format/src/engine.rs",
             lambda data: replace_once(
                 data,
-                b"runtime_ready: false,",
-                b"runtime_ready: true,",
+                b"nan_policy: PROFILE_2_SYNC_FLOAT_NAN_POLICY,\n        runtime_ready: false,",
+                b"nan_policy: PROFILE_2_SYNC_FLOAT_NAN_POLICY,\n        runtime_ready: true,",
                 "code-5 runtime_ready",
             ),
         ),
@@ -2882,8 +2902,8 @@ scope-nested-priority-route = { package = "vibeos-component-format", path = "../
         return {
             "Cargo.toml": replace_once(
                 root,
-                b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat"]',
-                b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", '
+                b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat"]',
+                b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat", '
                 b'"selftest-fixtures/scope-nested-priority-A"]',
                 "nested-priority fixture exclude",
             ),
@@ -3054,8 +3074,8 @@ edition = "2024"
             {
                 "Cargo.toml": replace_once(
                     root,
-                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat"]',
-                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", '
+                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat"]',
+                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat", '
                     b'"selftest-fixtures/scope-explicit"]',
                     "explicit nested workspace exclude",
                 )
@@ -3098,8 +3118,8 @@ scope-confused-dependency = { workspace = true }
             {
                 "Cargo.toml": replace_once(
                     root,
-                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat"]',
-                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", '
+                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat"]',
+                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat", '
                     b'"selftest-fixtures/scope-implicit"]',
                     "implicit nested workspace exclude",
                 )
@@ -3177,8 +3197,8 @@ scope-shadow-route = { workspace = true }
             {
                 "Cargo.toml": replace_once(
                     root,
-                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat"]',
-                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", '
+                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat"]',
+                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat", '
                     b'"selftest-fixtures/scope-two-hop/nested/source"]',
                     "two-hop nested source exclude",
                 )
@@ -3236,8 +3256,8 @@ scope-two-hop-route = { workspace = true }
             {
                 "Cargo.toml": replace_once(
                     root,
-                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat"]',
-                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", '
+                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat"]',
+                    b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat", '
                     b'"selftest-fixtures/scope-nearest-outer"]',
                     "nearest-fallback fixture exclude",
                 ),
@@ -3623,8 +3643,8 @@ scope-self-root-route = { package = "vibeos-wasm-float-candidate", path = "../..
         return {
             "Cargo.toml": replace_once(
                 root,
-                b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat"]',
-                b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", '
+                b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat"]',
+                b'exclude = ["vendor/sunset", "vendor/wasmi-softfloat", "vendor/wasmi-simd-softfloat", '
                 b'"selftest-fixtures/scope-self-root-A"]',
                 "nested self-root fixture exclude",
             ),

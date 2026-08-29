@@ -32,9 +32,9 @@ CONTRACT_PATH = (
     "fixed-qemu-target-release-policy-v1-contract.json"
 )
 
-EXPECTED_CONTRACT_BYTES = 19_624
+EXPECTED_CONTRACT_BYTES = 20_410
 EXPECTED_CONTRACT_SHA256 = (
-    "817c0cd35b803eb1d13aab69bfe2aaaca4d873fc313b38517e852e3530b18431"
+    "0d79fcc2e96c2a9f74df5de3c8f361792ad81fa2c65396eb48d9392ad7f562a2"
 )
 MAX_CONTRACT_BYTES = 64 * 1024
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
@@ -43,6 +43,7 @@ MAX_JSON_INTEGER_DIGITS = 20
 READ_CHUNK_BYTES = 64 * 1024
 
 ROOT_KEYS = {
+    "application_status",
     "authority",
     "code5_boundary",
     "contract_verifier",
@@ -62,6 +63,24 @@ ROOT_KEYS = {
     "successor_boundary",
     "unrelated_hardware_gates",
     "version",
+}
+
+EXPECTED_APPLICATION_STATUS = {
+    "allocation_contract_path": (
+        "acceptance/wasm-float-target/artifacts/"
+        "c89-float-successor-design-v1-contract.json"
+    ),
+    "allocation_contract_schema": "vibeos.c89.float-successor-design-v1.contract",
+    "current_roadmap_position": "c89-s1-design-frozen-pre-implementation",
+    "design_node": "C8.9-S1",
+    "design_node_complete": True,
+    "implementation_node": "C8.9-S2",
+    "implementation_node_complete": False,
+    "policy_checkpoint_remains_nonallocating": True,
+    "qualification_node": "C8.9-S3",
+    "qualification_node_complete": False,
+    "successor_design_review_passed": True,
+    "target_policy_applies_to_qualification": True,
 }
 
 EXPECTED_AUTHORITY = {
@@ -139,7 +158,7 @@ EXPECTED_EFFECTIVITY = {
     ),
     "release_authorized": False,
     "retroactive_evidence_reclassification": False,
-    "successor_review_passed": False,
+    "successor_review_passed_by_policy": False,
 }
 
 EXPECTED_EVIDENCE_NON_PROMOTION = {
@@ -252,32 +271,32 @@ VERIFICATION_COMMANDS = [
 
 EXPECTED_REPOSITORY_FILES = {
     ".github/workflows/ci.yml": {
-        "bytes": 23_970,
-        "sha256": "d489d727545a30e9416408b744d45ad0aeebbe8aa06a30b02245a2bf6f87ae69",
+        "bytes": 24_524,
+        "sha256": "68d71c57c5c230ff7159d573a77dd0799172ef32800d5d0b7c4bca9335c24720",
     },
     "TESTING.md": {
-        "bytes": 126_307,
-        "sha256": "8fc9d5cc00771d2b06c2429fd7a174415fdbbbeca359d11f289377a8826296b6",
+        "bytes": 127_880,
+        "sha256": "a3e3fa5349abf347ab3eb1ac23a6938564545e15eeb50c2db7803bfb773d9e8d",
     },
     "benchmarks/wasm-aot-decision/README.md": {
-        "bytes": 16_267,
-        "sha256": "14b7e2f12e1dfc69c3636aa8a538daa456c4d9573e484f9c3cd5ef2bc6ed59a4",
+        "bytes": 16_362,
+        "sha256": "ced8cb9019bdb976b2eef734c74e0273acbc614fa43313aa1187d7027d8c7f9d",
     },
     "benchmarks/wasm-runtime/README.md": {
         "bytes": 1_200,
         "sha256": "5e1e1bd8c21dc2f1badecc2f29dc52209cfa4682744c0677abdba604df1dd5b1",
     },
     "docs/WASM_AOT_DECISION.md": {
-        "bytes": 83_825,
-        "sha256": "106fb19131639802144b7f74f6aa5057090e4a3a55a4a89ebb6e7cc38c31e9bd",
+        "bytes": 83_972,
+        "sha256": "8048ab8022e167d9ec7332a486ff051827df93408c569c877cf21eb4820d52e6",
     },
     "docs/WASM_FLOAT_PROFILE.md": {
-        "bytes": 32_867,
-        "sha256": "97c7326a7cdb44005bc0b3b5de1c2560a26bf9ceafd6849c250b35e48505e315",
+        "bytes": 35_282,
+        "sha256": "47d04e75e5a92fe9e0703cea3f1192c57e0e0ae70c17dd95c74942f182f59a84",
     },
     "docs/WASM_ROADMAP.md": {
-        "bytes": 92_738,
-        "sha256": "f52fe7f2ad289f2b26bb7da8111c4f78ad594b574d9219ab41dff03727e681c0",
+        "bytes": 95_655,
+        "sha256": "cff64fdc658591fa000ca64230d625d587351aa915fde0bd6fe65c667241d273",
     },
     "docs/WASM_RUNTIME_COSTS.md": {
         "bytes": 12_908,
@@ -312,6 +331,7 @@ EXPECTED_SUCCESSOR_BOUNDARY = {
     "review_passed": False,
     "roadmap_node_allocated": False,
     "runtime_abi_allocated": False,
+    "scope": "policy-checkpoint-effect-not-current-repository-state",
     "selects_successor_target_policy": False,
     "state": "unallocated",
     "successor_gate_selected": False,
@@ -376,9 +396,10 @@ EXPECTED_LIMITATIONS = [
         "inert and cannot be promoted or migrated in place."
     ),
     (
-        "No successor identity, roadmap number, profile, ABI, engine, "
+        "This policy checkpoint itself allocates no successor identity, "
+        "roadmap number, profile, ABI, engine, "
         "implementation, execution, admission, release, or production "
-        "authority is allocated."
+        "authority."
     ),
 ]
 
@@ -388,7 +409,8 @@ CHECK_OUTPUT = (
     "policy_effective=true\n"
     "contract_is_target_evidence=false\n"
     "current_target_release_gate_satisfied=false\n"
-    "successor_state=unallocated\n"
+    "policy_checkpoint_successor_state=unallocated\n"
+    "current_roadmap_position=c89-s1-design-frozen-pre-implementation\n"
     "physical_inputs_required=0\n"
     "physical_inputs_permitted=0\n"
     "duo_gate_effect=false\n"
@@ -884,6 +906,11 @@ def validate_contract_object(contract: Any) -> None:
         "post-c88-f5-pre-allocation",
         "contract.roadmap_position",
     )
+    strict_equal(
+        contract["application_status"],
+        EXPECTED_APPLICATION_STATUS,
+        "application_status",
+    )
     strict_equal(contract["authority"], EXPECTED_AUTHORITY, "authority")
     strict_equal(contract["code5_boundary"], EXPECTED_CODE5_BOUNDARY, "code5_boundary")
     strict_equal(
@@ -1243,7 +1270,7 @@ CI_STEP_NAME = "Verify the prospective fixed-QEMU WASM target/release policy"
 CI_POLICY_STEP = (
     f"      - name: {CI_STEP_NAME}\n"
     "        # Policy/contract integrity only: no QEMU or Duo is run, no target or\n"
-    "        # release gate is satisfied, and no successor is allocated.\n"
+    "        # release gate is satisfied. C8.9 allocation is verified separately.\n"
     "        run: |\n"
     f"          {VERIFICATION_COMMANDS[0]}\n"
     f"          {VERIFICATION_COMMANDS[1]}\n"
@@ -1268,8 +1295,7 @@ C84_HISTORICAL_NEXT_MARKER = (
     "`C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position."
 )
 CURRENT_POSITION_MARKER = (
-    "The current roadmap position is `post-c88-f5-pre-allocation`; no successor "
-    "is allocated or authorized."
+    "The current roadmap position is `c89-s1-design-frozen-pre-implementation`."
 )
 FLOAT_NON_PROMOTION_MARKER = (
     "The C8.8-F5 replacement remains scoped to F5 only; the independent "
@@ -1963,6 +1989,18 @@ def run_contract_selftests(contract: dict[str, Any]) -> int:
             "successor_boundary.target_release_evidence_question differs",
         ),
         (
+            ("application_status", "implementation_node_complete"),
+            True,
+            "c89-implementation-falsely-complete",
+            "application_status.implementation_node_complete differs",
+        ),
+        (
+            ("application_status", "qualification_node_complete"),
+            True,
+            "c89-qualification-falsely-complete",
+            "application_status.qualification_node_complete differs",
+        ),
+        (
             ("historical_boundaries", "c1_through_c82", "status"),
             "reopened",
             "c1-c82-status-reopened",
@@ -2554,7 +2592,7 @@ def run_repository_selftests() -> int:
             replace(live, roadmap=contradictory_roadmap)
         ),
         "roadmap-appended-contradiction",
-        "roadmap policy section byte count differs",
+        "roadmap contains forbidden policy claim: Milk-V Duo made mandatory",
     )
     cases += 1
     contradictory_testing = replace_once(

@@ -1,4 +1,18 @@
 {
+  "application_status": {
+    "allocation_contract_path": "acceptance/wasm-float-target/artifacts/c89-float-successor-design-v1-contract.json",
+    "allocation_contract_schema": "vibeos.c89.float-successor-design-v1.contract",
+    "current_roadmap_position": "c89-s1-design-frozen-pre-implementation",
+    "design_node": "C8.9-S1",
+    "design_node_complete": true,
+    "implementation_node": "C8.9-S2",
+    "implementation_node_complete": false,
+    "policy_checkpoint_remains_nonallocating": true,
+    "qualification_node": "C8.9-S3",
+    "qualification_node_complete": false,
+    "successor_design_review_passed": true,
+    "target_policy_applies_to_qualification": true
+  },
   "authority": {
     "admission_authorized": false,
     "aot_authorized": false,
@@ -68,7 +82,7 @@
     "policy_effective_condition": "exact-contract-verifier-docs-testing-and-ci-integrated-on-codex-wasm",
     "release_authorized": false,
     "retroactive_evidence_reclassification": false,
-    "successor_review_passed": false
+    "successor_review_passed_by_policy": false
   },
   "evidence_non_promotion": {
     "baseline_specification_may_be_referenced": true,
@@ -339,7 +353,7 @@
     "Milk-V Duo testing remains paused; optional future observations are separate and have no gate, completion, or release effect.",
     "Unrelated board, device, entropy, physical-security, and certification gates remain unchanged.",
     "Artifact profile code 5 remains permanently validation-only and inert and cannot be promoted or migrated in place.",
-    "No successor identity, roadmap number, profile, ABI, engine, implementation, execution, admission, release, or production authority is allocated."
+    "This policy checkpoint itself allocates no successor identity, roadmap number, profile, ABI, engine, implementation, execution, admission, release, or production authority."
   ],
   "policy_basis": {
     "branch": "codex/wasm",
@@ -365,32 +379,32 @@
     "float_profile_doc": "docs/WASM_FLOAT_PROFILE.md",
     "pinned_files": {
       ".github/workflows/ci.yml": {
-        "bytes": 23970,
-        "sha256": "d489d727545a30e9416408b744d45ad0aeebbe8aa06a30b02245a2bf6f87ae69"
+        "bytes": 24524,
+        "sha256": "68d71c57c5c230ff7159d573a77dd0799172ef32800d5d0b7c4bca9335c24720"
       },
       "TESTING.md": {
-        "bytes": 126307,
-        "sha256": "8fc9d5cc00771d2b06c2429fd7a174415fdbbbeca359d11f289377a8826296b6"
+        "bytes": 127880,
+        "sha256": "a3e3fa5349abf347ab3eb1ac23a6938564545e15eeb50c2db7803bfb773d9e8d"
       },
       "benchmarks/wasm-aot-decision/README.md": {
-        "bytes": 16267,
-        "sha256": "14b7e2f12e1dfc69c3636aa8a538daa456c4d9573e484f9c3cd5ef2bc6ed59a4"
+        "bytes": 16362,
+        "sha256": "ced8cb9019bdb976b2eef734c74e0273acbc614fa43313aa1187d7027d8c7f9d"
       },
       "benchmarks/wasm-runtime/README.md": {
         "bytes": 1200,
         "sha256": "5e1e1bd8c21dc2f1badecc2f29dc52209cfa4682744c0677abdba604df1dd5b1"
       },
       "docs/WASM_AOT_DECISION.md": {
-        "bytes": 83825,
-        "sha256": "106fb19131639802144b7f74f6aa5057090e4a3a55a4a89ebb6e7cc38c31e9bd"
+        "bytes": 83972,
+        "sha256": "8048ab8022e167d9ec7332a486ff051827df93408c569c877cf21eb4820d52e6"
       },
       "docs/WASM_FLOAT_PROFILE.md": {
-        "bytes": 32867,
-        "sha256": "97c7326a7cdb44005bc0b3b5de1c2560a26bf9ceafd6849c250b35e48505e315"
+        "bytes": 35282,
+        "sha256": "47d04e75e5a92fe9e0703cea3f1192c57e0e0ae70c17dd95c74942f182f59a84"
       },
       "docs/WASM_ROADMAP.md": {
-        "bytes": 92738,
-        "sha256": "f52fe7f2ad289f2b26bb7da8111c4f78ad594b574d9219ab41dff03727e681c0"
+        "bytes": 95655,
+        "sha256": "cff64fdc658591fa000ca64230d625d587351aa915fde0bd6fe65c667241d273"
       },
       "docs/WASM_RUNTIME_COSTS.md": {
         "bytes": 12908,
@@ -425,6 +439,7 @@
     "review_passed": false,
     "roadmap_node_allocated": false,
     "runtime_abi_allocated": false,
+    "scope": "policy-checkpoint-effect-not-current-repository-state",
     "selects_successor_target_policy": false,
     "state": "unallocated",
     "successor_gate_selected": false,

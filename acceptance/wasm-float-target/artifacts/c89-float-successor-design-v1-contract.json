@@ -1,0 +1,230 @@
+{
+  "allocation_authority": {
+    "basis_commit": "33a694d4118ae33c37116b964a99056ef263b345",
+    "basis_tree": "a3e79f81a76157e74b16fca58e1ba9f98058860f",
+    "date": "2026-08-29",
+    "scope": "allocate-and-progress-independent-float-successor-design-implementation-and-fixed-qemu-qualification",
+    "source": "explicit-user-authorization",
+    "user_selected_physical_duo_gate": false,
+    "user_selected_profile5_promotion": false
+  },
+  "authority": {
+    "admission_authorized": false,
+    "aot_authorized": false,
+    "command_authorized": false,
+    "current_engine_binding_authorized_after_s2": true,
+    "current_engine_bound": false,
+    "design_authorized": true,
+    "durable_publication_authorized": false,
+    "fixed_qemu_qualification_authorized_after_s2": true,
+    "implementation_authorized": true,
+    "in_place_promotion_authorized": false,
+    "jit_authorized": false,
+    "migration_authorized": false,
+    "native_bytes_authorized": false,
+    "production_authorized": false,
+    "release_authorized": false,
+    "rwx_authorized": false,
+    "test_execution_authorized_for_s2": true
+  },
+  "code5_boundary": {
+    "activation_authorized": false,
+    "admission_authorized": false,
+    "artifact_profile_code": 5,
+    "current_engine": false,
+    "durable_publication_authorized": false,
+    "executable": false,
+    "in_place_promotion_authorized": false,
+    "inert": true,
+    "migration_authorized": false,
+    "permanent": true,
+    "production_authorized": false,
+    "stage": "validation-only"
+  },
+  "contract_verifier": {
+    "contract_identity_binding": "one-way-sha256-and-bytes-pin-in-verifier",
+    "path": "scripts/verify-c89-float-successor-design.py",
+    "success_only_means": "c89-s1-design-identity-frozen-not-implementation-or-qualification-complete"
+  },
+  "engine_selection": {
+    "backend": {
+      "archive_sha256": "486c2179b4796f65bfe2ee33679acf0927ac83ecf583ad6c91c3b4570911b9ad",
+      "llvm_revision": "462a31f5a5abb905869ea93cc49b096079b11aa4",
+      "package": "rustc_apfloat",
+      "revision": "eeaacad81247af65d4043cb3e32d023a652d7951",
+      "version": "0.2.3+llvm-462a31f5a5ab"
+    },
+    "feature_set": "default-features=false,extra-checks,prefer-btree-collections;simd=false",
+    "fork_manifests_sha256": "f78a26c86b00068d1bb9b8f7d499697d3a0f9b638c6d2051df249362a0006dfd",
+    "package": "vibeos-wasmi-softfloat",
+    "patch_delta_sha256": "3d2aec1d7e510fc3b3edb87dcacb2d4ed34eb448356704a027841b047938ec64",
+    "patched_manifest_sha256": "2d94218e4fa5eea30b8e516e055fae8f72465dbc1ef75f8b1df3495cbcd0432f",
+    "production_binding_status": "selected-for-c89-s2-not-yet-bound",
+    "provenance_file": {
+      "bytes": 4456,
+      "path": "vendor/wasmi-softfloat/PROVENANCE.toml",
+      "sha256": "7a3ddc2ae720d4fe8a9ebf8d016f2983f7a48dad6003799437a47020b9be9359"
+    },
+    "source_tree": {
+      "commit": "33a694d4118ae33c37116b964a99056ef263b345",
+      "git_tree": "c55904f72c70f9a0d807a13e678fec01b7c78f5a",
+      "path": "vendor/wasmi-softfloat"
+    },
+    "upstream_revision": "8273dfb09d493971b7bb12fe614d740cdc857175",
+    "version": "1.1.0-vibeos-f2.1"
+  },
+  "evidence_policy": {
+    "c88_f1_through_f5_evidence_satisfies_c89_gate": false,
+    "code5_artifacts_eligible_for_c89_execution": false,
+    "fresh_c89_implementation_evidence_required": true,
+    "fresh_c89_source_bound_fixed_qemu_evidence_required": true,
+    "historical_semantics_may_be_referenced": true,
+    "predecessor_receipts_relabeling_forbidden": true
+  },
+  "hardware_policy": {
+    "duo_gate_effect": false,
+    "duo_inputs_permitted": 0,
+    "duo_inputs_required": 0,
+    "duo_status": "paused-optional-observation-only",
+    "fixed_qemu_is_hardware_equivalent": false,
+    "other_hardware_gates_unchanged": true,
+    "physical_provenance": "not-claimed"
+  },
+  "identity": {
+    "artifact_abi": 6,
+    "artifact_profile_code": 6,
+    "canonical_abi_revision": "component-model-0.255.0-sync-float-values-deterministic-software-float-v1-c89-exec-v1",
+    "canonical_features": [
+      "utf8",
+      "sync-lift-lower",
+      "resources",
+      "float-values"
+    ],
+    "component_model_revision": "wasmparser-component-model-0.255.0-c89-sync-float-exec-v1",
+    "component_profile": 3,
+    "core_profile": 3,
+    "core_wasm_revision": "webassembly-core-2.0-scalar-f32-f64-deterministic-software-float-v1-c89-exec-v1",
+    "execution_stage": "executable",
+    "name": "PROFILE_3_SYNC_FLOAT_EXECUTABLE",
+    "runtime_abi": 6,
+    "wasi_revision": "wasi-not-selected-c89-sync-float",
+    "wasm_tools_revision": "wasm-tools-v1.255.0-76e20611d1920a7a39ca08983c6c77c3060de380",
+    "wit_world": {
+      "exports": [
+        "run(mode: u32, left: f32, right: f64) -> f64"
+      ],
+      "identity": "vibe:float/runtime@1.0.0",
+      "imports": []
+    }
+  },
+  "implementation_plan": [
+    {
+      "acceptance": "identity-engine-semantics-authority-and-target-policy-frozen;-code5-remains-inert",
+      "complete": true,
+      "id": "C8.9-S1",
+      "name": "freeze-independent-successor-design"
+    },
+    {
+      "acceptance": "new-code6-artifact-engine-admission-lifecycle-and-nonpromotion-gates-pass",
+      "complete": false,
+      "id": "C8.9-S2",
+      "name": "implement-successor-runtime-and-admission"
+    },
+    {
+      "acceptance": "fresh-source-bound-normal-and-optimized-fixed-qemu-contract-and-evidence-pass",
+      "complete": false,
+      "id": "C8.9-S3",
+      "name": "qualify-successor-on-fixed-qemu"
+    }
+  ],
+  "predecessor": {
+    "fixed_qemu_policy": {
+      "contract": {
+        "bytes": 19624,
+        "git_blob": "f536f6f43875b6e2e340c344f1dedbe32990aee9",
+        "path": "acceptance/wasm-roadmap/artifacts/fixed-qemu-target-release-policy-v1-contract.json",
+        "sha256": "817c0cd35b803eb1d13aab69bfe2aaaca4d873fc313b38517e852e3530b18431"
+      },
+      "publication": {
+        "commit": "33a694d4118ae33c37116b964a99056ef263b345",
+        "tree": "a3e79f81a76157e74b16fca58e1ba9f98058860f"
+      },
+      "verifier": {
+        "bytes": 94655,
+        "git_blob": "b1721a236f3e51ddafc5bdb3e0767dfe590d3837",
+        "path": "scripts/verify-wasm-fixed-qemu-target-release-policy.py",
+        "sha256": "ec95cbb5ccc808dff1db273f9e9995748fbf73fcb181ee7d394da72ef27bd868"
+      }
+    },
+    "review_charter": {
+      "contract": {
+        "bytes": 9885,
+        "git_blob": "52937bdac374f5cb852f88a5faae3ad27e7e47fb",
+        "path": "acceptance/wasm-float-target/artifacts/float-successor-review-boundary-v1-contract.json",
+        "sha256": "963c776ec5c1e6a7fa60f97b89b52a78a1857c6154718fbff906c5e59d8b2fe8"
+      },
+      "publication": {
+        "commit": "180393e53eff1be66b2d3be1ff26779d831c8865",
+        "tree": "9a6d2ec94d8785bdda6f985b882cc90e239641bd"
+      },
+      "verifier": {
+        "bytes": 42675,
+        "git_blob": "1a2aa19b6eadeb48192418eb6234a5f6ff32dd51",
+        "path": "scripts/verify-c88-float-successor-review-boundary.py",
+        "sha256": "ecc7f661b9ca4789a33a23f8bef8615d6c3fa810a1955f4dec3de21f99339b45"
+      }
+    }
+  },
+  "roadmap": {
+    "allocated_node": "C8.9",
+    "current_position": "c89-s1-design-frozen-pre-implementation",
+    "design_node": "C8.9-S1",
+    "implementation_node": "C8.9-S2",
+    "qualification_node": "C8.9-S3",
+    "successor_state": "allocated-design-frozen",
+    "unrelated_c88_widenings_complete": false
+  },
+  "schema": "vibeos.c89.float-successor-design-v1.contract",
+  "semantics": {
+    "adjacent_features_enabled": [],
+    "canonical_nan_f32_bits": "0x7fc00000",
+    "canonical_nan_f64_bits": "0x7ff8000000000000",
+    "component_boundary_nan_policy": "canonicalize-to-fixed-positive-quiet-nan",
+    "core_transport_nan_policy": "preserve-all-bits",
+    "enabled_core_numeric_types": [
+      "i32",
+      "i64",
+      "f32",
+      "f64"
+    ],
+    "f5_semantics_reference": "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1",
+    "forbidden_adjacent_features": [
+      "simd",
+      "relaxed-simd",
+      "reference-types",
+      "exceptions",
+      "memory64",
+      "multiple-memories",
+      "gc",
+      "threads",
+      "shared-memory",
+      "saturating-float-to-int"
+    ],
+    "numeric_nan_policy": "deterministic-canonical-v1",
+    "software_float_required": true
+  },
+  "status": "c89-s1-design-frozen-not-implemented-not-qualified",
+  "target_policy": {
+    "baseline": "qemu-virt-rv64-tcg-icount-v1",
+    "fresh_capture_required": true,
+    "fresh_challenge_required": true,
+    "fresh_node_specific_contract_required": true,
+    "fresh_run_id_required": true,
+    "fresh_source_commit_and_tree_required": true,
+    "normal_and_optimized_required": true,
+    "physical_duo_required": false,
+    "qualification_status": "not-started",
+    "release_status": "not-authorized"
+  },
+  "version": 1
+}

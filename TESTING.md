@@ -777,8 +777,8 @@ The C8.9 closure position is `c89-s3-qualified-sealed-float-runtime-released`.
 C8.9-S1 allocates and freezes the independent code-6 Float successor design;
 C8.9-S2 implementation and C8.9-S3 fixed-QEMU qualification are complete.
 The current roadmap position is
-`c810-s5-fixed-qemu-qualified-successor-review-eligible`; C8.10-S1 through
-C8.10-S5 are complete; the next successor design remains unallocated.
+`c811-s1-simd-executable-design-frozen-pre-implementation`; C8.10-S1 through
+C8.10-S5 and C8.11-S1 are complete; C8.11-S2 is next.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -1108,6 +1108,29 @@ allocates that successor nor authorizes design, implementation, current-engine
 binding, durable publication, production, or release. Code 5 remains permanently
 inert and code 7 remains validation-only. Milk-V Duo remains paused and has no
 gate effect.
+
+## C8.11-S1 SIMD successor design contract
+
+C8.11-S1 independently allocates `PROFILE_5_SYNC_SIMD_EXECUTABLE`: profile
+code 8, artifact/runtime ABI 8, Component/Core profile 5, exact Core,
+Component, Canonical ABI, wasm-tools, WIT-world, and engine identities. The
+selected S2 engine is
+`vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd2.1`, but S1 does not materialize
+or bind it.
+
+The fixed SIMD 1.0 and deterministic software-float semantics remain unchanged.
+Relaxed SIMD and adjacent proposals stay disabled, and `v128` remains
+Core-internal. Code 5 remains permanently inert. Code 7 stays validation-only,
+non-current, non-migratable, and cannot be promoted in place. S1 authorizes no
+admission, durable publication, release, or production. Milk-V Duo remains
+paused and supplies zero gate input.
+
+```sh
+python3 -B scripts/verify-c811-simd-successor-design.py --check-contract
+python3 -O -B scripts/verify-c811-simd-successor-design.py --check-contract
+python3 -B scripts/verify-c811-simd-successor-design.py --selftest
+python3 -O -B scripts/verify-c811-simd-successor-design.py --selftest
+```
 
 ## Fixed-QEMU target/release policy v1
 

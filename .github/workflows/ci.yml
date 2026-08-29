@@ -219,6 +219,14 @@ jobs:
           python3 -O -B scripts/verify-c810-s5-simd-evidence.py --selftest
           cargo test --locked --offline -p vibeos-wasm-simd-target \
             --features c810-s5-qemu-qualification
+      - name: Verify the C8.11-S1 SIMD successor design
+        # Static allocation and history checks only. Code 8 is not implemented
+        # or bound here; neither QEMU nor physical hardware is run.
+        run: |
+          python3 -B scripts/verify-c811-simd-successor-design.py --check-contract
+          python3 -O -B scripts/verify-c811-simd-successor-design.py --check-contract
+          python3 -B scripts/verify-c811-simd-successor-design.py --selftest
+          python3 -O -B scripts/verify-c811-simd-successor-design.py --selftest
       - name: Verify the prospective fixed-QEMU WASM target/release policy
         # Policy/contract integrity only: this step runs no QEMU or Duo and
         # itself satisfies no gate. C8.9 qualification is verified separately.

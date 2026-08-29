@@ -190,6 +190,11 @@ python3 -O -B scripts/verify-c88-f5-qemu-target-gate.py \
   acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-normal-receipt.json \
   --optimized-receipt \
   acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-optimized-receipt.json
+# Post-F5 review-charter integrity only; this allocates and authorizes nothing.
+python3 -B scripts/verify-c88-float-successor-review-boundary.py --check-contract
+python3 -O -B scripts/verify-c88-float-successor-review-boundary.py --check-contract
+python3 -B scripts/verify-c88-float-successor-review-boundary.py --selftest
+python3 -O -B scripts/verify-c88-float-successor-review-boundary.py --selftest
 # Development boot only; cannot export or count as formal evidence.
 python3 -B scripts/qemu-c88-f5-float-target.py \
   --allow-dirty-smoke --timeout-seconds 300
@@ -878,6 +883,21 @@ and [qualification-qemu-target-gate-v1-decision.json](acceptance/wasm-float-targ
 The retained Duo readiness gate remains in
 [qualification-duo-v1-manifest.json](acceptance/wasm-float-target/artifacts/qualification-duo-v1-manifest.json)
 as scoped non-evidence.
+
+The neutral post-F5 machine charter is
+[float-successor-review-boundary-v1-contract.json](acceptance/wasm-float-target/artifacts/float-successor-review-boundary-v1-contract.json).
+Its normal and optimized checks bind the exact closed F5 contract, verifier,
+decision, and two receipts at their historical commit. Its self-test rejects
+identity or candidate-value allocation, authorization, code-5
+activation, F5-evidence promotion, answered or non-blocking review questions,
+physical inputs, adjacent-widening completion, malformed JSON, aliases, and
+non-regular files. A pass means review-charter integrity only. The position
+`post-c88-f5-pre-allocation` is not a numbered Float increment and does not
+allocate a successor number, profile, ABI, engine, stage, fresh evidence gate,
+implementation, execution, or production authority. All eight review questions
+remain unresolved and blocking.
+Milk-V Duo remains paused and non-evidence, physical inputs remain zero, and
+unrelated hardware gates are unchanged.
 
 For the historical C8.4 Duo/AOT flow only, see
 [docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md). It is not the C8.8-F5

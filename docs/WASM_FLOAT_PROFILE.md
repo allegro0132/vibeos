@@ -445,3 +445,48 @@ durable-publication, native-byte, AOT, or in-place-promotion authorization.
 Decision completion only makes design review eligible for a separately
 numbered successor; its profile code, artifact ABI, runtime ABI, and engine
 identity remain unallocated, and its implementation is not authorized.
+
+## 8. Post-F5 successor review boundary
+
+The machine contract and
+[`verify-c88-float-successor-review-boundary.py`](../scripts/verify-c88-float-successor-review-boundary.py)
+freeze `post-c88-f5-pre-allocation` as a review-charter position, not an
+allocated roadmap node. A passing check proves only canonical contract
+integrity and exact historical membership of the closed F5 contract, verifier,
+decision, and normal/optimized receipts. It does not replay F5 evidence or
+publisher execution, pass the design review, or open an implementation gate.
+
+The successor identity remains `unallocated`. No roadmap number, profile code,
+artifact ABI, runtime ABI, Core or Component revision, stage, engine, or fresh
+target gate has been chosen. Every design, prototype, implementation,
+execution, current-engine, native-byte, AOT/JIT/RWX, command, admission,
+durable-publication, migration, in-place-promotion, release, and production
+authorization remains false.
+
+The eight canonical unresolved blocker IDs and their review topics are frozen
+with `state=unresolved`, `blocking=true`, `answer_selected=false`, and
+`candidate_value_present=false`:
+
+1. `identity_version_allocation`: Which independent identity and version axes
+   would require allocation?
+2. `engine_supply_chain_selection`: Which exact engine and reproducible supply
+   chain would require selection?
+3. `semantic_evidence_inheritance`: Which F1--F5 semantics could be referenced,
+   and which evidence would require a fresh run under a new identity and real
+   dispatch?
+4. `production_authority`: Which explicit end-to-end authority path would be
+   required for any future production admission?
+5. `durability_upgrade_rollback`: Which durability, upgrade, rollback, and
+   code-5 non-migration rules would be required?
+6. `accounting_concurrency_lifecycle`: Which system-wide owner, concurrency,
+   accounting, and lifecycle gaps would require closure?
+7. `target_release_evidence`: Which fresh target and release evidence would be
+   required without promoting F5 into successor activation evidence?
+8. `final_authorization_rollout`: Which separate versioned review would be
+   required before any final authorization or rollout decision?
+
+Code 5 remains permanently `ValidationOnly` and inert. The formal fixed-QEMU
+replacement remains scoped to C8.8-F5 only. Milk-V Duo stays paused, retained,
+non-blocking, and non-evidence; this review boundary permits and requires zero
+physical inputs, changes no unrelated hardware gate, and leaves every other
+C8.8 feature widening incomplete.

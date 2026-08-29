@@ -285,6 +285,15 @@ jobs:
             --test c812_r2_reference_containment
           cargo test --locked --offline -p vibeos-component-loader \
             profile_instance_limits_and_exact_wit_are_revalidated
+      - name: Verify the C8.12-R3 fixed-QEMU qualification harness
+        # Harness and fail-closed transcript grammar only. CI does not boot
+        # QEMU, consume physical inputs, or satisfy the R3 gate here.
+        run: |
+          python3 -B scripts/qemu-c812-r3-reference.py --selftest
+          python3 -B scripts/verify-c812-r3-reference-evidence.py --selftest
+          python3 -O -B scripts/verify-c812-r3-reference-evidence.py --selftest
+          cargo test --locked --offline -p vibeos-wasm-reference-target \
+            --features c812-r3-qemu-qualification
       - name: Verify the prospective fixed-QEMU WASM target/release policy
         # Policy/contract integrity only: this step runs no QEMU or Duo and
         # itself satisfies no gate. C8.9 qualification is verified separately.

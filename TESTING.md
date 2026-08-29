@@ -1160,6 +1160,22 @@ physical hardware. R3 remains the separate fresh fixed-QEMU qualification
 node; success here grants no current engine, admission, execution, durable,
 migration, successor-review, production, or release authority.
 
+### C8.12-R3 qualification harness (pre-evidence)
+
+The default-off R3 harness binds eight exact validation/containment cases and
+a 256-mutation Component corpus to the isolated
+`wasm-c812-r3-reference-qemu-qualification` image. Harness self-tests do not
+boot QEMU and do not satisfy R3. A formal run is accepted only from a clean,
+already-pushed source commit and preserves zero physical inputs, zero physical
+provenance, and zero Milk-V Duo gate effect.
+
+```sh
+python3 -B scripts/qemu-c812-r3-reference.py --selftest
+python3 -B scripts/verify-c812-r3-reference-evidence.py --selftest
+python3 -O -B scripts/verify-c812-r3-reference-evidence.py --selftest
+cargo test --locked --offline -p vibeos-wasm-reference-target --features c812-r3-qemu-qualification
+```
+
 ## C8.10-S5 fixed-QEMU qualification
 
 C8.10-S5 uses the frozen `qemu-virt-rv64-tcg-icount-v1` profile with fresh

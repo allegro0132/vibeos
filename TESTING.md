@@ -1115,7 +1115,7 @@ C8.11-S1 independently allocates `PROFILE_5_SYNC_SIMD_EXECUTABLE`: profile
 code 8, artifact/runtime ABI 8, Component/Core profile 5, exact Core,
 Component, Canonical ABI, wasm-tools, WIT-world, and engine identities. The
 selected S2 engine is
-`vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd2.1`, but S1 does not materialize
+`vibeos-wasmi-simd-executable-softfloat@1.1.0-vibeos-simd2.1`, but S1 does not materialize
 or bind it.
 
 The fixed SIMD 1.0 and deterministic software-float semantics remain unchanged.

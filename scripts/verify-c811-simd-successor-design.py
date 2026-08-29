@@ -21,8 +21,8 @@ CONTRACT = (
     / "acceptance/wasm-simd-target/artifacts/"
     "c811-simd-successor-design-v1-contract.json"
 )
-CONTRACT_BYTES = 8_256
-CONTRACT_SHA256 = "1495fed63f6fbfe275a1079e0177e5e924b1bd2532c997450a9410d4332a72af"
+CONTRACT_BYTES = 8_267
+CONTRACT_SHA256 = "5995b8513f182d891c30d95530d31f6b571c14b0649c39c438f99990f58133ee"
 BASIS_COMMIT = "2038c3134fe94d1ca297764c9fd8ee7d39a24123"
 BASIS_TREE = "4332275a81379b68e6daddaab7599a942054e9e1"
 POSITION = "c811-s1-simd-executable-design-frozen-pre-implementation"
@@ -158,7 +158,7 @@ def validate(value: dict[str, Any]) -> None:
     )
     engine = value.get("engine_selection", {})
     require(
-        engine.get("package") == "vibeos-wasmi-simd-softfloat"
+        engine.get("package") == "vibeos-wasmi-simd-executable-softfloat"
         and engine.get("version") == "1.1.0-vibeos-simd2.1"
         and engine.get("implementation_status")
         == "selected-for-c811-s2-fork-not-materialized",

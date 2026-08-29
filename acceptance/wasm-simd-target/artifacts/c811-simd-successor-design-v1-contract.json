@@ -79,7 +79,7 @@
     "base_version": "1.1.0-vibeos-simd1.1",
     "feature_set": "default-features=false,extra-checks,prefer-btree-collections,simd;relaxed-simd=false",
     "implementation_status": "selected-for-c811-s2-fork-not-materialized",
-    "package": "vibeos-wasmi-simd-softfloat",
+    "package": "vibeos-wasmi-simd-executable-softfloat",
     "required_patch": [
       "allocate-code8-without-reinterpreting-code7",
       "bind-only-the-exact-code8-component-core-and-runtime-abi-identity",

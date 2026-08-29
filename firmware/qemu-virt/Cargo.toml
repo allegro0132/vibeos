@@ -58,6 +58,9 @@ wasm-c810-s5-simd-qemu-qualification = [
 wasm-c811-s3-simd-qemu-qualification = [
     "vibeos-kernel/wasm-c811-s3-simd-qemu-qualification",
 ]
+wasm-c812-r3-reference-qemu-qualification = [
+    "vibeos-kernel/wasm-c812-r3-reference-qemu-qualification",
+]
 wasm-c84-profile-slot-qemu-acceptance = [
     "vibeos-kernel/wasm-c84-profile-slot-qemu-acceptance",
 ]

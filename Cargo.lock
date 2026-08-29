@@ -1803,6 +1803,7 @@ dependencies = [
  "vibeos-vsh",
  "vibeos-wasm-aot-profile",
  "vibeos-wasm-float-target",
+ "vibeos-wasm-reference-target",
  "vibeos-wasm-runtime",
  "vibeos-wasm-runtime-costs",
  "vibeos-wasm-simd-target",
@@ -2005,6 +2006,18 @@ dependencies = [
  "vibeos-component-format",
  "vibeos-wasmi-reference-validation",
  "wasmparser 0.239.0",
+ "wat",
+]
+
+[[package]]
+name = "vibeos-wasm-reference-target"
+version = "0.1.0"
+dependencies = [
+ "sha2 0.11.0",
+ "vibeos-component-format",
+ "vibeos-component-runtime",
+ "vibeos-wasm-reference-candidate",
+ "vibeos-wasm-runtime",
  "wat",
 ]
 

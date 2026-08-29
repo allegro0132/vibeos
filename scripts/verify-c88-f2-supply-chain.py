@@ -2454,8 +2454,9 @@ def verify_recursive_closure_self_test(base: View) -> None:
         PurePosixPath("vendor/wasmi-softfloat/crates/wasmi/Cargo.toml"),
         PurePosixPath("wasm-reference-candidate/Cargo.toml"),
         PurePosixPath("wasmi-reference-validation/Cargo.toml"),
+        PurePosixPath("acceptance/wasm-reference-target/Cargo.toml"),
     }
-    if len(parsed) != 74 or len(packages) != 73 or not required_implicit <= packages:
+    if len(parsed) != 75 or len(packages) != 74 or not required_implicit <= packages:
         missing = sorted(required_implicit - packages, key=str)
         raise RuntimeError(
             "self-test FAILED: recursive manifest closure drift: "
@@ -2463,7 +2464,7 @@ def verify_recursive_closure_self_test(base: View) -> None:
         )
     print(
         "self-test PASS: recursive repo-local closure covers "
-        "74 manifests and 73 packages"
+        "75 manifests and 74 packages"
     )
 
     scope_errors: list[str] = []

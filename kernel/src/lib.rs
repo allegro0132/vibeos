@@ -48,6 +48,7 @@
         feature = "wasm-c88-f5-float-qemu-acceptance",
         feature = "wasm-c88-f5-float-duo-compile-readiness",
         feature = "wasm-c810-s5-simd-qemu-qualification",
+        feature = "wasm-c812-r3-reference-qemu-qualification",
         feature = "ssh-native-async-command",
         feature = "ssh-native-async-qemu-acceptance",
         feature = "ssh-native-async-revoke-qemu-acceptance"
@@ -94,6 +95,50 @@ compile_error!("feature `wasm-c810-s5-simd-qemu-qualification` requires the QEMU
 ))]
 compile_error!(
     "feature `wasm-c810-s5-simd-qemu-qualification` is an isolated emulator qualification image"
+);
+
+#[cfg(all(
+    feature = "wasm-c812-r3-reference-qemu-qualification",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c812-r3-reference-qemu-qualification` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c812-r3-reference-qemu-qualification",
+    not(feature = "qemu-default-image")
+))]
+compile_error!(
+    "feature `wasm-c812-r3-reference-qemu-qualification` requires the QEMU image policy"
+);
+
+#[cfg(all(
+    feature = "wasm-c812-r3-reference-qemu-qualification",
+    any(
+        feature = "milkv-duo",
+        feature = "milkv-duo-sd-image",
+        feature = "legacy-shell",
+        feature = "storage-bench",
+        feature = "file-tree",
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server",
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "component-graph-principals",
+        feature = "component-durable-publication",
+        feature = "ssh-component-command",
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c84-profile-slot",
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness",
+        feature = "wasm-c810-s5-simd-qemu-qualification"
+    )
+))]
+compile_error!(
+    "feature `wasm-c812-r3-reference-qemu-qualification` is an isolated emulator qualification image"
 );
 
 #[cfg(all(
@@ -1020,6 +1065,8 @@ mod wasm_aot_profile_slot;
     feature = "wasm-c88-f5-float-duo-compile-readiness"
 ))]
 mod wasm_float_target;
+#[cfg(feature = "wasm-c812-r3-reference-qemu-qualification")]
+mod wasm_reference_target;
 #[cfg(feature = "wasm-c83-runtime-costs")]
 mod wasm_runtime_costs;
 #[cfg(feature = "wasm-c811-s3-simd-qemu-qualification")]
@@ -1737,6 +1784,12 @@ pub extern "C" fn kmain() -> ! {
         exec::HartId::BOOT,
         "wasm-c811-s3-simd-target",
         wasm_simd_executable_target::run(),
+    );
+    #[cfg(feature = "wasm-c812-r3-reference-qemu-qualification")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c812-r3-reference-target",
+        wasm_reference_target::run(),
     );
     #[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
     exec::spawn_pinned_on(

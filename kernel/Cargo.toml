@@ -239,6 +239,14 @@ wasm-c811-s3-simd-qemu-qualification = [
     "wasm-c810-s5-simd-qemu-qualification",
     "vibeos-wasm-simd-target/c811-s3-qemu-qualification",
 ]
+# C8.12-R3 isolated fixed-QEMU qualification for validation-only code 9.
+# It links only the bounded Reference Types candidate and grants no current,
+# execution, admission, durable, migration, or release authority.
+wasm-c812-r3-reference-qemu-qualification = [
+    "dep:sha2",
+    "dep:vibeos-wasm-reference-target",
+    "vibeos-wasm-reference-target/c812-r3-qemu-qualification",
+]
 # Isolated Milk-V Duo compile-readiness image for the same portable F5
 # qualification. It carries a reserved non-evidence sentinel identity behind
 # an immutable runtime-opaque arm byte of zero; no physical capture or evidence
@@ -523,6 +531,7 @@ vibeos-vsh = { path = "../components/vsh", default-features = false }
 vibeos-wasm-runtime = { path = "../wasm-runtime", optional = true }
 vibeos-wasm-runtime-costs = { path = "../acceptance/wasm-runtime-costs", optional = true }
 vibeos-wasm-float-target = { path = "../acceptance/wasm-float-target", default-features = false, optional = true }
+vibeos-wasm-reference-target = { path = "../acceptance/wasm-reference-target", default-features = false, optional = true }
 vibeos-wasm-simd-target = { path = "../acceptance/wasm-simd-target", default-features = false, optional = true }
 vibeos-wasm-aot-profile = { path = "../wasm-aot-profile", optional = true }
 sha2 = { version = "=0.11.0", default-features = false, optional = true }

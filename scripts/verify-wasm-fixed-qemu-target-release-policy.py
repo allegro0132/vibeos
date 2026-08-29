@@ -34,7 +34,7 @@ CONTRACT_PATH = (
 
 EXPECTED_CONTRACT_BYTES = 28_546
 EXPECTED_CONTRACT_SHA256 = (
-    "dd5f70a1fb686ed3724c9a7b289bfd4895db37198f4136056bd6e9158aea32db"
+    "adf30f7feffbaa6ef902e897d5f6da7240c6462b6544dde2ac25bdb5c227ba56"
 )
 MAX_CONTRACT_BYTES = 64 * 1024
 MAX_DOCUMENT_BYTES = 2 * 1024 * 1024
@@ -345,12 +345,12 @@ VERIFICATION_COMMANDS = [
 
 EXPECTED_REPOSITORY_FILES = {
     ".github/workflows/ci.yml": {
-        "bytes": 34_109,
-        "sha256": "ef7122011dd7463465cb0131547dfb431539643e3de43b7c4d57b3e84063a83d",
+        "bytes": 34_684,
+        "sha256": "5e9dddecf16e11e162d65fc30b5004d8be593d3385b73fc5f53206227edb3c2a",
     },
     "TESTING.md": {
-        "bytes": 143_619,
-        "sha256": "d4ea066a322ce799923cba288f13f95afac81b8800e2cdaa34be78c7d2f5570b",
+        "bytes": 144_379,
+        "sha256": "b8cac40a39503579d536348db157be75c00df581069feef872eebbffa47c67a8",
     },
     (
         "acceptance/wasm-float-target/artifacts/"

@@ -415,12 +415,12 @@
     "float_profile_doc": "docs/WASM_FLOAT_PROFILE.md",
     "pinned_files": {
       ".github/workflows/ci.yml": {
-        "bytes": 34109,
-        "sha256": "ef7122011dd7463465cb0131547dfb431539643e3de43b7c4d57b3e84063a83d"
+        "bytes": 34684,
+        "sha256": "5e9dddecf16e11e162d65fc30b5004d8be593d3385b73fc5f53206227edb3c2a"
       },
       "TESTING.md": {
-        "bytes": 143619,
-        "sha256": "d4ea066a322ce799923cba288f13f95afac81b8800e2cdaa34be78c7d2f5570b"
+        "bytes": 144379,
+        "sha256": "b8cac40a39503579d536348db157be75c00df581069feef872eebbffa47c67a8"
       },
       "acceptance/wasm-float-target/artifacts/c89-s3-fixed-qemu-qualification-v1-contract.json": {
         "bytes": 4457,

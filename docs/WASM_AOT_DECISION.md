@@ -16,8 +16,9 @@ It binds source commit
 `a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f`,
 and outcome `aot-not-justified-on-fixed-qemu`. C8.5 through C8.7 were not
 entered for this workload and remain globally deferred. Its immutable
-historical next-node value is `C8.8-skip-or-defer-C8.5-C8.7`; the live roadmap
-position is now `c811-s3-qualified-sealed-simd-runtime-released`. The separately
+historical next-node value is `C8.8-skip-or-defer-C8.5-C8.7`; the C8.11 closure
+position was `c811-s3-qualified-sealed-simd-runtime-released`, and the live
+position is now `c812-r1-reference-types-validation-design-frozen-pre-implementation`. The separately
 allocated C8.9 Float successor does not rewrite the C8.4 decision. The result
 does not authorize AOT or accept native component bytes.
 
@@ -28,8 +29,9 @@ C8.9-S1 allocates the independent Float successor design, C8.9-S2 implements
 its interpreter path, and C8.9-S3 qualifies and releases only the sealed Float
 runtime on fixed QEMU. AOT remains unauthorized.
 The current roadmap position is
-`c811-s3-qualified-sealed-simd-runtime-released`; C8.11-S3 releases only the
-sealed SIMD runtime and does not authorize AOT.
+`c812-r1-reference-types-validation-design-frozen-pre-implementation`;
+C8.11-S3 released only the sealed SIMD runtime and C8.12-R1 freezes only a
+validation design. Neither authorizes AOT.
 
 The later non-numbered fixed-QEMU target/release policy checkpoint applies
 prospectively to generic WASM target/release gates. It does not widen the

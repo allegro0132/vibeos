@@ -36,9 +36,15 @@ executable SIMD design without promoting code 7. C8.11-S2 now implements its
 exact engine, runtime, authority-free volatile admission, lifecycle, durable
 rejection, supply-chain closure, and RISC-V object gate. The previous position
 was `c811-s1-simd-executable-design-frozen-pre-implementation`. C8.11-S3 now
-qualifies and releases only the sealed volatile code-8 runtime; the current
-position is `c811-s3-qualified-sealed-simd-runtime-released`.
-Every later feature widening remains separately unallocated and incomplete.
+qualifies and releases only the sealed volatile code-8 runtime. Its closure
+position is `c811-s3-qualified-sealed-simd-runtime-released`. The next listed
+widening, Reference Types, is now allocated as C8.12. C8.12-R1 freezes fresh
+validation-only code/ABIs 9, Component/Core profile 6, exact revisions, the
+bounded nullable-`funcref` semantics, a separately named engine, non-promotion
+rules, and the fixed-QEMU policy. The current position is
+`c812-r1-reference-types-validation-design-frozen-pre-implementation`.
+Every feature widening after Reference Types remains separately unallocated and
+incomplete.
 The earlier non-numbered fixed-QEMU
 target/release policy checkpoint makes fresh source-bound
 `qemu-virt-rv64-tcg-icount-v1` evidence the prospective generic WASM
@@ -85,6 +91,8 @@ design/implementation/qualification sequence; it does not rewrite that charter.
 **C8.10 status (2026-08-29): C8.10-S1 through C8.10-S5 complete.**
 
 **C8.11 status (2026-08-30): C8.11-S1 through C8.11-S3 complete.**
+
+**C8.12 status (2026-08-30): C8.12-R1 complete; R2 and R3 remain incomplete.**
 
 ---
 
@@ -902,6 +910,7 @@ component security boundary is measured and stable.
 | C8.9 | Activate Float under an independent identity | A new code-6 executable identity must pass separately frozen design, implementation/admission, and fresh fixed-QEMU qualification nodes; code 5 remains permanently inert |
 | C8.10 | Widen fixed-width SIMD under an independent validation identity | New code 7 freezes fixed SIMD 1.0 with deterministic software-float lanes, no public `v128` boundary, no relaxed SIMD, and staged engine, containment, admission/lifecycle, and fixed-QEMU gates before any successor review |
 | C8.11 | Allocate an independent executable SIMD successor | New code 8 and ABIs 8 freeze fixed SIMD semantics, an exact engine identity, closed authority-free world, code-7 non-promotion, implementation gates, and fresh fixed-QEMU qualification before release |
+| C8.12 | Widen Reference Types under an independent validation identity | New code 9 and ABIs 9 freeze bounded Core-internal nullable `funcref`, reject `externref`, typed references, GC objects and all host/Component reference boundaries, and require separate implementation and fixed-QEMU qualification before any successor review |
 
 The C8.3 row above is retained verbatim as the historical v1 acceptance text.
 C1 through C8.3 are treated as complete under the project's historical-evidence
@@ -1342,9 +1351,9 @@ The ordered nodes are:
 
 The previous roadmap position was
 `c811-s1-simd-executable-design-frozen-pre-implementation`. The implementation
-position was `c811-s2-simd-executable-implemented-pre-fixed-qemu`. The current
-position is `c811-s3-qualified-sealed-simd-runtime-released`; the next widening
-is unallocated. S2 granted only the exact code-8 current-engine binding and sealed
+position was `c811-s2-simd-executable-implemented-pre-fixed-qemu`. C8.11's
+closure position is `c811-s3-qualified-sealed-simd-runtime-released`; C8.12 is
+the now-allocated next widening. S2 granted only the exact code-8 current-engine binding and sealed
 authority-free volatile admission. It grants no durable publication, ordinary
 command, release, or production authority. Code 5 remains permanently inert,
 code 7 remains validation-only and non-migratable, and historical C8.10
@@ -1358,6 +1367,38 @@ Normal and optimized verification and the final-ELF audit pass. The release is
 strictly the sealed authority-free volatile code-8 path; durable publication,
 ordinary commands, AOT/JIT/native bytes/RWX, and every unrelated hardware gate
 remain unchanged.
+
+## 9.4 C8.12 independent Reference Types validation widening
+
+C8.12-R1 allocates `PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION`, artifact
+profile code and artifact/runtime ABI 9, Component/Core profile 6, and stage
+`ValidationOnly`. It selects
+`vibeos-wasmi-reference-validation@1.1.0-vibeos-ref1.1` as a new facade over
+the pinned Wasmi soft-float source, while retaining the Profile-1 integer-only
+numeric configuration. R1 freezes design metadata only: code 9 is not yet
+materialized, current, admitted, executable, durable, migratable, or released.
+
+The bounded semantic surface is Core-internal nullable `funcref`, single-result
+typed select, one funcref table, Reference Types 1.0 table operations, and
+active element segments. Bulk-memory operations and passive/declarative element
+segments remain disabled. `externref`, typed function references, GC
+objects, host reference values, and every Component/Canonical/WIT reference
+boundary are rejected. Wasmi's required `GC_TYPES` parser bit grants no GC
+semantic authority. All other adjacent proposals remain disabled.
+
+| # | Scope | Exit gate |
+|---|---|---|
+| C8.12-R1 | Freeze independent validation design | Code/ABIs 9, profile 6, revisions, closed world, exact candidate engine, semantics, non-promotion, and target policy are frozen |
+| C8.12-R2 | Implement validation and containment | Code-9 codec, isolated candidate engine, syntax inspection, positive/negative/differential corpora, admission/durable rejection, supply-chain closure, and RISC-V audit pass |
+| C8.12-R3 | Qualify validation widening | Fresh source-bound normal and optimized fixed-QEMU evidence passes before only an independently numbered executable-successor design review becomes eligible |
+
+The current position is
+`c812-r1-reference-types-validation-design-frozen-pre-implementation` and the
+next node is C8.12-R2. Historical C8.11 receipts cannot satisfy C8.12. Fixed
+QEMU is emulator-scoped and makes no physical-equivalence claim; Milk-V Duo
+remains paused and supplies zero inputs. Code 5 remains permanently inert,
+code 7 remains validation-only, and code 8's released scope is unchanged. See
+[WASM_REFERENCE_TYPES_PROFILE.md](WASM_REFERENCE_TYPES_PROFILE.md).
 
 ## 10. Test and evidence matrix
 

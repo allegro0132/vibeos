@@ -778,9 +778,10 @@ C8.9-S1 allocates and freezes the independent code-6 Float successor design;
 C8.9-S2 implementation and C8.9-S3 fixed-QEMU qualification are complete.
 The previous roadmap position was
 `c811-s1-simd-executable-design-frozen-pre-implementation`. The implementation
-position was `c811-s2-simd-executable-implemented-pre-fixed-qemu`. The current
-roadmap position is `c811-s3-qualified-sealed-simd-runtime-released`; C8.10-S1
-through C8.10-S5 and C8.11-S1 through C8.11-S3 are complete.
+position was `c811-s2-simd-executable-implemented-pre-fixed-qemu`, and C8.11
+closed at `c811-s3-qualified-sealed-simd-runtime-released`. The current roadmap
+position is `c812-r1-reference-types-validation-design-frozen-pre-implementation`;
+C8.10-S1 through C8.10-S5, C8.11-S1 through C8.11-S3, and C8.12-R1 are complete.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -1102,6 +1103,30 @@ python3 -O -B scripts/verify-c811-s3-fixed-qemu-qualification.py --selftest
 python3 -B scripts/verify-c811-s3-simd-evidence.py --selftest
 python3 -O -B scripts/verify-c811-s3-simd-evidence.py --selftest
 cargo test --locked --offline -p vibeos-wasm-simd-target --features c811-s3-qemu-qualification
+```
+
+## C8.12-R1 Reference Types validation design
+
+C8.12-R1 allocates validation-only
+`PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION`: artifact profile code and
+artifact/runtime ABI 9, Component/Core profile 6, exact revision strings,
+closed authority-free WIT world, and candidate engine
+`vibeos-wasmi-reference-validation@1.1.0-vibeos-ref1.1`. It permits only
+Core-internal nullable `funcref` Reference Types 1.0 semantics and freezes
+explicit rejection of `externref`, typed function references, GC objects, and
+all Component/Canonical/host reference boundaries.
+
+These checks are static and run no QEMU or physical hardware. Success means
+only that the R1 design is frozen. R2 implementation and R3 fresh fixed-QEMU
+qualification remain separate incomplete nodes. Code 9 has no current engine,
+admission, execution, durable, migration, or release authority. Code 5 remains
+permanently inert; codes 7 and 8 retain their existing boundaries.
+
+```sh
+python3 -B scripts/verify-c812-reference-types-design.py --check-contract
+python3 -O -B scripts/verify-c812-reference-types-design.py --check-contract
+python3 -B scripts/verify-c812-reference-types-design.py --selftest
+python3 -O -B scripts/verify-c812-reference-types-design.py --selftest
 ```
 
 ## C8.10-S5 fixed-QEMU qualification

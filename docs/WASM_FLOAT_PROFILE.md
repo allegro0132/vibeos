@@ -44,10 +44,11 @@ Duo readiness image and physical-v1 contract remain retained, non-blocking
 non-evidence: nothing was packaged, flashed, booted, or captured. F4 evidence
 remains host-only. The RISC-V evidence through F3 remains compile- and
 object-level evidence rather than a QEMU or physical execution claim. Code 5
-remains permanently `ValidationOnly` and inert. Completion opens only design
-review for a separately numbered successor whose identity is unallocated; it
-does not authorize an engine, implementation, execution, production admission,
-native bytes, AOT, or in-place promotion.
+remains permanently `ValidationOnly` and inert. Completion opened design review
+only; the later, separately versioned C8.9-S1 contract now allocates a new
+code-6 successor without changing code 5. C8.9-S2 implementation and C8.9-S3
+qualification remain incomplete, so no production admission, release, native
+bytes, AOT, or in-place promotion is authorized.
 
 ## 1. Frozen identity
 
@@ -96,8 +97,9 @@ permanent change-control requirements:
 
 F2 through F5 must not promote code 5 in place. Although the complete Float
 evidence now passes, any executable successor must receive a new profile code,
-artifact ABI, runtime ABI, and exact engine identity. Its number remains
-deliberately unallocated, and only its design review is eligible.
+artifact ABI, runtime ABI, and exact engine identity. F5 left that number
+deliberately unallocated and made only its design review eligible; C8.9-S1 now
+performs the separate allocation without changing code 5.
 
 ## 3. Exact deterministic NaN policy
 
@@ -489,9 +491,10 @@ non-evidence. Neither blocks the formal fixed-QEMU F5 closure.
 Closure does not make Float executable. Code 5 remains permanently
 `ValidationOnly`, has no current engine, and has no execution, production,
 durable-publication, native-byte, AOT, or in-place-promotion authorization.
-Decision completion only makes design review eligible for a separately
-numbered successor; its profile code, artifact ABI, runtime ABI, and engine
-identity remain unallocated, and its implementation is not authorized.
+Decision completion only made design review eligible for a separately numbered
+successor. At F5 closure its profile code, artifact ABI, runtime ABI, and engine
+identity were unallocated and its implementation was not authorized. C8.9-S1
+is the later independent allocation and does not rewrite that decision.
 
 ## 8. Post-F5 successor review boundary
 
@@ -503,12 +506,11 @@ integrity and exact historical membership of the closed F5 contract, verifier,
 decision, and normal/optimized receipts. It does not replay F5 evidence or
 publisher execution, pass the design review, or open an implementation gate.
 
-The successor identity remains `unallocated`. No roadmap number, profile code,
-artifact ABI, runtime ABI, Core or Component revision, stage, engine, or fresh
-target gate has been chosen. Every design, prototype, implementation,
-execution, current-engine, native-byte, AOT/JIT/RWX, command, admission,
-durable-publication, migration, in-place-promotion, release, and production
-authorization remains false.
+At publication of this historical charter, the successor identity remained
+`unallocated`: no roadmap number, profile code, artifact ABI, runtime ABI, Core
+or Component revision, stage, engine, or fresh target gate had been chosen.
+The later C8.9-S1 contract records the independent allocation without modifying
+this charter or promoting any F5 evidence.
 
 The eight canonical unresolved blocker IDs and their review topics are frozen
 with `state=unresolved`, `blocking=true`, `answer_selected=false`, and
@@ -540,3 +542,43 @@ every other C8.8 feature widening incomplete. The separate prospective policy
 checkpoint allocates no successor and authorizes no implementation, execution,
 admission, durable publication, release, production use, native bytes, AOT,
 JIT, RWX, migration, or in-place promotion.
+
+## 9. C8.9 executable Float successor
+
+The live roadmap position is `c89-s1-design-frozen-pre-implementation`.
+C8.9 is independently numbered and is divided into three ordered nodes:
+
+1. C8.9-S1 freezes the successor design and identity.
+2. C8.9-S2 materializes code 6 and closes implementation, current-engine,
+   admission, lifecycle, accounting, rollback, and code-5 isolation gates.
+3. C8.9-S3 publishes fresh source-bound normal/optimized fixed-QEMU evidence
+   and makes a separate release decision.
+
+C8.9-S1 selects `PROFILE_3_SYNC_FLOAT_EXECUTABLE`: artifact profile code 6,
+artifact ABI 6, runtime ABI 6, Component/Core profile 3, and stage
+`Executable`. The Core, Component, and Canonical ABI revisions are independently
+suffixed `c89-exec-v1`; the exact WIT world is
+`vibe:float/runtime@1.0.0` with no imports and sole export
+`run(mode: u32, left: f32, right: f64) -> f64`. Adjacent proposals remain off.
+
+The selected engine is the already reviewed but newly bound-for-C8.9
+`vibeos-wasmi-softfloat` `1.1.0-vibeos-f2.1` source at upstream commit
+`8273dfb09d493971b7bb12fe614d740cdc857175`, using `rustc_apfloat`
+`0.2.3+llvm-462a31f5a5ab` and the exact no-default/SIMD-off feature vector.
+Selection is not binding: S1 leaves code 6 absent from the artifact codec and
+current engine resolver. S2 must add those paths and their negative evidence.
+
+The canonical machine contract is
+[`c89-float-successor-design-v1-contract.json`](../acceptance/wasm-float-target/artifacts/c89-float-successor-design-v1-contract.json),
+verified by
+[`verify-c89-float-successor-design.py`](../scripts/verify-c89-float-successor-design.py).
+It opens S2 implementation and test execution only. Admission, durable
+publication, release, and production remain false until their later gates.
+Code 5 remains permanently `ValidationOnly`, inert, non-migratable, and
+ineligible for execution under code 6. Historical F1--F5 evidence cannot be
+relabelled as C8.9 evidence.
+
+C8.9-S3 uses the prospective formal gate:
+`qemu-virt-rv64-tcg-icount-v1`, fresh source/tree, challenge, run ID, capture,
+node-specific predicates, and normal/optimized verification. Milk-V Duo stays
+paused and optional and has no gate, completion, or release effect.

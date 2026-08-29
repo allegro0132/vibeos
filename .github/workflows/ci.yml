@@ -138,9 +138,17 @@ jobs:
             --selftest
           python3 -O -B scripts/verify-c88-float-successor-review-boundary.py \
             --selftest
+      - name: Verify the C8.9-S1 Float successor design
+        # Design identity only: code 5 remains inert, code 6 is not yet
+        # materialized, and neither QEMU nor physical hardware is run here.
+        run: |
+          python3 -B scripts/verify-c89-float-successor-design.py --check-contract
+          python3 -O -B scripts/verify-c89-float-successor-design.py --check-contract
+          python3 -B scripts/verify-c89-float-successor-design.py --selftest
+          python3 -O -B scripts/verify-c89-float-successor-design.py --selftest
       - name: Verify the prospective fixed-QEMU WASM target/release policy
         # Policy/contract integrity only: no QEMU or Duo is run, no target or
-        # release gate is satisfied, and no successor is allocated.
+        # release gate is satisfied. C8.9 allocation is verified separately.
         run: |
           python3 -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract
           python3 -O -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract

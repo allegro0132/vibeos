@@ -205,6 +205,12 @@ python3 -B scripts/verify-c88-float-successor-review-boundary.py --check-contrac
 python3 -O -B scripts/verify-c88-float-successor-review-boundary.py --check-contract
 python3 -B scripts/verify-c88-float-successor-review-boundary.py --selftest
 python3 -O -B scripts/verify-c88-float-successor-review-boundary.py --selftest
+# C8.9-S1 identity/design only. No emulator or physical target is run; code 5
+# remains inert and code 6 must not be materialized before C8.9-S2.
+python3 -B scripts/verify-c89-float-successor-design.py --check-contract
+python3 -O -B scripts/verify-c89-float-successor-design.py --check-contract
+python3 -B scripts/verify-c89-float-successor-design.py --selftest
+python3 -O -B scripts/verify-c89-float-successor-design.py --selftest
 # Development boot only; cannot export or count as formal evidence.
 python3 -B scripts/qemu-c88-f5-float-target.py \
   --allow-dirty-smoke --timeout-seconds 300
@@ -758,7 +764,7 @@ Total p50/p95 are 2,899,765/2,901,632 ticks, interpretation p50/p95 are
 `aot-not-justified-on-fixed-qemu`. C8.5 through C8.7 were not entered for this
 workload and remain globally deferred. The stored next-node value remains
 `C8.8-skip-or-defer-C8.5-C8.7`; the live roadmap position is
-`post-c88-f5-pre-allocation`. This does not rewrite the historical C8.4
+`c89-s1-design-frozen-pre-implementation`. This does not rewrite the historical C8.4
 decision. The evidence records `platform_class=emulator`,
 `physical_provenance=not-claimed`, `aot_authorized=false`, and
 `native_code_accepted=false`. Source immutability and Docker runtime custody
@@ -767,8 +773,9 @@ physical-cold-boot proof.
 
 The immutable historical C8.4 `next_node` value is
 `C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position.
-The current roadmap position is `post-c88-f5-pre-allocation`; no successor is
-allocated or authorized.
+The current roadmap position is `c89-s1-design-frozen-pre-implementation`.
+C8.9-S1 allocates and freezes the independent code-6 Float successor design;
+C8.9-S2 implementation and C8.9-S3 qualification remain incomplete.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -903,9 +910,10 @@ does not close SIMD, references, exceptions, memory64, multiple memories, GC,
 threads, broader WASI, or any unrelated hardware gate. Profile code 5 remains
 permanently `ValidationOnly`: no current engine, execution, production,
 native-byte, AOT, durable-publication, or in-place-promotion authority is
-created. Completion opens design review only for a separately numbered,
-currently unallocated successor. The normative contract and retained decision
-are [qualification-qemu-target-gate-v1-contract.json](acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-contract.json)
+created. Completion opened design review only for a separately numbered
+successor. C8.9-S1 now allocates that independent design without changing code
+5; S2/S3 remain incomplete. The normative F5 contract and retained decision are
+[qualification-qemu-target-gate-v1-contract.json](acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-contract.json)
 and [qualification-qemu-target-gate-v1-decision.json](acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-decision.json).
 The retained Duo readiness artifact remains in
 [qualification-duo-v1-manifest.json](acceptance/wasm-float-target/artifacts/qualification-duo-v1-manifest.json)
@@ -928,6 +936,22 @@ implementation, execution, or production authority. All eight review questions
 remain unresolved and blocking.
 Milk-V Duo remains paused and non-evidence, physical inputs remain zero, and
 unrelated hardware gates are unchanged.
+
+## C8.9-S1 Float successor design contract
+
+The canonical C8.9-S1 contract allocates `PROFILE_3_SYNC_FLOAT_EXECUTABLE` as
+profile code 6 with artifact/runtime ABI 6, Component/Core profile 3, exact
+`c89-exec-v1` revisions, the reviewed vendored software-float Wasmi source, and
+the closed `vibe:float/runtime@1.0.0` world. Its verifier pins the historical
+review charter and fixed-QEMU policy, validates the selected engine provenance,
+checks every security-sensitive design field under normal and optimized Python,
+and rejects design mutations.
+
+Passing S1 proves design identity only. Code 6 remains absent from the artifact
+codec and current engine resolver until S2; admission, durable publication,
+release, and production authority remain false. Code 5 stays permanently
+`ValidationOnly` and inert. S3 requires fresh source-bound normal/optimized
+fixed-QEMU evidence. Milk-V Duo remains paused and optional with no gate effect.
 
 ## Fixed-QEMU target/release policy v1
 

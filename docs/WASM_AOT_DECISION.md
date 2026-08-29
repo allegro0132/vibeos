@@ -17,14 +17,15 @@ It binds source commit
 and outcome `aot-not-justified-on-fixed-qemu`. C8.5 through C8.7 were not
 entered for this workload and remain globally deferred. Its immutable
 historical next-node value is `C8.8-skip-or-defer-C8.5-C8.7`; the live roadmap
-position is now `post-c88-f5-pre-allocation`. The latter does not rewrite the
-C8.4 decision. The result does not authorize AOT or accept native component
-bytes.
+position is now `c89-s1-design-frozen-pre-implementation`. The separately
+allocated C8.9 Float successor does not rewrite the C8.4 decision. The result
+does not authorize AOT or accept native component bytes.
 
 The immutable historical C8.4 `next_node` value is
 `C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position.
-The current roadmap position is `post-c88-f5-pre-allocation`; no successor is
-allocated or authorized.
+The current roadmap position is `c89-s1-design-frozen-pre-implementation`.
+C8.9-S1 allocates the independent Float successor design; C8.9-S2 and C8.9-S3
+remain incomplete, and AOT remains unauthorized.
 
 The later non-numbered fixed-QEMU target/release policy checkpoint applies
 prospectively to generic WASM target/release gates. It does not widen the

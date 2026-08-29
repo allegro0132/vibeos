@@ -17,9 +17,13 @@ rerun. Formal fixed-QEMU evidence completes C8.4 for the selected workload.
 C8.5 through C8.7 were not entered for that workload
 and remain globally deferred. The C8.8 Float widening is closed by the formal
 fixed-QEMU F5 decision below; every other C8.8 feature widening remains
-separately unallocated and incomplete. At the live
-`post-c88-f5-pre-allocation` position, the non-numbered fixed-QEMU
-target/release policy checkpoint below makes fresh source-bound
+separately unallocated and incomplete. The independently numbered C8.9 Float
+successor is now allocated, and C8.9-S1 freezes its new code-6 identity,
+ABIs, revisions, software-float engine, non-promotion rules, and fixed-QEMU
+qualification policy. The live position is
+`c89-s1-design-frozen-pre-implementation`; C8.9-S2 implementation and C8.9-S3
+qualification remain incomplete. The earlier non-numbered fixed-QEMU
+target/release policy checkpoint makes fresh source-bound
 `qemu-virt-rv64-tcg-icount-v1` evidence the prospective generic WASM
 target/release gate. Milk-V Duo remains a paused optional observation with no
 gate, completion, or release effect. The decision contracts and explicit gaps
@@ -51,11 +55,15 @@ retained, non-blocking, and make no physical claim
 (`physical_provenance=not-claimed`). Every unrelated hardware gate is
 unchanged. This decision closes F5 and the Float widening only; it neither
 closes another C8.8 feature widening nor authorizes an engine, execution,
-production admission, native bytes, AOT, or in-place promotion. It opens only
-design review for a separately numbered successor whose identity remains
-unallocated and whose implementation is not authorized.
-The neutral `post-c88-f5-pre-allocation` charter freezes only eight unresolved,
-blocking review questions and allocates or authorizes nothing.
+production admission, native bytes, AOT, or in-place promotion. At F5 closure
+it opened only design review for a separately numbered successor whose identity
+was then unallocated and whose implementation was not authorized.
+The historical `post-c88-f5-pre-allocation` charter froze eight unresolved,
+blocking review questions and allocated or authorized nothing. Explicit user
+authorization on 2026-08-29 subsequently opened the separately versioned C8.9
+design/implementation/qualification sequence; it does not rewrite that charter.
+
+**C8.9 status (2026-08-29): C8.9-S1 design freeze complete; C8.9-S2 and C8.9-S3 incomplete.**
 
 ---
 
@@ -257,8 +265,9 @@ without registering code 5 as a current engine or exposing it as a command or
 durable object. F5 now closes the target gate through its formal fixed-QEMU
 replacement decision. These increments still do not enable Float execution:
 Profile 1 stays integer-only, code 5 stays permanently validation-only and
-inert, and only an unallocated separately numbered successor is eligible for
-design review.
+inert, and F5 made only a then-unallocated separately numbered successor
+eligible for design review. The later C8.9-S1 allocation does not change any of
+those code-5 claims.
 
 ## 5. WIT and CSpace mapping
 
@@ -869,6 +878,7 @@ component security boundary is measured and stable.
 | C8.6 | Reuse the sealed W^X lifecycle | Link RW-NX, validate imports/relocations, seal X-only, execute, quiesce, unseal, zero and reclaim; no JIT or RWX page exists |
 | C8.7 | Regenerate or verify native output | A pinned trusted compiler reproduces native bytes, or an equivalently reviewed verifier proves the accepted surface before execution |
 | C8.8 | Widen profiles one feature at a time | Float, SIMD, references, exceptions, memory64, multiple memories, GC, threads or broader WASI each require separate semantics and evidence |
+| C8.9 | Activate Float under an independent identity | A new code-6 executable identity must pass separately frozen design, implementation/admission, and fresh fixed-QEMU qualification nodes; code 5 remains permanently inert |
 
 The C8.3 row above is retained verbatim as the historical v1 acceptance text.
 C1 through C8.3 are treated as complete under the project's historical-evidence
@@ -1136,9 +1146,11 @@ for C8.8-F5. Milk-V Duo testing stays paused and its readiness and physical-v1
 contracts stay retained, non-blocking, and non-evidence; every unrelated
 hardware gate is unchanged. No other C8.8 feature widening is complete. Code 5
 remains permanently `ValidationOnly` and inert, and the closed Float evidence
-only makes design review eligible for a separately numbered, unallocated
-successor. No successor implementation, engine binding, execution, production
-admission, native-byte acceptance, AOT, or in-place promotion is authorized.
+only made design review eligible for a separately numbered successor that was
+then unallocated. F5 itself authorized no successor implementation, engine
+binding, execution, production admission, native-byte acceptance, AOT, or
+in-place promotion; the later C8.9-S1 contract is the separate allocation and
+implementation authority.
 
 ### Post-C8.8-F5 successor review boundary (not an allocated node)
 
@@ -1150,13 +1162,13 @@ F5 contract, verifier, decision, and normal/optimized receipt members. Passing
 means `review-charter-integrity-only`: it neither replays F5 evidence nor
 establishes that the review passed.
 
-The successor identity is still `unallocated`. Its roadmap number, profile
-code, artifact/runtime ABIs, Core/Component revisions, stage, engine, supply
-chain, production admission path, durable format, and target/release evidence
-gate are all unselected. Code 5 remains permanently `ValidationOnly`, inert,
-and ineligible for migration or promotion in place. Every implementation,
-execution, current-engine, native-byte, AOT/JIT/RWX, command, admission,
-durable-publication, release, and production authorization remains false.
+At publication of this historical charter, the successor identity was
+`unallocated`. Its roadmap number, profile code, artifact/runtime ABIs,
+Core/Component revisions, stage, engine, supply chain, production admission
+path, durable format, and target/release evidence gate were all unselected.
+Code 5 was and remains permanently `ValidationOnly`, inert, and ineligible for
+migration or promotion in place. The later C8.9-S1 allocation is a separate
+contract and does not mutate or relabel this historical charter.
 
 Eight review questions remain unresolved and blocking for later, separately
 versioned work: identity/version allocation; engine/supply-chain selection;
@@ -1210,6 +1222,33 @@ ABI, engine, implementation, execution, admission, release, or production
 authority is allocated by this policy. It also authorizes no durable
 publication, migration, native bytes, AOT, JIT, RWX, rollout, or in-place
 promotion.
+
+## 9.1 C8.9 independent executable Float successor
+
+Explicit allocation creates C8.9 as a new identity rather than an F6 or an
+in-place change to code 5. Its ordered nodes are:
+
+| # | Scope | Exit gate |
+|---|---|---|
+| C8.9-S1 | Freeze independent design | Code 6, artifact/runtime ABI 6, Component/Core profile 3, exact Core/Component/Canonical revisions, the exact vendored software-float Wasmi engine, the closed WIT world, code-5 non-promotion, and the fixed-QEMU policy are frozen |
+| C8.9-S2 | Implement runtime and admission | The code-6 codec, current engine binding, validator/executor, Canonical ABI, exact admission surface, lifecycle/accounting, rollback, durable rejection, and negative code-5 isolation gates pass |
+| C8.9-S3 | Qualify and decide release | Fresh source-bound normal and optimized evidence on `qemu-virt-rv64-tcg-icount-v1` passes the node-specific contract before any release or production authority is granted |
+
+C8.9-S1 is complete under
+[`c89-float-successor-design-v1-contract.json`](../acceptance/wasm-float-target/artifacts/c89-float-successor-design-v1-contract.json).
+It selects `PROFILE_3_SYNC_FLOAT_EXECUTABLE`, profile code 6, artifact/runtime
+ABI 6, Component/Core profile 3, deterministic scalar-float revision suffix
+`c89-exec-v1`, and `vibeos-wasmi-softfloat` version
+`1.1.0-vibeos-f2.1` at upstream revision
+`8273dfb09d493971b7bb12fe614d740cdc857175`. The selected execution stage is
+`Executable`, but S1 does not materialize that identity in the artifact codec,
+bind a current engine, admit code 6, or authorize release/production. Those are
+S2/S3 gates. F1--F5 semantics may be referenced, but none of their artifacts,
+receipts, or target evidence satisfies a C8.9 gate.
+
+The live roadmap position is `c89-s1-design-frozen-pre-implementation`.
+Milk-V Duo remains paused and optional with zero gate effect. C8.9-S3 must use
+fresh fixed-QEMU evidence; historical C8.8-F5 evidence is not reusable.
 
 ## 10. Test and evidence matrix
 

@@ -2203,9 +2203,22 @@ def verify_docs_ci(inputs: Inputs) -> None:
         == 1,
         "CI trusted SSHD feature-test command count differs",
     )
+    roadmap_status_prefix = (
+        "# Component Model admitted-code roadmap\n\n"
+        "This document defines the dependency order, security invariants, acceptance\n"
+        "gates, and compatibility boundaries for admitting WebAssembly components into\n"
+        "VibeOS. It complements [BLUEPRINT.md](BLUEPRINT.md),\n"
+        "[CAPABILITY_SHELL.md](CAPABILITY_SHELL.md), and\n"
+        "[PROGRAM_PERSISTENCE.md](PROGRAM_PERSISTENCE.md).\n\n"
+        "**Status (2026-08-29): implementation in progress.**"
+    )
     require(
-        "**Status (2026-08-28): implementation in progress.**" in inputs.roadmap,
-        "WASM roadmap still presents the implementation as wholly planned",
+        inputs.roadmap.startswith(roadmap_status_prefix)
+        and inputs.roadmap.count(
+            "**Status (2026-08-29): implementation in progress.**"
+        )
+        == 1,
+        "WASM roadmap top-level implementation status differs",
     )
     for text in (
         "live trusted-terminal",
@@ -2221,7 +2234,6 @@ def verify_docs_ci(inputs: Inputs) -> None:
         "completes C8.4 at source commit",
         "C8.5 through C8.7 are skipped for this workload and remain globally deferred; "
         "they are not marked complete.",
-        "The current implementation node is C8.8.",
     ):
         require(
             text in normalized_roadmap_status,
@@ -3850,8 +3862,8 @@ def run_selftest(inputs: Inputs, *, predecessors: bool = True) -> int:
             lambda data: mutate_text(
                 data,
                 "roadmap",
-                "**Status (2026-08-28): implementation in progress.**",
-                "**Status (2026-08-28): planned.**",
+                "**Status (2026-08-29): implementation in progress.**",
+                "**Status (2026-08-29): planned.**",
                 "WASM roadmap implementation status",
             ),
         ),

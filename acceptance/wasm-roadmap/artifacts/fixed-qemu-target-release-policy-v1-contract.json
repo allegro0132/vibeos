@@ -1,0 +1,458 @@
+{
+  "authority": {
+    "admission_authorized": false,
+    "aot_authorized": false,
+    "command_authorized": false,
+    "current_engine_authorized": false,
+    "design_authorized": false,
+    "durable_publication_authorized": false,
+    "execution_authorized": false,
+    "implementation_authorized": false,
+    "in_place_promotion_authorized": false,
+    "jit_authorized": false,
+    "migration_authorized": false,
+    "native_bytes_authorized": false,
+    "production_authorized": false,
+    "prototype_authorized": false,
+    "release_authorized": false,
+    "rwx_authorized": false
+  },
+  "code5_boundary": {
+    "activation_authorized": false,
+    "admission_authorized": false,
+    "artifact_profile_code": 5,
+    "current_engine": false,
+    "durable_publication_authorized": false,
+    "executable": false,
+    "execution_authorized": false,
+    "in_place_promotion_authorized": false,
+    "inert": true,
+    "migration_authorized": false,
+    "permanent": true,
+    "production_authorized": false,
+    "stage": "validation-only"
+  },
+  "contract_verifier": {
+    "check_modes": [
+      "--check-contract",
+      "--selftest"
+    ],
+    "contract_identity_binding": "one-way-sha256-and-bytes-pin-in-verifier",
+    "optimized_python_required": true,
+    "path": "scripts/verify-wasm-fixed-qemu-target-release-policy.py",
+    "runs_duo": false,
+    "runs_qemu": false,
+    "success_only_means": "prospective-policy-integrity-not-target-evidence-not-gate-satisfaction-not-release-authorization",
+    "writes_repository_outputs": false
+  },
+  "duo_observation": {
+    "automatic_resume": false,
+    "completion_effect": false,
+    "contracts_retained": true,
+    "current_physical_evidence_present": false,
+    "current_physical_inputs": 0,
+    "current_physical_provenance": "not-claimed",
+    "formal_gate_input_permitted": false,
+    "future_valid_observation_may_be_reported_separately": true,
+    "gate_effect": false,
+    "operator_authorization_required_to_resume": true,
+    "release_effect": false,
+    "status": "paused-retained-optional-separate-non-gating",
+    "tooling_retained": true
+  },
+  "effectivity": {
+    "contract_is_target_evidence": false,
+    "contract_satisfies_target_release_gate": false,
+    "current_target_release_gate_satisfied": false,
+    "policy_effective": true,
+    "policy_effective_condition": "exact-contract-verifier-docs-testing-and-ci-integrated-on-codex-wasm",
+    "release_authorized": false,
+    "retroactive_evidence_reclassification": false,
+    "successor_review_passed": false
+  },
+  "evidence_non_promotion": {
+    "baseline_specification_may_be_referenced": true,
+    "c83_historical_members_eligible_for_future_gate": false,
+    "c84_decision_or_bundle_eligible_for_future_gate": false,
+    "c88_f5_contract_decision_or_receipts_eligible_for_future_gate": false,
+    "fresh_capture_required": true,
+    "fresh_challenge_required": true,
+    "fresh_evidence_required": true,
+    "fresh_node_specific_contract_required": true,
+    "fresh_run_id_required": true,
+    "fresh_source_commit_and_tree_required": true,
+    "fresh_suite_and_domain_required": true,
+    "historical_contract_semantics_may_be_referenced_only": true,
+    "historical_evidence_may_satisfy_only_its_original_scope": true,
+    "historical_evidence_relabeling_forbidden": true,
+    "ineligible_historical_ids": [
+      "a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f",
+      "1841ae06e4c8bef4842a59bbc65362fa860e37d6d8a1d79cc68e3fc5a87004f9",
+      "53c9f7ed099c371724867d060c3994cb4b3ad93d46404156f40914d7f3b30254",
+      "4d70865a6a665829457ee0e9ec34c9fa38de51ed6ee2bcb2be1356d752355c1a",
+      "4f95fcd2b4d2524b1d27fce7bbf77846f4f7d0030da8ebe277ffc062e53550e0"
+    ],
+    "policy_contract_is_evidence": false,
+    "predecessor_source_commits_eligible_as_fresh_source": false
+  },
+  "fixed_qemu_gate": {
+    "additional_emulated_scenarios_must_be_node_specific_and_frozen": true,
+    "applies_to": "prospective-generic-wasm-target-and-release-completion",
+    "baseline": {
+      "argv_semantics": [
+        "-no-user-config",
+        "-machine=virt",
+        "-cpu=rv64",
+        "-smp=1",
+        "-m=128M",
+        "-accel=tcg,thread=single",
+        "-icount=shift=0,align=off,sleep=off",
+        "-nographic",
+        "-nic=none",
+        "-bios=pinned-opensbi",
+        "-kernel=measured-kernel"
+      ],
+      "class": "emulator",
+      "id": "qemu-virt-rv64-tcg-icount-v1",
+      "opensbi": {
+        "bytes": 273048,
+        "sha256": "49bdf7b939bda11321132d1042bf99d7324fb190f1feef423171fed3573f8705"
+      },
+      "physical_provenance": "not-claimed",
+      "qemu": {
+        "bytes": 13511488,
+        "sha256": "ef5c714232320c22561daa0998546b73672e21a2801404714dfbd4982ac7b3c0",
+        "version": "QEMU emulator version 11.0.3"
+      },
+      "target": "riscv64imac-unknown-none-elf"
+    },
+    "baseline_alone_claims_multicore_network_or_storage_coverage": false,
+    "baseline_evidence_reusable": false,
+    "baseline_specification_reusable": true,
+    "canonical_environment_required": true,
+    "exact_binary_and_opensbi_identity_required": true,
+    "fresh_capture_required": true,
+    "fresh_challenge_required": true,
+    "fresh_evidence_required": true,
+    "fresh_node_specific_acceptance_predicates_required": true,
+    "fresh_node_specific_contract_required": true,
+    "fresh_run_id_required": true,
+    "fresh_source_commit_and_tree_required": true,
+    "fresh_suite_and_run_id_domain_required": true,
+    "normal_and_optimized_verification_required": true,
+    "normative_gate": "fresh-source-bound-fixed-qemu",
+    "physical_equivalence_claimed": false,
+    "physical_inputs_permitted": 0,
+    "physical_inputs_required": 0,
+    "physical_provenance": "not-claimed",
+    "successful_policy_check_satisfies_gate": false
+  },
+  "historical_boundaries": {
+    "c1_through_c82": {
+      "current_policy_reopens_nodes": false,
+      "individual_node_rewalk_required": false,
+      "rerun_required": false,
+      "retroactive_rewrite": false,
+      "status": "accepted-complete-by-historical-evidence-policy"
+    },
+    "c83": {
+      "current_policy_reclassifies_historical_evidence": false,
+      "original_contract_physical_requirements_remain_historical": true,
+      "pinned_preparation_members": {
+        "duo_collector": {
+          "bytes": 72450,
+          "git_blob": "ec31216a03f1ddfbdbd6228f5f07ee594cb3cc47",
+          "git_mode": "100755",
+          "path": "scripts/capture-c83-duo-runtime-costs.py",
+          "sha256": "76000ef404a99e794d5175ea6119ef4b6c9bb825a0184c3b61e30e39d50611fe"
+        },
+        "evidence_verifier": {
+          "bytes": 80249,
+          "git_blob": "2a563b2be545baa1f792230f4817e622d6665443",
+          "git_mode": "100644",
+          "path": "scripts/verify-c83-evidence.py",
+          "sha256": "1f21ec3ce2f1fca326d109d60749c3adba5dfebddbecba9381483bff42206b3a"
+        },
+        "qemu_runner": {
+          "bytes": 38965,
+          "git_blob": "5da6567ebd5cd8ac4b82f48018feebb3a5a013c4",
+          "git_mode": "100755",
+          "path": "scripts/qemu-c83-runtime-costs.py",
+          "sha256": "588a9762f2da6cf419220921ad9481b696c11281183b6a3b65357b0db963cdc8"
+        },
+        "schema": {
+          "bytes": 6088,
+          "git_blob": "1da588bd3c8c3f6b1572b3c1a73eef3c9167c8d4",
+          "git_mode": "100644",
+          "path": "benchmarks/wasm-runtime/schema-v1.json",
+          "sha256": "4d36975acde2de015ef75e6ed402201da3d70f516d6d9f620adde08f3e11ed8d"
+        },
+        "source_verifier": {
+          "bytes": 43006,
+          "git_blob": "7f8a62def8d0d9e856b017c1e47dbfe02a1ab639",
+          "git_mode": "100644",
+          "path": "scripts/verify-c83-runtime-costs.py",
+          "sha256": "ee7efeabe9b2f2a85d3d5ccc665c378a542195540a40cac0912f80e08f77458d"
+        },
+        "workloads": {
+          "bytes": 5994,
+          "git_blob": "61feee3a19dd394db1abcfef7e7dabfa5e9d1a58",
+          "git_mode": "100644",
+          "path": "benchmarks/wasm-runtime/workloads-v1.json",
+          "sha256": "8b5bec7eacd2fd706b716b005af3a5a085730afdeb20839e905cf9177e70aeb4"
+        }
+      },
+      "preparation": {
+        "commit": "1a65ce75ef46210f89268a74ed8afc4e7c6b79fd",
+        "must_be_ancestor_of_checked_head": true,
+        "tree": "b07c7fbcf4a2672264cf6c5a65e52dece81aa2d7"
+      },
+      "rerun_required": false,
+      "retroactive_rewrite": false,
+      "status": "accepted-complete-by-historical-evidence-policy"
+    },
+    "c84": {
+      "aot_authorized": false,
+      "audit": {
+        "commit": "25111e04d3d1aa55e52bb29d05b66d0bfde087a3",
+        "must_be_ancestor_of_checked_head": true,
+        "pinned_members": {
+          "integrity_contract": {
+            "bytes": 6017,
+            "git_blob": "d25bec68a27c88f5f67f0e79ef29e0f3232a0725",
+            "git_mode": "100644",
+            "path": "benchmarks/wasm-aot-decision/qemu-v1-publication-integrity-contract.json",
+            "sha256": "bb93cc7d72ff9d2e0425b1a7a105de9243b5ae0e3f08a232d35ea0c2eec6d745"
+          },
+          "integrity_verifier": {
+            "bytes": 49741,
+            "git_blob": "2f1a236bf1dd0e4c5c39a3feb42a2389d5e3d330",
+            "git_mode": "100644",
+            "path": "scripts/verify-c84-qemu-published-evidence.py",
+            "sha256": "ab7021d1451d5fecd6a85e490d402baf290917f35874972fbadea9323cae66c7"
+          }
+        },
+        "tree": "800952738c5d2a0a547163cfa7e77acd48656479"
+      },
+      "historical_next_node": "C8.8-skip-or-defer-C8.5-C8.7",
+      "native_code_accepted": false,
+      "outcome": "aot-not-justified-on-fixed-qemu",
+      "publication": {
+        "commit": "cbb1d0fb0261377b848b218c9a31f862f7ec42ed",
+        "tree": "72a21b59dc563e193185aa8a2d60f4ee0c6df850"
+      },
+      "replacement_scope": "c84-only",
+      "run_id": "a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f",
+      "source": {
+        "commit": "e950a2facb6a6c230e67becb186bddf34a5924bb",
+        "tree": "235541126f0e8445ee5a884985db4ccd9bb24104"
+      },
+      "status": "complete-for-selected-workload-by-formal-fixed-qemu-evidence"
+    },
+    "c88_f5": {
+      "completion_scope": "c88-f5-float-widening-only",
+      "contract_member_required_at_source_and_publication": true,
+      "decision_id": "1841ae06e4c8bef4842a59bbc65362fa860e37d6d8a1d79cc68e3fc5a87004f9",
+      "pinned_publication_members": {
+        "contract": {
+          "bytes": 14364,
+          "git_blob": "c8751d541269b485ea0786a66ced506d2902caf1",
+          "git_mode": "100644",
+          "path": "acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-contract.json",
+          "sha256": "93b10e8311ce7794a923425018f834b3cc8b62eddf664285e8dc2a29aaedd1d9"
+        },
+        "decision": {
+          "bytes": 16608,
+          "git_blob": "1f43528cbb95c5f5d9d3731db7aa19997bee3ca8",
+          "git_mode": "100644",
+          "path": "acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-decision.json",
+          "sha256": "1d118cdb4f5709f4ce93331b1cd6b60435e6c530eb800e9c21e0a3e8569030d4"
+        },
+        "normal_receipt": {
+          "bytes": 2991,
+          "git_blob": "9c130c15dfaaab29000f5bfbf64598d87fe86b99",
+          "git_mode": "100644",
+          "path": "acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-normal-receipt.json",
+          "sha256": "4d70865a6a665829457ee0e9ec34c9fa38de51ed6ee2bcb2be1356d752355c1a"
+        },
+        "optimized_receipt": {
+          "bytes": 3000,
+          "git_blob": "970cbaf51c5960c374654a78d6051da6efe4ce44",
+          "git_mode": "100644",
+          "path": "acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-optimized-receipt.json",
+          "sha256": "4f95fcd2b4d2524b1d27fce7bbf77846f4f7d0030da8ebe277ffc062e53550e0"
+        },
+        "verifier": {
+          "bytes": 164132,
+          "git_blob": "6a41c789612a1ba9136b85ba488f1eed941eaabb",
+          "git_mode": "100644",
+          "path": "scripts/verify-c88-f5-qemu-target-gate.py",
+          "sha256": "cc3c486dfe4cb13d7cb0767dbce9f97f005e976bbeed05dc66a17dee405a9a87"
+        }
+      },
+      "publication": {
+        "commit": "5a6e88407056fdfed0974586479b42b5bd1470fb",
+        "must_be_ancestor_of_checked_head": true,
+        "tree": "d296000b1ba170aaafcbd7e8ca4f689c119b9921"
+      },
+      "replacement_scope": "c88-f5-only",
+      "run_id": "53c9f7ed099c371724867d060c3994cb4b3ad93d46404156f40914d7f3b30254",
+      "semantic_sha256": "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1",
+      "source": {
+        "commit": "0f06212f890077b2a3d1b4405a128058cb07c55e",
+        "tree": "a3a3ef403b80eb51e60dd3cb6a2a5b5a6d3aed6d"
+      },
+      "status": "complete-by-formal-fixed-qemu-evidence"
+    },
+    "successor_charter": {
+      "pinned_publication_members": {
+        "contract": {
+          "bytes": 9885,
+          "git_blob": "52937bdac374f5cb852f88a5faae3ad27e7e47fb",
+          "git_mode": "100644",
+          "path": "acceptance/wasm-float-target/artifacts/float-successor-review-boundary-v1-contract.json",
+          "sha256": "963c776ec5c1e6a7fa60f97b89b52a78a1857c6154718fbff906c5e59d8b2fe8"
+        },
+        "verifier": {
+          "bytes": 42675,
+          "git_blob": "1a2aa19b6eadeb48192418eb6234a5f6ff32dd51",
+          "git_mode": "100644",
+          "path": "scripts/verify-c88-float-successor-review-boundary.py",
+          "sha256": "ecc7f661b9ca4789a33a23f8bef8615d6c3fa810a1955f4dec3de21f99339b45"
+        }
+      },
+      "publication": {
+        "commit": "180393e53eff1be66b2d3be1ff26779d831c8865",
+        "must_be_ancestor_of_checked_head": true,
+        "tree": "9a6d2ec94d8785bdda6f985b882cc90e239641bd"
+      },
+      "roadmap_position": "post-c88-f5-pre-allocation",
+      "state": "unallocated",
+      "status": "review-charter-not-design-decision-not-evidence"
+    }
+  },
+  "limitations": [
+    "This is an effective prospective gate policy, not target evidence, gate satisfaction, release authorization, or a physical-equivalence claim.",
+    "The fixed baseline is emulator-scoped and by itself claims no multicore, network, storage, physical cache, DMA, entropy, thermal, electrical, or certification coverage.",
+    "Every future allocated WASM target or release gate needs fresh node-specific source, suite, challenge, run, capture, acceptance predicates, and evidence.",
+    "C8.3, C8.4, and C8.8-F5 historical members remain frozen in their original scopes and cannot be promoted into future gate evidence.",
+    "Milk-V Duo testing remains paused; optional future observations are separate and have no gate, completion, or release effect.",
+    "Unrelated board, device, entropy, physical-security, and certification gates remain unchanged.",
+    "Artifact profile code 5 remains permanently validation-only and inert and cannot be promoted or migrated in place.",
+    "No successor identity, roadmap number, profile, ABI, engine, implementation, execution, admission, release, or production authority is allocated."
+  ],
+  "policy_basis": {
+    "branch": "codex/wasm",
+    "commit": "adb2c6abedba24e4cb13f262de37931fd0913080",
+    "must_be_ancestor_of_checked_head": true,
+    "role": "last-pushed-pre-policy-strengthening-basis",
+    "self_binding_claimed": false,
+    "tree": "8016339f6a11c725652e02a819dc14a70da0d083"
+  },
+  "policy_checkpoint": {
+    "c_number_allocated": false,
+    "identity": "wasm-fixed-qemu-target-release-policy-v1",
+    "kind": "roadmap-governance-policy-checkpoint",
+    "product_roadmap_node": false,
+    "resolves_successor_review_question": false,
+    "successor_roadmap_node": false
+  },
+  "repository_integration": {
+    "aot_decision_doc": "docs/WASM_AOT_DECISION.md",
+    "aot_readme": "benchmarks/wasm-aot-decision/README.md",
+    "ci": ".github/workflows/ci.yml",
+    "ci_step_name": "Verify the prospective fixed-QEMU WASM target/release policy",
+    "float_profile_doc": "docs/WASM_FLOAT_PROFILE.md",
+    "pinned_files": {
+      ".github/workflows/ci.yml": {
+        "bytes": 23970,
+        "sha256": "d489d727545a30e9416408b744d45ad0aeebbe8aa06a30b02245a2bf6f87ae69"
+      },
+      "TESTING.md": {
+        "bytes": 126307,
+        "sha256": "8fc9d5cc00771d2b06c2429fd7a174415fdbbbeca359d11f289377a8826296b6"
+      },
+      "benchmarks/wasm-aot-decision/README.md": {
+        "bytes": 16267,
+        "sha256": "14b7e2f12e1dfc69c3636aa8a538daa456c4d9573e484f9c3cd5ef2bc6ed59a4"
+      },
+      "benchmarks/wasm-runtime/README.md": {
+        "bytes": 1200,
+        "sha256": "5e1e1bd8c21dc2f1badecc2f29dc52209cfa4682744c0677abdba604df1dd5b1"
+      },
+      "docs/WASM_AOT_DECISION.md": {
+        "bytes": 83825,
+        "sha256": "106fb19131639802144b7f74f6aa5057090e4a3a55a4a89ebb6e7cc38c31e9bd"
+      },
+      "docs/WASM_FLOAT_PROFILE.md": {
+        "bytes": 32867,
+        "sha256": "97c7326a7cdb44005bc0b3b5de1c2560a26bf9ceafd6849c250b35e48505e315"
+      },
+      "docs/WASM_ROADMAP.md": {
+        "bytes": 92738,
+        "sha256": "f52fe7f2ad289f2b26bb7da8111c4f78ad594b574d9219ab41dff03727e681c0"
+      },
+      "docs/WASM_RUNTIME_COSTS.md": {
+        "bytes": 12908,
+        "sha256": "3eb717ad1d6681ae073b1ba10f872cc05830911ae7204a078ec64ad87b7534ac"
+      }
+    },
+    "roadmap": "docs/WASM_ROADMAP.md",
+    "runtime_costs_doc": "docs/WASM_RUNTIME_COSTS.md",
+    "runtime_costs_readme": "benchmarks/wasm-runtime/README.md",
+    "testing": "TESTING.md",
+    "verification_commands": [
+      "python3 -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract",
+      "python3 -O -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract",
+      "python3 -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --selftest",
+      "python3 -O -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --selftest"
+    ]
+  },
+  "roadmap_position": "post-c88-f5-pre-allocation",
+  "schema": "vibeos.wasm.fixed-qemu-target-release-policy-v1.contract",
+  "scope": "prospective-wasm-roadmap-target-and-release-gates",
+  "status": "effective-policy-not-target-evidence-not-release-authorization",
+  "successor_boundary": {
+    "artifact_abi_allocated": false,
+    "component_model_revision_selected": false,
+    "core_wasm_revision_selected": false,
+    "engine_identity_selected": false,
+    "engine_supply_chain_selected": false,
+    "execution_stage_selected": false,
+    "global_policy_constrains_future_answer": true,
+    "implementation_gate_open": false,
+    "profile_code_allocated": false,
+    "review_passed": false,
+    "roadmap_node_allocated": false,
+    "runtime_abi_allocated": false,
+    "selects_successor_target_policy": false,
+    "state": "unallocated",
+    "successor_gate_selected": false,
+    "target_release_evidence_question": "unresolved-blocking",
+    "wit_world_selected": false
+  },
+  "unrelated_hardware_gates": {
+    "coverage_not_claimed": {
+      "cache_dma_irq_or_device_reset": true,
+      "dwc2_usb_hid_or_mass_storage": true,
+      "dwmac_dhcp_tcp_or_ssh": true,
+      "jitterentropy_or_device_host_key": true,
+      "native_microsd_sdhci_or_storage": true,
+      "physical_security_or_certification": true,
+      "thermal_electrical_or_physical_soak": true
+    },
+    "excluded_gate_classes": [
+      "milkv-duo-board-bringup-and-boot",
+      "native-microsd-sdhci-storage",
+      "dwmac-dhcp-tcp-ssh-network",
+      "dwc2-usb-hid-mass-storage",
+      "jitterentropy-entropy-and-host-key",
+      "cache-dma-irq-and-device-reset",
+      "thermal-electrical-long-duration",
+      "physical-security-and-certification"
+    ],
+    "fixed_qemu_may_satisfy_excluded_gates": false,
+    "unchanged": true
+  },
+  "version": 1
+}

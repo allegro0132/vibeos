@@ -186,16 +186,26 @@ AOT decision. Its raw input is a stable non-empty regular file capped at
 268,435,456 bytes; derived summary creation is no-clobber unless `--overwrite`
 is supplied explicitly.
 
-Current execution status (2026-08-28): the fixed-QEMU formal result completes
-C8.4 for the selected workload with outcome
+Historical C8.4 decision status (published 2026-08-28): C1 through C8.2 remain
+accepted complete by historical-evidence policy; none is reopened, rerun, or
+individually rewalked. The fixed-QEMU formal
+result completes C8.4 for the selected workload with outcome
 `aot-not-justified-on-fixed-qemu`; C8.5 through C8.7 are skipped for that
-workload and remain globally deferred, and work continues at C8.8. Milk-V Duo
-physical testing is paused and the retained physical toolchain remains
-available for future qualification. Its runtime evidence is software custody from the local Docker
-daemon plus an in-container namespace witness; it is not a TPM,
-remote-attestation, hardware, or physical-cold-boot proof. These CI-safe
-commands do not open a UART, invoke Docker, access the network, flash media,
-reset a board, or require an SDK:
+workload and remain globally deferred. The stored next-node value remains
+`C8.8-skip-or-defer-C8.5-C8.7`; the live roadmap position is
+`post-c88-f5-pre-allocation`, which does not rewrite this historical decision.
+Milk-V Duo physical testing is paused and the retained physical toolchain
+remains available for future qualification. Its runtime evidence is software
+custody from the local Docker daemon plus an in-container namespace witness;
+it is not a TPM, remote-attestation, hardware, or physical-cold-boot proof.
+
+The immutable historical C8.4 `next_node` value is
+`C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position.
+The current roadmap position is `post-c88-f5-pre-allocation`; no successor is
+allocated or authorized.
+
+These CI-safe commands do not open a UART, invoke Docker, access the network,
+flash media, reset a board, or require an SDK:
 
 ```sh
 bash -n scripts/build-milkv-duo.sh
@@ -208,6 +218,10 @@ python3 -B scripts/capture-c84-duo-aot-decision.py --selftest
 python3 -B scripts/verify-c84-evidence.py --selftest
 ```
 
+The separate non-numbered fixed-QEMU target/release policy is prospective. It
+does not broaden C8.4, alter its stored next-node value, or allow this evidence
+bundle to satisfy a future node's fresh source-bound campaign.
+
 The deferred Duo-v1 physical build/package/image/capture/publication commands
 are documented in
 [`docs/WASM_AOT_DECISION.md`](../../docs/WASM_AOT_DECISION.md). In particular,
@@ -215,7 +229,7 @@ the capture command accepts only an explicitly named read-only UART, refuses
 `usbmodem` monitor/control paths, performs no serial writes, reset,
 auto-discovery, or flash, and requires an interactive `COLD BOOT N`
 acknowledgement for each of three boots. Those commands are intentionally not
-being run while the physical gate is paused.
+being run while physical testing is paused.
 
 During preparation, before any decision-bearing capture may be produced, the
 exact frozen workload's portable profile preflight proved that the former

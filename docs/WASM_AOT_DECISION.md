@@ -1,9 +1,11 @@
 # C8.4 AOT decision contracts
 
-As of 2026-08-28, the independent fixed-QEMU v1 campaign formally completes
-C8.4 for `ssh-case-filter-12k-v1`. C1 through C8.3 remain accepted as complete
-by the project's historical-evidence policy. Milk-V Duo execution remains
-paused at operator request and was not a prerequisite for this decision. The
+The independent fixed-QEMU v1 campaign published on 2026-08-28 formally
+completes C8.4 for `ssh-case-filter-12k-v1`. C1 through C8.2 remain accepted
+complete by historical-evidence policy; none is reopened, rerun, or
+individually rewalked. C8.3 remains accepted as complete by the project's
+historical-evidence policy. Milk-V Duo execution remains paused at operator
+request and was not a prerequisite for this decision. The
 published QEMU result is explicitly emulator-scoped: it cannot claim, imply,
 or be renamed into physical-Duo performance evidence.
 
@@ -13,9 +15,21 @@ It binds source commit
 `e950a2facb6a6c230e67becb186bddf34a5924bb`, run ID
 `a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f`,
 and outcome `aot-not-justified-on-fixed-qemu`. C8.5 through C8.7 were not
-entered for this workload and remain globally deferred; the current
-implementation node is C8.8. The result does not authorize AOT or accept
-native component bytes.
+entered for this workload and remain globally deferred. Its immutable
+historical next-node value is `C8.8-skip-or-defer-C8.5-C8.7`; the live roadmap
+position is now `post-c88-f5-pre-allocation`. The latter does not rewrite the
+C8.4 decision. The result does not authorize AOT or accept native component
+bytes.
+
+The immutable historical C8.4 `next_node` value is
+`C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position.
+The current roadmap position is `post-c88-f5-pre-allocation`; no successor is
+allocated or authorized.
+
+The later non-numbered fixed-QEMU target/release policy checkpoint applies
+prospectively to generic WASM target/release gates. It does not widen the
+historical C8.4 replacement scope, alter the stored next-node value, or permit
+this campaign to be reused as fresh evidence for another node.
 
 The decision-bearing machine-readable contracts are
 [`benchmarks/wasm-aot-decision/workloads-qemu-v1.json`](../benchmarks/wasm-aot-decision/workloads-qemu-v1.json)
@@ -181,8 +195,9 @@ Both predicates must hold to produce
 2. `p95(total_ticks - interpretation_ticks) <= 1_000_000`.
 
 Otherwise the result is `aot-not-justified-on-fixed-qemu`, conditional C8.5
-through C8.7 are skipped or deferred, and work continues at C8.8. In either
-case `aot_authorized=false`, `native_code_accepted=false`,
+through C8.7 are skipped or deferred, and the historical decision records
+`C8.8-skip-or-defer-C8.5-C8.7` as its next node. In either case
+`aot_authorized=false`, `native_code_accepted=false`,
 `platform_class=emulator`, and `physical_provenance=not-claimed`. A malformed,
 incomplete, incorrect, or unstable run produces no decision at all.
 

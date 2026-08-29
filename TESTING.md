@@ -47,7 +47,6 @@ cargo test -p vibeos-driver-dwc2-host -p vibeos-bsp-milkv-duo
 C82_WASI_SDK_PATH=/path/to/wasi-sdk-33.0-arm64-macos \
   ./scripts/test-c82-preview1-corpus.sh # C8.2 source-to-execution gate
 python3 -B scripts/verify-c83-runtime-costs.py --selftest --check-manifest
-python3 -B scripts/qemu-c83-runtime-costs.py --allow-dirty-smoke
 python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
 python3 -B scripts/verify-c83-evidence.py --selftest
 # Published fixed-QEMU C8.4 replacement gate; no QEMU or physical replay
@@ -233,7 +232,7 @@ python3 -B scripts/verify-c88-f5-qemu-target-gate.py \
   --check-decision "$f5_evidence_dir/decision.json" \
   --normal-receipt "$f5_evidence_dir/normal-receipt.json" \
   --optimized-receipt "$f5_evidence_dir/optimized-receipt.json"
-# C8.8-F5 Milk-V Duo contract and compile-readiness gates.
+# C8.8-F5 Milk-V Duo retained contract and compile-readiness checks.
 # Compile/static inspection only: no packaging, flashing, serial access, boot,
 # capture, or physical-evidence claim.
 cargo test --locked --offline -p vibeos-wasm-float-target \
@@ -599,6 +598,9 @@ both filters through the bounded acceptance broker, and checks the feature-off,
 loader-isolation, and RISC-V `no_std` paths. It does not enable the Preview1
 profile for ordinary loader, graph, VSH, or durable registration.
 
+C1 through C8.2 remain accepted complete by historical-evidence policy; none
+is reopened, rerun, or individually rewalked.
+
 The C8.3 runtime-cost preparation and physical publication flow is documented
 in [docs/WASM_RUNTIME_COSTS.md](docs/WASM_RUNTIME_COSTS.md). Its dedicated image
 emits target-owned raw `rdtime` samples for validation, startup, Canonical ABI,
@@ -733,15 +735,20 @@ attestation and separately runs the complete package-mode verifier because its
 image report still binds the package attestation. This accommodates Docker
 Desktop inode remapping without weakening the host-side independence proof.
 
-The retained physical evidence gate binds three distinct boot indexes, revalidates the
-independently frozen C8.4 source and offline container-runtime closure, reruns
-the complete C8.3 evidence verifier from that explicit full preparation
-commit, and independently derives nearest-rank p50/p95 from all 63 retained
-samples. It remains available for future qualification but no longer blocks
-C8.4. Current execution status (2026-08-28): Milk-V Duo physical testing is
-paused, C1 through C8.3 are accepted by historical evidence, and formal
-fixed-QEMU evidence completes C8.4 for `ssh-case-filter-12k-v1`. The published
-bundle at `benchmarks/wasm-aot-decision/qemu-v1/` binds source commit
+The fixed-QEMU plus three-cold-boot Duo text below is the original v1
+publication contract, not a current physical prerequisite or a new publication
+claim.
+
+The retained physical evidence contract binds three distinct boot indexes,
+revalidates the independently frozen C8.4 source and offline container-runtime
+closure, reruns the complete C8.3 evidence verifier from that explicit full
+preparation commit, and independently derives nearest-rank p50/p95 from all 63
+retained samples. It remains available for future qualification but no longer
+blocks C8.4. Historical C8.4 execution status (published 2026-08-28): Milk-V
+Duo physical testing is paused, C1 through C8.3 are accepted by historical
+evidence, and formal fixed-QEMU evidence completes C8.4 for
+`ssh-case-filter-12k-v1`. The published bundle at
+`benchmarks/wasm-aot-decision/qemu-v1/` binds source commit
 `e950a2facb6a6c230e67becb186bddf34a5924bb` and run ID
 `a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f`.
 Total p50/p95 are 2,899,765/2,901,632 ticks, interpretation p50/p95 are
@@ -749,12 +756,19 @@ Total p50/p95 are 2,899,765/2,901,632 ticks, interpretation p50/p95 are
 2,802,541/2,804,417. Stability passes and `budget_miss=true`, but
 `interpretation_attribution=false`; the formal outcome is
 `aot-not-justified-on-fixed-qemu`. C8.5 through C8.7 were not entered for this
-workload and remain globally deferred, so the current implementation node is
-C8.8. The evidence records `platform_class=emulator`,
+workload and remain globally deferred. The stored next-node value remains
+`C8.8-skip-or-defer-C8.5-C8.7`; the live roadmap position is
+`post-c88-f5-pre-allocation`. This does not rewrite the historical C8.4
+decision. The evidence records `platform_class=emulator`,
 `physical_provenance=not-claimed`, `aot_authorized=false`, and
 `native_code_accepted=false`. Source immutability and Docker runtime custody
 remain local software evidence, not hardware, TPM, remote-attestation, or
 physical-cold-boot proof.
+
+The immutable historical C8.4 `next_node` value is
+`C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position.
+The current roadmap position is `post-c88-f5-pre-allocation`; no successor is
+allocated or authorized.
 
 The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
 strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
@@ -867,10 +881,11 @@ The Duo result is compile readiness only. It was not packaged, flashed, run, or
 captured and does not establish physical or source-build provenance. Its
 contract records `execution_armed=false`, `physical_evidence_present=false`,
 and three required physical cold boots with every present counter at zero. The
-sentinel ELF and run ID can never satisfy that gate, and patching this readiness
-image is not an arming procedure. Resumed testing requires a separately
-reviewed physical feature/arm producer with formal, non-sentinel bindings; its
-same-identity rule applies only across that future run's three captures.
+sentinel ELF and run ID can never satisfy that retained contract, and
+patching this readiness image is not an arming procedure. Resumed testing
+requires a separately reviewed physical feature/arm producer with formal,
+non-sentinel bindings; its same-identity rule applies only across that future
+run's three captures.
 
 The disjoint future wire contract is now frozen as suite
 `vibeos.c88.f5.float-target.duo-physical-v1`, with the independently hashed
@@ -892,9 +907,12 @@ created. Completion opens design review only for a separately numbered,
 currently unallocated successor. The normative contract and retained decision
 are [qualification-qemu-target-gate-v1-contract.json](acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-contract.json)
 and [qualification-qemu-target-gate-v1-decision.json](acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-decision.json).
-The retained Duo readiness gate remains in
+The retained Duo readiness artifact remains in
 [qualification-duo-v1-manifest.json](acceptance/wasm-float-target/artifacts/qualification-duo-v1-manifest.json)
 as scoped non-evidence.
+
+The C8.8-F5 replacement remains scoped to F5 only; the independent prospective
+fixed-QEMU target/release policy does not reclassify or promote F5 evidence.
 
 The neutral post-F5 machine charter is
 [float-successor-review-boundary-v1-contract.json](acceptance/wasm-float-target/artifacts/float-successor-review-boundary-v1-contract.json).
@@ -910,6 +928,42 @@ implementation, execution, or production authority. All eight review questions
 remain unresolved and blocking.
 Milk-V Duo remains paused and non-evidence, physical inputs remain zero, and
 unrelated hardware gates are unchanged.
+
+## Fixed-QEMU target/release policy v1
+
+This section and the canonical contract are normative for this policy; no
+other prose in `TESTING.md` can override them.
+
+The non-numbered **Fixed-QEMU target/release policy v1** checkpoint is at
+`post-c88-f5-pre-allocation`; it is a policy checkpoint, not a roadmap
+implementation node. For every future allocated node that uses the generic
+WASM target/release gate, it requires a fresh source-bound
+`qemu-virt-rv64-tcg-icount-v1` campaign with a new identity and evidence set.
+Historical C8.4 and C8.8-F5 artifacts cannot be promoted or reused as that
+evidence. The policy fixes `physical_inputs_required=0`,
+`physical_inputs_permitted=0`, `physical_provenance=not-claimed`, and
+`physical_equivalence_claimed=false`. Milk-V Duo stays a paused optional,
+separately labelled observation with `gate_effect=false`,
+`completion_effect=false`, and `release_effect=false`.
+
+The replacement does not apply to real-hardware gates for microSD, DWMAC, USB,
+entropy, cache/DMA coherency, thermal/electrical behavior, or certification.
+It allocates no successor and authorizes no engine, implementation, execution,
+admission, durable publication, release, production use, native bytes, AOT,
+JIT, RWX, migration, rollout, or in-place promotion. Profile code 5 remains
+permanently `ValidationOnly` and inert. Verify the canonical policy contract in
+all four interpreter modes:
+
+```sh
+# Prospective fixed-QEMU WASM target/release policy; static contract checks only.
+# These commands run no QEMU or Duo, satisfy no target or release gate, and allocate no successor.
+python3 -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract
+python3 -O -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract
+python3 -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --selftest
+python3 -O -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --selftest
+```
+
+## Retained C8.4 implementation notes
 
 For the historical C8.4 Duo/AOT flow only, see
 [docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md). It is not the C8.8-F5

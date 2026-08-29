@@ -3629,16 +3629,20 @@ def verify_docs_ci(inputs: Inputs) -> None:
     c83_build_index = ci_lines.index(
         "      - name: Build the isolated Milk-V Duo C8.3 sampler (CI-only identity)"
     )
-    c83_index = ci_lines.index("      - name: Exercise the fixed-QEMU C8.3 publication contract")
     ordinary_duo_index = ci_lines.index("      - name: Build the Milk-V Duo kernel")
     require(
         qemu_checkout_index
         < qemu_index
         < physical_index
         < c83_build_index
-        < c83_index
         < ordinary_duo_index,
         "CI frozen physical collector gate order differs",
+    )
+    require(
+        "      - name: Exercise the fixed-QEMU C8.3 publication contract"
+        not in ci_lines
+        and "qemu-c83-runtime-costs.py" not in inputs.ci,
+        "CI reruns the historical C8.3 formal QEMU campaign",
     )
     comments = "\n".join(ci_lines[max(0, physical_index - 3) : physical_index]).lower()
     require(
@@ -3751,7 +3755,23 @@ def verify_docs_ci(inputs: Inputs) -> None:
             phrase in decision_status,
             f"decision doc software-only CI boundary omits {phrase!r}",
         )
-    require("implementation in progress" in inputs.roadmap, "roadmap no longer reports the remaining physical evidence work")
+    roadmap_status_prefix = (
+        "# Component Model admitted-code roadmap\n\n"
+        "This document defines the dependency order, security invariants, acceptance\n"
+        "gates, and compatibility boundaries for admitting WebAssembly components into\n"
+        "VibeOS. It complements [BLUEPRINT.md](BLUEPRINT.md),\n"
+        "[CAPABILITY_SHELL.md](CAPABILITY_SHELL.md), and\n"
+        "[PROGRAM_PERSISTENCE.md](PROGRAM_PERSISTENCE.md).\n\n"
+        "**Status (2026-08-29): implementation in progress.**"
+    )
+    require(
+        inputs.roadmap.startswith(roadmap_status_prefix)
+        and inputs.roadmap.count(
+            "**Status (2026-08-29): implementation in progress.**"
+        )
+        == 1,
+        "roadmap top-level implementation status differs",
+    )
     roadmap_status = (
         re.sub(r"\s+", " ", inputs.roadmap.lower())
         .replace("cold-boot", "cold boot")
@@ -3794,7 +3814,6 @@ def verify_docs_ci(inputs: Inputs) -> None:
             "aot-not-justified-on-fixed-qemu",
             "e950a2facb6a6c230e67becb186bddf34a5924bb",
             "a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f",
-            "current implementation node is c8.8",
             "platform_class=emulator",
             "physical_provenance=not-claimed",
         ):
@@ -6627,6 +6646,18 @@ echo "Milk-V Duo binary: $output_bin"''',
             ),
         ),
         (
+            "ci-restores-c83-formal-qemu-campaign",
+            lambda data: mutate_text(
+                data,
+                "ci",
+                "      - name: Build the Milk-V Duo kernel",
+                "      - name: Exercise the fixed-QEMU C8.3 publication contract\n"
+                "        run: python3 -B scripts/qemu-c83-runtime-costs.py\n"
+                "      - name: Build the Milk-V Duo kernel",
+                "CI historical C8.3 formal campaign",
+            ),
+        ),
+        (
             "testing-overclaims-ci-evidence",
             lambda data: mutate_text(
                 data,
@@ -6656,6 +6687,17 @@ echo "Milk-V Duo binary: $output_bin"''',
                 "Milk-V Duo physical testing is paused at operator request.",
                 "Milk-V Duo physical testing is complete.",
                 "roadmap operator-paused physical status",
+            ),
+        ),
+        (
+            "roadmap-top-level-status-decoy",
+            lambda data: mutate_text(
+                data,
+                "roadmap",
+                "**Status (2026-08-29): implementation in progress.**",
+                "**Status (2026-08-29): planned.**\n\n"
+                "The words implementation in progress are only a decoy.",
+                "roadmap top-level status",
             ),
         ),
         (

@@ -1,6 +1,6 @@
 # Deterministic SIMD profile
 
-Status: `c810-s3-simd-contained-corpora-passed-pre-admission`.
+Status: `c810-s4-simd-admission-lifecycle-closed-pre-fixed-qemu`.
 
 This document defines the independently numbered C8.10 widening. It is the
 first unfinished non-Float C8.8 feature selected after C8.9 closure. C8.10-S1
@@ -57,9 +57,14 @@ semantic LLVM FP, runtime float helper, or RISC-V F, D, or V instruction.
 The default-off `vibeos-wasm-simd-candidate` exercises integer, saturating,
 shuffle, memory, floating-lane, repeatability, adjacent-feature rejection, and
 exact fuel boundaries. It is acceptance-only, import-free, not production
-ready, and supplies no current engine. C8.10-S3 now proves that `v128` remains
+ready, and supplies no current engine. C8.10-S3 proves that `v128` remains
 embedded-Core-only and pins separate 512-case differential and mutation
-corpora. Production admission and lifecycle remain C8.10-S4 work.
+corpora. C8.10-S4 adds an exact-image-pinned, authority-free, default-off
+volatile admission token and a one-instance acceptance lifecycle. Activation
+revalidates the Component/Core plan; cancel and fault reclaim the instance,
+recovery is explicit, the next poll recompiles from the retained validated Core
+bytes, and revoke is terminal. This is not ordinary command admission or
+durable loader recovery.
 
 ## Ordered nodes
 
@@ -68,7 +73,7 @@ corpora. Production admission and lifecycle remain C8.10-S4 work.
 | C8.10-S1 | Freeze code 7, ABI/revisions, semantics, engine design, authority boundary, and target policy |
 | C8.10-S2 | Complete: independent deterministic Core SIMD engine, supply chain, fuel, and RISC-V object audit |
 | C8.10-S3 | Complete: Component containment plus fixed differential and fuzz corpora; `v128` remains Core-internal |
-| C8.10-S4 | Close default-off candidate admission, quota, lifecycle, recovery, and durable rejection |
+| C8.10-S4 | Complete: default-off candidate admission, quota, lifecycle, recovery, and durable rejection |
 | C8.10-S5 | Pass fresh normal/optimized fixed-QEMU qualification and decide only successor-review eligibility |
 
 The fixed target gate is `qemu-virt-rv64-tcg-icount-v1` with fresh source/tree,
@@ -113,4 +118,17 @@ python3 -O -B scripts/verify-c810-simd-containment-corpus.py --check-contract
 python3 -B scripts/verify-c810-simd-containment-corpus.py --selftest
 python3 -O -B scripts/verify-c810-simd-containment-corpus.py --selftest
 cargo test --locked --offline -p vibeos-component-runtime --features c810-s3-acceptance --test c810_s3_simd_containment
+```
+
+The canonical S4 admission/lifecycle contract is
+[`c810-simd-admission-lifecycle-v1-contract.json`](../acceptance/wasm-simd-target/artifacts/c810-simd-admission-lifecycle-v1-contract.json).
+Verify it with:
+
+```sh
+python3 -B scripts/verify-c810-simd-admission-lifecycle.py --check-contract
+python3 -O -B scripts/verify-c810-simd-admission-lifecycle.py --check-contract
+python3 -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
+python3 -O -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
+cargo test --locked --offline -p vibeos-component-admission --features c810-s4-acceptance --test c810_s4_simd_admission
+cargo test --locked --offline -p vibeos-component-loader profile_instance_limits_and_exact_wit_are_revalidated
 ```

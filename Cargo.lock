@@ -1494,6 +1494,7 @@ dependencies = [
  "vibeos-component-runtime",
  "vibeos-core",
  "vibeos-wasm-runtime",
+ "vibeos-wasm-simd-candidate",
  "wasmparser 0.255.0",
  "wat",
 ]

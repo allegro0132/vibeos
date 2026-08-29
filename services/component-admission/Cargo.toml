@@ -11,12 +11,19 @@ vibeos-component-host = { path = "../component-host" }
 vibeos-component-runtime = { path = "../../component-runtime" }
 vibeos-core = { path = "../../core" }
 vibeos-wasm-runtime = { path = "../../wasm-runtime" }
+vibeos-wasm-simd-candidate = { path = "../../wasm-simd-candidate", default-features = false, optional = true }
 wasmparser = { version = "=0.255.0", default-features = false, features = ["component-model", "features", "prefer-btree-collections", "validate"], optional = true }
 
 [features]
 default = []
 c88-f4-acceptance = ["vibeos-component-runtime/c88-f4-acceptance"]
 c89-float-executable = ["vibeos-component-runtime/c89-float-executable"]
+c810-s4-acceptance = [
+    "dep:vibeos-wasm-simd-candidate",
+    "vibeos-component-runtime/c810-s3-acceptance",
+    "vibeos-wasm-runtime/c810-simd-candidate-inspection",
+    "vibeos-wasm-simd-candidate/c810-s2-acceptance",
+]
 native-async-acceptance = ["vibeos-component-runtime/native-async-acceptance"]
 preview1-wrapped-admission = ["dep:wasmparser"]
 # Default-off C8.2 corpus executor. It consumes only a freshly revalidated

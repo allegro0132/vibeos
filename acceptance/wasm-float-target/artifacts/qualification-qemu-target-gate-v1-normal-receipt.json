@@ -1,0 +1,85 @@
+{
+  "content": {
+    "candidate": {
+      "bytes": 15410,
+      "sha256": "f251f844879e103d836eed5b55c151de6f3b00875672a093c0257afcbc513239"
+    },
+    "candidate_content_sha256": "e3610e3f04e74545cdf576b98818a3425bd0a01035f98e49eb6698cad5c27da6",
+    "candidate_decision_id": "1841ae06e4c8bef4842a59bbc65362fa860e37d6d8a1d79cc68e3fc5a87004f9",
+    "decision_verifier": {
+      "bytes": 164132,
+      "sha256": "cc3c486dfe4cb13d7cb0767dbce9f97f005e976bbeed05dc66a17dee405a9a87"
+    },
+    "elf_auditor": {
+      "identity": {
+        "bytes": 92051,
+        "sha256": "3e7d9670c020de2e7ab274eb74b46d13153a0ca553f04d92134bde191e289f1b"
+      },
+      "kernel": {
+        "bytes": 40449184,
+        "sha256": "266b5e6dcce862938be71775106994bcfd3793832f9e216d43c906c2e35953c8"
+      },
+      "optimization_level": 0,
+      "optimization_mode": "normal",
+      "report": {
+        "bytes": 2031,
+        "sha256": "ba4dec8ec6fca71a84092d0dedfa851649ea1663bdddcba77c1aa306560666f6"
+      },
+      "status": "pass"
+    },
+    "evidence": {
+      "elf_audit": {
+        "bytes": 2031,
+        "sha256": "ba4dec8ec6fca71a84092d0dedfa851649ea1663bdddcba77c1aa306560666f6"
+      },
+      "environment": {
+        "bytes": 84807,
+        "sha256": "fc8202f7245422a8d3688879ca7ad29d64695438105dbb8add7465f0506a4302"
+      },
+      "kernel": {
+        "bytes": 40449184,
+        "sha256": "266b5e6dcce862938be71775106994bcfd3793832f9e216d43c906c2e35953c8"
+      },
+      "uart": {
+        "bytes": 384916,
+        "sha256": "c484c3cd0dae2479e52a07fcd048887cbe76bfd1f19cbcb43466bed11b1ef1f7"
+      }
+    },
+    "optimization_level": 0,
+    "optimization_mode": "normal",
+    "physical_inputs": 0,
+    "publisher_challenge_sha256": "e9c4a924d209d58a0fb169be8dcac9ec06247e18be57797ed88d7e790509bcfa",
+    "python_interpreter": {
+      "bytes": 6045728,
+      "sha256": "9a3ab72c2afa1586f204b7e00cf49c42ce890b1b72799ef39a76b093075027d4"
+    },
+    "shared_verifier": {
+      "environment": {
+        "bytes": 84807,
+        "sha256": "fc8202f7245422a8d3688879ca7ad29d64695438105dbb8add7465f0506a4302"
+      },
+      "identity": {
+        "bytes": 134348,
+        "sha256": "36451c3c614486a714b3466b77b329fee8a1368603ffaa9d2925b75b3f666686"
+      },
+      "optimization_level": 0,
+      "optimization_mode": "normal",
+      "records": 1176,
+      "semantic_sha256": "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1",
+      "status": "pass",
+      "uart": {
+        "bytes": 384916,
+        "sha256": "c484c3cd0dae2479e52a07fcd048887cbe76bfd1f19cbcb43466bed11b1ef1f7"
+      }
+    },
+    "source": {
+      "commit": "0f06212f890077b2a3d1b4405a128058cb07c55e",
+      "tree": "a3a3ef403b80eb51e60dd3cb6a2a5b5a6d3aed6d"
+    },
+    "suite_id": "vibeos.c88.f5.float-target.qemu-target-gate-v1"
+  },
+  "content_sha256": "47cd32ad51cbb3f675ebc0c680c95e28a9ac531f4b8334b84d643582323c596a",
+  "schema": "vibeos.c88.f5.float-target.qemu-target-gate-v1.mode-receipt",
+  "status": "pass",
+  "version": 1
+}

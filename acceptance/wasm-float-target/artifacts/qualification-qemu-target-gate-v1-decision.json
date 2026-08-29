@@ -1,0 +1,358 @@
+{
+  "content": {
+    "challenge": "40eaeea4c049b02bc48c2cc36323d62ea8e2855c485e57a4bba690012ec68859",
+    "completion": {
+      "aot_authorized_by_this_decision": false,
+      "c88_complete": true,
+      "c88_completion_scope": "float-widening-only",
+      "code5_activation_authorized": false,
+      "code5_current_component_engine": false,
+      "code5_current_validation_engine": false,
+      "code5_durable_publication_authorized": false,
+      "code5_production_admission_authorized": false,
+      "code5_promotion_in_place_authorized": false,
+      "code5_stage": "validation-only",
+      "duo_physical_evidence_present": false,
+      "duo_physical_gate_satisfied": false,
+      "duo_roadmap_blocking": false,
+      "executable_successor_authorized": false,
+      "f5_complete": true,
+      "float_complete": true,
+      "float_execution_available": false,
+      "native_bytes_accepted_by_this_decision": false,
+      "other_c88_feature_widenings_complete": false,
+      "physical_provenance": "not-claimed",
+      "successor_artifact_abi_allocated": false,
+      "successor_design_review_eligible": true,
+      "successor_engine_identity_selected": false,
+      "successor_execution_authorized": false,
+      "successor_implementation_authorized": false,
+      "successor_production_authorized": false,
+      "successor_profile_code_allocated": false,
+      "successor_runtime_abi_allocated": false,
+      "target_gate_basis": "formal-fixed-qemu-replacement-v1",
+      "target_gate_satisfied": true
+    },
+    "contract": {
+      "bytes": 14364,
+      "contract_status": "decision-contract-not-evidence",
+      "path": "acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-contract.json",
+      "sha256": "93b10e8311ce7794a923425018f834b3cc8b62eddf664285e8dc2a29aaedd1d9"
+    },
+    "decision_id": "1841ae06e4c8bef4842a59bbc65362fa860e37d6d8a1d79cc68e3fc5a87004f9",
+    "decision_id_fields": {
+      "challenge": "40eaeea4c049b02bc48c2cc36323d62ea8e2855c485e57a4bba690012ec68859",
+      "contract_sha256": "93b10e8311ce7794a923425018f834b3cc8b62eddf664285e8dc2a29aaedd1d9",
+      "decision_verifier_sha256": "cc3c486dfe4cb13d7cb0767dbce9f97f005e976bbeed05dc66a17dee405a9a87",
+      "elf_audit_sha256": "ba4dec8ec6fca71a84092d0dedfa851649ea1663bdddcba77c1aa306560666f6",
+      "elf_auditor_sha256": "3e7d9670c020de2e7ab274eb74b46d13153a0ca553f04d92134bde191e289f1b",
+      "environment_evidence_sha256": "890c66df895ceccfafb6345b256c38d503e0f98ae5f357f87ae952313caef821",
+      "environment_sha256": "fc8202f7245422a8d3688879ca7ad29d64695438105dbb8add7465f0506a4302",
+      "kernel_sha256": "266b5e6dcce862938be71775106994bcfd3793832f9e216d43c906c2e35953c8",
+      "qualification_manifest_sha256": "39abd7d8bf25f2da2dfe76109e0811202ba05a9dbc17501ef7a6c2a905c81d76",
+      "run_id": "53c9f7ed099c371724867d060c3994cb4b3ad93d46404156f40914d7f3b30254",
+      "runner_sha256": "8b4391524511550d8a0e9fd0722c697ddc8b6e8d1ebc349fc283708370cf2180",
+      "semantic_sha256": "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1",
+      "shared_verifier_sha256": "36451c3c614486a714b3466b77b329fee8a1368603ffaa9d2925b75b3f666686",
+      "source_commit": "0f06212f890077b2a3d1b4405a128058cb07c55e",
+      "source_tree": "a3a3ef403b80eb51e60dd3cb6a2a5b5a6d3aed6d",
+      "uart_sha256": "c484c3cd0dae2479e52a07fcd048887cbe76bfd1f19cbcb43466bed11b1ef1f7"
+    },
+    "decision_verifier": {
+      "bytes": 164132,
+      "path": "scripts/verify-c88-f5-qemu-target-gate.py",
+      "sha256": "cc3c486dfe4cb13d7cb0767dbce9f97f005e976bbeed05dc66a17dee405a9a87",
+      "source_commit_blob_verified": true
+    },
+    "evidence": {
+      "elf_audit": {
+        "bytes": 2031,
+        "sha256": "ba4dec8ec6fca71a84092d0dedfa851649ea1663bdddcba77c1aa306560666f6"
+      },
+      "environment": {
+        "bytes": 84807,
+        "sha256": "fc8202f7245422a8d3688879ca7ad29d64695438105dbb8add7465f0506a4302"
+      },
+      "environment_evidence_sha256": "890c66df895ceccfafb6345b256c38d503e0f98ae5f357f87ae952313caef821",
+      "kernel": {
+        "bytes": 40449184,
+        "sha256": "266b5e6dcce862938be71775106994bcfd3793832f9e216d43c906c2e35953c8"
+      },
+      "physical_inputs": 0,
+      "recorded_input_paths_trusted": false,
+      "relocated_role_hashes_verified": true,
+      "uart": {
+        "bytes": 384916,
+        "sha256": "c484c3cd0dae2479e52a07fcd048887cbe76bfd1f19cbcb43466bed11b1ef1f7"
+      }
+    },
+    "limitations": [
+      "This contract is not evidence and is ineffective until the required normal/optimized matrix accepts one canonical no-clobber decision.",
+      "This decision closes only the C8.8-F5 Float target gate; every unrelated hardware gate is unchanged.",
+      "This is emulator evidence and makes no Milk-V Duo, physical-hardware, or cold-boot provenance claim.",
+      "The source claim proves clean HEAD equality with the local origin/codex/wasm tracking ref, not a remotely advertised OID.",
+      "The fixed QEMU main binary, OpenSBI bytes, and argv are bound; ambient macOS dyld, dynamic-library, and QEMU module closure remains trusted TCB.",
+      "The four input artifacts are not atomically published; stable final rereads followed by no-clobber DECISION.json form the publication barrier.",
+      "The matrix publisher privately stages the four evidence inputs and an unpublished random challenge, directly executes normal and optimized verifier workers, treats their candidates and receipts only as outputs, and is the sole path that may publish a closed decision.",
+      "The retained Duo readiness and physical-v1 artifacts remain scoped non-evidence; their false completion fields cannot override this C8.8-F5 fixed-QEMU decision.",
+      "The checked-in decision retains hashes and summaries only; complete offline replay requires retaining the kernel, ELF-audit report, UART transcript, and environment envelope.",
+      "Checking the checked-in decision and mode receipts proves only structure, source membership, and hash integrity; it neither replays the four evidence artifacts nor proves that the publisher executed.",
+      "C8.8 completion in this decision means the Float widening only; no other C8.8 feature widening is claimed complete.",
+      "Completion keeps artifact profile code 5 permanently validation-only and opens design review for an unallocated separately numbered successor only."
+    ],
+    "pinned_files": {
+      "elf_auditor": {
+        "bytes": 92051,
+        "path": "scripts/verify-c88-f5-riscv-elf.py",
+        "sha256": "3e7d9670c020de2e7ab274eb74b46d13153a0ca553f04d92134bde191e289f1b"
+      },
+      "producer": {
+        "bytes": 34986,
+        "path": "kernel/src/wasm_float_target.rs",
+        "sha256": "f524ba72d904ce123bab3a5d2e14c8f5ea36885051cd4008d6c0bfa29eb5d06a"
+      },
+      "qualification": {
+        "bytes": 71473,
+        "path": "acceptance/wasm-float-target/src/lib.rs",
+        "sha256": "b24b7e6e48c96f36264e81bb936dda9ed82954f893a7b8b44dea486fa0b06167"
+      },
+      "qualification_manifest": {
+        "bytes": 2090,
+        "path": "acceptance/wasm-float-target/artifacts/qualification-manifest.json",
+        "sha256": "39abd7d8bf25f2da2dfe76109e0811202ba05a9dbc17501ef7a6c2a905c81d76"
+      },
+      "runner": {
+        "bytes": 89050,
+        "path": "scripts/qemu-c88-f5-float-target.py",
+        "sha256": "8b4391524511550d8a0e9fd0722c697ddc8b6e8d1ebc349fc283708370cf2180"
+      },
+      "rust_toolchain": {
+        "bytes": 214,
+        "path": "rust-toolchain.toml",
+        "sha256": "aac4c0b9d7f8d6677de6b396d51beac9adf7847af968d2e8aa376fadec961c9a"
+      },
+      "shared_verifier": {
+        "bytes": 134348,
+        "path": "scripts/verify-c88-f5-float-target.py",
+        "sha256": "36451c3c614486a714b3466b77b329fee8a1368603ffaa9d2925b75b3f666686"
+      }
+    },
+    "platform": {
+      "argv_semantics": [
+        "-no-user-config",
+        "-machine=virt",
+        "-cpu=rv64",
+        "-smp=1",
+        "-m=128M",
+        "-accel=tcg,thread=single",
+        "-icount=shift=0,align=off,sleep=off",
+        "-nographic",
+        "-nic=none",
+        "-bios=pinned-opensbi",
+        "-kernel=measured-kernel"
+      ],
+      "class": "emulator",
+      "id": "qemu-virt-rv64-tcg-icount-v1",
+      "opensbi": {
+        "bytes": 273048,
+        "path": "/opt/homebrew/Cellar/qemu/11.0.3/share/qemu/opensbi-riscv64-generic-fw_dynamic.bin",
+        "sha256": "49bdf7b939bda11321132d1042bf99d7324fb190f1feef423171fed3573f8705"
+      },
+      "physical_provenance": "not-claimed",
+      "qemu": {
+        "bytes": 13511488,
+        "path": "/opt/homebrew/Cellar/qemu/11.0.3/bin/qemu-system-riscv64",
+        "sha256": "ef5c714232320c22561daa0998546b73672e21a2801404714dfbd4982ac7b3c0",
+        "version": "QEMU emulator version 11.0.3\nCopyright (c) 2003-2026 Fabrice Bellard and the QEMU Project developers"
+      },
+      "runtime_custody": {
+        "ambient_macos_dyld_runtime_is_trusted_tcb": true,
+        "argv_frozen": true,
+        "complete_runtime_closure_claimed": false,
+        "macos_dyld_recursive_closure_verified": false,
+        "opensbi_frozen": true,
+        "qemu_main_binary_frozen": true,
+        "qemu_module_recursive_closure_verified": false
+      },
+      "target": "riscv64imac-unknown-none-elf"
+    },
+    "precedence": {
+      "decision_scope": "c88-f5-float-target-exit-status-only",
+      "normative_exit_gate": "formal-fixed-qemu-target-gate-v1",
+      "physical_duo_exit_requirement_replaced": true,
+      "retained_duo_artifacts_may_override_this_decision": false,
+      "retained_duo_false_completion_fields_scope": "their-own-readiness-or-physical-non-evidence-artifacts-only",
+      "unrelated_hardware_gate_precedence": "unchanged"
+    },
+    "publication": {
+      "decision_no_clobber_publication_barrier": true,
+      "input_bundle_atomic_publication": false,
+      "matrix_completion_required_before_effectivity": true,
+      "required_verification_matrix": {
+        "candidate_payload_byte_equality_required": true,
+        "checked_receipt_proves_publisher_execution": false,
+        "checked_receipt_replays_evidence": false,
+        "cross_stage_full_metadata_identity_required": true,
+        "decision_verifier_both_modes_required": true,
+        "elf_audit_report_byte_equality_required": true,
+        "elf_auditor_both_modes_required": true,
+        "elf_auditor_private_input_directory_seal_required": true,
+        "elf_auditor_verified_private_copy_required": true,
+        "live_input_parent_full_metadata_identity_required": true,
+        "matrix_publisher_completion_required_before_effectivity": true,
+        "matrix_publisher_required": true,
+        "mode_receipts_required": true,
+        "publisher_candidate_matches_caller_evidence_required": true,
+        "publisher_owned_worker_exit_and_output_validation_required": true,
+        "publisher_owned_worker_stderr_empty_required": true,
+        "publisher_owned_worker_stdout_canonical_required": true,
+        "python_interpreter_identity_same_required": true,
+        "required_optimization_modes": [
+          "normal",
+          "optimized"
+        ],
+        "shared_verifier_both_modes_required": true,
+        "shared_verifier_result_byte_equality_required": true,
+        "successful_exit_code": 0
+      },
+      "stable_final_reread_required": true
+    },
+    "python_interpreter": {
+      "bytes": 6045728,
+      "sha256": "9a3ab72c2afa1586f204b7e00cf49c42ce890b1b72799ef39a76b093075027d4"
+    },
+    "qualification": {
+      "artifact_abi": 5,
+      "artifact_profile_code": 5,
+      "candidate_production_ready": false,
+      "component_profile": 2,
+      "core_profile": 2,
+      "current_component_engine": false,
+      "current_validation_engine": false,
+      "elf_audit": {
+        "arbitrary_pc_redirection_claimed": false,
+        "canonical_boundaries": 381935,
+        "canonical_decoder_boundaries_only": true,
+        "code_symbols": 128657,
+        "decoded_instructions": 381934,
+        "direct_targets": 42010,
+        "forbidden_float_helpers": 0,
+        "forbidden_opcodes": 0,
+        "hardware_nx_claimed": false,
+        "section_and_segment_wx": true,
+        "static_no_relocations": true,
+        "status": "pass",
+        "trusted_native_control_flow_only": true,
+        "undefined_symbols": 0
+      },
+      "execution_enabled": false,
+      "mode": "formal-qemu",
+      "native_async_runtime_ready": false,
+      "records": {
+        "canonical_abi": 13,
+        "component_vectors": 12,
+        "core": 146,
+        "fuel": 1000,
+        "lifecycle": 5,
+        "total": 1176
+      },
+      "runtime_abi": 5,
+      "runtime_ready": false,
+      "semantic_sha256": "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1",
+      "stage": "validation-only",
+      "suite_id": "vibeos.c88.f5.float-target",
+      "target": "riscv64imac-unknown-none-elf"
+    },
+    "retained_duo_files": {
+      "physical_contract": {
+        "bytes": 5605,
+        "git_mode": "100644",
+        "path": "acceptance/wasm-float-target/artifacts/qualification-duo-physical-v1-contract.json",
+        "sha256": "01284fa4bb76a24e0a40e39fddec109e98ff36ec8912bb806f7a52a520a6617e"
+      },
+      "physical_transcript_schema": {
+        "bytes": 5923,
+        "git_mode": "100644",
+        "path": "acceptance/wasm-float-target/artifacts/qualification-duo-physical-v1-transcript-schema.json",
+        "sha256": "08007a5e68e53181592dd9eaecf124a630b2eddfdc20c146504ff1d4df8811f5"
+      },
+      "physical_verifier": {
+        "bytes": 56129,
+        "git_mode": "100755",
+        "path": "scripts/verify-c88-f5-duo-physical-transcript.py",
+        "sha256": "09a98255b9deb8c5d14b19ecb4c0c5725cfbef25a60b1d84f2f4bbfbda649928"
+      },
+      "readiness_manifest": {
+        "bytes": 4159,
+        "git_mode": "100644",
+        "path": "acceptance/wasm-float-target/artifacts/qualification-duo-v1-manifest.json",
+        "sha256": "1c85f22cacee7c8eb7693578052fe0452169eace99f1dab06e08aa0e42771b11"
+      },
+      "readiness_transcript_schema": {
+        "bytes": 4692,
+        "git_mode": "100644",
+        "path": "acceptance/wasm-float-target/artifacts/qualification-duo-v1-transcript-schema.json",
+        "sha256": "e25d9a38d194993906b7fe5ec9708654ea31e2386ac61f0fa360ed8ad1eb7439"
+      },
+      "readiness_verifier": {
+        "bytes": 102229,
+        "git_mode": "100644",
+        "path": "scripts/verify-c88-f5-duo-readiness.py",
+        "sha256": "b7f0d56f323eb7b155202e1ae33cd0952f772c26a615badcff1596fd75bb46c0"
+      }
+    },
+    "run_id": "53c9f7ed099c371724867d060c3994cb4b3ad93d46404156f40914d7f3b30254",
+    "scope": "c88-f5-formal-fixed-qemu-target-gate-replacement-only",
+    "source": {
+      "branch": "codex/wasm",
+      "claim": "clean-head-equals-local-origin-tracking-ref",
+      "clean": true,
+      "commit": "0f06212f890077b2a3d1b4405a128058cb07c55e",
+      "local_tracking_ref": "refs/remotes/origin/codex/wasm",
+      "local_tracking_ref_commit": "0f06212f890077b2a3d1b4405a128058cb07c55e",
+      "remote_advertised_oid_proven": false,
+      "tree": "a3a3ef403b80eb51e60dd3cb6a2a5b5a6d3aed6d"
+    },
+    "suite_id": "vibeos.c88.f5.float-target.qemu-target-gate-v1",
+    "verification_matrix": {
+      "candidate": {
+        "bytes": 15410,
+        "sha256": "f251f844879e103d836eed5b55c151de6f3b00875672a093c0257afcbc513239"
+      },
+      "candidate_payload_byte_equal": true,
+      "decision_verifier_both_modes": true,
+      "elf_audit_report_byte_equal": true,
+      "elf_auditor_both_modes": true,
+      "modes": [
+        {
+          "optimization_level": 0,
+          "optimization_mode": "normal"
+        },
+        {
+          "optimization_level": 1,
+          "optimization_mode": "optimized"
+        }
+      ],
+      "normal_receipt": {
+        "bytes": 2991,
+        "sha256": "4d70865a6a665829457ee0e9ec34c9fa38de51ed6ee2bcb2be1356d752355c1a"
+      },
+      "optimized_receipt": {
+        "bytes": 3000,
+        "sha256": "4f95fcd2b4d2524b1d27fce7bbf77846f4f7d0030da8ebe277ffc062e53550e0"
+      },
+      "physical_inputs": 0,
+      "publisher_challenge_sha256": "e9c4a924d209d58a0fb169be8dcac9ec06247e18be57797ed88d7e790509bcfa",
+      "python_interpreter_identity_same": true,
+      "schema": "vibeos.c88.f5.float-target.qemu-target-gate-v1.matrix",
+      "shared_verifier_both_modes": true,
+      "shared_verifier_result_byte_equal": true,
+      "status": "pass",
+      "version": 1
+    }
+  },
+  "content_sha256": "27189fb0ff18981dfb72208108b220803cb93adb71acad193c359eb3f996e37d",
+  "schema": "vibeos.c88.f5.float-target.qemu-target-gate-v1.decision",
+  "status": "closed",
+  "version": 1
+}

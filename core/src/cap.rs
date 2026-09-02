@@ -19,9 +19,10 @@ use core::any::Any;
 use core::fmt;
 use core::marker::PhantomData;
 use core::mem;
+use core::num::NonZeroU64;
 use core::ops::Deref;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::heap::{self, OwnerId};
 use vibeos_durable_format::{
@@ -31,6 +32,32 @@ use vibeos_durable_format::{
 
 pub const MAX_PERSISTENT_SLOTS: u32 = 4096;
 pub const CAPABILITY_TABLE_PAGE_SIZE: usize = 4096;
+
+/// Unforgeable process-local identity of one capability space.
+///
+/// Unlike a [`Cap`], this identity is stable across [`CSpace::reset`]. It lets
+/// service adapters reject a cap from another CSpace even when both spaces
+/// happen to contain the same slot and generation in the same incarnation.
+/// The scalar is intentionally private and redacted from diagnostics.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CSpaceIdentity(NonZeroU64);
+
+impl fmt::Debug for CSpaceIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CSpaceIdentity(<redacted>)")
+    }
+}
+
+static NEXT_CSPACE_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_cspace_identity() -> CSpaceIdentity {
+    let raw = NEXT_CSPACE_IDENTITY
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("CSpace identity space exhausted");
+    CSpaceIdentity(NonZeroU64::new(raw).expect("CSpace identity counter reached zero"))
+}
 
 pub type AllocateCapabilityTablePages = fn(page_count: usize) -> *mut u8;
 pub type ProtectCapabilityTablePages = fn(start: usize, page_count: usize, read_only: bool);
@@ -849,6 +876,33 @@ impl PersistentCapIdentity {
 /// Typed, non-forgeable view of one live durable derivation. It retains the
 /// object and ancestry only inside the capability module, allowing a child to
 /// be installed after an asynchronous commit without exposing a raw lookup.
+///
+/// Operation callbacks cannot let a resource borrow escape:
+///
+/// ```compile_fail
+/// use vibeos_core::cap::{PersistentDerivationWitness, Resource, Rights};
+///
+/// fn leak<T: Resource>(witness: &PersistentDerivationWitness<T>) -> &T {
+///     witness
+///         .try_with(Rights::READ, |resource| resource)
+///         .unwrap()
+/// }
+/// ```
+///
+/// Consuming a witness yields only an opaque invocation lease, never its
+/// backing `Arc`:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use vibeos_core::cap::{PersistentDerivationWitness, Resource, Rights};
+///
+/// fn into_arc<T: Resource>(witness: PersistentDerivationWitness<T>) -> Arc<T> {
+///     witness
+///         .try_into_invocation_lease(Rights::READ)
+///         .unwrap()
+///         .into_inner()
+/// }
+/// ```
 pub struct PersistentDerivationWitness<T: Resource> {
     identity: PersistentCapIdentity,
     object: Arc<T>,
@@ -859,6 +913,46 @@ pub struct PersistentDerivationWitness<T: Resource> {
 impl<T: Resource> PersistentDerivationWitness<T> {
     pub const fn identity(&self) -> PersistentCapIdentity {
         self.identity
+    }
+
+    /// Revalidate the complete durable ancestry and required rights, then
+    /// perform one operation without disclosing a borrow or backing `Arc`.
+    ///
+    /// The successful check is the operation's authority-acquisition
+    /// linearization point. Revocation that completed before this call is
+    /// observed; a concurrent revocation prevents later acquisitions but does
+    /// not interrupt a callback which already passed the check.
+    pub fn try_with<R, F>(&self, need: Rights, operation: F) -> Result<R, CapError>
+    where
+        F: for<'a> FnOnce(&'a T) -> R,
+    {
+        self.revalidate(need)?;
+        Ok(operation(&self.object))
+    }
+
+    /// Consume this durable witness into one invocation-scoped non-capability
+    /// borrow alias.
+    ///
+    /// Complete ancestry and rights are checked immediately before delivery.
+    /// Once delivered, the lease follows normal invocation semantics:
+    /// revocation prevents the next acquisition but does not interrupt this
+    /// already-linearized invocation.
+    pub fn try_into_invocation_lease(self, need: Rights) -> Result<InvocationLease<T>, CapError> {
+        self.revalidate(need)?;
+        Ok(InvocationLease {
+            object: self.object,
+            rights: self.identity.rights,
+        })
+    }
+
+    fn revalidate(&self, need: Rights) -> Result<(), CapError> {
+        if !self.node.is_alive() {
+            return Err(CapError::Invalid);
+        }
+        if !self.identity.rights.contains(need) {
+            return Err(CapError::InsufficientRights);
+        }
+        Ok(())
     }
 
     fn into_revocable(self) -> Revocable<T> {
@@ -981,9 +1075,36 @@ impl fmt::Display for PersistentInstallError {
     }
 }
 
+/// Why an exact volatile CSpace lifecycle transition was refused.
+///
+/// Every error is fail-closed: the authoritative table, derivations, slot
+/// generations, identity, and incarnation remain unchanged. Callers must not
+/// treat an identity or incarnation mismatch as evidence that reset happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CSpaceResetError {
+    IdentityMismatch,
+    IncarnationMismatch,
+    PersistentLifecycleRequired,
+    IncarnationExhausted,
+}
+
+impl fmt::Display for CSpaceResetError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::IdentityMismatch => "CSpace identity changed",
+            Self::IncarnationMismatch => "CSpace incarnation changed",
+            Self::PersistentLifecycleRequired => {
+                "CSpace contains durable capability lifecycle state"
+            }
+            Self::IncarnationExhausted => "CSpace incarnation space exhausted",
+        })
+    }
+}
+
 /// A task's capability space. Owning one *is* the task's entire authority.
 pub struct CSpace {
     pub name: String,
+    identity: CSpaceIdentity,
     slots: CapTable,
     incarnation: u64,
     persistent_space: Option<SpaceId>,
@@ -1005,12 +1126,20 @@ impl CSpace {
         })
     }
 
-    fn publish_slots(&mut self, candidate: Vec<Slot>) {
+    fn prepare_slots(candidate: Vec<Slot>) -> CapTable {
         // The detached candidate is moved into a fresh writable page run under
-        // SYSTEM accounting. Protection completes before the pointer becomes
-        // authoritative; the old backing is retired only after replacement.
-        let next = system_allocation(|| CapTable::from_slots(candidate)).publish_read_only();
-        let retired = mem::replace(&mut self.slots, next);
+        // SYSTEM accounting. Protection completes before it can become an
+        // authoritative CSpace table.
+        system_allocation(|| CapTable::from_slots(candidate)).publish_read_only()
+    }
+
+    fn replace_slots(&mut self, next: CapTable) -> CapTable {
+        mem::replace(&mut self.slots, next)
+    }
+
+    fn publish_slots(&mut self, candidate: Vec<Slot>) {
+        let next = Self::prepare_slots(candidate);
+        let retired = self.replace_slots(next);
         drop(retired);
     }
 
@@ -1034,6 +1163,20 @@ impl CSpace {
     /// Empty CSpaces have no backing allocation until their first mutation.
     pub fn capability_table_range(&self) -> Option<CapabilityTableRange> {
         self.slots.range()
+    }
+
+    /// Allocation-free count of installed entries for target lifecycle
+    /// acceptance. Vacant slot generations deliberately survive reset even
+    /// when COW republishes the table, so slot count is not a liveness metric.
+    #[cfg(any(
+        feature = "wasm-c48-target-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance"
+    ))]
+    pub(crate) fn acceptance_installed_capability_count(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.entry.is_some())
+            .count()
     }
 
     /// Reserve the exact slot generation that a durable `GrantRecord` will
@@ -1608,6 +1751,7 @@ impl CSpace {
     pub fn new(name: &str) -> Self {
         system_allocation(|| Self {
             name: String::from(name),
+            identity: allocate_cspace_identity(),
             slots: CapTable::empty(),
             incarnation: 1,
             persistent_space: None,
@@ -1622,6 +1766,7 @@ impl CSpace {
     pub fn new_persistent(name: &str, space: SpaceId) -> Self {
         system_allocation(|| Self {
             name: String::from(name),
+            identity: allocate_cspace_identity(),
             slots: CapTable::empty(),
             incarnation: 1,
             persistent_space: Some(space),
@@ -1632,6 +1777,11 @@ impl CSpace {
 
     pub const fn persistent_space_id(&self) -> Option<SpaceId> {
         self.persistent_space
+    }
+
+    /// Exact process-local identity of this CSpace allocation.
+    pub const fn identity(&self) -> CSpaceIdentity {
+        self.identity
     }
 
     /// Whether this durable space has been fail-closed after an in-memory
@@ -1920,6 +2070,22 @@ impl CSpace {
         self.collect()
     }
 
+    /// Supervisor-only exact revocation of one volatile capability.
+    ///
+    /// Unlike [`CSpace::revoke_slot`], this validates the complete opaque
+    /// handle, including its generation, before touching the derivation node.
+    /// It is therefore safe for a trusted owner to retire an authority removed
+    /// from an external handle table even if its old CSpace slot was reused.
+    pub fn revoke_exact_admin(&mut self, cap: Cap) -> Result<usize, CapError> {
+        let entry = self.entry(cap)?;
+        if entry.node.persistent.is_some() {
+            return Err(CapError::PersistentLifecycleRequired);
+        }
+        let node = entry.node.clone();
+        node.kill();
+        Ok(self.collect())
+    }
+
     /// Revoke everything in this space. What an operator means by "revoke that
     /// component": not one handle, but all of its authority.
     pub fn revoke_all(&mut self) -> usize {
@@ -1940,13 +2106,24 @@ impl CSpace {
         self.collect()
     }
 
-    /// Retire every capability in preparation for a fresh component
-    /// incarnation.
+    /// Validate every reset precondition for one exactly identified volatile
+    /// CSpace incarnation without mutating capabilities or generations.
     ///
-    /// Vacant slots are deliberately retained with their incremented
-    /// generations. Replacing the table with `CSpace::new` would let an old
-    /// `Cap { slot, generation }` alias the first grant in the new incarnation.
-    pub fn reset(&mut self) -> usize {
+    /// All preconditions are checked before any derivation is killed. A stale
+    /// lifecycle token therefore cannot authorize a later irreversible arena
+    /// operation for a different CSpace or a newer incarnation, and durable
+    /// state cannot be crossed by this volatile lifecycle operation.
+    pub fn preflight_reset_exact(
+        &self,
+        expected_identity: CSpaceIdentity,
+        expected_incarnation: u64,
+    ) -> Result<(), CSpaceResetError> {
+        if self.identity != expected_identity {
+            return Err(CSpaceResetError::IdentityMismatch);
+        }
+        if self.incarnation != expected_incarnation {
+            return Err(CSpaceResetError::IncarnationMismatch);
+        }
         if self.slots.iter().any(|slot| {
             slot.reservation.is_some()
                 || slot
@@ -1954,14 +2131,53 @@ impl CSpace {
                     .as_ref()
                     .is_some_and(|entry| entry.node.persistent.is_some())
         }) {
-            return 0;
+            return Err(CSpaceResetError::PersistentLifecycleRequired);
         }
-        let killed = self.revoke_all();
-        self.incarnation = self
+        self.incarnation
+            .checked_add(1)
+            .ok_or(CSpaceResetError::IncarnationExhausted)?;
+        Ok(())
+    }
+
+    /// Commit a reset after rechecking every exact precondition.  Lifecycle
+    /// code which must perform another irreversible operation first can call
+    /// [`Self::preflight_reset_exact`] while it still has a fail-closed branch,
+    /// then retain exclusive access until this commit.
+    pub fn reset_exact(
+        &mut self,
+        expected_identity: CSpaceIdentity,
+        expected_incarnation: u64,
+    ) -> Result<usize, CSpaceResetError> {
+        self.preflight_reset_exact(expected_identity, expected_incarnation)?;
+        let next_incarnation = self
             .incarnation
             .checked_add(1)
-            .expect("CSpace incarnation space exhausted");
-        killed
+            .ok_or(CSpaceResetError::IncarnationExhausted)?;
+        let killed = self.revoke_all();
+        self.incarnation = next_incarnation;
+        Ok(killed)
+    }
+
+    /// Retire every capability in preparation for a fresh component
+    /// incarnation.
+    ///
+    /// Vacant slots are deliberately retained with their incremented
+    /// generations. Replacing the table with `CSpace::new` would let an old
+    /// `Cap { slot, generation }` alias the first grant in the new incarnation.
+    /// New lifecycle code should use [`CSpace::reset_exact`] and handle every
+    /// mismatch explicitly. This compatibility wrapper preserves the historic
+    /// durable-state refusal and exhaustion panic.
+    pub fn reset(&mut self) -> usize {
+        match self.reset_exact(self.identity, self.incarnation) {
+            Ok(killed) => killed,
+            Err(CSpaceResetError::PersistentLifecycleRequired) => 0,
+            Err(CSpaceResetError::IncarnationExhausted) => {
+                panic!("CSpace incarnation space exhausted")
+            }
+            Err(CSpaceResetError::IdentityMismatch | CSpaceResetError::IncarnationMismatch) => {
+                unreachable!("CSpace reset wrapper supplied its own exact identity")
+            }
+        }
     }
 
     /// Finalize an already-durable tombstone. This is the only operation which
@@ -2014,6 +2230,40 @@ impl CSpace {
         killed
     }
 
+    /// Count live slots without allocating or exposing a capability selector.
+    pub fn live_count(&self) -> usize {
+        if self.persistent_quarantined {
+            return 0;
+        }
+        self.slots
+            .iter()
+            .filter(|slot| {
+                slot.entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.node.is_alive())
+            })
+            .count()
+    }
+
+    /// Return semantic kind/rights only when exactly one live slot exists.
+    ///
+    /// This allocation-free observation exposes no Cap, generation, object,
+    /// durable identity, or lease and is intended for exact lifecycle gates.
+    pub fn singleton_live_shape(&self) -> Option<(&'static str, Rights)> {
+        if self.persistent_quarantined {
+            return None;
+        }
+        let mut live = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.entry.as_ref().filter(|entry| entry.node.is_alive()));
+        let entry = live.next()?;
+        if live.next().is_some() {
+            return None;
+        }
+        Some((entry.obj.kind(), entry.rights))
+    }
+
     pub fn list(&self) -> Vec<(Cap, &'static str, Rights, String)> {
         if self.persistent_quarantined {
             return Vec::new();
@@ -2036,6 +2286,224 @@ impl CSpace {
                 })
                 .collect()
         })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SupervisedTransferOperation {
+    AttenuatedGrant,
+    RevocableProxyRelocate,
+}
+
+/// Opaque request for one exact cross-CSpace supervisor transfer.
+///
+/// A request seals both volatile CSpace identities and incarnations, the
+/// source selector, the non-administrative target rights, and the reviewed
+/// transfer operation. It owns no resource and exposes none of those values
+/// through accessors or diagnostics. The instance registry is the only code
+/// which can execute it, after the exact two-reservation postflight succeeds.
+///
+/// Direct transfer helpers are intentionally not part of the public core API:
+///
+/// ```compile_fail
+/// use vibeos_core::cap::grant_move;
+/// ```
+///
+/// ```compile_fail
+/// use vibeos_core::cap::move_cap;
+/// ```
+pub struct SupervisedTransferRequest {
+    operation: SupervisedTransferOperation,
+    source_identity: CSpaceIdentity,
+    source_incarnation: u64,
+    target_identity: CSpaceIdentity,
+    target_incarnation: u64,
+    source_cap: Cap,
+    rights: Rights,
+}
+
+impl fmt::Debug for SupervisedTransferRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SupervisedTransferRequest(<redacted>)")
+    }
+}
+
+/// A sealed transfer request coupled to caller-owned rollback state.
+///
+/// This value is intentionally neither `Clone` nor `Copy`. Its private fields
+/// prevent a caller from replacing the exact request after preparing external
+/// resource-table guards. The registry either drops the whole stage on every
+/// failure path or passes its state exactly once to the infallible finalizer.
+pub struct SupervisedTransferStage<S> {
+    request: SupervisedTransferRequest,
+    state: S,
+}
+
+impl<S> fmt::Debug for SupervisedTransferStage<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SupervisedTransferStage(<redacted>)")
+    }
+}
+
+impl<S> SupervisedTransferStage<S> {
+    pub(crate) fn into_parts(self) -> (SupervisedTransferRequest, S) {
+        (self.request, self.state)
+    }
+}
+
+/// Opaque proof of one successfully committed core transfer.
+///
+/// The target selector can only be consumed once, by the host finalizer which
+/// materializes the already-validated target authority after CSpace locks have
+/// been released. Debug output never exposes the selector.
+pub struct SupervisedTransferReceipt {
+    target_cap: Cap,
+}
+
+impl fmt::Debug for SupervisedTransferReceipt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SupervisedTransferReceipt(<redacted>)")
+    }
+}
+
+impl SupervisedTransferReceipt {
+    pub fn into_target_cap(self) -> Cap {
+        self.target_cap
+    }
+}
+
+impl SupervisedTransferRequest {
+    fn validate_route(source: &CSpace, target: &CSpace, rights: Rights) -> Result<(), CapError> {
+        const ADMIN: Rights = Rights::GRANT.union(Rights::REVOKE).union(Rights::INVOKE);
+        if ptr::eq(source, target)
+            || source.identity() == target.identity()
+            || source.persistent_space_id().is_some()
+            || target.persistent_space_id().is_some()
+        {
+            return Err(CapError::PersistentLifecycleRequired);
+        }
+        if rights.intersect(ADMIN) != Rights::NONE {
+            return Err(CapError::Amplification);
+        }
+        Ok(())
+    }
+
+    /// Prepare a typed, strict, volatile derive-and-retire request.
+    ///
+    /// This performs only read-only validation. The source must be the exact
+    /// volatile `T`, carry `GRANT`, and strictly exceed the requested rights;
+    /// administrative rights can never enter the target request.
+    pub fn prepare_attenuated_grant<T: Resource>(
+        source: &CSpace,
+        source_cap: Cap,
+        rights: Rights,
+        target: &CSpace,
+    ) -> Result<Self, CapError> {
+        Self::validate_route(source, target, rights)?;
+        let entry = source.entry(source_cap)?;
+        if entry.node.persistent.is_some() {
+            return Err(CapError::PersistentLifecycleRequired);
+        }
+        if !entry.rights.contains(Rights::GRANT) {
+            return Err(CapError::InsufficientRights);
+        }
+        if !entry.rights.contains(rights)
+            || entry.rights == rights
+            || entry.rights.intersect(Rights::REVOKE.union(Rights::INVOKE)) != Rights::NONE
+        {
+            return Err(CapError::Amplification);
+        }
+        drop(source.lookup_revocable::<T>(source_cap, Rights::NONE)?);
+        Ok(Self {
+            operation: SupervisedTransferOperation::AttenuatedGrant,
+            source_identity: source.identity(),
+            source_incarnation: source.incarnation(),
+            target_identity: target.identity(),
+            target_incarnation: target.incarnation(),
+            source_cap,
+            rights,
+        })
+    }
+
+    /// Prepare relocation of one exact volatile wrapper around a durable,
+    /// operation-time-revocable parent.
+    ///
+    /// This constructor performs only read-only validation and never exposes a
+    /// durable identity. The local source capability must itself be volatile,
+    /// exactly type `P`, non-administrative, and attenuable to `rights`.
+    ///
+    /// # Safety
+    ///
+    /// `P` must be a host-private proxy whose construction proves a durable
+    /// revocable parent. Before calling this function, the host must validate
+    /// the exact authority class, resource kind, rights ceiling, and perform an
+    /// operation-time access check against that durable parent. Using an
+    /// ordinary resource type to obtain a no-`GRANT` direct move violates this
+    /// contract.
+    pub unsafe fn prepare_revocable_proxy_relocate<P: Resource>(
+        source: &CSpace,
+        source_cap: Cap,
+        rights: Rights,
+        target: &CSpace,
+    ) -> Result<Self, CapError> {
+        Self::validate_route(source, target, rights)?;
+        let entry = source.entry(source_cap)?;
+        if entry.node.persistent.is_some() {
+            return Err(CapError::PersistentLifecycleRequired);
+        }
+        const ADMIN: Rights = Rights::GRANT.union(Rights::REVOKE).union(Rights::INVOKE);
+        if !entry.rights.contains(rights) || entry.rights.intersect(ADMIN) != Rights::NONE {
+            return Err(CapError::Amplification);
+        }
+        drop(source.lookup_revocable::<P>(source_cap, Rights::NONE)?);
+        Ok(Self {
+            operation: SupervisedTransferOperation::RevocableProxyRelocate,
+            source_identity: source.identity(),
+            source_incarnation: source.incarnation(),
+            target_identity: target.identity(),
+            target_incarnation: target.incarnation(),
+            source_cap,
+            rights,
+        })
+    }
+
+    /// Attach exact rollback state to this one-shot request.
+    pub fn attach<S>(self, state: S) -> SupervisedTransferStage<S> {
+        SupervisedTransferStage {
+            request: self,
+            state,
+        }
+    }
+
+    pub(crate) fn execute(
+        self,
+        first: &mut CSpace,
+        second: &mut CSpace,
+    ) -> Result<SupervisedTransferReceipt, CapError> {
+        let first_is_source = first.identity() == self.source_identity
+            && first.incarnation() == self.source_incarnation
+            && second.identity() == self.target_identity
+            && second.incarnation() == self.target_incarnation;
+        let second_is_source = second.identity() == self.source_identity
+            && second.incarnation() == self.source_incarnation
+            && first.identity() == self.target_identity
+            && first.incarnation() == self.target_incarnation;
+        let target_cap = match (first_is_source, second_is_source, self.operation) {
+            (true, false, SupervisedTransferOperation::AttenuatedGrant) => {
+                grant_move(first, self.source_cap, self.rights, second)
+            }
+            (false, true, SupervisedTransferOperation::AttenuatedGrant) => {
+                grant_move(second, self.source_cap, self.rights, first)
+            }
+            (true, false, SupervisedTransferOperation::RevocableProxyRelocate) => {
+                move_cap(first, self.source_cap, self.rights, second)
+            }
+            (false, true, SupervisedTransferOperation::RevocableProxyRelocate) => {
+                move_cap(second, self.source_cap, self.rights, first)
+            }
+            _ => return Err(CapError::Invalid),
+        }?;
+        Ok(SupervisedTransferReceipt { target_cap })
     }
 }
 
@@ -2069,4 +2537,387 @@ pub fn grant(src: &CSpace, cap: Cap, rights: Rights, dst: &mut CSpace) -> Result
     };
     dst.publish_slots(candidate);
     Ok(granted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct WitnessResource(u32);
+
+    impl Resource for WitnessResource {
+        fn kind(&self) -> &'static str {
+            "witness-resource"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn witness_with_ancestor(
+        rights: Rights,
+    ) -> (
+        PersistentDerivationWitness<WitnessResource>,
+        Arc<Derivation>,
+    ) {
+        let root_identity = PersistentNodeIdentity {
+            derivation_id: DerivationId::new(1).unwrap(),
+            object_id: ObjectId::new(2).unwrap(),
+            resource_kind: ResourceKind::new(3).unwrap(),
+        };
+        let root = Derivation::persistent_root(root_identity);
+        let child_identity = PersistentNodeIdentity {
+            derivation_id: DerivationId::new(4).unwrap(),
+            ..root_identity
+        };
+        let child = Derivation::persistent_child(&root, child_identity);
+        let identity = PersistentCapIdentity {
+            space: SpaceId::new(5).unwrap(),
+            slot: 0,
+            generation: 0,
+            derivation_id: child_identity.derivation_id,
+            object_id: child_identity.object_id,
+            resource_kind: child_identity.resource_kind,
+            rights,
+        };
+        (
+            PersistentDerivationWitness {
+                identity,
+                object: Arc::new(WitnessResource(7)),
+                node: child,
+                marker: PhantomData,
+            },
+            root,
+        )
+    }
+
+    #[test]
+    fn persistent_witness_rechecks_rights_and_complete_ancestry() {
+        let (witness, ancestor) = witness_with_ancestor(Rights::READ);
+        assert_eq!(witness.try_with(Rights::READ, |resource| resource.0), Ok(7));
+        assert_eq!(
+            witness.try_with(Rights::WRITE, |_| ()),
+            Err(CapError::InsufficientRights)
+        );
+
+        ancestor.kill();
+        assert_eq!(
+            witness.try_with(Rights::READ, |_| ()),
+            Err(CapError::Invalid),
+            "revoking an ancestor invalidates a previously delivered witness"
+        );
+    }
+
+    #[test]
+    fn persistent_witness_consumption_checks_delivery_then_scopes_the_lease() {
+        let (under_righted, _) = witness_with_ancestor(Rights::READ);
+        assert_eq!(
+            under_righted.try_into_invocation_lease(Rights::WRITE).err(),
+            Some(CapError::InsufficientRights)
+        );
+
+        let (revoked, ancestor) = witness_with_ancestor(Rights::READ);
+        ancestor.kill();
+        assert_eq!(
+            revoked.try_into_invocation_lease(Rights::READ).err(),
+            Some(CapError::Invalid)
+        );
+
+        let (live, ancestor) = witness_with_ancestor(Rights::READ);
+        let lease = live
+            .try_into_invocation_lease(Rights::READ)
+            .expect("live, sufficiently-righted witness must yield one lease");
+        assert!(lease.authorizes(Rights::READ));
+        assert!(!lease.authorizes(Rights::WRITE));
+        ancestor.kill();
+        assert_eq!(
+            lease.with(|resource| resource.0),
+            7,
+            "an acquired invocation lease survives later revocation"
+        );
+    }
+}
+
+/// Supervisor-only consume-and-derive transfer between distinct CSpaces.
+///
+/// This is deliberately narrower than both [`grant`] and [`move_cap`]. The
+/// source must be volatile and carry `GRANT`, while the target receives a new
+/// child derivation with an exact, strict attenuation of the source rights.
+/// In particular, `GRANT` can never cross this boundary. The source handle is
+/// retired without killing its derivation node, so revoking an older ancestor
+/// still reaches the transferred child.
+///
+/// Both candidate tables are fully constructed before either authoritative
+/// table is replaced. Holding exclusive access to both spaces prevents the
+/// prepared target and the not-yet-retired source from escaping separately;
+/// every returned error leaves both spaces byte-for-byte authoritative as
+/// they were on entry.
+fn grant_move(
+    src: &mut CSpace,
+    cap: Cap,
+    rights: Rights,
+    dst: &mut CSpace,
+) -> Result<Cap, CapError> {
+    if ptr::eq(src, dst) {
+        return Err(CapError::PersistentLifecycleRequired);
+    }
+    let source_index = cap.slot as usize;
+    let source_entry = src.entry(cap)?;
+    if source_entry.node.persistent.is_some() {
+        return Err(CapError::PersistentLifecycleRequired);
+    }
+    if !source_entry.rights.contains(Rights::GRANT) {
+        return Err(CapError::InsufficientRights);
+    }
+    if !source_entry.rights.contains(rights)
+        || rights.contains(Rights::GRANT)
+        || rights == source_entry.rights
+    {
+        return Err(CapError::Amplification);
+    }
+
+    let node = system_allocation(|| Derivation::child(&source_entry.node));
+    let transferred_entry = Entry {
+        obj: source_entry.obj.clone(),
+        rights,
+        node,
+    };
+
+    let mut target_candidate = dst.candidate_slots(1);
+    let target_slot = CSpace::alloc_candidate_slot(&mut target_candidate);
+    target_candidate[target_slot as usize].entry = Some(transferred_entry);
+    let transferred = Cap {
+        slot: target_slot,
+        generation: target_candidate[target_slot as usize].generation,
+    };
+    let mut source_candidate = src.candidate_slots(0);
+    CSpace::invalidate(&mut source_candidate[source_index]);
+
+    // Protect both complete candidates before the target becomes visible.
+    // The subsequent swaps and retirement drops are allocation-free.
+    let target_next = CSpace::prepare_slots(target_candidate);
+    let source_next = CSpace::prepare_slots(source_candidate);
+    let target_retired = dst.replace_slots(target_next);
+    let source_retired = src.replace_slots(source_next);
+    drop(target_retired);
+    drop(source_retired);
+    Ok(transferred)
+}
+
+/// Supervisor-only relocation of one volatile capability between CSpaces.
+///
+/// Unlike [`grant`], this consumes the source slot and preserves the exact
+/// derivation node. Holding both exclusive CSpace guards is the authority to
+/// relocate; the cap does not need `GRANT`. `rights` may only attenuate. Every
+/// fallible validation and target-table construction completes before either
+/// authoritative table is published, so an error leaves the source unchanged.
+fn move_cap(src: &mut CSpace, cap: Cap, rights: Rights, dst: &mut CSpace) -> Result<Cap, CapError> {
+    if ptr::eq(src, dst) {
+        return Err(CapError::PersistentLifecycleRequired);
+    }
+    let source_index = cap.slot as usize;
+    let source_entry = src.entry(cap)?;
+    if source_entry.node.persistent.is_some() {
+        return Err(CapError::PersistentLifecycleRequired);
+    }
+    if !source_entry.rights.contains(rights) {
+        return Err(CapError::Amplification);
+    }
+    let moved_entry = Entry {
+        obj: source_entry.obj.clone(),
+        rights,
+        node: source_entry.node.clone(),
+    };
+
+    let mut target_candidate = dst.candidate_slots(1);
+    let target_slot = CSpace::alloc_candidate_slot(&mut target_candidate);
+    target_candidate[target_slot as usize].entry = Some(moved_entry);
+    let moved = Cap {
+        slot: target_slot,
+        generation: target_candidate[target_slot as usize].generation,
+    };
+    let mut source_candidate = src.candidate_slots(0);
+    CSpace::invalidate(&mut source_candidate[source_index]);
+
+    // Prepare and protect both page runs before either CSpace changes. Once
+    // both preparations succeed, the two swaps are allocation-free and
+    // infallible. A preparation failure is fail-stop before publication and
+    // therefore cannot leave two live copies or consume only the source.
+    let target_next = CSpace::prepare_slots(target_candidate);
+    let source_next = CSpace::prepare_slots(source_candidate);
+    let target_retired = dst.replace_slots(target_next);
+    let source_retired = src.replace_slots(source_next);
+    drop(target_retired);
+    drop(source_retired);
+    Ok(moved)
+}
+
+#[cfg(test)]
+mod supervised_transfer_tests {
+    use super::*;
+
+    struct Probe;
+    struct Other;
+
+    impl Resource for Probe {
+        fn kind(&self) -> &'static str {
+            "supervised-transfer-probe"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    impl Resource for Other {
+        fn kind(&self) -> &'static str {
+            "supervised-transfer-other"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn supervised_transfer_values_are_opaque_and_debug_redacted() {
+        let mut source = CSpace::new("supervised-debug-source");
+        let target = CSpace::new("supervised-debug-target");
+        let cap = source.mint(Arc::new(Probe), Rights::READ.union(Rights::GRANT));
+        let request = SupervisedTransferRequest::prepare_attenuated_grant::<Probe>(
+            &source,
+            cap,
+            Rights::READ,
+            &target,
+        )
+        .unwrap();
+        assert_eq!(
+            alloc::format!("{request:?}"),
+            "SupervisedTransferRequest(<redacted>)"
+        );
+        let stage = request.attach(7_u8);
+        assert_eq!(
+            alloc::format!("{stage:?}"),
+            "SupervisedTransferStage(<redacted>)"
+        );
+        let receipt = SupervisedTransferReceipt { target_cap: cap };
+        assert_eq!(
+            alloc::format!("{receipt:?}"),
+            "SupervisedTransferReceipt(<redacted>)"
+        );
+    }
+
+    #[test]
+    fn revocable_proxy_request_rejects_wrong_type_and_administrative_rights() {
+        let mut source = CSpace::new("supervised-proxy-source");
+        let target = CSpace::new("supervised-proxy-target");
+        let ordinary = source.mint(Arc::new(Probe), Rights::READ);
+        assert_eq!(
+            unsafe {
+                SupervisedTransferRequest::prepare_revocable_proxy_relocate::<Other>(
+                    &source,
+                    ordinary,
+                    Rights::READ,
+                    &target,
+                )
+            }
+            .unwrap_err(),
+            CapError::WrongType
+        );
+        let administrative = source.mint(Arc::new(Probe), Rights::READ.union(Rights::REVOKE));
+        assert_eq!(
+            unsafe {
+                SupervisedTransferRequest::prepare_revocable_proxy_relocate::<Probe>(
+                    &source,
+                    administrative,
+                    Rights::READ,
+                    &target,
+                )
+            }
+            .unwrap_err(),
+            CapError::Amplification
+        );
+    }
+
+    #[test]
+    fn internal_grant_move_is_strict_atomic_and_keeps_revocation_ancestry() {
+        let mut source = CSpace::new("internal-grant-move-source");
+        let mut target = CSpace::new("internal-grant-move-target");
+        let ancestor = source.mint(
+            Arc::new(Probe),
+            Rights::READ
+                .union(Rights::WRITE)
+                .union(Rights::GRANT)
+                .union(Rights::REVOKE),
+        );
+        let source_cap = source
+            .derive(
+                ancestor,
+                Rights::READ.union(Rights::WRITE).union(Rights::GRANT),
+            )
+            .unwrap();
+
+        let transferred = grant_move(&mut source, source_cap, Rights::READ, &mut target).unwrap();
+        assert_eq!(source.rights_of(source_cap), Err(CapError::Invalid));
+        assert_eq!(target.rights_of(transferred), Ok(Rights::READ));
+        assert_eq!(
+            target.lookup(transferred, Rights::GRANT).err(),
+            Some(CapError::InsufficientRights),
+        );
+        assert_eq!(source.revoke(ancestor), Ok(1));
+        assert_eq!(target.rights_of(transferred), Err(CapError::Invalid));
+
+        for (held, requested, expected) in [
+            (Rights::READ, Rights::READ, CapError::InsufficientRights),
+            (
+                Rights::READ.union(Rights::GRANT),
+                Rights::WRITE,
+                CapError::Amplification,
+            ),
+            (
+                Rights::READ.union(Rights::GRANT),
+                Rights::READ.union(Rights::GRANT),
+                CapError::Amplification,
+            ),
+        ] {
+            let mut source = CSpace::new("internal-failed-grant-move-source");
+            let mut target = CSpace::new("internal-failed-grant-move-target");
+            let cap = source.mint(Arc::new(Probe), held);
+            let source_before = source.list();
+            let target_before = target.list();
+            assert_eq!(
+                grant_move(&mut source, cap, requested, &mut target),
+                Err(expected),
+            );
+            assert_eq!(source.list(), source_before);
+            assert_eq!(target.list(), target_before);
+        }
+    }
+
+    #[test]
+    fn internal_proxy_relocation_preserves_node_and_fails_atomically() {
+        let mut source = CSpace::new("internal-proxy-relocate-source");
+        let mut target = CSpace::new("internal-proxy-relocate-target");
+        let ancestor = source.mint(
+            Arc::new(Probe),
+            Rights::READ.union(Rights::GRANT).union(Rights::REVOKE),
+        );
+        let proxy = source.derive(ancestor, Rights::READ).unwrap();
+        let moved = move_cap(&mut source, proxy, Rights::READ, &mut target).unwrap();
+        assert_eq!(source.rights_of(proxy), Err(CapError::Invalid));
+        assert_eq!(target.rights_of(moved), Ok(Rights::READ));
+        assert_eq!(source.revoke(ancestor), Ok(1));
+        assert_eq!(target.rights_of(moved), Err(CapError::Invalid));
+
+        let cap = source.mint(Arc::new(Probe), Rights::READ);
+        let source_before = source.list();
+        let target_before = target.list();
+        assert_eq!(
+            move_cap(&mut source, cap, Rights::WRITE, &mut target),
+            Err(CapError::Amplification),
+        );
+        assert_eq!(source.list(), source_before);
+        assert_eq!(target.list(), target_before);
+    }
 }

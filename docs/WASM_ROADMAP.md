@@ -6,10 +6,103 @@ VibeOS. It complements [BLUEPRINT.md](BLUEPRINT.md),
 [CAPABILITY_SHELL.md](CAPABILITY_SHELL.md), and
 [PROGRAM_PERSISTENCE.md](PROGRAM_PERSISTENCE.md).
 
-**Status (2026-08-12): planned.** VibeOS does not currently contain a Core
-WebAssembly validator or interpreter, a Component Model decoder, a Canonical
-ABI implementation, a WASI adapter, or a component loader. Everything below is
-a roadmap, not an implementation claim.
+**Status (2026-08-30): implementation in progress.** The repository now contains
+bounded Core validation/execution, Component decoding and Canonical ABI,
+admission/loading, compatibility, and C8 profiling evidence. The dependency
+sequence and acceptance text below remain the roadmap rather than a claim that
+every milestone is complete. C1 through C8.2 remain accepted complete by
+historical-evidence policy; none is reopened, rerun, or individually rewalked.
+C8.3 is accepted complete by historical-evidence policy and is not being
+rerun. Formal fixed-QEMU evidence completes C8.4 for the selected workload.
+C8.5 through C8.7 were not entered for that workload
+and remain globally deferred. The C8.8 Float widening is closed by the formal
+fixed-QEMU F5 decision below. The independently numbered C8.9 Float
+successor is now allocated. C8.9-S1 froze its new code-6 identity, ABIs,
+revisions, software-float engine, non-promotion rules, and fixed-QEMU policy;
+C8.9-S2 implements and verifies its codec, current-engine binding, exact
+authority-free admission, executor, lifecycle, and durable rejection. C8.9-S3
+now closes the fresh fixed-QEMU gate and releases only that sealed Float
+runtime. Its closure position is `c89-s3-qualified-sealed-float-runtime-released`.
+The next listed C8.8 widening, fixed-width SIMD, is now allocated as C8.10.
+C8.10-S1 freezes validation-only code 7, ABI/revisions, deterministic semantics,
+the independent engine plan, and non-authorization boundaries. C8.10-S2
+implements and audits its isolated deterministic fixed-SIMD engine. C8.10-S3
+closes Component containment and fixed differential/mutation corpora. C8.10-S4
+closes the default-off volatile admission/lifecycle, one-instance quota,
+explicit recovery/revocation, and durable loader rejection. C8.10-S5 now
+passes a fresh normal/optimized fixed-QEMU campaign and makes only a successor
+design review eligible. C8.11-S1 allocates that successor as a distinct code-8
+executable SIMD design without promoting code 7. C8.11-S2 now implements its
+exact engine, runtime, authority-free volatile admission, lifecycle, durable
+rejection, supply-chain closure, and RISC-V object gate. The previous position
+was `c811-s1-simd-executable-design-frozen-pre-implementation`. C8.11-S3 now
+qualifies and releases only the sealed volatile code-8 runtime. Its closure
+position is `c811-s3-qualified-sealed-simd-runtime-released`. The next listed
+widening, Reference Types, is now allocated as C8.12. C8.12-R1 freezes fresh
+validation-only code/ABIs 9, Component/Core profile 6, exact revisions, the
+bounded nullable-`funcref` semantics, a separately named engine, non-promotion
+rules, and the fixed-QEMU policy. C8.12-R2 now implements the code-9 codec,
+separately named candidate facade, exact dual validation, bounded Core syntax,
+Component containment, fixed mutation corpus, durable rejection, supply-chain
+closure, and RISC-V object audit. C8.12-R3 now closes the fresh source-bound
+fixed-QEMU campaign. Code 9 remains
+validation-only and inert; only an independently numbered executable-successor
+design review is now eligible. The current position is
+now allocated as C8.13. C8.13-E1 freezes independent executable code/ABIs 10,
+Component/Core profile 7, exact revisions, a separately named engine, the
+sealed authority-free world, code-9 non-promotion, and the fixed-QEMU policy.
+The current position is
+`c813-e3-qualified-sealed-reference-runtime-released`.
+Every feature widening after Reference Types remains separately unallocated and
+incomplete.
+The earlier non-numbered fixed-QEMU
+target/release policy checkpoint makes fresh source-bound
+`qemu-virt-rv64-tcg-icount-v1` evidence the prospective generic WASM
+target/release gate. Milk-V Duo remains a paused optional observation with no
+gate, completion, or release effect. The decision contracts and explicit gaps
+are tracked in
+[WASM_AOT_DECISION.md](WASM_AOT_DECISION.md) and [TESTING.md](../TESTING.md).
+
+**C8.8 Float status (2026-08-29):** F1 through F5 are complete for the Float
+widening only. F1 freezes the immutable
+validation-only identity and deterministic scalar-float contract; F2 closes
+the independently identified, acceptance-only Core validator/software-float
+executor, differential, fuzz, trap, limit, fuel, supply-chain, and RISC-V
+object gates. F3 closes the acceptance-only WIT and Canonical ABI scalar-float
+value, memory, nested-value, allocation-request/cleanup-model, differential,
+and hostile-input gates. F4 closes the default-off, exact-image-pinned
+candidate admission/lifecycle path, including quota, cancel/revoke, fault
+reclamation/recovery, and durable-rejection gates. Artifact profile code 5
+remains permanently `ValidationOnly` and inert: it has no production
+admission, command, durable/publication, current-engine, or production
+execution path and can never be promoted in place. The host/fixed-QEMU portion
+of C8.8-F5 first passed at pushed implementation commit
+`c4ea5e5ca1de622884f33c01bf06653f498360aa`. The formal decision at pushed
+source commit `0f06212f890077b2a3d1b4405a128058cb07c55e` now makes the fixed
+`qemu-virt-rv64-tcg-icount-v1` matrix the normative F5 exit gate and replaces
+the physical-Duo requirement for C8.8-F5 only. It accepts all 1,176 records
+with semantic SHA-256
+`51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`.
+Milk-V Duo testing remains paused; its readiness and physical-v1 contracts are
+retained, non-blocking, and make no physical claim
+(`physical_provenance=not-claimed`). Every unrelated hardware gate is
+unchanged. This decision closes F5 and the Float widening only; it neither
+closes another C8.8 feature widening nor authorizes an engine, execution,
+production admission, native bytes, AOT, or in-place promotion. At F5 closure
+it opened only design review for a separately numbered successor whose identity
+was then unallocated and whose implementation was not authorized.
+The historical `post-c88-f5-pre-allocation` charter froze eight unresolved,
+blocking review questions and allocated or authorized nothing. Explicit user
+authorization on 2026-08-29 subsequently opened the separately versioned C8.9
+design/implementation/qualification sequence; it does not rewrite that charter.
+
+**C8.9 status (2026-08-29): C8.9-S1 through C8.9-S3 complete.**
+
+**C8.10 status (2026-08-29): C8.10-S1 through C8.10-S5 complete.**
+
+**C8.11 status (2026-08-30): C8.11-S1 through C8.11-S3 complete.**
+
+**C8.12 status (2026-08-30): C8.12-R1 and R2 complete; R3 remains incomplete.**
 
 ---
 
@@ -137,10 +230,14 @@ These invariants are release-blocking. Violating one is a security bug.
 9. **Memory is bounded before allocation.** Component and Core decoding have
    independent byte, nesting, definition, type, instance, alias, canonical
    function, adapter, resource, memory, table, and custom-section limits.
-10. **Execution is temporally bounded.** Total fuel limits an invocation. A
-    smaller poll quantum forces the Core interpreter and Canonical ABI machinery
-    to save continuations and return `Pending`, so component code cannot wedge a
-    hart.
+10. **Execution is temporally bounded.** Total fuel limits charged execution. A
+    smaller poll quantum is a hard ceiling on newly granted fuel: resumable Core
+    interpreter and Canonical ABI work saves continuations and returns `Pending`.
+    Together with finite code, nesting, and call-depth limits this prevents
+    unbounded interpreter work. An indivisible engine metering unit larger than
+    the quantum fails closed instead of silently widening that grant:
+    insufficient remaining total fuel takes priority, otherwise it is a quantum
+    policy failure. A fuel grant is not itself a wall-clock preemption guarantee.
 11. **Admission is atomic.** Validation, graph planning, candidate CSpaces,
     resource tables, memories, streams, accounts, and task envelopes are complete
     before any start function or exported operation executes. Failure publishes
@@ -196,6 +293,20 @@ The following start disabled:
 Features are enabled one at a time only with component validation, Core
 execution, Canonical ABI, differential, fuel, target, quota, revocation, and
 fault-containment evidence. Profile widening is an explicit ABI revision.
+
+C8.8-F1 selects the deterministic-software-float branch and freezes its exact
+semantics. F2 closes the acceptance-only Core backend, provenance, conversion
+trap, host differential/fuzz, fuel, and RISC-V object gates. F3 closes the
+acceptance-only WIT and Canonical ABI boundary, including nested values and an
+exact allocation trace replayed through the existing cleanup model. F4 closes
+the separately gated, exact-image-pinned candidate admission/runtime lifecycle
+without registering code 5 as a current engine or exposing it as a command or
+durable object. F5 now closes the target gate through its formal fixed-QEMU
+replacement decision. These increments still do not enable Float execution:
+Profile 1 stays integer-only, code 5 stays permanently validation-only and
+inert, and F5 made only a then-unallocated separately numbered successor
+eligible for design review. The later C8.9-S1 allocation does not change any of
+those code-5 claims.
 
 ## 5. WIT and CSpace mapping
 
@@ -279,9 +390,18 @@ The component owns two independent execution budgets:
 
 - **Total fuel** bounds the complete invocation, including adapter Core Wasm and
   charged Canonical ABI work. Exhaustion maps to VSH `BudgetExceeded`.
-- **Poll quantum** bounds one executor poll. Quantum exhaustion saves all needed
-  Core/component continuations, self-wakes once, and returns `Pending`; it does
-  not reset total fuel.
+- **Poll quantum** bounds the newly granted fuel in one executor poll. For a
+  resumable metering unit, quantum exhaustion saves the Core/component
+  continuation, the owning executor self-wakes once, and returns `Pending`; it
+  does not reset total fuel.
+
+That `Pending` rule applies to resumable metering units. When the remaining
+total can cover it, an indivisible engine charge larger than the configured
+quantum terminates with stable `LimitExceeded` before its side effect. If the
+remaining total is also insufficient, `FuelExhausted` takes priority. Neither
+the Core wrapper nor a higher layer may grant extra fuel to force the operation
+through. C1.4 pins this boundary for the Core engine. Canonical ABI charging and
+executor wake integration close in their own later nodes.
 
 C2 initially supports synchronous Canonical ABI calls. C5 adds the exact native
 async Component Model revision associated with the selected WASI 0.3 profile:
@@ -356,6 +476,17 @@ If the complete frontend cannot meet the measured TCB/footprint budget, the
 profile is narrowed; the project does not silently fall back to an untyped
 public Core-Wasm ABI.
 
+**C0.7 baseline (2026-08-28):** the reproducible evidence contract lives in
+`wasm-candidates/evidence/`. It records the closed candidate/metric
+applicability matrix, pinned fixtures and toolchain, RISC-V allocated
+code/static size, host validator and empty-instance memory, cold startup, exact
+Core fuel consumption, and Canonical ABI lift/lower cost. Baseline replacement
+requires the explicit `scripts/collect-c0-baseline.py --update` command. CI
+never rewrites it: CI verifies the checked-in record, its source hashes,
+derived statistics, heap cleanup invariants, and rejection mutations, then
+rebuilds the host collector, all four RISC-V probes, and generated fixtures
+without recollecting timings.
+
 ### C1 — Portable bounded Core Wasm execution
 
 **Goal:** provide the mandatory private execution substrate in a host-testable
@@ -366,10 +497,216 @@ public Core-Wasm ABI.
 | C1.1 | Add the pinned Core engine wrapper and exact Core profile validator | `cargo check` passes for the VibeOS target; every disabled proposal fails before instantiation |
 | C1.2 | Enforce decode limits before attacker-controlled allocation | Length, count, nesting, locals, types, tables, memories, data, elements and custom-section mutations never exceed the validation account |
 | C1.3 | Enforce mandatory effective maxima | `memory.grow`, table growth, call depth and engine allocation fail deterministically without charging another owner |
-| C1.4 | Implement total fuel and resumable poll quantum | An infinite loop returns after one bounded quantum and terminates only when total fuel or cancellation wins |
+| C1.4 | Implement total fuel and resumable poll quantum | An infinite loop returns after one bounded fuel grant and terminates only when total fuel or cancellation wins |
 | C1.5 | Freeze stable Core trap diagnostics | Arithmetic, unreachable, out-of-bounds, bad indirect call, call depth, validation and fuel failures have exact tested codes |
-| C1.6 | Add differential and specification evidence | Accepted modules match a pinned reference runtime and selected official Core spec tests; profile rejections are separately asserted |
-| C1.7 | Fuzz decode, validate, instantiate and execute | Arbitrary bytes never panic the host and cannot allocate or run without configured bounds |
+| C1.6 | Add differential and specification evidence | The complete pinned `wg-1.0` `fac.wast` baseline agrees across its official assertions, Vibe, and DLR; profile rejections remain separately asserted |
+| C1.7 | Fuzz decode, validate, instantiate and execute | The pinned local corpus remains panic-free, respects configured allocation/execution bounds, reaches every stage, and produces stable terminals |
+
+**C1.2 bounded decode account (2026-08-28):**
+`wasm-runtime/tests/decode_limits.rs` constructs raw Core modules locally and
+pins both sides of every applicable enabled Profile-1 ceiling: raw/declared
+lengths, bounded and imported-plus-defined counts, compact-import expansion,
+materialization-capable disabled recursive-type and operator vectors, parameter
+and result arities, compressed locals, structured-control nesting, table/memory
+declarations, data lengths/segments, element segments/items, and aggregate
+encoded custom names plus data. Enabled exact ceilings are admitted; fields
+modeled by `CoreSummary`, the Core decoder's structural account, also report the
+exact count. Limit-plus-one cases return their stable `AdmissionError`, while
+the numeric result ceiling does not enable disabled multi-value.
+
+Inputs are built outside the measured interval. A host `System`-allocator
+wrapper then records, for the current test thread, allocation calls, cumulative
+requested bytes and the largest individual request around both `inspect_core`
+and the production `ValidatedCore::new_in` entrypoint. These are request-envelope
+metrics, not live/high-water memory or kernel-owner attribution. Rejected inputs
+must produce identical errors and envelopes through both paths, proving that
+the zero-reservation entrypoint does not reach Wasmi compilation. Absolute small
+bounds plus shallow-versus-materialization-size comparisons prevent hostile
+declarations from amplifying predecode allocation.
+
+Type, table, global, data and MVP element framing is predecoded before
+attacker-sized vectors can be materialized, and function control nesting uses a
+fixed 129-frame stack. Core raw bytes bound data payload storage; segment and
+element-item counters provide independent structural ceilings. This closes
+C1.2 for the frozen Core Profile-1 grammar. Component decoding, successful Wasmi
+compilation, instantiation, growth/call-depth enforcement, kernel allocator
+ownership, QEMU/Duo allocation and exhaustive fuzzing remain separate evidence
+boundaries or later roadmap nodes.
+
+**C1.3 effective maxima (2026-08-28):**
+`wasm-runtime/tests/effective_maxima.rs` pins adjacent runtime boundaries through
+the production wrappers. A two-page image/store policy admits the guest growth
+that reaches page two, then repeatedly traps page three as `LimitExceeded`
+without changing memory. A smaller module-declared maximum remains a distinct
+Core bounds failure. The controlled host table seam reaches exactly 4,096 MVP
+function-table elements and rejects 4,097 with stable size and diagnostics,
+while guest `table.grow` remains rejected before compilation because reference
+types stay disabled. A countdown call accepts 128 active frames, rejects the
+129th as `CallDepthExceeded`, repeats the same terminal, and remains reusable.
+
+`ValidatedCore::required_compile_bytes` performs bounded structural inspection
+without constructing a Wasmi engine or module. Both constructors check the
+caller-provided per-compilation policy ceiling before engine creation, clone,
+or `Module::new`; the calculator-reported charge succeeds and charge-minus-one
+returns the stable allocation-reservation admission error. A 27-byte raw probe
+compactly declares 4,096 locals; `CoreSummary::max_locals` records that count,
+and the charge includes the corresponding pointer-sized per-function
+expansion. A thread-local host allocator probe labels two synthetic caller owner
+scopes. The rejected constructor has exactly the inspector's
+allocation-request fingerprint, successful selected-scope compilation observes
+a request at least as large as that expansion, and the other label is unchanged.
+This deterministic policy charge is not an upper bound on Wasmi's
+allocation-request total or live/high-water memory; the copyable reservation is
+neither an owner credential nor a ledger debit.
+
+This closes C1.3 for one portable Profile-1 Core memory/table/call stack and the
+pre-engine allocation policy gate with active-scope request attribution.
+Authentic kernel owner capabilities, exact full-lifecycle charging/reclamation,
+and aggregate memory across all Core instances in a Component principal remain
+C4.2/C6 boundaries. No QEMU or physical-Duo allocation claim is made here.
+
+**C1.4 total fuel and resumable poll quantum (2026-08-28):**
+`wasm-runtime/tests/fuel_quantum.rs` pins the production Core wrapper to enabled
+fuel consumption and Wasmi 1.1's versioned default cost schedule. It rejects
+zero total fuel, zero quantum, either Profile-1 ceiling plus one, and a quantum
+larger than its total, while the exact maximum pair remains executable. A
+preemptible infinite loop with total 41 and quantum 10 returns four exact
+`Pending` states `(consumed, remaining) = (9, 32), (19, 22), (29, 12), (39,
+2)`, followed by the single `FuelExhausted` terminal at `(41, 0)`. Thus each
+poll consumes no more than its grant, the logical total remains monotonic across
+Wasmi store-fuel resets, and exhaustion does not leave a runnable continuation.
+
+Cancellation after the first yield consumes no additional guest fuel. It also
+wins when a checked external debit has already reduced the remaining balance to
+zero, because cancellation is observed before another interpreter step. Both
+terminal paths clear active state and permit immediate reuse. The legacy
+borrowed invocation now delivers `Ready`, `FuelExhausted`, or `Cancelled` once;
+a later poll returns `Validation` without relabeling the prior terminal or
+changing its metrics.
+
+The grant quantum has an explicit fail-closed edge. Wasmi meters some translated
+blocks and dynamic operations as indivisible units; under its pinned
+64-bytes-per-fuel default, a ten-page `memory.grow` has a 10,240-fuel dynamic
+charge, larger than Profile 1's maximum 10,000-fuel quantum. With 20,000 total
+fuel the gate repeats that operation and requires exact `(4, 19,996)` metrics,
+`LimitExceeded`, unchanged one-page memory, cleared active state, and reuse.
+With only 10,000 total fuel the same request is instead `FuelExhausted` at `(4,
+9,996)`, so remaining total-budget insufficiency wins when both ceilings are
+insufficient.
+
+The adjacent nine-page charge is 9,216 fuel. Quantum 9,220 completes it in one
+poll at exact `(9,220, 10,780)` metrics; quantum 9,219 and the exact charge
+quantum 9,216 first return `Pending` at `(4, 19,996)`, then resume to the same
+final metrics and memory. Quantum 9,215 returns `LimitExceeded`, while a 9,219
+total returns `FuelExhausted`; neither path mutates memory.
+The runtime never widens the grant to force either operation through. Therefore
+the row's “only total fuel or cancellation wins” is the acceptance result for
+the preemptible spin fixture, while an oversized indivisible metering unit is a
+separate stable policy failure.
+
+This closes the portable Core fuel-ledger and continuation substrate, not a
+wall-clock or cycle bound. Wasmi precharges translated blocks, so a resumed
+poll can execute a suffix charged by an earlier poll; the gate bounds newly
+debited fuel, not an exact source-instruction count per poll. Host/adapter/
+Canonical ABI charging remains C2.6, and executor self-wake, target latency,
+exhaustive opcode fuel coverage, and physical-Duo execution are not claimed by
+this host gate.
+
+**C1.5 stable Core trap diagnostics (2026-08-28):**
+`component-format/tests/profile.rs` freezes the numeric value and exact
+kebab-case name of all fourteen `TrapCode` variants. The public `code()` method
+defines the stable 16-bit diagnostic projection for Component ABI and
+supervisor boundaries. `wasm-runtime/tests/trap_diagnostics.rs` separately classifies the
+twelve Core-facing codes, excluding the later `CanonicalAbi` and
+`ResourceMisuse` categories, and pins every Wasmi 1.1 Core trap variant through
+the production typed mapping. It also fixes the complete Wasmi memory and table
+error families, whether direct or wrapped by instantiation. Null indirect
+targets and numeric table bounds both intentionally become
+`TableOutOfBounds`; wrong target signatures remain
+`IndirectCallTypeMismatch`. The disabled-profile float-to-integer conversion
+trap maps fail-closed to `Validation` but is not guest-reachable in Profile 1.
+
+The production fixtures cover adjacent successful and failing signed division,
+conditional `unreachable`, the first invalid four-byte memory load, and the
+valid, null, wrong-signature, and first-out-of-range indirect-call cases. They
+also pin 128 active frames versus the rejected 129th, plus short-fuel
+exhaustion. Each execution trap repeats with the same identity, removes its
+terminal continuation, and leaves the instance reusable. Missing exports,
+wrong arity, and wrong scalar input types return exact `Validation` before
+installing active state; C1.5 fixed the single-instance start path to enforce
+the parameter type as well as its count.
+
+The admission matrix repeats exact malformed `Validation`, disabled-feature
+`UnsupportedFeature`, and module-size `LimitExceeded` results through both the
+bounded inspector and compiler. Active data placement at the first byte beyond
+memory maps to `MemoryOutOfBounds`; active element placement at the first slot
+beyond a table maps Wasmi's typed instantiation error to `TableOutOfBounds`.
+Both standalone and Component-group paths repeat those results, and adjacent
+placements instantiate successfully. A Component-group policy one byte below
+the module's initial memory maps to `LimitExceeded` instead of generic
+validation. No diagnostic relies on Wasmi display or debug text.
+
+This closes the stable diagnostics named by C1.5 for the portable Profile-1
+Core boundary. The gate is not full Core conformance, differential or fuzz
+coverage, a Canonical ABI/resource taxonomy result, a timing guarantee, or a
+QEMU/physical-Duo execution claim; those remain C1.6, C1.7, C2+, and target
+integration work.
+
+**C1.6 selected baseline (2026-08-27):** the offline fixture is the complete
+official [`test/core/fac.wast`](https://github.com/WebAssembly/spec/blob/977f97014c962f7bd1291fcc6d28b41a924882bf/test/core/fac.wast)
+from WebAssembly/spec `wg-1.0` commit
+`977f97014c962f7bd1291fcc6d28b41a924882bf`, not a rewritten subset. Its exact
+2,602 bytes are pinned by SHA-256
+`7bf27b090f6533865acc79a37e0331b27fa11d7a3ab27b02e32e2efddfb405e7`; the
+vendored license is independently pinned, and
+[`PROVENANCE.md`](../wasm-runtime/tests/spec/core-wg-1.0/PROVENANCE.md) records
+the immutable source URL, path, commit, sizes, and digests. The runner requires
+the file's one module, all five `assert_return` actions, and its one
+`assert_exhaustion`, rejecting any extra directive. For every return it compares
+the official WAST result with both Vibe's bounded Profile-1 engine and the
+pinned DLR reference runtime; the exhaustion action must classify as Vibe
+`CallDepthExceeded` and DLR `StackExhaustion`. This closes a selected integer
+semantic baseline covering calls/recursion, locals, structured control flow,
+the fixture's non-negative factorial comparisons, and wrapping `i64`
+arithmetic. It is not a claim of full
+WebAssembly Core 2.0 conformance and does not widen Profile 1. C1.6 did not by
+itself close C1.7; the independent bounded gate below now supplies that selected
+deterministic evidence.
+
+**C1.7 selected robustness evidence (2026-08-27):**
+`wasm-runtime/tests/core_robustness.rs` generates its corpus locally with fixed
+xorshift64* seed `0x6a09_e667_f3bc_c909`. It pins 679 execution inputs and
+575,262 total module bytes. FNV-1a digest `0x7fc98ac32e54fb64` commits every
+case tag, module length and byte, and `i32` invocation argument: raw lengths
+0--192, equal-length tails after the exact Core magic/version, and 96 valid
+Profile-1 modules plus one truncation and one bit flip of each. The accepted
+modules cover integer arithmetic, direct calls, `if`, loops, bounded memory,
+and `unreachable`; separate cases cover a disabled float signature, an
+unlinked import, bounded nontermination and recursion, a tight compile
+reservation, and the exact 524,289-byte module-size limit-plus-one input.
+Ordinary structured inputs never exceed 4,096 bytes.
+
+Every corpus pipeline exercise is protected by `catch_unwind`, repeated from a
+fresh pipeline, and required to produce the same full result. Every admitted
+summary/reservation is checked against Profile 1. Execution uses 50,000 total
+fuel with a 10,000-fuel quantum and at most six polls; pending and terminal
+metrics conserve the ledger and advance by no more than one quantum. The 96
+unmodified generated modules and dedicated spin/recursion cases require exact
+`Ready`, `Unreachable`, `FuelExhausted`, and `CallDepthExceeded` outcomes.
+
+The normalized ordered outcome digest `0x2e7b93e373f2c522` commits complete
+admission/instantiation errors, start/execution trap codes, and typed ready
+vectors for all 679 inputs. Exact counts pin 552 admission rejections, 127
+admissions, 126 instantiations, 111 starts, 101 ready terminals, 10 trapped
+terminals, one instantiation rejection, and 15 start rejections. No arbitrary
+or mutated input may silently change stage or terminal, panic, reach a host
+call, exceed its poll bound, or retain an active call after termination.
+
+This closes the C1.7 criterion for the selected deterministic bounded CI
+evidence. It is not coverage-guided or exhaustive fuzzing, and it does not
+claim every possible Core byte sequence, actual cumulative/live allocator
+measurements, kernel-owner attribution, wall-clock bounds, or exhaustive opcode
+coverage.
 
 **Demo:** a host test invokes exported integer functions, grows bounded memory,
 observes exact traps, and resumes an infinite loop across multiple quanta. This
@@ -389,6 +726,75 @@ semantics before adding live authority or async behavior.
 | C2.5 | Implement inert resource tables | `own`, `borrow`, move, drop, stale indices, double-drop and table exhaustion are model-tested without any live CSpace yet |
 | C2.6 | Charge adapters and ABI work | Embedded adapter instructions consume Core fuel; host lift/lower allocation and work consume component budgets |
 | C2.7 | Differential and fuzz evidence | Accepted components agree with a pinned reference implementation; component bytes and canonical values are fuzzed separately |
+
+**Selected C2.1 evidence (2026-08-28):**
+`component-runtime/tests/component_profile_limits.rs` pins adjacent Profile-1
+inspection boundaries. Exact maxima succeed with sealed inert plans and exact
+summaries: 256 definitions, 256 aliases, 16 Core instances and 16 Component
+instances in independent namespaces, 256 canonical functions, 16 lowering
+adapters, type depth 16, eight embedded modules, and one 524,288-byte embedded
+Core module. Every maximum-plus-one input returns `DecodeError::Limit` without
+yielding the `ComponentPlan` required for instantiation. The 524,289-byte Core
+case remains below the enclosing 1 MiB Component ceiling, independently
+proving the embedded-module limit rather than the artifact limit. Nested
+Component sections remain unsupported and inert.
+
+The allocation-free predecoder now aggregates top-level and instance-type
+aliases under the same 256-entry account and charges each canonical lower to
+the 16-adapter account before reading its remaining fields. Dedicated
+truncated-entry tests require those known excess counts to win before the
+regular parser can materialize data, while the regular decoder retains the
+same limits before reserving plan storage. The C2.7 byte corpus and digest are
+unchanged; one header-prefixed input is intentionally reclassified from
+malformed to limit by this earlier alias-count check. This closes the selected
+C2.1 structural acceptance evidence without claiming C2.2 WIT resolution,
+C2.3--C2.6 runtime ABI semantics, or C2.7 differential/fuzz coverage.
+
+**Selected C2.3 evidence (2026-08-27):** the exact
+`vibe:fixture/canonical-language@1.0.0` world now executes through two
+independently authored freestanding guests, one Rust and one C. Both implement
+the same Canonical ABI function whose input/output type graph covers every
+Profile-1 non-resource value family and return both arms of a typed variant.
+The import-free compiler outputs are rebuilt with byte-pinned toolchains, passed
+through a digest-allowlisted transform that removes only the linkers' private,
+unreferenced mutable stack global, and revalidated as Profile-1 Core before
+being embedded in import-free Components. The test pins both Core and derived
+Component byte identities, the exact WIT world, four typed boundary cases, 276
+aggregate dynamic bytes, and corpus digest `0x5a3e5d03338a9be3`. Both languages
+produce the exact same typed values under a 1,000,000-work budget,
+10,000-work quantum, and 101-poll ceiling without a host operation, trap,
+poisoned instance, or retained continuation. Exact source/tool/artifact
+provenance and the offline reproduction command are documented in
+`component-runtime/tests/fixtures/language/PROVENANCE.md` and `TESTING.md`.
+This closes the selected C2.3 cross-language acceptance evidence without
+claiming C2.7 reference-runtime agreement or fuzz coverage.
+
+**Selected C2.7 evidence (2026-08-27):** the same byte-pinned Rust and C
+Components are now admitted by Vibe against Profile 1 and the exact WIT world,
+then executed through both Vibe and pinned Wasmtime 48.0.0 with an empty linker
+and finite fuel. Both engines run all four C2.3 cases for both fixtures and
+agree with each other and with a neutral named representation, while retaining
+the 276-dynamic-byte and `0x5a3e5d03338a9be3` corpus pins. Wasmtime is a
+host-test-only, default-feature-disabled dev dependency whose release commit,
+crates.io package digest, features, license, and Rust version are recorded in
+`component-runtime/tests/reference/PROVENANCE.md`; it is not a Profile-1
+admission oracle and is not linked into the target.
+
+Component bytes and Canonical values have separate deterministic bounded
+corpora. The byte gate fixes seed `0x243f6a8885a308d3`, 4,323 inputs,
+4,604,005 aggregate bytes, all proper-prefix truncations and one-bit-per-byte
+mutations of two admitted fixtures, a 1,048,577-byte limit-plus-one case, exact
+decoder classifications (863 accepted, 520 non-Components, 2,527 malformed,
+134 unsupported, 11 limited, 267 invalid embedded Core, and one invalid
+wiring), and digest `0x9edc2bd8460d97a4`; every decode is
+panic-contained. The value gate fixes 512 valid cases across all 19
+non-resource families, 799 type nodes, 772 value nodes, 1,026 dynamic bytes,
+88 list elements, 65 allocations, depth 6/5, and digest
+`0xbf10e036e7750d0b`. It independently requires exact memory32 lower/lift
+round-trips and accounting, 512 stable type-mismatch mutations, and 32 named
+invalid type/value/memory rejections. These gates close the selected C2.7
+differential and separate-fuzz acceptance evidence without claiming exhaustive
+coverage-guided fuzzing; resource/Canonical-ABI state fuzzing remains C3.6.
 
 **Demo:** a host-only component accepts a record containing strings and lists,
 uses an inert borrowed resource, and returns a typed variant with exact output
@@ -506,11 +912,544 @@ component security boundary is measured and stable.
 | C8.1 | Adapt legacy WASIp1 off-device | A pinned Preview-1 adapter wraps a Core module into an admitted component; VibeOS still accepts the component artifact, not a raw ambient WASIp1 process |
 | C8.2 | Support a bounded compatibility corpus | Checked-in Rust and C stdin/stdout filters run unchanged through selected CLI streams/arguments/exit; paths, processes, mutable environment, threads and raw sockets remain absent |
 | C8.3 | Publish runtime costs | Report validation, startup, lift/lower, async, composition, host-call, memory, fuel and cancellation/revocation costs on fixed QEMU and physical-Duo baselines |
-| C8.4 | Decide whether AOT is justified per workload | AOT proceeds only when a named product workload misses a frozen budget and profiling attributes the miss to interpretation |
+| C8.4 | Decide whether AOT is justified per workload | A verified miss attributed to interpretation may open C8.5 design review only; C8.4 never authorizes AOT or accepts native bytes |
 | C8.5 | Treat AOT as a rebuildable cache | Original component/Core bytes and policy remain authoritative; cache mismatch discards native code and never widens WIT imports or rights |
 | C8.6 | Reuse the sealed W^X lifecycle | Link RW-NX, validate imports/relocations, seal X-only, execute, quiesce, unseal, zero and reclaim; no JIT or RWX page exists |
 | C8.7 | Regenerate or verify native output | A pinned trusted compiler reproduces native bytes, or an equivalently reviewed verifier proves the accepted surface before execution |
 | C8.8 | Widen profiles one feature at a time | Float, SIMD, references, exceptions, memory64, multiple memories, GC, threads or broader WASI each require separate semantics and evidence |
+| C8.9 | Activate Float under an independent identity | A new code-6 executable identity must pass separately frozen design, implementation/admission, and fresh fixed-QEMU qualification nodes; code 5 remains permanently inert |
+| C8.10 | Widen fixed-width SIMD under an independent validation identity | New code 7 freezes fixed SIMD 1.0 with deterministic software-float lanes, no public `v128` boundary, no relaxed SIMD, and staged engine, containment, admission/lifecycle, and fixed-QEMU gates before any successor review |
+| C8.11 | Allocate an independent executable SIMD successor | New code 8 and ABIs 8 freeze fixed SIMD semantics, an exact engine identity, closed authority-free world, code-7 non-promotion, implementation gates, and fresh fixed-QEMU qualification before release |
+| C8.12 | Widen Reference Types under an independent validation identity | New code 9 and ABIs 9 freeze bounded Core-internal nullable `funcref`, reject `externref`, typed references, GC objects and all host/Component reference boundaries, and require separate implementation and fixed-QEMU qualification before any successor review |
+| C8.13 | Allocate an independent executable Reference Types successor | New code 10 and ABIs 10 preserve the bounded code-9 semantics behind a sealed authority-free integer/byte boundary, forbid in-place promotion, and require separate design, implementation, and fresh fixed-QEMU qualification before release |
+
+The C8.3 row above is retained verbatim as the historical v1 acceptance text.
+C1 through C8.3 are treated as complete under the project's historical-evidence
+policy and are not rerun. This status does not assert that absent physical
+publication files exist, does not synthesize or backfill a Duo publication,
+and does not turn fixed-QEMU output into physical provenance.
+
+The Float widening is itself divided into five ordered increments. Completion
+of one increment does not activate code from the next:
+
+| # | Float increment | Acceptance |
+|---|---|---|
+| C8.8-F1 | Freeze contract and identity | Code 5, exact revisions and feature vector, scalar `f32`/`f64`, strict exact-bit NaN policy, Profile-1 non-widening, artifact mutation coverage, no current engine, and CGV1 rejection are frozen as metadata only |
+| C8.8-F2 | Implement deterministic Core validation and execution | A reviewed software-float Wasmi candidate with an independent package/source/checksum identity covers every scalar instruction and translator fold, stable conversion traps, limits, differential/fuzz corpus, and fuel/quantum behavior; code 5 remains inert |
+| C8.8-F3 | Implement WIT and Canonical ABI floats | `f32`/`f64` flat values and lift/lower paths close exact-bit, memory-bounds, nested-value, realloc/cleanup, hostile-input, and differential evidence without adding authority |
+| C8.8-F4 | Close default-off admission and lifecycle | Candidate-only loader/image policy, quota, revoke/cancel, fault reclamation, and durable-rejection tests pass; production code 5 remains inert |
+| C8.8-F5 | Qualify targets and review activation | Host and the formal fixed-QEMU normal/optimized matrix pass 1,176 exact-bit/fuel records; fixed QEMU replaces the physical-Duo exit requirement for this gate only, and completion opens only design review for a separately numbered, unallocated successor |
+
+The complete F1/F2/F3/F4/F5 Float contract and evidence are specified in
+[WASM_FLOAT_PROFILE.md](WASM_FLOAT_PROFILE.md). F2 uses the renamed, vendored
+`vibeos-wasmi-*-softfloat` package family only behind the
+`c88-f2-acceptance` feature. `rustc_apfloat` implements deterministic
+arithmetic and conversions; a fixed 24/53-round pure-integer algorithm
+implements square root. Strict NaN canonicalization and bit-preserving
+transport, every scalar runtime and translator-fold path, fused branches,
+stable conversion traps, Profile-1 limits, import denial, deterministic
+fuel/quantum traces, fixed-seed differential and end-to-end fuzz corpora,
+hostile byte mutations, and offline supply-chain checks pass. A pinned RISC-V
+release-object audit finds no semantic FP instruction, compiler FP helper, or
+target F/D opcode; remaining sign-only LLVM forms lower to integer bit
+operations. Stock Profile 1 and permanent code-5 inertness remain unchanged.
+F3 adds a separate bit-only flat representation and exact Component-boundary
+NaN normalization behind `c88-f3-acceptance`. It covers direct/indirect flat
+and memory lift/lower, Canonical ABI variant joins, nested record/list/result
+values, bounds/alignment, protected return areas, allocation journals,
+and byte-for-byte replay through the existing success/abort/failure cleanup
+state machine, fixed-seed bit and hostile-memory corpora, and an import-free
+Wasmtime 48 scalar/nested differential fixture. Its offline
+RISC-V audit binds the 29-rlib target closure and finds no F/D opcode in 126
+objects; all 29 workspace-owned objects remain LLVM-auditable and have no
+host-float type/transport, semantic FP, helper, or symbol. Default WIT and the
+production Profile-1 codec remain unchanged, and the synchronous candidate
+rejects adjacent async WIT shapes. The F3 replay remains cleanup-model
+evidence rather than runtime wiring.
+
+F4 adds one default-off image pin behind `c88-f4-float-candidate`. Its exact
+component SHA-256 is
+`5fdb9dc9a48a9c54e899a5dc724445083c055dbf0d664927ba55d9780cc9996a`, its
+world is `vibe:float-acceptance/lifecycle@1.0.0`, and its sole export is
+`run(mode: u32, left: f32, right: f64) -> f64`. The separately gated admission
+and runtime path admits no imports, host imports, resources, caller authority,
+command manifest, durable graph, or publication authority. The image fixes a
+two-page memory ceiling, 100,000 total fuel, a 100-fuel poll quantum, and zero
+resources; compile reservation is freshly derived and exact. Host tests cover
+exact Float bits and NaN normalization, one-live-instance enforcement,
+exact Component-to-Core `run` binding, under-reservation and adjacent quota
+rejection, grow-to-memory-ceiling enforcement, finite-fuel exhaustion,
+cancellation, absorbing revocation, trap reclamation, cold recovery, and
+durable loader/CGV1 rejection.
+This is explicit candidate-only activation evidence, not a current-engine or
+production activation path. F4 itself made no fixed-QEMU or physical-Duo
+execution claim; those remain separately attributed to F5.
+
+The non-physical portion of F5 reuses one `no_std` qualification routine on the
+host and in isolated, default-off target images. The frozen corpus contains 146
+Core runtime/fold/repeatability observations, 13 Canonical ABI records, 12
+image/lifecycle vectors, 1,000 fuel records, and 5 terminal lifecycle
+snapshots. A pre-decision fixed-QEMU regression from clean, already-pushed
+implementation commit `c4ea5e5ca1de622884f33c01bf06653f498360aa`, source tree
+`ec7e1195b1a8ba4a88d37a817a9e0f64c4432016`, and challenge
+`8fb4bba646b9755b897d5dcbab0cb5724f0c2821b30ee99bbfe76c9a470fce9a`
+used the fixed QEMU 11.0.3 `qemu-virt-rv64-tcg-icount-v1` contract. It accepted
+all 1,176 data records and reproduced semantic SHA-256
+`51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`.
+The source-bound run ID is
+`08cf7c906917fb6a9d1b482f461f12abfc30339bd7136124ae609fa5568c1caa`.
+
+That preliminary QEMU kernel is 40,449,184 bytes with SHA-256
+`0ef0ce1bf8f9aad1a5f35bbd783c94ea2fcfbc0fffc72285d5fe5efd781f146e`;
+the UART transcript is 384,916 bytes with SHA-256
+`ede6c9fc7b68982f372762af51d4a786224c6a54c115ac50be7f7e5a4d8de621`.
+The byte-reproducible final-ELF report is 2,031 bytes with SHA-256
+`cc70f99f265eb1fa767407b555d7324a7e49a4ed8d24b856859416f3557896af`;
+the canonical environment envelope is 84,839 bytes with file SHA-256
+`3307451b5273f00d455ca95cea58e13e78dbcbea5e752a11274cc1abcff48fe6`
+and whole-envelope evidence digest
+`6ad5d168efc32abf88bf982ef59decdd6eaa53f2c1a25d38f2d732c2a2eac8df`.
+Normal and optimized independent verifier replays passed, and standalone ELF
+audits reproduced that report byte-for-byte.
+
+The final QEMU RV64 IMAC ELF is static, relocation-free, W^X, soft-ABI/RVC, and
+has zero forbidden F/D opcodes, undefined symbols, or Float helper symbols at
+381,935 canonical decoder boundaries. It contains 381,934 decoded
+instructions, 42,010 trusted direct control-flow targets, and 128,657 code
+symbols. This audit is deliberately limited to trusted native control flow at
+canonical decoder boundaries; arbitrary-PC redirection and hardware NX are not
+claimed. The build envelope still closes 190 Cargo registry archives and the
+exact 3,603-file, 71,790,604-byte pinned `rust-src` tree. These are emulator
+and local software-custody facts only: `physical_provenance=not-claimed`.
+
+The formal F5 exit decision was published from clean, pushed source commit
+`0f06212f890077b2a3d1b4405a128058cb07c55e`. Its publisher directly ran the
+normal and optimized verifier workers against one fresh fixed-QEMU evidence
+set. Both modes accepted exactly 1,176 records and reproduced semantic SHA-256
+`51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`.
+The fresh source-bound run ID is
+`53c9f7ed099c371724867d060c3994cb4b3ad93d46404156f40914d7f3b30254`.
+The checked-in closure identities are:
+
+| Fixed-QEMU F5 closure identity | Value |
+|---|---|
+| Decision ID | `1841ae06e4c8bef4842a59bbc65362fa860e37d6d8a1d79cc68e3fc5a87004f9` |
+| Decision SHA-256 | `1d118cdb4f5709f4ce93331b1cd6b60435e6c530eb800e9c21e0a3e8569030d4` |
+| Normal receipt SHA-256 | `4d70865a6a665829457ee0e9ec34c9fa38de51ed6ee2bcb2be1356d752355c1a` |
+| Optimized receipt SHA-256 | `4f95fcd2b4d2524b1d27fce7bbf77846f4f7d0030da8ebe277ffc062e53550e0` |
+
+This decision makes fixed QEMU the formal replacement for the physical-Duo
+exit requirement of C8.8-F5 only. It is emulator evidence with
+`physical_provenance=not-claimed`, consumes zero physical inputs, and changes
+no other hardware gate. It closes F5 and the Float widening while explicitly
+leaving every other C8.8 feature widening incomplete.
+
+Separately, earlier pushed implementation commit
+`c4ea5e5ca1de622884f33c01bf06653f498360aa` freezes the Duo suite
+`vibeos.c88.f5.float-target.duo-v1` for platform
+`milkv-duo-cv1800b-c906-v1`. Its 4,159-byte manifest has SHA-256
+`1c85f22cacee7c8eb7693578052fe0452169eace99f1dab06e08aa0e42771b11`;
+its 4,692-byte transcript schema has SHA-256
+`e25d9a38d194993906b7fe5ec9708654ea31e2386ac61f0fa360ed8ad1eb7439`.
+The reserved non-evidence sentinel run ID is
+`c5c8ec42e56fbeaf38106965e5ec6735cb86a93af530cd37f5002dba1971b4ac`,
+with immutable arm marker `vibeos.c88.f5.duo.compile-readiness.arm=0`. The
+build only cross-links; it does not package, flash, connect to serial, or
+execute.
+
+The locally audited Duo RV64 IMAC ELF is 40,331,520 bytes with SHA-256
+`e9a58e681c4d3e073dbeb1d15f569600e0ab2a97c07f13ed1dc0c676b5d62b1e`.
+Its 2,031-byte audit report has SHA-256
+`0b3384b35d85fdee970b98f523b7bd814102611549c08e7915625310954beac4`;
+it contains 380,650 decoded instructions, 380,651 canonical boundaries, 41,883
+trusted direct targets, and 128,210 code symbols, with zero forbidden opcodes,
+Float helpers, or undefined symbols. This ELF identity records the local
+compile-readiness run; the verifier intentionally freezes structure and
+payload rather than globally pinning whole ELF bytes because source-build
+provenance is not claimed.
+
+The sentinel ELF and run ID can never satisfy the retained physical-v1 contract, and patching
+the readiness image is not an arming procedure. A separate host-side wire and
+campaign-verifier contract now exists at pushed commit
+`f502240a88eeb218ca923276675d7b6dec3e4030`, tree
+`d63a2a1ff68ab84586a1b53ee24982e232bc5b0f`. Its checked-in identities are:
+
+| Duo physical-v1 verifier artifact | Bytes | SHA-256 |
+|---|---:|---|
+| Transcript/campaign contract | 5,605 | `01284fa4bb76a24e0a40e39fddec109e98ff36ec8912bb806f7a52a520a6617e` |
+| Transcript schema | 5,923 | `08007a5e68e53181592dd9eaecf124a630b2eddfdc20c146504ff1d4df8811f5` |
+| Host-only verifier | 56,129 | `09a98255b9deb8c5d14b19ecb4c0c5725cfbef25a60b1d84f2f4bbfbda649928` |
+| Independent shared semantic oracle | 134,348 | `36451c3c614486a714b3466b77b329fee8a1368603ffaa9d2925b75b3f666686` |
+
+The suite is `vibeos.c88.f5.float-target.duo-physical-v1`, with a distinct
+NUL-terminated run-ID domain and physical-only UART prefix. The verifier
+rejects readiness, fixed-QEMU, and C8.4 families; validates exact formal
+non-sentinel bindings; enforces `META -> 1176 records -> END -> PASS`; and
+recomputes semantic SHA-256
+`51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`
+through the independently byte-pinned F5 oracle. Normal and optimized contract
+checks and the 53-mutation synthetic self-test are byte-identical. A host-only
+in-memory translation of the retained formal-QEMU records also exercises the
+normal semantic branch under both interpreters, but remains verifier test input
+and never physical evidence.
+
+The retained verifier node reserves the future feature
+`wasm-c88-f5-float-duo-physical-qualification` and arm marker
+`vibeos.c88.f5.duo.physical-qualification.arm=1`; neither exists as an
+executable producer in this node. Milk-V Duo testing remains paused. If it is
+voluntarily resumed, the retained campaign still requires a separately
+reviewed feature/arm producer with formal, non-sentinel bindings and must bind
+one build environment, package envelope, kernel ELF, and full SD image across
+three operator-confirmed power cycles and cold boots. Every retained physical
+counter remains zero and `gate_satisfied=false`; no physical evidence is
+claimed. Those retained readiness and physical-v1 artifacts are scoped
+non-evidence and non-blocking for C8.8-F5.
+
+As of 2026-08-29, C1 through C8.3 are accepted complete by historical-evidence
+policy. The completed C8.4 decision-bearing chain is the fixed-QEMU contract
+below. It reuses the live trusted-terminal boundary and private 24-sample collector
+to emit META + 24 SAMPLE + END through the platform-neutral atomic UART sink,
+with three warmups and 21 retained samples. Formal and dirty-smoke builds are
+compile-time and wire-distinct; an independent host verifier closes the exact
+workload, transcript, source, helper, QEMU, OpenSBI, OpenSSH, and publication
+envelopes. Formal builds use an exact commit-plus-gitlink object export and a
+fresh private Cargo target; a sanitized remote query proves the bound source
+commit is actually advertised. Only byte-identical private copies of frozen
+QEMU/OpenSBI plus the kernel are executed; pinned `/usr/bin/ssh` executes in
+place only after repeated Darwin sealed/read-only APFS, ownership, mode, link,
+`SF_RESTRICTED`, same-device, version, hash, and byte-length attestation.
+The formal build additionally audits the project and pinned rust-src
+`Cargo.lock` files into a conflict-free 213-package union and consumes only
+checksum/inventory-verified sources through one private read-only directory
+source. It runs absolute Cargo from `/`, never executes rustup, and closes the
+complete nightly toolchain, rust-src, crate-source, and non-system `ld.lld`
+Mach-O runtime trees before and after compilation. Its private Cargo home is
+config-only before and after: deterministic `.global-cache`, package-lock, and
+cache-tag runtime outputs are exact-gated, recorded, removed, and fsynced;
+unknown entries fail closed.
+Each committed non-final SAMPLE is fenced by `PendingAcceptance`. SAMPLE 23
+and the stability gate split Ready25 from the sole PendingEnd authority, but
+`PendingTerminal` keeps Ready25 unstartable until all remaining fallible
+request-tail checks pass and the finalizer commits END; abandonment or END
+failure is absorbing and never retries.
+The firmware search, QEMU version probe, and live process share one manifest-frozen,
+deny-by-default environment with exact locale, timezone, and `PATH` values and
+fresh private campaign-local `HOME`, `TMPDIR`, and `XDG_CONFIG_HOME`; ambient
+`DYLD_*`, `QEMU_*`, and user configuration are absent. OpenSSH is not resolved
+through `PATH`. A dedicated `/bin/sh` launcher pins CPython 3.14.6 with
+`-I -B -S`, an absent `/var/empty` pycache sink, a deterministic reachable
+stdlib/lib-dynload inventory, the Framework and Python.app executable, and
+exact `_hashlib`/libcrypto, `_lzma`/liblzma, and `_zstd`/libzstd identities;
+fixed empty OpenSSL configuration/provider inputs prevent ambient loading.
+Dynamic maintained helpers execute only stable UTF-8 source snapshots and
+propagate their actual hashes through the peer closure; ignored bytecode and
+site customization cannot become decision inputs. The 10 MHz decision clock
+is statically closed through `live_tick -> sbi::time -> rdtime` and the QEMU
+board constant. The earlier absorbing QEMU audit sink remains a separate
+integration-only test and cannot enter either decision dataset.
+
+The retained physical-Duo chain remains implemented but non-blocking: it has
+the build-bound single-cold-boot protocol, three-boot/63-sample aggregation,
+independent frozen-source and build/package envelopes, host-observed Docker
+runtime closure, full-SD-image verifier, read-only capture program, and final
+evidence verifier. Its host-only synthetic tests use no device, network, flash,
+reset, or physical cold boot and establish no physical provenance.
+
+Milk-V Duo physical testing is paused at operator request. The retained
+physical contract and tooling remain available but are no longer a C8.4
+prerequisite. The decision-bearing replacement is the disjoint
+`qemu-virt-rv64-tcg-icount-v1` contract: one fresh QEMU process, 3 warmups, 21
+retained samples, 10 MHz `rdtime`, a pre-frozen 1,000,000-tick budget, and a
+1.10 retained stability ceiling. It uses a separate suite, schema, and run-id
+domain and explicitly records `platform_class=emulator` and
+`physical_provenance=not-claimed`; it cannot be presented as Duo evidence.
+Formal fixed-QEMU evidence in
+[`benchmarks/wasm-aot-decision/qemu-v1/`](../benchmarks/wasm-aot-decision/qemu-v1/)
+completes C8.4 at source commit
+`e950a2facb6a6c230e67becb186bddf34a5924bb` and run ID
+`a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f`.
+Its stable p95 total is 2,901,632 ticks and p95 non-interpretation is 2,804,417
+ticks, both above the 1,000,000-tick budget. The miss is therefore not
+attributable to interpretation and the outcome is
+`aot-not-justified-on-fixed-qemu`; AOT remains unauthorized and no native code
+is accepted. C8.5 through C8.7 are skipped for this workload and remain
+globally deferred; they are not marked complete.
+The current C8.4 gate is the fixed-QEMU publication-integrity auditor: it binds
+the four checked-in evidence files to publication commit `cbb1d0f`, binds the
+recorded source/capture-time verifier members to source commit `e950a2f`, and
+rechecks the stored emulator-only/no-AOT decision with zero physical inputs.
+It is a structure/hash check and does not replay QEMU, publisher execution, or
+ephemeral host custody. The source-bound physical-Duo verifier and tooling stay
+retained, paused, non-blocking, and non-evidence; no current physical input is
+required, and unrelated hardware gates are unchanged.
+The C8.8 Float widening is complete through F5 under decision
+`1841ae06e4c8bef4842a59bbc65362fa860e37d6d8a1d79cc68e3fc5a87004f9`.
+That decision formally substitutes fixed QEMU for the physical-Duo gate only
+for C8.8-F5. Milk-V Duo testing stays paused and its readiness and physical-v1
+contracts stay retained, non-blocking, and non-evidence; every unrelated
+hardware gate is unchanged. No other C8.8 feature widening is complete. Code 5
+remains permanently `ValidationOnly` and inert, and the closed Float evidence
+only made design review eligible for a separately numbered successor that was
+then unallocated. F5 itself authorized no successor implementation, engine
+binding, execution, production admission, native-byte acceptance, AOT, or
+in-place promotion; the later C8.9-S1 contract is the separate allocation and
+implementation authority.
+
+### Post-C8.8-F5 successor review boundary (not an allocated node)
+
+The neutral
+[`float-successor-review-boundary-v1-contract.json`](../acceptance/wasm-float-target/artifacts/float-successor-review-boundary-v1-contract.json)
+turns design-review eligibility into a fail-closed charter without selecting a
+design. Its verifier checks canonical contract bytes plus the exact historical
+F5 contract, verifier, decision, and normal/optimized receipt members. Passing
+means `review-charter-integrity-only`: it neither replays F5 evidence nor
+establishes that the review passed.
+
+At publication of this historical charter, the successor identity was
+`unallocated`. Its roadmap number, profile code, artifact/runtime ABIs,
+Core/Component revisions, stage, engine, supply chain, production admission
+path, durable format, and target/release evidence gate were all unselected.
+Code 5 was and remains permanently `ValidationOnly`, inert, and ineligible for
+migration or promotion in place. The later C8.9-S1 allocation is a separate
+contract and does not mutate or relabel this historical charter.
+
+Eight review questions remain unresolved and blocking for later, separately
+versioned work: identity/version allocation; engine/supply-chain selection;
+semantic and evidence inheritance; production admission/authority; durability,
+upgrade and rollback; global accounting/concurrency/lifecycle; target/release
+evidence; and final authorization/rollout. F5 evidence may be referenced only
+for the closed F5 identity and cannot automatically become successor engine,
+activation, admission, or release evidence.
+
+The fixed-QEMU replacement remains scoped to C8.8-F5. Milk-V Duo stays paused,
+retained, non-blocking, and non-evidence; this charter takes zero physical
+inputs and changes no unrelated hardware gate. C8.5--C8.7 remain globally
+deferred and every other C8.8 widening remains incomplete. The separate
+prospective target/release policy below does not broaden or rewrite this
+historical decision.
+
+### Fixed-QEMU target/release policy v1 (policy checkpoint; not a roadmap implementation node)
+
+This non-C-numbered checkpoint is a governance policy. The policy checkpoint
+roadmap position is `post-c88-f5-pre-allocation`. The policy scope is
+`prospective-wasm-roadmap-target-and-release-gates`. The policy contract is not
+target evidence and satisfies no target or release gate. The normative generic
+WASM target/release gate is fresh, source-bound fixed QEMU on
+`qemu-virt-rv64-tcg-icount-v1`. Fresh node-specific source, suite, challenge,
+run, capture, acceptance predicates, and evidence remain mandatory. Historical
+C8.4 and C8.8-F5 QEMU evidence cannot satisfy a future gate.
+
+The policy has `physical_inputs_required=0`,
+`physical_inputs_permitted=0`, `physical_provenance=not-claimed`, and
+`physical_equivalence_claimed=false`. Fixed QEMU is emulator evidence, not a
+claim about Milk-V Duo performance, physical provenance, cache behavior, or
+board equivalence. Milk-V Duo remains paused and optional; any later
+observation is separate and has no gate, completion, or release effect. Its
+machine fields are `gate_effect=false`, `completion_effect=false`, and
+`release_effect=false`; resuming it voluntarily cannot replace or mutate the
+formal QEMU evidence set.
+
+This replacement is limited to the prospective generic WASM target/release
+gate. Any acceptance claim that is intrinsically about real hardware remains a
+separate physical gate, including microSD persistence, DWMAC networking, USB,
+entropy, cache/DMA coherency, thermal and electrical behavior, and
+certification. Those gates are neither satisfied nor weakened by QEMU.
+Unrelated board, device, entropy, physical-security, and certification gates
+remain unchanged.
+
+The canonical policy contract is
+[`fixed-qemu-target-release-policy-v1-contract.json`](../acceptance/wasm-roadmap/artifacts/fixed-qemu-target-release-policy-v1-contract.json).
+Passing its verifier proves policy integrity only. Code 5 remains permanently
+`ValidationOnly` and inert. No successor identity, roadmap number, profile,
+ABI, engine, implementation, execution, admission, release, or production
+authority is allocated by this policy. It also authorizes no durable
+publication, migration, native bytes, AOT, JIT, RWX, rollout, or in-place
+promotion.
+
+## 9.1 C8.9 independent executable Float successor
+
+Explicit allocation creates C8.9 as a new identity rather than an F6 or an
+in-place change to code 5. Its ordered nodes are:
+
+| # | Scope | Exit gate |
+|---|---|---|
+| C8.9-S1 | Freeze independent design | Code 6, artifact/runtime ABI 6, Component/Core profile 3, exact Core/Component/Canonical revisions, the exact vendored software-float Wasmi engine, the closed WIT world, code-5 non-promotion, and the fixed-QEMU policy are frozen |
+| C8.9-S2 | Implement runtime and admission | The code-6 codec, current engine binding, validator/executor, Canonical ABI, exact admission surface, lifecycle/accounting, rollback, durable rejection, and negative code-5 isolation gates pass |
+| C8.9-S3 | Qualify and decide release | Fresh source-bound normal and optimized evidence on `qemu-virt-rv64-tcg-icount-v1` passes the node-specific contract before any release or production authority is granted |
+
+C8.9-S1 is complete under
+[`c89-float-successor-design-v1-contract.json`](../acceptance/wasm-float-target/artifacts/c89-float-successor-design-v1-contract.json).
+It selects `PROFILE_3_SYNC_FLOAT_EXECUTABLE`, profile code 6, artifact/runtime
+ABI 6, Component/Core profile 3, deterministic scalar-float revision suffix
+`c89-exec-v1`, and `vibeos-wasmi-softfloat` version
+`1.1.0-vibeos-f2.1` at upstream revision
+`8273dfb09d493971b7bb12fe614d740cdc857175`. The selected execution stage is
+`Executable`. C8.9-S2 is complete under
+[`c89-float-successor-implementation-v1-contract.json`](../acceptance/wasm-float-target/artifacts/c89-float-successor-implementation-v1-contract.json): code 6 now has an exact artifact codec, current software-float engine proof,
+closed import-free admission, bit-only Canonical ABI, bounded move-only
+lifecycle, cold recovery, and explicit ordinary-command/durable rejection.
+Code 5 remains outside every current-engine and executable path. C8.9-S3 is
+complete under
+[`c89-s3-fixed-qemu-qualification-v1-contract.json`](../acceptance/wasm-float-target/artifacts/c89-s3-fixed-qemu-qualification-v1-contract.json):
+the fresh pushed source `2e9bc0c3648656cca8e4d198cbb6a7350975090a`
+passed 1,176 records under normal and optimized verification on fixed QEMU.
+Release and production authority apply only to the sealed, authority-free
+Float admission. Ordinary command routing, durable publication, AOT, JIT,
+native bytes, and RWX remain unauthorized.
+
+The C8.9 closure position is `c89-s3-qualified-sealed-float-runtime-released`.
+Milk-V Duo remains paused and optional with zero gate effect; no physical
+equivalence is claimed. Historical C8.8-F5 evidence was not reused.
+
+## 9.2 C8.10 deterministic fixed-width SIMD widening
+
+C8.10 is the first unfinished non-Float C8.8 widening. C8.10-S1 is complete
+under
+[`c810-simd-widening-design-v1-contract.json`](../acceptance/wasm-simd-target/artifacts/c810-simd-widening-design-v1-contract.json).
+It allocates `PROFILE_4_SYNC_SIMD_VALIDATION`, profile code 7, artifact/runtime
+ABI 7, Component/Core profile 4, and stage `ValidationOnly`. Fixed-width SIMD
+1.0 is selected; relaxed SIMD and every adjacent proposal remain forbidden.
+`v128` is Core-internal and cannot cross WIT, Canonical ABI, or host-call
+boundaries.
+
+The S2 engine is now materialized as
+`vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd1.1`. It removes host-float and
+`libm` dependence from SIMD lane semantics, freezes
+fuel, and passes a complete RISC-V object audit with no F, D, or V instructions.
+The closure is recorded by
+[`c810-simd-widening-implementation-v1-contract.json`](../acceptance/wasm-simd-target/artifacts/c810-simd-widening-implementation-v1-contract.json).
+S3 closes Component containment and corpora. S4 closes a default-off,
+exact-image-pinned, authority-free volatile admission token and single-instance
+acceptance lifecycle, including explicit cancel/fault recovery, terminal revoke,
+and ordinary loader rejection. It creates no durable or command conversion. S5
+uses fresh fixed-QEMU evidence to decide successor-review eligibility only.
+
+S5 passed fresh fixed-QEMU evidence at source commit
+`4b2add7ccf9dee18891b89548ee24a3e6d828f98`, run ID
+`ca57bdf2af07484ef48e8ef09e51700e1f5b7a169de04c58594b66a96c7c8b61`,
+under normal and optimized verification. This made a successor design review
+eligible but did not itself allocate or authorize one.
+Code 5 remains permanently inert, code 6 gains no SIMD, and code 7 remains
+validation-only, non-current, non-durable, unreleased, and non-production.
+Milk-V Duo remains paused, optional, non-gating, and supplies zero input.
+See [WASM_SIMD_PROFILE.md](WASM_SIMD_PROFILE.md) for the frozen design.
+
+## 9.3 C8.11 independent executable SIMD successor
+
+C8.11 follows the same non-promotion rule used by the Float successor. It does
+not reinterpret code 7. C8.11-S1 allocates
+`PROFILE_5_SYNC_SIMD_EXECUTABLE`, profile code 8, artifact/runtime ABI 8,
+Component/Core profile 5, and stage `Executable`. It freezes exact Core,
+Component, Canonical ABI, wasm-tools, WIT-world, semantic, engine, authority,
+and fixed-QEMU identities under
+[`c811-simd-successor-design-v1-contract.json`](../acceptance/wasm-simd-target/artifacts/c811-simd-successor-design-v1-contract.json).
+
+The selected S2 engine is
+`vibeos-wasmi-simd-executable-softfloat@1.1.0-vibeos-simd2.1`, derived from the qualified
+C8.10 engine tree but independently named. C8.11-S2 materializes its two-file
+facade, binds the exact code-8 current engine, and audits the complete closure.
+Fixed-width SIMD 1.0 and deterministic software-float lanes are retained;
+relaxed SIMD and every adjacent proposal remain forbidden. `v128` remains
+Core-internal and cannot cross WIT, Canonical ABI, or host boundaries.
+
+The ordered nodes are:
+
+| # | Scope | Exit gate |
+|---|---|---|
+| C8.11-S1 | Freeze independent design | Code/ABIs 8, profile 5, exact revisions, world, engine, semantics, code-5/code-7 non-promotion, and target policy are frozen |
+| C8.11-S2 | Implement runtime and admission | Code-8 codec, exact current engine, validator/executor, authority-free admission, lifecycle/accounting, durable rejection, supply-chain closure, and RISC-V audit pass |
+| C8.11-S3 | Qualify and decide release | Fresh source-bound normal and optimized fixed-QEMU evidence passes the node-specific contract before any release or production authority is granted |
+
+The previous roadmap position was
+`c811-s1-simd-executable-design-frozen-pre-implementation`. The implementation
+position was `c811-s2-simd-executable-implemented-pre-fixed-qemu`. C8.11's
+closure position is `c811-s3-qualified-sealed-simd-runtime-released`; C8.12 is
+the now-allocated next widening. S2 granted only the exact code-8 current-engine binding and sealed
+authority-free volatile admission. It grants no durable publication, ordinary
+command, release, or production authority. Code 5 remains permanently inert,
+code 7 remains validation-only and non-migratable, and historical C8.10
+evidence cannot satisfy C8.11. Milk-V Duo remains paused with zero gate input. See
+[WASM_SIMD_EXECUTABLE_PROFILE.md](WASM_SIMD_EXECUTABLE_PROFILE.md).
+
+C8.11-S3 binds pushed source commit `90f95df4503a3992067fa68dbcd7d9dd9485ef10`
+to a fresh fixed-QEMU campaign with seven records and semantic SHA-256
+`ddab9d539744523b332787be6f8a101de00108479c9644136538524f20cd4514`.
+Normal and optimized verification and the final-ELF audit pass. The release is
+strictly the sealed authority-free volatile code-8 path; durable publication,
+ordinary commands, AOT/JIT/native bytes/RWX, and every unrelated hardware gate
+remain unchanged.
+
+## 9.4 C8.12 independent Reference Types validation widening
+
+C8.12-R1 allocates `PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION`, artifact
+profile code and artifact/runtime ABI 9, Component/Core profile 6, and stage
+`ValidationOnly`. It selects
+`vibeos-wasmi-reference-validation@1.1.0-vibeos-ref1.1` as a new facade over
+the pinned Wasmi soft-float source, while retaining the Profile-1 integer-only
+numeric configuration. R1 freezes design metadata only: code 9 is not yet
+materialized, current, admitted, executable, durable, migratable, or released.
+
+The bounded semantic surface is Core-internal nullable `funcref`, single-result
+typed select, one funcref table, Reference Types 1.0 table operations, and
+active element segments. Bulk-memory operations and passive/declarative element
+segments remain disabled. `externref`, typed function references, GC
+objects, host reference values, and every Component/Canonical/WIT reference
+boundary are rejected. Wasmi's required `GC_TYPES` parser bit grants no GC
+semantic authority. All other adjacent proposals remain disabled.
+
+| # | Scope | Exit gate |
+|---|---|---|
+| C8.12-R1 | Freeze independent validation design | Code/ABIs 9, profile 6, revisions, closed world, exact candidate engine, semantics, non-promotion, and target policy are frozen |
+| C8.12-R2 | Implement validation and containment | Code-9 codec, isolated candidate engine, syntax inspection, positive/negative/differential corpora, admission/durable rejection, supply-chain closure, and RISC-V audit pass |
+| C8.12-R3 | Qualify validation widening | Fresh source-bound normal and optimized fixed-QEMU evidence passes before only an independently numbered executable-successor design review becomes eligible |
+
+The R1 position was
+`c812-r1-reference-types-validation-design-frozen-pre-implementation`. The
+current position is
+`c812-r3-qualified-reference-validation-successor-review-eligible`. R3 binds
+pushed source commit `43516cd6fe4d88c583f681714950884dc8660d4c` and tree
+`89ca3d099ef3981cc2d760a8993d47d5a6585cc7` to one fresh fixed-QEMU boot,
+nine semantic records, semantic SHA-256
+`bf33470617822af905ab8877797416e79aed3cde5a257689b3bbdda4df156279`,
+and an exact 208-rejected/48-accepted-inert mutation split. Normal and
+optimized verification plus the final-ELF audit pass. The next node is an
+unallocated, independently numbered Reference Types executable-successor
+design; code 9 is not promoted. Historical C8.11 receipts cannot satisfy
+C8.12. Fixed QEMU is emulator-scoped and makes no physical-equivalence claim;
+Milk-V Duo remains paused and supplies zero inputs. Code 5 remains permanently
+inert, code 7 remains validation-only, and code 8's released scope is unchanged. See
+[WASM_REFERENCE_TYPES_PROFILE.md](WASM_REFERENCE_TYPES_PROFILE.md).
+
+## 9.5 C8.13 independent Reference Types executable successor
+
+C8.12-R3 makes only a separately numbered executable-successor design review
+eligible. C8.13-E1 now allocates
+`PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE`: artifact profile code and
+artifact/runtime ABI 10, Component/Core profile 7, stage `Executable`, and
+engine `vibeos-wasmi-reference-executable@1.1.0-vibeos-ref2.1`. The exact
+world is `vibe:references/runtime@1.0.0` with only integer and byte-list
+parameters/results and zero resources.
+
+The semantic surface is unchanged from C8.12: bounded Core-internal nullable
+`funcref`, one table, active elements, Reference Types 1.0 table operations,
+and deterministic fuel. `externref`, typed references, GC, host/Component
+reference values, bulk memory, floats, SIMD, memory64, threads, AOT/JIT/native
+bytes/RWX, durable publication, and ordinary command routing remain forbidden.
+
+| # | Scope | Exit gate |
+|---|---|---|
+| C8.13-E1 | Freeze independent executable design | Code/ABIs 10, profile 7, revisions, world, exact engine, semantics, code-9 non-promotion, authority boundaries, and target policy are frozen |
+| C8.13-E2 | Implement sealed volatile runtime | Executor, current-engine binding, exact authority-free admission/lifecycle, durable rejection, supply-chain closure, and RISC-V audit pass |
+| C8.13-E3 | Qualify and decide release | Fresh source-bound normal and optimized fixed-QEMU evidence passes before releasing only the sealed volatile code-10 runtime |
+
+The current position is
+`c813-e3-qualified-sealed-reference-runtime-released`; C8.13 is closed and no
+successor node is allocated. E1 froze design metadata, E2 materialized the
+code-10 runtime and facade, and E3 qualified and released only its sealed
+volatile path. Code 9 remains validation-only, non-current,
+non-executable, and non-migratable. Code 5 remains permanently inert. Milk-V
+Duo remains paused with zero gate effect. See
+[WASM_REFERENCE_TYPES_EXECUTABLE_PROFILE.md](WASM_REFERENCE_TYPES_EXECUTABLE_PROFILE.md).
 
 ## 10. Test and evidence matrix
 
@@ -523,7 +1462,13 @@ The existing VibeOS evidence layers remain mandatory:
 | Fuzzing | Component/Core decoders, validators, canonical values, resources, adapters, async resumptions and malformed artifacts | Exhaustive target interleavings and hardware DMA |
 | In-kernel self-test | Live CSpace use/revoke, ownership, quotas, quantum yield, cancellation, arena reclamation and W^X if AOT exists | Complete remote and persistent workflows |
 | QEMU acceptance | VSH/SSH component invocation, multicore progress, async chains, composition, fault/restart, two-boot persistence and raw-disk evidence | Physical Duo cache, storage, entropy and long-duration behavior |
-| Physical Duo gate | Target runtime, memory pressure, microSD persistence, network streams, repeated install/run/revoke/restart and soak | Other boards and certification |
+| Formal fixed-QEMU WASM target/release gate | Fresh source-bound, node-specific validation, execution, lifecycle, quota, fault, restart, and soak evidence on pinned emulator profiles | Physical cache/DMA, native microSD/DWMAC/USB/entropy, thermal/electrical behavior, physical security, and certification |
+| Optional Milk-V Duo observation (paused) | Separately scoped observations only; never a target/release gate input or completion condition | No generic WASM gate, completion, or release effect |
+
+The formal fixed-QEMU row replaces only the former generic mandatory physical
+Duo row. Real-hardware requirements for microSD, DWMAC, USB, entropy,
+cache/DMA coherency, thermal/electrical behavior, certification, or another
+explicit board property remain independent physical gates.
 
 Security-sensitive mutations must prove that the gates are live:
 
@@ -537,6 +1482,18 @@ Security-sensitive mutations must prove that the gates are live:
 - publish an async result after cancellation;
 - omit one component/module/adapter/WIT/manifest hash binding;
 - enable one unsupported component or Core feature;
+- change either fixed canonical NaN bit pattern or weaken exact-bit checking to
+  a WebAssembly allowed-set check;
+- classify a canonicalizing Float operation as transport/sign-only, canonicalize
+  a transported Core value, preserve an arbitrary NaN payload across the
+  Component/Canonical ABI boundary, or let `abs`/`neg`/`copysign` alter a
+  NaN payload;
+- make profile code 5 executable, bind it to the current engine, or admit it to
+  CGV1, durable publication, or guest invocation;
+- replace Profile 1's Wasmi dependency with a workspace-wide Cargo patch;
+- expose `BadConversionToInteger` to a Float guest while still reporting the
+  static `Validation` trap, conflate NaN conversion (`0x0207`) with finite or
+  infinite overflow (`0x0202`), or widen the saturating-conversion proposal;
 - alter one durable root, graph edge, or crash-order record;
 - expose one ambient clock, random source, path, or endpoint.
 
@@ -559,7 +1516,8 @@ C0 measures candidates before freezing thresholds. Every release then reports:
 - revocation-to-denial and cancellation-to-terminal latency in poll quanta;
 - normal, cancellation, trap and restart heap return-to-baseline;
 - native-component and adapted-WASIp1 corpus pass counts with explicit exclusions;
-- QEMU and physical-Duo soak duration and restart count;
+- fixed-QEMU target/release soak duration, restart count, and exact baseline identity;
+- optional physical-Duo observations, if collected, reported separately with no gate effect;
 - dependency, source-line, unsafe-site, proposal-version and fuzz-corpus inventory
   added to the TCB.
 
@@ -580,7 +1538,7 @@ explicit review action, never a normal test side effect.
 | Composition hides authority flow inside adapters or nested modules | **High** | One principal before C6, typed graph inspection, per-node CSpaces, adapter import audits and atomic graph admission |
 | Broad WASI reintroduces POSIX ambient authority | **High** | Vibe WIT packages first, exact standard-interface allowlist, no global preopens/fallback namespace and negative tests |
 | Component Model and WASI revisions drift | **High** | Bind exact binary/Canonical ABI/WIT/adapter versions; revalidate on boot; version packages rather than silently upgrading |
-| Floating point conflicts with the integer-only kernel ABI | Medium | Keep the Core profile integer-only until software-float or complete target-context and differential evidence lands |
+| Floating point conflicts with the integer-only kernel ABI | Medium | Keep Profile 1 integer-only and code 5 permanently inert; the reviewed software-float, exact-bit NaN, conversion-trap, Canonical ABI, differential/fuel, and fixed-QEMU evidence opens only a separately numbered successor design review, never in-place activation |
 | AOT becomes unaudited native authority | **High** | Interpreter remains normative, component bytes remain authoritative, regenerate/reverify cache, sealed W^X, never accept external native bytes |
 | Content hash is mistaken for publisher authenticity | **High** | Separate integrity from signer/operator admission and document rollback limits until a hardware root exists |
 | Dynamic component state violates audited-arena no-escape | **High** | Only copied values, opaque caps and SYSTEM-owned registrations cross arenas; complete fault-reclaim evidence before C4 |
@@ -616,8 +1574,9 @@ Component v1 comprises C0--C7 and is complete only when:
     identities and exact reconstructed least authority; independent disk evidence
     rejects every documented mutation and crash prefix.
 11. Host tests, selected Core and Component reference tests, differential corpus,
-    fuzzers, self-tests, four-hart QEMU gates, and the physical-Duo gate are green
-    on pinned tools.
+    fuzzers, self-tests, four-hart QEMU gates, and every applicable fresh
+    fixed-QEMU target/release gate are green on pinned tools. Optional Milk-V
+    Duo observation does not block completion or release.
 12. The trust model names the exact Core/Component/Canonical ABI/WIT versions,
     engines, adapters, dependencies, unsafe sites, unsupported surface,
     performance costs, physical-security limits and rollback limits.

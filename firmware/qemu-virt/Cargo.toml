@@ -15,8 +15,150 @@ storage-bench = ["legacy-shell", "file-tree", "vibeos-kernel/storage-bench"]
 tcp-echo = ["vibeos-kernel/tcp-echo"]
 tcp-echo-recovery-test = ["vibeos-kernel/tcp-echo-recovery-test"]
 iperf3-server = ["vibeos-kernel/iperf3-server"]
+wasm-c63-graph-principal-acceptance = [
+    "vibeos-kernel/wasm-c63-graph-principal-acceptance",
+]
+wasm-c64-resource-route-acceptance = [
+    "vibeos-kernel/wasm-c64-resource-route-acceptance",
+]
+wasm-c65-async-chain-acceptance = [
+    "vibeos-kernel/wasm-c65-async-chain-acceptance",
+]
+wasm-c66-node-replacement-acceptance = [
+    "vibeos-kernel/wasm-c66-node-replacement-acceptance",
+]
+wasm-c67-information-flow-acceptance = [
+    "vibeos-kernel/wasm-c67-information-flow-acceptance",
+]
+wasm-c73-authenticated-admission-acceptance = [
+    "vibeos-kernel/wasm-c73-authenticated-admission-acceptance",
+]
+wasm-c74-crash-safe-publication-acceptance = [
+    "vibeos-kernel/wasm-c74-crash-safe-publication-acceptance",
+]
+wasm-c75-boot-revalidation-acceptance = [
+    "vibeos-kernel/wasm-c75-boot-revalidation-acceptance",
+]
+wasm-c76-graph-version-replacement-acceptance = [
+    "vibeos-kernel/wasm-c76-graph-version-replacement-acceptance",
+]
+wasm-c77-ephemeral-runtime-acceptance = [
+    "vibeos-kernel/wasm-c77-ephemeral-runtime-acceptance",
+]
+wasm-c83-runtime-costs = ["vibeos-kernel/wasm-c83-runtime-costs"]
+wasm-c88-f5-float-qemu-acceptance = [
+    "vibeos-kernel/wasm-c88-f5-float-qemu-acceptance",
+]
+wasm-c89-s3-float-qemu-qualification = [
+    "vibeos-kernel/wasm-c89-s3-float-qemu-qualification",
+]
+wasm-c810-s5-simd-qemu-qualification = [
+    "vibeos-kernel/wasm-c810-s5-simd-qemu-qualification",
+]
+wasm-c811-s3-simd-qemu-qualification = [
+    "vibeos-kernel/wasm-c811-s3-simd-qemu-qualification",
+]
+wasm-c812-r3-reference-qemu-qualification = [
+    "vibeos-kernel/wasm-c812-r3-reference-qemu-qualification",
+]
+wasm-c813-e3-reference-qemu-qualification = [
+    "vibeos-kernel/wasm-c813-e3-reference-qemu-qualification",
+]
+wasm-c84-profile-slot-qemu-acceptance = [
+    "vibeos-kernel/wasm-c84-profile-slot-qemu-acceptance",
+]
+wasm-c84-core-poll-qemu-acceptance = [
+    "vibeos-kernel/wasm-c84-core-poll-qemu-acceptance",
+]
+wasm-c84-profile-irq-overlay-qemu-acceptance = [
+    "vibeos-kernel/wasm-c84-profile-irq-overlay-qemu-acceptance",
+]
+wasm-c84-profile-child-delegation-qemu-acceptance = [
+    "vibeos-kernel/wasm-c84-profile-child-delegation-qemu-acceptance",
+]
+# Single-hart OpenSSH gate for the diagnostic-only C8.4 request-parent owner.
+# This deliberately selects the reusable SSH fixture without the four-hart
+# C4.8 acceptance composite, because the formal profile facade accepts only
+# the canonical one-hart topology.
+wasm-c84-ssh-request-parent-qemu-acceptance = [
+    "vibeos-kernel/ssh-test",
+    "vibeos-kernel/wasm-c84-ssh-request-parent-qemu-acceptance",
+]
+# Single-hart OpenSSH composition gate for the real managed child and its
+# ordinary synchronous Core observer. It deliberately reuses the narrow SSH
+# fixture rather than the four-hart C4.8 acceptance composite.
+wasm-c84-ssh-managed-child-core-qemu-acceptance = [
+    "vibeos-kernel/ssh-test",
+    "vibeos-kernel/wasm-c84-ssh-managed-child-core-qemu-acceptance",
+]
+# Single-hart diagnostic composition of the exact predecessor transcript with
+# the parent/child Host, Wait, and Cleanup phase sidecar.
+wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-core-qemu-acceptance",
+    "vibeos-kernel/wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance",
+]
+# Single-hart composition of the exact SSH phase transcript with the existing
+# kernel IRQ overlay. This intentionally does not select the standalone IRQ
+# acceptance worker.
+wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance",
+    "vibeos-kernel/wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance",
+]
+# Successor-only OpenSSH terminal gate. It inherits the exact IRQ transcript
+# image and promotes successful responses to finish/verify/explicit discard.
+wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance",
+    "vibeos-kernel/wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+]
+# Alternate finish successor which retains the verified sample behind one
+# trusted terminal-evidence bundle instead of consuming its stream.
+wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    "vibeos-kernel/wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+]
+# Diagnostic-only two-boot proof for the private 24-sample collector. The
+# kernel sink hashes and counts the formal records but never forwards their
+# bytes to QEMU UART, so this image cannot contribute decision evidence.
+wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    "vibeos-kernel/wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+]
+# Formal one-process C8.4 decision image for the frozen TCG/icount envelope.
+# The kernel feature selects the narrow real-OpenSSH fixture, the production
+# workload path, a disjoint record contract, and the atomic UART sink without
+# inheriting any diagnostic C8.4 QEMU-acceptance telemetry.
+wasm-c84-qemu-aot-decision = [
+    "vibeos-kernel/wasm-c84-qemu-aot-decision",
+]
+# Compile-time non-publication marker; the kernel feature includes the full
+# formal image and makes its smoke-only wire identity explicit.
+wasm-c84-qemu-aot-decision-smoke = [
+    "wasm-c84-qemu-aot-decision",
+    "vibeos-kernel/wasm-c84-qemu-aot-decision-smoke",
+]
+# Successor-only gate which consumes the verified summary and every interval,
+# then explicitly completes the stream without publishing it.
+wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    "vibeos-kernel/wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",
+]
 ssh-security-test = ["vibeos-kernel/ssh-security-test"]
-ssh-test = ["vibeos-kernel/ssh-test"]
+ssh-test = [
+    "vibeos-kernel/ssh-test",
+    "vibeos-kernel/wasm-c48-qemu-acceptance",
+]
+# Explicitly default-off standard OpenSSH gate for the formal managed native
+# command. It retains every existing ssh-test/C4.8 assertion in one image.
+ssh-native-async-qemu-acceptance = [
+    "ssh-test",
+    "vibeos-kernel/ssh-native-async-qemu-acceptance",
+]
+# Explicitly separate from the standard formal-native gate: C5.4c deliberately
+# runs destructive linearization/fault scenarios in independent QEMU boots.
+ssh-native-async-revoke-qemu-acceptance = [
+    "ssh-test",
+    "vibeos-kernel/ssh-native-async-revoke-qemu-acceptance",
+]
 
 [[bin]]
 name = "vibeos-qemu-virt"

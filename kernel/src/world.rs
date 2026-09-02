@@ -36,9 +36,27 @@ const IPERF3_SERVER_MEMORY_BUDGET: usize = 128 * 1024;
 const SSH_PRODUCTION_MEMORY_BUDGET: usize = store::STORE_CLIENT_MEMORY_BUDGET;
 #[cfg(all(
     any(feature = "ssh-test", feature = "milkv-ssh-acceptance"),
-    not(feature = "milkv-jitterentropy-ssh-probe")
+    not(feature = "milkv-jitterentropy-ssh-probe"),
+    not(any(
+        feature = "ssh-native-async-qemu-acceptance",
+        feature = "ssh-native-async-revoke-qemu-acceptance"
+    ))
 ))]
 const SSH_TEST_MEMORY_BUDGET: usize = 256 * 1024;
+// The target-only same-image gate sends a distinct 13,385-byte native command
+// through the QEMU OpenSSH session before retaining the existing sync probe.
+// Its measured transport/session owner reached 262,016/262,144 live bytes and
+// then requested another 1 KiB before the native instance driver was entered.
+// Keep the production, Milk-V, and ordinary ssh-test ceiling unchanged.
+#[cfg(all(
+    feature = "ssh-test",
+    any(
+        feature = "ssh-native-async-qemu-acceptance",
+        feature = "ssh-native-async-revoke-qemu-acceptance"
+    ),
+    not(feature = "milkv-jitterentropy-ssh-probe")
+))]
+const SSH_TEST_MEMORY_BUDGET: usize = 512 * 1024;
 #[cfg(feature = "milkv-jitterentropy-ssh-probe")]
 const SSH_TEST_MEMORY_BUDGET: usize = 1024 * 1024;
 // The interactive compiler and bounded full-journal object recovery charge
@@ -599,6 +617,86 @@ struct StoreBlockGrants {
 }
 
 impl World {
+    /// Hand the C7.4 supervisor its already-provisioned journal endpoint
+    /// through init's explicit store authority. The acceptance task receives
+    /// no `Cap`, CSpace, object name, or durable identity; it can only request
+    /// fresh linear Storage V2 provenance from this sealed facade handle.
+    #[cfg(feature = "wasm-c74-crash-safe-publication-acceptance")]
+    pub(crate) fn c74_component_authority_journal(&self) -> Option<store::AuthorityJournal> {
+        let store = self.store?;
+        let init = self.spaces.get("init")?;
+        let lease = init
+            .0
+            .lock()
+            .lookup_lease::<store::StoreService>(store, Rights::READ)
+            .ok()?;
+        Some(lease.with(store::StoreService::authority_journal))
+    }
+
+    /// C7.5 receives the same explicit, capability-mediated journal facade as
+    /// C7.4, but its boot protocol decides vacant versus existing durable
+    /// state before consulting any image artifact candidate. No CSpace,
+    /// object identity, raw token, or lookup surface crosses this handoff.
+    #[cfg(feature = "wasm-c75-boot-revalidation-acceptance")]
+    pub(crate) fn c75_component_authority_journal(&self) -> Option<store::AuthorityJournal> {
+        let store = self.store?;
+        let init = self.spaces.get("init")?;
+        let lease = init
+            .0
+            .lock()
+            .lookup_lease::<store::StoreService>(store, Rights::READ)
+            .ok()?;
+        Some(lease.with(store::StoreService::authority_journal))
+    }
+
+    /// Allocation-free global-registry cardinality used as the C7.5
+    /// no-new-component sentinel. Fixed boot services already occupy this
+    /// registry; their captured baseline must not change while target bytes
+    /// are probed, read back, freshly admitted, sealed, or published.
+    #[cfg(feature = "wasm-c75-boot-revalidation-acceptance")]
+    pub(crate) fn c75_component_count(&self) -> usize {
+        self.components.lock().len()
+    }
+
+    /// C7.6 receives only the explicit init-owned Storage V2 facade.  The
+    /// graph loader can classify V3 state, append its one bounded successor,
+    /// and request physical readback; no Cap, CSpace, raw durable identity,
+    /// or ambient store lookup crosses this handoff.
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    pub(crate) fn c76_graph_authority_journal(&self) -> Option<store::C76AuthorityJournal> {
+        let store = self.store?;
+        let init = self.spaces.get("init")?;
+        let lease = init
+            .0
+            .lock()
+            .lookup_lease::<store::StoreService>(store, Rights::READ)
+            .ok()?;
+        Some(lease.with(store::StoreService::c76_authority_journal))
+    }
+
+    /// Allocation-free registry cardinality used to prove that C7.6 has not
+    /// created a candidate principal before durable G1 readback and fresh
+    /// current-engine validation release the supervisor handoff.
+    #[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+    pub(crate) fn c76_component_count(&self) -> usize {
+        self.components.lock().len()
+    }
+
+    /// C7.7 receives the same explicit init-owned journal facade, then its
+    /// object-store typestate narrows that facade to a complete graph-only G1
+    /// namespace before any boot-local lifecycle can be constructed.
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    pub(crate) fn c77_graph_authority_journal(&self) -> Option<store::C76AuthorityJournal> {
+        self.c76_graph_authority_journal()
+    }
+
+    /// Allocation-free baseline used to prove cold recovery starts with no
+    /// component-owned publication before physical readback and revalidation.
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    pub(crate) fn c77_component_count(&self) -> usize {
+        self.c76_component_count()
+    }
+
     /// Spawn and register a task under a stable component identity.
     pub fn spawn_component(
         &self,
@@ -640,8 +738,11 @@ impl World {
             );
         }
         let id = next_component_id();
-        let memory_owner = OwnerId::new(id.0);
-        HEAP.register_owner(memory_owner, memory_budget)
+        // Allocation owners share the heap's one generational identity cursor
+        // with dynamically created component domains. ComponentId remains the
+        // stable semantic identity exposed by World and need not alias it.
+        let memory_owner = HEAP
+            .create_owner(memory_budget)
             .expect("a fresh component allocation owner must register");
         let cspace = space.0.lock().name.clone();
         let task = match template {
@@ -1336,7 +1437,10 @@ impl World {
 
         match before.state {
             exec::TaskState::Exited | exec::TaskState::Cancelled => HEAP
-                .close_empty_arena(before.arena)
+                .close_empty_domain(AllocationDomain::new(
+                    component.memory_owner(),
+                    before.arena,
+                ))
                 .expect("a normally terminated audited arena must be empty"),
             exec::TaskState::Faulted => {
                 debug_assert!(HEAP.arena_stats(before.arena).is_none());
@@ -1402,8 +1506,11 @@ impl World {
             return false;
         }
         if normal && snapshot.arena.is_tracked() {
-            HEAP.close_empty_arena(snapshot.arena)
-                .expect("a normal terminal arena must be empty");
+            HEAP.close_empty_domain(AllocationDomain::new(
+                component.memory_owner(),
+                snapshot.arena,
+            ))
+            .expect("a normal terminal arena must be empty");
         }
         if reclaimed_fault {
             // Fault teardown recovered the abandoned guard before publishing

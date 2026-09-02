@@ -1,0 +1,246 @@
+{
+  "authority": {
+    "admission_authorized": false,
+    "aot_authorized": false,
+    "command_authorized": false,
+    "current_engine_authorized": false,
+    "design_authorized": false,
+    "durable_publication_authorized": false,
+    "execution_authorized": false,
+    "implementation_authorized": false,
+    "in_place_promotion_authorized": false,
+    "jit_authorized": false,
+    "migration_authorized": false,
+    "native_bytes_authorized": false,
+    "production_authorized": false,
+    "prototype_authorized": false,
+    "release_authorized": false,
+    "rwx_authorized": false
+  },
+  "code5_boundary": {
+    "activation_authorized": false,
+    "admission_authorized": false,
+    "artifact_profile_code": 5,
+    "current_engine": false,
+    "durable_publication_authorized": false,
+    "executable": false,
+    "in_place_promotion_authorized": false,
+    "inert": true,
+    "permanent": true,
+    "stage": "validation-only"
+  },
+  "contract_verifier": {
+    "contract_identity_binding": "one-way-sha256-and-bytes-pin-in-verifier",
+    "path": "scripts/verify-c88-float-successor-review-boundary.py",
+    "success_only_means": "review-charter-integrity-not-review-passage-not-implementation-authority"
+  },
+  "effectivity": {
+    "can_become_effective": false,
+    "design_selected": false,
+    "effective": false,
+    "implementation_gate_open": false,
+    "review_passed": false
+  },
+  "f5_predecessor": {
+    "closure_scope": "c88-f5-float-widening-only",
+    "decision_id": "1841ae06e4c8bef4842a59bbc65362fa860e37d6d8a1d79cc68e3fc5a87004f9",
+    "pinned_publication_files": {
+      "contract": {
+        "bytes": 14364,
+        "git_blob": "c8751d541269b485ea0786a66ced506d2902caf1",
+        "git_mode": "100644",
+        "path": "acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-contract.json",
+        "sha256": "93b10e8311ce7794a923425018f834b3cc8b62eddf664285e8dc2a29aaedd1d9"
+      },
+      "decision": {
+        "bytes": 16608,
+        "git_blob": "1f43528cbb95c5f5d9d3731db7aa19997bee3ca8",
+        "git_mode": "100644",
+        "path": "acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-decision.json",
+        "sha256": "1d118cdb4f5709f4ce93331b1cd6b60435e6c530eb800e9c21e0a3e8569030d4"
+      },
+      "normal_receipt": {
+        "bytes": 2991,
+        "git_blob": "9c130c15dfaaab29000f5bfbf64598d87fe86b99",
+        "git_mode": "100644",
+        "path": "acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-normal-receipt.json",
+        "sha256": "4d70865a6a665829457ee0e9ec34c9fa38de51ed6ee2bcb2be1356d752355c1a"
+      },
+      "optimized_receipt": {
+        "bytes": 3000,
+        "git_blob": "970cbaf51c5960c374654a78d6051da6efe4ce44",
+        "git_mode": "100644",
+        "path": "acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-optimized-receipt.json",
+        "sha256": "4f95fcd2b4d2524b1d27fce7bbf77846f4f7d0030da8ebe277ffc062e53550e0"
+      },
+      "verifier": {
+        "bytes": 164132,
+        "git_blob": "6a41c789612a1ba9136b85ba488f1eed941eaabb",
+        "git_mode": "100644",
+        "path": "scripts/verify-c88-f5-qemu-target-gate.py",
+        "sha256": "cc3c486dfe4cb13d7cb0767dbce9f97f005e976bbeed05dc66a17dee405a9a87"
+      }
+    },
+    "publication": {
+      "commit": "5a6e88407056fdfed0974586479b42b5bd1470fb",
+      "must_be_ancestor_of_checked_head": true,
+      "tree": "d296000b1ba170aaafcbd7e8ca4f689c119b9921"
+    },
+    "semantic_sha256": "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1",
+    "source": {
+      "commit": "0f06212f890077b2a3d1b4405a128058cb07c55e",
+      "tree": "a3a3ef403b80eb51e60dd3cb6a2a5b5a6d3aed6d"
+    },
+    "status": "complete-by-formal-fixed-qemu-evidence"
+  },
+  "hardware_policy": {
+    "duo_contracts_retained": true,
+    "duo_roadmap_blocking": false,
+    "duo_testing_status": "paused-retained-nonblocking-non-evidence",
+    "duo_tooling_retained": true,
+    "fixed_qemu_formally_replaced_physical_duo_gate_for_f5": true,
+    "fixed_qemu_replacement_scope": "c88-f5-only",
+    "other_hardware_gates_unchanged": true,
+    "physical_equivalence_claimed": false,
+    "physical_inputs_permitted": 0,
+    "physical_inputs_required": 0,
+    "physical_provenance": "not-claimed"
+  },
+  "limitations": [
+    "This contract is a review charter, not a design decision, implementation gate, execution grant, or evidence artifact.",
+    "No successor identity, version axis, execution stage, engine, supply chain, target policy, command contract, or durable schema is allocated or selected.",
+    "F5 evidence closes only C8.8-F5 Float and does not become successor engine, admission, release, activation, or production evidence.",
+    "Artifact profile code 5 remains permanently validation-only and inert; it cannot be promoted in place.",
+    "Milk-V Duo testing remains paused; retained Duo contracts and tooling are nonblocking non-evidence and contribute zero physical inputs.",
+    "C8.5 through C8.7 remain deferred and every non-Float C8.8 feature widening remains incomplete.",
+    "Successful verification proves only this frozen charter's integrity and historical F5 publication membership; review_passed remains false."
+  ],
+  "review_basis": {
+    "commit": "25111e04d3d1aa55e52bb29d05b66d0bfde087a3",
+    "role": "historical-fixed-qemu-publication-audit-precedent-only",
+    "self_binding_claimed": false,
+    "tree": "800952738c5d2a0a547163cfa7e77acd48656479"
+  },
+  "review_questions": [
+    {
+      "answer_selected": false,
+      "blocking": true,
+      "candidate_value_present": false,
+      "id": "identity_version_allocation",
+      "order": 1,
+      "question": "Which separately numbered roadmap node, profile code, artifact ABI, runtime ABI, Core Wasm revision, Component Model revision, and execution stage are allocated?",
+      "state": "unresolved"
+    },
+    {
+      "answer_selected": false,
+      "blocking": true,
+      "candidate_value_present": false,
+      "id": "engine_supply_chain_selection",
+      "order": 2,
+      "question": "Which exact engine implementation, source revision, package version, checksum, feature set, and supply-chain policy are selected?",
+      "state": "unresolved"
+    },
+    {
+      "answer_selected": false,
+      "blocking": true,
+      "candidate_value_present": false,
+      "id": "semantic_evidence_inheritance",
+      "order": 3,
+      "question": "Which F5 semantics may be inherited, which claims require fresh evidence, and how is evidence non-promotion enforced?",
+      "state": "unresolved"
+    },
+    {
+      "answer_selected": false,
+      "blocking": true,
+      "candidate_value_present": false,
+      "id": "production_authority",
+      "order": 4,
+      "question": "Which explicit authority path can open current-engine, admission, command, release, and production gates?",
+      "state": "unresolved"
+    },
+    {
+      "answer_selected": false,
+      "blocking": true,
+      "candidate_value_present": false,
+      "id": "durability_upgrade_rollback",
+      "order": 5,
+      "question": "Which durable schema, upgrade compatibility, migration, rollback, and in-place promotion policy is selected?",
+      "state": "unresolved"
+    },
+    {
+      "answer_selected": false,
+      "blocking": true,
+      "candidate_value_present": false,
+      "id": "accounting_concurrency_lifecycle",
+      "order": 6,
+      "question": "Which global resource accounting, concurrency, cancellation, ownership, and lifecycle invariants are required?",
+      "state": "unresolved"
+    },
+    {
+      "answer_selected": false,
+      "blocking": true,
+      "candidate_value_present": false,
+      "id": "target_release_evidence",
+      "order": 7,
+      "question": "Which targets, environments, optimization modes, release artifacts, and fresh qualification evidence are required?",
+      "state": "unresolved"
+    },
+    {
+      "answer_selected": false,
+      "blocking": true,
+      "candidate_value_present": false,
+      "id": "final_authorization_rollout",
+      "order": 8,
+      "question": "Which independent review approves implementation, execution, rollout, observability, and rollback readiness?",
+      "state": "unresolved"
+    }
+  ],
+  "roadmap_position": "post-c88-f5-pre-allocation",
+  "roadmap_status": {
+    "c85_c87": "deferred-unallocated-unauthorized",
+    "c85_complete": false,
+    "c86_complete": false,
+    "c87_complete": false,
+    "c88_f5_float_complete": true,
+    "other_c88_feature_widenings": {
+      "broader_wasi": false,
+      "exceptions": false,
+      "gc": false,
+      "memory64": false,
+      "multiple_memories": false,
+      "reference_types": false,
+      "simd": false,
+      "threads": false
+    },
+    "successor_implementation_node_allocated": false
+  },
+  "schema": "vibeos.c88.float-successor-review-boundary-v1.contract",
+  "scope": "float-successor-design-review-boundary-only",
+  "status": "review-charter-not-design-decision-not-evidence",
+  "successor_evidence_policy": {
+    "activation_evidence_inherited_from_f5": false,
+    "admission_evidence_inherited_from_f5": false,
+    "engine_evidence_inherited_from_f5": false,
+    "f5_evidence_closes_only_f5": true,
+    "fresh_successor_gate_required": true,
+    "release_evidence_inherited_from_f5": false,
+    "successor_gate_selected": false
+  },
+  "successor_identity": {
+    "artifact_abi_allocated": false,
+    "command_contract_selected": false,
+    "component_model_revision_selected": false,
+    "core_wasm_revision_selected": false,
+    "durable_schema_selected": false,
+    "engine_identity_selected": false,
+    "engine_supply_chain_selected": false,
+    "execution_stage_selected": false,
+    "profile_code_allocated": false,
+    "roadmap_node_allocated": false,
+    "runtime_abi_allocated": false,
+    "state": "unallocated",
+    "target_policy_selected": false,
+    "wit_world_selected": false
+  },
+  "version": 1
+}

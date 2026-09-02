@@ -134,9 +134,13 @@ pub const ENTROPY_DRIVER_REJECTED_FEATURES: u64 = VIRTIO_RING_F_INDIRECT_DESC
 /// Block queue capacity negotiated with the comparison platform. The current
 /// client path remains single-in-flight while preserving the complete ring for
 /// the independently tested QD4/QD16 scheduler follow-up.
-pub const SPLIT_QUEUE_SIZE: u16 = 128;
+pub const BLOCK_QUEUE_SIZE: u16 = 128;
 pub const NET_QUEUE_SIZE: u16 = 8;
 pub const ENTROPY_QUEUE_SIZE: u16 = 8;
+/// Backing capacity of the shared split-ring wire structs. A device may
+/// negotiate a smaller queue, whose producer and consumer indices must use its
+/// device-specific queue-size constant rather than this storage bound.
+pub const MAX_SPLIT_QUEUE_SIZE: u16 = BLOCK_QUEUE_SIZE;
 pub const NET_RECEIVE_QUEUE: u16 = 0;
 pub const NET_TRANSMIT_QUEUE: u16 = 1;
 pub const ENTROPY_QUEUE: u16 = 0;
@@ -686,7 +690,7 @@ impl UsedElement {
 pub struct AvailableRing {
     pub flags: u16,
     pub index: u16,
-    pub ring: [u16; SPLIT_QUEUE_SIZE as usize],
+    pub ring: [u16; MAX_SPLIT_QUEUE_SIZE as usize],
 }
 
 impl Default for AvailableRing {
@@ -694,7 +698,7 @@ impl Default for AvailableRing {
         Self {
             flags: 0,
             index: 0,
-            ring: [0; SPLIT_QUEUE_SIZE as usize],
+            ring: [0; MAX_SPLIT_QUEUE_SIZE as usize],
         }
     }
 }
@@ -705,7 +709,7 @@ impl Default for AvailableRing {
 pub struct UsedRing {
     pub flags: u16,
     pub index: u16,
-    pub ring: [UsedElement; SPLIT_QUEUE_SIZE as usize],
+    pub ring: [UsedElement; MAX_SPLIT_QUEUE_SIZE as usize],
 }
 
 impl Default for UsedRing {
@@ -713,7 +717,7 @@ impl Default for UsedRing {
         Self {
             flags: 0,
             index: 0,
-            ring: [UsedElement::new(0, 0); SPLIT_QUEUE_SIZE as usize],
+            ring: [UsedElement::new(0, 0); MAX_SPLIT_QUEUE_SIZE as usize],
         }
     }
 }
@@ -1156,12 +1160,16 @@ impl BlockStatus {
     }
 }
 
-pub const fn ring_slot(index: u16) -> u16 {
-    index % SPLIT_QUEUE_SIZE
+pub const fn block_ring_slot(index: u16) -> u16 {
+    index % BLOCK_QUEUE_SIZE
 }
 
 pub const fn net_ring_slot(index: u16) -> u16 {
     index % NET_QUEUE_SIZE
+}
+
+pub const fn entropy_ring_slot(index: u16) -> u16 {
+    index % ENTROPY_QUEUE_SIZE
 }
 
 pub const fn advance_ring_index(index: u16) -> u16 {
@@ -1314,7 +1322,7 @@ impl SplitQueueModel {
             epoch: self.epoch,
             head: BLOCK_HEADER_DESCRIPTOR,
             available_index: self.available_index,
-            available_slot: ring_slot(previous),
+            available_slot: block_ring_slot(previous),
             operation,
         };
         self.state = QueueState::InFlight(submission);
@@ -1351,7 +1359,7 @@ impl SplitQueueModel {
             });
         }
         let used_id = used.id();
-        if used_id >= SPLIT_QUEUE_SIZE as u32 {
+        if used_id >= BLOCK_QUEUE_SIZE as u32 {
             return self.malformed(QueueError::UsedIdOutOfRange { observed: used_id });
         }
         if used_id != active.head as u32 {

@@ -1,0 +1,6 @@
+package vibe:async-fixture@1.0.0;
+
+world async-filter {
+    import source: async func(pending: future<u32>, chunks: stream<u8>);
+    export run: async func(pending: future<u32>, chunks: stream<u8>);
+}

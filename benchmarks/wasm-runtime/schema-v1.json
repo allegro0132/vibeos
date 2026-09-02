@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vibeos.invalid/schemas/wasm-runtime-costs-v1.json",
+  "title": "VibeOS C8.3 raw target transcript records",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/meta"
+    },
+    {
+      "$ref": "#/$defs/sample"
+    },
+    {
+      "$ref": "#/$defs/end"
+    }
+  ],
+  "$defs": {
+    "canonicalHex40": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "canonicalHex64": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "end": {
+      "additionalProperties": false,
+      "properties": {
+        "accumulator": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "challenge": {
+          "$ref": "#/$defs/canonicalHex64"
+        },
+        "records": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "run_id": {
+          "$ref": "#/$defs/canonicalHex64"
+        },
+        "schema": {
+          "const": "vibeos.wasm-runtime-cost"
+        },
+        "version": {
+          "const": 1
+        },
+        "workloads": {
+          "const": 10
+        }
+      },
+      "required": [
+        "schema",
+        "version",
+        "run_id",
+        "challenge",
+        "records",
+        "workloads",
+        "accumulator"
+      ],
+      "type": "object"
+    },
+    "meta": {
+      "additionalProperties": false,
+      "properties": {
+        "async_scope": {
+          "const": "validation-candidate-primitives"
+        },
+        "challenge": {
+          "$ref": "#/$defs/canonicalHex64"
+        },
+        "clock": {
+          "const": "riscv.rdtime"
+        },
+        "composition_scope": {
+          "const": "validation-only-plan"
+        },
+        "core_module_bytes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "core_module_sha256": {
+          "$ref": "#/$defs/canonicalHex64"
+        },
+        "manifest_sha256": {
+          "$ref": "#/$defs/canonicalHex64"
+        },
+        "platform": {
+          "enum": [
+            "qemu-virt",
+            "milkv-duo-cv1800b"
+          ]
+        },
+        "route_component_bytes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "route_component_sha256": {
+          "$ref": "#/$defs/canonicalHex64"
+        },
+        "run_id": {
+          "$ref": "#/$defs/canonicalHex64"
+        },
+        "schema": {
+          "const": "vibeos.wasm-runtime-cost.meta"
+        },
+        "source_commit": {
+          "$ref": "#/$defs/canonicalHex40"
+        },
+        "suite_id": {
+          "const": "vibeos.c83.runtime-costs"
+        },
+        "sync_component_bytes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "sync_component_sha256": {
+          "$ref": "#/$defs/canonicalHex64"
+        },
+        "sync_profile_stage": {
+          "const": "executable"
+        },
+        "target": {
+          "const": "riscv64imac-unknown-none-elf"
+        },
+        "timebase_hz": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "transcript_schema_sha256": {
+          "$ref": "#/$defs/canonicalHex64"
+        },
+        "version": {
+          "const": 1
+        },
+        "workload_revision": {
+          "const": 1
+        },
+        "workloads": {
+          "const": 10
+        }
+      },
+      "required": [
+        "schema",
+        "version",
+        "suite_id",
+        "workload_revision",
+        "source_commit",
+        "challenge",
+        "run_id",
+        "manifest_sha256",
+        "transcript_schema_sha256",
+        "platform",
+        "target",
+        "clock",
+        "timebase_hz",
+        "sync_profile_stage",
+        "async_scope",
+        "composition_scope",
+        "sync_component_sha256",
+        "sync_component_bytes",
+        "route_component_sha256",
+        "route_component_bytes",
+        "core_module_sha256",
+        "core_module_bytes",
+        "workloads"
+      ],
+      "type": "object"
+    },
+    "sample": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "category": {
+          "type": "string"
+        },
+        "challenge": {
+          "$ref": "#/$defs/canonicalHex64"
+        },
+        "fuel_consumed": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "heap_after": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "heap_before": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "heap_peak": {
+          "description": "Exact maximum global allocator live bytes observed inside this sample's resettable measurement window.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "logical_live_after": {
+          "const": 0
+        },
+        "operations": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "poll_quanta": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "result": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "run_id": {
+          "$ref": "#/$defs/canonicalHex64"
+        },
+        "sample_index": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "schema": {
+          "const": "vibeos.wasm-runtime-cost.sample"
+        },
+        "sequence": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ticks": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "version": {
+          "const": 1
+        },
+        "warmup": {
+          "type": "boolean"
+        },
+        "workload_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema",
+        "version",
+        "run_id",
+        "challenge",
+        "sequence",
+        "workload_id",
+        "category",
+        "sample_index",
+        "warmup",
+        "ticks",
+        "operations",
+        "bytes",
+        "fuel_consumed",
+        "poll_quanta",
+        "heap_before",
+        "heap_peak",
+        "heap_after",
+        "logical_live_after",
+        "result"
+      ],
+      "type": "object"
+    }
+  }
+}

@@ -1,0 +1,218 @@
+{
+  "allocation_authority": {
+    "basis_commit": "2038c3134fe94d1ca297764c9fd8ee7d39a24123",
+    "basis_tree": "4332275a81379b68e6daddaab7599a942054e9e1",
+    "date": "2026-08-29",
+    "scope": "progress-wasm-roadmap-independent-simd-executable-successor-design-implementation-and-fixed-qemu-qualification",
+    "source": "standing-user-wasm-roadmap-goal",
+    "user_selected_physical_duo_gate": false,
+    "user_selected_profile7_promotion": false
+  },
+  "authority": {
+    "admission_authorized": false,
+    "aot_authorized": false,
+    "command_authorized": false,
+    "current_engine_binding_authorized_after_s2": true,
+    "current_engine_bound": false,
+    "design_authorized": true,
+    "durable_publication_authorized": false,
+    "fixed_qemu_qualification_authorized_after_s2": true,
+    "implementation_authorized": true,
+    "in_place_promotion_authorized": false,
+    "jit_authorized": false,
+    "migration_authorized": false,
+    "native_bytes_authorized": false,
+    "production_authorized": false,
+    "release_authorized": false,
+    "rwx_authorized": false,
+    "test_execution_authorized_for_s2": true
+  },
+  "code5_boundary": {
+    "artifact_profile_code": 5,
+    "current_engine": false,
+    "executable": false,
+    "inert": true,
+    "migration_authorized": false,
+    "permanent": true,
+    "promotion_authorized": false,
+    "stage": "validation-only"
+  },
+  "code6_boundary": {
+    "artifact_profile_code": 6,
+    "identity": "PROFILE_3_SYNC_FLOAT_EXECUTABLE",
+    "release_scope_unchanged": true,
+    "simd_enabled": false,
+    "stage": "executable"
+  },
+  "code7_boundary": {
+    "artifact_profile_code": 7,
+    "current_engine": false,
+    "durable_authorized": false,
+    "execution_authorized": false,
+    "identity": "PROFILE_4_SYNC_SIMD_VALIDATION",
+    "in_place_promotion_authorized": false,
+    "migration_authorized": false,
+    "production_authorized": false,
+    "release_authorized": false,
+    "stage": "validation-only"
+  },
+  "contract_verifier": {
+    "check_modes": [
+      "--check-contract",
+      "--selftest"
+    ],
+    "optimized_python_required": true,
+    "path": "scripts/verify-c811-simd-successor-design.py",
+    "success_only_means": "c811-s1-independent-simd-executable-design-frozen-not-implemented-not-qualified-not-released",
+    "writes_repository_outputs": false
+  },
+  "engine_selection": {
+    "base_package": "vibeos-wasmi-simd-softfloat",
+    "base_source": {
+      "commit": "2038c3134fe94d1ca297764c9fd8ee7d39a24123",
+      "git_tree": "123bb351a40ff7e923523355eb08049a9d6db39b",
+      "path": "vendor/wasmi-simd-softfloat",
+      "provenance_bytes": 1556,
+      "provenance_sha256": "0473ed2cf4fc4ce16efa32103d7bfb725fe866e73c3da7577c09a2ca0b468647",
+      "upstream_revision": "8273dfb09d493971b7bb12fe614d740cdc857175"
+    },
+    "base_version": "1.1.0-vibeos-simd1.1",
+    "feature_set": "default-features=false,extra-checks,prefer-btree-collections,simd;relaxed-simd=false",
+    "implementation_status": "selected-for-c811-s2-fork-not-materialized",
+    "package": "vibeos-wasmi-simd-executable-softfloat",
+    "required_patch": [
+      "allocate-code8-without-reinterpreting-code7",
+      "bind-only-the-exact-code8-component-core-and-runtime-abi-identity",
+      "preserve-reviewed-fixed-simd-software-float-semantics-and-fuel",
+      "keep-v128-unrepresentable-at-component-canonical-and-host-boundaries",
+      "retain-no-std-alloc-and-deny-native-f-d-v-opcodes-on-riscv64imac"
+    ],
+    "version": "1.1.0-vibeos-simd2.1"
+  },
+  "evidence_policy": {
+    "c810_evidence_satisfies_c811_gate": false,
+    "code7_artifacts_eligible_for_c811_execution": false,
+    "fresh_c811_implementation_evidence_required": true,
+    "fresh_c811_source_bound_fixed_qemu_evidence_required": true,
+    "historical_simd_semantics_may_be_referenced": true,
+    "predecessor_receipts_relabeling_forbidden": true
+  },
+  "hardware_policy": {
+    "duo_gate_effect": false,
+    "duo_inputs_permitted": 0,
+    "duo_inputs_required": 0,
+    "duo_status": "paused-optional-observation-only",
+    "fixed_qemu_is_hardware_equivalent": false,
+    "other_hardware_gates_unchanged": true,
+    "physical_provenance": "not-claimed"
+  },
+  "identity": {
+    "artifact_abi": 8,
+    "artifact_profile_code": 8,
+    "canonical_abi_revision": "component-model-0.255.0-sync-float-values-no-v128-boundary-c811-simd-exec-v1",
+    "canonical_features": [
+      "utf8",
+      "sync-lift-lower",
+      "resources",
+      "float-values"
+    ],
+    "component_model_revision": "wasmparser-component-model-0.255.0-c811-simd-exec-v1",
+    "component_profile": 5,
+    "core_profile": 5,
+    "core_wasm_revision": "webassembly-core-2.0-fixed-width-simd-1.0-deterministic-software-float-c811-exec-v1",
+    "execution_stage": "executable",
+    "name": "PROFILE_5_SYNC_SIMD_EXECUTABLE",
+    "runtime_abi": 8,
+    "wasi_revision": "wasi-not-selected-c811-sync-simd",
+    "wasm_tools_revision": "wasm-tools-v1.255.0-76e20611d1920a7a39ca08983c6c77c3060de380",
+    "wit_world": {
+      "exports": [
+        "run(mode: u32, input: list<u8>) -> list<u8>"
+      ],
+      "identity": "vibe:simd/runtime@1.0.0",
+      "imports": [],
+      "v128_crosses_component_boundary": false
+    }
+  },
+  "implementation_plan": [
+    {
+      "acceptance": "code8-abi8-revisions-engine-semantics-authority-code5-and-code7-nonpromotion-and-target-policy-frozen",
+      "complete": true,
+      "id": "C8.11-S1",
+      "name": "freeze-independent-simd-executable-successor-design"
+    },
+    {
+      "acceptance": "new-code8-artifact-engine-admission-lifecycle-durable-rejection-supply-chain-and-riscv-gates-pass",
+      "complete": false,
+      "id": "C8.11-S2",
+      "name": "implement-simd-successor-runtime-and-admission"
+    },
+    {
+      "acceptance": "fresh-source-bound-normal-and-optimized-fixed-qemu-contract-and-evidence-pass-before-release-decision",
+      "complete": false,
+      "id": "C8.11-S3",
+      "name": "qualify-simd-successor-on-fixed-qemu"
+    }
+  ],
+  "predecessor": {
+    "publication": {
+      "commit": "2038c3134fe94d1ca297764c9fd8ee7d39a24123",
+      "tree": "4332275a81379b68e6daddaab7599a942054e9e1"
+    },
+    "qualification_contract": {
+      "bytes": 5518,
+      "path": "acceptance/wasm-simd-target/artifacts/c810-s5-fixed-qemu-qualification-v1-contract.json",
+      "sha256": "824bfe30eca3fb923ea5eeecd96963aa134364f0acc56a3db43cb26eb52ad6c8"
+    },
+    "review_decision": {
+      "bytes": 2174,
+      "path": "acceptance/wasm-simd-target/artifacts/c810-s5-review-decision.json",
+      "sha256": "f20f68bdf0e86e99d0024e6b008903c6bfdbcc4b9e210d6d56f65646ef24b6e0"
+    },
+    "review_outcome": "successor-design-review-eligible-code7-remains-validation-only"
+  },
+  "roadmap": {
+    "allocated_node": "C8.11",
+    "current_position": "c811-s1-simd-executable-design-frozen-pre-implementation",
+    "design_node": "C8.11-S1",
+    "implementation_node": "C8.11-S2",
+    "qualification_node": "C8.11-S3",
+    "successor_state": "allocated-design-frozen"
+  },
+  "schema": "vibeos.c811.simd-successor-design-v1.contract",
+  "semantics": {
+    "adjacent_features_enabled": [],
+    "canonical_nan_f32_bits": "0x7fc00000",
+    "canonical_nan_f64_bits": "0x7ff8000000000000",
+    "component_boundary_nan_policy": "canonicalize-to-fixed-positive-quiet-nan",
+    "core_transport_nan_policy": "preserve-all-128-bits",
+    "fixed_width_simd_1_0": true,
+    "forbidden_adjacent_features": [
+      "relaxed-simd",
+      "reference-types",
+      "exceptions",
+      "memory64",
+      "multiple-memories",
+      "gc",
+      "threads",
+      "shared-memory"
+    ],
+    "numeric_nan_policy": "deterministic-canonical-v1",
+    "software_float_required": true,
+    "v128_component_boundary": "forbidden"
+  },
+  "status": "c811-s1-design-frozen-not-implemented-not-qualified-not-released",
+  "target_policy": {
+    "baseline": "qemu-virt-rv64-tcg-icount-v1",
+    "fresh_capture_required": true,
+    "fresh_challenge_required": true,
+    "fresh_node_specific_contract_required": true,
+    "fresh_run_id_required": true,
+    "fresh_source_commit_and_tree_required": true,
+    "normal_and_optimized_required": true,
+    "physical_duo_required": false,
+    "qualification_status": "not-started",
+    "release_status": "not-authorized"
+  },
+  "version": 1
+}

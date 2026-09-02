@@ -13,8 +13,8 @@ use vibeos_driver_virtio_core as virtio;
 use vibeos_driver_virtio_core::{
     AvailableRing, BlockDmaAddresses, BlockOperation, BlockRequestHeader, BlockStatus, Descriptor,
     ModernInit, NegotiatedFeatures, QueueError, ResetReason, SplitQueueModel, Submission,
-    UsedElement, UsedRing, BLOCK_HEADER_DESCRIPTOR, BLOCK_MAX_TRANSFER_SIZE, SPLIT_QUEUE_SIZE,
-    STATUS_DEVICE_NEEDS_RESET, STATUS_DRIVER_OK,
+    UsedElement, UsedRing, BLOCK_HEADER_DESCRIPTOR, BLOCK_MAX_TRANSFER_SIZE, BLOCK_QUEUE_SIZE,
+    MAX_SPLIT_QUEUE_SIZE, STATUS_DEVICE_NEEDS_RESET, STATUS_DRIVER_OK,
 };
 use vibeos_driver_virtio_mmio::MmioTransport;
 
@@ -58,7 +58,7 @@ impl PendingSubmission {
 
 #[repr(C, align(4096))]
 struct DmaSlab {
-    descriptors: [Descriptor; SPLIT_QUEUE_SIZE as usize],
+    descriptors: [Descriptor; BLOCK_QUEUE_SIZE as usize],
     available: AvailableRing,
     used: UsedRing,
     header: BlockRequestHeader,
@@ -68,16 +68,16 @@ struct DmaSlab {
 
 impl DmaSlab {
     const ZERO: Self = Self {
-        descriptors: [Descriptor::new(0, 0, 0, 0); SPLIT_QUEUE_SIZE as usize],
+        descriptors: [Descriptor::new(0, 0, 0, 0); BLOCK_QUEUE_SIZE as usize],
         available: AvailableRing {
             flags: 0,
             index: 0,
-            ring: [0; SPLIT_QUEUE_SIZE as usize],
+            ring: [0; MAX_SPLIT_QUEUE_SIZE as usize],
         },
         used: UsedRing {
             flags: 0,
             index: 0,
-            ring: [UsedElement::new(0, 0); SPLIT_QUEUE_SIZE as usize],
+            ring: [UsedElement::new(0, 0); MAX_SPLIT_QUEUE_SIZE as usize],
         },
         header: BlockRequestHeader {
             request_type: 0,
@@ -154,7 +154,7 @@ impl BlockEngine {
     pub const fn info(&self) -> EngineInfo {
         EngineInfo {
             capacity_sectors: self.capacity,
-            queue_size: SPLIT_QUEUE_SIZE,
+            queue_size: BLOCK_QUEUE_SIZE,
             read_only: self.features.read_only(),
             supports_flush: self.features.supports_flush(),
             epoch: self.model.epoch(),
@@ -227,7 +227,7 @@ impl BlockEngine {
     }
 
     pub fn used_element(&self, previous_used_index: u16) -> UsedElement {
-        read_used_element(virtio::ring_slot(previous_used_index) as usize)
+        read_used_element(virtio::block_ring_slot(previous_used_index) as usize)
     }
 
     pub fn complete(
@@ -356,11 +356,11 @@ fn initialize(transport: MmioTransport) -> Result<(NegotiatedFeatures, u64), Har
     init.confirm_features(transport.status())
         .map_err(|_| HardwareError::Unsupported)?;
     transport.select_queue(0);
-    if transport.queue_ready() || transport.queue_num_max() < SPLIT_QUEUE_SIZE {
+    if transport.queue_ready() || transport.queue_num_max() < BLOCK_QUEUE_SIZE {
         return Err(HardwareError::Unsupported);
     }
     let (descriptors, available, used) = dma_addresses();
-    transport.configure_queue(SPLIT_QUEUE_SIZE, descriptors, available, used);
+    transport.configure_queue(BLOCK_QUEUE_SIZE, descriptors, available, used);
     let capacity = transport.block_capacity().ok_or(HardwareError::Protocol)?;
     Ok((features, capacity))
 }
@@ -375,7 +375,7 @@ fn publish_request(
     available_slot: u16,
     on_request_published: impl FnOnce(),
 ) -> Result<(), HardwareError> {
-    if available_slot >= SPLIT_QUEUE_SIZE {
+    if available_slot >= BLOCK_QUEUE_SIZE {
         return Err(HardwareError::Protocol);
     }
     let expected_len = operation.data_len() as usize;
@@ -518,7 +518,7 @@ mod tests {
         let model = SplitQueueModel::at_epoch(features, 9).unwrap();
         let info = EngineInfo {
             capacity_sectors: 123,
-            queue_size: SPLIT_QUEUE_SIZE,
+            queue_size: BLOCK_QUEUE_SIZE,
             read_only: features.read_only(),
             supports_flush: features.supports_flush(),
             epoch: model.epoch(),
@@ -567,7 +567,7 @@ mod tests {
             publish_request(
                 BlockOperation::Read { sector: 0 },
                 &[],
-                SPLIT_QUEUE_SIZE,
+                BLOCK_QUEUE_SIZE,
                 || rejected.set(rejected.get() + 1),
             ),
             Err(HardwareError::Protocol)

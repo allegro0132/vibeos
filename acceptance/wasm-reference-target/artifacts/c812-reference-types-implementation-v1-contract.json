@@ -1,0 +1,150 @@
+{
+  "authority": {
+    "admission_authorized": false,
+    "aot_authorized": false,
+    "candidate_validation_authorized": true,
+    "command_authorized": false,
+    "current_engine_bound": false,
+    "durable_publication_authorized": false,
+    "implementation_authorized": true,
+    "migration_authorized": false,
+    "production_authorized": false,
+    "release_authorized": false,
+    "rwx_authorized": false
+  },
+  "basis": {
+    "design_commit": "d8032d7fab63fe02fb6b53dfe0df5f81a0b83880",
+    "design_contract": {
+      "bytes": 8780,
+      "path": "acceptance/wasm-reference-target/artifacts/c812-reference-types-design-v1-contract.json",
+      "sha256": "ed8fdbe4964b7a42967258dabb5871c360899d1006666a7f9ab54c6b5f33db42"
+    },
+    "design_tree": "db141307819f17c32a19d772384a67509742b21c"
+  },
+  "boundaries": {
+    "code5_current_engine": false,
+    "code5_permanently_inert": true,
+    "code7_current_engine": false,
+    "code7_execution_authorized": false,
+    "code8_reference_types_enabled": false,
+    "code8_release_scope_unchanged": true,
+    "code9_current_engine": false,
+    "code9_durable_authorized": false,
+    "code9_executable": false,
+    "code9_migration_authorized": false,
+    "code9_stage": "validation-only"
+  },
+  "candidate": {
+    "acceptance_feature": "c812-r2-acceptance",
+    "component_containment_feature": "c812-r2-reference-validation",
+    "crate": "vibeos-wasm-reference-candidate",
+    "default_features": [],
+    "imports_allowed": false,
+    "production_ready": false,
+    "validation_passes": [
+      "wasmparser-0.239.0-exact-feature-validator-and-syntax-containment",
+      "vibeos-wasmi-reference-validation-translation"
+    ]
+  },
+  "containment": {
+    "active_element_segments_only": true,
+    "component_core_reference_boundary": false,
+    "core_nullable_funcref": true,
+    "externref": false,
+    "gc_semantics": false,
+    "host_reference_imports_or_exports": false,
+    "maximum_tables": 1,
+    "passive_or_declarative_elements": false,
+    "table_element_type": "nullable-funcref",
+    "typed_function_references": false
+  },
+  "engine": {
+    "base_package": "vibeos-wasmi-softfloat",
+    "base_tree": "c55904f72c70f9a0d807a13e678fec01b7c78f5a",
+    "base_version": "1.1.0-vibeos-f2.1",
+    "facade_sha256": "dfe572e3a02987a8b9cdb4b542de35d77394ede5da5a47b1a8e4d9b3b9fc4991",
+    "feature_set": "default-features=false;extra-checks,prefer-btree-collections;simd=false",
+    "floats": false,
+    "gc_types_parser_dependency": true,
+    "gc_types_semantics": false,
+    "package": "vibeos-wasmi-reference-validation",
+    "reference_types": true,
+    "version": "1.1.0-vibeos-ref1.1"
+  },
+  "hardware_policy": {
+    "duo_gate_effect": false,
+    "duo_inputs_permitted": 0,
+    "duo_inputs_required": 0,
+    "duo_status": "paused-optional-observation-only",
+    "fixed_qemu_is_hardware_equivalent": false,
+    "fixed_qemu_qualification_node": "C8.12-R3",
+    "other_hardware_gates_unchanged": true,
+    "physical_provenance": "not-claimed"
+  },
+  "identity": {
+    "artifact_abi": 9,
+    "artifact_profile_code": 9,
+    "component_profile": 6,
+    "core_profile": 6,
+    "name": "PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION",
+    "runtime_abi": 9,
+    "stage": "validation-only"
+  },
+  "qualification": {
+    "fixed_qemu": "not-started-c812-r3",
+    "release": "not-authorized",
+    "successor_design_review_eligible": false
+  },
+  "riscv_object_audit": {
+    "artifacts": 7,
+    "forbidden_instruction_extensions": [
+      "f",
+      "d",
+      "v"
+    ],
+    "forbidden_semantic_float_helpers": true,
+    "libm_reachable": false,
+    "llvm_version": "22.1.8",
+    "script": "scripts/verify-c812-r2-riscv-object.py",
+    "status": "passed",
+    "target": "riscv64imac-unknown-none-elf",
+    "toolchain": "nightly-2026-08-01"
+  },
+  "roadmap": {
+    "completed_node": "C8.12-R2",
+    "current_position": "c812-r2-reference-types-validation-implemented-pre-fixed-qemu",
+    "next_node": "C8.12-R3",
+    "state": "implementation-and-containment-complete-validation-only"
+  },
+  "schema": "vibeos.c812.reference-types-implementation-v1.contract",
+  "semantics": {
+    "bulk_memory": false,
+    "exceptions": false,
+    "floats": false,
+    "memory64": false,
+    "multi_memory": false,
+    "numeric_profile": "profile1-integer-only",
+    "reference_types": "bounded-nullable-funcref-1.0",
+    "relaxed_simd": false,
+    "simd": false,
+    "threads_or_shared_memory": false
+  },
+  "status": "c812-r2-reference-types-validation-implemented-contained-not-qualified-not-released",
+  "supply_chain": {
+    "facade_files": 2,
+    "facade_sha256": "dfe572e3a02987a8b9cdb4b542de35d77394ede5da5a47b1a8e4d9b3b9fc4991",
+    "script": "scripts/verify-c812-r2-supply-chain.py",
+    "selftest_mutations": 1,
+    "status": "passed"
+  },
+  "tests": {
+    "artifact_code9_roundtrip": true,
+    "candidate_unit_tests": 4,
+    "component_containment_tests": 3,
+    "durable_graph_and_loader_rejection": true,
+    "fixed_component_mutations": 256,
+    "fixed_component_mutations_rejected": 208,
+    "normal_and_optimized_contract_checks_required": true
+  },
+  "version": 1
+}

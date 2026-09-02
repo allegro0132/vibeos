@@ -1,0 +1,1237 @@
+//! Exact WIT-world resolution and normalized component type matching.
+
+use alloc::{
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
+use vibeos_component_format::PROFILE_1_LIMITS;
+use wasmparser::component_types::{
+    ComponentAnyTypeId, ComponentDefinedType, ComponentDefinedTypeId, ComponentEntityType,
+    ComponentValType, ResourceId,
+};
+use wasmparser::types::Types;
+use wasmparser::PrimitiveValType;
+use wit_parser::{Handle, Resolve, Type, TypeDefKind, TypeId, WorldItem};
+
+use crate::decode::CurrentComponentValidationEngine;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NamedValueShape {
+    pub name: String,
+    pub value: ValueShape,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NamedCaseShape {
+    pub name: String,
+    pub value: Option<ValueShape>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ValueShape {
+    Bool,
+    U8,
+    U16,
+    U32,
+    U64,
+    S8,
+    S16,
+    S32,
+    S64,
+    #[cfg(feature = "c88-f3-acceptance")]
+    F32,
+    #[cfg(feature = "c88-f3-acceptance")]
+    F64,
+    Char,
+    String,
+    List(Box<ValueShape>),
+    Tuple(Vec<ValueShape>),
+    Record(Vec<NamedValueShape>),
+    Flags(Vec<String>),
+    Enum(Vec<String>),
+    Option(Box<ValueShape>),
+    Result {
+        ok: Option<Box<ValueShape>>,
+        error: Option<Box<ValueShape>>,
+    },
+    Variant(Vec<NamedCaseShape>),
+    Future(Option<Box<ValueShape>>),
+    Stream(Option<Box<ValueShape>>),
+    Own(String),
+    Borrow(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FunctionEffect {
+    Sync,
+    Async,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct FunctionShape {
+    pub effect: FunctionEffect,
+    pub parameters: Vec<NamedValueShape>,
+    pub result: Option<ValueShape>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TypeShape {
+    Resource,
+    Value(ValueShape),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum EntityShape {
+    Function(FunctionShape),
+    Interface(Vec<NamedEntityShape>),
+    Type(TypeShape),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct NamedEntityShape {
+    pub name: String,
+    pub entity: EntityShape,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u16)]
+pub enum WorldError {
+    SourceTooLarge = 1,
+    InvalidWit = 2,
+    MissingWorld = 3,
+    VersionMismatch = 4,
+    UnsupportedType = 5,
+    TypeGraphLimit = 6,
+    Allocation = 7,
+    MissingImport = 8,
+    UnexpectedImport = 9,
+    MissingExport = 10,
+    UnexpectedExport = 11,
+    TypeMismatch = 12,
+}
+
+impl WorldError {
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct WorldContract {
+    /// Normalized fields remain public for low-level runtime fixtures and
+    /// generated policy adapters. They carry no provenance: security policy
+    /// must not fill them by reflecting the component being admitted. Prefer
+    /// [`WorldContract::parse`] over direct construction at trust boundaries.
+    pub identity: String,
+    pub imports: Vec<NamedEntityShape>,
+    pub exports: Vec<NamedEntityShape>,
+}
+
+impl WorldContract {
+    /// Resolves one fully-qualified world such as
+    /// `vibe:fixture/typed-filter@1.0.0`.
+    pub fn parse(source: &str, exact_world: &str) -> Result<Self, WorldError> {
+        Self::parse_with_features(source, exact_world, ShapeFeatures::PROFILE_1)
+    }
+
+    /// Acceptance-only WIT frontend for the sealed synchronous scalar-float
+    /// contract. This method does not resolve code 5 to a current engine and
+    /// returns only an owned, inert world shape.
+    #[cfg(feature = "c88-f3-acceptance")]
+    pub fn parse_profile_2_sync_float_candidate(
+        source: &str,
+        exact_world: &str,
+    ) -> Result<Self, WorldError> {
+        let contract = vibeos_component_format::profile_2_sync_float_validation_contract();
+        if contract.profile() != vibeos_component_format::ProfileIdentity::PROFILE_2_SYNC_FLOAT
+            || contract.runtime_ready()
+            || contract.component_validator().predecode_async()
+        {
+            return Err(WorldError::UnsupportedType);
+        }
+        Self::parse_with_features(source, exact_world, ShapeFeatures::PROFILE_2_FLOAT)
+    }
+
+    /// WIT frontend for the independently numbered C8.9 executable world.
+    #[cfg(feature = "c89-float-executable")]
+    pub fn parse_profile_3_sync_float_executable(
+        source: &str,
+        exact_world: &str,
+    ) -> Result<Self, WorldError> {
+        if exact_world != vibeos_component_format::PROFILE_3_SYNC_FLOAT_EXECUTABLE_WORLD {
+            return Err(WorldError::VersionMismatch);
+        }
+        let identity = vibeos_component_format::current_validation_engine_identity(
+            vibeos_component_format::ProfileIdentity::PROFILE_3_SYNC_FLOAT_EXECUTABLE,
+        )
+        .ok_or(WorldError::UnsupportedType)?;
+        if identity.component_validator().predecode_async() {
+            return Err(WorldError::UnsupportedType);
+        }
+        Self::parse_with_features(source, exact_world, ShapeFeatures::PROFILE_2_FLOAT)
+    }
+
+    /// Acceptance-only WIT frontend for code 7. SIMD adds no Component value
+    /// type, so this intentionally reuses the scalar-float boundary while the
+    /// sealed Core inspector confines `v128` to embedded modules.
+    #[cfg(feature = "c810-s3-acceptance")]
+    pub fn parse_profile_4_sync_simd_candidate(
+        source: &str,
+        exact_world: &str,
+    ) -> Result<Self, WorldError> {
+        let contract = vibeos_component_format::profile_4_sync_simd_validation_contract();
+        if contract.profile()
+            != vibeos_component_format::ProfileIdentity::PROFILE_4_SYNC_SIMD_VALIDATION
+            || contract.runtime_ready()
+            || contract.component_validator().predecode_async()
+        {
+            return Err(WorldError::UnsupportedType);
+        }
+        Self::parse_with_features(source, exact_world, ShapeFeatures::PROFILE_2_FLOAT)
+    }
+
+    /// WIT frontend for the independent code-8 executable SIMD world. SIMD
+    /// remains Core-internal, so the Component boundary is still scalar-float.
+    #[cfg(feature = "c811-simd-executable")]
+    pub fn parse_profile_5_sync_simd_executable(
+        source: &str,
+        exact_world: &str,
+    ) -> Result<Self, WorldError> {
+        if exact_world != vibeos_component_format::PROFILE_5_SYNC_SIMD_EXECUTABLE_WORLD {
+            return Err(WorldError::VersionMismatch);
+        }
+        let identity = vibeos_component_format::current_validation_engine_identity(
+            vibeos_component_format::ProfileIdentity::PROFILE_5_SYNC_SIMD_EXECUTABLE,
+        )
+        .ok_or(WorldError::UnsupportedType)?;
+        if identity.component_validator().predecode_async() {
+            return Err(WorldError::UnsupportedType);
+        }
+        Self::parse_with_features(source, exact_world, ShapeFeatures::PROFILE_2_FLOAT)
+    }
+
+    fn parse_with_features(
+        source: &str,
+        exact_world: &str,
+        features: ShapeFeatures,
+    ) -> Result<Self, WorldError> {
+        if source.len() > PROFILE_1_LIMITS.max_component_bytes || exact_world.len() > 256 {
+            return Err(WorldError::SourceTooLarge);
+        }
+        if !exact_world.contains('/') || !exact_world.contains('@') {
+            return Err(WorldError::VersionMismatch);
+        }
+        let mut resolve = Resolve::default();
+        let package = resolve
+            .push_source("profile.wit", source)
+            .map_err(|_| WorldError::InvalidWit)?;
+        let (package_name, world_name) = exact_world
+            .rsplit_once('/')
+            .ok_or(WorldError::VersionMismatch)?;
+        let (local_world_name, version) = world_name
+            .rsplit_once('@')
+            .ok_or(WorldError::VersionMismatch)?;
+        if local_world_name.is_empty() || version.is_empty() {
+            return Err(WorldError::VersionMismatch);
+        }
+        let mut expected_package = copied(package_name)?;
+        expected_package
+            .try_reserve(version.len() + 1)
+            .map_err(|_| WorldError::Allocation)?;
+        expected_package.push('@');
+        expected_package.push_str(version);
+        if resolve.packages[package].name.to_string() != expected_package {
+            return Err(WorldError::VersionMismatch);
+        }
+        let world_id = resolve
+            // The source parser has already normalized escaped WIT keywords
+            // such as `package vibe:%stream`, while `exact_world` deliberately
+            // carries the canonical identity `vibe:stream/filter@1.0.0`.
+            // Passing that canonical package spelling back through the WIT
+            // selector would lex `stream` as a keyword and reject the exact
+            // package we just proved. Select the local world in the one exact
+            // package instead, then independently compare the normalized full
+            // identity below.
+            .select_world(&[package], Some(local_world_name))
+            .map_err(|_| WorldError::MissingWorld)?;
+        let world = &resolve.worlds[world_id];
+        let owner = world.package.ok_or(WorldError::VersionMismatch)?;
+        let identity = resolve.id_of_name(owner, &world.name);
+        if identity != exact_world {
+            return Err(WorldError::VersionMismatch);
+        }
+        if world.imports.len() > PROFILE_1_LIMITS.max_imports as usize
+            || world.exports.len() > PROFILE_1_LIMITS.max_exports as usize
+        {
+            return Err(WorldError::TypeGraphLimit);
+        }
+        let resources = collect_wit_world_resources(
+            &resolve,
+            world.imports.iter().chain(world.exports.iter()),
+        )?;
+        let mut budget = ShapeBudget::default();
+        let imports = normalize_wit_entities(
+            &resolve,
+            world.imports.iter(),
+            &resources,
+            &mut budget,
+            features,
+        )?;
+        let exports = normalize_wit_entities(
+            &resolve,
+            world.exports.iter(),
+            &resources,
+            &mut budget,
+            features,
+        )?;
+        Ok(Self {
+            identity,
+            imports,
+            exports,
+        })
+    }
+
+    /// Parse WIT while consuming the same opaque current-engine proof used for
+    /// Component validation. The frontend has no runtime feature toggles, so
+    /// its exact version, registry checksum, and Cargo feature set are carried
+    /// by the proof's private identity.
+    pub fn parse_with_current_engine(
+        source: &str,
+        exact_world: &str,
+        engine: &CurrentComponentValidationEngine,
+    ) -> Result<Self, WorldError> {
+        let frontend = engine.identity().wit_parser();
+        if frontend.name() != "wit-parser"
+            || frontend.version() != vibeos_component_format::WIT_PARSER_0_255_0_VERSION
+            || frontend.checksum() != vibeos_component_format::WIT_PARSER_0_255_0_CHECKSUM
+            || frontend.features() != vibeos_component_format::WIT_PARSER_FEATURES
+        {
+            return Err(WorldError::InvalidWit);
+        }
+        Self::parse(source, exact_world)
+    }
+
+    pub fn check_component(
+        &self,
+        imports: &[NamedEntityShape],
+        exports: &[NamedEntityShape],
+    ) -> Result<(), WorldError> {
+        check_side(&self.imports, imports, true)?;
+        check_side(&self.exports, exports, false)
+    }
+}
+
+fn check_side(
+    expected: &[NamedEntityShape],
+    actual: &[NamedEntityShape],
+    imports: bool,
+) -> Result<(), WorldError> {
+    for expected_item in expected {
+        let actual_item = actual
+            .iter()
+            .find(|item| item.name == expected_item.name)
+            .ok_or(if imports {
+                WorldError::MissingImport
+            } else {
+                WorldError::MissingExport
+            })?;
+        if actual_item.entity != expected_item.entity {
+            return Err(WorldError::TypeMismatch);
+        }
+    }
+    if actual.len() != expected.len() {
+        return Err(if imports {
+            WorldError::UnexpectedImport
+        } else {
+            WorldError::UnexpectedExport
+        });
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ShapeBudget {
+    nodes: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ShapeFeatures {
+    async_values: bool,
+    #[cfg(feature = "c88-f3-acceptance")]
+    scalar_float: bool,
+}
+
+impl ShapeFeatures {
+    const PROFILE_1: Self = Self {
+        async_values: true,
+        #[cfg(feature = "c88-f3-acceptance")]
+        scalar_float: false,
+    };
+
+    #[cfg(feature = "c88-f3-acceptance")]
+    pub(crate) const PROFILE_2_FLOAT: Self = Self {
+        async_values: false,
+        scalar_float: true,
+    };
+}
+
+impl ShapeBudget {
+    fn enter(&mut self, depth: u32) -> Result<(), WorldError> {
+        if depth > PROFILE_1_LIMITS.max_canonical_nesting {
+            return Err(WorldError::TypeGraphLimit);
+        }
+        self.nodes = self
+            .nodes
+            .checked_add(1)
+            .ok_or(WorldError::TypeGraphLimit)?;
+        if self.nodes > PROFILE_1_LIMITS.max_component_definitions {
+            return Err(WorldError::TypeGraphLimit);
+        }
+        Ok(())
+    }
+}
+
+fn copied(value: &str) -> Result<String, WorldError> {
+    let mut result = String::new();
+    result
+        .try_reserve_exact(value.len())
+        .map_err(|_| WorldError::Allocation)?;
+    result.push_str(value);
+    Ok(result)
+}
+
+fn push_named_value(
+    target: &mut Vec<NamedValueShape>,
+    name: &str,
+    value: ValueShape,
+) -> Result<(), WorldError> {
+    target.try_reserve(1).map_err(|_| WorldError::Allocation)?;
+    target.push(NamedValueShape {
+        name: copied(name)?,
+        value,
+    });
+    Ok(())
+}
+
+fn push_named_entity(
+    target: &mut Vec<NamedEntityShape>,
+    name: &str,
+    entity: EntityShape,
+) -> Result<(), WorldError> {
+    target.try_reserve(1).map_err(|_| WorldError::Allocation)?;
+    target.push(NamedEntityShape {
+        name: copied(name)?,
+        entity,
+    });
+    Ok(())
+}
+
+fn normalize_wit_entities<'a>(
+    resolve: &Resolve,
+    items: impl Iterator<Item = (&'a wit_parser::WorldKey, &'a WorldItem)>,
+    resources: &[(TypeId, String)],
+    budget: &mut ShapeBudget,
+    features: ShapeFeatures,
+) -> Result<Vec<NamedEntityShape>, WorldError> {
+    let mut items = items;
+    let mut entries = Vec::new();
+    if let Some(upper) = items.size_hint().1 {
+        entries
+            .try_reserve_exact(upper)
+            .map_err(|_| WorldError::Allocation)?;
+    }
+    for entry in items.by_ref() {
+        entries.try_reserve(1).map_err(|_| WorldError::Allocation)?;
+        entries.push(entry);
+    }
+
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(entries.len())
+        .map_err(|_| WorldError::Allocation)?;
+    for (key, item) in entries {
+        let name = resolve.name_world_key(key);
+        if matches!(item, WorldItem::Type { id, .. }
+            if resolve_wit_resource_alias(resolve, *id)?.is_some())
+        {
+            // `use interface.{resource}` is a local nominal alias used to
+            // type world-level functions, not an additional external
+            // component import/export. Its canonical root remains available
+            // through `resources`, but publishing it here would require a
+            // top-level entity which no matching component type contains.
+            continue;
+        }
+        let entity = match item {
+            WorldItem::Interface { id, .. } => {
+                EntityShape::Interface(normalize_wit_interface(resolve, *id, budget, 1, features)?)
+            }
+            WorldItem::Function(function) => EntityShape::Function(normalize_wit_function(
+                resolve, function, resources, budget, 1, features,
+            )?),
+            WorldItem::Type { id, .. } => EntityShape::Type(normalize_wit_type_entity(
+                resolve, *id, resources, budget, 1, features,
+            )?),
+        };
+        push_named_entity(&mut result, &name, entity)?;
+    }
+    Ok(result)
+}
+
+fn collect_wit_world_resources<'a>(
+    resolve: &Resolve,
+    items: impl Iterator<Item = (&'a wit_parser::WorldKey, &'a WorldItem)>,
+) -> Result<Vec<(TypeId, String)>, WorldError> {
+    // A world may import `use interface.{resource}` aliases while exporting a
+    // function which borrows them. Build one canonical table across both
+    // sides before normalizing either side.
+    let mut resources = Vec::new();
+    for (key, item) in items {
+        let WorldItem::Type { id, .. } = item else {
+            continue;
+        };
+        let Some(resource) = resolve_wit_resource_alias(resolve, *id)? else {
+            continue;
+        };
+        let name = resolve.name_world_key(key);
+        if resources
+            .iter()
+            .any(|(existing, existing_name): &(TypeId, String)| {
+                (*existing == resource) != (existing_name == &name)
+            })
+        {
+            return Err(WorldError::TypeMismatch);
+        }
+        if resources
+            .iter()
+            .any(|(existing, existing_name)| *existing == resource && existing_name == &name)
+        {
+            continue;
+        }
+        resources
+            .try_reserve(1)
+            .map_err(|_| WorldError::Allocation)?;
+        resources.push((resource, copied(&name)?));
+    }
+    Ok(resources)
+}
+
+fn normalize_wit_interface(
+    resolve: &Resolve,
+    interface_id: wit_parser::InterfaceId,
+    budget: &mut ShapeBudget,
+    depth: u32,
+    features: ShapeFeatures,
+) -> Result<Vec<NamedEntityShape>, WorldError> {
+    budget.enter(depth)?;
+    let interface = &resolve.interfaces[interface_id];
+    let mut resources = Vec::new();
+    for (name, id) in &interface.types {
+        if let Some(resource) = resolve_wit_resource_alias(resolve, *id)? {
+            resources
+                .try_reserve(1)
+                .map_err(|_| WorldError::Allocation)?;
+            resources.push((resource, copied(name)?));
+        }
+    }
+    let total = interface
+        .types
+        .len()
+        .checked_add(interface.functions.len())
+        .ok_or(WorldError::TypeGraphLimit)?;
+    if total > PROFILE_1_LIMITS.max_component_definitions as usize {
+        return Err(WorldError::TypeGraphLimit);
+    }
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(total)
+        .map_err(|_| WorldError::Allocation)?;
+    for (name, id) in &interface.types {
+        let entity =
+            normalize_wit_type_entity(resolve, *id, &resources, budget, depth + 1, features)?;
+        push_named_entity(&mut result, name, EntityShape::Type(entity))?;
+    }
+    for (name, function) in &interface.functions {
+        let shape =
+            normalize_wit_function(resolve, function, &resources, budget, depth + 1, features)?;
+        push_named_entity(&mut result, name, EntityShape::Function(shape))?;
+    }
+    Ok(result)
+}
+
+fn normalize_wit_function(
+    resolve: &Resolve,
+    function: &wit_parser::Function,
+    resources: &[(TypeId, String)],
+    budget: &mut ShapeBudget,
+    depth: u32,
+    features: ShapeFeatures,
+) -> Result<FunctionShape, WorldError> {
+    budget.enter(depth)?;
+    if function.kind.is_async() && !features.async_values {
+        return Err(WorldError::UnsupportedType);
+    }
+    if function.params.len() > PROFILE_1_LIMITS.max_params_per_function as usize {
+        return Err(WorldError::UnsupportedType);
+    }
+    let mut parameters = Vec::new();
+    parameters
+        .try_reserve_exact(function.params.len())
+        .map_err(|_| WorldError::Allocation)?;
+    for parameter in &function.params {
+        let value = normalize_wit_value(
+            resolve,
+            parameter.ty,
+            resources,
+            budget,
+            depth + 1,
+            features,
+        )?;
+        push_named_value(&mut parameters, &parameter.name, value)?;
+    }
+    let result = function
+        .result
+        .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1, features))
+        .transpose()?;
+    Ok(FunctionShape {
+        effect: if function.kind.is_async() {
+            FunctionEffect::Async
+        } else {
+            FunctionEffect::Sync
+        },
+        parameters,
+        result,
+    })
+}
+
+fn normalize_wit_type_entity(
+    resolve: &Resolve,
+    id: TypeId,
+    resources: &[(TypeId, String)],
+    budget: &mut ShapeBudget,
+    depth: u32,
+    features: ShapeFeatures,
+) -> Result<TypeShape, WorldError> {
+    if resolve_wit_resource_alias(resolve, id)?.is_some() {
+        budget.enter(depth)?;
+        Ok(TypeShape::Resource)
+    } else {
+        Ok(TypeShape::Value(normalize_wit_type_id(
+            resolve, id, resources, budget, depth, features,
+        )?))
+    }
+}
+
+fn resolve_wit_resource_alias(
+    resolve: &Resolve,
+    mut id: TypeId,
+) -> Result<Option<TypeId>, WorldError> {
+    for _ in 0..PROFILE_1_LIMITS.max_canonical_nesting {
+        match resolve.types[id].kind {
+            TypeDefKind::Resource => return Ok(Some(id)),
+            TypeDefKind::Type(Type::Id(next)) => id = next,
+            _ => return Ok(None),
+        }
+    }
+    Err(WorldError::TypeGraphLimit)
+}
+
+fn normalize_wit_value(
+    resolve: &Resolve,
+    ty: Type,
+    resources: &[(TypeId, String)],
+    budget: &mut ShapeBudget,
+    depth: u32,
+    features: ShapeFeatures,
+) -> Result<ValueShape, WorldError> {
+    budget.enter(depth)?;
+    match ty {
+        Type::Bool => Ok(ValueShape::Bool),
+        Type::U8 => Ok(ValueShape::U8),
+        Type::U16 => Ok(ValueShape::U16),
+        Type::U32 => Ok(ValueShape::U32),
+        Type::U64 => Ok(ValueShape::U64),
+        Type::S8 => Ok(ValueShape::S8),
+        Type::S16 => Ok(ValueShape::S16),
+        Type::S32 => Ok(ValueShape::S32),
+        Type::S64 => Ok(ValueShape::S64),
+        Type::Char => Ok(ValueShape::Char),
+        Type::String => Ok(ValueShape::String),
+        #[cfg(feature = "c88-f3-acceptance")]
+        Type::F32 if features.scalar_float => Ok(ValueShape::F32),
+        #[cfg(feature = "c88-f3-acceptance")]
+        Type::F64 if features.scalar_float => Ok(ValueShape::F64),
+        Type::F32 | Type::F64 | Type::ErrorContext => Err(WorldError::UnsupportedType),
+        Type::Id(id) => normalize_wit_type_id(resolve, id, resources, budget, depth + 1, features),
+    }
+}
+
+fn normalize_wit_type_id(
+    resolve: &Resolve,
+    id: TypeId,
+    resources: &[(TypeId, String)],
+    budget: &mut ShapeBudget,
+    depth: u32,
+    features: ShapeFeatures,
+) -> Result<ValueShape, WorldError> {
+    budget.enter(depth)?;
+    match &resolve.types[id].kind {
+        TypeDefKind::Record(record) => {
+            let mut fields = Vec::new();
+            fields
+                .try_reserve_exact(record.fields.len())
+                .map_err(|_| WorldError::Allocation)?;
+            for field in &record.fields {
+                let value =
+                    normalize_wit_value(resolve, field.ty, resources, budget, depth + 1, features)?;
+                push_named_value(&mut fields, &field.name, value)?;
+            }
+            Ok(ValueShape::Record(fields))
+        }
+        TypeDefKind::Handle(handle) => {
+            let (owned, resource) = match handle {
+                Handle::Own(id) => (true, *id),
+                Handle::Borrow(id) => (false, *id),
+            };
+            // `use interface.{resource}` introduces a type alias. Handles may
+            // retain that alias id while the interface resource table stores
+            // the underlying resource identity, so compare canonical roots.
+            let resource =
+                resolve_wit_resource_alias(resolve, resource)?.ok_or(WorldError::TypeMismatch)?;
+            let name = resources
+                .iter()
+                .find_map(|(id, name)| (*id == resource).then_some(name))
+                .ok_or(WorldError::TypeMismatch)?;
+            Ok(if owned {
+                ValueShape::Own(copied(name)?)
+            } else {
+                ValueShape::Borrow(copied(name)?)
+            })
+        }
+        TypeDefKind::Flags(flags) => {
+            let mut names = Vec::new();
+            names
+                .try_reserve_exact(flags.flags.len())
+                .map_err(|_| WorldError::Allocation)?;
+            for flag in &flags.flags {
+                names.push(copied(&flag.name)?);
+            }
+            Ok(ValueShape::Flags(names))
+        }
+        TypeDefKind::Tuple(tuple) => {
+            let mut types = Vec::new();
+            types
+                .try_reserve_exact(tuple.types.len())
+                .map_err(|_| WorldError::Allocation)?;
+            for ty in &tuple.types {
+                types.push(normalize_wit_value(
+                    resolve,
+                    *ty,
+                    resources,
+                    budget,
+                    depth + 1,
+                    features,
+                )?);
+            }
+            Ok(ValueShape::Tuple(types))
+        }
+        TypeDefKind::Variant(variant) => {
+            let mut cases = Vec::new();
+            cases
+                .try_reserve_exact(variant.cases.len())
+                .map_err(|_| WorldError::Allocation)?;
+            for case in &variant.cases {
+                cases.push(NamedCaseShape {
+                    name: copied(&case.name)?,
+                    value: case
+                        .ty
+                        .map(|ty| {
+                            normalize_wit_value(resolve, ty, resources, budget, depth + 1, features)
+                        })
+                        .transpose()?,
+                });
+            }
+            Ok(ValueShape::Variant(cases))
+        }
+        TypeDefKind::Enum(enumeration) => {
+            let mut names = Vec::new();
+            names
+                .try_reserve_exact(enumeration.cases.len())
+                .map_err(|_| WorldError::Allocation)?;
+            for case in &enumeration.cases {
+                names.push(copied(&case.name)?);
+            }
+            Ok(ValueShape::Enum(names))
+        }
+        TypeDefKind::Option(ty) => Ok(ValueShape::Option(Box::new(normalize_wit_value(
+            resolve,
+            *ty,
+            resources,
+            budget,
+            depth + 1,
+            features,
+        )?))),
+        TypeDefKind::Result(result) => Ok(ValueShape::Result {
+            ok: result
+                .ok
+                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1, features))
+                .transpose()?
+                .map(Box::new),
+            error: result
+                .err
+                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1, features))
+                .transpose()?
+                .map(Box::new),
+        }),
+        TypeDefKind::List(ty) => Ok(ValueShape::List(Box::new(normalize_wit_value(
+            resolve,
+            *ty,
+            resources,
+            budget,
+            depth + 1,
+            features,
+        )?))),
+        TypeDefKind::Type(ty) => {
+            normalize_wit_value(resolve, *ty, resources, budget, depth + 1, features)
+        }
+        TypeDefKind::Future(payload) if features.async_values => Ok(ValueShape::Future(
+            payload
+                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1, features))
+                .transpose()?
+                .map(Box::new),
+        )),
+        TypeDefKind::Stream(payload) if features.async_values => Ok(ValueShape::Stream(
+            payload
+                .map(|ty| normalize_wit_value(resolve, ty, resources, budget, depth + 1, features))
+                .transpose()?
+                .map(Box::new),
+        )),
+        TypeDefKind::Future(_) | TypeDefKind::Stream(_) => Err(WorldError::UnsupportedType),
+        TypeDefKind::Resource
+        | TypeDefKind::Map(_, _)
+        | TypeDefKind::FixedLengthList(_, _)
+        | TypeDefKind::Unknown => Err(WorldError::UnsupportedType),
+    }
+}
+
+pub(crate) fn normalize_component_world_entities(
+    types: &Types,
+    import_names: &[String],
+    export_names: &[String],
+) -> Result<(Vec<NamedEntityShape>, Vec<NamedEntityShape>), WorldError> {
+    normalize_component_world_entities_with_features(
+        types,
+        import_names,
+        export_names,
+        ShapeFeatures::PROFILE_1,
+    )
+}
+
+#[cfg(feature = "c88-f3-acceptance")]
+pub(crate) fn normalize_component_world_entities_float_candidate(
+    types: &Types,
+    import_names: &[String],
+    export_names: &[String],
+) -> Result<(Vec<NamedEntityShape>, Vec<NamedEntityShape>), WorldError> {
+    normalize_component_world_entities_with_features(
+        types,
+        import_names,
+        export_names,
+        ShapeFeatures::PROFILE_2_FLOAT,
+    )
+}
+
+fn normalize_component_world_entities_with_features(
+    types: &Types,
+    import_names: &[String],
+    export_names: &[String],
+    features: ShapeFeatures,
+) -> Result<(Vec<NamedEntityShape>, Vec<NamedEntityShape>), WorldError> {
+    let mut resource_names = Vec::new();
+    collect_component_resource_names(types, import_names, true, &mut resource_names)?;
+    collect_component_resource_names(types, export_names, false, &mut resource_names)?;
+    let imports =
+        normalize_component_entities(types, import_names, true, &resource_names, features)?;
+    let exports =
+        normalize_component_entities(types, export_names, false, &resource_names, features)?;
+    Ok((imports, exports))
+}
+
+fn collect_component_resource_names(
+    types: &Types,
+    names: &[String],
+    imports: bool,
+    resources: &mut Vec<(ResourceId, String)>,
+) -> Result<(), WorldError> {
+    for name in names {
+        let item = if imports {
+            types.component_item_for_import(name)
+        } else {
+            types.component_item_for_export(name)
+        }
+        .ok_or(WorldError::TypeMismatch)?;
+        match item.ty {
+            ComponentEntityType::Type {
+                referenced: ComponentAnyTypeId::Resource(resource),
+                ..
+            } => push_component_resource(resources, resource.resource(), name)?,
+            ComponentEntityType::Instance(id) => {
+                for (member_name, member) in &types[id].exports {
+                    if let ComponentEntityType::Type {
+                        referenced: ComponentAnyTypeId::Resource(resource),
+                        ..
+                    } = member.ty
+                    {
+                        push_component_resource(resources, resource.resource(), member_name)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn push_component_resource(
+    resources: &mut Vec<(ResourceId, String)>,
+    resource: ResourceId,
+    name: &str,
+) -> Result<(), WorldError> {
+    if resources
+        .iter()
+        .any(|(id, existing)| *id == resource && existing == name)
+    {
+        return Ok(());
+    }
+    resources
+        .try_reserve(1)
+        .map_err(|_| WorldError::Allocation)?;
+    resources.push((resource, copied(name)?));
+    Ok(())
+}
+
+fn normalize_component_entities(
+    types: &Types,
+    names: &[String],
+    imports: bool,
+    resource_names: &[(ResourceId, String)],
+    features: ShapeFeatures,
+) -> Result<Vec<NamedEntityShape>, WorldError> {
+    let mut budget = ShapeBudget::default();
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(names.len())
+        .map_err(|_| WorldError::Allocation)?;
+    for name in names {
+        let item = if imports {
+            types.component_item_for_import(name)
+        } else {
+            types.component_item_for_export(name)
+        }
+        .ok_or(WorldError::TypeMismatch)?;
+        let entity =
+            normalize_component_entity(types, item.ty, resource_names, &mut budget, 1, features)?;
+        push_named_entity(&mut result, name, entity)?;
+    }
+    Ok(result)
+}
+
+fn normalize_component_entity(
+    types: &Types,
+    entity: ComponentEntityType,
+    outer_resources: &[(ResourceId, String)],
+    budget: &mut ShapeBudget,
+    depth: u32,
+    features: ShapeFeatures,
+) -> Result<EntityShape, WorldError> {
+    budget.enter(depth)?;
+    match entity {
+        ComponentEntityType::Func(id) => {
+            let function = &types[id];
+            if function.async_ && !features.async_values {
+                return Err(WorldError::UnsupportedType);
+            }
+            if function.params.len() > PROFILE_1_LIMITS.max_params_per_function as usize {
+                return Err(WorldError::UnsupportedType);
+            }
+            let mut parameters = Vec::new();
+            parameters
+                .try_reserve_exact(function.params.len())
+                .map_err(|_| WorldError::Allocation)?;
+            for (name, ty) in function.params.iter() {
+                let value = normalize_component_value(
+                    types,
+                    *ty,
+                    outer_resources,
+                    budget,
+                    depth + 1,
+                    features,
+                )?;
+                push_named_value(&mut parameters, name.as_str(), value)?;
+            }
+            let result = function
+                .result
+                .map(|ty| {
+                    normalize_component_value(
+                        types,
+                        ty,
+                        outer_resources,
+                        budget,
+                        depth + 1,
+                        features,
+                    )
+                })
+                .transpose()?;
+            Ok(EntityShape::Function(FunctionShape {
+                effect: if function.async_ {
+                    FunctionEffect::Async
+                } else {
+                    FunctionEffect::Sync
+                },
+                parameters,
+                result,
+            }))
+        }
+        ComponentEntityType::Instance(id) => {
+            let instance = &types[id];
+            let mut resources = Vec::new();
+            resources
+                .try_reserve_exact(
+                    outer_resources
+                        .len()
+                        .checked_add(instance.exports.len())
+                        .ok_or(WorldError::TypeGraphLimit)?,
+                )
+                .map_err(|_| WorldError::Allocation)?;
+            for (resource, name) in outer_resources {
+                resources.push((*resource, copied(name)?));
+            }
+            for (name, item) in &instance.exports {
+                if let ComponentEntityType::Type {
+                    referenced: ComponentAnyTypeId::Resource(resource),
+                    ..
+                } = item.ty
+                {
+                    resources.push((resource.resource(), copied(name)?));
+                }
+            }
+            let mut exports = Vec::new();
+            exports
+                .try_reserve_exact(instance.exports.len())
+                .map_err(|_| WorldError::Allocation)?;
+            for (name, item) in &instance.exports {
+                let entity = normalize_component_entity(
+                    types,
+                    item.ty,
+                    &resources,
+                    budget,
+                    depth + 1,
+                    features,
+                )?;
+                push_named_entity(&mut exports, name, entity)?;
+            }
+            Ok(EntityShape::Interface(exports))
+        }
+        ComponentEntityType::Type { referenced, .. } => match referenced {
+            ComponentAnyTypeId::Resource(_) => Ok(EntityShape::Type(TypeShape::Resource)),
+            ComponentAnyTypeId::Defined(id) => Ok(EntityShape::Type(TypeShape::Value(
+                normalize_component_defined(
+                    types,
+                    id,
+                    outer_resources,
+                    budget,
+                    depth + 1,
+                    features,
+                )?,
+            ))),
+            _ => Err(WorldError::UnsupportedType),
+        },
+        ComponentEntityType::Module(_)
+        | ComponentEntityType::Value(_)
+        | ComponentEntityType::Component(_) => Err(WorldError::UnsupportedType),
+    }
+}
+
+fn normalize_component_value(
+    types: &Types,
+    ty: ComponentValType,
+    resources: &[(ResourceId, String)],
+    budget: &mut ShapeBudget,
+    depth: u32,
+    features: ShapeFeatures,
+) -> Result<ValueShape, WorldError> {
+    budget.enter(depth)?;
+    match ty {
+        ComponentValType::Primitive(primitive) => primitive_shape(primitive, features),
+        ComponentValType::Type(id) => {
+            normalize_component_defined(types, id, resources, budget, depth + 1, features)
+        }
+    }
+}
+
+fn primitive_shape(
+    primitive: PrimitiveValType,
+    features: ShapeFeatures,
+) -> Result<ValueShape, WorldError> {
+    #[cfg(not(feature = "c88-f3-acceptance"))]
+    let _ = features;
+    match primitive {
+        PrimitiveValType::Bool => Ok(ValueShape::Bool),
+        PrimitiveValType::U8 => Ok(ValueShape::U8),
+        PrimitiveValType::U16 => Ok(ValueShape::U16),
+        PrimitiveValType::U32 => Ok(ValueShape::U32),
+        PrimitiveValType::U64 => Ok(ValueShape::U64),
+        PrimitiveValType::S8 => Ok(ValueShape::S8),
+        PrimitiveValType::S16 => Ok(ValueShape::S16),
+        PrimitiveValType::S32 => Ok(ValueShape::S32),
+        PrimitiveValType::S64 => Ok(ValueShape::S64),
+        PrimitiveValType::Char => Ok(ValueShape::Char),
+        PrimitiveValType::String => Ok(ValueShape::String),
+        #[cfg(feature = "c88-f3-acceptance")]
+        PrimitiveValType::F32 if features.scalar_float => Ok(ValueShape::F32),
+        #[cfg(feature = "c88-f3-acceptance")]
+        PrimitiveValType::F64 if features.scalar_float => Ok(ValueShape::F64),
+        PrimitiveValType::F32 | PrimitiveValType::F64 | PrimitiveValType::ErrorContext => {
+            Err(WorldError::UnsupportedType)
+        }
+    }
+}
+
+fn normalize_component_defined(
+    types: &Types,
+    id: ComponentDefinedTypeId,
+    resources: &[(ResourceId, String)],
+    budget: &mut ShapeBudget,
+    depth: u32,
+    features: ShapeFeatures,
+) -> Result<ValueShape, WorldError> {
+    budget.enter(depth)?;
+    match &types[id] {
+        ComponentDefinedType::Primitive(primitive) => primitive_shape(*primitive, features),
+        ComponentDefinedType::Record(record) => {
+            let mut fields = Vec::new();
+            fields
+                .try_reserve_exact(record.fields.len())
+                .map_err(|_| WorldError::Allocation)?;
+            for (name, ty) in &record.fields {
+                let value =
+                    normalize_component_value(types, *ty, resources, budget, depth + 1, features)?;
+                push_named_value(&mut fields, name.as_str(), value)?;
+            }
+            Ok(ValueShape::Record(fields))
+        }
+        ComponentDefinedType::Variant(variant) => {
+            let mut cases = Vec::new();
+            cases
+                .try_reserve_exact(variant.cases.len())
+                .map_err(|_| WorldError::Allocation)?;
+            for (name, case) in &variant.cases {
+                cases.push(NamedCaseShape {
+                    name: copied(name.as_str())?,
+                    value: case
+                        .ty
+                        .map(|ty| {
+                            normalize_component_value(
+                                types,
+                                ty,
+                                resources,
+                                budget,
+                                depth + 1,
+                                features,
+                            )
+                        })
+                        .transpose()?,
+                });
+            }
+            Ok(ValueShape::Variant(cases))
+        }
+        ComponentDefinedType::List { element, .. } => Ok(ValueShape::List(Box::new(
+            normalize_component_value(types, *element, resources, budget, depth + 1, features)?,
+        ))),
+        ComponentDefinedType::Tuple(tuple) => {
+            let mut result = Vec::new();
+            result
+                .try_reserve_exact(tuple.types.len())
+                .map_err(|_| WorldError::Allocation)?;
+            for ty in tuple.types.iter() {
+                result.push(normalize_component_value(
+                    types,
+                    *ty,
+                    resources,
+                    budget,
+                    depth + 1,
+                    features,
+                )?);
+            }
+            Ok(ValueShape::Tuple(result))
+        }
+        ComponentDefinedType::Flags(flags) => {
+            let mut names = Vec::new();
+            names
+                .try_reserve_exact(flags.len())
+                .map_err(|_| WorldError::Allocation)?;
+            for name in flags {
+                names.push(copied(name.as_str())?);
+            }
+            Ok(ValueShape::Flags(names))
+        }
+        ComponentDefinedType::Enum(enumeration) => {
+            let mut names = Vec::new();
+            names
+                .try_reserve_exact(enumeration.len())
+                .map_err(|_| WorldError::Allocation)?;
+            for name in enumeration {
+                names.push(copied(name.as_str())?);
+            }
+            Ok(ValueShape::Enum(names))
+        }
+        ComponentDefinedType::Option { ty, .. } => Ok(ValueShape::Option(Box::new(
+            normalize_component_value(types, *ty, resources, budget, depth + 1, features)?,
+        ))),
+        ComponentDefinedType::Result { ok, err, .. } => Ok(ValueShape::Result {
+            ok: ok
+                .map(|ty| {
+                    normalize_component_value(types, ty, resources, budget, depth + 1, features)
+                })
+                .transpose()?
+                .map(Box::new),
+            error: err
+                .map(|ty| {
+                    normalize_component_value(types, ty, resources, budget, depth + 1, features)
+                })
+                .transpose()?
+                .map(Box::new),
+        }),
+        ComponentDefinedType::Own(resource) | ComponentDefinedType::Borrow(resource) => {
+            let name = resources
+                .iter()
+                .find_map(|(id, name)| (*id == resource.resource()).then_some(name))
+                .ok_or(WorldError::TypeMismatch)?;
+            Ok(if matches!(&types[id], ComponentDefinedType::Own(_)) {
+                ValueShape::Own(copied(name)?)
+            } else {
+                ValueShape::Borrow(copied(name)?)
+            })
+        }
+        ComponentDefinedType::Future { ty, .. } if features.async_values => Ok(ValueShape::Future(
+            ty.map(|ty| {
+                normalize_component_value(types, ty, resources, budget, depth + 1, features)
+            })
+            .transpose()?
+            .map(Box::new),
+        )),
+        ComponentDefinedType::Stream { ty, .. } if features.async_values => Ok(ValueShape::Stream(
+            ty.map(|ty| {
+                normalize_component_value(types, ty, resources, budget, depth + 1, features)
+            })
+            .transpose()?
+            .map(Box::new),
+        )),
+        ComponentDefinedType::Future { .. } | ComponentDefinedType::Stream { .. } => {
+            Err(WorldError::UnsupportedType)
+        }
+        ComponentDefinedType::Map { .. } | ComponentDefinedType::FixedLengthList { .. } => {
+            Err(WorldError::UnsupportedType)
+        }
+    }
+}

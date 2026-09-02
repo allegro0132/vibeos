@@ -20,6 +20,18 @@ SSH_BOOT_TIMEOUT=${SSH_BOOT_TIMEOUT:-240}
 # patterns without weakening the OpenSSH wire-level readiness check.
 SSH_READY_LOG_PATTERN=${SSH_READY_LOG_PATTERN:-'ssh-test listening on 10\.0\.2\.15:2222'}
 SSH_FAILURE_LOG_PATTERN=${SSH_FAILURE_LOG_PATTERN:-'FAIL ssh-test:'}
+WASM_C48_PASS_MARKER='WASM_C48_ACCEPTANCE PASS'
+WASM_C48_POLICY_PATTERN='WASM_C48_ACCEPTANCE PASS.*policy=passed'
+WASM_C48_FAILURE_PATTERN='WASM_C48_ACCEPTANCE FAIL'
+WASM_C52_PASS_MARKER='WASM_C52_ACCEPTANCE PASS'
+WASM_C52_COUNTER_PATTERN='WASM_C52_ACCEPTANCE PASS parks=20 resumes=20 cross_hart_signals=20 stale_rejects=20 live_faults=20'
+WASM_C52_FAILURE_PATTERN='WASM_C52_ACCEPTANCE FAIL'
+WASM_C53_PASS_MARKER='WASM_C53_ACCEPTANCE PASS'
+WASM_C53_COUNTER_PATTERN='WASM_C53_ACCEPTANCE PASS pairs=20 input_chunks=180 output_chunks=180 xor_bytes=184320 backend_pending=20 backend_wakes=20 host_pending=20 exact_wakes=20 exact_resumes=20 late_wake_rejects=20 eof=20 normal_closes=40 terminal_matches=20 terminal_orders=20 close_races=3 terminal_mappings=3 start_error_terminals=2 terminal_races=3 cancel_busy_retries=3 completion_busy_retries=3 mismatches=9 duplicate_fault_rejects=1 aba_rejects=1 harts=4'
+WASM_C53_FAILURE_PATTERN='WASM_C53_ACCEPTANCE FAIL'
+WASM_C53_NATIVE_SSH_PASS_MARKER='WASM_C53_NATIVE_SSH_ACCEPTANCE PASS'
+WASM_C53_NATIVE_SSH_COUNTER_PATTERN='WASM_C53_NATIVE_SSH_ACCEPTANCE PASS starts=1 shadow_retires=1 terminals=1 cspace_resets=1 reaper_notifies=1 acks=1 input_bytes=13385 output_bytes=13385 normal_eof=1 normal_close=1 pending_shadows=0 registry_occupied=0 registry_header_mismatches=0 control_live=0 stream_bindings=0 cleanup_shadows=0 reaper_slots=0 reaper_waiters=0 route_exact=1 gates_open=1'
+WASM_C53_NATIVE_SSH_FAILURE_PATTERN='WASM_C53_NATIVE_SSH_ACCEPTANCE FAIL'
 
 TEST_TMP=""
 QEMU_PID=""
@@ -104,6 +116,100 @@ check_boot_log() {
   if grep -a -E -q "$SSH_FAILURE_LOG_PATTERN" "$QEMU_LOG"; then
     fail "boot $boot reported a component-fatal SSH error"
   fi
+  if grep -a -F -q "$WASM_C48_FAILURE_PATTERN" "$QEMU_LOG"; then
+    fail "boot $boot reported a C4.8 acceptance failure"
+  fi
+  if grep -a -F -q "$WASM_C52_FAILURE_PATTERN" "$QEMU_LOG"; then
+    fail "boot $boot reported a C5.2 acceptance failure"
+  fi
+  if grep -a -F -q "$WASM_C53_FAILURE_PATTERN" "$QEMU_LOG"; then
+    fail "boot $boot reported a C5.3 acceptance failure"
+  fi
+  if grep -a -F -q "$WASM_C53_NATIVE_SSH_FAILURE_PATTERN" "$QEMU_LOG"; then
+    fail "boot $boot reported a formal native SSH acceptance failure"
+  fi
+  c48_pass_count=$(grep -a -F -c "$WASM_C48_PASS_MARKER" "$QEMU_LOG" || true)
+  [ "$c48_pass_count" -eq 1 ] \
+    || fail "boot $boot did not publish exactly one C4.8 acceptance PASS marker"
+  c48_policy_count=$(grep -a -E -c "$WASM_C48_POLICY_PATTERN" "$QEMU_LOG" || true)
+  [ "$c48_policy_count" -eq 1 ] \
+    || fail "boot $boot C4.8 acceptance PASS did not publish policy=passed"
+  c52_pass_count=$(grep -a -F -c "$WASM_C52_PASS_MARKER" "$QEMU_LOG" || true)
+  [ "$c52_pass_count" -eq 1 ] \
+    || fail "boot $boot did not publish exactly one C5.2 acceptance PASS marker"
+  c52_counter_count=$(grep -a -F -c "$WASM_C52_COUNTER_PATTERN" "$QEMU_LOG" || true)
+  [ "$c52_counter_count" -eq 1 ] \
+    || fail "boot $boot C5.2 acceptance PASS did not publish all 20-cycle counters"
+  c53_pass_count=$(grep -a -F -c "$WASM_C53_PASS_MARKER" "$QEMU_LOG" || true)
+  [ "$c53_pass_count" -eq 1 ] \
+    || fail "boot $boot did not publish exactly one C5.3 acceptance PASS marker"
+  c53_counter_count=$(grep -a -F -c "$WASM_C53_COUNTER_PATTERN" "$QEMU_LOG" || true)
+  [ "$c53_counter_count" -eq 1 ] \
+    || fail "boot $boot C5.3 acceptance PASS did not publish the exact stream/lifecycle counters"
+  native_ssh_pass_count=$(grep -a -F -c "$WASM_C53_NATIVE_SSH_PASS_MARKER" "$QEMU_LOG" || true)
+  if [ "$boot" -eq 1 ]; then
+    [ "$native_ssh_pass_count" -eq 1 ] \
+      || fail "boot 1 did not publish exactly one formal native SSH PASS marker"
+    native_ssh_counter_count=$(grep -a -F -c "$WASM_C53_NATIVE_SSH_COUNTER_PATTERN" "$QEMU_LOG" || true)
+    [ "$native_ssh_counter_count" -eq 1 ] \
+      || fail "boot 1 formal native SSH PASS did not publish the exact managed lifecycle counters"
+  else
+    [ "$native_ssh_pass_count" -eq 0 ] \
+      || fail "boot $boot unexpectedly published a formal native SSH PASS without invoking it"
+  fi
+}
+
+wait_for_c48_acceptance() {
+  boot=$1
+  remaining=$SSH_BOOT_TIMEOUT
+  while :; do
+    kill -0 "$QEMU_PID" 2>/dev/null \
+      || fail "QEMU exited while waiting for boot $boot C4.8 acceptance"
+    if grep -a -E -q "$SSH_FAILURE_LOG_PATTERN" "$QEMU_LOG"; then
+      fail "guest reported a component-fatal SSH error before boot $boot C4.8 acceptance"
+    fi
+    if grep -a -F -q "$WASM_C48_FAILURE_PATTERN" "$QEMU_LOG"; then
+      fail "guest reported a C4.8 acceptance failure during boot $boot"
+    fi
+    if grep -a -F -q "$WASM_C52_FAILURE_PATTERN" "$QEMU_LOG"; then
+      fail "guest reported a C5.2 acceptance failure during boot $boot"
+    fi
+    if grep -a -F -q "$WASM_C53_FAILURE_PATTERN" "$QEMU_LOG"; then
+      fail "guest reported a C5.3 acceptance failure during boot $boot"
+    fi
+    if grep -a -F -q "$WASM_C53_NATIVE_SSH_FAILURE_PATTERN" "$QEMU_LOG"; then
+      fail "guest reported a formal native SSH acceptance failure during boot $boot"
+    fi
+    if grep -a -F -q "$WASM_C53_NATIVE_SSH_PASS_MARKER" "$QEMU_LOG"; then
+      fail "boot $boot published formal native SSH PASS before its OpenSSH invocation"
+    fi
+    c48_pass_count=$(grep -a -F -c "$WASM_C48_PASS_MARKER" "$QEMU_LOG" || true)
+    if [ "$c48_pass_count" -gt 1 ]; then
+      fail "boot $boot published more than one C4.8 acceptance PASS marker"
+    fi
+    c52_pass_count=$(grep -a -F -c "$WASM_C52_PASS_MARKER" "$QEMU_LOG" || true)
+    if [ "$c52_pass_count" -gt 1 ]; then
+      fail "boot $boot published more than one C5.2 acceptance PASS marker"
+    fi
+    c53_pass_count=$(grep -a -F -c "$WASM_C53_PASS_MARKER" "$QEMU_LOG" || true)
+    if [ "$c53_pass_count" -gt 1 ]; then
+      fail "boot $boot published more than one C5.3 acceptance PASS marker"
+    fi
+    if [ "$c48_pass_count" -eq 1 ] \
+      && grep -a -E -q "$WASM_C48_POLICY_PATTERN" "$QEMU_LOG" \
+      && [ "$c52_pass_count" -eq 1 ] \
+      && grep -a -F -q "$WASM_C52_COUNTER_PATTERN" "$QEMU_LOG" \
+      && [ "$c53_pass_count" -eq 1 ] \
+      && grep -a -F -q "$WASM_C53_COUNTER_PATTERN" "$QEMU_LOG"; then
+      echo "ssh-test: boot $boot C4.8/C5.2/C5.3 lifecycle and stream acceptance passed; starting OpenSSH"
+      return
+    fi
+    if [ "$remaining" -eq 0 ]; then
+      fail "boot $boot did not publish one C4.8 policy PASS plus exact C5.2 and C5.3 counter PASS markers"
+    fi
+    sleep 1
+    remaining=$((remaining - 1))
+  done
 }
 
 wait_for_log_count() {
@@ -116,6 +222,9 @@ wait_for_log_count() {
       || fail "QEMU exited while waiting for $label"
     if grep -a -E -q "$SSH_FAILURE_LOG_PATTERN" "$QEMU_LOG"; then
       fail "guest reported a component-fatal SSH error while waiting for $label"
+    fi
+    if grep -a -F -q "$WASM_C53_NATIVE_SSH_FAILURE_PATTERN" "$QEMU_LOG"; then
+      fail "guest reported a formal native SSH acceptance failure while waiting for $label"
     fi
     count=$(grep -a -E -c "$pattern" "$QEMU_LOG" || true)
     if [ "$count" -ge "$minimum" ]; then
@@ -193,7 +302,8 @@ run_peer() {
     --ready-timeout "$SSH_READY_TIMEOUT" \
     --command-timeout "$SSH_COMMAND_TIMEOUT"
   if [ "$mode" = functional ]; then
-    set -- "$@" --accepted-key "$ACCEPTED_KEY" --rejected-key "$REJECTED_KEY"
+    set -- "$@" --accepted-key "$ACCEPTED_KEY" --rejected-key "$REJECTED_KEY" \
+      --native-case-filter
   else
     set -- "$@" --accepted-key "$ACCEPTED_KEY" --scan-only
   fi
@@ -203,6 +313,10 @@ run_peer() {
   fi
   kill -0 "$QEMU_PID" 2>/dev/null \
     || fail "QEMU boot $boot exited during OpenSSH acceptance"
+  if [ "$mode" = functional ]; then
+    wait_for_log_count "$WASM_C53_NATIVE_SSH_PASS_MARKER" 1 \
+      "boot $boot did not publish formal native SSH completion-drain evidence"
+  fi
   check_boot_log "$boot"
   sed -n '1,8p' "$PEER_LOG"
 }
@@ -215,6 +329,8 @@ require_positive_integer "$SSH_PORT_ATTEMPTS" SSH_PORT_ATTEMPTS
 require_positive_integer "$SSH_READY_TIMEOUT" SSH_READY_TIMEOUT
 require_positive_integer "$SSH_COMMAND_TIMEOUT" SSH_COMMAND_TIMEOUT
 require_positive_integer "$SSH_BOOT_TIMEOUT" SSH_BOOT_TIMEOUT
+[ "$QEMU_SMP" -ge 4 ] \
+  || fail "QEMU_SMP must be at least 4 for the multi-hart C4.8/C5.2/C5.3 acceptance gate"
 if [ -n "$SSH_HOST_PORT" ]; then
   require_positive_integer "$SSH_HOST_PORT" SSH_HOST_PORT
   if [ "$SSH_HOST_PORT" -gt 65535 ]; then
@@ -244,9 +360,9 @@ python3 -B scripts/openssh-test-key.py --selftest >/dev/null \
 python3 -B scripts/openssh-peer.py --selftest >/dev/null \
   || fail "OpenSSH peer self-test failed"
 
-echo "ssh-test: building the explicit QEMU test-identity image"
+echo "ssh-test: building the explicit QEMU test-identity/formal-native image"
 if ! (cd firmware/qemu-virt && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
-  rustup run "$toolchain" cargo build --release --features ssh-test) >&2; then
+  rustup run "$toolchain" cargo build --release --features ssh-native-async-qemu-acceptance) >&2; then
   fail "kernel build failed"
 fi
 
@@ -266,10 +382,11 @@ python3 -B scripts/openssh-test-key.py \
   >/dev/null || fail "cannot generate the rejected OpenSSH fixture"
 
 start_qemu 1
+wait_for_c48_acceptance 1
 run_peer 1 functional "$KNOWN_HOSTS_ONE" "$HOST_KEY_ONE"
 
-wait_for_log_count 'ssh-test exec complete: status 0' 4 \
-  "boot 1 did not complete readiness true plus authorized echo/true and post-shell true commands"
+wait_for_log_count 'ssh-test exec complete: status 0' 6 \
+  "boot 1 did not complete readiness true plus authorized echo/true/native-case-filter/case-filter and post-shell true commands"
 wait_for_log_count 'ssh-test exec complete: status 1' 1 \
   "boot 1 did not publish the authorized false exit status"
 wait_for_log_count 'ssh-test shell complete: status 0' 1 \
@@ -277,8 +394,8 @@ wait_for_log_count 'ssh-test shell complete: status 0' 1 \
 status_zero_count=$(grep -a -E -c 'ssh-test exec complete: status 0' "$QEMU_LOG" || true)
 status_one_count=$(grep -a -E -c 'ssh-test exec complete: status 1' "$QEMU_LOG" || true)
 shell_status_zero_count=$(grep -a -F -c 'ssh-test shell complete: status 0' "$QEMU_LOG" || true)
-[ "$status_zero_count" -ge 4 ] \
-  || fail "boot 1 did not complete readiness true plus authorized echo/true and post-shell true commands"
+[ "$status_zero_count" -ge 6 ] \
+  || fail "boot 1 did not complete readiness true plus authorized echo/true/native-case-filter/case-filter and post-shell true commands"
 [ "$status_one_count" -ge 1 ] \
   || fail "boot 1 did not publish the authorized false exit status"
 [ "$shell_status_zero_count" -eq 1 ] \
@@ -286,6 +403,7 @@ shell_status_zero_count=$(grep -a -F -c 'ssh-test shell complete: status 0' "$QE
 stop_qemu
 
 start_qemu 2
+wait_for_c48_acceptance 2
 run_peer 2 scan "$KNOWN_HOSTS_TWO" "$HOST_KEY_TWO"
 wait_for_log_count 'ssh-test exec complete: status 0' 1 \
   "boot 2 did not complete its strict authenticated readiness command"
@@ -298,4 +416,4 @@ cmp -s "$HOST_KEY_ONE" "$HOST_KEY_TWO" \
   || fail "the deterministic SSH host identity changed across QEMU boots"
 
 RESULT_REPORTED=1
-echo "PASS qemu-ssh-test: exact test host key stable across boots; OpenSSH forced curve25519/Ed25519/ChaCha20-Poly1305; interactive PTY/shell, exec/auth, and request policy enforced"
+echo "PASS qemu-ssh-test: C4.8 lifecycle, C5.2 continuation, and C5.3 stream/terminal-order acceptance passed on both boots; formal native managed start/shadow-retire/terminal/CSpace-reset/reaper-notify/ack and 13385-byte OpenSSH XOR/EOF/close passed on boot 1; exact test host key stable; OpenSSH forced curve25519/Ed25519/ChaCha20-Poly1305; native and WASM case-filter, interactive PTY/shell, exec/auth, and request policy enforced"

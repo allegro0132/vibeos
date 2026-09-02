@@ -1,0 +1,611 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vibeos.invalid/schemas/wasm-aot-decision-evidence-v2.json",
+  "title": "VibeOS C8.4 provenance-closed three-cold-boot capture and final AOT-decision evidence",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/captureEnvelope"
+    },
+    {
+      "$ref": "#/$defs/decisionEnvelope"
+    }
+  ],
+  "$defs": {
+    "hex40": {
+      "pattern": "^[0-9a-f]{40}$",
+      "type": "string"
+    },
+    "hex64": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "positiveInteger": {
+      "minimum": 1,
+      "type": "integer"
+    },
+    "identity": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "sha256": {
+          "$ref": "#/$defs/hex64"
+        }
+      },
+      "required": [
+        "sha256",
+        "bytes"
+      ],
+      "type": "object"
+    },
+    "fileIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "file": {"minLength": 1, "type": "string"},
+        "sha256": {"$ref": "#/$defs/hex64"},
+        "bytes": {"$ref": "#/$defs/positiveInteger"}
+      },
+      "required": ["file", "sha256", "bytes"],
+      "type": "object"
+    },
+    "contentFileIdentity": {
+      "additionalProperties": false,
+      "properties": {
+        "file": {"minLength": 1, "type": "string"},
+        "content_sha256": {"$ref": "#/$defs/hex64"},
+        "sha256": {"$ref": "#/$defs/hex64"},
+        "bytes": {"$ref": "#/$defs/positiveInteger"}
+      },
+      "required": ["file", "content_sha256", "sha256", "bytes"],
+      "type": "object"
+    },
+    "sourceMaterializationEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "schema": {"const": "vibeos.c84.source-materialization-envelope"},
+        "version": {"const": 1},
+        "status": {"const": "closed"},
+        "content_sha256": {"$ref": "#/$defs/hex64"},
+        "content": {"type": "object"}
+      },
+      "required": ["schema", "version", "status", "content_sha256", "content"],
+      "type": "object"
+    },
+    "containerRuntimeEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "schema": {"const": "vibeos.c84.docker-runtime-closure"},
+        "version": {"const": 1},
+        "status": {"const": "closed"},
+        "content_sha256": {"$ref": "#/$defs/hex64"},
+        "content": {"type": "object"}
+      },
+      "required": ["schema", "version", "status", "content_sha256", "content"],
+      "type": "object"
+    },
+    "artifactIdentities": {
+      "additionalProperties": false,
+      "properties": {
+        "kernel_elf": {"$ref": "#/$defs/identity"},
+        "kernel_binary": {"$ref": "#/$defs/identity"},
+        "fit_boot_sd": {"$ref": "#/$defs/identity"},
+        "full_sd_image": {"$ref": "#/$defs/identity"}
+      },
+      "required": ["kernel_elf", "kernel_binary", "fit_boot_sd", "full_sd_image"],
+      "type": "object"
+    },
+    "toolIdentities": {
+      "additionalProperties": false,
+      "properties": {
+        "capture_script": {"$ref": "#/$defs/identity"},
+        "single_boot_verifier": {"$ref": "#/$defs/identity"},
+        "final_evidence_verifier": {"$ref": "#/$defs/identity"},
+        "c83_evidence_verifier": {"$ref": "#/$defs/identity"},
+        "source_materializer_script": {"$ref": "#/$defs/identity"},
+        "docker_runtime_script": {"$ref": "#/$defs/identity"},
+        "manifest": {"$ref": "#/$defs/identity"},
+        "transcript_schema": {"$ref": "#/$defs/identity"},
+        "evidence_schema": {"$ref": "#/$defs/identity"}
+      },
+      "required": ["capture_script", "single_boot_verifier", "final_evidence_verifier", "c83_evidence_verifier", "source_materializer_script", "docker_runtime_script", "manifest", "transcript_schema", "evidence_schema"],
+      "type": "object"
+    },
+    "predicates": {
+      "additionalProperties": false,
+      "properties": {
+        "budget_miss": {"type": "boolean"},
+        "interpretation_attribution": {"type": "boolean"}
+      },
+      "required": ["budget_miss", "interpretation_attribution"],
+      "type": "object"
+    },
+    "pooledPreview": {
+      "additionalProperties": false,
+      "properties": {
+        "scope": {"const": "capture-preview-final-evidence-verifier-required"},
+        "retained_samples": {"const": 63},
+        "budget_ticks": {"const": 2500000},
+        "total_ticks": {"$ref": "#/$defs/distribution"},
+        "interpretation_ticks": {"$ref": "#/$defs/distribution"},
+        "non_interpretation_ticks": {"$ref": "#/$defs/distribution"},
+        "predicates": {"$ref": "#/$defs/predicates"},
+        "candidate_outcome": {"enum": ["aot-eligible-for-c85-design-review", "aot-not-justified"]},
+        "aot_authorized": {"const": false},
+        "native_code_accepted": {"const": false}
+      },
+      "required": ["scope", "retained_samples", "budget_ticks", "total_ticks", "interpretation_ticks", "non_interpretation_ticks", "predicates", "candidate_outcome", "aot_authorized", "native_code_accepted"],
+      "type": "object"
+    },
+    "captureBoot": {
+      "additionalProperties": false,
+      "properties": {
+        "boot_index": {"minimum": 0, "maximum": 2, "type": "integer"},
+        "operator_confirmation": {"pattern": "^COLD BOOT [123]$", "type": "string"},
+        "operator_confirmed_utc": {"type": "string"},
+        "capture_started_utc": {"type": "string"},
+        "first_byte_utc": {"type": "string"},
+        "completion_marker_closed_utc": {"type": "string"},
+        "verified_utc": {"type": "string"},
+        "run_id": {"$ref": "#/$defs/hex64"},
+        "raw_log": {"$ref": "#/$defs/fileIdentity"},
+        "raw_capture_inode": {
+          "additionalProperties": false,
+          "properties": {"device": {"minimum": 0, "type": "integer"}, "inode": {"$ref": "#/$defs/positiveInteger"}},
+          "required": ["device", "inode"],
+          "type": "object"
+        },
+        "record_stream_sha256": {"$ref": "#/$defs/hex64"},
+        "summary": {"$ref": "#/$defs/fileIdentity"}
+      },
+      "required": ["boot_index", "operator_confirmation", "operator_confirmed_utc", "capture_started_utc", "first_byte_utc", "completion_marker_closed_utc", "verified_utc", "run_id", "raw_log", "raw_capture_inode", "record_stream_sha256", "summary"],
+      "type": "object"
+    },
+    "captureRecord": {
+      "additionalProperties": false,
+      "properties": {
+        "started_utc": {"type": "string"},
+        "completed_utc": {"type": "string"},
+        "fresh_cold_boots": {"const": 3},
+        "retained_samples": {"const": 63},
+        "timeout_seconds_per_boot": {"exclusiveMinimum": 1, "type": "number"},
+        "end_uniqueness_guard_seconds": {"const": 1.0},
+        "power_and_flash_control": {"const": "manual operator only; collector performs no serial writes, reset, auto-discovery, or flash"},
+        "serial": {
+          "additionalProperties": false,
+          "properties": {
+            "access": {"const": "read-only"},
+            "requested_port": {"minLength": 1, "type": "string"},
+            "resolved_port": {"minLength": 1, "type": "string"},
+            "settings": {"const": "115200 8N1"},
+            "usbmodem_forbidden": {"const": true}
+          },
+          "required": ["access", "requested_port", "resolved_port", "settings", "usbmodem_forbidden"],
+          "type": "object"
+        },
+        "boots": {"items": {"$ref": "#/$defs/captureBoot"}, "minItems": 3, "maxItems": 3, "type": "array"},
+        "cross_boot_stability": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {"boot_index": {"minimum": 0, "maximum": 2, "type": "integer"}, "p50_total_ticks": {"$ref": "#/$defs/positiveInteger"}, "p95_total_ticks": {"$ref": "#/$defs/positiveInteger"}},
+            "required": ["boot_index", "p50_total_ticks", "p95_total_ticks"],
+            "type": "object"
+          },
+          "minItems": 3,
+          "maxItems": 3,
+          "type": "array"
+        },
+        "pooled_preview": {"$ref": "#/$defs/pooledPreview"}
+      },
+      "required": ["started_utc", "completed_utc", "fresh_cold_boots", "retained_samples", "timeout_seconds_per_boot", "end_uniqueness_guard_seconds", "power_and_flash_control", "serial", "boots", "cross_boot_stability", "pooled_preview"],
+      "type": "object"
+    },
+    "distribution": {
+      "additionalProperties": false,
+      "properties": {
+        "samples": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "min": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p50": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p95": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mean": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "samples",
+        "min",
+        "p50",
+        "p95",
+        "max",
+        "mean"
+      ],
+      "type": "object"
+    },
+    "c83Precondition": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "verified-complete"
+        },
+        "source_commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "challenge": {
+          "$ref": "#/$defs/hex64"
+        },
+        "run_id": {
+          "$ref": "#/$defs/hex64"
+        },
+        "tree_digest_algorithm": {
+          "const": "sha256(domain-NUL,path-NUL,length-NUL,bytes)*"
+        },
+        "tree_sha256": {
+          "$ref": "#/$defs/hex64"
+        },
+        "git_tree_oid": {
+          "pattern": "^[0-9a-f]{40,64}$",
+          "type": "string"
+        },
+        "results": {
+          "$ref": "#/$defs/identity"
+        },
+        "verifier": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "const": "scripts/verify-c83-evidence.py"
+            },
+            "sha256": {
+              "$ref": "#/$defs/hex64"
+            },
+            "bytes": {
+              "$ref": "#/$defs/positiveInteger"
+            }
+          },
+          "required": [
+            "path",
+            "sha256",
+            "bytes"
+          ],
+          "type": "object"
+        },
+        "c84_preparation_commit": {
+          "$ref": "#/$defs/hex40"
+        },
+        "commit_tree_byte_match": {
+          "const": true
+        }
+      },
+      "required": [
+        "status",
+        "source_commit",
+        "challenge",
+        "run_id",
+        "tree_digest_algorithm",
+        "tree_sha256",
+        "git_tree_oid",
+        "results",
+        "verifier",
+        "c84_preparation_commit",
+        "commit_tree_byte_match"
+      ],
+      "type": "object"
+    },
+    "captureEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "vibeos.c84.duo-aot-decision.capture-envelope"
+        },
+        "version": {
+          "const": 2
+        },
+        "status": {
+          "const": "closed"
+        },
+        "content_sha256": {
+          "$ref": "#/$defs/hex64"
+        },
+        "content": {
+          "additionalProperties": false,
+          "properties": {
+            "platform": {
+              "const": "milkv-duo-cv1800b"
+            },
+            "source_commit": {
+              "$ref": "#/$defs/hex40"
+            },
+            "git_head": {
+              "$ref": "#/$defs/hex40"
+            },
+            "challenge": {
+              "$ref": "#/$defs/hex64"
+            },
+            "run_id": {
+              "$ref": "#/$defs/hex64"
+            },
+            "workload_id": {
+              "const": "ssh-case-filter-12k-v1"
+            },
+            "c83_precondition": {
+              "$ref": "#/$defs/c83Precondition"
+            },
+            "artifacts": {
+              "$ref": "#/$defs/artifactIdentities"
+            },
+            "artifact_custody": {
+              "additionalProperties": false,
+              "properties": {
+                "build_envelope": {"$ref": "#/$defs/contentFileIdentity"},
+                "package_envelope": {"$ref": "#/$defs/contentFileIdentity"},
+                "package_image_verifier_audit": {"$ref": "#/$defs/fileIdentity"},
+                "source_materialization_envelope": {"$ref": "#/$defs/contentFileIdentity"},
+                "package_runtime_attestation": {"$ref": "#/$defs/contentFileIdentity"},
+                "verifier_runtime_attestation": {"$ref": "#/$defs/contentFileIdentity"},
+                "container_runtime_closure": {"$ref": "#/$defs/contentFileIdentity"}
+              },
+              "required": ["build_envelope", "package_envelope", "package_image_verifier_audit", "source_materialization_envelope", "package_runtime_attestation", "verifier_runtime_attestation", "container_runtime_closure"],
+              "type": "object"
+            },
+            "provenance": {
+              "additionalProperties": false,
+              "properties": {
+                "source_materialization": {"$ref": "#/$defs/sourceMaterializationEnvelope"},
+                "container_runtime": {"$ref": "#/$defs/containerRuntimeEnvelope"}
+              },
+              "required": ["source_materialization", "container_runtime"],
+              "type": "object"
+            },
+            "capture": {
+              "$ref": "#/$defs/captureRecord"
+            },
+            "evidence_tools": {
+              "$ref": "#/$defs/toolIdentities"
+            }
+          },
+          "required": [
+            "platform",
+            "source_commit",
+            "git_head",
+            "challenge",
+            "run_id",
+            "workload_id",
+            "c83_precondition",
+            "artifacts",
+            "artifact_custody",
+            "provenance",
+            "capture",
+            "evidence_tools"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "schema",
+        "version",
+        "status",
+        "content_sha256",
+        "content"
+      ],
+      "type": "object"
+    },
+    "decisionEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "const": "vibeos.c84.aot-decision.evidence"
+        },
+        "version": {
+          "const": 2
+        },
+        "status": {
+          "const": "closed"
+        },
+        "content_sha256": {
+          "$ref": "#/$defs/hex64"
+        },
+        "content": {
+          "additionalProperties": false,
+          "properties": {
+            "suite_id": {
+              "const": "vibeos.c84.aot-decision"
+            },
+            "workload_revision": {
+              "const": 1
+            },
+            "source_commit": {
+              "$ref": "#/$defs/hex40"
+            },
+            "challenge": {
+              "$ref": "#/$defs/hex64"
+            },
+            "run_id": {
+              "$ref": "#/$defs/hex64"
+            },
+            "platform": {
+              "const": "milkv-duo-cv1800b"
+            },
+            "workload_id": {
+              "const": "ssh-case-filter-12k-v1"
+            },
+            "evidence_scope": {
+              "const": "three-distinct-physical-cold-boots"
+            },
+            "c83_precondition": {
+              "$ref": "#/$defs/c83Precondition"
+            },
+            "c84_preparation": {
+              "additionalProperties": false,
+              "properties": {
+                "commit": {"$ref": "#/$defs/hex40"},
+                "contracts": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "README.md": {"$ref": "#/$defs/identity"},
+                    "schema-v1.json": {"$ref": "#/$defs/identity"},
+                    "workloads-v1.json": {"$ref": "#/$defs/identity"},
+                    "evidence-schema-v2.json": {"$ref": "#/$defs/identity"}
+                  },
+                  "required": ["README.md", "schema-v1.json", "workloads-v1.json", "evidence-schema-v2.json"],
+                  "type": "object"
+                },
+                "tools": {"$ref": "#/$defs/toolIdentities"}
+              },
+              "required": ["commit", "contracts", "tools"],
+              "type": "object"
+            },
+            "provenance": {
+              "additionalProperties": false,
+              "properties": {
+                "source_materialization": {"$ref": "#/$defs/sourceMaterializationEnvelope"},
+                "container_runtime": {"$ref": "#/$defs/containerRuntimeEnvelope"}
+              },
+              "required": ["source_materialization", "container_runtime"],
+              "type": "object"
+            },
+            "capture_evidence": {
+              "additionalProperties": false,
+              "properties": {
+                "capture_envelope": {"$ref": "#/$defs/contentFileIdentity"},
+                "build_envelope": {"$ref": "#/$defs/contentFileIdentity"},
+                "package_envelope": {"$ref": "#/$defs/contentFileIdentity"},
+                "package_image_verifier_audit": {"$ref": "#/$defs/fileIdentity"},
+                "source_materialization_envelope": {"$ref": "#/$defs/contentFileIdentity"},
+                "package_runtime_attestation": {"$ref": "#/$defs/contentFileIdentity"},
+                "verifier_runtime_attestation": {"$ref": "#/$defs/contentFileIdentity"},
+                "container_runtime_closure": {"$ref": "#/$defs/contentFileIdentity"}
+              },
+              "required": ["capture_envelope", "build_envelope", "package_envelope", "package_image_verifier_audit", "source_materialization_envelope", "package_runtime_attestation", "verifier_runtime_attestation", "container_runtime_closure"],
+              "type": "object"
+            },
+            "population": {
+              "additionalProperties": false,
+              "properties": {
+                "cold_boots": {"const": 3},
+                "warmups_per_boot": {"const": 3},
+                "retained_per_boot": {"const": 21},
+                "retained_samples": {"const": 63},
+                "raw_transcript_sha256": {"items": {"$ref": "#/$defs/hex64"}, "minItems": 3, "maxItems": 3, "uniqueItems": true, "type": "array"},
+                "record_stream_sha256": {"items": {"$ref": "#/$defs/hex64"}, "minItems": 3, "maxItems": 3, "uniqueItems": true, "type": "array"},
+                "boot_summary_sha256": {"items": {"$ref": "#/$defs/hex64"}, "minItems": 3, "maxItems": 3, "uniqueItems": true, "type": "array"},
+                "qemu_inputs": {"const": 0}
+              },
+              "required": ["cold_boots", "warmups_per_boot", "retained_per_boot", "retained_samples", "raw_transcript_sha256", "record_stream_sha256", "boot_summary_sha256", "qemu_inputs"],
+              "type": "object"
+            },
+            "statistics": {
+              "additionalProperties": false,
+              "properties": {
+                "total_ticks": {
+                  "$ref": "#/$defs/distribution"
+                },
+                "interpretation_ticks": {
+                  "$ref": "#/$defs/distribution"
+                },
+                "non_interpretation_ticks": {
+                  "$ref": "#/$defs/distribution"
+                }
+              },
+              "required": [
+                "total_ticks",
+                "interpretation_ticks",
+                "non_interpretation_ticks"
+              ],
+              "type": "object"
+            },
+            "decision": {
+              "additionalProperties": false,
+              "properties": {
+                "budget_ticks": {
+                  "const": 2500000
+                },
+                "budget_miss": {
+                  "type": "boolean"
+                },
+                "interpretation_attribution": {
+                  "type": "boolean"
+                },
+                "candidate_for_c85_design_review": {
+                  "type": "boolean"
+                },
+                "outcome": {
+                  "enum": [
+                    "aot-eligible-for-c85-design-review",
+                    "aot-not-justified"
+                  ]
+                },
+                "aot_authorized": {
+                  "const": false
+                },
+                "native_code_accepted": {
+                  "const": false
+                }
+              },
+              "required": [
+                "budget_ticks",
+                "budget_miss",
+                "interpretation_attribution",
+                "candidate_for_c85_design_review",
+                "outcome",
+                "aot_authorized",
+                "native_code_accepted"
+              ],
+              "type": "object"
+            },
+            "limitations": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "minItems": 1,
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "suite_id",
+            "workload_revision",
+            "source_commit",
+            "challenge",
+            "run_id",
+            "platform",
+            "workload_id",
+            "evidence_scope",
+            "c83_precondition",
+            "c84_preparation",
+            "provenance",
+            "capture_evidence",
+            "population",
+            "statistics",
+            "decision",
+            "limitations"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "schema",
+        "version",
+        "status",
+        "content_sha256",
+        "content"
+      ],
+      "type": "object"
+    }
+  }
+}

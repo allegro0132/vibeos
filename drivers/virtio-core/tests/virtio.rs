@@ -60,8 +60,10 @@ fn modern_mmio_constants_match_virtio_1_2() {
     assert_eq!(MMIO_QUEUE_DEVICE_LOW_OFFSET, 0x0a0);
     assert_eq!(MMIO_CONFIG_GENERATION_OFFSET, 0x0fc);
     assert_eq!(MMIO_CONFIG_OFFSET, 0x100);
-    assert_eq!(SPLIT_QUEUE_SIZE, 128);
+    assert_eq!(BLOCK_QUEUE_SIZE, 128);
     assert_eq!(NET_QUEUE_SIZE, 8);
+    assert_eq!(ENTROPY_QUEUE_SIZE, 8);
+    assert_eq!(MAX_SPLIT_QUEUE_SIZE, BLOCK_QUEUE_SIZE);
 }
 
 #[test]
@@ -407,10 +409,10 @@ fn split_ring_wire_types_have_the_required_layout() {
     assert_eq!(size_of::<UsedElement>(), 8);
     assert_eq!(
         size_of::<AvailableRing>(),
-        4 + 2 * SPLIT_QUEUE_SIZE as usize
+        4 + 2 * MAX_SPLIT_QUEUE_SIZE as usize
     );
     assert_eq!(align_of::<AvailableRing>(), 2);
-    assert_eq!(size_of::<UsedRing>(), 4 + 8 * SPLIT_QUEUE_SIZE as usize);
+    assert_eq!(size_of::<UsedRing>(), 4 + 8 * MAX_SPLIT_QUEUE_SIZE as usize);
     assert_eq!(align_of::<UsedRing>(), 4);
     assert_eq!(size_of::<BlockRequestHeader>(), 16);
 }
@@ -631,11 +633,17 @@ fn used_length_bounds_and_block_status_values_match_block_protocol() {
 
 #[test]
 fn ring_index_helpers_use_u16_wrapping_and_queue_modulo() {
-    assert_eq!(ring_slot(0), 0);
-    assert_eq!(ring_slot(7), 7);
-    assert_eq!(ring_slot(127), 127);
-    assert_eq!(ring_slot(128), 0);
-    assert_eq!(ring_slot(u16::MAX), 127);
+    assert_eq!(block_ring_slot(0), 0);
+    assert_eq!(block_ring_slot(7), 7);
+    assert_eq!(block_ring_slot(127), 127);
+    assert_eq!(block_ring_slot(128), 0);
+    assert_eq!(block_ring_slot(u16::MAX), 127);
+    assert_eq!(net_ring_slot(7), 7);
+    assert_eq!(net_ring_slot(8), 0);
+    assert_eq!(net_ring_slot(u16::MAX), 7);
+    assert_eq!(entropy_ring_slot(7), 7);
+    assert_eq!(entropy_ring_slot(8), 0);
+    assert_eq!(entropy_ring_slot(u16::MAX), 7);
     assert_eq!(advance_ring_index(u16::MAX), 0);
     assert!(used_advanced_once(u16::MAX, 0));
     assert!(!used_advanced_once(u16::MAX, 1));
@@ -764,13 +772,13 @@ fn every_malformed_used_field_quarantines_dma_until_reset() {
                 .complete(
                     submission,
                     1,
-                    UsedElement::new(SPLIT_QUEUE_SIZE as u32, 513),
+                    UsedElement::new(BLOCK_QUEUE_SIZE as u32, 513),
                     BLOCK_STATUS_OK,
                 )
                 .unwrap_err()
         },
         QueueError::UsedIdOutOfRange {
-            observed: SPLIT_QUEUE_SIZE as u32,
+            observed: BLOCK_QUEUE_SIZE as u32,
         },
     );
     assert_malformed_completion(
@@ -952,7 +960,7 @@ fn queue_ring_indices_really_cross_the_u16_boundary() {
     }
     let last = last.unwrap();
     assert_eq!(last.available_index, 0);
-    assert_eq!(last.available_slot, SPLIT_QUEUE_SIZE - 1);
+    assert_eq!(last.available_slot, BLOCK_QUEUE_SIZE - 1);
     assert_eq!(queue.available_index(), 0);
     assert_eq!(queue.used_index(), 0);
     assert_eq!(queue.state(), QueueState::Idle);

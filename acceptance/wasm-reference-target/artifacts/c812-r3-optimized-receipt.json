@@ -1,0 +1,20 @@
+{
+  "challenge": "156fb2e70c19c7a8bf09d60f23ad543143bfa803abff9f9563bcf9b942faca74",
+  "elf_audit_sha256": "990a3b4bd72ac7bca498c430538fca65db20cecc3cebb85b4c7eba28559927a8",
+  "environment_evidence_sha256": "3c0c6569ceb3a221ef1af90b0e9e0c998f33486983fd84aa8a2113073d80e641",
+  "environment_sha256": "42cca28e9a298e56cc06f533c61e5848097bfb9f323e9ec28911320ef786712b",
+  "kernel_sha256": "f84b68fdd1962c1e152a1f1338230b13b0a32cc055d07ebce53bfc98b50ac335",
+  "mode": "optimized",
+  "physical_inputs": 0,
+  "physical_provenance": "not-claimed",
+  "records": 9,
+  "run_id": "fc40fbd874b274e786ad96f1f88b1b27251c7d9037654599bd30cefa623a8a2e",
+  "schema": "vibeos.c812.r3.reference-fixed-qemu.receipt",
+  "semantic_sha256": "bf33470617822af905ab8877797416e79aed3cde5a257689b3bbdda4df156279",
+  "source_commit": "43516cd6fe4d88c583f681714950884dc8660d4c",
+  "source_tree": "89ca3d099ef3981cc2d760a8993d47d5a6585cc7",
+  "status": "pass",
+  "uart_bytes": 5648,
+  "uart_sha256": "183df517ddbd94a1607f51edd80f19f2e734d542c880333f7b212c396eb727de",
+  "version": 1
+}

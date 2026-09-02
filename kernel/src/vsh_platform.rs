@@ -365,12 +365,18 @@ const NETWORK_COMMANDS: &[CommandSpec] = &[
 ];
 
 fn vsh_ps(_args: &[String]) -> Result<String, Status> {
-    let mut output = String::from("COMPONENT TASK NAME CSPACE STATE POLLS BUDGET\n");
+    let mut output = String::from("NAME STATE POLLS LIVE PEAK BUDGET DENIED\n");
     for component in world().components() {
         let c = component.snapshot();
         output.push_str(&format!(
             "{} {} {} {} {} {} {}\n",
-            c.id, c.task_id, c.name, c.cspace, c.state, c.polls, c.memory.budget_bytes
+            c.name,
+            c.state,
+            c.polls,
+            c.memory.live_bytes,
+            c.memory.peak_bytes,
+            c.memory.budget_bytes,
+            c.memory.denials,
         ));
     }
     Ok(output)

@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use vibeos_core::cap::{
-    grant, CSpace, CapError, PersistentInstallError, PersistentResourceWitness, Resource, Rights,
-    ScopedResource, CAPABILITY_TABLE_PAGE_SIZE, MAX_PERSISTENT_SLOTS,
+    grant, CSpace, CSpaceResetError, CapError, PersistentInstallError, PersistentResourceWitness,
+    Resource, Rights, ScopedResource, CAPABILITY_TABLE_PAGE_SIZE, MAX_PERSISTENT_SLOTS,
 };
 use vibeos_core::heap::{current_owner, enter_owner, OwnerId};
 use vibeos_durable_format::{
@@ -111,6 +111,100 @@ impl Resource for Liar {
 
 fn space() -> (CSpace, Arc<Widget>) {
     (CSpace::new("test"), Arc::new(Widget("w")))
+}
+
+#[test]
+fn cspace_identity_is_unique_redacted_and_stable_across_reset() {
+    let mut first = CSpace::new("first");
+    let second = CSpace::new("second");
+    let first_identity = first.identity();
+
+    assert_ne!(first_identity, second.identity());
+    assert_eq!(format!("{first_identity:?}"), "CSpaceIdentity(<redacted>)");
+    assert!(!format!("{first_identity:?}").contains(char::is_numeric));
+
+    assert_eq!(first.incarnation(), 1);
+    assert_eq!(first.reset(), 0);
+    assert_eq!(first.identity(), first_identity);
+    assert_eq!(first.incarnation(), 2);
+}
+
+#[test]
+fn exact_cspace_reset_rejects_identity_incarnation_and_aba_without_mutation() {
+    let mut space = CSpace::new("exact-reset");
+    let other = CSpace::new("foreign-reset");
+    let identity = space.identity();
+    let incarnation = space.incarnation();
+    let cap = space.mint(Arc::new(Widget("live")), Rights::READ);
+
+    assert_eq!(
+        space.reset_exact(other.identity(), incarnation),
+        Err(CSpaceResetError::IdentityMismatch)
+    );
+    assert_eq!(space.identity(), identity);
+    assert_eq!(space.incarnation(), incarnation);
+    assert_eq!(
+        space.lookup_as::<Widget>(cap, Rights::READ).unwrap().0,
+        "live"
+    );
+
+    assert_eq!(
+        space.reset_exact(identity, incarnation + 1),
+        Err(CSpaceResetError::IncarnationMismatch)
+    );
+    assert_eq!(space.incarnation(), incarnation);
+    assert!(space.lookup_as::<Widget>(cap, Rights::READ).is_ok());
+
+    assert_eq!(space.preflight_reset_exact(identity, incarnation), Ok(()));
+    assert_eq!(space.incarnation(), incarnation);
+    assert!(
+        space.lookup_as::<Widget>(cap, Rights::READ).is_ok(),
+        "reset preflight must not revoke live authority"
+    );
+
+    assert_eq!(space.reset_exact(identity, incarnation), Ok(1));
+    assert_eq!(space.incarnation(), incarnation + 1);
+    assert_eq!(
+        space.lookup(cap, Rights::READ).err(),
+        Some(CapError::Invalid)
+    );
+    let fresh = space.mint(Arc::new(Widget("fresh")), Rights::READ);
+
+    assert_eq!(
+        space.preflight_reset_exact(identity, incarnation),
+        Err(CSpaceResetError::IncarnationMismatch)
+    );
+
+    assert_eq!(
+        space.reset_exact(identity, incarnation),
+        Err(CSpaceResetError::IncarnationMismatch),
+        "a repeated stale reset cannot cross the incarnation boundary"
+    );
+    assert_eq!(space.incarnation(), incarnation + 1);
+    assert_eq!(
+        space.lookup_as::<Widget>(fresh, Rights::READ).unwrap().0,
+        "fresh",
+        "a stale reset cannot revoke authority from the replacement incarnation"
+    );
+}
+
+#[test]
+fn exact_admin_revoke_never_targets_a_reused_slot() {
+    let mut space = CSpace::new("exact-admin-revoke");
+    let stale = space.mint(Arc::new(Widget("old")), Rights::READ);
+    assert_eq!(space.revoke_slot(stale.slot()), 1);
+    let replacement = space.mint(Arc::new(Widget("replacement")), Rights::READ);
+    assert_eq!(replacement.slot(), stale.slot());
+    assert_ne!(replacement, stale);
+
+    assert_eq!(space.revoke_exact_admin(stale), Err(CapError::Invalid));
+    assert_eq!(
+        space
+            .lookup_as::<Widget>(replacement, Rights::READ)
+            .unwrap()
+            .0,
+        "replacement",
+    );
 }
 
 fn stable<T>(value: u128, constructor: fn(u128) -> Option<T>) -> T {
@@ -969,6 +1063,10 @@ fn committed_root_and_child_install_with_exact_identity_and_attenuation() {
     );
     assert_eq!(cs.revoke_slot(child_cap.slot()), 0);
     assert_eq!(cs.revoke_all(), 0);
+    assert_eq!(
+        cs.reset_exact(cs.identity(), incarnation),
+        Err(CSpaceResetError::PersistentLifecycleRequired)
+    );
     assert_eq!(cs.reset(), 0);
     assert_eq!(cs.incarnation(), incarnation);
     assert_eq!(cs.list().len(), 2);
@@ -977,7 +1075,6 @@ fn committed_root_and_child_install_with_exact_identity_and_attenuation() {
         grant(&cs, root_cap, Rights::READ, &mut other).err(),
         Some(CapError::PersistentLifecycleRequired)
     );
-
     assert_eq!(
         cs.complete_persistent_revoke(&root, child.identity())
             .unwrap(),

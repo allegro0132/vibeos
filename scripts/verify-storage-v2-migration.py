@@ -9,8 +9,9 @@ import importlib.util
 import json
 import struct
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 BLOCK = 512
 PAGE = 4096
@@ -583,7 +584,32 @@ def exact_policy_objects(state: Any) -> dict[int, tuple[int, bytes, int]]:
     return {object_id: state.objects[object_id] for object_id in sorted(selected_ids)}
 
 
-def parse_authority_snapshot(payload: bytes, checkpoint_generation: int) -> dict[str, Any]:
+@dataclass(frozen=True)
+class AuthorityPolicy:
+    """Immutable parser authority supplied by the verifier's caller."""
+
+    external_policy: bytes
+    exact_objects: Callable[[Any], dict[int, tuple[int, bytes, int]]]
+
+    def __post_init__(self) -> None:
+        require(
+            isinstance(self.external_policy, bytes) and bool(self.external_policy),
+            "external authority policy must be non-empty immutable bytes",
+        )
+        require(callable(self.exact_objects), "exact authority selector is not callable")
+
+
+# Capture the legacy policy once. Parser behavior must not depend on mutable
+# module attributes or on which verifier happened to be imported first.
+DEFAULT_AUTHORITY_POLICY = AuthorityPolicy(EXTERNAL_POLICY, exact_policy_objects)
+
+
+def parse_authority_snapshot(
+    payload: bytes,
+    checkpoint_generation: int,
+    *,
+    authority_policy: AuthorityPolicy = DEFAULT_AUTHORITY_POLICY,
+) -> dict[str, Any]:
     require(
         AUTHORITY_HEADER_LEN <= len(payload) <= MAX_AUTHORITY_BYTES,
         "persistent authority payload length is invalid",
@@ -603,7 +629,8 @@ def parse_authority_snapshot(payload: bytes, checkpoint_generation: int) -> dict
     record_count = u32(payload, 0x40)
     require(
         generation == checkpoint_generation
-        and policy_sha256 == hashlib.sha256(EXTERNAL_POLICY).digest(),
+        and policy_sha256
+        == hashlib.sha256(authority_policy.external_policy).digest(),
         "persistent authority generation or external policy commitment differs",
     )
     require(
@@ -983,6 +1010,7 @@ def reconstruct_v2_checkpoint(
     structural: dict[str, Any],
     *,
     require_authority: bool,
+    authority_policy: AuthorityPolicy = DEFAULT_AUTHORITY_POLICY,
 ) -> dict[str, Any]:
     checkpoint = structural["checkpoint"]
     require(checkpoint is not None, "V2 has no selected checkpoint")
@@ -1069,9 +1097,13 @@ def reconstruct_v2_checkpoint(
         )
         authority_generation = authority_extent["binding"]["target_checkpoint_generation"]
         require(authority_generation <= generation, "V2 authority targets a future checkpoint")
-        authority = parse_authority_snapshot(authority_payload, authority_generation)
+        authority = parse_authority_snapshot(
+            authority_payload,
+            authority_generation,
+            authority_policy=authority_policy,
+        )
         authority_state = recover_record_stream(authority["record_stream"])
-        authority_objects = exact_policy_objects(authority_state)
+        authority_objects = authority_policy.exact_objects(authority_state)
     else:
         require(
             authority_pointer["status"] == "null" and not require_authority,
@@ -1481,6 +1513,8 @@ def verify_v2_checkpoint_fallbacks(
     structural: dict[str, Any],
     superblock: dict[str, Any],
     selected_recovered: dict[str, Any],
+    *,
+    authority_policy: AuthorityPolicy = DEFAULT_AUTHORITY_POLICY,
 ) -> int:
     slots = v2_checkpoint_slots(region)
     sealed = sorted(
@@ -1506,7 +1540,10 @@ def verify_v2_checkpoint_fallbacks(
             candidate_structural = dict(structural)
             candidate_structural["checkpoint"] = checkpoint
             recovered_by_generation[generation] = reconstruct_v2_checkpoint(
-                region, candidate_structural, require_authority=False
+                region,
+                candidate_structural,
+                require_authority=False,
+                authority_policy=authority_policy,
             )
     if len(sealed) == 2:
         older, newer = sealed
@@ -1547,7 +1584,11 @@ def v2_managed_end(image: bytes | bytearray) -> int:
     return end
 
 
-def probe_v2(image: bytes | bytearray) -> tuple[str, dict[str, Any] | None]:
+def probe_v2(
+    image: bytes | bytearray,
+    *,
+    authority_policy: AuthorityPolicy = DEFAULT_AUTHORITY_POLICY,
+) -> tuple[str, dict[str, Any] | None]:
     first = V2_FIRST * BLOCK
     region = memoryview(image)[first:v2_managed_end(image)]
     if not any(region):
@@ -1584,10 +1625,17 @@ def probe_v2(image: bytes | bytearray) -> tuple[str, dict[str, Any] | None]:
             )
             return "absent", base
         recovered = reconstruct_v2_checkpoint(
-            region, structural, require_authority=True
+            region,
+            structural,
+            require_authority=True,
+            authority_policy=authority_policy,
         )
         fallback_copies = verify_v2_checkpoint_fallbacks(
-            region, structural, superblock, recovered
+            region,
+            structural,
+            superblock,
+            recovered,
+            authority_policy=authority_policy,
         )
         return "valid", {
             **base,
@@ -2023,14 +2071,20 @@ def canonical_empty_record_stream() -> bytes:
     return legacy_codec.encode_record(legacy_codec.FORMAT, b"", 1, 0, 0)
 
 
-def canonical_empty_authority_payload(checkpoint_generation: int) -> bytes:
+def canonical_empty_authority_payload(
+    checkpoint_generation: int,
+    *,
+    authority_policy: AuthorityPolicy = DEFAULT_AUTHORITY_POLICY,
+) -> bytes:
     record_stream = canonical_empty_record_stream()
     payload = bytearray(AUTHORITY_HEADER_LEN + AUTHORITY_PRINCIPAL_LEN + len(record_stream))
     payload[:8] = AUTHORITY_MAGIC
     put_u16(payload, 0x08, AUTHORITY_VERSION)
     put_u16(payload, 0x0A, AUTHORITY_HEADER_LEN)
     put_u64(payload, 0x10, checkpoint_generation)
-    payload[0x18:0x38] = hashlib.sha256(EXTERNAL_POLICY).digest()
+    payload[0x18:0x38] = hashlib.sha256(
+        authority_policy.external_policy
+    ).digest()
     struct.pack_into("<III", payload, 0x38, 0, 1, 1)
     struct.pack_into(
         "<III", payload, 0x44, AUTHORITY_OBJECT_LEN, AUTHORITY_PRINCIPAL_LEN, BLOCK
@@ -2049,7 +2103,11 @@ def canonical_empty_authority_payload(checkpoint_generation: int) -> bytes:
     payload[record_at:] = record_stream
     # Exercise the independent decoder too; hash construction alone must not
     # accidentally bless a malformed expected fixture.
-    parsed = parse_authority_snapshot(bytes(payload), checkpoint_generation)
+    parsed = parse_authority_snapshot(
+        bytes(payload),
+        checkpoint_generation,
+        authority_policy=authority_policy,
+    )
     require(not parsed["objects"], "canonical native authority selected an object")
     return bytes(payload)
 
@@ -2060,6 +2118,8 @@ def verify_image(
     frozen_m4_baseline: bytes | None = None,
     expect_native: bool = False,
     expect_file_tree: bool = False,
+    *,
+    authority_policy: AuthorityPolicy = DEFAULT_AUTHORITY_POLICY,
 ) -> dict[str, Any]:
     require(len(image) % BLOCK == 0, "image is not logical-block aligned")
     require(
@@ -2089,7 +2149,7 @@ def verify_image(
     ]
     selected = select_control(slots)
     m4 = probe_m4(image)
-    v2, v2_evidence = probe_v2(image)
+    v2, v2_evidence = probe_v2(image, authority_policy=authority_policy)
     native = (
         selected is not None
         and selected["state"] == "rollback_closed"
@@ -2154,7 +2214,9 @@ def verify_image(
             current = v2_evidence["authority_generation"]
             require(floor == 2, "native V2 initialization floor is not generation 2")
             require(current >= floor, "native V2 checkpoint predates its initialization floor")
-            expected_floor = canonical_empty_authority_payload(floor)
+            expected_floor = canonical_empty_authority_payload(
+                floor, authority_policy=authority_policy
+            )
             require(
                 selected["activation_authority_sha256"]
                 == hashlib.sha256(expected_floor).hexdigest(),
@@ -2174,7 +2236,7 @@ def verify_image(
                 empty_stream, current_stream
             )
             require(
-                not exact_policy_objects(empty_state),
+                not authority_policy.exact_objects(empty_state),
                 "canonical native authority unexpectedly confers object authority",
             )
             require(
@@ -2226,7 +2288,7 @@ def verify_image(
                 )
                 require(
                     v2_evidence["recovered"]["authority_objects"]
-                    == exact_policy_objects(m4_state),
+                    == authority_policy.exact_objects(m4_state),
                     "activation-floor object set differs from frozen M4",
                 )
                 equivalence["source"] = "frozen_m4_exact"
@@ -2481,6 +2543,53 @@ def selftest() -> dict[str, Any]:
         "canonical native authority fixture is not exact",
     )
     cases += 1
+
+    foreign_policy = AuthorityPolicy(
+        b"vibeos.storage-v2.selftest.foreign-policy.v1",
+        lambda _state: {},
+    )
+    foreign_authority = canonical_empty_authority_payload(
+        2, authority_policy=foreign_policy
+    )
+    parse_authority_snapshot(
+        foreign_authority, 2, authority_policy=foreign_policy
+    )
+    for payload, policy in (
+        (foreign_authority, DEFAULT_AUTHORITY_POLICY),
+        (native_authority, foreign_policy),
+    ):
+        try:
+            parse_authority_snapshot(payload, 2, authority_policy=policy)
+        except Violation:
+            cases += 1
+        else:
+            raise Violation("authority bytes were accepted under a foreign parser policy")
+
+    # The compatibility names remain public constants, but parser defaults
+    # capture their immutable values once and cannot be changed by an import
+    # side effect or by the pre-C7.8 monkeypatch pattern.
+    module_globals = globals()
+    saved_external_policy = module_globals["EXTERNAL_POLICY"]
+    saved_exact_objects = module_globals["exact_policy_objects"]
+    try:
+        module_globals["EXTERNAL_POLICY"] = foreign_policy.external_policy
+        module_globals["exact_policy_objects"] = foreign_policy.exact_objects
+        require(
+            canonical_empty_authority_payload(2) == native_authority,
+            "mutable compatibility names contaminated the default parser policy",
+        )
+        parse_authority_snapshot(native_authority, 2)
+    finally:
+        module_globals["EXTERNAL_POLICY"] = saved_external_policy
+        module_globals["exact_policy_objects"] = saved_exact_objects
+    cases += 1
+
+    try:
+        foreign_policy.external_policy = EXTERNAL_POLICY  # type: ignore[misc]
+    except (AttributeError, TypeError):
+        cases += 1
+    else:
+        raise Violation("AuthorityPolicy is mutable")
 
     # Bindings are canonical by stable ObjectId. A delayed grant may allocate
     # its fresh, independently revocable V2 ObjectId after a later stable

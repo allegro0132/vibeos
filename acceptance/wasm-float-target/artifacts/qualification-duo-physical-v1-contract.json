@@ -1,0 +1,156 @@
+{
+  "schema": "vibeos.c88.f5.float-target.duo-physical-v1.contract",
+  "version": 1,
+  "suite_id": "vibeos.c88.f5.float-target.duo-physical-v1",
+  "scope": "host-verifier-only-physical-campaign-contract",
+  "status": "non-evidence",
+  "separation": {
+    "readiness_suite_id": "vibeos.c88.f5.float-target.duo-v1",
+    "readiness_run_id_domain_ascii": "vibeos.c88.f5.float-target.duo-v1.run.v1",
+    "physical_run_id_domain_ascii": "vibeos.c88.f5.float-target.duo-physical-v1.run.v1",
+    "qemu_suite_id": "vibeos.c88.f5.float-target",
+    "c84_suite_id": "vibeos.c84.aot-decision",
+    "readiness_sentinel_never_promotable": true,
+    "readiness_elf_never_promotable": true,
+    "readiness_patch_is_not_arming": true,
+    "cross_suite_evidence_forbidden": true
+  },
+  "run_id": {
+    "algorithm": "sha256",
+    "domain_ascii": "vibeos.c88.f5.float-target.duo-physical-v1.run.v1",
+    "domain_nul_terminated": true,
+    "nul_separated_fields": [
+      "source_commit",
+      "source_tree",
+      "challenge",
+      "contract_sha256",
+      "transcript_schema_sha256",
+      "candidate_sha256"
+    ]
+  },
+  "platform": {
+    "id": "milkv-duo-cv1800b-c906-v1",
+    "class": "physical-target",
+    "target": "riscv64imac-unknown-none-elf",
+    "physical_provenance": "not-claimed"
+  },
+  "formal_bindings": {
+    "required": true,
+    "source_commit_lower_hex_bytes": 20,
+    "source_tree_lower_hex_bytes": 20,
+    "challenge_lower_hex_bytes": 32,
+    "contract_sha256_source": "sha256-of-this-checked-in-contract-bytes",
+    "transcript_schema_sha256_source": "sha256-of-checked-in-transcript-schema-bytes",
+    "candidate_sha256": "5fdb9dc9a48a9c54e899a5dc724445083c055dbf0d664927ba55d9780cc9996a",
+    "all_zero_forbidden": true,
+    "readiness_sentinels_forbidden": true,
+    "readiness_run_id_forbidden": "c5c8ec42e56fbeaf38106965e5ec6735cb86a93af530cd37f5002dba1971b4ac"
+  },
+  "future_physical_producer": {
+    "separate_feature_required": true,
+    "acceptance_feature": "c88-f5-duo-physical-qualification",
+    "kernel_image_feature": "wasm-c88-f5-float-duo-physical-qualification",
+    "default_off_required": true,
+    "explicit_arm_acknowledgement_required": true,
+    "arm_marker": "vibeos.c88.f5.duo.physical-qualification.arm=1",
+    "readiness_feature_reuse_forbidden": true,
+    "readiness_arm_marker_forbidden": "vibeos.c88.f5.duo.compile-readiness.arm=0",
+    "producer_present_in_this_node": false
+  },
+  "shared_qualification": {
+    "routine": "vibeos_wasm_float_target::qualify",
+    "semantic_sha256_domain_ascii": "vibeos.c88.f5.float-target.semantic.v1",
+    "semantic_domain_nul_terminated": true,
+    "semantic_sha256": "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1",
+    "candidate_sha256": "5fdb9dc9a48a9c54e899a5dc724445083c055dbf0d664927ba55d9780cc9996a",
+    "artifact_profile_code": 5,
+    "artifact_stage": "validation-only",
+    "execution_enabled": false,
+    "current_validation_engine": false,
+    "current_component_engine": false,
+    "records": {
+      "core": 146,
+      "canonical_abi": 13,
+      "component_vectors": 12,
+      "fuel": 1000,
+      "lifecycle": 5,
+      "total": 1176
+    }
+  },
+  "verifier_only": {
+    "producer_present": false,
+    "physical_feature_present": false,
+    "execution_arm_present": false,
+    "image_present": false,
+    "package_present": false,
+    "capture_present": false,
+    "device_access_permitted": false,
+    "serial_access_permitted": false,
+    "flash_permitted": false,
+    "reset_permitted": false,
+    "physical_evidence_present": false
+  },
+  "single_boot_verification": {
+    "grammar": [
+      "metadata:1",
+      "core:146",
+      "canonical-abi:13",
+      "component-vectors:12",
+      "fuel:1000",
+      "lifecycle:5",
+      "end:1",
+      "pass:1"
+    ],
+    "strict_semantic_oracle_required": true,
+    "semantic_digest_recomputation_required": true,
+    "terminal_pass_is_not_physical_provenance": true,
+    "operator_power_cycle_confirmed": false,
+    "operator_cold_boot_confirmed": false,
+    "capture_boot_id_present": false,
+    "terminal_quiescence_verified": false,
+    "operator_power_off_confirmed": false
+  },
+  "future_three_boot_gate": {
+    "operator_confirmed_power_cycles_required": 3,
+    "operator_confirmed_cold_boots_required": 3,
+    "independent_cold_boots_required": true,
+    "required_boot_ordinals": [0, 1, 2],
+    "unique_capture_boot_id_required": true,
+    "same_identity_fields_required": [
+      "source_commit",
+      "source_tree",
+      "challenge",
+      "run_id",
+      "contract_sha256",
+      "transcript_schema_sha256",
+      "candidate_sha256",
+      "build_environment_sha256",
+      "package_envelope_sha256",
+      "kernel_elf_sha256",
+      "full_sd_image_sha256"
+    ],
+    "external_build_package_custody_required": true,
+    "complete_transcripts_required": 3,
+    "no_fail_record_required": true,
+    "terminal_quiescence_after_pass_required": true,
+    "unexpected_uart_after_pass_forbidden": true,
+    "operator_power_off_after_pass_required": true,
+    "same_semantic_sha256_required": true,
+    "required_semantic_sha256": "51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1",
+    "present": {
+      "operator_confirmed_power_cycles": 0,
+      "operator_confirmed_cold_boots": 0,
+      "complete_transcripts": 0,
+      "terminal_quiescences": 0,
+      "operator_power_off_confirmations": 0
+    },
+    "gate_satisfied": false
+  },
+  "completion": {
+    "physical_provenance": "not-claimed",
+    "f5_complete": false,
+    "float_complete": false,
+    "c88_complete": false,
+    "executable_successor_authorized": false
+  }
+}

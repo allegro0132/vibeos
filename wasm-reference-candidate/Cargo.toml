@@ -1,0 +1,19 @@
+[package]
+name = "vibeos-wasm-reference-candidate"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "C8.12-R2 acceptance-only bounded Reference Types validator"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+c812-r2-acceptance = ["dep:wasmi-reference", "dep:wasmparser"]
+
+[dependencies]
+vibeos-component-format = { path = "../component-format" }
+wasmi-reference = { package = "vibeos-wasmi-reference-validation", path = "../wasmi-reference-validation", version = "=1.1.0-vibeos-ref1.1", default-features = false, features = ["extra-checks", "prefer-btree-collections"], optional = true }
+wasmparser = { version = "=0.239.0", default-features = false, features = ["features", "prefer-btree-collections", "validate"], optional = true }
+
+[dev-dependencies]
+wat = { version = "=1.255.0", default-features = false }

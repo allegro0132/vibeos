@@ -4,6 +4,7 @@
 //! component that frees a block therefore need not be the component that
 //! allocated it: accounting is always returned to the original owner.
 
+use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::fmt;
 use core::marker::PhantomData;
@@ -26,6 +27,12 @@ pub const MAX_OWNER_ACCOUNTS: usize = 64;
 /// The table is fixed so creating or reclaiming an arena never recursively
 /// allocates allocator metadata. Slots are reused after close/reclaim.
 pub const MAX_ALLOCATION_ARENAS: usize = 64;
+/// Maximum number of fresh owner/arena pairs created or retired atomically.
+///
+/// Principal graph lifecycle code uses this bound to keep all transaction
+/// preflight state on the stack. It is deliberately narrower than either
+/// allocator metadata table.
+pub const MAX_FRESH_ALLOCATION_DOMAIN_BATCH: usize = 16;
 const HEADER_MAGIC: u64 = 0x5649_4245_4f57_4e52; // "VIBEOWNR"
 const FREED_MAGIC: u64 = 0x4652_4545_4442_4c4b; // "FREEDBLK"
 
@@ -350,6 +357,25 @@ pub struct HeapSnapshot {
     pub bump_remaining_bytes: usize,
 }
 
+/// Exact global live-byte observation over one exclusive measurement window.
+///
+/// Unlike [`HeapSnapshot::peak_live_bytes`], `peak_live_bytes` here is reset at
+/// the start of the window. It therefore describes only allocations that were
+/// live between `Heap::begin_live_window` and `HeapLiveWindow::finish`.
+#[cfg(feature = "wasm-c83-runtime-costs")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HeapLiveWindowObservation {
+    pub live_before: usize,
+    pub peak_live_bytes: usize,
+    pub live_after: usize,
+}
+
+#[cfg(feature = "wasm-c83-runtime-costs")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeapLiveWindowError {
+    AlreadyActive,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum OwnerError {
     SystemOwnerReserved,
@@ -389,6 +415,10 @@ pub enum ArenaError {
     SystemOwnerReserved,
     UnknownOwner,
     UnknownArena,
+    OwnerMismatch {
+        expected: OwnerId,
+        actual: OwnerId,
+    },
     TableFull,
     ArenaIdExhausted,
     ArenaBusy {
@@ -396,6 +426,57 @@ pub enum ArenaError {
         live_allocations: usize,
     },
     CorruptList,
+}
+
+/// Why an atomic fresh allocation-domain transaction was rejected.
+///
+/// No variant carries an owner or arena identity. Every returned error leaves
+/// domain membership and both fresh-identity sequences unchanged. The result
+/// buffer is ordinary SYSTEM heap storage in kernel use: reserving it is
+/// recoverable and its failed-call drop restores live bytes, but ordinary
+/// bump/peak/free-list and allocation-denial telemetry can still reflect that
+/// allocation attempt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FreshDomainBatchError {
+    Empty,
+    TooMany,
+    ZeroQuota,
+    /// The result buffer could not be reserved before lifecycle preflight.
+    Allocation,
+    OwnerCapacity,
+    ArenaCapacity,
+    OwnerIdentityExhausted,
+    ArenaIdentityExhausted,
+}
+
+/// Why an atomic empty-domain retirement was rejected.
+///
+/// Identity-bearing inputs are intentionally collapsed into semantic error
+/// classes so lifecycle diagnostics cannot disclose raw owner or arena IDs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FreshDomainBatchRetireError {
+    Empty,
+    TooMany,
+    InvalidDomain,
+    DuplicateOwner,
+    DuplicateArena,
+    DomainUnavailable,
+    DomainMismatch,
+    ArenaBusy,
+    OwnerBusy,
+    OwnerHasOtherArena,
+}
+
+/// Allocation-free summary of one complete fresh-domain retirement.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FreshDomainBatchRetireOutcome {
+    retired_count: usize,
+}
+
+impl FreshDomainBatchRetireOutcome {
+    pub const fn retired_count(self) -> usize {
+        self.retired_count
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -583,6 +664,8 @@ struct HeapInner {
     free: [Option<NonNull<FreeNode>>; NUM_CLASSES],
     live_bytes: usize,
     peak_bytes: usize,
+    #[cfg(feature = "wasm-c83-runtime-costs")]
+    live_window: Option<HeapLiveWindowState>,
     owners: [OwnerAccount; MAX_OWNER_ACCOUNTS],
     arenas: [ArenaRecord; MAX_ALLOCATION_ARENAS],
     next_owner_id: u64,
@@ -590,9 +673,51 @@ struct HeapInner {
     last_failures: [Option<AllocationFailure>; MAX_HARTS],
 }
 
+#[cfg(feature = "wasm-c83-runtime-costs")]
+#[derive(Clone, Copy)]
+struct HeapLiveWindowState {
+    live_before: usize,
+    peak_live_bytes: usize,
+}
+
 unsafe impl Send for HeapInner {}
 
 pub struct Heap(SpinLock<HeapInner>);
+
+/// Exclusive, allocation-free live-byte measurement owned by one [`Heap`].
+///
+/// Dropping an unfinished window cancels it, so a failed benchmark sample
+/// cannot leak measurement state into the next run. The window is global to
+/// the heap: users that need workload-local results must independently ensure
+/// that no unrelated hart or background task allocates during the scope.
+#[cfg(feature = "wasm-c83-runtime-costs")]
+#[must_use = "finish the window to obtain its observation"]
+pub struct HeapLiveWindow<'a> {
+    heap: &'a Heap,
+    active: bool,
+    not_send: PhantomData<*mut ()>,
+}
+
+#[cfg(feature = "wasm-c83-runtime-costs")]
+impl HeapLiveWindow<'_> {
+    /// Close the window and return its exact baseline, scoped peak, and final
+    /// live-byte gauges under one allocator lock.
+    pub fn finish(mut self) -> HeapLiveWindowObservation {
+        let observation = self.heap.finish_live_window();
+        self.active = false;
+        observation
+    }
+}
+
+#[cfg(feature = "wasm-c83-runtime-costs")]
+impl Drop for HeapLiveWindow<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.heap.cancel_live_window();
+            self.active = false;
+        }
+    }
+}
 
 impl Heap {
     pub const fn new() -> Self {
@@ -605,6 +730,8 @@ impl Heap {
             free: [None; NUM_CLASSES],
             live_bytes: 0,
             peak_bytes: 0,
+            #[cfg(feature = "wasm-c83-runtime-costs")]
+            live_window: None,
             owners,
             arenas: [ArenaRecord::EMPTY; MAX_ALLOCATION_ARENAS],
             next_owner_id: 1,
@@ -625,6 +752,10 @@ impl Heap {
         h.free = [None; NUM_CLASSES];
         h.live_bytes = 0;
         h.peak_bytes = 0;
+        #[cfg(feature = "wasm-c83-runtime-costs")]
+        {
+            h.live_window = None;
+        }
         h.owners = [OwnerAccount::EMPTY; MAX_OWNER_ACCOUNTS];
         h.owners[0] = OwnerAccount::SYSTEM;
         h.arenas = [ArenaRecord::EMPTY; MAX_ALLOCATION_ARENAS];
@@ -657,6 +788,206 @@ impl Heap {
             bump_used_bytes: h.cursor.saturating_sub(h.start),
             bump_remaining_bytes: h.end.saturating_sub(h.cursor),
         }
+    }
+
+    /// Begin one resettable global live-byte peak window.
+    ///
+    /// Only one window may be active per heap. Successful allocations update
+    /// its peak under the allocator metadata lock, so short-lived allocations
+    /// that disappear before the next snapshot are still observed exactly.
+    #[cfg(feature = "wasm-c83-runtime-costs")]
+    pub fn begin_live_window(&self) -> Result<HeapLiveWindow<'_>, HeapLiveWindowError> {
+        let mut h = self.0.lock();
+        if h.live_window.is_some() {
+            return Err(HeapLiveWindowError::AlreadyActive);
+        }
+        h.live_window = Some(HeapLiveWindowState {
+            live_before: h.live_bytes,
+            peak_live_bytes: h.live_bytes,
+        });
+        drop(h);
+        Ok(HeapLiveWindow {
+            heap: self,
+            active: true,
+            not_send: PhantomData,
+        })
+    }
+
+    #[cfg(feature = "wasm-c83-runtime-costs")]
+    fn finish_live_window(&self) -> HeapLiveWindowObservation {
+        let mut h = self.0.lock();
+        let window = h
+            .live_window
+            .take()
+            .expect("an active heap live-byte window must finish exactly once");
+        HeapLiveWindowObservation {
+            live_before: window.live_before,
+            peak_live_bytes: window.peak_live_bytes,
+            live_after: h.live_bytes,
+        }
+    }
+
+    #[cfg(feature = "wasm-c83-runtime-costs")]
+    fn cancel_live_window(&self) {
+        let mut h = self.0.lock();
+        let _ = h.live_window.take();
+    }
+
+    /// Create one fresh owner and one fresh reclaimable arena for every quota.
+    ///
+    /// Returned domains preserve input order and never share an owner or an
+    /// arena. Return storage is allocated before the allocator metadata lock is
+    /// acquired. Under that single lock, table capacity and both identity
+    /// sequences are completely preflighted before the first mutation. The
+    /// final lifecycle-metadata writes are therefore one externally atomic
+    /// commit. Every returned error preserves domain-slot membership, both
+    /// identity cursors, and the pre-call live-byte baseline. Ordinary
+    /// allocator high-water and denial telemetry can reflect the attempted
+    /// result-buffer reservation.
+    pub fn create_fresh_domains_batch(
+        &self,
+        quota_bytes: &[usize],
+    ) -> Result<Vec<AllocationDomain>, FreshDomainBatchError> {
+        if quota_bytes.is_empty() {
+            return Err(FreshDomainBatchError::Empty);
+        }
+        if quota_bytes.len() > MAX_FRESH_ALLOCATION_DOMAIN_BATCH {
+            return Err(FreshDomainBatchError::TooMany);
+        }
+        if quota_bytes.iter().any(|quota| *quota == 0) {
+            return Err(FreshDomainBatchError::ZeroQuota);
+        }
+
+        // No allocation may remain after the transaction linearization point.
+        let mut domains = Vec::new();
+        domains
+            .try_reserve_exact(quota_bytes.len())
+            .map_err(|_| FreshDomainBatchError::Allocation)?;
+        let mut h = self.0.lock();
+        let mut owner_slots = [usize::MAX; MAX_FRESH_ALLOCATION_DOMAIN_BATCH];
+        let mut owner_slot_count = 0usize;
+        for (index, account) in h.owners.iter().enumerate() {
+            if !account.active && owner_slot_count < quota_bytes.len() {
+                owner_slots[owner_slot_count] = index;
+                owner_slot_count += 1;
+            }
+        }
+        if owner_slot_count != quota_bytes.len() {
+            return Err(FreshDomainBatchError::OwnerCapacity);
+        }
+
+        let mut arena_slots = [usize::MAX; MAX_FRESH_ALLOCATION_DOMAIN_BATCH];
+        let mut arena_slot_count = 0usize;
+        for (index, arena) in h.arenas.iter().enumerate() {
+            if !arena.active && arena_slot_count < quota_bytes.len() {
+                arena_slots[arena_slot_count] = index;
+                arena_slot_count += 1;
+            }
+        }
+        if arena_slot_count != quota_bytes.len() {
+            return Err(FreshDomainBatchError::ArenaCapacity);
+        }
+
+        let mut owners = [OwnerId::SYSTEM; MAX_FRESH_ALLOCATION_DOMAIN_BATCH];
+        let mut next_owner_id = h.next_owner_id;
+        for owner in owners.iter_mut().take(quota_bytes.len()) {
+            loop {
+                if next_owner_id == OwnerId::SYSTEM.0 {
+                    return Err(FreshDomainBatchError::OwnerIdentityExhausted);
+                }
+                let candidate = OwnerId(next_owner_id);
+                next_owner_id = next_owner_id.checked_add(1).unwrap_or(OwnerId::SYSTEM.0);
+                if find_owner(&h, candidate).is_none() {
+                    *owner = candidate;
+                    break;
+                }
+            }
+        }
+
+        let mut arenas = [ArenaId::UNTRACKED; MAX_FRESH_ALLOCATION_DOMAIN_BATCH];
+        let mut next_arena_id = h.next_arena_id;
+        for arena in arenas.iter_mut().take(quota_bytes.len()) {
+            loop {
+                if next_arena_id == ArenaId::UNTRACKED.0 {
+                    return Err(FreshDomainBatchError::ArenaIdentityExhausted);
+                }
+                let candidate = ArenaId(next_arena_id);
+                next_arena_id = next_arena_id.checked_add(1).unwrap_or(ArenaId::UNTRACKED.0);
+                if find_arena(&h, candidate).is_none() {
+                    *arena = candidate;
+                    break;
+                }
+            }
+        }
+
+        // Capacity was reserved before the lock and every identity is now
+        // fixed, so these pushes cannot allocate or fail.
+        for index in 0..quota_bytes.len() {
+            domains.push(AllocationDomain::new(owners[index], arenas[index]));
+        }
+
+        // Linearization point: the heap lock hides the complete metadata write
+        // set until all accounts, arenas, and sequence cursors are installed.
+        h.next_owner_id = next_owner_id;
+        h.next_arena_id = next_arena_id;
+        for (index, quota) in quota_bytes.iter().copied().enumerate() {
+            h.owners[owner_slots[index]] = OwnerAccount {
+                owner: owners[index],
+                quota_bytes: quota,
+                live_bytes: 0,
+                peak_bytes: 0,
+                live_allocations: 0,
+                denials: 0,
+                active: true,
+            };
+            h.arenas[arena_slots[index]] = ArenaRecord {
+                arena: arenas[index],
+                owner: owners[index],
+                head: None,
+                live_bytes: 0,
+                live_allocations: 0,
+                active: true,
+            };
+        }
+        Ok(domains)
+    }
+
+    /// Read-only validation for a later atomic fresh-domain retirement.
+    ///
+    /// Every owner and arena must be unique, exact, active, empty, and paired
+    /// exclusively with each other. All inputs are preflighted under one heap
+    /// lock and no allocator state is mutated. This does not reserve the
+    /// domains: only a caller holding exclusive lifecycle authority may rely
+    /// on the result remaining valid before the later retirement call.
+    pub fn preflight_retire_empty_domains_batch(
+        &self,
+        domains: &[AllocationDomain],
+    ) -> Result<(), FreshDomainBatchRetireError> {
+        let h = self.0.lock();
+        preflight_fresh_domain_batch_retirement(&h, domains).map(|_| ())
+    }
+
+    /// Atomically retire a batch created by [`Self::create_fresh_domains_batch`].
+    ///
+    /// This uses the exact same locked, read-only validation helper as
+    /// [`Self::preflight_retire_empty_domains_batch`]. After that helper
+    /// returns, no fallible operation remains before the single-lock commit.
+    pub fn retire_empty_domains_batch(
+        &self,
+        domains: &[AllocationDomain],
+    ) -> Result<FreshDomainBatchRetireOutcome, FreshDomainBatchRetireError> {
+        let mut h = self.0.lock();
+        let plan = preflight_fresh_domain_batch_retirement(&h, domains)?;
+
+        // Linearization point: clearing remains invisible until the one heap
+        // lock is released, and there are no fallible operations below it.
+        for index in 0..domains.len() {
+            h.arenas[plan.arena_slots[index]] = ArenaRecord::EMPTY;
+            h.owners[plan.owner_slots[index]] = OwnerAccount::EMPTY;
+        }
+        Ok(FreshDomainBatchRetireOutcome {
+            retired_count: domains.len(),
+        })
     }
 
     /// Register a stable externally-chosen owner identity.
@@ -790,16 +1121,27 @@ impl Heap {
         find_arena(&h, arena).map(|index| h.arenas[index].stats())
     }
 
-    /// Close an arena after normal Drop has returned every tracked block.
-    pub fn close_empty_arena(&self, arena: ArenaId) -> Result<(), ArenaError> {
-        if !arena.is_tracked() {
+    /// Close an exact allocation domain after normal Drop has returned every
+    /// tracked block.
+    ///
+    /// Owner and arena are checked together under the allocator lock. A stale
+    /// lifecycle record therefore cannot close a later arena merely because a
+    /// caller performed a separate `arena_stats` preflight.
+    pub fn close_empty_domain(&self, domain: AllocationDomain) -> Result<(), ArenaError> {
+        if !domain.arena.is_tracked() {
             return Err(ArenaError::UntrackedArenaReserved);
         }
         let mut h = self.0.lock();
-        let Some(index) = find_arena(&h, arena) else {
+        let Some(index) = find_arena(&h, domain.arena) else {
             return Err(ArenaError::UnknownArena);
         };
         let record = h.arenas[index];
+        if record.owner != domain.owner {
+            return Err(ArenaError::OwnerMismatch {
+                expected: domain.owner,
+                actual: record.owner,
+            });
+        }
         if record.live_bytes != 0 || record.live_allocations != 0 || record.head.is_some() {
             return Err(ArenaError::ArenaBusy {
                 live_bytes: record.live_bytes,
@@ -810,7 +1152,7 @@ impl Heap {
         Ok(())
     }
 
-    /// Raw-reclaim every allocation belonging to a faulted incarnation.
+    /// Raw-reclaim every allocation belonging to one exact faulted domain.
     ///
     /// Every complete size-class block is scrubbed before it enters a free
     /// list. This is required because fault recovery deliberately skips Rust
@@ -818,19 +1160,28 @@ impl Heap {
     /// payload bytes abandoned by the faulted incarnation.
     ///
     /// # Safety
-    /// The caller must have permanently quiesced every task in `arena`, raw
+    /// The caller must have permanently quiesced every task in `domain`, raw
     /// deallocated their future envelopes, removed runtime registrations, and
     /// proved that no pointer or reference into an arena allocation escaped.
     /// No destructor is run here.
-    pub unsafe fn reclaim_faulted_arena(&self, arena: ArenaId) -> Result<ReclaimStats, ArenaError> {
-        if !arena.is_tracked() {
+    pub unsafe fn reclaim_faulted_domain(
+        &self,
+        domain: AllocationDomain,
+    ) -> Result<ReclaimStats, ArenaError> {
+        if !domain.arena.is_tracked() {
             return Err(ArenaError::UntrackedArenaReserved);
         }
         let mut h = self.0.lock();
-        let Some(arena_index) = find_arena(&h, arena) else {
+        let Some(arena_index) = find_arena(&h, domain.arena) else {
             return Err(ArenaError::UnknownArena);
         };
         let record = h.arenas[arena_index];
+        if record.owner != domain.owner {
+            return Err(ArenaError::OwnerMismatch {
+                expected: domain.owner,
+                actual: record.owner,
+            });
+        }
         let Some(owner_index) = find_owner(&h, record.owner) else {
             return Err(ArenaError::UnknownOwner);
         };
@@ -857,7 +1208,7 @@ impl Heap {
             let header = unsafe { &*header_ptr.as_ptr() };
             if header.magic != HEADER_MAGIC
                 || header.owner != record.owner
-                || header.arena != arena
+                || header.arena != domain.arena
                 || header.class >= NUM_CLASSES
                 || header.arena_prev != previous
             {
@@ -926,7 +1277,7 @@ impl Heap {
         h.live_bytes = global_live;
         h.arenas[arena_index] = ArenaRecord::EMPTY;
         Ok(ReclaimStats {
-            arena,
+            arena: domain.arena,
             owner: record.owner,
             reclaimed_bytes: bytes,
             reclaimed_allocations: allocations,
@@ -990,6 +1341,93 @@ fn find_arena(h: &HeapInner, arena: ArenaId) -> Option<usize> {
     h.arenas
         .iter()
         .position(|record| record.active && record.arena == arena)
+}
+
+struct FreshDomainBatchRetirePlan {
+    owner_slots: [usize; MAX_FRESH_ALLOCATION_DOMAIN_BATCH],
+    arena_slots: [usize; MAX_FRESH_ALLOCATION_DOMAIN_BATCH],
+}
+
+fn preflight_fresh_domain_batch_retirement(
+    h: &HeapInner,
+    domains: &[AllocationDomain],
+) -> Result<FreshDomainBatchRetirePlan, FreshDomainBatchRetireError> {
+    if domains.is_empty() {
+        return Err(FreshDomainBatchRetireError::Empty);
+    }
+    if domains.len() > MAX_FRESH_ALLOCATION_DOMAIN_BATCH {
+        return Err(FreshDomainBatchRetireError::TooMany);
+    }
+    for (index, domain) in domains.iter().enumerate() {
+        if domain.owner == OwnerId::SYSTEM || !domain.arena.is_tracked() {
+            return Err(FreshDomainBatchRetireError::InvalidDomain);
+        }
+        if domains[index + 1..]
+            .iter()
+            .any(|other| other.owner == domain.owner)
+        {
+            return Err(FreshDomainBatchRetireError::DuplicateOwner);
+        }
+        if domains[index + 1..]
+            .iter()
+            .any(|other| other.arena == domain.arena)
+        {
+            return Err(FreshDomainBatchRetireError::DuplicateArena);
+        }
+    }
+
+    let mut plan = FreshDomainBatchRetirePlan {
+        owner_slots: [usize::MAX; MAX_FRESH_ALLOCATION_DOMAIN_BATCH],
+        arena_slots: [usize::MAX; MAX_FRESH_ALLOCATION_DOMAIN_BATCH],
+    };
+    for (input_index, domain) in domains.iter().copied().enumerate() {
+        let mut owner_index = None;
+        for (index, account) in h.owners.iter().enumerate() {
+            if account.active && account.owner == domain.owner {
+                if owner_index.replace(index).is_some() {
+                    return Err(FreshDomainBatchRetireError::DomainUnavailable);
+                }
+            }
+        }
+        let Some(owner_index) = owner_index else {
+            return Err(FreshDomainBatchRetireError::DomainUnavailable);
+        };
+
+        let mut arena_index = None;
+        for (index, arena) in h.arenas.iter().enumerate() {
+            if arena.active && arena.arena == domain.arena {
+                if arena_index.replace(index).is_some() {
+                    return Err(FreshDomainBatchRetireError::DomainUnavailable);
+                }
+            }
+        }
+        let Some(arena_index) = arena_index else {
+            return Err(FreshDomainBatchRetireError::DomainUnavailable);
+        };
+
+        let account = h.owners[owner_index];
+        let arena = h.arenas[arena_index];
+        if arena.owner != domain.owner {
+            return Err(FreshDomainBatchRetireError::DomainMismatch);
+        }
+        if arena.live_bytes != 0 || arena.live_allocations != 0 || arena.head.is_some() {
+            return Err(FreshDomainBatchRetireError::ArenaBusy);
+        }
+        if account.live_bytes != 0 || account.live_allocations != 0 {
+            return Err(FreshDomainBatchRetireError::OwnerBusy);
+        }
+        if h.arenas
+            .iter()
+            .filter(|other| other.active && other.owner == domain.owner)
+            .count()
+            != 1
+        {
+            return Err(FreshDomainBatchRetireError::OwnerHasOtherArena);
+        }
+        plan.owner_slots[input_index] = owner_index;
+        plan.arena_slots[input_index] = arena_index;
+    }
+    Ok(plan)
 }
 
 fn align_up(value: usize, align: usize) -> Option<usize> {
@@ -1195,6 +1633,12 @@ unsafe impl GlobalAlloc for Heap {
         }
         h.live_bytes = new_global_live;
         h.peak_bytes = h.peak_bytes.max(new_global_live);
+        #[cfg(feature = "wasm-c83-runtime-costs")]
+        {
+            if let Some(window) = &mut h.live_window {
+                window.peak_live_bytes = window.peak_live_bytes.max(new_global_live);
+            }
+        }
         h.last_failures[hart] = None;
         user as *mut u8
     }
@@ -1303,5 +1747,58 @@ unsafe impl GlobalAlloc for Heap {
             h.arenas[index].live_allocations = live_allocations;
         }
         h.live_bytes = global_live;
+    }
+}
+
+#[cfg(test)]
+mod fresh_domain_batch_tests {
+    use super::*;
+
+    fn assert_only_system_owner_is_active(h: &HeapInner) {
+        assert_eq!(h.owners.iter().filter(|account| account.active).count(), 1);
+        assert!(h.owners[0].active);
+        assert_eq!(h.owners[0].owner, OwnerId::SYSTEM);
+        assert!(h.owners[1..].iter().all(|account| !account.active));
+        assert!(h.arenas.iter().all(|arena| !arena.active));
+    }
+
+    #[test]
+    fn fresh_owner_identity_exhaustion_mutates_nothing() {
+        let heap = Heap::new();
+        {
+            let mut h = heap.0.lock();
+            h.next_owner_id = u64::MAX;
+            h.next_arena_id = 73;
+        }
+
+        assert_eq!(
+            heap.create_fresh_domains_batch(&[1024, 2048]),
+            Err(FreshDomainBatchError::OwnerIdentityExhausted)
+        );
+        let h = heap.0.lock();
+        assert_eq!(h.next_owner_id, u64::MAX);
+        assert_eq!(h.next_arena_id, 73);
+        assert_eq!(h.live_bytes, 0);
+        assert_only_system_owner_is_active(&h);
+    }
+
+    #[test]
+    fn fresh_arena_identity_exhaustion_mutates_nothing() {
+        let heap = Heap::new();
+        {
+            let mut h = heap.0.lock();
+            h.next_owner_id = 91;
+            h.next_arena_id = u64::MAX;
+        }
+
+        assert_eq!(
+            heap.create_fresh_domains_batch(&[1024, 2048]),
+            Err(FreshDomainBatchError::ArenaIdentityExhausted)
+        );
+        let h = heap.0.lock();
+        assert_eq!(h.next_owner_id, 91);
+        assert_eq!(h.next_arena_id, u64::MAX);
+        assert_eq!(h.live_bytes, 0);
+        assert_only_system_owner_is_active(&h);
     }
 }

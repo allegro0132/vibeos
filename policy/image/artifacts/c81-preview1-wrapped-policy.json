@@ -1,0 +1,265 @@
+{
+  "schema": "vibeos.c81.preview1-wrapped-policy",
+  "version": 1,
+  "profile": {
+    "name": "profile-1-preview1-wrapped",
+    "code": 4,
+    "artifact_abi": 4,
+    "component_profile": 1,
+    "core_profile": 1,
+    "runtime_abi": 4,
+    "stage": "validation-only",
+    "core_revision": "webassembly-core-2.0-integer-v1",
+    "component_revision": "wasmparser-component-model-0.255.0",
+    "canonical_abi_revision": "component-model-0.255.0-sync",
+    "wasm_tools_revision": "wasm-tools-v1.255.0-76e20611d1920a7a39ca08983c6c77c3060de380",
+    "wasi_revision": "wasi-v0.2.12",
+    "canonical_features": 7,
+    "runtime_ready": false,
+    "profile_runtime_ready": false
+  },
+  "transformer": {
+    "location": "off-device-host-only",
+    "implementation": "tools/c81-preview1-componentizer",
+    "wit_component_version": "0.255.0",
+    "wit_component_crate_sha256": "b0c8948006f57458ae3b2103f2e0e33847a6cdf4f5c763bbe7540fa89f3039f1",
+    "reference_cli_version": "wasm-tools 1.255.0 (76e20611d 2026-07-30)",
+    "reference_cli_source_commit": "76e20611d1920a7a39ca08983c6c77c3060de380",
+    "reference_cli_aarch64_macos_archive_sha256": "58bf83fdfa59da2c70ac6eb8dd395870934d8e3af835ff9311f34b9072586547",
+    "reference_cli_x86_64_linux_archive_sha256": "a62237f4731c45f665f1115cad39acaeec02963cbc848c9473ab033eed837072",
+    "adapter_import_name": "wasi_snapshot_preview1",
+    "validate_output": true,
+    "allow_disable_validation": false,
+    "allow_import_rename": false,
+    "ambient_adapter_lookup": false,
+    "network_lookup": false
+  },
+  "adapter": {
+    "release": "wasmtime-v48.0.0",
+    "source_commit": "f1412a598f96f3c261a19118d94caffcb0c36235",
+    "asset": "wasi_snapshot_preview1.command.wasm",
+    "manifest_revision": "wasmtime-v48.0.0-f1412a598f96f3c261a19118d94caffcb0c36235/wasi_snapshot_preview1.command.wasm",
+    "source_url": "https://github.com/bytecodealliance/wasmtime/releases/download/v48.0.0/wasi_snapshot_preview1.command.wasm",
+    "byte_len": 51828,
+    "sha256": "316dfbf171591d69ae414efd13b85933ca13526af8d9e0a735ab88ae08fd85f0",
+    "license": "Apache-2.0 WITH LLVM-exception",
+    "target_wasi_revision": "0.2.12",
+    "published_asset_bytes_are_normative": true,
+    "source_tag_is_bit_reproducibility_claim": false
+  },
+  "guest_core": {
+    "fixture": "c81-fd-write.core.wasm",
+    "byte_len": 145,
+    "sha256": "5ac1eb14874721c8355669fd91811f9a0165d96f1382ff82f08f3dfc0634bb0c",
+    "imports": [
+      {
+        "module": "wasi_snapshot_preview1",
+        "name": "fd_write",
+        "kind": "func",
+        "params": ["i32", "i32", "i32", "i32"],
+        "results": ["i32"]
+      }
+    ],
+    "exports": [
+      {
+        "name": "memory",
+        "kind": "memory"
+      },
+      {
+        "name": "_start",
+        "kind": "func",
+        "params": [],
+        "results": []
+      }
+    ],
+    "core_start_section": false,
+    "memory_initial_pages": 1,
+    "memory_maximum_pages": 16,
+    "allowed_preview1_functions": ["fd_write"]
+  },
+  "component": {
+    "fixture": "c81-fd-write.preview1-wrapped.component.wasm",
+    "byte_len": 17495,
+    "sha256": "b910b4428e9ff442649f36a59707373a34d73f50f11fc1ae1266cd9f19e9f48e",
+    "top_level_section_count": 86,
+    "top_level_section_occurrences": {
+      "custom": 2,
+      "core_module": 4,
+      "core_instance": 12,
+      "nested_component": 1,
+      "component_instance": 1,
+      "alias": 30,
+      "component_type": 9,
+      "canonical": 18,
+      "import": 8,
+      "export": 1
+    },
+    "top_level_entry_counts": {
+      "core_instance": 15,
+      "component_instance": 1,
+      "alias": 42,
+      "component_type": 10,
+      "canonical": 18,
+      "import": 8,
+      "export": 1
+    },
+    "imports": [
+      "wasi:io/error@0.2.12",
+      "wasi:io/streams@0.2.12",
+      "wasi:cli/stdin@0.2.12",
+      "wasi:cli/stdout@0.2.12",
+      "wasi:cli/stderr@0.2.12",
+      "wasi:clocks/wall-clock@0.2.12",
+      "wasi:filesystem/types@0.2.12",
+      "wasi:filesystem/preopens@0.2.12"
+    ],
+    "exports": ["wasi:cli/run@0.2.12"],
+    "top_level_entity_pins": [
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:cli/stderr@0.2.12",
+        "raw_byte_len": 26,
+        "raw_entry_sha256": "6fc47ffb74b1b905a5b8fe1c467ea8199eb091ffb0e9e2874f7ac986a4a91a32"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:cli/stdin@0.2.12",
+        "raw_byte_len": 25,
+        "raw_entry_sha256": "e5ff52618b9ebffbca4783de197eda34847f87c0a4351c0aea669cf7ba2db4a4"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:cli/stdout@0.2.12",
+        "raw_byte_len": 26,
+        "raw_entry_sha256": "9f231e2d8ad27a675d433c795b154f0246ca22f8d600bda2ddc60e76c8aa9d25"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:clocks/wall-clock@0.2.12",
+        "raw_byte_len": 33,
+        "raw_entry_sha256": "09d4e71704cfc40ffbd71d8481daab692c737df30fafc26d89e89a745f6116b7"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:filesystem/preopens@0.2.12",
+        "raw_byte_len": 35,
+        "raw_entry_sha256": "cb5037f354e73e9b1ae3380e90d00371bdd943c720aa7d0e5727e9591c507a90"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:filesystem/types@0.2.12",
+        "raw_byte_len": 32,
+        "raw_entry_sha256": "2fbf66c40479ed438de2ac00b156d8d88bbf38447c6b76449502be035d8849c5"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:io/error@0.2.12",
+        "raw_byte_len": 24,
+        "raw_entry_sha256": "40fed392ca0fd40a1feff77e63776a6bdc059a2cf26cd60366f3f77d2b7cc344"
+      },
+      {
+        "direction": "import",
+        "kind": "instance",
+        "name": "wasi:io/streams@0.2.12",
+        "raw_byte_len": 26,
+        "raw_entry_sha256": "9a16c9faac49b9dbf019eb4735259eb0d58ac3bc824867ab2aa374826ca95241"
+      },
+      {
+        "direction": "export",
+        "kind": "instance",
+        "name": "wasi:cli/run@0.2.12",
+        "raw_byte_len": 24,
+        "raw_entry_sha256": "c2429760150a601023aa7883ffaf212116e2a304829b6aab11aaadb84e510478"
+      }
+    ],
+    "embedded_core_modules": [
+      {
+        "ordinal": 0,
+        "byte_len": 145,
+        "sha256": "5ac1eb14874721c8355669fd91811f9a0165d96f1382ff82f08f3dfc0634bb0c"
+      },
+      {
+        "ordinal": 1,
+        "byte_len": 9581,
+        "sha256": "96cbc60f3ef3ad13621236858694165e0b4dd02052ab38b875285e1aeafb4f66"
+      },
+      {
+        "ordinal": 2,
+        "byte_len": 318,
+        "sha256": "1e30d212a60962a6eefee3b6ba9249332aa0a430b7e3bacca792bf86ef89ae0e"
+      },
+      {
+        "ordinal": 3,
+        "byte_len": 183,
+        "sha256": "3c11674007ed6e8d74e99a1d2b52dc41cf1acd842f20ebd6e438593668d7d7ff"
+      }
+    ],
+    "canonical_entries": {
+      "total": 18,
+      "resource_drop": 4,
+      "lower": 13,
+      "lift": 1,
+      "lower_fingerprint_domain": "vibeos.preview1-wrapped.canonical-lowerings.v1\u0000",
+      "lower_fingerprint_format": "sha256(domain || concat(u64le(raw_entry_len) || raw_entry_bytes))",
+      "lower_fingerprint_sha256": "a5f5d1b1b1a09d92718132121d367acef0aed6364b58b1aac3e70daef62701f8"
+    },
+    "nested_components": 1,
+    "nested_component_top_level_section_ordinal": 82
+  },
+  "component_artifact": {
+    "fixture": "c81-fd-write.preview1-wrapped.cmp1",
+    "world": "root:component/root",
+    "wit_package": {
+      "name": "root:component",
+      "version": "0.0.0+c81",
+      "source_fixture": "c81-fd-write.component.wit",
+      "source_sha256": "39c4ec95a1e92a8df777b03d0d11349b150725c50d862231fca35d61f9347ed4"
+    },
+    "interface_entity_kind": "interface",
+    "interface_diagnostic_shape": "instance(exact-wasi-0.2.12;host-mapping=none)",
+    "adapter_ordinal": 0,
+    "adapter_revision": "wasmtime-v48.0.0-f1412a598f96f3c261a19118d94caffcb0c36235/wasi_snapshot_preview1.command.wasm",
+    "signer_policy_kind": "development-image-pin",
+    "signer_policy_digest": "sha256(exact-policy-file-bytes)",
+    "instance_limits": {
+      "memory_bytes": 1048576,
+      "total_fuel": 100000,
+      "poll_quantum": 100,
+      "resources": 16
+    },
+    "runtime_ready": false
+  },
+  "admission": {
+    "feature": "preview1-wrapped-admission",
+    "default_enabled": false,
+    "input_kind": "ComponentArtifactV1",
+    "raw_wasip1_admission": false,
+    "validation_only_candidate": true,
+    "host_mappings": [],
+    "ambient_lookup": 0,
+    "raw_durable_ids": 0,
+    "no_grant_direct_move": 0,
+    "guest_execution": false,
+    "guest_calls": 0,
+    "runtime_ready": false,
+    "profile_runtime_ready": false,
+    "guest_transformer": false,
+    "kernel_transformer": false,
+    "preopens": false,
+    "filesystem_authority": false,
+    "environment_authority": false,
+    "process_authority": false,
+    "socket_authority": false,
+    "thread_authority": false,
+    "selected_wasi_0_3_mapping": false,
+    "aot": false,
+    "jit": false
+  }
+}

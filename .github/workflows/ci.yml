@@ -12,6 +12,8 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
       - name: Install repository toolchain
         run: |
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
@@ -38,7 +40,47 @@ jobs:
             rustup run "$VIBEOS_TOOLCHAIN" cargo test \
               --manifest-path vendor/sunset/Cargo.toml -p sunset \
               --no-default-features --features alloc --verbose
-      - name: Test each image policy independently
+      - name: Test the native async state-machine evidence
+        # The kernel library has `test = false`, but this model deliberately
+        # has no kernel dependencies and is a portable host evidence layer.
+        # The component-runtime fuzzer is feature-gated, so the workspace's
+        # default test command above does not discover it.
+        run: |
+          "$VIBEOS_RUSTC" --edition=2021 --test \
+            kernel/src/native_pending_shadow_model.rs \
+            -o "$RUNNER_TEMP/native-pending-shadow-model"
+          "$RUNNER_TEMP/native-pending-shadow-model"
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test \
+              -p vibeos-component-runtime \
+              --features native-async-acceptance \
+              --test native_async_fuzz --verbose
+      - name: Test the default-off C8.4 Core profiling boundary
+        run: |
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked \
+              -p vibeos-component-runtime --no-default-features \
+              --features c84-profile-hooks \
+              --test c84_profile --verbose
+      - name: Test the C8.4 trusted SSH terminal seam
+        run: |
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked \
+              -p vibeos-sshd --no-default-features \
+              --features c84-profile-trusted-sample,native-revoke-target-acceptance \
+              --verbose
+      - name: Test the allocation-free C8.4 phase ledger
+        run: |
+          rustup target add --toolchain "$VIBEOS_TOOLCHAIN" \
+            riscv64imac-unknown-none-elf
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked \
+              -p vibeos-wasm-aot-profile --verbose
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo check --locked \
+              -p vibeos-wasm-aot-profile --target \
+              riscv64imac-unknown-none-elf --verbose
+      - name: Test each image policy and the frozen C8.4 capacity preflight
         run: |
           RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
             rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked \
@@ -48,10 +90,318 @@ jobs:
             rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked \
               -p vibeos-image-policy --no-default-features \
               --features milkv-duo-sd --verbose
+      - name: Verify the C8.8-F5 fixed-QEMU replacement decision
+        run: |
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked --offline \
+              -p vibeos-wasm-float-target --no-default-features \
+              --features c88-f5-acceptance --verbose
+          python3 -B scripts/verify-c88-f5-qemu-target-gate.py \
+            --check-contract
+          python3 -O -B scripts/verify-c88-f5-qemu-target-gate.py \
+            --check-contract
+          python3 -B scripts/verify-c88-f5-qemu-target-gate.py \
+            --selftest
+          python3 -O -B scripts/verify-c88-f5-qemu-target-gate.py \
+            --selftest
+          python3 -B scripts/verify-c88-f5-qemu-target-gate.py \
+            --check-decision \
+            acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-decision.json \
+            --normal-receipt \
+            acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-normal-receipt.json \
+            --optimized-receipt \
+            acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-optimized-receipt.json
+          python3 -O -B scripts/verify-c88-f5-qemu-target-gate.py \
+            --check-decision \
+            acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-decision.json \
+            --normal-receipt \
+            acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-normal-receipt.json \
+            --optimized-receipt \
+            acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-optimized-receipt.json
+      - name: Verify the C8.8-F2 current candidate-consumer closure
+        # Offline acceptance-only fail-closed proof. This does not activate
+        # profile code 5 or authorize implementation or production.
+        run: |
+          python3 -B scripts/verify-c88-f2-supply-chain.py
+          python3 -O -B scripts/verify-c88-f2-supply-chain.py
+          python3 -B scripts/verify-c88-f2-supply-chain.py --self-test
+          python3 -O -B scripts/verify-c88-f2-supply-chain.py --self-test
+      - name: Verify the unallocated Float successor review boundary
+        # Charter integrity only: no successor identity or engine is selected,
+        # and no implementation, execution, admission, or production is authorized.
+        run: |
+          python3 -B scripts/verify-c88-float-successor-review-boundary.py \
+            --check-contract
+          python3 -O -B scripts/verify-c88-float-successor-review-boundary.py \
+            --check-contract
+          python3 -B scripts/verify-c88-float-successor-review-boundary.py \
+            --selftest
+          python3 -O -B scripts/verify-c88-float-successor-review-boundary.py \
+            --selftest
+      - name: Verify the C8.9-S1 Float successor design
+        # Historical design identity; neither QEMU nor hardware is run here.
+        run: |
+          python3 -B scripts/verify-c89-float-successor-design.py --check-contract
+          python3 -O -B scripts/verify-c89-float-successor-design.py --check-contract
+          python3 -B scripts/verify-c89-float-successor-design.py --selftest
+          python3 -O -B scripts/verify-c89-float-successor-design.py --selftest
+      - name: Verify the C8.9-S2 Float successor implementation
+        # Host-only implementation and isolation checks. QEMU belongs to S3;
+        # physical Duo remains paused and supplies no input.
+        run: |
+          python3 -B scripts/verify-c89-float-successor-implementation.py --check-contract
+          python3 -O -B scripts/verify-c89-float-successor-implementation.py --check-contract
+          python3 -B scripts/verify-c89-float-successor-implementation.py --selftest
+          python3 -O -B scripts/verify-c89-float-successor-implementation.py --selftest
+          cargo test --locked --offline -p vibeos-component-runtime \
+            --features c89-float-executable --test c89_float_executable
+          cargo test --locked --offline -p vibeos-component-admission \
+            --features c89-float-executable --test c89_float_executable
+      - name: Verify the C8.9-S3 fixed-QEMU qualification decision
+        # Published receipt/authority integrity only; CI does not rerun QEMU
+        # and consumes no physical input.
+        run: |
+          python3 -B scripts/verify-c89-s3-fixed-qemu-qualification.py --check-contract
+          python3 -O -B scripts/verify-c89-s3-fixed-qemu-qualification.py --check-contract
+          python3 -B scripts/verify-c89-s3-fixed-qemu-qualification.py --selftest
+          python3 -O -B scripts/verify-c89-s3-fixed-qemu-qualification.py --selftest
+      - name: Verify the C8.10-S1 SIMD widening design
+        # Static design and history checks only: code 7 is not implemented or
+        # executable, and neither QEMU nor physical hardware is run.
+        run: |
+          python3 -B scripts/verify-c810-simd-widening-design.py --check-contract
+          python3 -O -B scripts/verify-c810-simd-widening-design.py --check-contract
+          python3 -B scripts/verify-c810-simd-widening-design.py --selftest
+          python3 -O -B scripts/verify-c810-simd-widening-design.py --selftest
+      - name: Verify the C8.10-S2 SIMD implementation
+        # Default-off acceptance engine only. The RISC-V object audit proves
+        # the rv64imac closure contains no semantic FP helper or F/D/V opcode.
+        run: |
+          python3 -B scripts/verify-c810-simd-widening-implementation.py --check-contract
+          python3 -O -B scripts/verify-c810-simd-widening-implementation.py --check-contract
+          python3 -B scripts/verify-c810-simd-widening-implementation.py --selftest
+          python3 -O -B scripts/verify-c810-simd-widening-implementation.py --selftest
+          python3 scripts/verify-c810-s2-supply-chain.py --self-test
+          python3 scripts/verify-c810-s2-riscv-object.py
+          cargo test --locked --offline -p vibeos-wasm-simd-candidate \
+            --features c810-s2-acceptance
+      - name: Verify the C8.10-S3 SIMD containment and corpora
+        # Acceptance-only Component/Core boundary and deterministic host
+        # corpora. This runs neither QEMU nor physical hardware.
+        run: |
+          python3 -B scripts/verify-c810-simd-containment-corpus.py --check-contract
+          python3 -O -B scripts/verify-c810-simd-containment-corpus.py --check-contract
+          python3 -B scripts/verify-c810-simd-containment-corpus.py --selftest
+          python3 -O -B scripts/verify-c810-simd-containment-corpus.py --selftest
+          cargo test --locked --offline -p vibeos-component-runtime \
+            --features c810-s3-acceptance --test c810_s3_simd_containment
+      - name: Verify the C8.10-S4 SIMD admission and lifecycle
+        # Default-off volatile admission/lifecycle and durable rejection only.
+        # This runs neither QEMU nor physical hardware.
+        run: |
+          python3 -B scripts/verify-c810-simd-admission-lifecycle.py --check-contract
+          python3 -O -B scripts/verify-c810-simd-admission-lifecycle.py --check-contract
+          python3 -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
+          python3 -O -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
+          cargo test --locked --offline -p vibeos-component-admission \
+            --features c810-s4-acceptance --test c810_s4_simd_admission
+          cargo test --locked --offline -p vibeos-component-loader \
+            profile_instance_limits_and_exact_wit_are_revalidated
+      - name: Verify the C8.10-S5 fixed-QEMU qualification decision
+        # Published evidence/authority integrity and portable qualifier only.
+        # CI reruns neither QEMU nor physical hardware.
+        run: |
+          python3 -B scripts/verify-c810-s5-fixed-qemu-qualification.py --check-contract
+          python3 -O -B scripts/verify-c810-s5-fixed-qemu-qualification.py --check-contract
+          python3 -B scripts/verify-c810-s5-fixed-qemu-qualification.py --selftest
+          python3 -O -B scripts/verify-c810-s5-fixed-qemu-qualification.py --selftest
+          python3 -B scripts/verify-c810-s5-simd-evidence.py --selftest
+          python3 -O -B scripts/verify-c810-s5-simd-evidence.py --selftest
+          cargo test --locked --offline -p vibeos-wasm-simd-target \
+            --features c810-s5-qemu-qualification
+      - name: Verify the C8.11-S1 SIMD successor design
+        # Static allocation and history checks only. Code 8 is not implemented
+        # or bound here; neither QEMU nor physical hardware is run.
+        run: |
+          python3 -B scripts/verify-c811-simd-successor-design.py --check-contract
+          python3 -O -B scripts/verify-c811-simd-successor-design.py --check-contract
+          python3 -B scripts/verify-c811-simd-successor-design.py --selftest
+          python3 -O -B scripts/verify-c811-simd-successor-design.py --selftest
+      - name: Verify the C8.11-S2 executable SIMD implementation
+        # Host/static/RISC-V implementation closure only. Fixed QEMU is S3;
+        # physical hardware remains paused and is never consumed here.
+        run: |
+          python3 -B scripts/verify-c811-simd-successor-implementation.py --check-contract
+          python3 -O -B scripts/verify-c811-simd-successor-implementation.py --check-contract
+          python3 -B scripts/verify-c811-simd-successor-implementation.py --selftest
+          python3 -O -B scripts/verify-c811-simd-successor-implementation.py --selftest
+          python3 -B scripts/verify-c811-s2-supply-chain.py
+          python3 -O -B scripts/verify-c811-s2-supply-chain.py --self-test
+          python3 -B scripts/verify-c811-s2-riscv-object.py
+          cargo test --locked --offline -p vibeos-component-format
+          cargo test --locked --offline -p vibeos-wasm-simd-executable \
+            --features c811-s2-acceptance
+          cargo test --locked --offline -p vibeos-component-runtime \
+            --features c811-simd-executable --test c811_simd_executable
+          cargo test --locked --offline -p vibeos-component-admission \
+            --features c811-simd-executable --test c811_simd_executable
+          cargo test --locked --offline -p vibeos-component-loader \
+            profile_instance_limits_and_exact_wit_are_revalidated
+      - name: Verify the C8.11-S3 fixed-QEMU qualification decision
+        # Published evidence integrity only; CI reruns neither QEMU nor Duo.
+        run: |
+          python3 -B scripts/verify-c811-s3-fixed-qemu-qualification.py --check-contract
+          python3 -O -B scripts/verify-c811-s3-fixed-qemu-qualification.py --check-contract
+          python3 -B scripts/verify-c811-s3-fixed-qemu-qualification.py --selftest
+          python3 -O -B scripts/verify-c811-s3-fixed-qemu-qualification.py --selftest
+          python3 -B scripts/verify-c811-s3-simd-evidence.py --selftest
+          python3 -O -B scripts/verify-c811-s3-simd-evidence.py --selftest
+          cargo test --locked --offline -p vibeos-wasm-simd-target \
+            --features c811-s3-qemu-qualification
+      - name: Verify the C8.12-R1 Reference Types validation design
+        # Static allocation/history checks only. Code 9 is not implemented or
+        # bound here; neither QEMU nor physical hardware is run.
+        run: |
+          python3 -B scripts/verify-c812-reference-types-design.py --check-contract
+          python3 -O -B scripts/verify-c812-reference-types-design.py --check-contract
+          python3 -B scripts/verify-c812-reference-types-design.py --selftest
+          python3 -O -B scripts/verify-c812-reference-types-design.py --selftest
+      - name: Verify the C8.12-R2 Reference Types implementation
+        # Host/static/RISC-V validation closure only. Fixed QEMU is R3;
+        # physical hardware remains paused and is never consumed here.
+        run: |
+          python3 -B scripts/verify-c812-reference-types-implementation.py --check-contract
+          python3 -O -B scripts/verify-c812-reference-types-implementation.py --check-contract
+          python3 -B scripts/verify-c812-reference-types-implementation.py --selftest
+          python3 -O -B scripts/verify-c812-reference-types-implementation.py --selftest
+          python3 -B scripts/verify-c812-r2-supply-chain.py
+          python3 -O -B scripts/verify-c812-r2-supply-chain.py --self-test
+          python3 -B scripts/verify-c812-r2-riscv-object.py
+          cargo test --locked --offline -p vibeos-component-format
+          cargo test --locked --offline -p vibeos-wasm-reference-candidate \
+            --features c812-r2-acceptance
+          cargo test --locked --offline -p vibeos-component-runtime \
+            --features c812-r2-reference-validation \
+            --test c812_r2_reference_containment
+          cargo test --locked --offline -p vibeos-component-loader \
+            profile_instance_limits_and_exact_wit_are_revalidated
+      - name: Verify the C8.12-R3 fixed-QEMU qualification decision
+        # Published evidence integrity and harness self-tests only. CI does
+        # not replay QEMU or consume physical inputs.
+        run: |
+          python3 -B scripts/qemu-c812-r3-reference.py --selftest
+          python3 -B scripts/verify-c812-r3-reference-evidence.py --selftest
+          python3 -O -B scripts/verify-c812-r3-reference-evidence.py --selftest
+          python3 -B scripts/verify-c812-r3-fixed-qemu-qualification.py --check-contract
+          python3 -O -B scripts/verify-c812-r3-fixed-qemu-qualification.py --check-contract
+          python3 -B scripts/verify-c812-r3-fixed-qemu-qualification.py --selftest
+          python3 -O -B scripts/verify-c812-r3-fixed-qemu-qualification.py --selftest
+          cargo test --locked --offline -p vibeos-wasm-reference-target \
+            --features c812-r3-qemu-qualification
+      - name: Verify the C8.13-E1 Reference Types executable successor design
+        # Static allocation/design checks only. No code-10 implementation,
+        # QEMU replay, or physical input is permitted here.
+        run: |
+          python3 -B scripts/verify-c813-reference-executable-design.py --check-contract
+          python3 -O -B scripts/verify-c813-reference-executable-design.py --check-contract
+          python3 -B scripts/verify-c813-reference-executable-design.py --selftest
+          python3 -O -B scripts/verify-c813-reference-executable-design.py --selftest
+      - name: Verify the C8.13-E2 Reference Types executable implementation
+        # Host and RISC-V-static implementation checks only. E3 owns the one
+        # formal fixed-QEMU campaign; physical inputs remain forbidden.
+        run: |
+          python3 -B scripts/verify-c813-reference-executable-implementation.py
+          python3 -O -B scripts/verify-c813-reference-executable-implementation.py --selftest
+          cargo test --locked --offline -p vibeos-wasm-reference-executable \
+            --features c813-e2-acceptance
+          cargo test --locked --offline -p vibeos-component-admission \
+            --features c813-reference-executable --lib
+      - name: Verify the C8.13-E3 fixed-QEMU qualification closure
+        # Replays sealed evidence/contracts only; CI does not boot a second
+        # formal QEMU instance and never consumes physical inputs.
+        run: |
+          python3 -B scripts/qemu-c813-e3-reference.py --selftest
+          python3 -B scripts/verify-c813-e3-reference-evidence.py --selftest
+          python3 -O -B scripts/verify-c813-e3-reference-evidence.py --selftest
+          python3 -B scripts/verify-c813-e3-fixed-qemu-qualification.py --check-contract
+          python3 -O -B scripts/verify-c813-e3-fixed-qemu-qualification.py --selftest
+          cargo test --locked --offline -p vibeos-wasm-reference-target \
+            --features c813-e3-qemu-qualification
+      - name: Verify the prospective fixed-QEMU WASM target/release policy
+        # Policy/contract integrity only: this step runs no QEMU or Duo and
+        # itself satisfies no gate. C8.9 qualification is verified separately.
+        run: |
+          python3 -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract
+          python3 -O -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract
+          python3 -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --selftest
+          python3 -O -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --selftest
+      - name: Verify the retained C8.8-F5 Duo non-evidence contracts
+        # Retained compile/schema integrity only. Physical Duo completion is
+        # paused and is not a C8.8-F5 roadmap gate.
+        run: |
+          RUSTC="$VIBEOS_RUSTC" RUSTDOC="$VIBEOS_RUSTDOC" \
+            rustup run "$VIBEOS_TOOLCHAIN" cargo test --locked --offline \
+              -p vibeos-wasm-float-target --no-default-features \
+              --features c88-f5-duo-compile-readiness --verbose
+          python3 -B scripts/verify-c88-f5-duo-readiness.py
+          python3 -B scripts/verify-c88-f5-duo-readiness.py --selftest
+          python3 -B scripts/verify-c88-f5-duo-physical-transcript.py \
+            --check-contract
+          python3 -O -B scripts/verify-c88-f5-duo-physical-transcript.py \
+            --check-contract
+          python3 -B scripts/verify-c88-f5-duo-physical-transcript.py \
+            --selftest
+          python3 -O -B scripts/verify-c88-f5-duo-physical-transcript.py \
+            --selftest
       - name: Report repository status
         run: ./scripts/status.sh --check
       - name: Exercise SMP benchmark transcript validation
         run: python3 -B scripts/bench.py --selftest
+      - name: Verify the C0.7 candidate baseline contract
+        run: |
+          python3 -B scripts/verify-c0-baseline.py --selftest --check-toolchain
+          python3 -B scripts/collect-c0-baseline.py --check-build
+      - name: Verify the independent C8.3 runtime-cost evidence boundary
+        run: |
+          python3 -B scripts/verify-c83-runtime-costs.py --selftest --check-manifest
+          python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
+          python3 -B scripts/verify-c83-evidence.py --selftest
+      - name: Verify the published fixed-QEMU C8.4 replacement gate
+        # Historical structure/hash integrity only: this neither boots QEMU
+        # nor replays the publication-time host custody.
+        run: |
+          python3 -B scripts/verify-c84-qemu-published-evidence.py \
+            --check-published
+          python3 -O -B scripts/verify-c84-qemu-published-evidence.py \
+            --check-published
+          python3 -B scripts/verify-c84-qemu-published-evidence.py \
+            --selftest
+          python3 -O -B scripts/verify-c84-qemu-published-evidence.py \
+            --selftest
+      - name: Verify the retained C8.4 Duo non-evidence tooling
+        # Tooling integrity only. Physical execution remains paused and is
+        # not a C8.4 roadmap or evidence gate.
+        run: |
+          bash -n scripts/build-milkv-duo.sh
+          bash -n scripts/package-milkv-duo-sdk.sh
+          bash -n scripts/verify-milkv-duo-image.sh
+          python3 -B scripts/c84-source-materialization.py --selftest --check-source
+          python3 -B scripts/c84-docker-runtime.py --selftest
+          ./scripts/verify-milkv-duo-image.sh --selftest
+          python3 -B scripts/capture-c84-duo-aot-decision.py --selftest
+          python3 -B scripts/verify-c84-evidence.py --selftest
+      - name: Verify the C8.4 formal single-SAMPLE publisher
+        run: python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
+      - name: Verify the C8.4 trusted live-sample boundary
+        run: python3 -B scripts/verify-c84-ssh-managed-child-trusted-sample.py --selftest --check-source
+      - name: Test the C8.4 trusted transcript parser
+        run: python3 -B scripts/c84-ssh-managed-child-trusted-sample-peer.py --selftest
+      - name: Verify the C8.4 private single-boot collector
+        run: python3 -B scripts/verify-c84-ssh-managed-child-single-boot-collector.py --selftest --check-source
+      - name: Test the C8.4 single-boot collector transcript parser
+        run: python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py --selftest
+      - name: Verify the independent ComponentArtifact codec
+        run: python3 -B scripts/verify-c71-component-artifact.py --selftest
       - name: Verify the independent Storage V2 image parsers
         run: |
           python3 -B scripts/storage-v2-image.py --selftest
@@ -59,11 +409,108 @@ jobs:
           python3 -B scripts/verify-storage-v2-gc.py --selftest
           python3 -B scripts/verify-storage-v2-maintenance.py --selftest
           python3 -B scripts/verify-storage-v2-migration.py --selftest
-          ./scripts/verify-milkv-duo-image.sh --selftest
+
+  c82-preview1-corpus:
+    name: C8.2 source-to-execution evidence
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+      - name: Install repository toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal \
+            --component rust-src --component llvm-tools-preview \
+            --target wasm32-wasip1
+          rustup target add --toolchain "$toolchain" riscv64imac-unknown-none-elf
+          rustup target list --toolchain "$toolchain" --installed | grep -Fx wasm32-wasip1
+          rustup target list --toolchain "$toolchain" --installed \
+            | grep -Fx riscv64imac-unknown-none-elf
+          rustc_bin="$(rustup which --toolchain "$toolchain" rustc)"
+          rustdoc_bin="$(rustup which --toolchain "$toolchain" rustdoc)"
+          {
+            echo "VIBEOS_TOOLCHAIN=$toolchain"
+            echo "VIBEOS_RUSTC=$rustc_bin"
+            echo "VIBEOS_RUSTDOC=$rustdoc_bin"
+          } >> "$GITHUB_ENV"
+          rustup run "$toolchain" rustc -Vv
+          env RUSTC="$rustc_bin" RUSTDOC="$rustdoc_bin" \
+            rustup run "$toolchain" cargo fetch --locked
+          # The firmware config enables build-std. Its sysroot dependency graph
+          # is target-aware and is not populated by the workspace fetch above.
+          # Fetch both graphs before the corpus gate proves the build offline.
+          (
+            cd firmware/qemu-virt
+            env RUSTC="$rustc_bin" RUSTDOC="$rustdoc_bin" \
+              rustup run "$toolchain" cargo fetch --locked \
+                --target riscv64imac-unknown-none-elf
+          )
+      - name: Install the reviewed wasi-sdk-33 toolchain
+        run: |
+          archive="$RUNNER_TEMP/wasi-sdk-33.0-arm64-macos.tar.gz"
+          curl -L --fail --show-error \
+            --output "$archive" \
+            https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-33/wasi-sdk-33.0-arm64-macos.tar.gz
+          printf '%s  %s\n' \
+            85c997a2665ead91673b5bb88b7d0df3fc8900df3bfa244f720d478187bbdc78 \
+            "$archive" | shasum -a 256 -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          echo "C82_WASI_SDK_PATH=$RUNNER_TEMP/wasi-sdk-33.0-arm64-macos" >> "$GITHUB_ENV"
+      - name: Rebuild and execute the bounded Preview1 corpus
+        run: ./scripts/test-c82-preview1-corpus.sh
+
+  c88-f5-duo-readiness:
+    name: C8.8-F5 Duo static compile readiness
+    needs: host-tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - name: Install repository toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$toolchain"
+          rustup toolchain install "$toolchain" --profile minimal \
+            --component rust-src --component llvm-tools-preview
+          rustc_bin="$(rustup which --toolchain "$toolchain" rustc)"
+          rustdoc_bin="$(rustup which --toolchain "$toolchain" rustdoc)"
+          {
+            echo "VIBEOS_TOOLCHAIN=$toolchain"
+            echo "VIBEOS_RUSTC=$rustc_bin"
+            echo "VIBEOS_RUSTDOC=$rustdoc_bin"
+          } >> "$GITHUB_ENV"
+          env RUSTC="$rustc_bin" RUSTDOC="$rustdoc_bin" \
+            rustup run "$toolchain" cargo fetch --locked
+          (
+            cd firmware/milkv-duo
+            env RUSTC="$rustc_bin" RUSTDOC="$rustdoc_bin" \
+              rustup run "$toolchain" cargo fetch --locked \
+                --target riscv64imac-unknown-none-elf
+          )
+      - name: Install the bare-metal linker
+        run: |
+          brew install lld
+          lld_bin="$(brew --prefix lld)/bin"
+          test -x "$lld_bin/ld.lld"
+          echo "$lld_bin" >> "$GITHUB_PATH"
+          "$lld_bin/ld.lld" --version
+      - name: Cross-link and audit the inert Duo readiness ELF
+        # Static compile readiness only: no packaging, QEMU, serial, or board.
+        run: |
+          ./scripts/build-c88-f5-duo-readiness.sh
+          python3 -B scripts/verify-c88-f5-duo-readiness.py \
+            --elf target/c88-f5-duo-readiness/build/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo \
+            --audit-output "$RUNNER_TEMP/c88-f5-duo-elf-audit.json"
 
   differential:
     name: Real-rustc differential oracle
-    needs: host-tests
+    needs: [host-tests, c82-preview1-corpus]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -93,19 +540,34 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
       - name: Install repository toolchain
         run: |
           toolchain="$(sed -n 's/^channel = "\([^"]*\)"$/\1/p' rust-toolchain.toml)"
           test -n "$toolchain"
           rustup toolchain install "$toolchain" --profile minimal \
             --component rust-src --component llvm-tools-preview
+          rustc_bin="$(rustup which --toolchain "$toolchain" rustc)"
+          rustdoc_bin="$(rustup which --toolchain "$toolchain" rustdoc)"
           {
             echo "VIBEOS_TOOLCHAIN=$toolchain"
-            echo "VIBEOS_RUSTC=$(rustup which --toolchain "$toolchain" rustc)"
-            echo "VIBEOS_RUSTDOC=$(rustup which --toolchain "$toolchain" rustdoc)"
+            echo "VIBEOS_RUSTC=$rustc_bin"
+            echo "VIBEOS_RUSTDOC=$rustdoc_bin"
           } >> "$GITHUB_ENV"
           rustup run "$toolchain" rustc -Vv
           rustup run "$toolchain" cargo -V
+          env RUSTC="$rustc_bin" RUSTDOC="$rustdoc_bin" \
+            rustup run "$toolchain" cargo fetch --locked
+          # The QEMU and Duo builds inherit firmware/.cargo/config.toml's
+          # build-std graph. Populate its target-aware sysroot dependencies
+          # before every later build proves the source closure offline.
+          (
+            cd firmware/qemu-virt
+            env RUSTC="$rustc_bin" RUSTDOC="$rustdoc_bin" \
+              rustup run "$toolchain" cargo fetch --locked \
+                --target riscv64imac-unknown-none-elf
+          )
       - name: Install QEMU and lld
         run: |
           sudo apt-get update
@@ -114,6 +576,61 @@ jobs:
           sudo ln -sf "$(command -v lld)" /usr/local/bin/ld.lld
           qemu-system-riscv64 --version
           ld.lld --version
+      - name: Cross-link the inert C8.8-F5 Milk-V Duo readiness ELF
+        # Compile-only: no packaging, serial access, boot, or physical claim.
+        run: ./scripts/build-c88-f5-duo-readiness.sh
+      - name: Exercise the C8.4 kernel profile-slot ownership boundary
+        run: ./scripts/qemu-c84-profile-slot-test.sh
+      - name: Exercise the C8.4 real Core-poll observer boundary
+        run: ./scripts/qemu-c84-core-poll-test.sh
+      - name: Exercise the C8.4 real self-SSIP profile overlay boundary
+        run: ./scripts/qemu-c84-profile-irq-overlay-test.sh
+      - name: Exercise the C8.4 prepared-child lineage boundary
+        run: ./scripts/qemu-c84-profile-child-delegation-test.sh
+      - name: Exercise the C8.4 authenticated SSH request-parent boundary
+        run: ./scripts/qemu-c84-ssh-request-parent-test.sh
+      - name: Exercise the C8.4 authenticated managed-child/Core boundary
+        run: ./scripts/qemu-c84-ssh-managed-child-core-test.sh
+      - name: Exercise the C8.4 SSH managed-child phase sidecar
+        run: ./scripts/qemu-c84-ssh-managed-child-phase-sidecar-test.sh
+      - name: Exercise the C8.4 SSH managed-child IRQ-overlay composition
+        run: ./scripts/qemu-c84-ssh-managed-child-irq-overlay-test.sh
+      - name: Exercise the C8.4 SSH managed-child finish/verify closure
+        run: ./scripts/qemu-c84-ssh-managed-child-finish-verify-test.sh
+      - name: Exercise the C8.4 SSH managed-child verified-stream closure
+        run: ./scripts/qemu-c84-ssh-managed-child-verified-stream-test.sh
+      - name: Exercise the C8.4 SSH managed-child trusted-sample closure
+        run: ./scripts/qemu-c84-ssh-managed-child-trusted-sample-test.sh
+      - name: Exercise the C8.4 private single-boot collector closure
+        run: ./scripts/qemu-c84-ssh-managed-child-single-boot-collector-test.sh
+      # Keep these closed-source-state gates before the ordinary Duo build,
+      # which applies the reviewed jitterentropy patch inside its submodule.
+      # Materialize C8.4 before C8.3 changes the operator checkout's submodule.
+      # The artifact is not retained or executed; physical evidence additionally
+      # requires a real board capture and cold boot.
+      - name: Type/link-check the C8.4 physical single-boot collector
+        run: |
+          source_commit="$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$source_commit"
+          challenge="$(openssl rand -hex 32)"
+          frozen="$RUNNER_TEMP/vibeos-c84-frozen-$challenge"
+          python3 -B scripts/c84-source-materialization.py materialize \
+            --source "$GITHUB_WORKSPACE" \
+            --destination "$frozen" \
+            --source-commit "$source_commit" \
+            --challenge "$challenge"
+          cd "$frozen"
+          RUSTC_WRAPPER="$(command -v false)" \
+          CARGO_PROFILE_RELEASE_OPT_LEVEL=0 \
+          RUSTFLAGS='--c84-ambient-rustflags-must-not-leak' \
+          VIBEOS_C84_SOURCE_COMMIT="$source_commit" \
+          VIBEOS_C84_CHALLENGE="$challenge" \
+            ./scripts/build-milkv-duo.sh --wasm-aot-profile
+      - name: Build the isolated Milk-V Duo C8.3 sampler (CI-only identity)
+        run: |
+          VIBEOS_C83_SOURCE_COMMIT="$(git rev-parse HEAD)" \
+          VIBEOS_C83_CHALLENGE=8383838383838383838383838383838383838383838383838383838383838383 \
+            ./scripts/build-milkv-duo.sh --runtime-costs
       - name: Build the Milk-V Duo kernel
         # FIT/full-card packaging still requires a prebuilt official SDK and
         # remains part of the documented manual hardware acceptance flow.

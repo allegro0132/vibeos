@@ -1,0 +1,24 @@
+[package]
+name = "vibeos-wasmi-reference-validation"
+version = "1.1.0-vibeos-ref1.1"
+edition = "2021"
+rust-version = "1.86"
+publish = false
+description = "C8.12 validation identity facade for bounded Reference Types"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "wasmi"
+path = "src/lib.rs"
+
+[features]
+default = []
+extra-checks = ["wasmi-reference-base/extra-checks"]
+prefer-btree-collections = ["wasmi-reference-base/prefer-btree-collections"]
+std = ["wasmi-reference-base/std"]
+
+[dependencies.wasmi-reference-base]
+package = "vibeos-wasmi-softfloat"
+path = "../vendor/wasmi-softfloat/crates/wasmi"
+version = "=1.1.0-vibeos-f2.1"
+default-features = false

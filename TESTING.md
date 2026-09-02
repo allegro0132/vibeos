@@ -6,6 +6,30 @@ Four layers, cheapest first. Run them all before pushing.
 cargo test --workspace --exclude vibeos-sshd # VibeOS portable tests, no QEMU
 cargo test --manifest-path vendor/sunset/Cargo.toml -p sunset \
   --no-default-features --features alloc # audited Sunset fork tests
+cargo test --locked --offline -p vibeos-wasm-runtime \
+  --test decode_limits -- --test-threads=1 # C1.2 no attacker-scaled decode allocation
+cargo test --locked --offline -p vibeos-wasm-runtime \
+  --test effective_maxima -- --test-threads=1 # C1.3 adjacent execution/allocation maxima
+cargo test --locked --offline -p vibeos-wasm-runtime \
+  --test fuel_quantum -- --test-threads=1 # C1.4 total fuel/resumable quantum
+cargo test --locked --offline -p vibeos-wasm-runtime \
+  --test trap_diagnostics -- --test-threads=1 # C1.5 stable Core trap diagnostics
+cargo test --locked --offline -p vibeos-wasm-runtime --test core_spec # C1.6 pinned official integer semantics
+cargo test --locked --offline -p vibeos-wasm-runtime --test core_robustness # C1.7 deterministic bounded corpus
+cargo test --locked --offline -p vibeos-component-runtime \
+  --test component_profile_limits -- --test-threads=1 # C2.1 adjacent Profile-1 limits
+cargo test --locked --offline -p vibeos-component-runtime \
+  --test predecode -- --test-threads=1 # C2.1 allocation-free structural preflight
+cargo test --locked --offline -p vibeos-component-runtime \
+  --test canonical_language_fixtures # C2.3 Rust/C rich-value round-trip
+C2_WASI_SDK_PATH=/path/to/wasi-sdk-33.0-arm64-macos \
+  ./scripts/rebuild-c2-language-fixtures.sh # C2.3 exact source/Core gate
+cargo test --locked --offline -p vibeos-component-runtime \
+  --test c27_component_reference # C2.7 pinned Component reference differential
+cargo test --locked --offline -p vibeos-component-runtime \
+  --test c27_component_bytes # C2.7 bounded Component-byte corpus
+cargo test --locked --offline -p vibeos-component-runtime \
+  --test c27_canonical_values # C2.7 bounded Canonical-value corpus
 cargo check -p vibeos-sshd --features qemu-virt
 cargo check -p vibeos-sshd --features milkv-ssh-acceptance
 cargo test -p vibeos-driver-dwc2-host -p vibeos-bsp-milkv-duo
@@ -20,7 +44,1918 @@ cargo test -p vibeos-driver-dwc2-host -p vibeos-bsp-milkv-duo
 ./scripts/bench.py             # fixed QEMU/TCG run checked against the baseline
 ./scripts/bench.py --smp-scaling # equal-work four-hart throughput acceptance
 ./scripts/status.sh            # derive current test/corpus counts on the host
+C82_WASI_SDK_PATH=/path/to/wasi-sdk-33.0-arm64-macos \
+  ./scripts/test-c82-preview1-corpus.sh # C8.2 source-to-execution gate
+python3 -B scripts/verify-c83-runtime-costs.py --selftest --check-manifest
+python3 -B scripts/capture-c83-duo-runtime-costs.py --selftest
+python3 -B scripts/verify-c83-evidence.py --selftest
+# Published fixed-QEMU C8.4 replacement gate; no QEMU or physical replay
+python3 -B scripts/verify-c84-qemu-published-evidence.py --check-published
+python3 -O -B scripts/verify-c84-qemu-published-evidence.py --check-published
+python3 -B scripts/verify-c84-qemu-published-evidence.py --selftest
+python3 -O -B scripts/verify-c84-qemu-published-evidence.py --selftest
+# Retained capture-time transport tooling; non-evidence on the current tree
+python3 -B scripts/c84-qemu-aot-decision-peer.py --selftest
+./scripts/run-c84-qemu-aot-decision.sh --selftest
+# Formal mode additionally requires the clean pushed codex/wasm commit, a live
+# fixed-remote query, raw cat-file export of exact commit/gitlink blobs with
+# safe byte-identified local configs, no filters/rewrite, GIT_NO_LAZY_FETCH,
+# and a fresh private Cargo target,
+# plus private QEMU/OpenSBI/kernel copies and pinned /usr/bin/ssh on Darwin SSV.
+# Cargo runs from / with an absolute manifest and the checksum-verified
+# 213-package union of project plus pinned rust-src Cargo.lock inputs. Its
+# private CARGO_HOME is config-only before/after; fixed-clock `.global-cache`,
+# two empty package locks, and the registry tag are exact-gated then removed
+# and fsynced. PATH/tools, SOURCE_DATE_EPOCH, the direct archive path, and
+# pre/post full-toolchain/rust-src/crate/ld.lld closure are independently bound.
+# Firmware search, QEMU version, and live QEMU share one exact deny-by-default
+# environment. One actual argv reaches the process and evidence; the verifier
+# independently normalizes it. Source/custody QEMU have pre/post/final Mach-O
+# closure plus absent module-search dirs on the exact Darwin SSV/build.
+# The formal launcher also pins CPython 3.14.6, disables site and bytecode
+# loading, and verifies Python.app, stdlib, _hashlib/_lzma/_zstd, linked libs,
+# and OPENSSL_CONF=/dev/null plus OPENSSL_MODULES=/var/empty.
+# Shared publisher plus retained Duo-v1 software custody gates
+python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
+bash -n scripts/build-milkv-duo.sh scripts/package-milkv-duo-sdk.sh \
+  scripts/verify-milkv-duo-image.sh
+python3 -B scripts/c84-source-materialization.py --selftest --check-source
+python3 -B scripts/c84-docker-runtime.py --selftest
+./scripts/verify-milkv-duo-image.sh --selftest
+python3 -B scripts/capture-c84-duo-aot-decision.py --selftest
+python3 -B scripts/verify-c84-evidence.py --selftest
+cargo test --locked -p vibeos-component-runtime --no-default-features \
+  --features c84-profile-hooks --test c84_profile
+cargo test --locked -p vibeos-wasm-aot-profile
+cargo check --locked -p vibeos-wasm-aot-profile \
+  --target riscv64imac-unknown-none-elf
+./scripts/qemu-c84-profile-slot-test.sh # C8.4 slot ownership/topology gate
+./scripts/qemu-c84-core-poll-test.sh # C8.4 real Core observer/slot gate
+./scripts/qemu-c84-profile-irq-overlay-test.sh # C8.4 real self-SSIP overlay gate
+./scripts/qemu-c84-profile-child-delegation-test.sh # C8.4 prepared-child lineage gate
+python3 -B scripts/verify-c84-ssh-profile-request-parent.py --selftest --check-source
+./scripts/qemu-c84-ssh-request-parent-test.sh # C8.4 authenticated request-parent/reuse gate
+python3 -B scripts/verify-c84-ssh-managed-child-core.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-core-test.sh # C8.4 real managed-child/ordinary-Core SSH gate
+python3 -B scripts/verify-c84-ssh-managed-child-phase-sidecar.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-phase-sidecar-test.sh # C8.4 parent/child phase sidecar gate
+python3 -B scripts/verify-c84-ssh-managed-child-irq-overlay.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-irq-overlay-test.sh # C8.4 parent/child causal self-SSIP gate
+python3 -B scripts/verify-c84-ssh-managed-child-finish-verify.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-finish-verify-test.sh # C8.4 response finish/verify/discard gate
+python3 -B scripts/verify-c84-ssh-managed-child-verified-stream.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-verified-stream-test.sh # C8.4 verified summary/stream completion gate
+python3 -B scripts/verify-c84-ssh-managed-child-trusted-sample.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-trusted-sample-test.sh # C8.4 live terminal evidence/opaque bundle gate
+python3 -B scripts/verify-c84-ssh-managed-child-single-boot-collector.py --selftest --check-source
+python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py --selftest
+./scripts/qemu-c84-ssh-managed-child-single-boot-collector-test.sh # C8.4 private single-boot collector/audit gate
+cargo test --locked -p vibeos-image-policy --no-default-features \
+  --features milkv-duo-sd --test stream_pin \
+  frozen_case_filter_profile_preflight_proves_interval_capacity -- --exact
+# C8.8-F1 immutable contract gate
+cargo test --locked --offline -p vibeos-component-format
+cargo test --locked --offline -p vibeos-wasm-runtime --test current_engine
+cargo test --locked --offline -p vibeos-component-runtime --test current_engine
+cargo test --locked --offline -p vibeos-wasm-runtime --test runtime \
+  profile_rejects_disabled_proposals_before_compilation -- --exact
+cargo test --locked --offline -p vibeos-wasm-runtime --test trap_diagnostics \
+  validation_unsupported_and_limit_admission_codes_are_exact -- --exact
+# C8.8-F2 acceptance-only Core validator/software-float gates
+cargo check --locked --offline -p vibeos-wasm-float-candidate --no-default-features
+cargo test --locked --offline -p vibeos-wasm-runtime \
+  --test profile_2_candidate_inspection
+cargo test --locked --offline -p vibeos-wasm-float-candidate \
+  --features c88-f2-acceptance
+# Offline source/dependency and exact transitive F4/F5 candidate closure.
+# Recursively audits repo-local normal/dev/build/target path dependencies,
+# implicit members reached by actual path edges. Scope priority is exact:
+# invocation root when it can claim; otherwise the nearest workspace found from
+# the target itself outward, skipping excludes. A nested package+workspace is
+# rejected only when the invocation root can claim its non-excluded target.
+# Inherited templates are expanded only for discovered packages. Acceptance-only:
+# every package default is F2-inert and code 5 stays inert.
+python3 -B scripts/verify-c88-f2-supply-chain.py
+python3 -O -B scripts/verify-c88-f2-supply-chain.py
+python3 -B scripts/verify-c88-f2-supply-chain.py --self-test
+python3 -O -B scripts/verify-c88-f2-supply-chain.py --self-test
+# Pinned RISC-V compile gate; this is not target execution.
+RUSTC="$(rustup which --toolchain nightly-2026-08-01 rustc)" \
+"$(rustup which --toolchain nightly-2026-08-01 cargo)" check --locked \
+  -p vibeos-wasm-float-candidate --features c88-f2-acceptance \
+  --target riscv64imac-unknown-none-elf
+# Fresh release build plus candidate-specific LLVM/object audit.
+python3 scripts/verify-c88-f2-riscv-object.py
+# C8.8-F3 acceptance-only WIT/Canonical ABI scalar-float gates
+cargo test --locked --offline -p vibeos-component-runtime \
+  --features c88-f3-acceptance
+python3 -B scripts/verify-c88-f3-riscv-object.py --self-test
+# Fresh release build plus F3 workspace-owned LLVM/object audit. This is not
+# QEMU or physical-target execution.
+python3 -B scripts/verify-c88-f3-riscv-object.py
+# C8.8-F4 default-off exact-image admission and lifecycle host gates
+cargo test --locked --offline -p vibeos-image-policy \
+  --features c88-f4-float-candidate
+cargo test --locked --offline -p vibeos-component-admission \
+  --features c88-f4-acceptance
+cargo test --locked --offline -p vibeos-component-runtime \
+  --features c88-f4-acceptance
+cargo test --locked --offline -p vibeos-component-image-adapter \
+  --features c88-f4-float-candidate
+# Production durable paths must still reject validation-only profile code 5.
+cargo test --locked --offline -p vibeos-component-loader \
+  profile_instance_limits_and_exact_wit_are_revalidated
+cargo test --locked --offline -p vibeos-component-format \
+  --test graph_version \
+  validation_only_artifact_profiles_do_not_enter_the_durable_graph_codec \
+  -- --exact
+# C8.8-F5 shared host and fixed-QEMU qualification gates
+cargo check --locked --offline -p vibeos-wasm-float-target \
+  --no-default-features
+cargo test --locked --offline -p vibeos-wasm-float-target \
+  --features c88-f5-acceptance
+python3 -B scripts/qemu-c88-f5-float-target.py --selftest
+python3 -O -B scripts/qemu-c88-f5-float-target.py --selftest
+python3 -B scripts/verify-c88-f5-float-target.py --selftest
+python3 -O -B scripts/verify-c88-f5-float-target.py --selftest
+python3 -B scripts/verify-c88-f5-riscv-elf.py --self-test
+python3 -O -B scripts/verify-c88-f5-riscv-elf.py --self-test
+python3 -B scripts/verify-c88-f5-qemu-target-gate.py --check-contract
+python3 -O -B scripts/verify-c88-f5-qemu-target-gate.py --check-contract
+python3 -B scripts/verify-c88-f5-qemu-target-gate.py --selftest
+python3 -O -B scripts/verify-c88-f5-qemu-target-gate.py --selftest
+# This checks the retained triplet's structure, source membership, and hashes.
+# It does not replay the four raw evidence files or publisher execution.
+python3 -B scripts/verify-c88-f5-qemu-target-gate.py \
+  --check-decision \
+  acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-decision.json \
+  --normal-receipt \
+  acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-normal-receipt.json \
+  --optimized-receipt \
+  acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-optimized-receipt.json
+python3 -O -B scripts/verify-c88-f5-qemu-target-gate.py \
+  --check-decision \
+  acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-decision.json \
+  --normal-receipt \
+  acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-normal-receipt.json \
+  --optimized-receipt \
+  acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-optimized-receipt.json
+# Post-F5 review-charter integrity only; this allocates and authorizes nothing.
+python3 -B scripts/verify-c88-float-successor-review-boundary.py --check-contract
+python3 -O -B scripts/verify-c88-float-successor-review-boundary.py --check-contract
+python3 -B scripts/verify-c88-float-successor-review-boundary.py --selftest
+python3 -O -B scripts/verify-c88-float-successor-review-boundary.py --selftest
+# C8.9-S1 identity/design only. No emulator or physical target is run; code 5
+# remains inert and code 6 must not be materialized before C8.9-S2.
+python3 -B scripts/verify-c89-float-successor-design.py --check-contract
+python3 -O -B scripts/verify-c89-float-successor-design.py --check-contract
+python3 -B scripts/verify-c89-float-successor-design.py --selftest
+python3 -O -B scripts/verify-c89-float-successor-design.py --selftest
+# Development boot only; cannot export or count as formal evidence.
+python3 -B scripts/qemu-c88-f5-float-target.py \
+  --allow-dirty-smoke --timeout-seconds 300
+# A fresh formal replay requires clean codex/wasm, HEAD == the local
+# origin/codex/wasm tracking ref after an operator fetch, and seven absent
+# output paths outside the worktree. The publisher owns both normal and -O
+# workers; callers cannot supply candidates, receipts, or a challenge.
+f5_evidence_dir="$(mktemp -d /private/tmp/vibeos-c88-f5-formal.XXXXXX)"
+python3 -B scripts/qemu-c88-f5-float-target.py \
+  --timeout-seconds 300 \
+  --kernel-out "$f5_evidence_dir/kernel.elf" \
+  --elf-audit-out "$f5_evidence_dir/elf-audit.json" \
+  --uart-out "$f5_evidence_dir/qemu-uart.log" \
+  --environment-out "$f5_evidence_dir/environment.json"
+python3 -B scripts/verify-c88-f5-qemu-target-gate.py \
+  --publish-matrix \
+  --kernel "$f5_evidence_dir/kernel.elf" \
+  --elf-audit "$f5_evidence_dir/elf-audit.json" \
+  --uart "$f5_evidence_dir/qemu-uart.log" \
+  --environment "$f5_evidence_dir/environment.json" \
+  --normal-receipt-out "$f5_evidence_dir/normal-receipt.json" \
+  --optimized-receipt-out "$f5_evidence_dir/optimized-receipt.json" \
+  --decision-out "$f5_evidence_dir/decision.json"
+python3 -B scripts/verify-c88-f5-qemu-target-gate.py \
+  --check-decision "$f5_evidence_dir/decision.json" \
+  --normal-receipt "$f5_evidence_dir/normal-receipt.json" \
+  --optimized-receipt "$f5_evidence_dir/optimized-receipt.json"
+# C8.8-F5 Milk-V Duo retained contract and compile-readiness checks.
+# Compile/static inspection only: no packaging, flashing, serial access, boot,
+# capture, or physical-evidence claim.
+cargo test --locked --offline -p vibeos-wasm-float-target \
+  --no-default-features \
+  --features c88-f5-duo-compile-readiness
+python3 -B scripts/verify-c88-f5-duo-readiness.py
+python3 -O -B scripts/verify-c88-f5-duo-readiness.py
+python3 -B scripts/verify-c88-f5-duo-readiness.py --selftest
+python3 -O -B scripts/verify-c88-f5-duo-readiness.py --selftest
+# Future physical-v1 transcript/campaign contract only. These host checks use a
+# reserved synthetic fixture; they do not build an armed producer or image and
+# never access a package, serial device, board, flash, reset, or boot path.
+python3 -B scripts/verify-c88-f5-duo-physical-transcript.py --check-contract
+python3 -O -B scripts/verify-c88-f5-duo-physical-transcript.py --check-contract
+python3 -B scripts/verify-c88-f5-duo-physical-transcript.py --selftest
+python3 -O -B scripts/verify-c88-f5-duo-physical-transcript.py --selftest
+./scripts/build-c88-f5-duo-readiness.sh
+duo_readiness_elf="target/c88-f5-duo-readiness/build/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo"
+duo_audit_dir="$(mktemp -d /private/tmp/vibeos-c88-f5-duo-audit.XXXXXX)"
+python3 -B scripts/verify-c88-f5-duo-readiness.py \
+  --elf "$duo_readiness_elf" \
+  --audit-output "$duo_audit_dir/normal.json"
+python3 -O -B scripts/verify-c88-f5-duo-readiness.py \
+  --elf "$duo_readiness_elf" \
+  --audit-output "$duo_audit_dir/optimized.json"
+cmp "$duo_audit_dir/normal.json" "$duo_audit_dir/optimized.json"
+cargo fmt -p vibeos-component-format -- --check
+cargo fmt -p vibeos-wasm-runtime -- --check
+cargo fmt -p vibeos-wasm-float-candidate -- --check
+cargo fmt -p vibeos-wasm-float-target -- --check
+cargo fmt -p vibeos-component-runtime -- --check
+cargo fmt -p vibeos-component-admission -- --check
+cargo fmt -p vibeos-component-image-adapter -- --check
+cargo fmt -p vibeos-image-policy -- --check
+git diff --check
 ```
+
+`wasm-runtime/tests/decode_limits.rs` is the C1.2 Core decode-account gate. It
+builds raw modules locally at every applicable enabled Profile-1 ceiling and at
+the adjacent limit-plus-one mutation. The hostile matrix covers raw and
+declared lengths, bounded and imported-plus-defined counts, compact-import
+expansion, materialization-capable disabled type/operator vectors, signature
+arities, compressed locals, structured-control depth, table and memory maxima,
+data lengths/segments, element segments/items, and aggregate encoded custom
+names plus data. Enabled exact ceilings must be admitted; fields modeled by
+`CoreSummary` must also report the exact count. Disabled multi-value remains
+rejected even when its numeric result arity is within the configured ceiling.
+
+The test installs a thread-local-enabled wrapper around the host `System`
+allocator. Inputs are constructed outside the measured interval. Inside it,
+the test records allocation-call count, cumulative requested bytes, and largest
+single request for the current test thread; these are request-envelope metrics,
+not live/high-water memory or kernel-owner attribution. Every hostile rejection
+runs through both `inspect_core` and `ValidatedCore::new_in` with one prebuilt
+engine and a zero compile reservation. The stable error and request envelope
+must match, proving that the production entrypoint does not reach Wasmi
+compilation. Both absolute small bounds and shallow-versus-materialization-size
+comparisons prevent a hostile declaration from amplifying predecode allocation.
+
+`CoreSummary` plus the checked counters is the Core decoder's structural
+account. Type, table, global, data and MVP element framing is predecoded before
+attacker-sized vectors can be materialized, and function control frames use a
+fixed Profile-1 stack. This host gate does not measure Component decoding,
+successful Wasmi compilation, instantiation, growth, call-depth enforcement,
+kernel allocator ownership, QEMU or Duo allocation, or exhaustive fuzzing;
+those have separate gates or later roadmap nodes.
+
+`wasm-runtime/tests/effective_maxima.rs` is the portable C1.3 adjacent-boundary
+gate. An image-selected two-page store ceiling admits the first guest
+`memory.grow`, then repeatedly returns exact `LimitExceeded` without changing
+the two-page memory; a smaller module-declared maximum remains the distinct Core
+`MemoryOutOfBounds` path for host-directed growth. The production host table
+seam grows an MVP function table to exactly 4,096 elements, then rejects 4,097
+twice with `LimitExceeded` and an unchanged size. Guest `table.grow` remains an
+`UnsupportedFeature`; the gate does not enable reference types.
+
+The recursive countdown pins Wasmi's configured call-stack interpretation:
+argument 127 succeeds with 128 active frames, while argument 128 attempts the
+129th frame and repeatedly returns `CallDepthExceeded`; a shallow call succeeds
+afterward. The compile-reservation case pins the calculator-reported policy
+charge and charge-minus-one behavior. Its 27-byte raw module declares 4,096
+locals in one compact group; `CoreSummary::max_locals` records that count, and
+the policy charge includes the corresponding pointer-sized per-function
+expansion. A short reservation through `ValidatedCore::new` must have the same
+allocation-request fingerprint as `inspect_core`, proving rejection occurs
+before engine creation and `Module::new`.
+
+That allocation probe labels two synthetic caller-selected owner scopes and
+records calls, cumulative requested bytes, and largest requests for the current
+test thread. It proves the portable runtime does not switch a rejected or
+accepted compilation into the other label and observes, during selected-scope
+compilation, an allocation request at least as large as the compressed-locals
+expansion. `OwnerAllocationReservation` is a caller-provided per-compilation
+policy-ceiling assertion, not an owner credential or ledger debit. The
+deterministic policy charge is not an upper bound on Wasmi's allocation-request
+total or live/high-water memory.
+Live/high-water/denial accounting, an unforgeable kernel owner, aggregate memory
+across a multi-module Component principal, and lifecycle reclamation remain
+C4.2/C6 evidence. The gate performs no QEMU or Duo work.
+
+`wasm-runtime/tests/fuel_quantum.rs` is the portable C1.4 total-fuel and poll-
+quantum gate. It first pins the current engine identity to enabled Wasmi fuel
+consumption and the versioned `Wasmi110Default` cost schedule. Runtime starts
+reject zero fuel, zero quantum, either Profile-1 maximum plus one, and a quantum
+larger than its total; the exact Profile maxima remain executable.
+
+The preemptible spin fixture uses total fuel 41 and quantum 10. Its four
+`Pending` states have exact `(consumed, remaining)` values `(9, 32)`, `(19,
+22)`, `(29, 12)`, and `(39, 2)` under the pinned engine, so every poll advances
+by at most one quantum without resetting the logical total. The fifth poll is
+the single `FuelExhausted` terminal with `(41, 0)`. Cancellation after the first
+`Pending` consumes no more guest fuel, and cancellation also wins when an
+explicit host-side debit has already reduced remaining fuel to zero. Every
+terminal clears the active continuation, a later instance poll is invalid, and
+the same instance is immediately reusable. The legacy borrowed invocation now
+also delivers `Ready`, `FuelExhausted`, or `Cancelled` exactly once; later polls
+return `Validation` without changing metrics.
+
+Wasmi 1.1 meters some translated basic blocks and dynamic operations as
+indivisible units. With its pinned 64-bytes-per-fuel default, growing ten pages
+has a 10,240-fuel dynamic charge, already above Profile 1's maximum 10,000-fuel
+quantum. With 20,000 total fuel the gate repeats that admitted operation and
+requires exact `(4, 19,996)` metrics, stable `LimitExceeded`, unchanged memory,
+and immediate instance reuse. With 10,000 total fuel, insufficiency of the
+remaining total budget takes priority and produces `FuelExhausted` at `(4,
+9,996)`. The adjacent
+nine-page charge is 9,216 fuel: quantum 9,220 completes it in one poll, while
+9,219 and the exact dynamic-charge quantum 9,216 both save and resume it with
+the same final `(9,220, 10,780)` metrics. Quantum 9,215 returns `LimitExceeded`,
+and a 9,219 total returns `FuelExhausted`, both before growth. This is an
+intentional fail-closed
+exception to the spin fixture's `Pending` path: the runtime never silently
+widens a fuel grant to execute an indivisible charge.
+
+Wasmi precharges translated basic blocks, so a resumed poll may execute a
+suffix whose fuel was debited by an earlier poll. The gate therefore bounds new
+fuel granted and debited per poll; it does not assert an exact source-opcode,
+wall-clock, or CPU-cycle bound for each poll.
+
+This gate closes the portable Core fuel ledger and continuation behavior only.
+Automatic charging of host, adapter, and Canonical ABI work remains C2.6;
+component-executor wake behavior and target latency require their own
+integration evidence. The gate does not claim exhaustive opcode fuel coverage,
+a QEMU timing bound, or physical-Duo execution.
+
+`wasm-runtime/tests/trap_diagnostics.rs` is the portable C1.5 stable Core-trap
+gate. Together with the exact full-enum table in
+`component-format/tests/profile.rs`, it freezes every `TrapCode` numeric value
+and kebab-case name and classifies the twelve Core-facing codes separately from
+the later Canonical ABI and resource codes. It also directly pins all eleven
+Wasmi 1.1 Core trap variants, the complete typed memory and table error
+families including their instantiation wrappers, and selected typed
+instantiation limits and segment bounds. An indirect call through a null entry
+and a numeric table-index overflow intentionally share
+`TableOutOfBounds`; a present target with the wrong signature remains the
+distinct `IndirectCallTypeMismatch`. Wasmi's float-to-integer conversion trap
+maps fail-closed to `Validation`, but admitted Profile-1 modules cannot produce
+it because floating-point types and operators are disabled.
+
+C8.8-F1 does not make that trap guest-reachable. The acceptance-only F2
+candidate maps quiet and signaling NaN truncation to stable
+`InvalidConversionToInteger` (`0x0207`), while finite out-of-range values and
+positive or negative infinity remain `IntegerOverflow` (`0x0202`). Runtime and
+translator-fold tests cover all eight widths and signedness combinations,
+exact valid boundaries, adjacent positive and negative overflow, signed NaNs,
+and infinities. Production Profile 1 remains unchanged and guest-unreachable
+for these operations.
+
+Production execution fixtures cover signed division by zero and overflow,
+conditional `unreachable`, the first invalid four-byte load, valid/null/wrong-
+signature/first-out-of-range indirect calls, the exact 128/129 active-frame
+boundary, and short-fuel exhaustion. Every execution trap is delivered twice,
+clears active state, preserves its exact code and name, and is followed by a
+safe call on the same instance. Runtime API validation separately fixes missing
+exports, wrong arity, and wrong scalar argument type; a rejected start is
+failure-atomic and the instance remains callable.
+
+Admission fixtures distinguish malformed `Validation`, disabled-feature
+`UnsupportedFeature`, and module-size `LimitExceeded` through both structural
+inspection and the production compiler. Instantiation additionally fixes an
+active data segment's first invalid byte as `MemoryOutOfBounds` and an active
+element segment's first invalid table slot as `TableOutOfBounds`, with adjacent
+valid placements through both standalone and Component-group instantiation. A
+group policy one byte below a module's initial memory maps to `LimitExceeded`,
+not generic validation. These mappings inspect Wasmi's typed errors, not its
+display or debug strings.
+
+This gate freezes the selected Profile-1 Core diagnostic contract. It is not a
+full Core specification or opcode suite, differential-runtime evidence, a fuzz
+campaign, a Canonical ABI/resource diagnostic claim, a wall-clock bound, or a
+physical-Duo result; those belong to C1.6, C1.7, C2+, and target integration.
+
+The C1.6 specification gate is deliberately offline and byte-pinned. It vendors
+the complete official [`test/core/fac.wast`](https://github.com/WebAssembly/spec/blob/977f97014c962f7bd1291fcc6d28b41a924882bf/test/core/fac.wast)
+from the WebAssembly/spec `wg-1.0` commit
+`977f97014c962f7bd1291fcc6d28b41a924882bf` at
+`wasm-runtime/tests/spec/core-wg-1.0/fac.wast`: 2,602 bytes with SHA-256
+`7bf27b090f6533865acc79a37e0331b27fa11d7a3ab27b02e32e2efddfb405e7`.
+The adjacent `LICENSE` is also pinned at 11,358 bytes and SHA-256
+`c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08`;
+[`PROVENANCE.md`](wasm-runtime/tests/spec/core-wg-1.0/PROVENANCE.md) records the
+repository, tag, immutable commit, source path, download URL, sizes, and
+digests. The test performs no network fetch and fails if either vendored byte
+sequence changes.
+
+`wasm-runtime/tests/core_spec.rs` consumes the whole script, not selected
+hand-transcribed cases. It requires exactly one anonymous module, five
+`assert_return` directives, and one `assert_exhaustion`, and rejects every
+unknown directive. Each factorial return is compared three ways: the official
+WAST result, the Vibe Profile-1 runtime, and pinned
+`dlr-wasm-interpreter` 0.2.0. The exhaustion action must map to Vibe's stable
+`CallDepthExceeded` trap and DLR's `StackExhaustion`. This closes the selected
+Profile-1 integer baseline for indexed and named calls, recursion, locals,
+blocks, loops, branches, the fixture's non-negative factorial comparisons,
+and wrapping `i64` arithmetic
+under Vibe's configured bounds. It is not full WebAssembly Core 2.0
+conformance and does not enable any disabled Profile-1 feature. C1.6 does not
+itself supply C1.7 robustness evidence; that separate gate is described below.
+
+`wasm-runtime/tests/core_robustness.rs` is the C1.7 deterministic bounded CI
+corpus. Its in-process xorshift64* generator uses the fixed seed
+`0x6a09_e667_f3bc_c909`; the test pins exactly 679 execution inputs and 575,262
+aggregate module bytes. The input FNV-1a digest `0x7fc98ac32e54fb64`
+commits each case tag, module length and bytes, and little-endian `i32`
+invocation argument. The corpus contains raw inputs at every length from 0
+through 192, the same tail lengths after an exact Core magic/version prefix,
+and 96 valid generated Profile-1 modules plus one truncation and one bit flip
+of each. The valid modules cover integer arithmetic, direct calls, `if`, loops,
+bounded memory, and `unreachable`. Dedicated cases additionally cover a
+disabled float signature, a validated but unlinked import, fuel-bounded
+nontermination, call-depth exhaustion, the exact 524,289-byte module-size
+limit-plus-one input, and a compile reservation one byte below the measured
+requirement. Every ordinary structured input is at most 4,096 bytes.
+
+Each pipeline exercise is enclosed by `catch_unwind`, repeated from a fresh
+pipeline, and required to return the same full outcome. Every admitted summary
+and compile reservation is checked against Profile 1. Runnable modules receive
+exactly 50,000 total fuel and a 10,000-fuel quantum for at most six polls; every
+pending or terminal poll preserves the fuel ledger and consumes no more than
+one quantum. The 96 unmodified generated modules and the dedicated spin and
+recursion cases additionally require exact `Ready`, `Unreachable`,
+`FuelExhausted`, and `CallDepthExceeded` outcomes.
+
+The ordered normalized outcome digest `0x2e7b93e373f2c522` commits every full
+admission or instantiation error (trap, detail, and Core limit kind), start or
+execution trap code, and typed ready vector. Exact stage counts are 552
+admission rejections (506 malformed, 42 unsupported, and 4 limited), 127
+admissions, 126 instantiations, 111 starts, 101 ready terminals, and 10 trapped
+terminals; the remaining paths are one instantiation rejection and 15 start
+rejections. Thus arbitrary and mutated cases may have different kinds of
+pinned outcomes, but none may drift, panic, reach a host call, exceed the poll
+bound, or leave an active call after a terminal result.
+
+This closes the selected deterministic C1.7 evidence for decode, validation,
+instantiation, and execution under configured bounds. It is a reproducible
+bounded CI corpus, not coverage-guided or exhaustive fuzzing, and does not
+claim all byte sequences, actual cumulative/live allocator measurements,
+kernel-owner attribution, wall-clock bounds, or exhaustive opcode coverage.
+
+`component-runtime/tests/component_profile_limits.rs` is the C2.1 adjacent
+Profile-1 boundary gate. It first requires successful inert inspection at the
+exact ceilings, including 256 definitions, 256 aliases, 16 Core instances and
+16 Component instances in their independent namespaces, 256 canonical
+functions, 16 lowering adapters, type depth 16, eight embedded Core modules,
+and one exactly 524,288-byte embedded Core module. It then requires
+`DecodeError::Limit` at each adjacent value. The 524,289-byte Core case remains
+well below the 1,048,576-byte Component ceiling, so that rejection specifically
+pins the embedded-module boundary rather than the enclosing artifact boundary.
+No rejected input yields the sealed `ComponentPlan` required by an
+instantiation API.
+
+The companion `component-runtime/tests/predecode.rs` gate exercises the
+allocation-free structural pass. Top-level and nested aliases share one
+artifact-wide account, and every canonical lower is charged to the adapter
+account before its index or option vector is read. Truncated-entry cases pin
+that both ceilings take precedence once the excess declaration is known. The
+regular decoder still performs the same independent checks before reserving
+plan storage. This intentional precedence change leaves the C2.7 byte-corpus
+identity unchanged and reclassifies exactly one header-prefixed input from
+malformed to limit. Nested Component sections remain fail-closed as unsupported.
+This closes the selected C2.1 structural evidence; exact WIT-world resolution,
+Canonical ABI execution, and differential/fuzz evidence remain separate C2.2,
+C2.3--C2.6, and C2.7 gates.
+
+`component-runtime/tests/canonical_language_fixtures.rs` is the C2.3
+cross-language execution gate. The same exact
+`vibe:fixture/canonical-language@1.0.0` WIT world is implemented by
+freestanding Rust and C guests compiled for `wasm32-wasip1`. Their import-free
+Core modules are checked into
+`component-runtime/tests/fixtures/language/`, inspected under Vibe Profile 1,
+and embedded in deterministic import-free Components. The test pins the Rust
+Core/Component at 557/950 bytes and SHA-256
+`79e1eb3f2043c4ae224da6057279f80f32ec171106ad2112e8f7d2bf62e96f52` /
+`1826aef365bbc0c1061bd8f23eaea5883ed052220f711243cd7c29c335975cfe`,
+and the C Core/Component at 1,030/1,423 bytes and SHA-256
+`20e26c154f2fc3d0892a2175dd85912ea2df77ff43e22200864eba7e6d3f7e8e` /
+`2ee8f6154c6069d46d726e922a1d07979982d022dd8c02e035dcd244a9248b78`.
+
+Both Components execute the same four-case typed corpus covering booleans,
+signed and wide integers, Unicode scalar values, UTF-8 strings, byte lists,
+flags, enums, options, results, records, tuples, and both variant arms. The
+corpus pins 276 aggregate dynamic bytes and FNV-1a64
+`0x5a3e5d03338a9be3`. Each call has 1,000,000 total work, a 10,000-work poll
+quantum, and a 101-poll hard bound; host suspension, host failure, traps,
+poisoning, or a retained continuation fail the test. The adjacent provenance
+records exact compiler binaries and digests. The offline rebuild gate first
+reproduces both compiler outputs, then uses a digest-allowlisted structural
+sanitizer to remove only each linker's private, unreferenced mutable stack
+global before requiring byte-identical Profile-1 fixtures. This closes C2.3
+for the selected Rust/C language evidence; it neither claims every compiler
+nor supplies the separate C2.7 differential/fuzz evidence.
+
+The three C2.7 gates keep reference execution, Component bytes, and Canonical
+values as separate evidence. `c27_component_reference.rs` first requires Vibe
+Profile-1 admission, zero imports, and the exact C2.3 WIT world, then executes
+the byte-pinned Rust and C Components through both Vibe and Wasmtime 48.0.0.
+An empty Wasmtime linker supplies no ambient host authority. Each engine runs
+the same four cases for both fixtures; all 16 engine/case executions are
+compared with a neutral named representation as well as with each other. The
+test also retains the C2.3 pins of 276 aggregate dynamic bytes and corpus FNV
+`0x5a3e5d03338a9be3`, gives each reference call finite fuel, and proves that
+fuel was consumed without exhaustion. Wasmtime is an exact dev dependency with
+default features disabled and is used only by host tests; it is neither linked
+into the VibeOS target nor used as an admission oracle. Its release commit,
+crates.io digest, direct features, license, and Rust-version declaration are
+recorded in the adjacent
+[`PROVENANCE.md`](component-runtime/tests/reference/PROVENANCE.md).
+
+`c27_component_bytes.rs` uses seed `0x243f6a8885a308d3` and pins 4,323 inputs,
+4,604,005 aggregate bytes, maximum length 1,048,577, and corpus FNV
+`0x9edc2bd8460d97a4`. The cases comprise 512 arbitrary byte strings, 512 exact
+Component-header-prefixed strings, two admitted fixture originals, all 1,648
+proper-prefix truncations of those fixtures, one deterministic single-bit
+mutation at each of their 1,648 byte positions, and one limit-plus-one input.
+Every inspection is panic-contained. The gate pins all public decoder outcomes:
+863 accepted, 520 non-Components, 2,527 malformed, 134 unsupported, 11 limit
+failures, 267 invalid embedded Core modules, and one invalid wiring result,
+with zero allocation, duplicate-name, type-graph, or callback-signature
+failures for this exact corpus.
+
+`c27_canonical_values.rs` independently uses the same numeric seed for 512
+valid generated values spanning all 19 non-resource value families. Every
+case validates its generated type and value, lowers to bounded memory32, lifts
+it back under alternating parameter/result rules, and requires the exact value,
+usage accounting, allocation count, and encoded-memory digest inside a panic
+boundary. The pins are 799 type nodes, 772 value nodes, 1,026 dynamic bytes,
+88 list elements, 65 lower allocations, type/value depth 6/5, and corpus FNV
+`0xbf10e036e7750d0b`. A separate mutation pass requires exactly 512
+`TypeMismatch` results with digest `0x4cc0bcd2afdc82bc`; 32 named invalid
+type/value/memory cases pin digest `0x974017feed8c1e42` and the exact bool,
+character, UTF-8, bounds, alignment, limit, flags, discriminant, shape, and
+nesting errors. This is deterministic bounded CI fuzz evidence, not exhaustive
+coverage-guided fuzzing. Resource, stream, and future handles remain outside
+this corpus and resource/Canonical-ABI state fuzzing remains C3.6.
+
+The C8.2 gate is intentionally pinned to the reviewed
+`aarch64-apple-darwin` Rust distribution and wasi-sdk 33 macOS arm64 release.
+It fails closed when either toolchain is absent or has a different digest. The
+gate recompiles the checked-in Rust and C filters, verifies the exact compiler
+Core hashes, reproduces the sanitized Core modules and Components byte for
+byte, independently checks the CMP1 artifacts and named mutations, executes
+both filters through the bounded acceptance broker, and checks the feature-off,
+loader-isolation, and RISC-V `no_std` paths. It does not enable the Preview1
+profile for ordinary loader, graph, VSH, or durable registration.
+
+C1 through C8.2 remain accepted complete by historical-evidence policy; none
+is reopened, rerun, or individually rewalked.
+
+The C8.3 runtime-cost preparation and physical publication flow is documented
+in [docs/WASM_RUNTIME_COSTS.md](docs/WASM_RUNTIME_COSTS.md). Its dedicated image
+emits target-owned raw `rdtime` samples for validation, startup, Canonical ABI,
+native-async primitives, validation-only composition, host calls, memory, fuel,
+cancellation, and revocation. The independent host verifier owns the closed
+schema and all derived statistics. The original publication contract required
+one fixed QEMU boot and three real cold Duo boots from the same clean
+preparation commit; that tooling remains available, but C8.3 is accepted
+complete by historical-evidence policy and is not being rerun. Physical capture
+would also require the canonical `package-envelope.json`
+and image-verifier audit emitted by the pinned Linux/amd64 SDK packaging flow;
+the C8.3 record's container digest is an operator assertion, not hardware
+attestation.
+
+The C8.4 AOT-decision contracts are documented in
+[docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md). They freeze the exact
+authorized SSH `case-filter` product workload, mutually exclusive profiling
+phases, and fail-closed rules frozen before the published result. The
+decision-bearing QEMU-v1 contract fixes one fresh `virt`/RV64/TCG single-thread
+process with instruction counting, 3 warmups plus 21 retained samples, a 10 MHz
+clock, a 1,000,000-tick budget, and a 1.10 stability ceiling. C1 through C8.3 are
+accepted complete by historical-evidence policy. The retained Duo contract is
+non-blocking while physical testing stays paused. Neither possible fixed-QEMU
+outcome authorizes AOT or accepts native code.
+
+The current CI gate is
+`scripts/verify-c84-qemu-published-evidence.py`. It proves that the exact
+published bundle still matches publication commit `cbb1d0f`, that its source
+and capture-time verifier members still exist in source commit `e950a2f`, and
+that the stored decision remains emulator-only with zero physical inputs and
+no AOT/native-code authority. Its success is historical structure/hash
+integrity only: it does not rerun QEMU, replay publisher execution or ephemeral
+host custody, or establish physical provenance. The capture-time QEMU and
+physical verifiers remain frozen historical members; they are not run against
+later live policy files as a current-tree gate.
+
+Formal source custody inventories the superproject commit and both exact
+gitlinks, then writes only raw, independently OID-checked `git cat-file
+--batch` blob bytes with reviewed modes. It does not use checkout or Git
+clean/smudge conversion. Every Git command disables replacement objects and
+lazy fetching (`GIT_NO_LAZY_FETCH=1`) and ignores system/global configuration.
+The superproject and submodule local config files are byte-identified and
+parsed explicitly with `--no-includes` through a default-deny safe-key/value
+policy; filter configuration, URL rewrites, includes, and unknown keys fail
+closed. The formal fixed-remote query runs from `/` with no `/.git`. Dirty
+smoke still requires the fixed configured origin, but records its Cargo source
+as `<dirty-worktree>/firmware/qemu-virt/Cargo.toml` and can never claim the
+formal `<materialized-source>` provenance.
+
+The formal build uses exact PATH `/opt/homebrew/bin:/usr/bin:/bin`, the exact
+`cargo`, `rustc`, and `rustdoc` under the pinned toolchain root,
+`SOURCE_DATE_EPOCH` equal to the attested commit timestamp, and a canonical
+direct private crate-archive path distinct from the extracted source tree. It
+audits both the project and pinned rust-src locks into the fixed 213-package
+private directory source. Cargo's fixed cache clock and umask make the required
+SQLite cache, two empty package locks, and registry tag exact outputs; they are
+validated and recorded before removal/fsync, and an unknown private-home entry
+fails rather than being cleaned away.
+Firmware search, the version probe, and the live QEMU process all receive the
+same deny-by-default QEMU environment. The runner constructs one immutable
+actual argv and gives that value to the only QEMU process launch and evidence
+writer; the independent verifier validates the custody paths/host port and
+normalizes it independently before comparison with the fixed semantic argv.
+
+Both the source QEMU and byte-identical execution-custody copy carry identical
+before/after/final recursive non-system Mach-O closures. Homebrew edges remain
+inside the Cellar; system edges are limited to `/System/Library/` and
+`/usr/lib/` and bind the sealed read-only APFS root plus macOS 26.5.2, build
+`25F84`, Darwin `25.5.0`. Plugin argv and `QEMU_MODULE_DIR` are absent and the
+frozen module-search directories must not exist. This evidence accepts an
+explicit operational limit: same-UID host exclusivity is required because
+snapshots cannot exclude a swap-and-restore during the live process. It also
+makes no generic library-internal `dlopen` claim beyond the recursive Mach-O
+load-command graph.
+
+The pinned Python closure includes the Framework and Python.app executable,
+the reachable stdlib, `_hashlib`/libcrypto, `_lzma`/liblzma,
+`_zstd`/libzstd, and the xz/zstd symlink chains. Its empty-then-exact launch
+environment sets `OPENSSL_CONF=/dev/null` and `OPENSSL_MODULES=/var/empty`;
+the null device, empty provider directory, and SHA-256 known-answer result are
+verified. Finally, transcript parsing rejects every occurrence matching
+`WASM_[A-Z0-9_]+ FAIL`, including unknown future markers, before accepting the
+finite expected marker set.
+
+The image-policy command above enables `c84-profile-hooks` only through its
+dev-dependency and replays the exact 12,325-byte frozen input. It locks the
+1,251 typed polls, 1,165 Core polls, work ledger, dispatcher entries, 2,418
+no-wait intervals, and 4,918 managed-runner minimum which disproved the old
+4,096 cap. The verifier independently binds its 1,028/read, `4 + bytes`/write,
+and 1/close declarations, `required_work` branches, and ready/commit response
+sites to the kernel dispatcher and shared 1,024-byte component-host maximum.
+It pins the whole kernel component dispatcher file's reviewed byte identity,
+including attribute literal values, before scope extraction, rejecting module
+binding, `cfg` feature selection, alias, dead-code, and macro drift. It then
+strips comments and literals, and a second digest pins the seven balanced method
+scopes for localized review without accepting decoy text.
+The revised 65,536 capacity is an engineering bound for one packed active
+target sample, not a mathematical worst case.
+Formal samples must be complete and self-consistent; overflow or truncation is
+diagnostic-only.
+
+The retained physical C8.4 single-boot verifier self-test also closes one
+synthetic raw cold-boot transcript at a time:
+one metadata record, three warmups, 21 retained samples, and one end record. It
+rejects malformed JSON, wrong coordinates or campaign identity, incomplete or
+unmerged phase intervals, invalid fuel/poll counters, unstable retained data,
+and a stale ordered accumulator. Its host-file tests cover bounded stable reads,
+symlink and hardlink alias rejection, no-clobber summary creation, explicit
+overwrite, exact reread, and protected verifier inputs. A passing single-boot
+check reports physical and cold-boot provenance as unverified.
+
+The retained Duo-v1 physical C8.4 software-side closure has independent
+immutable source materialization, content-addressed build/package envelopes,
+host-observed Docker runtime custody, a full-SD-image verifier, a deliberately
+read-only three-boot UART capture program, and a final evidence verifier. The
+CI-safe commands listed above exercise source/config/path replacement attacks,
+runtime inspect/namespace mutations, shell syntax, raw-image parser mutations,
+capture stream/tree/no-clobber mutations, exact three-boot aggregation, and
+final evidence closure using synthetic host files. The source and runtime
+self-tests use only local fixtures, and
+`capture-c84-duo-aot-decision.py --selftest` never opens a serial device; no
+listed self-test invokes Docker, downloads an SDK, flashes media, resets a
+board, or claims a physical boot.
+
+The source proof deliberately separates namespaces: host materialization and
+offline verification bind the exact device/inode sets, while the fixed
+`/home/vibeos` read-only container mount rechecks content, Git administration,
+permissions, single-link counts, and clone disjointness after its runtime
+attestation is validated. Package preflight validates the package-mode
+attestation; the independent image verifier validates its own verify-mode
+attestation and separately runs the complete package-mode verifier because its
+image report still binds the package attestation. This accommodates Docker
+Desktop inode remapping without weakening the host-side independence proof.
+
+The fixed-QEMU plus three-cold-boot Duo text below is the original v1
+publication contract, not a current physical prerequisite or a new publication
+claim.
+
+The retained physical evidence contract binds three distinct boot indexes,
+revalidates the independently frozen C8.4 source and offline container-runtime
+closure, reruns the complete C8.3 evidence verifier from that explicit full
+preparation commit, and independently derives nearest-rank p50/p95 from all 63
+retained samples. It remains available for future qualification but no longer
+blocks C8.4. Historical C8.4 execution status (published 2026-08-28): Milk-V
+Duo physical testing is paused, C1 through C8.3 are accepted by historical
+evidence, and formal fixed-QEMU evidence completes C8.4 for
+`ssh-case-filter-12k-v1`. The published bundle at
+`benchmarks/wasm-aot-decision/qemu-v1/` binds source commit
+`e950a2facb6a6c230e67becb186bddf34a5924bb` and run ID
+`a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f`.
+Total p50/p95 are 2,899,765/2,901,632 ticks, interpretation p50/p95 are
+97,260/97,318, and per-sample-derived non-interpretation p50/p95 are
+2,802,541/2,804,417. Stability passes and `budget_miss=true`, but
+`interpretation_attribution=false`; the formal outcome is
+`aot-not-justified-on-fixed-qemu`. C8.5 through C8.7 were not entered for this
+workload and remain globally deferred. The stored next-node value remains
+`C8.8-skip-or-defer-C8.5-C8.7`; the live roadmap position is
+`c89-s2-implemented-pre-fixed-qemu-qualification`. This does not rewrite the historical C8.4
+decision. The evidence records `platform_class=emulator`,
+`physical_provenance=not-claimed`, `aot_authorized=false`, and
+`native_code_accepted=false`. Source immutability and Docker runtime custody
+remain local software evidence, not hardware, TPM, remote-attestation, or
+physical-cold-boot proof.
+
+The immutable historical C8.4 `next_node` value is
+`C8.8-skip-or-defer-C8.5-C8.7`; it is not the repository's current position.
+The C8.9 closure position is `c89-s3-qualified-sealed-float-runtime-released`.
+C8.9-S1 allocates and freezes the independent code-6 Float successor design;
+C8.9-S2 implementation and C8.9-S3 fixed-QEMU qualification are complete.
+The previous roadmap position was
+`c811-s1-simd-executable-design-frozen-pre-implementation`. The implementation
+position was `c811-s2-simd-executable-implemented-pre-fixed-qemu`, and C8.11
+closed at `c811-s3-qualified-sealed-simd-runtime-released`. The current roadmap
+position is `c813-e3-qualified-sealed-reference-runtime-released`;
+C8.10-S1 through C8.10-S5, C8.11-S1 through C8.11-S3, C8.12-R1/R2/R3, and C8.13-E1/E2/E3 are complete.
+
+The C8.8-F1 commands above prove the exact code-5 artifact identity and codec,
+strict NaN-policy metadata, unchanged integer-only Profile 1, absence from the
+current engine resolver, and fail-closed durable graph behavior. Code 5 is
+permanently `ValidationOnly`; it has no current validation-engine, production
+runtime/admission, command, durable publication, or production invocation
+activation path.
+
+The F2 commands execute Float only through the opt-in acceptance crate. They
+cover scalar runtime and translator-fold paths, strict NaN and bit transport,
+all conversion traps, fused paths, candidate trap recovery, limits, import
+denial, and repeatable fuel/quantum behavior. The fixed-seed 50,000-case host
+differential corpus is pinned by digest `0x05e1fa8e3d779f53`; 4,096 end-to-end
+candidate-Wasmi cases are pinned by `0xee61731687e8c81d`; hostile byte mutations
+and random modules are pinned by `0xb8eca6402ca6a5df`. The offline provenance
+verifier binds the renamed fork, backend, licenses, dependency closure, patch
+digests, unchanged Profile 1, and fail-closed source, consumer, feature-route,
+workspace-scope, path, alias, and code-5 mutation classes. The RISC-V
+release-object audit distinguishes the candidate fork from stock Profile 1 and
+rejects semantic FP LLVM operations, compiler float helpers, and target F/D
+instructions; sign-only LLVM forms must lower to integer bit operations.
+
+The F3 commands cover bit-only WIT/Canonical ABI scalar and nested-value
+boundaries, allocation-request/cleanup-model replay, fixed-seed differential
+and hostile-memory corpora, and the RISC-V object audit. That evidence remains
+separate from runtime wiring.
+
+The F4 commands enable only the default-off candidate features. The image pin
+binds SHA-256
+`5fdb9dc9a48a9c54e899a5dc724445083c055dbf0d664927ba55d9780cc9996a`, world
+`vibe:float-acceptance/lifecycle@1.0.0`, one synchronous
+`run(u32, f32, f64) -> f64` export, 131,072 bytes of memory, 100,000 total
+fuel, a 100-fuel poll quantum, and zero resources. Admission rejects every
+adjacent hash, world, profile, label, quota, topology, import, resource, and
+caller-authority input. The runtime derives and enforces the exact compile
+reservation, preserves exact finite bits, canonicalizes Component-boundary
+NaNs, permits at most one live instance per move-only lifecycle, and reclaims
+the whole instance after cancel, trap, or revoke. Cancel and trap require cold
+recovery; revoke is absorbing. These are per-lifecycle ceilings, not a global
+admission or concurrency ledger. The adapter test covers the complete
+exact-pin-to-admission-to-candidate-lifecycle chain without constructing a
+production command or durable value. A separate hostile fixture keeps both same-signature Core
+exports `run` and `other` but lifts `other` as Component `run`; admission and
+runtime reject that mismatch before compilation. The quota tests also grow
+memory exactly to its ceiling, reject the next page, and drive a finite-fuel
+loop through bounded pending quanta to deterministic reclamation and cold
+recovery. The loader and graph-codec tests independently keep code 5 out of
+production durable loading and CGV1.
+
+F1 through F4 are complete. F4 evidence above remains host evidence; F5 owns
+the separate target claim. For C8.8-F5 only, the formal fixed-QEMU gate now
+replaces the physical-Duo roadmap gate. The publisher-owned normal/`-O`
+matrix closed from clean, already-pushed implementation commit
+`0f06212f890077b2a3d1b4405a128058cb07c55e` (tree
+`a3a3ef403b80eb51e60dd3cb6a2a5b5a6d3aed6d`). The formal QEMU run used
+challenge
+`40eaeea4c049b02bc48c2cc36323d62ea8e2855c485e57a4bba690012ec68859`,
+accepted 1,176 records with semantic SHA-256
+`51896391bb2a3493f1252e2633f54678bb1e69aa46a7e740dc4bc110381504f1`,
+and produced run ID
+`53c9f7ed099c371724867d060c3994cb4b3ad93d46404156f40914d7f3b30254`.
+The audited QEMU kernel, UART, ELF-report, and environment identities are:
+
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| QEMU kernel ELF | 40,449,184 | `266b5e6dcce862938be71775106994bcfd3793832f9e216d43c906c2e35953c8` |
+| QEMU UART | 384,916 | `c484c3cd0dae2479e52a07fcd048887cbe76bfd1f19cbcb43466bed11b1ef1f7` |
+| QEMU final-ELF report | 2,031 | `ba4dec8ec6fca71a84092d0dedfa851649ea1663bdddcba77c1aa306560666f6` |
+| QEMU environment | 84,807 | `fc8202f7245422a8d3688879ca7ad29d64695438105dbb8add7465f0506a4302` |
+
+The environment evidence digest is
+`890c66df895ceccfafb6345b256c38d503e0f98ae5f357f87ae952313caef821`.
+The publisher directly ran both interpreter modes, required byte-identical
+candidate/shared-verifier/ELF-audit results, removed its private stage before
+publication, and wrote the decision last. Its normal receipt is SHA-256
+`4d70865a6a665829457ee0e9ec34c9fa38de51ed6ee2bcb2be1356d752355c1a`,
+its optimized receipt is
+`4f95fcd2b4d2524b1d27fce7bbf77846f4f7d0030da8ebe277ffc062e53550e0`,
+and its decision is
+`1d118cdb4f5709f4ce93331b1cd6b60435e6c530eb800e9c21e0a3e8569030d4`
+with decision ID
+`1841ae06e4c8bef4842a59bbc65362fa860e37d6d8a1d79cc68e3fc5a87004f9`.
+The retained decision is a hash summary: its checker proves structure, source
+membership, and hash integrity, but does not replay the raw evidence or prove
+publisher execution. The QEMU ELF contains 381,934 decoded instructions,
+381,935 canonical boundaries, 42,010 trusted direct targets, and 128,657 code
+symbols, with zero RISC-V F/D opcodes, undefined symbols, or forbidden Float
+helpers. The audit covers trusted native control flow at canonical decoder
+boundaries; it does not claim arbitrary-PC redirection or hardware NX. The
+platform is an emulator and records `physical_provenance=not-claimed` and
+`physical_inputs=0`.
+
+The retained, disjoint Duo compile-readiness slice freezes suite
+`vibeos.c88.f5.float-target.duo-v1`, platform
+`milkv-duo-cv1800b-c906-v1`, and an immutable unarmed sentinel. Its 4,159-byte
+manifest has SHA-256
+`1c85f22cacee7c8eb7693578052fe0452169eace99f1dab06e08aa0e42771b11`;
+its 4,692-byte transcript schema has SHA-256
+`e25d9a38d194993906b7fe5ec9708654ea31e2386ac61f0fa360ed8ad1eb7439`.
+The locally observed cross-linked ELF is 40,331,520 bytes with SHA-256
+`e9a58e681c4d3e073dbeb1d15f569600e0ab2a97c07f13ed1dc0c676b5d62b1e`;
+its 2,031-byte audit is SHA-256
+`0b3384b35d85fdee970b98f523b7bd814102611549c08e7915625310954beac4`.
+It contains 380,650 decoded instructions, 380,651 canonical boundaries,
+41,883 trusted direct targets, and 128,210 code symbols, with zero forbidden
+opcodes, Float helpers, or undefined symbols. Normal and optimized Duo
+verifier/auditor runs pass and produce byte-identical audit reports.
+
+The Duo result is compile readiness only. It was not packaged, flashed, run, or
+captured and does not establish physical or source-build provenance. Its
+contract records `execution_armed=false`, `physical_evidence_present=false`,
+and three required physical cold boots with every present counter at zero. The
+sentinel ELF and run ID can never satisfy that retained contract, and
+patching this readiness image is not an arming procedure. Resumed testing
+requires a separately reviewed physical feature/arm producer with formal,
+non-sentinel bindings; its same-identity rule applies only across that future
+run's three captures.
+
+The disjoint future wire contract is now frozen as suite
+`vibeos.c88.f5.float-target.duo-physical-v1`, with the independently hashed
+contract and transcript schema verified against the existing F5 semantic
+oracle. Its verifier rejects readiness, fixed-QEMU, and C8.4 families; enforces
+`META -> 1176 records -> END -> PASS`; recomputes the required semantic digest;
+and emits only `verified-transcript-non-evidence`. Normal and optimized contract
+checks and a 53-mutation synthetic self-test pass byte-for-byte. This node adds
+no physical feature, arm, producer, image, package, capture, or physical
+provenance. All three-boot counters remain zero.
+
+Milk-V Duo physical qualification remains paused, retained, and nonblocking.
+The fixed-QEMU decision closes F5, Float, and the Float-only scope of C8.8; it
+does not close SIMD, references, exceptions, memory64, multiple memories, GC,
+threads, broader WASI, or any unrelated hardware gate. Profile code 5 remains
+permanently `ValidationOnly`: no current engine, execution, production,
+native-byte, AOT, durable-publication, or in-place-promotion authority is
+created. Completion opened design review only for a separately numbered
+successor. C8.9-S1 now allocates that independent design without changing code
+5; S2/S3 remain incomplete. The normative F5 contract and retained decision are
+[qualification-qemu-target-gate-v1-contract.json](acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-contract.json)
+and [qualification-qemu-target-gate-v1-decision.json](acceptance/wasm-float-target/artifacts/qualification-qemu-target-gate-v1-decision.json).
+The retained Duo readiness artifact remains in
+[qualification-duo-v1-manifest.json](acceptance/wasm-float-target/artifacts/qualification-duo-v1-manifest.json)
+as scoped non-evidence.
+
+The C8.8-F5 replacement remains scoped to F5 only; the independent prospective
+fixed-QEMU target/release policy does not reclassify or promote F5 evidence.
+
+The neutral post-F5 machine charter is
+[float-successor-review-boundary-v1-contract.json](acceptance/wasm-float-target/artifacts/float-successor-review-boundary-v1-contract.json).
+Its normal and optimized checks bind the exact closed F5 contract, verifier,
+decision, and two receipts at their historical commit. Its self-test rejects
+identity or candidate-value allocation, authorization, code-5
+activation, F5-evidence promotion, answered or non-blocking review questions,
+physical inputs, adjacent-widening completion, malformed JSON, aliases, and
+non-regular files. A pass means review-charter integrity only. The position
+`post-c88-f5-pre-allocation` is not a numbered Float increment and does not
+allocate a successor number, profile, ABI, engine, stage, fresh evidence gate,
+implementation, execution, or production authority. All eight review questions
+remain unresolved and blocking.
+Milk-V Duo remains paused and non-evidence, physical inputs remain zero, and
+unrelated hardware gates are unchanged.
+
+## C8.9-S1 Float successor design contract
+
+The canonical C8.9-S1 contract allocates `PROFILE_3_SYNC_FLOAT_EXECUTABLE` as
+profile code 6 with artifact/runtime ABI 6, Component/Core profile 3, exact
+`c89-exec-v1` revisions, the reviewed vendored software-float Wasmi source, and
+the closed `vibe:float/runtime@1.0.0` world. Its verifier pins the historical
+review charter and fixed-QEMU policy, validates the selected engine provenance,
+checks every security-sensitive design field under normal and optimized Python,
+and rejects design mutations.
+
+S1 is retained as the immutable design checkpoint. C8.9-S2 now materializes
+code 6 and is verified by the separate implementation contract below; durable
+publication, release, and production authority remain false. Code 5 stays permanently
+`ValidationOnly` and inert. S3 requires fresh source-bound normal/optimized
+fixed-QEMU evidence. Milk-V Duo remains paused and optional with no gate effect.
+
+## C8.9-S2 Float successor implementation contract
+
+This node verifies the exact code-6 artifact identity and round-trip, current
+software-float Core/Component engine proof, closed `vibe:float/runtime@1.0.0`
+world, authority-free admission, bit-only execution, quotas, cancellation,
+revocation, fault reclamation and cold recovery. It also proves that code 5
+remains inert and that the ordinary command/durable loader still rejects code
+6. These commands run no QEMU and no physical hardware:
+
+```sh
+python3 -B scripts/verify-c89-float-successor-implementation.py --check-contract
+python3 -O -B scripts/verify-c89-float-successor-implementation.py --check-contract
+python3 -B scripts/verify-c89-float-successor-implementation.py --selftest
+python3 -O -B scripts/verify-c89-float-successor-implementation.py --selftest
+cargo test --locked --offline -p vibeos-component-runtime --features c89-float-executable --test c89_float_executable
+cargo test --locked --offline -p vibeos-component-admission --features c89-float-executable --test c89_float_executable
+```
+
+## C8.9-S3 fixed-QEMU qualification and release contract
+
+Fresh pushed source commit `2e9bc0c3648656cca8e4d198cbb6a7350975090a`
+produced one fixed-QEMU 11.0.3/TCG capture with run ID
+`d627c608da149a1324eea5a605ebd5caf4020fde48d75f0a21bea98d1873bd72`.
+Both normal and optimized independent verification accept all 1,176 records
+with semantic SHA-256
+`44cb0a12c01906b31a42fc6550d485496206ea23a08bc073a685e1b893fb94b8`.
+The result releases only the sealed authority-free code-6 Float runtime;
+ordinary command routing, durable publication, AOT, JIT, native bytes, and RWX
+remain closed. Code 5 is permanently inert. Milk-V Duo remains paused and
+supplies no gate input; no physical-equivalence claim is made.
+
+```sh
+python3 -B scripts/verify-c89-s3-fixed-qemu-qualification.py --check-contract
+python3 -O -B scripts/verify-c89-s3-fixed-qemu-qualification.py --check-contract
+python3 -B scripts/verify-c89-s3-fixed-qemu-qualification.py --selftest
+python3 -O -B scripts/verify-c89-s3-fixed-qemu-qualification.py --selftest
+```
+
+## C8.10-S1 deterministic SIMD widening design
+
+C8.10-S1 allocates validation-only `PROFILE_4_SYNC_SIMD_VALIDATION`: profile
+code 7, artifact/runtime ABI 7, and Component/Core profile 4. It selects fixed
+SIMD 1.0 with deterministic software-float lanes and forbids relaxed SIMD.
+`v128` remains Core-internal and cannot cross WIT, Canonical ABI, or host-call
+boundaries. The selected S2 engine is
+`vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd1.1`, but it is not materialized
+or bound by S1.
+
+This design node grants no execution, admission, command, durable publication,
+release, or production authority. Code 5 remains permanently inert and code 6
+gains no SIMD. C8.10-S2 is the next node. Milk-V Duo remains paused and
+non-gating with zero inputs.
+
+```sh
+python3 -B scripts/verify-c810-simd-widening-design.py --check-contract
+python3 -O -B scripts/verify-c810-simd-widening-design.py --check-contract
+python3 -B scripts/verify-c810-simd-widening-design.py --selftest
+python3 -O -B scripts/verify-c810-simd-widening-design.py --selftest
+```
+
+## C8.10-S2 deterministic Core SIMD engine
+
+C8.10-S2 materializes the independently named
+`vibeos-wasmi-simd-softfloat@1.1.0-vibeos-simd1.1` fork and a default-off
+acceptance candidate. Fixed integer and floating SIMD lanes, saturation,
+shuffle, V128 memory, repeatability, adjacent-feature rejection, and exact fuel
+boundaries are covered. The supply-chain verifier binds 168 fork files and
+proves `libm` unreachable. The pinned RISC-V audit rejects semantic LLVM FP,
+float helpers, and F/D/V instructions across the complete candidate closure.
+
+Code 7 remains `ValidationOnly`, non-current, and non-production. Code 5 stays
+permanently inert. C8.10-S3 containment/corpora, C8.10-S4 default-off
+admission/lifecycle, and C8.10-S5 fixed-QEMU qualification are complete.
+Milk-V Duo remains paused and supplies zero gate input.
+
+```sh
+python3 -B scripts/verify-c810-simd-widening-implementation.py --check-contract
+python3 -O -B scripts/verify-c810-simd-widening-implementation.py --check-contract
+python3 -B scripts/verify-c810-simd-widening-implementation.py --selftest
+python3 -O -B scripts/verify-c810-simd-widening-implementation.py --selftest
+python3 scripts/verify-c810-s2-supply-chain.py --self-test
+python3 scripts/verify-c810-s2-riscv-object.py
+cargo test --locked --offline -p vibeos-wasm-simd-candidate --features c810-s2-acceptance
+```
+
+## C8.10-S3 SIMD Component containment and corpora
+
+C8.10-S3 adds a default-off code-7 Component inspector. Fixed SIMD is accepted
+only inside embedded Core modules; `v128` remains unrepresentable in Component
+and WIT values and cannot cross a host import/export boundary. Neither code 7
+nor permanently inert code 5 resolves to a current engine.
+
+The fixed 512-case integer/float-lane differential corpus is pinned at FNV-1a64
+`fcb8de3059c13007`. A separate 512-case truncate/bit-flip/append/insert
+Component mutation corpus is panic-free and pinned at `8af29a0ea0a0b294`.
+S3 itself closes containment and corpus evidence only; the later S4
+admission/lifecycle and S5 fixed-QEMU qualification nodes are now complete.
+
+```sh
+python3 -B scripts/verify-c810-simd-containment-corpus.py --check-contract
+python3 -O -B scripts/verify-c810-simd-containment-corpus.py --check-contract
+python3 -B scripts/verify-c810-simd-containment-corpus.py --selftest
+python3 -O -B scripts/verify-c810-simd-containment-corpus.py --selftest
+cargo test --locked --offline -p vibeos-component-runtime --features c810-s3-acceptance --test c810_s3_simd_containment
+```
+
+## C8.10-S4 SIMD admission and lifecycle
+
+C8.10-S4 adds only the feature-gated `c810-s4-acceptance` route. Admission
+requires the exact code-7 identity, image SHA-256 pin, exact world and Core
+binding, zero caller offers/imports/resources, the frozen memory ceiling, and
+the exact compile reservation. The move-only volatile token exposes neither a
+command nor durable conversion. Its lifecycle permits exactly one live
+instance, bounds each call by the total fuel ceiling, reclaims on cancel/fault,
+requires explicit recovery, and makes revoke terminal and idempotent. The
+ordinary loader continues to reject code 7.
+
+```sh
+python3 -B scripts/verify-c810-simd-admission-lifecycle.py --check-contract
+python3 -O -B scripts/verify-c810-simd-admission-lifecycle.py --check-contract
+python3 -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
+python3 -O -B scripts/verify-c810-simd-admission-lifecycle.py --selftest
+cargo test --locked --offline -p vibeos-component-admission --features c810-s4-acceptance --test c810_s4_simd_admission
+cargo test --locked --offline -p vibeos-component-loader profile_instance_limits_and_exact_wit_are_revalidated
+```
+
+## C8.11-S3 fixed-QEMU qualification
+
+The formal `qemu-virt-rv64-tcg-icount-v1` campaign binds pushed source
+`90f95df4503a3992067fa68dbcd7d9dd9485ef10`, run ID
+`c7404023823bea9027e0c55bd564a062dc591974dd7385bd8957a4b4c3d61de8`,
+seven semantic records, and semantic SHA-256
+`ddab9d539744523b332787be6f8a101de00108479c9644136538524f20cd4514`.
+Normal and optimized verification and the final-ELF F/D/V/helper audit pass.
+Milk-V Duo contributes zero inputs and remains paused and non-gating.
+
+```sh
+python3 -B scripts/verify-c811-s3-fixed-qemu-qualification.py --check-contract
+python3 -O -B scripts/verify-c811-s3-fixed-qemu-qualification.py --check-contract
+python3 -B scripts/verify-c811-s3-fixed-qemu-qualification.py --selftest
+python3 -O -B scripts/verify-c811-s3-fixed-qemu-qualification.py --selftest
+python3 -B scripts/verify-c811-s3-simd-evidence.py --selftest
+python3 -O -B scripts/verify-c811-s3-simd-evidence.py --selftest
+cargo test --locked --offline -p vibeos-wasm-simd-target --features c811-s3-qemu-qualification
+```
+
+## C8.12-R1 Reference Types validation design
+
+C8.12-R1 allocates validation-only
+`PROFILE_6_SYNC_REFERENCE_TYPES_VALIDATION`: artifact profile code and
+artifact/runtime ABI 9, Component/Core profile 6, exact revision strings,
+closed authority-free WIT world, and candidate engine
+`vibeos-wasmi-reference-validation@1.1.0-vibeos-ref1.1`. It permits only
+Core-internal nullable `funcref` Reference Types 1.0 semantics and freezes
+explicit rejection of `externref`, typed function references, GC objects, and
+all Component/Canonical/host reference boundaries.
+
+These checks are static and run no QEMU or physical hardware. Success means
+only that the R1 design is frozen. R2 implementation and R3 fresh fixed-QEMU
+qualification remain separate incomplete nodes. Code 9 has no current engine,
+admission, execution, durable, migration, or release authority. Code 5 remains
+permanently inert; codes 7 and 8 retain their existing boundaries.
+
+```sh
+python3 -B scripts/verify-c812-reference-types-design.py --check-contract
+python3 -O -B scripts/verify-c812-reference-types-design.py --check-contract
+python3 -B scripts/verify-c812-reference-types-design.py --selftest
+python3 -O -B scripts/verify-c812-reference-types-design.py --selftest
+```
+
+## C8.12-R2 Reference Types implementation
+
+R2 materializes the independently named validation facade, code-9 artifact
+codec and exact non-current engine contract. The candidate runs an exact
+wasmparser syntax/feature pass followed by Wasmi translation, allows only
+Core-internal nullable `funcref`, one table and active elements, and rejects
+imports, `externref`, typed references, GC semantics, reference-valued exports,
+bulk memory and every adjacent proposal. The Component containment test keeps
+references out of Component/Canonical/WIT values; ordinary and durable loaders
+continue to reject code 9.
+
+```sh
+python3 -B scripts/verify-c812-reference-types-implementation.py --check-contract
+python3 -O -B scripts/verify-c812-reference-types-implementation.py --check-contract
+python3 -B scripts/verify-c812-reference-types-implementation.py --selftest
+python3 -O -B scripts/verify-c812-reference-types-implementation.py --selftest
+python3 -B scripts/verify-c812-r2-supply-chain.py
+python3 -O -B scripts/verify-c812-r2-supply-chain.py --self-test
+python3 -B scripts/verify-c812-r2-riscv-object.py
+cargo test --locked --offline -p vibeos-component-format
+cargo test --locked --offline -p vibeos-wasm-reference-candidate --features c812-r2-acceptance
+cargo test --locked --offline -p vibeos-component-runtime --features c812-r2-reference-validation --test c812_r2_reference_containment
+cargo test --locked --offline -p vibeos-component-loader profile_instance_limits_and_exact_wit_are_revalidated
+```
+
+The RISC-V audit covers seven closure rlibs and proves F/D/V opcodes, semantic
+native-float helpers and `libm` reachability absent. These R2 checks run no QEMU
+or physical hardware and by themselves grant no current engine, admission,
+execution, durable, migration, successor-review, production, or release
+authority. R3 qualification is documented separately below.
+
+### C8.12-R3 fixed-QEMU qualification
+
+The C8.12 closure position is
+`c812-r3-qualified-reference-validation-successor-review-eligible`.
+The default-off R3 harness binds eight exact validation/containment cases and
+a 256-mutation Component corpus to the isolated
+`wasm-c812-r3-reference-qemu-qualification` image. One formal QEMU 11.0.3
+rv64 TCG/icount boot from pushed commit
+`43516cd6fe4d88c583f681714950884dc8660d4c` produced nine records, run ID
+`fc40fbd874b274e786ad96f1f88b1b27251c7d9037654599bd30cefa623a8a2e`,
+semantic SHA-256
+`bf33470617822af905ab8877797416e79aed3cde5a257689b3bbdda4df156279`,
+and the exact 208-rejected/48-accepted-inert mutation split. Normal and
+optimized verification and the final-ELF audit pass. Physical inputs remain
+zero and physical provenance remains unclaimed.
+
+```sh
+python3 -B scripts/qemu-c812-r3-reference.py --selftest
+python3 -B scripts/verify-c812-r3-reference-evidence.py --selftest
+python3 -O -B scripts/verify-c812-r3-reference-evidence.py --selftest
+python3 -B scripts/verify-c812-r3-fixed-qemu-qualification.py --check-contract
+python3 -O -B scripts/verify-c812-r3-fixed-qemu-qualification.py --check-contract
+python3 -B scripts/verify-c812-r3-fixed-qemu-qualification.py --selftest
+python3 -O -B scripts/verify-c812-r3-fixed-qemu-qualification.py --selftest
+cargo test --locked --offline -p vibeos-wasm-reference-target --features c812-r3-qemu-qualification
+```
+
+R3 opens only an independently numbered executable-successor design review.
+Code 9 remains non-current, validation-only, non-executable, non-admitted,
+non-durable, non-migratable, non-production, and unreleased. Code 5 remains
+permanently inert. Milk-V Duo remains paused with zero gate effect.
+
+## C8.13-E1 Reference Types executable successor design
+
+E1 allocates code/ABIs 10 and Component/Core profile 7 under
+`PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE`. It freezes the exact bounded
+Reference Types semantics, `vibe:references/runtime@1.0.0` integer/byte-only
+world, and selected
+`vibeos-wasmi-reference-executable@1.1.0-vibeos-ref2.1` engine identity. These
+checks are static and run no QEMU or physical hardware. At the E1 checkpoint,
+success did not materialize the facade, bind a current engine, execute/admit
+code 10, authorize durability/migration/production/release, or promote code 9.
+
+```sh
+python3 -B scripts/verify-c813-reference-executable-design.py --check-contract
+python3 -O -B scripts/verify-c813-reference-executable-design.py --check-contract
+python3 -B scripts/verify-c813-reference-executable-design.py --selftest
+python3 -O -B scripts/verify-c813-reference-executable-design.py --selftest
+```
+
+Code 5 remains permanently inert. The fixed-QEMU qualification reserved for
+C8.13-E3 is complete; Milk-V Duo remains paused and supplied zero inputs.
+
+## C8.13-E2 Reference Types executable implementation
+
+E2 verifies the independently named code-10 facade and current-engine binding,
+bounded nullable-funcref execution, externref failure closure, sealed volatile
+admission lifecycle, durable graph rejection, and the RISC-V object audit. It
+runs no QEMU and consumes no physical input. Code 9 stays validation-only and
+code 5 stays permanently inert.
+
+```sh
+python3 -B scripts/verify-c813-reference-executable-implementation.py
+python3 -O -B scripts/verify-c813-reference-executable-implementation.py --selftest
+cargo test --locked --offline -p vibeos-wasm-reference-executable --features c813-e2-acceptance
+cargo test --locked --offline -p vibeos-component-admission --features c813-reference-executable --lib
+```
+
+## C8.13-E3 fixed-QEMU qualification
+
+E3 binds one clean source commit and tree to one fresh challenge/run ID and one
+fixed QEMU 11.0.3 boot. The same retained UART, environment, kernel, and ELF
+audit pass normal and optimized verification. This releases only the sealed,
+authority-free, volatile code-10 runtime. Code 5 remains permanently inert;
+code 9 remains validation-only and non-migratable. Milk-V Duo contributes zero
+inputs and has zero gate effect.
+
+```sh
+python3 -B scripts/qemu-c813-e3-reference.py --selftest
+python3 -B scripts/verify-c813-e3-reference-evidence.py --selftest
+python3 -O -B scripts/verify-c813-e3-reference-evidence.py --selftest
+python3 -B scripts/verify-c813-e3-fixed-qemu-qualification.py --check-contract
+python3 -O -B scripts/verify-c813-e3-fixed-qemu-qualification.py --selftest
+cargo test --locked --offline -p vibeos-wasm-reference-target --features c813-e3-qemu-qualification
+```
+
+## C8.10-S5 fixed-QEMU qualification
+
+C8.10-S5 uses the frozen `qemu-virt-rv64-tcg-icount-v1` profile with fresh
+source/tree, challenge, run ID, capture, and node-specific predicates. The
+published campaign contains seven semantic records, run ID
+`ca57bdf2af07484ef48e8ef09e51700e1f5b7a169de04c58594b66a96c7c8b61`,
+and semantic SHA-256
+`6b34b541a42fdf838eccd55e43473a4154421eadc0e3b4292a5a89fde54ae1c6`.
+Normal and optimized verification passed. CI verifies the frozen contracts and
+host qualifier; it does not rerun QEMU or consume physical inputs.
+
+```sh
+python3 -B scripts/verify-c810-s5-fixed-qemu-qualification.py --check-contract
+python3 -O -B scripts/verify-c810-s5-fixed-qemu-qualification.py --check-contract
+python3 -B scripts/verify-c810-s5-fixed-qemu-qualification.py --selftest
+python3 -O -B scripts/verify-c810-s5-fixed-qemu-qualification.py --selftest
+python3 -B scripts/verify-c810-s5-simd-evidence.py --selftest
+python3 -O -B scripts/verify-c810-s5-simd-evidence.py --selftest
+cargo test --locked --offline -p vibeos-wasm-simd-target --features c810-s5-qemu-qualification
+```
+
+Passing S5 makes only a later successor design review eligible. It neither
+allocates that successor nor authorizes design, implementation, current-engine
+binding, durable publication, production, or release. Code 5 remains permanently
+inert and code 7 remains validation-only. Milk-V Duo remains paused and has no
+gate effect.
+
+## C8.11-S1 SIMD successor design contract
+
+C8.11-S1 independently allocates `PROFILE_5_SYNC_SIMD_EXECUTABLE`: profile
+code 8, artifact/runtime ABI 8, Component/Core profile 5, exact Core,
+Component, Canonical ABI, wasm-tools, WIT-world, and engine identities. The
+selected S2 engine is
+`vibeos-wasmi-simd-executable-softfloat@1.1.0-vibeos-simd2.1`, but S1 does not materialize
+or bind it.
+
+The fixed SIMD 1.0 and deterministic software-float semantics remain unchanged.
+Relaxed SIMD and adjacent proposals stay disabled, and `v128` remains
+Core-internal. Code 5 remains permanently inert. Code 7 stays validation-only,
+non-current, non-migratable, and cannot be promoted in place. S1 authorizes no
+admission, durable publication, release, or production. Milk-V Duo remains
+paused and supplies zero gate input.
+
+```sh
+python3 -B scripts/verify-c811-simd-successor-design.py --check-contract
+python3 -O -B scripts/verify-c811-simd-successor-design.py --check-contract
+python3 -B scripts/verify-c811-simd-successor-design.py --selftest
+python3 -O -B scripts/verify-c811-simd-successor-design.py --selftest
+```
+
+## C8.11-S2 executable SIMD implementation
+
+C8.11-S2 implements the independently numbered code-8 codec, exact current
+Component/Core engine identity, fixed-SIMD executor, exact-image-pinned
+authority-free volatile admission, lifecycle/accounting, and durable rejection.
+The new engine facade reexports the exact qualified C8.10 software-float base;
+its two-file digest and the 168-file base closure are audited offline. The
+RISC-V object audit builds the complete code-8 closure for
+`riscv64imac-unknown-none-elf` and rejects semantic LLVM floating operations,
+FP helpers, and F/D/V instructions. Code 5 remains permanently inert and code
+7 remains non-current and non-migratable. Passing this node authorizes neither
+ordinary command/durable publication nor release/production; fresh fixed-QEMU
+qualification remains C8.11-S3.
+
+```sh
+python3 -B scripts/verify-c811-simd-successor-implementation.py --check-contract
+python3 -O -B scripts/verify-c811-simd-successor-implementation.py --check-contract
+python3 -B scripts/verify-c811-simd-successor-implementation.py --selftest
+python3 -O -B scripts/verify-c811-simd-successor-implementation.py --selftest
+python3 -B scripts/verify-c811-s2-supply-chain.py
+python3 -O -B scripts/verify-c811-s2-supply-chain.py --self-test
+python3 -B scripts/verify-c811-s2-riscv-object.py
+cargo test --locked --offline -p vibeos-component-format
+cargo test --locked --offline -p vibeos-wasm-simd-executable --features c811-s2-acceptance
+cargo test --locked --offline -p vibeos-component-runtime --features c811-simd-executable --test c811_simd_executable
+cargo test --locked --offline -p vibeos-component-admission --features c811-simd-executable --test c811_simd_executable
+cargo test --locked --offline -p vibeos-component-loader profile_instance_limits_and_exact_wit_are_revalidated
+```
+
+## Fixed-QEMU target/release policy v1
+
+This section and the canonical contract are normative for this policy; no
+other prose in `TESTING.md` can override them.
+
+The non-numbered **Fixed-QEMU target/release policy v1** checkpoint is at
+`post-c88-f5-pre-allocation`; it is a policy checkpoint, not a roadmap
+implementation node. For every future allocated node that uses the generic
+WASM target/release gate, it requires a fresh source-bound
+`qemu-virt-rv64-tcg-icount-v1` campaign with a new identity and evidence set.
+Historical C8.4 and C8.8-F5 artifacts cannot be promoted or reused as that
+evidence. The policy fixes `physical_inputs_required=0`,
+`physical_inputs_permitted=0`, `physical_provenance=not-claimed`, and
+`physical_equivalence_claimed=false`. Milk-V Duo stays a paused optional,
+separately labelled observation with `gate_effect=false`,
+`completion_effect=false`, and `release_effect=false`.
+
+The replacement does not apply to real-hardware gates for microSD, DWMAC, USB,
+entropy, cache/DMA coherency, thermal/electrical behavior, or certification.
+It allocates no successor and authorizes no engine, implementation, execution,
+admission, durable publication, release, production use, native bytes, AOT,
+JIT, RWX, migration, rollout, or in-place promotion. Profile code 5 remains
+permanently `ValidationOnly` and inert. Verify the canonical policy contract in
+all four interpreter modes:
+
+```sh
+# Prospective fixed-QEMU WASM target/release policy; static contract checks only.
+# These commands run no QEMU or Duo, satisfy no target or release gate, and allocate no successor.
+python3 -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract
+python3 -O -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --check-contract
+python3 -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --selftest
+python3 -O -B scripts/verify-wasm-fixed-qemu-target-release-policy.py --selftest
+```
+
+## Retained C8.4 implementation notes
+
+For the historical C8.4 Duo/AOT flow only, see
+[docs/WASM_AOT_DECISION.md](docs/WASM_AOT_DECISION.md). It is not the C8.8-F5
+physical qualification contract.
+
+The portable C8.4 hook gate above exercises the default-off, caller-clocked
+boundary around the real synchronous Core poll. It proves ordinary and
+profiled typed-call results stay identical and locks the exact observer/tick
+ordering: the start observer returns its post-observer sample, while the finish
+observer owns one end sample, atomically closes interpretation with that same
+sample, and returns it to the runtime aggregate. The gate also covers inclusive
+outer totals, wrapping subtraction, and saturating counters. It is only the
+interpreter-boundary primitive: connecting that Core hook to the kernel slot,
+interrupt attribution, and SSH integration remain separate gates.
+
+The standalone `vibeos-wasm-aot-profile` gate covers the target-side ledger
+state machine without connecting it to kernel, trap, executor, or SSH code. It
+borrows one exact 65,536-entry endpoint array and one packed phase array,
+for exactly 589,824 bytes (576 KiB) of caller storage, suppresses zero-duration
+intervals, merges only adjacent equal phases, latches cleanup, overlays
+interrupt time as wait, and freezes stored bytes after a sticky failure. Only a
+finished sample that passes an independent full rescan can expose the
+schema-shaped summary and exact-size interval iterator; rejected or
+capacity-overflow samples remain diagnostic-only. Its linear handles are
+`Send` but not `Sync`: this permits exclusive ownership to move inside the
+kernel's required `Send` future, including across suspension, without allowing
+the active sample or its hooks to be shared. `Send` is not a measurement-hart
+claim. Every formal target sample must still keep that future pinned to hart 0,
+and later target wiring must dynamically reject a hook observed on any other
+hart. The RISC-V check proves that this foundation stays dependency-free and
+`no_std`; target hook, pinning, and dynamic-hart verification remain later
+gates.
+
+The same crate's portable target-session facade is the next allocation-free,
+`no_std`, and `unsafe`-free boundary above that ledger. Within one continuously
+recycled `TargetReady` lineage, it gives each armed sample a private non-zero
+checked epoch, rejects any active hook whose token or trusted-kernel-supplied
+single-hart online mask, logical hart, or physical hart is wrong, and binds IRQ
+exit to the epoch captured by its entry cookie. Epochs are not globally unique
+across separately constructed lineages, so the kernel slot initializes
+exactly one lineage and preserves it only through recycle transitions. Only a
+facade-clean closed sample may proceed to the explicit independent ledger
+rescan; the formal target publisher must accept `TargetVerified`, not the raw
+ledger's `Verified`. Cancellation, facade faults, ledger faults, and epoch
+exhaustion remain diagnostic-only and clear storage before reuse. This facade
+intentionally contains no lock, callback, allocator, target clock access, or
+hardware topology reader.
+
+The default-off `wasm-c84-profile-slot` boundary allocates one exact 576 KiB
+backing store once before secondary-hart release and preserves that one
+`TargetReady` lineage behind the IRQ-masking kernel `SpinLock`. Storage-bearing
+active and verified states remain global; task-bound run and stream leases carry
+only exact epoch/task/domain identity across suspension. Task-detach capacity is
+reserved and the callback is armed before the start tick. Normal reuse requires
+complete indexed streaming and explicit recycle. An active or verified task
+detach, explicit cancellation, or an abandoned stream instead creates a
+diagnostic rejection which must be acknowledged before reuse. Full
+verification, clearing, and recycling run outside the slot lock.
+
+`scripts/qemu-c84-profile-slot-test.sh` builds one isolated image and boots it
+with `-smp 1` and `-smp 2`. The single-hart case intentionally forgets an active
+lease and a partially streamed verified lease in normally exiting pinned tasks,
+requires exact detach recovery for epochs 1 and 2, then streams all seven
+synthetic intervals and explicitly completes epoch 3 back to ready epoch 4. The
+two-hart case requires start-time rejection of online mask `0x3` without
+consuming epoch 1. This is ownership, detach, recycle, and topology integration
+evidence only. It does not connect the Core observer, trap/IRQ entry and exit,
+SSH timing boundary, schema publisher, collector, or physical-Duo path, and it
+does not inject the executor raw-fault or cancellation detach reasons.
+
+The separate default-off `wasm-c84-core-poll-observer` feature adapts one
+caller-supplied `poll_profiled` invocation to the exact current `RunLease`.
+The clock is lexical, sticky-latches its first slot error, requires each Core
+start/end pair to close before the next poll, and returns the same single end
+tick that changes the target ledger from Interpretation back to ABI. Ordinary
+`TypedCall::poll` is unchanged; this feature does not create an ambient hook or
+weaken task ownership.
+
+`scripts/qemu-c84-core-poll-test.sh` runs the exact image-pinned `case-filter`
+artifact through a real wasmi Core poll in one boot-hart-pinned task. The
+single-hart transcript must verify the exact phase sequence Validation,
+Instantiation, ABI, Interpretation, ABI, Cleanup; the external Interpretation
+total must contain the portable Core aggregate; streaming must complete back
+to ready epoch 2. The two-hart boot must reject topology before Core entry.
+This proves only the explicit Core-observer adapter. The frozen SSH runner
+still calls ordinary `poll` when the managed-child composition feature is off.
+The default-off composition gate below now connects this adapter to the exact
+SSH target child; IRQ overlays, complete SSH phase timing, publication,
+collection, and physical-Duo evidence remain separate work.
+
+The separate default-off `wasm-c84-profile-irq-overlay` feature gives a trap
+preempting the exact active slot owner one linear entry/exit cookie. The trap
+briefly borrows the slot at each boundary but never holds it across the handler;
+an inactive slot or a different current task remains observationally inert.
+The entry endpoint is the trap assembly's early timestamp, and the paired exit
+restores the interrupted base phase after accounting the intervening time as
+Wait.
+
+`scripts/qemu-c84-profile-irq-overlay-test.sh` builds the isolated
+`wasm-c84-profile-irq-overlay-qemu-acceptance` image and uses the parameterized
+profile-slot harness for both `-smp 1` and `-smp 2`. The single-hart worker
+forces four real boot-hart self-IPIs through OpenSBI and the SSIP early-return
+path. An acceptance-only SSIP counter proves exactly one active-owner
+entry/exit pair and causally distinguishes it from timer traffic. While the
+sample owner is suspended, the current non-owner task must remain inert;
+explicit cancellation, ordinary `RunLease` Drop, and exact task-detach recovery
+must each clear the active fast gate before the next epoch. The publishable
+sample requires a paired non-zero Wait overlay with the base phase restored and
+completes back to ready epoch 5; real SSIPs before and after Active must remain
+inert. Finally, an
+acceptance-only mismatch injection must preserve the first poison, clear the
+fast gate, and prevent re-arming. The two-hart boot must reject topology before
+arming the sample.
+This gate is evidence for that deliberate self-SSIP only; it does not establish
+targeted timer or PLIC handling, SSH timing, publication/collection, or
+physical Milk-V Duo behaviour.
+
+The default-off `wasm-c84-profile-child-delegation` seam lets an exact
+request-owned `RunLease` bind at most one still-hidden `PreparedTaskBatch`
+member before scheduler publication. The executor returns a copy-only seal for
+the child's already-armed detach callback; it grants no handle, wake, poll,
+cancel, disarm, or recycle authority. The child must claim from its exact first
+poll and may change phases only while claimed. IRQ overlays accept the exact
+child while claimed or while explicitly released and awaiting final detach.
+Release deliberately does not disarm the callback: only the executor's later
+`Exited` reason is clean. Early exit, ordinary lease Drop, post-release
+cancellation or fault, and parent finish with a live child become request-local
+diagnostic rejections. The parent remains the sole owner of finish,
+cancellation, target storage, streaming, and recycle.
+The `vibeos-core` compile-fail doctests independently enforce that the public
+prepared seal has neither wake nor disarm methods.
+
+`scripts/qemu-c84-profile-child-delegation-test.sh` proves bind-before-publish,
+one exact prepared-child identity, first-poll-only claim, duplicate and
+wrong-task inertia, an exact child-owned Core observer pair, a real child-owned
+self-SSIP, clean `release + Exited`, parent-cancel-first stale callback
+behavior, forgotten and dropped child rejection, `release + Cancelled`,
+fail-closed parent finish, and rejection of a claim attempted after a first-poll
+yield. A silent destructor fault proves that `release + Faulted` stays
+diagnostic. The successful Core epoch compares the exact ledger end tick with
+the tick returned to the portable observer by reconstructing that boundary
+from the final streamed interval. Seven additional epochs independently prove
+finish-without-start, observer Drop, open-child release, direct phase mutation
+and replacement rejection, simultaneous observer/child `forget`, and
+request-parent mutation rejection while child Core is open. A final
+parent-observer/RunLease double-`forget` epoch proves that raw owner detach
+preserves the global observer fault. The request-wide Core owner lives in the
+slot, so neither forgotten parent nor child adapters can overlap a later
+observer or produce verified evidence. The generic serial gate still rejects
+every panic. The single-hart boot completes fifteen epochs and returns to ready
+epoch 16; the two-hart boot rejects before epoch 1 starts. This is an isolated
+ownership seam only. By itself it does not modify the frozen ordinary component
+runner, connect the OpenSSH acceptance/response boundary, prove real wasmi Core
+attribution, publish the schema, collect physical Duo samples, or make an AOT
+decision. The managed-child/Core composition below closes the first three gaps
+for the exact diagnostic SSH target without changing the isolated gate's claim.
+
+The default-off `wasm-c84-ssh-request-parent` seam closes the authenticated
+request-parent ownership boundary without claiming a profile result. Only the
+public-key-authenticated, current-policy, exact-grammar `case-filter` descriptor
+can reserve the kernel slot. `PreparedExec` owns that reservation before the
+SSH success response; `PreparedExec::accept` sends success first and only then
+starts the slot lease, so a failed response drops the unstarted reservation.
+The resulting `AcceptedExec` keeps the run in `serve_connection`, outside the
+managed child. Every post-start, pre-response execution/reset/rebind failure
+therefore reaches the same linear Drop cleanup. A complete response instead
+consumes the run through the explicit response boundary, only after exit
+status, EOF, peer CLOSE acknowledgement, and Sunset output drain, before the
+next protocol event or TCP teardown.
+
+The kernel adapter deliberately cancels rather than finishes. It compares the
+cancel report with the independently stored rejection, acknowledges that exact
+epoch once, and requires `Ready(next_epoch)` before reporting RESPONSE or DROP.
+It has no finish, stream, publisher, or evidence surface. The independent
+source verifier mutation-checks the admission/order/ownership boundary and the
+exact cancel/rejection/acknowledge/reuse closure.
+
+`scripts/qemu-c84-ssh-request-parent-test.sh` boots the isolated OpenSSH image
+with one canonical hart. Builtin, unavailable native, parameterized target,
+and rejected-key probes must emit no profile marker. Two exact `case-filter`
+requests must close epochs 1 and 2; a third request is killed after its START
+marker and must emit one DROP cleanup marker; epoch 4 must then succeed, proving
+post-Drop slot reuse. The authenticated readiness probe starts immediately
+after DROP: the capability TCP adapter must retire the old connection
+generation in one poll, accept a queued replacement only on the next poll, and
+hand it to a fresh SSH Runner rather than resetting or reading it through the
+old parent. The exact epoch-4 request follows that successful readiness probe.
+The host accepts only the frozen ordered UART sequence.
+This request-parent-only gate remains QEMU integration evidence for request
+ownership: its managed child uses unprofiled wasmi polling, no sample is
+finished or streamed, and no physical-Duo profiling evidence is produced. The
+separate composition gate below closes the ordinary-child/Core connection.
+
+The default-off `wasm-c84-ssh-managed-child-core` feature composes the
+authenticated request parent, prepared-child delegation, and portable Core
+observer on the real ordinary Component path. During the exact synchronous
+`case-filter` start, child index 0 reserves its third prepared-task registration
+slot and is attached while the `PreparedTaskBatch` is still unpublished. Only
+its copy-only epoch enters the arena-owned payload; the parent `RunLease`
+remains private.
+The outer `ManagedChildFuture` claims that lineage in its first executor poll,
+before `child_start_gate`. A target driver constructs a fresh lexical
+`ManagedChildSlotCorePollClock` around every `poll_profiled`, then rejects an
+observer error or non-Closed Core owner before any later poll or `.await`.
+Non-target and feature-off drivers continue to call ordinary `call.poll()`.
+
+The driver sets its completion bit only after an exact successful guest result.
+The outer future releases only when that bit is true and the registry payload's
+final word is still exact Success; the armed executor detach callback then
+accepts only `CompletedPendingDetach + Exited` as clean. A cooperative
+cancellation cannot turn its later `Ready` envelope into a release: the
+future's destructor instead records abandonment before detach. Normal SSH
+response therefore requires no attached child, exact `Exited`, an empty fault
+set, and a Closed observer. Active request Drop accepts only the frozen
+detached/abandoned fault lattice. In both cases the request parent still
+cancels the sample, compares the rejection, acknowledges it once, and proves
+`Ready(next_epoch)`; it never finishes or streams the sample.
+
+The independent source verifier and isolated one-hart OpenSSH gate are:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-core.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-core-test.sh
+```
+
+The standalone gate preserves its original 19-marker managed-child/Core
+sequence and field contract. For identical successful requests at epochs 1, 2,
+and 4, it
+freezes 1,167 real Core polls, 1,167 observer pairs, and 1,241 typed polls.
+These are QEMU control-flow counts, distinct from the preparation preflight
+above and not timing evidence. Epoch 3 is killed only after the first ordinary
+Core pair;
+the actual executor detach is `Exited` after a canonical positive-u64 count of
+closed pairs (14 in the run that exposed the latent scheduling variation),
+with no release and exact `abandoned + detached` faults. That partial-run count
+is not frozen. The parent then performs the same cancel/ack closure, an
+immediate readiness probe succeeds, and epoch 4 proves post-Drop reuse. QEMU
+acceptance adds only guarded transition telemetry. This node deliberately does
+not add Host/Wait/Cleanup sidecars, combine the IRQ overlay, call `finish`,
+expose a verified stream or publisher, or produce schema, collector, physical
+Milk-V Duo, or AOT-decision evidence.
+
+The default-off `wasm-c84-ssh-managed-child-phase-sidecar` feature extends that
+same exact target with diagnostic Host, Wait, and Cleanup ownership. The parent
+records each real managed SSH pump/transport turn as Host and each execution,
+cooperation, cancellation, response-drain, or shutdown suspension as Wait. The
+child independently records Validation, Instantiation, and ABI; synchronous
+stream-dispatch methods use an explicit non-`Send` Host guard, while each real
+continuation await opens a copy-epoch Wait and revalidates the prepared task
+before restoring ABI or Cleanup. Parent and child Wait bits are independent.
+
+The portable runtime's default-no-op `cleanup_started` callback fires at most
+once per typed call. The managed clock latches Cleanup before canonical cleanup
+work, and a normal release requires closed child Wait/Host/Core plus that latch.
+Response additionally requires clean `Exited` and a closed parent Wait. Request
+Drop may preserve an open Wait as diagnostic state, but cannot acquire an extra
+phase fault; forgotten Host, stale successful Wait, missing Cleanup, or a late
+phase transition fails closed. The parent still cancels and acknowledges rather
+than finishing or streaming the sample.
+
+Run the source and live integration gates with:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-phase-sidecar.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-phase-sidecar-test.sh
+```
+
+The combined one-hart OpenSSH gate still strictly parses exactly 19 ordered
+managed-child/Core-family markers. Epochs 1 and 4 retain the standalone normal
+counts of 1,167 Core polls, 1,167 observer pairs, and 1,241 typed polls. Epoch 2
+writes only the first 257 stdin bytes before waiting for the real HostPending
+marker, so its frozen combined-image counts are exactly 1,171 Core polls,
+1,171 observer pairs, and 1,251 typed polls: Core increases by 4 and typed polls
+by 10. This combined workload does not change the standalone gate's transcript.
+The gate kills epoch 3 while the post-Core child Wait is open, immediately
+probes readiness, and reuses epoch 4. Successful epochs require ordered child
+phases, exactly one Cleanup, paired child Host/Core/Wait observations,
+relationally paired nonzero parent Host/Wait observations, clean detach, and
+response closure. On Drop, the canonical positive-u64 child Core start/finish
+count must exactly match the dynamically parsed Core-family closed-observer
+count. Dynamic partial-run and parent counts are not timing evidence. This node
+adds no IRQ composition, `finish`, verified stream, publisher, collector,
+physical Milk-V Duo sample, or AOT decision.
+
+The next default-off
+`wasm-c84-ssh-managed-child-irq-overlay` feature composes that same silent
+phase seam with the production IRQ overlay. It does not select the standalone
+IRQ acceptance worker. Its QEMU-only acceptance hooks force exactly two active
+boot-hart self-SSIPs, both in epoch 1: the first only after a real parent Host
+transition has returned and released `SLOT`, and the second only after the real
+managed child has opened its first lexical Core boundary. The child marker is
+withheld until that Core boundary has closed successfully. No active SSIP is
+forced in epochs 2--4.
+
+Every response or active Drop still performs the request parent's exact
+`cancel -> rejection -> acknowledge once -> Ready(next_epoch)` closure. Only
+after `Ready` and `ACTIVE_EPOCH == 0` are established does the acceptance hook
+force one inactive self-SSIP. Thus the cumulative `(paired, inactive,
+active_epoch)` observations are `(2, 1, 0)`, `(2, 2, 0)`, `(2, 3, 0)`, and
+`(2, 4, 0)` at epochs 1--4. The successful UART family is exactly six lines:
+epoch-1 `PARENT_SSIP` and `CHILD_SSIP`, then `RESPONSE` for epochs 1, 2, and 4
+and `DROP` for epoch 3. Epoch 1 alone reports `parent_pair=1 child_pair=1`;
+epochs 2--4 report both as zero. Each terminal reports
+`terminal_inactive=1`, `active_epoch=0`, `cancel=1`, `ack=1`, and the exact
+next ready epoch.
+
+Run the incremental source and live integration gates with:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-irq-overlay.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-irq-overlay-test.sh
+```
+
+The peer reuses the phase-sidecar's real four-request OpenSSH driver and strict
+27/28 phase-marker plus 19 Core-marker parser, and also imports the exact
+eight-marker request-parent parser. It then freezes the six IRQ markers and
+their cross-family order: request start precedes parent SSIP; child ABI and
+Core claim precede child SSIP; child SSIP precedes the original first-Core and
+Wait markers; and each phase, Core, and request terminal precedes the IRQ
+terminal before the next epoch starts. The old standalone IRQ and phase gates
+and their transcripts remain unchanged.
+
+The reusable base feature is UART-silent and is exposed to the Milk-V build
+only as a compile-time seam. This single-hart QEMU result is causal integration
+evidence, not timer/PLIC coverage, target timing, physical-Duo evidence, a
+verified profile, or an AOT decision. The parent still cancels: this node adds
+no `finish`, verified stream, schema publisher, or collector.
+
+The next default-off
+`wasm-c84-ssh-managed-child-finish-verify` successor changes only the terminal
+policy of successful profiled responses. After the existing child Cleanup,
+release, and exact Exited detach checks, epochs 1, 2, and 4 consume the parent
+`RunLease` with `finish`. The slot closes the target, runs the independent
+`TargetFinished::verify` rescan, and installs `TargetVerified` at cursor zero.
+The SSH adapter then explicitly discards that `StreamLease` without calling
+`summary`, `next_interval`, or `complete`; it checks the exact
+`StreamAbandoned` report with `intervals_emitted=0`, compares the independently
+stored rejection, acknowledges it once, and proves `Ready(next_epoch)`.
+
+Epoch 3 deliberately retains the predecessor active-Drop contract: kill after
+the real child Wait-open edge, observe abandoned+detached with Exited, cancel
+with `LeaseCancelled`, acknowledge once, prove `Ready(4)`, and reuse epoch 4.
+Nonzero status, an unready child, or stale policy is cancelled and recycled
+before finish; a target finish/verify rejection is also acknowledged before
+the response fails so the global slot is not stranded.
+
+Run the incremental source and live integration gates with:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-finish-verify.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-finish-verify-test.sh
+```
+
+The live peer reuses the exact four-request OpenSSH workload, including the
+epoch-2 257-byte delayed-stdin `HostPending` edge, epoch-3 active kill,
+immediate readiness probe, and epoch-4 replacement. In the successor image the
+normal RESPONSE suffix of the phase, Core, request, and IRQ families becomes
+`finish=1 verify=1 discard=stream_abandoned ack=1`; their nonterminal markers,
+epoch-3 DROP field/order contracts, family marker counts (27/28 phase, 19 Core,
+eight request, six IRQ), and cross-family order remain frozen. The
+scheduler-dependent phase/Core Drop observer count is parsed dynamically and
+must match across those two families. The new family contributes exactly four
+last-in-chain terminals: RESPONSE for epochs 1, 2, and 4 and DROP for epoch 3.
+The separately built predecessor IRQ gate remains byte-for-byte cancel-only
+and runs first in CI.
+
+This proves only the target finish/independent-verify transition and deliberate
+zero-cursor discard/recycle on one QEMU hart. It does not consume or validate a
+profile stream, publish a summary or schema, retain evidence, run a collector,
+produce physical Milk-V Duo evidence, or make the AOT decision.
+
+The next default-off
+`wasm-c84-ssh-managed-child-verified-stream` successor retains the same
+authenticated request, managed child, phase/Core, IRQ, and finish/verify
+boundaries while changing only successful verified-stream termination. Instead
+of abandoning the cursor-zero `StreamLease`, the kernel-private SSH adapter
+reads its `Summary`, consumes every indexed `Interval`, and calls
+`StreamLease::complete` only after the complete stream has passed the frozen
+schema-v1 partition semantics.
+
+For successful epochs 1, 2, and 4, `total_ticks` must be a positive u64,
+`interval_capacity` must be 65,536, `intervals_complete` must be true, and the
+dynamic `interval_count` must be in `1..=min(65_536, total_ticks)`: the
+`interval_count <= total_ticks` bound follows from positive interval lengths
+and contiguous coverage. The phase totals must add without overflow to
+`total_ticks`. The streamed intervals must have exact
+zero-based sequence numbers, positive lengths, gap-free contiguous endpoints,
+and distinct adjacent phases; a checked per-phase rescan must equal the summary
+and the final endpoint must equal `total_ticks`. The gate deliberately does not
+require every phase to be nonzero, freeze a phase order, or freeze the
+scheduler-dependent interval count. Completion requires
+`interval_count == emitted == final cursor` and exact `Ready(next_epoch)`.
+
+A locally detected summary or interval mismatch while the lease is still owned
+is explicitly discarded and must produce the exact same-epoch
+`StreamAbandoned` report, emitted cursor, stored comparison, acknowledgement,
+and Ready reuse before the SSH response fails. An error returned from
+`complete(self)` has already consumed the caller's handle, so the adapter may
+only inspect and acknowledge an installed same-epoch rejection; poison,
+ownership, or state mismatch without such a rejection remains fail-closed and
+is not claimed recoverable. Epoch 3 remains the active-Drop path and never
+finishes, verifies, summarizes, or streams a sample.
+
+Run the incremental gates with:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-verified-stream.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-verified-stream-test.sh
+```
+
+The successor leaves the five predecessor families' nonterminal and epoch-3
+DROP bytes/field contracts untouched and retains their exact family counts:
+27/28 phase, 19 Core, eight request, six IRQ, and four finish/verify. In the
+successor image only their successful RESPONSE suffix changes to
+`finish=1 verify=1 stream=complete ack=0 ready_epoch=...`; no predecessor
+success marker carries the dynamic interval count. The new family contributes
+exactly four last-in-chain terminals. Its successful marker is:
+
+```text
+WASM_C84_SSH_MANAGED_CHILD_VERIFIED_STREAM RESPONSE epoch=E status=0 finish=1 verify=1 summary=1 initial_cursor=0 total_ticks=T interval_capacity=65536 interval_count=N intervals_complete=1 emitted=N cursor=N sequence=exact contiguous=1 nonempty=1 adjacent_distinct=1 phase_sum=total_ticks phase_rescan=summary final_end=total_ticks stream=complete stored=0 ack=0 ready_epoch=R
+```
+
+Here `T` is a positive u64, `1 <= N <= min(65536, T)`, and `R = E + 1`; the
+`N <= T` bound is derived from positive-length contiguous coverage, and `N` is
+parsed semantically rather than frozen. Its epoch-3 terminal is:
+
+```text
+WASM_C84_SSH_MANAGED_CHILD_VERIFIED_STREAM DROP epoch=E cancel=lease_cancelled finish=0 verify=0 summary=0 stream=0 emitted=0 stored=1 ack=1 ready_epoch=R
+```
+
+Normal and Drop terminal order is phase, Core, request, IRQ, finish/verify, then
+verified-stream, and the last terminal must precede the next request START. The
+separately built finish/verify predecessor remains discard-only and runs first
+in CI. The compact verified-stream markers are diagnostic integration results,
+not serialized schema records. The storage-bearing lease never leaves the
+kernel adapter, and this node introduces no `ProfilePublisher`, schema
+publication, collector, retained evidence, physical Milk-V Duo evidence, or AOT
+decision; a later formal publisher must still accept `TargetVerified` rather
+than copied summary data or a UART success flag.
+
+The portable `vibeos-wasm-aot-profile` successor now provides that narrow
+single-record boundary. `ProfilePublisher::publish_profile` consumes one
+storage-bearing `TargetVerified` by value, rescans the complete profile and
+computes the chained accumulator before the first sink call, then streams one
+recursively ASCII-key-sorted, compact `VIBE_WASM_AOT_SAMPLE` JSON record without
+allocation. `RunId` and `Challenge` are distinct non-zero branded values;
+terminal observations must first become non-copyable eligible fields. That
+validation proves the frozen field values only, not live provenance.
+
+Zero-write preflight failures return the recycled `TargetReady` lineage and a
+retryable publisher with the original accumulator. Any possibly partial write
+or commit failure also recycles the lineage but permanently quarantines the
+sink in `ManuallyDrop`, including across unwinding, so its destructor cannot
+flush a truncated record. Only a committed record returns the sink, binding,
+recycled lineage, and derived accumulator. The checked-in golden is exactly one
+SAMPLE line; it intentionally contains no META or END.
+
+```sh
+python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
+cargo test --locked -p vibeos-wasm-aot-profile
+cargo check --locked -p vibeos-wasm-aot-profile \
+  --target riscv64imac-unknown-none-elf
+```
+
+This is still a portable serialization and ownership primitive. Its public
+terminal input can assert exactness but cannot prove where a counter came from;
+the exact-`u64::MAX` case is a serializer KAT, not permission to relabel a
+saturated live counter. The node adds no trusted SSH evidence producer,
+24-sample ordering, META/END closure, rollback resistance, physical-Duo
+capture, retained dataset, or AOT decision. Those remain collector/live nodes.
+
+The default-off `wasm-c84-ssh-managed-child-trusted-sample` live producer is a
+sibling successor of finish/verify, not a child of verified-stream. The two
+base features are mutually exclusive: verified-stream consumes and completes
+the storage-bearing authority, while trusted-sample must retain the unstreamed
+`TargetVerified` long enough to combine it with validated terminal evidence.
+The trusted base directly inherits finish/verify and the SSHD
+`c84-profile-trusted-sample` seam; its QEMU feature pairs only with the matching
+finish/verify QEMU predecessor. Milk-V forwards the silent base only.
+
+SSHD seals a non-copyable `SshExecProfileTerminal` only after the managed
+Component has published its exact terminal, all Component stdout has been
+drained into the SSH response buffer, and Component session shutdown has
+completed. It retains that seal inside the request run and delivers it to the
+kernel only at the later response boundary, after peer channel-close
+acknowledgement and complete Sunset output drain. `ComponentTerminal::Success`
+is required independently of numeric status zero, so `Returned(0)` is
+ineligible; any observed timeout, nonempty stderr, incomplete drain, or later
+cancellation fails closed. SSHD coalesces arbitrary Sunset channel-data slices
+into exactly twelve 1,024-byte Component sends plus the 37-byte EOF tail; the
+trusted feature fixes that staging limit even if the target-only native-revoke
+feature is also present. The exact Component host dispatcher counts a read only
+after the matching `Received(length)` commit and a write only after the
+immediate or resumed operation reaches its final `Sent`. It verifies all 13
+input and 13 output chunk boundaries and every byte of the frozen 12,325-byte
+transform with checked counters. Waiting, retry, EOF, and prepared-only edges
+never count.
+
+The terminal call's fuel metrics are copied before the call is dropped. The
+private producer rejects zero or over-budget fuel, a saturated fuel field, any
+of the five saturated `SyncCallProfile` fields, inconsistent Core/outer work,
+an empty or saturated poll count, or a non-exact poll derivation. Only then may
+the slot validate `TerminalObservation` into non-copyable
+`EligibleTerminalEvidence` and atomically move the matching `TargetVerified`
+into `TrustedVerifiedSample`. That kernel-private, non-`Send`, non-`Sync`
+bundle has private fields, no public constructor or `into_parts`, and keeps the
+sample and evidence inseparable. Public `TerminalObservation::validate` alone
+still proves eligibility values, not this live provenance.
+
+This node deliberately does not connect the bundle to `ProfilePublisher`.
+Epochs 1, 2, and 4 form exactly one bundle, take only a copy-only QEMU
+acceptance observation, explicitly discard the bundle with
+`TrustedSampleAbandoned`, compare the installed empty-fault/zero-cursor
+rejection, acknowledge it once, and prove `Ready(E + 1)`. Epoch 3 follows the
+existing active-Drop path and must form no bundle. Run the portable publisher,
+finish, verified-stream sibling, and trusted gates with:
+
+```sh
+python3 -B scripts/verify-c84-profile-publisher.py --selftest --check-source
+python3 -B scripts/verify-c84-ssh-managed-child-finish-verify.py --selftest --check-source
+python3 -B scripts/verify-c84-ssh-managed-child-verified-stream.py --selftest --check-source
+python3 -B scripts/verify-c84-ssh-managed-child-trusted-sample.py --selftest --check-source
+./scripts/qemu-c84-ssh-managed-child-trusted-sample-test.sh
+```
+
+The trusted image preserves every predecessor marker format and field contract,
+retaining 27/28 phase, 19 Core, eight request, six IRQ, and four finish/verify
+markers. The epoch-3 phase/Core observer count remains dynamically parsed and
+must agree across both families; it is not claimed byte-identical to a separate
+predecessor run. The three predecessor success lines per family end in
+`finish=1 verify=1 bundle=trusted discard=trusted_sample_abandoned ack=1
+ready_epoch=...`. The new family is last in the terminal chain and emits:
+
+```text
+WASM_C84_SSH_MANAGED_CHILD_TRUSTED_SAMPLE RESPONSE epoch=E status=0 exact_success=1 full_drain=1 read_chunks=13 write_chunks=13 stdout_bytes=12325 stdout_sha256=791f3fe1339984e8a8489c12ea5ff479ac7caa07c87be451134d3af0f526bb27 fuel_consumed=F poll_quanta=P poll_exact=1 logical_live_after=0 timed_out=0 bundle=trusted finish=1 verify=1 discard=trusted_sample_abandoned emitted=0 stored=1 ack=1 ready_epoch=R
+WASM_C84_SSH_MANAGED_CHILD_TRUSTED_SAMPLE DROP epoch=E cancel=lease_cancelled bundle=0 finish=0 verify=0 discard=0 emitted=0 stored=1 ack=1 ready_epoch=R
+```
+
+The peer accepts canonical decimal values only, with `1 <= F <= 500000`,
+`1 <= P < u64::MAX`, and `R = E + 1`; neither live count is frozen. It also
+requires each trusted `P` to equal the same epoch's dynamically parsed Core
+`typed_polls`, and requires phase/Core counts to agree. Normal and Drop order is
+phase, Core, request, IRQ, finish/verify, trusted-sample, followed by the next
+request START. These are log-only single-hart integration facts, not a SAMPLE
+record. No `ProfilePublisher`, META/SAMPLE/END transcript, collector ordering,
+retained dataset, physical Milk-V Duo capture, physical cold-boot provenance,
+or AOT decision is created or claimed.
+
+The default-off
+`wasm-c84-ssh-managed-child-single-boot-collector` successor consumes that
+opaque trusted bundle inside the kernel. A build-bound portable campaign owns
+the factory, sequence, accumulator, and 24-sample chain; after one META it
+accepts epochs 1 through 24, discards three warmups, retains 21 samples, checks
+nearest-rank p50/p95 stability, then splits Ready epoch 25 from the sole
+PendingEnd authority. Ready25 is already back in the target slot, but
+`PendingTerminal` makes every prepare Busy until all fallible request-tail
+gates succeed and the finalizer commits END. A non-final SAMPLE is similarly
+fenced by `PendingAcceptance`. Abandonment or END acquire/write/commit failure
+is absorbing and never retries; Complete/Failed states (diagnostic
+`closed`/`failed`) reject before target start. The platform-neutral
+formal UART sink holds TTY then TX across each raw-LF record for either the
+retained Milk-V contract or the disjoint fixed-QEMU contract. Framing, write,
+commit, panic, or allocator failure keeps the record fail-stopped; only a fully
+drained commit releases TX then TTY.
+For a terminal collector state, SSHD accepts the exec request only far enough
+to drain empty stdout plus exit status 126, EOF, and CLOSE; the rejection owns
+no command, Component, profile permit, or target-start path.
+
+The older diagnostic single-boot-collector QEMU acceptance uses the same
+collector and serializer with an absorbing SHA-256/byte-count audit sink. It
+performs one failed boot and one successful
+24-request boot, but writes no formal record bytes to UART and marks every
+diagnostic line `decision_eligible=0 formal_uart=0`. The host parser freezes
+both logs, validates all predecessor/collector counts and order, and rejects
+formal prefixes or schema payloads anywhere in the raw logs. Run the static,
+parser, and two-boot gates with:
+
+```sh
+python3 -B scripts/verify-c84-ssh-managed-child-single-boot-collector.py \
+  --selftest --check-source
+python3 -B scripts/c84-ssh-managed-child-single-boot-collector-peer.py \
+  --selftest
+./scripts/qemu-c84-ssh-managed-child-single-boot-collector-test.sh
+```
+
+CI also cross-compiles and links the physical Milk-V collector with a freshly
+generated challenge from an independently materialized and verified frozen
+source tree. The build runs in a sanitized `env -i` envelope with an isolated
+Cargo home, the pinned Rust tools, a fixed `ld.lld`, commit-derived
+`SOURCE_DATE_EPOCH`, and isolated objcopy. CI injects hostile ambient wrapper,
+profile, and rustflag values; the build must ignore all three. It neither runs
+nor retains that artifact. A Duo-v1 physical decision capture additionally
+requires that same frozen-source materialization and host-observed runtime
+closure, a real physical cold boot, and the documented
+three-boot/63-retained-sample verification flow; none is supplied by this
+compile gate and none is required by the disjoint fixed-QEMU decision contract.
 
 Normal `run.sh`/`qrun.sh` builds boot the separately compiled, least-authority
 `components/vsh` frontend through `kernel/src/vsh_platform.rs`. The
@@ -269,6 +2204,16 @@ larger byte allowances.
 ./scripts/bench.py --smp-scaling   # four exact-hart workers; require >=1.25x
 ./scripts/bench.py --selftest      # positive and fail-closed SMP parser fixtures
 ```
+
+Replacing the one-hart baseline is an architecture-epoch operation, not a way
+to waive a red comparison. Start from an otherwise clean source tree, use the
+pinned compiler, record the exact QEMU revision used, and rebuild once. Then
+repeat the exact binary with at least three `--no-build` runs. Review every
+metric and the policy-derived limits before committing the JSON. The
+2026-08-25 epoch followed that procedure on QEMU 11.0.3 after a source bisection
+attributed the old IPC/IRQ crossings to reclaimable-dispatch and generational
+instance safety. Its IPC/IRQ ratios were tightened so the larger coordinate
+retains approximately the old absolute regression headroom.
 
 The scaling mode intentionally does not share the deterministic one-hart
 baseline. It boots `-smp 4` with multithreaded TCG, waits for all three remote

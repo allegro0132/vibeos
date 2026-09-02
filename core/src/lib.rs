@@ -14,6 +14,7 @@ pub mod cap;
 pub mod chan;
 pub mod exec;
 pub mod heap;
+pub mod instance;
 pub mod interrupt;
 pub mod ipi;
 pub mod mmu;

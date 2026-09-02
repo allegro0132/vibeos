@@ -1,0 +1,86 @@
+{
+  "authority": {
+    "durable_publication_authorized": false,
+    "migration_authorized": false,
+    "ordinary_command_authorized": false,
+    "production_general_authorized": false,
+    "sealed_volatile_code10_runtime_released": true
+  },
+  "basis": {
+    "source_commit": "cdeefb93564ad0269306d27fabe879a8d88ac1df",
+    "source_tree": "e27f0978db7b1ed70c9dcae028b6109d2717cf4e"
+  },
+  "boundaries": {
+    "code5_current_engine": false,
+    "code5_permanently_inert": true,
+    "code8_scope_changed": false,
+    "code9_current_engine": false,
+    "code9_execution_authorized": false,
+    "code9_migration_authorized": false,
+    "code9_promoted": false
+  },
+  "evidence": {
+    "challenge": "084259602489bf4b64a4dcee876bdd064bb0174509349387bb05afeb3a55c0eb",
+    "environment_evidence_sha256": "00929ff04eda91286a0dfd7fc7205e0771289902a97b3f7dfaacfccac6097efc",
+    "environment_sha256": "b83aa628ba3b84c2cdde74d401964f72f0b511be2632f9f1bed6c70b647dd94c",
+    "manifest": {
+      "bytes": 2284,
+      "path": "acceptance/wasm-reference-target/artifacts/c813-e3-qualification-manifest.json",
+      "sha256": "f27036d546cb62e89f8931c65281656d61f034514bffd341510289a865938e38"
+    },
+    "normal_receipt": {
+      "bytes": 1051,
+      "path": "acceptance/wasm-reference-target/artifacts/c813-e3-normal-receipt.json",
+      "sha256": "91af00d5d1d1cb02b0a756b14b749da4ccc29a8322f361ec7879b0467167db5f"
+    },
+    "optimized_receipt": {
+      "bytes": 1054,
+      "path": "acceptance/wasm-reference-target/artifacts/c813-e3-optimized-receipt.json",
+      "sha256": "fc903026978da428e7e9c02973b526e75da579597190cf58652054a15b1ec8d7"
+    },
+    "records": 9,
+    "release_decision": {
+      "bytes": 1373,
+      "path": "acceptance/wasm-reference-target/artifacts/c813-e3-release-decision.json",
+      "sha256": "8a40657d23937cefa6051760a96a7bdea01e5320e7329ee64f4a20a25318aceb"
+    },
+    "run_id": "11f097eaa1ab51be766811018d0955ccc722f83feba7b37d0f095a31ae3d85b7",
+    "semantic_sha256": "6a654a8428f4f4479db637ab90d391c989c43b2c67dfc51570bd4ac617cc1a49",
+    "uart": {
+      "bytes": 5643,
+      "sha256": "32ab9d64cd21974bb846c5a5bf8574a4ed70c3630f2780dd4e428ede29894333"
+    }
+  },
+  "hardware_policy": {
+    "duo_gate_effect": false,
+    "duo_inputs": 0,
+    "fixed_qemu_is_hardware_equivalent": false,
+    "physical_provenance": "not-claimed"
+  },
+  "identity": {
+    "artifact_abi": 10,
+    "artifact_profile_code": 10,
+    "component_profile": 7,
+    "core_profile": 7,
+    "engine": "vibeos-wasmi-reference-executable@1.1.0-vibeos-ref2.1",
+    "name": "PROFILE_7_SYNC_REFERENCE_TYPES_EXECUTABLE",
+    "runtime_abi": 10,
+    "stage": "executable"
+  },
+  "qualification": {
+    "elf_no_native_float_helpers": true,
+    "elf_no_riscv_f_d_or_v": true,
+    "normal_verified": true,
+    "optimized_verified": true,
+    "platform": "qemu-virt-rv64-tcg-icount-v1",
+    "qemu_boots": 1
+  },
+  "roadmap": {
+    "completed_node": "C8.13-E3",
+    "current_position": "c813-e3-qualified-sealed-reference-runtime-released",
+    "next_node": "unallocated"
+  },
+  "schema": "vibeos.c813.e3.fixed-qemu-qualification-v1.contract",
+  "status": "c813-e3-qualified-sealed-reference-runtime-released",
+  "version": 1
+}

@@ -1,0 +1,497 @@
+{
+  "schema": "vibeos.wasm-aot-decision.manifest",
+  "version": 1,
+  "suite_id": "vibeos.c84.qemu-aot-decision",
+  "workload_revision": 1,
+  "scope": {
+    "roadmap_item": "C8.4",
+    "state": "qemu-decision-contract-frozen",
+    "c83_status": "accepted-complete-by-historical-evidence-policy",
+    "platform_class": "emulator",
+    "physical_provenance": "not-claimed",
+    "aot_authorized": false,
+    "native_code_accepted": false
+  },
+  "capture_modes": {
+    "formal-publication": {
+      "decision_eligible": true,
+      "publication_eligible": true
+    },
+    "dirty-smoke-not-publication": {
+      "decision_eligible": false,
+      "publication_eligible": false
+    }
+  },
+  "fixture": {
+    "id": "ssh-case-filter-12k-v1",
+    "product_path": "authenticated OpenSSH SessionExec of the image-pinned case-filter command",
+    "transport": "authenticated-openssh-exec",
+    "command": "case-filter",
+    "world": "vibe:stream/filter@1.0.0",
+    "entrypoint": "run",
+    "artifact": {
+      "wat_path": "policy/image/artifacts/c53-stream-filter.component.wat",
+      "byte_len": 2012,
+      "sha256": "180ed444de8b6c9ecd828b369d4c8b9f783758ef22c0b17170682d71f2fd0e72"
+    },
+    "input": {
+      "generator": "bytes((index * 17 + 3) % 251 for index in range(12 * 1024 + 37))",
+      "byte_len": 12325,
+      "sha256": "6b6054d492e00e68a93bc9b657a69577c7c44f5a48f169adb4124df0a50f6b3c"
+    },
+    "output": {
+      "transform": "bytes(byte ^ 0x20 for byte in input)",
+      "byte_len": 12325,
+      "sha256": "791f3fe1339984e8a8489c12ea5ff479ac7caa07c87be451134d3af0f526bb27",
+      "exit_status": 0,
+      "stderr_bytes": 0
+    },
+    "chunking": {
+      "maximum_chunk_bytes": 1024,
+      "read_chunks": 13,
+      "write_chunks": 13
+    },
+    "limits": {
+      "memory_bytes": 524288,
+      "total_fuel": 500000,
+      "poll_quantum": 100,
+      "resources": 4
+    }
+  },
+  "platform": {
+    "id": "qemu-virt-rv64-tcg-icount-v1",
+    "class": "emulator",
+    "physical_provenance": "not-claimed",
+    "decision_eligible": true,
+    "machine": "virt",
+    "cpu": "rv64",
+    "hart_count": 1,
+    "memory_mib": 128,
+    "accelerator": "tcg,thread=single",
+    "icount": "shift=0,align=off,sleep=off",
+    "bios": "explicit-opensbi-riscv64-generic-fw_dynamic.bin",
+    "bios_default_forbidden": true,
+    "clock": "riscv.rdtime",
+    "timebase_hz": 10000000,
+    "qemu_version_policy": "frozen-exact-v1",
+    "qemu_version": "QEMU emulator version 11.0.3",
+    "qemu_binary_policy": "frozen-sha256-and-byte-length-v1",
+    "qemu_binary": {
+      "sha256": "ef5c714232320c22561daa0998546b73672e21a2801404714dfbd4982ac7b3c0",
+      "bytes": 13511488
+    },
+    "qemu_environment": {
+      "policy": "deny-by-default-private-campaign-v1",
+      "applies_to": ["firmware-search-probe", "version-probe", "live-campaign"],
+      "private_directory_mode": "0700",
+      "private_directories_must_remain_empty": true,
+      "allowed_names": ["HOME", "LANG", "LC_ALL", "PATH", "TMPDIR", "TZ", "XDG_CONFIG_HOME"],
+      "normalized_values": {
+        "HOME": "<campaign-root>/qemu-environment/home",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "TMPDIR": "<campaign-root>/qemu-environment/tmp",
+        "TZ": "UTC",
+        "XDG_CONFIG_HOME": "<campaign-root>/qemu-environment/xdg-config"
+      },
+      "live_data_directory": {
+        "path": "<campaign-root>/qemu-environment/data",
+        "mode": "0500",
+        "must_remain_empty": true
+      }
+    },
+    "qemu_process_cwd": "/",
+    "python_runtime": {
+      "policy": "pinned-cpython-3.14-runtime-closure-v1",
+      "launcher": {
+        "path": "scripts/run-c84-qemu-aot-decision.sh",
+        "sha256": "a379d1531d67a19931563a47477467b4010046b922b22c0af40a9a2a1ba25c71",
+        "bytes": 4060
+      },
+      "argv_prefix": [
+        "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14",
+        "-I",
+        "-B",
+        "-S",
+        "-X",
+        "pycache_prefix=/var/empty/vibeos-c84-python-pyc"
+      ],
+      "executable": {
+        "path": "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/bin/python3.14",
+        "sha256": "b502cb4c5b46b8d4192ec6bcb600ce8922f1afc396fcf646e8765c6eba74a0bf",
+        "bytes": 52448
+      },
+      "version": "3.14.6",
+      "prefix": "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14",
+      "framework": {
+        "path": "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Python",
+        "sha256": "696ffa2cf9562522c387f7c2b3a990ef67e574df2d921822fe310ea35587cce0",
+        "bytes": 5454512
+      },
+      "app_executable": {
+        "path": "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python",
+        "sha256": "0c9a985712bb1235d8fe474a6a99810dc118bcae0dfb429a237aac0c907fa3af",
+        "bytes": 51392
+      },
+      "stdlib_inventory": {
+        "policy": "reachable-stdlib-tree-v1-exclude-site-packages-and-pycache",
+        "root": "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14",
+        "sha256": "59bb25e3cf5c4483dfdd8d152f41dafef62ab2f905717bcfd5f800c1a61c641a",
+        "entries": 2703,
+        "files": 2498,
+        "directories": 203,
+        "symlinks": 2,
+        "bytes": 57153940
+      },
+      "runtime_dynamic_closure": {
+        "hashlib_extension": {
+          "path": "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_hashlib.cpython-314-darwin.so",
+          "sha256": "7218f3babc5db5b091249955dbba6c2260a0dddd25560bc17d83c7da87a3e95c",
+          "bytes": 97968
+        },
+        "libcrypto": {
+          "path": "/opt/homebrew/Cellar/openssl@3/3.6.3/lib/libcrypto.3.dylib",
+          "sha256": "34bc039f5c725691e757ef42d26f1709830b18046c3ad6d93985153c83d0bbbc",
+          "bytes": 4846032
+        },
+        "lzma_extension": {
+          "path": "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_lzma.cpython-314-darwin.so",
+          "sha256": "90f3612615d66f3cc7ebced3851f2c24ed91a142ddb5428b1ad9253d2a7fbb19",
+          "bytes": 92256
+        },
+        "liblzma": {
+          "path": "/opt/homebrew/Cellar/xz/5.8.3/lib/liblzma.5.dylib",
+          "sha256": "3d5bfa2f097c31463642b1daab5e662b44368bb4da368f85e412e7f9adcbaa10",
+          "bytes": 184512
+        },
+        "zstd_extension": {
+          "path": "/opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/lib/python3.14/lib-dynload/_zstd.cpython-314-darwin.so",
+          "sha256": "4ee39ca9e3102ca37938cd578bb8e0c1c82106be7001f329ded33a0720cbee5e",
+          "bytes": 114176
+        },
+        "libzstd": {
+          "path": "/opt/homebrew/Cellar/zstd/1.5.7_1/lib/libzstd.1.5.7.dylib",
+          "sha256": "e2847c4613b386683c234913ae3b7b04299254096caf7616e3b3cd9bb97a39ab",
+          "bytes": 649648
+        },
+        "openssl_configuration": {
+          "conf": "/dev/null",
+          "modules": "/var/empty",
+          "modules_empty": true
+        },
+        "system_policy": "darwin-sealed-system-volume"
+      }
+    },
+    "bios_policy": "frozen-sha256-and-byte-length-v1",
+    "bios_identity": {
+      "sha256": "49bdf7b939bda11321132d1042bf99d7324fb190f1feef423171fed3573f8705",
+      "bytes": 273048
+    },
+    "host_os": "darwin",
+    "openssh_policy": "frozen-darwin-system-volume-v1",
+    "openssh_execution_path": "/usr/bin/ssh",
+    "openssh_version": "OpenSSH_10.2p1, LibreSSL 3.3.6",
+    "openssh_identity": {
+      "sha256": "470f812f6e71ee4ca1b49c79f9c2982c054493e22502d4648bd010feb4b2a9b2",
+      "bytes": 1555472
+    },
+    "kernel_policy": "sha256-and-byte-length-recorded-per-evidence",
+    "qemu_argv_policy": "single-generated-actual-plus-independent-normalization-v1",
+    "qemu_normalized_argv": [
+      "qemu-system-riscv64",
+      "-no-user-config",
+      "-L",
+      "<qemu-data>",
+      "-machine",
+      "virt",
+      "-cpu",
+      "rv64",
+      "-smp",
+      "1",
+      "-m",
+      "128M",
+      "-accel",
+      "tcg,thread=single",
+      "-icount",
+      "shift=0,align=off,sleep=off",
+      "-nographic",
+      "-bios",
+      "<opensbi>",
+      "-kernel",
+      "<kernel>",
+      "-object",
+      "rng-random,id=vibeos-c84-aot-decision-rng,filename=/dev/urandom",
+      "-device",
+      "virtio-rng-device,rng=vibeos-c84-aot-decision-rng,bus=virtio-mmio-bus.1",
+      "-netdev",
+      "user,id=vibeos-c84-aot-decision-net,net=10.0.2.0/24,host=10.0.2.2,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:<host-port>-10.0.2.15:2222",
+      "-device",
+      "virtio-net-device,netdev=vibeos-c84-aot-decision-net,bus=virtio-mmio-bus.0,mac=02:00:00:00:00:01",
+      "-global",
+      "virtio-mmio.force-legacy=false"
+    ],
+    "qemu_runtime_policy": "darwin-qemu-recursive-nonsystem-macho-closure-v1",
+    "qemu_runtime_graph_sha256": "4b410b796467f972fdf4f55113dad8c6edbe964cb921ff1271faf2439a737855",
+    "qemu_runtime_counts": {
+      "nodes": 29,
+      "load_edges": 147,
+      "pinned_homebrew_edges": 68,
+      "sealed_system_edges": 79
+    },
+    "qemu_runtime_phase_policy": "source-and-execution-custody-pre-post-final-v1",
+    "qemu_runtime_system_dependency_prefixes": ["/System/Library/", "/usr/lib/"],
+    "qemu_runtime_host_os_build": {
+      "product_name": "macOS",
+      "product_version": "26.5.2",
+      "build_version": "25F84",
+      "darwin_release": "25.5.0"
+    },
+    "qemu_module_search_policy": "no-plugin-argv-and-absent-qemu-module-directories-v1",
+    "qemu_live_data_policy": "private-empty-directory-v1",
+    "qemu_otool_custody": {
+      "policy": "direct-command-line-tools-symlink-and-identity-v1",
+      "invocation_path": "/Library/Developer/CommandLineTools/usr/bin/otool",
+      "resolved_path": "/Library/Developer/CommandLineTools/usr/bin/llvm-otool",
+      "sha256": "61ff2c63cf68eeeadf9c4700dadb8271740ff4960f98500f30db82b31521c0de",
+      "bytes": 138208,
+      "package_id": "com.apple.pkg.CLTools_Executables",
+      "package_version": "26.6.0.0.1781586589"
+    },
+    "qemu_runtime_host_exclusivity_limit": "same-uid-host-exclusivity-required; pre/post/final identity checks cannot exclude a same-UID swap-and-restore during a live process",
+    "source_materialization_policy": "exact-commit-raw-blob-export-v1",
+    "repository_local_config_policy": "raw-identity-safe-key-allowlist-v1",
+    "cargo_dependency_policy": "project-and-rust-src-lock-union-checksum-verified-private-directory-source-v1",
+    "cargo_registry_source": "registry+https://github.com/rust-lang/crates.io-index",
+    "cargo_project_lock_identity": {
+      "sha256": "ca1ed8424b4e21ba8844a7f426077e811097760a2d59c21c5c711d4927c2ec9d",
+      "bytes": 56970,
+      "packages": 189,
+      "package_set_sha256": "a327b577ce3f0b4591afa2451f6ad0ea3c8900e3b64677fae98581dc4f2be190"
+    },
+    "cargo_rust_src_lock_identity": {
+      "sha256": "0cd31e4d5c49d7cfbfc479e5cb63001a60c8fdca365677e8ee92137a2b5aaeeb",
+      "bytes": 9835,
+      "packages": 30,
+      "package_set_sha256": "c13441213110ae29eb2f814ca77627f2f3a43501b7e7d3d6e9337567a1572c8f"
+    },
+    "cargo_lock_union_identity": {
+      "packages": 213,
+      "exact_overlap": 6,
+      "project_only": 183,
+      "rust_src_only": 24,
+      "package_set_sha256": "395c4f3063d7d5c0db59ffa15cb1e58e48272837ac97386616a40e8bf3f9c5b2"
+    },
+    "private_crate_source_identity": {
+      "policy": "strict-tree-content-mode-v1",
+      "sha256": "4c147b68347c1183847aae453c1a625a08bcca6409f6036c2eaf2a85ace3a33b",
+      "files": 11604,
+      "directories": 2518,
+      "bytes": 138693206
+    },
+    "private_crate_archive_identity": {
+      "policy": "strict-tree-content-mode-v1",
+      "sha256": "d0b61dc97e2c4e3dda7a57c5034cf51a58c300254c571d1fe2f264a19bb48ad0",
+      "files": 189,
+      "directories": 1,
+      "bytes": 23706909
+    },
+    "cargo_configuration_policy": "cwd-root-private-home-exact-config-deterministic-transients-v1",
+    "cargo_cache_last_use_clock": "1234567890",
+    "cargo_transient_output_set": [
+      ".global-cache",
+      ".package-cache",
+      ".package-cache-mutate",
+      "registry/CACHEDIR.TAG"
+    ],
+    "cargo_global_cache_identity": {
+      "sha256": "66d946720de0afd44c2d5748698b700ce812830bd8a3dedaa589831610948d9d",
+      "bytes": 57344
+    },
+    "cargo_cache_directory_tag_identity": {
+      "sha256": "6d9d1d216e0f83abc5e5662ca62c92b4f23009466b54fa27321a69acdb778bb2",
+      "bytes": 177
+    },
+    "formal_cargo_cwd": "/",
+    "build_environment_path": "/opt/homebrew/bin:/usr/bin:/bin",
+    "rust_toolchain_resolution_policy": "fixed-rustup-home-channel-host-no-rustup-execution-v1",
+    "rust_toolchain_root": "/Users/ziangwang/.rustup/toolchains/nightly-2026-08-01-aarch64-apple-darwin",
+    "rust_toolchain_tree_identity": {
+      "policy": "strict-tree-content-mode-v1",
+      "sha256": "5927a8a6986e0478afcafd0d61151a503436225fdaceb0f087f7d46aad968f92",
+      "files": 3916,
+      "directories": 972,
+      "bytes": 853137324
+    },
+    "rust_src_identity": {
+      "policy": "strict-tree-content-mode-v1",
+      "sha256": "6dc205c0cc725423857e3fe34a0f7394a3247846bf71a25a087321281df5e182",
+      "files": 3603,
+      "directories": 933,
+      "bytes": 71790604
+    },
+    "rust_src_cargo_toml_identity": {
+      "sha256": "b346ae33bd9648949894510a2bcc1d1f8b78c7301c3110e4a98b68bacd3b4584",
+      "bytes": 3070
+    },
+    "rust_src_cargo_lock_identity": {
+      "sha256": "0cd31e4d5c49d7cfbfc479e5cb63001a60c8fdca365677e8ee92137a2b5aaeeb",
+      "bytes": 9835
+    },
+    "linker_runtime_policy": "darwin-recursive-nonsystem-macho-closure-v1",
+    "linker_runtime_sha256": "9b5885317dd8ea18a789427356d4258352222f0c218422f5d224f387e9888cb8",
+    "execution_custody_policy": "private-qemu-bios-kernel-plus-darwin-system-openssh-v1",
+    "guest_platform_identity_excludes_host_paths": true
+  },
+  "sampling": {
+    "fresh_qemu_processes": 1,
+    "warmup_per_process": 3,
+    "retained_per_process": 21,
+    "samples_per_process": 24,
+    "retained_total": 21,
+    "order": "three discarded warmups followed by twenty-one retained samples in one fresh fixed-QEMU process",
+    "statistics": {
+      "p50": "nearest-rank index ceil(0.50*n)-1 after ascending sort",
+      "p95": "nearest-rank index ceil(0.95*n)-1 after ascending sort",
+      "p50_sorted_index": 10,
+      "p95_sorted_index": 19,
+      "decision_population": "the 21 retained samples from the one fresh fixed-QEMU process",
+      "timer_overhead_subtracted": false,
+      "stability": "p95(total_ticks) / p50(total_ticks) <= 1.10"
+    }
+  },
+  "budget": {
+    "metric": "retained end-to-end response p95",
+    "clock": "riscv.rdtime",
+    "timebase_hz": 10000000,
+    "ticks": 1000000,
+    "milliseconds": 100,
+    "derivation": "the pre-frozen 100 ms workload budget multiplied by the fixed 10 MHz guest timebase",
+    "calibrated_after_measurement": false,
+    "comparison": "miss iff p95(total_ticks) > 1000000",
+    "eligible_platform": "qemu-virt-rv64-tcg-icount-v1"
+  },
+  "phases": [
+    {
+      "id": "validation",
+      "order": 1,
+      "aot_attributable": false
+    },
+    {
+      "id": "instantiation",
+      "order": 2,
+      "aot_attributable": false
+    },
+    {
+      "id": "abi",
+      "order": 3,
+      "aot_attributable": false
+    },
+    {
+      "id": "interpretation",
+      "order": 4,
+      "aot_attributable": true
+    },
+    {
+      "id": "host",
+      "order": 5,
+      "aot_attributable": false
+    },
+    {
+      "id": "wait",
+      "order": 6,
+      "aot_attributable": false
+    },
+    {
+      "id": "cleanup",
+      "order": 7,
+      "aot_attributable": false
+    }
+  ],
+  "transcript": {
+    "framing": {
+      "raw_scope": "one fresh fixed-QEMU process with no physical claim",
+      "required_raw_transcripts": 1,
+      "meta_records_per_raw": 1,
+      "sample_records_per_raw": 24,
+      "end_records_per_raw": 1,
+      "warmups_per_raw": 3,
+      "retained_per_raw": 21,
+      "maximum_raw_bytes": 268435456,
+      "record_order": "META, SAMPLE sequence 0 through 23, END",
+      "prefixes": {
+        "meta": "VIBE_WASM_AOT_META ",
+        "sample": "VIBE_WASM_AOT_SAMPLE ",
+        "end": "VIBE_WASM_AOT_END "
+      },
+      "forbidden_prefix": "WASM_C84_SSH_MANAGED_CHILD_SINGLE_BOOT_COLLECTOR AUDIT_"
+    },
+    "run_id": {
+      "domains": {
+        "formal-publication": "vibeos.c84.qemu-aot-decision.run-id.v1",
+        "dirty-smoke-not-publication": "vibeos.c84.qemu-aot-decision.smoke.run-id.v1"
+      },
+      "algorithm": "sha256",
+      "encoding": "domain followed by fields as NUL-separated ASCII values with no trailing NUL",
+      "fields": [
+        "source_commit",
+        "challenge",
+        "artifact_sha256",
+        "input_sha256",
+        "output_sha256",
+        "manifest_sha256",
+        "transcript_schema_sha256"
+      ],
+      "meaning": "identity of one source-bound QEMU campaign; it makes no cold-boot or physical-hardware claim"
+    },
+    "accumulator": {
+      "width_bits": 64,
+      "initial": 0,
+      "update": "acc = rotl64(acc, 7).wrapping_add(word)",
+      "sample_domain_word": 4843678931419484236,
+      "interval_domain_word": 4843678888688374358,
+      "phase_order": [
+        "validation",
+        "instantiation",
+        "abi",
+        "interpretation",
+        "host",
+        "wait",
+        "cleanup"
+      ],
+      "phase_codes": {
+        "validation": 1,
+        "instantiation": 2,
+        "abi": 3,
+        "interpretation": 4,
+        "host": 5,
+        "wait": 6,
+        "cleanup": 7
+      },
+      "purpose": "ordered truncation and corruption check, not authentication"
+    }
+  },
+  "decision_rule": {
+    "preconditions": "C1-C8.3 are accepted complete by historical-evidence policy and every QEMU-v1 C8.4 publication gate passes",
+    "budget_miss": "p95(total_ticks) > 1000000",
+    "interpretation_attribution": "p95(total_ticks - phase_ticks.interpretation) <= 1000000",
+    "eligible_outcome": "aot-eligible-for-c85-design-review-on-fixed-qemu",
+    "otherwise_outcome": "aot-not-justified-on-fixed-qemu",
+    "eligible_next_node": "C8.5 design review only",
+    "otherwise_next_node": "skip or defer conditional C8.5-C8.7 and continue C8.8",
+    "aot_authorized": false,
+    "native_code_accepted": false
+  },
+  "publication_gates": {
+    "preparation_commit": "the contract, runner, verifier, and feature isolation are committed and the fixed remote directly advertises that commit before and after capture",
+    "source": "the formal capture uses an exact raw-blob commit-and-gitlink export with frozen safe local Git configuration, a fresh private Cargo target, and binds the source commit and its timestamp into every build",
+    "smoke_exclusion": "dirty smoke records dirty-worktree build provenance while retaining the fixed-origin policy, uses a distinct build feature, capture mode, ineligible META value, and run-id domain, and cannot be promoted into formal publication",
+    "platform": "the frozen CPython launcher, executable, app executable, stdlib and dynamic runtime closure, QEMU and OpenSBI bytes, deny-by-default probe and process environments, actual and independently normalized QEMU argv, QEMU source/custody runtime closures and host-build-bound sealed-system edges, OpenSSH, private kernel, toolchain, executed Python source closure, and byte-identical execution custody are recorded and independently verified",
+    "completeness": "one fresh QEMU transcript contains one META, exactly 24 ordered SAMPLE records, and one END",
+    "correctness": "every sample exits zero, emits the exact output hash, emits empty stderr, and satisfies the frozen resource limits",
+    "phase_partition": "intervals are ordered, gap-free, non-overlapping, complete, and sum exactly to total_ticks and phase_ticks",
+    "stability": "the retained p95/p50 ratio is at most 1.10",
+    "physical_exclusion": "the evidence and outcome explicitly claim no physical provenance and cannot be accepted by the Duo contract",
+    "authorization": "neither outcome authorizes AOT, JIT, RWX, external native bytes, or bypass of authoritative component bytes and policy"
+  }
+}

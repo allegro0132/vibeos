@@ -1,0 +1,25 @@
+[package]
+name = "vibeos-wasmi-ir-softfloat"
+version = "1.1.0-vibeos-f2.1"
+edition = "2021"
+rust-version = "1.86"
+publish = false
+description = "C8.8-F2 deterministic software-float fork of wasmi_ir 1.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/wasmi-labs/wasmi"
+
+[lib]
+name = "wasmi_ir"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = ["wasmi_core/std"]
+simd = ["wasmi_core/simd"]
+
+[dependencies.wasmi_core]
+package = "vibeos-wasmi-core-softfloat"
+path = "../core"
+version = "=1.1.0-vibeos-f2.1"
+default-features = false
+

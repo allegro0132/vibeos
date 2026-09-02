@@ -14,6 +14,27 @@ legacy-shell = ["vibeos-kernel/legacy-shell"]
 milkv-ssh-acceptance = ["vibeos-kernel/milkv-ssh-acceptance"]
 milkv-jitterentropy-probe = ["vibeos-kernel/milkv-jitterentropy-probe"]
 milkv-jitterentropy-ssh-probe = ["vibeos-kernel/milkv-jitterentropy-ssh-probe"]
+wasm-c83-runtime-costs = ["vibeos-kernel/wasm-c83-runtime-costs"]
+wasm-c88-f5-float-duo-compile-readiness = [
+    "vibeos-kernel/wasm-c88-f5-float-duo-compile-readiness",
+]
+wasm-c84-profile-slot = ["vibeos-kernel/wasm-c84-profile-slot"]
+wasm-c84-core-poll-observer = ["vibeos-kernel/wasm-c84-core-poll-observer"]
+wasm-c84-profile-irq-overlay = ["vibeos-kernel/wasm-c84-profile-irq-overlay"]
+wasm-c84-profile-child-delegation = ["vibeos-kernel/wasm-c84-profile-child-delegation"]
+wasm-c84-ssh-request-parent = ["vibeos-kernel/wasm-c84-ssh-request-parent"]
+wasm-c84-ssh-managed-child-core = ["vibeos-kernel/wasm-c84-ssh-managed-child-core"]
+wasm-c84-ssh-managed-child-phase-sidecar = ["vibeos-kernel/wasm-c84-ssh-managed-child-phase-sidecar"]
+wasm-c84-ssh-managed-child-irq-overlay = ["vibeos-kernel/wasm-c84-ssh-managed-child-irq-overlay"]
+wasm-c84-ssh-managed-child-finish-verify = ["vibeos-kernel/wasm-c84-ssh-managed-child-finish-verify"]
+wasm-c84-ssh-managed-child-trusted-sample = ["vibeos-kernel/wasm-c84-ssh-managed-child-trusted-sample"]
+# Closed physical image: production Milk-V SSH plus the build-bound private
+# single-cold-boot collector and atomic formal UART sink.
+wasm-c84-ssh-managed-child-single-boot-collector = [
+    "milkv-ssh",
+    "vibeos-kernel/wasm-c84-ssh-managed-child-single-boot-collector",
+]
+wasm-c84-ssh-managed-child-verified-stream = ["vibeos-kernel/wasm-c84-ssh-managed-child-verified-stream"]
 
 [[bin]]
 name = "vibeos-milkv-duo"

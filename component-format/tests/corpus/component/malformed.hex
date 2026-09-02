@@ -1,0 +1,2 @@
+# truncated-section: valid component prefix followed by an unterminated LEB length
+00 61 73 6d 0d 00 01 00 01 80

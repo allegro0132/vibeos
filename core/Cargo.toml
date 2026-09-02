@@ -3,6 +3,15 @@ name = "vibeos-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Target-only fault-gate corruption/probe hooks used by the C4.8 QEMU
+# acceptance image. Production profiles must not enable this feature.
+wasm-c48-target-acceptance = []
+wasm-c66-node-replacement-acceptance = []
+# Resettable allocator telemetry used only by the isolated C8.3 sampler. Keep
+# the state and successful-allocation branch out of every product image.
+wasm-c83-runtime-costs = []
+
 [dependencies]
 vibeos-durable-format = { path = "../durable-format" }
 vibeos-hal = { path = "../hal" }

@@ -1,0 +1,17 @@
+[package]
+name = "vibeos-wasm-aot-profile"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# Formal C8.4 decision records for the fixed qemu-virt/TCG/icount envelope.
+# This is deliberately separate from the physical-Duo v1 record contract.
+qemu-decision-v1 = []
+# Non-publication build marker. This deliberately implies the complete formal
+# QEMU contract while changing the wire eligibility and run-id domain, so a
+# dirty smoke image cannot be mistaken for publication evidence.
+qemu-decision-v1-smoke = ["qemu-decision-v1"]
+
+[dependencies]
+sha2 = { version = "=0.11.0", default-features = false }

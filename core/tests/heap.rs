@@ -5,9 +5,12 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::sync::{Mutex, MutexGuard};
 
 use vibeos_core::arch;
+#[cfg(feature = "wasm-c83-runtime-costs")]
+use vibeos_core::heap::HeapLiveWindowError;
 use vibeos_core::heap::{
     current_domain, current_owner, enter_domain, enter_owner, AllocationDomain, AllocationFailure,
-    ArenaError, ArenaId, Heap, OwnerError, OwnerId,
+    ArenaError, ArenaId, FreshDomainBatchError, FreshDomainBatchRetireError, Heap, OwnerError,
+    OwnerId, MAX_ALLOCATION_ARENAS, MAX_FRESH_ALLOCATION_DOMAIN_BATCH, MAX_OWNER_ACCOUNTS,
 };
 use vibeos_core::runqueue::MAX_HARTS;
 
@@ -159,6 +162,50 @@ fn stats_track_live_and_peak() {
 }
 
 #[test]
+#[cfg(feature = "wasm-c83-runtime-costs")]
+fn live_window_tracks_short_lived_peak_and_exact_return() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let l = layout(64, 8);
+    let baseline = h.snapshot().live_bytes;
+    let window = h.begin_live_window().unwrap();
+
+    let first = unsafe { h.alloc(l) };
+    let second = unsafe { h.alloc(l) };
+    assert!(!first.is_null() && !second.is_null());
+    let held = h.snapshot().live_bytes;
+    unsafe {
+        h.dealloc(second, l);
+        h.dealloc(first, l);
+    }
+
+    let observation = window.finish();
+    assert_eq!(observation.live_before, baseline);
+    assert_eq!(observation.peak_live_bytes, held);
+    assert_eq!(observation.live_after, baseline);
+}
+
+#[test]
+#[cfg(feature = "wasm-c83-runtime-costs")]
+fn live_window_is_exclusive_and_drop_cancels_it() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let first = h.begin_live_window().unwrap();
+    assert_eq!(
+        h.begin_live_window().err(),
+        Some(HeapLiveWindowError::AlreadyActive)
+    );
+    drop(first);
+
+    let replacement = h
+        .begin_live_window()
+        .expect("dropping an unfinished window must release exclusivity");
+    let observation = replacement.finish();
+    assert_eq!(observation.live_before, observation.peak_live_bytes);
+    assert_eq!(observation.live_before, observation.live_after);
+}
+
+#[test]
 fn recycled_memory_is_usable() {
     let _serial = serial();
     let h = heap_of(64 * 1024);
@@ -216,7 +263,8 @@ fn domain_scopes_restore_both_owner_and_arena() {
     assert_eq!(current_domain(), AllocationDomain::new(owner, arena));
 
     outer.restore();
-    h.close_empty_arena(arena).unwrap();
+    h.close_empty_domain(AllocationDomain::new(owner, arena))
+        .unwrap();
     h.unregister_owner(owner).unwrap();
     assert_eq!(current_domain(), AllocationDomain::SYSTEM);
 }
@@ -259,8 +307,8 @@ fn owner_and_arena_scopes_are_isolated_by_hart() {
     first_scope.restore();
     assert_eq!(current_domain(), AllocationDomain::SYSTEM);
 
-    h.close_empty_arena(first_arena).unwrap();
-    h.close_empty_arena(second_arena).unwrap();
+    h.close_empty_domain(first_domain).unwrap();
+    h.close_empty_domain(second_domain).unwrap();
     h.unregister_owner(first_owner).unwrap();
     h.unregister_owner(second_owner).unwrap();
 }
@@ -582,6 +630,68 @@ fn owner_slots_unregister_only_after_provenance_is_gone() {
 }
 
 #[test]
+fn empty_domain_close_rejects_wrong_owner_without_consuming_arena() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let owner = h.create_owner(4096).unwrap();
+    let wrong_owner = h.create_owner(4096).unwrap();
+    let arena = h.create_arena(owner).unwrap();
+    let before = h.arena_stats(arena).unwrap();
+
+    assert_eq!(
+        h.close_empty_domain(AllocationDomain::new(wrong_owner, arena)),
+        Err(ArenaError::OwnerMismatch {
+            expected: wrong_owner,
+            actual: owner,
+        })
+    );
+    assert_eq!(h.arena_stats(arena), Some(before));
+
+    h.close_empty_domain(AllocationDomain::new(owner, arena))
+        .unwrap();
+    h.unregister_owner(owner).unwrap();
+    h.unregister_owner(wrong_owner).unwrap();
+}
+
+#[test]
+fn fault_reclaim_rejects_wrong_owner_without_touching_allocation() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let owner = h.create_owner(8192).unwrap();
+    let wrong_owner = h.create_owner(8192).unwrap();
+    let arena = h.create_arena(owner).unwrap();
+    let allocation = layout(48, 16);
+    let pointer = {
+        let _scope = unsafe { enter_domain(AllocationDomain::new(owner, arena)) };
+        unsafe { h.alloc(allocation) }
+    };
+    assert!(!pointer.is_null());
+    unsafe { pointer.write(0x6d) };
+    let arena_before = h.arena_stats(arena).unwrap();
+    let owner_before = h.account_stats(owner).unwrap();
+    let heap_before = h.stats();
+
+    assert_eq!(
+        unsafe { h.reclaim_faulted_domain(AllocationDomain::new(wrong_owner, arena)) },
+        Err(ArenaError::OwnerMismatch {
+            expected: wrong_owner,
+            actual: owner,
+        })
+    );
+    assert_eq!(h.arena_stats(arena), Some(arena_before));
+    assert_eq!(h.account_stats(owner), Some(owner_before));
+    assert_eq!(h.stats(), heap_before);
+    assert_eq!(unsafe { pointer.read() }, 0x6d);
+
+    let reclaimed =
+        unsafe { h.reclaim_faulted_domain(AllocationDomain::new(owner, arena)) }.unwrap();
+    assert_eq!(reclaimed.reclaimed_allocations, 1);
+    assert_eq!(h.arena_stats(arena), None);
+    h.unregister_owner(owner).unwrap();
+    h.unregister_owner(wrong_owner).unwrap();
+}
+
+#[test]
 fn arenas_isolate_incarnations_under_one_owner() {
     let _serial = serial();
     let h = heap_of(128 * 1024);
@@ -603,7 +713,8 @@ fn arenas_isolate_incarnations_under_one_owner() {
     unsafe { second_ptr.write(0xA7) };
     assert_eq!(h.account_stats(owner).unwrap().live_bytes, charge * 2);
 
-    let reclaimed = unsafe { h.reclaim_faulted_arena(first) }.unwrap();
+    let reclaimed =
+        unsafe { h.reclaim_faulted_domain(AllocationDomain::new(owner, first)) }.unwrap();
     assert_eq!(reclaimed.reclaimed_bytes, charge);
     assert_eq!(reclaimed.reclaimed_allocations, 1);
     assert_eq!(h.arena_stats(first), None);
@@ -616,7 +727,8 @@ fn arenas_isolate_incarnations_under_one_owner() {
     );
 
     unsafe { h.dealloc(second_ptr, l) };
-    h.close_empty_arena(second).unwrap();
+    h.close_empty_domain(AllocationDomain::new(owner, second))
+        .unwrap();
     h.unregister_owner(owner).unwrap();
 }
 
@@ -643,7 +755,8 @@ fn tracked_deallocation_unlinks_head_middle_and_tail() {
         0,
         "all intrusive links were removed"
     );
-    h.close_empty_arena(arena).unwrap();
+    h.close_empty_domain(AllocationDomain::new(owner, arena))
+        .unwrap();
     h.unregister_owner(owner).unwrap();
 }
 
@@ -661,7 +774,8 @@ fn fault_reclaim_returns_every_block_to_its_size_class() {
     };
     assert!(pointers.iter().all(|pointer| !pointer.is_null()));
 
-    let reclaimed = unsafe { h.reclaim_faulted_arena(arena) }.unwrap();
+    let reclaimed =
+        unsafe { h.reclaim_faulted_domain(AllocationDomain::new(owner, arena)) }.unwrap();
     assert_eq!(reclaimed.reclaimed_bytes, charge * pointers.len());
     assert_eq!(reclaimed.reclaimed_allocations, pointers.len());
     assert_eq!(h.account_stats(owner).unwrap().live_bytes, 0);
@@ -680,7 +794,8 @@ fn fault_reclaim_returns_every_block_to_its_size_class() {
     for pointer in replacements {
         unsafe { h.dealloc(pointer, l) };
     }
-    h.close_empty_arena(replacement_arena).unwrap();
+    h.close_empty_domain(AllocationDomain::new(owner, replacement_arena))
+        .unwrap();
     h.unregister_owner(owner).unwrap();
 }
 
@@ -698,7 +813,7 @@ fn fault_reclaim_scrubs_payload_before_same_address_reuse() {
     assert!(!abandoned.is_null());
     unsafe { abandoned.write_bytes(0xa5, l.size()) };
 
-    unsafe { h.reclaim_faulted_arena(arena) }.unwrap();
+    unsafe { h.reclaim_faulted_domain(AllocationDomain::new(owner, arena)) }.unwrap();
     let replacement_arena = h.create_arena(owner).unwrap();
     let replacement = {
         let _scope = unsafe { enter_domain(AllocationDomain::new(owner, replacement_arena)) };
@@ -712,7 +827,8 @@ fn fault_reclaim_scrubs_payload_before_same_address_reuse() {
     );
 
     unsafe { h.dealloc(replacement, l) };
-    h.close_empty_arena(replacement_arena).unwrap();
+    h.close_empty_domain(AllocationDomain::new(owner, replacement_arena))
+        .unwrap();
     h.unregister_owner(owner).unwrap();
 }
 
@@ -729,7 +845,7 @@ fn busy_or_active_arenas_block_close_and_owner_unregister() {
     };
 
     assert!(matches!(
-        h.close_empty_arena(arena),
+        h.close_empty_domain(AllocationDomain::new(owner, arena)),
         Err(ArenaError::ArenaBusy {
             live_allocations: 1,
             ..
@@ -748,7 +864,8 @@ fn busy_or_active_arenas_block_close_and_owner_unregister() {
         h.unregister_owner(owner),
         Err(OwnerError::ArenasActive { active_arenas: 1 })
     );
-    h.close_empty_arena(arena).unwrap();
+    h.close_empty_domain(AllocationDomain::new(owner, arena))
+        .unwrap();
     h.unregister_owner(owner).unwrap();
 }
 
@@ -770,16 +887,311 @@ fn arena_reclaim_never_touches_untracked_owner_allocations() {
     };
     unsafe { untracked.write(0x5C) };
 
-    unsafe { h.reclaim_faulted_arena(arena) }.unwrap();
+    unsafe { h.reclaim_faulted_domain(AllocationDomain::new(owner, arena)) }.unwrap();
     assert_eq!(h.account_stats(owner).unwrap().live_bytes, charge);
     assert_eq!(unsafe { untracked.read() }, 0x5C);
     assert_eq!(h.arena_stats(ArenaId::UNTRACKED), None);
     assert_eq!(
-        unsafe { h.reclaim_faulted_arena(ArenaId::UNTRACKED) },
+        unsafe { h.reclaim_faulted_domain(AllocationDomain::new(owner, ArenaId::UNTRACKED)) },
         Err(ArenaError::UntrackedArenaReserved)
     );
 
     let _ = tracked; // deliberately dangling after the unsafe reclaim contract
     unsafe { h.dealloc(untracked, l) };
     h.unregister_owner(owner).unwrap();
+}
+
+#[test]
+fn fresh_domain_batch_validation_preserves_the_fresh_sequences() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+
+    assert_eq!(
+        h.create_fresh_domains_batch(&[]),
+        Err(FreshDomainBatchError::Empty)
+    );
+    assert_eq!(
+        h.create_fresh_domains_batch(&vec![1; MAX_FRESH_ALLOCATION_DOMAIN_BATCH + 1]),
+        Err(FreshDomainBatchError::TooMany)
+    );
+    assert_eq!(
+        h.create_fresh_domains_batch(&[1024, 0, 2048]),
+        Err(FreshDomainBatchError::ZeroQuota)
+    );
+
+    let domains = h.create_fresh_domains_batch(&[1024, 2048]).unwrap();
+    assert_eq!(domains[0].owner, OwnerId::new(1));
+    assert_eq!(domains[0].arena, ArenaId::new(1));
+    assert_eq!(domains[1].owner, OwnerId::new(2));
+    assert_eq!(domains[1].arena, ArenaId::new(2));
+    assert_eq!(
+        h.retire_empty_domains_batch(&domains)
+            .unwrap()
+            .retired_count(),
+        domains.len()
+    );
+}
+
+#[test]
+fn fresh_domain_batch_success_is_ordered_distinct_and_reuses_slots() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let quotas = [1024, 4096, 2048, 8192];
+    let domains = h.create_fresh_domains_batch(&quotas).unwrap();
+
+    assert_eq!(domains.len(), quotas.len());
+    for (index, domain) in domains.iter().copied().enumerate() {
+        assert_ne!(domain.owner, OwnerId::SYSTEM);
+        assert!(domain.arena.is_tracked());
+        assert_eq!(
+            h.account_stats(domain.owner).unwrap().quota_bytes,
+            quotas[index]
+        );
+        assert_eq!(h.arena_stats(domain.arena).unwrap().owner, domain.owner);
+        assert!(domains[..index]
+            .iter()
+            .all(|prior| prior.owner != domain.owner && prior.arena != domain.arena));
+    }
+
+    let retired = h.retire_empty_domains_batch(&domains).unwrap();
+    assert_eq!(retired.retired_count(), domains.len());
+    for domain in &domains {
+        assert_eq!(h.account_stats(domain.owner), None);
+        assert_eq!(h.arena_stats(domain.arena), None);
+    }
+
+    let replacement_quotas = [16384, 32768, 65536, 131072];
+    let replacements = h.create_fresh_domains_batch(&replacement_quotas).unwrap();
+    assert_eq!(replacements.len(), domains.len());
+    for (index, domain) in replacements.iter().copied().enumerate() {
+        assert_eq!(
+            h.account_stats(domain.owner).unwrap().quota_bytes,
+            replacement_quotas[index]
+        );
+        assert!(domains
+            .iter()
+            .all(|retired| retired.owner != domain.owner && retired.arena != domain.arena));
+    }
+    h.retire_empty_domains_batch(&replacements).unwrap();
+}
+
+#[test]
+fn fresh_domain_batch_owner_capacity_failure_has_no_partial_registration() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let mut owners = Vec::new();
+    for _ in 1..MAX_OWNER_ACCOUNTS {
+        owners.push(h.create_owner(1024).unwrap());
+    }
+    let before: Vec<_> = owners
+        .iter()
+        .map(|owner| h.account_stats(*owner).unwrap())
+        .collect();
+    let live_before = h.snapshot().live_bytes;
+
+    assert_eq!(
+        h.create_fresh_domains_batch(&[2048]),
+        Err(FreshDomainBatchError::OwnerCapacity)
+    );
+    assert_eq!(
+        owners
+            .iter()
+            .map(|owner| h.account_stats(*owner).unwrap())
+            .collect::<Vec<_>>(),
+        before
+    );
+    assert_eq!(h.snapshot().live_bytes, live_before);
+    for owner in owners {
+        h.unregister_owner(owner).unwrap();
+    }
+}
+
+#[test]
+fn fresh_domain_batch_arena_capacity_failure_has_no_partial_registration() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let owner = h.create_owner(1024).unwrap();
+    let mut arenas = Vec::new();
+    for _ in 0..MAX_ALLOCATION_ARENAS {
+        arenas.push(h.create_arena(owner).unwrap());
+    }
+    let owner_before = h.account_stats(owner).unwrap();
+    let arenas_before: Vec<_> = arenas
+        .iter()
+        .map(|arena| h.arena_stats(*arena).unwrap())
+        .collect();
+    let live_before = h.snapshot().live_bytes;
+
+    assert_eq!(
+        h.create_fresh_domains_batch(&[2048]),
+        Err(FreshDomainBatchError::ArenaCapacity)
+    );
+    assert_eq!(h.account_stats(owner), Some(owner_before));
+    assert_eq!(
+        arenas
+            .iter()
+            .map(|arena| h.arena_stats(*arena).unwrap())
+            .collect::<Vec<_>>(),
+        arenas_before
+    );
+    assert_eq!(h.snapshot().live_bytes, live_before);
+    for arena in arenas {
+        h.close_empty_domain(AllocationDomain::new(owner, arena))
+            .unwrap();
+    }
+    h.unregister_owner(owner).unwrap();
+}
+
+fn fresh_domain_states(
+    h: &Heap,
+    domains: &[AllocationDomain],
+) -> Vec<(
+    Option<vibeos_core::heap::OwnerStats>,
+    Option<vibeos_core::heap::ArenaStats>,
+)> {
+    domains
+        .iter()
+        .map(|domain| (h.account_stats(domain.owner), h.arena_stats(domain.arena)))
+        .collect()
+}
+
+#[test]
+fn fresh_domain_batch_retire_rejects_duplicate_and_mismatched_identity_without_mutation() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let domains = h.create_fresh_domains_batch(&[4096, 4096, 4096]).unwrap();
+    let before = fresh_domain_states(h, &domains);
+
+    let duplicate_owner = [
+        domains[0],
+        AllocationDomain::new(domains[0].owner, domains[1].arena),
+    ];
+    assert_eq!(
+        h.retire_empty_domains_batch(&duplicate_owner),
+        Err(FreshDomainBatchRetireError::DuplicateOwner)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before);
+
+    let duplicate_arena = [
+        domains[0],
+        AllocationDomain::new(domains[1].owner, domains[0].arena),
+    ];
+    assert_eq!(
+        h.retire_empty_domains_batch(&duplicate_arena),
+        Err(FreshDomainBatchRetireError::DuplicateArena)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before);
+
+    let mismatch = [AllocationDomain::new(domains[1].owner, domains[0].arena)];
+    assert_eq!(
+        h.retire_empty_domains_batch(&mismatch),
+        Err(FreshDomainBatchRetireError::DomainMismatch)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before);
+
+    assert_eq!(
+        h.retire_empty_domains_batch(&[]),
+        Err(FreshDomainBatchRetireError::Empty)
+    );
+    assert_eq!(
+        h.retire_empty_domains_batch(&vec![
+            AllocationDomain::SYSTEM;
+            MAX_FRESH_ALLOCATION_DOMAIN_BATCH + 1
+        ]),
+        Err(FreshDomainBatchRetireError::TooMany)
+    );
+    assert_eq!(
+        h.retire_empty_domains_batch(&[AllocationDomain::SYSTEM]),
+        Err(FreshDomainBatchRetireError::InvalidDomain)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before);
+    h.retire_empty_domains_batch(&domains).unwrap();
+}
+
+#[test]
+fn fresh_domain_batch_retire_preflight_is_read_only_and_matches_commit_validation() {
+    let _serial = serial();
+    let h = heap_of(64 * 1024);
+    let domains = h.create_fresh_domains_batch(&[4096, 8192]).unwrap();
+    let before = fresh_domain_states(h, &domains);
+
+    h.preflight_retire_empty_domains_batch(&domains).unwrap();
+    assert_eq!(fresh_domain_states(h, &domains), before);
+
+    let mismatch = [AllocationDomain::new(domains[1].owner, domains[0].arena)];
+    assert_eq!(
+        h.preflight_retire_empty_domains_batch(&mismatch),
+        Err(FreshDomainBatchRetireError::DomainMismatch)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before);
+
+    let unavailable = [AllocationDomain::new(
+        OwnerId::new(u64::MAX - 1),
+        ArenaId::new(u64::MAX - 1),
+    )];
+    assert_eq!(
+        h.preflight_retire_empty_domains_batch(&unavailable),
+        Err(FreshDomainBatchRetireError::DomainUnavailable)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before);
+
+    assert_eq!(
+        h.retire_empty_domains_batch(&domains)
+            .unwrap()
+            .retired_count(),
+        domains.len()
+    );
+}
+
+#[test]
+fn fresh_domain_batch_retire_busy_or_extra_arena_never_consumes_a_peer() {
+    let _serial = serial();
+    let h = heap_of(128 * 1024);
+    let domains = h.create_fresh_domains_batch(&[32768, 32768]).unwrap();
+    let l = layout(64, 16);
+
+    let tracked = {
+        let _scope = unsafe { enter_domain(domains[0]) };
+        unsafe { h.alloc(l) }
+    };
+    assert!(!tracked.is_null());
+    let before_tracked = fresh_domain_states(h, &domains);
+    assert_eq!(
+        h.retire_empty_domains_batch(&domains),
+        Err(FreshDomainBatchRetireError::ArenaBusy)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before_tracked);
+    unsafe { h.dealloc(tracked, l) };
+
+    let untracked = {
+        let _scope = enter_owner(domains[0].owner);
+        unsafe { h.alloc(l) }
+    };
+    assert!(!untracked.is_null());
+    let before_untracked = fresh_domain_states(h, &domains);
+    assert_eq!(
+        h.retire_empty_domains_batch(&domains),
+        Err(FreshDomainBatchRetireError::OwnerBusy)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before_untracked);
+    unsafe { h.dealloc(untracked, l) };
+
+    let extra = h.create_arena(domains[0].owner).unwrap();
+    let before_extra = fresh_domain_states(h, &domains);
+    let extra_before = h.arena_stats(extra);
+    assert_eq!(
+        h.retire_empty_domains_batch(&domains),
+        Err(FreshDomainBatchRetireError::OwnerHasOtherArena)
+    );
+    assert_eq!(fresh_domain_states(h, &domains), before_extra);
+    assert_eq!(h.arena_stats(extra), extra_before);
+
+    h.close_empty_domain(AllocationDomain::new(domains[0].owner, extra))
+        .unwrap();
+    assert_eq!(
+        h.retire_empty_domains_batch(&domains)
+            .unwrap()
+            .retired_count(),
+        domains.len()
+    );
 }

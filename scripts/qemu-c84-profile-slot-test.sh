@@ -1,0 +1,277 @@
+#!/bin/sh
+# C8.4 fixed-storage, allocation-free-per-sample profile-slot acceptance.
+set -eu
+
+cd "$(dirname "$0")/.."
+
+KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt
+QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}
+C84_SLOT_TIMEOUT=${C84_SLOT_TIMEOUT:-60}
+C84_ACCEPTANCE_FEATURE=${C84_ACCEPTANCE_FEATURE:-wasm-c84-profile-slot-qemu-acceptance}
+C84_TEST_LABEL=${C84_TEST_LABEL:-qemu-c84-profile-slot-test}
+
+PASS_MARKER=${C84_PASS_MARKER:-'WASM_C84_PROFILE_SLOT PASS detached_active=1 detached_stream=1 epochs=1,2,3 intervals=7 indexed=1 complete=1 ready_epoch=4'}
+TOPOLOGY_MARKER=${C84_TOPOLOGY_MARKER:-'WASM_C84_PROFILE_SLOT TOPOLOGY_REJECT mask=0x3 logical=0 physical=0 epoch=1'}
+FAIL_MARKER=${C84_FAIL_MARKER:-'WASM_C84_PROFILE_SLOT FAIL'}
+FAMILY_MARKER=${C84_FAMILY_MARKER:-'WASM_C84_PROFILE_SLOT'}
+
+TEST_TMP=$(mktemp -d)
+SMP1_LOG="$TEST_TMP/smp1.log"
+SMP2_LOG="$TEST_TMP/smp2.log"
+MARKER_SNAPSHOT="$TEST_TMP/marker-snapshot.log"
+QEMU_PID=""
+KILLER_PID=""
+RESULT_REPORTED=0
+
+cleanup() {
+    status=$?
+    trap - EXIT HUP INT TERM
+    if [ -n "$KILLER_PID" ]; then
+        kill "$KILLER_PID" 2>/dev/null || true
+        wait "$KILLER_PID" 2>/dev/null || true
+    fi
+    if [ -n "$QEMU_PID" ]; then
+        kill "$QEMU_PID" 2>/dev/null || true
+        wait "$QEMU_PID" 2>/dev/null || true
+    fi
+    rm -f "$SMP1_LOG" "$SMP2_LOG" "$MARKER_SNAPSHOT"
+    rmdir "$TEST_TMP" 2>/dev/null || true
+    if [ "$status" -ne 0 ] && [ "$RESULT_REPORTED" -eq 0 ]; then
+        echo "$C84_TEST_LABEL: FAIL (unexpected exit)" >&2
+    fi
+    exit "$status"
+}
+
+fail() {
+    RESULT_REPORTED=1
+    echo "$C84_TEST_LABEL: FAIL ($1)" >&2
+    echo "--- smp=1 serial ---" >&2
+    if [ -f "$SMP1_LOG" ]; then
+        cat "$SMP1_LOG" >&2
+    fi
+    echo "--- smp=2 serial ---" >&2
+    if [ -f "$SMP2_LOG" ]; then
+        cat "$SMP2_LOG" >&2
+    fi
+    exit 1
+}
+
+count_exact_marker() {
+    log=$1
+    marker=$2
+    frozen=${3:-0}
+    cp "$log" "$MARKER_SNAPSHOT"
+    if [ "$frozen" -eq 1 ]; then
+        ignore_tail=0
+    else
+        ignore_tail=$(incomplete_uart_tail "$MARKER_SNAPSHOT")
+    fi
+    LC_ALL=C tr '\r' '\n' < "$MARKER_SNAPSHOT" | awk -v marker="$marker" -v ignore_tail="$ignore_tail" '
+        function inspect(line) {
+            if (line == marker || line == clear_line marker) {
+                count++
+            }
+        }
+        BEGIN { clear_line = sprintf("%c", 27) "[2K" }
+        {
+            if (have_previous) {
+                inspect(previous)
+            }
+            previous = $0
+            have_previous = 1
+        }
+        END {
+            if (have_previous && !ignore_tail) {
+                inspect(previous)
+            }
+            print count + 0
+        }
+    '
+}
+
+count_unexpected_markers() {
+    log=$1
+    expected=$2
+    frozen=${3:-0}
+    cp "$log" "$MARKER_SNAPSHOT"
+    if [ "$frozen" -eq 1 ]; then
+        ignore_tail=0
+    else
+        ignore_tail=$(incomplete_uart_tail "$MARKER_SNAPSHOT")
+    fi
+    LC_ALL=C tr '\r' '\n' < "$MARKER_SNAPSHOT" | awk -v family="$FAMILY_MARKER" -v expected="$expected" -v ignore_tail="$ignore_tail" '
+        function inspect(raw, line) {
+            line = raw
+            if (index(line, clear_line) == 1) {
+                line = substr(line, length(clear_line) + 1)
+            }
+            if (index(line, family) == 1 && line != expected) {
+                count++
+            }
+        }
+        BEGIN { clear_line = sprintf("%c", 27) "[2K" }
+        {
+            if (have_previous) {
+                inspect(previous)
+            }
+            previous = $0
+            have_previous = 1
+        }
+        END {
+            if (have_previous && !ignore_tail) {
+                inspect(previous)
+            }
+            print count + 0
+        }
+    '
+}
+
+incomplete_uart_tail() {
+    log=$1
+    if [ ! -s "$log" ]; then
+        echo 0
+        return
+    fi
+    last_byte=$(LC_ALL=C tail -c 1 "$log" | od -An -tu1 | tr -d '[:space:]')
+    case "$last_byte" in
+        10|13) echo 0 ;;
+        *) echo 1 ;;
+    esac
+}
+
+stop_qemu() {
+    if [ -n "$KILLER_PID" ]; then
+        kill "$KILLER_PID" 2>/dev/null || true
+        wait "$KILLER_PID" 2>/dev/null || true
+        KILLER_PID=""
+    fi
+    if [ -n "$QEMU_PID" ]; then
+        kill "$QEMU_PID" 2>/dev/null || true
+        wait "$QEMU_PID" 2>/dev/null || true
+        QEMU_PID=""
+    fi
+}
+
+boot_and_require() {
+    smp=$1
+    log=$2
+    expected=$3
+    forbidden=$4
+    scenario=$5
+
+    "$QEMU_BIN" \
+        -machine virt \
+        -cpu rv64 \
+        -smp "$smp" \
+        -m 128M \
+        -accel tcg,thread=single \
+        -nographic \
+        -bios default \
+        -kernel "$KERNEL" < /dev/null > "$log" 2>&1 &
+    QEMU_PID=$!
+
+    (
+        sleep "$C84_SLOT_TIMEOUT"
+        kill "$QEMU_PID" 2>/dev/null || true
+    ) &
+    KILLER_PID=$!
+
+    remaining=$((C84_SLOT_TIMEOUT * 10))
+    while [ "$remaining" -gt 0 ]; do
+        if grep -a -F "$FAIL_MARKER" "$log" >/dev/null 2>&1; then
+            fail "$scenario guest reported a FAIL marker"
+        fi
+        if grep -a -E '\[!\] (fatal|panic)|panicked at' "$log" >/dev/null 2>&1; then
+            fail "$scenario guest panicked"
+        fi
+
+        expected_count=$(count_exact_marker "$log" "$expected")
+        if [ "$expected_count" -gt 1 ]; then
+            fail "$scenario emitted the expected marker more than once"
+        fi
+
+        forbidden_count=$(count_exact_marker "$log" "$forbidden")
+        if [ "$forbidden_count" -ne 0 ]; then
+            fail "$scenario emitted the other scenario marker"
+        fi
+
+        unexpected_count=$(count_unexpected_markers "$log" "$expected")
+        if [ "$unexpected_count" -ne 0 ]; then
+            fail "$scenario emitted an unexpected profile-slot marker"
+        fi
+
+        if [ "$expected_count" -eq 1 ]; then
+            sleep 0.1
+
+            stop_qemu
+
+            if grep -a -F "$FAIL_MARKER" "$log" >/dev/null 2>&1; then
+                fail "$scenario guest reported a FAIL marker after PASS"
+            fi
+            if grep -a -E '\[!\] (fatal|panic)|panicked at' "$log" >/dev/null 2>&1; then
+                fail "$scenario guest panicked after PASS"
+            fi
+            if [ "$(count_exact_marker "$log" "$expected" 1)" -ne 1 ]; then
+                fail "$scenario emitted the expected marker more than once"
+            fi
+            if [ "$(count_exact_marker "$log" "$forbidden" 1)" -ne 0 ]; then
+                fail "$scenario emitted the other scenario marker"
+            fi
+            if [ "$(count_unexpected_markers "$log" "$expected" 1)" -ne 0 ]; then
+                fail "$scenario emitted an unexpected profile-slot marker"
+            fi
+
+            return 0
+        fi
+
+        if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+            fail "$scenario QEMU exited before the expected marker"
+        fi
+
+        sleep 0.1
+        remaining=$((remaining - 1))
+    done
+
+    fail "$scenario timed out waiting for the expected marker"
+}
+
+trap cleanup EXIT
+trap 'exit 130' HUP INT TERM
+
+case "$C84_SLOT_TIMEOUT" in
+    ''|*[!0-9]*|0)
+        fail "C84_SLOT_TIMEOUT must be a positive integer"
+        ;;
+esac
+
+if ! command -v rustup >/dev/null 2>&1; then
+    fail "rustup is required"
+fi
+if ! command -v "$QEMU_BIN" >/dev/null 2>&1; then
+    fail "$QEMU_BIN is required"
+fi
+
+toolchain=$(awk -F '"' '/^channel[[:space:]]*=/{print $2; exit}' rust-toolchain.toml)
+if [ -z "$toolchain" ]; then
+    fail "rust-toolchain.toml does not pin a toolchain"
+fi
+
+pinned_rustc=$(rustup which --toolchain "$toolchain" rustc) || fail "cannot locate pinned rustc"
+pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc) || fail "cannot locate pinned rustdoc"
+
+(
+    cd firmware/qemu-virt
+    RUSTC="$pinned_rustc" \
+    RUSTDOC="$pinned_rustdoc" \
+    rustup run "$toolchain" cargo build \
+        --release \
+        --locked \
+        --no-default-features \
+        --features "$C84_ACCEPTANCE_FEATURE"
+) >&2
+
+boot_and_require 1 "$SMP1_LOG" "$PASS_MARKER" "$TOPOLOGY_MARKER" "smp=1"
+boot_and_require 2 "$SMP2_LOG" "$TOPOLOGY_MARKER" "$PASS_MARKER" "smp=2"
+
+RESULT_REPORTED=1
+echo "$C84_TEST_LABEL: PASS"

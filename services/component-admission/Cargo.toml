@@ -1,0 +1,50 @@
+[package]
+name = "vibeos-component-admission"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ed25519-dalek = { version = "=3.0.0", default-features = false }
+sha2 = { version = "=0.11.0", default-features = false }
+vibeos-component-format = { path = "../../component-format" }
+vibeos-component-host = { path = "../component-host" }
+vibeos-component-runtime = { path = "../../component-runtime" }
+vibeos-core = { path = "../../core" }
+vibeos-wasm-runtime = { path = "../../wasm-runtime" }
+vibeos-wasm-simd-candidate = { path = "../../wasm-simd-candidate", default-features = false, optional = true }
+vibeos-wasm-simd-executable = { path = "../../wasm-simd-executable", default-features = false, optional = true }
+vibeos-wasm-reference-executable = { path = "../../wasm-reference-executable", default-features = false, optional = true }
+wasmparser = { version = "=0.255.0", default-features = false, features = ["component-model", "features", "prefer-btree-collections", "validate"], optional = true }
+
+[features]
+default = []
+c88-f4-acceptance = ["vibeos-component-runtime/c88-f4-acceptance"]
+c89-float-executable = ["vibeos-component-runtime/c89-float-executable"]
+c810-s4-acceptance = [
+    "dep:vibeos-wasm-simd-candidate",
+    "vibeos-component-runtime/c810-s3-acceptance",
+    "vibeos-wasm-runtime/c810-simd-candidate-inspection",
+    "vibeos-wasm-simd-candidate/c810-s2-acceptance",
+]
+c811-simd-executable = [
+    "dep:vibeos-wasm-simd-executable",
+    "vibeos-component-runtime/c811-simd-executable",
+    "vibeos-wasm-runtime/c811-simd-executable",
+    "vibeos-wasm-simd-executable/c811-s2-acceptance",
+]
+c813-reference-executable = [
+    "dep:vibeos-wasm-reference-executable",
+    "vibeos-component-runtime/c813-reference-executable",
+    "vibeos-wasm-runtime/c813-reference-executable",
+    "vibeos-wasm-reference-executable/c813-e2-acceptance",
+]
+native-async-acceptance = ["vibeos-component-runtime/native-async-acceptance"]
+preview1-wrapped-admission = ["dep:wasmparser"]
+# Default-off C8.2 corpus executor. It consumes only a freshly revalidated
+# Preview1-wrapped artifact and does not activate the profile/runtime-ready bit.
+preview1-corpus-acceptance = ["preview1-wrapped-admission"]
+selected-wasi-admission = []
+
+[dev-dependencies]
+vibeos-c82-preview1-corpus = { path = "../../tools/c82-preview1-corpus" }
+wat = { version = "=1.255.0", features = ["component-model"] }

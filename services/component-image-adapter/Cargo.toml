@@ -1,0 +1,43 @@
+[package]
+name = "vibeos-component-image-adapter"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+qemu-default = ["dep:vibeos-image-policy", "vibeos-image-policy/qemu-default"]
+milkv-duo-sd = ["dep:vibeos-image-policy", "vibeos-image-policy/milkv-duo-sd"]
+native-async-command-projection = [
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-image-policy",
+    "dep:vibeos-vsh",
+    "vibeos-component-admission/native-async-acceptance",
+    "vibeos-component-runtime/native-async-acceptance",
+    "vibeos-image-policy/c53-native-async-command-projection",
+]
+c88-f4-float-candidate-core = [
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-image-policy",
+    "vibeos-component-admission/c88-f4-acceptance",
+    "vibeos-component-runtime/c88-f4-acceptance",
+    "vibeos-image-policy/c88-f4-float-candidate",
+]
+c88-f4-float-candidate = [
+    "c88-f4-float-candidate-core",
+    "vibeos-image-policy/qemu-default",
+]
+c88-f4-float-candidate-duo = [
+    "c88-f4-float-candidate-core",
+    "vibeos-image-policy/milkv-duo-sd",
+]
+
+[dependencies]
+vibeos-component-admission = { path = "../component-admission", optional = true }
+vibeos-component-format = { path = "../../component-format", optional = true }
+vibeos-component-runtime = { path = "../../component-runtime", optional = true }
+vibeos-image-policy = { path = "../../policy/image", default-features = false, optional = true }
+vibeos-vsh = { path = "../../components/vsh", default-features = false, optional = true }

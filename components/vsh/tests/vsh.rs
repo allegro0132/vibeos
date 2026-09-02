@@ -1,11 +1,13 @@
 use std::any::Any;
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use vibeos_core::cap::{BlockRangeInfo, BlockRangeState, Resource, Rights};
 use vibeos_core::exec;
 use vibeos_vsh as vsh;
-use vibeos_vsh::{ScriptManifest, ScriptRequirement, Session, SessionProfile, Statement, Status};
+use vibeos_vsh::{
+    CancellationSignal, ScriptManifest, ScriptRequirement, Session, SessionProfile, Statement,
+    Status,
+};
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
@@ -41,7 +43,7 @@ fn execute_ssh(
     let task = exec::spawn_tracked("vsh-ssh-test", async move {
         let mut owned = session_task.lock().unwrap().take().unwrap();
         let report = owned
-            .execute_ssh_cancellable(source, Arc::new(AtomicBool::new(false)))
+            .execute_ssh_cancellable(source, Arc::new(CancellationSignal::new()))
             .await;
         *session_task.lock().unwrap() = Some(owned);
         *result_task.lock().unwrap() = Some(report);
@@ -83,6 +85,33 @@ fn assert_background_tasks_running(expected: usize) {
 fn assert_no_background_tasks() {
     let tasks = live_background_tasks();
     assert!(tasks.is_empty(), "background tasks survived: {tasks:?}");
+}
+
+#[test]
+fn prepared_pipeline_rejects_a_foreign_session_without_publishing_stages() {
+    let _serial = SERIAL.lock().unwrap();
+    assert_no_background_tasks();
+    let observed = Arc::new(Mutex::new(None));
+    let observed_task = observed.clone();
+    let task = exec::spawn_tracked("vsh-foreign-prepared-test", async move {
+        let mut owner = Session::new();
+        let script = vsh::parse("echo private").unwrap();
+        let Statement::Command(item) = &script.statements[0] else {
+            unreachable!()
+        };
+        let preflight = owner.preflight_pipeline(&item.command.first).unwrap();
+        let prepared = owner.prepare_pipeline(preflight).await.unwrap();
+        let mut foreign = Session::new();
+        let error = prepared.commit(&mut foreign, false).await.unwrap_err();
+        *observed_task.lock().unwrap() = Some(error.message);
+    });
+    exec::run_until_idle(100_000);
+    assert!(task.try_exit().is_some());
+    assert_eq!(
+        *observed.lock().unwrap(),
+        Some("prepared pipeline belongs to another session")
+    );
+    assert_no_background_tasks();
 }
 
 fn shutdown_session(mut session: Session) {
@@ -418,7 +447,8 @@ fn s4_vertical_echo_wc_pipeline() {
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].status, Status::Success);
     assert_eq!(reports[0].stages.len(), 2);
-    assert_ne!(reports[0].stages[0].task, reports[0].stages[1].task);
+    assert_eq!(reports[0].stages[0].stage, 0);
+    assert_eq!(reports[0].stages[1].stage, 1);
     assert_eq!(reports[0].output, "1 1 6\n");
     assert!(reports[0].peak_pipe_depth <= vsh::STREAM_BUFFER_CHUNKS);
 }

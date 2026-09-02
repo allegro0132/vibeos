@@ -1,0 +1,366 @@
+{
+  "schema": "vibeos.c78.independent-disk-policy",
+  "version": 1,
+  "scope": "frozen-c7-v1-policy-v3-component-graph",
+  "storage": {
+    "block_bytes": 512,
+    "page_bytes": 4096,
+    "geometry_profiles": {
+      "corpus": {
+        "managed_region_pages": 32784,
+        "initial_range_pages": 32784,
+        "initial_segments": 32,
+        "initial_block_count": 262272,
+        "admitted_range_pages": 32784,
+        "admitted_segments": 32,
+        "cleaner_reserve_segments": 4
+      },
+      "qemu": {
+        "managed_region_pages": 31760,
+        "initial_range_pages": 8208,
+        "initial_segments": 8,
+        "initial_block_count": 65664,
+        "admitted_range_pages": 14352,
+        "admitted_segments": 14,
+        "cleaner_reserve_segments": 2
+      }
+    },
+    "qemu_checkpoint_lifecycle": [
+      {
+        "generation": 3,
+        "classification": "vacant",
+        "allocated_segments": 2,
+        "next_segment_generation": 3,
+        "allocation_root": [1, 2, 1, 3],
+        "authority_root": [0, 1, 2, 2],
+        "catalog_root": [0, 1, 1, 2]
+      },
+      {
+        "generation": 4,
+        "classification": "g0",
+        "allocated_segments": 4,
+        "next_segment_generation": 5,
+        "allocation_root": [3, 4, 4, 4],
+        "authority_root": [3, 4, 3, 4],
+        "catalog_root": [3, 4, 2, 4]
+      },
+      {
+        "generation": 5,
+        "classification": "g1",
+        "allocated_segments": 6,
+        "next_segment_generation": 7,
+        "allocation_root": [5, 6, 4, 5],
+        "authority_root": [5, 6, 3, 5],
+        "catalog_root": [5, 6, 2, 5]
+      }
+    ],
+    "qemu_superseded_allocation_extents": [
+      [0, 1, 8, 3, 2],
+      [1, 2, 2, 1, 3]
+    ],
+    "external_policy_utf8": "vibeos.storage-v2.external-policy.v3\u0000persistent-space=0x5053,slot=0,generation=0,rights=rgx,kind=0x43535043\u0000program-space=0x50524f47,slot=0,generation=0,rights=r,kind=0x50524731\u0000graph-space=0x564942454f532d47524150482d563100,slot=0,generations=0..1,rights=r,kind=0x43475631\u0000graph-attachments=exact-root-relative,per-generation=3*0x434d5031+3*0x434d4531+1*0x43474531,inline=1,ungranted=1,max-replacement=1",
+    "external_policy_sha256": "f51d381c1323f51b6bc75286cc43be1aabf7fe63754c1a75fc67a05780aa521a",
+    "graph_space": "0x564942454f532d47524150482d563100",
+    "root_slot": 0,
+    "allowed_generations": [0, 1],
+    "root_rights": 1,
+    "stored_object_resource_kind": "0x53544f52",
+    "object_kinds": {
+      "artifact": "0x434d5031",
+      "artifact_evidence": "0x434d4531",
+      "graph_evidence": "0x43474531",
+      "graph_version": "0x43475631"
+    },
+    "root_object": {
+      "kind": "0x43475631",
+      "count": 1,
+      "granted": true,
+      "rights": 1
+    },
+    "attachments_per_generation": {
+      "artifact": 3,
+      "artifact_evidence": 3,
+      "graph_evidence": 1
+    },
+    "ordered_attachment_kinds": [
+      "artifact", "artifact", "artifact",
+      "artifact_evidence", "artifact_evidence", "artifact_evidence",
+      "graph_evidence"
+    ],
+    "attachments_inline": true,
+    "attachments_ungranted": true,
+    "max_replacements": 1
+  },
+  "trust": {
+    "signature_scheme": "ed25519",
+    "evidence_version": 1,
+    "policy_generation": 1,
+    "active_public_key": "1dfaeb2e9d9ff3d5c4eb7f81a1197dd09f8a301a5a31b6ed15921e939574154f"
+  },
+  "leaf_policy": {
+    "operator_role_domain": "vibeos.c76.acceptance.operator-role.v1\u0000",
+    "generation": 1,
+    "signer_status": 1,
+    "trust_mode": 2,
+    "command_name": "c76-node",
+    "entrypoint": "run",
+    "min_args": 0,
+    "max_args": 0,
+    "streams": {
+      "stdin": "closed",
+      "stdout": "closed",
+      "stderr": "closed"
+    },
+    "interface_ceilings": []
+  },
+  "artifact_profile": {
+    "format_version": 1,
+    "manifest_version": 1,
+    "profile_code": 2,
+    "stage": 2,
+    "artifact_abi": 2,
+    "component_profile": 1,
+    "core_profile": 1,
+    "runtime_abi": 2,
+    "canonical_features": 16383,
+    "signer_policy_kind": 2,
+    "signer_policy_version": 1,
+    "revisions": [
+      "webassembly-core-2.0-integer-v1",
+      "component-model-73b7ad51d3b5d6f1ef53c923d8c585e28b242bcc",
+      "canonical-abi-73b7ad51d3b5d6f1ef53c923d8c585e28b242bcc-vibe-async-callback-1",
+      "wasm-tools-v1.255.0-76e20611d1920a7a39ca08983c6c77c3060de380",
+      "wasi-v0.3.0-3ee2a590c766594ae44a54730fc74fc27da5c609"
+    ],
+    "instance_limits": {
+      "memory_bytes": 65536,
+      "total_fuel": 1000,
+      "poll_quantum": 100,
+      "resources": 8
+    },
+    "runtime_ready": false
+  },
+  "wit": {
+    "package": "test:c65-chain",
+    "version": "1.0.0",
+    "source": "package test:c65-chain@1.0.0;\n\ninterface pipe {\n    enum close-reason {\n        normal,\n        failure,\n        cancelled,\n        denied,\n        unavailable,\n        exhausted,\n        invalid,\n        backend-fault,\n    }\n\n    type bytes = stream<u8>;\n    type closed = future<close-reason>;\n\n    record byte-stream {\n        bytes: bytes,\n        closed: closed,\n    }\n\n    run: async func(input: byte-stream) -> byte-stream;\n}\n\nworld source {\n    export pipe;\n}\n\nworld relay {\n    import pipe;\n    export pipe;\n}\n\nworld sink {\n    import pipe;\n    export pipe;\n}\n",
+    "interface": {
+      "name": "test:c65-chain/pipe@1.0.0",
+      "members": [
+        {
+          "name": "close-reason",
+          "entity": {
+            "kind": "type",
+            "value": {
+              "kind": "enum",
+              "names": [
+                "normal",
+                "failure",
+                "cancelled",
+                "denied",
+                "unavailable",
+                "exhausted",
+                "invalid",
+                "backend-fault"
+              ]
+            }
+          }
+        },
+        {
+          "name": "bytes",
+          "entity": {
+            "kind": "type",
+            "value": {
+              "kind": "stream",
+              "value": { "kind": "u8" }
+            }
+          }
+        },
+        {
+          "name": "closed",
+          "entity": {
+            "kind": "type",
+            "value": {
+              "kind": "future",
+              "value": {
+                "kind": "enum",
+                "names": [
+                  "normal",
+                  "failure",
+                  "cancelled",
+                  "denied",
+                  "unavailable",
+                  "exhausted",
+                  "invalid",
+                  "backend-fault"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "name": "byte-stream",
+          "entity": {
+            "kind": "type",
+            "value": {
+              "kind": "record",
+              "fields": [
+                {
+                  "name": "bytes",
+                  "value": {
+                    "kind": "stream",
+                    "value": { "kind": "u8" }
+                  }
+                },
+                {
+                  "name": "closed",
+                  "value": {
+                    "kind": "future",
+                    "value": {
+                      "kind": "enum",
+                      "names": [
+                        "normal",
+                        "failure",
+                        "cancelled",
+                        "denied",
+                        "unavailable",
+                        "exhausted",
+                        "invalid",
+                        "backend-fault"
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "run",
+          "entity": {
+            "kind": "function",
+            "effect": "async",
+            "parameters": [
+              {
+                "name": "input",
+                "value": {
+                  "kind": "record",
+                  "fields": [
+                    {
+                      "name": "bytes",
+                      "value": {
+                        "kind": "stream",
+                        "value": { "kind": "u8" }
+                      }
+                    },
+                    {
+                      "name": "closed",
+                      "value": {
+                        "kind": "future",
+                        "value": {
+                          "kind": "enum",
+                          "names": [
+                            "normal",
+                            "failure",
+                            "cancelled",
+                            "denied",
+                            "unavailable",
+                            "exhausted",
+                            "invalid",
+                            "backend-fault"
+                          ]
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            ],
+            "result": {
+              "kind": "record",
+              "fields": [
+                {
+                  "name": "bytes",
+                  "value": {
+                    "kind": "stream",
+                    "value": { "kind": "u8" }
+                  }
+                },
+                {
+                  "name": "closed",
+                  "value": {
+                    "kind": "future",
+                    "value": {
+                      "kind": "enum",
+                      "names": [
+                        "normal",
+                        "failure",
+                        "cancelled",
+                        "denied",
+                        "unavailable",
+                        "exhausted",
+                        "invalid",
+                        "backend-fault"
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  "graph": {
+    "name": "c76-chain",
+    "version_ordinals": [0, 1],
+    "replacement_target": 1,
+    "replacement_action": "PolicyCancel",
+    "incident_edge_action": "RecreateFresh",
+    "nodes": [
+      {
+        "ordinal": 0,
+        "label": "source",
+        "world": "test:c65-chain/source@1.0.0",
+        "nesting": 0,
+        "parent": 0,
+        "imports": [],
+        "exports": ["test:c65-chain/pipe@1.0.0"]
+      },
+      {
+        "ordinal": 1,
+        "label": "relay",
+        "world": "test:c65-chain/relay@1.0.0",
+        "nesting": 0,
+        "parent": 0,
+        "imports": ["test:c65-chain/pipe@1.0.0"],
+        "exports": ["test:c65-chain/pipe@1.0.0"]
+      },
+      {
+        "ordinal": 2,
+        "label": "sink",
+        "world": "test:c65-chain/sink@1.0.0",
+        "nesting": 0,
+        "parent": 0,
+        "imports": ["test:c65-chain/pipe@1.0.0"],
+        "exports": ["test:c65-chain/pipe@1.0.0"]
+      }
+    ],
+    "edges": [[0, 0, 1, 0], [1, 0, 2, 0]],
+    "resource_edges": [],
+    "external_imports": [],
+    "async_edges": [[0, 0, 1, 0, 1, 4, 4], [1, 0, 2, 0, 1, 4, 4]],
+    "published_exports": [[2, 0]],
+    "incident_edges": [[0, 0, 1, 0, 1], [1, 0, 2, 0, 1]]
+  },
+  "negative_boundary": {
+    "runtime_ready": false,
+    "profile_runtime_ready": false,
+    "guest_calls": 0,
+    "guest_execution": false,
+    "ambient_lookup": 0,
+    "raw_durable_ids": 0,
+    "no_grant_direct_move": 0
+  }
+}

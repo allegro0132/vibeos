@@ -1,0 +1,191 @@
+{
+  "capture_mode": "formal-publication",
+  "challenge": "e191d45fa8be3bb890c807dd123f5185dc0e9a21bd879d196d36578ff1630fa6",
+  "decision": {
+    "aot_authorized": false,
+    "budget_miss": true,
+    "budget_ticks": 1000000,
+    "candidate_for_c85_design_review": false,
+    "interpretation_attribution": false,
+    "native_code_accepted": false,
+    "outcome": "aot-not-justified-on-fixed-qemu"
+  },
+  "end_accumulator": 7193228233872852912,
+  "fresh_qemu_processes": 1,
+  "manifest_sha256": "339bb27af9a4d24cf5440349777a2113c7ac815bc0289c2fc233426aac3402ef",
+  "physical_provenance": "not-claimed",
+  "platform": "qemu-virt-rv64-tcg-icount-v1",
+  "platform_class": "emulator",
+  "raw_transcript_bytes": 12158825,
+  "raw_transcript_sha256": "bc22610248db679a89336302f93a6fef760ae886d32121dce320961ddda8c112",
+  "retained": 21,
+  "retained_samples": [
+    {
+      "interpretation_ticks": 97318,
+      "non_interpretation_ticks": 2802649,
+      "sample_index": 3,
+      "total_ticks": 2899967
+    },
+    {
+      "interpretation_ticks": 97256,
+      "non_interpretation_ticks": 2803576,
+      "sample_index": 4,
+      "total_ticks": 2900832
+    },
+    {
+      "interpretation_ticks": 97260,
+      "non_interpretation_ticks": 2801489,
+      "sample_index": 5,
+      "total_ticks": 2898749
+    },
+    {
+      "interpretation_ticks": 97247,
+      "non_interpretation_ticks": 2803772,
+      "sample_index": 6,
+      "total_ticks": 2901019
+    },
+    {
+      "interpretation_ticks": 97310,
+      "non_interpretation_ticks": 2802045,
+      "sample_index": 7,
+      "total_ticks": 2899355
+    },
+    {
+      "interpretation_ticks": 97224,
+      "non_interpretation_ticks": 2802541,
+      "sample_index": 8,
+      "total_ticks": 2899765
+    },
+    {
+      "interpretation_ticks": 97213,
+      "non_interpretation_ticks": 2798396,
+      "sample_index": 9,
+      "total_ticks": 2895609
+    },
+    {
+      "interpretation_ticks": 97215,
+      "non_interpretation_ticks": 2804417,
+      "sample_index": 10,
+      "total_ticks": 2901632
+    },
+    {
+      "interpretation_ticks": 97256,
+      "non_interpretation_ticks": 2801289,
+      "sample_index": 11,
+      "total_ticks": 2898545
+    },
+    {
+      "interpretation_ticks": 97293,
+      "non_interpretation_ticks": 2802229,
+      "sample_index": 12,
+      "total_ticks": 2899522
+    },
+    {
+      "interpretation_ticks": 97285,
+      "non_interpretation_ticks": 2802732,
+      "sample_index": 13,
+      "total_ticks": 2900017
+    },
+    {
+      "interpretation_ticks": 97255,
+      "non_interpretation_ticks": 2803958,
+      "sample_index": 14,
+      "total_ticks": 2901213
+    },
+    {
+      "interpretation_ticks": 97283,
+      "non_interpretation_ticks": 2802093,
+      "sample_index": 15,
+      "total_ticks": 2899376
+    },
+    {
+      "interpretation_ticks": 97195,
+      "non_interpretation_ticks": 2804390,
+      "sample_index": 16,
+      "total_ticks": 2901585
+    },
+    {
+      "interpretation_ticks": 97274,
+      "non_interpretation_ticks": 2801925,
+      "sample_index": 17,
+      "total_ticks": 2899199
+    },
+    {
+      "interpretation_ticks": 97276,
+      "non_interpretation_ticks": 2801388,
+      "sample_index": 18,
+      "total_ticks": 2898664
+    },
+    {
+      "interpretation_ticks": 97314,
+      "non_interpretation_ticks": 2802812,
+      "sample_index": 19,
+      "total_ticks": 2900126
+    },
+    {
+      "interpretation_ticks": 97252,
+      "non_interpretation_ticks": 2804855,
+      "sample_index": 20,
+      "total_ticks": 2902107
+    },
+    {
+      "interpretation_ticks": 97215,
+      "non_interpretation_ticks": 2799743,
+      "sample_index": 21,
+      "total_ticks": 2896958
+    },
+    {
+      "interpretation_ticks": 97282,
+      "non_interpretation_ticks": 2803650,
+      "sample_index": 22,
+      "total_ticks": 2900932
+    },
+    {
+      "interpretation_ticks": 97342,
+      "non_interpretation_ticks": 2801906,
+      "sample_index": 23,
+      "total_ticks": 2899248
+    }
+  ],
+  "run_id": "a22f28ef7aab11de5c4858e9a4e4c5b5b4e6e763c43a126ad84d4ac80b9f500f",
+  "schema": "vibeos.c84.qemu-aot-decision.summary",
+  "scope": "one-fresh-fixed-qemu-process-no-physical-claim",
+  "source_commit": "e950a2facb6a6c230e67becb186bddf34a5924bb",
+  "statistics": {
+    "interpretation_ticks": {
+      "max": 97342,
+      "mean": 97265,
+      "min": 97195,
+      "p50": 97260,
+      "p95": 97318
+    },
+    "nearest_rank_sorted_indices": {
+      "p50": 10,
+      "p95": 19,
+      "population": 21
+    },
+    "non_interpretation_ticks": {
+      "max": 2804855,
+      "mean": 2802469,
+      "min": 2798396,
+      "p50": 2802541,
+      "p95": 2804417
+    },
+    "stability": {
+      "criterion": "p95(total_ticks) * 100 <= p50(total_ticks) * 110",
+      "passed": true
+    },
+    "total_ticks": {
+      "max": 2902107,
+      "mean": 2899734,
+      "min": 2895609,
+      "p50": 2899765,
+      "p95": 2901632
+    }
+  },
+  "suite_id": "vibeos.c84.qemu-aot-decision",
+  "timebase_hz": 10000000,
+  "transcript_schema_sha256": "0df879bea905ac1967685fdb411f017acf0136a69999ee031f71af76509eb520",
+  "version": 1,
+  "warmups": 3
+}

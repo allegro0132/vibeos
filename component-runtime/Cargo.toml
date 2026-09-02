@@ -1,0 +1,74 @@
+[package]
+name = "vibeos-component-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+# Narrow acceptance-only access to the validation-candidate native async
+# executor. This does not activate the profile identity or runtime-ready bit.
+native-async-acceptance = []
+# Acceptance-only WIT/Canonical ABI scalar-float codec. This never binds
+# artifact profile code 5 to the current validator, loader, or executor.
+c88-f3-acceptance = []
+# Default-off C8.8-F4 lifecycle wiring. This composes the independently
+# identified F2 engine candidate with the F3 bit-only Canonical ABI codec; it
+# does not register code 5 with either current-engine resolver.
+c88-f4-acceptance = [
+    "c88-f3-acceptance",
+    "dep:vibeos-wasm-float-candidate",
+    "vibeos-wasm-float-candidate/c88-f2-acceptance",
+]
+# Executable C8.9 successor. This selects the same audited engine sources
+# through a new code-6 current binding; it does not activate code 5.
+c89-float-executable = [
+    "c88-f3-acceptance",
+    "dep:vibeos-wasm-float-candidate",
+    "vibeos-wasm-float-candidate/c89-executable",
+]
+# Acceptance-only C8.10-S3 Component containment for code 7. This permits
+# fixed SIMD solely inside embedded Core modules; v128 is not a Component/WIT
+# value and code 7 remains absent from current-engine resolution.
+c810-s3-acceptance = [
+    "c88-f3-acceptance",
+    "dep:vibeos-wasm-simd-candidate",
+    "vibeos-wasm-simd-candidate/c810-s2-acceptance",
+    "vibeos-wasm-runtime/c810-simd-candidate-inspection",
+    "wasmparser/simd",
+]
+# Executable code-8 successor. It reuses the qualified fixed-SIMD semantics
+# under a fresh current profile and engine identity; code 7 stays non-current.
+c811-simd-executable = [
+    "c810-s3-acceptance",
+    "vibeos-wasm-runtime/c811-simd-executable",
+]
+# Acceptance-only C8.12-R2 Component containment for validation code 9.
+# Core references remain confined to embedded modules and never become
+# Component, Canonical ABI, WIT, or host values.
+c812-r2-reference-validation = [
+    "dep:vibeos-wasm-reference-candidate",
+    "vibeos-wasm-reference-candidate/c812-r2-acceptance",
+]
+# Independently numbered executable Reference Types successor. Code 9 remains
+# validation-only and is never selected by this feature.
+c813-reference-executable = [
+    "vibeos-wasm-runtime/c813-reference-executable",
+]
+# Portable, caller-clocked timing hooks used only by the frozen C8.4
+# interpreter/AOT decision harness. Production builds leave this disabled.
+c84-profile-hooks = []
+
+[dependencies]
+vibeos-component-format = { path = "../component-format" }
+vibeos-wasm-runtime = { path = "../wasm-runtime" }
+vibeos-wasm-float-candidate = { path = "../wasm-float-candidate", default-features = false, optional = true }
+vibeos-wasm-reference-candidate = { path = "../wasm-reference-candidate", default-features = false, optional = true }
+vibeos-wasm-simd-candidate = { path = "../wasm-simd-candidate", default-features = false, optional = true }
+wasmparser = { version = "=0.255.0", default-features = false, features = ["component-model", "features", "prefer-btree-collections", "validate"] }
+wit-parser = { version = "=0.255.0", default-features = false }
+
+[dev-dependencies]
+dlr-wasm-interpreter = { version = "=0.2.0", default-features = false }
+wat = { version = "=1.255.0", features = ["component-model"] }
+wasm-encoder = { version = "=0.255.0", default-features = false, features = ["component-model"] }
+wasmtime = { version = "=48.0.0", default-features = false, features = ["std", "runtime", "cranelift", "component-model"] }

@@ -1,0 +1,7 @@
+category,candidate,decision,rationale
+core-engine,wasmi=1.1.0,selected,audited no_std engine with safe handles enforced limits deterministic fuel and resumable calls
+core-engine,dlr-wasm-interpreter=0.2.0,not-selected,no_std and resumable with smaller dependency surface but unsafe address API no engine-wide decode limits and no published audit
+component-binary,wasmparser=0.255.0,selected,no_std streaming validator with exact feature switches and Component Model coverage
+wit,wit-parser=0.255.0,selected,no_std in-memory parser and resolver; filesystem decoding features remain disabled
+component-runtime,in-tree bounded planner,selected,external parsers decode syntax but never decide policy authority or runtime identity
+numeric,float,disabled,integer-only until soft-float NaN target context differential and fuel semantics have an independent gate

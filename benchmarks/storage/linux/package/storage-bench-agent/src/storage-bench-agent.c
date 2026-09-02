@@ -527,7 +527,7 @@ int main(int argc, char **argv) {
             uint64_t reads = after.reads - before.reads;
             uint64_t writes = after.writes - before.writes;
             uint64_t flushes = after.flushes - before.flushes;
-            printf("VIBE_STORAGE_BENCH {\"schema\":\"vibeos.storage-bench.sample\"," 
+            printf("VIBE_STORAGE_BENCH {\"schema\":\"vibeos.storage-bench.sample\","
                    "\"version\":1,\"backend\":\"linux-ext4\",\"layer\":\"object\","
                    "\"workload\":\"object-durable-put-get\",\"durability\":"
                    "\"write-fdatasync-rename-dirfsync-readback\",\"object_bytes\":%" PRIu64

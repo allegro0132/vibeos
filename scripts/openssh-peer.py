@@ -32,6 +32,60 @@ TEST_HOST_PUBLIC = bytes.fromhex(
 KEX_ALGORITHM = "curve25519-sha256"
 CIPHER = "chacha20-poly1305@openssh.com"
 ECHO_PAYLOAD = "vibeos-ssh-acceptance"
+CASE_FILTER_INPUT = bytes(
+    (index * 17 + 3) % 251 for index in range(12 * 1024 + 37)
+)
+CASE_FILTER_OUTPUT = bytes(byte ^ 0x20 for byte in CASE_FILTER_INPUT)
+NATIVE_CASE_FILTER_INPUT = bytes(
+    (index * 29 + 11) & 0xFF for index in range(13 * 1024 + 73)
+)
+NATIVE_CASE_FILTER_OUTPUT = bytes(byte ^ 0x20 for byte in NATIVE_CASE_FILTER_INPUT)
+NATIVE_REVOKE_FIXTURE_BYTES = 13 * 1024 + 73
+NATIVE_REVOKE_BACKEND_STDIN_FIRST_BYTES = 257
+NATIVE_REVOKE_BACKEND_STDIN_SECOND_BYTES = 767
+NATIVE_REVOKE_REPLACEMENT_BYTES = (
+    NATIVE_REVOKE_BACKEND_STDIN_FIRST_BYTES + NATIVE_REVOKE_BACKEND_STDIN_SECOND_BYTES
+)
+NATIVE_REVOKE_CANONICAL_SLICE_BYTES = 99
+NATIVE_REVOKE_FIRST_BACKEND_TAIL_BYTES = (
+    NATIVE_REVOKE_BACKEND_STDIN_FIRST_BYTES - 2 * NATIVE_REVOKE_CANONICAL_SLICE_BYTES
+)
+NATIVE_REVOKE_HEALTHY_SENT_PREFIXES = 8
+NATIVE_REVOKE_HEALTHY_OUTPUT_BYTES = (
+    NATIVE_REVOKE_BACKEND_STDIN_FIRST_BYTES
+    + (NATIVE_REVOKE_HEALTHY_SENT_PREFIXES - 3)
+    * NATIVE_REVOKE_CANONICAL_SLICE_BYTES
+)
+NATIVE_REVOKE_MAGICS = {
+    "healthy": b"VIBE-C54-HEALTHY\n",
+    "linearized": b"VIBE-C54-LINEARIZED\n",
+    "raw-invoking": b"VIBE-C54-RAW-INVOKING\n",
+    "raw-linearized": b"VIBE-C54-RAW-LINEARIZED\n",
+}
+
+
+def _native_revoke_fixture(scenario: str) -> bytes:
+    magic = NATIVE_REVOKE_MAGICS[scenario]
+    fixture = bytearray(
+        (index * 43 + 19) & 0xFF for index in range(NATIVE_REVOKE_FIXTURE_BYTES)
+    )
+    fixture[: len(magic)] = magic
+    return bytes(fixture)
+
+
+NATIVE_REVOKE_INPUTS = {
+    scenario: _native_revoke_fixture(scenario) for scenario in NATIVE_REVOKE_MAGICS
+}
+NATIVE_REVOKE_HEALTHY_OUTPUT = bytes(
+    byte ^ 0x20
+    for byte in NATIVE_REVOKE_INPUTS["healthy"][:NATIVE_REVOKE_HEALTHY_OUTPUT_BYTES]
+)
+NATIVE_REVOKE_REPLACEMENT_INPUT = NATIVE_CASE_FILTER_INPUT[
+    :NATIVE_REVOKE_REPLACEMENT_BYTES
+]
+NATIVE_REVOKE_REPLACEMENT_OUTPUT = NATIVE_CASE_FILTER_OUTPUT[
+    :NATIVE_REVOKE_REPLACEMENT_BYTES
+]
 INTERACTIVE_INPUT = b"discard\x03echo vibeos-vsh-interactivX\x7fe\r\x04"
 INTERACTIVE_OUTPUT = (
     b"vsh> discard^C\r\n"
@@ -182,7 +236,17 @@ def run_ssh(
             timeout=command_timeout,
         )
     except subprocess.TimeoutExpired as error:
-        raise PeerError(f"{label} timed out after {command_timeout:.1f}s") from error
+        stdout = error.stdout or b""
+        stderr = error.stderr or b""
+        if stdout:
+            raise PeerError(
+                f"{label} timed out after {command_timeout:.1f}s with "
+                f"stdout={stdout!r}; stderr tail={stderr[-800:]!r}"
+            ) from error
+        raise PeerError(
+            f"{label} timed out after {command_timeout:.1f}s without stdout; "
+            f"stderr tail={stderr[-800:]!r}"
+        ) from error
 
 
 def _display_failure(label: str, result: subprocess.CompletedProcess[bytes]) -> str:
@@ -200,10 +264,16 @@ def require_result(
     returncodes: set[int],
     stdout: bytes | None = None,
     stderr_pattern: str | None = None,
+    stderr_exact: bytes | None = None,
 ) -> None:
     if result.returncode not in returncodes:
         raise PeerError(_display_failure(label, result))
     if stdout is not None and result.stdout != stdout:
+        raise PeerError(
+            f"{label} stdout mismatch expected_bytes={len(stdout)} "
+            f"actual_bytes={len(result.stdout)}; " + _display_failure(label, result)
+        )
+    if stderr_exact is not None and result.stderr != stderr_exact:
         raise PeerError(_display_failure(label, result))
     if stderr_pattern is not None:
         stderr = result.stderr.decode("utf-8", errors="replace")
@@ -327,6 +397,8 @@ def run_acceptance(
     known_hosts: Path,
     bind_address: str | None,
     command_timeout: float,
+    native_case_filter_enabled: bool,
+    native_revoke_scenario: str | None,
 ) -> None:
     def invoke(
         label: str,
@@ -368,6 +440,73 @@ def run_acceptance(
 
     true_result = invoke("authorized true", accepted_key, ["-T"], ["true"])
     require_result("authorized true", true_result, {0}, b"")
+
+    if native_revoke_scenario == "healthy":
+        native_revoke = invoke(
+            "authorized native revoke winner",
+            accepted_key,
+            ["-T"],
+            ["native-case-filter"],
+            input_bytes=NATIVE_REVOKE_INPUTS["healthy"],
+        )
+        require_result(
+            "authorized native revoke winner",
+            native_revoke,
+            {130},
+            NATIVE_REVOKE_HEALTHY_OUTPUT,
+            stderr_exact=b"",
+        )
+
+        # A second exact formal-native invocation after cleanup proves that the
+        # old operation token, detached wake, and revoked endpoint incarnation
+        # did not mutate or strand the replacement.
+        native_replacement = invoke(
+            "authorized native revoke replacement",
+            accepted_key,
+            ["-T"],
+            ["native-case-filter"],
+            input_bytes=NATIVE_REVOKE_REPLACEMENT_INPUT,
+        )
+        require_result(
+            "authorized native revoke replacement",
+            native_replacement,
+            {0},
+            NATIVE_REVOKE_REPLACEMENT_OUTPUT,
+            stderr_exact=b"",
+        )
+    elif native_case_filter_enabled:
+        # subprocess closes the pipe after this complete binary fixture. Exact
+        # stdout length/content plus status zero therefore proves native EOF and
+        # output drain over the real OpenSSH channel, not merely command admission.
+        native_case_filter = invoke(
+            "authorized native async case-filter",
+            accepted_key,
+            ["-T"],
+            ["native-case-filter"],
+            input_bytes=NATIVE_CASE_FILTER_INPUT,
+        )
+        require_result(
+            "authorized native async case-filter",
+            native_case_filter,
+            {0},
+            NATIVE_CASE_FILTER_OUTPUT,
+            stderr_exact=b"",
+        )
+
+    case_filter = invoke(
+        "authorized WASM case-filter",
+        accepted_key,
+        ["-T"],
+        ["case-filter"],
+        input_bytes=CASE_FILTER_INPUT,
+    )
+    require_result(
+        "authorized WASM case-filter",
+        case_filter,
+        {0},
+        CASE_FILTER_OUTPUT,
+        stderr_exact=b"",
+    )
 
     false_result = invoke("authorized false", accepted_key, ["-T"], ["false"])
     require_result("authorized false", false_result, {1}, b"")
@@ -414,6 +553,31 @@ def run_acceptance(
         r"subsystem request failed.*channel",
     )
 
+    if native_revoke_scenario not in (None, "healthy"):
+        # These scenarios intentionally leave the managed-native structural
+        # fault domain quarantined. The UART guard, not an inferred SSH status,
+        # is the acceptance authority; OpenSSH must merely fail or remain
+        # blocked without receiving invented stdout.
+        try:
+            guard = invoke(
+                f"authorized native {native_revoke_scenario} guard",
+                accepted_key,
+                ["-T"],
+                ["native-case-filter"],
+                input_bytes=NATIVE_REVOKE_INPUTS[native_revoke_scenario],
+            )
+        except PeerError as error:
+            message = str(error)
+            if " timed out after " not in message or " without stdout; " not in message:
+                raise
+        else:
+            if guard.returncode == 0 or guard.stdout:
+                raise PeerError(
+                    _display_failure(
+                        f"authorized native {native_revoke_scenario} guard", guard
+                    )
+                )
+
 
 def selftest() -> None:
     if _fingerprint(_expected_host_blob()) != TEST_HOST_FINGERPRINT:
@@ -423,6 +587,59 @@ def selftest() -> None:
         != "AAAAC3NzaC1lZDI1NTE5AAAAICnlgzqRWmQppOOnlIR1wzjvQ264K+ickvBZcEQD251V"
     ):
         raise PeerError("host-key fixture OpenSSH blob changed")
+    if len(CASE_FILTER_INPUT) != 12 * 1024 + 37:
+        raise PeerError("WASM stream fixture length changed")
+    if CASE_FILTER_OUTPUT[-37:] != bytes(
+        byte ^ 0x20 for byte in CASE_FILTER_INPUT[-37:]
+    ):
+        raise PeerError("WASM stream fixture lost its exact final 37-byte chunk")
+    if bytes(byte ^ 0x20 for byte in CASE_FILTER_OUTPUT) != CASE_FILTER_INPUT:
+        raise PeerError("WASM stream fixture transform is not the pinned XOR")
+    if len(NATIVE_CASE_FILTER_INPUT) != 13 * 1024 + 73:
+        raise PeerError("native async stream fixture length changed")
+    if NATIVE_CASE_FILTER_OUTPUT[-73:] != bytes(
+        byte ^ 0x20 for byte in NATIVE_CASE_FILTER_INPUT[-73:]
+    ):
+        raise PeerError("native async stream fixture lost its exact final 73-byte chunk")
+    if (
+        bytes(byte ^ 0x20 for byte in NATIVE_CASE_FILTER_OUTPUT)
+        != NATIVE_CASE_FILTER_INPUT
+    ):
+        raise PeerError("native async stream fixture transform is not the pinned XOR")
+    if NATIVE_CASE_FILTER_INPUT == CASE_FILTER_INPUT:
+        raise PeerError("sync and native async stream fixtures unexpectedly alias")
+    if set(NATIVE_REVOKE_INPUTS) != set(NATIVE_REVOKE_MAGICS):
+        raise PeerError("native revoke fixture scenarios changed")
+    if len(set(NATIVE_REVOKE_INPUTS.values())) != len(NATIVE_REVOKE_MAGICS):
+        raise PeerError("native revoke scenario fixtures unexpectedly alias")
+    for scenario, magic in NATIVE_REVOKE_MAGICS.items():
+        fixture = NATIVE_REVOKE_INPUTS[scenario]
+        if len(fixture) != NATIVE_REVOKE_FIXTURE_BYTES or not fixture.startswith(magic):
+            raise PeerError(f"native revoke {scenario} fixture changed")
+    if NATIVE_REVOKE_HEALTHY_OUTPUT != bytes(
+        byte ^ 0x20
+        for byte in NATIVE_REVOKE_INPUTS["healthy"][:NATIVE_REVOKE_HEALTHY_OUTPUT_BYTES]
+    ):
+        raise PeerError("native revoke healthy XOR prefix changed")
+    if (
+        NATIVE_REVOKE_BACKEND_STDIN_FIRST_BYTES,
+        NATIVE_REVOKE_BACKEND_STDIN_SECOND_BYTES,
+    ) != (257, 767):
+        raise PeerError("native revoke backend stdin chunks changed")
+    if (
+        NATIVE_REVOKE_CANONICAL_SLICE_BYTES != 99
+        or NATIVE_REVOKE_FIRST_BACKEND_TAIL_BYTES != 59
+        or NATIVE_REVOKE_HEALTHY_SENT_PREFIXES != 8
+        or NATIVE_REVOKE_HEALTHY_OUTPUT_BYTES != 752
+    ):
+        raise PeerError("native revoke canonical output prefix changed")
+    if (
+        NATIVE_REVOKE_REPLACEMENT_BYTES != 1024
+        or len(NATIVE_REVOKE_REPLACEMENT_INPUT) != NATIVE_REVOKE_REPLACEMENT_BYTES
+        or NATIVE_REVOKE_REPLACEMENT_OUTPUT
+        != bytes(byte ^ 0x20 for byte in NATIVE_REVOKE_REPLACEMENT_INPUT)
+    ):
+        raise PeerError("native revoke replacement fixture changed")
     command = _base_ssh_command(
         "ssh",
         "localhost",
@@ -470,6 +687,56 @@ def selftest() -> None:
     )
     require_negotiated_profile(synthetic)
     require_expected_host_identity(synthetic)
+    require_result(
+        "empty WASM command",
+        subprocess.CompletedProcess(
+            args=["ssh"], returncode=0, stdout=b"", stderr=b""
+        ),
+        {0},
+        b"",
+        stderr_exact=b"",
+    )
+    try:
+        require_result(
+            "noisy WASM command",
+            subprocess.CompletedProcess(
+                args=["ssh"], returncode=0, stdout=b"", stderr=b"unexpected"
+            ),
+            {0},
+            b"",
+            stderr_exact=b"",
+        )
+    except PeerError:
+        pass
+    else:
+        raise PeerError("strict WASM stderr check accepted unexpected output")
+    parser = _parser()
+    if parser.parse_args([]).native_case_filter:
+        raise PeerError("native async probe unexpectedly enabled by default")
+    if parser.parse_args([]).native_revoke_scenario is not None:
+        raise PeerError("native revoke probe unexpectedly enabled by default")
+    if not parser.parse_args(["--native-case-filter"]).native_case_filter:
+        raise PeerError("native async probe opt-in was not retained")
+    for scenario in NATIVE_REVOKE_MAGICS:
+        if parser.parse_args(
+            ["--native-revoke-scenario", scenario]
+        ).native_revoke_scenario != scenario:
+            raise PeerError(f"native revoke {scenario} opt-in was not retained")
+    for incompatible in (
+        ["--scan-only", "--native-case-filter"],
+        ["--pick-port", "--native-case-filter"],
+        ["--selftest", "--native-case-filter"],
+        ["--scan-only", "--native-revoke-scenario", "healthy"],
+        ["--pick-port", "--native-revoke-scenario", "healthy"],
+        ["--selftest", "--native-revoke-scenario", "healthy"],
+        ["--native-case-filter", "--native-revoke-scenario", "healthy"],
+    ):
+        try:
+            _validate_operation_modes(parser.parse_args(incompatible))
+        except PeerError:
+            pass
+        else:
+            raise PeerError(f"incompatible peer modes were accepted: {incompatible!r}")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -493,6 +760,16 @@ def _parser() -> argparse.ArgumentParser:
         help="run only the strict authenticated readiness probe",
     )
     parser.add_argument(
+        "--native-case-filter",
+        action="store_true",
+        help="add the QEMU formal managed native-case-filter acceptance probe",
+    )
+    parser.add_argument(
+        "--native-revoke-scenario",
+        choices=tuple(NATIVE_REVOKE_MAGICS),
+        help="run one isolated QEMU C5.4c managed-native revoke/fault scenario",
+    )
+    parser.add_argument(
         "--pick-port",
         action="store_true",
         help="print a currently unused IPv4 loopback port and exit",
@@ -501,12 +778,30 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_operation_modes(arguments: argparse.Namespace) -> None:
+    native_revoke = arguments.native_revoke_scenario is not None
+    if arguments.selftest and (
+        arguments.pick_port
+        or arguments.scan_only
+        or arguments.native_case_filter
+        or native_revoke
+    ):
+        raise PeerError("--selftest cannot be combined with another operation")
+    if arguments.pick_port and (
+        arguments.scan_only or arguments.native_case_filter or native_revoke
+    ):
+        raise PeerError("--pick-port cannot be combined with another operation")
+    if arguments.scan_only and (arguments.native_case_filter or native_revoke):
+        raise PeerError("native Component probes require functional acceptance")
+    if arguments.native_case_filter and native_revoke:
+        raise PeerError("native standard and revoke probes are isolated modes")
+
+
 def main() -> int:
     arguments = _parser().parse_args()
     try:
+        _validate_operation_modes(arguments)
         if arguments.pick_port:
-            if arguments.selftest or arguments.scan_only:
-                raise PeerError("--pick-port cannot be combined with another operation")
             print(pick_loopback_port())
             return 0
         if arguments.selftest:
@@ -581,10 +876,22 @@ def main() -> int:
                 arguments.known_hosts,
                 arguments.bind_address,
                 arguments.command_timeout,
+                arguments.native_case_filter,
+                arguments.native_revoke_scenario,
+            )
+            component_label = (
+                f"native revoke {arguments.native_revoke_scenario} and WASM case-filter"
+                if arguments.native_revoke_scenario
+                else (
+                    "native async and WASM case-filter"
+                    if arguments.native_case_filter
+                    else "WASM case-filter"
+                )
             )
             print(
-                "PASS openssh-peer: forced crypto, authorized exec statuses, interactive "
-                "PTY/shell, rejected key, and invalid request denial"
+                "PASS openssh-peer: forced crypto, authorized exec statuses including "
+                f"{component_label}, interactive PTY/shell, rejected key, and invalid "
+                "request denial"
             )
         return 0
     except (OSError, PeerError, subprocess.SubprocessError) as error:

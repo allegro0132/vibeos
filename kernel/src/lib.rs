@@ -13,6 +13,616 @@
 #![feature(alloc_error_handler)]
 #![cfg_attr(not(feature = "legacy-shell"), allow(dead_code))]
 
+#[cfg(all(
+    feature = "wasm-c83-runtime-costs",
+    any(
+        feature = "legacy-shell",
+        feature = "storage-bench",
+        feature = "file-tree",
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server",
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "milkv-jitterentropy-probe",
+        feature = "milkv-jitterentropy-ssh-probe",
+        feature = "component-graph-principals",
+        feature = "component-durable-publication",
+        feature = "ssh-component-command",
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c73-authenticated-admission-acceptance",
+        feature = "wasm-c74-crash-safe-publication-acceptance",
+        feature = "wasm-c75-boot-revalidation-acceptance",
+        feature = "wasm-c76-graph-version-replacement-acceptance",
+        feature = "wasm-c77-ephemeral-runtime-acceptance",
+        feature = "wasm-c84-profile-slot",
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness",
+        feature = "wasm-c810-s5-simd-qemu-qualification",
+        feature = "wasm-c812-r3-reference-qemu-qualification",
+        feature = "wasm-c813-e3-reference-qemu-qualification",
+        feature = "ssh-native-async-command",
+        feature = "ssh-native-async-qemu-acceptance",
+        feature = "ssh-native-async-revoke-qemu-acceptance"
+    )
+))]
+compile_error!("feature `wasm-c83-runtime-costs` is an isolated benchmark image");
+
+#[cfg(all(
+    feature = "wasm-c810-s5-simd-qemu-qualification",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c810-s5-simd-qemu-qualification` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c810-s5-simd-qemu-qualification",
+    not(feature = "qemu-default-image")
+))]
+compile_error!("feature `wasm-c810-s5-simd-qemu-qualification` requires the QEMU image policy");
+
+#[cfg(all(
+    feature = "wasm-c810-s5-simd-qemu-qualification",
+    any(
+        feature = "milkv-duo",
+        feature = "milkv-duo-sd-image",
+        feature = "legacy-shell",
+        feature = "storage-bench",
+        feature = "file-tree",
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server",
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "component-graph-principals",
+        feature = "component-durable-publication",
+        feature = "ssh-component-command",
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c84-profile-slot",
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness"
+    )
+))]
+compile_error!(
+    "feature `wasm-c810-s5-simd-qemu-qualification` is an isolated emulator qualification image"
+);
+
+#[cfg(all(
+    feature = "wasm-c812-r3-reference-qemu-qualification",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c812-r3-reference-qemu-qualification` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c813-e3-reference-qemu-qualification",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c813-e3-reference-qemu-qualification` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c813-e3-reference-qemu-qualification",
+    not(feature = "qemu-default-image")
+))]
+compile_error!(
+    "feature `wasm-c813-e3-reference-qemu-qualification` requires the QEMU image policy"
+);
+
+#[cfg(all(
+    feature = "wasm-c812-r3-reference-qemu-qualification",
+    not(feature = "qemu-default-image")
+))]
+compile_error!(
+    "feature `wasm-c812-r3-reference-qemu-qualification` requires the QEMU image policy"
+);
+
+#[cfg(all(
+    feature = "wasm-c812-r3-reference-qemu-qualification",
+    any(
+        feature = "milkv-duo",
+        feature = "milkv-duo-sd-image",
+        feature = "legacy-shell",
+        feature = "storage-bench",
+        feature = "file-tree",
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server",
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "component-graph-principals",
+        feature = "component-durable-publication",
+        feature = "ssh-component-command",
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c84-profile-slot",
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness",
+        feature = "wasm-c810-s5-simd-qemu-qualification"
+    )
+))]
+compile_error!(
+    "feature `wasm-c812-r3-reference-qemu-qualification` is an isolated emulator qualification image"
+);
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c88-f5-float-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-qemu-acceptance",
+    not(feature = "qemu-default-image")
+))]
+compile_error!("feature `wasm-c88-f5-float-qemu-acceptance` requires the QEMU image policy");
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-qemu-acceptance",
+    any(
+        feature = "milkv-duo",
+        feature = "milkv-duo-sd-image",
+        feature = "legacy-shell",
+        feature = "storage-bench",
+        feature = "file-tree",
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server",
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "component-graph-principals",
+        feature = "component-durable-publication",
+        feature = "ssh-component-command",
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c73-authenticated-admission-acceptance",
+        feature = "wasm-c74-crash-safe-publication-acceptance",
+        feature = "wasm-c75-boot-revalidation-acceptance",
+        feature = "wasm-c76-graph-version-replacement-acceptance",
+        feature = "wasm-c77-ephemeral-runtime-acceptance",
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c84-profile-slot",
+        feature = "ssh-native-async-command",
+        feature = "ssh-native-async-qemu-acceptance",
+        feature = "ssh-native-async-revoke-qemu-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c88-f5-float-qemu-acceptance` is an isolated emulator qualification image"
+);
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-qemu-acceptance",
+    feature = "wasm-c88-f5-float-duo-compile-readiness"
+))]
+compile_error!("the QEMU and Milk-V Duo C8.8-F5 image contracts are mutually exclusive");
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-duo-compile-readiness",
+    not(feature = "milkv-duo")
+))]
+compile_error!("feature `wasm-c88-f5-float-duo-compile-readiness` requires the Milk-V Duo board");
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-duo-compile-readiness",
+    not(feature = "milkv-duo-sd-image")
+))]
+compile_error!(
+    "feature `wasm-c88-f5-float-duo-compile-readiness` requires the Milk-V Duo image policy"
+);
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-duo-compile-readiness",
+    any(feature = "qemu-virt", feature = "qemu-default-image")
+))]
+compile_error!(
+    "feature `wasm-c88-f5-float-duo-compile-readiness` cannot select a QEMU board or policy"
+);
+
+#[cfg(all(
+    feature = "wasm-c88-f5-float-duo-compile-readiness",
+    any(
+        feature = "legacy-shell",
+        feature = "storage-bench",
+        feature = "file-tree",
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "iperf3-server",
+        feature = "milkv-iperf3-server",
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh",
+        feature = "milkv-jitterentropy-probe",
+        feature = "milkv-jitterentropy-ssh-probe",
+        feature = "component-graph-principals",
+        feature = "component-durable-publication",
+        feature = "ssh-component-command",
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c73-authenticated-admission-acceptance",
+        feature = "wasm-c74-crash-safe-publication-acceptance",
+        feature = "wasm-c75-boot-revalidation-acceptance",
+        feature = "wasm-c76-graph-version-replacement-acceptance",
+        feature = "wasm-c77-ephemeral-runtime-acceptance",
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c84-profile-slot",
+        feature = "ssh-native-async-command",
+        feature = "ssh-native-async-qemu-acceptance",
+        feature = "ssh-native-async-revoke-qemu-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c88-f5-float-duo-compile-readiness` is an isolated, non-production readiness image"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-profile-slot-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-profile-slot-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-core-poll-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-core-poll-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-profile-irq-overlay-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-profile-child-delegation-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-profile-child-delegation-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-request-parent-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-ssh-request-parent-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-ssh-managed-child-core-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance` is QEMU-only"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector",
+    feature = "qemu-virt",
+    not(any(
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+        feature = "wasm-c84-qemu-aot-decision"
+    ))
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-single-boot-collector` cannot expose physical formal records on QEMU"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector",
+    not(any(
+        feature = "milkv-duo",
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+        feature = "wasm-c84-qemu-aot-decision"
+    ))
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-single-boot-collector` requires Milk-V Duo, its absorbing QEMU acceptance, or the formal QEMU contract"
+);
+
+#[cfg(all(feature = "wasm-c84-qemu-aot-decision", not(feature = "qemu-virt")))]
+compile_error!("feature `wasm-c84-qemu-aot-decision` is QEMU-only");
+
+#[cfg(all(feature = "wasm-c84-qemu-aot-decision", feature = "milkv-duo"))]
+compile_error!("feature `wasm-c84-qemu-aot-decision` cannot claim Milk-V Duo provenance");
+
+#[cfg(all(
+    feature = "wasm-c84-qemu-aot-decision-smoke",
+    not(feature = "wasm-c84-qemu-aot-decision")
+))]
+compile_error!("feature `wasm-c84-qemu-aot-decision-smoke` must layer on the formal QEMU image");
+
+#[cfg(all(
+    feature = "wasm-c84-qemu-aot-decision",
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"
+))]
+compile_error!("formal and absorbing C8.4 QEMU collectors are mutually exclusive");
+
+// The decision image measures the production workload path. Diagnostic
+// acceptance features add UART formatting and synthetic SSIPs inside active
+// intervals, so Cargo feature unification must fail instead of silently
+// contaminating a formal or dirty-smoke transcript.
+#[cfg(all(
+    feature = "wasm-c84-qemu-aot-decision",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance",
+        feature = "wasm-c84-ssh-request-parent-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance"
+    )
+))]
+compile_error!("formal C8.4 QEMU decision images exclude diagnostic QEMU acceptance telemetry");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector",
+    feature = "legacy-shell"
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-single-boot-collector` excludes the local legacy shell"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",
+    not(feature = "qemu-virt")
+))]
+compile_error!("feature `wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance` is QEMU-only");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-trusted-sample",
+    feature = "wasm-c84-ssh-managed-child-verified-stream"
+))]
+compile_error!(
+    "features `wasm-c84-ssh-managed-child-trusted-sample` and `wasm-c84-ssh-managed-child-verified-stream` are mutually exclusive finish/verify successors"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector",
+    feature = "wasm-c84-ssh-managed-child-verified-stream"
+))]
+compile_error!(
+    "features `wasm-c84-ssh-managed-child-single-boot-collector` and `wasm-c84-ssh-managed-child-verified-stream` are mutually exclusive trusted-sample consumers"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-trusted-sample",
+    feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    not(feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance"),
+    not(feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance"),
+    not(feature = "wasm-c84-qemu-aot-decision")
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-trusted-sample` cannot reuse the discard-only finish/verify QEMU transcript"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector",
+    feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    not(any(
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+        feature = "wasm-c84-qemu-aot-decision"
+    ))
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-single-boot-collector` cannot reuse the discard-only finish/verify QEMU transcript"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+        feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",
+        feature = "wasm-c84-qemu-aot-decision"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-verified-stream",
+    feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    not(feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance")
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-verified-stream` cannot reuse the discard-only finish/verify QEMU transcript"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-finish-verify",
+    feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance",
+    not(feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance")
+))]
+compile_error!(
+    "feature `wasm-c84-ssh-managed-child-finish-verify` cannot reuse the cancel-only IRQ QEMU transcript"
+);
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-managed-child-core-qemu-acceptance",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
+
+#[cfg(all(
+    feature = "wasm-c84-ssh-request-parent-qemu-acceptance",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
+
+#[cfg(any(
+    all(
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance"
+    ),
+    all(
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance"
+    ),
+    all(
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    ),
+    all(
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance"
+    ),
+    all(
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    ),
+    all(
+        feature = "wasm-c84-profile-irq-overlay-qemu-acceptance",
+        feature = "wasm-c84-profile-child-delegation-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 QEMU acceptances are isolated images");
+
+#[cfg(all(
+    feature = "wasm-c84-profile-irq-overlay",
+    not(feature = "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance"),
+    any(
+        feature = "wasm-c84-profile-slot-qemu-acceptance",
+        feature = "wasm-c84-core-poll-qemu-acceptance",
+        feature = "wasm-c84-ssh-request-parent-qemu-acceptance"
+    )
+))]
+compile_error!("C8.4 IRQ overlay cannot modify an exact-transcript QEMU acceptance image");
+
 #[cfg(all(feature = "tcp-echo", not(feature = "qemu-virt")))]
 compile_error!("feature `tcp-echo` is the QEMU-only N1 acceptance image");
 #[cfg(all(feature = "net-shell", not(feature = "milkv-duo")))]
@@ -47,6 +657,287 @@ compile_error!("feature `milkv-iperf3-server` is an isolated Milk-V network imag
 compile_error!("feature `ssh-security-test` is the QEMU-only N3 acceptance image");
 #[cfg(all(feature = "ssh-test", not(feature = "qemu-virt")))]
 compile_error!("feature `ssh-test` is the QEMU-only N4 acceptance image");
+#[cfg(all(
+    feature = "wasm-c48-qemu-acceptance",
+    not(all(feature = "qemu-virt", feature = "ssh-test"))
+))]
+compile_error!("feature `wasm-c48-qemu-acceptance` requires the QEMU-only `ssh-test` image");
+#[cfg(all(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c53-native-async-qemu-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    any(
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "ssh-security-test",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "milkv-ssh"
+    )
+))]
+compile_error!(
+    "feature `wasm-c53-native-async-qemu-acceptance` is isolated from every SSH/older WASM image"
+);
+#[cfg(all(
+    feature = "wasm-c53-native-async-qemu-acceptance",
+    feature = "ssh-native-async-command"
+))]
+compile_error!(
+    "the direct native-async acceptance image and formal managed command are distinct roots"
+);
+#[cfg(all(
+    feature = "wasm-c63-graph-principal-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c63-graph-principal-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "wasm-c64-resource-route-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c64-resource-route-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "wasm-c65-async-chain-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c65-async-chain-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "wasm-c66-node-replacement-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c66-node-replacement-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "wasm-c67-information-flow-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c67-information-flow-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "wasm-c73-authenticated-admission-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!(
+    "feature `wasm-c73-authenticated-admission-acceptance` requires the QEMU default image"
+);
+#[cfg(all(
+    feature = "wasm-c74-crash-safe-publication-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!(
+    "feature `wasm-c74-crash-safe-publication-acceptance` requires the QEMU default image"
+);
+#[cfg(all(
+    feature = "wasm-c75-boot-revalidation-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c75-boot-revalidation-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "wasm-c76-graph-version-replacement-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!(
+    "feature `wasm-c76-graph-version-replacement-acceptance` requires the QEMU default image"
+);
+#[cfg(all(
+    feature = "wasm-c77-ephemeral-runtime-acceptance",
+    not(all(feature = "qemu-virt", feature = "qemu-default-image"))
+))]
+compile_error!("feature `wasm-c77-ephemeral-runtime-acceptance` requires the QEMU default image");
+#[cfg(all(
+    feature = "wasm-c77-ephemeral-runtime-acceptance",
+    any(
+        feature = "legacy-shell",
+        feature = "ssh-component-command",
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c73-authenticated-admission-acceptance",
+        feature = "wasm-c74-crash-safe-publication-acceptance",
+        feature = "wasm-c75-boot-revalidation-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c77-ephemeral-runtime-acceptance` is isolated from guest, command, and every earlier WASM acceptance root"
+);
+#[cfg(all(
+    feature = "wasm-c76-graph-version-replacement-acceptance",
+    any(
+        feature = "legacy-shell",
+        feature = "ssh-component-command",
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c73-authenticated-admission-acceptance",
+        feature = "wasm-c74-crash-safe-publication-acceptance",
+        feature = "wasm-c75-boot-revalidation-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c76-graph-version-replacement-acceptance` is isolated from guest, command, and every earlier WASM acceptance root"
+);
+#[cfg(all(
+    feature = "wasm-c75-boot-revalidation-acceptance",
+    any(
+        feature = "legacy-shell",
+        feature = "component-graph-principals",
+        feature = "ssh-component-command",
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c73-authenticated-admission-acceptance",
+        feature = "wasm-c74-crash-safe-publication-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c75-boot-revalidation-acceptance` is isolated from live guest, command, and older WASM acceptance roots"
+);
+#[cfg(all(
+    feature = "wasm-c74-crash-safe-publication-acceptance",
+    any(
+        feature = "legacy-shell",
+        feature = "component-graph-principals",
+        feature = "ssh-component-command",
+        feature = "wasm-c48-qemu-acceptance",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c73-authenticated-admission-acceptance",
+        feature = "wasm-c75-boot-revalidation-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c74-crash-safe-publication-acceptance` is isolated from live guest, command, and older WASM acceptance roots"
+);
+#[cfg(all(
+    feature = "wasm-c73-authenticated-admission-acceptance",
+    any(
+        feature = "legacy-shell",
+        feature = "component-graph-principals",
+        feature = "ssh-component-command",
+        feature = "wasm-c53-native-async-qemu-acceptance",
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c73-authenticated-admission-acceptance` is isolated from live guest and older WASM acceptance roots"
+);
+#[cfg(all(
+    feature = "wasm-c67-information-flow-acceptance",
+    any(
+        feature = "legacy-shell",
+        feature = "component-graph-principals",
+        feature = "ssh-component-command",
+        feature = "wasm-c53-native-async-qemu-acceptance"
+    )
+))]
+compile_error!(
+    "feature `wasm-c67-information-flow-acceptance` is isolated from live shell/guest diagnostics"
+);
+#[cfg(all(
+    any(
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance",
+        feature = "wasm-c67-information-flow-acceptance"
+    ),
+    any(
+        all(
+            feature = "wasm-c63-graph-principal-acceptance",
+            feature = "wasm-c64-resource-route-acceptance"
+        ),
+        all(
+            feature = "wasm-c63-graph-principal-acceptance",
+            feature = "wasm-c65-async-chain-acceptance"
+        ),
+        all(
+            feature = "wasm-c64-resource-route-acceptance",
+            feature = "wasm-c65-async-chain-acceptance"
+        ),
+        all(
+            feature = "wasm-c63-graph-principal-acceptance",
+            feature = "wasm-c66-node-replacement-acceptance"
+        ),
+        all(
+            feature = "wasm-c64-resource-route-acceptance",
+            feature = "wasm-c66-node-replacement-acceptance"
+        ),
+        all(
+            feature = "wasm-c65-async-chain-acceptance",
+            feature = "wasm-c66-node-replacement-acceptance"
+        ),
+        all(
+            feature = "wasm-c63-graph-principal-acceptance",
+            feature = "wasm-c67-information-flow-acceptance"
+        ),
+        all(
+            feature = "wasm-c64-resource-route-acceptance",
+            feature = "wasm-c67-information-flow-acceptance"
+        ),
+        all(
+            feature = "wasm-c65-async-chain-acceptance",
+            feature = "wasm-c67-information-flow-acceptance"
+        ),
+        all(
+            feature = "wasm-c66-node-replacement-acceptance",
+            feature = "wasm-c67-information-flow-acceptance"
+        )
+    )
+))]
+compile_error!("the C6.3 through C6.7 graph acceptance images are distinct roots");
+#[cfg(all(
+    feature = "component-graph-principals",
+    feature = "ssh-component-command"
+))]
+compile_error!(
+    "features `component-graph-principals` and `ssh-component-command` are fail-closed lifecycle-isolation alternatives"
+);
+#[cfg(all(
+    feature = "ssh-native-async-qemu-acceptance",
+    not(all(
+        feature = "qemu-virt",
+        feature = "ssh-test",
+        feature = "wasm-c48-qemu-acceptance"
+    ))
+))]
+compile_error!("feature `ssh-native-async-qemu-acceptance` requires the QEMU ssh-test/C4.8 image");
+#[cfg(all(
+    feature = "ssh-native-async-revoke-qemu-acceptance",
+    not(all(
+        feature = "qemu-virt",
+        feature = "ssh-test",
+        feature = "wasm-c48-qemu-acceptance"
+    ))
+))]
+compile_error!(
+    "feature `ssh-native-async-revoke-qemu-acceptance` requires the QEMU ssh-test/C4.8 image"
+);
+#[cfg(all(
+    feature = "ssh-native-async-revoke-qemu-acceptance",
+    feature = "ssh-native-async-qemu-acceptance"
+))]
+compile_error!(
+    "the C5.4c native revoke gate and standard formal-native SSH gate are isolated images"
+);
 #[cfg(all(feature = "milkv-ssh-acceptance", not(feature = "milkv-duo")))]
 compile_error!("feature `milkv-ssh-acceptance` is the Milk-V Duo hardware acceptance image");
 #[cfg(all(feature = "milkv-ssh", not(feature = "milkv-duo")))]
@@ -102,7 +993,7 @@ extern crate alloc;
 #[cfg(not(all(target_arch = "riscv64", target_os = "none")))]
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
-pub use vibeos_core::{cap, chan, exec, heap, interrupt, ipi, sync};
+pub use vibeos_core::{cap, chan, exec, heap, instance, interrupt, ipi, sync};
 #[cfg(feature = "qemu-virt")]
 pub use vibeos_driver_virtio_core as virtio;
 pub use vibeos_durable_format as durable;
@@ -118,6 +1009,23 @@ mod bench_platform;
 mod board_led;
 mod cap_table_pool;
 mod code_pool;
+#[cfg(feature = "wasm-c73-authenticated-admission-acceptance")]
+mod component_authenticated_admission;
+#[cfg(feature = "wasm-c75-boot-revalidation-acceptance")]
+mod component_boot_revalidation;
+#[cfg(feature = "wasm-c74-crash-safe-publication-acceptance")]
+mod component_crash_safe_publication;
+#[cfg(feature = "component-durable-publication")]
+mod component_durable_publication;
+#[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+mod component_ephemeral_runtime;
+#[cfg(feature = "wasm-c67-information-flow-acceptance")]
+mod component_graph_information_flow;
+#[cfg(feature = "component-graph-principals")]
+pub mod component_graph_principals;
+#[cfg(feature = "wasm-c76-graph-version-replacement-acceptance")]
+mod component_graph_version_replacement;
+mod component_instances;
 mod dev;
 #[path = "authority_store_platform.rs"]
 mod durable_cspace;
@@ -165,6 +1073,26 @@ mod ssh_key_format;
 mod ssh_platform;
 #[cfg(feature = "milkv-ssh")]
 mod ssh_provisioning;
+#[cfg(feature = "wasm-c84-profile-slot")]
+mod wasm_aot_profile_slot;
+#[cfg(any(
+    feature = "wasm-c88-f5-float-qemu-acceptance",
+    feature = "wasm-c88-f5-float-duo-compile-readiness"
+))]
+mod wasm_float_target;
+#[cfg(feature = "wasm-c813-e3-reference-qemu-qualification")]
+mod wasm_reference_executable_target;
+#[cfg(feature = "wasm-c812-r3-reference-qemu-qualification")]
+mod wasm_reference_target;
+#[cfg(feature = "wasm-c83-runtime-costs")]
+mod wasm_runtime_costs;
+#[cfg(feature = "wasm-c811-s3-simd-qemu-qualification")]
+mod wasm_simd_executable_target;
+#[cfg(all(
+    feature = "wasm-c810-s5-simd-qemu-qualification",
+    not(feature = "wasm-c811-s3-simd-qemu-qualification")
+))]
+mod wasm_simd_target;
 pub use vibeos_object_store as store;
 #[cfg(any(
     feature = "ssh-security-test",
@@ -402,6 +1330,19 @@ pub extern "C" fn kmain() -> ! {
     exec::set_fault_guard(trampoline::guard_task);
     exec::set_fault_cleanup(cleanup_faulted_task);
     exec::set_fault_reclaimer(reclaim_faulted_component);
+    #[cfg(any(
+        feature = "wasm-c63-graph-principal-acceptance",
+        feature = "wasm-c64-resource-route-acceptance",
+        feature = "wasm-c65-async-chain-acceptance",
+        feature = "wasm-c66-node-replacement-acceptance"
+    ))]
+    assert!(
+        component_graph_principals::run_host_model_selftest(),
+        "component graph principal host model failed"
+    );
+
+    #[cfg(feature = "wasm-c84-profile-slot")]
+    wasm_aot_profile_slot::init();
 
     let online = start_secondary_harts();
     println!("  smp       {} hart(s) online", online);
@@ -414,7 +1355,15 @@ pub extern "C" fn kmain() -> ! {
         "  mmu       Sv39 single address space, hart mask {:#x}",
         mmu::enabled_hart_mask()
     );
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(all(
+        feature = "qemu-virt",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness",
+            feature = "wasm-c810-s5-simd-qemu-qualification"
+        ))
+    ))]
     {
         let functions = pci::init().expect("QEMU PCI resource assignment must succeed");
         println!(
@@ -435,7 +1384,15 @@ pub extern "C" fn kmain() -> ! {
             );
         }
     }
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(all(
+        feature = "milkv-duo",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness",
+            feature = "wasm-c810-s5-simd-qemu-qualification"
+        ))
+    ))]
     match dwc2_host::init() {
         Ok(info) => println!(
             "  usb       DWC2 {:#06x} @ {:#x}, IRQ {}, {} channel(s), port {}",
@@ -451,7 +1408,15 @@ pub extern "C" fn kmain() -> ! {
         ),
         Err(error) => println!("  usb       DWC2 bring-up FAILED: {:?}", error),
     }
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(all(
+        feature = "milkv-duo",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness",
+            feature = "wasm-c810-s5-simd-qemu-qualification"
+        ))
+    ))]
     if let Some(usb) = dwc2_host::telemetry() {
         println!(
             "  usb regs  clocks {:#010x}/{:#010x}, role {:#010x}, GUSBCFG {:#010x}, HPRT {:#010x}, PHY14 {:#010x}",
@@ -463,7 +1428,15 @@ pub extern "C" fn kmain() -> ! {
             usb.phy_utmi_control,
         );
     }
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(all(
+        feature = "milkv-duo",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness",
+            feature = "wasm-c810-s5-simd-qemu-qualification"
+        ))
+    ))]
     if dwc2_host::connected() {
         match dwc2_host::enumerate_device() {
             Ok(Some(device)) => {
@@ -565,20 +1538,320 @@ pub extern "C" fn kmain() -> ! {
         cap_table_pool::CAP_TABLE_POOL_BYTES / 1024,
     );
 
+    #[cfg(feature = "ssh-component-command")]
+    component_instances::init();
+
+    #[cfg(not(any(
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness",
+        feature = "wasm-c810-s5-simd-qemu-qualification"
+    )))]
     world::build();
 
+    #[cfg(not(any(
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness",
+        feature = "wasm-c810-s5-simd-qemu-qualification"
+    )))]
     let world = world::world();
+    #[cfg(not(any(
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness",
+        feature = "wasm-c810-s5-simd-qemu-qualification"
+    )))]
     world::start_block_supervisor();
+    #[cfg(not(any(
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness",
+        feature = "wasm-c810-s5-simd-qemu-qualification"
+    )))]
     world::start_net_supervisor();
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(all(
+        feature = "milkv-duo",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness",
+            feature = "wasm-c810-s5-simd-qemu-qualification"
+        ))
+    ))]
     world::start_usb_net_supervisor();
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(all(
+        feature = "qemu-virt",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness",
+            feature = "wasm-c810-s5-simd-qemu-qualification"
+        ))
+    ))]
     world::start_rng_supervisor();
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(all(
+        feature = "qemu-virt",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness",
+            feature = "wasm-c810-s5-simd-qemu-qualification"
+        ))
+    ))]
     if xhci::info().is_some() {
         exec::spawn("usb-host", xhci::service_task());
     }
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(feature = "wasm-c53-native-async-qemu-acceptance")]
+    exec::spawn("wasm-c53-native-async-acceptance", async {
+        if !component_instances::run_native_async_qemu_acceptance().await {
+            crate::println!("WASM_C53_NATIVE_ASYNC_FAIL");
+            sbi::shutdown(true);
+        }
+    });
+    #[cfg(feature = "wasm-c63-graph-principal-acceptance")]
+    exec::spawn("wasm-c63-graph-principal-acceptance", async {
+        if component_graph_principals::run_qemu_acceptance().await {
+            crate::println!("WASM_C63_GRAPH_PRINCIPAL PASS nodes=2 runtime_unavailable=2 fuel_consumed=0 peak_slots=0 live_slots=0 registry_occupied=0 registry_header_mismatches=0");
+        } else {
+            crate::println!("WASM_C63_GRAPH_PRINCIPAL FAIL");
+            sbi::shutdown(true);
+        }
+    });
+    #[cfg(feature = "wasm-c64-resource-route-acceptance")]
+    exec::spawn("wasm-c64-resource-route-acceptance", async {
+        match component_graph_principals::run_c64_qemu_acceptance().await {
+            Some(guest_calls) => crate::println!(
+                "WASM_C64_RESOURCE_ROUTE PASS nodes=2 own=1 borrow=1 guest_calls={} fuel_consumed=0 provider_peak=1 provider_live=0 consumer_peak=1 consumer_live=0 target_revoked=1 source_revoked=0 target_first=1 runtime_unavailable=2 registry_occupied=0 registry_header_mismatches=0",
+                guest_calls,
+            ),
+            None => {
+                crate::println!("WASM_C64_RESOURCE_ROUTE FAIL");
+                sbi::shutdown(true);
+            }
+        }
+    });
+    #[cfg(feature = "wasm-c65-async-chain-acceptance")]
+    exec::spawn("wasm-c65-async-chain-acceptance", async {
+        if component_graph_principals::run_c65_qemu_acceptance().await {
+            crate::println!("WASM_C65_ASYNC_CHAIN PASS nodes=3 internal_edges=2 host_deliveries=2 causes=backend-fault,cancelled cascades=2 consumer_first=2 no_active_poll=1 lost_wakes=0 guest_calls=0 runtime_ready=0 fuel_consumed=0 peak_depths=8,8,8 registry_occupied=0 registry_header_mismatches=0");
+        } else {
+            crate::println!("WASM_C65_ASYNC_CHAIN FAIL");
+            sbi::shutdown(true);
+        }
+    });
+    #[cfg(feature = "wasm-c66-node-replacement-acceptance")]
+    exec::spawn("wasm-c66-node-replacement-acceptance", async {
+        if component_graph_principals::run_c66_qemu_acceptance().await {
+            crate::println!("WASM_C66_NODE_REPLACEMENT PASS nodes=3 incarnations=4 replacements=1 kind=update candidate_staged=1 old_terminal_before_new_ready=1 siblings_stable=2 sibling_restarts=0 sibling_resource_tables=2 incident_edges=2 old_routes_retired=2 fresh_routes=2 sealed_handoffs=2 stale_sibling_routes=2 stale_replacement_tokens=2 late_wake_stale=1 fresh_edge_deliveries=2 sink_deliveries=1 no_active_poll=1 lost_wakes=0 terminal_receipts=4 runtime_unavailable=4 guest_calls=0 runtime_ready=0 fuel_consumed=0 live_slots=0 waiters=0 registrations=0 registry_occupied=0 registry_header_mismatches=0");
+        } else {
+            crate::println!("WASM_C66_NODE_REPLACEMENT FAIL");
+            sbi::shutdown(true);
+        }
+    });
+
+    #[cfg(feature = "wasm-c67-information-flow-acceptance")]
+    exec::spawn("wasm-c67-information-flow-acceptance", async {
+        if component_graph_information_flow::run_qemu_acceptance() {
+            crate::println!("WASM_C67_INFORMATION_FLOW PASS harts=4 nodes=3 edges=2 principal_policy_labels=3 typed_edges=2 async_edges=2 published=1 exact_render=1 negative_rejections=5 forbidden_classes=5 forbidden_hits=0 manifest_only=1 runtime_ready=0 guest_calls=0 registry_occupied=0 registry_header_mismatches=0");
+        } else {
+            crate::println!("WASM_C67_INFORMATION_FLOW FAIL");
+            sbi::shutdown(true);
+        }
+    });
+    #[cfg(feature = "wasm-c73-authenticated-admission-acceptance")]
+    exec::spawn("wasm-c73-authenticated-admission-acceptance", async {
+        if component_authenticated_admission::run_qemu_acceptance() {
+            crate::println!("\nWASM_C73_AUTHENTICATED_ADMISSION PASS development_accepted=1 operator_p1_accepted=2 operator_p2_accepted=1 wrong_signer_rejected=1 unknown_signer_rejected=1 revoked_signer_rejected=1 old_policy_rejected=1 artifact_mutations_rejected=2 module_mutations_rejected=2 wit_mutations_rejected=2 adapter_mutations_rejected=2 limit_mutations_rejected=2 profile_mutations_rejected=2 signature_replays_rejected=2 content_hash_only_rejected=1 runtime_unavailable=4 runtime_ready=0 guest_calls=0 raw_ids=0");
+        } else {
+            crate::println!("WASM_C73_AUTHENTICATED_ADMISSION FAIL");
+            sbi::shutdown(true);
+        }
+    });
+    #[cfg(feature = "wasm-c74-crash-safe-publication-acceptance")]
+    let c74_authority_journal = if online_hart_count() == 4 {
+        world.c74_component_authority_journal()
+    } else {
+        None
+    };
+    #[cfg(feature = "wasm-c74-crash-safe-publication-acceptance")]
+    exec::spawn("wasm-c74-crash-safe-publication-acceptance", async move {
+        if component_crash_safe_publication::run_qemu_acceptance(c74_authority_journal).await {
+            crate::println!("\nWASM_C74_CRASH_SAFE_PUBLICATION PASS evidence_committed=1 artifact_committed=1 root_committed=1 command_published=1 early_publications=0 durable_read=1 durable_grant=0 durable_invoke=0 component_tasks=0 runtime_ready=0 guest_calls=0 raw_ids=0 storage_v2_only=1 policy_v2=1 physical_readback=1");
+        } else {
+            crate::println!("WASM_C74_CRASH_SAFE_PUBLICATION FAIL");
+            sbi::shutdown(true);
+        }
+    });
+    #[cfg(feature = "wasm-c75-boot-revalidation-acceptance")]
+    let c75_baseline_component_count = world.c75_component_count();
+    #[cfg(feature = "wasm-c75-boot-revalidation-acceptance")]
+    let c75_authority_journal = if online_hart_count() == 4 {
+        world.c75_component_authority_journal()
+    } else {
+        None
+    };
+    #[cfg(feature = "wasm-c75-boot-revalidation-acceptance")]
+    exec::spawn("wasm-c75-boot-revalidation-acceptance", async move {
+        match component_boot_revalidation::run_qemu_acceptance(
+            c75_authority_journal,
+            c75_baseline_component_count,
+        )
+        .await
+        {
+            Some(component_boot_revalidation::C75BootOutcome::Installed) => {
+                crate::println!("\nWASM_C75_BOOT_REVALIDATION PASS durable_state=installed image_candidate=1 preappend_validation=1 physical_readback=1 fresh_component=1 fresh_core=1 fresh_wit=1 fresh_adapter_absence=1 fresh_hashes=1 fresh_limits=1 fresh_signer=1 fresh_engine_identity=1 publication_after_validation=1 early_runtime_objects=0 component_cspaces=0 component_resources=0 component_tasks=0 runtime_ready=0 guest_calls=0 raw_ids=0 ambient_lookup=0 vsh=0");
+            }
+            Some(component_boot_revalidation::C75BootOutcome::Existing) => {
+                crate::println!("\nWASM_C75_BOOT_REVALIDATION PASS durable_state=existing image_candidate=0 preappend_validation=0 physical_readback=1 fresh_component=1 fresh_core=1 fresh_wit=1 fresh_adapter_absence=1 fresh_hashes=1 fresh_limits=1 fresh_signer=1 fresh_engine_identity=1 publication_after_validation=1 early_runtime_objects=0 component_cspaces=0 component_resources=0 component_tasks=0 runtime_ready=0 guest_calls=0 raw_ids=0 ambient_lookup=0 vsh=0");
+            }
+            None => {
+                crate::println!("WASM_C75_BOOT_REVALIDATION FAIL");
+                sbi::shutdown(true);
+            }
+        }
+    });
+    #[cfg(all(
+        feature = "wasm-c76-graph-version-replacement-acceptance",
+        not(feature = "wasm-c77-ephemeral-runtime-acceptance")
+    ))]
+    let c76_baseline_component_count = world.c76_component_count();
+    #[cfg(all(
+        feature = "wasm-c76-graph-version-replacement-acceptance",
+        not(feature = "wasm-c77-ephemeral-runtime-acceptance")
+    ))]
+    let c76_graph_authority_journal = if online_hart_count() == 4 {
+        world.c76_graph_authority_journal()
+    } else {
+        None
+    };
+    #[cfg(all(
+        feature = "wasm-c76-graph-version-replacement-acceptance",
+        not(feature = "wasm-c77-ephemeral-runtime-acceptance")
+    ))]
+    exec::spawn(
+        "wasm-c76-graph-version-replacement-acceptance",
+        async move {
+            match component_graph_version_replacement::run_qemu_acceptance(
+                c76_graph_authority_journal,
+                c76_baseline_component_count,
+            )
+            .await
+            {
+                Some(component_graph_version_replacement::C76BootOutcome::InstalledG0) => {
+                    crate::println!("\nWASM_C76_GRAPH_VERSION_REPLACEMENT PASS durable_state=installed_g0 versions=1 replacements=0 image_candidate=1 physical_readback=1 fresh_graphs=1 current_visible=1 candidate_runtime_objects=0 runtime_ready=0 guest_calls=0 raw_ids=0 ambient_lookup=0 vsh=0");
+                }
+                Some(component_graph_version_replacement::C76BootOutcome::ReplacedG1) => {
+                    crate::println!("\nWASM_C76_GRAPH_VERSION_REPLACEMENT PASS durable_state=replaced_g1 versions=2 replacements=1 image_candidate=1 durable_before_candidate=1 physical_readback=1 fresh_graphs=2 policy_cancel=1 candidate_hidden=1 old_terminal_before_new_visible=1 siblings_stable=2 sibling_restarts=0 old_routes_retired=2 fresh_routes=2 stale_replacement_tokens=2 late_wake_stale=1 visibility_linearizations=1 mixed_versions=0 fail_stop_armed=1 runtime_ready=0 guest_calls=0 raw_ids=0 ambient_lookup=0 vsh=0");
+                }
+                Some(component_graph_version_replacement::C76BootOutcome::ExistingG1) => {
+                    crate::println!("\nWASM_C76_GRAPH_VERSION_REPLACEMENT PASS durable_state=existing_g1 versions=2 replacements=1 image_candidate=0 no_write=1 physical_readback=1 fresh_graphs=2 successor_visible=1 candidate_runtime_objects=0 runtime_ready=0 guest_calls=0 raw_ids=0 ambient_lookup=0 vsh=0");
+                }
+                None => {
+                    crate::println!("WASM_C76_GRAPH_VERSION_REPLACEMENT FAIL");
+                    sbi::shutdown(true);
+                }
+            }
+        },
+    );
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    let c77_baseline_component_count = world.c77_component_count();
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    let c77_graph_authority_journal = if online_hart_count() == 4 {
+        world.c77_graph_authority_journal()
+    } else {
+        None
+    };
+    #[cfg(feature = "wasm-c77-ephemeral-runtime-acceptance")]
+    exec::spawn("wasm-c77-ephemeral-runtime-acceptance", async move {
+        if component_ephemeral_runtime::run_qemu_acceptance(
+            c77_graph_authority_journal,
+            c77_baseline_component_count,
+        )
+        .await
+        {
+            crate::println!("\nWASM_C77_EPHEMERAL_RUNTIME PASS durable_state=existing_g1 graph_only=1 physical_readback=1 fresh_validation=1 same_manifest=1 cold_start_empty=1 fresh_tasks=3 fresh_arenas=3 fresh_cspaces=3 fresh_memories=3 memory_bytes=196608 fresh_resource_tables=3 live_resources=4 fresh_fuel_accounts=3 fuel_consumed=0 fresh_pending_ledgers=3 active_pending_calls=1 pending_cut=parked cold_no_write=1 runtime_ready=0 guest_calls=0 raw_ids=0 ambient_lookup=0 vsh=0");
+        } else {
+            crate::println!("WASM_C77_EPHEMERAL_RUNTIME FAIL");
+            sbi::shutdown(true);
+        }
+    });
+    #[cfg(feature = "wasm-c83-runtime-costs")]
+    exec::spawn("wasm-c83-runtime-costs", wasm_runtime_costs::run());
+    #[cfg(any(
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness"
+    ))]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c88-f5-float-target",
+        wasm_float_target::run(),
+    );
+    #[cfg(all(
+        feature = "wasm-c810-s5-simd-qemu-qualification",
+        not(feature = "wasm-c811-s3-simd-qemu-qualification")
+    ))]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c810-s5-simd-target",
+        wasm_simd_target::run(),
+    );
+    #[cfg(feature = "wasm-c811-s3-simd-qemu-qualification")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c811-s3-simd-target",
+        wasm_simd_executable_target::run(),
+    );
+    #[cfg(feature = "wasm-c812-r3-reference-qemu-qualification")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c812-r3-reference-target",
+        wasm_reference_target::run(),
+    );
+    #[cfg(feature = "wasm-c813-e3-reference-qemu-qualification")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c813-e3-reference-target",
+        wasm_reference_executable_target::run(),
+    );
+    #[cfg(feature = "wasm-c84-profile-slot-qemu-acceptance")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c84-profile-slot-acceptance",
+        wasm_aot_profile_slot::run_qemu_acceptance(),
+    );
+    #[cfg(feature = "wasm-c84-core-poll-qemu-acceptance")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c84-core-poll-acceptance",
+        wasm_aot_profile_slot::run_core_poll_qemu_acceptance(),
+    );
+    #[cfg(feature = "wasm-c84-profile-irq-overlay-qemu-acceptance")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c84-profile-irq-overlay-acceptance",
+        wasm_aot_profile_slot::run_irq_qemu_acceptance(),
+    );
+    #[cfg(feature = "wasm-c84-profile-child-delegation-qemu-acceptance")]
+    exec::spawn_pinned_on(
+        exec::HartId::BOOT,
+        "wasm-c84-profile-child-delegation-acceptance",
+        wasm_aot_profile_slot::run_child_delegation_qemu_acceptance(),
+    );
+    #[cfg(feature = "ssh-native-async-revoke-qemu-acceptance")]
+    exec::spawn(
+        "wasm-c54-native-revoke-worker",
+        component_instances::run_native_async_revoke_worker(),
+    );
+    #[cfg(all(
+        feature = "milkv-duo",
+        not(any(
+            feature = "wasm-c83-runtime-costs",
+            feature = "wasm-c88-f5-float-qemu-acceptance",
+            feature = "wasm-c88-f5-float-duo-compile-readiness",
+            feature = "wasm-c810-s5-simd-qemu-qualification"
+        ))
+    ))]
     if dwc2_host::info().is_some() {
         exec::spawn("usb-hid", dwc2_host::service_task());
     }
@@ -594,14 +1867,28 @@ pub extern "C" fn kmain() -> ! {
     world::start_ipv4_stack_supervisor();
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     world::start_ssh_test_supervisor();
-    #[cfg(feature = "legacy-shell")]
+    #[cfg(all(
+        feature = "legacy-shell",
+        not(feature = "wasm-c84-ssh-managed-child-single-boot-collector")
+    ))]
     world.spawn_component(
         "shell",
         world.spaces["init"].clone(),
         world::SHELL_MEMORY_BUDGET,
         legacy_shell::shell_task(boot_time),
     );
-    #[cfg(not(feature = "legacy-shell"))]
+    #[cfg(not(any(
+        feature = "legacy-shell",
+        feature = "wasm-c67-information-flow-acceptance",
+        feature = "wasm-c74-crash-safe-publication-acceptance",
+        feature = "wasm-c75-boot-revalidation-acceptance",
+        feature = "wasm-c76-graph-version-replacement-acceptance",
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness",
+        feature = "wasm-c810-s5-simd-qemu-qualification",
+        feature = "wasm-c84-ssh-managed-child-single-boot-collector"
+    )))]
     {
         let space = world.spaces["vsh"].clone();
         let mut session = vsh::Session::with_cspace(space.0.clone());
@@ -631,17 +1918,37 @@ pub extern "C" fn kmain() -> ! {
             vsh_platform::task(space, world.vsh_console, session),
         );
     }
+    #[cfg(not(any(
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness",
+        feature = "wasm-c810-s5-simd-qemu-qualification"
+    )))]
     let typed_channels = if world.net_outbound.is_some() {
         "3 typed channels"
     } else {
         "1 typed channel"
     };
+    #[cfg(not(any(
+        feature = "wasm-c83-runtime-costs",
+        feature = "wasm-c88-f5-float-qemu-acceptance",
+        feature = "wasm-c88-f5-float-duo-compile-readiness",
+        feature = "wasm-c810-s5-simd-qemu-qualification"
+    )))]
     println!(
         "  world     {} capability spaces, {}, {} components",
         world.spaces.len(),
         typed_channels,
         world.components().len()
     );
+    #[cfg(feature = "wasm-c83-runtime-costs")]
+    println!("  image     isolated C8.3 WebAssembly runtime-cost sampler");
+    #[cfg(feature = "wasm-c88-f5-float-qemu-acceptance")]
+    println!("  image     isolated C8.8-F5 fixed-QEMU float qualification");
+    #[cfg(feature = "wasm-c88-f5-float-duo-compile-readiness")]
+    println!("  image     isolated C8.8-F5 Milk-V Duo compile-only readiness");
+    #[cfg(feature = "wasm-c810-s5-simd-qemu-qualification")]
+    println!("  image     isolated C8.10-S5 fixed-QEMU SIMD qualification");
     println!("  sched     async executor, no threads, no preemption");
 
     trap::enable_interrupts();
@@ -773,9 +2080,23 @@ pub extern "C" fn secondary_kmain(physical_hart: usize, logical_index: usize) ->
 }
 
 /// Executor callback after every task and external registration in a tracked
-/// incarnation has been detached. The sealed World templates prove that no
-/// arena-backed pointer escaped, so raw reclamation is sound and runs no Drop.
-unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
+/// incarnation has been detached. Managed WASM instances first pass the
+/// generational registry gate; legacy components retain the sealed-World
+/// escape proof below. Raw reclamation never runs `Drop`.
+unsafe fn reclaim_faulted_component(
+    witness: exec::ReclaimableFaultWitness,
+) -> exec::FaultReclaimOutcome {
+    match unsafe { component_instances::reclaim_faulted(witness) } {
+        component_instances::FaultRoute::ManagedReclaimed => {
+            return exec::FaultReclaimOutcome::Reclaimed;
+        }
+        component_instances::FaultRoute::Quarantined => {
+            return exec::FaultReclaimOutcome::Quarantined;
+        }
+        component_instances::FaultRoute::Legacy => {}
+    }
+
+    let domain = witness.allocation_domain();
     unsafe {
         // Repair component-stable synchronization state while the exact
         // faulting incarnation is still identifiable and before Faulted is
@@ -788,15 +2109,31 @@ unsafe fn reclaim_faulted_component(domain: heap::AllocationDomain) {
         virtio_rng::recover_faulted_domain(domain);
         world::world().recover_faulted_domain(domain);
         code_pool::recover_faulted_domain(domain);
-        HEAP.reclaim_faulted_arena(domain.arena)
+        HEAP.reclaim_faulted_domain(domain)
             .expect("a faulted audited arena must reclaim atomically");
     }
+    exec::FaultReclaimOutcome::Reclaimed
 }
 
 /// Repair exact-task stable state for both conservative untracked faults and
 /// audited arena faults. The executor has detached the task permanently before
 /// entering this non-allocating hook.
 unsafe fn cleanup_faulted_task(task: exec::TaskId, domain: heap::AllocationDomain) {
+    unsafe {
+        #[cfg(feature = "ssh-component-command")]
+        component_instances::recover_faulted_task(task, domain);
+        cleanup_faulted_task_after_component_gate(task, domain);
+    }
+}
+
+/// Shared exact-task cleanup after a managed instance has already locked and
+/// validated its independent CONTROL projection. Calling CONTROL recovery a
+/// second time there would mistake the detached validation guard for the
+/// abandoned guard of the faulted child and poison a valid lifecycle.
+unsafe fn cleanup_faulted_task_after_component_gate(
+    task: exec::TaskId,
+    domain: heap::AllocationDomain,
+) {
     unsafe {
         store::recover_faulted_task(task, domain);
         segment_store_platform::recover_faulted_task(task, domain);
@@ -811,6 +2148,13 @@ unsafe fn cleanup_faulted_task(task: exec::TaskId, domain: heap::AllocationDomai
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
+    if uart::raw_record_active() {
+        // A physical formal record may already own TTY/TX and have emitted a
+        // prefix. SBI console output bypasses both locks, so the only framing-
+        // safe panic path is a silent machine stop.
+        sbi::shutdown(true);
+    }
     // Deliberately bypasses the UART driver: a panic may already hold its lock.
     let mut w = SbiWriter;
     let _ = core::fmt::write(&mut w, format_args!("\n[!] panic: {}\n", info));
@@ -848,14 +2192,30 @@ impl core::fmt::Write for SbiWriter {
 
 #[alloc_error_handler]
 fn oom(layout: core::alloc::Layout) -> ! {
+    #[cfg(feature = "wasm-c84-ssh-managed-child-single-boot-collector")]
+    if uart::raw_record_active() {
+        // This check precedes both quota diagnostics and the fatal allocator
+        // writer: neither may splice bytes into an in-flight formal record.
+        sbi::shutdown(true);
+    }
     match HEAP.take_last_failure() {
         Some(heap::AllocationFailure::QuotaExceeded {
             owner,
             requested_bytes,
             live_bytes,
             quota_bytes,
-        }) if owner != heap::OwnerId::SYSTEM =>
-        {
+        }) if owner != heap::OwnerId::SYSTEM => {
+            #[cfg(feature = "ssh-native-async-qemu-acceptance")]
+            {
+                let mut w = SbiWriter;
+                let _ = core::fmt::write(
+                    &mut w,
+                    format_args!(
+                        "\nWASM_C53_NATIVE_SSH_ALLOCATION_DIAG live_bytes={} requested_bytes={} quota_bytes={}\n",
+                        live_bytes, requested_bytes, quota_bytes,
+                    ),
+                );
+            }
             // Keep the production panic text deterministic; the account
             // snapshot carries exact live/peak/request evidence for
             // diagnostics and tests. Benchmark images print the numbers,

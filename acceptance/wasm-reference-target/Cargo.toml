@@ -1,0 +1,45 @@
+[package]
+name = "vibeos-wasm-reference-target"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "C8.12-R3 fixed-QEMU bounded Reference Types qualification"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+c812-r3-qemu-qualification = [
+    "dep:sha2",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-wasm-reference-candidate",
+    "dep:vibeos-wasm-runtime",
+    "dep:wat",
+    "vibeos-component-runtime/c812-r2-reference-validation",
+    "vibeos-wasm-reference-candidate/c812-r2-acceptance",
+]
+c813-e3-qemu-qualification = [
+    "dep:sha2",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-wasm-reference-candidate",
+    "dep:vibeos-wasm-reference-executable",
+    "dep:vibeos-wasm-runtime",
+    "dep:wat",
+    "vibeos-component-runtime/c813-reference-executable",
+    "vibeos-wasm-reference-candidate/c812-r2-acceptance",
+    "vibeos-wasm-reference-executable/c813-e2-acceptance",
+    "vibeos-wasm-runtime/c813-reference-executable",
+]
+
+[dependencies]
+sha2 = { version = "=0.11.0", default-features = false, optional = true }
+vibeos-component-format = { path = "../../component-format", optional = true }
+vibeos-component-runtime = { path = "../../component-runtime", default-features = false, optional = true }
+vibeos-wasm-reference-candidate = { path = "../../wasm-reference-candidate", default-features = false, optional = true }
+vibeos-wasm-reference-executable = { path = "../../wasm-reference-executable", default-features = false, optional = true }
+vibeos-wasm-runtime = { path = "../../wasm-runtime", default-features = false, optional = true }
+
+[build-dependencies]
+sha2 = { version = "=0.11.0", default-features = false, optional = true }
+wat = { version = "=1.255.0", default-features = false, features = ["component-model"], optional = true }

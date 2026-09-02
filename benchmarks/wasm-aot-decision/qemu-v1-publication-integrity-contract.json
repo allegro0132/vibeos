@@ -1,0 +1,171 @@
+{
+  "bundle": {
+    "decision": {
+      "bytes": 354846,
+      "git_blob": "97f9e4877a355b4e12b2f386c99eac62922d3391",
+      "git_mode": "100644",
+      "path": "benchmarks/wasm-aot-decision/qemu-v1/DECISION.json",
+      "sha256": "f2e9180569d43939a11e25e4d91cf9223447a141c8b7d8b5d75c756c6ae0569e"
+    },
+    "environment": {
+      "bytes": 348501,
+      "git_blob": "136ebe26a9794c156792f452467e50a379cb5859",
+      "git_mode": "100644",
+      "path": "benchmarks/wasm-aot-decision/qemu-v1/environment.json",
+      "sha256": "af738cb939c847aec337350ed82ad6064085f72bc0b112ae011fee60a5d92697"
+    },
+    "summary": {
+      "bytes": 5083,
+      "git_blob": "97fa47cf2063338c3c0022d4736cf5cb7a6268fa",
+      "git_mode": "100644",
+      "path": "benchmarks/wasm-aot-decision/qemu-v1/summary.json",
+      "sha256": "ca04d0b4fb89b40bdfc0f7028147e6b7e27c80cc0f5e3fbdba0e9a23f67f4354"
+    },
+    "uart": {
+      "bytes": 12158825,
+      "git_blob": "9a8d2b33fabddbf6481e50421bed985c1b932891",
+      "git_mode": "100644",
+      "path": "benchmarks/wasm-aot-decision/qemu-v1/uart.log",
+      "sha256": "bc22610248db679a89336302f93a6fef760ae886d32121dce320961ddda8c112"
+    }
+  },
+  "decision_semantics": {
+    "aot_authorized": false,
+    "budget_miss": true,
+    "budget_ticks": 1000000,
+    "candidate_for_c85_design_review": false,
+    "interpretation_attribution": false,
+    "native_code_accepted": false,
+    "outcome": "aot-not-justified-on-fixed-qemu"
+  },
+  "effectivity": {
+    "contract_is_evidence": false,
+    "formal_closure_reestablished": false,
+    "publisher_execution_replayed": false,
+    "qemu_execution_replayed": false,
+    "scope": "historical-structure-and-hash-integrity-only-no-evidence-replay"
+  },
+  "historical_blobs": {
+    "build_rs": {
+      "bytes": 40171,
+      "git_blob": "dbb0bd27796d65b4cecd8ca091a6d954f7978d42",
+      "git_mode": "100644",
+      "path": "policy/image/build.rs",
+      "required_at": [
+        "source",
+        "publication"
+      ],
+      "sha256": "ca0d4f100d136d26c0ac1e1beeb0919b12c8f8a9e2345d15b6284b041e6ed74e"
+    },
+    "evidence_schema": {
+      "bytes": 53287,
+      "git_blob": "25cf70e0a2d55098f17f8ea6d60a62d6042ea479",
+      "git_mode": "100644",
+      "path": "benchmarks/wasm-aot-decision/evidence-schema-qemu-v1.json",
+      "required_at": [
+        "source",
+        "publication"
+      ],
+      "sha256": "6239f8fb2e71a0195d8efccb445badbd8f6cad04a755440be93c08131e7cd22e"
+    },
+    "manifest": {
+      "bytes": 20229,
+      "git_blob": "2f6036d3c09183413a73619cf54b175ebd60ce27",
+      "git_mode": "100644",
+      "path": "benchmarks/wasm-aot-decision/workloads-qemu-v1.json",
+      "required_at": [
+        "source",
+        "publication"
+      ],
+      "sha256": "339bb27af9a4d24cf5440349777a2113c7ac815bc0289c2fc233426aac3402ef"
+    },
+    "physical_helper": {
+      "bytes": 139509,
+      "git_blob": "925a31cc95a570aae8b8ed6b6c71da7d1c527046",
+      "git_mode": "100644",
+      "path": "scripts/verify-c84-aot-decision.py",
+      "required_at": [
+        "source",
+        "publication"
+      ],
+      "sha256": "e40bd89b478de57ce893167ac754676d32032ff1553f0a4cdbd8a3f6b2d82b52"
+    },
+    "policy_lib": {
+      "bytes": 91547,
+      "git_blob": "5eb7cdbceccfc90d76c47c0d030039716dabef70",
+      "git_mode": "100644",
+      "path": "policy/image/src/lib.rs",
+      "required_at": [
+        "source",
+        "publication"
+      ],
+      "sha256": "d4912916f8407ddcb4ae7914186f6d567468896c72a39da0ddbbe957d1a7b2e0"
+    },
+    "qemu_verifier": {
+      "bytes": 339405,
+      "git_blob": "1169b293ff1976f0204028ba0eac789b5ddfaa79",
+      "git_mode": "100755",
+      "path": "scripts/verify-c84-qemu-aot-decision.py",
+      "required_at": [
+        "source",
+        "publication"
+      ],
+      "sha256": "fe67fee3e299d9110f6405fdee83df085cf110ebbc18c6bbf0576a021f3bdc6a"
+    },
+    "transcript_schema": {
+      "bytes": 8188,
+      "git_blob": "5d9a6fee8865c5ba784c0c1549d860959f2214c2",
+      "git_mode": "100644",
+      "path": "benchmarks/wasm-aot-decision/schema-qemu-v1.json",
+      "required_at": [
+        "source",
+        "publication"
+      ],
+      "sha256": "0df879bea905ac1967685fdb411f017acf0136a69999ee031f71af76509eb520"
+    }
+  },
+  "limitations": [
+    "Passing this audit proves only checked-in structure, hashes, Git ancestry, and historical blob membership.",
+    "The audit does not rerun QEMU, replay the publisher or execution, or reestablish the original formal closure.",
+    "No physical Milk-V Duo provenance or physical-hardware equivalence is claimed."
+  ],
+  "policy": {
+    "aot_authorized": false,
+    "native_code_accepted": false,
+    "other_hardware_gates_unchanged": true,
+    "physical_duo_gate_replaced": true,
+    "physical_inputs_permitted": 0,
+    "physical_inputs_required": 0,
+    "physical_provenance": "not-claimed",
+    "physical_tooling_retained": true,
+    "physical_tooling_status": "retained-non-blocking-non-evidence",
+    "replacement": "fixed-qemu-formally-replaces-c84-physical-duo-roadmap-gate",
+    "replacement_scope": "c84-only"
+  },
+  "publication": {
+    "commit": "cbb1d0fb0261377b848b218c9a31f862f7ec42ed",
+    "source_is_ancestor": true,
+    "tree": "72a21b59dc563e193185aa8a2d60f4ee0c6df850"
+  },
+  "schema": "vibeos.c84.qemu-published-evidence-integrity-contract",
+  "scope": "c84-fixed-qemu-published-bundle-historical-integrity",
+  "source": {
+    "commit": "e950a2facb6a6c230e67becb186bddf34a5924bb",
+    "tree": "235541126f0e8445ee5a884985db4ccd9bb24104"
+  },
+  "status": "neutral-integrity-audit-contract-not-evidence",
+  "suite_id": "vibeos.c84.qemu-published-evidence-integrity",
+  "verification": {
+    "check_published_writes_outputs": false,
+    "cli_modes": [
+      "--check-published",
+      "--selftest"
+    ],
+    "fixed_paths_only": true,
+    "git_access": "sanitized-local-no-lazy-fetch",
+    "json_policy": "duplicate-free-integer-only-canonical-json",
+    "selftest_writes_temporary_fixtures": true,
+    "writes_repository_outputs": false
+  },
+  "version": 1
+}

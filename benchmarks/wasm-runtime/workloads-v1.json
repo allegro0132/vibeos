@@ -1,0 +1,185 @@
+{
+  "schema": "vibeos.wasm-runtime-costs.manifest",
+  "version": 1,
+  "suite_id": "vibeos.c83.runtime-costs",
+  "workload_revision": 1,
+  "scope": {
+    "async": "validation-candidate-primitives",
+    "composition": "validation-only-plan",
+    "preview1": "validation-only and excluded from execution throughput",
+    "sync": "executable Profile 1"
+  },
+  "fixtures": [
+    {
+      "byte_len": 1470,
+      "compiled_sha256": "ac27cf109517a631840ec66b6a9d0551b1bb81528b13cbd4c86330c5ca79f0e2",
+      "id": "sync-rich-component",
+      "path": "component-runtime/tests/fixtures/rich.component.wat",
+      "profile": "profile-1-sync",
+      "source_sha256": "ded530d1df4fab6f556303e8142d3490674dfabf1118c7529cd4bc3badd0a008",
+      "stage": "executable"
+    },
+    {
+      "byte_len": 126,
+      "compiled_sha256": "015e06ae943bd6f4a5d23d8a29a50c0fc3b81402eae8c24516e827872b5479c7",
+      "id": "async-route-component",
+      "path": "acceptance/wasm-runtime-costs/fixtures/async-route.component.wat",
+      "profile": "profile-1-async",
+      "source_sha256": "6f2cee38bbd8788a61f8ce55512af10651f97430b1012cf25a85a2e9444f7434",
+      "stage": "validation-candidate"
+    },
+    {
+      "byte_len": 175,
+      "compiled_sha256": "7621071cf23c70cc74bbeea97f494d3457bef9ba27737f9923997dfab50f9ccc",
+      "id": "core-host-fuel-module",
+      "path": "acceptance/wasm-runtime-costs/fixtures/core-host-fuel.wat",
+      "profile": "core-profile-1",
+      "source_sha256": "6fbd4aafd71be8b9a6ebb8bb71c3039fddf977a1aee9857121d8a8f435b22714",
+      "stage": "executable"
+    }
+  ],
+  "platforms": {
+    "milkv-duo-cv1800b": {
+      "board": "Milk-V Duo CV1800B",
+      "cpu": "C906B",
+      "fresh_boots": 3,
+      "hart_count": 1,
+      "ram_bytes": 62914560,
+      "sdk_commit": "23eb84fecb29585dbb5728d6b7e2475ff273baac",
+      "sdk_container_digest": "sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679",
+      "target": "riscv64imac-unknown-none-elf",
+      "timebase_hz": 25000000,
+      "uart": "115200 8N1"
+    },
+    "qemu-virt": {
+      "accelerator": "tcg,thread=single",
+      "bios": "opensbi-riscv64-generic-fw_dynamic.bin",
+      "bios_version_policy": "recorded-exact-per-evidence",
+      "cpu": "rv64",
+      "fresh_boots": 1,
+      "hart_count": 1,
+      "icount": "shift=0,align=off,sleep=off",
+      "machine": "virt",
+      "memory": "128M",
+      "qemu_version_policy": "recorded-exact-per-evidence",
+      "target": "riscv64imac-unknown-none-elf",
+      "timebase_hz": 10000000
+    }
+  },
+  "sampling": {
+    "heavy": {
+      "samples": 21,
+      "warmup": 3
+    },
+    "hot": {
+      "samples": 41,
+      "warmup": 5
+    },
+    "fuel": {
+      "samples": 21,
+      "warmup": 3
+    },
+    "minimum_batch_ticks_divisor": 1000
+  },
+  "statistics": {
+    "heap_peak": "exact maximum global allocator live bytes within a resettable per-sample window; valid because the sampler runs one hart with background services disabled",
+    "mean": "integer floor of the u128 sum divided by count",
+    "p50": "nearest-rank index ceil(0.50*n)-1",
+    "p95": "nearest-rank index ceil(0.95*n)-1",
+    "raw_unit": "riscv.rdtime ticks",
+    "timer_overhead_subtracted": false
+  },
+  "workloads": [
+    {
+      "batch": 4,
+      "bytes": 5880,
+      "category": "validation",
+      "expected_result": 17179875064,
+      "id": "component-validation",
+      "sampling": "heavy"
+    },
+    {
+      "batch": 4,
+      "bytes": 5880,
+      "category": "startup",
+      "expected_result": 4,
+      "id": "cold-component-startup",
+      "sampling": "heavy",
+      "scope_note": "includes fresh engine construction and embedded Core validation/compilation"
+    },
+    {
+      "batch": 256,
+      "bytes": 131072,
+      "category": "lift-lower",
+      "expected_result": 81920,
+      "id": "canonical-string-list-roundtrip",
+      "sampling": "hot"
+    },
+    {
+      "batch": 1024,
+      "bytes": 0,
+      "category": "async",
+      "expected_result": 1024,
+      "id": "async-wait-suspend-resume",
+      "sampling": "hot",
+      "scope_note": "native async state primitive; not guest async throughput"
+    },
+    {
+      "batch": 256,
+      "bytes": 0,
+      "category": "composition",
+      "expected_result": 8796093024000,
+      "id": "composition-plan-8-nodes-7-edges",
+      "sampling": "heavy",
+      "scope_note": "validation-only graph planning against an already-decoded ComponentPlan; component decode bytes are excluded and runtime_ready remains false"
+    },
+    {
+      "batch": 256,
+      "bytes": 4096,
+      "category": "host-call",
+      "expected_result": 10752,
+      "id": "core-host-call-roundtrip",
+      "sampling": "hot"
+    },
+    {
+      "batch": 16,
+      "bytes": 1048576,
+      "category": "memory",
+      "expected_result": 1048576,
+      "id": "linear-memory-grow-64k",
+      "minimum_heap_peak_delta_bytes": 1048576,
+      "sampling": "hot"
+    },
+    {
+      "batch": 32768,
+      "bytes": 0,
+      "category": "fuel",
+      "expected_result": 0,
+      "id": "core-integer-fuel-throughput",
+      "sampling": "fuel"
+    },
+    {
+      "batch": 2048,
+      "bytes": 0,
+      "category": "cancellation",
+      "expected_result": 2048,
+      "id": "task-cancel-to-terminal",
+      "sampling": "hot"
+    },
+    {
+      "batch": 512,
+      "bytes": 0,
+      "category": "revocation",
+      "expected_result": 4608,
+      "id": "cap-revoke-to-denial",
+      "sampling": "hot"
+    }
+  ],
+  "publication_gates": {
+    "cleanup": "heap_after equals heap_before and logical_live_after is zero for every raw record; heap_peak is the exact maximum allocator live-byte gauge inside that sample's resettable window",
+    "completeness": "every platform, boot, workload, warmup and retained sample coordinate is present exactly once",
+    "duo_stability": "retained p95 divided by p50 is at most 1.50",
+    "qemu_stability": "retained p95 divided by p50 is at most 1.10",
+    "regression_budget": "none in C8.3; C8.4 must name and freeze a product workload budget"
+  }
+}

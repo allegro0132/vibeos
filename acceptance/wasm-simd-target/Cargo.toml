@@ -1,0 +1,49 @@
+[package]
+name = "vibeos-wasm-simd-target"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "C8.10-S5 fixed-QEMU deterministic SIMD qualification"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+c810-s5-qemu-qualification = [
+    "dep:sha2",
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-wasm-runtime",
+    "dep:vibeos-wasm-simd-candidate",
+    "dep:wat",
+    "vibeos-component-admission/c810-s4-acceptance",
+    "vibeos-component-runtime/c810-s3-acceptance",
+    "vibeos-wasm-runtime/c810-simd-candidate-inspection",
+    "vibeos-wasm-simd-candidate/c810-s2-acceptance",
+]
+c811-s3-qemu-qualification = [
+    "dep:sha2",
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-wasm-runtime",
+    "dep:vibeos-wasm-simd-executable",
+    "dep:wat",
+    "vibeos-component-admission/c811-simd-executable",
+    "vibeos-component-runtime/c811-simd-executable",
+    "vibeos-wasm-runtime/c811-simd-executable",
+    "vibeos-wasm-simd-executable/c811-s2-acceptance",
+]
+
+[dependencies]
+sha2 = { version = "=0.11.0", default-features = false, optional = true }
+vibeos-component-admission = { path = "../../services/component-admission", default-features = false, optional = true }
+vibeos-component-format = { path = "../../component-format", optional = true }
+vibeos-component-runtime = { path = "../../component-runtime", default-features = false, optional = true }
+vibeos-wasm-runtime = { path = "../../wasm-runtime", default-features = false, optional = true }
+vibeos-wasm-simd-candidate = { path = "../../wasm-simd-candidate", default-features = false, optional = true }
+vibeos-wasm-simd-executable = { path = "../../wasm-simd-executable", default-features = false, optional = true }
+
+[build-dependencies]
+sha2 = { version = "=0.11.0", default-features = false, optional = true }
+wat = { version = "=1.255.0", default-features = false, features = ["component-model"], optional = true }

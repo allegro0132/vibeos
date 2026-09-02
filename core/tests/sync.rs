@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use vibeos_core::arch;
 use vibeos_core::heap::{enter_domain, AllocationDomain, Heap, OwnerId};
-use vibeos_core::sync::{enter_task_recovery_context, SpinLock, TaskRecoveryKey};
+use vibeos_core::sync::{
+    enter_task_recovery_context, ConditionalRecovery, SpinLock, TaskRecoveryKey,
+};
 
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -132,4 +134,90 @@ fn exact_task_recovery_separates_system_domain_tasks() {
     assert!(unsafe { lock.recover_after_task_fault(AllocationDomain::SYSTEM, task_a) });
     assert_eq!(lock.stats().fault_recoveries, 1);
     assert_eq!(*lock.lock(), 23);
+}
+
+#[test]
+fn conditional_exact_task_recovery_validates_before_release() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    arch::reset_ipi_test_state();
+    vibeos_core::ipi::reset_test_state();
+    arch::set_test_hart_id(0);
+
+    let task = TaskRecoveryKey::new(70_101).unwrap();
+    let other_task = TaskRecoveryKey::new(70_102).unwrap();
+    let lock = SpinLock::new_recoverable(29u64);
+    let _ = lock.stats();
+    assert_eq!(
+        unsafe {
+            lock.recover_after_task_fault_if(AllocationDomain::SYSTEM, task, |_| {
+                panic!("a FREE lock has no exact-task provenance for value inspection")
+            })
+        },
+        ConditionalRecovery::NotHeldUnvalidated
+    );
+
+    let mut context = enter_task_recovery_context(task);
+    let guard = lock.lock();
+    core::mem::forget(guard);
+    context.restore();
+
+    assert_eq!(
+        unsafe {
+            lock.recover_after_task_fault_if(AllocationDomain::SYSTEM, other_task, |_| {
+                panic!("a provenance mismatch must not inspect the protected value")
+            })
+        },
+        ConditionalRecovery::ProvenanceMismatch
+    );
+    assert_eq!(
+        unsafe {
+            lock.recover_after_task_fault_if(
+                AllocationDomain::untracked(OwnerId::new(70_103)),
+                task,
+                |_| panic!("a domain mismatch must not inspect the protected value"),
+            )
+        },
+        ConditionalRecovery::ProvenanceMismatch
+    );
+    assert_eq!(
+        unsafe {
+            lock.recover_after_task_fault_if(AllocationDomain::SYSTEM, task, |value| *value == 29)
+        },
+        ConditionalRecovery::Recovered
+    );
+    assert_eq!(lock.stats().fault_recoveries, 1);
+    assert_eq!(*lock.lock(), 29);
+}
+
+#[test]
+fn conditional_value_mismatch_fail_stops_the_lock_generation() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    arch::reset_ipi_test_state();
+    vibeos_core::ipi::reset_test_state();
+    arch::set_test_hart_id(0);
+
+    let task = TaskRecoveryKey::new(70_201).unwrap();
+    let lock = SpinLock::new_recoverable(31u64);
+    let _ = lock.stats();
+    let mut context = enter_task_recovery_context(task);
+    let guard = lock.lock();
+    core::mem::forget(guard);
+    context.restore();
+
+    assert_eq!(
+        unsafe {
+            lock.recover_after_task_fault_if(AllocationDomain::SYSTEM, task, |value| *value == 32)
+        },
+        ConditionalRecovery::ValueMismatch
+    );
+    assert_eq!(lock.stats().fault_recoveries, 0);
+    assert_eq!(
+        unsafe { lock.recover_after_task_fault_if(AllocationDomain::SYSTEM, task, |_| true) },
+        ConditionalRecovery::ProvenanceMismatch,
+        "a quarantined RECOVERING generation cannot be released by retry"
+    );
 }

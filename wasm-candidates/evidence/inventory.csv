@@ -1,0 +1,5 @@
+crate,version,source_lines,unsafe_syntax_sites,license,role
+wasmi,1.1.0,36591,123,MIT OR Apache-2.0,selected Core interpreter
+dlr-wasm-interpreter,0.2.0,22880,442,MIT OR Apache-2.0,C0 comparison only
+wasmparser,0.255.0,40669,0,Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT,selected Component validator
+wit-parser,0.255.0,18157,0,Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT,selected WIT resolver

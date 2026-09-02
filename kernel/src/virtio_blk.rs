@@ -22,7 +22,7 @@ use crate::exec::{self, WaitQueue};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
 use crate::plic;
 use crate::sync::SpinLock;
-use crate::virtio::{self, BlockOperation, UsedElement, BLOCK_MAX_TRANSFER_SIZE, SPLIT_QUEUE_SIZE};
+use crate::virtio::{self, BlockOperation, UsedElement, BLOCK_MAX_TRANSFER_SIZE, BLOCK_QUEUE_SIZE};
 use crate::world::Space;
 
 use crate::virtio_mmio::MmioTransport;
@@ -190,7 +190,7 @@ impl BlockDevice {
             online: control.online,
             quarantined: control.quarantined,
             capacity_sectors: control.capacity,
-            queue_size: SPLIT_QUEUE_SIZE,
+            queue_size: BLOCK_QUEUE_SIZE,
             read_only: control.read_only,
             supports_flush: control.supports_flush,
             session_epoch: control.epoch,

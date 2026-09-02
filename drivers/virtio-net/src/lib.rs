@@ -91,12 +91,13 @@ impl QueueDma {
         available: AvailableRing {
             flags: 0,
             index: 0,
-            ring: [0; vibeos_driver_virtio_core::SPLIT_QUEUE_SIZE as usize],
+            ring: [0; vibeos_driver_virtio_core::MAX_SPLIT_QUEUE_SIZE as usize],
         },
         used: UsedRing {
             flags: 0,
             index: 0,
-            ring: [UsedElement::new(0, 0); vibeos_driver_virtio_core::SPLIT_QUEUE_SIZE as usize],
+            ring: [UsedElement::new(0, 0);
+                vibeos_driver_virtio_core::MAX_SPLIT_QUEUE_SIZE as usize],
         },
     };
 }
@@ -280,7 +281,7 @@ impl Engine {
         let mut completed = 0u8;
         let mut budget = QUEUE_SLOTS;
         while self.model.used_index(NetQueue::Transmit) != observed && budget != 0 {
-            let slot = virtio::ring_slot(self.model.used_index(NetQueue::Transmit)) as usize;
+            let slot = virtio::net_ring_slot(self.model.used_index(NetQueue::Transmit)) as usize;
             let used = read_used_element(NetQueue::Transmit, slot);
             match self.model.complete_transmit(observed, used) {
                 Ok(completion) => {
@@ -310,7 +311,7 @@ impl Engine {
         if self.model.used_index(NetQueue::Receive) == observed {
             return Ok(None);
         }
-        let slot = virtio::ring_slot(self.model.used_index(NetQueue::Receive)) as usize;
+        let slot = virtio::net_ring_slot(self.model.used_index(NetQueue::Receive)) as usize;
         let used = read_used_element(NetQueue::Receive, slot);
         let frame_length = virtio::validate_net_receive_length(used.length()).map_err(|_| {
             self.model

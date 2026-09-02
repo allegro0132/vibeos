@@ -1,0 +1,20 @@
+{
+  "challenge": "8aab535b6b0a348a812f52a8c0c8840dc34271be1af258c0e1398ba62aec1702",
+  "elf_audit_sha256": "15d1617609b0f22b3f12b29948d535da4fabb3f0ab97db5f26f1f3f2ccea3edc",
+  "environment_evidence_sha256": "67bffae55ff0638921d4abf1f0244f01eb12bc3f8b84706f5f5d17d2d95137f1",
+  "environment_sha256": "e33ee67e23881eb31f2757b7b4391a77f6cc085badce1d79dc82b05ee1d8ea0f",
+  "kernel_sha256": "7b1beb68c34a84589bda3e3361b828eda45fe10f4103472cb3bca814f4494edf",
+  "mode": "optimized",
+  "physical_inputs": 0,
+  "physical_provenance": "not-claimed",
+  "records": 7,
+  "run_id": "c7404023823bea9027e0c55bd564a062dc591974dd7385bd8957a4b4c3d61de8",
+  "schema": "vibeos.c811.s3.simd-fixed-qemu.receipt",
+  "semantic_sha256": "ddab9d539744523b332787be6f8a101de00108479c9644136538524f20cd4514",
+  "source_commit": "90f95df4503a3992067fa68dbcd7d9dd9485ef10",
+  "source_tree": "2ab8ca62c1a37dd766c86d2fd8fd9d5f873927cd",
+  "status": "pass",
+  "uart_bytes": 5375,
+  "uart_sha256": "570c5aa3992f84f79bd14ee5accb6a8d56d8023083cb7cd98bc5b4cb092b526e",
+  "version": 1
+}

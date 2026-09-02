@@ -323,6 +323,9 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
                     "  cancellation was too late; task completion is already committed as {}",
                     state
                 ),
+                exec::CancelOutcome::NotPublished => {
+                    println!("  component generation is prepared but not yet published")
+                }
             }
         }
 

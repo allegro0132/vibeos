@@ -54,6 +54,7 @@ ssh-security-test = [
 # Dedicated N4 acceptance image. Sunset is admitted only for this QEMU image
 # and retains its no-std surface with allocation support for connection state.
 ssh-test = [
+    "ssh-component-command",
     "dep:vibeos-net-api",
     "dep:vibeos-netstack",
     "dep:vibeos-sshd",
@@ -66,6 +67,7 @@ ssh-test = [
 # DHCP, OpenSSH, and interactive VSH can be validated before a real Duo entropy
 # and provisioning path exists. Never enable this feature in a production image.
 milkv-ssh-acceptance = [
+    "ssh-component-command",
     "dep:vibeos-net-api",
     "dep:vibeos-netstack",
     "dep:vibeos-sshd",
@@ -77,6 +79,7 @@ milkv-ssh-acceptance = [
 # Production SSH image. Device and client identities are provisioned locally;
 # no acceptance fixture is linked into this feature.
 milkv-ssh = [
+    "ssh-component-command",
     "dep:vibeos-net-api",
     "dep:vibeos-netstack",
     "dep:vibeos-sshd",
@@ -84,6 +87,387 @@ milkv-ssh = [
     "dep:jitterentropy",
     "vibeos-netstack/dhcp-service",
     "vibeos-vsh/network",
+]
+# Narrow image/session-policy-managed WASM command path shared by the three
+# SSH images. Keeping these dependencies behind an explicit image feature
+# prevents merely linking the reusable kernel archive from exposing a command.
+ssh-component-command = [
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-command",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-host",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-sshd",
+    "dep:vibeos-wasm-runtime",
+]
+# Default-off C6.3 lifecycle adapter for an atomically admitted Component
+# graph. This allocates only fresh per-node principal envelopes; the admitted
+# ValidationOnly graph remains non-executable.
+component-graph-principals = [
+    "dep:vibeos-component-command",
+    "dep:vibeos-component-host",
+    "dep:vibeos-component-runtime",
+]
+# QEMU image gate for the real two-node C6.3 lifecycle proof.
+wasm-c63-graph-principal-acceptance = [
+    "component-graph-principals",
+    "dep:vibeos-component-admission",
+]
+# QEMU image gate for the C6.4 exact resource-edge supervisor proof. The
+# selected profile remains validation-only; this feature never enables or
+# calls guest execution from the graph-principal path.
+wasm-c64-resource-route-acceptance = [
+    "component-graph-principals",
+    "dep:vibeos-component-admission",
+    "vibeos-image-policy/c64-resource-route-qemu-acceptance",
+]
+# QEMU image gate for the C6.5 validation-only async-chain proof. Pinned
+# Components contribute exact validator provenance only; bounded transport is
+# exercised by separately supervised SYSTEM byte streams and never calls guest
+# code while PROFILE_1_ASYNC remains execution-disabled.
+wasm-c65-async-chain-acceptance = [
+    "component-graph-principals",
+    "dep:vibeos-component-admission",
+    "vibeos-image-policy/c65-async-chain-qemu-acceptance",
+]
+# QEMU image gate for the C6.6 validation-only single-node replacement proof.
+# Both old and candidate incarnations are admitted from exact image pins, while
+# the replacement supervisor keeps guest execution disabled throughout.
+wasm-c66-node-replacement-acceptance = [
+    "component-graph-principals",
+    "dep:vibeos-component-admission",
+    "vibeos-core/wasm-c66-node-replacement-acceptance",
+    "vibeos-image-policy/c66-node-replacement-qemu-acceptance",
+]
+# QEMU image gate for C6.7 semantic-only graph information-flow inspection.
+# It links pinned validation inputs but no graph principal, CSpace, resource
+# table, Task, or guest executor lifecycle.
+wasm-c67-information-flow-acceptance = [
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-runtime",
+    "vibeos-image-policy/c67-information-flow-qemu-acceptance",
+]
+# QEMU-only C7.3 proof for the two disjoint artifact trust roots. The
+# development case retains an exact whole-envelope image pin; deployable
+# artifacts require detached operator evidence and remain unavailable after
+# command projection. No guest-execution feature, call, or durable lookup
+# surface is enabled by this gate.
+wasm-c73-authenticated-admission-acceptance = [
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-loader",
+    "dep:vibeos-component-runtime",
+    "vibeos-image-policy/c73-authenticated-admission-qemu-acceptance",
+]
+# Internal C7 durable-publication policy seam. Merely enabling this feature
+# admits the exact v2 authority policy and portable validators; it does not
+# publish a command name, mint INVOKE/GRANT, or enable a guest executor.
+component-durable-publication = [
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-loader",
+]
+# QEMU-only C7.4 proof for one crash-safe operator artifact publication. The
+# image uses the production Storage V2 installer and physical postflight, then
+# moves the unavailable command into the sealed supervisor singleton. It does
+# not enable a command registry, guest executor, or durable invocation path.
+wasm-c74-crash-safe-publication-acceptance = [
+    "component-durable-publication",
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-runtime",
+    "vibeos-image-policy/c73-authenticated-admission-qemu-acceptance",
+]
+# QEMU-only C7.5 proof that both a first installation and an existing durable
+# publication pass through physical readback and fresh current-policy/engine
+# validation before the private inert singleton is populated. The existing
+# boot never consumes image artifact bytes and this feature enables no VSH,
+# component-owned runtime principal, resource table, Task, or guest executor.
+wasm-c75-boot-revalidation-acceptance = [
+    "component-durable-publication",
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-runtime",
+    "vibeos-image-policy/c73-authenticated-admission-qemu-acceptance",
+]
+# QEMU-only C7.6 proof for one authenticated, durable graph-version
+# replacement. The complete successor graph is committed and physically
+# revalidated before the validation-only C6.6 lifecycle may stage its fresh
+# target or rotate either incident route.
+wasm-c76-graph-version-replacement-acceptance = [
+    "component-durable-publication",
+    "component-graph-principals",
+    "dep:vibeos-component-admission",
+    "dep:vibeos-component-runtime",
+    "vibeos-core/wasm-c66-node-replacement-acceptance",
+    "vibeos-image-policy/c76-graph-version-replacement-qemu-acceptance",
+]
+# QEMU-only C7.7 cold-recovery proof. It reuses the sealed C7.6 graph format
+# and policy surface, but accepts only an already-final graph-only G1
+# namespace. Every boot constructs fresh validation-only runtime state; no
+# execution identity or dynamic state is read from or written to disk.
+wasm-c77-ephemeral-runtime-acceptance = [
+    "wasm-c76-graph-version-replacement-acceptance",
+]
+# Dedicated C8.3 raw runtime-cost image. The target emits only source-bound
+# integer samples; schema verification and summary derivation remain host-owned.
+wasm-c83-runtime-costs = ["dep:vibeos-wasm-runtime-costs"]
+# Isolated C8.8-F5 host-equivalent target qualification. This links only the
+# acceptance candidate stack and never registers a current engine or command.
+wasm-c88-f5-float-qemu-acceptance = [
+    "dep:sha2",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-wasm-float-target",
+    "vibeos-wasm-float-target/c88-f5-acceptance",
+]
+# C8.9-S3 deliberately layers a new evidence identity over the already
+# isolated QEMU adapter while selecting the independent code-6 executor in the
+# shared qualification crate. The C8.8 feature remains present only to retain
+# the sealed adapter/module topology; C8.9 takes precedence inside that crate.
+wasm-c89-s3-float-qemu-qualification = [
+    "wasm-c88-f5-float-qemu-acceptance",
+    "vibeos-wasm-float-target/c89-s3-qemu-qualification",
+]
+# C8.10-S5 isolated fixed-QEMU qualification. It executes only the sealed
+# code-7 acceptance stack and grants no current-engine, durable, or release
+# authority.
+wasm-c810-s5-simd-qemu-qualification = [
+    "dep:sha2",
+    "dep:vibeos-wasm-simd-target",
+    "vibeos-wasm-simd-target/c810-s5-qemu-qualification",
+]
+# C8.11-S3 independently numbered code-8 fixed-QEMU qualification. It reuses
+# the emulator isolation shell but selects a distinct producer and runtime.
+wasm-c811-s3-simd-qemu-qualification = [
+    "wasm-c810-s5-simd-qemu-qualification",
+    "vibeos-wasm-simd-target/c811-s3-qemu-qualification",
+]
+# C8.12-R3 isolated fixed-QEMU qualification for validation-only code 9.
+# It links only the bounded Reference Types candidate and grants no current,
+# execution, admission, durable, migration, or release authority.
+wasm-c812-r3-reference-qemu-qualification = [
+    "dep:sha2",
+    "dep:vibeos-wasm-reference-target",
+    "vibeos-wasm-reference-target/c812-r3-qemu-qualification",
+]
+# C8.13-E3 independently numbered code-10 fixed-QEMU qualification.
+wasm-c813-e3-reference-qemu-qualification = [
+    "dep:sha2",
+    "dep:vibeos-wasm-reference-target",
+    "vibeos-wasm-reference-target/c813-e3-qemu-qualification",
+]
+# Isolated Milk-V Duo compile-readiness image for the same portable F5
+# qualification. It carries a reserved non-evidence sentinel identity behind
+# an immutable runtime-opaque arm byte of zero; no physical capture or evidence
+# is claimed until a separately reviewed future image supplies its own arm.
+wasm-c88-f5-float-duo-compile-readiness = [
+    "dep:sha2",
+    "dep:vibeos-component-format",
+    "dep:vibeos-component-runtime",
+    "dep:vibeos-wasm-float-target",
+    "vibeos-wasm-float-target/c88-f5-duo-compile-readiness",
+]
+# Default-off C8.4 kernel ownership boundary. It installs exactly one
+# target-session lineage behind the IRQ-masking kernel SpinLock; no runtime,
+# trap, SSH, or publisher hook is selected merely by enabling this feature.
+wasm-c84-profile-slot = ["dep:vibeos-wasm-aot-profile"]
+# QEMU-only proof for the slot's single-hart, TaskDetach, tombstone, indexed
+# streaming, rejection, and exact-recycle state machine.
+wasm-c84-profile-slot-qemu-acceptance = ["wasm-c84-profile-slot"]
+# Default-off adapter from the portable Core-poll observers to the exact
+# current-task profile-slot lease. This does not change ordinary `poll()` and
+# does not select any SSH, trap, or publication hook.
+wasm-c84-core-poll-observer = [
+    "wasm-c84-profile-slot",
+    "dep:vibeos-component-runtime",
+    "vibeos-component-runtime/c84-profile-hooks",
+]
+# QEMU-only proof that a real wasmi Core poll enters and leaves Interpretation
+# through the observer adapter while the slot remains exactly task-owned.
+wasm-c84-core-poll-qemu-acceptance = [
+    "wasm-c84-core-poll-observer",
+    "dep:vibeos-wasm-runtime",
+]
+# Default-off trap overlay for the one active target sample. Entry and exit
+# briefly borrow the slot but never hold it across timer, SSIP, or PLIC work.
+wasm-c84-profile-irq-overlay = ["wasm-c84-profile-slot"]
+# QEMU-only proof using a real supervisor self-IPI on the boot hart.
+wasm-c84-profile-irq-overlay-qemu-acceptance = ["wasm-c84-profile-irq-overlay"]
+# Default-off exact delegation from one request-owned slot lease to one hidden
+# PreparedTaskBatch child. The parent remains the sole terminal/storage owner.
+wasm-c84-profile-child-delegation = ["wasm-c84-profile-slot"]
+# QEMU-only bind-before-publish, exact-child Core-observer pairing,
+# terminal-reason, and real-SSIP proof. This remains disconnected from SSH and
+# the ordinary managed-component Core path.
+wasm-c84-profile-child-delegation-qemu-acceptance = [
+    "wasm-c84-profile-child-delegation",
+    "wasm-c84-core-poll-observer",
+    "wasm-c84-profile-irq-overlay",
+]
+# Default-off authenticated SSH request-parent owner. The adapter is
+# diagnostic-only: every response/Drop path cancels and acknowledges the
+# sample, and no finish, stream, or publication surface is enabled.
+wasm-c84-ssh-request-parent = [
+    "ssh-component-command",
+    "wasm-c84-profile-slot",
+    "vibeos-sshd/c84-profile-request-parent",
+]
+# QEMU gate telemetry for the diagnostic request-parent transitions. The base
+# feature above and every physical image remain silent.
+wasm-c84-ssh-request-parent-qemu-acceptance = ["wasm-c84-ssh-request-parent"]
+# Default-off composition of the authenticated request owner with the exact
+# production managed child and the ordinary synchronous Core observer. This
+# remains diagnostic-only: response handling still cancels the slot, and no
+# verified stream or publisher is enabled.
+wasm-c84-ssh-managed-child-core = [
+    "wasm-c84-ssh-request-parent",
+    "wasm-c84-profile-child-delegation",
+    "wasm-c84-core-poll-observer",
+]
+# Single-hart OpenSSH proof that the real hidden managed child claims the
+# request lineage from its first poll, brackets ordinary wasmi Core polls, and
+# releases before its exact Exited detach edge.
+wasm-c84-ssh-managed-child-core-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-core",
+    "wasm-c84-ssh-request-parent-qemu-acceptance",
+]
+# Default-off diagnostic phase sidecar for the same authenticated request and
+# real managed child. It accounts Host/Wait/Cleanup ownership but still leaves
+# the parent on the cancel/ack path and exposes no stream or publisher.
+wasm-c84-ssh-managed-child-phase-sidecar = [
+    "wasm-c84-ssh-managed-child-core",
+    "vibeos-sshd/c84-profile-phase-sidecar",
+]
+# Single-hart OpenSSH proof for the parent transport plus child phase sidecar.
+# The predecessor family remains enabled; CI first freezes its original gate,
+# then checks the composed image's exact delayed-stdin delta separately.
+wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-phase-sidecar",
+    "wasm-c84-ssh-managed-child-core-qemu-acceptance",
+]
+# Default-off composition of the real authenticated parent/managed child phase
+# path with the existing allocation-free trap IRQ overlay. The parent remains
+# cancel-only and no verified stream or publisher authority is exposed.
+wasm-c84-ssh-managed-child-irq-overlay = [
+    "wasm-c84-ssh-managed-child-phase-sidecar",
+    "wasm-c84-profile-irq-overlay",
+]
+# Single-hart OpenSSH proof for one causal parent Host self-SSIP, one causal
+# child Core self-SSIP, and an inactive gate after every terminal recycle.
+wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-irq-overlay",
+    "wasm-c84-ssh-managed-child-phase-sidecar-qemu-acceptance",
+]
+# Default-off terminal promotion for the exact authenticated SSH owner. A
+# successful response now finishes and verifies the sample, explicitly
+# discards the zero-cursor stream, validates the stored abandonment rejection,
+# acknowledges it once, and returns the slot to Ready. No stream or publisher
+# authority leaves the kernel adapter.
+wasm-c84-ssh-managed-child-finish-verify = [
+    "wasm-c84-ssh-managed-child-irq-overlay",
+]
+# Single-hart OpenSSH proof for the finish/verify/discard terminal path. The
+# predecessor QEMU image remains separately selectable with its original
+# cancel-only response transcript.
+wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-finish-verify",
+    "wasm-c84-ssh-managed-child-irq-overlay-qemu-acceptance",
+]
+# Default-off trusted-sample successor for the exact authenticated SSH owner.
+# It retains the verified sample and mints one opaque terminal-evidence bundle;
+# it is an alternative to the stream consumer, not an extension of that path.
+wasm-c84-ssh-managed-child-trusted-sample = [
+    "wasm-c84-ssh-managed-child-finish-verify",
+    "vibeos-sshd/c84-profile-trusted-sample",
+]
+# Single-hart OpenSSH proof for the trusted-sample terminal path. The finish
+# predecessor image remains separately selectable with its discard transcript.
+wasm-c84-ssh-managed-child-trusted-sample-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-trusted-sample",
+    "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+]
+# Default-off decision-record collector. The exact SSH trusted sample is
+# consumed synchronously into the selected contract's META + 24 SAMPLE + END
+# chain; no collector index, prior accumulator, or record factory escapes the
+# kernel slot boundary. Physical Duo-v1 is the profile crate's default; the
+# formal QEMU feature below selects its disjoint QEMU-v1 contract.
+wasm-c84-ssh-managed-child-single-boot-collector = [
+    "wasm-c84-ssh-managed-child-trusted-sample",
+]
+# Diagnostic-only QEMU projection of the same collector. It deliberately
+# reuses the finish/verify predecessor telemetry rather than the trusted-sample
+# discard transcript, and absorbs every formal record into a hash/length audit
+# sink instead of forwarding decision evidence to UART.
+wasm-c84-ssh-managed-child-single-boot-collector-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-single-boot-collector",
+    "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+    "dep:sha2",
+]
+# Formal C8.4 fixed-QEMU decision image. It selects the narrow OpenSSH fixture,
+# the production C8.4 workload path, the disjoint QEMU-v1 wire contract, and the
+# atomic UART sink. No `*-qemu-acceptance` telemetry or acceptance-only SSIP
+# injection is inherited into the timed image.
+wasm-c84-qemu-aot-decision = [
+    "ssh-test",
+    "wasm-c84-ssh-managed-child-single-boot-collector",
+    "vibeos-wasm-aot-profile/qemu-decision-v1",
+]
+# Compile-time dirty-smoke marker layered on the complete formal QEMU image.
+# Its profile feature changes META eligibility and the run-id domain.
+wasm-c84-qemu-aot-decision-smoke = [
+    "wasm-c84-qemu-aot-decision",
+    "vibeos-wasm-aot-profile/qemu-decision-v1-smoke",
+]
+# Default-off verified-stream consumer for the same exact SSH owner. Successful
+# samples are scanned through the kernel-private cursor and explicitly
+# completed back to Ready; no summary, interval, or publisher authority escapes
+# the synchronous response boundary.
+wasm-c84-ssh-managed-child-verified-stream = [
+    "wasm-c84-ssh-managed-child-finish-verify",
+]
+# Single-hart OpenSSH proof for full summary/interval consumption and explicit
+# stream completion. The predecessor image retains its discard-only transcript.
+wasm-c84-ssh-managed-child-verified-stream-qemu-acceptance = [
+    "wasm-c84-ssh-managed-child-verified-stream",
+    "wasm-c84-ssh-managed-child-finish-verify-qemu-acceptance",
+]
+# QEMU-only C4.8 proof image.  This is intentionally separate from both the
+# reusable SSH image feature and every Milk-V feature: only its target harness
+# may exercise fault injection and publish the one Closed -> Passed SSH gate.
+wasm-c48-qemu-acceptance = [
+    "ssh-component-command",
+    "vibeos-core/wasm-c48-target-acceptance",
+]
+# QEMU-only C5.3 native-async validation driver. This reuses the stable
+# managed-instance/CSpace machinery but has its own image pin, admission type,
+# payload mode, pending shadow, and acceptance entry point. It does not open or
+# modify the synchronous SSH/C4.8 acceptance gate.
+wasm-c53-native-async-qemu-acceptance = [
+    "ssh-component-command",
+    "vibeos-component-admission/native-async-acceptance",
+    "vibeos-component-runtime/native-async-acceptance",
+    "vibeos-image-policy/c53-native-async-qemu-acceptance",
+]
+# Explicit, default-off promotion of the sealed C5.3 artifact into a distinct
+# managed SSH/VSH command. The projection remains validation-only; this feature
+# selects only the reviewed kernel driver and lifecycle adapter around it.
+ssh-native-async-command = [
+    "ssh-component-command",
+    "dep:vibeos-component-image-adapter",
+    "vibeos-component-image-adapter/native-async-command-projection",
+    "vibeos-component-runtime/native-async-acceptance",
+]
+# Standard QEMU/OpenSSH promotion gate for the formal managed native command.
+# Keeping the telemetry and VSH aggregate behind this explicit composite
+# feature leaves the reusable formal command and every physical image inert.
+ssh-native-async-qemu-acceptance = [
+    "ssh-native-async-command",
+    "vibeos-vsh/managed-component-target-acceptance",
+]
+# C5.4c QEMU-only exact-incarnation revoke/fault gate. The firmware image must
+# still select ssh-test and C4.8 explicitly; this feature contributes only the
+# formal native route and target-only SSH/VSH coordination surfaces.
+ssh-native-async-revoke-qemu-acceptance = [
+    "ssh-native-async-command",
+    "vibeos-sshd/native-revoke-target-acceptance",
+    "vibeos-vsh/managed-component-target-acceptance",
 ]
 # Dedicated hardware qualification image for jitterentropy-rs. It exposes a
 # conditioned smoke test through the UART shell, but is not wired into SSH
@@ -111,6 +495,13 @@ bench = false
 [dependencies]
 vibeos-bsp-milkv-duo = { path = "../boards/milkv-duo", optional = true }
 vibeos-bsp-qemu-virt = { path = "../boards/qemu-virt", optional = true }
+vibeos-component-admission = { path = "../services/component-admission", optional = true }
+vibeos-component-command = { path = "../services/component-command", optional = true }
+vibeos-component-format = { path = "../component-format", optional = true }
+vibeos-component-host = { path = "../services/component-host", optional = true }
+vibeos-component-image-adapter = { path = "../services/component-image-adapter", optional = true }
+vibeos-component-loader = { path = "../services/component-loader", optional = true }
+vibeos-component-runtime = { path = "../component-runtime", optional = true }
 vibeos-core = { path = "../core" }
 vibeos-durable-format = { path = "../durable-format" }
 vibeos-driver-dwmac-net = { path = "../drivers/dwmac-net", optional = true }
@@ -143,6 +534,13 @@ vibeos-random = { path = "../random" }
 vibeos-sshd = { path = "../components/sshd", default-features = false, optional = true }
 vibeos-ssh-identity = { path = "../services/ssh-identity", optional = true }
 vibeos-vsh = { path = "../components/vsh", default-features = false }
+vibeos-wasm-runtime = { path = "../wasm-runtime", optional = true }
+vibeos-wasm-runtime-costs = { path = "../acceptance/wasm-runtime-costs", optional = true }
+vibeos-wasm-float-target = { path = "../acceptance/wasm-float-target", default-features = false, optional = true }
+vibeos-wasm-reference-target = { path = "../acceptance/wasm-reference-target", default-features = false, optional = true }
+vibeos-wasm-simd-target = { path = "../acceptance/wasm-simd-target", default-features = false, optional = true }
+vibeos-wasm-aot-profile = { path = "../wasm-aot-profile", optional = true }
+sha2 = { version = "=0.11.0", default-features = false, optional = true }
 jitterentropy = { package = "jitterentropy-rs", path = "../vendor/jitterentropy-rs", default-features = false, features = ["alloc"], optional = true }
 
 [target.'cfg(all(target_arch = "riscv64", target_os = "none"))'.dependencies]

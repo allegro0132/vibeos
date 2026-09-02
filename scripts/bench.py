@@ -46,10 +46,13 @@ QEMU_ICOUNT = "shift=0,align=off,sleep=off"
 
 # The statistic and direction are part of the policy, rather than something a
 # guest can choose.  A small absolute allowance keeps timer quantisation from
-# making a near-zero result look like a large relative regression.
+# making a near-zero result look like a large relative regression.  The IPC and
+# IRQ ratios preserve roughly the original absolute headroom across the
+# 2026-08-25 post-safety architecture epoch instead of mechanically scaling the
+# older ratios with a larger baseline.
 POLICY: dict[str, dict[str, Any]] = {
-    "ipc_roundtrip_ticks": {"stat": "p95", "direction": "lower", "ratio": 1.40, "absolute": 32},
-    "irq_to_poll_ticks": {"stat": "p95", "direction": "lower", "ratio": 1.75, "absolute": 8},
+    "ipc_roundtrip_ticks": {"stat": "p95", "direction": "lower", "ratio": 1.25, "absolute": 32},
+    "irq_to_poll_ticks": {"stat": "p95", "direction": "lower", "ratio": 1.40, "absolute": 8},
     "cap_lookup_depth_0_ticks": {"stat": "p50", "direction": "lower", "ratio": 1.30, "absolute": 1},
     "cap_lookup_depth_1_ticks": {"stat": "p50", "direction": "lower", "ratio": 1.30, "absolute": 1},
     "cap_lookup_depth_2_ticks": {"stat": "p50", "direction": "lower", "ratio": 1.30, "absolute": 1},

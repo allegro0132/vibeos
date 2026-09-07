@@ -55,6 +55,7 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
 - **[docs/PROGRAM_PERSISTENCE.md](docs/PROGRAM_PERSISTENCE.md)** — canonical
   source/VIBEEXE objects, crash-safe publication, compiler revalidation, and
   restored least authority.
+- **[docs/WASI.md](docs/WASI.md)** — opt-in raw WASI Preview 1 commands, real Rust/C standard-library examples, SSH upload, and QEMU acceptance.
 - **[docs/WASM_ROADMAP.md](docs/WASM_ROADMAP.md)** — the Component Model-first
   admitted-code plan: WIT contracts, bounded Core-WASM execution, CSpace-backed
   resources, native async, composition, durable installation, and later adapters/AOT.
@@ -111,10 +112,15 @@ layers and which mutations each one catches.
 ## Running it
 
 ```sh
-./run.sh          # interactive; exit with Ctrl-A then X
+./run.sh          # interactive + real Core-WASM boot demo; exit with Ctrl-A then X
 ./qrun.sh 10      # run for 10 seconds, feed the shell from stdin
 ./scripts/qemu-usb-test.sh  # PCI/XHCI, USB keyboard, storage, and hotplug
 ```
+
+The default `run.sh` image retains the file tree and executes its pinned
+Core-WASM artifact during boot. A successful run prints
+`WASM_C84_CORE_POLL PASS` before entering `vsh>`; the demo uses one hart to
+preserve its exact task-owned profiling contract.
 
 Normal images boot directly into `vsh>` with a dedicated CSpace. The broad
 diagnostic shell is compiled only with the `legacy-shell` test feature; the

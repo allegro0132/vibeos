@@ -6,6 +6,11 @@ VibeOS. It complements [BLUEPRINT.md](BLUEPRINT.md),
 [CAPABILITY_SHELL.md](CAPABILITY_SHELL.md), and
 [PROGRAM_PERSISTENCE.md](PROGRAM_PERSISTENCE.md).
 
+The independent [raw WASI Preview 1 command entry](WASI.md) supplements this
+Component-first route. Its `wasi-preview1-command-v1` profile, loader, invocation
+state and opt-in SSH policy are separate; it does not widen or renumber any
+Component profile or change the historical acceptance decisions below.
+
 **Status (2026-08-30): implementation in progress.** The repository now contains
 bounded Core validation/execution, Component decoding and Canonical ABI,
 admission/loading, compatibility, and C8 profiling evidence. The dependency

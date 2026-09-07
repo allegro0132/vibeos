@@ -1899,6 +1899,22 @@ impl SshdPlatform for SshPlatform {
         }
     }
 
+    #[cfg(feature = "wasi-ssh")]
+    fn wasi_exec_permitted(
+        &self,
+        profile: AuthorizedProfile,
+        request: &vibeos_wasi_command::Request,
+    ) -> bool {
+        crate::wasi::permitted(profile, request)
+    }
+    #[cfg(feature = "wasi-ssh")]
+    fn open_wasi_exec(
+        &self,
+        profile: AuthorizedProfile,
+        request: vibeos_wasi_command::Request,
+    ) -> Result<alloc::sync::Arc<vibeos_wasi_command::CommandIo>, u32> {
+        crate::wasi::open(profile, request)
+    }
     fn install_vsh_commands(&self, session: &mut vibeos_vsh::Session, onboarding: bool) {
         if onboarding {
             #[cfg(feature = "milkv-ssh")]

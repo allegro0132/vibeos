@@ -98,6 +98,8 @@ pub async fn run_legacy_source(source: &str, session: &mut Session) {
 }
 
 pub fn install_standard_commands(session: &mut Session) {
+    #[cfg(feature = "wasi-preview1")]
+    crate::wasi::install(session);
     install_shared_commands(session);
     vibeos_vsh::install_lsblk_command(session);
     #[cfg(feature = "file-tree")]
@@ -132,7 +134,7 @@ pub async fn bind_persistent_file_tree(session: &mut Session) {
                 session
                     .install_capability(
                         "home",
-                        Arc::new(home),
+                        home,
                         Rights::READ
                             .union(Rights::WRITE)
                             .union(Rights::GRANT)

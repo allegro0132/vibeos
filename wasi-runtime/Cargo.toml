@@ -1,0 +1,13 @@
+[package]
+name = "vibeos-wasi-runtime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+wasmi = { package = "vibeos-wasmi-softfloat", path = "../vendor/wasmi-softfloat/crates/wasmi", default-features = false, features = ["extra-checks", "prefer-btree-collections"] }
+wasmparser = { version = "=0.255.0", default-features = false, features = ["features", "prefer-btree-collections", "validate"] }
+vibeos-component-format = { path = "../component-format" }
+
+[dev-dependencies]
+wat = { version = "=1.255.0", default-features = false }

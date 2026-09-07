@@ -13,6 +13,9 @@
 #![feature(alloc_error_handler)]
 #![cfg_attr(not(feature = "legacy-shell"), allow(dead_code))]
 
+#[cfg(feature = "wasi-preview1")]
+mod wasi;
+
 #[cfg(all(
     feature = "wasm-c83-runtime-costs",
     any(

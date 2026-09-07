@@ -932,3 +932,87 @@ fn ssh_exec_api_rejects_an_interactive_session() {
         "session does not use the SSH exec profile"
     );
 }
+
+static AUTHORITY_CHECK_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+fn wait_for_authority_loss(ctx: vsh::CapabilityCommandContext) -> vsh::CapabilityCommandFuture {
+    Box::pin(async move {
+        let vsh::ResolvedArgument::CapabilityPath { root, .. } = ctx.args[0] else {
+            return Err(Status::Faulted);
+        };
+        let check = ctx.authority_check(root, Rights::READ);
+        assert!(check());
+        AUTHORITY_CHECK_STARTED.store(true, std::sync::atomic::Ordering::Release);
+        while check() {
+            exec::yield_now().await;
+        }
+        Err(Status::Denied)
+    })
+}
+
+#[test]
+fn capability_command_guard_observes_revocation_during_invocation() {
+    let _serial = SERIAL.lock().unwrap();
+    AUTHORITY_CHECK_STARTED.store(false, std::sync::atomic::Ordering::Release);
+    let space = Arc::new(vibeos_core::sync::SpinLock::new(
+        vibeos_core::cap::CSpace::new("wasi-guard-test"),
+    ));
+    let mut session = Session::with_cspace(space.clone());
+    session.install_capability_host_command(
+        "guard",
+        1,
+        1,
+        vsh::StreamMode::Closed,
+        read_path_planner,
+        wait_for_authority_loss,
+    );
+    let root = session
+        .install_capability(
+            "home",
+            Arc::new(TestFileRoot),
+            Rights::READ.union(Rights::GRANT).union(Rights::REVOKE),
+        )
+        .unwrap();
+    let result = Arc::new(Mutex::new(None));
+    let result_task = result.clone();
+    let task = exec::spawn_tracked("wasi-guard-test", async move {
+        *result_task.lock().unwrap() =
+            Some(session.execute("guard @home/test.wasm").await.unwrap());
+    });
+    exec::run_until_idle(100);
+    assert!(AUTHORITY_CHECK_STARTED.load(std::sync::atomic::Ordering::Acquire));
+    space.lock().revoke(root).unwrap();
+    exec::run_until_idle(100_000);
+    assert!(task.try_exit().is_some());
+    assert_eq!(
+        result.lock().unwrap().take().unwrap()[0].status,
+        Status::Denied
+    );
+}
+
+fn wide_exit(ctx: vsh::CapabilityCommandContext) -> vsh::CapabilityCommandFuture {
+    Box::pin(async move {
+        ctx.record_exit_code(u32::MAX);
+        Err(Status::Returned(1))
+    })
+}
+#[test]
+fn capability_command_retains_full_wasi_exit_detail() {
+    let _serial = SERIAL.lock().unwrap();
+    let mut session = Session::new();
+    session.install_capability_host_command(
+        "wide-exit",
+        0,
+        0,
+        vsh::StreamMode::Closed,
+        read_path_planner,
+        wide_exit,
+    );
+    let (_, reports) = execute(session, "wide-exit");
+    let report = reports.unwrap().remove(0);
+    assert_eq!(report.status, Status::Returned(1));
+    assert_eq!(
+        report.stages[0].detail,
+        vsh::TerminalDetail::WasiExit(u32::MAX)
+    );
+}

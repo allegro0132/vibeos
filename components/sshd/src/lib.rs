@@ -406,6 +406,23 @@ impl Drop for SecretBytes {
 /// through the exact capability supplied to this component. Protocol and
 /// session code cannot name a device, key, policy, or console directly.
 pub trait Platform: Sync {
+    #[cfg(feature = "wasi-exec")]
+    fn wasi_exec_permitted(
+        &self,
+        _profile: AuthorizedProfile,
+        _request: &vibeos_wasi_command::Request,
+    ) -> bool {
+        false
+    }
+    #[cfg(feature = "wasi-exec")]
+    fn open_wasi_exec(
+        &self,
+        _profile: AuthorizedProfile,
+        _request: vibeos_wasi_command::Request,
+    ) -> Result<Arc<vibeos_wasi_command::CommandIo>, u32> {
+        Err(126)
+    }
+
     fn packet_endpoints(
         &self,
         outbound: Cap,
@@ -2668,6 +2685,63 @@ async fn serve_connection(
                 command,
                 component: accepted_component,
             } = accepted;
+            #[cfg(feature = "wasi-exec")]
+            if let Some(request) = vibeos_wasi_command::parse_request(&command) {
+                let candidate = protocol.committed.expect("authenticated WASI request");
+                let opened = if matches!(candidate.credential, AuthCredential::PublicKey(_))
+                    && space.wasi_exec_permitted(candidate.profile, &request)
+                {
+                    space.open_wasi_exec(candidate.profile, request)
+                } else {
+                    Err(126)
+                };
+                let status = match opened {
+                    Ok(io) => match execute_wasi_with_network(
+                        io,
+                        &mut runner,
+                        &mut signer,
+                        space,
+                        control,
+                        bound_epoch,
+                        policy,
+                        stack,
+                        &mut bridge,
+                        &mut protocol,
+                        require_carrier,
+                    )
+                    .await
+                    {
+                        Ok(status) => status,
+                        Err(ConnectionEnd::Reset(reason)) => {
+                            return reset_connection(stack, reason)
+                        }
+                        Err(other) => return other,
+                    },
+                    Err(status) => status,
+                };
+                return match finish_exec(
+                    &mut runner,
+                    &mut signer,
+                    space,
+                    control,
+                    bound_epoch,
+                    policy,
+                    stack,
+                    &mut bridge,
+                    &mut protocol,
+                    #[cfg(feature = "c84-profile-request-parent")]
+                    &mut profile_run,
+                    &[],
+                    status,
+                    require_carrier,
+                )
+                .await
+                {
+                    Ok(()) => ConnectionEnd::ExecComplete(status),
+                    Err(ConnectionEnd::Reset(reason)) => reset_connection(stack, reason),
+                    Err(other) => other,
+                };
+            }
             #[cfg(feature = "qualification-stream")]
             if let Some(opened) = accepted_component
                 .is_none()
@@ -3033,6 +3107,24 @@ fn progress_protocol(
                         );
                         if vibeos_vsh::validate_ssh_exec(&value).is_ok()
                             || accepted_component.is_some()
+                            || {
+                                #[cfg(feature = "wasi-exec")]
+                                {
+                                    matches!(candidate.credential, AuthCredential::PublicKey(_))
+                                        && vibeos_wasi_command::parse_request(&value).is_some_and(
+                                            |request| {
+                                                space.wasi_exec_permitted(
+                                                    candidate.profile,
+                                                    &request,
+                                                )
+                                            },
+                                        )
+                                }
+                                #[cfg(not(feature = "wasi-exec"))]
+                                {
+                                    false
+                                }
+                            }
                             || {
                                 #[cfg(feature = "qualification-stream")]
                                 {
@@ -7056,6 +7148,25 @@ mod tests {
         component_lifecycle: Option<&'static TestManagedLifecycle>,
     }
 
+    #[cfg(feature = "wasi-exec")]
+    #[test]
+    fn authenticated_profile_has_no_implicit_wasi_authority() {
+        let platform = TestPolicyPlatform {
+            component_policy: None,
+            secondary_component_policy: None,
+            component_lifecycle: None,
+        };
+        let profile = AuthorizedProfile {
+            generation: 1,
+            profile: CapabilityProfileId::new(1).unwrap(),
+        };
+        for source in ["wasm-run hello.wasm", "wasm-upload hello.wasm 1 0000000000000000000000000000000000000000000000000000000000000000"] {
+            let request = vibeos_wasi_command::parse_request(source).unwrap();
+            assert!(!platform.wasi_exec_permitted(profile, &request));
+            assert!(platform.open_wasi_exec(profile, request).is_err());
+        }
+    }
+
     fn component_policy(
         profile: AuthorizedProfile,
         incarnation: u64,
@@ -7636,5 +7747,152 @@ mod tests {
             TerminalDetail::Component(ComponentTerminal::Success)
         );
         assert_eq!(lifecycle.started_invocations(), 1);
+    }
+}
+
+#[cfg(feature = "wasi-exec")]
+struct WasiExecGuard(Arc<vibeos_wasi_command::CommandIo>);
+#[cfg(feature = "wasi-exec")]
+impl Drop for WasiExecGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// Binary duplex SSH exec: bounded staging, separate stderr, and no VSH text
+/// decoding on application bytes. The guard cancels on every disconnect path.
+#[cfg(feature = "wasi-exec")]
+#[allow(clippy::too_many_arguments)]
+async fn execute_wasi_with_network(
+    io: Arc<vibeos_wasi_command::CommandIo>,
+    runner: &mut Runner<'_, Server>,
+    signer: &mut CapabilityHostSigner<'_>,
+    space: &Space,
+    control: Cap,
+    bound_epoch: u64,
+    policy: Cap,
+    stack: &mut dyn TcpTransport,
+    bridge: &mut WireBridge,
+    protocol: &mut ProtocolState,
+    require_carrier: bool,
+) -> Result<u32, ConnectionEnd> {
+    let _guard = WasiExecGuard(io.clone());
+    let mut input = [0u8; 1024];
+    let (mut input_len, mut input_at) = (0, 0);
+    let mut input_closed = false;
+    let mut output = [[0u8; 1024]; 2];
+    let mut output_len = [0usize; 2];
+    let mut output_at = [0usize; 2];
+    let started = monotonic_ms();
+    loop {
+        if monotonic_ms().saturating_sub(started) > 120_000 {
+            return Err(ConnectionEnd::Reset("WASI exec timed out"));
+        }
+        validate_network_authority(space, control, bound_epoch, require_carrier)
+            .map_err(ConnectionEnd::Rebind)?;
+        let candidate = protocol
+            .committed
+            .ok_or(ConnectionEnd::Reset("WASI authorization lost"))?;
+        if !revalidate_candidate(space, policy, signer, candidate).map_err(ConnectionEnd::Reset)? {
+            return Err(ConnectionEnd::Reset("WASI authorization revoked"));
+        }
+        let wire = bridge
+            .drive(runner, stack, monotonic_ms())
+            .map_err(ConnectionEnd::Reset)?;
+        if wire.ended {
+            return Err(ConnectionEnd::Reset("WASI peer disconnected"));
+        }
+        let signal = progress_protocol(runner, signer, space, policy, protocol)
+            .map_err(ConnectionEnd::Reset)?;
+        if matches!(signal, ProtocolSignal::Defunct) {
+            return Err(ConnectionEnd::Reset("WASI SSH channel closed"));
+        }
+        let channel = protocol
+            .channel
+            .as_ref()
+            .ok_or(ConnectionEnd::Reset("WASI SSH channel missing"))?;
+        if runner.is_channel_closed(channel) {
+            return Err(ConnectionEnd::Reset("WASI SSH channel closed"));
+        }
+        let mut worked = false;
+        // Network polling supplies the wake clock; no guest executes using this
+        // context. Guest-side pipe waits use their actual executor context.
+        {
+            let mut cx = core::task::Context::from_waker(core::task::Waker::noop());
+            if !input_closed && input_at == input_len {
+                input_at = 0;
+                input_len = 0;
+                if let Some((number, data, ready)) = runner.read_channel_ready() {
+                    if number != channel.num() || data != ChanData::Normal {
+                        return Err(ConnectionEnd::Reset("invalid WASI stdin channel"));
+                    }
+                    input_len = runner
+                        .read_channel(channel, ChanData::Normal, &mut input[..ready.min(1024)])
+                        .map_err(|_| ConnectionEnd::Reset("WASI stdin failed"))?;
+                    worked |= input_len != 0;
+                }
+            }
+            if !input_closed && input_at < input_len {
+                match io.stdin.write(&mut cx, &input[input_at..input_len]) {
+                    Poll::Ready(Ok(n)) => {
+                        input_at += n;
+                        worked |= n != 0;
+                    }
+                    Poll::Ready(Err(_)) => {
+                        input_closed = true;
+                    }
+                    Poll::Pending => (),
+                }
+            }
+            if !input_closed
+                && input_at == input_len
+                && runner.read_channel_ready().is_none()
+                && runner.is_channel_eof(channel)
+            {
+                io.stdin.close();
+                input_closed = true;
+                worked = true;
+            }
+            for index in 0..2 {
+                if output_at[index] == output_len[index] {
+                    output_at[index] = 0;
+                    output_len[index] = 0;
+                    let pipe = if index == 0 { &io.stdout } else { &io.stderr };
+                    if let Poll::Ready(Ok(n)) = pipe.read(&mut cx, &mut output[index]) {
+                        output_len[index] = n;
+                        worked |= n != 0;
+                    }
+                }
+                if output_at[index] < output_len[index] {
+                    let data = if index == 0 {
+                        ChanData::Normal
+                    } else {
+                        ChanData::Stderr
+                    };
+                    match runner.write_channel(
+                        channel,
+                        data,
+                        &output[index][output_at[index]..output_len[index]],
+                    ) {
+                        Ok(n) => {
+                            output_at[index] += n;
+                            worked |= n != 0;
+                        }
+                        Err(sunset::Error::NoRoom { .. } | sunset::Error::BusySend { .. }) => (),
+                        Err(_) => return Err(ConnectionEnd::Reset("WASI output closed")),
+                    }
+                }
+            }
+            if let Some(t) = io.terminal() {
+                if io.stdout.drained() && io.stderr.drained() && output_at == output_len {
+                    return Ok(vibeos_wasi_command::exit_status(t));
+                }
+            }
+        }
+        cooperate(
+            wire.worked || worked || matches!(signal, ProtocolSignal::Progressed),
+            wire.next_poll_delay_ms,
+        )
+        .await;
     }
 }

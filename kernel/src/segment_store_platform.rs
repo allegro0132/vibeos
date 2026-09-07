@@ -13,7 +13,7 @@ use core::cell::UnsafeCell;
 use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use core::task::{Context, Poll};
 
 use alloc::boxed::Box;
@@ -26,7 +26,7 @@ use vibeos_core::cap::{Cap, InvocationLease, Resource, Rights};
 use vibeos_core::heap::OwnerId;
 #[cfg(feature = "file-tree")]
 use vibeos_file_store::{FileError, FileTreeBackend, FileTreeFuture, FileTreeRoot, FsTransaction};
-use vibeos_segment_format::{PAGE_SIZE, Page, StoreUuid};
+use vibeos_segment_format::{Page, StoreUuid, PAGE_SIZE};
 use vibeos_segment_store::{
     ColdScrubEvidence, FormatOptions, FormatProbe, GrowablePageDevice, LegacyFormatProbe,
     MigrationControl, MigrationController, MigrationError, MigrationState, MigrationTransition,
@@ -614,6 +614,8 @@ pub(crate) use vibeos_segment_store::{
 /// The two non-overlapping page devices owned by the trusted migration
 /// coordinator. Neither handle is installed into init or a client CSpace.
 pub(crate) struct StorageV2Devices {
+    #[cfg(feature = "file-tree")]
+    home_file_tree: SpinLock<Option<Arc<FileTreeRoot>>>,
     backend: Arc<Space>,
     legacy_writer: Cap,
     legacy_reader: Cap,
@@ -1015,13 +1017,12 @@ impl FileTreeBackend for KernelFileTreeBackend {
                             // reclaim dead segments and retry once.
                             if let Ok(mut operation) = self.runtime.begin() {
                                 let _ = poll_as_system(operation.store().collect_garbage()).await;
-                                if let Ok(view) = poll_as_system(
-                                    recover_recognized_persistent_authority(
+                                if let Ok(view) =
+                                    poll_as_system(recover_recognized_persistent_authority(
                                         operation.store(),
                                         crate::durable_cspace::storage_v2_external_policy_sha256(),
-                                    ),
-                                )
-                                .await
+                                    ))
+                                    .await
                                 {
                                     self.runtime.publish_authority(view);
                                 }
@@ -2367,6 +2368,8 @@ impl StorageV2Devices {
         }
         Ok(Self {
             backend: backend.clone(),
+            #[cfg(feature = "file-tree")]
+            home_file_tree: SpinLock::new(None),
             legacy_writer,
             legacy_reader,
             legacy_write_frozen: system_arc(AtomicBool::new(false)),
@@ -2403,8 +2406,21 @@ impl StorageV2Devices {
     pub(crate) async fn recover_file_tree_root(
         &self,
         namespace: u128,
-    ) -> Result<FileTreeRoot, FileError> {
-        self.runtime.recover_file_tree(namespace).await
+    ) -> Result<Arc<FileTreeRoot>, FileError> {
+        // One live authority per home namespace: local VSH and SSH must share
+        // publication state and the writer claim, not independently recovered views.
+        const HOME_NAMESPACE: u128 = 0x5649_4245_4f53_2d46_494c_4554_5245_4501;
+        if namespace == HOME_NAMESPACE {
+            if let Some(root) = self.home_file_tree.lock().as_ref() {
+                return Ok(root.clone());
+            }
+        }
+        let root = system_arc(self.runtime.recover_file_tree(namespace).await?);
+        if namespace != HOME_NAMESPACE {
+            return Ok(root);
+        }
+        let mut home = self.home_file_tree.lock();
+        Ok(home.get_or_insert(root).clone())
     }
 
     /// Bind the sole unified facade so migration can prove no legacy journal

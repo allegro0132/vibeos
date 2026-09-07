@@ -24,7 +24,7 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use vibeos_core::cap::Resource;
 use vibeos_core::sync::SpinLock;
 
@@ -375,7 +375,10 @@ pub struct StagedFileContent {
 impl FsContentStager {
     pub async fn push(&mut self, mut bytes: &[u8]) -> Result<(), FileError> {
         while !bytes.is_empty() {
-            let take = core::cmp::min(PERSISTENT_STAGE_CHUNK_SIZE - self.pending.len(), bytes.len());
+            let take = core::cmp::min(
+                PERSISTENT_STAGE_CHUNK_SIZE - self.pending.len(),
+                bytes.len(),
+            );
             self.pending.extend_from_slice(&bytes[..take]);
             bytes = &bytes[take..];
             if self.pending.len() == PERSISTENT_STAGE_CHUNK_SIZE {
@@ -502,8 +505,28 @@ impl FileTreeRoot {
     pub fn is_persistent(&self) -> bool {
         self.inner.backend.is_some()
     }
-    pub fn reader(&self, path: &RelPath) -> Result<FsFileReader, FileError> {
+    /// Pin metadata and content from one namespace generation, rejecting symlinks.
+    pub fn regular_reader(&self, path: &RelPath) -> Result<(Metadata, FsFileReader), FileError> {
         let snapshot = self.inner.state.lock().clone();
+        let lease = FsSnapshotLease {
+            state: snapshot.clone(),
+        };
+        let metadata = lease.stat(path, false)?;
+        if metadata.file_type != FileType::Regular
+            || lease.canonical_path(path)? != path.to_selector_string()
+        {
+            return Err(FileError::InvalidType);
+        }
+        Ok((metadata, self.reader_in(snapshot, path)?))
+    }
+    pub fn reader(&self, path: &RelPath) -> Result<FsFileReader, FileError> {
+        self.reader_in(self.inner.state.lock().clone(), path)
+    }
+    fn reader_in(
+        &self,
+        snapshot: Arc<NamespaceState>,
+        path: &RelPath,
+    ) -> Result<FsFileReader, FileError> {
         let id = snapshot.resolve(path, true)?;
         match &snapshot.inodes.get(&id).ok_or(FileError::NotFound)?.content {
             Content::File(chunks) => Ok(FsFileReader {
@@ -602,6 +625,7 @@ impl FileTreeRoot {
             working: (*snapshot).clone(),
             edits: 0,
             committed: false,
+            cancellation: None,
         })
     }
     pub fn recover_writer_claim(&self, owner: u64, token: u64) -> bool {
@@ -648,9 +672,31 @@ pub struct FsTransaction {
     working: NamespaceState,
     edits: usize,
     committed: bool,
+    cancellation: Option<Arc<AtomicBool>>,
 }
 
 impl FsTransaction {
+    /// Recheck cancellation after backend waits, before entering the atomic
+    /// root-publication operation. Once publication starts it completes atomically.
+    pub fn cancel_on(&mut self, flag: Arc<AtomicBool>) {
+        self.cancellation = Some(flag);
+    }
+
+    fn check_publication(&self) -> Result<(), FileError> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            Err(FileError::Conflict)
+        } else {
+            Ok(())
+        }
+    }
+    pub fn base_generation(&self) -> u64 {
+        self.base_generation
+    }
+
     pub async fn commit_authoritative(self) -> Result<u64, FileError> {
         let backend = self.root.backend.clone();
         match backend {
@@ -1170,6 +1216,7 @@ impl FsTransaction {
         Ok(())
     }
     pub fn commit(mut self) -> Result<u64, FileError> {
+        self.check_publication()?;
         let generation = self.next_generation()?;
         self.working.generation = generation;
         let mut published = self.root.state.lock();
@@ -1220,6 +1267,20 @@ mod tests {
             b"hello"
         );
         assert_eq!(old.stat(&path("etc"), true), Err(FileError::NotFound));
+    }
+
+    #[test]
+    fn cancelled_publication_preserves_generation_and_releases_writer() {
+        let root = FileTreeRoot::new_empty(321).unwrap();
+        let mut tx = root.begin().unwrap();
+        tx.mkdir(&RelPath::parse("cancelled").unwrap(), false)
+            .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        tx.cancel_on(cancel.clone());
+        cancel.store(true, Ordering::Release);
+        assert_eq!(tx.commit(), Err(FileError::Conflict));
+        assert_eq!(root.snapshot().generation(), 0);
+        assert!(root.begin().is_ok());
     }
 
     #[test]

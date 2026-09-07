@@ -1,0 +1,9 @@
+[package]
+name = "vibeos-wasi-command"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+vibeos-core = { path = "../../core" }
+vibeos-file-store = { path = "../file-store" }
+vibeos-wasi-runtime = { path = "../../wasi-runtime" }
+sha2 = { version = "=0.11.0", default-features = false }

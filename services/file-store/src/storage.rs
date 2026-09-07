@@ -262,6 +262,7 @@ impl FsTransaction {
         principal: Option<&StoragePrincipal>,
         maintenance: Option<&StoreMaintenance>,
     ) -> Result<u64, PersistentCommitError<D::Error>> {
+        self.check_publication()?;
         let generation = self.next_generation()?;
         self.working.generation = generation;
         for inode in self.working.inodes.values_mut() {
@@ -312,6 +313,7 @@ impl FsTransaction {
             // for the root-policy switch.
             let inode_inputs = build_node_inputs(&inode_entries, Some(&content))?;
             let dirent_inputs = build_node_inputs(&dirent_entries, None)?;
+            self.check_publication()?;
             store
                 .commit_fs_transaction_with_root_switch_for_maintenance(
                     maintenance,
@@ -337,6 +339,7 @@ impl FsTransaction {
                     maintenance,
                 )
                 .await?;
+            self.check_publication()?;
             match maintenance {
                 Some(maintenance) => {
                     store

@@ -4453,12 +4453,42 @@ impl ManagedComponentContract {
 pub struct CapabilityCommandContext {
     pub args: Vec<ResolvedArgument>,
     cspace: Arc<SpinLock<CSpace>>,
+    command: Cap,
     stdin: LocalIo,
     stdout: LocalIo,
+    stderr: LocalIo,
+    exit_code: Arc<AtomicU64>,
     job: JobControl,
 }
 
 impl CapabilityCommandContext {
+    /// A supervisor may revalidate the command and its source authority at each
+    /// guest quantum, even while the command adapter waits for I/O.
+    pub fn authority_check(
+        &self,
+        source: Cap,
+        rights: Rights,
+    ) -> impl Fn() -> bool + Send + Sync + 'static {
+        let space = self.cspace.clone();
+        let command = self.command;
+        move || {
+            let space = space.lock();
+            space
+                .rights_of(command)
+                .is_ok_and(|r| r.contains(Rights::INVOKE))
+                && space.rights_of(source).is_ok_and(|r| r.contains(rights))
+        }
+    }
+    pub fn cancelled(&self) -> bool {
+        !self.job.live.load(Ordering::Acquire)
+    }
+    pub fn record_exit_code(&self, code: u32) {
+        self.exit_code.store(u64::from(code) + 1, Ordering::Release);
+    }
+    pub async fn write_stderr(&self, bytes: Vec<u8>) -> Status {
+        write_all(&self.cspace, &self.stderr, bytes, &self.job).await
+    }
+
     pub fn lookup<T: Resource>(
         &self,
         cap: Cap,
@@ -5083,6 +5113,7 @@ fn validate_managed_component_io_source(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TerminalDetail {
     Command(Status),
+    WasiExit(u32),
     Component(ComponentTerminal),
 }
 
@@ -8983,11 +9014,15 @@ async fn run_stage(stage: &PreparedStage, job: &JobControl) -> StageExit {
             let Some(args) = stage.resolved_args.clone() else {
                 return command_exit(Status::Faulted);
             };
-            match command(CapabilityCommandContext {
+            let exit_code = Arc::new(AtomicU64::new(0));
+            let status = match command(CapabilityCommandContext {
                 args,
                 cspace: stage.cspace.clone(),
+                command: stage.command,
                 stdin: stage.stdin.clone(),
                 stdout: stage.stdout.clone(),
+                stderr: stage._stderr.clone(),
+                exit_code: exit_code.clone(),
                 job: job.clone(),
             })
             .await
@@ -8997,7 +9032,15 @@ async fn run_stage(stage: &PreparedStage, job: &JobControl) -> StageExit {
                     write_all(&stage.cspace, &stage.stdout, output.into_bytes(), job).await
                 }
                 Err(status) => status,
+            };
+            let code = exit_code.load(Ordering::Acquire);
+            if code != 0 {
+                return StageExit {
+                    status,
+                    detail: TerminalDetail::WasiExit((code - 1) as u32),
+                };
             }
+            status
         }
         Applet::Component { manifest, runner } => {
             return run_component_stage(stage, job, manifest.clone(), runner.clone()).await;

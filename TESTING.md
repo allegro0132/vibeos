@@ -1,5 +1,11 @@
 # Testing VibeOS
 
+Raw WASI Preview 1 has its own [build and acceptance workflow](docs/WASI.md#repeatable-acceptance):
+`cargo test --locked --offline -p vibeos-wasi-runtime -p vibeos-wasi-command`,
+real Rust/C standard-library fixtures, the pinned Wasmtime 48.0.0 oracle, and
+`scripts/test-wasi-qemu.py` for OpenSSH upload/execution and restart persistence.
+This gate is independent of the historical Component qualification campaigns.
+
 Four layers, cheapest first. Run them all before pushing.
 
 ```sh

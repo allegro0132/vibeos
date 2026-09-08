@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+wasi-benchmark = ["vibeos-kernel/wasi-benchmark"]
 wasi-preview1 = ["vibeos-kernel/wasi-preview1"]
 wasi-ssh-upload = ["vibeos-kernel/wasi-ssh-upload"]
 wasi-ssh = ["vibeos-kernel/wasi-ssh"]

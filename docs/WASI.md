@@ -121,6 +121,7 @@ Omitted memory/table maxima are supported; the host limiter remains authoritativ
 | `fd_seek`, `fd_tell` | `SPIPE` for open standard streams |
 | `fd_prestat_get`, `fd_prestat_dir_name` | `BADF`; no preopened directories |
 | `proc_exit` | Non-returning, preserves the full `u32` status |
+| `clock_time_get`, `clock_res_get` | Explicit embedding clocks; QEMU supplies realtime (Goldfish RTC) and monotonic (RISC-V timebase), in nanoseconds |
 | Other known Preview 1 imports | Linked with exact signatures; return `NOSYS` |
 | Unknown imports or incorrect signatures | Rejected before execution |
 
@@ -148,9 +149,24 @@ permission denial and resource exhaustion. SSH maps non-exit terminals to 125,
 own process exit status may truncate that value. Vsh preserves 1–255, maps larger
 nonzero guest values to status 1, and retains the original in `TerminalDetail::WasiExit`.
 
-There is no guest filesystem, networking, clock, random source, threading, or
+There is no guest filesystem, networking, random source, threading, or
 promise of the complete WASI standard world. Standard libraries may import such
 functions successfully but receive `NOSYS` if they use them.
+
+Clock IDs 2/3 (CPU time) return `NOSYS`; invalid IDs return `INVAL`. The complete
+8-byte result range is checked before consulting the embedding, including
+unaligned results. Clock providers are optional and default to `NOSYS` in the
+standalone runtime. The QEMU execution service grants clock reads along with
+stdio; revocation still terminates the invocation. Milk-V has monotonic time
+only, with no fabricated Unix epoch. Precision is an allowed error hint; these
+providers return the current counter without intentional coarsening.
+
+The explicit `wasi-benchmark` firmware feature raises total fuel to 10 billion;
+the ordinary image remains at 10 million and both yield every 10,000 fuel.
+All other memory, output, authorization, cancellation and concurrency limits
+are unchanged. Run `WASI_BENCHMARK=1 scripts/run-wasi-qemu.sh` for the benchmark
+image and real-time QEMU clock configuration (no `icount`). See
+[CoreMark](COREMARK_WASI.md) for benchmark methodology and reproduction.
 
 ## Repeatable acceptance
 

@@ -22,6 +22,7 @@ pub const PLIC_BASE: usize = 0x0c00_0000;
 pub const PLIC_MMIO_END: usize = PLIC_BASE + 0x0040_0000;
 pub const PLIC_MAX_IRQ: u32 = 1023;
 pub const UART_BASE: usize = 0x1000_0000;
+pub const RTC_BASE: usize = 0x0010_1000;
 pub const UART_IRQ: u32 = 10;
 pub const UART_REG_SHIFT: usize = 0;
 pub const UART_REG_WIDTH: usize = 1;
@@ -57,6 +58,7 @@ pub const CONSOLE_CAPABILITIES: ConsoleCapabilities = ConsoleCapabilities {
 };
 
 pub const MEMORY_MAP: &[MemoryRegion] = &[
+    MemoryRegion::mmio("goldfish RTC", RTC_BASE, RTC_BASE + 0x1000),
     MemoryRegion::ram("kernel RAM", RAM_START, RAM_END),
     MemoryRegion::mmio("PLIC", PLIC_BASE, PLIC_MMIO_END),
     MemoryRegion::mmio("platform devices", DEVICE_MMIO_START, DEVICE_MMIO_END),
@@ -66,6 +68,7 @@ pub const MEMORY_MAP: &[MemoryRegion] = &[
 ];
 
 pub const MMIO_MAPPINGS: &[IdentityMapping] = &[
+    IdentityMapping::pages("goldfish RTC", RTC_BASE, RTC_BASE + 0x1000),
     IdentityMapping::pages("platform devices", DEVICE_MMIO_START, DEVICE_MMIO_END),
     IdentityMapping::megapages("PCI ECAM", PCI_ECAM_START, PCI_ECAM_END),
     IdentityMapping::pages("PCI I/O", PCI_IO_START, PCI_IO_END),
@@ -78,7 +81,7 @@ pub const MMU: MmuDescription = MmuDescription {
     mmio_attributes: MemoryAttributes::Standard,
     identity_mappings: MMIO_MAPPINGS,
     device_level1_tables: 1,
-    device_level0_tables: 4,
+    device_level0_tables: 5,
 };
 
 /// Board hardware-reset fallback. QEMU's OpenSBI performs a real SBI SRST

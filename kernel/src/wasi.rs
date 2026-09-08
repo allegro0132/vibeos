@@ -27,8 +27,64 @@ use vibeos_vsh::{
     PlannerError, ResolvedArgument, Span, Status,
 };
 use vibeos_wasi_command::{CommandIo, GuestIo};
-use vibeos_wasi_runtime::{WasiInvocation, WasiLimits, WasiTerminal};
+use vibeos_wasi_runtime::{
+    WasiClockError, WasiInvocation, WasiIo, WasiIoError, WasiLimits, WasiTerminal,
+};
 static BUSY: AtomicBool = AtomicBool::new(false);
+// A low-register read latches the high register globally; serialize the pair.
+#[cfg(feature = "qemu-virt")]
+static RTC_LOCK: SpinLock<()> = SpinLock::new(());
+struct KernelIo<'a>(GuestIo<'a>);
+impl WasiIo for KernelIo<'_> {
+    fn read(&mut self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<Result<usize, WasiIoError>> {
+        self.0.read(cx, bytes)
+    }
+    fn write(
+        &mut self,
+        cx: &mut Context<'_>,
+        fd: u32,
+        bytes: &[u8],
+    ) -> Poll<Result<usize, WasiIoError>> {
+        self.0.write(cx, fd, bytes)
+    }
+    fn clock_time(&mut self, id: u32, _precision: u64) -> Result<u64, WasiClockError> {
+        match id {
+            #[cfg(feature = "qemu-virt")]
+            0 => {
+                let _lock = RTC_LOCK.lock();
+                // SAFETY: QEMU virt's BSP maps these two 32-bit RTC registers.
+                // TIME_LOW latches TIME_HIGH; neither read changes the RTC time.
+                let ns = unsafe {
+                    let low = core::ptr::read_volatile(crate::platform::RTC_BASE as *const u32);
+                    let high =
+                        core::ptr::read_volatile((crate::platform::RTC_BASE + 4) as *const u32);
+                    (u64::from(high) << 32) | u64::from(low)
+                };
+                Ok(ns)
+            }
+            1 => u64::try_from(
+                u128::from(crate::sbi::time()) * 1_000_000_000 / u128::from(exec::timebase_hz()),
+            )
+            .map_err(|_| WasiClockError::Failed),
+            _ => Err(WasiClockError::Unsupported),
+        }
+    }
+    fn clock_resolution(&mut self, id: u32) -> Result<u64, WasiClockError> {
+        match id {
+            #[cfg(feature = "qemu-virt")]
+            0 => Ok(1),
+            1 => Ok(1_000_000_000u64.div_ceil(exec::timebase_hz())),
+            _ => Err(WasiClockError::Unsupported),
+        }
+    }
+}
+fn invocation_limits() -> WasiLimits {
+    WasiLimits {
+        #[cfg(feature = "wasi-benchmark")]
+        total_fuel: 10_000_000_000,
+        ..WasiLimits::default()
+    }
+}
 struct Endpoint;
 impl Resource for Endpoint {
     fn kind(&self) -> &'static str {
@@ -86,7 +142,7 @@ impl Future for Guest {
             let _ = i;
         }
         if this.instance.is_none() {
-            match WasiInvocation::new(&job.bytes, &job.argv, WasiLimits::default()) {
+            match WasiInvocation::new(&job.bytes, &job.argv, invocation_limits()) {
                 Ok(instance) => {
                     this.instance = Some(instance);
                     crate::println!("WASI running");
@@ -106,7 +162,7 @@ impl Future for Guest {
             .instance
             .as_mut()
             .unwrap()
-            .poll(cx, &mut GuestIo(&job.io))
+            .poll(cx, &mut KernelIo(GuestIo(&job.io)))
         {
             Poll::Pending => Poll::Pending,
             Poll::Ready(t) => {

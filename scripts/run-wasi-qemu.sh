@@ -4,9 +4,20 @@ set -eu
 cd "$(dirname "$0")/.."
 work=${WASI_WORK_DIR:-target/wasi-qemu}
 port=${WASI_SSH_PORT:-22222}
+feature=wasi-ssh-upload
+set -- -icount shift=0,align=off,sleep=off
+memory=128M
+harts=4
+if [ "${WASI_BENCHMARK:-0}" = 1 ]; then
+  feature=wasi-benchmark
+  # Real virtual-clock progression, without instruction-count time dilation.
+  set -- -rtc base=utc,clock=vm
+  memory=1G
+  harts=1
+fi
 mkdir -p "$work"
 if [ "${WASI_SKIP_BUILD:-0}" != 1 ]; then
-  (cd firmware/qemu-virt && cargo build --locked --offline --release --features wasi-ssh-upload)
+  (cd firmware/qemu-virt && cargo build --locked --offline --release --features "$feature")
 fi
 python3 - "$work" "$port" <<'PY'
 import importlib.util, pathlib, sys
@@ -26,8 +37,8 @@ with open(sys.argv[1],'xb') as f:f.truncate(128*1024*1024)
 PY
 fi
 exec qemu-system-riscv64 \
-  -machine virt -cpu rv64 -smp 4 -m 128M -accel tcg,thread=single \
-  -icount shift=0,align=off,sleep=off -nographic -bios default \
+  -machine virt -cpu rv64 -smp "$harts" -m "$memory" -accel tcg,thread=single \
+  "$@" -nographic -bios default \
   -kernel target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt \
   -object rng-random,id=wasi-rng,filename=/dev/urandom \
   -device virtio-rng-device,rng=wasi-rng,bus=virtio-mmio-bus.1 \

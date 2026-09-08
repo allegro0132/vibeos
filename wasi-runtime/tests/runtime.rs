@@ -262,3 +262,97 @@ fn pending_input_does_not_burn_fuel_and_can_be_denied() {
         Poll::Ready(WasiTerminal::Denied)
     );
 }
+
+#[test]
+fn clocks_validate_pointers_and_preserve_full_nanoseconds() {
+    struct Clock {
+        calls: usize,
+        error: Option<WasiClockError>,
+    }
+    impl WasiIo for Clock {
+        fn read(&mut self, _: &mut Context<'_>, _: &mut [u8]) -> Poll<Result<usize, WasiIoError>> {
+            unreachable!()
+        }
+        fn write(
+            &mut self,
+            _: &mut Context<'_>,
+            _: u32,
+            _: &[u8],
+        ) -> Poll<Result<usize, WasiIoError>> {
+            unreachable!()
+        }
+        fn clock_time(&mut self, id: u32, precision: u64) -> Result<u64, WasiClockError> {
+            self.calls += 1;
+            assert_eq!(id, 1);
+            assert_eq!(precision, u64::MAX);
+            self.error.map_or(Ok(0x123456789abcdef0), Err)
+        }
+        fn clock_resolution(&mut self, id: u32) -> Result<u64, WasiClockError> {
+            self.calls += 1;
+            assert_eq!(id, 0);
+            Ok(100)
+        }
+    }
+    let prefix = r#"(module
+        (import "wasi_snapshot_preview1" "clock_time_get" (func $t (param i32 i64 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "clock_res_get" (func $r (param i32 i32) (result i32)))
+        (memory (export "memory") 1) (func (export "_start") "#;
+    for (body, calls, error, expected) in [
+        ("i32.const 1 i64.const -1 i32.const 65529 call $t i32.const 21 i32.ne if unreachable end", 0, None, WasiTerminal::Exited(0)),
+        ("i32.const 0 i32.const -1 call $r i32.const 21 i32.ne if unreachable end", 0, None, WasiTerminal::Exited(0)),
+        ("i32.const 4 i64.const 0 i32.const 0 call $t i32.const 28 i32.ne if unreachable end", 0, None, WasiTerminal::Exited(0)),
+        ("i32.const 1 i64.const -1 i32.const 3 call $t if unreachable end i32.const 3 i64.load i64.const 0x123456789abcdef0 i64.ne if unreachable end i32.const 0 i32.const 17 call $r if unreachable end i32.const 17 i64.load i64.const 100 i64.ne if unreachable end", 2, None, WasiTerminal::Exited(0)),
+        ("i32.const 1 i64.const -1 i32.const 0 call $t i32.const 52 i32.ne if unreachable end", 1, Some(WasiClockError::Unsupported), WasiTerminal::Exited(0)),
+        ("i32.const 1 i64.const -1 i32.const 0 call $t i32.const 29 i32.ne if unreachable end", 1, Some(WasiClockError::Failed), WasiTerminal::Exited(0)),
+        ("i32.const 1 i64.const -1 i32.const 0 call $t unreachable", 1, Some(WasiClockError::Denied), WasiTerminal::Denied),
+    ] {
+        let bytes = wat::parse_str(format!("{prefix}{body}))")).unwrap();
+        let mut instance = WasiInvocation::new(&bytes, &["clock.wasm".into()], WasiLimits::default()).unwrap();
+        let mut io = Clock { calls: 0, error };
+        let mut cx = Context::from_waker(Waker::noop());
+        let terminal = loop { if let Poll::Ready(t) = instance.poll(&mut cx, &mut io) { break t; } };
+        assert_eq!(terminal, expected);
+        assert_eq!(io.calls, calls);
+    }
+}
+
+#[test]
+fn embedding_fuel_budget_has_a_hard_ceiling_and_bounded_quanta() {
+    let bytes = wat::parse_str(r#"(module (memory (export "memory") 1) (func (export "_start")))"#)
+        .unwrap();
+    assert_eq!(WasiLimits::default().total_fuel, 10_000_000);
+    for (fuel, quantum, valid) in [
+        (10_000_000_000, 10_000, true),
+        (10_000_000_001, 10_000, false),
+        (10_000_000_000, 10_001, false),
+    ] {
+        let result = WasiInvocation::new(
+            &bytes,
+            &["test.wasm".into()],
+            WasiLimits {
+                total_fuel: fuel,
+                poll_quantum: quantum,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.is_ok(), valid);
+    }
+}
+
+#[test]
+fn clocks_are_not_ambient_in_standalone_embeddings() {
+    let terminal = run(
+        r#"(module
+      (import "wasi_snapshot_preview1" "clock_time_get" (func $time (param i32 i64 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "clock_res_get" (func $res (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "_start")
+        i32.const 0 i32.const 0 call $res i32.const 52 i32.ne if unreachable end
+        i32.const 1 i64.const 0 i32.const 0 call $time i32.const 52 i32.ne if unreachable end
+        i32.const 2 i64.const 0 i32.const 0 call $time i32.const 52 i32.ne if unreachable end
+        i32.const 3 i32.const 0 call $res i32.const 52 i32.ne if unreachable end))"#,
+        &mut Io::default(),
+        WasiLimits::default(),
+    );
+    assert_eq!(terminal, WasiTerminal::Exited(0));
+}

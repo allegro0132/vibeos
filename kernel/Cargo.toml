@@ -5,6 +5,8 @@ edition = "2021"
 autobins = false
 
 [features]
+# Explicit long-running benchmark image; ordinary commands retain 10 million fuel.
+wasi-benchmark = ["wasi-ssh-upload"]
 wasi-preview1 = ["file-tree", "dep:vibeos-wasi-runtime", "dep:vibeos-wasi-command"]
 wasi-ssh-upload = ["wasi-ssh"]
 wasi-ssh = ["wasi-preview1", "ssh-test", "vibeos-sshd/wasi-exec"]

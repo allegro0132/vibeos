@@ -1,5 +1,5 @@
 //! Capability-neutral, bounded WASI Preview 1 command interpreter.
-//! All external I/O is supplied per invocation; there is no filesystem, clock,
+//! All external I/O and clocks are supplied per invocation; there is no filesystem,
 //! entropy, global linker, or ambient environment in this crate.
 #![no_std]
 #![forbid(unsafe_code)]
@@ -30,6 +30,8 @@ pub struct WasiLimits {
     pub argument_bytes: usize,
     pub arguments: usize,
     pub output_bytes: usize,
+    /// Trusted embedding budget, default 10 million, hard ceiling 10 billion.
+    /// Guest arguments cannot select this value. The poll quantum stays bounded.
     pub total_fuel: u64,
     pub poll_quantum: u64,
 }
@@ -60,7 +62,7 @@ impl WasiLimits {
             || self.argument_bytes > max.argument_bytes
             || self.output_bytes > max.output_bytes
             || self.total_fuel == 0
-            || self.total_fuel > max.total_fuel
+            || self.total_fuel > 10_000_000_000
             || self.poll_quantum == 0
             || self.poll_quantum > self.total_fuel
             || self.poll_quantum > max.poll_quantum
@@ -94,9 +96,25 @@ pub enum WasiIoError {
     Denied,
     Failed,
 }
+/// Clock access is an explicit embedding grant. No host clock is used by default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WasiClockError {
+    Unsupported,
+    Denied,
+    Failed,
+}
 /// Implementations register the supplied waker on pending I/O. A successful
 /// read/write may be short, but must never exceed the supplied slice length.
 pub trait WasiIo {
+    /// Nanoseconds since Unix epoch (0) or an unspecified monotonic origin (1).
+    /// CPU clocks (2/3) may be unsupported. Precision is an allowed error hint.
+    fn clock_time(&mut self, _id: u32, _precision: u64) -> Result<u64, WasiClockError> {
+        Err(WasiClockError::Unsupported)
+    }
+    /// Resolution in nanoseconds, strictly positive on success.
+    fn clock_resolution(&mut self, _id: u32) -> Result<u64, WasiClockError> {
+        Err(WasiClockError::Unsupported)
+    }
     fn read(&mut self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<Result<usize, WasiIoError>>;
     fn write(
         &mut self,
@@ -445,6 +463,31 @@ impl WasiInvocation {
         }
         if call.name == "fd_read" || call.name == "fd_write" {
             return self.host_io(call, cx, io);
+        }
+        if call.name == "clock_time_get" || call.name == "clock_res_get" {
+            let time = call.name == "clock_time_get";
+            let address = call.args[if time { 2 } else { 1 }];
+            // Validate the entire timestamp before consulting the embedding.
+            if !self.range(address, 8) {
+                return Poll::Ready(Ok(FAULT));
+            }
+            if call.args[0] > 3 {
+                return Poll::Ready(Ok(28)); // INVAL
+            }
+            let result = if time {
+                io.clock_time(call.args[0] as u32, call.args[1])
+            } else {
+                io.clock_resolution(call.args[0] as u32)
+            };
+            return Poll::Ready(match result {
+                Ok(0) if !time => Ok(IO),
+                Ok(ns) => Ok(self
+                    .write(address, &ns.to_le_bytes())
+                    .map_or_else(|e| e, |_| SUCCESS)),
+                Err(WasiClockError::Unsupported) => Ok(NOSYS),
+                Err(WasiClockError::Denied) => Err(WasiTerminal::Denied),
+                Err(WasiClockError::Failed) => Ok(IO),
+            });
         }
         Poll::Ready(Ok(self.host_sync(call).unwrap_or_else(|errno| errno)))
     }

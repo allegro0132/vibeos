@@ -1,5 +1,9 @@
 # CoreMark on VibeOS WASI and Debian RISC-V
 
+The measurements below record the original implementation. Subsequent
+[performance investigation and fixes](WASI_PERFORMANCE.md) improve the WASI
+median from 26.393402 to 105.579898 iterations/s using the same configuration.
+
 The unmodified [official CoreMark](https://github.com/eembc/coremark) sources and
 POSIX port execute as a raw WASI Preview 1 module. QEMU realtime and monotonic
 clocks are now available. Timed measurements require the explicit

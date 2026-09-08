@@ -13,6 +13,15 @@ lto = true
 opt-level = "z"
 debug = true
 
+# The interpreter dispatch loop is a throughput-critical hot path. Keep its
+# safety checks and fuel accounting, but compile it for speed rather than size.
+[profile.release.package.vibeos-wasmi-softfloat]
+opt-level = 3
+# Dispatch, capability lookup and allocation-domain transitions run at every
+# guest quantum, so keep these shared kernel primitives speed-optimized too.
+[profile.release.package.vibeos-core]
+opt-level = 3
+
 # The size-optimized kernel profile keeps the image small, but the storage
 # stack's software SHA-256 and codec loops are latency-critical on the
 # durable put/get path (and painfully slow under TCG emulation at -Oz).

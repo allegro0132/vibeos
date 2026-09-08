@@ -109,6 +109,8 @@ struct Job {
 struct Guest {
     job: usize,
     instance: Option<WasiInvocation>,
+    #[cfg(feature = "wasi-benchmark")]
+    profile: (u64, u64, u64), // start tick, runtime poll ticks, poll count
 }
 impl Future for Guest {
     type Output = ();
@@ -145,6 +147,10 @@ impl Future for Guest {
             match WasiInvocation::new(&job.bytes, &job.argv, invocation_limits()) {
                 Ok(instance) => {
                     this.instance = Some(instance);
+                    #[cfg(feature = "wasi-benchmark")]
+                    {
+                        this.profile.0 = crate::sbi::time();
+                    }
                     crate::println!("WASI running");
                 }
                 Err(error) => {
@@ -158,12 +164,30 @@ impl Future for Guest {
                 }
             }
         }
-        match this
+        #[cfg(feature = "wasi-benchmark")]
+        let poll_start = crate::sbi::time();
+        let outcome = this
             .instance
             .as_mut()
             .unwrap()
-            .poll(cx, &mut KernelIo(GuestIo(&job.io)))
+            .poll(cx, &mut KernelIo(GuestIo(&job.io)));
+        #[cfg(feature = "wasi-benchmark")]
         {
+            let now = crate::sbi::time();
+            this.profile.1 += now.wrapping_sub(poll_start);
+            this.profile.2 += 1;
+            if outcome.is_ready() {
+                crate::println!(
+                    "WASI profile polls={} fuel={} runtime_ticks={} wall_ticks={} hz={}",
+                    this.profile.2,
+                    this.instance.as_ref().unwrap().consumed_fuel(),
+                    this.profile.1,
+                    now.wrapping_sub(this.profile.0),
+                    exec::timebase_hz()
+                );
+            }
+        }
+        match outcome {
             Poll::Pending => Poll::Pending,
             Poll::Ready(t) => {
                 this.instance = None;
@@ -229,6 +253,8 @@ fn launch(
             Guest {
                 job: raw,
                 instance: None,
+                #[cfg(feature = "wasi-benchmark")]
+                profile: (0, 0, 0),
             },
         )
     };

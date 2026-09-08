@@ -89,6 +89,18 @@ def main():
             (work/'results.json').write_text(json.dumps(samples,indent=2)+'\n')
             print(json.dumps(sample), flush=True)
         assert (work/'boot.log').read_text().count('reclaimed=true caps=0 waiters=0') >= len(samples)+1
+        profiles = re.findall(r'WASI profile polls=(\d+) fuel=(\d+) runtime_ticks=(\d+) wall_ticks=(\d+) hz=(\d+)', (work/'boot.log').read_text())
+        if profiles:
+            runs = [record for record in records if record['command'].startswith('wasm-run ')]
+            assert len(profiles) == len(runs), 'incomplete runtime profile records'
+            data = []
+            for run, values in zip(runs, profiles):
+                polls, fuel, runtime, wall, hz = map(int, values)
+                assert 0 <= runtime <= wall and wall > 0 and hz > 0
+                data.append(dict(name=run['name'], polls=polls, fuel=fuel,
+                    runtime_seconds=runtime/hz, invocation_seconds=wall/hz,
+                    outside_poll_seconds=(wall-runtime)/hz, runtime_fraction=runtime/wall))
+            (work/'profiles.json').write_text(json.dumps(data,indent=2)+'\n')
     finally:
         vm.terminate(); vm.wait(timeout=10); log.close()
 

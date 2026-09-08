@@ -39,7 +39,7 @@ fi
 exec qemu-system-riscv64 \
   -machine virt -cpu rv64 -smp "$harts" -m "$memory" -accel tcg,thread=single \
   "$@" -nographic -bios default \
-  -kernel target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt \
+  -kernel "${WASI_KERNEL:-target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt}" \
   -object rng-random,id=wasi-rng,filename=/dev/urandom \
   -device virtio-rng-device,rng=wasi-rng,bus=virtio-mmio-bus.1 \
   -netdev "user,id=wasi-net,net=10.0.2.0/24,host=10.0.2.2,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:$port-10.0.2.15:2222" \

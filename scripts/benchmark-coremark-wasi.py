@@ -30,8 +30,12 @@ def main():
     parser.add_argument('--work', type=Path, default=ROOT/'target/coremark-benchmark/vibeos-single')
     parser.add_argument('--module', type=Path, default=ROOT/'target/coremark-wasi/coremark.wasm')
     parser.add_argument('--skip-build', action='store_true')
+    parser.add_argument('--kernel', type=Path, help='Run this existing firmware ELF (implies --skip-build)')
     args = parser.parse_args()
     os.chdir(ROOT)
+    if args.kernel:
+        args.kernel = args.kernel.resolve(strict=True)
+        args.skip_build = True
     work = args.work.resolve(); work.mkdir(parents=True, exist_ok=True)
     (work/'results.json').write_text('[]\n')
     spec = importlib.util.spec_from_file_location('peer', ROOT/'scripts/openssh-peer.py')
@@ -40,6 +44,10 @@ def main():
         sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
     command = peer._base_ssh_command('ssh', '127.0.0.1', port, 'vibe', work/'id_ed25519', work/'known_hosts', 30, None)
     env = dict(os.environ, WASI_WORK_DIR=str(work), WASI_SSH_PORT=str(port), WASI_BENCHMARK='1', WASI_SKIP_BUILD=str(int(args.skip_build)))
+    if args.kernel:
+        env['WASI_KERNEL'] = str(args.kernel)
+    else:
+        env.pop('WASI_KERNEL', None)
     records = []
     def ssh(name, request, data=b''):
         for attempt in range(4):
@@ -68,10 +76,11 @@ def main():
             assert vm.poll() is None and time.monotonic()<deadline, 'QEMU boot failed or timed out'
             time.sleep(.5)
         metadata = dict(qemu=subprocess.check_output(['qemu-system-riscv64','--version'],text=True),
-            source_revision=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
-            source_diff_sha256=hashlib.sha256(subprocess.check_output(['git','diff','HEAD'])).hexdigest(),
+            workspace_revision=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+            workspace_diff_sha256=hashlib.sha256(subprocess.check_output(['git','diff','HEAD'])).hexdigest(),
+            kernel_origin='explicit ELF' if args.kernel else 'existing build' if args.skip_build else 'built by launcher',
             module_sha256=hashlib.sha256(args.module.read_bytes()).hexdigest(),
-            kernel_sha256=hashlib.sha256((ROOT/'target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt').read_bytes()).hexdigest(),
+            kernel_sha256=hashlib.sha256((args.kernel or ROOT/'target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt').read_bytes()).hexdigest(),
             configuration=dict(machine='virt',cpu='rv64',harts=1,memory='1G',accel='tcg,thread=single',rtc='base=utc,clock=vm',icount=None,feature='wasi-benchmark'))
         (work/'environment.json').write_text(json.dumps(metadata,indent=2)+'\n')
         upload(args.module, 'coremark.wasm')

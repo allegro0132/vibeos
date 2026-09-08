@@ -91,3 +91,68 @@ hashes, UART logs and per-run results. `optimization.json` summarizes before,
 after and final poll measurements. `regression.log` and `core-regression.log`
 contain test outcomes. The original baseline remains unchanged under
 `target/coremark-benchmark/vibeos-single/`.
+
+## Follow-up: inline checked scalar memory helpers
+
+A subsequent investigation found out-of-line calls in the scalar memory path.
+For example, the previous RISC-V `memory::access::load::<u32>` included a stack
+frame, return-address/frame-pointer saves and restores, in addition to the actual
+bounds check and load. Nine small address/load/store composition helpers now use
+`#[inline(always)]`. This removes avoidable call boundaries in the instruction
+handlers while leaving overflow checks, range checks, byte order, unaligned
+access and trap behavior unchanged. No unsafe access or alignment assumption was
+introduced.
+
+The two broader compiler experiments were rejected: final-firmware `-O3` gave
+99.253470 iterations/s, and compiling the entire Wasmi numeric helper crate at
+`-O3` gave approximately 95 iterations/s. Neither override is retained. The
+previous Wasmi and kernel-core package overrides remain the only new package
+speed overrides from this investigation.
+
+The same saved pre-change ELF was rerun after the candidate on the same host,
+using the new `--kernel` option. This distinguishes a code improvement from a
+change in host conditions. Explicit-ELF runs imply `--skip-build`, and their
+metadata records the actual ELF hash separately from the current workspace.
+
+| Single-hart run | Performance samples (iterations/s) | Median |
+| --- | --- | ---: |
+| Previous ELF, contemporaneous rerun | 103.625046, 103.327770, 103.441074 | 103.441074 |
+| Checked memory helpers inlined | 133.490905, 133.312808, 133.497765 | **133.490905** |
+
+This is **1.2905×** the contemporaneous baseline, and **5.0577×** the original
+26.393402 result. Each candidate performance run completed 2,598 iterations in
+19.462, 19.488 and 19.461 seconds; validation completed in 19.451 seconds. All
+passed CRC validation. Both measured images reported 116,412 KiB of free boot
+heap, so there was no increase in this linked-memory footprint measure.
+
+Median runtime-poll time per iteration fell from 8.578 ms to 6.528 ms. The
+outside-poll fraction rose from about 11.3% to 12.9% because the inner work became
+faster; the fuel quantum and authority checks were not relaxed. The unchanged
+Debian native result is still approximately 71.34× faster, so this remains an
+interpreter-stack comparison rather than native execution parity.
+
+A new runtime test exercises 160 combinations of scalar widths, signed/unsigned
+extension, unaligned addresses, final valid accesses, out-of-bounds stores and
+independent out-of-bounds loads. The real interpreter executes these Wasm cases.
+Results, profile records and ELF identities are in
+`target/coremark-performance/memory-inline/` and `previous-recheck/`;
+`memory-optimization.json` retains the comparison and rejected experiments.
+
+Follow-up validation passed 36 host tests (one optional stdlib fixture test
+ignored), including the 160 interpreter cases above. The ordinary four-hart
+QEMU image also passed the end-to-end suite: 44 SSH requests, Rust/C commands,
+binary stdin and separate stderr, upload rejection, containment, cancellation,
+disconnect recovery, post-boot compilation/upload, and execution after reboot.
+This follow-up used five repeated invocations, not another 100-cycle run. All
+33 logged invocation lifecycles across both boots reported clean reclamation,
+zero guest capabilities and zero I/O waiters. Evidence is in
+`memory-regression.log`, `memory-acceptance-2.log` and `memory-acceptance-2/`.
+The acceptance script now checks the pinned SDK before booting QEMU.
+
+```sh
+# Run an immutable saved image rather than the mutable build output path.
+scripts/benchmark-coremark-wasi.py --kernel target/coremark-performance/memory-inline.elf \
+  --work target/coremark-performance/memory-inline-repeat
+cargo test --release --locked --offline -p vibeos-wasmi-core-softfloat \
+  -p vibeos-wasi-runtime -p vibeos-wasi-command
+```

@@ -155,6 +155,10 @@ impl_little_endian_convert_primitive!(u8, u16, u32, u64, u128, i8, i16, i32, i64
 /// # Errors
 ///
 /// If the resulting effective address overflows.
+// These small wrappers compose the checked scalar memory path. Inline them
+// into the interpreter's instruction handlers rather than paying a function
+// call and stack frame for each guest load/store. All checks stay in place.
+#[inline(always)]
 fn effective_address(ptr: u64, offset: u64) -> Result<usize, TrapCode> {
     let Some(address) = ptr.checked_add(offset) else {
         return Err(TrapCode::MemoryOutOfBounds);
@@ -168,6 +172,7 @@ fn effective_address(ptr: u64, offset: u64) -> Result<usize, TrapCode> {
 ///
 /// - If `ptr + offset` overflows.
 /// - If `ptr + offset` loads out of bounds from `memory`.
+#[inline(always)]
 pub fn load<T>(memory: &[u8], ptr: u64, offset: u64) -> Result<T, TrapCode>
 where
     T: LittleEndianConvert,
@@ -181,6 +186,7 @@ where
 /// # Errors
 ///
 /// If `address` loads out of bounds from `memory`.
+#[inline(always)]
 pub fn load_at<T>(memory: &[u8], address: usize) -> Result<T, TrapCode>
 where
     T: LittleEndianConvert,
@@ -197,6 +203,7 @@ where
 ///
 /// - If `ptr + offset` overflows.
 /// - If `ptr + offset` loads out of bounds from `memory`.
+#[inline(always)]
 pub fn load_extend<T, U>(memory: &[u8], ptr: u64, offset: u64) -> Result<T, TrapCode>
 where
     U: LittleEndianConvert + ExtendInto<T>,
@@ -210,6 +217,7 @@ where
 /// # Errors
 ///
 /// If `address` loads out of bounds from `memory`.
+#[inline(always)]
 pub fn load_extend_at<T, U>(memory: &[u8], address: usize) -> Result<T, TrapCode>
 where
     U: LittleEndianConvert + ExtendInto<T>,
@@ -223,6 +231,7 @@ where
 ///
 /// - If `ptr + offset` overflows.
 /// - If `ptr + offset` stores out of bounds from `memory`.
+#[inline(always)]
 pub fn store<T>(memory: &mut [u8], ptr: u64, offset: u64, value: T) -> Result<(), TrapCode>
 where
     T: LittleEndianConvert,
@@ -236,6 +245,7 @@ where
 /// # Errors
 ///
 /// If `address` loads out of bounds from `memory`.
+#[inline(always)]
 pub fn store_at<T>(memory: &mut [u8], address: usize, value: T) -> Result<(), TrapCode>
 where
     T: LittleEndianConvert,
@@ -251,6 +261,7 @@ where
 ///
 /// - If `ptr + offset` overflows.
 /// - If `ptr + offset` stores out of bounds from `memory`.
+#[inline(always)]
 pub fn store_wrap<T, U>(memory: &mut [u8], ptr: u64, offset: u64, value: T) -> Result<(), TrapCode>
 where
     T: WrapInto<U>,
@@ -265,6 +276,7 @@ where
 /// # Errors
 ///
 /// - If `address` stores out of bounds from `memory`.
+#[inline(always)]
 pub fn store_wrap_at<T, U>(memory: &mut [u8], address: usize, value: T) -> Result<(), TrapCode>
 where
     T: WrapInto<U>,

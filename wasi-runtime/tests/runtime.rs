@@ -356,3 +356,57 @@ fn clocks_are_not_ambient_in_standalone_embeddings() {
     );
     assert_eq!(terminal, WasiTerminal::Exited(0));
 }
+
+#[test]
+fn scalar_memory_helpers_preserve_unaligned_access_and_traps() {
+    let value = 0xfedc_ba98_f654_b2f1u64;
+    for (width, suffix) in [(1, "8"), (2, "16"), (4, "32"), (8, "")] {
+        for signed in [false, true] {
+            let extension = if width == 8 {
+                ""
+            } else if signed {
+                "_s"
+            } else {
+                "_u"
+            };
+            let shift = 64 - width * 8;
+            let expected = if signed {
+                (((value << shift) as i64) >> shift) as u64
+            } else {
+                (value << shift) >> shift
+            };
+            let function = format!(
+                r#"(func $rw (param $p i32) (result i64)
+                local.get $p i64.const 0x{value:x} i64.store{suffix} offset=1 align=1
+                local.get $p i64.load{suffix}{extension} offset=1 align=1)"#
+            );
+            for pointer in (0..16).chain([65535 - width, 65536 - width, u32::MAX]) {
+                let module = format!(
+                    r#"(module (memory (export "memory") 1) {function}
+                    (func (export "_start") i32.const {pointer} call $rw
+                    i64.const 0x{expected:x} i64.ne if unreachable end))"#
+                );
+                let expected_terminal = if pointer <= 65535 - width {
+                    WasiTerminal::Exited(0)
+                } else {
+                    WasiTerminal::Trapped
+                };
+                assert_eq!(
+                    run(&module, &mut Io::default(), WasiLimits::default()),
+                    expected_terminal,
+                    "width={width} signed={signed} pointer={pointer}"
+                );
+            }
+            // Exercise a trapping load independently of the trapping store above.
+            let module = format!(
+                r#"(module (memory (export "memory") 1)
+                (func $read (param i32) (result i64) local.get 0 i64.load{suffix}{extension} offset=1 align=1)
+                (func (export "_start") i32.const -1 call $read drop))"#
+            );
+            assert_eq!(
+                run(&module, &mut Io::default(), WasiLimits::default()),
+                WasiTerminal::Trapped
+            );
+        }
+    }
+}

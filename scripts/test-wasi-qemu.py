@@ -27,6 +27,10 @@ def main():
     env=dict(os.environ,WASI_SKIP_BUILD='1',WASI_WORK_DIR=str(work),WASI_SSH_PORT=str(port))
     command=peer._base_ssh_command('ssh','127.0.0.1',port,'vibe',work/'id_ed25519',work/'known_hosts',15,None)
     sdk=Path(os.environ['WASI_SDK_PATH'])
+    # Fail before boot/upload work if the compiler needed by the live-update
+    # test is absent (for example after a temporary SDK directory is cleaned).
+    sdk_version=subprocess.check_output([str(sdk/'bin/clang'),'--version'],text=True)
+    assert '22.1.0-wasi-sdk' in sdk_version, 'acceptance requires wasi-sdk 33'
     results=[];qemu=None;log=None
     def ssh(words,data=b'',status=0,out=None,err=b'',timeout=60):
         for attempt in range(5):
@@ -160,7 +164,7 @@ def main():
         paths=subprocess.check_output(['git','ls-files','--cached','--others','--exclude-standard','-z']).decode().split('\0')
         record['source_files_sha256']={p:hashlib.sha256((ROOT/p).read_bytes()).hexdigest() for p in paths if p and (ROOT/p).is_file()}
         record['kernel_sha256']=hashlib.sha256((ROOT/'target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt').read_bytes()).hexdigest()
-        record['wasi_sdk']=subprocess.check_output([str(sdk/'bin/clang'),'--version'],text=True)
+        record['wasi_sdk']=sdk_version
         record['post_boot_module_sha256']=hashlib.sha256((work/'changed.wasm').read_bytes()).hexdigest()
         (work/'results.json').write_text(json.dumps(record,indent=2)+'\n')
         print(f'PASS WASI_QEMU: upload, execution, lifecycle, restart; evidence: {work}',flush=True)

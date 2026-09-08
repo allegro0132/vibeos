@@ -92,6 +92,10 @@ mod foreach_tuple;
 pub mod tests;
 
 mod engine;
+#[cfg(feature = "instruction-profile")]
+pub mod instruction_profile;
+#[cfg(feature = "rv64-cache")]
+pub mod native;
 mod error;
 mod func;
 mod global;

@@ -69,7 +69,9 @@ and `-accel tcg,thread=single`. CoreMark is single-threaded. VibeOS's BSP and
 linker still use only the first 128 MiB RAM (about 114 MiB heap), with a 32 MiB
 guest allocation quota; Debian manages its full RAM allocation.
 
-The benchmark image raises total fuel from 10 million to 10 billion. Every
+The benchmark image raises total fuel from 10 million to 100 billion. This allows
+20-second measurements at the target throughput without exhausting the trusted
+budget (the module consumes approximately 755,000 fuel per iteration). Every
 10,000 fuel still yields to the scheduler. One WASI instance, 16 MiB guest linear
 memory, 32 MiB allocations, 64 KiB combined output, authorization/revocation,
 SSH disconnect and cancellation remain enforced. The 120-second SSH request

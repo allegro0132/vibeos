@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+instruction-profile = ["wasmi/instruction-profile"]
+rv64-cache = ["wasmi/rv64-cache"]
+
 [dependencies]
 wasmi = { package = "vibeos-wasmi-softfloat", path = "../vendor/wasmi-softfloat/crates/wasmi", default-features = false, features = ["extra-checks", "prefer-btree-collections"] }
 wasmparser = { version = "=0.255.0", default-features = false, features = ["features", "prefer-btree-collections", "validate"] }

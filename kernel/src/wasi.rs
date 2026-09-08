@@ -81,7 +81,7 @@ impl WasiIo for KernelIo<'_> {
 fn invocation_limits() -> WasiLimits {
     WasiLimits {
         #[cfg(feature = "wasi-benchmark")]
-        total_fuel: 10_000_000_000,
+        total_fuel: 100_000_000_000,
         ..WasiLimits::default()
     }
 }
@@ -119,81 +119,122 @@ impl Future for Guest {
         // SAFETY: SYSTEM publishes the boxed record before the child is runnable,
         // and its independent reaper frees it only after this exact child joins.
         let job = unsafe { &*(this.job as *const Job) };
-        let terminal = if job.io.cancelled() {
-            Some(if job.io.denied() {
-                WasiTerminal::Denied
+        #[cfg(feature = "wasi-rv64-cache")]
+        let mut quanta = 0;
+        loop {
+            let terminal = if job.io.cancelled() {
+                Some(if job.io.denied() {
+                    WasiTerminal::Denied
+                } else {
+                    WasiTerminal::Cancelled
+                })
+            } else if job.authority.as_ref().is_some_and(|check| !check()) {
+                Some(WasiTerminal::Denied)
             } else {
-                WasiTerminal::Cancelled
-            })
-        } else if job.authority.as_ref().is_some_and(|check| !check()) {
-            Some(WasiTerminal::Denied)
-        } else {
-            None
-        };
-        if let Some(t) = terminal {
-            this.instance = None;
-            *job.result.lock() = Some(t);
-            return Poll::Ready(());
-        }
-        for (i, cap) in job.caps.iter().enumerate() {
-            if job.space.rights_of(*cap).is_err() {
-                this.instance = None;
-                *job.result.lock() = Some(WasiTerminal::Denied);
-                return Poll::Ready(());
-            }
-            let _ = i;
-        }
-        if this.instance.is_none() {
-            match WasiInvocation::new(&job.bytes, &job.argv, invocation_limits()) {
-                Ok(instance) => {
-                    this.instance = Some(instance);
-                    #[cfg(feature = "wasi-benchmark")]
-                    {
-                        this.profile.0 = crate::sbi::time();
-                    }
-                    crate::println!("WASI running");
-                }
-                Err(error) => {
-                    crate::println!("WASI admission rejected: {:?}", error);
-                    *job.result.lock() = Some(if error == vibeos_wasi_runtime::WasiError::Limit {
-                        WasiTerminal::LimitExceeded
-                    } else {
-                        WasiTerminal::Denied
-                    });
-                    return Poll::Ready(());
-                }
-            }
-        }
-        #[cfg(feature = "wasi-benchmark")]
-        let poll_start = crate::sbi::time();
-        let outcome = this
-            .instance
-            .as_mut()
-            .unwrap()
-            .poll(cx, &mut KernelIo(GuestIo(&job.io)));
-        #[cfg(feature = "wasi-benchmark")]
-        {
-            let now = crate::sbi::time();
-            this.profile.1 += now.wrapping_sub(poll_start);
-            this.profile.2 += 1;
-            if outcome.is_ready() {
-                crate::println!(
-                    "WASI profile polls={} fuel={} runtime_ticks={} wall_ticks={} hz={}",
-                    this.profile.2,
-                    this.instance.as_ref().unwrap().consumed_fuel(),
-                    this.profile.1,
-                    now.wrapping_sub(this.profile.0),
-                    exec::timebase_hz()
-                );
-            }
-        }
-        match outcome {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(t) => {
+                None
+            };
+            if let Some(t) = terminal {
                 this.instance = None;
                 *job.result.lock() = Some(t);
-                Poll::Ready(())
+                return Poll::Ready(());
             }
+            for (i, cap) in job.caps.iter().enumerate() {
+                if job.space.rights_of(*cap).is_err() {
+                    this.instance = None;
+                    *job.result.lock() = Some(WasiTerminal::Denied);
+                    return Poll::Ready(());
+                }
+                let _ = i;
+            }
+            if this.instance.is_none() {
+                match WasiInvocation::new(&job.bytes, &job.argv, invocation_limits()) {
+                    Ok(instance) => {
+                        #[cfg(feature = "wasi-rv64-cache")]
+                        let instance = {
+                            let mut instance = instance;
+                            assert!(instance.enable_native_cache(Arc::new(NativePublisher)));
+                            instance
+                        };
+                        this.instance = Some(instance);
+                        #[cfg(feature = "wasi-benchmark")]
+                        {
+                            this.profile.0 = crate::sbi::time();
+                        }
+                        crate::println!("WASI running");
+                    }
+                    Err(error) => {
+                        crate::println!("WASI admission rejected: {:?}", error);
+                        *job.result.lock() =
+                            Some(if error == vibeos_wasi_runtime::WasiError::Limit {
+                                WasiTerminal::LimitExceeded
+                            } else {
+                                WasiTerminal::Denied
+                            });
+                        return Poll::Ready(());
+                    }
+                }
+            }
+            #[cfg(feature = "wasi-benchmark")]
+            let poll_start = crate::sbi::time();
+            let outcome = this
+                .instance
+                .as_mut()
+                .unwrap()
+                .poll(cx, &mut KernelIo(GuestIo(&job.io)));
+            #[cfg(feature = "wasi-benchmark")]
+            {
+                let now = crate::sbi::time();
+                this.profile.1 += now.wrapping_sub(poll_start);
+                this.profile.2 += 1;
+                if outcome.is_ready() {
+                    crate::println!(
+                        "WASI profile polls={} fuel={} runtime_ticks={} wall_ticks={} hz={}",
+                        this.profile.2,
+                        this.instance.as_ref().unwrap().consumed_fuel(),
+                        this.profile.1,
+                        now.wrapping_sub(this.profile.0),
+                        exec::timebase_hz()
+                    );
+                }
+            }
+            #[cfg(feature = "wasi-rv64-cache")]
+            {
+                quanta += 1;
+                // Keep each fuel boundary and authority check. Only avoid a full
+                // scheduler round trip when no other work is runnable; host I/O
+                // always returns to the executor. Bound even an idle-system batch.
+                if outcome.is_pending()
+                    && quanta < 32
+                    && this.instance.as_ref().unwrap().yielded_for_fuel()
+                    && exec::current_task_may_continue()
+                {
+                    continue;
+                }
+            }
+            return match outcome {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(t) => {
+                    #[cfg(feature = "wasi-rv64-cache")]
+                    {
+                        let (funcs, bytes, calls) =
+                            this.instance.as_ref().unwrap().native_cache_stats();
+                        crate::println!(
+                            "WASI native funcs={} bytes={} calls={}",
+                            funcs,
+                            bytes,
+                            calls
+                        );
+                    }
+                    this.instance = None;
+                    #[cfg(feature = "wasi-rv64-cache")]
+                    crate::println!(
+                        "WASI native teardown pool_pages={}",
+                        crate::code_pool::stats().live_pages
+                    );
+                    *job.result.lock() = Some(t);
+                    Poll::Ready(())
+                }
+            };
         }
     }
 }
@@ -211,7 +252,12 @@ fn launch(
     }
     // Allocate control/input storage outside the guest's reclaimable domain.
     let mut system = unsafe { heap::enter_domain(AllocationDomain::SYSTEM) };
-    let owner = match HEAP.create_owner(WasiLimits::default().allocation_bytes) {
+    let heap_budget = WasiLimits::default().allocation_bytes;
+    // Code-pool pages are outside HEAP, so reserve their hard maximum from the
+    // same invocation budget rather than allowing an additional MiB of memory.
+    #[cfg(feature = "wasi-rv64-cache")]
+    let heap_budget = heap_budget - vibeos_wasi_runtime::native::CODE_BUDGET;
+    let owner = match HEAP.create_owner(heap_budget) {
         Ok(o) => o,
         Err(_) => {
             BUSY.store(false, Ordering::Release);
@@ -617,4 +663,36 @@ pub fn open(
     });
     system.restore();
     Ok(io)
+}
+
+#[cfg(feature = "wasi-rv64-cache")]
+#[derive(Debug)]
+struct NativePublisher;
+#[cfg(feature = "wasi-rv64-cache")]
+struct NativeImage(crate::code_pool::ExecutableCode);
+#[cfg(feature = "wasi-rv64-cache")]
+impl core::fmt::Debug for NativeImage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("NativeImage")
+            .field("bytes", &self.0.byte_len())
+            .finish()
+    }
+}
+#[cfg(feature = "wasi-rv64-cache")]
+// SAFETY: code_pool owns immutable execute-only pages through this handle and
+// unseals/zeros them on Drop. Its fault reclaimer uses the exact guest domain.
+unsafe impl vibeos_wasi_runtime::native::Executable for NativeImage {
+    fn entry(&self) -> usize {
+        self.0.entry()
+    }
+}
+#[cfg(feature = "wasi-rv64-cache")]
+// SAFETY: only the trusted IR compiler calls publish. The code pool copies into
+// private RW-NX pages and completes local/remote W^X synchronization at seal.
+unsafe impl vibeos_wasi_runtime::native::CodeMemory for NativePublisher {
+    fn publish(&self, words: &[u32]) -> Option<Box<dyn vibeos_wasi_runtime::native::Executable>> {
+        let mut code = crate::code_pool::WritableCode::allocate(words.len()).ok()?;
+        code.words_mut().copy_from_slice(words);
+        Some(Box::new(NativeImage(code.seal())))
+    }
 }

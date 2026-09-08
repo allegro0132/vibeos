@@ -45,27 +45,30 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--work', type=Path, default=ROOT/'target/coremark-benchmark/debian')
     p.add_argument('--timeout', type=int, default=1200)
+    p.add_argument('--image-work', type=Path, help='Prepared image directory; benchmark output stays in --work')
+    p.add_argument('--guest-script', type=Path, help='Run a custom guest measurement/preparation script; retain raw results')
     args=p.parse_args(); work=args.work.resolve(); work.mkdir(parents=True,exist_ok=True)
     source=ROOT/'target/coremark-upstream'
     assert subprocess.check_output(['git','-C',str(source),'rev-parse','HEAD'],text=True).strip()==REVISION
     subprocess.run(['git','-C',str(source),'diff','--exit-code','HEAD','--','.'],check=True,stdout=subprocess.DEVNULL)
-    sums=(work/'SHA512SUMS').read_text()
+    image_work=(args.image_work or work).resolve()
+    sums=(image_work/'SHA512SUMS').read_text()
     expected=re.search(r'^(\w+)\s+debian-13-nocloud-riscv64.qcow2$',sums,re.M)[1]
-    assert hashlib.file_digest(open(work/'base.qcow2','rb'),'sha512').hexdigest()==expected, 'Debian base image checksum mismatch'
+    assert hashlib.file_digest(open(image_work/'base.qcow2','rb'),'sha512').hexdigest()==expected, 'Debian base image checksum mismatch'
     for filename, sha in [('vmlinux-6.12.107+deb13-riscv64', '8898c27a38f0bfcc3d9a4b0687ee752c4a2b3028576f919ba8955d2cbd6d4722'), ('initrd.img-6.12.107+deb13-riscv64', '74e9f1cb179fa2ba64363bb2196416d459827cde0443a58971f3b9a929df0d8e')]:
-        assert hashlib.sha256((work/'extracted/boot'/filename).read_bytes()).hexdigest()==sha, filename
+        assert hashlib.sha256((image_work/'extracted/boot'/filename).read_bytes()).hexdigest()==sha, filename
     inputs=work/'inputs'; inputs.mkdir(exist_ok=True)
     shutil.copytree(source,inputs/'source',ignore=shutil.ignore_patterns('.git'),dirs_exist_ok=True)
-    (inputs/'run.sh').write_text(GUEST)
+    (inputs/'run.sh').write_text(args.guest_script.read_text() if args.guest_script else GUEST)
     results=work/'results'; results.mkdir(exist_ok=True)
     (results/'results.json').write_text('[]\n')
     disk=work/'run.qcow2'
     if not disk.exists():
-        subprocess.run(['qemu-img','create','-f','qcow2','-F','qcow2','-b',str(work/'base.qcow2'),str(disk)],check=True)
+        subprocess.run(['qemu-img','create','-f','qcow2','-F','qcow2','-b',str(image_work/'base.qcow2'),str(disk)],check=True)
     command=['qemu-system-riscv64','-machine','virt','-cpu','rv64','-smp','1','-m','1G','-accel','tcg,thread=single',
         '-rtc','base=utc,clock=vm','-nographic','-bios','default',
-        '-kernel',str(work/'extracted/boot/vmlinux-6.12.107+deb13-riscv64'),
-        '-initrd',str(work/'extracted/boot/initrd.img-6.12.107+deb13-riscv64'),
+        '-kernel',str(image_work/'extracted/boot/vmlinux-6.12.107+deb13-riscv64'),
+        '-initrd',str(image_work/'extracted/boot/initrd.img-6.12.107+deb13-riscv64'),
         '-append','root=/dev/vda1 rw console=ttyS0 systemd.firstboot=off systemd.debug_shell=ttyS0 systemd.mask=serial-getty@ttyS0.service',
         '-drive',f'if=none,id=disk,format=qcow2,file={disk},cache=writeback','-device','virtio-blk-device,drive=disk',
         '-netdev','user,id=net,ipv6=off','-device','virtio-net-device,netdev=net',
@@ -94,7 +97,7 @@ def main():
         expect(b'BENCHMARK_DONE=',args.timeout); expect(b'\r\n',30)
         assert b'BENCHMARK_DONE=0' in (work/'boot.log').read_bytes(), 'Guest benchmark failed; inspect logs'
         samples=[]
-        for name in ['performance-1','performance-2','performance-3','validation']:
+        for name in ([] if args.guest_script else ['performance-1','performance-2','performance-3','validation']):
             text=(results/f'{name}.stdout').read_text()
             def value(label): return re.search(r'^'+re.escape(label)+r'\s*:\s*(\S+)',text,re.M)[1]
             sample=dict(name=name,seconds=float(value('Total time (secs)')),iterations=int(value('Iterations')),score=float(value('Iterations/Sec')))

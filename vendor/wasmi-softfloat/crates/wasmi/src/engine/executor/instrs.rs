@@ -6,20 +6,13 @@ use crate::{
         code_map::CodeMap,
         executor::stack::{CallFrame, FrameSlots, ValueStack},
         utils::unreachable_unchecked,
-        DedupFuncType,
-        EngineFunc,
+        DedupFuncType, EngineFunc,
     },
     ir::{index, BlockFuel, Const16, Offset64Hi, Op, ShiftAmount, Slot},
     memory::DataSegment,
     store::{PrunedStore, StoreInner},
     table::ElementSegment,
-    Error,
-    Func,
-    Global,
-    Memory,
-    Ref,
-    Table,
-    TrapCode,
+    Error, Func, Global, Memory, Ref, Table, TrapCode,
 };
 
 #[cfg(doc)]
@@ -72,7 +65,12 @@ pub fn execute_instrs<'engine>(
     let instance = stack.calls.instance_expect();
     let cache = CachedInstance::new(store.inner_mut(), instance);
     let mut executor = Executor::new(stack, code_map, cache);
-    if let Err(error) = executor.execute(store) {
+    let outcome = executor.execute(store);
+    #[cfg(all(feature = "rv64-cache", target_arch = "riscv64"))]
+    code_map
+        .native_calls
+        .fetch_add(executor.native_calls, core::sync::atomic::Ordering::Relaxed);
+    if let Err(error) = outcome {
         if error.is_out_of_fuel() {
             if let Some(frame) = executor.stack.calls.peek_mut() {
                 // Note: we need to update the instruction pointer to make it possible to
@@ -88,6 +86,10 @@ pub fn execute_instrs<'engine>(
 /// An execution context for executing a Wasmi function frame.
 #[derive(Debug)]
 struct Executor<'engine> {
+    #[cfg(all(feature = "rv64-cache", target_arch = "riscv64"))]
+    native_body: Option<(usize, alloc::sync::Arc<crate::native::Body>)>,
+    #[cfg(all(feature = "rv64-cache", target_arch = "riscv64"))]
+    native_calls: u64,
     /// Stores the value stack of live values on the Wasm stack.
     sp: FrameSlots,
     /// The pointer to the currently executed instruction.
@@ -120,6 +122,10 @@ impl<'engine> Executor<'engine> {
         let sp = unsafe { stack.values.stack_ptr_at(frame.base_offset()) };
         let ip = frame.instr_ptr();
         Self {
+            #[cfg(all(feature = "rv64-cache", target_arch = "riscv64"))]
+            native_body: None,
+            #[cfg(all(feature = "rv64-cache", target_arch = "riscv64"))]
+            native_calls: 0,
             sp,
             ip,
             cache,
@@ -133,6 +139,10 @@ impl<'engine> Executor<'engine> {
     fn execute(&mut self, store: &mut PrunedStore) -> Result<(), Error> {
         use Op as Instr;
         loop {
+            #[cfg(all(feature = "rv64-cache", target_arch = "riscv64"))]
+            self.execute_native(store)?;
+            #[cfg(feature = "instruction-profile")]
+            crate::instruction_profile::record(self.ip.get());
             match *self.ip.get() {
                 Instr::Trap { trap_code } => self.execute_trap(trap_code)?,
                 Instr::ConsumeFuel { block_fuel } => {
@@ -2713,5 +2723,67 @@ impl UntypedValueCmpExt for f64 {
 
     fn not_lt(x: Self, y: Self) -> bool {
         !wasm::f64_lt(x, y)
+    }
+}
+
+#[cfg(all(feature = "rv64-cache", target_arch = "riscv64"))]
+impl Executor<'_> {
+    fn execute_native(&mut self, store: &mut PrunedStore) -> Result<(), Error> {
+        use core::{mem::size_of, sync::atomic::Ordering};
+        if !self.code_map.native_enabled.load(Ordering::Acquire) || size_of::<UntypedVal>() != 8 {
+            return Ok(());
+        }
+        let ip = self.ip.get() as *const Op as usize;
+        if !self
+            .native_body
+            .as_ref()
+            .is_some_and(|(start, body)| *start <= ip && ip < body.end)
+        {
+            self.native_body = Some(self.code_map.native_body(ip)?);
+        }
+        let (start, body) = self.native_body.as_ref().unwrap();
+        let Some((image, entries, supported)) = &body.image else {
+            return Ok(());
+        };
+        let index = (ip - start) / size_of::<Op>();
+        if (ip - start) % size_of::<Op>() != 0 || index >= entries.len() {
+            return Err(TrapCode::UnreachableCodeReached.into());
+        }
+        if !supported[index] {
+            return Ok(());
+        }
+        let Ok(fuel) = store.inner().get_fuel() else {
+            return Ok(());
+        };
+        let slots = self.sp.native_base() as u64;
+        // SAFETY: CachedInstance is refreshed after every interpreter memory
+        // growth/call. No memory operation can invalidate it during native code.
+        let memory = unsafe { self.cache.memory.data_mut() };
+        let mut context = crate::native::Context {
+            slots,
+            memory: memory.as_mut_ptr() as u64,
+            memory_len: memory.len() as u64,
+            fuel,
+            resume: 0,
+            reason: 0,
+        };
+        // SAFETY: the trusted compiler supplies all offsets; Executable owns
+        // coherent immutable code, and this live frame is exclusively borrowed.
+        let entry: unsafe extern "C" fn(*mut crate::native::Context, usize) =
+            unsafe { core::mem::transmute(image.entry()) };
+        self.native_calls += 1;
+        unsafe {
+            entry(&mut context, image.entry() + entries[index] * 4);
+        }
+        store.inner_mut().set_fuel(context.fuel.min(fuel))?;
+        if context.fuel > fuel || context.resume >= entries.len() as u64 || context.reason > 2 {
+            return Err(TrapCode::UnreachableCodeReached.into());
+        }
+        if context.reason == 2 {
+            return Err(TrapCode::MemoryOutOfBounds.into());
+        }
+        self.ip =
+            InstructionPtr::new((start + context.resume as usize * size_of::<Op>()) as *const Op);
+        Ok(())
     }
 }

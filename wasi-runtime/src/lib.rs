@@ -4,6 +4,8 @@
 #![no_std]
 #![forbid(unsafe_code)]
 extern crate alloc;
+#[cfg(feature = "rv64-cache")]
+pub use wasmi::native;
 mod abi;
 mod validate;
 use abi::*;
@@ -30,7 +32,7 @@ pub struct WasiLimits {
     pub argument_bytes: usize,
     pub arguments: usize,
     pub output_bytes: usize,
-    /// Trusted embedding budget, default 10 million, hard ceiling 10 billion.
+    /// Trusted embedding budget, default 10 million, hard ceiling 100 billion.
     /// Guest arguments cannot select this value. The poll quantum stays bounded.
     pub total_fuel: u64,
     pub poll_quantum: u64,
@@ -62,7 +64,7 @@ impl WasiLimits {
             || self.argument_bytes > max.argument_bytes
             || self.output_bytes > max.output_bytes
             || self.total_fuel == 0
-            || self.total_fuel > 10_000_000_000
+            || self.total_fuel > 100_000_000_000
             || self.poll_quantum == 0
             || self.poll_quantum > self.total_fuel
             || self.poll_quantum > max.poll_quantum
@@ -161,6 +163,18 @@ pub struct WasiInvocation {
     io_ready: bool,
 }
 impl WasiInvocation {
+    /// Install the trusted code publisher before the invocation starts.
+    #[cfg(feature = "rv64-cache")]
+    pub fn enable_native_cache(
+        &mut self,
+        backend: alloc::sync::Arc<dyn native::CodeMemory>,
+    ) -> bool {
+        !self.started && self.terminal.is_none() && self.store.engine().enable_native_cache(backend)
+    }
+    #[cfg(feature = "rv64-cache")]
+    pub fn native_cache_stats(&self) -> (usize, usize, u64) {
+        self.store.engine().native_cache_stats()
+    }
     /// Caller must construct and poll inside its own quota-controlled allocation domain.
     pub fn new(bytes: &[u8], arguments: &[String], limits: WasiLimits) -> Result<Self, WasiError> {
         limits.check()?;
@@ -312,6 +326,12 @@ impl WasiInvocation {
             io_buffer: [0; IO_CHUNK],
             io_ready: false,
         })
+    }
+    /// Pending solely at a fuel boundary, without a pending host I/O call.
+    pub fn yielded_for_fuel(&self) -> bool {
+        self.terminal.is_none()
+            && self.pending.is_none()
+            && matches!(self.continuation, Some(Continuation::Fuel(_)))
     }
     pub fn consumed_fuel(&self) -> u64 {
         self.limits.total_fuel - self.fuel

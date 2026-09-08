@@ -402,6 +402,8 @@ impl Debug for FrameSlots {
 }
 
 impl FrameSlots {
+    #[cfg(all(feature = "rv64-cache", target_arch = "riscv64"))]
+    pub fn native_base(&self) -> *mut UntypedVal { self.ptr }
     /// Creates a new [`FrameSlots`].
     fn new(ptr: *mut UntypedVal) -> Self {
         Self { ptr }

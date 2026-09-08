@@ -322,9 +322,9 @@ fn embedding_fuel_budget_has_a_hard_ceiling_and_bounded_quanta() {
         .unwrap();
     assert_eq!(WasiLimits::default().total_fuel, 10_000_000);
     for (fuel, quantum, valid) in [
-        (10_000_000_000, 10_000, true),
-        (10_000_000_001, 10_000, false),
-        (10_000_000_000, 10_001, false),
+        (100_000_000_000, 10_000, true),
+        (100_000_000_001, 10_000, false),
+        (100_000_000_000, 10_001, false),
     ] {
         let result = WasiInvocation::new(
             &bytes,
@@ -409,4 +409,42 @@ fn scalar_memory_helpers_preserve_unaligned_access_and_traps() {
             );
         }
     }
+}
+
+#[test]
+fn fuel_continuation_hint_excludes_host_calls_and_terminal_states() {
+    let make = |source: &str| {
+        WasiInvocation::new(
+            &wat::parse_str(source).unwrap(),
+            &["test".into()],
+            WasiLimits {
+                total_fuel: 1000,
+                poll_quantum: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let mut io = Io::default();
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut looping =
+        make(r#"(module (memory (export "memory") 1) (func (export "_start") (loop $l br $l)))"#);
+    assert!(!looping.yielded_for_fuel());
+    assert!(looping.poll(&mut cx, &mut io).is_pending());
+    assert!(looping.yielded_for_fuel());
+    looping.cancel();
+    assert!(!looping.yielded_for_fuel());
+    let mut host = make(
+        r#"(module
+        (import "wasi_snapshot_preview1" "environ_sizes_get" (func $env (param i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (func (export "_start") i32.const 0 i32.const 4 call $env drop))"#,
+    );
+    assert!(host.poll(&mut cx, &mut io).is_pending());
+    assert!(!host.yielded_for_fuel());
+    assert_eq!(
+        host.poll(&mut cx, &mut io),
+        Poll::Ready(WasiTerminal::Exited(0))
+    );
+    assert!(!host.yielded_for_fuel());
 }

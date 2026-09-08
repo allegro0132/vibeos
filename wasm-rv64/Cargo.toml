@@ -1,0 +1,8 @@
+[package]
+name = "vibeos-wasm-rv64"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+wasmi_ir = { package = "vibeos-wasmi-ir-softfloat", path = "../vendor/wasmi-softfloat/crates/ir", default-features = false }

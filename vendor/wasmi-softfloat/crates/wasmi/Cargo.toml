@@ -15,6 +15,9 @@ path = "src/lib.rs"
 [features]
 default = ["std", "wat"]
 extra-checks = []
+# Host-only diagnostic; never enabled in firmware performance measurements.
+instruction-profile = ["std"]
+rv64-cache = ["dep:vibeos-wasm-rv64"]
 hash-collections = ["wasmi_collections/hash-collections", "wasmparser/hash-collections"]
 prefer-btree-collections = ["wasmi_collections/prefer-btree-collections", "wasmparser/prefer-btree-collections"]
 simd = ["wasmi_core/simd", "wasmi_ir/simd", "wasmparser/simd"]
@@ -25,6 +28,10 @@ wat = ["dep:wat", "std"]
 version = "=0.9.9"
 features = ["mutex", "spin_mutex", "rwlock"]
 default-features = false
+
+[dependencies.vibeos-wasm-rv64]
+path = "../../../../wasm-rv64"
+optional = true
 
 [dependencies.wasmi_collections]
 package = "vibeos-wasmi-collections-softfloat"

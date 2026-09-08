@@ -13,9 +13,7 @@ use crate::{
     errors::FuelError,
     ir::{index::InternalFunc, Op},
     module::{FuncIdx, ModuleHeader},
-    Config,
-    Error,
-    TrapCode,
+    Config, Error, TrapCode,
 };
 use alloc::boxed::Box;
 use core::{
@@ -72,6 +70,12 @@ impl ArenaIndex for EngineFunc {
 /// Datastructure to efficiently store information about compiled functions.
 #[derive(Debug)]
 pub struct CodeMap {
+    #[cfg(all(feature = "rv64-cache", target_arch = "riscv64"))]
+    pub(crate) native_calls: core::sync::atomic::AtomicU64,
+    #[cfg(feature = "rv64-cache")]
+    pub(crate) native_enabled: core::sync::atomic::AtomicBool,
+    #[cfg(feature = "rv64-cache")]
+    pub(crate) native: Mutex<crate::native::Cache>,
     funcs: Mutex<Arena<EngineFunc, FuncEntity>>,
     features: WasmFeatures,
 }
@@ -214,6 +218,12 @@ impl CodeMap {
     /// Creates a new [`CodeMap`].
     pub fn new(config: &Config) -> Self {
         Self {
+            #[cfg(feature = "rv64-cache")]
+            native_enabled: core::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(feature = "rv64-cache", target_arch = "riscv64"))]
+            native_calls: core::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "rv64-cache")]
+            native: Mutex::new(crate::native::Cache::default()),
             funcs: Mutex::new(Arena::default()),
             features: config.wasm_features(),
         }
@@ -871,5 +881,72 @@ impl<'a> CompiledFuncRef<'a> {
     #[inline]
     pub fn consts(&self) -> &'a [UntypedVal] {
         self.consts.get_ref()
+    }
+}
+
+#[cfg(all(feature = "rv64-cache", target_arch = "riscv64"))]
+impl CodeMap {
+    /// Resolve immutable compiled metadata. Executors retain the Arc while the
+    /// current function is active, avoiding map locks at every native segment.
+    pub fn native_body(
+        &self,
+        ip: usize,
+    ) -> Result<(usize, alloc::sync::Arc<crate::native::Body>), TrapCode> {
+        use crate::native::{Body, CODE_BUDGET};
+        let mut cache = self.native.lock();
+        let covered = cache
+            .bodies
+            .range(..=ip)
+            .next_back()
+            .is_some_and(|(_, body)| ip < body.end);
+        if !covered {
+            let found = {
+                let funcs = self.funcs.lock();
+                funcs
+                    .iter()
+                    .filter_map(|(_, func)| func.get_compiled())
+                    .find(|func| {
+                        let start = func.instrs().as_ptr() as usize;
+                        ip >= start && ip < start + core::mem::size_of_val(func.instrs())
+                    })
+                    .map(|func| self.adjust_cref_lifetime(func))
+            };
+            let Some(func) = found else {
+                return Err(TrapCode::UnreachableCodeReached);
+            };
+            let start = func.instrs().as_ptr() as usize;
+            let end = start + core::mem::size_of_val(func.instrs());
+            let locals = usize::from(func.len_stack_slots())
+                .checked_sub(func.consts().len())
+                .ok_or(TrapCode::UnreachableCodeReached)?;
+            let mut image = None;
+            if let Ok(code) = crate::native::compile(
+                func.instrs(),
+                locals as u16,
+                func.consts().len() as u16,
+                32768,
+            ) {
+                let charge = (code.words.len() * 4).div_ceil(4096) * 4096;
+                if code.lowered > 0 && cache.bytes + charge <= CODE_BUDGET {
+                    if let Some(published) = cache
+                        .backend
+                        .as_ref()
+                        .and_then(|backend| backend.publish(&code.words))
+                    {
+                        image = Some((published, code.entries, code.supported));
+                        cache.bytes += charge;
+                    }
+                }
+            }
+            cache
+                .bodies
+                .insert(start, alloc::sync::Arc::new(Body { end, image }));
+        }
+        let (&start, body) = cache
+            .bodies
+            .range(..=ip)
+            .next_back()
+            .ok_or(TrapCode::UnreachableCodeReached)?;
+        Ok((start, alloc::sync::Arc::clone(body)))
     }
 }

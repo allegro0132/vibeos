@@ -5,15 +5,26 @@ cd "$(dirname "$0")/.."
 work=${WASI_WORK_DIR:-target/wasi-qemu}
 port=${WASI_SSH_PORT:-22222}
 feature=wasi-ssh-upload
+if [ "${WASI_RV64_CACHE:-0}" = 1 ]; then
+  feature=wasi-rv64-cache
+fi
 set -- -icount shift=0,align=off,sleep=off
 memory=128M
 harts=4
 if [ "${WASI_BENCHMARK:-0}" = 1 ]; then
   feature=wasi-benchmark
+  if [ "${WASI_RV64_CACHE:-0}" = 1 ]; then
+    feature=wasi-benchmark,wasi-rv64-cache
+  fi
   # Real virtual-clock progression, without instruction-count time dilation.
   set -- -rtc base=utc,clock=vm
   memory=1G
   harts=1
+fi
+if [ "${WASI_DIAGNOSTIC_ICOUNT:-0}" = 1 ]; then
+  [ "${WASI_BENCHMARK:-0}" = 1 ] || { echo 'icount diagnostic requires benchmark configuration' >&2; exit 2; }
+  set -- -rtc base=utc,clock=vm -icount shift=0,align=off,sleep=off
+  echo 'WASI diagnostic: instruction-count virtual time; not a formal CoreMark score'
 fi
 mkdir -p "$work"
 if [ "${WASI_SKIP_BUILD:-0}" != 1 ]; then

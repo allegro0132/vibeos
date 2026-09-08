@@ -1026,6 +1026,48 @@ pub fn current_task_id() -> Option<TaskId> {
         .map(|running| running.id)
 }
 
+/// Whether the current poll may execute one more bounded work quantum.
+/// Recheck between quanta and impose a finite batch limit. This is only a
+/// scheduling hint: newly arriving work can race with it just as with dispatch.
+/// It never permits skipping application authority/cancellation checks.
+pub fn current_task_may_continue() -> bool {
+    let Some(hart) = current_scheduler_hart() else {
+        return false;
+    };
+    let Some(status) = CURRENT_TASK_STATUS[hart.index()].lock().clone() else {
+        return false;
+    };
+    let sched = SCHED.lock();
+    let Some(running) = sched.harts[hart.index()].running.as_ref() else {
+        return false;
+    };
+    if !Arc::ptr_eq(&running.status, &status)
+        || status.cancellation_requested()
+        || status.raw_state() != TaskState::Running as u8
+        || !sched.ready.hart_idle(hart)
+    {
+        return false;
+    }
+    if running.domain.arena.is_tracked() {
+        let key = running
+            .reclaimable_domain
+            .expect("tracked continuation has no domain key");
+        match sched.reclaimable_domains.validate_active_task(
+            key,
+            running.domain,
+            hart,
+            running.id,
+            &status,
+            running.instance_token,
+        ) {
+            Ok(_) => {}
+            Err(ReclaimableDomainError::NotActive) => return false,
+            Err(error) => panic!("tracked continuation gate mismatch: {error:?}"),
+        }
+    }
+    true
+}
+
 fn current_task_exact_wake() -> Option<ExactTaskWake> {
     let hart = current_scheduler_hart()?;
     let status = CURRENT_TASK_STATUS[hart.index()].lock().clone()?;
@@ -7303,6 +7345,31 @@ mod one_shot_wait_tests {
                 .store(self.queue.waiter_count(), Ordering::SeqCst);
             self.drops.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn bounded_continuation_yields_to_ready_work_and_cancellation() {
+        let _serial = EXECUTOR_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::arch::set_test_hart_id(0);
+        run_until_idle(10_000);
+        assert!(!current_task_may_continue());
+        let observed = Arc::new(AtomicUsize::new(0));
+        let inside = observed.clone();
+        spawn("continuation-probe", async move {
+            assert!(current_task_may_continue());
+            spawn("continuation-peer", async {});
+            assert!(!current_task_may_continue());
+            yield_now().await;
+            assert!(current_task_may_continue());
+            current_task_status().unwrap().request_cancel();
+            assert!(!current_task_may_continue());
+            inside.store(1, Ordering::SeqCst);
+        });
+        run_until_idle(10_000);
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        assert!(!current_task_may_continue());
     }
 
     #[test]

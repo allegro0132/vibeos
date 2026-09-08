@@ -1,0 +1,25 @@
+[package]
+name = "vibeos-coremark-engines"
+version = "0.1.0"
+edition = "2021"
+publish = false
+[workspace]
+[features]
+compiled = ["dep:wasmtime", "dep:wasmtime-wasi"]
+[[bin]]
+name = "wasmtime"
+path = "src/bin/wasmtime.rs"
+required-features = ["compiled"]
+[dependencies]
+vibeos-wasi-runtime = { path = "../../wasi-runtime" }
+wasmtime = { optional = true, version = "=48.0.0", default-features = false, features = ["std", "runtime", "cranelift"] }
+wasmtime-wasi = { optional = true, version = "=48.0.0", default-features = false, features = ["p1"] }
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+debug = true
+[profile.release.package.vibeos-wasmi-softfloat]
+opt-level = 3
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("instruction-profile"))'] }

@@ -106,7 +106,18 @@ def main():
         print('PASS standard Rust/C commands, arguments, binary stdin, stderr, exit',flush=True)
         subprocess.run(['python3',str(ROOT/'scripts/openssh-test-key.py'),'--fixture','rejected','--output',str(work/'rejected_key')],check=True)
         rejected=peer._base_ssh_command('ssh','127.0.0.1',port,'vibe',work/'rejected_key',work/'known_hosts',15,None)
-        denied=subprocess.run([*rejected,'wasm-run c.wasm'],input=b'',capture_output=True,timeout=20)
+        # A transport reset before key exchange is not authentication evidence.
+        # Retry only that pre-auth failure; never accept it as a denied key or
+        # retry a request that has reached the WASI service.
+        for attempt in range(5):
+            before=(work/'boot-1.log').stat().st_size
+            denied=subprocess.run([*rejected,'wasm-run c.wasm'],input=b'',capture_output=True,timeout=20)
+            observed=(work/'boot-1.log').read_bytes()[before:]
+            began=any(marker in observed for marker in (b'WASI running',b'WASI upload receiving',b'WASI admission rejected'))
+            if denied.returncode==255 and not denied.stdout and b'kex_exchange_identification:' in denied.stderr and not began:
+                time.sleep(.25)
+                continue
+            break
         assert denied.returncode!=0 and b'Permission denied (publickey)' in denied.stderr,denied
         results.append({'case':'unauthorized key','status':denied.returncode})
         time.sleep(.25)

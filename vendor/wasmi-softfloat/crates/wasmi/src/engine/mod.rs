@@ -16,12 +16,8 @@ pub(crate) use self::{
     executor::Stack,
     func_types::DedupFuncType,
     translator::{
-        FuncTranslationDriver,
-        FuncTranslator,
-        FuncTranslatorAllocations,
-        LazyFuncTranslator,
-        ValidatingFuncTranslator,
-        WasmTranslator,
+        FuncTranslationDriver, FuncTranslator, FuncTranslatorAllocations, LazyFuncTranslator,
+        ValidatingFuncTranslator, WasmTranslator,
     },
 };
 use self::{
@@ -34,15 +30,9 @@ pub use self::{
     config::{CompilationMode, Config},
     limits::{EnforcedLimits, EnforcedLimitsError, StackConfig},
     resumable::{
-        ResumableCall,
-        ResumableCallHostTrap,
-        ResumableCallOutOfFuel,
-        ResumableError,
-        ResumableHostTrapError,
-        ResumableOutOfFuelError,
-        TypedResumableCall,
-        TypedResumableCallHostTrap,
-        TypedResumableCallOutOfFuel,
+        ResumableCall, ResumableCallHostTrap, ResumableCallOutOfFuel, ResumableError,
+        ResumableHostTrapError, ResumableOutOfFuelError, TypedResumableCall,
+        TypedResumableCallHostTrap, TypedResumableCallOutOfFuel,
     },
     traits::{CallParams, CallResults},
     translator::TranslationError,
@@ -51,10 +41,7 @@ use crate::{
     collections::arena::{ArenaIndex, GuardedEntity},
     func::FuncInOut,
     module::{FuncIdx, ModuleHeader},
-    Error,
-    Func,
-    FuncType,
-    StoreContextMut,
+    Error, Func, FuncType, StoreContextMut,
 };
 use alloc::{
     sync::{Arc, Weak},
@@ -136,6 +123,39 @@ impl Default for Engine {
 }
 
 impl Engine {
+    /// Enable the explicit RV64 publisher once, before invoking guest code.
+    /// Other engines, including component engines, remain interpreter-only.
+    #[cfg(feature = "rv64-cache")]
+    pub fn enable_native_cache(&self, backend: Arc<dyn crate::native::CodeMemory>) -> bool {
+        let mut cache = self.inner.code_map.native.lock();
+        if cache.backend.is_some() {
+            return false;
+        }
+        cache.backend = Some(backend);
+        self.inner
+            .code_map
+            .native_enabled
+            .store(true, core::sync::atomic::Ordering::Release);
+        true
+    }
+    /// Cached function count, reserved code bytes, native entry calls.
+    #[cfg(feature = "rv64-cache")]
+    pub fn native_cache_stats(&self) -> (usize, usize, u64) {
+        #[cfg(target_arch = "riscv64")]
+        {
+            let cache = self.inner.code_map.native.lock();
+            (
+                cache.bodies.len(),
+                cache.bytes,
+                self.inner
+                    .code_map
+                    .native_calls
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            )
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        (0, 0, 0)
+    }
     /// Creates a new [`Engine`] with default configuration.
     ///
     /// # Note

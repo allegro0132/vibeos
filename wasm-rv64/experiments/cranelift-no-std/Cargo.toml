@@ -1,0 +1,9 @@
+[package]
+name = "vibeos-cranelift-no-std-check"
+version = "0.0.0"
+edition = "2021"
+[workspace]
+[dependencies]
+cranelift-codegen = { version = "=0.135.1", default-features = false, features = ["riscv64"] }
+cranelift-frontend = { version = "=0.135.1", default-features = false }
+vibeos-wasm-rv64 = { path = "../.." }

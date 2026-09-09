@@ -3,8 +3,11 @@
 This is the active replacement direction for WASI performance: port Wasmtime's
 runtime, Cranelift integration and Preview 1 adapter, then compile **ordinary
 uploaded Wasm inside VibeOS** and execute it through existing command services.
-The final acceptance remains less than 5× slower than a contemporaneous Debian
-native CoreMark baseline, alongside existing WASI lifecycle and containment tests.
+The actual command now meets the CoreMark target: 2020.202020 iterations/s versus
+9870.941457 for a fresh Debian native control, or 4.886116× slower. The bounded
+fuel policy also passes the Rust/C functional diagnostic, 100 reclaimed calls,
+restart persistence and 410 platform checks. Synchronous compiler scheduling
+and strict SSH keepalive acceptance remain open (diagnostics use 30 seconds).
 A host-AOT-only loader would not satisfy this objective.
 
 The independent workspace prevents `std` features from leaking into the kernel

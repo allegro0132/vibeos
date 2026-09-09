@@ -1,4 +1,60 @@
-# WASI interpreter performance investigation
+# WASI runtime performance investigation
+
+## Current Wasmtime command result (2026-09-09)
+
+Ordinary CoreMark Wasm was uploaded over authenticated OpenSSH, compiled inside
+VibeOS, and run through the actual command service. The final paired QEMU
+measurements meet the **less-than-5× native slowdown** target:
+
+| Runtime | Three performance samples (iterations/s) | Median |
+| --- | --- | ---: |
+| VibeOS Wasmtime command | 2035.996417, 2020.202020, 2005.454837 | **2020.202020** |
+| Debian native C | 9870.941457, 9544.881508, 9932.576474 | **9870.941457** |
+
+Median slowdown is **4.886116×**. Even the fastest Debian sample divided by the
+slowest VibeOS sample is **4.952780×**. Validation scores are 1993.779408 and
+10054.973822 respectively. All timed intervals exceed 10 seconds and pass the
+correct seed-specific CRCs. The VMs ran serially, without concurrent compilation.
+These are CoreMark timed-region scores; compilation and SSH setup are excluded,
+with separate whole-invocation counters retained in the logs.
+
+The useful change is bounded in-fiber fuel scheduling: authorization,
+cancellation and executor competition are checked at every nominal 10000-fuel
+boundary, while up to 32 quanta use one native poll. Competing work and blocking
+I/O yield normally. The reserve and total fuel are unchanged. Single-writer
+accounting avoids unnecessary atomic read-modify-write instructions. Broad
+kernel opt-level 3 regressed throughput and was not adopted.
+
+Enable the optional backend with
+`WASI_WASMTIME=1 WASI_FUEL_BATCH=1 scripts/run-wasi-qemu.sh`.
+Formal runs use `wasi-benchmark,wasmtime-command-fuel-batch` and the benchmark
+script's `--wasmtime --fuel-batch` flags. Default images continue to use Wasmi.
+
+Evidence is in `target/coremark-performance/wasmtime-command-final/`,
+`debian-command-final/results/native-summary.json` and
+`wasmtime-command-final-comparison.json`. The final firmware SHA-256 is
+`5e4f1ded7cc2978943ee7e25de4b5a71398a8834c3c34aeec1593d974b0be655`;
+Wasm SHA-256 is
+`c5f77f7fd38fc3e87e7f9ccbd761327beee01de2adc9f24736ed4c94fe3dcc9a`.
+Toolchain versions, frozen firmware, native compiler environment, source/module
+hashes, command output and profiles are retained alongside those results.
+
+The new policy passed 23 host streaming cases, bounded-fuel/cancellation tests,
+and the complete Rust/C QEMU functional diagnostic with 100 consecutive
+reclaimed calls and restart persistence. The four-hart native platform suite
+passed **410/410**, including FP state, stack guards, suspended cancellation,
+raw fault cleanup and the expected fatal host read-only write. Evidence:
+`wasmtime-command-fuel-functional/` and `wasmtime-fuel-platform-recheck/`.
+The default Wasmi tests and firmware compilation check also pass.
+
+**Remaining limitation:** functional diagnostics use a recorded 30-second SSH
+keepalive. The original 2-second keepalive failed during synchronous compilation;
+compiler scheduling/deadlines and compiler stack-fault supervision are not
+finished. Meeting the CoreMark target does not claim these hardening gates are
+complete. Default limits remain 10 million fuel; only the explicit benchmark
+image grants the larger allowance.
+
+## Earlier interpreter investigation
 
 The release build inherited `opt-level = "z"` for both the Wasmi interpreter
 and shared kernel primitives. Optimizing these hot paths for size substantially

@@ -35,6 +35,41 @@ fn stopped(job: &Job) -> Option<WasiTerminal> {
         Some(WasiTerminal::Denied)
     } else { None }
 }
+
+#[cfg(feature = "wasmtime-command-fuel-batch")]
+pub(super) struct FuelBatch {
+    remaining: core::sync::atomic::AtomicUsize,
+    checks: core::sync::atomic::AtomicUsize,
+    continued: core::sync::atomic::AtomicUsize,
+}
+#[cfg(feature = "wasmtime-command-fuel-batch")]
+impl FuelBatch {
+    pub(super) fn new() -> Self {
+        Self { remaining: 0.into(), checks: 0.into(), continued: 0.into() }
+    }
+}
+#[cfg(feature = "wasmtime-command-fuel-batch")]
+fn fuel_may_continue(raw: usize) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    // Installed only in this job's Store. The SYSTEM reaper retains the job
+    // until that Store/fiber has been dropped and the child joined. No owning
+    // SYSTEM reference is carried on the abandonable guest stack.
+    let job = unsafe { &*(raw as *const Job) };
+    let fuel = &job.native_fuel;
+    // Only this exact child poll (including its fiber callback) writes these
+    // cells; the reaper waits for its join. Atomic loads/stores permit shared
+    // Job references without imposing unnecessary RMW operations on every
+    // quantum. No cancellation or authority state uses this single-writer rule.
+    fuel.checks.store(fuel.checks.load(Relaxed) + 1, Relaxed);
+    let remaining = fuel.remaining.load(Relaxed);
+    if stopped(job).is_some() || remaining == 0
+        || !exec::current_task_may_continue() {
+        return false;
+    }
+    fuel.remaining.store(remaining - 1, Relaxed);
+    fuel.continued.store(fuel.continued.load(Relaxed) + 1, Relaxed);
+    true
+}
 struct Streams(usize);
 impl Streams {
     fn job(&self) -> &Job { unsafe { &*(self.0 as *const Job) } }
@@ -83,6 +118,8 @@ impl Future for Guest {
         // Waker storage is SYSTEM-owned. Borrow its persistent Waker instead of
         // cloning an owning SYSTEM reference onto an abandonable guest stack.
         job.native_signal.begin(cx.waker());
+        #[cfg(feature = "wasmtime-command-fuel-batch")]
+        job.native_fuel.remaining.store(31, core::sync::atomic::Ordering::Relaxed);
         let mut native_cx = Context::from_waker(&job.native_signal.waker);
         for quantum in 0..32 {
             let begin = crate::sbi::time();
@@ -102,7 +139,10 @@ impl Future for Guest {
             match outcome {
                 Poll::Pending => {
                     let ready = job.native_signal.take_ready();
-                    if ready && quantum < 31 && exec::current_task_may_continue() { continue; }
+                    // Fuel batching already bounds this poll to 32 quanta on
+                    // the fiber. Never multiply that bound with outer batching.
+                    if !cfg!(feature = "wasmtime-command-fuel-batch")
+                        && ready && quantum < 31 && exec::current_task_may_continue() { continue; }
                     job.native_signal.finish(ready);
                     return Poll::Pending;
                 }
@@ -111,6 +151,8 @@ impl Future for Guest {
                     close(job);
                     *job.result.lock() = Some(terminal);
                     crate::println!("WASI Wasmtime polls={} quantum=10000 scheduler=exec", this.polls);
+                    #[cfg(feature = "wasmtime-command-fuel-batch")]
+                    crate::println!("WASI Wasmtime fuel checks={} continued={} max_batch=32", job.native_fuel.checks.load(core::sync::atomic::Ordering::Relaxed), job.native_fuel.continued.load(core::sync::atomic::Ordering::Relaxed));
                     crate::println!("WASI Wasmtime profile dispatches={} polls={} check_ticks={} guest_ticks={} wall_ticks={} hz={}",
                         this.dispatches, this.polls, this.check_ticks, this.guest_ticks, crate::sbi::time() - this.started, exec::timebase_hz());
                     return Poll::Ready(());
@@ -146,6 +188,8 @@ async fn execute(raw: usize) -> wasmtime::Result<WasiTerminal> {
     let limits = invocation_limits();
     store.set_fuel(limits.total_fuel)?;
     store.fuel_async_yield_interval(Some(limits.poll_quantum))?;
+    #[cfg(feature = "wasmtime-command-fuel-batch")]
+    store.fuel_async_yield_callback(fuel_may_continue, raw);
     let instance = match NativeFuture::new(linker.instantiate_async(&mut store, &module)).await {
         Ok(instance) => instance,
         Err(error) => { drop(error); return Ok(if store.data().resource_limit_hit() { WasiTerminal::LimitExceeded } else { WasiTerminal::Trapped }); }

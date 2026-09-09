@@ -86,6 +86,8 @@ struct Job {
     result: SpinLock<Option<WasiTerminal>>,
     #[cfg(feature = "wasmtime-command")]
     native_signal: wasmtime_backend::PollSignal,
+    #[cfg(feature = "wasmtime-command-fuel-batch")]
+    native_fuel: wasmtime_backend::FuelBatch,
     authority: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 struct Guest {
@@ -273,6 +275,8 @@ fn launch(
         result: SpinLock::new(None),
         #[cfg(feature = "wasmtime-command")]
         native_signal: wasmtime_backend::PollSignal::new(),
+        #[cfg(feature = "wasmtime-command-fuel-batch")]
+        native_fuel: wasmtime_backend::FuelBatch::new(),
         authority,
     });
     let raw = Box::into_raw(job) as usize;

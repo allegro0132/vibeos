@@ -495,6 +495,8 @@ pub struct StoreOpaque {
     // until the reserve is empty.
     fuel_reserve: u64,
     pub(crate) fuel_yield_interval: Option<NonZeroU64>,
+    #[cfg(feature = "custom-fuel-yield")]
+    pub(crate) fuel_yield_continue: Option<(fn(usize) -> bool, usize)>,
     /// Indexed data within this `Store`, used to store information about
     /// globals, functions, memories, etc.
     store_data: StoreData,
@@ -748,6 +750,8 @@ impl<T> Store<T> {
             async_state: Default::default(),
             fuel_reserve: 0,
             fuel_yield_interval: None,
+            #[cfg(feature = "custom-fuel-yield")]
+            fuel_yield_continue: None,
             store_data,
             traitobj: StorePtr(None),
             default_caller_vmctx: SendSyncPtr::new(NonNull::dangling()),
@@ -1052,6 +1056,17 @@ impl<T> Store<T> {
     #[cfg(feature = "async")]
     pub fn fuel_async_yield_interval(&mut self, interval: Option<u64>) -> Result<()> {
         self.inner.fuel_async_yield_interval(interval)
+    }
+
+    /// Install a synchronous scheduling decision at every async fuel boundary.
+    /// Returning true continues on the current fiber; false performs the normal
+    /// wake-and-yield. Refueling and final OutOfFuel behavior are unchanged.
+    /// The embedder must impose a finite batch and check cancellation/fairness
+    /// on every invocation. The context is an opaque token, never dereferenced
+    /// by Wasmtime. This local platform extension is disabled by default.
+    #[cfg(feature = "custom-fuel-yield")]
+    pub fn fuel_async_yield_callback(&mut self, callback: fn(usize) -> bool, context: usize) {
+        self.inner.fuel_yield_continue = Some((callback, context));
     }
 
     /// Sets the epoch deadline to a certain number of ticks in the future.

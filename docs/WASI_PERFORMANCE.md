@@ -1179,3 +1179,26 @@ reported no discovered harts/extensions in this configuration. This does not
 explain the command score: broader ISA code generation remains deliberately
 opt-in, and the measured default continues to generate GC code. The benchmark
 driver can now assert and record the *available* firmware ISA mask separately.
+
+The split-stack speed-profile experiment booted and discovered the 1-GiB DTB
+correctly, but scored 1186.854661, 1168.466068 and 1203.046052 (median
+1186.854661, validation 1215.061602). Consequently those package profile
+overrides were not adopted. The default size-oriented kernel profile remains.
+
+A fresh Debian native control ran alone using an independent overlay of the
+prepared image, with no package installation. `debian-command-fresh/results/`
+contains scores 8879.267357, 9270.424509, 9352.828283; median **9270.424509**.
+Validation scored 9348.578929. All intervals were 19.8 seconds or longer and
+passed the expected performance/validation CRCs. `native-summary.json` parses
+the raw files (the generic driver's custom-script results.json remains empty).
+
+The first bounded in-fiber fuel policy reached 1813.530276, 1818.873793 and
+1898.428157, median **1818.873793**, validation 1953.155212. This improves on the
+post-fix command control by 39.8%, but remains **5.097×** slower than the new
+Debian median. Evidence: `wasmtime-command-fuel-batch-benchmark/`. The quantum
+remains 10000 and each boundary still checks capability authority, cancellation
+and competing work. At most 31 boundaries continue on the existing fiber; the
+32nd yields. Outer batching is disabled, retaining a maximum of 32 quanta per
+executor poll. Counter records verify that bound. The host `fuel-custom` test
+exhausts identical 1000000 fuel with 99 decisions, reducing 100 polls to 4,
+and verifies dropping a pending call followed by reuse.

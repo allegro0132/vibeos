@@ -33,6 +33,7 @@ all-features = true
 
 [features]
 custom-code-registry = ["runtime"]
+custom-fuel-yield = ["async"]
 addr2line = [
     "dep:addr2line",
     "dep:gimli",

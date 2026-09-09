@@ -83,3 +83,17 @@ the core/alloc changes. `wasi-runtime/examples/fixtures.rs` generates the `copy`
 SSH regression with unaligned, overlapping and disjoint copies, lengths around
 16/128-byte boundaries, and a host memmove oracle for every destination byte.
 Earlier comparisons against vanilla compiler glue predate this correctness fix.
+
+`runtime-custom-fuel-yield.patch` is an opt-in `custom-fuel-yield` runtime
+extension. A Store may install a synchronous function/token decision after each
+normal refuel, before the async yield. Returning true keeps the current fiber;
+false preserves the standard wake-and-yield path. The reserve, quantum, final
+OutOfFuel trap and non-fuel I/O/GC yields are unchanged. No callback is installed
+by default. VibeOS's experimental `wasmtime-command-fuel-batch` policy checks
+job authority/cancellation and executor competition every 10000 fuel and forces
+a yield by the 32nd quantum. Outer batching is disabled in that mode so the
+bounds cannot multiply. Its token borrows the SYSTEM job until the Store/fiber
+is gone and the child joined; it owns no external reference in the arena.
+The patch chain was replayed from hash-verified published runtime files.
+`fuel-custom` verifies identical exhaustion, 99 callback boundaries with or
+without batching, a maximum of 32 boundaries per poll, cancellation and reuse.

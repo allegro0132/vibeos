@@ -20,11 +20,13 @@ def main():
     parser.add_argument('--work',type=Path,default=ROOT/'target/wasi-acceptance')
     parser.add_argument('--kernel',type=Path,help='Existing firmware ELF to freeze and verify')
     parser.add_argument('--wasmtime',action='store_true',help='Require the experimental native command backend')
+    parser.add_argument('--fuel-batch',action='store_true',help='Require bounded in-fiber fuel batching')
     parser.add_argument('--cycles',type=int,default=100)
     parser.add_argument('--boot-timeout',type=int,default=300)
     parser.add_argument('--server-alive-interval',type=int,default=2,
         help='SSH liveness window; values above 2 are functional diagnostics, not responsiveness acceptance')
     args=parser.parse_args();os.chdir(ROOT);work=args.work.resolve();work.mkdir(parents=True,exist_ok=True)
+    if args.fuel_batch and not args.wasmtime:parser.error('--fuel-batch requires --wasmtime')
     if (work/'disk.raw').exists():raise SystemExit('use a fresh --work directory for source-bound acceptance')
     spec=importlib.util.spec_from_file_location('wasi_peer',ROOT/'scripts/openssh-peer.py');peer=importlib.util.module_from_spec(spec);sys.modules[spec.name]=peer;spec.loader.exec_module(peer)
     with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
@@ -191,6 +193,8 @@ def main():
         record['source_files_sha256']={p:hashlib.sha256((ROOT/p).read_bytes()).hexdigest() for p in paths if p and (ROOT/p).is_file()}
         record['kernel_sha256']=hashlib.sha256(frozen.read_bytes()).hexdigest()
         record['backend']='wasmtime' if args.wasmtime else 'wasmi'
+        record['fuel_batch']=args.fuel_batch
+        if args.fuel_batch:assert 'max_batch=32' in (work/'boot-1.log').read_text()
         record['ssh_server_alive_interval']=args.server_alive_interval
         record['responsiveness_acceptance']=args.server_alive_interval==2
         if args.wasmtime: assert 'WASI running backend=wasmtime' in (work/'boot-1.log').read_text()

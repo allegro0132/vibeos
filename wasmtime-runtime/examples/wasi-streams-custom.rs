@@ -36,6 +36,8 @@ fn main() -> wasmtime::Result<()> {
     let mut store = wasmtime::Store::new(&engine, state);
     store.set_fuel(100_000_000_000)?;
     store.fuel_async_yield_interval(Some(10_000))?;
+    #[cfg(feature = "fuel-batch")]
+    store.fuel_async_yield_callback(fuel_batch::may_continue, 0);
     let instance = drive(linker.instantiate_async(&mut store, &module))?;
     let start = instance.get_typed_func::<(), ()>(&mut store, "_start")?;
     let result = drive(start.call_async(&mut store, ()));
@@ -84,5 +86,23 @@ impl wasi::Streams for HostStreams {
 fn drive<F: std::future::Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
-    loop { if let std::task::Poll::Ready(result) = future.as_mut().poll(&mut cx) { return result; } }
+    loop {
+        #[cfg(feature = "fuel-batch")]
+        fuel_batch::reset();
+        if let std::task::Poll::Ready(result) = future.as_mut().poll(&mut cx) { return result; }
+    }
+}
+
+#[cfg(feature = "fuel-batch")]
+mod fuel_batch {
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    // This host executable drives one invocation on one thread.
+    static REMAINING: AtomicUsize = AtomicUsize::new(0);
+    pub fn reset() { REMAINING.store(31, Relaxed); }
+    pub fn may_continue(_: usize) -> bool {
+        let remaining = REMAINING.load(Relaxed);
+        if remaining == 0 { return false; }
+        REMAINING.store(remaining - 1, Relaxed);
+        true
+    }
 }

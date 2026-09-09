@@ -54,6 +54,7 @@ def main():
     parser.add_argument('--module', type=Path, default=ROOT/'target/coremark-wasi/coremark.wasm')
     parser.add_argument('--skip-build', action='store_true')
     parser.add_argument('--wasmtime', action='store_true', help='Use the experimental native command backend')
+    parser.add_argument('--fuel-batch', action='store_true', help='Require bounded in-fiber fuel batching in the explicit Wasmtime ELF')
     parser.add_argument('--require-isa-mask', type=lambda value:int(value,0),
         help='Require the firmware-discovered available extension mask (not the enabled codegen mask)')
     parser.add_argument('--rv64-cache', action='store_true', help='Use the experimental WASI RV64 cache image')
@@ -61,6 +62,7 @@ def main():
     parser.add_argument('--icount-iterations', type=int, help='Diagnostic only: fixed iterations with icount virtual time, never a formal score')
     args = parser.parse_args()
     if args.wasmtime and args.rv64_cache: parser.error('choose one WASI backend')
+    if args.fuel_batch and not args.wasmtime: parser.error('--fuel-batch requires --wasmtime')
     if args.wasmtime and not args.kernel: parser.error('--wasmtime requires an explicit --kernel ELF')
     if args.icount_iterations is not None and args.icount_iterations < 1:
         parser.error('--icount-iterations must be positive')
@@ -118,6 +120,8 @@ def main():
             kernel_sha256=hashlib.sha256((args.kernel or ROOT/'target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt').read_bytes()).hexdigest(),
             configuration=dict(machine='virt',cpu='rv64',harts=1,memory='1G',accel='tcg,thread=single',rtc='base=utc,clock=vm',icount='shift=0,align=off,sleep=off' if args.icount_iterations is not None else None,feature='wasi-benchmark,wasmtime-command' if args.wasmtime else 'wasi-benchmark,wasi-rv64-cache' if args.rv64_cache else 'wasi-benchmark'))
         metadata['measurement_mode'] = 'instruction-count-diagnostic' if args.icount_iterations is not None else 'formal-real-clock'
+        metadata['fuel_batch'] = args.fuel_batch
+        if args.fuel_batch: metadata['configuration']['feature']='wasi-benchmark,wasmtime-command-fuel-batch'
         isa = re.search(r'Wasmtime ISA firmware_harts=(\d+) extra_mask=(0x[0-9a-f]+)', (work/'boot.log').read_text())
         if isa:
             metadata['firmware_isa_available'] = dict(harts=int(isa[1]), mask=int(isa[2],16))
@@ -170,6 +174,15 @@ def main():
                     other_seconds=(wall-checks-guest)/hz,
                     scope='includes compilation and instantiation; not the CoreMark timed interval'))
             (work/'native-profiles.json').write_text(json.dumps(data,indent=2)+'\n')
+            if args.fuel_batch:
+                batches = re.findall(r'WASI Wasmtime fuel checks=(\d+) continued=(\d+) max_batch=32', (work/'boot.log').read_text())
+                assert len(batches)==len(data), 'incomplete bounded fuel profile'
+                for row, values in zip(data, batches):
+                    checks, continued = map(int, values)
+                    assert 0 <= continued <= checks <= 32*row['polls']
+                    row.update(fuel_checks=checks, in_fiber_continuations=continued, max_batch=32)
+                assert any(row['in_fiber_continuations'] > 0 for row in data)
+                (work/'native-profiles.json').write_text(json.dumps(data,indent=2)+'\n')
     finally:
         vm.terminate(); vm.wait(timeout=10); log.close()
 

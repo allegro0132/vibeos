@@ -6,6 +6,7 @@ build = "build.rs"
 
 [features]
 wasmtime-command = ["vibeos-kernel/wasmtime-command"]
+wasmtime-command-fuel-batch = ["vibeos-kernel/wasmtime-command-fuel-batch"]
 wasmtime-async = ["vibeos-kernel/wasmtime-async"]
 wasmtime-guarded-memory = ["vibeos-kernel/wasmtime-guarded-memory"]
 wasmtime-hardware-traps = ["vibeos-kernel/wasmtime-hardware-traps"]

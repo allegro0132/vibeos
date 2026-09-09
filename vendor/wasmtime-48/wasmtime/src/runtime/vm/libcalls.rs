@@ -681,6 +681,12 @@ fn out_of_gas(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
         }
         #[cfg(feature = "async")]
         if store.fuel_yield_interval.is_some() {
+            #[cfg(feature = "custom-fuel-yield")]
+            if let Some((callback, context)) = store.fuel_yield_continue {
+                if callback(context) {
+                    return Ok(());
+                }
+            }
             store.yield_now().await;
         }
         Ok(())

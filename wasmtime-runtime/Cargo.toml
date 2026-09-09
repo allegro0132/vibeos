@@ -10,6 +10,7 @@ wasmtime = { version = "=48.0.0", default-features = false, features = ["runtime
 
 [features]
 custom-code-registry = ["wasmtime/custom-code-registry"]
+fuel-batch = ["async", "wasmtime/custom-fuel-yield"]
 async = ["wasmtime/async"]
 native-signals = ["wasmtime/custom-native-signals"]
 # Required by the future kernel execution integration, not cross-compilation tools.
@@ -75,3 +76,7 @@ required-features = ["compiler", "host-custom"]
 [[example]]
 name = "wasi-streams-custom"
 required-features = ["compiler", "host-custom", "async"]
+
+[[example]]
+name = "fuel-custom"
+required-features = ["compiler", "host-custom", "fuel-batch"]

@@ -6,6 +6,11 @@ publish = false
 [workspace]
 [features]
 compiled = ["dep:wasmtime", "dep:wasmtime-wasi"]
+compiled-threads = ["compiled", "wasmtime/threads"]
+[[bin]]
+name = "wasmtime-threads"
+path = "src/bin/wasmtime-threads.rs"
+required-features = ["compiled-threads"]
 [[bin]]
 name = "wasmtime"
 path = "src/bin/wasmtime.rs"
@@ -23,3 +28,9 @@ debug = true
 opt-level = 3
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("instruction-profile"))'] }
+
+# Same RISC-V correctness fixes as VibeOS (fs1 ABI and scalar inline copy).
+# Keep the standard Wasmtime runtime, Linux memory/traps and OS threads.
+[patch.crates-io]
+cranelift-codegen = { path = "../../vendor/wasmtime-48/cranelift-codegen" }
+wasmtime-internal-cranelift = { path = "../../vendor/wasmtime-48/wasmtime-cranelift" }

@@ -102,7 +102,8 @@ revocations.
 ## Compatibility and limits
 
 A module must export `memory` and `_start: () -> ()`. `_start` is explicitly
-called after instantiation; a Core start section is rejected. Only function
+called after instantiation; a Core start section is rejected except for the
+complete native WASI threads contract described below. Only function
 imports from `wasi_snapshot_preview1` with exact Preview 1 signatures are allowed.
 Component binaries and host memory/table/global imports are rejected.
 
@@ -160,13 +161,18 @@ successfully but receive `NOSYS` if they use them.
 The `wasmtime-threads` firmware feature (which implies `wasmtime-command`)
 admits the [wasi-threads](https://github.com/WebAssembly/wasi-threads) contract
 as produced by wasi-sdk `--target=wasm32-wasi-threads -pthread` with
-`-Wl,--export-memory`: an imported shared, bounded `env.memory`, the
+`-Wl,--import-memory -Wl,--export-memory`: an imported shared, bounded `env.memory`, the
 `wasi::thread-spawn: (i32) -> i32` import, the exported `wasi_thread_start`
 entry, and the threads proposal's atomics, `memory.atomic.wait32/64` and
 `memory.atomic.notify`. A module that uses any half of the contract without the
 other is rejected before compilation; a defined (non-imported) shared memory is
 rejected; the interpreter image rejects all of it with the existing `Import`
 terminal.
+
+For this complete contract, a Core start section is allowed: LLD uses it to
+initialize shared passive data and pthread TLS. It runs during asynchronous
+instantiation under the same fuel, memory, and allocation limits as guest
+execution. Non-threaded commands still reject Core start sections.
 
 | Aspect | Behavior |
 | --- | --- |

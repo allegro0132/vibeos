@@ -41,6 +41,7 @@ pub(crate) fn inspect(bytes: &[u8], limits: WasiLimits) -> Result<(), WasiError>
     let mut thread_start_export = false;
     let mut imports_thread_spawn = false;
     let mut imports_shared_memory = false;
+    let mut has_core_start = false;
     let mut elements = 0u32;
     for payload in Parser::new(0).parse_all(bytes) {
         match payload.map_err(|_| WasiError::Malformed)? {
@@ -140,7 +141,10 @@ pub(crate) fn inspect(bytes: &[u8], limits: WasiLimits) -> Result<(), WasiError>
                         export.name == "wasi_thread_start" && export.kind == ExternalKind::Func;
                 }
             }
-            Payload::StartSection { .. } => return Err(WasiError::Contract),
+            // LLD initializes pthread TLS/passive data through a Core start
+            // function. The threaded native embedding instantiates under the
+            // same fuel, allocation and async execution limits as _start.
+            Payload::StartSection { .. } => has_core_start = true,
             Payload::ElementSection(reader) => {
                 bound(reader.count(), BASE.max_element_segments)?;
                 for element in reader {
@@ -204,6 +208,9 @@ pub(crate) fn inspect(bytes: &[u8], limits: WasiLimits) -> Result<(), WasiError>
     {
         return Err(WasiError::Contract);
     }
+    if has_core_start && !(limits.threads && imports_thread_spawn && imports_shared_memory) {
+        return Err(WasiError::Contract);
+    }
     Validator::new_with_features(features(limits.threads))
         .validate_all(bytes)
         .map_err(|_| WasiError::Unsupported)?;
@@ -249,6 +256,18 @@ mod tests {
         let threaded = module("(memory 1 4 shared)", true, true, true);
         assert_eq!(check(&threaded, false), Err(WasiError::Import));
         assert_eq!(check(&threaded, true), Ok(()));
+    }
+    #[test]
+    fn core_start_requires_the_complete_threads_contract() {
+        let threaded = module("(memory 1 4 shared)", true, true, true)
+            .replace("(export \"memory\"", "(func $init (i32.atomic.store (i32.const 0) (i32.const 7))) (start $init) (export \"memory\"");
+        assert_eq!(check(&threaded, true), Ok(()));
+        assert_eq!(check(&threaded, false), Err(WasiError::Import));
+        let single = r#"(module (memory (export "memory") 1)
+            (func $init) (start $init) (func (export "_start")))"#;
+        assert_eq!(check(single, false), Err(WasiError::Contract));
+        assert_eq!(check(single, true), Err(WasiError::Contract));
+        assert_eq!(check(&threaded.replace("(export \"wasi_thread_start\")", ""), true), Err(WasiError::Contract));
     }
     #[test]
     fn threads_contract_requires_every_half() {

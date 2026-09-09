@@ -617,7 +617,10 @@ The `threads` crate feature (`wasmtime/custom-threads`, implies `async`) adds
 `ThreadSpawner`, `define_shared_memory`, and `thread_start`. `enable_threads`
 turns on the threads proposal, shared memories and a `wasmtime::ThreadHooks`
 implementation supplied by the embedding. `compile_with(.., true)` admits the
-wasi-threads contract through the shared structural inspector.
+wasi-threads contract through the shared structural inspector. Complete threaded
+commands may have a Core start section for LLD's shared-data/TLS initialization;
+the embedding must instantiate them under its guest execution limits. Other
+commands continue to reject Core start sections.
 
 Without `std` a `memory.atomic.wait*` cannot park an OS thread. The vendored
 runtime instead records the waiter as a copy-only token in a fixed 16-entry

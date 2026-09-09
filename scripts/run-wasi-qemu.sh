@@ -21,6 +21,16 @@ if [ "${WASI_BENCHMARK:-0}" = 1 ]; then
   memory=1G
   harts=1
 fi
+if [ "${WASI_BENCHMARK:-0}" = 1 ]; then
+  harts=${WASI_HARTS:-$harts}
+fi
+tcg_thread=${WASI_TCG_THREAD:-single}
+case "$tcg_thread" in single|multi) ;; *) echo 'invalid WASI_TCG_THREAD' >&2; exit 2;; esac
+if [ "$tcg_thread" = multi ]; then
+  [ "${WASI_BENCHMARK:-0}" = 1 ] && [ "${WASI_DIAGNOSTIC_ICOUNT:-0}" != 1 ] || {
+    echo 'multi-thread TCG requires real-clock benchmark mode' >&2; exit 2;
+  }
+fi
 if [ "${WASI_DIAGNOSTIC_ICOUNT:-0}" = 1 ]; then
   [ "${WASI_BENCHMARK:-0}" = 1 ] || { echo 'icount diagnostic requires benchmark configuration' >&2; exit 2; }
   set -- -rtc base=utc,clock=vm -icount shift=0,align=off,sleep=off
@@ -67,7 +77,7 @@ with open(sys.argv[1],'xb') as f:f.truncate(128*1024*1024)
 PY
 fi
 exec qemu-system-riscv64 \
-  -machine virt -cpu rv64 -smp "$harts" -m "$memory" -accel tcg,thread=single \
+  -machine virt -cpu "${WASI_CPU:-rv64}" -smp "$harts" -m "$memory" -accel "tcg,thread=$tcg_thread" \
   "$@" -nographic -bios default \
   -kernel "${WASI_KERNEL:-target/$target/release/vibeos-qemu-virt}" \
   -object rng-random,id=wasi-rng,filename=/dev/urandom \

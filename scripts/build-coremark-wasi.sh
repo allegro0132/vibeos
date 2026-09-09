@@ -21,6 +21,20 @@ git -C "$source_dir" diff --quiet HEAD -- . || {
   exit 1
 }
 mkdir -p target/coremark-wasi
+if [ "${COREMARK_THREADS:-0}" = 1 ]; then
+  "$WASI_SDK_PATH/bin/clang" --target=wasm32-wasi-threads -pthread -O3 -msign-ext -mbulk-memory \
+    -DMULTITHREAD=4 -DUSE_PTHREAD=1 -DITERATIONS=1 \
+    '-DFLAGS_STR="-O3 -pthread -msign-ext -mbulk-memory -DMULTITHREAD=4 -DUSE_PTHREAD=1 -DITERATIONS=1"' \
+    '-DMEM_LOCATION="WASI shared linear memory"' -I"$source_dir" -I"$source_dir/posix" \
+    "$source_dir/core_list_join.c" "$source_dir/core_main.c" \
+    "$source_dir/core_matrix.c" "$source_dir/core_state.c" \
+    "$source_dir/core_util.c" "$source_dir/posix/core_portme.c" \
+    -Wl,--max-memory=16777216 -Wl,--import-memory -Wl,--export-memory -Wl,--export=wasi_thread_start \
+    -Wl,-z,stack-size=65536 -Wl,--strip-all \
+    -o target/coremark-wasi/coremark-threads.wasm
+  shasum -a 256 target/coremark-wasi/coremark-threads.wasm
+  exit 0
+fi
 "$WASI_SDK_PATH/bin/clang" --target=wasm32-wasip1 -O3 -msign-ext -mbulk-memory \
   -DITERATIONS=1 '-DFLAGS_STR="-O3 -msign-ext -mbulk-memory -DITERATIONS=1"' \
   '-DMEM_LOCATION="WASI linear memory"' -I"$source_dir" -I"$source_dir/posix" \

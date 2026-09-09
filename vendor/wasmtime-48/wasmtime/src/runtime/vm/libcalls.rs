@@ -622,7 +622,7 @@ fn is_subtype(
 }
 
 // Implementation of `memory.atomic.notify` for locally defined memories.
-#[cfg(feature = "threads")]
+#[cfg(all(feature = "threads", not(has_custom_threads)))]
 fn memory_atomic_notify(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -638,7 +638,7 @@ fn memory_atomic_notify(
 }
 
 // Implementation of `memory.atomic.wait32` for locally defined memories.
-#[cfg(feature = "threads")]
+#[cfg(all(feature = "threads", not(has_custom_threads)))]
 fn memory_atomic_wait32(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -656,7 +656,7 @@ fn memory_atomic_wait32(
 }
 
 // Implementation of `memory.atomic.wait64` for locally defined memories.
-#[cfg(feature = "threads")]
+#[cfg(all(feature = "threads", not(has_custom_threads)))]
 fn memory_atomic_wait64(
     store: &mut dyn VMStore,
     instance: InstanceId,
@@ -671,6 +671,82 @@ fn memory_atomic_wait64(
         .instance_mut(instance)
         .get_defined_memory_mut(memory)
         .atomic_wait64(addr_index, expected, timeout)? as u32)
+}
+
+// `memory.atomic.notify` without `std`: wake suspended guest threads through
+// the engine's thread hooks.
+#[cfg(has_custom_threads)]
+fn memory_atomic_notify(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory_index: u32,
+    addr_index: u64,
+    count: u32,
+) -> Result<u32, Trap> {
+    let memory = DefinedMemoryIndex::from_u32(memory_index);
+    let hooks = store.engine().config().thread_hooks.clone();
+    store
+        .instance_mut(instance)
+        .get_defined_memory_mut(memory)
+        .atomic_notify(addr_index, count, hooks.as_deref())
+}
+
+// `memory.atomic.wait32` without `std`: suspend this guest thread's fiber.
+#[cfg(has_custom_threads)]
+fn memory_atomic_wait32(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory_index: u32,
+    addr_index: u64,
+    expected: u32,
+    timeout: u64,
+) -> Result<u32> {
+    let timeout = (timeout as i64 >= 0).then(|| Duration::from_nanos(timeout));
+    let memory = DefinedMemoryIndex::from_u32(memory_index);
+    let shared = {
+        let memory = store.instance_mut(instance).get_defined_memory_mut(memory);
+        match memory.as_shared_memory() {
+            Some(shared) => shared.clone(),
+            None => return Err(memory.atomic_wait_unshared(addr_index, 4).into()),
+        }
+    };
+    let Some(hooks) = store.engine().config().thread_hooks.clone() else {
+        bail!("memory.atomic.wait32 requires `Config::with_thread_hooks`");
+    };
+    block_on!(store, async |_store, _| {
+        Ok(shared
+            .atomic_wait32_async(addr_index, expected, timeout, &*hooks)
+            .await? as u32)
+    })?
+}
+
+// `memory.atomic.wait64` without `std`: suspend this guest thread's fiber.
+#[cfg(has_custom_threads)]
+fn memory_atomic_wait64(
+    store: &mut dyn VMStore,
+    instance: InstanceId,
+    memory_index: u32,
+    addr_index: u64,
+    expected: u64,
+    timeout: u64,
+) -> Result<u32> {
+    let timeout = (timeout as i64 >= 0).then(|| Duration::from_nanos(timeout));
+    let memory = DefinedMemoryIndex::from_u32(memory_index);
+    let shared = {
+        let memory = store.instance_mut(instance).get_defined_memory_mut(memory);
+        match memory.as_shared_memory() {
+            Some(shared) => shared.clone(),
+            None => return Err(memory.atomic_wait_unshared(addr_index, 8).into()),
+        }
+    };
+    let Some(hooks) = store.engine().config().thread_hooks.clone() else {
+        bail!("memory.atomic.wait64 requires `Config::with_thread_hooks`");
+    };
+    block_on!(store, async |_store, _| {
+        Ok(shared
+            .atomic_wait64_async(addr_index, expected, timeout, &*hooks)
+            .await? as u32)
+    })?
 }
 
 // Hook for when an instance runs out of fuel.

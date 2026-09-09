@@ -88,6 +88,8 @@ struct Job {
     native_signal: wasmtime_backend::PollSignal,
     #[cfg(feature = "wasmtime-command-fuel-batch")]
     native_fuel: wasmtime_backend::FuelBatch,
+    #[cfg(feature = "wasmtime-threads")]
+    threads: wasmtime_backend::Threads,
     authority: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 struct Guest {
@@ -277,6 +279,8 @@ fn launch(
         native_signal: wasmtime_backend::PollSignal::new(),
         #[cfg(feature = "wasmtime-command-fuel-batch")]
         native_fuel: wasmtime_backend::FuelBatch::new(),
+        #[cfg(feature = "wasmtime-threads")]
+        threads: wasmtime_backend::Threads::new(),
         authority,
     });
     let raw = Box::into_raw(job) as usize;
@@ -287,6 +291,7 @@ fn launch(
     let guest = { wasmtime_backend::register(domain, raw); wasmtime_backend::Guest::new(raw) };
     #[cfg(not(feature = "wasmtime-command"))]
     let guest = Guest { job: raw, instance: None, #[cfg(feature = "wasi-benchmark")] profile: (0, 0, 0) };
+    #[cfg(not(feature = "wasmtime-threads"))]
     let child = unsafe {
         exec::spawn_reclaimable_owned(
             domain,
@@ -294,6 +299,10 @@ fn launch(
             guest,
         )
     };
+    // Guest threads are siblings of this task placed on other harts; a fault
+    // anywhere quiesces them before the arena is reclaimed raw.
+    #[cfg(feature = "wasmtime-threads")]
+    let child = unsafe { exec::spawn_reclaimable_owned_parallel(domain, "wasi-guest", guest) };
     exec::spawn_tracked("wasi-reaper", async move {
         let exit = {
             let mut joined = pin!(child.join());
@@ -319,9 +328,18 @@ fn launch(
                 let job = unsafe { &*(raw as *const Job) };
                 if job.authority.as_ref().is_some_and(|check| !check()) {
                     job.io.deny();
+                    // A thread parked in an atomic wait has no I/O wait to
+                    // interrupt; wake every task so it observes the denial.
+                    #[cfg(feature = "wasmtime-threads")]
+                    wasmtime_backend::notify_denied(raw);
                 }
             }
         };
+        // Sibling thread tasks share the arena. Main normally joins them; after
+        // a main fault the executor tore them down. Join whatever remains so
+        // retirement sees every handle released.
+        #[cfg(feature = "wasmtime-threads")]
+        wasmtime_backend::reap_threads(raw).await;
         // The join proves guest polling/destruction and executor fault reclaim
         // have completed. Only the reaper owns and retires the control record.
         #[cfg(feature = "wasmtime-command")]

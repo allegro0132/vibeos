@@ -7,6 +7,9 @@ autobins = false
 [features]
 wasmtime-command = ["wasmtime-async", "wasi-preview1"]
 wasmtime-command-fuel-batch = ["wasmtime-command", "vibeos-wasmtime-runtime/fuel-batch"]
+# wasi-threads on the native command backend: shared memory, atomics, and
+# up to MAX_GUEST_THREADS sibling tasks per command.
+wasmtime-threads = ["wasmtime-command", "vibeos-wasmtime-runtime/threads"]
 wasmtime-async = ["vibeos-wasmtime-runtime/custom-code-registry", "wasmtime-guarded-memory", "vibeos-wasmtime-runtime/async", "dep:vibeos-wasi-command", "dep:vibeos-wasi-runtime"]
 wasmtime-guarded-memory = ["wasmtime-hardware-traps"]
 wasmtime-hardware-traps = ["wasmtime-native", "vibeos-wasmtime-runtime/native-signals"]

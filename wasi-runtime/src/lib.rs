@@ -36,6 +36,10 @@ pub struct WasiLimits {
     /// Guest arguments cannot select this value. The poll quantum stays bounded.
     pub total_fuel: u64,
     pub poll_quantum: u64,
+    /// Admit the wasi-threads contract (shared imported memory, atomics,
+    /// `wasi::thread-spawn`). The interpreter never executes threads; only the
+    /// native command backend may set this.
+    pub threads: bool,
 }
 impl Default for WasiLimits {
     fn default() -> Self {
@@ -48,6 +52,7 @@ impl Default for WasiLimits {
             output_bytes: 64 * 1024,
             total_fuel: 10_000_000,
             poll_quantum: 10_000,
+            threads: false,
         }
     }
 }
@@ -70,6 +75,9 @@ impl WasiLimits {
             || self.poll_quantum > max.poll_quantum
         {
             return Err(WasiError::Limit);
+        }
+        if self.threads {
+            return Err(WasiError::Unsupported);
         }
         Ok(())
     }

@@ -72,8 +72,14 @@ mod throw;
 mod traphandlers;
 mod vmcontext;
 
-#[cfg(feature = "threads")]
+#[cfg(all(feature = "threads", not(has_custom_threads)))]
 mod parking_spot;
+#[cfg(has_custom_threads)]
+mod parking_spot_nostd;
+#[cfg(has_custom_threads)]
+use parking_spot_nostd as parking_spot;
+#[cfg(has_custom_threads)]
+pub mod threads;
 
 // Note that `debug_builtins` here is disabled with a feature or a lack of a
 // native compilation backend because it's only here to assist in debugging

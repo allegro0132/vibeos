@@ -1,14 +1,22 @@
 use crate::Engine;
 use crate::prelude::*;
-use crate::runtime::vm::memory::{LocalMemory, MmapMemory, validate_atomic_addr};
-use crate::runtime::vm::parking_spot::{ParkingSpot, Waiter};
+#[cfg(not(has_custom_threads))]
+use crate::runtime::vm::parking_spot::Waiter;
+use crate::runtime::vm::memory::{LocalMemory, validate_atomic_addr};
+use crate::runtime::vm::parking_spot::ParkingSpot;
+#[cfg(has_custom_threads)]
+use crate::runtime::vm::threads::ThreadHooks;
 use crate::runtime::vm::{self, Memory, VMMemoryDefinition, WaitResult};
+use crate::sync::RwLock;
+use alloc::sync::Arc;
+use core::ops::Range;
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::time::Duration;
+#[cfg(not(has_custom_threads))]
 use std::cell::RefCell;
-use std::ops::Range;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+#[cfg(not(has_custom_threads))]
+use std::time::Instant;
 use wasmtime_environ::Trap;
 
 /// For shared memory (and only for shared memory), this lock-version restricts
@@ -31,6 +39,10 @@ struct SharedMemoryInner {
 
 impl SharedMemory {
     /// Construct a new [`SharedMemory`].
+    ///
+    /// The backing store comes from the engine's configured host memory
+    /// creator when one is installed; otherwise the default mmap-backed
+    /// allocation is used.
     pub fn new(engine: &Engine, ty: &wasmtime_environ::Memory) -> Result<Self> {
         let tunables = engine.tunables();
         let memory_tunables = wasmtime_environ::MemoryTunables::new(
@@ -40,9 +52,28 @@ impl SharedMemory {
         // Note that without a limiter being passed to `limit_new` this
         // `assert_ready` should never panic.
         let (minimum_bytes, maximum_bytes) = vm::assert_ready(Memory::limit_new(ty, None))?;
-        let mmap_memory = MmapMemory::new(ty, &memory_tunables, minimum_bytes, maximum_bytes)?;
         let boxed: Box<dyn crate::runtime::vm::RuntimeLinearMemory> =
-            try_new::<Box<_>>(mmap_memory)?;
+            match &engine.config().mem_creator {
+                Some(creator) => {
+                    creator.new_memory(ty, &memory_tunables, minimum_bytes, maximum_bytes)?
+                }
+                None => {
+                    #[cfg(has_virtual_memory)]
+                    {
+                        let mmap_memory = crate::runtime::vm::memory::MmapMemory::new(
+                            ty,
+                            &memory_tunables,
+                            minimum_bytes,
+                            maximum_bytes,
+                        )?;
+                        try_new::<Box<_>>(mmap_memory)?
+                    }
+                    #[cfg(not(has_virtual_memory))]
+                    {
+                        bail!("shared memory requires a host memory creator on this platform")
+                    }
+                }
+            };
         Self::wrap(
             engine,
             ty,
@@ -89,7 +120,7 @@ impl SharedMemory {
 
     /// Same as `RuntimeLinearMemory::grow`, except with `&self`.
     pub fn grow(&self, delta_pages: u64) -> Result<Option<(usize, usize)>, Error> {
-        let mut memory = self.0.memory.write().unwrap();
+        let mut memory = self.0.memory.write();
         // Without a limiter being passed in this shouldn't have an await point,
         // so it should be safe to assert that it's ready.
         let result = vm::assert_ready(memory.grow(delta_pages, None))?;
@@ -123,6 +154,7 @@ impl SharedMemory {
     }
 
     /// Implementation of `memory.atomic.notify` for this shared memory.
+    #[cfg(not(has_custom_threads))]
     pub fn atomic_notify(&self, addr_index: u64, count: u32) -> Result<u32, Trap> {
         let ptr = validate_atomic_addr(&self.0.def.0, addr_index, 4, 4)?;
         log::trace!("memory.atomic.notify(addr={addr_index:#x}, count={count})");
@@ -130,7 +162,25 @@ impl SharedMemory {
         Ok(self.0.spot.notify(ptr, count))
     }
 
+    /// Implementation of `memory.atomic.notify` for this shared memory.
+    ///
+    /// Waiters are woken through `hooks`; without hooks the waiters are still
+    /// marked notified and complete at their next poll.
+    #[cfg(has_custom_threads)]
+    pub fn atomic_notify(
+        &self,
+        addr_index: u64,
+        count: u32,
+        hooks: Option<&dyn ThreadHooks>,
+    ) -> Result<u32, Trap> {
+        let ptr = validate_atomic_addr(&self.0.def.0, addr_index, 4, 4)?;
+        log::trace!("memory.atomic.notify(addr={addr_index:#x}, count={count})");
+        let ptr = unsafe { &*ptr };
+        Ok(self.0.spot.notify(ptr, count, hooks))
+    }
+
     /// Implementation of `memory.atomic.wait32` for this shared memory.
+    #[cfg(not(has_custom_threads))]
     pub fn atomic_wait32(
         &self,
         addr_index: u64,
@@ -143,8 +193,8 @@ impl SharedMemory {
         );
 
         // SAFETY: `addr_index` was validated by `validate_atomic_addr` above.
-        assert!(std::mem::size_of::<AtomicU32>() == 4);
-        assert!(std::mem::align_of::<AtomicU32>() <= 4);
+        assert!(core::mem::size_of::<AtomicU32>() == 4);
+        assert!(core::mem::align_of::<AtomicU32>() <= 4);
         let atomic = unsafe { AtomicU32::from_ptr(addr.cast()) };
         // Wasm linear memory is always little-endian, but `AtomicU32` uses the
         // host's native endianness.
@@ -163,6 +213,7 @@ impl SharedMemory {
     }
 
     /// Implementation of `memory.atomic.wait64` for this shared memory.
+    #[cfg(not(has_custom_threads))]
     pub fn atomic_wait64(
         &self,
         addr_index: u64,
@@ -175,8 +226,8 @@ impl SharedMemory {
         );
 
         // SAFETY: `addr_index` was validated by `validate_atomic_addr` above.
-        assert!(std::mem::size_of::<AtomicU64>() == 8);
-        assert!(std::mem::align_of::<AtomicU64>() <= 8);
+        assert!(core::mem::size_of::<AtomicU64>() == 8);
+        assert!(core::mem::align_of::<AtomicU64>() <= 8);
         let atomic = unsafe { AtomicU64::from_ptr(addr.cast()) };
         // Wasm linear memory is always little-endian, but `AtomicU64` uses the
         // host's native endianness.
@@ -191,19 +242,65 @@ impl SharedMemory {
         })
     }
 
+    /// Implementation of `memory.atomic.wait32` that suspends the calling
+    /// guest thread's async fiber instead of an OS thread.
+    #[cfg(has_custom_threads)]
+    pub async fn atomic_wait32_async(
+        &self,
+        addr_index: u64,
+        expected: u32,
+        timeout: Option<Duration>,
+        hooks: &dyn ThreadHooks,
+    ) -> Result<WaitResult> {
+        let addr = validate_atomic_addr(&self.0.def.0, addr_index, 4, 4)?;
+        log::trace!(
+            "memory.atomic.wait32(addr={addr_index:#x}, expected={expected}, timeout={timeout:?})"
+        );
+        // SAFETY: `addr_index` was validated by `validate_atomic_addr` above,
+        // and the base pointer of a shared memory never changes.
+        assert!(core::mem::size_of::<AtomicU32>() == 4);
+        assert!(core::mem::align_of::<AtomicU32>() <= 4);
+        let atomic = unsafe { AtomicU32::from_ptr(addr.cast()) };
+        let expected = expected.to_le();
+        self.0.spot.wait32(atomic, expected, timeout, hooks).await
+    }
+
+    /// Implementation of `memory.atomic.wait64` that suspends the calling
+    /// guest thread's async fiber instead of an OS thread.
+    #[cfg(has_custom_threads)]
+    pub async fn atomic_wait64_async(
+        &self,
+        addr_index: u64,
+        expected: u64,
+        timeout: Option<Duration>,
+        hooks: &dyn ThreadHooks,
+    ) -> Result<WaitResult> {
+        let addr = validate_atomic_addr(&self.0.def.0, addr_index, 8, 8)?;
+        log::trace!(
+            "memory.atomic.wait64(addr={addr_index:#x}, expected={expected}, timeout={timeout:?})"
+        );
+        // SAFETY: see `atomic_wait32_async`.
+        assert!(core::mem::size_of::<AtomicU64>() == 8);
+        assert!(core::mem::align_of::<AtomicU64>() <= 8);
+        let atomic = unsafe { AtomicU64::from_ptr(addr.cast()) };
+        let expected = expected.to_le();
+        self.0.spot.wait64(atomic, expected, timeout, hooks).await
+    }
+
     pub(crate) fn byte_size(&self) -> usize {
-        self.0.memory.read().unwrap().byte_size()
+        self.0.memory.read().byte_size()
     }
 
     pub(crate) fn needs_init(&self) -> bool {
-        self.0.memory.read().unwrap().needs_init()
+        self.0.memory.read().needs_init()
     }
 
     pub(crate) fn wasm_accessible(&self) -> Range<usize> {
-        self.0.memory.read().unwrap().wasm_accessible()
+        self.0.memory.read().wasm_accessible()
     }
 }
 
+#[cfg(not(has_custom_threads))]
 thread_local! {
     /// Structure used in conjunction with `ParkingSpot` to block the current
     /// thread if necessary. Note that this is lazily initialized.

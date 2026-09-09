@@ -1,5 +1,7 @@
 //! One fixed guest VA reservation; only committed pages consume physical RAM.
-use alloc::{alloc::{alloc_zeroed, dealloc}, boxed::Box, string::String, sync::Arc};
+//! A shared (wasi-threads) memory never relocates: growth appends zeroed
+//! chunks at the VA tail while other guest threads keep executing.
+use alloc::{alloc::{alloc_zeroed, dealloc}, boxed::Box, string::String, sync::Arc, vec::Vec};
 use core::{alloc::Layout, ptr::NonNull, sync::atomic::{AtomicUsize, Ordering}};
 use vibeos_wasmtime_runtime::wasmtime::{self, Config, LinearMemory, MemoryCreator, MemoryType};
 const PAGE: usize = 4096;
@@ -40,14 +42,26 @@ pub(super) unsafe fn recover(domain: AllocationDomain) {
     let Some(record) = *slot else { return };
     if record.domain != domain { return; }
     if record.size != 0 {
-        unsafe { crate::mmu::replace_wasm_memory(record.base, record.size, 0, 0); }
+        // Physical chunks are arena bytes; the caller reclaims them raw.
+        unsafe { crate::mmu::unmap_wasm_memory(record.size); }
     }
     *slot = None;
 }
 struct Creator;
-struct Memory { base: NonNull<u8>, layout: Layout, size: usize, maximum: usize }
-// A single store owns the mapping. Wasmtime excludes concurrent growth/access,
-// and shared memories are rejected. All harts receive TLB invalidations.
+struct Memory {
+    base: NonNull<u8>,
+    layout: Layout,
+    size: usize,
+    maximum: usize,
+    /// Shared memories keep every chunk ever mapped; `base`/`layout` is the
+    /// first one. Private memories relocate instead and keep this empty.
+    chunks: Option<Vec<(NonNull<u8>, Layout)>>,
+}
+// A private memory is owned by one store, which excludes concurrent growth
+// and access. A shared memory is guarded by Wasmtime's shared-memory write
+// lock during growth and never moves, so guest threads on other harts keep
+// valid translations; only new pages are published. All harts receive TLB
+// invalidations for every mapping change.
 unsafe impl Send for Memory {}
 unsafe impl Sync for Memory {}
 pub(super) fn configure(config: &mut Config) {
@@ -66,6 +80,22 @@ unsafe impl LinearMemory for Memory {
             wasmtime::bail!("guest memory limit exceeded");
         }
         if size == self.size { return Ok(()); }
+        if let Some(chunks) = self.chunks.as_mut() {
+            // Shared: append a zeroed chunk at the tail; nothing relocates.
+            let layout = Layout::from_size_align(size - self.size, PAGE).unwrap();
+            let chunk = NonNull::new(unsafe { alloc_zeroed(layout) })
+                .ok_or_else(|| wasmtime::Error::msg("guest memory allocation failed"))?;
+            {
+                let mut slot = SLOT.lock();
+                let record = slot.as_mut().expect("guest memory reservation");
+                assert_eq!(record.size, self.size);
+                unsafe { crate::mmu::append_wasm_memory(self.size, chunk.as_ptr() as usize, layout.size()); }
+                record.size = size;
+            }
+            chunks.push((chunk, layout));
+            self.size = size;
+            return Ok(());
+        }
         if size > self.layout.size() {
             let layout = Layout::from_size_align(size.next_power_of_two().min(LIMIT), PAGE).unwrap();
             let base = NonNull::new(unsafe { alloc_zeroed(layout) })
@@ -88,9 +118,22 @@ unsafe impl LinearMemory for Memory {
 }
 impl Drop for Memory {
     fn drop(&mut self) {
-        unsafe {
-            replace(self.base.as_ptr() as usize, self.size, 0, 0);
-            dealloc(self.base.as_ptr(), self.layout);
+        match self.chunks.take() {
+            Some(chunks) => unsafe {
+                {
+                    let mut slot = SLOT.lock();
+                    let record = slot.as_mut().expect("guest memory reservation");
+                    assert_eq!(record.size, self.size);
+                    crate::mmu::unmap_wasm_memory(self.size);
+                    record.size = 0;
+                }
+                dealloc(self.base.as_ptr(), self.layout);
+                for (chunk, layout) in chunks { dealloc(chunk.as_ptr(), layout); }
+            },
+            None => unsafe {
+                replace(self.base.as_ptr() as usize, self.size, 0, 0);
+                dealloc(self.base.as_ptr(), self.layout);
+            },
         }
         *SLOT.lock() = None;
         DROPS.fetch_add(1, Ordering::Relaxed);
@@ -100,9 +143,13 @@ unsafe impl MemoryCreator for Creator {
     fn new_memory(&self, ty: MemoryType, minimum: usize, maximum: Option<usize>, reservation: Option<usize>, guard: usize)
         -> Result<Box<dyn LinearMemory>, String> {
         let maximum = maximum.unwrap_or(LIMIT).min(LIMIT);
-        if ty.is_shared() || ty.is_64() || ty.page_size() != 65536 || minimum > maximum || minimum % PAGE != 0
+        if ty.is_64() || ty.page_size() != 65536 || minimum > maximum || minimum % PAGE != 0
             || reservation != Some(RESERVATION) || guard != GUARD {
             return Err(String::from("unsupported guarded guest memory"));
+        }
+        // Admission already requires a declared maximum for shared memories.
+        if ty.is_shared() && ty.maximum().is_none() {
+            return Err(String::from("shared guest memory requires a maximum"));
         }
         let reserved = {
             let mut slot = SLOT.lock();
@@ -112,13 +159,26 @@ unsafe impl MemoryCreator for Creator {
             }
         };
         if !reserved { return Err(String::from("guarded guest memory busy")); }
-        let layout = Layout::from_size_align(minimum.max(PAGE).next_power_of_two(), PAGE).unwrap();
+        // A shared memory commits exactly its initial pages; a private one
+        // rounds up so the first growth avoids a relocation.
+        let initial = if ty.is_shared() { minimum.max(PAGE) } else { minimum.max(PAGE).next_power_of_two() };
+        let layout = Layout::from_size_align(initial, PAGE).unwrap();
         let Some(base) = NonNull::new(unsafe { alloc_zeroed(layout) }) else {
             *SLOT.lock() = None;
             return Err(String::from("guest memory allocation failed"));
         };
+        if ty.is_shared() {
+            if minimum != 0 {
+                let mut slot = SLOT.lock();
+                let record = slot.as_mut().expect("guest memory reservation");
+                unsafe { crate::mmu::append_wasm_memory(0, base.as_ptr() as usize, minimum); }
+                record.base = base.as_ptr() as usize;
+                record.size = minimum;
+            }
+            return Ok(Box::new(Memory { base, layout, size: minimum, maximum, chunks: Some(Vec::new()) }));
+        }
         replace(0, 0, base.as_ptr() as usize, minimum);
-        Ok(Box::new(Memory { base, layout, size: minimum, maximum }))
+        Ok(Box::new(Memory { base, layout, size: minimum, maximum, chunks: None }))
     }
 }
 pub(super) fn assert_idle() {

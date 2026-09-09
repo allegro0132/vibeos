@@ -108,8 +108,10 @@ Component binaries and host memory/table/global imports are rejected.
 
 Enabled features: Wasm32, one memory and at most one table, scalar integers and
 software float, mutable globals, sign extension, saturating float conversion,
-multi-value, bulk memory and reference types. SIMD, threads, GC, exceptions,
-memory64, multiple memories, tail calls and extended constants are excluded.
+multi-value, bulk memory and reference types. SIMD, GC, exceptions, memory64,
+multiple memories, tail calls and extended constants are excluded. Threads are
+excluded on the interpreter image and admitted only by the `wasmtime-threads`
+native image described below.
 Omitted memory/table maxima are supported; the host limiter remains authoritative.
 
 | Interface | Behavior |
@@ -149,9 +151,37 @@ permission denial and resource exhaustion. SSH maps non-exit terminals to 125,
 own process exit status may truncate that value. Vsh preserves 1–255, maps larger
 nonzero guest values to status 1, and retains the original in `TerminalDetail::WasiExit`.
 
-There is no guest filesystem, networking, random source, threading, or
-promise of the complete WASI standard world. Standard libraries may import such
-functions successfully but receive `NOSYS` if they use them.
+There is no guest filesystem, networking, random source, or promise of the
+complete WASI standard world. Standard libraries may import such functions
+successfully but receive `NOSYS` if they use them.
+
+## wasi-threads (native backend)
+
+The `wasmtime-threads` firmware feature (which implies `wasmtime-command`)
+admits the [wasi-threads](https://github.com/WebAssembly/wasi-threads) contract
+as produced by wasi-sdk `--target=wasm32-wasi-threads -pthread` with
+`-Wl,--export-memory`: an imported shared, bounded `env.memory`, the
+`wasi::thread-spawn: (i32) -> i32` import, the exported `wasi_thread_start`
+entry, and the threads proposal's atomics, `memory.atomic.wait32/64` and
+`memory.atomic.notify`. A module that uses any half of the contract without the
+other is rejected before compilation; a defined (non-imported) shared memory is
+rejected; the interpreter image rejects all of it with the existing `Import`
+terminal.
+
+| Aspect | Behavior |
+| --- | --- |
+| Threads | At most 3 spawned threads per command (main plus three, one native fiber stack each); `thread-spawn` beyond that returns `-EAGAIN` (`-6`) |
+| Placement | Each thread is a kernel task pinned round-robin to an online hart; threads run in parallel on a multi-hart machine |
+| Shared memory | One fixed guest virtual reservation; growth appends zeroed pages and never relocates; failure returns `-1` to the guest instead of terminating |
+| Waits | `memory.atomic.wait*` suspends the thread's fiber through the executor; timeouts are rounded up to whole milliseconds |
+| Process semantics | `proc_exit` or a trap in any thread ends the command with that status; `_start` returning ends every thread; cancellation, revocation and fuel/output limits apply to the whole command |
+| Budgets | Each thread's store carries the invocation fuel budget; the command is limited to four budgets in total; stdout/stderr share one 64 KiB budget |
+| Faults | A fault in any thread tears down the whole arena after siblings mid-poll on other harts have detached; no destructor runs |
+
+`fd_read`/`fd_write` from several threads interleave at the granularity of one
+host call. There is still no `sched_yield` beyond the Preview 1 stub, no
+thread-local descriptor state, and no thread join primitive other than the
+guest's own atomics.
 
 Clock IDs 2/3 (CPU time) return `NOSYS`; invalid IDs return `INVAL`. The complete
 8-byte result range is checked before consulting the embedding, including
@@ -179,6 +209,10 @@ WASI_EXAMPLE="$PWD/target/wasi-examples/c-hello.wasm" \
 ./scripts/test-wasi-oracle.py --wasmtime /path/to/wasmtime-48.0.0
 (cd firmware/qemu-virt && cargo build --locked --offline --release --features wasi-ssh-upload)
 ./scripts/test-wasi-qemu.py --work target/wasi-acceptance-fresh
+# wasi-threads on the native backend (4 harts):
+(cd firmware/qemu-virt && cargo build --locked --offline --release --target riscv64gc-unknown-none-elf \
+   --features wasi-ssh-upload,wasmtime-command-fuel-batch,wasmtime-threads)
+./scripts/test-wasi-qemu.py --work target/wasi-acceptance-threads --wasmtime --fuel-batch --threads
 ```
 
 Use a fresh acceptance work directory. The QEMU harness uses real OpenSSH clients,

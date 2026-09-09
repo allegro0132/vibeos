@@ -34,7 +34,13 @@ if [ "${WASI_WASMTIME:-0}" = 1 ]; then
   else
     feature="$feature,wasmtime-command"
   fi
+  if [ "${WASI_THREADS:-0}" = 1 ]; then
+    feature="$feature,wasmtime-threads"
+  fi
   target=riscv64gc-unknown-none-elf
+fi
+if [ "${WASI_THREADS:-0}" = 1 ]; then
+  [ "${WASI_WASMTIME:-0}" = 1 ] || { echo 'wasi-threads requires Wasmtime' >&2; exit 2; }
 fi
 if [ "${WASI_FUEL_BATCH:-0}" = 1 ]; then
   [ "${WASI_WASMTIME:-0}" = 1 ] || { echo 'fuel batching requires Wasmtime' >&2; exit 2; }

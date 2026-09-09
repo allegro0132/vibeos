@@ -2150,6 +2150,12 @@ unsafe fn reclaim_faulted_component(
         unsafe { HEAP.reclaim_faulted_domain(domain) }.expect("native code probe arena reclaim");
         return exec::FaultReclaimOutcome::Reclaimed;
     }
+    #[cfg(feature = "wasmtime-threads")]
+    if unsafe { wasmtime_platform::recover_threads_probe(domain) } {
+        // Plain futures only: siblings on other harts have already detached.
+        unsafe { HEAP.reclaim_faulted_domain(domain) }.expect("parallel probe arena reclaim");
+        return exec::FaultReclaimOutcome::Reclaimed;
+    }
     #[cfg(feature = "wasmtime-guarded-memory")]
     if unsafe { wasmtime_platform::recover_memory_probe(domain) } {
         // This fixed fixture publishes no Engine/Module/TLS or service state.

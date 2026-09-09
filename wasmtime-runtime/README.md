@@ -609,3 +609,44 @@ For formal CoreMark, build `wasi-benchmark,wasmtime-command-fuel-batch`, then us
 This benchmark feature explicitly grants the long-running fuel allowance.
 The firmware ISA mask describes available extensions; code generation still
 uses GC unless `wasmtime-discovered-isa` is separately selected.
+
+### wasi-threads
+
+The `threads` crate feature (`wasmtime/custom-threads`, implies `async`) adds
+`wasi::threads`: `create_shared_memory`, `linker_threads` with a
+`ThreadSpawner`, `define_shared_memory`, and `thread_start`. `enable_threads`
+turns on the threads proposal, shared memories and a `wasmtime::ThreadHooks`
+implementation supplied by the embedding. `compile_with(.., true)` admits the
+wasi-threads contract through the shared structural inspector.
+
+Without `std` a `memory.atomic.wait*` cannot park an OS thread. The vendored
+runtime instead records the waiter as a copy-only token in a fixed 16-entry
+table per shared memory and suspends the calling guest thread's async fiber;
+`memory.atomic.notify` marks waiters and asks the hooks to wake their tokens,
+and timeouts poll a hook-supplied timer future. The wait libcalls return to
+Cranelift through the same trap sentinel as every other builtin, so dropping a
+suspended waiter unwinds the guest like any other cancelled fiber.
+
+Host memories that back a shared memory must never move: the host
+`BoundedMemoryCreator` commits a shared memory at its declared maximum. Host
+calls on shared memory copy through a per-store scratch buffer across any
+await, and `Streams::output_remaining` lets the embedding cap output across
+every thread of one command.
+
+```sh
+cargo run --locked --offline -p vibeos-wasi-runtime --example fixtures -- target/wasi-fixtures
+CARGO_TARGET_DIR="$PWD/target/wasmtime-platform" cargo build --locked \
+  --manifest-path wasmtime-runtime/Cargo.toml --features compiler,host-custom,threads --example threads-custom
+target/wasmtime-platform/debug/examples/threads-custom [--cap N] target/wasi-fixtures/threads-counter.wasm
+python3 scripts/wasmtime/test-wasi-host.py
+```
+
+`threads-custom` is a round-robin host driver standing in for the kernel
+executor: one Store per guest thread, a spawn cap (default 3), the job-wide
+output budget, and the process semantics of the kernel backend. The fixtures
+cover atomics, a counter shared by three workers with wait/notify completion,
+wait timeouts, `proc_exit` from a worker cancelling a parked main thread, the
+spawn cap, `memory.grow` visibility across stores, a worker trap and an
+all-threads busy loop ending in fuel exhaustion, plus the two admission
+rejections. Cancelling a fiber suspended inside a wait is exercised with
+`THREADS_CUSTOM_CANCEL_AFTER=1`.

@@ -13,6 +13,8 @@ use core::time::Duration;
 use wasmtime_environ::DefinedMemoryIndex;
 
 pub use crate::runtime::vm::WaitResult;
+#[cfg(has_custom_threads)]
+pub use crate::runtime::vm::threads::ThreadHooks;
 
 /// Error for out of bounds [`Memory`] access.
 #[derive(Debug)]
@@ -994,8 +996,18 @@ impl SharedMemory {
     ///
     /// This function will return an error if `addr` is not within bounds or
     /// not aligned to a 4-byte boundary.
+    #[cfg(not(has_custom_threads))]
     pub fn atomic_notify(&self, addr: u64, count: u32) -> Result<u32, Trap> {
         self.vm.atomic_notify(addr, count)
+    }
+
+    /// Equivalent of the WebAssembly `memory.atomic.notify` instruction for
+    /// this shared memory, waking suspended guest threads through the
+    /// engine's [`ThreadHooks`](crate::ThreadHooks).
+    #[cfg(has_custom_threads)]
+    pub fn atomic_notify(&self, addr: u64, count: u32) -> Result<u32, Trap> {
+        self.vm
+            .atomic_notify(addr, count, self.engine.config().thread_hooks.as_deref())
     }
 
     /// Equivalent of the WebAssembly `memory.atomic.wait32` instruction for
@@ -1031,6 +1043,7 @@ impl SharedMemory {
     ///
     /// This function will return an error if `addr` is not within bounds or
     /// not aligned to a 4-byte boundary.
+    #[cfg(not(has_custom_threads))]
     pub fn atomic_wait32(
         &self,
         addr: u64,
@@ -1038,6 +1051,23 @@ impl SharedMemory {
         timeout: Option<Duration>,
     ) -> Result<WaitResult, Trap> {
         self.vm.atomic_wait32(addr, expected, timeout)
+    }
+
+    /// Asynchronous equivalent of `memory.atomic.wait32` for embedders
+    /// without `std`; the future completes when notified or timed out.
+    #[cfg(has_custom_threads)]
+    pub async fn atomic_wait32_async(
+        &self,
+        addr: u64,
+        expected: u32,
+        timeout: Option<Duration>,
+    ) -> Result<WaitResult> {
+        let Some(hooks) = self.engine.config().thread_hooks.clone() else {
+            bail!("atomic wait requires `Config::with_thread_hooks`");
+        };
+        self.vm
+            .atomic_wait32_async(addr, expected, timeout, &*hooks)
+            .await
     }
 
     /// Equivalent of the WebAssembly `memory.atomic.wait64` instruction for
@@ -1049,6 +1079,7 @@ impl SharedMemory {
     ///
     /// Returns the same error as [`SharedMemory::atomic_wait32`] except that
     /// the specified address must be 8-byte aligned instead of 4-byte aligned.
+    #[cfg(not(has_custom_threads))]
     pub fn atomic_wait64(
         &self,
         addr: u64,
@@ -1056,6 +1087,23 @@ impl SharedMemory {
         timeout: Option<Duration>,
     ) -> Result<WaitResult, Trap> {
         self.vm.atomic_wait64(addr, expected, timeout)
+    }
+
+    /// Asynchronous equivalent of `memory.atomic.wait64` for embedders
+    /// without `std`.
+    #[cfg(has_custom_threads)]
+    pub async fn atomic_wait64_async(
+        &self,
+        addr: u64,
+        expected: u64,
+        timeout: Option<Duration>,
+    ) -> Result<WaitResult> {
+        let Some(hooks) = self.engine.config().thread_hooks.clone() else {
+            bail!("atomic wait requires `Config::with_thread_hooks`");
+        };
+        self.vm
+            .atomic_wait64_async(addr, expected, timeout, &*hooks)
+            .await
     }
 
     /// Return a reference to the [`Engine`] used to configure the shared

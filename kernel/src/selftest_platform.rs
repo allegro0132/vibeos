@@ -222,6 +222,11 @@ pub async fn run() -> Report {
         crate::wasmtime_platform::code_recovery_selftest().await;
         h.check("Wasmtime post-call and active-call raw recovery", true);
     }
+    #[cfg(feature = "wasmtime-threads")]
+    {
+        crate::wasmtime_platform::threads_recovery_selftest().await;
+        h.check("parallel tracked-domain fault recovery across harts", true);
+    }
     compiler(&mut h);
 
     for f in h.failures() {

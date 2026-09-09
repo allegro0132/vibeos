@@ -2,7 +2,7 @@
 //! The command service must add admission limits, scheduling and capability policy
 //! before exposing this adapter to uploaded programs.
 use alloc::{string::String, vec::Vec};
-use wasmtime::{Caller, Engine, ExternType, Linker, Memory, Module, Val, ValType};
+use wasmtime::{Caller, Engine, Extern, ExternType, Linker, Memory, Module, SharedMemory, Val, ValType};
 #[path = "../../wasi-runtime/src/abi.rs"]
 #[allow(dead_code)]
 mod abi;
@@ -19,12 +19,47 @@ impl core::fmt::Display for AdmissionError {
 impl core::error::Error for AdmissionError {}
 type WasiError = AdmissionError;
 #[derive(Clone, Copy)]
-struct WasiLimits { module_bytes: usize, memory_bytes: usize }
+struct WasiLimits { module_bytes: usize, memory_bytes: usize, threads: bool }
 
 #[cfg(feature = "async")]
 mod streams;
 #[cfg(feature = "async")]
 pub use streams::{Streams, linker_streams};
+#[cfg(feature = "threads")]
+pub mod threads;
+
+/// The guest's exported `memory`, either private to this store or the shared
+/// memory every guest thread instantiates against.
+pub(crate) enum GuestMemory { Local(Memory), Shared(SharedMemory) }
+pub(crate) fn guest_memory<T>(caller: &mut Caller<'_, T>) -> wasmtime::Result<GuestMemory> {
+    match caller.get_export("memory") {
+        Some(Extern::Memory(memory)) => Ok(GuestMemory::Local(memory)),
+        Some(Extern::SharedMemory(memory)) => Ok(GuestMemory::Shared(memory)),
+        _ => wasmtime::bail!("missing memory"),
+    }
+}
+impl GuestMemory {
+    /// Run `f` over the current guest bytes and the store data.
+    ///
+    /// For shared memory the slice aliases bytes that other guest threads may
+    /// access concurrently. Host calls only touch guest-designated ranges and
+    /// never retain the slice beyond this synchronous call, so a racing guest
+    /// observes exactly the data races the threads proposal already permits.
+    /// The base of a shared memory never moves and it only grows.
+    pub(crate) fn with_data<T, R>(&self, caller: &mut Caller<'_, T>, f: impl FnOnce(&mut [u8], &mut T) -> R) -> R {
+        match self {
+            GuestMemory::Local(memory) => {
+                let (data, state) = memory.data_and_store_mut(caller);
+                f(data, state)
+            }
+            GuestMemory::Shared(memory) => {
+                let cells = memory.data();
+                let data = unsafe { core::slice::from_raw_parts_mut(cells.as_ptr() as *mut u8, cells.len()) };
+                f(data, caller.data_mut())
+            }
+        }
+    }
+}
 
 /// Clocks are supplied explicitly by the embedding, never inferred by the runtime.
 pub trait Clock: Send + 'static {
@@ -32,6 +67,8 @@ pub trait Clock: Send + 'static {
     fn resolution(&mut self, id: u32) -> Result<u64, i32>;
 }
 pub struct Invocation<C> {
+    /// wasi-threads identifier: 0 for the main thread, >= 1 for spawned threads.
+    pub tid: u32,
     argv: Vec<Vec<u8>>,
     input: Vec<u8>,
     read: usize,
@@ -61,6 +98,7 @@ impl<C: Clock> Invocation<C> {
             wasmtime::bail!("WASI invocation limit");
         }
         Ok(Self {
+            tid: 0,
             argv: args
                 .iter()
                 .map(|s| {
@@ -231,22 +269,62 @@ fn call<C: Clock>(
 /// Apply the shared command profile's structural admission before compilation.
 /// The embedding must still supervise compiler allocations and scheduling.
 pub fn compile(engine: &Engine, bytes: &[u8]) -> wasmtime::Result<Module> {
-    validate::inspect(bytes, WasiLimits { module_bytes: 512 * 1024, memory_bytes: 16 * 1024 * 1024 })
+    compile_with(engine, bytes, false)
+}
+/// Like [`compile`]; with `threads` the wasi-threads contract is admitted:
+/// an imported shared, bounded `env.memory`, `wasi::thread-spawn`, and the
+/// `wasi_thread_start` export. The exported `memory` may then be shared.
+pub fn compile_with(engine: &Engine, bytes: &[u8], threads: bool) -> wasmtime::Result<Module> {
+    validate::inspect(bytes, WasiLimits { module_bytes: 512 * 1024, memory_bytes: 16 * 1024 * 1024, threads })
         .map_err(wasmtime::Error::new)?;
     let module = Module::new(engine, bytes)?;
     match module.get_export("memory") {
-        Some(ExternType::Memory(m)) if !m.is_shared() && !m.is_64() => (),
+        Some(ExternType::Memory(m)) if !m.is_64() && (!m.is_shared() || threads) => (),
         _ => wasmtime::bail!("memory export required"),
     }
     match module.get_export("_start") {
         Some(ExternType::Func(f)) if f.params().len() == 0 && f.results().len() == 0 => (),
         _ => wasmtime::bail!("_start: () -> () required"),
     }
+    if uses_threads(&module) {
+        match module.get_export(THREAD_START_EXPORT) {
+            Some(ExternType::Func(f))
+                if f.params().len() == 2
+                    && f.params().all(|p| matches!(p, ValType::I32))
+                    && f.results().len() == 0 => (),
+            _ => wasmtime::bail!("wasi_thread_start: (i32, i32) -> () required"),
+        }
+    }
     check_imports(&module)?;
     Ok(module)
 }
+/// Whether the module imports the wasi-threads shared memory. Structural
+/// admission (`validate::inspect`) has already required the full contract.
+pub fn uses_threads(module: &Module) -> bool {
+    module.imports().any(|i| i.module() == "env" && i.name() == "memory")
+}
+fn is_thread_import(import: &wasmtime::ImportType<'_>) -> bool {
+    (import.module() == THREAD_SPAWN_MODULE && import.name() == THREAD_SPAWN_NAME)
+        || (import.module() == "env" && import.name() == "memory")
+}
 fn check_imports(module: &Module) -> wasmtime::Result<()> {
     for import in module.imports() {
+        if import.module() == "env" && import.name() == "memory" {
+            match import.ty() {
+                ExternType::Memory(m) if m.is_shared() && !m.is_64() && m.maximum().is_some() => continue,
+                _ => wasmtime::bail!("env.memory must be a bounded shared memory"),
+            }
+        }
+        if import.module() == THREAD_SPAWN_MODULE && import.name() == THREAD_SPAWN_NAME {
+            match import.ty() {
+                ExternType::Func(f)
+                    if f.params().len() == 1
+                        && matches!(f.params().next(), Some(ValType::I32))
+                        && f.results().len() == 1
+                        && matches!(f.results().next(), Some(ValType::I32)) => continue,
+                _ => wasmtime::bail!("wasi.thread-spawn: (i32) -> i32 required"),
+            }
+        }
         if import.module() != "wasi_snapshot_preview1" {
             wasmtime::bail!("unknown import namespace");
         }
@@ -279,6 +357,10 @@ pub fn linker<C: Clock>(
     let mut linker = Linker::new(engine);
     let mut defined = alloc::collections::BTreeSet::new();
     for import in module.imports() {
+        // The shared memory and spawner are defined by the threads embedding.
+        if is_thread_import(&import) {
+            continue;
+        }
         let ExternType::Func(ty) = import.ty() else {
             wasmtime::bail!("function required");
         };
@@ -304,13 +386,10 @@ pub fn linker<C: Clock>(
                     caller.data_mut().exit = Some(a[0] as u32);
                     wasmtime::bail!("WASI proc_exit");
                 }
-                let memory: Memory = caller
-                    .get_export("memory")
-                    .and_then(|e| e.into_memory())
-                    .ok_or_else(|| wasmtime::format_err!("missing memory"))?;
-                let (data, state) = memory.data_and_store_mut(&mut caller);
-                results[0] = Val::I32(call(&name, data, state, a).unwrap_or_else(|errno| errno));
-                if state.resource_limit_hit() {
+                let memory = guest_memory(&mut caller)?;
+                let errno = memory.with_data(&mut caller, |data, state| call(&name, data, state, a));
+                results[0] = Val::I32(errno.unwrap_or_else(|errno| errno));
+                if caller.data().resource_limit_hit() {
                     wasmtime::bail!("WASI output limit");
                 }
                 Ok(())

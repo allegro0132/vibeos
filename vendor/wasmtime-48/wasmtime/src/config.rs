@@ -170,6 +170,8 @@ pub struct Config {
     pub(crate) cache: Option<Cache>,
     #[cfg(feature = "runtime")]
     pub(crate) mem_creator: Option<Arc<dyn RuntimeMemoryCreator>>,
+    #[cfg(has_custom_threads)]
+    pub(crate) thread_hooks: Option<Arc<dyn crate::runtime::vm::threads::ThreadHooks>>,
     #[cfg(feature = "runtime")]
     pub(crate) custom_code_memory: Option<Arc<dyn CustomCodeMemory>>,
     pub(crate) allocation_strategy: InstanceAllocationStrategy,
@@ -284,6 +286,8 @@ impl Config {
             profiling_strategy: ProfilingStrategy::None,
             #[cfg(feature = "runtime")]
             mem_creator: None,
+            #[cfg(has_custom_threads)]
+            thread_hooks: None,
             #[cfg(feature = "runtime")]
             custom_code_memory: None,
             allocation_strategy: InstanceAllocationStrategy::OnDemand,
@@ -1699,6 +1703,21 @@ impl Config {
     #[cfg(feature = "runtime")]
     pub fn with_host_memory(&mut self, mem_creator: Arc<dyn MemoryCreator>) -> &mut Self {
         self.mem_creator = Some(Arc::new(MemoryCreatorProxy(mem_creator)));
+        self
+    }
+
+    /// Installs the scheduler hooks used by shared-memory waits without `std`.
+    ///
+    /// `memory.atomic.wait32/64` suspend the calling guest thread's async
+    /// fiber and complete when another thread notifies the token the hooks
+    /// reported, or when the hook-supplied timer completes. Blocking waits
+    /// fail with an error when no hooks are installed.
+    #[cfg(has_custom_threads)]
+    pub fn with_thread_hooks(
+        &mut self,
+        hooks: Arc<dyn crate::runtime::vm::threads::ThreadHooks>,
+    ) -> &mut Self {
+        self.thread_hooks = Some(hooks);
         self
     }
 

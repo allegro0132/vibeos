@@ -31,7 +31,19 @@ pub fn configuration() -> Config {
         config.cranelift_flag_enable("has_c");
     }
     config.with_host_memory(alloc::sync::Arc::new(memory::BoundedMemoryCreator));
+    // Compiling the threads proposal in must not widen the ordinary command
+    // profile: shared memory and atomics stay opt-in per engine.
+    #[cfg(feature = "threads")]
+    config.wasm_threads(false);
     config
+}
+
+/// Enable wasi-threads on this configuration. The hooks connect shared-memory
+/// waits and notifies to the embedding's scheduler; the memory creator must
+/// keep shared memories at a fixed base.
+#[cfg(all(feature = "threads", not(feature = "host-tools")))]
+pub fn enable_threads(config: &mut Config, hooks: alloc::sync::Arc<dyn wasmtime::ThreadHooks>) {
+    config.wasm_threads(true).shared_memory(true).with_thread_hooks(hooks);
 }
 
 #[cfg(feature = "native-riscv")]

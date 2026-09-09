@@ -12,6 +12,7 @@ wasmtime = { version = "=48.0.0", default-features = false, features = ["runtime
 custom-code-registry = ["wasmtime/custom-code-registry"]
 fuel-batch = ["async", "wasmtime/custom-fuel-yield"]
 async = ["wasmtime/async"]
+threads = ["async", "wasmtime/custom-threads"]
 native-signals = ["wasmtime/custom-native-signals"]
 # Required by the future kernel execution integration, not cross-compilation tools.
 native-riscv = ["compiler"]
@@ -80,3 +81,7 @@ required-features = ["compiler", "host-custom", "async"]
 [[example]]
 name = "fuel-custom"
 required-features = ["compiler", "host-custom", "fuel-batch"]
+
+[[example]]
+name = "threads-custom"
+required-features = ["compiler", "host-custom", "threads"]

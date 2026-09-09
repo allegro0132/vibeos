@@ -1202,3 +1202,58 @@ and competing work. At most 31 boundaries continue on the existing fiber; the
 executor poll. Counter records verify that bound. The host `fuel-custom` test
 exhausts identical 1000000 fuel with 99 decisions, reducing 100 polls to 4,
 and verifies dropping a pending call followed by reuse.
+
+### wasi-threads on the native backend (2026-09-09)
+
+The `wasmtime-threads` image admits the wasi-threads contract (imported shared
+bounded `env.memory`, `wasi::thread-spawn`, `wasi_thread_start`, atomics,
+`memory.atomic.wait/notify`) and runs each guest thread as a kernel task pinned
+round-robin to an online hart. The vendored runtime gains
+`runtime-no-std-threads.patch`: `threads` no longer implies `std`, shared
+memories are allocated through the host `MemoryCreator`, atomic waits suspend
+the calling fiber through the executor with copy-only waiter tokens, and the
+`threads` feature is forwarded to `wasmtime-environ`/`wasmtime-cranelift` so
+the atomic builtins keep their trap sentinels (without it the compiler emitted no
+trap check after a wait and a cancelled waiter continued into the next host
+call). Shared guest memory keeps the fixed reservation and grows by appending
+zeroed pages, so threads on other harts never lose a translation. The executor
+gains parallel tracked domains: siblings may live on any hart, and a fault
+quiesces siblings mid-poll elsewhere (they detach without destructors) before
+the arena is reclaimed raw; a poisoned lock spin faults the spinner instead of
+hanging its hart. The command service adds up to three thread slots per job, a
+job-wide output budget and a four-budget aggregate fuel ceiling.
+
+Evidence on the 4-hart QEMU image (`wasi-ssh-upload,wasmtime-command-fuel-batch,
+wasmtime-threads`, generated fixtures uploaded over SSH):
+
+| Fixture | Status | Terminal | Threads / harts |
+| --- | ---: | --- | --- |
+| `threads-atomics` (cmpxchg/xchg/sub-word rmw/fence) | 0 | Exited(0) | 0 |
+| `threads-counter` (3 workers, wait/notify) | 0 | Exited(0) | 3 on `0x7` |
+| `threads-wait-timeout` (wait32/wait64 timeouts) | 0 | Exited(0) | 0 |
+| `threads-exit` (worker `proc_exit(7)`, main parked) | 7 | Exited(7) | 1 |
+| `threads-spawn-cap` (16 spawns, `-EAGAIN` past 3) | 3 | Exited(3) | 3 on `0x7` |
+| `threads-grow` (worker grows, main reads page 2) | 0 | Exited(0) | 1 |
+| `threads-fault` (worker `unreachable`) | 125 | Trapped | 1 |
+| `threads-busy` (3 spinning workers) | 124 | LimitExceeded | 3 |
+| `threads-defined-shared`, `threads-no-start` | 126 | Denied | rejected at admission |
+
+Every terminal printed `reclaimed=true caps=0 waiters=0`, and five repeated
+`threads-counter` runs followed. `harts_used=0x7` records three distinct harts
+polling the three workers of one command. The host `threads-custom` driver
+passes the same fixtures, including cancellation of a fiber suspended inside a
+wait. The kernel selftest adds `WASMTIME THREADS PASS` (two stores on one shared
+memory: atomics, suspended wait, notify, timeout, mismatch, shared growth) and
+`WASMTIME PARALLEL RECOVERY PASS` (16 cycles of a primary fault with three
+siblings on other harts; every cycle collected siblings mid-poll on another
+hart, ran no destructor and reclaimed the arena).
+
+Two selftest checks fail identically on the unmodified base commit and are not
+caused by this work: the streaming-adapter probe still expected errno 27 at the
+output quota after the adapter was changed to unwind the guest (the probe now
+expects the unwind), and `fault/restart heap bump use stabilizes after warmup`
+fails on the one-hart configuration at HEAD. The pthreads C fixture
+(`tests/wasi/threads.c`, `--target=wasm32-wasi-threads`) is wired into
+`build-wasi-examples.sh`, `test-wasi-host.py` and `test-wasi-qemu.py --threads`
+but was not executed here because no wasi-sdk is installed on this host. No
+CoreMark or throughput claim is made for threaded guests.

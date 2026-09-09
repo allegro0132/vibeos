@@ -2002,6 +2002,7 @@ pub struct ReclaimableDomainSnapshot {
     pub home_hart: HartId,
     pub live_tasks: usize,
     pub exclusive: bool,
+    pub parallel: bool,
     pub phase: ReclaimableDomainPhase,
 }
 
@@ -2009,6 +2010,9 @@ pub struct ReclaimableDomainSnapshot {
 enum ReclaimableDomainMode {
     Shared,
     Exclusive,
+    /// Shared, and its tasks may be placed on different harts. Fault teardown
+    /// first quiesces siblings running elsewhere (see `remote_running`).
+    Parallel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2071,6 +2075,13 @@ struct ReclaimableDomainRecord {
     home_hart: HartId,
     live_tasks: usize,
     exclusive: bool,
+    /// Tasks of this domain may run on any hart. `home_hart` is then only
+    /// the first task's placement and teardown happens on the faulting hart.
+    parallel: bool,
+    /// Parallel teardown: siblings that were mid-poll on other harts when the
+    /// domain entered `TearingDown`. Each detaches itself and decrements this
+    /// before the faulting hart reclaims the arena.
+    remote_running: usize,
     exclusive_task: Option<TaskId>,
     exclusive_status: Option<usize>,
     exclusive_instance: Option<InstanceToken>,
@@ -2097,6 +2108,7 @@ impl ReclaimableDomainRecord {
             home_hart: self.home_hart,
             live_tasks: self.live_tasks,
             exclusive: self.exclusive,
+            parallel: self.parallel,
             phase: self.phase,
         }
     }
@@ -2323,6 +2335,8 @@ impl ReclaimableDomains {
             home_hart,
             live_tasks: 1,
             exclusive: true,
+            parallel: false,
+            remote_running: 0,
             exclusive_task: Some(task),
             exclusive_status: Some(Arc::as_ptr(status) as usize),
             exclusive_instance: Some(instance),
@@ -2363,7 +2377,7 @@ impl ReclaimableDomains {
         if record.phase != ReclaimableDomainPhase::Active {
             return Err(ReclaimableDomainError::NotActive);
         }
-        if record.home_hart != home_hart {
+        if record.home_hart != home_hart && !record.parallel {
             return Err(ReclaimableDomainError::WrongHome);
         }
         if record.exclusive {
@@ -2395,8 +2409,11 @@ impl ReclaimableDomains {
             if record.phase != ReclaimableDomainPhase::Active {
                 return Err(ReclaimableDomainError::NotActive);
             }
-            if record.home_hart != home_hart {
+            if record.home_hart != home_hart && !record.parallel {
                 return Err(ReclaimableDomainError::WrongHome);
+            }
+            if mode == ReclaimableDomainMode::Parallel && !record.parallel {
+                return Err(ReclaimableDomainError::LifecycleMismatch);
             }
             if record.exclusive || mode == ReclaimableDomainMode::Exclusive {
                 return Err(ReclaimableDomainError::Exclusive);
@@ -2461,6 +2478,8 @@ impl ReclaimableDomains {
             home_hart,
             live_tasks: 1,
             exclusive: mode == ReclaimableDomainMode::Exclusive,
+            parallel: mode == ReclaimableDomainMode::Parallel,
+            remote_running: 0,
             exclusive_task: (mode == ReclaimableDomainMode::Exclusive).then_some(task),
             exclusive_status: (mode == ReclaimableDomainMode::Exclusive)
                 .then_some(Arc::as_ptr(status) as usize),
@@ -2542,6 +2561,7 @@ struct ReclaimableTeardownPermit {
     home_hart: HartId,
     live_tasks: usize,
     exclusive: bool,
+    parallel: bool,
     primary_task: TaskId,
     primary_status: usize,
     instance_token: Option<InstanceToken>,
@@ -2644,7 +2664,13 @@ impl Sched {
         if record.phase != ReclaimableDomainPhase::Active {
             return Err(ReclaimableDomainError::NotActive);
         }
-        if record.home_hart != home_hart {
+        // A parallel domain is torn down on whichever hart observed the fault.
+        let home_hart = if record.parallel {
+            require_current_scheduler_hart("parallel reclaimable teardown")
+        } else {
+            home_hart
+        };
+        if record.home_hart != home_hart && !record.parallel {
             return Err(ReclaimableDomainError::WrongHome);
         }
         if record.exclusive && record.exclusive_task != Some(primary_task) {
@@ -2657,16 +2683,27 @@ impl Sched {
         if record.exclusive && record.exclusive_instance != primary_instance {
             return Err(ReclaimableDomainError::InstanceMismatch);
         }
-        if self
-            .running_tasks()
-            .any(|running| running.domain == domain && running.hart != home_hart)
-        {
-            return Err(ReclaimableDomainError::RemoteRunning);
+        // Siblings mid-poll on other harts: a parallel domain records them and
+        // waits for each to detach itself; any other domain never has them.
+        let mut remote_running = 0usize;
+        for running in self.running_tasks() {
+            if running.domain != domain || running.hart == home_hart {
+                continue;
+            }
+            if !record.parallel {
+                return Err(ReclaimableDomainError::RemoteRunning);
+            }
+            let raw = running.status.raw_state();
+            if raw != TaskState::Running as u8 && raw != CANCEL_REQUESTED {
+                return Err(ReclaimableDomainError::LifecycleMismatch);
+            }
+            remote_running += 1;
         }
-        if self
-            .tasks
-            .values()
-            .any(|task| task.domain == domain && task.queue_owner != home_hart)
+        if !record.parallel
+            && self
+                .tasks
+                .values()
+                .any(|task| task.domain == domain && task.queue_owner != home_hart)
         {
             return Err(ReclaimableDomainError::WrongHome);
         }
@@ -2684,7 +2721,7 @@ impl Sched {
             {
                 return Err(ReclaimableDomainError::LiveTaskMismatch);
             }
-        } else if self.running_tasks().any(|running| running.domain == domain) {
+        } else if !record.parallel && self.running_tasks().any(|running| running.domain == domain) {
             return Err(ReclaimableDomainError::LiveTaskMismatch);
         }
         let mapped_siblings = self
@@ -2694,6 +2731,7 @@ impl Sched {
             .count();
         let expected_live = mapped_siblings
             .checked_add(1)
+            .and_then(|live| live.checked_add(remote_running))
             .ok_or(ReclaimableDomainError::LiveTaskOverflow)?;
         if expected_live != record.live_tasks {
             return Err(ReclaimableDomainError::LiveTaskMismatch);
@@ -2719,11 +2757,22 @@ impl Sched {
                 .claim_terminal(TaskState::Faulted)
                 .expect("validated arena sibling lost its fault claim under SCHED");
         }
+        for running in self.running_tasks() {
+            if running.domain == domain && running.hart != home_hart {
+                running
+                    .status
+                    .claim_terminal(TaskState::Faulted)
+                    .expect("validated remote sibling lost its fault claim under SCHED");
+            }
+        }
 
-        self.reclaimable_domains.records[index]
-            .as_mut()
-            .expect("validated tracked-domain record remains occupied")
-            .phase = ReclaimableDomainPhase::TearingDown;
+        {
+            let record = self.reclaimable_domains.records[index]
+                .as_mut()
+                .expect("validated tracked-domain record remains occupied");
+            record.phase = ReclaimableDomainPhase::TearingDown;
+            record.remote_running = remote_running;
+        }
         if primary_running {
             self.clear_running(home_hart);
             self.harts[home_hart.index()].woken = false;
@@ -2734,6 +2783,7 @@ impl Sched {
             home_hart,
             live_tasks: record.live_tasks,
             exclusive: record.exclusive,
+            parallel: record.parallel,
             primary_task,
             primary_status: primary_status_identity,
             instance_token: record.exclusive_instance,
@@ -2750,11 +2800,14 @@ impl Sched {
         if record.phase != ReclaimableDomainPhase::TearingDown {
             return Err(ReclaimableDomainError::NotActive);
         }
-        if record.home_hart != permit.home_hart {
+        if record.home_hart != permit.home_hart && !record.parallel {
             return Err(ReclaimableDomainError::WrongHome);
         }
         if record.live_tasks != permit.live_tasks {
             return Err(ReclaimableDomainError::LiveTaskMismatch);
+        }
+        if record.remote_running != 0 {
+            return Err(ReclaimableDomainError::RemoteRunning);
         }
         if record.exclusive && record.exclusive_task != Some(permit.primary_task) {
             return Err(ReclaimableDomainError::TaskMismatch);
@@ -2808,7 +2861,7 @@ impl Sched {
         if record.phase != ReclaimableDomainPhase::Active {
             return Err(ReclaimableDomainError::NotActive);
         }
-        if record.home_hart != home_hart {
+        if record.home_hart != home_hart && !record.parallel {
             return Err(ReclaimableDomainError::WrongHome);
         }
         if record.exclusive {
@@ -2893,8 +2946,8 @@ fn assert_sched_invariants(s: &Sched) {
                 .reclaimable_domains
                 .record_exact(key, task.domain)
                 .expect("tracked task has no scheduler domain record");
-            debug_assert_eq!(
-                record.home_hart, task.queue_owner,
+            debug_assert!(
+                record.parallel || record.home_hart == task.queue_owner,
                 "tracked task {id} escaped its domain home hart"
             );
             Some(record)
@@ -2973,14 +3026,14 @@ fn assert_sched_invariants(s: &Sched) {
                 .reclaimable_domains
                 .record_exact(key, running.domain)
                 .expect("running tracked task has no scheduler domain record");
-            debug_assert_eq!(
-                record.home_hart, running.hart,
+            debug_assert!(
+                record.parallel || record.home_hart == running.hart,
                 "running tracked task {} escaped its domain home hart",
                 running.id
             );
-            debug_assert_eq!(
-                record.phase,
-                ReclaimableDomainPhase::Active,
+            debug_assert!(
+                record.phase == ReclaimableDomainPhase::Active
+                    || (record.parallel && record.phase == ReclaimableDomainPhase::TearingDown),
                 "a tearing-down domain remained runnable"
             );
         }
@@ -3323,6 +3376,47 @@ pub unsafe fn spawn_reclaimable_owned(
         "a reclaimable task needs an installed fault reclaimer"
     );
     spawn_tracked_domain(domain, current_queue_hart(), false, name, fut)
+}
+
+/// Like [`spawn_reclaimable_owned`], but later siblings spawned with
+/// [`spawn_sibling_on`] may be placed on other harts and run in parallel.
+///
+/// # Safety
+/// The contract of [`spawn_reclaimable_owned`] applies. Additionally the
+/// domain's tasks may execute concurrently on several harts: everything they
+/// share inside the arena must be synchronized for that, and any spin lock
+/// they can wait on must consult [`current_domain_tearing_down`] so a fault
+/// on one hart cannot leave a sibling spinning on a holder that will never
+/// run again.
+pub unsafe fn spawn_reclaimable_owned_parallel(
+    domain: AllocationDomain,
+    name: &str,
+    fut: impl Future<Output = ()> + Send + 'static,
+) -> TaskHandle {
+    assert!(domain.arena.is_tracked(), "a reclaimable task needs a tracked arena");
+    assert!(domain.owner != OwnerId::SYSTEM, "SYSTEM cannot be a raw-reclaimable component arena");
+    assert!(load_fault_reclaimer().is_some(), "a reclaimable task needs an installed fault reclaimer");
+    spawn_tracked_domain_mode(
+        domain,
+        current_queue_hart(),
+        false,
+        ReclaimableDomainMode::Parallel,
+        name,
+        fut,
+    )
+}
+
+/// Spawn a sibling of the calling task's parallel tracked domain onto an
+/// explicit logical hart. The task is pinned there (never stolen) and is
+/// torn down with the domain if any member faults.
+pub fn spawn_sibling_on(
+    hart: HartId,
+    name: &str,
+    fut: impl Future<Output = ()> + Send + 'static,
+) -> TaskHandle {
+    let domain = heap::current_domain();
+    assert!(domain.arena.is_tracked(), "a parallel sibling needs a tracked arena");
+    spawn_tracked_domain_mode(domain, hart, false, ReclaimableDomainMode::Parallel, name, fut)
 }
 
 /// Host-model helper that immediately spawns the sole task permitted to
@@ -5230,8 +5324,8 @@ fn teardown_faulted_domain(
                 Some(permit.key),
                 "fault victim carries a stale reclaimable-domain generation"
             );
-            assert_eq!(
-                task.queue_owner, permit.home_hart,
+            assert!(
+                permit.parallel || task.queue_owner == permit.home_hart,
                 "fault victim escaped its reclaimable-domain home hart"
             );
             if task.ready {
@@ -5303,6 +5397,108 @@ fn teardown_faulted_domain(
     }
 }
 
+impl Sched {
+    /// Whether `key` names a parallel domain whose teardown another hart has
+    /// already published. Such a domain's running siblings are detached by
+    /// their own harts instead of starting a second teardown.
+    fn parallel_teardown_in_progress(&self, key: ReclaimableDomainKey, domain: AllocationDomain) -> bool {
+        self.reclaimable_domains
+            .record_exact(key, domain)
+            .is_ok_and(|record| record.parallel && record.phase == ReclaimableDomainPhase::TearingDown)
+    }
+}
+
+/// Parallel teardown, remote side: this hart's poll of a sibling ended after
+/// the faulting hart committed the domain to `TearingDown`. Drain the task's
+/// wake edges, abandon its future without destructors (the arena is about to
+/// be reclaimed raw), release the quiescence count, and publish the terminal
+/// only after the teardown linearized.
+static PARALLEL_REMOTE_DETACHES: AtomicU64 = AtomicU64::new(0);
+/// How many parallel-domain siblings detached themselves on another hart
+/// during a teardown. Acceptance evidence for the multi-hart fault path.
+pub fn parallel_remote_detaches() -> u64 {
+    PARALLEL_REMOTE_DETACHES.load(Ordering::Relaxed)
+}
+fn detach_remote_victim(task: Task, status: Arc<TaskStatus>, key: ReclaimableDomainKey) {
+    PARALLEL_REMOTE_DETACHES.fetch_add(1, Ordering::Relaxed);
+    let id = task.id;
+    let domain = task.domain;
+    debug_assert_eq!(status.raw_state(), FAULT_COMMITTED);
+    drain_task_registrations(&status, TaskDetachReason::Faulted);
+    abandon_task_without_drop(task);
+    let mut system = heap::enter_owner(OwnerId::SYSTEM);
+    notify_fault_cleanup(id, domain);
+    system.restore();
+    {
+        let mut s = SCHED.lock();
+        let record = s.reclaimable_domains.records[key.slot as usize]
+            .as_mut()
+            .filter(|record| record.key == key && record.domain == domain)
+            .expect("remote victim outlived its tearing-down domain record");
+        record.remote_running = record
+            .remote_running
+            .checked_sub(1)
+            .expect("remote quiescence count underflow");
+        check_sched!(&s);
+    }
+    let mut spins = 0usize;
+    loop {
+        let done = {
+            let s = SCHED.lock();
+            match s.reclaimable_domains.record_exact(key, domain) {
+                Ok(record) => record.phase != ReclaimableDomainPhase::TearingDown,
+                Err(_) => true,
+            }
+        };
+        if done {
+            break;
+        }
+        spins += 1;
+        assert!(spins < (1 << 28), "parallel domain teardown did not complete");
+        core::hint::spin_loop();
+    }
+    publish_terminal(&status, TerminalClaim::new(TaskState::Faulted));
+}
+
+/// Parallel teardown, faulting side: block until every sibling that was
+/// mid-poll on another hart has detached. Siblings return from their poll at
+/// the next fuel quantum, host wait or poisoned lock spin, so this is bounded.
+fn wait_remote_quiescence(permit: ReclaimableTeardownPermit) {
+    if !permit.parallel {
+        return;
+    }
+    let mut spins = 0usize;
+    loop {
+        let remaining = {
+            let s = SCHED.lock();
+            s.reclaimable_domains
+                .record_exact(permit.key, permit.domain)
+                .map_or(0, |record| record.remote_running)
+        };
+        if remaining == 0 {
+            return;
+        }
+        spins += 1;
+        assert!(spins < (1 << 28), "parallel domain siblings did not quiesce");
+        core::hint::spin_loop();
+    }
+}
+
+/// Whether the caller's tracked allocation domain is being torn down by
+/// another hart. Long spins inside such a domain must fail instead of waiting
+/// for a holder that will never run again.
+pub fn current_domain_tearing_down() -> bool {
+    let domain = heap::current_domain();
+    if !domain.arena.is_tracked() {
+        return false;
+    }
+    let s = SCHED.lock();
+    s.reclaimable_domains
+        .index_of_arena(domain.arena)
+        .and_then(|index| s.reclaimable_domains.records[index])
+        .is_some_and(|record| record.parallel && record.phase == ReclaimableDomainPhase::TearingDown)
+}
+
 fn reclaim_and_publish(task: Task, status: &Arc<TaskStatus>, claim: TerminalClaim) {
     let result = reclaim_task(task);
     let claim = if result.faulted {
@@ -5332,6 +5528,7 @@ fn reclaim_and_publish(task: Task, status: &Arc<TaskStatus>, claim: TerminalClai
             check_sched!(&s);
             permit
         };
+        wait_remote_quiescence(permit);
         teardown_faulted_domain(permit, result.id, None, status.clone(), claim);
     } else {
         if result.faulted {
@@ -5978,6 +6175,7 @@ fn poll_once_on(hart: HartId) -> bool {
             return false;
         };
         let id = ready_dispatch.task;
+        let mut parallel_teardown = false;
         if let Some(candidate) = s.tasks.get(&id) {
             if candidate.domain.arena.is_tracked() {
                 let key = candidate
@@ -5987,23 +6185,26 @@ fn poll_once_on(hart: HartId) -> bool {
                     .reclaimable_domains
                     .record_exact(key, candidate.domain)
                     .unwrap_or_else(|error| panic!("tracked dispatch domain mismatch: {error:?}"));
-                assert_eq!(
-                    record.phase,
-                    ReclaimableDomainPhase::Active,
+                parallel_teardown =
+                    record.parallel && record.phase == ReclaimableDomainPhase::TearingDown;
+                assert!(
+                    parallel_teardown || record.phase == ReclaimableDomainPhase::Active,
                     "a non-active reclaimable domain reached dispatch"
                 );
-                assert_eq!(
-                    record.home_hart, hart,
-                    "a reclaimable task reached a non-home executor hart"
-                );
-                assert_eq!(
-                    candidate.queue_owner, record.home_hart,
-                    "reclaimable task queue owner changed"
-                );
-                assert_eq!(
-                    ready_dispatch.source, record.home_hart,
-                    "reclaimable task was dispatched from a foreign queue"
-                );
+                if !record.parallel {
+                    assert_eq!(
+                        record.home_hart, hart,
+                        "a reclaimable task reached a non-home executor hart"
+                    );
+                    assert_eq!(
+                        candidate.queue_owner, record.home_hart,
+                        "reclaimable task queue owner changed"
+                    );
+                    assert_eq!(
+                        ready_dispatch.source, record.home_hart,
+                        "reclaimable task was dispatched from a foreign queue"
+                    );
+                }
                 assert!(!candidate.stealable && !ready_dispatch.stolen);
                 if record.exclusive {
                     assert_eq!(record.live_tasks, 1);
@@ -6014,6 +6215,22 @@ fn poll_once_on(hart: HartId) -> bool {
                     );
                 }
             }
+        }
+        if parallel_teardown {
+            // Another hart committed this parallel domain to teardown after the
+            // task was queued here. Its ready entry is consumed; leave it in the
+            // map, unready, for the teardown's victim collection.
+            let task = s
+                .tasks
+                .get_mut(&id)
+                .expect("a parallel teardown candidate remains mapped");
+            debug_assert_eq!(task.status.raw_state(), FAULT_COMMITTED);
+            task.ready = false;
+            check_sched!(&s);
+            drop(s);
+            // Safety: poll_once_on is pinned to `hart` for this complete executor turn.
+            unsafe { system.restore_on_verified_hart() };
+            return true;
         }
         let mut task = s
             .tasks
@@ -6132,6 +6349,19 @@ fn poll_once_on(hart: HartId) -> bool {
                 let key = task
                     .reclaimable_domain
                     .expect("a running tracked fault has no domain generation");
+                if s.parallel_teardown_in_progress(key, task.domain) {
+                    // A sibling of a parallel domain already being torn down
+                    // faulted on this hart (for example a poisoned lock spin).
+                    // It is a remote victim of that teardown, not a new one.
+                    s.clear_running(hart);
+                    s.harts[hart.index()].woken = false;
+                    check_sched!(&s);
+                    drop(s);
+                    // Safety: this remains inside the same hart-pinned executor turn.
+                    unsafe { system.restore_on_verified_hart() };
+                    detach_remote_victim(task, status, key);
+                    return true;
+                }
                 Some(
                     s.begin_reclaimable_teardown(
                         task.domain,
@@ -6160,13 +6390,9 @@ fn poll_once_on(hart: HartId) -> bool {
             panic!("a faulted running task could not claim its terminal state");
         };
         if task.domain.arena.is_tracked() {
-            teardown_faulted_domain(
-                teardown.expect("tracked poll fault produced no teardown permit"),
-                id,
-                Some(task),
-                status,
-                claim,
-            );
+            let permit = teardown.expect("tracked poll fault produced no teardown permit");
+            wait_remote_quiescence(permit);
+            teardown_faulted_domain(permit, id, Some(task), status, claim);
         } else {
             // Ordinary tasks have no audited escape contract. Clean external
             // registrations, but conservatively leak their future allocation.
@@ -6190,6 +6416,19 @@ fn poll_once_on(hart: HartId) -> bool {
         let key = task
             .reclaimable_domain
             .expect("a running tracked task has no domain generation");
+        if s.parallel_teardown_in_progress(key, task.domain) {
+            // Another hart is tearing this parallel domain down and already
+            // committed this task to Faulted. Detach without destructors and
+            // let the teardown proceed once no sibling runs anywhere.
+            s.clear_running(hart);
+            s.harts[hart.index()].woken = false;
+            check_sched!(&s);
+            drop(s);
+            // Safety: this remains inside the same hart-pinned executor turn.
+            unsafe { system.restore_on_verified_hart() };
+            detach_remote_victim(task, status, key);
+            return true;
+        }
         s.reclaimable_domains
             .validate_active_task(key, task.domain, hart, id, &status, task.instance_token)
             .unwrap_or_else(|error| panic!("tracked poll return gate mismatch: {error:?}"));

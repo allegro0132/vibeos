@@ -2,15 +2,22 @@ use super::{WasiError, WasiLimits};
 use vibeos_component_format::PROFILE_1_LIMITS as BASE;
 use wasmparser::{Encoding, ExternalKind, Parser, Payload, TypeRef, Validator, WasmFeatures};
 
-pub(crate) fn features() -> WasmFeatures {
-    WasmFeatures::MUTABLE_GLOBAL
+/// Threads (shared memory, atomics, `memory.atomic.wait/notify`) are admitted
+/// only when the embedding executes guests on an engine with shared memory.
+pub(crate) fn features(threads: bool) -> WasmFeatures {
+    let base = WasmFeatures::MUTABLE_GLOBAL
         | WasmFeatures::SATURATING_FLOAT_TO_INT
         | WasmFeatures::SIGN_EXTENSION
         | WasmFeatures::MULTI_VALUE
         | WasmFeatures::BULK_MEMORY
         | WasmFeatures::REFERENCE_TYPES
         | WasmFeatures::FLOATS
-        | WasmFeatures::GC_TYPES
+        | WasmFeatures::GC_TYPES;
+    if threads {
+        base | WasmFeatures::THREADS
+    } else {
+        base
+    }
 }
 fn bound(count: u32, max: u32) -> Result<(), WasiError> {
     if count > max {
@@ -31,6 +38,9 @@ pub(crate) fn inspect(bytes: &[u8], limits: WasiLimits) -> Result<(), WasiError>
     let mut custom_count = 0;
     let mut memory_export = false;
     let mut start_export = false;
+    let mut thread_start_export = false;
+    let mut imports_thread_spawn = false;
+    let mut imports_shared_memory = false;
     let mut elements = 0u32;
     for payload in Parser::new(0).parse_all(bytes) {
         match payload.map_err(|_| WasiError::Malformed)? {
@@ -52,13 +62,37 @@ pub(crate) fn inspect(bytes: &[u8], limits: WasiLimits) -> Result<(), WasiError>
                     imports += 1;
                     bound(imports, BASE.max_imports)?;
                     let import = import.map_err(|_| WasiError::Malformed)?;
-                    if !matches!(import.ty, TypeRef::Func(_))
-                        || import.module != "wasi_snapshot_preview1"
-                        || super::abi::signature(import.name).is_none()
-                    {
-                        return Err(WasiError::Import);
+                    match (import.module, import.name, import.ty) {
+                        ("wasi_snapshot_preview1", name, TypeRef::Func(_))
+                            if super::abi::signature(name).is_some() =>
+                        {
+                            functions += 1;
+                        }
+                        // wasi-threads: the guest spawns through this import and
+                        // every thread instantiates the module against one
+                        // shared, bounded, imported memory.
+                        ("wasi", "thread-spawn", TypeRef::Func(_)) if limits.threads => {
+                            functions += 1;
+                            imports_thread_spawn = true;
+                        }
+                        ("env", "memory", TypeRef::Memory(memory)) if limits.threads => {
+                            if !memory.shared || memory.memory64 || memory.page_size_log2.is_some()
+                            {
+                                return Err(WasiError::Unsupported);
+                            }
+                            let Some(maximum) = memory.maximum else {
+                                return Err(WasiError::Unsupported);
+                            };
+                            let pages = (limits.memory_bytes / 65536) as u64;
+                            if memory.initial > pages || maximum > pages {
+                                return Err(WasiError::Limit);
+                            }
+                            memories = memories.checked_add(1).ok_or(WasiError::Limit)?;
+                            bound(memories, 1)?;
+                            imports_shared_memory = true;
+                        }
+                        _ => return Err(WasiError::Import),
                     }
-                    functions += 1;
                 }
             }
             Payload::FunctionSection(reader) => {
@@ -102,6 +136,8 @@ pub(crate) fn inspect(bytes: &[u8], limits: WasiLimits) -> Result<(), WasiError>
                     let export = export.map_err(|_| WasiError::Malformed)?;
                     memory_export |= export.name == "memory" && export.kind == ExternalKind::Memory;
                     start_export |= export.name == "_start" && export.kind == ExternalKind::Func;
+                    thread_start_export |=
+                        export.name == "wasi_thread_start" && export.kind == ExternalKind::Func;
                 }
             }
             Payload::StartSection { .. } => return Err(WasiError::Contract),
@@ -161,8 +197,78 @@ pub(crate) fn inspect(bytes: &[u8], limits: WasiLimits) -> Result<(), WasiError>
     if memories != 1 || !memory_export || !start_export {
         return Err(WasiError::Contract);
     }
-    Validator::new_with_features(features())
+    // A threaded command imports both halves of the wasi-threads contract and
+    // exports the per-thread entry; a single-threaded one imports neither.
+    if imports_thread_spawn != imports_shared_memory
+        || (imports_thread_spawn && !thread_start_export)
+    {
+        return Err(WasiError::Contract);
+    }
+    Validator::new_with_features(features(limits.threads))
         .validate_all(bytes)
         .map_err(|_| WasiError::Unsupported)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::{format, string::{String, ToString}};
+    /// Build a wasi-threads module from its parts: the memory declaration
+    /// (imported or defined, placed after the imports), the spawn import, and
+    /// the per-thread entry export.
+    fn module(memory: &str, imported: bool, spawn: bool, thread_start: bool) -> String {
+        let spawn = if spawn {
+            r#"(import "wasi" "thread-spawn" (func $spawn (param i32) (result i32)))"#
+        } else {
+            ""
+        };
+        let (import, define) = if imported {
+            (format!(r#"(import "env" "memory" {memory})"#), String::new())
+        } else {
+            (String::new(), memory.to_string())
+        };
+        let start = if thread_start { r#"(func (export "wasi_thread_start") (param i32 i32))"# } else { "" };
+        format!(
+            r#"(module {import} {spawn} {define} (export "memory" (memory 0))
+            (func (export "_start")
+                (drop (memory.atomic.wait32 (i32.const 0) (i32.const 1) (i64.const 0)))
+                (drop (memory.atomic.notify (i32.const 0) (i32.const 1)))
+                (drop (i32.atomic.rmw.add (i32.const 0) (i32.const 1))))
+            {start})"#
+        )
+    }
+    fn limits(threads: bool) -> WasiLimits {
+        WasiLimits { threads, ..WasiLimits::default() }
+    }
+    fn check(source: &str, threads: bool) -> Result<(), WasiError> {
+        inspect(&wat::parse_str(source).unwrap(), limits(threads))
+    }
+    #[test]
+    fn threads_contract_is_gated() {
+        let threaded = module("(memory 1 4 shared)", true, true, true);
+        assert_eq!(check(&threaded, false), Err(WasiError::Import));
+        assert_eq!(check(&threaded, true), Ok(()));
+    }
+    #[test]
+    fn threads_contract_requires_every_half() {
+        assert_eq!(check(&module("(memory 1 4 shared)", true, true, false), true), Err(WasiError::Contract));
+        assert_eq!(check(&module("(memory 1 4 shared)", true, false, true), true), Err(WasiError::Contract));
+        assert_eq!(check(&module("(memory 1 4)", false, true, true), true), Err(WasiError::Contract));
+    }
+    #[test]
+    fn shared_memory_must_be_imported_and_bounded() {
+        assert_eq!(check(&module("(memory 1 4 shared)", false, true, true), true), Err(WasiError::Unsupported));
+        assert_eq!(check(&module("(memory 1 300 shared)", true, true, true), true), Err(WasiError::Limit));
+        assert_eq!(check(&module("(memory 1 4)", true, true, true), true), Err(WasiError::Unsupported));
+        // An unbounded shared memory is malformed at the encoding level.
+        assert!(check(&module("(memory 1 4)", true, true, true).replace("(memory 1 4)", "(memory 1 shared)"), true).is_err());
+    }
+    #[test]
+    fn atomics_need_the_threads_profile() {
+        let single = r#"(module (memory (export "memory") 1)
+            (func (export "_start") (drop (i32.atomic.rmw.add (i32.const 0) (i32.const 1)))))"#;
+        assert_eq!(check(single, false), Err(WasiError::Unsupported));
+        assert_eq!(check(single, true), Ok(()));
+    }
 }

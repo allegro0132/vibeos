@@ -204,7 +204,16 @@ std = [
     "wasmtime-jit-debug?/std",
     "futures?/std",
 ]
-threads = ["std"]
+threads = [
+    "wasmtime-environ/threads",
+    "wasmtime-cranelift?/threads",
+]
+# VibeOS: no_std threads over embedder hooks (see runtime-no-std-threads.patch).
+custom-threads = [
+    "threads",
+    "async",
+    "custom-sync-primitives",
+]
 trace-log = ["wasmtime-cranelift?/trace-log"]
 wave = [
     "dep:wasm-wave",
@@ -563,4 +572,5 @@ check-cfg = [
     "cfg(arc_try_new)",
     "cfg(fuzzing)",
     "cfg(gc_zeal)",
+    "cfg(has_custom_threads)",
 ]

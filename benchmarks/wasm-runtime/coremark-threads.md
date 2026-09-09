@@ -117,6 +117,40 @@ per-sample JSON and VibeOS thread/cleanup logs remain under `--work`.
 `summary.json` contains median throughput and scaling. Failed runs retain their
 logs and must not be included as valid performance samples.
 
+## Fuel policy ownership invariants
+
+The native command keeps checking cancellation, live caller authority and the
+executor continuation probe at each 10,000-fuel boundary. Its private stdio
+CSpace contains fresh root capabilities, exports no derivations, and is only
+revoked after main and all workers have joined. Its invariant slot checks are
+therefore performed at the enclosing poll and on stream reads/writes rather than repeated
+inside the same fiber poll. The SSH loader similarly owns fresh private roots:
+the read and execution lookups validate them before launch, and the immutable
+loader plus execution invocation lease remain owned by the authority closure.
+The vsh caller's revocable authority closure is still evaluated every quantum;
+session cancellation/denial also remains live at every boundary.
+
+Each job has one main Store and at most three worker Stores. Each receives its
+total fuel once, and thread slots transition FREE → RUNNING → DONE without
+reuse. This enforces the same four-budget aggregate ceiling without a shared
+atomic increment on every quantum. Worker counters occupy separate aligned
+storage, and a pinned worker records its hart once. The quantum, maximum batch
+of 32, compiler/memory checks, per-Store fuel and reclamation rules are unchanged.
+
+Worker placement prefers non-boot harts only when they can accommodate every
+worker slot. Thus four-hart commands use harts 1/2/3 for workers, while smaller
+or sparse topologies retain all available harts. This avoids competing with
+boot-hart housekeeping without reducing worker parallelism. The policy has
+exhaustive capacity tests and one/two-hart QEMU fallback checks. The threaded
+command's periodic SYSTEM reaper is also pinned to the boot hart: leaving it
+stealable allowed it to migrate onto a worker and reintroduce contention on
+every 10 ms supervision wakeup. Its timer and cancellation policy are unchanged.
+
+Fuel continuation counters may legitimately be zero when runnable peers force
+every boundary to yield, such as multiple workers on one hart. Thread and fuel
+statistics are emitted after all joins in the common retirement path, including
+short calls and cancellation, so those exits retain placement evidence too.
+
 Verify the retained stdout against the JSON (including per-worker CRC values,
 cleanup and identical Wasm/QEMU configuration) and combine successful runs with:
 

@@ -299,12 +299,12 @@ cp /root/coremark-native /mnt/results/coremark-native
                 assert boot.count('reclaimed=true caps=0 waiters=0') >= len(matches), 'missing cleanup evidence'
                 profile = dict(name=name, spawned=int(spawned), harts_used=mask)
                 if args.fuel_batch:
-                    # Every worker must have continued on its fiber at 10,000-fuel
-                    # boundaries; the counters are the batching evidence.
+                    # The hook must be present. With ready peers (notably more
+                    # workers than harts), every boundary may correctly yield.
                     fuel = re.findall(r'WASI Wasmtime thread fuel checks=(\d+) continued=(\d+) max_batch=32', boot)
                     assert len(fuel) == len(matches), 'missing per-thread fuel batching evidence'
                     checks, continued = map(int, fuel[-1])
-                    assert 0 < continued < checks, fuel[-1]
+                    assert 0 <= continued < checks, fuel[-1]
                     profile.update(thread_fuel_checks=checks, thread_fuel_continued=continued)
                 profiles.append(profile)
                 save(work/'thread-profiles.json', profiles)

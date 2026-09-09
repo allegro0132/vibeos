@@ -2,6 +2,7 @@
 #![no_std]
 extern crate alloc;
 pub mod memory;
+pub mod placement;
 pub mod riscv_isa;
 #[cfg(feature = "compiler")]
 pub mod wasi;

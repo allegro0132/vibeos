@@ -4,7 +4,7 @@ use super::*;
 use crate::wasmtime_platform::async_call::NativeFuture;
 use vibeos_wasmtime_runtime::{wasi as w, wasmtime::{self, Engine, Store, Trap}};
 #[cfg(feature = "wasmtime-threads")]
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, AtomicUsize};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, AtomicUsize};
 static ACTIVE: SpinLock<Option<(AllocationDomain, usize)>> = SpinLock::new(None);
 pub(super) fn register(domain: AllocationDomain, job: usize) {
     let mut active = ACTIVE.lock();
@@ -26,6 +26,20 @@ pub(super) fn retire(domain: AllocationDomain, job: usize) {
     #[cfg(feature = "wasmtime-command-fuel-batch")]
     disarm_all(record);
     *active = None;
+    drop(active);
+    // All tasks have joined, including the early-stop path after main's
+    // normal exit races a worker's final cleanup. Emit these exactly once
+    // here so short runs and cancellations do not lose placement evidence.
+    #[cfg(feature = "wasmtime-threads")]
+    crate::println!("WASI Wasmtime threads spawned={} harts_used={:#x}", record.threads.next_tid.load(Ordering::Relaxed), record.threads.harts_used.load(Ordering::Relaxed));
+    #[cfg(feature = "wasmtime-command-fuel-batch")]
+    crate::println!("WASI Wasmtime fuel checks={} continued={} max_batch=32", record.native_fuel.checks.load(core::sync::atomic::Ordering::Relaxed), record.native_fuel.continued.load(core::sync::atomic::Ordering::Relaxed));
+    #[cfg(all(feature = "wasmtime-command-fuel-batch", feature = "wasmtime-threads"))]
+    {
+        use core::sync::atomic::Ordering::Relaxed;
+        let (checks, continued) = record.threads.slots.iter().fold((0, 0), |(c, k), slot| (c + slot.fuel.checks.load(Relaxed), k + slot.fuel.continued.load(Relaxed)));
+        crate::println!("WASI Wasmtime thread fuel checks={checks} continued={continued} max_batch=32");
+    }
 }
 /// Every task of the job has returned or been detached, so no fiber can
 /// consult a probe: release the task identities the batches still hold.
@@ -56,19 +70,27 @@ pub(crate) unsafe fn recover(domain: AllocationDomain) -> bool {
 }
 fn close(job: &Job) { job.native_signal.clear(); job.io.stdin.close(); job.io.stdout.close(); job.io.stderr.close(); }
 fn stopped(job: &Job) -> Option<WasiTerminal> {
+    authority_stopped(job).or_else(|| {
+        job.caps.iter().any(|cap| job.space.rights_of(*cap).is_err())
+            .then_some(WasiTerminal::Denied)
+    })
+}
+fn authority_stopped(job: &Job) -> Option<WasiTerminal> {
     #[cfg(feature = "wasmtime-threads")]
     if job.threads.cancelled.load(Ordering::Acquire) {
         return Some(job.threads.terminal());
     }
     if job.io.cancelled() {
         Some(if job.io.denied() { WasiTerminal::Denied } else { WasiTerminal::Cancelled })
-    } else if job.authority.as_ref().is_some_and(|check| !check())
-        || job.caps.iter().any(|cap| job.space.rights_of(*cap).is_err()) {
+    } else if job.authority.as_ref().is_some_and(|check| !check()) {
         Some(WasiTerminal::Denied)
     } else { None }
 }
 
 #[cfg(feature = "wasmtime-command-fuel-batch")]
+// Each hart writes its own counters at every quantum. Keep those writes out
+// of neighbouring thread/control cache lines (including 128-byte host lines).
+#[repr(align(128))]
 pub(super) struct FuelBatch {
     remaining: core::sync::atomic::AtomicUsize,
     checks: core::sync::atomic::AtomicUsize,
@@ -120,14 +142,17 @@ fn fuel_may_continue(context: usize) -> bool {
     // ready or stealable work and domain teardown through atomics.
     let probe = unsafe { &*fuel.probe.0.get() };
     let Some(probe) = probe.as_ref() else { return false };
-    if stopped(job).is_some() || remaining == 0 || !probe.may_continue() {
+    // `stopped` validated the private stdio roots before this poll. No Cap or
+    // derivation from that CSpace leaves the job, and its sole mutation is
+    // revoke_all after main and every sibling have joined (wasi::launch).
+    // Those checks cannot change on this fiber. External loader/execution
+    // authority and cancellation can change and are checked every quantum.
+    if authority_stopped(job).is_some() || remaining == 0 || !probe.may_continue() {
         return false;
     }
-    // Threads each carry a full budget; the job-wide ceiling bounds their sum.
-    #[cfg(feature = "wasmtime-threads")]
-    if !job.threads.charge_quantum(invocation_limits()) {
-        return false;
-    }
+    // Each of the fixed, non-reusable thread slots has exactly one Store,
+    // supplied total_fuel once. Together with the main Store this bounds the
+    // sum by (MAX_GUEST_THREADS + 1) * total_fuel without a shared quantum RMW.
     fuel.remaining.store(remaining - 1, Relaxed);
     fuel.continued.store(fuel.continued.load(Relaxed) + 1, Relaxed);
     true
@@ -238,17 +263,7 @@ impl Future for Guest {
                     this.future = None;
                     close(job);
                     *job.result.lock() = Some(terminal);
-                    #[cfg(feature = "wasmtime-threads")]
-                    crate::println!("WASI Wasmtime threads spawned={} harts_used={:#x}", job.threads.next_tid.load(Ordering::Relaxed), job.threads.harts_used.load(Ordering::Relaxed));
                     crate::println!("WASI Wasmtime polls={} quantum=10000 scheduler=exec", this.polls);
-                    #[cfg(feature = "wasmtime-command-fuel-batch")]
-                    crate::println!("WASI Wasmtime fuel checks={} continued={} max_batch=32", job.native_fuel.checks.load(core::sync::atomic::Ordering::Relaxed), job.native_fuel.continued.load(core::sync::atomic::Ordering::Relaxed));
-                    #[cfg(all(feature = "wasmtime-command-fuel-batch", feature = "wasmtime-threads"))]
-                    {
-                        use core::sync::atomic::Ordering::Relaxed;
-                        let (checks, continued) = job.threads.slots.iter().fold((0, 0), |(c, k), slot| (c + slot.fuel.checks.load(Relaxed), k + slot.fuel.continued.load(Relaxed)));
-                        crate::println!("WASI Wasmtime thread fuel checks={checks} continued={continued} max_batch=32");
-                    }
                     crate::println!("WASI Wasmtime profile dispatches={} polls={} check_ticks={} guest_ticks={} wall_ticks={} hz={}",
                         this.dispatches, this.polls, this.check_ticks, this.guest_ticks, crate::sbi::time() - this.started, exec::timebase_hz());
                     return Poll::Ready(());
@@ -362,6 +377,8 @@ pub(super) struct ThreadSlot {
     #[cfg(feature = "wasmtime-command-fuel-batch")]
     fuel: FuelBatch,
     handle: SpinLock<Option<exec::TaskHandle>>,
+    // Monotonic FREE -> RUNNING -> DONE for this job: never reuse a Store
+    // slot. The aggregate fuel bound relies on that fixed Store count.
     state: AtomicU8,
     tid: AtomicU32,
     start_arg: AtomicI32,
@@ -377,7 +394,6 @@ pub(super) struct Threads {
     trapped: AtomicBool,
     limit: AtomicBool,
     output_remaining: AtomicUsize,
-    fuel_spent: AtomicU64,
     /// Raw address of the arena `ThreadGroup`; zero outside the run.
     group: AtomicUsize,
     /// Bit mask of harts that polled a guest thread of this job.
@@ -402,7 +418,6 @@ impl Threads {
             trapped: AtomicBool::new(false),
             limit: AtomicBool::new(false),
             output_remaining: AtomicUsize::new(65536),
-            fuel_spent: AtomicU64::new(0),
             group: AtomicUsize::new(0),
             harts_used: AtomicUsize::new(0),
         }
@@ -422,14 +437,6 @@ impl Threads {
         else if let Some(code) = *self.exit.lock() { WasiTerminal::Exited(code) }
         else if self.trapped.load(Ordering::Acquire) { WasiTerminal::Trapped }
         else { WasiTerminal::Exited(0) }
-    }
-    fn charge_quantum(&self, limits: WasiLimits) -> bool {
-        let spent = self.fuel_spent.fetch_add(limits.poll_quantum, Ordering::AcqRel) + limits.poll_quantum;
-        if spent > limits.total_fuel.saturating_mul(MAX_GUEST_THREADS as u64 + 1) {
-            self.end(None, false, true);
-            return false;
-        }
-        true
     }
 }
 /// Wake every task of the job so parked waiters re-check cancellation.
@@ -456,10 +463,21 @@ static NEXT_HART: AtomicUsize = AtomicUsize::new(0);
 /// The next online logical hart in round-robin order.
 #[cfg(feature = "wasmtime-threads")]
 fn next_thread_hart() -> vibeos_core::runqueue::HartId {
+    use vibeos_core::runqueue::HartId;
+    let online = (0..exec::MAX_HARTS).fold(0, |mask, index| {
+        let hart = HartId::new(index).expect("hart index in range");
+        mask | if crate::ipi::is_online(hart) { 1 << index } else { 0 }
+    });
+    // Boot-hart I/O and supervision compete with CPU-bound workers. Keep it
+    // available for housekeeping when the other harts can host every slot;
+    // otherwise preserve all available parallelism, including one-hart boots.
+    let eligible = vibeos_wasmtime_runtime::placement::worker_harts(
+        online, 1 << HartId::BOOT.index(), MAX_GUEST_THREADS,
+    );
     for _ in 0..exec::MAX_HARTS {
         let index = NEXT_HART.fetch_add(1, Ordering::Relaxed) % exec::MAX_HARTS;
         let hart = vibeos_core::runqueue::HartId::new(index).expect("hart index in range");
-        if crate::ipi::is_online(hart) { return hart; }
+        if eligible & (1 << index) != 0 { return hart; }
     }
     crate::ipi::current_logical_hart().expect("thread spawn needs a registered hart")
 }
@@ -493,7 +511,7 @@ impl w::threads::ThreadSpawner for Spawner {
         // Round-robin over online harts so threads run in parallel; each task
         // stays pinned to the hart it was placed on.
         let hart = next_thread_hart();
-        let handle = exec::spawn_sibling_on(hart, "wasi-thread", ThreadTask { job: raw, index, group: Some(group), future: None });
+        let handle = exec::spawn_sibling_on(hart, "wasi-thread", ThreadTask { job: raw, index, group: Some(group), future: None, hart_recorded: false });
         *slot.handle.lock() = Some(handle);
         tid as i32
     }
@@ -506,6 +524,7 @@ struct ThreadTask {
     index: usize,
     group: Option<Arc<ThreadGroup>>,
     future: Option<Pin<Box<dyn Future<Output = ThreadOutcome> + Send>>>,
+    hart_recorded: bool,
 }
 /// See `Drop for Guest`: a worker cancelled between its last fuel yield and
 /// its next poll would otherwise keep a stale task identity in the
@@ -521,7 +540,11 @@ impl Future for ThreadTask {
         let this = self.get_mut();
         let job = unsafe { &*(this.job as *const Job) };
         let slot = &job.threads.slots[this.index];
-        job.threads.harts_used.fetch_or(1 << crate::wasmtime_platform::hart(), Ordering::Relaxed);
+        if !this.hart_recorded {
+            // Siblings stay pinned for their entire lifetime.
+            job.threads.harts_used.fetch_or(1 << crate::wasmtime_platform::hart(), Ordering::Relaxed);
+            this.hart_recorded = true;
+        }
         slot.signal.begin(cx.waker());
         let mut native_cx = Context::from_waker(&slot.signal.waker);
         for quantum in 0..32 {

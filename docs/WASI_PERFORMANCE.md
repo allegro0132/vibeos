@@ -1,6 +1,101 @@
 # WASI runtime performance investigation
 
-## Current pthread CoreMark measurement: 66a1e6c (2026-09-09)
+## Pthread runtime optimization (2026-09-10)
+
+The final four-hart VibeOS image reaches the goal of **at least 90% of Debian
+Wasmtime with fuel at every worker count**, using three interleaved performance
+samples and an independent validation-seed sample per count. M1/M2/M3 are one,
+two or three actual pthread workers plus the waiting main thread.
+
+The final paired Debian M3 run was substantially slower than the preceding
+reference. To avoid crediting that fluctuation as a runtime advantage, the
+conservative comparison below uses the **higher median at each worker count**
+from the two adjacent Debian runs. This is a sensitivity check, not an additional
+physical run. Every raw sample, including low scores, remains in the reports.
+Values are aggregate iterations/second.
+
+| Measurement | M1 | M2 | M3 |
+| --- | ---: | ---: | ---: |
+| Final VibeOS Wasmtime | 2248.13 | 4526.90 | 7013.31 |
+| Immediately paired Debian Wasmtime, fuel | 2430.80 | 4691.72 | 6353.14 |
+| Preceding Debian Wasmtime, fuel | 2421.85 | 4891.33 | 7335.88 |
+| VibeOS / conservative reference | **92.5%** | **92.6%** | **95.6%** |
+
+VibeOS ranges were 2228.19–2257.62 (M1), 4030.38–4535.20 (M2), and
+6916.96–7057.53 (M3). The paired Debian M3 range was 5850.45–6678.70;
+the preceding reference range was 7284.26–7338.88. The apparent paired M3
+advantage is not evidence of a stable advantage over Linux. VibeOS M3/M1 is
+3.12×; slightly superlinear scaling can reflect fixed costs and host variation.
+These are median throughput results, not a lower bound for individual runs.
+
+All runs use QEMU 11.0.3, `virt`, `rv64`, four harts, 1 GiB, MTTCG, VM-clock RTC,
+no `icount`, the same Wasmtime 48/compiler correctness patches, and the identical
+46,489-byte threaded Wasm (SHA-256
+`3a6b9af26c55b962a79c5fd6a3e52f850b39d1ca373178a436379970a013017f`).
+The 36 retained samples across these three runs pass per-worker CRC validation
+and last at least 18.993 seconds. All 15 final VibeOS invocations, including
+calibration, report clean reclamation and the expected distinct worker harts.
+Builds completed before the serial VM runs. Five-second process snapshots found
+no overlapping QEMU or compiler during the final pair; editor/desktop background
+load remained. Measurements ran on an Apple M3 Max (14 CPU cores, 36 GiB RAM).
+
+The optimized image is based on `8717c4c40e46f9ad964186849a749ecaa3cce674`
+plus the recorded working-tree changes; that Git revision alone does not identify
+the measured source. Benchmark ELF SHA-256:
+`1bc44062f4ad91e7f01da33bf958ee5dcac23aa037d12537754807f6fceee8d3`.
+The [verified comparison](../benchmarks/wasm-runtime/results/coremark-threads-goal90.json)
+contains exact medians, ranges, configuration and executable hashes; the
+[acceptance record](../benchmarks/wasm-runtime/results/coremark-threads-goal90-acceptance.json)
+binds source-file hashes, regressions and conservative ratios to this image.
+
+Profiling found repeated invariant private capability lookups and shared writes
+in the fuel path. Same-image measurements also correlated slower runs with worker
+placement on the boot hart. The changes remove invariant private-slot lookups
+from each in-fiber continuation, remove a shared aggregate fuel counter whose
+bound is already enforced by the fixed Store count, separate worker counter
+cache lines, and record each pinned worker's hart once. Four-hart placement leaves
+the boot hart for I/O and supervision; smaller topologies retain all online harts.
+The 10 ms SYSTEM reaper is also pinned to the boot hart: previously workers could
+steal it, reintroducing periodic scheduling contention. After this change, M1
+fuel continuations follow the expected 31-of-32 batch pattern and its measured
+range narrows. This evidence does not isolate each kernel service's time cost.
+
+Per-Store fuel remains 100 billion in the benchmark and 10 million in the ordinary
+image, with a 10,000-fuel quantum and maximum batch of 32. Live cancellation,
+caller authority, memory/compiler checks and allocation-domain reclamation are
+unchanged. The [ownership proof](../benchmarks/wasm-runtime/coremark-threads.md#fuel-policy-ownership-invariants)
+explains why private-slot checks and the aggregate counter are redundant.
+No experimental synchronous-fuel vendor patch or function optimization attribute
+is retained; neither improved fixed-work instruction-count diagnostics.
+
+The final ordinary image passes 57 thread/atomic/trap/fuel/reuse cases with clean
+reclamation. The final benchmark image passes six SSH disconnect cancellations
+within 30 seconds and six successful follow-up runs. Placement unit tests cover
+small and sparse topologies. The final image also passes all six one-hart
+fixed-work diagnostic calls and all six two-hart real-clock performance/validation
+calls (M1/M2/M3). Thread statistics now come from the common retirement
+path after all joins, fixing missing short-call diagnostics when main exit raced
+worker cleanup. A previous two-hart `icount` M3 diagnostic timed out and remains
+recorded as a failed experiment; real-clock MTTCG fallback completed. This work
+does not claim to rerun the entire original WASI acceptance matrix.
+
+Evidence and intermediate attempts remain under `target/coremark-threads/goal90/`.
+`supervisor-full` and `supervisor-debian-fuel` are the final pair;
+`isolated-debian-fuel` is the conservative reference. `supervisor-source.json`
+and `.patch` bind the build to source; build logs, regression logs and
+`supervisor-process-audit.jsonl` are adjacent. The earlier `retire-*` pair overlapped
+an external VM near the end of its Debian run and is not final acceptance evidence.
+The next `isolated-*` pair failed M1 at 88.6%, motivating the supervisor fix.
+Neither failed nor noisy experiments were deleted or substituted into medians.
+
+Comparison limits remain: Linux uses OS threads and the official Preview 1
+adapter, fixed RV64GC compilation and synchronous fuel counting; VibeOS enables
+firmware-discovered Zba/Zbb/Zbc/Zbs and retains async scheduling/capability checks.
+Compilation and upload are outside CoreMark timing. These are QEMU throughput
+measurements, not certified CoreMark ratings or physical-hardware measurements.
+Reproduction commands are in the [benchmark guide](../benchmarks/wasm-runtime/coremark-threads.md).
+
+## Previous pthread CoreMark measurement: 66a1e6c (2026-09-09)
 
 Rebuilt kernel revision `66a1e6cfed113db8f2e017f5350ee2bb41b502c6` with
 `wasi-benchmark,wasmtime-command-fuel-batch,wasmtime-threads`, using the pinned

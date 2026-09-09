@@ -305,7 +305,7 @@ fn launch(
     // anywhere quiesces them before the arena is reclaimed raw.
     #[cfg(feature = "wasmtime-threads")]
     let child = unsafe { exec::spawn_reclaimable_owned_parallel(domain, "wasi-guest", guest) };
-    exec::spawn_tracked("wasi-reaper", async move {
+    let reaper = async move {
         let exit = {
             let mut joined = pin!(child.join());
             loop {
@@ -417,7 +417,14 @@ fn launch(
             caps,
             io.pending_waiters()
         );
-    });
+    };
+    // The periodic SYSTEM supervisor belongs with boot-hart housekeeping.
+    // Letting idle workers steal it makes their future CPU-bound polls share
+    // that hart with every 10 ms wakeup, defeating worker placement isolation.
+    #[cfg(feature = "wasmtime-threads")]
+    exec::spawn_pinned_on(exec::HartId::BOOT, "wasi-reaper", reaper);
+    #[cfg(not(feature = "wasmtime-threads"))]
+    exec::spawn_tracked("wasi-reaper", reaper);
     system.restore();
     Ok(())
 }
@@ -688,13 +695,16 @@ pub fn open(
                     let mut argv = alloc::vec![name];
                     argv.extend(args);
                     let authority = Box::new(move || {
+                        // Both handles are fresh private roots, validated by
+                        // lookup_lease/lookup_as above. This closure exclusively
+                        // owns their loader CSpace and never mutates it or
+                        // exports either derivation. Retain it for the complete
+                        // invocation, but do not re-walk invariant slots at
+                        // every fuel boundary. The invocation lease retains
+                        // the granted execution right; session denial and
+                        // disconnect still revoke CommandIo at every boundary.
+                        let _keep_loader_alive = &loader;
                         service_lease.authorizes(Rights::INVOKE)
-                            && loader
-                                .rights_of(source)
-                                .is_ok_and(|r| r.contains(Rights::READ))
-                            && loader
-                                .rights_of(service)
-                                .is_ok_and(|r| r.contains(Rights::INVOKE))
                     });
                     launch(&bytes, &argv, task_io.clone(), Some(authority))?;
                     Ok(true)

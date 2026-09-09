@@ -7,6 +7,10 @@ use wasmtime::{Caller, Engine, Extern, ExternType, Linker, Memory, Module, Share
 #[allow(dead_code)]
 mod abi;
 use abi::*;
+mod profile {
+    pub const DECLARATIONS: vibeos_component_format::ProfileLimits =
+        vibeos_component_format::PROFILE_1_LIMITS;
+}
 // Share the exact declaration limits with the Wasmi command entry. This module
 // is compiled against each backend's pinned wasmparser version.
 #[path = "../../wasi-runtime/src/validate.rs"]
@@ -206,12 +210,12 @@ fn call<C: Clock>(
             fd(state)?;
             let mut buf = [0u8; 64];
             let len = if name == "fd_fdstat_get" {
-                buf[0] = 2;
+                buf[0] = 0; // UNKNOWN: byte pipe, never an interactive TTY.
                 let rights: u64 = (if p[0] == 0 { 2 } else { 64 }) | (1 << 21);
                 buf[8..16].copy_from_slice(&rights.to_le_bytes());
                 24
             } else {
-                buf[16] = 2;
+                buf[16] = 0;
                 buf[24..32].copy_from_slice(&1u64.to_le_bytes());
                 64
             };

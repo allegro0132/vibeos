@@ -4,6 +4,7 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-changed=linker-storage-bench.ld");
+    println!("cargo:rerun-if-changed=linker-python.ld");
     if env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("riscv64")
         || env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("none")
     {
@@ -12,7 +13,9 @@ fn main() {
 
     // The storage benchmark contract boots with -m 512M; qualification
     // workloads legitimately hold multi-MiB record streams in transit.
-    let script_name = if env::var_os("CARGO_FEATURE_STORAGE_BENCH").is_some() {
+    let script_name = if env::var_os("CARGO_FEATURE_PYTHON_WASI").is_some() {
+        "linker-python.ld"
+    } else if env::var_os("CARGO_FEATURE_STORAGE_BENCH").is_some() {
         "linker-storage-bench.ld"
     } else {
         "linker.ld"

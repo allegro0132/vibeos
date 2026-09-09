@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use vibeos_core::sync::SpinLock;
 use vibeos_file_store::{FileTreeRoot, FileType, RelPath};
 use vibeos_wasi_runtime::{WasiIo, WasiIoError, WasiTerminal, IO_CHUNK};
+use vibeos_wasi_runtime::profile::MODULE_BYTES;
 
 const DEPTH: usize = 8;
 struct PipeState {
@@ -251,7 +252,7 @@ pub fn digest(text: &str) -> Result<[u8; 32], u32> {
 /// its immutable content while uploads can publish a later namespace version.
 pub async fn load(root: &FileTreeRoot, path: &RelPath) -> Result<Vec<u8>, u32> {
     let (meta, reader) = root.regular_reader(path).map_err(|_| 126u32)?;
-    if meta.file_type != FileType::Regular || meta.size > 512 * 1024 {
+    if meta.file_type != FileType::Regular || meta.size > MODULE_BYTES as u64 {
         return Err(126);
     }
     load_reader(reader).await
@@ -264,7 +265,7 @@ pub async fn load_reader(reader: vibeos_file_store::FsFileReader) -> Result<Vec<
             .await
             .map_err(|_| 125u32)?
             .ok_or(125u32)?;
-        if bytes.len() + chunk.len() > 512 * 1024 {
+        if bytes.len() + chunk.len() > MODULE_BYTES {
             return Err(126);
         }
         bytes.extend_from_slice(&chunk);
@@ -278,7 +279,7 @@ pub async fn upload(
     expected: [u8; 32],
     io: &CommandIo,
 ) -> Result<(), u32> {
-    if length > 512 * 1024 || length == 0 {
+    if length > MODULE_BYTES || length == 0 {
         return Err(2);
     }
     let path = upload_path(name)?;
@@ -427,7 +428,7 @@ pub fn parse_request(source: &str) -> Option<Request> {
         }),
         "wasm-upload" if words.len() == 4 => {
             let length = words[2].parse::<usize>().ok()?;
-            if length == 0 || length > 512 * 1024 {
+            if length == 0 || length > MODULE_BYTES {
                 return None;
             }
             Some(Request::Upload {

@@ -1,4 +1,70 @@
-# WASI interpreter performance investigation
+# WASI runtime performance investigation
+
+## Current pthread CoreMark measurement: 66a1e6c (2026-09-09)
+
+Rebuilt kernel revision `66a1e6cfed113db8f2e017f5350ee2bb41b502c6` with
+`wasi-benchmark,wasmtime-command-fuel-batch,wasmtime-threads`, using the pinned
+nightly and wasi-sdk 33. No runtime optimization was changed for this measurement.
+All four runs used QEMU 11.0.3, `virt`, `rv64`, four harts, 1 GiB,
+`tcg,thread=multi`, `-rtc base=utc,clock=vm`, and no `icount`. Builds completed
+before measurement and VMs ran sequentially on an Apple M3 Max host (14 CPU
+cores, 36 GiB RAM). The native baseline compiled the
+same pinned upstream CoreMark POSIX pthread sources with Debian GCC 14.2.0
+and `-O3 -pthread -DMULTITHREAD=4 -DUSE_PTHREAD=1 -DITERATIONS=1`.
+
+Values below are median **aggregate iterations/second**, from three interleaved
+performance samples per worker count. M1/M2/M3 mean one/two/three actual pthread
+workers plus a waiting main thread, not independent processes. VibeOS currently
+has capacity for three workers and the main thread.
+
+| Platform | M1 | M2 | M3 | M3 / M1 |
+| --- | ---: | ---: | ---: | ---: |
+| VibeOS Wasmtime, bounded fuel batching | 2163.97 | 3906.73 | 5698.58 | 2.63× |
+| Debian native C pthread | 9317.84 | 18863.83 | 28183.75 | 3.02× |
+| Debian Wasmtime 48, no fuel | 2667.74 | 5365.68 | 8090.69 | 3.03× |
+| Debian Wasmtime 48, fuel | 2416.28 | 4840.18 | 7303.58 | 3.02× |
+| Native median / VibeOS median | 4.31× | 4.83× | 4.95× | — |
+
+VibeOS's M3 parallel efficiency is **87.8%**. Its M3 throughput is 70.4% of
+Linux Wasmtime without fuel, or 78.0% with fuel. Linux fuel counting reduces
+throughput by about 9–10%, without appreciably reducing scaling. VibeOS workers
+continue in the same fiber at 96.6–96.8% of fuel decisions across all three
+worker counts, confirming that batching is active. The remaining scaling gap
+therefore warrants profiling the concurrent runtime/scheduler/check paths;
+these measurements do not isolate a particular lock or establish a cause.
+
+All **48 measured samples**, including a separate validation-seed run for every
+platform/worker count, passed upstream CRC checks and lasted at least 17.334
+seconds. All **15 VibeOS invocations** (three calibrations plus twelve measured
+runs) exited zero, used the expected number of distinct worker harts, and
+reported `reclaimed=true caps=0 waiters=0`. VibeOS performance ranges were
+1851.09–2218.92 (M1), 3475.00–4297.06 (M2), and 5684.08–6145.87 (M3);
+the medians should not be interpreted as a guarantee for every run.
+
+Comparison limits: Debian Wasmtime uses the standard Linux runtime, OS threads
+and official Preview 1 adapter, with the repository's RISC-V compiler correctness
+fixes. Its compiler target is RV64GC; VibeOS additionally enables the firmware's
+Zba/Zbb/Zbc/Zbs extensions. Debian's fuel mode grants 100 billion per Store but
+does not reproduce VibeOS's asynchronous 10,000-fuel checks, capability checks,
+allocation domains or scheduling. Compilation and upload are outside CoreMark's
+timed region. These are QEMU throughput measurements, not physical hardware or
+certified CoreMark ratings.
+
+Reproduction and native baseline options are documented in
+[`coremark-threads.md`](../benchmarks/wasm-runtime/coremark-threads.md).
+The verified [machine-readable comparison](../benchmarks/wasm-runtime/results/coremark-threads-66a1e6c.json)
+includes revision, executable hashes, ranges and scaling. Full evidence is under
+`target/coremark-threads/current/{vibeos-4h,debian-native-4h,debian-wasmtime-4h,debian-wasmtime-fuel-4h}/`:
+commands, frozen kernel/native ELF/Linux runner, stdout/stderr, boot logs,
+calibration, per-invocation profiles and environment metadata. Build logs and
+toolchain provenance are in the parent directory.
+
+The shared Wasm is 46,489 bytes, SHA-256
+`3a6b9af26c55b962a79c5fd6a3e52f850b39d1ca373178a436379970a013017f`;
+kernel SHA-256 is
+`795483f3936e5308eb01173b38c65c9c379e58aebafa1d4b84d0f6fb36a32930`.
+
+## Earlier interpreter investigation
 
 The release build inherited `opt-level = "z"` for both the Wasmi interpreter
 and shared kernel primitives. Optimizing these hot paths for size substantially
@@ -1346,5 +1412,4 @@ present in the unmodified baseline image:
   `join_threads` now clones a slot's handle and clears the slot only after that
   thread is joined, so whichever of the two paths runs last still waits.
 
-Formal results are in the section below.
-
+Current formal measurements are in the first section of this document.

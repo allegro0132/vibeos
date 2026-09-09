@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+python-wasi = ["vibeos-kernel/python-wasi"]
 wasmtime-command = ["vibeos-kernel/wasmtime-command"]
 wasmtime-command-fuel-batch = ["vibeos-kernel/wasmtime-command-fuel-batch"]
 wasmtime-threads = ["vibeos-kernel/wasmtime-threads"]

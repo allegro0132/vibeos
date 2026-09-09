@@ -8,6 +8,7 @@ extern crate alloc;
 pub use wasmi::native;
 mod abi;
 mod validate;
+pub mod profile;
 use abi::*;
 use alloc::{
     string::{String, ToString},
@@ -44,14 +45,14 @@ pub struct WasiLimits {
 impl Default for WasiLimits {
     fn default() -> Self {
         Self {
-            module_bytes: 512 * 1024,
-            memory_bytes: 16 * 1024 * 1024,
-            allocation_bytes: 32 * 1024 * 1024,
+            module_bytes: profile::MODULE_BYTES,
+            memory_bytes: profile::MEMORY_BYTES,
+            allocation_bytes: profile::ALLOCATION_BYTES,
             argument_bytes: 16 * 1024,
             arguments: 128,
             output_bytes: 64 * 1024,
-            total_fuel: 10_000_000,
-            poll_quantum: 10_000,
+            total_fuel: if cfg!(feature = "python-wasi") { 10_000_000_000 } else { 10_000_000 },
+            poll_quantum: if cfg!(feature = "python-wasi") { 100_000 } else { 10_000 },
             threads: false,
         }
     }
@@ -232,7 +233,7 @@ impl WasiInvocation {
             .wasm_wide_arithmetic(false)
             .consume_fuel(true)
             .ignore_custom_sections(true)
-            .set_max_recursion_depth(128)
+            .set_max_recursion_depth(profile::DECLARATIONS.max_call_depth as usize)
             .set_min_stack_height(4096)
             .set_max_stack_height(128 * 1024)
             .set_max_cached_stacks(0)
@@ -291,7 +292,7 @@ impl WasiInvocation {
         }
         let store_limits = StoreLimitsBuilder::new()
             .memory_size(limits.memory_bytes)
-            .table_elements(4096)
+            .table_elements(profile::DECLARATIONS.max_table_elements as usize)
             .instances(1)
             .memories(1)
             .tables(1)
@@ -561,12 +562,14 @@ impl WasiInvocation {
                 self.fd(a[0])?;
                 let mut buf = [0u8; 64];
                 let len = if call.name == "fd_fdstat_get" {
-                    buf[0] = 2; // CHARACTER_DEVICE; seek/tell are not granted.
+                    // Bounded byte pipes, not TTYs. WASI has no FIFO filetype;
+                    // UNKNOWN prevents libc isatty() from selecting a REPL.
+                    buf[0] = 0;
                     let rights: u64 = if a[0] == 0 { 2 } else { 64 } | (1 << 21);
                     buf[8..16].copy_from_slice(&rights.to_le_bytes());
                     24
                 } else {
-                    buf[16] = 2;
+                    buf[16] = 0;
                     buf[24..32].copy_from_slice(&1u64.to_le_bytes());
                     64
                 };

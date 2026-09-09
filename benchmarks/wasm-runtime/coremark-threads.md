@@ -10,8 +10,10 @@ controls, not benchmark scores. The Linux control instead uses
 `tools/coremark-engines/src/bin/wasmtime-threads.rs`: standard Wasmtime 48,
 official Preview 1, Linux OS threads and one Store per worker, with the same
 vendored RISC-V compiler correctness fixes as VibeOS (fs1 ABI and scalar inline
-copy). Both use the scalar RV64GC compiler target; Linux retains its normal
-virtual memory and signal traps.
+copy). Linux uses the scalar RV64GC compiler target and retains its normal
+virtual memory and signal traps. Current VibeOS command images also enable
+zba/zbb/zbc/zbs when advertised on every hart; this compiler-policy difference
+must accompany the comparison even though the QEMU CPU model is identical.
 The default matrix keeps four harts online and varies the workload through
 CoreMark's `M1`, `M2`, and `M3` arguments. These count **workers**; a separate
 main thread waits for their completion. VibeOS has four native fiber slots,
@@ -58,6 +60,16 @@ and extracts a matching kernel/initrd (on macOS use `7zz` if `7z` is absent).
 Repeat the Debian command with a fresh `--work` and `--debian-fuel` for the
 metered Linux control. `--harts 1` is a useful serial hardware control with the
 same worker counts. Each work directory is an evidence set and must be fresh.
+
+For the native Linux pthread baseline, use the same Debian image/kernel/initrd
+arguments with `--native-debian` and omit `--wasmtime`. The image must already
+contain GCC and libc development headers. The driver verifies the pinned, clean
+upstream CoreMark checkout, snapshots it, and builds it inside Debian with
+`-O3 -pthread -DMULTITHREAD=4 -DUSE_PTHREAD=1 -DITERATIONS=1`. It runs the same
+M1/M2/M3 matrix, calibration and validation as the Wasm controls. Compiler
+version, source hashes, build command and the native ELF are retained. This row
+compares native C to Wasm; its recorded module hash identifies the associated
+Wasm comparison workload, not the executable used for the native measurement.
 
 ## Interpretation and gates
 

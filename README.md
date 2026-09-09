@@ -56,6 +56,7 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
   source/VIBEEXE objects, crash-safe publication, compiler revalidation, and
   restored least authority.
 - **[docs/WASI.md](docs/WASI.md)** — opt-in raw WASI Preview 1 commands, real Rust/C standard-library examples, SSH upload, and QEMU acceptance.
+- **[docs/PYTHON_WASI.md](docs/PYTHON_WASI.md)** — self-contained CPython/WASI commands, frozen standard library, and the opt-in Python QEMU image.
 - **[docs/WASM_ROADMAP.md](docs/WASM_ROADMAP.md)** — the Component Model-first
   admitted-code plan: WIT contracts, bounded Core-WASM execution, CSpace-backed
   resources, native async, composition, durable installation, and later adapters/AOT.

@@ -1,5 +1,5 @@
 use super::{WasiError, WasiLimits};
-use vibeos_component_format::PROFILE_1_LIMITS as BASE;
+use super::profile::DECLARATIONS as BASE;
 use wasmparser::{Encoding, ExternalKind, Parser, Payload, TypeRef, Validator, WasmFeatures};
 
 /// Threads (shared memory, atomics, `memory.atomic.wait/notify`) are admitted
@@ -278,7 +278,8 @@ mod tests {
     #[test]
     fn shared_memory_must_be_imported_and_bounded() {
         assert_eq!(check(&module("(memory 1 4 shared)", false, true, true), true), Err(WasiError::Unsupported));
-        assert_eq!(check(&module("(memory 1 300 shared)", true, true, true), true), Err(WasiError::Limit));
+        let oversized = format!("(memory 1 {} shared)", WasiLimits::default().memory_bytes / 65536 + 1);
+        assert_eq!(check(&module(&oversized, true, true, true), true), Err(WasiError::Limit));
         assert_eq!(check(&module("(memory 1 4)", true, true, true), true), Err(WasiError::Unsupported));
         // An unbounded shared memory is malformed at the encoding level.
         assert!(check(&module("(memory 1 4)", true, true, true).replace("(memory 1 4)", "(memory 1 shared)"), true).is_err());
@@ -289,5 +290,16 @@ mod tests {
             (func (export "_start") (drop (i32.atomic.rmw.add (i32.const 0) (i32.const 1)))))"#;
         assert_eq!(check(single, false), Err(WasiError::Unsupported));
         assert_eq!(check(single, true), Ok(()));
+    }
+    #[test]
+    fn command_declaration_ceiling_is_enforced() {
+        let mut wat = String::from("(module (memory (export \"memory\") 1) (func (export \"_start\"))");
+        for _ in 1..BASE.max_functions {
+            wat.push_str("(func)");
+        }
+        assert_eq!(check(&(wat.clone() + ")"), false), Ok(()));
+        assert_eq!(check(&(wat + "(func))"), false), Err(WasiError::Limit));
+        let over_table = format!("(module (memory (export \"memory\") 1) (table {} funcref) (func (export \"_start\")))", BASE.max_table_elements + 1);
+        assert_eq!(check(&over_table, false), Err(WasiError::Limit));
     }
 }

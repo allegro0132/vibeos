@@ -120,7 +120,7 @@ Omitted memory/table maxima are supported; the host limiter remains authoritativ
 | `args_sizes_get`, `args_get` | UTF-8 program name and arguments, NUL terminated |
 | `environ_sizes_get`, `environ_get` | Empty environment |
 | `fd_read`, `fd_write` | fd 0 stdin, fd 1 stdout, fd 2 stderr; EOF and short transfers |
-| `fd_fdstat_get`, `fd_filestat_get`, `fd_close` | Standard-stream metadata and invocation-local close |
+| `fd_fdstat_get`, `fd_filestat_get`, `fd_close` | Non-terminal byte-pipe metadata (`UNKNOWN` file type) and invocation-local close |
 | `fd_seek`, `fd_tell` | `SPIPE` for open standard streams |
 | `fd_prestat_get`, `fd_prestat_dir_name` | `BADF`; no preopened directories |
 | `proc_exit` | Non-returning, preserves the full `u32` status |
@@ -155,6 +155,11 @@ nonzero guest values to status 1, and retains the original in `TerminalDetail::W
 There is no guest filesystem, networking, random source, or promise of the
 complete WASI standard world. Standard libraries may import such functions
 successfully but receive `NOSYS` if they use them.
+
+The separate opt-in [`python-wasi` image](PYTHON_WASI.md) runs a self-contained
+CPython/WASI command with frozen standard-library modules. It raises command
+resource ceilings explicitly and uses a single-hart, 1 GiB QEMU configuration;
+the ordinary WASI and Component profiles retain their existing resource limits.
 
 ## wasi-threads (native backend)
 

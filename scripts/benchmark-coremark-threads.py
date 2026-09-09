@@ -134,10 +134,13 @@ def main():
     p.add_argument('--samples', type=int, default=3)
     p.add_argument('--seconds', type=float, default=20)
     p.add_argument('--debian-fuel', action='store_true', help='100 billion fuel per store; not VibeOS async scheduling')
+    p.add_argument('--native-debian', action='store_true', help='Compile the same upstream POSIX pthread sources with Debian GCC -O3')
     p.add_argument('--prepare-sysroot', action='store_true', help='Debian only: install build dependencies and export sysroot, without measuring')
     p.add_argument('--fuel-batch', action='store_true', help='VibeOS kernel was built with wasmtime-command-fuel-batch: record it and require its per-thread evidence')
     p.add_argument('--icount-iterations', type=int, help='VibeOS diagnostic only: fixed iterations per worker under icount virtual time and single-thread TCG; never a formal score')
     args = p.parse_args()
+    if args.native_debian and (args.platform != 'debian' or args.debian_fuel or args.official_cli or args.prepare_sysroot):
+        p.error('--native-debian requires debian and excludes fuel/CLI/sysroot modes')
     if args.prepare_sysroot and args.platform != 'debian':
         p.error('--prepare-sysroot requires debian')
     if args.seconds < 15 or args.samples < 1 or 1 not in args.workers:
@@ -157,14 +160,23 @@ def main():
             harts=args.harts, accel='tcg,thread=multi', rtc='base=utc,clock=vm', icount=None),
         samples=args.samples, target_seconds=args.seconds, workers=args.workers)
     if args.platform == 'debian':
-        for name in ['debian_image', 'debian_kernel', 'debian_initrd'] + ([] if args.prepare_sysroot else ['wasmtime']):
+        for name in ['debian_image', 'debian_kernel', 'debian_initrd'] + ([] if args.prepare_sysroot or args.native_debian else ['wasmtime']):
             path = getattr(args, name)
             if not path: p.error(f'--{name.replace("_", "-")} required')
             path = path.resolve(strict=True); setattr(args, name, path)
             metadata[name + '_sha256'] = digest(path)
         inputs = work/'inputs'; inputs.mkdir()
         shutil.copy2(args.module, inputs/'coremark.wasm')
-        if not args.prepare_sysroot:
+        if args.native_debian:
+            source = ROOT/'target/coremark-upstream'
+            revision = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
+            assert revision == '1f483d5b8316753a742cbf5590caf5bd0a4e4777'
+            subprocess.run(['git', '-C', str(source), 'diff', '--exit-code', 'HEAD'], check=True, stdout=subprocess.DEVNULL)
+            shutil.copytree(source, inputs/'source', ignore=shutil.ignore_patterns('.git'))
+            metadata['coremark_revision'] = revision
+            metadata['source_sha256'] = {str(f.relative_to(inputs/'source')): digest(f)
+                for f in sorted((inputs/'source').rglob('*')) if f.is_file()}
+        elif not args.prepare_sysroot:
             shutil.copy2(args.wasmtime, inputs/'wasmtime')
         subprocess.run(['qemu-img', 'create', '-f', 'qcow2', '-F', 'qcow2', '-b', str(args.debian_image), str(work/'disk.qcow2')], check=True)
         command = ['qemu-system-riscv64', '-machine', 'virt', '-cpu', args.cpu, '-smp', str(args.harts),
@@ -175,7 +187,7 @@ def main():
             '-virtfs', f'local,path={inputs},mount_tag=inputs,security_model=none,readonly=on',
             '-virtfs', f'local,path={work},mount_tag=results,security_model=none', '-global', 'virtio-mmio.force-legacy=false']
         metadata['fuel'] = 100_000_000_000 if args.debian_fuel else None
-        metadata['runner'] = 'sysroot-preparation' if args.prepare_sysroot else 'official-cli' if args.official_cli else 'std-linux-threads'
+        metadata['runner'] = 'native-pthreads' if args.native_debian else 'sysroot-preparation' if args.prepare_sysroot else 'official-cli' if args.official_cli else 'std-linux-threads'
         if args.prepare_sysroot:
             command += ['-netdev', 'user,id=net,ipv6=off', '-device', 'virtio-net-device,netdev=net']
         save(work/'qemu-command.json', command); save(work/'environment.json', metadata)
@@ -191,8 +203,20 @@ def main():
                 serial.command("tar -C / --exclude='usr/include/linux/netfilter*' -cf /mnt/results/sysroot.tar usr/lib/riscv64-linux-gnu usr/lib/gcc usr/include", 300)
                 serial.command('sync')
                 return
-            serial.command('cp /mnt/inputs/wasmtime /root/wasmtime; chmod +x /root/wasmtime; cp /mnt/inputs/coremark.wasm /root/coremark.wasm')
-            serial.command('/root/wasmtime --version >> /mnt/results/guest-environment.txt')
+            if args.native_debian:
+                build = '''set -eu
+mkdir -p /root/coremark-threads
+cp -r /mnt/inputs/source/. /root/coremark-threads/
+cd /root/coremark-threads
+cc -O3 -pthread -DMULTITHREAD=4 -DUSE_PTHREAD=1 -DITERATIONS=1 '-DFLAGS_STR="-O3 -pthread -DMULTITHREAD=4 -DUSE_PTHREAD=1 -DITERATIONS=1"' '-DMEM_LOCATION="Debian process memory"' -I. -Iposix core_list_join.c core_main.c core_matrix.c core_state.c core_util.c posix/core_portme.c -o /root/coremark-native
+cp /root/coremark-native /mnt/results/coremark-native
+{ cc --version; sha256sum /root/coremark-native; dpkg-query -W gcc libc6 libc6-dev; } >> /mnt/results/guest-environment.txt
+'''
+                (work/'native-build.sh').write_text(build)
+                serial.command('sh /mnt/results/native-build.sh > /mnt/results/native-build.log 2>&1')
+            else:
+                serial.command('cp /mnt/inputs/wasmtime /root/wasmtime; chmod +x /root/wasmtime; cp /mnt/inputs/coremark.wasm /root/coremark.wasm')
+                serial.command('/root/wasmtime --version >> /mnt/results/guest-environment.txt')
             if args.official_cli:
                 serial.command('/root/wasmtime run -W help > /mnt/results/wasmtime-wasm-options.txt 2>&1')
             def run(name, workers, seeds, iterations):
@@ -201,10 +225,10 @@ def main():
                     runner = f'/root/wasmtime run -W threads=y -S threads=y{fuel}'
                 else:
                     runner = '/root/wasmtime' + (' --fuel' if args.debian_fuel else '')
-                cmd = f'{runner} /root/coremark.wasm M{workers} {seeds} {iterations}'
+                cmd = f'/root/coremark-native M{workers} {seeds} {iterations}' if args.native_debian else f'{runner} /root/coremark.wasm M{workers} {seeds} {iterations}'
                 (work/f'{name}.command').write_text(cmd+'\n')
                 serial.command(f'{cmd} > /mnt/results/{name}.stdout 2> /mnt/results/{name}.stderr', 300)
-                if not args.official_cli:
+                if not args.official_cli and not args.native_debian:
                     evidence = (work/f'{name}.stderr').read_text()
                     spawned = re.search(r'scheduler=os-threads .*spawned=(\d+)', evidence)
                     assert spawned and int(spawned[1]) == workers, evidence

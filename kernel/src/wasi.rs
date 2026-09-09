@@ -34,6 +34,8 @@ use vibeos_wasi_runtime::{
     WasiClockError, WasiInvocation, WasiIo, WasiIoError, WasiLimits, WasiTerminal,
 };
 static BUSY: AtomicBool = AtomicBool::new(false);
+#[cfg(all(feature = "python-wasi", any(feature = "wasmtime-command", feature = "wasi-rv64-cache")))]
+compile_error!("python-wasi currently requires the bounded Wasmi interpreter backend");
 struct KernelIo<'a>(GuestIo<'a>);
 impl WasiIo for KernelIo<'_> {
     fn read(&mut self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<Result<usize, WasiIoError>> {
@@ -460,7 +462,7 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
             .lookup::<vibeos_file_store::FileTreeRoot>(root_cap, Rights::READ)?
             .with(|root| root.regular_reader(&path))
             .map_err(|_| Status::Denied)?;
-        if reader.0.size > 512 * 1024 {
+        if reader.0.size > vibeos_wasi_runtime::profile::MODULE_BYTES as u64 {
             return Err(Status::BudgetExceeded);
         }
         let bytes = vibeos_wasi_command::load_reader(reader.1)

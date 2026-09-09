@@ -23,7 +23,17 @@ pub(super) fn retire(domain: AllocationDomain, job: usize) {
         assert!(slot.signal.inner.0.lock().parent.is_none());
         assert!(slot.handle.lock().is_none(), "thread handle survived retirement");
     }
+    #[cfg(feature = "wasmtime-command-fuel-batch")]
+    disarm_all(record);
     *active = None;
+}
+/// Every task of the job has returned or been detached, so no fiber can
+/// consult a probe: release the task identities the batches still hold.
+#[cfg(feature = "wasmtime-command-fuel-batch")]
+fn disarm_all(job: &Job) {
+    job.native_fuel.disarm();
+    #[cfg(feature = "wasmtime-threads")]
+    for slot in &job.threads.slots { slot.fuel.disarm(); }
 }
 /// Executor quiescence plus this private exact-domain registration admits only
 /// the one job published by launch. The SYSTEM reaper keeps the loan alive.
@@ -31,6 +41,10 @@ pub(crate) unsafe fn recover(domain: AllocationDomain) -> bool {
     let raw = match *ACTIVE.lock() { Some((d, raw)) if d == domain => raw, _ => return false };
     let job = unsafe { &*(raw as *const Job) };
     close(job);
+    // Abandoned tasks never ran `disarm`; the executor has already detached
+    // them, so their probes are stale identities to drop, not live gates.
+    #[cfg(feature = "wasmtime-command-fuel-batch")]
+    disarm_all(job);
     #[cfg(feature = "wasmtime-threads")]
     {
         crate::wasmtime_platform::thread_hooks::clear_job(raw);
@@ -61,11 +75,30 @@ pub(super) struct FuelBatch {
     continued: core::sync::atomic::AtomicUsize,
     /// The owning SYSTEM job record; every thread's batch points at one job.
     job: core::sync::atomic::AtomicUsize,
+    /// The executor-validated identity of the task polling this batch's
+    /// fiber, installed before each poll and cleared when the poll returns.
+    probe: ProbeCell,
 }
+/// Written only by the polling task on its own hart, immediately before and
+/// after the fiber runs, and read only by that fiber's fuel callback. No other
+/// hart touches it, so the cell needs no lock on the quantum path.
+#[cfg(feature = "wasmtime-command-fuel-batch")]
+struct ProbeCell(core::cell::UnsafeCell<Option<exec::ContinuationProbe>>);
+#[cfg(feature = "wasmtime-command-fuel-batch")]
+unsafe impl Sync for ProbeCell {}
 #[cfg(feature = "wasmtime-command-fuel-batch")]
 impl FuelBatch {
     pub(super) fn new() -> Self {
-        Self { remaining: 0.into(), checks: 0.into(), continued: 0.into(), job: 0.into() }
+        Self { remaining: 0.into(), checks: 0.into(), continued: 0.into(), job: 0.into(), probe: ProbeCell(core::cell::UnsafeCell::new(None)) }
+    }
+    /// Validate the current task on the executor before entering its fiber.
+    /// Failure leaves no probe, so every boundary yields to the executor.
+    fn arm(&self) {
+        self.remaining.store(31, core::sync::atomic::Ordering::Relaxed);
+        unsafe { *self.probe.0.get() = exec::continuation_probe(); }
+    }
+    fn disarm(&self) {
+        unsafe { *self.probe.0.get() = None; }
     }
 }
 #[cfg(feature = "wasmtime-command-fuel-batch")]
@@ -82,8 +115,12 @@ fn fuel_may_continue(context: usize) -> bool {
     // quantum. No cancellation or authority state uses this single-writer rule.
     fuel.checks.store(fuel.checks.load(Relaxed) + 1, Relaxed);
     let remaining = fuel.remaining.load(Relaxed);
-    if stopped(job).is_some() || remaining == 0
-        || !exec::current_task_may_continue() {
+    // The lock-free probe repeats exec::current_task_may_continue(): it was
+    // validated on the executor for this exact poll and observes cancellation,
+    // ready or stealable work and domain teardown through atomics.
+    let probe = unsafe { &*fuel.probe.0.get() };
+    let Some(probe) = probe.as_ref() else { return false };
+    if stopped(job).is_some() || remaining == 0 || !probe.may_continue() {
         return false;
     }
     // Threads each carry a full budget; the job-wide ceiling bounds their sum.
@@ -147,6 +184,12 @@ pub(super) struct Guest {
     guest_ticks: u64,
 }
 impl Guest { pub(super) fn new(job: usize) -> Self { Self { job, future: None, polls: 0, dispatches: 0, started: 0, check_ticks: 0, guest_ticks: 0 } } }
+/// A task cancelled while its fiber is suspended is dropped by the executor
+/// without another poll, so the probe armed for that poll is released here.
+#[cfg(feature = "wasmtime-command-fuel-batch")]
+impl Drop for Guest {
+    fn drop(&mut self) { unsafe { &*(self.job as *const Job) }.native_fuel.disarm(); }
+}
 impl Future for Guest {
     type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
@@ -157,8 +200,6 @@ impl Future for Guest {
         // Waker storage is SYSTEM-owned. Borrow its persistent Waker instead of
         // cloning an owning SYSTEM reference onto an abandonable guest stack.
         job.native_signal.begin(cx.waker());
-        #[cfg(feature = "wasmtime-command-fuel-batch")]
-        job.native_fuel.remaining.store(31, core::sync::atomic::Ordering::Relaxed);
         let mut native_cx = Context::from_waker(&job.native_signal.waker);
         for quantum in 0..32 {
             let begin = crate::sbi::time();
@@ -175,7 +216,11 @@ impl Future for Guest {
             let begin = crate::sbi::time();
             #[cfg(feature = "wasmtime-threads")]
             crate::wasmtime_platform::thread_hooks::enter(this.job, 0);
+            #[cfg(feature = "wasmtime-command-fuel-batch")]
+            job.native_fuel.arm();
             let outcome = this.future.as_mut().unwrap().as_mut().poll(&mut native_cx);
+            #[cfg(feature = "wasmtime-command-fuel-batch")]
+            job.native_fuel.disarm();
             #[cfg(feature = "wasmtime-threads")]
             crate::wasmtime_platform::thread_hooks::leave();
             this.guest_ticks += crate::sbi::time() - begin;
@@ -198,6 +243,12 @@ impl Future for Guest {
                     crate::println!("WASI Wasmtime polls={} quantum=10000 scheduler=exec", this.polls);
                     #[cfg(feature = "wasmtime-command-fuel-batch")]
                     crate::println!("WASI Wasmtime fuel checks={} continued={} max_batch=32", job.native_fuel.checks.load(core::sync::atomic::Ordering::Relaxed), job.native_fuel.continued.load(core::sync::atomic::Ordering::Relaxed));
+                    #[cfg(all(feature = "wasmtime-command-fuel-batch", feature = "wasmtime-threads"))]
+                    {
+                        use core::sync::atomic::Ordering::Relaxed;
+                        let (checks, continued) = job.threads.slots.iter().fold((0, 0), |(c, k), slot| (c + slot.fuel.checks.load(Relaxed), k + slot.fuel.continued.load(Relaxed)));
+                        crate::println!("WASI Wasmtime thread fuel checks={checks} continued={continued} max_batch=32");
+                    }
                     crate::println!("WASI Wasmtime profile dispatches={} polls={} check_ticks={} guest_ticks={} wall_ticks={} hz={}",
                         this.dispatches, this.polls, this.check_ticks, this.guest_ticks, crate::sbi::time() - this.started, exec::timebase_hz());
                     return Poll::Ready(());
@@ -456,6 +507,13 @@ struct ThreadTask {
     group: Option<Arc<ThreadGroup>>,
     future: Option<Pin<Box<dyn Future<Output = ThreadOutcome> + Send>>>,
 }
+/// See `Drop for Guest`: a worker cancelled between its last fuel yield and
+/// its next poll would otherwise keep a stale task identity in the
+/// SYSTEM-owned batch until retirement.
+#[cfg(all(feature = "wasmtime-threads", feature = "wasmtime-command-fuel-batch"))]
+impl Drop for ThreadTask {
+    fn drop(&mut self) { unsafe { &*(self.job as *const Job) }.threads.slots[self.index].fuel.disarm(); }
+}
 #[cfg(feature = "wasmtime-threads")]
 impl Future for ThreadTask {
     type Output = ();
@@ -465,8 +523,6 @@ impl Future for ThreadTask {
         let slot = &job.threads.slots[this.index];
         job.threads.harts_used.fetch_or(1 << crate::wasmtime_platform::hart(), Ordering::Relaxed);
         slot.signal.begin(cx.waker());
-        #[cfg(feature = "wasmtime-command-fuel-batch")]
-        slot.fuel.remaining.store(31, Ordering::Relaxed);
         let mut native_cx = Context::from_waker(&slot.signal.waker);
         for quantum in 0..32 {
             if stopped(job).is_some() {
@@ -482,7 +538,11 @@ impl Future for ThreadTask {
                 this.future = Some(Box::pin(run_thread(this.job, this.index, group)));
             }
             crate::wasmtime_platform::thread_hooks::enter(this.job, this.index + 1);
+            #[cfg(feature = "wasmtime-command-fuel-batch")]
+            slot.fuel.arm();
             let outcome = this.future.as_mut().unwrap().as_mut().poll(&mut native_cx);
+            #[cfg(feature = "wasmtime-command-fuel-batch")]
+            slot.fuel.disarm();
             crate::wasmtime_platform::thread_hooks::leave();
             match outcome {
                 Poll::Pending => {
@@ -549,14 +609,22 @@ async fn run_thread(raw: usize, index: usize, group: Arc<ThreadGroup>) -> Thread
 }
 /// Cancel and join every spawned thread. Runs on the executor (not a fiber);
 /// join registrations use the SYSTEM-owned poll signal waker.
+///
+/// The slot keeps its handle until that thread has actually been joined. The
+/// main guest's own `end` makes `stopped` drop its future at the next poll
+/// boundary, which can happen while this join is still pending; a handle
+/// taken out of the slot would vanish with that future and the reaper's
+/// `reap_threads` would then retire the job while the worker was still being
+/// reclaimed on another hart, leaving the arena unclean.
 #[cfg(feature = "wasmtime-threads")]
 async fn join_threads(job: &Job) {
     wake_all(job as *const Job as usize);
     for slot in &job.threads.slots {
-        let handle = slot.handle.lock().take();
+        let handle = slot.handle.lock().clone();
         if let Some(handle) = handle {
             let _ = handle.cancel();
             handle.join().await;
+            *slot.handle.lock() = None;
         }
     }
 }

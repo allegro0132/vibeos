@@ -1257,3 +1257,94 @@ fails on the one-hart configuration at HEAD. The pthreads C fixture
 `build-wasi-examples.sh`, `test-wasi-host.py` and `test-wasi-qemu.py --threads`
 but was not executed here because no wasi-sdk is installed on this host. No
 CoreMark or throughput claim is made for threaded guests.
+
+### pthread CoreMark: fuel batching, discovered ISA, lock-free quantum gate (2026-09-09)
+
+The four-hart `wasi-benchmark,wasmtime-threads` image measured about 44% of
+the Linux Wasmtime control on `M1` (VibeOS 1,389 against Debian 3,153
+iterations/s; see `benchmarks/wasm-runtime/coremark-threads.md`). Three
+changes close most of that gap. Host-time scores on this machine vary by more
+than 10% between samples, so the code-level comparison below uses the new
+deterministic diagnostic instead: `benchmark-coremark-threads.py
+--icount-iterations 2000 --harts 1` runs a fixed 2,000 iterations per worker
+under `-icount shift=0` with single-thread TCG; two runs of one image agree to
+the instruction (892,000 per iteration twice), so differences are code, not
+noise. The virtual seconds are an instruction count, never a throughput score.
+
+| `M1` image (2,000 iterations, one hart, icount) | instructions per iteration |
+| --- | ---: |
+| `wasi-benchmark,wasmtime-threads` (the measured baseline) | 982,500 |
+| + `wasmtime-command-fuel-batch` | 892,000 |
+| + discovered zba/zbb/zbc/zbs code generation | 795,000 |
+| + lock-free continuation probe (final) | 768,500 |
+| (diagnostic only: fuel batch with every boundary check removed) | 832,500 |
+
+1. **Fuel batching** was already available (`wasmtime-command-fuel-batch`) but
+   the threads benchmark image did not select it, so every 10,000 fuel forced a
+   fiber switch and an executor round trip. The benchmark now documents and
+   records the batched image (`--fuel-batch`), and each invocation prints the
+   workers' `thread fuel checks=… continued=…` counters: on `M1` about 95% of
+   the 126,800 boundaries of a 20-second run continue on the fiber.
+2. **Discovered scalar ISA.** The Linux control compiles for plain RV64GC, and
+   VibeOS did too. `wasmtime-command` now selects `wasmtime-discovered-isa`:
+   when the boot DTB advertises zba/zbb/zbc/zbs on every schedulable hart,
+   Cranelift generates code for them. This is 10.9% fewer instructions per
+   iteration on the same module; a target without those extensions keeps
+   receiving GC code.
+3. **Lock-free quantum gate.** The batching callback used to take the per-hart
+   status lock, clone the status Arc, take the global scheduler lock, scan all
+   four ready queues and validate the domain record at every 10,000-fuel
+   boundary, about 790 instructions plus seven atomic operations that the
+   other worker harts contend on. `exec::continuation_probe()` now performs
+   that validation once per executor poll, and `ContinuationProbe::may_continue`
+   repeats the same decision from atomics: the task's cancellation state, a
+   `ReadyHint` occupancy mirror maintained inside every run-queue mutation, and
+   a domain epoch that every reclaimable-domain record transition advances.
+   The probe is armed before each fiber poll and released after it, in `Drop`
+   of the task futures, and in retire/recover. Host tests show it agreeing
+   with `current_task_may_continue()` across ready peers, yields and
+   cancellation; breaking the hint mirror or the hint check turns them red
+   (cancellation alone is also covered by the `Running` state check, so that
+   mutation is not distinguishable, as with the locked gate).
+
+Two pre-existing defects surfaced while validating multi-worker runs, both
+present in the unmodified baseline image:
+
+- **Intermittent `reclaimed=false` after a normal run** (about one in ten
+  `M2`/`M3` runs), after which the command service refused every request with
+  status 75. The allocator's `dealloc` read the block header before taking the
+  heap lock and then validated the arena links from that snapshot; a
+  neighbouring allocation or free on another hart in between (guest threads
+  share one arena) failed those checks and the free silently returned, leaving
+  the block linked and charged. The header is now read under the lock.
+  `core/tests/heap.rs` reproduces the race with two threads on one arena and
+  fails within one run when the old ordering is restored. The kernel now prints
+  what survived an unclean reclamation (size classes, allocating call sites
+  through the benchmark-only `alloc-site-trace` core feature, and the executor's
+  view), which is how the leaked object was identified: the boxed
+  `allocate_memory` future of a worker's shared-memory import.
+- **Hang after a client disconnect** in a threaded run. The reaper only woke
+  parked guest threads on authority loss; on cancellation the pipes closed but a
+  main thread parked in `memory.atomic.wait` for its join was never polled
+  again, and its workers had already stopped at their next fuel boundary. The
+  reaper now wakes every task of the job while it is cancelled, so the parked
+  thread observes the cancellation and the process ends. The disconnect test
+  kills the SSH client three seconds into `M3`/`M2` runs on the benchmark image
+  and requires `terminal=Cancelled reclaimed=true` within 30 seconds followed
+  by a clean run.
+
+- **Retirement racing a still-reclaiming worker** (once in about fifty
+  fixture runs on the ordinary-limit image, seen after `threads-counter`). When
+  main returns, `execute` calls `end` and awaits `join_threads`; that join can
+  pend, and at the next poll boundary the guest's own `end` makes `stopped`
+  drop the whole future, as it must for a main thread parked in a wait after a
+  worker's `proc_exit`. `join_threads` had taken the thread handles out of
+  their SYSTEM slots, so they vanished with the dropped future and the
+  reaper's `reap_threads` had nothing left to join: it retired the job while a
+  worker was still being reclaimed on another hart, and the arena check saw
+  the worker's entire runtime graph (291 allocations in the observed case).
+  `join_threads` now clones a slot's handle and clears the slot only after that
+  thread is joined, so whichever of the two paths runs last still waits.
+
+Formal results are in the section below.
+

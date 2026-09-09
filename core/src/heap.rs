@@ -618,6 +618,25 @@ struct AllocationHeader {
     class: usize,
     arena_prev: Option<NonNull<AllocationHeader>>,
     arena_next: Option<NonNull<AllocationHeader>>,
+    /// Return address of the allocating call (diagnostic feature only).
+    #[cfg(feature = "alloc-site-trace")]
+    site: usize,
+}
+
+/// The caller's return address, captured before anything else in `alloc`.
+#[cfg(feature = "alloc-site-trace")]
+#[inline(always)]
+fn allocation_site() -> usize {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let ra: usize;
+        unsafe { core::arch::asm!("mv {}, ra", out(reg) ra, options(nomem, nostack, preserves_flags)); }
+        ra
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1113,6 +1132,48 @@ impl Heap {
         }
     }
 
+    /// Size classes (in bytes) of the allocations still live in `arena`, oldest
+    /// first, truncated to `out.len()`; returns the total live count. This is
+    /// an allocation-free diagnostic for unclean lifecycle reports.
+    pub fn arena_live_classes(&self, arena: ArenaId, out: &mut [usize], detail: &mut [(usize, usize, [u64; 32])]) -> usize {
+        if !arena.is_tracked() {
+            return 0;
+        }
+        let h = self.0.lock();
+        let Some(index) = find_arena(&h, arena) else { return 0 };
+        let mut cursor = h.arenas[index].head;
+        let mut count = 0;
+        while let Some(header) = cursor {
+            // SAFETY: arena list nodes are live headers owned by this heap and
+            // only unlinked under the same lock held here.
+            let node = unsafe { header.as_ref() };
+            if let Some(slot) = out.get_mut(count) {
+                *slot = class_size(node.class);
+            }
+            if let Some(slot) = detail.get_mut(count) {
+                // Diagnostic only: the block's user base and its first words,
+                // enough to recognise a vtable, a pointer or text in the log.
+                // The payload follows the header at the class alignment; never
+                // read past the block's own class size.
+                let offset = size_of::<AllocationHeader>().next_multiple_of(MIN_CLASS_SIZE);
+                let words = (node.base + offset) as *const u64;
+                let available = (class_size(node.class) - offset) / size_of::<u64>();
+                let mut first = [0u64; 32];
+                for (index, word) in first.iter_mut().enumerate().take(available) {
+                    *word = unsafe { words.add(index).read_unaligned() };
+                }
+                #[cfg(feature = "alloc-site-trace")]
+                let site = node.site;
+                #[cfg(not(feature = "alloc-site-trace"))]
+                let site = 0;
+                *slot = (node.base, site, first);
+            }
+            count += 1;
+            cursor = node.arena_next;
+        }
+        count
+    }
+
     pub fn arena_stats(&self, arena: ArenaId) -> Option<ArenaStats> {
         if !arena.is_tracked() {
             return None;
@@ -1469,6 +1530,8 @@ fn user_address(base: usize, plan: AllocationPlan, layout: Layout) -> Option<usi
 
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        #[cfg(feature = "alloc-site-trace")]
+        let site = allocation_site();
         let Some(hart) = allocation_context_hart_index() else {
             // Allocating without a registered logical hart must not borrow
             // another hart's owner, arena, or diagnostic slot.
@@ -1615,6 +1678,8 @@ unsafe impl GlobalAlloc for Heap {
                 class: plan.class,
                 arena_prev: None,
                 arena_next,
+                #[cfg(feature = "alloc-site-trace")]
+                site,
             });
             if let Some(mut next) = arena_next {
                 next.as_mut().arena_prev = Some(header_ptr);
@@ -1649,6 +1714,14 @@ unsafe impl GlobalAlloc for Heap {
         }
         let header_ptr =
             unsafe { ptr.sub(size_of::<AllocationHeader>()) }.cast::<AllocationHeader>();
+        // Read the header only under the allocator lock. Its arena links are
+        // rewritten by every neighbouring allocation or free in the same
+        // arena, and guest threads on other harts share one arena: a snapshot
+        // taken before the lock could see a neighbour that has since moved,
+        // fail the link checks below, and silently leave this block linked and
+        // charged forever (an intermittent "reclaimed=false" after a normal
+        // multi-thread run).
+        let mut h = self.0.lock();
         let header = unsafe { header_ptr.read() };
         if header.magic != HEADER_MAGIC || header.class >= NUM_CLASSES {
             // A bad pointer is already a GlobalAlloc contract violation. Leak
@@ -1657,7 +1730,6 @@ unsafe impl GlobalAlloc for Heap {
         }
 
         let charge = class_size(header.class);
-        let mut h = self.0.lock();
         let Some(owner_index) = find_owner(&h, header.owner) else {
             return;
         };

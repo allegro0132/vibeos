@@ -5,7 +5,10 @@ edition = "2021"
 autobins = false
 
 [features]
-wasmtime-command = ["wasmtime-async", "wasi-preview1"]
+# Command images generate code for the scalar extensions every schedulable
+# hart advertised at boot (see `wasmtime-discovered-isa`); a target without
+# them still receives RV64GC code.
+wasmtime-command = ["wasmtime-async", "wasi-preview1", "wasmtime-discovered-isa"]
 wasmtime-command-fuel-batch = ["wasmtime-command", "vibeos-wasmtime-runtime/fuel-batch"]
 # wasi-threads on the native command backend: shared memory, atomics, and
 # up to MAX_GUEST_THREADS sibling tasks per command.
@@ -13,12 +16,16 @@ wasmtime-threads = ["wasmtime-command", "vibeos-wasmtime-runtime/threads"]
 wasmtime-async = ["vibeos-wasmtime-runtime/custom-code-registry", "wasmtime-guarded-memory", "vibeos-wasmtime-runtime/async", "dep:vibeos-wasi-command", "dep:vibeos-wasi-runtime"]
 wasmtime-guarded-memory = ["wasmtime-hardware-traps"]
 wasmtime-hardware-traps = ["wasmtime-native", "vibeos-wasmtime-runtime/native-signals"]
-# Optional experiment: discovered scalar extensions regress current QEMU TCG.
+# Generate code for the firmware-discovered scalar B extensions (zba/zbb/zbc/
+# zbs) when every schedulable hart supports them. Deterministic icount runs of
+# the pthread CoreMark module execute 10.9% fewer instructions per iteration
+# with them; an earlier wall-clock cohort could not resolve that inside host
+# noise. Default for command images; still opt-in for the bare native probe.
 wasmtime-discovered-isa = ["wasmtime-native"]
 wasmtime-coremark-probe = ["wasmtime-native"]
 wasmtime-native = ["dep:vibeos-wasmtime-runtime"]
 # Explicit long-running benchmark image; ordinary commands retain 10 million fuel.
-wasi-benchmark = ["wasi-ssh-upload"]
+wasi-benchmark = ["wasi-ssh-upload", "vibeos-core/alloc-site-trace"]
 wasi-rv64-cache = ["wasi-ssh-upload", "vibeos-wasi-runtime/rv64-cache"]
 wasi-preview1 = ["file-tree", "dep:vibeos-wasi-runtime", "dep:vibeos-wasi-command"]
 wasi-ssh-upload = ["wasi-ssh"]

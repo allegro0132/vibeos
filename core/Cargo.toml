@@ -11,6 +11,10 @@ wasm-c66-node-replacement-acceptance = []
 # Resettable allocator telemetry used only by the isolated C8.3 sampler. Keep
 # the state and successful-allocation branch out of every product image.
 wasm-c83-runtime-costs = []
+# Diagnostic: record each allocation's caller return address in its header so
+# an unclean arena can name the code that allocated what survived. Benchmark
+# images only; it widens every header by one word.
+alloc-site-trace = []
 
 [dependencies]
 vibeos-durable-format = { path = "../durable-format" }

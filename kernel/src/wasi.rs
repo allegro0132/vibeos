@@ -328,9 +328,15 @@ fn launch(
                 let job = unsafe { &*(raw as *const Job) };
                 if job.authority.as_ref().is_some_and(|check| !check()) {
                     job.io.deny();
-                    // A thread parked in an atomic wait has no I/O wait to
-                    // interrupt; wake every task so it observes the denial.
-                    #[cfg(feature = "wasmtime-threads")]
+                }
+                // A thread parked in an atomic wait has no I/O wait to
+                // interrupt: closing the pipes on cancellation (an SSH channel
+                // that went away) wakes nobody, and its siblings stop at their
+                // next fuel boundary without ever reaching the notify it waits
+                // for. Wake every task so it observes the denial or
+                // cancellation through `stopped` and the process can end.
+                #[cfg(feature = "wasmtime-threads")]
+                if job.io.cancelled() {
                     wasmtime_backend::notify_denied(raw);
                 }
             }
@@ -354,7 +360,8 @@ fn launch(
                 WasiTerminal::Cancelled
             },
         );
-        let clean = if HEAP.arena_stats(arena).is_some() {
+        let leftover = HEAP.arena_stats(arena);
+        let clean = if leftover.is_some() {
             HEAP.close_empty_domain(domain).is_ok()
         } else {
             true
@@ -373,6 +380,34 @@ fn launch(
             BUSY.store(false, Ordering::Release);
         }
         io.complete(if clean { t } else { WasiTerminal::Trapped });
+        if !clean {
+            // Name what survived so an unclean lifecycle is diagnosable from
+            // the log alone: arena bytes/allocations and owner accounting,
+            // then every live block's size class, allocating call site (with
+            // the benchmark image's `alloc-site-trace`) and first words, and
+            // the executor's view. A failed close leaves the arena in place.
+            let mut leftover_classes = [0usize; 8];
+            let mut leftover_detail = [(0usize, 0usize, [0u64; 32]); 8];
+            let leftover_count = HEAP.arena_live_classes(arena, &mut leftover_classes, &mut leftover_detail);
+            crate::println!(
+                "WASI unclean reclamation: arena={:?} owner={:?} live_classes={:?} ({} total)",
+                leftover,
+                HEAP.account_stats(owner),
+                &leftover_classes[..leftover_count.min(leftover_classes.len())],
+                leftover_count
+            );
+            for (index, (base, site, words)) in leftover_detail[..leftover_count.min(leftover_detail.len())].iter().enumerate() {
+                crate::println!("WASI unclean block base={base:#x} class={} site={site:#x} words={words:x?}", leftover_classes[index]);
+            }
+            crate::println!(
+                "WASI unclean executor: remote_detaches={} completed={} faulted={} cancelled={} domain={:?}",
+                exec::parallel_remote_detaches(), exec::completed_count(), exec::faulted_count(), exec::cancelled_count(),
+                exec::reclaimable_domain_snapshot(domain)
+            );
+            for task in exec::task_report() {
+                crate::println!("WASI unclean live task id={} name={} state={:?} owner={:?} arena={:?} polls={}", task.id.0, task.name, task.state, task.owner, task.arena, task.polls);
+            }
+        }
         crate::println!(
             "WASI terminal={:?} reclaimed={} caps={} waiters={}",
             t,

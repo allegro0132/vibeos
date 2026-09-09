@@ -87,7 +87,12 @@ class Serial:
 def measure(run, work, args):
     iterations = {}
     rows = []
+    diagnostic = args.icount_iterations is not None
     for workers in args.workers:
+        if diagnostic:
+            # Instruction-count virtual time: fixed work, no calibration, no rating.
+            iterations[workers] = args.icount_iterations
+            continue
         output = run(f'calibration-m{workers}', workers, '0 0 0x66', 1000)
         row = parse(output, workers, False)
         iterations[workers] = max(1, math.ceil(args.seconds * 1000 / row['seconds']))
@@ -98,13 +103,17 @@ def measure(run, work, args):
         for workers in args.workers:
             name = f'{sample}-m{workers}'
             output = run(name, workers, seeds, iterations[workers])
-            row = parse(output, workers)
+            row = parse(output, workers, not diagnostic)
             assert row['iterations'] == iterations[workers] * workers
             row.update(name=name, seeds=seeds, iterations_per_worker=iterations[workers])
+            if diagnostic:
+                # Virtual seconds are an instruction-count estimate, not elapsed time.
+                row.update(formal=False, mode='instruction-count-diagnostic', virtual_seconds=row.pop('seconds'))
             rows.append(row); save(work / 'results.json', rows)
             print(json.dumps(dict(platform=args.platform, **row)), flush=True)
     medians = {n: statistics.median(r['score'] for r in rows if r['workers'] == n and r['name'].startswith('performance')) for n in args.workers}
-    save(work / 'summary.json', [dict(workers=n, median_score=value, speedup=value/medians[1]) for n, value in medians.items()])
+    key = 'median_virtual_iterations_per_second' if diagnostic else 'median_score'
+    save(work / 'summary.json', [dict(workers=n, formal=not diagnostic, **{key: value}, speedup=value/medians[1]) for n, value in medians.items()])
 
 
 def main():
@@ -126,11 +135,15 @@ def main():
     p.add_argument('--seconds', type=float, default=20)
     p.add_argument('--debian-fuel', action='store_true', help='100 billion fuel per store; not VibeOS async scheduling')
     p.add_argument('--prepare-sysroot', action='store_true', help='Debian only: install build dependencies and export sysroot, without measuring')
+    p.add_argument('--fuel-batch', action='store_true', help='VibeOS kernel was built with wasmtime-command-fuel-batch: record it and require its per-thread evidence')
+    p.add_argument('--icount-iterations', type=int, help='VibeOS diagnostic only: fixed iterations per worker under icount virtual time and single-thread TCG; never a formal score')
     args = p.parse_args()
     if args.prepare_sysroot and args.platform != 'debian':
         p.error('--prepare-sysroot requires debian')
     if args.seconds < 15 or args.samples < 1 or 1 not in args.workers:
         p.error('require >=15 seconds, >=1 sample, and M1 for speedup')
+    if args.icount_iterations is not None and (args.platform != 'vibeos' or args.icount_iterations < 1):
+        p.error('--icount-iterations requires vibeos and a positive count')
     work = args.work.resolve(); work.mkdir(parents=True, exist_ok=True)
     if (work/'results.json').exists() or (work/'boot.log').exists():
         p.error('choose a fresh work directory to preserve evidence')
@@ -204,7 +217,10 @@ def main():
         if not args.kernel: p.error('--kernel required')
         shutil.copy2(args.kernel.resolve(strict=True), work/'kernel.elf')
         metadata['kernel_sha256'] = digest(work/'kernel.elf')
-        metadata['features'] = 'wasi-benchmark,wasmtime-threads'
+        metadata['features'] = 'wasi-benchmark,wasmtime-command-fuel-batch,wasmtime-threads' if args.fuel_batch else 'wasi-benchmark,wasmtime-threads'
+        if args.icount_iterations is not None:
+            metadata['measurement_mode'] = 'instruction-count-diagnostic'
+            metadata['configuration'].update(accel='tcg,thread=single', icount='shift=0,align=off,sleep=off')
         metadata['capacity_probe'] = bool(args.thread_fixture)
         if args.thread_fixture:
             metadata['capacity_probe_sha256'] = digest(args.thread_fixture)
@@ -215,7 +231,8 @@ def main():
             sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
         env = dict(os.environ, WASI_WORK_DIR=str(work), WASI_SSH_PORT=str(port), WASI_BENCHMARK='1',
             WASI_WASMTIME='1', WASI_THREADS='1', WASI_SKIP_BUILD='1', WASI_KERNEL=str(work/'kernel.elf'),
-            WASI_HARTS=str(args.harts), WASI_CPU=args.cpu, WASI_TCG_THREAD='multi', WASI_DIAGNOSTIC_ICOUNT='0', WASI_FUEL_BATCH='0', WASI_RV64_CACHE='0')
+            WASI_HARTS=str(args.harts), WASI_CPU=args.cpu, WASI_TCG_THREAD='single' if args.icount_iterations is not None else 'multi',
+            WASI_DIAGNOSTIC_ICOUNT=str(int(args.icount_iterations is not None)), WASI_FUEL_BATCH=str(int(args.fuel_batch)), WASI_RV64_CACHE='0')
         save(work/'launcher-environment.json', {k:v for k,v in env.items() if k.startswith('WASI_')})
         log = open(work/'boot.log', 'wb')
         vm = subprocess.Popen([str(ROOT/'scripts/run-wasi-qemu.sh')], cwd=ROOT, env=env, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
@@ -256,7 +273,16 @@ def main():
                 assert int(spawned) == workers, matches[-1]
                 assert int(mask, 16).bit_count() == min(workers, args.harts), matches[-1]
                 assert boot.count('reclaimed=true caps=0 waiters=0') >= len(matches), 'missing cleanup evidence'
-                profiles.append(dict(name=name, spawned=int(spawned), harts_used=mask))
+                profile = dict(name=name, spawned=int(spawned), harts_used=mask)
+                if args.fuel_batch:
+                    # Every worker must have continued on its fiber at 10,000-fuel
+                    # boundaries; the counters are the batching evidence.
+                    fuel = re.findall(r'WASI Wasmtime thread fuel checks=(\d+) continued=(\d+) max_batch=32', boot)
+                    assert len(fuel) == len(matches), 'missing per-thread fuel batching evidence'
+                    checks, continued = map(int, fuel[-1])
+                    assert 0 < continued < checks, fuel[-1]
+                    profile.update(thread_fuel_checks=checks, thread_fuel_continued=continued)
+                profiles.append(profile)
                 save(work/'thread-profiles.json', profiles)
                 return output
             measure(run, work, args)

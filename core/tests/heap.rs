@@ -1195,3 +1195,43 @@ fn fresh_domain_batch_retire_busy_or_extra_arena_never_consumes_a_peer() {
         domains.len()
     );
 }
+
+/// Guest threads on several harts free and allocate in one shared arena at
+/// once. `dealloc` must read a block's arena links under the allocator lock:
+/// a snapshot taken before the lock can see a neighbour that has since moved,
+/// fail the link checks and silently leave the block linked and charged, which
+/// surfaced as an intermittent unclean reclamation after multi-thread runs.
+#[test]
+fn concurrent_frees_in_one_arena_leave_nothing_linked() {
+    let _serial = serial();
+    let h = heap_of(32 * 1024 * 1024);
+    let owner = h.create_owner(24 * 1024 * 1024).unwrap();
+    let arena = h.create_arena(owner).unwrap();
+    let domain = AllocationDomain::new(owner, arena);
+    let mut scope = unsafe { enter_domain(domain) };
+    // Two workers churn the arena head: each free races the other's
+    // allocation for the same list position.
+    std::thread::scope(|threads| {
+        for worker in 0..2usize {
+            threads.spawn(move || {
+                let l = layout(8 + worker * 24, 8);
+                for _ in 0..100_000 {
+                    let a = unsafe { h.alloc(l) };
+                    let b = unsafe { h.alloc(l) };
+                    assert!(!a.is_null() && !b.is_null());
+                    unsafe { h.dealloc(a, l) };
+                    unsafe { h.dealloc(b, l) };
+                }
+            });
+        }
+    });
+    scope.restore();
+    let stats = h.arena_stats(arena).unwrap();
+    assert_eq!(
+        (stats.live_allocations, stats.live_bytes),
+        (0, 0),
+        "a racing free silently left blocks charged to the arena"
+    );
+    h.close_empty_domain(domain).unwrap();
+    h.unregister_owner(owner).unwrap();
+}

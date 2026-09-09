@@ -219,6 +219,14 @@ WASI_EXAMPLE="$PWD/target/wasi-examples/c-hello.wasm" \
 (cd firmware/qemu-virt && cargo build --locked --offline --release --target riscv64gc-unknown-none-elf \
    --features wasi-ssh-upload,wasmtime-command-fuel-batch,wasmtime-threads)
 ./scripts/test-wasi-qemu.py --work target/wasi-acceptance-threads --wasmtime --fuel-batch --threads
+# Thread lifecycle regressions that need no wasi-sdk on the host: interleaved
+# fixture/fault/CoreMark runs on the image above, and client disconnects
+# during long pthread CoreMark runs on the benchmark image.
+cargo run --locked --offline -p vibeos-wasi-runtime --example fixtures -- target/wasi-fixtures
+./scripts/test-wasi-threads-fixtures.py target/riscv64gc-unknown-none-elf/release/vibeos-qemu-virt \
+   target/wasi-threads-fixtures target/wasi-fixtures target/wasi-examples/c-threads.wasm \
+   target/coremark-wasi/coremark-threads.wasm
+./scripts/test-wasi-threads-disconnect.py BENCHMARK_KERNEL target/wasi-threads-disconnect 3
 ```
 
 Use a fresh acceptance work directory. The QEMU harness uses real OpenSSH clients,

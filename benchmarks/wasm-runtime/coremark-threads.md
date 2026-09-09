@@ -29,9 +29,9 @@ WASI_SDK_PATH=/path/to/wasi-sdk-33.0-arm64-macos COREMARK_THREADS=1 \
 # Use the repository's pinned Rust toolchain, not a system Homebrew rustc.
 rustup run nightly-2026-08-01 cargo build --locked --offline --release \
   -p vibeos-firmware-qemu-virt --target riscv64gc-unknown-none-elf \
-  --features wasi-benchmark,wasmtime-threads
+  --features wasi-benchmark,wasmtime-command-fuel-batch,wasmtime-threads
 
-python3 scripts/benchmark-coremark-threads.py vibeos \
+python3 scripts/benchmark-coremark-threads.py vibeos --fuel-batch \
   --work target/coremark-threads/vibeos-4h \
   --kernel target/riscv64gc-unknown-none-elf/release/vibeos-qemu-virt
 
@@ -77,6 +77,20 @@ The optional `--thread-fixture` accepts the compiled `tests/wasi/threads.c`
 program and checks `spawnmany` before measurement. It requires exactly three
 successful spawns and `EAGAIN`; any failed cleanup aborts the run. Keep this
 capacity stress result separate from successful CoreMark results.
+
+`--fuel-batch` records the bounded in-fiber fuel policy and requires every
+invocation's per-thread `thread fuel checks=… continued=…` evidence: workers
+continued on their fibers at most boundaries instead of switching to the
+executor. Without the feature the image measured ~1,450 M1 iterations/s here;
+see [WASI_PERFORMANCE.md](../../docs/WASI_PERFORMANCE.md) for the retained
+comparison. Command images also generate zba/zbb/zbc/zbs code when the
+firmware advertises them on every hart.
+
+`--icount-iterations N --harts 1` is a deterministic diagnostic: fixed work per
+worker under `-icount shift=0` and single-thread TCG, reported as virtual
+seconds and labelled `formal: false`. Two runs of one image agree to the
+instruction, so it isolates code-path changes from host noise; it is not a
+throughput score and the multi-hart round-robin variant is not deterministic.
 
 The default Debian runner has no fuel counter. `--debian-fuel` enables 100 billion
 fuel per store, but does not reproduce VibeOS's 10,000-fuel asynchronous yields,

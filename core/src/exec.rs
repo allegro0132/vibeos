@@ -25,7 +25,7 @@ use crate::arch;
 use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
 use crate::instance::{InstanceToken, MAX_COMPONENT_INSTANCES};
 use crate::ipi;
-use crate::runqueue::{EnqueueError, RunQueues};
+use crate::runqueue::{EnqueueError, ReadyHint, RunQueues};
 use crate::sync::{SpinLock, TaskRecoveryContext, TaskRecoveryKey};
 
 pub use crate::runqueue::{HartId, HartRunQueueStats, MAX_HARTS};
@@ -1066,6 +1066,74 @@ pub fn current_task_may_continue() -> bool {
         }
     }
     true
+}
+
+/// A validated identity for the task currently polled on this hart, whose
+/// [`ContinuationProbe::may_continue`] repeats the [`current_task_may_continue`]
+/// decision without taking any lock.
+///
+/// Creation performs the full locked validation. Between the executor's
+/// dispatch and the poll's return the running task cannot change, its state
+/// cannot leave `Running` except through a cancellation request, its domain
+/// record cannot change without advancing the domain epoch, and ready-queue
+/// occupancy is mirrored in [`ReadyHint`]. Each of those is an atomic read.
+pub struct ContinuationProbe {
+    status: Arc<TaskStatus>,
+    hart: HartId,
+    domain_epoch: Option<u64>,
+}
+
+impl ContinuationProbe {
+    /// Whether the probed task may keep running instead of returning to the
+    /// executor: not cancelled, still `Running`, no ready or stealable work
+    /// for its hart, and its tracked domain record unchanged since creation.
+    pub fn may_continue(&self) -> bool {
+        !self.status.cancellation_requested()
+            && self.status.raw_state() == TaskState::Running as u8
+            && READY_HINT.hart_idle(self.hart)
+            && self
+                .domain_epoch
+                .is_none_or(|epoch| DOMAIN_EPOCH.load(Ordering::Acquire) == epoch)
+    }
+}
+
+/// Validate the task currently polled on this hart and return its probe, or
+/// `None` when the locked [`current_task_may_continue`] identity checks fail.
+/// Ready work does not prevent creation; the probe reports it live.
+pub fn continuation_probe() -> Option<ContinuationProbe> {
+    let hart = current_scheduler_hart()?;
+    let status = CURRENT_TASK_STATUS[hart.index()].lock().clone()?;
+    let sched = SCHED.lock();
+    let running = sched.harts[hart.index()].running.as_ref()?;
+    if !Arc::ptr_eq(&running.status, &status)
+        || status.cancellation_requested()
+        || status.raw_state() != TaskState::Running as u8
+    {
+        return None;
+    }
+    let mut domain_epoch = None;
+    if running.domain.arena.is_tracked() {
+        // Snapshot before validating, both under SCHED, so a later bump is
+        // never hidden behind a stale snapshot.
+        let epoch = DOMAIN_EPOCH.load(Ordering::Acquire);
+        let key = running
+            .reclaimable_domain
+            .expect("tracked continuation has no domain key");
+        match sched.reclaimable_domains.validate_active_task(
+            key,
+            running.domain,
+            hart,
+            running.id,
+            &status,
+            running.instance_token,
+        ) {
+            Ok(_) => {}
+            Err(ReclaimableDomainError::NotActive) => return None,
+            Err(error) => panic!("tracked continuation gate mismatch: {error:?}"),
+        }
+        domain_epoch = Some(epoch);
+    }
+    Some(ContinuationProbe { status, hart, domain_epoch })
 }
 
 fn current_task_exact_wake() -> Option<ExactTaskWake> {
@@ -2329,6 +2397,7 @@ impl ReclaimableDomains {
 
         self.generations[index] = reservation.key.generation;
         self.reservations[index] = None;
+        bump_domain_epoch();
         self.records[index] = Some(ReclaimableDomainRecord {
             key: reservation.key,
             domain,
@@ -2472,6 +2541,7 @@ impl ReclaimableDomains {
             slot: u8::try_from(index).expect("reclaimable-domain table exceeds u8"),
             generation,
         };
+        bump_domain_epoch();
         self.records[index] = Some(ReclaimableDomainRecord {
             key,
             domain,
@@ -2500,6 +2570,7 @@ impl ReclaimableDomains {
         if record.phase != ReclaimableDomainPhase::TerminalReady {
             return Err(ReclaimableDomainError::NotActive);
         }
+        bump_domain_epoch();
         self.records[key.slot as usize] = None;
         Ok(())
     }
@@ -2586,9 +2657,20 @@ impl ReclaimableTeardownPermit {
     }
 }
 
+/// Lock-free occupancy mirror of `SCHED.ready`; see [`ContinuationProbe`].
+static READY_HINT: ReadyHint = ReadyHint::new();
+/// Incremented under `SCHED` whenever any reclaimable-domain record is
+/// created, changes phase or is released. A probe whose snapshot still matches
+/// knows its own domain record is exactly as it was validated.
+static DOMAIN_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn bump_domain_epoch() {
+    DOMAIN_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
+
 static SCHED: SpinLock<Sched> = SpinLock::new(Sched {
     tasks: BTreeMap::new(),
-    ready: RunQueues::new(),
+    ready: RunQueues::with_hint(&READY_HINT),
     reclaimable_domains: ReclaimableDomains::new(),
     pending_prepared_tasks: 0,
     harts: [const { HartRunState::new() }; MAX_HARTS],
@@ -2772,6 +2854,7 @@ impl Sched {
                 .expect("validated tracked-domain record remains occupied");
             record.phase = ReclaimableDomainPhase::TearingDown;
             record.remote_running = remote_running;
+            bump_domain_epoch();
         }
         if primary_running {
             self.clear_running(home_hart);
@@ -2841,6 +2924,7 @@ impl Sched {
             FaultReclaimOutcome::Reclaimed => ReclaimableDomainPhase::TerminalReady,
             FaultReclaimOutcome::Quarantined => ReclaimableDomainPhase::Quarantined,
         };
+        bump_domain_epoch();
         Ok(())
     }
 
@@ -2883,6 +2967,7 @@ impl Sched {
             .expect("validated reclaimable-domain record remains occupied");
         if retained.live_tasks == 1 {
             retained.phase = ReclaimableDomainPhase::TerminalReady;
+            bump_domain_epoch();
             Ok(true)
         } else {
             retained.live_tasks = retained
@@ -7613,6 +7698,36 @@ mod one_shot_wait_tests {
         run_until_idle(10_000);
         assert_eq!(observed.load(Ordering::SeqCst), 1);
         assert!(!current_task_may_continue());
+    }
+
+    #[test]
+    fn continuation_probe_tracks_ready_work_and_cancellation_without_locks() {
+        let _serial = EXECUTOR_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::arch::set_test_hart_id(0);
+        run_until_idle(10_000);
+        assert!(continuation_probe().is_none());
+        let observed = Arc::new(AtomicUsize::new(0));
+        let inside = observed.clone();
+        spawn("continuation-probe", async move {
+            let probe = continuation_probe().expect("running task has a probe");
+            assert!(probe.may_continue());
+            assert_eq!(probe.may_continue(), current_task_may_continue());
+            spawn("continuation-peer", async {});
+            assert!(!probe.may_continue());
+            assert_eq!(probe.may_continue(), current_task_may_continue());
+            yield_now().await;
+            assert!(probe.may_continue());
+            assert_eq!(probe.may_continue(), current_task_may_continue());
+            current_task_status().unwrap().request_cancel();
+            assert!(!probe.may_continue());
+            assert_eq!(probe.may_continue(), current_task_may_continue());
+            inside.store(1, Ordering::SeqCst);
+        });
+        run_until_idle(10_000);
+        assert_eq!(observed.load(Ordering::SeqCst), 1);
+        assert!(continuation_probe().is_none());
     }
 
     #[test]

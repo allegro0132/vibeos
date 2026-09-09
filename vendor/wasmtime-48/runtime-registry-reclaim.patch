@@ -1,0 +1,22 @@
+--- a/src/runtime/module/registry.rs
++++ b/src/runtime/module/registry.rs
+@@ -441,8 +441,18 @@
+         return;
+     }
+     let end = address.end - 1;
+-    let code = global_code().write().remove(end);
++    let mut registry = global_code().write();
++    let code = registry.remove(end);
+     assert!(code.is_some());
++    // VibeOS attributes allocations to the current invocation. The fallible
++    // B-tree retains its slab/forest capacity after removing its last entry;
++    // release that capacity before the invocation's allocation domain retires.
++    let retired = registry.is_empty().then(|| core::mem::take(&mut *registry));
++    drop(registry);
++    // CodeMemory destruction and platform unmapping must not hold the registry
++    // lock (trap lookup and other module teardown also acquire it).
++    drop(retired);
++    drop(code);
+ }
+ 
+ #[test]

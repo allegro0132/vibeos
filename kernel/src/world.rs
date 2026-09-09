@@ -3503,6 +3503,22 @@ async fn fault_probe_task(space: SpaceRef, memory_budget: usize) {
         .expect("fault probe must reserve one code-pool page");
     code.words_mut()[0] = 0x0000_8067; // ret
     let _abandoned_code = code.seal();
+    #[cfg(target_feature = "d")]
+    let _abandoned_readable_code = {
+        let mut code = crate::code_pool::WritableCode::allocate(1)
+            .expect("fault probe must reserve an RX code-pool page");
+        code.words_mut()[0] = 0x0000_8067;
+        code.seal_readable()
+    };
+    #[cfg(target_feature = "d")]
+    let _abandoned_image = {
+        let code = crate::code_pool::WritableCode::allocate(3 * vibeos_core::mmu::PAGE_SIZE / 4)
+            .expect("fault probe must reserve a segmented image");
+        let mut image = code.freeze_image();
+        image.publish_text(vibeos_core::mmu::PAGE_SIZE, vibeos_core::mmu::PAGE_SIZE)
+            .expect("fault probe text publication");
+        image
+    };
     let mut held = Vec::new();
     held.resize(512, 0xA5);
     let _abandoned_cspace = space.get().0.lock();

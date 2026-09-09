@@ -55,3 +55,21 @@ must pass upstream CRC checks and run at least ten seconds. Calibration aims at
 25 seconds. `/usr/bin/time -v` also records whole-process elapsed time and RSS.
 No host build or other QEMU workload should overlap measured samples. Retain
 module/runner/source hashes, lockfiles, commands and raw output with the result.
+
+Additional Wasmtime-only VM controls are available through
+`--profile explicit-gc` and `--profile guards-gc` (RV64GC hosts only). Both fix
+the compiler ISA to GC, use speed optimization, disable copy-on-write memory
+initialization, set a 32 KiB Wasm stack limit and retain the 16 MiB memory cap.
+Pass `--fuel` to both for the same 100-billion total fuel limit. `explicit-gc`
+uses movable memory, no guard/reservation and explicit traps; `guards-gc` uses
+a fixed 4 GiB virtual reservation, a 64 KiB guard and native signal traps. The
+reservation is virtual address space, not a 4 GiB physical-memory allocation.
+The default `native` profile preserves the original native-CPU/VM benchmark.
+
+`scripts/wasmtime/measure-vm-controls.sh` interleaves three performance runs and
+one validation-seed run per profile, requiring CRC validation and >=10 seconds.
+Copy this runner as `inputs/wasmtime-vm-control` and the unchanged module as
+`inputs/coremark.wasm` into a fresh prepared Debian measurement directory.
+Results: `target/coremark-performance/debian-wasmtime-vm-controls/results/`.
+These controls do not demonstrate VibeOS memory/trap support or command-service
+scheduling. They identify the potential benefit of completing that port.

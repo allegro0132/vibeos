@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "f1412a598f96f3c261a19118d94caffcb0c36235"
+  },
+  "path_in_vcs": "crates/cranelift"
+}

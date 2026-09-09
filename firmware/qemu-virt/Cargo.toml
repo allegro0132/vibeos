@@ -5,6 +5,13 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+wasmtime-command = ["vibeos-kernel/wasmtime-command"]
+wasmtime-async = ["vibeos-kernel/wasmtime-async"]
+wasmtime-guarded-memory = ["vibeos-kernel/wasmtime-guarded-memory"]
+wasmtime-hardware-traps = ["vibeos-kernel/wasmtime-hardware-traps"]
+wasmtime-discovered-isa = ["vibeos-kernel/wasmtime-discovered-isa"]
+wasmtime-coremark-probe = ["vibeos-kernel/wasmtime-coremark-probe"]
+wasmtime-native = ["vibeos-kernel/wasmtime-native"]
 wasi-benchmark = ["vibeos-kernel/wasi-benchmark"]
 wasi-rv64-cache = ["vibeos-kernel/wasi-rv64-cache"]
 wasi-preview1 = ["vibeos-kernel/wasi-preview1"]

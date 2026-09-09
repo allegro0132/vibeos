@@ -1,0 +1,430 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -45,9 +45,7 @@
+ compile = [
+     "gimli/write",
+     "object/write_core",
+-    "std",
+     "dep:wasm-encoder",
+-    "dep:wasmprinter",
+ ]
+ component-model = [
+     "dep:wasmtime-component-util",
+@@ -65,6 +63,7 @@
+ rr = ["component-model"]
+ stack-switching = []
+ std = [
++    "dep:wasmprinter",
+     "anyhow/std",
+     "object/std",
+     "wasmparser/std",
+@@ -182,6 +181,8 @@
+ [dependencies.wasm-encoder]
+ version = "0.254.0"
+ optional = true
++default-features = false
++features = ["component-model"]
+ 
+ [dependencies.wasmparser]
+ version = "0.254.0"
+--- a/src/compile/address_map.rs
++++ b/src/compile/address_map.rs
+@@ -5,9 +5,9 @@
+ use crate::bytes::{write_sleb, write_uleb};
+ use crate::obj::ELF_WASMTIME_ADDRMAP;
+ use crate::prelude::*;
++use core::ops::Range;
+ use object::write::{Object, StandardSegment};
+ use object::{LittleEndian, SectionKind, U32};
+-use std::ops::Range;
+ 
+ /// Builder for the address map section of a wasmtime compilation image.
+ ///
+--- a/src/compile/frame_table.rs
++++ b/src/compile/frame_table.rs
+@@ -8,12 +8,12 @@
+ //! operand stack depth in each frame by PC, with offsets to read
+ //! those values off of the state in the stack frame.
+ 
++use crate::collections::oom_abort::{HashMap, hash_map::Entry};
+ use crate::{
+     FrameInstPos, FrameStackShape, FrameStateSlotOffset, FrameTableDescriptorIndex, FrameValType,
+     FuncKey, ModulePC, WasmHeapTopType, WasmValType, prelude::*,
+ };
+ use object::{LittleEndian, U32};
+-use std::collections::{HashMap, hash_map::Entry};
+ 
+ /// Builder for a stackslot descriptor.
+ pub struct FrameStateSlotBuilder {
+--- a/src/compile/mod.rs
++++ b/src/compile/mod.rs
+@@ -7,13 +7,14 @@
+     DefinedFuncIndex, FlagValue, FuncKey, FunctionLoc, ObjectKind, PrimaryMap, StaticModuleIndex,
+     TripleExt, Tunables, WasmError, obj,
+ };
++use alloc::borrow::Cow;
++use alloc::sync::Arc;
++use core::any::Any;
++use core::fmt;
+ use object::write::{Object, SymbolId};
+ use object::{Architecture, BinaryFormat, FileFlags};
+-use std::any::Any;
+-use std::borrow::Cow;
+-use std::fmt;
++#[cfg(feature = "std")]
+ use std::path;
+-use std::sync::Arc;
+ 
+ mod address_map;
+ mod frame_table;
+@@ -76,7 +77,7 @@
+ /// In theory, this could just be Cranelift's `CacheKvStore` trait, but it is not as we want to
+ /// make sure that wasmtime isn't too tied to Cranelift internals (and as a matter of fact, we
+ /// can't depend on the Cranelift trait here).
+-pub trait CacheStore: Send + Sync + std::fmt::Debug {
++pub trait CacheStore: Send + Sync + core::fmt::Debug {
+     /// Try to retrieve an arbitrary cache key entry, and returns a reference to bytes that were
+     /// inserted via `Self::insert` before.
+     fn get(&self, key: &[u8]) -> Option<Cow<'_, [u8]>>;
+@@ -96,6 +97,7 @@
+     fn target(&mut self, target: target_lexicon::Triple) -> Result<()>;
+ 
+     /// Enables clif output in the directory specified.
++    #[cfg(feature = "std")]
+     fn clif_dir(&mut self, _path: &path::Path) -> Result<()> {
+         bail!("clif output not supported");
+     }
+--- a/src/compile/module_artifacts.rs
++++ b/src/compile/module_artifacts.rs
+@@ -7,9 +7,9 @@
+ use crate::{
+     CompiledModuleInfo, DebugInfoData, FunctionName, Metadata, ModuleTranslation, Tunables, obj,
+ };
++use core::ops::Range;
+ use object::SectionKind;
+ use object::write::{Object, SectionId, StandardSegment, WritableBuffer};
+-use std::ops::Range;
+ 
+ /// Helper structure to create an ELF file as a compilation artifact.
+ ///
+--- a/src/compile/module_environ.rs
++++ b/src/compile/module_environ.rs
+@@ -1,3 +1,4 @@
++use crate::collections::oom_abort::HashMap;
+ use crate::error::{OutOfMemory, Result, bail};
+ use crate::module::{
+     FuncRefIndex, Initializer, MemoryInitialization, Module, TableSegment, TableSegmentElements,
+@@ -12,12 +13,12 @@
+     WasmHeapTopType, WasmHeapType, WasmResult, WasmValType, WasmparserTypeConverter,
+ };
+ use alloc::borrow::Cow;
++use alloc::sync::Arc;
++use core::mem;
+ use cranelift_entity::SecondaryMap;
+ use cranelift_entity::packed_option::ReservedValue;
+-use std::collections::HashMap;
+-use std::mem;
++#[cfg(feature = "std")]
+ use std::path::PathBuf;
+-use std::sync::Arc;
+ use wasmparser::{
+     CustomSectionReader, DataKind, ElementItems, ElementKind, Encoding, ExternalKind,
+     FuncToValidate, FunctionBody, KnownCustom, NameSectionReader, Naming, Parser, Payload, TypeRef,
+@@ -301,6 +302,7 @@
+ #[derive(Debug, Default)]
+ #[expect(missing_docs, reason = "self-describing fields")]
+ pub struct WasmFileInfo {
++    #[cfg(feature = "std")]
+     pub path: Option<PathBuf>,
+     pub code_section_offset: u64,
+     pub imported_func_count: u32,
+@@ -1367,13 +1369,13 @@
+             // the front and back with extra zeros as necessary
+             if offset % page_size != 0 {
+                 let zero_padding = offset % page_size;
+-                image.splice(0..0, std::iter::repeat(0).take(zero_padding as usize));
++                image.splice(0..0, core::iter::repeat(0).take(zero_padding as usize));
+                 offset -= zero_padding;
+                 len += zero_padding;
+             }
+             if len % page_size != 0 {
+                 let zero_padding = page_size - (len % page_size);
+-                image.extend(std::iter::repeat(0).take(zero_padding as usize));
++                image.extend(core::iter::repeat(0).take(zero_padding as usize));
+                 len += zero_padding;
+             }
+             let runtime_index = if image.is_empty() {
+--- a/src/compile/module_types.rs
++++ b/src/compile/module_types.rs
+@@ -1,3 +1,4 @@
++use crate::collections::oom_abort::{HashMap, hash_map::Entry};
+ use crate::{
+     EngineOrModuleTypeIndex, EntityRef, ModuleInternedRecGroupIndex, ModuleInternedTypeIndex,
+     ModuleTypes, PanicOnOom as _, TypeConvert, TypeIndex, WasmArrayType, WasmCompositeInnerType,
+@@ -6,10 +7,7 @@
+     collections::{TryClone as _, TryCow},
+     wasm_unsupported,
+ };
+-use std::{
+-    collections::{HashMap, hash_map::Entry},
+-    ops::Index,
+-};
++use core::ops::Index;
+ use wasmparser::{UnpackedIndex, Validator, ValidatorId};
+ 
+ /// A type marking the start of a recursion group's definition.
+@@ -160,7 +158,7 @@
+         let sub_ty = &self.types[for_func_ty];
+         let trampoline = sub_ty.unwrap_func().trampoline_type().panic_on_oom();
+ 
+-        if let Some(idx) = self.trampoline_types.get(&trampoline) {
++        if let Some(idx) = self.trampoline_types.get(&*trampoline) {
+             // We've already interned this trampoline type; reuse it.
+             *idx
+         } else {
+--- a/src/compile/trap_encoding.rs
++++ b/src/compile/trap_encoding.rs
+@@ -3,9 +3,9 @@
+ use crate::obj::ELF_WASMTIME_TRAPS;
+ use crate::prelude::*;
+ use crate::trap_encoding::TRAP_BLOCK_SIZE;
++use core::ops::Range;
+ use object::write::{Object, StandardSegment};
+ use object::{LittleEndian, SectionKind, U32};
+-use std::ops::Range;
+ 
+ /// A helper structure to build the custom-encoded section of a wasmtime
+ /// compilation image which encodes trap information.
+--- a/src/component/dfg.rs
++++ b/src/component/dfg.rs
+@@ -27,16 +27,16 @@
+ //! translation where the dataflow performed there allows identification of
+ //! fused adapters, what arguments make their way to core wasm modules, etc.
+ 
++use crate::collections::oom_abort::HashMap;
+ use crate::component::*;
+ use crate::error::Result;
+ use crate::prelude::*;
+ use crate::{EntityIndex, EntityRef, ModuleInternedTypeIndex, PrimaryMap, WasmValType};
++use core::hash::Hash;
++use core::ops::Index;
+ use cranelift_entity::packed_option::PackedOption;
+-use indexmap::IndexMap;
+ use info::LinearMemoryOptions;
+-use std::collections::HashMap;
+-use std::hash::Hash;
+-use std::ops::Index;
++use wasmparser::collections::IndexMap;
+ use wasmparser::component_types::ComponentCoreModuleTypeId;
+ 
+ /// High-level representation of a component as a "data-flow graph".
+--- a/src/component/translate/adapt.rs
++++ b/src/component/translate/adapt.rs
+@@ -115,10 +115,10 @@
+ //! time this may want to be revisited if too many adapter modules are being
+ //! created.
+ 
++use crate::collections::oom_abort::HashSet;
+ use crate::component::translate::*;
+ use crate::fact;
+ use crate::{EntityType, Memory};
+-use std::collections::HashSet;
+ 
+ /// Metadata information about a fused adapter.
+ #[derive(Debug, Clone, Hash, Eq, PartialEq)]
+@@ -225,6 +225,7 @@
+             // transform `wasm` into `&'data [u8]` which is much easier to work
+             // with here.
+             let wasm = &*self.scope_vec.push(wasm);
++            #[cfg(feature = "std")]
+             if log::log_enabled!(log::Level::Trace) {
+                 match wasmprinter::print_bytes(wasm) {
+                     Ok(s) => log::trace!("generated adapter module:\n{s}"),
+--- a/src/component/translate/inline.rs
++++ b/src/component/translate/inline.rs
+@@ -47,8 +47,8 @@
+ 
+ use crate::component::translate::*;
+ use crate::{EntityType, Memory};
++use alloc::borrow::Cow;
+ use core::str::FromStr;
+-use std::borrow::Cow;
+ use wasmparser::component_types::{ComponentAnyTypeId, ComponentCoreModuleTypeId};
+ 
+ pub(super) fn run(
+@@ -57,6 +57,7 @@
+     nested_modules: &PrimaryMap<StaticModuleIndex, ModuleTranslation<'_>>,
+     nested_components: &PrimaryMap<StaticComponentIndex, Translation<'_>>,
+ ) -> Result<dfg::ComponentDfg> {
++    let types_ref = result.types_ref();
+     let mut inliner = Inliner {
+         nested_modules,
+         nested_components,
+@@ -77,7 +78,6 @@
+     let mut args = HashMap::with_capacity(result.exports.len());
+     let mut path = Vec::new();
+     types.resources_mut().set_current_instance(index);
+-    let types_ref = result.types_ref();
+     for init in result.initializers.iter() {
+         let (name, ty) = match *init {
+             LocalInitializer::Import(name, ty) => (name, ty),
+@@ -189,7 +189,7 @@
+     instance: RuntimeComponentInstanceIndex,
+ 
+     /// The remaining initializers to process when instantiating this component.
+-    initializers: std::slice::Iter<'a, LocalInitializer<'a>>,
++    initializers: core::slice::Iter<'a, LocalInitializer<'a>>,
+ 
+     /// The component being instantiated.
+     translation: &'a Translation<'a>,
+@@ -1223,13 +1223,13 @@
+                         )
+                     }
+                     ModuleDef::Import(path, ty) => {
+-                        let mut defs = IndexMap::new();
++                        let mut defs: IndexMap<_, IndexMap<_, _>> = IndexMap::default();
+                         for ((module, name), _) in types[*ty].imports.iter() {
+                             let instance = args[module.as_str()];
+                             let def =
+                                 self.core_def_of_module_instance_export(frame, instance, name);
+                             defs.entry(module.to_string())
+-                                .or_insert(IndexMap::new())
++                                .or_default()
+                                 .insert(name.to_string(), def);
+                         }
+                         let index = self.runtime_import(path);
+@@ -1677,7 +1677,7 @@
+             },
+ 
+             ComponentItemDef::Instance(instance) => {
+-                let mut exports = IndexMap::new();
++                let mut exports = IndexMap::default();
+                 match instance {
+                     ComponentInstanceDef::Intrinsics => {
+                         bail!(
+--- a/src/component/translate.rs
++++ b/src/component/translate.rs
+@@ -1,4 +1,5 @@
+ use crate::Abi;
++use crate::collections::oom_abort::HashMap;
+ use crate::component::dfg::AbstractInstantiations;
+ use crate::component::*;
+ use crate::prelude::*;
+@@ -7,12 +8,11 @@
+     ModuleInternedTypeIndex, ModuleTranslation, ModuleTypesBuilder, PrimaryMap, ScopeVec, TagIndex,
+     Tunables, TypeConvert, WasmHeapType, WasmResult, WasmValType,
+ };
++use core::mem;
+ use core::str::FromStr;
+ use cranelift_entity::SecondaryMap;
+ use cranelift_entity::packed_option::PackedOption;
+-use indexmap::IndexMap;
+-use std::collections::HashMap;
+-use std::mem;
++use wasmparser::collections::IndexMap;
+ use wasmparser::component_types::{
+     AliasableResourceId, ComponentCoreModuleTypeId, ComponentDefinedTypeId, ComponentEntityType,
+     ComponentFuncTypeId, ComponentInstanceTypeId, ComponentValType,
+--- a/src/component/types_builder/resources.rs
++++ b/src/component/types_builder/resources.rs
+@@ -67,12 +67,12 @@
+ //! For more details on fiddly bits see the documentation on various fields and
+ //! methods below.
+ 
++use crate::collections::oom_abort::HashMap;
+ use crate::component::{
+     AbstractResourceIndex, ComponentTypes, ResourceIndex, RuntimeComponentInstanceIndex,
+     TypeResourceTable, TypeResourceTableIndex,
+ };
+ use crate::prelude::*;
+-use std::collections::HashMap;
+ use wasmparser::component_types::{ComponentAnyTypeId, ComponentEntityType, ResourceId};
+ use wasmparser::types::TypesRef;
+ 
+--- a/src/component/types_builder.rs
++++ b/src/component/types_builder.rs
+@@ -1,3 +1,4 @@
++use crate::collections::oom_abort::HashMap;
+ use crate::component::*;
+ use crate::error::{Result, bail};
+ use crate::prelude::*;
+@@ -5,10 +6,9 @@
+     EngineOrModuleTypeIndex, EntityType, ModuleTypes, ModuleTypesBuilder, PrimaryMap, TypeConvert,
+     WasmHeapType,
+ };
++use core::hash::Hash;
++use core::ops::Index;
+ use cranelift_entity::EntityRef;
+-use std::collections::HashMap;
+-use std::hash::Hash;
+-use std::ops::Index;
+ use wasmparser::component_types::{
+     ComponentAnyTypeId, ComponentCoreModuleTypeId, ComponentDefinedType, ComponentDefinedTypeId,
+     ComponentEntityType, ComponentFuncTypeId, ComponentInstanceTypeId, ComponentTypeId,
+--- a/src/fact/core_types.rs
++++ b/src/fact/core_types.rs
+@@ -1,5 +1,5 @@
++use crate::collections::oom_abort::HashMap;
+ use crate::prelude::*;
+-use std::collections::HashMap;
+ use wasm_encoder::{TypeSection, ValType};
+ 
+ /// A simple representation of the type section which automatically intern's
+--- a/src/fact/trampoline.rs
++++ b/src/fact/trampoline.rs
+@@ -15,6 +15,7 @@
+ //! it's important to note that some of the precise choices of control flow here
+ //! can be somewhat arbitrary, an intentional decision.
+ 
++use crate::collections::oom_abort::HashMap;
+ use crate::component::{
+     CanonicalAbiInfo, ComponentTypesBuilder, FixedEncoding as FE, FlatType, InterfaceType,
+     MAX_FLAT_ASYNC_PARAMS, MAX_FLAT_PARAMS, PREPARE_ASYNC_NO_RESULT, PREPARE_ASYNC_WITH_RESULT,
+@@ -31,9 +32,8 @@
+ };
+ use crate::prelude::*;
+ use crate::{FuncIndex, GlobalIndex, IndexType, Trap};
+-use std::collections::HashMap;
+-use std::mem;
+-use std::ops::Range;
++use core::mem;
++use core::ops::Range;
+ use wasm_encoder::{BlockType, Catch, Encode, Instruction, Instruction::*, MemArg, ValType};
+ use wasmtime_component_util::{DiscriminantSize, FlagsSize};
+ 
+@@ -1337,7 +1337,7 @@
+                         .collect::<Vec<_>>();
+                     for (ty, local) in tys.iter().zip(locals.into_iter().rev()) {
+                         self.instruction(LocalGet(local.idx));
+-                        self.stack_set(std::slice::from_ref(ty), local.ty);
++                        self.stack_set(core::slice::from_ref(ty), local.ty);
+                         self.free_temp_local(local);
+                     }
+                 }
+@@ -4601,7 +4601,7 @@
+     }
+ }
+ 
+-impl std::ops::Drop for TempLocal {
++impl core::ops::Drop for TempLocal {
+     fn drop(&mut self) {
+         if self.needs_free {
+             panic!("temporary local not free'd");
+--- a/src/fact.rs
++++ b/src/fact.rs
+@@ -18,6 +18,7 @@
+ //! their imports and then generating a core wasm module to implement all of
+ //! that.
+ 
++use crate::collections::oom_abort::HashMap;
+ use crate::component::dfg::CoreDef;
+ use crate::component::{
+     Adapter, AdapterOptions as AdapterOptionsDfg, CanonicalAbiInfo, ComponentTypesBuilder,
+@@ -30,7 +31,6 @@
+     EntityRef, FuncIndex, GlobalIndex, IndexType, Memory, MemoryIndex, ModuleInternedTypeIndex,
+     PrimaryMap, Tunables,
+ };
+-use std::collections::HashMap;
+ use wasm_encoder::*;
+ use wasmparser::WasmFeatures;
+ 

@@ -25,13 +25,16 @@
 
 use core::arch::global_asm;
 
-/// `ra`, `sp`, `s0`–`s11`, the entry `sstatus.SIE` bit, and one reserved word.
+/// Integer return context and entry SIE; GC targets additionally retain all
+/// 32 floating-point registers and FCSR across nonlocal exits.
 #[repr(C, align(16))]
 #[derive(Clone, Copy)]
 pub struct JmpBuf {
     regs: [u64; 14],
     sie: u64,
     reserved: u64,
+    #[cfg(target_feature = "d")]
+    fp: [u64; 33],
 }
 
 impl JmpBuf {
@@ -39,6 +42,8 @@ impl JmpBuf {
         regs: [0; 14],
         sie: 0,
         reserved: 0,
+        #[cfg(target_feature = "d")]
+        fp: [0; 33],
     };
 }
 
@@ -77,6 +82,17 @@ vibe_catch:
     andi t0, t0, 2
     sd t0,  112(a0)
 
+    .if {fp_enabled}
+    .option push
+    .option arch, +f, +d
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fsd f\r, (128 + 8 * \r)(a0)
+    .endr
+    frcsr t2
+    sd t2, 384(a0)
+    .option pop
+    .endif
+
     // s0 is callee-saved, so it keeps the buffer address across the thunk.
     // The incoming stack is already 16-byte aligned at this C ABI boundary.
     mv s0, a0
@@ -89,6 +105,17 @@ vibe_catch:
     mv t0, s0
     csrci sstatus, 2
     ld t1,  112(t0)
+    .if {fp_enabled}
+    .option push
+    .option arch, +f, +d
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fld f\r, (128 + 8 * \r)(t0)
+    .endr
+    ld t2, 384(t0)
+    fscsr t2
+    .option pop
+    .endif
+
     ld ra,    0(t0)
     ld s0,   16(t0)
     ld s1,   24(t0)
@@ -119,6 +146,17 @@ vibe_longjmp:
 .Lvibe_longjmp_nonzero:
     csrci sstatus, 2
     ld t0,  112(a0)
+    .if {fp_enabled}
+    .option push
+    .option arch, +f, +d
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fld f\r, (128 + 8 * \r)(a0)
+    .endr
+    ld t2, 384(a0)
+    fscsr t2
+    .option pop
+    .endif
+
     ld ra,    0(a0)
     ld s0,   16(a0)
     ld s1,   24(a0)
@@ -172,7 +210,7 @@ vibe_enter:
 // of mismatches observed after vibe_catch returns.
 .global vibe_catch_abi_probe
 vibe_catch_abi_probe:
-    addi sp, sp, -144
+    addi sp, sp, -{probe_bytes}
     sd ra,    0(sp)
     sd s0,    8(sp)
     sd s1,   16(sp)
@@ -192,6 +230,23 @@ vibe_catch_abi_probe:
     sd t0, 112(sp)
     sd a3, 120(sp)
     sd sp, 128(sp)
+
+    .if {fp_enabled}
+    .option push
+    .option arch, +f, +d
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fsd f\r, (144 + 8 * \r)(sp)
+    .endr
+    frcsr t0
+    sd t0, 400(sp)
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    li t0, 2000 + \r
+    fmv.d.x f\r, t0
+    .endr
+    li t0, 0x60
+    fscsr t0
+    .option pop
+    .endif
 
     li s0,  0x101
     li s1,  0x112
@@ -275,6 +330,28 @@ vibe_catch_abi_probe:
     snez t0, t0
     add t6, t6, t0
 
+    .if {fp_enabled}
+    .option push
+    .option arch, +f, +d
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fmv.x.d t0, f\r
+    li t1, 2000 + \r
+    xor t0, t0, t1
+    snez t0, t0
+    add t6, t6, t0
+    .endr
+    frcsr t0
+    xori t0, t0, 0x60
+    snez t0, t0
+    add t6, t6, t0
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fld f\r, (144 + 8 * \r)(sp)
+    .endr
+    ld t0, 400(sp)
+    fscsr t0
+    .option pop
+    .endif
+
     mv a0, t6
     ld ra,    0(sp)
     ld s0,    8(sp)
@@ -289,7 +366,7 @@ vibe_catch_abi_probe:
     ld s9,   80(sp)
     ld s10,  88(sp)
     ld s11,  96(sp)
-    addi sp, sp, 144
+    addi sp, sp, {probe_bytes}
     ret
 
 // Test thunk context: {{ JmpBuf *buf; i64 status; }}. Deliberately dirties all
@@ -311,13 +388,83 @@ vibe_catch_test_jump:
     li s9,  -10
     li s10, -11
     li s11, -12
+    .if {fp_enabled}
+    .option push
+    .option arch, +f, +d
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fmv.d.x f\r, zero
+    .endr
+    fscsr zero
+    .option pop
+    .endif
     mv a0, t0
     mv a1, t1
     tail vibe_longjmp
-"#
+
+    .if {fp_enabled}
+    .option push
+    .option arch, +f, +d
+.global vibe_fp_irq_probe
+vibe_fp_irq_probe:
+    addi sp, sp, -272
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fsd f\r, (0 + 8 * \r)(sp)
+    .endr
+    frcsr t0
+    sd t0, 256(sp)
+    csrr t0, sstatus
+    andi t0, t0, 2
+    sd t0, 264(sp)
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    li t0, 3000 + \r
+    fmv.d.x f\r, t0
+    .endr
+    li t0, 0x60
+    fscsr t0
+    csrsi sip, 2
+    csrsi sstatus, 2
+    li t2, 10000
+.Lfp_irq_wait:
+    csrr t0, sip
+    andi t0, t0, 2
+    beqz t0, .Lfp_irq_done
+    addi t2, t2, -1
+    bnez t2, .Lfp_irq_wait
+.Lfp_irq_done:
+    snez a0, t0
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fmv.x.d t0, f\r
+    li t1, 3000 + \r
+    xor t0, t0, t1
+    snez t0, t0
+    add a0, a0, t0
+    .endr
+    frcsr t0
+    xori t0, t0, 0x60
+    snez t0, t0
+    add a0, a0, t0
+    csrci sstatus, 2
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fld f\r, (0 + 8 * \r)(sp)
+    .endr
+    ld t0, 256(sp)
+    fscsr t0
+    ld t0, 264(sp)
+    addi sp, sp, 272
+    beqz t0, .Lfp_irq_return
+    csrsi sstatus, 2
+.Lfp_irq_return:
+    ret
+    .option pop
+    .endif
+"#,
+    fp_enabled = const cfg!(target_feature = "d") as usize,
+    probe_bytes = const if cfg!(target_feature = "d") { 416 } else { 144 },
 );
 
 extern "C" {
+    #[cfg(target_feature = "d")]
+    pub fn vibe_fp_irq_probe() -> usize;
     pub fn vibe_catch(buf: *mut JmpBuf, thunk: CatchThunk, ctx: *mut ()) -> i64;
     pub fn vibe_longjmp(buf: *mut JmpBuf, value: i64) -> !;
     pub fn vibe_enter(

@@ -1,0 +1,18 @@
+--- a/src/isa/riscv64/abi.rs
++++ b/src/isa/riscv64/abi.rs
+@@ -754,6 +754,7 @@
+     .with(px_reg(27))
+     // F Regs
+     .with(pf_reg(8))
++    .with(pf_reg(9))
+     .with(pf_reg(18))
+     .with(pf_reg(19))
+     .with(pf_reg(20))
+@@ -810,7 +811,6 @@
+     .with(pf_reg(5))
+     .with(pf_reg(6))
+     .with(pf_reg(7))
+-    .with(pf_reg(9))
+     .with(pf_reg(10))
+     .with(pf_reg(11))
+     .with(pf_reg(12))

@@ -1,0 +1,86 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -32,6 +32,7 @@
+ all-features = true
+ 
+ [features]
++custom-code-registry = ["runtime"]
+ addr2line = [
+     "dep:addr2line",
+     "dep:gimli",
+--- a/src/runtime/module/registry.rs
++++ b/src/runtime/module/registry.rs
+@@ -4,6 +4,7 @@
+ #[cfg(feature = "component-model")]
+ use crate::component::Component;
+ use crate::runtime::vm::VMWasmCallFunction;
++#[cfg(not(feature = "custom-code-registry"))]
+ use crate::sync::{OnceLock, RwLock};
+ use crate::vm::CompiledModuleId;
+ use crate::{Engine, FrameInfo, Module, code_memory::CodeMemory, prelude::*};
+@@ -398,6 +399,9 @@
+ // it is also automatically registered with the singleton global module
+ // registry. When a `ModuleRegistry` is destroyed then all of its entries
+ // are removed from the global registry.
++#[cfg(not(feature = "custom-code-registry"))]
++mod default_registry {
++use super::*;
+ fn global_code() -> &'static RwLock<GlobalRegistry> {
+     static GLOBAL_CODE: OnceLock<RwLock<GlobalRegistry>> = OnceLock::new();
+     GLOBAL_CODE.get_or_init(Default::default)
+@@ -454,6 +458,15 @@
+     drop(retired);
+     drop(code);
+ }
++
++}
++#[cfg(not(feature = "custom-code-registry"))]
++pub use default_registry::{lookup_code, register_code, unregister_code};
++#[cfg(feature = "custom-code-registry")]
++#[path = "custom_registry.rs"]
++mod custom_registry;
++#[cfg(feature = "custom-code-registry")]
++pub use custom_registry::{lookup_code, register_code, unregister_code};
+ 
+ #[test]
+ #[cfg_attr(miri, ignore)]
+--- /dev/null
++++ b/src/runtime/module/custom_registry.rs
+@@ -0,0 +1,37 @@
++//! Embedder-owned code registry. No global arena-allocated collection.
++use super::*;
++unsafe extern "C" {
++    /// On success retains ownership of this one strong reference until removal.
++    fn wasmtime_code_register(start: usize, end: usize, code: *const u8) -> i32;
++    /// Under the registry lock, retain must be called before returning a match.
++    fn wasmtime_code_lookup(pc: usize, retain: unsafe extern "C" fn(*const u8), offset: &mut usize) -> *const u8;
++    /// Removes the exact range and transfers its owned reference back to Rust.
++    fn wasmtime_code_unregister(start: usize, end: usize) -> *const u8;
++}
++unsafe extern "C" fn retain(code: *const u8) {
++    unsafe { Arc::<CodeMemory>::increment_strong_count(code.cast()); }
++}
++pub fn lookup_code(pc: usize) -> Option<(Arc<CodeMemory>, usize)> {
++    let mut offset = 0;
++    let code = unsafe { wasmtime_code_lookup(pc, retain, &mut offset) };
++    if code.is_null() { None } else {
++        // lookup retained this reference while removal was excluded by its lock.
++        Some((unsafe { Arc::from_raw(code.cast::<CodeMemory>()) }, offset))
++    }
++}
++pub fn register_code(image: &Arc<CodeMemory>, address: Range<usize>) -> Result<(), OutOfMemory> {
++    if address.is_empty() { return Ok(()); }
++    let code = Arc::into_raw(image.clone());
++    if unsafe { wasmtime_code_register(address.start, address.end, code.cast()) } != 0 {
++        unsafe { drop(Arc::from_raw(code)); }
++        return Err(OutOfMemory::new(core::mem::size_of::<(usize, usize, usize)>()));
++    }
++    Ok(())
++}
++pub fn unregister_code(address: Range<usize>) {
++    if address.is_empty() { return; }
++    let code = unsafe { wasmtime_code_unregister(address.start, address.end) };
++    assert!(!code.is_null(), "unregistered code range");
++    // The embedder released its lock; destruction may call platform unmapping.
++    unsafe { drop(Arc::from_raw(code.cast::<CodeMemory>())); }
++}

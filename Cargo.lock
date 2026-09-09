@@ -288,8 +288,6 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen"
 version = "0.135.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73eecedc85ffca4f34dbe197c6545c8ade6579a61352457936f53c3bffa6353b"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64",
@@ -1810,6 +1808,7 @@ dependencies = [
  "vibeos-wasm-runtime",
  "vibeos-wasm-runtime-costs",
  "vibeos-wasm-simd-target",
+ "vibeos-wasmtime-runtime",
 ]
 
 [[package]]
@@ -2208,6 +2207,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-wasmtime-runtime"
+version = "0.1.0"
+dependencies = [
+ "vibeos-component-format",
+ "wasmparser 0.254.0",
+ "wasmtime",
+ "wasmtime-environ",
+ "wasmtime-internal-cranelift",
+]
+
+[[package]]
 name = "virtue"
 version = "0.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2343,8 +2353,6 @@ dependencies = [
 [[package]]
 name = "wasmtime"
 version = "48.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f12115b509def01c338ec8ee9b52c4cefb27f7b8db57279c5c7cfe2e9eaf9900"
 dependencies = [
  "addr2line",
  "async-trait",
@@ -2384,8 +2392,6 @@ dependencies = [
 [[package]]
 name = "wasmtime-environ"
 version = "48.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13b153945550fe9f370f611b33a2b6398cb9b6be333e3bc49e4cbe5219ef44b9"
 dependencies = [
  "anyhow",
  "cpp_demangle",
@@ -2447,8 +2453,6 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-cranelift"
 version = "48.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a83f10fbd4bcacec9bcf7be49932a738356ec027816230f9d6f053433b3de97f"
 dependencies = [
  "cranelift-codegen",
  "cranelift-control",
@@ -2461,6 +2465,7 @@ dependencies = [
  "object",
  "pulley-interpreter",
  "smallvec",
+ "spin",
  "target-lexicon",
  "thiserror",
  "wasmparser 0.254.0",

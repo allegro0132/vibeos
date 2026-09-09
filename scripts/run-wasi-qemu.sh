@@ -26,9 +26,15 @@ if [ "${WASI_DIAGNOSTIC_ICOUNT:-0}" = 1 ]; then
   set -- -rtc base=utc,clock=vm -icount shift=0,align=off,sleep=off
   echo 'WASI diagnostic: instruction-count virtual time; not a formal CoreMark score'
 fi
+target=riscv64imac-unknown-none-elf
+if [ "${WASI_WASMTIME:-0}" = 1 ]; then
+  [ "${WASI_RV64_CACHE:-0}" != 1 ] || { echo "choose one WASI backend" >&2; exit 2; }
+  feature="$feature,wasmtime-command"
+  target=riscv64gc-unknown-none-elf
+fi
 mkdir -p "$work"
 if [ "${WASI_SKIP_BUILD:-0}" != 1 ]; then
-  (cd firmware/qemu-virt && cargo build --locked --offline --release --features "$feature")
+  (cd firmware/qemu-virt && cargo build --locked --offline --release --target "$target" --features "$feature")
 fi
 python3 - "$work" "$port" <<'PY'
 import importlib.util, pathlib, sys
@@ -50,7 +56,7 @@ fi
 exec qemu-system-riscv64 \
   -machine virt -cpu rv64 -smp "$harts" -m "$memory" -accel tcg,thread=single \
   "$@" -nographic -bios default \
-  -kernel "${WASI_KERNEL:-target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt}" \
+  -kernel "${WASI_KERNEL:-target/$target/release/vibeos-qemu-virt}" \
   -object rng-random,id=wasi-rng,filename=/dev/urandom \
   -device virtio-rng-device,rng=wasi-rng,bus=virtio-mmio-bus.1 \
   -netdev "user,id=wasi-net,net=10.0.2.0/24,host=10.0.2.2,restrict=on,ipv6=off,hostfwd=tcp:127.0.0.1:$port-10.0.2.15:2222" \

@@ -1,4 +1,4 @@
-use crate::{WasiError, WasiLimits};
+use super::{WasiError, WasiLimits};
 use vibeos_component_format::PROFILE_1_LIMITS as BASE;
 use wasmparser::{Encoding, ExternalKind, Parser, Payload, TypeRef, Validator, WasmFeatures};
 
@@ -54,7 +54,7 @@ pub(crate) fn inspect(bytes: &[u8], limits: WasiLimits) -> Result<(), WasiError>
                     let import = import.map_err(|_| WasiError::Malformed)?;
                     if !matches!(import.ty, TypeRef::Func(_))
                         || import.module != "wasi_snapshot_preview1"
-                        || crate::abi::signature(import.name).is_none()
+                        || super::abi::signature(import.name).is_none()
                     {
                         return Err(WasiError::Import);
                     }

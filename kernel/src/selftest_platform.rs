@@ -210,6 +210,18 @@ pub async fn run() -> Report {
     crate::segment_store_platform::run_storage_v2_transition_selftests();
     #[cfg(feature = "legacy-shell")]
     h.check("Storage V2 rollback/close transition policy", true);
+    #[cfg(feature = "wasmtime-guarded-memory")]
+    {
+        crate::wasmtime_platform::memory_recovery_selftest().await;
+        h.check("guarded memory raw fault recovery", true);
+    }
+    #[cfg(feature = "wasmtime-async")]
+    {
+        crate::trap::native_stack_selftest();
+        h.check("native trap entry with unmapped interrupted SP", true);
+        crate::wasmtime_platform::code_recovery_selftest().await;
+        h.check("Wasmtime post-call and active-call raw recovery", true);
+    }
     compiler(&mut h);
 
     for f in h.failures() {
@@ -741,10 +753,17 @@ async fn cancellation(h: &mut Harness) {
 /// Exercise the actual release ABI on target, including the state LLVM assumes
 /// a C callee preserves.
 fn catcher_abi_sync(h: &mut Harness) {
+    #[cfg(target_feature = "d")]
+    {
+        crate::trap::__vibe_fp_irq_probe_active.store(true, core::sync::atomic::Ordering::SeqCst);
+        let mismatches = unsafe { trampoline::vibe_fp_irq_probe() };
+        crate::trap::__vibe_fp_irq_probe_active.store(false, core::sync::atomic::Ordering::SeqCst);
+        h.eq("interrupt restores every FP register and FCSR after injected clobber", mismatches, 0);
+    }
     h.eq(
         "catch buffer has the assembly ABI size",
         core::mem::size_of::<JmpBuf>(),
-        128,
+        if cfg!(target_feature = "d") { 400 } else { 128 },
     );
     h.eq(
         "catch buffer has the assembly ABI alignment",
@@ -991,9 +1010,14 @@ async fn fault_isolation(h: &mut Harness) {
         panic!("deliberate fault from the self-test");
     });
 
-    // Give it enough turns to be polled, panic, and be reaped.
-    for _ in 0..8 {
-        exec::yield_now().await;
+    // Yield counts do not synchronize with a worker on another hart. Wait for
+    // its published terminal state and fault accounting, with a real deadline.
+    let deadline = sbi::time().saturating_add(exec::timebase_hz());
+    while sbi::time() < deadline
+        && (doomed.state() != exec::TaskState::Faulted
+            || exec::faulted_count() != faults_before + 1)
+    {
+        exec::sleep_ms(1).await;
     }
 
     h.eq(
@@ -1485,7 +1509,77 @@ fn capability_table_is_read_only(range: crate::cap::CapabilityTableRange) -> boo
 
 /// Machine code actually executing. Host tests can check what the emitter
 /// *emits*; only this can check what the CPU *does* with it.
+#[cfg(target_feature = "d")]
+fn segmented_code_image(h: &mut Harness) {
+    use crate::code_pool::{self, WritableCode};
+    use vibeos_core::mmu::{PagePermissions as P, PAGE_SIZE};
+    let before = code_pool::stats();
+    let mut writable = WritableCode::allocate(3 * PAGE_SIZE / 4).expect("code image allocation");
+    writable.words_mut()[0] = 0xfeedface;
+    writable.words_mut()[2 * PAGE_SIZE / 4] = 0xcafebabe;
+    writable.words_mut()[PAGE_SIZE / 4..PAGE_SIZE / 4 + 6].copy_from_slice(
+        &[0x00000517, 0x01053503, 0x00008067, 0x00000013, 42, 0]);
+    let address = writable.start();
+    let mut image = writable.freeze_image();
+    let permissions = |page| crate::mmu::mapping(address + page * PAGE_SIZE).unwrap().permissions;
+    h.check("complete image freezes RO-NX before text publication", (0..3).all(|p| permissions(p) == P::READ));
+    h.check("image rejects empty, unaligned, overflowing and escaping text",
+        [(0,0),(1,PAGE_SIZE),(0,1),(usize::MAX,PAGE_SIZE),(3*PAGE_SIZE,PAGE_SIZE)]
+        .into_iter().all(|(start,len)| image.publish_text(start,len).is_err()));
+    image.publish_text(PAGE_SIZE, PAGE_SIZE).expect("publish middle text page");
+    h.check("only selected text page becomes RX", permissions(0) == P::READ
+        && permissions(1) == P::READ.union(P::EXECUTE) && permissions(2) == P::READ);
+    h.check("overlapping publication rejects before changing metadata", image.publish_text(0, 2*PAGE_SIZE).is_err()
+        && permissions(0) == P::READ && permissions(1) == P::READ.union(P::EXECUTE));
+    let entry: unsafe extern "C" fn() -> u64 = unsafe { core::mem::transmute(image.start() + PAGE_SIZE) };
+    h.eq("segmented image text executes and reads its constant", unsafe { entry() }, 42);
+    h.check("image metadata remains readable and intact", image.bytes()[..4] == 0xfeedfaceu32.to_le_bytes()
+        && image.bytes()[2*PAGE_SIZE..2*PAGE_SIZE+4] == 0xcafebabeu32.to_le_bytes());
+    h.check("segmented publication retains W^X", crate::mmu::first_writable_executable_ram_page().is_none());
+    drop(image);
+    let mut reused = WritableCode::allocate(3 * PAGE_SIZE / 4).expect("image reuse");
+    h.check("mixed RO/RX image retires and clears all pages", reused.start() == address && reused.is_zeroed()
+        && (0..3).all(|p| permissions(p) == P::READ.union(P::WRITE)));
+    drop(reused);
+    let after = code_pool::stats();
+    h.check("image lifecycle restores pool baseline", after.live_pages == before.live_pages && after.sealed_pages == before.sealed_pages);
+}
+
+#[cfg(target_feature = "d")]
+fn readable_code(h: &mut Harness) {
+    use crate::code_pool::{self, WritableCode};
+    use vibeos_core::mmu::PagePermissions;
+    let baseline = code_pool::stats();
+    let mut code = WritableCode::allocate(6).expect("RX probe allocation");
+    // auipc a0,0; ld a0,16(a0); ret; nop; inline 64-bit constant.
+    code.words_mut().copy_from_slice(&[0x00000517, 0x01053503, 0x00008067,
+        0x00000013, 0x12345678, 0xabcdef09]);
+    let address = code.start();
+    let code = code.seal_readable();
+    h.check("RX code has read/execute and no write permission", crate::mmu::mapping(address)
+        .is_some_and(|m| m.permissions == PagePermissions::READ.union(PagePermissions::EXECUTE)));
+    let entry: unsafe extern "C" fn() -> u64 = unsafe { core::mem::transmute(code.entry()) };
+    h.eq("native code reads its embedded constant with MXR clear", unsafe { entry() }, 0xabcdef0912345678u64);
+    h.check("RX owner can inspect immutable bytes", code.bytes()[16..24] == 0xabcdef0912345678u64.to_le_bytes());
+    h.check("RX publication creates no writable-executable page", crate::mmu::first_writable_executable_ram_page().is_none());
+    drop(code);
+    let mut reused = WritableCode::allocate(6).expect("RX reuse allocation");
+    h.check("RX drop revokes execution and zeroes before reuse", reused.start() == address && reused.is_zeroed()
+        && crate::mmu::mapping(address).is_some_and(|m| m.permissions == PagePermissions::READ.union(PagePermissions::WRITE)));
+    drop(reused);
+    let after = code_pool::stats();
+    h.check("RX lifecycle returns live and sealed pages to baseline", after.live_pages == baseline.live_pages && after.sealed_pages == baseline.sealed_pages);
+}
+
 fn compiler(h: &mut Harness) {
+    #[cfg(feature = "wasmtime-native")]
+    {
+        let result = crate::wasmtime_platform::selftest();
+        if let Err(error) = &result { crate::println!("Wasmtime native: {error:#}"); }
+        h.check("Wasmtime compiles and executes in the kernel", result.is_ok());
+    }
+    #[cfg(target_feature = "d")]
+    { readable_code(h); segmented_code_image(h); }
     let hello = crate::rustc::compile(crate::rustc::HELLO_SRC);
     h.check("hello compiles", hello.is_ok());
     h.check(

@@ -2,8 +2,9 @@
 //!
 //! The pool is outside the general heap so an executable never shares a PTE
 //! with writable allocator metadata or another object.  A buffer has one of
-//! two Rust-visible states: writable RW-NX while the trusted linker fills it,
-//! or immutable execute-only after the all-hart permission transition.  Pages
+//! typed states: writable RW-NX while the trusted linker fills it, or immutable
+//! execute-only/RX after the all-hart permission transition. RX is a separate
+//! optimizing-backend API; existing execute-only callers retain their semantics.  Pages
 //! stay reserved across every transition and are zeroed before their allocation
 //! record becomes reusable.
 
@@ -30,6 +31,7 @@ pub enum CodePoolError {
     TooLarge,
     Exhausted,
     GenerationExhausted,
+    InvalidTextRange,
 }
 
 impl fmt::Display for CodePoolError {
@@ -39,6 +41,7 @@ impl fmt::Display for CodePoolError {
             Self::LengthOverflow => "executable code length overflow",
             Self::TooLarge => "executable code exceeds the W^X pool",
             Self::Exhausted => "executable code pool exhausted",
+            Self::InvalidTextRange => "invalid or already published text range",
             Self::GenerationExhausted => "executable code allocation identity exhausted",
         })
     }
@@ -63,6 +66,9 @@ struct PoolState {
     owners: [u64; CODE_POOL_PAGES],
     arenas: [u64; CODE_POOL_PAGES],
     sealed: [bool; CODE_POOL_PAGES],
+    readable: [bool; CODE_POOL_PAGES],
+    image: [bool; CODE_POOL_PAGES],
+    text_page: [bool; CODE_POOL_PAGES],
     next_generation: u64,
     live_pages: usize,
     sealed_pages: usize,
@@ -81,6 +87,9 @@ impl PoolState {
             owners: [0; CODE_POOL_PAGES],
             arenas: [0; CODE_POOL_PAGES],
             sealed: [false; CODE_POOL_PAGES],
+            readable: [false; CODE_POOL_PAGES],
+            image: [false; CODE_POOL_PAGES],
+            text_page: [false; CODE_POOL_PAGES],
             next_generation: 0,
             live_pages: 0,
             sealed_pages: 0,
@@ -130,6 +139,9 @@ impl PoolState {
         self.owners[head] = domain.owner.get();
         self.arenas[head] = domain.arena.get();
         self.sealed[head] = false;
+        self.readable[head] = false;
+        self.image[head] = false;
+        self.text_page[head..head + pages].fill(false);
         self.live_pages += pages;
         self.peak_pages = self.peak_pages.max(self.live_pages);
         self.allocations = self.allocations.saturating_add(1);
@@ -167,6 +179,9 @@ impl PoolState {
         self.owners[allocation.head] = 0;
         self.arenas[allocation.head] = 0;
         self.sealed[allocation.head] = false;
+        self.readable[allocation.head] = false;
+        self.image[allocation.head] = false;
+        self.text_page[allocation.head..allocation.head + allocation.pages].fill(false);
         self.live_pages -= allocation.pages;
         self.frees = self.frees.saturating_add(1);
     }
@@ -295,6 +310,31 @@ impl WritableCode {
         self.words_mut().iter().all(|word| *word == 0)
     }
 
+    /// Freeze the whole image as RO-NX. Only explicit text ranges become RX.
+    pub fn freeze_image(mut self) -> CodeImage {
+        mmu::freeze_code_image(self.allocation.start(), self.allocation.pages);
+        {
+            let mut pool = POOL.lock();
+            pool.mark_sealed(self.allocation);
+            pool.image[self.allocation.head] = true;
+        }
+        self.armed = false;
+        CodeImage { allocation: self.allocation }
+    }
+
+    /// Publish read-execute code for an optimizing backend's embedded constants.
+    /// This consumes writable access; legacy `seal` remains execute-only.
+    pub fn seal_readable(mut self) -> ReadableExecutableCode {
+        mmu::seal_readable_code(self.allocation.start(), self.allocation.pages);
+        {
+            let mut pool = POOL.lock();
+            pool.mark_sealed(self.allocation);
+            pool.readable[self.allocation.head] = true;
+        }
+        self.armed = false;
+        ReadableExecutableCode { allocation: self.allocation }
+    }
+
     pub fn seal(mut self) -> ExecutableCode {
         mmu::seal_code(self.allocation.start(), self.allocation.pages);
         POOL.lock().mark_sealed(self.allocation);
@@ -337,6 +377,51 @@ impl Drop for ExecutableCode {
     fn drop(&mut self) {
         release_allocation(self.allocation, true);
     }
+}
+
+/// Compiled image with immutable metadata and individually published text pages.
+/// The owner retains the entire allocation across every permission transition.
+pub struct CodeImage { allocation: Allocation }
+impl CodeImage {
+    pub fn start(&self) -> usize { self.allocation.start() }
+    pub fn bytes(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.start() as *const u8, self.allocation.words * 4) }
+    }
+    pub fn publish_text(&mut self, offset: usize, len: usize) -> Result<(), CodePoolError> {
+        let end = offset.checked_add(len).ok_or(CodePoolError::InvalidTextRange)?;
+        if len == 0 || offset % PAGE_SIZE != 0 || len % PAGE_SIZE != 0
+            || end > self.allocation.mapped_bytes() {
+            return Err(CodePoolError::InvalidTextRange);
+        }
+        let first = self.allocation.head + offset / PAGE_SIZE;
+        let last = self.allocation.head + end / PAGE_SIZE;
+        {
+            let pool = POOL.lock();
+            pool.assert_live(self.allocation);
+            if pool.text_page[first..last].iter().any(|page| *page) {
+                return Err(CodePoolError::InvalidTextRange);
+            }
+        }
+        mmu::publish_code_image_text(self.start() + offset, len / PAGE_SIZE);
+        POOL.lock().text_page[first..last].fill(true);
+        Ok(())
+    }
+}
+impl Drop for CodeImage {
+    fn drop(&mut self) { release_allocation(self.allocation, true); }
+}
+
+/// Immutable RX allocation. No writable reference survives publication.
+pub struct ReadableExecutableCode { allocation: Allocation }
+impl ReadableExecutableCode {
+    pub fn entry(&self) -> usize { self.allocation.start() }
+    pub fn bytes(&self) -> &[u8] {
+        // Safety: this typed owner retains the complete immutable RX run.
+        unsafe { core::slice::from_raw_parts(self.entry() as *const u8, self.allocation.words * 4) }
+    }
+}
+impl Drop for ReadableExecutableCode {
+    fn drop(&mut self) { release_allocation(self.allocation, true); }
 }
 
 pub fn pool_start() -> usize {
@@ -407,12 +492,40 @@ fn release_allocation(allocation: Allocation, sealed: bool) {
     if sealed {
         // Rust ownership, or the unsafe recovery quiescence proof, establishes
         // that no hart is still executing this run before execute is removed.
-        mmu::unseal_code(allocation.start(), allocation.pages);
+        let (readable, image) = {
+            let pool = POOL.lock();
+            pool.assert_live(allocation);
+            (pool.readable[allocation.head], pool.image[allocation.head])
+        };
+        if image {
+            retire_image(allocation);
+        } else if readable {
+            mmu::unseal_readable_code(allocation.start(), allocation.pages);
+        } else {
+            mmu::unseal_code(allocation.start(), allocation.pages);
+        }
     }
     zero_allocation(allocation);
     // Reuse is published only after permissions are RW-NX and every byte in
     // the complete page run, including padding, is zero.
     POOL.lock().release(allocation, sealed);
+}
+
+fn retire_image(allocation: Allocation) {
+    let mut page = 0;
+    while page < allocation.pages {
+        let (executable, count) = {
+            let pool = POOL.lock();
+            pool.assert_live(allocation);
+            let pages = &pool.text_page[allocation.head + page..allocation.head + allocation.pages];
+            let value = pages[0];
+            (value, pages.iter().take_while(|next| **next == value).count())
+        };
+        let start = allocation.start() + page * PAGE_SIZE;
+        if executable { mmu::unseal_readable_code(start, count); }
+        else { mmu::thaw_code_image_data(start, count); }
+        page += count;
+    }
 }
 
 fn zero_allocation(allocation: Allocation) {

@@ -18,25 +18,39 @@ ROOT=Path(__file__).resolve().parent.parent
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--work',type=Path,default=ROOT/'target/wasi-acceptance')
+    parser.add_argument('--kernel',type=Path,help='Existing firmware ELF to freeze and verify')
+    parser.add_argument('--wasmtime',action='store_true',help='Require the experimental native command backend')
     parser.add_argument('--cycles',type=int,default=100)
     parser.add_argument('--boot-timeout',type=int,default=300)
+    parser.add_argument('--server-alive-interval',type=int,default=2,
+        help='SSH liveness window; values above 2 are functional diagnostics, not responsiveness acceptance')
     args=parser.parse_args();os.chdir(ROOT);work=args.work.resolve();work.mkdir(parents=True,exist_ok=True)
     if (work/'disk.raw').exists():raise SystemExit('use a fresh --work directory for source-bound acceptance')
     spec=importlib.util.spec_from_file_location('wasi_peer',ROOT/'scripts/openssh-peer.py');peer=importlib.util.module_from_spec(spec);sys.modules[spec.name]=peer;spec.loader.exec_module(peer)
     with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
     env=dict(os.environ,WASI_SKIP_BUILD='1',WASI_WORK_DIR=str(work),WASI_SSH_PORT=str(port))
+    if args.kernel:
+        kernel=args.kernel.resolve(strict=True)
+    else:
+        target='riscv64gc-unknown-none-elf' if args.wasmtime else 'riscv64imac-unknown-none-elf'
+        kernel=ROOT/f'target/{target}/release/vibeos-qemu-virt'
+    frozen=work/'kernel.elf';frozen.write_bytes(kernel.read_bytes())
+    env['WASI_KERNEL']=str(frozen)
+    env['WASI_WASMTIME']=str(int(args.wasmtime))
     command=peer._base_ssh_command('ssh','127.0.0.1',port,'vibe',work/'id_ed25519',work/'known_hosts',15,None)
+    assert args.server_alive_interval > 0
+    command=[f'-oServerAliveInterval={args.server_alive_interval}' if option=='-oServerAliveInterval=2' else option for option in command]
     sdk=Path(os.environ['WASI_SDK_PATH'])
     # Fail before boot/upload work if the compiler needed by the live-update
     # test is absent (for example after a temporary SDK directory is cleaned).
     sdk_version=subprocess.check_output([str(sdk/'bin/clang'),'--version'],text=True)
     assert '22.1.0-wasi-sdk' in sdk_version, 'acceptance requires wasi-sdk 33'
-    results=[];qemu=None;log=None
+    results=[];qemu=None;log=None;active_boot=1
     def ssh(words,data=b'',status=0,out=None,err=b'',timeout=60):
         for attempt in range(5):
-            before=(work/'boot-1.log').stat().st_size
+            before=(work/f'boot-{active_boot}.log').stat().st_size
             p=subprocess.run([*command,shlex.join(words)],input=data,capture_output=True,timeout=timeout)
-            observed=(work/'boot-1.log').read_bytes()[before:]
+            observed=(work/f'boot-{active_boot}.log').read_bytes()[before:]
             pre_auth_failure=(b'kex_exchange_identification:' in p.stderr or (b'timed out' in p.stderr and b'Connection' in p.stderr))
             # These known fixtures cannot synthesize transport diagnostics.
             # Never retry a timeout after the kernel has begun this request.
@@ -54,7 +68,8 @@ def main():
     def upload(name,data,status=0,hash=None,length=None):
         return ssh(['wasm-upload',name,str(len(data) if length is None else length),hash or hashlib.sha256(data).hexdigest()],data,status,out=b'')
     def start(boot):
-        nonlocal qemu,log
+        nonlocal qemu,log,active_boot
+        active_boot=boot
         log=open(work/f'boot-{boot}.log','wb');qemu=subprocess.Popen([str(ROOT/'scripts/run-wasi-qemu.sh')],env=env,stdin=subprocess.PIPE,stdout=log,stderr=subprocess.STDOUT)
         deadline=time.monotonic()+args.boot_timeout
         while time.monotonic()<deadline:
@@ -133,7 +148,7 @@ def main():
         ssh(['wasm-run','../c.wasm'],status=None,err=None)
         assert results[-1]['status']!=0
         upload('malformed.wasm',b'not wasm');ssh(['wasm-run','malformed.wasm'],status=126,out=b'')
-        for name,status in [('bounds',0),('memory',124),('trap',125),('unknown',126),('loop',124),('output',124)]:
+        for name,status in [('copy',0),('bounds',0),('memory',124),('trap',125),('unknown',126),('loop',124),('output',124)]:
             upload(name+'.wasm',(work/f'fixtures/{name}.wasm').read_bytes())
             p=ssh(['wasm-run',name+'.wasm'],status=status,out=None)
             assert len(p.stdout)<=65536
@@ -174,10 +189,15 @@ def main():
         record={'profile':'wasi-preview1-command-v1','cycles':args.cycles,'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'dirty_diff_sha256':hashlib.sha256(subprocess.check_output(['git','diff'])).hexdigest(),'qemu':subprocess.check_output(['qemu-system-riscv64','--version'],text=True).splitlines()[0],'rustc':subprocess.check_output(['rustc','-Vv'],text=True),'examples':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT/'target/wasi-examples').glob('*-hello.wasm')},'results':results}
         paths=subprocess.check_output(['git','ls-files','--cached','--others','--exclude-standard','-z']).decode().split('\0')
         record['source_files_sha256']={p:hashlib.sha256((ROOT/p).read_bytes()).hexdigest() for p in paths if p and (ROOT/p).is_file()}
-        record['kernel_sha256']=hashlib.sha256((ROOT/'target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt').read_bytes()).hexdigest()
+        record['kernel_sha256']=hashlib.sha256(frozen.read_bytes()).hexdigest()
+        record['backend']='wasmtime' if args.wasmtime else 'wasmi'
+        record['ssh_server_alive_interval']=args.server_alive_interval
+        record['responsiveness_acceptance']=args.server_alive_interval==2
+        if args.wasmtime: assert 'WASI running backend=wasmtime' in (work/'boot-1.log').read_text()
         record['wasi_sdk']=sdk_version
         record['post_boot_module_sha256']=hashlib.sha256((work/'changed.wasm').read_bytes()).hexdigest()
         (work/'results.json').write_text(json.dumps(record,indent=2)+'\n')
-        print(f'PASS WASI_QEMU: upload, execution, lifecycle, restart; evidence: {work}',flush=True)
+        scope='WASI_QEMU' if args.server_alive_interval==2 else 'WASI_QEMU_FUNCTIONAL_DIAGNOSTIC'
+        print(f'PASS {scope}: upload, execution, lifecycle, restart; evidence: {work}',flush=True)
     finally:stop()
 if __name__=='__main__':main()

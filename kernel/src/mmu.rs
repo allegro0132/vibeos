@@ -74,6 +74,18 @@ struct AddressSpace {
     root: PageTable,
     device_level1: [PageTable; MAX_DEVICE_LEVEL1_TABLES],
     device_level0: [PageTable; MAX_DEVICE_LEVEL0_TABLES],
+    #[cfg(feature = "wasmtime-guarded-memory")]
+    guest_level1: PageTable,
+    #[cfg(feature = "wasmtime-guarded-memory")]
+    guest_level0: [PageTable; 8],
+    #[cfg(feature = "wasmtime-async")]
+    trap_level1: [PageTable; exec::MAX_HARTS],
+    #[cfg(feature = "wasmtime-async")]
+    trap_level0: [PageTable; exec::MAX_HARTS],
+    #[cfg(feature = "wasmtime-async")]
+    fiber_level1: PageTable,
+    #[cfg(feature = "wasmtime-async")]
+    fiber_level0: PageTable,
     ram_level1: PageTable,
     ram_level0: [PageTable; RAM_LEVEL0_TABLES],
 }
@@ -84,6 +96,18 @@ impl AddressSpace {
             root: PageTable::empty(),
             device_level1: [const { PageTable::empty() }; MAX_DEVICE_LEVEL1_TABLES],
             device_level0: [const { PageTable::empty() }; MAX_DEVICE_LEVEL0_TABLES],
+            #[cfg(feature = "wasmtime-guarded-memory")]
+            guest_level1: PageTable::empty(),
+            #[cfg(feature = "wasmtime-guarded-memory")]
+            guest_level0: [const { PageTable::empty() }; 8],
+            #[cfg(feature = "wasmtime-async")]
+            trap_level1: [const { PageTable::empty() }; exec::MAX_HARTS],
+            #[cfg(feature = "wasmtime-async")]
+            trap_level0: [const { PageTable::empty() }; exec::MAX_HARTS],
+            #[cfg(feature = "wasmtime-async")]
+            fiber_level1: PageTable::empty(),
+            #[cfg(feature = "wasmtime-async")]
+            fiber_level0: PageTable::empty(),
             ram_level1: PageTable::empty(),
             ram_level0: [const { PageTable::empty() }; RAM_LEVEL0_TABLES],
         }
@@ -203,6 +227,42 @@ pub fn init_boot(boot_physical_hart: usize) {
         {
             *ram_leaf_mut(tables, address) =
                 ram_leaf(address, STACK_PERMISSIONS).expect("mapped kernel stack page is valid");
+        }
+    }
+
+    #[cfg(feature = "wasmtime-guarded-memory")]
+    {
+        // Reserve eight GiB including all wasm32 offsets. Only the first
+        // sixteen MiB ever acquire leaves; everything else remains unmapped.
+        let root = sv39::vpn_index(WASM_MEMORY_BASE, 2);
+        for index in root..root + 8 {
+            assert!(!tables.root.entries[index].is_valid());
+        }
+        tables.root.entries[root] = PageTableEntry::table(table_address(&tables.guest_level1)).unwrap();
+        for (index, table) in tables.guest_level0.iter().enumerate() {
+            tables.guest_level1.entries[index] = PageTableEntry::table(table_address(table)).unwrap();
+        }
+    }
+
+    #[cfg(feature = "wasmtime-async")]
+    {
+        let root = sv39::vpn_index(NATIVE_FIBER_BASE, 2);
+        assert!(!tables.root.entries[root].is_valid());
+        tables.root.entries[root] = PageTableEntry::table(table_address(&tables.fiber_level1)).unwrap();
+        tables.fiber_level1.entries[0] = PageTableEntry::table(table_address(&tables.fiber_level0)).unwrap();
+        assert!(exec::MAX_HARTS < 16);
+        for hart in 0..exec::MAX_HARTS {
+            let base = native_trap_stack_top(hart) - NATIVE_TRAP_STACK_SIZE;
+            let root = sv39::vpn_index(base, 2);
+            assert!(!tables.root.entries[root].is_valid());
+            tables.root.entries[root] = PageTableEntry::table(table_address(&tables.trap_level1[hart])).unwrap();
+            tables.trap_level1[hart].entries[sv39::vpn_index(base, 1)] =
+                PageTableEntry::table(table_address(&tables.trap_level0[hart])).unwrap();
+            let physical = unsafe { (*TRAP_STACKS.0.get())[hart].as_ptr() as usize };
+            for offset in (0..NATIVE_TRAP_STACK_SIZE).step_by(sv39::PAGE_SIZE) {
+                tables.trap_level0[hart].entries[sv39::vpn_index(base + offset, 0)] =
+                    ram_leaf(physical + offset, STACK_PERMISSIONS).unwrap();
+            }
         }
     }
 
@@ -371,6 +431,35 @@ pub fn seal_code(start: usize, pages: usize) {
         code_pool_range(),
         "W^X code pool",
     );
+    WX_TRANSITIONS.fetch_add(1, Ordering::Release);
+}
+
+/// Freeze a complete compiled image before publishing its text subrange.
+pub fn freeze_code_image(start: usize, pages: usize) {
+    transition_ram_range(start, pages, WRITABLE_PERMISSIONS, READ_ONLY_PERMISSIONS,
+        false, code_pool_range(), "read-only code image");
+}
+pub fn publish_code_image_text(start: usize, pages: usize) {
+    transition_ram_range(start, pages, READ_ONLY_PERMISSIONS, TEXT_PERMISSIONS,
+        true, code_pool_range(), "code image text");
+    WX_TRANSITIONS.fetch_add(1, Ordering::Release);
+}
+pub fn thaw_code_image_data(start: usize, pages: usize) {
+    transition_ram_range(start, pages, READ_ONLY_PERMISSIONS, WRITABLE_PERMISSIONS,
+        false, code_pool_range(), "retired code image data");
+}
+
+/// Publish code whose native instructions read embedded constants. Existing
+/// execute-only callers continue to use `seal_code` and retain MXR=0.
+pub fn seal_readable_code(start: usize, pages: usize) {
+    transition_ram_range(start, pages, WRITABLE_PERMISSIONS, TEXT_PERMISSIONS,
+        true, code_pool_range(), "RX code pool");
+    WX_TRANSITIONS.fetch_add(1, Ordering::Release);
+}
+
+pub fn unseal_readable_code(start: usize, pages: usize) {
+    transition_ram_range(start, pages, TEXT_PERMISSIONS, WRITABLE_PERMISSIONS,
+        false, code_pool_range(), "RX code pool");
     WX_TRANSITIONS.fetch_add(1, Ordering::Release);
 }
 
@@ -785,4 +874,99 @@ const fn page_attributes(attributes: MemoryAttributes) -> PageAttributes {
 
 fn table_address(table: &PageTable) -> usize {
     table as *const PageTable as usize
+}
+
+#[cfg(feature = "wasmtime-guarded-memory")]
+pub const WASM_MEMORY_BASE: usize = 0x10_0000_0000;
+/// Replace the sole guest alias with RW/NX pages. Caller owns both physical
+/// buffers and guarantees no guest is executing or holding a data borrow.
+#[cfg(feature = "wasmtime-guarded-memory")]
+pub unsafe fn replace_wasm_memory(old: usize, old_size: usize, new: usize, new_size: usize) {
+    const LIMIT: usize = 16 * 1024 * 1024;
+    for (base, size) in [(old, old_size), (new, new_size)] {
+        assert!(size <= LIMIT && size % sv39::PAGE_SIZE == 0);
+        if size != 0 {
+            assert_eq!(base % sv39::PAGE_SIZE, 0);
+            assert!(base >= core::ptr::addr_of!(crate::__heap_start) as usize);
+            assert!(base.checked_add(size).unwrap() <= core::ptr::addr_of!(crate::__heap_end) as usize);
+        }
+    }
+    assert!(TABLES_READY.load(Ordering::Acquire));
+    let _lock = PAGE_TABLE_LOCK.lock();
+    let tables = unsafe { &mut *TABLES.0.get() };
+    for page in 0..LIMIT / sv39::PAGE_SIZE {
+        let entry = tables.guest_level0[page / 512].entries[page % 512];
+        if page * sv39::PAGE_SIZE < old_size {
+            assert!(entry.is_valid() && entry.is_leaf());
+            assert_eq!(entry.physical_address(), old + page * sv39::PAGE_SIZE);
+            assert_eq!(entry.permissions(), WRITABLE_PERMISSIONS);
+        } else {
+            assert!(!entry.is_valid());
+        }
+    }
+    for table in &mut tables.guest_level0 {
+        table.entries.fill(PageTableEntry::EMPTY);
+    }
+    publish_pte_writes();
+    synchronize_tlbs(WASM_MEMORY_BASE, LIMIT);
+    for offset in (0..new_size).step_by(sv39::PAGE_SIZE) {
+        let page = offset / sv39::PAGE_SIZE;
+        tables.guest_level0[page / 512].entries[page % 512] = ram_leaf(new + offset, WRITABLE_PERMISSIONS).unwrap();
+    }
+    publish_pte_writes();
+    synchronize_tlbs(WASM_MEMORY_BASE, LIMIT);
+}
+
+
+// Independent trap stacks are mapped below 17, 18, ... GiB. The entry assembly
+// computes the top from the encoded sscratch hart id using only t0, preserving
+// every interrupted register without touching the interrupted stack first.
+#[cfg(feature = "wasmtime-async")]
+pub const NATIVE_TRAP_STACK_SIZE: usize = 64 * 1024;
+#[cfg(feature = "wasmtime-async")]
+pub const fn native_trap_stack_top(hart: usize) -> usize { (17 + hart) << 30 }
+#[cfg(feature = "wasmtime-async")]
+#[repr(C, align(4096))]
+struct NativeTrapStacks(UnsafeCell<[[u8; NATIVE_TRAP_STACK_SIZE]; exec::MAX_HARTS]>);
+#[cfg(feature = "wasmtime-async")]
+unsafe impl Sync for NativeTrapStacks {}
+#[cfg(feature = "wasmtime-async")]
+static TRAP_STACKS: NativeTrapStacks = NativeTrapStacks(UnsafeCell::new([[0; NATIVE_TRAP_STACK_SIZE]; exec::MAX_HARTS]));
+
+#[cfg(feature = "wasmtime-async")]
+pub const NATIVE_FIBER_BASE: usize = 0x20_0000_0000;
+#[cfg(feature = "wasmtime-async")]
+pub const NATIVE_FIBER_STRIDE: usize = 512 * 1024;
+#[cfg(feature = "wasmtime-async")]
+pub const NATIVE_FIBER_SLOTS: usize = 4;
+/// Caller exclusively owns this stack slot and no fiber is accessing it.
+#[cfg(feature = "wasmtime-async")]
+pub unsafe fn replace_native_fiber(slot: usize, old: usize, old_size: usize, new: usize, new_size: usize) {
+    assert!(slot < NATIVE_FIBER_SLOTS);
+    for (base, size) in [(old, old_size), (new, new_size)] {
+        assert!(size <= 256 * 1024 && size % sv39::PAGE_SIZE == 0);
+        if size != 0 {
+            assert_eq!(base % sv39::PAGE_SIZE, 0);
+            assert!(base >= core::ptr::addr_of!(crate::__heap_start) as usize);
+            assert!(base.checked_add(size).unwrap() <= core::ptr::addr_of!(crate::__heap_end) as usize);
+        }
+    }
+    let _lock = PAGE_TABLE_LOCK.lock();
+    let tables = unsafe { &mut *TABLES.0.get() };
+    let first = slot * (NATIVE_FIBER_STRIDE / sv39::PAGE_SIZE);
+    let count = NATIVE_FIBER_STRIDE / sv39::PAGE_SIZE;
+    let entries = &mut tables.fiber_level0.entries[first..first + count];
+    for (page, entry) in entries.iter().enumerate() {
+        if page > 0 && page <= old_size / sv39::PAGE_SIZE {
+            assert!(entry.is_valid() && entry.is_leaf());
+            assert_eq!(entry.physical_address(), old + (page - 1) * sv39::PAGE_SIZE);
+        } else { assert!(!entry.is_valid()); }
+    }
+    entries.fill(PageTableEntry::EMPTY);
+    let start = NATIVE_FIBER_BASE + slot * NATIVE_FIBER_STRIDE;
+    publish_pte_writes(); synchronize_tlbs(start, NATIVE_FIBER_STRIDE);
+    for offset in (0..new_size).step_by(sv39::PAGE_SIZE) {
+        entries[1 + offset / sv39::PAGE_SIZE] = ram_leaf(new + offset, STACK_PERMISSIONS).unwrap();
+    }
+    publish_pte_writes(); synchronize_tlbs(start, NATIVE_FIBER_STRIDE);
 }

@@ -5,6 +5,14 @@ edition = "2021"
 autobins = false
 
 [features]
+wasmtime-command = ["wasmtime-async", "wasi-preview1"]
+wasmtime-async = ["vibeos-wasmtime-runtime/custom-code-registry", "wasmtime-guarded-memory", "vibeos-wasmtime-runtime/async", "dep:vibeos-wasi-command", "dep:vibeos-wasi-runtime"]
+wasmtime-guarded-memory = ["wasmtime-hardware-traps"]
+wasmtime-hardware-traps = ["wasmtime-native", "vibeos-wasmtime-runtime/native-signals"]
+# Optional experiment: discovered scalar extensions regress current QEMU TCG.
+wasmtime-discovered-isa = ["wasmtime-native"]
+wasmtime-coremark-probe = ["wasmtime-native"]
+wasmtime-native = ["dep:vibeos-wasmtime-runtime"]
 # Explicit long-running benchmark image; ordinary commands retain 10 million fuel.
 wasi-benchmark = ["wasi-ssh-upload"]
 wasi-rv64-cache = ["wasi-ssh-upload", "vibeos-wasi-runtime/rv64-cache"]
@@ -550,6 +558,11 @@ vibeos-wasm-simd-target = { path = "../acceptance/wasm-simd-target", default-fea
 vibeos-wasm-aot-profile = { path = "../wasm-aot-profile", optional = true }
 sha2 = { version = "=0.11.0", default-features = false, optional = true }
 jitterentropy = { package = "jitterentropy-rs", path = "../vendor/jitterentropy-rs", default-features = false, features = ["alloc"], optional = true }
+
+[dependencies.vibeos-wasmtime-runtime]
+path = "../wasmtime-runtime"
+features = ["native-riscv"]
+optional = true
 
 [target.'cfg(all(target_arch = "riscv64", target_os = "none"))'.dependencies]
 vibeos-runtime-riscv = { path = "../runtime/riscv" }

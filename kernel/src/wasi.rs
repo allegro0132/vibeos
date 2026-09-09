@@ -1,6 +1,9 @@
 //! Raw WASI command lifecycle. SYSTEM owns inputs, streams and the control
 //! record; the audited child owns only its interpreter allocations. No guest
 //! allocation or pointer is published outside the child's arena.
+#[cfg(feature = "wasmtime-command")]
+#[path = "wasi_wasmtime.rs"]
+pub(crate) mod wasmtime_backend;
 extern crate alloc;
 use crate::HEAP;
 use alloc::{
@@ -31,9 +34,6 @@ use vibeos_wasi_runtime::{
     WasiClockError, WasiInvocation, WasiIo, WasiIoError, WasiLimits, WasiTerminal,
 };
 static BUSY: AtomicBool = AtomicBool::new(false);
-// A low-register read latches the high register globally; serialize the pair.
-#[cfg(feature = "qemu-virt")]
-static RTC_LOCK: SpinLock<()> = SpinLock::new(());
 struct KernelIo<'a>(GuestIo<'a>);
 impl WasiIo for KernelIo<'_> {
     fn read(&mut self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<Result<usize, WasiIoError>> {
@@ -47,37 +47,17 @@ impl WasiIo for KernelIo<'_> {
     ) -> Poll<Result<usize, WasiIoError>> {
         self.0.write(cx, fd, bytes)
     }
-    fn clock_time(&mut self, id: u32, _precision: u64) -> Result<u64, WasiClockError> {
-        match id {
-            #[cfg(feature = "qemu-virt")]
-            0 => {
-                let _lock = RTC_LOCK.lock();
-                // SAFETY: QEMU virt's BSP maps these two 32-bit RTC registers.
-                // TIME_LOW latches TIME_HIGH; neither read changes the RTC time.
-                let ns = unsafe {
-                    let low = core::ptr::read_volatile(crate::platform::RTC_BASE as *const u32);
-                    let high =
-                        core::ptr::read_volatile((crate::platform::RTC_BASE + 4) as *const u32);
-                    (u64::from(high) << 32) | u64::from(low)
-                };
-                Ok(ns)
-            }
-            1 => u64::try_from(
-                u128::from(crate::sbi::time()) * 1_000_000_000 / u128::from(exec::timebase_hz()),
-            )
-            .map_err(|_| WasiClockError::Failed),
-            _ => Err(WasiClockError::Unsupported),
-        }
+    fn clock_time(&mut self, id: u32, precision: u64) -> Result<u64, WasiClockError> {
+        crate::wasi_clock::time(id, precision).map_err(clock_error)
     }
     fn clock_resolution(&mut self, id: u32) -> Result<u64, WasiClockError> {
-        match id {
-            #[cfg(feature = "qemu-virt")]
-            0 => Ok(1),
-            1 => Ok(1_000_000_000u64.div_ceil(exec::timebase_hz())),
-            _ => Err(WasiClockError::Unsupported),
-        }
+        crate::wasi_clock::resolution(id).map_err(clock_error)
     }
 }
+fn clock_error(errno: i32) -> WasiClockError {
+    if errno == 52 { WasiClockError::Unsupported } else { WasiClockError::Failed }
+}
+
 fn invocation_limits() -> WasiLimits {
     WasiLimits {
         #[cfg(feature = "wasi-benchmark")]
@@ -104,6 +84,8 @@ struct Job {
     space: CSpace,
     caps: [Cap; 3],
     result: SpinLock<Option<WasiTerminal>>,
+    #[cfg(feature = "wasmtime-command")]
+    native_signal: wasmtime_backend::PollSignal,
     authority: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 struct Guest {
@@ -252,11 +234,14 @@ fn launch(
     }
     // Allocate control/input storage outside the guest's reclaimable domain.
     let mut system = unsafe { heap::enter_domain(AllocationDomain::SYSTEM) };
+    #[cfg(not(feature = "wasmtime-command"))]
     let heap_budget = WasiLimits::default().allocation_bytes;
     // Code-pool pages are outside HEAP, so reserve their hard maximum from the
     // same invocation budget rather than allowing an additional MiB of memory.
-    #[cfg(feature = "wasi-rv64-cache")]
+    #[cfg(all(feature = "wasi-rv64-cache", not(feature = "wasmtime-command")))]
     let heap_budget = heap_budget - vibeos_wasi_runtime::native::CODE_BUDGET;
+    #[cfg(feature = "wasmtime-command")]
+    let heap_budget = crate::wasmtime_platform::invocation_heap_budget();
     let owner = match HEAP.create_owner(heap_budget) {
         Ok(o) => o,
         Err(_) => {
@@ -286,22 +271,23 @@ fn launch(
         space,
         caps,
         result: SpinLock::new(None),
+        #[cfg(feature = "wasmtime-command")]
+        native_signal: wasmtime_backend::PollSignal::new(),
         authority,
     });
     let raw = Box::into_raw(job) as usize;
     // SAFETY: Guest contains only this stable control-record key and an
     // arena-local interpreter. Its host bridge copies bytes into fixed SYSTEM
     // pipe arrays; no reference or owning pointer into the arena escapes.
+    #[cfg(feature = "wasmtime-command")]
+    let guest = { wasmtime_backend::register(domain, raw); wasmtime_backend::Guest::new(raw) };
+    #[cfg(not(feature = "wasmtime-command"))]
+    let guest = Guest { job: raw, instance: None, #[cfg(feature = "wasi-benchmark")] profile: (0, 0, 0) };
     let child = unsafe {
         exec::spawn_reclaimable_owned(
             domain,
             "wasi-guest",
-            Guest {
-                job: raw,
-                instance: None,
-                #[cfg(feature = "wasi-benchmark")]
-                profile: (0, 0, 0),
-            },
+            guest,
         )
     };
     exec::spawn_tracked("wasi-reaper", async move {
@@ -334,6 +320,8 @@ fn launch(
         };
         // The join proves guest polling/destruction and executor fault reclaim
         // have completed. Only the reaper owns and retires the control record.
+        #[cfg(feature = "wasmtime-command")]
+        wasmtime_backend::retire(domain, raw);
         let mut job = unsafe { Box::from_raw(raw as *mut Job) };
         let t = job.result.lock().unwrap_or(
             if HEAP.account_stats(owner).is_some_and(|s| s.denials != 0) {

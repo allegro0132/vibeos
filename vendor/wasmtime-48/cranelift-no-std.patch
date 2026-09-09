@@ -1,0 +1,955 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -34,6 +34,9 @@
+ resolver = "2"
+ 
+ [features]
++riscv64 = ["cranelift-codegen/riscv64"]
++default = ["std"]
++std = ["dep:cranelift-native", "cranelift-codegen/std", "cranelift-codegen/timing", "cranelift-frontend/std", "gimli/std", "object/write", "wasmtime-environ/std", "wasmtime-environ/threads"]
+ all-arch = ["cranelift-codegen/all-arch"]
+ host-arch = ["cranelift-codegen/host-arch"]
+ pulley = [
+@@ -51,7 +54,6 @@
+ features = [
+     "unwind",
+     "host-arch",
+-    "timing",
+     "incremental-cache",
+ ]
+ default-features = false
+@@ -63,22 +65,29 @@
+ [dependencies.cranelift-entity]
+ version = "0.135.0"
+ 
++default-features = false
++
+ [dependencies.cranelift-frontend]
+ version = "0.135.0"
+ 
++default-features = false
++
+ [dependencies.cranelift-native]
+ version = "0.135.0"
++optional = true
+ 
+ [dependencies.gimli]
+ version = "0.33.0"
+ features = [
+     "read",
+-    "std",
+ ]
+ default-features = false
+ 
+ [dependencies.itertools]
+ version = "0.14.0"
++features = ["use_alloc"]
++
++default-features = false
+ 
+ [dependencies.log]
+ version = "0.4.28"
+@@ -89,8 +98,7 @@
+ features = [
+     "read_core",
+     "elf",
+-    "write",
+-    "std",
++    "write_core",
+ ]
+ default-features = false
+ 
+@@ -102,11 +110,17 @@
+ version = "1.15.1"
+ features = ["union"]
+ 
++default-features = false
++
+ [dependencies.target-lexicon]
+ version = "0.13.5"
+ 
++default-features = false
++
+ [dependencies.thiserror]
+ version = "2.0.17"
++
++default-features = false
+ 
+ [dependencies.wasmparser]
+ version = "0.254.0"
+@@ -116,6 +130,8 @@
+ [dependencies.wasmtime-core]
+ version = "=48.0.0"
+ package = "wasmtime-internal-core"
++
++default-features = false
+ 
+ [dependencies.wasmtime-environ]
+ version = "=48.0.0"
+@@ -126,13 +142,16 @@
+     "gc-null",
+     "gc-copying",
+     "stack-switching",
+-    "threads",
+-]
++]
++
++default-features = false
+ 
+ [dependencies.wasmtime-unwinder]
+ version = "=48.0.0"
+ features = ["cranelift"]
+ package = "wasmtime-internal-unwinder"
++
++default-features = false
+ 
+ [dependencies.wasmtime-versioned-export-macros]
+ version = "=48.0.0"
+@@ -177,3 +196,8 @@
+     "cfg(fuzzing)",
+     "cfg(gc_zeal)",
+ ]
++
++[dependencies.spin]
++version = "=0.9.9"
++default-features = false
++features = ["mutex", "spin_mutex"]
+--- a/src/alias_region.rs
++++ b/src/alias_region.rs
+@@ -4,6 +4,7 @@
+     cursor::FuncCursor,
+     ir::{self, InstBuilder as _},
+ };
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{
+     BuiltinFunctionIndex, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex, FuncIndex,
+     GetPtrSize, GlobalIndex, MemoryIndex, ModuleInternedTypeIndex, PtrSize as _, RuntimeDataIndex,
+@@ -315,7 +316,7 @@
+     ///
+     /// Avoids allocating a string for the debug formatting of `AliasRegionKey`
+     /// as the `ir::AliasRegionData::description` string repeatedly.
+-    cache: std::collections::HashMap<AliasRegionKey, ir::AliasRegion>,
++    cache: wasmtime_environ::collections::oom_abort::HashMap<AliasRegionKey, ir::AliasRegion>,
+ }
+ 
+ impl<Offsets> AliasRegions<Offsets> {
+@@ -713,7 +714,7 @@
+             pointer_type: ir::Type::int_with_byte_size(offsets.get_ptr_size().size().into())
+                 .unwrap(),
+             offsets,
+-            cache: std::collections::HashMap::default(),
++            cache: wasmtime_environ::collections::oom_abort::HashMap::default(),
+         }
+     }
+ 
+--- a/src/builder.rs
++++ b/src/builder.rs
+@@ -4,15 +4,17 @@
+ //! well as providing a function to return the default configuration to build.
+ 
+ use crate::isa_builder::IsaBuilder;
++use alloc::sync::Arc;
++use core::fmt;
+ use cranelift_codegen::{
+     CodegenResult,
+     isa::{self, OwnedTargetIsa},
+ };
+-use std::fmt;
++#[cfg(feature = "std")]
+ use std::path;
+-use std::sync::Arc;
+ use target_lexicon::Triple;
+ use wasmtime_environ::error::Result;
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{CacheStore, CompilerBuilder, Setting, Tunables};
+ 
+ struct Builder {
+@@ -21,6 +23,7 @@
+     emit_debug_checks: bool,
+     linkopts: LinkOptions,
+     cache_store: Option<Arc<dyn CacheStore>>,
++    #[cfg(feature = "std")]
+     clif_dir: Option<path::PathBuf>,
+     wmemcheck: bool,
+ }
+@@ -44,6 +47,7 @@
+         inner: IsaBuilder::new(triple, |triple| isa::lookup(triple).map_err(|e| e.into()))?,
+         linkopts: LinkOptions::default(),
+         cache_store: None,
++        #[cfg(feature = "std")]
+         clif_dir: None,
+         wmemcheck: false,
+         emit_debug_checks: false,
+@@ -68,6 +72,7 @@
+         self.inner.triple()
+     }
+ 
++    #[cfg(feature = "std")]
+     fn clif_dir(&mut self, path: &path::Path) -> Result<()> {
+         self.clif_dir = Some(path.to_path_buf());
+         Ok(())
+@@ -127,6 +132,7 @@
+             self.cache_store.clone(),
+             self.emit_debug_checks,
+             self.linkopts.clone(),
++            #[cfg(feature = "std")]
+             self.clif_dir.clone(),
+             self.wmemcheck,
+         )))
+--- a/src/compiled_function.rs
++++ b/src/compiled_function.rs
+@@ -1,10 +1,11 @@
+-use std::ops::Range;
++use core::ops::Range;
+ 
+ use crate::{Relocation, mach_reloc_to_reloc, mach_trap_to_trap};
+ use cranelift_codegen::{
+     Final, MachBufferFinalized, MachBufferFrameLayout, MachSrcLoc, ValueLabelsRanges, ir,
+     isa::unwind::CfaUnwindInfo, isa::unwind::UnwindInfo,
+ };
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{
+     FilePos, FrameStateSlotBuilder, InstructionAddressMap, ModulePC, PrimaryMap, TrapInformation,
+     Tunables,
+--- a/src/compiler/component.rs
++++ b/src/compiler/component.rs
+@@ -1,6 +1,7 @@
+ //! Compilation support for the component model.
+ 
+-use std::marker::PhantomData;
++use core::marker::PhantomData;
++use wasmtime_environ::prelude::*;
+ 
+ use crate::alias_region::AliasRegions;
+ use crate::func_environ::BuiltinFunctions;
+--- a/src/compiler.rs
++++ b/src/compiler.rs
+@@ -2,9 +2,16 @@
+ use crate::alias_region::AliasRegions;
+ use crate::debug::DwarfSectionRelocTarget;
+ use crate::func_environ::FuncEnvironment;
++use crate::sync::Mutex;
+ use crate::translate::{FuncTranslator, VmctxLoadChain};
+ use crate::{BuiltinFunctionSignatures, builder::LinkOptions, wasm_call_signature};
+ use crate::{CompiledFunction, ModuleTextBuilder, array_call_signature};
++use alloc::borrow::Cow;
++use alloc::sync::Arc;
++use core::any::Any;
++use core::cmp;
++use core::mem;
++use core::ops::Range;
+ use cranelift_codegen::binemit::CodeOffset;
+ use cranelift_codegen::cursor::FuncCursor;
+ use cranelift_codegen::inline::InlineCommand;
+@@ -26,24 +33,20 @@
+ use cranelift_frontend::FunctionBuilder;
+ use object::write::{Object, StandardSegment, SymbolId};
+ use object::{RelocationEncoding, RelocationFlags, RelocationKind, SectionKind};
+-use std::any::Any;
+-use std::borrow::Cow;
+-use std::cmp;
+-use std::collections::HashMap;
+-use std::mem;
+-use std::ops::Range;
++#[cfg(feature = "std")]
+ use std::path;
+-use std::sync::{Arc, Mutex};
+ use wasmparser::{FuncValidatorAllocations, FunctionBody};
++use wasmtime_environ::collections::oom_abort::HashMap;
+ use wasmtime_environ::error::{Context as _, Result};
+ use wasmtime_environ::obj::{ELF_WASMTIME_EXCEPTIONS, ELF_WASMTIME_FRAMES};
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{
+     Abi, AddressMapSection, BuiltinFunctionIndex, CacheStore, CompileError, CompiledFunctionBody,
+     DefinedFuncIndex, FlagValue, FrameInstPos, FrameStackShape, FrameStateSlotBuilder,
+     FrameTableBuilder, FuncKey, FunctionBodyData, FunctionLoc, GetPtrSize, HostCall,
+     InliningCompiler, ModulePC, ModuleStartup, ModuleTranslation, ModuleTypesBuilder,
+     StackMapSection, StaticModuleIndex, TrapEncodingBuilder, TrapSentinel, TripleExt, Tunables,
+-    WasmFuncType, WasmValType, prelude::*,
++    WasmFuncType, WasmValType,
+ };
+ use wasmtime_unwinder::ExceptionTableBuilder;
+ 
+@@ -86,6 +89,7 @@
+     emit_debug_checks: bool,
+     linkopts: LinkOptions,
+     cache_store: Option<Arc<dyn CacheStore>>,
++    #[cfg(feature = "std")]
+     clif_dir: Option<path::PathBuf>,
+     pub(crate) wmemcheck: bool,
+ }
+@@ -125,7 +129,7 @@
+         cache_store: Option<Arc<dyn CacheStore>>,
+         emit_debug_checks: bool,
+         linkopts: LinkOptions,
+-        clif_dir: Option<path::PathBuf>,
++        #[cfg(feature = "std")] clif_dir: Option<path::PathBuf>,
+         wmemcheck: bool,
+     ) -> Compiler {
+         let _ = wmemcheck;
+@@ -136,6 +140,7 @@
+             emit_debug_checks,
+             linkopts,
+             cache_store,
++            #[cfg(feature = "std")]
+             clif_dir,
+             wmemcheck,
+         }
+@@ -454,7 +459,7 @@
+ fn box_dyn_any(x: impl Any + Send + Sync) -> Box<dyn Any + Send + Sync> {
+     log::trace!(
+         "making Box<dyn Any + Send + Sync> of {}",
+-        std::any::type_name_of_val(&x)
++        core::any::type_name_of_val(&x)
+     );
+     let b = Box::new(x);
+     let r: &(dyn Any + Sync + Send) = &*b;
+@@ -577,9 +582,12 @@
+             compiler.cx.debug_slot_descriptor = Some(slot_builder);
+         }
+ 
+-        let timing = cranelift_codegen::timing::take_current();
+-        log::debug!("`{symbol}` translated to CLIF in {:?}", timing.total());
+-        log::trace!("`{symbol}` timing info\n{timing}");
++        #[cfg(feature = "std")]
++        {
++            let timing = cranelift_codegen::timing::take_current();
++            log::debug!("`{symbol}` translated to CLIF in {:?}", timing.total());
++            log::trace!("`{symbol}` timing info\n{timing}");
++        }
+ 
+         Ok(CompiledFunctionBody {
+             code: box_dyn_any_compiler_context(Some(compiler.cx)),
+@@ -1071,9 +1079,12 @@
+             compiler.finish(&symbol)?
+         };
+ 
+-        let timing = cranelift_codegen::timing::take_current();
+-        log::debug!("`{symbol}` compiled in {:?}", timing.total());
+-        log::trace!("`{symbol}` timing info\n{timing}");
++        #[cfg(feature = "std")]
++        {
++            let timing = cranelift_codegen::timing::take_current();
++            log::debug!("`{symbol}` compiled in {:?}", timing.total());
++            log::trace!("`{symbol}` timing info\n{timing}");
++        }
+ 
+         func_body.code = box_dyn_any_compiled_function(compiled_func);
+         Ok(())
+@@ -1083,7 +1094,7 @@
+ struct CraneliftCacheStore(Arc<dyn CacheStore>);
+ 
+ impl cranelift_codegen::incremental_cache::CacheKvStore for CraneliftCacheStore {
+-    fn get(&self, key: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
++    fn get(&self, key: &[u8]) -> Option<alloc::borrow::Cow<'_, [u8]>> {
+         self.0.get(key)
+     }
+     fn insert(&mut self, key: &[u8], val: Vec<u8>) {
+@@ -1621,6 +1632,8 @@
+         body_and_tunables: Option<(&FunctionBody<'_>, &Tunables)>,
+         symbol: &str,
+     ) -> Result<CompiledFunction, CompileError> {
++        #[cfg(not(feature = "std"))]
++        let _ = symbol;
+         let context = &mut self.cx.codegen_context;
+         let isa = &*self.compiler.isa;
+ 
+@@ -1632,6 +1645,7 @@
+         let compilation_result =
+             compile_maybe_cached(context, isa, self.cx.incremental_cache_ctx.as_mut());
+ 
++        #[cfg(feature = "std")]
+         if let Some(path) = &self.compiler.clif_dir {
+             use std::io::Write;
+ 
+--- a/src/debug/transform/address_transform.rs
++++ b/src/debug/transform/address_transform.rs
+@@ -1,7 +1,8 @@
+ use crate::FunctionAddressMap;
+ use crate::debug::Compilation;
++use alloc::collections::BTreeMap;
+ use gimli::write;
+-use std::collections::BTreeMap;
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{DefinedFuncIndex, FilePos, PrimaryMap, StaticModuleIndex};
+ 
+ pub type GeneratedAddress = usize;
+@@ -178,7 +179,7 @@
+             sorted_ranges.sort();
+             index.insert(position, sorted_ranges.into_boxed_slice());
+         }
+-        active_ranges.retain(|r| ranges[*r].wasm_end.cmp(&wasm_start) != std::cmp::Ordering::Less);
++        active_ranges.retain(|r| ranges[*r].wasm_end.cmp(&wasm_start) != core::cmp::Ordering::Less);
+         active_ranges.push(range_index);
+         last_wasm_pos = Some(wasm_start);
+     }
+@@ -667,9 +668,9 @@
+ mod tests {
+     use super::{AddressTransform, build_function_lookup, get_wasm_code_offset};
+     use crate::{CompiledFunctionMetadata, FunctionAddressMap};
++    use core::mem;
+     use cranelift_entity::PrimaryMap;
+     use gimli::write::Address;
+-    use std::mem;
+     use wasmtime_environ::{FilePos, InstructionAddressMap, WasmFileInfo};
+ 
+     #[test]
+--- a/src/debug/transform/attr.rs
++++ b/src/debug/transform/attr.rs
+@@ -1,5 +1,6 @@
+ use crate::debug::Reader;
+ use crate::debug::transform::utils::resolve_die_ref;
++use wasmtime_environ::prelude::*;
+ 
+ use super::address_transform::AddressTransform;
+ use super::dbi_log;
+--- a/src/debug/transform/debug_transform_logging.rs
++++ b/src/debug/transform/debug_transform_logging.rs
+@@ -2,6 +2,7 @@
+ use core::fmt;
+ use cranelift_codegen::{LabelValueLoc, ValueLabelsRanges, ir::ValueLabel, isa::TargetIsa};
+ use gimli::{AttributeValue, LittleEndian, UnitRef, write};
++use wasmtime_environ::prelude::*;
+ 
+ macro_rules! dbi_log_enabled {
+     () => {
+--- a/src/debug/transform/expression.rs
++++ b/src/debug/transform/expression.rs
+@@ -5,18 +5,19 @@
+     dbi_log_enabled, log_get_value_loc, log_get_value_name, log_get_value_ranges,
+ };
+ use crate::translate::get_vmctx_value_label;
++use alloc::rc::Rc;
++use core::cmp::PartialEq;
+ use core::fmt;
++use core::hash::{Hash, Hasher};
+ use cranelift_codegen::LabelValueLoc;
+ use cranelift_codegen::ValueLabelsRanges;
+ use cranelift_codegen::ir::ValueLabel;
+ use cranelift_codegen::isa::TargetIsa;
+ use gimli::{Expression, Operation, Reader, ReaderOffset, write};
+ use itertools::Itertools;
+-use std::cmp::PartialEq;
+-use std::collections::{HashMap, HashSet};
+-use std::hash::{Hash, Hasher};
+-use std::rc::Rc;
++use wasmtime_environ::collections::oom_abort::{HashMap, HashSet};
+ use wasmtime_environ::error::{Context, Error, Result};
++use wasmtime_environ::prelude::*;
+ 
+ #[derive(Debug)]
+ pub struct FunctionFrameInfo<'a> {
+@@ -388,7 +389,7 @@
+                                 }
+                                 CompiledExpressionPart::Local { label, trailing } => {
+                                     let loc =
+-                                        *label_location.get(&label).context("label_location")?;
++                                        *label_location.get(label).context("label_location")?;
+                                     if let Some(expr) = translate_loc(loc, isa, *trailing)? {
+                                         code_buf.extend_from_slice(&expr)
+                                     } else {
+@@ -879,8 +880,8 @@
+         hasher.write_u32(*self.0);
+     }
+ }
+-impl std::fmt::Debug for JumpTargetMarker {
+-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
++impl core::fmt::Debug for JumpTargetMarker {
++    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::result::Result<(), core::fmt::Error> {
+         write!(
+             f,
+             "JumpMarker<{:08x}>",
+@@ -1276,7 +1277,7 @@
+     fn create_mock_value_ranges() -> (ValueLabelsRanges, (ValueLabel, ValueLabel, ValueLabel)) {
+         use cranelift_codegen::{LabelValueLoc, ValueLocRange};
+         use cranelift_entity::EntityRef;
+-        use std::collections::HashMap;
++        use wasmtime_environ::collections::oom_abort::HashMap;
+         let mut value_ranges = HashMap::new();
+         let value_0 = ValueLabel::new(0);
+         let value_1 = ValueLabel::new(1);
+--- a/src/debug/transform/line_program.rs
++++ b/src/debug/transform/line_program.rs
+@@ -2,6 +2,7 @@
+ use crate::debug::Reader;
+ use gimli::write;
+ use wasmtime_environ::error::Error;
++use wasmtime_environ::prelude::*;
+ 
+ pub(crate) fn clone_line_program(
+     mut transform: write::ConvertLineProgram<'_, Reader<'_>>,
+--- a/src/debug/transform/mod.rs
++++ b/src/debug/transform/mod.rs
+@@ -5,11 +5,12 @@
+ use crate::debug::gc::build_dependencies;
+ use cranelift_codegen::isa::TargetIsa;
+ use gimli::{DwarfPackage, LittleEndian, Section, write};
+-use std::collections::HashSet;
+ use synthetic::ModuleSyntheticUnit;
++use wasmtime_environ::collections::oom_abort::HashSet;
+ use wasmtime_environ::error::Error;
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{
+-    DefinedFuncIndex, ModuleTranslation, PrimaryMap, StaticModuleIndex, Tunables, prelude::*,
++    DefinedFuncIndex, ModuleTranslation, PrimaryMap, StaticModuleIndex, Tunables,
+ };
+ 
+ pub use address_transform::AddressTransform;
+--- a/src/debug/transform/range_info_builder.rs
++++ b/src/debug/transform/range_info_builder.rs
+@@ -3,6 +3,7 @@
+ use gimli::{AttributeValue, RangeListsOffset, UnitRef, write};
+ use wasmtime_environ::DefinedFuncIndex;
+ use wasmtime_environ::error::Error;
++use wasmtime_environ::prelude::*;
+ 
+ pub(crate) enum RangeInfoBuilder {
+     Undefined,
+--- a/src/debug/transform/simulate.rs
++++ b/src/debug/transform/simulate.rs
+@@ -1,22 +1,34 @@
+ use super::AddressTransform;
++#[cfg(feature = "std")]
+ use super::expression::{CompiledExpression, FunctionFrameInfo};
++#[cfg(feature = "std")]
+ use super::utils::append_vmctx_info;
+ use crate::debug::Compilation;
++#[cfg(feature = "std")]
+ use crate::translate::get_vmctx_value_label;
++#[cfg(feature = "std")]
++use core::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+ use cranelift_codegen::isa::TargetIsa;
++#[cfg(feature = "std")]
+ use gimli::LineEncoding;
+ use gimli::write;
+-use std::collections::{HashMap, HashSet};
++#[cfg(feature = "std")]
+ use std::path::PathBuf;
+-use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+-use wasmtime_environ::error::{Context, Error};
+-use wasmtime_environ::{
+-    DebugInfoData, EntityRef, FunctionMetadata, PrimaryMap, StaticModuleIndex, WasmFileInfo,
+-    WasmValType,
+-};
+-
++#[cfg(feature = "std")]
++use wasmtime_environ::collections::oom_abort::HashMap;
++use wasmtime_environ::collections::oom_abort::HashSet;
++#[cfg(feature = "std")]
++use wasmtime_environ::error::Context;
++use wasmtime_environ::error::Error;
++use wasmtime_environ::prelude::*;
++#[cfg(feature = "std")]
++use wasmtime_environ::{DebugInfoData, EntityRef, FunctionMetadata, WasmFileInfo, WasmValType};
++use wasmtime_environ::{PrimaryMap, StaticModuleIndex};
++
++#[cfg(feature = "std")]
+ const PRODUCER_NAME: &str = "wasmtime";
+ 
++#[cfg(feature = "std")]
+ macro_rules! assert_dwarf_str {
+     ($s:expr) => {{
+         let s = $s;
+@@ -29,6 +41,7 @@
+     }};
+ }
+ 
++#[cfg(feature = "std")]
+ fn generate_line_info(
+     addr_tr: &PrimaryMap<StaticModuleIndex, AddressTransform>,
+     translated: &HashSet<usize>,
+@@ -103,10 +116,12 @@
+     Ok((out_program, file_index))
+ }
+ 
++#[cfg(feature = "std")]
+ fn check_invalid_chars_in_name(s: &str) -> Option<&str> {
+     if s.contains('\x00') { None } else { Some(s) }
+ }
+ 
++#[cfg(feature = "std")]
+ fn autogenerate_dwarf_wasm_path(di: &DebugInfoData) -> PathBuf {
+     static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+     let module_name = di
+@@ -119,6 +134,7 @@
+     PathBuf::from(path)
+ }
+ 
++#[cfg(feature = "std")]
+ struct WasmTypesDieRefs {
+     i32: write::UnitEntryId,
+     i64: write::UnitEntryId,
+@@ -126,6 +142,7 @@
+     f64: write::UnitEntryId,
+ }
+ 
++#[cfg(feature = "std")]
+ fn add_wasm_types(
+     unit: &mut write::Unit,
+     root_id: write::UnitEntryId,
+@@ -158,6 +175,7 @@
+     }
+ }
+ 
++#[cfg(feature = "std")]
+ fn resolve_var_type(
+     index: usize,
+     wasm_types: &WasmTypesDieRefs,
+@@ -191,6 +209,7 @@
+     Some((type_die_id, is_param))
+ }
+ 
++#[cfg(feature = "std")]
+ fn generate_vars(
+     unit: &mut write::Unit,
+     die_id: write::UnitEntryId,
+@@ -279,6 +298,7 @@
+     Ok(())
+ }
+ 
++#[cfg(feature = "std")]
+ fn check_invalid_chars_in_path(path: PathBuf) -> Option<PathBuf> {
+     path.clone()
+         .to_str()
+@@ -286,6 +306,7 @@
+ }
+ 
+ /// Generate "simulated" native DWARF for functions lacking WASM-level DWARF.
++#[cfg(feature = "std")]
+ pub fn generate_simulated_dwarf(
+     compilation: &mut Compilation<'_>,
+     addr_tr: &PrimaryMap<StaticModuleIndex, AddressTransform>,
+@@ -442,3 +463,27 @@
+ 
+     Ok(())
+ }
++
++#[cfg(not(feature = "std"))]
++pub fn generate_simulated_dwarf(
++    compilation: &mut Compilation<'_>,
++    addr_tr: &PrimaryMap<StaticModuleIndex, AddressTransform>,
++    translated: &HashSet<usize>,
++    out_encoding: gimli::Encoding,
++    vmctx_ptr_die_refs: &PrimaryMap<StaticModuleIndex, write::DebugInfoRef>,
++    out_units: &mut write::UnitTable,
++    out_strings: &mut write::StringTable,
++    isa: &dyn TargetIsa,
++) -> Result<(), Error> {
++    let _ = (
++        compilation,
++        addr_tr,
++        translated,
++        out_encoding,
++        vmctx_ptr_die_refs,
++        out_units,
++        out_strings,
++        isa,
++    );
++    wasmtime_environ::error::bail!("simulated native DWARF requires std")
++}
+--- a/src/debug/transform/unit.rs
++++ b/src/debug/transform/unit.rs
+@@ -14,9 +14,10 @@
+ use cranelift_codegen::isa::TargetIsa;
+ use gimli::AttributeValue;
+ use gimli::write;
+-use std::collections::HashSet;
+ use wasmtime_environ::StaticModuleIndex;
++use wasmtime_environ::collections::oom_abort::HashSet;
+ use wasmtime_environ::error::{Context, Error};
++use wasmtime_environ::prelude::*;
+ use wasmtime_versioned_export_macros::versioned_stringify_ident;
+ 
+ #[derive(Debug)]
+--- a/src/debug/transform/utils.rs
++++ b/src/debug/transform/utils.rs
+@@ -5,6 +5,7 @@
+ use cranelift_codegen::isa::TargetIsa;
+ use gimli::{AttributeValue, UnitRef, write};
+ use wasmtime_environ::error::Error;
++use wasmtime_environ::prelude::*;
+ 
+ pub(crate) fn append_vmctx_info(
+     comp_unit: &mut write::Unit,
+--- a/src/debug/write_debuginfo.rs
++++ b/src/debug/write_debuginfo.rs
+@@ -10,6 +10,7 @@
+ };
+ use gimli::{RunTimeEndian, SectionId};
+ use wasmtime_environ::error::Result as EnvResult;
++use wasmtime_environ::prelude::*;
+ 
+ pub struct DwarfSection {
+     pub name: &'static str,
+@@ -58,7 +59,7 @@
+             return Ok(());
+         }
+         let mut relocs = vec![];
+-        ::std::mem::swap(&mut relocs, &mut s.relocs);
++        ::core::mem::swap(&mut relocs, &mut s.relocs);
+         result.push(DwarfSection { name, body, relocs });
+         Ok(())
+     })?;
+--- a/src/debug.rs
++++ b/src/debug.rs
+@@ -13,7 +13,8 @@
+ use core::fmt;
+ use cranelift_codegen::isa::TargetIsa;
+ use object::write::SymbolId;
+-use std::collections::HashMap;
++use wasmtime_environ::collections::oom_abort::HashMap;
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{
+     DefinedFuncIndex, DefinedMemoryIndex, EntityRef, MemoryIndex, ModuleTranslation,
+     OwnedMemoryIndex, PrimaryMap, PtrSize, StaticModuleIndex, Tunables, VMOffsets,
+--- a/src/func_environ/gc.rs
++++ b/src/func_environ/gc.rs
+@@ -16,6 +16,7 @@
+ use cranelift_entity::packed_option::ReservedValue;
+ use cranelift_frontend::FunctionBuilder;
+ use smallvec::{SmallVec, smallvec};
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{
+     Collector, GcArrayLayout, GcLayout, GcStructLayout, GcTypeLayouts, I31_DISCRIMINANT,
+     ModuleInternedTypeIndex, TagIndex, TypeIndex, VMGcKind, WasmCompositeInnerType,
+--- a/src/func_environ/stack_switching/instructions.rs
++++ b/src/func_environ/stack_switching/instructions.rs
+@@ -8,6 +8,7 @@
+ use cranelift_codegen::ir::{Block, BlockCall, InstBuilder, JumpTableData};
+ use cranelift_frontend::FunctionBuilder;
+ use itertools::{Either, Itertools};
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{PtrSize, TagIndex, TypeIndex, WasmResult, WasmValType, wasm_unsupported};
+ 
+ fn control_context_size(triple: &target_lexicon::Triple) -> WasmResult<u8> {
+@@ -24,6 +25,7 @@
+ 
+ /// This module contains compile-time counterparts to types defined elsewhere.
+ pub(crate) mod stack_switching_helpers {
++    use alloc::{vec, vec::Vec};
+     use core::marker::PhantomData;
+     use cranelift_codegen::ir;
+     use cranelift_codegen::ir::InstBuilder;
+@@ -1908,9 +1910,9 @@
+     // We stack allocate enough room for the suspend arguments and the
+     // return values including the possible exception reference.
+     let values = active_contref.values(env, builder);
+-    let required_capacity = u32::try_from(std::cmp::max(
++    let required_capacity = u32::try_from(core::cmp::max(
+         1, // This account for the possible exception reference.
+-        std::cmp::max(suspend_args.len(), tag_return_types.len()),
++        core::cmp::max(suspend_args.len(), tag_return_types.len()),
+     ))
+     .expect("Number of stack switching payloads should fit in u32");
+ 
+@@ -2022,7 +2024,7 @@
+         // the return values including the possible exception
+         // reference.
+         let values = switcher_contref.values(env, builder);
+-        let required_capacity = u32::try_from(std::cmp::max(1, return_types.len())).unwrap();
++        let required_capacity = u32::try_from(core::cmp::max(1, return_types.len())).unwrap();
+         env.stack_switching_values_buffer = Some(values.allocate_or_reuse_stack_slot(
+             env,
+             builder,
+--- a/src/func_environ.rs
++++ b/src/func_environ.rs
+@@ -12,6 +12,9 @@
+     BuiltinFunctionSignatures, TRAP_ARRAY_OUT_OF_BOUNDS, TRAP_GC_HEAP_CORRUPT,
+     TRAP_TABLE_OUT_OF_BOUNDS,
+ };
++use core::iter::Peekable;
++use core::marker::PhantomData;
++use core::mem;
+ use cranelift_codegen::cursor::FuncCursor;
+ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+ use cranelift_codegen::ir::immediates::{Ieee32, Ieee64, Imm64, V128Imm};
+@@ -26,13 +29,11 @@
+ use cranelift_frontend::Variable;
+ use cranelift_frontend::{FuncInstBuilder, FunctionBuilder};
+ use smallvec::{SmallVec, smallvec};
+-use std::iter::Peekable;
+-use std::marker::PhantomData;
+-use std::mem;
+ use wasmparser::{
+     BranchHint, FuncValidator, Operator, SectionLimitedIntoIter, WasmModuleResources,
+ };
+ use wasmtime_core::math::f64_cvt_to_int_bounds;
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{
+     BuiltinFunctionIndex, ComponentPC, ConstExpr, ConstOp, DataIndex, DefinedFuncIndex,
+     DefinedGlobalIndex, DefinedTableIndex, ElemIndex, EngineOrModuleTypeIndex, FactInlineIntrinsic,
+@@ -155,7 +156,7 @@
+     /// Translation state at the given point.
+     pub(crate) stacks: FuncTranslationStacks,
+ 
+-    ty_to_gc_layout: std::collections::HashMap<
++    ty_to_gc_layout: wasmtime_environ::collections::oom_abort::HashMap<
+         wasmtime_environ::ModuleInternedTypeIndex,
+         wasmtime_environ::GcLayout,
+     >,
+@@ -279,7 +280,7 @@
+             entities: WasmEntities::default(),
+             stacks: FuncTranslationStacks::new(),
+ 
+-            ty_to_gc_layout: std::collections::HashMap::new(),
++            ty_to_gc_layout: wasmtime_environ::collections::oom_abort::HashMap::new(),
+             gc_heap: None,
+ 
+             heaps: PrimaryMap::default(),
+--- a/src/isa_builder.rs
++++ b/src/isa_builder.rs
+@@ -2,6 +2,7 @@
+ use cranelift_codegen::settings::{self, Configurable, Flags, SetError};
+ use target_lexicon::Triple;
+ use wasmtime_environ::error::Result;
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{Setting, SettingKind};
+ 
+ /// A helper to build an Isa for a compiler implementation.
+@@ -28,9 +29,13 @@
+             .set("enable_probestack", "false")
+             .expect("should be valid flag");
+ 
++        #[cfg(feature = "std")]
+         let triple_specified = triple.is_some();
+         let triple = triple.unwrap_or_else(Triple::host);
+-        let mut isa_flags = lookup(triple)?;
++        let isa_flags = lookup(triple)?;
++        #[cfg(feature = "std")]
++        let mut isa_flags = isa_flags;
++        #[cfg(feature = "std")]
+         if !triple_specified {
+             cranelift_native::infer_native_flags(&mut isa_flags).unwrap();
+         }
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -13,6 +13,11 @@
+ // See documentation in crates/wasmtime/src/runtime.rs for why this is
+ // selectively enabled here.
+ #![warn(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
++#![no_std]
++extern crate alloc;
++#[cfg(feature = "std")]
++extern crate std;
++mod sync;
+ 
+ use cranelift_codegen::{
+     FinalizedMachReloc, FinalizedRelocTarget, MachTrap, binemit,
+@@ -22,6 +27,7 @@
+     settings,
+ };
+ use cranelift_entity::PrimaryMap;
++use wasmtime_environ::prelude::*;
+ 
+ use target_lexicon::Architecture;
+ use wasmtime_environ::{
+--- a/src/obj.rs
++++ b/src/obj.rs
+@@ -14,6 +14,7 @@
+ //! names have format "_trampoline_N", where N is `SignatureIndex`.
+ 
+ use crate::{CompiledFunction, Compiler};
++use core::ops::Range;
+ use cranelift_codegen::TextSectionBuilder;
+ use cranelift_codegen::isa::unwind::{UnwindInfo, systemv};
+ use cranelift_control::ControlPlane;
+@@ -21,8 +22,8 @@
+ use gimli::write::{Address, EhFrame, EndianVec, FrameTable, Writer};
+ use object::write::{Object, SectionId, StandardSegment, Symbol, SymbolId, SymbolSection};
+ use object::{Architecture, SectionFlags, SectionKind, SymbolFlags, SymbolKind, SymbolScope};
+-use std::ops::Range;
+ use wasmtime_environ::error::Result;
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{Compiler as _, FuncKey, TripleExt, obj};
+ 
+ const TEXT_SECTION_NAME: &[u8] = b".text";
+--- a/src/sync.rs
++++ b/src/sync.rs
+@@ -0,0 +1,12 @@
++#[cfg(feature = "std")]
++pub use std::sync::Mutex;
++#[cfg(not(feature = "std"))]
++#[derive(Default)]
++pub struct Mutex<T>(spin::Mutex<T>);
++#[cfg(not(feature = "std"))]
++impl<T> Mutex<T> {
++    // The kernel uses aborting panics, so there is no poisoned-lock state.
++    pub fn lock(&self) -> Result<spin::MutexGuard<'_, T>, core::convert::Infallible> {
++        Ok(self.0.lock())
++    }
++}
+--- a/src/translate/code_translator.rs
++++ b/src/translate/code_translator.rs
+@@ -81,6 +81,7 @@
+     block_with_params, blocktype_params_results, f32_translation, f64_translation, set_block_params,
+ };
+ use crate::trap::TranslateTrap;
++use alloc::vec::Vec;
+ use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+ use cranelift_codegen::ir::immediates::Offset32;
+ use cranelift_codegen::ir::{
+@@ -91,9 +92,9 @@
+ use cranelift_frontend::{FunctionBuilder, Variable};
+ use itertools::Itertools;
+ use smallvec::{SmallVec, ToSmallVec};
+-use std::collections::{HashMap, hash_map};
+-use std::vec::Vec;
+ use wasmparser::{FuncValidator, MemArg, Operator, WasmModuleResources};
++use wasmtime_environ::collections::oom_abort::{HashMap, hash_map};
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{
+     DataIndex, ElemIndex, FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TagIndex, TypeConvert,
+     TypeIndex, WasmHeapType, WasmRefType, WasmResult, WasmValType, wasm_unsupported,
+--- a/src/translate/func_translator.rs
++++ b/src/translate/func_translator.rs
+@@ -15,6 +15,7 @@
+ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
+ use smallvec::SmallVec;
+ use wasmparser::{BinaryReader, FuncValidator, FunctionBody, OperatorsReader, WasmModuleResources};
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{TypeConvert, WasmResult};
+ 
+ /// WebAssembly to Cranelift IR function translator.
+--- a/src/translate/stack.rs
++++ b/src/translate/stack.rs
+@@ -4,12 +4,13 @@
+ //! track of the WebAssembly value and control stacks during the translation of
+ //! a single function.
+ 
++use alloc::vec::Vec;
+ use cranelift_codegen::ir::{self, Block, ExceptionTag, Inst, Value};
+ use cranelift_entity::SecondaryMap;
+ use cranelift_frontend::{FunctionBuilder, Variable};
+ use smallvec::SmallVec;
+-use std::vec::Vec;
+ use wasmtime_environ::FrameStackShape;
++use wasmtime_environ::prelude::*;
+ 
+ /// Information about the presence of an associated `else` for an `if`, or the
+ /// lack thereof.
+--- a/src/translate/translation_utils.rs
++++ b/src/translate/translation_utils.rs
+@@ -21,11 +21,11 @@
+ {
+     return Ok(match ty {
+         wasmparser::BlockType::Empty => (
+-            itertools::Either::Left(std::iter::empty()),
++            itertools::Either::Left(core::iter::empty()),
+             itertools::Either::Left(None.into_iter()),
+         ),
+         wasmparser::BlockType::Type(ty) => (
+-            itertools::Either::Left(std::iter::empty()),
++            itertools::Either::Left(core::iter::empty()),
+             itertools::Either::Left(Some(ty).into_iter()),
+         ),
+         wasmparser::BlockType::FuncType(ty_index) => {
+--- a/src/trap.rs
++++ b/src/trap.rs
+@@ -6,6 +6,7 @@
+ use cranelift_codegen::ir::types::I8;
+ use cranelift_codegen::ir::{self, InstBuilder};
+ use cranelift_frontend::FunctionBuilder;
++use wasmtime_environ::prelude::*;
+ use wasmtime_environ::{BuiltinFunctionIndex, GetPtrSize, TripleExt};
+ 
+ /// Helper trait to share translation of traps between core functions and

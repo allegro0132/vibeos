@@ -1,0 +1,44 @@
+--- a/src/func_environ.rs
++++ b/src/func_environ.rs
+@@ -4622,20 +4622,35 @@
+             (2, ir::types::I16),
+             (1, ir::types::I8),
+         ];
+-        // 12 covers the worst case under the 128-byte cap: n=127 decomposes into
+-        // 7×i8x16 + i64 + i32 + i16 + i8 = 11 chunks. Sized so both `SmallVec`s
+-        // stay inline.
+-        let mut chunks: SmallVec<[(i32, ir::Type); 12]> = smallvec![];
++        // Bulk memory is available even when the target cannot lower SIMD.
++        // RV64GC does not guarantee V; require the full V extension before
++        // introducing i8x16 internally (V also guarantees VLEN >= 128).
++        let widths = if matches!(
++            self.isa.triple().architecture,
++            target_lexicon::Architecture::Riscv64(_)
++        ) && !self
++            .isa
++            .isa_flags()
++            .iter()
++            .any(|flag| flag.name == "has_v" && flag.as_bool() == Some(true))
++        {
++            &WIDTHS[1..]
++        } else {
++            WIDTHS
++        };
++        // Without vectors, 127 bytes needs 15 i64 chunks plus i32/i16/i8.
++        // Keep all loads before all stores, including overlapping copies.
++        let mut chunks: SmallVec<[(i32, ir::Type); 18]> = smallvec![];
+         let mut offset = 0u64;
+         let mut remaining = bytes;
+-        for &(width, ty) in WIDTHS {
++        for &(width, ty) in widths {
+             while remaining >= width {
+                 chunks.push((i32::try_from(offset).unwrap(), ty));
+                 offset += width;
+                 remaining -= width;
+             }
+         }
+-        let vals: SmallVec<[ir::Value; 12]> = chunks
++        let vals: SmallVec<[ir::Value; 18]> = chunks
+             .iter()
+             .map(|&(off, ty)| builder.ins().load(ty, load_flags, src_addr, off))
+             .collect();

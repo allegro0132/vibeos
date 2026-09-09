@@ -1,0 +1,77 @@
+[package]
+name = "vibeos-wasmtime-runtime"
+version = "0.1.0"
+edition = "2024"
+publish = false
+[workspace]
+[dependencies]
+vibeos-component-format = { path = "../component-format" }
+wasmtime = { version = "=48.0.0", default-features = false, features = ["runtime", "custom-virtual-memory", "custom-sync-primitives"] }
+
+[features]
+custom-code-registry = ["wasmtime/custom-code-registry"]
+async = ["wasmtime/async"]
+native-signals = ["wasmtime/custom-native-signals"]
+# Required by the future kernel execution integration, not cross-compilation tools.
+native-riscv = ["compiler"]
+host-custom = ["dep:libc"]
+host-tools = ["wasmtime/std"]
+compiler = ["wasmtime/cranelift","compiler-environment", "dep:wasmtime-cranelift", "wasmtime-cranelift/riscv64"]
+compiler-environment = ["dep:wasmtime-environ"]
+[dependencies.wasmtime-environ]
+version = "=48.0.0"
+default-features = false
+features = ["compile", "component-model"]
+optional = true
+[dependencies.wasmtime-cranelift]
+package = "wasmtime-internal-cranelift"
+version = "=48.0.0"
+default-features = false
+optional = true
+
+[patch.crates-io]
+cranelift-codegen = { path = "../vendor/wasmtime-48/cranelift-codegen" }
+wasmtime = { path = "../vendor/wasmtime-48/wasmtime" }
+wasmtime-internal-cranelift = { path = "../vendor/wasmtime-48/wasmtime-cranelift" }
+wasmtime-environ = { path = "../vendor/wasmtime-48/wasmtime-environ" }
+
+[dependencies.wasmparser]
+version = "=0.254.0"
+default-features = false
+features = ["features", "validate", "component-model"]
+
+[[example]]
+name = "translate"
+required-features = ["compiler-environment"]
+
+[[example]]
+name = "compile"
+required-features = ["compiler"]
+
+[[example]]
+name = "module"
+required-features = ["compiler", "host-tools"]
+
+[dependencies.libc]
+version = "0.2"
+optional = true
+
+[[example]]
+name = "module-custom"
+required-features = ["compiler", "host-custom"]
+
+[[example]]
+name = "execute-custom"
+required-features = ["compiler", "host-custom"]
+
+[[example]]
+name = "memory-custom"
+required-features = ["compiler", "host-custom"]
+
+[[example]]
+name = "wasi-custom"
+required-features = ["compiler", "host-custom"]
+
+[[example]]
+name = "wasi-streams-custom"
+required-features = ["compiler", "host-custom", "async"]

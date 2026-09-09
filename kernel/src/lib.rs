@@ -15,6 +15,8 @@
 
 #[cfg(feature = "wasi-preview1")]
 mod wasi;
+#[cfg(any(feature = "wasi-preview1", feature = "wasmtime-native"))]
+mod wasi_clock;
 
 #[cfg(all(
     feature = "wasm-c83-runtime-costs",
@@ -1155,6 +1157,15 @@ global_asm!(
 .global vibeos_kernel_start
 vibeos_kernel_start:
     csrw sie, zero
+    .if {fp_enabled}
+    .option push
+    .option arch, +f, +d
+    li t0, 0x6000
+    csrs sstatus, t0
+    fscsr zero
+    .option pop
+    .endif
+
     csrw sip, zero
     // Zero is the fail-closed "no logical hart" encoding. `mark_online`
     // installs logical_index + 1 after validating the firmware hartid.
@@ -1190,6 +1201,15 @@ vibeos_kernel_start:
 .global _secondary_start
 _secondary_start:
     csrw sie, zero
+    .if {fp_enabled}
+    .option push
+    .option arch, +f, +d
+    li t0, 0x6000
+    csrs sstatus, t0
+    fscsr zero
+    .option pop
+    .endif
+
     csrw sip, zero
     csrw sscratch, zero
 
@@ -1220,7 +1240,8 @@ _secondary_start:
 .Lsecondary_park:
     wfi
     j .Lsecondary_park
-"#
+"#,
+    fp_enabled = const cfg!(target_feature = "d") as usize,
 );
 
 extern "C" {
@@ -1265,13 +1286,23 @@ const BANNER: &str = r#"
 "#;
 
 #[no_mangle]
-pub extern "C" fn kmain() -> ! {
+pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
     uart::early_write("\r\n[VibeOS] entry\r\n");
     exec::configure_timebase(platform::TIMEBASE_HZ);
     let boot_time = sbi::time();
     #[cfg(not(feature = "legacy-shell"))]
     let _ = boot_time;
     let boot_physical_hart = sbi::current_hart_id();
+
+    let (hs, he) = (
+        core::ptr::addr_of!(__heap_start) as usize,
+        core::ptr::addr_of!(__heap_end) as usize,
+    );
+    // OpenSBI's DTB may be outside the RAM mapped by our bounded allocator.
+    // Capture its scalar ISA intersection while physical addressing is active,
+    // before page tables or heap initialization can hide/reuse the blob.
+    #[cfg(feature = "wasmtime-native")]
+    let wasmtime_harts = unsafe { wasmtime_platform::capture_boot_isa(_firmware_dtb, hs, he) };
 
     mmu::init_boot(boot_physical_hart);
     uart::early_write("[VibeOS] page tables ready\r\n");
@@ -1304,10 +1335,8 @@ pub extern "C" fn kmain() -> ! {
         blue_led.external,
     );
 
-    let (hs, he) = (
-        core::ptr::addr_of!(__heap_start) as usize,
-        core::ptr::addr_of!(__heap_end) as usize,
-    );
+    #[cfg(feature = "wasmtime-native")]
+    wasmtime_platform::report_boot_isa(wasmtime_harts);
     unsafe { HEAP.init(hs, he) };
     println!(
         "  heap      {:#x}..{:#x}  ({} KiB)",
@@ -1551,6 +1580,17 @@ pub extern "C" fn kmain() -> ! {
         feature = "wasm-c810-s5-simd-qemu-qualification"
     )))]
     world::build();
+
+    start_services(boot_time)
+}
+
+// Keep service-future construction out of kmain's frame. With speed-oriented
+// codegen, retaining those temporaries while world::build runs exceeds the
+// guarded boot stack even though each phase fits on its own.
+#[inline(never)]
+fn start_services(boot_time: u64) -> ! {
+    #[cfg(not(feature = "legacy-shell"))]
+    let _ = boot_time;
 
     #[cfg(not(any(
         feature = "wasm-c83-runtime-costs",
@@ -2100,6 +2140,23 @@ unsafe fn reclaim_faulted_component(
     }
 
     let domain = witness.allocation_domain();
+    #[cfg(feature = "wasmtime-command")]
+    if unsafe { wasi::wasmtime_backend::recover(domain) } {
+        unsafe { HEAP.reclaim_faulted_domain(domain) }.expect("native command arena reclaim");
+        return exec::FaultReclaimOutcome::Reclaimed;
+    }
+    #[cfg(feature = "wasmtime-async")]
+    if unsafe { wasmtime_platform::recover_code_probe(domain) } {
+        unsafe { HEAP.reclaim_faulted_domain(domain) }.expect("native code probe arena reclaim");
+        return exec::FaultReclaimOutcome::Reclaimed;
+    }
+    #[cfg(feature = "wasmtime-guarded-memory")]
+    if unsafe { wasmtime_platform::recover_memory_probe(domain) } {
+        // This fixed fixture publishes no Engine/Module/TLS or service state.
+        // Its sole mapping record was detached before arena bytes are freed.
+        unsafe { HEAP.reclaim_faulted_domain(domain) }.expect("memory probe arena reclaim");
+        return exec::FaultReclaimOutcome::Reclaimed;
+    }
     unsafe {
         // Repair component-stable synchronization state while the exact
         // faulting incarnation is still identifiable and before Faulted is
@@ -2111,6 +2168,8 @@ unsafe fn reclaim_faulted_component(
         #[cfg(feature = "qemu-virt")]
         virtio_rng::recover_faulted_domain(domain);
         world::world().recover_faulted_domain(domain);
+        #[cfg(feature = "wasmtime-guarded-memory")]
+        wasmtime_platform::recover_guest_memory(domain);
         code_pool::recover_faulted_domain(domain);
         HEAP.reclaim_faulted_domain(domain)
             .expect("a faulted audited arena must reclaim atomically");
@@ -2138,6 +2197,8 @@ unsafe fn cleanup_faulted_task_after_component_gate(
     domain: heap::AllocationDomain,
 ) {
     unsafe {
+        #[cfg(feature = "wasmtime-async")]
+        wasmtime_platform::call_recovery::recover_task(task, domain);
         store::recover_faulted_task(task, domain);
         segment_store_platform::recover_faulted_task(task, domain);
         // Durable boot recovery installs and fail-closes the saved-program
@@ -2251,3 +2312,6 @@ fn oom(layout: core::alloc::Layout) -> ! {
         }
     }
 }
+
+#[cfg(feature = "wasmtime-native")]
+mod wasmtime_platform;

@@ -15,6 +15,11 @@ const SIE_STIE: usize = 1 << 5; // supervisor timer
 const SIE_SEIE: usize = 1 << 9; // supervisor external
 const SSTATUS_SIE: usize = 1 << 1;
 
+// Only the synchronous kernel self-test arms this fault-injection hook.
+#[cfg(target_feature = "d")]
+#[no_mangle]
+pub(crate) static __vibe_fp_irq_probe_active: AtomicBool = AtomicBool::new(false);
+
 // A task fault landing pad is still armed when an interrupt preempts its poll.
 // Panicking from that interrupt must not longjmp into the interrupted task: it
 // would abandon the trap frame and falsely blame the component. The panic path
@@ -33,7 +38,37 @@ global_asm!(
 .align 4
 .global __trap_entry
 __trap_entry:
-    addi sp, sp, -256
+    .if {independent_stack}
+    // sscratch stores logical hart + 1. Preserve t0 in the CSR temporarily;
+    // interrupts are disabled by hardware until the complete frame is saved.
+    csrrw t0, sscratch, t0
+    ori t0, t0, 16
+    slli t0, t0, 30
+    // Do not overwrite an outer frame if the trap handler itself faults.
+    srli t0, t0, 16
+    addi t0, t0, -1
+    slli t0, t0, 16
+    bltu sp, t0, .Ltrap_restore_top
+    srli t0, t0, 16
+    addi t0, t0, 1
+    slli t0, t0, 16
+    bltu sp, t0, .Ltrap_nested_fatal
+    j .Ltrap_top_ready
+.Ltrap_restore_top:
+    srli t0, t0, 16
+    addi t0, t0, 1
+    slli t0, t0, 16
+.Ltrap_top_ready:
+    sd sp, -8(t0)
+    csrr sp, sscratch
+    sd sp, -16(t0)
+    mv sp, t0
+    srli t0, t0, 30
+    andi t0, t0, 15
+    csrw sscratch, t0
+    ld t0, -16(sp)
+    .endif
+    addi sp, sp, -{trap_bytes}
     // Capture the IRQ-side benchmark endpoint before the full register save.
     // t0 is the first scratch register saved, so using it after this store
     // preserves the interrupted context. Offset 240 is otherwise unused.
@@ -70,9 +105,39 @@ __trap_entry:
     sd tp, 224(sp)
     sd gp, 232(sp)
 
+    .if {fp_enabled}
+    .option push
+    .option arch, +f, +d
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fsd f\r, (256 + 8 * \r)(sp)
+    .endr
+    frcsr t0
+    sd t0, 512(sp)
+    la t0, __vibe_fp_irq_probe_active
+    lbu t0, 0(t0)
+    beqz t0, .Lfp_irq_no_injection
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fmv.d.x f\r, zero
+    .endr
+    fscsr zero
+.Lfp_irq_no_injection:
+    .option pop
+    .endif
     ld a0, 240(sp)
+    ld a1, 128(sp) // interrupted frame pointer for native Wasmtime traps
+    mv a2, sp // stable frame for the private invalid-SP probe
     call __trap_handler
 
+    .if {fp_enabled}
+    .option push
+    .option arch, +f, +d
+    .irp r,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31
+    fld f\r, (256 + 8 * \r)(sp)
+    .endr
+    ld t0, 512(sp)
+    fscsr t0
+    .option pop
+    .endif
     ld ra,   0(sp)
     ld t0,   8(sp)
     ld t1,  16(sp)
@@ -103,9 +168,28 @@ __trap_entry:
     ld s11,216(sp)
     ld tp, 224(sp)
     ld gp, 232(sp)
-    addi sp, sp, 256
+    .if {independent_stack}
+    ld sp, 536(sp)
+    .else
+    addi sp, sp, {trap_bytes}
+    .endif
     sret
-"#
+    .if {independent_stack}
+.Ltrap_nested_fatal:
+    // The handler's own stack fault is a kernel failure, never a task fault.
+    li a0, 0
+    li a1, 1
+    li a6, 0
+    li a7, 0x53525354
+    ecall
+.Ltrap_nested_halt:
+    wfi
+    j .Ltrap_nested_halt
+    .endif
+"#,
+    fp_enabled = const cfg!(target_feature = "d") as usize,
+    independent_stack = const cfg!(feature = "wasmtime-async") as usize,
+    trap_bytes = const if cfg!(feature = "wasmtime-async") { 544 } else if cfg!(target_feature = "d") { 528 } else { 256 },
 );
 
 extern "C" {
@@ -162,7 +246,7 @@ pub fn in_interrupt() -> bool {
 }
 
 #[no_mangle]
-extern "C" fn __trap_handler(irq_entry: u64) {
+extern "C" fn __trap_handler(irq_entry: u64, _interrupted_fp: usize, _frame: usize) {
     let scause: usize;
     let stval: usize;
     let sepc: usize;
@@ -172,10 +256,17 @@ extern "C" fn __trap_handler(irq_entry: u64) {
         asm!("csrr {}, sepc", out(reg) sepc);
     }
 
+    #[cfg(feature = "wasmtime-async")]
+    if unsafe { recover_bad_stack_probe(scause, sepc, _frame) } { return; }
+
     let is_interrupt = scause >> 63 == 1;
     let code = scause & !(1usize << 63);
 
     if !is_interrupt {
+        #[cfg(feature = "wasmtime-hardware-traps")]
+        unsafe { crate::wasmtime_platform::native_traps::dispatch(code, sepc, _interrupted_fp, stval); }
+        // A returning Wasmtime handler did not recognize the exception. Keep
+        // the existing fatal behavior for host faults and unknown trap sites.
         crate::println!(
             "\n[!] fatal trap: cause={} stval={:#x} sepc={:#x} ({})",
             code,
@@ -286,4 +377,60 @@ fn exception_name(code: usize) -> &'static str {
         15 => "store page fault",
         _ => "unknown",
     }
+}
+
+
+#[cfg(feature = "wasmtime-async")]
+static BAD_STACK_PROBE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "wasmtime-async")]
+global_asm!(r#"
+.option push
+.option norvc
+.section .text
+.balign 4
+.global __vibe_bad_stack_probe
+__vibe_bad_stack_probe:
+    mv t1, sp
+    mv sp, a0
+.global __vibe_bad_stack_trap
+__vibe_bad_stack_trap:
+    ebreak
+.global __vibe_bad_stack_resume
+__vibe_bad_stack_resume:
+    li a0, 42
+    ret
+.option pop
+"#);
+#[cfg(feature = "wasmtime-async")]
+unsafe extern "C" {
+    fn __vibe_bad_stack_probe(sp: usize) -> usize;
+    fn __vibe_bad_stack_trap();
+    fn __vibe_bad_stack_resume();
+}
+#[cfg(feature = "wasmtime-async")]
+unsafe fn recover_bad_stack_probe(cause: usize, pc: usize, frame: usize) -> bool {
+    if cause != 3 || pc != __vibe_bad_stack_trap as *const () as usize
+        || !BAD_STACK_PROBE.swap(false, Ordering::AcqRel) { return false; }
+    let top = crate::mmu::native_trap_stack_top(current_hart_index().unwrap());
+    assert_eq!(frame, top - 544);
+    // The assembly probe preserved its valid caller SP in t1 (frame offset 16).
+    // No address from the unmapped interrupted stack is dereferenced.
+    unsafe {
+        *((frame + 536) as *mut usize) = *((frame + 16) as *const usize);
+        asm!("csrw sepc, {}", in(reg) __vibe_bad_stack_resume as *const () as usize);
+    }
+    true
+}
+#[cfg(feature = "wasmtime-async")]
+pub fn native_stack_selftest() {
+    let top = crate::mmu::native_trap_stack_top(current_hart_index().unwrap());
+    let base = top - crate::mmu::NATIVE_TRAP_STACK_SIZE;
+    assert!(crate::mmu::mapping(base).is_some());
+    assert!(crate::mmu::mapping(base - 16).is_none());
+    for _ in 0..16 {
+        assert!(!BAD_STACK_PROBE.swap(true, Ordering::AcqRel));
+        assert_eq!(unsafe { __vibe_bad_stack_probe(base - 16) }, 42);
+        assert!(!BAD_STACK_PROBE.load(Ordering::Acquire));
+    }
+    crate::println!("  WASMTIME TRAP STACK PASS invalid_sp=16 bytes=65536 guard=1 returned=1");
 }

@@ -1083,7 +1083,11 @@ fn current_task_exact_wake() -> Option<ExactTaskWake> {
     })
 }
 
-fn current_task_scope_id() -> Option<TaskId> {
+/// Exact identity of the executor scope currently polling or destroying a task.
+/// Unlike `current_task_id`, this remains available during guarded destruction
+/// after the running slot is detached. This is cleanup provenance only, not
+/// authorization to publish work or reclaim an arena.
+pub fn current_task_scope_id() -> Option<TaskId> {
     let hart = current_scheduler_hart()?;
     let current = CURRENT_TASK_STATUS[hart.index()].lock();
     let id = CURRENT_TASK_ID[hart.index()].load(Ordering::Acquire);
@@ -7648,7 +7652,10 @@ mod one_shot_wait_tests {
         let task = TaskId(90_000);
         let domain = heap::current_domain();
         // Safety: the serial host test stays on hart zero for the scope.
+        assert_eq!(current_task_scope_id(), None);
         let _task = unsafe { enter_current_task_on_hart(HartId::BOOT, task, status.clone()) };
+        assert_eq!(current_task_scope_id(), Some(task));
+        assert_eq!(current_task_id(), None); // Detached scope, like guarded Drop.
 
         assert!(!try_reserve_current_task_registrations(0));
         assert!(!try_reserve_current_task_registrations(5));

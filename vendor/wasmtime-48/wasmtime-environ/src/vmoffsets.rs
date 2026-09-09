@@ -1,0 +1,1376 @@
+//! Offsets and sizes of various structs in `wasmtime::runtime::vm::*` that are
+//! accessed directly by compiled Wasm code.
+
+// Currently the `VMContext` allocation by field looks like this:
+//
+// struct VMContext {
+//      // Fixed-width data comes first so the calculation of the offset of
+//      // these fields is a compile-time constant when using `HostPtr`.
+//      magic: u32,
+//      _padding: u32, // (On 64-bit systems)
+//      vm_store_context: *const VMStoreContext,
+//      builtin_functions: *mut VMBuiltinFunctionsArray,
+//      epoch_ptr: *mut AtomicU64,
+//      gc_heap_data: *mut T, // Collector-specific pointer
+//      type_ids: *const VMSharedTypeIndex,
+//
+//      // Variable-width fields come after the fixed-width fields above. Place
+//      // memory-related items first as they're some of the most frequently
+//      // accessed items and minimizing their offset in this structure can
+//      // shrink the size of load/store instruction offset immediates on
+//      // platforms like x64 and Pulley (e.g. fit in an 8-bit offset instead
+//      // of needing a 32-bit offset)
+//      imported_memories: [VMMemoryImport; module.num_imported_memories],
+//      memories: [*mut VMMemoryDefinition; module.num_defined_memories],
+//      owned_memories: [VMMemoryDefinition; module.num_owned_memories],
+//      imported_functions: [VMFunctionImport; module.num_imported_functions],
+//      imported_tables: [VMTableImport; module.num_imported_tables],
+//      imported_globals: [VMGlobalImport; module.num_imported_globals],
+//      imported_tags: [VMTagImport; module.num_imported_tags],
+//      tables: [VMTableDefinition; module.num_defined_tables],
+//      globals: [VMGlobalDefinition; module.num_defined_globals],
+//      tags: [VMTagDefinition; module.num_defined_tags],
+//      func_refs: [VMFuncRef; module.num_escaped_funcs],
+//      startup_func_ref: [VMFuncRef; module.has_startup_func ? 1 : 0],
+//      runtime_data_bases: [*const u8; module.num_runtime_data],
+//      runtime_data_lengths: [u32; module.num_runtime_data],
+// }
+
+use crate::{
+    DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex, DefinedTagIndex, FuncIndex,
+    FuncRefIndex, GlobalIndex, MemoryIndex, Module, OwnedMemoryIndex, RuntimeDataIndex, TableIndex,
+    TagIndex,
+};
+use cranelift_entity::packed_option::ReservedValue;
+
+/// Number of slots in for `component_context` in the `VMStoreContext`. This is
+/// defined by the component model's `context.{get,set}` intrinsics.
+pub const NUM_COMPONENT_CONTEXT_SLOTS: usize = 2;
+
+#[cfg(target_pointer_width = "32")]
+fn cast_to_u32(sz: usize) -> u32 {
+    u32::try_from(sz).unwrap()
+}
+#[cfg(target_pointer_width = "64")]
+fn cast_to_u32(sz: usize) -> u32 {
+    u32::try_from(sz).expect("overflow in cast from usize to u32")
+}
+
+/// Align an offset used in this module to a specific byte-width by rounding up
+#[inline]
+fn align(offset: u32, width: u32) -> u32 {
+    (offset + (width - 1)) / width * width
+}
+
+/// Generate the [`offsets`] module: a `struct VMFoo<P: PtrSize>(P)` for each
+/// `VM*` type, with a method per field returning that field's offset, plus
+/// `size` and `align` methods.
+macro_rules! define_vm_type_offsets {
+    // `UnsafeCell<T>` is `repr(transparent)`, so it has exactly `T`'s layout;
+    // delegate to the inner type.
+    (@size ($p:expr) UnsafeCell < $inner:tt >) => { define_vm_type_offsets!(@size ($p) $inner) };
+
+    // Classify a field type to its size in bytes as a `u32`, given `$p` (the
+    // target pointer size as a `u8`). All `VmPtr<_>` and `Option<VmPtr<_>>`
+    // fields are pointer-sized; the `Defined*Index` types are `u32` entity
+    // references; and `VMGlobalKind` is a `repr(C, u32)` enum with a `u32`
+    // payload.
+    (@size ($p:expr) VmPtr < $g:ty >) => { u32::from($p) };
+    (@size ($p:expr) Option < VmPtr < $g:ty >>) => { u32::from($p) };
+    (@size ($p:expr) AtomicUsize) => { u32::from($p) };
+    (@size ($p:expr) usize) => { u32::from($p) };
+    (@size ($p:expr) i64) => { 8u32 };
+    (@size ($p:expr) u64) => { 8u32 };
+    (@size ($p:expr) u32) => { 4u32 };
+    (@size ($p:expr) [u8; 16]) => { 16u32 };
+    (@size ($p:expr) [u32; $n:expr]) => { 4u32 * u32::try_from($n).unwrap() };
+    (@size ($p:expr) VMSharedTypeIndex) => { u32::from(($p).size_of_vmshared_type_index()) };
+    (@size ($p:expr) DefinedTableIndex) => { 4u32 };
+    (@size ($p:expr) DefinedMemoryIndex) => { 4u32 };
+    (@size ($p:expr) DefinedTagIndex) => { 4u32 };
+    (@size ($p:expr) VMGlobalKind) => { 8u32 };
+    // `Range<T>` is a two-field `{ start: T, end: T }` struct.
+    (@size ($p:expr) Range < *mut u8 >) => { 2u32 * u32::from($p) };
+    // Nested `VM*` types recurse through their own generated offsets, keeping
+    // this macro the single source of truth for their layout too.
+    (@size ($p:expr) VMMemoryDefinition) => { u32::from(($p).vm_memory_definition().size()) };
+    (@size ($p:expr) VMLazyThread) => { u32::from(($p).vm_lazy_thread().size()) };
+    // `VMStackChain` is a `repr(usize, C)` enum, and is not itself defined by
+    // `for_each_vm_type!`.
+    (@size ($p:expr) VMStackChain) => { u32::from(($p).size_of_vmstack_chain()) };
+
+    // As with `@size` above, `UnsafeCell<T>` has exactly `T`'s alignment.
+    (@align ($p:expr) UnsafeCell < $inner:tt >) => { define_vm_type_offsets!(@align ($p) $inner) };
+
+    // Classify a field type to its alignment in bytes as a `u32`, given `$p`
+    // (the target pointer size as a `u8`).
+    //
+    // NB: 64-bit integers are assumed to be 8-aligned, which holds everywhere except
+    // `i686-unknown-linux-gnu`, and the pointer size alone can't tell those apart. Types
+    // with 64-bit fields must therefore put them first and force their own alignment with
+    // `#[repr(C, align(8))]`, as `VMStoreContext` does.
+    (@align ($p:expr) VmPtr < $g:ty >) => { u32::from($p) };
+    (@align ($p:expr) Option < VmPtr < $g:ty >>) => { u32::from($p) };
+    (@align ($p:expr) AtomicUsize) => { u32::from($p) };
+    (@align ($p:expr) usize) => { u32::from($p) };
+    (@align ($p:expr) i64) => { 8u32 };
+    (@align ($p:expr) u64) => { 8u32 };
+    (@align ($p:expr) u32) => { 4u32 };
+    (@align ($p:expr) [u8; 16]) => { 16u32 };
+    (@align ($p:expr) [u32; $n:expr]) => { 4u32 };
+    (@align ($p:expr) VMSharedTypeIndex) => { u32::from(($p).align_of_vmshared_type_index()) };
+    (@align ($p:expr) DefinedTableIndex) => { 4u32 };
+    (@align ($p:expr) DefinedMemoryIndex) => { 4u32 };
+    (@align ($p:expr) DefinedTagIndex) => { 4u32 };
+    (@align ($p:expr) VMGlobalKind) => { 4u32 };
+    (@align ($p:expr) Range < *mut u8 >) => { u32::from($p) };
+    (@align ($p:expr) VMMemoryDefinition) => { u32::from(($p).vm_memory_definition().align()) };
+    (@align ($p:expr) VMLazyThread) => { u32::from(($p).vm_lazy_thread().align()) };
+    (@align ($p:expr) VMStackChain) => { u32::from($p) };
+
+    // Classify a `#[repr(...)]` to the minimum alignment it forces, as a `u32`.
+    (@repr_align C) => { 1u32 };
+    (@repr_align transparent) => { 1u32 };
+    (@repr_align C, align($n:literal)) => {{ let align: u32 = $n; align }};
+
+    // Emit a `pub fn` per field returning that field's offset, computed by
+    // accumulating the aligned size of each preceding field. `$p`/`$o` are
+    // caller-minted identifiers (for the pointer size and running offset) that
+    // are threaded through the recursion so their hygiene stays consistent
+    // across the emitted `let` bindings.
+    //
+    // Fields arrive pre-split into `[ $fname : $fty... ]` groups (see `@impl`
+    // below), so each field's type is a raw token sequence that the `@size`
+    // and `@align` classifiers can match against structurally.
+    (@fields $Name:ident ($p:ident, $o:ident) prefix( $($prefix:tt)* )) => {};
+    (@fields $Name:ident ($p:ident, $o:ident) prefix( $($prefix:tt)* )
+        [ $fname:ident : $($fty:tt)* ]
+        $($rest:tt)*
+    ) => {
+        #[doc = concat!(
+            "The offset of the `", stringify!($fname),
+            "` field of `", stringify!($Name), "`."
+        )]
+        #[inline]
+        pub fn $fname(&self) -> u8 {
+            let $p = self.0.size();
+            let $o: u32 = 0;
+            $($prefix)*
+            let $o = align($o, define_vm_type_offsets!(@align ($p) $($fty)*));
+            let _ = $p;
+            u8::try_from($o).unwrap()
+        }
+        define_vm_type_offsets!(@fields $Name ($p, $o)
+            prefix(
+                $($prefix)*
+                let $o = align($o, define_vm_type_offsets!(@align ($p) $($fty)*));
+                let $o = $o + define_vm_type_offsets!(@size ($p) $($fty)*);
+            )
+            $($rest)*
+        );
+    };
+
+    // Emit an `offsets::VMFoo` type's inherent `impl`. Fields are peeled off
+    // the raw struct body one at a time into `[ $fname : $fty... ]` groups
+    // accumulated in the `{ ... }` list; once the body is exhausted, the
+    // terminal arm emits the per-field offset methods plus `align`/`size`.
+    //
+    // Splitting the body by hand (rather than matching `$fty:tt $(< $fgen:ty
+    // >)?` within a repetition) is what lets each field's type reach the
+    // `@size`/`@align` classifiers as raw tokens, so those classifiers can
+    // require `Option`s to specifically be `Option<VmPtr<_>>`.
+    (@impl $Name:ident [$($repr:tt)*] { $( [ $fname:ident : $($fty:tt)* ] )* }) => {
+        impl<P: PtrSize> $Name<P> {
+            define_vm_type_offsets!(@fields $Name (p, o) prefix()
+                $( [ $fname : $($fty)* ] )*
+            );
+
+            #[doc = concat!("The alignment of the `", stringify!($Name), "` type.")]
+            #[inline]
+            pub fn align(&self) -> u8 {
+                let p = self.0.size();
+                let a: u32 = define_vm_type_offsets!(@repr_align $($repr)*);
+                $(
+                    let a = core::cmp::max(
+                        a,
+                        define_vm_type_offsets!(@align (p) $($fty)*),
+                    );
+                )*
+                let _ = p;
+                u8::try_from(a).unwrap()
+            }
+
+            #[doc = concat!("The size of the `", stringify!($Name), "` type.")]
+            #[inline]
+            pub fn size(&self) -> u8 {
+                let p = self.0.size();
+                let o: u32 = 0;
+                $(
+                    let o = align(o, define_vm_type_offsets!(@align (p) $($fty)*));
+                    let o = o + define_vm_type_offsets!(@size (p) $($fty)*);
+                )*
+                let o = align(o, u32::from(self.align()));
+                let _ = p;
+                u8::try_from(o).unwrap()
+            }
+        }
+    };
+    // Consume one field's attributes, visibility, and name, then collect its
+    // type tokens. None of the field attributes (doc comments and the
+    // `#[aggregate]`/`#[readonly]`/`#[can_move]` markers) affect layout, so they
+    // are all discarded here.
+    (@impl $Name:ident $repr:tt { $($groups:tt)* }
+        $(#[$($attr:tt)*])* $fvis:vis $fname:ident : $($rest:tt)*
+    ) => {
+        define_vm_type_offsets!(@impl_ty $Name $repr { $($groups)* } $fname [] $($rest)*);
+    };
+    // Accumulate one field's type tokens up to its terminating comma, then
+    // append the completed `[ $fname : $fty... ]` group and resume `@impl`.
+    (@impl_ty $Name:ident $repr:tt { $($groups:tt)* } $fname:ident [ $($fty:tt)* ] , $($rest:tt)*) => {
+        define_vm_type_offsets!(@impl $Name $repr { $($groups)* [ $fname : $($fty)* ] } $($rest)*);
+    };
+    (@impl_ty $Name:ident $repr:tt { $($groups:tt)* } $fname:ident [ $($fty:tt)* ] $tok:tt $($rest:tt)*) => {
+        define_vm_type_offsets!(@impl_ty $Name $repr { $($groups)* } $fname [ $($fty)* $tok ] $($rest)*);
+    };
+
+    // Top-level entry: the list of `VM*` type definitions.
+    ( $(
+        $(#[doc = $sdoc:literal])*
+        $(#[derive($($d:ident),*)])?
+        #[repr($($repr:tt)*)]
+        #[snake_name = $snake:ident]
+        $svis:vis struct $Name:ident {
+            $($body:tt)*
+        }
+    )* ) => {
+        /// Offsets of fields within the various `VM*` types, parameterized over
+        /// a target [`PtrSize`] so that they can be computed during cross
+        /// compilation.
+        ///
+        /// These types are namespaced within their own module so that they never
+        /// collide with the real definitions of the `VM*` types themselves.
+        pub mod offsets {
+            use super::{align, PtrSize, NUM_COMPONENT_CONTEXT_SLOTS};
+
+            $(
+                #[doc = concat!("Offsets of fields within the `", stringify!($Name), "` type.")]
+                pub struct $Name<P: PtrSize>(pub P);
+
+                define_vm_type_offsets!(@impl $Name [$($repr)*] {} $($body)*);
+            )*
+        }
+    };
+}
+for_each_vm_type!(define_vm_type_offsets);
+
+/// The size, in bytes, of one `context.{get,set}` slot. These slots are `u32`s,
+/// both in `VMStoreContext::component_context` and in
+/// `VMDeferredThread::saved_context`.
+const COMPONENT_CONTEXT_SLOT_SIZE: u8 = 4;
+
+/// Offsets within a `VMStoreContext` that are not simply the offset of one of
+/// its fields, and so are not generated by `for_each_vm_type!`.
+impl<P: PtrSize> offsets::VMStoreContext<P> {
+    /// The offset of the `gc_heap.base` field within a `VMStoreContext`.
+    pub fn gc_heap_base(&self) -> u8 {
+        let offset = self.gc_heap() + self.0.vm_memory_definition().base();
+        debug_assert!(offset < self.last_wasm_exit_trampoline_fp());
+        offset
+    }
+
+    /// The offset of the `gc_heap.current_length` field within a
+    /// `VMStoreContext`.
+    pub fn gc_heap_current_length(&self) -> u8 {
+        let offset = self.gc_heap() + self.0.vm_memory_definition().current_length();
+        debug_assert!(offset < self.last_wasm_exit_trampoline_fp());
+        offset
+    }
+
+    /// The offset of the `component_context[i]` slot within a `VMStoreContext`.
+    pub fn component_context_slot(&self, i: u8) -> u8 {
+        assert!(usize::from(i) < NUM_COMPONENT_CONTEXT_SLOTS);
+        self.component_context() + i * COMPONENT_CONTEXT_SLOT_SIZE
+    }
+}
+
+/// Offsets within a `VMDeferredThread` that are not simply the offset of one of
+/// its fields, and so are not generated by `for_each_vm_type!`.
+impl<P: PtrSize> offsets::VMDeferredThread<P> {
+    /// The offset of the `saved_context[i]` slot within a `VMDeferredThread`.
+    pub fn saved_context_slot(&self, i: u8) -> u8 {
+        assert!(usize::from(i) < NUM_COMPONENT_CONTEXT_SLOTS);
+        self.saved_context() + i * COMPONENT_CONTEXT_SLOT_SIZE
+    }
+}
+
+/// Add a `fn vm_foo(&self) -> offsets::VMFoo<&Self>` accessor to [`PtrSize`] for
+/// each `VM*` type, using the `#[snake_name = ...]` attribute for the method
+/// name.
+macro_rules! define_ptr_size_vm_type_accessors {
+    ( $(
+        $(#[doc = $sdoc:literal])*
+        $(#[derive($($d:ident),*)])?
+        #[repr($($repr:tt)*)]
+        #[snake_name = $snake:ident]
+        $svis:vis struct $Name:ident {
+            // This macro only needs each type's name and snake name, so the
+            // body is captured raw rather than parsed into fields.
+            $($body:tt)*
+        }
+    )* ) => {
+        $(
+            #[doc = concat!("Get the [`offsets::", stringify!($Name), "`] offsets for this pointer size.")]
+            #[inline]
+            fn $snake(&self) -> offsets::$Name<&Self> {
+                offsets::$Name(self)
+            }
+        )*
+    };
+}
+
+/// This class computes offsets to fields within `VMContext` and other
+/// related structs that JIT code accesses directly.
+#[derive(Debug, Clone, Copy)]
+pub struct VMOffsets<P> {
+    /// The size in bytes of a pointer on the target.
+    pub ptr: P,
+    /// The number of imported functions in the module.
+    pub num_imported_functions: u32,
+    /// The number of imported tables in the module.
+    pub num_imported_tables: u32,
+    /// The number of imported memories in the module.
+    pub num_imported_memories: u32,
+    /// The number of imported globals in the module.
+    pub num_imported_globals: u32,
+    /// The number of imported tags in the module.
+    pub num_imported_tags: u32,
+    /// The number of defined tables in the module.
+    pub num_defined_tables: u32,
+    /// The number of defined memories in the module.
+    pub num_defined_memories: u32,
+    /// The number of memories owned by the module instance.
+    pub num_owned_memories: u32,
+    /// The number of defined globals in the module.
+    pub num_defined_globals: u32,
+    /// The number of defined tags in the module.
+    pub num_defined_tags: u32,
+    /// The number of escaped functions in the module, the size of the func_refs
+    /// array.
+    pub num_escaped_funcs: u32,
+    /// The number of runtime data segments in the module.
+    pub num_runtime_data: u32,
+    /// Whether or not the module has a start function.
+    pub has_startup_func: bool,
+
+    // precalculated offsets of various member fields
+    imported_functions: u32,
+    imported_tables: u32,
+    imported_memories: u32,
+    imported_globals: u32,
+    imported_tags: u32,
+    defined_tables: u32,
+    defined_memories: u32,
+    owned_memories: u32,
+    defined_globals: u32,
+    defined_tags: u32,
+    defined_func_refs: u32,
+    startup_func_ref: u32,
+    runtime_data_bases: u32,
+    runtime_data_lengths: u32,
+    size: u32,
+}
+
+/// Trait used for the `ptr` representation of the field of `VMOffsets`
+pub trait PtrSize {
+    /// Returns the pointer size, in bytes, for the target.
+    fn size(&self) -> u8;
+
+    // Generate a `fn vm_foo(&self) -> offsets::VMFoo<&Self>` accessor for each
+    // `VM*` type, giving access to that type's field offsets, size, and
+    // alignment for this pointer size.
+    for_each_vm_type!(define_ptr_size_vm_type_accessors);
+
+    /// The offset of the `VMContext::store_context` field
+    fn vmcontext_store_context(&self) -> u8 {
+        u8::try_from(align(
+            u32::try_from(core::mem::size_of::<u32>()).unwrap(),
+            u32::from(self.size()),
+        ))
+        .unwrap()
+    }
+
+    /// The offset of the `VMContext::builtin_functions` field
+    fn vmcontext_builtin_functions(&self) -> u8 {
+        self.vmcontext_store_context() + self.size()
+    }
+
+    /// Return the size of `VMSharedTypeIndex`.
+    #[inline]
+    fn size_of_vmshared_type_index(&self) -> u8 {
+        4
+    }
+
+    /// Return the alignment of `VMSharedTypeIndex`.
+    #[inline]
+    fn align_of_vmshared_type_index(&self) -> u8 {
+        4
+    }
+
+    /// This is the size of the largest value type (i.e. a V128).
+    #[inline]
+    fn maximum_value_size(&self) -> u8 {
+        self.vm_global_definition().size()
+    }
+
+    /// Return the size of `*mut VMMemoryDefinition`.
+    #[inline]
+    fn size_of_vmmemory_pointer(&self) -> u8 {
+        self.size()
+    }
+
+    // Offsets within `VMArrayCallHostFuncContext`.
+
+    /// Return the offset of `VMArrayCallHostFuncContext::func_ref`.
+    fn vmarray_call_host_func_context_func_ref(&self) -> u8 {
+        u8::try_from(align(
+            u32::try_from(core::mem::size_of::<u32>()).unwrap(),
+            u32::from(self.size()),
+        ))
+        .unwrap()
+    }
+
+    /// Return the size of `VMStackChain`.
+    fn size_of_vmstack_chain(&self) -> u8 {
+        2 * self.size()
+    }
+
+    // Offsets within `VMStackLimits`
+
+    /// Return the offset of `VMStackLimits::stack_limit`.
+    fn vmstack_limits_stack_limit(&self) -> u8 {
+        0
+    }
+
+    /// Return the offset of `VMStackLimits::last_wasm_entry_fp`.
+    fn vmstack_limits_last_wasm_entry_fp(&self) -> u8 {
+        self.size()
+    }
+
+    /// Return the offset of `VMStackLimits::last_wasm_entry_sp`.
+    fn vmstack_limits_last_wasm_entry_sp(&self) -> u8 {
+        self.vmstack_limits_last_wasm_entry_fp() + self.size()
+    }
+
+    /// Return the offset of `VMStackLimits::last_wasm_entry_trap_handler`.
+    fn vmstack_limits_last_wasm_entry_trap_handler(&self) -> u8 {
+        self.vmstack_limits_last_wasm_entry_sp() + self.size()
+    }
+
+    // Offsets within `VMHostArray`
+
+    /// Return the offset of `VMHostArray::length`.
+    fn vmhostarray_length(&self) -> u8 {
+        0
+    }
+
+    /// Return the offset of `VMHostArray::capacity`.
+    fn vmhostarray_capacity(&self) -> u8 {
+        4
+    }
+
+    /// Return the offset of `VMHostArray::data`.
+    fn vmhostarray_data(&self) -> u8 {
+        8
+    }
+
+    /// Return the size of `VMHostArray`.
+    fn size_of_vmhostarray(&self) -> u8 {
+        8 + self.size()
+    }
+
+    // Offsets within `VMCommonStackInformation`
+
+    /// Return the offset of `VMCommonStackInformation::limits`.
+    fn vmcommon_stack_information_limits(&self) -> u8 {
+        0 * self.size()
+    }
+
+    /// Return the offset of `VMCommonStackInformation::state`.
+    fn vmcommon_stack_information_state(&self) -> u8 {
+        4 * self.size()
+    }
+
+    /// Return the offset of `VMCommonStackInformation::handlers`.
+    fn vmcommon_stack_information_handlers(&self) -> u8 {
+        u8::try_from(align(
+            self.vmcommon_stack_information_state() as u32 + 4,
+            u32::from(self.size()),
+        ))
+        .unwrap()
+    }
+
+    /// Return the offset of `VMCommonStackInformation::first_switch_handler_index`.
+    fn vmcommon_stack_information_first_switch_handler_index(&self) -> u8 {
+        self.vmcommon_stack_information_handlers() + self.size_of_vmhostarray()
+    }
+
+    /// Return the size of `VMCommonStackInformation`.
+    fn size_of_vmcommon_stack_information(&self) -> u8 {
+        u8::try_from(align(
+            self.vmcommon_stack_information_first_switch_handler_index() as u32 + 4,
+            u32::from(self.size()),
+        ))
+        .unwrap()
+    }
+
+    // Offsets within `VMContObj`
+
+    /// Return the offset of `VMContObj::contref`
+    fn vmcontobj_contref(&self) -> u8 {
+        0
+    }
+
+    /// Return the offset of `VMContObj::revision`
+    fn vmcontobj_revision(&self) -> u8 {
+        self.size()
+    }
+
+    /// Return the size of `VMContObj`.
+    fn size_of_vmcontobj(&self) -> u8 {
+        u8::try_from(align(
+            u32::from(self.vmcontobj_revision())
+                + u32::try_from(core::mem::size_of::<usize>()).unwrap(),
+            u32::from(self.size()),
+        ))
+        .unwrap()
+    }
+
+    // Offsets within `VMContRef`
+
+    /// Return the offset of `VMContRef::common_stack_information`.
+    fn vmcontref_common_stack_information(&self) -> u8 {
+        0 * self.size()
+    }
+
+    /// Return the offset of `VMContRef::parent_chain`.
+    fn vmcontref_parent_chain(&self) -> u8 {
+        u8::try_from(align(
+            (self.vmcontref_common_stack_information() + self.size_of_vmcommon_stack_information())
+                as u32,
+            u32::from(self.size()),
+        ))
+        .unwrap()
+    }
+
+    /// Return the offset of `VMContRef::last_ancestor`.
+    fn vmcontref_last_ancestor(&self) -> u8 {
+        self.vmcontref_parent_chain() + 2 * self.size()
+    }
+
+    /// Return the offset of `VMContRef::revision`.
+    fn vmcontref_revision(&self) -> u8 {
+        self.vmcontref_last_ancestor() + self.size()
+    }
+
+    /// Return the offset of `VMContRef::stack`.
+    fn vmcontref_stack(&self) -> u8 {
+        self.vmcontref_revision() + self.size()
+    }
+
+    /// Return the offset of `VMContRef::args`.
+    fn vmcontref_args(&self) -> u8 {
+        self.vmcontref_stack() + 3 * self.size()
+    }
+
+    /// Return the offset of `VMContRef::values`.
+    fn vmcontref_values(&self) -> u8 {
+        self.vmcontref_args() + self.size_of_vmhostarray()
+    }
+
+    /// Return the offset to the `magic` value in this `VMContext`.
+    #[inline]
+    fn vmctx_magic(&self) -> u8 {
+        // This is required by the implementation of `VMContext::instance` and
+        // `VMContext::instance_mut`. If this value changes then those locations
+        // need to be updated.
+        0
+    }
+
+    /// Return the offset to the `VMStoreContext` structure
+    #[inline]
+    fn vmctx_store_context(&self) -> u8 {
+        self.vmctx_magic() + self.size()
+    }
+
+    /// Return the offset to the `VMBuiltinFunctionsArray` structure
+    #[inline]
+    fn vmctx_builtin_functions(&self) -> u8 {
+        self.vmctx_store_context() + self.size()
+    }
+
+    /// Return the offset to the `*const AtomicU64` epoch-counter
+    /// pointer.
+    #[inline]
+    fn vmctx_epoch_ptr(&self) -> u8 {
+        self.vmctx_builtin_functions() + self.size()
+    }
+
+    /// Return the offset to the `*mut T` collector-specific data.
+    ///
+    /// This is a pointer that different collectors can use however they see
+    /// fit.
+    #[inline]
+    fn vmctx_gc_heap_data(&self) -> u8 {
+        self.vmctx_epoch_ptr() + self.size()
+    }
+
+    /// Return the offset of the `over_approximated_stack_roots` field within
+    /// `VMDrcHeapData`.
+    #[inline]
+    fn vmdrc_heap_data_over_approximated_stack_roots(&self) -> u8 {
+        0
+    }
+
+    /// Return the offset of the `current_over_approximated_stack_roots_len`
+    /// field within `VMDrcHeapData`.
+    #[inline]
+    fn vmdrc_heap_data_current_over_approximated_stack_roots_len(&self) -> u8 {
+        4
+    }
+
+    /// Return the offset of the
+    /// `over_approximated_stack_roots_len_after_last_gc` field within
+    /// `VMDrcHeapData`.
+    #[inline]
+    fn vmdrc_heap_data_over_approximated_stack_roots_len_after_last_gc(&self) -> u8 {
+        8
+    }
+
+    /// Return the size of `VMDrcHeapData`.
+    #[inline]
+    fn size_of_vmdrc_heap_data(&self) -> u8 {
+        12
+    }
+
+    /// Return the alignment of `VMDrcHeapData`.
+    #[inline]
+    fn align_of_vmdrc_heap_data(&self) -> u8 {
+        4
+    }
+
+    /// Return the offset of the `bump_ptr` field within `VMCopyingHeapData`.
+    #[inline]
+    fn vmcopying_heap_data_bump_ptr(&self) -> u8 {
+        0
+    }
+
+    /// Return the offset of the `active_space_end` field within
+    /// `VMCopyingHeapData`.
+    #[inline]
+    fn vmcopying_heap_data_active_space_end(&self) -> u8 {
+        4
+    }
+
+    /// Return the size of `VMCopyingHeapData`.
+    #[inline]
+    fn size_of_vmcopying_heap_data(&self) -> u8 {
+        8
+    }
+
+    /// Return the alignment of `VMCopyingHeapData`.
+    #[inline]
+    fn align_of_vmcopying_heap_data(&self) -> u8 {
+        4
+    }
+
+    /// The offset of the `type_ids` array pointer.
+    #[inline]
+    fn vmctx_type_ids_array(&self) -> u8 {
+        self.vmctx_gc_heap_data() + self.size()
+    }
+
+    /// The end of statically known offsets in `VMContext`.
+    ///
+    /// Data after this is dynamically sized.
+    #[inline]
+    fn vmctx_dynamic_data_start(&self) -> u8 {
+        self.vmctx_type_ids_array() + self.size()
+    }
+}
+
+/// A trait to abstract over various types that contain a `P: PtrSize`.
+pub trait GetPtrSize {
+    /// The type that implements `PtrSize`.
+    type Ptr: PtrSize;
+
+    /// Get a `&P` where `P: PtrSize`.
+    fn get_ptr_size(&self) -> &Self::Ptr;
+}
+
+impl<P> GetPtrSize for P
+where
+    P: PtrSize,
+{
+    type Ptr = Self;
+
+    #[inline]
+    fn get_ptr_size(&self) -> &Self::Ptr {
+        self
+    }
+}
+
+/// Type representing the size of a pointer for the current compilation host
+#[derive(Clone, Copy)]
+pub struct HostPtr;
+
+impl PtrSize for HostPtr {
+    #[inline]
+    fn size(&self) -> u8 {
+        core::mem::size_of::<usize>() as u8
+    }
+}
+
+impl PtrSize for u8 {
+    #[inline]
+    fn size(&self) -> u8 {
+        *self
+    }
+}
+
+impl<P> PtrSize for &'_ P
+where
+    P: PtrSize + ?Sized,
+{
+    #[inline]
+    fn size(&self) -> u8 {
+        (**self).size()
+    }
+}
+
+/// Used to construct a `VMOffsets`
+#[derive(Debug, Clone, Copy)]
+pub struct VMOffsetsFields<P> {
+    /// The size in bytes of a pointer on the target.
+    pub ptr: P,
+    /// The number of imported functions in the module.
+    pub num_imported_functions: u32,
+    /// The number of imported tables in the module.
+    pub num_imported_tables: u32,
+    /// The number of imported memories in the module.
+    pub num_imported_memories: u32,
+    /// The number of imported globals in the module.
+    pub num_imported_globals: u32,
+    /// The number of imported tags in the module.
+    pub num_imported_tags: u32,
+    /// The number of defined tables in the module.
+    pub num_defined_tables: u32,
+    /// The number of defined memories in the module.
+    pub num_defined_memories: u32,
+    /// The number of memories owned by the module instance.
+    pub num_owned_memories: u32,
+    /// The number of defined globals in the module.
+    pub num_defined_globals: u32,
+    /// The number of defined tags in the module.
+    pub num_defined_tags: u32,
+    /// The number of escaped functions in the module, the size of the function
+    /// references array.
+    pub num_escaped_funcs: u32,
+    /// The number of runtime data segments in the module.
+    pub num_runtime_data: u32,
+    /// Whether or not the module has a start function.
+    pub has_startup_func: bool,
+}
+
+impl<P: PtrSize> VMOffsets<P> {
+    /// Return a new `VMOffsets` instance, for a given pointer size.
+    pub fn new(ptr: P, module: &Module) -> Self {
+        let num_owned_memories = module
+            .memories
+            .iter()
+            .skip(module.num_imported_memories)
+            .filter(|p| !p.1.shared)
+            .count()
+            .try_into()
+            .unwrap();
+        VMOffsets::from(VMOffsetsFields {
+            ptr,
+            num_imported_functions: cast_to_u32(module.num_imported_funcs),
+            num_imported_tables: cast_to_u32(module.num_imported_tables),
+            num_imported_memories: cast_to_u32(module.num_imported_memories),
+            num_imported_globals: cast_to_u32(module.num_imported_globals),
+            num_imported_tags: cast_to_u32(module.num_imported_tags),
+            num_defined_tables: cast_to_u32(module.num_defined_tables()),
+            num_defined_memories: cast_to_u32(module.num_defined_memories()),
+            num_owned_memories,
+            num_defined_globals: cast_to_u32(module.globals.len() - module.num_imported_globals),
+            num_defined_tags: cast_to_u32(module.tags.len() - module.num_imported_tags),
+            num_escaped_funcs: cast_to_u32(module.num_escaped_funcs),
+            num_runtime_data: cast_to_u32(module.runtime_data.len()),
+            has_startup_func: !module.startup.is_none(),
+        })
+    }
+
+    /// Returns the size, in bytes, of the target
+    #[inline]
+    pub fn pointer_size(&self) -> u8 {
+        self.ptr.size()
+    }
+
+    /// Returns an iterator which provides a human readable description and a
+    /// byte size. The iterator returned will iterate over the bytes allocated
+    /// to the entire `VMOffsets` structure to explain where each byte size is
+    /// coming from.
+    pub fn region_sizes(&self) -> impl Iterator<Item = (&str, u32)> {
+        macro_rules! calculate_sizes {
+            ($($name:ident: $desc:tt,)*) => {{
+                let VMOffsets {
+                    // These fields are metadata not talking about specific
+                    // offsets of specific fields.
+                    ptr: _,
+                    num_imported_functions: _,
+                    num_imported_tables: _,
+                    num_imported_memories: _,
+                    num_imported_globals: _,
+                    num_imported_tags: _,
+                    num_defined_tables: _,
+                    num_defined_globals: _,
+                    num_defined_memories: _,
+                    num_defined_tags: _,
+                    num_owned_memories: _,
+                    num_escaped_funcs: _,
+                    num_runtime_data: _,
+                    has_startup_func: _,
+
+                    // used as the initial size below
+                    size,
+
+                    // exhaustively match the rest of the fields with input from
+                    // the macro
+                    $($name,)*
+                } = *self;
+
+                // calculate the size of each field by relying on the inputs to
+                // the macro being in reverse order and determining the size of
+                // the field as the offset from the field to the last field.
+                let mut last = size;
+                $(
+                    assert!($name <= last);
+                    let tmp = $name;
+                    let $name = last - $name;
+                    last = tmp;
+                )*
+                assert_ne!(last, 0);
+                IntoIterator::into_iter([
+                    $(($desc, $name),)*
+                    ("static vmctx data", last),
+                ])
+            }};
+        }
+
+        calculate_sizes! {
+            runtime_data_lengths: "runtime data lengths",
+            runtime_data_bases: "runtime data base pointers",
+            startup_func_ref: "startup funcref",
+            defined_func_refs: "module functions",
+            defined_tags: "defined tags",
+            defined_globals: "defined globals",
+            defined_tables: "defined tables",
+            imported_tags: "imported tags",
+            imported_globals: "imported globals",
+            imported_tables: "imported tables",
+            imported_functions: "imported functions",
+            owned_memories: "owned memories",
+            defined_memories: "defined memories",
+            imported_memories: "imported memories",
+        }
+    }
+}
+
+impl<P: PtrSize> GetPtrSize for VMOffsets<P> {
+    type Ptr = P;
+
+    #[inline]
+    fn get_ptr_size(&self) -> &Self::Ptr {
+        &self.ptr
+    }
+}
+
+impl<P: PtrSize> From<VMOffsetsFields<P>> for VMOffsets<P> {
+    fn from(fields: VMOffsetsFields<P>) -> VMOffsets<P> {
+        let mut ret = Self {
+            ptr: fields.ptr,
+            num_imported_functions: fields.num_imported_functions,
+            num_imported_tables: fields.num_imported_tables,
+            num_imported_memories: fields.num_imported_memories,
+            num_imported_globals: fields.num_imported_globals,
+            num_imported_tags: fields.num_imported_tags,
+            num_defined_tables: fields.num_defined_tables,
+            num_defined_memories: fields.num_defined_memories,
+            num_owned_memories: fields.num_owned_memories,
+            num_defined_globals: fields.num_defined_globals,
+            num_defined_tags: fields.num_defined_tags,
+            num_escaped_funcs: fields.num_escaped_funcs,
+            num_runtime_data: fields.num_runtime_data,
+            has_startup_func: fields.has_startup_func,
+            imported_functions: 0,
+            imported_tables: 0,
+            imported_memories: 0,
+            imported_globals: 0,
+            imported_tags: 0,
+            defined_tables: 0,
+            defined_memories: 0,
+            owned_memories: 0,
+            defined_globals: 0,
+            defined_tags: 0,
+            defined_func_refs: 0,
+            startup_func_ref: 0,
+            runtime_data_bases: 0,
+            runtime_data_lengths: 0,
+            size: 0,
+        };
+
+        // Convenience functions for checked addition and multiplication.
+        // As side effect this reduces binary size by using only a single
+        // `#[track_caller]` location for each function instead of one for
+        // each individual invocation.
+        #[inline]
+        fn cadd(count: u32, size: u32) -> u32 {
+            count.checked_add(size).unwrap()
+        }
+
+        #[inline]
+        fn cmul(count: u32, size: u8) -> u32 {
+            count.checked_mul(u32::from(size)).unwrap()
+        }
+
+        let mut next_field_offset = u32::from(ret.ptr.vmctx_dynamic_data_start());
+
+        macro_rules! fields {
+            (size($field:ident) = $size:expr, $($rest:tt)*) => {
+                ret.$field = next_field_offset;
+                next_field_offset = cadd(next_field_offset, u32::from($size));
+                fields!($($rest)*);
+            };
+            (align($align:expr), $($rest:tt)*) => {
+                next_field_offset = align(next_field_offset, $align);
+                fields!($($rest)*);
+            };
+            () => {};
+        }
+
+        fields! {
+            size(imported_memories)
+                = cmul(ret.num_imported_memories, ret.ptr.vm_memory_import().size()),
+            size(defined_memories)
+                = cmul(ret.num_defined_memories, ret.ptr.size_of_vmmemory_pointer()),
+            size(owned_memories)
+                = cmul(ret.num_owned_memories, ret.ptr.vm_memory_definition().size()),
+            size(imported_functions)
+                = cmul(ret.num_imported_functions, ret.ptr.vm_function_import().size()),
+            size(imported_tables)
+                = cmul(ret.num_imported_tables, ret.ptr.vm_table_import().size()),
+            size(imported_globals)
+                = cmul(ret.num_imported_globals, ret.ptr.vm_global_import().size()),
+            size(imported_tags)
+                = cmul(ret.num_imported_tags, ret.ptr.vm_tag_import().size()),
+            size(defined_tables)
+                = cmul(ret.num_defined_tables, ret.ptr.vm_table_definition().size()),
+            align(16),
+            size(defined_globals)
+                = cmul(ret.num_defined_globals, ret.ptr.vm_global_definition().size()),
+            size(defined_tags)
+                = cmul(ret.num_defined_tags, ret.ptr.vm_tag_definition().size()),
+            size(defined_func_refs) = cmul(
+                ret.num_escaped_funcs,
+                ret.ptr.vm_func_ref().size(),
+            ),
+            size(startup_func_ref) = if ret.has_startup_func {
+                ret.ptr.vm_func_ref().size()
+            } else {
+                0
+            },
+            size(runtime_data_bases) = cmul(ret.num_runtime_data, ret.ptr.size()),
+            size(runtime_data_lengths) = cmul(ret.num_runtime_data, 4),
+        }
+
+        ret.size = next_field_offset;
+
+        return ret;
+    }
+}
+
+/// Offsets for `*const VMFunctionBody`.
+impl<P: PtrSize> VMOffsets<P> {
+    /// The size of the `current_elements` field.
+    pub fn size_of_vmfunction_body_ptr(&self) -> u8 {
+        1 * self.pointer_size()
+    }
+}
+
+/// Offsets for `VMTableDefinition`.
+impl<P: PtrSize> VMOffsets<P> {
+    /// The size of the `current_elements` field.
+    #[inline]
+    pub fn size_of_vmtable_definition_current_elements(&self) -> u8 {
+        self.pointer_size()
+    }
+}
+
+/// Offsets for `VMSharedTypeIndex`.
+impl<P: PtrSize> VMOffsets<P> {
+    /// Return the size of `VMSharedTypeIndex`.
+    #[inline]
+    pub fn size_of_vmshared_type_index(&self) -> u8 {
+        self.ptr.size_of_vmshared_type_index()
+    }
+}
+
+/// Offsets for `VMContext`.
+impl<P: PtrSize> VMOffsets<P> {
+    /// The offset of the `tables` array.
+    #[inline]
+    pub fn vmctx_imported_functions_begin(&self) -> u32 {
+        self.imported_functions
+    }
+
+    /// The offset of the `tables` array.
+    #[inline]
+    pub fn vmctx_imported_tables_begin(&self) -> u32 {
+        self.imported_tables
+    }
+
+    /// The offset of the `memories` array.
+    #[inline]
+    pub fn vmctx_imported_memories_begin(&self) -> u32 {
+        self.imported_memories
+    }
+
+    /// The offset of the `globals` array.
+    #[inline]
+    pub fn vmctx_imported_globals_begin(&self) -> u32 {
+        self.imported_globals
+    }
+
+    /// The offset of the `tags` array.
+    #[inline]
+    pub fn vmctx_imported_tags_begin(&self) -> u32 {
+        self.imported_tags
+    }
+
+    /// The offset of the `tables` array.
+    #[inline]
+    pub fn vmctx_tables_begin(&self) -> u32 {
+        self.defined_tables
+    }
+
+    /// The offset of the `memories` array.
+    #[inline]
+    pub fn vmctx_memories_begin(&self) -> u32 {
+        self.defined_memories
+    }
+
+    /// The offset of the `owned_memories` array.
+    #[inline]
+    pub fn vmctx_owned_memories_begin(&self) -> u32 {
+        self.owned_memories
+    }
+
+    /// The offset of the `globals` array.
+    #[inline]
+    pub fn vmctx_globals_begin(&self) -> u32 {
+        self.defined_globals
+    }
+
+    /// The offset of the `tags` array.
+    #[inline]
+    pub fn vmctx_tags_begin(&self) -> u32 {
+        self.defined_tags
+    }
+
+    /// The offset of the `func_refs` array.
+    #[inline]
+    pub fn vmctx_func_refs_begin(&self) -> u32 {
+        self.defined_func_refs
+    }
+
+    /// The offset of the `runtime_data_bases` array.
+    #[inline]
+    pub fn vmctx_runtime_data_bases_begin(&self) -> u32 {
+        self.runtime_data_bases
+    }
+
+    /// The offset of the `runtime_data_lengths` array.
+    #[inline]
+    pub fn vmctx_runtime_data_lengths_begin(&self) -> u32 {
+        self.runtime_data_lengths
+    }
+
+    /// Return the size of the `VMContext` allocation.
+    #[inline]
+    pub fn size_of_vmctx(&self) -> u32 {
+        self.size
+    }
+
+    /// Return the offset to `VMFunctionImport` index `index`.
+    #[inline]
+    pub fn vmctx_vmfunction_import(&self, index: FuncIndex) -> u32 {
+        assert!(index.as_u32() < self.num_imported_functions);
+        self.vmctx_imported_functions_begin()
+            + index.as_u32() * u32::from(self.ptr.vm_function_import().size())
+    }
+
+    /// Return the offset to `VMTable` index `index`.
+    #[inline]
+    pub fn vmctx_vmtable_import(&self, index: TableIndex) -> u32 {
+        assert!(index.as_u32() < self.num_imported_tables);
+        self.vmctx_imported_tables_begin()
+            + index.as_u32() * u32::from(self.ptr.vm_table_import().size())
+    }
+
+    /// Return the offset to `VMMemoryImport` index `index`.
+    #[inline]
+    pub fn vmctx_vmmemory_import(&self, index: MemoryIndex) -> u32 {
+        assert!(index.as_u32() < self.num_imported_memories);
+        self.vmctx_imported_memories_begin()
+            + index.as_u32() * u32::from(self.ptr.vm_memory_import().size())
+    }
+
+    /// Return the offset to `VMGlobalImport` index `index`.
+    #[inline]
+    pub fn vmctx_vmglobal_import(&self, index: GlobalIndex) -> u32 {
+        assert!(index.as_u32() < self.num_imported_globals);
+        self.vmctx_imported_globals_begin()
+            + index.as_u32() * u32::from(self.ptr.vm_global_import().size())
+    }
+
+    /// Return the offset to `VMTagImport` index `index`.
+    #[inline]
+    pub fn vmctx_vmtag_import(&self, index: TagIndex) -> u32 {
+        assert!(index.as_u32() < self.num_imported_tags);
+        self.vmctx_imported_tags_begin()
+            + index.as_u32() * u32::from(self.ptr.vm_tag_import().size())
+    }
+
+    /// Return the offset to `VMTableDefinition` index `index`.
+    #[inline]
+    pub fn vmctx_vmtable_definition(&self, index: DefinedTableIndex) -> u32 {
+        assert!(index.as_u32() < self.num_defined_tables);
+        self.vmctx_tables_begin()
+            + index.as_u32() * u32::from(self.ptr.vm_table_definition().size())
+    }
+
+    /// Return the offset to the `*mut VMMemoryDefinition` at index `index`.
+    #[inline]
+    pub fn vmctx_vmmemory_pointer(&self, index: DefinedMemoryIndex) -> u32 {
+        assert!(index.as_u32() < self.num_defined_memories);
+        self.vmctx_memories_begin()
+            + index.as_u32() * u32::from(self.ptr.size_of_vmmemory_pointer())
+    }
+
+    /// Return the offset to the owned `VMMemoryDefinition` at index `index`.
+    #[inline]
+    pub fn vmctx_vmmemory_definition(&self, index: OwnedMemoryIndex) -> u32 {
+        assert!(index.as_u32() < self.num_owned_memories);
+        self.vmctx_owned_memories_begin()
+            + index.as_u32() * u32::from(self.ptr.vm_memory_definition().size())
+    }
+
+    /// Return the offset to the `VMGlobalDefinition` index `index`.
+    #[inline]
+    pub fn vmctx_vmglobal_definition(&self, index: DefinedGlobalIndex) -> u32 {
+        assert!(index.as_u32() < self.num_defined_globals);
+        self.vmctx_globals_begin()
+            + index.as_u32() * u32::from(self.ptr.vm_global_definition().size())
+    }
+
+    /// Return the offset to the `VMTagDefinition` index `index`.
+    #[inline]
+    pub fn vmctx_vmtag_definition(&self, index: DefinedTagIndex) -> u32 {
+        assert!(index.as_u32() < self.num_defined_tags);
+        self.vmctx_tags_begin() + index.as_u32() * u32::from(self.ptr.vm_tag_definition().size())
+    }
+
+    /// Return the offset to the `VMFuncRef` for the given function
+    /// index (either imported or defined).
+    #[inline]
+    pub fn vmctx_func_ref(&self, index: FuncRefIndex) -> u32 {
+        assert!(!index.is_reserved_value());
+        assert!(index.as_u32() < self.num_escaped_funcs);
+        self.vmctx_func_refs_begin() + index.as_u32() * u32::from(self.ptr.vm_func_ref().size())
+    }
+
+    /// Returns the offset to the `VMFuncRef` for the module startup function.
+    ///
+    /// Panics if this module does not have a startup function.
+    #[inline]
+    pub fn vmctx_startup_func_ref(&self) -> u32 {
+        assert!(self.has_startup_func);
+        self.startup_func_ref
+    }
+
+    /// Return the offset to the base of the runtime data segment at `index`.
+    #[inline]
+    pub fn vmctx_runtime_data_base(&self, index: RuntimeDataIndex) -> u32 {
+        assert!(!index.is_reserved_value());
+        assert!(index.as_u32() < self.num_runtime_data);
+        self.vmctx_runtime_data_bases_begin() + index.as_u32() * u32::from(self.ptr.size())
+    }
+
+    /// Return the offset to the length of the runtime data segment at `index`.
+    #[inline]
+    pub fn vmctx_runtime_data_length(&self, index: RuntimeDataIndex) -> u32 {
+        assert!(!index.is_reserved_value());
+        assert!(index.as_u32() < self.num_runtime_data);
+        self.vmctx_runtime_data_lengths_begin() + index.as_u32() * 4
+    }
+
+    /// Return the offset to the `wasm_call` field in `*const VMFunctionBody` index `index`.
+    #[inline]
+    pub fn vmctx_vmfunction_import_wasm_call(&self, index: FuncIndex) -> u32 {
+        self.vmctx_vmfunction_import(index) + u32::from(self.ptr.vm_function_import().wasm_call())
+    }
+
+    /// Return the offset to the `array_call` field in `*const VMFunctionBody` index `index`.
+    #[inline]
+    pub fn vmctx_vmfunction_import_array_call(&self, index: FuncIndex) -> u32 {
+        self.vmctx_vmfunction_import(index) + u32::from(self.ptr.vm_function_import().array_call())
+    }
+
+    /// Return the offset to the `vmctx` field in `*const VMFunctionBody` index `index`.
+    #[inline]
+    pub fn vmctx_vmfunction_import_vmctx(&self, index: FuncIndex) -> u32 {
+        self.vmctx_vmfunction_import(index) + u32::from(self.ptr.vm_function_import().vmctx())
+    }
+
+    /// Return the offset to the `from` field in the imported `VMTable` at index
+    /// `index`.
+    #[inline]
+    pub fn vmctx_vmtable_from(&self, index: TableIndex) -> u32 {
+        self.vmctx_vmtable_import(index) + u32::from(self.ptr.vm_table_import().from())
+    }
+
+    /// Return the offset to the `base` field in `VMTableDefinition` index `index`.
+    #[inline]
+    pub fn vmctx_vmtable_definition_base(&self, index: DefinedTableIndex) -> u32 {
+        self.vmctx_vmtable_definition(index) + u32::from(self.ptr.vm_table_definition().base())
+    }
+
+    /// Return the offset to the `current_elements` field in `VMTableDefinition` index `index`.
+    #[inline]
+    pub fn vmctx_vmtable_definition_current_elements(&self, index: DefinedTableIndex) -> u32 {
+        self.vmctx_vmtable_definition(index)
+            + u32::from(self.ptr.vm_table_definition().current_elements())
+    }
+
+    /// Return the offset to the `from` field in `VMMemoryImport` index `index`.
+    #[inline]
+    pub fn vmctx_vmmemory_import_from(&self, index: MemoryIndex) -> u32 {
+        self.vmctx_vmmemory_import(index) + u32::from(self.ptr.vm_memory_import().from())
+    }
+
+    /// Return the offset to the `base` field in `VMMemoryDefinition` index `index`.
+    #[inline]
+    pub fn vmctx_vmmemory_definition_base(&self, index: OwnedMemoryIndex) -> u32 {
+        self.vmctx_vmmemory_definition(index) + u32::from(self.ptr.vm_memory_definition().base())
+    }
+
+    /// Return the offset to the `current_length` field in `VMMemoryDefinition` index `index`.
+    #[inline]
+    pub fn vmctx_vmmemory_definition_current_length(&self, index: OwnedMemoryIndex) -> u32 {
+        self.vmctx_vmmemory_definition(index)
+            + u32::from(self.ptr.vm_memory_definition().current_length())
+    }
+
+    /// Return the offset to the `from` field in `VMGlobalImport` index `index`.
+    #[inline]
+    pub fn vmctx_vmglobal_import_from(&self, index: GlobalIndex) -> u32 {
+        self.vmctx_vmglobal_import(index) + u32::from(self.ptr.vm_global_import().from())
+    }
+
+    /// Return the offset to the `from` field in `VMTagImport` index `index`.
+    #[inline]
+    pub fn vmctx_vmtag_import_from(&self, index: TagIndex) -> u32 {
+        self.vmctx_vmtag_import(index) + u32::from(self.ptr.vm_tag_import().from())
+    }
+
+    /// Return the offset to the `vmctx` field in `VMTagImport` index `index`.
+    #[inline]
+    pub fn vmctx_vmtag_import_vmctx(&self, index: TagIndex) -> u32 {
+        self.vmctx_vmtag_import(index) + u32::from(self.ptr.vm_tag_import().vmctx())
+    }
+
+    /// Return the offset to the `index` field in `VMTagImport` index `index`.
+    #[inline]
+    pub fn vmctx_vmtag_import_index(&self, index: TagIndex) -> u32 {
+        self.vmctx_vmtag_import(index) + u32::from(self.ptr.vm_tag_import().index())
+    }
+}
+
+/// Offsets for `VMGcHeader`.
+impl<P: PtrSize> VMOffsets<P> {
+    /// Return the offset for the `VMGcHeader::kind` field.
+    #[inline]
+    pub fn vm_gc_header_kind(&self) -> u32 {
+        0
+    }
+
+    /// Return the offset for the `VMGcHeader`'s reserved bits.
+    #[inline]
+    pub fn vm_gc_header_reserved_bits(&self) -> u32 {
+        // NB: The reserved bits are the unused `VMGcKind` bits.
+        self.vm_gc_header_kind()
+    }
+
+    /// Return the offset for the `VMGcHeader::ty` field.
+    #[inline]
+    pub fn vm_gc_header_ty(&self) -> u32 {
+        self.vm_gc_header_kind() + 4
+    }
+}
+
+/// Offsets for `VMDrcHeader`.
+///
+/// Should only be used when the DRC collector is enabled.
+impl<P: PtrSize> VMOffsets<P> {
+    /// Return the offset for `VMDrcHeader::ref_count`.
+    #[inline]
+    pub fn vm_drc_header_ref_count(&self) -> u32 {
+        8
+    }
+
+    /// Return the offset for `VMDrcHeader::next_over_approximated_stack_root`.
+    #[inline]
+    pub fn vm_drc_header_next_over_approximated_stack_root(&self) -> u32 {
+        self.vm_drc_header_ref_count() + 8
+    }
+}
+
+/// Magic value for core Wasm VM contexts.
+///
+/// This is stored at the start of all `VMContext` structures.
+pub const VMCONTEXT_MAGIC: u32 = u32::from_le_bytes(*b"core");
+
+/// Equivalent of `VMCONTEXT_MAGIC` except for array-call host functions.
+///
+/// This is stored at the start of all `VMArrayCallHostFuncContext` structures
+/// and double-checked on `VMArrayCallHostFuncContext::from_opaque`.
+pub const VM_ARRAY_CALL_HOST_FUNC_MAGIC: u32 = u32::from_le_bytes(*b"ACHF");
+
+#[cfg(test)]
+mod tests {
+    use crate::vmoffsets::align;
+
+    #[test]
+    fn alignment() {
+        fn is_aligned(x: u32) -> bool {
+            x % 16 == 0
+        }
+        assert!(is_aligned(align(0, 16)));
+        assert!(is_aligned(align(32, 16)));
+        assert!(is_aligned(align(33, 16)));
+        assert!(is_aligned(align(31, 16)));
+    }
+}
+
+/// The bit pattern of `VMLazyThread::forced()`.
+pub const VM_LAZY_THREAD_FORCED: u64 = 1;

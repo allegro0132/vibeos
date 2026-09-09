@@ -53,10 +53,15 @@ def main():
     parser.add_argument('--work', type=Path, default=ROOT/'target/coremark-benchmark/vibeos-single')
     parser.add_argument('--module', type=Path, default=ROOT/'target/coremark-wasi/coremark.wasm')
     parser.add_argument('--skip-build', action='store_true')
+    parser.add_argument('--wasmtime', action='store_true', help='Use the experimental native command backend')
+    parser.add_argument('--require-isa-mask', type=lambda value:int(value,0),
+        help='Require the firmware-discovered available extension mask (not the enabled codegen mask)')
     parser.add_argument('--rv64-cache', action='store_true', help='Use the experimental WASI RV64 cache image')
     parser.add_argument('--kernel', type=Path, help='Run this existing firmware ELF (implies --skip-build)')
     parser.add_argument('--icount-iterations', type=int, help='Diagnostic only: fixed iterations with icount virtual time, never a formal score')
     args = parser.parse_args()
+    if args.wasmtime and args.rv64_cache: parser.error('choose one WASI backend')
+    if args.wasmtime and not args.kernel: parser.error('--wasmtime requires an explicit --kernel ELF')
     if args.icount_iterations is not None and args.icount_iterations < 1:
         parser.error('--icount-iterations must be positive')
     os.chdir(ROOT)
@@ -64,6 +69,8 @@ def main():
         args.kernel = args.kernel.resolve(strict=True)
         args.skip_build = True
     work = args.work.resolve(); work.mkdir(parents=True, exist_ok=True)
+    if args.kernel:
+        frozen=work/'kernel.elf';frozen.write_bytes(args.kernel.read_bytes());args.kernel=frozen
     (work/'results.json').write_text('[]\n')
     spec = importlib.util.spec_from_file_location('peer', ROOT/'scripts/openssh-peer.py')
     peer = importlib.util.module_from_spec(spec); sys.modules[spec.name] = peer; spec.loader.exec_module(peer)
@@ -71,6 +78,7 @@ def main():
         sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
     command = peer._base_ssh_command('ssh', '127.0.0.1', port, 'vibe', work/'id_ed25519', work/'known_hosts', 30, None)
     env = dict(os.environ, WASI_WORK_DIR=str(work), WASI_SSH_PORT=str(port), WASI_BENCHMARK='1', WASI_DIAGNOSTIC_ICOUNT=str(int(args.icount_iterations is not None)), WASI_SKIP_BUILD=str(int(args.skip_build)), WASI_RV64_CACHE=str(int(args.rv64_cache)))
+    env['WASI_WASMTIME'] = str(int(args.wasmtime))
     if args.kernel:
         env['WASI_KERNEL'] = str(args.kernel)
     else:
@@ -102,14 +110,19 @@ def main():
         while 'vsh> ' not in (work/'boot.log').read_text(errors='replace'):
             assert vm.poll() is None and time.monotonic()<deadline, 'QEMU boot failed or timed out'
             time.sleep(.5)
-        metadata = dict(qemu=subprocess.check_output(['qemu-system-riscv64','--version'],text=True),
+        metadata = dict(backend='wasmtime' if args.wasmtime else 'wasmi',qemu=subprocess.check_output(['qemu-system-riscv64','--version'],text=True),
             workspace_revision=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
             workspace_diff_sha256=hashlib.sha256(subprocess.check_output(['git','diff','HEAD'])).hexdigest(),
             kernel_origin='explicit ELF' if args.kernel else 'existing build' if args.skip_build else 'built by launcher',
             module_sha256=hashlib.sha256(args.module.read_bytes()).hexdigest(),
             kernel_sha256=hashlib.sha256((args.kernel or ROOT/'target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt').read_bytes()).hexdigest(),
-            configuration=dict(machine='virt',cpu='rv64',harts=1,memory='1G',accel='tcg,thread=single',rtc='base=utc,clock=vm',icount='shift=0,align=off,sleep=off' if args.icount_iterations is not None else None,feature='wasi-benchmark,wasi-rv64-cache' if args.rv64_cache else 'wasi-benchmark'))
+            configuration=dict(machine='virt',cpu='rv64',harts=1,memory='1G',accel='tcg,thread=single',rtc='base=utc,clock=vm',icount='shift=0,align=off,sleep=off' if args.icount_iterations is not None else None,feature='wasi-benchmark,wasmtime-command' if args.wasmtime else 'wasi-benchmark,wasi-rv64-cache' if args.rv64_cache else 'wasi-benchmark'))
         metadata['measurement_mode'] = 'instruction-count-diagnostic' if args.icount_iterations is not None else 'formal-real-clock'
+        isa = re.search(r'Wasmtime ISA firmware_harts=(\d+) extra_mask=(0x[0-9a-f]+)', (work/'boot.log').read_text())
+        if isa:
+            metadata['firmware_isa_available'] = dict(harts=int(isa[1]), mask=int(isa[2],16))
+        if args.require_isa_mask is not None:
+            assert isa and int(isa[1])==1 and int(isa[2],16)==args.require_isa_mask, 'firmware ISA discovery mismatch'
         (work/'environment.json').write_text(json.dumps(metadata,indent=2)+'\n')
         upload(args.module, 'coremark.wasm')
         clock = ROOT/'target/coremark-benchmark/clock.wasm'
@@ -129,6 +142,7 @@ def main():
             sample.update(name=name, seeds=seeds); samples.append(sample)
             (work/'results.json').write_text(json.dumps(samples,indent=2)+'\n')
             print(json.dumps(sample), flush=True)
+        if args.wasmtime: assert 'WASI running backend=wasmtime' in (work/'boot.log').read_text()
         assert (work/'boot.log').read_text().count('reclaimed=true caps=0 waiters=0') >= sum(record['command'].startswith('wasm-run ') for record in records)
         profiles = re.findall(r'WASI profile polls=(\d+) fuel=(\d+) runtime_ticks=(\d+) wall_ticks=(\d+) hz=(\d+)', (work/'boot.log').read_text())
         if profiles:
@@ -142,6 +156,20 @@ def main():
                     runtime_seconds=runtime/hz, invocation_seconds=wall/hz,
                     outside_poll_seconds=(wall-runtime)/hz, runtime_fraction=runtime/wall))
             (work/'profiles.json').write_text(json.dumps(data,indent=2)+'\n')
+        if args.wasmtime:
+            native = re.findall(r'WASI Wasmtime profile dispatches=(\d+) polls=(\d+) check_ticks=(\d+) guest_ticks=(\d+) wall_ticks=(\d+) hz=(\d+)', (work/'boot.log').read_text())
+            runs = [record for record in records if record['command'].startswith('wasm-run ')]
+            assert len(native) == len(runs), 'incomplete native runtime profile records'
+            data = []
+            for run, values in zip(runs, native):
+                dispatches, polls, checks, guest, wall, hz = map(int, values)
+                assert 0 <= checks + guest <= wall and wall > 0 and hz > 0
+                data.append(dict(name=run['name'], mode=metadata['measurement_mode'],
+                    dispatches=dispatches, polls=polls, check_seconds=checks/hz,
+                    guest_seconds=guest/hz, invocation_seconds=wall/hz,
+                    other_seconds=(wall-checks-guest)/hz,
+                    scope='includes compilation and instantiation; not the CoreMark timed interval'))
+            (work/'native-profiles.json').write_text(json.dumps(data,indent=2)+'\n')
     finally:
         vm.terminate(); vm.wait(timeout=10); log.close()
 

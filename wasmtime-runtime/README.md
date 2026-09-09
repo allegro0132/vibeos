@@ -586,3 +586,26 @@ following reboot. It uses an explicit 30-second SSH keepalive; the original
 and responsiveness are still open. Exceeding the combined 64 KiB output quota
 now terminates the invocation as resource exhaustion instead of allowing an
 ignored-FBIG hostcall loop. Host buffered/streaming suites each pass 23 cases.
+
+### Bounded in-fiber fuel scheduling
+
+Enable the measured command configuration with:
+
+```sh
+WASI_WASMTIME=1 WASI_FUEL_BATCH=1 scripts/run-wasi-qemu.sh
+```
+
+This builds `wasi-ssh-upload,wasmtime-command-fuel-batch` for RV64GC. It retains
+the default 10-million total fuel limit and checks authority/cancellation and
+executor competition every 10000 fuel. At most 32 quanta share a native poll;
+I/O blocking and competing tasks force a return to the executor. The existing
+outer batch is disabled, so these limits cannot multiply. A per-store function
+and opaque token borrow the SYSTEM job through its supervised lifetime. The
+optional Wasmtime patch changes only the decision to suspend a fiber after
+normal refueling; it never grants extra fuel or changes memory checks.
+
+For formal CoreMark, build `wasi-benchmark,wasmtime-command-fuel-batch`, then use
+`python3 scripts/benchmark-coremark-wasi.py --wasmtime --fuel-batch --require-isa-mask 0xf --kernel PATH --work FRESH_DIRECTORY`.
+This benchmark feature explicitly grants the long-running fuel allowance.
+The firmware ISA mask describes available extensions; code generation still
+uses GC unless `wasmtime-discovered-isa` is separately selected.

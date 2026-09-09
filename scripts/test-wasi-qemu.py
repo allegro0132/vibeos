@@ -39,6 +39,7 @@ def main():
     frozen=work/'kernel.elf';frozen.write_bytes(kernel.read_bytes())
     env['WASI_KERNEL']=str(frozen)
     env['WASI_WASMTIME']=str(int(args.wasmtime))
+    env['WASI_FUEL_BATCH']=str(int(args.fuel_batch))
     command=peer._base_ssh_command('ssh','127.0.0.1',port,'vibe',work/'id_ed25519',work/'known_hosts',15,None)
     assert args.server_alive_interval > 0
     command=[f'-oServerAliveInterval={args.server_alive_interval}' if option=='-oServerAliveInterval=2' else option for option in command]

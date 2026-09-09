@@ -29,8 +29,15 @@ fi
 target=riscv64imac-unknown-none-elf
 if [ "${WASI_WASMTIME:-0}" = 1 ]; then
   [ "${WASI_RV64_CACHE:-0}" != 1 ] || { echo "choose one WASI backend" >&2; exit 2; }
-  feature="$feature,wasmtime-command"
+  if [ "${WASI_FUEL_BATCH:-0}" = 1 ]; then
+    feature="$feature,wasmtime-command-fuel-batch"
+  else
+    feature="$feature,wasmtime-command"
+  fi
   target=riscv64gc-unknown-none-elf
+fi
+if [ "${WASI_FUEL_BATCH:-0}" = 1 ]; then
+  [ "${WASI_WASMTIME:-0}" = 1 ] || { echo 'fuel batching requires Wasmtime' >&2; exit 2; }
 fi
 mkdir -p "$work"
 if [ "${WASI_SKIP_BUILD:-0}" != 1 ]; then

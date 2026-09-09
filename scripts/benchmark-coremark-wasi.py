@@ -81,6 +81,7 @@ def main():
     command = peer._base_ssh_command('ssh', '127.0.0.1', port, 'vibe', work/'id_ed25519', work/'known_hosts', 30, None)
     env = dict(os.environ, WASI_WORK_DIR=str(work), WASI_SSH_PORT=str(port), WASI_BENCHMARK='1', WASI_DIAGNOSTIC_ICOUNT=str(int(args.icount_iterations is not None)), WASI_SKIP_BUILD=str(int(args.skip_build)), WASI_RV64_CACHE=str(int(args.rv64_cache)))
     env['WASI_WASMTIME'] = str(int(args.wasmtime))
+    env['WASI_FUEL_BATCH'] = str(int(args.fuel_batch))
     if args.kernel:
         env['WASI_KERNEL'] = str(args.kernel)
     else:

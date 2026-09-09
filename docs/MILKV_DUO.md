@@ -81,6 +81,100 @@ board evidence, not a claim of NIST/CMVP certification. The dual-interface
 composition builds, but its simultaneous physical gate remains unchecked until
 the UART procedure below is run with both links attached.
 
+## Wasmtime SD image
+
+Build the production SSH/file-tree image with the complete VibeOS Wasmtime
+command backend: Wasmtime 48 + Cranelift, native code publication, hardware traps,
+guarded memory, async fibers, bounded fuel continuation, WASI Preview 1 and
+`wasi-threads`.
+
+```sh
+./scripts/build-milkv-duo.sh --wasmtime
+# Inside the official SDK Linux/amd64 environment:
+./scripts/package-milkv-duo-sdk.sh --wasmtime /path/to/duo-buildroot-sdk
+./scripts/verify-milkv-duo-image.sh --wasmtime /path/to/duo-buildroot-sdk
+```
+
+On macOS, package the host-built kernel using the cached SDK volume:
+
+```sh
+docker run --rm --network none --platform linux/amd64 \
+  -v vibeos-milkv-duo-sdk:/home/work:ro \
+  -v "$PWD:/home/vibeos:ro" \
+  -v "$PWD/target/milkv-duo-wasmtime:/home/vibeos/target/milkv-duo-wasmtime" \
+  milkvtech/milkv-duo@sha256:63d71ea6fb2c2fb23ee34b68892ace67ed8a0c66954ed47b5cb793443fead679 \
+  /home/vibeos/scripts/package-milkv-duo-sdk.sh --wasmtime /home/work
+```
+
+Output: `target/milkv-duo-wasmtime/vibeos-milkv-duo-wasmtime-sd.img`.
+The Wasmtime kernel is LZMA-compressed inside FIT, using the pinned SDK's
+`CONFIG_LZMA=y` decoder. The packager rejects a FIT larger than 7 MiB and rejects
+an expanded kernel that overlaps the FIT source at `0x81400000`. The verifier
+checks the compressed payload's CRC and bounded-decompresses it before comparing
+with the original kernel; DTB compression remains `none`.
+
+The original uncompressed Wasmtime FIT (8,423,752 bytes) caused a physical boot
+hang immediately after `mmc0 is current device`. SDK U-Boot loads it at
+`0x81400000`, ending at `0x81c08948`. The reported U-Boot relocation is
+`0x82435000`; its compiled `reserve_malloc` subtracts `0x840000`, placing the
+reservation boundary at `0x81bf5000`, with further data and descending stack
+below it. The FAT read therefore overwrites U-Boot's live reservations. The
+nominal 15 MiB SDK UIMAG_SIZE is not a safe load limit for this relocated layout.
+The corrected FIT is approximately 3.12 MiB and ends at `0x8171e20c`. Its kernel
+bytes are unchanged. The original SDK C LZMA decoder was also built on the host
+and reproduced those bytes. Physical reboot and Wasmtime command tests then
+passed on the CV1800B (see the scoped results below).
+
+This mode uses `riscv64gc-unknown-none-elf` (LP64D), ensuring trap/task switches
+preserve floating-point state used by generated code. Other modes retain IMAC.
+The 60 MiB RAM envelope and FreeRTOS reservation are unchanged. C906B remains
+the sole application hart; guest threads share it and do not use C906L.
+
+First provision a client key through the existing production onboarding flow.
+The image contains no QEMU fixed test identity. Password onboarding cannot
+upload or execute Wasm. The current provisioned public-key profile can use:
+
+```sh
+ssh -i KEY vibe@BOARD 'wasm-upload hello.wasm BYTE_LENGTH SHA256' < hello.wasm
+ssh -i KEY vibe@BOARD 'wasm-run hello.wasm "argument with spaces"'
+# Local vsh:
+wasm-run @home/wasm/hello.wasm
+```
+
+Ordinary limits apply: 10 million fuel per Store, 16 MiB guest memory, bounded
+allocation/output, and at most three worker slots. This is the complete backend
+currently implemented by VibeOS, not all upstream Wasmtime proposals or WASI
+interfaces. It does not bundle Python or enable the long-running benchmark
+budget. Image verification checks packaging and payload identity; it does not
+qualify physical-board runtime behavior. The scoped UART/SSH runtime results
+for this image are recorded below.
+
+### Physical Wasmtime smoke results (2026-09-10)
+
+The LZMA image was tested through `/dev/cu.usbmodem54340134951` and the direct
+`en7` Ethernet link (`192.168.77.10`). U-Boot reads 3,269,132 bytes, decompresses
+the 8,402,256-byte kernel and reaches VibeOS/vsh. Public-key provisioning and
+SSH upload/exec work. The retained suite contains 12 uploads and **24 successful
+execution checks**, all with `reclaimed=true caps=0 waiters=0`:
+
+- Rust/C standard-library Hello World, spaced/Unicode arguments, binary stdin,
+  separate stdout/stderr and exit 7.
+- Atomics, shared-memory growth, wait timeout, worker exit, spawn limits,
+  native trap and fuel exhaustion.
+- C pthread mutex/condition/counter, worker exit and capacity handling.
+- CoreMark M1/M2/M3 short correctness runs with matching CRCs on the single
+  application hart. They do not meet the 10-second timing requirement and are
+  not scores.
+
+After another reboot, the same authorized key and pinned host identity work,
+and the persisted Rust module executes without uploading again. This is scoped
+physical smoke evidence, not the full WASI acceptance or long-duration benchmark.
+Boot still logs a nonfatal blue GPIOC24 readback failure; firmware ISA parsing
+falls back to RV64GC. Storage initialization retries an initial DeviceIo and
+recovers successfully. Logs and module hashes are in
+`target/milkv-duo-wasmtime/physical/summary.json` and its adjacent serial/SSH files.
+The host's original known_hosts file was preserved; the test has a separate pin.
+
 ## CPU model and support boundaries
 
 The official SDK does not expose the two cores as symmetric OpenSBI harts:
@@ -931,3 +1025,57 @@ Checked base-port items include the earlier hardware acceptance run and the
 explicit 2026-08-11 SSH/VSH run. Unchecked storage, raw-network, recovery, and
 fault-injection items still require dedicated fresh board evidence. Neither
 status is a claim of production readiness or dual-core SMP support.
+
+### Physical Duo CoreMark measurement
+
+The ordinary `--wasmtime` image has a 10,000,000 fuel limit per Store. It can
+validate short CoreMark runs but cannot complete a valid timed run. Use the
+separate `--wasmtime-benchmark` build/package/verify mode for measurement:
+
+```sh
+scripts/build-milkv-duo.sh --wasmtime-benchmark
+# Inside the approved SDK Docker container (SDK and sources mounted read-only,
+# target/milkv-duo-wasmtime-benchmark mounted writable):
+scripts/package-milkv-duo-sdk.sh --wasmtime-benchmark /home/work
+```
+
+Artifacts are isolated in `target/milkv-duo-wasmtime-benchmark`. The benchmark
+feature changes total fuel to 100,000,000,000 per Store, retaining the 10,000 fuel
+quantum, authority checks, memory limits and production SSH provisioning. It
+does not enable QEMU test credentials or allocation tracing. Ordinary images
+retain their original limit. LZMA packaging and the checked U-Boot load window
+apply to both modes.
+
+Boot the benchmark image before measurement. Alternatively, with the board
+powered off and its SD boot partition mounted on the host, replace only
+`boot.sd` with the generated benchmark `boot.sd`; this preserves the existing
+data partition and SSH authorization. Writing the full SD image initializes a
+new data partition and requires provisioning again.
+
+```sh
+COREMARK_THREADS=1 COREMARK_MONOTONIC=1 \
+  WASI_SDK_PATH=target/toolchains/wasi-sdk-33.0-arm64-macos \
+  sh scripts/build-coremark-wasi.sh
+python3 scripts/benchmark-coremark-duo.py \
+  --known-hosts target/milkv-duo-wasmtime/physical/known_hosts \
+  --work target/duo-coremark-measurement
+```
+
+The runner requires enabled UART logging and an authorized SSH key. It uploads
+one upstream pthread module, calibrates M1/M2/M3 to 20 seconds, runs three
+performance samples per count and a separate validation-seed sample, and saves
+raw stdout/stderr, UART reclamation evidence, hashes and median scores. Every
+reported sample must run for at least ten seconds and pass upstream CRC checks.
+The Duo has one application hart: these worker counts measure scheduling on one
+core, not multicore scaling. Short CRC smoke tests and QEMU scores are not
+physical Duo benchmark results. A score meeting these checks is not a claim of
+EEMBC certification.
+
+Duo currently exposes WASI monotonic time, but no realtime Unix epoch. For
+physical measurement `COREMARK_MONOTONIC=1` links an explicit timer adapter
+(`benchmarks/wasm-runtime/coremark-monotonic.c`) that routes the upstream POSIX
+port's `CLOCK_REALTIME` call to `CLOCK_MONOTONIC`, and aborts on timer errors.
+The upstream CoreMark sources and algorithm remain unmodified. The output is
+`coremark-threads-monotonic.wasm`, with its own hash; it is not byte-identical to
+the previous QEMU module. Without this adapter the upstream port ignores the
+unsupported-clock error and prints zero elapsed time, which is not a score.

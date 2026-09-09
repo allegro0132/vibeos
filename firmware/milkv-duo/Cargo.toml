@@ -5,6 +5,8 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+wasmtime = ["vibeos-kernel/milkv-wasmtime"]
+wasmtime-benchmark = ["wasmtime", "vibeos-kernel/wasi-long-fuel"]
 default = ["milkv-ssh"]
 net-shell = ["vibeos-kernel/net-shell"]
 milkv-iperf3-server = ["vibeos-kernel/milkv-iperf3-server"]

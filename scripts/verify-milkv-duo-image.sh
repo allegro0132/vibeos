@@ -5,7 +5,7 @@ export LC_ALL=C
 
 usage() {
   echo "usage: $0 --selftest" >&2
-  echo "       $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree | --runtime-costs | --wasm-aot-profile] [--package-preflight] [--artifact-root=<absolute-path>] <duo-buildroot-sdk-root>" >&2
+  echo "       $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree | --wasmtime | --wasmtime-benchmark | --runtime-costs | --wasm-aot-profile] [--package-preflight] [--artifact-root=<absolute-path>] <duo-buildroot-sdk-root>" >&2
 }
 
 verify_raw_data_partition() {
@@ -760,6 +760,9 @@ jitterentropy_ssh_probe=false
 selftest=false
 iperf3_server=false
 file_tree=false
+wasmtime=false
+wasmtime_suffix=
+wasmtime_mode=--wasmtime
 runtime_costs=false
 wasm_aot_profile=false
 package_preflight=false
@@ -777,6 +780,8 @@ for arg in "$@"; do
     --selftest) selftest=true ;;
     --iperf3-server) iperf3_server=true ;;
     --file-tree) file_tree=true ;;
+    --wasmtime) wasmtime=true ;;
+    --wasmtime-benchmark) wasmtime=true; wasmtime_suffix=-benchmark; wasmtime_mode=--wasmtime-benchmark ;;
     --runtime-costs) runtime_costs=true ;;
     --wasm-aot-profile) wasm_aot_profile=true ;;
     --package-preflight) package_preflight=true ;;
@@ -804,6 +809,7 @@ mode_count=0
 [[ "$jitterentropy_ssh_probe" == true ]] && ((mode_count += 1))
 [[ "$iperf3_server" == true ]] && ((mode_count += 1))
 [[ "$file_tree" == true ]] && ((mode_count += 1))
+[[ "$wasmtime" == true ]] && ((mode_count += 1))
 [[ "$runtime_costs" == true ]] && ((mode_count += 1))
 [[ "$wasm_aot_profile" == true ]] && ((mode_count += 1))
 if ((mode_count > 1)); then
@@ -1073,6 +1079,9 @@ elif [[ "$jitterentropy_ssh_probe" == true ]]; then
 elif [[ "$iperf3_server" == true ]]; then
   output_dir="$repo_root/target/milkv-duo-iperf3-server"
   image_name="vibeos-milkv-duo-iperf3-server-sd.img"
+elif [[ "$wasmtime" == true ]]; then
+  output_dir="$repo_root/target/milkv-duo-wasmtime$wasmtime_suffix"
+  image_name="vibeos-milkv-duo-wasmtime$wasmtime_suffix-sd.img"
 elif [[ "$file_tree" == true ]]; then
   output_dir="$repo_root/target/milkv-duo-file-tree"
   image_name="vibeos-milkv-duo-file-tree-sd.img"
@@ -1325,7 +1334,12 @@ expect_addr() {
 expect_prop /images/kernel type kernel
 expect_prop /images/kernel arch riscv
 expect_prop /images/kernel os linux
-expect_prop /images/kernel compression none
+if [[ "$wasmtime" == true ]]; then
+  expect_prop /images/kernel compression lzma
+  python3 "$script_dir/milkv-duo-fit.py" check "$output_dir" --fit "$temp_dir/fat-boot.sd"
+else
+  expect_prop /images/kernel compression none
+fi
 expect_addr /images/kernel load 80200000
 expect_addr /images/kernel entry 80200000
 expect_prop /images/fdt type flat_dt
@@ -1343,7 +1357,24 @@ if [[ "$wasm_aot_profile" == true ]]; then
   c84_stability_tracker add "$c84_stability_state" \
     "$temp_dir/kernel.bin" "$temp_dir/fdt.dtb"
 fi
-cmp -s "$expected_kernel" "$temp_dir/kernel.bin" ||
+kernel_to_compare="$temp_dir/kernel.bin"
+if [[ "$wasmtime" == true ]]; then
+  kernel_to_compare="$temp_dir/kernel-decoded.bin"
+  python3 - "$temp_dir/kernel.bin" "$kernel_to_compare" "$expected_kernel" <<'PYLZMA'
+import lzma, pathlib, struct, sys
+source, output, expected = map(pathlib.Path, sys.argv[1:])
+packed = source.read_bytes()
+size = expected.stat().st_size
+if len(packed) < 13 or struct.unpack_from("<Q", packed, 5)[0] not in (size, 0xffffffffffffffff):
+    raise SystemExit("LZMA size header differs from kernel")
+decoder = lzma.LZMADecompressor(format=lzma.FORMAT_ALONE, memlimit=16*1024*1024)
+raw = decoder.decompress(packed, max_length=size + 1)
+if len(raw) != size or not decoder.eof or decoder.unused_data:
+    raise SystemExit("Invalid or oversized LZMA kernel")
+output.write_bytes(raw)
+PYLZMA
+fi
+cmp -s "$expected_kernel" "$kernel_to_compare" ||
   die "FIT kernel payload differs from this build's VibeOS kernel"
 cmp -s "$expected_dtb" "$temp_dir/fdt.dtb" ||
   die "FIT FDT payload differs from the SDK Linux DTB"

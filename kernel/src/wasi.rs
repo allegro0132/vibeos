@@ -62,7 +62,7 @@ fn clock_error(errno: i32) -> WasiClockError {
 
 fn invocation_limits() -> WasiLimits {
     WasiLimits {
-        #[cfg(feature = "wasi-benchmark")]
+        #[cfg(feature = "wasi-long-fuel")]
         total_fuel: 100_000_000_000,
         ..WasiLimits::default()
     }
@@ -589,22 +589,23 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
     })
 }
 
-#[cfg(feature = "wasi-ssh")]
+#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime"))]
 pub fn permitted(
     profile: vibeos_sshd::AuthorizedProfile,
     request: &vibeos_wasi_command::Request,
 ) -> bool {
-    // Explicit QEMU acceptance profile, separate upload/run capability switches.
-    profile.profile.get() == 1
-        && profile.generation == 1
-        && match request {
-            vibeos_wasi_command::Request::Upload { .. } => cfg!(feature = "wasi-ssh-upload"),
-            vibeos_wasi_command::Request::Run { .. } => true,
-        }
+    #[cfg(feature = "milkv-wasmtime")]
+    let admitted = crate::ssh_provisioning::command_profile_current(profile);
+    #[cfg(not(feature = "milkv-wasmtime"))]
+    let admitted = profile.profile.get() == 1 && profile.generation == 1;
+    admitted && match request {
+        vibeos_wasi_command::Request::Upload { .. } => cfg!(any(feature = "wasi-ssh-upload", feature = "milkv-wasmtime")),
+        vibeos_wasi_command::Request::Run { .. } => true,
+    }
 }
-#[cfg(feature = "wasi-ssh")]
+#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime"))]
 struct RequestService(bool);
-#[cfg(feature = "wasi-ssh")]
+#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime"))]
 impl Resource for RequestService {
     fn kind(&self) -> &'static str {
         if self.0 {
@@ -620,7 +621,7 @@ impl Resource for RequestService {
         self
     }
 }
-#[cfg(feature = "wasi-ssh")]
+#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime"))]
 pub fn open(
     profile: vibeos_sshd::AuthorizedProfile,
     request: vibeos_wasi_command::Request,
@@ -657,6 +658,9 @@ pub fn open(
             };
             if task_io.cancelled() {
                 return Err(130);
+            }
+            if !permitted(profile, &request) {
+                return Err(126);
             }
             // Translate the explicitly admitted SSH profile into least-rights
             // loader capabilities. This CSpace belongs to the trusted request,
@@ -704,6 +708,10 @@ pub fn open(
                         // the granted execution right; session denial and
                         // disconnect still revoke CommandIo at every boundary.
                         let _keep_loader_alive = &loader;
+                        #[cfg(feature = "milkv-wasmtime")]
+                        if !crate::ssh_provisioning::command_profile_current(profile) {
+                            return false;
+                        }
                         service_lease.authorizes(Rights::INVOKE)
                     });
                     launch(&bytes, &argv, task_io.clone(), Some(authority))?;

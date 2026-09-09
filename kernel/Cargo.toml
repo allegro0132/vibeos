@@ -5,6 +5,8 @@ edition = "2021"
 autobins = false
 
 [features]
+# Production Duo command image; never pulls in QEMU test identities.
+milkv-wasmtime = ["milkv-ssh", "wasi-preview1", "vibeos-sshd/wasi-exec", "wasmtime-command-fuel-batch", "wasmtime-threads"]
 python-wasi = ["wasi-ssh-upload", "vibeos-wasi-runtime/python-wasi", "vibeos-bsp-qemu-virt?/python-wasi", "vibeos-sshd/python-wasi"]
 # Command images generate code for the scalar extensions every schedulable
 # hart advertised at boot (see `wasmtime-discovered-isa`); a target without
@@ -26,7 +28,8 @@ wasmtime-discovered-isa = ["wasmtime-native"]
 wasmtime-coremark-probe = ["wasmtime-native"]
 wasmtime-native = ["dep:vibeos-wasmtime-runtime"]
 # Explicit long-running benchmark image; ordinary commands retain 10 million fuel.
-wasi-benchmark = ["wasi-ssh-upload", "vibeos-core/alloc-site-trace"]
+wasi-long-fuel = []
+wasi-benchmark = ["wasi-ssh-upload", "vibeos-core/alloc-site-trace", "wasi-long-fuel"]
 wasi-rv64-cache = ["wasi-ssh-upload", "vibeos-wasi-runtime/rv64-cache"]
 wasi-preview1 = ["file-tree", "dep:vibeos-wasi-runtime", "dep:vibeos-wasi-command"]
 wasi-ssh-upload = ["wasi-ssh"]

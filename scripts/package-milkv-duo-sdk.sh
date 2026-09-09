@@ -11,6 +11,9 @@ jitterentropy_probe=false
 jitterentropy_ssh_probe=false
 iperf3_server=false
 file_tree=false
+wasmtime=false
+wasmtime_suffix=
+wasmtime_mode=--wasmtime
 runtime_costs=false
 wasm_aot_profile=false
 runtime_costs_sdk_commit=23eb84fecb29585dbb5728d6b7e2475ff273baac
@@ -26,12 +29,14 @@ for arg in "$@"; do
     --jitterentropy-ssh-probe) jitterentropy_ssh_probe=true ;;
     --iperf3-server) iperf3_server=true ;;
     --file-tree) file_tree=true ;;
+    --wasmtime) wasmtime=true ;;
+    --wasmtime-benchmark) wasmtime=true; wasmtime_suffix=-benchmark; wasmtime_mode=--wasmtime-benchmark ;;
     --runtime-costs) runtime_costs=true ;;
     --wasm-aot-profile) wasm_aot_profile=true ;;
-    -*) echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree | --runtime-costs | --wasm-aot-profile] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
+    -*) echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree | --wasmtime | --wasmtime-benchmark | --runtime-costs | --wasm-aot-profile] <duo-buildroot-sdk-root>" >&2; exit 2 ;;
     *)
       if [[ -n "$sdk_arg" ]]; then
-        echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree | --runtime-costs | --wasm-aot-profile] <duo-buildroot-sdk-root>" >&2
+        echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree | --wasmtime | --wasmtime-benchmark | --runtime-costs | --wasm-aot-profile] <duo-buildroot-sdk-root>" >&2
         exit 2
       fi
       sdk_arg=$arg
@@ -45,15 +50,16 @@ mode_count=0
 [[ "$jitterentropy_ssh_probe" == true ]] && ((mode_count += 1))
 [[ "$iperf3_server" == true ]] && ((mode_count += 1))
 [[ "$file_tree" == true ]] && ((mode_count += 1))
+[[ "$wasmtime" == true ]] && ((mode_count += 1))
 [[ "$runtime_costs" == true ]] && ((mode_count += 1))
 [[ "$wasm_aot_profile" == true ]] && ((mode_count += 1))
 if ((mode_count > 1)); then
   echo "package-milkv-duo-sdk.sh: image mode options are mutually exclusive" >&2
-  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree | --runtime-costs | --wasm-aot-profile] <duo-buildroot-sdk-root>" >&2
+  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree | --wasmtime | --wasmtime-benchmark | --runtime-costs | --wasm-aot-profile] <duo-buildroot-sdk-root>" >&2
   exit 2
 fi
 if [[ -z "$sdk_arg" ]]; then
-  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree | --runtime-costs | --wasm-aot-profile] <duo-buildroot-sdk-root>" >&2
+  echo "usage: $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree | --wasmtime | --wasmtime-benchmark | --runtime-costs | --wasm-aot-profile] <duo-buildroot-sdk-root>" >&2
   exit 2
 fi
 
@@ -292,6 +298,9 @@ elif [[ "$jitterentropy_ssh_probe" == true ]]; then
 elif [[ "$iperf3_server" == true ]]; then
   output_dir="$repo_root/target/milkv-duo-iperf3-server"
   image_name="vibeos-milkv-duo-iperf3-server-sd.img"
+elif [[ "$wasmtime" == true ]]; then
+  output_dir="$repo_root/target/milkv-duo-wasmtime$wasmtime_suffix"
+  image_name="vibeos-milkv-duo-wasmtime$wasmtime_suffix-sd.img"
 elif [[ "$file_tree" == true ]]; then
   output_dir="$repo_root/target/milkv-duo-file-tree"
   image_name="vibeos-milkv-duo-file-tree-sd.img"
@@ -1271,7 +1280,16 @@ finally:
 PY
 fi
 
-cp "$script_dir/milkv-duo.its" "$output_its"
+if [[ "$wasmtime" == true ]]; then
+  python3 - "$sdk_root/u-boot-2021.10/build/cv1800b_milkv_duo_sd/.config" <<'PYCONFIG'
+import pathlib, sys
+if "CONFIG_LZMA=y" not in pathlib.Path(sys.argv[1]).read_text().splitlines():
+    raise SystemExit("Wasmtime FIT requires SDK U-Boot CONFIG_LZMA=y")
+PYCONFIG
+  python3 "$script_dir/milkv-duo-fit.py" prepare "$package_work_dir"
+else
+  cp "$script_dir/milkv-duo.its" "$output_its"
+fi
 cp "$sdk_dtb" "$output_dtb"
 
 (
@@ -1286,6 +1304,10 @@ cp "$sdk_dtb" "$output_dtb"
     "$mkimage" -l "$(basename -- "$temp_fit")"
   fi
 )
+
+if [[ "$wasmtime" == true ]]; then
+  python3 "$script_dir/milkv-duo-fit.py" check "$package_work_dir" --fit "$temp_fit"
+fi
 
 pack_dir=$(mktemp -d "$package_work_dir/.vibeos-pack.XXXXXX")
 mkdir -p "$pack_dir/input/rawimages" "$pack_dir/root" "$pack_dir/output" "$pack_dir/tmp"
@@ -1343,6 +1365,8 @@ elif [[ "$jitterentropy_ssh_probe" == true ]]; then
   verify_args=(--jitterentropy-ssh-probe "$sdk_root")
 elif [[ "$iperf3_server" == true ]]; then
   verify_args=(--iperf3-server "$sdk_root")
+elif [[ "$wasmtime" == true ]]; then
+  verify_args=("$wasmtime_mode" "$sdk_root")
 elif [[ "$file_tree" == true ]]; then
   verify_args=(--file-tree "$sdk_root")
 elif [[ "$runtime_costs" == true ]]; then

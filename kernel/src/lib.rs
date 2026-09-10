@@ -1309,16 +1309,33 @@ const BANNER: &str = r#"
 #[no_mangle]
 pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
     uart::early_write("\r\n[VibeOS] entry\r\n");
-    exec::configure_timebase(platform::timebase_hz());
-    let boot_time = sbi::time();
-    #[cfg(not(feature = "legacy-shell"))]
-    let _ = boot_time;
     let boot_physical_hart = sbi::current_hart_id();
 
     let (hs, he) = (
         core::ptr::addr_of!(__heap_start) as usize,
         core::ptr::addr_of!(__heap_end) as usize,
     );
+    if let Some(admit) = platform::description().admit_boot {
+        let request = vibeos_hal::boot::BootRequest {
+            physical_hart: boot_physical_hart,
+            dtb_address: _firmware_dtb,
+            ram: platform::mmu().ram,
+            static_memory: vibeos_hal::AddressRange::new(platform::mmu().ram.start, hs),
+            heap_envelope: vibeos_hal::AddressRange::new(hs, he),
+        };
+        // Only this cold entry invokes admission. Secondary entry does not
+        // revalidate or mutate the firmware's published boot descriptions.
+        if let Err(error) = unsafe { admit(request) } {
+            uart::init();
+            println!("BOOT_ADMISSION FAIL: {:?}", error);
+            sbi::shutdown(true);
+        }
+    }
+    exec::configure_timebase(platform::timebase_hz());
+    let boot_time = sbi::time();
+    #[cfg(not(feature = "legacy-shell"))]
+    let _ = boot_time;
+
     // OpenSBI's DTB may be outside the RAM mapped by our bounded allocator.
     // Capture its scalar ISA intersection while physical addressing is active,
     // before page tables or heap initialization can hide/reuse the blob.

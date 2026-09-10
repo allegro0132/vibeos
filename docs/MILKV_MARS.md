@@ -554,3 +554,43 @@ fail the host regressions.
 The Mars firmware entry, live DTB resource publication and registration of the
 prepared DW-MSHC instance remain to be connected. EQoS, paired boot components,
 the flashable SD image and physical acceptance are still outstanding.
+
+### Pre-MMU firmware admission stage
+
+The optional `BootPlatform::admit_boot` callback runs once on the boot hart,
+prior to timebase configuration, page tables, heap initialization and secondary
+release. Its `BootRequest` carries the physical hart, DTB pointer, RAM envelope,
+static image/stacks/pools span and heap envelope. `BootRequest::dtb` bounds the
+aligned header and complete blob (at most 1 MiB) before parsing. Physical
+readability is still an obligation of the boot handoff; pointer arithmetic alone
+cannot establish it. Rejection initializes the UART for a diagnostic and asks
+SBI to shut down, without publishing device services.
+
+Hart IDs and timebase are now firmware callbacks, allowing a composition root
+to publish copied, immutable metadata after admission. QEMU and Duo production
+images retain their existing static topology/timebase through these callbacks.
+The optional `boot-admission-test` image in `firmware/qemu-hal-test` validates
+its four CPUs, Sv39 support, timebase and static memory against a live DTB,
+then publishes boot-hart-first IDs and timebase with release/acquire ordering.
+No borrowed DTB pointers survive. Repeated publication fails.
+
+```sh
+(cd firmware/qemu-hal-test && cargo build --offline --locked --release --features boot-admission-test)
+python3 scripts/qemu-boot-dtb-test.py \
+  --kernel target/riscv64imac-unknown-none-elf/release/vibeos-qemu-hal-test \
+  --output target/mars-reference/admission-run --require-admission
+```
+
+The live QEMU run verifies one publication, four harts and 390 passing kernel
+selftests. A wrong-timebase DTB is rejected before the kernel banner/heap.
+Host tests exercise bounded DTB access, invalid CPU/memory/timebase rejection,
+nonzero boot-hart ordering and repeated publication. Mutations that remove
+memory or timebase rejection or permit republishing are detected. Python
+ordering guards cover placement before MMU/heap/SMP. Host tests cannot prove
+physical address decoding, RV64 cache visibility or hardware fault behavior;
+QEMU does not qualify Mars hardware.
+
+This is an admission interface and a QEMU acceptance composition, not production
+Mars admission. The existing heap still uses one fixed contiguous linker range;
+reservation-aware allocation, Mars resource validation and SBI qualification
+remain required before registering Mars devices or producing the SD image.

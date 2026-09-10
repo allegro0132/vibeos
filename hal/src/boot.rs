@@ -9,6 +9,56 @@ pub struct PageTableArena {
     pub pages: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct BootRequest {
+    pub physical_hart: usize,
+    pub dtb_address: usize,
+    pub ram: AddressRange,
+    /// Loaded image, static pools, page tables and all initial stacks.
+    pub static_memory: AddressRange,
+    pub heap_envelope: AddressRange,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootError {
+    InvalidDtb,
+    InvalidMemory,
+    InvalidCpu,
+    InvalidTimebase,
+    AlreadyInitialized,
+}
+impl BootRequest {
+    /// # Safety
+    /// The boot firmware supplies immutable, readable physical RAM at this
+    /// pointer. Bounds checks do not themselves establish physical readability.
+    /// Consume the slice before the allocator can reuse the DTB's storage.
+    pub unsafe fn dtb(&self) -> Result<&[u8], BootError> {
+        if self.dtb_address % 8 != 0
+            || self.dtb_address < self.ram.start
+            || self
+                .dtb_address
+                .checked_add(40)
+                .filter(|&end| end <= self.ram.end)
+                .is_none()
+        {
+            return Err(BootError::InvalidDtb);
+        }
+        let header = unsafe { core::slice::from_raw_parts(self.dtb_address as *const u8, 40) };
+        let size = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+        if !(40..=1024 * 1024).contains(&size)
+            || self
+                .dtb_address
+                .checked_add(size)
+                .filter(|&end| end <= self.ram.end)
+                .is_none()
+        {
+            return Err(BootError::InvalidDtb);
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(self.dtb_address as *const u8, size) };
+        crate::fdt::Fdt::new(bytes).map_err(|_| BootError::InvalidDtb)?;
+        Ok(bytes)
+    }
+}
+
 pub struct BootPlatform {
     /// Persistent logical device identity is image policy, not controller type.
     pub managed_block_id: core::num::NonZeroU128,
@@ -17,7 +67,15 @@ pub struct BootPlatform {
     pub info: BoardInfo,
     pub memory_map: &'static [MemoryRegion],
     pub mmu: MmuDescription,
-    pub hart_ids: &'static [usize],
+    /// Called only after successful boot admission, when configured.
+    pub hart_ids: fn() -> &'static [usize],
+    pub timebase_hz: fn() -> u64,
+    /// # Safety
+    /// Boot-hart-only, before paging, heap setup or secondary release. The
+    /// firmware pointer is readable physical memory inside the supplied RAM
+    /// envelope. Validate before publishing any immutable runtime description.
+    /// No allocation, device registration or references into reusable DTB RAM.
+    pub admit_boot: Option<unsafe fn(BootRequest) -> Result<(), BootError>>,
     pub rtc: Option<AddressRange>,
     pub cold_reset: Option<fn() -> !>,
     /// # Safety

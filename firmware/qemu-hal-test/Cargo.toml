@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+boot-admission-test = []
 jh7110-sd-model-test = ["dep:vibeos-platform-jh7110"]
 
 [[bin]]

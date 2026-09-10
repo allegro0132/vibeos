@@ -15,10 +15,10 @@ pub fn name() -> &'static str {
     info().name
 }
 pub fn timebase_hz() -> u64 {
-    info().timebase_hz
+    (description().timebase_hz)()
 }
 pub fn hart_ids() -> &'static [usize] {
-    description().hart_ids
+    (description().hart_ids)()
 }
 pub fn pci() -> PciHostDescription {
     info().pci.expect("firmware did not supply a PCI host")

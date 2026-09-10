@@ -44,3 +44,13 @@ mod transport;
 const MANAGED_BLOCK_ID: core::num::NonZeroU128 =
     core::num::NonZeroU128::new(0x5649_4245_4f53_0000_0000_0000_0000_0001).unwrap();
 const NETWORK_DRIVER_NAME: &str = "virtio-mmio";
+
+fn hart_ids() -> &'static [usize] {
+    Board::HART_IDS
+}
+fn timebase_hz() -> u64 {
+    Board::INFO.timebase_hz
+}
+const BOOT_ADMISSION: Option<
+    unsafe fn(vibeos_hal::boot::BootRequest) -> Result<(), vibeos_hal::boot::BootError>,
+> = None;

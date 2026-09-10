@@ -4,6 +4,7 @@
 //! Runtime memory must be admitted from the boot DTB before use.
 pub mod harts;
 pub mod resources;
+pub mod network_resources;
 
 use vibeos_hal::{
     fdt::{Error as FdtError, Fdt},
@@ -69,6 +70,7 @@ pub const GMAC0_REGISTERS: AddressRange = AddressRange::new(0x1603_0000, 0x1604_
 pub const GMAC0_IRQ: u32 = 7;
 pub const SYS_CRG: AddressRange = AddressRange::new(0x1302_0000, 0x1303_0000);
 pub const AON_CRG: AddressRange = AddressRange::new(0x1700_0000, 0x1701_0000);
+pub const AON_SYSCON: AddressRange = AddressRange::new(0x1701_0000, 0x1701_1000);
 pub const SYS_PINCTRL: AddressRange = AddressRange::new(0x1304_0000, 0x1305_0000);
 pub const L2_CACHE: AddressRange = AddressRange::new(0x0201_0000, 0x0201_4000);
 
@@ -184,12 +186,14 @@ pub const MEMORY_MAP: &[vibeos_hal::MemoryRegion] = &[
     vibeos_hal::MemoryRegion::mmio("SYS CRG/SYSCON/pins", SYS_CRG.start, SYS_PINCTRL.end),
     vibeos_hal::MemoryRegion::mmio("SDIO1/GMAC0", SD_REGISTERS.start, GMAC0_REGISTERS.end),
     vibeos_hal::MemoryRegion::mmio("L2 control", L2_CACHE.start, L2_CACHE.end),
+    vibeos_hal::MemoryRegion::mmio("AON CRG/SYSCON", AON_CRG.start, AON_SYSCON.end),
 ];
 pub const MMIO_MAPPINGS: &[vibeos_hal::IdentityMapping] = &[
     vibeos_hal::IdentityMapping::pages("UART0", UART_REGISTERS.start, UART_REGISTERS.end),
     vibeos_hal::IdentityMapping::pages("SYS CRG/SYSCON/pins", SYS_CRG.start, SYS_PINCTRL.end),
     vibeos_hal::IdentityMapping::pages("SDIO1/GMAC0", SD_REGISTERS.start, GMAC0_REGISTERS.end),
     vibeos_hal::IdentityMapping::pages("L2 control", L2_CACHE.start, L2_CACHE.end),
+    vibeos_hal::IdentityMapping::pages("AON CRG/SYSCON", AON_CRG.start, AON_SYSCON.end),
 ];
 impl vibeos_hal::Board for Board {
     const INFO: vibeos_hal::BoardInfo = vibeos_hal::BoardInfo {
@@ -216,8 +220,8 @@ impl vibeos_hal::Board for Board {
         mmio_attributes: vibeos_hal::MemoryAttributes::Standard,
         identity_mappings: MMIO_MAPPINGS,
         device_level1_tables: 1,
-        // UART, SYS, SD/GMAC, L2 and the two sparse PLIC windows.
-        device_level0_tables: 6,
+        // UART, SYS, SD/GMAC, L2, AON and the two sparse PLIC windows.
+        device_level0_tables: 7,
     };
     const HART_IDS: &'static [usize] = HART_IDS;
     fn plic_s_context(physical_hart: usize) -> Option<usize> {

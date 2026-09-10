@@ -50,6 +50,12 @@ unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
     }
     #[cfg(feature = "mars-resources-test")]
     {
+        let network_fixture = include_bytes!("../../../boards/milkv-mars/tests/fixtures/network.dtb");
+        let network = vibeos_bsp_milkv_mars::network_resources::admit(network_fixture)
+            .expect("Mars GMAC/cache admission");
+        assert_eq!(network.mac.start, 0x16030000);
+        assert_eq!(network.phy.tx_delay_fe, 5);
+        _print(format_args!("MARS_NETWORK_RESOURCES PASS gmac=0 irq=7 phy_address=undiscovered\n"));
         let fixture = include_bytes!("../../../boards/milkv-mars/tests/fixtures/resources.dtb");
         let resources =
             vibeos_bsp_milkv_mars::resources::admit(fixture).expect("Mars fixture admission");

@@ -355,7 +355,7 @@ fn validate_contexts(bytes: &[u8], intc: [u32; 5]) -> Result<(), Error> {
 
 // Only handles used by this admission policy need global resolution. Count
 // their definitions across the whole tree, including unrelated/nested nodes.
-fn unique_handles(tree: &Fdt<'_>, targets: [u32; 6]) -> Result<(), Error> {
+pub(super) fn unique_handles<const N: usize>(tree: &Fdt<'_>, targets: [u32; N]) -> Result<(), Error> {
     if targets
         .iter()
         .enumerate()
@@ -365,7 +365,7 @@ fn unique_handles(tree: &Fdt<'_>, targets: [u32; 6]) -> Result<(), Error> {
     }
     let mut handles = [0; 32];
     let mut properties = [0u8; 32];
-    let mut counts = [0usize; 6];
+    let mut counts = [0usize; N];
     for event in tree.events() {
         match event? {
             Event::Begin { depth, .. } => {
@@ -396,7 +396,7 @@ fn unique_handles(tree: &Fdt<'_>, targets: [u32; 6]) -> Result<(), Error> {
             _ => (),
         }
     }
-    if counts != [1; 6] {
+    if counts != [1; N] {
         return Err(Error::InvalidStructure);
     }
     Ok(())

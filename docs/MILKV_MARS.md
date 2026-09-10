@@ -893,3 +893,31 @@ admission of GMAC/cache resources, clock/reset/pinmux and PHY preparation,
 production pool reservation/registration, network/SSH and physical stability
 qualification remain required. This stage does not change the serial-only
 network status of the previously generated test SD image.
+
+### GMAC0 and cache resource admission
+
+`network_resources::admit` now validates the pinned GMAC0 register window, PLIC
+interrupts, ordered clock/reset references and provider geometry, AON SYSCON,
+cache geometry, and vendor PHY tuning. It rejects provider aliases, duplicate
+properties, changed resources and alternative PHY bindings. The admission is
+separate from console/SD admission so an old serial-only fixture cannot silently
+enable networking. AON CRG/SYSCON now has a page-granular mapping and its own
+reserved level-zero page table.
+
+The official SDK's `ethernet-phy@0` has neither `reg` nor `phy-handle`. Admission
+therefore returns tuning values without inventing a PHY address or identity;
+MDIO discovery and supported-ID validation remain required before enabling the
+link. Likewise, the DTB's `dma-coherent` hint does not replace the cache service
+or actual multicore DMA qualification.
+
+The complete pinned SDK DTB passes `inspect_network`. Five network admission
+tests plus 18 prior BSP tests pass, including resource substitution and malformed
+binding cases. The RV64 firmware reports `MARS_NETWORK_RESOURCES PASS` and runs
+395 kernel selftests. Mutations removing cache-line validation, provider handle
+uniqueness, and duplicate-property rejection are detected. Source hashes and
+validation evidence are in `boards/milkv-mars/network-resource-reference.json`
+and `boards/milkv-mars/network-resource-evidence.json`.
+
+This stage admits descriptions only: JH7110 Ethernet clock/reset programming,
+PHY discovery/configuration and production device registration remain pending.
+The existing SD image continues to be the serial/SD bring-up profile.

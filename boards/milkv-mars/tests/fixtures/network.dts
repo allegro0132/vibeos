@@ -1,0 +1,37 @@
+// Focused pinned vendor topology; PHY address intentionally absent in SDK.
+/include/ "resources.dts"
+&{/soc/clock-controller} {
+ phandle = <200>; #clock-cells = <1>; reg-names = "sys", "stg", "aon";
+};
+&{/soc} {
+ reset-controller {
+  phandle = <201>; compatible = "starfive,jh7110-reset"; #reset-cells = <1>;
+  reg = <0 0x13020000 0 0x10000>, <0 0x10230000 0 0x10000>,
+        <0 0x17000000 0 0x10000>, <0 0x19810000 0 0x10000>, <0 0x295c0000 0 0x10000>;
+  reg-names = "syscrg", "stgcrg", "aoncrg", "ispcrg", "voutcrg";
+ };
+ aon_syscon@17010000 { compatible = "syscon"; reg = <0 0x17010000 0 0x1000>; };
+ cache-controller@2010000 {
+  compatible = "sifive,fu740-c000-ccache", "cache";
+  reg = <0 0x2010000 0 0x4000>, <0 0x8000000 0 0x2000000>;
+  reg-names = "control", "sideband";
+  cache-block-size = <64>; cache-level = <2>; cache-sets = <2048>;
+  cache-size = <2097152>; cache-unified;
+ };
+ ethernet@16030000 {
+  compatible = "starfive,dwmac", "snps,dwmac-5.10a";
+  reg = <0 0x16030000 0 0x10000>; status = "okay";
+  #address-cells = <1>; #size-cells = <0>;
+  interrupts = <7 6 5>; interrupt-names = "macirq", "eth_wake_irq", "eth_lpi";
+  clocks = <200 108 200 224 200 109 200 221 200 222 200 111 200 223>;
+  clock-names = "gtx", "tx", "ptp_ref", "stmmaceth", "pclk", "gtxc", "rmii_rtx";
+  resets = <201 161 201 160>; reset-names = "ahb", "stmmaceth";
+  phy-mode = "rgmii-id"; rx-fifo-depth = <2048>; tx-fifo-depth = <2048>;
+  dma-coherent;
+  ethernet-phy@0 {
+   rgmii_sw_dr_2 = <0>; rgmii_sw_dr = <3>; rgmii_sw_dr_rxc = <6>;
+   rxc_dly_en = <0>; rx_delay_sel = <10>; tx_delay_sel_fe = <5>; tx_delay_sel = <10>;
+   tx_inverted_10 = <1>; tx_inverted_100 = <1>; tx_inverted_1000 = <1>;
+  };
+ };
+};

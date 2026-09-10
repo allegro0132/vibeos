@@ -1,0 +1,75 @@
+{
+  "status": "GMAC0/cache/provider DTB admission implemented; clock/PHY preparation and firmware network registration pending",
+  "host_tests": 23,
+  "new_network_admission_tests": 5,
+  "sdk_dtb_admission": "passed",
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 3,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 121962496,
+    "kernel_sha256": "af104ed94e49c387b501b2fb737d3fb00c11610e0e625dfc59bb71af0c3c5e30",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "rv64_marker": "MARS_NETWORK_RESOURCES PASS gmac=0 irq=7 phy_address=undiscovered",
+  "mars_release_elf_contract": "passed",
+  "source_reference": "boards/milkv-mars/network-resource-reference.json",
+  "mutations": [
+    "cache-line validation removed: detected",
+    "provider handle uniqueness removed: detected",
+    "duplicate property rejection removed: detected"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage30-host-restored.log",
+      "sha256": "8c12f53b02c7a95310cbe1c05c49dc552112ef9dc41e4b47b124485f21410173"
+    },
+    {
+      "path": "target/mars-reference/stage30-sdk-network.log",
+      "sha256": "d50c8d387be3a8b2eb61771d38b451ec538609ba3586d7713340a9a991802331"
+    },
+    {
+      "path": "target/mars-reference/stage30-rv64-build.log",
+      "sha256": "5e18441f83c585bad6876f26554d2cb001a7920b3358d46581c7a7ed91b870da"
+    },
+    {
+      "path": "target/mars-reference/stage30-rv64-model/serial.log",
+      "sha256": "baddf9e4f35d4b30eed1d4f78096255e05734ab9714f64f3896cdba1be3f61a6"
+    },
+    {
+      "path": "target/mars-reference/stage30-rv64-model/summary.json",
+      "sha256": "fabd015880819644b8281d4129d5aaf75360af79bc5b7577c9d9bd5d5b4682fc"
+    },
+    {
+      "path": "target/mars-reference/stage30-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage30-mars-build.log",
+      "sha256": "d64b28eed2cc6e898590043ee53b0919309fa522d916472e5bd748ce9eea5a8e"
+    },
+    {
+      "path": "target/mars-reference/stage30-mutation-cache-line.log",
+      "sha256": "67b7dd4fa2b9c2d84174c9b5991e2e3111bb8baec3ffdb99f6377fcb55b75bc8"
+    },
+    {
+      "path": "target/mars-reference/stage30-mutation-handles.log",
+      "sha256": "764ccf30d938293e08c72f87ab5e3155311b410f84fab5f781ebd049a59f7f20"
+    },
+    {
+      "path": "target/mars-reference/stage30-mutation-duplicates.log",
+      "sha256": "283ee6fc422d7a5f8ffbd6225234c92afcf3c2f941c7f4559a2e056d0b423203"
+    }
+  ],
+  "physical_acceptance": false,
+  "blind_spots": [
+    "DTB resource descriptions do not prove actual PHY wiring, link behavior or running clocks",
+    "Actual JH7110 cache MMIO and multicore DMA coherence remain unqualified",
+    "No Ethernet device is registered in the Mars firmware or existing SD image"
+  ]
+}

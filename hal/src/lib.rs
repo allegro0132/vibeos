@@ -329,3 +329,5 @@ pub mod queued_block;
 pub mod network;
 
 pub mod queued_network;
+
+pub mod pci;

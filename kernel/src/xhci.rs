@@ -32,6 +32,7 @@ pub enum Error {
     BarMissing,
     BarOutsidePlatform,
     InterruptMissing,
+    PciConfiguration,
     InterruptRoute,
     Driver(vibeos_driver_xhci::Error),
 }
@@ -56,7 +57,7 @@ pub fn init() -> Result<Option<Info>, Error> {
     };
     let mmio = bar_region(function.bars[0])?;
     let irq = function.interrupt_line.ok_or(Error::InterruptMissing)?;
-    function.enable_bus_mastering();
+    crate::pci::enable_bus_mastering(function).map_err(|_| Error::PciConfiguration)?;
 
     // Safety: the BSP maps the complete PCI MMIO aperture, `bar_region`
     // validates this function's entire BAR within it, and the static DMA area

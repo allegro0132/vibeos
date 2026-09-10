@@ -194,3 +194,4 @@ vibeos-driver-virtio-mmio = { path = "../../drivers/virtio-mmio" }
 vibeos-driver-virtio-blk = { path = "../../drivers/virtio-blk" }
 vibeos-driver-virtio-core = { path = "../../drivers/virtio-core" }
 vibeos-driver-virtio-net = { path = "../../drivers/virtio-net" }
+vibeos-driver-pci = { path = "../../drivers/pci" }

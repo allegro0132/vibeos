@@ -1761,6 +1761,7 @@ name = "vibeos-firmware-qemu-virt"
 version = "0.1.0"
 dependencies = [
  "vibeos-bsp-qemu-virt",
+ "vibeos-driver-pci",
  "vibeos-driver-plic",
  "vibeos-driver-uart16550",
  "vibeos-driver-virtio-blk",
@@ -1818,7 +1819,6 @@ dependencies = [
  "vibeos-component-runtime",
  "vibeos-core",
  "vibeos-driver-dwc2-host",
- "vibeos-driver-pci",
  "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
  "vibeos-driver-xhci",

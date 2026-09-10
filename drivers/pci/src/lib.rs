@@ -10,7 +10,6 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use core::fmt;
 pub use vibeos_hal::PciHostDescription;
 
 const VENDOR_DEVICE: u16 = 0x00;
@@ -87,103 +86,7 @@ const fn bus_count(config: PciHostDescription) -> usize {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Address {
-    pub bus: u8,
-    pub device: u8,
-    pub function: u8,
-}
-
-impl fmt::Display for Address {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:02x}:{:02x}.{}", self.bus, self.device, self.function)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Bar {
-    None,
-    Io {
-        address: u32,
-        size: u32,
-    },
-    Memory32 {
-        address: u32,
-        size: u32,
-        prefetchable: bool,
-    },
-    Memory64 {
-        address: u64,
-        size: u64,
-        prefetchable: bool,
-    },
-}
-
-impl Bar {
-    pub const fn address(self) -> Option<u64> {
-        match self {
-            Self::None => None,
-            Self::Io { address, .. } | Self::Memory32 { address, .. } => Some(address as u64),
-            Self::Memory64 { address, .. } => Some(address),
-        }
-    }
-
-    pub const fn size(self) -> u64 {
-        match self {
-            Self::None => 0,
-            Self::Io { size, .. } | Self::Memory32 { size, .. } => size as u64,
-            Self::Memory64 { size, .. } => size,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Function {
-    pub address: Address,
-    pub vendor_id: u16,
-    pub device_id: u16,
-    pub class: u8,
-    pub subclass: u8,
-    pub programming_interface: u8,
-    pub revision: u8,
-    pub header_type: u8,
-    pub interrupt_pin: u8,
-    pub interrupt_line: Option<u32>,
-    pub bars: [Bar; 6],
-    config: PciConfig,
-}
-
-impl Function {
-    pub const fn class_code(self) -> u32 {
-        ((self.class as u32) << 16)
-            | ((self.subclass as u32) << 8)
-            | self.programming_interface as u32
-    }
-
-    pub const fn is_xhci(self) -> bool {
-        self.class == 0x0c && self.subclass == 0x03 && self.programming_interface == 0x30
-    }
-
-    pub fn enable_bus_mastering(self) {
-        let command = read16(self.config, self.address, COMMAND_STATUS);
-        write16(
-            self.config,
-            self.address,
-            COMMAND_STATUS,
-            command | COMMAND_MEMORY | COMMAND_BUS_MASTER,
-        );
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Error {
-    InvalidConfig,
-    InvalidConfigAddress,
-    InvalidInterruptPin,
-    TooManyFunctions,
-    BarAddressExhausted,
-    InvalidBarSize,
-}
+pub use vibeos_hal::pci::{Address, Bar, Function, Error};
 
 #[derive(Clone, Copy)]
 struct Allocator {
@@ -307,6 +210,21 @@ impl Pci {
             .collect()
     }
 
+    /// Enumerate immutable inventory without allocating in the hardware layer.
+    pub fn visit_functions(&self, visit: &mut dyn FnMut(Function)) {
+        for function in self.entries[..self.count].iter().flatten() { visit(*function); }
+    }
+
+    /// Reject stale or fabricated inventory before touching configuration space.
+    pub fn enable_bus_mastering(&mut self, function: Function) -> Result<(), Error> {
+        if !self.initialized || !self.entries[..self.count].contains(&Some(function)) {
+            return Err(Error::InvalidConfigAddress);
+        }
+        let command = read16(self.config, function.address, COMMAND_STATUS);
+        write16(self.config, function.address, COMMAND_STATUS, command | COMMAND_MEMORY | COMMAND_BUS_MASTER);
+        Ok(())
+    }
+
     pub fn find_xhci(&self) -> Option<Function> {
         self.entries[..self.count]
             .iter()
@@ -376,7 +294,6 @@ fn configure_function(
         interrupt_pin,
         interrupt_line,
         bars,
-        config,
     })
 }
 
@@ -535,6 +452,26 @@ mod tests {
         io: vibeos_hal::AddressRange::new(0x0300_0000, 0x0301_0000),
         intx_first_irq: 32,
     };
+
+    #[test]
+    fn bus_mastering_requires_inventory_and_preserves_command_status() {
+        let mut registers = alloc::vec![0u32; (1 << 20) / 4];
+        let start = registers.as_mut_ptr() as usize;
+        let mut pci = Pci::new(PciConfig { ecam: vibeos_hal::AddressRange::new(start, start + (1 << 20)), ..CONFIG });
+        let function = Function { address: Address { bus:0,device:0,function:0 },vendor_id:0x1234,device_id:0x5678,
+            class:0x0c,subclass:3,programming_interface:0x30,revision:0,header_type:0,interrupt_pin:1,
+            interrupt_line:Some(32),bars:[Bar::None;6] };
+        registers[1]=0xabcd0001;
+        assert_eq!(pci.enable_bus_mastering(function),Err(Error::InvalidConfigAddress));
+        assert_eq!(registers[1],0xabcd0001);
+        pci.entries[0]=Some(function);pci.count=1;pci.initialized=true;
+        let forged=Function { vendor_id:0xffff,..function };
+        assert_eq!(pci.enable_bus_mastering(forged),Err(Error::InvalidConfigAddress));
+        assert_eq!(registers[1],0xabcd0001);
+        pci.enable_bus_mastering(function).unwrap();assert_eq!(registers[1],0xabcd0007);
+        let mut observed=alloc::vec::Vec::new();pci.visit_functions(&mut |entry|observed.push(entry));
+        assert_eq!(observed,[function]);assert!(function.is_xhci());assert_eq!(function.class_code(),0x0c0330);
+    }
 
     #[test]
     fn computes_ecam_addresses() {

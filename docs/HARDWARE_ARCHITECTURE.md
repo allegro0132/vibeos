@@ -159,3 +159,9 @@ BootPlatform provides boot-only platform initialization and reporting callbacks,
 invoked after MMIO mapping and before SMP/services. Board-specific LED setup and
 its diagnostic formatting now belong to Duo firmware. The kernel has no LED
 hardware dependency or board-selection branch for that startup operation.
+
+PCI host enumeration and BAR allocation are now firmware-owned. HAL function
+snapshots describe resources without embedding ECAM access. Kernel callers
+serialize host operations and request bus-master activation through the host,
+which validates membership in its current inventory before writing configuration
+space. USB controller ownership is a subsequent boundary migration.

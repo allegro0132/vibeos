@@ -286,3 +286,20 @@ Host tests execute the actual Duo hook helpers against plain-memory register
 apertures, checking GPIO/mux preservation and the distinction between asserted
 output and unconfirmed input. Mutating that distinction fails the diagnostic
 regression. These tests do not prove electrical LED behavior on a physical board.
+
+### PCI host composition stage
+
+QEMU firmware owns the ECAM host, BAR allocator and enumerated inventory. HAL
+contains immutable function/BAR records and the host operation table. The kernel
+retains serialization and collects inventory into its own caller-facing vector;
+firmware enumeration callbacks do not allocate or retain callback references.
+Enabling bus mastering now goes through the host operation after checking the
+complete function against the current initialized inventory. The snapshot itself
+contains no configuration-space mapping or hardware access method.
+
+Host tests check that absent or forged inventory cannot modify the command
+register and that valid activation preserves status and unrelated command bits.
+Removing the inventory check fails the regression. QEMU USB acceptance exercises
+PCI BAR/INTx, XHCI, HID input/hotplug and BOT/SCSI backing I/O. The kernel no longer
+depends on the PCI driver. USB controllers and shared VirtIO helpers remain to
+be migrated; no Mars PCIe support is implied or included in this port's scope.

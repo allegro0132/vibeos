@@ -55,3 +55,4 @@ vibeos-driver-sdhci-blk = { path = "../../drivers/sdhci-blk" }
 vibeos-platform-cv1800b = { path = "../../platform/cv1800b" }
 vibeos-driver-dwmac-net = { path = "../../drivers/dwmac-net" }
 vibeos-driver-milkv-duo-led = { path = "../../drivers/milkv-duo-led" }
+vibeos-driver-dwc2-host = { path = "../../drivers/dwc2-host" }

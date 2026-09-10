@@ -1749,6 +1749,7 @@ name = "vibeos-firmware-milkv-duo"
 version = "0.1.0"
 dependencies = [
  "vibeos-bsp-milkv-duo",
+ "vibeos-driver-dwc2-host",
  "vibeos-driver-dwmac-net",
  "vibeos-driver-milkv-duo-led",
  "vibeos-driver-plic",
@@ -1822,7 +1823,6 @@ dependencies = [
  "vibeos-component-loader",
  "vibeos-component-runtime",
  "vibeos-core",
- "vibeos-driver-dwc2-host",
  "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
  "vibeos-durable-format",

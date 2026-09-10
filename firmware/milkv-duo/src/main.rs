@@ -28,3 +28,5 @@ mod network;
 
 mod platform;
 use platform::{platform_init, platform_report};
+
+mod usb;

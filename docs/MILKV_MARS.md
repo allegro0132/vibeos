@@ -321,3 +321,22 @@ with failed registration and failed enable, then successful retry, sector I/O,
 HID injection and wakeup. Removing IRQ masking fails the regression. QEMU USB
 acceptance covers the real XHCI/HID/hotplug/BOT path; ELF inspection verifies the
 moved DMA slab's section and page alignment. This does not add Mars USB support.
+
+### Duo polling USB composition stage
+
+The Duo firmware owns DWC2, its instance claim and its permanent DMA slab.
+The kernel consumes the HAL polling USB table for HID, BOT storage and CDC-ECM,
+retaining the same hotplug configuration order, polling intervals, terminal
+injection and network-session policy. Descriptor/input bounds are represented
+in HAL without register-access methods. Existing driver type imports remain
+compatible through re-exports. The Duo kernel's normal dependency graph no
+longer includes BSP or concrete drivers; QEMU's shared VirtIO transport/types
+and the remaining SoC-resource split still need migration.
+
+Host tests exercise the actual kernel adapter: failed initialization followed
+by retry, idempotent publication, class configuration order, HID injection,
+sector I/O and network error propagation. Removing the idempotence guard fails
+the regression. The Duo release image retains the USB slab in `.dma`; QEMU
+selftest passes 390 checks. These are composition checks, not physical Duo USB
+or Mars validation. Mars firmware, GMAC5, boot firmware, the flashable SD image
+and the planned physical acceptance remain outstanding.

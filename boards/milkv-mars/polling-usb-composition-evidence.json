@@ -1,0 +1,58 @@
+{
+  "status": "Duo polling USB firmware composition verified; Mars incomplete",
+  "host_tests": 24,
+  "qemu_selftests": 390,
+  "target_checks": [
+    "Duo release build",
+    "USB DMA linked within .dma",
+    "Duo kernel normal dependency graph excludes BSP and concrete drivers"
+  ],
+  "dma_layout": {
+    "elf": "target/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo",
+    "sha256": "e58f1eb7b9b20c2bb9d76d3a5492458fb59df1d3d134d84e2f3baa7803b798f6",
+    "dma_section": [
+      "0x805de000",
+      "0x805f8000"
+    ],
+    "usb_dma": {
+      "symbol": "vibeos_milkv_duo::usb::DMA",
+      "address": "0x805de000",
+      "bytes": 2048,
+      "aligned_64": true
+    }
+  },
+  "mutation": "Removing kernel initialization idempotence guard fails actual adapter test (3 initializations instead of 2); source restored and tests pass",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage12-host-final.log",
+      "sha256": "4d5e0b2f0c6a6837e68176097fbe8f18f00178bfb1d4c3850321b28d9e8a7599"
+    },
+    {
+      "path": "target/mars-reference/stage12-mutation.log",
+      "sha256": "4155a55efce2c40c66b6ea65e2509a2513361a185f12652ee435d6eefb229b40"
+    },
+    {
+      "path": "target/mars-reference/stage12-qemu-selftest.log",
+      "sha256": "1b29a812d68d949adee26124f2dffc0a0746fbc9190732dbfa09cda4b8ab8397"
+    },
+    {
+      "path": "target/mars-reference/stage12-duo-build.log",
+      "sha256": "f1210e7ced9afd898faab785bc9d70f589bc4ad092203dfd86b17c6fd9d94dd7"
+    },
+    {
+      "path": "target/mars-reference/stage12-duo-dependencies.log",
+      "sha256": "95a6effd808d03a22bd34a12439eac7443d9dd0276dcf620aef397e4949dac3d"
+    },
+    {
+      "path": "target/mars-reference/stage12-dma-layout.json",
+      "sha256": "6ae532ad9ccc9d8c42f60a5913dcac740735c224334fb8d4ebc4e60de4a493ae"
+    }
+  ],
+  "hardware_acceptance": "not run",
+  "remaining": [
+    "QEMU shared VirtIO transport/types and remaining SoC-resource split",
+    "JH7110 platform, Mars firmware and DW-MSHC/GMAC5 integration",
+    "Boot firmware and flashable SD image",
+    "Physical serial/SSH, entropy qualification and stability acceptance"
+  ]
+}

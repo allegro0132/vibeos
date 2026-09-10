@@ -44,7 +44,7 @@ milkv-command = ["milkv-ssh", "ssh-commands"]
 ssh-commands = []
 default = ["qemu-virt", "qemu-default-image"]
 qemu-virt = ["dep:vibeos-driver-virtio-core", "dep:vibeos-driver-virtio-mmio", "vibeos-vsh/pci-usb-help"]
-milkv-duo = ["dep:vibeos-driver-dwc2-host"]
+milkv-duo = []
 qemu-default-image = ["vibeos-image-policy/qemu-default"]
 milkv-duo-sd-image = ["vibeos-image-policy/milkv-duo-sd"]
 legacy-shell = []
@@ -541,7 +541,6 @@ vibeos-component-loader = { path = "../services/component-loader", optional = tr
 vibeos-component-runtime = { path = "../component-runtime", optional = true }
 vibeos-core = { path = "../core" }
 vibeos-durable-format = { path = "../durable-format" }
-vibeos-driver-dwc2-host = { path = "../drivers/dwc2-host", optional = true }
 vibeos-driver-virtio-core = { path = "../drivers/virtio-core", optional = true }
 vibeos-driver-virtio-mmio = { path = "../drivers/virtio-mmio", optional = true }
 vibeos-hal = { path = "../hal" }

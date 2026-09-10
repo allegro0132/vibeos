@@ -729,7 +729,7 @@ fn vsh_milkv_usb(args: &[String]) -> Result<String, Status> {
         if args.len() != 1 {
             return Err(Status::Usage);
         }
-        let mut frame = [0; vibeos_driver_dwc2_host::MAX_ETHERNET_FRAME_BYTES];
+        let mut frame = [0; vibeos_hal::usb_polling::MAX_ETHERNET_FRAME_BYTES];
         for _ in 0..100 {
             match crate::dwc2_host::receive_cdc_ecm(&mut frame) {
                 Ok(length) => {
@@ -743,7 +743,7 @@ fn vsh_milkv_usb(args: &[String]) -> Result<String, Status> {
                     }
                     return Ok(output);
                 }
-                Err(vibeos_driver_dwc2_host::Error::Nak) => {}
+                Err(vibeos_hal::usb_polling::Error::Nak) => {}
                 Err(_) => return Err(Status::Unavailable),
             }
         }

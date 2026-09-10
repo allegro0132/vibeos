@@ -1,37 +1,70 @@
-//! Kernel composition for the fixed CV1800B DWC2 host controller.
+//! Kernel policy for the firmware-owned polling USB host.
 
 use crate::{println, sync::SpinLock};
-use vibeos_driver_dwc2_host::{
-    CdcEcmInfo, ConfigurationInfo, Controller, DeviceInfo, DmaStorage, Error, HidKeyboardInfo,
-    HidReportDescriptor, HubChildInfo, HubInfo, Info, InstanceState, MassStorageInfo, Telemetry,
-    UsbBusPath, MAX_DEVICE_CONFIGURATIONS, MAX_HUB_CHILDREN,
-};
-
+use vibeos_hal::usb_polling::*;
+pub use vibeos_hal::usb_polling::Snapshot;
 static CONTROLLER: SpinLock<Option<Controller>> = SpinLock::new(None);
-#[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
-static DMA: DmaStorage = DmaStorage::new();
-static INSTANCE: InstanceState = InstanceState::new();
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Snapshot {
-    pub info: Info,
-    pub connected: bool,
-    pub device: Option<DeviceInfo>,
-    pub child: Option<DeviceInfo>,
-    pub children: [Option<HubChildInfo>; MAX_HUB_CHILDREN],
-    pub hub: Option<HubInfo>,
-    pub hubs: [Option<HubInfo>; MAX_HUB_CHILDREN],
-    pub configuration: Option<ConfigurationInfo>,
-    pub configurations: [Option<ConfigurationInfo>; MAX_DEVICE_CONFIGURATIONS],
-    pub configuration_device_address: Option<u8>,
-    pub report_descriptor: Option<HidReportDescriptor>,
-    pub keyboard: Option<HidKeyboardInfo>,
-    pub keyboard_device_address: Option<u8>,
-    pub mass_storage: Option<MassStorageInfo>,
-    pub storage_device_address: Option<u8>,
-    pub cdc_ecm: Option<CdcEcmInfo>,
-    pub cdc_ecm_device_address: Option<u8>,
-    pub telemetry: Telemetry,
+// This token is published only after successful initialization. All methods
+// require the CONTROLLER lock, serializing firmware access across services.
+struct Controller;
+impl Controller {
+    fn connected(&self) -> bool {
+        unsafe { (host().connected)() }
+    }
+    fn info(&self) -> Info {
+        unsafe { (host().info)() }
+    }
+    fn network_bus_path(&self) -> Option<UsbBusPath> {
+        unsafe { (host().network_bus_path)() }
+    }
+    fn snapshot(&self) -> Snapshot {
+        unsafe { (host().snapshot)() }
+    }
+    fn device(&self) -> Option<DeviceInfo> {
+        unsafe { (host().device)() }
+    }
+    fn keyboard(&self) -> Option<HidKeyboardInfo> {
+        unsafe { (host().keyboard)() }
+    }
+    fn telemetry(&self) -> Telemetry {
+        unsafe { (host().telemetry)() }
+    }
+    fn enumerate_device(&mut self) -> Result<Option<DeviceInfo>, Error> {
+        unsafe { (host().enumerate_device)() }
+    }
+    fn configure_hid_keyboard(&mut self) -> Result<Option<HidKeyboardInfo>, Error> {
+        unsafe { (host().configure_hid_keyboard)() }
+    }
+    fn configure_mass_storage(&mut self) -> Result<Option<MassStorageInfo>, Error> {
+        unsafe { (host().configure_mass_storage)() }
+    }
+    fn switch_rtl8151_install_mode(&mut self) -> Result<bool, Error> {
+        unsafe { (host().switch_rtl8151_install_mode)() }
+    }
+    fn configure_cdc_ecm(&mut self) -> Result<Option<CdcEcmInfo>, Error> {
+        unsafe { (host().configure_cdc_ecm)() }
+    }
+    fn receive_cdc_ecm(&mut self, output: &mut [u8]) -> Result<usize, Error> {
+        unsafe { (host().receive_cdc_ecm)(output) }
+    }
+    fn transmit_cdc_ecm(&mut self, frame: &[u8]) -> Result<(), Error> {
+        unsafe { (host().transmit_cdc_ecm)(frame) }
+    }
+    fn poll_cdc_ecm_carrier(&mut self) -> Result<CdcCarrierStatus, Error> {
+        unsafe { (host().poll_cdc_ecm_carrier)() }
+    }
+    fn read_sector(&mut self, sector: u64) -> Result<[u8; 512], Error> {
+        unsafe { (host().read_sector)(sector) }
+    }
+    fn write_sector(&mut self, sector: u64, bytes: &[u8; 512]) -> Result<(), Error> {
+        unsafe { (host().write_sector)(sector, bytes) }
+    }
+    fn hub_topology_changed(&mut self) -> Result<bool, Error> {
+        unsafe { (host().hub_topology_changed)() }
+    }
+    fn poll_keyboard(&mut self) -> Result<HidInputBatch, Error> {
+        unsafe { (host().poll_keyboard)() }
+    }
 }
 
 pub fn init() -> Result<Info, Error> {
@@ -39,17 +72,8 @@ pub fn init() -> Result<Info, Error> {
     if let Some(controller) = published.as_ref() {
         return Ok(controller.info());
     }
-    // Safety: the Milk-V BSP maps and exclusively assigns the fixed USB core,
-    // PHY and TOP control ranges to this adapter for the kernel lifetime.
-    let controller = unsafe {
-        Controller::initialize(
-            crate::platform::dwc2(),
-            &DMA,
-            &INSTANCE,
-            crate::platform::timebase_hz(),
-            crate::sbi::time,
-        )
-    }?;
+    unsafe { (host().initialize)(crate::platform::timebase_hz(), crate::sbi::time) }?;
+    let controller = Controller;
     let info = controller.info();
     *published = Some(controller);
     Ok(info)
@@ -74,26 +98,7 @@ pub fn network_bus_path() -> Option<UsbBusPath> {
 }
 
 pub fn snapshot() -> Option<Snapshot> {
-    CONTROLLER.lock().as_ref().map(|controller| Snapshot {
-        info: controller.info(),
-        connected: controller.connected(),
-        device: controller.device(),
-        child: controller.child(),
-        children: controller.children(),
-        hub: controller.hub(),
-        hubs: controller.hubs(),
-        configuration: controller.configuration(),
-        configurations: controller.configurations(),
-        configuration_device_address: controller.configuration_device_address(),
-        report_descriptor: controller.report_descriptor(),
-        keyboard: controller.keyboard(),
-        keyboard_device_address: controller.keyboard_device_address(),
-        mass_storage: controller.mass_storage(),
-        storage_device_address: controller.storage_device_address(),
-        cdc_ecm: controller.cdc_ecm(),
-        cdc_ecm_device_address: controller.cdc_ecm_device_address(),
-        telemetry: controller.telemetry(),
-    })
+    CONTROLLER.lock().as_ref().map(Controller::snapshot)
 }
 
 pub fn enumerate_device() -> Result<Option<DeviceInfo>, Error> {
@@ -152,7 +157,7 @@ pub fn transmit_cdc_ecm(frame: &[u8]) -> Result<(), Error> {
         .transmit_cdc_ecm(frame)
 }
 
-pub fn poll_cdc_ecm_carrier() -> Result<vibeos_driver_dwc2_host::CdcCarrierStatus, Error> {
+pub fn poll_cdc_ecm_carrier() -> Result<vibeos_hal::usb_polling::CdcCarrierStatus, Error> {
     CONTROLLER
         .lock()
         .as_mut()

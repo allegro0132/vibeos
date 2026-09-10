@@ -171,3 +171,12 @@ resource admission, locking, IRQ registration and TTY injection. A failed IRQ
 route is masked and remains unpublished; firmware retains its controller for a
 same-resource retry, preventing a second live mutable DMA borrow. The IRQ token
 contains only live MMIO context and bypasses controller-state borrowing.
+
+Duo's polling USB host is now composed by firmware. HAL `usb_polling::Host`
+provides serialized operations and bounded descriptor/HID snapshots; the kernel
+keeps initialization publication, hotplug/class-selection policy, TTY delivery,
+and CDC network sessions. Firmware owns DWC2's controller, instance claim and
+permanent `.dma` storage. Failed initialization leaves no published kernel token;
+successful initialization is idempotent. The Duo kernel production dependency
+graph now contains no BSP or concrete driver crate. CV1800B USB clock/PHY access
+still lives in the DWC2 implementation and needs the later SoC-resource split.

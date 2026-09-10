@@ -426,8 +426,8 @@ fn driver_turn(
                 control.carrier_up = carrier_up;
             }
             Ok(_) => {}
-            Err(vibeos_driver_dwc2_host::Error::NoDevice) => return Err(NetError::Offline),
-            Err(vibeos_driver_dwc2_host::Error::InvalidDescriptor)
+            Err(vibeos_hal::usb_polling::Error::NoDevice) => return Err(NetError::Offline),
+            Err(vibeos_hal::usb_polling::Error::InvalidDescriptor)
                 if ecm.status_endpoint.is_none() => {}
             Err(_) => return Err(NetError::DriverFault),
         }
@@ -455,12 +455,12 @@ fn driver_turn(
                 control.tx_inflight = false;
                 device.tx_packets.fetch_add(1, Ordering::Relaxed);
             }
-            Err(vibeos_driver_dwc2_host::Error::Nak) if now < *tx_deadline => {}
-            Err(vibeos_driver_dwc2_host::Error::Nak) => {
+            Err(vibeos_hal::usb_polling::Error::Nak) if now < *tx_deadline => {}
+            Err(vibeos_hal::usb_polling::Error::Nak) => {
                 device.timeouts.fetch_add(1, Ordering::Relaxed);
                 return Err(NetError::TimedOut);
             }
-            Err(vibeos_driver_dwc2_host::Error::NoDevice) => return Err(NetError::Offline),
+            Err(vibeos_hal::usb_polling::Error::NoDevice) => return Err(NetError::Offline),
             Err(_) => return Err(NetError::DriverFault),
         }
     }
@@ -474,9 +474,9 @@ fn driver_turn(
             }
         }
         Err(
-            vibeos_driver_dwc2_host::Error::Nak | vibeos_driver_dwc2_host::Error::TransferTimedOut,
+            vibeos_hal::usb_polling::Error::Nak | vibeos_hal::usb_polling::Error::TransferTimedOut,
         ) => {}
-        Err(vibeos_driver_dwc2_host::Error::NoDevice) => return Err(NetError::Offline),
+        Err(vibeos_hal::usb_polling::Error::NoDevice) => return Err(NetError::Offline),
         Err(_) => return Err(NetError::DriverFault),
     }
     Ok(())

@@ -93,12 +93,10 @@ const HOST_MODE_TIMEOUT_MS: u64 = 110;
 const TRANSFER_TIMEOUT_MS: u64 = 250;
 const CDC_RX_POLL_TIMEOUT_MS: u64 = 2;
 const DMA_BYTES: usize = 2_048;
-pub const MAX_ETHERNET_FRAME_BYTES: usize = 1_536;
 const MAX_NAK_RETRIES: usize = 32;
 const MAX_COMPLETE_SPLIT_RETRIES: usize = 16;
 const HID_REPORT_BYTES: usize = 8;
 const APPLE_NKRO_REPORT_BYTES: usize = 15;
-const HID_INPUT_BYTES: usize = 18;
 const DWC2_CORE_REVISION_4_20A: u16 = 0x420a;
 const USB_CLASS_HUB: u8 = 9;
 const USB_CLASS_MASS_STORAGE: u8 = 8;
@@ -165,191 +163,15 @@ impl Default for InstanceState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error {
-    Busy,
-    InvalidDescription,
-    CoreNotFound(u32),
-    AhbIdleTimedOut,
-    CoreResetTimedOut,
-    HostModeTimedOut,
-    UnsupportedDma(u8),
-    DmaAddressTooWide,
-    NoDevice,
-    PortResetTimedOut,
-    BufferTooSmall,
-    InvalidDescriptor,
-    TransferTimedOut,
-    TransferFailed(u32),
-    Stalled,
-    Nak,
-    StorageProtocol,
-    StorageCommandFailed(u8),
-    StorageCswSignature(u32),
-    StorageCswTag(u32),
-    StorageCswResidue(u32),
-    StorageBlockSize(u32),
-    StorageCbwLength(usize),
-    TransferLength { expected: usize, actual: usize },
-    StorageDataLength { expected: usize, actual: usize },
-    StorageCswLength(usize),
-    StorageCapacityTooLarge,
-    StorageOutOfRange,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Speed {
-    High,
-    Full,
-    Low,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DeviceInfo {
-    pub address: u8,
-    pub speed: Speed,
-    pub usb_version: u16,
-    pub device_class: u8,
-    pub vendor_id: u16,
-    pub product_id: u16,
-    pub max_packet_size_0: u8,
-    pub configuration_count: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HidKeyboardInfo {
-    pub interface: u8,
-    pub endpoint_in: u8,
-    pub max_packet_size: u16,
-    pub interval_ms: u16,
-    pub protocol: HidKeyboardProtocol,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HidKeyboardProtocol {
-    Boot,
-    Report,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MassStorageInfo {
-    pub configuration: u8,
-    pub interface: u8,
-    pub endpoint_in: u8,
-    pub endpoint_out: u8,
-    pub max_packet_size_in: u16,
-    pub max_packet_size_out: u16,
-    pub capacity_sectors: Option<u64>,
-    pub block_size: Option<u32>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CdcEcmInfo {
-    pub configuration: u8,
-    pub control_interface: u8,
-    pub data_interface: u8,
-    pub data_alternate: u8,
-    pub endpoint_in: u8,
-    pub endpoint_out: u8,
-    pub max_packet_size_in: u16,
-    pub max_packet_size_out: u16,
-    pub status_endpoint: Option<u8>,
-    pub status_max_packet_size: u16,
-    pub status_interval_ms: u16,
-    pub mac_string_index: u8,
-    pub mac_address: Option<[u8; 6]>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CdcCarrierStatus {
-    pub link_up: Option<bool>,
-    pub rtl815x_phystatus: Option<u16>,
-}
-
-pub const MAX_CONFIGURATION_INTERFACES: usize = 8;
-pub const MAX_INTERFACE_ENDPOINTS: usize = 8;
-pub const MAX_DEVICE_CONFIGURATIONS: usize = 8;
-pub const MAX_HID_REPORT_DESCRIPTOR_BYTES: usize = 256;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InterfaceInfo {
-    pub number: u8,
-    pub alternate: u8,
-    pub class: u8,
-    pub subclass: u8,
-    pub protocol: u8,
-    pub hid_report_length: u16,
-    pub interrupt_in: Option<u8>,
-    pub max_packet_size: u16,
-    pub interval: u8,
-    pub bulk_in: Option<u8>,
-    pub bulk_out: Option<u8>,
-    pub bulk_in_max_packet_size: u16,
-    pub bulk_out_max_packet_size: u16,
-    pub cdc_mac_string_index: Option<u8>,
-    pub endpoints: [Option<EndpointInfo>; MAX_INTERFACE_ENDPOINTS],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EndpointInfo {
-    pub address: u8,
-    pub attributes: u8,
-    pub max_packet_size: u16,
-    pub interval: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HidReportDescriptor {
-    pub interface: u8,
-    pub declared_length: u16,
-    bytes: [u8; MAX_HID_REPORT_DESCRIPTOR_BYTES],
-    length: usize,
-}
-
-impl HidReportDescriptor {
-    pub fn as_slice(&self) -> &[u8] {
-        &self.bytes[..self.length]
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConfigurationInfo {
-    pub value: u8,
-    pub total_length: u16,
-    pub declared_interfaces: u8,
-    pub interfaces: [Option<InterfaceInfo>; MAX_CONFIGURATION_INTERFACES],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HubInfo {
-    pub address: u8,
-    pub ports: u8,
-    pub active_port: Option<u8>,
-    pub child_speed: Option<Speed>,
-    pub port_status: u16,
-}
-
-pub const MAX_HUB_CHILDREN: usize = MAX_HUB_PORTS as usize;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HubChildInfo {
-    pub device: DeviceInfo,
-    pub parent_hub_address: u8,
-    pub port: u8,
-    pub port_status: u16,
-    pub depth: u8,
-    pub tt_hub_address: Option<u8>,
-    pub tt_port: Option<u8>,
-}
-
+pub use vibeos_hal::usb_polling::{
+    CdcCarrierStatus, CdcEcmInfo, ConfigurationInfo, DeviceInfo, EndpointInfo, Error,
+    HidInputBatch, HidKeyboardInfo, HidKeyboardProtocol, HidReportDescriptor, HubChildInfo,
+    HubInfo, Info, InterfaceInfo, MassStorageInfo, Speed, Telemetry, UsbBusPath,
+    MAX_CONFIGURATION_INTERFACES, MAX_DEVICE_CONFIGURATIONS, MAX_ETHERNET_FRAME_BYTES,
+    MAX_HID_REPORT_DESCRIPTOR_BYTES, MAX_HUB_CHILDREN, MAX_INTERFACE_ENDPOINTS,
+    MAX_USB_BUS_PATH_DEPTH,
+};
 const MAX_HUB_DEPTH: u8 = 4;
-pub const MAX_USB_BUS_PATH_DEPTH: usize = MAX_HUB_DEPTH as usize + 1;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct UsbBusPath {
-    pub ports: [u8; MAX_USB_BUS_PATH_DEPTH],
-    pub depth: u8,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SplitTarget {
@@ -369,32 +191,6 @@ struct TransferTarget {
 enum KeyboardLayout {
     Boot,
     AppleReport,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HidInputBatch {
-    bytes: [u8; HID_INPUT_BYTES],
-    length: usize,
-}
-
-impl HidInputBatch {
-    const fn new() -> Self {
-        Self {
-            bytes: [0; HID_INPUT_BYTES],
-            length: 0,
-        }
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.bytes[..self.length]
-    }
-
-    fn push(&mut self, byte: u8) {
-        if self.length < self.bytes.len() {
-            self.bytes[self.length] = byte;
-            self.length += 1;
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -422,28 +218,6 @@ impl SetupPacket {
             length[1],
         ]
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Info {
-    pub core_id: u32,
-    pub release: u16,
-    pub irq: u32,
-    pub host_channels: u8,
-    pub dynamic_fifo: bool,
-    pub dma_architecture: u8,
-    pub fifo_depth_words: u16,
-    pub dedicated_fifos: bool,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Telemetry {
-    pub clock_enable_1: u32,
-    pub clock_enable_2: u32,
-    pub role_override: u32,
-    pub gusbcfg: u32,
-    pub hprt0: u32,
-    pub phy_utmi_control: u32,
 }
 
 /// Exclusive ownership of the fixed CV1800B DWC2 host instance.
@@ -1366,12 +1140,12 @@ impl Controller {
                     },
                     &mut bytes[..requested],
                 )?;
-                self.report_descriptor = Some(HidReportDescriptor {
-                    interface: interface.number,
-                    declared_length: interface.hid_report_length,
+                self.report_descriptor = Some(HidReportDescriptor::new(
+                    interface.number,
+                    interface.hid_report_length,
                     bytes,
                     length,
-                });
+                )?);
                 if is_apple_report_keyboard_descriptor(&bytes[..length]) {
                     self.keyboard = Some(HidKeyboardInfo {
                         interface: interface.number,

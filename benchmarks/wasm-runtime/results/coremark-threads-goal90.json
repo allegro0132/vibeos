@@ -1,0 +1,146 @@
+[
+  {
+    "work": "target/coremark-threads/goal90/supervisor-full",
+    "platform": "vibeos",
+    "runner": "vibeos-wasmtime",
+    "fuel": "VibeOS async 10000-fuel quanta",
+    "revision": "8717c4c40e46f9ad964186849a749ecaa3cce674",
+    "kernel_sha256": "1bc44062f4ad91e7f01da33bf958ee5dcac23aa037d12537754807f6fceee8d3",
+    "runner_sha256": null,
+    "features": "wasi-benchmark,wasmtime-command-fuel-batch,wasmtime-threads",
+    "native_sha256": null,
+    "configuration": {
+      "cpu": "rv64",
+      "machine": "virt",
+      "memory": "1G",
+      "harts": 4,
+      "accel": "tcg,thread=multi",
+      "rtc": "base=utc,clock=vm",
+      "icount": null
+    },
+    "module_sha256": "3a6b9af26c55b962a79c5fd6a3e52f850b39d1ca373178a436379970a013017f",
+    "samples": 3,
+    "summary": [
+      {
+        "workers": 1,
+        "median_score": 2248.132944,
+        "min_score": 2228.186275,
+        "max_score": 2257.62392,
+        "speedup": 1.0,
+        "parallel_efficiency": 1.0
+      },
+      {
+        "workers": 2,
+        "median_score": 4526.904055,
+        "min_score": 4030.381753,
+        "max_score": 4535.202894,
+        "speedup": 2.0136282718874656,
+        "parallel_efficiency": 1.0068141359437328
+      },
+      {
+        "workers": 3,
+        "median_score": 7013.307788,
+        "min_score": 6916.960319,
+        "max_score": 7057.526966,
+        "speedup": 3.1196143478603817,
+        "parallel_efficiency": 1.039871449286794
+      }
+    ]
+  },
+  {
+    "work": "target/coremark-threads/goal90/supervisor-debian-fuel",
+    "platform": "debian",
+    "runner": "std-linux-threads",
+    "fuel": 100000000000,
+    "revision": "8717c4c40e46f9ad964186849a749ecaa3cce674",
+    "kernel_sha256": null,
+    "runner_sha256": "620ba4f21429681009ce528a96cef32fc3c6d7443facc96cebd47aabd96a3185",
+    "features": null,
+    "native_sha256": null,
+    "configuration": {
+      "cpu": "rv64",
+      "machine": "virt",
+      "memory": "1G",
+      "harts": 4,
+      "accel": "tcg,thread=multi",
+      "rtc": "base=utc,clock=vm",
+      "icount": null
+    },
+    "module_sha256": "3a6b9af26c55b962a79c5fd6a3e52f850b39d1ca373178a436379970a013017f",
+    "samples": 3,
+    "summary": [
+      {
+        "workers": 1,
+        "median_score": 2430.799118,
+        "min_score": 2291.476935,
+        "max_score": 2437.582267,
+        "speedup": 1.0,
+        "parallel_efficiency": 1.0
+      },
+      {
+        "workers": 2,
+        "median_score": 4691.718927,
+        "min_score": 4470.311471,
+        "max_score": 4766.807144,
+        "speedup": 1.9301138017773463,
+        "parallel_efficiency": 0.9650569008886731
+      },
+      {
+        "workers": 3,
+        "median_score": 6353.143765,
+        "min_score": 5850.45133,
+        "max_score": 6678.704048,
+        "speedup": 2.613602957955327,
+        "parallel_efficiency": 0.871200985985109
+      }
+    ]
+  },
+  {
+    "work": "target/coremark-threads/goal90/isolated-debian-fuel",
+    "platform": "debian",
+    "runner": "std-linux-threads",
+    "fuel": 100000000000,
+    "revision": "8717c4c40e46f9ad964186849a749ecaa3cce674",
+    "kernel_sha256": null,
+    "runner_sha256": "620ba4f21429681009ce528a96cef32fc3c6d7443facc96cebd47aabd96a3185",
+    "features": null,
+    "native_sha256": null,
+    "configuration": {
+      "cpu": "rv64",
+      "machine": "virt",
+      "memory": "1G",
+      "harts": 4,
+      "accel": "tcg,thread=multi",
+      "rtc": "base=utc,clock=vm",
+      "icount": null
+    },
+    "module_sha256": "3a6b9af26c55b962a79c5fd6a3e52f850b39d1ca373178a436379970a013017f",
+    "samples": 3,
+    "summary": [
+      {
+        "workers": 1,
+        "median_score": 2421.85168,
+        "min_score": 2416.255905,
+        "max_score": 2437.532373,
+        "speedup": 1.0,
+        "parallel_efficiency": 1.0
+      },
+      {
+        "workers": 2,
+        "median_score": 4891.325713,
+        "min_score": 4732.932933,
+        "max_score": 4908.590709,
+        "speedup": 2.0196636125132152,
+        "parallel_efficiency": 1.0098318062566076
+      },
+      {
+        "workers": 3,
+        "median_score": 7335.882533,
+        "min_score": 7284.260619,
+        "max_score": 7338.875854,
+        "speedup": 3.0290387283336853,
+        "parallel_efficiency": 1.0096795761112285
+      }
+    ]
+  }
+]

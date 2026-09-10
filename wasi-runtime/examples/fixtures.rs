@@ -3,6 +3,7 @@ fn main() {
     let out = std::env::args().nth(1).expect("output directory");
     std::fs::create_dir_all(&out).unwrap();
     let fixtures = [
+        ("stdio-pipes", include_str!("../../tests/wasi/stdio-pipes.wat")),
         (
             "loop",
             r#"(module (memory (export "memory") 1) (func (export "_start") (loop $l br $l)))"#,

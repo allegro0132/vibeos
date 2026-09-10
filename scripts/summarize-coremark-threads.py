@@ -56,7 +56,10 @@ def main():
             values = [r['score'] for r in rows if r['workers']==n and r['name'].startswith('performance')]
             summary.append(dict(workers=n, median_score=score, min_score=min(values), max_score=max(values),
                 speedup=score/medians[1], parallel_efficiency=score/medians[1]/n))
-        report.append(dict(work=str(work), platform=env['platform'], fuel=env.get('fuel', 'VibeOS async 10000-fuel quanta'),
+        report.append(dict(work=str(work), platform=env['platform'], runner=env.get('runner', 'vibeos-wasmtime'), fuel=env.get('fuel', 'VibeOS async 10000-fuel quanta'),
+            revision=env['revision'], kernel_sha256=env.get('kernel_sha256'),
+            runner_sha256=env.get('wasmtime_sha256'), features=env.get('features'),
+            native_sha256=measure.digest(work/'coremark-native') if env.get('runner') == 'native-pthreads' else None,
             configuration=env['configuration'], module_sha256=env['module_sha256'], samples=env['samples'], summary=summary))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2)+'\n')

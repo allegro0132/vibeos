@@ -11,6 +11,15 @@ fi
 set -- -icount shift=0,align=off,sleep=off
 memory=128M
 harts=4
+if [ "${WASI_PYTHON:-0}" = 1 ]; then
+  [ "${WASI_WASMTIME:-0}" != 1 ] && [ "${WASI_RV64_CACHE:-0}" != 1 ] && [ "${WASI_BENCHMARK:-0}" != 1 ] || {
+    echo 'WASI_PYTHON requires the interpreter profile, without benchmark/cache overrides' >&2; exit 2;
+  }
+  feature=python-wasi
+  memory=1G
+  harts=1
+  set -- -rtc base=utc,clock=vm
+fi
 if [ "${WASI_BENCHMARK:-0}" = 1 ]; then
   feature=wasi-benchmark
   if [ "${WASI_RV64_CACHE:-0}" = 1 ]; then

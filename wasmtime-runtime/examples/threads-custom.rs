@@ -62,7 +62,9 @@ impl Clock for HostClock {
     fn resolution(&mut self, id: u32) -> Result<u64, i32> { if id < 2 { Ok(1) } else { Err(52) } }
 }
 // Job-wide output budget shared by every thread's streams, as in the kernel.
-static OUTPUT_REMAINING: AtomicUsize = AtomicUsize::new(65536);
+#[path = "../../wasi-runtime/src/output_budget.rs"]
+mod output_budget;
+static OUTPUT: output_budget::OutputBudget = output_budget::OutputBudget::new(65536);
 struct HostStreams;
 impl Streams for HostStreams {
     fn read(&mut self, _cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<Result<usize, i32>> {
@@ -71,11 +73,10 @@ impl Streams for HostStreams {
     }
     fn write(&mut self, _cx: &mut Context<'_>, fd: u32, bytes: &[u8]) -> Poll<Result<usize, i32>> {
         use std::io::Write;
-        let result = if fd == 1 { std::io::stdout().write(bytes) } else { std::io::stderr().write(bytes) }.map_err(|_| 29);
-        if let Ok(n) = result { OUTPUT_REMAINING.fetch_sub(n, SeqCst); }
-        Poll::Ready(result)
+        Poll::Ready(if fd == 1 { std::io::stdout().write(bytes) } else { std::io::stderr().write(bytes) }.map_err(|_| 29))
     }
-    fn output_remaining(&self) -> usize { OUTPUT_REMAINING.load(SeqCst) }
+    fn reserve_output(&mut self, want: usize) -> usize { OUTPUT.reserve(want) }
+    fn release_output(&mut self, unused: usize) { OUTPUT.release(unused) }
 }
 struct Outcome { tid: i32, exit: Option<u32>, result: wasmtime::Result<()>, fuel: u64 }
 type Thread = (usize, Waker, Pin<Box<dyn Future<Output = Outcome>>>);
@@ -190,7 +191,7 @@ fn main() -> wasmtime::Result<()> {
         (None, None) => 0,
     };
     eprintln!("wasi_exit={exit} threads={} finished={finished} cancelled={cancelled} polls={polls} wakes={} sleeps={} fuel_used={fuel_used} output_remaining={}",
-        spawner.count.load(SeqCst) + 1, WAKES.load(SeqCst), SLEEPS.load(SeqCst), OUTPUT_REMAINING.load(SeqCst));
+        spawner.count.load(SeqCst) + 1, WAKES.load(SeqCst), SLEEPS.load(SeqCst), OUTPUT.remaining());
     drop(add);
     drop(run_thread);
     drop((spawner, linker, memory, module, engine));

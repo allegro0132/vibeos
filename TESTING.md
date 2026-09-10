@@ -6,6 +6,12 @@ real Rust/C standard-library fixtures, the pinned Wasmtime 48.0.0 oracle, and
 `scripts/test-wasi-qemu.py` for OpenSSH upload/execution and restart persistence.
 This gate is independent of the historical Component qualification campaigns.
 
+The opt-in [CPython/WASI workflow](docs/PYTHON_WASI.md#acceptance) adds the
+`python-wasi` profile tests and `scripts/test-python-wasi.py`: the same real
+CPython binary runs first in the host interpreter and then through QEMU/SSH.
+`stdio-pipes.wat` is shared by interpreter tests and the Wasmtime host runner;
+it rejects the old terminal metadata that caused Python stdin to enter a REPL.
+
 Four layers, cheapest first. Run them all before pushing.
 
 ```sh

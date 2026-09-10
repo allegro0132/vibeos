@@ -21,6 +21,12 @@ git -C "$source_dir" diff --quiet HEAD -- . || {
   exit 1
 }
 mkdir -p target/coremark-wasi
+set --
+suffix=
+if [ "${COREMARK_MONOTONIC:-0}" = 1 ]; then
+  set -- benchmarks/wasm-runtime/coremark-monotonic.c -Wl,--wrap=clock_gettime
+  suffix=-monotonic
+fi
 if [ "${COREMARK_THREADS:-0}" = 1 ]; then
   "$WASI_SDK_PATH/bin/clang" --target=wasm32-wasi-threads -pthread -O3 -msign-ext -mbulk-memory \
     -DMULTITHREAD=4 -DUSE_PTHREAD=1 -DITERATIONS=1 \
@@ -31,8 +37,8 @@ if [ "${COREMARK_THREADS:-0}" = 1 ]; then
     "$source_dir/core_util.c" "$source_dir/posix/core_portme.c" \
     -Wl,--max-memory=16777216 -Wl,--import-memory -Wl,--export-memory -Wl,--export=wasi_thread_start \
     -Wl,-z,stack-size=65536 -Wl,--strip-all \
-    -o target/coremark-wasi/coremark-threads.wasm
-  shasum -a 256 target/coremark-wasi/coremark-threads.wasm
+    "$@" -o "target/coremark-wasi/coremark-threads$suffix.wasm"
+  shasum -a 256 "target/coremark-wasi/coremark-threads$suffix.wasm"
   exit 0
 fi
 "$WASI_SDK_PATH/bin/clang" --target=wasm32-wasip1 -O3 -msign-ext -mbulk-memory \
@@ -42,5 +48,5 @@ fi
   "$source_dir/core_matrix.c" "$source_dir/core_state.c" \
   "$source_dir/core_util.c" "$source_dir/posix/core_portme.c" \
   -Wl,--max-memory=16777216 -Wl,-z,stack-size=65536 -Wl,--strip-all \
-  -o target/coremark-wasi/coremark.wasm
-shasum -a 256 target/coremark-wasi/coremark.wasm
+  "$@" -o "target/coremark-wasi/coremark$suffix.wasm"
+shasum -a 256 "target/coremark-wasi/coremark$suffix.wasm"

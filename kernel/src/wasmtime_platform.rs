@@ -56,45 +56,59 @@ extern "C" fn wasmtime_tls_get(slot: usize) -> *mut u8 { TLS[hart()][slot].load(
 #[no_mangle]
 extern "C" fn wasmtime_tls_set(slot: usize, ptr: *mut u8) { TLS[hart()][slot].store(ptr, Ordering::Relaxed); }
 // Wasmtime never holds these locks across a fiber suspension, so a holder is
-// always running on some hart and a bounded spin suffices. Guest threads of
-// one command may contend from several harts; exceeding the bound means an
-// invariant broke, and the panic becomes a recoverable task fault rather than
-// a silently hung hart.
-const SPIN_LIMIT: usize = 1 << 24;
+// always running on some hart. Guest threads of one command may contend from
+// several harts. The wait is bounded by wall time, not iterations: a holder
+// may legitimately zero up to 16 MiB and shoot down every hart's TLB under the
+// shared-memory write lock, which takes far longer under TCG than any
+// iteration count would suggest. A holder that faulted is detected through
+// its domain teardown instead; exceeding the time bound means an invariant
+// broke, and the panic becomes a recoverable task fault rather than a
+// silently hung hart.
+const SPIN_SECS: u64 = 60;
 const WRITER: usize = 1 << (usize::BITS - 1);
-fn spin(iterations: &mut usize) {
-    core::hint::spin_loop();
-    *iterations += 1;
-    // A sibling on another hart faulted: the holder will never run again, so
-    // fault this thread too and let the domain teardown collect it.
-    if *iterations % 4096 == 0 && crate::exec::current_domain_tearing_down() {
-        panic!("wasmtime sync hook abandoned by a torn-down guest thread");
+struct Spin { iterations: usize, started: u64 }
+impl Spin {
+    const fn new() -> Self { Self { iterations: 0, started: 0 } }
+    fn once(&mut self) {
+        core::hint::spin_loop();
+        self.iterations += 1;
+        if self.iterations % 4096 != 0 { return; }
+        // A sibling on another hart faulted: the holder will never run again, so
+        // fault this thread too and let the domain teardown collect it.
+        if crate::exec::current_domain_tearing_down() {
+            panic!("wasmtime sync hook abandoned by a torn-down guest thread");
+        }
+        let now = crate::sbi::time();
+        if self.started == 0 {
+            self.started = now.max(1);
+        } else if now.saturating_sub(self.started) > SPIN_SECS.saturating_mul(crate::exec::timebase_hz()) {
+            panic!("wasmtime sync hook exceeded its {SPIN_SECS} s wait bound");
+        }
     }
-    if *iterations > SPIN_LIMIT { panic!("wasmtime sync hook exceeded its spin bound"); }
 }
 unsafe fn lock(ptr: *mut usize) {
     let value = unsafe { AtomicUsize::from_ptr(ptr) };
-    let mut iterations = 0;
-    while value.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() { spin(&mut iterations); }
+    let mut spin = Spin::new();
+    while value.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() { spin.once(); }
 }
 unsafe fn unlock(ptr: *mut usize) { unsafe { AtomicUsize::from_ptr(ptr) }.store(0, Ordering::Release); }
 // Reader/writer word: bit 63 marks the writer, the low bits count readers.
 unsafe fn read(ptr: *mut usize) {
     let value = unsafe { AtomicUsize::from_ptr(ptr) };
-    let mut iterations = 0;
+    let mut spin = Spin::new();
     loop {
         let current = value.load(Ordering::Relaxed);
         if current & WRITER == 0
             && value.compare_exchange_weak(current, current + 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
         { return; }
-        spin(&mut iterations);
+        spin.once();
     }
 }
 unsafe fn read_release(ptr: *mut usize) { unsafe { AtomicUsize::from_ptr(ptr) }.fetch_sub(1, Ordering::Release); }
 unsafe fn write(ptr: *mut usize) {
     let value = unsafe { AtomicUsize::from_ptr(ptr) };
-    let mut iterations = 0;
-    while value.compare_exchange_weak(0, WRITER, Ordering::Acquire, Ordering::Relaxed).is_err() { spin(&mut iterations); }
+    let mut spin = Spin::new();
+    while value.compare_exchange_weak(0, WRITER, Ordering::Acquire, Ordering::Relaxed).is_err() { spin.once(); }
 }
 unsafe fn write_release(ptr: *mut usize) { unsafe { AtomicUsize::from_ptr(ptr) }.store(0, Ordering::Release); }
 macro_rules! sync_hook { ($name:ident, $f:ident) => { #[no_mangle] unsafe extern "C" fn $name(ptr: *mut usize) { unsafe { $f(ptr) }; } }; }

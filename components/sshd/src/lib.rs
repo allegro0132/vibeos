@@ -708,8 +708,10 @@ const IDLE_POLL_CEILING_MS: u64 = 10;
 const MAX_SSH_PROGRESS_PER_TURN: usize = 32;
 const MAX_WIRE_IO_PER_TURN: usize = 8;
 const MAX_CHANNEL_DISCARDS_PER_TURN: usize = 4;
-#[cfg(not(feature = "qualification-stream"))]
+#[cfg(not(any(feature = "qualification-stream", feature = "python-wasi")))]
 const MAX_WIRE_BYTES_PER_DIRECTION: usize = 512 * 1024;
+#[cfg(all(feature = "python-wasi", not(feature = "qualification-stream")))]
+const MAX_WIRE_BYTES_PER_DIRECTION: usize = 32 * 1024 * 1024;
 #[cfg(feature = "qualification-stream")]
 const MAX_WIRE_BYTES_PER_DIRECTION: usize = 64 * 1024 * 1024;
 const MAX_EXEC_OUTPUT_BYTES: usize = 64 * 1024;
@@ -7785,7 +7787,8 @@ async fn execute_wasi_with_network(
     let mut output_at = [0usize; 2];
     let started = monotonic_ms();
     loop {
-        if monotonic_ms().saturating_sub(started) > 120_000 {
+        let timeout = if cfg!(feature = "python-wasi") { 600_000 } else { 120_000 };
+        if monotonic_ms().saturating_sub(started) > timeout {
             return Err(ConnectionEnd::Reset("WASI exec timed out"));
         }
         validate_network_authority(space, control, bound_epoch, require_carrier)

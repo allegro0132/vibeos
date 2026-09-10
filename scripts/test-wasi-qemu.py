@@ -14,6 +14,8 @@ import sys
 import time
 
 ROOT=Path(__file__).resolve().parent.parent
+sys.path.insert(0,str(ROOT/'scripts'))
+import wasi_threads_cases
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
@@ -161,18 +163,15 @@ def main():
         if args.threads:
             # wasi-threads: sibling tasks on several harts share one memory.
             # Every terminal must still reclaim the whole arena.
-            for name,status,out in [('threads-atomics',0,b''),('threads-counter',0,b''),('threads-wait-timeout',0,b''),
-                    ('threads-exit',7,b''),('threads-spawn-cap',3,b''),('threads-grow',0,b''),
-                    ('threads-fault',125,b''),('threads-busy',124,b''),('threads-defined-shared',126,b''),('threads-no-start',126,b'')]:
+            for name,status in wasi_threads_cases.FIXTURES:
                 upload(name+'.wasm',(work/f'fixtures/{name}.wasm').read_bytes())
                 before=(work/'boot-1.log').stat().st_size
-                ssh(['wasm-run',name+'.wasm'],status=status,out=out)
+                ssh(['wasm-run',name+'.wasm'],status=status,out=b'')
                 wait_uart(b'reclaimed=true',before)
             pthreads=ROOT/'target/wasi-examples/c-threads.wasm'
             upload('c-threads.wasm',pthreads.read_bytes())
-            ssh(['wasm-run','c-threads.wasm'],out=b'sum=3000 cond=1\n')
-            ssh(['wasm-run','c-threads.wasm','exit'],status=7,out=b'')
-            ssh(['wasm-run','c-threads.wasm','spawnmany'],out=b'eagain=1 created=3\n')
+            for pargs,status,out in wasi_threads_cases.PTHREADS:
+                ssh(['wasm-run','c-threads.wasm',*pargs],status=status,out=out)
             text=(work/'boot-1.log').read_text(errors='replace')
             used=[int(m,16) for m in re.findall(r'harts_used=(0x[0-9a-f]+)',text)]
             assert used and max(bin(u).count('1') for u in used)>=2,('guest threads never ran on a second hart',used[-10:])

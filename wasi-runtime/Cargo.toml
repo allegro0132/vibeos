@@ -5,6 +5,8 @@ edition = "2021"
 publish = false
 
 [features]
+python-duo = ["python-wasi"]
+python-wasi = []
 instruction-profile = ["wasmi/instruction-profile"]
 rv64-cache = ["wasmi/rv64-cache"]
 

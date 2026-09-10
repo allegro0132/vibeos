@@ -10,8 +10,10 @@ controls, not benchmark scores. The Linux control instead uses
 `tools/coremark-engines/src/bin/wasmtime-threads.rs`: standard Wasmtime 48,
 official Preview 1, Linux OS threads and one Store per worker, with the same
 vendored RISC-V compiler correctness fixes as VibeOS (fs1 ABI and scalar inline
-copy). Both use the scalar RV64GC compiler target; Linux retains its normal
-virtual memory and signal traps.
+copy). Linux uses the scalar RV64GC compiler target and retains its normal
+virtual memory and signal traps. Current VibeOS command images also enable
+zba/zbb/zbc/zbs when advertised on every hart; this compiler-policy difference
+must accompany the comparison even though the QEMU CPU model is identical.
 The default matrix keeps four harts online and varies the workload through
 CoreMark's `M1`, `M2`, and `M3` arguments. These count **workers**; a separate
 main thread waits for their completion. VibeOS has four native fiber slots,
@@ -59,6 +61,16 @@ Repeat the Debian command with a fresh `--work` and `--debian-fuel` for the
 metered Linux control. `--harts 1` is a useful serial hardware control with the
 same worker counts. Each work directory is an evidence set and must be fresh.
 
+For the native Linux pthread baseline, use the same Debian image/kernel/initrd
+arguments with `--native-debian` and omit `--wasmtime`. The image must already
+contain GCC and libc development headers. The driver verifies the pinned, clean
+upstream CoreMark checkout, snapshots it, and builds it inside Debian with
+`-O3 -pthread -DMULTITHREAD=4 -DUSE_PTHREAD=1 -DITERATIONS=1`. It runs the same
+M1/M2/M3 matrix, calibration and validation as the Wasm controls. Compiler
+version, source hashes, build command and the native ELF are retained. This row
+compares native C to Wasm; its recorded module hash identifies the associated
+Wasm comparison workload, not the executable used for the native measurement.
+
 ## Interpretation and gates
 
 Calibration uses 1,000 iterations per worker and targets 20 seconds by default.
@@ -104,6 +116,40 @@ Raw stdout/stderr, command lines, module/kernel/image hashes, calibration,
 per-sample JSON and VibeOS thread/cleanup logs remain under `--work`.
 `summary.json` contains median throughput and scaling. Failed runs retain their
 logs and must not be included as valid performance samples.
+
+## Fuel policy ownership invariants
+
+The native command keeps checking cancellation, live caller authority and the
+executor continuation probe at each 10,000-fuel boundary. Its private stdio
+CSpace contains fresh root capabilities, exports no derivations, and is only
+revoked after main and all workers have joined. Its invariant slot checks are
+therefore performed at the enclosing poll and on stream reads/writes rather than repeated
+inside the same fiber poll. The SSH loader similarly owns fresh private roots:
+the read and execution lookups validate them before launch, and the immutable
+loader plus execution invocation lease remain owned by the authority closure.
+The vsh caller's revocable authority closure is still evaluated every quantum;
+session cancellation/denial also remains live at every boundary.
+
+Each job has one main Store and at most three worker Stores. Each receives its
+total fuel once, and thread slots transition FREE → RUNNING → DONE without
+reuse. This enforces the same four-budget aggregate ceiling without a shared
+atomic increment on every quantum. Worker counters occupy separate aligned
+storage, and a pinned worker records its hart once. The quantum, maximum batch
+of 32, compiler/memory checks, per-Store fuel and reclamation rules are unchanged.
+
+Worker placement prefers non-boot harts only when they can accommodate every
+worker slot. Thus four-hart commands use harts 1/2/3 for workers, while smaller
+or sparse topologies retain all available harts. This avoids competing with
+boot-hart housekeeping without reducing worker parallelism. The policy has
+exhaustive capacity tests and one/two-hart QEMU fallback checks. The threaded
+command's periodic SYSTEM reaper is also pinned to the boot hart: leaving it
+stealable allowed it to migrate onto a worker and reintroduce contention on
+every 10 ms supervision wakeup. Its timer and cancellation policy are unchanged.
+
+Fuel continuation counters may legitimately be zero when runnable peers force
+every boundary to yield, such as multiple workers on one hart. Thread and fuel
+statistics are emitted after all joins in the common retirement path, including
+short calls and cancellation, so those exits retain placement evidence too.
 
 Verify the retained stdout against the JSON (including per-worker CRC values,
 cleanup and identical Wasm/QEMU configuration) and combine successful runs with:

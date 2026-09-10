@@ -27,11 +27,11 @@ mod wasi_clock;
         feature = "tcp-echo",
         feature = "net-shell",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server",
+        feature = "dhcp-iperf3-server",
         feature = "ssh-security-test",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "milkv-jitterentropy-probe",
         feature = "milkv-jitterentropy-ssh-probe",
         feature = "component-graph-principals",
@@ -85,11 +85,11 @@ compile_error!("feature `wasm-c810-s5-simd-qemu-qualification` requires the QEMU
         feature = "tcp-echo",
         feature = "net-shell",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server",
+        feature = "dhcp-iperf3-server",
         feature = "ssh-security-test",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "component-graph-principals",
         feature = "component-durable-publication",
         feature = "ssh-component-command",
@@ -142,11 +142,11 @@ compile_error!(
         feature = "tcp-echo",
         feature = "net-shell",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server",
+        feature = "dhcp-iperf3-server",
         feature = "ssh-security-test",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "component-graph-principals",
         feature = "component-durable-publication",
         feature = "ssh-component-command",
@@ -184,11 +184,11 @@ compile_error!("feature `wasm-c88-f5-float-qemu-acceptance` requires the QEMU im
         feature = "tcp-echo",
         feature = "net-shell",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server",
+        feature = "dhcp-iperf3-server",
         feature = "ssh-security-test",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "component-graph-principals",
         feature = "component-durable-publication",
         feature = "ssh-component-command",
@@ -252,11 +252,11 @@ compile_error!(
         feature = "tcp-echo",
         feature = "net-shell",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server",
+        feature = "dhcp-iperf3-server",
         feature = "ssh-security-test",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "milkv-jitterentropy-probe",
         feature = "milkv-jitterentropy-ssh-probe",
         feature = "component-graph-principals",
@@ -630,12 +630,8 @@ compile_error!("C8.4 IRQ overlay cannot modify an exact-transcript QEMU acceptan
 
 #[cfg(all(feature = "tcp-echo", not(feature = "qemu-virt")))]
 compile_error!("feature `tcp-echo` is the QEMU-only N1 acceptance image");
-#[cfg(all(feature = "net-shell", not(feature = "milkv-duo")))]
-compile_error!("feature `net-shell` is the Milk-V Duo production IPv4 image");
 #[cfg(all(feature = "iperf3-server", not(feature = "qemu-virt")))]
 compile_error!("feature `iperf3-server` is the QEMU iperf3 server image");
-#[cfg(all(feature = "milkv-iperf3-server", not(feature = "milkv-duo")))]
-compile_error!("feature `milkv-iperf3-server` is the Milk-V Duo iperf3 server image");
 #[cfg(all(feature = "net-shell", feature = "tcp-echo"))]
 compile_error!("features `net-shell` and `tcp-echo` are mutually exclusive IPv4 images");
 #[cfg(all(
@@ -648,10 +644,10 @@ compile_error!("features `net-shell` and `tcp-echo` are mutually exclusive IPv4 
 ))]
 compile_error!("feature `iperf3-server` is an isolated QEMU network image");
 #[cfg(all(
-    feature = "milkv-iperf3-server",
+    feature = "dhcp-iperf3-server",
     any(
         feature = "net-shell",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "milkv-ssh-acceptance",
         feature = "milkv-jitterentropy-probe",
         feature = "milkv-jitterentropy-ssh-probe"
@@ -679,7 +675,7 @@ compile_error!("feature `wasm-c53-native-async-qemu-acceptance` requires the QEM
         feature = "ssh-security-test",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "provisioned-ssh"
     )
 ))]
 compile_error!(
@@ -943,12 +939,17 @@ compile_error!(
 compile_error!(
     "the C5.4c native revoke gate and standard formal-native SSH gate are isolated images"
 );
+// Provider qualification is distinct from enabling the reusable SSH service.
+#[cfg(all(feature = "jitter-entropy", not(feature = "milkv-duo")))]
+compile_error!("jitter-entropy is restricted to the existing Duo configuration");
+#[cfg(all(feature = "provisioned-ssh", not(any(feature = "qemu-virt", feature = "jitter-entropy"))))]
+compile_error!("provisioned-ssh requires an explicitly selected entropy provider");
+#[cfg(all(feature = "jitter-entropy", feature = "qemu-virt"))]
+compile_error!("select exactly one entropy provider");
 #[cfg(all(feature = "milkv-ssh-acceptance", not(feature = "milkv-duo")))]
 compile_error!("feature `milkv-ssh-acceptance` is the Milk-V Duo hardware acceptance image");
-#[cfg(all(feature = "milkv-ssh", not(feature = "milkv-duo")))]
-compile_error!("feature `milkv-ssh` is the Milk-V Duo production SSH image");
 #[cfg(all(
-    feature = "milkv-ssh",
+    feature = "provisioned-ssh",
     any(
         feature = "net-shell",
         feature = "milkv-ssh-acceptance",
@@ -993,7 +994,7 @@ compile_error!("feature `milkv-jitterentropy-probe` is an isolated UART qualific
 
 extern crate alloc;
 
-#[cfg(all(feature = "milkv-wasmtime", target_arch = "riscv64", not(target_feature = "d")))]
+#[cfg(all(feature = "provisioned-wasmtime", target_arch = "riscv64", not(target_feature = "d")))]
 compile_error!("Milk-V Wasmtime requires riscv64gc-unknown-none-elf; use build-milkv-duo.sh --wasmtime");
 
 // Portable kernel logic lives in `vibeos-core`; the bare SBI seam lives in the
@@ -1035,14 +1036,14 @@ mod component_instances;
 mod dev;
 #[path = "authority_store_platform.rs"]
 mod durable_cspace;
-#[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+#[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
 mod iperf3_platform;
 #[cfg(any(
     feature = "milkv-jitterentropy-probe",
     feature = "milkv-jitterentropy-ssh-probe"
 ))]
 mod jitterentropy_probe;
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "jitter-entropy")]
 mod jitterentropy_random;
 #[cfg(feature = "legacy-shell")]
 mod legacy_shell;
@@ -1054,9 +1055,9 @@ mod net_echo_platform;
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh",
+    feature = "provisioned-ssh",
     feature = "iperf3-server",
-    feature = "milkv-iperf3-server"
+    feature = "dhcp-iperf3-server"
 ))]
 mod netstack_platform;
 #[cfg(feature = "qemu-virt")]
@@ -1068,17 +1069,19 @@ mod rustc;
 mod saved_program;
 #[path = "selftest_platform.rs"]
 mod selftest;
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "provisioned-ssh")]
 mod ssh_key_format;
 #[cfg(any(
     feature = "ssh-security-test",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 mod ssh_platform;
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "provisioned-ssh")]
 mod ssh_provisioning;
+#[cfg(feature = "provisioned-ssh")]
+mod ssh_entropy;
 #[cfg(feature = "wasm-c84-profile-slot")]
 mod wasm_aot_profile_slot;
 #[cfg(any(
@@ -1104,7 +1107,7 @@ pub use vibeos_object_store as store;
     feature = "ssh-security-test",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 pub use vibeos_ssh_identity as ssh_security;
 mod block_device;
@@ -1902,9 +1905,9 @@ fn start_services(boot_time: u64) -> ! {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     world::start_ipv4_stack_supervisor();
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]

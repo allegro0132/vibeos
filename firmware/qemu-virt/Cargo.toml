@@ -5,6 +5,12 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+# Reusable services; this firmware selects the appropriate entropy provider.
+provisioned-ssh = ["vibeos-kernel/provisioned-ssh"]
+provisioned-command = ["provisioned-ssh", "vibeos-kernel/provisioned-command"]
+provisioned-wasmtime = ["provisioned-command", "vibeos-kernel/provisioned-wasmtime"]
+dhcp-iperf3-server = ["vibeos-kernel/dhcp-iperf3-server"]
+
 mmu-large-memory = ["legacy-shell", "vibeos-bsp-qemu-virt/mmu-large-memory", "vibeos-kernel/mmu-large-memory-test"]
 python-wasi = ["vibeos-kernel/python-wasi", "vibeos-bsp-qemu-virt/python-wasi"]
 wasmtime-command = ["vibeos-kernel/wasmtime-command"]

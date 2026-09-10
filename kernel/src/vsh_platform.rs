@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 use core::fmt::Write as _;
 
 use vibeos_core::cap::{Cap, Rights};
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "provisioned-ssh")]
 use vibeos_vsh::AsyncCommandSpec;
 use vibeos_vsh::{CommandSpec, InputEvent, Platform, Session, Status};
 
@@ -104,7 +104,7 @@ pub fn install_standard_commands(session: &mut Session) {
     vibeos_vsh::install_lsblk_command(session);
     #[cfg(feature = "file-tree")]
     vibeos_vsh::install_file_commands(session);
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(feature = "provisioned-ssh")]
     vibeos_vsh::install_async_commands(session, SSH_UART_MUTATION_COMMANDS);
 }
 
@@ -167,14 +167,14 @@ fn install_shared_commands(session: &mut Session) {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     vibeos_vsh::install_commands(session, NETWORK_COMMANDS);
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(feature = "provisioned-ssh")]
     vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(feature = "provisioned-ssh")]
     vibeos_vsh::install_async_commands(session, SSH_OBJECT_COMMANDS);
 }
 
@@ -182,26 +182,26 @@ fn install_shared_commands(session: &mut Session) {
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh",
+    feature = "provisioned-ssh",
     feature = "iperf3-server",
-    feature = "milkv-iperf3-server"
+    feature = "dhcp-iperf3-server"
 ))]
 pub fn install_remote_commands(session: &mut Session) {
     install_shared_commands(session);
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(feature = "provisioned-ssh")]
     vibeos_vsh::install_async_commands(session, SSH_REMOTE_MUTATION_COMMANDS);
 }
 
 /// The default password receives only the commands needed to replace itself
 /// with a client public key. It never receives the standard remote profile.
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "provisioned-ssh")]
 pub fn install_ssh_onboarding_commands(session: &mut Session) {
     vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
     vibeos_vsh::install_async_commands(session, SSH_OBJECT_COMMANDS);
     vibeos_vsh::install_async_commands(session, SSH_REMOTE_MUTATION_COMMANDS);
 }
 
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "provisioned-ssh")]
 const SSH_PROVISIONING_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "ssh-keygen",
@@ -217,17 +217,27 @@ const SSH_PROVISIONING_COMMANDS: &[CommandSpec] = &[
     },
 ];
 
-#[cfg(feature = "milkv-ssh")]
-const SSH_OBJECT_COMMANDS: &[AsyncCommandSpec] = &[AsyncCommandSpec {
-    name: "cat",
-    min_args: 1,
-    max_args: 1,
-    handler: crate::ssh_provisioning::vsh_keycat,
-}];
+#[cfg(feature = "provisioned-ssh")]
+const SSH_OBJECT_COMMANDS: &[AsyncCommandSpec] = &[
+    // Dedicated spelling remains usable when file-tree assigns capability-path
+    // semantics to `cat`; the handler still accepts only named SSH key objects.
+    AsyncCommandSpec {
+        name: "ssh-keycat",
+        min_args: 1,
+        max_args: 1,
+        handler: crate::ssh_provisioning::vsh_keycat,
+    },
+    AsyncCommandSpec {
+        name: "cat",
+        min_args: 1,
+        max_args: 1,
+        handler: crate::ssh_provisioning::vsh_keycat,
+    },
+];
 
 /// Physical UART may remove authorization state; SSH sessions may not reopen
 /// the globally known onboarding password.
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "provisioned-ssh")]
 const SSH_UART_MUTATION_COMMANDS: &[AsyncCommandSpec] = &[AsyncCommandSpec {
     name: "rm",
     min_args: 1,
@@ -235,7 +245,7 @@ const SSH_UART_MUTATION_COMMANDS: &[AsyncCommandSpec] = &[AsyncCommandSpec {
     handler: crate::ssh_provisioning::vsh_rm_uart,
 }];
 
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "provisioned-ssh")]
 const SSH_REMOTE_MUTATION_COMMANDS: &[AsyncCommandSpec] = &[AsyncCommandSpec {
     name: "rm",
     min_args: 1,
@@ -347,9 +357,9 @@ const MILKV_USB_COMMANDS: &[CommandSpec] = &[
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh",
+    feature = "provisioned-ssh",
     feature = "iperf3-server",
-    feature = "milkv-iperf3-server"
+    feature = "dhcp-iperf3-server"
 ))]
 const NETWORK_COMMANDS: &[CommandSpec] = &[
     CommandSpec {

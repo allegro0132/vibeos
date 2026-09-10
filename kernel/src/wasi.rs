@@ -618,12 +618,12 @@ pub fn permitted(
     profile: vibeos_sshd::AuthorizedProfile,
     request: &vibeos_wasi_command::Request,
 ) -> bool {
-    #[cfg(feature = "milkv-command")]
+    #[cfg(feature = "provisioned-command")]
     let admitted = crate::ssh_provisioning::command_profile_current(profile);
-    #[cfg(not(feature = "milkv-command"))]
+    #[cfg(not(feature = "provisioned-command"))]
     let admitted = profile.profile.get() == 1 && profile.generation == 1;
     admitted && match request {
-        vibeos_wasi_command::Request::Upload { .. } => cfg!(any(feature = "wasi-ssh-upload", feature = "milkv-command")),
+        vibeos_wasi_command::Request::Upload { .. } => cfg!(any(feature = "wasi-ssh-upload", feature = "provisioned-command")),
         vibeos_wasi_command::Request::Run { .. } => true,
     }
 }
@@ -732,7 +732,7 @@ pub fn open(
                         // the granted execution right; session denial and
                         // disconnect still revoke CommandIo at every boundary.
                         let _keep_loader_alive = &loader;
-                        #[cfg(feature = "milkv-command")]
+                        #[cfg(feature = "provisioned-command")]
                         if !crate::ssh_provisioning::command_profile_current(profile) {
                             return false;
                         }

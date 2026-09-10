@@ -220,3 +220,18 @@ before releasing the instance claim. Failed platform preparation never accesses
 the USB core. Successful initialization retains the platform resources.
 The shared C906 DMA implementation preserves USB input invalidation and output
 cleaning, and remains outside all controller crates.
+
+Provisioned SSH, WASI commands, Wasmtime commands and DHCP iperf3 now have
+board-neutral kernel service features: `provisioned-ssh`, `provisioned-command`,
+`provisioned-wasmtime` and `dhcp-iperf3-server`. Existing `milkv-*` service names
+remain aliases. Service selection does not select entropy: Duo firmware binds
+its existing jitter collector explicitly, while QEMU uses the supervised VirtIO
+entropy queue. Missing or conflicting provider selections fail compilation.
+
+Key provisioning uses the selected entropy frontend asynchronously; a failed
+seed request clears its output. Client key generation keeps its update lock
+until entropy generation and persistence finish. `ssh-keycat` names the existing
+SSH key-object handler without conflicting with file-tree capability paths;
+the old `cat` registration remains for images without that path parser. Identity
+encoding, authorization policy and on-media object kind are unchanged. This
+service separation does not yet remove board-named device/acceptance features.

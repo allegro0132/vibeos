@@ -30,9 +30,9 @@ use crate::{exec, HEAP};
 
 const BACKGROUND_MEMORY_BUDGET: usize = 64 * 1024;
 const NETWORK_STACK_MEMORY_BUDGET: usize = 384 * 1024;
-#[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+#[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
 const IPERF3_SERVER_MEMORY_BUDGET: usize = 128 * 1024;
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "provisioned-ssh")]
 const SSH_PRODUCTION_MEMORY_BUDGET: usize = store::STORE_CLIENT_MEMORY_BUDGET;
 #[cfg(all(
     any(feature = "ssh-test", feature = "milkv-ssh-acceptance"),
@@ -145,14 +145,14 @@ enum ComponentTemplate {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     Ipv4Stack,
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     TcpEcho,
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     Iperf3Server,
     StoreFaultProbe,
     FaultProbe,
@@ -210,16 +210,16 @@ enum ComponentGrants {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     Ipv4Stack(Vec<vibeos_netstack::NetworkInterfaceCapabilities>),
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     TcpEcho {
         listener: Cap,
     },
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     Iperf3Server {
         control: Cap,
         data: Cap,
@@ -233,9 +233,9 @@ enum ComponentGrants {
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh",
+    feature = "provisioned-ssh",
     feature = "iperf3-server",
-    feature = "milkv-iperf3-server"
+    feature = "dhcp-iperf3-server"
 ))]
 #[derive(Clone)]
 struct NetworkStackRoot {
@@ -253,9 +253,9 @@ struct NetworkStackRoot {
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh",
+    feature = "provisioned-ssh",
     feature = "iperf3-server",
-    feature = "milkv-iperf3-server"
+    feature = "dhcp-iperf3-server"
 ))]
 fn grant_network_stack(
     roots: &[NetworkStackRoot],
@@ -541,9 +541,9 @@ pub struct World {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     network_stack_roots: Vec<NetworkStackRoot>,
     #[cfg(feature = "milkv-duo")]
@@ -561,17 +561,17 @@ pub struct World {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     tcp_listener_root: Option<Cap>,
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     iperf_data_listener_root: Option<Cap>,
     #[cfg(any(
         feature = "qemu-virt",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "provisioned-ssh"
     ))]
     rng_policy: Option<Arc<Space>>,
     #[cfg(feature = "qemu-virt")]
@@ -581,7 +581,7 @@ pub struct World {
     #[cfg(any(
         feature = "qemu-virt",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh"
+        feature = "provisioned-ssh"
     ))]
     rng_source_root: Option<Cap>,
     #[cfg(any(
@@ -1082,9 +1082,9 @@ impl World {
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         ))]
         if template == ComponentTemplate::Ipv4Stack {
             return ComponentGrants::Ipv4Stack(grant_network_stack(
@@ -1116,7 +1116,7 @@ impl World {
             };
         }
 
-        #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+        #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
         if template == ComponentTemplate::Iperf3Server {
             let policy = self
                 .net_policy
@@ -1193,9 +1193,9 @@ impl World {
                 feature = "net-shell",
                 feature = "ssh-test",
                 feature = "milkv-ssh-acceptance",
-                feature = "milkv-ssh",
+                feature = "provisioned-ssh",
                 feature = "iperf3-server",
-                feature = "milkv-iperf3-server"
+                feature = "dhcp-iperf3-server"
             ))]
             ComponentTemplate::Ipv4Stack => {
                 unreachable!("TCP echo grants come from the private policy CSpace")
@@ -1204,7 +1204,7 @@ impl World {
             ComponentTemplate::TcpEcho => {
                 unreachable!("TCP echo app grants come from the private policy CSpace")
             }
-            #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+            #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
             ComponentTemplate::Iperf3Server => {
                 unreachable!("iperf3 grants come from the private policy CSpace")
             }
@@ -1340,9 +1340,9 @@ impl World {
                 feature = "net-shell",
                 feature = "ssh-test",
                 feature = "milkv-ssh-acceptance",
-                feature = "milkv-ssh",
+                feature = "provisioned-ssh",
                 feature = "iperf3-server",
-                feature = "milkv-iperf3-server"
+                feature = "dhcp-iperf3-server"
             ))]
             ComponentGrants::Ipv4Stack(interfaces) => unsafe {
                 exec::spawn_reclaimable_owned(
@@ -1359,7 +1359,7 @@ impl World {
                     crate::net_echo_platform::task(space.get(), listener),
                 )
             },
-            #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+            #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
             ComponentGrants::Iperf3Server { control, data } => unsafe {
                 exec::spawn_reclaimable_owned(
                     domain,
@@ -1845,9 +1845,9 @@ pub fn start_rng_supervisor() {
     feature = "net-shell",
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh",
+    feature = "provisioned-ssh",
     feature = "iperf3-server",
-    feature = "milkv-iperf3-server"
+    feature = "dhcp-iperf3-server"
 ))]
 pub fn start_ipv4_stack_supervisor() {
     let world = world();
@@ -1945,9 +1945,9 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     let net_location = net_resources.as_ref().map(|resources| resources.location);
     let net_space = net_resources.as_ref().map(|_| Space::new("virtio-net"));
@@ -1963,9 +1963,9 @@ pub fn build() {
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         )
     ))]
     let usb_net_location = usb_net_resources
@@ -1983,7 +1983,7 @@ pub fn build() {
     let rng_resources = virtio_rng::discover();
     #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
     let rng_resources = Some(vibeos_kernel_acceptance::ssh_acceptance_rng::provision());
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh"))]
+    #[cfg(all(feature = "jitter-entropy", feature = "provisioned-ssh"))]
     let rng_resources = crate::jitterentropy_random::provision().ok();
     #[cfg(feature = "qemu-virt")]
     let rng_space = rng_resources.as_ref().map(|_| Space::new("virtio-rng"));
@@ -1995,7 +1995,7 @@ pub fn build() {
     let rng_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("ssh-acceptance-random-policy"));
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh"))]
+    #[cfg(all(feature = "jitter-entropy", feature = "provisioned-ssh"))]
     let rng_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("ssh-random-policy"));
@@ -2008,7 +2008,7 @@ pub fn build() {
         .as_ref()
         .zip(rng_resources.as_ref())
         .map(|_| Space::new("ssh-test"));
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(feature = "provisioned-ssh")]
     let ssh_production_space = net_resources
         .as_ref()
         .zip(rng_resources.as_ref())
@@ -2026,9 +2026,9 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     #[cfg(not(feature = "milkv-duo"))]
     let ipv4_stack_space = net_resources
@@ -2041,9 +2041,9 @@ pub fn build() {
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         )
     ))]
     let ipv4_stack_space = (net_resources.is_some() || usb_net_resources.is_some())
@@ -2052,7 +2052,7 @@ pub fn build() {
     let tcp_echo_app_space = net_resources
         .as_ref()
         .map(|_| Space::new("tcp-echo-service"));
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     let iperf3_app_space = net_resources.as_ref().map(|_| Space::new("iperf3-server"));
     let store_backend = block_resources
         .as_ref()
@@ -2396,9 +2396,9 @@ pub fn build() {
                 feature = "net-shell",
                 feature = "ssh-test",
                 feature = "milkv-ssh-acceptance",
-                feature = "milkv-ssh",
+                feature = "provisioned-ssh",
                 feature = "iperf3-server",
-                feature = "milkv-iperf3-server"
+                feature = "dhcp-iperf3-server"
             )))]
             let (init_outbound, init_inbound, init_control) = (
                 Some(cap::grant(&policy, outbound_root, Rights::SEND, &mut cs).unwrap()),
@@ -2418,9 +2418,9 @@ pub fn build() {
                 feature = "net-shell",
                 feature = "ssh-test",
                 feature = "milkv-ssh-acceptance",
-                feature = "milkv-ssh",
+                feature = "provisioned-ssh",
                 feature = "iperf3-server",
-                feature = "milkv-iperf3-server"
+                feature = "dhcp-iperf3-server"
             ))]
             let (init_outbound, init_inbound, init_control) = (None, None, None);
 
@@ -2516,40 +2516,40 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     let tcp_listener_root = net_policy.as_ref().map(|policy_space| {
         let listener_label = if cfg!(any(
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh"
+            feature = "provisioned-ssh"
         )) {
             "sshd"
         } else if cfg!(any(
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         )) {
             "iperf3-control"
         } else {
             "tcp-echo"
         };
-        #[cfg(feature = "milkv-ssh")]
+        #[cfg(feature = "provisioned-ssh")]
         let listen_port = 22;
         #[cfg(all(
-            not(feature = "milkv-ssh"),
-            any(feature = "iperf3-server", feature = "milkv-iperf3-server")
+            not(feature = "provisioned-ssh"),
+            any(feature = "iperf3-server", feature = "dhcp-iperf3-server")
         ))]
         let listen_port = vibeos_iperf3_server::DEFAULT_PORT;
         #[cfg(not(any(
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         )))]
         let listen_port = 2222;
         let id = vibeos_net_api::TcpListenerId::new(1).expect("listener identity is non-zero");
-        #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+        #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
         let listener = vibeos_net_api::TcpListener::new_shared(
             listener_label,
             id,
@@ -2558,7 +2558,7 @@ pub fn build() {
             vibeos_net_api::MAX_TCP_FRONTEND_BUFFER_BYTES,
             vibeos_net_api::TcpPortGroupId::new(1).expect("iperf3 port group identity is non-zero"),
         );
-        #[cfg(not(any(feature = "iperf3-server", feature = "milkv-iperf3-server")))]
+        #[cfg(not(any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
         let listener = vibeos_net_api::TcpListener::new(
             listener_label,
             id,
@@ -2569,7 +2569,7 @@ pub fn build() {
         let listener = listener.expect("the image TCP listener policy is valid");
         policy_space.0.lock().mint(listener, Rights::ALL_VOLATILE)
     });
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     let iperf_data_listener_root = net_policy.as_ref().map(|policy_space| {
         let listener = vibeos_net_api::TcpListener::new_shared(
             "iperf3-data",
@@ -2629,7 +2629,7 @@ pub fn build() {
         (None, None) => None,
         _ => unreachable!("acceptance entropy resource and policy are constructed together"),
     };
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh"))]
+    #[cfg(all(feature = "jitter-entropy", feature = "provisioned-ssh"))]
     let rng_source_root = match (rng_resources, rng_policy.as_ref()) {
         (Some(resources), Some(policy_space)) => {
             Some(policy_space.0.lock().mint(resources.source, Rights::ALL))
@@ -2756,7 +2756,7 @@ pub fn build() {
             .unwrap(),
         )
     });
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(feature = "provisioned-ssh")]
     let ssh_production_grants = ssh_production_space.as_ref().map(|target_space| {
         let network = net_policy
             .as_ref()
@@ -2794,9 +2794,9 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     let mut network_stack_roots = Vec::new();
     #[cfg(any(
@@ -2804,9 +2804,9 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     if let (Some(location), Some(policy), Some(outbound), Some(inbound), Some(control)) = (
         net_location,
@@ -2815,12 +2815,12 @@ pub fn build() {
         net_inbound_root,
         net_control_root,
     ) {
-        #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+        #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
         let listeners = vibeos_netstack::two_tcp_listeners(
             tcp_listener_root.expect("iperf3 control listener root"),
             iperf_data_listener_root.expect("iperf3 data listener root"),
         );
-        #[cfg(not(any(feature = "iperf3-server", feature = "milkv-iperf3-server")))]
+        #[cfg(not(any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
         let listeners = match tcp_listener_root {
             Some(listener) => vibeos_netstack::one_tcp_listener(listener),
             None => vibeos_netstack::no_tcp_listeners(),
@@ -2846,9 +2846,9 @@ pub fn build() {
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         )
     ))]
     if let (Some(location), Some(policy), Some(outbound), Some(inbound), Some(control)) = (
@@ -2873,9 +2873,9 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     {
         network_stack_roots.sort_by_key(|root| root.location);
@@ -2899,9 +2899,9 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     let ipv4_stack_grants = ipv4_stack_space
         .as_ref()
@@ -2931,7 +2931,7 @@ pub fn build() {
         (None, None, None) => None,
         _ => unreachable!("TCP echo app grant exists exactly with its listener"),
     };
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     let iperf3_app_grants = match (
         net_policy.as_ref(),
         iperf3_app_space.as_ref(),
@@ -3074,7 +3074,7 @@ pub fn build() {
     if let Some(space) = rng_policy.as_ref() {
         spaces.insert("ssh-acceptance-random-policy", space.clone());
     }
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(feature = "provisioned-ssh")]
     if let Some(space) = rng_policy.as_ref() {
         spaces.insert("ssh-random-policy", space.clone());
     }
@@ -3086,7 +3086,7 @@ pub fn build() {
     if let Some(space) = ssh_test_space.as_ref() {
         spaces.insert("ssh-test", space.clone());
     }
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(feature = "provisioned-ssh")]
     if let Some(space) = ssh_production_space.as_ref() {
         spaces.insert("sshd", space.clone());
     }
@@ -3103,9 +3103,9 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     if let Some(space) = ipv4_stack_space.as_ref() {
         spaces.insert(crate::netstack_platform::COMPONENT_NAME, space.clone());
@@ -3114,7 +3114,7 @@ pub fn build() {
     if let Some(space) = tcp_echo_app_space.as_ref() {
         spaces.insert("tcp-echo-service", space.clone());
     }
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     if let Some(space) = iperf3_app_space.as_ref() {
         spaces.insert("iperf3-server", space.clone());
     }
@@ -3172,9 +3172,9 @@ pub fn build() {
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         ))]
         network_stack_roots,
         #[cfg(feature = "milkv-duo")]
@@ -3192,17 +3192,17 @@ pub fn build() {
             feature = "net-shell",
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh",
+            feature = "provisioned-ssh",
             feature = "iperf3-server",
-            feature = "milkv-iperf3-server"
+            feature = "dhcp-iperf3-server"
         ))]
         tcp_listener_root,
-        #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+        #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
         iperf_data_listener_root,
         #[cfg(any(
             feature = "qemu-virt",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh"
+            feature = "provisioned-ssh"
         ))]
         rng_policy,
         #[cfg(feature = "qemu-virt")]
@@ -3212,7 +3212,7 @@ pub fn build() {
         #[cfg(any(
             feature = "qemu-virt",
             feature = "milkv-ssh-acceptance",
-            feature = "milkv-ssh"
+            feature = "provisioned-ssh"
         ))]
         rng_source_root,
         #[cfg(any(
@@ -3355,7 +3355,7 @@ pub fn build() {
         );
     }
 
-    #[cfg(feature = "milkv-ssh")]
+    #[cfg(feature = "provisioned-ssh")]
     if let (Some(space), Some((listener, random))) = (ssh_production_space, ssh_production_grants) {
         world.spawn_component_inner(
             "sshd",
@@ -3371,18 +3371,18 @@ pub fn build() {
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     #[cfg(any(
         feature = "tcp-echo",
         feature = "net-shell",
         feature = "ssh-test",
         feature = "milkv-ssh-acceptance",
-        feature = "milkv-ssh",
+        feature = "provisioned-ssh",
         feature = "iperf3-server",
-        feature = "milkv-iperf3-server"
+        feature = "dhcp-iperf3-server"
     ))]
     if let (Some(space), Some(interfaces)) = (ipv4_stack_space, ipv4_stack_grants) {
         world.spawn_component_inner(
@@ -3405,7 +3405,7 @@ pub fn build() {
         );
     }
 
-    #[cfg(any(feature = "iperf3-server", feature = "milkv-iperf3-server"))]
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     if let (Some(space), Some((control, data))) = (iperf3_app_space, iperf3_app_grants) {
         world.spawn_component_inner(
             "iperf3-server",

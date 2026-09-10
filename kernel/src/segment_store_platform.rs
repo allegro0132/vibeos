@@ -1303,6 +1303,7 @@ impl StorageV2Runtime {
         let page_operation = match self.device.begin_operation(task, domain, token) {
             Ok(operation) => operation,
             Err(error) => {
+                crate::uart::_print(format_args!("  storage v2 page admission failed: {error:?}\n"));
                 assert!(self.clear(claim));
                 return Err(match error {
                     PageIoError::OperationBusy => V2RuntimeError::Busy,

@@ -394,3 +394,33 @@ Removing rollback fails the driver regression. QEMU regression and Duo builds
 remain software evidence only; no Duo UTMI timing or Mars DMA/entropy validation
 is claimed. Board-feature/service decoupling, shared PHY support, Mars firmware,
 boot components and the flashable SD image still remain to be implemented.
+
+### Reusable provisioned services stage
+
+The kernel now exposes `provisioned-ssh`, `provisioned-command`,
+`provisioned-wasmtime`, and `dhcp-iperf3-server`. The old `milkv-ssh`,
+`milkv-command`, `milkv-wasmtime`, and `milkv-iperf3-server` aliases remain.
+The command entry includes its WASI dependencies directly, so it can be built
+without relying on a board wrapper to add them. Firmware chooses entropy
+separately: Duo's new service entries explicitly select the existing jitter
+provider; QEMU's provisioned entry uses VirtIO RNG. New platforms do not
+implicitly inherit Duo entropy or acceptance identities.
+
+Build examples (run inside the corresponding firmware directory):
+
+- QEMU: `cargo build --release --features provisioned-command`
+- Duo SSH: `cargo build --release --no-default-features --features provisioned-ssh`
+- Duo Wasmtime: `cargo build --release --target riscv64gc-unknown-none-elf --no-default-features --features provisioned-wasmtime`
+
+Wasmtime still requires LP64D; adding floating-point instructions to the IMAC
+LP64 target does not satisfy its ABI. The reusable production service also
+requires an explicitly selected entropy provider. Mars must add and qualify
+its own provider before enabling formal SSH.
+
+`scripts/qemu-provisioned-service-test.py` exercises a freshly built QEMU
+`provisioned-command` ELF using a temporary 128 MiB data disk matching the
+file-tree image policy, real VirtIO entropy, four harts and two boots. It checks
+identity persistence, VSH `ssh-keygen`/`ssh-keycat`, matching persisted/public
+client keys and absence of automatic authorization. It forwards no SSH port
+and deletes the identity-bearing disk afterwards. This does not claim SSH/WASM
+transport or physical entropy qualification. The VSSHKEY1 encoding is unchanged.

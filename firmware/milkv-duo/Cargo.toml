@@ -5,6 +5,12 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+# Reusable services; this firmware selects the appropriate entropy provider.
+provisioned-ssh = ["vibeos-kernel/provisioned-ssh", "vibeos-kernel/jitter-entropy"]
+provisioned-command = ["provisioned-ssh", "vibeos-kernel/provisioned-command"]
+provisioned-wasmtime = ["provisioned-command", "vibeos-kernel/provisioned-wasmtime"]
+dhcp-iperf3-server = ["vibeos-kernel/dhcp-iperf3-server"]
+
 python = ["vibeos-kernel/milkv-python"]
 wasmtime = ["vibeos-kernel/milkv-wasmtime"]
 wasmtime-benchmark = ["wasmtime", "vibeos-kernel/wasi-long-fuel"]

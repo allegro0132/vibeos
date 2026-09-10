@@ -279,6 +279,14 @@ pub async fn bytes_with(
     result
 }
 
+/// Trusted kernel provisioning path; never exported as a component syscall.
+/// Uses the same supervised request queue and reset/quarantine policy as the
+/// capability frontend. The caller controls identity-storage authority.
+#[cfg(feature = "provisioned-ssh")]
+pub async fn fill_seed(output: &mut [u8; 32]) -> Result<(), RandomError> {
+    request(output.len()).await?.copy_to(output)
+}
+
 /// Convenience wrapper for callers which already own a fixed destination.
 /// The destination pointer never crosses the service or DMA boundary.
 pub async fn fill_with(

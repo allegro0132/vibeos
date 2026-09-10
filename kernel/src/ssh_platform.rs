@@ -12,7 +12,7 @@ use alloc::boxed::Box;
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 use core::fmt;
 
@@ -20,13 +20,13 @@ use vibeos_core::cap::{Cap, Rights};
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 use vibeos_core::chan::Endpoint;
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 use vibeos_core::net::StampedPacket;
 #[cfg(feature = "ssh-security-test")]
@@ -37,13 +37,13 @@ use vibeos_kernel_acceptance::ssh_security_test::{
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 use vibeos_net_api::{TcpConnectionToken, TcpIoResult, TcpListener, TcpListenerSnapshot};
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 use vibeos_ssh_identity::SshEd25519PublicKey;
 #[cfg(feature = "wasm-c84-ssh-managed-child-trusted-sample")]
@@ -51,7 +51,7 @@ use vibeos_sshd::SshExecProfileTerminal;
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 use vibeos_sshd::{
     AuthorizedProfile, BindRetry, HostPublicKeySnapshot, HostSignatureResult, Ipv4Policy,
@@ -67,14 +67,14 @@ use vibeos_sshd::{
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 use crate::ssh_security::{AuthorizedKeyPolicyService, HostSigningService};
 use crate::world::Space;
 
-#[cfg(feature = "milkv-ssh")]
-use crate::jitterentropy_random as ssh_rng;
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "provisioned-ssh")]
+use crate::ssh_entropy as ssh_rng;
+#[cfg(all(feature = "qemu-virt", not(feature = "provisioned-ssh")))]
 use crate::virtio_rng as ssh_rng;
 use ssh_rng::RandomError;
 #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
@@ -98,7 +98,7 @@ const SSH_SERVICE_POLICY: SshServicePolicy = SshServicePolicy {
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 fn ssh_service_policy() -> SshServicePolicy {
     SSH_SERVICE_POLICY
@@ -117,7 +117,7 @@ const SSH_SERVICE_POLICY: SshServicePolicy = SshServicePolicy {
     listener_label: "milkv-ssh-acceptance",
 };
 
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "provisioned-ssh")]
 const SSH_SERVICE_POLICY: SshServicePolicy = SshServicePolicy {
     ethernet_address: [0x02, 0, 0, 0, 0, 1],
     listen_port: 22,
@@ -133,7 +133,7 @@ const SSH_SERVICE_POLICY: SshServicePolicy = SshServicePolicy {
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 struct SshPlatform {
     space: &'static Space,
@@ -142,7 +142,7 @@ struct SshPlatform {
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 impl SshPlatform {
     const fn new(space: &'static Space) -> Self {
@@ -1625,7 +1625,7 @@ fn profile_phase_drop(
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 impl SshdPlatform for SshPlatform {
     fn packet_endpoints(
@@ -1850,7 +1850,7 @@ impl SshdPlatform for SshPlatform {
                     profile.profile.get()
                         == vibeos_kernel_acceptance::ssh_test_fixture::TEST_PROFILE
                 }
-                #[cfg(feature = "milkv-ssh")]
+                #[cfg(feature = "provisioned-ssh")]
                 {
                     profile.profile.get() == crate::ssh_provisioning::PROFILE
                 }
@@ -1866,11 +1866,11 @@ impl SshdPlatform for SshPlatform {
         username: &str,
         password: &str,
     ) -> Option<AuthorizedProfile> {
-        #[cfg(feature = "milkv-ssh")]
+        #[cfg(feature = "provisioned-ssh")]
         {
             crate::ssh_provisioning::onboarding_password_profile(username, password)
         }
-        #[cfg(not(feature = "milkv-ssh"))]
+        #[cfg(not(feature = "provisioned-ssh"))]
         {
             let _ = (username, password);
             None
@@ -1878,22 +1878,22 @@ impl SshdPlatform for SshPlatform {
     }
 
     fn onboarding_profile(&self) -> Option<AuthorizedProfile> {
-        #[cfg(feature = "milkv-ssh")]
+        #[cfg(feature = "provisioned-ssh")]
         {
             crate::ssh_provisioning::onboarding_profile()
         }
-        #[cfg(not(feature = "milkv-ssh"))]
+        #[cfg(not(feature = "provisioned-ssh"))]
         {
             None
         }
     }
 
     fn security_policy_changed(&self) -> bool {
-        #[cfg(feature = "milkv-ssh")]
+        #[cfg(feature = "provisioned-ssh")]
         {
             crate::ssh_provisioning::policy_changed()
         }
-        #[cfg(not(feature = "milkv-ssh"))]
+        #[cfg(not(feature = "provisioned-ssh"))]
         {
             false
         }
@@ -1917,7 +1917,7 @@ impl SshdPlatform for SshPlatform {
     }
     fn install_vsh_commands(&self, session: &mut vibeos_vsh::Session, onboarding: bool) {
         if onboarding {
-            #[cfg(feature = "milkv-ssh")]
+            #[cfg(feature = "provisioned-ssh")]
             crate::vsh_platform::install_ssh_onboarding_commands(session);
         } else {
             crate::vsh_platform::install_remote_commands(session);
@@ -2041,7 +2041,7 @@ impl SshdPlatform for SshPlatform {
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 pub async fn capability_task(
     space: &'static Space,
@@ -2081,7 +2081,7 @@ pub async fn capability_task(
 #[cfg(any(
     feature = "ssh-test",
     feature = "milkv-ssh-acceptance",
-    feature = "milkv-ssh"
+    feature = "provisioned-ssh"
 ))]
 pub async fn task(
     space: &'static Space,
@@ -2116,7 +2116,7 @@ pub async fn task(
     .await;
 }
 
-#[cfg(feature = "milkv-ssh")]
+#[cfg(feature = "provisioned-ssh")]
 pub async fn provisioned_task(space: &'static Space, listener: Cap, random: Cap) {
     let mut provisioning_failure_reported = false;
     loop {

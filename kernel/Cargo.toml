@@ -6,8 +6,8 @@ autobins = false
 
 [features]
 mmu-large-memory-test = []
-# Production Duo command image; never pulls in QEMU test identities.
-milkv-wasmtime = ["milkv-command", "wasi-preview1", "vibeos-sshd/wasi-exec", "wasmtime-command-fuel-batch", "wasmtime-threads"]
+# Provisioned command service; never pulls in acceptance identities.
+provisioned-wasmtime = ["provisioned-command", "wasi-preview1", "vibeos-sshd/wasi-exec", "wasmtime-command-fuel-batch", "wasmtime-threads"]
 python-command = ["wasi-preview1", "vibeos-wasi-runtime/python-wasi", "vibeos-sshd/python-wasi"]
 python-wasi = ["wasi-ssh-upload", "python-command"]
 milkv-python = ["milkv-command", "python-command", "vibeos-wasi-runtime/python-duo"]
@@ -37,10 +37,9 @@ wasi-rv64-cache = ["wasi-ssh-upload", "vibeos-wasi-runtime/rv64-cache"]
 wasi-preview1 = ["file-tree", "dep:vibeos-wasi-runtime", "dep:vibeos-wasi-command"]
 wasi-ssh-upload = ["wasi-ssh"]
 wasi-ssh = ["ssh-commands", "wasi-preview1", "ssh-test", "vibeos-sshd/wasi-exec"]
-# Provisioned Duo command images admit WASI requests for the live production
-# SSH profile. Every milkv-* command image enables this; the request path
-# itself is shared with the QEMU test identity through `ssh-commands`.
-milkv-command = ["milkv-ssh", "ssh-commands"]
+# Provisioned command images admit WASI requests for the current SSH policy.
+# Explicit WASI dependencies make this entry usable without a board wrapper.
+provisioned-command = ["provisioned-ssh", "ssh-commands", "wasi-preview1", "vibeos-sshd/wasi-exec"]
 ssh-commands = []
 default = ["qemu-virt", "qemu-default-image"]
 qemu-virt = ["dep:vibeos-virtio-protocol", "vibeos-vsh/pci-usb-help"]
@@ -60,7 +59,7 @@ file-tree = [
 # listener. This is deliberately separate from the eventual SSH feature so a
 # byte-stream transport can be proved before cryptographic code is admitted.
 tcp-echo = ["dep:vibeos-net-api", "dep:vibeos-net-echo", "dep:vibeos-netstack", "vibeos-netstack/tcp-echo", "vibeos-vsh/network"]
-# Production Milk-V Duo IPv4 control plane. It owns the raw packet endpoints,
+# Reusable DHCP IPv4 control plane. It owns the raw packet endpoints,
 # starts in DHCP mode, and exposes only capability-admitted ip/dhclient commands.
 net-shell = ["dep:vibeos-net-api", "dep:vibeos-net-echo", "dep:vibeos-netstack", "vibeos-netstack/net-shell", "vibeos-vsh/network"]
 # Test-only recovery hook used by the live stack-generation acceptance script.
@@ -74,8 +73,8 @@ iperf3-server = [
     "vibeos-netstack/static-service",
     "vibeos-vsh/network",
 ]
-# Physical Milk-V Duo iperf3 TCP server image with DHCP configuration.
-milkv-iperf3-server = [
+# Reusable iperf3 TCP server with DHCP configuration.
+dhcp-iperf3-server = [
     "dep:vibeos-iperf3-server",
     "dep:vibeos-net-api",
     "dep:vibeos-netstack",
@@ -115,16 +114,23 @@ milkv-ssh-acceptance = [
 ]
 # Production SSH image. Device and client identities are provisioned locally;
 # no acceptance fixture is linked into this feature.
-milkv-ssh = [
+provisioned-ssh = [
     "ssh-component-command",
     "dep:vibeos-net-api",
     "dep:vibeos-netstack",
     "dep:vibeos-sshd",
     "dep:vibeos-ssh-identity",
-    "dep:jitterentropy",
     "vibeos-netstack/dhcp-service",
     "vibeos-vsh/network",
 ]
+# Compatibility aliases retain Duo's existing entropy selection.
+milkv-ssh = ["provisioned-ssh", "jitter-entropy"]
+milkv-command = ["provisioned-command", "jitter-entropy"]
+milkv-wasmtime = ["provisioned-wasmtime", "jitter-entropy"]
+milkv-iperf3-server = ["dhcp-iperf3-server"]
+# Provider selection is explicit; new boards must supply/qualify their source.
+jitter-entropy = ["dep:jitterentropy"]
+
 # Narrow image/session-policy-managed WASM command path shared by the three
 # SSH images. Keeping these dependencies behind an explicit image feature
 # prevents merely linking the reusable kernel archive from exposing a command.

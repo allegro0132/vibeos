@@ -1,4 +1,4 @@
-# Mars serial/SD test image
+# Mars test SD images
 
 From the repository root, run `sh scripts/build-mars-sd.sh`. It requires Docker,
 the project's Rust nightly, LLVM objcopy, Git and Python 3 on the host. The
@@ -15,6 +15,20 @@ and component artifacts/configurations. The manifest records separate payload
 and bootchain source states, component hashes, compiler versions and missing
 qualification. This is an experimental serial/SD image; EQoS, SSH and qualified
 entropy are not enabled. A valid disk image is not evidence of successful boot.
+
+For the Ethernet test profile, run `sh scripts/build-mars-sd.sh --ethernet`.
+It shares the pinned, clean SDK checkout but builds into a separate directory:
+`target/mars-boot-ethernet/out/mars-ethernet-sd.img`. Its own manifest, checks,
+hashes and component versions are alongside that image. The container mounts
+the SDK read-only. Neither profile overwrites an existing output image.
+
+The Ethernet profile composes EQoS/YT8531 with DHCP and the TCP 5201 iperf3
+service. SSH remains disabled and physical operation is unverified. Its current
+test MAC is `02:00:00:00:00:01`; run one such test board per network. Obtain the
+board's actual DHCP address from its serial log or the router lease table before
+running `iperf3 --client ACTUAL_MARS_IP --port 5201 --time 60`. Do not use an old
+Duo address. Preserve output and logs; successful throughput alone would not
+prove persistence, reboot recovery or multicore DMA consistency.
 
 | GPT partition | Offset | Size | Contents |
 |---|---:|---:|---|
@@ -54,8 +68,8 @@ Look for `MARS_BOOT_ADMISSION PASS` with four harts and 4000000 Hz, followed by
 `smp       4 hart(s) online`. Admission alone does not demonstrate four cores
 running. Preserve the complete serial log, including any SD initialization or
 panic diagnostics. SD persistence, timeout/reset behavior and protection of
-the boot region still require board tests. Network/SSH acceptance is pending
-implementation and must not be reported as passed by this image.
+the boot region still require board tests. Ethernet needs physical validation;
+SSH and qualified entropy remain unimplemented in these test profiles.
 
 Host validation checks both GPT copies and CRCs, exact partition geometry,
 embedded bytes and a blank data area. Independent `sgdisk` and FAT checks run

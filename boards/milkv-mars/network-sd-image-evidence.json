@@ -1,0 +1,83 @@
+{
+  "status": "Network test SD image assembled and checked; hardware acceptance pending",
+  "image": "target/mars-boot-ethernet/out/mars-ethernet-sd.img",
+  "bytes": 672137216,
+  "sha256": "8008a8780286ad90242f7e95d2025e1930c27801c24f0c97da505afee8da9e92",
+  "profile": "mars-4gb-sd-dhcp-iperf3-bringup",
+  "sd_check": {
+    "status": "sd-layout-passed",
+    "bytes": 672137216,
+    "sha256": "8008a8780286ad90242f7e95d2025e1930c27801c24f0c97da505afee8da9e92",
+    "physical_acceptance": false,
+    "ssh_enabled": false,
+    "partitions": [
+      {
+        "name": "spl",
+        "first_sector": 4096,
+        "sector_count": 4096
+      },
+      {
+        "name": "uboot",
+        "first_sector": 8192,
+        "sector_count": 8192
+      },
+      {
+        "name": "boot",
+        "first_sector": 16384,
+        "sector_count": 245760
+      },
+      {
+        "name": "vibeos-data",
+        "first_sector": 262144,
+        "sector_count": 1048576
+      }
+    ]
+  },
+  "bootchain_check": {
+    "status": "bootchain-contract-passed",
+    "opensbi": "1.2",
+    "uboot": "2021.10",
+    "sbi_extensions_built": [
+      "TIME",
+      "IPI",
+      "RFENCE",
+      "HSM"
+    ],
+    "spi_environment": false,
+    "physical_acceptance": false,
+    "checked_sha256": {
+      "u-boot-spl.bin.normal.out": "b05d699c43f1fa87303a5d675e98f2fb0a8d8ac3ae4e39a1a9b35f19be78c326",
+      "fw_payload.bin": "260c38e5212c8d81268e5ec79a902a07ba09ddc9a74a2a77c6bb25b0df439e0a",
+      "uboot.config": "b2e7f0d1a3ef9c8693c43b5731e1234ac0d3e9a4e78cdec7b1ea98fbdee472cb",
+      "opensbi.config": "d83376c0e8b3813285f0f83f827e419df79826bef22b0b9d3634c919b98ccef5",
+      "firmware.itb": "dde3fd4a7c2c0c2af9de9898e64bed5c98c9ed4268aac47a9ad4b5b794627afa",
+      "vibeos.itb": "250d4ed03311e2b5defd56793efc086c9b52177a5a00f3dc4ca78fceb45b6908",
+      "vibeos.bin": "de7c72aefe6c23337310f1194a75cea9107dc59463f1a877c7db44a4f08b197d",
+      "mars.dtb": "f0224b4b1b6bfba25cfc81a0403804a4b7851af1a2bb385b01c9a880025c8b3d"
+    }
+  },
+  "host_sd_tests": 5,
+  "bootchain_tests": 2,
+  "original_serial_image_sha256": "25f9e8bd58bdf899df600ecf2464d6ee77917f3ef753d1b43fa1ed13b68b82d5",
+  "original_serial_image_unchanged": true,
+  "cli_checks": [
+    "Both existing profile images refused before source fetch or build",
+    "Unknown arguments rejected by build, package and manifest scripts"
+  ],
+  "physical_acceptance": false,
+  "ssh_enabled": false,
+  "logs": [
+    {
+      "path": "target/mars-reference/stage35-network-sd-build.log",
+      "sha256": "36b33735962d6e9c8070eff06f8a67ac3e7674014d56e11366fa99da743e1f15"
+    },
+    {
+      "path": "target/mars-reference/stage35-image-tests.log",
+      "sha256": "0ff5b50681a66324c0a07b15ab2e2b288a98b9dab9c21f8e8e35d942e7ce06e1"
+    },
+    {
+      "path": "target/mars-reference/stage35-bootchain-tests.log",
+      "sha256": "3ac748c7fc6dedd062d3f2967c58ff2fad5c801ee3613b7807a1bb2e5b228e09"
+    }
+  ]
+}

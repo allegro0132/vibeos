@@ -1,9 +1,10 @@
 # Milk-V Mars port status
 
 Target: standard Milk-V Mars with 4 GiB RAM, microSD boot, serial and SSH
-acceptance. This is an **incomplete port**. A 641 MiB serial/SD test image now
-builds with paired SPL/OpenSBI/U-Boot. Hardware qualification, EQoS and SSH
-remain outstanding. See [image instructions](../firmware/milkv-mars/bootchain/README.md).
+acceptance. This is an **incomplete port**. Separate 641 MiB serial/SD and
+EQoS DHCP/iperf3 test images build with paired SPL/OpenSBI/U-Boot. Physical
+qualification, qualified entropy and SSH remain outstanding.
+See [image instructions](../firmware/milkv-mars/bootchain/README.md).
 
 ## Implemented foundation
 
@@ -1049,3 +1050,22 @@ These tests do not execute the full DHCP packet task against real Mars hardware,
 qualify PHY electrical timing, or prove multicore DMA/cache coherence. They also
 do not qualify entropy, SSH, WASM over SSH, or the required cold-boot/stability
 acceptance. Payload composition is not physical Ethernet acceptance.
+
+### Network test SD image
+
+`sh scripts/build-mars-sd.sh --ethernet` now builds and checks an independent
+641 MiB image under `target/mars-boot-ethernet/out`. The first checked image is
+`mars-ethernet-sd.img`, SHA-256
+`8008a8780286ad90242f7e95d2025e1930c27801c24f0c97da505afee8da9e92`.
+Its four partitions retain the existing data offset/capacity and persistence
+format. The build checks both GPT copies, FAT, embedded FIT payload hashes,
+SPL CRC, actual SBI extension symbols and U-Boot configuration. Five host SD
+tests and two actual-artifact bootchain tests (including corruption mutations)
+pass. Both profile scripts refuse existing image files before fetching sources.
+The earlier serial/SD image was verified byte-for-byte unchanged.
+
+Evidence is in `boards/milkv-mars/network-sd-image-evidence.json`; the image
+directory holds its manifest, checksums, tool versions and component files.
+No physical SD card was written and no SPI change was made. This is a DHCP/iperf3
+bring-up image, with SSH disabled. Real cold boots, persistence, link recovery,
+multicore cache/DMA, entropy and SSH/WASM stability remain unqualified.

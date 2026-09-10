@@ -1,9 +1,16 @@
 #!/bin/sh
 set -eu
+image=mars-serial-sd.img
+if [ "$#" -eq 1 ] && [ "$1" = --ethernet ]; then
+    image=mars-ethernet-sd.img
+elif [ "$#" -ne 0 ]; then
+    echo 'usage: package.sh [--ethernet]' >&2
+    exit 2
+fi
 export SOURCE_DATE_EPOCH=1711929600
 sdk=/work/sdk
 out=/work/out/artifacts
-test ! -e /work/out/mars-serial-sd.img
+test ! -e "/work/out/$image"
 cd "$out"
 cp /work/input/vibeos.bin .
 cp /work/input/firmware.its /work/input/vibeos.its .
@@ -21,8 +28,8 @@ mkfs.vfat --invariant -F 32 -n VIBEOSBOOT boot.fat
 mcopy -o -i boot.fat vibeos.itb ::vibeos.itb
 mdir -i boot.fat ::
 fsck.vfat -n boot.fat
-python3 /work/input/mars-sd-image.py assemble /work/out/mars-serial-sd.img \
+python3 /work/input/mars-sd-image.py assemble "/work/out/$image" \
     --artifacts "$out" --report /work/out/sd-check.json
-sgdisk --verify /work/out/mars-serial-sd.img
+sgdisk --verify "/work/out/$image"
 mkimage -l firmware.itb
 mkimage -l vibeos.itb

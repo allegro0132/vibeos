@@ -50,6 +50,8 @@ pub static VIBEOS_BOOT_PLATFORM: BootPlatform = BootPlatform {
     hart_ids: Board::HART_IDS,
     rtc: Board::RTC,
     cold_reset: Board::RESET,
+    early_platform_init: super::platform_init,
+    platform_report: super::platform_report,
     ram_page_tables: || PageTableArena {
         base: RAM_TABLES.0.get() as usize,
         pages: RAM_TABLE_PAGES,

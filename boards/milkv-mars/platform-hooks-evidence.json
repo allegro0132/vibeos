@@ -1,0 +1,36 @@
+{
+  "status": "firmware platform boot hooks verified; Mars incomplete",
+  "host_tests": 24,
+  "qemu_selftests": 390,
+  "duo_build": "passed",
+  "mutation": "Confusing unconfirmed input with failed output fails exact firmware diagnostic test in isolated copy",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage9-host.log",
+      "sha256": "af868e084ac95eaaff08d5493d80e2d12081739dd93f3f7d88ad3d217fd89722"
+    },
+    {
+      "path": "target/mars-reference/stage9-led-mutation.log",
+      "sha256": "79cf38658460733d16911ddba8bf4a26e9c0ccef95decf1832b4d3f16a4ffb27"
+    },
+    {
+      "path": "target/mars-reference/stage9-qemu-selftest.log",
+      "sha256": "082d28a1ce502c92058626050bbf029e56b40c9bbc351fe93b50ac9341ca14a3"
+    },
+    {
+      "path": "target/mars-reference/stage9-duo-build.log",
+      "sha256": "b1e409e0ae2ec26f672e2de105e33fccd2123716cb4061cd2d622ab0a41b4eee"
+    },
+    {
+      "path": "target/mars-reference/stage9-kernel-dependencies.log",
+      "sha256": "a495b57b0bdd82d39bd56a95ff81c6c518473824f64c2e4803d1810b3f7b16b0"
+    }
+  ],
+  "hardware_acceptance": "not run",
+  "remaining": [
+    "USB, PCI and shared VirtIO transport/protocol migration",
+    "JH7110 platform, Mars firmware and DW-MSHC/GMAC5 integration",
+    "Boot firmware and flashable SD image",
+    "Physical serial/SSH, entropy qualification and stress acceptance"
+  ]
+}

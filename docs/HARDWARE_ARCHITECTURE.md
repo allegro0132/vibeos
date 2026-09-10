@@ -154,3 +154,8 @@ tokens record release locally so repeated cleanup cannot dispatch a shutdown to
 a replacement firmware instance. Network frame bounds are checked before the
 HAL frame exposes a byte slice; controller ring/header validation stays in the
 driver. Packet-session policy and endpoint scheduling remain in the kernel.
+
+BootPlatform provides boot-only platform initialization and reporting callbacks,
+invoked after MMIO mapping and before SMP/services. Board-specific LED setup and
+its diagnostic formatting now belong to Duo firmware. The kernel has no LED
+hardware dependency or board-selection branch for that startup operation.

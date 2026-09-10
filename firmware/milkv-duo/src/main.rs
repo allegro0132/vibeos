@@ -25,3 +25,6 @@ mod early_devices;
 mod storage;
 
 mod network;
+
+mod platform;
+use platform::{platform_init, platform_report};

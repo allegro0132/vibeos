@@ -1013,8 +1013,6 @@ pub use vibeos_vsh as vsh;
 pub use vibeos_vsh::terminal;
 
 mod bench_platform;
-#[cfg(feature = "milkv-duo")]
-mod board_led;
 mod cap_table_pool;
 mod code_pool;
 #[cfg(feature = "wasm-c73-authenticated-admission-acceptance")]
@@ -1322,16 +1320,9 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
     mmu::enable(exec::HartId::BOOT.index());
     uart::early_write("[VibeOS] Sv39 enabled\r\n");
 
-    #[cfg(feature = "milkv-duo")]
-    let blue_led = board_led::init();
-    #[cfg(feature = "milkv-duo")]
-    uart::early_write(if blue_led.on() {
-        "[VibeOS] blue status LED on\r\n"
-    } else if blue_led.output_asserted() {
-        "[VibeOS] blue status LED output asserted (input unconfirmed)\r\n"
-    } else {
-        "[VibeOS] blue status LED readback failed\r\n"
-    });
+    // SAFETY: only the boot hart runs here; MMIO is mapped and no service
+    // or secondary hart can access firmware-owned platform state yet.
+    unsafe { (platform::description().early_platform_init)(uart::early_write); }
 
     uart::init();
     println!("{}", BANNER);
@@ -1340,15 +1331,8 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
         platform::name(),
         platform::timebase_hz() / 1_000_000
     );
-    #[cfg(feature = "milkv-duo")]
-    println!(
-        "  led       blue GPIOC24 {} (pinmux {:#x}, dir {:#010x}, data {:#010x}, input {:#010x})",
-        blue_led.status(),
-        blue_led.pinmux,
-        blue_led.direction,
-        blue_led.data,
-        blue_led.external,
-    );
+    // SAFETY: early_platform_init completed on this same boot hart.
+    unsafe { (platform::description().platform_report)(uart::_print); }
 
     #[cfg(feature = "wasmtime-native")]
     wasmtime_platform::report_boot_isa(wasmtime_harts);

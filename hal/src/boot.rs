@@ -17,6 +17,14 @@ pub struct BootPlatform {
     pub rtc: Option<AddressRange>,
     pub cold_reset: Option<fn() -> !>,
     /// # Safety
+    /// Boot-hart-only hook after identity mappings exist, before secondary
+    /// harts and services start. No allocation or capability policy is allowed.
+    pub early_platform_init: unsafe fn(fn(&str)),
+    /// # Safety
+    /// Called by the same boot hart after early_platform_init, before SMP.
+    /// Firmware may report the initialized platform without kernel dependencies.
+    pub platform_report: unsafe fn(fn(core::fmt::Arguments<'_>)),
+    /// # Safety
     /// The kernel may access this arena only under its page-table ownership
     /// protocol: boot hart before publication, then the global page-table lock.
     pub ram_page_tables: unsafe fn() -> PageTableArena,

@@ -30,3 +30,6 @@ mod entropy;
 mod storage;
 
 mod network;
+
+unsafe fn platform_init(_write: fn(&str)) {}
+unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {}

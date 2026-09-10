@@ -273,3 +273,16 @@ fresh generation handshake. This is not physical Mars GMAC/DMA qualification.
 
 The kernel no longer depends on `vibeos-driver-virtio-net`. Shared VirtIO
 transport/protocol helpers, PCI, USB and the Duo LED still require migration.
+
+### Firmware platform boot hooks
+
+BootPlatform now exposes boot-hart-only initialization and diagnostic callbacks.
+The kernel invokes them after identity mappings exist, before heap services or
+secondary harts. Duo supplies LED initialization and its existing exact diagnostic
+text; QEMU supplies no-op hooks. The kernel's LED crate dependency and Duo-only
+LED startup branches are removed. Other platform/device migration is still pending.
+
+Host tests execute the actual Duo hook helpers against plain-memory register
+apertures, checking GPIO/mux preservation and the distinction between asserted
+output and unconfirmed input. Mutating that distinction fails the diagnostic
+regression. These tests do not prove electrical LED behavior on a physical board.

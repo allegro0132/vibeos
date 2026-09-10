@@ -1,8 +1,10 @@
 [package]
-name = "vibeos-driver-dwmac-net"
+name = "vibeos-eqos-net"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-vibeos-hal = { path = "../../hal" }
 vibeos-ethernet = { path = "../ethernet" }
+
+[lib]
+path = "src/lib.rs"

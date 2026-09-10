@@ -1640,6 +1640,7 @@ dependencies = [
 name = "vibeos-driver-dwmac-net"
 version = "0.1.0"
 dependencies = [
+ "vibeos-ethernet",
  "vibeos-hal",
 ]
 
@@ -1738,6 +1739,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-eqos-net"
+version = "0.1.0"
+dependencies = [
+ "vibeos-ethernet",
+]
+
+[[package]]
+name = "vibeos-ethernet"
+version = "0.1.0"
+
+[[package]]
 name = "vibeos-file-store"
 version = "0.1.0"
 dependencies = [
@@ -1791,6 +1803,8 @@ dependencies = [
  "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
  "vibeos-driver-virtio-net",
+ "vibeos-eqos-net",
+ "vibeos-ethernet",
  "vibeos-firmware-milkv-mars",
  "vibeos-hal",
  "vibeos-kernel",

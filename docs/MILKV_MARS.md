@@ -781,3 +781,31 @@ revision and SD-selector requirements. The image is suitable for writing to
 the selected test card, but **the Mars port remains incomplete**: physical
 serial/four-core/SD qualification, EQoS/DMA, entropy, SSH/WASM, three cold boots
 and the one-hour concurrent stability run remain required.
+
+### Shared MDIO and EQoS controller encodings
+
+`drivers/ethernet` now owns bounded Clause 22 read/write sequencing and the
+double BMSR read needed for current link status. `drivers/dwmac-net` uses this
+code with its legacy register transport; a register-array test checks the old
+offsets and command words. An all-ones PHY response is treated as unavailable.
+Packet/client contracts and persistent data formats are unchanged.
+
+`drivers/eqos-net` adds a separate transport for GMAC4/5 PA/RDA/GOC fields and
+CSR-clock selection, plus single-buffer TX/RX descriptors. It validates the
+entire 32-bit DMA span, leaves OWN unpublished in prepared descriptors, rejects
+error/context/fragmented completions, bounds lengths, strips retained FCS from
+the reported RX length and computes DSL using AXI width. The pinned reference
+manifest is `boards/milkv-mars/eqos-reference.json`.
+
+Twenty-two host tests pass across shared Ethernet, EQoS and legacy DWMAC. The
+RV64 register/descriptor model reports `EQOS_MODEL PASS`, followed by 395
+kernel selftests. The Duo release build and dependency boundary check pass.
+Mutations dropping the latch-clearing read, changing the EQoS PHY address
+shift to the Duo value, and changing OWN from bit 31 are detected and restored.
+Evidence is in `boards/milkv-mars/eqos-codec-evidence.json`.
+
+This is still **not a working Mars NIC**. Ordered live ring publication and
+reclamation, reset/quarantine behavior, JH7110 clocks/pins/cache maintenance,
+PHY/RGMII setup, resource admission and the firmware packet instance remain
+to be implemented and qualified. The stage-25 SD image continues to identify
+itself as serial/SD-only; no unqualified SSH or entropy provider is enabled.

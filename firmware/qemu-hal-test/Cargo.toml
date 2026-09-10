@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+eqos-model-test = ["dep:vibeos-eqos-net", "dep:vibeos-ethernet"]
 mars-composition-test = ["dep:vibeos-firmware-milkv-mars"]
 mars-resources-test = ["dep:vibeos-bsp-milkv-mars"]
 boot-admission-test = []
@@ -17,6 +18,8 @@ test = false
 bench = false
 
 [dependencies]
+vibeos-eqos-net = { path = "../../drivers/eqos-net", optional = true }
+vibeos-ethernet = { path = "../../drivers/ethernet", optional = true }
 vibeos-kernel = { path = "../../kernel", default-features = false, features = ["queued-block", "queued-network", "qemu-default-image", "boot-dtb-probe", "legacy-shell"] }
 vibeos-hal = { path = "../../hal" }
 vibeos-bsp-qemu-virt = { path = "../../boards/qemu-virt" }

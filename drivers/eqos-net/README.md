@@ -1,0 +1,38 @@
+# EQoS controller foundation
+
+This `no_std` crate provides GMAC4/5 Clause 22 command encoding and basic DMA
+descriptor codecs. It is not yet a complete packet device. It depends only on
+the shared `vibeos-ethernet` protocol crate; it does not import a BSP or kernel.
+The separate Duo DWMAC driver also uses the shared transaction/status code.
+
+`mdio::Port` receives ordered register IO and an actual CSR clock rate. It uses
+offsets 0x200/0x204 and EQoS's PA/RDA/CR/GOC fields. Supported clock rates are
+20–300 MHz; other rates are rejected. Shared transactions validate Clause 22
+addresses, wait for idle before issuing exactly one command, and bound the
+completion poll loop. A timed-out write is not retried. Link status is read
+twice to clear the BMSR latch; an all-ones final response is not a usable PHY.
+Controller/PHY reset and wall-clock timeout policy remain to be integrated.
+
+Descriptor codecs accept a complete 32-bit-addressable single-buffer span and
+produce CPU-order words without OWN. The future ring implementation must:
+
+1. Keep a private, validated slot-to-buffer mapping; do not trust RX write-back
+   descriptor words as buffer pointers.
+2. Map and isolate the real DMA pool; synchronize packet bytes and descriptor
+   fields before publishing OWN, then synchronize the descriptor before the
+   tail-pointer write.
+3. Poll ownership using correctly ordered volatile accesses and the platform's
+   cache maintenance. Read completion data only after CPU ownership returns.
+4. Configure the MAC consistently with the codec: no checksum/TSO/context
+   descriptors, standard frames, RX FCS retained in memory (ACS/CST disabled).
+   Successful RX lengths returned by the codec exclude that FCS.
+5. Program DSL from descriptor stride and actual AXI width. A 64-byte slot on
+   an 8-byte AXI bus needs DSL=6; it is not Duo's word-count encoding.
+6. Quarantine DMA memory across failed shutdown/reset. No safe reuse is implied
+   by a descriptor codec returning an error.
+
+Host tests check literal wire encodings and adversarial boundaries. The optional
+`eqos-model-test` in `firmware/qemu-hal-test` executes these same codecs on RV64
+with a register model, then runs normal kernel selftests. Neither layer executes
+JH7110 MMIO, DMA, clock/PHY setup or cache operations. Source hashes and pinned
+SDK paths are in `boards/milkv-mars/eqos-reference.json`.

@@ -612,21 +612,17 @@ fn wait_reset(d: DwmacDescription) -> bool {
 }
 
 fn update_phy_link(d: DwmacDescription, state: &InstanceState) {
-    if mdio_read(d, 1).is_none() {
-        state.phy_link_up.store(false, Ordering::Release);
-        return;
-    }
-    let Some(status) = mdio_read(d, 1) else {
+    let Ok(status) = vibeos_ethernet::status(&mut LegacyMdio(d), d.phy_address, 10_000) else {
         state.phy_link_up.store(false, Ordering::Release);
         return;
     };
-    if status & (1 << 2) == 0 {
+    if !status.link_up() {
         state.phy_link_up.store(false, Ordering::Release);
         return;
     }
     state.phy_link_up.store(true, Ordering::Release);
     let control = mdio_read(d, 0).unwrap_or(0);
-    let (fast, full) = if control & (1 << 12) != 0 && status & (1 << 5) != 0 {
+    let (fast, full) = if control & (1 << 12) != 0 && status.autoneg_complete() {
         let partner = mdio_read(d, 5).unwrap_or(0);
         if partner & (1 << 8) != 0 {
             (true, true)
@@ -649,28 +645,37 @@ fn update_phy_link(d: DwmacDescription, state: &InstanceState) {
     }
     write32(d, GMAC_CONTROL, mac);
 }
+struct LegacyMdio(DwmacDescription);
+impl vibeos_ethernet::MdioPort for LegacyMdio {
+    fn busy(&mut self) -> bool {
+        read32(self.0, GMAC_MII_ADDR) & MII_BUSY != 0
+    }
+    fn start_read(&mut self, phy: u8, register: u8) {
+        write32(
+            self.0,
+            GMAC_MII_ADDR,
+            u32::from(phy) << 11 | u32::from(register) << 6 | MII_CLOCK_RANGE_250MHZ | MII_BUSY,
+        );
+    }
+    fn start_write(&mut self, phy: u8, register: u8, value: u16) {
+        write32(self.0, GMAC_MII_DATA, u32::from(value));
+        write32(
+            self.0,
+            GMAC_MII_ADDR,
+            u32::from(phy) << 11
+                | u32::from(register) << 6
+                | MII_CLOCK_RANGE_250MHZ
+                | (1 << 1)
+                | MII_BUSY,
+        );
+    }
+    fn data(&mut self) -> u16 {
+        read32(self.0, GMAC_MII_DATA) as u16
+    }
+}
 fn mdio_read(d: DwmacDescription, register: u32) -> Option<u16> {
-    for _ in 0..10_000 {
-        if read32(d, GMAC_MII_ADDR) & MII_BUSY == 0 {
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    if read32(d, GMAC_MII_ADDR) & MII_BUSY != 0 {
-        return None;
-    }
-    write32(
-        d,
-        GMAC_MII_ADDR,
-        u32::from(d.phy_address) << 11 | (register & 0x1f) << 6 | MII_CLOCK_RANGE_250MHZ | MII_BUSY,
-    );
-    for _ in 0..10_000 {
-        if read32(d, GMAC_MII_ADDR) & MII_BUSY == 0 {
-            return Some(read32(d, GMAC_MII_DATA) as u16);
-        }
-        core::hint::spin_loop();
-    }
-    None
+    let register = u8::try_from(register).ok()?;
+    vibeos_ethernet::read(&mut LegacyMdio(d), d.phy_address, register, 10_000).ok()
 }
 
 fn descriptor_address(v: &Descriptor) -> usize {
@@ -738,6 +743,29 @@ mod tests {
     #[test]
     fn error_values_are_stable() {
         assert_eq!(Error::PacketTooLarge, Error::PacketTooLarge)
+    }
+
+    #[test]
+    fn legacy_mdio_preserves_offsets_and_command_encoding() {
+        use vibeos_ethernet::MdioPort;
+        let mut registers = [0u32; 0x1100 / 4];
+        let start = registers.as_mut_ptr() as usize;
+        let mut port = LegacyMdio(DwmacDescription {
+            registers: vibeos_hal::AddressRange::new(start, start + 0x1100),
+            irq: 1,
+            phy_address: 3,
+            dma_address_bits: 32,
+            cache_line_bytes: 64,
+        });
+        port.start_read(3, 17);
+        assert_eq!(registers[0x10 / 4], 0x1c55);
+        assert!(port.busy());
+        port.start_write(3, 17, 0xbeef);
+        assert_eq!(registers[0x14 / 4], 0xbeef);
+        assert_eq!(registers[0x10 / 4], 0x1c57);
+        registers[0x10 / 4] = 0;
+        assert!(!port.busy());
+        assert_eq!(port.data(), 0xbeef);
     }
 
     #[test]

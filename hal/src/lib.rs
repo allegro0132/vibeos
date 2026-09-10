@@ -327,3 +327,5 @@ pub mod entropy;
 pub mod queued_block;
 
 pub mod network;
+
+pub mod queued_network;

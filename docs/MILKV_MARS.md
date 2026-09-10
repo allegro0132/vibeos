@@ -252,3 +252,24 @@ qualification is claimed; QEMU tests exercise the existing QEMU path.
 The DWMAC engine still contains CV1800B platform setup and cache operations.
 Those must be split before sharing its MDIO/PHY support with JH7110 GMAC5;
 Mars must not inherit CV1800B/T-Head cache instructions.
+
+### QEMU queued-network composition stage
+
+QEMU firmware now owns the VirtIO network engine and supplies HAL queued packet
+operations. The kernel keeps endpoint publication, packet generation fences,
+capability admission, timeout policy and IRQ routing. Received frames have a
+bounded HAL representation; ring validation remains in the hardware driver.
+Shared queries never borrow mutable firmware state, and fault recovery abandons
+old engine metadata before the explicit hardware reset.
+
+The kernel invocation token remembers release/quarantine locally. An explicit
+shutdown followed by task destruction cannot touch a replacement engine. Host
+regression tests exercise this sequence, including a replacement attached between
+the two shutdown calls; removing the local release guard fails the test. The same
+adapter tests cover receive bounds, frame contents, deadlines, reset and error
+propagation. QEMU `net` and `net_recovery` validate the real ring path against a
+localhost peer; the latter injects a fault after DMA publication and checks a
+fresh generation handshake. This is not physical Mars GMAC/DMA qualification.
+
+The kernel no longer depends on `vibeos-driver-virtio-net`. Shared VirtIO
+transport/protocol helpers, PCI, USB and the Duo LED still require migration.

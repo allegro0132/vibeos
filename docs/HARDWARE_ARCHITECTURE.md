@@ -148,3 +148,9 @@ Packet endpoints, stack generations and capability/fault policy remain kernel
 services. Firmware retains a fixed `.dma` slab and an instance claim. Ordinary
 shutdown consumes the engine; fault recovery explicitly abandons old metadata
 without a destructor and does not release the claim until reset succeeds.
+
+QEMU queued networking is now assembled by firmware as well. Kernel invocation
+tokens record release locally so repeated cleanup cannot dispatch a shutdown to
+a replacement firmware instance. Network frame bounds are checked before the
+HAL frame exposes a byte slice; controller ring/header validation stays in the
+driver. Packet-session policy and endpoint scheduling remain in the kernel.

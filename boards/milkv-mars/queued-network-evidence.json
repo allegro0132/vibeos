@@ -1,0 +1,48 @@
+{
+  "status": "QEMU queued network composition verified; Mars incomplete",
+  "host_tests": 22,
+  "qemu_selftests": 390,
+  "target_checks": [
+    "raw L2 handshake with localhost peer",
+    "post-DMA-publication fault recovery and fresh generation handshake",
+    "Duo release build"
+  ],
+  "mutation": "Removing repeated-shutdown guard fails replacement-incarnation test in isolated source copy",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage8-host.log",
+      "sha256": "81a6ee9293c8c647d32a84cef95fde10384ac83f4acc9cbef831a560af9b100e"
+    },
+    {
+      "path": "target/mars-reference/stage8-shutdown-mutation.log",
+      "sha256": "96ca550f69e2292ea0a1c9ed254d14e5482f604f8e097a72cda2f02e628e24ca"
+    },
+    {
+      "path": "target/mars-reference/stage8-qemu-net.log",
+      "sha256": "6795ff6865b0755d9ab286acc51ba2cafb1b7be43704f444b54b9b9cdf1371df"
+    },
+    {
+      "path": "target/mars-reference/stage8-qemu-net-recovery.log",
+      "sha256": "3f3727ddc08706c8f1df7ae0499d6026bf6e8855c544ea0661d150661a5c411e"
+    },
+    {
+      "path": "target/mars-reference/stage8-qemu-selftest.log",
+      "sha256": "e862567a38b47b4002e79766983676d03e774f8dff415397627bdc5b5326ba2b"
+    },
+    {
+      "path": "target/mars-reference/stage8-duo-build.log",
+      "sha256": "034875ec5df1e65d24eb5b55e8623117cb94f4b810ddcac5019d8517dfb7fa67"
+    },
+    {
+      "path": "target/mars-reference/stage8-kernel-dependencies.log",
+      "sha256": "f7e4acd4a916ceda57fca49a1c6428ac99226c2ed3f15a6b01d20e3f4cfec620"
+    }
+  ],
+  "hardware_acceptance": "not run",
+  "remaining": [
+    "Shared VirtIO transport/protocol, PCI, USB and LED migration",
+    "JH7110 platform, Mars firmware and DW-MSHC/GMAC5 integration",
+    "Boot firmware and flashable SD image",
+    "Physical serial/SSH, entropy qualification and stress acceptance"
+  ]
+}

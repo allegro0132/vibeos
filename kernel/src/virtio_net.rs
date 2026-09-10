@@ -26,7 +26,7 @@ use crate::sync::SpinLock;
 use crate::virtio::{self, NegotiatedFeatures, NET_HEADER_SIZE, NET_QUEUE_SIZE};
 use crate::virtio_mmio::MmioTransport;
 use crate::world::Space;
-use vibeos_driver_virtio_net::{Engine, HardwareError, ResetReason};
+use crate::queued_network::{Engine, HardwareError, ResetReason};
 
 const TX_TIMEOUT_MS: u64 = 2_000;
 const IDLE_POLL_MS: u64 = 1;
@@ -141,8 +141,8 @@ impl Resource for DmaRegion {
     fn describe(&self) -> String {
         format!(
             "SYSTEM stable net slab @ {:#x}, {} bytes, page aligned",
-            vibeos_driver_virtio_net::dma_base(),
-            vibeos_driver_virtio_net::dma_size()
+            crate::queued_network::dma_base(),
+            crate::queued_network::dma_size()
         )
     }
 
@@ -509,7 +509,7 @@ struct DriverSession {
 
 impl DriverSession {
     fn attach(transport: MmioTransport, authority: DriverAuthority) -> Option<Self> {
-        if CONTROL.lock().quarantined || vibeos_driver_virtio_net::dma_quarantined() {
+        if CONTROL.lock().quarantined || crate::queued_network::dma_quarantined() {
             return None;
         }
         {
@@ -543,7 +543,7 @@ impl DriverSession {
             Err(_) => {
                 let mut control = CONTROL.lock();
                 control.sessions.detach_device();
-                control.quarantined = vibeos_driver_virtio_net::dma_quarantined();
+                control.quarantined = crate::queued_network::dma_quarantined();
                 *AUTHORITY.lock() = None;
                 clear_driver_domain();
                 return None;
@@ -795,7 +795,7 @@ fn map_reset_reason(error: HardwareError) -> ResetReason {
 fn quarantine_identity_exhausted(transport: MmioTransport) {
     let _ = plic::disable(transport.irq());
     let _ = plic::unregister(transport.irq());
-    vibeos_driver_virtio_net::quarantine_before_attach(transport);
+    crate::queued_network::quarantine_before_attach(transport);
     IRQ_CAUSES.store(0, Ordering::Release);
     {
         let mut control = CONTROL.lock();
@@ -936,7 +936,7 @@ fn irq_top_half(transport_base: usize, _irq_entry: u64) {
 fn acknowledge_irq_transport(transport_base: usize) -> u32 {
     // Safety: PLIC registration captures the base from a successfully probed
     // transport and unregisters the callback before transport retirement.
-    unsafe { vibeos_driver_virtio_net::acknowledge_irq_at_base(transport_base) }
+    unsafe { crate::queued_network::acknowledge_irq_at_base(transport_base) }
 }
 
 pub fn hello_packet() -> Packet {
@@ -997,7 +997,7 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
         // in this exact owner/arena incarnation. PLIC delivery is detached
         // before the hardware crate clears DMA or releases its global claim;
         // the abandoned DriverSession can therefore never run or Drop later.
-        let reset = unsafe { vibeos_driver_virtio_net::recover_faulted_transport(transport) };
+        let reset = unsafe { crate::queued_network::recover_faulted_transport(transport) };
         IRQ_CAUSES.store(0, Ordering::Release);
         let mut control = CONTROL.lock();
         control.online = false;

@@ -28,3 +28,5 @@ compile_error!("the high-RAM probe requires the ordinary 128 MiB heap contract")
 mod entropy;
 
 mod storage;
+
+mod network;

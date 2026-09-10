@@ -26,44 +26,7 @@ const HEADER_BYTES: usize = NET_HEADER_SIZE as usize;
 const INTERRUPT_STATUS_OFFSET: usize = 0x060;
 const INTERRUPT_ACK_OFFSET: usize = 0x064;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HardwareError {
-    Offline,
-    QueueFull,
-    TimedOut,
-    Protocol,
-    Quarantined,
-    IdentityExhausted,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResetReason {
-    Device,
-    Protocol,
-    Timeout,
-    Cancelled,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReceivedFrame {
-    bytes: [u8; MAX_PACKET_LEN],
-    len: u16,
-}
-
-impl ReceivedFrame {
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..usize::from(self.len)]
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EngineInfo {
-    pub accepted_features: u64,
-    pub epoch: u64,
-    pub rx_inflight: u8,
-    pub tx_inflight: u8,
-    pub quarantined: bool,
-}
+pub use vibeos_hal::queued_network::{Error as HardwareError, ResetReason, ReceivedFrame, Info as EngineInfo};
 
 #[repr(C)]
 struct NetBuffer {
@@ -340,10 +303,7 @@ impl Engine {
             .map_err(|_| HardwareError::Protocol)?;
         publish_receive(submission)?;
         self.transport.notify_queue(NET_RECEIVE_QUEUE);
-        Ok(Some(ReceivedFrame {
-            bytes,
-            len: frame_length as u16,
-        }))
+        Ok(Some(ReceivedFrame::new(bytes, frame_length as u16).ok_or(HardwareError::Protocol)?))
     }
 
     pub fn submit_transmit(&mut self, frame: &[u8], deadline: u64) -> Result<(), HardwareError> {
@@ -699,7 +659,7 @@ mod tests {
     fn received_frame_exposes_only_initialized_prefix() {
         let mut bytes = [0; MAX_PACKET_LEN];
         bytes[..4].copy_from_slice(b"vibe");
-        let frame = ReceivedFrame { bytes, len: 4 };
+        let frame = ReceivedFrame::new(bytes, 4).unwrap();
         assert_eq!(frame.as_bytes(), b"vibe");
     }
 

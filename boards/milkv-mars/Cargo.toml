@@ -1,8 +1,7 @@
 [package]
-name = "vibeos-driver-sdhci-blk"
+name = "vibeos-bsp-milkv-mars"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 vibeos-hal = { path = "../../hal" }
-vibeos-sd-protocol = { path = "../sd-protocol" }

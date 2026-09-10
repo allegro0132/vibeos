@@ -209,9 +209,9 @@ fn install_local(enabled: usize) {
 pub fn init_boot() {
     install_local(SIE_SSIE | SIE_STIE | SIE_SEIE);
     plic::init(sbi::current_hart_id());
-    plic::register(uart::UART_IRQ, uart_irq, 0)
+    plic::register(uart::irq(), uart_irq, 0)
         .expect("UART IRQ must fit in the PLIC handler registry");
-    plic::enable(uart::UART_IRQ).expect("UART IRQ must be a valid PLIC source");
+    plic::enable(uart::irq()).expect("UART IRQ must be a valid PLIC source");
     exec::init_timer();
 }
 

@@ -1,0 +1,30 @@
+{
+  "repository": "https://github.com/milkv-mars/mars-buildroot-sdk",
+  "commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+  "files": [
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110-milkv-mars.dts",
+      "sha256": "be67b70444f960cb649317f8117b472c0878adfc0792484b363dbb791da829bf"
+    },
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110-milkv-mars.dtsi",
+      "sha256": "74ec33a74931aed76cc62a32a00382b5af18b6a30d8c10b50fc1b1985cbbd8fd"
+    },
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110.dtsi",
+      "sha256": "4834672066b8e4d7a2ae14169cc235de904966e8b8c3bc6b03cc5f670ece4a80"
+    },
+    {
+      "path": "linux/arch/riscv/boot/dts/starfive/jh7110-clk.dtsi",
+      "sha256": "e3b4be49e1f972ece717eca63f4713c9b75b225033ac6849e323f1d48c53fdde"
+    },
+    {
+      "path": "u-boot/drivers/clk/starfive/clk-jh7110.c",
+      "sha256": "dd1a15472b1c19f7261009a396439d747f1d7af8a58336354806773c500372ee"
+    },
+    {
+      "path": "u-boot/include/dwmmc.h",
+      "sha256": "fae0542c30334a185e6445e877b3f34b67d37251a91b7e656d39f9aca5ee1964"
+    }
+  ]
+}

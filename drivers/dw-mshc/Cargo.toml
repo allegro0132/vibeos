@@ -1,5 +1,5 @@
 [package]
-name = "vibeos-driver-sdhci-blk"
+name = "vibeos-driver-dw-mshc"
 version = "0.1.0"
 edition = "2021"
 

@@ -43,10 +43,28 @@ Final entry symbols and linking also remain in those crates. Build from one
 firmware directory at a time so Cargo uses `firmware/.cargo/config.toml` and
 does not combine both board features into one kernel archive.
 
+## Firmware-owned early devices
+
+UART and PLIC instances are now composed directly by the final firmware via
+`firmware/early_devices.rs`. The immutable `VIBEOS_EARLY_DEVICES` Rust static
+contains HAL descriptions and operation tables; it needs no heap or mutable
+registration before the first console write. This is an internal static-link
+contract, not a stable module ABI. Firmware supplies the mapping and lifetime
+obligations; the kernel serializes TX, config and PLIC enable updates.
+
+The kernel UART/PLIC adapters contain queues, IRQ-handler publication and
+policy only. They neither access registers nor import a board/driver crate.
+The MMU and other device adapters still use the original composition shown
+above. See `MILKV_MARS.md` for the remaining migration and port work.
+
 ## Driver crates
 
 | Crate | Owns | Deliberately left to the kernel adapter |
 |---|---|---|
+| `drivers/uart16550` | 16550/DW APB register access and interrupt acknowledgement | Console buffering, locks, framing and wakeups |
+| `drivers/plic` | PLIC register access, context reset, enable/claim/complete | Context selection, locking and atomic handler registry |
+| `drivers/sd-protocol` | SD CSD capacity and block/byte address encoding | Controller transport and managed storage policy |
+| `drivers/dw-mshc` | DW-MSHC PIO SD engine; currently unattached | SoC preparation and generic block-service integration remain pending |
 | `drivers/pci` | Generic PCI ECAM discovery, type-0 BAR sizing/assignment, bus-master enablement | Serialized host access, device policy, INTx routing |
 | `drivers/virtio-core` | VirtIO 1.2 wire constants, feature/status machines, descriptors and split-queue lifecycle models | MMIO access, DMA storage, interrupts and device policy |
 | `drivers/virtio-mmio` | Modern VirtIO MMIO probing, register transport, feature and queue setup primitives | Device-specific queues, DMA allocation, interrupts and recovery |

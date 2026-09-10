@@ -183,3 +183,7 @@ bench = false
 
 [dependencies]
 vibeos-kernel = { path = "../../kernel", default-features = false, features = ["qemu-virt", "qemu-default-image"] }
+vibeos-hal = { path = "../../hal" }
+vibeos-bsp-qemu-virt = { path = "../../boards/qemu-virt" }
+vibeos-driver-uart16550 = { path = "../../drivers/uart16550" }
+vibeos-driver-plic = { path = "../../drivers/plic" }

@@ -47,3 +47,7 @@ bench = false
 
 [dependencies]
 vibeos-kernel = { path = "../../kernel", default-features = false, features = ["milkv-duo", "milkv-duo-sd-image"] }
+vibeos-hal = { path = "../../hal" }
+vibeos-bsp-milkv-duo = { path = "../../boards/milkv-duo" }
+vibeos-driver-uart16550 = { path = "../../drivers/uart16550" }
+vibeos-driver-plic = { path = "../../drivers/plic" }

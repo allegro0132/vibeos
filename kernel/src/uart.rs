@@ -1,4 +1,4 @@
-//! 16550-compatible UART driver for the selected board.
+//! Console buffering and scheduling over the firmware-owned UART.
 //!
 //! TX is synchronous (polled) because it is on the panic path. RX is
 //! interrupt-driven: the trap handler fills a ring and wakes whichever task is
@@ -11,54 +11,15 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::exec::WaitQueue;
 use crate::interrupt::SpscByteRing;
 use crate::sync::{SpinGuard, SpinLock};
-use vibeos_hal::Board as BoardContract;
-
-const BOARD_INFO: vibeos_hal::BoardInfo = <crate::platform::Board as BoardContract>::INFO;
-const UART: vibeos_hal::UartDescription = BOARD_INFO.uart;
-const CONSOLE: vibeos_hal::ConsoleCapabilities = BOARD_INFO.console;
-
-pub const UART_BASE: usize = UART.registers.start;
-pub const UART_IRQ: u32 = UART.irq;
-
-const RBR: usize = 0; // read: receive buffer
-const THR: usize = 0; // write: transmit holding
-const IER: usize = 1; // interrupt enable
-const IIR: usize = 2; // read: interrupt identification
-const FCR: usize = 2; // FIFO control
-const LCR: usize = 3; // line control
-const LSR: usize = 5; // line status
-const DW_USR: usize = 0x1f; // DesignWare UART status register
-
-const LSR_RX_READY: u8 = 1 << 0;
-const LSR_BREAK: u8 = 1 << 4;
-const LSR_TX_IDLE: u8 = 1 << 5;
-const LSR_TX_EMPTY: u8 = 1 << 6;
-const IIR_NO_INTERRUPT: u8 = 1 << 0;
-const IIR_BUSY: u8 = 0x07;
-const IIR_RX_TIMEOUT: u8 = 0x0c;
-const DW_USR_BUSY: u8 = 1 << 0;
-
-#[inline]
-fn reg_address(off: usize) -> usize {
-    UART_BASE + (off << UART.register_shift)
+pub fn base() -> usize {
+    hardware().description.registers.start
+}
+pub fn irq() -> u32 {
+    hardware().description.irq
 }
 
-#[inline]
-unsafe fn read_reg(off: usize) -> u8 {
-    match UART.register_width {
-        1 => unsafe { (reg_address(off) as *const u8).read_volatile() },
-        4 => unsafe { (reg_address(off) as *const u32).read_volatile() as u8 },
-        _ => unreachable!("unsupported UART register width"),
-    }
-}
-
-#[inline]
-unsafe fn write_reg(off: usize, value: u8) {
-    match UART.register_width {
-        1 => unsafe { (reg_address(off) as *mut u8).write_volatile(value) },
-        4 => unsafe { (reg_address(off) as *mut u32).write_volatile(u32::from(value)) },
-        _ => unreachable!("unsupported UART register width"),
-    }
+fn hardware() -> &'static vibeos_hal::devices::ConsoleOps {
+    &vibeos_hal::devices::early_devices().console
 }
 
 /// Byte-level state protected by the one UART transmitter lock.
@@ -108,40 +69,10 @@ pub fn init() {
     // Safety: boot initializes UART before enabling the PLIC source or
     // starting the sole shell consumer.
     unsafe { RX.reset_quiescent() };
-    if CONSOLE.usb_keyboard_input {
+    if hardware().capabilities.usb_keyboard_input {
         unsafe { USB_RX.reset_quiescent() };
     }
-    let baud_divisor =
-        (u64::from(UART.clock_hz) + u64::from(UART.baud) * 8) / (u64::from(UART.baud) * 16);
-    assert!(
-        (1..=u16::MAX as u64).contains(&baud_divisor),
-        "UART baud divisor is out of range"
-    );
-    unsafe {
-        // U-Boot can leave its final byte in flight. DesignWare raises a
-        // sticky busy-detect interrupt if LCR is changed before that transfer
-        // completes, so quiesce it before touching the divisor.
-        write_reg(IER, 0x00);
-        while read_reg(LSR) & LSR_TX_EMPTY == 0 {
-            core::hint::spin_loop();
-        }
-        if UART.quirks.busy_detect {
-            while read_reg(DW_USR) & DW_USR_BUSY != 0 {
-                core::hint::spin_loop();
-            }
-        }
-        write_reg(LCR, 0x80); // DLAB on
-        write_reg(0, baud_divisor as u8);
-        write_reg(1, (baud_divisor >> 8) as u8);
-        write_reg(LCR, 0x03); // 8N1, DLAB off
-        write_reg(FCR, 0x07); // enable + clear FIFOs
-        if UART.quirks.busy_detect {
-            // Reading USR clears any busy-detect condition inherited from the
-            // firmware or raised during the line-control transition above.
-            let _ = read_reg(DW_USR);
-        }
-        write_reg(IER, 0x01); // receive-data-available interrupt
-    }
+    (hardware().init)();
 }
 
 /// Emit a boot marker before the normal console and MMU diagnostics exist.
@@ -152,24 +83,13 @@ pub fn init() {
 /// before secondary harts or the executor can introduce another console
 /// writer; one final marker may be emitted immediately after enabling IRQs.
 pub fn early_write(text: &str) {
-    if !CONSOLE.early_uart {
+    if !hardware().capabilities.early_uart {
         return;
     }
     for byte in text.bytes() {
-        unsafe {
-            while read_reg(LSR) & LSR_TX_IDLE == 0 {
-                core::hint::spin_loop();
-            }
-            write_reg(THR, byte);
-        }
+        (hardware().write_byte)(byte);
     }
-    // Unlike ordinary console writes, the next early-boot operation may
-    // reprogram LCR. Wait for both the FIFO and shift register to drain.
-    unsafe {
-        while read_reg(LSR) & LSR_TX_EMPTY == 0 {
-            core::hint::spin_loop();
-        }
-    }
+    (hardware().drain)();
 }
 
 pub fn put(b: u8) {
@@ -205,21 +125,12 @@ pub(crate) fn finish_raw_record_activity() {
 /// The line-state update follows the hardware write, so a successfully
 /// observed LF means the raw stream itself ended at a complete LF boundary.
 fn put_locked(tx: &mut TxState, byte: u8) {
-    unsafe {
-        while read_reg(LSR) & LSR_TX_IDLE == 0 {
-            core::hint::spin_loop();
-        }
-        write_reg(THR, byte);
-    }
+    (hardware().write_byte)(byte);
     tx.observe(byte);
 }
 
 fn wait_tx_fully_empty() {
-    unsafe {
-        while read_reg(LSR) & LSR_TX_EMPTY == 0 {
-            core::hint::spin_loop();
-        }
-    }
+    (hardware().drain)();
 }
 
 /// Explicit framing failures for one raw UART record.
@@ -423,44 +334,28 @@ impl RawTxRecord {
     }
 }
 
-/// Called from the trap handler when the PLIC reports UART_IRQ.
+/// Called by the console IRQ handler registered during boot.
 pub fn handle_irq() {
-    let mut received = false;
-    unsafe {
-        let iir = read_reg(IIR);
-        if UART.quirks.busy_detect && iir & 0x3f == IIR_BUSY {
-            // DW APB busy detect is cleared only by reading USR. Merely
-            // completing the level-triggered PLIC claim would immediately
-            // reclaim IRQ 44 forever and starve the executor.
-            let _ = read_reg(DW_USR);
+    use vibeos_hal::devices::ConsoleInterrupt;
+    match (hardware().interrupt)() {
+        ConsoleInterrupt::None => return,
+        ConsoleInterrupt::BusyCleared => {
             DW_BUSY_IRQS.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if iir & IIR_NO_INTERRUPT != 0 {
+        ConsoleInterrupt::PhantomTimeoutCleared => {
+            DW_PHANTOM_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if UART.quirks.phantom_rx_timeout && iir & 0x3f == IIR_RX_TIMEOUT {
-            let status = read_reg(LSR);
-            if status & (LSR_RX_READY | LSR_BREAK) == 0 {
-                // DesignWare can assert RX timeout with an empty FIFO. Its
-                // documented workaround is one harmless dummy RBR read.
-                let _ = read_reg(RBR);
-                DW_PHANTOM_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        }
-        while read_reg(LSR) & LSR_RX_READY != 0 {
-            let b = read_reg(RBR);
-            // Safety: the boot-hart UART top half is the ring's sole producer.
-            // Failure is a counted newest-byte drop; draining the hardware
-            // FIFO still prevents a level interrupt storm.
-            let _ = RX.push_from_producer(b);
-            received = true;
-        }
+        ConsoleInterrupt::Receive => {}
     }
-    if received {
-        RX_WAIT.wake_all();
+    let mut received = false;
+    while let Some(byte) = (hardware().read_byte)() {
+        // SAFETY: the boot-hart top half remains the sole producer.
+        unsafe { let _ = RX.push_from_producer(byte); }
+        received = true;
     }
+    if received { RX_WAIT.wake_all(); }
 }
 
 pub fn dw_irq_recoveries() -> (u64, u64) {
@@ -474,7 +369,7 @@ pub fn try_read() -> Option<u8> {
     // Safety: console input is owned by the one shell task.
     unsafe {
         RX.pop_from_consumer().or_else(|| {
-            CONSOLE
+            hardware().capabilities
                 .usb_keyboard_input
                 .then(|| USB_RX.pop_from_consumer())
                 .flatten()
@@ -485,15 +380,15 @@ pub fn try_read() -> Option<u8> {
 /// Inject one byte from the sole USB keyboard service. Overflow drops the
 /// newest byte, matching the physical UART receive policy.
 pub fn inject_usb_input(byte: u8) {
-    if !CONSOLE.usb_keyboard_input {
+    if !hardware().capabilities.usb_keyboard_input {
         return;
     }
     let _ = unsafe { USB_RX.push_from_producer(byte) };
     RX_WAIT.wake_all();
 }
 
-pub const fn variant_name() -> &'static str {
-    UART.variant.name()
+pub fn variant_name() -> &'static str {
+    hardware().description.variant.name()
 }
 
 #[allow(dead_code)]

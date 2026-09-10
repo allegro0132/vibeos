@@ -1359,7 +1359,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
     println!(
         "  traps     stvec armed, PLIC ctx S/hart{}, IRQ {} enabled",
         boot_physical_hart,
-        uart::UART_IRQ
+        uart::irq()
     );
 
     // Install the complete fault boundary before World admits any reclaimable

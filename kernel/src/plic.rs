@@ -1,4 +1,4 @@
-//! RISC-V PLIC driver using the selected board's boot-hart S-mode context.
+//! Interrupt registry and serialization over the firmware-owned controller.
 //!
 //! IRQ handlers live in a small, fixed-capacity atomic registry. Registration
 //! never allocates. Dispatch takes one bounded sequence snapshot per slot and
@@ -8,26 +8,12 @@
 use crate::interrupt::{AtomicIrqHandlerSlot, IrqHandlerPublication};
 use crate::sync::SpinLock;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use vibeos_hal::Board as BoardContract;
-
-const PLIC: vibeos_hal::PlicDescription = <crate::platform::Board as BoardContract>::INFO.plic;
-pub const PLIC_BASE: usize = PLIC.registers.start;
-
-const PRIORITY: usize = PLIC_BASE;
-const ENABLE_CONTEXTS: usize = PLIC_BASE + 0x2000;
-const ENABLE_CONTEXT_STRIDE: usize = 0x80;
-const CONTEXTS: usize = PLIC_BASE + 0x20_0000;
-const CONTEXT_STRIDE: usize = 0x1000;
-const CLAIM_OFFSET: usize = 4;
 const UNINITIALIZED_CONTEXT: usize = usize::MAX;
 
 // VibeOS routes every external interrupt through the selected boot hart. QEMU
 // has M/S pairs per hart; CV1800B's stock DT exposes S context 1 for C906B.
 static BOOT_S_CONTEXT: AtomicUsize = AtomicUsize::new(UNINITIALIZED_CONTEXT);
 
-// Clear only words implemented by the selected PLIC. QEMU retains the full
-// 0x80-byte/1024-source context while CV1800B implements sources 1..=101.
-const ENABLE_WORDS: usize = (PLIC.max_irq as usize + 32) / 32;
 pub const MAX_HANDLERS: usize = 16;
 
 /// Allocation-free top-half callback. `context` is the value supplied during
@@ -56,22 +42,16 @@ static ENABLE_LOCK: SpinLock<()> = SpinLock::new(());
 
 /// Reset the boot physical hart's S-mode PLIC context to a fully masked state.
 pub fn init(physical_hart: usize) {
-    let context = <crate::platform::Board as BoardContract>::plic_s_context(physical_hart)
+    let context = (hardware().supervisor_context)(physical_hart)
         .expect("boot hart has no S-mode PLIC context on the selected platform");
     BOOT_S_CONTEXT.store(context, Ordering::Release);
     let _writer = HANDLER_WRITER.lock();
     for slot in &HANDLERS {
-        // Safety: HANDLER_WRITER is the sole registry writer and interrupts
-        // have not been enabled while PLIC initialization runs.
+        // SAFETY: this is the sole writer, before interrupts are enabled.
         unsafe { slot.publish_exclusive(None) };
     }
     let _enable = ENABLE_LOCK.lock();
-    unsafe {
-        threshold_reg().write_volatile(0);
-        for word in 0..ENABLE_WORDS {
-            enable_reg(word).write_volatile(0);
-        }
-    }
+    (hardware().init_context)(context);
 }
 
 /// Register a handler without enabling its interrupt source.
@@ -79,7 +59,7 @@ pub fn init(physical_hart: usize) {
 /// Keeping registration and enabling separate lets callers finish device
 /// initialization before the first top half can run.
 pub fn register(irq: u32, handler: IrqHandler, context: usize) -> Result<(), RegisterError> {
-    if irq > PLIC.max_irq {
+    if irq > hardware().description.max_irq {
         return Err(RegisterError::InvalidIrq);
     }
     crate::interrupt::plic_enable_location(irq).ok_or(RegisterError::InvalidIrq)?;
@@ -165,33 +145,17 @@ pub fn disable(irq: u32) -> Result<(), RegisterError> {
 }
 
 fn set_enabled(irq: u32, enabled: bool) -> Result<(), RegisterError> {
-    if irq > PLIC.max_irq {
+    if irq > hardware().description.max_irq {
         return Err(RegisterError::InvalidIrq);
     }
-    let (word, bit) =
-        crate::interrupt::plic_enable_location(irq).ok_or(RegisterError::InvalidIrq)?;
+    crate::interrupt::plic_enable_location(irq).ok_or(RegisterError::InvalidIrq)?;
     let _enable = ENABLE_LOCK.lock();
-    unsafe {
-        let reg = enable_reg(word);
-        let current = reg.read_volatile();
-        let mask = 1u32 << bit;
-        reg.write_volatile(if enabled {
-            current | mask
-        } else {
-            current & !mask
-        });
-        // A source only needs a non-zero priority to pass threshold zero.
-        if enabled {
-            ((PRIORITY + irq as usize * 4) as *mut u32).write_volatile(1);
-        }
-    }
+    (hardware().set_enabled)(boot_context(), irq, enabled);
     Ok(())
 }
 
-#[inline]
-unsafe fn enable_reg(word: usize) -> *mut u32 {
-    (ENABLE_CONTEXTS + boot_context() * ENABLE_CONTEXT_STRIDE + word * core::mem::size_of::<u32>())
-        as *mut u32
+fn hardware() -> &'static vibeos_hal::devices::InterruptControllerOps {
+    &vibeos_hal::devices::early_devices().interrupts
 }
 
 #[inline]
@@ -204,21 +168,10 @@ fn boot_context() -> usize {
     context
 }
 
-#[inline]
-unsafe fn threshold_reg() -> *mut u32 {
-    (CONTEXTS + boot_context() * CONTEXT_STRIDE) as *mut u32
-}
-
-#[inline]
-unsafe fn claim_reg() -> *mut u32 {
-    (CONTEXTS + boot_context() * CONTEXT_STRIDE + CLAIM_OFFSET) as *mut u32
-}
-
 pub fn claim() -> Option<u32> {
-    let irq = unsafe { claim_reg().read_volatile() };
-    (irq != 0).then_some(irq)
+    (hardware().claim)(boot_context())
 }
 
 pub fn complete(irq: u32) {
-    unsafe { claim_reg().write_volatile(irq) };
+    (hardware().complete)(boot_context(), irq);
 }

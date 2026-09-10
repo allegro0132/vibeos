@@ -16,3 +16,8 @@ _start:
 );
 
 extern crate vibeos_kernel;
+
+use vibeos_bsp_milkv_duo::Board;
+use vibeos_hal::Board as BoardContract;
+#[path = "../../early_devices.rs"]
+mod early_devices;

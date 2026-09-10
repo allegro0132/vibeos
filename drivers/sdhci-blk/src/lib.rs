@@ -1015,14 +1015,14 @@ fn command_word(index: u8, flags: u16) -> u16 {
 }
 
 fn sector_argument(high_capacity: bool, physical_sector: u64) -> Result<u32, Error> {
-    let address = if high_capacity {
-        physical_sector
-    } else {
-        physical_sector
-            .checked_mul(SECTOR_SIZE as u64)
-            .ok_or(Error::OutOfRange)?
-    };
-    u32::try_from(address).map_err(|_| Error::OutOfRange)
+    vibeos_sd_protocol::sector_argument(high_capacity, physical_sector).map_err(protocol_error)
+}
+
+fn protocol_error(error: vibeos_sd_protocol::Error) -> Error {
+    match error {
+        vibeos_sd_protocol::Error::OutOfRange => Error::OutOfRange,
+        vibeos_sd_protocol::Error::Unsupported => Error::Unsupported,
+    }
 }
 
 const fn validate_sector(capacity_sectors: u64, physical_sector: u64) -> Result<(), Error> {
@@ -1058,29 +1058,7 @@ fn validate_block_range(
 }
 
 fn capacity_from_csd(csd: [u32; 4]) -> Result<u64, Error> {
-    match unstuff(csd, 126, 2) {
-        1 => Ok((u64::from(unstuff(csd, 48, 22)) + 1) * 1024),
-        0 => {
-            let read_block_len = unstuff(csd, 80, 4);
-            let size = u64::from(unstuff(csd, 62, 12)) + 1;
-            let multiplier = unstuff(csd, 47, 3) + 2;
-            let bytes = size
-                .checked_shl(multiplier + read_block_len)
-                .ok_or(Error::Unsupported)?;
-            Ok(bytes / SECTOR_SIZE as u64)
-        }
-        _ => Err(Error::Unsupported),
-    }
-}
-
-fn unstuff(response: [u32; 4], start: usize, size: usize) -> u32 {
-    let offset = 3 - start / 32;
-    let shift = start & 31;
-    let mut value = response[offset] >> shift;
-    if size + shift > 32 {
-        value |= response[offset - 1] << (32 - shift);
-    }
-    value & ((1u32 << size) - 1)
+    vibeos_sd_protocol::capacity_from_csd(csd).map_err(protocol_error)
 }
 
 #[cfg(test)]

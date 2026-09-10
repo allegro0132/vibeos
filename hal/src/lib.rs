@@ -7,6 +7,9 @@
 //! drivers consume the smaller device-specific descriptions.
 
 pub mod arch;
+pub mod devices;
+pub mod memory;
+pub mod fdt;
 
 /// Largest Ethernet frame handled by the network interface contract,
 /// excluding the four-byte frame check sequence supplied and consumed by the
@@ -301,4 +304,15 @@ pub trait Board {
 
     /// Return the supervisor PLIC context for an OpenSBI-visible physical hart.
     fn plic_s_context(physical_hart: usize) -> Option<usize>;
+}
+
+/// DesignWare MSHC resource contract, independent of a specific SoC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DwMshcDescription {
+    pub registers: AddressRange,
+    pub irq: u32,
+    pub source_clock_hz: u32,
+    pub data_clock_hz: u32,
+    pub fifo_depth_words: u16,
+    pub fifo_offset: usize,
 }

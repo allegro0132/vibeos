@@ -1478,6 +1478,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-bsp-milkv-mars"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
+]
+
+[[package]]
 name = "vibeos-bsp-qemu-virt"
 version = "0.1.0"
 dependencies = [
@@ -1613,6 +1620,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-driver-dw-mshc"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
+ "vibeos-sd-protocol",
+]
+
+[[package]]
 name = "vibeos-driver-dwc2-host"
 version = "0.1.0"
 dependencies = [
@@ -1642,11 +1657,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-driver-plic"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
+]
+
+[[package]]
 name = "vibeos-driver-rtl815x"
 version = "0.1.0"
 
 [[package]]
 name = "vibeos-driver-sdhci-blk"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
+ "vibeos-sd-protocol",
+]
+
+[[package]]
+name = "vibeos-driver-uart16550"
 version = "0.1.0"
 dependencies = [
  "vibeos-hal",
@@ -1715,6 +1745,10 @@ dependencies = [
 name = "vibeos-firmware-milkv-duo"
 version = "0.1.0"
 dependencies = [
+ "vibeos-bsp-milkv-duo",
+ "vibeos-driver-plic",
+ "vibeos-driver-uart16550",
+ "vibeos-hal",
  "vibeos-kernel",
 ]
 
@@ -1722,6 +1756,10 @@ dependencies = [
 name = "vibeos-firmware-qemu-virt"
 version = "0.1.0"
 dependencies = [
+ "vibeos-bsp-qemu-virt",
+ "vibeos-driver-plic",
+ "vibeos-driver-uart16550",
+ "vibeos-hal",
  "vibeos-kernel",
 ]
 
@@ -1894,6 +1932,10 @@ dependencies = [
 
 [[package]]
 name = "vibeos-rustc"
+version = "0.1.0"
+
+[[package]]
+name = "vibeos-sd-protocol"
 version = "0.1.0"
 
 [[package]]

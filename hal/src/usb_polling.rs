@@ -307,3 +307,27 @@ extern "Rust" {
 pub fn host() -> &'static Host {
     unsafe { &VIBEOS_POLLING_USB_HOST }
 }
+
+/// Owned, implementation-private rollback words, interpreted only by platform
+/// callbacks. This is part of static Rust composition, not a dynamic module ABI.
+pub struct PlatformState(pub [usize; 4]);
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlatformTelemetry {
+    pub clock_enable_1: u32,
+    pub clock_enable_2: u32,
+    pub role_override: u32,
+    pub phy_utmi_control: u32,
+}
+/// # Safety
+/// Caller serializes preparation, rollback and controller access. Failed
+/// preparation must restore any resources it changed. On subsequent controller
+/// failure, rollback consumes the exact successful prepare token once. After
+/// success the controller retains platform resources until shutdown; dropping
+/// the token alone does not undo initialization. DMA operations synchronize all
+/// required cache levels on the selected SoC.
+pub struct Platform {
+    pub prepare: unsafe fn(u64, fn() -> u64) -> Result<PlatformState, Error>,
+    pub rollback: unsafe fn(PlatformState),
+    pub telemetry: unsafe fn() -> PlatformTelemetry,
+    pub dma: &'static crate::memory::DmaOps,
+}

@@ -1,0 +1,62 @@
+{
+  "status": "DWC2 platform and DMA separation verified in software; Mars incomplete",
+  "host_tests": 37,
+  "qemu_selftests": 390,
+  "duo_release_build": "passed",
+  "dma_layout": {
+    "elf": "target/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo",
+    "sha256": "69edb150d4f92a2d1e9f4a1dc81f93a005a01cc66e8d4f236585afc67ab8b1e7",
+    "section": [
+      "0x805de000",
+      "0x805f8000"
+    ],
+    "usb_dma": {
+      "address": "0x805de000",
+      "bytes": 2048,
+      "cache_isolated": true,
+      "reachable_32bit": true
+    }
+  },
+  "mutation": "Removing platform rollback fails core-initialization-error test in isolated driver copy",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage15-host.log",
+      "sha256": "c89dd3d2a673a0ca022cd954185ad629b7c20faeed84f9438434528a6d31192f"
+    },
+    {
+      "path": "target/mars-reference/stage15-bsp-tests.log",
+      "sha256": "447ca8bb272bf5e18f36857e101a5c8c10728ab616ca3e526bc1a5a3b8ae94f2"
+    },
+    {
+      "path": "target/mars-reference/stage15-mutation.log",
+      "sha256": "74705af5b937c4027bd9accc3297bde83dbe23be1236c6ab806ff8136251af24"
+    },
+    {
+      "path": "target/mars-reference/stage15-qemu-selftest.log",
+      "sha256": "22cdcae0a870a426f97b5c394ce08387f09c2fbb92eba34b5bdf100300d651b0"
+    },
+    {
+      "path": "target/mars-reference/stage15-duo-build.log",
+      "sha256": "b18f414728b619098bccf5bbd5fc5deb63e9b9ecf113460a3d9c20e133a684ec"
+    },
+    {
+      "path": "target/mars-reference/stage15-boundary-audit.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage15-driver-resource-audit.log",
+      "sha256": "320bd96636d2a56796ed846e43bc3736ba2ccca49620736f6b5c776861eef843"
+    },
+    {
+      "path": "target/mars-reference/stage15-dma-layout.json",
+      "sha256": "30dfef7dfdfe25051d06b820b86d7234768b6cdd840f35ee755a5939fd10f665"
+    }
+  ],
+  "hardware_acceptance": "not run; no physical UTMI or DMA coherence claim",
+  "remaining": [
+    "Board-feature and service decoupling",
+    "Shared MDIO/PHY support; Mars firmware and JH7110 SD/EQoS integration",
+    "Boot firmware and flashable SD image",
+    "Physical serial/SSH, entropy qualification and stability acceptance"
+  ]
+}

@@ -69,9 +69,7 @@ pub const SDHCI: SdhciDescription = SdhciDescription {
 };
 pub const DWC2: Dwc2Description = Dwc2Description {
     registers: AddressRange::new(USB_BASE, USB_MMIO_END),
-    phy: AddressRange::new(USB_PHY_BASE, USB_PHY_END),
     irq: USB_IRQ,
-    soc_control: AddressRange::new(SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END),
     dma_address_bits: 32,
     cache_line_bytes: 64,
 };

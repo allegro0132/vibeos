@@ -3,3 +3,4 @@
 pub mod sd;
 pub mod ethernet;
 pub mod cache;
+pub mod usb;

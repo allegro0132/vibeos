@@ -377,3 +377,20 @@ and direction, failed setup rollback and DMA address boundaries. These checks
 plus Duo compilation and QEMU regression do not validate physical Ethernet,
 cache coherence, or Mars entropy. DWC2 still needs its remaining SoC split;
 shared MDIO/PHY helpers and Mars EQoS/SD integration remain pending.
+
+### USB SoC and cache separation stage
+
+DWC2 no longer receives TOP/PHY apertures or embeds C906 cache instructions.
+Firmware selects CV1800B platform preparation, rollback, diagnostics and the
+shared DMA operation table. The original clock/host-role/UTMI pulse/100-us delay
+sequence and reverse-order clock rollback are preserved. Initialization errors
+before platform success do not invoke core accesses or rollback; core errors
+after successful preparation consume the platform token and release the claim.
+The fixed DMA pool is checked for controller reach and cache isolation.
+
+Host tests cover the exact preparation/rollback event sequence, retry after
+both failure classes, minimum delay/timer wrap and DMA ownership directions.
+Removing rollback fails the driver regression. QEMU regression and Duo builds
+remain software evidence only; no Duo UTMI timing or Mars DMA/entropy validation
+is claimed. Board-feature/service decoupling, shared PHY support, Mars firmware,
+boot components and the flashable SD image still remain to be implemented.

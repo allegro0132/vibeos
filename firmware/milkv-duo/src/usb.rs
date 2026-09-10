@@ -21,7 +21,14 @@ pub static VIBEOS_POLLING_USB_HOST: Host = Host {
         if let Some(c) = (*STATE.0.get()).as_ref() {
             return Ok(c.info());
         }
-        let c = Controller::initialize(Board::INFO.dwc2.unwrap(), &DMA, &INSTANCE, hz, time)?;
+        let c = Controller::initialize(
+            Board::INFO.dwc2.unwrap(),
+            &PLATFORM,
+            &DMA,
+            &INSTANCE,
+            hz,
+            time,
+        )?;
         let info = c.info();
         *STATE.0.get() = Some(c);
         Ok(info)
@@ -66,4 +73,34 @@ pub static VIBEOS_POLLING_USB_HOST: Host = Host {
     write_sector: |sector, bytes| unsafe { controller().write_sector(sector, bytes) },
     hub_topology_changed: || unsafe { controller().hub_topology_changed() },
     poll_keyboard: || unsafe { controller().poll_keyboard() },
+};
+
+unsafe fn platform(
+    hz: u64,
+    time: fn() -> u64,
+) -> Result<vibeos_platform_cv1800b::usb::Usb<vibeos_platform_cv1800b::usb::Mmio>, Error> {
+    use vibeos_bsp_milkv_duo::{SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END, USB_PHY_BASE, USB_PHY_END};
+    use vibeos_hal::AddressRange;
+    Ok(vibeos_platform_cv1800b::usb::Usb(
+        vibeos_platform_cv1800b::usb::Mmio::new(
+            AddressRange::new(SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END),
+            AddressRange::new(USB_PHY_BASE, USB_PHY_END),
+            hz,
+            time,
+        )?,
+    ))
+}
+static PLATFORM: vibeos_hal::usb_polling::Platform = vibeos_hal::usb_polling::Platform {
+    prepare: |hz, time| unsafe { Ok(platform(hz, time)?.prepare()) },
+    rollback: |saved| unsafe {
+        platform(Board::INFO.timebase_hz, || 0)
+            .expect("valid USB platform wiring")
+            .rollback(saved)
+    },
+    telemetry: || unsafe {
+        platform(Board::INFO.timebase_hz, || 0)
+            .expect("valid USB platform wiring")
+            .telemetry()
+    },
+    dma: &vibeos_platform_cv1800b::cache::DMA,
 };

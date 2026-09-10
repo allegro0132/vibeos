@@ -256,13 +256,11 @@ pub struct SdhciDescription {
     pub data_clock_hz: u32,
 }
 
-/// Synopsys DWC2 USB 2.0 OTG core plus SoC-specific PHY and role wiring.
+/// Synopsys DWC2 controller resources; platform PHY/role wiring is separate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Dwc2Description {
     pub registers: AddressRange,
-    pub phy: AddressRange,
     pub irq: u32,
-    pub soc_control: AddressRange,
     pub dma_address_bits: u8,
     pub cache_line_bytes: usize,
 }

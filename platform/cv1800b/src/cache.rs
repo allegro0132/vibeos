@@ -13,7 +13,9 @@ pub static DMA: DmaOps = DmaOps {
         alignment: 64,
         cache_line: 64,
     },
-    sync_for_device: |r, _direction| unsafe { sync(r, true) },
+    sync_for_device: |r, direction| unsafe {
+        sync(r, !matches!(direction, DmaDirection::FromDevice))
+    },
     sync_for_cpu: |r, direction| unsafe { sync(r, matches!(direction, DmaDirection::ToDevice)) },
 };
 unsafe fn sync(r: DmaRegion, clean: bool) {

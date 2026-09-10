@@ -211,3 +211,12 @@ The complete pre-migration PHY register sequence is retained as a golden trace
 for fallback and programmed eFuse paths. This verifies software ordering; host
 cache tests only execute compiler fences and cannot establish physical DMA
 coherence. JH7110 must provide its own cache implementation and EQoS controller.
+
+DWC2 now receives only controller resources plus firmware-selected USB platform
+and DMA operations. CV1800B clock enables, role override and the UTMI reset pulse
+are owned by `platform/cv1800b/usb`. Successful preparation returns an owned
+opaque rollback token; failed controller initialization passes that token back
+before releasing the instance claim. Failed platform preparation never accesses
+the USB core. Successful initialization retains the platform resources.
+The shared C906 DMA implementation preserves USB input invalidation and output
+cleaning, and remains outside all controller crates.

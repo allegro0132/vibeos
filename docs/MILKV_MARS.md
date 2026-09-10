@@ -1,9 +1,9 @@
 # Milk-V Mars port status
 
 Target: standard Milk-V Mars with 4 GiB RAM, microSD boot, serial and SSH
-acceptance. This is an **incomplete port**. A serial/SD bring-up firmware
-payload now builds; a flashable SD image and hardware qualification are still
-outstanding.
+acceptance. This is an **incomplete port**. A 641 MiB serial/SD test image now
+builds with paired SPL/OpenSBI/U-Boot. Hardware qualification, EQoS and SSH
+remain outstanding. See [image instructions](../firmware/milkv-mars/bootchain/README.md).
 
 ## Implemented foundation
 
@@ -29,7 +29,7 @@ outstanding.
   reservations without allocation. `hal::memory` subtracts reservations
   transactionally and validates complete DMA spans and cache-line isolation.
   DTB admission now publishes reservation-subtracted heap ranges in the QEMU
-  acceptance composition; production Mars composition is still pending. The MMU consumes
+  acceptance composition and Mars serial/SD composition. The MMU consumes
   the firmware boot contract and its RAM table arena, supports multiple GiB
   windows and 2 MiB RAM leaves, and pre-splits permission-changing pools.
 - `boards/milkv-mars` describes the target and admits DTB memory within its
@@ -73,25 +73,17 @@ must establish them before attaching the relevant controller.
 
 ## Remaining implementation
 
-1. Extend the firmware device registration contract to the remaining hardware
-   engines. BSP dependencies are removed; remove remaining driver dependencies, preserving device
-   capability lifetimes, DMA quarantine, queue cancellation and recovery.
-2. Implement JH7110 clock/reset/pinmux preparation and verify DMA coherence for
+1. Implement JH7110 clock/reset/pinmux preparation and verify DMA coherence for
    the GMAC path. Add the GMAC5/EQoS engine and PHY setup using the Mars wiring.
-3. Connect the DW-MSHC engine to the generic block service. Preserve the existing
-   managed-range and write-certainty contracts; reserve separate boot/data
-   partitions in image policy. Add device timeout and recovery acceptance.
-4. Integrate the boot DTB parser with hart, timebase, resource and image
-   validation. The live MMU now supports multiple GiB windows and large RAM
-   leaves with fine protection boundaries. Connect admitted DTB free ranges to
-   allocation and exclude reserved pages from the live map.
-5. Add `firmware/milkv-mars`, a linker layout and reproducible SD packaging.
-   Qualify a matching SPL/OpenSBI/U-Boot configuration with HSM/IPI/RFENCE/TIME.
-   Do not update SPI as part of this test-card workflow.
-6. Generalize service image features, provision a separate Mars identity,
+2. Qualify DW-MSHC data-only IO, persistence, timeout/reset behavior and protection
+   of boot partitions on the board.
+3. Qualify the paired SPL/OpenSBI/U-Boot image, four-core HSM startup, IPI,
+   fences, timer, DTB reservations and guarded mappings on physical Mars.
+   Confirm board revision/SD boot selector; do not update SPI in this workflow.
+4. Provision a separate Mars identity,
    qualify the entropy source, and enable SSH/WASM/Wasmtime only after these
    prerequisites work on the board.
-7. Capture three cold boots and an hour of simultaneous storage, networking and
+5. Capture three cold boots and an hour of simultaneous storage, networking and
    WASM activity. Supply the serial device, SSH address/user/key and test-card
    device explicitly; never infer these from the existing Duo setup.
 
@@ -752,3 +744,40 @@ QEMU profile and Duo build are retained. Mutations removing the HSM requirement,
 partition offset enforcement, absent-NIC claim guard or ELF heap-ceiling check
 are detected. Physical Mars serial, SD, four-core and fence behavior, EQoS/DMA,
 entropy, SSH/WASM acceptance and the bootable SD packaging are still pending.
+
+### Paired boot firmware and test SD image
+
+The stage above's missing boot packaging is now implemented. Run
+`sh scripts/build-mars-sd.sh` to produce
+`target/mars-boot/out/mars-serial-sd.img`, a 641 MiB regular disk image with
+official SPL/DDR initialization, OpenSBI 1.2, U-Boot 2021.10, VibeOS FIT and
+the exact previously admitted SDK Mars DTB. The pinned Ubuntu tools container
+builds on this host's Linux/aarch64 Docker environment with GCC 11.4/binutils
+2.38; the output contains complete tool/package versions and configs.
+
+The SPL/firmware partitions retain SDK offsets/types. The FAT boot partition
+ends at 128 MiB; the 512 MiB VibeOS data partition begins there, matching the
+firmware's enforced block window. The data partition is initially blank. The
+packer only creates a new regular file and refuses existing paths, including
+device nodes and symlinks. It does not write an SD card or change SPI.
+
+The paired U-Boot uses no persistent SPI environment, runs without S-mode SMP,
+and loads `vibeos.itb` from SD partition 3 at `0x46000000`. The FIT requests the
+RISC-V Linux `bootm` calling convention at `0x40200000`. SPL SMP is retained;
+the compiled OpenSBI ELF contains HSM, IPI, RFENCE and TIME extensions. Those
+static facts do not prove actual secondary-hart startup or handoff behavior.
+
+Five host image tests include CRC corruption, a rechecksummed partition-boundary
+mutation, payload tampering, nonblank data and overwrite rejection. Two tests
+in the tools container inspect actual boot artifacts and detect SPL CRC, HSM,
+SPI environment and FIT payload mutations. Independent GPT/FAT checks pass.
+The compiled DTB hash matches `resource-reference.json`; the VibeOS payload
+hash matches the stage-24 ELF build. No new real-Mars or emulator boot of this
+Mars boot chain has been performed. Evidence is recorded in
+`boards/milkv-mars/bootchain-image-evidence.json`.
+
+See [boot instructions](../firmware/milkv-mars/bootchain/README.md) for hardware
+revision and SD-selector requirements. The image is suitable for writing to
+the selected test card, but **the Mars port remains incomplete**: physical
+serial/four-core/SD qualification, EQoS/DMA, entropy, SSH/WASM, three cold boots
+and the one-hour concurrent stability run remain required.

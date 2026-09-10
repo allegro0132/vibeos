@@ -11,6 +11,7 @@ scripts/test-wasi-qemu.py --threads that needs no compiler on the host.
 
 usage: test-wasi-threads-fixtures.py KERNEL WORK FIXTURES_DIR THREADS_WASM COREMARK_THREADS_WASM
   FIXTURES_DIR: output of `cargo run -p vibeos-wasi-runtime --example fixtures -- DIR`
+  THREADS_WASM: `-` skips the prebuilt pthreads checks on a host without wasi-sdk
 """
 import hashlib, importlib.util, json, os, re, shlex, socket, subprocess, sys, time
 from pathlib import Path
@@ -18,9 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if len(sys.argv) != 6:
     sys.exit(__doc__)
 kernel, work, fixtures, pthreads, coremark = (Path(a).resolve() for a in sys.argv[1:6])
+skip_pthreads = sys.argv[4] == '-'
 work.mkdir(parents=True, exist_ok=True)
 spec = importlib.util.spec_from_file_location('peer', ROOT/'scripts/openssh-peer.py')
 peer = importlib.util.module_from_spec(spec); sys.modules['peer'] = peer; spec.loader.exec_module(peer)
+sys.path.insert(0, str(ROOT/'scripts'))
+from wasi_threads_cases import FIXTURES, PTHREADS
 with socket.socket() as sock:
     sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
 env = dict(os.environ, WASI_WORK_DIR=str(work), WASI_SSH_PORT=str(port), WASI_SKIP_BUILD='1', WASI_KERNEL=str(kernel),
@@ -31,18 +35,12 @@ results = []
 def boot_text():
     return (work/'boot.log').read_text(errors='replace')
 try:
-    end = time.monotonic()+300
-    while 'vsh> ' not in boot_text():
-        assert vm.poll() is None and time.monotonic() < end, 'boot failed'
-        time.sleep(.5)
-    command = peer._base_ssh_command('ssh', '127.0.0.1', port, 'vibe', work/'id_ed25519', work/'known_hosts', 30, None)
+    peer.wait_for_vsh(work/'boot.log', vm)
+    command = peer.vsh_ssh_command(port, work)
     def ssh(words, data=b'', timeout=120):
         before = (work/'boot.log').stat().st_size
-        for attempt in range(4):
-            p = subprocess.run([*command, shlex.join(words)], input=data, capture_output=True, timeout=timeout)
-            if p.returncode == 255 and (b'kex_exchange_identification:' in p.stderr or b'not responding' in p.stderr):
-                time.sleep(1); continue
-            break
+        p = peer.run_ssh_retrying(command, shlex.join(words), data, timeout,
+                                  began=lambda: b'WASI ' in (work/'boot.log').read_bytes()[before:])
         # Wait for the reaper's lifecycle line before the next request; a
         # request that arrives earlier is refused as busy (75) by design.
         deadline = time.monotonic()+60
@@ -69,15 +67,15 @@ try:
             vm.stdin.write(b'ps\n'); vm.stdin.flush(); time.sleep(5)
             print('VSH PS:\n' + (work/'boot.log').read_bytes()[before:].decode(errors='replace'), flush=True)
         assert ok, (case, p.returncode, p.stdout[-300:], p.stderr[-300:], text[-1500:])
-    for name, status in [('threads-atomics', 0), ('threads-counter', 0), ('threads-wait-timeout', 0), ('threads-exit', 7),
-                         ('threads-spawn-cap', 3), ('threads-grow', 0), ('threads-fault', 125), ('threads-busy', 124),
-                         ('threads-defined-shared', 126), ('threads-no-start', 126)]:
+    for name, status in FIXTURES:
         upload(name+'.wasm', (fixtures/f'{name}.wasm').read_bytes())
         check(name, [name+'.wasm'], status)
-    upload('c-threads.wasm', pthreads.read_bytes())
-    check('pthreads', ['c-threads.wasm'], 0, b'sum=3000 cond=1\n')
-    check('pthreads exit', ['c-threads.wasm', 'exit'], 7, b'')
-    check('pthreads spawnmany', ['c-threads.wasm', 'spawnmany'], 0, b'eagain=1 created=3\n')
+    if skip_pthreads:
+        print('SKIP pthreads checks (no prebuilt tests/wasi/threads.c program)', flush=True)
+    else:
+        upload('c-threads.wasm', pthreads.read_bytes())
+        for args, status, out in PTHREADS:
+            check(' '.join(['pthreads', *args]), ['c-threads.wasm', *args], status, out)
     upload('coremark.wasm', coremark.read_bytes())
     # Ordinary fuel: ~10 iterations per worker fit; the join hand-off races the
     # last fuel yield of each worker, which is the case the probe must survive.

@@ -32,13 +32,10 @@ def wait_for(marker, before, timeout):
     return False
 ok = True
 try:
-    end = time.monotonic()+300
-    while 'vsh> ' not in text():
-        assert vm.poll() is None and time.monotonic() < end, 'boot failed'
-        time.sleep(.5)
-    command = peer._base_ssh_command('ssh', '127.0.0.1', port, 'vibe', work/'id_ed25519', work/'known_hosts', 30, None)
+    peer.wait_for_vsh(work/'boot.log', vm)
+    command = peer.vsh_ssh_command(port, work)
     data = (ROOT/'target/coremark-wasi/coremark-threads.wasm').read_bytes()
-    p = subprocess.run([*command, shlex.join(['wasm-upload', 'coremark.wasm', str(len(data)), hashlib.sha256(data).hexdigest()])], input=data, capture_output=True, timeout=120)
+    p = peer.run_ssh_retrying(command, shlex.join(['wasm-upload', 'coremark.wasm', str(len(data)), hashlib.sha256(data).hexdigest()]), data, 120)
     assert p.returncode == 0, p.stderr
     for round in range(rounds):
         for workers in (3, 2):

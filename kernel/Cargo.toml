@@ -5,6 +5,11 @@ edition = "2021"
 autobins = false
 
 [features]
+# Production Duo command image; never pulls in QEMU test identities.
+milkv-wasmtime = ["milkv-command", "wasi-preview1", "vibeos-sshd/wasi-exec", "wasmtime-command-fuel-batch", "wasmtime-threads"]
+python-command = ["wasi-preview1", "vibeos-wasi-runtime/python-wasi", "vibeos-sshd/python-wasi"]
+python-wasi = ["wasi-ssh-upload", "python-command", "vibeos-bsp-qemu-virt?/python-wasi"]
+milkv-python = ["milkv-command", "python-command", "vibeos-wasi-runtime/python-duo"]
 # Command images generate code for the scalar extensions every schedulable
 # hart advertised at boot (see `wasmtime-discovered-isa`); a target without
 # them still receives RV64GC code.
@@ -25,11 +30,17 @@ wasmtime-discovered-isa = ["wasmtime-native"]
 wasmtime-coremark-probe = ["wasmtime-native"]
 wasmtime-native = ["dep:vibeos-wasmtime-runtime"]
 # Explicit long-running benchmark image; ordinary commands retain 10 million fuel.
-wasi-benchmark = ["wasi-ssh-upload", "vibeos-core/alloc-site-trace"]
+wasi-long-fuel = []
+wasi-benchmark = ["wasi-ssh-upload", "vibeos-core/alloc-site-trace", "wasi-long-fuel"]
 wasi-rv64-cache = ["wasi-ssh-upload", "vibeos-wasi-runtime/rv64-cache"]
 wasi-preview1 = ["file-tree", "dep:vibeos-wasi-runtime", "dep:vibeos-wasi-command"]
 wasi-ssh-upload = ["wasi-ssh"]
-wasi-ssh = ["wasi-preview1", "ssh-test", "vibeos-sshd/wasi-exec"]
+wasi-ssh = ["ssh-commands", "wasi-preview1", "ssh-test", "vibeos-sshd/wasi-exec"]
+# Provisioned Duo command images admit WASI requests for the live production
+# SSH profile. Every milkv-* command image enables this; the request path
+# itself is shared with the QEMU test identity through `ssh-commands`.
+milkv-command = ["milkv-ssh", "ssh-commands"]
+ssh-commands = []
 default = ["qemu-virt", "qemu-default-image"]
 qemu-virt = ["dep:vibeos-bsp-qemu-virt", "dep:vibeos-driver-pci", "dep:vibeos-driver-virtio-blk", "dep:vibeos-driver-virtio-core", "dep:vibeos-driver-virtio-mmio", "dep:vibeos-driver-virtio-net", "dep:vibeos-driver-virtio-rng", "dep:vibeos-driver-xhci", "vibeos-vsh/pci-usb-help"]
 milkv-duo = ["dep:vibeos-bsp-milkv-duo", "dep:vibeos-driver-dwmac-net", "dep:vibeos-driver-dwc2-host", "dep:vibeos-driver-milkv-duo-led", "dep:vibeos-driver-sdhci-blk"]

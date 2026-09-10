@@ -10,9 +10,20 @@ pub trait Streams: Send + 'static {
     fn close(&mut self, _fd: u32) -> Result<(), i32> { Ok(()) }
     fn read(&mut self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<Result<usize, i32>>;
     fn write(&mut self, cx: &mut Context<'_>, fd: u32, bytes: &[u8]) -> Poll<Result<usize, i32>>;
-    /// Output bytes the whole invocation may still emit across every guest
-    /// thread. The per-store 65,536-byte ceiling always applies as well.
-    fn output_remaining(&self) -> usize { usize::MAX }
+    /// Reserve output bytes against the whole invocation's ceiling before a
+    /// write; the grant may be smaller than `want`, and zero means the
+    /// ceiling is exhausted. Reserving first is what keeps several guest
+    /// threads from spending the same remaining bytes. The per-store
+    /// 65,536-byte ceiling always applies as well.
+    fn reserve_output(&mut self, want: usize) -> usize { want }
+    /// Return the part of a reservation the write did not use.
+    fn release_output(&mut self, _unused: usize) {}
+}
+/// Give back the unused part of an output reservation.
+fn release<C: Clock>(caller: &mut Caller<'_, Invocation<C>>, unused: usize) {
+    if unused != 0 {
+        if let Some(io) = caller.data_mut().streams.as_mut() { io.release_output(unused); }
+    }
 }
 impl<C: Clock> Invocation<C> {
     pub fn with_streams(args: &[String], clock: C, streams: Box<dyn Streams>) -> wasmtime::Result<Self> {
@@ -42,48 +53,76 @@ async fn transfer<C: Clock>(caller: &mut Caller<'_, Invocation<C>>, read: bool, 
     })?;
     let mut count = 0;
     if let Some((addr, mut len)) = selected {
+        // Bytes reserved against the invocation-wide ceiling for this write.
+        let mut reserved = 0;
         if !read {
             let state = caller.data_mut();
-            let remaining = state.streams.as_ref().map_or(usize::MAX, |io| io.output_remaining());
-            len = len.min(65536 - state.written).min(remaining);
+            len = len.min(65536 - state.written);
+            if len != 0 {
+                if let Some(io) = state.streams.as_mut() {
+                    len = io.reserve_output(len);
+                    reserved = len;
+                }
+            }
             if len == 0 {
                 state.resources.exceeded = true;
                 return Err(27);
             }
         }
-        count = match &memory {
-            GuestMemory::Local(local) => {
-                let (data, state) = local.data_and_store_mut(&mut *caller);
-                let io = state.streams.as_mut().ok_or(IO)?;
-                // The caller/store borrow excludes guest execution or memory
-                // growth throughout this await. Host slice borrows cannot
-                // escape a poll call.
-                if read {
-                    poll_fn(|cx| io.read(cx, &mut data[addr..addr + len])).await?
-                } else {
-                    poll_fn(|cx| io.write(cx, p[0] as u32, &data[addr..addr + len])).await?
+        let transferred: Result<usize, i32> = {
+            match &memory {
+                GuestMemory::Local(local) => {
+                    let (data, state) = local.data_and_store_mut(&mut *caller);
+                    // The caller/store borrow excludes guest execution or memory
+                    // growth throughout this await. Host slice borrows cannot
+                    // escape a poll call.
+                    match state.streams.as_mut() {
+                        None => Err(IO),
+                        Some(io) if read => poll_fn(|cx| io.read(cx, &mut data[addr..addr + len])).await,
+                        Some(io) => poll_fn(|cx| io.write(cx, p[0] as u32, &data[addr..addr + len])).await,
+                    }
                 }
-            }
-            GuestMemory::Shared(_) => {
-                // Other guest threads keep running during the await, so no
-                // slice into shared memory may live across it: stage the
-                // bytes in this store's own scratch buffer.
-                let mut scratch = alloc::vec![0u8; len];
-                if read {
-                    let io = caller.data_mut().streams.as_mut().ok_or(IO)?;
-                    let n = poll_fn(|cx| io.read(cx, &mut scratch)).await?;
-                    if n > len { return Err(IO); }
-                    memory.with_data(caller, |data, _| data[addr..addr + n].copy_from_slice(&scratch[..n]));
-                    n
-                } else {
-                    memory.with_data(caller, |data, _| scratch.copy_from_slice(&data[addr..addr + len]));
-                    let io = caller.data_mut().streams.as_mut().ok_or(IO)?;
-                    poll_fn(|cx| io.write(cx, p[0] as u32, &scratch)).await?
+                GuestMemory::Shared(_) => {
+                    // Other guest threads keep running during the await, so no
+                    // slice into shared memory may live across it: stage the
+                    // bytes in this store's own scratch buffer, kept across
+                    // calls so a print-heavy guest does not allocate per line.
+                    let mut scratch = core::mem::take(&mut caller.data_mut().scratch);
+                    scratch.clear();
+                    scratch.resize(len, 0);
+                    let result = if read {
+                        match caller.data_mut().streams.as_mut().ok_or(IO) {
+                            Ok(io) => match poll_fn(|cx| io.read(cx, &mut scratch)).await {
+                                Ok(n) if n > len => Err(IO),
+                                Ok(n) => {
+                                    memory.with_data(caller, |data, _| data[addr..addr + n].copy_from_slice(&scratch[..n]));
+                                    Ok(n)
+                                }
+                                Err(e) => Err(e),
+                            },
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        memory.with_data(caller, |data, _| scratch.copy_from_slice(&data[addr..addr + len]));
+                        match caller.data_mut().streams.as_mut().ok_or(IO) {
+                            Ok(io) => poll_fn(|cx| io.write(cx, p[0] as u32, &scratch)).await,
+                            Err(e) => Err(e),
+                        }
+                    };
+                    caller.data_mut().scratch = scratch;
+                    result
                 }
             }
         };
-        if count > len { return Err(IO); }
-        if !read { caller.data_mut().written += count; }
+        count = match transferred {
+            Ok(n) if n <= len => n,
+            Ok(_) => { release(caller, reserved); return Err(IO); }
+            Err(errno) => { release(caller, reserved); return Err(errno); }
+        };
+        if !read {
+            caller.data_mut().written += count;
+            release(caller, reserved - count);
+        }
     }
     memory.with_data(caller, |data, _| put(data, p[3], &(count as u32).to_le_bytes()))?;
     Ok(SUCCESS)

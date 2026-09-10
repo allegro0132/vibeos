@@ -120,7 +120,7 @@ Omitted memory/table maxima are supported; the host limiter remains authoritativ
 | `args_sizes_get`, `args_get` | UTF-8 program name and arguments, NUL terminated |
 | `environ_sizes_get`, `environ_get` | Empty environment |
 | `fd_read`, `fd_write` | fd 0 stdin, fd 1 stdout, fd 2 stderr; EOF and short transfers |
-| `fd_fdstat_get`, `fd_filestat_get`, `fd_close` | Standard-stream metadata and invocation-local close |
+| `fd_fdstat_get`, `fd_filestat_get`, `fd_close` | Non-terminal byte-pipe metadata (`UNKNOWN` file type) and invocation-local close |
 | `fd_seek`, `fd_tell` | `SPIPE` for open standard streams |
 | `fd_prestat_get`, `fd_prestat_dir_name` | `BADF`; no preopened directories |
 | `proc_exit` | Non-returning, preserves the full `u32` status |
@@ -155,6 +155,11 @@ nonzero guest values to status 1, and retains the original in `TerminalDetail::W
 There is no guest filesystem, networking, random source, or promise of the
 complete WASI standard world. Standard libraries may import such functions
 successfully but receive `NOSYS` if they use them.
+
+The separate opt-in [`python-wasi` image](PYTHON_WASI.md) runs a self-contained
+CPython/WASI command with frozen standard-library modules. It raises command
+resource ceilings explicitly and uses a single-hart, 1 GiB QEMU configuration;
+the ordinary WASI and Component profiles retain their existing resource limits.
 
 ## wasi-threads (native backend)
 
@@ -203,6 +208,35 @@ All other memory, output, authorization, cancellation and concurrency limits
 are unchanged. Run `WASI_BENCHMARK=1 scripts/run-wasi-qemu.sh` for the benchmark
 image and real-time QEMU clock configuration (no `icount`). See
 [CoreMark](COREMARK_WASI.md) for benchmark methodology and reproduction.
+
+### Multi-hart lifecycle rules
+
+Guest threads of one command share its pipes, output ceiling and process
+outcome from several harts, and the executor's parallel domain teardown must
+account for every sibling wherever it is:
+
+- Pipes keep a bounded table of parked pollers (one per guest thread plus the
+  main thread) and wake all of them when data moves; a full table wakes the
+  oldest poller so it re-registers. A single waker slot let one thread sleep
+  through another thread's wakeup on a full stdout pipe.
+- The whole-invocation 64 KiB output ceiling is reserved before each write
+  (`Streams::reserve_output`) and the unused part returned afterwards, so two
+  threads cannot both spend the same remaining bytes; the counter never wraps.
+- The first process-ending event (main returning, any thread's `proc_exit`,
+  trap or resource limit) fixes the exit status; a worker that trips a limit
+  while it is already being stopped cannot rewrite it. Session cancellation and
+  loss of authority observed while main ran still override the guest status,
+  as they do on the single-store path.
+- A sibling that returned normally is still running its destructors inside the
+  arena after it left its hart's scheduler. The scheduler counts such tasks as
+  `completing`: a fault teardown on another hart expects them in its live-task
+  gate and waits for them (with the mid-poll siblings) before the arena is
+  reclaimed raw. `parallel_fault_teardown_accounts_for_completing_siblings`
+  replays that interleaving on the host.
+- Wasmtime's sync-hook spins are bounded by wall time (60 s), not iterations:
+  a holder may legitimately zero 16 MiB and shoot down every hart's TLB under
+  the shared-memory write lock. A holder whose domain is being torn down is
+  still detected at the next spin check.
 
 ## Repeatable acceptance
 

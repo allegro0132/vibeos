@@ -26,7 +26,7 @@ use crate::heap::{self, AllocationDomain, ArenaId, OwnerId};
 use crate::instance::{InstanceToken, MAX_COMPONENT_INSTANCES};
 use crate::ipi;
 use crate::runqueue::{EnqueueError, ReadyHint, RunQueues};
-use crate::sync::{SpinLock, TaskRecoveryContext, TaskRecoveryKey};
+use crate::sync::{SpinGuard, SpinLock, TaskRecoveryContext, TaskRecoveryKey};
 
 pub use crate::runqueue::{HartId, HartRunQueueStats, MAX_HARTS};
 
@@ -2150,6 +2150,12 @@ struct ReclaimableDomainRecord {
     /// domain entered `TearingDown`. Each detaches itself and decrements this
     /// before the faulting hart reclaims the arena.
     remote_running: usize,
+    /// Tasks that left the scheduler with a normal terminal claim and are
+    /// running their destructors inside the arena, outside SCHED. They stay
+    /// counted in `live_tasks` until `finish_reclaimable_task`, so a fault
+    /// teardown on another hart must expect them in its live-task gate and
+    /// wait for them before the arena is reclaimed raw.
+    completing: usize,
     exclusive_task: Option<TaskId>,
     exclusive_status: Option<usize>,
     exclusive_instance: Option<InstanceToken>,
@@ -2406,6 +2412,7 @@ impl ReclaimableDomains {
             exclusive: true,
             parallel: false,
             remote_running: 0,
+            completing: 0,
             exclusive_task: Some(task),
             exclusive_status: Some(Arc::as_ptr(status) as usize),
             exclusive_instance: Some(instance),
@@ -2550,6 +2557,7 @@ impl ReclaimableDomains {
             exclusive: mode == ReclaimableDomainMode::Exclusive,
             parallel: mode == ReclaimableDomainMode::Parallel,
             remote_running: 0,
+            completing: 0,
             exclusive_task: (mode == ReclaimableDomainMode::Exclusive).then_some(task),
             exclusive_status: (mode == ReclaimableDomainMode::Exclusive)
                 .then_some(Arc::as_ptr(status) as usize),
@@ -2572,6 +2580,46 @@ impl ReclaimableDomains {
         }
         bump_domain_epoch();
         self.records[key.slot as usize] = None;
+        Ok(())
+    }
+
+    /// A task of this domain is leaving the scheduler with a normal terminal
+    /// claim; its destructors run next, outside SCHED, while it stays counted
+    /// in `live_tasks`.
+    fn begin_completion(
+        &mut self,
+        key: ReclaimableDomainKey,
+        domain: AllocationDomain,
+    ) -> Result<(), ReclaimableDomainError> {
+        let record = self.record_exact(key, domain)?;
+        if record.phase != ReclaimableDomainPhase::Active {
+            return Err(ReclaimableDomainError::NotActive);
+        }
+        let record = self.records[key.slot as usize]
+            .as_mut()
+            .expect("validated reclaimable-domain record remains occupied");
+        record.completing = record
+            .completing
+            .checked_add(1)
+            .ok_or(ReclaimableDomainError::LiveTaskOverflow)?;
+        Ok(())
+    }
+
+    /// The destructors of a completing task have returned (normally or by a
+    /// fault); it is no longer inside the arena.
+    fn end_completion(
+        &mut self,
+        key: ReclaimableDomainKey,
+        domain: AllocationDomain,
+    ) -> Result<(), ReclaimableDomainError> {
+        self.record_exact(key, domain)?;
+        let record = self.records[key.slot as usize]
+            .as_mut()
+            .expect("validated reclaimable-domain record remains occupied");
+        record.completing = record
+            .completing
+            .checked_sub(1)
+            .ok_or(ReclaimableDomainError::LiveTaskMismatch)?;
         Ok(())
     }
 
@@ -2811,9 +2859,13 @@ impl Sched {
             .values()
             .filter(|task| task.domain == domain)
             .count();
+        // Siblings running their destructors on any hart are neither mapped
+        // nor running, but still live; the teardown waits for them before it
+        // reclaims the arena (see `wait_remote_quiescence`).
         let expected_live = mapped_siblings
             .checked_add(1)
             .and_then(|live| live.checked_add(remote_running))
+            .and_then(|live| live.checked_add(record.completing))
             .ok_or(ReclaimableDomainError::LiveTaskOverflow)?;
         if expected_live != record.live_tasks {
             return Err(ReclaimableDomainError::LiveTaskMismatch);
@@ -2892,6 +2944,9 @@ impl Sched {
         if record.remote_running != 0 {
             return Err(ReclaimableDomainError::RemoteRunning);
         }
+        if record.completing != 0 {
+            return Err(ReclaimableDomainError::LiveTaskMismatch);
+        }
         if record.exclusive && record.exclusive_task != Some(permit.primary_task) {
             return Err(ReclaimableDomainError::TaskMismatch);
         }
@@ -2942,6 +2997,14 @@ impl Sched {
         instance_token: Option<InstanceToken>,
     ) -> Result<bool, ReclaimableDomainError> {
         let record = self.reclaimable_domains.record_exact(key, domain)?;
+        if record.parallel && record.phase == ReclaimableDomainPhase::TearingDown {
+            // Another hart began tearing this domain down while this task ran
+            // its destructors. The teardown owns `live_tasks` and the terminal
+            // record and reclaims raw whatever those destructors left behind;
+            // this task's normal completion only releases its quiescence hold.
+            self.reclaimable_domains.end_completion(key, domain)?;
+            return Ok(false);
+        }
         if record.phase != ReclaimableDomainPhase::Active {
             return Err(ReclaimableDomainError::NotActive);
         }
@@ -2962,6 +3025,7 @@ impl Sched {
                 return Err(ReclaimableDomainError::LiveTaskMismatch);
             }
         }
+        self.reclaimable_domains.end_completion(key, domain)?;
         let retained = self.reclaimable_domains.records[key.slot as usize]
             .as_mut()
             .expect("validated reclaimable-domain record remains occupied");
@@ -3152,7 +3216,7 @@ fn assert_sched_invariants(s: &Sched) {
             .filter(|task| task.domain == record.domain)
             .count();
         debug_assert!(
-            mapped + running <= record.live_tasks,
+            mapped + running + record.completing <= record.live_tasks,
             "tracked-domain scheduler projection exceeds its live task count"
         );
         debug_assert!(record.live_tasks != 0);
@@ -5526,46 +5590,92 @@ fn detach_remote_victim(task: Task, status: Arc<TaskStatus>, key: ReclaimableDom
             .expect("remote quiescence count underflow");
         check_sched!(&s);
     }
-    let mut spins = 0usize;
-    loop {
-        let done = {
-            let s = SCHED.lock();
-            match s.reclaimable_domains.record_exact(key, domain) {
-                Ok(record) => record.phase != ReclaimableDomainPhase::TearingDown,
-                Err(_) => true,
-            }
-        };
-        if done {
-            break;
-        }
-        spins += 1;
-        assert!(spins < (1 << 28), "parallel domain teardown did not complete");
-        core::hint::spin_loop();
-    }
+    await_teardown_linearized(key, domain);
     publish_terminal(&status, TerminalClaim::new(TaskState::Faulted));
 }
 
+/// Parallel teardown, remote side, from the executor turn that was polling
+/// `task` on `hart`: release the running slot under `s`, leave SCHED, restore
+/// the SYSTEM owner scope and detach without destructors.
+///
+/// # Safety
+/// The caller is inside the hart-pinned executor turn that entered `system`
+/// on `hart`.
+unsafe fn detach_running_remote_victim(
+    mut s: SpinGuard<'_, Sched>,
+    hart: HartId,
+    system: &mut heap::OwnerScope,
+    task: Task,
+    status: Arc<TaskStatus>,
+    key: ReclaimableDomainKey,
+) {
+    s.clear_running(hart);
+    s.harts[hart.index()].woken = false;
+    check_sched!(&s);
+    drop(s);
+    unsafe { system.restore_on_verified_hart() };
+    detach_remote_victim(task, status, key);
+}
+
+/// Spin until the domain record satisfies `done`; a retired record counts as
+/// done. Bounded so a broken teardown handshake panics instead of hanging.
+fn spin_on_domain_record(
+    key: ReclaimableDomainKey,
+    domain: AllocationDomain,
+    message: &str,
+    done: impl Fn(&ReclaimableDomainRecord) -> bool,
+) {
+    let mut spins = 0usize;
+    loop {
+        let finished = {
+            let s = SCHED.lock();
+            s.reclaimable_domains
+                .record_exact(key, domain)
+                .map_or(true, |record| done(&record))
+        };
+        if finished {
+            return;
+        }
+        spins += 1;
+        assert!(spins < (1 << 28), "{message}");
+        core::hint::spin_loop();
+    }
+}
+
+/// Parallel teardown, remote side: block until the faulting hart has taken
+/// the domain out of `TearingDown`, so the terminal can be published after
+/// the teardown linearized.
+fn await_teardown_linearized(key: ReclaimableDomainKey, domain: AllocationDomain) {
+    spin_on_domain_record(key, domain, "parallel domain teardown did not complete", |record| {
+        record.phase != ReclaimableDomainPhase::TearingDown
+    });
+}
+
 /// Parallel teardown, faulting side: block until every sibling that was
-/// mid-poll on another hart has detached. Siblings return from their poll at
-/// the next fuel quantum, host wait or poisoned lock spin, so this is bounded.
+/// mid-poll on another hart has detached and every sibling running its
+/// destructors has returned. Siblings return from their poll at the next fuel
+/// quantum, host wait or poisoned lock spin, and destructors of a domain being
+/// torn down fail at their next lock spin, so this is bounded.
 fn wait_remote_quiescence(permit: ReclaimableTeardownPermit) {
     if !permit.parallel {
         return;
     }
-    let mut spins = 0usize;
-    loop {
-        let remaining = {
-            let s = SCHED.lock();
-            s.reclaimable_domains
-                .record_exact(permit.key, permit.domain)
-                .map_or(0, |record| record.remote_running)
-        };
-        if remaining == 0 {
-            return;
-        }
-        spins += 1;
-        assert!(spins < (1 << 28), "parallel domain siblings did not quiesce");
-        core::hint::spin_loop();
+    spin_on_domain_record(permit.key, permit.domain, "parallel domain siblings did not quiesce", |record| {
+        record.remote_running == 0 && record.completing == 0
+    });
+}
+
+/// A tracked task is leaving the scheduler with a normal terminal claim; its
+/// destructors run next, outside SCHED, so count it as completing until
+/// `finish_reclaimable_task` (see `ReclaimableDomainRecord::completing`).
+fn begin_task_completion(s: &mut Sched, task: &Task) {
+    if task.domain.arena.is_tracked() {
+        let key = task
+            .reclaimable_domain
+            .expect("a tracked task has no domain generation");
+        s.reclaimable_domains
+            .begin_completion(key, task.domain)
+            .unwrap_or_else(|error| panic!("tracked task completion gate mismatch: {error:?}"));
     }
 }
 
@@ -5597,6 +5707,24 @@ fn reclaim_and_publish(task: Task, status: &Arc<TaskStatus>, claim: TerminalClai
             .expect("a tracked destructor fault has no domain generation");
         let permit = {
             let mut s = SCHED.lock();
+            s.reclaimable_domains
+                .end_completion(key, result.domain)
+                .unwrap_or_else(|error| {
+                    panic!("tracked destructor completion gate mismatch: {error:?}")
+                });
+            if s.parallel_teardown_in_progress(key, result.domain) {
+                // Another hart's teardown is already waiting for this
+                // completion; the faulted destructor leaves the arena to that
+                // raw reclaim instead of starting a second teardown.
+                check_sched!(&s);
+                drop(s);
+                let mut system = heap::enter_owner(OwnerId::SYSTEM);
+                notify_fault_cleanup(result.id, result.domain);
+                system.restore();
+                await_teardown_linearized(key, result.domain);
+                publish_terminal(status, claim);
+                return;
+            }
             let permit = s
                 .begin_reclaimable_teardown(
                     result.domain,
@@ -5830,6 +5958,7 @@ fn cancel_task(handle: &TaskHandle) -> CancelOutcome {
                                     "cancel target metadata must identify its exact queue"
                                 );
                             }
+                            begin_task_completion(&mut s, &task);
                             Action::Reclaim(task, claim)
                         }
                         None => Action::Return(requested_outcome(handle)),
@@ -6330,7 +6459,10 @@ fn poll_once_on(hart: HartId) -> bool {
         let status = task.status.clone();
         let dispatch = if status.cancellation_requested() {
             match status.claim_terminal(TaskState::Cancelled) {
-                Some(claim) => Dispatch::Reclaim(task, status, claim),
+                Some(claim) => {
+                    begin_task_completion(&mut s, &task);
+                    Dispatch::Reclaim(task, status, claim)
+                }
                 None => Dispatch::Invalid(task),
             }
         } else if status.raw_state() == TaskState::Running as u8 {
@@ -6438,13 +6570,8 @@ fn poll_once_on(hart: HartId) -> bool {
                     // A sibling of a parallel domain already being torn down
                     // faulted on this hart (for example a poisoned lock spin).
                     // It is a remote victim of that teardown, not a new one.
-                    s.clear_running(hart);
-                    s.harts[hart.index()].woken = false;
-                    check_sched!(&s);
-                    drop(s);
                     // Safety: this remains inside the same hart-pinned executor turn.
-                    unsafe { system.restore_on_verified_hart() };
-                    detach_remote_victim(task, status, key);
+                    unsafe { detach_running_remote_victim(s, hart, &mut system, task, status, key) };
                     return true;
                 }
                 Some(
@@ -6505,13 +6632,8 @@ fn poll_once_on(hart: HartId) -> bool {
             // Another hart is tearing this parallel domain down and already
             // committed this task to Faulted. Detach without destructors and
             // let the teardown proceed once no sibling runs anywhere.
-            s.clear_running(hart);
-            s.harts[hart.index()].woken = false;
-            check_sched!(&s);
-            drop(s);
             // Safety: this remains inside the same hart-pinned executor turn.
-            unsafe { system.restore_on_verified_hart() };
-            detach_remote_victim(task, status, key);
+            unsafe { detach_running_remote_victim(s, hart, &mut system, task, status, key) };
             return true;
         }
         s.reclaimable_domains
@@ -6551,6 +6673,7 @@ fn poll_once_on(hart: HartId) -> bool {
     } else {
         TaskState::Cancelled
     };
+    begin_task_completion(&mut s, &task);
     let claim = status.claim_terminal(requested);
     check_sched!(&s);
     check_status_detached!(&s, status.as_ref());
@@ -8343,6 +8466,106 @@ mod one_shot_wait_tests {
 mod reclaimable_domain_tests {
     use super::*;
     use alloc::task::Wake;
+
+    unsafe fn reclaim_completing_test(_: ReclaimableFaultWitness) -> FaultReclaimOutcome {
+        FaultReclaimOutcome::Reclaimed
+    }
+
+    /// A sibling that left its hart's scheduler with a normal terminal claim
+    /// but is still running its destructors is neither mapped nor running. A
+    /// fault teardown on another hart must still count it in its live-task
+    /// gate (the executor otherwise panics with `LiveTaskMismatch`), wait for
+    /// it before the arena is reclaimed raw, and let its completion return
+    /// through `finish_reclaimable_task` while the domain is tearing down.
+    /// The steps below replay what `poll_once_on` does on each hart.
+    #[test]
+    fn parallel_fault_teardown_accounts_for_completing_siblings() {
+        let _serial = EXECUTOR_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::arch::set_test_hart_id(0);
+        run_until_idle(10_000);
+        set_fault_reclaimer(reclaim_completing_test);
+        let domain = AllocationDomain::new(OwnerId::new(20_401), ArenaId::new(30_401));
+        let hart0 = HartId::new(0).unwrap();
+        let hart2 = HartId::new(2).unwrap();
+        let primary = unsafe {
+            spawn_reclaimable_owned_parallel(domain, "completing-primary", core::future::pending::<()>())
+        };
+        crate::arch::set_test_hart_id(2);
+        let sibling = unsafe { spawn_reclaimable_owned_parallel(domain, "completing-sibling", async {}) };
+        crate::arch::set_test_hart_id(0);
+
+        // Hart 2: the sibling's poll returned Ready; it leaves the scheduler
+        // with an Exited claim and is about to run its destructors.
+        let (key, sibling_task, sibling_claim) = {
+            let mut s = SCHED.lock();
+            let mut task = s.tasks.remove(&sibling.id).unwrap();
+            assert!(s.ready.remove(task.queue_owner, sibling.id));
+            task.ready = false;
+            let key = task.reclaimable_domain.unwrap();
+            begin_task_completion(&mut s, &task);
+            let claim = task.status.claim_terminal(TaskState::Exited).unwrap();
+            check_sched!(&s);
+            (key, task, claim)
+        };
+        // Hart 0: the primary is dispatched and faults mid-poll.
+        let primary_task = {
+            let mut s = SCHED.lock();
+            let mut task = s.tasks.remove(&primary.id).unwrap();
+            assert!(s.ready.remove(task.queue_owner, primary.id));
+            task.ready = false;
+            s.install_running(
+                hart0,
+                RunningTask {
+                    id: primary.id,
+                    hart: hart0,
+                    domain,
+                    name: task.name.clone(),
+                    status: task.status.clone(),
+                    reclaimable_domain: task.reclaimable_domain,
+                    instance_token: task.instance_token,
+                },
+            );
+            check_sched!(&s);
+            task
+        };
+        let permit = {
+            let mut s = SCHED.lock();
+            let permit = s
+                .begin_reclaimable_teardown(domain, key, hart0, primary.id, &primary.status, None, true)
+                .expect("a completing sibling is live but neither mapped nor running");
+            check_sched!(&s);
+            permit
+        };
+        let primary_claim = primary.status.claim_terminal(TaskState::Faulted).unwrap();
+        assert_eq!(
+            reclaimable_domain_snapshot(domain).map(|record| record.phase),
+            Some(ReclaimableDomainPhase::TearingDown)
+        );
+
+        // Hart 2 meanwhile finishes the sibling's destructors and accounts it;
+        // that completion is what the faulting hart's quiescence wait needs.
+        let result = reclaim_task(sibling_task);
+        assert!(!result.faulted);
+        {
+            let mut s = SCHED.lock();
+            let last = s
+                .finish_reclaimable_task(key, domain, hart2, sibling.id, &sibling.status, None)
+                .expect("a completion during teardown releases its quiescence hold");
+            assert!(!last, "the teardown owns the domain's terminal record");
+            check_sched!(&s);
+        }
+        publish_terminal(&sibling.status, sibling_claim);
+        assert_eq!(sibling.state(), TaskState::Exited);
+
+        // Hart 0 resumes exactly where poll_once_on's fault path continues.
+        wait_remote_quiescence(permit);
+        teardown_faulted_domain(permit, primary.id, Some(primary_task), primary.status.clone(), primary_claim);
+        assert_eq!(primary.state(), TaskState::Faulted);
+        assert_eq!(reclaimable_domain_snapshot(domain), None);
+        assert!(!current_domain_tearing_down());
+    }
 
     struct SilentWake;
 

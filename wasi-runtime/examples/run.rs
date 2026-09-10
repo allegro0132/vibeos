@@ -55,6 +55,7 @@ fn main() {
     assert!(!args.is_empty(), "usage: run MODULE.wasm [arguments...]");
     let module = std::fs::read(&args[0]).unwrap();
     let limits = WasiLimits {
+        #[cfg(not(feature = "python-wasi"))]
         total_fuel: 100_000_000_000,
         ..Default::default()
     };

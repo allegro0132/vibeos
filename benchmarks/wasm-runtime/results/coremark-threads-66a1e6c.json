@@ -1,0 +1,194 @@
+[
+  {
+    "work": "target/coremark-threads/current/vibeos-4h",
+    "platform": "vibeos",
+    "runner": "vibeos-wasmtime",
+    "fuel": "VibeOS async 10000-fuel quanta",
+    "revision": "66a1e6cfed113db8f2e017f5350ee2bb41b502c6",
+    "kernel_sha256": "795483f3936e5308eb01173b38c65c9c379e58aebafa1d4b84d0f6fb36a32930",
+    "runner_sha256": null,
+    "features": "wasi-benchmark,wasmtime-command-fuel-batch,wasmtime-threads",
+    "native_sha256": null,
+    "configuration": {
+      "cpu": "rv64",
+      "machine": "virt",
+      "memory": "1G",
+      "harts": 4,
+      "accel": "tcg,thread=multi",
+      "rtc": "base=utc,clock=vm",
+      "icount": null
+    },
+    "module_sha256": "3a6b9af26c55b962a79c5fd6a3e52f850b39d1ca373178a436379970a013017f",
+    "samples": 3,
+    "summary": [
+      {
+        "workers": 1,
+        "median_score": 2163.971249,
+        "min_score": 1851.090403,
+        "max_score": 2218.920942,
+        "speedup": 1.0,
+        "parallel_efficiency": 1.0
+      },
+      {
+        "workers": 2,
+        "median_score": 3906.731549,
+        "min_score": 3474.998873,
+        "max_score": 4297.0562,
+        "speedup": 1.8053527979197286,
+        "parallel_efficiency": 0.9026763989598643
+      },
+      {
+        "workers": 3,
+        "median_score": 5698.577039,
+        "min_score": 5684.082006,
+        "max_score": 6145.874587,
+        "speedup": 2.633388517353633,
+        "parallel_efficiency": 0.877796172451211
+      }
+    ]
+  },
+  {
+    "work": "target/coremark-threads/current/debian-native-4h",
+    "platform": "debian",
+    "runner": "native-pthreads",
+    "fuel": null,
+    "revision": "66a1e6cfed113db8f2e017f5350ee2bb41b502c6",
+    "kernel_sha256": null,
+    "runner_sha256": null,
+    "features": null,
+    "native_sha256": "34a175725251a9c27d33f6edb7db185913b375e1bf78fdf03c0dd8a4a46f5063",
+    "configuration": {
+      "cpu": "rv64",
+      "machine": "virt",
+      "memory": "1G",
+      "harts": 4,
+      "accel": "tcg,thread=multi",
+      "rtc": "base=utc,clock=vm",
+      "icount": null
+    },
+    "module_sha256": "3a6b9af26c55b962a79c5fd6a3e52f850b39d1ca373178a436379970a013017f",
+    "samples": 3,
+    "summary": [
+      {
+        "workers": 1,
+        "median_score": 9317.84481,
+        "min_score": 9315.0066,
+        "max_score": 9334.91046,
+        "speedup": 1.0,
+        "parallel_efficiency": 1.0
+      },
+      {
+        "workers": 2,
+        "median_score": 18863.827359,
+        "min_score": 18838.418899,
+        "max_score": 18883.419016,
+        "speedup": 2.024483959934078,
+        "parallel_efficiency": 1.012241979967039
+      },
+      {
+        "workers": 3,
+        "median_score": 28183.745942,
+        "min_score": 28098.219705,
+        "max_score": 28186.605784,
+        "speedup": 3.0247065192321014,
+        "parallel_efficiency": 1.0082355064107005
+      }
+    ]
+  },
+  {
+    "work": "target/coremark-threads/current/debian-wasmtime-4h",
+    "platform": "debian",
+    "runner": "std-linux-threads",
+    "fuel": null,
+    "revision": "66a1e6cfed113db8f2e017f5350ee2bb41b502c6",
+    "kernel_sha256": null,
+    "runner_sha256": "620ba4f21429681009ce528a96cef32fc3c6d7443facc96cebd47aabd96a3185",
+    "features": null,
+    "native_sha256": null,
+    "configuration": {
+      "cpu": "rv64",
+      "machine": "virt",
+      "memory": "1G",
+      "harts": 4,
+      "accel": "tcg,thread=multi",
+      "rtc": "base=utc,clock=vm",
+      "icount": null
+    },
+    "module_sha256": "3a6b9af26c55b962a79c5fd6a3e52f850b39d1ca373178a436379970a013017f",
+    "samples": 3,
+    "summary": [
+      {
+        "workers": 1,
+        "median_score": 2667.743764,
+        "min_score": 2660.203505,
+        "max_score": 2686.782758,
+        "speedup": 1.0,
+        "parallel_efficiency": 1.0
+      },
+      {
+        "workers": 2,
+        "median_score": 5365.682994,
+        "min_score": 5348.867772,
+        "max_score": 5382.604273,
+        "speedup": 2.0113187279856013,
+        "parallel_efficiency": 1.0056593639928006
+      },
+      {
+        "workers": 3,
+        "median_score": 8090.688426,
+        "min_score": 7955.51493,
+        "max_score": 8094.03255,
+        "speedup": 3.032783183745079,
+        "parallel_efficiency": 1.0109277279150264
+      }
+    ]
+  },
+  {
+    "work": "target/coremark-threads/current/debian-wasmtime-fuel-4h",
+    "platform": "debian",
+    "runner": "std-linux-threads",
+    "fuel": 100000000000,
+    "revision": "66a1e6cfed113db8f2e017f5350ee2bb41b502c6",
+    "kernel_sha256": null,
+    "runner_sha256": "620ba4f21429681009ce528a96cef32fc3c6d7443facc96cebd47aabd96a3185",
+    "features": null,
+    "native_sha256": null,
+    "configuration": {
+      "cpu": "rv64",
+      "machine": "virt",
+      "memory": "1G",
+      "harts": 4,
+      "accel": "tcg,thread=multi",
+      "rtc": "base=utc,clock=vm",
+      "icount": null
+    },
+    "module_sha256": "3a6b9af26c55b962a79c5fd6a3e52f850b39d1ca373178a436379970a013017f",
+    "samples": 3,
+    "summary": [
+      {
+        "workers": 1,
+        "median_score": 2416.276845,
+        "min_score": 2409.360755,
+        "max_score": 2419.492202,
+        "speedup": 1.0,
+        "parallel_efficiency": 1.0
+      },
+      {
+        "workers": 2,
+        "median_score": 4840.182648,
+        "min_score": 4831.01188,
+        "max_score": 4867.653888,
+        "speedup": 2.0031573194999517,
+        "parallel_efficiency": 1.0015786597499758
+      },
+      {
+        "workers": 3,
+        "median_score": 7303.575046,
+        "min_score": 7241.23908,
+        "max_score": 7313.574362,
+        "speedup": 3.0226565557308893,
+        "parallel_efficiency": 1.0075521852436298
+      }
+    ]
+  }
+]

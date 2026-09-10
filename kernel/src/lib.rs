@@ -993,6 +993,9 @@ compile_error!("feature `milkv-jitterentropy-probe` is an isolated UART qualific
 
 extern crate alloc;
 
+#[cfg(all(feature = "milkv-wasmtime", target_arch = "riscv64", not(target_feature = "d")))]
+compile_error!("Milk-V Wasmtime requires riscv64gc-unknown-none-elf; use build-milkv-duo.sh --wasmtime");
+
 // Portable kernel logic lives in `vibeos-core`; the bare SBI seam lives in the
 // RISC-V runtime. Re-export both under the names the rest of the tree uses.
 #[cfg(not(all(target_arch = "riscv64", target_os = "none")))]

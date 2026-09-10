@@ -186,7 +186,9 @@ async fn recover_recognized_persistent_authority(
 /// but a 25 MHz PIO microSD cannot. All runtime I/O flows through this one
 /// device, so hits are coherent: writes update or drop the affected entries,
 /// and an ambiguous write failure drops them as well.
-const PAGE_CACHE_CAPACITY: usize = 512;
+// Each boxed 4 KiB page is charged as an 8 KiB heap allocation. The small
+// Duo Python image must leave room for the interpreter's admission peak.
+const PAGE_CACHE_CAPACITY: usize = if cfg!(feature = "milkv-python") { 64 } else { 512 };
 
 struct PageCacheEntry {
     data: alloc::boxed::Box<Page>,

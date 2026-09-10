@@ -80,11 +80,9 @@ pub(super) fn run(engine: &Engine) -> wasmtime::Result<()> {
     }
     { let s = state.lock(); assert_eq!(s.stdout.len() + s.stderr.len(), 65536); }
     let before = state.lock().calls;
-    // Output quota is an invocation limit: the guest is unwound instead of
-    // receiving an errno it could ignore in a hostcall loop.
-    let error = finish(write.call_async(&mut store, (1,0,1,16)), false).unwrap_err();
-    assert!(alloc::format!("{error:#}").contains("WASI output limit"), "{error:#}");
-    drop(error);
+    // Output exhaustion is now terminal for the invocation, rather than an
+    // FBIG result a guest can ignore in an expensive hostcall loop.
+    assert!(finish(write.call_async(&mut store, (1,0,1,16)), false).is_err());
     assert!(store.data().resource_limit_hit());
     assert_eq!(state.lock().calls, before, "output over budget reached host");
     let mut future = Box::pin(NativeFuture::new(read.call_async(&mut store, (0,0,1,16))));

@@ -189,10 +189,10 @@ fn standard_descriptors_and_known_stubs() {
       (memory (export "memory") 1)
       (func (export "_start")
         i32.const 1 i32.const 0 call $stat if unreachable end
-        i32.const 0 i32.load8_u i32.const 2 i32.ne if unreachable end
+        i32.const 0 i32.load8_u i32.const 0 i32.ne if unreachable end
         i32.const 8 i64.load i64.const 2097216 i64.ne if unreachable end
         i32.const 1 i32.const 32 call $file if unreachable end
-        i32.const 48 i32.load8_u i32.const 2 i32.ne if unreachable end
+        i32.const 48 i32.load8_u i32.const 0 i32.ne if unreachable end
         i32.const 1 i32.const 0 call $tell i32.const 70 i32.ne if unreachable end
         i32.const 3 i32.const 0 call $pre i32.const 8 i32.ne if unreachable end
         i32.const -1 i32.const -1 call $random i32.const 52 i32.ne if unreachable end
@@ -203,6 +203,12 @@ fn standard_descriptors_and_known_stubs() {
         Default::default(),
     );
     assert_eq!(t, WasiTerminal::Exited(0));
+}
+
+#[test]
+fn standard_streams_are_not_interactive_terminals() {
+    assert_eq!(run(include_str!("../../tests/wasi/stdio-pipes.wat"),
+        &mut Io::default(), WasiLimits::default()), WasiTerminal::Exited(0));
 }
 
 #[test]
@@ -320,11 +326,12 @@ fn clocks_validate_pointers_and_preserve_full_nanoseconds() {
 fn embedding_fuel_budget_has_a_hard_ceiling_and_bounded_quanta() {
     let bytes = wat::parse_str(r#"(module (memory (export "memory") 1) (func (export "_start")))"#)
         .unwrap();
-    assert_eq!(WasiLimits::default().total_fuel, 10_000_000);
+    assert_eq!(WasiLimits::default().total_fuel,
+        if cfg!(feature = "python-wasi") { 10_000_000_000 } else { 10_000_000 });
     for (fuel, quantum, valid) in [
         (100_000_000_000, 10_000, true),
         (100_000_000_001, 10_000, false),
-        (100_000_000_000, 10_001, false),
+        (100_000_000_000, WasiLimits::default().poll_quantum + 1, false),
     ] {
         let result = WasiInvocation::new(
             &bytes,

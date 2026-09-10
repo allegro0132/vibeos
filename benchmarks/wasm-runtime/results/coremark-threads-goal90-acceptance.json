@@ -1,0 +1,67 @@
+{
+  "base_revision": "8717c4c40e46f9ad964186849a749ecaa3cce674",
+  "measured_worktree_source_sha256": {
+    "kernel/src/wasi.rs": "b177df65400569178d77961a17f5493723a4e75e81bff160e1dbe096c2a475b2",
+    "kernel/src/wasi_wasmtime.rs": "2d1f50f113ffa09f18aba5e1c2496a9e566ca134937d8e46269804f715afdf73",
+    "wasmtime-runtime/src/lib.rs": "6a7570f99b10cf0262608c2a4ecd5ba3a1baa5c65b3cbb88484887ff80651e4a",
+    "wasmtime-runtime/src/placement.rs": "07665c1db7a855d438cfaacbf52eada18ee4baeec560e39f7cec688fa418d814"
+  },
+  "benchmark_kernel_sha256": "1bc44062f4ad91e7f01da33bf958ee5dcac23aa037d12537754807f6fceee8d3",
+  "ordinary_kernel_sha256": "459b53bdcff3dec8cb2ac661a9bc784dbb27c3cc502e590a4aad376de1d06a4d",
+  "acceptance": "Each M1/M2/M3 performance median >=90% of paired Debian Wasmtime fuel median; also compare to higher of two adjacent reference medians because final Debian M3 is variable.",
+  "comparison": [
+    {
+      "workers": 1,
+      "vibeos_median": 2248.132944,
+      "paired_debian_median": 2430.799118,
+      "paired_ratio": 0.9248534473098324,
+      "conservative_debian_median": 2430.799118,
+      "conservative_ratio": 0.9248534473098324
+    },
+    {
+      "workers": 2,
+      "vibeos_median": 4526.904055,
+      "paired_debian_median": 4691.718927,
+      "paired_ratio": 0.9648711112996305,
+      "conservative_debian_median": 4891.325713,
+      "conservative_ratio": 0.9254963420179825
+    },
+    {
+      "workers": 3,
+      "vibeos_median": 7013.307788,
+      "paired_debian_median": 6353.143765,
+      "paired_ratio": 1.1039113937003755,
+      "conservative_debian_median": 7335.882533,
+      "conservative_ratio": 0.9560278202998865
+    }
+  ],
+  "data": "coremark-threads-goal90.json",
+  "raw_evidence_root": "target/coremark-threads/goal90",
+  "limitations": [
+    "QEMU throughput, not certified hardware CoreMark score",
+    "Debian uses fixed RV64GC; VibeOS uses discovered Zba/Zbb/Zbc/Zbs",
+    "Debian fuel is synchronous; VibeOS retains asynchronous 10000-fuel checks",
+    "No other QEMU/compiler observed at 5 second process snapshots; desktop and editor background load remains",
+    "Earlier retire pair overlapped externally launched VM late in Debian run and is not final acceptance evidence",
+    "Earlier isolated pair failed M1 at 88.6%; supervisor pinning added afterward"
+  ],
+  "regressions": {
+    "ordinary_thread_cases": 57,
+    "ordinary_clean_lifecycles": 57,
+    "benchmark_disconnect_cancel_within_30s": 6,
+    "benchmark_followup_clean_runs": 6,
+    "placement_unit_tests": 2,
+    "one_hart_diagnostic_calls": 6,
+    "two_hart_real_clock_calls": 6,
+    "four_hart_benchmark_clean_invocations": 15
+  },
+  "evidence_sha256": {
+    "target/coremark-threads/goal90/supervisor-regression.log": "95235ad9efabcb3be3ad7f71946c488b536f2085202da995b8a3f33a581b1bb5",
+    "target/coremark-threads/goal90/supervisor-disconnect.log": "69493477e8853e89f30de4af6ac1ec9fa40bdb7797ac34b801377dbb5e097603",
+    "target/coremark-threads/goal90/supervisor-1h.log": "93b8daceae00c0e7fa17f88f1805bdd6e054ba7c1ffe98d04f553c8407bf961a",
+    "target/coremark-threads/goal90/supervisor-2h.log": "8b81ad0c1963b220e697189fd04b574efa97665a287e14154c1f436fc9386a3c",
+    "target/coremark-threads/goal90/supervisor-process-audit.jsonl": "4403d8935d9afd181ddd4f76c37d25f6792232efcbb08c716dc9716a94ccb798",
+    "target/coremark-threads/goal90/supervisor-source.patch": "8a229f1d76be95ddfc1cd4bad3f60b518b13a5d2100fcb4cd55b62408481d0c4",
+    "target/coremark-threads/goal90/placement-tests.log": "f927e256258a3000768e02d54a9f28894302a13eb4e838d52f85c92e078e76ac"
+  }
+}

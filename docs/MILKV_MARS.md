@@ -358,3 +358,22 @@ now pass this gate. This establishes the crate dependency boundary, while
 board-feature/service decoupling and the remaining CV1800B SoC resource split
 remain work in the architecture phase. Mars hardware and SD-image acceptance
 are still outstanding.
+
+### Ethernet SoC and DMA separation stage
+
+CV1800B Ethernet clocks, PHY calibration and C906 cache instructions now reside
+in the platform crate. Firmware selects the platform callbacks; DWMAC receives
+only MAC resources, PHY address, DMA limits and those callbacks. SoC/eFuse
+apertures were removed from its resource description. Existing diagnostic words
+and PHY tuning are preserved. An early platform error leaves the controller
+untouched and permits retry. DMA spans are checked against the platform's
+32-bit address limit and 64-byte cache isolation before controller setup.
+
+The golden sequence in `platform/cv1800b/tests/ethernet-sequence.txt` was captured
+from commit `e831630` with mocked MMIO and delays: 226 entries cover the complete
+write/delay sequences for fallback and calibrated eFuse cases. Mutating the PHY
+link-removal tuning fails the regression. Host tests also cover callback span
+and direction, failed setup rollback and DMA address boundaries. These checks
+plus Duo compilation and QEMU regression do not validate physical Ethernet,
+cache coherence, or Mars entropy. DWC2 still needs its remaining SoC split;
+shared MDIO/PHY helpers and Mars EQoS/SD integration remain pending.

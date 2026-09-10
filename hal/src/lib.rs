@@ -235,13 +235,11 @@ pub struct PciHostDescription {
     pub intx_first_irq: u32,
 }
 
-/// Synopsys DWMAC instance plus board-level clock/PHY wiring.
+/// Synopsys DWMAC controller resources after firmware platform selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DwmacDescription {
     pub registers: AddressRange,
     pub irq: u32,
-    pub soc_control: AddressRange,
-    pub efuse: AddressRange,
     pub phy_address: u8,
     pub dma_address_bits: u8,
     pub cache_line_bytes: usize,

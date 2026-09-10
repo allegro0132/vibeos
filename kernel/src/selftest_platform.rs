@@ -368,15 +368,33 @@ fn paging(h: &mut Harness) {
     for (name, address) in [
         (
             "CV1800B SoC control is identity mapped",
-            crate::platform::dwmac().soc_control.start,
+            crate::platform::mmu()
+                .identity_mappings
+                .iter()
+                .find(|m| m.name == "SoC control")
+                .unwrap()
+                .range
+                .start,
         ),
         (
             "CV1800B EPHY is identity mapped",
-            crate::platform::dwmac().soc_control.start + 0x9000,
+            crate::platform::mmu()
+                .identity_mappings
+                .iter()
+                .find(|m| m.name == "SoC control")
+                .unwrap()
+                .range
+                .start + 0x9000,
         ),
         (
             "CV1800B eFuse shadow is identity mapped",
-            crate::platform::dwmac().efuse.start,
+            crate::platform::mmu()
+                .identity_mappings
+                .iter()
+                .find(|m| m.name == "eFuse")
+                .unwrap()
+                .range
+                .start,
         ),
         (
             "CV1800B GPIOC is identity mapped",

@@ -52,3 +52,20 @@ extern "Rust" {
 pub fn device() -> &'static Device {
     unsafe { &VIBEOS_PACKET_DEVICE }
 }
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PlatformTelemetry {
+    pub clock_enable: u32,
+    pub clock_bypass: u32,
+    pub clock_divider: u32,
+    pub ephy_control: u32,
+}
+/// # Safety
+/// Firmware binds exclusively assigned clock/PHY resources; initialization is
+/// serialized with the controller. Diagnostics must not borrow mutable state.
+/// DMA synchronization must cover every cache level on the selected platform.
+pub struct Platform {
+    pub prepare: unsafe fn(fn() -> u64, u64) -> Result<(), Error>,
+    pub telemetry: unsafe fn() -> PlatformTelemetry,
+    pub dma: &'static crate::memory::DmaOps,
+}

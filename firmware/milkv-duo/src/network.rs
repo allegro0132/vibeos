@@ -28,12 +28,12 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
     irq: DESC.irq,
     rx_queue_size: driver::RX_RING_SIZE,
     dma_base: || driver::dma_region_base(&DMA),
-    telemetry: || unsafe { driver::telemetry(DESC, &INSTANCE) },
+    telemetry: || unsafe { driver::telemetry(DESC, &INSTANCE, &PLATFORM) },
     claim: |mac, time, hz| unsafe {
         CLAIMED
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| Error::Busy)?;
-        match Engine::claim(DESC, &DMA, &INSTANCE, mac, time, hz) {
+        match Engine::claim(DESC, &PLATFORM, &DMA, &INSTANCE, mac, time, hz) {
             Ok(e) => {
                 *ENGINE.0.get() = Some(e);
                 Ok(())
@@ -66,4 +66,37 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
         }
         reset
     },
+};
+
+unsafe fn ethernet(
+    time: fn() -> u64,
+    hz: u64,
+) -> Result<
+    vibeos_platform_cv1800b::ethernet::Ethernet<vibeos_platform_cv1800b::ethernet::Mmio>,
+    Error,
+> {
+    use vibeos_bsp_milkv_duo::{
+        EFUSE_BASE, EFUSE_MMIO_END, SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END,
+    };
+    use vibeos_hal::AddressRange;
+    Ok(vibeos_platform_cv1800b::ethernet::Ethernet(
+        vibeos_platform_cv1800b::ethernet::Mmio::new(
+            AddressRange::new(SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END),
+            AddressRange::new(EFUSE_BASE, EFUSE_MMIO_END),
+            hz,
+            time,
+        )?,
+    ))
+}
+static PLATFORM: vibeos_hal::network::Platform = vibeos_hal::network::Platform {
+    prepare: |time, hz| unsafe {
+        ethernet(time, hz)?.prepare();
+        Ok(())
+    },
+    telemetry: || unsafe {
+        ethernet(|| 0, Board::INFO.timebase_hz)
+            .expect("valid Ethernet platform wiring")
+            .telemetry()
+    },
+    dma: &vibeos_platform_cv1800b::cache::DMA,
 };

@@ -197,3 +197,17 @@ drivers or BSPs. `python3 scripts/check-driver-boundaries.py` enforces declared
 workspace normal/build/optional edges, excludes test-only fixtures, and checks
 that drivers also cannot reach the kernel or a BSP. This dependency gate does
 not prove the remaining board-feature or SoC-register-policy separation.
+
+DWMAC receives controller resources and a firmware-selected Ethernet platform
+operation table. CV1800B clocks, integrated PHY/eFuse calibration and C906 cache
+instructions live under `platform/cv1800b`; the driver no longer receives SoC or
+eFuse apertures. Firmware supplies platform diagnostics while keeping existing
+network telemetry fields. DMA callbacks use physical spans and explicit sync
+directions; the fixed identity-mapped pool must meet both the controller's
+32-bit reach and 64-byte isolation requirements. Platform setup failure releases
+the claim without touching the clockless MAC or running controller teardown.
+
+The complete pre-migration PHY register sequence is retained as a golden trace
+for fallback and programmed eFuse paths. This verifies software ordering; host
+cache tests only execute compiler fences and cannot establish physical DMA
+coherence. JH7110 must provide its own cache implementation and EQoS controller.

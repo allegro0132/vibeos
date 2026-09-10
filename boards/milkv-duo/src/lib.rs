@@ -55,8 +55,6 @@ pub const TIMEBASE_HZ: u64 = 25_000_000;
 pub const DWMAC: DwmacDescription = DwmacDescription {
     registers: AddressRange::new(ETHERNET_BASE, ETHERNET_MMIO_END),
     irq: ETHERNET_IRQ,
-    soc_control: AddressRange::new(SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END),
-    efuse: AddressRange::new(EFUSE_BASE, EFUSE_MMIO_END),
     phy_address: 0,
     dma_address_bits: 32,
     cache_line_bytes: 64,

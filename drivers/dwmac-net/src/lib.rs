@@ -1,8 +1,8 @@
 //! Polling Synopsys DWMAC engine for the CV1800B integrated Ethernet MAC.
 //!
-//! The crate owns registers, clock/ePHY setup and one cache-isolated RX/TX
-//! descriptor rings. Kernel capabilities, packet sessions and supervision are
-//! deliberately outside this layer.
+//! The crate owns controller registers and cache-isolated RX/TX descriptor
+//! rings. Platform callbacks supply clocks, PHY setup and cache maintenance.
+//! Kernel capabilities, packet sessions and supervision stay outside this layer.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -68,25 +68,6 @@ const TX_END_RING: u32 = 1 << 25;
 const TX_CHECKSUM_INSERTION_FULL: u32 = 3 << 27;
 const TX_FIRST: u32 = 1 << 29;
 const TX_LAST: u32 = 1 << 30;
-
-// CV1800B EPHY page 10 link-pulse tuning. The alternate values shipped next
-// to the original Milk-V settings explicitly fix a latched link-up indication
-// after the cable is removed.
-const EPHY_LINK_PULSE: &[(usize, u32)] = &[
-    (0x40, 0x2000),
-    (0x44, 0x3832),
-    (0x48, 0x3132),
-    (0x4c, 0x2d2f),
-    (0x50, 0x2c2d),
-    (0x54, 0x1b2b),
-    (0x58, 0x94a0),
-    (0x5c, 0x8990),
-    (0x60, 0x8788),
-    (0x64, 0x8485),
-    (0x68, 0x8283),
-    (0x6c, 0x8182),
-    (0x70, 0x0081),
-];
 
 pub use vibeos_hal::network::{Error, Telemetry};
 
@@ -188,12 +169,7 @@ pub const fn validate_description(description: DwmacDescription) -> bool {
         description.registers.start,
         description.registers.end,
         DMA_HW_FEATURE + 4,
-    ) && range_contains_bytes(
-        description.soc_control.start,
-        description.soc_control.end,
-        0xa000,
-    ) && range_contains_bytes(description.efuse.start, description.efuse.end, 0x128)
-        && description.cache_line_bytes == 64
+    ) && description.cache_line_bytes == 64
         && description.dma_address_bits == 32
         && description.phy_address < 32
 }
@@ -208,10 +184,9 @@ const fn range_contains_bytes(start: usize, end: usize, bytes: usize) -> bool {
 /// Exclusive live ownership of one caller-supplied DMA slab and DWMAC instance.
 pub struct Engine {
     description: DwmacDescription,
+    platform: &'static vibeos_hal::network::Platform,
     dma: &'static DmaStorage,
     state: &'static InstanceState,
-    time: fn() -> u64,
-    timebase_hz: u64,
     rx_index: usize,
     tx_produce: usize,
     tx_reclaim: usize,
@@ -233,13 +208,18 @@ impl Engine {
     /// descriptor addresses are published directly from their Rust address.
     pub unsafe fn claim(
         description: DwmacDescription,
+        platform: &'static vibeos_hal::network::Platform,
         dma: &'static DmaStorage,
         state: &'static InstanceState,
         guest_mac: [u8; 6],
         time: fn() -> u64,
         timebase_hz: u64,
     ) -> Result<Self, Error> {
-        if !validate_description(description) {
+        if !validate_description(description)
+            || platform.dma.constraints.cache_line != 64
+            || platform.dma.constraints.alignment != 64
+            || platform.dma.constraints.address_bits != description.dma_address_bits
+        {
             return Err(Error::InvalidDescription);
         }
         if state
@@ -249,12 +229,29 @@ impl Engine {
         {
             return Err(Error::Busy);
         }
+        // Platform failure can leave the MAC clock disabled: do not touch the
+        // controller or run its destructor until platform setup succeeds.
+        if let Err(error) = (platform.prepare)(time, timebase_hz) {
+            state.claimed.store(false, Ordering::Release);
+            return Err(error);
+        }
+        if platform
+            .dma
+            .constraints
+            .validate(vibeos_hal::memory::DmaRegion {
+                physical: dma.base() as u64,
+                bytes: core::mem::size_of::<Slab>(),
+            })
+            .is_err()
+        {
+            state.claimed.store(false, Ordering::Release);
+            return Err(Error::AddressTooWide);
+        }
         let mut engine = Self {
             description,
+            platform,
             dma,
             state,
-            time,
-            timebase_hz,
             rx_index: 0,
             tx_produce: 0,
             tx_reclaim: 0,
@@ -299,8 +296,8 @@ impl Engine {
         }
         let index = self.tx_produce;
         let dma = unsafe { &mut *self.dma.slab.get() };
-        invalidate_range(
-            self.description.cache_line_bytes,
+        sync_cpu(
+            self.platform.dma,
             descriptor_address(&dma.tx_desc[index]),
             core::mem::size_of::<Descriptor>(),
         );
@@ -328,13 +325,13 @@ impl Engine {
         self.state
             .tx_status
             .store(u64::from(DESC_OWN), Ordering::Release);
-        clean_range(
-            self.description.cache_line_bytes,
+        sync_device(
+            self.platform.dma,
             buffer_address(&dma.tx[index]),
             packet.len(),
         );
-        clean_range(
-            self.description.cache_line_bytes,
+        sync_device(
+            self.platform.dma,
             descriptor_address(&dma.tx_desc[index]),
             core::mem::size_of::<Descriptor>(),
         );
@@ -348,8 +345,8 @@ impl Engine {
     pub fn receive(&mut self, output: &mut [u8]) -> Option<usize> {
         let index = self.rx_index;
         let dma = unsafe { &mut *self.dma.slab.get() };
-        invalidate_range(
-            self.description.cache_line_bytes,
+        sync_cpu(
+            self.platform.dma,
             descriptor_address(&dma.rx_desc[index]),
             core::mem::size_of::<Descriptor>(),
         );
@@ -365,8 +362,8 @@ impl Engine {
             && length <= MAX_PACKET_LEN
             && length <= output.len();
         let result = if valid {
-            invalidate_range(
-                self.description.cache_line_bytes,
+            sync_cpu(
+                self.platform.dma,
                 buffer_address(&dma.rx[index]),
                 with_fcs.min(DMA_BUFFER_LEN),
             );
@@ -383,8 +380,8 @@ impl Engine {
                 0
             };
         dma.rx_desc[index].words[0] = DESC_OWN;
-        clean_range(
-            self.description.cache_line_bytes,
+        sync_device(
+            self.platform.dma,
             descriptor_address(&dma.rx_desc[index]),
             core::mem::size_of::<Descriptor>(),
         );
@@ -397,8 +394,8 @@ impl Engine {
         let dma = unsafe { &*self.dma.slab.get() };
         while self.tx_in_flight != 0 {
             let descriptor = &dma.tx_desc[self.tx_reclaim];
-            invalidate_range(
-                self.description.cache_line_bytes,
+            sync_cpu(
+                self.platform.dma,
                 descriptor_address(descriptor),
                 core::mem::size_of::<Descriptor>(),
             );
@@ -427,7 +424,6 @@ impl Engine {
     }
 
     unsafe fn initialize(&mut self, mac: [u8; 6]) -> Result<(), Error> {
-        prepare_soc(self.description, self.time, self.timebase_hz);
         write32(
             self.description,
             DMA_BUS_MODE,
@@ -468,8 +464,8 @@ impl Engine {
             };
             dma.tx_desc[index].words[2] = buffer_address(&dma.tx[index]) as u32;
         }
-        clean_range(
-            self.description.cache_line_bytes,
+        sync_device(
+            self.platform.dma,
             self.dma.base(),
             core::mem::size_of::<Slab>(),
         );
@@ -549,23 +545,26 @@ impl Drop for Engine {
 /// readable for this call. The caller must also serialize these diagnostic
 /// reads with platform operations for which the DWMAC, clock, or ePHY
 /// register semantics require exclusive access.
-pub unsafe fn telemetry(description: DwmacDescription, state: &InstanceState) -> Telemetry {
+pub unsafe fn telemetry(
+    description: DwmacDescription,
+    state: &InstanceState,
+    platform: &vibeos_hal::network::Platform,
+) -> Telemetry {
+    let wiring = (platform.telemetry)();
     let tx_descriptor_status = state.tx_status.load(Ordering::Acquire) as u32;
     Telemetry {
         phy_link_up: state.phy_link_up.load(Ordering::Acquire),
         tx_descriptor_status,
         dma_status: read32(description, DMA_STATUS),
-        clock_enable: soc_read32(description.soc_control.start + 0x2000),
-        clock_bypass: soc_read32(description.soc_control.start + 0x2030),
-        clock_divider: soc_read32(description.soc_control.start + 0x208c),
-        ephy_control: soc_read32(description.soc_control.start + 0x9800),
+        clock_enable: wiring.clock_enable,
+        clock_bypass: wiring.clock_bypass,
+        clock_divider: wiring.clock_divider,
+        ephy_control: wiring.ephy_control,
         resets: state.resets.load(Ordering::Acquire),
         rx_packets: state.rx_packets.load(Ordering::Acquire),
         tx_packets: state.tx_packets.load(Ordering::Acquire),
         tx_checksum_offload: read32(description, DMA_HW_FEATURE) & DMA_HW_TX_CHECKSUM != 0,
-        rx_checksum_offload: read32(description, DMA_HW_FEATURE)
-            & DMA_HW_RX_CHECKSUM_TYPE2
-            != 0,
+        rx_checksum_offload: read32(description, DMA_HW_FEATURE) & DMA_HW_RX_CHECKSUM_TYPE2 != 0,
     }
 }
 
@@ -674,222 +673,11 @@ fn mdio_read(d: DwmacDescription, register: u32) -> Option<u16> {
     None
 }
 
-fn prepare_soc(d: DwmacDescription, time: fn() -> u64, hz: u64) {
-    let clk = d.soc_control.start + 0x2000;
-    soc_write32(clk, soc_read32(clk) | ((1 << 11) | (1 << 25) | (1 << 26)));
-    soc_write32(clk + 0x30, soc_read32(clk + 0x30) & !(1 << 9));
-    soc_write32(
-        clk + 0x8c,
-        (soc_read32(clk + 0x8c) & !(0xf << 16)) | (3 << 16) | (1 << 3),
-    );
-    prepare_ephy(d, time, hz);
-    let _ = soc_read32(clk);
-}
-fn prepare_ephy(d: DwmacDescription, time: fn() -> u64, hz: u64) {
-    let base = d.soc_control.start + 0x9000;
-    let top = base + 0x800;
-    soc_write32(top + 4, 1);
-    soc_write32(top, 0x0900);
-    soc_write32(top, 0x0904);
-    delay(time, hz, 10);
-    page(base, 5);
-    ew(base, 0x40, 0x0c7e);
-    delay(time, hz, 1);
-    soc_write32(top, 0x0906);
-    page(base, 0);
-    let e20 = soc_read32(d.efuse.start + 0x120);
-    let e24 = soc_read32(d.efuse.start + 0x124);
-    ew(
-        base,
-        0x64,
-        if e20 & 0x200 != 0 {
-            (e24 >> 24 & 0xff) | (e24 >> 8 & 0xff00)
-        } else {
-            0x5a5a
-        },
-    );
-    ew(base, 0x54, if e20 & 0x100 != 0 { e24 & 0xff00 } else { 0 });
-    let term = if e20 & 0x800 != 0 {
-        ((e20 >> 24) & 0xf0) | ((e20 >> 16) & 0xf00)
-    } else {
-        0xbb0
-    };
-    ew(base, 0x58, (er(base, 0x58) & !0xff0) | term);
-    ew(base, 0x5c, 0xc10);
-    ew(base, 0x68, 3);
-    ew(base, 0x54, 0);
-    table(
-        base,
-        16,
-        &[
-            (0x68, 0x1000),
-            (0x6c, 0x3020),
-            (0x70, 0x5040),
-            (0x74, 0x7060),
-            (0x58, 0x1708),
-            (0x5c, 0x3827),
-            (0x60, 0x5748),
-            (0x64, 0x7867),
-        ],
-    );
-    table(
-        base,
-        17,
-        &[
-            (0x40, 0x9080),
-            (0x44, 0xb0a0),
-            (0x48, 0xd0c0),
-            (0x4c, 0xf0e0),
-            (0x50, 0x9788),
-            (0x54, 0xb8a7),
-            (0x58, 0xd7c8),
-            (0x5c, 0xf8e7),
-        ],
-    );
-    page(base, 5);
-    ew(base, 0x40, er(base, 0x40) | 1);
-    ew(base, 0x4c, er(base, 0x4c) | 0x820);
-    table(base, 10, EPHY_LINK_PULSE);
-    table(
-        base,
-        11,
-        &[
-            (0x40, 0x5252),
-            (0x44, 0x5252),
-            (0x48, 0x4b52),
-            (0x4c, 0x3d47),
-            (0x50, 0xaa99),
-            (0x54, 0x989e),
-            (0x58, 0x9395),
-            (0x5c, 0x9091),
-            (0x60, 0x8e8f),
-            (0x64, 0x8d8e),
-            (0x68, 0x8c8c),
-            (0x6c, 0x8b8b),
-            (0x70, 0x8a),
-        ],
-    );
-    table(
-        base,
-        13,
-        &[
-            (0x40, 0x1e0a),
-            (0x44, 0x3862),
-            (0x48, 0x1e62),
-            (0x4c, 0x2a08),
-            (0x50, 0x244c),
-            (0x54, 0x1a44),
-            (0x58, 0x61c),
-        ],
-    );
-    table(
-        base,
-        14,
-        &[
-            (0x40, 0x2d30),
-            (0x44, 0x3470),
-            (0x48, 0x648),
-            (0x4c, 0x261c),
-            (0x50, 0x3160),
-            (0x54, 0x2d5e),
-        ],
-    );
-    table(
-        base,
-        15,
-        &[
-            (0x40, 0x2922),
-            (0x44, 0x366e),
-            (0x48, 0x752),
-            (0x4c, 0x2556),
-            (0x50, 0x2348),
-            (0x54, 0xc30),
-        ],
-    );
-    table(
-        base,
-        16,
-        &[
-            (0x40, 0x1e08),
-            (0x44, 0x3868),
-            (0x48, 0x1462),
-            (0x4c, 0x1a0e),
-            (0x50, 0x305e),
-            (0x54, 0x2f62),
-        ],
-    );
-    page(base, 1);
-    ew(base, 0x68, er(base, 0x68) & !0xf00);
-    table(base, 19, &[(0x58, 0x12), (0x5c, 0x6848)]);
-    table(
-        base,
-        18,
-        &[
-            (0x48, 0x801),
-            (0x4c, 0x1717),
-            (0x5c, 0x108),
-            (0x50, 0x3afc),
-            (0x54, 0x8d3),
-            (0x60, 0xfb),
-        ],
-    );
-    page(base, 0);
-    soc_write32(top, 0x090e);
-    ew(base, 0, er(base, 0) | 0x100);
-    soc_write32(top + 4, 0);
-}
-fn table(base: usize, p: u32, v: &[(usize, u32)]) {
-    page(base, p);
-    for &(o, x) in v {
-        ew(base, o, x)
-    }
-}
-fn page(base: usize, p: u32) {
-    soc_write32(base + 0x7c, p << 8)
-}
-fn er(base: usize, o: usize) -> u32 {
-    soc_read32(base + o)
-}
-fn ew(base: usize, o: usize, v: u32) {
-    soc_write32(base + o, v)
-}
-fn delay(time: fn() -> u64, hz: u64, ms: u64) {
-    let end = time().saturating_add(ms.saturating_mul(hz) / 1000);
-    while time() < end {
-        core::hint::spin_loop()
-    }
-}
 fn descriptor_address(v: &Descriptor) -> usize {
     v.words.as_ptr() as usize
 }
 fn buffer_address(v: &[u8; DMA_BUFFER_LEN]) -> usize {
     v.as_ptr() as usize
-}
-fn clean_range(line: usize, start: usize, size: usize) {
-    cache_range(line, start, size, true)
-}
-fn invalidate_range(line: usize, start: usize, size: usize) {
-    cache_range(line, start, size, false)
-}
-#[cfg(target_arch = "riscv64")]
-fn cache_range(bytes: usize, start: usize, size: usize, clean: bool) {
-    let mut line = start & !(bytes - 1);
-    let end = start.saturating_add(size).saturating_add(bytes - 1) & !(bytes - 1);
-    while line < end {
-        unsafe {
-            if clean {
-                core::arch::asm!(".long 0x0295000b",in("a0")line,options(nostack))
-            } else {
-                core::arch::asm!(".long 0x02a5000b",in("a0")line,options(nostack))
-            }
-        }
-        line += bytes
-    }
-    unsafe { core::arch::asm!(".long 0x0190000b", options(nostack)) }
-}
-#[cfg(not(target_arch = "riscv64"))]
-fn cache_range(_: usize, _: usize, _: usize, _: bool) {
-    core::sync::atomic::compiler_fence(Ordering::SeqCst)
 }
 #[inline]
 fn read32(d: DwmacDescription, o: usize) -> u32 {
@@ -899,15 +687,6 @@ fn read32(d: DwmacDescription, o: usize) -> u32 {
 fn write32(d: DwmacDescription, o: usize, v: u32) {
     unsafe { ((d.registers.start + o) as *mut u32).write_volatile(v) }
 }
-#[inline]
-fn soc_read32(a: usize) -> u32 {
-    unsafe { (a as *const u32).read_volatile() }
-}
-#[inline]
-fn soc_write32(a: usize, v: u32) {
-    unsafe { (a as *mut u32).write_volatile(v) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,13 +714,6 @@ mod tests {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err());
         assert_eq!(state.resets.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn link_pulse_tuning_uses_cable_removal_fix() {
-        assert_eq!(EPHY_LINK_PULSE.first(), Some(&(0x40, 0x2000)));
-        assert_eq!(EPHY_LINK_PULSE.get(6), Some(&(0x58, 0x94a0)));
-        assert_eq!(EPHY_LINK_PULSE.last(), Some(&(0x70, 0x0081)));
     }
 
     #[test]
@@ -974,8 +746,6 @@ mod tests {
         let valid = DwmacDescription {
             registers: AddressRange::new(0x1000, 0x3000),
             irq: 1,
-            soc_control: AddressRange::new(0x4000, 0xe000),
-            efuse: AddressRange::new(0x1_0000, 0x1_1000),
             phy_address: 0,
             dma_address_bits: 32,
             cache_line_bytes: 64,
@@ -989,5 +759,99 @@ mod tests {
             registers: AddressRange::new(usize::MAX - 0x100, usize::MAX),
             ..valid
         }));
+    }
+}
+
+fn sync_device(ops: &vibeos_hal::memory::DmaOps, start: usize, bytes: usize) {
+    unsafe {
+        (ops.sync_for_device)(
+            vibeos_hal::memory::DmaRegion {
+                physical: start as u64,
+                bytes,
+            },
+            vibeos_hal::memory::DmaDirection::Bidirectional,
+        )
+    }
+}
+fn sync_cpu(ops: &vibeos_hal::memory::DmaOps, start: usize, bytes: usize) {
+    unsafe {
+        (ops.sync_for_cpu)(
+            vibeos_hal::memory::DmaRegion {
+                physical: start as u64,
+                bytes,
+            },
+            vibeos_hal::memory::DmaDirection::Bidirectional,
+        )
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+    use vibeos_hal::{
+        memory::*,
+        network::{Platform, PlatformTelemetry},
+        AddressRange,
+    };
+    static STORAGE: DmaStorage = DmaStorage::new();
+    static STATE: InstanceState = InstanceState::new();
+    static SYNCS: std::sync::Mutex<std::vec::Vec<(bool, DmaRegion, DmaDirection)>> =
+        std::sync::Mutex::new(std::vec::Vec::new());
+    static DMA: DmaOps = DmaOps {
+        constraints: DmaConstraints {
+            address_bits: 32,
+            alignment: 64,
+            cache_line: 64,
+        },
+        sync_for_device: |r, d| SYNCS.lock().unwrap().push((true, r, d)),
+        sync_for_cpu: |r, d| SYNCS.lock().unwrap().push((false, r, d)),
+    };
+    static PLATFORM: Platform = Platform {
+        prepare: |_, _| Err(Error::InvalidDescription),
+        telemetry: PlatformTelemetry::default,
+        dma: &DMA,
+    };
+    #[test]
+    fn failed_platform_setup_never_accesses_clockless_controller_and_permits_retry() {
+        let desc = DwmacDescription {
+            registers: AddressRange::new(0x1000, 0x3000),
+            irq: 1,
+            phy_address: 0,
+            dma_address_bits: 32,
+            cache_line_bytes: 64,
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                unsafe { Engine::claim(desc, &PLATFORM, &STORAGE, &STATE, [0; 6], || 0, 1000) },
+                Err(Error::InvalidDescription)
+            ));
+            assert!(!STATE.claimed.load(Ordering::Acquire));
+        }
+    }
+    #[test]
+    fn synchronization_dispatch_preserves_span_and_direction() {
+        sync_device(&DMA, 0x80001000, 1536);
+        sync_cpu(&DMA, 0x80001040, 64);
+        assert_eq!(
+            *SYNCS.lock().unwrap(),
+            [
+                (
+                    true,
+                    DmaRegion {
+                        physical: 0x80001000,
+                        bytes: 1536
+                    },
+                    DmaDirection::Bidirectional
+                ),
+                (
+                    false,
+                    DmaRegion {
+                        physical: 0x80001040,
+                        bytes: 64
+                    },
+                    DmaDirection::Bidirectional
+                )
+            ]
+        );
     }
 }

@@ -39,3 +39,8 @@ mod pci;
 mod usb;
 
 mod transport;
+
+// Preserve the established storage namespace independently of HAL frontend choice.
+const MANAGED_BLOCK_ID: core::num::NonZeroU128 =
+    core::num::NonZeroU128::new(0x5649_4245_4f53_0000_0000_0000_0000_0001).unwrap();
+const NETWORK_DRIVER_NAME: &str = "virtio-mmio";

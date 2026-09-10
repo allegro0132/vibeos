@@ -1,0 +1,22 @@
+[package]
+name = "vibeos-firmware-qemu-hal-test"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[[bin]]
+name = "vibeos-qemu-hal-test"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vibeos-kernel = { path = "../../kernel", default-features = false, features = ["queued-block", "queued-network", "qemu-default-image", "boot-dtb-probe", "legacy-shell"] }
+vibeos-hal = { path = "../../hal" }
+vibeos-bsp-qemu-virt = { path = "../../boards/qemu-virt" }
+vibeos-driver-uart16550 = { path = "../../drivers/uart16550" }
+vibeos-driver-plic = { path = "../../drivers/plic" }
+vibeos-driver-virtio-mmio = { path = "../../drivers/virtio-mmio" }
+vibeos-driver-virtio-blk = { path = "../../drivers/virtio-blk" }
+vibeos-driver-virtio-core = { path = "../../drivers/virtio-core" }
+vibeos-driver-virtio-net = { path = "../../drivers/virtio-net" }

@@ -474,3 +474,19 @@ SBI extension probing, live Mars resource/memory publication, four physical
 hart completion, SD/EQoS integration and the flashable image remain pending.
 The opt-in QEMU probe is acceptance instrumentation, not a replacement for
 those production checks or physical acceptance.
+
+### Storage/network frontend selection stage
+
+The Mars composition can now select `pio-block` and `packet-network` without
+implicitly enabling Duo USB or its entropy provider. The four combinations of
+PIO/queued block and packet/queued network frontends compile with generic
+network/WASI/legacy-shell services and no kernel board profile. Conflicting
+frontend selections fail compilation. Firmware owns the stable block device
+identity and NIC driver label; existing QEMU/Duo identity values are preserved.
+
+A real QEMU composition image with no kernel board profile passes live DTB and
+390 selftests, block read/write and network handshake tests; recovery results
+are recorded in `boards/milkv-mars/frontend-selection-evidence.json`.
+This establishes the composition boundary, not JH7110 controller behavior.
+Mars still requires its firmware entry, live admission/resource publication,
+DW-MSHC/EQoS integration, boot components and the flashable SD image.

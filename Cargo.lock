@@ -1764,6 +1764,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-firmware-qemu-hal-test"
+version = "0.1.0"
+dependencies = [
+ "vibeos-bsp-qemu-virt",
+ "vibeos-driver-plic",
+ "vibeos-driver-uart16550",
+ "vibeos-driver-virtio-blk",
+ "vibeos-driver-virtio-core",
+ "vibeos-driver-virtio-mmio",
+ "vibeos-driver-virtio-net",
+ "vibeos-hal",
+ "vibeos-kernel",
+]
+
+[[package]]
 name = "vibeos-firmware-qemu-virt"
 version = "0.1.0"
 dependencies = [

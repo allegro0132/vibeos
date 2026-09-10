@@ -158,8 +158,8 @@ fn install_shared_commands(session: &mut Session) {
     vibeos_vsh::install_commands(session, BASE_COMMANDS);
     #[cfg(feature = "qemu-virt")]
     vibeos_vsh::install_commands(session, QEMU_COMMANDS);
-    #[cfg(feature = "milkv-duo")]
-    vibeos_vsh::install_commands(session, MILKV_STORAGE_COMMANDS);
+    #[cfg(feature = "pio-block")]
+    vibeos_vsh::install_commands(session, PIO_STORAGE_COMMANDS);
     #[cfg(feature = "milkv-duo")]
     vibeos_vsh::install_commands(session, MILKV_USB_COMMANDS);
     #[cfg(any(
@@ -320,8 +320,8 @@ const QEMU_COMMANDS: &[CommandSpec] = &[
     },
 ];
 
-#[cfg(feature = "milkv-duo")]
-const MILKV_STORAGE_COMMANDS: &[CommandSpec] = &[
+#[cfg(feature = "pio-block")]
+const PIO_STORAGE_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "readback",
         min_args: 0,
@@ -875,7 +875,7 @@ fn vsh_verbose(_args: &[String]) -> Result<String, Status> {
 ///
 /// - `iostat` — print ops / blocks-read / blocks-written / busy-ms.
 /// - `iostat reset` — zero the counters before measuring one operation.
-#[cfg(feature = "milkv-duo")]
+#[cfg(feature = "pio-block")]
 fn vsh_iostat(args: &[String]) -> Result<String, Status> {
     match args.first().map(String::as_str) {
         Some("reset") => {
@@ -894,7 +894,7 @@ fn vsh_iostat(args: &[String]) -> Result<String, Status> {
     }
 }
 
-#[cfg(feature = "milkv-duo")]
+#[cfg(feature = "pio-block")]
 fn vsh_readback(args: &[String]) -> Result<String, Status> {
     match args.first().map(String::as_str) {
         None | Some("status") => Ok(format!(

@@ -1,6 +1,6 @@
 //! Capability-scoped logical-block frontend.
 //!
-//! The selected board backend owns the raw controller service. Clients receive
+//! The selected HAL backend owns the raw controller service. Clients receive
 //! only an attenuable [`BlockDevice`] resource naming one exact logical-block
 //! range; every address is validated and translated before reaching the raw
 //! backend.
@@ -21,9 +21,9 @@ use vibeos_storage_device::{
     Operation, RangeInfo, RangeSession, WriteCache, WriteDurability,
 };
 
-#[cfg(feature = "milkv-duo")]
+#[cfg(feature = "pio-block")]
 use crate::sdhci_blk as backend;
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "queued-block")]
 use crate::virtio_blk as backend;
 
 #[allow(unused_imports)]
@@ -32,17 +32,10 @@ pub use backend::{
     recover_faulted_domain, BlockError, BlockInfo, DmaRegion, MmioWindow,
 };
 
-#[cfg(feature = "qemu-virt")]
-const MANAGED_DEVICE_ID: DeviceId = match DeviceId::new(0x5649_4245_4f53_0000_0000_0000_0000_0001) {
-    Some(id) => id,
-    None => panic!("managed block device identity must be non-zero"),
-};
-
-#[cfg(feature = "milkv-duo")]
-const MANAGED_DEVICE_ID: DeviceId = match DeviceId::new(0x5649_4245_4f53_0000_0000_0000_0000_0002) {
-    Some(id) => id,
-    None => panic!("managed block device identity must be non-zero"),
-};
+fn managed_device_id() -> DeviceId {
+    DeviceId::new(vibeos_hal::boot::platform().managed_block_id.get())
+        .expect("firmware block identity is nonzero")
+}
 
 /// Client-visible authority over one exact range in the managed device's
 /// logical namespace. Safe derivation can only shrink this range.
@@ -128,7 +121,7 @@ pub(crate) fn discover() -> Option<BlockResources> {
     // logical zero. Partition offsets therefore never enter a client CSpace.
     // SAFETY: image policy is the sole root provisioning authority for the
     // managed device namespace; client CSpaces receive only attenuated ranges.
-    let range = unsafe { BlockRange::root(MANAGED_DEVICE_ID, 0, slice.sector_count) }.ok()?;
+    let range = unsafe { BlockRange::root(managed_device_id(), 0, slice.sector_count) }.ok()?;
     Some(BlockResources {
         mmio: resources.mmio,
         dma: resources.dma,
@@ -373,10 +366,10 @@ fn current_device_info() -> Result<DeviceInfo, BlockError> {
         return Err(BlockError::Offline);
     }
     let session =
-        DeviceSession::new(MANAGED_DEVICE_ID, raw.session_epoch).map_err(map_contract_error)?;
-    #[cfg(feature = "qemu-virt")]
+        DeviceSession::new(managed_device_id(), raw.session_epoch).map_err(map_contract_error)?;
+    #[cfg(feature = "queued-block")]
     let max_transfer_blocks = vibeos_virtio_protocol::BLOCK_MAX_TRANSFER_BLOCKS;
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(feature = "pio-block")]
     let max_transfer_blocks = backend::MAX_TRANSFER_BLOCKS;
     let geometry = DeviceGeometry::new(
         512,

@@ -235,3 +235,42 @@ SSH key-object handler without conflicting with file-tree capability paths;
 the old `cat` registration remains for images without that path parser. Identity
 encoding, authorization policy and on-media object kind are unchanged. This
 service separation does not yet remove board-named device/acceptance features.
+
+### Independently selected block and network frontends
+
+Firmware can select `pio-block` or `queued-block`, and `packet-network` or
+`queued-network`, without selecting a kernel board profile. Exactly one of
+each pair is required. These are static HAL frontend implementations, not
+concrete controller drivers. The old `qemu-virt`/`milkv-duo` profiles retain
+their original selections and compatibility behavior. Storage V2 batching,
+block/network diagnostics and recovery paths follow the interface selection.
+The existing internal `sdhci_blk`/`dwmac_net` adapter filenames remain; their
+hardware implementation is still provided through firmware-owned HAL tables.
+
+`BootPlatform.managed_block_id` is a nonzero image-provided storage namespace
+identity. It is independent of backend choice; QEMU and Duo retain their
+existing values. The primary NIC's displayed driver name also comes from
+`BootPlatform`, allowing EQoS to identify itself without kernel board branches.
+
+`firmware/qemu-hal-test` is a composition acceptance image. It links the real
+QEMU storage/network/transport providers and the shared UART/PLIC composition,
+but enables neither kernel board profile, USB nor entropy services. Its linker
+layout reuses the ordinary QEMU template. It is not a replacement for either
+production firmware or a Mars image. Four frontend combinations are checked
+with the generic network, WASI and legacy-shell services; only the queued pair
+has been run in this QEMU composition image.
+
+After building from `firmware/qemu-hal-test`, existing golden tests can use it:
+
+```sh
+QEMU_TEST_KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-hal-test \
+  scripts/qemu-test.sh block
+```
+
+`QEMU_TEST_KERNEL` skips the test harness's default build and requires the
+supplied ELF to exist. Omitting it preserves the original build/test behavior.
+The `net`, `block_recovery` and `net_recovery` cases exercise real providers and
+unchanged client authority/recovery contracts. The optional live DTB probe and
+390 target selftests also run on this image. USB, entropy and acceptance-only
+kernel board switches remain to be separated; this stage does not claim a
+fully board-independent kernel.

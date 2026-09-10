@@ -7,7 +7,7 @@
 set -eu
 
 cd "$(dirname "$0")/.."
-KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt
+KERNEL=${QEMU_TEST_KERNEL:-target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt}
 UPDATE=0
 FILTER=""
 QEMU_SMP=${QEMU_SMP:-4}
@@ -29,8 +29,15 @@ if [ -z "$toolchain" ] || ! command -v rustup >/dev/null 2>&1; then
 fi
 pinned_rustc=$(rustup which --toolchain "$toolchain" rustc)
 pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc)
+if [ -n "${QEMU_TEST_KERNEL:-}" ]; then
+  if [ ! -f "$KERNEL" ]; then
+    echo "qemu-test.sh: supplied QEMU_TEST_KERNEL does not exist: $KERNEL" >&2
+    exit 1
+  fi
+else
 (cd firmware/qemu-virt && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
   rustup run "$toolchain" cargo build --release --features legacy-shell) >&2
+fi
 
 # Strip everything that legitimately varies between runs: timings, addresses,
 # heap sizes, and the terminal control codes the line discipline emits.

@@ -44,6 +44,8 @@ unsafe impl Sync for RamTables {}
 static RAM_TABLES: RamTables = RamTables(UnsafeCell::new([[0; 512]; RAM_TABLE_PAGES]));
 #[no_mangle]
 pub static VIBEOS_BOOT_PLATFORM: BootPlatform = BootPlatform {
+    managed_block_id: super::MANAGED_BLOCK_ID,
+    network_driver_name: super::NETWORK_DRIVER_NAME,
     info: Board::INFO,
     memory_map: Board::MEMORY_MAP,
     mmu: Board::MMU,

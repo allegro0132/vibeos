@@ -10,6 +10,10 @@ pub struct PageTableArena {
 }
 
 pub struct BootPlatform {
+    /// Persistent logical device identity is image policy, not controller type.
+    pub managed_block_id: core::num::NonZeroU128,
+    /// User-visible primary NIC driver label supplied by the composition root.
+    pub network_driver_name: &'static str,
     pub info: BoardInfo,
     pub memory_map: &'static [MemoryRegion],
     pub mmu: MmuDescription,

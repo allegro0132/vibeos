@@ -992,6 +992,11 @@ compile_error!(
 ))]
 compile_error!("feature `milkv-jitterentropy-probe` is an isolated UART qualification image");
 
+#[cfg(any(all(feature = "pio-block", feature = "queued-block"), not(any(feature = "pio-block", feature = "queued-block"))))]
+compile_error!("select exactly one block frontend: pio-block or queued-block");
+#[cfg(any(all(feature = "packet-network", feature = "queued-network"), not(any(feature = "packet-network", feature = "queued-network"))))]
+compile_error!("select exactly one network frontend: packet-network or queued-network");
+
 extern crate alloc;
 
 #[cfg(all(feature = "provisioned-wasmtime", target_arch = "riscv64", not(target_feature = "d")))]
@@ -1003,7 +1008,7 @@ compile_error!("Milk-V Wasmtime requires riscv64gc-unknown-none-elf; use build-m
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
 pub use vibeos_core::{cap, chan, exec, heap, instance, interrupt, ipi, sync};
-#[cfg(feature = "qemu-virt")]
+#[cfg(any(feature = "queued-block", feature = "queued-network", feature = "qemu-virt"))]
 pub use vibeos_virtio_protocol as virtio;
 pub use vibeos_durable_format as durable;
 pub use vibeos_program_store as program;
@@ -1115,14 +1120,14 @@ mod boot_dtb_probe;
 mod block_device;
 #[cfg(feature = "milkv-duo")]
 mod dwc2_host;
-#[cfg(feature = "milkv-duo")]
+#[cfg(feature = "packet-network")]
 mod packet_device;
-#[cfg(feature = "milkv-duo")]
+#[cfg(feature = "packet-network")]
 mod dwmac_net;
 mod net_device;
-#[cfg(feature = "milkv-duo")]
+#[cfg(feature = "pio-block")]
 mod pio_block;
-#[cfg(feature = "milkv-duo")]
+#[cfg(feature = "pio-block")]
 mod sdhci_blk;
 mod segment_store_platform;
 mod store_platform;
@@ -1132,15 +1137,15 @@ mod tty;
 mod uart;
 #[cfg(feature = "milkv-duo")]
 mod usb_ecm_net;
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "queued-block")]
 mod queued_block;
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "queued-block")]
 mod virtio_blk;
-#[cfg(feature = "qemu-virt")]
+#[cfg(any(feature = "queued-block", feature = "queued-network", feature = "qemu-virt"))]
 mod virtio_mmio;
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "queued-network")]
 mod queued_network;
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "queued-network")]
 mod virtio_net;
 #[cfg(feature = "qemu-virt")]
 mod entropy_device;

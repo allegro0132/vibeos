@@ -1632,7 +1632,7 @@ async fn net_command(args: &[&str]) {
             Ok(info) if info.quarantined => {
                 println!("  virtio-net: quarantined (reset was not confirmed)")
             }
-            #[cfg(feature = "milkv-duo")]
+            #[cfg(feature = "packet-network")]
             Ok(info) if info.online => {
                 println!(
                     "  dwmac: ready, polling descriptors {}, raw Ethernet header {}, RMII, PHY link {}",
@@ -1649,7 +1649,7 @@ async fn net_command(args: &[&str]) {
                     info.clock_bypass, info.clock_divider, info.ephy_control
                 );
             }
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-network")]
             Ok(info) if info.online => println!(
                 "  virtio-net: ready, queues rx=0/tx=1 size {}, header {}, features VERSION_1",
                 info.queue_size, info.header_size
@@ -1660,13 +1660,13 @@ async fn net_command(args: &[&str]) {
         "test" => match net_handshake(&init, outbound, inbound, control).await {
             Ok((before, after)) => {
                 println!("  raw L2 HELLO -> CHALLENGE -> ACK: ok");
-                #[cfg(feature = "milkv-duo")]
+                #[cfg(feature = "packet-network")]
                 println!(
                     "  DWMAC polling completion: ok (rx +{}, tx +{})",
                     after.rx_packets.saturating_sub(before.rx_packets),
                     after.tx_packets.saturating_sub(before.tx_packets)
                 );
-                #[cfg(feature = "qemu-virt")]
+                #[cfg(feature = "queued-network")]
                 println!(
                     "  dual-queue completion: ok (IRQ observed; rx +{}, tx +{})",
                     after.rx_packets.saturating_sub(before.rx_packets),
@@ -1844,9 +1844,9 @@ async fn net_handshake(
     let tx_target = before.tx_packets.saturating_add(2);
     for _ in 0..NET_COMMAND_TIMEOUT_MS {
         let after = net_info(init, control)?;
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(feature = "packet-network")]
         let completed = after.tx_packets >= tx_target && after.rx_packets > before.rx_packets;
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-network")]
         let completed = after.tx_packets >= tx_target
             && after.rx_packets > before.rx_packets
             && after.used_interrupts > before.used_interrupts;
@@ -1888,18 +1888,18 @@ async fn block_command(args: &[&str]) {
                     if info.quarantined {
                         println!("  virtio-blk: quarantined (reset was not confirmed)");
                     } else if info.online {
-                        #[cfg(feature = "milkv-duo")]
+                        #[cfg(feature = "pio-block")]
                         println!(
                             "  microSD: ready, data partition {} sectors, PIO depth {}",
                             info.capacity_sectors, info.queue_size
                         );
-                        #[cfg(feature = "qemu-virt")]
+                        #[cfg(feature = "queued-block")]
                         println!(
                             "  virtio-blk: ready, capacity {} sectors, queue size {}",
                             info.capacity_sectors, info.queue_size
                         );
                     } else {
-                        #[cfg(feature = "milkv-duo")]
+                        #[cfg(feature = "pio-block")]
                         match info.last_error {
                             Some(error) => {
                                 println!("  microSD: offline ({})", error);
@@ -1910,7 +1910,7 @@ async fn block_command(args: &[&str]) {
                             }
                             None => println!("  microSD: offline (driver component not attached)"),
                         }
-                        #[cfg(feature = "qemu-virt")]
+                        #[cfg(feature = "queued-block")]
                         println!("  virtio-blk: offline (driver component not attached)");
                     }
                 }
@@ -1992,7 +1992,7 @@ async fn block_command(args: &[&str]) {
             }
         }
         "test" => {
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-block")]
             let irq_before = {
                 let lease = init
                     .0
@@ -2063,7 +2063,7 @@ async fn block_command(args: &[&str]) {
                 Ok(lease) => crate::block_device::read_with(lease, 8).await,
                 Err(_) => Err(crate::block_device::BlockError::AuthorityRevoked),
             };
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-block")]
             let irq_after = {
                 let lease = init
                     .0
@@ -2078,13 +2078,13 @@ async fn block_command(args: &[&str]) {
             match verified {
                 Ok(observed) if observed == data => {
                     println!("  sector 8 write + flush: ok");
-                    #[cfg(feature = "qemu-virt")]
+                    #[cfg(feature = "queued-block")]
                     if irq_after > irq_before {
                         println!("  used-buffer IRQ delivery: ok");
                     } else {
                         println!("  used-buffer IRQ delivery: not observed");
                     }
-                    #[cfg(feature = "milkv-duo")]
+                    #[cfg(feature = "pio-block")]
                     println!("  SDHCI PIO polling completion: ok");
                 }
                 Ok(_) => println!("  sector 8 write + flush: readback mismatch"),
@@ -2280,7 +2280,7 @@ async fn block_command(args: &[&str]) {
                 println!("  authority revocation: explicit restart failed");
             }
         }
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(feature = "pio-block")]
         "multiblock-probe" => {
             let poll_budget: usize = args
                 .get(1)
@@ -2320,7 +2320,7 @@ async fn block_command(args: &[&str]) {
         }
         other => println!(
             "  usage: blk [info|scope|test|fault|recover|timeout|cancel|revoke{}] (got `{}`)",
-            if cfg!(feature = "milkv-duo") {
+            if cfg!(feature = "pio-block") {
                 "|multiblock-probe"
             } else {
                 ""
@@ -2365,7 +2365,7 @@ async fn block_benchmark(init: &Arc<Space>, block_cap: Cap, args: &[&str]) {
         return;
     }
 
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let before = crate::virtio_blk::telemetry();
     let started = crate::sbi::time();
     let result = match workload {
@@ -2502,7 +2502,7 @@ async fn block_benchmark(init: &Arc<Space>, block_cap: Cap, args: &[&str]) {
         _ => unreachable!(),
     };
     let elapsed = crate::sbi::time().saturating_sub(started).max(1);
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io = {
         let delta = crate::virtio_blk::telemetry().saturating_sub(before);
         (
@@ -2515,7 +2515,7 @@ async fn block_benchmark(init: &Arc<Space>, block_cap: Cap, args: &[&str]) {
             delta.used_interrupts,
         )
     };
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(feature = "pio-block")]
     let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
     let status = if result.is_ok() {
         "ok"
@@ -2965,7 +2965,7 @@ async fn storage_object_bench(
             .ok()
             .and_then(|lease| crate::store::info_with(&lease).ok())
             .is_some_and(|info| info.ready && !info.busy);
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-block")]
         let quiet = if ready {
             let before = crate::virtio_blk::telemetry();
             exec::sleep_ms(250).await;
@@ -2973,7 +2973,7 @@ async fn storage_object_bench(
         } else {
             false
         };
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(feature = "pio-block")]
         let quiet = ready;
         if quiet || crate::sbi::time() >= ready_deadline {
             break;
@@ -2984,7 +2984,7 @@ async fn storage_object_bench(
         .expect("storage benchmark kind is non-zero");
     if workload == "v2-dedup-gc" {
         const OBJECT_COUNT: u64 = 8;
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-block")]
         let io_started = crate::virtio_blk::telemetry();
         let started = crate::sbi::time();
         let mut ok = true;
@@ -3039,11 +3039,11 @@ async fn storage_object_bench(
             ok &= verified;
         }
         let elapsed = crate::sbi::time().saturating_sub(started).max(1);
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-block")]
         let io = crate::virtio_blk::telemetry().saturating_sub(io_started);
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(feature = "pio-block")]
         let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-block")]
         let io = (io.requests, io.read_requests, io.write_requests, io.flush_requests,
             io.read_bytes, io.write_bytes, io.used_interrupts);
         let (
@@ -3080,7 +3080,7 @@ async fn storage_object_bench(
         .benchmark_authority_shape()
         .await
         .unwrap_or((0, 0, false, 0, 0, 0));
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io_started = crate::virtio_blk::telemetry();
     let put_started = crate::sbi::time();
     // The Merkle-blob profile wraps content in its own verified envelope;
@@ -3109,11 +3109,11 @@ async fn storage_object_bench(
         )),
     };
     let put_ticks = crate::sbi::time().saturating_sub(put_started).max(1);
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let put_io = crate::virtio_blk::telemetry().saturating_sub(io_started);
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(feature = "pio-block")]
     let put_io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let put_io = (
         put_io.requests,
         put_io.read_requests,
@@ -3209,11 +3209,11 @@ async fn storage_object_bench(
             .is_err();
         status = if revoked && denied { "ok" } else { "failed-closed" };
     }
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io = crate::virtio_blk::telemetry().saturating_sub(io_started);
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(feature = "pio-block")]
     let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io = (
         io.requests,
         io.read_requests,
@@ -3442,11 +3442,11 @@ async fn storage_file_tree_bench(
     }
     .await;
     let elapsed = crate::sbi::time().saturating_sub(started).max(1);
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io = crate::virtio_blk::telemetry();
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(feature = "pio-block")]
     let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-block")]
     let io = (io.requests, io.read_requests, io.write_requests, io.flush_requests,
         io.read_bytes, io.write_bytes, io.used_interrupts);
     let status = if result.is_ok() { "ok" } else { "failed-closed" };

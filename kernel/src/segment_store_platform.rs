@@ -49,11 +49,11 @@ const LOGICAL_BLOCK_SIZE: usize = 512;
 const BLOCKS_PER_PAGE: u64 = (PAGE_SIZE / LOGICAL_BLOCK_SIZE) as u64;
 
 /// Largest page run one block-device request may carry, derived from the
-/// selected board backend's maximum transfer size.
-#[cfg(feature = "qemu-virt")]
+/// selected HAL backend's maximum transfer size.
+#[cfg(feature = "queued-block")]
 const MAX_PAGES_PER_REQUEST: usize =
     crate::virtio::BLOCK_MAX_TRANSFER_SIZE as usize / vibeos_segment_format::PAGE_SIZE;
-#[cfg(feature = "milkv-duo")]
+#[cfg(feature = "pio-block")]
 const MAX_PAGES_PER_REQUEST: usize = crate::sdhci_blk::MAX_TRANSFER_BLOCKS as usize
     * LOGICAL_BLOCK_SIZE
     / vibeos_segment_format::PAGE_SIZE;
@@ -2078,7 +2078,7 @@ impl StorageV2Runtime {
             let mut last_free = info.free_segments;
             let mut stalled = 0_u32;
             for _ in 0..8 {
-                #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+                #[cfg(all(feature = "storage-bench", feature = "queued-block"))]
                 let io_before = crate::virtio_blk::telemetry();
                 let _telemetry = match poll_as_system(operation.store().collect_garbage()).await {
                     Ok(telemetry) => telemetry,
@@ -2098,7 +2098,7 @@ impl StorageV2Runtime {
                     current.free_segments,
                     floor
                 );
-                #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+                #[cfg(all(feature = "storage-bench", feature = "queued-block"))]
                 {
                     let io = crate::virtio_blk::telemetry().saturating_sub(io_before);
                     crate::println!(

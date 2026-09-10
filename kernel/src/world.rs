@@ -2827,11 +2827,7 @@ pub fn build() {
         };
         network_stack_roots.push(NetworkStackRoot {
             location,
-            driver: if cfg!(feature = "milkv-duo") {
-                "dwmac"
-            } else {
-                "virtio-mmio"
-            },
+            driver: vibeos_hal::boot::platform().network_driver_name,
             policy: policy.clone(),
             outbound,
             inbound,

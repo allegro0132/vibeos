@@ -340,3 +340,21 @@ the regression. The Duo release image retains the USB slab in `.dma`; QEMU
 selftest passes 390 checks. These are composition checks, not physical Duo USB
 or Mars validation. Mars firmware, GMAC5, boot firmware, the flashable SD image
 and the planned physical acceptance remain outstanding.
+
+### VirtIO transport and contract separation stage
+
+QEMU firmware now supplies device discovery and transport lifecycle operations.
+Kernel tokens preserve slot/base/IRQ/vendor diagnostics but cannot read or write
+registers. Firmware reprobes only trusted windows, rejects mismatched descriptor
+identity, and reports failed reset on an invalid descriptor. DMA release and
+quarantine remain kernel policy. The MMIO-free VirtIO protocol implementation
+and its 44 existing regressions moved to `contracts/virtio`, with the old driver
+crate retained as a compatible re-export.
+
+The dependency gate checks all declared workspace production edges, including
+optional features and build dependencies. Kernel/HAL/contracts cannot depend on
+concrete drivers or BSPs; drivers cannot depend on kernel or BSPs. QEMU and Duo
+now pass this gate. This establishes the crate dependency boundary, while
+board-feature/service decoupling and the remaining CV1800B SoC resource split
+remain work in the architecture phase. Mars hardware and SD-image acceptance
+are still outstanding.

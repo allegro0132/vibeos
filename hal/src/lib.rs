@@ -335,3 +335,5 @@ pub mod pci;
 pub mod usb;
 
 pub mod usb_polling;
+
+pub mod device_transport;

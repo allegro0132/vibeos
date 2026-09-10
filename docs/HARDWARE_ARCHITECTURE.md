@@ -180,3 +180,20 @@ permanent `.dma` storage. Failed initialization leaves no published kernel token
 successful initialization is idempotent. The Duo kernel production dependency
 graph now contains no BSP or concrete driver crate. CV1800B USB clock/PHY access
 still lives in the DWC2 implementation and needs the later SoC-resource split.
+
+Fixed VirtIO discovery, status reads, reset confirmation and task-context IRQ
+acknowledgement now cross a firmware transport table. Kernel transport tokens
+contain only copied resource identity. Firmware resolves them against its own
+MMIO description and checks the complete descriptor before use; a supplied base
+is never dereferenced. Missing/mismatched resources report reset-required or
+failed reset, preserving quarantine. IRQ top halves retain the existing stateless
+firmware acknowledgement callbacks and never borrow an engine.
+
+Pure VirtIO wire types and state machines now live in `contracts/virtio`.
+`drivers/virtio-core` is a source-compatible re-export for existing driver users.
+The contract performs no MMIO and owns no DMA. Its existing 44 protocol tests
+moved with it. Neither QEMU nor Duo kernel production graphs contain concrete
+drivers or BSPs. `python3 scripts/check-driver-boundaries.py` enforces declared
+workspace normal/build/optional edges, excludes test-only fixtures, and checks
+that drivers also cannot reach the kernel or a BSP. This dependency gate does
+not prove the remaining board-feature or SoC-register-policy separation.

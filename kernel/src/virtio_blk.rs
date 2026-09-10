@@ -300,7 +300,7 @@ pub struct BlockResources {
 pub fn discover() -> Option<BlockResources> {
     // Safety: the selected BSP maps this trusted VirtIO MMIO aperture into
     // the kernel's identity address space before device discovery begins.
-    let transport = unsafe { MmioTransport::scan_block(crate::platform::virtio_mmio()) }?;
+    let transport = unsafe { MmioTransport::scan_block() }?;
     Some(BlockResources {
         mmio: MmioWindow::new(transport),
         dma: Arc::new(DmaRegion),

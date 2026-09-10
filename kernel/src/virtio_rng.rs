@@ -303,7 +303,7 @@ pub struct RandomResources {
 pub fn discover() -> Option<RandomResources> {
     // Safety: the selected BSP maps this trusted VirtIO MMIO aperture into
     // the kernel's identity address space before device discovery begins.
-    let transport = unsafe { MmioTransport::scan_entropy(crate::platform::virtio_mmio()) }?;
+    let transport = unsafe { MmioTransport::scan_entropy() }?;
     {
         // The transport is a boot-discovered, immutable part of the DMA claim.
         // Publish it before any component can claim the slab so raw-fault

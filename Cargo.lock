@@ -1693,6 +1693,9 @@ dependencies = [
 [[package]]
 name = "vibeos-driver-virtio-core"
 version = "0.1.0"
+dependencies = [
+ "vibeos-virtio-protocol",
+]
 
 [[package]]
 name = "vibeos-driver-virtio-mmio"
@@ -1823,8 +1826,6 @@ dependencies = [
  "vibeos-component-loader",
  "vibeos-component-runtime",
  "vibeos-core",
- "vibeos-driver-virtio-core",
- "vibeos-driver-virtio-mmio",
  "vibeos-durable-format",
  "vibeos-file-store",
  "vibeos-hal",
@@ -1844,6 +1845,7 @@ dependencies = [
  "vibeos-ssh-identity",
  "vibeos-sshd",
  "vibeos-storage-device",
+ "vibeos-virtio-protocol",
  "vibeos-vsh",
  "vibeos-wasi-command",
  "vibeos-wasi-runtime",
@@ -2002,6 +2004,10 @@ dependencies = [
 
 [[package]]
 name = "vibeos-storage-device"
+version = "0.1.0"
+
+[[package]]
+name = "vibeos-virtio-protocol"
 version = "0.1.0"
 
 [[package]]

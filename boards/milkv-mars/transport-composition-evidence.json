@@ -1,0 +1,77 @@
+{
+  "status": "VirtIO firmware transport and protocol contract separation verified; Mars incomplete",
+  "host_rust_tests": 64,
+  "dependency_gate_tests": 3,
+  "qemu_selftests": 390,
+  "target_checks": [
+    "raw backing-sector write",
+    "block timeout, cancel, revoke and post-publication fault recovery",
+    "network fault and fresh-generation handshake",
+    "two-boot VirtIO RNG freshness and stable test identity",
+    "Duo release build"
+  ],
+  "kernel_dependencies": "No BSP or concrete driver dependencies in QEMU/Duo normal graphs; static workspace gate also checks optional and build dependencies",
+  "mutation": "Removing complete descriptor identity validation fails forged-resource test in isolated crate copy",
+  "last_qemu_artifact": {
+    "profile": "ssh-security-test",
+    "path": "target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt",
+    "sha256": "6bce8d3acbec815f2724ef84b2e472e89fdc91f1afb18f650b521e142f3ec3ba"
+  },
+  "logs": [
+    {
+      "path": "target/mars-reference/stage13-host.log",
+      "sha256": "a920193186df22866ae1721103c9cbd268336cee194ef3c8f641cd9511fafc36"
+    },
+    {
+      "path": "target/mars-reference/stage13-boundary-tests.log",
+      "sha256": "33060fd73862c5e1af97335504d5b45211fce6d229657f556d8deceeadc52ce4"
+    },
+    {
+      "path": "target/mars-reference/stage13-boundary-audit.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage13-mutation.log",
+      "sha256": "bff427cf99bee2abe9612f98134884dc5920e362b9a4e39e6a1024145b93f254"
+    },
+    {
+      "path": "target/mars-reference/stage13-qemu-selftest.log",
+      "sha256": "49c6429ffd985ef90d7cbb45def448d03f8d1f22b5177035a4e76491fdef7a62"
+    },
+    {
+      "path": "target/mars-reference/stage13-qemu-block.log",
+      "sha256": "0b1b9fe5c72f3e884d2413f673f2f3595baa5f8d20a719270c7a6d4f240b6fed"
+    },
+    {
+      "path": "target/mars-reference/stage13-qemu-block-recovery.log",
+      "sha256": "f83a7ec30592119de3a8f2ea16724eb2aa6ea2cfc8d39dd77e8fdbce4068fa22"
+    },
+    {
+      "path": "target/mars-reference/stage13-qemu-net-recovery.log",
+      "sha256": "3f3727ddc08706c8f1df7ae0499d6026bf6e8855c544ea0661d150661a5c411e"
+    },
+    {
+      "path": "target/mars-reference/stage13-qemu-entropy.log",
+      "sha256": "7c8a9bacb9fccee4aea43b5bf9437fe2e0c822d6627c9d49228e2ac3828771b2"
+    },
+    {
+      "path": "target/mars-reference/stage13-duo-build.log",
+      "sha256": "aaa9c76eb0178ae3075a2419fa2468e1f1d2ae7bc189fc4672ac8ee7d0ff400c"
+    },
+    {
+      "path": "target/mars-reference/stage13-qemu-dependencies.log",
+      "sha256": "66ae1046419bd52b86f690a2fc7f1a344122da72fdb2bc1f41c9d94998a14b1e"
+    },
+    {
+      "path": "target/mars-reference/stage13-duo-dependencies.log",
+      "sha256": "95a6effd808d03a22bd34a12439eac7443d9dd0276dcf620aef397e4949dac3d"
+    }
+  ],
+  "hardware_acceptance": "not run",
+  "remaining": [
+    "Board-feature/service decoupling and remaining CV1800B SoC resource split",
+    "JH7110 platform, Mars firmware and SD/EQoS integration",
+    "Boot firmware and flashable SD image",
+    "Mars serial/SSH, qualified entropy and physical stability acceptance"
+  ]
+}

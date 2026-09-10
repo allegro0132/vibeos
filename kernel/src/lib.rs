@@ -1003,7 +1003,7 @@ pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
 pub use vibeos_core::{cap, chan, exec, heap, instance, interrupt, ipi, sync};
 #[cfg(feature = "qemu-virt")]
-pub use vibeos_driver_virtio_core as virtio;
+pub use vibeos_virtio_protocol as virtio;
 pub use vibeos_durable_format as durable;
 pub use vibeos_program_store as program;
 pub use vibeos_random as random;
@@ -1132,7 +1132,7 @@ mod queued_block;
 #[cfg(feature = "qemu-virt")]
 mod virtio_blk;
 #[cfg(feature = "qemu-virt")]
-use vibeos_driver_virtio_mmio as virtio_mmio;
+mod virtio_mmio;
 #[cfg(feature = "qemu-virt")]
 mod queued_network;
 #[cfg(feature = "qemu-virt")]

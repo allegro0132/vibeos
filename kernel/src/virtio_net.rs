@@ -384,7 +384,7 @@ pub struct NetResources {
 pub fn discover() -> Option<NetResources> {
     // Safety: the selected BSP maps this trusted VirtIO MMIO aperture into
     // the kernel's identity address space before device discovery begins.
-    let transport = unsafe { MmioTransport::scan_network(crate::platform::virtio_mmio()) }?;
+    let transport = unsafe { MmioTransport::scan_network() }?;
     Some(NetResources {
         location: crate::net_device::NetworkLocation::Mmio {
             base: transport.base(),

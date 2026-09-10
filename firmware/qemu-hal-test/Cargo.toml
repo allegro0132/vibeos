@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+mars-resources-test = ["dep:vibeos-bsp-milkv-mars"]
 boot-admission-test = []
 jh7110-sd-model-test = ["dep:vibeos-platform-jh7110"]
 
@@ -25,3 +26,5 @@ vibeos-driver-virtio-blk = { path = "../../drivers/virtio-blk" }
 vibeos-driver-virtio-core = { path = "../../drivers/virtio-core" }
 vibeos-driver-virtio-net = { path = "../../drivers/virtio-net" }
 vibeos-platform-jh7110 = { path = "../../platform/jh7110", optional = true }
+
+vibeos-bsp-milkv-mars = { path = "../../boards/milkv-mars", optional = true }

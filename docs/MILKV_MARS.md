@@ -631,3 +631,59 @@ This stage does not remove reserved RAM from every identity mapping, qualify
 Mars DMA/cache behavior or establish the device/firmware reservations for a Mars
 image. Those must be supplied by the production Mars composition. SBI probing,
 DW-MSHC registration, EQoS, paired boot firmware and an SD image remain pending.
+
+### Console/SD DTB resources and Mars BSP composition
+
+`boards/milkv-mars::resources::admit` now validates the pinned SDK console/SD
+resources before returning their actual DTB apertures: UART0, PLIC, SDIO1,
+SYS CRG, SYS SYSCON and SYS pin controller. The SYSCON aperture is 4 KiB in
+this DTB, despite the broader static mapping envelope. The runtime platform
+binding should use the returned aperture. UART register shift/width, SD FIFO
+and bus width, IRQ numbers, enabled state, parent controller and PLIC source
+count must match the supported board configuration. Only the first clock
+controller register window is consumed; its additional STG/AON windows are not
+implicitly admitted for access by this API.
+
+The parser requires an enabled root `/soc` simple bus with two address and size
+cells and empty identity `ranges`. It does not guess unsupported translations.
+It resolves CPU interrupt-controller phandles, verifies the nine PLIC context
+slots (S7 M, followed by four U74 M/S pairs), and detects ambiguous related
+phandles anywhere in the DTB, including matching legacy aliases. Global phandle
+inspection is bounded to 32 node levels. Machine contexts may retain IRQ 11 or
+be masked as `0xffffffff`, as in the official
+[OpenSBI v1.6 fixup](https://github.com/riscv-software-src/opensbi/blob/v1.6/lib/utils/fdt/fdt_fixup.c).
+Supervisor slots must remain IRQ 9 for the matching physical hart. This reference
+does not select the eventual paired OpenSBI version.
+
+The Mars BSP now implements the static firmware composition contract with
+standard PTE attributes, 2 MiB RAM leaves and six sparse device page-table
+windows. It reserves 2051 RAM page-table pages for `0x40200000..0x140000000`.
+No SDHCI or legacy DWMAC description is supplied. This description establishes
+mapping requirements, not readiness of a controller, DMA pool or PHY.
+
+`resource-reference.json` records all 16 fetched DTS/include source hashes,
+SDK commit, preprocessing tools and the complete compiled 52,701-byte official
+Mars DTB hash. It passes memory, resource and four-hart admission with boot
+hart 4. Vendor DTS warnings are retained in the evidence log. The focused
+checked-in fixture is a separate model, not the official or production boot DTB.
+
+```sh
+cargo run --offline --locked -p vibeos-bsp-milkv-mars --example inspect_dtb -- \
+  path/to/mars.dtb 0x48000000 4
+(cd firmware/qemu-hal-test && cargo build --offline --locked --release \
+  --features boot-admission-test,mars-resources-test)
+python3 scripts/qemu-boot-dtb-test.py \
+  --kernel target/riscv64imac-unknown-none-elf/release/vibeos-qemu-hal-test \
+  --output target/mars-reference/resource-run --require-admission
+```
+
+The physical DTB address and boot hart in the inspection command are explicit
+inputs; they are not a bootloader configuration. The optional RV64 image runs
+the focused Mars parser fixture and prints `MARS_RESOURCES_MODEL PASS`, then
+runs the QEMU boot/heap admission and 395 selftests. Host mutations removing
+UART-width checks, supervisor IRQ validation, duplicate-handle rejection or
+identity-bus restrictions fail their regressions. Neither this model nor host
+inspection exercises Mars MMIO, SBI HSM, clock preparation or physical boot.
+The production Mars entry, SD instance/data partition binding, GMAC/PHY/DMA
+resource validation and engine, paired boot firmware, SD image and physical
+acceptance remain outstanding.

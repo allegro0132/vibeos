@@ -1768,6 +1768,7 @@ dependencies = [
 name = "vibeos-firmware-qemu-hal-test"
 version = "0.1.0"
 dependencies = [
+ "vibeos-bsp-milkv-mars",
  "vibeos-bsp-qemu-virt",
  "vibeos-driver-plic",
  "vibeos-driver-uart16550",

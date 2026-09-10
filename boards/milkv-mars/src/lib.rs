@@ -3,6 +3,7 @@
 //! This crate is a hardware description, not a claim of firmware support.
 //! Runtime memory must be admitted from the boot DTB before use.
 pub mod harts;
+pub mod resources;
 
 use vibeos_hal::{
     fdt::{Error as FdtError, Fdt},
@@ -169,4 +170,57 @@ fn validate_board(tree: &Fdt<'_>) -> Result<(), FdtError> {
         return Err(FdtError::InvalidHeader);
     }
     Ok(())
+}
+
+/// Static mapping envelope for the console/SD composition. Device resources
+/// must pass `resources::admit` before any service is registered. Standard PTE
+/// attributes rely on JH7110 PMAs; T-Head attributes/instructions are forbidden.
+pub struct Board;
+pub const MEMORY_MAP: &[vibeos_hal::MemoryRegion] = &[
+    vibeos_hal::MemoryRegion::reserved("boot firmware", RAM.start, KERNEL_LOAD_ADDRESS),
+    vibeos_hal::MemoryRegion::ram("kernel RAM", KERNEL_LOAD_ADDRESS, RAM.end),
+    vibeos_hal::MemoryRegion::mmio("PLIC", PLIC.registers.start, PLIC.registers.end),
+    vibeos_hal::MemoryRegion::mmio("UART0", UART_REGISTERS.start, UART_REGISTERS.end),
+    vibeos_hal::MemoryRegion::mmio("SYS CRG/SYSCON/pins", SYS_CRG.start, SYS_PINCTRL.end),
+    vibeos_hal::MemoryRegion::mmio("SDIO1/GMAC0", SD_REGISTERS.start, GMAC0_REGISTERS.end),
+    vibeos_hal::MemoryRegion::mmio("L2 control", L2_CACHE.start, L2_CACHE.end),
+];
+pub const MMIO_MAPPINGS: &[vibeos_hal::IdentityMapping] = &[
+    vibeos_hal::IdentityMapping::pages("UART0", UART_REGISTERS.start, UART_REGISTERS.end),
+    vibeos_hal::IdentityMapping::pages("SYS CRG/SYSCON/pins", SYS_CRG.start, SYS_PINCTRL.end),
+    vibeos_hal::IdentityMapping::pages("SDIO1/GMAC0", SD_REGISTERS.start, GMAC0_REGISTERS.end),
+    vibeos_hal::IdentityMapping::pages("L2 control", L2_CACHE.start, L2_CACHE.end),
+];
+impl vibeos_hal::Board for Board {
+    const INFO: vibeos_hal::BoardInfo = vibeos_hal::BoardInfo {
+        name: NAME,
+        timebase_hz: TIMEBASE_HZ,
+        uart: UART,
+        plic: PLIC,
+        console: vibeos_hal::ConsoleCapabilities {
+            early_uart: true,
+            usb_keyboard_input: false,
+        },
+        virtio_mmio: None,
+        pci: None,
+        dwmac: None,
+        sdhci: None,
+        dwc2: None,
+        status_led: None,
+    };
+    const MEMORY_MAP: &'static [vibeos_hal::MemoryRegion] = MEMORY_MAP;
+    const MMU: vibeos_hal::MmuDescription = vibeos_hal::MmuDescription {
+        ram: AddressRange::new(KERNEL_LOAD_ADDRESS, RAM.end),
+        ram_granularity: vibeos_hal::MappingGranularity::Megapage2M,
+        ram_attributes: vibeos_hal::MemoryAttributes::Standard,
+        mmio_attributes: vibeos_hal::MemoryAttributes::Standard,
+        identity_mappings: MMIO_MAPPINGS,
+        device_level1_tables: 1,
+        // UART, SYS, SD/GMAC, L2 and the two sparse PLIC windows.
+        device_level0_tables: 6,
+    };
+    const HART_IDS: &'static [usize] = HART_IDS;
+    fn plic_s_context(physical_hart: usize) -> Option<usize> {
+        plic_s_context(physical_hart)
+    }
 }

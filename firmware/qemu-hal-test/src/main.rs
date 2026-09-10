@@ -21,6 +21,15 @@ mod boot_admission;
 #[cfg(feature = "jh7110-sd-model-test")]
 mod jh7110_sd_model;
 unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
+    #[cfg(feature = "mars-resources-test")]
+    {
+        let fixture = include_bytes!("../../../boards/milkv-mars/tests/fixtures/resources.dtb");
+        let resources = vibeos_bsp_milkv_mars::resources::admit(fixture).expect("Mars fixture admission");
+        assert_eq!(resources.syscon.len(), 4096);
+        let harts = vibeos_bsp_milkv_mars::harts::admit(fixture, 4, false).unwrap();
+        assert_eq!(harts.ids(), &[4, 1, 2, 3]);
+        _print(format_args!("MARS_RESOURCES_MODEL PASS contexts=2,4,6,8 syscon_bytes=4096\n"));
+    }
     #[cfg(feature = "boot-admission-test")]
     _print(format_args!(
         "BOOT_ADMISSION PASS boot={} count={} timebase={}\n",

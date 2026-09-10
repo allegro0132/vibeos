@@ -43,7 +43,7 @@ wasi-ssh = ["ssh-commands", "wasi-preview1", "ssh-test", "vibeos-sshd/wasi-exec"
 milkv-command = ["milkv-ssh", "ssh-commands"]
 ssh-commands = []
 default = ["qemu-virt", "qemu-default-image"]
-qemu-virt = ["dep:vibeos-driver-virtio-core", "dep:vibeos-driver-virtio-mmio", "dep:vibeos-driver-xhci", "vibeos-vsh/pci-usb-help"]
+qemu-virt = ["dep:vibeos-driver-virtio-core", "dep:vibeos-driver-virtio-mmio", "vibeos-vsh/pci-usb-help"]
 milkv-duo = ["dep:vibeos-driver-dwc2-host"]
 qemu-default-image = ["vibeos-image-policy/qemu-default"]
 milkv-duo-sd-image = ["vibeos-image-policy/milkv-duo-sd"]
@@ -544,7 +544,6 @@ vibeos-durable-format = { path = "../durable-format" }
 vibeos-driver-dwc2-host = { path = "../drivers/dwc2-host", optional = true }
 vibeos-driver-virtio-core = { path = "../drivers/virtio-core", optional = true }
 vibeos-driver-virtio-mmio = { path = "../drivers/virtio-mmio", optional = true }
-vibeos-driver-xhci = { path = "../drivers/xhci", optional = true }
 vibeos-hal = { path = "../hal" }
 vibeos-image-policy = { path = "../policy/image", default-features = false }
 vibeos-rustc = { path = "../compiler" }

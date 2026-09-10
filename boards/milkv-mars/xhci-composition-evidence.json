@@ -1,0 +1,61 @@
+{
+  "status": "XHCI firmware composition verified; Mars incomplete",
+  "host_tests": 23,
+  "qemu_selftests": 390,
+  "target_checks": [
+    "PCI/XHCI/HID hotplug and BOT/SCSI I/O",
+    "Duo release build"
+  ],
+  "dma_layout": {
+    "elf": "target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt",
+    "sha256": "f57e93afeb3021b8f4b90bbe2db33beee5961f5b75e06b65e2e0cecebcee6f75",
+    "dma_section": [
+      "0x80485000",
+      "0x804c9000"
+    ],
+    "xhci_dma": {
+      "symbol": "vibeos_qemu_virt::usb::DMA",
+      "address": "0x80485000",
+      "bytes": 106496,
+      "page_aligned": true
+    }
+  },
+  "mutation": "Removing IRQ mask on installation failure fails actual adapter rollback test in isolated source copy",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage11-host.log",
+      "sha256": "4d8255490dc7acc4f5d6f3b5f5c0f642bbc66d2387a45e0ca7d6b7ed796d0830"
+    },
+    {
+      "path": "target/mars-reference/stage11-irq-mutation.log",
+      "sha256": "f8dce21200507aff5b25d2f95cf2d8364161ea271695376fe8ed871b9a65a7e0"
+    },
+    {
+      "path": "target/mars-reference/stage11-qemu-usb.log",
+      "sha256": "9f8a58cb84fe637677c64f6d2e57377eb06347dc3e625e4ad21f848adf746a20"
+    },
+    {
+      "path": "target/mars-reference/stage11-qemu-selftest.log",
+      "sha256": "ad072549a15b10656f76c42ac89bde6c63a90185b1e67880ad8e7184f744ea6b"
+    },
+    {
+      "path": "target/mars-reference/stage11-duo-build.log",
+      "sha256": "fda5ce020385dcdcfb8c48a6ab67fa93ea91bc88e332aac292f3d3badf778cb8"
+    },
+    {
+      "path": "target/mars-reference/stage11-dma-layout.json",
+      "sha256": "517c6d1ecbf7c6a1e1b00edcd4c8a6ff82692f0368616813a8f8495b1b4e8c74"
+    },
+    {
+      "path": "target/mars-reference/stage11-kernel-dependencies.log",
+      "sha256": "1bc00ab44124ef8d8f13d17ac6946b4fa52c30587070cd17169d111bbc4d54a6"
+    }
+  ],
+  "hardware_acceptance": "not run",
+  "remaining": [
+    "Duo USB and shared VirtIO transport/protocol migration",
+    "JH7110 platform, Mars firmware and DW-MSHC/GMAC5 integration",
+    "Boot firmware and flashable SD image",
+    "Physical serial/SSH, entropy qualification and stress acceptance"
+  ]
+}

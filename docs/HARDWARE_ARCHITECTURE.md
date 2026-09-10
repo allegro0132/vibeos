@@ -165,3 +165,9 @@ snapshots describe resources without embedding ECAM access. Kernel callers
 serialize host operations and request bus-master activation through the host,
 which validates membership in its current inventory before writing configuration
 space. USB controller ownership is a subsequent boundary migration.
+
+XHCI controller and DMA storage are now firmware-owned. Kernel USB policy keeps
+resource admission, locking, IRQ registration and TTY injection. A failed IRQ
+route is masked and remains unpublished; firmware retains its controller for a
+same-resource retry, preventing a second live mutable DMA borrow. The IRQ token
+contains only live MMIO context and bypasses controller-state borrowing.

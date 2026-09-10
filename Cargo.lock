@@ -1722,6 +1722,9 @@ dependencies = [
 [[package]]
 name = "vibeos-driver-xhci"
 version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
+]
 
 [[package]]
 name = "vibeos-durable-format"
@@ -1769,6 +1772,7 @@ dependencies = [
  "vibeos-driver-virtio-mmio",
  "vibeos-driver-virtio-net",
  "vibeos-driver-virtio-rng",
+ "vibeos-driver-xhci",
  "vibeos-hal",
  "vibeos-kernel",
 ]
@@ -1821,7 +1825,6 @@ dependencies = [
  "vibeos-driver-dwc2-host",
  "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
- "vibeos-driver-xhci",
  "vibeos-durable-format",
  "vibeos-file-store",
  "vibeos-hal",

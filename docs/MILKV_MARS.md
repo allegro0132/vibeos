@@ -303,3 +303,21 @@ Removing the inventory check fails the regression. QEMU USB acceptance exercises
 PCI BAR/INTx, XHCI, HID input/hotplug and BOT/SCSI backing I/O. The kernel no longer
 depends on the PCI driver. USB controllers and shared VirtIO helpers remain to
 be migrated; no Mars PCIe support is implied or included in this port's scope.
+
+### XHCI firmware composition stage
+
+QEMU firmware now owns the XHCI controller and its permanent page-aligned `.dma`
+storage. HAL carries USB inventory, bounded HID input and host operations. The
+kernel retains PCI resource admission, controller serialization, PLIC routing,
+wait-queue ordering and terminal injection; it has no XHCI driver dependency.
+The firmware IRQ callback reconstructs only the validated MMIO token and never
+borrows mutable controller state.
+
+On IRQ-install failure the kernel masks controller interrupts and leaves its
+published flag false. Firmware retains the already initialized instance, so a
+retry with the same resources does not manufacture another mutable DMA borrow.
+Different resources are rejected. Host tests execute the actual kernel adapter
+with failed registration and failed enable, then successful retry, sector I/O,
+HID injection and wakeup. Removing IRQ masking fails the regression. QEMU USB
+acceptance covers the real XHCI/HID/hotplug/BOT path; ELF inspection verifies the
+moved DMA slab's section and page alignment. This does not add Mars USB support.

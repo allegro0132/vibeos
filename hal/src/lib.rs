@@ -331,3 +331,5 @@ pub mod network;
 pub mod queued_network;
 
 pub mod pci;
+
+pub mod usb;

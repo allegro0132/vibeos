@@ -1235,3 +1235,84 @@ fn concurrent_frees_in_one_arena_leave_nothing_linked() {
     h.close_empty_domain(domain).unwrap();
     h.unregister_owner(owner).unwrap();
 }
+
+#[test]
+fn exhausted_bump_reuses_a_larger_free_block_without_changing_live_accounts() {
+    let _serial = serial();
+    let h = heap_of(4096);
+    let large = layout(2000, 16); // 4096-byte charged block
+    let small = layout(500, 16); // 1024-byte charged block
+    let p = unsafe { h.alloc(large) };
+    assert!(!p.is_null());
+    unsafe { h.dealloc(p, large) };
+    assert_eq!(h.stats().0, 0);
+    let mut pieces = Vec::new();
+    for _ in 0..4 {
+        let q = unsafe { h.alloc(small) };
+        assert!(!q.is_null(), "free larger blocks must remain usable after the bump reaches the end");
+        assert_eq!(q as usize % 16, 0);
+        assert!(!pieces.contains(&q));
+        pieces.push(q);
+    }
+    assert_eq!(h.stats().0, 4096);
+    assert!(unsafe { h.alloc(small) }.is_null());
+    for q in pieces { unsafe { h.dealloc(q, small) }; }
+    assert_eq!(h.stats().0, 0);
+}
+
+#[test]
+fn same_class_realloc_grows_in_place_even_when_heap_is_full() {
+    let _serial = serial();
+    let h = heap_of(1024);
+    let old = layout(600, 8);
+    let new = layout(800, 8);
+    let p = unsafe { h.alloc(old) };
+    assert!(!p.is_null());
+    unsafe { p.write_bytes(0x5a, 600); }
+    let before = h.snapshot();
+    let q = unsafe { h.realloc(p, old, 800) };
+    assert_eq!(q, p);
+    assert!(unsafe { std::slice::from_raw_parts(q, 600) }.iter().all(|&b| b == 0x5a));
+    assert_eq!(h.snapshot().live_bytes, before.live_bytes);
+    assert_eq!(h.snapshot().peak_live_bytes, before.peak_live_bytes);
+    unsafe { h.dealloc(q, new); }
+    assert_eq!(h.stats().0, 0);
+}
+
+#[test]
+fn free_blocks_are_reused_before_consuming_contiguous_bump_space() {
+    let _serial = serial();
+    let h = heap_of(12 * 1024);
+    let scratch = layout(2000, 16); // 4096 charged
+    let small = layout(500, 16); // 1024 charged
+    let large = layout(5000, 16); // 8192 charged
+    let p = unsafe { h.alloc(scratch) };
+    assert!(!p.is_null());
+    unsafe { h.dealloc(p, scratch); }
+    let q = unsafe { h.alloc(small) };
+    assert!(!q.is_null());
+    let r = unsafe { h.alloc(large) };
+    assert!(!r.is_null(), "a small allocation must reuse free space before fragmenting the large bump region");
+    unsafe { h.dealloc(q, small); h.dealloc(r, large); }
+    assert_eq!(h.stats().0, 0);
+}
+
+#[test]
+fn realloc_in_another_owner_still_transfers_accounting() {
+    let _serial = serial();
+    let h = heap_of(4096);
+    let owner = h.create_owner(2048).unwrap();
+    let l = layout(600, 8);
+    let p = unsafe { h.alloc(l) };
+    assert!(!p.is_null());
+    unsafe { p.write_bytes(0x33, l.size()); }
+    let mut scope = unsafe { enter_owner(owner) };
+    let q = unsafe { h.realloc(p, l, 800) };
+    assert!(!q.is_null());
+    assert_ne!(p, q);
+    assert!(unsafe { std::slice::from_raw_parts(q, 600) }.iter().all(|&b| b == 0x33));
+    unsafe { h.dealloc(q, layout(800, 8)); }
+    scope.restore();
+    assert_eq!(h.stats().0, 0);
+    h.unregister_owner(owner).unwrap();
+}

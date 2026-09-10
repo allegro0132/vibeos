@@ -31,13 +31,25 @@ impl Snapshot {
         self.pinmux & self.pinmux_mask == self.pinmux_function && self.direction & self.mask != 0
     }
 
+    /// Whether mux, output direction, and output latch request an illuminated LED.
+    /// This verifies register programming, not the electrical level or light.
+    pub const fn output_asserted(self) -> bool {
+        self.configured() && (self.data & self.mask != 0) == self.active_high
+    }
+
+    /// Whether the input sample also agrees with the asserted output.
     pub const fn on(self) -> bool {
-        let asserted = if self.active_high {
-            self.data & self.mask != 0 && self.external & self.mask != 0
+        self.output_asserted() && (self.external & self.mask != 0) == self.active_high
+    }
+
+    pub const fn status(self) -> &'static str {
+        if self.on() {
+            "on"
+        } else if self.output_asserted() {
+            "output asserted (input unconfirmed)"
         } else {
-            self.data & self.mask == 0 && self.external & self.mask == 0
-        };
-        self.configured() && asserted
+            "FAILED"
+        }
     }
 }
 
@@ -212,5 +224,49 @@ mod tests {
             ..high
         }
         .on());
+    }
+
+    #[test]
+    fn physical_duo_input_mismatch_does_not_mean_configuration_failed() {
+        let sample = Snapshot {
+            pinmux: 3,
+            direction: 0x0100_0000,
+            data: 0x0100_0000,
+            external: 0x0000_0600,
+            mask: 1 << 24,
+            pinmux_mask: 7,
+            pinmux_function: 3,
+            active_high: true,
+        };
+        assert!(sample.output_asserted());
+        assert!(!sample.on());
+        assert_eq!(sample.status(), "output asserted (input unconfirmed)");
+        for invalid in [
+            Snapshot {
+                pinmux: 0,
+                ..sample
+            },
+            Snapshot {
+                direction: 0,
+                ..sample
+            },
+            Snapshot { data: 0, ..sample },
+        ] {
+            assert_eq!(invalid.status(), "FAILED");
+        }
+        let low = Snapshot {
+            data: 0,
+            active_high: false,
+            ..sample
+        };
+        assert_eq!(low.status(), "on");
+        assert_eq!(
+            Snapshot {
+                external: 1 << 24,
+                ..low
+            }
+            .status(),
+            "output asserted (input unconfirmed)"
+        );
     }
 }

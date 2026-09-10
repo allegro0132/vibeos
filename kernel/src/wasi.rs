@@ -149,7 +149,10 @@ impl Future for Guest {
                         crate::println!("WASI running");
                     }
                     Err(error) => {
+                        let failure = HEAP.last_failure();
+                        let snapshot = HEAP.snapshot();
                         crate::println!("WASI admission rejected: {:?}", error);
+                        crate::println!("WASI admission heap={:?} allocation_failure={:?}", snapshot, failure);
                         *job.result.lock() =
                             Some(if error == vibeos_wasi_runtime::WasiError::Limit {
                                 WasiTerminal::LimitExceeded

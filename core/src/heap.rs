@@ -1630,6 +1630,29 @@ unsafe impl GlobalAlloc for Heap {
             return ptr::null_mut();
         };
 
+        // Reuse the smallest suitable free class before consuming the contiguous
+        // bump region. Waiting until bump exhaustion lets small allocations
+        // strand that region before a later large request arrives. At most
+        // NUM_CLASSES heads and splits are visited; no free-list scan occurs.
+        // The exact-class fast path is unchanged.
+        if h.free[plan.class].is_none() {
+            if let Some(mut class) = ((plan.class + 1)..NUM_CLASSES)
+                .find(|&class| h.free[class].is_some())
+            {
+                let node = h.free[class].take().unwrap();
+                let base = node.as_ptr() as usize;
+                h.free[class] = unsafe { node.as_ref().next };
+                while class > plan.class {
+                    class -= 1;
+                    let sibling = (base + class_size(class)) as *mut FreeNode;
+                    unsafe { sibling.write(FreeNode { next: h.free[class] }); }
+                    h.free[class] = Some(unsafe { NonNull::new_unchecked(sibling) });
+                }
+                unsafe { (base as *mut FreeNode).write(FreeNode { next: h.free[plan.class] }); }
+                h.free[plan.class] = Some(node);
+            }
+        }
+
         let (base, user) = if let Some(node) = h.free[plan.class] {
             let base = node.as_ptr().cast::<u8>() as usize;
             let Some(user) = user_address(base, plan, layout) else {
@@ -1706,6 +1729,37 @@ unsafe impl GlobalAlloc for Heap {
         }
         h.last_failures[hart] = None;
         user as *mut u8
+    }
+
+    unsafe fn realloc(&self, allocation: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let Ok(new_layout) = Layout::from_size_align(new_size, layout.align()) else {
+            return ptr::null_mut();
+        };
+        // A size-class block already owns its padding. Growing within that
+        // block must not allocate a second equally large buffer temporarily.
+        if let (Some(old), Some(new), Some(hart)) = (
+            allocation_plan(layout), allocation_plan(new_layout), allocation_context_hart_index(),
+        ) {
+            if old.class == new.class {
+                let domain = domain_on_hart(hart);
+                let mut h = self.0.lock();
+                let header = unsafe { &*allocation.sub(size_of::<AllocationHeader>()).cast::<AllocationHeader>() };
+                if header.magic == HEADER_MAGIC && header.class == old.class
+                    && header.owner == domain.owner && header.arena == domain.arena
+                {
+                    h.last_failures[hart] = None;
+                    return allocation;
+                }
+            }
+        }
+        let replacement = unsafe { self.alloc(new_layout) };
+        if !replacement.is_null() {
+            unsafe {
+                ptr::copy_nonoverlapping(allocation, replacement, layout.size().min(new_size));
+                self.dealloc(allocation, layout);
+            }
+        }
+        replacement
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {

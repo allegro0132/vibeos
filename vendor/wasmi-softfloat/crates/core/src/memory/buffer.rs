@@ -75,7 +75,7 @@ impl ByteBuffer {
     /// If the requested amount of heap bytes could not be allocated.
     pub fn new(size: usize) -> Result<Self, MemoryError> {
         let mut vec = Vec::new();
-        if vec.try_reserve(size).is_err() {
+        if vec.try_reserve_exact(size).is_err() {
             return Err(MemoryError::OutOfSystemMemory);
         };
         vec.extend(iter::repeat_n(0x00_u8, size));
@@ -137,7 +137,10 @@ impl ByteBuffer {
     ) -> Result<(), MemoryError> {
         debug_assert!(vec.len() <= new_size);
         let additional = new_size - vec.len();
-        if vec.try_reserve(additional).is_err() {
+        // Guest limits bound the requested linear memory, not a geometrically
+        // doubled Vec capacity. Reserve only the requested growth so bounded
+        // hosts do not need a second, oversized buffer during memory.grow.
+        if vec.try_reserve_exact(additional).is_err() {
             return Err(MemoryError::OutOfSystemMemory);
         };
         vec.resize(new_size, 0x00_u8);

@@ -1314,6 +1314,8 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
     #[cfg(feature = "milkv-duo")]
     uart::early_write(if blue_led.on() {
         "[VibeOS] blue status LED on\r\n"
+    } else if blue_led.output_asserted() {
+        "[VibeOS] blue status LED output asserted (input unconfirmed)\r\n"
     } else {
         "[VibeOS] blue status LED readback failed\r\n"
     });
@@ -1328,7 +1330,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
     #[cfg(feature = "milkv-duo")]
     println!(
         "  led       blue GPIOC24 {} (pinmux {:#x}, dir {:#010x}, data {:#010x}, input {:#010x})",
-        if blue_led.on() { "on" } else { "FAILED" },
+        blue_led.status(),
         blue_led.pinmux,
         blue_led.direction,
         blue_led.data,

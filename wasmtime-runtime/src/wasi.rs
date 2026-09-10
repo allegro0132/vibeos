@@ -7,12 +7,13 @@ use wasmtime::{Caller, Engine, Extern, ExternType, Linker, Memory, Module, Share
 #[allow(dead_code)]
 mod abi;
 use abi::*;
-mod profile {
-    pub const DECLARATIONS: vibeos_component_format::ProfileLimits =
-        vibeos_component_format::PROFILE_1_LIMITS;
-}
-// Share the exact declaration limits with the Wasmi command entry. This module
-// is compiled against each backend's pinned wasmparser version.
+// Share the exact command ceilings and declaration limits with the Wasmi
+// command entry. These modules are compiled against each backend's pinned
+// wasmparser version; this crate declares none of the profile features, so it
+// always receives the ordinary command profile.
+#[path = "../../wasi-runtime/src/profile.rs"]
+#[allow(dead_code)]
+mod profile;
 #[path = "../../wasi-runtime/src/validate.rs"]
 mod validate;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +87,9 @@ pub struct Invocation<C> {
     streams: Option<alloc::boxed::Box<dyn Streams>>,
     #[cfg(feature = "async")]
     written: usize,
+    /// Staging buffer for stdio on shared memory; see `streams::transfer`.
+    #[cfg(feature = "async")]
+    scratch: Vec<u8>,
 }
 impl<C: Clock> Invocation<C> {
     pub fn resource_limits(&mut self) -> &mut dyn wasmtime::ResourceLimiter { &mut self.resources }
@@ -123,6 +127,8 @@ impl<C: Clock> Invocation<C> {
             streams: None,
             #[cfg(feature = "async")]
             written: 0,
+            #[cfg(feature = "async")]
+            scratch: Vec::new(),
         })
     }
 }
@@ -279,7 +285,7 @@ pub fn compile(engine: &Engine, bytes: &[u8]) -> wasmtime::Result<Module> {
 /// an imported shared, bounded `env.memory`, `wasi::thread-spawn`, and the
 /// `wasi_thread_start` export. The exported `memory` may then be shared.
 pub fn compile_with(engine: &Engine, bytes: &[u8], threads: bool) -> wasmtime::Result<Module> {
-    validate::inspect(bytes, WasiLimits { module_bytes: 512 * 1024, memory_bytes: 16 * 1024 * 1024, threads })
+    validate::inspect(bytes, WasiLimits { module_bytes: profile::MODULE_BYTES, memory_bytes: profile::MEMORY_BYTES, threads })
         .map_err(wasmtime::Error::new)?;
     let module = Module::new(engine, bytes)?;
     match module.get_export("memory") {
@@ -409,7 +415,7 @@ pub fn linker<C: Clock>(
 struct Resources { exceeded: bool }
 impl wasmtime::ResourceLimiter for Resources {
     fn memory_growing(&mut self, _: usize, desired: usize, maximum: Option<usize>) -> wasmtime::Result<bool> {
-        if desired > (16 * 1024 * 1024).min(maximum.unwrap_or(usize::MAX)) {
+        if desired > profile::MEMORY_BYTES.min(maximum.unwrap_or(usize::MAX)) {
             self.exceeded = true; wasmtime::bail!("WASI memory limit");
         }
         Ok(true)

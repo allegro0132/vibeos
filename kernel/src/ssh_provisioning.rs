@@ -385,7 +385,7 @@ pub fn onboarding_profile() -> Option<vibeos_sshd::AuthorizedProfile> {
 
 /// WASI is admitted only for a provisioned production session of the live
 /// policy generation. The password onboarding profile has no command authority.
-#[cfg(any(feature = "milkv-wasmtime", feature = "milkv-python"))]
+#[cfg(feature = "milkv-command")]
 pub fn command_profile_current(profile: vibeos_sshd::AuthorizedProfile) -> bool {
     !ONBOARDING_ACTIVE.load(Ordering::Acquire)
         && !POLICY_CHANGED.load(Ordering::Acquire)

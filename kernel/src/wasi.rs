@@ -606,23 +606,23 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
     })
 }
 
-#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime", feature = "milkv-python"))]
+#[cfg(feature = "ssh-commands")]
 pub fn permitted(
     profile: vibeos_sshd::AuthorizedProfile,
     request: &vibeos_wasi_command::Request,
 ) -> bool {
-    #[cfg(any(feature = "milkv-wasmtime", feature = "milkv-python"))]
+    #[cfg(feature = "milkv-command")]
     let admitted = crate::ssh_provisioning::command_profile_current(profile);
-    #[cfg(not(any(feature = "milkv-wasmtime", feature = "milkv-python")))]
+    #[cfg(not(feature = "milkv-command"))]
     let admitted = profile.profile.get() == 1 && profile.generation == 1;
     admitted && match request {
-        vibeos_wasi_command::Request::Upload { .. } => cfg!(any(feature = "wasi-ssh-upload", feature = "milkv-wasmtime", feature = "milkv-python")),
+        vibeos_wasi_command::Request::Upload { .. } => cfg!(any(feature = "wasi-ssh-upload", feature = "milkv-command")),
         vibeos_wasi_command::Request::Run { .. } => true,
     }
 }
-#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime", feature = "milkv-python"))]
+#[cfg(feature = "ssh-commands")]
 struct RequestService(bool);
-#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime", feature = "milkv-python"))]
+#[cfg(feature = "ssh-commands")]
 impl Resource for RequestService {
     fn kind(&self) -> &'static str {
         if self.0 {
@@ -638,7 +638,7 @@ impl Resource for RequestService {
         self
     }
 }
-#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime", feature = "milkv-python"))]
+#[cfg(feature = "ssh-commands")]
 pub fn open(
     profile: vibeos_sshd::AuthorizedProfile,
     request: vibeos_wasi_command::Request,
@@ -725,7 +725,7 @@ pub fn open(
                         // the granted execution right; session denial and
                         // disconnect still revoke CommandIo at every boundary.
                         let _keep_loader_alive = &loader;
-                        #[cfg(any(feature = "milkv-wasmtime", feature = "milkv-python"))]
+                        #[cfg(feature = "milkv-command")]
                         if !crate::ssh_provisioning::command_profile_current(profile) {
                             return false;
                         }

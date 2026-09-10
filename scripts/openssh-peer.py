@@ -140,6 +140,53 @@ def write_host_key_evidence(host_key_output: Path) -> None:
     os.chmod(host_key_output, 0o600)
 
 
+# Transport failures before authentication that a QEMU-hosted request may
+# retry. A request the kernel has already begun must never be re-sent.
+SSH_PREAUTH_FAILURES = (b"kex_exchange_identification:", b"not responding")
+
+
+def wait_for_vsh(boot_log: Path, vm: subprocess.Popen, timeout: float = 300) -> None:
+    """Block until the VibeOS shell prompt appears in `boot_log`."""
+    deadline = time.monotonic() + timeout
+    while "vsh> " not in boot_log.read_text(errors="replace"):
+        if vm.poll() is not None or time.monotonic() >= deadline:
+            raise AssertionError("VibeOS boot failed")
+        time.sleep(0.5)
+
+
+def vsh_ssh_command(port: int, work: Path, connect_timeout: int = 30) -> list[str]:
+    """The exec-only client command the QEMU WASI gates use for `vibe`."""
+    return _base_ssh_command(
+        "ssh", "127.0.0.1", port, "vibe", work / "id_ed25519", work / "known_hosts", connect_timeout, None
+    )
+
+
+def run_ssh_retrying(
+    command: list[str],
+    argument: str,
+    data: bytes = b"",
+    timeout: float = 120,
+    attempts: int = 4,
+    began=None,
+) -> subprocess.CompletedProcess[bytes]:
+    """Run one exec request, retrying only pre-authentication transport failures.
+
+    `began`, when given, reports whether the kernel already started the
+    request; such a request is returned as-is rather than re-sent.
+    """
+    for _ in range(attempts):
+        result = subprocess.run([*command, argument], input=data, capture_output=True, timeout=timeout)
+        transport = (
+            result.returncode == 255
+            and not result.stdout
+            and any(marker in result.stderr for marker in SSH_PREAUTH_FAILURES)
+        )
+        if not transport or (began is not None and began()):
+            return result
+        time.sleep(1)
+    return result
+
+
 def _base_ssh_command(
     ssh: str,
     host: str,

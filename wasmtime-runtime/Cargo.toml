@@ -8,6 +8,11 @@ publish = false
 vibeos-component-format = { path = "../component-format" }
 wasmtime = { version = "=48.0.0", default-features = false, features = ["runtime", "custom-virtual-memory", "custom-sync-primitives"] }
 
+# `wasi-runtime/src/profile.rs` is included by path and names that crate's
+# profile features; this crate never enables them.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("python-wasi", "python-duo"))'] }
+
 [features]
 custom-code-registry = ["wasmtime/custom-code-registry"]
 fuel-batch = ["async", "wasmtime/custom-fuel-yield"]

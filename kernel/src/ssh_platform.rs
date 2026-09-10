@@ -1899,7 +1899,7 @@ impl SshdPlatform for SshPlatform {
         }
     }
 
-    #[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime", feature = "milkv-python"))]
+    #[cfg(feature = "ssh-commands")]
     fn wasi_exec_permitted(
         &self,
         profile: AuthorizedProfile,
@@ -1907,7 +1907,7 @@ impl SshdPlatform for SshPlatform {
     ) -> bool {
         crate::wasi::permitted(profile, request)
     }
-    #[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime", feature = "milkv-python"))]
+    #[cfg(feature = "ssh-commands")]
     fn open_wasi_exec(
         &self,
         profile: AuthorizedProfile,

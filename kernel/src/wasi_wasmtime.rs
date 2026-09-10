@@ -4,6 +4,8 @@ use super::*;
 use crate::wasmtime_platform::async_call::NativeFuture;
 use vibeos_wasmtime_runtime::{wasi as w, wasmtime::{self, Engine, Store, Trap}};
 #[cfg(feature = "wasmtime-threads")]
+use vibeos_wasi_runtime::OutputBudget;
+#[cfg(feature = "wasmtime-threads")]
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU8, AtomicUsize};
 static ACTIVE: SpinLock<Option<(AllocationDomain, usize)>> = SpinLock::new(None);
 pub(super) fn register(domain: AllocationDomain, job: usize) {
@@ -80,6 +82,11 @@ fn authority_stopped(job: &Job) -> Option<WasiTerminal> {
     if job.threads.cancelled.load(Ordering::Acquire) {
         return Some(job.threads.terminal());
     }
+    external_stopped(job)
+}
+/// Session cancellation or loss of the invoking authority, independent of
+/// the guest's own process state.
+fn external_stopped(job: &Job) -> Option<WasiTerminal> {
     if job.io.cancelled() {
         Some(if job.io.denied() { WasiTerminal::Denied } else { WasiTerminal::Cancelled })
     } else if job.authority.as_ref().is_some_and(|check| !check()) {
@@ -168,15 +175,14 @@ impl w::Streams for Streams {
     }
     fn write(&mut self, cx: &mut Context<'_>, fd: u32, data: &[u8]) -> Poll<Result<usize, i32>> {
         if stopped(self.job()).is_some() { return Poll::Ready(Err(76)); }
-        let result = GuestIo(&self.job().io).write(cx, fd, data).map(|r| r.map_err(io_errno));
-        #[cfg(feature = "wasmtime-threads")]
-        if let Poll::Ready(Ok(n)) = result {
-            self.job().threads.output_remaining.fetch_sub(n, Ordering::AcqRel);
-        }
-        result
+        GuestIo(&self.job().io).write(cx, fd, data).map(|r| r.map_err(io_errno))
     }
+    // The job-wide ceiling is reserved before a write and the unused part
+    // returned afterwards, so threads on several harts cannot overdraw it.
     #[cfg(feature = "wasmtime-threads")]
-    fn output_remaining(&self) -> usize { self.job().threads.output_remaining.load(Ordering::Acquire) }
+    fn reserve_output(&mut self, want: usize) -> usize { self.job().threads.output.reserve(want) }
+    #[cfg(feature = "wasmtime-threads")]
+    fn release_output(&mut self, unused: usize) { self.job().threads.output.release(unused) }
     fn close(&mut self, fd: u32) -> Result<(), i32> {
         let io = &self.job().io;
         match fd { 0 => io.stdin.close(), 1 => io.stdout.close(), 2 => io.stderr.close(), _ => return Err(8) }
@@ -345,9 +351,11 @@ async fn execute(raw: usize) -> wasmtime::Result<WasiTerminal> {
     drop(result);
     // Process semantics: main returning or exiting ends every thread. A
     // worker's earlier proc_exit/trap already cancelled us and wins below.
+    // Session cancellation or lost authority while main ran overrides the
+    // guest's status, as the single-store path rechecks after `_start`.
     #[cfg(feature = "wasmtime-threads")]
     if let Some(group) = group {
-        job.threads.end(match terminal { WasiTerminal::Exited(code) => Some(code), _ => None }, terminal == WasiTerminal::Trapped, terminal == WasiTerminal::LimitExceeded);
+        job.threads.end(external_stopped(job).unwrap_or(terminal));
         join_threads(job).await;
         drop(store);
         drop(group);
@@ -390,10 +398,9 @@ pub(super) struct Threads {
     /// Set once the process is ending; every task drops its fiber at the next
     /// quantum and parked waiters are woken to observe it.
     cancelled: AtomicBool,
-    exit: SpinLock<Option<u32>>,
-    trapped: AtomicBool,
-    limit: AtomicBool,
-    output_remaining: AtomicUsize,
+    /// The process outcome; see `end`.
+    terminal: SpinLock<Option<WasiTerminal>>,
+    output: OutputBudget,
     /// Raw address of the arena `ThreadGroup`; zero outside the run.
     group: AtomicUsize,
     /// Bit mask of harts that polled a guest thread of this job.
@@ -414,29 +421,29 @@ impl Threads {
             }),
             next_tid: AtomicU32::new(0),
             cancelled: AtomicBool::new(false),
-            exit: SpinLock::new(None),
-            trapped: AtomicBool::new(false),
-            limit: AtomicBool::new(false),
-            output_remaining: AtomicUsize::new(65536),
+            terminal: SpinLock::new(None),
+            output: OutputBudget::new(65536),
             group: AtomicUsize::new(0),
             harts_used: AtomicUsize::new(0),
         }
     }
-    /// Record a process-ending event and stop every thread.
-    fn end(&self, exit: Option<u32>, trapped: bool, limit: bool) {
-        if let Some(code) = exit {
-            let mut slot = self.exit.lock();
-            if slot.is_none() { *slot = Some(code); }
+    /// Record a process-ending event and stop every thread. The first event
+    /// (main returning, or any thread's proc_exit, trap or resource limit)
+    /// fixes the outcome; a worker that trips a limit while it is already
+    /// being stopped cannot rewrite it. Session cancellation and loss of
+    /// authority still override a guest-chosen status.
+    fn end(&self, terminal: WasiTerminal) {
+        let external = |t: WasiTerminal| matches!(t, WasiTerminal::Denied | WasiTerminal::Cancelled);
+        {
+            let mut slot = self.terminal.lock();
+            if slot.is_none() || (external(terminal) && !slot.is_some_and(external)) {
+                *slot = Some(terminal);
+            }
         }
-        if trapped { self.trapped.store(true, Ordering::Release); }
-        if limit { self.limit.store(true, Ordering::Release); }
         self.cancelled.store(true, Ordering::Release);
     }
     fn terminal(&self) -> WasiTerminal {
-        if self.limit.load(Ordering::Acquire) { WasiTerminal::LimitExceeded }
-        else if let Some(code) = *self.exit.lock() { WasiTerminal::Exited(code) }
-        else if self.trapped.load(Ordering::Acquire) { WasiTerminal::Trapped }
-        else { WasiTerminal::Exited(0) }
+        self.terminal.lock().unwrap_or(WasiTerminal::Exited(0))
     }
 }
 /// Wake every task of the job so parked waiters re-check cancellation.
@@ -517,13 +524,12 @@ impl w::threads::ThreadSpawner for Spawner {
     }
 }
 #[cfg(feature = "wasmtime-threads")]
-struct ThreadOutcome { exit: Option<u32>, trapped: bool, limit: bool }
-#[cfg(feature = "wasmtime-threads")]
 struct ThreadTask {
     job: usize,
     index: usize,
     group: Option<Arc<ThreadGroup>>,
-    future: Option<Pin<Box<dyn Future<Output = ThreadOutcome> + Send>>>,
+    /// Resolves to the process-ending event this thread caused, if any.
+    future: Option<Pin<Box<dyn Future<Output = Option<WasiTerminal>> + Send>>>,
     hart_recorded: bool,
 }
 /// See `Drop for Guest`: a worker cancelled between its last fuel yield and
@@ -578,8 +584,8 @@ impl Future for ThreadTask {
                 Poll::Ready(outcome) => {
                     this.future = None;
                     this.group = None;
-                    if outcome.exit.is_some() || outcome.trapped || outcome.limit {
-                        job.threads.end(outcome.exit, outcome.trapped, outcome.limit);
+                    if let Some(terminal) = outcome {
+                        job.threads.end(terminal);
                         wake_all(this.job);
                     }
                     slot.state.store(DONE, Ordering::Release);
@@ -591,7 +597,7 @@ impl Future for ThreadTask {
     }
 }
 #[cfg(feature = "wasmtime-threads")]
-async fn run_thread(raw: usize, index: usize, group: Arc<ThreadGroup>) -> ThreadOutcome {
+async fn run_thread(raw: usize, index: usize, group: Arc<ThreadGroup>) -> Option<WasiTerminal> {
     let job = unsafe { &*(raw as *const Job) };
     let slot = &job.threads.slots[index];
     let tid = slot.tid.load(Ordering::Acquire);
@@ -614,20 +620,22 @@ async fn run_thread(raw: usize, index: usize, group: Arc<ThreadGroup>) -> Thread
         let result = NativeFuture::new(start.call_async(&mut store, (tid as i32, start_arg))).await;
         let exit = store.data().exit;
         let limit = store.data().resource_limit_hit();
-        let (trapped, fuel) = match result {
-            Ok(()) => (false, false),
+        let outcome = match result {
+            Ok(()) => limit.then_some(WasiTerminal::LimitExceeded),
             Err(error) => {
                 let fuel = error.downcast_ref::<Trap>() == Some(&Trap::OutOfFuel);
                 drop(error);
-                (exit.is_none() && !fuel && !limit, fuel)
+                Some(if limit || fuel { WasiTerminal::LimitExceeded }
+                    else if let Some(code) = exit { WasiTerminal::Exited(code) }
+                    else { WasiTerminal::Trapped })
             }
         };
         drop(store);
-        Ok::<_, wasmtime::Error>(ThreadOutcome { exit, trapped, limit: limit || fuel })
+        Ok::<_, wasmtime::Error>(outcome)
     };
     match run.await {
         Ok(outcome) => outcome,
-        Err(error) => { drop(error); ThreadOutcome { exit: None, trapped: true, limit: false } }
+        Err(error) => { drop(error); Some(WasiTerminal::Trapped) }
     }
 }
 /// Cancel and join every spawned thread. Runs on the executor (not a fiber);

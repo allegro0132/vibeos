@@ -8,7 +8,11 @@ extern crate alloc;
 pub use wasmi::native;
 mod abi;
 mod validate;
+#[cfg(test)]
+mod validate_tests;
 pub mod profile;
+pub mod output_budget;
+pub use output_budget::OutputBudget;
 use abi::*;
 use alloc::{
     string::{String, ToString},

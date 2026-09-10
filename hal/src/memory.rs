@@ -130,6 +130,22 @@ pub struct DmaOps {
     pub sync_for_device: unsafe fn(DmaRegion, DmaDirection),
     pub sync_for_cpu: unsafe fn(DmaRegion, DmaDirection),
 }
+
+/// Instance-owned cache visibility service for statically assembled drivers.
+/// Ownership is governed by the device protocol, including descriptor OWN
+/// polling and publication; synchronization alone does not publish ownership.
+/// # Safety
+/// Validation must reject any span the implementation cannot fully synchronize.
+/// For validated spans, operations cover every required cache level and order
+/// CPU/device visibility. The caller must exclude concurrent CPU writes while
+/// the device owns data, isolate cache lines, and obey descriptor ownership.
+/// These operations do not allocate, free or change the underlying DMA mapping.
+pub unsafe trait DmaCache {
+    fn validate(&self, region: DmaRegion) -> Result<(), MemoryError>;
+    fn for_device(&mut self, region: DmaRegion, direction: DmaDirection);
+    fn for_cpu(&mut self, region: DmaRegion, direction: DmaDirection);
+    fn barrier(&mut self);
+}
 #[cfg(test)]
 mod tests {
     use super::*;

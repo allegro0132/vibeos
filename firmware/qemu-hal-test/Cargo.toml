@@ -5,7 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
-eqos-model-test = ["dep:vibeos-eqos-net", "dep:vibeos-ethernet"]
+eqos-model-test = ["dep:vibeos-eqos-net", "dep:vibeos-ethernet", "dep:vibeos-platform-jh7110"]
 mars-composition-test = ["dep:vibeos-firmware-milkv-mars"]
 mars-resources-test = ["dep:vibeos-bsp-milkv-mars"]
 boot-admission-test = []

@@ -2,8 +2,9 @@
 
 This `no_std` crate provides GMAC4/5 Clause 22 command encoding and basic DMA
 descriptor codecs and a serialized ring state machine. It is not yet a complete
-packet device: JH7110 DMA memory/cache and platform integration remain outstanding. It depends only on
-the shared `vibeos-ethernet` protocol crate; it does not import a BSP or kernel.
+packet device: clock/PHY setup, firmware integration and hardware qualification
+remain outstanding. It depends on HAL and the shared `vibeos-ethernet` protocol
+crate; it does not import a BSP, SoC implementation or kernel.
 The separate Duo DWMAC driver also uses the shared transaction/status code.
 
 `mdio::Port` receives ordered register IO and an actual CSR clock rate. It uses
@@ -83,6 +84,24 @@ by a software loop bound, so the platform must prepare live resources first.
 `Memory` provider. The provider must admit the actual dedicated pool before any
 DMA addresses are programmed and implement cache/volatile/copy operations. The
 register adapter supplies standard RISC-V IO fences, never T-Head instructions.
-No JH7110 cache implementation is supplied yet. Host integration tests and the
+The JH7110 implementation now lives separately in `platform/jh7110/src/cache.rs`.
+Host integration tests and the
 RV64 ring model run this register engine through successful initialization and
 reset-failure recovery; neither emulates the physical interconnect or PHY.
+
+`pool::Storage<N>` provides permanent 64-byte-isolated descriptors and 1536-byte
+packet slots. `Pool::new` takes an exclusive static storage reference, its real
+physical base, and a HAL `DmaCache` instance. Its unsafe contract requires the
+CPU/device mappings to describe the same bytes and raw callbacks to be used
+only through the serialized ring protocol. It validates the entire 32-bit pool
+and every descriptor/buffer cache span, then derives one exact admitted layout.
+Copies translate physical addresses into offsets within the borrowed CPU view;
+descriptor access is volatile and little-endian. Callback checks enforce slot
+kind, full bounds, operation size and synchronization direction.
+
+The pool never uses an uncached alias and cannot be freed by dropping the ring.
+The JH7110 cache implementation validates 64-byte hardware geometry and emits
+the SDK FLUSH64 sequence through ordered 64-bit MMIO. Host and RV64 models cover
+CPU/physical translation and cache-command calls, but cannot prove L1/L2 or
+multicore visibility. The production firmware must still reserve/admit the
+actual pool and cache-controller DTB resource before attaching the device.

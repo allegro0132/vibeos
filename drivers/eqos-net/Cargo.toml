@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 vibeos-ethernet = { path = "../ethernet" }
+vibeos-hal = { path = "../../hal" }
 
 [lib]
 path = "src/lib.rs"

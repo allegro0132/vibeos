@@ -864,3 +864,32 @@ These checks do not qualify JH7110 bus-reset completion, cache visibility or
 physical link behavior. The next required integration is the SoC's clock/reset,
 PHY/pinmux and DMA/cache provider, followed by firmware registration and physical
 network/SSH acceptance. The SD image is still the serial/SD bring-up profile.
+
+### JH7110 cache service and permanent EQoS DMA pool
+
+HAL now has an instance-owned `DmaCache` visibility contract in addition to the
+existing static callback table. `platform/jh7110/cache.rs` implements the pinned
+SDK's SiFive L2 FLUSH64 sequence, including hardware line-size/way checks,
+complete physical-address writes and per-line barriers. It rejects partial
+lines and invalid RAM ranges and does not use the uncached alias or T-Head ISA.
+The source manifest is `boards/milkv-mars/jh7110-cache-reference.json`.
+
+The independent EQoS `Pool` provides aligned permanent storage and explicit CPU
+versus physical views. Construction validates the whole 32-bit-addressable pool
+and each cache operation span; callbacks enforce descriptor/packet slot types,
+directions and bounds. Host tests use deliberately different CPU/physical
+addresses to catch identity-mapping assumptions. A QEMU composition test now
+combines the real pool, ring, controller and JH7110 cache service, with only
+hardware register/DMA effects modeled, and reports `EQOS_POOL_MODEL PASS`.
+
+Five cache and five pool tests, the relevant HAL/controller/SD tests, and 395
+QEMU kernel selftests pass. The Duo release build and dependency guard pass.
+Mutations truncating FLUSH64 addresses, removing per-line barriers, accepting
+wrong cache geometry and shifting CPU offsets are detected. Evidence is in
+`boards/milkv-mars/eqos-cache-pool-evidence.json`.
+
+No actual JH7110 cache operation or GMAC DMA transaction has run on Mars. DTB
+admission of GMAC/cache resources, clock/reset/pinmux and PHY preparation,
+production pool reservation/registration, network/SSH and physical stability
+qualification remain required. This stage does not change the serial-only
+network status of the previously generated test SD image.

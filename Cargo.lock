@@ -1743,6 +1743,7 @@ name = "vibeos-eqos-net"
 version = "0.1.0"
 dependencies = [
  "vibeos-ethernet",
+ "vibeos-hal",
 ]
 
 [[package]]

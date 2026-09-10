@@ -1482,6 +1482,7 @@ name = "vibeos-bsp-milkv-mars"
 version = "0.1.0"
 dependencies = [
  "vibeos-hal",
+ "vibeos-platform-jh7110",
 ]
 
 [[package]]
@@ -1776,6 +1777,7 @@ dependencies = [
  "vibeos-driver-virtio-net",
  "vibeos-hal",
  "vibeos-kernel",
+ "vibeos-platform-jh7110",
 ]
 
 [[package]]
@@ -1930,6 +1932,13 @@ dependencies = [
 
 [[package]]
 name = "vibeos-platform-cv1800b"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
+]
+
+[[package]]
+name = "vibeos-platform-jh7110"
 version = "0.1.0"
 dependencies = [
  "vibeos-hal",

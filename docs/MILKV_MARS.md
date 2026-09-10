@@ -515,3 +515,42 @@ passes, but exercises VirtIO and the shared kernel policy, not DW-MSHC hardware.
 The register model does not prove JH7110 register layout, pin/clock sequencing,
 FIFO timing or real media durability. Mars platform preparation, firmware-owned
 instance registration and SD image integration remain outstanding.
+
+### JH7110 SD platform preparation stage
+
+`platform/jh7110` supplies SDIO1 clock/reset/pad preparation independently of
+BSP wiring and the DW-MSHC controller engine. Mars supplies CLK/CMD/DAT0..3
+GPIOs `[10,9,11,12,7,8]` and the 200 ms settling interval. The source files and
+hashes are pinned in `boards/milkv-mars/jh7110-sd-reference.json`, including the
+[official SDK board DTS](https://github.com/milkv-mars/mars-buildroot-sdk/blob/1fd6bac9f2efde47fbb8afd28d2903c49f893e3f/linux/arch/riscv/boot/dts/starfive/jh7110-milkv-mars.dts).
+
+Preparation reads the running bus/AXI divider and integer PLL2 configuration.
+For PLL2 at 1188 MHz and AXI_CFG0 divide-by-three, a divide-by-eight SDIO1 clock
+is 49.5 MHz. The returned actual source rate must be passed to the BSP's
+`sd_controller(source_hz)`. There is no ready-to-use nominal 50 MHz controller
+description. The subsequent MSHC divider keeps the data clock at or below
+25 MHz. Fractional/powered-down PLLs, disabled shared parents, zero dividers,
+invalid resources and unsupported GPIO wiring are rejected before writes.
+The paired boot firmware must establish the supported parent clock tree.
+
+The platform enables the slot AHB clock, requests and checks reset, disables
+and configures the card clock, installs the six pin routes, then enables the
+clock and releases reset. It waits for the board-supplied settling interval.
+Shared PLL/bus settings, SDIO0 and unowned register bits are preserved. Polling
+has both elapsed-time and iteration bounds. A post-write failure requests reset
+and disables the card clock; missing reset acknowledgment does not establish
+hardware quiescence, so the controller engine must not be registered afterwards.
+Firmware must exclude concurrent access and explicitly prepare again to retry.
+
+Host tests cover clock decoding, route fields and reserved bits, sequence,
+resource validation, timer wrap, reset timeout cleanup and retry. The optional
+`jh7110-sd-model-test` feature of `firmware/qemu-hal-test` executes the same
+platform code under RV64 QEMU using an explicit register model. It reports
+`JH7110_SD_MODEL PASS` and is followed by the existing 390 kernel selftests.
+This is not JH7110 MMIO, pad timing or real card testing. Mutations substituting
+a nominal clock, dropping timeout cleanup or overwriting reserved pad bits
+fail the host regressions.
+
+The Mars firmware entry, live DTB resource publication and registration of the
+prepared DW-MSHC instance remain to be connected. EQoS, paired boot components,
+the flashable SD image and physical acceptance are still outstanding.

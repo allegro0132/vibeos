@@ -42,18 +42,28 @@ pub const fn console(clock_hz: u32) -> UartDescription {
 /// SDK clock tree gates UART0 directly from the 24 MHz oscillator.
 pub const UART: UartDescription = console(24_000_000);
 pub const SD_REGISTERS: AddressRange = AddressRange::new(0x1602_0000, 0x1603_0000);
+/// SDIO1 CLK, CMD, DAT0..3 wiring from the pinned board DTS.
+pub const SD_SETTLE_MS: u32 = 200;
+pub const SD_PINS: vibeos_platform_jh7110::sd::Pins =
+    vibeos_platform_jh7110::sd::Pins([10, 9, 11, 12, 7, 8]);
+pub const SYS_SYSCON: AddressRange = AddressRange::new(0x1303_0000, 0x1304_0000);
+/// Firmware must pass the actual clock rate returned by platform preparation.
+pub const fn sd_controller(source_clock_hz: u32) -> vibeos_hal::DwMshcDescription {
+    assert!(source_clock_hz > 0 && source_clock_hz <= SD_SOURCE_CLOCK_CEILING_HZ);
+    vibeos_hal::DwMshcDescription {
+        registers: SD_REGISTERS,
+        irq: SD_IRQ,
+        source_clock_hz,
+        data_clock_hz: SD_DATA_CLOCK_HZ,
+        fifo_depth_words: SD_FIFO_DEPTH_WORDS,
+        fifo_offset: 0x200,
+    }
+}
 pub const SD_IRQ: u32 = 75;
-pub const SD_SOURCE_CLOCK_HZ: u32 = 50_000_000;
+/// Requested maximum, not the measured source frequency supplied to MSHC.
+pub const SD_SOURCE_CLOCK_CEILING_HZ: u32 = 50_000_000;
 pub const SD_DATA_CLOCK_HZ: u32 = 25_000_000;
 pub const SD_FIFO_DEPTH_WORDS: u16 = 32;
-pub const SD: vibeos_hal::DwMshcDescription = vibeos_hal::DwMshcDescription {
-    registers: SD_REGISTERS,
-    irq: SD_IRQ,
-    source_clock_hz: SD_SOURCE_CLOCK_HZ,
-    data_clock_hz: SD_DATA_CLOCK_HZ,
-    fifo_depth_words: SD_FIFO_DEPTH_WORDS,
-    fifo_offset: 0x200,
-};
 pub const GMAC0_REGISTERS: AddressRange = AddressRange::new(0x1603_0000, 0x1604_0000);
 pub const GMAC0_IRQ: u32 = 7;
 pub const SYS_CRG: AddressRange = AddressRange::new(0x1302_0000, 0x1303_0000);
@@ -108,6 +118,15 @@ mod tests {
         assert_eq!(RAM.len(), 4usize * 1024 * 1024 * 1024);
         assert_eq!(RAM.end, 0x140000000);
         assert_eq!(FIRMWARE_RESERVED.end, KERNEL_LOAD_ADDRESS);
+    }
+    #[test]
+    fn sd_platform_wiring_and_actual_clock_are_board_owned() {
+        assert_eq!(SD_PINS.0, [10, 9, 11, 12, 7, 8]);
+        assert_eq!(SD_SETTLE_MS, 200);
+        let controller = sd_controller(49_500_000);
+        assert_eq!(controller.source_clock_hz, 49_500_000);
+        assert_eq!(controller.data_clock_hz, 25_000_000);
+        assert_eq!(controller.registers, SD_REGISTERS);
     }
     #[test]
     fn microsd_is_mshc_one_and_not_emmc_zero() {

@@ -1,0 +1,71 @@
+{
+  "status": "JH7110 SDIO1 platform implementation verified with host and RV64 models; Mars firmware integration incomplete",
+  "host_tests": 18,
+  "python_tests": 14,
+  "rv64_register_model": "passed, actual-rate and reset-timeout cleanup assertions",
+  "qemu_boot": {
+    "status": "passed",
+    "boot_hart": 0,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 390,
+    "kernel_sha256": "ed308f9a1f1491032ae8d1f9a022458a1a849d728e70299563bd61a65ba7c6e8",
+    "physical_acceptance": false
+  },
+  "mars_bsp_rv64_check": "passed",
+  "source_reference": "boards/milkv-mars/jh7110-sd-reference.json",
+  "mutations": [
+    "Nominal frequency substitution detected",
+    "Missing timeout cleanup detected",
+    "Reserved pad-bit overwrite detected"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage20-tests.log",
+      "sha256": "2f883a92b82f9917ce6113c2fe3cbef5c99c2ce4ea841e971c91b82a6daef10e"
+    },
+    {
+      "path": "target/mars-reference/stage20-python-tests.log",
+      "sha256": "c9811dcd7d51683ba5e61910b5aa26e91e8766a287b6a6f52a04bac8ac9f3a3d"
+    },
+    {
+      "path": "target/mars-reference/stage20-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage20-rv64-build.log",
+      "sha256": "bf6da57860f15ed3d0137f40202c44d821b326d38061a789e6b0c885d1105c80"
+    },
+    {
+      "path": "target/mars-reference/stage20-mars-rv64-check.log",
+      "sha256": "2760b454d797e11b0308251f70984549a19170bc46486d844d84e06a32da0654"
+    },
+    {
+      "path": "target/mars-reference/stage20-rv64-model/serial.log",
+      "sha256": "2f946aa08f786c36329e976376dcb53db137e6e68b02d99d9cbe0d6d773d1d5c"
+    },
+    {
+      "path": "target/mars-reference/stage20-rv64-model/summary.json",
+      "sha256": "77d8086b7e566d4c54ba63a5d3fb6a64a9670da5a65c0484d28df5cf74fa085c"
+    },
+    {
+      "path": "target/mars-reference/stage20-mutation-nominal-clock.log",
+      "sha256": "0e03ce347ff001641868d83bf6ca09855b4a5bf212af7aa7f913e9e7cd50d65d"
+    },
+    {
+      "path": "target/mars-reference/stage20-mutation-timeout-cleanup.log",
+      "sha256": "afdc33b902ec55f389f2d99acb082b1d9892e8e5ecc10216aae0644315a4a714"
+    },
+    {
+      "path": "target/mars-reference/stage20-mutation-pad-reserved-bits.log",
+      "sha256": "e37d4fe830724adc80ac6fdada9f98231f0aac16c329027994779f7d3d436607"
+    }
+  ],
+  "hardware_acceptance": "not run; register models do not qualify JH7110 MMIO, reset synchronization, pad timing or SD media",
+  "remaining": [
+    "Mars firmware entry with live DTB admission and resource publication",
+    "Register the prepared DW-MSHC instance and enforce the SD data partition",
+    "EQoS and real DMA/cache qualification",
+    "Paired SPL/OpenSBI/U-Boot, flashable SD image and physical acceptance"
+  ]
+}

@@ -274,3 +274,15 @@ unchanged client authority/recovery contracts. The optional live DTB probe and
 390 target selftests also run on this image. USB, entropy and acceptance-only
 kernel board switches remain to be separated; this stage does not claim a
 fully board-independent kernel.
+
+### JH7110 SD resources
+
+The JH7110 platform crate depends only on HAL. Mars BSP supplies the SDIO1 pin
+order and settling interval; final firmware will own the exclusive CRG/SYSCON/
+IOMUX handles and invoke preparation before constructing the controller engine.
+The returned source rate is an input to the DW-MSHC description. Neither the
+kernel nor the controller driver gains a JH7110/BSP dependency. The initial pin
+implementation supports SYS GPIO7..12 and integer PLL2 or oscillator parents;
+unsupported configurations fail explicitly. MMIO access uses RISC-V I/O fences.
+The host and RV64 register-model tests cannot qualify those real MMIO accesses
+or the board's electrical behavior.

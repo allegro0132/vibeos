@@ -16,7 +16,15 @@ mod network;
 #[path = "../../qemu-virt/src/transport.rs"]
 mod transport;
 unsafe fn platform_init(_write: fn(&str)) {}
-unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {}
+#[cfg(feature = "jh7110-sd-model-test")]
+mod jh7110_sd_model;
+unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
+    #[cfg(feature = "jh7110-sd-model-test")]
+    {
+        jh7110_sd_model::run();
+        _print(format_args!("JH7110_SD_MODEL PASS source_hz=49500000 timeout_cleanup=ok\n"));
+    }
+}
 const MANAGED_BLOCK_ID: core::num::NonZeroU128 =
     core::num::NonZeroU128::new(0x5649_4245_4f53_0000_0000_0000_0000_0001).unwrap();
 const NETWORK_DRIVER_NAME: &str = "virtio-mmio";

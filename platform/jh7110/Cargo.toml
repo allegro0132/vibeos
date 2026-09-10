@@ -1,8 +1,6 @@
 [package]
-name = "vibeos-bsp-milkv-mars"
+name = "vibeos-platform-jh7110"
 version = "0.1.0"
 edition = "2021"
-
 [dependencies]
 vibeos-hal = { path = "../../hal" }
-vibeos-platform-jh7110 = { path = "../../platform/jh7110" }

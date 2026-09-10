@@ -1,0 +1,55 @@
+{
+  "status": "Duo packet-device composition verified by host/build/ELF checks; Mars incomplete",
+  "host_tests": 25,
+  "qemu_selftests": 390,
+  "duo_build": "passed",
+  "dma_layout": {
+    "elf": "target/riscv64imac-unknown-none-elf/release/vibeos-milkv-duo",
+    "sha256": "24cb7666b62608ff69db1bb07eec8f46e36327599764a22a936c6525588f02fe",
+    "dma_section": [
+      "0x805dd000",
+      "0x805f7000"
+    ],
+    "network_dma": {
+      "symbol": "vibeos_milkv_duo::network::DMA",
+      "address": "0x805dd000",
+      "bytes": 102400,
+      "cache_line_aligned": true,
+      "within_32_bit_dma_range": true
+    }
+  },
+  "mutation": "Dropping faulted instance instead of abandoning it fails destructor regression in isolated HAL copy",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage7-host.log",
+      "sha256": "70d5b0e57ff4fe91097b1db1a770edcb8d64a03bfb576712e5a57b5bb9578f20"
+    },
+    {
+      "path": "target/mars-reference/stage7-fault-drop-mutation.log",
+      "sha256": "ddeb9db95c6032f30dd35f1e931a839286197fb0619ccb2cb19243f67a5af912"
+    },
+    {
+      "path": "target/mars-reference/stage7-qemu-selftest.log",
+      "sha256": "e52054ec3fe846a94c0dbedf0a563423855be1421da7b973282e7b52cf8cbbbf"
+    },
+    {
+      "path": "target/mars-reference/stage7-duo-build.log",
+      "sha256": "ce13b5acfbfe5e2a575c8607f10a86b87f4f18f7923537a399bc86a9df58efef"
+    },
+    {
+      "path": "target/mars-reference/stage7-dma-layout.json",
+      "sha256": "42d16b94f916797f1624f2164fa9130ed434dfa824807aa62a9be10a221d9e95"
+    },
+    {
+      "path": "target/mars-reference/stage7-kernel-dependencies.log",
+      "sha256": "270862659e12789e60043f31b7ebeab3b3a1c126fc061fd0d11fad5a49006669"
+    }
+  ],
+  "hardware_acceptance": "not run; no physical PHY or DMA timing qualification",
+  "remaining": [
+    "Other concrete driver and SoC operations migration",
+    "JH7110 platform, Mars firmware and DW-MSHC/GMAC5 integration",
+    "Boot firmware and flashable SD image",
+    "Physical serial/SSH, entropy qualification and stress acceptance"
+  ]
+}

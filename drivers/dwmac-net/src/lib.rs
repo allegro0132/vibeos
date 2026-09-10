@@ -88,31 +88,7 @@ const EPHY_LINK_PULSE: &[(usize, u32)] = &[
     (0x70, 0x0081),
 ];
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error {
-    Busy,
-    InvalidDescription,
-    TimedOut,
-    QueueFull,
-    PacketTooLarge,
-    AddressTooWide,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Telemetry {
-    pub phy_link_up: bool,
-    pub tx_descriptor_status: u32,
-    pub dma_status: u32,
-    pub clock_enable: u32,
-    pub clock_bypass: u32,
-    pub clock_divider: u32,
-    pub ephy_control: u32,
-    pub resets: u64,
-    pub rx_packets: u64,
-    pub tx_packets: u64,
-    pub tx_checksum_offload: bool,
-    pub rx_checksum_offload: bool,
-}
+pub use vibeos_hal::network::{Error, Telemetry};
 
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]

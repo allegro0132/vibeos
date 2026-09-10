@@ -50,3 +50,32 @@ pub fn early_devices() -> &'static EarlyDevices {
     // SAFETY: a single final firmware provides the immutable Rust static.
     unsafe { &VIBEOS_EARLY_DEVICES }
 }
+
+/// Retire metadata for an owner that cannot resume, without running a driver
+/// destructor that could race recovery or a replacement device incarnation.
+/// This does not release DMA ownership or prove that hardware is quiescent.
+///
+/// # Safety
+/// All prior users of this instance must be permanently unable to execute.
+/// The caller must perform explicit hardware recovery, retaining DMA storage
+/// and quarantine until reset is confirmed. Resources owned by T are leaked
+/// deliberately: this function cannot be used for ordinary shutdown.
+pub unsafe fn abandon_faulted_instance<T>(instance: &mut Option<T>) {
+    if let Some(old) = instance.take() { core::mem::forget(old); }
+}
+#[cfg(test)]
+mod instance_tests {
+    use super::*;
+    use core::sync::atomic::{AtomicUsize,Ordering};
+    #[test]
+    fn fault_retirement_never_runs_old_destructor_during_replacement() {
+        static DROPS:AtomicUsize=AtomicUsize::new(0);
+        struct Instance;
+        impl Drop for Instance {fn drop(&mut self){DROPS.fetch_add(1,Ordering::SeqCst);}}
+        let mut slot=Some(Instance);
+        unsafe{abandon_faulted_instance(&mut slot);}
+        assert!(slot.is_none());assert_eq!(DROPS.load(Ordering::SeqCst),0);
+        slot=Some(Instance);drop(slot);
+        assert_eq!(DROPS.load(Ordering::SeqCst),1);
+    }
+}

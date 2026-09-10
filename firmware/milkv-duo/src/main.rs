@@ -23,3 +23,5 @@ use vibeos_hal::Board as BoardContract;
 mod early_devices;
 
 mod storage;
+
+mod network;

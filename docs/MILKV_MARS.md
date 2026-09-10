@@ -229,3 +229,26 @@ Mars DW-MSHC or physical SD behavior.
 
 The kernel no longer depends on `vibeos-driver-virtio-blk`; shared VirtIO
 transport/protocol helpers, network and USB engines still require migration.
+
+### Packet-device composition stage
+
+The Duo firmware now owns the DWMAC engine, instance state and DMA slab, and
+publishes HAL packet-device operations. The kernel retains packet endpoints,
+network generations, capability admission and fault/recovery policy. Driver
+telemetry and the old device identifiers remain compatible; controller/platform
+register diagnostic words are transitional fields for those existing tools.
+The controller engine no longer appears in the kernel's dependency graph.
+
+Firmware preserves the `.dma` placement and serializes instance claim/release.
+Fault recovery abandons the old engine metadata without running its destructor:
+DWMAC's destructor can reset hardware, and the driver's recovery contract forbids
+an old instance from being dropped after recovery. Explicit recovery owns reset;
+a failed reset keeps the firmware claim fenced. Ordinary shutdown still consumes
+the engine normally. Host tests cover packet marshaling, error propagation,
+claim/shutdown dispatch and non-execution of the abandoned destructor. A mutation
+that drops the old instance is caught. No new physical Ethernet or DMA timing
+qualification is claimed; QEMU tests exercise the existing QEMU path.
+
+The DWMAC engine still contains CV1800B platform setup and cache operations.
+Those must be split before sharing its MDIO/PHY support with JH7110 GMAC5;
+Mars must not inherit CV1800B/T-Head cache instructions.

@@ -11,7 +11,8 @@ extern crate alloc;
 use alloc::{format, string::String, sync::Arc};
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use vibeos_driver_dwmac_net::{DmaStorage, Engine, Error as HardwareError, InstanceState};
+use crate::packet_device::Engine;
+use vibeos_hal::network::{device, Error as HardwareError};
 
 use crate::cap::{Cap, InvocationLease, Resource, Revocable, Rights};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
@@ -25,11 +26,7 @@ use crate::world::Space;
 const TX_TIMEOUT_MS: u64 = 2_000;
 const DRIVER_BATCH_PACKETS: usize = 32;
 
-fn description() -> vibeos_hal::DwmacDescription { crate::platform::dwmac() }
-
-#[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
-static DMA: DmaStorage = DmaStorage::new();
-static INSTANCE: InstanceState = InstanceState::new();
+fn description() -> &'static vibeos_hal::network::Device { device() }
 
 pub const HANDSHAKE_FRAME_LEN: usize = 60;
 pub const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
@@ -125,12 +122,12 @@ impl Resource for MmioWindow {
 }
 
 pub struct DmaRegion {
-    storage: &'static DmaStorage,
+    device: &'static vibeos_hal::network::Device,
 }
 
 impl DmaRegion {
-    fn storage(&self) -> &'static DmaStorage {
-        self.storage
+    fn device(&self) -> &'static vibeos_hal::network::Device {
+        self.device
     }
 }
 impl Resource for DmaRegion {
@@ -140,7 +137,7 @@ impl Resource for DmaRegion {
     fn describe(&self) -> String {
         format!(
             "DWMAC stable cache-isolated descriptor-ring slab @ {:#x}",
-            vibeos_driver_dwmac_net::dma_region_base(self.storage)
+            (self.device.dma_base)()
         )
     }
     fn as_any(&self) -> &dyn Any {
@@ -156,11 +153,11 @@ impl NetDevice {
         // apertures for the firmware lifetime. CONTROL serializes this
         // diagnostic snapshot with kernel packet-engine operations; the
         // selected status registers are non-destructive reads.
-        let hardware = unsafe { vibeos_driver_dwmac_net::telemetry(description(), &INSTANCE) };
+        let hardware = unsafe { (device().telemetry)() };
         NetInfo {
             online: state.online,
             quarantined: state.quarantined,
-            queue_size: u16::try_from(vibeos_driver_dwmac_net::RX_RING_SIZE)
+            queue_size: u16::try_from(device().rx_queue_size)
                 .expect("DWMAC ring size fits telemetry"),
             header_size: 0,
             accepted_features: 0,
@@ -225,7 +222,7 @@ pub fn discover() -> Option<NetResources> {
             base: description().registers.start,
         },
         mmio: Arc::new(MmioWindow),
-        dma: Arc::new(DmaRegion { storage: &DMA }),
+        dma: Arc::new(DmaRegion { device: device() }),
         control: Arc::new(NetDevice),
     })
 }
@@ -329,7 +326,7 @@ pub async fn driver_task(
     DRIVER_OWNER.store(domain.owner.get(), Ordering::Release);
     DRIVER_ARENA.store(domain.arena.get(), Ordering::Release);
 
-    let storage = match dma.try_with(DmaRegion::storage) {
+    let _device = match dma.try_with(DmaRegion::device) {
         Ok(storage) => storage,
         Err(_) => return,
     };
@@ -340,9 +337,6 @@ pub async fn driver_task(
         // board's 32-bit DMA limit for this engine's lifetime.
         unsafe {
             Engine::claim(
-                description(),
-                storage,
-                &INSTANCE,
                 GUEST_MAC,
                 crate::sbi::time,
                 crate::exec::timebase_hz(),
@@ -381,7 +375,7 @@ pub async fn driver_task(
     crate::println!(
         "  dwmac net online, IRQ {}, DMA {:#x}, epoch {}, tx-csum {}, rx-csum {}",
         engine.irq(),
-        storage.base(),
+        (_device.dma_base)(),
         CONTROL.lock().sessions.device_epoch(),
         engine.tx_checksum_offload(),
         engine.rx_checksum_offload(),
@@ -433,7 +427,7 @@ impl Drop for DriverSession {
         let reset = self
             .engine
             .take()
-            .is_some_and(vibeos_driver_dwmac_net::Engine::shutdown);
+            .is_some_and(Engine::shutdown);
         shutdown_driver_policy(reset);
     }
 }
@@ -647,7 +641,7 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     {
         return;
     }
-    let reset = unsafe { vibeos_driver_dwmac_net::recover_faulted(description(), &INSTANCE) };
+    let reset = unsafe { (device().recover)() };
     shutdown_driver_policy(reset);
 }
 

@@ -142,3 +142,9 @@ policy; firmware owns the engine and DMA state. Operation tokens identify a
 specific epoch and serial. Driver completion validation precedes copying data
 back to kernel request buffers. Existing timeout, cancel, revoke and fault
 recovery paths retain their reset-before-reuse ordering across this boundary.
+
+The HAL packet-device boundary now composes the Duo DWMAC instance in firmware.
+Packet endpoints, stack generations and capability/fault policy remain kernel
+services. Firmware retains a fixed `.dma` slab and an instance claim. Ordinary
+shutdown consumes the engine; fault recovery explicitly abandons old metadata
+without a destructor and does not release the claim until reset succeeds.

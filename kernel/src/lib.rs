@@ -1113,6 +1113,8 @@ mod block_device;
 #[cfg(feature = "milkv-duo")]
 mod dwc2_host;
 #[cfg(feature = "milkv-duo")]
+mod packet_device;
+#[cfg(feature = "milkv-duo")]
 mod dwmac_net;
 mod net_device;
 #[cfg(feature = "milkv-duo")]

@@ -6,6 +6,6 @@ pub fn init() -> BlueLedInfo {
     // SAFETY: the Milk-V BSP identity-maps both declared apertures for the
     // firmware lifetime. Boot calls this before publishing any other owner of
     // GPIOC24 or its pad-mux register.
-    unsafe { vibeos_driver_milkv_duo_led::initialize(crate::platform::STATUS_LED) }
+    unsafe { vibeos_driver_milkv_duo_led::initialize(crate::platform::status_led()) }
         .expect("Milk-V Duo BSP must provide a valid status LED description")
 }

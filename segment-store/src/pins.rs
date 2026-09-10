@@ -291,6 +291,33 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
         })
     }
 
+    /// Construct the production registry directly in its final allocation.
+    /// The 1024-root profile is larger than 72 KiB; returning it by value can
+    /// create several simultaneous stack copies in an inlined boot call tree.
+    pub(crate) fn new_shared(reserved_roots: usize, reserved_readers: usize) -> Result<SharedPinRegistry<ROOT_SLOTS, READER_SLOTS>, PinError> {
+        if reserved_roots > ROOT_SLOTS || reserved_readers > READER_SLOTS {
+            return Err(PinError::InvalidConfiguration);
+        }
+        let mut allocation = Arc::<Self>::new_uninit();
+        let pointer = Arc::get_mut(&mut allocation).expect("unpublished registry is unique").as_mut_ptr();
+        // SAFETY: the unique Arc allocation has proper Self alignment. Every
+        // field is initialized exactly once before assume_init, no reference
+        // to uninitialized contents is created, and the slot constructors
+        // neither allocate nor publish a handle to this registry.
+        unsafe {
+            let roots = core::ptr::addr_of_mut!((*pointer).roots).cast::<RootSlot>();
+            for index in 0..ROOT_SLOTS { roots.add(index).write(RootSlot::new()); }
+            let readers = core::ptr::addr_of_mut!((*pointer).readers).cast::<ReaderSlot>();
+            for index in 0..READER_SLOTS { readers.add(index).write(ReaderSlot::new()); }
+            core::ptr::addr_of_mut!((*pointer).reserved_roots).write(reserved_roots);
+            core::ptr::addr_of_mut!((*pointer).reserved_readers).write(reserved_readers);
+            core::ptr::addr_of_mut!((*pointer).next_lease).write(AtomicU64::new(1));
+            core::ptr::addr_of_mut!((*pointer).next_owner).write(AtomicU64::new(1));
+            core::ptr::addr_of_mut!((*pointer).root_revision).write(AtomicU64::new(0));
+            Ok(allocation.assume_init())
+        }
+    }
+
     fn begin_root_write(&self) -> RootWriteGuard<'_> {
         loop {
             let revision = self.root_revision.load(Ordering::SeqCst);
@@ -928,6 +955,20 @@ pub(crate) struct ReleasedPins {
 #[cfg(test)]
 mod tests {
     extern crate std;
+
+    #[test]
+    fn production_registry_initializes_on_a_small_stack() {
+        std::thread::Builder::new().stack_size(64 * 1024).spawn(|| {
+            let pins = super::PinRegistry::<1024, 256>::new_shared(32, 8).unwrap();
+            assert_eq!(pins.reserved_roots, 32);
+            assert_eq!(pins.reserved_readers, 8);
+            assert!(pins.roots.iter().all(|slot| slot.read_stable().is_none()));
+            assert!(pins.readers.iter().all(|slot| slot.read_stable().is_none()));
+            assert!(pins.allocate_owner().is_ok());
+        }).unwrap().join().unwrap();
+        assert!(super::PinRegistry::<1, 1>::new_shared(2, 0).is_err());
+    }
+
 
     use super::*;
     use std::sync::Barrier;

@@ -156,9 +156,8 @@ impl StoreRuntimeContext {
         typed_reference_kinds.extend_from_slice(kinds);
         typed_reference_kinds.sort_unstable();
         typed_reference_kinds.dedup();
-        let pins = StorePinRegistry::new(RESERVED_ROOT_PIN_SLOTS, RESERVED_READER_PIN_SLOTS)
-            .expect("fixed Storage V2 pin-registry configuration")
-            .into_shared();
+        let pins = StorePinRegistry::new_shared(RESERVED_ROOT_PIN_SLOTS, RESERVED_READER_PIN_SLOTS)
+            .expect("fixed Storage V2 pin-registry configuration");
         Ok(Self {
             pins,
             published_generation: alloc::sync::Arc::new(AtomicU64::new(0)),

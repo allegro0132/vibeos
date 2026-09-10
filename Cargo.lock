@@ -1797,8 +1797,6 @@ dependencies = [
  "jitterentropy-rs",
  "sha2 0.11.0",
  "vibeos-authority-store",
- "vibeos-bsp-milkv-duo",
- "vibeos-bsp-qemu-virt",
  "vibeos-component-admission",
  "vibeos-component-command",
  "vibeos-component-format",

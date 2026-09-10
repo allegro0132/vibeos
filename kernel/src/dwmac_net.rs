@@ -25,8 +25,7 @@ use crate::world::Space;
 const TX_TIMEOUT_MS: u64 = 2_000;
 const DRIVER_BATCH_PACKETS: usize = 32;
 
-const DWMAC: vibeos_hal::DwmacDescription = crate::platform::DWMAC;
-const IRQ: u32 = DWMAC.irq;
+fn description() -> vibeos_hal::DwmacDescription { crate::platform::dwmac() }
 
 #[cfg_attr(target_arch = "riscv64", link_section = ".dma")]
 static DMA: DmaStorage = DmaStorage::new();
@@ -116,8 +115,8 @@ impl Resource for MmioWindow {
     }
     fn describe(&self) -> String {
         format!(
-            "CV1800B DWMAC @ {:#x}, IRQ {IRQ}, RMII",
-            DWMAC.registers.start
+            "CV1800B DWMAC @ {:#x}, IRQ {}, RMII",
+            description().registers.start, description().irq
         )
     }
     fn as_any(&self) -> &dyn Any {
@@ -157,7 +156,7 @@ impl NetDevice {
         // apertures for the firmware lifetime. CONTROL serializes this
         // diagnostic snapshot with kernel packet-engine operations; the
         // selected status registers are non-destructive reads.
-        let hardware = unsafe { vibeos_driver_dwmac_net::telemetry(DWMAC, &INSTANCE) };
+        let hardware = unsafe { vibeos_driver_dwmac_net::telemetry(description(), &INSTANCE) };
         NetInfo {
             online: state.online,
             quarantined: state.quarantined,
@@ -170,7 +169,7 @@ impl NetDevice {
                 .sessions
                 .active_stamp()
                 .map_or(0, PacketStamp::stack_generation),
-            irq: IRQ,
+            irq: description().irq,
             used_interrupts: 0,
             rx_packets: hardware.rx_packets,
             tx_packets: hardware.tx_packets,
@@ -223,7 +222,7 @@ pub struct NetResources {
 pub fn discover() -> Option<NetResources> {
     Some(NetResources {
         location: crate::net_device::NetworkLocation::Mmio {
-            base: DWMAC.registers.start,
+            base: description().registers.start,
         },
         mmio: Arc::new(MmioWindow),
         dma: Arc::new(DmaRegion { storage: &DMA }),
@@ -341,7 +340,7 @@ pub async fn driver_task(
         // board's 32-bit DMA limit for this engine's lifetime.
         unsafe {
             Engine::claim(
-                DWMAC,
+                description(),
                 storage,
                 &INSTANCE,
                 GUEST_MAC,
@@ -648,7 +647,7 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     {
         return;
     }
-    let reset = unsafe { vibeos_driver_dwmac_net::recover_faulted(DWMAC, &INSTANCE) };
+    let reset = unsafe { vibeos_driver_dwmac_net::recover_faulted(description(), &INSTANCE) };
     shutdown_driver_policy(reset);
 }
 

@@ -1,41 +1,63 @@
-//! Compatibility facade for the compile-time selected board support crate.
-//!
-//! Hardware descriptions live outside the kernel in `boards/`. Keeping the
-//! legacy constant names here lets the MMU and drivers migrate independently
-//! without copying board data back into the kernel.
-
-#[cfg(all(feature = "qemu-virt", feature = "milkv-duo"))]
-compile_error!("features `qemu-virt` and `milkv-duo` are mutually exclusive");
-
-#[cfg(all(feature = "qemu-default-image", feature = "milkv-duo-sd-image"))]
-compile_error!("image-policy features are mutually exclusive");
-
-#[cfg(all(feature = "qemu-virt", not(feature = "qemu-default-image")))]
-compile_error!("QEMU firmware must select an image policy");
-
-#[cfg(all(feature = "milkv-duo", not(feature = "milkv-duo-sd-image")))]
-compile_error!("Milk-V Duo firmware must select an image policy");
-
-#[cfg(not(any(feature = "qemu-virt", feature = "milkv-duo")))]
-compile_error!("exactly one board feature must be enabled: `qemu-virt` or `milkv-duo`");
-
-#[cfg(all(feature = "qemu-virt", not(feature = "milkv-duo")))]
-mod selected {
-    pub use vibeos_bsp_qemu_virt::*;
-    #[allow(unused_imports)]
-    pub use vibeos_image_policy::{BLOCK_DATA_SLICE, NETWORK_FRONTEND};
+//! Firmware-provided physical resources. The kernel never selects a BSP.
+#![allow(dead_code, unused_imports)]
+use vibeos_hal::*;
+pub use vibeos_image_policy::{BLOCK_DATA_SLICE, NETWORK_FRONTEND};
+pub fn description() -> &'static vibeos_hal::boot::BootPlatform {
+    vibeos_hal::boot::platform()
 }
-
-#[cfg(all(feature = "milkv-duo", not(feature = "qemu-virt")))]
-mod selected {
-    pub use vibeos_bsp_milkv_duo::*;
-    pub use vibeos_image_policy::{BLOCK_DATA_SLICE, NETWORK_FRONTEND};
+pub fn info() -> &'static BoardInfo {
+    &description().info
 }
-
-#[cfg(any(
-    all(feature = "qemu-virt", feature = "milkv-duo"),
-    not(any(feature = "qemu-virt", feature = "milkv-duo"))
-))]
-mod selected {}
-
-pub use selected::*;
+pub fn mmu() -> &'static MmuDescription {
+    &description().mmu
+}
+pub fn name() -> &'static str {
+    info().name
+}
+pub fn timebase_hz() -> u64 {
+    info().timebase_hz
+}
+pub fn hart_ids() -> &'static [usize] {
+    description().hart_ids
+}
+pub fn pci() -> PciHostDescription {
+    info().pci.expect("firmware did not supply a PCI host")
+}
+pub fn dwmac() -> DwmacDescription {
+    info().dwmac.expect("firmware did not supply a DWMAC")
+}
+pub fn sdhci() -> SdhciDescription {
+    info().sdhci.expect("firmware did not supply SDHCI")
+}
+pub fn dwc2() -> Dwc2Description {
+    info().dwc2.expect("firmware did not supply DWC2")
+}
+pub fn status_led() -> StatusLedDescription {
+    info()
+        .status_led
+        .expect("firmware did not supply a status LED")
+}
+pub fn virtio_mmio() -> VirtioMmioDescription {
+    info()
+        .virtio_mmio
+        .expect("firmware did not supply VirtIO MMIO")
+}
+pub fn rtc_base() -> usize {
+    description()
+        .rtc
+        .expect("firmware did not supply an RTC")
+        .start
+}
+pub fn console_window() -> AddressRange {
+    AddressRange::new(
+        info().uart.registers.start,
+        info()
+            .virtio_mmio
+            .map_or(info().uart.registers.end, |v| v.registers.end),
+    )
+}
+pub fn cold_reset() -> ! {
+    (description()
+        .cold_reset
+        .expect("firmware did not supply a cold reset"))()
+}

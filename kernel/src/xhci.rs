@@ -136,7 +136,7 @@ fn bar_region(bar: Bar) -> Result<MmioRegion, Error> {
         ),
         _ => return Err(Error::BarMissing),
     };
-    let aperture = crate::platform::PCI.mmio;
+    let aperture = crate::platform::pci().mmio;
     let end = base.checked_add(length).ok_or(Error::BarOutsidePlatform)?;
     if base < aperture.start || end > aperture.end {
         return Err(Error::BarOutsidePlatform);

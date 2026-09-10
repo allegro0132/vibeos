@@ -118,6 +118,7 @@ pub const MMIO_MAPPINGS: &[IdentityMapping] = &[
 ];
 
 pub const MMU: MmuDescription = MmuDescription {
+    ram_granularity: vibeos_hal::MappingGranularity::Page4K,
     ram: AddressRange::new(RAM_START, RAM_END),
     ram_attributes: MemoryAttributes::THeadNormal,
     mmio_attributes: MemoryAttributes::THeadDevice,
@@ -187,6 +188,7 @@ impl BoardContract for Board {
     };
     const MEMORY_MAP: &'static [MemoryRegion] = MEMORY_MAP;
     const MMU: MmuDescription = MMU;
+    const RESET: Option<fn() -> !> = Some(cold_reset);
     const HART_IDS: &'static [usize] = HART_IDS;
 
     fn plic_s_context(physical_hart: usize) -> Option<usize> {

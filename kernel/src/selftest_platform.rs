@@ -240,9 +240,40 @@ pub async fn run() -> Report {
     report
 }
 
+/// Dedicated QEMU 4 GiB profile. The firmware retains a 128 MiB heap; these
+/// five pages are otherwise unused and must never be probed in ordinary images.
+#[cfg(feature = "mmu-large-memory-test")]
+fn large_ram(h: &mut Harness) {
+    use vibeos_core::mmu::PagePermissions;
+    let pages = [0x90000000usize, 0xc0000000, 0x100000000, 0x140000000, 0x17ffff000];
+    let heap_end = core::ptr::addr_of!(crate::__heap_end) as usize;
+    assert!(pages.iter().all(|&p| p >= heap_end && p + 4096 <= crate::mmu::kernel_ram_end()));
+    h.check("four GiB profile maps four separate Sv39 root windows",
+        crate::mmu::kernel_ram_start() == 0x80200000 && crate::mmu::kernel_ram_end() == 0x180000000);
+    let mapped = pages.iter().all(|&p| crate::mmu::mapping(p).is_some_and(|m|
+        m.physical == p && m.page_size == 2 * 1024 * 1024 &&
+        m.permissions == PagePermissions::READ.union(PagePermissions::WRITE)));
+    h.check("high RAM uses identity-mapped RW-NX two-MiB leaves", mapped);
+    if !mapped { return; }
+    let mut saved = [0u64; 5];
+    // SAFETY: the dedicated firmware profile declares these physical RAM
+    // pages outside every allocated range. Preserve their contents, and
+    // write all patterns before reading so aliased roots cannot pass.
+    unsafe {
+        for (index, &page) in pages.iter().enumerate() { saved[index] = (page as *const u64).read_volatile(); }
+        for (index, &page) in pages.iter().enumerate() { (page as *mut u64).write_volatile(0xfeed_cafe_0000_0000 | index as u64); }
+        let independent = pages.iter().enumerate().all(|(index, &page)|
+            (page as *const u64).read_volatile() == (0xfeed_cafe_0000_0000 | index as u64));
+        for (index, &page) in pages.iter().enumerate() { (page as *mut u64).write_volatile(saved[index]); }
+        h.check("hardware accesses through high RAM roots remain independent", independent);
+    }
+}
+
 /// M6.1--M6.3: one identity-mapped Sv39 root is active on every online hart;
 /// stack guards, W^X, execute-only code, and non-executable devices are live.
 fn paging(h: &mut Harness) {
+    #[cfg(feature = "mmu-large-memory-test")]
+    large_ram(h);
     use vibeos_core::mmu::{PagePermissions, PAGE_SIZE};
 
     h.check(
@@ -316,10 +347,10 @@ fn paging(h: &mut Harness) {
     );
 
     for (name, address) in [
-        ("PLIC is identity mapped", crate::mmu::PLIC_START),
+        ("PLIC is identity mapped", crate::mmu::plic_start()),
         (
             "UART/virtio is identity mapped",
-            crate::mmu::UART_VIRTIO_START,
+            crate::mmu::uart_virtio_start(),
         ),
     ] {
         let device = crate::mmu::mapping(address).expect("required MMIO aperture is mapped");
@@ -337,27 +368,27 @@ fn paging(h: &mut Harness) {
     for (name, address) in [
         (
             "CV1800B SoC control is identity mapped",
-            crate::platform::SOC_CONTROL_BASE,
+            crate::platform::dwmac().soc_control.start,
         ),
         (
             "CV1800B EPHY is identity mapped",
-            crate::platform::SOC_CONTROL_BASE + 0x9000,
+            crate::platform::dwmac().soc_control.start + 0x9000,
         ),
         (
             "CV1800B eFuse shadow is identity mapped",
-            crate::platform::EFUSE_BASE,
+            crate::platform::dwmac().efuse.start,
         ),
         (
             "CV1800B GPIOC is identity mapped",
-            crate::platform::GPIOC_BASE,
+            crate::platform::status_led().gpio.start,
         ),
         (
             "CV1800B DWMAC is identity mapped",
-            crate::platform::ETHERNET_BASE,
+            crate::platform::dwmac().registers.start,
         ),
         (
             "CV1800B SDIO0 is identity mapped",
-            crate::platform::SDHCI_BASE,
+            crate::platform::sdhci().registers.start,
         ),
     ] {
         let device = crate::mmu::mapping(address).expect("native device MMIO is mapped");
@@ -381,11 +412,11 @@ fn paging(h: &mut Harness) {
     );
     h.check(
         "RAM beyond the configured machine is absent",
-        crate::mmu::mapping(crate::mmu::KERNEL_RAM_END).is_none(),
+        crate::mmu::mapping(crate::mmu::kernel_ram_end()).is_none(),
     );
     h.check(
         "unused PLIC pages are absent",
-        crate::mmu::mapping(crate::mmu::PLIC_START + PAGE_SIZE).is_none(),
+        crate::mmu::mapping(crate::mmu::plic_start() + PAGE_SIZE).is_none(),
     );
     let boot_physical = sbi::current_hart_id();
     let boot_s_context = crate::mmu::plic_s_context_page(boot_physical)
@@ -397,17 +428,17 @@ fn paging(h: &mut Harness) {
     h.check(
         "PLIC M-context and unused S-context pages are absent",
         (0..exec::MAX_HARTS * 2)
-            .map(|context| crate::mmu::PLIC_CONTEXT_START + context * PAGE_SIZE)
+            .map(|context| crate::mmu::plic_context_start() + context * PAGE_SIZE)
             .filter(|address| *address != boot_s_context)
             .all(|address| crate::mmu::mapping(address).is_none()),
     );
     h.check(
         "the end of the PLIC aperture is absent",
-        crate::mmu::mapping(crate::mmu::PLIC_END).is_none(),
+        crate::mmu::mapping(crate::mmu::plic_end()).is_none(),
     );
     h.check(
         "unused UART/virtio pages are absent",
-        crate::mmu::mapping(crate::mmu::UART_VIRTIO_END).is_none(),
+        crate::mmu::mapping(crate::mmu::uart_virtio_end()).is_none(),
     );
     h.check(
         "the diagnostic walker rejects non-canonical Sv39 addresses",

@@ -14,12 +14,16 @@ pub const RAM_START: usize = 0x8020_0000;
 /// benchmark contract boots with -m 512M and its qualification workloads
 /// legitimately hold multi-MiB record streams in transit. The linker script
 /// variant selected by the same feature sizes the heap to match.
-#[cfg(feature = "python-wasi")]
+#[cfg(all(feature = "python-wasi", not(feature = "mmu-large-memory")))]
 pub const RAM_END: usize = 0xc000_0000;
-#[cfg(all(feature = "storage-bench", not(feature = "python-wasi")))]
+#[cfg(all(feature = "storage-bench", not(any(feature = "python-wasi", feature = "mmu-large-memory"))))]
 pub const RAM_END: usize = 0xa000_0000;
-#[cfg(not(any(feature = "storage-bench", feature = "python-wasi")))]
+#[cfg(not(any(feature = "storage-bench", feature = "python-wasi", feature = "mmu-large-memory")))]
 pub const RAM_END: usize = 0x8800_0000;
+/// Acceptance profile: map four GiB while retaining the ordinary 128 MiB
+/// allocation/linker bound so high-page probes cannot touch allocated data.
+#[cfg(feature = "mmu-large-memory")]
+pub const RAM_END: usize = 0x1_8000_0000;
 pub const PLIC_BASE: usize = 0x0c00_0000;
 pub const PLIC_MMIO_END: usize = PLIC_BASE + 0x0040_0000;
 pub const PLIC_MAX_IRQ: u32 = 1023;
@@ -78,6 +82,9 @@ pub const MMIO_MAPPINGS: &[IdentityMapping] = &[
 ];
 
 pub const MMU: MmuDescription = MmuDescription {
+    ram_granularity: if cfg!(feature = "mmu-large-memory") {
+        vibeos_hal::MappingGranularity::Megapage2M
+    } else { vibeos_hal::MappingGranularity::Page4K },
     ram: AddressRange::new(RAM_START, RAM_END),
     ram_attributes: MemoryAttributes::Standard,
     mmio_attributes: MemoryAttributes::Standard,
@@ -127,6 +134,7 @@ impl BoardContract for Board {
     };
     const MEMORY_MAP: &'static [MemoryRegion] = MEMORY_MAP;
     const MMU: MmuDescription = MMU;
+    const RTC: Option<AddressRange> = Some(AddressRange::new(RTC_BASE, RTC_BASE + 0x1000));
     const HART_IDS: &'static [usize] = HART_IDS;
 
     fn plic_s_context(physical_hart: usize) -> Option<usize> {

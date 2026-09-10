@@ -55,9 +55,7 @@ use crate::heap::{AllocationDomain, ArenaId, OwnerId};
 use crate::sync::SpinLock;
 use crate::world::Space;
 
-const SDHCI: vibeos_hal::SdhciDescription = crate::platform::SDHCI;
-const BASE: usize = SDHCI.registers.start;
-const IRQ: u32 = SDHCI.irq;
+fn description() -> vibeos_hal::SdhciDescription { crate::platform::sdhci() }
 const DATA_SLICE: vibeos_image_policy::BlockSlice = match crate::platform::BLOCK_DATA_SLICE {
     Some(slice) => slice,
     None => panic!("Milk-V Duo firmware must select a data block slice"),
@@ -127,7 +125,7 @@ impl Resource for MmioWindow {
         "cv1800b-sdhci-mmio"
     }
     fn describe(&self) -> String {
-        format!("CV1800B SDIO0 @ {BASE:#x}, IRQ {IRQ}")
+        format!("CV1800B SDIO0 @ {:#x}, IRQ {}", description().registers.start, description().irq)
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -159,7 +157,7 @@ impl BlockDevice {
             read_only: false,
             supports_flush: true,
             session_epoch: state.epoch,
-            irq: IRQ,
+            irq: description().irq,
             used_interrupts: 0,
             last_error: state.last_error,
             last_command: state.last_command,
@@ -309,7 +307,7 @@ pub fn write_readback_enabled() -> bool {
 /// busy milliseconds). Lets an operator attribute a single high-level
 /// operation's cost to reads, writes, or per-command busy time.
 pub fn io_counters() -> (u64, u64, u64, u64) {
-    let busy_ms = IO_BUSY_TICKS.load(Ordering::Relaxed) / (crate::platform::TIMEBASE_HZ / 1000);
+    let busy_ms = IO_BUSY_TICKS.load(Ordering::Relaxed) / (crate::platform::timebase_hz() / 1000);
     (
         IO_OPS.load(Ordering::Relaxed),
         IO_BLOCKS_READ.load(Ordering::Relaxed),
@@ -370,7 +368,7 @@ fn with_card_at<T>(
     IO_BUSY_TICKS.fetch_add(busy_ticks, Ordering::Relaxed);
     let ops = IO_OPS.fetch_add(1, Ordering::Relaxed) + 1;
     if ops % 16384 == 0 {
-        let busy_ms = IO_BUSY_TICKS.load(Ordering::Relaxed) / (crate::platform::TIMEBASE_HZ / 1000);
+        let busy_ms = IO_BUSY_TICKS.load(Ordering::Relaxed) / (crate::platform::timebase_hz() / 1000);
         crate::uart::_print(format_args!(
             "  sdhci stats: {ops} ops, {} blk rd, {} blk wr, {busy_ms} ms busy\n",
             IO_BLOCKS_READ.load(Ordering::Relaxed),
@@ -583,7 +581,7 @@ impl Card {
         // the retained MMIO capability above gives this supervised incarnation
         // exclusive authority to use the controller until it exits.
         let hardware = unsafe {
-            HardwareCard::initialize(SDHCI, crate::platform::TIMEBASE_HZ, crate::sbi::time)
+            HardwareCard::initialize(description(), crate::platform::timebase_hz(), crate::sbi::time)
         }
         .map_err(map_hardware_error)?;
         let physical_capacity = hardware.info().capacity_sectors;

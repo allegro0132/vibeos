@@ -10,8 +10,9 @@ claim of hardware qualification in this change.
   used by the existing QEMU and Duo firmware. The kernel console adapter keeps
   its locks, ring buffers, record framing and wakeups; the interrupt adapter
   keeps its atomic handler registry and enable lock. Neither adapter imports a
-  BSP or accesses registers. Other kernel adapters still depend on concrete
-  hardware drivers and board features.
+  BSP or accesses registers. All kernel adapters now obtain physical resource
+  descriptions from firmware; other adapters still depend on concrete driver
+  engines and compatibility feature names.
 - `drivers/uart16550` implements 16550/DW APB register IO and preserves the DW
   busy-detect and phantom-timeout acknowledgements. `drivers/plic` implements
   context initialization, source masking, claim and completion.
@@ -25,7 +26,9 @@ claim of hardware qualification in this change.
 - `hal::fdt` validates bounded FDT v17 byte slices and extracts RAM and fixed
   reservations without allocation. `hal::memory` subtracts reservations
   transactionally and validates complete DMA spans and cache-line isolation.
-  These helpers do not yet replace the kernel's existing MMU/allocator boot.
+  DTB admission is not yet connected to allocator boot. The MMU now consumes
+  the firmware boot contract and its RAM table arena, supports multiple GiB
+  windows and 2 MiB RAM leaves, and pre-splits permission-changing pools.
 - `boards/milkv-mars` describes the target and admits DTB memory within its
   physical RAM range. The caller must still reserve the kernel image, page
   tables and permanent DMA before using that memory for allocation.
@@ -67,8 +70,8 @@ must establish them before attaching the relevant controller.
 
 ## Remaining implementation
 
-1. Introduce the complete firmware boot/device registration contract. Move
-   remaining BSP and driver dependencies out of the kernel, preserving device
+1. Extend the firmware device registration contract to the remaining hardware
+   engines. BSP dependencies are removed; remove remaining driver dependencies, preserving device
    capability lifetimes, DMA quarantine, queue cancellation and recovery.
 2. Implement JH7110 clock/reset/pinmux preparation and verify DMA coherence for
    the GMAC path. Add the GMAC5/EQoS engine and PHY setup using the Mars wiring.
@@ -76,9 +79,9 @@ must establish them before attaching the relevant controller.
    managed-range and write-certainty contracts; reserve separate boot/data
    partitions in image policy. Add device timeout and recovery acceptance.
 4. Integrate the boot DTB parser with hart, timebase, resource and image
-   validation. Extend the live MMU beyond its current single-gigapage RAM
-   hierarchy, with large-page RAM mappings and fine mappings for protection
-   boundaries. Connect the admitted free ranges to allocation.
+   validation. The live MMU now supports multiple GiB windows and large RAM
+   leaves with fine protection boundaries. Connect admitted DTB free ranges to
+   allocation and exclude reserved pages from the live map.
 5. Add `firmware/milkv-mars`, a linker layout and reproducible SD packaging.
    Qualify a matching SPL/OpenSBI/U-Boot configuration with HSM/IPI/RFENCE/TIME.
    Do not update SPI as part of this test-card workflow.
@@ -100,6 +103,7 @@ cargo test --locked --offline \
 (cd firmware/milkv-duo && cargo build --locked --offline --release)
 scripts/qemu-test.sh mmu
 scripts/qemu-test.sh selftest
+python3 scripts/qemu-large-ram-test.py
 ```
 
 Recreate the independent DTB fixture with:
@@ -114,3 +118,28 @@ they do not emulate electrical timing, clock/reset hardware, interrupt delivery
 or cache coherence. QEMU acceptance validates the existing QEMU platform only.
 Actual run results and remaining gaps are recorded in the
 [foundation evidence](../boards/milkv-mars/foundation-evidence.json).
+
+## Firmware boot contract and large-RAM stage
+
+The kernel imports `VIBEOS_BOOT_PLATFORM` from its final firmware. The table
+contains board facts, hart topology, MMU layout, optional RTC/reset operations
+and a callback returning permanent page-table storage. QEMU and Duo use this
+path; Cargo feature forwarding that affects QEMU RAM now belongs to firmware.
+
+The dedicated `mmu-large-memory` QEMU firmware profile maps four GiB while
+keeping its heap below 128 MiB. On-target checks write distinct patterns through
+five unused high pages, including all four root windows and addresses above
+physical 4 GiB, verify that the pages do not alias, and restore their contents.
+The same image runs the normal selftest including stack guards and W^X. It is
+an acceptance profile, not the default QEMU image or a Mars hardware emulator.
+
+The storage bootstrap exposed a stack-overflow regression during this change:
+returning the 1024-root pin registry by value produced multiple large stack
+copies. Production initialization now constructs it directly in its Arc, with
+a separate 64 KiB-stack host regression. Ordinary VirtIO-block boot and the
+on-target selftest exercise the actual bootstrap path.
+
+OpenSBI's `Platform HSM Device: ---` line does **not** prove that the SBI HSM
+extension is absent (QEMU's current firmware prints this and advertises HSM).
+Bootloader qualification must probe the extension and start secondary harts;
+it must not infer capability from that label alone.

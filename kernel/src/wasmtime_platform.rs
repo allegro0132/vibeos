@@ -215,8 +215,8 @@ pub unsafe fn capture_boot_isa(dtb: usize, heap_start: usize, heap_end: usize) -
         let mut harts = [0u64; crate::exec::MAX_HARTS];
         let mut count = 0;
         let boot = crate::sbi::current_hart_id();
-        if !crate::platform::HART_IDS.contains(&boot) { return None; }
-        for &hart in crate::platform::HART_IDS {
+        if !crate::platform::hart_ids().contains(&boot) { return None; }
+        for &hart in crate::platform::hart_ids() {
             if hart != boot {
                 match crate::sbi::hart_status(hart) {
                     Ok(crate::sbi::HartState::Stopped) => (),

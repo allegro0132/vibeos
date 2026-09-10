@@ -207,7 +207,7 @@ pub fn discover() -> Option<NetResources> {
     ports[..path.ports.len()].copy_from_slice(&path.ports);
     Some(NetResources {
         location: crate::net_device::NetworkLocation::Usb {
-            controller: crate::platform::DWC2.registers.start,
+            controller: crate::platform::dwc2().registers.start,
             ports,
             depth: path.depth,
         },

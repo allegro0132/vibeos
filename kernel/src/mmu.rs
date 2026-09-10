@@ -2,10 +2,10 @@
 //!
 //! M6 uses paging for integrity, not process isolation.  The initial map keeps
 //! kernel RAM and the selected board's MMIO regions at identical virtual and
-//! physical addresses. RAM uses 4 KiB leaves from the outset so later guard,
-//! W^X, and read-only milestones can change one page without splitting a live
-//! superpage. A fixed early table pool is populated from the selected BSP's
-//! typed identity-map descriptors without allocation.
+//! physical addresses. Firmware chooses 4 KiB or 2 MiB RAM leaves. Guard,
+//! W^X and capability-table pools are split before publication, so runtime
+//! permission changes never split a live superpage. RAM tables occupy a
+//! firmware-owned arena; boot descriptions are consumed without allocation.
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
@@ -15,27 +15,26 @@ use crate::exec;
 use crate::sync::SpinLock;
 use sv39::{PageAttributes, PagePermissions, PageTableEntry};
 use vibeos_core::mmu as sv39;
-use vibeos_hal::{Board as BoardContract, MappingGranularity, MemoryAttributes};
+use vibeos_hal::{MappingGranularity, MemoryAttributes};
 
-pub const KERNEL_RAM_START: usize = crate::platform::MMU.ram.start;
-pub const KERNEL_RAM_END: usize = crate::platform::MMU.ram.end;
-const PLIC: vibeos_hal::PlicDescription = <crate::platform::Board as BoardContract>::INFO.plic;
-pub const PLIC_START: usize = PLIC.registers.start;
-pub const PLIC_END: usize = PLIC.registers.end;
+pub fn kernel_ram_start() -> usize { crate::platform::mmu().ram.start }
+pub fn kernel_ram_end() -> usize { crate::platform::mmu().ram.end }
+fn plic() -> vibeos_hal::PlicDescription { crate::platform::info().plic }
+pub fn plic_start() -> usize { plic().registers.start }
+pub fn plic_end() -> usize { plic().registers.end }
 // Compatibility aliases used by the existing in-kernel acceptance suite. The
 // mapping itself is sourced exclusively from the board's MMU descriptors.
-pub const UART_VIRTIO_START: usize = crate::platform::DEVICE_MMIO_START;
-pub const UART_VIRTIO_END: usize = crate::platform::DEVICE_MMIO_END;
+pub fn uart_virtio_start() -> usize { crate::platform::console_window().start }
+pub fn uart_virtio_end() -> usize { crate::platform::console_window().end }
 pub const STACK_GUARD_SIZE: usize = sv39::PAGE_SIZE;
 pub const STACK_SLOT_STRIDE: usize = 256 * 1024;
 
 const MEGAPAGE_SIZE: usize = 2 * 1024 * 1024;
 const GIGAPAGE_SIZE: usize = 1024 * 1024 * 1024;
-const RAM_LEVEL0_TABLES: usize = (KERNEL_RAM_END - KERNEL_RAM_START) / MEGAPAGE_SIZE;
 const MAX_DEVICE_LEVEL1_TABLES: usize = 2;
 const MAX_DEVICE_LEVEL0_TABLES: usize = 6;
-const PLIC_ENABLE_PAGE: usize = PLIC_START + 0x2000;
-pub const PLIC_CONTEXT_START: usize = PLIC_START + 0x20_0000;
+pub fn plic_enable_page() -> usize { plic_start() + 0x2000 }
+pub fn plic_context_start() -> usize { plic_start() + 0x20_0000 }
 
 const WRITABLE_PERMISSIONS: PagePermissions = PagePermissions::READ.union(PagePermissions::WRITE);
 const READ_ONLY_PERMISSIONS: PagePermissions = PagePermissions::READ;
@@ -86,8 +85,6 @@ struct AddressSpace {
     fiber_level1: PageTable,
     #[cfg(feature = "wasmtime-async")]
     fiber_level0: PageTable,
-    ram_level1: PageTable,
-    ram_level0: [PageTable; RAM_LEVEL0_TABLES],
 }
 
 impl AddressSpace {
@@ -108,8 +105,6 @@ impl AddressSpace {
             fiber_level1: PageTable::empty(),
             #[cfg(feature = "wasmtime-async")]
             fiber_level0: PageTable::empty(),
-            ram_level1: PageTable::empty(),
-            ram_level0: [const { PageTable::empty() }; RAM_LEVEL0_TABLES],
         }
     }
 }
@@ -153,10 +148,10 @@ pub fn init_boot(boot_physical_hart: usize) {
             .is_ok(),
         "Sv39 tables initialized twice"
     );
-    assert_eq!(KERNEL_RAM_START % MEGAPAGE_SIZE, 0);
-    assert_eq!(KERNEL_RAM_END % MEGAPAGE_SIZE, 0);
+    assert_eq!(kernel_ram_start() % MEGAPAGE_SIZE, 0);
+    assert_eq!(kernel_ram_end() % MEGAPAGE_SIZE, 0);
     assert!(
-        crate::platform::HART_IDS.contains(&boot_physical_hart),
+        crate::platform::hart_ids().contains(&boot_physical_hart),
         "boot hart must fit the selected platform topology"
     );
 
@@ -167,15 +162,19 @@ pub fn init_boot(boot_physical_hart: usize) {
     // fresh `AddressSpace::empty()` here: materializing the large page-table
     // hierarchy can create a temporary larger than the boot hart's stack.
 
-    tables.root.entries[sv39::vpn_index(KERNEL_RAM_START, 2)] =
-        PageTableEntry::table(table_address(&tables.ram_level1))
-            .expect("RAM level-1 table is page aligned");
+    validate_ram_arena();
+    for index in 0..ram_level1_count() {
+        let root = sv39::vpn_index(kernel_ram_start(), 2) + index;
+        assert!(!tables.root.entries[root].is_valid());
+        tables.root.entries[root] = PageTableEntry::table(ram_table_address(index))
+            .expect("firmware RAM table is page aligned");
+    }
     assert!(
-        crate::platform::MMU.device_level1_tables <= MAX_DEVICE_LEVEL1_TABLES,
+        crate::platform::mmu().device_level1_tables <= MAX_DEVICE_LEVEL1_TABLES,
         "board MMU description exceeds the static level-1 table pool"
     );
     assert!(
-        crate::platform::MMU.device_level0_tables <= MAX_DEVICE_LEVEL0_TABLES,
+        crate::platform::mmu().device_level0_tables <= MAX_DEVICE_LEVEL0_TABLES,
         "board MMU description exceeds the static level-0 table pool"
     );
     {
@@ -183,28 +182,32 @@ pub fn init_boot(boot_physical_hart: usize) {
 
         // PLIC mappings are intentionally sparse: only global control, the
         // enable page, and the boot supervisor context are accessible initially.
-        mapper.map_page(PLIC_START);
-        mapper.map_page(PLIC_ENABLE_PAGE);
+        mapper.map_page(plic_start());
+        mapper.map_page(plic_enable_page());
         mapper.map_page(
             plic_s_context_page(boot_physical_hart).expect("boot physical hart is in range"),
         );
 
-        for mapping in crate::platform::MMU.identity_mappings {
+        for mapping in crate::platform::mmu().identity_mappings {
             mapper.map_range(*mapping);
         }
         mapper.assert_declared_capacity();
     }
 
-    for (table_index, level0) in tables.ram_level0.iter_mut().enumerate() {
-        let base = KERNEL_RAM_START + table_index * MEGAPAGE_SIZE;
-        let level1_index = sv39::vpn_index(base, 1);
-        tables.ram_level1.entries[level1_index] = PageTableEntry::table(table_address(level0))
-            .expect("RAM level-0 table is page aligned");
-        for (page_index, entry) in level0.entries.iter_mut().enumerate() {
-            let physical = base + page_index * sv39::PAGE_SIZE;
-            *entry = ram_leaf(physical, WRITABLE_PERMISSIONS)
-                .expect("identity RAM leaf is architecturally valid");
-        }
+    for table_index in 0..ram_level0_count() {
+        let base = kernel_ram_start() + table_index * MEGAPAGE_SIZE;
+        let parent = match crate::platform::mmu().ram_granularity {
+            MappingGranularity::Page4K => {
+                for (page_index, entry) in ram_level0_mut(tables, table_index).entries.iter_mut().enumerate() {
+                    let physical = base + page_index * sv39::PAGE_SIZE;
+                    *entry = ram_leaf(physical, WRITABLE_PERMISSIONS).expect("identity RAM page");
+                }
+                PageTableEntry::table(ram_table_address(ram_level1_count() + table_index)).unwrap()
+            }
+            MappingGranularity::Megapage2M => ram_leaf(base, WRITABLE_PERMISSIONS).unwrap(),
+            MappingGranularity::Gigapage1G => panic!("RAM must use 4 KiB or 2 MiB leaves"),
+        };
+        ram_level1_mut(tables, base).entries[sv39::vpn_index(base, 1)] = parent;
     }
 
     let (text_start, text_end) = text_range();
@@ -218,6 +221,12 @@ pub fn init_boot(boot_physical_hart: usize) {
     let (code_start, code_end) = code_pool_range();
     assert_page_range(code_start, code_end);
     remap_boot_range(tables, code_start, code_end, WRITABLE_PERMISSIONS);
+
+    // Runtime permission changes only touch pre-split dedicated pools. No
+    // live large-page split can race another hart's cached translation.
+    let (cap_start, cap_end) = capability_table_pool_range();
+    assert_page_range(cap_start, cap_end);
+    remap_boot_range(tables, cap_start, cap_end, WRITABLE_PERMISSIONS);
 
     for logical_index in 0..exec::MAX_HARTS {
         let guard = stack_guard_page(logical_index).expect("logical stack guard is in range");
@@ -331,8 +340,8 @@ pub fn root_physical() -> usize {
 }
 
 pub fn plic_s_context_page(physical_hart: usize) -> Option<usize> {
-    <crate::platform::Board as BoardContract>::plic_s_context(physical_hart)
-        .map(|context| PLIC_CONTEXT_START + context * sv39::PAGE_SIZE)
+    (vibeos_hal::devices::early_devices().interrupts.supervisor_context)(physical_hart)
+        .map(|context| plic_context_start() + context * sv39::PAGE_SIZE)
 }
 
 const fn megapage_base(address: usize) -> usize {
@@ -510,7 +519,20 @@ pub fn first_writable_executable_ram_page() -> Option<usize> {
     // Safety: the lock serializes all post-boot mutations and TABLES_READY
     // proves the complete hierarchy was published.
     let tables = unsafe { &*TABLES.0.get() };
-    for (table_index, level0) in tables.ram_level0.iter().enumerate() {
+    for index in 0..ram_level1_count() {
+        // SAFETY: PAGE_TABLE_LOCK excludes all mutation; the firmware arena
+        // remains owned by this address space for the complete boot.
+        let level1 = unsafe { &*(ram_table_address(index) as *const PageTable) };
+        for (entry_index, entry) in level1.entries.iter().copied().enumerate() {
+            if entry.is_valid() && entry.is_leaf()
+                && entry.permissions().contains(PagePermissions::WRITE)
+                && entry.permissions().contains(PagePermissions::EXECUTE) {
+                return Some((kernel_ram_start() / GIGAPAGE_SIZE + index) * GIGAPAGE_SIZE + entry_index * MEGAPAGE_SIZE);
+            }
+        }
+    }
+    for table_index in 0..ram_level0_count() {
+        let level0 = ram_level0(tables, table_index);
         for (page_index, entry) in level0.entries.iter().copied().enumerate() {
             let permissions = entry.permissions();
             if entry.is_valid()
@@ -519,7 +541,7 @@ pub fn first_writable_executable_ram_page() -> Option<usize> {
                 && permissions.contains(PagePermissions::EXECUTE)
             {
                 return Some(
-                    KERNEL_RAM_START + table_index * MEGAPAGE_SIZE + page_index * sv39::PAGE_SIZE,
+                    kernel_ram_start() + table_index * MEGAPAGE_SIZE + page_index * sv39::PAGE_SIZE,
                 );
             }
         }
@@ -632,7 +654,7 @@ impl<'a> BootIdentityMapper<'a> {
             return index;
         }
         assert!(
-            self.level1_count < crate::platform::MMU.device_level1_tables,
+            self.level1_count < crate::platform::mmu().device_level1_tables,
             "board MMIO mappings exhausted the declared level-1 table capacity"
         );
         let table_index = self.level1_count;
@@ -658,7 +680,7 @@ impl<'a> BootIdentityMapper<'a> {
             return index;
         }
         assert!(
-            self.level0_count < crate::platform::MMU.device_level0_tables,
+            self.level0_count < crate::platform::mmu().device_level0_tables,
             "board MMIO mappings exhausted the declared level-0 table capacity"
         );
         let level1_index = self.ensure_level1(physical);
@@ -680,19 +702,19 @@ impl<'a> BootIdentityMapper<'a> {
     fn assert_declared_capacity(&self) {
         assert_eq!(
             self.level1_count,
-            crate::platform::MMU.device_level1_tables,
+            crate::platform::mmu().device_level1_tables,
             "board level-1 table declaration is not exact"
         );
         assert_eq!(
             self.level0_count,
-            crate::platform::MMU.device_level0_tables,
+            crate::platform::mmu().device_level0_tables,
             "board level-0 table declaration is not exact"
         );
     }
 }
 
 fn assert_page_range(start: usize, end: usize) {
-    assert!(start >= KERNEL_RAM_START && end <= KERNEL_RAM_END && start < end);
+    assert!(start >= kernel_ram_start() && end <= kernel_ram_end() && start < end);
     assert_eq!(start % sv39::PAGE_SIZE, 0);
     assert_eq!(end % sv39::PAGE_SIZE, 0);
 }
@@ -827,13 +849,58 @@ fn synchronize_instruction_caches() {
     REMOTE_FENCE_I.fetch_add(1, Ordering::Release);
 }
 
+fn ram_level1_count() -> usize {
+    (kernel_ram_end() - 1) / GIGAPAGE_SIZE - kernel_ram_start() / GIGAPAGE_SIZE + 1
+}
+fn ram_level0_count() -> usize { (kernel_ram_end() - kernel_ram_start()) / MEGAPAGE_SIZE }
+fn ram_arena() -> vibeos_hal::boot::PageTableArena {
+    // SAFETY: callers are page-table operations serialized by boot ownership
+    // or PAGE_TABLE_LOCK. Retrieving the arena does not dereference it.
+    unsafe { (crate::platform::description().ram_page_tables)() }
+}
+fn validate_ram_arena() {
+    let arena = ram_arena();
+    assert_eq!(arena.base % sv39::PAGE_SIZE, 0);
+    assert_eq!(arena.pages, ram_level1_count() + ram_level0_count());
+    let end = arena.base.checked_add(arena.pages.checked_mul(sv39::PAGE_SIZE).unwrap()).unwrap();
+    assert!(arena.base >= kernel_ram_start() && end <= kernel_ram_end(), "firmware page-table arena must lie in RAM");
+}
+fn ram_table_address(index: usize) -> usize {
+    let arena = ram_arena();
+    assert!(index < arena.pages);
+    arena.base + index * sv39::PAGE_SIZE
+}
+fn ram_level1_mut(_owner: &mut AddressSpace, physical: usize) -> &mut PageTable {
+    let index = physical / GIGAPAGE_SIZE - kernel_ram_start() / GIGAPAGE_SIZE;
+    assert!(index < ram_level1_count());
+    // SAFETY: the AddressSpace borrow represents exclusive arena ownership.
+    unsafe { &mut *(ram_table_address(index) as *mut PageTable) }
+}
+fn ram_level0_mut(_owner: &mut AddressSpace, index: usize) -> &mut PageTable {
+    assert!(index < ram_level0_count());
+    unsafe { &mut *(ram_table_address(ram_level1_count() + index) as *mut PageTable) }
+}
+fn ram_level0(_owner: &AddressSpace, index: usize) -> &PageTable {
+    assert!(index < ram_level0_count());
+    unsafe { &*(ram_table_address(ram_level1_count() + index) as *const PageTable) }
+}
 fn ram_leaf_mut(tables: &mut AddressSpace, address: usize) -> &mut PageTableEntry {
-    assert!(address >= KERNEL_RAM_START && address < KERNEL_RAM_END);
+    assert!(address >= kernel_ram_start() && address < kernel_ram_end());
     assert_eq!(address % sv39::PAGE_SIZE, 0);
-    let offset = address - KERNEL_RAM_START;
+    let offset = address - kernel_ram_start();
     let table_index = offset / MEGAPAGE_SIZE;
-    let page_index = offset % MEGAPAGE_SIZE / sv39::PAGE_SIZE;
-    &mut tables.ram_level0[table_index].entries[page_index]
+    let parent_index = sv39::vpn_index(address, 1);
+    let parent = ram_level1_mut(tables, address).entries[parent_index];
+    if parent.is_leaf() {
+        assert!(!TABLES_READY.load(Ordering::Acquire), "fine-grained pools must be split before publishing the MMU");
+        let base = megapage_base(address);
+        for (index, entry) in ram_level0_mut(tables, table_index).entries.iter_mut().enumerate() {
+            *entry = ram_leaf(base + index * sv39::PAGE_SIZE, parent.permissions()).unwrap();
+        }
+        ram_level1_mut(tables, address).entries[parent_index] =
+            PageTableEntry::table(ram_table_address(ram_level1_count() + table_index)).unwrap();
+    }
+    &mut ram_level0_mut(tables, table_index).entries[sv39::vpn_index(address, 0)]
 }
 
 fn ram_leaf(
@@ -843,7 +910,7 @@ fn ram_leaf(
     PageTableEntry::leaf_with_attributes(
         physical,
         permissions,
-        page_attributes(crate::platform::MMU.ram_attributes),
+        page_attributes(crate::platform::mmu().ram_attributes),
     )
 }
 
@@ -854,7 +921,7 @@ fn mmio_leaf(
     PageTableEntry::leaf_with_attributes(
         physical,
         permissions,
-        page_attributes(crate::platform::MMU.mmio_attributes),
+        page_attributes(crate::platform::mmu().mmio_attributes),
     )
 }
 

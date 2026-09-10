@@ -9,8 +9,8 @@ pub fn time(id: u32, _precision: u64) -> Result<u64, i32> {
             // The low-register read latches the high register globally. All
             // WASI engines must use the same lock for this pair of MMIO reads.
             let ns = unsafe {
-                let low = core::ptr::read_volatile(crate::platform::RTC_BASE as *const u32);
-                let high = core::ptr::read_volatile((crate::platform::RTC_BASE + 4) as *const u32);
+                let low = core::ptr::read_volatile(crate::platform::rtc_base() as *const u32);
+                let high = core::ptr::read_volatile((crate::platform::rtc_base() + 4) as *const u32);
                 (u64::from(high) << 32) | u64::from(low)
             };
             Ok(ns)

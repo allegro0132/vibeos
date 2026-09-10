@@ -5,16 +5,19 @@ compiled. The Cargo composition and downward dependency direction are:
 
 ```text
 firmware/<board>  (selects features, owns entry point and final linking)
+        ├── boards/<board> + UART/PLIC engines
+        ├── immutable HAL boot/device operation tables
         └── kernel archive
               ├── policy/image   (logical resources)
-              ├── boards/<board> (typed physical descriptions)
+              ├── hal            (firmware-supplied physical resources)
               └── kernel adapters (capabilities, IRQs, supervision)
                        └── drivers/* (register/protocol engines)
                                   └── hal + core
 ```
 
-The selected `boards/<board>` BSP constructs the
-typed `vibeos_hal::BoardInfo` consumed by the kernel adapters: RAM and MMIO
+The final firmware uses its `boards/<board>` BSP to construct the immutable
+`vibeos_hal::boot::BootPlatform` consumed by the kernel. The kernel archive
+has no BSP dependency or board-selection facade. The contract includes: RAM and MMIO
 ranges, MMU mappings, hart and interrupt-controller facts, UART details, and
 optional per-device descriptions. Drivers receive only the description they
 need; they do not import a BSP or select a board themselves. Consequently,
@@ -54,8 +57,13 @@ obligations; the kernel serializes TX, config and PLIC enable updates.
 
 The kernel UART/PLIC adapters contain queues, IRQ-handler publication and
 policy only. They neither access registers nor import a board/driver crate.
-The MMU and other device adapters still use the original composition shown
-above. See `MILKV_MARS.md` for the remaining migration and port work.
+The MMU and other device adapters obtain physical descriptions through
+`VIBEOS_BOOT_PLATFORM`. RAM page tables are allocated statically by firmware
+and borrowed under the kernel page-table ownership protocol. Multiple GiB
+windows and 2 MiB RAM leaves are supported; all runtime permission-changing
+pools are split before publishing the address space. Other hardware engines
+still have direct kernel dependencies pending the remaining driver migration.
+See `MILKV_MARS.md` for the remaining port work.
 
 ## Driver crates
 

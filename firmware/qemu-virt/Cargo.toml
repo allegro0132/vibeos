@@ -5,7 +5,8 @@ edition = "2021"
 build = "build.rs"
 
 [features]
-python-wasi = ["vibeos-kernel/python-wasi"]
+mmu-large-memory = ["legacy-shell", "vibeos-bsp-qemu-virt/mmu-large-memory", "vibeos-kernel/mmu-large-memory-test"]
+python-wasi = ["vibeos-kernel/python-wasi", "vibeos-bsp-qemu-virt/python-wasi"]
 wasmtime-command = ["vibeos-kernel/wasmtime-command"]
 wasmtime-command-fuel-batch = ["vibeos-kernel/wasmtime-command-fuel-batch"]
 wasmtime-threads = ["vibeos-kernel/wasmtime-threads"]
@@ -26,7 +27,7 @@ legacy-shell = ["vibeos-kernel/legacy-shell"]
 # Dedicated guest-path storage qualification image. Keeping this as one named
 # feature prevents benchmark builds from silently omitting the V2 file-tree
 # policy while preserving the production storage and capability paths.
-storage-bench = ["legacy-shell", "file-tree", "vibeos-kernel/storage-bench"]
+storage-bench = ["legacy-shell", "file-tree", "vibeos-kernel/storage-bench", "vibeos-bsp-qemu-virt/storage-bench"]
 tcp-echo = ["vibeos-kernel/tcp-echo"]
 tcp-echo-recovery-test = ["vibeos-kernel/tcp-echo-recovery-test"]
 iperf3-server = ["vibeos-kernel/iperf3-server"]

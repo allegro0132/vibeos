@@ -1291,7 +1291,7 @@ const BANNER: &str = r#"
 #[no_mangle]
 pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
     uart::early_write("\r\n[VibeOS] entry\r\n");
-    exec::configure_timebase(platform::TIMEBASE_HZ);
+    exec::configure_timebase(platform::timebase_hz());
     let boot_time = sbi::time();
     #[cfg(not(feature = "legacy-shell"))]
     let _ = boot_time;
@@ -1327,8 +1327,8 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
     println!("{}", BANNER);
     println!(
         "  platform  {} ({} MHz timebase)",
-        platform::NAME,
-        platform::TIMEBASE_HZ / 1_000_000
+        platform::name(),
+        platform::timebase_hz() / 1_000_000
     );
     #[cfg(feature = "milkv-duo")]
     println!(
@@ -1406,9 +1406,9 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
         println!(
             "  pci       {} function(s), ECAM {:#x}, MMIO {:#x}..{:#x}",
             functions,
-            platform::PCI_ECAM_START,
-            platform::PCI_MMIO_START,
-            platform::PCI_MMIO_END,
+            platform::pci().ecam.start,
+            platform::pci().mmio.start,
+            platform::pci().mmio.end,
         );
         if let Some(info) = xhci::init().expect("QEMU XHCI initialization must succeed") {
             println!(
@@ -1434,7 +1434,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
         Ok(info) => println!(
             "  usb       DWC2 {:#06x} @ {:#x}, IRQ {}, {} channel(s), port {}",
             info.release,
-            platform::USB_BASE,
+            platform::dwc2().registers.start,
             info.irq,
             info.host_channels,
             if dwc2_host::connected() {
@@ -2020,10 +2020,10 @@ fn start_secondary_harts() -> usize {
     physical_for_logical[exec::HartId::BOOT.index()] = boot_physical_hart;
     let mut next_logical_index = 1;
     assert!(
-        platform::HART_IDS.contains(&boot_physical_hart),
+        platform::hart_ids().contains(&boot_physical_hart),
         "firmware boot hart is absent from the selected platform topology"
     );
-    for &physical_hart in platform::HART_IDS {
+    for &physical_hart in platform::hart_ids() {
         if physical_hart == boot_physical_hart {
             continue;
         }

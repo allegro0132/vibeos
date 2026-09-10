@@ -573,8 +573,8 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
 fn mmu_status() {
     let text = mmu::mapping(mmu_status as *const () as usize)
         .expect("the running shell text must be mapped");
-    let plic = mmu::mapping(mmu::PLIC_START).expect("the PLIC must be mapped");
-    let uart = mmu::mapping(mmu::UART_VIRTIO_START).expect("UART/virtio must be mapped");
+    let plic = mmu::mapping(mmu::plic_start()).expect("the PLIC must be mapped");
+    let uart = mmu::mapping(mmu::uart_virtio_start()).expect("UART/virtio must be mapped");
     let online = crate::online_hart_mask();
     let enabled = mmu::enabled_hart_mask();
     println!(
@@ -590,8 +590,8 @@ fn mmu_status() {
     );
     println!(
         "  kernel RAM: {:#x}..{:#x}, identity, {} KiB leaves, strict W^X",
-        mmu::KERNEL_RAM_START,
-        mmu::KERNEL_RAM_END,
+        mmu::kernel_ram_start(),
+        mmu::kernel_ram_end(),
         text.page_size / 1024,
     );
     println!(

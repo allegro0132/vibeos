@@ -5,10 +5,11 @@ edition = "2021"
 autobins = false
 
 [features]
+mmu-large-memory-test = []
 # Production Duo command image; never pulls in QEMU test identities.
 milkv-wasmtime = ["milkv-command", "wasi-preview1", "vibeos-sshd/wasi-exec", "wasmtime-command-fuel-batch", "wasmtime-threads"]
 python-command = ["wasi-preview1", "vibeos-wasi-runtime/python-wasi", "vibeos-sshd/python-wasi"]
-python-wasi = ["wasi-ssh-upload", "python-command", "vibeos-bsp-qemu-virt?/python-wasi"]
+python-wasi = ["wasi-ssh-upload", "python-command"]
 milkv-python = ["milkv-command", "python-command", "vibeos-wasi-runtime/python-duo"]
 # Command images generate code for the scalar extensions every schedulable
 # hart advertised at boot (see `wasmtime-discovered-isa`); a target without
@@ -42,14 +43,14 @@ wasi-ssh = ["ssh-commands", "wasi-preview1", "ssh-test", "vibeos-sshd/wasi-exec"
 milkv-command = ["milkv-ssh", "ssh-commands"]
 ssh-commands = []
 default = ["qemu-virt", "qemu-default-image"]
-qemu-virt = ["dep:vibeos-bsp-qemu-virt", "dep:vibeos-driver-pci", "dep:vibeos-driver-virtio-blk", "dep:vibeos-driver-virtio-core", "dep:vibeos-driver-virtio-mmio", "dep:vibeos-driver-virtio-net", "dep:vibeos-driver-virtio-rng", "dep:vibeos-driver-xhci", "vibeos-vsh/pci-usb-help"]
-milkv-duo = ["dep:vibeos-bsp-milkv-duo", "dep:vibeos-driver-dwmac-net", "dep:vibeos-driver-dwc2-host", "dep:vibeos-driver-milkv-duo-led", "dep:vibeos-driver-sdhci-blk"]
+qemu-virt = ["dep:vibeos-driver-pci", "dep:vibeos-driver-virtio-blk", "dep:vibeos-driver-virtio-core", "dep:vibeos-driver-virtio-mmio", "dep:vibeos-driver-virtio-net", "dep:vibeos-driver-virtio-rng", "dep:vibeos-driver-xhci", "vibeos-vsh/pci-usb-help"]
+milkv-duo = ["dep:vibeos-driver-dwmac-net", "dep:vibeos-driver-dwc2-host", "dep:vibeos-driver-milkv-duo-led", "dep:vibeos-driver-sdhci-blk"]
 qemu-default-image = ["vibeos-image-policy/qemu-default"]
 milkv-duo-sd-image = ["vibeos-image-policy/milkv-duo-sd"]
 legacy-shell = []
 # Dedicated raw-block benchmark authority. This is only enabled by the
 # benchmark image and is absent from production capability layouts.
-storage-bench = ["vibeos-image-policy/storage-bench", "vibeos-bsp-qemu-virt?/storage-bench"]
+storage-bench = ["vibeos-image-policy/storage-bench"]
 file-tree = [
     "dep:vibeos-file-store",
     "vibeos-vsh/file-tree",
@@ -531,8 +532,6 @@ bench = false
 [dependencies]
 vibeos-wasi-runtime = { path = "../wasi-runtime", optional = true }
 vibeos-wasi-command = { path = "../services/wasi-command", optional = true }
-vibeos-bsp-milkv-duo = { path = "../boards/milkv-duo", optional = true }
-vibeos-bsp-qemu-virt = { path = "../boards/qemu-virt", optional = true }
 vibeos-component-admission = { path = "../services/component-admission", optional = true }
 vibeos-component-command = { path = "../services/component-command", optional = true }
 vibeos-component-format = { path = "../component-format", optional = true }

@@ -7,6 +7,7 @@
 //! drivers consume the smaller device-specific descriptions.
 
 pub mod arch;
+pub mod boot;
 pub mod devices;
 pub mod memory;
 pub mod fdt;
@@ -124,6 +125,7 @@ impl IdentityMapping {
 /// the kernel (control/enable and supervisor contexts).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MmuDescription {
+    pub ram_granularity: MappingGranularity,
     pub ram: AddressRange,
     pub ram_attributes: MemoryAttributes,
     pub mmio_attributes: MemoryAttributes,
@@ -300,6 +302,8 @@ pub trait Board {
     const INFO: BoardInfo;
     const MEMORY_MAP: &'static [MemoryRegion];
     const MMU: MmuDescription;
+    const RTC: Option<AddressRange> = None;
+    const RESET: Option<fn() -> !> = None;
     const HART_IDS: &'static [usize];
 
     /// Return the supervisor PLIC context for an OpenSBI-visible physical hart.

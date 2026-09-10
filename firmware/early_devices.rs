@@ -33,3 +33,25 @@ pub static VIBEOS_EARLY_DEVICES: EarlyDevices = EarlyDevices {
         complete: |context, irq| PLIC.complete(context, irq),
     },
 };
+
+use core::cell::UnsafeCell;
+use vibeos_hal::boot::{ram_page_table_pages, BootPlatform, PageTableArena};
+const RAM_TABLE_PAGES: usize = ram_page_table_pages(Board::MMU.ram);
+#[repr(C, align(4096))]
+struct RamTables(UnsafeCell<[[u64; 512]; RAM_TABLE_PAGES]>);
+// SAFETY: only the kernel page-table owner accesses this static after boot.
+unsafe impl Sync for RamTables {}
+static RAM_TABLES: RamTables = RamTables(UnsafeCell::new([[0; 512]; RAM_TABLE_PAGES]));
+#[no_mangle]
+pub static VIBEOS_BOOT_PLATFORM: BootPlatform = BootPlatform {
+    info: Board::INFO,
+    memory_map: Board::MEMORY_MAP,
+    mmu: Board::MMU,
+    hart_ids: Board::HART_IDS,
+    rtc: Board::RTC,
+    cold_reset: Board::RESET,
+    ram_page_tables: || PageTableArena {
+        base: RAM_TABLES.0.get() as usize,
+        pages: RAM_TABLE_PAGES,
+    },
+};

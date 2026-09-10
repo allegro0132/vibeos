@@ -43,10 +43,10 @@ pub fn init() -> Result<Info, Error> {
     // PHY and TOP control ranges to this adapter for the kernel lifetime.
     let controller = unsafe {
         Controller::initialize(
-            crate::platform::DWC2,
+            crate::platform::dwc2(),
             &DMA,
             &INSTANCE,
-            crate::platform::TIMEBASE_HZ,
+            crate::platform::timebase_hz(),
             crate::sbi::time,
         )
     }?;

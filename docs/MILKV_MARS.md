@@ -490,3 +490,28 @@ are recorded in `boards/milkv-mars/frontend-selection-evidence.json`.
 This establishes the composition boundary, not JH7110 controller behavior.
 Mars still requires its firmware entry, live admission/resource publication,
 DW-MSHC/EQoS integration, boot components and the flashable SD image.
+
+### DW-MSHC PIO service contract stage
+
+The DW-MSHC engine now exposes bounded `read_blocks`,
+`write_blocks_tracked`, `flush_tracked` and HAL-compatible diagnostics/errors.
+Each request is validated in full before touching the controller, including
+capacity, sector-address encoding, arithmetic overflow and the HAL's 256-sector
+limit. Batches deliberately use single-sector CMD17/CMD24 transactions.
+Optional write verification compares each completed sector before advancing.
+
+The submission callback now runs immediately before the command-register
+store. Previously it ran after the store, leaving a fault window in which a
+possibly executed write could still appear unsubmitted. Batch writes invoke
+it exactly once, and a failing command or mismatched readback makes the card
+unavailable until firmware reconstructs it. Flush tracks only the first CMD13
+and waits for ready-for-data in transfer state, including repeated status polls.
+
+Fourteen driver model tests plus two SD protocol tests pass. Mutations moving
+publication after the command store, validating only the first sector, or
+ignoring verification mismatch each fail their regressions. The driver also
+checks for the bare-metal RV64 target. The existing QEMU block-recovery test
+passes, but exercises VirtIO and the shared kernel policy, not DW-MSHC hardware.
+The register model does not prove JH7110 register layout, pin/clock sequencing,
+FIFO timing or real media durability. Mars platform preparation, firmware-owned
+instance registration and SD image integration remain outstanding.

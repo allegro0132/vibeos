@@ -2,6 +2,7 @@
 //! Synopsys DesignWare MSHC SD transport (PIO, 512-byte single-block IO).
 //! SoC clocks, resets, pinmux and card power are prepared by the embedding
 //! firmware. No SDHCI register assumptions or CPU-specific cache operations.
+use core::cell::Cell;
 use vibeos_hal::AddressRange;
 use vibeos_sd_protocol::{capacity_from_csd, sector_argument};
 
@@ -54,7 +55,19 @@ pub enum Error {
     OutOfRange,
     Offline,
 }
-pub use vibeos_hal::DwMshcDescription as Description;
+impl From<Error> for vibeos_hal::block::Error {
+    fn from(error: Error) -> Self {
+        match error {
+            Error::InvalidConfiguration => Self::InvalidConfiguration,
+            Error::TimedOut => Self::TimedOut,
+            Error::Protocol => Self::Protocol,
+            Error::Unsupported => Self::Unsupported,
+            Error::OutOfRange => Self::OutOfRange,
+            Error::Offline => Self::DeviceIo,
+        }
+    }
+}
+pub use vibeos_hal::{block::MAX_TRANSFER_BLOCKS, DwMshcDescription as Description};
 /// 32-bit FIFO and control accesses. Implementations must preserve ordering.
 pub trait Registers {
     fn read(&self, offset: usize) -> u32;
@@ -93,6 +106,8 @@ pub struct Card<R> {
     rca: u16,
     info: CardInfo,
     online: bool,
+    last_command: Cell<u8>,
+    last_interrupt: Cell<u32>,
 }
 
 pub fn clock_divider(source: u32, target: u32) -> Result<u8, Error> {
@@ -138,6 +153,8 @@ impl<R: Registers> Card<R> {
                 high_capacity: false,
             },
             online: false,
+            last_command: Cell::new(0),
+            last_interrupt: Cell::new(0),
         };
         card.registers.write(INTMASK, 0);
         card.registers.write(CTRL, 7); // reset controller, FIFO and DMA; DMA disabled
@@ -194,6 +211,64 @@ impl<R: Registers> Card<R> {
     pub fn info(&self) -> CardInfo {
         self.info
     }
+    pub fn diagnostics(&self) -> vibeos_hal::block::Diagnostics {
+        vibeos_hal::block::Diagnostics {
+            command: self.last_command.get(),
+            interrupt_status: self.last_interrupt.get(),
+            present_state: self.registers.read(STATUS),
+        }
+    }
+    fn validate_blocks(&self, sector: u64, bytes: usize) -> Result<(), Error> {
+        if !self.online {
+            return Err(Error::Offline);
+        }
+        if bytes == 0 || bytes % 512 != 0 || bytes / 512 > MAX_TRANSFER_BLOCKS as usize {
+            return Err(Error::OutOfRange);
+        }
+        let end = sector
+            .checked_add((bytes / 512) as u64)
+            .ok_or(Error::OutOfRange)?;
+        if end > self.info.capacity_sectors {
+            return Err(Error::OutOfRange);
+        }
+        sector_argument(self.info.high_capacity, end - 1).map_err(|_| Error::OutOfRange)?;
+        Ok(())
+    }
+    /// Bounded batches use single-block commands; no DMA or caller slice is
+    /// retained. Validate the entire request before issuing the first command.
+    pub fn read_blocks(&mut self, sector: u64, output: &mut [u8]) -> Result<(), Error> {
+        self.validate_blocks(sector, output.len())?;
+        for (index, block) in output.chunks_exact_mut(512).enumerate() {
+            block.copy_from_slice(&self.read_sector(sector + index as u64)?);
+        }
+        Ok(())
+    }
+    /// Publish exactly once, before the first CMD24, even if a later sector or
+    /// verification fails. Never retry a failed write or silently keep online.
+    pub fn write_blocks_tracked(
+        &mut self,
+        sector: u64,
+        data: &[u8],
+        verify: bool,
+        published: &mut dyn FnMut(),
+    ) -> Result<(), Error> {
+        self.validate_blocks(sector, data.len())?;
+        let mut submitted = false;
+        for (index, bytes) in data.chunks_exact(512).enumerate() {
+            let block: &[u8; 512] = bytes.try_into().unwrap();
+            let address = sector + index as u64;
+            self.write_sector_tracked(address, block, || {
+                if !submitted {
+                    published();
+                    submitted = true;
+                }
+            })?;
+            if verify && self.read_sector(address)? != *block {
+                return self.finish(Err(Error::Protocol));
+            }
+        }
+        Ok(())
+    }
     pub fn is_online(&self) -> bool {
         self.online
     }
@@ -234,6 +309,7 @@ impl<R: Registers> Card<R> {
     }
     fn check_interrupts(&self) -> Result<u32, Error> {
         let status = self.registers.read(RINTSTS);
+        self.last_interrupt.set(status);
         if status & RESP_TIMEOUT != 0 {
             Err(Error::TimedOut)
         } else if status & ERRORS != 0 {
@@ -252,9 +328,12 @@ impl<R: Registers> Card<R> {
         self.wait_not_busy()?;
         self.registers.write(RINTSTS, u32::MAX);
         self.registers.write(CMDARG, argument);
+        self.last_command.set(index);
+        // Record submission before the MMIO store: a trap after publication
+        // must never make a possibly executed write look safe to retry.
+        published();
         self.registers
             .write(CMD, CMD_START | (1 << 13) | flags | u32::from(index));
-        published();
         self.wait(|| self.registers.read(RINTSTS) & (CMD_DONE | ERRORS) != 0)?;
         self.check_interrupts()?;
         self.registers.write(RINTSTS, CMD_DONE);
@@ -356,6 +435,10 @@ impl<R: Registers> Card<R> {
         Ok(())
     }
     fn ready_for_data(&self) -> Result<(), Error> {
+        self.ready_for_data_tracked(|| {})
+    }
+    fn ready_for_data_tracked(&self, published: impl FnOnce()) -> Result<(), Error> {
+        let mut published = Some(published);
         let start = (self.time)();
         let mut attempts = 10_000usize;
         loop {
@@ -363,7 +446,11 @@ impl<R: Registers> Card<R> {
                 return Err(Error::TimedOut);
             }
             attempts -= 1;
-            let r1 = self.command(13, u32::from(self.rca) << 16, RESP_SHORT | RESP_CRC, || {})?[0];
+            let r1 = self.command(13, u32::from(self.rca) << 16, RESP_SHORT | RESP_CRC, || {
+                if let Some(publish) = published.take() {
+                    publish();
+                }
+            })?[0];
             if r1 & (1 << 8) != 0 && (r1 >> 9) & 15 == 4 {
                 return Ok(());
             }
@@ -373,10 +460,16 @@ impl<R: Registers> Card<R> {
         }
     }
     pub fn flush(&mut self) -> Result<(), Error> {
+        self.flush_tracked(|| {})
+    }
+    /// Track the first CMD13 submission, matching the PIO block HAL contract.
+    pub fn flush_tracked(&mut self, published: impl FnOnce()) -> Result<(), Error> {
         if !self.online {
             return Err(Error::Offline);
         }
-        let result = self.wait_not_busy().and_then(|_| self.ready_for_data());
+        let result = self
+            .wait_not_busy()
+            .and_then(|_| self.ready_for_data_tracked(published));
         self.finish(result)
     }
 }
@@ -389,26 +482,35 @@ mod tests {
         cell::{Cell, RefCell},
         sync::atomic::{AtomicU64, Ordering},
     };
-    use std::vec::Vec;
+    use std::{rc::Rc, vec::Vec};
     static TIME: AtomicU64 = AtomicU64::new(0);
     fn time() -> u64 {
         TIME.fetch_add(1, Ordering::Relaxed)
     }
     struct Fake {
-        writes: RefCell<Vec<(usize, u32)>>,
+        writes: Rc<RefCell<Vec<(usize, u32)>>>,
         interrupt: Cell<u32>,
         fail: bool,
+        fail_write_number: Cell<usize>,
+        write_commands: Cell<usize>,
+        busy: Cell<bool>,
+        not_ready_polls: Cell<usize>,
         command: Cell<u8>,
     }
     impl Registers for Fake {
         fn read(&self, offset: usize) -> u32 {
             match offset {
+                STATUS if self.busy.get() => DATA_BUSY,
                 RINTSTS => self.interrupt.get(),
                 RESP0 => match self.command.get() {
                     8 => 0x1aa,
                     41 => 0xc0ff8000,
                     3 => 0x10000,
                     9 => 0,
+                    13 if self.not_ready_polls.get() != 0 => {
+                        self.not_ready_polls.set(self.not_ready_polls.get() - 1);
+                        0xe00 // programming state, not ready for data
+                    }
                     _ => 0x900,
                 },
                 0x3c if self.command.get() == 9 => 0x40000000,
@@ -423,20 +525,32 @@ mod tests {
             }
             if offset == CMD {
                 self.command.set((value & 63) as u8);
-                self.interrupt.set(if self.fail {
-                    RESP_TIMEOUT
-                } else {
-                    CMD_DONE | DATA_OVER
-                });
+                if value & 63 == 24 {
+                    self.write_commands.set(self.write_commands.get() + 1);
+                }
+                self.interrupt.set(
+                    if self.fail
+                        || (value & 63 == 24
+                            && self.fail_write_number.get() == self.write_commands.get())
+                    {
+                        RESP_TIMEOUT
+                    } else {
+                        CMD_DONE | DATA_OVER
+                    },
+                );
             }
         }
     }
     fn card(fail: bool) -> Card<Fake> {
         Card {
             registers: Fake {
-                writes: RefCell::new(Vec::new()),
+                writes: Rc::new(RefCell::new(Vec::new())),
                 interrupt: Cell::new(0),
                 fail,
+                fail_write_number: Cell::new(usize::MAX),
+                write_commands: Cell::new(0),
+                busy: Cell::new(false),
+                not_ready_polls: Cell::new(0),
                 command: Cell::new(0),
             },
             description: Description {
@@ -455,6 +569,8 @@ mod tests {
                 high_capacity: true,
             },
             online: true,
+            last_command: Cell::new(0),
+            last_interrupt: Cell::new(0),
         }
     }
     #[test]
@@ -529,5 +645,157 @@ mod tests {
             128
         );
         assert!(writes.iter().any(|&(o, v)| o == CMD && v & 63 == 13));
+    }
+    #[test]
+    fn tracked_submission_runs_before_the_command_register_store() {
+        let mut c = card(false);
+        let writes = c.registers.writes.clone();
+        c.write_sector_tracked(0, &[0; 512], || {
+            assert!(!writes
+                .borrow()
+                .iter()
+                .any(|&(o, v)| o == CMD && v & 63 == 24));
+        })
+        .unwrap();
+        assert!(writes
+            .borrow()
+            .iter()
+            .any(|&(o, v)| o == CMD && v & 63 == 24));
+    }
+    #[test]
+    fn batch_validates_whole_range_and_address_encoding_before_io() {
+        for (sector, bytes) in [
+            (15, 1024),
+            (u64::MAX, 512),
+            (0, 0),
+            (0, 513),
+            (0, 257 * 512),
+        ] {
+            let mut c = card(false);
+            let published = Cell::new(0);
+            assert_eq!(
+                c.write_blocks_tracked(sector, &std::vec![0;bytes], false, &mut || published
+                    .set(1)),
+                Err(Error::OutOfRange)
+            );
+            assert_eq!(published.get(), 0);
+            assert!(c.registers.writes.borrow().is_empty());
+            assert!(c.is_online());
+        }
+        let mut c = card(false);
+        c.info.capacity_sectors = u64::MAX;
+        assert_eq!(
+            c.write_blocks_tracked(u32::MAX as u64, &[0; 1024], false, &mut || panic!(
+                "published"
+            )),
+            Err(Error::OutOfRange)
+        );
+        assert!(c.registers.writes.borrow().is_empty());
+        let mut output = [0; 1024];
+        let mut c = card(false);
+        assert_eq!(c.read_blocks(15, &mut output), Err(Error::OutOfRange));
+        assert!(c.registers.writes.borrow().is_empty());
+    }
+    #[test]
+    fn batch_tracks_once_and_verifies_each_sector() {
+        let mut c = card(false);
+        let mut data = [0; 1024];
+        for word in data.chunks_exact_mut(4) {
+            word.copy_from_slice(&[1, 2, 3, 4]);
+        }
+        let mut published = 0;
+        c.write_blocks_tracked(14, &data, true, &mut || published += 1)
+            .unwrap();
+        assert_eq!(published, 1);
+        let commands: Vec<_> = c
+            .registers
+            .writes
+            .borrow()
+            .iter()
+            .filter(|&&(o, _)| o == CMD)
+            .map(|&(_, v)| v & 63)
+            .collect();
+        assert_eq!(commands, [24, 13, 17, 24, 13, 17]);
+        let mut output = [0; 1024];
+        c.read_blocks(14, &mut output).unwrap();
+        assert_eq!(output, data);
+    }
+    #[test]
+    fn mid_batch_failure_is_not_retried_and_retains_submission() {
+        let mut c = card(false);
+        c.registers.fail_write_number.set(2);
+        let mut published = 0;
+        assert_eq!(
+            c.write_blocks_tracked(0, &[0; 1536], false, &mut || published += 1),
+            Err(Error::TimedOut)
+        );
+        assert_eq!(published, 1);
+        assert_eq!(c.registers.write_commands.get(), 2);
+        assert!(!c.is_online());
+        let diagnostic = c.diagnostics();
+        assert_eq!(diagnostic.command, 24);
+        assert_eq!(diagnostic.interrupt_status, RESP_TIMEOUT);
+        assert_eq!(
+            c.write_blocks_tracked(0, &[0; 512], false, &mut || panic!("retry")),
+            Err(Error::Offline)
+        );
+    }
+    #[test]
+    fn verification_mismatch_quarantines_card_without_retry() {
+        let mut c = card(false);
+        let mut published = 0;
+        assert_eq!(
+            c.write_blocks_tracked(0, &[0; 1024], true, &mut || published += 1),
+            Err(Error::Protocol)
+        );
+        assert_eq!(published, 1);
+        assert_eq!(c.registers.write_commands.get(), 1);
+        assert!(!c.is_online());
+    }
+    #[test]
+    fn busy_failure_before_publication_is_not_reported_as_submitted() {
+        let mut c = card(false);
+        c.registers.busy.set(true);
+        assert_eq!(
+            c.write_blocks_tracked(0, &[0; 512], false, &mut || panic!("not submitted")),
+            Err(Error::TimedOut)
+        );
+        assert!(c.registers.writes.borrow().is_empty());
+        assert!(!c.is_online());
+    }
+    #[test]
+    fn flush_tracks_before_first_status_command_and_failure_stays_offline() {
+        let mut c = card(true);
+        let writes = c.registers.writes.clone();
+        let mut published = 0;
+        assert_eq!(
+            c.flush_tracked(|| {
+                assert!(!writes.borrow().iter().any(|&(o, _)| o == CMD));
+                published += 1;
+            }),
+            Err(Error::TimedOut)
+        );
+        assert_eq!(published, 1);
+        assert_eq!(c.diagnostics().command, 13);
+        assert!(!c.is_online());
+        assert_eq!(c.flush_tracked(|| panic!("offline")), Err(Error::Offline));
+    }
+    #[test]
+    fn flush_waits_for_transfer_state_without_republishing() {
+        let mut c = card(false);
+        c.registers.not_ready_polls.set(2);
+        let mut published = 0;
+        c.flush_tracked(|| published += 1).unwrap();
+        assert_eq!(published, 1);
+        assert!(c.is_online());
+        let commands: Vec<_> = c
+            .registers
+            .writes
+            .borrow()
+            .iter()
+            .filter(|&&(o, _)| o == CMD)
+            .map(|&(_, v)| v & 63)
+            .collect();
+        assert_eq!(commands, [13, 13, 13]);
     }
 }

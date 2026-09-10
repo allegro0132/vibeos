@@ -1,0 +1,52 @@
+{
+  "status": "DW-MSHC PIO batch and mutation-tracking contract verified in software; Mars integration incomplete",
+  "driver_model_tests": 14,
+  "sd_protocol_tests": 2,
+  "rv64_compile_check": "passed",
+  "mutations": [
+    "Late submission callback detected",
+    "First-sector-only validation detected",
+    "Ignored verification mismatch detected"
+  ],
+  "qemu_regression": {
+    "block_recovery": "passed",
+    "scope": "VirtIO and shared kernel recovery policy; does not execute DW-MSHC"
+  },
+  "logs": [
+    {
+      "path": "target/mars-reference/stage19-driver-tests.log",
+      "sha256": "ae7232f414e4ce3b6a09a40cd2d6c0e62fc0eefd455d977e5a423d9560be053c"
+    },
+    {
+      "path": "target/mars-reference/stage19-rv64-check.log",
+      "sha256": "6b276dd1d7f957270e9703c050282b6f168845d7cc31f24a03b7e312b6a3e336"
+    },
+    {
+      "path": "target/mars-reference/stage19-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage19-mutation-late-publication.log",
+      "sha256": "23260f876603eb2b47a3463ed6b6f756920eac5f29dda5dd1a5aea1076175dd8"
+    },
+    {
+      "path": "target/mars-reference/stage19-mutation-partial-validation.log",
+      "sha256": "81313235fb6c72da6e79871d6d114a0924656d71edec5679b2a1b95ae8f35e02"
+    },
+    {
+      "path": "target/mars-reference/stage19-mutation-ignore-readback.log",
+      "sha256": "7f97eb1e6b48d1b80ac2d8b5b556d4290afaafcf13d258b9cac2048581767659"
+    },
+    {
+      "path": "target/mars-reference/stage19-block-recovery.log",
+      "sha256": "fc5af6cc144f8c719ea47e6169ffc7f0579f272c1b1a8430589c675a984f8b33"
+    }
+  ],
+  "hardware_acceptance": "not run",
+  "remaining": [
+    "JH7110 SD clocks, resets and pin configuration",
+    "Mars firmware registration and data-partition provisioning",
+    "Real SD timeout/reset, boundary IO and reboot durability tests",
+    "EQoS, boot firmware, flashable image and full physical acceptance"
+  ]
+}

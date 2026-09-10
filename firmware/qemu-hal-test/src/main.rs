@@ -20,6 +20,8 @@ unsafe fn platform_init(_write: fn(&str)) {}
 mod boot_admission;
 #[cfg(feature = "eqos-model-test")]
 mod eqos_model;
+#[cfg(feature = "eqos-model-test")]
+mod eqos_ring_model;
 #[cfg(feature = "jh7110-sd-model-test")]
 mod jh7110_sd_model;
 #[cfg(feature = "mars-composition-test")]
@@ -28,6 +30,8 @@ unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
     #[cfg(feature = "eqos-model-test")]
     {
         eqos_model::run();
+        eqos_ring_model::run();
+        _print(format_args!("EQOS_RING_MODEL PASS tx=bounded rx=copied recovery=quarantined\n"));
         _print(format_args!(
             "EQOS_MODEL PASS mdio=clause22 descriptors=bounded\n"
         ));

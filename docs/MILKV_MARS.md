@@ -809,3 +809,30 @@ reclamation, reset/quarantine behavior, JH7110 clocks/pins/cache maintenance,
 PHY/RGMII setup, resource admission and the firmware packet instance remain
 to be implemented and qualified. The stage-25 SD image continues to identify
 itself as serial/SD-only; no unqualified SSH or entropy provider is enabled.
+
+### EQoS ring ownership and recovery
+
+The EQoS driver now implements a serialized TX/RX ring state machine with four
+separately validated DMA spans, fixed 64-byte descriptor isolation and 1536-byte
+buffers. TX preserves a spare slot, reaps in FIFO order, synchronizes packet
+and descriptor data, publishes OWN last, and only then advances the tail. RX
+uses the driver's private buffer map, copies a validated frame without FCS,
+and returns the slot to DMA; malformed frames and undersized destinations are
+dropped without copying. Processing loops are bounded by the ring count.
+
+Start/stop failures, TX descriptor errors and explicit timeout faults quarantine
+the ring. A successful reset must prove hardware quiescent before descriptors
+or buffers are initialized again. Abandoned TX packets are not retried. The
+backend/pool has permanent storage and remains exclusively borrowed; dropping
+the ring does not free DMA storage. Arithmetic validation is supplemented by
+the backend's required admission against the actual dedicated pool.
+
+Ten ring host tests plus the existing 22 Ethernet tests pass. The RV64 model
+reports `EQOS_RING_MODEL PASS`, followed by 395 kernel selftests. Mutations
+skipping reset, omitting OWN publication and filling the reserved TX slot are
+detected. Evidence is in `boards/milkv-mars/eqos-ring-evidence.json`.
+
+The concrete MMIO/cache backend, JH7110 platform/PHY preparation and firmware
+packet instance are still pending. Neither host traces nor the RV64 DMA model
+proves actual DMA ordering, cache maintenance, network connectivity or shutdown
+on Mars. The test SD image remains serial/SD-only.

@@ -1,0 +1,71 @@
+{
+  "status": "Serialized EQoS DMA ring lifecycle implemented and model-tested; concrete Mars backend pending",
+  "host_tests": 32,
+  "ring_host_tests": 10,
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 0,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 122019840,
+    "kernel_sha256": "5fb90fb9fc70e905aa26bd903da9658fc01c16c0861cdd1ba767593cdd80754c",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "rv64_marker": "EQOS_RING_MODEL PASS tx=bounded rx=copied recovery=quarantined",
+  "mutations": [
+    "Reset proof bypassed: detected",
+    "OWN publication omitted: detected",
+    "Reserved TX slot consumed: detected"
+  ],
+  "source_reference": "boards/milkv-mars/eqos-reference.json",
+  "logs": [
+    {
+      "path": "target/mars-reference/stage27-host-restored.log",
+      "sha256": "bb892b6b73980dd2e2fa452fd1caf328e7393dbcdc5ab6f7826f2a7511d0d942"
+    },
+    {
+      "path": "target/mars-reference/stage27-rv64-build.log",
+      "sha256": "234167fb4457b1b22fb2d1516ff1c07dc2d9c704f304949af41cb91315c2bd5b"
+    },
+    {
+      "path": "target/mars-reference/stage27-rv64-model/serial.log",
+      "sha256": "c29c7a8c3cfd499740399a0c8115bce9434f1c303dce562e0b1dd4c6d533f236"
+    },
+    {
+      "path": "target/mars-reference/stage27-rv64-model/summary.json",
+      "sha256": "d077695a59b7784c1499ce358dff5f43086b160e773bbd7aa597da316480b294"
+    },
+    {
+      "path": "target/mars-reference/stage27-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage27-mutation-reset.log",
+      "sha256": "a437895d04226e32bdbb2769652d591df4a6d465822256341ee5f2dce0a45d60"
+    },
+    {
+      "path": "target/mars-reference/stage27-mutation-own.log",
+      "sha256": "6a2d3a0406f480a57a34864b1bdc9346ce524c8a9e04a3b22c7970facd1f3ce0"
+    },
+    {
+      "path": "target/mars-reference/stage27-mutation-full.log",
+      "sha256": "e474aefc43023e66e908301bb6045b9a216755eb16eb8863a53001185ad22bd6"
+    }
+  ],
+  "physical_acceptance": false,
+  "remaining": [
+    "Concrete EQoS register backend and bounded controller reset/quiescence proof",
+    "JH7110 clock/PHY/pinmux/cache preparation and dedicated DMA pool",
+    "Mars firmware packet-device composition and DTB GMAC admission",
+    "DHCP, link recovery, qualified entropy, SSH/WASM and physical stability acceptance"
+  ],
+  "blind_spots": [
+    "Models do not execute actual MMIO/cache/DMA",
+    "Backend must enforce pool admission and exclusive permanent ownership",
+    "Hardware reset/stop completion is represented by a model boolean, not qualified on Mars"
+  ]
+}

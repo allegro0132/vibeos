@@ -31,6 +31,7 @@ unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
     {
         eqos_model::run();
         eqos_ring_model::run();
+        _print(format_args!("EQOS_CONTROLLER_MODEL PASS registers=configured reset=bounded\n"));
         _print(format_args!("EQOS_RING_MODEL PASS tx=bounded rx=copied recovery=quarantined\n"));
         _print(format_args!(
             "EQOS_MODEL PASS mdio=clause22 descriptors=bounded\n"

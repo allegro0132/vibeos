@@ -1,16 +1,39 @@
 //! RV64 ring model: atomics emulate DMA completion; no actual MMIO/cache work.
 use core::{
     cell::UnsafeCell,
+    mem::MaybeUninit,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
+};
+use vibeos_eqos_net::{
+    controller::{Config, Controller, Io, Speed},
+    mdio::Registers,
 };
 use vibeos_eqos_net::{descriptor::OWN, ring::*};
 static TX: AtomicU32 = AtomicU32::new(0);
 static RX: AtomicU32 = AtomicU32::new(0);
 static RESET: AtomicBool = AtomicBool::new(true);
-struct Model;
-struct Storage(UnsafeCell<Model>);
+struct RegisterModel([u32; 0x1164 / 4]);
+impl Registers for RegisterModel {
+    fn read(&mut self, a: usize) -> u32 {
+        self.0[a / 4]
+    }
+    fn write(&mut self, a: usize, v: u32) {
+        self.0[a / 4] = if a == 0x1000 && RESET.load(Ordering::Acquire) {
+            0
+        } else {
+            v
+        };
+    }
+}
+unsafe impl Io for RegisterModel {
+    fn ticks(&mut self) -> u64 {
+        0
+    }
+}
+struct Model(Controller<RegisterModel>);
+struct Storage(UnsafeCell<MaybeUninit<Model>>);
 unsafe impl Sync for Storage {}
-static STORAGE: Storage = Storage(UnsafeCell::new(Model));
+static STORAGE: Storage = Storage(UnsafeCell::new(MaybeUninit::uninit()));
 const L: Layout = Layout {
     tx_descriptors: 0x42000000,
     rx_descriptors: 0x42001000,
@@ -21,17 +44,17 @@ const L: Layout = Layout {
 };
 unsafe impl Backend for Model {
     fn reset(&mut self) -> bool {
-        RESET.load(Ordering::Acquire)
+        self.0.reset().is_ok()
     }
     fn configure(&mut self, l: Layout) -> bool {
         assert_eq!(l, L);
-        true
+        self.0.configure(l).is_ok()
     }
     fn start(&mut self) -> bool {
-        true
+        self.0.start().is_ok()
     }
     fn stop(&mut self) -> bool {
-        false
+        self.0.stop().is_ok()
     }
     fn read_word(&mut self, a: u64, w: usize) -> u32 {
         assert_eq!(w, 3);
@@ -67,13 +90,28 @@ unsafe impl Backend for Model {
         assert_eq!(n % 64, 0);
     }
     fn barrier(&mut self) {}
-    fn tail(&mut self, _: bool, a: u64) {
-        assert_eq!(a % 64, 0);
+    fn tail(&mut self, rx: bool, a: u64) {
+        self.0.tail(rx, a).unwrap();
     }
 }
 /// Invoked once by the boot hart; static model storage is never reused.
 pub unsafe fn run() {
-    let mut r = Ring::new(&mut *STORAGE.0.get(), L).unwrap();
+    let mut registers = RegisterModel([0; 0x1164 / 4]);
+    registers.0[0x120 / 4] = 5 << 6 | 5;
+    let controller = Controller::new(
+        registers,
+        Config {
+            mac: [2, 3, 4, 5, 6, 7],
+            speed: Speed::Mbps1000,
+            full_duplex: true,
+            csr_hz: 125_000_000,
+            timebase_hz: 4_000_000,
+            max_polls: 4,
+        },
+    )
+    .unwrap();
+    (*STORAGE.0.get()).write(Model(controller));
+    let mut r = Ring::new((*STORAGE.0.get()).assume_init_mut(), L).unwrap();
     r.initialize().unwrap();
     r.transmit(&[0; 60]).unwrap();
     assert_ne!(TX.load(Ordering::Acquire) & OWN, 0);
@@ -86,6 +124,7 @@ pub unsafe fn run() {
     assert_eq!(&p[..60], &[0x5a; 60]);
     assert_eq!(&p[60..], &[0; 4]);
     assert_eq!(RX.load(Ordering::Acquire), OWN | (1 << 24));
+    RESET.store(false, Ordering::Release);
     assert!(!r.shutdown());
     assert!(r.quarantined());
     RESET.store(false, Ordering::Release);

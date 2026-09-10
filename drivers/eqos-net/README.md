@@ -2,7 +2,7 @@
 
 This `no_std` crate provides GMAC4/5 Clause 22 command encoding and basic DMA
 descriptor codecs and a serialized ring state machine. It is not yet a complete
-packet device: the concrete controller/cache backend remains outstanding. It depends only on
+packet device: JH7110 DMA memory/cache and platform integration remain outstanding. It depends only on
 the shared `vibeos-ethernet` protocol crate; it does not import a BSP or kernel.
 The separate Duo DWMAC driver also uses the shared transaction/status code.
 
@@ -59,4 +59,30 @@ Ten host ring tests cover literal ordering traces, both circular indices,
 backpressure, RX copy bounds, private buffer addresses, layout rejection and
 failed reset/stop. The RV64 model additionally runs TX completion, RX copy/rearm
 and quarantine/reset transitions. Real controller MMIO, DMA visibility and
-reset completion remain to be implemented and tested on Mars.
+reset completion remain to be qualified on Mars.
+
+The `controller` module now programs actual GMAC4/5 registers through ordered
+MMIO (or a register model). Configuration validates MAC address, CSR/timebase
+rates, FIFO geometry, descriptor layout and tail ranges. It uses one DCB RX/TX
+queue, store-and-forward, eight-beat bursts without PBLx8, 32-bit DMA with zero
+upper descriptor addresses, and no promiscuous mode or unnegotiated pause.
+RX FCS retention and disabled checksum/TSO match the descriptor codecs. MAC
+speed/duplex are explicit inputs from future PHY negotiation, not assumptions
+about an attached link.
+
+Reset disables IRQ/MAC/DMA enables, writes SWR once and waits for completion
+using a 100 ms counter deadline rounded up to a tick, plus a finite poll cap
+for stalled counters. It then checks disabled channel/MAC readback. Start also
+checks enable readback. Stop uses that reset handshake to discard old work;
+it does not promise TX delivery or infer quiescence solely from FIFO emptiness.
+Hardware qualification must establish that the SoC's reset completion covers
+outstanding DMA transactions. Clock-gated/hung MMIO itself cannot be made safe
+by a software loop bound, so the platform must prepare live resources first.
+
+`backend::Backend` joins this register engine with a permanently borrowed unsafe
+`Memory` provider. The provider must admit the actual dedicated pool before any
+DMA addresses are programmed and implement cache/volatile/copy operations. The
+register adapter supplies standard RISC-V IO fences, never T-Head instructions.
+No JH7110 cache implementation is supplied yet. Host integration tests and the
+RV64 ring model run this register engine through successful initialization and
+reset-failure recovery; neither emulates the physical interconnect or PHY.

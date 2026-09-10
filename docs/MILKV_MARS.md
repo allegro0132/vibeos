@@ -836,3 +836,31 @@ The concrete MMIO/cache backend, JH7110 platform/PHY preparation and firmware
 packet instance are still pending. Neither host traces nor the RV64 DMA model
 proves actual DMA ordering, cache maintenance, network connectivity or shutdown
 on Mars. The test SD image remains serial/SD-only.
+
+### EQoS register controller and ring adapter
+
+The driver now has an ordered MMIO register implementation and a single-queue
+GMAC4/5 controller. Configuration validates actual FIFO size encodings, programs
+MAC speed/duplex, store-and-forward queues, conservative DMA bursts, descriptor
+bases/lengths and DSL, and retains FCS to match the RX codec. It keeps checksum,
+TSO, extended DMA addressing, promiscuous filtering and unnegotiated pause off.
+The polled frontend does not enable DMA interrupts.
+
+Reset uses one SWR publication, a counter deadline plus a finite poll cap, and
+disabled channel/MAC readback. Stop follows the same reset handshake so old
+packets are abandoned rather than retried. Reset/start readback failures keep
+the ring quarantined. `backend::Backend` connects the controller to the ring
+and a separately admitted permanent DMA memory provider. Actual memory/cache
+implementation remains a platform responsibility.
+
+Twelve controller/adapter/MMIO host tests plus the prior 32 Ethernet tests pass.
+The RV64 ring model now executes this controller's configuration and failed
+reset path, reports `EQOS_CONTROLLER_MODEL PASS`, and runs 395 kernel selftests.
+Mutations skipping reset completion, changing TX descriptor base, enabling FCS
+stripping and bypassing pool admission are detected. Evidence is recorded in
+`boards/milkv-mars/eqos-controller-evidence.json`.
+
+These checks do not qualify JH7110 bus-reset completion, cache visibility or
+physical link behavior. The next required integration is the SoC's clock/reset,
+PHY/pinmux and DMA/cache provider, followed by firmware registration and physical
+network/SSH acceptance. The SD image is still the serial/SD bring-up profile.

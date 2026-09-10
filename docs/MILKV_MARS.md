@@ -1069,3 +1069,20 @@ directory holds its manifest, checksums, tool versions and component files.
 No physical SD card was written and no SPI change was made. This is a DHCP/iperf3
 bring-up image, with SSH disabled. Real cold boots, persistence, link recovery,
 multicore cache/DMA, entropy and SSH/WASM stability remain unqualified.
+
+### Passive serial acceptance collector
+
+`scripts/mars-serial-accept.py` requires an explicit serial port, operator-reported
+board revision and new evidence directory. It preserves raw bytes and a hash,
+checks ordered Mars boot/four-hart/Sv39 markers, and waits the whole requested
+interval so a late panic cannot be hidden by early boot success. Reboots,
+truncated markers, interrupted captures and size limits cannot pass. It does
+not send commands, select an SD device, verify a power cycle or grant physical
+acceptance based on strings. See the bootchain README for its invocation.
+
+Eleven tests include actual host PTYs for fragmented reads, no transmitted
+bytes, TTY restoration, late panic, empty input, interruption and byte limits.
+Mutations disabling late-panic rejection, repeated-boot detection or capture
+failure status are detected. These are host capture-tool tests, not new kernel
+or Mars runs. `boards/milkv-mars/serial-collector-evidence.json` records results;
+all physical acceptance and stability gates remain outstanding.

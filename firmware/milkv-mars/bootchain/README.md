@@ -78,6 +78,39 @@ payload placement, actual SBI extension symbols, U-Boot options, FIT addresses
 and extracted payload hashes. Mutation tests corrupt each important boundary.
 These do not execute Mars ROM, DDR, MMIO, cache operations or firmware handoff.
 
+## Passive serial evidence capture
+
+Use a separate terminal for each planned cold boot, with the actual port and
+operator-checked board revision supplied explicitly:
+
+```sh
+python3 scripts/mars-serial-accept.py \
+  --port ACTUAL_SERIAL_PORT --board-revision ACTUAL_BOARD_REVISION \
+  --output target/mars-acceptance/boot-1 --seconds 120
+```
+
+Close other serial clients first. Start this command before powering the board.
+Wait for `target/mars-acceptance/boot-1/ready.json` to appear while the command is
+still running, then perform the cold boot. The script opens the port read-only,
+configures 115200 8N1, discards preexisting input, and sends no commands or reset
+signals intentionally. USB serial hardware may change modem lines on open;
+connect only RX/TX/GND and perform the physical power cycle yourself.
+
+The script captures the complete requested interval and restores TTY settings.
+It saves raw `serial.log`, its SHA-256 and `summary.json`; it refuses any existing
+output directory. Repeat with new `boot-2` and `boot-3` directories. Exit 0 means
+exactly one ordered set of Mars entry, page-table, Sv39, platform, four-hart
+admission, four-core online and `0xf` MMU-mask lines was observed, without a
+failure diagnostic during that interval. An interrupted capture, byte limit,
+disconnect, partial boot or repeated boot cannot pass.
+
+This cannot verify that a power cycle actually occurred or that the connected
+endpoint is physical Mars hardware. `physical_acceptance` and
+`cold_boot_verified` remain false. Record the physical power-cycle procedure,
+selected SD image hash and board revision separately; review the full boot chain
+and complete the storage, network, entropy, SSH/WASM and stability gates before
+claiming the full plan passed. The same output cannot be counted three times.
+
 The source reference is the [fixed official SDK](https://github.com/milkv-mars/mars-buildroot-sdk/tree/1fd6bac9f2efde47fbb8afd28d2903c49f893e3f).
 U-Boot and the SPL tool retain their upstream GPL licensing; OpenSBI retains its
 upstream BSD licensing. Exact sources and configuration changes are available

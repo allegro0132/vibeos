@@ -31,6 +31,7 @@ fn pinned_wiring_is_admitted_without_inventing_phy_address_or_coherence() {
     assert_eq!(r.mac, mars::GMAC0_REGISTERS);
     assert_eq!(r.irq, 7);
     assert_eq!(r.cache, mars::L2_CACHE);
+    assert_eq!(r.aon_pins, mars::AON_PINCTRL);
     assert_eq!(r.aon_crg.end, r.aon_syscon.start);
     assert_eq!(r.phy.drive, [0, 3, 6]);
     assert!(!r.phy.rxc_delay_enabled);
@@ -43,6 +44,8 @@ fn pinned_wiring_is_admitted_without_inventing_phy_address_or_coherence() {
 fn rejects_provider_substitution_indices_and_cache_geometry() {
     for (node, key, at, value) in [
         ("ethernet@16030000", "reg", 1, 0x16040000),
+        ("gpio@17020000", "reg", 1, 0x17030000),
+        ("gpio@17020000", "resets", 1, 163),
         ("spare-serial@10010000", "reg", 1, 0x16030000),
         ("ethernet@16030000", "reg", 3, 0x1000),
         ("ethernet@16030000", "interrupts", 0, 78),

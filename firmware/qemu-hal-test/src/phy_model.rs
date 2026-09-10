@@ -47,7 +47,7 @@ impl Registers for Model {
             return;
         }
         assert_eq!(offset, 0x200);
-        assert_eq!((value >> 8) & 15, 1); // actual 125 MHz CSR selects divisor 62
+        assert_eq!((value >> 8) & 15, 4); // actual 198 MHz CSR selects divisor 102
         assert_eq!(value & 1, 1);
         let phy = (value >> 21) & 31;
         let reg = ((value >> 16) & 31) as usize;
@@ -75,7 +75,7 @@ impl Registers for Model {
         }
     }
 }
-pub fn run() {
+pub fn run(csr_hz: u64) {
     let tuning = Tuning {
         drive: [0, 3, 6],
         rxc_delay_enabled: false,
@@ -85,7 +85,7 @@ pub fn run() {
         tx_inverted: [true; 3],
     };
     let mut phy =
-        Yt8531::probe(Port::new(Model::new(), 125_000_000).unwrap(), u32::MAX, 4).unwrap();
+        Yt8531::probe(Port::new(Model::new(), csr_hz).unwrap(), u32::MAX, 4).unwrap();
     assert_eq!(phy.identity().address, 17);
     assert_eq!(phy.poll_link(), Err(Error::NotReady));
     phy.initialize(tuning, 3).unwrap();
@@ -97,7 +97,7 @@ pub fn run() {
     assert_eq!(model.registers[4], 0x0141);
     assert_eq!(model.registers[9], 0x0200);
     model.reset_stuck = true;
-    let mut phy = Yt8531::probe(Port::new(model, 125_000_000).unwrap(), u32::MAX, 4).unwrap();
+    let mut phy = Yt8531::probe(Port::new(model, csr_hz).unwrap(), u32::MAX, 4).unwrap();
     assert_eq!(phy.initialize(tuning, 3), Err(Error::ResetTimedOut));
     assert_eq!(phy.poll_link(), Err(Error::NotReady));
 }

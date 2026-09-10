@@ -4,6 +4,11 @@
  phandle = <200>; #clock-cells = <1>; reg-names = "sys", "stg", "aon";
 };
 &{/soc} {
+ gpio@17020000 {
+  compatible = "starfive,jh7110-aon-pinctrl";
+  reg = <0 0x17020000 0 0x10000>; reg-names = "control";
+  resets = <201 162>; ngpios = <4>; status = "okay";
+ };
  reset-controller {
   phandle = <201>; compatible = "starfive,jh7110-reset"; #reset-cells = <1>;
   reg = <0 0x13020000 0 0x10000>, <0 0x10230000 0 0x10000>,

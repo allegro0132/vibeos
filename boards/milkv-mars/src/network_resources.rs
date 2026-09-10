@@ -14,6 +14,7 @@ pub struct Resources {
     pub sys_crg: AddressRange,
     pub aon_crg: AddressRange,
     pub aon_syscon: AddressRange,
+    pub aon_pins: AddressRange,
     pub phy: PhyTuning,
 }
 
@@ -152,6 +153,14 @@ pub fn admit(dtb: &[u8]) -> Result<Resources, Error> {
     };
     super::resources::unique_handles(&tree, [clock, reset])?;
     {
+        let n = node(&tree, &["soc", "gpio@17020000"])?;
+        n.strings("compatible", b"starfive,jh7110-aon-pinctrl\0")?;
+        n.strings("reg-names", b"control\0")?;
+        n.cells("reg", &[0, 0x17020000, 0, 0x10000])?;
+        n.cells("resets", &[reset, 162])?;
+        n.cells("ngpios", &[4])?;
+    }
+    {
         let n = node(&tree, &["soc", "aon_syscon@17010000"])?;
         n.strings("compatible", b"syscon\0")?;
         n.cells("reg", &[0, 0x17010000, 0, 0x1000])?;
@@ -252,6 +261,7 @@ pub fn admit(dtb: &[u8]) -> Result<Resources, Error> {
                             (0x16030000, "ethernet@16030000"),
                             (0x2010000, "cache-controller@2010000"),
                             (0x17010000, "aon_syscon@17010000"),
+                            (0x17020000, "gpio@17020000"),
                         ] {
                             check(address != base || device_name == expected)?;
                         }
@@ -271,6 +281,7 @@ pub fn admit(dtb: &[u8]) -> Result<Resources, Error> {
         sys_crg: super::SYS_CRG,
         aon_crg: super::AON_CRG,
         aon_syscon: super::AON_SYSCON,
+        aon_pins: super::AON_PINCTRL,
         phy,
     })
 }

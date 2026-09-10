@@ -950,3 +950,33 @@ failing to quarantine are detected. Sources and evidence are in
 Actual PHY identity, electrical timing and Ethernet clock/reset programming are
 not qualified by these models. Mars firmware device registration and network,
 SSH/entropy and physical acceptance still remain; the SD image is unchanged.
+
+### JH7110 GMAC0 clocks, reset and pads
+
+The platform module now prepares GMAC0 using actual integer PLL and bus-divider
+readback. It derives the CSR clock from STG_AXI/AHB separately from GTX, sets an
+exact 125 MHz GTX rate through the local divider, and leaves shared PLLs and bus
+dividers unchanged. The Mars external RGMII TX parent is corroborated by the
+upstream v6.12 Mars DTS; it follows the PHY's negotiated speed without changing
+shared clocks. The pinned vendor SDK remains the register/reset/pad reference.
+
+Preparation requires boot firmware to have released the shared AON pin block.
+It asserts the two MAC resets, checks acknowledgment, programs the MAC-owned
+clocks/RGMII selection and board-supplied TX drive, then releases reset with a
+bounded acknowledgment wait. Masked configuration writes require readback.
+Failures request reset and disable TX clocks; this cleanup is explicitly not
+DMA quiescence proof and cannot permit memory reuse. Existing MAC/DMA must have
+been stopped before preparation. The BSP now admits/maps the AON pin aperture.
+
+Eight platform tests plus the prior BSP/cache/SD tests pass (42 total). The RV64
+model passes its decoded 198 MHz CSR rate to the real EQoS MDIO/YT8531 frontend,
+checks reset failure, and reports `JH7110_ETHERNET_MODEL PASS` alongside 395
+kernel selftests. Mutations dropping reset acknowledgment, substituting GTX for
+CSR rate, broadening the pad mask, and omitting failure TX gating are detected.
+Sources and evidence are recorded in `boards/milkv-mars/ethernet-platform-reference.json`
+and `boards/milkv-mars/jh7110-ethernet-platform-evidence.json`.
+
+Actual clocks, reset synchronizers, pad electrical behavior and PHY/carrier are
+still unqualified. Production Mars packet-device assembly and physical network,
+SSH and stability acceptance remain required. The existing SD image remains
+the serial/SD bring-up profile.

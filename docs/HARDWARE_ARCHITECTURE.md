@@ -122,3 +122,11 @@ publication callbacks. Kernel partition admission uses the reusable HAL
 `BlockWindow`; card protocol probing lives in the SDHCI crate. This boundary
 is ready for a DW-MSHC provider without importing SDHCI types into the kernel.
 Asynchronous DMA backends still need their completion and ownership migration.
+
+The HAL entropy operation table separates asynchronous RNG hardware ownership
+from kernel request policy. Firmware retains the driver engine, DMA slab and
+hardware completion records; kernel requests use epoch/serial tokens. Read-only
+completion queries can cross scheduler awaits, while state mutation requires
+exclusive invocation ownership. The minimal IRQ acknowledgement callback never
+borrows firmware engine state. Confirmed reset remains the prerequisite for
+releasing the kernel's DMA claim; failed resets retain quarantine.

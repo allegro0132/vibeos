@@ -1134,6 +1134,8 @@ use vibeos_driver_virtio_mmio as virtio_mmio;
 #[cfg(feature = "qemu-virt")]
 mod virtio_net;
 #[cfg(feature = "qemu-virt")]
+mod entropy_device;
+#[cfg(feature = "qemu-virt")]
 mod virtio_rng;
 mod vsh_platform;
 mod world;

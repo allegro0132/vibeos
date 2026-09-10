@@ -188,3 +188,6 @@ vibeos-hal = { path = "../../hal" }
 vibeos-bsp-qemu-virt = { path = "../../boards/qemu-virt" }
 vibeos-driver-uart16550 = { path = "../../drivers/uart16550" }
 vibeos-driver-plic = { path = "../../drivers/plic" }
+
+vibeos-driver-virtio-rng = { path = "../../drivers/virtio-rng" }
+vibeos-driver-virtio-mmio = { path = "../../drivers/virtio-mmio" }

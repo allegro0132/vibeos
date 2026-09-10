@@ -1,0 +1,114 @@
+//! Statically composed asynchronous entropy source. Kernel policy owns claims,
+//! deadlines, interrupt delivery and quarantine after an unconfirmed reset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    InvalidLength,
+    Busy,
+    Protocol,
+    Unsupported,
+    DriverRestarted,
+    IdentityExhausted,
+    Quarantined,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Submission {
+    pub epoch: u64,
+    pub serial: u64,
+}
+pub const MAX_RANDOM_BYTES: usize = 64;
+/// # Safety
+/// Every operation except `acknowledge` requires exclusive ownership of the
+/// instance and its DMA pool. Completion reads may not race mutation. The IRQ
+/// acknowledgement callback must not borrow mutable instance state. Buffers
+/// are copied only at finish; no caller pointer may be published to hardware.
+/// A failed reset retains DMA ownership until a later confirmed reset.
+pub struct EntropyDevice {
+    pub dma_base: fn() -> usize,
+    pub dma_bytes: usize,
+    pub prepare: unsafe fn(usize, usize, u64, usize) -> Result<(), Error>,
+    pub start: unsafe fn() -> Result<(), Error>,
+    pub epoch: unsafe fn() -> u64,
+    pub accepted_features: unsafe fn() -> u64,
+    pub operational: unsafe fn() -> bool,
+    pub submit: unsafe fn(usize) -> Result<Submission, Error>,
+    pub completion: unsafe fn(Submission) -> bool,
+    pub finish: unsafe fn(Submission, &mut [u8]) -> Result<usize, Error>,
+    pub require_reset: unsafe fn(),
+    pub reset_and_prepare: unsafe fn(u64, usize) -> Result<(), Error>,
+    pub shutdown: unsafe fn(usize) -> Result<(), Error>,
+    pub confirmed_reset: unsafe fn(usize, usize, usize) -> bool,
+    pub acknowledge: unsafe fn(usize) -> u32,
+}
+extern "Rust" {
+    static VIBEOS_ENTROPY_DEVICE: EntropyDevice;
+}
+pub fn device() -> &'static EntropyDevice {
+    unsafe { &VIBEOS_ENTROPY_DEVICE }
+}
+
+/// Associates an opaque driver completion with a non-reused invocation token.
+/// Serial numbers survive controller resets, so a stale waiter cannot observe
+/// a new request after the hardware queue index wraps or is reset to zero.
+pub struct Pending<T: Copy> {
+    serial: u64,
+    active: Option<(Submission, T)>,
+}
+impl<T: Copy> Pending<T> {
+    pub const fn new() -> Self {
+        Self {
+            serial: 0,
+            active: None,
+        }
+    }
+    /// Reserve before publishing to hardware; rejected hardware submissions
+    /// may consume serial numbers but may never cause serial reuse.
+    pub fn reserve(&mut self, epoch: u64) -> Result<Submission, Error> {
+        if self.active.is_some() {
+            return Err(Error::Busy);
+        }
+        if epoch == 0 {
+            return Err(Error::IdentityExhausted);
+        }
+        self.serial = self.serial.checked_add(1).ok_or(Error::IdentityExhausted)?;
+        Ok(Submission {
+            epoch,
+            serial: self.serial,
+        })
+    }
+    pub fn publish(&mut self, token: Submission, value: T) {
+        assert!(self.active.is_none() && token.serial == self.serial);
+        self.active = Some((token, value));
+    }
+    pub fn get(&self, token: Submission) -> Option<T> {
+        self.active
+            .filter(|(current, _)| *current == token)
+            .map(|(_, value)| value)
+    }
+    pub fn clear(&mut self) {
+        self.active = None;
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn completion_tokens_reject_stale_epochs_and_survive_reset() {
+        let mut pending = Pending::new();
+        assert_eq!(pending.reserve(0), Err(Error::IdentityExhausted));
+        let first = pending.reserve(1).unwrap();
+        pending.publish(first, 42);
+        assert_eq!(pending.reserve(1), Err(Error::Busy));
+        assert_eq!(pending.get(first), Some(42));
+        assert_eq!(pending.get(Submission { epoch: 2, ..first }), None);
+        pending.clear();
+        assert_eq!(pending.get(first), None);
+        let next = pending.reserve(1).unwrap();
+        pending.publish(next, 43);
+        assert_ne!(first, next);
+        assert_eq!(pending.get(first), None);
+        assert_eq!(pending.get(next), Some(43));
+        pending.clear();
+        pending.serial = u64::MAX;
+        assert_eq!(pending.reserve(2), Err(Error::IdentityExhausted));
+    }
+}

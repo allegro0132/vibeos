@@ -1760,6 +1760,8 @@ dependencies = [
  "vibeos-bsp-qemu-virt",
  "vibeos-driver-plic",
  "vibeos-driver-uart16550",
+ "vibeos-driver-virtio-mmio",
+ "vibeos-driver-virtio-rng",
  "vibeos-hal",
  "vibeos-kernel",
 ]
@@ -1814,7 +1816,6 @@ dependencies = [
  "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
  "vibeos-driver-virtio-net",
- "vibeos-driver-virtio-rng",
  "vibeos-driver-xhci",
  "vibeos-durable-format",
  "vibeos-file-store",

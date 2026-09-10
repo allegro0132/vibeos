@@ -167,3 +167,25 @@ Evidence: `boards/milkv-mars/pio-composition-evidence.json`. This stage removes
 the SDHCI dependency from the kernel; VirtIO, Ethernet, USB and LED migration,
 Duo SoC setup separation, Mars platform setup and DW-MSHC firmware composition
 are still pending. No new physical SD qualification or Mars image is claimed.
+
+### Asynchronous entropy composition stage
+
+QEMU firmware now owns the VirtIO RNG engine and publishes a HAL entropy
+operation table. The kernel retains its capability leases, DMA claim barrier,
+request deadlines, interrupt routing, revocation, epoch allocation and quarantine
+policy. The firmware's IRQ acknowledgement path does not borrow mutable engine
+state. Completion queries use shared state; submission and reset require the
+exclusive invocation token.
+
+HAL submission tokens contain an epoch and a checked serial number. The serial
+survives device resets, and the provider retains the actual hardware completion
+record. This prevents stale waiters from matching a reused hardware ring index.
+Host tests cover stale epochs, reset, active-request rejection and serial
+exhaustion. A mutation that ignores the epoch is caught. QEMU N3's two-boot
+acceptance exercises real VirtIO RNG, distinct signed samples, stable test
+identity and binary authentication policy. This is QEMU transport validation,
+not Mars entropy qualification or a new physical fault/recovery qualification.
+
+The kernel no longer depends on `vibeos-driver-virtio-rng`. Its shared VirtIO
+transport and other DMA engines still require migration. Mars production SSH
+remains gated on an independently configured identity and qualified entropy.

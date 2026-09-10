@@ -31,7 +31,8 @@ use crate::sync::SpinLock;
 use crate::virtio::{self, ENTROPY_QUEUE_SIZE};
 use crate::virtio_mmio::MmioTransport;
 use crate::world::Space;
-use vibeos_driver_virtio_rng::{Engine, Submission};
+use crate::entropy_device::Engine;
+use vibeos_hal::entropy::Submission;
 
 const RESET_POLL_BUDGET: usize = 100_000;
 const REQUEST_TIMEOUT_MS: u64 = 2_000;
@@ -40,7 +41,7 @@ const REQUEST_TIMEOUT_MS: u64 = 2_000;
 ///
 /// The bound limits DMA exposure, queue work, per-client kernel state, and the
 /// amount of entropy copied through a capability invocation.
-pub use vibeos_driver_virtio_rng::MAX_RANDOM_BYTES;
+pub use vibeos_hal::entropy::MAX_RANDOM_BYTES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RandomError {
@@ -59,8 +60,8 @@ pub enum RandomError {
     IdentityExhausted,
 }
 
-fn map_engine_error(error: vibeos_driver_virtio_rng::Error) -> RandomError {
-    use vibeos_driver_virtio_rng::Error;
+fn map_engine_error(error: vibeos_hal::entropy::Error) -> RandomError {
+    use vibeos_hal::entropy::Error;
     match error {
         Error::InvalidLength => RandomError::InvalidLength,
         Error::Busy => RandomError::Busy,
@@ -197,8 +198,8 @@ impl Resource for DmaRegion {
     fn describe(&self) -> String {
         format!(
             "SYSTEM stable entropy slab @ {:#x}, {} bytes",
-            vibeos_driver_virtio_rng::dma_base(),
-            vibeos_driver_virtio_rng::DMA_BYTES
+            crate::entropy_device::dma_base(),
+            crate::entropy_device::dma_bytes()
         )
     }
 
@@ -955,7 +956,7 @@ fn advance_epoch() -> Result<u64, RandomError> {
 fn attach_failed(transport: MmioTransport, claim_arena: ArenaId, error: RandomError) {
     // Safety: attach owns the exact DMA claim and the failed local Engine is
     // no longer accessed; no replacement can attach until claim release.
-    let reset = unsafe { vibeos_driver_virtio_rng::confirmed_reset(transport, RESET_POLL_BUDGET) };
+    let reset = unsafe { crate::entropy_device::confirmed_reset(transport, RESET_POLL_BUDGET) };
     IRQ_CAUSES.store(0, Ordering::Release);
     *AUTHORITY.lock() = None;
     finish_claimed_teardown(claim_arena, reset, error);
@@ -987,7 +988,7 @@ fn shutdown(transport: MmioTransport, claim_arena: ArenaId, reason: RandomError)
     // Safety: ordinary teardown or fault recovery owns the exact claim; a
     // faulted owner is permanently detached before this path, and normal
     // DriverSession teardown performs no concurrent Engine access.
-    let reset = unsafe { vibeos_driver_virtio_rng::confirmed_reset(transport, RESET_POLL_BUDGET) };
+    let reset = unsafe { crate::entropy_device::confirmed_reset(transport, RESET_POLL_BUDGET) };
     IRQ_CAUSES.store(0, Ordering::Release);
     *AUTHORITY.lock() = None;
     finish_claimed_teardown(claim_arena, reset, reason);
@@ -1122,7 +1123,7 @@ fn acknowledge_irq_transport(transport_base: usize) -> u32 {
     // lifetime and assigns this fixed slot only to the entropy device. PLIC
     // teardown may leave one copied handler in flight, but concurrent W1C
     // acknowledgements of the same transport are explicitly supported.
-    unsafe { vibeos_driver_virtio_rng::acknowledge_interrupt_at(transport_base) }
+    unsafe { crate::entropy_device::acknowledge_interrupt_at(transport_base) }
 }
 
 pub fn is_online() -> bool {

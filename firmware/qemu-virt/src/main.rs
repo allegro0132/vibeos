@@ -24,3 +24,5 @@ mod early_devices;
 
 #[cfg(all(feature = "mmu-large-memory", any(feature = "python-wasi", feature = "storage-bench")))]
 compile_error!("the high-RAM probe requires the ordinary 128 MiB heap contract");
+
+mod entropy;

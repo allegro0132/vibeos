@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+trng-model-test = ["dep:vibeos-starfive-trng"]
 mars-ethernet-test = ["mars-composition-test", "vibeos-firmware-milkv-mars/ethernet", "eqos-model-test"]
 eqos-model-test = ["dep:vibeos-eqos-net", "dep:vibeos-ethernet", "dep:vibeos-platform-jh7110"]
 mars-composition-test = ["dep:vibeos-firmware-milkv-mars"]
@@ -19,6 +20,7 @@ test = false
 bench = false
 
 [dependencies]
+vibeos-starfive-trng = { path = "../../drivers/starfive-trng", optional = true }
 vibeos-eqos-net = { path = "../../drivers/eqos-net", optional = true }
 vibeos-ethernet = { path = "../../drivers/ethernet", optional = true }
 vibeos-kernel = { path = "../../kernel", default-features = false, features = ["queued-block", "queued-network", "qemu-default-image", "boot-dtb-probe", "legacy-shell"] }

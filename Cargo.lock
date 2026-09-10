@@ -1812,6 +1812,7 @@ dependencies = [
  "vibeos-hal",
  "vibeos-kernel",
  "vibeos-platform-jh7110",
+ "vibeos-starfive-trng",
 ]
 
 [[package]]
@@ -2059,6 +2060,10 @@ dependencies = [
  "vibeos-wasi-command",
  "vibeos-wasi-runtime",
 ]
+
+[[package]]
+name = "vibeos-starfive-trng"
+version = "0.1.0"
 
 [[package]]
 name = "vibeos-storage-device"

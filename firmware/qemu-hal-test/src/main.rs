@@ -14,6 +14,8 @@ use seven_windows::Board;
 use vibeos_hal::Board as BoardContract;
 #[path = "../../early_devices.rs"]
 mod early_devices;
+#[cfg(feature = "trng-model-test")]
+mod trng_model;
 #[path = "../../qemu-virt/src/network.rs"]
 mod network;
 #[path = "../../qemu-virt/src/storage.rs"]
@@ -41,6 +43,11 @@ mod jh7110_sd_model;
 #[cfg(feature = "mars-composition-test")]
 mod mars_composition;
 unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
+    #[cfg(feature = "trng-model-test")]
+    {
+        trng_model::run();
+        _print(format_args!("JH7110_TRNG_MODEL PASS reseed=per-block failure=no-output entropy=unqualified\n"));
+    }
     #[cfg(feature = "eqos-model-test")]
     {
         eqos_model::run();

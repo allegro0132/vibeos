@@ -1,0 +1,38 @@
+{
+  "references": [
+    {
+      "url": "https://github.com/milkv-mars/mars-buildroot-sdk/blob/1fd6bac9f2efde47fbb8afd28d2903c49f893e3f/linux/drivers/char/hw_random/starfive-trng.c",
+      "revision": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+      "source_sha256": "21ae90232187a331c3cd9feed909e1cc3d0face230a08b7463b8f0329679ef68",
+      "local_reference": "target/mars-reference/stage37-sdk-trng.c"
+    },
+    {
+      "url": "https://github.com/torvalds/linux/blob/v6.12/drivers/char/hw_random/jh7110-trng.c",
+      "revision": "v6.12",
+      "source_sha256": "1cc7ced32bca61dd21e0b2c98c6cf423ac8f253235fc27ea19b6b007c591cc7f",
+      "local_reference": "target/mars-reference/stage37-upstream-trng.c"
+    }
+  ],
+  "sdk_dtb_sha256": "f0224b4b1b6bfba25cfc81a0403804a4b7851af1a2bb385b01c9a880025c8b3d",
+  "node": "/soc/trng@1600C000",
+  "status": "okay",
+  "registers": {
+    "base": "0x1600c000",
+    "bytes": "0x4000",
+    "irq": 30
+  },
+  "vendor_clock_ids": [
+    205,
+    206
+  ],
+  "vendor_reset_id": 131,
+  "notes": [
+    "Final Mars DTB enables TRNG via jh7110-milkv-mars.dtsi override; production VibeOS firmware has no TRNG mapping or registration",
+    "Reset belongs to SEC_TOP and is also used by crypto/security DMA; no driver-owned reset is allowed",
+    "Polling transport requires firmware to mask PLIC IRQ and exclusively own ISTAT",
+    "Requires preconfigured mission/non-nonce mode with readback; no undocumented SMODE programming",
+    "Reads conditioned 256-bit blocks; zero/all-one/consecutive-duplicate rejection is not an entropy estimate",
+    "Every block explicitly reseeds; faults disable interrupts and require owner recovery without automatic commands",
+    "Neither Linux driver presence nor model success qualifies this source for production SSH"
+  ]
+}

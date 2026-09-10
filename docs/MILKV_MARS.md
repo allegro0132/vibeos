@@ -1086,3 +1086,39 @@ Mutations disabling late-panic rejection, repeated-boot detection or capture
 failure status are detected. These are host capture-tool tests, not new kernel
 or Mars runs. `boards/milkv-mars/serial-collector-evidence.json` records results;
 all physical acceptance and stability gates remain outstanding.
+
+### JH7110 TRNG command transport
+
+`drivers/starfive-trng` is an independent `no_std` register-protocol crate. It
+has no kernel, board or other crate dependency. Firmware must own the clocks,
+shared SEC reset and PLIC mask; the driver never resets the SEC subsystem or
+assumes that a disabled interrupt proves hardware stopped. It requires mission
+mode with nonce mode off, verifies configuration readback, disables automatic
+reseed counters and explicitly reseeds before each conditioned 256-bit block.
+
+Both elapsed-time and poll-count limits bound waits. Stale completions are
+acknowledged before issuing a command; the expected completion, idle state and
+seeded/mode bits must agree before reading. Lockup during the copy invalidates
+the whole block. Zero, all-one or consecutive repeated blocks are rejected.
+Errors disable TRNG interrupts and permanently fault the instance; no automatic
+reseed retry hides a failure. These checks are not statistical health tests,
+an entropy estimate or permission to enable production SSH.
+
+The final pinned Mars DTB has TRNG enabled at `/soc/trng@1600C000`, IRQ 30,
+with vendor clock IDs 205/206 and shared reset ID 131. The base SoC file says
+`disabled`, but the Mars board include overrides it to `okay`; the compiled
+DTB is the authority. Crypto and security DMA also reference reset 131, so a
+platform reset policy must account for all users. Exact references are recorded
+in `boards/milkv-mars/trng-reference.json`.
+
+Ten host tests cover commands, configuration, output publication and failure
+paths. An RV64/QEMU model executes this same crate, including lockup during
+copy and wrapped-clock timeout, with `JH7110_TRNG_MODEL PASS` and 395 kernel
+selftests. Mutations disabling the deadline, duplicate detection, quarantine
+or lockup handling are detected. Evidence is in
+`boards/milkv-mars/trng-protocol-evidence.json`.
+
+Production Mars firmware does not yet map, initialize or register this source.
+Clock/shared-reset preparation, HAL service integration, physical behavior and
+entropy qualification remain required. The existing test SD image and its
+disabled SSH state are unchanged.

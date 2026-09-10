@@ -1,6 +1,8 @@
 //! Bounded, allocation-free FDT v17 reader for firmware handoff data.
 //! This module accepts an already readable byte slice; converting a firmware
 //! physical pointer to that slice is the architecture entry's responsibility.
+pub mod cpus;
+
 use crate::{
     memory::{BootMemory, MemoryError},
     AddressRange,

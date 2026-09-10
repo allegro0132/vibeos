@@ -1,0 +1,47 @@
+/dts-v1/;
+/ {
+ compatible = "milk-v,mars", "starfive,jh7110";
+ cpus {
+#address-cells = <2>; #size-cells = <0>; timebase-frequency = <4000000>;
+cpu@0 {
+device_type = "cpu"; reg = <1 0>;
+compatible = "sifive,s7", "riscv";
+status = "disabled";
+riscv,isa = "rv64imac_zba_zbb";
+mmu-type = "riscv,sv39";
+interrupt-controller { #interrupt-cells = <1>; interrupt-controller; compatible = "riscv,cpu-intc"; };
+};
+cpu@1 {
+device_type = "cpu"; reg = <1 1>;
+compatible = "sifive,u74-mc", "riscv";
+status = "okay";
+riscv,isa = "rv64imafdc_zba_zbb";
+mmu-type = "riscv,sv39";
+interrupt-controller { #interrupt-cells = <1>; interrupt-controller; compatible = "riscv,cpu-intc"; };
+};
+cpu@2 {
+device_type = "cpu"; reg = <1 2>;
+compatible = "sifive,u74-mc", "riscv";
+status = "okay";
+riscv,isa = "rv64imafdc_zba_zbb";
+mmu-type = "riscv,sv39";
+interrupt-controller { #interrupt-cells = <1>; interrupt-controller; compatible = "riscv,cpu-intc"; };
+};
+cpu@3 {
+device_type = "cpu"; reg = <1 3>;
+compatible = "sifive,u74-mc", "riscv";
+status = "okay";
+riscv,isa = "rv64imafdc_zba_zbb";
+mmu-type = "riscv,sv39";
+interrupt-controller { #interrupt-cells = <1>; interrupt-controller; compatible = "riscv,cpu-intc"; };
+};
+cpu@4 {
+device_type = "cpu"; reg = <1 4>;
+compatible = "sifive,u74-mc", "riscv";
+status = "okay";
+riscv,isa = "rv64imafdc_zba_zbb";
+mmu-type = "riscv,sv39";
+interrupt-controller { #interrupt-cells = <1>; interrupt-controller; compatible = "riscv,cpu-intc"; };
+};
+ };
+};

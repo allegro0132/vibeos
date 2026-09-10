@@ -2,6 +2,8 @@
 //! Milk-V Mars 4 GiB board facts, pinned to the SDK dev revision below.
 //! This crate is a hardware description, not a claim of firmware support.
 //! Runtime memory must be admitted from the boot DTB before use.
+pub mod harts;
+
 use vibeos_hal::{
     fdt::{Error as FdtError, Fdt},
     memory::BootMemory,
@@ -75,21 +77,7 @@ pub fn usable_memory<const N: usize>(
     physical_address: usize,
 ) -> Result<BootMemory<N>, FdtError> {
     let tree = Fdt::new(dtb)?;
-    // Identify the board before interpreting its physical addresses.
-    let mut mars = false;
-    for event in tree.events() {
-        if let vibeos_hal::fdt::Event::Property {
-            depth: 0,
-            name: "compatible",
-            value,
-        } = event?
-        {
-            mars = value.split(|&x| x == 0).any(|s| s == b"milk-v,mars");
-        }
-    }
-    if !mars {
-        return Err(FdtError::InvalidHeader);
-    }
+    validate_board(&tree)?;
     let mut memory = tree.memory::<N>(physical_address)?;
     if memory.ranges().is_empty()
         || memory
@@ -132,4 +120,34 @@ mod tests {
     fn invalid_boot_blob_is_not_admitted() {
         assert!(usable_memory::<16>(&[0; 40], 0x48000000).is_err());
     }
+}
+
+fn validate_board(tree: &Fdt<'_>) -> Result<(), FdtError> {
+    // Identify the board before interpreting its physical addresses.
+    let mut mars = false;
+    let mut seen = false;
+    for event in tree.events() {
+        if let vibeos_hal::fdt::Event::Property {
+            depth: 0,
+            name: "compatible",
+            value,
+        } = event?
+        {
+            if seen || value.last() != Some(&0) || value.len() < 2 {
+                return Err(FdtError::InvalidStructure);
+            }
+            seen = true;
+            if value[..value.len() - 1]
+                .split(|&b| b == 0)
+                .any(|s| s.is_empty() || core::str::from_utf8(s).is_err())
+            {
+                return Err(FdtError::InvalidString);
+            }
+            mars = value.split(|&x| x == 0).any(|s| s == b"milk-v,mars");
+        }
+    }
+    if !mars {
+        return Err(FdtError::InvalidHeader);
+    }
+    Ok(())
 }

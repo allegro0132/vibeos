@@ -1110,6 +1110,8 @@ pub use vibeos_object_store as store;
     feature = "provisioned-ssh"
 ))]
 pub use vibeos_ssh_identity as ssh_security;
+#[cfg(feature = "boot-dtb-probe")]
+mod boot_dtb_probe;
 mod block_device;
 #[cfg(feature = "milkv-duo")]
 mod dwc2_host;
@@ -1318,6 +1320,9 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
     #[cfg(feature = "wasmtime-native")]
     let wasmtime_harts = unsafe { wasmtime_platform::capture_boot_isa(_firmware_dtb, hs, he) };
 
+    #[cfg(feature = "boot-dtb-probe")]
+    let dtb_report = unsafe { boot_dtb_probe::capture(_firmware_dtb, boot_physical_hart) };
+
     mmu::init_boot(boot_physical_hart);
     uart::early_write("[VibeOS] page tables ready\r\n");
     mmu::enable(exec::HartId::BOOT.index());
@@ -1329,6 +1334,11 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
 
     uart::init();
     println!("{}", BANNER);
+    #[cfg(feature = "boot-dtb-probe")]
+    match dtb_report {
+        Ok(report) => println!("BOOT_DTB_CPUS PASS boot={} count={} timebase={}", report.boot, report.count, report.hz),
+        Err(error) => { println!("BOOT_DTB_CPUS FAIL: {}", error); sbi::shutdown(true); }
+    }
     println!(
         "  platform  {} ({} MHz timebase)",
         platform::name(),

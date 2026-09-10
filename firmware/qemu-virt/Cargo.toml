@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+boot-dtb-probe = ["vibeos-kernel/boot-dtb-probe"]
 # Reusable services; this firmware selects the appropriate entropy provider.
 provisioned-ssh = ["vibeos-kernel/provisioned-ssh"]
 provisioned-command = ["provisioned-ssh", "vibeos-kernel/provisioned-command"]

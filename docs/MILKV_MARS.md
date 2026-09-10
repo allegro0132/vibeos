@@ -424,3 +424,53 @@ identity persistence, VSH `ssh-keygen`/`ssh-keycat`, matching persisted/public
 client keys and absence of automatic authorization. It forwards no SSH port
 and deletes the identity-bearing disk afterwards. This does not claim SSH/WASM
 transport or physical entropy qualification. The VSSHKEY1 encoding is unchanged.
+
+### CPU admission and live DTB probe stage
+
+`vibeos-hal::fdt::Fdt::cpus` reads a bounded CPU inventory without allocation.
+It validates the unique `/cpus` node, cell widths, hart IDs, scalar strings,
+compatible lists and nonzero timebase. Duplicate IDs, duplicate consumed
+properties and insufficient inventory capacity reject the handoff. Disabled
+CPU entries remain available to board policy; nested interrupt-controller and
+CPU-map nodes do not become harts. Both one-cell and two-cell hart IDs retain
+their full value.
+
+`vibeos_bsp_milkv_mars::harts::admit` accepts only enabled U74-MC harts 1–4,
+Sv39, the 4 MHz timebase and the image's RV64IMAC/optional FD requirements.
+It accepts the pinned Linux and U-Boot ISA spellings; letters inside named
+extensions cannot supply missing base capabilities. The actual boot hart is
+logical slot zero, followed by the remaining admitted physical IDs in order.
+A bad boot hart fails; an incompatible secondary produces a reduced inventory
+with `is_four_core() == false`. Even an enabled S7 is excluded.
+
+The synthetic fixtures under `hal/tests/fixtures/cpus*.dts` project CPU facts
+from the SDK revision in `boards/milkv-mars/sdk-reference.json`; they are not
+complete boot device trees. Regenerate each with `dtc -I dts -O dtb -o NAME.dtb
+NAME.dts`. Host tests cover every U74 boot choice, disabled/incompatible CPUs,
+FP requirements, 64-bit IDs, malformed declarations and bounded bit mutations.
+Deliberately removing disabled-hart filtering or duplicate-ID rejection fails
+the corresponding regression.
+
+For a live software check, build in `firmware/qemu-virt` with
+`cargo build --release --features boot-dtb-probe,legacy-shell`, then run from
+the repository root:
+
+```sh
+python3 scripts/qemu-boot-dtb-test.py \
+  --kernel target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt \
+  --output target/boot-dtb-evidence
+```
+
+This opt-in probe captures CPU/timebase facts before heap initialization and
+keeps no references into the DTB. QEMU's highest advertised mode is Sv57;
+Sv48/Sv57 also support Sv39 under the
+[RISC-V privileged specification](https://docs.riscv.org/reference/isa/priv/supervisor.html).
+The probe verifies firmware-selected harts and timebase, then runs the existing
+390 target selftests. A DTB with a changed timebase is rejected before services.
+`--dtb PATH --expect-rejection` exercises a deliberately invalid handoff.
+
+These checks do not yet wire Mars admission into a production Mars boot entry.
+SBI extension probing, live Mars resource/memory publication, four physical
+hart completion, SD/EQoS integration and the flashable image remain pending.
+The opt-in QEMU probe is acceptance instrumentation, not a replacement for
+those production checks or physical acceptance.

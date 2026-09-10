@@ -124,15 +124,7 @@ const CLK_BYPASS_0: usize = CLKGEN_OFFSET + 0x30;
 const CLK_DIV_SD0: usize = CLKGEN_OFFSET + 0x70;
 const SD0_CLOCKS: u32 = (1 << 18) | (1 << 19) | (1 << 20);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Error {
-    OutOfRange,
-    TimedOut,
-    DeviceIo,
-    Unsupported,
-    Protocol,
-    InvalidConfiguration,
-}
+pub use vibeos_hal::block::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CardInfo {
@@ -1098,6 +1090,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn adaptive_rejects_invalid_ranges_before_registers_or_publication() {
+        let mut registers = [0u32; TEST_MMIO_WORDS];
+        let mut card = adaptive::AdaptiveCard::new(fake_card(&mut registers), |_| {});
+        let published = Cell::new(0);
+        assert_eq!(card.write_blocks_tracked(1, &[0;512], || published.set(1)), Err(Error::OutOfRange));
+        assert_eq!(card.read_blocks(0, &mut [0;1024]), Err(Error::OutOfRange));
+        assert_eq!(published.get(), 0);
+        assert!(registers.iter().all(|word| *word == 0));
+    }
+
+    #[test]
+    fn adaptive_probe_fallback_reports_one_publication_across_failed_attempts() {
+        let mut registers = [0u32; TEST_MMIO_WORDS];
+        let mut hardware = fake_card(&mut registers);
+        hardware.capacity_sectors = 8;
+        let mut card = adaptive::AdaptiveCard::new(hardware, |_| {});
+        let published = Cell::new(0);
+        // Plain memory does not emulate W1C, so every published attempt
+        // fails. This exercises the real fallback ladder without claiming
+        // successful SD transfers or real controller timing.
+        assert!(card.write_blocks_tracked(0, &[0;4096], || published.set(published.get()+1)).is_err());
+        assert_eq!(published.get(), 1);
+    }
+
     fn read_test_command(registers: &[u32; TEST_MMIO_WORDS]) -> u16 {
         let address = registers.as_ptr() as usize + COMMAND;
         // The test buffer is live, aligned for a u16 access at COMMAND, and
@@ -1404,3 +1421,5 @@ mod tests {
         );
     }
 }
+
+pub mod adaptive;

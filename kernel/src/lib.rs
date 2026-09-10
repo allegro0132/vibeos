@@ -1116,6 +1116,8 @@ mod dwc2_host;
 mod dwmac_net;
 mod net_device;
 #[cfg(feature = "milkv-duo")]
+mod pio_block;
+#[cfg(feature = "milkv-duo")]
 mod sdhci_blk;
 mod segment_store_platform;
 mod store_platform;

@@ -114,3 +114,11 @@ assigns the boot-local `netN` sequence. The netstack allocates state for that
 runtime list; it has no fixed interface-count table. A service listener stays
 attached to the policy root that minted it, even if another topology changes
 that root's ordinal on a later boot.
+
+The synchronous PIO block boundary is now firmware-owned as well. The HAL
+operation table carries device metadata and serialized initialization, read,
+write, flush and diagnostic callbacks. It cannot retain caller buffers or
+publication callbacks. Kernel partition admission uses the reusable HAL
+`BlockWindow`; card protocol probing lives in the SDHCI crate. This boundary
+is ready for a DW-MSHC provider without importing SDHCI types into the kernel.
+Asynchronous DMA backends still need their completion and ownership migration.

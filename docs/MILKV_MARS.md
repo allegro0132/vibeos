@@ -143,3 +143,27 @@ OpenSBI's `Platform HSM Device: ---` line does **not** prove that the SBI HSM
 extension is absent (QEMU's current firmware prints this and advertises HSM).
 Bootloader qualification must probe the extension and start secondary harts;
 it must not infer capability from that label alone.
+
+### PIO block composition stage
+
+The Duo firmware now owns the SDHCI card instance and publishes the HAL
+`PioBlockDevice` operation table. The kernel holds an exclusive invocation token
+and retains capability checks, incarnation/epoch handling, fault policy and
+partition translation. CMD18 fallback, CMD25 mode probing, adaptive blind PIO
+and verification now live in `drivers/sdhci-blk/src/adaptive.rs`. Existing Duo
+resource identifiers, image-policy sector ranges and diagnostic commands remain
+compatible. The explicit raw diagnostic read is still separate from ordinary
+partition-limited I/O.
+
+`BlockWindow` validates the complete logical run before translating it into
+physical sectors. The HAL callback contract records mutation publication even
+when the card subsequently fails. The actual kernel invocation adapter is tested
+against synthetic firmware, including duplicate-notification suppression,
+pre-publication rejection and post-publication timeout. Driver tests exercise
+invalid-range rejection and the failed SDHCI protocol fallback ladder with plain
+memory registers; these do not emulate successful SD transfers or hardware timing.
+
+Evidence: `boards/milkv-mars/pio-composition-evidence.json`. This stage removes
+the SDHCI dependency from the kernel; VirtIO, Ethernet, USB and LED migration,
+Duo SoC setup separation, Mars platform setup and DW-MSHC firmware composition
+are still pending. No new physical SD qualification or Mars image is claimed.

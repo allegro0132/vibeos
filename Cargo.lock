@@ -1747,6 +1747,7 @@ version = "0.1.0"
 dependencies = [
  "vibeos-bsp-milkv-duo",
  "vibeos-driver-plic",
+ "vibeos-driver-sdhci-blk",
  "vibeos-driver-uart16550",
  "vibeos-hal",
  "vibeos-kernel",
@@ -1809,7 +1810,6 @@ dependencies = [
  "vibeos-driver-dwmac-net",
  "vibeos-driver-milkv-duo-led",
  "vibeos-driver-pci",
- "vibeos-driver-sdhci-blk",
  "vibeos-driver-virtio-blk",
  "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",

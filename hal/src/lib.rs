@@ -323,3 +323,5 @@ pub struct DwMshcDescription {
 pub mod block;
 
 pub mod entropy;
+
+pub mod queued_block;

@@ -1128,6 +1128,8 @@ mod uart;
 #[cfg(feature = "milkv-duo")]
 mod usb_ecm_net;
 #[cfg(feature = "qemu-virt")]
+mod queued_block;
+#[cfg(feature = "qemu-virt")]
 mod virtio_blk;
 #[cfg(feature = "qemu-virt")]
 use vibeos_driver_virtio_mmio as virtio_mmio;

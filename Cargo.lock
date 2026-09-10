@@ -1761,6 +1761,8 @@ dependencies = [
  "vibeos-bsp-qemu-virt",
  "vibeos-driver-plic",
  "vibeos-driver-uart16550",
+ "vibeos-driver-virtio-blk",
+ "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
  "vibeos-driver-virtio-rng",
  "vibeos-hal",
@@ -1770,6 +1772,9 @@ dependencies = [
 [[package]]
 name = "vibeos-hal"
 version = "0.1.0"
+dependencies = [
+ "vibeos-driver-virtio-core",
+]
 
 [[package]]
 name = "vibeos-image-policy"
@@ -1813,7 +1818,6 @@ dependencies = [
  "vibeos-driver-dwmac-net",
  "vibeos-driver-milkv-duo-led",
  "vibeos-driver-pci",
- "vibeos-driver-virtio-blk",
  "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
  "vibeos-driver-virtio-net",

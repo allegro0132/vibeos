@@ -26,7 +26,7 @@ use crate::virtio::{self, BlockOperation, UsedElement, BLOCK_MAX_TRANSFER_SIZE, 
 use crate::world::Space;
 
 use crate::virtio_mmio::MmioTransport;
-use vibeos_driver_virtio_blk::{self as block_driver, BlockEngine, HardwareError};
+use crate::queued_block::{self as block_driver, BlockEngine, HardwareError};
 use vibeos_storage_device::{MutationFailure, MutationResult};
 
 const REQUEST_TIMEOUT_MS: u64 = 2_000;
@@ -166,7 +166,7 @@ impl Resource for DmaRegion {
         format!(
             "SYSTEM stable slab @ {:#x}, {} bytes",
             block_driver::dma_base(),
-            block_driver::DMA_BYTES
+            block_driver::dma_bytes()
         )
     }
 

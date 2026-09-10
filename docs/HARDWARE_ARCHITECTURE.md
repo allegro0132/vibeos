@@ -135,3 +135,10 @@ SD slot clock/pad/supply operations are supplied by a platform crate through
 HAL `SdPlatform` hooks. SDHCI receives only its own controller aperture and
 clock rates; it no longer receives a SoC control aperture. Firmware composes
 the controller and platform implementations, preserving power/reset ordering.
+
+Queued block devices are also composed by firmware. The kernel sends HAL
+operations and keeps scheduling, request publication accounting and capability
+policy; firmware owns the engine and DMA state. Operation tokens identify a
+specific epoch and serial. Driver completion validation precedes copying data
+back to kernel request buffers. Existing timeout, cancel, revoke and fault
+recovery paths retain their reset-before-reuse ordering across this boundary.

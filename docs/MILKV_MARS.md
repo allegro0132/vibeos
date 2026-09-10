@@ -208,3 +208,24 @@ physical voltage, pad timing or a particular card's power requirements.
 This is the SD portion of the platform split. Ethernet and USB still contain
 CV1800B platform code, and shared clock-register ownership must remain serialized
 when those resources are migrated. JH7110 requires its own implementation.
+
+### Queued block composition stage
+
+QEMU firmware now owns the VirtIO block engine and its fixed DMA slab. The HAL
+queued-block table carries read/write/flush requests, publication notifications,
+completion records and reset operations. Kernel policy retains capability checks,
+queue scheduling, epoch validation, cancellation, revocation and fault recovery.
+Firmware retains the actual driver submission, matching an epoch/serial token
+before completing or timing out a request. IRQ acknowledgement never borrows
+mutable firmware engine state. Reset failure continues to quarantine DMA.
+
+The actual kernel invocation adapter is host-tested against synthetic firmware.
+This covers multi-sector marshaling, publication notification, completion data,
+timeout/reset and recovery dispatch. A mutation truncating multi-sector requests
+to one sector fails. QEMU `block` verifies the physical backing file contents;
+`block_recovery` covers timeout, cancellation, revocation and a fault after DMA
+publication, followed by a fresh online generation. These tests do not emulate
+Mars DW-MSHC or physical SD behavior.
+
+The kernel no longer depends on `vibeos-driver-virtio-blk`; shared VirtIO
+transport/protocol helpers, network and USB engines still require migration.

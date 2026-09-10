@@ -68,10 +68,10 @@ const SSH_TEST_MEMORY_BUDGET: usize = 1024 * 1024;
 // larger transient envelope than the production interactive client budget.
 #[cfg(feature = "storage-bench")]
 pub const SHELL_MEMORY_BUDGET: usize = 192 * 1024 * 1024;
-// Loading the compact CPython module charges an 8 MiB block to the shell.
-// Leave headroom for the existing session and storage client allocations.
+// Python command images grant the interactive shell the maximum owner quota.
+// Actual allocation remains bounded by the physical heap; guest quotas are separate.
 #[cfg(all(not(feature = "storage-bench"), feature = "python-command"))]
-pub const SHELL_MEMORY_BUDGET: usize = 16 * 1024 * 1024;
+pub const SHELL_MEMORY_BUDGET: usize = usize::MAX;
 #[cfg(not(any(feature = "storage-bench", feature = "python-command")))]
 pub const SHELL_MEMORY_BUDGET: usize = store::STORE_CLIENT_MEMORY_BUDGET;
 

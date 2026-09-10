@@ -517,6 +517,10 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
                 Status::BudgetExceeded
             }
         })?;
+        // launch copied the snapshot into SYSTEM so the child can outlive this
+        // command. Release the caller-domain copy before yielding to admission:
+        // retaining it across the I/O pump costs another 8 MiB for CPython.
+        drop(bytes);
         let _cancel = CancelOnDrop(io.clone());
         let input = async {
             loop {

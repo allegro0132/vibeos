@@ -4735,12 +4735,16 @@ impl Resource for ByteStream {
 }
 
 pub struct OutputSink {
+    capture_depth: AtomicUsize,
     bytes: SpinLock<Vec<u8>>,
+    readable: WaitQueue,
 }
 impl OutputSink {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             bytes: SpinLock::new(Vec::new()),
+            capture_depth: AtomicUsize::new(0),
+            readable: WaitQueue::new(),
         })
     }
     fn write(&self, bytes: &[u8]) -> Result<(), Status> {
@@ -4753,7 +4757,38 @@ impl OutputSink {
             return Err(Status::BudgetExceeded);
         }
         out.extend_from_slice(bytes);
+        drop(out);
+        self.readable.wake_all();
         Ok(())
+    }
+    pub async fn wait_ready(&self) {
+        loop {
+            let wait = self.readable.wait();
+            {
+                let bytes = self.bytes.lock();
+                if self.capture_depth.load(Ordering::Acquire) == 0 && Self::terminal_prefix(&bytes) != 0 { return; }
+            }
+            wait.await;
+        }
+    }
+    fn terminal_prefix(bytes: &[u8]) -> usize {
+        match core::str::from_utf8(bytes) {
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            _ => bytes.len(),
+        }
+    }
+    pub fn take_terminal_string(&self) -> String {
+        let mut bytes = self.bytes.lock();
+        if self.capture_depth.load(Ordering::Acquire) != 0 { return String::new(); }
+        let end = Self::terminal_prefix(&bytes);
+        let text = String::from_utf8_lossy(&bytes[..end]).into_owned();
+        bytes.drain(..end);
+        text
+    }
+    fn capture(self: &Arc<Self>) -> OutputCapture {
+        let _bytes = self.bytes.lock();
+        self.capture_depth.fetch_add(1, Ordering::AcqRel);
+        OutputCapture(self.clone())
     }
     pub fn take_string(&self) -> String {
         let mut out = self.bytes.lock();
@@ -4761,6 +4796,19 @@ impl OutputSink {
         String::from_utf8_lossy(&bytes).into_owned()
     }
 }
+// Suppress frontend draining while command substitution captures job reports.
+// RAII restores streaming even if its future is cancelled or returns an error.
+struct OutputCapture(Arc<OutputSink>);
+impl Drop for OutputCapture {
+    fn drop(&mut self) {
+        {
+            let _bytes = self.0.bytes.lock();
+            self.0.capture_depth.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.0.readable.wake_all();
+    }
+}
+
 impl Resource for OutputSink {
     fn kind(&self) -> &'static str {
         "byte-sink"
@@ -5222,6 +5270,7 @@ pub struct Session {
     cancel_next_job: bool,
     jobs: BTreeMap<u64, BackgroundJob>,
     external_cancel: Option<Arc<CancellationSignal>>,
+    terminal_input: Option<Arc<ByteStream>>,
     managed_cleanup: Option<ManagedInvocationCleanup>,
     function_depth: usize,
     substitution_depth: usize,
@@ -5342,6 +5391,7 @@ impl Session {
             cancel_next_job: false,
             jobs: BTreeMap::new(),
             external_cancel: None,
+            terminal_input: None,
             managed_cleanup: None,
             function_depth: 0,
             substitution_depth: 0,
@@ -6083,6 +6133,25 @@ impl Session {
         result
     }
 
+    /// A local frontend may stream one foreground pipeline's input/output.
+    /// Batch execution and SSH exec retain their existing explicit IO contracts.
+    pub fn terminal_output(&self) -> Arc<OutputSink> { self.console.clone() }
+
+    pub async fn execute_terminal_cancellable(
+        &mut self, source: &str, cancel: Arc<CancellationSignal>, input: Arc<ByteStream>,
+    ) -> Result<Vec<JobReport>, Diagnostic> {
+        let script = parse(source)?;
+        let single_foreground = matches!(script.statements.as_slice(),
+            [Statement::Command(item)] if !item.background && item.command.rest.is_empty());
+        if single_foreground && self.profile == SessionProfile::Interactive {
+            self.terminal_input = Some(input.clone());
+        }
+        let result = self.execute_cancellable(source, cancel).await;
+        self.terminal_input = None;
+        input.close_read(CloseReason::Normal);
+        result
+    }
+
     /// Validate and execute exactly one foreground command from the SSH
     /// profile. Execution deliberately continues through `execute_cancellable`
     /// so disconnect and supervisor cancellation use the ordinary Job teardown
@@ -6603,6 +6672,7 @@ impl Session {
             let script = parse(source).map_err(|_| {
                 Diagnostic::new(span.start, span.end, "invalid command substitution")
             })?;
+            let _capture = self.console.capture();
             let saved_values = self.values.clone();
             let saved_functions = self.functions.clone();
             self.substitution_depth += 1;
@@ -6723,7 +6793,8 @@ impl Session {
                 Applet::ManagedComponent { io, .. } => Some(*io),
                 _ => None,
             };
-            let stdin_present = index > 0 || has_stdin_redirect || managed_io_source.is_some();
+            let stdin_present = index > 0 || has_stdin_redirect || managed_io_source.is_some()
+                || (manifest.stdin != StreamMode::Closed && self.substitution_depth == 0 && self.terminal_input.is_some());
             if manifest.stdin == StreamMode::Required && !stdin_present {
                 return Err(Diagnostic::new(
                     command_ast.span.start,
@@ -7607,6 +7678,10 @@ impl Session {
                         },
                     )?,
                 )
+            } else if preflight_stage.manifest.stdin != StreamMode::Closed
+                && self.substitution_depth == 0 && self.terminal_input.is_some()
+            {
+                LocalIo::Stream(stage.mint(self.terminal_input.as_ref().unwrap().clone(), Rights::RECV))
             } else {
                 LocalIo::Closed
             };

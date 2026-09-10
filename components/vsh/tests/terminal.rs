@@ -489,3 +489,12 @@ fn frontend_instances_do_not_share_state_or_backpressure() {
     assert_eq!(take_output(&mut second), b"!");
     assert_eq!(first.input(), "private");
 }
+
+#[test]
+fn control_d_ends_empty_input_and_submits_partial_line() {
+    let mut line = LineDiscipline::new();
+    assert_eq!(line.feed_byte(4), InputAction::Event(TerminalEvent::Eof));
+    feed(&mut line, b"value");
+    assert_eq!(line.feed_byte(4), InputAction::Event(TerminalEvent::Line("value".into())));
+    assert_eq!(line.feed_byte(4), InputAction::Event(TerminalEvent::Eof));
+}

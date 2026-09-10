@@ -6,12 +6,74 @@ transport. The interpreter runs inside VibeOS using bounded, software-float
 Wasmi. This is the CPython/WASI route, not the Pyodide JavaScript/Emscripten
 distribution or its binary wheel ABI.
 
-On physical Milk-V Duo, the compact full CPython 3.14.0 module has now executed
-the arithmetic and JSON/math/fractions standard-library cases successfully
-through Wasmi, with exit 0 and clean resource reclamation. Continuous invocation
-is not yet reliable: the third case was rejected during initialization with
-status 124. This is a partial physical result, not a completed acceptance suite.
-Raw evidence is under `tests/python-wasi/results/duo-freereuse`.
+On physical Milk-V Duo, the compact full CPython 3.14.0 module now passes
+100 consecutive SSH invocations and a complete 10-invocation serial/vsh suite
+without rebooting. All 114 executed invocations (including four earlier serial
+checks) have clean reclamation. The allocator coalescing and local snapshot
+lifetime fixes resolve the reproduced repeated-admission failure. The running
+vsh owner quota is the maximum `u64` value, bounded by physical memory; guest
+limits remain separate. Evidence: `tests/python-wasi/results/duo-coalesce-physical`.
+The historical failed attempts below are retained for diagnosis, not current
+qualification status. This remains the compact frozen-stdlib profile; the heavy
+stdlib helper combination can exceed available memory.
+
+## Interactive CPython
+
+Use `-i` to select CPython's basic interactive loop. The dedicated Duo module
+is built with `--native-tracebacks`: a small conditional patch selects CPython's
+existing C exception formatter, including chained exceptions, instead of
+importing the larger Python traceback formatter during error reporting. The
+interpreter and explicitly imported stdlib modules are unchanged. This avoids
+an ordinary REPL exception exhausting memory before the next prompt. The option
+is recorded in `build.json`; omit it to retain upstream formatter selection.
+
+Local serial vsh (requires the REPL kernel image):
+
+```text
+wasm-run @home/wasm/python.wasm -i
+```
+
+SSH exec, using the already provisioned identity and known-host configuration:
+
+```sh
+ssh -T vibe@192.168.77.10 'wasm-run python.wasm -i'
+```
+
+No remote PTY is required for SSH exec. Enter expressions or statements at
+`>>>`; finish an indented block with an empty line at `...`. Ctrl-D on an empty
+input line sends EOF and returns to the caller. In serial vsh, Ctrl-C cancels
+the entire foreground invocation and returns to vsh; it is not delivered as a
+Python `KeyboardInterrupt`. Because this isolated profile disables `site`, use
+EOF or `import sys; sys.exit()` instead of relying on `exit()`/`quit()` helpers.
+
+The serial frontend streams output while a foreground pipeline runs and sends
+canonical input lines to its first input-capable stage. Existing pipes and
+input redirection take precedence; closed-stdin commands, batch execution and
+managed component IO retain their contracts. Background commands and compound
+scripts do not inherit this terminal input. The input queue is bounded and
+signals overflow. The existing UART input line discipline accepts ASCII;
+UTF-8 output and SSH UTF-8 input are supported. This is the basic CPython REPL,
+not the enhanced `_pyrepl`/readline terminal UI. `quiet` can suppress routine
+background logger output while using the UART console.
+
+Real Duo SSH tests verify incremental prompts, persistent variables, multiline
+blocks, `input()` and UTF-8 input, exception recovery and EOF. A fixed-heap test
+also completes 100 exception/recovery cycles. Frontend tests cover live prompts,
+multiple input lines, EOF, cancellation, split UTF-8 output and command-substitution
+capture. Physical serial and SSH qualification also passed on the REPL SD image
+(SHA-256 `831de45fd9ce93163f9c9e92a7f305124427a332d4b3a87ac6919fc1e9169d9b`).
+After a fresh flash, the existing client public key was provisioned and the
+7,558,226-byte CPython module was uploaded. Serial testing verified prompts
+before EOF, arithmetic, persistent variables, multiline blocks, exception
+recovery, Ctrl-D, Ctrl-C, and successful execution after cancellation. All three
+serial invocation terminals reported `reclaimed=true caps=0 waiters=0`.
+Command-substitution output remained correct. The post-serial heap snapshot was
+live=2,092,416 and peak=39,375,744 bytes; vsh had no quota denials.
+SSH testing in the same boot verified incremental input, multiline blocks,
+`input()`, UTF-8, exception recovery, and exit 0 on EOF. The harnesses, raw logs,
+results, and image manifest are in `tests/python-wasi/results/duo-repl-physical`.
+These checks cover basic interactive operation, not unrestricted stdlib use
+within the Duo's finite memory.
 
 ## Build the guest
 
@@ -348,3 +410,86 @@ remains suspected, and free blocks still cannot coalesce. Reclamation was clean
 and the board remained responsive. Remaining cases were not run after this
 failure. The full interpreter is now physically demonstrated, while repeated
 execution and the complete stdio/Unicode suite remain unfinished.
+
+### Local vsh snapshot lifetime
+
+The subsequent local vsh failure exposed a separate memory cost: `launch`
+copies the caller-owned module into SYSTEM for the asynchronous child, but the
+command retained the caller's snapshot across the entire I/O pump. For this
+CPython module that is another 8 MiB charged block. The local command now drops
+that original snapshot immediately after successful launch and before yielding.
+The SYSTEM copy and its lifetime remain unchanged, preserving caller-domain
+isolation. This correction does not claim to fix the repeated SSH admission
+failure above. Use matching shell quotes when testing:
+
+```text
+wasm-run @home/wasm/python.wasm -c 'print("Hello World!")'
+```
+
+The host diagnostic now supports `VIBE_DUO_REPEATS=100` to construct, execute,
+drop and unregister successive invocations inside the same fixed heap. Native
+stdio buffers are initialized before switching allocators so their process
+lifetime is not attributed to a guest owner. With `print("Hello World!")`,
+the first invocation succeeds and its owner unregisters without leftovers;
+the second fails admission with `HeapExhausted { requested_bytes: 8388608 }`.
+Live memory is back to 12,583,808 bytes, with 5,928,192 bytes of bump space.
+This reproduces a contiguous-allocation failure after clean destruction;
+independent-process acceptance tests had missed it. Evidence is under
+`tests/python-wasi/results/duo-repeat-heap`. The vsh snapshot-release image is
+built and packaged but is not a complete solution and has not been physically
+validated. Allocator fragmentation remains unresolved.
+
+### Pressure coalescing correction (physical verification pending)
+
+The allocator now coalesces adjacent free blocks when a request cannot fit in
+the bump region or any suitable free class. An intrusive bottom-up merge sort
+orders free blocks by address without allocating scratch buffers; adjacent
+extents are combined and partitioned back into size classes. A free trailing
+extent returns to the bump region. Existing bump blocks are not buddy-aligned,
+so address adjacency, rather than an XOR buddy rule, is required. Live blocks
+and owner/arena accounting are unchanged. This pressure-only path holds the
+heap lock for O(n log n) work with O(word bits) stack storage; it is not a
+constant-time allocation path, and latency on hardware still needs measurement.
+
+The same fixed-heap CPython test now passes all 100 invocations with the same
+12,583,808-byte live baseline and no failed allocation. Previously it failed on
+the second admission. The 45 heap tests include adjacent-block recovery across
+live allocations and 4,000 mixed-size/alignment operations with payload checks.
+Evidence is in `tests/python-wasi/results/duo-coalesce-host`. The heavier frozen
+stdlib helper case still reaches a true MemoryError resource boundary; this
+change does not remove the 16 MiB guest memory ceiling.
+
+Python-command images additionally grant vsh the maximum representable owner
+quota (`usize::MAX`); actual use is bounded by the physical heap. This is a
+quota ceiling, not a reservation or an increase in physical RAM. Guest memory
+and owner budgets remain independent. Together with the earlier snapshot-drop
+fix, these changes are awaiting repeated serial/vsh and SSH tests on the Duo.
+
+### Physical coalescing qualification
+
+The coalescing SD image (SHA-256
+`5dfa815e7ad47f45d57891a20865644b224c4f7e92b366300ddeb70900a8e5ad`)
+booted on the 64 MiB Duo. Its boot.sd SHA-256 is
+`dcf8a9bb5dd0d09cd5bede030d76b7570fa4f2e78b8453b27935f0f0f30531c1`.
+The same CPython module was uploaded after serial key provisioning. A single
+boot then completed 100 SSH commands cycling arithmetic, JSON/math/fractions,
+Unicode arguments, stdin, separate stdout/stderr with exit 7, filesystem errors,
+Python exceptions, and reuse. Exact outputs and exit codes were checked.
+
+The serial harness initially checked output immediately upon receiving the
+runtime terminal log. On its fourth invocation this raced the remaining UART
+output. The complete raw log contains the correct output and Exited(0), so this
+was a harness false negative. Both raw results and the failed assertion are
+preserved. After requiring the terminal, complete output, and shell prompt, a
+fresh 10-command serial suite passed in the same boot. No kernel change or
+reboot intervened. Independent audit counted all 114 terminal records, each
+with `reclaimed=true caps=0 waiters=0`, and rechecked the SSH outputs and source
+hashes. The final `mem` reports heap live=2,096,768, peak=47,652,608, vsh
+live=64,768, peak=8,469,888, budget=18,446,744,073,709,551,615, denied=0.
+The reported 782,976 bump bytes are not total allocatable free memory.
+
+The host fixed-heap 100-repeat check, 45 heap tests, and 92 core unit tests also
+pass. The successful physical result qualifies these commands and repetition
+counts; it does not remove the finite-memory limit for larger Python workloads.
+Raw UART, output files, both harnesses, independent audit, and image manifest
+are archived in `tests/python-wasi/results/duo-coalesce-physical`.

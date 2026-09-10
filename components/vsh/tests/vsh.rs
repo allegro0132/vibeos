@@ -1016,3 +1016,92 @@ fn capability_command_retains_full_wasi_exit_detail() {
         vsh::TerminalDetail::WasiExit(u32::MAX)
     );
 }
+
+struct InteractivePlatform {
+    input: Mutex<std::collections::VecDeque<u8>>,
+    reader: Mutex<Option<std::task::Waker>>,
+    line: Mutex<vsh::terminal::LineDiscipline>,
+    output: Mutex<String>,
+}
+impl InteractivePlatform {
+    fn new() -> &'static Self {
+        Box::leak(Box::new(Self { input: Mutex::new(Default::default()), reader: Mutex::new(None),
+            line: Mutex::new(vsh::terminal::LineDiscipline::new()), output: Mutex::new(String::new()) }))
+    }
+    fn feed(&self, bytes: &[u8]) {
+        self.input.lock().unwrap().extend(bytes);
+        if let Some(w) = self.reader.lock().unwrap().take() { w.wake(); }
+    }
+}
+impl vsh::Platform for InteractivePlatform {
+    fn prompt(&self, text: &'static str) { self.output.lock().unwrap().push_str(text); }
+    fn write(&self, text: &str) { self.output.lock().unwrap().push_str(text); }
+    fn read_byte(&self) -> vsh::ReadByteFuture<'_> {
+        Box::pin(std::future::poll_fn(|cx| {
+            *self.reader.lock().unwrap() = Some(cx.waker().clone());
+            match self.input.lock().unwrap().pop_front() {
+                Some(b) => std::task::Poll::Ready(b), None => std::task::Poll::Pending,
+            }
+        }))
+    }
+    fn accept_byte(&self, b: u8) -> Option<vsh::InputEvent> {
+        match self.line.lock().unwrap().feed_byte(b) {
+            vsh::terminal::InputAction::Event(vsh::terminal::TerminalEvent::Line(s)) => Some(vsh::InputEvent::Line(s)),
+            vsh::terminal::InputAction::Event(vsh::terminal::TerminalEvent::Eof) => Some(vsh::InputEvent::Eof),
+            vsh::terminal::InputAction::Event(vsh::terminal::TerminalEvent::Interrupt) => Some(vsh::InputEvent::Interrupt),
+            _ => None,
+        }
+    }
+}
+fn interactive_echo(ctx: vsh::CapabilityCommandContext) -> vsh::CapabilityCommandFuture {
+    Box::pin(async move {
+        assert_eq!(ctx.write_stdout(b"READY>".to_vec()).await, Status::Success);
+        while let Some(bytes) = ctx.read_stdin_chunk().await? {
+            assert_eq!(ctx.write_stdout(bytes).await, Status::Success);
+            assert_eq!(ctx.write_stderr(b"NEXT>".to_vec()).await, Status::Success);
+        }
+        assert_eq!(ctx.write_stdout(vec![0xe4]).await, Status::Success);
+        exec::yield_now().await;
+        assert_eq!(ctx.write_stdout(vec![0xbd, 0xa0]).await, Status::Success);
+        Ok(String::new())
+    })
+}
+#[test]
+fn foreground_console_streams_prompts_input_eof_and_cancellation() {
+    let _serial = SERIAL.lock().unwrap();
+    for eof in [4, 3] {
+        let platform = InteractivePlatform::new();
+        let task = exec::spawn_tracked("terminal-test", async move {
+            let mut s = Session::new();
+            s.install_capability_host_command("repl", 0, 0, vsh::StreamMode::Optional, read_path_planner, interactive_echo);
+            vsh::run_source(platform, "repl", &mut s).await;
+        });
+        exec::run_until_idle(100_000);
+        assert!(task.try_exit().is_none());
+        assert_eq!(*platform.output.lock().unwrap(), "READY>");
+        platform.feed(b"first\r");
+        exec::run_until_idle(100_000);
+        assert!(platform.output.lock().unwrap().contains("first\nNEXT>"));
+        platform.feed(b"second\r");
+        exec::run_until_idle(100_000);
+        assert!(platform.output.lock().unwrap().contains("second\nNEXT>"));
+        platform.feed(&[eof]);
+        exec::run_until_idle(100_000);
+        assert!(task.try_exit().is_some());
+        assert_eq!(platform.output.lock().unwrap().matches("first\n").count(), 1);
+        if eof == 4 { assert!(platform.output.lock().unwrap().ends_with("你")); }
+    }
+}
+
+#[test]
+fn streaming_console_does_not_steal_command_substitution_output() {
+    let _serial = SERIAL.lock().unwrap();
+    let platform = InteractivePlatform::new();
+    let task = exec::spawn_tracked("terminal-capture", async move {
+        let mut s = Session::new();
+        vsh::run_source(platform, "echo \"a$(echo secret)b\"", &mut s).await;
+    });
+    exec::run_until_idle(100_000);
+    assert!(task.try_exit().is_some());
+    assert_eq!(*platform.output.lock().unwrap(), "asecretb\n");
+}

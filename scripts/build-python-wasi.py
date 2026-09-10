@@ -31,6 +31,7 @@ def main():
     p.add_argument('--compact-encodings', action='store_true', help='freeze Unicode, ASCII and Latin-1 codecs only; reuse intrinsic import bootstrap')
     p.add_argument('--frozen-opt-level', type=int, choices=[0, 1, 2], default=0)
     p.add_argument('--opt-level', choices=['2', 's', 'z'], default='2')
+    p.add_argument('--native-tracebacks', action='store_true', help='use CPython native exception formatting without importing the Python traceback formatter')
     p.add_argument('--jobs', type=int, default=8)
     p.add_argument('--skip-configure', action='store_true', help='reuse this work directory\'s configured WASI build')
     args = p.parse_args()
@@ -60,7 +61,21 @@ def main():
             cwd=work, env=env)
     if args.without_legacy_cjk_codecs:
         (work / 'Modules/Setup.local').write_text('*disabled*\n_codecs_cn _codecs_hk _codecs_iso2022 _codecs_jp _codecs_kr _codecs_tw\n')
-    run(['make', f'-j{args.jobs}', 'libpython3.14.a'], cwd=work, env=env)
+    # Keep the upstream native formatter (including chained exceptions) for
+    # memory-constrained interactive use. Other builds retain upstream behavior.
+    pythonrun = source / 'Python/pythonrun.c'
+    marker = '    // Try first with the stdlib traceback module\n'
+    guard = '#ifdef VIBE_WASI_NATIVE_TRACEBACK\n    goto fallback;\n#endif\n'
+    text = pythonrun.read_text()
+    if guard not in text:
+        if text.count(marker) != 1:
+            raise RuntimeError('CPython exception-formatting patch anchor changed')
+        pythonrun.write_text(text.replace(marker, guard + marker))
+    # Make does not track command-line macro changes. Recompile this one object
+    # on every invocation so switching the option cannot reuse stale behavior.
+    (work / 'Python/pythonrun.o').unlink(missing_ok=True)
+    extra = 'EXTRA_CFLAGS=' + ('-DVIBE_WASI_NATIVE_TRACEBACK' if args.native_tracebacks else '')
+    run(['make', f'-j{args.jobs}', extra, 'libpython3.14.a'], cwd=work, env=env)
     run([python, ROOT / 'scripts/freeze-python-wasi.py', source / 'Lib', work / 'frozen-stdlib.h', str(args.frozen_opt_level), 'compact' if args.compact_encodings else 'all'])
     # Retain CPython's actual library closure (mpdecimal, expat, HACL, wasi-libc)
     # instead of guessing libraries or accidentally linking host dependencies.
@@ -76,7 +91,7 @@ def main():
          '-o', work / 'python.wasm'], cwd=work, env=env)
     module = (work / 'python.wasm').read_bytes()
     (work / 'build.json').write_text(json.dumps({
-        'python': version, 'compiler': compiler, 'opt_level': args.opt_level, 'legacy_cjk_codecs': not args.without_legacy_cjk_codecs, 'frozen_opt_level': args.frozen_opt_level, 'compact_encodings': args.compact_encodings, 'bytes': len(module),
+        'python': version, 'compiler': compiler, 'native_tracebacks': args.native_tracebacks, 'opt_level': args.opt_level, 'legacy_cjk_codecs': not args.without_legacy_cjk_codecs, 'frozen_opt_level': args.frozen_opt_level, 'compact_encodings': args.compact_encodings, 'bytes': len(module),
         'sha256': hashlib.sha256(module).hexdigest(),
     }, indent=2) + '\n')
     print(work / 'python.wasm')

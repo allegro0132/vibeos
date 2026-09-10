@@ -21,6 +21,7 @@ pub use engine::*;
 pub use file_commands::*;
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -147,29 +148,70 @@ pub async fn run_source(platform: &dyn Platform, source: &str, session: &mut Ses
     let cancel_task = cancel.clone();
     let source = String::from(source);
     let mut foreground = core::mem::take(session);
+    platform.set_completion_candidates(&[]);
+    let terminal_input = ByteStream::new();
+    let task_input = terminal_input.clone();
+    let terminal_output = foreground.terminal_output();
     let handle = vibeos_core::exec::spawn_tracked("vsh-foreground", async move {
-        let result = foreground.execute_cancellable(&source, cancel_task).await;
+        let result = foreground.execute_terminal_cancellable(&source, cancel_task, task_input).await;
         *completed_task.lock() = Some((foreground, result));
     });
 
+    let mut lines = VecDeque::<Vec<u8>>::new();
+    let mut sending: Option<Pin<Box<dyn Future<Output = Result<(), CloseReason>> + Send>>> = None;
+    let mut eof = false;
     loop {
+        if sending.is_none() {
+            if let Some(line) = lines.pop_front() {
+                let stream = terminal_input.clone();
+                sending = Some(Box::pin(async move {
+                    for chunk in line.chunks(MAX_STREAM_CHUNK_BYTES) {
+                        stream.send(chunk.to_vec()).await?;
+                    }
+                    Ok(())
+                }));
+            } else if eof { terminal_input.close_write(CloseReason::Normal); }
+        }
         let mut join = pin!(handle.join());
         let mut input = platform.read_byte();
+        let mut output = pin!(terminal_output.wait_ready());
         let event = poll_fn(|cx| {
-            if let Poll::Ready(exit) = join.as_mut().poll(cx) {
-                return Poll::Ready(Ok(exit));
+            if join.as_mut().poll(cx).is_ready() { return Poll::Ready((0, 0)); }
+            if let Some(send) = &mut sending {
+                if send.as_mut().poll(cx).is_ready() { return Poll::Ready((3, 0)); }
             }
-            input.as_mut().poll(cx).map(Err)
-        })
-        .await;
+            if output.as_mut().poll(cx).is_ready() { return Poll::Ready((2, 0)); }
+            input.as_mut().poll(cx).map(|byte| (1, byte))
+        }).await;
         match event {
-            Ok(_) => break,
-            Err(0x03) => {
-                cancel.cancel();
+            (0, _) => break,
+            (3, _) => sending = None,
+            (2, _) => platform.write(&terminal_output.take_terminal_string()),
+            (1, byte) => {
+                if byte == 0x03 {
+                    cancel.cancel();
+                    terminal_input.close_write(CloseReason::Cancelled);
+                    lines.clear();
+                    sending = None;
+                    let _ = platform.accept_byte(byte);
+                } else if !eof {
+                    match platform.accept_byte(byte) {
+                        Some(InputEvent::Line(mut line)) => {
+                            if lines.len() < STREAM_BUFFER_CHUNKS {
+                                line.push('\n');
+                                lines.push_back(line.into_bytes());
+                            } else { platform.write("\x07[terminal input queue full]\n"); }
+                        }
+                        Some(InputEvent::Eof) => eof = true,
+                        Some(InputEvent::Interrupt) => { cancel.cancel(); },
+                        None => {}
+                    }
+                }
             }
-            Err(_) => {}
+            _ => unreachable!(),
         }
     }
+    terminal_input.close_write(CloseReason::Normal);
 
     let (foreground, result) = completed
         .lock()

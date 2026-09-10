@@ -605,6 +605,7 @@ impl OwnerAccount {
 }
 
 struct FreeNode {
+    size: usize, // populated by pressure coalescing
     next: Option<NonNull<FreeNode>>,
 }
 
@@ -1326,6 +1327,7 @@ impl Heap {
                 });
                 let free = base as *mut FreeNode;
                 free.write(FreeNode {
+                    size: 0,
                     next: h.free[class],
                 });
                 h.free[class] = NonNull::new(free);
@@ -1497,6 +1499,72 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
         .map(|aligned| aligned & !(align - 1))
 }
 
+// Merge two address-ordered intrusive lists without allocating scratch memory.
+unsafe fn merge_free(mut a: Option<NonNull<FreeNode>>, mut b: Option<NonNull<FreeNode>>) -> Option<NonNull<FreeNode>> {
+    let mut result = None;
+    let mut tail = &mut result as *mut Option<NonNull<FreeNode>>;
+    while a.is_some() && b.is_some() {
+        let take_a = a.unwrap().as_ptr() < b.unwrap().as_ptr();
+        let mut node = if take_a { a.unwrap() } else { b.unwrap() };
+        if take_a { a = unsafe { node.as_ref().next }; } else { b = unsafe { node.as_ref().next }; }
+        unsafe { *tail = Some(node); tail = &mut node.as_mut().next; }
+    }
+    unsafe { *tail = a.or(b); }
+    result
+}
+
+// Allocation-free bottom-up merge sort: O(n log n) time, O(word bits) stack.
+// Runs under the heap lock only when ordinary allocation cannot find space.
+// Blocks need only MIN_CLASS_SIZE alignment; unlike a buddy allocator, existing
+// bump allocations are not aligned to their size. Merge by adjacency, then
+// partition each free extent back into power-of-two size classes.
+unsafe fn coalesce_free(h: &mut HeapInner) {
+    let mut bins = [None; usize::BITS as usize];
+    for class in 0..NUM_CLASSES {
+        let mut list = h.free[class].take();
+        while let Some(mut node) = list {
+            unsafe {
+                list = node.as_ref().next;
+                node.as_mut().next = None;
+                node.as_mut().size = class_size(class);
+            }
+            let mut run = Some(node);
+            let mut i = 0;
+            while bins[i].is_some() {
+                run = unsafe { merge_free(bins[i].take(), run) };
+                i += 1;
+            }
+            bins[i] = run;
+        }
+    }
+    let mut list = None;
+    for bin in bins { list = unsafe { merge_free(list, bin) }; }
+    while let Some(node) = list {
+        let mut base = node.as_ptr() as usize;
+        let mut size = unsafe { node.as_ref().size };
+        list = unsafe { node.as_ref().next };
+        while let Some(next) = list {
+            if base + size != next.as_ptr() as usize { break; }
+            size += unsafe { next.as_ref().size };
+            list = unsafe { next.as_ref().next };
+        }
+        if base + size == h.cursor {
+            h.cursor = base;
+            continue;
+        }
+        while size != 0 {
+            let shift = usize::BITS as usize - 1 - size.leading_zeros() as usize;
+            let class = shift - MIN_CLASS_SHIFT;
+            let block = base as *mut FreeNode;
+            unsafe { block.write(FreeNode { size: 0, next: h.free[class] }); }
+            h.free[class] = NonNull::new(block);
+            let bytes = class_size(class);
+            base += bytes;
+            size -= bytes;
+        }
+    }
+}
+
 fn class_size(index: usize) -> usize {
     1usize << (index + MIN_CLASS_SHIFT)
 }
@@ -1630,6 +1698,14 @@ unsafe impl GlobalAlloc for Heap {
             return ptr::null_mut();
         };
 
+        // Only the pressure path sorts free blocks. No allocation is performed;
+        // address-order merging recovers adjacent space across size classes.
+        if h.cursor.checked_add(plan.charge).is_none_or(|end| end > h.end)
+            && h.free[plan.class..].iter().all(Option::is_none)
+        {
+            unsafe { coalesce_free(&mut h); }
+        }
+
         // Reuse the smallest suitable free class before consuming the contiguous
         // bump region. Waiting until bump exhaustion lets small allocations
         // strand that region before a later large request arrives. At most
@@ -1645,10 +1721,10 @@ unsafe impl GlobalAlloc for Heap {
                 while class > plan.class {
                     class -= 1;
                     let sibling = (base + class_size(class)) as *mut FreeNode;
-                    unsafe { sibling.write(FreeNode { next: h.free[class] }); }
+                    unsafe { sibling.write(FreeNode { size: 0, next: h.free[class] }); }
                     h.free[class] = Some(unsafe { NonNull::new_unchecked(sibling) });
                 }
-                unsafe { (base as *mut FreeNode).write(FreeNode { next: h.free[plan.class] }); }
+                unsafe { (base as *mut FreeNode).write(FreeNode { size: 0, next: h.free[plan.class] }); }
                 h.free[plan.class] = Some(node);
             }
         }
@@ -1861,6 +1937,7 @@ unsafe impl GlobalAlloc for Heap {
             });
             let node = header.base as *mut FreeNode;
             node.write(FreeNode {
+                size: 0,
                 next: h.free[header.class],
             });
             h.free[header.class] = NonNull::new(node);

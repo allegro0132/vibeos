@@ -85,6 +85,11 @@ impl WasiIo for Io {
 }
 
 fn main() {
+    // Native stdio has process-lifetime lazy buffers; initialize them before
+    // switching allocators so they are not mistaken for leaked guest objects.
+    drop(std::io::stdin().lock());
+    drop(std::io::stdout().lock());
+    drop(std::io::stderr().lock());
     const BYTES: usize = 50_442_240;
     vibeos_core::arch::set_test_hart_id(0);
     let memory = unsafe { System.alloc(Layout::from_size_align(BYTES, 4096).unwrap()) };
@@ -105,8 +110,13 @@ fn main() {
         total_fuel: 100_000_000_000,
         ..Default::default()
     };
+    let repeats: usize = std::env::var("VIBE_DUO_REPEATS")
+        .ok().map(|n| n.parse().expect("VIBE_DUO_REPEATS must be an integer")).unwrap_or(1);
+    assert!(repeats > 0);
+    for iteration in 0..repeats {
+    *FAILURE.lock().unwrap() = None;
     let owner = HEAP.create_owner(40 * 1024 * 1024).unwrap();
-    let mut owner_scope = unsafe { enter_owner(owner) };
+    let mut owner_scope = enter_owner(owner);
     let setup = Instant::now();
     let mut invocation = match WasiInvocation::new(&module, &args, limits) {
         Ok(value) => value,
@@ -134,8 +144,9 @@ fn main() {
     drop(invocation);
     owner_scope.restore();
     eprintln!("board_heap={:?} failure={:?}", HEAP.snapshot(), *FAILURE.lock().unwrap());
-    std::process::exit(match terminal {
-        WasiTerminal::Exited(0) => 0,
-        _ => 1,
-    });
+    HEAP.unregister_owner(owner).expect("interpreter allocations must be reclaimed");
+    if terminal != WasiTerminal::Exited(0) { std::process::exit(1); }
+    if repeats > 1 { eprintln!("repeat={}/{}", iteration + 1, repeats); }
+    }
+
 }

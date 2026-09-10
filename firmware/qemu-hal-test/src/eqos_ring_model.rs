@@ -133,5 +133,15 @@ pub unsafe fn run() {
     RESET.store(true, Ordering::Release);
     r.initialize().unwrap();
     assert_eq!(r.pending(), 0);
+    let mut r = match r.into_stopped_backend() {
+        Err(r) => r,
+        Ok(_) => panic!("released live ring"),
+    };
+    assert!(r.shutdown());
+    let backend = r.into_stopped_backend().ok().unwrap();
+    backend.0.set_link(Speed::Mbps100, true).unwrap();
+    let mut r = Ring::new(backend, L).unwrap();
+    r.initialize().unwrap();
+    assert_eq!(r.pending(), 0);
     r.fault();
 }

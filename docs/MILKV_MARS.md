@@ -980,3 +980,29 @@ Actual clocks, reset synchronizers, pad electrical behavior and PHY/carrier are
 still unqualified. Production Mars packet-device assembly and physical network,
 SSH and stability acceptance remain required. The existing SD image remains
 the serial/SD bring-up profile.
+
+### Packet link lifecycle prerequisites
+
+EQoS now permits changing the next MAC speed/duplex only while stopped and
+invalidates the previous controller configuration. A ring can return its owned
+backend before first start or after successful shutdown; running or quarantined
+rings retain ownership. This allows firmware to coordinate PHY phase changes
+and MAC configuration without reaching through live DMA references.
+
+The kernel packet adapter now polls PHY by elapsed time before processing the
+packet batch. Previously, only idle iterations advanced its PHY poll counter;
+an outbound DHCP packet waiting for the first link could keep the task busy and
+prevent it from observing that link. A pending packet with no DMA-owned TX now
+uses the normal sleep/retry path, while active descriptors retain fast polling.
+Capability/session admission and hardware timeout policy remain in the kernel.
+
+Two controller/ownership tests and two cadence tests pass along with the prior
+related tests (41 total). The RV64 model exercises stopped backend reuse and
+the real cadence helper, reports `PACKET_LINK_MODEL PASS`, and runs 395 kernel
+selftests. Mutations removing the running-state guard, releasing a live backend,
+keeping stale configuration and shifting the poll deadline are detected.
+Evidence is in `boards/milkv-mars/eqos-link-lifecycle-evidence.json`.
+
+The QEMU model does not exercise actual Mars carrier changes or the complete
+packet-task/DHCP path. Firmware packet-device assembly and physical tests are
+still required before claiming Mars Ethernet or SSH support.

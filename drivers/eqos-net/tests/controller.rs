@@ -10,6 +10,55 @@ struct Pool {
     state: Rc<RefCell<State>>,
     admit: bool,
 }
+
+#[test]
+fn link_reconfiguration_requires_stop_and_invalidates_old_configuration() {
+    let (mut c, s) = model();
+    c.reset().unwrap();
+    c.configure(layout()).unwrap();
+    c.set_link(Speed::Mbps10, true).unwrap();
+    assert_eq!(c.start(), Err(Error::NotReady));
+    c.configure(layout()).unwrap();
+    c.start().unwrap();
+    let count = s.borrow().writes.len();
+    assert_eq!(c.set_link(Speed::Mbps100, true), Err(Error::NotReady));
+    assert_eq!(s.borrow().writes.len(), count);
+    c.stop().unwrap();
+    c.set_link(Speed::Mbps100, true).unwrap();
+    assert_eq!(c.start(), Err(Error::NotReady));
+    c.configure(layout()).unwrap();
+    c.start().unwrap();
+    assert_eq!(s.borrow().registers[&0] & 0xe000, 0xe000);
+}
+
+#[test]
+fn running_or_failed_stop_keeps_backend_and_successful_stop_allows_reuse() {
+    let (c, s) = model();
+    let pool = Box::leak(Box::new(Pool {
+        state: s.clone(),
+        admit: true,
+    }));
+    let b = Box::leak(Box::new(Backend::new(c, pool)));
+    let mut ring = Ring::new(b, layout()).unwrap();
+    ring.initialize().unwrap();
+    let mut ring = match ring.into_stopped_backend() {
+        Err(r) => r,
+        Ok(_) => panic!("released live DMA"),
+    };
+    s.borrow_mut().reset_stuck = true;
+    assert!(!ring.shutdown());
+    let mut ring = match ring.into_stopped_backend() {
+        Err(r) => r,
+        Ok(_) => panic!("released quarantined DMA"),
+    };
+    s.borrow_mut().reset_stuck = false;
+    assert!(ring.shutdown());
+    let b = ring.into_stopped_backend().ok().unwrap();
+    b.set_link(Speed::Mbps10, true).unwrap();
+    let mut ring = Ring::new(b, layout()).unwrap();
+    ring.initialize().unwrap();
+    assert_eq!(s.borrow().registers[&0] & 0xe000, 0xa000);
+}
 unsafe impl Memory for Pool {
     fn admit(&self, l: Layout) -> bool {
         self.admit && l == layout()

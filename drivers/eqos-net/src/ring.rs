@@ -139,6 +139,15 @@ impl<B: Backend> Ring<B> {
             receive: 0,
         })
     }
+    /// Release the backend only before first DMA start or after a successful
+    /// shutdown. A running/quarantined ring retains exclusive pool ownership.
+    pub fn into_stopped_backend(self) -> Result<&'static mut B, Self> {
+        if self.state == State::Offline {
+            Ok(self.backend)
+        } else {
+            Err(self)
+        }
+    }
     pub fn initialize(&mut self) -> Result<(), Error> {
         if self.state == State::Running {
             return Err(Error::Controller);

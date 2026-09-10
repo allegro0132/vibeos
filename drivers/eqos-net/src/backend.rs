@@ -28,6 +28,13 @@ pub struct Backend<R: Io, M: Memory> {
     failed: bool,
 }
 impl<R: Io, M: Memory> Backend<R, M> {
+    pub fn set_link(
+        &mut self,
+        speed: crate::controller::Speed,
+        full_duplex: bool,
+    ) -> Result<(), crate::controller::Error> {
+        self.controller.set_link(speed, full_duplex)
+    }
     pub fn new(controller: Controller<R>, memory: &'static mut M) -> Self {
         Self {
             controller,

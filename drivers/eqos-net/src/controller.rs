@@ -73,6 +73,17 @@ impl<R: Io> Controller<R> {
             layout: None,
         })
     }
+    /// Change the next configuration only while the controller is stopped.
+    /// Invalidates any prior configuration; start requires configure again.
+    pub fn set_link(&mut self, speed: Speed, full_duplex: bool) -> Result<(), Error> {
+        if self.running {
+            return Err(Error::NotReady);
+        }
+        self.config.speed = speed;
+        self.config.full_duplex = full_duplex;
+        self.configured = false;
+        Ok(())
+    }
     fn update(&mut self, offset: usize, clear: u32, set: u32) {
         let value = self.io.read(offset);
         self.io.write(offset, (value & !clear) | set);

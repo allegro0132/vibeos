@@ -1124,6 +1124,8 @@ mod dwc2_host;
 mod packet_device;
 #[cfg(feature = "packet-network")]
 mod dwmac_net;
+#[cfg(feature = "packet-network")]
+mod network_poll;
 mod net_device;
 #[cfg(feature = "pio-block")]
 mod pio_block;

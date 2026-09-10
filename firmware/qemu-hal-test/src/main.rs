@@ -28,6 +28,9 @@ mod eqos_pool_model;
 mod phy_model;
 #[cfg(feature = "eqos-model-test")]
 mod jh7110_ethernet_model;
+#[cfg(feature = "eqos-model-test")]
+#[path = "../../../kernel/src/network_poll.rs"]
+mod network_poll;
 #[cfg(feature = "jh7110-sd-model-test")]
 mod jh7110_sd_model;
 #[cfg(feature = "mars-composition-test")]
@@ -37,6 +40,11 @@ unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
     {
         eqos_model::run();
         eqos_ring_model::run();
+        let mut last = None;
+        assert!(network_poll::due(&mut last, 1, 4_000_000));
+        for _ in 0..10_000 { assert!(!network_poll::due(&mut last, 2, 4_000_000)); }
+        assert!(network_poll::due(&mut last, 4_000_001, 4_000_000));
+        _print(format_args!("PACKET_LINK_MODEL PASS reconfigure=stopped cadence=elapsed-time\n"));
         eqos_pool_model::run();
         phy_model::run(jh7110_ethernet_model::run());
         _print(format_args!("JH7110_ETHERNET_MODEL PASS csr_hz=198000000 tx_parent=external reset=bounded\n"));

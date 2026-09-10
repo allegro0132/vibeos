@@ -1,10 +1,6 @@
-//! Polling CV1800B DWMAC backend for the Milk-V Duo Ethernet IO Board.
-//!
-//! The driver uses bounded normal RX and TX descriptor rings. Each descriptor
-//! occupies its own non-coherent cache line even
-//! though the device consumes only the first four words. Packet transport
-//! remains the same bounded, capability-addressed raw-L2 interface used by the
-//! QEMU virtio-net backend.
+//! Capability/session policy for a firmware-owned packet device. The historical
+//! module and resource names remain compatible; hardware descriptors, PHY,
+//! clocks and DMA synchronization are supplied by the firmware HAL instance.
 
 extern crate alloc;
 
@@ -387,7 +383,7 @@ pub async fn driver_task(
 
     let mut pending_tx = None;
     let mut tx_deadline = 0;
-    let mut link_poll = 0u16;
+    let mut link_poll = None;
     loop {
         if FAULT.swap(false, Ordering::AcqRel) {
             panic!("injected CV1800B DWMAC fault");
@@ -451,8 +447,13 @@ fn driver_turn(
     inbound: &Revocable<Endpoint<StampedPacket>>,
     pending_tx: &mut Option<Packet>,
     tx_deadline: &mut u64,
-    link_poll: &mut u16,
+    link_poll: &mut Option<u64>,
 ) -> Result<bool, NetError> {
+    // Observe cable/negotiation changes even when a queued DHCP packet is
+    // waiting for the first link, or sustained traffic keeps the turn busy.
+    if crate::network_poll::due(link_poll, crate::sbi::time(), crate::exec::timebase_hz()) {
+        engine.poll_link();
+    }
     let mut immediate_work = false;
     // Once a packet leaves the bounded endpoint, this task owns it until a TX
     // descriptor accepts it. Ring pressure is ordinary backpressure until the
@@ -482,7 +483,6 @@ fn driver_turn(
                     immediate_work = true;
                 }
                 Err(HardwareError::QueueFull) => {
-                    immediate_work = true;
                     break;
                 }
                 Err(HardwareError::PacketTooLarge) => {
@@ -495,7 +495,7 @@ fn driver_turn(
         }
         let descriptor_busy = engine.tx_owned();
         state.tx_inflight = descriptor_busy || pending_tx.is_some();
-        immediate_work |= state.tx_inflight;
+        immediate_work |= descriptor_busy;
         if state.tx_inflight && *tx_deadline == 0 {
             *tx_deadline = now.saturating_add(tx_timeout_ticks());
         } else if !state.tx_inflight {
@@ -519,17 +519,6 @@ fn driver_turn(
                 Err(NetError::QueueFull) => break,
                 Err(error) => return Err(error),
             }
-        }
-    }
-    // Preserve the original approximately-one-second PHY cadence.  Busy
-    // turns can now run much faster than 1 kHz, so counting them would make
-    // MDIO polling consume the data path.  Once traffic stops, idle turns
-    // resume the link check and promptly observe a disconnected cable.
-    if !immediate_work {
-        *link_poll = link_poll.wrapping_add(1);
-        if *link_poll >= 1_000 {
-            *link_poll = 0;
-            engine.poll_link();
         }
     }
     Ok(immediate_work)

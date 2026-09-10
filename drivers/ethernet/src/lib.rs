@@ -1,6 +1,7 @@
 #![no_std]
 //! Shared IEEE Clause 22 transactions. Register encodings belong to controllers.
 //! Poll bounds do not prove a wall-clock timeout; consumers provide the budget.
+pub mod phy;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {

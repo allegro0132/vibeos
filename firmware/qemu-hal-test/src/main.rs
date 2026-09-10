@@ -24,6 +24,8 @@ mod eqos_model;
 mod eqos_ring_model;
 #[cfg(feature = "eqos-model-test")]
 mod eqos_pool_model;
+#[cfg(feature = "eqos-model-test")]
+mod phy_model;
 #[cfg(feature = "jh7110-sd-model-test")]
 mod jh7110_sd_model;
 #[cfg(feature = "mars-composition-test")]
@@ -34,6 +36,8 @@ unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
         eqos_model::run();
         eqos_ring_model::run();
         eqos_pool_model::run();
+        phy_model::run();
+        _print(format_args!("YT8531_MODEL PASS address=17 config=verified reset=bounded\n"));
         _print(format_args!("EQOS_POOL_MODEL PASS mapping=translated cache=flush64 tx_rx=copied\n"));
         _print(format_args!("EQOS_CONTROLLER_MODEL PASS registers=configured reset=bounded\n"));
         _print(format_args!("EQOS_RING_MODEL PASS tx=bounded rx=copied recovery=quarantined\n"));

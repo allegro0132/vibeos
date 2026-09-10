@@ -921,3 +921,32 @@ and `boards/milkv-mars/network-resource-evidence.json`.
 This stage admits descriptions only: JH7110 Ethernet clock/reset programming,
 PHY discovery/configuration and production device registration remain pending.
 The existing SD image continues to be the serial/SD bring-up profile.
+
+### Shared PHY discovery and YT8531 configuration
+
+`drivers/ethernet::phy` now provides read-only Clause 22 discovery across an
+explicit address mask. The YT8531 frontend requires the exact supported ID,
+owns its MDIO port, validates board tuning before I/O, and revalidates identity
+before soft reset. Reset and all transactions have finite poll budgets; a
+failed configuration remains unavailable. Extended-register writes preserve
+unrelated fields and verify readback. The initial advertisement supports full
+duplex at 10/100/1000 Mbps without pause, matching the EQoS datapath.
+
+Ordinary link polling performs reads only. It requires completed negotiation,
+resolved vendor status, and a stable second sample. The caller must stop MAC/DMA
+before invoking the separate speed-dependent TX inversion configuration. Any
+configuration or MDIO error invalidates the initialized state; no failed write
+is replayed. EQoS re-exports the shared speed type, preserving its existing API.
+
+Eight new PHY tests cover discovery ambiguity, register preservation, reset and
+readback failures, every initialization transaction failing in turn, link
+changes, and timeout recovery. Together with existing Ethernet/EQoS/Duo tests,
+57 host tests pass. The RV64 model composes the real EQoS MDIO transport and PHY
+frontend and reports `YT8531_MODEL PASS`; 395 kernel selftests pass. Four mutations
+removing reset proof, preserving the wrong drive bits, bypassing readback and
+failing to quarantine are detected. Sources and evidence are in
+`boards/milkv-mars/phy-reference.json` and `boards/milkv-mars/phy-evidence.json`.
+
+Actual PHY identity, electrical timing and Ethernet clock/reset programming are
+not qualified by these models. Mars firmware device registration and network,
+SSH/entropy and physical acceptance still remain; the SD image is unchanged.

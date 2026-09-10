@@ -25,12 +25,7 @@ pub unsafe trait Io: Registers {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Speed {
-    Mbps10,
-    Mbps100,
-    Mbps1000,
-}
+pub use vibeos_ethernet::phy::Speed;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
     pub mac: [u8; 6],

@@ -15,14 +15,14 @@ import tempfile
 import time
 
 
-def run(kernel, output, dtb=None, expect_rejection=False, require_admission=False):
+def run(kernel, output, dtb=None, expect_rejection=False, require_admission=False, memory="128M"):
     output.mkdir(parents=True, exist_ok=True)
     # Refuse to overwrite evidence before starting a VM.
     with (output / 'serial.log').open('xb') as log, tempfile.TemporaryDirectory(prefix='vibeos-dtb-') as work:
         disk = Path(work) / 'data.raw'
         with disk.open('wb') as f:
             f.truncate(128 * 1024 * 1024)
-        cmd = ['qemu-system-riscv64', '-machine', 'virt', '-cpu', 'rv64', '-smp', '4', '-m', '128M',
+        cmd = ['qemu-system-riscv64', '-machine', 'virt', '-cpu', 'rv64', '-smp', '4', '-m', memory,
                '-nographic', '-bios', 'default', '-kernel', str(kernel), '-nic', 'none',
                '-drive', f'if=none,id=disk,format=raw,file={disk}',
                '-device', 'virtio-blk-device,drive=disk,bus=virtio-mmio-bus.0,queue-size=8',
@@ -92,6 +92,7 @@ def run(kernel, output, dtb=None, expect_rejection=False, require_admission=Fals
     result['kernel_sha256'] = hashlib.sha256(kernel.read_bytes()).hexdigest()
     result['physical_acceptance'] = False
     result['require_admission'] = require_admission
+    result['memory'] = memory
     (output / 'summary.json').write_text(json.dumps(result, indent=2) + '\n')
     return result
 
@@ -103,5 +104,6 @@ if __name__ == '__main__':
     parser.add_argument('--dtb', type=Path)
     parser.add_argument('--expect-rejection', action='store_true')
     parser.add_argument('--require-admission', action='store_true')
+    parser.add_argument('--memory', default='128M', choices=['128M', '4G'])
     args = parser.parse_args()
-    print(json.dumps(run(args.kernel, args.output, args.dtb, args.expect_rejection, args.require_admission), indent=2))
+    print(json.dumps(run(args.kernel, args.output, args.dtb, args.expect_rejection, args.require_admission, args.memory), indent=2))

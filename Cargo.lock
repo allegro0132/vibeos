@@ -1765,6 +1765,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibeos-firmware-milkv-mars"
+version = "0.1.0"
+dependencies = [
+ "vibeos-bsp-milkv-mars",
+ "vibeos-driver-dw-mshc",
+ "vibeos-driver-plic",
+ "vibeos-driver-uart16550",
+ "vibeos-hal",
+ "vibeos-image-policy",
+ "vibeos-kernel",
+ "vibeos-platform-jh7110",
+ "vibeos-runtime-riscv",
+]
+
+[[package]]
 name = "vibeos-firmware-qemu-hal-test"
 version = "0.1.0"
 dependencies = [
@@ -1776,6 +1791,7 @@ dependencies = [
  "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
  "vibeos-driver-virtio-net",
+ "vibeos-firmware-milkv-mars",
  "vibeos-hal",
  "vibeos-kernel",
  "vibeos-platform-jh7110",

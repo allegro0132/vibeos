@@ -276,7 +276,7 @@ fn disjoint_heap(h: &mut Harness) {
 fn large_ram(h: &mut Harness) {
     use vibeos_core::mmu::PagePermissions;
     let pages = [0x90000000usize, 0xc0000000, 0x100000000, 0x140000000, 0x17ffff000];
-    let heap_end = core::ptr::addr_of!(crate::__heap_end) as usize;
+    let heap_end = crate::platform::description().heap_end;
     assert!(pages.iter().all(|&p| p >= heap_end && p + 4096 <= crate::mmu::kernel_ram_end()));
     h.check("four GiB profile maps four separate Sv39 root windows",
         crate::mmu::kernel_ram_start() == 0x80200000 && crate::mmu::kernel_ram_end() == 0x180000000);

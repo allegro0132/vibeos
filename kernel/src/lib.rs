@@ -1267,7 +1267,6 @@ _secondary_start:
 
 extern "C" {
     static __heap_start: u8;
-    static __heap_end: u8;
     static __stack_bottom: u8;
     fn _secondary_start();
 }
@@ -1313,7 +1312,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
 
     let (hs, he) = (
         core::ptr::addr_of!(__heap_start) as usize,
-        core::ptr::addr_of!(__heap_end) as usize,
+        platform::description().heap_end,
     );
     if let Some(admit) = platform::description().admit_boot {
         let request = vibeos_hal::boot::BootRequest {

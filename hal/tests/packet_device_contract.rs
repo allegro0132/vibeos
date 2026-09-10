@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize,Ordering::SeqCst};
 static STAGE:AtomicUsize=AtomicUsize::new(0);
 #[no_mangle]
 static VIBEOS_PACKET_DEVICE:Device=Device{
+    present:true,
     registers:AddressRange::new(0x1000,0x2000),irq:31,rx_queue_size:32,
     dma_base:||0x90000000,
     telemetry:||Telemetry{tx_checksum_offload:true,rx_checksum_offload:false,..Telemetry::default()},

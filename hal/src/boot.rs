@@ -25,6 +25,7 @@ pub enum BootError {
     InvalidCpu,
     InvalidTimebase,
     AlreadyInitialized,
+    UnsupportedFirmware,
 }
 impl BootRequest {
     /// Clip the already reservation-subtracted memory map to the linker heap
@@ -100,6 +101,9 @@ pub struct BootPlatform {
     pub info: BoardInfo,
     pub memory_map: &'static [MemoryRegion],
     pub mmu: MmuDescription,
+    /// Physical heap ceiling as a value: a 4 GiB RAM span can place its end
+    /// beyond the RISC-V medany range of a PC-relative linker-symbol address.
+    pub heap_end: usize,
     /// Called only after successful boot admission, when configured.
     pub hart_ids: fn() -> &'static [usize],
     pub timebase_hz: fn() -> u64,

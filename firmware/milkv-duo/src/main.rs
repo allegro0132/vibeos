@@ -47,3 +47,5 @@ const BOOT_ADMISSION: Option<
 > = None;
 
 const BOOT_HEAP_REGIONS: Option<fn() -> &'static [vibeos_hal::AddressRange]> = None;
+
+const HEAP_END: usize = Board::MMU.ram.end;

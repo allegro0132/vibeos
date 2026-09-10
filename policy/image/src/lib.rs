@@ -39,10 +39,13 @@ use vibeos_component_format::{
     ComponentGraphVersionError, ComponentGraphVersionV1,
 };
 
+#[cfg(all(feature = "bounded-device", any(feature = "qemu-default", feature = "milkv-duo-sd")))]
+compile_error!("bounded-device cannot be combined with another image policy");
+
 #[cfg(all(feature = "qemu-default", feature = "milkv-duo-sd"))]
 compile_error!("image policies `qemu-default` and `milkv-duo-sd` are mutually exclusive");
 
-#[cfg(not(any(feature = "qemu-default", feature = "milkv-duo-sd")))]
+#[cfg(not(any(feature = "qemu-default", feature = "milkv-duo-sd", feature = "bounded-device")))]
 compile_error!("exactly one image policy must be selected");
 
 #[cfg(all(
@@ -53,7 +56,7 @@ compile_error!("feature `c53-native-async-qemu-acceptance` requires `qemu-defaul
 
 #[cfg(all(
     feature = "c88-f4-float-candidate",
-    not(any(feature = "qemu-default", feature = "milkv-duo-sd"))
+    not(any(feature = "qemu-default", feature = "milkv-duo-sd", feature = "bounded-device"))
 ))]
 compile_error!(
     "feature `c88-f4-float-candidate` requires an explicit QEMU or Milk-V Duo image policy"
@@ -2394,6 +2397,14 @@ pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
 pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
     first_sector: 0,
     sector_count: 262_144,
+});
+
+/// Firmware already enforces a 512 MiB data-only device namespace. Kernel
+/// capabilities may attenuate it, but cannot address the physical boot area.
+#[cfg(feature = "bounded-device")]
+pub const BLOCK_DATA_SLICE: Option<BlockSlice> = Some(BlockSlice {
+    first_sector: 0,
+    sector_count: 1_048_576,
 });
 
 /// The packaged Duo image places raw service data immediately after its

@@ -5,6 +5,7 @@ impl Engine {
     /// # Safety
     /// The caller retains exclusive device/DMA capabilities for this session.
     pub unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<Self, Error> {
+        if !device().present { return Err(Error::InvalidDescription); }
         (device().claim)(mac, time, hz)?;
         Ok(Self)
     }

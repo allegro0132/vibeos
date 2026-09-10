@@ -20,7 +20,14 @@ unsafe fn platform_init(_write: fn(&str)) {}
 mod boot_admission;
 #[cfg(feature = "jh7110-sd-model-test")]
 mod jh7110_sd_model;
+#[cfg(feature = "mars-composition-test")]
+mod mars_composition;
 unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
+    #[cfg(feature = "mars-composition-test")]
+    {
+        mars_composition::run();
+        _print(format_args!("MARS_COMPOSITION_MODEL PASS admission=ok partition=bounded\n"));
+    }
     #[cfg(feature = "mars-resources-test")]
     {
         let fixture = include_bytes!("../../../boards/milkv-mars/tests/fixtures/resources.dtb");
@@ -76,3 +83,5 @@ const BOOT_ADMISSION: Option<
 const BOOT_HEAP_REGIONS: Option<fn() -> &'static [vibeos_hal::AddressRange]> = Some(boot_admission::heap_regions);
 #[cfg(not(feature = "boot-admission-test"))]
 const BOOT_HEAP_REGIONS: Option<fn() -> &'static [vibeos_hal::AddressRange]> = None;
+
+const HEAP_END: usize = Board::MMU.ram.end;

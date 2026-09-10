@@ -1,8 +1,9 @@
 # Milk-V Mars port status
 
 Target: standard Milk-V Mars with 4 GiB RAM, microSD boot, serial and SSH
-acceptance. This is an **incomplete port**. There is no Mars firmware image or
-claim of hardware qualification in this change.
+acceptance. This is an **incomplete port**. A serial/SD bring-up firmware
+payload now builds; a flashable SD image and hardware qualification are still
+outstanding.
 
 ## Implemented foundation
 
@@ -21,8 +22,9 @@ claim of hardware qualification in this change.
 - `drivers/dw-mshc` implements SD initialization, four-bit negotiation, bounded
   clock changes, 512-byte PIO reads/writes, card-ready checking and write
   publication tracking. IO failures quarantine the instance. It requires the
-  caller to prepare clocks, reset, pinmux and card power. It is not yet wired
-  into a kernel block service or exercised against a real controller.
+  caller to prepare clocks, reset, pinmux and card power. It has not been tested
+  against a real controller. The Mars firmware now binds it to the kernel PIO
+  service through a firmware-enforced data partition.
 - `hal::fdt` validates bounded FDT v17 byte slices and extracts RAM and fixed
   reservations without allocation. `hal::memory` subtracts reservations
   transactionally and validates complete DMA spans and cache-line isolation.
@@ -687,3 +689,66 @@ inspection exercises Mars MMIO, SBI HSM, clock preparation or physical boot.
 The production Mars entry, SD instance/data partition binding, GMAC/PHY/DMA
 resource validation and engine, paired boot firmware, SD image and physical
 acceptance remain outstanding.
+
+
+### Mars serial/SD bring-up firmware
+
+`firmware/milkv-mars` now supplies the final entry, boot description, early
+UART/PLIC tables and a firmware-owned DW-MSHC instance. Boot admission requires
+four DTB-admitted application harts and SBI HSM, IPI, RFENCE and TIME extension
+probes. It publishes only copied resource/hart/heap metadata. A missing extension
+or invalid handoff fails before MMU/heap/service initialization. Extension probes
+are not proof that all harts subsequently start or that remote fences work on
+Mars; those remain physical acceptance requirements.
+
+The linker loads at `0x40200000`, reserves four guarded stacks and maps the
+4 GiB RAM envelope ending at `0x140000000`. The kernel now reads the heap ceiling
+as a firmware value, avoiding a PC-relative address of a linker symbol more than
+2 GiB away under RISC-V medany. QEMU's large-memory profile intentionally retains
+its original 128 MiB heap ceiling. QEMU and Duo production layouts are unchanged.
+
+The SD binding uses the admitted SYS CRG/SYSCON/pin apertures, prepares SDIO1,
+passes the decoded source rate to MSHC and publishes a data-only device.
+Its fixed image-layout contract is **physical LBA 262144, 1048576 sectors**
+(128 MiB offset, 512 MiB data, 512-byte sectors). The boot image packer must reserve
+all boot components/partitions below that boundary. This image is not a general
+partition-table autodetector and must be paired with the matching test SD layout.
+Media too small for the complete data range is rejected. Every read/write checks
+the full logical run before translating it; no raw probe operation is exported.
+`bounded-device` is a generic zero-based image policy, with compile-time agreement
+between its capacity and the firmware data boundary. Other firmware retains its
+existing policy and data format. Standard RISC-V I/O fences surround MSHC MMIO;
+model tests cannot qualify the real interconnect ordering or SD durability.
+
+The packet-device contract now distinguishes an absent firmware slot. Discovery
+publishes no NIC/MMIO/DMA capability for that slot, and the engine rejects claims
+before calling hardware operations. Mars currently uses this state: EQoS, network
+and SSH are explicitly unavailable in this bring-up image. No entropy provider
+or provisional SSH identity has been enabled. This is a temporary bring-up
+composition; it does not satisfy the planned network/SSH acceptance.
+
+Build the payload and inspect its layout with:
+
+```sh
+scripts/build-milkv-mars.sh
+# target/milkv-mars/bringup/{vibeos.elf,vibeos.bin,elf-check.json,manifest.json}
+```
+
+The ELF checker requires the correct architecture/entry, non-overlapping identity
+loads outside firmware-reserved RAM, no writable executable load, the full 64-bit
+heap ceiling, writable BSS and four guarded stack reservations. It checks layout,
+not boot instructions or hardware behavior. The manifest records hashes, source
+revision/dirty state, compiler, SDK revision and the data layout. These artifacts
+are **not an SD image** and do not yet bundle SPL, OpenSBI, U-Boot, a FIT handoff
+or a qualified production DTB. Do not treat the raw payload as a disk image.
+
+Host tests cover SBI admission failure, reserved DTB pages, complete partition
+bounds, write-publication timing/error forwarding and absent NIC rejection.
+`firmware/qemu-hal-test` can run the same Mars admission and partition logic
+under RV64 with `boot-admission-test,mars-composition-test`, followed by 395
+kernel selftests. Its hardware resources are models. The 4 GiB QEMU profile
+passes 393 tests, including the existing high-memory probes, and the ordinary
+QEMU profile and Duo build are retained. Mutations removing the HSM requirement,
+partition offset enforcement, absent-NIC claim guard or ELF heap-ceiling check
+are detected. Physical Mars serial, SD, four-core and fence behavior, EQoS/DMA,
+entropy, SSH/WASM acceptance and the bootable SD packaging are still pending.

@@ -27,7 +27,7 @@ fn description() -> &'static vibeos_hal::block::PioBlockDevice {
 }
 const DATA_SLICE: vibeos_image_policy::BlockSlice = match crate::platform::BLOCK_DATA_SLICE {
     Some(slice) => slice,
-    None => panic!("Milk-V Duo firmware must select a data block slice"),
+    None => panic!("PIO firmware must select a data block slice"),
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

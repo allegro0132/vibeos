@@ -33,6 +33,9 @@ pub struct Telemetry {
 /// No caller slice is retained or published to DMA. A failed shutdown keeps
 /// the pool quarantined; fault recovery requires the old owner cannot resume.
 pub struct Device {
+    /// False means no hardware instance is composed; discovery must not mint
+    /// MMIO/DMA/device capabilities for this slot.
+    pub present: bool,
     pub registers: crate::AddressRange,
     pub irq: u32,
     pub rx_queue_size: usize,

@@ -24,6 +24,7 @@ unsafe fn engine() -> &'static mut Engine {
 const DESC: vibeos_hal::DwmacDescription = Board::INFO.dwmac.unwrap();
 #[no_mangle]
 pub static VIBEOS_PACKET_DEVICE: Device = Device {
+    present: true,
     registers: DESC.registers,
     irq: DESC.irq,
     rx_queue_size: driver::RX_RING_SIZE,

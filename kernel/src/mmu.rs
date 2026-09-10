@@ -955,7 +955,7 @@ pub unsafe fn replace_wasm_memory(old: usize, old_size: usize, new: usize, new_s
         if size != 0 {
             assert_eq!(base % sv39::PAGE_SIZE, 0);
             assert!(base >= core::ptr::addr_of!(crate::__heap_start) as usize);
-            assert!(base.checked_add(size).unwrap() <= core::ptr::addr_of!(crate::__heap_end) as usize);
+            assert!(base.checked_add(size).unwrap() <= crate::platform::description().heap_end);
         }
     }
     assert!(TABLES_READY.load(Ordering::Acquire));
@@ -997,7 +997,7 @@ pub unsafe fn append_wasm_memory(offset: usize, physical: usize, len: usize) {
     assert!(end <= LIMIT);
     assert_eq!(physical % sv39::PAGE_SIZE, 0);
     assert!(physical >= core::ptr::addr_of!(crate::__heap_start) as usize);
-    assert!(physical.checked_add(len).unwrap() <= core::ptr::addr_of!(crate::__heap_end) as usize);
+    assert!(physical.checked_add(len).unwrap() <= crate::platform::description().heap_end);
     assert!(TABLES_READY.load(Ordering::Acquire));
     let _lock = PAGE_TABLE_LOCK.lock();
     let tables = unsafe { &mut *TABLES.0.get() };
@@ -1068,7 +1068,7 @@ pub unsafe fn replace_native_fiber(slot: usize, old: usize, old_size: usize, new
         if size != 0 {
             assert_eq!(base % sv39::PAGE_SIZE, 0);
             assert!(base >= core::ptr::addr_of!(crate::__heap_start) as usize);
-            assert!(base.checked_add(size).unwrap() <= core::ptr::addr_of!(crate::__heap_end) as usize);
+            assert!(base.checked_add(size).unwrap() <= crate::platform::description().heap_end);
         }
     }
     let _lock = PAGE_TABLE_LOCK.lock();

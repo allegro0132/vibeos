@@ -83,14 +83,26 @@ impl Mmio {
         Self(range)
     }
 }
+#[inline]
+fn io_fence() {
+    #[cfg(target_arch = "riscv64")]
+    unsafe { core::arch::asm!("fence iorw, iorw", options(nostack)); }
+    #[cfg(not(target_arch = "riscv64"))]
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
 impl Registers for Mmio {
     fn read(&self, offset: usize) -> u32 {
         assert!(offset % 4 == 0 && offset <= self.0.len() - 4);
-        unsafe { ((self.0.start + offset) as *const u32).read_volatile() }
+        io_fence();
+        let value = unsafe { ((self.0.start + offset) as *const u32).read_volatile() };
+        io_fence();
+        value
     }
     fn write(&self, offset: usize, value: u32) {
         assert!(offset % 4 == 0 && offset <= self.0.len() - 4);
-        unsafe { ((self.0.start + offset) as *mut u32).write_volatile(value) }
+        io_fence();
+        unsafe { ((self.0.start + offset) as *mut u32).write_volatile(value) };
+        io_fence();
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

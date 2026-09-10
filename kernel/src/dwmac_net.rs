@@ -217,6 +217,7 @@ pub struct NetResources {
 }
 
 pub fn discover() -> Option<NetResources> {
+    if !device().present { return None; }
     Some(NetResources {
         location: crate::net_device::NetworkLocation::Mmio {
             base: description().registers.start,

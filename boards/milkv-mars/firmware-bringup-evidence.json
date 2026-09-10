@@ -1,0 +1,177 @@
+{
+  "status": "Mars serial/SD bring-up firmware builds; flashable SD image and physical acceptance incomplete",
+  "firmware_host_tests": 3,
+  "hal_host_tests": 36,
+  "bounded_image_policy_tests": 2,
+  "mshc_host_tests": 14,
+  "python_tests": 19,
+  "rv64_composition_model": {
+    "status": "passed",
+    "boot_hart": 2,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 122007552,
+    "kernel_sha256": "b603fede01dff0150186d6cd327af3ee8581700a52bf39b4ab28cbf0b7b59b7e",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "qemu_large_memory": {
+    "status": "passed",
+    "boot_hart": 2,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 393,
+    "kernel_sha256": "569496875fae0b7b934054444beb2218dd7de36085de8903a4499cdc8419780e",
+    "physical_acceptance": false,
+    "require_admission": false,
+    "memory": "4G"
+  },
+  "qemu_production_selftests": 390,
+  "duo_default_ssh_build": "passed",
+  "elf_check": {
+    "status": "elf-contract-passed",
+    "entry": 1075838976,
+    "heap_start": 1095294976,
+    "heap_end": 5368709120,
+    "elf_sha256": "714f89909b1fc0e35e2b2762fbc990bf2ae8605ce1ac888a59186aa8d95be37c",
+    "loads": [
+      {
+        "address": 1075838976,
+        "file_bytes": 2932736,
+        "memory_bytes": 2932736,
+        "flags": 5
+      },
+      {
+        "address": 1078771712,
+        "file_bytes": 380928,
+        "memory_bytes": 380928,
+        "flags": 4
+      },
+      {
+        "address": 1079152640,
+        "file_bytes": 50952,
+        "memory_bytes": 15093760,
+        "flags": 6
+      }
+    ],
+    "physical_acceptance": false,
+    "flashable_sd_image": false
+  },
+  "artifacts": [
+    {
+      "path": "target/milkv-mars/bringup/vibeos.elf",
+      "bytes": 12744528,
+      "sha256": "714f89909b1fc0e35e2b2762fbc990bf2ae8605ce1ac888a59186aa8d95be37c"
+    },
+    {
+      "path": "target/milkv-mars/bringup/vibeos.bin",
+      "bytes": 3364616,
+      "sha256": "9dae6a5b50d87cc42a9a20f0e88619160c32306422d76ebd048af3291eb9142e"
+    },
+    {
+      "path": "target/milkv-mars/bringup/elf-check.json",
+      "bytes": 633,
+      "sha256": "008eeb4f742ec8530569fbd5c79b7248fbf2f1741cbf51266d98b5ba6fcfde35"
+    }
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage24-firmware-restored.log",
+      "sha256": "8b2690d453dbc727be1eb944adb87c71334d76e95f7b0cde8cad089018d45577"
+    },
+    {
+      "path": "target/mars-reference/stage24-hal-restored.log",
+      "sha256": "e0f640b0af47e521e40f1dd9288d996bdb3adaaf379335d21873a28a8774bc3f"
+    },
+    {
+      "path": "target/mars-reference/stage24-policy-tests.log",
+      "sha256": "a123fa285edf975703cc4c58416d3025f3dd4425ce481fe9c683716d07578f3c"
+    },
+    {
+      "path": "target/mars-reference/stage24-mshc-tests.log",
+      "sha256": "93008903a1ffa5af8f0c9fd0d09c66b114e87c68402159e0afa95b876f0daae8"
+    },
+    {
+      "path": "target/mars-reference/stage24-python.log",
+      "sha256": "3a23405a755a7d6d9ad22267d1635b62fbc421d698b4ebf041393d18ba32585f"
+    },
+    {
+      "path": "target/mars-reference/stage24-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage24-final-artifacts.log",
+      "sha256": "612e79dce795ad739088c208a8966d143ce35426245fe98488a3650bd5c68b5f"
+    },
+    {
+      "path": "target/mars-reference/stage24-model-build.log",
+      "sha256": "a7f7b88b186135492e77f6951a8479e875f09556f517ac1d15ce9e7517cfd943"
+    },
+    {
+      "path": "target/mars-reference/stage24-rv64-composition/serial.log",
+      "sha256": "5b9c352b8a0fd956f06c2f2f3f3bd06adea2cd9eda08885be9e780e086058684"
+    },
+    {
+      "path": "target/mars-reference/stage24-rv64-composition/summary.json",
+      "sha256": "6f14f7a80772274a609f4746c91fa9480300a2802b7f7ca73bf00159760d744e"
+    },
+    {
+      "path": "target/mars-reference/stage24-large-build.log",
+      "sha256": "d023df9e20eac8cec784e1269747b06dcc66680919c0c76180dff3e5324e41d9"
+    },
+    {
+      "path": "target/mars-reference/stage24-large-memory/serial.log",
+      "sha256": "194f46367be7f332051033acf0113d96101913c2f6273855169a04275ca40e14"
+    },
+    {
+      "path": "target/mars-reference/stage24-large-memory/summary.json",
+      "sha256": "455cd3e99b097632adc7725ca9cb0a3fddbfc808ccd287a997fc1db7105a8582"
+    },
+    {
+      "path": "target/mars-reference/stage24-qemu-build.log",
+      "sha256": "d4c5cfd31b516cc4ed967c6e5a158cb77963d4acc15b8803a5448d4532a397a1"
+    },
+    {
+      "path": "target/mars-reference/stage24-qemu-selftest.log",
+      "sha256": "a2e33c54eef0a0ae8ebe7b8d3cb69e077f2f5bf2499ee05232596697978b9ac2"
+    },
+    {
+      "path": "target/mars-reference/stage24-duo-build.log",
+      "sha256": "7e82090514e69709d2a96b467dc05002ef4d10538028bcd2215edb2a10f8f956"
+    },
+    {
+      "path": "target/mars-reference/stage24-mutation-sbi-hsm.log",
+      "sha256": "836f6c24fe1d8d809cbc1b2ee817b2bea937fff120dfe0727c1a2e3cb380df0c"
+    },
+    {
+      "path": "target/mars-reference/stage24-mutation-partition-offset.log",
+      "sha256": "c26a36602a69ee3148bdecbe9489db04f90e05ce7b5e37a305abab8bb62c29e4"
+    },
+    {
+      "path": "target/mars-reference/stage24-mutation-absent-nic.log",
+      "sha256": "bed19a4d61a7d57c32ca306db2b1014cfb5515679b4bef4faf4db736085c5c41"
+    },
+    {
+      "path": "target/mars-reference/stage24-mutation-elf-ceiling.log",
+      "sha256": "c320621c0880fb03026cf6485f6d95c66f924a8374263c5eaa848a28d7b7a4e2"
+    }
+  ],
+  "mutations": [
+    "Missing HSM accepted: detected",
+    "Partition offset bypass detected",
+    "Absent NIC hardware call detected",
+    "Wrong ELF heap ceiling accepted: detected"
+  ],
+  "physical_acceptance": false,
+  "flashable_sd_image": false,
+  "remaining": [
+    "Build and package paired SPL/OpenSBI/U-Boot and FIT handoff with matching SD layout",
+    "Actual Mars serial/four-hart/SBI/SD acceptance",
+    "EQoS/PHY/DMA and cache qualification",
+    "Qualified entropy, independent SSH identity, SSH/WASM/Wasmtime persistence acceptance",
+    "Three cold boots and one-hour concurrent stability test"
+  ]
+}

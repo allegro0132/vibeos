@@ -49,6 +49,7 @@ pub static VIBEOS_BOOT_PLATFORM: BootPlatform = BootPlatform {
     info: Board::INFO,
     memory_map: Board::MEMORY_MAP,
     mmu: Board::MMU,
+    heap_end: super::HEAP_END,
     hart_ids: super::hart_ids,
     timebase_hz: super::timebase_hz,
     admit_boot: super::BOOT_ADMISSION,

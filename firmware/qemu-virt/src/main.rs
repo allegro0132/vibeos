@@ -56,3 +56,8 @@ const BOOT_ADMISSION: Option<
 > = None;
 
 const BOOT_HEAP_REGIONS: Option<fn() -> &'static [vibeos_hal::AddressRange]> = None;
+
+#[cfg(feature = "mmu-large-memory")]
+const HEAP_END: usize = 0x88000000;
+#[cfg(not(feature = "mmu-large-memory"))]
+const HEAP_END: usize = Board::MMU.ram.end;

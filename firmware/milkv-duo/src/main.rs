@@ -45,3 +45,5 @@ fn timebase_hz() -> u64 {
 const BOOT_ADMISSION: Option<
     unsafe fn(vibeos_hal::boot::BootRequest) -> Result<(), vibeos_hal::boot::BootError>,
 > = None;
+
+const BOOT_HEAP_REGIONS: Option<fn() -> &'static [vibeos_hal::AddressRange]> = None;

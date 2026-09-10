@@ -1,5 +1,5 @@
 //! Live pre-MMU contract acceptance. This test image publishes copied CPU
-//! metadata only; it does not implement a reservation-aware heap for Mars.
+//! metadata and reservation-subtracted heap ranges; Mars resource policy is separate.
 use super::Board;
 use core::{
     cell::UnsafeCell,
@@ -14,6 +14,7 @@ struct State {
     ready: AtomicU8,
     harts: UnsafeCell<[usize; 4]>,
     hz: UnsafeCell<u64>,
+    heap: UnsafeCell<vibeos_hal::memory::BootMemory<16>>,
 }
 // Boot hart writes once before Release; readers require Acquire publication.
 unsafe impl Sync for State {}
@@ -21,6 +22,7 @@ static STATE: State = State {
     ready: AtomicU8::new(0),
     harts: UnsafeCell::new([0; 4]),
     hz: UnsafeCell::new(0),
+    heap: UnsafeCell::new(vibeos_hal::memory::BootMemory::new()),
 };
 pub unsafe fn admit(request: BootRequest) -> Result<(), BootError> {
     let bytes = unsafe { request.dtb()? };
@@ -42,9 +44,7 @@ pub unsafe fn admit(request: BootRequest) -> Result<(), BootError> {
     let memory = tree
         .memory::<16>(request.dtb_address)
         .map_err(|_| BootError::InvalidMemory)?;
-    if !memory.contains(request.static_memory) {
-        return Err(BootError::InvalidMemory);
-    }
+    let heap = request.usable_heap(&memory)?;
     let mut harts = [request.physical_hart; 4];
     let mut next = 1;
     for &hart in Board::HART_IDS {
@@ -58,6 +58,7 @@ pub unsafe fn admit(request: BootRequest) -> Result<(), BootError> {
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| BootError::AlreadyInitialized)?;
     unsafe {
+        *STATE.heap.get() = heap;
         *STATE.harts.get() = harts;
         *STATE.hz.get() = u64::from(cpus.timebase_hz);
     }
@@ -71,4 +72,9 @@ pub fn hart_ids() -> &'static [usize] {
 pub fn timebase_hz() -> u64 {
     assert_eq!(STATE.ready.load(Ordering::Acquire), 2);
     unsafe { *STATE.hz.get() }
+}
+
+pub fn heap_regions() -> &'static [vibeos_hal::AddressRange] {
+    assert_eq!(STATE.ready.load(Ordering::Acquire), 2);
+    unsafe { (&*STATE.heap.get()).ranges() }
 }

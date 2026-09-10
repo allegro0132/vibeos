@@ -1371,12 +1371,19 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
 
     #[cfg(feature = "wasmtime-native")]
     wasmtime_platform::report_boot_isa(wasmtime_harts);
-    unsafe { HEAP.init(hs, he) };
+    if let Some(regions) = platform::description().heap_regions {
+        let regions = regions();
+        assert!(!regions.is_empty() && regions.iter().all(|r| r.start >= hs && r.end <= he),
+            "firmware heap escaped linker envelope");
+        unsafe { HEAP.init_regions(regions).expect("invalid firmware heap ranges") };
+    } else {
+        unsafe { HEAP.init(hs, he) };
+    }
     println!(
         "  heap      {:#x}..{:#x}  ({} KiB)",
         hs,
         he,
-        (he - hs) / 1024
+        HEAP.stats().2 / 1024
     );
 
     ipi::mark_online(exec::HartId::BOOT, boot_physical_hart)

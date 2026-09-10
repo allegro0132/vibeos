@@ -7,7 +7,7 @@ class BootAdmissionOrder(unittest.TestCase):
         source = (ROOT / 'kernel/src/lib.rs').read_text()
         cold = source[source.index('pub extern "C" fn kmain('):]
         admission = cold.index('unsafe { admit(request) }')
-        for later in ['exec::configure_timebase(', 'mmu::init_boot(', 'HEAP.init(', 'ipi::mark_online(']:
+        for later in ['exec::configure_timebase(', 'mmu::init_boot(', 'HEAP.init(', 'HEAP.init_regions(', 'ipi::mark_online(']:
             self.assertLess(admission, cold.index(later), later)
         self.assertEqual(source.count('unsafe { admit(request) }'), 1)
     def test_kernel_uses_published_callbacks(self):

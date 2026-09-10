@@ -68,6 +68,13 @@ def run(kernel, output, dtb=None, expect_rejection=False, require_admission=Fals
                     if boot not in range(4) or count != 4 or hz != 10_000_000:
                         raise RuntimeError('unexpected live CPU inventory')
                     result = {'status': 'passed', 'boot_hart': boot, 'harts': count, 'timebase_hz': hz, 'selftests': int(tests[1])}
+                    if require_admission:
+                        heap = re.search(rb'BOOT_HEAP PASS regions=(\d+) bytes=(\d+)[\r\n]', data)
+                        actual = re.search(rb'  heap +0x[0-9a-f]+\.\.0x[0-9a-f]+ +\((\d+) KiB\)', data)
+                        if not heap or not actual or int(heap[1]) == 0 or int(heap[2]) // 1024 != int(actual[1]) or int(tests[1]) < 395:
+                            raise RuntimeError('usable heap metadata or disjoint allocator selftests failed')
+                        result['heap_regions'] = int(heap[1])
+                        result['heap_bytes'] = int(heap[2])
                     break
                 if vm.poll() is not None and not selector.get_map():
                     raise RuntimeError('QEMU exited before completing the probe')

@@ -191,6 +191,7 @@ pub async fn run() -> Report {
     let mut h = Harness::default();
 
     paging(&mut h);
+    if crate::platform::description().heap_regions.is_some() { disjoint_heap(&mut h); }
     timers(&mut h).await;
     scheduler(&mut h).await;
     cancellation(&mut h).await;
@@ -238,6 +239,35 @@ pub async fn run() -> Report {
         report.passed, report.failed
     );
     report
+}
+
+/// Exercise the real allocator on RV64 with a canary-filled reserved hole.
+fn disjoint_heap(h: &mut Harness) {
+    use core::alloc::{GlobalAlloc, Layout};
+    use vibeos_hal::AddressRange;
+    let mut backing = alloc::vec![0xa5u8; 12288 + 16];
+    let base = (backing.as_mut_ptr() as usize + 15) & !15;
+    let local = alloc::boxed::Box::new(heap::Heap::new());
+    unsafe { local.init_regions(&[
+        AddressRange::new(base, base + 4096),
+        AddressRange::new(base + 8192, base + 12288),
+    ]).unwrap() };
+    // The private heap owns only its system account, independently of the
+    // selftest task's ambient owner in the global heap.
+    let _scope = heap::enter_owner(heap::OwnerId::SYSTEM);
+    let layout = Layout::from_size_align(3000, 16).unwrap();
+    let a = unsafe { local.alloc(layout) };
+    let b = unsafe { local.alloc(layout) };
+    h.check("disjoint heap uses both ranges", !a.is_null() && !b.is_null() && a != b);
+    h.check("disjoint heap exhaustion", unsafe { local.alloc(layout) }.is_null());
+    if !a.is_null() { unsafe { a.write_bytes(0x3c, layout.size()); local.dealloc(a, layout); } }
+    if !b.is_null() { unsafe { b.write_bytes(0x3c, layout.size()); local.dealloc(b, layout); } }
+    let too_large = Layout::from_size_align(6000, 16).unwrap();
+    h.check("disjoint heap cannot merge across reservation", unsafe { local.alloc(too_large) }.is_null());
+    h.eq("disjoint heap rewinds each extent", local.stats().2, 8192);
+    h.check("disjoint heap preserves reservation", unsafe {
+        core::slice::from_raw_parts((base + 4096) as *const u8, 4096)
+    }.iter().all(|&byte| byte == 0xa5));
 }
 
 /// Dedicated QEMU 4 GiB profile. The firmware retains a 128 MiB heap; these

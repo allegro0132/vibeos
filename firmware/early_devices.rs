@@ -52,6 +52,7 @@ pub static VIBEOS_BOOT_PLATFORM: BootPlatform = BootPlatform {
     hart_ids: super::hart_ids,
     timebase_hz: super::timebase_hz,
     admit_boot: super::BOOT_ADMISSION,
+    heap_regions: super::BOOT_HEAP_REGIONS,
     rtc: Board::RTC,
     cold_reset: Board::RESET,
     early_platform_init: super::platform_init,

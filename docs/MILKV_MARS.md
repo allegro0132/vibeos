@@ -11,8 +11,8 @@ claim of hardware qualification in this change.
   its locks, ring buffers, record framing and wakeups; the interrupt adapter
   keeps its atomic handler registry and enable lock. Neither adapter imports a
   BSP or accesses registers. All kernel adapters now obtain physical resource
-  descriptions from firmware; other adapters still depend on concrete driver
-  engines and compatibility feature names.
+  descriptions from firmware. The dependency guard rejects concrete drivers
+  and BSPs in the kernel dependency graph; legacy feature aliases remain.
 - `drivers/uart16550` implements 16550/DW APB register IO and preserves the DW
   busy-detect and phantom-timeout acknowledgements. `drivers/plic` implements
   context initialization, source masking, claim and completion.
@@ -26,7 +26,8 @@ claim of hardware qualification in this change.
 - `hal::fdt` validates bounded FDT v17 byte slices and extracts RAM and fixed
   reservations without allocation. `hal::memory` subtracts reservations
   transactionally and validates complete DMA spans and cache-line isolation.
-  DTB admission is not yet connected to allocator boot. The MMU now consumes
+  DTB admission now publishes reservation-subtracted heap ranges in the QEMU
+  acceptance composition; production Mars composition is still pending. The MMU consumes
   the firmware boot contract and its RAM table arena, supports multiple GiB
   windows and 2 MiB RAM leaves, and pre-splits permission-changing pools.
 - `boards/milkv-mars` describes the target and admits DTB memory within its
@@ -591,6 +592,42 @@ physical address decoding, RV64 cache visibility or hardware fault behavior;
 QEMU does not qualify Mars hardware.
 
 This is an admission interface and a QEMU acceptance composition, not production
-Mars admission. The existing heap still uses one fixed contiguous linker range;
-reservation-aware allocation, Mars resource validation and SBI qualification
-remain required before registering Mars devices or producing the SD image.
+Mars admission. The subsequent disjoint-heap stage below connects reservation-aware
+allocation. Mars resource validation and SBI qualification remain required before
+registering Mars devices or producing the SD image.
+
+
+### Reservation-aware heap stage
+
+`Heap::init_regions` accepts up to 16 sorted, disjoint RAM ranges without
+allocating metadata. Initialization validates and trims alignment before changing
+allocator state. Adjacent ranges merge; a reserved gap never merges. Each extent
+has its own bump cursor. Free-list reuse, pressure coalescing and tail rewind
+work across the admitted extents while preserving gaps. Fault-domain recovery
+checks that both headers and complete allocation blocks belong to a used prefix
+of one extent before dereferencing them. Live-byte accounting and persistent
+formats are unchanged. The existing single-range initializer remains available.
+
+`BootRequest::usable_heap` clips a reservation-subtracted `BootMemory` to the
+linker heap envelope, validates the static image span and discards partial pages
+around reservations. Its host test covers the Mars 4 GiB range, including RAM
+above physical address 4 GiB. `BootPlatform::heap_regions` publishes the immutable
+result; the kernel checks the linker envelope and initializes these ranges.
+QEMU and Duo production compositions retain their existing single-range policy.
+The QEMU admission composition now uses the real DTB memory/reservations and
+publishes two heap ranges in the 128 MiB live boot test. The reported usable
+capacity agrees with the kernel allocator's initial capacity.
+
+The updated `--require-admission` test requires the heap metadata/capacity check
+and 395 successful selftests. Five additional on-target checks allocate from
+both sides of a canary-filled hole, exhaust them, recycle allocations and verify
+that a larger request cannot merge across the hole. Host regressions also reclaim
+one fault domain spanning both ranges, verify transactional initialization errors,
+merge adjacent ranges and exercise the live-byte telemetry feature. Mutations
+merging a reserved gap, suppressing per-extent tail rewind and rounding a
+reservation inward are detected.
+
+This stage does not remove reserved RAM from every identity mapping, qualify
+Mars DMA/cache behavior or establish the device/firmware reservations for a Mars
+image. Those must be supplied by the production Mars composition. SBI probing,
+DW-MSHC registration, EQoS, paired boot firmware and an SD image remain pending.

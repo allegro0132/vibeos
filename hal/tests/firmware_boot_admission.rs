@@ -28,7 +28,7 @@ fn validates_before_publication_and_never_replaces_published_metadata() {
     let mut request = BootRequest {
         physical_hart: 3,
         dtb_address: base,
-        ram: AddressRange::new(base, base + blob.len()),
+        ram: AddressRange::new(0x80000000, base + blob.len()),
         static_memory: AddressRange::new(0x80200000, 0x80400000),
         heap_envelope: AddressRange::new(0x80400000, 0x88000000),
     };
@@ -65,6 +65,10 @@ fn validates_before_publication_and_never_replaces_published_metadata() {
     assert_eq!(unsafe { admission::admit(request) }, Ok(()));
     assert_eq!(admission::hart_ids(), &[3, 0, 1, 2]);
     assert_eq!(admission::timebase_hz(), 10_000_000);
+    assert_eq!(
+        admission::heap_regions(),
+        &[AddressRange::new(0x80400000, 0x88000000)]
+    );
     request.physical_hart = 1;
     assert_eq!(
         unsafe { admission::admit(request) },

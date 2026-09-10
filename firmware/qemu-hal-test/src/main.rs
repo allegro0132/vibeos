@@ -28,6 +28,10 @@ unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
         hart_ids().len(),
         timebase_hz()
     ));
+    #[cfg(feature = "boot-admission-test")]
+    _print(format_args!("BOOT_HEAP PASS regions={} bytes={}\n",
+        boot_admission::heap_regions().len(),
+        boot_admission::heap_regions().iter().map(|r| r.len()).sum::<usize>()));
     #[cfg(feature = "jh7110-sd-model-test")]
     {
         jh7110_sd_model::run();
@@ -58,3 +62,8 @@ const BOOT_ADMISSION: Option<
 const BOOT_ADMISSION: Option<
     unsafe fn(vibeos_hal::boot::BootRequest) -> Result<(), vibeos_hal::boot::BootError>,
 > = None;
+
+#[cfg(feature = "boot-admission-test")]
+const BOOT_HEAP_REGIONS: Option<fn() -> &'static [vibeos_hal::AddressRange]> = Some(boot_admission::heap_regions);
+#[cfg(not(feature = "boot-admission-test"))]
+const BOOT_HEAP_REGIONS: Option<fn() -> &'static [vibeos_hal::AddressRange]> = None;

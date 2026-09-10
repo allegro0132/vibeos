@@ -50,3 +50,44 @@ fn rejects_corrupted_header_without_reading_unadvertised_storage() {
     header[0] = 0;
     assert_eq!(unsafe { request.dtb() }, Err(BootError::InvalidDtb));
 }
+
+#[test]
+fn usable_heap_clips_four_gib_memory_and_rounds_reservations_outward() {
+    use vibeos_hal::memory::BootMemory;
+    let request = BootRequest {
+        physical_hart: 1,
+        dtb_address: 0,
+        ram: AddressRange::new(0x40000000, 0x140000000),
+        static_memory: AddressRange::new(0x40200000, 0x41000000),
+        heap_envelope: AddressRange::new(0x41000000, 0x140000000),
+    };
+    let mut memory = BootMemory::<8>::new();
+    memory.add_ram(request.ram).unwrap();
+    memory
+        .reserve(AddressRange::new(0x40000000, 0x40200000))
+        .unwrap();
+    memory
+        .reserve(AddressRange::new(0x80000001, 0x80000fff))
+        .unwrap();
+    memory
+        .reserve(AddressRange::new(0x100000001, 0x100001001))
+        .unwrap();
+    assert_eq!(
+        request.usable_heap(&memory).unwrap().ranges(),
+        &[
+            AddressRange::new(0x41000000, 0x80000000),
+            AddressRange::new(0x80001000, 0x100000000),
+            AddressRange::new(0x100002000, 0x140000000)
+        ]
+    );
+    let mut bad = request;
+    bad.heap_envelope.end += 1;
+    assert_eq!(bad.usable_heap(&memory), Err(BootError::InvalidMemory));
+    bad = request;
+    bad.heap_envelope.start -= 4096;
+    assert_eq!(bad.usable_heap(&memory), Err(BootError::InvalidMemory));
+    memory.reserve(request.heap_envelope).unwrap();
+    assert_eq!(request.usable_heap(&memory), Err(BootError::InvalidMemory));
+    memory.reserve(request.static_memory).unwrap();
+    assert_eq!(request.usable_heap(&memory), Err(BootError::InvalidMemory));
+}

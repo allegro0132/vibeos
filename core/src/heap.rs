@@ -677,10 +677,22 @@ struct AllocationPlan {
     user_align: usize,
 }
 
+pub const MAX_HEAP_REGIONS: usize = 16;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeapInitError { InvalidRange, TooManyRegions, OverlapOrUnsorted }
+#[derive(Clone, Copy)]
+struct HeapExtent { start: usize, cursor: usize, end: usize }
+impl HeapExtent {
+    const EMPTY: Self = Self { start: 0, cursor: 0, end: 0 };
+    fn contains_used(self, base: usize, bytes: usize) -> bool {
+        bytes != 0 && base >= self.start && base.checked_add(bytes).is_some_and(|end| end <= self.cursor)
+    }
+    fn fits(self, bytes: usize) -> bool {
+        self.cursor.checked_add(bytes).is_some_and(|end| end <= self.end)
+    }
+}
 struct HeapInner {
-    start: usize,
-    cursor: usize,
-    end: usize,
+    extents: [HeapExtent; MAX_HEAP_REGIONS],
     free: [Option<NonNull<FreeNode>>; NUM_CLASSES],
     live_bytes: usize,
     peak_bytes: usize,
@@ -744,9 +756,7 @@ impl Heap {
         let mut owners = [OwnerAccount::EMPTY; MAX_OWNER_ACCOUNTS];
         owners[0] = OwnerAccount::SYSTEM;
         Heap(SpinLock::new(HeapInner {
-            start: 0,
-            cursor: 0,
-            end: 0,
+            extents: [HeapExtent::EMPTY; MAX_HEAP_REGIONS],
             free: [None; NUM_CLASSES],
             live_bytes: 0,
             peak_bytes: 0,
@@ -763,12 +773,40 @@ impl Heap {
     /// # Safety
     /// `start..end` must be a unique, otherwise-unused region of writable RAM.
     pub unsafe fn init(&self, start: usize, end: usize) {
-        let mut h = self.0.lock();
         let start = align_up(start, MIN_CLASS_SIZE).unwrap_or(end);
         let end = end & !(MIN_CLASS_SIZE - 1);
-        h.start = start.min(end);
-        h.cursor = h.start;
-        h.end = end;
+        let ranges = [vibeos_hal::AddressRange::new(start.min(end), end)];
+        let ranges = if start < end { &ranges[..] } else { &[] };
+        unsafe { self.init_regions(ranges).expect("single heap region") };
+    }
+
+    /// Initialize sorted, disjoint usable RAM. Alignment trims each range;
+    /// adjacent aligned ranges merge so coalescing cannot cross extent bounds.
+    /// Validation is transactional and performs no writes to supplied RAM.
+    /// # Safety
+    /// Every region must be uniquely owned writable RAM. No allocation or
+    /// allocator client may survive reinitialization, including on other harts.
+    pub unsafe fn init_regions(&self, ranges: &[vibeos_hal::AddressRange]) -> Result<(), HeapInitError> {
+        if ranges.len() > MAX_HEAP_REGIONS { return Err(HeapInitError::TooManyRegions); }
+        let mut extents = [HeapExtent::EMPTY; MAX_HEAP_REGIONS];
+        let mut count = 0;
+        let mut previous_end = 0;
+        for range in ranges {
+            if range.is_empty() { return Err(HeapInitError::InvalidRange); }
+            if range.start < previous_end { return Err(HeapInitError::OverlapOrUnsorted); }
+            previous_end = range.end;
+            let start = align_up(range.start, MIN_CLASS_SIZE).ok_or(HeapInitError::InvalidRange)?;
+            let end = range.end & !(MIN_CLASS_SIZE - 1);
+            if start >= end { return Err(HeapInitError::InvalidRange); }
+            if count > 0 && extents[count - 1].end == start {
+                extents[count - 1].end = end;
+            } else {
+                extents[count] = HeapExtent { start, cursor: start, end };
+                count += 1;
+            }
+        }
+        let mut h = self.0.lock();
+        h.extents = extents;
         h.free = [None; NUM_CLASSES];
         h.live_bytes = 0;
         h.peak_bytes = 0;
@@ -782,6 +820,7 @@ impl Heap {
         h.next_owner_id = 1;
         h.next_arena_id = 1;
         h.last_failures = [None; MAX_HARTS];
+        Ok(())
     }
 
     /// Global physical live/peak bytes and never-yet-used bump bytes.
@@ -805,8 +844,8 @@ impl Heap {
         HeapSnapshot {
             live_bytes: h.live_bytes,
             peak_live_bytes: h.peak_bytes,
-            bump_used_bytes: h.cursor.saturating_sub(h.start),
-            bump_remaining_bytes: h.end.saturating_sub(h.cursor),
+            bump_used_bytes: h.extents.iter().map(|e| e.cursor - e.start).sum(),
+            bump_remaining_bytes: h.extents.iter().map(|e| e.end - e.cursor).sum(),
         }
     }
 
@@ -1256,13 +1295,8 @@ impl Heap {
         let mut bytes = 0usize;
         while let Some(header_ptr) = node {
             let header_address = header_ptr.as_ptr() as usize;
-            let Some(last_header_start) = h.cursor.checked_sub(size_of::<AllocationHeader>())
-            else {
-                return Err(ArenaError::CorruptList);
-            };
             if allocations >= record.live_allocations
-                || header_address < h.start
-                || header_address > last_header_start
+                || !h.extents.iter().any(|e| e.contains_used(header_address, size_of::<AllocationHeader>()))
                 || header_address % align_of::<AllocationHeader>() != 0
             {
                 return Err(ArenaError::CorruptList);
@@ -1283,9 +1317,8 @@ impl Heap {
             let Some(header_end) = header_address.checked_add(size_of::<AllocationHeader>()) else {
                 return Err(ArenaError::CorruptList);
             };
-            if header.base < h.start
+            if !h.extents.iter().any(|e| e.contains_used(header.base, block_bytes))
                 || header.base % MIN_CLASS_SIZE != 0
-                || block_end > h.cursor
                 || header_address < header.base
                 || header_end > block_end
             {
@@ -1548,8 +1581,8 @@ unsafe fn coalesce_free(h: &mut HeapInner) {
             size += unsafe { next.as_ref().size };
             list = unsafe { next.as_ref().next };
         }
-        if base + size == h.cursor {
-            h.cursor = base;
+        if let Some(extent) = h.extents.iter_mut().find(|e| e.contains_used(base, size) && base + size == e.cursor) {
+            extent.cursor = base;
             continue;
         }
         while size != 0 {
@@ -1700,7 +1733,7 @@ unsafe impl GlobalAlloc for Heap {
 
         // Only the pressure path sorts free blocks. No allocation is performed;
         // address-order merging recovers adjacent space across size classes.
-        if h.cursor.checked_add(plan.charge).is_none_or(|end| end > h.end)
+        if !h.extents.iter().any(|e| e.fits(plan.charge))
             && h.free[plan.class..].iter().all(Option::is_none)
         {
             unsafe { coalesce_free(&mut h); }
@@ -1739,8 +1772,7 @@ unsafe impl GlobalAlloc for Heap {
             h.free[plan.class] = unsafe { node.as_ref().next };
             (base, user)
         } else {
-            let base = h.cursor;
-            let Some(next) = base.checked_add(plan.charge) else {
+            let Some(extent_index) = h.extents.iter().position(|e| e.fits(plan.charge)) else {
                 h.owners[owner_index].denials = account.denials.saturating_add(1);
                 h.last_failures[hart] = Some(AllocationFailure::HeapExhausted {
                     owner,
@@ -1748,20 +1780,14 @@ unsafe impl GlobalAlloc for Heap {
                 });
                 return ptr::null_mut();
             };
-            if next > h.end {
-                h.owners[owner_index].denials = account.denials.saturating_add(1);
-                h.last_failures[hart] = Some(AllocationFailure::HeapExhausted {
-                    owner,
-                    requested_bytes: plan.charge,
-                });
-                return ptr::null_mut();
-            }
+            let base = h.extents[extent_index].cursor;
+            let next = base + plan.charge;
             let Some(user) = user_address(base, plan, layout) else {
                 h.owners[owner_index].denials = account.denials.saturating_add(1);
                 h.last_failures[hart] = Some(AllocationFailure::LayoutOverflow { owner });
                 return ptr::null_mut();
             };
-            h.cursor = next;
+            h.extents[extent_index].cursor = next;
             (base, user)
         };
 

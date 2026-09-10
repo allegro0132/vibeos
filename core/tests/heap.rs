@@ -1372,3 +1372,104 @@ fn coalescing_churn_preserves_alignment_and_live_payloads() {
     unsafe { h.dealloc(p, l); }
     assert_eq!(h.stats().0, 0);
 }
+
+#[test]
+fn disjoint_regions_preserve_holes_through_exhaustion_reclaim_and_coalescing() {
+    let _serial = serial();
+    use vibeos_hal::AddressRange;
+    let mut backing = vec![0xa5u8; 3 * 16384 + 16];
+    let base = (backing.as_mut_ptr() as usize + 15) & !15;
+    let heap = Heap::new();
+    let ranges = [
+        AddressRange::new(base, base + 16384),
+        AddressRange::new(base + 32768, base + 49152),
+    ];
+    unsafe { heap.init_regions(&ranges).unwrap() };
+    let owner = heap.create_owner(32768).unwrap();
+    let arena = heap.create_arena(owner).unwrap();
+    let domain = AllocationDomain::new(owner, arena);
+    let l = layout(1000, 64);
+    let charge = Heap::allocation_charge(l).unwrap();
+    let mut count = 0;
+    {
+        let _scope = unsafe { enter_domain(domain) };
+        loop {
+            let ptr = unsafe { heap.alloc(l) };
+            if ptr.is_null() {
+                break;
+            }
+            let start = ptr as usize;
+            assert!(ranges
+                .iter()
+                .any(|r| start >= r.start && start + l.size() <= r.end));
+            unsafe { ptr.write_bytes(0x3c, l.size()) };
+            count += 1;
+        }
+    }
+    assert_eq!(count, 32768 / charge);
+    assert_eq!(heap.stats().2, 0);
+    let reclaimed = unsafe { heap.reclaim_faulted_domain(domain).unwrap() };
+    assert_eq!(reclaimed.reclaimed_allocations, count);
+    assert_eq!(reclaimed.reclaimed_bytes, 32768);
+    // Total free bytes are sufficient, but no single extent can hold this.
+    assert!(unsafe { heap.alloc(layout(20000, 16)) }.is_null());
+    assert_eq!(heap.snapshot().bump_used_bytes, 0);
+    assert_eq!(heap.stats().2, 32768);
+    let large = layout(15000, 16);
+    let a = unsafe { heap.alloc(large) };
+    let b = unsafe { heap.alloc(large) };
+    assert!(!a.is_null() && !b.is_null() && a != b);
+    assert!(unsafe { heap.alloc(large) }.is_null());
+    unsafe {
+        heap.dealloc(a, large);
+        heap.dealloc(b, large);
+    }
+    assert!(
+        unsafe { core::slice::from_raw_parts((base + 16384) as *const u8, 16384) }
+            .iter()
+            .all(|&b| b == 0xa5)
+    );
+}
+
+#[test]
+fn region_validation_is_transactional_and_adjacent_ranges_merge() {
+    let _serial = serial();
+    use vibeos_core::heap::{HeapInitError as E, MAX_HEAP_REGIONS};
+    use vibeos_hal::AddressRange as R;
+    let mut backing = vec![0u8; 32768 + 16];
+    let base = (backing.as_mut_ptr() as usize + 15) & !15;
+    let heap = Heap::new();
+    unsafe {
+        heap.init_regions(&[
+            R::new(base, base + 16384),
+            R::new(base + 16384, base + 32768),
+        ])
+        .unwrap()
+    };
+    for (ranges, error) in [
+        (vec![R::new(base, base)], E::InvalidRange),
+        (vec![R::new(usize::MAX - 1, usize::MAX)], E::InvalidRange),
+        (
+            vec![R::new(base, base + 32), R::new(base + 16, base + 48)],
+            E::OverlapOrUnsorted,
+        ),
+        (
+            vec![R::new(base + 32, base + 48), R::new(base, base + 16)],
+            E::OverlapOrUnsorted,
+        ),
+        (
+            vec![R::new(base, base + 16); MAX_HEAP_REGIONS + 1],
+            E::TooManyRegions,
+        ),
+    ] {
+        assert_eq!(unsafe { heap.init_regions(&ranges) }, Err(error));
+        assert_eq!(heap.stats(), (0, 0, 32768));
+    }
+    let l = layout(20000, 16);
+    let ptr = unsafe { heap.alloc(l) };
+    assert!(
+        !ptr.is_null(),
+        "adjacent regions form one usable allocation span"
+    );
+    unsafe { heap.dealloc(ptr, l) };
+}

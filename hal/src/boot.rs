@@ -27,6 +27,39 @@ pub enum BootError {
     AlreadyInitialized,
 }
 impl BootRequest {
+    /// Clip the already reservation-subtracted memory map to the linker heap
+    /// envelope, excluding partial pages around every reservation. No physical
+    /// memory is read or written. The loaded static span must also be usable.
+    pub fn usable_heap<const N: usize>(
+        &self,
+        memory: &crate::memory::BootMemory<N>,
+    ) -> Result<crate::memory::BootMemory<N>, BootError> {
+        if !memory.contains(self.static_memory)
+            || self.static_memory.start < self.ram.start
+            || self.static_memory.end != self.heap_envelope.start
+            || self.heap_envelope.is_empty()
+            || self.heap_envelope.end > self.ram.end
+        {
+            return Err(BootError::InvalidMemory);
+        }
+        let mut heap = crate::memory::BootMemory::new();
+        for range in memory.ranges() {
+            let start = range.start.max(self.heap_envelope.start);
+            let end = range.end.min(self.heap_envelope.end) & !4095;
+            let Some(start) = start.checked_add(4095).map(|s| s & !4095) else {
+                continue;
+            };
+            if start < end {
+                heap.add_ram(AddressRange::new(start, end))
+                    .map_err(|_| BootError::InvalidMemory)?;
+            }
+        }
+        if heap.ranges().is_empty() {
+            return Err(BootError::InvalidMemory);
+        }
+        Ok(heap)
+    }
+
     /// # Safety
     /// The boot firmware supplies immutable, readable physical RAM at this
     /// pointer. Bounds checks do not themselves establish physical readability.
@@ -76,6 +109,9 @@ pub struct BootPlatform {
     /// envelope. Validate before publishing any immutable runtime description.
     /// No allocation, device registration or references into reusable DTB RAM.
     pub admit_boot: Option<unsafe fn(BootRequest) -> Result<(), BootError>>,
+    /// Post-admission immutable usable heap ranges; None retains the linker
+    /// envelope. Ranges are sorted, disjoint and exclude all reservations.
+    pub heap_regions: Option<fn() -> &'static [AddressRange]>,
     pub rtc: Option<AddressRange>,
     pub cold_reset: Option<fn() -> !>,
     /// # Safety

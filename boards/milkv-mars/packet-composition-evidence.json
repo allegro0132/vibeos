@@ -1,0 +1,125 @@
+{
+  "status": "Mars static Ethernet test profile composed; physical acceptance pending",
+  "host_firmware_tests": 11,
+  "elf_checker_tests": 4,
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 0,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 121933824,
+    "kernel_sha256": "f68eeaf9b3aa29e60ee13d3c44ddb15f89e33b2723b70e9b64a13c9424e1b54e",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "qemu_device_level0_windows": 7,
+  "rv64_marker": "MARS_PACKET_ENGINE_MODEL PASS pool=permanent link=down-up-down-100 stopped=retired",
+  "duo_release_build": "passed",
+  "serial_payload_elf_contract": "passed",
+  "mutations": [
+    "stop proof removed: detected",
+    "candidate verification removed: detected",
+    "retired engine reenabled: detected",
+    "MMU capacity reduced to six: compile-time E0080 detected"
+  ],
+  "physical_acceptance": false,
+  "ssh_enabled": false,
+  "blind_spots": [
+    "No physical Mars PHY/electrical or multicore DMA/cache qualification",
+    "No complete DHCP packet-task model or physical network traffic test",
+    "Real MMIO claim/retire callbacks not executed on Mars",
+    "Entropy, SSH identity and SSH/WASM acceptance pending"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage34-host-restored.log",
+      "sha256": "10fcae8958a86b46c58fdece52314366be03b8c4027c14b20b7c1aeb03a587b9"
+    },
+    {
+      "path": "target/mars-reference/stage34-image-tests.log",
+      "sha256": "feabb4add9e2ca3374e538560634d1ec97dc4f4ce89aab12f3d726e36ea9b2f6"
+    },
+    {
+      "path": "target/mars-reference/stage34-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage34-rv64-build.log",
+      "sha256": "727f4c0ef63225df099abd23816b16514215466b50617d13e81c178132c59632"
+    },
+    {
+      "path": "target/mars-reference/stage34-rv64-model/serial.log",
+      "sha256": "b77e110ff647c1e189b0e76ae7d7bbbea2edb79f0c7c086b3dcc23bd8c0d5cf5"
+    },
+    {
+      "path": "target/mars-reference/stage34-rv64-model/summary.json",
+      "sha256": "f239c00ca88ae1ff147d9185f92f956737d348a7e75c59a97501b1433bc8121c"
+    },
+    {
+      "path": "target/mars-reference/stage34-duo-build.log",
+      "sha256": "086c7319de78a60c1684b0bb4db8f02389990077487758fd77a6c1529e51767b"
+    },
+    {
+      "path": "target/mars-reference/stage34-serial-payload.log",
+      "sha256": "91a9fcb5c5bd4b978d43630195b92cccb41715d48a48aa193de8a54aa22c5f5f"
+    },
+    {
+      "path": "target/mars-reference/stage34-mutation-candidate-proof.log",
+      "sha256": "2bd46c0561166d8a765b097766f1f7db48905e815105ff57a2167ca9a930c54b"
+    },
+    {
+      "path": "target/mars-reference/stage34-mutation-mmu-capacity.log",
+      "sha256": "0121ef780484088bb93e5b7202d2f708ce0c5c6fc7cd8812c0498d91583b4f75"
+    },
+    {
+      "path": "target/mars-reference/stage34-mutation-retirement.log",
+      "sha256": "5bc8873507b52b428c540dec6fe47e7112f329e24aa7df290362a4610dc53b3e"
+    },
+    {
+      "path": "target/mars-reference/stage34-mutation-stop-proof.log",
+      "sha256": "c906854a06cff5cfc90dac65d53e4488cf332a385ecb2e524e43d4c1deb99dd9"
+    },
+    {
+      "path": "target/mars-reference/stage34-network-payload.log",
+      "sha256": "773c794b4c2d89c38d3ef2ff071a3981504f3943fe9c11248be5842e7cd197cd"
+    }
+  ],
+  "network_payload_elf_contract": {
+    "status": "elf-contract-passed",
+    "entry": 1075838976,
+    "heap_start": 1095553024,
+    "heap_end": 5368709120,
+    "elf_sha256": "1b9dec721873f96fa565d71ee98d16493b5e22c90da14ded1355f42c7740d0e8",
+    "loads": [
+      {
+        "address": 1075838976,
+        "file_bytes": 3035136,
+        "memory_bytes": 3035136,
+        "flags": 5
+      },
+      {
+        "address": 1078874112,
+        "file_bytes": 434176,
+        "memory_bytes": 434176,
+        "flags": 4
+      },
+      {
+        "address": 1079308288,
+        "file_bytes": 51984,
+        "memory_bytes": 15196160,
+        "flags": 6
+      }
+    ],
+    "physical_acceptance": false,
+    "flashable_sd_image": false,
+    "eqos_dma": {
+      "base": 1088110592,
+      "bytes": 102400,
+      "address_bits": 32,
+      "cache_line_bytes": 64
+    }
+  }
+}

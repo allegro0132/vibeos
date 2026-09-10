@@ -5,7 +5,12 @@
 use core::arch::global_asm;
 global_asm!(".section .text.boot\n.option norvc\n.global _start\n_start:\nj vibeos_kernel_start");
 extern crate vibeos_kernel;
+#[cfg(not(feature = "mars-ethernet-test"))]
 use vibeos_bsp_qemu_virt::Board;
+#[cfg(feature = "mars-ethernet-test")]
+mod seven_windows;
+#[cfg(feature = "mars-ethernet-test")]
+use seven_windows::Board;
 use vibeos_hal::Board as BoardContract;
 #[path = "../../early_devices.rs"]
 mod early_devices;
@@ -46,6 +51,8 @@ unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
         assert!(network_poll::due(&mut last, 4_000_001, 4_000_000));
         _print(format_args!("PACKET_LINK_MODEL PASS reconfigure=stopped cadence=elapsed-time\n"));
         eqos_pool_model::run();
+        #[cfg(feature = "mars-ethernet-test")]
+        _print(format_args!("MARS_PACKET_ENGINE_MODEL PASS pool=permanent link=down-up-down-100 stopped=retired\n"));
         phy_model::run(jh7110_ethernet_model::run());
         _print(format_args!("JH7110_ETHERNET_MODEL PASS csr_hz=198000000 tx_parent=external reset=bounded\n"));
         _print(format_args!("YT8531_MODEL PASS address=17 config=verified reset=bounded\n"));

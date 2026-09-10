@@ -2,12 +2,13 @@
 //! modeled on RV64. This is not a PHY timing or physical link qualification.
 use vibeos_eqos_net::mdio::{Port, Registers};
 use vibeos_ethernet::phy::{Error, Speed, Tuning, Yt8531};
-struct Model {
+pub(super) struct Model {
     registers: [u16; 32],
     extended: [u16; 3],
     selected: u16,
     data: u32,
     reset_stuck: bool,
+    live: bool,
 }
 impl Model {
     fn new() -> Self {
@@ -22,6 +23,7 @@ impl Model {
             selected: 0,
             data: 0,
             reset_stuck: false,
+            live: false,
         }
     }
     fn ext_index(&self) -> usize {
@@ -55,6 +57,14 @@ impl Registers for Model {
             3 => {
                 self.data = if phy != 17 {
                     0xffff
+                } else if self.live && reg == 1 {
+                    if STATUS.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+                        0
+                    } else {
+                        0x24
+                    }
+                } else if self.live && reg == 17 {
+                    STATUS.load(core::sync::atomic::Ordering::Relaxed)
                 } else if reg == 31 {
                     u32::from(self.extended[self.ext_index()])
                 } else {
@@ -75,6 +85,30 @@ impl Registers for Model {
         }
     }
 }
+static STATUS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "mars-ethernet-test")]
+pub(super) fn link(status: u32) {
+    STATUS.store(status, core::sync::atomic::Ordering::Relaxed);
+}
+#[cfg(feature = "mars-ethernet-test")]
+pub(super) fn initialized() -> Yt8531<Port<Model>> {
+    let mut model = Model::new();
+    model.live = true;
+    let mut phy = Yt8531::probe(Port::new(model, 198_000_000).unwrap(), u32::MAX, 4).unwrap();
+    phy.initialize(
+        Tuning {
+            drive: [0, 3, 6],
+            rxc_delay_enabled: false,
+            rx_delay: 10,
+            tx_delay_fe: 5,
+            tx_delay: 10,
+            tx_inverted: [true; 3],
+        },
+        3,
+    )
+    .unwrap();
+    phy
+}
 pub fn run(csr_hz: u64) {
     let tuning = Tuning {
         drive: [0, 3, 6],
@@ -84,8 +118,7 @@ pub fn run(csr_hz: u64) {
         tx_delay: 10,
         tx_inverted: [true; 3],
     };
-    let mut phy =
-        Yt8531::probe(Port::new(Model::new(), csr_hz).unwrap(), u32::MAX, 4).unwrap();
+    let mut phy = Yt8531::probe(Port::new(Model::new(), csr_hz).unwrap(), u32::MAX, 4).unwrap();
     assert_eq!(phy.identity().address, 17);
     assert_eq!(phy.poll_link(), Err(Error::NotReady));
     phy.initialize(tuning, 3).unwrap();

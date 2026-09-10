@@ -9,7 +9,7 @@ import struct
 LOAD = 0x40200000
 RAM_END = 0x140000000
 
-def inspect(data):
+def inspect(data, ethernet=False):
     def unpack(fmt, offset):
         if offset < 0 or offset + struct.calcsize(fmt) > len(data):
             raise ValueError('truncated ELF structure')
@@ -38,6 +38,7 @@ def inspect(data):
         raise ValueError('overlapping loads')
     sections = [unpack('<IIQQQQIIQQ', h[6] + i * h[11]) for i in range(h[12])]
     symbols = {}
+    symbol_sizes = {}
     for section in sections:
         if section[1] != 2:
             continue
@@ -48,7 +49,7 @@ def inspect(data):
             raise ValueError('invalid string table')
         table = data[strings[4]:strings[4] + strings[5]]
         for offset in range(section[4], section[4] + section[5], 24):
-            name, info, _, shndx, value, _ = unpack('<IBBHQQ', offset)
+            name, info, _, shndx, value, symbol_size = unpack('<IBBHQQ', offset)
             if name >= len(table):
                 raise ValueError('symbol name outside table')
             end = table.find(b'\0', name)
@@ -59,6 +60,7 @@ def inspect(data):
                 if label in symbols and symbols[label] != value:
                     raise ValueError('ambiguous symbol')
                 symbols[label] = value
+                symbol_sizes[label] = symbol_size
     required = ['_start', '__heap_start', '__heap_end', '__stacks_bottom', '__stacks_top',
                 '__stack_guard_size', '__kernel_stack_stride', '__bss_start', '__bss_end']
     if any(name not in symbols for name in required):
@@ -74,17 +76,34 @@ def inspect(data):
     bss = (symbols['__bss_start'], symbols['__bss_end'])
     if not any(p['flags'] & 2 and p['address'] <= bss[0] < bss[1] <= p['address'] + p['memory_bytes'] for p in loads):
         raise ValueError('BSS is not in writable loaded RAM')
-    return {'status': 'elf-contract-passed', 'entry': LOAD, 'heap_start': heap, 'heap_end': RAM_END,
+    dma = None
+    if ethernet:
+        names = ['VIBEOS_MARS_EQOS_DMA', '__dma_start', '__dma_end', 'VIBEOS_PACKET_DEVICE']
+        if any(name not in symbols for name in names):
+            raise ValueError('missing Ethernet composition symbols')
+        base, size = symbols['VIBEOS_MARS_EQOS_DMA'], symbol_sizes['VIBEOS_MARS_EQOS_DMA']
+        if base % 64 or size != 32 * (2 * 64 + 2 * 1536):
+            raise ValueError('invalid EQoS DMA slab geometry')
+        if not LOAD <= symbols['__dma_start'] <= base < base + size <= symbols['__dma_end'] <= min(heap, 1 << 32):
+            raise ValueError('EQoS DMA slab is outside its permanent 32-bit region')
+        if not any(p['flags'] & 2 and p['address'] <= base and base + size <= p['address'] + p['memory_bytes'] for p in loads):
+            raise ValueError('EQoS DMA slab is not in writable loaded RAM')
+        dma = {'base': base, 'bytes': size, 'address_bits': 32, 'cache_line_bytes': 64}
+    result = {'status': 'elf-contract-passed', 'entry': LOAD, 'heap_start': heap, 'heap_end': RAM_END,
             'elf_sha256': hashlib.sha256(data).hexdigest(), 'loads': loads,
             'physical_acceptance': False, 'flashable_sd_image': False}
+    if dma is not None:
+        result['eqos_dma'] = dma
+    return result
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('elf', type=Path)
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--ethernet', action='store_true', help='also require the composed EQoS DMA slab')
     args = parser.parse_args()
     try:
-        result = inspect(args.elf.read_bytes())
+        result = inspect(args.elf.read_bytes(), ethernet=args.ethernet)
     except (ValueError, OSError) as error:
         parser.exit(1, f'MARS_IMAGE FAIL: {error}\n')
     payload = json.dumps(result, indent=2) + '\n'

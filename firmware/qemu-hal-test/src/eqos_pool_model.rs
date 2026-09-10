@@ -93,4 +93,32 @@ pub unsafe fn run() {
     assert_eq!(&output[60..], &[0; 4]);
     assert!(FLUSHES.load(Ordering::Relaxed) > 100);
     assert!(ring.shutdown());
+    #[cfg(feature = "mars-ethernet-test")]
+    {
+        use vibeos_firmware_milkv_mars::packet::Engine;
+        let backend = ring.into_stopped_backend().ok().unwrap();
+        let mut engine = Engine::new(backend, layout, super::phy_model::initialized()).unwrap();
+        assert_eq!(engine.poll_link(), Ok(()));
+        assert!(!engine.tx_owned().unwrap());
+        assert!(engine.transmit(&[0xbc; 60]).is_err());
+        super::phy_model::link(0xac00);
+        engine.poll_link().unwrap();
+        assert_eq!(engine.link().unwrap().speed, Speed::Mbps1000);
+        engine.transmit(&[0xbc; 60]).unwrap();
+        assert_eq!(
+            core::slice::from_raw_parts(txbuf as *const u8, 60),
+            &[0xbc; 60]
+        );
+        assert!(engine.tx_owned().unwrap());
+        super::phy_model::link(0);
+        engine.poll_link().unwrap();
+        assert!(engine.link().is_none());
+        assert!(!engine.tx_owned().unwrap());
+        super::phy_model::link(0x6c00);
+        engine.poll_link().unwrap();
+        assert_eq!(engine.link().unwrap().speed, Speed::Mbps100);
+        assert!(!engine.tx_owned().unwrap()); // prior TX is never replayed
+        assert!(engine.shutdown());
+        assert!(engine.poll_link().is_err());
+    }
 }

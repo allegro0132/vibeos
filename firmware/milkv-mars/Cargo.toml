@@ -7,6 +7,7 @@ build = "build.rs"
 [features]
 default = ["image"]
 image = ["dep:vibeos-kernel", "dep:vibeos-runtime-riscv", "dep:vibeos-image-policy"]
+ethernet = ["dep:vibeos-eqos-net", "dep:vibeos-ethernet", "vibeos-kernel?/dhcp-iperf3-server"]
 
 [lib]
 path = "src/lib.rs"
@@ -25,6 +26,8 @@ vibeos-platform-jh7110 = { path = "../../platform/jh7110" }
 vibeos-driver-uart16550 = { path = "../../drivers/uart16550" }
 vibeos-driver-plic = { path = "../../drivers/plic" }
 vibeos-driver-dw-mshc = { path = "../../drivers/dw-mshc" }
+vibeos-eqos-net = { path = "../../drivers/eqos-net", optional = true }
+vibeos-ethernet = { path = "../../drivers/ethernet", optional = true }
 
 [target.'cfg(all(target_arch = "riscv64", target_os = "none"))'.dependencies]
 vibeos-kernel = { path = "../../kernel", optional = true, default-features = false, features = ["pio-block", "packet-network", "bounded-device-image", "legacy-shell", "wasi-preview1"] }

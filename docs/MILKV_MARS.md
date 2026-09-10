@@ -1006,3 +1006,46 @@ Evidence is in `boards/milkv-mars/eqos-link-lifecycle-evidence.json`.
 The QEMU model does not exercise actual Mars carrier changes or the complete
 packet-task/DHCP path. Firmware packet-device assembly and physical tests are
 still required before claiming Mars Ethernet or SSH support.
+
+### Static Mars packet-device assembly (test profile)
+
+`sh scripts/build-milkv-mars.sh --ethernet` composes the admitted JH7110
+clock/reset/pad service, YT8531 PHY, EQoS controller, permanent DMA pool and HAL
+packet operations. The optional payload includes DHCP and the existing TCP 5201
+iperf3 service; it does not enable SSH. The default build remains serial/SD.
+Network payloads and their ELF checks/manifests are placed separately under
+`target/milkv-mars/ethernet`. The current generic test MAC is
+`02:00:00:00:00:01`; use only one such test image per network. Independent identity
+configuration remains required for the formal image.
+
+Firmware retains the ring throughout link transitions and fault recovery. It
+proves DMA stopped before changing PHY phase or MAC speed, and publishes a link
+only after configuration/start succeeds. Failed stop keeps the permanent pool
+quarantined; retirement cannot resume the old engine. Kernel capability,
+session, scheduling and recovery policies remain outside the hardware drivers.
+The NOLOAD DMA slab is explicitly initialized, 64-byte aligned, 102400 bytes,
+below 4 GiB and outside the heap; artifact checks enforce these properties.
+
+This integration found two boot defects. LTO could reorder the cold entry after
+other `.text.boot` objects; Mars now keeps a distinct entry section first and
+asserts its address equals the FIT load address. Also, the network-resource
+mapping additions in stages 30–33 required seven device level-0 tables while
+the kernel reserved six, causing an unconditional MMU startup failure. The HAL
+now declares a shared capacity of eight, and firmware checks board requirements
+at compile time. Earlier ELF-only reports did not detect that startup failure
+and must not be interpreted as boot evidence. The earlier stage-25 SD file is
+unchanged and predates those mapping additions.
+
+Eleven host firmware tests and four ELF checker tests pass. The RV64 acceptance
+image uses the real kernel mapper with seven device windows, then exercises the
+real pool/cache/controller/PHY/coordinator with modeled device effects: initial
+link down, gigabit TX, disconnect, 100 Mbps reconnect and retirement. Its
+`MARS_PACKET_ENGINE_MODEL PASS` marker accompanies 395 kernel selftests. Mutations
+removing stop proof, candidate verification and retirement are detected by host
+tests; reducing MMU capacity back to six fails at compile time. Evidence is in
+`boards/milkv-mars/packet-composition-evidence.json`.
+
+These tests do not execute the full DHCP packet task against real Mars hardware,
+qualify PHY electrical timing, or prove multicore DMA/cache coherence. They also
+do not qualify entropy, SSH, WASM over SSH, or the required cold-boot/stability
+acceptance. Payload composition is not physical Ethernet acceptance.

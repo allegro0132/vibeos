@@ -2,6 +2,8 @@
 //! Mars composition policy. Host tests exercise admission and data-only block
 //! translation; only the binary performs SBI calls or real device accesses.
 pub mod partition;
+#[cfg(feature = "ethernet")]
+pub mod packet;
 use vibeos_bsp_milkv_mars as mars;
 use vibeos_hal::{
     boot::{BootError, BootRequest},
@@ -21,6 +23,7 @@ pub struct Admission {
     pub harts: mars::harts::BootHarts,
     pub resources: mars::resources::Resources,
     pub heap: BootMemory<16>,
+    pub network: Option<mars::network_resources::Resources>,
 }
 /// The caller associates `dtb` with the handoff's physical DTB address.
 /// SBI bits are extension probes, not proof of successful four-hart startup.
@@ -44,17 +47,22 @@ pub fn admit(
     let memory = mars::usable_memory::<16>(dtb, request.dtb_address)
         .map_err(|_| BootError::InvalidMemory)?;
     let heap = request.usable_heap(&memory)?;
+    #[cfg(feature = "ethernet")]
+    let network = Some(mars::network_resources::admit(dtb).map_err(|_| BootError::InvalidDtb)?);
+    #[cfg(not(feature = "ethernet"))]
+    let network = None;
     Ok(Admission {
         harts,
         resources,
         heap,
+        network,
     })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use vibeos_hal::AddressRange;
-    const DTB: &[u8] = include_bytes!("../../../boards/milkv-mars/tests/fixtures/resources.dtb");
+    const DTB: &[u8] = include_bytes!("../../../boards/milkv-mars/tests/fixtures/network.dtb");
     #[test]
     fn four_hart_admission_requires_sbi_and_preserves_reserved_dtb_pages() {
         let mut request = BootRequest {

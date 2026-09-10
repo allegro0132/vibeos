@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
-//! Mars serial/SD bring-up image. EQoS and qualified entropy are not composed,
-//! so this image intentionally exposes no NIC and cannot enable SSH yet.
+//! Mars serial/SD bring-up image with an optional EQoS DHCP/iperf3 profile.
+//! Qualified entropy and SSH are not enabled; physical acceptance is pending.
 use core::{
     arch::global_asm,
     cell::UnsafeCell,
@@ -14,11 +14,13 @@ use vibeos_hal::{
     Board as BoardContract,
 };
 use vibeos_runtime_riscv as sbi;
-global_asm!(".section .text.boot\n.option norvc\n.global _start\n_start:\nj vibeos_kernel_start");
+global_asm!(".section .text.boot.entry,\"ax\"\n.option norvc\n.global _start\n_start:\nj vibeos_kernel_start");
 extern crate vibeos_kernel;
 #[path = "../../early_devices.rs"]
 mod early_devices;
 mod storage;
+#[cfg(feature = "ethernet")]
+mod network;
 struct BootState {
     ready: AtomicU8,
     value: UnsafeCell<Option<Admission>>,
@@ -60,13 +62,17 @@ const BOOT_HEAP_REGIONS: Option<fn() -> &'static [vibeos_hal::AddressRange]> =
 const HEAP_END: usize = vibeos_bsp_milkv_mars::RAM.end;
 const MANAGED_BLOCK_ID: core::num::NonZeroU128 =
     core::num::NonZeroU128::new(0x5649_4245_4f53_0000_0000_0000_0000_0003).unwrap();
-const NETWORK_DRIVER_NAME: &str = "unavailable (JH7110 EQoS pending)";
+#[cfg(not(feature = "ethernet"))]
+const NETWORK_DRIVER_NAME: &str = "unavailable (serial/SD profile)";
+#[cfg(feature = "ethernet")]
+const NETWORK_DRIVER_NAME: &str = "JH7110 EQoS / YT8531";
 unsafe fn platform_init(_write: fn(&str)) {}
 unsafe fn platform_report(print: fn(core::fmt::Arguments<'_>)) {
     print(format_args!("MARS_BOOT_ADMISSION PASS boot={} harts={} timebase={} heap_regions={} SBI=HSM,IPI,RFENCE,TIME\n",
         hart_ids()[0],hart_ids().len(),timebase_hz(),admission().heap.ranges().len()));
-    print(format_args!("Mars bring-up image: SD data-only PIO; EQoS/SSH not available; physical acceptance pending\n"));
+    print(format_args!("Mars bring-up: SD data-only PIO; network={}; SSH disabled; physical acceptance pending\n", NETWORK_DRIVER_NAME));
 }
+#[cfg(not(feature = "ethernet"))]
 #[no_mangle]
 pub static VIBEOS_PACKET_DEVICE: vibeos_hal::network::Device = vibeos_hal::network::Device {
     present: false,

@@ -148,6 +148,10 @@ pub const fn ram_page_table_pages(ram: AddressRange) -> usize {
     assert!(ram.start % (2 << 20) == 0 && ram.end % (2 << 20) == 0);
     (ram.end - 1) / (1 << 30) - ram.start / (1 << 30) + 1 + ram.len() / (2 << 20)
 }
+
+/// Static device mapping capacity shared by BSP admission and the kernel.
+pub const MAX_DEVICE_LEVEL1_TABLES: usize = 2;
+pub const MAX_DEVICE_LEVEL0_TABLES: usize = 8;
 #[cfg(test)]
 mod tests {
     use super::*;

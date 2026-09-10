@@ -1785,6 +1785,8 @@ dependencies = [
  "vibeos-driver-dw-mshc",
  "vibeos-driver-plic",
  "vibeos-driver-uart16550",
+ "vibeos-eqos-net",
+ "vibeos-ethernet",
  "vibeos-hal",
  "vibeos-image-policy",
  "vibeos-kernel",

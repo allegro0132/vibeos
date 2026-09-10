@@ -36,6 +36,10 @@ pub static VIBEOS_EARLY_DEVICES: EarlyDevices = EarlyDevices {
 
 use core::cell::UnsafeCell;
 use vibeos_hal::boot::{ram_page_table_pages, BootPlatform, PageTableArena};
+const _: () = {
+    assert!(Board::MMU.device_level1_tables <= vibeos_hal::boot::MAX_DEVICE_LEVEL1_TABLES);
+    assert!(Board::MMU.device_level0_tables <= vibeos_hal::boot::MAX_DEVICE_LEVEL0_TABLES);
+};
 const RAM_TABLE_PAGES: usize = ram_page_table_pages(Board::MMU.ram);
 #[repr(C, align(4096))]
 struct RamTables(UnsafeCell<[[u64; 512]; RAM_TABLE_PAGES]>);

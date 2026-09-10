@@ -31,8 +31,7 @@ pub const STACK_SLOT_STRIDE: usize = 256 * 1024;
 
 const MEGAPAGE_SIZE: usize = 2 * 1024 * 1024;
 const GIGAPAGE_SIZE: usize = 1024 * 1024 * 1024;
-const MAX_DEVICE_LEVEL1_TABLES: usize = 2;
-const MAX_DEVICE_LEVEL0_TABLES: usize = 6;
+use vibeos_hal::boot::{MAX_DEVICE_LEVEL0_TABLES, MAX_DEVICE_LEVEL1_TABLES};
 pub fn plic_enable_page() -> usize { plic_start() + 0x2000 }
 pub fn plic_context_start() -> usize { plic_start() + 0x20_0000 }
 

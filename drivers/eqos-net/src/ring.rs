@@ -148,6 +148,13 @@ impl<B: Backend> Ring<B> {
             Err(self)
         }
     }
+    pub(crate) fn stopped_backend(&mut self) -> Option<&mut B> {
+        if self.state == State::Offline {
+            Some(self.backend)
+        } else {
+            None
+        }
+    }
     pub fn initialize(&mut self) -> Result<(), Error> {
         if self.state == State::Running {
             return Err(Error::Controller);

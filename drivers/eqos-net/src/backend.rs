@@ -27,6 +27,19 @@ pub struct Backend<R: Io, M: Memory> {
     memory: &'static mut M,
     failed: bool,
 }
+impl<R: Io + 'static, M: Memory> ring::Ring<Backend<R, M>> {
+    /// Update software configuration while retaining the ring's ownership even
+    /// if the caller faults mid-operation. No DMA may be running at this point.
+    pub fn set_link(
+        &mut self,
+        speed: crate::controller::Speed,
+        full_duplex: bool,
+    ) -> Result<(), crate::controller::Error> {
+        self.stopped_backend()
+            .ok_or(crate::controller::Error::NotReady)?
+            .set_link(speed, full_duplex)
+    }
+}
 impl<R: Io, M: Memory> Backend<R, M> {
     pub fn set_link(
         &mut self,

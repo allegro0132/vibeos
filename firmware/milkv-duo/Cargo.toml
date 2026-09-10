@@ -52,3 +52,4 @@ vibeos-bsp-milkv-duo = { path = "../../boards/milkv-duo" }
 vibeos-driver-uart16550 = { path = "../../drivers/uart16550" }
 vibeos-driver-plic = { path = "../../drivers/plic" }
 vibeos-driver-sdhci-blk = { path = "../../drivers/sdhci-blk" }
+vibeos-platform-cv1800b = { path = "../../platform/cv1800b" }

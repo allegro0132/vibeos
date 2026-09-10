@@ -1751,6 +1751,7 @@ dependencies = [
  "vibeos-driver-uart16550",
  "vibeos-hal",
  "vibeos-kernel",
+ "vibeos-platform-cv1800b",
 ]
 
 [[package]]
@@ -1901,6 +1902,13 @@ dependencies = [
  "vibeos-core",
  "vibeos-durable-format",
  "vibeos-storage-device",
+]
+
+[[package]]
+name = "vibeos-platform-cv1800b"
+version = "0.1.0"
+dependencies = [
+ "vibeos-hal",
 ]
 
 [[package]]

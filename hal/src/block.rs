@@ -109,3 +109,13 @@ mod tests {
         assert_eq!(BlockWindow::new(1000, 0, 0), Err(Error::OutOfRange));
     }
 }
+
+/// Platform-provided slot power and source-clock sequencing. The controller
+/// owns its POWER_CONTROL/reset registers; the SoC owns pads and clock gates.
+pub trait SdPlatform {
+    fn prepare_clock(&mut self);
+    /// Called after controller power is disabled, before host reset.
+    fn power_off(&mut self);
+    /// Called after host reset, initial clock and controller power are ready.
+    fn power_on(&mut self);
+}

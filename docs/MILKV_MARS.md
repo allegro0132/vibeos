@@ -189,3 +189,22 @@ not Mars entropy qualification or a new physical fault/recovery qualification.
 The kernel no longer depends on `vibeos-driver-virtio-rng`. Its shared VirtIO
 transport and other DMA engines still require migration. Mars production SSH
 remains gated on an independently configured identity and qualified entropy.
+
+### SoC/SDHCI resource separation
+
+`vibeos-platform-cv1800b` now owns SDIO0 source clocks, pad mux/pulls and
+slot supply switching. The SDHCI description no longer grants access to the
+TOP block. Firmware constructs the platform resources and passes the HAL
+`SdPlatform` hooks to card initialization. Controller POWER_CONTROL, controller
+reset, command/response and FIFO operations remain in the SDHCI driver.
+
+The prior order is preserved: platform clocks, controller power off, pad/supply
+off with 30 ms settling, host reset and initial controller clock/power, then
+slot supply on with 1 ms and 5 ms settling. Host tests check unrelated bits,
+pad modes, power sequencing and failure to reset stopping before power-on.
+The monotonic delay also handles counter wrap. Fake registers cannot validate
+physical voltage, pad timing or a particular card's power requirements.
+
+This is the SD portion of the platform split. Ethernet and USB still contain
+CV1800B platform code, and shared clock-register ownership must remain serialized
+when those resources are migrated. JH7110 requires its own implementation.

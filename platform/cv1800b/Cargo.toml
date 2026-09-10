@@ -1,0 +1,6 @@
+[package]
+name = "vibeos-platform-cv1800b"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+vibeos-hal = { path = "../../hal" }

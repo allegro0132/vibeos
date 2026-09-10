@@ -23,10 +23,19 @@ pub static VIBEOS_PIO_BLOCK_DEVICE: PioBlockDevice = PioBlockDevice {
     irq: Board::INFO.sdhci.unwrap().irq,
     initialize: |hz, time, log| unsafe {
         *STORAGE.0.get() = None;
+        let mut slot = vibeos_platform_cv1800b::sd::SdSlot(vibeos_platform_cv1800b::sd::Mmio::new(
+            vibeos_hal::AddressRange::new(
+                vibeos_bsp_milkv_duo::SOC_CONTROL_BASE,
+                vibeos_bsp_milkv_duo::SOC_CONTROL_MMIO_END,
+            ),
+            hz,
+            time,
+        )?);
         let hardware = Card::initialize(
             Board::INFO.sdhci.ok_or(Error::InvalidConfiguration)?,
             hz,
             time,
+            &mut slot,
         )?;
         let capacity = hardware.info().capacity_sectors;
         *STORAGE.0.get() = Some(AdaptiveCard::new(hardware, log));

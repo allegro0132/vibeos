@@ -247,12 +247,11 @@ pub struct DwmacDescription {
     pub cache_line_bytes: usize,
 }
 
-/// SDHCI instance plus board-level pinmux and source-clock wiring.
+/// SDHCI controller resources after platform source-clock selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SdhciDescription {
     pub registers: AddressRange,
     pub irq: u32,
-    pub soc_control: AddressRange,
     pub source_clock_hz: u32,
     pub bus_width: u8,
     pub init_clock_hz: u32,

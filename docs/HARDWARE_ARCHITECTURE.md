@@ -130,3 +130,8 @@ completion queries can cross scheduler awaits, while state mutation requires
 exclusive invocation ownership. The minimal IRQ acknowledgement callback never
 borrows firmware engine state. Confirmed reset remains the prerequisite for
 releasing the kernel's DMA claim; failed resets retain quarantine.
+
+SD slot clock/pad/supply operations are supplied by a platform crate through
+HAL `SdPlatform` hooks. SDHCI receives only its own controller aperture and
+clock rates; it no longer receives a SoC control aperture. Firmware composes
+the controller and platform implementations, preserving power/reset ordering.

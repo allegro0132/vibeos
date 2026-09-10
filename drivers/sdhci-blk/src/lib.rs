@@ -2,7 +2,7 @@
 
 //! Conservative SDHCI PIO block driver for the CV1800B SDIO0 controller.
 //!
-//! This crate owns SoC clock/pad/power setup, SD card discovery and the SDHCI
+//! This crate owns SD card discovery and the SDHCI
 //! command/data path. It intentionally implements one-bit, 25 MHz PIO only:
 //! no device-visible DMA address is ever published.
 
@@ -116,14 +116,6 @@ pub enum MultiBlockWriteMode {
     BlindPio,
 }
 
-const PINMUX_OFFSET: usize = 0x1000;
-const CLKGEN_OFFSET: usize = 0x2000;
-const TOP_SD_PWRSW_CTRL: usize = 0x1f4;
-const CLK_ENABLE_0: usize = CLKGEN_OFFSET;
-const CLK_BYPASS_0: usize = CLKGEN_OFFSET + 0x30;
-const CLK_DIV_SD0: usize = CLKGEN_OFFSET + 0x70;
-const SD0_CLOCKS: u32 = (1 << 18) | (1 << 19) | (1 << 20);
-
 pub use vibeos_hal::block::Error;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,9 +140,9 @@ impl Card {
     /// Initialize the described CV1800B SDIO0 controller and attached card.
     ///
     /// # Safety
-    /// `description.registers` and `description.soc_control` must be mapped,
-    /// writable MMIO ranges for the CV1800B SDIO0 instance and its TOP block.
-    /// The caller must hold exclusive ownership of both ranges for the full
+    /// `description.registers` must be a mapped writable SDHCI aperture.
+    /// `platform` owns the source clock, slot supply and pads.
+    /// The caller must hold exclusive ownership of these resources for the full
     /// lifetime of the returned card. `time` must be a monotonic counter at
     /// `timebase_hz`, and the ranges must remain identity mapped and strongly
     /// ordered while any method on the card is executing.
@@ -158,6 +150,7 @@ impl Card {
         description: SdhciDescription,
         timebase_hz: u64,
         time: fn() -> u64,
+        platform: &mut impl vibeos_hal::block::SdPlatform,
     ) -> Result<Self, Error> {
         validate_description(description, timebase_hz)?;
         let mut card = Self {
@@ -170,11 +163,13 @@ impl Card {
             last_command: 0,
             last_interrupt_status: 0,
         };
-        card.prepare_soc_hardware();
+        platform.prepare_clock();
+        card.write8(POWER_CONTROL, 0);
+        platform.power_off();
         card.reset_host()?;
         card.set_clock(description.init_clock_hz)?;
         card.write8(POWER_CONTROL, 0x0f);
-        card.power_on_card();
+        platform.power_on();
         card.write8(TIMEOUT_CONTROL, 0x0e);
         card.write32(INT_ENABLE, INT_ALL);
         card.write32(SIGNAL_ENABLE, 0);
@@ -729,62 +724,6 @@ impl Card {
         Err(Error::TimedOut)
     }
 
-    fn prepare_soc_hardware(&self) {
-        self.soc_write32(CLK_ENABLE_0, self.soc_read32(CLK_ENABLE_0) | SD0_CLOCKS);
-        self.soc_write32(CLK_BYPASS_0, self.soc_read32(CLK_BYPASS_0) & !(1 << 6));
-        self.soc_write32(CLK_DIV_SD0, 0x0004_0009);
-        self.write8(POWER_CONTROL, 0);
-        self.set_sd_pad_function(3);
-        self.set_sd_pad_bias(false);
-        self.soc_write32(
-            TOP_SD_PWRSW_CTRL,
-            (self.soc_read32(TOP_SD_PWRSW_CTRL) & !0xf) | 0xe,
-        );
-        self.delay_ms(30);
-    }
-
-    fn power_on_card(&self) {
-        self.soc_write32(
-            TOP_SD_PWRSW_CTRL,
-            (self.soc_read32(TOP_SD_PWRSW_CTRL) & !0xf) | 0x9,
-        );
-        self.delay_ms(1);
-        self.set_sd_pad_function(0);
-        self.set_sd_pad_bias(true);
-        self.delay_ms(5);
-    }
-
-    fn set_sd_pad_function(&self, function: u8) {
-        self.soc_write8(PINMUX_OFFSET + 0x18, 0);
-        self.soc_write8(PINMUX_OFFSET + 0x1c, 0);
-        for offset in [0x00, 0x04, 0x08, 0x0c, 0x10, 0x14] {
-            self.soc_write8(PINMUX_OFFSET + offset, function);
-        }
-    }
-
-    fn set_sd_pad_bias(&self, online: bool) {
-        self.set_pad_pull(PINMUX_OFFSET + 0x900, true);
-        self.set_pad_pull(PINMUX_OFFSET + 0x904, false);
-        self.set_pad_pull(PINMUX_OFFSET + 0xa00, false);
-        for offset in [0xa04, 0xa08, 0xa0c, 0xa10, 0xa14] {
-            self.set_pad_pull(PINMUX_OFFSET + offset, online);
-        }
-    }
-
-    fn set_pad_pull(&self, offset: usize, pull_up: bool) {
-        let mut value = self.soc_read8(offset) & !((1 << 2) | (1 << 3));
-        value |= if pull_up { 1 << 2 } else { 1 << 3 };
-        self.soc_write8(offset, value);
-    }
-
-    fn delay_ms(&self, milliseconds: u64) {
-        let ticks = milliseconds.saturating_mul(self.timebase_hz) / 1_000;
-        let deadline = (self.time)().saturating_add(ticks);
-        while (self.time)() < deadline {
-            core::hint::spin_loop();
-        }
-    }
-
     fn reset_host(&self) -> Result<(), Error> {
         self.write32(SIGNAL_ENABLE, 0);
         self.write32(INT_ENABLE, 0);
@@ -932,10 +871,6 @@ impl Card {
         self.description.registers.start + offset
     }
     #[inline]
-    fn soc_address(&self, offset: usize) -> usize {
-        self.description.soc_control.start + offset
-    }
-    #[inline]
     fn read8(&self, offset: usize) -> u8 {
         unsafe { (self.address(offset) as *const u8).read_volatile() }
     }
@@ -959,27 +894,10 @@ impl Card {
     fn write32(&self, offset: usize, value: u32) {
         unsafe { (self.address(offset) as *mut u32).write_volatile(value) }
     }
-    #[inline]
-    fn soc_read8(&self, offset: usize) -> u8 {
-        unsafe { (self.soc_address(offset) as *const u8).read_volatile() }
-    }
-    #[inline]
-    fn soc_write8(&self, offset: usize, value: u8) {
-        unsafe { (self.soc_address(offset) as *mut u8).write_volatile(value) }
-    }
-    #[inline]
-    fn soc_read32(&self, offset: usize) -> u32 {
-        unsafe { (self.soc_address(offset) as *const u32).read_volatile() }
-    }
-    #[inline]
-    fn soc_write32(&self, offset: usize, value: u32) {
-        unsafe { (self.soc_address(offset) as *mut u32).write_volatile(value) }
-    }
 }
 
 fn validate_description(description: SdhciDescription, timebase_hz: u64) -> Result<(), Error> {
     if description.registers.len() < 0x250
-        || description.soc_control.len() < 0x3000
         || description.source_clock_hz == 0
         || description.init_clock_hz == 0
         || description.data_clock_hz == 0
@@ -1067,8 +985,6 @@ mod tests {
             description: SdhciDescription {
                 registers: AddressRange::new(start, start + core::mem::size_of_val(registers)),
                 irq: 0,
-                // None of the command-path tests touch SoC control registers.
-                soc_control: AddressRange::new(start, start + core::mem::size_of_val(registers)),
                 source_clock_hz: 1,
                 bus_width: 1,
                 init_clock_hz: 1,
@@ -1113,6 +1029,29 @@ mod tests {
         // successful SD transfers or real controller timing.
         assert!(card.write_blocks_tracked(0, &[0;4096], || published.set(published.get()+1)).is_err());
         assert_eq!(published.get(), 1);
+    }
+
+    #[test]
+    fn initialization_powers_off_before_reset_and_never_powers_on_after_reset_failure() {
+        struct Platform { power: *const u8, calls: [u8; 3], count: usize }
+        impl vibeos_hal::block::SdPlatform for Platform {
+            fn prepare_clock(&mut self) {
+                assert_eq!(unsafe { self.power.read_volatile() }, 0xff);
+                self.calls[self.count] = 1; self.count += 1;
+            }
+            fn power_off(&mut self) {
+                assert_eq!(unsafe { self.power.read_volatile() }, 0);
+                self.calls[self.count] = 2; self.count += 1;
+            }
+            fn power_on(&mut self) { panic!("failed reset must leave card power off"); }
+        }
+        let mut registers = [0u32; TEST_MMIO_WORDS];
+        let hardware = fake_card(&mut registers);
+        let power = (registers.as_mut_ptr() as usize + POWER_CONTROL) as *mut u8;
+        unsafe { power.write_volatile(0xff); }
+        let mut platform = Platform { power, calls: [0;3], count: 0 };
+        assert!(matches!(unsafe { Card::initialize(hardware.description, 1, hardware.time, &mut platform) }, Err(Error::TimedOut)));
+        assert_eq!(platform.calls, [1,2,0]);
     }
 
     fn read_test_command(registers: &[u32; TEST_MMIO_WORDS]) -> u16 {

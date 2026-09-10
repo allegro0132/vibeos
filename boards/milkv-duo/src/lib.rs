@@ -64,7 +64,6 @@ pub const DWMAC: DwmacDescription = DwmacDescription {
 pub const SDHCI: SdhciDescription = SdhciDescription {
     registers: AddressRange::new(SDHCI_BASE, SDHCI_MMIO_END),
     irq: SDHCI_IRQ,
-    soc_control: AddressRange::new(SOC_CONTROL_BASE, SOC_CONTROL_MMIO_END),
     source_clock_hz: 375_000_000,
     bus_width: 1,
     init_clock_hz: 400_000,

@@ -34,7 +34,7 @@ use vibeos_wasi_runtime::{
     WasiClockError, WasiInvocation, WasiIo, WasiIoError, WasiLimits, WasiTerminal,
 };
 static BUSY: AtomicBool = AtomicBool::new(false);
-#[cfg(all(feature = "python-wasi", any(feature = "wasmtime-command", feature = "wasi-rv64-cache")))]
+#[cfg(all(feature = "python-command", any(feature = "wasmtime-command", feature = "wasi-rv64-cache")))]
 compile_error!("python-wasi currently requires the bounded Wasmi interpreter backend");
 struct KernelIo<'a>(GuestIo<'a>);
 impl WasiIo for KernelIo<'_> {
@@ -232,6 +232,23 @@ fn launch(
     io: Arc<CommandIo>,
     authority: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<(), u32> {
+    // Local command input can belong to the caller's allocation domain.
+    // Keep the asynchronous job's input in SYSTEM until the job retires.
+    let _system = unsafe { heap::enter_domain(AllocationDomain::SYSTEM) };
+    let mut owned = Vec::new();
+    owned.try_reserve_exact(bytes.len()).map_err(|_| 124u32)?;
+    owned.extend_from_slice(bytes);
+    launch_owned(owned, argv, io, authority)
+}
+
+// The SSH request already owns its loaded snapshot in SYSTEM. Transfer it
+// directly instead of retaining a second full module buffer during admission.
+fn launch_owned(
+    bytes: Vec<u8>,
+    argv: &[String],
+    io: Arc<CommandIo>,
+    authority: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+) -> Result<(), u32> {
     if BUSY
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -271,7 +288,7 @@ fn launch(
         space.mint(Arc::new(Endpoint), Rights::WRITE),
     ];
     let job = Box::new(Job {
-        bytes: bytes.to_vec(),
+        bytes,
         argv: argv.to_vec(),
         io,
         space,
@@ -472,7 +489,7 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
         if reader.0.size > vibeos_wasi_runtime::profile::MODULE_BYTES as u64 {
             return Err(Status::BudgetExceeded);
         }
-        let bytes = vibeos_wasi_command::load_reader(reader.1)
+        let bytes = vibeos_wasi_command::load_reader(reader.1, reader.0.size)
             .await
             .map_err(|_| Status::Denied)?;
         let mut argv = alloc::vec![path.file_name().unwrap_or("command.wasm").to_string()];
@@ -589,23 +606,23 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
     })
 }
 
-#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime"))]
+#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime", feature = "milkv-python"))]
 pub fn permitted(
     profile: vibeos_sshd::AuthorizedProfile,
     request: &vibeos_wasi_command::Request,
 ) -> bool {
-    #[cfg(feature = "milkv-wasmtime")]
+    #[cfg(any(feature = "milkv-wasmtime", feature = "milkv-python"))]
     let admitted = crate::ssh_provisioning::command_profile_current(profile);
-    #[cfg(not(feature = "milkv-wasmtime"))]
+    #[cfg(not(any(feature = "milkv-wasmtime", feature = "milkv-python")))]
     let admitted = profile.profile.get() == 1 && profile.generation == 1;
     admitted && match request {
-        vibeos_wasi_command::Request::Upload { .. } => cfg!(any(feature = "wasi-ssh-upload", feature = "milkv-wasmtime")),
+        vibeos_wasi_command::Request::Upload { .. } => cfg!(any(feature = "wasi-ssh-upload", feature = "milkv-wasmtime", feature = "milkv-python")),
         vibeos_wasi_command::Request::Run { .. } => true,
     }
 }
-#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime"))]
+#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime", feature = "milkv-python"))]
 struct RequestService(bool);
-#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime"))]
+#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime", feature = "milkv-python"))]
 impl Resource for RequestService {
     fn kind(&self) -> &'static str {
         if self.0 {
@@ -621,7 +638,7 @@ impl Resource for RequestService {
         self
     }
 }
-#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime"))]
+#[cfg(any(feature = "wasi-ssh", feature = "milkv-wasmtime", feature = "milkv-python"))]
 pub fn open(
     profile: vibeos_sshd::AuthorizedProfile,
     request: vibeos_wasi_command::Request,
@@ -708,13 +725,13 @@ pub fn open(
                         // the granted execution right; session denial and
                         // disconnect still revoke CommandIo at every boundary.
                         let _keep_loader_alive = &loader;
-                        #[cfg(feature = "milkv-wasmtime")]
+                        #[cfg(any(feature = "milkv-wasmtime", feature = "milkv-python"))]
                         if !crate::ssh_provisioning::command_profile_current(profile) {
                             return false;
                         }
                         service_lease.authorizes(Rights::INVOKE)
                     });
-                    launch(&bytes, &argv, task_io.clone(), Some(authority))?;
+                    launch_owned(bytes, &argv, task_io.clone(), Some(authority))?;
                     Ok(true)
                 }
             }

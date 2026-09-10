@@ -7,7 +7,9 @@ autobins = false
 [features]
 # Production Duo command image; never pulls in QEMU test identities.
 milkv-wasmtime = ["milkv-ssh", "wasi-preview1", "vibeos-sshd/wasi-exec", "wasmtime-command-fuel-batch", "wasmtime-threads"]
-python-wasi = ["wasi-ssh-upload", "vibeos-wasi-runtime/python-wasi", "vibeos-bsp-qemu-virt?/python-wasi", "vibeos-sshd/python-wasi"]
+python-command = ["wasi-preview1", "vibeos-wasi-runtime/python-wasi", "vibeos-sshd/python-wasi"]
+python-wasi = ["wasi-ssh-upload", "python-command", "vibeos-bsp-qemu-virt?/python-wasi"]
+milkv-python = ["milkv-ssh", "python-command", "vibeos-wasi-runtime/python-duo"]
 # Command images generate code for the scalar extensions every schedulable
 # hart advertised at boot (see `wasmtime-discovered-isa`); a target without
 # them still receives RV64GC code.

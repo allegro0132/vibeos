@@ -12,6 +12,7 @@ jitterentropy_ssh_probe=false
 iperf3_server=false
 file_tree=false
 wasmtime=false
+python=false
 wasmtime_suffix=
 wasmtime_mode=--wasmtime
 runtime_costs=false
@@ -35,14 +36,15 @@ for arg in "$@"; do
     --jitterentropy-ssh-probe) jitterentropy_ssh_probe=true ;;
     --iperf3-server) iperf3_server=true ;;
     --file-tree) file_tree=true ;;
+    --python) wasmtime=true; python=true; wasmtime_mode=--python ;;
     --wasmtime) wasmtime=true ;;
     --wasmtime-benchmark) wasmtime=true; wasmtime_suffix=-benchmark; wasmtime_mode=--wasmtime-benchmark ;;
     --runtime-costs) runtime_costs=true ;;
     --wasm-aot-profile) wasm_aot_profile=true ;;
-    -*) echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree|--wasmtime|--wasmtime-benchmark|--runtime-costs] [duo-buildroot-sdk-root]" >&2; echo "       $0 --wasm-aot-profile" >&2; exit 2 ;;
+    -*) echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree|--python|--wasmtime|--wasmtime-benchmark|--runtime-costs] [duo-buildroot-sdk-root]" >&2; echo "       $0 --wasm-aot-profile" >&2; exit 2 ;;
     *)
       if [ -n "$sdk_arg" ]; then
-        echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree|--wasmtime|--wasmtime-benchmark|--runtime-costs] [duo-buildroot-sdk-root]" >&2
+        echo "usage: $0 [--diagnostic|--ssh-acceptance|--jitterentropy-probe|--jitterentropy-ssh-probe|--iperf3-server|--file-tree|--python|--wasmtime|--wasmtime-benchmark|--runtime-costs] [duo-buildroot-sdk-root]" >&2
         echo "       $0 --wasm-aot-profile" >&2
         exit 2
       fi
@@ -533,6 +535,11 @@ elif [ "$wasmtime" = true ]; then
   features=wasmtime$wasmtime_suffix
   output_dir="$repo_root/target/milkv-duo-wasmtime$wasmtime_suffix"
   output_elf="$output_dir/vibeos-milkv-duo-wasmtime$wasmtime_suffix.elf"
+  if [ "$python" = true ]; then
+    features=python
+    output_dir="$repo_root/target/milkv-duo-python"
+    output_elf="$output_dir/vibeos-milkv-duo-python.elf"
+  fi
 elif [ "$file_tree" = true ]; then
   features=milkv-ssh,file-tree
   output_dir="$repo_root/target/milkv-duo-file-tree"

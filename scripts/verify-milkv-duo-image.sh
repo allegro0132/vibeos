@@ -5,7 +5,7 @@ export LC_ALL=C
 
 usage() {
   echo "usage: $0 --selftest" >&2
-  echo "       $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree | --wasmtime | --wasmtime-benchmark | --runtime-costs | --wasm-aot-profile] [--package-preflight] [--artifact-root=<absolute-path>] <duo-buildroot-sdk-root>" >&2
+  echo "       $0 [--diagnostic | --ssh-acceptance | --jitterentropy-probe | --jitterentropy-ssh-probe | --iperf3-server | --file-tree | --python | --wasmtime | --wasmtime-benchmark | --runtime-costs | --wasm-aot-profile] [--package-preflight] [--artifact-root=<absolute-path>] <duo-buildroot-sdk-root>" >&2
 }
 
 verify_raw_data_partition() {
@@ -761,6 +761,7 @@ selftest=false
 iperf3_server=false
 file_tree=false
 wasmtime=false
+python=false
 wasmtime_suffix=
 wasmtime_mode=--wasmtime
 runtime_costs=false
@@ -780,6 +781,7 @@ for arg in "$@"; do
     --selftest) selftest=true ;;
     --iperf3-server) iperf3_server=true ;;
     --file-tree) file_tree=true ;;
+    --python) wasmtime=true; python=true; wasmtime_mode=--python ;;
     --wasmtime) wasmtime=true ;;
     --wasmtime-benchmark) wasmtime=true; wasmtime_suffix=-benchmark; wasmtime_mode=--wasmtime-benchmark ;;
     --runtime-costs) runtime_costs=true ;;
@@ -1082,6 +1084,10 @@ elif [[ "$iperf3_server" == true ]]; then
 elif [[ "$wasmtime" == true ]]; then
   output_dir="$repo_root/target/milkv-duo-wasmtime$wasmtime_suffix"
   image_name="vibeos-milkv-duo-wasmtime$wasmtime_suffix-sd.img"
+  if [[ "$python" == true ]]; then
+    output_dir="$repo_root/target/milkv-duo-python"
+    image_name="vibeos-milkv-duo-python-sd.img"
+  fi
 elif [[ "$file_tree" == true ]]; then
   output_dir="$repo_root/target/milkv-duo-file-tree"
   image_name="vibeos-milkv-duo-file-tree-sd.img"

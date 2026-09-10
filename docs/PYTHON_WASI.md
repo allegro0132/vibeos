@@ -138,3 +138,110 @@ tests passed, as did native Wasmtime execution of the stdio metadata fixture
 and the existing C standard-library command. Local evidence is in
 `target/python-wasi/{host,qemu}-acceptance/`, with build and regression logs in
 `target/pyodide/`.
+
+## Milk-V Duo CPython image (awaiting physical qualification)
+
+`--python` is a separate Duo image using the existing Wasmi engine. It does not
+include the Wasmtime backend. The previously qualified Wasmtime/CoreMark image
+remains in its own output directory. The production SSH provisioning policy is
+preserved; QEMU test credentials are not enabled.
+
+```sh
+scripts/build-milkv-duo.sh --python
+# In the approved SDK Docker container, with output directory writable:
+scripts/package-milkv-duo-sdk.sh --python /home/work
+```
+
+The output directory is `target/milkv-duo-python`, with `boot.sd` and
+`vibeos-milkv-duo-python-sd.img`. The LZMA boot-window checks apply. Replacing only
+`boot.sd` on a powered-off board's SD card preserves the data partition; a full
+image write resets uploaded files and SSH provisioning.
+
+The `python-duo` runtime profile admits 16 MiB modules and the Python declaration
+limits while bounding linear memory to 16 MiB and the kernel allocation owner to
+40 MiB. It retains 10 billion total fuel and 100,000 fuel per poll. The original
+32-times-module-size admission estimate is bypassed only for this profile:
+CPython's frozen data makes that estimate overly conservative. Structural
+validation and the kernel allocation-owner quota remain enforced. Other profiles
+retain their original estimates and limits.
+
+The existing CPython 3.14.0 module (SHA-256
+`be59a6f2db568e3c8e1b6a92212ca183c79c91f682e36ab44496f8c205703a82`)
+passes all nine host Python acceptance cases with this runtime profile, including
+JSON/math, Unicode argv, stdin, exceptions and exit 7. The diagnostic example
+`cargo run --release -p vibeos-wasi-runtime --features python-duo --example memory
+-- target/python-wasi/python.wasm -c 'print(42)'` measures requested allocator
+bytes, not allocator metadata, fragmentation, kernel memory or board peak RAM.
+Host peaks were approximately 35.6 MiB including the input module buffer; this
+is feasibility evidence, not proof of operation on the 64 MiB board.
+
+Physical boot, upload and execution qualification is pending. The ordinary Duo
+Wasmtime image rejects the existing 10 MiB CPython upload. No Python execution on
+Duo is claimed until the new image is installed and the real SSH/UART tests pass.
+
+### First physical attempt and loader correction
+
+The first Duo image accepted and durably uploaded the 10,073,226-byte module,
+but failed before Python execution: growing the SYSTEM file buffer requested a
+12 MiB allocation, charged as 16 MiB, and exhausted the heap. Host requested-byte
+measurements had not included this growth transient or allocator size classes.
+This attempt is a failure, not physical Python acceptance.
+
+The corrected loader reserves the pinned file length once using fallible
+allocation, verifies the final length, and the SSH job takes ownership of that
+buffer without another full-module copy. Local callers retain SYSTEM ownership
+isolation, with fallible copying. A regression checks exact reservation and both
+short/long snapshot mismatches.
+
+For Duo, build the same CPython interpreter and frozen module list with:
+
+```sh
+python3 scripts/build-python-wasi.py \
+  --source target/pyodide/Python-3.14.0 \
+  --build-python target/pyodide/build-host/python.exe \
+  --sdk target/toolchains/wasi-sdk-33.0-arm64-macos \
+  --work target/python-duo-wasi --opt-level z \
+  --without-legacy-cjk-codecs --frozen-opt-level 2
+```
+
+This omits the optional legacy CJK codec extensions (UTF-8/Unicode remain), and
+compiles frozen standard-library bytecode at optimization level 2, removing its
+docstrings and assertions. User scripts keep their normal optimization setting.
+The resulting module is 8,165,626 bytes. All nine host cases pass with eager
+Wasmi translation; no lazy translation is enabled in the delivered image.
+Wasmi's internal function ceiling now matches the separately validated profile
+ceiling, since size optimization increases the number of small functions.
+
+The updated allocation diagnostic also estimates the 64-bit allocator's
+56-byte header, alignment, power-of-two charge and reallocation transient.
+Worst case across the host suite: 45,625,856 bytes including the module buffer;
+37,234,816 bytes for invocation allocations. The owner quota is 40 MiB. These
+estimates exclude kernel services and fragmentation, so physical qualification
+of the corrected image remains necessary. Raw first-attempt UART evidence is
+in `target/duo-python/physical`; original artifacts are retained under
+`target/milkv-duo-python/previous-load-oom`.
+
+### Second physical attempt: initialization and cache budget
+
+The load-fix image uploaded the 8,165,626-byte module successfully and passed the
+former SYSTEM-buffer growth point. Wasmi initialization then exhausted the heap
+on owner 9 while allocating a 4,787,105-byte data buffer (8 MiB charged). Python
+had not begun execution. Evidence is in `target/duo-python/physical-loadfix`.
+
+The CPython image now limits the storage read cache to 64 pages rather than 512.
+Each boxed 4096-byte page occupies an 8192-byte allocator block, so this removes
+up to 3.5 MiB of cache charge. Other images retain 512 pages. This is a cache
+capacity change, not a change to durable storage or write semantics.
+
+The Duo module additionally uses `--compact-encodings`: frozen codecs are ASCII,
+Latin-1, UTF-8/16/32 and Unicode escape variants, plus their initialization and
+alias tables. Other encoding modules are unavailable. Import bootstrap code uses
+CPython's existing intrinsic frozen copy. The full CPython interpreter and the
+nine tested library/stdio cases remain supported. This variant is 7,558,394 bytes,
+SHA-256 `9ef6b0ec3b49675a6a1f51b7fd1a3406aa6bf549736951f4a3b2c07e1873e5ab`.
+Its largest initialized data segment is 4,179,873 bytes, below the 4 MiB allocation
+boundary including the allocator header. Host allocator-charge estimates peak at
+45,332,352 bytes including the module buffer; add kernel service memory and the
+new smaller cache separately. All nine host cases pass. Physical execution of
+this cache-budget correction remains pending; neither previous attempt is a
+successful Python-on-Duo run.

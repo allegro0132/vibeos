@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+python = ["vibeos-kernel/milkv-python"]
 wasmtime = ["vibeos-kernel/milkv-wasmtime"]
 wasmtime-benchmark = ["wasmtime", "vibeos-kernel/wasi-long-fuel"]
 default = ["milkv-ssh"]

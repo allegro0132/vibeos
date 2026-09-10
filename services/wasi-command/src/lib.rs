@@ -255,21 +255,27 @@ pub async fn load(root: &FileTreeRoot, path: &RelPath) -> Result<Vec<u8>, u32> {
     if meta.file_type != FileType::Regular || meta.size > MODULE_BYTES as u64 {
         return Err(126);
     }
-    load_reader(reader).await
+    load_reader(reader, meta.size).await
 }
-pub async fn load_reader(reader: vibeos_file_store::FsFileReader) -> Result<Vec<u8>, u32> {
+pub async fn load_reader(reader: vibeos_file_store::FsFileReader, size: u64) -> Result<Vec<u8>, u32> {
+    let size = usize::try_from(size).map_err(|_| 126u32)?;
+    if size > MODULE_BYTES { return Err(126); }
     let mut bytes = Vec::new();
+    // Allocate once from the pinned metadata. Growth would temporarily retain
+    // both large buffers, and SYSTEM allocation failure is not guest-recoverable.
+    bytes.try_reserve_exact(size).map_err(|_| 124u32)?;
     for i in 0..reader.chunk_count() {
         let chunk = reader
             .read_chunk(i)
             .await
             .map_err(|_| 125u32)?
             .ok_or(125u32)?;
-        if bytes.len() + chunk.len() > MODULE_BYTES {
+        if chunk.len() > size.saturating_sub(bytes.len()) {
             return Err(126);
         }
         bytes.extend_from_slice(&chunk);
     }
+    if bytes.len() != size { return Err(125); }
     Ok(bytes)
 }
 pub async fn upload(
@@ -510,6 +516,22 @@ mod tests {
         assert!(denied.denied());
         denied.complete(WasiTerminal::Denied);
         assert_eq!(denied.pending_waiters(), 0);
+    }
+
+    #[test]
+    fn loader_uses_exact_snapshot_length_and_rejects_mismatch() {
+        let root = FileTreeRoot::new_empty(124).unwrap();
+        let path = RelPath::parse("chunks.wasm").unwrap();
+        let mut tx = root.begin().unwrap();
+        tx.write_chunks(&path, [b"abc", b"def", b"ghi"], false).unwrap();
+        tx.commit().unwrap();
+        for (size, expected) in [(9, Ok(b"abcdefghi".to_vec())), (8, Err(126)), (10, Err(125))] {
+            let (_, reader) = root.regular_reader(&path).unwrap();
+            let mut future = core::pin::pin!(load_reader(reader, size));
+            let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(Waker::noop())) else { panic!("volatile reader must be ready") };
+            if let Ok(bytes) = &result { assert_eq!(bytes.capacity(), size as usize); }
+            assert_eq!(result, expected);
+        }
     }
 
     #[test]

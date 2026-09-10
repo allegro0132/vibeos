@@ -188,8 +188,10 @@ impl WasiInvocation {
     pub fn new(bytes: &[u8], arguments: &[String], limits: WasiLimits) -> Result<Self, WasiError> {
         limits.check()?;
         validate::inspect(bytes, limits)?;
-        // Conservative compilation reservation, separately from the actual owner quota.
-        if bytes
+        // Ordinary profiles retain their conservative size heuristic. The Duo
+        // CPython profile is admitted against its enforced allocation owner:
+        // frozen bytecode/data makes the 32x file-size estimate inappropriate.
+        if !cfg!(feature = "python-duo") && bytes
             .len()
             .checked_mul(32)
             .and_then(|n| n.checked_add(256 * 1024))
@@ -238,7 +240,7 @@ impl WasiInvocation {
             .set_max_stack_height(128 * 1024)
             .set_max_cached_stacks(0)
             .compilation_mode(wasmi::CompilationMode::Eager)
-            .enforced_limits(wasmi::EnforcedLimits::strict());
+            .enforced_limits(wasmi::EnforcedLimits::strict().with_max_functions(profile::DECLARATIONS.max_functions));
         let engine = Engine::new(&config);
         let module = Module::new(&engine, bytes).map_err(|_| WasiError::Unsupported)?;
         let mut linker = Linker::new(&engine);

@@ -16,12 +16,22 @@ site stat string stringprep struct textwrap token tokenize traceback
 types typing warnings weakref _collections_abc _sitebuiltins'''.split()
 
 
-def freeze(library, output):
+def freeze(library, output, optimize=0, compact_encodings=False):
     files = {}
     for module in MODULES:
         path = library / module
         if path.is_dir():
             for child in sorted(path.rglob('*.py')):
+                if compact_encodings and module == 'encodings' and child.stem not in {
+                    '__init__', 'aliases', 'ascii', 'latin_1', 'utf_8', 'utf_8_sig',
+                    'utf_16', 'utf_16_be', 'utf_16_le', 'utf_32', 'utf_32_be', 'utf_32_le',
+                    'unicode_escape', 'raw_unicode_escape',
+                }:
+                    continue
+                # CPython already provides the import bootstrap as intrinsic
+                # frozen modules and aliases these names during initialization.
+                if compact_encodings and module == 'importlib' and child.stem in {'_bootstrap', '_bootstrap_external'}:
+                    continue
                 if '__pycache__' not in child.parts:
                     name = '.'.join(child.relative_to(library).with_suffix('').parts)
                     package = name.endswith('.__init__')
@@ -33,7 +43,7 @@ def freeze(library, output):
     with output.open('w') as out:
         rows = []
         for index, (name, (path, package)) in enumerate(sorted(files.items())):
-            code = compile(path.read_bytes(), '<frozen ' + name + '>', 'exec', dont_inherit=True)
+            code = compile(path.read_bytes(), '<frozen ' + name + '>', 'exec', dont_inherit=True, optimize=optimize)
             data = marshal.dumps(code)
             symbol = f'vibe_frozen_{index}'
             out.write(f'static const unsigned char {symbol}[] = {{\n')
@@ -47,4 +57,4 @@ def freeze(library, output):
 
 
 if __name__ == '__main__':
-    freeze(Path(sys.argv[1]), Path(sys.argv[2]))
+    freeze(Path(sys.argv[1]), Path(sys.argv[2]), int(sys.argv[3]) if len(sys.argv) > 3 else 0, len(sys.argv) > 4 and sys.argv[4] == "compact")

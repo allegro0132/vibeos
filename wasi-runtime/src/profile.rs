@@ -6,12 +6,16 @@ pub const MODULE_BYTES: usize = if cfg!(feature = "python-wasi") {
 } else {
     512 * 1024
 };
-pub const MEMORY_BYTES: usize = if cfg!(feature = "python-wasi") {
+pub const MEMORY_BYTES: usize = if cfg!(feature = "python-duo") {
+    16 * 1024 * 1024
+} else if cfg!(feature = "python-wasi") {
     64 * 1024 * 1024
 } else {
     16 * 1024 * 1024
 };
-pub const ALLOCATION_BYTES: usize = if cfg!(feature = "python-wasi") {
+pub const ALLOCATION_BYTES: usize = if cfg!(feature = "python-duo") {
+    40 * 1024 * 1024
+} else if cfg!(feature = "python-wasi") {
     512 * 1024 * 1024
 } else {
     32 * 1024 * 1024

@@ -51,6 +51,7 @@ legacy-shell = []
 # benchmark image and is absent from production capability layouts.
 storage-bench = ["vibeos-image-policy/storage-bench", "vibeos-bsp-qemu-virt?/storage-bench"]
 storage-bench-128m = ["storage-bench", "vibeos-bsp-qemu-virt?/storage-bench-128m"]
+storage-bench-small-store = ["storage-bench"]
 file-tree = [
     "dep:vibeos-file-store",
     "vibeos-vsh/file-tree",

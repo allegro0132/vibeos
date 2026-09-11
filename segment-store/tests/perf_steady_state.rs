@@ -296,6 +296,14 @@ fn append_records(
     records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
     bytes: &[u8],
 ) -> (Vec<[u8; vibeos_durable_format::RECORD_SIZE]>, ObjectId) {
+    append_records_with_encoding(records, bytes, false)
+}
+
+fn append_records_with_encoding(
+    records: &[[u8; vibeos_durable_format::RECORD_SIZE]],
+    bytes: &[u8],
+    external: bool,
+) -> (Vec<[u8; vibeos_durable_format::RECORD_SIZE]>, ObjectId) {
     let preflight = vibeos_durable_format::preflight_recovery(records, store_id()).unwrap();
     let mut chain =
         RecordChain::from_checkpoint(store_id(), preflight.chain_checkpoint().unwrap()).unwrap();
@@ -309,17 +317,33 @@ fn append_records(
             .append(None, RecordBody::IdHighWater { exclusive_end })
             .unwrap(),
     );
-    output.extend(
-        encode_object_transaction(
-            &mut chain,
+    if external {
+        let root = vibeos_blob_format::BlobDescriptor::from_content(OBJECT_KIND_RAW, bytes)
+            .unwrap()
+            .root;
+        let (encoded, _) = vibeos_durable_format::preview_external_object_transaction(
+            &chain,
             TransactionId::new(transaction).unwrap(),
             object_id,
             kind(),
-            bytes,
+            bytes.len() as u64,
+            root,
         )
-        .unwrap()
-        .records,
-    );
+        .unwrap();
+        output.extend(encoded.records);
+    } else {
+        output.extend(
+            encode_object_transaction(
+                &mut chain,
+                TransactionId::new(transaction).unwrap(),
+                object_id,
+                kind(),
+                bytes,
+            )
+            .unwrap()
+            .records,
+        );
+    }
     (output, object_id)
 }
 
@@ -334,6 +358,15 @@ fn runtime_ctx() -> (
 
 #[test]
 fn steady_state_replace_attribution() {
+    steady_state_attribution(false, 64);
+}
+
+#[test]
+fn steady_state_external_attribution() {
+    steady_state_attribution(true, 128);
+}
+
+fn steady_state_attribution(external: bool, default_rounds: usize) {
     let device = CountingDevice::blank(SEGMENTS);
     let (runtime, _quota, provisioner) = runtime_ctx();
     let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
@@ -344,8 +377,9 @@ fn steady_state_replace_attribution() {
     }))
     .unwrap();
     let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
-    let writer: PersistentAuthorityWriter =
-        store.derive_persistent_authority_writer(&maintenance).unwrap();
+    let writer: PersistentAuthorityWriter = store
+        .derive_persistent_authority_writer(&maintenance)
+        .unwrap();
 
     let mut records = format_records();
     let first = import(&records);
@@ -361,10 +395,24 @@ fn steady_state_replace_attribution() {
         .collect();
     let mut generation = first_view.checkpoint_generation();
     let bench_principal = first_view.principals()[0].clone();
+    let rounds = std::env::var("VIBEOS_STEADY_APPEND_COUNT")
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .expect("VIBEOS_STEADY_APPEND_COUNT must be an integer")
+        })
+        .unwrap_or(default_rounds);
+    assert!(rounds > 0);
+    println!("steady-state requested appends: {rounds}; external={external}");
     println!("append,kind,read_pages,write_pages,flush,read_req,write_req");
-    for round in 0..40 {
-        let (next_records, _object_id) = append_records(&records, &payload);
-        let update = import(&next_records);
+    for round in 0..rounds {
+        let (next_records, object_id) = append_records_with_encoding(&records, &payload, external);
+        let mut update = import(&next_records);
+        if external {
+            update
+                .attach_external_payload(object_id.get(), payload.clone())
+                .unwrap();
+        }
         device.begin_epoch();
         device.set_trace(round == 34);
         let result = block_on(store.append_persistent_authority(
@@ -378,23 +426,40 @@ fn steady_state_replace_attribution() {
             device.set_trace(false);
             device.dump_sites();
         }
-        let view = match result {
-            Ok(result) => result.into_parts().0,
+        let (view, witness) = match result {
+            Ok(result) => result.into_parts(),
             Err(error) => panic!("append {} failed: {:?}", round, error),
         };
+        if external {
+            let recovered =
+                vibeos_durable_format::preflight_recovery(&next_records, store_id()).unwrap();
+            let object = recovered
+                .committed_objects()
+                .iter()
+                .find(|object| object.object_id == object_id)
+                .unwrap();
+            assert_eq!(
+                block_on(store.read_transient_object(&witness, object)).unwrap(),
+                payload
+            );
+            // Keep readback verification outside the append I/O attribution.
+            device.epoch_counters();
+        }
+        drop(witness);
         generation = view.checkpoint_generation();
         records = next_records;
         // A collection round is visible as extra checkpoint transactions;
         // flush count is the stable signature now that GC reads are batched.
-        let kind_label = if counters.flushes > 4 {
-            "gc"
-        } else {
-            "normal"
-        };
+        let kind_label = if counters.flushes > 4 { "gc" } else { "normal" };
         println!(
             "{},{},{},{},{},{},{}",
-            round, kind_label, counters.reads, counters.writes, counters.flushes,
-            counters.read_requests, counters.write_requests
+            round,
+            kind_label,
+            counters.reads,
+            counters.writes,
+            counters.flushes,
+            counters.read_requests,
+            counters.write_requests
         );
         // Regression budget for the fused durable-append fast path: one
         // metadata segment and one checkpoint per append. The zero-seal reuse
@@ -423,6 +488,19 @@ fn steady_state_replace_attribution() {
     // so appended objects stay boot-local (transient) and the admitted set
     // remains empty, exactly like the observed "2 live objects" matrix.
     assert_eq!(view.objects().len(), 0);
+    println!(
+        "final authority stream bytes: {}",
+        records.len() * vibeos_durable_format::RECORD_SIZE
+    );
+    drop(view);
+    drop(store);
+    let (runtime, _quota, _provisioner) = runtime_ctx();
+    let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+    block_on(cold.mount()).unwrap();
+    let view = block_on(cold.recover_persistent_authority(root_policy_commitment(POLICY))).unwrap();
+    // Neither encoding may turn an ungranted transient object into authority
+    // at the boot boundary. External payload readback was checked per append.
+    assert!(view.objects().is_empty());
 }
 
 #[test]

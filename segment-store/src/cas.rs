@@ -226,11 +226,9 @@ impl<D: PageDevice> PageDevice for SpanSnapshotDevice<'_, D> {
     }
 
     async fn read_page(&self, page: u64, output: &mut Page) -> Result<(), Self::Error> {
-        for (first, pages) in &self.spans {
-            if page >= *first && page < *first + pages.len() as u64 {
-                output.copy_from_slice(&pages[(page - first) as usize]);
-                return Ok(());
-            }
+        if let Some(bytes) = self.buffered_page(page) {
+            output.copy_from_slice(bytes);
+            return Ok(());
         }
         self.inner.read_page(page, output).await
     }
@@ -301,12 +299,9 @@ impl<D: PageDevice> PageDevice for SinkOverlayDevice<'_, D> {
     }
 
     async fn read_page(&self, page: u64, output: &mut Page) -> Result<(), Self::Error> {
-        if let Some(sink) = self.sink {
-            // Later writes win, so search from the end.
-            if let Some((_, bytes)) = sink.entries.iter().rev().find(|(sunk, _)| *sunk == page) {
-                output.copy_from_slice(bytes.as_ref());
-                return Ok(());
-            }
+        if let Some(bytes) = self.buffered_page(page) {
+            output.copy_from_slice(bytes);
+            return Ok(());
         }
         self.inner.read_page(page, output).await
     }
@@ -356,48 +351,39 @@ impl<D: PageDevice> PageDevice for SinkOverlayDevice<'_, D> {
 /// How many upcoming scratch segments one publication pre-clears.
 const PRECLEAR_SEAL_SEGMENTS: usize = 4;
 
-/// The free segments the next transaction's allocator hands out first: the
-/// leading run (at least two long, because a fresh blob needs its own segment
-/// plus one of headroom) of segments free in both the durable base map and
-/// the successor map. Segments this publication allocates are excluded, and
-/// so is anything the successor frees: a crash before the successor
-/// checkpoint seals leaves the base map authoritative, and it must never find
-/// a zeroed seal on a segment it still names.
+/// The first bounded set of segments free in both the durable base map and
+/// the successor map. V2 can use isolated holes for data and metadata, so the
+/// hint need not be contiguous. Exclude newly allocated and newly freed
+/// segments: until the successor checkpoint seals, the base may still name
+/// a freed segment's nonzero seal.
 fn preclear_candidates(
     base: &AllocationV2,
     successor: &AllocationV2,
     admitted_segments: u64,
 ) -> Vec<u64> {
-    let mut run: Vec<u64> = Vec::new();
+    let mut candidates = Vec::new();
     for segment_no in 0..admitted_segments {
-        let free = base.segment_state(segment_no) == Some(SegmentAllocation::Free)
-            && successor.segment_state(segment_no) == Some(SegmentAllocation::Free);
-        if free {
-            if run.try_reserve(1).is_err() {
+        if base.segment_state(segment_no) == Some(SegmentAllocation::Free)
+            && successor.segment_state(segment_no) == Some(SegmentAllocation::Free)
+        {
+            if candidates.try_reserve(1).is_err() {
                 return Vec::new();
             }
-            run.push(segment_no);
-            if run.len() == PRECLEAR_SEAL_SEGMENTS {
+            candidates.push(segment_no);
+            if candidates.len() == PRECLEAR_SEAL_SEGMENTS {
                 break;
             }
-        } else if run.len() >= 2 {
-            break;
-        } else {
-            run.clear();
         }
     }
-    if run.len() < 2 {
-        run.clear();
-    }
-    run
+    candidates
 }
 
 /// Stage zero pages over the candidates' final seal pages (into the
 /// publication sink when there is one, else straight to the device). The
 /// checkpoint slot protocol's barriers that follow make them durable, so the
 /// successor state may record them as durably cleared and the next writer
-/// skips the zero-write + flush + read-back it otherwise pays per scratch
-/// segment — one flush per checkpoint on small transactions. Previously
+/// skips the zero-write and flush it otherwise pays before scratch writes,
+/// while retaining the zero-seal readback. Previously
 /// proven segments carry forward while they stay free: nothing but a
 /// publication or a collection round (which starts a fresh state) touches
 /// a free segment's seal page.
@@ -1546,9 +1532,14 @@ impl<D: PageDevice> SegmentStore<D> {
             .ok()
             .and_then(|count| count.checked_add(1))
             .ok_or(StoreError::Capacity(CapacityClass::Payload))?;
-        let first_segment = current
-            .find_free_run(required, false)
-            .ok_or(StoreError::Capacity(CapacityClass::CleanerReserve))?;
+        // V2 metadata is placed independently of the contiguous data run.
+        // Still reserve its capacity above the cleaner/root-policy floor.
+        let first_segment = if current.allocation_version == 2 && fresh_segments > 0 {
+            current.find_free_run_with_headroom(required - 1, 1, false)
+        } else {
+            current.find_free_run(required, false)
+        }
+        .ok_or(StoreError::Capacity(CapacityClass::CleanerReserve))?;
         if fresh_segments > 0 && first_segment != current.next_physical_segment {
             (extents, segments, owned_from) = plan_scratch_with_cursor(
                 current.superblock.binding.store_uuid,
@@ -1907,12 +1898,40 @@ impl<D: PageDevice> SegmentStore<D> {
 /// Verify one already-resolved manifest without exercising object authority.
 /// This is crate-private so GC and scrub can authenticate staged media without
 /// turning a content digest or catalog identity into an object-opening API.
+/// Immutable bounds needed by blob verification; never owns catalog or
+/// authority buffers and cannot create an authorized object handle.
+#[derive(Clone, Copy)]
+pub(crate) struct ManifestReadContext {
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    generation: u64,
+}
+
+impl ManifestReadContext {
+    pub(crate) fn for_generation(state: &MountedState, generation: u64, next_segment_generation: u64) -> Self {
+        Self { generation, next_segment_generation, ..Self::from(state) }
+    }
+}
+
+impl From<&MountedState> for ManifestReadContext {
+    fn from(state: &MountedState) -> Self {
+        Self {
+            store_uuid: state.superblock.binding.store_uuid,
+            admitted_segments: state.admitted_segments,
+            next_segment_generation: state.next_segment_generation,
+            generation: state.generation,
+        }
+    }
+}
+
 pub(crate) async fn verify_manifest_blob<D: PageDevice>(
     device: &D,
-    state: &MountedState,
+    state: impl Into<ManifestReadContext>,
     manifest: &BlobManifest,
     memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(), CasStoreError<D::Error>> {
+    let state = state.into();
     let geometry = BlobGeometry::for_len(manifest.blob_key.exact_len())?;
     let descriptor = BlobDescriptor {
         object_kind: manifest.blob_key.object_kind(),
@@ -1923,7 +1942,7 @@ pub(crate) async fn verify_manifest_blob<D: PageDevice>(
     };
     validate_cas_blob_descriptors(
         device,
-        state.superblock.binding.store_uuid,
+        state.store_uuid,
         state.admitted_segments,
         state.next_segment_generation,
         state.generation,
@@ -1931,7 +1950,7 @@ pub(crate) async fn verify_manifest_blob<D: PageDevice>(
         memo,
     )
     .await?;
-    let header = read_manifest_range(device, state, manifest, 0, HEADER_SIZE).await?;
+    let header = ManifestRangeReader::new(false).read(device, state, manifest, 0, HEADER_SIZE).await?;
     let header: &[u8; HEADER_SIZE] = header
         .as_slice()
         .try_into()
@@ -2109,10 +2128,11 @@ async fn read_resolved_chunk<D: PageDevice>(
 
 async fn verify_resolved_blob<D: PageDevice>(
     device: &D,
-    state: &MountedState,
+    state: impl Into<ManifestReadContext>,
     descriptor: BlobDescriptor,
     manifest: &BlobManifest,
 ) -> Result<(), CasStoreError<D::Error>> {
+    let state = state.into();
     let geometry = BlobGeometry::for_len(descriptor.byte_len)?;
     let mut reader = ManifestRangeReader::new(true);
     let mut builder = StreamingMerkle::begin(
@@ -2253,11 +2273,12 @@ impl<D: PageDevice> Drop for BlobWriter<'_, D> {
 async fn verify_tree_emissions<D: PageDevice>(
     reader: &mut ManifestRangeReader,
     device: &D,
-    state: &MountedState,
+    state: impl Into<ManifestReadContext>,
     manifest: &BlobManifest,
     geometry: BlobGeometry,
     emissions: [Option<Emission>; MAX_STREAMING_EMISSIONS_PER_STEP],
 ) -> Result<(), CasStoreError<D::Error>> {
+    let state = state.into();
     let tree_offset = geometry.tree_offset() as u64;
     for emission in emissions.into_iter().flatten() {
         if emission.index >= geometry.tree_node_count() {
@@ -2304,11 +2325,12 @@ impl ManifestRangeReader {
     async fn read<D: PageDevice>(
         &mut self,
         device: &D,
-        state: &MountedState,
+        state: impl Into<ManifestReadContext>,
         manifest: &BlobManifest,
         encoded_offset: u64,
         len: usize,
     ) -> Result<Vec<u8>, CasStoreError<D::Error>> {
+        let state = state.into();
         if len == 0 {
             return Ok(Vec::new());
         }
@@ -2334,7 +2356,7 @@ impl ManifestRangeReader {
         let PhysicalPointer::Value(pointer) = declared.pointer else {
             return Err(StoreError::Corrupt.into());
         };
-        if pointer.store_uuid != state.superblock.binding.store_uuid
+        if pointer.store_uuid != state.store_uuid
             || pointer.segment_no >= state.admitted_segments
             || pointer.segment_generation == 0
             || pointer.segment_generation >= state.next_segment_generation
@@ -2535,7 +2557,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
         // Only freshly claimed segments need their publication page cleared:
         // a batch's shared segment was cleared by the writer which claimed
         // it, and a batched publication places its metadata segment itself,
-        // so the speculative last+1 clear is skipped under batch packing.
+        // so the independently selected metadata clear is skipped under batch packing.
         let mut cleared: Vec<u64> = Vec::new();
         cleared
             .try_reserve_exact(self.segments.len().saturating_sub(self.owned_from) + 1)
@@ -2546,12 +2568,10 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
                 .map(|segment| segment.segment_no),
         );
         if !self.batch_packing {
-            cleared.push(
-                self.segments
-                    .last()
-                    .and_then(|segment| segment.segment_no.checked_add(1))
-                    .ok_or(StoreError::Capacity(CapacityClass::Payload))?,
-            );
+            cleared.push(blob_metadata_segment(
+                self.state.as_ref().ok_or(CasStoreError::WriterFailed)?,
+                &self.segments,
+            )?);
         }
         let zero = heap_page();
         // Segments the previous publication pre-cleared (and whose zero seal
@@ -5349,10 +5369,7 @@ async fn commit_snapshot<D: PageDevice>(
         .map(|segment| segment.segment_no)
         .ok_or(StoreError::Corrupt)?;
     let metadata_segment_no = if is_new {
-        scratch_segments
-            .last()
-            .and_then(|segment| segment.segment_no.checked_add(1))
-            .ok_or(StoreError::IdExhausted)?
+        blob_metadata_segment(state, scratch_segments)?
     } else {
         scratch_first_segment
     };
@@ -5644,6 +5661,7 @@ async fn commit_snapshot<D: PageDevice>(
             allocated_segments.extend(scratch_segments.iter().map(|segment| segment.segment_no));
         }
         allocated_segments.push(metadata_segment_no);
+        allocated_segments.sort_unstable();
         let allocation = state
             .allocation
             .apply_transition(AllocationTransition {
@@ -6221,9 +6239,132 @@ fn find_scratch_page<E>(
     Ok((extent, within))
 }
 
+/// Select the same metadata carrier for pre-clear and final publication.
+/// Scratch is still free in the predecessor map, so explicitly exclude it.
+fn blob_metadata_segment<E>(
+    state: &MountedState,
+    scratch: &[ScratchSegment],
+) -> Result<u64, StoreError<E>> {
+    if state.allocation_version == 2 {
+        (0..state.admitted_segments)
+            .find(|segment_no| {
+                state.allocation.segment_state(*segment_no)
+                    == Some(crate::allocation_v2::SegmentAllocation::Free)
+                    && !scratch.iter().any(|entry| entry.segment_no == *segment_no)
+            })
+            .ok_or(StoreError::Capacity(CapacityClass::CleanerReserve))
+    } else {
+        scratch
+            .last()
+            .and_then(|entry| entry.segment_no.checked_add(1))
+            .ok_or(StoreError::Capacity(CapacityClass::Payload))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preclear_holes_excludes_either_checkpoint_live_segments_and_bounds_work() {
+        use crate::allocation_v2::SegmentAllocation::{Allocated, Free};
+        let base_states = [Allocated, Free, Allocated, Free, Allocated, Free,
+            Allocated, Free, Allocated, Free, Allocated, Free];
+        let mut next_states = base_states;
+        next_states[1] = Allocated; // This publication claims a previously free segment.
+        next_states[2] = Free; // Never pre-clear space absent from the base free set.
+        let base = AllocationV2::new(9, 30, 2, &base_states, &[]).unwrap();
+        let successor = AllocationV2::new(10, 31, 2, &next_states, &[]).unwrap();
+        assert_eq!(preclear_candidates(&base, &successor, 12), [3, 5, 7, 9]);
+        assert_eq!(preclear_candidates(&base, &successor, 4), [3]);
+        assert!(preclear_candidates(&base, &successor, 3).is_empty());
+        // Contiguous free space still has the same bounded first-four hint.
+        let contiguous = AllocationV2::new(9, 30, 2,
+            &[Allocated, Free, Free, Free, Free, Free], &[]).unwrap();
+        assert_eq!(preclear_candidates(&contiguous, &contiguous, 6), [1, 2, 3, 4]);
+    }
+
+
+    #[test]
+    fn device_views_batch_only_missing_runs_and_preserve_precedence() {
+        use alloc::vec;
+        use core::cell::{Cell, RefCell};
+        use core::future::Future;
+        use core::task::{Context, Poll, Waker};
+        use vibeos_storage_device::MutationResult;
+
+        struct Device {
+            reads: RefCell<Vec<(u64, usize)>>,
+            fail_at: Cell<Option<usize>>,
+        }
+        impl PageDevice for Device {
+            type Error = ();
+            fn info(&self) -> PageDeviceInfo { unreachable!() }
+            async fn write_page(&self, _: u64, _: &Page) -> MutationResult<(), ()> { unreachable!() }
+            async fn flush(&self) -> MutationResult<(), ()> { unreachable!() }
+            async fn read_page(&self, first: u64, out: &mut Page) -> Result<(), ()> {
+                self.read_pages(first, core::slice::from_mut(out)).await
+            }
+            async fn read_pages(&self, first: u64, out: &mut [Page]) -> Result<(), ()> {
+                let call = self.reads.borrow().len();
+                self.reads.borrow_mut().push((first, out.len()));
+                if first.checked_add(out.len() as u64).is_none_or(|end| end > 100) { return Err(()); }
+                for (index, page) in out.iter_mut().enumerate() {
+                    page.fill((first + index as u64) as u8);
+                    if self.fail_at.get() == Some(call) { return Err(()); }
+                }
+                Ok(())
+            }
+        }
+        fn run<F: Future>(future: F) -> F::Output {
+            let mut future = Box::pin(future);
+            match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(result) => result,
+                Poll::Pending => panic!("memory device unexpectedly yielded"),
+            }
+        }
+        fn check<D: PageDevice<Error = ()>>(view: &D, device: &Device) {
+            let mut out = vec![[0; PAGE_SIZE]; 10];
+            run(view.read_pages(10, &mut out)).unwrap();
+            assert_eq!(*device.reads.borrow(), [(10, 2), (14, 3), (18, 2)]);
+            for (index, page) in out.iter().enumerate() {
+                let expected = match index { 2 => 0xa0, 3 => 0xa1, 7 => 0xa2, _ => (10 + index) as u8 };
+                assert!(page.iter().all(|byte| *byte == expected));
+            }
+            device.reads.borrow_mut().clear();
+            run(view.read_pages(12, &mut out[..2])).unwrap();
+            run(view.read_pages(u64::MAX, &mut [])).unwrap();
+            assert!(device.reads.borrow().is_empty());
+            run(view.read_pages(20, &mut out[..3])).unwrap();
+            assert_eq!(*device.reads.borrow(), [(20, 3)]);
+            for failure in 0..3 {
+                device.reads.borrow_mut().clear();
+                device.fail_at.set(Some(failure));
+                assert!(run(view.read_pages(10, &mut out)).is_err());
+                assert_eq!(device.reads.borrow().len(), failure + 1);
+            }
+            device.fail_at.set(None);
+            device.reads.borrow_mut().clear();
+            assert!(run(view.read_pages(u64::MAX, &mut out[..2])).is_err());
+            assert_eq!(*device.reads.borrow(), [(u64::MAX, 1)]);
+            device.reads.borrow_mut().clear();
+        }
+        let device = Device { reads: RefCell::new(Vec::new()), fail_at: Cell::new(None) };
+        let snapshot = SpanSnapshotDevice {
+            inner: &device,
+            spans: vec![(12, vec![[0xa0; PAGE_SIZE], [0xa1; PAGE_SIZE]]),
+                (13, vec![[0xbb; PAGE_SIZE]]), (17, vec![[0xa2; PAGE_SIZE]])],
+        };
+        check(&snapshot, &device);
+        let mut sink = PageSink::new();
+        for (page, value) in [(13, 0xbb), (12, 0xa0), (13, 0xa1), (17, 0xa2)] {
+            sink.push::<()>(page, &[value; PAGE_SIZE]).unwrap();
+        }
+        check(&SinkOverlayDevice::new(&device, Some(&sink)), &device);
+        let mut out = vec![[0; PAGE_SIZE]; 32];
+        run(SinkOverlayDevice::new(&device, None).read_pages(20, &mut out)).unwrap();
+        assert_eq!(*device.reads.borrow(), [(20, 32)]);
+    }
 
     #[test]
     fn sink_drain_bounds_buffers_preserves_latest_pages_and_stops_on_failure() {

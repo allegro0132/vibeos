@@ -1312,13 +1312,24 @@ impl MountedState {
     }
 
     pub(crate) fn find_free_run(&self, required: u64, may_use_reserve: bool) -> Option<u64> {
+        self.find_free_run_with_headroom(required, 0, may_use_reserve)
+    }
+
+    /// Reserve extra free capacity without requiring adjacency to the run.
+    pub(crate) fn find_free_run_with_headroom(
+        &self,
+        required: u64,
+        extra: u64,
+        may_use_reserve: bool,
+    ) -> Option<u64> {
         if required == 0 {
             return None;
         }
+        let reserved = required.checked_add(extra)?;
         let free = self.allocation.counts().ok()?.free;
         let ordinary_floor = u64::from(self.cleaner_reserve_segments)
             .checked_add(u64::from(ROOT_POLICY_HEADROOM_SEGMENTS))?;
-        if free < required || (!may_use_reserve && free.checked_sub(required)? < ordinary_floor) {
+        if free < reserved || (!may_use_reserve && free.checked_sub(reserved)? < ordinary_floor) {
             return None;
         }
         if self.allocation_version == 1 {

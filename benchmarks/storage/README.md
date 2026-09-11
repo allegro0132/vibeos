@@ -1226,3 +1226,348 @@ of the helper, not cancellation or a physical device's DMA behavior.
 The new test and the SDHCI 4/16/128 KiB multiblock command-size contract test
 pass. No production behavior changed in this validation step. Evidence:
 `target/storage-payload-read-errors-20260911/`.
+
+### Preserve read runs through device views (2026-09-11)
+
+`SpanSnapshotDevice` and `SinkOverlayDevice` now forward consecutive uncached
+pages as a single `read_pages` call. Previously the trait default split each
+request back into single-page reads. Buffered pages are copied directly;
+overlapping snapshot spans retain first-span priority and repeated sink writes
+retain last-write priority. No buffer, cache budget or durable format changes.
+The inner device still enforces its transfer limit. Partial-transfer errors stop
+the request sequence immediately.
+
+The new regression covers mixed cached/missing spans, overlapping snapshots,
+repeated sink writes, fully cached and fully missing requests, empty and
+overflowing ranges, and errors at each missing run. It passes along with 190
+unit tests, five fused recovery tests, Duo file-tree compilation and the
+three-boot QEMU file-tree gate with offline verification.
+
+The host steady-state replacement attribution test exposed an existing limit:
+both the optimized path and a per-page forwarding control fail on append index
+39 (the 40th append) with `Gc(MemoryLimit)`. At that comparison point this test
+was **not passing**; budgets and workload length were left unchanged.
+For the identical 39 successful appends before that failure, read requests are
+470 before and 455 after; both read 3,195 pages, write 2,702 pages in 385 requests,
+and flush 173 times. GC-classified rounds have identical I/O in both versions,
+so this is a modest forwarding benefit, not a demonstrated GC speedup. No
+latency or physical-SD performance claim is made.
+
+Evidence, including both failure logs: `target/storage-device-view-runs-20260911/`.
+The GC phase-budget correction below subsequently resolves this failure.
+
+### Account for the mounted-state release before GC relocation (2026-09-11)
+
+The 40th-append failure came from the relocation workspace preflight: it
+combined 1,224,140 retained bytes and 901,482 transient bytes against the default
+2,097,152-byte recovery ceiling, exceeding it by 28,470 bytes. This included
+the original `self.mounted` copy even though the protocol drops that copy before
+relocation allocates its workspace. The local planning state remains live.
+
+GC now preflights the relocation and post-relocation phases using the retained
+bytes after that already-scheduled release. The preflight does not modify the
+current ledger or drop the mounted state: ordinary planning allocations remain
+fully charged, and a rejected preflight leaves the current mounted state intact.
+The actual drop and ledger release still occur immediately before relocation.
+Both operation workspace bounds, overflow checks and the configured limit are
+retained. This corrects a conservative lifetime estimate; it does not claim a
+measured reduction in allocator RSS.
+
+`steady_state_replace_attribution` now completes all 40 original appends with
+the unchanged 2 MiB ceiling, including GC on append index 39. No workload was
+shortened. A ledger regression checks projected peak accounting, unchanged
+current charges, rejection of impossible releases/overflow, and the requirement
+to perform a real release before reusing memory in the current phase.
+
+All 191 unit tests, five fused recovery tests and four performance attribution
+tests pass. Duo file-tree compilation and the three-boot QEMU file-tree gate
+also pass, including GC, cold recovery and powered-off verification. Evidence:
+`target/storage-gc-phase-budget-20260911/`. This qualifies the original failing
+workload, not indefinite append growth or physical-SD performance.
+
+### Bound GC planning tables to the frozen catalog (2026-09-11)
+
+Extending the steady-state fixture to 128 appends exposed another budget stop
+at index 49, after the earlier index-39 correction. GC reserved mark tables for
+the configured maximum 4,096 objects and blobs even when the frozen catalog
+contained far fewer entries. Mark object/blob capacities now use the actual
+catalog lengths, bounded by the configured ceiling and a one-entry empty-case
+minimum. Valid traversal cannot discover more distinct catalog identities;
+missing/stale references still fail closed. The preflight uses these same
+capacities. Root and per-object child limits are unchanged.
+
+Separately, computing authority snapshot size for GC no longer clones and
+encodes the complete snapshot. A checked, allocation-free frozen-format size
+helper is shared with validation/encoding; generation changes do not change
+table widths. Ordinary, external-root and relocated snapshots are tested
+against their actual encoded lengths. Actual publication still performs the
+normal encoding and authentication.
+
+The default steady-state regression is extended from 40 to 50 appends, keeping
+the 2 MiB budget and normal-append I/O/flush guards. It passes. Longer probes can
+set `VIBEOS_STEADY_APPEND_COUNT=128`; the 128-append probe now completes 59
+appends and fails at index 59 with `Gc(MemoryLimit)`. That probe remains failing,
+not an indefinite-growth qualification. Its original and updated failure logs
+are retained in `target/storage-gc-catalog-sized-20260911/`.
+
+All 191 unit tests, five fused recovery tests and four performance attribution
+tests pass, with an additional explicit 50-append run. These changes reduce
+planning allocations; no new timing or physical-SD speedup is claimed.
+
+The three-boot QEMU file-tree gate and Duo file-tree compilation also pass;
+boot logs and offline verifier reports are in the same evidence directory.
+
+### Release GC root snapshots and avoid verifier state clones (2026-09-11)
+
+The 128-append probe still reached `Gc(MemoryLimit)` at index 59 after the
+catalog-sized mark change. Relocated blob verification cloned the entire
+mounted state just to change its generation bounds. It now passes a Copy-only
+`ManifestReadContext` containing store identity, admitted segment count and
+generation bounds through the existing verifier. Descriptor checks, header
+validation, payload reads and Merkle verification remain unchanged; the context
+cannot create an authorized handle. The memory bound continues to charge the
+separate relocated authority value, which remains live during root encoding
+and readback.
+
+The captured root list also remained allocated after marking, though relocation
+only needed its count. GC now saves that count, releases the allocation charge
+and drops the list before loading manifests. This list owns copied identifiers,
+not pins; the mark retains the resolved identities and the pin registry remains
+responsible for their lifetime. No configured memory ceiling is increased.
+
+The default attribution regression is extended to 64 appends and passes with
+the same 2 MiB recovery ceiling and I/O guards. All 191 unit tests, five fused
+recovery tests and four attribution tests pass. The final 128-append probe
+completes 69 appends, then fails at index 69 with `Gc(MemoryLimit)`; it is not a
+passing long-growth result. No new latency or physical-SD speedup is inferred.
+
+Duo compilation and the three-boot QEMU file-tree gate pass, including GC,
+cold recovery and offline verification. Evidence and the remaining failure:
+`target/storage-gc-workspace-lifetimes-20260911/`.
+
+### Distinguish legacy inline and external-content steady-state growth (2026-09-11)
+
+The original steady-state fixture uses `encode_object_transaction`, adding the
+complete 4 KiB payload to the logical authority history at every append. Its
+128-append budget failure therefore measures growing legacy inline history.
+The new `steady_state_external_attribution` fixture uses the existing external
+object record plus an authenticated attached CAS payload. It defaults to 128
+appends; the inline fixture remains at 64, and either accepts the explicit
+`VIBEOS_STEADY_APPEND_COUNT` override. No production encoding threshold changed.
+This tests the storage primitive with raw 4 KiB payloads, not the object-store
+facade's envelope or its threshold selection.
+
+The external fixture verifies every appended payload through its transient
+witness. Both fixtures cold-mount after completion and check that ungranted
+objects do not become persistent authority. Cold recovery intentionally does
+not grant/read the transient payloads. All five attribution tests pass,
+including the default 128 external appends under the same 2 MiB budget.
+
+Separate runs at 64 appends, same repeated 4 KiB content and store geometry:
+
+| Metric | Legacy inline | External content |
+| --- | ---: | ---: |
+| Final logical authority stream | 492,032 B | 66,048 B |
+| Written pages | 6,310 | 2,332 |
+| Write requests | 711 | 573 |
+| Flushes | 295 | 295 |
+
+The external run writes about 63% fewer pages in this host fixture. These are
+existing encoding choices, not a new production speedup. Append counters include
+the harness's common initial format/import costs; external readback verification
+is counted separately and excluded from the table. No timing or SD latency
+comparison is inferred. The legacy 128-append failure at index 69 is unchanged
+and remains recorded; passing the external workload does not resolve it.
+
+Evidence: `target/storage-steady-encodings-20260911/`. This validation step changes
+only the attribution harness and documentation.
+
+### QEMU sustained object publication exposes a capacity failure (2026-09-11)
+
+Run the current `storage-bench-128m` ELF with one 128 MiB QEMU guest, a fresh
+blank image, 4 KiB `object-durable-put-get`, seeds 32 onward, and 128 requested
+samples. Throttles are 4 MiB/s read, 2 MiB/s write and 400/200 read/write IOPS.
+The kernel uses its existing 64 MiB recovery budget; this is not the host
+fixture's 2 MiB ceiling. Each operation publishes a distinct Merkle-encoded
+object, retains its live capability and verifies immediate readback. The
+encoded envelope exceeds the facade's 4 KiB inline cutoff. No cold recovery
+or physical SD timing is qualified by this probe.
+
+Both runs complete 107 verified operations and fail at zero-based index 107
+(the 108th publication, seed 139). The diagnostic replay reports:
+
+```
+bench-detail authority append error: Cas(Store(Capacity(CleanerReserve)))
+```
+
+The facade exposes this as `Store(Corrupt)`. That mapping is not evidence of
+media corruption. This remains an unresolved capacity failure, not a passing
+128-operation run. The initial runner was interrupted after recording the
+failure because it continued waiting on the invalidated service; the replay
+stops automatically and returns exit status 1.
+
+Three-flush operations write 135,168–249,856 bytes for 4,096 content bytes
+(33–61x device write amplification). Growth operations occur every 11 samples
+through index 99, with increasing read traffic. At index 102 the serial log
+confirms foreground GC: 608 reads, 102 live objects/blobs and eight reclaimed
+segments. The whole publication at that index performs 39 flushes, reads
+6,242,304 bytes and writes 6,303,744 bytes; put latency is 5.410 s in the first
+run and 4.650 s in the replay. Immediate get phases issue zero device reads,
+so these results do not measure cold-get performance.
+
+Code inspection identifies two capacity assumptions for follow-up: foreground
+admission checks the free-segment count, while blob staging requires a
+contiguous free run; the authority append only retains a retry import when
+free segments are at most cleaner reserve plus six. The logs do not yet prove
+which condition causes the failure. Do not treat raising the memory budget
+or relaxing the cleaner reserve as a demonstrated fix. The sample's authority
+shape fields describe a cached view and must not be used as current allocator
+occupancy; use maintenance diagnostics for that purpose.
+
+The runner now accepts optional `--serial-log PATH` and `--stop-on-failure`.
+The former preserves raw bytes as they are consumed, including diagnostics
+before an incomplete record; the latter saves the first non-ok record, halts
+and cleans up the guest, skips remaining VMs and returns 1. Default behavior
+is unchanged. Eleven runner tests pass, including fragmented-marker and EOF
+transcript retention; the failed replay exercises the actual QEMU stop path.
+
+Evidence: `target/storage-qemu-object-steady-20260911/` contains the exact ELF,
+both JSONL runs, replay serial log, summary and runner test output. This step
+changes benchmark tooling and documentation, not production storage behavior.
+
+### Reuse isolated free segments for object publication (2026-09-11)
+
+The diagnostic replay confirms that the 108th 4 KiB publication failed with
+22 free segments, two cleaner-reserved segments and 107 live CAS objects.
+The data writer requested a contiguous data-plus-metadata run, even though
+allocation-map v2 can represent a separately placed metadata carrier. A trial
+which merely retained the bounded GC retry under fragmentation completed one
+more append, then failed with 32 free segments. That retry trial is removed.
+
+V2 now requires adjacency only for the scratch data segments. Admission still
+reserves one additional free segment for metadata above the unchanged cleaner
+and root-policy floor. The metadata carrier is selected from free segments
+excluding scratch. One helper supplies that exact carrier both to the
+pre-write seal-clear protocol and the final publication; allocation transitions
+are sorted before validation. Legacy prefix allocation retains its adjacency
+rule. No disk format, quota, durability barrier or recovery memory limit changes.
+
+An initial placement-only trial failed the existing GC/cold-mount regression:
+preparation still cleared `last_data_segment + 1`, which could be occupied.
+That trial was rejected and its ELF/patch retained for diagnosis. The final
+implementation uses the shared selector before clearing, so it does not clear
+an occupied neighbor. The existing GC/ID-high-water regression now explicitly
+requires reuse of an isolated free hole and checks the pinned stream after
+three destructive GC rounds and cold mount.
+
+With the same fresh-image, seed, RAM and throttling configuration as the prior
+probe, the final QEMU run completes all 128 writes and immediate full readbacks.
+This qualifies that sequence, not indefinite growth or physical SD performance.
+The first 107 successful operations read the same 104,054,784 device bytes in
+9,238 requests as the diagnostic baseline. They write 26,972,160 bytes versus
+26,963,968, and perform 402 flushes versus 398: this is a fragmentation/capacity
+fix, not a measured reduction in write amplification. The current contiguous
+pre-clear hint can miss isolated holes, which safely fall back to the normal
+clear/flush/readback protocol; adapting that hint is further performance work.
+
+Validation: 191 unit tests, five fused append/power-cut recovery tests and five
+attribution tests pass. The production three-boot QEMU file-tree gate passes
+with GC, cold recovery and powered-off verification. Duo `file-tree` compilation
+passes; no physical device was accessed. The benchmark-only append error line
+now includes actual `StoreInfo`, avoiding reliance on cached authority-shape
+counters when diagnosing capacity.
+
+Evidence: `target/storage-qemu-fragmentation-20260911/` includes diagnostic,
+rejected placement, retry-only and final ELFs; serial logs/JSONL for diagnostic,
+retry and final runs; their hashes, comparison summary, test and boot logs.
+
+### Pre-clear isolated free holes without an extra barrier (2026-09-11)
+
+The independent metadata allocator can reuse isolated free segments, but its
+pre-clear hint still selected only a contiguous run. Those holes consequently
+fell back to zero-write/flush/readback before each new scratch write. The hint
+now selects the first at most four segments free in both the durable base and
+the successor allocation maps, including isolated holes. The four-segment
+work bound is unchanged; newly allocated and newly freed segments remain
+excluded. The writer still reads back the zero seal before using a carried
+proof. Legacy allocation skips this v2 pre-clear path as before.
+
+The new regression covers fragmented holes, the four-segment bound, an empty
+hint, a single candidate, contiguous space, and exclusion of segments live in
+either checkpoint. All 192 unit tests, five fused/power-cut recovery tests and
+five steady-state attribution tests pass.
+
+A matched fresh-image QEMU run repeats 128 unique 4 KiB publications with all
+live capabilities retained and immediate full readback. Both before and after
+use 128 MiB RAM, 4/2 MiB/s read/write limits and 400/200 IOPS; all 128 operations
+pass. The before run is the independently placed metadata version documented
+above, not the earlier failing allocator.
+
+| Whole-run metric | Before | After |
+| --- | ---: | ---: |
+| Flush requests | 555 | 533 |
+| Write requests | 1,569 | 1,569 |
+| Written bytes | 46,424,064 | 46,424,064 |
+| Read requests | 9,524 | 9,522 |
+| Read bytes | 105,742,336 | 105,734,144 |
+
+This removes 22 flushes (about 4% of the complete run), without changing written
+bytes. The final ordinary append uses three flushes instead of four. These
+single-run device counters do not establish a physical SD latency speedup or
+a reduction in payload/metadata write amplification. Growth and GC traffic
+remain included in the whole-run totals.
+
+Evidence: `target/storage-preclear-holes-20260911/` contains the candidate ELF,
+its hash and baseline reference, JSONL/serial logs, summary and test results.
+
+The production three-boot QEMU gate also passes, including GC, cold recovery
+and powered-off verification, and the Duo `file-tree` build check passes.
+Boot logs and the compile result are retained alongside the benchmark evidence.
+No physical device was accessed.
+
+### Amortize growth remounts on larger provisioned stores (2026-09-11)
+
+The sustained object probe spends substantial I/O in `grow`: growth retains
+its strict remount, which re-reads existing state before admitting the new
+suffix. The foreground policy previously requested only the device-scaled
+22-segment maximum hysteresis regardless of how much data had accumulated.
+
+Capacity policy now lives in the independently testable
+`kernel/src/storage_capacity_policy.rs`. Admission hysteresis is the maximum
+of the existing scaled hysteresis and the admitted-segment count capped at
+one quarter of the provisioned device and 64 segments. The adjacent capability
+still bounds the actual suffix, and all growth validation, memory limits,
+checkpoint publication and strict remount behavior remain unchanged. Enlarging
+admission extends the free bitmap; it does not write every new payload page.
+The GC free target and its bounded round policy keep the old hysteresis.
+Devices with at most 88 segments retain their prior admission policy, including
+the default 16-segment/64 MiB Duo slice. This optimization primarily benefits
+larger provisioned regions; it is not a demonstrated gain on that small slice.
+
+Policy tests exhaust the small-device cases and cover growing admission,
+unchanged collection targets, monotonic bounds, and `u64::MAX` inputs. A fresh
+128 MiB QEMU guest repeats the same 128 unique 4 KiB puts with live capabilities
+retained and immediate full readback, limited to 4/2 MiB/s and 400/200 IOPS.
+Both versions complete all 128 operations successfully.
+
+| Whole-run metric | Previous pre-clear version | Adaptive admission |
+| --- | ---: | ---: |
+| Growth operations | 10 | 5 |
+| GC rounds | 12 | 8 |
+| Read requests | 9,522 | 3,626 |
+| Read bytes | 105,734,144 | 39,096,320 |
+| Write requests | 1,569 | 1,400 |
+| Write bytes | 46,424,064 | 38,957,056 |
+| Flush requests | 533 | 477 |
+
+Device reads fall about 63%, writes about 16%, and flushes about 11% in this
+matched sequence. Earlier admission changes the later allocation/GC schedule,
+so the totals include that effect; they are not per-growth latency figures.
+This is one run per version and does not establish a physical SD speedup.
+
+Evidence: `target/storage-growth-amortization-20260911/`, including the candidate
+ELF/hash, baseline reference, JSONL and raw serial log, policy tests and summary.
+
+The production three-boot QEMU file-tree gate passes, including GC, cold
+recovery and powered-off verification. Duo `file-tree` compilation passes.
+These logs and the exact policy source are saved with the benchmark evidence.

@@ -41,12 +41,13 @@ use crate::allocation_v2::{
 };
 use crate::authority::AuthorizedObject;
 use crate::authority_snapshot::{
-    encode_persistent_authority_snapshot, AuthoritySnapshotError, PersistentAuthoritySnapshot,
+    encode_persistent_authority_snapshot, persistent_authority_encoded_len, AuthoritySnapshotError,
+    PersistentAuthoritySnapshot,
 };
 use crate::cas::{
     build_record, flush, read_manifest_range, sink_or_write_page, verify_manifest_blob,
     write_page, write_payload_records_with_header, CasObjectHandle, CasStoreError, FinalRecord,
-    PageSink,
+    ManifestReadContext, PageSink,
 };
 use crate::cas_codec::{
     decode_blob_manifest, encode_blob_manifest, encode_cas_snapshot, BlobKey, BlobManifest,
@@ -543,9 +544,16 @@ impl GcMemoryAccount {
     }
 
     fn transient(&mut self, bytes: usize) -> Result<(), GcError> {
+        self.transient_after_release(0, bytes)
+    }
+
+    /// Preflight a later phase without changing the current allocation ledger.
+    /// The caller must drop `released` bytes before allocating its workspace.
+    fn transient_after_release(&mut self, released: usize, bytes: usize) -> Result<(), GcError> {
         let high = self
             .current
-            .checked_add(bytes)
+            .checked_sub(released)
+            .and_then(|current| current.checked_add(bytes))
             .ok_or(GcError::ArithmeticOverflow)?;
         self.peak = self.peak.max(high);
         if high > self.limit {
@@ -1684,6 +1692,11 @@ fn relocation_workspace_upper_bound(
         .and_then(|bytes| bytes.checked_add(PAGE_SIZE))
         .ok_or(GcError::ArithmeticOverflow)?;
     let verification = root_readback.max(manifest_readback);
+    // The relocated authority value still owns its tables/stream alongside
+    // the encoded root and its readback, even without a staged-state clone.
+    let relocated_authority_bytes = state.persistent_authority.as_ref()
+        .map(|authority| authority.allocated_bytes().ok_or(GcError::ArithmeticOverflow))
+        .transpose()?.unwrap_or(0);
     [
         root_len,
         allocation_len,
@@ -1694,7 +1707,8 @@ fn relocation_workspace_upper_bound(
         maximum_manifest_len,
         snapshot_tables,
         snapshot_len,
-        mounted_state_heap_bytes(state)?,
+        relocated_authority_bytes,
+        core::mem::size_of::<ManifestReadContext>(),
         verification,
     ]
     .into_iter()
@@ -2976,9 +2990,9 @@ async fn relocate_live_state<D: PageDevice>(
         memo,
     )
     .await?;
-    let mut staged_state = state.clone();
-    staged_state.generation = plan.relocation_generation;
-    staged_state.next_segment_generation = target_next_generation;
+    let staged_state = ManifestReadContext::for_generation(
+        state, plan.relocation_generation, target_next_generation,
+    );
     for mapping in &snapshot.blobs {
         let manifest_payload = read_pointer_payload(
             device,
@@ -3019,7 +3033,7 @@ async fn relocate_live_state<D: PageDevice>(
         // them, and re-verifying the complete live set every round makes one
         // collection cost reads proportional to the store's total content.
         if relocated {
-            verify_manifest_blob(device, &staged_state, &manifest, memo)
+            verify_manifest_blob(device, staged_state, &manifest, memo)
                 .await
                 .map_err(|error| match error {
                     CasStoreError::Store(error) => GcStoreError::Store(error),
@@ -3745,14 +3759,21 @@ impl<D: PageDevice> SegmentStore<D> {
         .await?;
         memory.transient(typed.peak_bytes)?;
         memory.retain(typed.allocated_bytes)?;
+        // Marking cannot discover more distinct valid identities than this
+        // frozen catalog contains. Do not retain maximum-size tables for a
+        // small catalog; keep the configured ceiling and nonzero empty case.
+        let object_capacity = cas.objects.len().max(1).min(self.limits.max_catalog_entries as usize);
+        let blob_capacity = cas.blobs.len().max(1).min(self.limits.max_catalog_entries as usize);
         let budget = MarkBudget::new(
-            self.limits.max_catalog_entries as usize,
-            self.limits.max_catalog_entries as usize,
+            object_capacity,
+            blob_capacity,
             GC_CHILD_BUDGET,
             maximum_roots,
         );
-        let planned_mark_bytes = (self.limits.max_catalog_entries as usize)
-            .checked_mul(core::mem::size_of::<RootKey>() * 2 + core::mem::size_of::<BlobKey>())
+        let planned_mark_bytes = object_capacity
+            .checked_mul(core::mem::size_of::<RootKey>() * 2)
+            .and_then(|bytes| blob_capacity.checked_mul(core::mem::size_of::<BlobKey>())
+                .and_then(|more| bytes.checked_add(more)))
             .and_then(|bytes| {
                 GC_CHILD_BUDGET
                     .checked_mul(core::mem::size_of::<ChildReference>())
@@ -3799,6 +3820,11 @@ impl<D: PageDevice> SegmentStore<D> {
         drop(planner);
         memory.release(typed.allocated_bytes)?;
         drop(typed);
+        // The mark owns the resolved live identities. This copied root list
+        // owns no pins and is now used only for its telemetry count.
+        let root_count = roots.len();
+        memory.release(roots_bytes)?;
+        drop(roots);
         let manifests =
             load_live_manifests(
                 &self.device,
@@ -3847,14 +3873,7 @@ impl<D: PageDevice> SegmentStore<D> {
             vector_bytes(manifest_lens.capacity(), core::mem::size_of::<usize>())?;
         memory.retain(manifest_lens_bytes)?;
         let root_len = match state.persistent_authority.as_ref() {
-            Some(authority) => {
-                let relocated = authority
-                    .relocated(relocation_generation)
-                    .map_err(GcError::from)?;
-                encode_persistent_authority_snapshot(&relocated)
-                    .map_err(GcError::from)?
-                    .len()
-            }
+            Some(authority) => persistent_authority_encoded_len(authority).map_err(GcError::from)?,
             None => persistent_root_encoded_len(&relocated_roots)?,
         };
         // Exact snapshot length from table counts.
@@ -3999,7 +4018,10 @@ impl<D: PageDevice> SegmentStore<D> {
                 })
                 .ok_or(GcError::ArithmeticOverflow)?,
         )?;
-        memory.transient(relocation_workspace_upper_bound(
+        // The original mounted copy is dropped immediately below, before
+        // either workspace exists. Keep it charged during planning, but do
+        // not include it in these subsequent-phase peaks a second time.
+        memory.transient_after_release(state_bytes, relocation_workspace_upper_bound(
             &state,
             &mark,
             &manifests,
@@ -4009,7 +4031,7 @@ impl<D: PageDevice> SegmentStore<D> {
             root_len,
             provisional_allocation_len,
         )?)?;
-        memory.transient(post_relocation_workspace_upper_bound(
+        memory.transient_after_release(state_bytes, post_relocation_workspace_upper_bound(
             &state,
             &relocated_roots,
             &manifests,
@@ -4027,7 +4049,7 @@ impl<D: PageDevice> SegmentStore<D> {
             &state,
             self.limits,
             &mark,
-            roots.len(),
+            root_count,
             &relocated_roots,
             state.persistent_authority.as_ref(),
             &manifests,
@@ -4167,6 +4189,23 @@ impl<D: PageDevice> SegmentStore<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_preflight_preserves_current_charges_and_requires_real_release() {
+        let mut memory = GcMemoryAccount::new(100);
+        memory.retain(80).unwrap();
+        memory.transient_after_release(30, 40).unwrap();
+        assert_eq!(memory.current, 80);
+        assert_eq!(memory.peak, 90);
+        // Projection must not silently make room in the active phase.
+        assert_eq!(memory.transient(40), Err(GcError::MemoryLimit));
+        assert_eq!(memory.transient_after_release(81, 0), Err(GcError::ArithmeticOverflow));
+        assert_eq!(memory.transient_after_release(0, usize::MAX), Err(GcError::ArithmeticOverflow));
+        assert_eq!(memory.transient_after_release(30, 51), Err(GcError::MemoryLimit));
+        memory.release(30).unwrap();
+        memory.transient(40).unwrap();
+        assert_eq!(memory.current, 50);
+    }
     use crate::allocation_v2::SegmentAllocation;
     use crate::pins::{PinAdmission, RuntimeRootClass};
     use core::cell::Cell;

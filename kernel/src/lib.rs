@@ -1118,6 +1118,7 @@ mod net_device;
 #[cfg(feature = "milkv-duo")]
 mod sdhci_blk;
 mod segment_store_platform;
+mod storage_capacity_policy;
 mod store_platform;
 mod trampoline;
 mod trap;

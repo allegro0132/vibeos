@@ -3493,13 +3493,28 @@ mod tests {
         // Staging now packs small blobs into shared segments, so a freshly
         // staged store is already compact; feed every destructive round
         // enough dropped (dead) objects that a yielding compaction exists.
+        let mut used_isolated_hole = false;
         for round in 0..3_u8 {
             for extra in 0..3_u8 {
                 let payload = alloc::vec![0x40 + round * 3 + extra; 8192];
+                let state = store.mounted.as_ref().unwrap();
+                let first = state.find_free_run(1, false).unwrap();
+                let isolated = state.allocation.segment_state(first + 1)
+                    != Some(crate::allocation_v2::SegmentAllocation::Free);
                 drop(block_on(store.commit_fs_data_chunk(None, &payload)).unwrap());
+                if isolated {
+                    // Reuse a single free hole without clearing its occupied
+                    // neighbor as though metadata were necessarily adjacent.
+                    assert_eq!(
+                        store.mounted.as_ref().unwrap().allocation.segment_state(first),
+                        Some(crate::allocation_v2::SegmentAllocation::Allocated)
+                    );
+                    used_isolated_hole = true;
+                }
             }
             block_on(store.collect_garbage()).unwrap();
         }
+        assert!(used_isolated_hole, "fixture must exercise fragmented placement");
         drop(store);
         let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
         block_on(cold.mount()).unwrap();

@@ -758,6 +758,41 @@ pub fn root_policy_commitment(canonical_policy: &[u8]) -> [u8; 32] {
     Sha256::digest(canonical_policy).into()
 }
 
+/// Exact frozen-format size; unlike encoding, this performs no allocation.
+/// Checkpoint generation changes values, never the encoded table widths.
+pub(crate) fn persistent_authority_encoded_len(
+    value: &PersistentAuthoritySnapshot,
+) -> Result<usize, AuthoritySnapshotError> {
+    let encoded_len = PERSISTENT_AUTHORITY_HEADER_LEN
+        .checked_add(
+            value
+                .objects
+                .len()
+                .checked_mul(PERSISTENT_AUTHORITY_OBJECT_BINDING_LEN)
+                .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?,
+        )
+        .and_then(|bytes| {
+            value
+                .principals
+                .len()
+                .checked_mul(PERSISTENT_AUTHORITY_PRINCIPAL_LEN)
+                .and_then(|more| bytes.checked_add(more))
+        })
+        .and_then(|bytes| bytes.checked_add(value.record_stream.len()))
+        .and_then(|bytes| {
+            value
+                .external_roots
+                .len()
+                .checked_mul(PERSISTENT_ROOT_ENTRY_LEN)
+                .and_then(|more| bytes.checked_add(more))
+        })
+        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    if encoded_len > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN {
+        return Err(AuthoritySnapshotError::OutOfBounds);
+    }
+    Ok(encoded_len)
+}
+
 pub fn encode_persistent_authority_snapshot(
     value: &PersistentAuthoritySnapshot,
 ) -> Result<Vec<u8>, AuthoritySnapshotError> {
@@ -793,12 +828,7 @@ pub fn encode_persistent_authority_snapshot(
                 .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?,
         )
         .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
-    let encoded_len = record_offset
-        .checked_add(value.record_stream.len())
-        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
-    if encoded_len > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN {
-        return Err(AuthoritySnapshotError::OutOfBounds);
-    }
+    let encoded_len = persistent_authority_encoded_len(value)?;
     let mut output = vec![0; encoded_len];
     output[..8].copy_from_slice(MAGIC);
     put_u16(&mut output, 0x08, PERSISTENT_AUTHORITY_SNAPSHOT_VERSION);
@@ -1062,33 +1092,7 @@ fn validate(
         }
         previous_external = Some(root.object_id);
     }
-    let encoded_len = PERSISTENT_AUTHORITY_HEADER_LEN
-        .checked_add(
-            value
-                .objects
-                .len()
-                .checked_mul(PERSISTENT_AUTHORITY_OBJECT_BINDING_LEN)
-                .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?,
-        )
-        .and_then(|bytes| {
-            value
-                .principals
-                .len()
-                .checked_mul(PERSISTENT_AUTHORITY_PRINCIPAL_LEN)
-                .and_then(|more| bytes.checked_add(more))
-        })
-        .and_then(|bytes| bytes.checked_add(value.record_stream.len()))
-        .and_then(|bytes| {
-            value
-                .external_roots
-                .len()
-                .checked_mul(PERSISTENT_ROOT_ENTRY_LEN)
-                .and_then(|more| bytes.checked_add(more))
-        })
-        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
-    if encoded_len > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN {
-        return Err(AuthoritySnapshotError::OutOfBounds);
-    }
+    persistent_authority_encoded_len(value)?;
     Ok(())
 }
 
@@ -1294,6 +1298,10 @@ mod tests {
     fn canonical_round_trip_and_reserved_corruption_fail_closed() {
         let sample = sample();
         let bytes = encode_persistent_authority_snapshot(&sample).unwrap();
+        assert_eq!(persistent_authority_encoded_len(&sample).unwrap(), bytes.len());
+        let relocated = sample.relocated(sample.checkpoint_generation + 1).unwrap();
+        assert_eq!(persistent_authority_encoded_len(&relocated).unwrap(), bytes.len());
+        assert_eq!(encode_persistent_authority_snapshot(&relocated).unwrap().len(), bytes.len());
         assert_eq!(&bytes[..8], b"VIBEAUT2");
         assert_eq!(
             decode_persistent_authority_snapshot(&bytes).unwrap(),
@@ -1319,6 +1327,7 @@ mod tests {
             }])
             .unwrap();
         let bytes = encode_persistent_authority_snapshot(&sample).unwrap();
+        assert_eq!(persistent_authority_encoded_len(&sample).unwrap(), bytes.len());
         let decoded = decode_persistent_authority_snapshot(&bytes).unwrap();
         assert_eq!(decoded, sample);
         assert_eq!(decoded.objects.len(), 1);

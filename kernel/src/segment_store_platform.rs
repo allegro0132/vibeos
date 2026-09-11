@@ -57,25 +57,10 @@ const MAX_PAGES_PER_REQUEST: usize =
 const MAX_PAGES_PER_REQUEST: usize = crate::sdhci_blk::MAX_TRANSFER_BLOCKS as usize
     * LOGICAL_BLOCK_SIZE
     / vibeos_segment_format::PAGE_SIZE;
-const STORAGE_V2_FOREGROUND_FREE_SEGMENTS: u64 = 10;
-/// Extra segments requested beyond the floor whenever foreground growth
-/// runs, so one growth transaction serves many subsequent commits.
-const STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS: u64 = 22;
-
-/// Scale the fixed foreground floor and hysteresis to the device: they were
-/// tuned on large bench devices, and on a small store (the Milk-V 64 MiB
-/// slice is sixteen 4 MiB segments) a 10-segment floor is structurally
-/// unreachable once a handful of segments hold live data — growth exhausts
-/// immediately and every subsequent commit pays up to eight full GC mark
-/// walks of the live object graph. An eighth of the device (clamped to the
-/// tuned values) keeps foreground collection an emergency, not a tax.
-fn scaled_free_floor(total_segments: u64) -> u64 {
-    (total_segments / 8).clamp(2, STORAGE_V2_FOREGROUND_FREE_SEGMENTS)
-}
-
-fn scaled_growth_hysteresis(total_segments: u64) -> u64 {
-    (total_segments / 4).clamp(2, STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS)
-}
+use crate::storage_capacity_policy::{
+    scaled_admission_hysteresis, scaled_free_floor, scaled_growth_hysteresis,
+    STORAGE_V2_FOREGROUND_FREE_SEGMENTS,
+};
 pub(crate) const STORAGE_V2_GROWTH_GRANULE_BLOCKS: u64 =
     vibeos_segment_format::SEGMENT_PAGES * BLOCKS_PER_PAGE;
 const M4_STORE_ID_RAW: u128 = 0x5649_4245_4f53_2d53_544f_5245_2d4d_3401;
@@ -1719,7 +1704,7 @@ impl StorageV2Runtime {
                     PersistentAuthorityError::GenerationMismatch => V2RuntimeError::JournalChanged,
                     _error => {
                         #[cfg(feature = "storage-bench")]
-                        crate::println!("  bench-detail authority append error: {_error:?}");
+                        crate::println!("  bench-detail authority append error: {_error:?}; store={:?}", store.info());
                         V2RuntimeError::Corrupt
                     }
                 })
@@ -2119,7 +2104,7 @@ impl StorageV2Runtime {
         // growth checkpoint. Overshooting amortizes one growth transaction
         // across many commits.
         let growth_blocks = floor
-            .saturating_add(hysteresis)
+            .saturating_add(scaled_admission_hysteresis(total_segments, info.admitted_segments))
             .saturating_sub(info.free_segments)
             .checked_mul(STORAGE_V2_GROWTH_GRANULE_BLOCKS)
             .ok_or(V2RuntimeError::Corrupt)?;
@@ -2151,7 +2136,7 @@ impl StorageV2Runtime {
             // only rejoins the free set two checkpoint generations later, so
             // one round cannot observe its own relief — iterate bounded
             // rounds until the requested floor is met or reclaim stalls.
-            // Reclaim past the floor with the same hysteresis as growth:
+            // Reclaim past the floor with the bounded collection hysteresis:
             // every mark walk costs one pass over the live object graph, so
             // stopping at the floor makes the very next batch dip below it
             // and charges a full walk per handful of freed segments.
@@ -4350,7 +4335,14 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                         .saturating_add(8)
                 })
                 .unwrap_or(STORAGE_V2_FOREGROUND_FREE_SEGMENTS);
-            let _ = runtime.ensure_foreground_capacity_for(required_free).await;
+            // Small payloads occupy one scratch segment plus metadata; the
+            // store still enforces its real reserve/quota checks at append.
+            // Avoid imposing a large-device free target on tiny partitions.
+            if external_payload.is_none_or(|(_, payload)| payload.len() <= 128 * 1024) {
+                let _ = runtime.ensure_foreground_capacity_for_scaled(required_free).await;
+            } else {
+                let _ = runtime.ensure_foreground_capacity_for(required_free).await;
+            }
             let current = runtime
                 .authority_view()
                 .ok_or(vibeos_object_store::StoreError::Corrupt)?;

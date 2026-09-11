@@ -11,6 +11,25 @@ SPEC.loader.exec_module(MODULE)
 
 
 class StorageBenchTests(unittest.TestCase):
+    def test_serial_transcript_survives_partial_marker_and_eof(self):
+        import io
+        from unittest.mock import Mock, patch
+        for chunks, succeeds in [([b"diagnostic\r\nVI", b"BE!"], True),
+                                 ([b"diagnostic\r\n", b""], False)]:
+            transcript = io.BytesIO()
+            selector = Mock()
+            selector.select.return_value = [(object(), 1)]
+            with patch.object(MODULE.selectors, "DefaultSelector", return_value=selector), \
+                 patch.object(MODULE.os, "read", side_effect=chunks):
+                if succeeds:
+                    data = MODULE.wait_for(Mock(), Mock(), b"VIBE!", 30, transcript)
+                    self.assertEqual(data, b"diagnostic\r\nVIBE!")
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "serial closed"):
+                        MODULE.wait_for(Mock(), Mock(), b"VIBE!", 30, transcript)
+            self.assertEqual(transcript.getvalue(), b"".join(chunks))
+            selector.close.assert_called_once()
+
     def test_validator_selftest(self):
         MODULE.selftest()
 
@@ -108,6 +127,31 @@ class StorageBenchTests(unittest.TestCase):
             MODULE.summaries([record, incompatible])
         with self.assertRaisesRegex(MODULE.ValidationError, "cannot replace"):
             MODULE.require_baseline_evidence([incompatible], pathlib.Path("unused"), pathlib.Path("unused"))
+
+    def test_guest_geometry_is_validated_and_different_store_sizes_do_not_mix(self):
+        import json
+        prefix = b"VIBE_STORAGE_BENCH_GEOMETRY "
+        small = prefix + b'{"provisioned_segments":16}\r\n'
+        self.assertEqual(MODULE.guest_storage_geometry(b"boot\n" + small),
+                         {"storage_v2_provisioned_segments": 16})
+        self.assertEqual(MODULE.guest_storage_geometry(b"old kernel boot\n"), {})
+        with self.assertRaises(MODULE.ValidationError):
+            MODULE.guest_storage_geometry(small + small)
+        for invalid in (0, -1, True, "16", None):
+            with self.assertRaises(MODULE.ValidationError):
+                MODULE.guest_storage_geometry(prefix + json.dumps(
+                    {"provisioned_segments": invalid}).encode())
+        record = {"backend": "storage-v2", "layer": "object", "workload": "v2-dedup-gc",
+                  "object_bytes": 4096, "object_count": 8, "queue_depth": 1,
+                  "status": "ok", "warmup": False, "metrics": {"latency_ns": 100},
+                  "environment": {"storage_v2_provisioned_segments": 16}}
+        self.assertEqual(len(MODULE.summaries([record, record])), 1)
+        for environment in ({}, {"storage_v2_provisioned_segments": 223}):
+            with self.assertRaisesRegex(MODULE.ValidationError, "incompatible storage geometries"):
+                MODULE.summaries([record, dict(record, environment=environment)])
+        # The separate raw-block window is unaffected by the v2 partition size.
+        raw = dict(record, layer="block")
+        self.assertEqual(len(MODULE.summaries([raw, dict(raw, environment={})])), 1)
 
     def test_memory_profiles_cannot_be_mixed(self):
         record = {"backend": "storage-v2", "layer": "file-tree", "workload": "file-sequential",

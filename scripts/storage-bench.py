@@ -95,6 +95,9 @@ def validate_record(record: dict[str, Any]) -> None:
     if "memory_mib" in environment:
         require(type(environment["memory_mib"]) is int and environment["memory_mib"] > 0,
                 "invalid guest memory size")
+    if "storage_v2_provisioned_segments" in environment:
+        value = environment["storage_v2_provisioned_segments"]
+        require(type(value) is int and value > 0, "invalid storage geometry")
     if "storage_throttle" in environment:
         profile = environment["storage_throttle"]
         require(isinstance(profile, dict) and set(profile) <= set(THROTTLE_FIELDS),
@@ -373,26 +376,32 @@ def convert_linux_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
 
 
 def wait_for(stream: Any, process: subprocess.Popen[bytes], marker: bytes,
-             timeout: float) -> bytes:
+             timeout: float, transcript: Any = None) -> bytes:
     selector = selectors.DefaultSelector()
     selector.register(stream, selectors.EVENT_READ)
     collected = bytearray()
     deadline = time.monotonic() + timeout
-    while marker not in collected:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            tail = bytes(collected[-4096:]).decode("utf-8", errors="replace").replace("\r", "\n")
-            raise TimeoutError(f"timed out waiting for {marker!r}; serial tail:\n{tail}")
-        events = selector.select(min(remaining, 1.0))
-        if not events:
-            if process.poll() is not None:
-                raise RuntimeError(f"guest exited with {process.returncode}")
-            continue
-        chunk = os.read(stream.fileno(), 65536)
-        if not chunk:
-            raise RuntimeError("guest serial closed")
-        collected.extend(chunk)
-    return bytes(collected)
+    try:
+        while marker not in collected:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                tail = bytes(collected[-4096:]).decode("utf-8", errors="replace").replace("\r", "\n")
+                raise TimeoutError(f"timed out waiting for {marker!r}; serial tail:\n{tail}")
+            events = selector.select(min(remaining, 1.0))
+            if not events:
+                if process.poll() is not None:
+                    raise RuntimeError(f"guest exited with {process.returncode}")
+                continue
+            chunk = os.read(stream.fileno(), 65536)
+            if not chunk:
+                raise RuntimeError("guest serial closed")
+            if transcript is not None:
+                transcript.write(chunk)
+                transcript.flush()
+            collected.extend(chunk)
+        return bytes(collected)
+    finally:
+        selector.close()
 
 
 def guest_record_from(data: bytes) -> dict[str, Any]:
@@ -402,6 +411,19 @@ def guest_record_from(data: bytes) -> dict[str, Any]:
     value = json.loads(candidates[0])
     require(isinstance(value, dict), "guest record must be an object")
     return value
+
+
+def guest_storage_geometry(boot: bytes) -> dict[str, int]:
+    prefix = b"VIBE_STORAGE_BENCH_GEOMETRY "
+    lines = [line.split(prefix, 1)[1] for line in boot.splitlines() if prefix in line]
+    require(len(lines) <= 1, "multiple guest storage geometry records")
+    if not lines:
+        return {} # Older benchmark ELFs do not report their provisioned geometry.
+    value = json.loads(lines[0])
+    require(isinstance(value, dict), "invalid guest storage geometry")
+    segments = value.get("provisioned_segments")
+    require(type(segments) is int and segments > 0, "invalid guest storage geometry")
+    return {"storage_v2_provisioned_segments": segments}
 
 
 def run_vibeos(args: argparse.Namespace) -> int:
@@ -416,7 +438,11 @@ def run_vibeos(args: argparse.Namespace) -> int:
     run_id = args.run_id or str(uuid.uuid4())
     total = args.warmups + args.samples
     output = args.output.open("x" if not args.overwrite else "w", encoding="utf-8")
+    transcript = None
+    failed = False
     try:
+        if args.serial_log is not None:
+            transcript = args.serial_log.open("wb" if args.overwrite else "xb")
         for vm_index in range(args.vms):
             with tempfile.TemporaryDirectory(prefix="vibeos-storage-bench-") as temporary:
                 disk = Path(temporary) / "data.raw"
@@ -439,7 +465,8 @@ def run_vibeos(args: argparse.Namespace) -> int:
                                            stderr=subprocess.STDOUT)
                 try:
                     assert process.stdin is not None and process.stdout is not None
-                    wait_for(process.stdout, process, b"VibeOS shell ready", args.boot_timeout)
+                    boot = wait_for(process.stdout, process, b"VibeOS shell ready", args.boot_timeout, transcript)
+                    env.update(guest_storage_geometry(boot))
                     # The shell-ready banner is emitted before the async
                     # virtio task has necessarily published its online
                     # session. Keep this bootstrap wait outside the timed
@@ -447,14 +474,14 @@ def run_vibeos(args: argparse.Namespace) -> int:
                     time.sleep(1.0)
                     process.stdin.write(b"blk info\n")
                     process.stdin.flush()
-                    wait_for(process.stdout, process, b"vibe> ", args.sample_timeout)
+                    wait_for(process.stdout, process, b"vibe> ", args.sample_timeout, transcript)
                     process.stdin.write(b"quiet\n")
                     process.stdin.flush()
                     # Wait for the shell to finish the quiet command before
                     # submitting the timed workload. Sending both lines in
                     # one UART burst can otherwise race the legacy parser and
                     # produce a valid but failed-closed guest record.
-                    wait_for(process.stdout, process, b"vibe> ", args.sample_timeout)
+                    wait_for(process.stdout, process, b"vibe> ", args.sample_timeout, transcript)
                     for index in range(total):
                         seed = (args.seed + vm_index * total + index) & ((1 << 64) - 1)
                         if args.workload.startswith("block-"):
@@ -470,10 +497,10 @@ def run_vibeos(args: argparse.Namespace) -> int:
                             command = f"storage bench {args.object_bytes} {seed}{extra}\n".encode()
                         process.stdin.write(command)
                         process.stdin.flush()
-                        data = wait_for(process.stdout, process, PREFIX.encode(), args.sample_timeout)
+                        data = wait_for(process.stdout, process, PREFIX.encode(), args.sample_timeout, transcript)
                         prefix_at = data.rfind(PREFIX.encode())
                         if b"\n" not in data[prefix_at:]:
-                            data += wait_for(process.stdout, process, b"\n", args.sample_timeout)
+                            data += wait_for(process.stdout, process, b"\n", args.sample_timeout, transcript)
                         sample = guest_record_from(data)
                         require(sample.get("backend") == args.backend,
                                 f"expected {args.backend}, guest selected {sample.get('backend')}")
@@ -484,6 +511,9 @@ def run_vibeos(args: argparse.Namespace) -> int:
                         )
                         output.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
                         output.flush()
+                        if args.stop_on_failure and record["status"] != "ok":
+                            failed = True
+                            break
                     process.stdin.write(b"halt\n")
                     process.stdin.flush()
                 finally:
@@ -492,7 +522,11 @@ def run_vibeos(args: argparse.Namespace) -> int:
                     except subprocess.TimeoutExpired:
                         process.terminate()
                         process.wait(timeout=5)
+                if failed:
+                    return 1
     finally:
+        if transcript is not None:
+            transcript.close()
         output.close()
     return 0
 
@@ -692,6 +726,7 @@ def summaries(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[tuple[Any, ...], list[float]] = defaultdict(list)
     profiles: dict[tuple[Any, ...], tuple[int, ...]] = {}
     memories: dict[tuple[Any, ...], int] = {}
+    geometries: dict[tuple[Any, ...], int | None] = {}
     patterns: dict[tuple[Any, ...], str] = {}
     scopes: dict[tuple[Any, ...], str] = {}
     for record in records:
@@ -719,6 +754,12 @@ def summaries(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
             scope = record["environment"].get("latency_scope", "legacy")
             require(scopes.setdefault(shared_key, scope) == scope,
                     "incompatible latency scopes for the same coordinate")
+            if record["backend"] == "storage-v2" and record["layer"] != "block":
+                geometry = record["environment"].get("storage_v2_provisioned_segments")
+                require(geometry is None or (type(geometry) is int and geometry > 0),
+                        "invalid storage geometry")
+                require(geometries.setdefault(key, geometry) == geometry,
+                        "incompatible storage geometries for the same coordinate")
             groups[key].append(float(value))
     result = []
     for key, values in sorted(groups.items(), key=lambda item: str(item[0])):
@@ -855,6 +896,10 @@ def main() -> int:
     run.add_argument("--qemu", default="qemu-system-riscv64")
     run.add_argument("--boot-timeout", type=float, default=180)
     run.add_argument("--sample-timeout", type=float, default=300)
+    run.add_argument("--serial-log", type=Path,
+                     help="save raw guest serial output, including diagnostic lines")
+    run.add_argument("--stop-on-failure", action="store_true",
+                     help="stop after the first non-ok sample and return exit status 1")
     run.add_argument("--overwrite", action="store_true")
     linux = subparsers.add_parser("run-linux")
     linux.add_argument("--root-image", type=Path, required=True)

@@ -238,6 +238,26 @@ pub(crate) struct FsTreeCache {
 /// small-namespace transaction, not to pin megabytes of decoded nodes.
 const FS_TREE_CACHE_MAX_NODES: usize = 512;
 
+/// The decoded namespace root the last fused transaction published, keyed by
+/// the exact object identity the authority names. Root objects are immutable
+/// and id-addressed, so while the current mapping still names this identity
+/// the memo equals what a verified media read returns; every transaction
+/// otherwise re-read (and re-scanned the segment of) the root it had just
+/// written, twice: once to check its expectation and once to recover it.
+pub(crate) struct FsRootMemo {
+    object_id: u128,
+    commit_generation: u64,
+    decoded: FsRootV1,
+}
+
+impl FsRootMemo {
+    fn matches(&self, mapping: &ObjectMapping) -> bool {
+        self.object_id == mapping.object_id
+            && self.commit_generation == mapping.commit_generation
+            && mapping.blob_key.object_kind() == FS_ROOT_V1_KIND
+    }
+}
+
 struct CowBuiltNode {
     minimum_key: Vec<u8>,
     object: Arc<AuthorizedObject<CasObjectHandle>>,
@@ -1281,15 +1301,19 @@ impl<D: PageDevice> SegmentStore<D> {
         match self.current_fs_root_mapping()? {
             None if expected_generation == 0 => Ok(()),
             Some(mapping) => {
-                let current = recover_persistent_cas_object(
-                    self.require_current_generation()?
-                        .superblock
-                        .binding
-                        .store_uuid,
-                    mapping,
-                );
-                let decoded =
-                    crate::decode_fs_root_v1(&self.read_fs_object_bytes(&current).await?)?;
+                let decoded = match self.fs_root_memo.as_ref().filter(|memo| memo.matches(&mapping)) {
+                    Some(memo) => memo.decoded.clone(),
+                    None => {
+                        let current = recover_persistent_cas_object(
+                            self.require_current_generation()?
+                                .superblock
+                                .binding
+                                .store_uuid,
+                            mapping,
+                        );
+                        crate::decode_fs_root_v1(&self.read_fs_object_bytes(&current).await?)?
+                    }
+                };
                 if decoded.namespace_uuid != namespace_uuid
                     || decoded.commit_generation != expected_generation
                 {
@@ -1618,14 +1642,15 @@ impl<D: PageDevice> SegmentStore<D> {
             .copied()
             .flatten()
             .ok_or(FsStructuralCommitError::InvalidChild)?;
-        let payload = encode_fs_root_v1(&FsRootV1 {
+        let root_value = FsRootV1 {
             namespace_uuid,
             commit_generation: namespace_generation,
             next_file_id,
             root_file_id,
             inode_tree,
             dirent_tree,
-        })?;
+        };
+        let payload = encode_fs_root_v1(&root_value)?;
         let (root_id, root_generation) = self
             .stage_blob_in_batch(&mut batch, FS_ROOT_V1_KIND, REFERENCE_CODEC_FS_V1, &payload)
             .await?;
@@ -1668,6 +1693,11 @@ impl<D: PageDevice> SegmentStore<D> {
         if key.object_id() != root_id || key.commit_generation() != root_generation {
             return Err(StoreError::Corrupt.into());
         }
+        self.fs_root_memo = Some(FsRootMemo {
+            object_id: root_id,
+            commit_generation: root_generation,
+            decoded: root_value,
+        });
         // Pending content occupied the batch's first positions; bind each
         // published stream head to the prediction its leaf already names.
         let mut pending_data = Vec::new();
@@ -2421,7 +2451,10 @@ impl<D: PageDevice> SegmentStore<D> {
                 .store_uuid,
             mapping,
         ));
-        let decoded = crate::decode_fs_root_v1(&self.read_fs_object_bytes(&object).await?)?;
+        let decoded = match self.fs_root_memo.as_ref().filter(|memo| memo.matches(&mapping)) {
+            Some(memo) => memo.decoded.clone(),
+            None => crate::decode_fs_root_v1(&self.read_fs_object_bytes(&object).await?)?,
+        };
         if decoded.namespace_uuid != namespace_uuid {
             return Ok(None);
         }

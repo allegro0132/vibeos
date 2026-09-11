@@ -576,6 +576,8 @@ pub struct SegmentStore<D> {
     /// Decoded successor trees of the last fused file transaction, keyed by
     /// the exact root they belong to.
     pub(crate) fs_tree_cache: Option<crate::fs_api::FsTreeCache>,
+    /// See [`crate::fs_api::FsRootMemo`].
+    pub(crate) fs_root_memo: Option<crate::fs_api::FsRootMemo>,
     /// When set, commits skip the publication-time read-back verification of
     /// the pages they just wrote. See [`SegmentStore::set_deferred_commit_readback`].
     pub(crate) defer_commit_readback: bool,
@@ -616,6 +618,7 @@ impl<D: PageDevice> SegmentStore<D> {
             committed_ids_cache: None,
             promotion_claims_cache: None,
             fs_tree_cache: None,
+            fs_root_memo: None,
             defer_commit_readback: false,
             catalog_delta_policy: crate::cas::CatalogDeltaPolicy::Auto,
             verified_scans: VerifiedSegmentScans::new(),

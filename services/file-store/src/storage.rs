@@ -193,12 +193,16 @@ fn encode_namespace(
     state: &NamespaceState,
 ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>), FileError> {
     let mut inode_entries = Vec::new();
+    inode_entries
+        .try_reserve_exact(state.inodes.len())
+        .map_err(|_| FileError::BudgetExceeded)?;
+    let link_counts = state.link_counts();
     for (file_id, inode) in &state.inodes {
         let metadata = PersistedInodeV1 {
             file_id: *file_id,
             file_type: inode.file_type,
             size: inode_size(inode),
-            link_count: state.link_count(*file_id, inode.file_type),
+            link_count: link_counts.get(file_id).copied().unwrap_or(0),
             change_generation: if inode.change_generation == 0 {
                 state.generation
             } else {
@@ -410,7 +414,20 @@ impl FsTransaction {
             .await?
             .ok_or(FileError::InvalidType)?;
 
-        *self.root.state.lock() = alloc::sync::Arc::new(self.working.clone());
+        // The transaction is consumed: publish its working state by moving it
+        // instead of cloning every inode and entry a second time.
+        let namespace = self.working.namespace;
+        let published = core::mem::replace(
+            &mut self.working,
+            NamespaceState {
+                namespace,
+                generation: 0,
+                next_file_id: 0,
+                inodes: BTreeMap::new(),
+                dirents: BTreeMap::new(),
+            },
+        );
+        *self.root.state.lock() = alloc::sync::Arc::new(published);
         *self.root.persistent_root.lock() = Some(persisted);
         self.committed = true;
         assert!(self.root.release_writer_claim(self.claim));
@@ -620,9 +637,12 @@ impl FileTreeRoot {
                 .get(&crate::ROOT_FILE_ID)
                 .map(|inode| inode.file_type)
                 != Some(FileType::Directory)
-            || persisted_metadata.iter().any(|(file_id, metadata)| {
-                state.link_count(*file_id, metadata.file_type) != metadata.link_count
-            })
+            || {
+                let link_counts = state.link_counts();
+                persisted_metadata.iter().any(|(file_id, metadata)| {
+                    link_counts.get(file_id).copied().unwrap_or(0) != metadata.link_count
+                })
+            }
             || state.inodes.iter().any(|(file_id, inode)| {
                 if *file_id == crate::ROOT_FILE_ID {
                     return state.dirents.values().any(|child| child == file_id);
@@ -1404,6 +1424,8 @@ mod io_trace {
         Write(u64, u64),
         Read(u64, u64),
         Flush,
+        /// Phase probe from instrumented engine code (id, time).
+        Probe(u64, std::time::Instant),
     }
 
     #[derive(Clone)]
@@ -1436,6 +1458,40 @@ mod io_trace {
     }
 
     fn report(label: &str, events: &[Event]) {
+        let probes: Vec<(u64, std::time::Instant)> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Probe(id, at) => Some((*id, *at)),
+                _ => None,
+            })
+            .collect();
+        if probes.len() >= 2 {
+            let total = probes[probes.len() - 1].1.duration_since(probes[0].1);
+            let mut line = alloc::format!("  {label} phases ({:.2} ms total):", total.as_secs_f64() * 1e3);
+            for pair in probes.windows(2) {
+                let span = pair[1].1.duration_since(pair[0].1);
+                line.push_str(&alloc::format!(" {}->{} {:.2}ms", pair[0].0, pair[1].0, span.as_secs_f64() * 1e3));
+            }
+            std::println!("{line}");
+            let mut current = 0_u64;
+            let mut per: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+            for event in events {
+                match event {
+                    Event::Probe(id, _) => current = *id,
+                    Event::Read(_, count) => {
+                        let entry = per.entry(current).or_insert((0, 0));
+                        entry.0 += 1;
+                        entry.1 += count;
+                    }
+                    _ => {}
+                }
+            }
+            let mut reads = alloc::format!("  {label} reads after probe:");
+            for (probe, (requests, pages)) in &per {
+                reads.push_str(&alloc::format!(" {probe}:{requests}req/{}KiB", pages * 4));
+            }
+            std::println!("{reads}");
+        }
         let mut writes = 0_u64;
         let mut write_pages = 0_u64;
         let mut reads = 0_u64;
@@ -1458,6 +1514,7 @@ mod io_trace {
                     entry.0 += 1;
                     entry.1 += count;
                 }
+                Event::Probe(..) => {}
                 Event::Flush => {
                     flushes += 1;
                     lines.push_str("  ---- FLUSH\n");
@@ -1525,6 +1582,12 @@ mod io_trace {
         }
         async fn read_page(&self, page: u64, output: &mut Page) -> Result<(), Self::Error> {
             if page >= self.page_count {
+                if page >= u64::MAX - 128 {
+                    self.events
+                        .lock()
+                        .unwrap()
+                        .push(Event::Probe(u64::MAX - page, std::time::Instant::now()));
+                }
                 return Err(DeviceError::OutsideRange);
             }
             self.events.lock().unwrap().push(Event::Read(page, 1));
@@ -1702,7 +1765,7 @@ mod io_trace {
                         pages += count;
                     }
                     Event::Flush => flushes += 1,
-                    Event::Read(..) => {}
+                    Event::Read(..) | Event::Probe(..) => {}
                 }
             }
             std::println!(
@@ -2007,17 +2070,22 @@ mod io_trace {
             block_on(stager.push(&payload)).unwrap();
             let staged = block_on(stager.finish()).unwrap();
             report(&alloc::format!("s{sample} stage content"), &device.take());
+            let wall = std::time::Instant::now();
             let mut tx = root.begin().unwrap();
+            std::println!("  s{sample} begin wall {:.2} ms", wall.elapsed().as_secs_f64() * 1e3);
             tx.write_staged(&path, staged).unwrap();
             block_on(tx.commit_durable()).unwrap();
+            std::println!("  s{sample} commit create wall {:.2} ms", wall.elapsed().as_secs_f64() * 1e3);
             report(&alloc::format!("s{sample} commit create"), &device.take());
             let reader = root.reader(&path).unwrap();
             let chunk = block_on(reader.read_chunk(0)).unwrap().unwrap();
             assert_eq!(chunk, payload);
             report(&alloc::format!("s{sample} read back"), &device.take());
+            let wall = std::time::Instant::now();
             let mut tx = root.begin().unwrap();
             tx.remove(&path, false, false).unwrap();
             block_on(tx.commit_durable()).unwrap();
+            std::println!("  s{sample} commit unlink wall {:.2} ms", wall.elapsed().as_secs_f64() * 1e3);
             report(&alloc::format!("s{sample} commit unlink"), &device.take());
             std::println!(
                 "  edge-cache (objects, hits, misses) = {:?}",

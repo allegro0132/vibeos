@@ -656,6 +656,10 @@ file-tree QEMU case's powered-off verifier.
   Catalog changes ride the format's bounded replay chain (one 3-page delta
   per minted object) instead of rewriting the whole object catalog every
   checkpoint, so the per-commit catalog cost no longer grows with `@home`.
+  A transaction no longer re-reads and re-scans the namespace root it
+  just published (twice), and namespace encoding is linear instead of
+  quadratic in the file count — both were pure CPU and card reads that
+  grew with `@home`.
   Collection rounds batch their relocation writes into contiguous runs
   (986 → 36 device requests for one relocated segment). Both matter far
   more on 1-bit PIO SD than on QEMU's RAM-backed disk. Later rounds in one

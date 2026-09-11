@@ -227,3 +227,41 @@ fused segment, a format change), the first collection round of each process
 (its mark walk reads about three distinct pages per live node; later rounds
 reuse the edge memo), and the relocation copy itself, which reads every live
 extent of a source segment once and verifies the copy.
+
+## 2026-09-11 (later): CPU profile of a small transaction, and two more cuts
+
+Host profile (release build, in-memory device, Apple M5) of one fused
+create at 8 and 600 files, using timestamped phase probes. Engine time is
+dominated by SHA-256 over descriptor pages that the frozen format mandates
+(two 4 KiB pages per extent, three extents per small blob): building the
+packed extent records costs ~0.1 ms per staged blob, manifest and
+catalog/allocation records ~0.2 ms, segment summary/seal ~0.15 ms, the
+checkpoint pair ~0.1 ms, and the mandated re-read of the checkpoint pair on
+successor mount ~0.15 ms. Blob staging itself (Merkle, encoding) is under
+10 µs per blob. The object-store append profiles the same way (~1.1 ms
+store-side, flat in object count; the host-side import build is linear in
+stream length but the kernel caches that replay). QEMU's TCG multiplies
+these by roughly 13x, which is why its latencies are CPU-bound.
+
+Two costs outside the hashing floor were found and removed:
+
+- **Root re-reads.** Every transaction read the current namespace root from
+  media twice — once in `expect_current_fs_root` before staging and once in
+  `recover_fs_root` after publication — and each read re-scanned a segment's
+  descriptor chain: 43 + 73 requests, ~900 KiB and the matching hashing per
+  commit. The store now memoizes the decoded root it just published, keyed
+  by the object identity the authority names (`FsRootMemo`); a commit reads
+  4 pages (48 KiB) instead.
+- **Quadratic link counts.** `encode_namespace` computed each inode's link
+  count by scanning every directory entry, so encoding a 600-file namespace
+  cost 1.2–1.5 ms per commit (40% of the transaction). `link_counts()` now
+  derives all counts in one pass; cold-recovery validation uses it too. The
+  publish step also moves the working state instead of cloning it again.
+
+Whole-transaction wall time on the host: 600-file create 3.9 → 1.8 ms.
+QEMU medians (two independent runs each): create+fsync+unlink 4 KiB
+22.4 → 14.7 / 12.9 ms, overwrite 4 KiB 27.3 → 15.9 / 14.9 ms, object put
+4 KiB 26.9 → 15.1 / 14.6 ms, directory of 100 files 32.0 → 23.0 ms;
+sequential 16 MiB unchanged (709 / 730 ms isolated) and object put 128 KiB
+unchanged (138.6 ms). Goldens `storage_v2`, `storage_v2_native` and the
+three-boot file-tree acceptance pass.

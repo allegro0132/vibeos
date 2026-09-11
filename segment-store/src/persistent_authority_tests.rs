@@ -257,6 +257,7 @@ enum TestError {
 struct MemoryDevice {
     pages: Arc<Mutex<BTreeMap<u64, Page>>>,
     segments: u64,
+    probes: Arc<Mutex<Vec<(u64, std::time::Instant)>>>,
 }
 
 impl MemoryDevice {
@@ -268,7 +269,12 @@ impl MemoryDevice {
         Self {
             pages: Arc::new(Mutex::new(BTreeMap::new())),
             segments,
+            probes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn take_probes(&self) -> Vec<(u64, std::time::Instant)> {
+        core::mem::take(&mut *self.probes.lock().unwrap())
     }
 
     fn snapshot(&self) -> BTreeMap<u64, Page> {
@@ -292,6 +298,12 @@ impl PageDevice for MemoryDevice {
 
     async fn read_page(&self, page: u64, output: &mut Page) -> Result<(), Self::Error> {
         if page >= self.info().page_count {
+            if page >= u64::MAX - 64 {
+                self.probes
+                    .lock()
+                    .unwrap()
+                    .push((u64::MAX - page, std::time::Instant::now()));
+            }
             return Err(TestError::OutsideRange);
         }
         output.fill(0);
@@ -2296,4 +2308,85 @@ fn fused_fs_root_switch_is_power_cut_atomic_at_every_mutation() {
         old > 0 && new > 0,
         "fault matrix must recover both old and new roots"
     );
+}
+
+/// Profiling harness: `cargo test --release -p vibeos-segment-store --lib
+/// profile_object_append -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn profile_object_append() {
+    let device = MemoryDevice::with_segments(64);
+    let (runtime, _quota, maintenance_provisioner) =
+        StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let limits = StoreLimits {
+        max_catalog_entries: 4096,
+        max_replay_records: 32,
+        recovery_memory_bytes: 64 * 1024 * 1024,
+        max_compat_object_bytes: 64 * 1024,
+    };
+    let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits, runtime);
+    block_on(store.format(FormatOptions {
+        store_uuid: StoreUuid::new(*b"M7.7-AUTH-PROF!!").unwrap(),
+        cleaner_reserve_segments: 4,
+        limits,
+    }))
+    .unwrap();
+    store.set_deferred_commit_readback(true);
+    let maintenance = store
+        .provision_maintenance_root(&maintenance_provisioner)
+        .unwrap();
+    let mut records = format_records();
+    let initial =
+        block_on(store.import_persistent_authority(&maintenance, import(&records, &[]))).unwrap();
+    let principal = initial.principals()[0].clone();
+    let writer = store
+        .derive_persistent_authority_writer(&maintenance)
+        .unwrap();
+    let mut generation = initial.checkpoint_generation();
+    let total: u32 = std::env::var("VIBE_PROFILE_APPENDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(40);
+    for index in 0..total {
+        let bytes: Vec<u8> = (0..4096_u32)
+            .map(|i| (i.wrapping_mul(131).wrapping_add(index.wrapping_mul(17)) % 251) as u8)
+            .collect();
+        let build_started = std::time::Instant::now();
+        let (next_records, _object) = append_next_object_records(&records, &bytes);
+        let update = import(&next_records, &[]);
+        let build = build_started.elapsed();
+        device.take_probes();
+        let before = device.snapshot();
+        let started = std::time::Instant::now();
+        let appended =
+            block_on(store.append_persistent_authority(&writer, generation, update, &principal))
+                .unwrap();
+        let elapsed = started.elapsed();
+        let after = device.snapshot();
+        let written = after
+            .iter()
+            .filter(|(page, bytes)| before.get(page) != Some(bytes))
+            .count();
+        generation = appended.view().checkpoint_generation();
+        records = next_records;
+        if index == 1 || index == 9 || index + 1 == total {
+            let probes = device.take_probes();
+            let mut line = std::format!(
+                "append #{:>2}: stream {} records, import-build {:.2} ms, append {:.2} ms, {written} pages written; phases:",
+                index + 1,
+                records.len(),
+                build.as_secs_f64() * 1e3,
+                elapsed.as_secs_f64() * 1e3
+            );
+            for pair in probes.windows(2) {
+                line.push_str(&std::format!(
+                    " {}->{} {:.2}",
+                    pair[0].0,
+                    pair[1].0,
+                    pair[1].1.duration_since(pair[0].1).as_secs_f64() * 1e3
+                ));
+            }
+            std::println!("{line}");
+        }
+    }
 }

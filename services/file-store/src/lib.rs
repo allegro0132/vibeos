@@ -183,6 +183,29 @@ impl NamespaceState {
             .map(|value| value.0)
     }
 
+    /// Link counts of every inode in one pass over the directory entries:
+    /// directories count 2 plus their subdirectories, everything else counts
+    /// its incoming entries. Encoding or validating a whole namespace must
+    /// use this instead of [`Self::link_count`] per inode, which scans every
+    /// entry per inode and made each commit quadratic in the file count.
+    fn link_counts(&self) -> BTreeMap<FileId, u64> {
+        let mut counts: BTreeMap<FileId, u64> = BTreeMap::new();
+        for (id, inode) in &self.inodes {
+            counts.insert(*id, if inode.file_type == FileType::Directory { 2 } else { 0 });
+        }
+        for ((parent, _), child) in &self.dirents {
+            let child_is_directory = self
+                .inodes
+                .get(child)
+                .is_some_and(|inode| inode.file_type == FileType::Directory);
+            let counted = if child_is_directory { *parent } else { *child };
+            if let Some(count) = counts.get_mut(&counted) {
+                *count += 1;
+            }
+        }
+        counts
+    }
+
     fn link_count(&self, id: FileId, kind: FileType) -> u64 {
         if kind == FileType::Directory {
             2 + self

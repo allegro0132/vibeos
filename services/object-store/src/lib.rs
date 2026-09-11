@@ -68,6 +68,12 @@ pub const STORE_WORKING_HEADROOM: usize = 4 * 1024 * 1024;
 /// It leaves room for their own future/payload plus the recovery floor above.
 pub const STORE_CLIENT_MEMORY_BUDGET: usize = 8 * 1024 * 1024;
 
+// This is a write-policy threshold, not a format limit. Larger v2 objects
+// already have a content-by-reference representation; keeping them out of
+// the authority stream avoids rewriting their payload on every later append.
+// Small objects retain the compact inline path, including 4 KiB blob envelopes.
+const V2_INLINE_OBJECT_LIMIT: usize = 16 * 1024;
+
 // Stable platform trust anchor for this object journal.  VibeOS has no entropy
 // source yet, so this is intentionally a fixed, documented value rather than a
 // boot-local counter pretending to be globally unique.
@@ -445,6 +451,28 @@ pub trait StorageV2Backend: Send + Sync {
         }
     }
     fn read_object<'a>(&'a self, object: &'a StorageV2ObjectToken) -> StorageV2Future<'a, Vec<u8>>;
+    /// Authenticate up to 32 ranges of one exact object. Native backends
+    /// share a manifest/proof reader; existing bridges retain their fallback.
+    fn read_object_ranges<'a>(
+        &'a self,
+        object: &'a StorageV2ObjectToken,
+        ranges: &'a [(u64, usize)],
+    ) -> StorageV2Future<'a, Vec<Vec<u8>>> {
+        Box::pin(async move {
+            if ranges.len() > 32 {
+                return Err(StoreError::ObjectTooLarge);
+            }
+            let mut output = Vec::new();
+            if ranges.is_empty() {
+                self.read_object_range(object, 0, 0).await?;
+            }
+            for &(offset, len) in ranges {
+                output.push(self.read_object_range(object, offset, len).await?);
+            }
+            Ok(output)
+        })
+    }
+
     /// Return an authenticated range of the exact capability-bound object.
     /// The compatibility fallback verifies the complete object first; native
     /// CAS backends authenticate only the intersecting leaves and their proofs.
@@ -2955,11 +2983,10 @@ async fn put_to_space(
     let target_incarnation = target.incarnation();
     let inner = lease.with(|service| service.inner.clone());
     if let Some(backend) = selected_v2_backend(&inner)? {
-        // The logical v2 record stream admits inline objects up to the
-        // journal chunk envelope; larger objects commit by reference with
-        // their content in the V2 content-addressed store. The M4 backend
-        // additionally enforces its physical sector capacity below.
-        let external = bytes.len() > journal::MAX_OBJECT_SIZE;
+        // Choose inline storage for small objects, rather than filling the
+        // format's entire chunk envelope. External commits keep payload bytes
+        // in CAS and the authority journal proportional to object count.
+        let external = bytes.len() > V2_INLINE_OBJECT_LIMIT.min(journal::MAX_OBJECT_SIZE);
         if bytes.len() as u64 > journal::MAX_EXTERNAL_OBJECT_SIZE {
             return Err(StoreError::ObjectTooLarge);
         }
@@ -3363,29 +3390,34 @@ async fn read_v2_blob_chunk(
         .byte_len
         .saturating_sub(offset)
         .min(LEAF_SIZE as u64) as usize;
-    let bytes = backend
-        .read_object_range(token, HEADER_SIZE as u64 + offset, len)
-        .await?;
-    let mut proof = MerkleProof {
-        leaf_index: index,
-        siblings: Vec::new(),
-    };
+    let mut requests = Vec::new();
+    requests.push((HEADER_SIZE as u64 + offset, len));
     let mut position = index as usize;
     let mut width = geometry.padded_leaf_count() as usize;
     let mut base = 0;
     while width > 1 {
         let offset = geometry.tree_offset() + (base + (position ^ 1)) * HASH_SIZE;
-        let node = backend
-            .read_object_range(token, offset as u64, HASH_SIZE)
-            .await?;
+        requests.push((offset as u64, HASH_SIZE));
+        base += width;
+        width /= 2;
+        position /= 2;
+    }
+    let values = backend.read_object_ranges(token, &requests).await?;
+    if values.len() != requests.len() {
+        return Err(StoreError::Corrupt.into());
+    }
+    let mut values = values.into_iter();
+    let bytes = values.next().ok_or(StoreError::Corrupt)?;
+    let mut proof = MerkleProof {
+        leaf_index: index,
+        siblings: Vec::new(),
+    };
+    for node in values {
         proof.siblings.push(
             node.as_slice()
                 .try_into()
                 .map_err(|_| StoreError::Corrupt)?,
         );
-        base += width;
-        width /= 2;
-        position /= 2;
     }
     verify_proof(descriptor, &bytes, &proof)?;
     Ok(VerifiedBlobChunk {

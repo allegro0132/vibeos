@@ -123,6 +123,64 @@ The 2026-09-11 QEMU smoke runs passed for 4 KiB and 128 KiB range workloads,
 and for range/full reads of 1 MiB objects. For the latter, get performed 28
 device reads / 167,936 bytes for a 4 KiB range versus 40 reads / 1,216,512 bytes
 for the whole object. Short-run latency variance was too high for formal
-qualification. Repeated manifest resolution and nested-proof work remain
-optimization opportunities. Local logs, JSONL and the detailed report are in
+qualification. Local logs, JSONL and the detailed report are in
 `target/storage-read-optimization-20260911/`; the formal baseline is unchanged.
+
+## SD-oriented QEMU experiments
+
+Both runners accept `--read-bps`, `--write-bps`, `--read-iops` and
+`--write-iops` (nonnegative integers, zero means unlimited). They throttle only
+the benchmark disk and record the limits in `environment.storage_throttle`.
+Comparison rejects mismatched profiles for the same workload coordinate;
+throttled experiments cannot replace the formal unthrottled baseline.
+These QEMU average-rate limits allow bursts. They do not simulate SD commands,
+card firmware, erase behavior or flush latency, and cannot qualify real cards.
+
+The current v2 facade puts objects larger than 16 KiB into the existing external
+content path instead of embedding them in the authority journal. The on-disk
+format and recovery ordering are unchanged. Batched proof ranges share one
+manifest resolution and bounded verification buffers (up to 32 ranges).
+PageDevice reads reuse cached prefixes/suffixes, with at most one device read
+per original hardware-sized chunk to avoid turning cache holes into many SD
+commands. All returned content still passes the existing verification path.
+
+The 2026-09-11 exploratory run used one VM, one warmup and three retained
+samples, with read/write limits of 4/2 MiB/s and 400/200 IOPS. Baseline firmware
+was built from `9ccce326f0fc2a79d804da9de1bf2eb59014ad75`:
+
+| Phase | Baseline median | Changed median |
+| --- | ---: | ---: |
+| 128 KiB durable put | 552.664 ms | 58.909 ms |
+| 1 MiB durable put | 7.560677 s | 1.333638 s |
+| 4 KiB range read from 1 MiB object | 34.290 ms | 8.146 ms |
+
+The put rows use the final external-content policy; the range row isolates the
+batched-proof change. These short runs are not formal latency qualification.
+For 1 MiB put, device writes fell from 4.24–7.13 MiB to 1.22–1.29 MiB per
+retained sample, and authority growth fell from 2,962 to 2 records per object.
+The range row still uses 28 physical reads / 167,936 bytes; its gain reflects
+less repeated metadata/proof processing, not reduced physical read traffic.
+The host regression separately reduces five native range reads from 61 to 15
+PageDevice requests and from 91 to 21 pages by sharing their reader.
+
+Reproduce a limited large-object point with:
+
+```sh
+python3 scripts/storage-bench.py run-vibeos \
+  --kernel target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt \
+  --data-image target/storage-v2-native-verified.raw \
+  --output /tmp/vibeos-limited-1m.jsonl \
+  --object-bytes 1048576 --workload object-v2-large \
+  --vms 1 --warmups 1 --samples 3 \
+  --read-bps 4194304 --write-bps 2097152 \
+  --read-iops 400 --write-iops 200 \
+  --boot-timeout 120 --sample-timeout 180
+```
+
+Local binaries, SHA-256 manifest, JSONL, summaries and test logs are in
+`target/storage-sd-qemu-20260911/`. Validation covers CAS streaming/corruption,
+object-store tests, exhaustive cache patterns, and crash cuts for external
+objects of 16 KiB + 1 and 128 KiB. The final QEMU firmware passes selftests;
+the Milk-V Duo target passes a compile check only. Large streaming puts still
+issue roughly 281 writes per 1 MiB object, making bounded write coalescing a
+remaining optimization opportunity.

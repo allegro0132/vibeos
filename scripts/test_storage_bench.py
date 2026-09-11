@@ -89,6 +89,26 @@ class StorageBenchTests(unittest.TestCase):
         self.assertEqual(record["metrics"], {"latency_ns": 130.0,
                          "put_latency_ns": 100.0, "get_latency_ns": 20.0})
 
+    def test_storage_throttle_options_and_comparison_profiles(self):
+        from argparse import Namespace
+        self.assertEqual(MODULE.throttle_drive_options(Namespace()), "")
+        args = Namespace(read_bps=4194304, write_bps=2097152, read_iops=400, write_iops=200)
+        self.assertEqual(MODULE.throttle_drive_options(args),
+                         ",bps_rd=4194304,bps_wr=2097152,iops_rd=400,iops_wr=200")
+        with self.assertRaises(MODULE.ValidationError):
+            MODULE.throttle_drive_options(Namespace(read_bps=-1))
+        record = {"backend": "storage-v2", "layer": "object", "workload": "object-range-get",
+                  "object_bytes": 4096, "object_count": 1, "queue_depth": 1,
+                  "status": "ok", "warmup": False, "metrics": {"get_latency_ns": 100},
+                  "environment": {}}
+        compatible = dict(record, backend="linux-ext4", environment={"storage_throttle": MODULE.storage_throttle(Namespace())})
+        self.assertEqual(len(MODULE.summaries([record, compatible])), 2)
+        incompatible = dict(compatible, environment={"storage_throttle": MODULE.storage_throttle(args)})
+        with self.assertRaises(MODULE.ValidationError):
+            MODULE.summaries([record, incompatible])
+        with self.assertRaisesRegex(MODULE.ValidationError, "cannot replace"):
+            MODULE.require_baseline_evidence([incompatible], pathlib.Path("unused"), pathlib.Path("unused"))
+
 
 if __name__ == "__main__":
     unittest.main()

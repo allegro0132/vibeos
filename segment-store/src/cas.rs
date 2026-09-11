@@ -1563,81 +1563,84 @@ impl<D: PageDevice> SegmentStore<D> {
         index: u32,
     ) -> Result<VerifiedCasChunk, CasStoreError<D::Error>> {
         let read_pin = self.pin_blob_reader(object)?;
-        let mut reader = ManifestRangeReader::new(false);
         let (descriptor, manifest) = self.resolve_authorized_manifest(object).await?;
-        let geometry = BlobGeometry::for_len(descriptor.byte_len)?;
-        if index >= geometry.leaf_count() {
-            return Err(BlobError::ChunkOutOfRange.into());
-        }
-        let content_offset = HEADER_SIZE as u64 + u64::from(index) * LEAF_SIZE as u64;
-        let chunk_len = if descriptor.byte_len == 0 {
-            0
-        } else {
-            descriptor
-                .byte_len
-                .saturating_sub(u64::from(index) * LEAF_SIZE as u64)
-                .min(LEAF_SIZE as u64) as usize
-        };
-        let bytes = if chunk_len == 0 {
-            Vec::new()
-        } else {
-            reader
-                .read(
-                    &self.device,
-                    self.mounted.as_ref().ok_or(StoreError::NotMounted)?,
-                    &manifest,
-                    content_offset,
-                    chunk_len,
-                )
-                .await?
-        };
-        let mut siblings = Vec::new();
-        siblings
-            .try_reserve_exact(geometry.height() as usize)
-            .map_err(|_| StoreError::MemoryLimit)?;
-        let mut position = index as usize;
-        let mut level_width = geometry.padded_leaf_count() as usize;
-        let mut level_base = 0_usize;
-        while level_width > 1 {
-            let node_index = level_base
-                .checked_add(position ^ 1)
-                .ok_or(StoreError::Corrupt)?;
-            let node_offset = u64::try_from(geometry.tree_offset())
-                .ok()
-                .and_then(|offset| offset.checked_add((node_index * HASH_SIZE) as u64))
-                .ok_or(StoreError::Corrupt)?;
-            let node = reader
-                .read(
-                    &self.device,
-                    self.mounted.as_ref().ok_or(StoreError::NotMounted)?,
-                    &manifest,
-                    node_offset,
-                    HASH_SIZE,
-                )
-                .await?;
-            siblings.push(
-                node.as_slice()
-                    .try_into()
-                    .map_err(|_| StoreError::Corrupt)?,
-            );
-            level_base = level_base
-                .checked_add(level_width)
-                .ok_or(StoreError::Corrupt)?;
-            position /= 2;
-            level_width /= 2;
-        }
-        let proof = MerkleProof {
-            leaf_index: index,
-            siblings,
-        };
-        verify_proof(descriptor, &bytes, &proof)?;
-        drop(read_pin);
-        Ok(VerifiedCasChunk {
+        let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
+        let mut reader = ManifestRangeReader::new(false);
+        let chunk = read_resolved_chunk(
+            &self.device,
+            state,
             descriptor,
+            &manifest,
             index,
-            bytes,
-            proof,
-        })
+            &mut reader,
+        )
+        .await?;
+        drop(read_pin);
+        Ok(chunk)
+    }
+
+    /// Authenticate a bounded group of logical ranges under one reader pin
+    /// and one manifest resolution. Proof windows and the most recent leaf
+    /// are shared only within this invocation; output order matches input.
+    pub(crate) async fn read_blob_ranges(
+        &self,
+        object: &AuthorizedObject<CasObjectHandle>,
+        ranges: &[(u64, usize)],
+    ) -> Result<Vec<Vec<u8>>, CasStoreError<D::Error>> {
+        if ranges.len() > 32 {
+            return Err(StoreError::MemoryLimit.into());
+        }
+        for &(offset, len) in ranges {
+            offset
+                .checked_add(len as u64)
+                .filter(|end| *end <= object.exact_len())
+                .ok_or(StoreError::ObjectUnavailable)?;
+        }
+        let read_pin = self.pin_blob_reader(object)?;
+        let (descriptor, manifest) = self.resolve_authorized_manifest(object).await?;
+        let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
+        let mut reader = ManifestRangeReader::new(false);
+        let mut previous: Option<VerifiedCasChunk> = None;
+        let mut results = Vec::new();
+        results
+            .try_reserve_exact(ranges.len())
+            .map_err(|_| StoreError::MemoryLimit)?;
+        let leaf_size = LEAF_SIZE as u64;
+        for &(offset, len) in ranges {
+            let end = offset + len as u64; // all ranges were checked before I/O
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(len)
+                .map_err(|_| StoreError::MemoryLimit)?;
+            let first = if len == 0 { 0 } else { offset / leaf_size };
+            let last = if len == 0 { 0 } else { (end - 1) / leaf_size };
+            for index in first..=last {
+                let index = u32::try_from(index).map_err(|_| StoreError::Corrupt)?;
+                if previous.as_ref().is_none_or(|chunk| chunk.index != index) {
+                    previous = Some(
+                        read_resolved_chunk(
+                            &self.device,
+                            state,
+                            descriptor,
+                            &manifest,
+                            index,
+                            &mut reader,
+                        )
+                        .await?,
+                    );
+                }
+                let chunk = previous.as_ref().expect("verified leaf initialized");
+                if len != 0 {
+                    let base = u64::from(index) * leaf_size;
+                    let start = offset.saturating_sub(base) as usize;
+                    let stop = (end - base).min(chunk.bytes.len() as u64) as usize;
+                    bytes.extend_from_slice(&chunk.bytes[start..stop]);
+                }
+            }
+            results.push(bytes);
+        }
+        drop(read_pin);
+        Ok(results)
     }
 
     pub async fn verify_blob(
@@ -1945,6 +1948,76 @@ async fn read_small_verified_blob<D: PageDevice>(
     }
     blob.verify_all()?;
     Ok(blob.data().to_vec())
+}
+
+async fn read_resolved_chunk<D: PageDevice>(
+    device: &D,
+    state: &MountedState,
+    descriptor: BlobDescriptor,
+    manifest: &BlobManifest,
+    index: u32,
+    reader: &mut ManifestRangeReader,
+) -> Result<VerifiedCasChunk, CasStoreError<D::Error>> {
+    let geometry = BlobGeometry::for_len(descriptor.byte_len)?;
+    if index >= geometry.leaf_count() {
+        return Err(BlobError::ChunkOutOfRange.into());
+    }
+    let content_offset = HEADER_SIZE as u64 + u64::from(index) * LEAF_SIZE as u64;
+    let chunk_len = if descriptor.byte_len == 0 {
+        0
+    } else {
+        descriptor
+            .byte_len
+            .saturating_sub(u64::from(index) * LEAF_SIZE as u64)
+            .min(LEAF_SIZE as u64) as usize
+    };
+    let bytes = if chunk_len == 0 {
+        Vec::new()
+    } else {
+        reader
+            .read(device, state, manifest, content_offset, chunk_len)
+            .await?
+    };
+    let mut siblings = Vec::new();
+    siblings
+        .try_reserve_exact(geometry.height() as usize)
+        .map_err(|_| StoreError::MemoryLimit)?;
+    let mut position = index as usize;
+    let mut level_width = geometry.padded_leaf_count() as usize;
+    let mut level_base = 0_usize;
+    while level_width > 1 {
+        let node_index = level_base
+            .checked_add(position ^ 1)
+            .ok_or(StoreError::Corrupt)?;
+        let node_offset = u64::try_from(geometry.tree_offset())
+            .ok()
+            .and_then(|offset| offset.checked_add((node_index * HASH_SIZE) as u64))
+            .ok_or(StoreError::Corrupt)?;
+        let node = reader
+            .read(device, state, manifest, node_offset, HASH_SIZE)
+            .await?;
+        siblings.push(
+            node.as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Corrupt)?,
+        );
+        level_base = level_base
+            .checked_add(level_width)
+            .ok_or(StoreError::Corrupt)?;
+        position /= 2;
+        level_width /= 2;
+    }
+    let proof = MerkleProof {
+        leaf_index: index,
+        siblings,
+    };
+    verify_proof(descriptor, &bytes, &proof)?;
+    Ok(VerifiedCasChunk {
+        descriptor,
+        index,
+        bytes,
+        proof,
+    })
 }
 
 async fn verify_resolved_blob<D: PageDevice>(

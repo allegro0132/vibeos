@@ -252,6 +252,34 @@ impl PageCache {
         }
     }
 
+    /// Copy cached pages and return the smallest contiguous span covering all
+    /// misses. One span per hardware-sized batch avoids turning alternating
+    /// hits/misses into many expensive SD commands. Cached prefixes/suffixes
+    /// never need another device transfer. The caller validates the range.
+    fn read_span(&self, first_page: u64, output: &mut [Page]) -> core::ops::Range<usize> {
+        let mut missing = output.len()..0;
+        let mut state = self.state.lock();
+        for (index, page) in output.iter_mut().enumerate() {
+            state.tick += 1;
+            let tick = state.tick;
+            match state.entries.get_mut(&(first_page + index as u64)) {
+                Some(entry) => {
+                    entry.tick = tick;
+                    page.copy_from_slice(&entry.data[..]);
+                }
+                None => {
+                    missing.start = missing.start.min(index);
+                    missing.end = index + 1;
+                }
+            }
+        }
+        if missing.end == 0 {
+            0..0
+        } else {
+            missing
+        }
+    }
+
     fn insert(&self, page: u64, data: &Page) {
         let boxed = alloc::boxed::Box::new(*data);
         let mut state = self.state.lock();
@@ -3348,6 +3376,46 @@ impl StorageV2Devices {
 mod storage_v2_transition_tests {
     use super::*;
 
+    #[cfg_attr(test, test)]
+    pub(crate) fn cached_read_spans_preserve_data_and_bound_command_count() {
+        const PAGES: usize = 8;
+        let cache = PageCache::new();
+        let mut output = alloc::vec![[0; PAGE_SIZE]; PAGES];
+        let mut data = alloc::vec![[0; PAGE_SIZE]; PAGES];
+        for (index, page) in data.iter_mut().enumerate() {
+            page.fill(index as u8 + 1);
+        }
+        for hits in 0u32..(1 << PAGES) {
+            cache.clear();
+            for (index, page) in data.iter().enumerate() {
+                if hits & (1 << index) != 0 {
+                    cache.insert(71 + index as u64, page);
+                }
+            }
+            output.fill([0; PAGE_SIZE]);
+            let missing = cache.read_span(71, &mut output);
+            // A single request covers every miss, without rereading a cached
+            // prefix/suffix; simulated device bytes must complete the result.
+            for index in 0..PAGES {
+                if hits & (1 << index) == 0 {
+                    assert!(missing.contains(&index));
+                }
+            }
+            if !missing.is_empty() {
+                assert_eq!(hits & (1 << missing.start), 0);
+                assert_eq!(hits & (1 << (missing.end - 1)), 0);
+                output[missing.clone()].copy_from_slice(&data[missing]);
+            }
+            assert_eq!(output, data);
+        }
+        // Mutation invalidation must force just the changed page to media.
+        cache.invalidate(74, 1);
+        assert_eq!(cache.read_span(71, &mut output), 3..4);
+        cache.clear();
+        assert_eq!(cache.read_span(71, &mut output), 0..PAGES);
+        assert!(cache.read_span(71, &mut []).is_empty());
+    }
+
     fn staged() -> MigrationControl {
         MigrationControl {
             state: MigrationState::V2Staged,
@@ -3671,6 +3739,7 @@ mod storage_v2_transition_tests {
 
 #[cfg(feature = "legacy-shell")]
 pub(crate) fn run_storage_v2_transition_selftests() {
+    storage_v2_transition_tests::cached_read_spans_preserve_data_and_bound_command_count();
     storage_v2_transition_tests::stage_retry_accepts_only_exact_old_or_new_selector();
     storage_v2_transition_tests::rollback_requires_exact_staged_evidence_and_source_stream();
     storage_v2_transition_tests::close_preserves_activation_floor_and_accepts_newer_healthy_evidence();
@@ -4354,6 +4423,98 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
         })
     }
 
+    fn read_object_ranges<'a>(
+        &'a self,
+        object: &'a vibeos_object_store::StorageV2ObjectToken,
+        ranges: &'a [(u64, usize)],
+    ) -> vibeos_object_store::StorageV2Future<'a, Vec<Vec<u8>>> {
+        if ranges.len() > 32 {
+            return Box::pin(async { Err(vibeos_object_store::StoreError::ObjectTooLarge) });
+        }
+        let hot = (|| {
+            let installed_current = INSTALLED_V2_RUNTIME
+                .lock()
+                .as_ref()
+                .is_some_and(|runtime| core::ptr::eq(runtime.as_ref(), self));
+            if !installed_current {
+                return Err(vibeos_object_store::StoreError::Corrupt);
+            }
+            let token = object
+                .downcast_ref::<StorageV2ReadToken>()
+                .ok_or(vibeos_object_store::StoreError::ObjectUnavailable)?;
+            let (cached, generation) = match token {
+                StorageV2ReadToken::Persistent {
+                    cached,
+                    authority_generation,
+                    ..
+                }
+                | StorageV2ReadToken::Transient {
+                    cached,
+                    authority_generation,
+                    ..
+                } => (cached, *authority_generation),
+            };
+            match cached.as_ref() {
+                Some(cached) => {
+                    if ranges.is_empty() {
+                        return self.read_hot_range(cached, generation, Some((0, 0)))
+                            .map(|value| value.map(|_| Vec::new()));
+                    }
+                    let mut values = Vec::new();
+                    for &(offset, len) in ranges {
+                        match self.read_hot_range(cached, generation, Some((offset, len)))? {
+                            Some(bytes) => values.push(bytes),
+                            None => return Ok(None),
+                        }
+                    }
+                    Ok(Some(values))
+                }
+                None => Ok(None),
+            }
+        })();
+        match hot {
+            Ok(Some(bytes)) => return Box::pin(async move { Ok(bytes) }),
+            Err(error) => return Box::pin(async move { Err(error) }),
+            Ok(None) => {}
+        }
+        Box::pin(async move {
+            let runtime = INSTALLED_V2_RUNTIME
+                .lock()
+                .as_ref()
+                .filter(|runtime| core::ptr::eq(runtime.as_ref(), self))
+                .cloned()
+                .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            let token = object
+                .downcast_ref::<StorageV2ReadToken>()
+                .ok_or(vibeos_object_store::StoreError::ObjectUnavailable)?;
+            let mut operation = runtime.begin().map_err(map_facade_error)?;
+            let result = match token {
+                StorageV2ReadToken::Persistent { handle, .. } => {
+                    poll_as_system(
+                        operation
+                            .store()
+                            .read_persistent_object_ranges(handle, ranges),
+                    )
+                    .await
+                }
+                StorageV2ReadToken::Transient {
+                    witness, recovered, ..
+                } => {
+                    poll_as_system(
+                        operation
+                            .store()
+                            .read_transient_object_ranges(witness, recovered, ranges),
+                    )
+                    .await
+                }
+            };
+            operation.finish();
+            result
+                .map_err(map_persistent_read_error)
+                .map_err(map_facade_error)
+        })
+    }
+
     fn read_object_range<'a>(
         &'a self,
         object: &'a vibeos_object_store::StorageV2ObjectToken,
@@ -4602,48 +4763,54 @@ impl PageDevice for CapabilityPageDevice {
         if output.is_empty() {
             return Ok(());
         }
-        let all_cached = output
-            .iter_mut()
-            .enumerate()
-            .all(|(index, page)| self.page_cache.get(first_page + index as u64, page));
-        page_cache_account(
-            output.len() as u64,
-            if all_cached { output.len() as u64 } else { 0 },
-        );
-        if all_cached {
-            return Ok(());
-        }
         let first = self.page_range_first_sector(first_page, output.len())?;
-        let lease = self.lease(Rights::READ)?;
-        let session = block_device::range_info_with(&lease)
-            .map_err(PageIoError::Block)?
-            .session();
-        self.require_session(session)?;
+        let mut active_read = None;
         for (chunk_index, chunk) in output.chunks_mut(MAX_PAGES_PER_REQUEST).enumerate() {
             let page_offset = chunk_index
                 .checked_mul(MAX_PAGES_PER_REQUEST)
                 .ok_or(PageIoError::InvalidRange)?;
-            let block_offset = (page_offset as u64)
-                .checked_mul(BLOCKS_PER_PAGE)
+            let chunk_first = first_page
+                .checked_add(page_offset as u64)
                 .ok_or(PageIoError::InvalidRange)?;
-            let block_count = u32::try_from(chunk.len())
+            let missing = self.page_cache.read_span(chunk_first, chunk);
+            page_cache_account(chunk.len() as u64, (chunk.len() - missing.len()) as u64);
+            if missing.is_empty() {
+                continue;
+            }
+            if active_read.is_none() {
+                let lease = self.lease(Rights::READ)?;
+                let session = block_device::range_info_with(&lease)
+                    .map_err(PageIoError::Block)?
+                    .session();
+                self.require_session(session)?;
+                active_read = Some((lease, session));
+            }
+            let (lease, session) = active_read.as_ref().expect("read session initialized");
+            let block_offset = (page_offset as u64)
+                .checked_add(missing.start as u64)
+                .and_then(|offset| offset.checked_mul(BLOCKS_PER_PAGE))
+                .ok_or(PageIoError::InvalidRange)?;
+            let block_count = u32::try_from(missing.len())
                 .ok()
                 .and_then(|count| count.checked_mul(BLOCKS_PER_PAGE as u32))
                 .ok_or(PageIoError::InvalidRange)?;
             block_device::read_blocks_with_session(
-                &lease,
-                session,
+                lease,
+                *session,
                 first
                     .checked_add(block_offset)
                     .ok_or(PageIoError::InvalidRange)?,
                 block_count,
-                chunk.as_flattened_mut(),
+                chunk[missing.clone()].as_flattened_mut(),
             )
             .await
             .map_err(PageIoError::Block)?;
-        }
-        for (index, page) in output.iter().enumerate() {
-            self.page_cache.insert(first_page + index as u64, page);
+            // Publish only the successfully read span. A failed transfer
+            // cannot introduce partially filled pages into the cache.
+            for index in missing {
+                self.page_cache
+                    .insert(chunk_first + index as u64, &chunk[index]);
+            }
         }
         Ok(())
     }

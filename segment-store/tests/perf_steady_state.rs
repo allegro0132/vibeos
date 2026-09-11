@@ -520,6 +520,21 @@ fn large_object_append_and_cold_recover() {
                 "directed read scanned full payload"
             );
         }
+        let ranges = [(128, 4096), (4096 + 128, 32), (4096 + 256, 32),
+                      (8192, 32), (8192, 0)];
+        device.epoch_counters();
+        let separate: Vec<_> = ranges.iter().map(|&(offset, len)|
+            block_on(store.read_persistent_object_range(handle, offset, len)).unwrap()).collect();
+        let separate_io = device.epoch_counters();
+        let batched = block_on(store.read_persistent_object_ranges(handle, &ranges)).unwrap();
+        let batched_io = device.epoch_counters();
+        assert_eq!(batched, separate);
+        assert!(batched_io.read_requests < separate_io.read_requests / 2,
+            "batch repeated resolution: {batched_io:?} vs {separate_io:?}");
+        println!("batch ranges: {} -> {} requests, {} -> {} pages",
+            separate_io.read_requests, batched_io.read_requests, separate_io.reads, batched_io.reads);
+        assert!(block_on(store.read_persistent_object_ranges(handle, &[(0, 1); 33])).is_err());
+        assert!(block_on(store.read_persistent_object_ranges(handle, &[(0, 1), (u64::MAX, 1)])).is_err());
         assert!(block_on(store.read_persistent_object_range(handle, u64::MAX, 1)).is_err());
         assert!(block_on(store.read_persistent_object_range(handle, 1024 * 1024, 1)).is_err());
     }

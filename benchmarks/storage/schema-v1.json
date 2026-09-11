@@ -50,7 +50,17 @@
         "host_cpu": { "type": "string" },
         "host_os": { "type": "string" },
         "qemu_args": { "type": "array", "items": { "type": "string" } },
-        "cache_state": { "enum": ["cold", "warm", "mixed", "unknown"] }
+        "cache_state": { "enum": ["cold", "warm", "mixed", "unknown"] },
+        "storage_throttle": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "read_bps": { "type": "integer", "minimum": 0 },
+            "write_bps": { "type": "integer", "minimum": 0 },
+            "read_iops": { "type": "integer", "minimum": 0 },
+            "write_iops": { "type": "integer", "minimum": 0 }
+          }
+        }
       },
       "additionalProperties": true
     }

@@ -512,3 +512,12 @@ fn one_mib_append_cut_boundaries_recover() {
 fn external_object_append_cut_boundaries_recover() {
     sweep_cut_boundaries_with(2 * 1024 * 1024, 23, true);
 }
+
+/// The ordinary v2 facade now selects external content immediately above
+/// 16 KiB. Exercise both compact and split external CAS layouts at every cut,
+/// not just the formerly external-only multi-megabyte case.
+#[test]
+fn small_external_append_cut_boundaries_recover() {
+    sweep_cut_boundaries_with(16 * 1024 + 1, 1, true);
+    sweep_cut_boundaries_with(128 * 1024, 1, true);
+}

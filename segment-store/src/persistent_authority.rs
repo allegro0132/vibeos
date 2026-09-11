@@ -905,30 +905,20 @@ impl<D: PageDevice> SegmentStore<D> {
         offset: u64,
         len: usize,
     ) -> Result<Vec<u8>, PersistentAuthorityError<D::Error>> {
-        let end = offset
-            .checked_add(len as u64)
-            .filter(|end| *end <= object.exact_len())
-            .ok_or(StoreError::ObjectUnavailable)?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(len)
-            .map_err(|_| StoreError::MemoryLimit)?;
-        // Even an empty range must validate the handle's current authority.
-        let leaf_size = vibeos_blob_format::LEAF_SIZE as u64;
-        let first = if len == 0 { 0 } else { offset / leaf_size };
-        let last = if len == 0 { 0 } else { (end - 1) / leaf_size };
-        for index in first..=last {
-            let chunk = self
-                .get_blob_chunk(object.object.as_ref(), index as u32)
-                .await?;
-            if len != 0 {
-                let base = index * leaf_size;
-                let start = offset.saturating_sub(base) as usize;
-                let stop = (end - base).min(chunk.bytes.len() as u64) as usize;
-                bytes.extend_from_slice(&chunk.bytes[start..stop]);
-            }
-        }
-        Ok(bytes)
+        let mut ranges = self
+            .read_persistent_object_ranges(object, &[(offset, len)])
+            .await?;
+        Ok(ranges.pop().expect("one requested range"))
+    }
+
+    pub async fn read_persistent_object_ranges(
+        &self,
+        object: &PersistentObjectHandle,
+        ranges: &[(u64, usize)],
+    ) -> Result<Vec<Vec<u8>>, PersistentAuthorityError<D::Error>> {
+        self.read_blob_ranges(object.object.as_ref(), ranges)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn read_transient_object_range(
@@ -942,6 +932,18 @@ impl<D: PageDevice> SegmentStore<D> {
             .object_for_recovered(recovered)
             .ok_or(StoreError::ObjectUnavailable)?;
         self.read_persistent_object_range(object, offset, len).await
+    }
+
+    pub async fn read_transient_object_ranges(
+        &self,
+        witness: &PersistentAuthorityTransientObjects,
+        recovered: &vibeos_durable_format::RecoveredObject,
+        ranges: &[(u64, usize)],
+    ) -> Result<Vec<Vec<u8>>, PersistentAuthorityError<D::Error>> {
+        let object = witness
+            .object_for_recovered(recovered)
+            .ok_or(StoreError::ObjectUnavailable)?;
+        self.read_persistent_object_ranges(object, ranges).await
     }
 
     /// Read an object obtained from this append result. The logical recovered

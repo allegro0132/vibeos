@@ -92,6 +92,12 @@ def validate_record(record: dict[str, Any]) -> None:
     for key in ("git_commit", "qemu_version", "qemu_args", "cache_state"):
         require(key in environment, f"environment.{key} is missing")
     require(isinstance(environment["qemu_args"], list), "environment.qemu_args must be an array")
+    if "storage_throttle" in environment:
+        profile = environment["storage_throttle"]
+        require(isinstance(profile, dict) and set(profile) <= set(THROTTLE_FIELDS),
+                "invalid storage throttle profile")
+        require(all(type(value) is int and value >= 0 for value in profile.values()),
+                "invalid storage throttle rate")
     if record["status"] == "ok":
         require(any(name in record["metrics"] for name in TIMED_METRICS),
                 "ok record has no timed metric")
@@ -154,6 +160,22 @@ def file_sha256(path: Path) -> str:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+THROTTLE_FIELDS = {"read_bps": "bps_rd", "write_bps": "bps_wr",
+                   "read_iops": "iops_rd", "write_iops": "iops_wr"}
+
+
+def storage_throttle(args: argparse.Namespace) -> dict[str, int]:
+    profile = {name: getattr(args, name, 0) for name in THROTTLE_FIELDS}
+    require(all(type(value) is int and value >= 0 for value in profile.values()),
+            "storage bandwidth/IOPS limits must be non-negative integers")
+    return profile
+
+
+def throttle_drive_options(args: argparse.Namespace) -> str:
+    return "".join(f",{THROTTLE_FIELDS[name]}={value}"
+                   for name, value in storage_throttle(args).items() if value)
 
 
 def environment(qemu_args: list[str], qemu_version: str) -> dict[str, Any]:
@@ -369,6 +391,7 @@ def guest_record_from(data: bytes) -> dict[str, Any]:
 
 
 def run_vibeos(args: argparse.Namespace) -> int:
+    throttle_options = throttle_drive_options(args)
     kernel = args.kernel.resolve()
     require(kernel.is_file(), f"kernel not found: {kernel}")
     qemu_version = subprocess.run([args.qemu, "--version"], check=True, text=True,
@@ -389,11 +412,12 @@ def run_vibeos(args: argparse.Namespace) -> int:
                     args.qemu, "-machine", "virt", "-cpu", "rv64", "-smp", "1", "-m", "512M",
                     "-accel", "tcg,thread=single", "-nographic", "-bios", "default",
                     "-kernel", str(kernel), "-drive",
-                    f"if=none,id=bench-disk,format=raw,file={disk},cache=none,aio=threads",
+                    f"if=none,id=bench-disk,format=raw,file={disk},cache=none,aio=threads{throttle_options}",
                     "-device", "virtio-blk-device,drive=bench-disk,bus=virtio-mmio-bus.0,queue-size=128",
                     "-global", "virtio-mmio.force-legacy=false",
                 ]
                 env = environment(qemu_args, qemu_version)
+                env["storage_throttle"] = storage_throttle(args)
                 env.update(artifact_hashes)
                 process = subprocess.Popen(qemu_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=subprocess.STDOUT)
@@ -458,6 +482,7 @@ def run_vibeos(args: argparse.Namespace) -> int:
 
 
 def run_linux(args: argparse.Namespace) -> int:
+    throttle_options = throttle_drive_options(args)
     for path in (args.root_image, args.firmware_code, args.firmware_vars,
                  args.agent, args.data_image):
         require(path.is_file(), f"guest artifact not found: {path}")
@@ -491,11 +516,12 @@ def run_linux(args: argparse.Namespace) -> int:
                     "-drive", f"if=pflash,format=raw,unit=1,file={variables}",
                     "-drive", f"if=none,id=root,format=qcow2,file={root},cache=none,aio=threads",
                     "-device", "virtio-blk-device,drive=root,queue-size=128,serial=debian-root",
-                    "-drive", f"if=none,id=bench-disk,format=raw,file={disk},cache=none,aio=threads",
+                    "-drive", f"if=none,id=bench-disk,format=raw,file={disk},cache=none,aio=threads{throttle_options}",
                     "-device", "virtio-blk-device,drive=bench-disk,queue-size=128,serial=vibeos-bench-data",
                     "-virtfs", f"local,path={args.agent.resolve().parent},mount_tag=bench,security_model=none,readonly=on",
                 ]
                 env = environment(qemu_args, qemu_version)
+                env["storage_throttle"] = storage_throttle(args)
                 env.update({"linux_version": args.linux_version,
                             "debian_release": args.debian_release})
                 env.update(artifact_hashes)
@@ -646,11 +672,23 @@ def coordinate(record: dict[str, Any], metric: str) -> tuple[Any, ...]:
 
 def summaries(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    profiles: dict[tuple[Any, ...], tuple[int, ...]] = {}
     for record in records:
         if record["warmup"] or record["status"] != "ok":
             continue
         for metric, value in record["metrics"].items():
-            groups[coordinate(record, metric)].append(float(value))
+            key = coordinate(record, metric)
+            profile = record["environment"].get("storage_throttle", {})
+            require(isinstance(profile, dict), "invalid storage throttle profile")
+            signature = tuple(profile.get(name, 0) for name in THROTTLE_FIELDS)
+            require(all(type(value) is int and value >= 0 for value in signature),
+                    "invalid storage throttle profile")
+            # Exclude backend so Linux/VibeOS comparisons also require the
+            # same limits for an otherwise identical workload coordinate.
+            shared_key = key[1:]
+            require(profiles.setdefault(shared_key, signature) == signature,
+                    "incompatible storage throttle profiles for the same coordinate")
+            groups[key].append(float(value))
     result = []
     for key, values in sorted(groups.items(), key=lambda item: str(item[0])):
         mean = statistics.fmean(values)
@@ -696,6 +734,9 @@ def compare(records: list[dict[str, Any]]) -> tuple[bool, list[dict[str, Any]]]:
 
 def require_baseline_evidence(records: list[dict[str, Any]], manifest_path: Path,
                               evidence_path: Path) -> None:
+    require(all(not any(record["environment"].get("storage_throttle", {}).values())
+                for record in records),
+            "rate-limited exploratory runs cannot replace the unthrottled v1 baseline")
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     require(isinstance(evidence, dict) and evidence.get("status") == "ok",
             "correctness evidence is not ok")
@@ -808,6 +849,10 @@ def main() -> int:
     linux.add_argument("--boot-timeout", type=float, default=300)
     linux.add_argument("--sample-timeout", type=float, default=900)
     linux.add_argument("--overwrite", action="store_true")
+    for runner in (run, linux):
+        for flag in THROTTLE_FIELDS:
+            runner.add_argument("--" + flag.replace("_", "-"), type=int, default=0,
+                                help="benchmark disk rate limit; 0 leaves it unlimited")
     provision = subparsers.add_parser("provision-debian")
     provision.add_argument("--base-image", type=Path, required=True)
     provision.add_argument("--firmware-code", type=Path, required=True)

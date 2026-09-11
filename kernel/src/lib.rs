@@ -939,10 +939,11 @@ compile_error!(
 compile_error!(
     "the C5.4c native revoke gate and standard formal-native SSH gate are isolated images"
 );
-// Provider qualification is distinct from enabling the reusable SSH service.
+// Provider selection is distinct from enabling the reusable SSH service.
+// Queued sources must also pass firmware approval at endpoint discovery.
 #[cfg(all(feature = "jitter-entropy", not(feature = "milkv-duo")))]
 compile_error!("jitter-entropy is restricted to the existing Duo configuration");
-#[cfg(all(feature = "provisioned-ssh", not(any(feature = "qemu-virt", feature = "jitter-entropy"))))]
+#[cfg(all(feature = "provisioned-ssh", not(any(feature = "queued-entropy", feature = "jitter-entropy"))))]
 compile_error!("provisioned-ssh requires an explicitly selected entropy provider");
 #[cfg(all(feature = "jitter-entropy", feature = "queued-entropy"))]
 compile_error!("select exactly one entropy provider");

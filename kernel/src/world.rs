@@ -486,6 +486,8 @@ pub(crate) fn fault_probe_drop_count() -> u64 {
 pub struct World {
     pub spaces: BTreeMap<&'static str, Arc<Space>>,
     components: SpinLock<BTreeMap<ComponentId, Arc<Component>>>,
+    /// Image-policy expectation captured before any component is registered.
+    pub(crate) expected_boot_components: usize,
     /// init's handles onto everything it created.
     pub console: Cap,
     #[cfg(not(feature = "legacy-shell"))]
@@ -621,13 +623,6 @@ struct StoreBlockGrants {
 }
 
 impl World {
-    /// Discovery state, independent of whether the supervised driver is online.
-    pub(crate) fn entropy_driver_present(&self) -> bool {
-        #[cfg(feature = "queued-entropy")]
-        { self.rng_mmio.is_some() }
-        #[cfg(not(feature = "queued-entropy"))]
-        { false }
-    }
     /// Hand the C7.4 supervisor its already-provisioned journal endpoint
     /// through init's explicit store authority. The acceptance task receives
     /// no `Cap`, CSpace, object name, or durable identity; it can only request
@@ -3134,7 +3129,31 @@ pub fn build() {
         spaces.insert("saved-program", space.clone());
     }
 
+    // Count planned component spaces before registration. Client grants (such
+    // as init's net_control) may be withheld by a service image and cannot be
+    // used to infer whether its driver or IPv4/SSH service was discovered.
+    let expected_boot_components = 4 + usize::from(block_space.is_some())
+        + usize::from(net_space.is_some());
+    #[cfg(feature = "milkv-duo")]
+    let expected_boot_components = expected_boot_components + usize::from(usb_net_space.is_some());
+    #[cfg(feature = "queued-entropy")]
+    let expected_boot_components = expected_boot_components + usize::from(rng_space.is_some());
+    #[cfg(feature = "ssh-security-test")]
+    let expected_boot_components = expected_boot_components + usize::from(ssh_security_test_space.is_some());
+    #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
+    let expected_boot_components = expected_boot_components + usize::from(ssh_test_space.is_some());
+    #[cfg(feature = "provisioned-ssh")]
+    let expected_boot_components = expected_boot_components + usize::from(ssh_production_space.is_some());
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell", feature = "ssh-test",
+        feature = "milkv-ssh-acceptance", feature = "provisioned-ssh",
+        feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
+    let expected_boot_components = expected_boot_components + usize::from(ipv4_stack_space.is_some());
+    #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
+    let expected_boot_components = expected_boot_components + usize::from(tcp_echo_app_space.is_some());
+    #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
+    let expected_boot_components = expected_boot_components + usize::from(iperf3_app_space.is_some());
     let world = Arc::new(World {
+        expected_boot_components,
         spaces,
         components: SpinLock::new(BTreeMap::new()),
         console: c_console,

@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+ssh-composition-test = ["vibeos-kernel/provisioned-ssh"]
 mars-entropy-composition-test = ["trng-model-test", "vibeos-kernel/queued-entropy"]
 entropy-diagnostic-only = ["entropy-composition-test"]
 entropy-composition-test = ["vibeos-kernel/queued-entropy", "dep:vibeos-driver-virtio-rng"]

@@ -1,0 +1,178 @@
+{
+  "status": "Provisioned SSH composes with generic entropy; native diagnostics cannot publish SSH",
+  "independent_kernel_features": [
+    "boot-dtb-probe",
+    "legacy-shell",
+    "provisioned-ssh",
+    "qemu-default-image",
+    "queued-block",
+    "queued-entropy",
+    "queued-network",
+    "ssh-component-command"
+  ],
+  "approved_qemu": {
+    "status": "passed",
+    "boots": 2,
+    "harts": 4,
+    "selftests_per_boot": 395,
+    "host_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIL6TngKjVF7oA7QSKF9Z7P8CoubLZNOTLQsy7FBib5fb",
+    "identity_persisted": true,
+    "authentication_tested": false,
+    "wasm_tested": false,
+    "physical_acceptance": false,
+    "kernel_sha256": "8fb00f39f3eb60979422730e89e1c2bf74415aeea3778a2efc89ebaa988c88d1"
+  },
+  "diagnostic_qemu": {
+    "network_operational": true,
+    "random_capability_published": false,
+    "ssh_capability_published": false,
+    "components": 6,
+    "harts": 4,
+    "selftests": 395
+  },
+  "regression_fixed": "Selftest inferred driver presence from init client grants and omitted service components",
+  "mutation": "Old QEMU-only provider condition rejects independent composition",
+  "missing_provider_configuration": "rejected by explicit compile guard",
+  "compatibility": {
+    "duo_default_target_check": "passed",
+    "qemu_existing_security_two_boot_regression": "passed",
+    "mars_elf_check": {
+      "status": "elf-contract-passed",
+      "entry": 1075838976,
+      "heap_start": 1095581696,
+      "heap_end": 5368709120,
+      "elf_sha256": "d7ff280001ae9e85899df9cb32407661de0012d7cd05fd450022ebf758f39eb2",
+      "loads": [
+        {
+          "address": 1075838976,
+          "file_bytes": 3059712,
+          "memory_bytes": 3059712,
+          "flags": 5
+        },
+        {
+          "address": 1078898688,
+          "file_bytes": 438272,
+          "memory_bytes": 438272,
+          "flags": 4
+        },
+        {
+          "address": 1079336960,
+          "file_bytes": 52976,
+          "memory_bytes": 15196160,
+          "flags": 6
+        }
+      ],
+      "physical_acceptance": false,
+      "flashable_sd_image": false,
+      "eqos_dma": {
+        "base": 1088139264,
+        "bytes": 102400,
+        "address_bits": 32,
+        "cache_line_bytes": 64
+      }
+    }
+  },
+  "physical_acceptance": false,
+  "mars_ssh_enabled": false,
+  "sd_images_rebuilt": false,
+  "limitations": [
+    "Successful authentication and WASM not tested by the new handshake harness",
+    "QEMU RNG assumes trusted host /dev/urandom",
+    "No physical Mars entropy qualification or production identity handoff",
+    "The stage-54 SD image predates this generic service change"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage55-approved-build.log",
+      "sha256": "069bcbc6e41b3139f2ea2ab6515868f92a916bf75d0854572ed1ce351a39aa2c"
+    },
+    {
+      "path": "target/mars-reference/stage55-approved-test-v2.log",
+      "sha256": "fd359d3f996b235f95f03fda6aa9f58c27b713709a2d439ebc6e6ea555f572cb"
+    },
+    {
+      "path": "target/mars-reference/stage55-approved-test-v3.log",
+      "sha256": "f750c49f1b5fdce19a90a2b49a34bf98accb0a0fa0e0b4bdd0732a1a3e16f544"
+    },
+    {
+      "path": "target/mars-reference/stage55-approved-test.log",
+      "sha256": "2785f33f42acc0cde32f9266a689ed9989607d793d318ca227332dda5cce3296"
+    },
+    {
+      "path": "target/mars-reference/stage55-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage55-compatible-test.log",
+      "sha256": "d9bfd3b52fbe4bcf06d2bea8a7fc0aeaa68217e1be01547c0bceb117a08636f7"
+    },
+    {
+      "path": "target/mars-reference/stage55-diagnostic-build.log",
+      "sha256": "8f65473a2556b2496336fda5daf5c69eb80d2e9c4f6ae6d6e2aafba688113aa0"
+    },
+    {
+      "path": "target/mars-reference/stage55-duo-check.log",
+      "sha256": "f3fedcdda35f3afb215aecdc11c34e28de85365ba5954e0dc890adf74287e3b4"
+    },
+    {
+      "path": "target/mars-reference/stage55-features.log",
+      "sha256": "f9a914ba3532a00d2eea95e59e36ec546476db06957665c98b0fc4f3369c5b50"
+    },
+    {
+      "path": "target/mars-reference/stage55-mars-build.log",
+      "sha256": "b1d1f0b7d62c999212103d67f2f78b78a6fcccf8f6bfc735a6a5cf1f40644bc1"
+    },
+    {
+      "path": "target/mars-reference/stage55-missing-provider.log",
+      "sha256": "621d0d9849ff2830d67a170e7d76d765cb185a4b92a132e6b5a8ebc57bcf1868"
+    },
+    {
+      "path": "target/mars-reference/stage55-mutation-board-gate.log",
+      "sha256": "3b06ffe77d52695ea9cb24c13565fcb07d2adb18522b2e5340d578f0842291bb"
+    },
+    {
+      "path": "target/mars-reference/stage55-withheld-fixed-build.log",
+      "sha256": "aef0741932d6afe15652d52dcb275d6f105094fdd0540d9e961d759105190b3b"
+    },
+    {
+      "path": "target/mars-reference/stage55-withheld-fixed-runtime.log",
+      "sha256": "709be97c84a058140017b0ee4872823ccd4bb479b2e5c5196156a49a06fcb535"
+    },
+    {
+      "path": "target/mars-reference/stage55-withheld-runtime.log",
+      "sha256": "14a6c43fcf01cd16473b1ed38eaf4c6ffb9ad96b41d3bbc971cce6b6bd52a4e4"
+    },
+    {
+      "path": "target/mars-reference/stage55-approved-runtime-v2/boot-1.log",
+      "sha256": "66df69613fa2c4d7ddf08b35f58b0fc873ef8da7b6cd83181c6529019b371628"
+    },
+    {
+      "path": "target/mars-reference/stage55-approved-runtime-v2/keyscan-1.log",
+      "sha256": "24cf1dcf3e8c180a8c9e0c5064a4333fbdb0bdbb290c1a535fed6835106689fd"
+    },
+    {
+      "path": "target/mars-reference/stage55-approved-runtime-v3/boot-1.log",
+      "sha256": "c8d9084e21051eed56088bbd711e29a478b7a022552ddba9f1279b978a1378b4"
+    },
+    {
+      "path": "target/mars-reference/stage55-approved-runtime-v3/boot-2.log",
+      "sha256": "f7ac48ec6fc67702517f85d0964308fbcc8e2ec9ed60ad241917d9efb2ec09c7"
+    },
+    {
+      "path": "target/mars-reference/stage55-approved-runtime-v3/handshake-1.log",
+      "sha256": "9fc7d94ca7d12e3e96f71ee9155fb58e0a8cfdad36d8bec4d3481e696bfd2b9e"
+    },
+    {
+      "path": "target/mars-reference/stage55-approved-runtime-v3/handshake-2.log",
+      "sha256": "2d18d3da08476e18ba4a8c784f5f6bc30b41c25e7dc4aba47a5f48f1a2fab0a1"
+    },
+    {
+      "path": "target/mars-reference/stage55-compatible/boot-1.log",
+      "sha256": "7f67f2128812a57c690cf9f9a96c7129f7b19dcb3fe1193c5945f9ba7cab334e"
+    },
+    {
+      "path": "target/mars-reference/stage55-compatible/boot-2.log",
+      "sha256": "b4935568740916258ba925e83910d9ed6bf7370c3efdf9632a5fbd72b70f5ca1"
+    }
+  ]
+}

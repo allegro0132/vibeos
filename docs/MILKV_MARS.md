@@ -1559,3 +1559,45 @@ artifacts pass. A mutation restoring same-filename-only protection is caught.
 Evidence: `boards/milkv-mars/sd-stage54-evidence.json`. Physical cold starts,
 SD persistence, network/DMA behavior, qualified entropy, production SSH/WASM
 and the one-hour stability run remain outstanding.
+
+### Provisioned SSH uses the generic entropy selection (stage 55)
+
+`provisioned-ssh` now requires `queued-entropy` or the existing Duo jitter
+provider, rather than requiring the QEMU board switch. Queued source admission
+still rejects `DiagnosticOnly` endpoints before capabilities are minted; the
+SSH service is created only when both network and admitted entropy resources
+exist. No source-selection feature grants entropy approval. The Mars diagnostic
+profile and stage-54 SD image continue to have SSH disabled.
+
+Independent QEMU HAL firmware compiled with
+`boot-admission-test,ssh-composition-test,entropy-composition-test` performs
+provisioning on an isolated 128 MiB virtual disk using host `/dev/urandom`. Two
+four-hart boots pass all 395 kernel selftests and a normal OpenSSH client
+observes the same Ed25519 public host key across reboot. The client completes
+the transport handshake and deliberately offers no authentication credentials.
+This checks persisted identity and transport, not successful login, WASM, Mars
+entropy quality or production identity configuration. The test disk is disposable.
+Reproduce with `python3 scripts/qemu-provisioned-composition-test.py --kernel PATH
+--output UNUSED_DIRECTORY` after building that firmware from its package directory.
+
+With `mars-entropy-composition-test` instead of the VirtIO entropy provider, a
+real QEMU NIC is operational but the modeled native diagnostic source produces
+neither a random capability nor an SSH service; all 395 checks pass. Restoring
+the old QEMU-only compile condition fails independent composition. Omitting
+all entropy providers is still rejected by the explicit compile guard.
+
+The service image exposed a selftest counting defect: init's network grant
+may be withheld while a supervised network driver and IPv4 stack are present.
+The expectation is now captured from planned component spaces before any
+registration, including optional services, and compared with actual registered
+components. The negative image has six components and the provisioned image
+has nine; both match their independently captured plans.
+
+The first keyscan-only harness could not negotiate the server's required strict
+KEX. It was replaced by a normal OpenSSH client without changing server protocol
+requirements. The first socket attempt was denied by the host sandbox; the
+completed localhost-only test ran with permission. These failed attempts are
+retained alongside passing evidence. Duo default target checking, Mars Ethernet/
+TRNG ELF construction and the existing QEMU security regression remain valid.
+Evidence: `boards/milkv-mars/ssh-entropy-composition-evidence.json`. No SD image
+was repacked in this stage.

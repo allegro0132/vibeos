@@ -10,17 +10,21 @@ import subprocess
 root = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--ethernet', action='store_true')
+parser.add_argument('--trng-probe', action='store_true')
 args = parser.parse_args()
-out = root / ('target/mars-boot-ethernet/out' if args.ethernet else 'target/mars-boot/out')
-payload_dir = root / ('target/milkv-mars/ethernet' if args.ethernet else 'target/milkv-mars/bringup')
+suffix = '-trng-probe' if args.trng_probe else ''
+out = root / (('target/mars-boot-ethernet' if args.ethernet else 'target/mars-boot') + suffix) / 'out'
+payload_dir = root / (('target/milkv-mars/ethernet' if args.ethernet else 'target/milkv-mars/bringup') + suffix)
 payload = json.loads((payload_dir / 'manifest.json').read_text())
-image = 'mars-ethernet-sd.img' if args.ethernet else 'mars-serial-sd.img'
+image = ('mars-ethernet' if args.ethernet else 'mars-serial') + suffix + '-sd.img'
 sdk = json.loads((root / 'boards/milkv-mars/resource-reference.json').read_text())
 spec = importlib.util.spec_from_file_location('sd', root / 'scripts/mars-sd-image.py')
 sd = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sd)
 report = sd.inspect(out / image, out / 'artifacts')
 sd.require(payload['network_available'] == args.ethernet, 'payload network profile')
+sd.require(payload.get('trng_boot_probe', False) == args.trng_probe, 'payload TRNG profile')
+sd.require(payload.get('entropy_qualified', False) is False, 'test entropy must remain unqualified')
 sd.require(payload['ssh_enabled'] is False, 'test profile must not enable SSH')
 sd.require(payload['sd_data_first_sector'] == report['partitions'][3]['first_sector'], 'firmware data offset')
 sd.require(payload['sd_data_sector_count'] == report['partitions'][3]['sector_count'], 'firmware data capacity')
@@ -43,6 +47,7 @@ for name, expected in bootcheck['checked_sha256'].items():
 manifest = {
     'profile': payload['profile'],
     'flashable_sd_image': True,
+    'trng_boot_probe': args.trng_probe, 'entropy_qualified': False,
     'physical_acceptance': False,
     'network_available': args.ethernet, 'network_hardware_verified': False,
     'network_services': payload.get('network_services', []), 'ssh_enabled': False,

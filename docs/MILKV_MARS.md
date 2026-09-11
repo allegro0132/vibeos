@@ -1270,3 +1270,21 @@ profile; neither existing test SD image was replaced. Software evidence is in
 `boards/milkv-mars/trng-composition-evidence.json`. QEMU continues to exercise
 the driver/platform models and normal boot regression, not the physical Mars
 diagnostic entry. No physical SEC handoff or TRNG result has been observed.
+
+### Diagnostic SD packaging
+
+The SD builder, container packer and manifest checker now accept `--trng-probe`
+alongside optional `--ethernet`. All four profiles have separate image names,
+payload directories and bootchain output directories. The manifest checker
+rejects mismatched TRNG/network metadata and any claim of qualified entropy in
+these test images. The existing GPT geometry and boot/data separation remain
+unchanged. Output overwrite is rejected before fetching/building.
+
+The combined Ethernet/TRNG diagnostic image was built with the paired pinned
+SPL/OpenSBI/U-Boot chain and checked as a 641 MiB image. Bootchain corruption
+tests, SD geometry tests and three manifest profile mutations pass. Build and
+hash evidence is in `boards/milkv-mars/trng-sd-evidence.json`; the artifact and
+usage are documented in `firmware/milkv-mars/bootchain/README.md`.
+This supersedes the earlier diagnostic-payload-only packaging limitation.
+The image is suitable for the planned test SD card, but no physical boot,
+SEC handoff, entropy, SSH or full stability qualification is claimed.

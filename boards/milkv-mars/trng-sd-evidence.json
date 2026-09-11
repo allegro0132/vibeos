@@ -1,0 +1,115 @@
+{
+  "status": "Diagnostic SD image assembled and checked; physical acceptance pending",
+  "image": {
+    "path": "target/mars-boot-ethernet-trng-probe/out/mars-ethernet-trng-probe-sd.img",
+    "bytes": 672137216,
+    "sha256": "5f9545cc84b34ee583f8194ff06e0fa999c7d0fa1494c9bbd82d575423f591ba"
+  },
+  "sdk_commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+  "sd_check": {
+    "status": "sd-layout-passed",
+    "bytes": 672137216,
+    "sha256": "5f9545cc84b34ee583f8194ff06e0fa999c7d0fa1494c9bbd82d575423f591ba",
+    "physical_acceptance": false,
+    "ssh_enabled": false,
+    "partitions": [
+      {
+        "name": "spl",
+        "first_sector": 4096,
+        "sector_count": 4096
+      },
+      {
+        "name": "uboot",
+        "first_sector": 8192,
+        "sector_count": 8192
+      },
+      {
+        "name": "boot",
+        "first_sector": 16384,
+        "sector_count": 245760
+      },
+      {
+        "name": "vibeos-data",
+        "first_sector": 262144,
+        "sector_count": 1048576
+      }
+    ]
+  },
+  "bootchain_check": {
+    "status": "bootchain-contract-passed",
+    "opensbi": "1.2",
+    "uboot": "2021.10",
+    "sbi_extensions_built": [
+      "TIME",
+      "IPI",
+      "RFENCE",
+      "HSM"
+    ],
+    "spi_environment": false,
+    "physical_acceptance": false,
+    "checked_sha256": {
+      "u-boot-spl.bin.normal.out": "b05d699c43f1fa87303a5d675e98f2fb0a8d8ac3ae4e39a1a9b35f19be78c326",
+      "fw_payload.bin": "260c38e5212c8d81268e5ec79a902a07ba09ddc9a74a2a77c6bb25b0df439e0a",
+      "uboot.config": "b2e7f0d1a3ef9c8693c43b5731e1234ac0d3e9a4e78cdec7b1ea98fbdee472cb",
+      "opensbi.config": "d83376c0e8b3813285f0f83f827e419df79826bef22b0b9d3634c919b98ccef5",
+      "firmware.itb": "dde3fd4a7c2c0c2af9de9898e64bed5c98c9ed4268aac47a9ad4b5b794627afa",
+      "vibeos.itb": "e617f12413efe7c2907edadca66d6d81d4ba485d87b892a21e89d06dc8a82a27",
+      "vibeos.bin": "306c2f82059626729904562f5dfb03508c7a9a65c68277c9f34470c3d9b6e7c2",
+      "mars.dtb": "f0224b4b1b6bfba25cfc81a0403804a4b7851af1a2bb385b01c9a880025c8b3d"
+    }
+  },
+  "tests": {
+    "sd_tests": 5,
+    "real_bootchain_tests": 2,
+    "profile_mutations": [
+      "TRNG flag mismatch",
+      "entropy qualification claim",
+      "network flag mismatch"
+    ],
+    "overwrite_refusal": "passed",
+    "prior_sd_image_hashes": "unchanged"
+  },
+  "physical_acceptance": false,
+  "entropy_qualified": false,
+  "ssh_enabled": false,
+  "blind_spots": [
+    "No physical boot or SEC handoff has been observed",
+    "TRNG protocol diagnosis is not entropy qualification",
+    "Serial collector still requires manual review of TRNG marker",
+    "Full persistence, SSH/WASM and three-cold-boot/one-hour stability acceptance remain pending"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage44-bootchain-tests.log",
+      "sha256": "188b408a64f26e077a165fd3c2a5fea6cd582f1b68fe093f3813ad511d79d3ac"
+    },
+    {
+      "path": "target/mars-reference/stage44-manifest-check.log",
+      "sha256": "050e1e08b929aaf3614c67eae788c586d8e8e7d0fea4329532a9bc0ab1db9789"
+    },
+    {
+      "path": "target/mars-reference/stage44-mutation-entropy.log",
+      "sha256": "651a9ff96e4004fee394d7b4bdb7e1728839417ff9bd4589c49783efce924a0c"
+    },
+    {
+      "path": "target/mars-reference/stage44-mutation-network.log",
+      "sha256": "55218678de766f25d8f6494ff174faaac8e9ec3c2a759253c2752c3fcdc51781"
+    },
+    {
+      "path": "target/mars-reference/stage44-mutation-trng.log",
+      "sha256": "f34d851045a29a9f7f342de56b7b007e7b928d2b20306cca10d9c06f4ce61b1d"
+    },
+    {
+      "path": "target/mars-reference/stage44-overwrite-test.log",
+      "sha256": "403364e0d19600b35a44de376a8888fae0a765dd4f5c42e8109c2125e2f731b8"
+    },
+    {
+      "path": "target/mars-reference/stage44-sd-build.log",
+      "sha256": "52440f47a16e48b6c21b2a6af73816c9c948cf67ef32b6c1478f27f5d05a08cf"
+    },
+    {
+      "path": "target/mars-reference/stage44-sd-tests.log",
+      "sha256": "e440b1a2c718e700b17b5a2eec20a6ffe1c7bbe43f571ba178d72a1d775dbaaa"
+    }
+  ]
+}

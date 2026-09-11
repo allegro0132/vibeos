@@ -1,12 +1,16 @@
 #!/bin/sh
 set -eu
-image=mars-serial-sd.img
-if [ "$#" -eq 1 ] && [ "$1" = --ethernet ]; then
-    image=mars-ethernet-sd.img
-elif [ "$#" -ne 0 ]; then
-    echo 'usage: package.sh [--ethernet]' >&2
-    exit 2
-fi
+profile=serial
+trng=0
+for arg in "$@"; do
+    case "$arg" in
+        --ethernet) [ "$profile" = serial ] || exit 2; profile=ethernet ;;
+        --trng-probe) [ "$trng" -eq 0 ] || exit 2; trng=1 ;;
+        *) echo 'usage: package.sh [--ethernet] [--trng-probe]' >&2; exit 2 ;;
+    esac
+done
+if [ "$trng" -eq 1 ]; then profile="$profile-trng-probe"; fi
+image="mars-$profile-sd.img"
 export SOURCE_DATE_EPOCH=1711929600
 sdk=/work/sdk
 out=/work/out/artifacts

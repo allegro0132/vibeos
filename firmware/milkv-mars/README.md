@@ -42,8 +42,9 @@ directory. Before secondary harts/services, it admits the TRNG DTB resource,
 suppresses its PLIC priority, reads the parent clock, prepares the shared SEC
 domain, reads two conditioned blocks and confirms stop. Failure logs the stage
 and halts; success says `protocol-observed` and `entropy=unqualified`.
-No random capability or SSH is enabled. This is currently a payload build;
-`build-mars-sd.sh` does not yet accept the diagnostic option.
+No random capability or SSH is enabled. To package the corresponding SD image,
+run `sh scripts/build-mars-sd.sh --trng-probe` with the same optional
+`--ethernet` flag. Diagnostic images use separate output directories and names.
 
 The probe requires the paired boot firmware to have relinquished all SEC
 clients, including crypto/security DMA, and stable shared clocks through stop.

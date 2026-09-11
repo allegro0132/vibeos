@@ -2,12 +2,14 @@
 # Produces a test SD image file; never writes a physical disk or board SPI.
 set -eu
 profile=serial
-if [ "$#" -eq 1 ] && [ "$1" = --ethernet ]; then
-    profile=ethernet
-elif [ "$#" -ne 0 ]; then
-    echo 'usage: build-mars-sd.sh [--ethernet]' >&2
-    exit 2
-fi
+trng=0
+for arg in "$@"; do
+    case "$arg" in
+        --ethernet) [ "$profile" = serial ] || exit 2; profile=ethernet ;;
+        --trng-probe) [ "$trng" -eq 0 ] || exit 2; trng=1 ;;
+        *) echo 'usage: build-mars-sd.sh [--ethernet] [--trng-probe]' >&2; exit 2 ;;
+    esac
+done
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 sdk_commit=1fd6bac9f2efde47fbb8afd28d2903c49f893e3f
@@ -17,6 +19,11 @@ payload=bringup
 if [ "$profile" = ethernet ]; then
     work="$root/target/mars-boot-ethernet"
     payload=ethernet
+fi
+if [ "$trng" -eq 1 ]; then
+    work="$work-trng-probe"
+    payload="$payload-trng-probe"
+    profile="$profile-trng-probe"
 fi
 image="mars-$profile-sd.img"
 if [ -e "$work/out/$image" ]; then

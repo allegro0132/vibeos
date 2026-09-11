@@ -80,6 +80,31 @@ These do not execute Mars ROM, DDR, MMIO, cache operations or firmware handoff.
 
 ## Passive serial evidence capture
 
+For the TRNG control-path diagnostic plus Ethernet, build with:
+
+```sh
+sh scripts/build-mars-sd.sh --ethernet --trng-probe
+```
+
+The image is
+`target/mars-boot-ethernet-trng-probe/out/mars-ethernet-trng-probe-sd.img`,
+with `manifest.json` and `SHA256SUMS` alongside it. It retains the same 641 MiB
+GPT layout and data-only block capability. Existing images are not overwritten;
+the command refuses an existing output image before fetching or building.
+Omit `--ethernet` for the separate serial diagnostic profile.
+
+The first generated combined diagnostic image has SHA-256
+`5f9545cc84b34ee583f8194ff06e0fa999c7d0fa1494c9bbd82d575423f591ba`.
+This is a test image with DHCP/iperf3 and no SSH. Review the SEC handoff
+prerequisite in the [firmware instructions](../README.md). The probe runs before
+normal boot reporting; expect either `MARS_TRNG_PROBE protocol-observed` with
+`blocks=2 stopped=true entropy=unqualified`, or a failure message followed by
+shutdown. Neither message establishes entropy quality. No physical boot of
+this image has been observed yet; capture its complete serial log.
+
+The following collector preserves the diagnostic line, but its success gates
+currently check normal boot markers only. Inspect the TRNG line separately.
+
 Use a separate terminal for each planned cold boot, with the actual port and
 operator-checked board revision supplied explicitly:
 

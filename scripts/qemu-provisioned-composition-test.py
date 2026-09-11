@@ -43,7 +43,14 @@ def boot(kernel, output, disk, number, modules=None, expected_key=None, wasmtime
             '-device', 'virtio-net-device,netdev=net0'],
             stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
         try:
-            time.sleep(2)
+            # Persistent recovery can still be occupying executor turns long
+            # after the UART prompt. Wait for identity/storage/service startup
+            # before launching destructive and timing-sensitive selftests.
+            deadline = time.monotonic() + 90
+            while b'sshd listening on ' not in path.read_bytes():
+                if vm.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError(f'boot {number}: SSH service initialization did not finish')
+                time.sleep(0.05)
             vm.stdin.write(b'quiet\ncaps virtio-rng\ncaps sshd\nselftest\n')
             vm.stdin.flush()
             # Native selftests deliberately fault fibers and claim global
@@ -52,6 +59,8 @@ def boot(kernel, output, disk, number, modules=None, expected_key=None, wasmtime
             deadline = time.monotonic() + 90
             marker = f'SELFTEST OK ({expected_checks} checks)'.encode()
             while marker not in path.read_bytes():
+                if b'SELFTEST FAILED' in path.read_bytes():
+                    raise RuntimeError(f'boot {number}: kernel selftest failed')
                 if vm.poll() is not None or time.monotonic() >= deadline:
                     raise RuntimeError(f'boot {number}: selftest did not finish before service checks')
                 time.sleep(0.05)

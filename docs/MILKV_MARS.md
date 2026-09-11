@@ -1791,3 +1791,36 @@ this does not enable a functioning Mars SSH endpoint or qualify native execution
 on physical U74 cores. The stage-60 SD image is unchanged. Full physical boot,
 DMA, entropy, SSH/WASM and sustained-load acceptance remain outstanding.
 Evidence: `boards/milkv-mars/wasmtime-composition-evidence.json`.
+
+### Explicit-target SSH collector (stage 62)
+
+`scripts/mars-ssh-accept.py` now provides separate upload and post-reboot verify
+phases using explicit host, port, user, client identity and a dedicated verified
+Ed25519 host pin. Verification is bound to the successful upload summary's host
+key, user and fixture hashes; it never uploads or authorizes. Both phases record
+binary outputs, exit statuses and hashes without copying private credentials.
+Failures and timeouts are not retried, interrupted runs cannot pass, and existing
+evidence directories are preserved. Optional thread fixtures use the shared
+native test cases. See the bootchain README for commands and prerequisites.
+
+Eight host tests passed, including changed fixtures/host keys, wrong output,
+connection failure, timeout, interruption and overwrite rejection. The actual
+collector passed 34 upload-phase and 21 verify-phase checks across two QEMU
+boots with native WASM and threads. Output hashes were independently rechecked;
+verify used the upload baseline and issued no upload commands. Both boots passed
+416 selftests, alongside the composition harness's 85 command checks.
+
+Two earlier integration runs failed boot-two timing assertions while storage
+recovery and selftests overlapped. The QEMU harness now waits for SSH service
+initialization before starting selftests, and for selftest success before
+commands. It also detects an explicit selftest failure immediately. Kernel
+assertions were not relaxed. These runs do not establish mixed-load latency or
+stability during boot recovery.
+
+Evidence: `boards/milkv-mars/ssh-collector-evidence.json`. The collector cannot
+prove physical hardware, a cold power cycle, persisted byte-for-byte module
+identity, native backend or multi-hart execution from SSH output alone. Those
+qualification fields remain false and require separate board evidence. The
+stage-60 diagnostic image still has no SSH and is unchanged by this host-tool
+stage. Physical entropy qualification and a provisioned Mars image are required
+before using the collector against the board.

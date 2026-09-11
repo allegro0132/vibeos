@@ -143,3 +143,57 @@ The source reference is the [fixed official SDK](https://github.com/milkv-mars/m
 U-Boot and the SPL tool retain their upstream GPL licensing; OpenSBI retains its
 upstream BSD licensing. Exact sources and configuration changes are available
 through the pinned checkout and this directory's build scripts.
+
+## SSH command evidence for a provisioned Mars image
+
+`scripts/mars-ssh-accept.py` is a host-side collector for a future qualified,
+provisioned SSH image. The current stage-60 diagnostic SD image has SSH disabled
+and cannot pass this check. First finish physical entropy qualification and
+configure a separate board identity and authorized client key. Obtain the host
+public key over an independently verified channel and place its one Ed25519
+entry in a dedicated OpenSSH known-hosts file. The collector never accepts an
+unknown host key, enables password login, authorizes clients or reboots a board.
+
+Use explicit connection parameters and the compiled `tests/wasi/hello.c` and
+trap fixtures. The upload phase writes the `mars-accept-*.wasm` test programs to
+the VibeOS data service, replacing those test names if present:
+
+```sh
+python3 scripts/mars-ssh-accept.py \
+  --host ACTUAL_MARS_HOST --port ACTUAL_SSH_PORT --user ACTUAL_SSH_USER \
+  --identity PATH_TO_CLIENT_PRIVATE_KEY --known-hosts PATH_TO_VERIFIED_HOST_PIN \
+  --phase upload --output target/mars-acceptance/ssh-before-reboot \
+  --command-module target/wasi-examples/c-hello.wasm \
+  --trap-module target/wasi-fixtures/trap.wasm
+```
+
+After recording an operator-controlled cold boot, run the same command with
+`--phase verify --baseline target/mars-acceptance/ssh-before-reboot/summary.json`
+and a new output directory, such as `target/mars-acceptance/ssh-after-reboot`.
+Verify never uploads or authorizes anything. It requires a successful upload
+baseline with identical fixture hashes, user and host public key. The explicitly
+supplied host/port may change after DHCP; its verified host pin must still match
+the baseline identity. Retain both directories and the separate serial capture.
+
+Both phases check binary stdin (including NUL bytes), EOF, Unicode and spaced
+arguments, exact stdout/stderr, exit status 7 and trap status 125. For a native
+thread-enabled image, add both `--thread-fixtures target/wasi-fixtures` and
+`--pthread-module target/wasi-examples/c-threads.wasm` in both phases. This adds
+the ten existing thread/atomic fixtures and three pthread scenarios. Each
+connection is attempted once; a failed command is never replayed. Timeout and
+failure summaries retain captured output. Existing evidence directories are
+refused. Private credentials are referenced only by path and never copied.
+
+The summary records the endpoint, fixture hashes, public host key, baseline hash,
+per-command input/output hashes, durations and exit statuses. Passing verifies
+SSH-observed command behavior. It does not read back persisted module bytes,
+prove the physical power cycle, identify physical hardware, measure entropy,
+prove native execution or multi-hart placement, or replace the one-hour mixed
+workload test. Those require the corresponding board/serial evidence. All such
+physical qualification fields remain false. Native fault-injection selftests
+must finish before starting these command checks.
+
+For software regression of the collector itself, `scripts/test-mars-ssh-qemu.py`
+accepts the QEMU composition harness arguments and runs both phases on its
+throwaway VM, preserving identities and programs across two boots. QEMU output
+must not be submitted as Mars physical qualification.

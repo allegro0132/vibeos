@@ -1,0 +1,90 @@
+{
+  "status": "Interrupt and polling entropy completion verified with actual QEMU RNG requests",
+  "host_hal_driver_tests": 40,
+  "completion_statistics": {
+    "Polling": [
+      {
+        "bytes": 64,
+        "interrupts": 0
+      },
+      {
+        "bytes": 64,
+        "interrupts": 0
+      }
+    ],
+    "Interrupt": [
+      {
+        "bytes": 64,
+        "interrupts": 1
+      },
+      {
+        "bytes": 64,
+        "interrupts": 1
+      }
+    ]
+  },
+  "paced_device": "one byte per 10 ms: complete 64-byte sample with zero interrupts",
+  "stalled_device": "one byte per 60 seconds: bounded failure, zero client bytes",
+  "mutation": "periodic timer wake removed: paced request failed",
+  "physical_acceptance": false,
+  "sd_images_rebuilt": false,
+  "blind_spots": [
+    "QEMU RNG tests do not qualify Mars entropy or MMIO",
+    "Native non-DMA state and discovery integration remain pending",
+    "Existing test identity is not a production SSH identity"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage47-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage47-host.log",
+      "sha256": "78a832f02ac531daa146c10ed54c186c08fef91cd6e3e0b9ff6d6e5a2d6dae7d"
+    },
+    {
+      "path": "target/mars-reference/stage47-interrupt-test.log",
+      "sha256": "44ea07008cd7c80167eea88610f1a581f8be7216690b918321b942e66fb6c357"
+    },
+    {
+      "path": "target/mars-reference/stage47-mutation-build.log",
+      "sha256": "becabfd741c6381057fb14cef0fef2f3ac8942e6eab19a40ccb540543afd44ce"
+    },
+    {
+      "path": "target/mars-reference/stage47-mutation-paced.log",
+      "sha256": "2c40821f0336d2731b559e1eea707608cf92886c8280887b9b5489376a3a64af"
+    },
+    {
+      "path": "target/mars-reference/stage47-polling-final-test.log",
+      "sha256": "a0cf5391b23051e9aabc4463149db3d0345cbf3a1cd9ba5aa4442de548d2c0f8"
+    },
+    {
+      "path": "target/mars-reference/stage47-polling-paced.log",
+      "sha256": "b7541bc7ad564c8879232d6087a5f57c09b3e3fe2b749c687d4257135135056e"
+    },
+    {
+      "path": "target/mars-reference/stage47-polling-test.log",
+      "sha256": "1d8289bf00aa2fcf7d8b095eb07dcdf4304716e17c27b967b4c229b5cb060912"
+    },
+    {
+      "path": "target/mars-reference/stage47-polling-timeout.log",
+      "sha256": "2c40821f0336d2731b559e1eea707608cf92886c8280887b9b5489376a3a64af"
+    },
+    {
+      "path": "target/mars-reference/stage47-polling-final/boot-1.log",
+      "sha256": "f99edebcba2deb838850a85119c3cb30e1b869056885d5c06fbe2261880ebaca"
+    },
+    {
+      "path": "target/mars-reference/stage47-polling-final/boot-2.log",
+      "sha256": "efa6cc1864d8a7db6ead867360e114a3484aa4fe090a22f0fa8cf23dd57c62ce"
+    },
+    {
+      "path": "target/mars-reference/stage47-interrupt/boot-1.log",
+      "sha256": "cf0be11938b6514dc2edd878e82622e25b5143b19b00fa66f08cf8b2de69110e"
+    },
+    {
+      "path": "target/mars-reference/stage47-interrupt/boot-2.log",
+      "sha256": "63eddc31f2d894fefd6bb1eba79861311e28c10c4ebe8bc9fb4848fd8c72ad23"
+    }
+  ]
+}

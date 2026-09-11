@@ -1329,3 +1329,33 @@ This removes two protocol assumptions from the policy layer. Discovery,
 polling completion, non-DMA instance ownership and Mars entropy qualification
 still require further work; no Mars production random service or new SD image
 is delivered by this change.
+
+### Explicit entropy polling completion
+
+HAL `CompletionMode` lets firmware select interrupt or polling completion.
+Kernel policy keeps the polling device's PLIC source disabled, installs no IRQ
+handler for it, and checks pending completion on a timer at intervals of at
+most 1 ms. The original request deadline still terminates stalled requests;
+reset/reinitialization preserves the selected mode. The QEMU default remains
+interrupt-driven. `entropy-polling` is a QEMU firmware feature for exercising
+this policy with an actual emulated device before native Mars integration.
+
+The existing SSH security acceptance script accepts
+`SSH_SECURITY_ENTROPY_MODE=interrupt|polling` and optional
+`SSH_SECURITY_EVIDENCE` naming a new log directory. It verifies the mode and
+completion statistics as well as its existing bounded entropy, domain-stream,
+signer/auth and reboot-freshness checks. Polling acceptance requires zero
+completion interrupts. This remains the explicit non-production test-identity
+image; it does not configure Mars SSH.
+
+Two polling boots return complete 64-byte samples with zero completion IRQs.
+A QEMU RNG limited to one byte per 10 ms still completes the whole request;
+one byte per 60 seconds instead fails near the 2-second request deadline and
+returns zero client bytes. Removing periodic wakeup causes the paced test to
+fail, demonstrating that the polling timer is needed. The default interrupt
+mode is tested separately. Evidence is in
+`boards/milkv-mars/entropy-polling-evidence.json`.
+
+These are QEMU device and policy tests. Native discovery, non-DMA state
+ownership, shared SEC lifecycle and physical entropy qualification remain
+outstanding; existing Mars SD images are unchanged.

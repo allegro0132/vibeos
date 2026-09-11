@@ -24,6 +24,10 @@ pub struct Events {
     pub completion: bool,
     pub state_changed: bool,
 }
+/// Firmware selects completion delivery; scheduling intervals belong to kernel
+/// policy. Polling callbacks must remain bounded and must not require IRQ ack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionMode { Interrupt, Polling }
 /// # Safety
 /// Every operation except `acknowledge` requires exclusive ownership of the
 /// instance and its DMA pool. Completion reads may not race mutation. The IRQ
@@ -31,6 +35,7 @@ pub struct Events {
 /// are copied only at finish; no caller pointer may be published to hardware.
 /// A failed reset retains DMA ownership until a later confirmed reset.
 pub struct EntropyDevice {
+    pub completion_mode: CompletionMode,
     /// Hardware queue capacity for diagnostics, not the kernel request limit.
     pub queue_size: u16,
     pub dma_base: fn() -> usize,

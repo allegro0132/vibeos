@@ -8,6 +8,8 @@ KERNEL=target/riscv64imac-unknown-none-elf/release/vibeos-qemu-virt
 QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}
 QEMU_ACCEL=${QEMU_ACCEL:-tcg}
 SSH_SECURITY_TIMEOUT=${SSH_SECURITY_TIMEOUT:-20}
+ENTROPY_MODE=${SSH_SECURITY_ENTROPY_MODE:-interrupt}
+EVIDENCE=${SSH_SECURITY_EVIDENCE:-}
 TEST_TMP=""
 QEMU_PID=""
 KILLER_PID=""
@@ -53,9 +55,19 @@ pinned_rustc=$(rustup which --toolchain "$toolchain" rustc) \
 pinned_rustdoc=$(rustup which --toolchain "$toolchain" rustdoc) \
   || fail "cannot locate rustdoc for $toolchain"
 
+case "$ENTROPY_MODE" in
+  interrupt) features=ssh-security-test; mode_marker=Interrupt ;;
+  polling) features=ssh-security-test,entropy-polling; mode_marker=Polling ;;
+  *) fail 'SSH_SECURITY_ENTROPY_MODE must be interrupt or polling' ;;
+esac
+if [ -n "$EVIDENCE" ]; then
+  [ ! -e "$EVIDENCE" ] || fail 'evidence directory already exists'
+  mkdir -p "$EVIDENCE"
+fi
+
 echo "ssh-security-test: building the explicit test-identity image"
 (cd firmware/qemu-virt && RUSTC="$pinned_rustc" RUSTDOC="$pinned_rustdoc" \
-  rustup run "$toolchain" cargo build --release --features ssh-security-test) >&2 \
+  rustup run "$toolchain" cargo build --offline --locked --release --features "$features") >&2 \
   || fail "kernel build failed"
 
 TEST_TMP=$(mktemp -d) || fail "cannot create temporary directory"
@@ -81,6 +93,9 @@ boot_once() {
   wait "$KILLER_PID" 2>/dev/null || true
   KILLER_PID=""
 
+  if [ -n "$EVIDENCE" ]; then cp "$log" "$EVIDENCE/boot-$boot.log"; fi
+  grep -a -F -q "ENTROPY_COMPLETION_MODE $mode_marker" "$log" \
+    || fail "boot $boot used the wrong entropy completion mode"
   grep -a -F -q 'N3 SSH SECURITY TEST IDENTITY -- NOT FOR PRODUCTION' "$log" \
     || fail "boot $boot did not identify the deterministic test image"
   grep -a -F -q 'ssh-security virtio-rng PASS: bounded 64-byte transport sample' "$log" \
@@ -93,6 +108,13 @@ boot_once() {
     || fail "boot $boot did not reach the final acceptance marker"
   if grep -a -F -q 'FAIL ssh-security-test:' "$log"; then
     fail "boot $boot reported an in-guest failure"
+  fi
+
+  grep -a -F -q "ENTROPY_COMPLETION_STATS mode=$mode_marker bytes=" "$log" \
+    || fail "boot $boot did not record entropy completion statistics"
+  if [ "$ENTROPY_MODE" = polling ]; then
+    grep -a -E -q 'ENTROPY_COMPLETION_STATS mode=Polling bytes=[0-9]+ interrupts=0' "$log" \
+      || fail "boot $boot delivered entropy interrupts in polling mode"
   fi
 
   key=$(sed -n 's/.*ssh-security signer PASS: generation 1 host-key \([0-9a-f]\{64\}\).*/\1/p' "$log" \

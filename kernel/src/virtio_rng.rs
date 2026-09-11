@@ -676,6 +676,13 @@ fn complete_active(result: Result<RandomBytes, RandomError>) {
     }
 }
 
+fn polling_completion() -> bool {
+    vibeos_hal::entropy::device().completion_mode == vibeos_hal::entropy::CompletionMode::Polling
+}
+fn enable_completion_irq(transport: MmioTransport) -> Result<(), plic::RegisterError> {
+    if polling_completion() { plic::disable(transport.irq()) } else { plic::enable(transport.irq()) }
+}
+
 struct DriverSession {
     transport: MmioTransport,
     engine: Engine,
@@ -745,8 +752,8 @@ impl DriverSession {
         };
 
         let _ = plic::unregister(transport.irq());
-        if plic::register(transport.irq(), irq_top_half, transport.base()).is_err()
-            || plic::enable(transport.irq()).is_err()
+        if (!polling_completion() && plic::register(transport.irq(), irq_top_half, transport.base()).is_err())
+            || enable_completion_irq(transport).is_err()
         {
             shutdown(transport, claim_arena, RandomError::DriverCancelled);
             return None;
@@ -873,7 +880,7 @@ impl DriverSession {
                 .reset_and_prepare(epoch, RESET_POLL_BUDGET)
                 .is_ok()
             {
-                if plic::enable(self.transport.irq()).is_ok() {
+                if enable_completion_irq(self.transport).is_ok() {
                     if self.engine.start().is_ok() {
                         let mut control = CONTROL.lock();
                         control.accepted_features = self.engine.accepted_features();
@@ -1058,6 +1065,7 @@ enum WaitOutcome {
 }
 
 enum WaitSignal {
+    PollAgain,
     Completed,
     DeviceNeedsReset,
     Irq,
@@ -1069,6 +1077,7 @@ async fn wait_for_completion(
     submission: Submission,
     deadline: u64,
 ) -> WaitOutcome {
+    let polling = polling_completion();
     loop {
         let irq = IRQ_WAIT.wait();
         if !engine.operational() {
@@ -1085,7 +1094,7 @@ async fn wait_for_completion(
             .saturating_mul(1_000)
             .div_ceil(exec::timebase_hz())
             .max(1);
-        let timeout = exec::sleep_ms(remaining_ms);
+        let timeout = exec::sleep_ms(if polling { remaining_ms.min(1) } else { remaining_ms });
         let mut irq = pin!(irq);
         let mut timeout = pin!(timeout);
         let signal = poll_fn(|cx| {
@@ -1096,9 +1105,9 @@ async fn wait_for_completion(
                 return Poll::Ready(WaitSignal::Completed);
             }
             if timeout.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(WaitSignal::TimedOut);
+                return Poll::Ready(if polling && crate::sbi::time() < deadline { WaitSignal::PollAgain } else { WaitSignal::TimedOut });
             }
-            if irq.as_mut().poll(cx).is_ready() {
+            if !polling && irq.as_mut().poll(cx).is_ready() {
                 return Poll::Ready(WaitSignal::Irq);
             }
             Poll::Pending
@@ -1108,7 +1117,7 @@ async fn wait_for_completion(
             WaitSignal::Completed => return WaitOutcome::Completed,
             WaitSignal::DeviceNeedsReset => return WaitOutcome::DeviceNeedsReset,
             WaitSignal::TimedOut => return WaitOutcome::TimedOut,
-            WaitSignal::Irq => {}
+            WaitSignal::Irq | WaitSignal::PollAgain => {}
         }
     }
 }

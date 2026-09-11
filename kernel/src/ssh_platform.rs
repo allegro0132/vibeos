@@ -2216,5 +2216,16 @@ pub async fn security_test_task(
         policy,
     )
     .await;
-    crate::sbi::shutdown(!passed)
+    let lease = space.0.lock().lookup_lease::<crate::virtio_rng::RandomSource>(random, Rights::READ);
+    let info = lease.ok().and_then(|lease| crate::virtio_rng::info_with(&lease).ok());
+    let mode = vibeos_hal::entropy::device().completion_mode;
+    let completion_valid = info.is_some_and(|info| {
+        crate::uart::_print(format_args!("ENTROPY_COMPLETION_STATS mode={mode:?} bytes={} interrupts={}\n", info.bytes_returned, info.used_interrupts));
+        info.online && info.bytes_returned >= 64
+            && (mode != vibeos_hal::entropy::CompletionMode::Polling || info.used_interrupts == 0)
+    });
+    if !completion_valid {
+        crate::uart::_print(format_args!("FAIL ssh-security-test: entropy completion statistics\n"));
+    }
+    crate::sbi::shutdown(!(passed && completion_valid))
 }

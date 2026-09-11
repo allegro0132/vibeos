@@ -32,7 +32,10 @@ mod storage;
 mod network;
 
 unsafe fn platform_init(_write: fn(&str)) {}
-unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {}
+unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
+    #[cfg(feature = "ssh-security-test")]
+    _print(format_args!("ENTROPY_COMPLETION_MODE {:?}\n", vibeos_hal::entropy::device().completion_mode));
+}
 
 mod pci;
 

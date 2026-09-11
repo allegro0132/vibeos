@@ -6,7 +6,7 @@ use core::cell::UnsafeCell;
 use vibeos_driver_virtio_mmio::MmioTransport;
 use vibeos_driver_virtio_rng::{self as driver, Engine};
 use vibeos_hal::{
-    entropy::{Backing, CompletionMode, EntropyDevice, Error, Pending},
+    entropy::{Backing, CompletionMode, DiscoveredSource, SourceApproval, EntropyDevice, Error, Pending},
     Board as _,
 };
 struct State {
@@ -51,7 +51,19 @@ unsafe fn transport(slot: usize, base: usize) -> Result<MmioTransport, Error> {
 #[no_mangle]
 pub static VIBEOS_ENTROPY_DEVICE: EntropyDevice = EntropyDevice {
     discover: || unsafe {
-        MmioTransport::scan_entropy(Board::INFO.virtio_mmio?)?.descriptor()
+        let endpoint = MmioTransport::scan_entropy(Board::INFO.virtio_mmio?)?.descriptor()?;
+        #[cfg(feature = "entropy-diagnostic-only")]
+        for byte in b"ENTROPY_DIAGNOSTIC_SOURCE present; random capability withheld\n" {
+            (super::early_devices::VIBEOS_EARLY_DEVICES.console.write_byte)(*byte);
+        }
+        Some(DiscoveredSource {
+            endpoint,
+            // This firmware's approved profile assumes a trusted host RNG
+            // backend. Diagnostic builds deliberately cannot publish randomness.
+            approval: if cfg!(feature = "entropy-diagnostic-only") {
+                SourceApproval::DiagnosticOnly
+            } else { SourceApproval::FirmwareApproved },
+        })
     },
     resource_kind: "virtio-mmio",
     transport_name: "modern entropy transport",

@@ -37,6 +37,16 @@ pub enum Backing {
     /// Private controller/PIO state with no hardware DMA allocation.
     DriverOwned,
 }
+/// Source admission policy asserted by firmware assembly. Approval requires
+/// source-specific evidence/review; successful register reads do not grant it.
+/// This enum is not an entropy estimate or a runtime health test.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceApproval { DiagnosticOnly, FirmwareApproved }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DiscoveredSource {
+    pub endpoint: crate::device_transport::Descriptor,
+    pub approval: SourceApproval,
+}
 /// # Safety
 /// Engine operations require exclusive ownership of the instance and its backing
 /// state (including the DMA pool when present). Discovery runs before claims.
@@ -46,7 +56,7 @@ pub enum Backing {
 /// A failed reset retains instance/backing ownership until confirmed retirement.
 pub struct EntropyDevice {
     /// Firmware admits one entropy endpoint after resources are mapped.
-    pub discover: unsafe fn() -> Option<crate::device_transport::Descriptor>,
+    pub discover: unsafe fn() -> Option<DiscoveredSource>,
     pub resource_kind: &'static str,
     pub transport_name: &'static str,
     /// Hardware-only best-effort stop for inconsistent CPU ownership. Must not

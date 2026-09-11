@@ -12,8 +12,9 @@ fn description() -> Descriptor {
 #[no_mangle]
 static VIBEOS_ENTROPY_DEVICE: EntropyDevice = EntropyDevice {
     discover: || match DISCOVERY.load(SeqCst) {
-        0 => Some(description()),
-        1 => Some(Descriptor { kind: Kind::Block, ..description() }),
+        0 => Some(DiscoveredSource { endpoint: description(), approval: SourceApproval::FirmwareApproved }),
+        1 => Some(DiscoveredSource { endpoint: Descriptor { kind: Kind::Block, ..description() }, approval: SourceApproval::FirmwareApproved }),
+        3 => Some(DiscoveredSource { endpoint: description(), approval: SourceApproval::DiagnosticOnly }),
         _ => None,
     },
     resource_kind: "test-native-entropy",
@@ -65,6 +66,9 @@ fn native_endpoint_needs_no_shared_transport_and_preserves_owner_on_quiesce() {
     assert_eq!(PREPARED.load(SeqCst), 0);
     DISCOVERY.store(1, SeqCst);
     assert!(unsafe { adapter::Endpoint::discover() }.is_none());
+    DISCOVERY.store(3, SeqCst);
+    assert!(unsafe { adapter::Endpoint::discover() }.is_none());
+    assert_eq!(PREPARED.load(SeqCst), 0);
     DISCOVERY.store(2, SeqCst);
     assert!(unsafe { adapter::Endpoint::discover() }.is_none());
 }

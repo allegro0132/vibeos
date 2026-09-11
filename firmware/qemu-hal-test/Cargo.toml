@@ -5,6 +5,7 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+entropy-diagnostic-only = ["entropy-composition-test"]
 entropy-composition-test = ["vibeos-kernel/queued-entropy", "dep:vibeos-driver-virtio-rng"]
 entropy-polling = ["entropy-composition-test"]
 trng-model-test = ["dep:vibeos-starfive-trng", "dep:vibeos-platform-jh7110"]

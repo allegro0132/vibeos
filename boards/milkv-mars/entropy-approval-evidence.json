@@ -1,0 +1,68 @@
+{
+  "status": "Explicit firmware source approval enforced before entropy capability publication",
+  "diagnostic_qemu": {
+    "device_observed": true,
+    "random_capability_published": false,
+    "harts": 4,
+    "selftests_passed": 395,
+    "selftests_failed": 0
+  },
+  "approved_qemu": [
+    {
+      "bytes": 64,
+      "interrupts": 1
+    },
+    {
+      "bytes": 64,
+      "interrupts": 1
+    }
+  ],
+  "mutation": "Removing approval filter fails endpoint test; restored test passes",
+  "host_tests": 41,
+  "physical_acceptance": false,
+  "mars_entropy_qualified": false,
+  "sd_images_rebuilt": false,
+  "limitations": [
+    "Firmware approval is an admission assertion, not entropy measurement or runtime health proof",
+    "QEMU approval assumes a trusted host RNG backend",
+    "Native Mars operation table and physical source review remain pending"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage51-approved-test.log",
+      "sha256": "65215f49845f06ce50dc78d958d7e8729073d1a75db240cbf2c8779ebb911cef"
+    },
+    {
+      "path": "target/mars-reference/stage51-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage51-diagnostic-build.log",
+      "sha256": "6f35cbfdee3f83b5434e1c9ca03a6a61a98f9cb3fa33daedf106cee333ae4cbb"
+    },
+    {
+      "path": "target/mars-reference/stage51-diagnostic-runtime.log",
+      "sha256": "2304fccebc1c4aa7c55e44328b17795d8694c8e181803c80f9dc634fd67d71a0"
+    },
+    {
+      "path": "target/mars-reference/stage51-host.log",
+      "sha256": "e3753185e49d9650995feed888c1a98f80fe3bdb960f2076f67546351e6379a2"
+    },
+    {
+      "path": "target/mars-reference/stage51-mutation-approval.log",
+      "sha256": "67f5a0d18289f4ae2f50b731f3639a8776828d4a5b9c4807c81e5b5bd614c972"
+    },
+    {
+      "path": "target/mars-reference/stage51-restored.log",
+      "sha256": "69e8bc04f64ad338fd800d82ddaa1b2bc1eec2ea5a2798663c40d374d8841122"
+    },
+    {
+      "path": "target/mars-reference/stage51-approved/boot-1.log",
+      "sha256": "a6bc3d95450f53ffa22fc4e4ec194ca115bce0addace59dd14d01bfbda57c766"
+    },
+    {
+      "path": "target/mars-reference/stage51-approved/boot-2.log",
+      "sha256": "7849410272c07f323f92777dacc5f056fa3f909f55c51dfcb1ecb44819155b09"
+    }
+  ]
+}

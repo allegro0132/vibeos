@@ -1431,3 +1431,26 @@ profiles still omit the service pending native composition and qualification.
 Restoring the old module-level QEMU condition makes the independent kernel
 check fail; the mutation is detected. Selecting queued and jitter providers
 together is also rejected by the intended single-provider compile guard.
+
+### Entropy source approval at discovery (stage 51)
+
+HAL entropy discovery now returns the endpoint together with an explicit
+`DiagnosticOnly` or `FirmwareApproved` declaration from firmware assembly. The
+kernel admits only approved entropy-kind endpoints, before creating device
+state or random capabilities. Successful register reads alone cannot cross
+this boundary. The declaration records a firmware admission decision; it is
+not an entropy estimate, health test, runtime revocation mechanism, or proof
+that the stated review actually happened. Existing runtime health and recovery
+policy still applies.
+
+The QEMU compatibility profile assumes a trusted host RNG backend. Its new
+`entropy-diagnostic-only` test feature deliberately withholds approval. With a
+real modern VirtIO RNG attached, the independent HAL firmware observes the
+device, publishes no `virtio-rng` capability space, and passes all 395 selftests
+on four harts. Removing the approval filter fails the host endpoint test. The
+approved profile still passes both boots of the existing security regression,
+each consuming 64 bytes with one completion interrupt. This uses a test SSH
+identity and does not qualify Mars entropy or production SSH.
+
+Evidence: `boards/milkv-mars/entropy-approval-evidence.json`. No Mars native
+entropy service was composed in this stage and no SD image was rebuilt.

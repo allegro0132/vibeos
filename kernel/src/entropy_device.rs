@@ -1,6 +1,6 @@
 //! Exclusive invocation token for firmware-owned entropy hardware.
 use vibeos_hal::device_transport::{Descriptor, Kind};
-use vibeos_hal::entropy::{device, Error, Events, Submission};
+use vibeos_hal::entropy::{device, Error, Events, SourceApproval, Submission};
 /// Immutable identity supplied by the firmware's entropy provider. No register
 /// access or dependency on the shared block/network transport registry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9,7 +9,10 @@ impl Endpoint {
     /// # Safety
     /// Firmware resources are mapped; this is boot-time admission before claims.
     pub unsafe fn discover() -> Option<Self> {
-        (device().discover)().filter(|d| d.kind == Kind::Entropy).map(Self)
+        (device().discover)()
+            .filter(|source| source.approval == SourceApproval::FirmwareApproved
+                && source.endpoint.kind == Kind::Entropy)
+            .map(|source| Self(source.endpoint))
     }
     pub const fn slot(self) -> usize { self.0.slot }
     pub const fn base(self) -> usize { self.0.base }

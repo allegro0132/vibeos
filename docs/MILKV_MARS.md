@@ -1663,3 +1663,49 @@ production instance/table code with simulated registers; they cannot establish
 real bootloader SEC relinquishment, parent-clock stability or entropy quality.
 Native linking is not physical execution, authentication or WASM acceptance.
 No SD image was repacked and no source approval was granted in this stage.
+
+### Authenticated generic command execution (stage 58)
+
+The independent QEMU HAL profile can now select `command-composition-test`
+with `entropy-composition-test` and `boot-admission-test`. It enables the
+reusable provisioned command service without the QEMU board feature. The
+existing two-boot composition harness accepts `--command-module` (the compiled
+`tests/wasi/hello.c`) and `--trap-module` in addition to its kernel/output paths.
+It freezes the ELF and fixture bytes in the new evidence directory, generates
+a fresh client key, and authorizes only that public key through the virtual
+UART on the first boot. It does not use the Duo acceptance keys.
+
+On both four-hart boots the client authenticates using its key, uploads and/or
+runs the C WASI command, checks space-containing/UTF-8 arguments, 13300 bytes
+of binary stdin including NULs, EOF, exact stdout/stderr, exit status 7 and
+trap status 125. The second boot performs no authorization or upload, checking
+both key and program persistence. Both boots pass all 395 kernel selftests,
+and the host identity is compared before authenticated commands on boot two.
+A negative run substituting the trap module for the normal C command fails
+at the expected output/status check. These are core Wasmi execution tests,
+not Wasmtime or wasi-threads qualification.
+
+The functional run needed 15 bounded command-connection retries before request admission. A retry
+is allowed only for a KEX-stage reset with empty stdout and no UART evidence
+of request admission; started uploads/runs are never replayed. Every command attempt
+is retained; readiness retries are not included in that counter. This follows the existing WASI peer's pre-authentication policy
+and does not establish reliable connection handling or one-hour stability.
+The repeated resets require further investigation. OpenSSH's local warning
+text is excluded with the existing peer's `LogLevel=ERROR` setting so guest
+stderr can be compared exactly; server requirements are unchanged.
+
+Run from the repository after building the independent firmware:
+
+```sh
+python3 scripts/qemu-provisioned-composition-test.py \
+  --kernel target/riscv64imac-unknown-none-elf/release/vibeos-qemu-hal-test \
+  --output target/UNUSED_COMMAND_TEST_DIRECTORY \
+  --command-module target/wasi-examples/c-hello.wasm \
+  --trap-module target/wasi-fixtures/trap.wasm
+```
+
+The evidence directory contains disposable virtual media and newly generated
+test identities, not production credentials. Evidence is summarized in
+`boards/milkv-mars/ssh-wasi-composition-evidence.json`. Mars entropy remains
+unqualified, the stage-54 SD image remains unchanged, and physical SSH/WASM,
+threads, DMA/concurrency and cold-start/stability acceptance are still pending.

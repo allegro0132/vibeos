@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Two-boot provisioned SSH handshake check on disposable QEMU media.
+"""Two-boot provisioned SSH/WASI composition check on disposable QEMU media.
 
 Build qemu-hal-test with boot-admission-test,ssh-composition-test,
 entropy-composition-test first. Uses host /dev/urandom and no fixed host identity.
-Proves key exchange and persisted public identity, not authentication/WASM or
-physical entropy quality. Never use the generated disk as a production identity.
+Optional --command-module/--trap-module also test public-key authentication,
+upload, WASI IO/arguments/exit/traps and persistence. Build command-composition-test
+instead of ssh-composition-test for that mode. Does not test threads or physical
+entropy quality. Never use the generated disk as a production identity.
 """
 import argparse
 import hashlib
 import json
 from pathlib import Path
+import shlex
+import shutil
 import socket
 import subprocess
 import time
 
 
-def boot(kernel, output, disk, number):
+def boot(kernel, output, disk, number, modules=None, expected_key=None):
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
@@ -65,6 +69,11 @@ def boot(kernel, output, disk, number):
             (output / f'handshake-{number}.log').write_text('\n'.join(attempts))
             if key is None:
                 raise RuntimeError(f'boot {number}: no provisioned SSH handshake; inspect {path}')
+            if expected_key is not None and key != expected_key:
+                raise RuntimeError('host identity changed before authenticated commands')
+            if modules is not None:
+                commands(table_path=path, output=output, vm=vm, port=port,
+                         number=number, modules=modules)
             time.sleep(1)
         finally:
             if vm.poll() is None:
@@ -83,26 +92,122 @@ def boot(kernel, output, disk, number):
     return key
 
 
+def commands(table_path, output, vm, port, number, modules):
+    key = output / 'client-key'
+    if number == 1:
+        public = key.with_suffix('.pub').read_text().split()
+        assert public[0] == 'ssh-ed25519'
+        offset = table_path.stat().st_size
+        vm.stdin.write(('vsh ssh-authorize add ' + ' '.join(public[:2]) + '\n').encode())
+        vm.stdin.flush()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if b'ssh-authorize: client key persisted; password authentication disabled' in table_path.read_bytes()[offset:]:
+                break
+            if vm.poll() is not None:
+                raise RuntimeError('QEMU stopped during key authorization')
+            time.sleep(0.05)
+        else:
+            raise RuntimeError('client public key was not persisted')
+    base = ['ssh', '-F', '/dev/null', '-T', '-o', 'BatchMode=yes',
+            '-o', 'LogLevel=ERROR',
+            '-o', 'StrictHostKeyChecking=yes', '-o', f'UserKnownHostsFile={output / f"known-hosts-{number}"}',
+            '-o', 'GlobalKnownHostsFile=/dev/null', '-o', 'IdentityAgent=none',
+            '-o', 'IdentitiesOnly=yes', '-o', 'PreferredAuthentications=publickey',
+            '-o', 'ConnectTimeout=2', '-i', str(key), '-p', str(port), 'vibe@127.0.0.1']
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        ready = subprocess.run([*base, 'echo ready'], input=b'', capture_output=True, timeout=5)
+        if ready.returncode == 0 and ready.stdout == b'ready\n':
+            break
+        time.sleep(0.25)
+    else:
+        raise RuntimeError('persisted client key did not authenticate')
+    evidence = []
+    def execute(words, data=b'', status=0, stdout=b'', stderr=b''):
+        for attempt in range(4):
+            offset = table_path.stat().st_size
+            result = subprocess.run([*base, shlex.join(words)], input=data,
+                                    capture_output=True, timeout=30)
+            observed = table_path.read_bytes()[offset:]
+            began = any(marker in observed for marker in
+                        (b'WASI running', b'WASI upload receiving', b'WASI admission rejected'))
+            retry = (attempt < 3 and result.returncode == 255 and not result.stdout
+                     and b'kex_exchange_identification:' in result.stderr and not began)
+            evidence.append({'command': words, 'status': result.returncode,
+                             'preauth_retry': retry,
+                             'stdout_hex': result.stdout.hex(), 'stderr_hex': result.stderr.hex()})
+            (output / f'commands-{number}.json').write_text(json.dumps(evidence, indent=2) + '\n')
+            if not retry:
+                break
+            # Match the existing WASI peer: only a demonstrably pre-request
+            # connection reset is retried. Never replay a started upload/run.
+            time.sleep(0.25)
+        if (result.returncode, result.stdout, result.stderr) != (status, stdout, stderr):
+            raise RuntimeError(f'command mismatch: {words}; inspect commands-{number}.json')
+    # Boot two deliberately skips both authorization and upload.
+    if number == 1:
+        for name, data in modules.items():
+            execute(['wasm-upload', name, str(len(data)), hashlib.sha256(data).hexdigest()], data)
+    run = ['wasm-run', 'composition-hello.wasm']
+    execute(run, stdout=b'Hello from C WASI!\n')
+    execute([*run, 'args', 'a b', '中文'], stdout='a b\n中文\n'.encode())
+    data = b'ab\0cde\n' * 1900
+    execute([*run, 'filter'], data, stdout=data.upper())
+    execute([*run, 'filter'])
+    execute([*run, 'stderr'], stdout=b'out\n', stderr=b'err\n')
+    execute([*run, 'exit'], status=7)
+    execute(['wasm-run', 'composition-trap.wasm'], status=125)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--kernel', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--command-module', type=Path, help='compiled tests/wasi/hello.c module')
+    parser.add_argument('--trap-module', type=Path, help='fixture exporting an immediately trapping _start')
     args = parser.parse_args()
+    if bool(args.command_module) != bool(args.trap_module):
+        parser.error('--command-module and --trap-module must be supplied together')
+    modules = None if args.command_module is None else {
+        'composition-hello.wasm': args.command_module.read_bytes(),
+        'composition-trap.wasm': args.trap_module.read_bytes()}
+    if modules is not None and any(not (8 <= len(b) <= 512 * 1024 and b.startswith(b'\0asm\x01\0\0\0')) for b in modules.values()):
+        parser.error('fixtures must be bounded core WASM modules')
     kernel = args.kernel.resolve(strict=True)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    frozen_kernel = output / 'kernel.elf'
+    shutil.copyfile(kernel, frozen_kernel)
+    kernel = frozen_kernel
+    kernel_hash = hashlib.sha256(kernel.read_bytes()).hexdigest()
+    if modules is not None:
+        fixtures = output / 'fixtures'
+        fixtures.mkdir()
+        for name, data in modules.items():
+            (fixtures / name).write_bytes(data)
     disk = output / 'disposable-data.raw'
     with disk.open('xb') as f:
         f.truncate(128 * 1024 * 1024)
-    first = boot(kernel, output, disk, 1)
-    second = boot(kernel, output, disk, 2)
+    if modules is not None:
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '',
+                        '-f', str(output / 'client-key')], check=True)
+    first = boot(kernel, output, disk, 1, modules)
+    second = boot(kernel, output, disk, 2, modules, first)
     if first != second:
         raise RuntimeError('provisioned public host identity changed across reboot')
+    if hashlib.sha256(kernel.read_bytes()).hexdigest() != kernel_hash:
+        raise RuntimeError('frozen kernel changed during the test')
     result = {'status': 'passed', 'boots': 2, 'harts': 4, 'selftests_per_boot': 395,
               'host_public_key': ' '.join(first), 'identity_persisted': True,
-              'authentication_tested': False, 'wasm_tested': False,
+              'authentication_tested': modules is not None, 'wasm_tested': modules is not None,
+              'wasm_threads_tested': False,
+              'module_sha256': {} if modules is None else {n: hashlib.sha256(b).hexdigest() for n, b in modules.items()},
               'physical_acceptance': False,
-              'kernel_sha256': hashlib.sha256(kernel.read_bytes()).hexdigest()}
+              'kernel_sha256': kernel_hash,
+              'preauth_command_retries': 0 if modules is None else sum(
+                  int(item['preauth_retry']) for n in [1, 2] for item in
+                  json.loads((output / f'commands-{n}.json').read_text()))}
     (output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps(result, indent=2))
 

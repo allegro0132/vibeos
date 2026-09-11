@@ -1,0 +1,177 @@
+{
+  "status": "Independent provisioned command functionality and persistence passed; transport stability not qualified",
+  "kernel_features": [
+    "boot-dtb-probe",
+    "file-tree",
+    "legacy-shell",
+    "provisioned-command",
+    "provisioned-ssh",
+    "qemu-default-image",
+    "queued-block",
+    "queued-entropy",
+    "queued-network",
+    "ssh-commands",
+    "ssh-component-command",
+    "wasi-preview1"
+  ],
+  "functional_result": {
+    "status": "passed",
+    "boots": 2,
+    "harts": 4,
+    "selftests_per_boot": 395,
+    "host_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINVmA/URNlc2HkOwHc1eGgUR5T9MyljmoxL371S+qjEY",
+    "identity_persisted": true,
+    "authentication_tested": true,
+    "wasm_tested": true,
+    "wasm_threads_tested": false,
+    "module_sha256": {
+      "composition-hello.wasm": "2fc8f58df91a31eaf91698693fca489bea9014871f1b99227a04e09b39a11303",
+      "composition-trap.wasm": "f871c8e6845227d776312d643b2bfbf076f9b5a55f9322a33440f18db838c58f"
+    },
+    "physical_acceptance": false,
+    "kernel_sha256": "d58146e417274982dd82fdd5a1f80b4f650d5c3b34c1ddc11c2f93e57262f958",
+    "preauth_command_retries": 15
+  },
+  "successful_commands_per_boot": [
+    9,
+    7
+  ],
+  "checks": [
+    "fresh client key authorized through virtual UART",
+    "public-key authentication on both boots",
+    "host identity pinned before boot-two authenticated commands",
+    "atomic raw-module upload",
+    "UTF-8 and space-containing arguments",
+    "13300-byte binary stdin with NULs",
+    "EOF",
+    "separate stdout and stderr",
+    "exit 7",
+    "trap 125",
+    "program persistence without re-upload"
+  ],
+  "negative_fixture": "Substituted trap module rejected at normal-program output/status check",
+  "handshake_only_compatibility": "passed two boots",
+  "transport_stability_qualified": false,
+  "readiness_retries_in_command_counter": false,
+  "physical_acceptance": false,
+  "wasmtime_tested": false,
+  "threads_tested": false,
+  "mars_ssh_enabled": false,
+  "sd_images_rebuilt": false,
+  "limitations": [
+    "15 command connections required bounded pre-request KEX retries; investigate before stability acceptance",
+    "Readiness retries not included in command retry counter",
+    "Core Wasmi checks only, not native Wasmtime/wasi-threads",
+    "Host RNG and disposable QEMU identities do not qualify Mars source or production identity"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage58-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-build.log",
+      "sha256": "f64ec10d5609c3d4b86a18816e32f913054f71d2ac6747e531cd2bfe9f79285c"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-test-v2.log",
+      "sha256": "fa4b0b061ffa782e37b5e41f882ae29232236b54395dafc2829468bf645e9256"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-test-v3.log",
+      "sha256": "f7f83fd190f353cc2266de335f16d72488b8aafcf4a2de7ac780effffc06f967"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-test.log",
+      "sha256": "7f84fd3639ab7313af224cf1618c9d9988d4c38c7697b039a2ec5cb444ced709"
+    },
+    {
+      "path": "target/mars-reference/stage58-features.log",
+      "sha256": "2cada71f111327966f5b694eee0bdd47890d353637601bee69d772e137241a1c"
+    },
+    {
+      "path": "target/mars-reference/stage58-handshake-compatible-test.log",
+      "sha256": "05af82c3b1554c867603e8d12d852532ef8468aaa05a3069a0d145bf3bcd89df"
+    },
+    {
+      "path": "target/mars-reference/stage58-negative-fixture-test.log",
+      "sha256": "6870d843b47e247dd310b29a21a3ebf5c8f8251ae5321126afae68bbc656247f"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-runtime/boot-1.log",
+      "sha256": "aaed16121e1f83ccf9e23e6b77d19ee97e06a94ea1df5797e0c2a053685af92d"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-runtime/handshake-1.log",
+      "sha256": "0681bf25acc0cc7b6e9104cff1e7d0f2b998cb850f6028b29004559f037c3fb6"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-runtime/commands-1.json",
+      "sha256": "8f48a2903a6be8988941968ce5cf6c89f59a8220fd71521b1572d4a0a7c4cad8"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-runtime-v2/boot-1.log",
+      "sha256": "6a15333a0ddc136bd75aea69b08b0545fc2411d0721df1e53b05f55fb865acc8"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-runtime-v2/handshake-1.log",
+      "sha256": "d2c1698c43115bc3fa4d79e251560d553182507a9209a01972428afe7380af82"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-runtime-v2/commands-1.json",
+      "sha256": "9fa39db0b774a26e0a65f533f62007480066dbb71a0d7450f963450c97e6473b"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-runtime-v3/boot-1.log",
+      "sha256": "bb74d9b3ed3a56d377b545a07a8ee89667f9583722582d7076fc96b35d5b7f5e"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-runtime-v3/boot-2.log",
+      "sha256": "4557509144736b57e6dd1af28c84a8870debb082ba92306fb33a6133116a0c34"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-runtime-v3/handshake-1.log",
+      "sha256": "11798f4a038a3d94dbe1b076f64cd7440f04358ca4d916e061e1f134c913c411"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-runtime-v3/handshake-2.log",
+      "sha256": "63a4b57dd186db027f15c45507dcc1e8b870ad4826a02f088e63f38ed63203d0"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-runtime-v3/commands-1.json",
+      "sha256": "afd84ccb580afeaa9dbe2ee426a2f8a9f0947f4482664eb2a86ed49cffb406b4"
+    },
+    {
+      "path": "target/mars-reference/stage58-command-runtime-v3/commands-2.json",
+      "sha256": "58e051de37b124d654e9a4c5cd8471ccbdbfccb0a0b1ae87170485369e491814"
+    },
+    {
+      "path": "target/mars-reference/stage58-negative-fixture/boot-1.log",
+      "sha256": "7345d25d8182058ef40c997beba4cde39df4a5098a37fa8a15d08e1617b38673"
+    },
+    {
+      "path": "target/mars-reference/stage58-negative-fixture/handshake-1.log",
+      "sha256": "8941b2309de42a0dedd956be8e684a14baf562ada5806a65aab0ce87abef28f6"
+    },
+    {
+      "path": "target/mars-reference/stage58-negative-fixture/commands-1.json",
+      "sha256": "e53927cb9eb996743adc5bd6e2cc6af3387089f22c7dbb6a5660346ab3348082"
+    },
+    {
+      "path": "target/mars-reference/stage58-handshake-compatible/boot-1.log",
+      "sha256": "b1eb6543969472e8f304998fcc78d2ec628088be62a0855121b51654ae599e5c"
+    },
+    {
+      "path": "target/mars-reference/stage58-handshake-compatible/boot-2.log",
+      "sha256": "82edffd854e31c1fe226ca0b903f1f8a5d13228e0bfa5cc9ea7b37f1519d8f3e"
+    },
+    {
+      "path": "target/mars-reference/stage58-handshake-compatible/handshake-1.log",
+      "sha256": "a1dd98cd1477991ddc2acae8344412e5af0af21e52a85b00e669cf1d8c113c61"
+    },
+    {
+      "path": "target/mars-reference/stage58-handshake-compatible/handshake-2.log",
+      "sha256": "9161307e18e1fa6e34627e4c10a13988ef715173a2a54b774caceb8b46ef4f5d"
+    }
+  ]
+}

@@ -19,6 +19,11 @@ use vibeos_hal::Board as BoardContract;
 mod early_devices;
 #[cfg(feature = "trng-model-test")]
 mod trng_model;
+#[cfg(all(feature = "mars-entropy-composition-test", feature = "entropy-composition-test"))]
+compile_error!("select exactly one test entropy provider");
+#[cfg(feature = "mars-entropy-composition-test")]
+#[no_mangle]
+pub static VIBEOS_ENTROPY_DEVICE: vibeos_hal::entropy::EntropyDevice = trng_model::ENTROPY_DEVICE;
 #[path = "../../qemu-virt/src/network.rs"]
 mod network;
 #[path = "../../qemu-virt/src/storage.rs"]
@@ -51,6 +56,7 @@ unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
     #[cfg(feature = "trng-model-test")]
     {
         trng_model::run();
+        _print(format_args!("MARS_ENTROPY_TABLE_MODEL PASS backing=private approval=diagnostic reset=retained\n"));
         _print(format_args!("JH7110_SEC_MODEL PASS gates=STG reset=shared bit=3 stopped=acknowledged\n"));
         _print(format_args!("JH7110_TRNG_MODEL PASS reseed=per-block failure=no-output entropy=unqualified\n"));
         _print(format_args!("JH7110_TRNG_MMIO PASS backing=RAM access=volatile32 entropy=unqualified\n"));

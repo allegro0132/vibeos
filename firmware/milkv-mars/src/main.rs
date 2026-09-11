@@ -21,6 +21,22 @@ mod early_devices;
 mod storage;
 #[cfg(feature = "trng-probe")]
 mod trng_probe;
+#[cfg(feature = "trng-probe")]
+mod entropy;
+#[cfg(feature = "trng-probe")]
+#[no_mangle]
+pub static VIBEOS_ENTROPY_DEVICE: vibeos_hal::entropy::EntropyDevice = entropy::DEVICE;
+#[cfg(feature = "trng-probe")]
+type NativeEntropyInstance = vibeos_firmware_milkv_mars::entropy_instance::Instance<
+    vibeos_platform_jh7110::security::Mmio, vibeos_starfive_trng::Mmio>;
+#[cfg(feature = "trng-probe")]
+fn entropy_description() -> Option<vibeos_hal::device_transport::Descriptor> {
+    let r = admission().trng?;
+    Some(vibeos_hal::device_transport::Descriptor {
+        kind: vibeos_hal::device_transport::Kind::Entropy,
+        slot: 0, base: r.registers.start, irq: r.irq, vendor_id: 0,
+    })
+}
 #[cfg(feature = "ethernet")]
 mod network;
 struct BootState {

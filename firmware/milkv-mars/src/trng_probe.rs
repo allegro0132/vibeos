@@ -74,8 +74,8 @@ pub unsafe fn run(write: fn(&str)) {
         timebase,
     )
     .unwrap();
-    // Retain both owners on this stack until a confirmed stop, or SBI shutdown
-    // on failure. There is no retry, dynamic registration or fallback source.
+    // Installation moves both owners into permanent firmware storage. There is
+    // no retry, dynamic module registration or fallback source.
     let trng = Trng::new(
         Mmio::new(
             resources.registers.start,
@@ -87,13 +87,17 @@ pub unsafe fn run(write: fn(&str)) {
         100_000,
     )
     .unwrap();
-    let mut instance = vibeos_firmware_milkv_mars::entropy_instance::Instance::new(domain, trng);
-    let prepared = instance.prepare(1);
+    super::entropy::install(vibeos_firmware_milkv_mars::entropy_instance::Instance::new(domain, trng));
+    let table = &super::VIBEOS_ENTROPY_DEVICE;
+    let endpoint = (table.discover)().expect("admitted TRNG source").endpoint;
+    let prepared = (table.prepare)(endpoint.slot, endpoint.base, 1, super::entropy::POLL_BUDGET);
+    let started = prepared.and_then(|()| (table.start)());
     let mut blocks = 0;
-    let result = if prepared.is_ok() {
-        instance.submit(64).and_then(|token| {
+    let result = if started.is_ok() {
+        (table.submit)(64).and_then(|token| {
             let mut output = [0; 64];
-            let bytes = instance.finish(token, &mut output)?;
+            assert!((table.completion)(token));
+            let bytes = (table.finish)(token, &mut output)?;
             for byte in &mut output { core::ptr::write_volatile(byte, 0); }
             blocks = bytes / 32;
             Ok(())
@@ -102,9 +106,9 @@ pub unsafe fn run(write: fn(&str)) {
         Err(vibeos_hal::entropy::Error::DriverRestarted)
     };
     // A failure keeps the sole SEC/child owner retained through SBI halt.
-    let stopped = instance.shutdown();
-    if prepared.is_err() || result.is_err() || stopped.is_err() {
-        halt(write, format_args!("MARS_TRNG_PROBE FAIL parent_hz={hz} prepare={prepared:?} read={result:?} stop={stopped:?} blocks={blocks}\n"));
+    let stopped = (table.shutdown)(super::entropy::POLL_BUDGET);
+    if started.is_err() || result.is_err() || stopped.is_err() {
+        halt(write, format_args!("MARS_TRNG_PROBE FAIL parent_hz={hz} prepare={started:?} read={result:?} stop={stopped:?} blocks={blocks}\n"));
     }
     print(write, format_args!("MARS_TRNG_PROBE protocol-observed parent_hz={hz} blocks={blocks} stopped=true entropy=unqualified\n"));
 }

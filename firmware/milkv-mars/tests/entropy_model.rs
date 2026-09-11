@@ -14,7 +14,7 @@ struct Model {
     fail_at: Cell<u32>,
 }
 impl Model {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self { words: [const { Cell::new(0) }; 26], gates: [const { Cell::new(0) }; 2],
             reset: Cell::new(0), stop_fails: Cell::new(false), repeat: Cell::new(false),
             generated: Cell::new(0), fail_at: Cell::new(u32::MAX) }
@@ -66,6 +66,7 @@ impl Registers for Rng<'_> {
 }
 
 pub fn run() {
+    table_model();
     let m = Model::new(); let mut i = m.instance();
     assert_eq!(i.prepare(0), Err(Error::IdentityExhausted));
     i.prepare(1).unwrap(); assert!(i.operational()); assert_eq!(i.epoch(), 1);
@@ -110,3 +111,63 @@ pub fn run() {
 }
 #[test]
 fn native_request_lifecycle() { run(); }
+
+// Execute the exact production table with the same Instance and modeled IO.
+// Only this test invocation accesses the static owner; IRQ/quiesce do not.
+#[path = "../src/entropy.rs"]
+mod provider;
+pub const ENTROPY_DEVICE: vibeos_hal::entropy::EntropyDevice = provider::DEVICE;
+type NativeEntropyInstance = Instance<Crg<'static>, Rng<'static>>;
+fn entropy_description() -> Option<vibeos_hal::device_transport::Descriptor> {
+    Some(vibeos_hal::device_transport::Descriptor {
+        kind: vibeos_hal::device_transport::Kind::Entropy,
+        slot: 0, base: 0x1600c000, irq: 30, vendor_id: 0,
+    })
+}
+struct StaticModel(core::cell::UnsafeCell<Model>);
+unsafe impl Sync for StaticModel {}
+static TABLE_MODEL: StaticModel = StaticModel(core::cell::UnsafeCell::new(Model::new()));
+fn table_model() { unsafe {
+    use vibeos_hal::entropy::{Backing, CompletionMode, Events, SourceApproval};
+    let table = &ENTROPY_DEVICE;
+    let source = (table.discover)().unwrap();
+    assert_eq!(source.approval, SourceApproval::DiagnosticOnly);
+    assert_eq!(source.endpoint, entropy_description().unwrap());
+    assert!(matches!(table.backing, Backing::DriverOwned));
+    assert_eq!(table.completion_mode, CompletionMode::Polling);
+    assert_eq!(table.queue_size, 1);
+    assert!(!(table.operational)());
+    assert_eq!((table.prepare)(0, 0x1600c000, 1, provider::POLL_BUDGET), Err(Error::Unsupported));
+    let m = &*TABLE_MODEL.0.get();
+    provider::install(m.instance());
+    assert_eq!((table.prepare)(1, 0x1600c000, 1, provider::POLL_BUDGET), Err(Error::Unsupported));
+    assert_eq!((table.prepare)(0, 0x1600d000, 1, provider::POLL_BUDGET), Err(Error::Unsupported));
+    assert_eq!((table.prepare)(0, 0x1600c000, 1, 0), Err(Error::Unsupported));
+    assert_eq!(m.reset.get(), 0); // invalid resources/budget performed no reset
+    (table.prepare)(0, 0x1600c000, 1, provider::POLL_BUDGET).unwrap();
+    (table.start)().unwrap(); assert_eq!((table.epoch)(), 1);
+    assert_eq!((table.accepted_features)(), 0);
+    let first = (table.submit)(64).unwrap(); assert!((table.completion)(first));
+    assert!(!(table.quiesce)(source.endpoint, provider::POLL_BUDGET));
+    assert_eq!((table.acknowledge)(source.endpoint.base), Events::default());
+    assert!((table.completion)(first)); // neither callback changed pending state
+    let mut out = [0; 64]; assert_eq!((table.finish)(first, &mut out), Ok(64));
+    assert_eq!(&out[..4], &[1, 0, 0, 0]); assert_eq!(&out[32..36], &[2, 0, 0, 0]);
+    let old = (table.submit)(1).unwrap(); (table.require_reset)();
+    assert!(!(table.completion)(old));
+    m.stop_fails.set(true);
+    assert!(!(table.confirmed_reset)(0, 0x1600c000, provider::POLL_BUDGET));
+    assert_eq!((table.start)(), Err(Error::DriverRestarted));
+    m.stop_fails.set(false);
+    assert!(!(table.confirmed_reset)(1, 0x1600c000, provider::POLL_BUDGET));
+    assert!((table.confirmed_reset)(0, 0x1600c000, provider::POLL_BUDGET));
+    (table.prepare)(0, 0x1600c000, 2, provider::POLL_BUDGET).unwrap();
+    let new = (table.submit)(1).unwrap(); assert!(new.serial > old.serial);
+    assert!(!(table.completion)(old));
+    assert_eq!((table.finish)(old, &mut out), Err(Error::DriverRestarted));
+    (table.finish)(new, &mut out).unwrap();
+    (table.reset_and_prepare)(3, provider::POLL_BUDGET).unwrap();
+    assert_eq!((table.epoch)(), 3);
+    (table.shutdown)(provider::POLL_BUDGET).unwrap(); assert!(!(table.operational)());
+    assert_eq!((table.discover)().unwrap().approval, SourceApproval::DiagnosticOnly);
+} }

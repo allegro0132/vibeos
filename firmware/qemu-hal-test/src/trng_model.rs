@@ -1,6 +1,8 @@
 //! RV64 protocol execution only; registers/noise are modeled, not physical.
 #[path = "../../milkv-mars/tests/entropy_model.rs"]
 mod entropy_model;
+#[cfg(feature = "mars-entropy-composition-test")]
+pub const ENTROPY_DEVICE: vibeos_hal::entropy::EntropyDevice = entropy_model::ENTROPY_DEVICE;
 use vibeos_starfive_trng::{Error, Registers, Trng};
 struct Model {
     words: [u32; 26],

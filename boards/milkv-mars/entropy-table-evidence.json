@@ -1,0 +1,118 @@
+{
+  "status": "Native HAL table composed; diagnostic source withheld from kernel capabilities",
+  "host_firmware_tests": 12,
+  "rv64": {
+    "harts": 4,
+    "selftests": 395,
+    "native_table_exercised_with_modeled_io": true,
+    "random_capability_published": false
+  },
+  "kernel_features": [
+    "boot-dtb-probe",
+    "legacy-shell",
+    "qemu-default-image",
+    "queued-block",
+    "queued-entropy",
+    "queued-network"
+  ],
+  "mutations_caught": [
+    "source incorrectly approved",
+    "quiesce mutates owner",
+    "confirmed_reset falsely succeeds"
+  ],
+  "mars_elf_check": {
+    "status": "elf-contract-passed",
+    "entry": 1075838976,
+    "heap_start": 1095581696,
+    "heap_end": 5368709120,
+    "elf_sha256": "099df21e2277c7e30a92bd43e4251a7b9b40ae0d16a961fee71eb40f97884864",
+    "loads": [
+      {
+        "address": 1075838976,
+        "file_bytes": 3059712,
+        "memory_bytes": 3059712,
+        "flags": 5
+      },
+      {
+        "address": 1078898688,
+        "file_bytes": 438272,
+        "memory_bytes": 438272,
+        "flags": 4
+      },
+      {
+        "address": 1079336960,
+        "file_bytes": 52976,
+        "memory_bytes": 15196160,
+        "flags": 6
+      }
+    ],
+    "physical_acceptance": false,
+    "flashable_sd_image": false,
+    "eqos_dma": {
+      "base": 1088139264,
+      "bytes": 102400,
+      "address_bits": 32,
+      "cache_line_bytes": 64
+    }
+  },
+  "physical_acceptance": false,
+  "entropy_qualified": false,
+  "ssh_enabled": false,
+  "sd_images_rebuilt": false,
+  "blind_spots": [
+    "Host/RV64 execute modeled IO, not physical SEC/TRNG",
+    "Uncertain CPU ownership cannot authorize shared SEC reset; quiesce deliberately fails",
+    "Diagnostic profile stops after consuming a boot epoch; qualified service needs separate handoff",
+    "Existing SD image predates this native operation table"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage53-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage53-capability-runtime.log",
+      "sha256": "7184c7f0b12d7868f957f7db7f2725eaea51a29b01b3455630b6a06d7d5412c1"
+    },
+    {
+      "path": "target/mars-reference/stage53-feature-tree.log",
+      "sha256": "04af19bfd516a7e1c9943f5bb528c36cd1943a9402a3c083feee13ad4b9bfb9b"
+    },
+    {
+      "path": "target/mars-reference/stage53-host.log",
+      "sha256": "9fd6e6349a9c9f9947e1cbd77aa0e2d25bbbc519a621d3f5f92877bf48556503"
+    },
+    {
+      "path": "target/mars-reference/stage53-mars-build.log",
+      "sha256": "9849b4e7e06b910452b0b93fb500fc6848db64c99b4c798c695b6261f376adab"
+    },
+    {
+      "path": "target/mars-reference/stage53-mutation-approval.log",
+      "sha256": "86d35d39c989759c278002640a67203adb116ba76b8b28e756c183c222016730"
+    },
+    {
+      "path": "target/mars-reference/stage53-mutation-quiesce.log",
+      "sha256": "bb53b4f2b2844d01169ab82c822d9d72ff68364d1a236c9d0ce7a8ba7891aafa"
+    },
+    {
+      "path": "target/mars-reference/stage53-mutation-reset.log",
+      "sha256": "1771c6690dd892c3e644cde72485a85768e89dcd341221bdc1482d01fb839fee"
+    },
+    {
+      "path": "target/mars-reference/stage53-restored.log",
+      "sha256": "46d35de5ad595ac86aa26743cdd316b82097ffd43a3d42800c5164840e37354e"
+    },
+    {
+      "path": "target/mars-reference/stage53-rv64-build.log",
+      "sha256": "3adb3bcff7a079a9e1bb1048dccf7faf1b0a0fc3205140858e3cd0af2925a95c"
+    },
+    {
+      "path": "target/mars-reference/stage53-rv64-model/serial.log",
+      "sha256": "dad1836adc05e32b067e230549073051f67e22166e60011deab8e1d5ea46721e"
+    },
+    {
+      "path": "target/mars-reference/stage53-rv64-model/summary.json",
+      "sha256": "c99ff5d36f67b41c96f0cfa4a67713da3ec7db123e840da8d405ca65191ee59d"
+    }
+  ]
+}

@@ -9,7 +9,7 @@ default = ["image"]
 image = ["dep:vibeos-kernel", "dep:vibeos-runtime-riscv", "dep:vibeos-image-policy"]
 ethernet = ["dep:vibeos-eqos-net", "dep:vibeos-ethernet", "vibeos-kernel?/dhcp-iperf3-server"]
 
-trng-probe = ["dep:vibeos-starfive-trng"]
+trng-probe = ["dep:vibeos-starfive-trng", "vibeos-kernel?/queued-entropy"]
 
 [lib]
 path = "src/lib.rs"

@@ -1484,3 +1484,37 @@ not publish a native HAL operation table or approve an entropy source; it
 provides the owner used by the existing diagnostic and the future table.
 Existing SD images were not repacked. Evidence is recorded in
 `boards/milkv-mars/entropy-instance-evidence.json`.
+
+### Native entropy HAL assembly (stage 53)
+
+The optional Mars TRNG diagnostic now exports the native HAL operation table
+and links the generic `queued-entropy` kernel path. The table describes private
+PIO backing and polling completion; no DMA slab or VirtIO transport is involved.
+The boot hart installs the sole SEC/TRNG instance in permanent firmware storage
+before invoking prepare/start/submit/completion/finish/shutdown through the table.
+Discovery returns DTB-admitted resources as `DiagnosticOnly`, so the kernel does
+not mint random or instance-state capabilities. Discovery alone is not a hardware
+readiness observation. Production SSH remains disabled.
+
+The table validates slot/base and rejects budgets below its fixed 100000-poll
+per-wait ceiling. Larger budgets do not extend driver waits. Confirmed reset
+uses the retained owner and never replaces serial/history state. If CPU ownership
+is inconsistent, hardware-only quiesce returns false: shared SEC reset cannot be
+authorized without its sole owner. IRQ acknowledgement is state-free because
+the polling driver owns the event registers.
+
+The same production operation table runs with modeled CRG/TRNG IO in host and
+RV64 tests. A dedicated `mars-entropy-composition-test` QEMU HAL profile connects
+it to the generic kernel without the QEMU board feature. It verifies native table
+lifecycle, reaches four-hart startup, reports no `virtio-rng` capability space,
+and passes all 395 selftests. Approval, quiesce-state mutation and falsely
+successful reset mutations are caught. Mars Ethernet/TRNG firmware builds and
+passes the ELF contract check. Evidence is in
+`boards/milkv-mars/entropy-table-evidence.json`.
+
+This remains a diagnostic assembly: the boot probe consumes an epoch and leaves
+the instance stopped. A future qualified service profile must hand off an
+unstarted instance to the kernel instead of merely changing the approval bit
+in this diagnostic profile. Physical source review, ownership handoff and
+production identity configuration remain outstanding. No SD image was repacked
+in this stage.

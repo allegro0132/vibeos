@@ -1,0 +1,103 @@
+{
+  "status": "Refreshed diagnostic SD image generated and structurally checked; physical acceptance pending",
+  "image": "target/mars-boot-stage54/out/mars-ethernet-trng-probe-sd.img",
+  "bytes": 672137216,
+  "sha256": "cca05dc9b9a0f9aec05fe9dfcfd9a383a3d7be9ce883b6852323a9b6137e2894",
+  "profile": "mars-4gb-sd-dhcp-iperf3-bringup-trng-probe",
+  "flashable_sd_image": true,
+  "physical_acceptance": false,
+  "entropy_qualified": false,
+  "ssh_enabled": false,
+  "firmware_code_base": "3607236260dd8611a2d2267ccedb85c103ab906e",
+  "sdk_commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+  "prior_image_preserved": {
+    "path": "target/mars-boot-ethernet-trng-probe/out/mars-ethernet-trng-probe-sd.img",
+    "sha256": "5f9545cc84b34ee583f8194ff06e0fa999c7d0fa1494c9bbd82d575423f591ba"
+  },
+  "validation": {
+    "workdir_tests": 3,
+    "sd_geometry_tests": 5,
+    "actual_bootchain_tests": 2,
+    "mutation": "same-filename-only overwrite protection rejected",
+    "serial_collector_tests": 14
+  },
+  "artifact_manifest": "target/mars-boot-stage54/out/manifest.json",
+  "bootchain_check": {
+    "status": "bootchain-contract-passed",
+    "opensbi": "1.2",
+    "uboot": "2021.10",
+    "sbi_extensions_built": [
+      "TIME",
+      "IPI",
+      "RFENCE",
+      "HSM"
+    ],
+    "spi_environment": false,
+    "physical_acceptance": false,
+    "checked_sha256": {
+      "u-boot-spl.bin.normal.out": "b05d699c43f1fa87303a5d675e98f2fb0a8d8ac3ae4e39a1a9b35f19be78c326",
+      "fw_payload.bin": "260c38e5212c8d81268e5ec79a902a07ba09ddc9a74a2a77c6bb25b0df439e0a",
+      "uboot.config": "b2e7f0d1a3ef9c8693c43b5731e1234ac0d3e9a4e78cdec7b1ea98fbdee472cb",
+      "opensbi.config": "d83376c0e8b3813285f0f83f827e419df79826bef22b0b9d3634c919b98ccef5",
+      "firmware.itb": "dde3fd4a7c2c0c2af9de9898e64bed5c98c9ed4268aac47a9ad4b5b794627afa",
+      "vibeos.itb": "2714c521f92da6b448f9bfbf14cc8b7b90e0ee8a7f03f7c7c3109a7a53e6dac5",
+      "vibeos.bin": "dc61a98a680904517d43a3bc13e7914e3ba75be1f916da38ba3570dd6f742700",
+      "mars.dtb": "f0224b4b1b6bfba25cfc81a0403804a4b7851af1a2bb385b01c9a880025c8b3d"
+    }
+  },
+  "sd_check": {
+    "status": "sd-layout-passed",
+    "bytes": 672137216,
+    "sha256": "cca05dc9b9a0f9aec05fe9dfcfd9a383a3d7be9ce883b6852323a9b6137e2894",
+    "physical_acceptance": false,
+    "ssh_enabled": false,
+    "partitions": [
+      {
+        "name": "spl",
+        "first_sector": 4096,
+        "sector_count": 4096
+      },
+      {
+        "name": "uboot",
+        "first_sector": 8192,
+        "sector_count": 8192
+      },
+      {
+        "name": "boot",
+        "first_sector": 16384,
+        "sector_count": 245760
+      },
+      {
+        "name": "vibeos-data",
+        "first_sector": 262144,
+        "sector_count": 1048576
+      }
+    ]
+  },
+  "logs": [
+    {
+      "path": "target/mars-reference/stage54-bootchain-test.log",
+      "sha256": "58a56a5b7845f391e41f3b158de5dfbcddc894dfe65f2fb3805d7927d5ab98a0"
+    },
+    {
+      "path": "target/mars-reference/stage54-mutation-profile-guard.log",
+      "sha256": "bd07cd45815703e66e360b4c23c1ed34c94da032b76aae345e3273dde4a39c40"
+    },
+    {
+      "path": "target/mars-reference/stage54-sd-build.log",
+      "sha256": "6c2139096ac93dc092e24f7faeb47f88e0ba9b80ee43a56bd01931d437caaa80"
+    },
+    {
+      "path": "target/mars-reference/stage54-sd-test.log",
+      "sha256": "bbe597c5166690a28a0624cfe689cf113ad575fd67186894056b25540c81ba49"
+    },
+    {
+      "path": "target/mars-reference/stage54-workdir-test.log",
+      "sha256": "9e3618c465353a9e4a6828d5e621fa61c3754bf90d19d768cd975a69fc4289e2"
+    },
+    {
+      "path": "target/mars-reference/stage54-serial-test.log",
+      "sha256": "519a977714e034ba179b99d4c5b3789d949cc8678a071abfbc53bd2336b9ce50"
+    }
+  ]
+}

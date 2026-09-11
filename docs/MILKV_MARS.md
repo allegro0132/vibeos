@@ -1518,3 +1518,44 @@ unstarted instance to the kernel instead of merely changing the approval bit
 in this diagnostic profile. Physical source review, ownership handoff and
 production identity configuration remain outstanding. No SD image was repacked
 in this stage.
+
+### Refreshed diagnostic SD image (stage 54)
+
+The latest diagnostic image includes the native entropy operation table and
+permanent owner from stage 53. It is stored separately from the earlier stage-44
+image, whose SHA-256 was rechecked unchanged. The new regular image file is
+`target/mars-boot-stage54/out/mars-ethernet-trng-probe-sd.img`
+(672137216 bytes / 641 MiB), SHA-256:
+
+```text
+cca05dc9b9a0f9aec05fe9dfcfd9a383a3d7be9ce883b6852323a9b6137e2894
+```
+
+Its output directory contains `manifest.json`, `SHA256SUMS`, GPT/FIT/bootchain
+checks, the pinned component configurations and tool versions. The build still
+uses SDK commit `1fd6bac9f2efde47fbb8afd28d2903c49f893e3f`; it includes SPL DDR
+initialization, OpenSBI/U-Boot, the Mars DTB and a separate VibeOS data partition.
+The script creates a regular image file and never writes physical SD or SPI.
+The physical SD selector/board-revision and serial checks documented above still
+apply. This image provides DHCP/iperf3 and TRNG diagnostics; entropy remains
+unqualified and SSH remains disabled. It is not full Mars acceptance.
+
+To preserve each generation, choose an unused directory:
+
+```sh
+sh scripts/build-mars-sd.sh --ethernet --trng-probe \
+  --work-dir target/mars-boot-stage54
+```
+
+Relative work directories are relative to the repository. The default paths
+remain compatible. Any existing Mars image in the selected output directory,
+including another profile or a dangling image symlink, prevents reuse before
+SDK or build access. This protects the shared artifacts and manifest beside it.
+Use a fresh work directory for the next build; the command above deliberately
+refuses to replace this image.
+
+Work-directory rejection, SD geometry/bounds, and checks of the actual bootchain
+artifacts pass. A mutation restoring same-filename-only protection is caught.
+Evidence: `boards/milkv-mars/sd-stage54-evidence.json`. Physical cold starts,
+SD persistence, network/DMA behavior, qualified entropy, production SSH/WASM
+and the one-hour stability run remain outstanding.

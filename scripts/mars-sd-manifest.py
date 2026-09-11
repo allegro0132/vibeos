@@ -11,9 +11,13 @@ root = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--ethernet', action='store_true')
 parser.add_argument('--trng-probe', action='store_true')
+parser.add_argument('--work-dir', type=Path, help='build work directory; relative to repository')
 args = parser.parse_args()
 suffix = '-trng-probe' if args.trng_probe else ''
-out = root / (('target/mars-boot-ethernet' if args.ethernet else 'target/mars-boot') + suffix) / 'out'
+work = args.work_dir if args.work_dir is not None else Path(('target/mars-boot-ethernet' if args.ethernet else 'target/mars-boot') + suffix)
+if not work.is_absolute():
+    work = root / work
+out = work / 'out'
 payload_dir = root / (('target/milkv-mars/ethernet' if args.ethernet else 'target/milkv-mars/bringup') + suffix)
 payload = json.loads((payload_dir / 'manifest.json').read_text())
 image = ('mars-ethernet' if args.ethernet else 'mars-serial') + suffix + '-sd.img'

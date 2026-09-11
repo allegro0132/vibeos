@@ -3,13 +3,25 @@
 set -eu
 profile=serial
 trng=0
-for arg in "$@"; do
-    case "$arg" in
-        --ethernet) [ "$profile" = serial ] || exit 2; profile=ethernet ;;
-        --trng-probe) [ "$trng" -eq 0 ] || exit 2; trng=1 ;;
-        *) echo 'usage: build-mars-sd.sh [--ethernet] [--trng-probe]' >&2; exit 2 ;;
+work_override=
+usage() { echo 'usage: build-mars-sd.sh [--ethernet] [--trng-probe] [--work-dir DIRECTORY]' >&2; exit 2; }
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --ethernet) [ "$profile" = serial ] || usage; profile=ethernet ;;
+        --trng-probe) [ "$trng" -eq 0 ] || usage; trng=1 ;;
+        --work-dir)
+            [ -z "$work_override" ] && [ "$#" -ge 2 ] && [ -n "$2" ] || usage
+            case "$2" in --*) usage ;; esac
+            work_override=$2
+            shift ;;
+        *) usage ;;
     esac
+    shift
 done
+# Forward only profile flags to payload and in-container packaging commands.
+set --
+[ "$profile" != ethernet ] || set -- "$@" --ethernet
+[ "$trng" -eq 0 ] || set -- "$@" --trng-probe
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 sdk_commit=1fd6bac9f2efde47fbb8afd28d2903c49f893e3f
@@ -25,11 +37,23 @@ if [ "$trng" -eq 1 ]; then
     payload="$payload-trng-probe"
     profile="$profile-trng-probe"
 fi
-image="mars-$profile-sd.img"
-if [ -e "$work/out/$image" ]; then
-    echo "Move the previous $work/out/$image before rebuilding." >&2
-    exit 1
+# Relative custom work paths are relative to the repository, as are defaults.
+# Keep SDK inputs shared and pinned even when archiving a new output generation.
+if [ -n "$work_override" ]; then
+    case "$work_override" in
+        /*) work=$work_override ;;
+        *) work="$root/$work_override" ;;
+    esac
 fi
+image="mars-$profile-sd.img"
+# Artifacts and manifest are shared within a work directory. Even a different
+# profile image must prevent reuse, or its existing evidence would be replaced.
+for previous in "$work"/out/mars-*-sd.img; do
+    if [ -e "$previous" ] || [ -L "$previous" ]; then
+        echo "Move the previous $previous or select a new --work-dir before rebuilding." >&2
+        exit 1
+    fi
+done
 mkdir -p "$work/input"
 if [ ! -d "$sdk/.git" ]; then
     mkdir -p "$(dirname "$sdk")"
@@ -52,5 +76,5 @@ docker run --rm --mount "type=bind,source=$work,target=/work" \
 docker run --rm --mount "type=bind,source=$work,target=/work" \
     --mount "type=bind,source=$sdk,target=/work/sdk,readonly" \
     vibeos-mars-boot-tools:stage25 sh /work/input/package.sh "$@"
-python3 scripts/mars-sd-manifest.py "$@"
+python3 scripts/mars-sd-manifest.py "$@" --work-dir "$work"
 echo "Test image: $work/out/$image (physical qualification pending)"

@@ -1199,3 +1199,26 @@ Evidence is in `boards/milkv-mars/security-mapping-evidence.json`.
 Mapping alone does not register or run a driver and does not prove physical
 MMIO decoding. The shared-domain ownership, parent-clock preparation, firmware
 entropy service and physical entropy/SSH qualification remain outstanding.
+
+### TRNG native register lane
+
+`vibeos-starfive-trng::Mmio` now supplies the ordered volatile 32-bit lane for
+the existing polling protocol. Firmware passes a mapped aperture and timer;
+the driver has no board address, kernel dependency, clock/reset policy or
+entropy estimate. Construction checks alignment, minimum extent and address
+overflow without IO. Register allowlists exclude reserved offsets and writes
+to status, mission-mode and random-output words. Firmware must exclusively own
+ISTAT, mask the PLIC source on every hart and keep the shared SEC domain alive.
+
+Three new host tests verify aperture rejection, exact word access and untouched
+neighbors, and rejection of forbidden reads/writes; all 13 driver tests pass.
+RV64 executes the same native lane against RAM, reports `JH7110_TRNG_MMIO PASS`
+and passes 395 kernel selftests. The generated lane contains RV64 IO fences.
+Mutations weakening the aperture bound, allowing status writes and redirecting
+word addresses are detected. Evidence is recorded in
+`boards/milkv-mars/trng-mmio-evidence.json`.
+
+The RAM access test does not emulate hardware register side effects or verify
+the Mars MMIO bus. No production TRNG instance or random capability is published
+by this change. Parent-clock lifetime, shared-domain composition and physical
+entropy/SSH qualification remain required; existing SD images are unchanged.

@@ -6,6 +6,9 @@
 //! Register references and deliberate restrictions are recorded in
 //! `boards/milkv-mars/trng-reference.json` in the workspace.
 
+mod mmio;
+pub use mmio::{InvalidAperture, Mmio};
+
 const CTRL: usize = 0;
 const STAT: usize = 4;
 const MODE: usize = 8;

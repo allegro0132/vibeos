@@ -27,9 +27,13 @@ the bring-up firmware does not discover arbitrary GPT/MBR partition layouts.
 The packer places all boot components and the FAT partition below the data
 boundary. The kernel has no exported raw-card diagnostic entry.
 
-EQoS is not composed, so no NIC capabilities or SSH service are available. No
-unqualified entropy source or temporary SSH identity is enabled. Compiling or
-passing the ELF checker does not satisfy Mars physical acceptance.
+The default payload has no NIC. Add `--ethernet` to either build script for
+the EQoS test composition (DHCP and TCP 5201 iperf3); its SD artifacts are kept
+separately in `target/mars-boot-ethernet/out`. Neither profile enables SSH.
+The TRNG protocol and ordered MMIO lane are available as a separate driver,
+but firmware entropy-service composition and physical qualification remain
+pending. Compiling or passing the ELF checker does not satisfy Mars physical
+acceptance.
 
 See [bootchain instructions](bootchain/README.md) for layout, build tools,
 hardware revision requirements and evidence limitations.

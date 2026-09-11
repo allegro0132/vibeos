@@ -1,0 +1,74 @@
+{
+  "status": "Native TRNG register lane verified against RAM; physical acceptance pending",
+  "host_driver_tests": 13,
+  "new_mmio_tests": 3,
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 0,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 121921536,
+    "kernel_sha256": "d633b12a7b316bb42a4b2b06bbdb190a9e24286b22d75672d660ebde2d85d32f",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "mutations": [
+    "short aperture accepted: detected",
+    "status write allowed: detected",
+    "incorrect word address: detected"
+  ],
+  "physical_acceptance": false,
+  "entropy_driver_registered": false,
+  "sd_images_rebuilt": false,
+  "blind_spots": [
+    "RAM-backed access does not verify Mars MMIO decoding or register side effects",
+    "Fences in generated RV64 code do not prove physical bus behavior",
+    "Parent-clock lifetime and shared SEC ownership still require firmware composition",
+    "No entropy estimate, physical source qualification or SSH enabled"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage41-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage41-host.log",
+      "sha256": "289cd16afda0531e139b0c8a61e2e0c6fa8be48a63264fa3eefc72e85656369a"
+    },
+    {
+      "path": "target/mars-reference/stage41-mmio-access-disassembly.log",
+      "sha256": "5c5f2638c473b8340cf79097494041026ae4efcdca90272c5ed677b4d018183f"
+    },
+    {
+      "path": "target/mars-reference/stage41-mmio-disassembly.log",
+      "sha256": "e7cb7271f94c6547e1d9f6f3932675a6bebad9fedfaab761a21fbe710b6e7471"
+    },
+    {
+      "path": "target/mars-reference/stage41-mutation-allow-status-write.log",
+      "sha256": "335ba1e809a5138d819040c6a61bd887069d1ecea2882b1d617f4c8d4d3042af"
+    },
+    {
+      "path": "target/mars-reference/stage41-mutation-short-range.log",
+      "sha256": "0ee6174b13ed06d8e950fad317ccf8c19caa36dbe7703a2175cf621c16dfd064"
+    },
+    {
+      "path": "target/mars-reference/stage41-mutation-wrong-word.log",
+      "sha256": "fdbfc34a95120148c7ad35c3aad8f3873ce3bf843ea58a61376c6806bd003334"
+    },
+    {
+      "path": "target/mars-reference/stage41-rv64-build.log",
+      "sha256": "b998f66d014ecf75cf5a8875165d98520a39bdf136f01e7bb3c7b12ac5d4fb78"
+    },
+    {
+      "path": "target/mars-reference/stage41-rv64-model/serial.log",
+      "sha256": "0733f861fff466cb78a088354fb52c02df6c1ba2b238a60818dc36601542e2dd"
+    },
+    {
+      "path": "target/mars-reference/stage41-rv64-model/summary.json",
+      "sha256": "29753b407b804cf720b26de8c6bfb85067db034dd2ba1aa1f19ece831bf3c68d"
+    }
+  ]
+}

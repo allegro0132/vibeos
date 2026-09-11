@@ -58,6 +58,7 @@ impl Registers for Model {
     }
 }
 pub fn run() {
+    mmio_lane();
     platform_model();
     let mut trng = Trng::new(Model::new(false, false), 4_000_000, 4).unwrap();
     trng.initialize().unwrap();
@@ -71,6 +72,27 @@ pub fn run() {
     let mut trng = Trng::new(Model::new(false, true), 4_000_000, 4).unwrap();
     assert_eq!(trng.initialize(), Err(Error::TimedOut));
     assert_eq!(trng.initialize(), Err(Error::NotReady));
+}
+
+// RAM-backed access test: executes the production volatile/fence lane on RV64,
+// but does not simulate TRNG side effects or establish physical entropy quality.
+#[inline(never)]
+fn mmio_lane() {
+    use vibeos_starfive_trng::Mmio;
+    let mut words = [0xa5a5a5a5u32; 28];
+    let mut lane = unsafe {
+        Mmio::new(words.as_mut_ptr().add(1) as usize, 104, || 77).unwrap()
+    };
+    lane.write(100, 0x12345678);
+    lane.write(16, 0);
+    assert_eq!(lane.read(100), 0x12345678);
+    assert_eq!(lane.read(16), 0);
+    for offset in (32..64).step_by(4) {
+        assert_eq!(lane.read(offset), 0xa5a5a5a5);
+    }
+    assert_eq!(lane.ticks(), 77);
+    assert_eq!(words[0], 0xa5a5a5a5);
+    assert_eq!(words[27], 0xa5a5a5a5);
 }
 
 fn platform_model() {

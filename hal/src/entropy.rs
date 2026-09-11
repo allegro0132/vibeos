@@ -28,12 +28,22 @@ pub struct Events {
 /// policy. Polling callbacks must remain bounded and must not require IRQ ack.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionMode { Interrupt, Polling }
+/// Storage retained by the sole driver incarnation. This description does not
+/// allocate memory or grant DMA reachability; drivers own those mappings.
+#[derive(Clone, Copy, Debug)]
+pub enum Backing {
+    /// A stable CPU-visible slab also used by hardware DMA.
+    Dma { cpu_base: fn() -> usize, bytes: usize },
+    /// Private controller/PIO state with no hardware DMA allocation.
+    DriverOwned,
+}
 /// # Safety
-/// Engine operations require exclusive ownership of the instance and its DMA
-/// pool. Discovery runs before claims. Completion reads may not race mutation.
+/// Engine operations require exclusive ownership of the instance and its backing
+/// state (including the DMA pool when present). Discovery runs before claims.
+/// Completion reads may not race mutation.
 /// Acknowledgement and quiesce must not borrow mutable instance state. Buffers
 /// are copied only at finish; no caller pointer may be published to hardware.
-/// A failed reset retains DMA ownership until a later confirmed reset.
+/// A failed reset retains instance/backing ownership until confirmed retirement.
 pub struct EntropyDevice {
     /// Firmware admits one entropy endpoint after resources are mapped.
     pub discover: unsafe fn() -> Option<crate::device_transport::Descriptor>,
@@ -46,8 +56,7 @@ pub struct EntropyDevice {
     pub completion_mode: CompletionMode,
     /// Hardware queue capacity for diagnostics, not the kernel request limit.
     pub queue_size: u16,
-    pub dma_base: fn() -> usize,
-    pub dma_bytes: usize,
+    pub backing: Backing,
     pub prepare: unsafe fn(usize, usize, u64, usize) -> Result<(), Error>,
     pub start: unsafe fn() -> Result<(), Error>,
     pub epoch: unsafe fn() -> u64,

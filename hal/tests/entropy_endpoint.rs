@@ -25,8 +25,7 @@ static VIBEOS_ENTROPY_DEVICE: EntropyDevice = EntropyDevice {
     },
     completion_mode: CompletionMode::Polling,
     queue_size: 1,
-    dma_base: || 0,
-    dma_bytes: 0,
+    backing: Backing::DriverOwned,
     prepare: |slot, base, epoch, budget| {
         assert_eq!((slot, base, epoch, budget), (2, 0x1600c000, 3, 10));
         PREPARED.store(1, SeqCst);
@@ -51,6 +50,7 @@ static VIBEOS_ENTROPY_DEVICE: EntropyDevice = EntropyDevice {
 
 #[test]
 fn native_endpoint_needs_no_shared_transport_and_preserves_owner_on_quiesce() {
+    assert!(matches!(adapter::backing(), Backing::DriverOwned));
     let endpoint = unsafe { adapter::Endpoint::discover() }.unwrap();
     assert_eq!((endpoint.slot(), endpoint.base(), endpoint.irq(), endpoint.vendor_id()), (2, 0x1600c000, 30, 7));
     let engine = unsafe { adapter::Engine::prepare(endpoint, 3, 10) }.unwrap();

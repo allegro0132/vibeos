@@ -26,7 +26,7 @@ impl Endpoint {
 pub struct Engine(());
 impl Engine {
     /// # Safety
-    /// Caller holds the exact device/DMA claim and excludes every old engine.
+    /// Caller holds the exact device/backing-state claim and excludes every old engine.
     pub unsafe fn prepare(t: Endpoint, epoch: u64, budget: usize) -> Result<Self, Error> {
         (device().prepare)(t.slot(), t.base(), epoch, budget)?;
         Ok(Self(()))
@@ -68,9 +68,6 @@ pub unsafe fn confirmed_reset(t: Endpoint, budget: usize) -> bool {
 pub unsafe fn acknowledge_interrupt_at(base: usize) -> Events {
     (device().acknowledge)(base)
 }
-pub fn dma_base() -> usize {
-    (device().dma_base)()
-}
-pub fn dma_bytes() -> usize {
-    device().dma_bytes
+pub fn backing() -> vibeos_hal::entropy::Backing {
+    device().backing
 }

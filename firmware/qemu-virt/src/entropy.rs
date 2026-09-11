@@ -6,7 +6,7 @@ use core::cell::UnsafeCell;
 use vibeos_driver_virtio_mmio::MmioTransport;
 use vibeos_driver_virtio_rng::{self as driver, Engine};
 use vibeos_hal::{
-    entropy::{CompletionMode, EntropyDevice, Error, Pending},
+    entropy::{Backing, CompletionMode, EntropyDevice, Error, Pending},
     Board as _,
 };
 struct State {
@@ -61,8 +61,7 @@ pub static VIBEOS_ENTROPY_DEVICE: EntropyDevice = EntropyDevice {
     },
     completion_mode: if cfg!(feature = "entropy-polling") { CompletionMode::Polling } else { CompletionMode::Interrupt },
     queue_size: driver::QUEUE_SIZE,
-    dma_base: driver::dma_base,
-    dma_bytes: driver::DMA_BYTES,
+    backing: Backing::Dma { cpu_base: driver::dma_base, bytes: driver::DMA_BYTES },
     prepare: |slot, base, epoch, budget| unsafe {
         let t = transport(slot, base)?;
         let s = state();

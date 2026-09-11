@@ -1383,3 +1383,23 @@ both interrupt and polling modes. Evidence is recorded in
 does not run a Mars controller or prove a complete non-DMA kernel service.
 Backing-state ownership and native service publication remain to be completed;
 physical entropy qualification is still required and SD images are unchanged.
+
+### Explicit entropy backing state
+
+The entropy table now declares either `Backing::Dma` with the existing stable
+CPU-visible slab, or `Backing::DriverOwned` with no DMA allocation. Native
+providers no longer need dummy zero-address/zero-length DMA callbacks. This
+metadata does not allocate memory or authorize device DMA mappings.
+
+The kernel capability is now `InstanceState`: both backing types require the
+same revocable READ/WRITE grant and exact incarnation claim. DMA providers keep
+the existing `dma-region` description; private controller state is described
+as `driver-state`. Retirement and quarantine continue to guard the whole
+instance, including its backing storage. Choosing private state does not bypass
+the ownership barrier or permit retry after uncertain reset.
+
+The actual kernel adapter's native-provider test now uses `DriverOwned` without
+DMA callbacks. QEMU's real DMA entropy provider passes the two-boot security
+acceptance after the capability wiring change. Evidence is in
+`boards/milkv-mars/entropy-backing-evidence.json`. Native Mars controller service
+publication and physical qualification remain pending; SD images are unchanged.

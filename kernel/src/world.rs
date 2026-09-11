@@ -2588,7 +2588,7 @@ pub fn build() {
             (Some(resources), Some(driver_space), Some(policy_space)) => {
                 let mut policy = policy_space.0.lock();
                 let mmio_root = policy.mint(resources.mmio, Rights::ALL);
-                let dma_root = policy.mint(resources.dma, Rights::ALL);
+                let dma_root = policy.mint(resources.state, Rights::ALL);
                 let source_root = policy.mint(resources.source, Rights::ALL);
                 let mut target = driver_space.0.lock();
                 let grants = (

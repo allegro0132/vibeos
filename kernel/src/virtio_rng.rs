@@ -187,25 +187,26 @@ impl Resource for MmioWindow {
     }
 }
 
-/// Capability naming the sole fixed SYSTEM-owned entropy DMA slab.
-pub struct DmaRegion;
+/// Capability naming the sole firmware-owned entropy instance state. Both
+/// DMA and PIO implementations require the same revocable READ/WRITE claim.
+pub struct InstanceState;
 
-impl Resource for DmaRegion {
+impl Resource for InstanceState {
     fn kind(&self) -> &'static str {
-        "dma-region"
+        match crate::entropy_device::backing() {
+            vibeos_hal::entropy::Backing::Dma { .. } => "dma-region",
+            vibeos_hal::entropy::Backing::DriverOwned => "driver-state",
+        }
     }
-
     fn describe(&self) -> String {
-        format!(
-            "SYSTEM stable entropy slab @ {:#x}, {} bytes",
-            crate::entropy_device::dma_base(),
-            crate::entropy_device::dma_bytes()
-        )
+        match crate::entropy_device::backing() {
+            vibeos_hal::entropy::Backing::Dma { cpu_base, bytes } => format!(
+                "SYSTEM stable entropy slab @ {:#x}, {} bytes", cpu_base(), bytes),
+            vibeos_hal::entropy::Backing::DriverOwned =>
+                String::from("firmware-owned entropy controller state (no DMA)"),
+        }
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
+    fn as_any(&self) -> &dyn Any { self }
 }
 
 /// Bounded, fallible entropy service. Possessing the Rust object is not enough:
@@ -299,7 +300,7 @@ pub async fn fill_with(
 
 pub struct RandomResources {
     pub mmio: Arc<MmioWindow>,
-    pub dma: Arc<DmaRegion>,
+    pub state: Arc<InstanceState>,
     pub source: Arc<RandomSource>,
 }
 
@@ -313,7 +314,7 @@ pub fn discover() -> Option<RandomResources> {
     // the provider validates hardware identity and assigned resource ownership.
     let transport = unsafe { Endpoint::discover() }?;
     {
-        // The transport is a boot-discovered, immutable part of the DMA claim.
+        // The endpoint is a boot-discovered, immutable part of the instance claim.
         // Publish it before any component can claim the slab so raw-fault
         // recovery never has to rely on a half-completed driver attach.
         let mut control = CONTROL.lock();
@@ -329,17 +330,18 @@ pub fn discover() -> Option<RandomResources> {
     }
     Some(RandomResources {
         mmio: MmioWindow::new(transport),
-        dma: Arc::new(DmaRegion),
+        state: Arc::new(InstanceState),
         source: RandomSource::new(),
     })
 }
 
-// Safety: DMA_CLAIM_ARENA serializes task-side CPU access. Its non-zero value
+// Safety: INSTANCE_CLAIM_ARENA serializes task-side access to the controller
+// and its backing state, whether or not hardware DMA is used. Its non-zero value
 // is the exact tracked arena which owns the current device incarnation, so
 // fault recovery can identify a claim even if attach has not yet published any
-// other driver state. A confirmed status-zero reset is the only path which
-// releases the slab for another incarnation.
-static DMA_CLAIM_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.get());
+// other driver state. Only confirmed reset/retirement under the existing
+// teardown barriers may release the instance claim for another incarnation.
+static INSTANCE_CLAIM_ARENA: AtomicU64 = AtomicU64::new(ArenaId::UNTRACKED.get());
 
 #[derive(Clone, Copy)]
 struct PendingRequest {
@@ -372,7 +374,7 @@ struct DriverControl {
 
 struct DriverAuthority {
     mmio: Revocable<MmioWindow>,
-    dma: Revocable<DmaRegion>,
+    dma: Revocable<InstanceState>,
     source: Revocable<RandomSource>,
 }
 
@@ -563,7 +565,7 @@ pub async fn driver_task(space: &'static Space, mmio_cap: Cap, dma_cap: Cap, sou
         let cspace = space.0.lock();
         match (
             cspace.lookup_revocable::<MmioWindow>(mmio_cap, Rights::READ.union(Rights::WRITE)),
-            cspace.lookup_revocable::<DmaRegion>(dma_cap, Rights::READ.union(Rights::WRITE)),
+            cspace.lookup_revocable::<InstanceState>(dma_cap, Rights::READ.union(Rights::WRITE)),
             cspace.lookup_revocable::<RandomSource>(source_cap, Rights::READ),
         ) {
             (Ok(mmio), Ok(dma), Ok(source)) => Some(DriverAuthority { mmio, dma, source }),
@@ -707,7 +709,7 @@ impl DriverSession {
             return None;
         }
         let claim_arena = domain.arena;
-        if DMA_CLAIM_ARENA
+        if INSTANCE_CLAIM_ARENA
             .compare_exchange(
                 ArenaId::UNTRACKED.get(),
                 claim_arena.get(),
@@ -741,7 +743,7 @@ impl DriverSession {
                 return None;
             }
         };
-        // Safety: this incarnation holds the exact DMA_CLAIM_ARENA claim and
+        // Safety: this incarnation holds the exact INSTANCE_CLAIM_ARENA claim and
         // no Engine has been published. On later attach failure the local
         // engine is never accessed again before teardown resets the device.
         let engine = match unsafe { Engine::prepare(transport, epoch, RESET_POLL_BUDGET) } {
@@ -940,7 +942,7 @@ impl DriverSession {
         *AUTHORITY.lock() = None;
         self.armed = false;
         // Reset was not confirmed, so the device may still own every DMA byte.
-        // DMA_CLAIM_ARENA intentionally retains this exact incarnation forever.
+        // INSTANCE_CLAIM_ARENA intentionally retains this exact incarnation forever.
     }
 }
 
@@ -993,7 +995,7 @@ fn quarantine_inconsistent_attach(transport: Endpoint) {
         control.quarantined = true;
     }
     complete_active(Err(RandomError::Quarantined));
-    // DMA_CLAIM_ARENA intentionally remains non-zero forever.
+    // INSTANCE_CLAIM_ARENA intentionally remains non-zero forever.
 }
 
 fn shutdown(transport: Endpoint, claim_arena: ArenaId, reason: RandomError) {
@@ -1016,7 +1018,7 @@ fn finish_claimed_teardown(claim_arena: ArenaId, reset: bool, reason: RandomErro
     let mut control = CONTROL.lock();
     control.online = false;
     let owns_claim =
-        claim_arena.is_tracked() && DMA_CLAIM_ARENA.load(Ordering::Acquire) == claim_arena.get();
+        claim_arena.is_tracked() && INSTANCE_CLAIM_ARENA.load(Ordering::Acquire) == claim_arena.get();
     if !reset || !owns_claim || matches!(reason, RandomError::IdentityExhausted) {
         control.quarantined = true;
     }
@@ -1036,7 +1038,7 @@ fn finish_claimed_teardown(claim_arena: ArenaId, reset: bool, reason: RandomErro
 
 fn release_dma_claim(claim_arena: ArenaId) -> bool {
     claim_arena.is_tracked()
-        && DMA_CLAIM_ARENA
+        && INSTANCE_CLAIM_ARENA
             .compare_exchange(
                 claim_arena.get(),
                 ArenaId::UNTRACKED.get(),
@@ -1165,7 +1167,7 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
     // remains valid from the first successful claim instruction, including the
     // attach window before DriverSession exists or CONTROL has been touched by
     // that component.
-    if !domain.arena.is_tracked() || DMA_CLAIM_ARENA.load(Ordering::Acquire) != domain.arena.get() {
+    if !domain.arena.is_tracked() || INSTANCE_CLAIM_ARENA.load(Ordering::Acquire) != domain.arena.get() {
         return;
     }
 

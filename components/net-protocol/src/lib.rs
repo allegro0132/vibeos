@@ -586,6 +586,9 @@ impl From<TcpFrontendError> for TcpFrontendDriveError {
 
 struct TcpListenerEntry {
     socket: SocketHandle,
+    // One bounded pending connection for exclusive service ports. Shared port
+    // groups already allocate their own parallel connection sockets.
+    pending: Option<SocketHandle>,
     port: u16,
     port_group: Option<u64>,
     generation: u64,
@@ -718,24 +721,8 @@ impl SharedIpv4TcpStack {
             return Err(StackError::TcpListenerLimitReached);
         }
 
-        let receive = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
-        let transmit = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
-        let mut socket = tcp::Socket::new(receive, transmit);
-        socket.set_congestion_control(tcp::CongestionControl::Reno);
-        socket.set_nagle_enabled(false);
-        // The packet backends are polled and currently cannot wake this task
-        // when a frame arrives.  smoltcp's default 10 ms delayed ACK would
-        // therefore be observed only on a later protocol poll.  On the Duo's
-        // one-descriptor DWMAC receive path that turns TCP into stop-and-wait:
-        // one MSS followed by roughly 20 ms of silence.  ACK immediately so
-        // the peer can refill the deliberately bounded receive window.
-        socket.set_ack_delay(None);
-        socket.set_timeout(Some(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS)));
-        socket
-            .listen(port)
-            .expect("validated non-zero TCP port must be listenable");
-
-        let socket = self.sockets.add(socket);
+        let socket = self.sockets.add(passive_socket(port));
+        let pending = port_group.is_none().then(|| self.sockets.add(passive_socket(port)));
         let generation = self.next_listener_generation;
         self.next_listener_generation = self
             .next_listener_generation
@@ -745,6 +732,7 @@ impl SharedIpv4TcpStack {
             .expect("the bounded TCP listener table fits in a u8");
         self.listeners.push(TcpListenerEntry {
             socket,
+            pending,
             port,
             port_group,
             generation,
@@ -1110,6 +1098,22 @@ impl SharedIpv4TcpStack {
             if listener.reset_requested && !rearm_resets {
                 continue;
             }
+            if let Some(pending) = listener.pending {
+                // Promote only at the START of a later turn. The prior turn
+                // must publish the old connection's inactive edge so queued
+                // capability bytes and close requests cannot cross generations.
+                if !rearm_resets
+                    && self.sockets.get::<tcp::Socket>(listener.socket).state() == tcp::State::Listen
+                    && self.sockets.get::<tcp::Socket>(pending).is_active()
+                {
+                    let old = core::mem::replace(&mut listener.socket, pending);
+                    listener.pending = Some(old);
+                }
+                let pending = self.sockets.get_mut::<tcp::Socket>(listener.pending.unwrap());
+                if pending.state() == tcp::State::Closed {
+                    pending.listen(listener.port).expect("validated pending port");
+                }
+            }
             let socket = self.sockets.get_mut::<tcp::Socket>(listener.socket);
             // `is_open()` is also false in TIME-WAIT. Re-listening there would
             // reset delayed-ACK/close state. Only CLOSED is safe to reuse.
@@ -1125,6 +1129,9 @@ impl SharedIpv4TcpStack {
     fn abort_for_reconfiguration(&mut self) {
         for listener in &mut self.listeners {
             self.sockets.get_mut::<tcp::Socket>(listener.socket).abort();
+            if let Some(pending) = listener.pending {
+                self.sockets.get_mut::<tcp::Socket>(pending).abort();
+            }
             listener.connection_active = false;
             listener.reset_requested = false;
             listener.last_poll = TcpListenerPollReport::default();
@@ -1543,4 +1550,25 @@ fn validate_ipv4_address(
 fn is_unicast_ipv4(octets: [u8; 4]) -> bool {
     let address = Ipv4Addr::from(octets);
     !address.is_unspecified() && !address.is_multicast() && octets != [255; 4] && octets[0] != 0
+}
+
+fn passive_socket(port: u16) -> tcp::Socket<'static> {
+    let receive = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
+    let transmit = tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]);
+    let mut socket = tcp::Socket::new(receive, transmit);
+    socket.set_congestion_control(tcp::CongestionControl::Reno);
+    socket.set_nagle_enabled(false);
+    // The packet backends are polled and currently cannot wake this task
+    // when a frame arrives.  smoltcp's default 10 ms delayed ACK would
+    // therefore be observed only on a later protocol poll.  On the Duo's
+    // one-descriptor DWMAC receive path that turns TCP into stop-and-wait:
+    // one MSS followed by roughly 20 ms of silence.  ACK immediately so
+    // the peer can refill the deliberately bounded receive window.
+    socket.set_ack_delay(None);
+    socket.set_timeout(Some(Duration::from_secs(TCP_IDLE_TIMEOUT_SECS)));
+    socket
+        .listen(port)
+        .expect("validated non-zero TCP port must be listenable");
+
+    socket
 }

@@ -7,6 +7,8 @@ Optional --command-module/--trap-module also test public-key authentication,
 upload, WASI IO/arguments/exit/traps and persistence. Build command-composition-test
 instead of ssh-composition-test for that mode. Does not test threads or physical
 entropy quality. Never use the generated disk as a production identity.
+Command checks never reconnect or replay on failure. PCAP files are retained
+for virtual TCP close/accept diagnostics.
 """
 import argparse
 import hashlib
@@ -34,6 +36,7 @@ def boot(kernel, output, disk, number, modules=None, expected_key=None):
             '-object', 'rng-random,filename=/dev/urandom,id=rng0',
             '-device', 'virtio-rng-device,rng=rng0',
             '-netdev', f'user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22',
+            '-object', f'filter-dump,id=capture,netdev=net0,file={output / f"network-{number}.pcap"}',
             '-device', 'virtio-net-device,netdev=net0'],
             stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT)
         try:
@@ -125,24 +128,12 @@ def commands(table_path, output, vm, port, number, modules):
         raise RuntimeError('persisted client key did not authenticate')
     evidence = []
     def execute(words, data=b'', status=0, stdout=b'', stderr=b''):
-        for attempt in range(4):
-            offset = table_path.stat().st_size
-            result = subprocess.run([*base, shlex.join(words)], input=data,
-                                    capture_output=True, timeout=30)
-            observed = table_path.read_bytes()[offset:]
-            began = any(marker in observed for marker in
-                        (b'WASI running', b'WASI upload receiving', b'WASI admission rejected'))
-            retry = (attempt < 3 and result.returncode == 255 and not result.stdout
-                     and b'kex_exchange_identification:' in result.stderr and not began)
-            evidence.append({'command': words, 'status': result.returncode,
-                             'preauth_retry': retry,
-                             'stdout_hex': result.stdout.hex(), 'stderr_hex': result.stderr.hex()})
-            (output / f'commands-{number}.json').write_text(json.dumps(evidence, indent=2) + '\n')
-            if not retry:
-                break
-            # Match the existing WASI peer: only a demonstrably pre-request
-            # connection reset is retried. Never replay a started upload/run.
-            time.sleep(0.25)
+        result = subprocess.run([*base, shlex.join(words)], input=data,
+                                capture_output=True, timeout=30)
+        evidence.append({'command': words, 'status': result.returncode,
+                         'preauth_retry': False,
+                         'stdout_hex': result.stdout.hex(), 'stderr_hex': result.stderr.hex()})
+        (output / f'commands-{number}.json').write_text(json.dumps(evidence, indent=2) + '\n')
         if (result.returncode, result.stdout, result.stderr) != (status, stdout, stderr):
             raise RuntimeError(f'command mismatch: {words}; inspect commands-{number}.json')
     # Boot two deliberately skips both authorization and upload.
@@ -158,6 +149,10 @@ def commands(table_path, output, vm, port, number, modules):
     execute([*run, 'stderr'], stdout=b'out\n', stderr=b'err\n')
     execute([*run, 'exit'], status=7)
     execute(['wasm-run', 'composition-trap.wasm'], status=125)
+    # No pacing or reconnect retry: a successor SYN may overlap the previous
+    # command's passive TCP close. Each connection gets a fresh SSH session.
+    for index in range(16):
+        execute(['echo', f'connection-{index}'], stdout=f'connection-{index}\n'.encode())
 
 
 def main():
@@ -202,6 +197,8 @@ def main():
               'host_public_key': ' '.join(first), 'identity_persisted': True,
               'authentication_tested': modules is not None, 'wasm_tested': modules is not None,
               'wasm_threads_tested': False,
+              'command_retries_allowed': False,
+              'consecutive_echo_connections_per_boot': 0 if modules is None else 16,
               'module_sha256': {} if modules is None else {n: hashlib.sha256(b).hexdigest() for n, b in modules.items()},
               'physical_acceptance': False,
               'kernel_sha256': kernel_hash,

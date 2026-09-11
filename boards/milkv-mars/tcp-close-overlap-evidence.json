@@ -1,0 +1,160 @@
+{
+  "status": "QEMU close-overlap regression fixed; physical and sustained-load acceptance pending",
+  "cause": "A successor SYN arrived during the current socket CLOSE-WAIT and received RST before SSH negotiation.",
+  "design": {
+    "pending_connections_per_exclusive_listener": 1,
+    "additional_stream_buffer_bytes_per_exclusive_listener": 65536,
+    "exclusive_listener_limit": 8,
+    "shared_port_groups_changed": false,
+    "promotion": "Only after old socket returns to LISTEN, on a subsequent poll preserving the inactive frontend edge",
+    "time_wait_retained": true,
+    "address_reconfiguration_aborts_pending": true
+  },
+  "before": {
+    "baseline_command_retries": 16,
+    "no_retry_harness_old_elf": "failed at first upload with pre-KEX connection reset"
+  },
+  "after": {
+    "status": "passed",
+    "boots": 2,
+    "harts": 4,
+    "selftests_per_boot": 395,
+    "host_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKjcvTZIrDqdMM+9GNh+9Wt2H1ELAjKKe7vQuFPZ0b8/",
+    "identity_persisted": true,
+    "authentication_tested": true,
+    "wasm_tested": true,
+    "wasm_threads_tested": false,
+    "command_retries_allowed": false,
+    "consecutive_echo_connections_per_boot": 16,
+    "module_sha256": {
+      "composition-hello.wasm": "2fc8f58df91a31eaf91698693fca489bea9014871f1b99227a04e09b39a11303",
+      "composition-trap.wasm": "f871c8e6845227d776312d643b2bfbf076f9b5a55f9322a33440f18db838c58f"
+    },
+    "physical_acceptance": false,
+    "kernel_sha256": "922786f7b4caa8829922f4c2a5034dc5130cef8a37377799613b250ec4e3bac6",
+    "preauth_command_retries": 0
+  },
+  "successful_command_checks_per_boot": [
+    25,
+    23
+  ],
+  "host_tests_passed": 29,
+  "mutation": "Removing pending socket fails next_connection_waits_while_previous_peer_close_is_drained at successor handshake assertion; source restored",
+  "builds": {
+    "qemu_independent_provisioned_commands": "passed RV64 release",
+    "duo_default": "passed RV64 cargo check",
+    "mars_native_ethernet_entropy_provisioned_commands": "passed RV64 release link only"
+  },
+  "driver_dependency_boundaries": "passed",
+  "command_checks_retry": false,
+  "initial_readiness_may_retry": true,
+  "physical_acceptance": false,
+  "one_hour_stability_tested": false,
+  "mars_entropy_qualified": false,
+  "mars_ssh_enabled": false,
+  "wasmtime_tested": false,
+  "threads_tested": false,
+  "sd_image_repacked": false,
+  "logs": [
+    {
+      "path": "target/mars-reference/stage59-build.log",
+      "sha256": "3996a6756f8a211f36ce8f7d2bb7eaa75f0e2076d70ddaa90dcf4b1e784b46e5"
+    },
+    {
+      "path": "target/mars-reference/stage59-host-final.log",
+      "sha256": "3ecb885928577da65e2db79e0895856639d278f64e71346a764539f4dc607973"
+    },
+    {
+      "path": "target/mars-reference/stage59-negative-no-pending.log",
+      "sha256": "c1ed0a864c36356d57ddc90e410064bee09f93949c52102e7f5397b709e65141"
+    },
+    {
+      "path": "target/mars-reference/stage59-duo-check.log",
+      "sha256": "12914079333faf1102ec285864467a24feecb9d71496cbb3e6532a241c3c83d6"
+    },
+    {
+      "path": "target/mars-reference/stage59-mars-build.log",
+      "sha256": "7ba9f23485ae8ab37043481dbb9b51beae40402f3a4437bfa6079bf8de139e60"
+    },
+    {
+      "path": "target/mars-reference/stage59-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage59-baseline-flags.log",
+      "sha256": "145335678f77d81738dd0cb523f3dc85da47fe18542a63870c5bece705ee52ce"
+    },
+    {
+      "path": "target/mars-reference/stage59-fixed-flags.log",
+      "sha256": "17d9eee56fa1a1ee6f7519dce44136c2fd9f282381bf2441679517723ba7fc4d"
+    },
+    {
+      "path": "target/mars-reference/stage59-tcp-baseline/result.json",
+      "sha256": "2646d6530b43e96fa356b07913692f09fd377eede6a680df1d876f7dc6e1dac3"
+    },
+    {
+      "path": "target/mars-reference/stage59-tcp-baseline/boot-1.log",
+      "sha256": "c7135b6f31e879351b910320abf89d18a233e5e8a4cecffdab023f2275be9ebb"
+    },
+    {
+      "path": "target/mars-reference/stage59-tcp-baseline/boot-2.log",
+      "sha256": "7855ae39aaa9aa18f990758792f3baaed42e75ba5d77ed6b1f75747ff6bf8651"
+    },
+    {
+      "path": "target/mars-reference/stage59-tcp-baseline/commands-1.json",
+      "sha256": "afd84ccb580afeaa9dbe2ee426a2f8a9f0947f4482664eb2a86ed49cffb406b4"
+    },
+    {
+      "path": "target/mars-reference/stage59-tcp-baseline/commands-2.json",
+      "sha256": "705edeac69bef1fe0b50ed46f49f204add05bf12f1e2c136638110a1eaca21ca"
+    },
+    {
+      "path": "target/mars-reference/stage59-tcp-baseline/network-1.pcap",
+      "sha256": "8b786f9964079aad58a62258f65bb3eb723e2510fa073e55947c77ef81b3a681"
+    },
+    {
+      "path": "target/mars-reference/stage59-tcp-baseline/network-2.pcap",
+      "sha256": "838d4bcca1282cc9bac1c88cac11078079de4ca8952bfaed2614837130b74d49"
+    },
+    {
+      "path": "target/mars-reference/stage59-no-retry/result.json",
+      "sha256": "102886908d98efe6f14607824b4400a93dce5c2ce140a93dd7e078e6ea7d6c8b"
+    },
+    {
+      "path": "target/mars-reference/stage59-no-retry/boot-1.log",
+      "sha256": "cd8171fca92cb60461361e4cbaff2ee046655d110bcb79e6ac0a6aa90e7ad1f6"
+    },
+    {
+      "path": "target/mars-reference/stage59-no-retry/boot-2.log",
+      "sha256": "9806d7c62f88335fb3ed78bea2ad1202c83fce61cdac72ff1e04b58e4cbc8a46"
+    },
+    {
+      "path": "target/mars-reference/stage59-no-retry/commands-1.json",
+      "sha256": "9547c49c4b309f6c45a3a4866e081b95c09f69c05ddde3a968949dad477b26fc"
+    },
+    {
+      "path": "target/mars-reference/stage59-no-retry/commands-2.json",
+      "sha256": "837f6db6547aa9cebb74504f750530987cca52446374686117f041f301bab1fa"
+    },
+    {
+      "path": "target/mars-reference/stage59-no-retry/network-1.pcap",
+      "sha256": "ffd24a628c9a262c2123c0c17a287efc4a2a4813c303414a33aae09fa6659a2a"
+    },
+    {
+      "path": "target/mars-reference/stage59-no-retry/network-2.pcap",
+      "sha256": "44f1cfcea87c670119c40e96d483b6b2b2ff944055c8435d0d96eab4b75fc41e"
+    },
+    {
+      "path": "target/mars-reference/stage59-negative-old-kernel/boot-1.log",
+      "sha256": "123fd5e1832e58533263652bfbd4144976dbf1de2639d160742b0569e063c2f2"
+    },
+    {
+      "path": "target/mars-reference/stage59-negative-old-kernel/commands-1.json",
+      "sha256": "5fc7383729c4df4bda22cbe87a4e82464dcb8cf31b387b1b3fd94dcac69e8679"
+    },
+    {
+      "path": "target/mars-reference/stage59-negative-old-kernel/network-1.pcap",
+      "sha256": "727a6c9c96ef214e4db52d896b43b1efbff50789c508aa750df4edb4c2f32796"
+    }
+  ]
+}

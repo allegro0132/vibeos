@@ -1053,6 +1053,57 @@ fn peer_first_close_rearms_quickly_and_accepts_a_second_connection() {
 }
 
 #[test]
+fn next_connection_waits_while_previous_peer_close_is_drained() {
+    let (mut server, mut client) = raw_tcp_pair();
+    let mut now = connect_raw_pair(&mut server, &mut client);
+    client.socket().send_slice(b"old disconnect").unwrap();
+    client.socket().close();
+    for _ in 0..100 {
+        client.poll(now);
+        server.poll_network(now).unwrap();
+        now += 1;
+        if server.stream_status().state == TcpStreamState::PeerClosed { break; }
+    }
+    assert_eq!(server.stream_status().state, TcpStreamState::PeerClosed);
+    // OpenSSH has exited, but the server application has not drained/closed
+    // its old connection yet. This SYN must not receive a reset.
+    let next = client.open_connection(49_153);
+    for _ in 0..100 {
+        client.poll(now);
+        server.poll_network(now).unwrap();
+        now += 1;
+        if client.socket_by_handle(next).may_send() { break; }
+    }
+    assert!(client.socket_by_handle(next).may_send());
+    client.socket_by_handle(next).send_slice(b"new identification").unwrap();
+    for _ in 0..5 {
+        client.poll(now);
+        server.poll_network(now).unwrap();
+        now += 1;
+    }
+    let mut bytes = [0; 64];
+    assert_eq!(server.try_recv(&mut bytes).unwrap(), TcpIoResult::Progress(14));
+    assert_eq!(&bytes[..14], b"old disconnect");
+    server.close().unwrap();
+    let mut ended = false;
+    let mut started = false;
+    for _ in 0..100 {
+        client.poll(now);
+        let report = server.poll_network(now).unwrap();
+        if report.connection_started {
+            assert!(ended, "successor exposed before old connection ended");
+            started = true;
+            break;
+        }
+        ended |= report.connection_ended;
+        now += 1;
+    }
+    assert!(ended && started);
+    assert_eq!(server.try_recv(&mut bytes).unwrap(), TcpIoResult::Progress(18));
+    assert_eq!(&bytes[..18], b"new identification");
+}
+
+#[test]
 fn final_ack_and_queued_next_syn_keep_distinct_connection_edges() {
     let (mut server, mut client) = raw_tcp_pair();
     let mut now_ms = connect_raw_pair(&mut server, &mut client);

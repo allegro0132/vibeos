@@ -1709,3 +1709,34 @@ test identities, not production credentials. Evidence is summarized in
 `boards/milkv-mars/ssh-wasi-composition-evidence.json`. Mars entropy remains
 unqualified, the stage-54 SD image remains unchanged, and physical SSH/WASM,
 threads, DMA/concurrency and cold-start/stability acceptance are still pending.
+
+### Overlapping SSH connections (stage 59)
+
+Virtual-network packet captures identified the stage-58 resets: a new command's
+SYN arrived after the old peer FIN but before the server application requested
+its FIN. With the sole port socket still in CLOSE-WAIT, the interface rejected
+the new tuple with RST, before any SSH negotiation.
+
+Exclusive TCP listeners now retain one additional passive socket. It can finish
+a handshake and buffer bounded input while the application drains its current
+connection. Promotion occurs only on a later poll after the current socket has
+returned to LISTEN; the intervening inactive state preserves capability
+connection generations and prevents old bytes/close requests reaching a new
+session. TIME-WAIT is still retained. Explicit shared port groups retain their
+existing socket allocation. The additional cost is 64 KiB of stream buffers per
+exclusive listener (at most eight), plus socket metadata; this is a one-connection
+backlog, not unbounded admission. Address reconfiguration aborts both sockets.
+
+The composition harness now records virtual PCAP files and fails command checks
+on their first unsuccessful connection. It also executes 16 unpaced, independent
+SSH echo connections per boot. The two-boot run passed 48 command checks with
+zero command retries, including authentication, WASI IO/status/trap checks and
+key/program persistence, with 395 kernel selftests on each four-hart boot.
+Initial service-readiness attempts remain separate from command checks.
+The old ELF fails this stricter harness at its first upload, and removing the
+pending socket causes the new close-overlap host regression to fail.
+
+Evidence: `boards/milkv-mars/tcp-close-overlap-evidence.json`. This resolves the
+observed QEMU reconnect failure; it does not establish sustained load, physical
+Mars networking/DMA, entropy qualification, Wasmtime or thread support. The
+stage-54 SD image remains unchanged in this stage.

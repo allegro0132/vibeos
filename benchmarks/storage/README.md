@@ -10,6 +10,8 @@ and the rejected uncached 4 KiB trial are historical comparisons, not the
 current policy. These QEMU results do not qualify physical SD hardware.
 Streaming scratch writes now use up to 128 KiB per submission; the earlier
 64 KiB run measurements below are retained as baselines.
+Whole-object verification also uses a 128 KiB content window; directed ranges
+retain their demand-sized reads.
 
 `workloads-v1.json` is the complete qualification matrix. `schema-v1.json` is
 the versioned JSONL record contract. Every coordinate has one of `ok`,
@@ -659,3 +661,193 @@ samples start after an overlapping host-test build finished during warmup.
 Twelve CAS streaming tests, five fused-append recovery sweeps, four steady-state
 tests, the large-file attribution check, QEMU execution and Duo compilation
 validate this change. Evidence is in `target/storage-stream128-20260911/`.
+
+## Use 128 KiB windows for whole-object reads
+
+The sequential verifier's content window now fetches up to 32 pages rather
+than 16, still clamped to the declared extent. Directed chunk/range readers
+keep read-ahead disabled. The reader adds 64 KiB of content-window capacity;
+its separate sixteen hash-page slots are unchanged. These window bounds are
+not a bound on total object/output-buffer memory. Merkle validation and the
+per-invocation cache lifetime remain unchanged.
+
+The 16 MiB host file-read trace falls from 459 to 331 PageDevice read requests,
+with 17,360 KiB read in both versions. Its byte-verifying regression now also
+bounds read requests below 400, in addition to the existing byte-amplification
+bound. Twelve CAS streaming tests (including corruption and directed-read
+bounds), four steady-state tests and the large-file trace pass.
+
+QEMU uses the same unique 16 MiB write/readback/delete workload, one VM and one
+warmup per variant. Both variants already use 128 KiB streaming writes. Read/
+write bandwidth stays at 4/2 MiB/s and write IOPS at 200:
+
+| Read request limit | Retained samples | 64 KiB read window | 128 KiB read window |
+| --- | ---: | ---: | ---: |
+| 400 IOPS (standard) | 3 | 13.148333 s | 12.994929 s |
+| 40 IOPS (request-limited control) | 2 | 22.491344 s | 19.256930 s |
+
+Median complete-workload times are shown. The standard result is roughly flat;
+the deliberately request-limited control improves about 14%. Read/write bytes,
+write requests and flushes match per sample. Standard-profile read requests
+fall from 458 / 680 / 458 to 330 / 552 / 330. QEMU readback and Duo compilation
+pass, but these request limits do not establish performance on a physical SD
+card. The change is retained; evidence is in `target/storage-read128-20260911/`.
+
+
+### Qualifying the larger buffers at 128 MiB RAM (2026-09-11)
+
+The runner now accepts `--memory-mib` (default 512) for both VibeOS and Linux
+and records it in each sample. Summaries reject mixing memory sizes within a
+workload coordinate; older runner records retain their fixed 512 MiB meaning.
+Provisioning remains at 512 MiB, independently of timed Linux runs.
+
+VibeOS RAM is a compile-time board/linker contract, so `--memory-mib 128`
+must use firmware built with `--features storage-bench-128m`. This feature
+includes the normal storage benchmark and selects 128 MiB in both the BSP
+and linker. Passing 128 MiB to an ordinary 512 MiB benchmark ELF is invalid;
+an initial mismatched attempt was interrupted and produced no usable samples.
+Guest RAM size does not change component allocation quotas.
+
+With the 128 MiB ELF (verified `__heap_end = 0x88000000`), the unique 16 MiB
+file write/readback/delete workload passes one warmup plus three retained
+samples at the standard 4/2 MiB/s, 400/200 read/write IOPS limits. Complete
+workload times are 12.946488 / 13.457037 / 12.949880 seconds, median 12.949880 s.
+The previous 512 MiB run with the same storage optimizations had median
+12.994929 s. Every device counter matches at each retained seed, including
+read/write requests, bytes and flushes. This is a bounded-memory qualification
+with roughly unchanged performance, not a measured peak-heap claim or a
+physical SD result. It does not establish that larger workloads fit 128 MiB.
+
+The runner's ten host tests pass, including mixed-memory rejection. Firmware,
+build log, JSONL samples and summary are in `target/storage-memory128-20260911/`.
+
+
+### Fill deferred metadata pages in place (2026-09-11)
+
+`write_payload_records_with_header` now fills each sink-owned page directly
+instead of building a temporary vector of up to 32 pages and then copying it
+into the deferred sink. This removes up to 128 KiB of simultaneous temporary
+payload storage and one payload copy in that path. The sink retains the same
+page count, physical destinations and zero padding. Its bounded drain, direct
+(non-sink) device write batching, and publication barriers are unchanged.
+This is an allocation/copy reduction; it does not predict lower SD I/O counts.
+
+Validation: 185 segment-store unit tests pass (one ignored), along with 12 CAS
+streaming tests, five fused-append recovery tests and the 16 MiB file trace.
+The latter retains 201 stage writes / 10 flushes and 331 read requests.
+A 128 MiB QEMU run with one warmup and three retained unique 16 MiB file
+write/readback/delete samples passes. Median complete-workload time is
+12.956447 s versus 12.949880 s before the change, with every device counter
+identical for each retained seed. Throughput is unchanged within this small
+sample; the retained benefit is the eliminated temporary allocation and copy.
+Evidence: `target/storage-owned-sink-20260911/`.
+
+
+### Larger files with 128 MiB RAM and bounded stager capacity (2026-09-11)
+
+The owned-sink 128 MiB firmware also passes unique 64 MiB and 256 MiB file
+write/readback/delete qualification, one fresh VM and one un-warmed sample per
+size, at 4/2 MiB/s and 400/200 read/write IOPS. These are capacity/correctness
+observations, not statistically established performance comparisons:
+
+| Logical file | Full workload | Device read bytes | Device write bytes | Read requests | Write requests | Flushes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 MiB | 52.245993 s | 73,109,504 | 71,442,432 | 1,694 | 786 | 35 |
+| 256 MiB | 223.154691 s | 346,107,904 | 284,672,000 | 14,407 | 3,071 | 104 |
+
+The benchmark generates and checks content in 4 KiB pieces. In particular,
+the 256 MiB success demonstrates a file larger than guest RAM without a
+whole-file test buffer. Read amplification rises from about 1.09 to 1.29;
+its source needs separate attribution. Samples and logs are under
+`target/storage-memory64file-20260911/`.
+
+Inspection also found that incremental `Vec` growth gave nominal 3 MiB
+persistent chunks 4 MiB capacity. The existing variable-input 20 MiB stager
+test, extended to bound both pending and staged capacities, fails before the
+fix. The final growth now uses `reserve_exact` at the chunk limit, preserving
+incremental allocation for small inputs and the existing four-chunk batching.
+This removes up to 4 MiB of spare capacity in a full batch; it does not change
+chunk contents, on-disk layout or commit frequency. The large QEMU samples
+above precede this capacity-only fix.
+
+After the capacity fix, all 28 file-store tests pass (one ignored). The 128 MiB
+QEMU 16 MiB unique file workload passes one warmup and three retained samples;
+median full-workload time is 13.143506 s versus 12.956447 s before the fix
+(about 1.4% slower in this small sample), and every device counter matches by
+seed. Retain the verified capacity bound without claiming a throughput gain.
+Before/after host logs, firmware and QEMU samples are preserved in
+`target/storage-stager-capacity-20260911/`.
+
+
+### Segment-proof LRU for larger files (2026-09-11)
+
+A new explicitly ignored 256 MiB host trace reuses the normal unique-file
+stage/commit/read/delete test. Its byte pattern differs from the QEMU
+SplitMix64 pattern, so compare each environment only with itself. The trace
+shows the old 48-entry segment-proof memo repeatedly evicting low-numbered
+segments, even when they were recently accessed: eviction was by smallest
+physical key rather than recency.
+
+The memo now uses a bounded deque and promotes successfully used proofs.
+It still holds at most 48 exact `(segment, generation)` keys, checks the same
+checkpoint horizon, and retains the existing GC invalidation and cold-scrub
+bypass. Replacing an existing key no longer evicts an unrelated proof.
+
+| Host 256 MiB phase | Old read requests / KiB | LRU read requests / KiB |
+| --- | ---: | ---: |
+| Stage | 3,207 / 17,240 | 3,351 / 18,392 |
+| Commit | 4 / 48 | 4 / 48 |
+| Readback | 8,920 / 302,328 | 6,697 / 284,544 |
+| Delete | 4 / 48 | 4 / 48 |
+
+Readback repeated-page traffic falls from 29,312 to 8,288 KiB; staging gets
+slightly worse, but total reads still fall by 16,632 KiB. Writes and flushes
+are unchanged. The ignored large-file regression now requires fewer than
+7,000 readback requests and less than 1.1x readback byte amplification.
+The LRU unit test covers capacity, recency, replacement, generation/horizon
+binding and clear. All 186 segment-store unit tests (one ignored), 12 streaming,
+five fused recovery and 28 file-store tests (two ignored) pass, and the large
+ignored regression passes separately. Evidence is under
+`target/storage-scan-lru-20260911/`.
+
+QEMU 128 MiB, one fresh-VM 256 MiB sample at the standard limits, passes full
+readback and deletion: 221.092733 s versus the prior 223.154691 s. Read requests
+fall from 14,407 to 13,318 and read bytes from 346,107,904 to 337,186,816 (8.5 MiB
+less); write bytes/requests and all 104 flushes match. The earlier QEMU image
+also predates the stager capacity fix, so the host before/after trace is the
+isolated LRU comparison. A single roughly 0.9% timing improvement is too small
+to establish a throughput gain, but the actual device read reduction is
+visible in QEMU. No physical SD measurements are implied.
+
+
+### Recovery qualification after cache and allocation changes (2026-09-11)
+
+The current worktree passes `qemu-test.sh storage_v2_native`: two native V2
+boots, object recovery/readback and powered-off verification, with unmanaged
+and absent-M4 regions unchanged. It also passes `qemu-file-tree-test.sh` at
+128 MiB, covering three boots, hard links, canonical symlinks, recursive
+removal, GC pressure and cold recovery. The independent final image verifier
+accepts the generation-13 empty tree (one inode, zero dirents) after removal
+and maintenance relocation. These correctness gates are not performance
+measurements and do not replace the 256 MiB workload's I/O evidence.
+
+The LRU unit test now also checks GC retention against an allocation map:
+Allocated entries survive; Retired, Free and out-of-range entries are removed.
+The focused test passes. Logs, all three powered-off verification reports,
+final file-tree image and SHA-256 are in `target/storage-lru-recovery-20260911/`.
+
+
+### Exact range-get byte validation (2026-09-11)
+
+The QEMU object-range-get benchmark previously accepted a result by descriptor
+identity alone. It now compares the returned bytes with the exact requested
+4 KiB leaf slice of the generated payload, including the shorter final leaf.
+This check runs after the existing timing endpoint; the content pattern and
+operation timing contract are unchanged.
+
+A 128 MiB QEMU run validates a 4,097-byte object at seeds 1/2 (one-byte tail,
+then first page), and a 131,073-byte object at seeds 32/33/34 (one-byte tail,
+first page, second page). All five records report `ok`. These immediate
+put/get samples report zero device reads during get: they qualify the byte
+check and warm path, not cold-media random-read performance. Firmware, logs
+and JSONL records are under `target/storage-range-bytes-20260911/`.

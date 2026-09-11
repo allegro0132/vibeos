@@ -1589,7 +1589,7 @@ pub(crate) struct VerifiedSegmentScans {
     entries: ScanMemoCell,
 }
 
-struct ScanMemoCell(core::cell::RefCell<BTreeMap<(u64, u64), VerifiedSegment>>);
+struct ScanMemoCell(core::cell::RefCell<alloc::collections::VecDeque<((u64, u64), VerifiedSegment)>>);
 
 // Safety: the memo lives inside `SegmentStore`, whose every operation runs
 // through `&mut self`, and shared kernel handles serialize all store access
@@ -1612,13 +1612,13 @@ struct VerifiedSegment {
 }
 
 /// Bounded so a large store cannot grow the memo without limit; eviction is
-/// oldest-key-first and only costs a re-walk on the next access.
+/// least-recently-used and only costs a re-walk on the next access.
 const VERIFIED_SEGMENT_SCAN_CAPACITY: usize = 48;
 
 impl VerifiedSegmentScans {
     pub(crate) fn new() -> Self {
         Self {
-            entries: ScanMemoCell(core::cell::RefCell::new(BTreeMap::new())),
+            entries: ScanMemoCell(core::cell::RefCell::new(alloc::collections::VecDeque::new())),
         }
     }
 
@@ -1635,14 +1635,17 @@ impl VerifiedSegmentScans {
         checkpoint_generation: u64,
         interpret: impl FnOnce(&VerifiedSegment) -> T,
     ) -> Option<T> {
-        let entries = self.entries.0.borrow();
-        let cached = entries.get(&(segment_no, segment_generation))?;
+        let mut entries = self.entries.0.borrow_mut();
+        let position = entries.iter().position(|(key, _)| *key == (segment_no, segment_generation))?;
+        let cached = &entries[position].1;
         if cached.header_target_checkpoint_generation > checkpoint_generation
             || cached.last_target_checkpoint_generation > checkpoint_generation
         {
             return None;
         }
-        Some(interpret(cached))
+        let entry = entries.remove(position).expect("located cached segment");
+        entries.push_back(entry);
+        Some(interpret(&entries.back().expect("promoted cached segment").1))
     }
 
     /// Drop every entry whose segment is no longer Allocated: only such
@@ -1650,7 +1653,7 @@ impl VerifiedSegmentScans {
     /// fresh generation, so proofs for them must not outlive the round that
     /// freed them. Allocated sealed segments remain immutable and provable.
     pub(crate) fn retain_allocated(&self, allocation: &crate::allocation_v2::AllocationV2) {
-        self.entries.0.borrow_mut().retain(|(segment_no, _), _| {
+        self.entries.0.borrow_mut().retain(|((segment_no, _), _)| {
             matches!(
                 allocation.segment_state(*segment_no),
                 Some(crate::allocation_v2::SegmentAllocation::Allocated)
@@ -1660,10 +1663,60 @@ impl VerifiedSegmentScans {
 
     fn insert(&self, segment_no: u64, segment_generation: u64, verified: VerifiedSegment) {
         let mut entries = self.entries.0.borrow_mut();
-        while entries.len() >= VERIFIED_SEGMENT_SCAN_CAPACITY {
-            entries.pop_first();
+        let key = (segment_no, segment_generation);
+        if let Some(position) = entries.iter().position(|(cached, _)| *cached == key) {
+            entries.remove(position);
         }
-        entries.insert((segment_no, segment_generation), verified);
+        while entries.len() >= VERIFIED_SEGMENT_SCAN_CAPACITY {
+            entries.pop_front();
+        }
+        entries.push_back((key, verified));
+    }
+}
+
+#[cfg(test)]
+mod scan_memo_tests {
+    use super::*;
+
+    #[test]
+    fn scan_memo_evicts_unused_entries_and_preserves_proof_identity() {
+        let memo = VerifiedSegmentScans::new();
+        let verified = || VerifiedSegment {
+            extents: Vec::new(),
+            record_count: 0,
+            total_payload_bytes: 0,
+            segment_seal_body_sha256: [0; 32],
+            previous_segment: (0, 0, [0; 32]),
+            header_target_checkpoint_generation: 1,
+            last_target_checkpoint_generation: 2,
+        };
+        for segment in 0..VERIFIED_SEGMENT_SCAN_CAPACITY as u64 {
+            memo.insert(segment, 1, verified());
+        }
+        assert_eq!(memo.with_verified(0, 2, 2, |_| ()), None);
+        assert_eq!(memo.with_verified(0, 1, 1, |_| ()), None);
+        assert_eq!(memo.with_verified(0, 1, 2, |_| ()), Some(()));
+        let next = VERIFIED_SEGMENT_SCAN_CAPACITY as u64;
+        memo.insert(next, 1, verified());
+        assert_eq!(memo.with_verified(1, 1, 2, |_| ()), None);
+        assert_eq!(memo.with_verified(0, 1, 2, |_| ()), Some(()));
+        // Replacing a cached key must not evict an unrelated proof.
+        memo.insert(next, 1, verified());
+        assert_eq!(memo.entries.0.borrow().len(), VERIFIED_SEGMENT_SCAN_CAPACITY);
+        assert_eq!(memo.with_verified(2, 1, 2, |_| ()), Some(()));
+        use crate::allocation_v2::{AllocationV2, RetiredSegment, SegmentAllocation};
+        let mut states = [SegmentAllocation::Free; VERIFIED_SEGMENT_SCAN_CAPACITY];
+        states[0] = SegmentAllocation::Allocated;
+        states[2] = SegmentAllocation::Retired;
+        let allocation = AllocationV2::new(2, 50, 6, &states,
+            &[RetiredSegment { segment_no: 2, retire_generation: 2 }]).unwrap();
+        memo.retain_allocated(&allocation);
+        assert_eq!(memo.entries.0.borrow().len(), 1);
+        assert_eq!(memo.with_verified(0, 1, 2, |_| ()), Some(()));
+        assert_eq!(memo.with_verified(2, 1, 2, |_| ()), None);
+        assert_eq!(memo.with_verified(next, 1, 2, |_| ()), None);
+        memo.clear();
+        assert_eq!(memo.with_verified(0, 1, 2, |_| ()), None);
     }
 }
 

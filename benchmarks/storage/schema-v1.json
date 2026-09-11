@@ -50,6 +50,7 @@
         "host_cpu": { "type": "string" },
         "host_os": { "type": "string" },
         "qemu_args": { "type": "array", "items": { "type": "string" } },
+        "memory_mib": { "type": "integer", "minimum": 1 },
         "cache_state": { "enum": ["cold", "warm", "mixed", "unknown"] },
         "latency_scope": {"enum": ["workload"]},
         "content_pattern": {"enum": ["legacy", "splitmix64-offset-v1"]},

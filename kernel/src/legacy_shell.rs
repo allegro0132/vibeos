@@ -3163,11 +3163,11 @@ async fn storage_object_bench(
         .0
         .lock()
         .lookup_lease::<crate::store::StoredObject>(publication.capability, Rights::READ);
+    let range_leaf = (seed as u32) % ((size.max(1) + 4095) / 4096) as u32;
     let get_started = crate::sbi::time();
     let read_back = match (service, object) {
         (Ok(service), Ok(object)) if workload == "object-range-get" => {
-            let leaf = (seed as u32) % ((size.max(1) + 4095) / 4096) as u32;
-            crate::store::get_blob_chunk_with(service, object, leaf)
+            crate::store::get_blob_chunk_with(service, object, range_leaf)
                 .await
                 .map(|chunk| crate::store::VerifiedBlob {
                     descriptor: chunk.descriptor,
@@ -3189,27 +3189,19 @@ async fn storage_object_bench(
         )),
     };
     let get_ticks = crate::sbi::time().saturating_sub(get_started).max(1);
+    let expected_read_back = if workload == "object-range-get" {
+        let start = range_leaf as usize * 4096;
+        &payload[start..payload.len().min(start + 4096)]
+    } else {
+        payload.as_slice()
+    };
     let mut status = if read_back.as_ref().is_ok_and(|verified| {
-        verified.bytes == payload && verified.descriptor == publication.descriptor
+        verified.bytes == expected_read_back && verified.descriptor == publication.descriptor
     }) {
         "ok"
     } else {
         "failed-closed"
     };
-    if workload == "object-range-get" {
-        // Range-get authenticates one 4 KiB leaf, so its returned bytes are
-        // intentionally shorter than the full payload.  The descriptor is
-        // still checked above; the proof verifier has already checked the
-        // leaf and sibling path.
-        status = if read_back
-            .as_ref()
-            .is_ok_and(|verified| verified.descriptor == publication.descriptor)
-        {
-            "ok"
-        } else {
-            "failed-closed"
-        };
-    }
     if workload == "object-revoke" {
         let revoked = init.0.lock().revoke_slot(publication.capability.slot()) != 0;
         let denied = init

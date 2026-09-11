@@ -27,6 +27,7 @@ legacy-shell = ["vibeos-kernel/legacy-shell"]
 # feature prevents benchmark builds from silently omitting the V2 file-tree
 # policy while preserving the production storage and capability paths.
 storage-bench = ["legacy-shell", "file-tree", "vibeos-kernel/storage-bench"]
+storage-bench-128m = ["storage-bench", "vibeos-kernel/storage-bench-128m"]
 tcp-echo = ["vibeos-kernel/tcp-echo"]
 tcp-echo-recovery-test = ["vibeos-kernel/tcp-echo-recovery-test"]
 iperf3-server = ["vibeos-kernel/iperf3-server"]

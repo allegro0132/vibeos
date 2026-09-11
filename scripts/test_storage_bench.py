@@ -109,6 +109,20 @@ class StorageBenchTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ValidationError, "cannot replace"):
             MODULE.require_baseline_evidence([incompatible], pathlib.Path("unused"), pathlib.Path("unused"))
 
+    def test_memory_profiles_cannot_be_mixed(self):
+        record = {"backend": "storage-v2", "layer": "file-tree", "workload": "file-sequential",
+                  "object_bytes": 16777216, "object_count": 1, "queue_depth": 1,
+                  "status": "ok", "warmup": False, "metrics": {"latency_ns": 100},
+                  "environment": {}}
+        explicit_default = dict(record, environment={"memory_mib": 512})
+        self.assertEqual(len(MODULE.summaries([record, explicit_default])), 1)
+        smaller = dict(record, environment={"memory_mib": 128})
+        with self.assertRaisesRegex(MODULE.ValidationError, "incompatible guest memory"):
+            MODULE.summaries([record, smaller])
+        for invalid in (0, -1, True, "128"):
+            with self.assertRaisesRegex(MODULE.ValidationError, "invalid guest memory"):
+                MODULE.summaries([dict(record, environment={"memory_mib": invalid})])
+
     def test_content_pattern_identity_is_preserved_and_mixing_rejected(self):
         sample = {"schema": "vibeos.storage-bench.sample", "version": 1,
                   "backend": "storage-v2", "layer": "file-tree", "workload": "file-sequential",

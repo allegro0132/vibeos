@@ -875,6 +875,10 @@ mod tests {
                 .map(|offset| (offset % 251) as u8)
                 .collect();
             block_on(stager.push(&bytes)).unwrap();
+            assert!(stager.pending.capacity() <= crate::PERSISTENT_STAGE_CHUNK_SIZE);
+            assert!(stager.staged.iter().all(|chunk| {
+                chunk.capacity() <= crate::PERSISTENT_STAGE_CHUNK_SIZE
+            }));
             written += len;
             step += 1;
         }
@@ -1841,9 +1845,19 @@ mod io_trace {
 
     #[test]
     fn large_unique_file_io_attribution() {
-        let fixture = fixture_with(0, 64);
+        trace_unique_file_io(16 * 1024 * 1024, 64);
+    }
+
+    #[test]
+    #[ignore = "large-file I/O attribution; allocates a 256 MiB host payload"]
+    fn file_256m_io_attribution() {
+        trace_unique_file_io(256 * 1024 * 1024, 256);
+    }
+
+    fn trace_unique_file_io(size: usize, segments: u64) {
+        let fixture = fixture_with(0, segments);
         let path = crate::RelPath::parse("large-unique").unwrap();
-        let bytes: Vec<u8> = (0..16 * 1024 * 1024usize)
+        let bytes: Vec<u8> = (0..size)
             .map(|i| ((i as u64).wrapping_mul(131) ^ ((i as u64) >> 13) ^ ((i as u64) >> 21)) as u8)
             .collect();
         let mut stager = fixture.root.begin_content_stager(&path, false).unwrap();
@@ -1875,8 +1889,14 @@ mod io_trace {
             "whole-file read repeated payload verification: {read_pages} pages"
         );
         let read_requests = reads.iter().filter(|event| matches!(event, Event::Read(_, _))).count();
-        assert!(read_requests < 400,
-            "whole-file verification fragmented sequential reads: {read_requests} requests");
+        if size == 16 * 1024 * 1024 {
+            assert!(read_requests < 400,
+                "whole-file verification fragmented sequential reads: {read_requests} requests");
+        }
+        if size == 256 * 1024 * 1024 {
+            assert!(read_requests < 7000 && read_pages * (PAGE_SIZE as u64) < size as u64 * 11 / 10,
+                "large-file read thrashes segment proofs: {read_requests} requests, {read_pages} pages");
+        }
         report("unique-read", &reads);
         let mut tx = fixture.root.begin().unwrap();
         tx.remove(&path, false, false).unwrap();

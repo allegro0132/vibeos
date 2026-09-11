@@ -50,6 +50,7 @@ legacy-shell = []
 # Dedicated raw-block benchmark authority. This is only enabled by the
 # benchmark image and is absent from production capability layouts.
 storage-bench = ["vibeos-image-policy/storage-bench", "vibeos-bsp-qemu-virt?/storage-bench"]
+storage-bench-128m = ["storage-bench", "vibeos-bsp-qemu-virt?/storage-bench-128m"]
 file-tree = [
     "dep:vibeos-file-store",
     "vibeos-vsh/file-tree",

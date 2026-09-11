@@ -12,10 +12,13 @@ fn main() {
     // Golden/test images boot QEMU virt with -m 128M; the storage benchmark
     // contract boots with -m 512M because its qualification workloads
     // legitimately hold multi-MiB record streams in transit; the Python WASI
-    // image boots with -m 1G. OpenSBI occupies the first 2 MiB of each.
+    // image boots with -m 1G. storage-bench-128m opts into 128 MiB.
+    // OpenSBI occupies the first 2 MiB of each.
     let ram_length = if env::var_os("CARGO_FEATURE_PYTHON_WASI").is_some() {
         "1022M"
-    } else if env::var_os("CARGO_FEATURE_STORAGE_BENCH").is_some() {
+    } else if env::var_os("CARGO_FEATURE_STORAGE_BENCH").is_some()
+        && env::var_os("CARGO_FEATURE_STORAGE_BENCH_128M").is_none()
+    {
         "510M"
     } else {
         "126M"

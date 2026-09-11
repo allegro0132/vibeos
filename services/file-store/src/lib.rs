@@ -414,6 +414,14 @@ impl FsContentStager {
                 PERSISTENT_STAGE_CHUNK_SIZE - self.pending.len(),
                 bytes.len(),
             );
+            if self.pending.len() + take > self.pending.capacity()
+                && self.pending.capacity() > PERSISTENT_STAGE_CHUNK_SIZE / 2
+            {
+                // Geometric growth would round a 3 MiB chunk up to 4 MiB.
+                // Keep small writes incremental, but cap the final growth
+                // so a four-chunk batch holds at most 12 MiB of capacity.
+                self.pending.reserve_exact(PERSISTENT_STAGE_CHUNK_SIZE - self.pending.len());
+            }
             self.pending.extend_from_slice(&bytes[..take]);
             bytes = &bytes[take..];
             if self.pending.len() == PERSISTENT_STAGE_CHUNK_SIZE {

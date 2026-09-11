@@ -92,6 +92,9 @@ def validate_record(record: dict[str, Any]) -> None:
     for key in ("git_commit", "qemu_version", "qemu_args", "cache_state"):
         require(key in environment, f"environment.{key} is missing")
     require(isinstance(environment["qemu_args"], list), "environment.qemu_args must be an array")
+    if "memory_mib" in environment:
+        require(type(environment["memory_mib"]) is int and environment["memory_mib"] > 0,
+                "invalid guest memory size")
     if "storage_throttle" in environment:
         profile = environment["storage_throttle"]
         require(isinstance(profile, dict) and set(profile) <= set(THROTTLE_FIELDS),
@@ -402,6 +405,7 @@ def guest_record_from(data: bytes) -> dict[str, Any]:
 
 
 def run_vibeos(args: argparse.Namespace) -> int:
+    require(args.memory_mib > 0, "memory-mib must be positive")
     throttle_options = throttle_drive_options(args)
     kernel = args.kernel.resolve()
     require(kernel.is_file(), f"kernel not found: {kernel}")
@@ -420,7 +424,7 @@ def run_vibeos(args: argparse.Namespace) -> int:
                 with disk.open("r+b") as target:
                     target.truncate(1024 * 1024 * 1024)
                 qemu_args = [
-                    args.qemu, "-machine", "virt", "-cpu", "rv64", "-smp", "1", "-m", "512M",
+                    args.qemu, "-machine", "virt", "-cpu", "rv64", "-smp", "1", "-m", f"{args.memory_mib}M",
                     "-accel", "tcg,thread=single", "-nographic", "-bios", "default",
                     "-kernel", str(kernel), "-drive",
                     f"if=none,id=bench-disk,format=raw,file={disk},cache=none,aio=threads{throttle_options}",
@@ -429,6 +433,7 @@ def run_vibeos(args: argparse.Namespace) -> int:
                 ]
                 env = environment(qemu_args, qemu_version)
                 env["storage_throttle"] = storage_throttle(args)
+                env["memory_mib"] = args.memory_mib
                 env.update(artifact_hashes)
                 process = subprocess.Popen(qemu_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=subprocess.STDOUT)
@@ -493,6 +498,7 @@ def run_vibeos(args: argparse.Namespace) -> int:
 
 
 def run_linux(args: argparse.Namespace) -> int:
+    require(args.memory_mib > 0, "memory-mib must be positive")
     throttle_options = throttle_drive_options(args)
     for path in (args.root_image, args.firmware_code, args.firmware_vars,
                  args.agent, args.data_image):
@@ -521,7 +527,7 @@ def run_linux(args: argparse.Namespace) -> int:
                         "Linux ext4 template must be exactly 1 GiB")
                 seed = (args.seed + vm_index * (args.warmups + args.samples)) & ((1 << 64) - 1)
                 qemu_args = [
-                    args.qemu, "-machine", "virt", "-cpu", "rv64", "-smp", "1", "-m", "512M",
+                    args.qemu, "-machine", "virt", "-cpu", "rv64", "-smp", "1", "-m", f"{args.memory_mib}M",
                     "-accel", "tcg,thread=single", "-nographic", "-drive",
                     f"if=pflash,format=raw,unit=0,readonly=on,file={args.firmware_code.resolve()}",
                     "-drive", f"if=pflash,format=raw,unit=1,file={variables}",
@@ -533,6 +539,7 @@ def run_linux(args: argparse.Namespace) -> int:
                 ]
                 env = environment(qemu_args, qemu_version)
                 env["storage_throttle"] = storage_throttle(args)
+                env["memory_mib"] = args.memory_mib
                 env.update({"linux_version": args.linux_version,
                             "debian_release": args.debian_release})
                 env.update(artifact_hashes)
@@ -684,6 +691,7 @@ def coordinate(record: dict[str, Any], metric: str) -> tuple[Any, ...]:
 def summaries(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[tuple[Any, ...], list[float]] = defaultdict(list)
     profiles: dict[tuple[Any, ...], tuple[int, ...]] = {}
+    memories: dict[tuple[Any, ...], int] = {}
     patterns: dict[tuple[Any, ...], str] = {}
     scopes: dict[tuple[Any, ...], str] = {}
     for record in records:
@@ -699,6 +707,10 @@ def summaries(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
             # Exclude backend so Linux/VibeOS comparisons also require the
             # same limits for an otherwise identical workload coordinate.
             shared_key = key[1:]
+            memory = record["environment"].get("memory_mib", 512)
+            require(type(memory) is int and memory > 0, "invalid guest memory size")
+            require(memories.setdefault(shared_key, memory) == memory,
+                    "incompatible guest memory sizes for the same coordinate")
             require(profiles.setdefault(shared_key, signature) == signature,
                     "incompatible storage throttle profiles for the same coordinate")
             pattern = record["environment"].get("content_pattern", "legacy")
@@ -869,6 +881,8 @@ def main() -> int:
     linux.add_argument("--sample-timeout", type=float, default=900)
     linux.add_argument("--overwrite", action="store_true")
     for runner in (run, linux):
+        runner.add_argument("--memory-mib", type=int, default=512,
+                            help="guest RAM in MiB (default: 512)")
         for flag in THROTTLE_FIELDS:
             runner.add_argument("--" + flag.replace("_", "-"), type=int, default=0,
                                 help="benchmark disk rate limit; 0 leaves it unlimited")

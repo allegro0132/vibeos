@@ -96,12 +96,16 @@ impl PageSink {
     }
 
     pub(crate) fn push<E>(&mut self, page: u64, bytes: &Page) -> Result<(), StoreError<E>> {
+        let mut copy = heap_page();
+        copy.copy_from_slice(bytes);
+        self.push_owned(page, copy)
+    }
+
+    fn push_owned<E>(&mut self, page: u64, bytes: Box<Page>) -> Result<(), StoreError<E>> {
         self.entries
             .try_reserve(1)
             .map_err(|_| StoreError::MemoryLimit)?;
-        let mut copy = heap_page();
-        copy.copy_from_slice(bytes);
-        self.entries.push((page, copy));
+        self.entries.push((page, bytes));
         Ok(())
     }
 
@@ -5864,6 +5868,22 @@ pub(crate) async fn write_payload_records_with_header<D: PageDevice>(
     // cut before that shared barrier still leaves the whole segment unreachable.
     for (record, payload) in records {
         let mut copied = 0_usize;
+        if let Some(sink) = sink.as_deref_mut() {
+            // Fill the final owned pages directly. A temporary multi-page
+            // device buffer would duplicate up to 128 KiB while the sink
+            // copies it into separately allocated pages.
+            for page_index in 0..record.value.payload_pages {
+                let mut page = heap_page();
+                let take = (payload.len() - copied).min(PAGE_SIZE);
+                page[..take].copy_from_slice(&payload[copied..copied + take]);
+                copied += take;
+                sink.push_owned(
+                    base + u64::from(record.value.payload_first_relative_page + page_index),
+                    page,
+                )?;
+            }
+            continue;
+        }
         let mut page_index = 0_u32;
         while page_index < record.value.payload_pages {
             let batch_pages = (record.value.payload_pages - page_index).min(32) as usize;
@@ -5873,28 +5893,13 @@ pub(crate) async fn write_payload_records_with_header<D: PageDevice>(
                 page[..take].copy_from_slice(&payload[copied..copied + take]);
                 copied += take;
             }
-            match sink.as_deref_mut() {
-                Some(sink) => {
-                    for (offset, page) in pages.iter().enumerate() {
-                        sink.push(
-                            base + u64::from(record.value.payload_first_relative_page + page_index)
-                                + offset as u64,
-                            page,
-                        )?;
-                    }
-                }
-                None => {
-                    device
-                        .write_pages(
-                            base + u64::from(
-                                record.value.payload_first_relative_page + page_index,
-                            ),
-                            &pages,
-                        )
-                        .await
-                        .map_err(StoreError::Mutation)?;
-                }
-            }
+            device
+                .write_pages(
+                    base + u64::from(record.value.payload_first_relative_page + page_index),
+                    &pages,
+                )
+                .await
+                .map_err(StoreError::Mutation)?;
             page_index += batch_pages as u32;
         }
     }

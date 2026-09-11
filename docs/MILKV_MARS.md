@@ -1601,3 +1601,33 @@ retained alongside passing evidence. Duo default target checking, Mars Ethernet/
 TRNG ELF construction and the existing QEMU security regression remain valid.
 Evidence: `boards/milkv-mars/ssh-entropy-composition-evidence.json`. No SD image
 was repacked in this stage.
+
+### Ethernet hardware separated from service selection (stage 56)
+
+Mars now has an `ethernet-device` Cargo feature for EQoS/PHY dependencies,
+DTB admission, packet-engine code and firmware device-table assembly. It does
+not select a network service. The existing `ethernet` feature includes this
+device feature and `dhcp-iperf3-server`, preserving both build scripts'
+`--ethernet` behavior and existing diagnostic image profiles.
+
+A native Mars release build with
+`ethernet-device,trng-probe,vibeos-kernel/provisioned-command` links and passes
+the Ethernet ELF contract check. Its kernel features include PIO block, packet
+network, queued entropy, provisioned SSH/commands and WASI Preview 1, and exclude
+the QEMU board profile and DHCP/iperf3 service. This is a link/composition check:
+the diagnostic source remains unapproved and stopped, so it does not establish
+a working SSH/WASM image, authentication, execution or physical qualification.
+
+Host tests exercise the independent device feature, the legacy Ethernet alias
+and the default serial configuration. The dedicated QEMU HAL
+`mars-ethernet-device-test` feature exercises native packet/link models and
+asserts the admitted GMAC range without selecting the benchmark service. It
+also passes all 395 kernel selftests on four harts. The old
+`mars-ethernet-test` name remains an alias for compatibility. Mutations that
+restore benchmark coupling or bind DTB admission to the legacy service switch
+are detected. The unchanged `--ethernet --trng-probe` payload command still
+builds and passes its ELF check.
+
+Evidence: `boards/milkv-mars/ethernet-service-separation-evidence.json`. The
+stage-54 SD image is unchanged; no new SD image or production SSH profile was
+published in this stage.

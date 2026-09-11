@@ -31,8 +31,8 @@ The default payload has no NIC. Add `--ethernet` to either build script for
 the EQoS test composition (DHCP and TCP 5201 iperf3); its SD artifacts are kept
 separately in `target/mars-boot-ethernet/out`. Neither profile enables SSH.
 The TRNG protocol and ordered MMIO lane are available as a separate driver,
-but firmware entropy-service composition and physical qualification remain
-pending. Compiling or passing the ELF checker does not satisfy Mars physical
+and its native HAL table is composed by the diagnostic profile. Qualified
+entropy-service activation and physical qualification remain pending. Compiling or passing the ELF checker does not satisfy Mars physical
 acceptance.
 
 For an explicit hardware diagnostic payload, run
@@ -54,3 +54,15 @@ control path only and cannot qualify the source for cryptographic use.
 
 See [bootchain instructions](bootchain/README.md) for layout, build tools,
 hardware revision requirements and evidence limitations.
+
+The Cargo feature `ethernet-device` selects only the EQoS/PHY hardware assembly,
+DTB admission and packet backend. It does not select DHCP, iperf3 or SSH. Other
+service images can compose that device independently. The existing `ethernet`
+feature is a compatibility alias selecting `ethernet-device` plus the DHCP/iperf3
+service image; `--ethernet` build and SD packaging commands keep that behavior.
+
+A native link check combining `ethernet-device,trng-probe` with
+`vibeos-kernel/provisioned-command` verifies the generic command service can be
+assembled without a benchmark service conflict. The diagnostic TRNG source is
+still unapproved and stopped, so this is not an operational SSH/WASM image or
+entropy qualification. No service profile bypasses firmware source admission.

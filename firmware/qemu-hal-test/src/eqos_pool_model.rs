@@ -93,7 +93,7 @@ pub unsafe fn run() {
     assert_eq!(&output[60..], &[0; 4]);
     assert!(FLUSHES.load(Ordering::Relaxed) > 100);
     assert!(ring.shutdown());
-    #[cfg(feature = "mars-ethernet-test")]
+    #[cfg(feature = "mars-ethernet-device-test")]
     {
         use vibeos_firmware_milkv_mars::packet::Engine;
         let backend = ring.into_stopped_backend().ok().unwrap();

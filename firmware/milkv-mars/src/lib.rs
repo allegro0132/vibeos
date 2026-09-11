@@ -4,7 +4,7 @@
 pub mod partition;
 #[cfg(feature = "trng-probe")]
 pub mod entropy_instance;
-#[cfg(feature = "ethernet")]
+#[cfg(feature = "ethernet-device")]
 pub mod packet;
 use vibeos_bsp_milkv_mars as mars;
 use vibeos_hal::{
@@ -50,9 +50,9 @@ pub fn admit(
     let memory = mars::usable_memory::<16>(dtb, request.dtb_address)
         .map_err(|_| BootError::InvalidMemory)?;
     let heap = request.usable_heap(&memory)?;
-    #[cfg(feature = "ethernet")]
+    #[cfg(feature = "ethernet-device")]
     let network = Some(mars::network_resources::admit(dtb).map_err(|_| BootError::InvalidDtb)?);
-    #[cfg(not(feature = "ethernet"))]
+    #[cfg(not(feature = "ethernet-device"))]
     let network = None;
     #[cfg(feature = "trng-probe")]
     let trng = Some(mars::trng_resources::admit(dtb).map_err(|_| BootError::InvalidDtb)?);
@@ -87,6 +87,10 @@ mod tests {
             time: true,
         };
         let result = admit(DTB, &request, all).unwrap();
+        #[cfg(feature = "ethernet-device")]
+        assert_eq!(result.network.unwrap().mac, AddressRange::new(0x16030000, 0x16040000));
+        #[cfg(not(feature = "ethernet-device"))]
+        assert!(result.network.is_none());
         #[cfg(feature = "trng-probe")]
         {
             assert_eq!(result.trng.unwrap().registers, mars::TRNG_REGISTERS);

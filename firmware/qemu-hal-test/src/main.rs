@@ -8,11 +8,11 @@ extern crate vibeos_kernel;
 #[cfg(feature = "entropy-composition-test")]
 #[path = "../../qemu-virt/src/entropy.rs"]
 mod entropy;
-#[cfg(not(feature = "mars-ethernet-test"))]
+#[cfg(not(feature = "mars-ethernet-device-test"))]
 use vibeos_bsp_qemu_virt::Board;
-#[cfg(feature = "mars-ethernet-test")]
+#[cfg(feature = "mars-ethernet-device-test")]
 mod device_windows;
-#[cfg(feature = "mars-ethernet-test")]
+#[cfg(feature = "mars-ethernet-device-test")]
 use device_windows::Board;
 use vibeos_hal::Board as BoardContract;
 #[path = "../../early_devices.rs"]
@@ -51,7 +51,7 @@ mod jh7110_sd_model;
 #[cfg(feature = "mars-composition-test")]
 mod mars_composition;
 unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
-    #[cfg(feature = "mars-ethernet-test")]
+    #[cfg(feature = "mars-ethernet-device-test")]
     _print(format_args!("DEVICE_WINDOW_CAPACITY PASS level0=8\n"));
     #[cfg(feature = "trng-model-test")]
     {
@@ -72,7 +72,7 @@ unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
         assert!(network_poll::due(&mut last, 4_000_001, 4_000_000));
         _print(format_args!("PACKET_LINK_MODEL PASS reconfigure=stopped cadence=elapsed-time\n"));
         eqos_pool_model::run();
-        #[cfg(feature = "mars-ethernet-test")]
+        #[cfg(feature = "mars-ethernet-device-test")]
         _print(format_args!("MARS_PACKET_ENGINE_MODEL PASS pool=permanent link=down-up-down-100 stopped=retired\n"));
         phy_model::run(jh7110_ethernet_model::run());
         _print(format_args!("JH7110_ETHERNET_MODEL PASS csr_hz=198000000 tx_parent=external reset=bounded\n"));

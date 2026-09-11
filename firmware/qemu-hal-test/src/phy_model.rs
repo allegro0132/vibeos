@@ -86,11 +86,11 @@ impl Registers for Model {
     }
 }
 static STATUS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-#[cfg(feature = "mars-ethernet-test")]
+#[cfg(feature = "mars-ethernet-device-test")]
 pub(super) fn link(status: u32) {
     STATUS.store(status, core::sync::atomic::Ordering::Relaxed);
 }
-#[cfg(feature = "mars-ethernet-test")]
+#[cfg(feature = "mars-ethernet-device-test")]
 pub(super) fn initialized() -> Yt8531<Port<Model>> {
     let mut model = Model::new();
     model.live = true;

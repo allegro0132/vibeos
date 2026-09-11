@@ -54,6 +54,8 @@ pub fn run() {
     };
     let fixture = include_bytes!("../../../boards/milkv-mars/tests/fixtures/trng.dtb");
     let admitted = admit(fixture, &request, capabilities).unwrap();
+    #[cfg(feature = "mars-ethernet-device-test")]
+    assert_eq!(admitted.network.unwrap().mac, AddressRange::new(0x16030000, 0x16040000));
     assert_eq!(admitted.harts.ids(), &[4, 1, 2, 3]);
     assert!(admit(
         fixture,

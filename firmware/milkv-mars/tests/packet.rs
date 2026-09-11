@@ -1,4 +1,4 @@
-#![cfg(feature = "ethernet")]
+#![cfg(feature = "ethernet-device")]
 use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 use vibeos_eqos_net::{
     backend::{Backend, Memory},

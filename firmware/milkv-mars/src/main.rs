@@ -37,7 +37,7 @@ fn entropy_description() -> Option<vibeos_hal::device_transport::Descriptor> {
         slot: 0, base: r.registers.start, irq: r.irq, vendor_id: 0,
     })
 }
-#[cfg(feature = "ethernet")]
+#[cfg(feature = "ethernet-device")]
 mod network;
 struct BootState {
     ready: AtomicU8,
@@ -80,9 +80,9 @@ const BOOT_HEAP_REGIONS: Option<fn() -> &'static [vibeos_hal::AddressRange]> =
 const HEAP_END: usize = vibeos_bsp_milkv_mars::RAM.end;
 const MANAGED_BLOCK_ID: core::num::NonZeroU128 =
     core::num::NonZeroU128::new(0x5649_4245_4f53_0000_0000_0000_0000_0003).unwrap();
-#[cfg(not(feature = "ethernet"))]
+#[cfg(not(feature = "ethernet-device"))]
 const NETWORK_DRIVER_NAME: &str = "unavailable (serial/SD profile)";
-#[cfg(feature = "ethernet")]
+#[cfg(feature = "ethernet-device")]
 const NETWORK_DRIVER_NAME: &str = "JH7110 EQoS / YT8531";
 unsafe fn platform_init(_write: fn(&str)) {
     #[cfg(feature = "trng-probe")]
@@ -93,7 +93,7 @@ unsafe fn platform_report(print: fn(core::fmt::Arguments<'_>)) {
         hart_ids()[0],hart_ids().len(),timebase_hz(),admission().heap.ranges().len()));
     print(format_args!("Mars bring-up: SD data-only PIO; network={}; SSH disabled; physical acceptance pending\n", NETWORK_DRIVER_NAME));
 }
-#[cfg(not(feature = "ethernet"))]
+#[cfg(not(feature = "ethernet-device"))]
 #[no_mangle]
 pub static VIBEOS_PACKET_DEVICE: vibeos_hal::network::Device = vibeos_hal::network::Device {
     present: false,

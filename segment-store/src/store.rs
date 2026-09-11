@@ -32,7 +32,9 @@ use crate::authority_snapshot::{
     PERSISTENT_AUTHORITY_HEADER_LEN,
 };
 use crate::cas_codec::{
-    decode_blob_manifest, decode_cas_snapshot, BlobManifest, BlobMapping,
+    decode_blob_manifest, decode_cas_delta, decode_cas_snapshot, BlobManifest, BlobMapping,
+    CasSnapshot,
+    CasDelta,
     CasCodecContext, ManifestExtent, ObjectMapping, BLOB_MANIFEST_HEADER_LEN, BLOB_MAPPING_LEN,
     CAS_SNAPSHOT_HEADER_LEN, MANIFEST_EXTENT_LEN, OBJECT_MAPPING_LEN,
 };
@@ -577,9 +579,14 @@ pub struct SegmentStore<D> {
     /// When set, commits skip the publication-time read-back verification of
     /// the pages they just wrote. See [`SegmentStore::set_deferred_commit_readback`].
     pub(crate) defer_commit_readback: bool,
+    /// See [`SegmentStore::set_catalog_delta_policy`].
+    pub(crate) catalog_delta_policy: crate::cas::CatalogDeltaPolicy,
     /// See [`VerifiedSegmentScans`]: chain-authentication memo for sealed
     /// segments, cleared around every collection round.
     pub(crate) verified_scans: VerifiedSegmentScans,
+    /// See [`crate::gc::TypedEdgeCache`]: authenticated typed edges reused by
+    /// later collection rounds in this process.
+    pub(crate) typed_edge_cache: crate::gc::TypedEdgeCache,
 }
 
 impl<D: PageDevice> SegmentStore<D> {
@@ -610,7 +617,9 @@ impl<D: PageDevice> SegmentStore<D> {
             promotion_claims_cache: None,
             fs_tree_cache: None,
             defer_commit_readback: false,
+            catalog_delta_policy: crate::cas::CatalogDeltaPolicy::Auto,
             verified_scans: VerifiedSegmentScans::new(),
+            typed_edge_cache: crate::gc::TypedEdgeCache::new(),
         }
     }
 
@@ -709,6 +718,21 @@ impl<D: PageDevice> SegmentStore<D> {
     /// scrub instead of at the commit that wrote it.
     pub fn set_deferred_commit_readback(&mut self, deferred: bool) {
         self.defer_commit_readback = deferred;
+    }
+
+    /// Choose how commits publish catalog changes: complete snapshots or the
+    /// frozen bounded-replay delta chain (see
+    /// [`crate::cas::CatalogDeltaPolicy`]). `Auto` writes deltas only when
+    /// they cost fewer pages than the snapshot they would replace, which is
+    /// the case for every small transaction against a populated catalog.
+    pub fn set_catalog_delta_policy(&mut self, policy: crate::cas::CatalogDeltaPolicy) {
+        self.catalog_delta_policy = policy;
+    }
+
+    /// Diagnostics: `(cached objects, mark-walk hits, misses)` of the typed
+    /// edge memo collection rounds reuse in this process.
+    pub fn typed_edge_cache_stats(&self) -> (usize, u64, u64) {
+        self.typed_edge_cache.stats()
     }
 
     pub fn info(&self) -> Result<StoreInfo, StoreError<D::Error>> {
@@ -2807,9 +2831,6 @@ pub(crate) async fn recover_state<D: PageDevice>(
         )
         .await?;
         if snapshot.bytes.starts_with(b"VIBECAS2") {
-            if checkpoint.replay_count != 0 || checkpoint.replay_tail != PhysicalPointer::Null {
-                return Err(StoreError::Corrupt);
-            }
             let context = CasCodecContext::new(
                 superblock.binding.store_uuid,
                 checkpoint.admitted_segments,
@@ -2832,19 +2853,128 @@ pub(crate) async fn recover_state<D: PageDevice>(
             {
                 return Err(StoreError::Corrupt);
             }
-            let cas_bytes = decoded
-                .objects
+            let snapshot_generation = decoded.checkpoint_generation;
+            let CasSnapshot {
+                objects: mut objects,
+                blobs: mut blobs,
+                ..
+            } = decoded;
+            let snapshot_capacity = snapshot.bytes.capacity();
+            // The decoded tables own their data; release the encoded snapshot
+            // before reading anything else so the measured recovery peak is
+            // also the actual live-memory bound.
+            drop(snapshot);
+            if checkpoint.replay_count != 0 {
+                // Bounded replay: every delta after the snapshot root minted
+                // exactly one object (and at most one new Blob). Walk the
+                // chain from the checkpoint's tail back to the root, then
+                // apply it in commit order under the frozen chain rules.
+                let replay_count = checkpoint.replay_count as usize;
+                let chain_bytes = replay_count
+                    .checked_mul(mem::size_of::<CasDelta>())
+                    .ok_or(StoreError::MemoryLimit)?;
+                let table_bytes = objects
+                    .capacity()
+                    .checked_mul(mem::size_of::<ObjectMapping>())
+                    .and_then(|bytes| {
+                        blobs
+                            .capacity()
+                            .checked_mul(mem::size_of::<BlobMapping>())
+                            .and_then(|more| bytes.checked_add(more))
+                    })
+                    .ok_or(StoreError::MemoryLimit)?;
+                let replay_resident = allocation_bytes
+                    .checked_add(table_bytes)
+                    .and_then(|bytes| bytes.checked_add(chain_bytes))
+                    .ok_or(StoreError::MemoryLimit)?;
+                recovery_observe(
+                    &mut recovery_peak,
+                    limits.recovery_memory_bytes,
+                    replay_resident,
+                )?;
+                let mut chain: Vec<CasDelta> = Vec::new();
+                chain
+                    .try_reserve_exact(replay_count)
+                    .map_err(|_| StoreError::MemoryLimit)?;
+                let mut pointer = checkpoint.replay_tail;
+                let mut depth = checkpoint.replay_count;
+                while depth != 0 {
+                    require_allocated_pointer(&allocation, pointer)?;
+                    let record = read_recovery_pointer_payload(
+                        device,
+                        superblock.binding.store_uuid,
+                        checkpoint.admitted_segments,
+                        checkpoint.next_segment_generation,
+                        checkpoint.binding.generation,
+                        pointer,
+                        ExtentKind::CatalogDelta,
+                        limits.recovery_memory_bytes,
+                        replay_resident,
+                    )
+                    .await?;
+                    let delta = decode_cas_delta(&record.bytes, context)
+                        .map_err(|_| StoreError::Corrupt)?;
+                    if delta.chain_count != depth
+                        || delta.checkpoint_generation > checkpoint.binding.generation
+                        || delta.checkpoint_generation
+                            != record.extent.binding.target_checkpoint_generation
+                    {
+                        return Err(StoreError::Corrupt);
+                    }
+                    chain.push(delta);
+                    pointer = delta.previous_delta;
+                    depth -= 1;
+                }
+                if pointer != PhysicalPointer::Null {
+                    return Err(StoreError::Corrupt);
+                }
+                objects
+                    .try_reserve(replay_count)
+                    .map_err(|_| StoreError::MemoryLimit)?;
+                blobs
+                    .try_reserve(replay_count)
+                    .map_err(|_| StoreError::MemoryLimit)?;
+                let mut previous_generation = snapshot_generation;
+                let mut previous_id = objects.last().map_or(0, |object| object.object_id);
+                for delta in chain.iter().rev() {
+                    // Chain generations never decrease (one checkpoint may
+                    // append several deltas), ObjectIds strictly increase, a
+                    // reuse resolves an already published Blob and a new
+                    // Blob mapping publishes its key exactly once.
+                    if delta.checkpoint_generation < previous_generation
+                        || delta.object.object_id <= previous_id
+                    {
+                        return Err(StoreError::Corrupt);
+                    }
+                    previous_generation = delta.checkpoint_generation;
+                    previous_id = delta.object.object_id;
+                    let position =
+                        blobs.binary_search_by_key(&delta.object.blob_key, |blob| blob.blob_key);
+                    match (delta.new_blob, position) {
+                        (None, Ok(_)) => {}
+                        (Some(blob), Err(insert)) if blob.blob_key == delta.object.blob_key => {
+                            blobs.insert(insert, blob);
+                        }
+                        _ => return Err(StoreError::Corrupt),
+                    }
+                    objects.push(delta.object);
+                }
+                if objects.len() > limits.max_catalog_entries as usize
+                    || blobs.len() > limits.max_catalog_entries as usize
+                {
+                    return Err(StoreError::Corrupt);
+                }
+            }
+            let cas_bytes = objects
                 .capacity()
                 .checked_mul(mem::size_of::<ObjectMapping>())
                 .and_then(|bytes| {
-                    decoded
-                        .blobs
+                    blobs
                         .capacity()
                         .checked_mul(mem::size_of::<BlobMapping>())
                         .and_then(|more| bytes.checked_add(more))
                 })
                 .ok_or(StoreError::MemoryLimit)?;
-            let snapshot_capacity = snapshot.bytes.capacity();
             recovery_observe(
                 &mut recovery_peak,
                 limits.recovery_memory_bytes,
@@ -2853,11 +2983,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
                     .and_then(|bytes| bytes.checked_add(snapshot_capacity))
                     .ok_or(StoreError::MemoryLimit)?,
             )?;
-            // The decoded tables own their data; release the encoded snapshot
-            // before reading a manifest so the measured recovery peak is also
-            // the actual live-memory bound.
-            drop(snapshot);
-            for blob in &decoded.blobs {
+            for blob in &blobs {
                 let PhysicalPointer::Value(_manifest_pointer) = blob.manifest else {
                     return Err(StoreError::Corrupt);
                 };
@@ -2922,10 +3048,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
                         .ok_or(StoreError::MemoryLimit)?,
                 )?;
             }
-            cas = Some(CasMountedState {
-                objects: decoded.objects,
-                blobs: decoded.blobs,
-            });
+            cas = Some(CasMountedState { objects, blobs });
         } else {
             recovery_preflight_decode(
                 limits.recovery_memory_bytes,
@@ -3068,7 +3191,10 @@ pub(crate) async fn recover_state<D: PageDevice>(
     }
 
     let mut reverse_deltas = Vec::new();
-    let replay_capacity_bytes = usize::try_from(checkpoint.replay_count)
+    // A CAS catalog consumed its replay chain above; only the legacy catalog
+    // replays entries here.
+    let legacy_replay_count = if cas.is_some() { 0 } else { checkpoint.replay_count };
+    let replay_capacity_bytes = usize::try_from(legacy_replay_count)
         .ok()
         .and_then(|count| count.checked_mul(mem::size_of::<CatalogEntry>()))
         .ok_or(StoreError::MemoryLimit)?;
@@ -3087,7 +3213,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
         return Err(StoreError::MemoryLimit);
     }
     reverse_deltas
-        .try_reserve_exact(checkpoint.replay_count as usize)
+        .try_reserve_exact(legacy_replay_count as usize)
         .map_err(|_| StoreError::MemoryLimit)?;
     recovery_observe(
         &mut recovery_peak,
@@ -3096,8 +3222,12 @@ pub(crate) async fn recover_state<D: PageDevice>(
             .checked_add(reverse_deltas.capacity() * mem::size_of::<CatalogEntry>())
             .ok_or(StoreError::MemoryLimit)?,
     )?;
-    let mut pointer = checkpoint.replay_tail;
-    let mut expected_depth = u64::from(checkpoint.replay_count);
+    let mut pointer = if cas.is_some() {
+        PhysicalPointer::Null
+    } else {
+        checkpoint.replay_tail
+    };
+    let mut expected_depth = u64::from(legacy_replay_count);
     while expected_depth != 0 {
         let replay_resident = resident_bytes
             .checked_add(

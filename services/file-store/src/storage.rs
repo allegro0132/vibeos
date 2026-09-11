@@ -1570,7 +1570,7 @@ mod io_trace {
     fn limits() -> StoreLimits {
         StoreLimits {
             max_catalog_entries: 4096,
-            max_replay_records: 4,
+            max_replay_records: 32,
             recovery_memory_bytes: 8 * 1024 * 1024,
             max_compat_object_bytes: 64 * 1024,
         }
@@ -1641,12 +1641,16 @@ mod io_trace {
     /// Format a store, import an empty persistent authority, attach the
     /// maintenance backend, and populate `warm` 4 KiB files in commits of 40.
     fn fixture(warm: u32) -> Fixture {
-        const NAMESPACE: u128 = 0x5649_4245_4f53_2d54_5241_4345_5f49_4f31;
-        const POLICY: &[u8] = b"io trace policy v1";
         let segments: u64 = std::env::var("VIBE_IO_TRACE_SEGMENTS")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(256);
+        fixture_with(warm, segments)
+    }
+
+    fn fixture_with(warm: u32, segments: u64) -> Fixture {
+        const NAMESPACE: u128 = 0x5649_4245_4f53_2d54_5241_4345_5f49_4f31;
+        const POLICY: &[u8] = b"io trace policy v1";
         let device = TraceDevice::blank(segments);
         let (context, _quota, provisioner) =
             StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
@@ -1702,8 +1706,9 @@ mod io_trace {
                 }
             }
             std::println!(
-                "== warm phase: writes={writes} ({} KiB, {single_page_writes} single-page) flushes={flushes}",
-                pages * 4
+                "== warm phase: writes={writes} ({} KiB, {single_page_writes} single-page) flushes={flushes} edge-cache={:?}",
+                pages * 4,
+                backend.store.lock().unwrap().typed_edge_cache_stats()
             );
         }
         Fixture { device, root, backend }
@@ -1827,6 +1832,162 @@ mod io_trace {
         assert_eq!(flushes(&create), 3);
     }
 
+    fn replay_count(backend: &TraceBackend) -> u32 {
+        backend.store.lock().unwrap().info().unwrap().replay_count
+    }
+
+    fn cold_mount_and_check(device: &TraceDevice, namespace: u128, expected: &[(&str, Vec<u8>)]) {
+        let (cold_context, _cold_quota, _cold_maintenance) =
+            StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
+                &vibeos_segment_store::fs_typed_reference_kinds(),
+            )
+            .unwrap();
+        let mut cold =
+            SegmentStore::new_with_runtime_context(device.clone(), limits(), cold_context);
+        block_on(cold.mount()).unwrap();
+        let recovered = block_on(crate::FileTreeRoot::recover_persistent(&cold, namespace, 4096))
+            .unwrap()
+            .unwrap();
+        let snapshot = recovered.snapshot();
+        for (path, bytes) in expected {
+            let data = snapshot
+                .persistent_data(&crate::RelPath::parse(path).unwrap())
+                .unwrap();
+            assert_eq!(
+                block_on(cold.read_fs_data_chunk(&data, 0)).unwrap().unwrap(),
+                *bytes,
+                "{path} content after cold mount"
+            );
+        }
+    }
+
+    /// Against a populated catalog, small transactions publish catalog
+    /// deltas instead of rewriting the whole `VIBECAS2` snapshot: the replay
+    /// chain grows by one record per minted object, cold mount replays it,
+    /// and the chain resets to a snapshot before it exceeds the superblock's
+    /// replay budget.
+    #[test]
+    fn small_transactions_publish_catalog_deltas_that_cold_mount_replays() {
+        let fixture = fixture(600);
+        let namespace = fixture.root.snapshot().namespace();
+        let budget = limits().max_replay_records;
+        let mut expected: Vec<(&str, Vec<u8>)> = Vec::new();
+        let names = [
+            "delta-a", "delta-b", "delta-c", "delta-d", "delta-e", "delta-f", "delta-g",
+            "delta-h", "delta-i", "delta-j", "delta-k", "delta-l",
+        ];
+        let mut saw_chain = false;
+        let mut saw_reset = false;
+        let mut previous_depth = replay_count(&fixture.backend);
+        for (index, name) in names.iter().enumerate() {
+            let bytes = payload(100 + index as u32);
+            let path = crate::RelPath::parse(name).unwrap();
+            let mut stager = fixture.root.begin_content_stager(&path, false).unwrap();
+            block_on(stager.push(&bytes)).unwrap();
+            let staged = block_on(stager.finish()).unwrap();
+            let mut tx = fixture.root.begin().unwrap();
+            tx.write_staged(&path, staged).unwrap();
+            block_on(tx.commit_durable()).unwrap();
+            let events = fixture.device.take();
+            assert_eq!(flushes(&events), 3, "a delta commit is still one checkpoint");
+            let depth = replay_count(&fixture.backend);
+            assert!(depth <= budget, "chain depth {depth} exceeds the replay budget {budget}");
+            if depth > previous_depth {
+                saw_chain = true;
+                // One delta per minted object: content node, touched tree
+                // nodes, root — never more than a handful.
+                assert!(depth - previous_depth <= 8, "unexpectedly many deltas per commit");
+            } else if previous_depth > 0 && depth == 0 {
+                saw_reset = true;
+            }
+            previous_depth = depth;
+            expected.push((name, bytes));
+            if index == 2 {
+                assert!(saw_chain, "Auto policy must choose deltas against a 600-file catalog");
+                cold_mount_and_check(&fixture.device, namespace, &expected);
+            }
+        }
+        assert!(saw_chain && saw_reset, "chain={saw_chain} reset={saw_reset}");
+        cold_mount_and_check(&fixture.device, namespace, &expected);
+        let mut all: Vec<(&str, Vec<u8>)> = expected.clone();
+        all.push(("warm-0007", alloc::vec![7_u8; 4096]));
+        cold_mount_and_check(&fixture.device, namespace, &all);
+        if let Ok(path) = std::env::var("VIBE_IO_TRACE_DUMP") {
+            let pages = fixture.device.pages.lock().unwrap();
+            let mut image =
+                alloc::vec![0_u8; (fixture.device.page_count * PAGE_SIZE as u64) as usize];
+            for (page, bytes) in pages.iter() {
+                let at = (*page as usize) * PAGE_SIZE;
+                image[at..at + PAGE_SIZE].copy_from_slice(bytes);
+            }
+            std::fs::write(path, image).unwrap();
+        }
+    }
+
+    /// `Never` keeps the pre-replay behaviour: every commit rewrites the
+    /// complete snapshot and the chain stays empty.
+    #[test]
+    fn never_policy_keeps_compact_snapshots() {
+        let fixture = fixture(600);
+        fixture
+            .backend
+            .store
+            .lock()
+            .unwrap()
+            .set_catalog_delta_policy(vibeos_segment_store::CatalogDeltaPolicy::Never);
+        for index in 0..3_u32 {
+            let path = crate::RelPath::parse(&alloc::format!("compact-{index}")).unwrap();
+            let mut tx = fixture.root.begin().unwrap();
+            tx.write_chunks(&path, [payload(200 + index)], false).unwrap();
+            block_on(tx.commit_durable()).unwrap();
+            assert_eq!(replay_count(&fixture.backend), 0);
+        }
+    }
+
+    /// A collection round that follows an earlier round in the same process
+    /// rebuilds reachability from the typed edge memo and reads only objects
+    /// committed since, so its device reads drop by more than half.
+    #[test]
+    fn later_collection_rounds_reuse_authenticated_edges() {
+        // 900 files on a 36-segment device: the free-segment floor forces a
+        // collection round every third create+unlink pair.
+        let fixture = fixture_with(900, 36);
+        let device = fixture.device.clone();
+        let mut rounds: Vec<(u64, u64, u64)> = Vec::new(); // (read pages, hits, misses)
+        for sample in 0..8_u32 {
+            let bytes = payload(300 + sample);
+            let path = crate::RelPath::parse(&alloc::format!("gc-{sample}")).unwrap();
+            let mut tx = fixture.root.begin().unwrap();
+            tx.write_chunks(&path, [bytes], false).unwrap();
+            block_on(tx.commit_durable()).unwrap();
+            device.take();
+            let mut tx = fixture.root.begin().unwrap();
+            tx.remove(&path, false, false).unwrap();
+            block_on(tx.commit_durable()).unwrap();
+            let events = device.take();
+            if flushes(&events) >= 10 {
+                let pages: u64 = events
+                    .iter()
+                    .map(|event| match event {
+                        Event::Read(_, count) => *count,
+                        _ => 0,
+                    })
+                    .sum();
+                let (_, hits, misses) = fixture.backend.store.lock().unwrap().typed_edge_cache_stats();
+                rounds.push((pages, hits, misses));
+            }
+        }
+        assert!(rounds.len() >= 2, "expected at least two collection rounds, saw {rounds:?}");
+        let (first_pages, first_hits, _) = rounds[0];
+        let (later_pages, later_hits, _) = rounds[rounds.len() - 1];
+        assert_eq!(first_hits, 0, "the first round in a process has nothing to reuse");
+        assert!(later_hits > first_hits, "later rounds must hit the edge memo: {rounds:?}");
+        assert!(
+            later_pages * 2 < first_pages,
+            "a warm round should read less than half of a cold one: {rounds:?}"
+        );
+    }
+
     #[test]
     #[ignore]
     fn trace_create_fsync_unlink() {
@@ -1835,7 +1996,11 @@ mod io_trace {
         );
         let device = fixture.device.clone();
         let root = fixture.root;
-        for sample in 0..2 {
+        let samples: u32 = std::env::var("VIBE_IO_TRACE_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2);
+        for sample in 0..samples {
             let payload = payload(sample);
             let path = crate::RelPath::parse(&alloc::format!("bench-file-{sample}")).unwrap();
             let mut stager = root.begin_content_stager(&path, false).unwrap();
@@ -1854,6 +2019,10 @@ mod io_trace {
             tx.remove(&path, false, false).unwrap();
             block_on(tx.commit_durable()).unwrap();
             report(&alloc::format!("s{sample} commit unlink"), &device.take());
+            std::println!(
+                "  edge-cache (objects, hits, misses) = {:?}",
+                fixture.backend.store.lock().unwrap().typed_edge_cache_stats()
+            );
         }
         if let Ok(path) = std::env::var("VIBE_IO_TRACE_DUMP") {
             let pages = device.pages.lock().unwrap();

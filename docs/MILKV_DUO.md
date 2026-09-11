@@ -653,11 +653,15 @@ file-tree QEMU case's powered-off verifier.
   the previous publication), and the COW planner keeps old node boundaries
   so an edit in a populated directory re-stages only its own path instead
   of most of the tree (600-file namespace: 908 KiB → 420 KiB per create).
+  Catalog changes ride the format's bounded replay chain (one 3-page delta
+  per minted object) instead of rewriting the whole object catalog every
+  checkpoint, so the per-commit catalog cost no longer grows with `@home`.
   Collection rounds batch their relocation writes into contiguous runs
   (986 → 36 device requests for one relocated segment). Both matter far
-  more on 1-bit PIO SD than on QEMU's RAM-backed disk. A round's remaining
-  cost is its mark walk: ~3 page reads per live node, larger than the
-  2 MiB page cache on a populated store.
+  more on 1-bit PIO SD than on QEMU's RAM-backed disk. Later rounds in one
+  boot reuse the previous round's authenticated edges, so only the first
+  round pays the full mark walk (~3 page reads per live node); a warm round
+  over 900 files reads about a third of a cold one.
 - One spontaneous board reset was observed under sustained write load
   (possible supply dip; worth checking the Duo's power source). Data written
   minutes before the reset survived except one subtree, consistent with the

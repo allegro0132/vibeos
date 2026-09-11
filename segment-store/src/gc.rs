@@ -380,6 +380,117 @@ pub(crate) fn capture_mark_roots<const ROOT_SLOTS: usize, const READER_SLOTS: us
 /// Typed-child adapter used by the asynchronous engine.  MarkPlanner itself is
 /// deliberately synchronous, so all admitted typed payloads are authenticated
 /// and decoded into this bounded table before traversal starts.
+/// Runtime memo of the typed child references each committed object names.
+/// Objects are immutable and id-addressed: once an object's bytes were read
+/// and authenticated by one mark walk, the children it names never change,
+/// so a later collection round in the same process rebuilds reachability
+/// from these edges and reads only objects it has not seen. Entries stay
+/// bound to the object's BlobKey and are dropped when the id leaves the
+/// catalog, so a stale or re-bound identity can never be served. Bounded by
+/// bytes; on overflow the whole memo is dropped and the next round walks
+/// from media again. Never persisted: every cold mount starts empty.
+pub(crate) struct TypedEdgeCache {
+    edges: alloc::collections::BTreeMap<u128, TypedEdgeEntry>,
+    bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+struct TypedEdgeEntry {
+    blob_key: BlobKey,
+    commit_generation: u64,
+    children: Vec<ChildReference>,
+}
+
+/// Upper bound on cached edge bytes (the store's own catalog tables are of
+/// the same order at the catalog-entry ceiling).
+const TYPED_EDGE_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+impl TypedEdgeCache {
+    pub(crate) const fn new() -> Self {
+        Self {
+            edges: alloc::collections::BTreeMap::new(),
+            bytes: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// `(cached objects, walk hits, walk misses)` since the store opened.
+    pub(crate) fn stats(&self) -> (usize, u64, u64) {
+        (self.edges.len(), self.hits, self.misses)
+    }
+
+    fn entry_bytes(children: usize) -> usize {
+        core::mem::size_of::<u128>()
+            + core::mem::size_of::<TypedEdgeEntry>()
+            + children * core::mem::size_of::<ChildReference>()
+    }
+
+    /// Children of `object` as authenticated by an earlier walk, if known.
+    fn lookup(&self, object: &ObjectMapping) -> Option<&[ChildReference]> {
+        self.edges
+            .get(&object.object_id)
+            .filter(|entry| {
+                entry.blob_key == object.blob_key
+                    && entry.commit_generation == object.commit_generation
+            })
+            .map(|entry| entry.children.as_slice())
+    }
+
+    fn insert(&mut self, object: &ObjectMapping, children: &[ChildReference]) {
+        let bytes = Self::entry_bytes(children.len());
+        if self.bytes.saturating_add(bytes) > TYPED_EDGE_CACHE_MAX_BYTES {
+            self.clear();
+            if bytes > TYPED_EDGE_CACHE_MAX_BYTES {
+                return;
+            }
+        }
+        let mut copy = Vec::new();
+        if copy.try_reserve_exact(children.len()).is_err() {
+            return;
+        }
+        copy.extend_from_slice(children);
+        if let Some(previous) = self.edges.insert(
+            object.object_id,
+            TypedEdgeEntry {
+                blob_key: object.blob_key,
+                commit_generation: object.commit_generation,
+                children: copy,
+            },
+        ) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(Self::entry_bytes(previous.children.len()));
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// Drop every id the catalog no longer names.
+    fn retain_catalog(&mut self, objects: &[ObjectMapping]) {
+        let mut dropped = 0_usize;
+        self.edges.retain(|object_id, entry| {
+            let live = objects
+                .binary_search_by_key(object_id, |object| object.object_id)
+                .is_ok();
+            if !live {
+                dropped = dropped.saturating_add(Self::entry_bytes(entry.children.len()));
+            }
+            live
+        });
+        self.bytes = self.bytes.saturating_sub(dropped);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.edges.clear();
+        self.bytes = 0;
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.edges.len()
+    }
+}
+
 pub(crate) struct DecodedTypedChildren {
     entries: Vec<(u128, Vec<ChildReference>)>,
     allocated_bytes: usize,
@@ -510,8 +621,12 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
     roots: &[MarkRoot],
     typed_reference_kinds: &[u32],
     memo: Option<&VerifiedSegmentScans>,
+    mut edge_cache: Option<&mut TypedEdgeCache>,
 ) -> Result<DecodedTypedChildren, GcStoreError<D::Error>> {
     let cas = state.cas.as_ref().ok_or(GcError::NotCas)?;
+    if let Some(cache) = edge_cache.as_deref_mut() {
+        cache.retain_catalog(&cas.objects);
+    }
     let object_budget =
         usize::try_from(limits.max_catalog_entries).map_err(|_| GcError::MemoryLimit)?;
     if object_budget == 0 || roots.len() > object_budget {
@@ -596,6 +711,44 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
             // A media tag never admits its own parser. Unregistered kinds are
             // opaque even when their bytes happen to be valid VIBEREF1.
             entries.push((object.object_id, Vec::new()));
+            continue;
+        }
+        let cached: Option<Vec<ChildReference>> = match edge_cache.as_deref_mut() {
+            Some(cache) => match cache.lookup(&object) {
+                Some(children) => {
+                    let mut copy = Vec::new();
+                    copy.try_reserve_exact(children.len())
+                        .map_err(|_| GcError::MemoryLimit)?;
+                    copy.extend_from_slice(children);
+                    cache.hits = cache.hits.saturating_add(1);
+                    Some(copy)
+                }
+                None => {
+                    cache.misses = cache.misses.saturating_add(1);
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some(children) = cached {
+            // Authenticated by an earlier walk in this process: rebuild the
+            // edge without touching media.
+            let object_children = children;
+            for child in &object_children {
+                let child_key =
+                    RootKey::new(child.object_id, child.commit_generation, child.object_kind)
+                        .map_err(GcError::from)?;
+                if visited.binary_search(&child_key).is_err()
+                    && pending.binary_search(&child_key).is_err()
+                {
+                    if pending.len() == object_budget {
+                        return Err(GcError::MemoryLimit.into());
+                    }
+                    let insert = pending.binary_search(&child_key).unwrap_err();
+                    pending.insert(insert, child_key);
+                }
+            }
+            entries.push((object.object_id, object_children));
             continue;
         }
         // Reject an over-budget typed payload from the authenticated BlobKey
@@ -915,6 +1068,9 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
                 let insert = pending.binary_search(&child_key).unwrap_err();
                 pending.insert(insert, child_key);
             }
+        }
+        if let Some(cache) = edge_cache.as_deref_mut() {
+            cache.insert(&object, &object_children);
         }
         entries.push((object.object_id, object_children));
     }
@@ -3584,6 +3740,7 @@ impl<D: PageDevice> SegmentStore<D> {
             &roots,
             &self.typed_reference_kinds,
             Some(&self.verified_scans),
+            Some(&mut self.typed_edge_cache),
         )
         .await?;
         memory.transient(typed.peak_bytes)?;
@@ -3643,8 +3800,15 @@ impl<D: PageDevice> SegmentStore<D> {
         memory.release(typed.allocated_bytes)?;
         drop(typed);
         let manifests =
-            load_live_manifests(&self.device, &state, self.limits, &mark, memory.current, Some(&self.verified_scans))
-                .await
+            load_live_manifests(
+                &self.device,
+                &state,
+                self.limits,
+                &mark,
+                memory.current,
+                Some(&self.verified_scans),
+            )
+            .await
                 .map_err(|error| match error {
                     GcStoreError::Gc(GcError::Corrupt) => {
                         GcStoreError::Gc(GcError::CorruptAt("load-manifests"))

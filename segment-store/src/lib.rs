@@ -65,7 +65,7 @@ pub use authority_snapshot::{
     PERSISTENT_AUTHORITY_PRINCIPAL_LEN, PERSISTENT_AUTHORITY_SNAPSHOT_VERSION,
 };
 pub use cas::{
-    BlobWriter, CasCommitError, CasObjectHandle, CasStoreError, ForegroundBlobError,
+    BlobWriter, CasCommitError, CatalogDeltaPolicy, CasObjectHandle, CasStoreError, ForegroundBlobError,
     ReleasedRuntimePins, RuntimeObjectPin, RuntimeObjectPinClass, RuntimePinOwner,
     RuntimePinOwnerError, StoppedRuntimePinOwner, VerifiedCasBlob, VerifiedCasChunk,
 };

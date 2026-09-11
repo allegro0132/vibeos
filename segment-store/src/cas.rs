@@ -31,7 +31,8 @@ use crate::authority::{
     PublishError,
 };
 use crate::cas_codec::{
-    decode_blob_manifest, encode_blob_manifest, encode_cas_snapshot, BlobKey, BlobManifest,
+    decode_blob_manifest, encode_blob_manifest, encode_cas_delta, encode_cas_snapshot, BlobKey,
+    BlobManifest, CasDelta,
     BlobMapping, CasCodecContext, CasCodecError, CasSnapshot, ManifestExtent, ObjectMapping,
     BLOB_MANIFEST_HEADER_LEN, BLOB_MAPPING_LEN, CANONICAL_CONTENT_EXTENT_LEN,
     CAS_SNAPSHOT_HEADER_LEN, MANIFEST_EXTENT_LEN, MAX_BLOB_EXTENTS, MAX_METADATA_PAYLOAD_LEN,
@@ -57,6 +58,7 @@ use crate::store::{
 
 const METADATA_KIND_MANIFEST: u32 = 0xffff_0010;
 const METADATA_KIND_CAS_SNAPSHOT: u32 = 0xffff_0011;
+const METADATA_KIND_CAS_DELTA: u32 = 0xffff_0012;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 const METADATA_KIND_PERSISTENT_AUTHORITY: u32 = 0xffff_0021;
 // The cheap readback path decodes and fully re-verifies the staged blob from
@@ -359,6 +361,55 @@ async fn preclear_scratch_seals<D: PageDevice>(
         cleared.insert(segment_no);
     }
     Ok(cleared)
+}
+
+/// How a commit publishes its catalog change: a complete `VIBECAS2` snapshot
+/// (the M7.4 baseline, one extent whose size grows with the object count)
+/// or the frozen bounded-replay form — one `CatalogDelta` extent per newly
+/// minted object, chained from the checkpoint's replay tail back to the
+/// unchanged snapshot root. Deltas are admitted only while the chain stays
+/// within the superblock's `max_replay_records`; every collection round and
+/// every out-of-budget commit re-emits a complete snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CatalogDeltaPolicy {
+    /// Emit deltas when they cost fewer segment pages than the snapshot.
+    Auto,
+    /// Always write a complete snapshot (the pre-replay behaviour).
+    Never,
+    /// Emit deltas whenever the replay budget admits them (tests).
+    Always,
+}
+
+/// The catalog records one publication writes and what the checkpoint names.
+struct CatalogPublication {
+    root: PhysicalPointer,
+    replay_count: u32,
+    replay_tail: PhysicalPointer,
+    /// `(record index, extent kind, encoded payload)` in write order.
+    payloads: Vec<(usize, ExtentKind, Vec<u8>)>,
+}
+
+/// Pages one delta record spans: a descriptor pair plus one payload page.
+const CATALOG_DELTA_SPAN_PAGES: u64 = 3;
+
+fn catalog_deltas_preferred(
+    policy: CatalogDeltaPolicy,
+    state: &MountedState,
+    delta_count: usize,
+    snapshot_spans: u64,
+) -> bool {
+    if policy == CatalogDeltaPolicy::Never || delta_count == 0 {
+        return false;
+    }
+    let within_budget = u32::try_from(delta_count)
+        .ok()
+        .and_then(|count| state.replay_count.checked_add(count))
+        .is_some_and(|depth| depth <= state.superblock.max_replay_records);
+    let eligible =
+        state.cas.is_some() && state.catalog_root != PhysicalPointer::Null && within_budget;
+    eligible
+        && (policy == CatalogDeltaPolicy::Always
+            || (delta_count as u64).saturating_mul(CATALOG_DELTA_SPAN_PAGES) < snapshot_spans)
 }
 
 fn heap_page() -> Box<Page> {
@@ -2575,6 +2626,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             sink,
             self.store.defer_commit_readback,
             Some(&self.store.verified_scans),
+            self.store.catalog_delta_policy,
         )
         .await?;
         Ok((
@@ -3433,6 +3485,7 @@ impl<D: PageDevice> SegmentStore<D> {
             Some(staged.sink),
             self.defer_commit_readback,
             Some(&self.verified_scans),
+            self.catalog_delta_policy,
         )
         .await?;
         self.mount_verified_successor(state, checkpoint, successor, true)
@@ -3910,6 +3963,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 &self.pins,
                 self.defer_commit_readback,
                 Some(&self.verified_scans),
+                self.catalog_delta_policy,
             )
             .await?;
         self.mount_verified_successor(base, checkpoint, successor, true)
@@ -3952,6 +4006,7 @@ async fn commit_batch_snapshot<D: PageDevice>(
     pins: &crate::store::SharedStorePinRegistry,
     defer_readback: bool,
     memo: Option<&VerifiedSegmentScans>,
+    delta_policy: CatalogDeltaPolicy,
 ) -> Result<(Vec<PendingCasObjectHandle>, Checkpoint, MountedState), CasStoreError<D::Error>> {
     let checkpoint_generation = state
         .generation
@@ -4044,8 +4099,15 @@ async fn commit_batch_snapshot<D: PageDevice>(
     } else {
         0
     };
+    let use_deltas =
+        catalog_deltas_preferred(delta_policy, state, staged.len(), span_pages(snapshot_len)?);
+    let catalog_spans = if use_deltas {
+        (staged.len() as u64).saturating_mul(CATALOG_DELTA_SPAN_PAGES)
+    } else {
+        span_pages(snapshot_len)?
+    };
     metadata_spans = metadata_spans
-        .checked_add(span_pages(snapshot_len)?)
+        .checked_add(catalog_spans)
         .and_then(|spans| spans.checked_add(span_pages(allocation_len).ok()?))
         .ok_or(StoreError::Corrupt)?;
     if let Some(fused) = fused {
@@ -4188,35 +4250,126 @@ async fn commit_batch_snapshot<D: PageDevice>(
     {
         return Err(StoreError::Capacity(CapacityClass::Metadata).into());
     }
-    let snapshot = CasSnapshot {
-        checkpoint_generation,
-        objects,
-        blobs,
+    // Deltas name the unchanged snapshot root and extend the replay chain by
+    // one record per minted object; the in-memory tables still merge fully.
+    let (catalog, objects, blobs) = if use_deltas {
+        let mut payloads = Vec::new();
+        payloads
+            .try_reserve_exact(staged.len())
+            .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        let mut emitted_blobs: alloc::collections::BTreeSet<BlobKey> =
+            alloc::collections::BTreeSet::new();
+        let mut previous_delta = state.replay_tail;
+        let mut chain_count = state.replay_count;
+        for (index, entry) in staged.iter().enumerate() {
+            let object_id = state
+                .next_object_id
+                .checked_add(index as u128)
+                .ok_or(StoreError::IdExhausted)?;
+            let new_blob = match first_new_manifest.get(&entry.blob_key) {
+                Some(record_index)
+                    if entry.existing.is_none() && emitted_blobs.insert(entry.blob_key) =>
+                {
+                    Some(BlobMapping {
+                        blob_key: entry.blob_key,
+                        manifest: records[*record_index].pointer(),
+                    })
+                }
+                _ => None,
+            };
+            chain_count = chain_count.checked_add(1).ok_or(StoreError::IdExhausted)?;
+            let delta = CasDelta {
+                checkpoint_generation,
+                chain_count,
+                previous_delta,
+                object: ObjectMapping {
+                    object_id,
+                    blob_key: entry.blob_key,
+                    commit_generation: checkpoint_generation,
+                    reference_codec: entry.reference_codec,
+                },
+                new_blob,
+            };
+            let bytes = encode_cas_delta(delta, context)?;
+            let record = build_record(
+                state.superblock.binding.store_uuid,
+                metadata_segment_no,
+                metadata_generation,
+                checkpoint_generation,
+                ordinal,
+                relative,
+                ExtentKind::CatalogDelta,
+                METADATA_KIND_CAS_DELTA,
+                0,
+                1,
+                bytes.len() as u64,
+                bytes.len() as u64,
+                0,
+                bytes.len() as u64,
+                payload_sha256(&bytes),
+                payload_sha256(&bytes),
+            )?;
+            relative += record.value.record_span_pages;
+            ordinal += 1;
+            previous_delta = record.pointer();
+            payloads.push((records.len(), ExtentKind::CatalogDelta, bytes));
+            records.push(record);
+        }
+        let publication = CatalogPublication {
+            root: state.catalog_root,
+            replay_count: chain_count,
+            replay_tail: previous_delta,
+            payloads,
+        };
+        (publication, objects, blobs)
+    } else {
+        let snapshot = CasSnapshot {
+            checkpoint_generation,
+            objects,
+            blobs,
+        };
+        let snapshot_bytes = encode_cas_snapshot(&snapshot, context)?;
+        let snapshot_record = build_record(
+            state.superblock.binding.store_uuid,
+            metadata_segment_no,
+            metadata_generation,
+            checkpoint_generation,
+            ordinal,
+            relative,
+            ExtentKind::Catalog,
+            METADATA_KIND_CAS_SNAPSHOT,
+            0,
+            1,
+            snapshot_bytes.len() as u64,
+            snapshot_bytes.len() as u64,
+            0,
+            snapshot_bytes.len() as u64,
+            payload_sha256(&snapshot_bytes),
+            payload_sha256(&snapshot_bytes),
+        )?;
+        relative += snapshot_record.value.record_span_pages;
+        ordinal += 1;
+        let mut payloads = Vec::new();
+        payloads
+            .try_reserve_exact(1)
+            .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        payloads.push((records.len(), ExtentKind::Catalog, snapshot_bytes));
+        let publication = CatalogPublication {
+            root: snapshot_record.pointer(),
+            replay_count: 0_u32,
+            replay_tail: PhysicalPointer::Null,
+            payloads,
+        };
+        records.push(snapshot_record);
+        (publication, snapshot.objects, snapshot.blobs)
     };
-    let snapshot_bytes = encode_cas_snapshot(&snapshot, context)?;
-    let snapshot_record = build_record(
-        state.superblock.binding.store_uuid,
-        metadata_segment_no,
-        metadata_generation,
-        checkpoint_generation,
-        ordinal,
-        relative,
-        ExtentKind::Catalog,
-        METADATA_KIND_CAS_SNAPSHOT,
-        0,
-        1,
-        snapshot_bytes.len() as u64,
-        snapshot_bytes.len() as u64,
-        0,
-        snapshot_bytes.len() as u64,
-        payload_sha256(&snapshot_bytes),
-        payload_sha256(&snapshot_bytes),
-    )?;
-    relative += snapshot_record.value.record_span_pages;
-    ordinal += 1;
-    let catalog_root = snapshot_record.pointer();
-    let snapshot_index = records.len();
-    records.push(snapshot_record);
+    let mut catalog_pointers: Vec<(PhysicalPointer, ExtentKind, &[u8])> = Vec::new();
+    catalog_pointers
+        .try_reserve_exact(catalog.payloads.len())
+        .map_err(|_| StoreError::MemoryLimit)?;
+    for (index, kind, bytes) in &catalog.payloads {
+        catalog_pointers.push((records[*index].pointer(), *kind, bytes.as_slice()));
+    }
 
     let authority_index = if let Some(fused) = fused {
         let record = build_record(
@@ -4318,7 +4471,9 @@ async fn commit_batch_snapshot<D: PageDevice>(
     for (index, bytes) in &manifest_payloads {
         payload_records.push((&records[*index], bytes.as_slice()));
     }
-    payload_records.push((&records[snapshot_index], snapshot_bytes.as_slice()));
+    for (index, _, bytes) in &catalog.payloads {
+        payload_records.push((&records[*index], bytes.as_slice()));
+    }
     if let (Some(index), Some(fused)) = (authority_index, fused) {
         payload_records.push((&records[index], fused.authority_bytes.as_slice()));
     }
@@ -4444,13 +4599,13 @@ async fn commit_batch_snapshot<D: PageDevice>(
         admitted_range_pages: vibeos_segment_format::admitted_pages(state.admitted_segments)?,
         admitted_segments: state.admitted_segments,
         next_segment_generation,
-        replay_count: 0,
+        replay_count: catalog.replay_count,
         max_replay_records: limits.max_replay_records,
         cleaner_reserve_segments: state.cleaner_reserve_segments,
-        catalog_root,
+        catalog_root: catalog.root,
         authority_root,
         allocation_root,
-        replay_tail: PhysicalPointer::Null,
+        replay_tail: catalog.replay_tail,
     };
     write_checkpoint(device, &checkpoint, true).await?;
 
@@ -4524,12 +4679,10 @@ async fn commit_batch_snapshot<D: PageDevice>(
             requests.push((*pointer, ExtentKind::Catalog, limits.recovery_memory_bytes));
             expected.push(bytes.as_slice());
         }
-        requests.push((
-            catalog_root,
-            ExtentKind::Catalog,
-            limits.recovery_memory_bytes,
-        ));
-        expected.push(snapshot_bytes.as_slice());
+        for (pointer, kind, bytes) in &catalog_pointers {
+            requests.push((*pointer, *kind, limits.recovery_memory_bytes));
+            expected.push(bytes);
+        }
         requests.push((
             allocation_root,
             ExtentKind::Allocation,
@@ -4580,9 +4733,9 @@ async fn commit_batch_snapshot<D: PageDevice>(
         next_segment_generation,
         next_object_id,
         cleaner_reserve_segments: state.cleaner_reserve_segments,
-        replay_count: 0,
-        catalog_root,
-        replay_tail: PhysicalPointer::Null,
+        replay_count: catalog.replay_count,
+        catalog_root: catalog.root,
+        replay_tail: catalog.replay_tail,
         authority_root,
         allocation_root,
         allocation,
@@ -4597,8 +4750,8 @@ async fn commit_batch_snapshot<D: PageDevice>(
         },
         catalog: state.catalog.clone(),
         cas: Some(CasMountedState {
-            objects: snapshot.objects,
-            blobs: snapshot.blobs,
+            objects,
+            blobs,
         }),
         recovery_peak_bytes: 0,
         last_segment: Some((metadata_segment_no, metadata_generation, metadata_seal_hash)),
@@ -4665,6 +4818,7 @@ async fn commit_snapshot<D: PageDevice>(
     mut sink: Option<PageSink>,
     defer_readback: bool,
     memo: Option<&VerifiedSegmentScans>,
+    delta_policy: CatalogDeltaPolicy,
 ) -> Result<(PendingCasObjectHandle, Checkpoint, MountedState), CasStoreError<D::Error>> {
     let checkpoint_generation = state
         .generation
@@ -4822,35 +4976,119 @@ async fn commit_snapshot<D: PageDevice>(
     {
         return Err(StoreError::Capacity(CapacityClass::Metadata).into());
     }
-    let snapshot = CasSnapshot {
-        checkpoint_generation,
-        objects,
-        blobs,
-    };
-    let snapshot_bytes = encode_cas_snapshot(&snapshot, context)?;
-    let snapshot_record = build_record(
-        state.superblock.binding.store_uuid,
-        metadata_segment_no,
-        metadata_generation,
-        checkpoint_generation,
-        ordinal,
-        relative,
-        ExtentKind::Catalog,
-        METADATA_KIND_CAS_SNAPSHOT,
-        0,
+    let use_deltas = catalog_deltas_preferred(
+        delta_policy,
+        state,
         1,
-        snapshot_bytes.len() as u64,
-        snapshot_bytes.len() as u64,
-        0,
-        snapshot_bytes.len() as u64,
-        payload_sha256(&snapshot_bytes),
-        payload_sha256(&snapshot_bytes),
-    )?;
-    relative += snapshot_record.value.record_span_pages;
-    ordinal += 1;
-    let catalog_root = snapshot_record.pointer();
-    let snapshot_index = records.len();
-    records.push(snapshot_record);
+        u64::try_from(
+            (CAS_SNAPSHOT_HEADER_LEN
+                + objects.len() * OBJECT_MAPPING_LEN
+                + blobs.len() * BLOB_MAPPING_LEN)
+                .div_ceil(PAGE_SIZE),
+        )
+        .map_err(|_| StoreError::Corrupt)?
+        .saturating_add(2),
+    );
+    let (catalog, objects, blobs) = if use_deltas {
+        let mut payloads = Vec::new();
+        payloads
+            .try_reserve_exact(1)
+            .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        let mut previous_delta = state.replay_tail;
+        let chain_count = state.replay_count.checked_add(1).ok_or(StoreError::IdExhausted)?;
+        {
+            let delta = CasDelta {
+                checkpoint_generation,
+                chain_count,
+                previous_delta,
+                object: ObjectMapping {
+                    object_id: state.next_object_id,
+                    blob_key,
+                    commit_generation: checkpoint_generation,
+                    reference_codec,
+                },
+                new_blob: is_new.then_some(new_blob_mapping),
+            };
+            let bytes = encode_cas_delta(delta, context)?;
+            let record = build_record(
+                state.superblock.binding.store_uuid,
+                metadata_segment_no,
+                metadata_generation,
+                checkpoint_generation,
+                ordinal,
+                relative,
+                ExtentKind::CatalogDelta,
+                METADATA_KIND_CAS_DELTA,
+                0,
+                1,
+                bytes.len() as u64,
+                bytes.len() as u64,
+                0,
+                bytes.len() as u64,
+                payload_sha256(&bytes),
+                payload_sha256(&bytes),
+            )?;
+            relative += record.value.record_span_pages;
+            ordinal += 1;
+            previous_delta = record.pointer();
+            payloads.push((records.len(), ExtentKind::CatalogDelta, bytes));
+            records.push(record);
+        }
+        let publication = CatalogPublication {
+            root: state.catalog_root,
+            replay_count: chain_count,
+            replay_tail: previous_delta,
+            payloads,
+        };
+        (publication, objects, blobs)
+    } else {
+        let snapshot = CasSnapshot {
+            checkpoint_generation,
+            objects,
+            blobs,
+        };
+        let snapshot_bytes = encode_cas_snapshot(&snapshot, context)?;
+        let snapshot_record = build_record(
+            state.superblock.binding.store_uuid,
+            metadata_segment_no,
+            metadata_generation,
+            checkpoint_generation,
+            ordinal,
+            relative,
+            ExtentKind::Catalog,
+            METADATA_KIND_CAS_SNAPSHOT,
+            0,
+            1,
+            snapshot_bytes.len() as u64,
+            snapshot_bytes.len() as u64,
+            0,
+            snapshot_bytes.len() as u64,
+            payload_sha256(&snapshot_bytes),
+            payload_sha256(&snapshot_bytes),
+        )?;
+        relative += snapshot_record.value.record_span_pages;
+        ordinal += 1;
+        let mut payloads = Vec::new();
+        payloads
+            .try_reserve_exact(1)
+            .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
+        payloads.push((records.len(), ExtentKind::Catalog, snapshot_bytes));
+        let publication = CatalogPublication {
+            root: snapshot_record.pointer(),
+            replay_count: 0_u32,
+            replay_tail: PhysicalPointer::Null,
+            payloads,
+        };
+        records.push(snapshot_record);
+        (publication, snapshot.objects, snapshot.blobs)
+    };
+    let mut catalog_pointers: Vec<(PhysicalPointer, ExtentKind, &[u8])> = Vec::new();
+    catalog_pointers
+        .try_reserve_exact(catalog.payloads.len())
+        .map_err(|_| StoreError::MemoryLimit)?;
+    for (index, kind, bytes) in &catalog.payloads {
+        catalog_pointers.push((records[*index].pointer(), *kind, bytes.as_slice()));
+    }
 
     let authority_index = if let Some(fused) = fused {
         let record = build_record(
@@ -4951,7 +5189,9 @@ async fn commit_snapshot<D: PageDevice>(
     if let Some((record, bytes)) = &manifest_record_and_bytes {
         payload_records.push((record, bytes.as_slice()));
     }
-    payload_records.push((&records[snapshot_index], snapshot_bytes.as_slice()));
+    for (index, _, bytes) in &catalog.payloads {
+        payload_records.push((&records[*index], bytes.as_slice()));
+    }
     if let (Some(index), Some(fused)) = (authority_index, fused) {
         payload_records.push((&records[index], fused.authority_bytes.as_slice()));
     }
@@ -5000,13 +5240,13 @@ async fn commit_snapshot<D: PageDevice>(
         admitted_range_pages: vibeos_segment_format::admitted_pages(state.admitted_segments)?,
         admitted_segments: state.admitted_segments,
         next_segment_generation,
-        replay_count: 0,
+        replay_count: catalog.replay_count,
         max_replay_records: limits.max_replay_records,
         cleaner_reserve_segments: state.cleaner_reserve_segments,
-        catalog_root,
+        catalog_root: catalog.root,
         authority_root,
         allocation_root,
-        replay_tail: PhysicalPointer::Null,
+        replay_tail: catalog.replay_tail,
     };
     write_checkpoint(device, &checkpoint, true).await?;
     // Verify the complete newly selected state after the checkpoint itself has
@@ -5080,12 +5320,10 @@ async fn commit_snapshot<D: PageDevice>(
             ));
             expected.push(bytes.as_slice());
         }
-        requests.push((
-            catalog_root,
-            ExtentKind::Catalog,
-            limits.recovery_memory_bytes,
-        ));
-        expected.push(snapshot_bytes.as_slice());
+        for (pointer, kind, bytes) in &catalog_pointers {
+            requests.push((*pointer, *kind, limits.recovery_memory_bytes));
+            expected.push(bytes);
+        }
         requests.push((
             allocation_root,
             ExtentKind::Allocation,
@@ -5135,9 +5373,9 @@ async fn commit_snapshot<D: PageDevice>(
         next_segment_generation,
         next_object_id,
         cleaner_reserve_segments: state.cleaner_reserve_segments,
-        replay_count: 0,
-        catalog_root,
-        replay_tail: PhysicalPointer::Null,
+        replay_count: catalog.replay_count,
+        catalog_root: catalog.root,
+        replay_tail: catalog.replay_tail,
         authority_root,
         allocation_root,
         allocation,
@@ -5152,8 +5390,8 @@ async fn commit_snapshot<D: PageDevice>(
         },
         catalog: state.catalog.clone(),
         cas: Some(CasMountedState {
-            objects: snapshot.objects,
-            blobs: snapshot.blobs,
+            objects,
+            blobs,
         }),
         recovery_peak_bytes: 0,
         last_segment: Some((metadata_segment_no, metadata_generation, metadata_seal_hash)),

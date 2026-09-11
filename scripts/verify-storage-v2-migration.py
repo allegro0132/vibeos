@@ -1121,14 +1121,12 @@ def reconstruct_v2_checkpoint(
     snapshot_generation = 0
     catalog_pointer = record["catalog_root"]
     if catalog_pointer["status"] == "value":
-        # The CAS delta ABI is frozen for a later milestone, but the current
-        # production VIBECAS2 mount path publishes and accepts only one dense
-        # snapshot.  A powered-off verifier must never accept a state the
-        # kernel itself would reject.
+        # Production emits the frozen CAS delta chain (one minted object per
+        # delta) within the superblock replay budget; the mount path replays
+        # it under the same rules enforced below.
         require(
-            record["replay_count"] == 0
-            and record["replay_tail"]["status"] == "null",
-            "current VIBECAS2 production requires a compact snapshot",
+            record["replay_count"] <= record["max_replay_records"],
+            "VIBECAS2 replay chain exceeds the superblock budget",
         )
         add_physical_pointer(physical_pointers, catalog_pointer, "CAS snapshot root")
         catalog_extent, catalog_payload = resolver.resolve(
@@ -1198,9 +1196,11 @@ def reconstruct_v2_checkpoint(
     previous_generation = snapshot_generation
     previous_object = max(objects, default=0)
     for delta in reversed(reverse_deltas):
+        # One checkpoint may append several deltas: generations never
+        # decrease along the chain, and the snapshot root precedes them all.
         require(
-            delta["checkpoint_generation"] > previous_generation,
-            "CAS replay generations are not strictly increasing",
+            delta["checkpoint_generation"] >= previous_generation,
+            "CAS replay generations decrease along the chain",
         )
         previous_generation = delta["checkpoint_generation"]
         obj = delta["object"]

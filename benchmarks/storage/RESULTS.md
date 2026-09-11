@@ -164,6 +164,36 @@ Three engine changes on branch `wasm_threads` (measured against the
   identical bytes. Nothing reads a relocation target before its seal, and
   the pre-cleared seal set also spares the target-open flush.
 
+- **Catalog delta records** (`segment-store/src/cas.rs`,
+  `CatalogDeltaPolicy`; mount replay in `store.rs`; chain verification in
+  `scrub.rs` and `scripts/verify-storage-v2-migration.py`). Every checkpoint
+  rewrote the complete `VIBECAS2` snapshot, about 100 bytes per object, so
+  a 4 KiB create in a 600-file namespace spent 31 of its ~100 segment pages
+  on the catalog and the share grew linearly with the namespace. The writer
+  now uses the format's frozen delta ABI: one 3-page `CatalogDelta` record
+  per minted object, chained from the checkpoint's replay tail back to the
+  unchanged snapshot root, chosen whenever that costs fewer pages than the
+  snapshot and the chain stays within the superblock's 32-record budget;
+  the chain resets to a snapshot when the budget would be exceeded and on
+  every collection round. A 600-file unlink dropped from 97 to 83 pages,
+  and the per-checkpoint catalog cost is now flat (3 pages per object
+  minted) instead of proportional to the live object count.
+
+- **Reusable mark edges** (`segment-store/src/gc.rs`, `TypedEdgeCache`).
+  Every collection round re-read and re-authenticated every live typed
+  object (manifest, first leaf, tree page) to learn its child references:
+  a round over 900 files read 18 MiB in 4,000 requests. Objects are
+  immutable and id-addressed, so the store now keeps the child list each
+  walk authenticated, bound to the object's BlobKey and pruned to the live
+  catalog; a later round in the same process reads only objects committed
+  since the previous one. Second and later rounds over the same 900 files
+  read 6.6 MiB in 1,174 requests with ~6 misses each; the first round of a
+  process is unchanged. The memo is bounded (4 MiB) and never persisted.
+- Delta chains were also exercised on QEMU: after seven 100-file directory
+  transactions the small-file samples left a 29-record replay chain that
+  the powered-off native verifier (`verify-storage-v2-migration.py
+  --expect-native`) accepted.
+
 Per create+fsync+unlink sample (host trace, in-memory device; the QEMU
 `counters` are now per-sample deltas — the file-tree bench previously
 reported cumulative-since-boot telemetry):
@@ -189,10 +219,11 @@ Raw block coordinates are unchanged. On QEMU the latency deltas are
 inside run-to-run variance (a 5-sample run moves 10-20% between
 sessions, and the bimodal outlier on durable object commits — one sample
 in five 3-8x above the rest — persists and is unrelated to these
-changes); the flush and byte reductions above are the durable result. Remaining per-commit costs, in order: the
-frozen 2-page descriptor pair per extent and the 3-extent split of every
-small blob (about 60% of a small fused segment), the full CAS catalog
-snapshot rewritten per checkpoint (31 pages at ~1200 objects; the format's
-replay-record mechanism could carry deltas), and the per-round mark walk, which reads
-about three distinct pages per live node (manifest, first leaf, tree page)
-and therefore stays O(live objects) until marking becomes incremental.
+changes); the flush and byte reductions above are the durable result.
+
+Remaining per-commit costs, in order: the frozen 2-page descriptor pair per
+extent and the 3-extent split of every small blob (about 60% of a small
+fused segment, a format change), the first collection round of each process
+(its mark walk reads about three distinct pages per live node; later rounds
+reuse the edge memo), and the relocation copy itself, which reads every live
+extent of a source segment once and verifies the copy.

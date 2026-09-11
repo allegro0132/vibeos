@@ -552,7 +552,7 @@ def reconstruct_cas(
     previous_generation = snapshot_generation
     previous_object = max(objects, default=0)
     for delta in reversed(reverse_deltas):
-        require(delta["checkpoint_generation"] > previous_generation, "CAS delta generations are not increasing")
+        require(delta["checkpoint_generation"] >= previous_generation, "CAS delta generations decrease along the chain")
         previous_generation = delta["checkpoint_generation"]
         obj = delta["object"]
         require(obj["object_id"] > previous_object, "CAS delta object IDs are not increasing")

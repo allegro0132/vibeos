@@ -726,6 +726,7 @@ async fn verify_durable_authority_closure<D: PageDevice>(
         &roots,
         typed_reference_kinds,
         None,
+        None,
     )
     .await
     .map_err(map_gc_step_error)?;
@@ -857,6 +858,47 @@ async fn verify_state_contents<D: PageDevice>(
         }
         if pointer != PhysicalPointer::Null {
             verify_pointer_payload_and_padding(device, state, pointer).await?;
+        }
+    }
+    if state.cas.is_some() && state.replay_count != 0 {
+        // Every delta of a CAS replay chain is checkpoint state: verify each
+        // payload and its padding and re-check the chain's shape.
+        let context = CasCodecContext::new(
+            state.superblock.binding.store_uuid,
+            state.admitted_segments,
+            state.next_segment_generation,
+        )
+        .map_err(|_| StepError::Corrupt)?;
+        let mut pointer = state.replay_tail;
+        let mut depth = state.replay_count;
+        while depth != 0 {
+            if !pointer_is_current(state, pointer) || pointer == PhysicalPointer::Null {
+                return Err(StepError::Corrupt);
+            }
+            verify_pointer_payload_and_padding(device, state, pointer).await?;
+            let payload = read_pointer_payload(
+                device,
+                state.superblock.binding.store_uuid,
+                state.admitted_segments,
+                state.next_segment_generation,
+                state.generation,
+                pointer,
+                ExtentKind::CatalogDelta,
+                crate::cas_codec::CAS_DELTA_NEW_BLOB_LEN,
+                None,
+            )
+            .await
+            .map_err(StepError::from_store)?;
+            let delta = crate::cas_codec::decode_cas_delta(&payload.bytes, context)
+                .map_err(|_| StepError::Corrupt)?;
+            if delta.chain_count != depth || delta.checkpoint_generation > state.generation {
+                return Err(StepError::Corrupt);
+            }
+            pointer = delta.previous_delta;
+            depth -= 1;
+        }
+        if pointer != PhysicalPointer::Null {
+            return Err(StepError::Corrupt);
         }
     }
 

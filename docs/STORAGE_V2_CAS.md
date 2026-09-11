@@ -188,10 +188,23 @@ BlobKey. ObjectId MUST NOT be a digest truncation or other derivation of content
 Deduplication may omit a new Blob mapping, but it never omits the new Object
 mapping.
 
-The M7.4 writer emits a complete canonical CAS snapshot at each checkpoint and
-sets replay depth to zero. The delta ABI below is frozen for a later bounded
-replay optimization; a writer MUST NOT start emitting deltas until mount and the
-independent verifier enforce the documented chain rules.
+The M7.4 writer emitted a complete canonical CAS snapshot at each checkpoint
+with replay depth zero. Since 2026-09-11 the writer also uses the frozen delta
+ABI below as a bounded replay chain: a commit that mints `k` objects may
+append `k` delta records (one object each, chained from the checkpoint's
+replay tail back to the unchanged snapshot root) instead of rewriting the
+snapshot, provided `replay_count + k` stays within the superblock's
+`max_replay_records`. The default policy chooses deltas only when they cost
+fewer segment pages than the snapshot they would replace (one descriptor pair
+plus one payload page per delta), so small transactions against a populated
+catalog stop paying O(objects) per checkpoint while tiny catalogs keep dense
+snapshots. Every collection round and every out-of-budget commit re-emits a
+complete snapshot and resets the chain. Mount, scrub, and the independent
+verifier enforce the chain rules: chain counts decrease by one to null,
+generations never decrease along the chain (one checkpoint may append
+several deltas), ObjectIds strictly increase, a reuse delta resolves an
+already published BlobKey, and a new-Blob delta publishes its key exactly
+once.
 
 Every `PhysicalPointer` field below uses the frozen `0x60`-byte M7.2 encoding.
 Mount MUST validate store UUID, admitted segment range, non-zero and historical
@@ -304,8 +317,10 @@ A reuse delta is exactly `0x100` bytes; a new-Blob delta is exactly `0x1a0`
 bytes. A new Blob mapping's key MUST equal the Object mapping's key. During
 replay, a reuse delta MUST resolve its key in the base snapshot or an earlier
 delta. Following `previous_delta` MUST reduce the chain depth by one and
-terminate at null within the checkpoint's replay limit. Duplicate ObjectIds,
-conflicting Blob mappings, and mixed generations fail closed.
+terminate at null within the checkpoint's replay limit. Chain generations are
+non-decreasing from the snapshot root to the tail. Duplicate ObjectIds,
+conflicting Blob mappings, and a delta whose generation precedes its
+predecessor's fail closed.
 
 ## BlobWriter state machine
 

@@ -3357,7 +3357,14 @@ mod tests {
             .collect::<Vec<u8>>();
         let small_b = alloc::vec![0x33_u8; 2048];
         let small_c = alloc::vec![0x44_u8; 4096];
-        let payloads = [&small_a, &large, &committed, &small_b, &small_c, &small_a, &committed];
+        // Same head/middle/tail as small_a, but different full key: content
+        // deduplication must compare the authenticated complete payload.
+        let mut sample_collision = small_a.clone();
+        sample_collision[100] ^= 1;
+        let empty = Vec::new();
+        let short = alloc::vec![7_u8; 3];
+        let payloads = [&small_a, &large, &committed, &small_b, &small_c,
+            &sample_collision, &small_a, &committed, &empty, &empty, &short, &short];
         let mut batch = store.begin_staged_batch().unwrap();
         for payload in payloads {
             block_on(store.stage_blob_in_batch(
@@ -3370,8 +3377,19 @@ mod tests {
         }
         let published = block_on(store.publish_staged_batch(batch)).unwrap();
         assert_eq!(published.len(), payloads.len());
+        for left in 0..published.len() {
+            for right in left + 1..published.len() {
+                assert_ne!(
+                    published[left].backend_handle().root_key(&store.pins).unwrap(),
+                    published[right].backend_handle().root_key(&store.pins).unwrap(),
+                );
+            }
+        }
         for (object, payload) in published.iter().zip(payloads) {
             assert_eq!(object.exact_len(), payload.len() as u64);
+            if payload.is_empty() {
+                continue;
+            }
             let chunk = block_on(store.get_blob_chunk(object, 0)).unwrap();
             assert_eq!(chunk.bytes, payload[..payload.len().min(4096)]);
         }
@@ -3499,6 +3517,50 @@ mod tests {
             block_on(cold.read_fs_data_chunk(&tail, 4)).unwrap(),
             Some(alloc::vec![5_u8; 40960])
         );
+    }
+
+    #[test]
+    fn early_duplicate_batch_publication_is_power_cut_atomic() {
+        let mut collision = alloc::vec![1u8; 4096];
+        collision[100] = 2;
+        let payloads = [alloc::vec![1u8; 4096], collision, alloc::vec![1u8; 4096]];
+        let stage = |store: &mut SegmentStore<TestDevice>| {
+            let mut batch = store.begin_staged_batch().unwrap();
+            for payload in &payloads {
+                block_on(store.stage_blob_in_batch(&mut batch, FS_DATA_V1_KIND,
+                    crate::cas_codec::REFERENCE_CODEC_RAW, payload)).unwrap();
+            }
+            batch
+        };
+        let probe_device = TestDevice::blank(32);
+        let mut probe = format(probe_device.clone());
+        let before = probe.info().unwrap().object_count;
+        let batch = stage(&mut probe);
+        probe_device.reset_mutations();
+        block_on(probe.publish_staged_batch(batch)).unwrap();
+        let mutations = probe_device.mutation_count();
+        assert!(mutations > 0);
+        let after = probe.info().unwrap().object_count;
+        assert_eq!(after, before + 3);
+        for boundary in 0..mutations {
+            for action in [FaultAction::NotSubmitted, FaultAction::AmbiguousNone, FaultAction::AmbiguousDurable] {
+                let device = TestDevice::blank(32);
+                let mut store = format(device.clone());
+                let batch = stage(&mut store);
+                device.arm(boundary, action);
+                assert!(block_on(store.publish_staged_batch(batch)).is_err());
+                device.power_cycle();
+                let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime());
+                block_on(cold.mount()).unwrap();
+                let count = cold.info().unwrap().object_count;
+                assert!(count == before || count == after, "partial duplicate batch at {boundary}");
+                let batch = stage(&mut cold);
+                let objects = block_on(cold.publish_staged_batch(batch)).unwrap();
+                for (object, payload) in objects.iter().zip(&payloads) {
+                    assert_eq!(block_on(cold.get_blob_chunk(object, 0)).unwrap().bytes, *payload);
+                }
+            }
+        }
     }
 
     #[test]

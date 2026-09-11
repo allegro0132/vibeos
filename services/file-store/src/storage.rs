@@ -1846,11 +1846,31 @@ mod io_trace {
     #[test]
     #[ignore = "qualify the thousand-file single-transaction workload"]
     fn thousand_file_batch_commit_and_cold_recovery() {
+        trace_file_batch(1000, false, 4096);
+    }
+
+    #[test]
+    #[ignore = "unique-content control for batch staging"]
+    fn unique_file_batch_commit_and_cold_recovery() {
+        trace_file_batch(100, true, 4096);
+    }
+
+    #[test]
+    #[ignore = "larger unique-content control for batch staging"]
+    fn unique_128k_file_batch_commit_and_cold_recovery() {
+        trace_file_batch(100, true, 128 * 1024);
+    }
+
+    fn trace_file_batch(count: usize, unique: bool, size: usize) {
         let fixture = fixture_with(0, 256);
-        let payload = alloc::vec![0x5au8; 4096];
+        let started = std::time::Instant::now();
+        let mut payload = alloc::vec![0x5au8; size];
         let mut staged = Vec::new();
         let mut expected = Vec::new();
-        for index in 0..1000 {
+        for index in 0..count {
+            if unique {
+                payload[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            }
             let name = alloc::format!("batch-{index:04}");
             let path = crate::RelPath::parse(&name).unwrap();
             let mut stager = fixture.root.begin_content_stager(&path, false).unwrap();
@@ -1862,18 +1882,23 @@ mod io_trace {
         for (path, content) in staged {
             tx.write_staged(&path, content).unwrap();
         }
+        let commit_started = std::time::Instant::now();
         block_on(tx.commit_persistent_for_maintenance(
             &mut fixture.backend.store.lock().unwrap(), &fixture.backend.maintenance
         )).unwrap();
+        std::println!("batch-timing: unique={unique} count={count} commit_us={} total_us={}",
+            commit_started.elapsed().as_micros(), started.elapsed().as_micros());
         let events = fixture.device.take();
         let written_pages: u64 = events.iter().map(|event| match event {
             Event::Write(_, pages) => *pages,
             _ => 0,
         }).sum();
-        assert!(written_pages * (PAGE_SIZE as u64) < 2 * 1024 * 1024,
-            "duplicate file content consumed scratch pages: {written_pages}");
-        assert!(flushes(&events) <= 4);
-        report("thousand-file-commit", &events);
+        if !unique {
+            assert!(written_pages * (PAGE_SIZE as u64) < 2 * 1024 * 1024,
+                "duplicate file content consumed scratch pages: {written_pages}");
+            assert!(flushes(&events) <= 4);
+        }
+        report(if unique { "unique-file-batch" } else { "thousand-file-commit" }, &events);
         let expected: Vec<_> = expected.iter().map(|(name, bytes)| (name.as_str(), bytes.clone())).collect();
         cold_mount_and_check(&fixture.device,
             0x5649_4245_4f53_2d54_5241_4345_5f49_4f31, &expected);

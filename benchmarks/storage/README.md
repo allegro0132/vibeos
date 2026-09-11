@@ -1028,3 +1028,78 @@ The production file-tree QEMU gate also passes all three boots after this
 change: hard/symbolic links, recursive removal, GC pressure, cold recovery and
 powered-off independent verification. Its boot logs and verifier reports are
 included in the same evidence directory.
+
+
+### Deduplicate small payloads before staging batch scratch (2026-09-11)
+
+The trusted batch staging path now detects an identical payload already staged
+in the same batch before allocating or writing another scratch extent. The
+lookup is bounded to inputs at most 256 KiB; it computes the ordinary Blob
+Merkle descriptor and matches kind, length, root and reference codec. It reuses
+the first entry's manifest while retaining a distinct predicted object ID and
+ObjectMapping for every input. The first copy still follows the normal staging
+and publication protocol. No additional payload cache or quota bypass is added;
+this existing trusted staging API does not take a principal quota reservation.
+
+The thousand-file shared-content host test drops from 17,560 KiB / 151 writes /
+eight flushes to 1,464 KiB / 21 writes / four flushes, and cold mount verifies
+all files. Its regression now bounds writes below 2 MiB and flushes at four.
+The mixed-batch test covers unique equal-sized content, small in-batch repeats,
+a repeated already-committed blob and a large blob, and asserts distinct object
+identities. A dedicated fault test cuts every publication mutation with three
+failure modes, checks all-or-nothing cold recovery and re-stages/readbacks the
+same mixed duplicate batch. Both pass, along with 187 pre-existing unit tests,
+12 streaming, five fused recovery and 28 file-store tests. The new power-cut
+test runs separately. The 16 MiB unique-file control retains 201 stage writes /
+17,436 KiB / ten flushes; its readback byte count remains 17,360 KiB. Duo
+production file-tree compilation passes.
+
+One matching fresh 128 MiB QEMU sample, 1,000 x 4 KiB files sharing one payload,
+seed 32 and standard 4/2 MiB/s, 400/200 IOPS, reports:
+
+| Metric | Before early dedup | After |
+| --- | ---: | ---: |
+| Single-transaction workload | 8.934386 s | 0.864106 s |
+| Write bytes | 18,096,128 | 1,613,824 |
+| Write requests | 151 | 21 |
+| Flushes | 8 | 4 |
+
+The approximately 10x observed time difference is for this duplicate-content
+qualification sample; it is not a general unique-file or physical-SD speedup.
+The reduction in flushes follows fewer scratch segments, with the existing
+publication barriers preserved. Evidence: `target/storage-batch-early-dedup-20260911/`.
+
+The unique-content control stages 100 distinct 4 KiB files in one transaction
+and verifies every file after cold mount. Twelve host test runs alternate early
+dedup enabled / disabled / disabled / enabled in groups of three. Both variants
+issue 33 writes / 3,120 KiB, four flushes and four reads / 48 KiB before cold
+recovery. Median measured commit time is 11.108 ms enabled versus 10.221 ms
+disabled (8.7% higher). These are host test timings, not QEMU or SD latency;
+the extra descriptor hashing has a measurable cost in this unique-input control.
+The shared-content speedup above must not be generalized to unique inputs.
+The ignored `unique_file_batch_commit_and_cold_recovery` test shares the
+thousand-file test fixture and reports staging-plus-commit and commit-only
+timing, excluding fixture construction and cold verification. This control
+qualifies 100 unique files, not 1,000 unique files. Logs and summary are in
+`target/storage-batch-unique-control-20260911/`. The temporary disabled guard
+used for the control has been restored; production retains early batch dedup.
+
+### Rejected sampled-content filter (2026-09-11)
+
+A 24-byte head/middle/tail rejection filter was evaluated before the full
+in-batch content hash. It preserved full-key authentication and passed all 188
+unit tests, including a single-byte difference outside the sampled regions,
+empty/short duplicates, distinct object identities and publication power cuts.
+However, it did not demonstrate a latency benefit. Alternating host groups
+(enabled / disabled / disabled / enabled, three samples each) measured commit
+medians of 15.023 versus 12.100 ms for 100 unique 4 KiB files, with substantial
+between-group variation. A larger 100 x 128 KiB control measured 35.086 versus
+31.500 ms. Both variants retained identical I/O: 33 writes / 3,120 KiB / four
+flushes for 4 KiB files, and 138 writes / 16,004 KiB / seven flushes for 128 KiB
+files. All files passed cold recovery. These are host timings, not SD results.
+
+The filter and its per-entry memory cost were removed from production. The
+expanded correctness cases and ignored
+`unique_128k_file_batch_commit_and_cold_recovery` control are retained. Evidence
+is in `target/storage-batch-sample-filter-20260911/`; its `candidate.elf` is a
+compiled but rejected experiment, not a qualified QEMU performance result.

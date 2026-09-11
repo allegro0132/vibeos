@@ -3290,6 +3290,7 @@ async fn storage_file_tree_bench(
         return;
     }
     if (workload == "file-sequential" && size > 512 * 1024 * 1024)
+        || (workload == "file-batch-create-unique" && (count > 100 || size == 0 || size > 128 * 1024))
         || (workload == "file-overwrite-1m" && size > 64 * 1024 * 1024)
         || (workload == "file-batch-create" && count > 100 && (count > 1000 || size > 4096)) {
         unsupported("staged persistence exceeds the bounded guest benchmark budget");
@@ -3366,9 +3367,13 @@ async fn storage_file_tree_bench(
             transferred = (size as u64).saturating_mul(2);
             Ok(())
         }
-        "file-batch-create" => {
+        "file-batch-create" | "file-batch-create-unique" => {
+            let unique = workload == "file-batch-create-unique";
             let mut staged_files = Vec::with_capacity(count);
             for index in 0..count {
+                if unique {
+                    sequential_pattern::fill(&mut payload, seed, (index * size) as u64);
+                }
                 let name = alloc::format!("bench-{seed:016x}-{index:04}");
                 let path = RelPath::parse(&name)?;
                 let mut stager = root.begin_content_stager(&path, false)?;
@@ -3381,8 +3386,31 @@ async fn storage_file_tree_bench(
                 tx.write_staged(&path, staged)?;
             }
             tx.commit_durable().await?;
+            if unique {
+                for index in 0..count {
+                    let name = alloc::format!("bench-{seed:016x}-{index:04}");
+                    let reader = root.reader(&RelPath::parse(&name)?)?;
+                    let mut read = 0;
+                    for chunk in 0..reader.chunk_count() {
+                        let bytes = reader.read_chunk(chunk).await?.ok_or(FileError::Conflict)?;
+                        if bytes.is_empty() || !sequential_pattern::matches(
+                            &bytes, seed, (index * size + read) as u64,
+                        ) {
+                            return Err(FileError::Conflict);
+                        }
+                        read += bytes.len();
+                    }
+                    if read != size {
+                        return Err(FileError::Conflict);
+                    }
+                }
+            }
             operations = count as u64;
             transferred = (size as u64).saturating_mul(count as u64);
+            if unique {
+                operations *= 2;
+                transferred *= 2;
+            }
             Ok(())
         }
         "file-sequential" => {
@@ -3490,7 +3518,7 @@ async fn storage_file_tree_bench(
         "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"file-tree\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":{},\"seed\":{},\"timebase_hz\":{},\"operations\":{},\"transferred_bytes\":{},\"elapsed_ticks\":{},\"latency_ticks\":{},\"recovery_ticks\":{},\"content_pattern\":\"{}\",\"latency_scope\":\"workload\",\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\",\"reason\":\"{}\"}}",
         backend, workload, size, count, seed, crate::exec::timebase_hz(), operations,
         transferred, elapsed, elapsed, recovery_ticks,
-        if workload == "file-sequential" { "splitmix64-offset-v1" } else { "legacy" },
+        if matches!(workload, "file-sequential" | "file-batch-create-unique") { "splitmix64-offset-v1" } else { "legacy" },
         io.0, io.1, io.2, io.3, io.4, io.5, io.6, status, reason
     );
 }

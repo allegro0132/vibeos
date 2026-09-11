@@ -8,9 +8,9 @@ extern crate vibeos_kernel;
 #[cfg(not(feature = "mars-ethernet-test"))]
 use vibeos_bsp_qemu_virt::Board;
 #[cfg(feature = "mars-ethernet-test")]
-mod seven_windows;
+mod device_windows;
 #[cfg(feature = "mars-ethernet-test")]
-use seven_windows::Board;
+use device_windows::Board;
 use vibeos_hal::Board as BoardContract;
 #[path = "../../early_devices.rs"]
 mod early_devices;
@@ -43,6 +43,8 @@ mod jh7110_sd_model;
 #[cfg(feature = "mars-composition-test")]
 mod mars_composition;
 unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
+    #[cfg(feature = "mars-ethernet-test")]
+    _print(format_args!("DEVICE_WINDOW_CAPACITY PASS level0=8\n"));
     #[cfg(feature = "trng-model-test")]
     {
         trng_model::run();

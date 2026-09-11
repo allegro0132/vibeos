@@ -1178,3 +1178,24 @@ still needs to map STG/TRNG, establish this exclusive ownership and the parent
 clock prerequisite, register the entropy service and collect physical entropy
 evidence. The domain does not reprogram parent clocks or infer entropy quality.
 SSH remains disabled in the existing test SD image.
+
+### Security MMIO mapping coverage
+
+The Mars BSP now maps the exact TRNG (`0x1600c000..0x16010000`) and STG CRG
+(`0x10230000..0x10240000`) apertures with 4 KiB pages. Their neighboring crypto
+and security-DMA windows remain unmapped. TRNG shares the SD/GMAC level-0 table;
+STG needs an additional table, bringing the declared device window count to
+eight. The static HAL capacity already reserves eight; no kernel board branch
+or concrete driver dependency was added.
+
+Two new host tests enumerate every device page and all four PLIC supervisor
+contexts, verify exact table counts and ensure no overlap or accidental
+neighbor mapping. BSP host tests total 32. The QEMU acceptance composition now
+builds eight device windows through the real kernel mapper and reports
+`DEVICE_WINDOW_CAPACITY PASS level0=8` with 395 kernel selftests. Removing either
+security mapping or reducing declared capacity is detected by mutation tests.
+Evidence is in `boards/milkv-mars/security-mapping-evidence.json`.
+
+Mapping alone does not register or run a driver and does not prove physical
+MMIO decoding. The shared-domain ownership, parent-clock preparation, firmware
+entropy service and physical entropy/SSH qualification remain outstanding.

@@ -195,6 +195,8 @@ pub const MEMORY_MAP: &[vibeos_hal::MemoryRegion] = &[
     vibeos_hal::MemoryRegion::mmio("L2 control", L2_CACHE.start, L2_CACHE.end),
     vibeos_hal::MemoryRegion::mmio("AON CRG/SYSCON", AON_CRG.start, AON_SYSCON.end),
     vibeos_hal::MemoryRegion::mmio("AON pins", AON_PINCTRL.start, AON_PINCTRL.end),
+    vibeos_hal::MemoryRegion::mmio("STG CRG", STG_CRG.start, STG_CRG.end),
+    vibeos_hal::MemoryRegion::mmio("TRNG", TRNG_REGISTERS.start, TRNG_REGISTERS.end),
 ];
 pub const MMIO_MAPPINGS: &[vibeos_hal::IdentityMapping] = &[
     vibeos_hal::IdentityMapping::pages("UART0", UART_REGISTERS.start, UART_REGISTERS.end),
@@ -203,6 +205,8 @@ pub const MMIO_MAPPINGS: &[vibeos_hal::IdentityMapping] = &[
     vibeos_hal::IdentityMapping::pages("L2 control", L2_CACHE.start, L2_CACHE.end),
     vibeos_hal::IdentityMapping::pages("AON CRG/SYSCON", AON_CRG.start, AON_SYSCON.end),
     vibeos_hal::IdentityMapping::pages("AON pins", AON_PINCTRL.start, AON_PINCTRL.end),
+    vibeos_hal::IdentityMapping::pages("STG CRG", STG_CRG.start, STG_CRG.end),
+    vibeos_hal::IdentityMapping::pages("TRNG", TRNG_REGISTERS.start, TRNG_REGISTERS.end),
 ];
 impl vibeos_hal::Board for Board {
     const INFO: vibeos_hal::BoardInfo = vibeos_hal::BoardInfo {
@@ -229,8 +233,8 @@ impl vibeos_hal::Board for Board {
         mmio_attributes: vibeos_hal::MemoryAttributes::Standard,
         identity_mappings: MMIO_MAPPINGS,
         device_level1_tables: 1,
-        // UART, SYS, SD/GMAC, L2, AON and the two sparse PLIC windows.
-        device_level0_tables: 7,
+        // UART, SYS, SD/GMAC/TRNG, L2, AON, STG and two sparse PLIC windows.
+        device_level0_tables: 8,
     };
     const HART_IDS: &'static [usize] = HART_IDS;
     fn plic_s_context(physical_hart: usize) -> Option<usize> {

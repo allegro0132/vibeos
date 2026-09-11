@@ -1,0 +1,147 @@
+{
+  "status": "Security MMIO mapping and eight-window capacity verified in models; physical acceptance pending",
+  "host_bsp_tests": 32,
+  "new_layout_tests": 2,
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 3,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 121917440,
+    "kernel_sha256": "74219244eb7fe4b448046e8f29daed48b43b5f23a516d7082404f31f780ddbb5",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "device_level0_windows": 8,
+  "mapped_security_ranges": [
+    [
+      "0x10230000",
+      "0x10240000"
+    ],
+    [
+      "0x1600c000",
+      "0x16010000"
+    ]
+  ],
+  "serial_payload_elf_check": {
+    "status": "elf-contract-passed",
+    "entry": 1075838976,
+    "heap_start": 1095294976,
+    "heap_end": 5368709120,
+    "elf_sha256": "1b8667efad6018c084b3f87df80ed218e4ea30eab643b19a73487f56ddb6d56b",
+    "loads": [
+      {
+        "address": 1075838976,
+        "file_bytes": 2932736,
+        "memory_bytes": 2932736,
+        "flags": 5
+      },
+      {
+        "address": 1078771712,
+        "file_bytes": 380928,
+        "memory_bytes": 380928,
+        "flags": 4
+      },
+      {
+        "address": 1079152640,
+        "file_bytes": 51496,
+        "memory_bytes": 15093760,
+        "flags": 6
+      }
+    ],
+    "physical_acceptance": false,
+    "flashable_sd_image": false
+  },
+  "mutations": [
+    "STG mapping removed: detected",
+    "TRNG mapping removed: detected",
+    "declared device table count reduced: detected"
+  ],
+  "physical_acceptance": false,
+  "entropy_driver_registered": false,
+  "blind_spots": [
+    "Page description and kernel mapper models do not probe real Mars devices",
+    "Security-domain and parent-clock ownership still require firmware composition",
+    "Entropy quality and full SSH/WASM/stability acceptance remain unverified"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage40-host.log",
+      "sha256": "6e4b2f87aafa33fa2bfaa47739901754e6221f1a23eef775218e42cb4b203c5b"
+    },
+    {
+      "path": "target/mars-reference/stage40-rv64-build.log",
+      "sha256": "3291bd31dbb5632730c250ca4be2ddfe773e1543341f10d5d590bd8c5ef72d00"
+    },
+    {
+      "path": "target/mars-reference/stage40-rv64-model/serial.log",
+      "sha256": "edabcdfa1132ff6f4801651ec08d55d498ac0f163412db8cc1086ba6e51e940a"
+    },
+    {
+      "path": "target/mars-reference/stage40-rv64-model/summary.json",
+      "sha256": "f07670597de80a1e462f652cff87b85458dfa387800d7700c5c7afae0b46bbd3"
+    },
+    {
+      "path": "target/mars-reference/stage40-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage40-serial-build.log",
+      "sha256": "2d835dd60ac2fcaa34bff259e4d366a2563c7395e80ecb3a69cdb1eb5a66474c"
+    },
+    {
+      "path": "target/mars-reference/stage40-mutation-capacity.log",
+      "sha256": "2140d09182efd0789aeac0e5c916a2cfd2c10de872617c8857a5371146589bf2"
+    },
+    {
+      "path": "target/mars-reference/stage40-mutation-missing-stg.log",
+      "sha256": "51128844d4d370a685ad6ad4ccb81cacb81622d6c838f0b083d5b66321709dbc"
+    },
+    {
+      "path": "target/mars-reference/stage40-mutation-missing-trng.log",
+      "sha256": "f2b84cf7d9944cfed717f20de268eab94bf61bd7d01676cd82b617a6af171bd3"
+    },
+    {
+      "path": "target/mars-reference/stage40-network-build.log",
+      "sha256": "35c3a3ebb85dd3b272279578214abed383a87e26b5d17d11a79b3b81cb728aef"
+    }
+  ],
+  "network_payload_elf_check": {
+    "status": "elf-contract-passed",
+    "entry": 1075838976,
+    "heap_start": 1095553024,
+    "heap_end": 5368709120,
+    "elf_sha256": "4e6a5fb79c24988f01845f5fb3d7f8f2636e1ed8e5df782df55fbe8fab32fa1c",
+    "loads": [
+      {
+        "address": 1075838976,
+        "file_bytes": 3035136,
+        "memory_bytes": 3035136,
+        "flags": 5
+      },
+      {
+        "address": 1078874112,
+        "file_bytes": 434176,
+        "memory_bytes": 434176,
+        "flags": 4
+      },
+      {
+        "address": 1079308288,
+        "file_bytes": 51984,
+        "memory_bytes": 15196160,
+        "flags": 6
+      }
+    ],
+    "physical_acceptance": false,
+    "flashable_sd_image": false,
+    "eqos_dma": {
+      "base": 1088110592,
+      "bytes": 102400,
+      "address_bits": 32,
+      "cache_line_bytes": 64
+    }
+  }
+}

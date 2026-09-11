@@ -1288,3 +1288,21 @@ usage are documented in `firmware/milkv-mars/bootchain/README.md`.
 This supersedes the earlier diagnostic-payload-only packaging limitation.
 The image is suitable for the planned test SD card, but no physical boot,
 SEC handoff, entropy, SSH or full stability qualification is claimed.
+
+### TRNG serial observation gate
+
+`mars-serial-accept.py --require-trng-probe` now requires the diagnostic line
+between Sv39 enable and platform reporting, in addition to normal boot gates.
+It accepts exactly two blocks, confirmed stop, `entropy=unqualified` and the
+supported 20–300 MHz parent range. Any present diagnostic is checked even when
+the option is omitted; absent diagnostics remain compatible with old images.
+Repeated/partial attempts and failure diagnostics cannot hide behind a valid
+boot. The summary records whether the probe was required/observed and always
+keeps `entropy_qualified` false.
+
+Fourteen parser/PTY tests pass, including CLI propagation, fragmented capture,
+missing diagnostics and existing passive-capture behavior. Mutations removing
+the requirement, accepting failed stop and ignoring partial duplicates are
+detected. Evidence is in `boards/milkv-mars/trng-serial-evidence.json`.
+These tests use synthetic logs/PTYs only; no physical serial port was opened
+and no SD image needed rebuilding for this host-side change.

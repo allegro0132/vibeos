@@ -1,0 +1,35 @@
+{
+  "status": "TRNG serial observation gate verified with synthetic logs and PTYs",
+  "tests": 14,
+  "mutations": [
+    "missing requirement",
+    "failed stop accepted",
+    "partial duplicate ignored"
+  ],
+  "physical_serial_opened": false,
+  "physical_acceptance": false,
+  "entropy_qualified": false,
+  "sd_images_rebuilt": false,
+  "blind_spots": [
+    "Serial markers do not establish board identity, physical cold boot or entropy quality",
+    "No actual Mars diagnostic log has been captured"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage45-mutation-failed-stop.log",
+      "sha256": "810b81d41bd47490cb282b7d71aeb50c160c98b8f03e3769132f6a31918f49fa"
+    },
+    {
+      "path": "target/mars-reference/stage45-mutation-missing-required.log",
+      "sha256": "d15d1fca58b23bc9e4a1dcc5661d540c96d13091e889216633f973929d774ecf"
+    },
+    {
+      "path": "target/mars-reference/stage45-mutation-partial-duplicate.log",
+      "sha256": "61d3322860de253120b9fb754e19041e4d0d75fbbba44cd2e0790bc377bc104c"
+    },
+    {
+      "path": "target/mars-reference/stage45-serial-tests.log",
+      "sha256": "2df52721677cc4871a42d5fc7adb257e4650eefad67059edf1444a1f533c96d8"
+    }
+  ]
+}

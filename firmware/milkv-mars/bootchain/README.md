@@ -102,8 +102,11 @@ normal boot reporting; expect either `MARS_TRNG_PROBE protocol-observed` with
 shutdown. Neither message establishes entropy quality. No physical boot of
 this image has been observed yet; capture its complete serial log.
 
-The following collector preserves the diagnostic line, but its success gates
-currently check normal boot markers only. Inspect the TRNG line separately.
+When capturing this diagnostic image, add `--require-trng-probe` to the
+collector below. It requires exactly one ordered diagnostic line with two
+blocks, confirmed stop and an unqualified-entropy label. Missing, malformed,
+duplicate or failed diagnostics cannot pass. This remains an observation of
+the serial log; it does not qualify entropy or prove a physical cold boot.
 
 Use a separate terminal for each planned cold boot, with the actual port and
 operator-checked board revision supplied explicitly:

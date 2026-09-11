@@ -20,7 +20,7 @@ import time
 LIMIT = 16 * 1024 * 1024
 
 
-def inspect(data):
+def inspect(data, require_trng_probe=False):
     # Keep raw evidence untouched. Only normalize CRLF and complete ANSI CSI
     # sequences for parsing; a partial last line must not satisfy a gate.
     normalized = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b'', data).replace(b'\r\n', b'\n')
@@ -34,6 +34,8 @@ def inspect(data):
         ('smp', rb'  smp       4 hart\(s\) online'),
         ('mmu', rb'  mmu       Sv39 single address space, hart mask 0xf'),
     ]
+    if require_trng_probe or b'MARS_TRNG_PROBE' in normalized:
+        gates.insert(3, ('trng_probe', rb'MARS_TRNG_PROBE protocol-observed parent_hz=([0-9]{8,9}) blocks=2 stopped=true entropy=unqualified'))
     errors, observed, positions = [], {}, []
     for name, pattern in gates:
         matches = [(i, re.fullmatch(pattern, line)) for i, line in enumerate(lines)]
@@ -43,18 +45,23 @@ def inspect(data):
             errors.append(f'{name}: expected exactly one valid line, observed {len(matches)}')
         else:
             positions.append(matches[0][0])
+            if name == 'trng_probe' and not 20_000_000 <= int(matches[0][1][1]) <= 300_000_000:
+                errors.append('TRNG parent frequency outside supported range')
     if positions != sorted(positions):
         errors.append('boot markers out of order')
     # Count invalid attempts too: a successful second boot must not hide the
     # failure of the first, even if its admission tuple was not valid.
-    for prefix in [b'[VibeOS] entry', b'MARS_BOOT_ADMISSION', b'  smp ', b'  mmu ']:
+    for prefix in [b'[VibeOS] entry', b'MARS_BOOT_ADMISSION', b'  smp ', b'  mmu ', b'MARS_TRNG_PROBE']:
         if sum(line.startswith(prefix) for line in normalized.split(b'\n')) > 1:
             errors.append('multiple boot attempts: ' + prefix.decode())
-    if re.search(rb'(?i)(?:panic|panicked|fatal|BOOT_ADMISSION FAIL|MARS_BOOT_ADMISSION FAIL)', normalized):
+    if re.search(rb'(?i)(?:panic|panicked|fatal|MARS_TRNG_PROBE FAIL|BOOT_ADMISSION FAIL|MARS_BOOT_ADMISSION FAIL)', normalized):
         errors.append('failure diagnostic observed')
     return {
         'status': 'boot-markers-observed' if not errors else 'boot-markers-incomplete-or-failed',
         'gates': observed, 'errors': errors,
+        'trng_probe_required': require_trng_probe,
+        'trng_protocol_observed': observed.get('trng_probe') == 1 and not errors,
+        'entropy_qualified': False,
         'physical_acceptance': False,
         'cold_boot_verified': False,
         'network_verified': False,
@@ -62,7 +69,7 @@ def inspect(data):
     }
 
 
-def capture(port, output, duration, board_revision):
+def capture(port, output, duration, board_revision, require_trng_probe=False):
     if not math.isfinite(duration) or not 0 < duration <= 86400:
         raise ValueError('duration must be finite and between 0 and 86400 seconds')
     if not board_revision.strip():
@@ -117,7 +124,7 @@ def capture(port, output, duration, board_revision):
                 error = error or 'cannot restore serial settings: ' + str(exc)
             finally:
                 os.close(fd)
-    result = inspect(bytes(data))
+    result = inspect(bytes(data), require_trng_probe)
     result.update(port=str(port), board_revision=board_revision, started_utc=utc,
                   elapsed_seconds=time.monotonic() - started, requested_seconds=duration,
                   bytes=len(data), sha256=hashlib.sha256(data).hexdigest(),
@@ -134,11 +141,12 @@ def main():
     parser.add_argument('--port', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True, help='new evidence directory')
     parser.add_argument('--board-revision', required=True, help='operator-reported revision; not auto-detected')
+    parser.add_argument('--require-trng-probe', action='store_true', help='require one ordered, stopped TRNG diagnostic; never qualifies entropy')
     parser.add_argument('--seconds', type=float, default=120)
     args = parser.parse_args()
     print('Waiting for capture readiness; power-cycle only after ready.json appears.', flush=True)
     try:
-        result = capture(args.port, args.output, args.seconds, args.board_revision)
+        result = capture(args.port, args.output, args.seconds, args.board_revision, args.require_trng_probe)
     except (OSError, ValueError) as exc:
         parser.exit(2, f'MARS_SERIAL: {exc}\n')
     print(json.dumps(result, indent=2))

@@ -25,7 +25,35 @@ BOOT = (b'[VibeOS] entry\r\n[VibeOS] page tables ready\r\n[VibeOS] Sv39 enabled\
         b'  mmu       Sv39 single address space, hart mask 0xf\r\n')
 
 
+PROBE = b'MARS_TRNG_PROBE protocol-observed parent_hz=198000000 blocks=2 stopped=true entropy=unqualified\r\n'
+PROBE_BOOT = BOOT.replace(b'  platform', PROBE + b'  platform')
+
+
 class ParserTests(unittest.TestCase):
+    def test_required_probe_and_default_compatibility(self):
+        self.assertEqual(serial.inspect(BOOT)['status'], 'boot-markers-observed')
+        self.assertNotEqual(serial.inspect(BOOT, True)['status'], 'boot-markers-observed')
+        for required in [False, True]:
+            result = serial.inspect(PROBE_BOOT, required)
+            self.assertEqual(result['status'], 'boot-markers-observed')
+            self.assertTrue(result['trng_protocol_observed'])
+            self.assertFalse(result['entropy_qualified'])
+
+    def test_bad_probe_cannot_hide_behind_successful_boot(self):
+        for probe in [PROBE.replace(b'blocks=2', b'blocks=1'),
+                      PROBE.replace(b'stopped=true', b'stopped=false'),
+                      PROBE.replace(b'198000000', b'999999999'),
+                      PROBE.replace(b'198000000', b'19999999'),
+                      PROBE.replace(b'unqualified', b'qualified'),
+                      b'MARS_TRNG_PROBE FAIL prepare=TimedOut\n', PROBE[:-1]]:
+            for required in [False, True]:
+                data = BOOT.replace(b'  platform', probe + b'  platform')
+                self.assertNotEqual(serial.inspect(data, required)['status'], 'boot-markers-observed')
+        for data in [PROBE + BOOT, BOOT + PROBE, PROBE_BOOT + PROBE,
+                     PROBE_BOOT + b'MARS_TRNG_PROBE',
+                     PROBE_BOOT + b'MARS_TRNG_PROBE FAIL stop=TimedOut']:
+            self.assertNotEqual(serial.inspect(data, True)['status'], 'boot-markers-observed')
+
     def test_four_boot_harts_and_no_physical_claim(self):
         for hart in range(1, 5):
             result = serial.inspect(BOOT.replace(b'boot=4', f'boot={hart}'.encode()))
@@ -59,7 +87,7 @@ class ParserTests(unittest.TestCase):
 
 
 class CaptureTests(unittest.TestCase):
-    def run_capture(self, chunks, limit=None, interrupt=False):
+    def run_capture(self, chunks, limit=None, interrupt=False, require_trng=False):
         with tempfile.TemporaryDirectory() as tmp:
             master, slave = pty.openpty()
             original = termios.tcgetattr(slave)
@@ -70,6 +98,8 @@ class CaptureTests(unittest.TestCase):
                            'import runpy; m=runpy.run_path(' + repr(str(SCRIPT)) + '); '
                            + 'm["capture"].__globals__["LIMIT"]=' + str(limit) + '; '
                            + 'raise SystemExit(m["main"]())']
+            if require_trng:
+                command += ['--require-trng-probe']
             child = subprocess.Popen(command + ['--port', os.ttyname(slave),
                                       '--output', str(output), '--seconds', '0.8',
                                       '--board-revision', 'PTY model (not hardware)'],
@@ -107,6 +137,16 @@ class CaptureTests(unittest.TestCase):
                     child.communicate()
                 os.close(master)
                 os.close(slave)
+
+    def test_probe_cli_requires_marker_and_preserves_fragmented_capture(self):
+        code, result = self.run_capture([PROBE_BOOT[:100], PROBE_BOOT[100:]], require_trng=True)
+        self.assertEqual(code, 0)
+        self.assertTrue(result['trng_probe_required'])
+        self.assertTrue(result['trng_protocol_observed'])
+        self.assertFalse(result['entropy_qualified'])
+        code, result = self.run_capture([BOOT], require_trng=True)
+        self.assertEqual(code, 1)
+        self.assertFalse(result['trng_protocol_observed'])
 
     def test_fragmented_real_tty_capture_preserves_raw_bytes(self):
         code, result = self.run_capture([BOOT[:7], BOOT[7:170], BOOT[170:]])

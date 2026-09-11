@@ -482,6 +482,13 @@ pub(crate) struct MountedState {
     pub(crate) last_segment: Option<(u64, u64, [u8; 32])>,
     pub(crate) last_segment_previous: Option<(u64, u64, [u8; 32])>,
     pub(crate) last_segment_target_checkpoint_generation: u64,
+    /// Free segments whose final publication seal page is known to be
+    /// durably zero: this generation's own publication wrote the zero and
+    /// the checkpoint barrier that installed this state flushed it. A writer
+    /// claiming one of them skips the zero-write + flush + read-back that
+    /// otherwise precedes every scratch segment (one flush per checkpoint).
+    /// Runtime knowledge only; every cold mount starts empty.
+    pub(crate) durably_cleared_seals: alloc::collections::BTreeSet<u64>,
 }
 
 pub(crate) struct CheckpointTransitionWitness {
@@ -3295,6 +3302,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
         last_segment,
         last_segment_previous,
         last_segment_target_checkpoint_generation,
+        durably_cleared_seals: alloc::collections::BTreeSet::new(),
     })
 }
 

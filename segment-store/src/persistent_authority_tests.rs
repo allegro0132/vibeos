@@ -2136,6 +2136,7 @@ fn fused_fs_root_switch_publishes_one_checkpoint_and_cold_recovers() {
     // persistent root switch — advances exactly one checkpoint generation.
     let before = store.info().unwrap();
     let dirent_inputs = [crate::FsNodeEntryInput {
+        pending: None,
         key: b"dirent-fused",
         value: b"target-fused",
         child: None,
@@ -2199,6 +2200,7 @@ fn fused_fs_root_switch_is_power_cut_atomic_at_every_mutation() {
     let (_seed_device, seeded) = seed_fs_root_switch_fixture();
 
     let dirent_inputs = [crate::FsNodeEntryInput {
+        pending: None,
         key: b"dirent-atomic",
         value: b"target-atomic",
         child: None,

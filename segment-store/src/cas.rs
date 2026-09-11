@@ -273,6 +273,89 @@ impl<D: PageDevice> PageDevice for SinkOverlayDevice<'_, D> {
 /// Allocate page-sized I/O scratch directly in the heap-backed representation.
 /// Keeping `Page` arrays out of async generator variants is part of the kernel
 /// stack contract: these buffers routinely live across device awaits.
+/// How many upcoming scratch segments one publication pre-clears.
+const PRECLEAR_SEAL_SEGMENTS: usize = 4;
+
+/// The free segments the next transaction's allocator hands out first: the
+/// leading run (at least two long, because a fresh blob needs its own segment
+/// plus one of headroom) of segments free in both the durable base map and
+/// the successor map. Segments this publication allocates are excluded, and
+/// so is anything the successor frees: a crash before the successor
+/// checkpoint seals leaves the base map authoritative, and it must never find
+/// a zeroed seal on a segment it still names.
+fn preclear_candidates(
+    base: &AllocationV2,
+    successor: &AllocationV2,
+    admitted_segments: u64,
+) -> Vec<u64> {
+    let mut run: Vec<u64> = Vec::new();
+    for segment_no in 0..admitted_segments {
+        let free = base.segment_state(segment_no) == Some(SegmentAllocation::Free)
+            && successor.segment_state(segment_no) == Some(SegmentAllocation::Free);
+        if free {
+            if run.try_reserve(1).is_err() {
+                return Vec::new();
+            }
+            run.push(segment_no);
+            if run.len() == PRECLEAR_SEAL_SEGMENTS {
+                break;
+            }
+        } else if run.len() >= 2 {
+            break;
+        } else {
+            run.clear();
+        }
+    }
+    if run.len() < 2 {
+        run.clear();
+    }
+    run
+}
+
+/// Stage zero pages over the candidates' final seal pages (into the
+/// publication sink when there is one, else straight to the device). The
+/// checkpoint slot protocol's barriers that follow make them durable, so the
+/// successor state may record them as durably cleared and the next writer
+/// skips the zero-write + flush + read-back it otherwise pays per scratch
+/// segment — one flush per checkpoint on small transactions. Previously
+/// proven segments carry forward while they stay free: nothing but a
+/// publication or a collection round (which starts a fresh state) touches
+/// a free segment's seal page.
+async fn preclear_scratch_seals<D: PageDevice>(
+    device: &D,
+    state: &MountedState,
+    successor_allocation: &AllocationV2,
+    mut sink: Option<&mut PageSink>,
+) -> Result<alloc::collections::BTreeSet<u64>, StoreError<D::Error>> {
+    let mut cleared = alloc::collections::BTreeSet::new();
+    if state.allocation_version != 2 {
+        return Ok(cleared);
+    }
+    for segment_no in &state.durably_cleared_seals {
+        if successor_allocation.segment_state(*segment_no) == Some(SegmentAllocation::Free) {
+            cleared.insert(*segment_no);
+        }
+    }
+    let zero = heap_page();
+    for segment_no in
+        preclear_candidates(&state.allocation, successor_allocation, state.admitted_segments)
+    {
+        if cleared.contains(&segment_no) {
+            continue;
+        }
+        let base = segment_base_page(segment_no)?;
+        sink_or_write_page(
+            device,
+            sink.as_deref_mut(),
+            base + u64::from(SEGMENT_SEAL_PAGE),
+            &zero,
+        )
+        .await?;
+        cleared.insert(segment_no);
+    }
+    Ok(cleared)
+}
+
 fn heap_page() -> Box<Page> {
     alloc::vec![0_u8; PAGE_SIZE]
         .into_boxed_slice()
@@ -2072,7 +2155,32 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             );
         }
         let zero = heap_page();
-        if !cleared.is_empty() {
+        // Segments the previous publication pre-cleared (and whose zero seal
+        // that publication's checkpoint barrier made durable) need neither
+        // the zero-write nor the flush; the read-back below still proves the
+        // page is zero now, and any mismatch falls back to the full protocol.
+        let mut proven = !cleared.is_empty()
+            && self.state.as_ref().is_some_and(|state| {
+                cleared
+                    .iter()
+                    .all(|segment_no| state.durably_cleared_seals.contains(segment_no))
+            });
+        if proven {
+            for segment_no in cleared.iter().copied() {
+                let base = segment_base_page(segment_no)?;
+                let mut observed = heap_page();
+                self.store
+                    .device
+                    .read_page(base + u64::from(SEGMENT_SEAL_PAGE), &mut observed)
+                    .await
+                    .map_err(StoreError::Device)?;
+                if observed != zero {
+                    proven = false;
+                    break;
+                }
+            }
+        }
+        if !cleared.is_empty() && !proven {
             for segment_no in cleared.iter().copied() {
                 let base = segment_base_page(segment_no)?;
                 self.store
@@ -4312,6 +4420,8 @@ async fn commit_batch_snapshot<D: PageDevice>(
     let metadata_seal_hash = metadata_seal.2;
     let (previous_segment_no, previous_segment_generation, previous_hash) =
         final_previous.unwrap_or((ANCHOR_SEGMENT_NO, 0, [0; 32]));
+    let durably_cleared_seals =
+        preclear_scratch_seals(device, state, &allocation, Some(&mut sink)).await?;
     sink.drain(device).await?;
 
     let slot = ((checkpoint_generation - 1) & 1) as u8;
@@ -4493,6 +4603,7 @@ async fn commit_batch_snapshot<D: PageDevice>(
             previous_hash,
         )),
         last_segment_target_checkpoint_generation: checkpoint_generation,
+        durably_cleared_seals,
     };
     successor.recovery_peak_bytes = successor
         .resident_heap_bytes()
@@ -4863,6 +4974,8 @@ async fn commit_snapshot<D: PageDevice>(
     .await?;
     // Batched publication: everything staged above lands as a few large
     // contiguous requests before the checkpoint slot protocol's barrier.
+    let durably_cleared_seals =
+        preclear_scratch_seals(device, state, &allocation, sink.as_mut()).await?;
     if let Some(sink) = sink.take() {
         sink.drain(device).await?;
     }
@@ -5045,6 +5158,7 @@ async fn commit_snapshot<D: PageDevice>(
             previous_hash,
         )),
         last_segment_target_checkpoint_generation: checkpoint_generation,
+        durably_cleared_seals,
     };
     successor.recovery_peak_bytes = successor
         .resident_heap_bytes()

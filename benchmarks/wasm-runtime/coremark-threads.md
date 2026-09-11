@@ -160,3 +160,36 @@ python3 scripts/summarize-coremark-threads.py \
   target/coremark-threads/debian-fuel-4h \
   --output target/coremark-threads/comparison.json
 ```
+
+## Results (2026-09-09, four harts, `M1`/`M2`/`M3`)
+
+The VibeOS image is `wasi-benchmark,wasmtime-command-fuel-batch,wasmtime-threads`
+at the current tree (kernel SHA-256
+`97fd7e36ca7b5a57087ca041cb78a5a6115b0392fb43abc8d0edf48e7f101d7b`): fuel
+batching, code generation for the firmware-discovered zba/zbb/zbc/zbs, the
+lock-free 10,000-fuel continuation gate, and the three lifecycle fixes
+described in [WASI_PERFORMANCE.md](../../docs/WASI_PERFORMANCE.md). The Linux
+runner is unchanged (`971693f1…`, plain RV64GC, no fuel).
+
+| Workers | VibeOS before (2026-09-09, `vibeos-4h-r4`) | VibeOS after (`vibeos-4h-fuel-batch-isa-probe`) | Debian control, same window (`debian-std-4h-r4`) | after / control |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1,389 | **2,611** (2,540–2,784) | 3,453 (3,361–3,470) | 76% |
+| 2 | 2,271 | **5,088** (4,681–5,111) | 6,136 (6,098–6,369) | 83% |
+| 3 | 3,262 | **6,581** (6,273–7,164) | 8,601 (8,237–8,637) | 77% |
+
+Medians of three 20-second performance samples, iterations/second aggregate
+over all workers; every sample passed upstream CRC validation and the fourth
+(validation-seed) sample also passed. Against the Debian medians of the
+original comparison (3,153 / 5,880 / 8,031, measured earlier the same day),
+the new image reaches 83% / 87% / 82%. The Debian control measured 40 minutes
+earlier in the same session (`debian-std-4h-r3-early`) gave 3,260 / 5,902 /
+8,122. Host load on this machine moves both platforms by more than 10%
+between windows, so only pairs measured back to back should be compared.
+
+Per-invocation batching evidence for the first performance sample: workers
+continued on their fibers at 3,110,038 of 3,218,501 boundaries (`M1`),
+4,915,542 of 5,085,060 (`M2`) and 6,887,549 of 7,126,983 (`M3`); every one of
+the 15 invocations (12 samples plus three calibrations) reported
+`reclaimed=true caps=0 waiters=0`. `comparison-fuel-batch-isa-probe.json`
+holds the verified summary of all three evidence sets.
+

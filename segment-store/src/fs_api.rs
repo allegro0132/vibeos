@@ -36,6 +36,16 @@ pub struct FsNodeEntryInput<'a> {
     pub value: &'a [u8],
     pub child: Option<&'a AuthorizedObject<CasObjectHandle>>,
     pub data: Option<&'a FsPersistentData>,
+    /// Index into the fused transaction's pending content list: this inode's
+    /// data edge names a stream head the same batch stages ahead of the
+    /// trees, so it is unknown until publication predicts it.
+    pub pending: Option<usize>,
+}
+
+/// One file's whole content, staged inside the fused tree transaction as a
+/// single stream head instead of through its own checkpoint beforehand.
+pub struct FsPendingContent<'a> {
+    pub bytes: &'a [u8],
 }
 
 fn structural_to_root_publish<E>(error: FsStructuralCommitError<E>) -> FsRootPublishError<E> {
@@ -239,6 +249,9 @@ struct CowBuiltNode {
 enum PlannedFsRef {
     Known(TypedObjectReference),
     Node(usize),
+    /// The stream head of the fused transaction's pending content at this
+    /// index; the batch stages it before any node and predicts its identity.
+    Pending(usize),
 }
 
 struct PlannedFsEntry {
@@ -288,6 +301,7 @@ fn find_reusable_fs_node(
 fn plan_fs_cow_tree(
     tree: FsTreeKind,
     leaves: Vec<FsBtreeEntryV1>,
+    pending_marks: &[Option<usize>],
     old_nodes: &[RecoverableFsNode],
     plan: &mut Vec<PlannedFsNode>,
 ) -> Result<usize, FsCodecError> {
@@ -296,10 +310,21 @@ fn plan_fs_cow_tree(
         slot: usize,
         exact: Option<TypedObjectReference>,
     }
+    if pending_marks.len() != leaves.len() {
+        return Err(FsCodecError::OutOfBounds);
+    }
     let mut built: Vec<PlannedChild> = Vec::new();
-    for range in partition_fs_entries(&leaves)? {
+    let leaf_boundaries = old_fs_node_boundaries(old_nodes, tree, 0);
+    for range in partition_fs_entries_stable(&leaves, &leaf_boundaries)? {
         let entries = &leaves[range.clone()];
-        let reused = find_reusable_fs_node(old_nodes, tree, 0, entries);
+        let marks = &pending_marks[range.clone()];
+        // A leaf naming pending content can never byte-match a committed
+        // node: its data edge is minted by this very batch.
+        let reused = if marks.iter().any(Option::is_some) {
+            None
+        } else {
+            find_reusable_fs_node(old_nodes, tree, 0, entries)
+        };
         let slot = plan.len();
         match reused {
             Some(reference) => plan.push(PlannedFsNode::Reused(reference)),
@@ -308,10 +333,14 @@ fn plan_fs_cow_tree(
                 level: 0,
                 entries: entries
                     .iter()
-                    .map(|entry| PlannedFsEntry {
+                    .zip(marks)
+                    .map(|(entry, mark)| PlannedFsEntry {
                         key: entry.key.clone(),
                         value: entry.value.clone(),
-                        reference: entry.reference.map(PlannedFsRef::Known),
+                        reference: match mark {
+                            Some(index) => Some(PlannedFsRef::Pending(*index)),
+                            None => entry.reference.map(PlannedFsRef::Known),
+                        },
                     })
                     .collect(),
             }),
@@ -344,7 +373,8 @@ fn plan_fs_cow_tree(
             });
         }
         let mut parents = Vec::new();
-        for range in partition_fs_entries(&sizing)? {
+        let level_boundaries = old_fs_node_boundaries(old_nodes, tree, level);
+        for range in partition_fs_entries_stable(&sizing, &level_boundaries)? {
             let children = &built[range.clone()];
             // A parent is reusable only when every child kept its committed
             // identity; then its exact entries are known before staging.
@@ -396,6 +426,66 @@ fn plan_fs_cow_tree(
         .pop()
         .map(|node| node.slot)
         .ok_or(FsCodecError::OutOfBounds)
+}
+
+/// Minimum keys of the previous tree's nodes at one level, sorted. They are
+/// the node boundaries a successor partition keeps so that an insertion or
+/// deletion re-stages only the node it lands in (plus that node's ancestors)
+/// instead of every node after it.
+fn old_fs_node_boundaries(
+    old_nodes: &[RecoverableFsNode],
+    tree: FsTreeKind,
+    level: u8,
+) -> Vec<Vec<u8>> {
+    let mut keys: Vec<Vec<u8>> = old_nodes
+        .iter()
+        .filter(|node| node.decoded.tree == tree && node.decoded.level == level)
+        .filter_map(|node| node.decoded.entries.first().map(|entry| entry.key.clone()))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Partition sorted `entries` into node ranges, preserving the previous
+/// tree's node boundaries wherever they still apply. Entries below the first
+/// old boundary join the first node; each old node's key range keeps its own
+/// node (split by size when it overflows, dropped when it empties); entries
+/// past the last boundary belong to the last node. Every range is a valid
+/// B+tree partition — the reader checks only key order and the parent's
+/// minimum-key binding — so this differs from the greedy packing only in
+/// which unchanged nodes stay byte-identical and are therefore reused.
+///
+/// The greedy packing of `partition_fs_entries` is a poor COW layout: one
+/// inserted key shifts every later node boundary, so a single create in a
+/// populated directory re-staged most of the tree (14 nodes for one file in
+/// a 600-file namespace, measured), which was the dominant write and GC
+/// amplification of small file-tree transactions.
+fn partition_fs_entries_stable(
+    entries: &[FsBtreeEntryV1],
+    boundaries: &[Vec<u8>],
+) -> Result<Vec<core::ops::Range<usize>>, FsCodecError> {
+    if boundaries.len() < 2 || entries.is_empty() {
+        return partition_fs_entries(entries);
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0_usize;
+    let mut push_bucket = |start: usize, end: usize| -> Result<(), FsCodecError> {
+        if end > start {
+            for range in partition_fs_entries(&entries[start..end])? {
+                ranges.push(start + range.start..start + range.end);
+            }
+        }
+        Ok(())
+    };
+    for boundary in &boundaries[1..] {
+        let end = start
+            + entries[start..].partition_point(|entry| entry.key.as_slice() < boundary.as_slice());
+        push_bucket(start, end)?;
+        start = end;
+    }
+    push_bucket(start, entries.len())?;
+    Ok(ranges)
 }
 
 fn partition_fs_entries(
@@ -1041,9 +1131,11 @@ impl<D: PageDevice> SegmentStore<D> {
             root_file_id,
             inode_entries,
             dirent_entries,
+            &[],
             false,
         )
         .await
+        .map(|(root, _)| root)
     }
 
     /// [`Self::commit_fs_transaction_for_maintenance`] plus the persistent
@@ -1068,6 +1160,46 @@ impl<D: PageDevice> SegmentStore<D> {
         dirent_entries: &[FsNodeEntryInput<'_>],
         expected_generation: u64,
     ) -> Result<AuthorizedObject<CasObjectHandle>, FsRootPublishError<D::Error>> {
+        self.commit_fs_transaction_with_root_switch_and_content_for_maintenance(
+            maintenance,
+            previous,
+            namespace_uuid,
+            namespace_generation,
+            next_file_id,
+            root_file_id,
+            inode_entries,
+            dirent_entries,
+            &[],
+            expected_generation,
+        )
+        .await
+        .map(|(root, _)| root)
+    }
+
+    /// [`Self::commit_fs_transaction_with_root_switch_for_maintenance`] that
+    /// also stages `pending` file contents inside the same batch: each becomes
+    /// one stream head published under the transaction's single checkpoint,
+    /// and the returned handles (in `pending` order) are the committed data
+    /// edges the leaves already name. Small file creates and overwrites thus
+    /// cost one checkpoint instead of one for the content plus one for the
+    /// trees.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_fs_transaction_with_root_switch_and_content_for_maintenance(
+        &mut self,
+        maintenance: &StoreMaintenance,
+        previous: Option<&FsPersistentRoot>,
+        namespace_uuid: u128,
+        namespace_generation: u64,
+        next_file_id: u64,
+        root_file_id: u64,
+        inode_entries: &[FsNodeEntryInput<'_>],
+        dirent_entries: &[FsNodeEntryInput<'_>],
+        pending: &[FsPendingContent<'_>],
+        expected_generation: u64,
+    ) -> Result<
+        (AuthorizedObject<CasObjectHandle>, Vec<FsPersistentData>),
+        FsRootPublishError<D::Error>,
+    > {
         // The new root's declared generation must be the strict successor of
         // the expectation, exactly as compare-exchange enforces after decode.
         if Some(namespace_generation) != expected_generation.checked_add(1) {
@@ -1099,7 +1231,7 @@ impl<D: PageDevice> SegmentStore<D> {
         )
         .map_err(FsRootPublishError::Authority)?;
         if !fused_fits {
-            let root = self
+            let (root, data) = self
                 .commit_fs_transaction_for_maintenance_inner(
                     maintenance,
                     previous,
@@ -1109,6 +1241,7 @@ impl<D: PageDevice> SegmentStore<D> {
                     root_file_id,
                     inode_entries,
                     dirent_entries,
+                    pending,
                     false,
                 )
                 .await
@@ -1120,7 +1253,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 &root,
             )
             .await?;
-            return Ok(root);
+            return Ok((root, data));
         }
         self.commit_fs_transaction_for_maintenance_inner(
             maintenance,
@@ -1131,6 +1264,7 @@ impl<D: PageDevice> SegmentStore<D> {
             root_file_id,
             inode_entries,
             dirent_entries,
+            pending,
             true,
         )
         .await
@@ -1178,14 +1312,31 @@ impl<D: PageDevice> SegmentStore<D> {
         root_file_id: u64,
         inode_entries: &[FsNodeEntryInput<'_>],
         dirent_entries: &[FsNodeEntryInput<'_>],
+        pending: &[FsPendingContent<'_>],
         fused_root_switch: bool,
-    ) -> Result<AuthorizedObject<CasObjectHandle>, FsStructuralCommitError<D::Error>> {
+    ) -> Result<
+        (AuthorizedObject<CasObjectHandle>, Vec<FsPersistentData>),
+        FsStructuralCommitError<D::Error>,
+    > {
         // The lease proves maintenance authority for this trusted-service
         // write path, exactly like the staged chunk batch.
         let lease = self
             .acquire_maintenance(maintenance, MaintenanceOperation::ExplicitMaintenance)
             .ok_or(FsStructuralCommitError::InvalidChild)?;
         drop(lease);
+        if pending
+            .iter()
+            .any(|content| content.bytes.is_empty() || content.bytes.len() > FS_DATA_CHUNK_MAX_LEN)
+        {
+            return Err(FsCodecError::OutOfBounds.into());
+        }
+        if inode_entries
+            .iter()
+            .chain(dirent_entries)
+            .any(|input| input.pending.is_some_and(|index| index >= pending.len()))
+        {
+            return Err(FsStructuralCommitError::InvalidChild);
+        }
         // Recover the previous trees and resolve every committed reference
         // while the store is still mounted; staging poisons it until
         // publication.
@@ -1236,14 +1387,28 @@ impl<D: PageDevice> SegmentStore<D> {
             self.resolve_fs_leaves(FsTreeKind::Inode, inode_entries, &old_inode_nodes)?;
         let dirent_leaves =
             self.resolve_fs_leaves(FsTreeKind::Dirent, dirent_entries, &old_dirent_nodes)?;
+        let inode_marks: Vec<Option<usize>> =
+            inode_entries.iter().map(|input| input.pending).collect();
+        let dirent_marks: Vec<Option<usize>> =
+            dirent_entries.iter().map(|input| input.pending).collect();
         // Both trees plan into one node list; reuse decisions depend only on
         // committed references, never on the ids the batch will predict, so
         // the plan is exact before any staging begins.
         let mut plan: Vec<PlannedFsNode> = Vec::new();
-        let inode_root_slot =
-            plan_fs_cow_tree(FsTreeKind::Inode, inode_leaves, &old_inode_nodes, &mut plan)?;
-        let dirent_root_slot =
-            plan_fs_cow_tree(FsTreeKind::Dirent, dirent_leaves, &old_dirent_nodes, &mut plan)?;
+        let inode_root_slot = plan_fs_cow_tree(
+            FsTreeKind::Inode,
+            inode_leaves,
+            &inode_marks,
+            &old_inode_nodes,
+            &mut plan,
+        )?;
+        let dirent_root_slot = plan_fs_cow_tree(
+            FsTreeKind::Dirent,
+            dirent_leaves,
+            &dirent_marks,
+            &old_dirent_nodes,
+            &mut plan,
+        )?;
         // Ensure capacity before staging anything: nothing is consumed while
         // the store stays mounted, so a shortfall may collect garbage and
         // re-check like the sequential maintenance commit did per node.
@@ -1257,10 +1422,29 @@ impl<D: PageDevice> SegmentStore<D> {
             .filter(|node| matches!(node, PlannedFsNode::Staged { .. }))
             .count() as u64;
         let entry_span_pages = (FS_OBJECT_MAX_LEN as u64).div_ceil(PAGE_SIZE as u64) + 8;
-        let shared_segments = staged_nodes
+        // Pending content packs into the same shared segments when small
+        // (the stream node's page count plus its record span) and streams
+        // about three 1 MiB extents per segment otherwise, exactly as the
+        // standalone chunk batch budgets it.
+        let mut pooled_pages = staged_nodes
             .checked_add(1)
             .and_then(|entries| entries.checked_mul(entry_span_pages))
-            .map(|pages| pages.div_ceil(u64::from(DATA_END_PAGE - DATA_FIRST_PAGE)))
+            .ok_or(StoreError::Corrupt)?;
+        let mut dedicated_segments = 0_u64;
+        for content in pending {
+            if content.bytes.len() <= 192 * 1024 {
+                pooled_pages = pooled_pages
+                    .checked_add((content.bytes.len() as u64).div_ceil(PAGE_SIZE as u64) + 8)
+                    .ok_or(StoreError::Corrupt)?;
+            } else {
+                dedicated_segments = dedicated_segments
+                    .checked_add(1 + content.bytes.len() as u64 / (3 * 1024 * 1024))
+                    .ok_or(StoreError::Corrupt)?;
+            }
+        }
+        let shared_segments = pooled_pages
+            .div_ceil(u64::from(DATA_END_PAGE - DATA_FIRST_PAGE))
+            .checked_add(dedicated_segments)
             .ok_or(StoreError::Corrupt)?;
         let needed = shared_segments.checked_add(2).ok_or(StoreError::Corrupt)?;
         let maximum_cycles = self.info()?.admitted_segments;
@@ -1308,6 +1492,39 @@ impl<D: PageDevice> SegmentStore<D> {
         }
         staged_decoded.resize(plan.len(), None);
         let mut staging: Result<(), FsStructuralCommitError<D::Error>> = Ok(());
+        // Pending content goes first: positions 0..pending.len() of the batch,
+        // one stream head each, so the leaves' predicted data edges are the
+        // identities publication will bind.
+        let mut pending_refs: Vec<TypedObjectReference> = Vec::new();
+        let mut pending_metas: Vec<FsDataNodeMeta> = Vec::new();
+        if pending_refs.try_reserve_exact(pending.len()).is_err()
+            || pending_metas.try_reserve_exact(pending.len()).is_err()
+        {
+            return Err(FsStructuralCommitError::Store(CasStoreError::Store(
+                StoreError::MemoryLimit,
+            )));
+        }
+        let mut staged_metas: alloc::collections::BTreeMap<u128, FsDataNodeMeta> =
+            alloc::collections::BTreeMap::new();
+        for content in pending {
+            match self
+                .stage_fs_data_chunk_inner(&mut batch, &mut staged_metas, None, content.bytes)
+                .await
+            {
+                Ok((reference, meta)) => {
+                    pending_refs.push(reference);
+                    pending_metas.push(meta);
+                }
+                Err(error) => {
+                    staging = Err(error);
+                    break;
+                }
+            }
+        }
+        if let Err(error) = staging {
+            return Err(error);
+        }
+        let mut staging: Result<(), FsStructuralCommitError<D::Error>> = Ok(());
         'stage: for (slot, node) in plan.iter().enumerate() {
             match node {
                 PlannedFsNode::Reused(reference) => resolved[slot] = Some(*reference),
@@ -1329,6 +1546,15 @@ impl<D: PageDevice> SegmentStore<D> {
                             Some(PlannedFsRef::Known(reference)) => Some(reference),
                             Some(PlannedFsRef::Node(child_slot)) => {
                                 match resolved.get(child_slot).copied().flatten() {
+                                    Some(reference) => Some(reference),
+                                    None => {
+                                        staging = Err(FsStructuralCommitError::InvalidChild);
+                                        break 'stage;
+                                    }
+                                }
+                            }
+                            Some(PlannedFsRef::Pending(index)) => {
+                                match pending_refs.get(index).copied() {
                                     Some(reference) => Some(reference),
                                     None => {
                                         staging = Err(FsStructuralCommitError::InvalidChild);
@@ -1427,10 +1653,11 @@ impl<D: PageDevice> SegmentStore<D> {
         } else {
             self.publish_staged_batch(batch).await?
         };
-        let object = published
-            .into_iter()
-            .nth(root_index)
-            .ok_or(StoreError::Corrupt)?;
+        if published.len() <= root_index {
+            return Err(StoreError::Corrupt.into());
+        }
+        let mut published = published;
+        let object = published.remove(root_index);
         // The published identity must equal the prediction the staged root
         // payload's readers will resolve; a mismatch means the batch's
         // position accounting broke.
@@ -1440,6 +1667,34 @@ impl<D: PageDevice> SegmentStore<D> {
             .map_err(|_| StoreError::Corrupt)?;
         if key.object_id() != root_id || key.commit_generation() != root_generation {
             return Err(StoreError::Corrupt.into());
+        }
+        // Pending content occupied the batch's first positions; bind each
+        // published stream head to the prediction its leaf already names.
+        let mut pending_data = Vec::new();
+        if pending_data.try_reserve_exact(pending.len()).is_err() {
+            return Err(FsStructuralCommitError::Store(CasStoreError::Store(
+                StoreError::MemoryLimit,
+            )));
+        }
+        for (index, (data_object, meta)) in published
+            .drain(..pending.len())
+            .zip(pending_metas)
+            .enumerate()
+        {
+            let data_key = data_object
+                .backend_handle()
+                .authority_key()
+                .map_err(|_| StoreError::Corrupt)?;
+            let predicted = pending_refs.get(index).ok_or(StoreError::Corrupt)?;
+            if data_key.object_id() != predicted.object_id
+                || data_key.commit_generation() != predicted.commit_generation
+            {
+                return Err(StoreError::Corrupt.into());
+            }
+            pending_data.push(FsPersistentData {
+                object: Arc::new(data_object),
+                layout: FsPersistentDataLayout::Stream(meta),
+            });
         }
         if fused_root_switch {
             // The mounted successor must expose the switched root through the
@@ -1554,7 +1809,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 });
             }
         }
-        Ok(object)
+        Ok((object, pending_data))
     }
 
     /// Resolve one tree's leaf entries against committed children and, for
@@ -1580,7 +1835,10 @@ impl<D: PageDevice> SegmentStore<D> {
                 (None, None) => None,
                 (Some(_), Some(_)) => unreachable!(),
             };
-            if reference.is_none() && tree == FsTreeKind::Inode {
+            if input.pending.is_some() && (reference.is_some() || tree != FsTreeKind::Inode) {
+                return Err(FsStructuralCommitError::InvalidChild);
+            }
+            if reference.is_none() && input.pending.is_none() && tree == FsTreeKind::Inode {
                 reference = old_nodes
                     .iter()
                     .filter(|node| node.decoded.level == 0)
@@ -1784,6 +2042,10 @@ impl<D: PageDevice> SegmentStore<D> {
             .map_err(|_| FsCodecError::OutOfBounds)?;
         for input in entries {
             if input.child.is_some() && input.data.is_some() {
+                return Err(FsStructuralCommitError::InvalidChild);
+            }
+            if input.pending.is_some() {
+                // Pending content exists only for the fused batch transaction.
                 return Err(FsStructuralCommitError::InvalidChild);
             }
             let mut reference = match (input.child, input.data) {
@@ -2636,12 +2898,14 @@ mod tests {
         let maintenance = store.mint_maintenance_root().unwrap();
         const NAMESPACE: u128 = 0x4655_5345_442d_5458;
         let inode_inputs = [FsNodeEntryInput {
+            pending: None,
             key: b"inode-1",
             value: b"meta-1",
             child: None,
             data: None,
         }];
         let dirent_inputs = [FsNodeEntryInput {
+            pending: None,
             key: b"dirent-1",
             value: b"target-1",
             child: None,

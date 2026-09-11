@@ -88,7 +88,7 @@ pub use codec::{
 pub use compat::PutGetAdapter;
 pub use device::{BlockPageDevice, BlockPageError, GrowablePageDevice, PageDevice, PageDeviceInfo};
 pub use fs_api::{
-    FsNodeEntryInput, FsPersistentData, FsPersistentRoot, FsPersistentTreeEntry,
+    FsNodeEntryInput, FsPendingContent, FsPersistentData, FsPersistentRoot, FsPersistentTreeEntry,
     FsRootPublishError, FsStructuralCommitError,
 };
 pub use fs_codec::{

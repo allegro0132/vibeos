@@ -646,6 +646,14 @@ by closing the shared segment before any younger segment seals. The packed
 layout is byte-compatible with what the GC compactor already writes, and is
 exercised by the staged-batch crash matrix, the packing unit tests, and the
 file-tree QEMU case's powered-off verifier.
+- **2026-09-11: flushes and bytes per file transaction halved** (see
+  `benchmarks/storage/RESULTS.md`). Small file creates and overwrites are
+  one checkpoint of three flushes instead of two checkpoints of four
+  (content now rides the fused tree batch; scratch seals are pre-cleared by
+  the previous publication), and the COW planner keeps old node boundaries
+  so an edit in a populated directory re-stages only its own path instead
+  of most of the tree (600-file namespace: 908 KiB → 420 KiB per create).
+  Both matter far more on 1-bit PIO SD than on QEMU's RAM-backed disk.
 - One spontaneous board reset was observed under sustained write load
   (possible supply dip; worth checking the Duo's power source). Data written
   minutes before the reset survived except one subtree, consistent with the

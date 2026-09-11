@@ -1924,6 +1924,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 [0; 32],
             ))),
             last_segment_target_checkpoint_generation: generation,
+            durably_cleared_seals: alloc::collections::BTreeSet::new(),
         };
         successor.recovery_peak_bytes = successor
             .resident_heap_bytes()

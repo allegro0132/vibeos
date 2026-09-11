@@ -43,7 +43,11 @@ def main():
         if env['platform'] == 'vibeos':
             boot = (work/'boot.log').read_text()
             assert 'reclaimed=false' not in boot
-            assert boot.count('reclaimed=true caps=0 waiters=0') == len(rows)+len(env['workers'])+int(env.get('capacity_probe', False))
+            # Every measured run, every calibration attempt and the optional
+            # capacity probe is one invocation with a clean lifecycle line.
+            calibrations = len(list(work.glob('calibration-m*.stdout')))
+            assert calibrations >= len(env['workers'])
+            assert boot.count('reclaimed=true caps=0 waiters=0') == len(rows)+calibrations+int(env.get('capacity_probe', False))
             profiles = json.loads((work/'thread-profiles.json').read_text())
             by_name = {r['name']:r for r in profiles}
             for row in rows:

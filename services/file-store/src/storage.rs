@@ -6,8 +6,8 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use vibeos_segment_store::{
-    AuthorizedObject, CasObjectHandle, CasStoreError, FsNodeEntryInput, FsPersistentData,
-    FsRootPublishError, FsStructuralCommitError, FsTreeKind, PageDevice, SegmentStore,
+    AuthorizedObject, CasObjectHandle, CasStoreError, FsNodeEntryInput, FsPendingContent,
+    FsPersistentData, FsRootPublishError, FsStructuralCommitError, FsTreeKind, PageDevice, SegmentStore,
     StoragePrincipal, StoreError, StoreMaintenance,
 };
 
@@ -169,6 +169,7 @@ async fn commit_tree<D: PageDevice>(
             value,
             child: None,
             data,
+            pending: None,
         });
     }
     match (principal, maintenance) {
@@ -288,12 +289,33 @@ impl FsTransaction {
             })
             .collect();
         let mut content = BTreeMap::new();
+        // Under the fused trusted-service path, small in-memory content is
+        // not committed ahead of the trees: it is handed to the fused
+        // transaction and published under the same checkpoint.
+        let fold_content = principal.is_none() && maintenance.is_some();
+        let mut pending_files: Vec<(FileId, Vec<u8>)> = Vec::new();
         for file_id in content_inodes {
             let inode = self
                 .working
                 .inodes
                 .get(&file_id)
                 .ok_or(FileError::NotFound)?;
+            if fold_content {
+                if let Content::File(chunks) = &inode.content {
+                    let total: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+                    if total > 0 && total <= crate::FUSED_CONTENT_LIMIT {
+                        let mut bytes = Vec::new();
+                        bytes
+                            .try_reserve_exact(total)
+                            .map_err(|_| FileError::BudgetExceeded)?;
+                        for chunk in chunks {
+                            bytes.extend_from_slice(chunk);
+                        }
+                        pending_files.push((file_id, bytes));
+                        continue;
+                    }
+                }
+            }
             if let Some(data) = commit_content(store, inode, principal, maintenance).await? {
                 if inode.file_type == FileType::Regular {
                     self.working
@@ -311,11 +333,21 @@ impl FsTransaction {
             // and the persistent root switch publish under one staged-batch
             // checkpoint instead of one checkpoint for the batch plus one
             // for the root-policy switch.
-            let inode_inputs = build_node_inputs(&inode_entries, Some(&content))?;
-            let dirent_inputs = build_node_inputs(&dirent_entries, None)?;
+            let pending_index: BTreeMap<FileId, usize> = pending_files
+                .iter()
+                .enumerate()
+                .map(|(index, (file_id, _))| (*file_id, index))
+                .collect();
+            let inode_inputs =
+                build_node_inputs(&inode_entries, Some(&content), Some(&pending_index))?;
+            let dirent_inputs = build_node_inputs(&dirent_entries, None, None)?;
+            let pending: Vec<FsPendingContent<'_>> = pending_files
+                .iter()
+                .map(|(_, bytes)| FsPendingContent { bytes })
+                .collect();
             self.check_publication()?;
-            store
-                .commit_fs_transaction_with_root_switch_for_maintenance(
+            let (_, published_data) = store
+                .commit_fs_transaction_with_root_switch_and_content_for_maintenance(
                     maintenance,
                     self.previous_root.as_ref(),
                     self.working.namespace,
@@ -324,9 +356,20 @@ impl FsTransaction {
                     crate::ROOT_FILE_ID,
                     &inode_inputs,
                     &dirent_inputs,
+                    &pending,
                     self.base_generation,
                 )
                 .await?;
+            if published_data.len() != pending_files.len() {
+                return Err(FileError::ServiceUnavailable.into());
+            }
+            for ((file_id, _), data) in pending_files.iter().zip(published_data) {
+                self.working
+                    .inodes
+                    .get_mut(file_id)
+                    .ok_or(FileError::NotFound)?
+                    .content = Content::PersistentFile(data);
+            }
         } else {
             let new_root = self
                 .commit_persistent_trees_and_root(
@@ -455,20 +498,25 @@ impl FsTransaction {
 fn build_node_inputs<'a>(
     entries: &'a [(Vec<u8>, Vec<u8>)],
     content: Option<&'a BTreeMap<FileId, FsPersistentData>>,
+    pending: Option<&BTreeMap<FileId, usize>>,
 ) -> Result<Vec<FsNodeEntryInput<'a>>, FileError> {
     let mut inputs = Vec::new();
     for (key, value) in entries {
-        let data = if let Some(content) = content {
+        let (data, pending) = if let Some(content) = content {
             let file_id = crate::decode_inode_key(key).map_err(|_| FileError::InvalidType)?;
-            content.get(&file_id)
+            (
+                content.get(&file_id),
+                pending.and_then(|pending| pending.get(&file_id).copied()),
+            )
         } else {
-            None
+            (None, None)
         };
         inputs.push(FsNodeEntryInput {
             key,
             value,
             child: None,
             data,
+            pending,
         });
     }
     Ok(inputs)
@@ -1303,6 +1351,456 @@ mod tests {
                 }
             }
             std::println!("mkdir {index}: {} device page reads", device.reads() - before);
+        }
+    }
+}
+
+#[cfg(test)]
+mod io_trace {
+    //! Diagnostic: itemize device writes and flushes for the benchmark's
+    //! create+fsync+unlink sequence. Run with
+    //! `cargo test -p vibeos-file-store --lib io_trace -- --ignored --nocapture`.
+    extern crate std;
+
+    use super::*;
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+    use std::collections::BTreeMap;
+    use std::fmt;
+    use std::sync::Mutex;
+
+    use vibeos_segment_format::{
+        admitted_pages, Page, StoreUuid, ANCHOR_PAGES, PAGE_SIZE, SEGMENT_PAGES,
+    };
+    use vibeos_segment_store::{
+        FormatOptions, PageDeviceInfo, StoreLimits, StoreMaintenance, StoreRuntimeContext,
+    };
+    use vibeos_storage_device::MutationFailure;
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = Box::pin(future);
+        loop {
+            match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(output) => return output,
+                Poll::Pending => std::thread::yield_now(),
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DeviceError {
+        OutsideRange,
+    }
+    impl fmt::Display for DeviceError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{self:?}")
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Event {
+        Write(u64, u64),
+        Read(u64, u64),
+        Flush,
+    }
+
+    #[derive(Clone)]
+    struct TraceDevice {
+        page_count: u64,
+        pages: Arc<Mutex<BTreeMap<u64, Page>>>,
+        events: Arc<Mutex<Vec<Event>>>,
+    }
+
+    impl TraceDevice {
+        fn blank(segments: u64) -> Self {
+            Self {
+                page_count: admitted_pages(segments).unwrap(),
+                pages: Arc::new(Mutex::new(BTreeMap::new())),
+                events: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+        fn take(&self) -> Vec<Event> {
+            core::mem::take(&mut *self.events.lock().unwrap())
+        }
+    }
+
+    fn region(page: u64) -> std::string::String {
+        if page < ANCHOR_PAGES {
+            return alloc::format!("anchor:{page}");
+        }
+        let segment = (page - ANCHOR_PAGES) / SEGMENT_PAGES;
+        let relative = (page - ANCHOR_PAGES) % SEGMENT_PAGES;
+        alloc::format!("seg{segment}+{relative}")
+    }
+
+    fn report(label: &str, events: &[Event]) {
+        let mut writes = 0_u64;
+        let mut write_pages = 0_u64;
+        let mut reads = 0_u64;
+        let mut read_pages = 0_u64;
+        let mut flushes = 0_u64;
+        let mut read_by_region: BTreeMap<std::string::String, (u64, u64)> = BTreeMap::new();
+        let mut lines = std::string::String::new();
+        for event in events {
+            match event {
+                Event::Write(first, count) => {
+                    writes += 1;
+                    write_pages += count;
+                    lines.push_str(&alloc::format!("  W {}..+{}\n", region(*first), count));
+                }
+                Event::Read(first, count) => {
+                    reads += 1;
+                    read_pages += count;
+                    let key = if *first < ANCHOR_PAGES { "anchor".into() } else { alloc::format!("seg{}", (*first - ANCHOR_PAGES) / SEGMENT_PAGES) };
+                    let entry = read_by_region.entry(key).or_insert((0_u64, 0_u64));
+                    entry.0 += 1;
+                    entry.1 += count;
+                }
+                Event::Flush => {
+                    flushes += 1;
+                    lines.push_str("  ---- FLUSH\n");
+                }
+            }
+        }
+        std::println!(
+            "== {label}: writes={writes} ({} KiB) flushes={flushes} reads={reads} ({} KiB)",
+            write_pages * 4,
+            read_pages * 4
+        );
+        std::print!("{lines}");
+        for (key, (count, pages)) in read_by_region {
+            std::println!("  R {key}: {count} requests, {} KiB", pages * 4);
+        }
+    }
+
+    impl PageDevice for TraceDevice {
+        type Error = DeviceError;
+        fn info(&self) -> PageDeviceInfo {
+            PageDeviceInfo {
+                device_id: [0x47; 16],
+                range_first_logical_block: 0,
+                logical_block_count: self.page_count * 8,
+                logical_block_size: 512,
+                page_count: self.page_count,
+            }
+        }
+        async fn read_page(&self, page: u64, output: &mut Page) -> Result<(), Self::Error> {
+            if page >= self.page_count {
+                return Err(DeviceError::OutsideRange);
+            }
+            self.events.lock().unwrap().push(Event::Read(page, 1));
+            *output = self.pages.lock().unwrap().get(&page).copied().unwrap_or([0; PAGE_SIZE]);
+            Ok(())
+        }
+        async fn read_pages(&self, first: u64, output: &mut [Page]) -> Result<(), Self::Error> {
+            if first + output.len() as u64 > self.page_count {
+                return Err(DeviceError::OutsideRange);
+            }
+            self.events.lock().unwrap().push(Event::Read(first, output.len() as u64));
+            let pages = self.pages.lock().unwrap();
+            for (offset, page) in output.iter_mut().enumerate() {
+                *page = pages.get(&(first + offset as u64)).copied().unwrap_or([0; PAGE_SIZE]);
+            }
+            Ok(())
+        }
+        async fn write_page(&self, page: u64, input: &Page) -> Result<(), MutationFailure<Self::Error>> {
+            if page >= self.page_count {
+                return Err(MutationFailure::not_submitted(DeviceError::OutsideRange));
+            }
+            self.events.lock().unwrap().push(Event::Write(page, 1));
+            self.pages.lock().unwrap().insert(page, *input);
+            Ok(())
+        }
+        async fn write_pages(&self, first: u64, input: &[Page]) -> Result<(), MutationFailure<Self::Error>> {
+            if first + input.len() as u64 > self.page_count {
+                return Err(MutationFailure::not_submitted(DeviceError::OutsideRange));
+            }
+            self.events.lock().unwrap().push(Event::Write(first, input.len() as u64));
+            let mut pages = self.pages.lock().unwrap();
+            for (offset, page) in input.iter().enumerate() {
+                pages.insert(first + offset as u64, *page);
+            }
+            Ok(())
+        }
+        async fn flush(&self) -> Result<(), MutationFailure<Self::Error>> {
+            self.events.lock().unwrap().push(Event::Flush);
+            Ok(())
+        }
+    }
+
+    fn limits() -> StoreLimits {
+        StoreLimits {
+            max_catalog_entries: 4096,
+            max_replay_records: 4,
+            recovery_memory_bytes: 8 * 1024 * 1024,
+            max_compat_object_bytes: 64 * 1024,
+        }
+    }
+
+    struct TraceBackend {
+        store: Mutex<SegmentStore<TraceDevice>>,
+        maintenance: StoreMaintenance,
+    }
+
+    impl crate::FileTreeBackend for TraceBackend {
+        fn stage_chunk<'a>(
+            &'a self,
+            previous: Option<vibeos_segment_store::FsPersistentData>,
+            bytes: Vec<u8>,
+        ) -> crate::FileTreeFuture<'a, vibeos_segment_store::FsPersistentData> {
+            let result = block_on(self.store.lock().unwrap().commit_fs_data_chunk_for_maintenance(
+                &self.maintenance,
+                previous.as_ref(),
+                &bytes,
+            ))
+            .map_err(|_| crate::FileError::ServiceUnavailable);
+            Box::pin(async move { result })
+        }
+        fn stage_chunks<'a>(
+            &'a self,
+            previous: Option<vibeos_segment_store::FsPersistentData>,
+            chunks: Vec<Vec<u8>>,
+        ) -> crate::FileTreeFuture<'a, vibeos_segment_store::FsPersistentData> {
+            let result = block_on(self.store.lock().unwrap().stage_fs_data_chunks_for_maintenance(
+                &self.maintenance,
+                previous.as_ref(),
+                &chunks,
+            ))
+            .map_err(|_| crate::FileError::ServiceUnavailable);
+            Box::pin(async move { result })
+        }
+        fn read_chunk<'a>(
+            &'a self,
+            data: vibeos_segment_store::FsPersistentData,
+            index: u64,
+        ) -> crate::FileTreeFuture<'a, Option<Vec<u8>>> {
+            let result = block_on(self.store.lock().unwrap().read_fs_data_chunk(&data, index))
+                .map_err(|_| crate::FileError::ServiceUnavailable);
+            Box::pin(async move { result })
+        }
+        fn commit<'a>(&'a self, transaction: crate::FsTransaction) -> crate::FileTreeFuture<'a, u64> {
+            let result = block_on(
+                transaction.commit_persistent_for_maintenance(
+                    &mut self.store.lock().unwrap(),
+                    &self.maintenance,
+                ),
+            )
+            .map_err(|error| match error {
+                PersistentCommitError::File(error) => error,
+                _ => crate::FileError::ServiceUnavailable,
+            });
+            Box::pin(async move { result })
+        }
+    }
+
+    struct Fixture {
+        device: TraceDevice,
+        root: crate::FileTreeRoot,
+        backend: Arc<TraceBackend>,
+    }
+
+    /// Format a store, import an empty persistent authority, attach the
+    /// maintenance backend, and populate `warm` 4 KiB files in commits of 40.
+    fn fixture(warm: u32) -> Fixture {
+        const NAMESPACE: u128 = 0x5649_4245_4f53_2d54_5241_4345_5f49_4f31;
+        const POLICY: &[u8] = b"io trace policy v1";
+        let device = TraceDevice::blank(256);
+        let (context, _quota, provisioner) =
+            StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
+                &vibeos_segment_store::fs_typed_reference_kinds(),
+            )
+            .unwrap();
+        let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), context);
+        block_on(store.format(FormatOptions {
+            store_uuid: StoreUuid::new(*b"VIBE-FS-IOTRACE!").unwrap(),
+            cleaner_reserve_segments: 6,
+            limits: limits(),
+        }))
+        .unwrap();
+        store.set_deferred_commit_readback(true);
+        let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+        let import = vibeos_segment_store::PersistentAuthorityImport::empty(
+            vibeos_durable_format::StoreId::new(92).unwrap(),
+            POLICY,
+            Vec::new(),
+        )
+        .unwrap();
+        block_on(store.import_persistent_authority(&maintenance, import)).unwrap();
+        let backend = Arc::new(TraceBackend { store: Mutex::new(store), maintenance });
+        let mut root = crate::FileTreeRoot::new_empty(NAMESPACE).unwrap();
+        root.attach_backend(backend.clone()).unwrap();
+        let mut done = 0_u32;
+        while done < warm {
+            let mut tx = root.begin().unwrap();
+            let batch = (warm - done).min(40);
+            for index in done..done + batch {
+                let path = alloc::format!("warm-{index:04}");
+                tx.write_chunks(&crate::RelPath::parse(&path).unwrap(), [alloc::vec![index as u8; 4096]], false)
+                    .unwrap();
+            }
+            block_on(tx.commit_durable()).unwrap();
+            done += batch;
+        }
+        device.take();
+        Fixture { device, root, backend }
+    }
+
+    fn payload(seed: u32) -> Vec<u8> {
+        (0..4096_u32)
+            .map(|i| (i.wrapping_mul(131).wrapping_add(seed.wrapping_mul(17)) % 251) as u8)
+            .collect()
+    }
+
+    fn flushes(events: &[Event]) -> usize {
+        events.iter().filter(|event| matches!(event, Event::Flush)).count()
+    }
+
+    fn write_pages(events: &[Event]) -> u64 {
+        events
+            .iter()
+            .map(|event| match event {
+                Event::Write(_, count) => *count,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    fn generation(backend: &TraceBackend) -> u64 {
+        backend.store.lock().unwrap().info().unwrap().generation
+    }
+
+    /// A small file's content rides the fused tree transaction: the stager
+    /// touches no media, the create is exactly one checkpoint whose slot
+    /// protocol is the only barrier (three flushes, the scratch seal having
+    /// been pre-cleared by the previous publication), and the content cold
+    /// recovers through the predicted data edge.
+    #[test]
+    fn small_create_is_one_checkpoint_with_three_flushes_and_cold_recovers() {
+        let fixture = fixture(8);
+        let bytes = payload(1);
+        let path = crate::RelPath::parse("bench-file-1").unwrap();
+        let mut stager = fixture.root.begin_content_stager(&path, false).unwrap();
+        block_on(stager.push(&bytes)).unwrap();
+        let staged = block_on(stager.finish()).unwrap();
+        let staging = fixture.device.take();
+        assert!(staging.is_empty(), "stager must not touch media for small content");
+
+        let before = generation(&fixture.backend);
+        let mut tx = fixture.root.begin().unwrap();
+        tx.write_staged(&path, staged).unwrap();
+        block_on(tx.commit_durable()).unwrap();
+        let create = fixture.device.take();
+        assert_eq!(generation(&fixture.backend) - before, 1, "content and trees share one checkpoint");
+        assert_eq!(flushes(&create), 3, "one checkpoint: clear old seal, body, seal");
+
+        let reader = fixture.root.reader(&path).unwrap();
+        assert_eq!(block_on(reader.read_chunk(0)).unwrap().unwrap(), bytes);
+
+        let mut tx = fixture.root.begin().unwrap();
+        tx.remove(&path, false, false).unwrap();
+        block_on(tx.commit_durable()).unwrap();
+        assert_eq!(flushes(&fixture.device.take()), 3);
+
+        // Cold recovery of a folded file: reopen from the device image.
+        let path2 = crate::RelPath::parse("bench-file-2").unwrap();
+        let bytes2 = payload(2);
+        let mut stager = fixture.root.begin_content_stager(&path2, false).unwrap();
+        block_on(stager.push(&bytes2)).unwrap();
+        let staged = block_on(stager.finish()).unwrap();
+        let mut tx = fixture.root.begin().unwrap();
+        tx.write_staged(&path2, staged).unwrap();
+        block_on(tx.commit_durable()).unwrap();
+        let namespace = fixture.root.snapshot().namespace();
+        drop(fixture.root);
+        let (cold_context, _cold_quota, _cold_maintenance) =
+            StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
+                &vibeos_segment_store::fs_typed_reference_kinds(),
+            )
+            .unwrap();
+        let mut cold = SegmentStore::new_with_runtime_context(
+            fixture.device.clone(),
+            limits(),
+            cold_context,
+        );
+        block_on(cold.mount()).unwrap();
+        let recovered = block_on(crate::FileTreeRoot::recover_persistent(&cold, namespace, 4096))
+            .unwrap()
+            .unwrap();
+        let snapshot = recovered.snapshot();
+        assert!(snapshot.persistent_data(&path).is_err(), "unlinked file stays gone");
+        let data = snapshot.persistent_data(&path2).unwrap();
+        assert_eq!(block_on(cold.read_fs_data_chunk(&data, 0)).unwrap().unwrap(), bytes2);
+        let warm = snapshot
+            .persistent_data(&crate::RelPath::parse("warm-0003").unwrap())
+            .unwrap();
+        assert_eq!(
+            block_on(cold.read_fs_data_chunk(&warm, 0)).unwrap().unwrap(),
+            alloc::vec![3_u8; 4096]
+        );
+    }
+
+    /// One create in a populated namespace re-stages only the nodes on the
+    /// modified paths: with 600 files the greedy packing re-staged 14 tree
+    /// nodes (219 segment pages); boundary-stable partitioning stays within
+    /// a handful, so the fused segment is bounded.
+    #[test]
+    fn single_create_in_populated_namespace_restages_bounded_nodes() {
+        let fixture = fixture(600);
+        let bytes = payload(3);
+        let path = crate::RelPath::parse("bench-file-3").unwrap();
+        let mut stager = fixture.root.begin_content_stager(&path, false).unwrap();
+        block_on(stager.push(&bytes)).unwrap();
+        let staged = block_on(stager.finish()).unwrap();
+        let mut tx = fixture.root.begin().unwrap();
+        tx.write_staged(&path, staged).unwrap();
+        block_on(tx.commit_durable()).unwrap();
+        let create = fixture.device.take();
+        let pages = write_pages(&create);
+        assert!(
+            pages <= 150,
+            "single create wrote {pages} pages; expected a few nodes plus catalog, not a tree rewrite"
+        );
+        assert_eq!(flushes(&create), 3);
+    }
+
+    #[test]
+    #[ignore]
+    fn trace_create_fsync_unlink() {
+        let fixture = fixture(
+            std::env::var("VIBE_IO_TRACE_WARM").ok().and_then(|v| v.parse().ok()).unwrap_or(8),
+        );
+        let device = fixture.device.clone();
+        let root = fixture.root;
+        for sample in 0..2 {
+            let payload = payload(sample);
+            let path = crate::RelPath::parse(&alloc::format!("bench-file-{sample}")).unwrap();
+            let mut stager = root.begin_content_stager(&path, false).unwrap();
+            block_on(stager.push(&payload)).unwrap();
+            let staged = block_on(stager.finish()).unwrap();
+            report(&alloc::format!("s{sample} stage content"), &device.take());
+            let mut tx = root.begin().unwrap();
+            tx.write_staged(&path, staged).unwrap();
+            block_on(tx.commit_durable()).unwrap();
+            report(&alloc::format!("s{sample} commit create"), &device.take());
+            let reader = root.reader(&path).unwrap();
+            let chunk = block_on(reader.read_chunk(0)).unwrap().unwrap();
+            assert_eq!(chunk, payload);
+            report(&alloc::format!("s{sample} read back"), &device.take());
+            let mut tx = root.begin().unwrap();
+            tx.remove(&path, false, false).unwrap();
+            block_on(tx.commit_durable()).unwrap();
+            report(&alloc::format!("s{sample} commit unlink"), &device.take());
+        }
+        if let Ok(path) = std::env::var("VIBE_IO_TRACE_DUMP") {
+            let pages = device.pages.lock().unwrap();
+            let mut image = alloc::vec![0_u8; (device.page_count * PAGE_SIZE as u64) as usize];
+            for (page, bytes) in pages.iter() {
+                let at = (*page as usize) * PAGE_SIZE;
+                image[at..at + PAGE_SIZE].copy_from_slice(bytes);
+            }
+            std::fs::write(path, image).unwrap();
         }
     }
 }

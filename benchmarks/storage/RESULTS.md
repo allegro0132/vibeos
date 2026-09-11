@@ -125,3 +125,62 @@ fixed machine contract:
   band above, so treat those two deltas as directionally real but not
   precisely quantified by this run; a rerun with more samples per
   coordinate is recommended before citing exact numbers for either.
+
+## 2026-09-11: fewer flushes and less write amplification per file transaction
+
+Three engine changes on branch `wasm_threads` (measured against the
+2026-09-10 run above, same machine contract, 1 VM, 1 warmup, 5 samples):
+
+- **Boundary-stable COW partitioning** (`segment-store/src/fs_api.rs`,
+  `partition_fs_entries_stable`). The fused tree planner re-packed every
+  leaf greedily from the sorted entry list, so one inserted name shifted
+  every later leaf boundary and re-staged most of the tree: a single 4 KiB
+  create in a 600-file namespace re-staged 14 B+tree nodes (219 segment
+  pages, 908 KiB). Leaves and internal nodes now keep the previous tree's
+  boundaries, so an edit re-stages only its own path: 97 pages / 420 KiB
+  for the same create, and reads per commit fell from 2.7 MiB to 1.1 MiB.
+- **Pre-cleared scratch seals** (`segment-store/src/cas.rs`,
+  `preclear_scratch_seals`, `MountedState::durably_cleared_seals`). Every
+  publication zeroes the final seal page of the next free scratch run
+  inside its own batched write; the checkpoint barriers make the zeros
+  durable and the successor state records them, so the next writer skips
+  the zero-write + flush + read-back it paid per scratch segment. One
+  checkpoint now costs 3 flushes (clear old slot seal, body, seal) instead
+  of 4, on every commit path (object put, file transaction, chunk batch).
+- **Content folded into the fused transaction** (`file-store`
+  `FUSED_CONTENT_LIMIT`, segment-store `FsPendingContent`). Content up to
+  192 KiB from the stager or `write_chunks` is no longer published through
+  its own checkpoint before the tree commit; the fused batch stages it as
+  the first entries, the leaves name its predicted identity, and the
+  published handles are bound after the checkpoint. A small create or
+  overwrite is one checkpoint.
+
+Per create+fsync+unlink sample (host trace, in-memory device; the QEMU
+`counters` are now per-sample deltas — the file-tree bench previously
+reported cumulative-since-boot telemetry):
+
+| namespace | flushes before → after | bytes written before → after |
+|---|---:|---:|
+| 8 files | 12 → 6 | 516 KiB → 448 KiB |
+| 600 files | 12 → 6 | 1.5 MiB → 0.9 MiB |
+
+QEMU medians (RAM-backed disk, so flushes are nearly free; the ratios that
+matter for the SD-card target are the flush and byte counts above):
+
+| coordinate | before | after |
+|---|---:|---:|
+| object put 4 KiB | 26.9 ms | 12.7 ms |
+| object range-get / revoke 4 KiB | 26.6 / 29.3 ms | 16.5 / 13.2 ms |
+| create+fsync+unlink 4 KiB | 22.4 ms | 20.9 ms |
+| overwrite 4 KiB | 27.3 ms | 23.5 ms |
+| directory of 100 files | 32.0 ms | 23.5 ms |
+| sequential write 64 / 256 MiB | 3.96 / 14.95 s | 3.66 / 14.01 s |
+
+Raw block coordinates are unchanged. The bimodal outlier on durable
+object commits (one sample in five 3-8x above the rest) persists and is
+unrelated to these changes. Remaining per-commit costs, in order: the
+frozen 2-page descriptor pair per extent and the 3-extent split of every
+small blob (about 60% of a small fused segment), the full CAS catalog
+snapshot rewritten per checkpoint (31 pages at ~1200 objects; the format's
+replay-record mechanism could carry deltas), and GC relocation writing one
+page per request.

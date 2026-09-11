@@ -3311,6 +3311,8 @@ async fn storage_file_tree_bench(
                 .wrapping_add(0x5a) as u8
         }));
     }
+    #[cfg(feature = "qemu-virt")]
+    let io_started = crate::virtio_blk::telemetry();
     let started = crate::sbi::time();
     let mut transferred = 0_u64;
     let mut operations = 0_u64;
@@ -3442,8 +3444,9 @@ async fn storage_file_tree_bench(
     }
     .await;
     let elapsed = crate::sbi::time().saturating_sub(started).max(1);
+    // Per-sample accounting: the device telemetry is cumulative since boot.
     #[cfg(feature = "qemu-virt")]
-    let io = crate::virtio_blk::telemetry();
+    let io = crate::virtio_blk::telemetry().saturating_sub(io_started);
     #[cfg(feature = "milkv-duo")]
     let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
     #[cfg(feature = "qemu-virt")]

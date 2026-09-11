@@ -368,8 +368,20 @@ pub struct FsContentStager {
     staged: Vec<Vec<u8>>,
 }
 
+/// Content no larger than this that a stager finishes without having staged
+/// anything stays in memory and is published inside the transaction's own
+/// fused checkpoint, instead of through a checkpoint of its own first. The
+/// bound matches the segment store's small-blob packing, so the content
+/// shares the tree nodes' scratch segment.
+pub const FUSED_CONTENT_LIMIT: usize = 192 * 1024;
+
 pub struct StagedFileContent {
-    data: vibeos_segment_store::FsPersistentData,
+    source: StagedContentSource,
+}
+
+enum StagedContentSource {
+    Persistent(vibeos_segment_store::FsPersistentData),
+    Inline(Vec<u8>),
 }
 
 impl FsContentStager {
@@ -401,6 +413,17 @@ impl FsContentStager {
     }
 
     pub async fn finish(mut self) -> Result<StagedFileContent, FileError> {
+        if self.tail.is_none()
+            && self.staged.is_empty()
+            && !self.pending.is_empty()
+            && self.pending.len() <= FUSED_CONTENT_LIMIT
+        {
+            // Nothing reached the backend yet: let the committing transaction
+            // publish this content under its own checkpoint.
+            return Ok(StagedFileContent {
+                source: StagedContentSource::Inline(core::mem::take(&mut self.pending)),
+            });
+        }
         if !self.pending.is_empty() {
             self.staged.push(core::mem::take(&mut self.pending));
         }
@@ -410,7 +433,7 @@ impl FsContentStager {
             self.tail = Some(self.backend.stage_chunk(None, Vec::new()).await?);
         }
         Ok(StagedFileContent {
-            data: self.tail.ok_or(FileError::InvalidType)?,
+            source: StagedContentSource::Persistent(self.tail.ok_or(FileError::InvalidType)?),
         })
     }
 }
@@ -885,6 +908,15 @@ impl FsTransaction {
         staged: StagedFileContent,
     ) -> Result<(), FileError> {
         let generation = self.next_generation()?;
+        let content = match staged.source {
+            StagedContentSource::Persistent(data) => Content::PersistentFile(data),
+            StagedContentSource::Inline(bytes) => Content::File(
+                bytes
+                    .chunks(DATA_CHUNK_SIZE)
+                    .map(Arc::<[u8]>::from)
+                    .collect(),
+            ),
+        };
         match self.working.resolve(path, true) {
             Ok(id) => {
                 self.charge(1)?;
@@ -899,7 +931,7 @@ impl FsTransaction {
                 if inode.file_type != FileType::Regular {
                     return Err(FileError::InvalidType);
                 }
-                inode.content = Content::PersistentFile(staged.data);
+                inode.content = content;
                 inode.change_generation = generation;
             }
             Err(FileError::NotFound) => {
@@ -911,7 +943,7 @@ impl FsTransaction {
                 let id = self.working.allocate(Inode {
                     file_type: FileType::Regular,
                     change_generation: generation,
-                    content: Content::PersistentFile(staged.data),
+                    content,
                 })?;
                 self.working.dirents.insert((parent, name), id);
             }

@@ -1,0 +1,39 @@
+{
+  "sdk_commit": "1fd6bac9f2efde47fbb8afd28d2903c49f893e3f",
+  "sources": [
+    {
+      "url": "https://github.com/milkv-mars/mars-buildroot-sdk/blob/1fd6bac9f2efde47fbb8afd28d2903c49f893e3f/linux/drivers/clk/starfive/clk-starfive-jh7110-stg.c",
+      "local_reference": "target/mars-reference/stage39-stg.c",
+      "sha256": "772d4ccf60ed2cfc80cf97d7115898e357c2402d46bcf268900355a6a44ad65f"
+    },
+    {
+      "url": "https://github.com/milkv-mars/mars-buildroot-sdk/blob/1fd6bac9f2efde47fbb8afd28d2903c49f893e3f/linux/drivers/clk/starfive/clk-starfive-jh7110-gen.c",
+      "local_reference": "target/mars-reference/stage39-gen.c",
+      "sha256": "4b58c8c6522033475e8772a7b550a60d6dd50eef0d7854474b6ad2496eb79c9d"
+    },
+    {
+      "url": "https://github.com/milkv-mars/mars-buildroot-sdk/blob/1fd6bac9f2efde47fbb8afd28d2903c49f893e3f/linux/drivers/reset/starfive/reset-starfive-jh7110.c",
+      "local_reference": "target/mars-reference/stage39-reset.c",
+      "sha256": "52221c11a2878531d740ceca99d6255c15ab2b2db48b6c71e8ae3220bae9c252"
+    }
+  ],
+  "stg_crg_base": "0x10230000",
+  "clock_gate_offsets": [
+    "0x3c",
+    "0x40"
+  ],
+  "clock_gate_bit": 31,
+  "reset_offset": "0x74",
+  "status_offset": "0x78",
+  "reset_bit": 3,
+  "status_when_asserted": 0,
+  "status_when_released": 8,
+  "timeout_microseconds": 1000,
+  "parent": "JH7110_STG_AXIAHB (owner prerequisite, not changed here)",
+  "shared_clients": [
+    "TRNG",
+    "crypto",
+    "security DMA"
+  ],
+  "physical_acceptance": false
+}

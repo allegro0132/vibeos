@@ -46,6 +46,8 @@ fn pinned_node_retains_shared_reset_scope_and_exact_resources() {
     assert_eq!(r.registers, mars::TRNG_REGISTERS);
     assert_eq!(r.irq, 30);
     assert_eq!(r.sys_crg, mars::SYS_CRG);
+    assert_eq!(r.stg_crg, mars::STG_CRG);
+    assert_eq!(r.stg_crg.start, 0x10230000);
     assert_eq!(r.clock_ids, [205, 206]);
     assert_eq!(r.reset_id, 131);
     assert_eq!(r.reset_scope, ResetScope::SharedSecuritySubsystem);

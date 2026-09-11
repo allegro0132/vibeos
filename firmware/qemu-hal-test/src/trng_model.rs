@@ -58,6 +58,7 @@ impl Registers for Model {
     }
 }
 pub fn run() {
+    platform_model();
     let mut trng = Trng::new(Model::new(false, false), 4_000_000, 4).unwrap();
     trng.initialize().unwrap();
     let first = trng.read_block().unwrap();
@@ -70,4 +71,62 @@ pub fn run() {
     let mut trng = Trng::new(Model::new(false, true), 4_000_000, 4).unwrap();
     assert_eq!(trng.initialize(), Err(Error::TimedOut));
     assert_eq!(trng.initialize(), Err(Error::NotReady));
+}
+
+fn platform_model() {
+    use vibeos_platform_jh7110::security::{Domain, Registers as PlatformRegisters};
+    struct Crg {
+        gates: [u32; 2],
+        reset: u32,
+    }
+    impl PlatformRegisters for Crg {
+        fn read(&mut self, o: usize) -> u32 {
+            match o {
+                0x3c => self.gates[0],
+                0x40 => self.gates[1],
+                0x74 => self.reset,
+                0x78 => !self.reset,
+                _ => panic!("STG read"),
+            }
+        }
+        fn write(&mut self, o: usize, v: u32) {
+            match o {
+                0x3c | 0x40 => {
+                    if v & (1 << 31) == 0 {
+                        assert_ne!(self.reset & 8, 0);
+                    }
+                    self.gates[(o - 0x3c) / 4] = v;
+                }
+                0x74 => {
+                    assert!(self.gates.iter().all(|g| g & (1 << 31) != 0));
+                    assert_eq!(v & !8, 0x50);
+                    self.reset = v;
+                }
+                _ => panic!("STG write"),
+            }
+        }
+        fn ticks(&mut self) -> u64 {
+            0
+        }
+    }
+    let mut domain = unsafe {
+        Domain::new_exclusive(
+            Crg {
+                gates: [0; 2],
+                reset: 0x50,
+            },
+            4_000_000,
+        )
+        .unwrap()
+    };
+    domain.prepare().unwrap();
+    assert!(domain.ready());
+    unsafe {
+        domain.stop().unwrap();
+    }
+    assert!(!domain.ready());
+    domain.prepare().unwrap();
+    unsafe {
+        domain.stop().unwrap();
+    }
 }

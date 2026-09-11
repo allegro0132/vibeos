@@ -46,6 +46,7 @@ unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
     #[cfg(feature = "trng-model-test")]
     {
         trng_model::run();
+        _print(format_args!("JH7110_SEC_MODEL PASS gates=STG reset=shared bit=3 stopped=acknowledged\n"));
         _print(format_args!("JH7110_TRNG_MODEL PASS reseed=per-block failure=no-output entropy=unqualified\n"));
     }
     #[cfg(feature = "eqos-model-test")]
@@ -83,6 +84,7 @@ unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
         let trng = vibeos_bsp_milkv_mars::trng_resources::admit(trng_fixture)
             .expect("Mars TRNG resource admission");
         assert_eq!(trng.registers.start, 0x1600c000);
+        assert_eq!(trng.stg_crg.start, 0x10230000);
         assert_eq!(trng.clock_ids, [205, 206]);
         assert_eq!(trng.reset_scope, vibeos_bsp_milkv_mars::trng_resources::ResetScope::SharedSecuritySubsystem);
         _print(format_args!("MARS_TRNG_RESOURCES PASS irq=30 reset=shared-security entropy=unqualified\n"));

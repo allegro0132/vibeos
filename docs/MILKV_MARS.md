@@ -1146,3 +1146,35 @@ resource description is not yet used by production firmware: its MMIO mapping,
 platform clock/shared-reset lifecycle, HAL integration and physical entropy
 qualification remain work before SSH can be enabled. No physical port was
 opened or board state changed by this stage.
+
+### Shared SEC_TOP platform lifecycle
+
+`platform/jh7110/src/security.rs` now owns the two SEC clock gates and the
+shared reset sequence. The vendor IDs 205/206 select STG CRG offsets `0x3c`
+and `0x40`; reset ID 131 selects bit 3 of STG `0x74`, with acknowledgement at
+`0x78`. The BSP resource description now supplies STG CRG at `0x10230000` in
+addition to SYS CRG. These controls must not be addressed through SYS CRG.
+
+Creating the domain requires explicit exclusive ownership of every SEC_TOP
+client (TRNG, crypto and security DMA), a retained parent STG bus clock and
+serialized CRG access. Preparation enables only the two child gates, asserts
+and verifies reset, then releases and verifies it. Stop requires child
+invocations to have ceased, asserts reset and waits before disabling clocks.
+Readback errors or a bounded timeout retain a faulted owner; no Drop handler or
+automatic retry resets hardware. Unrelated register bits are preserved.
+
+Seven new platform tests cover ordering, partial writes, both reset directions,
+wrapped timers, a frozen timer's poll limit, idempotent stop and invalid MMIO
+apertures. Together with the existing platform/BSP tests, 56 host tests pass.
+RV64 executes the same lifecycle with modeled STG registers and reports
+`JH7110_SEC_MODEL PASS`, alongside the TRNG/resource models and 395 kernel
+selftests. Mutations removing reset acknowledgement, gating before reset,
+broadening the reset mask and removing the deadline are detected. Source and
+evidence records are `boards/milkv-mars/security-platform-reference.json` and
+`boards/milkv-mars/security-platform-evidence.json`.
+
+These are protocol models, not physical stop/clock proofs. Production firmware
+still needs to map STG/TRNG, establish this exclusive ownership and the parent
+clock prerequisite, register the entropy service and collect physical entropy
+evidence. The domain does not reprogram parent clocks or infer entropy quality.
+SSH remains disabled in the existing test SD image.

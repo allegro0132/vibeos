@@ -90,3 +90,39 @@ The powered-off Storage v2 verifier and `fsck.ext4 -fn` remain correctness
 gates outside timed regions. The update command requires both evidence records,
 a clean recorded Git worktree, and every explicitly backend-scoped manifest
 coordinate. A failed correctness gate or partial matrix blocks baseline update.
+
+## Read-path attribution and focused regression
+
+For `object-range-get`, `latency_ns` includes the initial durable put. Compare
+`get_latency_ns` to measure just the range read. Linux range-get and large-object
+samples now report both put/get phase latency alongside their composite total.
+VibeOS records expose `phases.put_*` and `phases.get_*` I/O counts and bytes;
+get counters are total minus put, and inconsistent totals are rejected. Zero
+device reads may reflect the existing caches, not zero verification work.
+
+The CAS streaming reader uses a 64 KiB content window and up to 16 hash pages,
+all local to one invocation. The object range API authenticates the needed
+envelope bytes with native CAS proofs and then verifies the outer blob proof.
+Persistent/transient authority checks and small-object hot-cache generation
+checks remain in place. The disk format is unchanged.
+
+The focused 1 MiB host regression reduced PageDevice read requests from 781 to
+34 and pages from 793 to 286, compared with the original CAS implementation
+using the same harness. These are deterministic I/O counts, not wall-clock
+speedup claims. The regression also checks unaligned and out-of-bounds ranges:
+
+```sh
+cargo test -p vibeos-segment-store --test perf_steady_state \
+  large_object_append_and_cold_recover -- --nocapture
+cargo test -p vibeos-segment-store --test cas_streaming
+cargo test -p vibeos-object-store
+python3 -m unittest scripts/test_storage_bench.py
+```
+
+The 2026-09-11 QEMU smoke runs passed for 4 KiB and 128 KiB range workloads,
+and for range/full reads of 1 MiB objects. For the latter, get performed 28
+device reads / 167,936 bytes for a 4 KiB range versus 40 reads / 1,216,512 bytes
+for the whole object. Short-run latency variance was too high for formal
+qualification. Repeated manifest resolution and nested-proof work remain
+optimization opportunities. Local logs, JSONL and the detailed report are in
+`target/storage-read-optimization-20260911/`; the formal baseline is unchanged.

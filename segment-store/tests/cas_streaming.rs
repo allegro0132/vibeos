@@ -669,6 +669,22 @@ fn corrupted_content_and_required_proof_bytes_fail_closed() {
 }
 
 #[test]
+fn read_windows_do_not_hide_corruption_between_invocations() {
+    let device = FaultDevice::blank(16);
+    let mut store = format(device.clone());
+    let object = put_stream(&mut store, 1024 * 1024 + 4097);
+    block_on(store.verify_blob(&object)).unwrap();
+    block_on(store.get_blob_chunk(&object, 0)).unwrap();
+
+    // Keep the mounted store and authority intact: only the payload changes.
+    // A window accidentally retained across calls would hide this damage.
+    let first = pattern_chunk(0, PAGE_SIZE);
+    device.flip_durable_page_with_prefix(&first[..64], 7);
+    assert!(block_on(store.get_blob_chunk(&object, 0)).is_err());
+    assert!(block_on(store.verify_blob(&object)).is_err());
+}
+
+#[test]
 fn identical_streams_share_one_blob_but_publish_independent_revocable_objects() {
     let exact_len = 1024 * 1024 + 4097;
     let device = FaultDevice::blank(20);

@@ -489,10 +489,39 @@ fn large_object_append_and_cold_recover() {
         records = next_records;
         expected_objects += 1;
         assert_eq!(view.objects().len(), expected_objects);
+        let handle = view.objects().last().unwrap();
+        device.epoch_counters();
         assert_eq!(
-            block_on(store.read_persistent_object(view.objects().last().unwrap())).unwrap(),
+            block_on(store.read_persistent_object(handle)).unwrap(),
             object_payload
         );
+        let full = device.epoch_counters();
+        assert!(full.read_requests < 64, "streaming read lost batching: {full:?}");
+        assert!(full.reads < 320, "streaming verification reread payload/hash pages: {full:?}");
+        // Unaligned reads cross native CAS leaves without materializing the
+        // full object. Include both extent edges and the final partial range.
+        for (offset, len) in [
+            (0, 0),
+            (0, 4096),
+            (127, 4096),
+            (1024 * 1024 - 13, 13),
+            (1024 * 1024, 0),
+        ] {
+            let bytes = block_on(store.read_persistent_object_range(handle, offset, len)).unwrap();
+            assert_eq!(
+                bytes,
+                object_payload[offset as usize..offset as usize + len]
+            );
+            let range = device.epoch_counters();
+            println!("range round={round} offset={offset} len={len} reads={} requests={} full_reads={} full_requests={}",
+                range.reads, range.read_requests, full.reads, full.read_requests);
+            assert!(
+                range.read_bytes < full.read_bytes / 2,
+                "directed read scanned full payload"
+            );
+        }
+        assert!(block_on(store.read_persistent_object_range(handle, u64::MAX, 1)).is_err());
+        assert!(block_on(store.read_persistent_object_range(handle, 1024 * 1024, 1)).is_err());
     }
     drop(store);
     // Cold recovery must reassemble the multi-extent authority payload.

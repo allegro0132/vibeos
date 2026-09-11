@@ -1356,6 +1356,15 @@ impl StorageV2Runtime {
         cached: &Weak<[u8]>,
         expected_generation: u64,
     ) -> Result<Option<Vec<u8>>, vibeos_object_store::StoreError> {
+        self.read_hot_range(cached, expected_generation, None)
+    }
+
+    fn read_hot_range(
+        &self,
+        cached: &Weak<[u8]>,
+        expected_generation: u64,
+        range: Option<(u64, usize)>,
+    ) -> Result<Option<Vec<u8>>, vibeos_object_store::StoreError> {
         let Some(bytes) = cached.upgrade() else {
             return Ok(None);
         };
@@ -1384,7 +1393,15 @@ impl StorageV2Runtime {
             // fails closed only if the object is genuinely unresolvable.
             return Ok(None);
         }
-        let output = bytes.as_ref().to_vec();
+        let selected = match range {
+            None => bytes.as_ref(),
+            Some((offset, len)) => usize::try_from(offset)
+                .ok()
+                .and_then(|start| start.checked_add(len).map(|end| (start, end)))
+                .and_then(|(start, end)| bytes.get(start..end))
+                .ok_or(vibeos_object_store::StoreError::ObjectUnavailable)?,
+        };
+        let output = selected.to_vec();
         drop(authority);
         drop(active);
         Ok(Some(output))
@@ -4334,6 +4351,83 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                 );
             }
             Ok(snapshot)
+        })
+    }
+
+    fn read_object_range<'a>(
+        &'a self,
+        object: &'a vibeos_object_store::StorageV2ObjectToken,
+        offset: u64,
+        len: usize,
+    ) -> vibeos_object_store::StorageV2Future<'a, Vec<u8>> {
+        let hot = (|| {
+            let installed_current = INSTALLED_V2_RUNTIME
+                .lock()
+                .as_ref()
+                .is_some_and(|runtime| core::ptr::eq(runtime.as_ref(), self));
+            if !installed_current {
+                return Err(vibeos_object_store::StoreError::Corrupt);
+            }
+            let token = object
+                .downcast_ref::<StorageV2ReadToken>()
+                .ok_or(vibeos_object_store::StoreError::ObjectUnavailable)?;
+            let (cached, generation) = match token {
+                StorageV2ReadToken::Persistent {
+                    cached,
+                    authority_generation,
+                    ..
+                }
+                | StorageV2ReadToken::Transient {
+                    cached,
+                    authority_generation,
+                    ..
+                } => (cached, *authority_generation),
+            };
+            match cached.as_ref() {
+                Some(cached) => self.read_hot_range(cached, generation, Some((offset, len))),
+                None => Ok(None),
+            }
+        })();
+        match hot {
+            Ok(Some(bytes)) => return Box::pin(async move { Ok(bytes) }),
+            Err(error) => return Box::pin(async move { Err(error) }),
+            Ok(None) => {}
+        }
+        Box::pin(async move {
+            let runtime = INSTALLED_V2_RUNTIME
+                .lock()
+                .as_ref()
+                .filter(|runtime| core::ptr::eq(runtime.as_ref(), self))
+                .cloned()
+                .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            let token = object
+                .downcast_ref::<StorageV2ReadToken>()
+                .ok_or(vibeos_object_store::StoreError::ObjectUnavailable)?;
+            let mut operation = runtime.begin().map_err(map_facade_error)?;
+            let result = match token {
+                StorageV2ReadToken::Persistent { handle, .. } => {
+                    poll_as_system(
+                        operation
+                            .store()
+                            .read_persistent_object_range(handle, offset, len),
+                    )
+                    .await
+                }
+                StorageV2ReadToken::Transient {
+                    witness, recovered, ..
+                } => {
+                    poll_as_system(
+                        operation
+                            .store()
+                            .read_transient_object_range(witness, recovered, offset, len),
+                    )
+                    .await
+                }
+            };
+            operation.finish();
+            result
+                .map_err(map_persistent_read_error)
+                .map_err(map_facade_error)
         })
     }
 

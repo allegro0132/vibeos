@@ -1563,6 +1563,7 @@ impl<D: PageDevice> SegmentStore<D> {
         index: u32,
     ) -> Result<VerifiedCasChunk, CasStoreError<D::Error>> {
         let read_pin = self.pin_blob_reader(object)?;
+        let mut reader = ManifestRangeReader::new(false);
         let (descriptor, manifest) = self.resolve_authorized_manifest(object).await?;
         let geometry = BlobGeometry::for_len(descriptor.byte_len)?;
         if index >= geometry.leaf_count() {
@@ -1580,14 +1581,15 @@ impl<D: PageDevice> SegmentStore<D> {
         let bytes = if chunk_len == 0 {
             Vec::new()
         } else {
-            read_manifest_range(
-                &self.device,
-                self.mounted.as_ref().ok_or(StoreError::NotMounted)?,
-                &manifest,
-                content_offset,
-                chunk_len,
-            )
-            .await?
+            reader
+                .read(
+                    &self.device,
+                    self.mounted.as_ref().ok_or(StoreError::NotMounted)?,
+                    &manifest,
+                    content_offset,
+                    chunk_len,
+                )
+                .await?
         };
         let mut siblings = Vec::new();
         siblings
@@ -1604,14 +1606,15 @@ impl<D: PageDevice> SegmentStore<D> {
                 .ok()
                 .and_then(|offset| offset.checked_add((node_index * HASH_SIZE) as u64))
                 .ok_or(StoreError::Corrupt)?;
-            let node = read_manifest_range(
-                &self.device,
-                self.mounted.as_ref().ok_or(StoreError::NotMounted)?,
-                &manifest,
-                node_offset,
-                HASH_SIZE,
-            )
-            .await?;
+            let node = reader
+                .read(
+                    &self.device,
+                    self.mounted.as_ref().ok_or(StoreError::NotMounted)?,
+                    &manifest,
+                    node_offset,
+                    HASH_SIZE,
+                )
+                .await?;
             siblings.push(
                 node.as_slice()
                     .try_into()
@@ -1951,6 +1954,7 @@ async fn verify_resolved_blob<D: PageDevice>(
     manifest: &BlobManifest,
 ) -> Result<(), CasStoreError<D::Error>> {
     let geometry = BlobGeometry::for_len(descriptor.byte_len)?;
+    let mut reader = ManifestRangeReader::new(true);
     let mut builder = StreamingMerkle::begin(
         descriptor.object_kind,
         descriptor.byte_len,
@@ -1965,22 +1969,39 @@ async fn verify_resolved_blob<D: PageDevice>(
             .byte_len
             .saturating_sub(u64::from(index) * LEAF_SIZE as u64)
             .min(LEAF_SIZE as u64) as usize;
-        let bytes = read_manifest_range(
-            device,
-            state,
-            manifest,
-            HEADER_SIZE as u64 + u64::from(index) * LEAF_SIZE as u64,
-            chunk_len,
-        )
-        .await?;
+        let bytes = reader
+            .read(
+                device,
+                state,
+                manifest,
+                HEADER_SIZE as u64 + u64::from(index) * LEAF_SIZE as u64,
+                chunk_len,
+            )
+            .await?;
         builder
             .push_chunk(index, &bytes)
             .map_err(map_streaming_error)?;
-        verify_tree_emissions(device, state, manifest, geometry, builder.sink_mut().take()).await?;
+        verify_tree_emissions(
+            &mut reader,
+            device,
+            state,
+            manifest,
+            geometry,
+            builder.sink_mut().take(),
+        )
+        .await?;
     }
     while builder.padding_remaining().map_err(map_streaming_error)? != 0 {
         builder.pad_next().map_err(map_streaming_error)?;
-        verify_tree_emissions(device, state, manifest, geometry, builder.sink_mut().take()).await?;
+        verify_tree_emissions(
+            &mut reader,
+            device,
+            state,
+            manifest,
+            geometry,
+            builder.sink_mut().take(),
+        )
+        .await?;
     }
     let computed = builder.finalize().map_err(map_streaming_error)?;
     if computed.descriptor != descriptor {
@@ -1996,6 +2017,7 @@ async fn read_and_verify_resolved_blob<D: PageDevice>(
     manifest: &BlobManifest,
 ) -> Result<Vec<u8>, CasStoreError<D::Error>> {
     let geometry = BlobGeometry::for_len(descriptor.byte_len)?;
+    let mut reader = ManifestRangeReader::new(true);
     let exact_len = usize::try_from(descriptor.byte_len).map_err(|_| StoreError::MemoryLimit)?;
     let mut output = Vec::new();
     output
@@ -2015,23 +2037,40 @@ async fn read_and_verify_resolved_blob<D: PageDevice>(
             .byte_len
             .saturating_sub(u64::from(index) * LEAF_SIZE as u64)
             .min(LEAF_SIZE as u64) as usize;
-        let bytes = read_manifest_range(
-            device,
-            state,
-            manifest,
-            HEADER_SIZE as u64 + u64::from(index) * LEAF_SIZE as u64,
-            chunk_len,
-        )
-        .await?;
+        let bytes = reader
+            .read(
+                device,
+                state,
+                manifest,
+                HEADER_SIZE as u64 + u64::from(index) * LEAF_SIZE as u64,
+                chunk_len,
+            )
+            .await?;
         builder
             .push_chunk(index, &bytes)
             .map_err(map_streaming_error)?;
         output.extend_from_slice(&bytes);
-        verify_tree_emissions(device, state, manifest, geometry, builder.sink_mut().take()).await?;
+        verify_tree_emissions(
+            &mut reader,
+            device,
+            state,
+            manifest,
+            geometry,
+            builder.sink_mut().take(),
+        )
+        .await?;
     }
     while builder.padding_remaining().map_err(map_streaming_error)? != 0 {
         builder.pad_next().map_err(map_streaming_error)?;
-        verify_tree_emissions(device, state, manifest, geometry, builder.sink_mut().take()).await?;
+        verify_tree_emissions(
+            &mut reader,
+            device,
+            state,
+            manifest,
+            geometry,
+            builder.sink_mut().take(),
+        )
+        .await?;
     }
     let computed = builder.finalize().map_err(map_streaming_error)?;
     if computed.descriptor != descriptor || output.len() != exact_len {
@@ -2052,6 +2091,7 @@ impl<D: PageDevice> Drop for BlobWriter<'_, D> {
 }
 
 async fn verify_tree_emissions<D: PageDevice>(
+    reader: &mut ManifestRangeReader,
     device: &D,
     state: &MountedState,
     manifest: &BlobManifest,
@@ -2066,12 +2106,172 @@ async fn verify_tree_emissions<D: PageDevice>(
         let offset = tree_offset
             .checked_add(u64::from(emission.index) * HASH_SIZE as u64)
             .ok_or(StoreError::Corrupt)?;
-        let stored = read_manifest_range(device, state, manifest, offset, HASH_SIZE).await?;
+        let stored = reader
+            .read(device, state, manifest, offset, HASH_SIZE)
+            .await?;
         if stored.as_slice() != emission.hash {
             return Err(StoreError::Corrupt.into());
         }
     }
     Ok(())
+}
+
+/// Per-invocation windows: at most 64 KiB of content and 16 hash pages.
+/// The hash-page LRU retains upper tree levels while leaves stream past;
+/// no observation survives a read operation.
+#[derive(Default)]
+struct ReadWindow {
+    first: u64,
+    pages: Vec<Page>,
+    last_used: u64,
+}
+
+struct ManifestRangeReader {
+    windows: [ReadWindow; 17],
+    read_ahead: bool,
+    clock: u64,
+}
+
+impl ManifestRangeReader {
+    fn new(read_ahead: bool) -> Self {
+        Self {
+            windows: Default::default(),
+            read_ahead,
+            clock: 0,
+        }
+    }
+
+    async fn read<D: PageDevice>(
+        &mut self,
+        device: &D,
+        state: &MountedState,
+        manifest: &BlobManifest,
+        encoded_offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, CasStoreError<D::Error>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let len_u64 = u64::try_from(len).map_err(|_| StoreError::Corrupt)?;
+        let encoded_end = encoded_offset
+            .checked_add(len_u64)
+            .ok_or(StoreError::Corrupt)?;
+        if encoded_end > manifest.encoded_blob_len {
+            return Err(StoreError::Corrupt.into());
+        }
+        let declared = manifest
+            .extents
+            .iter()
+            .find(|extent| {
+                extent
+                    .encoded_offset
+                    .checked_add(extent.payload_byte_len)
+                    .is_some_and(|extent_end| {
+                        encoded_offset >= extent.encoded_offset && encoded_end <= extent_end
+                    })
+            })
+            .ok_or(StoreError::Corrupt)?;
+        let PhysicalPointer::Value(pointer) = declared.pointer else {
+            return Err(StoreError::Corrupt.into());
+        };
+        if pointer.store_uuid != state.superblock.binding.store_uuid
+            || pointer.segment_no >= state.admitted_segments
+            || pointer.segment_generation == 0
+            || pointer.segment_generation >= state.next_segment_generation
+            || pointer.extent_kind != ExtentKind::Blob
+            || pointer.exact_byte_len != declared.payload_byte_len
+        {
+            return Err(StoreError::Corrupt.into());
+        }
+        let within = encoded_offset - declared.encoded_offset;
+        let first_page = within / PAGE_SIZE as u64;
+        let first_byte =
+            usize::try_from(within % PAGE_SIZE as u64).map_err(|_| StoreError::Corrupt)?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(len)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        output.resize(len, 0);
+        let base = segment_base_page(pointer.segment_no)?;
+        let mut copied = 0_usize;
+        let mut page_index = first_page;
+        while copied != len {
+            let physical = base
+                .checked_add(u64::from(pointer.payload_relative_page))
+                .and_then(|value| value.checked_add(page_index))
+                .ok_or(StoreError::Corrupt)?;
+            // Keep content read-ahead separate from hash-node reads so the
+            // verifier's interleaved proof work cannot evict the payload window.
+            let slot = if len == HASH_SIZE {
+                self.windows
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find(|(_, window)| window.first == physical && !window.pages.is_empty())
+                    .map(|(slot, _)| slot)
+                    .unwrap_or_else(|| {
+                        self.windows
+                            .iter()
+                            .enumerate()
+                            .skip(1)
+                            .min_by_key(|(_, window)| window.last_used)
+                            .unwrap()
+                            .0
+                    })
+            } else {
+                0
+            };
+            self.clock += 1;
+            let window = &mut self.windows[slot];
+            window.last_used = self.clock;
+            if physical < window.first || physical - window.first >= window.pages.len() as u64 {
+                let extent_pages = declared.payload_byte_len.div_ceil(PAGE_SIZE as u64);
+                let remaining = extent_pages
+                    .checked_sub(page_index)
+                    .ok_or(StoreError::Corrupt)?;
+                let wanted = if len == HASH_SIZE {
+                    1
+                } else if self.read_ahead {
+                    16
+                } else {
+                    (len - copied
+                        + if page_index == first_page {
+                            first_byte
+                        } else {
+                            0
+                        })
+                    .div_ceil(PAGE_SIZE)
+                    .min(16)
+                };
+                let count = remaining.min(wanted as u64) as usize;
+                window.pages.clear();
+                window
+                    .pages
+                    .try_reserve_exact(count)
+                    .map_err(|_| StoreError::MemoryLimit)?;
+                window.pages.resize(count, [0; PAGE_SIZE]);
+                // Invalidate before awaiting: a failed read must never leave a
+                // partially filled buffer addressable as a successful snapshot.
+                window.first = u64::MAX;
+                device
+                    .read_pages(physical, &mut window.pages)
+                    .await
+                    .map_err(StoreError::Device)?;
+                window.first = physical;
+            }
+            let page = &window.pages[(physical - window.first) as usize];
+            let in_page = if page_index == first_page {
+                first_byte
+            } else {
+                0
+            };
+            let take = (len - copied).min(PAGE_SIZE - in_page);
+            output[copied..copied + take].copy_from_slice(&page[in_page..in_page + take]);
+            copied += take;
+            page_index = page_index.checked_add(1).ok_or(StoreError::Corrupt)?;
+        }
+        Ok(output)
+    }
 }
 
 pub(crate) async fn read_manifest_range<D: PageDevice>(
@@ -2081,72 +2281,9 @@ pub(crate) async fn read_manifest_range<D: PageDevice>(
     encoded_offset: u64,
     len: usize,
 ) -> Result<Vec<u8>, CasStoreError<D::Error>> {
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    let len_u64 = u64::try_from(len).map_err(|_| StoreError::Corrupt)?;
-    let encoded_end = encoded_offset
-        .checked_add(len_u64)
-        .ok_or(StoreError::Corrupt)?;
-    if encoded_end > manifest.encoded_blob_len {
-        return Err(StoreError::Corrupt.into());
-    }
-    let declared = manifest
-        .extents
-        .iter()
-        .find(|extent| {
-            extent
-                .encoded_offset
-                .checked_add(extent.payload_byte_len)
-                .is_some_and(|extent_end| {
-                    encoded_offset >= extent.encoded_offset && encoded_end <= extent_end
-                })
-        })
-        .ok_or(StoreError::Corrupt)?;
-    let PhysicalPointer::Value(pointer) = declared.pointer else {
-        return Err(StoreError::Corrupt.into());
-    };
-    if pointer.store_uuid != state.superblock.binding.store_uuid
-        || pointer.segment_no >= state.admitted_segments
-        || pointer.segment_generation == 0
-        || pointer.segment_generation >= state.next_segment_generation
-        || pointer.extent_kind != ExtentKind::Blob
-        || pointer.exact_byte_len != declared.payload_byte_len
-    {
-        return Err(StoreError::Corrupt.into());
-    }
-    let within = encoded_offset - declared.encoded_offset;
-    let first_page = within / PAGE_SIZE as u64;
-    let first_byte = usize::try_from(within % PAGE_SIZE as u64).map_err(|_| StoreError::Corrupt)?;
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(len)
-        .map_err(|_| StoreError::MemoryLimit)?;
-    output.resize(len, 0);
-    let base = segment_base_page(pointer.segment_no)?;
-    let mut copied = 0_usize;
-    let mut page_index = first_page;
-    while copied != len {
-        let mut page = heap_page();
-        let physical = base
-            .checked_add(u64::from(pointer.payload_relative_page))
-            .and_then(|value| value.checked_add(page_index))
-            .ok_or(StoreError::Corrupt)?;
-        device
-            .read_page(physical, &mut page)
-            .await
-            .map_err(StoreError::Device)?;
-        let in_page = if page_index == first_page {
-            first_byte
-        } else {
-            0
-        };
-        let take = (len - copied).min(PAGE_SIZE - in_page);
-        output[copied..copied + take].copy_from_slice(&page[in_page..in_page + take]);
-        copied += take;
-        page_index = page_index.checked_add(1).ok_or(StoreError::Corrupt)?;
-    }
-    Ok(output)
+    ManifestRangeReader::new(false)
+        .read(device, state, manifest, encoded_offset, len)
+        .await
 }
 
 impl<'a, D: PageDevice> BlobWriter<'a, D> {

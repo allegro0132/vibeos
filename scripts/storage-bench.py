@@ -234,6 +234,12 @@ def convert_guest_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
                 value = sample.get(name)
                 require(isinstance(value, int) and value >= 0, f"missing {name}")
                 phases["put_" + name.removeprefix("put_block_")] = value
+                total_name = name.removeprefix("put_")
+                if total_name in sample:
+                    total = sample[total_name]
+                    require(isinstance(total, int) and total >= value,
+                            f"{total_name} is smaller than its put phase")
+                    phases["get_" + name.removeprefix("put_block_")] = total - value
         for name in ("authority_objects", "authority_records", "cas_payloads_verified",
                      "allocated_segments", "free_segments", "cleaner_reserved_segments"):
             if name in sample:
@@ -285,7 +291,7 @@ def convert_linux_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
             require(isinstance(value, int) and value > 0, "missing latency_ns")
             metrics["latency_ns"] = float(value)
             phases["latency_total_ns"] = value
-        else:
+        if "latency_ns" not in sample or "put_ns" in sample or "get_ns" in sample:
             for source, target in (("put_ns", "put_latency_ns"), ("get_ns", "get_latency_ns")):
                 value = sample.get(source)
                 require(isinstance(value, int) and value > 0, f"missing {source}")

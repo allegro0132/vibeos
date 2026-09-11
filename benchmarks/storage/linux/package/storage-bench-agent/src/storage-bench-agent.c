@@ -303,14 +303,19 @@ static int run_extended_workload(const char *workload, const char *directory,
         struct block_stats before, after;
         bool stats_ok = read_block_stats(block_stat, &before);
         fill_payload(payload, (size_t)bytes, seed);
+        uint64_t put_ns = 0, get_ns = 0;
         if (strcmp(workload, "object-range-get") == 0 ||
             strcmp(workload, "object-revoke") == 0 ||
             strcmp(workload, "object-v2-large") == 0) {
             char temporary[64], final[64];
             snprintf(temporary, sizeof(temporary), ".bench-%016" PRIx64 ".tmp", seed);
             snprintf(final, sizeof(final), "bench-%016" PRIx64, seed);
+            uint64_t phase_started = monotonic_ns();
             ok = durable_put(dirfd, temporary, final, payload, readback, (size_t)bytes);
+            put_ns = monotonic_ns() - phase_started;
+            if (put_ns == 0) put_ns = 1;
             operations++;
+            phase_started = monotonic_ns();
             if (ok && strcmp(workload, "object-range-get") == 0) {
                 int fd = openat(dirfd, final, O_RDONLY | O_CLOEXEC);
                 uint64_t offset = bytes == 0 ? 0 : (seed % ((bytes + 4095) / 4096)) * 4096;
@@ -326,6 +331,11 @@ static int run_extended_workload(const char *workload, const char *directory,
             } else if (ok) {
                 ok = unlinkat(dirfd, final, 0) == 0 && fsync(dirfd) == 0;
                 operations++;
+            }
+            if (strcmp(workload, "object-range-get") == 0 ||
+                strcmp(workload, "object-v2-large") == 0) {
+                get_ns = monotonic_ns() - phase_started;
+                if (get_ns == 0) get_ns = 1;
             }
         } else if (strcmp(workload, "file-durable-mutations") == 0 ||
                    strcmp(workload, "file-overwrite-4k") == 0 ||
@@ -410,6 +420,11 @@ static int run_extended_workload(const char *workload, const char *directory,
             ok = false;
         }
         if (ok) {
+            char phase_json[128] = "";
+            if (get_ns != 0) {
+                snprintf(phase_json, sizeof(phase_json),
+                         ",\"put_ns\":%" PRIu64 ",\"get_ns\":%" PRIu64, put_ns, get_ns);
+            }
             printf("VIBE_STORAGE_BENCH {\"schema\":\"vibeos.storage-bench.sample\","
                    "\"version\":1,\"backend\":\"linux-ext4\",\"layer\":\"%s\","
                    "\"workload\":\"%s\",\"object_bytes\":%" PRIu64
@@ -420,7 +435,7 @@ static int run_extended_workload(const char *workload, const char *directory,
                    ",\"block_requests\":%" PRIu64 ",\"block_read_requests\":%" PRIu64
                    ",\"block_write_requests\":%" PRIu64 ",\"block_flush_requests\":%" PRIu64
                    ",\"block_read_bytes\":%" PRIu64 ",\"block_write_bytes\":%" PRIu64
-                   ",\"status\":\"ok\"}\n",
+                   "%s,\"status\":\"ok\"}\n",
                    (strcmp(workload, "object-range-get") == 0 ||
                     strcmp(workload, "object-revoke") == 0 ||
                     strcmp(workload, "object-v2-large") == 0) ? "object" : "file-tree",
@@ -429,7 +444,7 @@ static int run_extended_workload(const char *workload, const char *directory,
                    index < warmups ? "true" : "false", operations, transferred,
                    elapsed == 0 ? 1 : elapsed, elapsed == 0 ? 1 : elapsed,
                    reads + writes + flushes, reads, writes, flushes,
-                   read_bytes, write_bytes);
+                   read_bytes, write_bytes, phase_json);
         } else {
             emit_unsupported_sample("file-tree", workload, bytes, object_count,
                                     seed, index < warmups ? index : index - warmups,

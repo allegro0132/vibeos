@@ -259,6 +259,48 @@ def convert_guest_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
             if value is not None:
                 require(isinstance(value, int) and value >= 0, f"bad {name}")
                 counters[name.removeprefix("block_")] = value
+        file_phase_names = ("stage", "publish", "verify", "remove")
+        if any(name.startswith(tuple(f"file_{phase}_" for phase in file_phase_names))
+               for name in sample):
+            require(sample.get("workload") == "file-sequential", "file phases on another workload")
+            for metric in ("requests", "read_requests", "write_requests", "flush_requests",
+                           "read_bytes", "write_bytes", "used_interrupts"):
+                total = 0
+                for phase in file_phase_names:
+                    name = f"file_{phase}_{metric}"
+                    value = sample.get(name)
+                    require(type(value) is int and value >= 0, f"bad or missing {name}")
+                    phases[name] = value
+                    total += value
+                require(total == counters.get(metric), f"file phase sum differs for {metric}")
+        time_names = [f"file_{phase}_elapsed_ticks" for phase in file_phase_names]
+        if any(name in sample for name in time_names):
+            require(sample.get("workload") == "file-sequential", "file times on another workload")
+            for name in time_names:
+                value = sample.get(name)
+                require(type(value) is int and value >= 0, f"bad or missing {name}")
+                phases[name] = value
+            require(type(sample.get("elapsed_ticks")) is int, "missing elapsed_ticks for file times")
+            require(sum(phases[name] for name in time_names) == sample["elapsed_ticks"],
+                    "file time sum differs from elapsed_ticks")
+        stage_names = [f"file_stage_{part}_ticks" for part in ("pattern", "push", "finish", "other")]
+        if any(name in sample for name in stage_names):
+            require("file_stage_elapsed_ticks" in phases, "missing file phase times for staging details")
+            for name in stage_names:
+                value = sample.get(name)
+                require(type(value) is int and value >= 0, f"bad or missing {name}")
+                phases[name] = value
+            require(sum(phases[name] for name in stage_names) == phases["file_stage_elapsed_ticks"],
+                    "staging detail sum differs from stage elapsed_ticks")
+        verify_names = [f"file_verify_{part}_ticks" for part in ("reader", "pattern", "other")]
+        if any(name in sample for name in verify_names):
+            require("file_verify_elapsed_ticks" in phases, "missing file phase times for verification details")
+            for name in verify_names:
+                value = sample.get(name)
+                require(type(value) is int and value >= 0, f"bad or missing {name}")
+                phases[name] = value
+            require(sum(phases[name] for name in verify_names) == phases["file_verify_elapsed_ticks"],
+                    "verification detail sum differs from verify elapsed_ticks")
         if "put_block_requests" in sample:
             for name in ("put_block_requests", "put_block_read_requests",
                          "put_block_write_requests", "put_block_flush_requests",
@@ -857,6 +899,92 @@ def selftest() -> None:
             pass
         else:
             raise AssertionError("validator accepted a malformed record")
+
+    guest = {"schema": "vibeos.storage-bench.sample", "version": 1,
+             "backend": "storage-v2", "layer": "file-tree", "workload": "file-sequential",
+             "status": "ok", "seed": 1, "timebase_hz": 1000, "latency_ticks": 1}
+    metrics = ("requests", "read_requests", "write_requests", "flush_requests",
+               "read_bytes", "write_bytes", "used_interrupts")
+    for metric in metrics:
+        guest["block_" + metric] = 10
+        for value, phase in enumerate(("stage", "publish", "verify", "remove"), 1):
+            guest[f"file_{phase}_{metric}"] = value
+    def convert(item):
+        return convert_guest_sample(item, run_id="test", vm_index=0, sample_index=0,
+                                    warmup=False, seed=1, env=base["environment"])
+    assert convert(guest)["phases"]["file_remove_read_bytes"] == 4
+    for mutate in (
+        lambda item: item.pop("file_verify_read_bytes"),
+        lambda item: item.update(file_stage_read_bytes=-1),
+        lambda item: item.update(file_stage_read_bytes=True),
+        lambda item: item.update(block_read_bytes=11),
+        lambda item: item.update(workload="object-range-get"),
+    ):
+        candidate = dict(guest)
+        mutate(candidate)
+        try:
+            convert(candidate)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("converter accepted inconsistent file phases")
+    timed = dict(guest, elapsed_ticks=10, transferred_bytes=0)
+    for value, phase in enumerate(("stage", "publish", "verify", "remove"), 1):
+        timed[f"file_{phase}_elapsed_ticks"] = value
+    assert convert(timed)["phases"]["file_verify_elapsed_ticks"] == 3
+    for mutate in (
+        lambda item: item.pop("file_verify_elapsed_ticks"),
+        lambda item: item.update(file_stage_elapsed_ticks=-1),
+        lambda item: item.update(file_stage_elapsed_ticks=True),
+        lambda item: item.update(elapsed_ticks=11),
+        lambda item: item.pop("elapsed_ticks"),
+    ):
+        candidate = dict(timed)
+        mutate(candidate)
+        try:
+            convert(candidate)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("converter accepted inconsistent file phase times")
+    detailed = dict(timed, file_stage_pattern_ticks=0, file_stage_push_ticks=1,
+                    file_stage_finish_ticks=0, file_stage_other_ticks=0)
+    assert convert(detailed)["phases"]["file_stage_push_ticks"] == 1
+    for mutate in (
+        lambda item: item.pop("file_stage_finish_ticks"),
+        lambda item: item.update(file_stage_other_ticks=True),
+        lambda item: item.update(file_stage_push_ticks=-1),
+        lambda item: item.update(file_stage_push_ticks=2),
+        lambda item: item.pop("file_stage_elapsed_ticks"),
+    ):
+        candidate = dict(detailed)
+        mutate(candidate)
+        try:
+            convert(candidate)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("converter accepted inconsistent staging details")
+    verify_details = dict(timed, file_verify_reader_ticks=1,
+                          file_verify_pattern_ticks=1, file_verify_other_ticks=1)
+    assert convert(verify_details)["phases"]["file_verify_reader_ticks"] == 1
+    for mutate in (
+        lambda item: item.pop("file_verify_pattern_ticks"),
+        lambda item: item.update(file_verify_other_ticks=True),
+        lambda item: item.update(file_verify_reader_ticks=-1),
+        lambda item: item.update(file_verify_reader_ticks=2),
+        lambda item: item.pop("file_verify_elapsed_ticks"),
+    ):
+        candidate = dict(verify_details)
+        mutate(candidate)
+        try:
+            convert(candidate)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("converter accepted inconsistent verification details")
+    legacy = {name: value for name, value in guest.items() if not name.startswith("file_")}
+    assert "file_stage_read_bytes" not in convert(legacy)["phases"]
 
 
 def main() -> int:

@@ -51,9 +51,9 @@ use crate::cas_codec::{
 pub const DEFAULT_MAX_STORAGE_PRINCIPALS: u32 = 256;
 
 /// Maximum number of live boot-local object charges which may be waiting for
-/// an exact stable-object binding. The runtime root table has the same hard
-/// bound, so reserving this storage up front keeps the quota lock allocation
-/// free without introducing a second, smaller admission ceiling.
+/// an exact stable-object binding. Persistent admissions reserve these slots
+/// before publication; preallocation keeps binding allocation-free under the
+/// quota lock. This capacity is distinct from byte and principal limits.
 const MAX_PENDING_PERSISTENT_CHARGES: usize = 256;
 
 /// Frozen M7.6 physical-attribution formula version.
@@ -161,6 +161,7 @@ pub struct QuotaDiagnostics {
 pub enum QuotaError {
     InvalidConfiguration,
     PrincipalCapacity,
+    PersistentCandidateCapacity,
     AllocationFailed,
     UnknownPrincipal,
     PrincipalRevoked,
@@ -178,6 +179,7 @@ impl fmt::Display for QuotaError {
         formatter.write_str(match self {
             Self::InvalidConfiguration => "invalid quota configuration",
             Self::PrincipalCapacity => "principal quota table is full",
+            Self::PersistentCandidateCapacity => "persistent charge candidate table is full",
             Self::AllocationFailed => "quota table allocation failed",
             Self::UnknownPrincipal => "principal capability is unavailable",
             Self::PrincipalRevoked => "principal admission is revoked",
@@ -329,6 +331,7 @@ struct QuotaStateData {
     maximum_principals: u32,
     accounts: Vec<PrincipalAccount>,
     persistent_candidates: Vec<PersistentChargeCandidate>,
+    reserved_candidate_slots: usize,
     aggregate: AggregateAccounting,
 }
 
@@ -430,6 +433,7 @@ impl PrincipalQuotaTable {
             state: Arc::new(QuotaState {
                 locked: AtomicBool::new(false),
                 data: UnsafeCell::new(QuotaStateData {
+                    reserved_candidate_slots: 0,
                     maximum_principals,
                     accounts,
                     persistent_candidates,
@@ -931,6 +935,7 @@ impl PrincipalQuotaTable {
             logical_bytes,
             physical_bytes,
             active: true,
+            candidate_slot_reserved: false,
         })
     }
 
@@ -1111,8 +1116,14 @@ impl PrincipalQuotaTable {
                 Err(QuotaError::InvalidConfiguration)
             };
         }
-        if state.persistent_candidates.len() == state.persistent_candidates.capacity() {
-            return Err(QuotaError::PrincipalCapacity);
+        let reserved = charge.candidate_slot_reserved.load(Ordering::Acquire);
+        if !reserved && state.persistent_candidates.len() + state.reserved_candidate_slots
+            >= state.persistent_candidates.capacity()
+        {
+            return Err(QuotaError::PersistentCandidateCapacity);
+        }
+        if charge.candidate_slot_reserved.swap(false, Ordering::AcqRel) {
+            state.reserved_candidate_slots -= 1;
         }
         state.persistent_candidates.push(PersistentChargeCandidate {
             stable_object_id,
@@ -1148,6 +1159,7 @@ pub(crate) struct QuotaReservation {
     logical_bytes: u64,
     physical_bytes: u64,
     active: bool,
+    candidate_slot_reserved: bool,
 }
 
 impl fmt::Debug for QuotaReservation {
@@ -1162,6 +1174,27 @@ impl fmt::Debug for QuotaReservation {
 }
 
 impl QuotaReservation {
+    /// Hold binding-table capacity through asynchronous publication. Other
+    /// reservations and unreserved binders must leave this slot available.
+    pub(crate) fn reserve_persistent_candidate(&mut self) -> Result<(), QuotaError> {
+        if self.candidate_slot_reserved { return Ok(()); }
+        let mut state = self.state.lock();
+        state.persistent_candidates.retain(|candidate| {
+            candidate.charge.upgrade().is_some_and(|charge| {
+                charge.status.load(Ordering::Acquire) != CHARGE_RELEASED
+            })
+        });
+        if state.persistent_candidates.len() + state.reserved_candidate_slots
+            >= state.persistent_candidates.capacity()
+        {
+            record_rejection(&mut state.aggregate);
+            return Err(QuotaError::PersistentCandidateCapacity);
+        }
+        state.reserved_candidate_slots += 1;
+        self.candidate_slot_reserved = true;
+        Ok(())
+    }
+
     /// Commit a non-deduplicated admission.  Principal quota accounting is the
     /// same as [`Self::commit_with_unique_physical`]; this convenience merely
     /// records the full envelope as newly unique aggregate media.
@@ -1262,7 +1295,9 @@ impl QuotaReservation {
             logical_bytes: self.logical_bytes,
             physical_bytes: self.physical_bytes,
         });
+        let candidate_slot_reserved = core::mem::replace(&mut self.candidate_slot_reserved, false);
         Ok(CommittedQuotaCharge {
+            candidate_slot_reserved: AtomicBool::new(candidate_slot_reserved),
             state: Arc::clone(&self.state),
             charge,
             released: false,
@@ -1272,6 +1307,10 @@ impl QuotaReservation {
 
 impl Drop for QuotaReservation {
     fn drop(&mut self) {
+        if self.candidate_slot_reserved {
+            self.state.lock().reserved_candidate_slots -= 1;
+            self.candidate_slot_reserved = false;
+        }
         if !self.active {
             return;
         }
@@ -1321,6 +1360,7 @@ impl Drop for QuotaReservation {
 /// [`PrincipalQuotaTable::account_authority_revoked`] after durable revocation.
 #[must_use = "a committed quota charge must remain attached to its Object authority"]
 pub(crate) struct CommittedQuotaCharge {
+    candidate_slot_reserved: AtomicBool,
     state: Arc<QuotaState>,
     charge: Arc<CommittedChargeState>,
     released: bool,
@@ -1356,7 +1396,10 @@ impl CommittedQuotaCharge {
 
 impl Drop for CommittedQuotaCharge {
     fn drop(&mut self) {
-        // Deliberately no release. See the type-level contract above.
+        // Release only unused table capacity, never committed byte charges.
+        if self.candidate_slot_reserved.swap(false, Ordering::AcqRel) {
+            self.state.lock().reserved_candidate_slots -= 1;
+        }
     }
 }
 
@@ -1570,6 +1613,49 @@ mod tests {
         assert_eq!(diagnostics.committed_physical_bytes, 50);
         assert_eq!(diagnostics.logical_high_water_bytes, 50);
         assert_eq!(diagnostics.physical_high_water_bytes, 100);
+    }
+
+    #[test]
+    fn candidate_slots_are_reserved_until_binding_or_cancellation() {
+        let table = PrincipalQuotaTable::new(1).unwrap();
+        let principal = table.restore_persistent(&[PersistentPrincipalPolicy {
+            principal: StablePrincipalId::new([0x79; 16]).unwrap(),
+            logical_limit_bytes: 100_000,
+            physical_limit_bytes: 100_000,
+            committed_logical_bytes: 0,
+            committed_physical_bytes: 0,
+            admission_revoked: false,
+        }]).unwrap().remove(0);
+        let mut reservations = Vec::new();
+        for _ in 0..MAX_PENDING_PERSISTENT_CHARGES {
+            let mut reservation = table.reserve(&principal, 1, 1, 100_000).unwrap();
+            reservation.reserve_persistent_candidate().unwrap();
+            reservation.reserve_persistent_candidate().unwrap(); // Idempotent.
+            reservations.push(reservation);
+        }
+        let mut denied = table.reserve(&principal, 1, 1, 100_000).unwrap();
+        assert_eq!(denied.reserve_persistent_candidate(),
+                   Err(QuotaError::PersistentCandidateCapacity));
+        drop(denied);
+        let unreserved = table.reserve(&principal, 1, 1, 100_000).unwrap().commit();
+        assert_eq!(table.bind_persistent_candidate(1, 1, &unreserved),
+                   Err(QuotaError::PersistentCandidateCapacity));
+        drop(reservations.pop()); // Cancellation makes exactly one slot available.
+        table.bind_persistent_candidate(1, 1, &unreserved).unwrap();
+        let reserved = reservations.pop().unwrap().commit();
+        table.bind_persistent_candidate(2, 2, &reserved).unwrap();
+        table.bind_persistent_candidate(2, 2, &reserved).unwrap();
+        assert_eq!(table.state.lock().reserved_candidate_slots,
+                   MAX_PENDING_PERSISTENT_CHARGES - 2);
+        drop(reservations);
+        assert_eq!(table.state.lock().reserved_candidate_slots, 0);
+        let mut unused = table.reserve(&principal, 1, 1, 100_000).unwrap();
+        unused.reserve_persistent_candidate().unwrap();
+        let unused = unused.commit();
+        let committed = table.diagnostics().committed_logical_bytes;
+        drop(unused);
+        assert_eq!(table.state.lock().reserved_candidate_slots, 0);
+        assert_eq!(table.diagnostics().committed_logical_bytes, committed);
     }
 
     #[test]

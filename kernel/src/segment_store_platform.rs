@@ -175,9 +175,18 @@ async fn recover_recognized_persistent_authority(
 // Duo Python image must leave room for the interpreter's admission peak.
 const PAGE_CACHE_CAPACITY: usize = if cfg!(feature = "milkv-python") { 64 } else { 512 };
 
+const NO_CACHE_SLOT: u16 = u16::MAX;
+const _: () = assert!(PAGE_CACHE_CAPACITY < NO_CACHE_SLOT as usize);
+
 struct PageCacheEntry {
     data: alloc::boxed::Box<Page>,
-    tick: u64,
+    slot: u16,
+}
+
+struct PageCacheLink {
+    page: u64,
+    previous: u16,
+    next: u16,
 }
 
 struct PageCache {
@@ -186,7 +195,80 @@ struct PageCache {
 
 struct PageCacheState {
     entries: alloc::collections::BTreeMap<u64, PageCacheEntry>,
-    tick: u64,
+    // At most one slot per cache entry. Removed slots form a free list;
+    // recency changes never allocate or perform another map lookup.
+    links: Vec<PageCacheLink>,
+    oldest: u16,
+    newest: u16,
+    free: u16,
+}
+
+impl PageCacheState {
+    fn unlink(&mut self, slot: u16) {
+        let link = &self.links[slot as usize];
+        let (previous, next) = (link.previous, link.next);
+        if previous != NO_CACHE_SLOT {
+            self.links[previous as usize].next = next;
+        } else {
+            self.oldest = next;
+        }
+        if next != NO_CACHE_SLOT {
+            self.links[next as usize].previous = previous;
+        } else {
+            self.newest = previous;
+        }
+    }
+
+    fn append(&mut self, slot: u16) {
+        let link = &mut self.links[slot as usize];
+        link.previous = self.newest;
+        link.next = NO_CACHE_SLOT;
+        if self.newest != NO_CACHE_SLOT {
+            self.links[self.newest as usize].next = slot;
+        } else {
+            self.oldest = slot;
+        }
+        self.newest = slot;
+    }
+
+    fn touch(&mut self, slot: u16) {
+        if self.newest != slot {
+            self.unlink(slot);
+            self.append(slot);
+        }
+    }
+
+    fn remove(&mut self, page: u64) -> Option<PageCacheEntry> {
+        let entry = self.entries.remove(&page)?;
+        self.unlink(entry.slot);
+        self.links[entry.slot as usize].next = self.free;
+        self.free = entry.slot;
+        Some(entry)
+    }
+
+    fn oldest_page(&self) -> u64 {
+        self.links[self.oldest as usize].page
+    }
+
+    fn insert(&mut self, page: u64, mut entry: PageCacheEntry) {
+        debug_assert!(!self.entries.contains_key(&page));
+        let slot = if self.free != NO_CACHE_SLOT {
+            let slot = self.free;
+            self.free = self.links[slot as usize].next;
+            self.links[slot as usize].page = page;
+            slot
+        } else {
+            assert!(self.links.len() < PAGE_CACHE_CAPACITY);
+            let slot = self.links.len() as u16;
+            self.links.push(PageCacheLink {
+                page, previous: NO_CACHE_SLOT, next: NO_CACHE_SLOT,
+            });
+            slot
+        };
+        entry.slot = slot;
+        self.entries.insert(page, entry);
+        self.append(slot);
+    }
 }
 
 /// Bounded page-cache effectiveness telemetry: a one-line hit-rate report
@@ -217,7 +299,10 @@ impl PageCache {
         Self {
             state: SpinLock::new_recoverable(PageCacheState {
                 entries: alloc::collections::BTreeMap::new(),
-                tick: 0,
+                links: Vec::new(),
+                oldest: NO_CACHE_SLOT,
+                newest: NO_CACHE_SLOT,
+                free: NO_CACHE_SLOT,
             }),
         }
     }
@@ -225,12 +310,11 @@ impl PageCache {
     /// Copy a cached page into `output`, refreshing its recency.
     fn get(&self, page: u64, output: &mut Page) -> bool {
         let mut state = self.state.lock();
-        state.tick += 1;
-        let tick = state.tick;
         match state.entries.get_mut(&page) {
             Some(entry) => {
-                entry.tick = tick;
                 output.copy_from_slice(&entry.data[..]);
+                let slot = entry.slot;
+                state.touch(slot);
                 true
             }
             None => false,
@@ -245,12 +329,12 @@ impl PageCache {
         let mut missing = output.len()..0;
         let mut state = self.state.lock();
         for (index, page) in output.iter_mut().enumerate() {
-            state.tick += 1;
-            let tick = state.tick;
-            match state.entries.get_mut(&(first_page + index as u64)) {
+            let key = first_page + index as u64;
+            match state.entries.get_mut(&key) {
                 Some(entry) => {
-                    entry.tick = tick;
                     page.copy_from_slice(&entry.data[..]);
+                    let slot = entry.slot;
+                    state.touch(slot);
                 }
                 None => {
                     missing.start = missing.start.min(index);
@@ -266,34 +350,52 @@ impl PageCache {
     }
 
     fn insert(&self, page: u64, data: &Page) {
-        let boxed = alloc::boxed::Box::new(*data);
+        self.insert_with_allocator(page, data, |data| alloc::boxed::Box::new(*data));
+    }
+
+    fn insert_with_allocator(
+        &self,
+        page: u64,
+        data: &Page,
+        allocate: impl FnOnce(&Page) -> alloc::boxed::Box<Page>,
+    ) {
+        {
+            let mut state = self.state.lock();
+            if let Some(entry) = state.entries.get_mut(&page) {
+                entry.data.copy_from_slice(data);
+                let slot = entry.slot;
+                state.touch(slot);
+                return;
+            }
+            if state.entries.len() >= PAGE_CACHE_CAPACITY {
+                let oldest = state.oldest_page();
+                let mut entry = state.remove(oldest).expect("LRU page");
+                entry.data.copy_from_slice(data);
+                state.insert(page, entry);
+                return;
+            }
+        }
+        // Allocate outside the cache lock. Recheck after allocation because
+        // another inserter may have updated the key or filled the cache.
+        let boxed = allocate(data);
         let mut state = self.state.lock();
-        state.tick += 1;
-        let tick = state.tick;
         if let Some(entry) = state.entries.get_mut(&page) {
             entry.data.copy_from_slice(data);
-            entry.tick = tick;
+            let slot = entry.slot;
+            state.touch(slot);
             return;
         }
         if state.entries.len() >= PAGE_CACHE_CAPACITY {
-            if let Some(oldest) = state
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.tick)
-                .map(|(page, _)| *page)
-            {
-                state.entries.remove(&oldest);
-            }
+            let oldest = state.oldest_page();
+            state.remove(oldest);
         }
-        state
-            .entries
-            .insert(page, PageCacheEntry { data: boxed, tick });
+        state.insert(page, PageCacheEntry { data: boxed, slot: NO_CACHE_SLOT });
     }
 
     fn invalidate(&self, first_page: u64, page_count: usize) {
         let mut state = self.state.lock();
         for page in first_page..first_page.saturating_add(page_count as u64) {
-            state.entries.remove(&page);
+            state.remove(page);
         }
     }
 
@@ -304,7 +406,10 @@ impl PageCache {
     fn clear(&self) {
         let mut state = self.state.lock();
         state.entries.clear();
-        state.tick = 0;
+        state.links.clear();
+        state.oldest = NO_CACHE_SLOT;
+        state.newest = NO_CACHE_SLOT;
+        state.free = NO_CACHE_SLOT;
     }
 }
 
@@ -833,6 +938,7 @@ pub(crate) enum BootProbeError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum V2RuntimeError {
+    CandidateCapacity,
     Busy,
     OutsideTask,
     Unformatted,
@@ -935,7 +1041,7 @@ struct KernelFileTreeBackend {
 #[cfg(feature = "file-tree")]
 fn map_file_runtime_error(error: V2RuntimeError) -> FileError {
     match error {
-        V2RuntimeError::Busy | V2RuntimeError::JournalChanged => FileError::Busy,
+        V2RuntimeError::Busy | V2RuntimeError::JournalChanged | V2RuntimeError::CandidateCapacity => FileError::Busy,
         V2RuntimeError::OutsideTask
         | V2RuntimeError::Unformatted
         | V2RuntimeError::AuthorityMissing
@@ -1146,9 +1252,10 @@ pub(crate) struct StorageV2Runtime {
 
 /// Boot compaction only rewrites authority streams above this record count.
 const STORAGE_V2_COMPACT_MIN_RECORDS: usize = 2048;
-// On regions of at most 16 segments, frequent GC amplifies ID reservation
-// history. Fold it earlier there; larger regions keep the original threshold
-// because an early rewrite adds checkpoint traffic before that cost amortizes.
+// Foreground compaction amortizes reservation history once 256 records
+// accumulate. The existing reduction and policy checks still gate a rewrite.
+const STORAGE_V2_FOREGROUND_COMPACT_MIN_RECORDS: usize = 256;
+// Regions of at most 16 segments encounter GC pressure earlier.
 const STORAGE_V2_SMALL_COMPACT_MIN_RECORDS: usize = 128;
 
 const STORAGE_V2_HOT_READ_CACHE_BYTES: usize = 256 * 1024;
@@ -1299,6 +1406,7 @@ impl StorageV2Runtime {
         // A damaged acknowledged write is detected there rather than by an
         // extra foreground readback of every newly committed payload page.
         store.set_deferred_commit_readback(true);
+        store.set_hot_content_proof_max_bytes(STORAGE_V2_HOT_READ_MAX_OBJECT_BYTES as u64);
         store
     }
 
@@ -1705,6 +1813,13 @@ impl StorageV2Runtime {
                 .await
                 .map_err(|error| match error {
                     PersistentAuthorityError::GenerationMismatch => V2RuntimeError::JournalChanged,
+                    PersistentAuthorityError::Store(vibeos_segment_store::StoreError::Quota(
+                        vibeos_segment_store::QuotaError::PersistentCandidateCapacity,
+                    )) => {
+                        #[cfg(feature = "storage-bench")]
+                        crate::println!("  bench-detail candidate capacity rejected before append; store={:?}", store.info());
+                        V2RuntimeError::CandidateCapacity
+                    },
                     _error => {
                         #[cfg(feature = "storage-bench")]
                         crate::println!("  bench-detail authority append error: {_error:?}; store={:?}", store.info());
@@ -1717,7 +1832,7 @@ impl StorageV2Runtime {
             .as_ref()
             .is_err_and(|error| append_error_requires_cold_recovery(*error))
         {
-            // Every non-stale-check append failure may have crossed an
+            // Failures not proved to precede append I/O may have crossed an
             // on-media mutation boundary. Revoke the predecessor proof while
             // this operation still owns the runtime claim; only a new boot
             // probe may establish which atomic checkpoint became durable.
@@ -2221,16 +2336,21 @@ impl StorageV2Runtime {
     }
 
     /// Bound orphan history before the facade constructs its next journal
-    /// extension. Only the baseline policy and qualified small regions use
-    /// this path; shared store pins decide whether rewriting is safe now.
+    /// extension. Only the baseline policy uses this path; shared store pins
+    /// decide whether rewriting is safe now. Larger regions amortize the
+    /// replacement checkpoint with a higher record threshold.
     async fn compact_unpinned_authority(
         self: &Arc<Self>,
         view: &PersistentAuthorityView,
     ) -> Result<Option<Arc<PersistentAuthorityView>>, vibeos_object_store::StoreError> {
         let total_segments = self.device.provisioned_page_count()
             / vibeos_segment_format::SEGMENT_PAGES;
-        if total_segments > 16
-            || view.record_stream().len() / LOGICAL_BLOCK_SIZE < STORAGE_V2_SMALL_COMPACT_MIN_RECORDS
+        let minimum_records = if total_segments <= 16 {
+            STORAGE_V2_SMALL_COMPACT_MIN_RECORDS
+        } else {
+            STORAGE_V2_FOREGROUND_COMPACT_MIN_RECORDS
+        };
+        if view.record_stream().len() / LOGICAL_BLOCK_SIZE < minimum_records
             || view.root_policy_sha256() != crate::durable_cspace::storage_v2_external_policy_sha256()
         {
             return Ok(None);
@@ -2242,12 +2362,13 @@ impl StorageV2Runtime {
         };
         let policy = view.root_policy_sha256();
         let result = poll_as_system(async {
+            let store = operation.store();
+            if !store.quiescent_compaction_hint() { return Ok(None); }
             let import = crate::durable_cspace::storage_v2_recovery_import_for_policy(
                 view.record_stream(), policy,
             ).map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
             let maintenance = self.maintenance.lock().clone()
                 .ok_or(PersistentAuthorityError::Unauthorized)?;
-            let store = operation.store();
             let writer = store.derive_persistent_authority_writer(&maintenance)?;
             store.compact_unpinned_persistent_authority(
                 &writer, view.checkpoint_generation(), import,
@@ -2296,7 +2417,7 @@ impl StorageV2Runtime {
         let minimum_records = if total_segments <= 16 {
             STORAGE_V2_SMALL_COMPACT_MIN_RECORDS
         } else {
-            STORAGE_V2_COMPACT_MIN_RECORDS
+            STORAGE_V2_FOREGROUND_COMPACT_MIN_RECORDS
         };
         if (record_count as usize) < minimum_records {
             return Ok(None);
@@ -3530,6 +3651,160 @@ mod storage_v2_transition_tests {
         assert!(cache.read_span(71, &mut []).is_empty());
     }
 
+    #[cfg_attr(test, test)]
+    pub(crate) fn page_cache_reuses_buffers_and_preserves_lru() {
+        let cache = PageCache::new();
+        let allocations = core::cell::Cell::new(0);
+        let mut data = alloc::boxed::Box::new([0x51; PAGE_SIZE]);
+        for page in 0..PAGE_CACHE_CAPACITY as u64 {
+            cache.insert_with_allocator(page, &data, |data| {
+                allocations.set(allocations.get() + 1);
+                alloc::boxed::Box::new(*data)
+            });
+        }
+        assert_eq!(allocations.get(), PAGE_CACHE_CAPACITY);
+        let mut output = alloc::boxed::Box::new([0; PAGE_SIZE]);
+        data.fill(0x72);
+        cache.insert_with_allocator(0, &data, |_| panic!("update allocated a page"));
+        let victim = cache.state.lock().entries.get(&1).unwrap().data.as_ptr();
+        cache.insert_with_allocator(PAGE_CACHE_CAPACITY as u64, &data, |_| {
+            panic!("replacement allocated a page")
+        });
+        assert_eq!(
+            cache.state.lock().entries.get(&(PAGE_CACHE_CAPACITY as u64))
+                .unwrap().data.as_ptr(),
+            victim,
+        );
+        assert!(cache.get(0, &mut output));
+        assert_eq!(output[..], data[..]);
+        assert!(!cache.get(1, &mut output));
+        assert!(cache.get(PAGE_CACHE_CAPACITY as u64, &mut output));
+        assert_eq!(output[..], data[..]);
+        assert_eq!(cache.state.lock().entries.len(), PAGE_CACHE_CAPACITY);
+        cache.clear();
+        // Simulate a competing insert while the allocator is running; this
+        // also verifies that allocation happens without holding the lock.
+        cache.insert_with_allocator(7, &data, |data| {
+            cache.insert(7, &[0x99; PAGE_SIZE]);
+            alloc::boxed::Box::new(*data)
+        });
+        assert_eq!(cache.state.lock().entries.len(), 1);
+        assert!(cache.get(7, &mut output));
+        assert_eq!(output[..], data[..]);
+        cache.invalidate(7, 1);
+        assert!(!cache.get(7, &mut output));
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn page_cache_links_match_reference_lru() {
+        use alloc::collections::{BTreeMap, VecDeque};
+        let cache = PageCache::new();
+        let mut order = VecDeque::new();
+        let mut values = BTreeMap::new();
+        let mut random = 17_u64;
+        let mut output = alloc::vec![[0; PAGE_SIZE]; 4];
+        for step in 0..6000_u64 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let page = random % (PAGE_CACHE_CAPACITY as u64 * 2);
+            let operation = if step < PAGE_CACHE_CAPACITY as u64 * 3 { 0 } else { random % 5 };
+            let touch = |order: &mut VecDeque<u64>, key| {
+                if let Some(index) = order.iter().position(|p| *p == key) {
+                    order.remove(index);
+                }
+                order.push_back(key);
+            };
+            match operation {
+                0 | 1 => {
+                    let value = step as u8;
+                    cache.insert(page, &[value; PAGE_SIZE]);
+                    if !values.contains_key(&page) && values.len() == PAGE_CACHE_CAPACITY {
+                        values.remove(&order.pop_front().unwrap());
+                    }
+                    values.insert(page, value);
+                    touch(&mut order, page);
+                }
+                2 => {
+                    let hit = cache.get(page, &mut output[0]);
+                    assert_eq!(hit, values.contains_key(&page));
+                    if let Some(value) = values.get(&page) {
+                        assert_eq!(output[0], [*value; PAGE_SIZE]);
+                        touch(&mut order, page);
+                    }
+                }
+                3 => {
+                    let missing = cache.read_span(page, &mut output);
+                    let mut expected = 4..0;
+                    for index in 0..4 {
+                        let key = page + index as u64;
+                        if let Some(value) = values.get(&key) {
+                            assert_eq!(output[index], [*value; PAGE_SIZE]);
+                            touch(&mut order, key);
+                        } else {
+                            expected.start = expected.start.min(index);
+                            expected.end = index + 1;
+                        }
+                    }
+                    assert_eq!(missing, if expected.end == 0 { 0..0 } else { expected });
+                }
+                _ => {
+                    cache.invalidate(page, 3);
+                    for key in page..page + 3 {
+                        values.remove(&key);
+                        order.retain(|p| *p != key);
+                    }
+                }
+            }
+            if step % 1999 == 1998 {
+                cache.clear();
+                order.clear();
+                values.clear();
+            }
+            let state = cache.state.lock();
+            assert_eq!(state.entries.len(), values.len());
+            let key = |slot: u16| {
+                if slot == NO_CACHE_SLOT { None } else { Some(state.links[slot as usize].page) }
+            };
+            assert_eq!(key(state.oldest), order.front().copied());
+            assert_eq!(key(state.newest), order.back().copied());
+            assert!(state.links.len() <= PAGE_CACHE_CAPACITY);
+            let mut seen = alloc::collections::BTreeSet::new();
+            for (index, key) in order.iter().enumerate() {
+                let entry = state.entries.get(key).unwrap();
+                assert!(seen.insert(entry.slot));
+                let link = &state.links[entry.slot as usize];
+                assert_eq!(link.page, *key);
+                let previous = if link.previous == NO_CACHE_SLOT { None }
+                    else { Some(state.links[link.previous as usize].page) };
+                let next = if link.next == NO_CACHE_SLOT { None }
+                    else { Some(state.links[link.next as usize].page) };
+                assert_eq!(previous, index.checked_sub(1).map(|i| order[i]));
+                assert_eq!(next, order.get(index + 1).copied());
+                assert_eq!(entry.data[..], [values[key]; PAGE_SIZE]);
+            }
+            let mut free = state.free;
+            while free != NO_CACHE_SLOT {
+                assert!(seen.insert(free));
+                free = state.links[free as usize].next;
+            }
+            assert_eq!(seen.len(), state.links.len());
+        }
+        // The allocator can also race with enough inserts to fill the cache.
+        cache.clear();
+        cache.insert_with_allocator(u64::MAX, &[0x42; PAGE_SIZE], |data| {
+            for page in 0..PAGE_CACHE_CAPACITY as u64 {
+                cache.insert(page, &[0x31; PAGE_SIZE]);
+            }
+            alloc::boxed::Box::new(*data)
+        });
+        assert!(!cache.get(0, &mut output[0]));
+        assert!(cache.get(u64::MAX, &mut output[0]));
+        assert_eq!(output[0], [0x42; PAGE_SIZE]);
+        assert_eq!(cache.state.lock().entries.len(), PAGE_CACHE_CAPACITY);
+    }
+
     fn staged() -> MigrationControl {
         MigrationControl {
             state: MigrationState::V2Staged,
@@ -3773,6 +4048,7 @@ mod storage_v2_transition_tests {
         assert!(!append_error_requires_cold_recovery(
             V2RuntimeError::JournalChanged
         ));
+        assert!(!append_error_requires_cold_recovery(V2RuntimeError::CandidateCapacity));
         for error in [
             V2RuntimeError::Busy,
             V2RuntimeError::OutsideTask,
@@ -3880,6 +4156,7 @@ mod storage_v2_transition_tests {
 #[cfg(feature = "legacy-shell")]
 pub(crate) fn run_storage_v2_transition_selftests() {
     storage_v2_transition_tests::cached_read_spans_preserve_data_and_bound_command_count();
+    storage_v2_transition_tests::page_cache_reuses_buffers_and_preserves_lru();
     storage_v2_transition_tests::stage_retry_accepts_only_exact_old_or_new_selector();
     storage_v2_transition_tests::rollback_requires_exact_staged_evidence_and_source_stream();
     storage_v2_transition_tests::close_preserves_activation_floor_and_accepts_newer_healthy_evidence();
@@ -3893,6 +4170,7 @@ pub(crate) fn run_storage_v2_transition_selftests() {
 
 fn map_facade_error(error: V2RuntimeError) -> vibeos_object_store::StoreError {
     match error {
+        V2RuntimeError::CandidateCapacity => vibeos_object_store::StoreError::InsufficientMemory,
         V2RuntimeError::Busy => vibeos_object_store::StoreError::Busy,
         V2RuntimeError::JournalChanged => vibeos_object_store::StoreError::JournalChanged,
         V2RuntimeError::ObjectUnavailable => vibeos_object_store::StoreError::ObjectUnavailable,
@@ -3927,10 +4205,9 @@ fn cache_metadata_matches_boot_proof(
 }
 
 fn append_error_requires_cold_recovery(error: V2RuntimeError) -> bool {
-    // GenerationMismatch is checked against the mounted authority before any
-    // append mutation. Every other error is conservatively ambiguous at this
-    // sealed facade boundary and must revoke the boot proof.
-    error != V2RuntimeError::JournalChanged
+    // Generation and candidate-slot admission are checked before append I/O.
+    // Other errors remain conservatively ambiguous at this facade boundary.
+    !matches!(error, V2RuntimeError::JournalChanged | V2RuntimeError::CandidateCapacity)
 }
 
 fn recovered_v2_snapshot(

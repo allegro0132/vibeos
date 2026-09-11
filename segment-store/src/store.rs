@@ -494,6 +494,8 @@ pub(crate) struct MountedState {
 }
 
 pub(crate) struct CheckpointTransitionWitness {
+    superblock: Superblock,
+    recovery_peak_bytes: usize,
     store_uuid: StoreUuid,
     generation: u64,
     admitted_segments: u64,
@@ -509,8 +511,31 @@ pub(crate) struct CheckpointTransitionWitness {
 }
 
 impl CheckpointTransitionWitness {
+    /// Move only the predecessor allocation into the transition proof; the
+    /// unchanged catalogs and authority stay owned by the growth successor.
+    pub(crate) fn replace_growth_allocation(state: &mut MountedState, allocation: AllocationV2) -> Self {
+        Self {
+            superblock: state.superblock,
+            recovery_peak_bytes: state.recovery_peak_bytes,
+            store_uuid: state.superblock.binding.store_uuid,
+            generation: state.generation,
+            admitted_segments: state.admitted_segments,
+            next_segment_generation: state.next_segment_generation,
+            cleaner_reserve_segments: state.cleaner_reserve_segments,
+            replay_count: state.replay_count,
+            catalog_root: state.catalog_root,
+            replay_tail: state.replay_tail,
+            authority_root: state.authority_root,
+            allocation_root: state.allocation_root,
+            allocation: mem::replace(&mut state.allocation, allocation),
+            last_segment: state.last_segment,
+        }
+    }
+
     pub(crate) fn from_mounted(state: MountedState) -> Self {
         Self {
+            superblock: state.superblock,
+            recovery_peak_bytes: state.recovery_peak_bytes,
             store_uuid: state.superblock.binding.store_uuid,
             generation: state.generation,
             admitted_segments: state.admitted_segments,
@@ -581,6 +606,8 @@ pub struct SegmentStore<D> {
     /// When set, commits skip the publication-time read-back verification of
     /// the pages they just wrote. See [`SegmentStore::set_deferred_commit_readback`].
     pub(crate) defer_commit_readback: bool,
+    /// Platform hot-content cache admission bound; zero disables eager proofs.
+    pub(crate) hot_content_proof_max_bytes: u64,
     /// See [`SegmentStore::set_catalog_delta_policy`].
     pub(crate) catalog_delta_policy: crate::cas::CatalogDeltaPolicy,
     /// See [`VerifiedSegmentScans`]: chain-authentication memo for sealed
@@ -620,6 +647,7 @@ impl<D: PageDevice> SegmentStore<D> {
             fs_tree_cache: None,
             fs_root_memo: None,
             defer_commit_readback: false,
+            hot_content_proof_max_bytes: 0,
             catalog_delta_policy: crate::cas::CatalogDeltaPolicy::Auto,
             verified_scans: VerifiedSegmentScans::new(),
             typed_edge_cache: crate::gc::TypedEdgeCache::new(),
@@ -721,6 +749,14 @@ impl<D: PageDevice> SegmentStore<D> {
     /// scrub instead of at the commit that wrote it.
     pub fn set_deferred_commit_readback(&mut self, deferred: bool) {
         self.defer_commit_readback = deferred;
+    }
+
+    /// Preverify new packed segments for objects admitted by an upper-layer
+    /// content cache, whose hits may bypass CAS reads until collection. This
+    /// is a performance policy only: normal scan validation is always used.
+    /// Zero (the default) disables it; the bound includes the exact object size.
+    pub fn set_hot_content_proof_max_bytes(&mut self, max_bytes: u64) {
+        self.hot_content_proof_max_bytes = max_bytes;
     }
 
     /// Choose how commits publish catalog changes: complete snapshots or the
@@ -1017,8 +1053,21 @@ impl<D: PageDevice> SegmentStore<D> {
         &mut self,
         previous: MountedState,
         expected: Checkpoint,
+        successor: MountedState,
+        verifies_all_cas: bool,
+    ) -> Result<StoreInfo, StoreError<D::Error>> {
+        self.mount_verified_successor_witness(
+            CheckpointTransitionWitness::from_mounted(previous), expected, successor, verifies_all_cas, 0,
+        ).await
+    }
+
+    pub(crate) async fn mount_verified_successor_witness(
+        &mut self,
+        previous: CheckpointTransitionWitness,
+        expected: Checkpoint,
         mut successor: MountedState,
         verifies_all_cas: bool,
+        operation_peak: usize,
     ) -> Result<StoreInfo, StoreError<D::Error>> {
         self.mounted = None;
         self.poisoned = true;
@@ -1058,7 +1107,7 @@ impl<D: PageDevice> SegmentStore<D> {
         }
         let predecessor =
             if expected.slot == 0 { right } else { left }.ok_or(StoreError::Corrupt)?;
-        if !checkpoint_matches_mounted(predecessor.value(), &previous, self.limits) {
+        if !checkpoint_matches_witness(predecessor.value(), &previous, self.limits) {
             return Err(StoreError::Corrupt);
         }
         if !checkpoint_matches_mounted(&expected, &successor, self.limits) {
@@ -1068,13 +1117,13 @@ impl<D: PageDevice> SegmentStore<D> {
         let predecessor_cas_verified =
             self.verified_cas_generation.load(Ordering::Acquire) == previous.generation;
         let previous_peak = previous.recovery_peak_bytes;
-        let witness = CheckpointTransitionWitness::from_mounted(previous);
+        let witness = previous;
         let witness_bytes = witness.resident_bytes().ok_or(StoreError::MemoryLimit)?;
         validate_checkpoint_transition(&witness, &successor)?;
         let pair_peak = witness_bytes
             .checked_add(successor.recovery_peak_bytes)
             .ok_or(StoreError::MemoryLimit)?;
-        successor.recovery_peak_bytes = previous_peak.max(pair_peak).max(
+        successor.recovery_peak_bytes = previous_peak.max(pair_peak).max(operation_peak).max(
             successor
                 .resident_heap_bytes()
                 .ok_or(StoreError::MemoryLimit)?,
@@ -1260,6 +1309,31 @@ impl<D: PageDevice> SegmentStore<D> {
 fn checkpoint_matches_mounted(
     checkpoint: &Checkpoint,
     state: &MountedState,
+    limits: StoreLimits,
+) -> bool {
+    checkpoint.binding.store_uuid == state.superblock.binding.store_uuid
+        && checkpoint.binding.generation == state.generation
+        && checkpoint.binding.segment_no == ANCHOR_SEGMENT_NO
+        && checkpoint.binding.ordinal == u32::from(checkpoint.slot)
+        && checkpoint.binding.self_page == 4 + u64::from(checkpoint.slot) * 2
+        && checkpoint.binding.target_checkpoint_generation == state.generation
+        && checkpoint.slot == ((state.generation - 1) & 1) as u8
+        && admitted_pages(state.admitted_segments)
+            .is_ok_and(|pages| checkpoint.admitted_range_pages == pages)
+        && checkpoint.admitted_segments == state.admitted_segments
+        && checkpoint.next_segment_generation == state.next_segment_generation
+        && checkpoint.replay_count == state.replay_count
+        && checkpoint.max_replay_records == limits.max_replay_records
+        && checkpoint.cleaner_reserve_segments == state.cleaner_reserve_segments
+        && checkpoint.catalog_root == state.catalog_root
+        && checkpoint.authority_root == state.authority_root
+        && checkpoint.allocation_root == state.allocation_root
+        && checkpoint.replay_tail == state.replay_tail
+}
+
+fn checkpoint_matches_witness(
+    checkpoint: &Checkpoint,
+    state: &CheckpointTransitionWitness,
     limits: StoreLimits,
 ) -> bool {
     checkpoint.binding.store_uuid == state.superblock.binding.store_uuid
@@ -1594,13 +1668,13 @@ pub(crate) struct ScannedSegment {
 /// re-walking the whole chain on every pointer dereference, which measures
 /// as the dominant read amplification of small-store commits. Collection is
 /// the only path that retires and eventually reuses segment numbers, so the
-/// memo is cleared around every GC round; cold scrub and migration passes
-/// never consult it.
+/// memo drops retired/freed segments around GC; cold scrub and migration
+/// passes never consult it.
 pub(crate) struct VerifiedSegmentScans {
     entries: ScanMemoCell,
 }
 
-struct ScanMemoCell(core::cell::RefCell<alloc::collections::VecDeque<((u64, u64), VerifiedSegment)>>);
+struct ScanMemoCell(core::cell::RefCell<alloc::collections::VecDeque<ScanMemoEntry>>);
 
 // Safety: the memo lives inside `SegmentStore`, whose every operation runs
 // through `&mut self`, and shared kernel handles serialize all store access
@@ -1624,7 +1698,17 @@ struct VerifiedSegment {
 
 /// Bounded so a large store cannot grow the memo without limit; eviction is
 /// least-recently-used and only costs a re-walk on the next access.
-const VERIFIED_SEGMENT_SCAN_CAPACITY: usize = 48;
+const VERIFIED_SEGMENT_SCAN_CAPACITY: usize = 256;
+// Bounds requested resident allocation bytes, including queue capacity and
+// all extent Vec capacities. Allocator bookkeeping/rounding is platform-owned.
+const VERIFIED_SEGMENT_SCAN_BYTE_BUDGET: usize = 320 * 1024;
+
+type ScanMemoEntry = ((u64, u64), VerifiedSegment);
+
+fn scan_extent_bytes(verified: &VerifiedSegment) -> usize {
+    verified.extents.capacity().checked_mul(core::mem::size_of::<ExtentRecord>())
+        .unwrap_or(usize::MAX)
+}
 
 impl VerifiedSegmentScans {
     pub(crate) fn new() -> Self {
@@ -1678,8 +1762,30 @@ impl VerifiedSegmentScans {
         if let Some(position) = entries.iter().position(|(cached, _)| *cached == key) {
             entries.remove(position);
         }
-        while entries.len() >= VERIFIED_SEGMENT_SCAN_CAPACITY {
-            entries.pop_front();
+        let incoming = scan_extent_bytes(&verified);
+        let minimum_queue = VERIFIED_SEGMENT_SCAN_CAPACITY * core::mem::size_of::<ScanMemoEntry>();
+        if incoming > VERIFIED_SEGMENT_SCAN_BYTE_BUDGET.saturating_sub(minimum_queue) {
+            return; // A proof too large to memoize remains valid for this read.
+        }
+        if entries.capacity() == 0
+            && entries.try_reserve_exact(VERIFIED_SEGMENT_SCAN_CAPACITY).is_err()
+        {
+            return; // Optional memo allocation must not fail a verified read.
+        }
+        let queue_bytes = entries.capacity().checked_mul(core::mem::size_of::<ScanMemoEntry>())
+            .unwrap_or(usize::MAX);
+        if queue_bytes > VERIFIED_SEGMENT_SCAN_BYTE_BUDGET {
+            *entries = alloc::collections::VecDeque::new();
+            return;
+        }
+        let available = VERIFIED_SEGMENT_SCAN_BYTE_BUDGET - queue_bytes;
+        if incoming > available { return; }
+        let mut resident = entries.iter().fold(0usize, |bytes, (_, proof)| {
+            bytes.saturating_add(scan_extent_bytes(proof))
+        });
+        while entries.len() >= VERIFIED_SEGMENT_SCAN_CAPACITY || resident > available - incoming {
+            let (_, evicted) = entries.pop_front().expect("memo eviction candidate");
+            resident = resident.saturating_sub(scan_extent_bytes(&evicted));
         }
         entries.push_back((key, verified));
     }
@@ -1688,6 +1794,73 @@ impl VerifiedSegmentScans {
 #[cfg(test)]
 mod scan_memo_tests {
     use super::*;
+
+    fn proof_with_capacity(capacity: usize) -> VerifiedSegment {
+        VerifiedSegment {
+            extents: Vec::with_capacity(capacity),
+            record_count: 0,
+            total_payload_bytes: 0,
+            segment_seal_body_sha256: [0; 32],
+            previous_segment: (0, 0, [0; 32]),
+            header_target_checkpoint_generation: 1,
+            last_target_checkpoint_generation: 2,
+        }
+    }
+
+    fn resident_bytes(memo: &VerifiedSegmentScans) -> usize {
+        let entries = memo.entries.0.borrow();
+        entries.capacity() * core::mem::size_of::<ScanMemoEntry>()
+            + entries.iter().map(|(_, p)| scan_extent_bytes(p)).sum::<usize>()
+    }
+
+    #[test]
+    fn scan_memo_budget_charges_capacity_and_evicts_lru() {
+        let memo = VerifiedSegmentScans::new();
+        memo.insert(0, 1, proof_with_capacity(0));
+        let queue = resident_bytes(&memo);
+        memo.clear();
+        assert_eq!(resident_bytes(&memo), queue);
+        let available = VERIFIED_SEGMENT_SCAN_BYTE_BUDGET - queue;
+        let extent_size = core::mem::size_of::<ExtentRecord>();
+        let half = available / 2 / extent_size;
+        memo.insert(1, 1, proof_with_capacity(half));
+        memo.insert(2, 1, proof_with_capacity(half));
+        assert_eq!(memo.with_verified(1, 1, 2, |_| ()), Some(()));
+        let extra = (available - 2 * half * extent_size) / extent_size + 1;
+        memo.insert(3, 1, proof_with_capacity(extra));
+        assert_eq!(memo.with_verified(2, 1, 2, |_| ()), None);
+        assert_eq!(memo.with_verified(1, 1, 2, |_| ()), Some(()));
+        assert_eq!(memo.with_verified(3, 1, 2, |_| ()), Some(()));
+        assert!(resident_bytes(&memo) <= VERIFIED_SEGMENT_SCAN_BYTE_BUDGET);
+        // Empty vectors with reserved capacity consume the full byte budget.
+        assert!(memo.entries.0.borrow().iter().all(|(_, p)| p.extents.is_empty()));
+        memo.insert(1, 1, proof_with_capacity(0));
+        memo.insert(4, 1, proof_with_capacity(half));
+        assert_eq!(memo.with_verified(3, 1, 2, |_| ()), Some(()));
+        assert!(resident_bytes(&memo) <= VERIFIED_SEGMENT_SCAN_BYTE_BUDGET);
+        use crate::allocation_v2::{AllocationV2, SegmentAllocation};
+        let states = [SegmentAllocation::Free, SegmentAllocation::Allocated,
+            SegmentAllocation::Free, SegmentAllocation::Free, SegmentAllocation::Free];
+        memo.retain_allocated(&AllocationV2::new(2, 10, 2, &states, &[]).unwrap());
+        assert_eq!(memo.entries.0.borrow().len(), 1);
+        memo.insert(5, 1, proof_with_capacity(available / extent_size));
+        assert_eq!(memo.with_verified(1, 1, 2, |_| ()), Some(()));
+        assert!(resident_bytes(&memo) <= VERIFIED_SEGMENT_SCAN_BYTE_BUDGET);
+    }
+
+    #[test]
+    fn oversized_scan_proof_is_not_retained() {
+        let memo = VerifiedSegmentScans::new();
+        let oversized = VERIFIED_SEGMENT_SCAN_BYTE_BUDGET / core::mem::size_of::<ExtentRecord>() + 1;
+        memo.insert(1, 1, proof_with_capacity(oversized));
+        assert_eq!(resident_bytes(&memo), 0);
+        memo.insert(1, 1, proof_with_capacity(0));
+        memo.insert(2, 1, proof_with_capacity(1));
+        memo.insert(1, 1, proof_with_capacity(oversized));
+        assert_eq!(memo.with_verified(1, 1, 2, |_| ()), None);
+        assert_eq!(memo.with_verified(2, 1, 2, |_| ()), Some(()));
+        assert!(resident_bytes(&memo) <= VERIFIED_SEGMENT_SCAN_BYTE_BUDGET);
+    }
 
     #[test]
     fn scan_memo_evicts_unused_entries_and_preserves_proof_identity() {
@@ -2505,6 +2678,9 @@ fn persistent_authority_decode_capacity_upper_bound<E>(
     let object_count = input_u32(input, 0x38).ok_or(StoreError::Corrupt)? as usize;
     let principal_count = input_u32(input, 0x3c).ok_or(StoreError::Corrupt)? as usize;
     let record_count = input_u32(input, 0x40).ok_or(StoreError::Corrupt)? as usize;
+    // V1 reserves this field as zero; V2 uses it for the external-root table.
+    // Full snapshot decoding still validates the version and reserved fields.
+    let external_root_count = input_u32(input, 0x70).ok_or(StoreError::Corrupt)? as usize;
     object_count
         .checked_mul(core::mem::size_of::<
             crate::authority_snapshot::PersistentObjectBinding,
@@ -2515,11 +2691,42 @@ fn persistent_authority_decode_capacity_upper_bound<E>(
                 .checked_add(bytes)
         })
         .and_then(|bytes| {
+            external_root_count
+                .checked_mul(core::mem::size_of::<PersistentRootEntry>())?
+                .checked_add(bytes)
+        })
+        .and_then(|bytes| {
             record_count
                 .checked_mul(vibeos_durable_format::RECORD_SIZE)?
                 .checked_add(bytes)
         })
         .ok_or(StoreError::MemoryLimit)
+}
+
+
+fn persistent_authority_recovery_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
+    let decoded = persistent_authority_decode_capacity_upper_bound(input)?;
+    let objects = input_u32(input, 0x38).ok_or(StoreError::Corrupt)? as usize;
+    let external = input_u32(input, 0x70).ok_or(StoreError::Corrupt)? as usize;
+    objects.checked_add(external)
+        .and_then(|count| count.checked_mul(mem::size_of::<PersistentRootEntry>()))
+        .and_then(|roots| decoded.checked_add(roots))
+        .ok_or(StoreError::MemoryLimit)
+}
+
+fn authority_roots_from_snapshot<E>(decoded: &PersistentAuthoritySnapshot) -> Result<PersistentRootSet, StoreError<E>> {
+    let count = decoded.objects.len().checked_add(decoded.external_roots().len())
+        .ok_or(StoreError::MemoryLimit)?;
+    let mut entries = Vec::new();
+    entries.try_reserve_exact(count).map_err(|_| StoreError::MemoryLimit)?;
+    entries.extend(decoded.objects.iter().map(|binding| PersistentRootEntry {
+        object_id: binding.v2_object_id,
+        commit_generation: binding.commit_generation,
+        object_kind: binding.object_kind,
+    }));
+    entries.extend_from_slice(decoded.external_roots());
+    entries.sort_unstable_by_key(|entry| entry.object_id);
+    PersistentRootSet::new(decoded.checkpoint_generation(), entries).map_err(|_| StoreError::Corrupt)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3208,7 +3415,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
                 limits.recovery_memory_bytes,
                 resident_before_roots,
                 authority_bytes.capacity(),
-                persistent_authority_decode_capacity_upper_bound(&authority_bytes)?,
+                persistent_authority_recovery_capacity_upper_bound(&authority_bytes)?,
             )?;
             let decoded = decode_persistent_authority_snapshot(&authority_bytes)
                 .map_err(|_| StoreError::Corrupt)?;
@@ -3217,19 +3424,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
             {
                 return Err(StoreError::Corrupt);
             }
-            let mut entries: Vec<PersistentRootEntry> = decoded
-                .objects
-                .iter()
-                .map(|binding| PersistentRootEntry {
-                    object_id: binding.v2_object_id,
-                    commit_generation: binding.commit_generation,
-                    object_kind: binding.object_kind,
-                })
-                .collect();
-            entries.extend_from_slice(decoded.external_roots());
-            entries.sort_unstable_by_key(|entry| entry.object_id);
-            let roots = PersistentRootSet::new(decoded.checkpoint_generation(), entries)
-                .map_err(|_| StoreError::Corrupt)?;
+            let roots = authority_roots_from_snapshot(&decoded)?;
             (roots, Some(decoded))
         } else {
             recovery_preflight_decode(
@@ -3937,32 +4132,39 @@ fn build_extent<'a>(
     })
 }
 
+/// Keep the existing 32-page request boundaries while borrowing complete
+/// payload pages. Only the last, partial-page batch needs a zero-padded copy.
+/// Publication barriers remain the caller's responsibility.
+pub(crate) async fn write_payload_pages<D: PageDevice>(
+    device: &D,
+    first_page: u64,
+    payload: &[u8],
+) -> Result<(), StoreError<D::Error>> {
+    for (index, bytes) in payload.chunks(32 * PAGE_SIZE).enumerate() {
+        let (pages, tail) = bytes.as_chunks::<PAGE_SIZE>();
+        let first = first_page + (index * 32) as u64;
+        if tail.is_empty() {
+            device.write_pages(first, pages).await.map_err(StoreError::Mutation)?;
+        } else {
+            let mut padded = vec![[0; PAGE_SIZE]; pages.len() + 1];
+            padded.as_flattened_mut()[..bytes.len()].copy_from_slice(bytes);
+            device.write_pages(first, &padded).await.map_err(StoreError::Mutation)?;
+        }
+    }
+    Ok(())
+}
+
 async fn write_extent<D: PageDevice>(
     device: &D,
     base: u64,
     extent: &BuiltExtent<'_>,
 ) -> Result<(), StoreError<D::Error>> {
     let relative = extent.value.binding.self_page - base;
-    let mut copied = 0;
-    let mut page_index = 0_u32;
-    while page_index < extent.value.payload_pages {
-        let batch_pages = (extent.value.payload_pages - page_index).min(32) as usize;
-        let mut pages = vec![[0; PAGE_SIZE]; batch_pages];
-        for page in &mut pages {
-            let remaining = extent.payload.len() - copied;
-            let take = remaining.min(PAGE_SIZE);
-            page[..take].copy_from_slice(&extent.payload[copied..copied + take]);
-            copied += take;
-        }
-        device
-            .write_pages(
-                base + u64::from(extent.value.payload_first_relative_page + page_index),
-                &pages,
-            )
-            .await
-            .map_err(StoreError::Mutation)?;
-        page_index += batch_pages as u32;
-    }
+    write_payload_pages(
+        device,
+        base + u64::from(extent.value.payload_first_relative_page),
+        extent.payload,
+    ).await?;
     flush(device).await?;
     write_page(device, base + relative, &extent.body).await?;
     flush(device).await?;
@@ -4412,6 +4614,59 @@ mod payload_read_tests {
     use core::future::Future;
     use core::task::{Context, Poll, Waker};
 
+    #[test]
+    fn authority_decode_budget_includes_external_root_table() {
+        use vibeos_durable_format::{RecordBody, RecordChain, StoreId};
+        let records = RecordChain::new(StoreId::new(7).unwrap())
+            .append(None, RecordBody::Format).unwrap().to_vec();
+        let plain = PersistentAuthoritySnapshot::new(3, [1;32], records, vec![], vec![]).unwrap();
+        let rooted = plain.clone().with_external_roots(vec![
+            PersistentRootEntry { object_id: 1, commit_generation: 2, object_kind: 7 },
+            PersistentRootEntry { object_id: 2, commit_generation: 3, object_kind: 8 },
+        ]).unwrap();
+        let before = crate::encode_persistent_authority_snapshot(&plain).unwrap();
+        let encoded = crate::encode_persistent_authority_snapshot(&rooted).unwrap();
+        let base = persistent_authority_decode_capacity_upper_bound::<()>(&before).unwrap();
+        let required = persistent_authority_decode_capacity_upper_bound::<()>(&encoded).unwrap();
+        assert_eq!(required - base, 2 * mem::size_of::<PersistentRootEntry>());
+        let decoded = decode_persistent_authority_snapshot(&encoded).unwrap();
+        assert!(required >= decoded.allocated_bytes().unwrap());
+        // The old estimate admitted this budget although the root table did
+        // not fit. The pre-allocation check must reject it now.
+        let budget = encoded.len() + required - 1;
+        assert!(recovery_preflight_decode::<()>(budget, 0, encoded.len(), base).is_ok());
+        assert!(matches!(recovery_preflight_decode::<()>(budget, 0, encoded.len(), required), Err(StoreError::MemoryLimit)));
+        recovery_preflight_decode::<()>(budget+1, 0, encoded.len(), required).unwrap();
+    }
+
+    #[test]
+    fn authority_roots_are_preallocated_budgeted_and_reject_collisions() {
+        use vibeos_durable_format::{RecordBody, RecordChain, StoreId};
+        let records = RecordChain::new(StoreId::new(7).unwrap()).append(None, RecordBody::Format).unwrap().to_vec();
+        let snapshot = PersistentAuthoritySnapshot::new(3, [1;32], records, vec![
+            crate::authority_snapshot::PersistentObjectBinding {
+                stable_object_id: 1, v2_object_id: 3, commit_generation: 2, object_kind: 7,
+            }
+        ], vec![]).unwrap().with_external_roots(vec![
+            PersistentRootEntry { object_id: 2, commit_generation: 3, object_kind: 8 },
+        ]).unwrap();
+        let encoded = crate::encode_persistent_authority_snapshot(&snapshot).unwrap();
+        let roots = authority_roots_from_snapshot::<()>(&snapshot).unwrap();
+        assert_eq!(roots.entries().iter().map(|entry| entry.object_id).collect::<Vec<_>>(), vec![2,3]);
+        assert_eq!(roots.allocated_bytes().unwrap(), 2 * mem::size_of::<PersistentRootEntry>());
+        let decoded = persistent_authority_decode_capacity_upper_bound::<()>(&encoded).unwrap();
+        let required = persistent_authority_recovery_capacity_upper_bound::<()>(&encoded).unwrap();
+        assert_eq!(required, decoded + roots.allocated_bytes().unwrap());
+        let short = encoded.len()+required-1;
+        assert!(recovery_preflight_decode::<()>(short, 0, encoded.len(), decoded).is_ok());
+        assert!(matches!(recovery_preflight_decode::<()>(short, 0, encoded.len(), required), Err(StoreError::MemoryLimit)));
+        recovery_preflight_decode::<()>(short+1, 0, encoded.len(), required).unwrap();
+        let colliding = snapshot.with_external_roots(vec![
+            PersistentRootEntry { object_id: 3, commit_generation: 2, object_kind: 7 },
+        ]).unwrap();
+        assert!(matches!(authority_roots_from_snapshot::<()>(&colliding), Err(StoreError::Corrupt)));
+    }
+
     struct Device {
         calls: RefCell<Vec<(u64, usize)>>,
         fail_at: Cell<Option<usize>>,
@@ -4455,6 +4710,61 @@ mod payload_read_tests {
         {
             Poll::Ready(result) => result,
             Poll::Pending => panic!("memory device unexpectedly yielded"),
+        }
+    }
+
+    #[test]
+    fn payload_writes_borrow_full_batches_preserve_padding_and_failures() {
+        struct Writer<'a> {
+            source: &'a [u8],
+            calls: RefCell<Vec<(u64, usize)>>,
+            fail_at: Cell<Option<usize>>,
+        }
+        impl PageDevice for Writer<'_> {
+            type Error = ();
+            fn info(&self) -> crate::device::PageDeviceInfo { unreachable!() }
+            async fn read_page(&self, _: u64, _: &mut Page) -> Result<(), ()> { unreachable!() }
+            async fn write_page(&self, _: u64, _: &Page) -> Result<(), MutationFailure<()>> { unreachable!() }
+            async fn flush(&self) -> Result<(), MutationFailure<()>> { panic!("helper changed barriers") }
+            async fn write_pages(&self, first: u64, pages: &[Page]) -> Result<(), MutationFailure<()>> {
+                let index = self.calls.borrow().len();
+                self.calls.borrow_mut().push((first, pages.len()));
+                let offset = (first - 7) as usize * PAGE_SIZE;
+                let len = (self.source.len() - offset).min(32 * PAGE_SIZE);
+                let expected = &self.source[offset..offset + len];
+                assert_eq!(pages.len(), len.div_ceil(PAGE_SIZE));
+                assert_eq!(&pages.as_flattened()[..len], expected);
+                assert!(pages.as_flattened()[len..].iter().all(|byte| *byte == 0));
+                if len % PAGE_SIZE == 0 {
+                    assert_eq!(pages.as_flattened().as_ptr(), expected.as_ptr());
+                }
+                if self.fail_at.get() == Some(index) {
+                    return Err(MutationFailure::ambiguous(()));
+                }
+                Ok(())
+            }
+        }
+        for len in [0, 1, PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE + 1,
+            31 * PAGE_SIZE + 1, 32 * PAGE_SIZE, 32 * PAGE_SIZE + 1,
+            33 * PAGE_SIZE, 64 * PAGE_SIZE + 3] {
+            // Deliberately offset the input: Page's byte alignment must not
+            // impose a stronger alignment requirement on the caller.
+            let input: Vec<u8> = (0..len + 1).map(|i| (i % 251) as u8).collect();
+            let writer = Writer { source: &input[1..], calls: RefCell::new(Vec::new()), fail_at: Cell::new(None) };
+            run(write_payload_pages(&writer, 7, writer.source)).unwrap();
+            let expected: Vec<_> = (0..len.div_ceil(32 * PAGE_SIZE))
+                .map(|i| (7 + (i * 32) as u64, (len - i * 32 * PAGE_SIZE).div_ceil(PAGE_SIZE).min(32)))
+                .collect();
+            assert_eq!(*writer.calls.borrow(), expected);
+            for failure in 0..expected.len() {
+                writer.calls.borrow_mut().clear();
+                writer.fail_at.set(Some(failure));
+                match run(write_payload_pages(&writer, 7, writer.source)) {
+                    Err(StoreError::Mutation(error)) => assert_eq!(error.certainty(), MutationCertainty::Ambiguous),
+                    other => panic!("unexpected write result: {other:?}"),
+                }
+                assert_eq!(*writer.calls.borrow(), expected[..=failure]);
+            }
         }
     }
 

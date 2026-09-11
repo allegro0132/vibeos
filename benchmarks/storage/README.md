@@ -1930,3 +1930,3272 @@ baseline I/O instead of regressing. These remain scoped QEMU counter results,
 not physical SD latency claims; revoked-workload uniqueness remains per sample.
 Evidence is `target/storage-live-compaction-order-20260911/`, including qualified
 ELF/hash, transcripts, JSONL, `summary.json`, tests and build logs.
+
+The production three-boot file-tree gate passes GC pressure, cold recovery and
+powered-off verification. The accepted scheduling change is retained; no physical
+device was accessed or modified.
+
+### Rejected GC padding-read elimination (2026-09-11)
+
+A trial made the normal payload reader return whether the physical final-page
+padding was zero, letting GC reuse that observation instead of reading the
+last page again. Payload and padding corruption tests still failed before
+checkpoint publication, and all selected host tests, Duo compilation and the
+trial three-boot gate passed.
+
+However, the matched 16-segment, 128-retained-object QEMU run had identical
+physical I/O: 6,487 reads / 32,575,488 bytes, 2,321 writes / 88,788,992 bytes,
+and 745 flushes. `CapabilityPageDevice::read_page` already serves the immediate
+second tail-page read from its page cache. Removing a logical PageDevice call
+did not remove a block-device request on this path. The trial also computed
+padding observations for ordinary reads that did not consume them, so it is
+not retained without a demonstrated benefit.
+
+Both changed source files were restored exactly to their qualified pre-trial
+index state. Evidence is `target/storage-gc-padding-read-20260911/`, containing
+the rejected patch, ELF/hash, matched counters, transcript, tests/build logs
+and revert verification. `small.elf` there is the rejected trial. Future read
+optimization should attribute actual page-cache misses rather than counting
+source-level `read_page` calls. No physical SD device was accessed.
+
+### Reuse page-cache buffers (2026-09-11)
+
+`PageCache::insert` now updates an existing entry in place and reuses the LRU
+victim's boxed page when the cache is full. Previously both paths allocated a
+fresh 4 KiB buffer first (charged as 8 KiB by the kernel allocator). Capacity,
+recency, invalidation and cold-proof clearing remain unchanged. Free-capacity
+allocation remains outside the lock, followed by a recheck for concurrent
+insertion. BTreeMap node allocations are still possible; this is specifically
+page-buffer reuse, not an allocation-free cache.
+
+Two host tests extracted from the actual kernel source pass, using a mutex
+shim for the kernel spinlock: all 256 eight-page hit patterns, plus allocation
+counting, updated contents, LRU victim pointer reuse, clearing/invalidation and
+same-key insertion during allocation. These prove sequential behavior and the
+allocation recheck; they are not a kernel concurrency stress test.
+
+The matched throttled QEMU run (16 segments, 128 MiB RAM, 128 retained 4 KiB
+objects, seed 32) passes every sample. Baseline and candidate both issue
+6,487 reads / 32,575,488 bytes, 2,321 writes / 88,788,992 bytes and 745 flushes.
+The optimization removes unnecessary page-buffer allocation on the tested
+cache paths; no wall-clock speedup or physical SD improvement is claimed.
+QEMU benchmark firmware and Duo file-tree compilation pass. Evidence is
+`target/storage-page-cache-reuse-20260911/`, including the benchmark ELF,
+extracted test harness, test/build logs, transcript and matched counters.
+The final source differs from the measured ELF only by formatting and stronger
+test-only content assertions; the production cache algorithm is identical.
+
+The production three-boot file-tree gate also passes durable hard links,
+symlinks, recursive removal, GC pressure, cold recovery and powered-off
+verification. No physical device was accessed or modified.
+
+### Borrow complete payload write batches (2026-09-11)
+
+The direct CAS payload writer and legacy extent writer now share
+`write_payload_pages`. Complete-page batches borrow the original payload;
+only a batch containing the partial final page allocates a zero-padded copy.
+The 32-page request partition and all caller-owned publication barriers remain
+unchanged. This removes allocation, zeroing and copying for complete batches;
+it does not promise fewer block requests or a smaller worst-case final buffer.
+The PageSink-owned path remains unchanged because it needs owned pages.
+
+A focused test covers empty input, byte-offset input, page and 32-page
+boundaries, exact request addresses/counts, zero padding, source pointer identity
+for complete batches, and ambiguous failure at every request position. The
+selected suite passes 233 tests with one ignored, including GC and fused append
+recovery. QEMU benchmark firmware builds and Duo file-tree compilation passes.
+
+Matched throttled QEMU runs use the prior page-cache-reuse ELF as baseline:
+16 segments, 128 MiB RAM, 8 retained 360 KiB objects, seed 32, the same blank
+image and 4/2 MiB/s read/write, 400/200 read/write IOPS limits. All samples pass.
+Both runs issue 56 reads / 2,105,344 bytes, 193 writes / 7,360,512 bytes and
+49 flushes. This confirms unchanged I/O for this bounded workload; eight
+samples do not establish a latency improvement. No physical SD claim is made.
+Evidence is `target/storage-borrowed-payload-write-20260911/`, with baseline
+and candidate JSONL/transcripts, candidate ELF/hash, tests, builds and summary.
+
+The production three-boot gate passes GC pressure, cold recovery and powered-off
+verification, as well as hard links, symlinks and recursive removal. The borrowed
+payload change is retained. No physical device was accessed or modified.
+
+### Range-get data-cache attribution (2026-09-11)
+
+The original aggregate range-get timing includes the preceding durable put.
+To isolate reads, the following measurements use only `phases.get_*`, after
+publication and (in the evicted case) `benchmark_evict_read_data`. That hook
+clears hot object bytes and the device page cache, but retains mounted metadata
+and proof provenance: this is **not cold boot or cold recovery**.
+
+Each row has four samples per cache mode on the qualified borrowed-payload ELF,
+16 segments, 128 MiB RAM, seed 32, no warmups, the same blank template and
+4/2 MiB/s, 400/200 read/write IOPS throttle. Each get returns one 4 KiB leaf;
+leaf indices follow the existing seed-modulo-leaf-count benchmark rule.
+All 32 samples pass, with no get-phase writes or flushes.
+
+| Object size | Evicted get read bytes | Evicted read requests | Warm read bytes / requests |
+|---|---:|---:|---:|
+| 4 KiB | 100 KiB | 10 | 0 / 0 |
+| 128 KiB | 112–120 KiB | 13–14 | 0 / 0 |
+| 360 KiB | 144 KiB | 19 | 0 / 0 |
+| 1 MiB | 172 KiB | 25 | 0 / 0 |
+
+The 1 MiB result rules out a whole-object physical read for these leaf requests,
+but eviction exposes 25–43 times physical read amplification relative to the
+4 KiB output. Immediate post-put warm reads hide this cost entirely in this
+bounded workload. Source inspection identifies manifest resolution, descriptor
+validation, header and Merkle proof reads along the path; these counters do not
+yet attribute bytes to each phase, so they do not justify removing any check.
+The next read-path investigation should attribute that fixed validation cost
+and determine why existing authenticated scan memoization does not eliminate
+it on this public capability path, before changing read-ahead or cache capacity.
+
+Evidence: `target/storage-range-attribution-20260911/`, with all eight JSONL
+runs, serial transcripts, environment/ELF provenance and `summary.json`.
+This round changes measurement documentation only; it makes no latency or
+physical SD claim and accessed no real device.
+
+### Range-get physical-page trace (2026-09-11)
+
+A diagnostic ELF temporarily logs only successful physical read misses after
+benchmark data eviction. A single 1 MiB / seed-32 range-get passes and reproduces
+the uninstrumented run's exact 25 requests / 176,128 bytes. The trace itself
+must not be used for latency comparisons. Kernel source was restored exactly
+to its pre-instrumentation snapshot; `trace.elf` is diagnostic only.
+
+The segment ABI has 16 anchor pages and 1,024 pages per segment. Reads at
+3,088/4,108 (four pages each) and 3,093/3,096/3,099 (two each) scan segment 3's
+header/first descriptor, trailer, and remaining descriptors. Reads at
+2,064/3,084 (four each) and 2,069/2,327/2,334 (two each) do the same for segment 2.
+These match `scan_segment`'s authenticated chain-walk request pattern.
+Together they account for 10 requests and 28 pages = 112 KiB, or 65.1% of the
+172 KiB get read volume. The remaining 15 one-page requests total 60 KiB and
+cover payload/header/proof observations; this trace does not subdivide them.
+
+The public blob API has two proof layers: its envelope header/content/siblings
+are logical ranges authenticated again by the CAS Merkle layer. Existing
+`VerifiedSegmentScans` misses on these two segments in this first post-publication
+read; the trace shows the actual scans rather than merely counting source calls.
+Next, investigate transferring already verified segment evidence from successful
+publication readback into the runtime memo. Such a change must not retain proof
+from failed, cancelled or unpublished writes, and must preserve generation,
+GC-retirement and cold-proof invalidation rules. No validation was removed here.
+
+Evidence: `target/storage-range-trace-20260911/` contains the diagnostic patch,
+ELF/hash, trace, exact counter reconciliation, pre-instrumentation snapshot and
+restore verification. No real device was accessed or modified.
+
+### Confirmed first-read proof cost, not a memo retention failure (2026-09-11)
+
+The proposed transfer of publication readback proofs is inapplicable to the
+current kernel profile: `StorageV2Runtime` enables `set_deferred_commit_readback(true)`.
+CAS commit skips its full segment readback in that profile. Consequently the
+new segment proofs observed missing above have not yet been established;
+inserting writer-derived entries would bypass the first media verification.
+No such optimization was implemented. This corrects the preceding investigation
+hypothesis about reusable commit readback evidence.
+
+A diagnostic run first performs the ordinary data-evicted range read, then
+evicts data again and repeats the same leaf, asserting exact bytes and descriptor
+equality. Separate `MEMO_REPEAT` counters cover only that second read. Existing
+mounted metadata and segment proof memo entries survive the second eviction.
+
+| Object | First evicted read (prior matched baseline) | Repeated evicted read |
+|---|---:|---:|
+| 4 KiB | 10 requests / 100 KiB | 3 requests / 12 KiB |
+| 1 MiB | 25 requests / 172 KiB | 15 requests / 60 KiB |
+
+Both one-sample diagnostic runs pass and repeat reads issue no writes/flushes.
+For 1 MiB, exactly the previously attributed 10 segment-scan requests / 112 KiB
+disappear: the existing authenticated memo works after first verification.
+This is evidence against a memo retention bug, not a new performance gain.
+The remaining repeated-read cost is a better optimization target than skipping
+first-read segment validation. These measurements do not exercise memo eviction
+under a large working set or establish latency distributions.
+
+Evidence is `target/storage-range-memo-proof-20260911/`. Diagnostic JSONL totals
+include the extra read, so do not compare their ordinary get/aggregate counters
+or timings with baseline; use the separately logged counters and `summary.json`.
+The patch, diagnostic ELF/hash, serial logs and exact source restore verification
+are retained. Production source was restored, and no real device was accessed.
+
+### Coalesce only a required two-page proof tree (2026-09-11)
+
+A broad experiment fetched proof trees up to 64 KiB after copying out the
+content leaf. For 360 KiB objects it reduced range-get requests 19 → 18 with
+144 KiB unchanged. For 1 MiB objects it reduced requests 25 → 20 but increased
+reads 172 → 180 KiB. The broad policy is not retained: fewer commands alone
+would hide additional read amplification and unnecessary proof copies.
+
+The final policy applies only when the tree occupies a separate manifest
+extent and its length is greater than one page and at most two. Such a tree
+has 128 padded leaves: every proof needs a leaf sibling from its first page
+and an upper-level sibling from its second. Reading the two pages together
+therefore adds no otherwise-unneeded physical page. Compact envelopes and
+larger trees retain demand reads. First-read segment validation and every
+Merkle proof verification remain unchanged. Temporary copied tree output is
+bounded to 8 KiB; the existing content window holds the prefetched pages.
+
+A structural test enumerates every leaf for all 65–128-leaf geometries; an
+integration test cold-mounts and authenticates all 90 leaves of a 360 KiB blob.
+The selected suite passes 235 tests, one ignored, including GC and fused append
+recovery. QEMU firmware build and Duo file-tree compilation pass.
+
+Matched final QEMU runs (four samples each, 16 segments, 128 MiB RAM, seed 32,
+4/2 MiB/s and 400/200 read/write IOPS) all pass. The 360 KiB range-get uses
+18 requests / 144 KiB versus baseline 19 / 144 KiB (5.3% fewer read requests).
+The 1 MiB control remains 25 requests / 172 KiB, avoiding the broad trial's
+extra reads. These are data-evicted get-phase counters, not cold-boot numbers
+or a measured physical-SD latency improvement.
+
+Evidence is `target/storage-proof-prefetch-trial-20260911/`: `trial.elf` and
+unsuffixed JSONL are the rejected broad experiment; `two-page.elf` and
+`*-final.jsonl` are the final bounded implementation. Patches, hashes, matched
+summary, tests and build logs are retained. No real device was accessed.
+
+The production three-boot file-tree gate passes GC pressure, cold recovery and
+powered-off verification. The two-page-only policy is retained; the broader
+prefetch experiment remains rejected.
+
+### Preserve proof sharing across multi-leaf ranges (2026-09-11)
+
+A follow-up host audit exposed a limitation of the two-page coalescing policy:
+on a PageDevice without its own page cache, three ranges read the same proof
+tree three times (three two-page requests). Prefetch used the content window,
+which the next leaf replaced. QEMU's device cache masked the repeated logical
+reads, so the earlier physical counter result alone did not cover this case.
+
+Two-page coalescing now applies only to a single-leaf invocation. Multi-range
+calls, a single range spanning multiple leaves, and unaligned ranges crossing
+a leaf boundary use the existing hash-page LRU. The new test verifies returned
+bytes and exact proof-page requests for all four cases: the first three read
+each proof page once (two one-page requests); the single-leaf case retains one
+two-page request. The three-range uncached-device case falls from 24 KiB to
+8 KiB of proof reads. This is a PageDevice-level regression fix, not a claimed
+additional physical-I/O saving on the already-cached QEMU backend.
+
+Evidence is `target/storage-proof-batch-audit-20260911/`; `test.log` captures
+the pre-fix repeated reads, and the final regression test asserts bounded
+reuse. First-read segment validation and Merkle authentication remain unchanged.
+
+The selected final suite passes 236 tests, one ignored. QEMU firmware builds
+and Duo file-tree compilation passes. Four matched throttled QEMU 360 KiB
+range-get samples all pass and retain 18 physical reads / 144 KiB, exactly the
+previous two-page implementation's counters. Thus the single-leaf coalescing
+benefit remains while multi-leaf proof sharing is restored. ELF/hash, JSONL,
+serial log and `summary.json` are included in the evidence directory.
+No real device was accessed; no new physical-SD latency gain is claimed.
+
+The production three-boot gate also passes GC pressure, cold recovery and
+powered-off verification. The multi-leaf cache-sharing correction is retained.
+
+### Proof working-set qualification through 4 MiB (2026-09-11)
+
+The uncached PageDevice regression now covers native CAS blobs of 360 KiB,
+1 MiB and 4 MiB, with three adjacent ranges, one three-leaf range, a two-byte
+boundary-crossing range, one leaf, and 32 descending dispersed ranges. It
+computes the union of pages containing required sibling hashes and compares
+it with every observed proof-page read, including duplicates. All returned
+bytes are also checked. This makes both unnecessary prefetch and repeated
+proof reads observable independently of the kernel page cache.
+
+| Native CAS size | Tree pages | One-leaf proof pages / requests | 32 dispersed ranges: proof pages / requests |
+|---|---:|---:|---:|
+| 360 KiB | 2 | 2 / 1 | 2 / 2 |
+| 1 MiB | 4 | 3 / 3 | 4 / 4 |
+| 4 MiB | 16 | 5 / 5 | 16 / 16 |
+
+These are proof-region-only host counts, not the public nested-envelope QEMU
+get totals above. The largest case reaches the 16-page hash-cache budget;
+working sets above that budget are not qualified by this test. Native CAS
+geometry differs from the public service's additional blob envelope.
+
+The expanded test also flips a required leaf-level sibling and a required
+upper-level sibling for each object size. Each read must fail; restoring the
+byte must restore successful exact readback, even with segment proofs memoized.
+Evidence is `target/storage-proof-working-set-20260911/`. This round expands
+regression coverage and attribution without changing the runtime algorithm.
+
+The focused final test passes all 15 range configurations and six corruption /
+restore cases. No physical device was accessed or modified.
+
+### Current large-file scaling checkpoint (2026-09-11)
+
+The current default-capacity firmware, with `storage-bench-128m` (not the
+16-segment small-store profile), passes fresh-VM 16 MiB and 64 MiB unique
+file-sequential samples. Each sample writes, fully verifies and removes the
+file. Seed 14476452505690153217, one VM / one un-warmed sample per size,
+128 MiB guest RAM, and the existing 4/2 MiB/s, 400/200 read/write IOPS throttle
+are retained. This is a whole-workload observation, not pure write throughput.
+
+| File | Whole workload | Read bytes | Write bytes | Read requests | Write requests | Flushes |
+|---|---:|---:|---:|---:|---:|---:|
+| 16 MiB | 13.249455 s | 17,850,368 | 18,157,568 | 314 | 213 | 16 |
+| 64 MiB | 53.848149 s | 73,154,560 | 71,442,432 | 1,645 | 786 | 35 |
+
+Relative to logical file bytes, read/write amplification is 1.064 / 1.082
+for 16 MiB and 1.090 / 1.065 for 64 MiB. The serial transfer estimate
+`read_bytes / read_bps + write_bytes / write_bps` gives 12.914 and 51.508 s.
+Its proximity to observed elapsed time suggests configured bandwidth dominates
+these runs. This estimate is not measured CPU time or a strict lower bound:
+QEMU throttling can burst, and flush and execution costs are not modeled.
+Reducing a handful of metadata requests is unlikely to transform these
+bandwidth-limited large-file results; small-object mutation amplification
+and unthrottled CPU attribution remain separate optimization targets.
+
+These single samples neither establish latency distributions nor isolate the
+benefit of one recent patch. They refresh current-state correctness and I/O
+scaling through 64 MiB; the older 256 MiB result is not a current-ELF rerun.
+Evidence is `target/storage-file-scale-20260911/`: ELF/hash, build log, JSONL,
+serial transcripts and `summary.json`. No runtime algorithm changed in this
+measurement round and no real device was accessed or modified.
+
+### Unthrottled file timing: inconclusive under run-to-run drift (2026-09-11)
+
+An unthrottled 16 MiB write/verify/delete comparison uses the same blank image,
+seed 14476452505690153217, 128 MiB RAM, one warmup and three retained samples
+per fresh VM. No builds or other agent-started CPU work overlap these runs.
+Three alternating pairs compare the historical owned-sink ELF with the current
+file-scale ELF; two further opposite-order pairs use the closer quiescent
+compaction default ELF. All 40 workloads (10 warmups, 30 retained) pass.
+
+| Pair | Baseline ELF | Baseline median | Current median |
+|---|---|---:|---:|
+| 0 | owned-sink | 1.789376 s | 1.961283 s |
+| 1 | owned-sink | 1.844904 s | 1.920773 s |
+| 2 | owned-sink | 1.765495 s | 2.262468 s |
+| near-0 | quiescent default | 1.998212 s | 1.742823 s |
+| near-1 | quiescent default | 1.673176 s | 1.748661 s |
+
+The same current ELF's run medians span 1.743–2.262 s despite the same seeds
+and reproducible device counters. The closer baseline also changes relative
+ordering between pairs. Therefore this experiment does not establish a CPU
+speedup or a causal regression from the allocation/copy changes. QEMU TCG,
+host I/O and scheduling remain in the measurement; removing rate limits does
+not isolate CPU execution. A post-run load-average observation cannot explain
+or reconstruct scheduling during individual samples.
+
+No implementation was reverted on this timing evidence. Future CPU work needs
+more stable attribution or per-phase operation counts; physical I/O savings
+already verified under throttling remain separate claims. Evidence is
+`target/storage-unthrottled-file-20260911/`, with every run's JSONL, ELF hashes
+in provenance, transcripts and per-seed `summary.json`. Both historical ELFs
+include multiple differences from current, so this is not a one-patch A/B test.
+No real device was accessed or modified.
+
+### Machine-readable sequential-file phase counters (2026-09-11)
+
+Successful QEMU `file-sequential` samples now include seven device counters
+for each of four phases: `file_stage_*`, `file_publish_*`, `file_verify_*`,
+and `file_remove_*`. Stage includes content generation, stager pushes and
+finish; publish switches the durable file-tree root; verify reads and checks
+all file content; remove durably deletes the file. Counter snapshots are taken
+at these boundaries. JSON formatting occurs after timing and total counter
+capture. These are I/O attribution counters, not CPU timings.
+
+The converter preserves them in `phases` and requires a complete nonnegative
+integer set whose sums equal the aggregate device counters. Its selftest
+covers valid data, missing/negative/boolean fields, inconsistent sums, incorrect
+workload tagging and compatibility with old samples without phase fields.
+Failed samples do not publish a misleading completed-phase breakdown.
+
+A matched fresh 16 MiB sample, same seed and 4/2 MiB/s, 400/200 IOPS limits,
+passes exact content verification and reproduces every pre-instrumentation
+aggregate counter:
+
+| Phase | Read requests | Write requests | Flushes | Read bytes | Write bytes |
+|---|---:|---:|---:|---:|---:|
+| Stage | 25 | 201 | 10 | 196,608 | 17,854,464 |
+| Publish | 1 | 6 | 3 | 4,096 | 151,552 |
+| Verify | 286 | 0 | 0 | 17,612,800 | 0 |
+| Remove | 2 | 6 | 3 | 36,864 | 151,552 |
+
+This identifies staging as the dominant writer and verification as the dominant
+reader for this case. Evidence: `target/storage-file-phases-20260911/`, including
+ELF/hash, build and converter-test logs, JSONL, transcript and summary. No real
+device was accessed or modified; storage publication semantics are unchanged.
+
+QEMU benchmark firmware builds, and Duo `file-tree,legacy-shell` compilation
+also passes, covering the non-QEMU branch of the added output code. The phase
+instrumentation and converter validation are retained.
+
+### Pair hash-page reads during full streaming verification (2026-09-11)
+
+The full streaming verifier now fetches separate Merkle-tree extents in
+aligned two-page runs. Its hash cache uses eight windows of up to two pages,
+retaining the existing 16-page total budget. Content read-ahead stays separate.
+Compact envelopes use demand reads, and range-read policy is unchanged. Failed
+transfers still invalidate the window before awaiting; only successful reads
+publish a cache address. All hash emissions and the final root remain checked.
+
+The uncached host fixture now verifies full content and exact two-page runs
+for 1 MiB and 4 MiB native CAS blobs, as well as range behavior. The 360 KiB
+case continues through the existing small-blob reader. Required leaf-level
+and upper-level hash corruption must also fail full reads. The selected suite
+passes 236 tests, one ignored; Duo compilation and QEMU firmware build pass.
+
+A matched 16 MiB QEMU file workload passes. Verify-stage requests decrease
+286 → 262 (8.4%), with exactly 17,612,800 bytes read in both runs. All stage,
+publish and remove counters remain identical. Total reads decrease 314 → 290,
+with read/write bytes, write requests and flushes unchanged. This is fewer
+physical requests, not a wall-clock or physical-SD speedup claim.
+
+The matched 64 MiB file control also passes: total reads fall 1,645 → 1,557
+(5.3%), while read bytes, write bytes, write requests and flushes exactly match
+baseline. Both sizes use fresh VMs, 128 MiB RAM, the same seed/template, one
+un-warmed sample and 4/2 MiB/s, 400/200 IOPS limits. They establish request-count
+savings for these workloads, not latency distributions. Individual native CAS
+proof working sets larger than the 16-page hash cache need separate attribution.
+
+Evidence is `target/storage-full-proof-runs-20260911/`, with the candidate
+ELF/hash, exact patch, test/build logs, phase-bearing JSONL, transcripts and
+matched counter summary. The measured ELF and final runtime algorithm match;
+test expectations were corrected separately after the build. No physical
+device was accessed or modified.
+
+The production three-boot file-tree gate passes GC pressure, cold recovery
+and powered-off verification. The full-verification hash-page batching is retained.
+
+### Full verification beyond the hash-cache budget (2026-09-11)
+
+The uncached host fixture now includes native 8 MiB and 16 MiB CAS objects,
+whose separate proof trees contain 32 and 64 pages, respectively. Full streaming
+verification reads each tree page exactly once in aligned two-page requests:
+32 pages / 16 requests and 64 pages / 32 requests. The cache remains 16 pages;
+these workloads stream a proof tree larger than the resident cache.
+
+Exact request-set assertions now cover all five object sizes through 16 MiB.
+The existing five range shapes per size (including 32 descending dispersed
+ranges), exact content checks, and required lower/upper sibling corruption
+checks also run for the larger objects. These results qualify the tested access
+orders; they do not imply arbitrary randomized range orders avoid LRU eviction
+or establish a physical-SD timing benefit.
+
+Evidence is `target/storage-large-proof-audit-20260911/`. This round expands
+regression qualification only; the runtime algorithm and cache budget are
+unchanged. No real device was accessed or modified.
+
+The final focused test passes all 25 range configurations, five full-object
+checks and ten corruption cases; the runtime prefix is byte-identical to the
+pre-turn source. Logs and `summary.json` record the results.
+
+### Current 256 MiB file qualification with phase attribution (2026-09-12)
+
+The current full-proof-run ELF passes a fresh 256 MiB file write, exact full
+readback and durable removal in a 128 MiB guest. The benchmark generates and
+checks bounded chunks rather than allocating a whole-file test buffer. One
+un-warmed sample uses seed 14476452505690153217 and the same blank template,
+4/2 MiB/s bandwidth and 400/200 read/write IOPS limits. Total workload time is
+222.233878 s; this is a capacity/correctness observation, not a latency distribution.
+
+| Phase | Read requests | Write requests | Flushes | Read bytes | Write bytes |
+|---|---:|---:|---:|---:|---:|
+| Stage | 3,684 | 3,039 | 84 | 23,961,600 | 284,196,864 |
+| Publish | 1 | 7 | 3 | 4,096 | 172,032 |
+| Verify | 5,546 | 0 | 0 | 288,587,776 | 0 |
+| Remove | 2 | 7 | 3 | 36,864 | 172,032 |
+| Total | 9,233 | 3,053 | 90 | 312,590,336 | 284,540,928 |
+
+All phase sums reconcile. Read/write amplification relative to logical file
+bytes is 1.1645 / 1.0600. Three capacity-growth messages are present in the
+transcript; do not infer a GC count solely from phase totals. Staging's 3,684
+read requests averaging about 6.4 KiB each suggest a useful next attribution
+point for metadata work; the counters alone do not identify the call sites.
+
+This refreshes the older 256 MiB qualification on the current implementation,
+without claiming one recent change caused the difference from historical data.
+Evidence is `target/storage-file256-phases-20260911/`, containing JSONL, serial
+transcript, exact ELF provenance and `summary.json`. No runtime changes were
+made this round, and no physical device was accessed or modified.
+
+### Physical-page attribution of 256 MiB staging (2026-09-12)
+
+A diagnostic ELF records physical misses only while the sequential-file stager
+runs, including each returned page's Storage v2 body/seal magic and record kind.
+The unthrottled diagnostic completes exact file verification and reproduces
+all seven staging counters of the throttled baseline: 3,684 reads, 5,850 pages,
+23,961,600 bytes, with the same writes/flushes. Request lengths and page logs
+reconcile exactly. Serial instrumentation makes its elapsed time unsuitable
+for performance comparison. Both kernel files were restored to their exact
+pre-instrumentation snapshots after building the diagnostic ELF.
+
+| Recognized on-media category | Pages read (body + seal) | Distinct body / seal addresses |
+|---|---:|---:|
+| Superblock | 88 | 2 / 2 |
+| Checkpoint | 68 | 2 / 2 |
+| Segment header | 372 | 85 / 85 |
+| Extent descriptor | 2,204 | 502 / 502 |
+| Segment summary | 372 | 85 / 85 |
+| Segment final seal record | 372 | 85 / 85 |
+| No recognized record magic | 2,374 | 773 |
+
+Recognized record pages account for 59.4% of staging read bytes; extent bodies
+and seals alone account for 37.7%. The remaining 40.6% includes untyped pages
+and must not be equated with file content (it can include catalog/allocation
+payloads or cleared pages). Tags describe returned bytes, not an additional
+independent authentication step; the successful workload supplies its normal
+storage checks.
+
+The trace touches 2,225 distinct physical page numbers but reads 5,850 pages.
+Repeated addresses are not automatically redundant: checkpoint/superblock
+updates and possible generation changes require fresh checks. Segment headers
+appear 186 times across 85 addresses, and extent bodies 1,102 times across
+502 addresses. This motivates investigating bounded scan-proof retention and
+metadata working-set pressure, rather than enlarging content read-ahead. The
+trace did not record generations, so it does not prove repeated proof identities.
+
+Evidence: `target/storage-stage-trace-20260912/`, containing diagnostic ELF/hash,
+patches, serial transcript, JSONL, reconciled categories and restore verification.
+The historical log tag `payload` means unrecognized record magic, not verified
+user payload. No production instrumentation remains and no real device was accessed.
+
+### Scan-proof capacity experiment: 48 versus 96 entries (2026-09-12)
+
+A temporary build changes only `VERIFIED_SEGMENT_SCAN_CAPACITY` from 48 to 96.
+Both uninstrumented ELFs pass a fresh 256 MiB file write, exact full readback
+and durable removal with 128 MiB guest RAM, seed 14476452505690153217 and the
+same blank disk template. Each runs one un-warmed, unthrottled sample. The
+48-entry control reproduces all aggregate counters of the preceding baseline.
+
+| Counter | 48 entries | 96 entries |
+|---|---:|---:|
+| Total read requests | 9,233 | 8,946 |
+| Total read bytes | 312,590,336 | 309,567,488 |
+| Staging read requests | 3,684 | 3,572 |
+| Staging read bytes | 23,961,600 | 22,781,952 |
+| Verification read requests | 5,546 | 5,371 |
+| Verification read bytes | 288,587,776 | 286,744,576 |
+
+Both runs retain 3,053 write requests, 284,540,928 write bytes and 90 flushes.
+Doubling the entry limit saves 3.11% of total read requests and 0.97% of total
+read bytes (2.88 MiB); staging read bytes fall 4.92%. This establishes a modest
+capacity benefit for this workload, not a latency improvement or a complete
+explanation of repeated metadata reads. Single unthrottled timings do not
+support a causal timing claim.
+
+The production limit remains 48: the modest reduction does not yet justify
+raising the retained-memory ceiling, especially for smaller guests. A future
+capacity change should measure resident allocation and enforce a byte budget
+for variable-length extent vectors as well as an entry bound. The source was
+restored byte-for-byte before building the 48-entry control. Evidence lives in
+`target/storage-scan-capacity-trial-20260912/`: both ELFs and hashes, build logs,
+JSONL, serial logs, counter comparison and source-restoration check. This trial
+adds no runtime change.
+
+### Page-cache intrusive LRU trial, not retained (2026-09-12)
+
+The current cache finds a replacement by scanning up to 512 entry timestamps.
+A trial replaces timestamps with previous/next page keys and head/tail keys,
+eliminating the victim scan while preserving exact LRU and page-buffer reuse.
+Its cost is additional BTreeMap lookups on ordinary hits and a larger entry:
+the host representation grows from 16 to 40 bytes, excluding map-node overhead.
+
+An extracted-source host fixture using a mutex shim passes the existing 256
+hit-mask combinations and buffer-reuse tests, plus 6,000 operations checked
+against an independent map/deque LRU model. It checks bytes, both link directions,
+eviction, overwrites, range reads, invalidation, clear and allocation-time
+competing inserts. QEMU and Duo `file-tree,legacy-shell` builds/checks pass.
+The 256 MiB fresh file workload passes and exactly preserves all aggregate
+and file-phase I/O counters of the 48-entry scan-cache control.
+
+Four unthrottled 16 MiB runs use before/after/after/before order, each with one
+warmup and three retained samples. All 16 workloads pass and corresponding
+aggregate/phase I/O counters match. Retained medians are 2.271, 5.088, 4.665 and
+4.851 seconds. The large drift in the unchanged control prevents a causal
+end-to-end timing conclusion.
+
+An isolated host microbenchmark (100,000 operations, five trials) observes
+replacement-plus-hit medians of 98.87 to 40.10 ms, but hit-only medians of 14.00
+to 22.70 ms. These are host/mutex observations, not SD or guest CPU measurements.
+They expose the tradeoff rather than establish a storage speedup. The trial is
+not retained: it increases hit-path map work and resident metadata without a
+demonstrated end-to-end benefit. Any follow-up should avoid repeated map lookups
+for recency updates, for example by evaluating bounded indexed links.
+
+Evidence is `target/storage-page-cache-linked-lru-20260912/`: saved before/trial
+sources, exact patch, extracted tests, microbenchmark sources/results, firmware,
+build logs, QEMU JSONL/transcripts and summaries. Production source was restored
+byte-for-byte to its pre-trial snapshot. No production recovery gate was run
+for this rejected candidate; its workload checks do not substitute for that gate.
+
+### Indexed page-cache LRU, retained (2026-09-12)
+
+The follow-up keeps the page-key BTreeMap but replaces timestamps with compact
+slot indices. A bounded array stores each slot's page key and previous/next
+indices. Recency updates use array accesses after the existing map lookup;
+victim selection uses the oldest slot rather than scanning all cache entries.
+Map insertion/removal still costs O(log N). Removed slots are reused through
+a free list; replacement continues to reuse the victim's boxed page buffer.
+
+The map entry remains 16 bytes on the measured 64-bit host. Link slots are
+16 bytes each, with at most 512 slots (64 for the Duo Python configuration):
+8 KiB / 1 KiB of slot storage, excluding allocator overhead. Clearing the cache
+resets the live/free lists and retains the bounded vector allocation. Page
+capacity, exact LRU order, write invalidation and physical-proof cache clearing
+are unchanged.
+
+Extracted-source host tests with a mutex shim pass at both 512 and 64 entries.
+They include 256 hit-mask combinations, buffer reuse and competing insertion
+checks, plus 6,000 mixed operations against an independent map/deque model.
+Each step checks cached bytes, live links, free slots and list coverage.
+The host microbenchmark uses 100,000 operations per trial, five trials:
+
+| Host median | Timestamp scan | Indexed links |
+|---|---:|---:|
+| Replacement followed by hit | 62.11 ms | 23.67 ms |
+| Hit only | 10.33 ms | 9.53 ms |
+
+These measurements isolate cache work with a host mutex; they do not measure
+SD latency or establish a guest end-to-end speedup. The structural benefit is
+removing the full victim scan without adding map lookups to cache hits.
+
+The fresh 256 MiB file workload passes in a 128 MiB QEMU guest. Every aggregate
+and file-phase I/O counter matches the timestamp control: 9,233 reads /
+312,590,336 bytes, 3,053 writes / 284,540,928 bytes, and 90 flushes. The production
+three-boot gate passes durable links, recursive removal, GC pressure, cold
+recovery and powered-off verification. Duo `file-tree,legacy-shell` compilation
+also passes. No physical device has been measured.
+
+Evidence is `target/storage-page-cache-indexed-lru-20260912/`: before/final
+sources, exact patch, host fixtures and logs, microbenchmark sources/results,
+benchmark ELF/hash, QEMU JSONL/transcript, firmware build logs and three-boot
+recovery evidence. The indexed LRU implementation is retained.
+
+### Indexed LRU under small-store GC pressure (2026-09-12)
+
+Matched small-store ELFs differ only in the page-cache implementation and its
+tests. Both start fresh with 16 provisioned segments, 128 MiB guest RAM, seed
+32 and 128 retained 4 KiB `object-durable-put-get` samples, without warmups.
+QEMU limits reads/writes to 4/2 MiB/s and 400/200 IOPS. The timestamp control
+was built from the saved pre-indexed source; the indexed source was restored
+byte-for-byte before either workload ran.
+
+Both runs pass every sample and complete 43 GC rounds. The seven I/O counters
+match for each corresponding sample, not just in aggregate. Each GC report's
+read/write requests, live object/blob counts, copied bytes and reclaimed
+segments also match (pause timing is excluded from this equality check).
+Both totals are 6,487 reads / 32,575,488 bytes, 2,321 writes / 88,788,992 bytes
+and 745 flushes. This additionally reproduces the earlier retained-object
+baseline under repeated page invalidation, eviction and slot reuse.
+
+The sum of measured workload times is 49.54 s for the timestamp control and
+52.02 s for indexed LRU; sample medians are 36.69 and 57.43 ms. These are one
+ordered pair of growing-store runs with mixed ordinary/GC operations. They
+do not demonstrate an end-to-end speedup or isolate the cause of the timing
+difference. Retaining the cache optimization is supported by its structural
+and isolated-host improvement plus correctness qualification, not by a claim
+that this QEMU workload became faster.
+
+Evidence: `target/storage-indexed-lru-small-store-20260912/`, including both
+ELFs/hashes, build logs, JSONL and serial transcripts, source-restoration
+verification and a reproducible `analyze.py` that checks sample identity,
+geometry, throttle configuration, per-sample I/O and per-round GC reports.
+This qualification adds no runtime changes and makes no physical-SD claim.
+
+### Reverse-order timing check for indexed LRU (2026-09-12)
+
+The exact same ELF hashes were rerun in candidate/control order with the same
+fresh disk, seed, 128 samples, 16-segment geometry and SD-style QEMU limits.
+All four runs pass: per-sample I/O and every GC report match across both orders.
+
+| Run order | Timestamp total | Indexed total |
+|---|---:|---:|
+| Timestamp then indexed | 49.54 s | 52.02 s |
+| Indexed then timestamp | 41.43 s | 41.26 s |
+
+The earlier approximately 5% difference does not reproduce. The unchanged
+ELFs vary substantially between runs, so these observations establish neither
+a stable regression nor an end-to-end speedup. Keep the distinction between
+isolated cache work and workload wall time; further identical timing reruns
+alone would not resolve the source of this variability.
+
+Serial attribution identifies 42 GC-containing samples (43 GC rounds) and
+86 samples without GC in every run. In the reverse pair, GC-containing samples
+sum to 39.17 / 39.19 seconds for timestamp/indexed, versus 2.25 / 2.07 seconds
+without GC. Thus roughly 95% of measured time belongs to GC-containing
+workloads. This is not a measurement of time exclusively inside the collector:
+those samples also perform their ordinary put/get work. It prioritizes further
+GC-path attribution over additional LRU timing tuning.
+
+Evidence is under `target/storage-indexed-lru-small-store-20260912/reverse/`,
+with `analyze_reverse.py` and `reverse-summary.json` in its parent directory.
+No runtime changes were made for this check.
+
+### GC phase I/O attribution (2026-09-12)
+
+A temporary PageDevice diagnostic hook snapshots physical block counters at
+GC phase boundaries. The diagnostic small-store ELF completes the same 128
+retained-object samples and 43 GC rounds unthrottled. Every sample's seven I/O
+counters matches the indexed-LRU throttled control. Phase differences reconcile
+with each GC report and the aggregate; serial-instrumented timings are not used.
+
+| Completed phase | Reads | Read bytes | Writes | Write bytes | Flushes |
+|---|---:|---:|---:|---:|---:|
+| Typed children, manifests and planning | 0 | 0 | 0 | 0 | 0 |
+| Blob relocation and manifest staging | 2,382 | 10,321,920 | 522 | 51,363,840 | 2 |
+| Remaining target metadata and segment finish | 0 | 0 | 153 | 10,575,872 | 0 |
+| Staged checkpoint-root verification | 1,169 | 9,666,560 | 0 | 0 | 0 |
+| Manifest and copied-blob verification | 2,905 | 11,898,880 | 0 | 0 | 0 |
+| G+1 publication and successor mount | 23 | 655,360 | 129 | 528,384 | 129 |
+| Old checkpoint seal clear | 0 | 0 | 43 | 176,128 | 43 |
+| G+2 allocation staging and verification | 0 | 0 | 129 | 1,761,280 | 43 |
+| G+2 publication and successor mount | 0 | 0 | 86 | 352,256 | 86 |
+| Total | 6,479 | 32,542,720 | 1,062 | 64,757,760 | 303 |
+
+These are physical requests submitted within each interval. Buffered writes
+can be issued when a later stage drains the builder, so the phase name does
+not independently classify every transferred byte's record type. Zero physical
+reads likewise does not mean zero logical reads or CPU work.
+
+Target verification accounts for 4,074 reads (62.9% of GC reads) and 21,565,440
+read bytes (66.3%). Relocation contributes 2,382 reads (36.8%). The absence of
+physical reads during manifest loading argues against adding a manifest cache
+for this workload. The next useful attribution is target layout and repeated
+reads during staged-root/copied-blob verification, while preserving all
+integrity checks. This measurement does not justify skipping target readback.
+
+Evidence is `target/storage-gc-phase-trace-20260912/`: diagnostic ELF/hash,
+three exact patches and before/diagnostic snapshots, build log, serial trace,
+JSONL and reproducible phase reconciliation. `device.rs`, `gc.rs` and platform
+source were restored byte-for-byte immediately after the build. No diagnostic
+hook remains in production source and no physical device was accessed.
+
+### Verify relocated blobs from newest to oldest (2026-09-12)
+
+GC now traverses the relocated snapshot's blob table in reverse order during
+target verification. Manifest staging and the snapshot are both BlobKey ordered,
+so this visits newer target pages before an older-to-newer scan can evict them.
+Every existing manifest, copied-payload hash, padding and Merkle check remains
+in place before G+1 publication. The change adds no cache or on-media format.
+
+In the 16-segment retained-object workload (128 fresh 4 KiB samples, seed 32,
+128 MiB guest), all samples pass. Compared with the forward-order baseline:
+
+| Counter | Forward verification | Reverse verification |
+|---|---:|---:|
+| Read requests | 6,487 | 5,125 |
+| Read bytes | 32,575,488 | 26,996,736 |
+| Write requests | 2,321 | 2,321 |
+| Write bytes | 88,788,992 | 88,788,992 |
+| Flushes | 745 | 745 |
+| GC rounds | 43 | 43 |
+
+Reads fall 21.0% by request count and 17.1% by bytes. Each corresponding
+sample's writes/flushes and every GC round's live counts, copied bytes,
+reclaimed segments and write requests remain identical. This trial is
+unthrottled and compared by deterministic I/O counters, not elapsed time.
+
+The default-capacity 256 MiB file write/full verification/durable removal
+also passes in 128 MiB RAM. All aggregate and file-phase counters match the
+previous implementation exactly: 9,233 reads / 312,590,336 bytes, 3,053 writes /
+284,540,928 bytes and 90 flushes. The selected host suite passes 236 tests with
+one existing ignore, including acknowledged copied-payload/padding corruption
+and GC recovery tests. Duo `file-tree,legacy-shell` compilation passes.
+
+Evidence is `target/storage-gc-reverse-verify-20260912/`: before/final source,
+patch, small/default ELF hashes, build/test logs, JSONL, serial transcripts
+and counter reconciliation. The small-store ELF was built before explanatory
+comments were added; its runtime change is the same reverse traversal.
+These results do not measure physical-SD latency.
+
+The production three-boot file-tree gate passes GC pressure, cold recovery
+and powered-off verification. Reverse target verification is retained.
+
+### Reverse verification under SD-style QEMU limits (2026-09-12)
+
+The retained reverse-order ELF and the forward-order control were run
+consecutively in that order, each on a fresh 16-segment store with 128 MiB RAM,
+128 retained 4 KiB samples, seed 32 and no warmups. Limits were 4/2 MiB/s and
+400/200 read/write IOPS. Both complete every sample and 43 GC rounds.
+
+Each corresponding sample reproduces its implementation's earlier I/O counters.
+Reverse order retains 5,125 reads / 26,996,736 bytes versus 6,487 reads /
+32,575,488 bytes for forward order: 21.0% fewer reads and 17.1% fewer read bytes.
+Both still issue 2,321 writes / 88,788,992 bytes and 745 flushes. GC live counts,
+copied bytes, reclaimed segments and write requests are unchanged per round.
+
+The sums of guest workload intervals are 41.60 s (reverse) and 46.28 s (forward),
+with sample medians of 48.01 and 54.67 ms. The approximately 10% lower sum is
+an observation from this ordered pair, not a stable latency estimate: earlier
+identical-ELF runs showed substantial timing variation. These sums also exclude
+host/UART command turnaround between samples. The repeatable result is the
+physical I/O reduction under both unthrottled and throttled configurations.
+
+Evidence is `target/storage-gc-reverse-verify-20260912/throttled/`: JSONL and
+serial transcripts for both runs, run logs, `analyze.py` and `summary.json`
+including ELF hashes and per-sample reconciliation. No runtime code changed
+for this qualification. Physical SD performance remains unmeasured.
+
+### Default-capacity write cost and early-compaction trial (2026-09-12)
+
+The current default-capacity ELF passes 128 retained 4 KiB put/get samples
+(seed 32, 128 MiB RAM, fresh disk, unthrottled). It exposes 223 provisioned
+segments, admits more space on five growth requests, and performs eight GC
+rounds. Total physical writes are 38,924,288 bytes for 524,288 user bytes
+(74.24x for this complete workload), versus 88,788,992 bytes in the deliberately
+constrained 16-segment pressure test. This is workload-level write amplification,
+not a general estimate for arbitrary stores. The last ordinary 4 KiB sample
+writes 266,240 bytes and reports 255 authority records.
+
+A temporary build lowers `STORAGE_V2_COMPACT_MIN_RECORDS` from 2048 to 128;
+this shared constant affects both steady-state and boot compaction eligibility.
+The fresh workload exercises steady-state compaction twice, reducing streams
+129 -> 66 and 128 -> 97. All 128 samples pass, but total cost increases:
+
+| Counter | Default threshold | Threshold 128 trial |
+|---|---:|---:|
+| Read requests | 3,626 | 3,729 |
+| Read bytes | 39,096,320 | 39,399,424 |
+| Write requests | 1,392 | 1,475 |
+| Write bytes | 38,924,288 | 43,319,296 |
+| Flushes | 469 | 509 |
+| GC rounds | 8 | 12 |
+| Final authority records | 255 | 161 |
+
+The shorter stream does not compensate for the extra compaction/GC work in
+this sequence: write bytes rise about 11.3%. The threshold change is rejected;
+the original source was restored byte-for-byte immediately after building
+the trial. No additional cold-recovery qualification is claimed for this
+rejected build.
+
+Every GC report in both default-capacity runs records zero copied blob bytes.
+Inspection shows `relocate_live_state` still emits all live manifests and
+`required_gc_segments` budgets all of them unconditionally. This identifies a
+more direct next investigation: retain an existing manifest only if both its
+own segment and all referenced extents remain outside the selected sources.
+Any such optimization must update reservation planning and preserve recovery
+validation; the observations alone do not authorize reusing a pointer into
+a reclaimed segment.
+
+Evidence is `target/storage-default-retained-20260912/`: baseline/trial JSONL,
+serial logs, summaries, trial ELF/hash, before/trial platform snapshots and
+restoration verification. The original reverse-GC verification and indexed
+LRU remain in place. This round retains no new runtime change.
+
+### Unconditional reuse of unselected manifests: prototype rejected (2026-09-12)
+
+A prototype shares one decision between reservation planning and relocation:
+retain a manifest only when its own segment and every referenced extent are
+outside the selected sources. It still reads/validates the resulting manifests
+before publication. Metadata telemetry counts only manifests actually written;
+memory estimates remain conservative. No extra persistent cache is introduced.
+
+The selected host suite passes 238 tests with one existing ignore. A new
+integration fixture retains the exact manifest pointer and bytes across two GC
+rounds with intervening segment reuse, checks that its segment stays Allocated,
+passes the powered-off image verifier after both rounds, then cold-mounts and
+reads all 128 KiB through the original handle. Planner fixtures were updated to
+supply sorted catalog mappings; classification tests cover selected manifest
+records, selected extents, missing mappings and null pointers. Duo compilation
+passes.
+
+Default-capacity QEMU results for 128 retained 4 KiB objects are mixed:
+
+| Counter | Before | Manifest reuse prototype |
+|---|---:|---:|
+| Read requests | 3,626 | 7,601 |
+| Read bytes | 39,096,320 | 77,828,096 |
+| Write requests | 1,392 | 1,295 |
+| Write bytes | 38,924,288 | 30,310,400 |
+| Flushes | 469 | 469 |
+| GC rounds | 8 | 8 |
+| Blob bytes copied by GC | 0 | 0 |
+
+All 128 samples pass. Writes fall 22.1%, but read bytes nearly double and read
+requests more than double. Retained manifests remain spread across historical
+segments, making increased scan/verification work a likely explanation; this
+trial does not separately attribute that extra read traffic. The prototype is
+not retained. Follow-up needs to consider metadata locality and scan-proof
+working sets, rather than optimize write bytes in isolation.
+
+Three stdio runs were rejected by the strict parser because serial JSON keys
+lost characters; the first stopped before any GC. Adding 100 ms between samples
+did not eliminate the issue. A temporary runner using a local Unix-socket
+serial backend completed the workload with the same ELF. The precise cause of
+the stdio losses is not established. No missing counter was inferred or repaired,
+and no timing comparison is claimed across transports. The wrapper appends the
+serial argument after the standard runner constructs its environment metadata;
+the wrapper source documents this additional actual launch argument.
+
+Evidence is `target/storage-gc-manifest-reuse-20260912/`: prototype source/patch,
+new test fixture, successful test/build logs, rejected stdio runs, socket runner,
+successful `retained-socket3.jsonl` and transcript, counters and ELF hash. Both
+modified source files were restored to their pre-trial contents; the accepted
+reverse-verification optimization remains. The rejected prototype did not run
+the production three-boot gate or the large-file QEMU qualification.
+
+### Manifest reuse versus scan-proof capacity (2026-09-12)
+
+All 3,975 extra read requests in the 48-entry reuse prototype occur inside GC:
+GC reads rise from 727 to 4,702, while reads outside GC remain 2,899. Two
+diagnostic ELFs raise only the verified-segment scan cache's entry limit to 192,
+one with the original manifest rewriting and one with the reuse prototype.
+Both complete the same fresh 223-segment, 128 MiB, 128-object workload using
+the local Unix-socket serial wrapper. The 48-entry results are the earlier
+matched workloads; all four runs pass every sample and perform eight GC rounds.
+
+| Implementation / scan-cache entries | Read requests | Read bytes | Write bytes |
+|---|---:|---:|---:|
+| Original / 48 | 3,626 | 39,096,320 | 38,924,288 |
+| Original / 192 | 3,626 | 39,096,320 | 38,924,288 |
+| Manifest reuse / 48 | 7,601 | 77,828,096 | 30,310,400 |
+| Manifest reuse / 192 | 3,690 | 39,276,544 | 30,310,400 |
+
+Increasing capacity changes neither writes/flushes nor GC round counts within
+either implementation. With reuse, GC reads fall from 4,702 to 791; the original
+stays at 727. This isolates scan-proof cache pressure as the main source of the
+reuse prototype's extra reads in this workload. At 192 entries, reuse saves
+22.1% of write bytes while adding about 0.46% of read bytes versus the original.
+No elapsed-time improvement is claimed.
+
+Neither diagnostic change is retained. A production design must account for
+the bytes retained by variable-length extent vectors and queue storage, rather
+than simply quadrupling an entry limit. Candidate directions are an explicit
+cache byte budget or a reuse policy constrained by its scan working set.
+
+Evidence is `target/storage-gc-reuse-proof-capacity-20260912/`: build logs,
+both ELFs/hashes, socket-backed JSONL/transcripts, `analyze.py`, factorial
+counter summary and exact source-restoration verification. `store.rs` and
+`gc.rs` were restored before either diagnostic workload ran. The launcher uses
+the same temporary socket wrapper documented in the preceding experiment.
+
+### Bounded scan-proof cache and manifest reuse retained (2026-09-12)
+
+GC now retains an existing manifest when its record and every referenced extent
+are outside the selected source segments. Reservation planning uses the same
+classification; metadata telemetry counts only manifests actually written.
+All resulting manifests remain validated before publication, and recovery
+memory estimates remain conservative.
+
+The verified-segment scan memo allows at most 192 entries and 256 KiB of
+requested resident heap capacity per memo. The budget includes actual deque
+capacity and each extent vector's capacity, including unused slots. It excludes
+allocator bookkeeping/rounding and transient caller scan workspace. Oversized
+proofs are not retained; allocation failure declines optional caching. LRU
+removal enforces both bounds. Exact segment/generation keys, checkpoint horizon
+checks and retired-segment invalidation remain intact.
+
+Fresh single-hart TCG QEMU runs use 128 MiB RAM, a private 1 GiB image and
+unthrottled block I/O. Object workloads retain 128 distinct 4 KiB objects with
+seed 32. The comparison baseline is the accepted reverse-verification code
+with 48 scan entries and unconditional manifest rewriting.
+
+| Workload / counter | Before | Bounded cache + reuse |
+|---|---:|---:|
+| Default 223 segments: read bytes | 39,096,320 | 39,276,544 |
+| Default 223 segments: write bytes | 38,924,288 | 30,310,400 |
+| Small 16 segments: read bytes | 26,996,736 | 15,933,440 |
+| Small 16 segments: write bytes | 88,788,992 | 71,536,640 |
+| 256 MiB file: read bytes | 312,590,336 | 303,964,160 |
+| 256 MiB file: write bytes | 284,540,928 | 284,540,928 |
+
+Default writes fall 22.1% with 0.46% more read bytes; the bounded implementation
+matches the prior 192-entry diagnostic's I/O exactly. Small-store read bytes
+fall 41.0% and write bytes 19.4%. Flush counts remain 469, 745 and 90 respectively;
+GC rounds remain eight and 43 for the object runs. The file workload includes
+write, full readback and durable deletion, and performs no GC. All samples pass.
+These are block-traffic measurements, not elapsed-time or physical SD results.
+
+Validation passes 240 selected host tests with one existing ignore, default
+and small QEMU release builds, Duo compilation, and the production three-boot
+file-tree gate including cold recovery and powered-off verification. New tests
+exercise cache capacity charging, byte-pressure LRU eviction, replacement,
+clear/retain and oversized-proof rejection. The manifest fixture verifies exact
+pointer/byte retention across two GC rounds with segment reuse, offline image
+verification and cold reads through the original handle.
+
+Evidence is `target/storage-gc-bounded-proof-cache-20260912/`: source snapshots
+and scoped patches, test/build logs, saved ELFs and hashes, all three JSONL runs,
+serial transcripts, counter summaries and retained gate logs. Benchmarks use
+`target/storage-gc-manifest-reuse-20260912/socket-runner.py`; as documented above,
+the wrapper adds a local Unix-socket serial argument after runner environment
+metadata construction. Strict sample validation remains enabled. This combined
+change is retained, superseding the earlier rejected unbounded prototypes.
+
+### Bounded-cache reuse under QEMU device limits (2026-09-12)
+
+A serial A/B/B/A qualification compares the saved pre-change reverse-GC ELF
+with the retained bounded-cache/manifest-reuse ELF. Each run starts from a
+fresh private disk with 16 provisioned segments, one TCG hart and 128 MiB RAM,
+then retains 128 unique 4 KiB objects (seeds 32 through 159). Both versions use
+the same Unix-socket serial wrapper. Disk limits are 4 MiB/s reads, 2 MiB/s
+writes, 400 read IOPS and 200 write IOPS, with cache=none and aio=threads.
+
+| Run order | Implementation | Sum of guest operation times | Slowest operation |
+|---|---|---:|---:|
+| 1 | Before | 37.723 s | 1.986 s |
+| 2 | Bounded cache + reuse | 27.095 s | 1.281 s |
+| 3 | Bounded cache + reuse | 27.163 s | 1.279 s |
+| 4 | Before | 38.116 s | 1.973 s |
+
+The mean summed guest operation time falls from 37.919 s to 27.129 s (28.46%).
+This excludes boot and host/serial delays between commands. All 512 samples
+pass strict validation; every run performs 43 GC rounds and 745 flushes.
+Repeated runs of each ELF have identical block counters, also matching the
+preceding unthrottled qualification: reads fall from 26,996,736 to 15,933,440
+bytes and writes from 88,788,992 to 71,536,640 bytes. Median individual operation
+latency remains approximately 24 ms; the improvement includes lower long
+operations during the pressure workload, rather than a comparable reduction
+for every ordinary operation.
+
+These two repetitions per ELF support a benefit under this specific QEMU rate
+profile. They do not establish physical SD performance or simulate flash
+translation, erase-block garbage collection or card-specific flush latency.
+The unthrottled baseline remains separate. No runtime code changes in this
+qualification. Evidence is `target/storage-bounded-cache-throttled-20260912/`:
+ordered launcher, exact command files, ELF paths/hashes, wrapper snapshot, four
+JSONL/transcript pairs, validation and counter assertions in `analyze.py`, and
+`summary.json`. The wrapper's additional serial argument remains outside the
+standard runner's pre-launch environment metadata, as documented above.
+
+### Manifest-reuse scaling to 256 retained objects (2026-09-12)
+
+Two fresh default-capacity QEMU runs extend the unique 4 KiB retained-object
+sequence to 256 objects (seeds 32 through 287). The saved reverse-verification
+ELF is compared with the retained bounded-cache/manifest-reuse ELF, using one
+TCG hart, 128 MiB RAM, 223 provisioned segments, no device throttling and the
+same Unix-socket serial transport. Every sample passes in both runs.
+
+| Counter | Before | Bounded cache + reuse |
+|---|---:|---:|
+| Read requests | 17,510 | 8,642 |
+| Read bytes | 127,737,856 | 68,399,104 |
+| Write requests | 4,446 | 3,733 |
+| Write bytes | 200,523,776 | 133,787,648 |
+| Flushes | 1,205 | 1,205 |
+| GC rounds | 52 | 52 |
+
+Reads fall 46.5% and writes 33.3%. Comparing successive 32-object windows
+shows no late reversal: the final window reads 6,123,520 versus 45,871,104
+bytes and writes 19,509,248 versus 52,908,032 bytes. This covers a larger
+working set but does not prove cache behavior at every capacity. GC may
+select different physical content after the optimized layout diverges.
+
+Substantial metadata amplification remains: the candidate's final ordinary
+4 KiB put reports 397,312 write bytes, three flushes and 511 authority records.
+This motivates further attribution of authority history and checkpoint writes;
+it is not evidence that these writes can safely be omitted. No runtime change
+is introduced in this qualification and no elapsed-time comparison is claimed.
+Evidence is `target/storage-reuse-256-retained-20260912/`: ordered launcher,
+commands, ELF hashes, two JSONL/transcript pairs, per-32-object counters and
+GC counts in `summary.json`, and the analysis script. The Unix-socket launch
+argument provenance follows the earlier wrapper qualification.
+
+### Ordinary-put authority write attribution (2026-09-12)
+
+A repeat of the candidate's 256-retained-object run preserves its powered-off
+QEMU disk through a cleanup wrapper. All 256 samples pass, and every sample's
+block counters match the preceding run exactly. The V2 region starts at logical
+block 2048; raw dense-image tools must not be pointed at the whole disk.
+The independent framing parser validates the final generation's sealed record
+pairs and SHA-256 of each extent payload. At checkpoint generation 367:
+
+| Extent | Payload bytes | Descriptor pair + padded payload bytes |
+|---|---:|---:|
+| Encoded 4 KiB blob | 4,480 | 16,384 |
+| Manifest | 256 | 12,288 |
+| Catalog delta | 416 | 12,288 |
+| Authority | 262,848 | 274,432 |
+| Allocation | 184 | 12,288 |
+
+Authority is the dominant component, about 69.1% of the measured 397,312 write
+bytes including its descriptor pair and page padding. The catalog already uses
+an increment rather than a full snapshot. Authority contains 513 records of
+512 bytes, one 64-byte principal and a 128-byte header; there are no object
+bindings or external roots. The benchmark's 511-record field is the pre-append
+observation, not the final on-media count. The five framed extents sum to
+327,680 bytes. Two segment header/summary/seal sets account for 49,152 bytes;
+checkpoint publication writes three pages (12,288 bytes), leaving 8,192 bytes
+outside this static accounting. Static final-state inspection alone does not
+attribute transient zero/preclear writes, so those remaining bytes are not
+assigned a measured cause here.
+
+The whole-disk migration verifier rejects this image with `persistent authority
+record stream length is invalid`: `recover_record_stream` still caps the stream
+at the legacy M4 journal's 512 sectors, while production Storage V2 admits a
+larger bounded authority payload. This is a verifier coverage gap, not a passed
+cold-recovery result. Record and payload validation do not substitute for full
+logical recovery. Extend and qualify that verifier before using it to accept
+larger authority histories; separately investigate bounded authority deltas or
+safe compaction to reduce the identified write cost.
+
+Evidence is `target/storage-authority-write-attribution-20260912/`: capture
+wrapper, 256-sample JSONL/transcript, final disk, attribution script/summary,
+and rejected verifier outputs. No runtime code is changed by this experiment.
+
+### Offline recovery of extended authority histories (2026-09-12)
+
+The independent migration verifier now recovers a bounded logical record stream
+directly, sharing the existing sequence/CRC-chain validation and semantic
+recovery engine. It no longer copies that stream into the fixed 512-sector M4
+journal. Raw M4 image recovery still scans exactly the original physical region.
+The authority payload/record bounds match production's 64 MiB encoded payload
+ceiling, including the header deduction for the record-count limit. This is an
+admission ceiling, not evidence of qualification at the maximum size.
+
+The saved 256-object disk with 513 authority records now passes the complete
+native migration verifier, superseding the previous capacity rejection. The
+retained production file-tree disk also passes native/file-tree verification.
+New fixtures prove that the 513th record affects logical recovery while it is
+outside fixed M4 image recovery; they reject truncation, corruption after the
+old boundary, reordered/duplicated records and an exceeded caller record budget,
+and accept the exact budget. Migration selftests pass 25,129 cases; the legacy
+strict-prefix suite passes 19 records times 512 cuts. Python compilation and
+diff whitespace checks pass. Firmware and on-media formats are unchanged.
+
+Evidence is `target/storage-authority-verifier-20260912/`: before/after verifier
+sources, source hashes, selftest logs, the previously rejected native disk's
+successful full report, and the retained file-tree disk's successful report.
+
+### Foreground authority compaction at 256 records: candidate (2026-09-12)
+
+A diagnostic ELF changes only the default-capacity foreground compaction
+threshold from 2,048 to 256 records. The small-store threshold, cold-boot
+threshold, policy validation, record-reduction admission rule and all other
+runtime code remain unchanged. Its source was restored before benchmarking.
+The comparison uses the retained bounded-cache/manifest-reuse baseline and the
+same 256 unique retained 4 KiB object sequence, default 223-segment provisioning,
+128 MiB RAM, single-hart TCG and unthrottled Unix-socket serial runner.
+
+| Counter | Baseline | Foreground threshold 256 |
+|---|---:|---:|
+| Read bytes | 68,399,104 | 64,811,008 |
+| Read requests | 8,642 | 8,109 |
+| Write bytes | 133,787,648 | 120,111,104 |
+| Write requests | 3,733 | 3,642 |
+| Flushes | 1,205 | 1,213 |
+| GC rounds | 52 | 52 |
+
+All 256 samples pass strict validation. Writes fall about 10.2%, reads about
+5.2%, with eight additional flushes. Two compactions reduce 257 records to 130
+and 256 to 193; the final pre-put record observation falls from 511 to 321.
+This is promising but not yet retained: rate-limited timing, cold recovery and
+broader workload qualification remain necessary, especially because extra
+flushes can matter on real devices. It does not supersede the earlier rejected
+128-record threshold trial, which used a different runtime and workload length.
+
+Evidence is `target/storage-authority-compact256-20260912/`: before/trial source,
+build log, saved ELF/hash, 256-sample JSONL/transcript, analysis and summary.
+The working source is verified identical to the pre-trial snapshot; the default
+foreground threshold remains 2,048. No elapsed-time benefit is claimed.
+
+### Foreground 256-record compaction: rate-limited qualification (2026-09-12)
+
+The saved baseline and candidate ELFs each run the same 256-object workload on
+a fresh disk, in that order, at 4 MiB/s reads, 2 MiB/s writes, 400 read IOPS and
+200 write IOPS. Both use default 223-segment provisioning, single-hart TCG,
+128 MiB RAM and Unix-socket serial capture. All 512 samples pass. Each ELF's
+complete I/O counters match its earlier unthrottled run exactly, including
+52 GC rounds; candidate flushes remain 1,213 versus baseline 1,205.
+
+Summed guest operation time is 65.260 s before and 56.711 s with the candidate,
+a 13.1% reduction in this single pair. Median operation time is 60.600 versus
+41.325 ms and maximum is 6.940 versus 6.292 s. Timing excludes boot and host
+inter-command delays. This is one pair under a specific QEMU rate profile,
+not a physical-card performance estimate or a repeated statistical result.
+
+The candidate's final disk is retained after QEMU exits. It passes the complete
+native migration verifier using the original blank image as unmanaged-prefix
+baseline, covering the final state after both foreground compactions. This is
+powered-off independent recovery validation, not a firmware reboot test.
+The candidate remains unretained pending file-tree and firmware cold-start
+qualification; working source still uses the 2,048-record foreground default.
+
+Evidence is `target/storage-compact256-throttled-20260912/`: launcher, commands,
+ELF hashes, capture-wrapper source, two JSONL/transcript pairs, final candidate
+disk, counter/timing analysis and successful `native-verifier.json`. The wrapper
+appends its Unix serial argument after normal runner metadata construction.
+
+### Foreground compaction threshold retained (2026-09-12)
+
+The default-capacity foreground threshold is now a named 256-record constant.
+Cold compaction remains at 2,048 records; regions of at most 16 segments remain
+at 128. Existing policy validation, reduction admission and watermark behavior
+are unchanged. This retains the candidate evaluated in the preceding two
+experiments: 10.2% fewer write bytes and 5.2% fewer read bytes for the 256-object
+workload, with eight additional flushes, and 13.1% lower accumulated guest time
+in one rate-limited QEMU pair. Those timing limits still apply.
+
+The saved candidate ELF passes 256 MiB file write/full-readback/durable-delete
+qualification with exactly unchanged counters: 303,964,160 read bytes,
+284,540,928 write bytes and 90 flushes. The final named-constant source passes
+the production three-boot file-tree gate, including hard links, symlink,
+recursive removal, GC pressure, cold recovery and powered-off verification.
+Duo compilation passes from its firmware directory. An initial root-directory
+check omitted the firmware target configuration and failed; its log is retained
+separately and is not counted as target validation. No real-board execution is
+claimed. The preceding captured compacted image also passed the full independent
+native verifier; this gate is additional file-tree/reboot regression coverage.
+
+Evidence is `target/storage-compact256-qualification-20260912/`: file JSONL and
+counter comparison, gate build/transcript and retained boot reports, successful
+`duo-target.log`, source snapshots/hash and retained-decision summary. The
+working tree keeps the new foreground constant. Python sample validation and
+diff whitespace checks pass.
+
+### Sixteen-source GC rounds: diagnostic candidate (2026-09-12)
+
+A saved diagnostic ELF raises only `GC_MAX_SOURCES_PER_ROUND` from eight to
+sixteen, on top of the retained 256-record foreground compaction and bounded
+scan-proof cache. Existing source-memory and target-space admission checks stay
+in force. Source is restored before running the candidate. Both workloads retain
+256 unique 4 KiB objects on fresh default-capacity QEMU disks with 223 provisioned
+segments, 128 MiB RAM, one TCG hart and unthrottled Unix-socket serial transport.
+
+| Counter | Eight sources | Sixteen sources |
+|---|---:|---:|
+| Read bytes | 64,811,008 | 56,627,200 |
+| Read requests | 8,109 | 6,626 |
+| Write bytes | 120,111,104 | 83,046,400 |
+| Write requests | 3,642 | 2,931 |
+| Flushes | 1,213 | 973 |
+| GC rounds | 52 | 22 |
+| GC copied blob bytes | 322,560 | 300,160 |
+| Total reclaimed segments | 416 | 352 |
+
+All 256 samples pass. Write bytes fall 30.9%, read bytes 12.6%, and flushes 19.8%.
+The reduction does not come from copying more live blob content. Fewer rounds
+also avoid generating as much new metadata garbage, although physical source
+selection and final free-space states differ. This finite-workload comparison
+is not proof of identical steady-state capacity or lower worst-case pause.
+Rate-limited latency, small-store pressure and recovery qualification are still
+required before retaining the change. The production source limit remains eight.
+
+Evidence is `target/storage-gc-source16-20260912/`: source snapshots, build log,
+ELF/hash, complete JSONL and transcript, counter/GC analysis and verified source
+restoration. No elapsed-time result is claimed for this diagnostic run.
+
+### Sixteen-source GC: small-store and host qualification (2026-09-12)
+
+The same candidate is built with the 16-segment small-store feature and run
+with 128 unique retained 4 KiB objects, seeds 32 through 159, 128 MiB RAM and
+a fresh unthrottled single-hart QEMU disk. All samples pass strict validation.
+Compared with the retained eight-source small-store baseline, read bytes change
+from 15,933,440 to 15,978,496 (+0.28%), writes from 71,536,640 to 71,249,920
+(-0.40%), flushes from 745 to 737, and GC rounds from 43 to 42. Copied blob
+bytes decline slightly from 6,173,440 to 6,160,000. The small-store foreground
+compaction threshold is unchanged between these ELFs. The larger-store gain
+does not generalize to a substantial small-store gain in this sequence.
+
+Host qualification is incomplete: the library suite reports 204 passed,
+one existing ignore, and one failed fixture precondition in
+`gc_after_batched_staging_preserves_the_id_high_water`: the candidate no longer
+produces the isolated free hole that fixture requires. This is not a reported
+data mismatch, but it removes intended fragmented-placement coverage and must
+be addressed without weakening the assertion. Cargo stops before the requested
+integration suites, so those are not claimed to have passed for this candidate.
+
+The candidate remains unretained; source is restored to eight sources per
+round. Next qualification must restore meaningful fragmented-placement coverage
+and measure rate-limited pauses before considering a production policy.
+Evidence is `target/storage-gc-source16-small-20260912/`: before/trial source,
+small-store ELF/build, complete failed host log, passing QEMU JSONL/transcript
+and comparison summary. This run introduces no production runtime change.
+
+### GC fixture coverage across eight/sixteen-source policies (2026-09-12)
+
+Two fixtures now provision enough dead data to exercise their intended partial
+collection cases under either source bound. The high-water fixture uses nine
+rather than three dropped two-segment commits per round. Its isolated-hole
+precondition remains, and an additional assertion compares every stored page
+in the occupied neighbor before/after reuse. It still checks ID high-water
+across GC/cold mount and reads the pinned staged stream afterward.
+
+The manifest-retention fixture uses 64 test segments and ten dropped objects
+before each collection, so a sixteen-source round has sufficient dead sources
+without selecting the protected live manifest. Exact pointer/byte retention,
+Allocated state, both offline verifications and cold payload reads remain
+required. The earlier failed pointer equality was caused by the fixture's live
+manifest entering the selected set; no assertion is weakened to accept it.
+
+With sixteen-source runtime code, the final fixtures pass alongside 205 library,
+five fused recovery, 24 GC recovery and six steady-state tests (240 passes and
+one existing ignore across the completed runs). Restoring the eight-source
+runtime and rerunning both modified fixtures also passes. Test improvements
+are retained; the production runtime source limit remains eight pending latency
+and firmware qualification. Evidence is `target/storage-gc-fragment-fixture-20260912/`:
+before/final fixture sources, intermediate failure logs, successful candidate
+suites, baseline fixture runs and source-restoration summary.
+
+### Sixteen-source GC under QEMU rate limits (2026-09-12)
+
+A fresh baseline/candidate pair runs 256 unique retained 4 KiB objects with the
+same seeds, 223 provisioned segments, 128 MiB RAM, one TCG hart and Unix-socket
+serial transport. Device limits are 4 MiB/s reads, 2 MiB/s writes, 400 read IOPS
+and 200 write IOPS. All 512 samples pass; both ELFs reproduce their respective
+unthrottled block counters exactly, including 52 versus 22 GC rounds.
+
+| Guest operation metric | Eight-source baseline | Sixteen-source candidate |
+|---|---:|---:|
+| Summed time | 56.854 s | 36.727 s |
+| Median | 42.234 ms | 41.660 ms |
+| P95, nearest rank | 1.604 s | 1.054 s |
+| P99, nearest rank | 4.569 s | 2.556 s |
+| Maximum | 6.252 s | 3.890 s |
+| Operations over one second | 16 | 14 |
+
+Summed operation time falls 35.4%; the observed tail improves in this pair.
+These are finite-workload sample statistics, not population quantiles or a
+worst-case pause bound. Boot and host inter-command delays are excluded; the
+QEMU limits do not model physical flash behavior. Larger source sets can still
+have different copying costs for other live/dead layouts.
+
+The powered-off candidate disk passes the complete native migration verifier
+with the original blank image as unmanaged-prefix baseline. This qualifies its
+final compacted state independently; firmware reboot/file-tree qualification
+remains before retaining the source-limit change. Runtime source remains eight.
+Evidence is `target/storage-gc-source16-throttled-20260912/`: exact command files,
+ELF hashes, capture wrapper, both JSONL/transcripts, final disk, analysis/summary
+and successful native verifier report. The wrapper's extra Unix serial argument
+is added after standard runner environment metadata, as in preceding runs.
+
+### Sixteen-source GC retained after firmware qualification (2026-09-12)
+
+`GC_MAX_SOURCES_PER_ROUND` is now sixteen. Existing source-memory accounting,
+relocation target admission, source ranking and checkpoint/recovery protocols
+remain unchanged. The preceding default-capacity qualification measured 30.9%
+fewer write bytes, 12.6% fewer read bytes and 19.8% fewer flushes for 256 retained
+objects; a single rate-limited QEMU pair measured 35.4% less accumulated guest
+time and a lower observed tail. The 16-segment workload was approximately flat
+(-0.40% write bytes, +0.28% reads). These results retain their finite-workload
+and QEMU-only limits; a sixteen-source bound is not a wall-clock pause bound.
+
+The candidate passes 256 MiB file write/full readback/durable deletion with
+identical counters to eight sources: 303,964,160 read bytes, 284,540,928 write
+bytes and 90 flushes. Current firmware passes the production three-boot
+file-tree gate (hard links, symlink, recursive removal, GC pressure, cold
+recovery and powered-off verification), and Duo target compilation passes.
+The earlier 240 host tests plus one existing ignore and independently verified
+compacted disk supply the candidate's additional recovery evidence. The improved
+fragmented-placement and retained-manifest fixtures remain in the worktree.
+
+Evidence is `target/storage-gc-source16-qualified-20260912/`: file sample and
+counter comparison, gate/build log and retained boot reports, Duo check log,
+before/final GC source, hash and retained-decision summary. Strict sample
+validation and whitespace checks pass. This supersedes the preceding temporary
+source-restoration notes: production now retains the sixteen-source bound.
+
+### Retained-object scaling hits quota-candidate capacity (2026-09-12)
+
+An attempted extension to 512 retained unique 4 KiB objects stops at the same
+boundary in both saved eight-source and sixteen-source ELFs: samples 0..255
+pass, then sample 256 (seed 288, the 257th object) fails closed. Both runs use
+fresh default-capacity disks, 128 MiB RAM and the same unthrottled serial runner.
+The runner honors stop-on-failure; the second ELF is dispatched separately
+after the first failure. No 512-object performance result is claimed.
+
+Both transcripts report `InvalidQuotaPolicy` after publication, with 257 CAS
+objects already present. Free segments remain 14 for eight sources and 10 for
+sixteen sources, so this boundary is not disk exhaustion. Code inspection
+identifies the matching 256-entry `MAX_PENDING_PERSISTENT_CHARGES` table:
+`bind_persistent_candidate` returns `PrincipalCapacity` when its preallocated
+vector is full; the fused authority path invokes this after
+`publish_staged_object_with_authority` and maps the error to
+`InvalidQuotaPolicy`. The candidates have live charges because the workload
+retains its handles. This explains why earlier 256-object qualifications pass
+but cannot establish behavior beyond that bound.
+
+Further work must address capacity admission before publication and preserve
+quota accounting, rather than silently increasing the table or interpreting
+this failed attempt as completed benchmark work. Error reporting also needs
+to distinguish quota-candidate capacity from corrupt policy. No runtime change
+is introduced in this diagnosis. Evidence is
+`target/storage-gc-512-retained-20260912/`: exact commands/ELF hashes, both
+257-record JSONL/transcripts including failures, and `boundary-summary.json`.
+The original full-length analysis script intentionally cannot accept these
+incomplete runs as successful 512-object measurements.
+
+### Candidate-table admission before publication retained (2026-09-12)
+
+Persistent quota reservations now also reserve one candidate-table slot before
+promotion or publication I/O. A table-wide reserved count prevents other
+reservations or unreserved binders from stealing that capacity. Commitment
+transfers ownership of the slot to the committed charge; binding consumes it.
+Cancellation and dropping an unbound charge return only unused table capacity,
+never committed byte charges. The table remains bounded at 256 entries, and
+binding performs no allocation under the quota lock.
+
+A distinct `PersistentCandidateCapacity` quota error reaches the runtime as a
+proved pre-append admission rejection. The object facade reports
+`InsufficientMemory`, rather than `Corrupt`, and retains its valid predecessor
+proof. Other ambiguous append failures still invalidate recovery state. This
+does not increase the retained-object ceiling or make the 512-object benchmark
+possible; it removes the post-publication failure and misleading corruption
+classification at that boundary.
+
+Validation passes 241 selected host tests plus one existing ignore, covering
+slot exhaustion, idempotent reservation/binding, exclusion of unreserved binders,
+reservation cancellation, committed-unbound slot release without byte-quota
+release, and existing mutation/cancellation recovery tests. In QEMU, the first
+256 operations reproduce the prior I/O counters exactly. The expected 257th
+rejection now reports `InsufficientMemory`, with object count still 256 and
+generation 309 (previously 257 objects at generation 310 before failure).
+The rejected-operation disk passes full independent native verification; its
+report equals the earlier successful 256-object final-state report. The
+production three-boot file-tree gate and Duo target compilation also pass.
+
+Evidence is `target/storage-quota-candidate-admission-20260912/`: before/final
+source and hashes, test/build logs, saved ELF, boundary JSONL/transcript with
+its expected failed sample, captured disk, independent verifier result, retained
+boot reports and summary. JSONL validation checks record validity, not a claim
+that all 257 operations succeeded. The change is retained; no media format or
+quota byte limit changes.
+
+### Long-running create/read/revoke baseline (2026-09-12)
+
+The existing `object-revoke` workload completes 512 sequential 4 KiB operations
+with the retained runtime, including early candidate-slot admission. Each
+operation publishes and verifies its payload, revokes the capability and checks
+lookup denial; it is not a durable object-deletion benchmark. This keeps the
+number of simultaneously retained capabilities bounded and confirms that the
+256-candidate ceiling does not limit the lifetime count of such operations.
+All 512 samples pass in fresh default-capacity, single-hart TCG QEMU with
+128 MiB RAM and no device throttling.
+
+The legacy object byte generator repeats every 256 seeds (the seed term is
+truncated to one byte), so seeds 32..543 exercise two cycles of content. Despite
+the legacy `unique` label, this is not a 512-distinct-content run. The earlier
+256-retained-object runs use one complete cycle and are unaffected by this
+cross-cycle distinction. A longer unique-content experiment needs a different,
+explicitly versioned pattern before meaningful comparison.
+
+| Operations | Write bytes | Flushes |
+|---|---:|---:|
+| 1–128 | 27,049,984 | 440 |
+| 129–256 | 36,618,240 | 533 |
+| 257–384 | 48,738,304 | 548 |
+| 385–512 | 58,679,296 | 532 |
+
+Total writes are 171,085,824 bytes with 2,053 flushes and 60 GC rounds. All
+32,231,424 physical read bytes occur in the first block of 128 operations.
+Foreground history compaction runs four times, but quiescent compaction never
+runs and the final pre-put authority record count is 588. The write increase
+supports investigating quiescent orphan-history compaction for larger regions:
+its current runtime guard enables that path only at sixteen segments or below.
+Safety still depends on the existing exact-policy and empty-root-admission
+checks; workload behavior alone cannot justify discarding history.
+
+Evidence is `target/storage-revoke-longrun-20260912/`: complete JSONL/transcript,
+strict validation, analysis and per-128-operation summary. No runtime change or
+elapsed-time performance claim is introduced in this baseline measurement.
+
+### Large-region quiescent history compaction: candidate (2026-09-12)
+
+A diagnostic ELF enables the existing exact-policy, empty-root-admission
+compaction path for larger regions at 256 authority records. Small regions keep
+128. All pin exclusion, minimum record savings and publication checks remain
+unchanged. The working source is restored before benchmarking.
+
+The same 512-operation create/read/capability-revoke workload passes every
+sample on fresh default-capacity QEMU with 128 MiB RAM and one TCG hart. Content
+still follows the documented 256-seed cycle. Total write bytes fall from
+171,085,824 to 121,778,176 (28.82%); reads remain 32,231,424 bytes and GC rounds
+remain 60. Flushes rise from 2,053 to 2,061. Candidate writes per 128 operations
+are 27,049,984 / 31,879,168 / 32,247,808 / 30,601,216 bytes, rather than the
+baseline's increasing 27,049,984 / 36,618,240 / 48,738,304 / 58,679,296.
+
+Quiescent compaction executes twice. Maximum observed pre-put authority records
+are 257 and the final observation is 132 versus the baseline's 588. The final
+captured disk passes the full independent native migration verifier. These
+results support the intended history-bounding effect, but do not establish
+rate-limited latency, held-object behavior or firmware reboot qualification for
+the expanded policy. The candidate is not yet retained and no elapsed-time
+benefit is claimed.
+
+Evidence is `target/storage-quiescent-large-20260912/`: before/trial platform
+source, build and ELF, capture wrapper, 512-sample JSONL/transcript, final disk,
+per-window counters and successful `native.json`. Source restoration and strict
+sample validation pass; Unix-socket launch provenance follows earlier runs.
+
+### Expanded quiescent compaction with held objects (2026-09-12)
+
+The saved expanded-policy ELF completes 256 retained 4 KiB object operations
+on a fresh default-capacity, 128 MiB, single-hart TCG QEMU disk. Every sample
+passes, no quiescent compaction is reported, and every sample's complete block
+counters equals the corresponding pre-change candidate-admission baseline.
+This verifies that the expanded runtime call path does not compact this held
+working set or introduce physical I/O in the tested sequence. It is not an
+additional read of every older handle after every operation; the existing
+live-witness and GC recovery tests cover their separate invariants.
+
+Accumulated operation time is 11.639 s versus the prior baseline's 11.374 s;
+last-half totals are 6.666 versus 6.402 s. These non-contemporaneous unthrottled
+observations do not isolate a small CPU regression. Source inspection shows
+that the facade constructs the authority import before the core rejects a
+nonempty pin set; a future early negative hint could avoid that work, but must
+never replace the core admission guard. No new API or optimization is added
+from this observation alone.
+
+Evidence is `target/storage-quiescent-held-20260912/`: JSONL, serial transcript,
+run log and per-sample equality/timing summary. Strict sample validation passes.
+The expanded policy remains an unretained candidate pending rate-limited timing
+and firmware reboot/file-tree qualification; source stays at the existing
+small-region-only quiescent policy.
+
+### Expanded quiescent compaction under device rate limits (2026-09-12)
+
+A fresh baseline/candidate pair each completes 512 create/read/capability-revoke
+cycles at 4 MiB/s reads, 2 MiB/s writes, 400 read IOPS and 200 write IOPS, with
+128 MiB RAM and one TCG hart. All 1,024 samples pass strict validation, and each
+ELF's complete I/O totals exactly match its preceding unthrottled workload.
+The cyclic-content and capability-revocation semantics remain as documented.
+
+The reported latency field is explicitly put time plus get time: it includes
+foreground maintenance charged to put, but excludes subsequent capability
+revocation, boot and host inter-command delays. Summed put/get time changes
+from 59.613 s to 32.125 s (-46.1%). Median changes from 83.528 to 33.716 ms;
+nearest-rank P95 from 310.173 to 188.841 ms. Maximum remains approximately
+3.89 s (3.884 before, 3.888 after), so this pair does not improve the worst
+observed operation. Write bytes remain 171,085,824 versus 121,778,176; reads
+are identical and flushes increase from 2,053 to 2,061.
+
+This is one pair under QEMU rate limits, not a physical SD estimate or a
+statistical bound. Evidence is `target/storage-quiescent-throttled-20260912/`:
+ordered launcher, exact commands and ELF hashes, both JSONL/transcripts,
+counter-equality assertions and timing summary. The candidate remains
+unretained pending firmware/file-tree reboot qualification. No runtime changes
+are made in this measurement turn.
+
+### Expanded quiescent history compaction retained (2026-09-12)
+
+The existing baseline-policy quiescent compaction path now applies to larger
+regions at 256 records; regions of at most sixteen segments retain their
+128-record threshold. The core exact-policy, empty root/reader admission and
+minimum-saving checks are unchanged. A held-object workload already passed
+without any quiescent compaction and with identical per-operation block counts.
+The 512-cycle create/read/capability-revoke qualification measured 28.82% fewer
+write bytes; one rate-limited pair measured 46.1% less accumulated put/get time.
+Revocation is outside that latency field, and worst observed latency remained
+approximately 3.89 seconds. These measurement limits continue to apply.
+
+Final firmware qualification passes the production three-boot file-tree gate,
+including hard links, symlink, recursive removal, GC pressure, cold recovery and
+powered-off verification. Duo target compilation passes. The saved candidate
+also completes 256 MiB file write/full readback/durable deletion with exactly
+unchanged counters: 303,964,160 read bytes, 284,540,928 write bytes and 90 flushes.
+The earlier independently verified compacted disk supplies additional final-state
+recovery evidence. The expanded policy is retained, superseding earlier source
+restoration notes; firmware and media-format safety checks remain in force.
+
+Evidence is `target/storage-quiescent-qualified-20260912/`: file JSONL and counter
+comparison, gate build/transcript and retained boot reports, Duo check log,
+source snapshots/hash and retained-decision summary. Strict sample validation
+and whitespace checks pass. Physical SD behavior remains unmeasured.
+
+### Skip import reconstruction when pins exclude compaction (2026-09-12)
+
+A bounded allocation-free scheduling hint now checks the current mount, root
+registry and reader quiescence before the kernel constructs a complete authority
+import for optional history compaction. A negative result skips that optional
+work. A positive result can immediately become stale and does not authorize
+history removal: the core still validates the import and closes empty-root
+admission atomically before publication. No memory, media or policy limits are
+changed. This avoids decoding/allocation work on held-object writes once the
+history crosses the compaction threshold.
+
+The existing live-witness test now also asserts hint behavior with live objects,
+after release, and with/without an active reader. It and the compaction mutation/
+cancellation atomicity test pass. A fresh 256-retained-object QEMU run passes
+every sample with per-sample I/O exactly equal to the expanded-policy baseline.
+Summed time is 11.603 versus the earlier 11.639 seconds; this small difference
+is not a demonstrated speed improvement. The retained benefit is avoiding the
+known unnecessary import reconstruction, not an asserted latency percentage.
+
+The production three-boot file-tree gate and Duo target compilation pass.
+Evidence is `target/storage-quiescent-hint-20260912/`: source snapshots, focused
+test/build logs, saved benchmark ELF, held-object JSONL/transcript and comparison,
+retained boot reports and Duo log. Strict sample validation and whitespace checks
+pass. The hint is retained; the core compaction safety guard remains mandatory.
+
+### Four-page full-verification hash windows rejected (2026-09-12)
+
+The page adapter and both block backends already admit 128 KiB transfers;
+there is no additional adapter-level split below that ceiling. A bounded host
+experiment increased separate-tree full-verification hash fetches from two to
+four aligned pages while preserving the sixteen-page hash budget (four windows
+instead of eight). Range-proof behavior was left unchanged. The existing exact
+read-set test was adjusted only to expect four-page runs for complete verification.
+
+The candidate failed that test: a 64-page tree caused 1,280 requests and 5,120
+page reads, rather than sixteen four-page requests. Fewer independently retained
+windows caused repeated reads across interleaved tree levels. This is host
+uncached-device evidence, not measured QEMU or SD latency. The candidate was
+rejected before firmware qualification and the exact previous source restored.
+Evidence is `target/storage-hash-window4-20260912/`: before/trial snapshots,
+failing trial, restored regression log and machine-readable counter summary.
+
+### Tiered hash windows: bounded host candidate (2026-09-12)
+
+A follow-up experiment reserves one four-page window for leaf hashes and six
+two-page windows for upper levels, preserving the sixteen-page hash budget.
+Complete uncached verification of 16/32 MiB objects reads exactly 64/128 tree
+pages in 24/48 requests, versus the original 32/64 requests. Existing range
+read-set assertions and required-sibling corruption detection pass. The
+unbounded policy regresses at 64 MiB: 928 requests and 1,920 page reads for a
+256-page tree. The forty-segment test fixture supplies sufficient space; an
+initial twenty-segment attempt stopped at cleaner reserve before verification.
+
+Restricting tiered windows to 4–64 leaf-hash pages passes the extended test,
+including the original policy at 64 MiB (256 pages in 128 requests). This is a
+candidate for QEMU measurement, not an end-to-end speed claim. Runtime source
+was restored; only the expanded 32/64 MiB exact-read/corruption regression and
+its fixture capacity remain. No firmware or SD qualification is claimed.
+Evidence is `target/storage-hash-tiered-20260912/`: original, unbounded and
+bounded source snapshots; all trial logs; restored larger-object regression
+and structured summary. Next qualification must also check firmware memory
+bounds and end-to-end counters before considering runtime retention.
+
+### Bounded tiered hash prefetch retained after QEMU qualification (2026-09-12)
+
+The bounded candidate above is now retained. Full verification uses one
+four-page leaf-hash window and six two-page upper-level windows when padded
+leaf hashes occupy 4–64 pages. Other geometries retain the original windows;
+range proofs are unchanged. The sixteen-page hash budget is preserved, and
+geometry for the tiered policy is computed only on separate-tree hash reads.
+
+A sequential QEMU pair completes 256 MiB file staging, publication, complete
+readback and durable removal. Read requests decrease from 8,414 to 8,243
+(171 fewer, 2.03%); every saved request is in complete readback, whose requests
+decrease from 4,839 to 4,668. Read bytes remain 303,964,160, write bytes
+284,540,928, write requests 3,053 and flushes 90. Staging, publication and
+removal counters are exactly unchanged. Total interrupts decrease by 171.
+One unthrottled timing pair measures 24.660378 versus 23.905744 seconds; this
+is not evidence of a stable latency percentage or physical SD speedup.
+
+Qualification passes 241 selected host tests (one existing ignored test),
+including extended uncached 32/64 MiB read-set and corruption checks, GC and
+fused-append recovery. The production three-boot file-tree gate passes cold
+recovery and powered-off verification; Duo target compilation passes.
+Strict JSONL and whitespace checks pass. Evidence is
+`target/storage-hash-tiered-qemu-20260912/`: exact ordered commands and ELF
+hashes, saved candidate, before/after JSONL and serial logs, per-phase deltas,
+source snapshots, host/build/gate/Duo logs and retained-decision summary.
+
+### Small-cache ABBA withdraws tiered runtime retention (2026-09-12)
+
+Matched QEMU ELFs temporarily use a 64-page kernel cache, corresponding only
+to the cache capacity of the Duo `milkv-python` configuration. All other
+benchmark parameters remain unchanged. This is not an SD controller/card model.
+Four fresh-disk 256 MiB file samples run in before/after/after/before order.
+All pass. Each implementation repeats its exact I/O counters: tiered reads
+9,008 versus 9,179 requests, with identical 311,455,744 read bytes, 284,540,928
+write bytes, 3,053 write requests and 90 flushes. Savings remain exclusively
+in complete readback.
+
+Elapsed seconds are 24.300106 / 25.399294 / 25.121716 / 24.709728. Tiered mean
+25.260505 seconds exceeds the original 24.504917 seconds by about 3.08%.
+Two samples per implementation do not establish a universal regression, but
+both orders fail to support retention for the small-cache workload. The tiered
+runtime is withdrawn pending CPU/latency investigation, superseding the prior
+retention decision. The original two-page policy and normal cache configuration
+are restored; expanded 32/64 MiB read-set/corruption regressions remain.
+
+Evidence is `target/storage-tiered-cache64-20260912/`: both saved ELFs, ordered
+launchers/commands/hashes, four validated JSONL and serial logs, build logs,
+source snapshots and ABBA/counter summary. Sources were restored before QEMU
+execution, so runtime JSONL git metadata describes the restored working tree;
+the saved ELF hashes and build-source snapshots identify the tested overrides.
+No new hardware claim or memory-limit change is made.
+
+### Inline hash output buffer experiment rejected (2026-09-12)
+
+Inspection found a temporary 32-byte Vec for each hash-node read. An experiment
+shared the existing reader through a generic output-buffer factory: normal
+reads returned Vecs, while sibling and full-verification hash reads returned
+inline arrays. Range/pointer validation remained ahead of buffer creation;
+read-ahead, integrity checks and media ordering were unchanged. The selected
+241 host tests pass (one existing ignored test), including uncached exact-read
+sets, corruption detection and recovery.
+
+A fresh-disk 64-page-cache QEMU ABBA test of the 256 MiB file workload passes
+all four samples with exactly identical I/O: 9,179 reads / 311,455,744 bytes,
+3,053 writes / 284,540,928 bytes and 90 flushes. Seconds in execution order
+are 25.249669 / 25.917186 / 25.545376 / 24.147676. Candidate mean 25.731281
+exceeds baseline mean 24.698673 by about 4.18%. This small sample does not
+attribute the difference to allocation removal or the new async helper, but
+does not justify retaining this implementation. The exact previous source is
+restored; no firmware gate is claimed for the rejected implementation.
+
+Evidence is `target/storage-hash-inline-buffer-20260912/`: before/trial source,
+build/cache overrides, saved ELF and ordered commands/hashes, host log, four
+validated benchmark outputs/transcripts and decision summary. Runtime source
+metadata was collected after restoring the normal cache configuration; saved
+ELF hashes and source snapshots identify the 64-page test build. Physical SD
+behavior remains unmeasured.
+
+### File workload phase elapsed ticks (2026-09-12)
+
+QEMU file-sequential samples now expose `file_{stage,publish,verify,remove}_elapsed_ticks`.
+Three additional timer reads divide the existing workload interval; removal
+includes final async-scope cleanup through the original total-time endpoint.
+These measure elapsed time including I/O waits, not CPU cycles. The converter
+accepts old samples without times, but requires all four nonnegative integer
+fields and an exact sum to elapsed_ticks when any is present. Selftests reject
+missing, negative, boolean and inconsistent values.
+
+A 256 MiB QEMU run passes with unchanged baseline I/O (8,414 reads,
+303,964,160 read bytes; 3,053 writes, 284,540,928 write bytes; 90 flushes).
+Phase ticks sum exactly to total time: staging 159,254,280 (63.63%), publication
+143,340 (0.057%), verification 90,763,340 (36.27%), removal 102,960 (0.041%).
+This single sample prioritizes staging for further attribution; it does not
+explain earlier candidate regressions or demonstrate a performance improvement.
+Evidence is `target/storage-file-phase-time-20260912/`: prior source snapshots,
+build log and saved ELF, actual JSONL/transcript, phase summary and Duo check.
+The timer instrumentation is retained; storage algorithms are unchanged.
+
+### Separate staging workload generation from storage elapsed time (2026-09-12)
+
+QEMU file-sequential samples additionally expose `file_stage_{pattern,push,finish,other}_ticks`.
+Pattern measures SplitMix64 input generation, push measures awaited stager
+push calls, and finish measures awaited stager finalization. Other is the
+remaining staging interval, including setup, loop and timer overhead. These
+are elapsed intervals, including I/O waits, not CPU-cycle attribution. Their
+sum must exactly equal `file_stage_elapsed_ticks`; old samples remain accepted.
+Converter selftests reject missing, negative, boolean and inconsistent values.
+
+A fresh 256 MiB QEMU run passes with I/O exactly matching the prior baseline.
+Staging ticks are pattern 46,029,130 (31.14%), push 100,172,280 (67.76%), finish
+1,518,870 (1.03%) and other 109,500 (0.074%). Input generation therefore consumes
+a substantial part of measured staging. This identifies push internals as the
+next storage attribution target; optimizing the benchmark generator would not
+by itself demonstrate improved storage. The pattern and total workload timing
+semantics remain unchanged. Instrumentation is retained.
+
+Evidence is `target/storage-stage-time-20260912/`: prior source snapshots,
+QEMU build/saved ELF, validated JSONL and transcript, I/O equality and staging
+summary, plus Duo target check log. This single run is not a stable timing
+estimate or a physical SD measurement.
+
+### Batch staging poll-time diagnostic (2026-09-12)
+
+A temporary kernel-only probe times capacity preparation and wraps each
+`stage_fs_data_chunks_for_maintenance` future poll. It records awaited batch
+elapsed ticks, the sum of elapsed ticks inside polls and poll count. This
+separates active poll intervals from suspended intervals; neither is pure CPU
+or device time. Active intervals can include preemption, while suspended time
+includes backend execution, I/O wait and scheduling. Diagnostic printing occurs
+after the recorded batch interval and affects the enclosing workload timing.
+
+A 256 MiB QEMU file test passes with exactly unchanged baseline I/O. Twenty-two
+batch reports cover all 268,435,456 bytes, including the final partial batch.
+Capacity preparation totals 8,522,200 ticks, batch elapsed 90,388,290 ticks,
+active-poll elapsed 77,756,020 ticks and 5,578 polls. Active poll intervals occupy
+86.02% of batch elapsed. This points next attribution toward synchronous encoding,
+hashing and metadata work; it does not establish their individual shares.
+
+The exact pre-probe kernel source is restored. Evidence is
+`target/storage-push-poll-profile-20260912/`: before/probe source snapshots,
+QEMU build and saved diagnostic ELF, validated JSONL/serial log, all batch rows
+and aggregate summary. Runtime git metadata reflects restored source, so the
+saved diagnostic source/ELF identify the probe. No production instrumentation,
+algorithm change, latency improvement or physical SD claim is retained.
+
+### File batch internal elapsed attribution (2026-09-12)
+
+A temporary diagnostic splits maintenance file-data staging into node encoding
+(including input clone, codec, metadata construction and decoded-buffer drop),
+awaited `stage_blob_in_batch`, and awaited `publish_staged_batch`. Remaining
+batch elapsed includes admission, ancestry recovery and bookkeeping. Temporary
+RISC-V timer/accumulator hooks and kernel poll instrumentation are saved only
+as evidence and are fully removed from production source after building.
+
+All twenty-two batches covering 256 MiB pass; each batch's measured subintervals
+fit inside its wall interval. I/O is exactly unchanged from the baseline.
+Aggregate batch wall is 87,106,730 ticks: encoding 15,383,720 (17.66%), blob
+staging 64,885,460 (74.49%), publication 2,393,580 (2.75%), remainder 4,443,970
+(5.10%). Blob staging is the next attribution priority. Awaited sections include
+I/O/scheduling waits, and timer/diagnostic overhead prevents treating this as an
+uninstrumented latency comparison or a CPU-only breakdown.
+
+Evidence is `target/storage-stage-internal-profile-20260912/`: before/probe
+sources, build and saved ELF, validated JSONL/serial transcript, every batch's
+nested timing and aggregate summary. Normal sources were restored before the
+run; the saved source/ELF identify the temporary probe rather than runtime git
+metadata. No algorithm change or physical SD performance claim is made.
+
+### Complete streaming leaf borrowing: first implementation rejected (2026-09-12)
+
+Streaming BlobWriter::write_chunk normally allocates/zeros a temporary 4 KiB
+page, copies a complete leaf into it, then copies it into the owned scratch
+batch. A candidate borrowed complete input pages directly, retaining padding
+for short final leaves and the same failure/barrier path. The first implementation
+placed an awaited write_exact_page call in each full/partial branch.
+
+All 241 selected host tests pass (one existing ignored), including recovery and
+corruption checks. Four 256 MiB QEMU samples in ABBA order pass with identical
+I/O counters. Mean push ticks decrease 103,716,400 to 99,664,850 (3.91%), but
+mean verification ticks increase 95,012,140 to 106,573,960 (12.17%). Total mean
+seconds increase 24.863055 to 25.845784 (3.95%). No read algorithm was deliberately
+changed; this experiment does not attribute the cross-phase timing difference
+to code layout, async-state changes or another cause. Two samples per version
+do not establish a universal regression, but fail to justify retaining this
+implementation. Exact prior runtime source is restored.
+
+Evidence is `target/storage-stream-borrow-page-20260912/`: before/trial source,
+build and saved candidate, exact ordered commands/ELF hashes, host log, four
+validated JSONL/transcripts and per-phase/total mean summary. The staged timing
+fields expose a tradeoff that total I/O counts alone would miss. No physical SD
+claim or production qualification is made for this rejected candidate.
+
+### Baseline reproducibility and selected code-generation audit (2026-09-12)
+
+Rebuilding the restored runtime with storage-bench-128m produces a byte-identical
+ELF to `storage-stage-time-20260912/candidate.elf` (SHA-256
+c091abc28e400f89540aaeccace5e3870fd79acb562654b24623a1a0666f1af3).
+This rules out stale baseline build content in the complete-leaf borrowing ABBA
+comparison. The earlier source-before snapshot of legacy_shell naturally differs
+by retained stage-detail instrumentation; ELF equality is the authoritative
+reproducibility check here.
+
+LLVM symbol/disassembly comparison of that baseline and the rejected borrowing
+candidate shows the selected write_chunk future body grows 690 to 738 bytes
+(229 to 246 decoded instructions). The selected read_verified_blob body, two
+ManifestRangeReader read bodies and kernel file read_chunk future retain sizes
+4,288 / 1,094 / 1,306 / 652 bytes and identical instruction-mnemonic sequences.
+Their addresses move. This is not byte/operand equivalence or coverage of every
+callee, and does not establish a cause for the readback timing difference.
+A shared await after choosing the input page is a concrete next candidate to
+reduce write-state expansion; no runtime optimization is retained by this audit.
+
+Evidence is `target/storage-baseline-rebuild-20260912/`: rebuild log/hash result,
+both complete symbol tables, selected symbols, paired disassembly and instruction
+sequence summary. It supports build reproducibility and the stated narrow code
+comparison, not a physical SD or stable QEMU latency conclusion.
+
+### Shared-await streaming page borrowing rejected (2026-09-12)
+
+A second complete-leaf borrowing implementation selects a borrowed page or
+owned padded tail before a single shared write_exact_page await. It retains
+one source-level await but its selected compiled write_chunk future remains
+738 bytes, versus baseline 690; source simplification did not shrink that body.
+All 241 selected host tests pass (one existing ignored).
+
+Four fresh-disk 256 MiB QEMU samples in ABBA order pass with identical I/O.
+Mean push ticks are 101,574,445 versus 99,636,435 (candidate 1.91% lower),
+verification ticks 95,348,675 versus 100,853,965 (5.77% higher), and total seconds
+24.612369 versus 25.823085 (4.92% higher). Two samples per version do not
+establish a universal regression, but fail to support end-to-end retention.
+The exact prior source is restored. Further branch-shape variants are deprioritized
+in favor of attribution inside blob hashing/encoding; no timing cause is claimed.
+
+Evidence is `target/storage-stream-single-await-20260912/`: before/trial source,
+host/build logs, compiled symbols and saved ELF, exact ordered commands/hashes,
+four validated JSONL/transcripts and per-phase summary. No production gate or
+physical SD result is claimed for the rejected candidate.
+
+### Blob writer component timing identifies hashing priority (2026-09-12)
+
+A temporary QEMU probe accumulates four disjoint regions: Merkle push plus
+content-extent hasher update; content-page copying/buffering and awaited writes;
+write_chunk tree-emission draining; and awaited stage_commit. The normal batched
+staging probe supplies the enclosing wall interval. Hash timing also includes
+small index/bookkeeping operations; page/commit intervals include waits. Timers
+run per leaf and add overhead, so these are diagnostic proportions, not an
+uninstrumented CPU profile or a performance comparison.
+
+Twenty-two batches cover all 256 MiB and pass with unchanged baseline I/O.
+Batch wall totals 88,493,550 ticks. Hash regions total 45,403,900 (51.31% of
+batch wall), pages 15,678,840 (17.72%), tree emissions 1,443,740 (1.63%), and
+stage_commit 2,402,060 (2.71%). The remaining 23,565,010 ticks (26.63%) include
+file encoding, batch publication, preparation, ancestry and other bookkeeping.
+These percentages use whole-batch wall, not blob-only time. Every batch's
+measured regions fit its wall interval. Hash implementation and repeated work
+are the next priority; integrity checks remain required.
+
+Exact pre-probe source is restored. Evidence is
+`target/storage-blob-component-profile-20260912/`: before/probe sources,
+QEMU build and saved ELF, validated JSONL/serial transcript, batch records and
+summary. Saved sources/ELF identify the temporary instrumentation; runtime git
+metadata reflects restored source. No runtime optimization or physical SD
+claim is retained by this diagnostic.
+
+### SHA software backend audit and compact screening (2026-09-12)
+
+The pinned sha2 0.11.0 RISC-V build uses its unrolled software SHA-256 backend,
+already compiled at opt-level 3. Merkle leaf hashes include domain, object kind,
+leaf index and leaf length before content. Content-extent hashes cover the
+exact payload independently; these are different integrity commitments and
+cannot be substituted for one another.
+
+A temporary target rustflag `sha2_backend_soft="compact"` selects sha2's bundled
+compact software implementation without adding ISA requirements or changing
+storage source. This cfg selects software backend variants across sha2, not a
+new hardware accelerator. The selected compress256 body shrinks from 14,842
+to 1,422 bytes. A sequential 256 MiB QEMU screening pair passes complete
+readback/removal with identical I/O. Total seconds are 24.563940 versus
+26.908408; push ticks 102,786,030 versus 109,664,810 and verification ticks
+94,340,660 versus 108,872,320. One pair does not prove a universal slowdown,
+but provides no performance reason to retain this backend. Default build
+configuration is restored; no hardware or production qualification is claimed.
+
+Evidence is `target/storage-sha-compact-20260912/`: original/trial target config,
+build and saved ELF, symbol table, ordered launcher/commands/hashes, validated
+before/after JSONL and transcripts, and decision summary. Runtime metadata sees
+the restored configuration; saved config/ELF identify the test. Smaller code
+alone is not treated as storage performance improvement.
+
+### Borrowed file-node encoding retained (2026-09-12)
+
+The maintenance batch staging path now encodes node content from the input
+slice directly, instead of cloning it into an owned FsDataNodeV1 first.
+A crate-private parts encoder shares the original validation and canonical
+encoding implementation with the public owned-node API. Metadata takes the
+existing ancestor vector after encoding, avoiding its extra clone too. Normal
+3 MiB staging chunks no longer allocate a second 3 MiB content Vec during
+encoding. This is a source-level temporary-allocation reduction, not a measured
+whole-guest peak-memory bound. Disk format, hashes and publication barriers
+are unchanged; no integrity check is removed.
+
+Four fresh-disk 256 MiB QEMU samples in ABBA order pass with identical I/O.
+Mean push ticks decrease 101,807,965 to 88,370,445 (13.20%). Mean total seconds
+decrease 24.601213 to 22.492182 (8.57%). Mean readback ticks also change from
+94,868,220 to 85,300,625 although its algorithm was not changed; the complete
+timing difference is not attributed solely to saved copies. Both orders favor
+the candidate, but two samples per implementation are not a population bound
+or a physical SD result.
+
+All 241 selected host tests pass (one existing ignored), covering codecs,
+corruption checks, GC/fused recovery and steady-state behavior. Production
+three-boot file-tree verification passes hard links, symlink, recursive removal,
+GC pressure, cold recovery and powered-off checking. Duo target compilation,
+strict JSONL validation and whitespace checks pass. The change is retained.
+Evidence is `target/storage-fs-borrow-encode-20260912/`: before/final sources,
+compiled candidate and exact ABBA commands/hashes, host/build/gate/Duo logs,
+retained boot reports, four JSONL/transcripts and decision/phase summary.
+
+### Borrowed encoding under a 64-page cache (2026-09-12)
+
+Freshly rebuilt before/after firmware both use a temporary 64-page kernel cache
+and the same retained phase instrumentation. Four fresh-disk 256 MiB file tests
+in ABBA order pass. All I/O counters match: 9,179 reads / 311,455,744 bytes;
+3,053 writes / 284,540,928 bytes; 90 flushes. Mean push ticks decrease
+102,771,230 to 94,032,505 (8.50%). Verification ticks decrease 93,592,525 to
+91,937,825. However input-pattern ticks increase 46,993,545 to 64,408,615, and
+total mean seconds increase 24.522069 to 25.217461 (2.84%).
+
+These results support the observed push-time reduction, not a small-cache
+end-to-end speedup. The pattern-generation increase is recorded without causal
+attribution; it must not be hidden by reporting only favorable phases. The prior
+borrowed-encoding change remains retained for its avoided temporary content
+allocation and measured staging benefit. This cache experiment changes no
+production limits and makes no physical SD performance claim.
+
+Evidence is `target/storage-fs-borrow-cache64-20260912/`: before/after source and
+build logs, both ELFs, exact ABBA launcher/commands/hashes, four validated
+JSONL/transcripts and full per-phase summary. Normal cache configuration and
+retained optimized sources are restored and byte-compared to their saved
+snapshots. Runtime metadata reflects restored source; saved builds identify
+the 64-page override used for both measured versions.
+
+### Pattern-generation anomaly audit; icount diagnostic invalid (2026-09-12)
+
+The small-cache borrowed-encoding ELFs retain 142-byte pattern fill/matches
+bodies and a 72-byte word generator; their addresses move by ten bytes. The
+selected copy_from_slice helper bodies also retain sizes and instruction-mnemonic
+sequences. Paired disassembly is archived. This does not cover every callee,
+operand, runtime data placement or scheduling effect, and does not establish
+why pattern elapsed ticks differ.
+
+An attempted instruction-count virtual-clock run appended QEMU
+`-icount shift=0,align=off,sleep=off` to the serial wrapper's actual arguments.
+The baseline failed closed during file-tree root recovery before file staging;
+the ordered launcher consequently did not start the candidate. There are zero
+valid performance samples. The failure reason is retained without guessing its
+underlying cause. No timeout, recovery check or production configuration was
+changed to force the diagnostic to pass. Its clocks must not be interpreted as
+real latency or physical SD behavior.
+
+Evidence is `target/storage-pattern-icount-20260912/`: diagnostic wrapper and
+launcher, command/ELF hash record, failed baseline transcript/output, complete
+symbol tables, selected paired disassembly and audit summary. No runtime source
+change is retained, and the generation-time anomaly remains unresolved. Existing
+small-cache total-time results and their caveats remain in force.
+
+### Current representative QEMU matrix (2026-09-12)
+
+Nine scenarios on the retained borrowed-encoding ELF each run five samples in
+one fresh-disk VM (seeds 32–36, no warmups), and all 45 pass strict validation.
+Default cache is 512 pages with 128 MiB RAM and one TCG hart. Subsequent-four
+medians, keeping the first sample separate, are: 4 KiB object put 16.677 ms/get
+0.219 ms; 128 KiB put 24.623/get 5.321; 360 KiB put 35.435/get 12.816; 1 MiB
+put 69.277/get 33.092. Range-get on a 360 KiB object is 2.132 ms with the normal
+post-put cache and 4.334 ms after the existing data-cache clearing operation.
+These are get fields, not totals that also include put.
+
+File create/validate/remove medians are 12.718 ms for 4 KiB and 64.967 ms for
+1 MiB. The 16 MiB sequential workload, including generation, write, full readback
+and removal, is 1,407.985 ms. This is a short sequence, not a steady-state bound,
+and there is no matched Linux/SD baseline. Different workloads retain their
+existing content patterns and timing scopes; old-table ratios are not inferred.
+
+The 4 KiB object workload writes a median 137,216 bytes (33.5 times logical
+input) and issues three flushes. Its fixed metadata cost merits renewed
+attribution; required publication ordering must remain intact. Evidence is
+`target/storage-current-matrix-20260912/`: exact commands/ELF hash, nine complete
+JSONL/transcripts, first/subsequent latency ranges and counters, and report.md.
+No runtime code changes are made in this measurement turn.
+
+### Small-put media and write-request attribution (2026-09-12)
+
+A captured five-object 4 KiB QEMU run reproduces every sample's I/O from the
+current matrix. Its final put writes 139,264 bytes (136 KiB); the preceding
+matrix's four-sample median remains 137,216 bytes. Offline native verification
+passes and verifies five unique blobs. Latest checkpoint generation is eight.
+
+The final generation contains five extent records: canonical blob payload
+4,480 bytes / 16 KiB framed; manifest 256 bytes / 12 KiB framed; CAS catalog
+1,408 bytes / 12 KiB framed; authority 5,824 bytes (eleven records) / 16 KiB
+framed; allocation 137 bytes / 12 KiB framed. Extents total 68 KiB. Two segment
+header/summary/seal sets add 48 KiB. A second run with QEMU write tracing repeats
+all counters and attributes all eight final write requests: the first three
+write those 116 KiB, two 4 KiB writes preclear future segment seal pages, and
+three 4 KiB writes clear/write/seal the checkpoint slot (sectors 2104/2096/2104).
+The future seal positions and zero contents are checked against captured media.
+The resulting 68 + 48 + 8 + 12 KiB exactly equals measured 136 KiB.
+
+The duplicated segment structural overhead is a concrete next investigation:
+small data and metadata currently occupy separate segments. Any packing change
+must preserve pointer validation, free-space ownership and publication barriers;
+this attribution does not authorize dropping flushes. Evidence is
+`target/storage-small-write-attribution-20260912/`: captured disk and native
+verification, decoded/hash-checked records, original and traced runs, QEMU trace,
+wrappers, parser and exact byte accounting. No runtime changes are made.
+
+### Compact single-object fused packing (2026-09-12)
+
+Retain compact V2 single-object packing: the fused publisher reuses the existing
+batch publication machinery to place payload and metadata in one segment when
+they fit. Split/noncompact layouts retain their prior publication path; the
+batch publisher falls back to a separate metadata segment when necessary.
+Quota charges remain attached to the returned handle and checkpoint barriers
+are preserved. A new cold-recovery test requires a 4 KiB append to allocate
+exactly one segment and verifies recovered content.
+
+Five-object QEMU measurements save 28 KiB and two write requests on every put;
+normal subsequent puts still require three flushes. For 256 held 4 KiB objects,
+read bytes rise from 56,627,200 to 76,550,144 (+35.2%), while write bytes fall
+from 83,046,400 to 53,743,616 (-35.3%) and flushes from 973 to 829 (-14.8%).
+Both unthrottled captured candidate images pass offline native verification.
+
+One sequential before/after QEMU pair, throttled to 4/2 MiB/s read/write and
+400/200 read/write IOPS, completes all 256 samples on each side. Cumulative
+put+get latency is 36.949943 versus 30.120402 seconds (-18.5%). These are one
+pair of simulated measurements, not an SD-card result or a stable latency
+bound; the increased read traffic is a material tradeoff. Independent fresh
+images, 128 MiB RAM, one hart and TCG single-thread are used on both sides.
+
+Validation: 242 selected host tests pass, one ignored; fused append fault cuts,
+GC recovery and quota tests are included. The production three-boot file-tree
+gate passes (including offline verification), as does Duo file-tree/legacy-shell
+release compilation. No hardware was accessed. Evidence:
+`target/storage-single-object-pack-20260912/` contains source snapshots, saved
+benchmark ELF, exact command/hashes, JSONL and serial logs, captured images and
+native reports, comparison.json and qualification logs. The final source only
+changes documentation from the measured candidate.
+
+### Packed-segment scan memo capacity (2026-09-12)
+
+Increase the verified immutable-segment scan memo from 192 entries / 256 KiB
+to 256 entries / 320 KiB of requested resident allocations. This explicitly
+trades up to 64 KiB additional allocation budget for fewer descriptor-chain
+reads after compact single-object packing. Byte and entry limits, optional
+allocation failure behavior, exact generation identity, checkpoint horizon,
+and GC invalidation remain unchanged.
+
+A 256-object 4 KiB held-object QEMU run passes at read/write limits of 4/2 MiB/s
+and 400/200 IOPS. Relative to the preceding single-object packing run with the
+same limits, reads fall from 76,550,144 to 69,320,704 bytes (-9.4%) and requests
+from 8,274 to 7,439. Writes remain exactly 53,743,616 bytes / 1,874 requests and
+829 flushes. Cumulative put+get time is 30.120402 versus 28.318166 seconds
+(-6.0%): a sequential single comparison, not a replicated speed bound or SD
+hardware measurement. Baseline: storage-single-object-pack-20260912/limited-after.
+
+All read savings occur at the two GC episodes (sample indices 206 and 234).
+Growth episodes at indices 22, 55, 110 and 164 have exactly unchanged reads;
+inspection confirms grow() ends with a full mount(). This identifies growth
+remount authentication as a separate follow-up; it is not changed here.
+
+Qualification: 242 selected host tests pass / one ignored, including cache
+budget, eviction, generation/horizon and GC invalidation coverage; captured
+native disk verification reports status ok; the production three-boot file-tree
+gate and Duo file-tree/legacy-shell release compilation pass. This retains the
+bounded cache change. No hardware was accessed. Evidence and snapshots:
+`target/storage-scan-cache320-20260912/`.
+
+### Verified successor installation after growth (2026-09-12)
+
+Replace grow()'s full remount with the existing verified-successor installation
+protocol. Growth still reads back its new allocation extent, rereads/selects
+both checkpoint slots and superblock pairs, checks the predecessor checkpoint,
+and validates the exact growth allocation transition before publishing runtime
+state. Existing catalog, authority and CAS state move into the successor; only
+the old allocation moves into a transition witness. This avoids cloning the
+live object catalog. No new all-content verification claim is manufactured:
+the predecessor's CAS-verification flag is carried forward only if already set.
+Cold mount/scrub still performs its original media validation.
+
+The shared successor installer now accepts the compact predecessor witness.
+Growth's measured transient memory peak is passed separately so the old bitmap
+is not counted twice. The first implementation failed the existing exact-budget
+267-byte empty-store test; this was corrected without increasing that budget.
+The new regression compares 4 KiB and 128 KiB objects: growth I/O is identical,
+content reads succeed after two successive growths and a cold mount succeeds.
+
+All 256 held-object samples pass under QEMU's 4/2 MiB/s and 400/200 read/write
+IOPS limits. Compared with storage-scan-cache320-20260912/run.jsonl:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Cumulative put+get seconds | 28.318166 | 15.496130 |
+| Read bytes | 69,320,704 | 18,550,784 |
+| Read requests | 7,439 | 2,209 |
+| Write bytes | 53,743,616 | 53,694,464 |
+| Write requests | 1,874 | 1,862 |
+| Flush requests | 829 | 825 |
+
+Time decreases 45.3%, reads 73.2%. The only remaining read episodes are the
+same GC samples 206 and 234, with byte counts exactly matching the baseline;
+all growth-related device reads are served without additional block reads in
+this cached QEMU workload. This is a single sequential comparison on 128 MiB,
+one-hart TCG, not an SD-card result or a replicated latency bound.
+
+Qualification: 242 existing selected host tests and the new growth regression
+pass (243 total, one ignored). Includes exact-budget admission, all growth
+mutation failure/cancellation boundaries, cold/offline recovery and shared
+successor callers' fused-publication/GC tests. Captured native image verification
+reports status ok; production three-boot file-tree gate and Duo compilation pass.
+Retain this change. No hardware accessed. Commands/environment, candidate ELF,
+source snapshots, JSONL, captured disk, verifier and qualification logs are in
+`target/storage-growth-successor-20260912/`.
+
+### Growth successor with a 64-page cache, ABBA (2026-09-12)
+
+Qualify the retained growth-successor optimization with the block page cache
+restricted to 64 pages (256 KiB). Total guest memory remains 128 MiB; this is
+not a 64 MiB board simulation. Both ELFs contain compact single-object packing
+and the 320 KiB scan memo; only growth-successor installation differs.
+Independent images, one-hart TCG and 4/2 MiB/s plus 400/200 read/write IOPS are
+used for four runs in before/after/after/before order. Each holds 256 4 KiB
+objects using seeds 32..287. All 1,024 samples pass.
+
+| Metric per 256 operations | Before | After |
+| --- | ---: | ---: |
+| Mean cumulative seconds, two runs | 33.326043 | 18.194337 |
+| Read bytes | 86,618,112 | 26,492,928 |
+| Read requests | 9,856 | 3,716 |
+| Write bytes | 53,743,616 | 53,694,464 |
+| Flush requests | 829 | 825 |
+
+Every aggregate I/O count repeats exactly within each version. Time improves
+45.4%, reads 69.4%. Individual totals are 33.337486 / 18.227043 / 18.161630 /
+33.314600 seconds. Median operation latency changes only modestly, from
+36.23–36.38 ms to 35.13–35.81 ms. The gain is principally removal of growth
+spikes: the four growth samples together take 15.097542 seconds before versus
+0.139274 after in the first pair. Each new growth sample reads 8 KiB, compared
+with approximately 4.3/8.9/19.3/24.8 MiB before.
+
+GC remains: samples 206 and 234 take 8.855605 versus 8.851243 seconds in that
+pair, about 49% of the improved total. The maximum candidate operation remains
+about 5.51 seconds. The next bottleneck is therefore foreground collection,
+not residual content-proportional reads during growth. These QEMU measurements
+do not establish actual SD-card latency.
+
+Build provenance: copying saved sources with preserved timestamps initially
+caused Cargo to reuse an unsuitable artifact. No timed run used that pair.
+Both versions were rebuilt after updating source timestamps; compilation logs
+and distinct ELF hashes are saved. The unqualified ELF and logs are retained
+and explicitly named unqualified/stale. Runtime sources and normal page-cache
+configuration were restored before measurement and checked byte-for-byte.
+The saved source snapshots, commands.json, socket wrapper and ELF hashes are
+the authority for the compared code; runtime Git metadata reflects the restored
+worktree. This turn changes benchmark documentation only; the temporary 64-page
+cache override is not retained. Prior growth safety qualification remains in
+storage-growth-successor-20260912; these runs provide performance/readback
+coverage, not a new powered-off image verification.
+
+Evidence: `target/storage-growth-cache64-20260912/`, including all four JSONL
+files, serial logs, exact commands, builds, snapshots, analyze.py and summary.json.
+
+### Foreground GC phase I/O attribution, 64-page cache (2026-09-12)
+
+A temporary RISC-V hook records cumulative virtio counters at eight GC phase
+boundaries. The QEMU workload is the retained growth-successor runtime with a
+64-page block cache, 128 MiB guest, one-hart TCG, 256 held 4 KiB objects and
+4/2 MiB/s plus 400/200 read/write IOPS limits. All samples pass, and every
+sample's complete I/O counters match storage-growth-cache64-20260912/after.jsonl
+exactly. Diagnostic latency is not used as a performance comparison.
+
+Four collections occur in two foreground episodes. Their combined I/O is:
+
+| Phase | Read bytes | Read requests |
+| --- | ---: | ---: |
+| Typed-child decoding and mark | 0 | 0 |
+| Live manifest loading and planning | 18,612,224 | 2,204 |
+| Relocation writes, including source reads | 442,368 | 108 |
+| Staged root readback | 1,732,608 | 139 |
+| Manifest / relocated blob readback | 4,038,656 | 986 |
+| Publication and reuse barrier | 98,304 | 4 |
+
+Total GC reads are 24,924,160 bytes: manifest loading accounts for 74.7%,
+relocation source reads only 1.8%. The first collection alone reads 14,344,192
+bytes while loading live manifests/planning. Source inspection establishes
+that code between completed load_live_manifests and relocation contains no
+device reads, so the combined measured phase's I/O belongs to manifest loading.
+That path uses read_pointer_payload, which authenticates the containing segment
+chain on a scan-memo miss. This identifies metadata/segment proof access as the
+next target; reducing copied data alone cannot remove most of this workload's
+foreground read cost. The phase trace does not by itself distinguish memo
+miss reasons or prove a safe way to skip validation.
+
+No runtime optimization is added here. The hooks and cache override were
+restored before the run, using a saved instrumented ELF; source comparisons
+confirm normal runtime restoration. Snapshot source files and the saved ELF,
+not restored-worktree Git metadata, define the profiled implementation.
+Evidence: `target/storage-gc-phases-20260912/`, with before/trial sources,
+build, ELF, socket runner, environment, JSONL, phase serial trace and summary.json.
+This is QEMU evidence only; no hardware or new crash-recovery claim.
+
+### Rejected reverse GC manifest traversal (2026-09-12)
+
+Trial: load live manifests in reverse BlobKey order, then reverse the resulting
+Vec to preserve every downstream ordering invariant. All pointer/segment and
+payload validation, memory limits and publication behavior remain unchanged.
+243 host tests pass / one ignored. With 64-page block cache, 128 MiB guest,
+one-hart QEMU TCG and 4/2 MiB/s plus 400/200 read/write IOPS limits, all 256
+held 4 KiB objects pass.
+
+Compared with storage-growth-cache64-20260912/after.jsonl, total reads worsen
+from 26,492,928 to 26,796,032 bytes (+303,104), and read requests from 3,716 to
+3,794. Writes remain 53,694,464 bytes / 1,862 requests with 825 flushes. Single
+run cumulative latency changes from 18.227043 to 18.420752 seconds; this small
+timing difference is not independently established as a stable regression,
+but the trial does not reduce the targeted I/O. Reject and restore the original
+traversal. No new runtime change remains. The next diagnostic should count
+scan-memo hits/misses and evictions rather than infer them from traversal order.
+
+Evidence: `target/storage-gc-manifest-order-20260912/`, including before/trial
+source, host/build logs, saved trial ELF, wrapper, JSONL, serial output,
+environment and comparison.json. The measured cache override was temporary
+and restored; the saved ELF defines the experiment. No hardware accessed.
+
+### GC scan-memo miss classification (2026-09-12)
+
+Temporary counters classify scan-memo hits, missing keys, checkpoint-horizon
+mismatches, LRU evictions and oversized proofs. Last-observed resident entry
+count/requested allocation bytes are sampled at lookup. GC phase boundaries
+print cumulative counters; the hooks and 64-page cache override are restored
+before running the saved ELF. All 256 QEMU samples pass and each sample's full
+I/O counters exactly match storage-growth-cache64-20260912/after.jsonl.
+The same 128 MiB, one-hart TCG and 4/2 MiB/s plus 400/200 IOPS limits apply.
+Diagnostic timing is not a performance result.
+
+| Collection | Manifest hits | Manifest missing keys | Evictions | Horizon mismatches |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 0 | 206 | 0 | 0 |
+| 2 | 206 | 0 | 0 | 0 |
+| 3 | 206 | 28 | 0 | 0 |
+| 4 | 234 | 0 | 0 | 0 |
+
+All memo counters are zero at the first collection: no memo lookup occurred
+before GC in this workload. No oversized proof was refused and no eviction or
+horizon mismatch occurred throughout the measured run. The greatest observed
+phase-end resident footprint is 248,856 bytes, below the retained 320 KiB
+budget. Reported residence is a last-lookup observation, not an allocation
+high-water measurement. GC pruning can change it between samples.
+
+This resolves the remaining manifest-read cause: first-use segment proofs,
+not insufficient retained memo capacity. The two later 28-miss additions match
+new objects since the first collection. Reverse ordering cannot remove these
+mandatory first authentications. A next candidate is performing the identical
+segment scan for newly packed segments immediately after publication while
+pages are still cached, inserting only the genuinely validated proof. It must
+be measured for total I/O, ordinary put overhead and GC pauses; simply moving
+uncached reads earlier would not satisfy the optimization goal. No proof may
+be seeded from unverified transaction intent or used to bypass payload checks.
+
+No runtime code change remains. Evidence:
+`target/storage-scan-memo-probe-20260912/`: before/trial source snapshots,
+build log, instrumented ELF, socket runner, environment, JSONL, complete phase
+serial trace and summary.json. No hardware or new crash-recovery claim.
+
+### Authenticate packed segments while hot (2026-09-12)
+
+Retain eager segment-proof validation after compact single-object publication.
+For a new uniquely stored compact blob whose allocation root shares the packed
+segment, run the existing device-backed scan_segment before installing the
+successor/returning the handle. Only the actual scanner result enters the
+bounded verified-scans memo. Deduplicated objects and separate metadata-segment
+fallbacks do not use this new step. Descriptor, summary, seal and pointer checks
+are preserved; payload authentication remains independent. No checkpoint or
+flush ordering is removed and no unverified transaction data seeds the memo.
+
+The aim is to perform the first proof while recently written pages remain in
+the device cache, instead of waiting until foreground GC. In a 64-page-cache,
+128 MiB one-hart TCG QEMU run, all 256 held 4 KiB object operations pass under
+4/2 MiB/s and 400/200 read/write IOPS limits. Baseline is
+storage-growth-cache64-20260912/after.jsonl.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Cumulative put+get seconds | 18.227043 | 15.128103 |
+| Read bytes | 26,492,928 | 11,186,176 |
+| Read requests | 3,716 | 2,319 |
+| Write bytes | 53,694,464 | 53,694,464 |
+| Write requests | 1,862 | 1,862 |
+| Flush requests | 825 | 825 |
+| Median operation ms | 35.8125 | 37.2635 |
+| P95 operation ms (nearest rank) | 67.033 | 67.678 |
+| Maximum operation ms | 5,508.278 | 2,936.415 |
+| Two GC-episode operations, seconds | 8.851243 | 5.359543 |
+
+Total reads decrease 57.8%, cumulative time 17.0%. Median rises about 4.1%:
+this spreads real validation work into ordinary commits rather than making
+all operations faster. The GC episode and maximum latency improvements matter
+for foreground responsiveness, while reduced total reads show this is more
+than merely moving uncached I/O earlier. Timing is a single sequential
+comparison; no physical SD-card claim is made.
+
+Qualification: 243 selected host tests pass / one ignored, including fused
+append failure/cut recovery, GC and quota coverage. The captured native image
+verifier reports status ok; production three-boot file-tree gate and Duo
+file-tree/legacy-shell release compilation pass. The temporary 64-page cache
+override was restored; normal configuration remains 512 pages except its
+existing milkv-python setting. Source snapshots and the saved ELF define the
+measured candidate; environment Git metadata sees the restored configuration.
+Evidence: `target/storage-hot-segment-proof-20260912/`, with source snapshots,
+build/host/gate logs, saved ELF, wrapper, JSONL, serial log, captured disk,
+native report and comparison.json. No hardware accessed.
+
+### Larger-object check of eager packed-segment proofs (2026-09-12)
+
+Run 256 held 128 KiB objects on each side of eager packed-segment validation.
+Both saved ELFs use a 64-page block cache, 128 MiB guest, one-hart TCG and
+4/2 MiB/s plus 400/200 read/write IOPS limits. The before ELF is the retained
+growth-successor implementation; the after ELF adds eager proof validation.
+Both complete all samples and four GC rounds. Exact commands and hashes are
+in commands.json.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Cumulative seconds | 36.112948 | 36.303049 |
+| Put seconds | 33.693725 | 34.283908 |
+| Get seconds | 2.419223 | 2.019141 |
+| Read bytes | 60,280,832 | 59,428,864 |
+| Read requests | 3,781 | 3,699 |
+| Median operation ms | 111.7160 | 113.3305 |
+| P95 operation ms | 149.941 | 151.209 |
+| Maximum operation ms | 5,052.535 | 5,045.230 |
+
+Writes are identical: 94,195,712 bytes / 2,181 requests / 825 flushes.
+Read savings are only 1.4%; cumulative time increases 0.5%. This single pair
+is not evidence of a stable timing regression, but clearly does not reproduce
+the much larger 4 KiB benefit. Eager validation adds put work and reduces get
+work, with little effect on the maximum pause. The implementation should next
+be scoped using actual inline-versus-external content handling rather than
+assuming all compact objects benefit equally. persistent_authority.rs retains
+that distinction via recovered.external_root when constructing the fused
+publication; it is not currently passed into FusedAuthorityPublication.
+
+This turn adds measurement documentation only, with no new runtime change.
+The broad eager-proof implementation remains as previously qualified pending
+that refinement; these results explicitly limit its benefit claim to tested
+workloads. No hardware or additional power-cut validation is claimed.
+Evidence: `target/storage-hot-proof-128k-20260912/`, including commands/hashes,
+runner, both JSONL/transcripts and summary.json.
+
+### Rejected persistent-inline proof policy (2026-09-12)
+
+Trial: pass recovered.external_root.is_none() through FusedAuthorityPublication
+as the condition for eager packed-segment validation. File-tree batch
+publications set this flag false. The policy compiles in the ordinary QEMU
+configuration and 243 host tests pass / one ignored. Two 64-page-cache QEMU
+runs of 256 operations each pass under the existing 128 MiB / single-hart TCG /
+4/2 MiB/s / 400/200 IOPS configuration.
+
+The behavioral result rejects the premise: 4 KiB benchmark objects also have
+external content roots. The trial disables their eager proof, increasing total
+reads back to 26,492,928 bytes versus 11,186,176 with the retained eager path.
+128 KiB per-sample counters exactly match its pre-eager baseline, as intended,
+but preserving that behavior while losing the principal 4 KiB benefit is not
+an acceptable refinement. Restore all three runtime files; the broad eager
+proof change from storage-hot-segment-proof-20260912 remains retained.
+
+Source inspection identifies the actual bypass: kernel HotReadCache accepts
+objects up to STORAGE_V2_HOT_READ_MAX_OBJECT_BYTES (72 KiB), with total 256 KiB
+and 64-entry bounds, and caches external payloads too. On-disk inline/external
+classification is therefore not a proxy for whether later reads touch CAS.
+The next refinement should explicitly communicate the platform's hot-content
+cache policy, rather than depend on persistent format classification. The
+previous 128 KiB measurement's proposed inline/external split is superseded
+by this result; these data do not justify that split.
+
+Evidence: `target/storage-inline-proof-policy-20260912/`, with before/trial
+sources, ordinary and 64-page candidate ELFs, build/host logs, exact commands,
+JSONL/transcripts and summary.json. Labels inline4k/external128k preserve the
+original experiment labels; inline4k is not a proven on-disk classification.
+The candidate and cache override are fully restored. No hardware or new
+power-cut qualification is claimed.
+
+### Scope eager proofs to platform hot-content admission (2026-09-12)
+
+Retain an explicit runtime performance policy:
+SegmentStore::set_hot_content_proof_max_bytes(max_bytes). Zero is the default
+and disables proactive scans. The kernel configures the store with the same
+STORAGE_V2_HOT_READ_MAX_OBJECT_BYTES constant used by HotReadCache (72 KiB),
+so eligible newly packed objects get an eager segment proof and larger objects
+do not. Dedup/separate-metadata fallback conditions stay unchanged. The policy
+is independent of persistent inline/external format; it changes when the
+existing device-backed scan runs, not what it validates. No new wire format,
+checkpoint protocol or proof trust assumption is introduced.
+
+Fused-append recovery tests explicitly select the 72 KiB policy, covering
+objects on either side using the existing mutation-cut sweeps. 243 selected
+host tests pass / one ignored. The production three-boot file-tree gate
+(including cold/powered-off verification) and Duo compilation pass.
+
+Two 256-operation QEMU runs use the same 64-page block cache, 128 MiB guest,
+one-hart TCG and 4/2 MiB/s plus 400/200 read/write IOPS settings as the previous
+experiments. Every sample passes. For 4 KiB objects, every sample's full I/O
+counter record exactly equals the retained broad-eager experiment in
+storage-hot-segment-proof-20260912/run.jsonl: 11,186,176 total read bytes.
+For 128 KiB objects, every sample's counters exactly equal the pre-eager
+baseline in storage-hot-proof-128k-20260912/before.jsonl: 60,280,832 read bytes.
+Thus the small-object benefit is retained and the larger-object proactive
+scan is removed. Cumulative times are 15.041471 and 36.068836 seconds,
+respectively; these individual runs do not establish further timing gains.
+
+Temporary page-cache reduction is restored; the kernel retains its usual
+512-page setting and existing milkv-python 64-page setting. This refinement
+supersedes the broad eager-proof policy and the rejected format-inline policy.
+It does not claim a physical SD benchmark or bounded GC worst-case latency.
+Evidence: `target/storage-hot-proof-policy-20260912/`, with source snapshots,
+host/build logs, saved 64-page ELF, exact commands/hashes, JSONL/transcripts,
+summary.json and gate/Duo logs. No hardware accessed.
+
+### GC phase attribution after platform-scoped eager proofs (2026-09-12)
+
+Repeat the previous phase I/O diagnostic on the latest retained runtime:
+platform-scoped eager packed-segment proofs, 64-page block cache, 128 MiB guest,
+one-hart TCG and 4/2 MiB/s plus 400/200 read/write IOPS limits. All 256 held
+4 KiB operations pass. Every sample's full counters exactly match
+storage-hot-proof-policy-20260912/cached4k.jsonl. Diagnostic prints are excluded
+from performance claims, not from measured workload wall time.
+
+| Four collections combined | Read bytes | Read requests |
+| --- | ---: | ---: |
+| Typed decoding / mark | 0 | 0 |
+| Manifest loading / planning | 3,276,800 | 800 |
+| Relocation source reads | 442,368 | 108 |
+| Staged root readback | 1,732,608 | 139 |
+| Manifest / blob readback | 4,038,656 | 986 |
+| Publication / reuse barrier | 98,304 | 4 |
+
+GC reads total 9,588,736 bytes versus 24,924,160 before eager proofs.
+Manifest loading drops from 18,612,224 to 3,276,800 bytes; every other phase's
+I/O is exactly unchanged from storage-gc-phases-20260912. Thus the measured
+benefit specifically eliminates first-use descriptor-chain reads in manifest
+loading. GC writes remain 2,748,416 bytes across 68 requests and 30 flushes.
+
+The remaining root plus manifest/blob readback is 5,771,264 bytes (60.2% of
+GC reads). The next investigation should distinguish fresh relocated metadata
+from unchanged retained manifests already authenticated earlier in the same
+collection. Any reuse must preserve pointer identity, source/target ownership,
+corruption detection and publication failure behavior; this diagnostic does
+not prove that removing any existing check is safe. Cache-capacity increases
+are not supported as the next action by these data.
+
+This turn adds evidence only. Temporary hooks and cache override were restored
+before running the saved instrumented ELF, and source comparisons verify that
+restoration. Evidence: `target/storage-gc-phases-hot-20260912/`, with before/trial
+sources, build log, instrumented ELF, runner, environment, JSONL, full phase
+trace and summary.json. No hardware or new crash-recovery qualification.
+
+### Reuse retained manifest verification within one GC (2026-09-12)
+
+Retain bounded reuse of manifests already authenticated by load_live_manifests
+in the same frozen collection. The successor mapping must retain exactly the
+original physical pointer; the manifest and every content extent must be
+outside the source set and outside the target set. Only then omit the second
+read of the unchanged manifest after relocation. Fresh/rewritten manifests,
+copied extents and their Merkle contents still receive the existing device
+readback checks before publication. No cross-collection manifest byte cache is
+introduced, and the staged catalog/root readback remains unchanged.
+
+Strengthen the existing retained-manifest recovery test: before each of two
+collections, corrupt the retained manifest payload (including after a prior
+collection has memoized its segment chain), require collection failure with
+exactly unchanged damaged media, restore the byte, and continue successful GC
+and cold recovery. Existing copied-payload/padding corruption and mutation-cut
+coverage also pass. This preserves per-collection input authentication and
+fresh-write validation while avoiding redundant reads of immutable data that
+the transaction does not write.
+
+All 256 held 4 KiB operations pass in 64-page-cache / 128 MiB / one-hart TCG
+QEMU with 4/2 MiB/s and 400/200 read/write IOPS limits. Compared with
+storage-hot-proof-policy-20260912/cached4k.jsonl:
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Cumulative seconds | 15.041471 | 13.201704 |
+| Read bytes | 11,186,176 | 8,097,792 |
+| Read requests | 2,319 | 1,565 |
+| Write bytes | 53,694,464 | 53,694,464 |
+| Write requests | 1,862 | 1,862 |
+| Flush requests | 825 | 825 |
+| Median operation ms | 37.6295 | 37.5335 |
+| Maximum operation ms | 2,934.442 | 1,900.145 |
+| Two GC-episode operations, seconds | 5.352097 | 3.450243 |
+
+Reads decrease 27.6%, cumulative time 12.2%, GC-episode time 35.5%. Timing is
+a single sequential comparison, not a replicated bound or SD-card result.
+
+Qualification: 243 selected host tests pass / one ignored; captured native
+image verification reports status ok; production three-boot file-tree gate
+and Duo release compilation pass. The temporary small-cache override is
+restored. Evidence: `target/storage-gc-retained-proof-20260912/`, including
+before/final source, build and host logs, saved 64-page ELF, runner, JSONL,
+serial log, environment, captured disk and native report, comparison.json,
+and gate/Duo logs. No hardware accessed.
+
+### Retained-manifest reuse at 128 KiB (2026-09-12)
+
+Compare the current within-collection retained-manifest reuse against the
+immediately preceding platform-scoped hot-proof implementation. Both saved
+ELFs use 64 block-cache pages, 128 MiB guest, one-hart TCG and 4/2 MiB/s plus
+400/200 read/write IOPS. Each independently runs 256 held 128 KiB objects,
+seeds 32..287. All 512 operations pass and both runs perform four GC rounds.
+
+| Metric | Before | After |
+| --- | ---: | ---: |
+| Cumulative seconds | 35.983091 | 35.319078 |
+| Read bytes | 60,280,832 | 57,008,128 |
+| Read requests | 3,781 | 2,982 |
+| Write bytes | 94,195,712 | 94,195,712 |
+| Write requests | 2,181 | 2,181 |
+| Flush requests | 825 | 825 |
+| Median operation ms | 111.642 | 111.638 |
+| P95 operation ms | 148.809 | 150.937 |
+| Maximum operation ms | 5,045.079 | 4,624.435 |
+| Two GC-episode operations, seconds | 9.159215 | 8.237250 |
+
+Only sample indices 206 and 234 have changed I/O counters. Every other sample
+is identical. This directly attributes the saved 3,272,704 bytes / 799 read
+requests to collection, without moving I/O into ordinary operations. Reads
+decrease 5.4%, GC-episode elapsed time 10.1%, cumulative time 1.8%. Timing is
+one sequential comparison and P95 is slightly higher; do not claim uniform
+latency improvement. Larger-object transfer costs dominate more than in the
+4 KiB workload. The measured benefit is consistent with retaining the change.
+
+No runtime edits this turn. Prior corruption, mutation-cut, offline and
+three-boot qualification remains in storage-gc-retained-proof-20260912; these
+runs extend performance/readback evidence, not power-cut coverage. No hardware
+access or SD-card result. Evidence: `target/storage-retained-proof-128k-20260912/`,
+including exact commands/ELF hashes, runner, JSONL/transcripts and summary.json.
+
+### File-tree sweep after accumulated storage changes (2026-09-12)
+
+Compare saved 64-page-cache ELFs: the earlier borrowed-file-encoder build
+(storage-fs-borrow-cache64-20260912/after.elf) against the latest retained
+GC-manifest-reuse build (storage-gc-retained-proof-20260912/candidate.elf).
+This evaluates the accumulated changes, not one isolated commit. Each size
+uses a fresh independent image, 128 MiB guest, one-hart TCG and one sample;
+there is no throughput/IOPS throttle in this sweep. The file-sequential workload
+includes SplitMix pattern generation, staging/publication, complete readback
+verification and removal. All six records pass.
+
+| Size | Seconds before/after | Read bytes before/after | Flushes before/after |
+| --- | ---: | ---: | ---: |
+| 16 MiB | 1.531722 / 1.550266 | 17,907,712 / 17,907,712 | 16 / 16 |
+| 64 MiB | 6.391966 / 5.854749 | 76,001,280 / 72,392,704 | 35 / 32 |
+| 256 MiB | 25.412108 / 23.930725 | 311,455,744 / 296,534,016 | 90 / 84 |
+
+The 16 MiB counters are identical. At 64 MiB, reads save 3,608,576 bytes / 398
+requests, writes save 12,288 bytes / three requests, and three flushes disappear.
+At 256 MiB, reads save 14,921,728 bytes / 1,576 requests, writes save 24,576
+bytes / six requests, and six flushes disappear. These extend the measured
+I/O benefit to file-tree workloads beyond small-object benchmarks.
+
+Single-run elapsed changes are +1.2%, -8.4% and -5.8%; do not treat them as
+replicated speed bounds. Pattern generation timings also vary despite no
+algorithm change in this comparison, and full readback phases take longer in
+the new ELF in all three samples. The strongest evidence is reduced physical
+I/O at the two larger sizes. This sweep is not directly comparable to the
+user's original write-only table or physical SD timings. Large-file readback
+CPU/verification work remains a significant separate target.
+
+No runtime edits this turn. The previous correctness qualification still
+applies; this is extra complete-content readback/performance evidence, not a
+new power-cut test. Evidence: `target/storage-file-current-20260912/`, with
+exact commands and ELF hashes, runner, all JSONL/transcripts, and summary.json
+including phase ticks. No hardware accessed.
+
+### Reuse the verified file-node read buffer (2026-09-12)
+
+Retain in-place removal of the verified file-data node prefix. Previously,
+Vec::split_off allocated a second content-sized buffer while the full encoded
+node allocation was still live. Check the suffix length, copy the suffix to
+the start of the original Vec, and truncate its length instead. The complete
+blob is still verified before any transformation. The returned content bytes
+are unchanged; the returned capacity now retains the small prefix allowance.
+This removes one full-content temporary allocation per streamed data-node read,
+not the byte movement itself. Whole-guest peak RAM was not measured.
+
+243 selected host tests pass / one ignored. An ABBA QEMU sweep runs a complete
+256 MiB file generation/write/publication/readback/removal on each independent
+image, with 64-page block cache, 128 MiB RAM, one-hart TCG and no storage
+throttle. All four runs pass and every I/O counter is identical:
+296,534,016 read bytes / 7,603 requests; 284,516,352 write bytes / 3,047 requests;
+84 flushes. Runs before/after/after/before take 24.386781 / 23.470111 /
+23.233375 / 23.400109 seconds. Means are 23.893445 versus 23.351743 seconds
+(-2.3%). Mean full-readback ticks are 98,696,290 versus 97,701,165 (-1.0%).
+The end-to-end difference includes unchanged phases and is not wholly
+attributable to this small allocation change. The concrete allocation removal
+and unchanged I/O/content behavior are stronger evidence than the small timing
+difference; no physical SD-card speed claim is made.
+
+Production three-boot file-tree recovery (including powered-off verification)
+and Duo file-tree/legacy-shell compilation pass. The temporary cache override
+is restored. Evidence: `target/storage-file-read-buffer-20260912/`, with
+before/final source, build and host logs, saved candidate ELF, exact commands/
+hashes, four JSONL/transcripts, phase summary.json and gate/Duo logs.
+No hardware accessed.
+
+### File readback component profile (2026-09-12)
+
+Temporary successful-call timers surround structural metadata reads, whole
+content read/verification, and verified-buffer prefix removal. Counters reset
+immediately before opening the benchmark file reader and print after its full
+read loop. The 256 MiB QEMU file-sequential workload uses 64 page-cache pages,
+128 MiB guest, one-hart TCG and no storage throttle. Complete content validation
+passes. Every I/O counter exactly matches the uninstrumented retained buffer
+reuse candidate in storage-file-read-buffer-20260912/after.jsonl.
+
+| Component | Calls | Elapsed ticks | Fraction of readback phase |
+| --- | ---: | ---: | ---: |
+| Data-node structural metadata | 259 | 3,202,690 | 3.2% |
+| Complete content read/verification | 86 | 49,332,510 | 48.9% |
+| Prefix validation/removal | 86 | 548,420 | 0.5% |
+| Remaining benchmark/framework work | — | 47,778,580 | 47.4% |
+
+Full readback phase is 100,862,200 ticks. These are elapsed rdtime intervals,
+including suspension/scheduling where an operation awaits, not CPU-cycle
+measurements. The outer phase also includes diagnostic print overhead and
+loop/framework work. In particular, the remaining time includes the benchmark's
+SplitMix content-pattern check, which regenerates expected content. It must
+not all be attributed to storage, nor all to pattern generation without a
+separate timer. Metadata traversal is a small fraction, so adding skip-list
+caches is not supported as the primary next optimization. First separate the
+benchmark's pattern check from actual reader time; then profile the roughly
+half spent in read_verified_blob if needed.
+
+This turn adds measurement evidence only. All three instrumented source files
+are restored and checked against saved baselines; the saved ELF and trial
+sources define the measurement. No latency comparison or hardware claim.
+Evidence: `target/storage-file-read-profile-20260912/`, with before/trial
+sources, build/ELF, runner, JSONL, serial profile, environment and summary.json.
+
+### Separate file reader time from benchmark pattern matching (2026-09-12)
+
+Retain optional file-sequential telemetry fields:
+file_verify_reader_ticks surrounds awaited reader.read_chunk calls;
+file_verify_pattern_ticks surrounds the benchmark's empty/content-pattern
+check; file_verify_other_ticks is the remainder of the existing verify phase.
+The three must sum exactly to file_verify_elapsed_ticks. Reader time includes
+normal filesystem lookup, device waits, content authentication and result
+construction; it is not a raw-block or pure CPU metric. The benchmark still
+checks every content byte and the total length before reporting success.
+
+The converter accepts old records without this group. If any new field occurs,
+all three and the enclosing phase are required, must be nonnegative exact
+integers (not bools), and must sum correctly. Selftests cover malformed groups,
+negative/bool values, missing phase and inconsistent sums. Selftest and explicit
+validation of both old/new records pass; QEMU release build and Duo release
+compilation pass.
+
+A 256 MiB full file lifecycle in 64-page-cache / 128 MiB / one-hart TCG QEMU,
+without storage throttle, completes content verification. Physical counters
+exactly equal storage-file-read-buffer-20260912/after.jsonl. New ticks:
+
+| Component | Ticks | Approximate share |
+| --- | ---: | ---: |
+| Reader calls | 54,013,840 | 63.0% |
+| Benchmark pattern match | 31,676,950 | 37.0% |
+| Other | 4,890 | 0.006% |
+| Verify phase | 85,695,680 | 100% |
+
+These new fields establish the boundary for future optimization comparisons.
+Differences from prior instrumented phase totals are not a speedup claim:
+pattern timing has varied across QEMU builds. Four extra timer reads per chunk
+add small measurement overhead, included in the enclosing phase. No storage
+algorithm change or hardware result is claimed here. Temporary cache override
+is restored; the telemetry remains for future QEMU benchmarks.
+
+Evidence: `target/storage-file-verify-timing-20260912/`, with before/final
+benchmark sources, selftest/build/Duo logs, saved ELF, runner, JSONL/serial,
+environment and summary.json. No new crash-recovery gate is claimed for this
+benchmark-only change.
+
+### Rejected direct-output Blob reads (2026-09-12)
+
+Trial: add ManifestRangeReader::read_into and fill the final output Vec's leaf
+slice directly in read_and_verify_resolved_blob. The existing Vec-returning
+reader becomes a wrapper. This eliminates the per-leaf temporary Vec and
+copy into the final output while preserving range/pointer/window checks,
+streaming Merkle reconstruction and on-media tree comparisons. The final
+output is initialized before filling rather than extended per leaf.
+243 selected host tests pass / one ignored.
+
+Four complete 256 MiB file lifecycle runs (before/after/after/before) on
+independent 64-page-cache, 128 MiB, one-hart TCG QEMU images all pass. No storage
+throttle is used. Every I/O counter is identical: 296,534,016 read bytes /
+7,603 requests, 284,516,352 write bytes / 3,047 requests, 84 flushes.
+
+| Mean of two runs | Before | After |
+| --- | ---: | ---: |
+| Total seconds | 21.647103 | 22.770781 |
+| Reader ticks | 52,672,885 | 52,865,690 |
+| Pattern-check ticks | 31,449,280 | 43,521,930 |
+
+Reader time does not improve (+0.4%); total time worsens 5.2%, predominantly
+alongside a large change in the unchanged benchmark pattern check. Do not
+attribute that change to an identified mechanism: code-layout/TCG or other
+causes are unproven. Crucially, the new independent reader metric also shows
+no benefit. Reject and restore the original reader rather than retaining a
+larger refactor on allocation-count intuition alone. Existing file-buffer
+reuse and all earlier retained runtime changes remain intact.
+
+Evidence: `target/storage-blob-read-into-20260912/`, with before/trial source,
+host/build logs, saved ELF, exact commands/hashes, four JSONL/transcripts and
+summary.json. Temporary page-cache override is restored. No hardware or
+additional recovery qualification is claimed for this rejected trial.
+
+### Whole-Blob reader component profile (2026-09-12)
+
+A temporary diagnostic build times the full-content leaf loop's range read,
+StreamingMerkle::push_chunk, output extension and tree-emission verification.
+A separate nested timer measures awaited PageDevice::read_pages calls in
+ManifestRangeReader, including its metadata/directed readers. All counters
+reset before the file reader opens. No on-media validation is removed.
+
+The 256 MiB file lifecycle passes on a fresh disk, 64-page cache, 128 MiB RAM,
+one-hart TCG, without throttling. Reader elapsed is 52,757,190 ticks (10 MHz).
+
+| Component | Elapsed ticks | Calls | Fraction of reader |
+| --- | ---: | ---: | ---: |
+| Content range reads | 15,442,110 | 65,622 | 29.3% |
+| Merkle push (hashing/frontier/emission generation) | 23,195,020 | 65,622 | 44.0% |
+| Output extension/copy | 792,370 | 65,622 | 1.5% |
+| Tree-emission checks after content leaves | 6,405,410 | 65,622 | 12.1% |
+| Nested device reads, overlaps above | 12,652,200 | 4,717 | 24.0% |
+
+The first four components total 45,834,910 ticks. The unassigned reader time
+includes metadata traversal, setup, padding/finalization, buffer prefix removal,
+loop and instrumentation overhead. Padding tree checks are not in the fourth
+row. Device reads overlap the first/fourth rows and also include other
+ManifestRangeReader uses; do not add the fifth row to the others or subtract it
+from just one component. These are elapsed rdtime intervals, not CPU counters.
+The outer reader excludes the benchmark pattern comparison.
+
+All five I/O counters exactly equal the retained baseline: 296,534,016 read
+bytes / 7,603 requests, 284,516,352 write bytes / 3,047 requests, 84 flushes.
+The run supplies diagnostic evidence, not a speed comparison. It argues against
+prioritizing result copies, and supports examining Merkle/hash CPU work next.
+This is TCG evidence, not proof of the same balance on a physical SD device.
+
+All temporary cas/shell/cache changes are restored and byte-compared with their
+saved baselines. JSONL validation and diff whitespace checks pass. Source
+snapshots, build log, ELF/hash, exact runner command, serial/JSONL and computed
+summary are in `target/storage-blob-reader-profile-20260912/`. No new storage
+algorithm, recovery qualification or hardware run is claimed this turn.
+
+### Batched Merkle hash inputs rejected (2026-09-12)
+
+Following the reader component profile, a trial consolidates the leaf's domain,
+kind, index and length into one stack prefix passed to Sha256::update, followed
+by content. Internal nodes concatenate domain, level and both hashes into one
+stack input to Sha256::digest. Input bytes, hash algorithm, object format and
+all storage verification remain identical; no hardware extensions are required.
+All 17 blob-format tests pass, including fixed format vectors, checked-in disk
+fixtures and streaming/canonical comparisons. The QEMU release build succeeds.
+
+Four independent 256 MiB file lifecycles in before/after/after/before order all
+pass on 64-page-cache, 128 MiB, one-hart TCG QEMU without storage throttling.
+All I/O counters are identical: reads 296,534,016 bytes / 7,603 requests,
+writes 284,516,352 bytes / 3,047 requests and 84 flushes.
+
+| Mean of two runs | Before | Trial | Change |
+| --- | ---: | ---: | ---: |
+| Total seconds | 21.2717095 | 22.7363830 | +6.89% |
+| File stage push ticks | 81,506,435 | 80,713,035 | -0.97% |
+| Reader ticks | 52,103,515 | 52,760,160 | +1.26% |
+| Pattern comparison ticks | 30,675,735 | 44,034,775 | +43.55% |
+
+The targeted reader does not improve. The small write-stage difference does
+not justify retaining this change; reject it. The unchanged benchmark pattern
+again varies substantially across ELFs, so do not attribute the whole-workload
+regression to hashing or claim a diagnosed code-layout mechanism. The separate
+reader metric makes rejection independent of that unexplained pattern effect.
+This rules out this short-update consolidation as a demonstrated optimization;
+it does not rule out other SHA or Merkle optimizations.
+
+Original blob source and page-cache configuration are restored and byte-checked.
+All four JSONL validations and diff whitespace checks pass. No new algorithm
+is retained; no storage recovery gate or physical SD validation is claimed.
+Evidence in `target/storage-hash-input-batch-20260912/` contains before/trial
+source, build/test logs, saved ELF and hashes, exact ABBA commands, transcripts,
+JSONL and summary. Runtime Git metadata sees restored source; saved trial source
+and ELF identify the experiment.
+
+### Large-file SD-style throttled qualification (2026-09-12)
+
+A fresh-disk pair compares the saved borrowed-encoder 64-page-cache baseline
+(storage-fs-borrow-cache64-20260912/after.elf) with the retained current runtime
+and independent verification timers (storage-file-verify-timing-20260912/
+candidate.elf). This is a cumulative comparison, not an isolated new change.
+Both 64 MiB file lifecycles pass complete pattern verification and removal.
+QEMU uses one TCG hart, 128 MiB RAM, a 64-page cache, read/write bandwidth
+limits of 4/2 MiB/s and read/write IOPS limits of 400/200. No physical SD card
+is used; these limits do not simulate an SD controller or its latency tails.
+
+| Measurement | Earlier baseline | Current |
+| --- | ---: | ---: |
+| Total seconds | 53.001419 | 51.476392 |
+| Device read bytes | 76,001,280 | 72,392,704 |
+| Device read requests | 1,855 | 1,457 |
+| Device write bytes | 71,442,432 | 71,430,144 |
+| Device write requests | 786 | 783 |
+| Flushes | 35 | 32 |
+| Staging seconds | 36.305246 | 34.785175 |
+| Staging push seconds | 32.438027 | 31.428824 |
+| Full verification seconds | 16.609208 | 16.604934 |
+
+Total improves 2.88% in this one pair. All I/O savings occur in staging:
+3,608,576 fewer read bytes / 398 requests, 12,288 fewer write bytes / three
+requests and three fewer flushes. Publication, verification and removal I/O
+remain identical. Pattern generation also drops from 1.773229 to 1.263299
+seconds, so do not attribute the entire elapsed gain to storage changes.
+The deterministic I/O difference is stronger evidence than this single timing
+pair and reproduces the prior unthrottled comparison's saved reads/requests.
+
+Current total write amplification is 1.0644 relative to the logical 64 MiB;
+full verification read amplification is 1.04175. Verification reads 69,910,528
+bytes in 1,078 requests, with 15.377464 seconds inside the reader and 1.226703
+seconds in the pattern check. QEMU's throttled workload timing includes its
+burst/scheduling semantics; do not infer an exact bandwidth lower bound.
+The sequential payload path is already close to one write and one verification
+read per logical byte. Subsequent SD-oriented work should prioritize small
+object metadata and publication/GC I/O, where prior measurements show much
+higher amplification, rather than assume a similar large-file opportunity.
+
+No runtime source changes this turn. Both JSONL validations pass. Saved exact
+commands/ELF hashes, runner logs, serial/JSONL, raw extracted samples and summary
+are in `target/storage-file-sd-profile-20260912/`. No new power-cut or physical
+hardware qualification is claimed.
+
+### Current retained-small-object authority attribution (2026-09-12)
+
+Reinspect the captured 256-held-object image from
+storage-gc-retained-proof-20260912/final.raw using the independent framing
+parser, and re-run the complete native migration verifier. Native status is
+ok. This is read-only analysis of existing QEMU evidence, not a fresh latency
+measurement. Subsequent retained file-buffer/timing changes do not affect this
+object workload, but the named saved image is the exact evidence source.
+
+The latest checkpoint is generation 273. Every current-generation descriptor
+pair is sealed and every extent payload matches its SHA-256. The final 4 KiB
+put/get sample passes, takes 72.272 ms under the saved throttle profile, and
+writes 270,336 bytes in seven requests plus three flushes.
+
+| Latest-generation extent | Payload bytes | Framed bytes |
+| --- | ---: | ---: |
+| Blob | 4,480 | 16,384 |
+| Manifest | 256 | 12,288 |
+| Catalog delta | 416 | 12,288 |
+| Authority | 165,568 | 176,128 |
+| Allocation | 184 | 12,288 |
+
+Authority is 65.15% of the measured device write bytes. It contains 323 records
+of 512 bytes, one principal, no explicit object bindings or external roots;
+the sample's 321-record field is its pre-append observation. Existing safe
+history compaction reduced history relative to the earlier 513-record image,
+but full snapshot rewriting still dominates this later ordinary put.
+
+Extents total 229,376 bytes. One segment header/summary/seal set adds 24,576
+bytes; the existing checkpoint protocol writes 12,288 bytes, leaving 4,096
+bytes not attributed by static final-state inspection. Do not assert an exact
+transient-write cause without a write trace. Catalog is already a three-page
+delta, so another catalog threshold change cannot address the dominant cost.
+
+Next implementation target: a bounded authority append representation that
+reuses an authenticated predecessor snapshot when its record stream is an exact
+prefix and all non-stream state is represented without loss. It must bind the
+predecessor identity and resulting canonical snapshot, validate record sequence
+and CRC/hash chains, and fall back to a full snapshot on incompatible state or
+replay limits. Recovery and the independent image verifier must reconstruct the
+same complete authority before capability admission; GC must retain all chain
+ancestors or materialize a full snapshot before reclaiming them. Growth, cold
+mount, quiescent compaction, policy/principal updates and damaged/missing chain
+links need qualification, alongside torn publication fault cuts. Existing
+checkpoint barriers remain unchanged. This is an implementation direction,
+not an implemented format or a measured future speedup.
+
+Evidence: attribution script/decoded summary, final sample, and refreshed native
+verification in `target/storage-current-authority-attribution-20260912/`.
+No runtime changes, no hardware access, and no new benchmark result this turn.
+
+### Authority append codec foundation (2026-09-12)
+
+Add the experimental internal `authority_delta` module, compiled only under
+cfg(test). No production publisher or reader admits its bytes yet. This is the
+first implementation component for reducing full authority history rewrites;
+it is not a shipped on-media format or a completed storage optimization.
+
+The codec retains the entire successor snapshot prefix (header, object bindings,
+principal/quota/policy state and external roots), followed by newly appended
+records. It omits only a byte-identical complete predecessor record stream.
+The 128-byte experimental header binds canonical predecessor/result SHA-256,
+lengths and stream offsets. Reconstruction bounds lengths before output
+reservation, requires a canonical fully decoded predecessor, checks the result
+hash, decodes the complete result with existing record-chain validation and
+requires increasing checkpoint generation. The caller must still validate
+external authority policy. Non-appending/rewritten histories return full-snapshot
+fallback, and an encoding with no byte saving is not selected.
+
+Four new tests cover exact roundtrip with changed policy/principal/quota/object
+bindings/external roots; non-appending/rewritten history fallback and wrong
+predecessor; every strict byte prefix, every single-byte corruption of delta
+and predecessor, and trailing garbage; integer bounds and a damaged record
+whose result digest was recomputed. Existing selected store, fused append,
+GC recovery and steady-state tests also pass (see host.log).
+
+This prototype deliberately does not yet carry a physical predecessor pointer,
+replay depth/budget, GC liveness or final disk-format admission. Those must be
+implemented together with the production publisher, mount reconstruction and
+independent Python verifier before enabling it. Publication fault cuts, cold
+recovery, growth and compaction interaction still need qualification. Current
+encode/reconstruct also materialize complete snapshots; recovery memory peak
+must be accounted before integration. No QEMU speedup, physical SD result or
+new production recovery coverage is claimed from these codec tests.
+
+Source: `segment-store/src/authority_delta.rs`, registered as test-only in
+`segment-store/src/lib.rs`. Evidence and test log:
+`target/storage-authority-delta-codec-20260912/`.
+
+### Authority delta predecessor envelope and depth checks (2026-09-12)
+
+Extend the test-only authority_delta prototype with a 128-byte physical-link
+envelope around the append payload. It contains a canonical 96-byte Authority
+pointer, predecessor/result checkpoint generations and replay depth. Decode
+requires a non-null pointer, matching store UUID, admitted segment, valid
+pointer shape/kind, segment generation below the horizon, increasing nonzero
+checkpoint generations and a result within the selected checkpoint horizon.
+Reserved fields are checked. Experimental replay depth is limited to 32;
+encoding the next increment at the limit falls back to a full snapshot.
+
+apply_link requires the exact resolved pointer, the reconstructed predecessor
+and its observed depth, then checks depth+1 and both checkpoint identities.
+It retains the existing predecessor/result canonical hash and record-chain
+checks. The caller must authenticate the actual on-media pointer payload and
+segment before invoking it; matching input arguments alone are not device
+proof. These bytes remain experimental and are not yet a frozen disk ABI.
+
+Six codec tests pass. New coverage checks cross-store pointers, null/wrong-kind
+references, segment admission and generation horizon, future checkpoints,
+wrong predecessor identity, forged depths, and overflow. A generated chain
+reconstructs all 32 increments exactly equal to independently encoded complete
+snapshots, then requires full-snapshot fallback at increment 33. Existing
+roundtrip, metadata preservation, corruption/truncation and record-chain tests
+remain green. See tests.log. This is CPU-only codec testing, not a cold-mount
+or crash-recovery claim.
+
+Still required before production admission: a device-backed bounded chain
+walker with cumulative byte/heap accounting and physical validation; mount and
+checkpoint successor integration; append publication selection; GC retention
+or materialization of all ancestors; Python offline verification; and cut-point,
+growth/compaction, QEMU performance and recovery qualification. The depth cap
+alone is not a sufficient memory or I/O bound. Production storage behavior is
+unchanged because the module remains cfg(test).
+
+### Authority delta bounded replay and device adapter (2026-09-12)
+
+Extend the test-only prototype with an asynchronous AuthoritySource and replay
+walker. Before each read it validates non-null Authority pointer shape, store,
+admission and generation horizon, rejects repeated pointers, and supplies the
+remaining cumulative payload-byte allowance. Returned payload length is checked
+again. Each loaded extent target generation must match the envelope/snapshot;
+child and observed predecessor depths/generations must agree. Replayed snapshots
+are bounded separately from cumulative fetched payload bytes. A maximum of 32
+links plus the full base is retained, then applied in reverse order. The result
+includes depth, ancestor roots and payload byte count for subsequent integration.
+
+DeviceAuthoritySource calls the existing read_pointer_authority_payload, including
+segment/descriptor checks, extent chain validation and payload/Merkle hashes.
+It rejects a root segment absent from the supplied allocated set. This preserves
+multi-extent full-snapshot reading through the existing resolver, but does not
+yet integrate the new chain with mount or publication.
+
+Six codec/replay tests pass. The 32-link fixture now exercises actual asynchronous
+chain walking through an authenticated in-memory source, all 33 roots, exact
+cumulative byte accounting, one-byte-insufficient cumulative/result budgets,
+damaged/missing ancestors and wrong target generations. A separate seventh test
+formats a real store on the test PageDevice and imports authority through the
+existing production writer, then reads that full snapshot through the new device
+adapter. Exact-budget reading matches its canonical bytes; smaller budget and
+physical payload corruption reject. Read attempts leave the test media unchanged.
+This adapter test covers a full-snapshot base, not on-device delta chains.
+
+The module remains cfg(test). No new bytes are published in production. The
+payload budget is not a complete heap bound: snapshot decoder/preflight temporary
+allocations and loader segment scans require separate accounting before enabling
+mount. It also is not a complete physical-I/O budget, since segment scans add
+reads. Next: account reconstruction memory, build on-device delta-chain fixtures,
+then integrate mount/publisher, GC ancestor liveness/materialization and independent
+verification before QEMU fault/performance qualification. No new speedup or
+physical SD evidence is claimed.
+
+Evidence: tests.log (six tests), device-tests.log (one test), and this note in
+`target/storage-authority-delta-replay-20260912/`. Whitespace diff check passes.
+
+### Authority replay duplicate decode removal (2026-09-12)
+
+The experimental link application decoded predecessor and successor to check
+their generations, while its reconstruction helper independently decoded both
+again. Consolidate those checks: reconstruct_checked returns generations from
+the same fully validated snapshots used to reconstruct the bytes. Each link
+now performs two complete snapshot decodes rather than four; neither snapshot's
+record-chain preflight, canonical encoding comparison nor digest validation is
+removed. The raw byte helper remains a wrapper for codec tests.
+
+After canonical predecessor validation, capture its generation and drop its
+decoded tables/record stream before allocating the successor. The prefix check
+uses the already-validated predecessor byte range, so it does not require the
+owned decoded predecessor to remain live. This removes avoidable overlapping
+snapshot storage and repeated preflight work. It is a source-level allocation/
+call-lifetime improvement, not a measured heap peak or latency claim.
+
+The authority-filtered host suite passes 37 tests, one ignored, including the
+experimental codec/32-link replay/device-adapter tests and existing authority
+fault/compaction coverage. Existing production tests still exercise the original
+snapshot publisher, because the prototype remains cfg(test). Whitespace check
+passes. Exact before source and tests.log are saved here.
+
+Still pending: complete decoder/preflight/segment-scan heap accounting, on-device
+delta-chain fixtures, production mount/publication and GC integration, independent
+verifier support and QEMU performance/crash qualification. This change improves
+the implementation being prepared; it does not yet reduce production SD writes.
+
+### Sealed-media authority delta chain fixture (2026-09-12)
+
+Add a host PageDevice fixture that writes a full authority snapshot and two
+incremental successors into separate segments using production build_record,
+write_payload_records_with_header and finalize_segment helpers. Every payload
+has real descriptor pairs, payload hashes, segment header/summary/final seals.
+The test supplies an explicit allocated set and generation context to the
+existing device-backed authority resolver; no checkpoint publisher is changed.
+
+The new replay walker follows tip -> middle -> full base through actual page
+reads and reconstructs the exact independently encoded final snapshot, reporting
+depth two, all three ancestor roots and exact cumulative payload bytes. It
+rejects corruption in the base descriptor body/seal, payload, summary seal and
+final segment seal. Removing the intermediate payload page also rejects, as
+does excluding the base from the allocated set. Replay does not perform device
+writes in successful or failing cases.
+
+The authority-filtered host suite passes 38 tests, one ignored; the new case is
+sealed_device_delta_replays_and_rejects_damaged_ancestor_frames. This extends
+codec-only chain coverage to framed test media. It is not a selected-checkpoint
+cold mount, real hardware, torn-publication test or QEMU latency measurement.
+The helper-generated segments are fixtures, not an enabled production format.
+
+Still pending before runtime enablement: complete reconstruction/preflight heap
+accounting; mount and publisher integration; GC ancestor liveness or snapshot
+materialization; independent Python verification; and checkpoint fault/growth/
+compaction/QEMU qualification. The experimental module remains cfg(test).
+Evidence: tests.log in `target/storage-authority-delta-media-20260912/`.
+
+### Bounded authority record preflight retained (2026-09-12)
+
+Production authority snapshot validation previously copied its entire logical
+record stream into a sector Vec and submitted all sectors to preflight_recovery,
+which allocated an equally long probe array. Retain a bounded batch path using
+the existing PreflightReplay API. A strict sealed-record pass still precedes
+semantic replay; empty/torn records are rejected as before. The subsequent pass
+feeds at most 32 records per append, preserving transaction/graph state across
+batches, then runs the same finish and exact sequence-count validation.
+
+The copied-sector buffer requests at most 16 KiB instead of a full stream, and
+per-append probes cover at most 32 records. For the previously observed
+323-record snapshot, the sector buffer's requested storage falls from 165,376
+to 16,384 bytes. This is not an overall heap-peak measurement: transaction,
+object and grant graph memory still scales with the stream. The change also
+supports the experimental delta reader but does not enable its disk format.
+
+A new regression compares every complete-record prefix of a 32 KiB object
+transaction with whole-stream preflight, covering transactions across multiple
+32-record boundaries. Reordered and damaged records around boundaries 32/64
+reject. The selected host suite passes 251 tests / one ignored, and the added
+boundary test passes separately (252 distinct passing tests). The production
+three-boot file-tree gate passes including cold recovery, GC pressure and offline
+verification. Duo file-tree/legacy-shell release compilation passes.
+
+Four independent fresh-disk QEMU runs (before/after/after/before) each complete
+256 retained 4 KiB put/get operations. 64-page cache, 128 MiB, one TCG hart,
+4/2 MiB/s read/write limits and 400/200 IOPS; no builds run alongside timings.
+Total seconds: 13.121577 / 12.871951 / 12.938500 / 12.997146. Means are
+13.0593615 -> 12.9052255 (-1.18%); this small sample establishes no universal
+speedup. Every per-sample I/O counter is identical. Each run reads 8,097,792
+bytes / 1,565 requests, writes 53,694,464 bytes / 1,862 requests, and flushes
+825 times. Retain for bounded temporary allocation with no observed regression.
+
+Evidence in `target/storage-authority-preflight-batch-20260912/`: before/final
+source, host/boundary/build/Duo/gate logs and retained boot artifacts, saved
+64-page ELF, exact ABBA commands/hashes, four validated JSONL/transcripts and
+summary. Normal page-cache configuration is restored. No physical SD access.
+
+### Independent Python authority delta byte oracle (2026-09-12)
+
+Add scripts/authority-delta-codec.py as an experimental, independent byte-level
+oracle. It imports no Rust format constants or decoder. It checks envelope
+size/magic/reserved fields, expected physical predecessor, pointer geometry and
+store/generation context, observed depth, canonical snapshot table offsets,
+record counts, predecessor/result lengths and SHA-256. Logical records are
+validated through the independent strict CSpace record/CRC/sequence/semantic
+parser. External policy and complete snapshot table/graph admission remain the
+production snapshot verifier's responsibility; this tool is not disk admission.
+
+The Rust sealed-device fixture optionally exports base, first delta, intermediate
+snapshot, second delta and result when VIBE_AUTHORITY_DELTA_FIXTURES is set.
+Python independently reconstructs both links exactly equal to the Rust canonical
+snapshots and rejects 1,923 cases: every strict first-link byte prefix, each
+single-byte corruption, trailing garbage, a damaged record with recomputed
+result SHA, and an incorrect expected logical StoreId. Fixture generation's
+Rust test passes. Optional fixture export is absent from production builds.
+
+The existing logical-stream parser previously fixed StoreId to the platform
+constant. Add an explicit expected_store_id keyword to decode_sector and
+recover_record_stream while keeping the platform value as default. The oracle
+passes the test StoreId explicitly; it does not infer trusted identity from
+untrusted input or disable that check. Existing strict-prefix selftests pass
+(19 records x 512 cuts). The default production verifier behavior is unchanged.
+
+Evidence: rust.log, five binary fixtures, python.json and legacy.log in
+`target/storage-authority-delta-python-20260912/`. Whitespace check passes.
+Still needed: full snapshot policy validation and physical chain integration in
+the migration verifier, production mount/publisher and GC support, recovery heap
+accounting, and QEMU checkpoint/fault/performance qualification. No production
+authority deltas are published and no new speedup is claimed.
+
+### Independent delta metadata validation (2026-09-12)
+
+Extend the Python experimental byte oracle from table-layout checks to canonical
+table-entry checks. Object bindings require nonzero and strictly ordered stable
+IDs, unique nonzero backend IDs, valid commit generations/kinds and zero reserved
+bytes. Principal entries require ordered nonzero IDs, positive limits, usage
+within limits, canonical boolean flags and zero padding. External roots require
+ordered nonzero IDs, valid generations/kinds and zero reserved bytes. These are
+structural snapshot constraints, not admission against an external root policy.
+
+The Rust codec test optionally exports an additional linked snapshot containing
+object bindings, a principal and an external root. Seven Rust prototype tests
+pass. Python reconstructs all three exported links exactly and rejects 1,940
+cases. New cases modify principal/policy/binding/root metadata and recompute the
+result SHA-256, proving that these failures are caught beyond digest mismatch.
+The fixtures include zero IDs/limits, over-limit usage, future/zero generations,
+zero kinds, invalid boolean flags and nonzero reserved bytes.
+
+Evidence in `target/storage-authority-delta-metadata-20260912/`: Rust log, eight
+binary fixtures and Python result JSON. Run:
+`python3 scripts/authority-delta-codec.py target/storage-authority-delta-metadata-20260912/fixtures`.
+The expanded selftest now expects the rich fixtures as well as the two-link
+chain fixtures. Whitespace check passes. Production snapshot publishing/mount
+remains unchanged; the incremental format is still test-only. External policy,
+physical full-image/GC integration and performance qualification remain pending.
+
+### Authority chain materialization and resumed append fixture (2026-09-12)
+
+Inspection confirms production GC relocation already calls authority.relocated()
+and encode_persistent_authority_snapshot, emitting a complete authority root.
+This supports truncating an admitted delta chain at GC rather than copying its
+links indefinitely. Existing checkpoint retirement/reuse ordering must remain
+unchanged; this observation does not alone qualify the integration.
+
+Extend the sealed-media fixture after its two-link chain: relocate its final
+snapshot to generation six using the same relocated() method and write a full
+sealed authority extent in a new segment. The old tip still reconstructs while
+all old segments are present. The new full root reconstructs with only its own
+segment in the supplied allocated set, reports depth zero and one ancestor.
+After physically removing the three old segments from fixture media, the old
+tip rejects while the full root remains readable. A further append at generation
+seven uses the materialized full root at depth zero; replay succeeds at depth
+one with only the two new segments and matches a complete canonical snapshot.
+
+All seven prototype tests pass. This is a framed PageDevice fixture, not an
+actual GC checkpoint switch or power-cut proof. It establishes byte/pointer
+independence after materialization and the resumed depth rule. Production GC,
+mount and publication are unchanged, and the format remains test-only.
+
+Integration direction: preserve GC's full-snapshot output; ensure chain recovery
+runs before obtaining the authoritative in-memory snapshot; protect the old
+checkpoint's referenced media until the existing retirement/reuse barrier.
+Still required: production selection/mount, complete memory accounting, full
+independent image verification, real GC/fault/growth/compaction tests and QEMU
+performance qualification. No new performance claim.
+Evidence: `target/storage-authority-delta-materialize-20260912/tests.log`.
+
+### Reuse validated authority stream during relocation (2026-09-12)
+
+Retain a production reduction in redundant semantic replay. Snapshot relocated()
+previously called new(), which replayed its record chain, then with_external_roots(),
+which replayed the same unchanged chain again. It now uses the existing trusted
+parts constructor with the full cloned tables and stream, performing structural
+validation once against the requested generation. The private record stream has
+no mutable public/crate accessor; it was validated by snapshot construction or
+validated import. Object bindings are crate-visible and still structurally checked.
+No decoder of newly read media skips record validation as a result of this change.
+
+A regression confirms that relocation preserves all encoded bytes except the
+checkpoint generation, roundtrips through the full decoder, and rejects zero or
+too-early generations and an invalid object binding. External roots, principals,
+quota fields and policy commitment are preserved. This removes two complete
+preflight walks and their temporary allocations per relocated() call; it does
+not eliminate snapshot cloning or change encoded media bytes/publication ordering.
+
+253 selected host tests pass / one ignored (217 library, six fused recovery,
+24 GC recovery, six steady-state). The three-boot production file-tree gate
+passes cold recovery, GC pressure and offline verification. Duo file-tree/
+legacy-shell release check passes. No new timed benchmark was run, so no elapsed
+speedup or heap-peak percentage is claimed. This is a verified removal of
+redundant work in the existing runtime, separate from the test-only delta format.
+
+Evidence: `target/storage-authority-relocate-validation-20260912/` contains
+before/final source, host/gate/Duo logs and boot verification artifacts.
+Whitespace check passes. Production authority deltas still require mount/
+publisher/GC qualification and complete recovery memory accounting before enabling.
+
+### Account for decoded authority external roots (2026-09-12)
+
+During delta mount integration review, the existing production snapshot decode
+capacity estimate was found to include object bindings, principal policies and
+record bytes, but omit the decoded external-root table. Add checked root-count
+multiplication by size_of::<PersistentRootEntry>() to that estimate. The V1 field
+is canonically zero; V2 carries the root count. Version and reserved-field
+validation remain in the complete decoder.
+
+A regression builds a valid two-root authority snapshot, compares the additional
+estimate with its decoded root storage, and demonstrates that a budget one byte
+short was accepted with the old estimate but now rejects before decode allocation.
+The exact estimated budget passes. This fixes one component of recovery budget
+admission; it is not a complete preflight graph/temporary heap bound, and does
+not establish the full budget safety of the experimental delta reader.
+
+254 selected host tests pass / one ignored (218 library plus 36 integrations).
+The production three-boot file-tree gate passes cold recovery, GC pressure and
+offline verification. Duo release file-tree/legacy-shell check passes. No limits
+are raised and no on-media format changes. Near-limit images may now correctly
+report MemoryLimit where the incomplete estimate previously allowed allocation.
+No throughput or latency improvement is claimed; this supports bounded recovery
+on small-memory devices and subsequent incremental-authority integration.
+
+Evidence in `target/storage-authority-root-budget-20260912/`: before/final store
+source, host/gate/Duo logs and retained boot verification files. Whitespace check
+passes. Incremental authority publishing/mount remains disabled pending complete
+memory, GC, verifier and fault/performance qualification.

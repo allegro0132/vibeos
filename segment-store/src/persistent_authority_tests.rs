@@ -1840,6 +1840,7 @@ fn quiescent_compaction_preserves_live_witnesses_and_reclaims_only_after_drop() 
         let (view, witness) = appended.into_parts();
         let generation = view.checkpoint_generation();
         assert!(store.transient_witness_covers_runtime_roots(&witness));
+        assert!(!store.quiescent_compaction_hint());
         let owner = store.pins.allocate_owner().unwrap();
         let unrelated = store.pins.pin_root(
             crate::pins::RootKey::new(u128::MAX, 1, OBJECT_KIND_RAW).unwrap(),
@@ -1866,6 +1867,11 @@ fn quiescent_compaction_preserves_live_witnesses_and_reclaims_only_after_drop() 
         assert_eq!(block_on(store.read_transient_object(&witness, &recovered)).unwrap(), payload);
         drop(witness);
         drop(view);
+        assert!(store.quiescent_compaction_hint());
+        let reader = store.pins.pin_read_generation(generation, owner, crate::pins::PinAdmission::Ordinary).unwrap();
+        assert!(!store.quiescent_compaction_hint());
+        drop(reader);
+        assert!(store.quiescent_compaction_hint());
         for wrong_stream in [false, true] {
             let result = block_on(store.compact_unpinned_persistent_authority(
                 &writer, generation, import(&records, &[]), |_| {
@@ -2597,4 +2603,26 @@ fn profile_object_append() {
             std::println!("{line}");
         }
     }
+}
+
+#[test]
+fn experimental_authority_replay_uses_verified_device_snapshot() {
+    let device = MemoryDevice::blank();
+    let (runtime, _quota, provisioner) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+    block_on(store.format(FormatOptions { store_uuid: StoreUuid::new([7;16]).unwrap(), cleaner_reserve_segments: 4, limits: limits() })).unwrap();
+    let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+    block_on(store.import_persistent_authority(&maintenance, import(&format_records(), &[]))).unwrap();
+    let state = store.mounted.as_ref().unwrap();
+    let expected = crate::encode_persistent_authority_snapshot(state.persistent_authority.as_ref().unwrap()).unwrap();
+    let before = device.snapshot();
+    assert_eq!(block_on(crate::authority_delta::replay_device_for_test(&device, state, expected.len())).unwrap(), expected);
+    assert!(block_on(crate::authority_delta::replay_device_for_test(&device, state, expected.len()-1)).is_err());
+    assert_eq!(device.snapshot(), before);
+    let vibeos_segment_format::PhysicalPointer::Value(pointer) = state.authority_root else { panic!("authority pointer"); };
+    let page = vibeos_segment_format::segment_base_page(pointer.segment_no).unwrap() + u64::from(pointer.payload_relative_page);
+    device.pages.lock().unwrap().get_mut(&page).unwrap()[0] ^= 1;
+    let damaged = device.snapshot();
+    assert!(block_on(crate::authority_delta::replay_device_for_test(&device, state, expected.len())).is_err());
+    assert_eq!(device.snapshot(), damaged);
 }

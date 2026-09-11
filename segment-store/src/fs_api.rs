@@ -750,11 +750,15 @@ impl<D: PageDevice> SegmentStore<D> {
         if encoded.len() != meta.encoded_len() {
             return Err(FsRootPublishError::InvalidRoot);
         }
-        let bytes = encoded.split_off(meta.bytes_offset());
-        if bytes.len() != meta.bytes_len {
+        let offset = meta.bytes_offset();
+        if encoded.len().checked_sub(offset) != Some(meta.bytes_len) {
             return Err(FsRootPublishError::InvalidRoot);
         }
-        Ok(bytes)
+        // Reuse the verified node allocation rather than allocating a second
+        // multi-MiB buffer merely to remove its small metadata prefix.
+        encoded.copy_within(offset.., 0);
+        encoded.truncate(meta.bytes_len);
+        Ok(encoded)
     }
 
     fn fs_reference_for(
@@ -1078,15 +1082,15 @@ impl<D: PageDevice> SegmentStore<D> {
                 (chunk_index, total_len, ancestors)
             }
         };
-        let decoded = FsDataNodeV1 {
+        let payload = crate::fs_codec::encode_fs_data_node_parts(
+            chunk_index, total_len, &ancestors, bytes,
+        )?;
+        let meta = FsDataNodeMeta {
             chunk_index,
             total_len,
+            bytes_len: bytes.len(),
             ancestors,
-            bytes: bytes.to_vec(),
         };
-        let payload = encode_fs_data_node_v1(&decoded)?;
-        let meta = FsDataNodeMeta::from_node(&decoded);
-        drop(decoded);
         let (object_id, commit_generation) = self
             .stage_blob_in_batch(batch, FS_DATA_V1_KIND, REFERENCE_CODEC_FS_V1, &payload)
             .await?;
@@ -3493,16 +3497,27 @@ mod tests {
         // Staging now packs small blobs into shared segments, so a freshly
         // staged store is already compact; feed every destructive round
         // enough dropped (dead) objects that a yielding compaction exists.
+        // Nine two-segment commits exceed both the eight- and sixteen-source
+        // round budgets, leaving partial collections that exercise isolated holes.
         let mut used_isolated_hole = false;
         for round in 0..3_u8 {
-            for extra in 0..3_u8 {
-                let payload = alloc::vec![0x40 + round * 3 + extra; 8192];
+            for extra in 0..9_u8 {
+                let payload = alloc::vec![0x40 + round * 9 + extra; 8192];
                 let state = store.mounted.as_ref().unwrap();
                 let first = state.find_free_run(1, false).unwrap();
                 let isolated = state.allocation.segment_state(first + 1)
                     != Some(crate::allocation_v2::SegmentAllocation::Free);
+                let neighbor_start = vibeos_segment_format::segment_base_page(first + 1).unwrap();
+                let neighbor_end = neighbor_start + vibeos_segment_format::SEGMENT_PAGES;
+                let neighbor_pages = || {
+                    device.media.lock().unwrap().visible.range(neighbor_start..neighbor_end)
+                        .map(|(page, bytes)| (*page, *bytes)).collect::<Vec<_>>()
+                };
+                let neighbor_before = isolated.then(&neighbor_pages);
                 drop(block_on(store.commit_fs_data_chunk(None, &payload)).unwrap());
                 if isolated {
+                    assert_eq!(neighbor_pages(), neighbor_before.unwrap(),
+                               "isolated-hole reuse changed the occupied neighbor");
                     // Reuse a single free hole without clearing its occupied
                     // neighbor as though metadata were necessarily adjacent.
                     assert_eq!(

@@ -1666,6 +1666,11 @@ impl<D: PageDevice> SegmentStore<D> {
         }
         let read_pin = self.pin_blob_reader(object)?;
         let mut reader = ManifestRangeReader::new(false);
+        // Multi-leaf reads retain proof pages in the hash LRU. Putting a
+        // whole tree in the content window would reread it after each leaf.
+        reader.coalesce_two_page_tree = ranges.len() == 1
+            && ranges[0].1 <= LEAF_SIZE
+            && ranges[0].0 % LEAF_SIZE as u64 + ranges[0].1 as u64 <= LEAF_SIZE as u64;
         let (descriptor, manifest) = self.resolve_authorized_manifest(object, &mut reader).await?;
         let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
         let mut previous: Option<VerifiedCasChunk> = None;
@@ -2084,6 +2089,20 @@ async fn read_resolved_chunk<D: PageDevice>(
             .read(device, state, manifest, content_offset, chunk_len)
             .await?
     };
+    // A separate two-page tree has 128 padded leaves: every proof reads
+    // a leaf sibling in page one and an upper-level sibling in page two.
+    // Coalesce exactly those required pages after copying out the content.
+    // Larger trees can contain unneeded pages and must stay demand-read.
+    if reader.coalesce_two_page_tree
+        && geometry.tree_len() > PAGE_SIZE && geometry.tree_len() <= 2 * PAGE_SIZE
+        && manifest.extents.iter().any(|extent| {
+            extent.encoded_offset == geometry.tree_offset() as u64
+                && extent.payload_byte_len == geometry.tree_len() as u64
+        })
+    {
+        let _ = reader.read(device, state, manifest, geometry.tree_offset() as u64,
+            geometry.tree_len()).await?;
+    }
     let mut siblings = Vec::new();
     siblings
         .try_reserve_exact(geometry.height() as usize)
@@ -2310,6 +2329,7 @@ struct ReadWindow {
 struct ManifestRangeReader {
     windows: [ReadWindow; 17],
     read_ahead: bool,
+    coalesce_two_page_tree: bool,
     clock: u64,
 }
 
@@ -2318,6 +2338,7 @@ impl ManifestRangeReader {
         Self {
             windows: Default::default(),
             read_ahead,
+            coalesce_two_page_tree: true,
             clock: 0,
         }
     }
@@ -2375,6 +2396,11 @@ impl ManifestRangeReader {
             .map_err(|_| StoreError::MemoryLimit)?;
         output.resize(len, 0);
         let base = segment_base_page(pointer.segment_no)?;
+        // Full verification consumes every hash. Batch only a separate
+        // tree extent; compact envelopes retain ordinary demand reads.
+        let hash_run = self.read_ahead && len == HASH_SIZE
+            && declared.encoded_offset
+                == BlobGeometry::for_len(manifest.blob_key.exact_len())?.tree_offset() as u64;
         let mut copied = 0_usize;
         let mut page_index = first_page;
         while copied != len {
@@ -2401,6 +2427,9 @@ impl ManifestRangeReader {
                             .iter()
                             .enumerate()
                             .skip(1)
+                            // Eight full-verification windows, each at most
+                            // two pages, preserve the 16-page hash budget.
+                            .filter(|(index, _)| !self.read_ahead || index % 2 == 1)
                             .min_by_key(|(_, window)| window.last_used)
                             .unwrap()
                             .0
@@ -2413,11 +2442,13 @@ impl ManifestRangeReader {
             window.last_used = self.clock;
             if physical < window.first || physical - window.first >= window.pages.len() as u64 {
                 let extent_pages = declared.payload_byte_len.div_ceil(PAGE_SIZE as u64);
+                let fetch_index = if hash_run { page_index & !1 } else { page_index };
+                let fetch_first = physical - (page_index - fetch_index);
                 let remaining = extent_pages
-                    .checked_sub(page_index)
+                    .checked_sub(fetch_index)
                     .ok_or(StoreError::Corrupt)?;
                 let wanted = if len == HASH_SIZE {
-                    1
+                    if hash_run { 2 } else { 1 }
                 } else if self.read_ahead {
                     32
                 } else {
@@ -2441,10 +2472,10 @@ impl ManifestRangeReader {
                 // partially filled buffer addressable as a successful snapshot.
                 window.first = u64::MAX;
                 device
-                    .read_pages(physical, &mut window.pages)
+                    .read_pages(fetch_first, &mut window.pages)
                     .await
                     .map_err(StoreError::Device)?;
-                window.first = physical;
+                window.first = fetch_first;
             }
             let page = &window.pages[(physical - window.first) as usize];
             let in_page = if page_index == first_page {
@@ -2701,8 +2732,16 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
         Ok(())
     }
 
-    /// Route this writer's scratch writes through an in-memory sink so a
-    /// fused publication can drain them as batched device requests.
+    /// Keep compact V2 payloads open for the single-object fused publisher
+    /// to pack metadata into the same segment when space permits.
+    pub(crate) fn enable_fused_packing(&mut self) {
+        self.enable_staged_batching();
+        self.batch_packing = self.compact.is_some() && self.segments.len() == 1
+            && self.owned_from == 0
+            && self.state.as_ref().is_some_and(|state| state.allocation_version == 2);
+    }
+
+    /// Buffer scratch writes for batched device requests at publication.
     pub(crate) fn enable_staged_batching(&mut self) {
         if self.staged_sink.is_none()
             && self.geometry.encoded_len() as u64 <= SMALL_BLOB_SINK_LIMIT
@@ -3963,8 +4002,51 @@ impl<D: PageDevice> SegmentStore<D> {
         mut staged: StagedObjectCommit,
         fused: FusedAuthorityPublication,
     ) -> Result<AuthorizedObject<CasObjectHandle>, CasStoreError<D::Error>> {
-        let state = staged.predecessor;
-        let (pending, checkpoint, successor) = commit_snapshot(
+        let quota_charge = staged.quota_charge.take();
+        let object_kind = staged.object_kind;
+        let exact_len = staged.exact_len;
+        let proof_segment = if self.hot_content_proof_max_bytes != 0
+            && exact_len <= self.hot_content_proof_max_bytes
+            && staged.batch_packed && staged.existing.is_none() {
+            staged.segments.first().map(|segment| segment.segment_no)
+        } else { None };
+        let state = staged.predecessor.clone();
+        let (pending, checkpoint, successor) = if staged.batch_packed {
+            let mut planning = state.clone();
+            let mut seal = BatchSealState {
+                open: None, previous_seal: state.last_segment, sink: PageSink::new(),
+            };
+            if staged.existing.is_none() {
+                if staged.segments.len() != 1 || staged.owned_from != 0 {
+                    return Err(StoreError::Corrupt.into());
+                }
+                let segment = staged.segments[0].segment_no;
+                let next = planning.next_segment_generation.checked_add(1)
+                    .ok_or(StoreError::IdExhausted)?;
+                planning.allocation = planning.allocation.apply_transition(AllocationTransition {
+                    checkpoint_generation: planning.allocation.checkpoint_generation.checked_add(1)
+                        .ok_or(StoreError::IdExhausted)?,
+                    next_segment_generation: next,
+                    allocate: &[segment], retire: &[], reclaim: &[],
+                }).map_err(|_| StoreError::Corrupt)?;
+                planning.next_segment_generation = next;
+                planning.next_physical_segment = segment.checked_add(1).ok_or(StoreError::IdExhausted)?;
+                absorb_packed_entry(&self.device, state.superblock.binding.store_uuid,
+                    state.generation.checked_add(1).ok_or(StoreError::IdExhausted)?,
+                    &mut seal, &staged).await?;
+            }
+            let mut entries = Vec::new();
+            entries.try_reserve_exact(1).map_err(|_| StoreError::MemoryLimit)?;
+            entries.push(staged);
+            let (mut handles, checkpoint, successor) = commit_batch_snapshot(
+                &self.device, &state, &planning, self.limits, entries, seal,
+                Some(&fused), &self.pins, self.defer_commit_readback,
+                Some(&self.verified_scans), self.catalog_delta_policy,
+            ).await?;
+            if handles.len() != 1 { return Err(StoreError::Corrupt.into()); }
+            (handles.pop().ok_or(StoreError::Corrupt)?, checkpoint, successor)
+        } else {
+            commit_snapshot(
             &self.device,
             &state,
             self.limits,
@@ -3983,10 +4065,24 @@ impl<D: PageDevice> SegmentStore<D> {
             Some(&self.verified_scans),
             self.catalog_delta_policy,
         )
-        .await?;
+        .await?
+        };
+        // Authenticate the new packed segment while its pages are still hot.
+        // Cache only the proof returned by the normal device-backed scanner;
+        // payload reads and cold recovery keep their independent verification.
+        if let PhysicalPointer::Value(pointer) = successor.allocation_root {
+            if proof_segment == Some(pointer.segment_no) {
+                let scanned = scan_segment(
+                    &self.device, successor.superblock.binding.store_uuid,
+                    successor.admitted_segments, successor.next_segment_generation,
+                    successor.generation, pointer, Some(&self.verified_scans),
+                ).await?;
+                if scanned.matched.is_none() { return Err(StoreError::Corrupt.into()); }
+            }
+        }
         self.mount_verified_successor(state, checkpoint, successor, true)
             .await?;
-        let handle = pending.complete(staged.quota_charge.take());
+        let handle = pending.complete(quota_charge);
         let maximum_persistence = if handle.is_quota_charged() {
             ObjectPublicationPersistence::RuntimeOnly
         } else {
@@ -3994,8 +4090,8 @@ impl<D: PageDevice> SegmentStore<D> {
         };
         Ok(AuthorizedObject::from_committed(
             handle,
-            staged.object_kind,
-            staged.exact_len,
+            object_kind,
+            exact_len,
             maximum_persistence,
         ))
     }
@@ -6004,24 +6100,11 @@ pub(crate) async fn write_payload_records_with_header<D: PageDevice>(
             }
             continue;
         }
-        let mut page_index = 0_u32;
-        while page_index < record.value.payload_pages {
-            let batch_pages = (record.value.payload_pages - page_index).min(32) as usize;
-            let mut pages = alloc::vec![[0; PAGE_SIZE]; batch_pages];
-            for page in &mut pages {
-                let take = (payload.len() - copied).min(PAGE_SIZE);
-                page[..take].copy_from_slice(&payload[copied..copied + take]);
-                copied += take;
-            }
-            device
-                .write_pages(
-                    base + u64::from(record.value.payload_first_relative_page + page_index),
-                    &pages,
-                )
-                .await
-                .map_err(StoreError::Mutation)?;
-            page_index += batch_pages as u32;
-        }
+        crate::store::write_payload_pages(
+            device,
+            base + u64::from(record.value.payload_first_relative_page),
+            payload,
+        ).await?;
     }
     if let Some((body, _)) = header {
         sink_or_write_page(device, sink.as_deref_mut(), base, body).await?;
@@ -6264,6 +6347,149 @@ fn blob_metadata_segment<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proof_batches_read_each_required_page_once_without_device_cache() {
+        use alloc::collections::BTreeMap;
+        use alloc::rc::Rc;
+        use core::cell::RefCell;
+        use core::task::{Context, Poll, Waker};
+        use crate::store::{FormatOptions, StoreLimits};
+        use vibeos_storage_device::MutationResult;
+        #[derive(Clone, Default)]
+        struct Device {
+            pages: Rc<RefCell<BTreeMap<u64, Page>>>,
+            reads: Rc<RefCell<Vec<(u64, usize)>>>,
+        }
+        impl PageDevice for Device {
+            type Error = ();
+            fn info(&self) -> PageDeviceInfo {
+                let pages = vibeos_segment_format::admitted_pages(40).unwrap();
+                PageDeviceInfo { device_id: [3; 16], range_first_logical_block: 64,
+                    logical_block_count: pages * 8, logical_block_size: 512, page_count: pages }
+            }
+            async fn read_page(&self, page: u64, out: &mut Page) -> Result<(), ()> {
+                self.read_pages(page, core::slice::from_mut(out)).await
+            }
+            async fn read_pages(&self, first: u64, out: &mut [Page]) -> Result<(), ()> {
+                self.reads.borrow_mut().push((first, out.len()));
+                for (offset, page) in out.iter_mut().enumerate() {
+                    page.fill(0);
+                    if let Some(stored) = self.pages.borrow().get(&(first + offset as u64)) {
+                        page.copy_from_slice(stored);
+                    }
+                }
+                Ok(())
+            }
+            async fn write_page(&self, page: u64, input: &Page) -> MutationResult<(), ()> {
+                self.pages.borrow_mut().insert(page, *input); Ok(())
+            }
+            async fn flush(&self) -> MutationResult<(), ()> { Ok(()) }
+        }
+        fn run<F: Future>(future: F) -> F::Output {
+            let mut future = Box::pin(future);
+            match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(output) => output,
+                Poll::Pending => panic!("memory device yielded"),
+            }
+        }
+        for size in [360 * 1024usize, 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024, 32 * 1024 * 1024, 64 * 1024 * 1024] {
+            let device = Device::default();
+            let limits = StoreLimits::default();
+            let mut store = SegmentStore::new(device.clone(), limits);
+            run(store.format(FormatOptions { store_uuid: StoreUuid::new(*b"PROOF-BATCH-TEST").unwrap(),
+                cleaner_reserve_segments: 2, limits })).unwrap();
+            let bytes: Vec<u8> = (0..size).map(|i| (i ^ (i >> 11)) as u8).collect();
+            let mut writer = store.begin_blob(9, bytes.len() as u64, None).unwrap();
+            for chunk in bytes.chunks(4096) { run(writer.write_chunk(chunk)).unwrap(); }
+            let object = run(writer.commit()).unwrap();
+            let (_, manifest) = run(store.resolve_authorized_manifest_unverified(&object)).unwrap();
+            let geometry = BlobGeometry::for_len(bytes.len() as u64).unwrap();
+            let tree = manifest.extents.iter().find(|extent| extent.encoded_offset == geometry.tree_offset() as u64).unwrap();
+            let PhysicalPointer::Value(pointer) = tree.pointer else { panic!("missing tree") };
+            let tree_first = segment_base_page(pointer.segment_no).unwrap() + u64::from(pointer.payload_relative_page);
+            let tree_pages = geometry.tree_len().div_ceil(PAGE_SIZE) as u64;
+            let dispersed: Vec<_> = (0..32).map(|i| (((31 - i) * (size / 4096 - 1) / 31 * 4096) as u64, 4096)).collect();
+            for ranges in [
+                alloc::vec![(0, 4096), (4096, 4096), (8192, 4096)],
+                alloc::vec![(0, 3 * 4096)],
+                alloc::vec![(4095, 2)],
+                alloc::vec![(0, 4096)],
+                dispersed,
+            ] {
+                device.reads.borrow_mut().clear();
+                let values = run(store.read_blob_ranges(&object, &ranges)).unwrap();
+                let mut required = alloc::collections::BTreeSet::new();
+                for (value, &(offset, len)) in values.iter().zip(&ranges) {
+                    assert_eq!(value, &bytes[offset as usize..offset as usize + len]);
+                    for leaf in offset / 4096..=(offset + len as u64 - 1) / 4096 {
+                        let (mut position, mut width, mut base) = (leaf as usize, geometry.padded_leaf_count() as usize, 0usize);
+                        while width > 1 {
+                            required.insert(tree_first + ((base + (position ^ 1)) * HASH_SIZE / PAGE_SIZE) as u64);
+                            base += width;
+                            width /= 2;
+                            position /= 2;
+                        }
+                    }
+                }
+                let tree_reads: Vec<_> = device.reads.borrow().iter().copied()
+                    .filter(|(first, count)| *first < tree_first + tree_pages && first + *count as u64 > tree_first)
+                    .collect();
+                let mut observed: Vec<_> = tree_reads.iter().flat_map(|(first, count)| *first..*first + *count as u64).collect();
+                observed.sort_unstable();
+                assert_eq!(observed, required.into_iter().collect::<Vec<_>>(), "size={size} ranges={ranges:?}");
+                if size == 360 * 1024 && ranges == [(0, 4096)] {
+                    assert_eq!(tree_reads, [(tree_first, 2)]);
+                }
+                std::println!("proof working set: size={} ranges={} tree_pages={} read_pages={} requests={}", size, ranges.len(), tree_pages, observed.len(), tree_reads.len());
+            }
+            device.reads.borrow_mut().clear();
+            assert_eq!(run(store.read_verified_blob(&object)).unwrap(), bytes);
+            let mut full_tree_reads: Vec<_> = device.reads.borrow().iter().copied()
+                .filter(|(first, count)| *first < tree_first + tree_pages && first + *count as u64 > tree_first)
+                .collect();
+            full_tree_reads.sort_unstable();
+            // The 360 KiB object uses the existing small-blob payload
+            // reader; larger objects use the streaming verifier optimized here.
+            let run_pages = if size == 360 * 1024 { 1 } else { 2 };
+            assert_eq!(full_tree_reads, (0..tree_pages).step_by(run_pages)
+                .map(|offset| (tree_first + offset, (tree_pages - offset).min(run_pages as u64) as usize))
+                .collect::<Vec<_>>());
+            std::println!("full proof: size={} tree_pages={} read_pages={} requests={}", size, tree_pages,
+                full_tree_reads.iter().map(|(_, count)| count).sum::<usize>(), full_tree_reads.len());
+            // Corrupt a required sibling in both the leaf-hash area and
+            // the top tree level. Every invocation must authenticate media
+            // again even when segment descriptor proofs remain memoized.
+            for node in [1usize, geometry.tree_node_count() as usize - 2] {
+                let page = tree_first + (node * HASH_SIZE / PAGE_SIZE) as u64;
+                let offset = node * HASH_SIZE % PAGE_SIZE;
+                device.pages.borrow_mut().get_mut(&page).unwrap()[offset] ^= 1;
+                assert!(run(store.read_blob_ranges(&object, &[(0, 4096)])).is_err());
+                assert!(run(store.read_verified_blob(&object)).is_err());
+                device.pages.borrow_mut().get_mut(&page).unwrap()[offset] ^= 1;
+                assert_eq!(run(store.read_blob_ranges(&object, &[(0, 4096)])).unwrap()[0], bytes[..4096]);
+            }
+        }
+    }
+
+    #[test]
+    fn every_two_page_tree_proof_requires_both_pages() {
+        for leaves in 65..=128 {
+            let geometry = BlobGeometry::for_len(leaves * LEAF_SIZE as u64).unwrap();
+            assert_eq!(geometry.tree_len().div_ceil(PAGE_SIZE), 2);
+            for index in 0..leaves as usize {
+                let (mut position, mut width, mut base) = (index, 128usize, 0usize);
+                let mut pages = [false; 2];
+                while width > 1 {
+                    pages[(base + (position ^ 1)) * HASH_SIZE / PAGE_SIZE] = true;
+                    base += width;
+                    width /= 2;
+                    position /= 2;
+                }
+                assert_eq!(pages, [true, true]);
+            }
+        }
+    }
 
     #[test]
     fn preclear_holes_excludes_either_checkpoint_live_segments_and_bounds_work() {

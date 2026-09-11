@@ -621,9 +621,9 @@ impl PersistentAuthoritySnapshot {
     }
 
     /// Build a snapshot whose record stream is known to be validated because
-    /// it was taken verbatim from a [`PersistentAuthorityImport`], whose only
-    /// constructors preflight the stream. Every structural field check still
-    /// runs; only the per-record chain walk is skipped.
+    /// it was taken verbatim from a [`PersistentAuthorityImport`] or another
+    /// validated snapshot. Their constructors preflight the stream. Every
+    /// structural field check still runs; only the record-chain walk is skipped.
     pub(crate) fn from_validated_import_parts(
         checkpoint_generation: u64,
         root_policy_sha256: [u8; 32],
@@ -706,14 +706,17 @@ impl PersistentAuthoritySnapshot {
         &self,
         checkpoint_generation: u64,
     ) -> Result<Self, AuthoritySnapshotError> {
-        Self::new(
+        // The private record stream was validated on construction and is
+        // cloned unchanged. Recheck structural fields against the new
+        // generation without replaying the same authority graph twice.
+        Self::from_validated_import_parts(
             checkpoint_generation,
             self.root_policy_sha256,
             self.record_stream.clone(),
             self.objects.clone(),
             self.principals.clone(),
-        )?
-        .with_external_roots(self.external_roots.clone())
+            self.external_roots.clone(),
+        )
     }
 }
 
@@ -1098,25 +1101,37 @@ fn validate(
 
 fn validate_record_chain(record_stream: &[u8]) -> Result<(), AuthoritySnapshotError> {
     let record_count = record_stream.len() / RECORD_SIZE;
-    let mut sectors = Vec::new();
-    sectors
-        .try_reserve_exact(record_count)
-        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
     let mut store_id = None;
+    // Preserve the strict sealed-record pass before semantic replay. The
+    // preflight API also accepts empty/torn sectors, while snapshots do not.
     for bytes in record_stream.chunks_exact(RECORD_SIZE) {
-        let sector: [u8; RECORD_SIZE] = bytes.try_into().expect("exact record chunk");
-        let decoded = match LogRecord::decode(&sector) {
+        let sector: &[u8; RECORD_SIZE] = bytes.try_into().expect("exact record chunk");
+        let decoded = match LogRecord::decode(sector) {
             Ok(DecodeStatus::Valid(decoded)) => decoded,
             _ => return Err(AuthoritySnapshotError::InvalidRecord),
         };
         store_id.get_or_insert(decoded.record.store_id);
-        sectors.push(sector);
     }
     let store_id = store_id.ok_or(AuthoritySnapshotError::InvalidRecord)?;
-    let preflight = preflight_recovery(&sectors, store_id)
-        .map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?;
-    if preflight.last_sequence() as usize != sectors.len() {
-        return Err(AuthoritySnapshotError::InvalidAuthorityGraph);
+    let mut replay = vibeos_durable_format::PreflightReplay::new(store_id);
+    // Bound the copied sectors and PreflightReplay's per-append probes rather
+    // than duplicating the entire authority stream. Graph state remains live
+    // across batches; transactions and grants may cross a batch boundary.
+    const BATCH_RECORDS: usize = 32;
+    let mut sectors = Vec::new();
+    sectors.try_reserve_exact(record_count.min(BATCH_RECORDS))
+        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    for chunk in record_stream.chunks(BATCH_RECORDS * RECORD_SIZE) {
+        sectors.clear();
+        sectors.extend(chunk.chunks_exact(RECORD_SIZE).map(|bytes| {
+            <[u8; RECORD_SIZE]>::try_from(bytes).expect("exact record chunk")
+        }));
+        replay.append(&sectors).map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?;
+    }
+    drop(sectors);
+    let preflight = replay.finish().map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?;
+    if preflight.last_sequence() as usize != record_count {
+        return Err(AuthoritySnapshotError::InvalidRecord);
     }
     Ok(())
 }
@@ -1292,6 +1307,51 @@ mod tests {
             }],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn bounded_record_replay_matches_whole_stream_across_transaction_boundaries() {
+        let store = StoreId::new(7).unwrap();
+        let mut chain = RecordChain::new(store);
+        let mut records = vec![chain.append(None, RecordBody::Format).unwrap(),
+            chain.append(None, RecordBody::IdHighWater { exclusive_end: 32 }).unwrap()];
+        records.extend(encode_object_transaction(&mut chain, TransactionId::new(3).unwrap(),
+            ObjectId::new(4).unwrap(), ObjectKind::new(5).unwrap(), &vec![0x59; 32 * 1024]).unwrap().records);
+        assert!(records.len() > 64);
+        // Compare all complete-record prefixes, including incomplete object
+        // transactions, against the original whole-stream semantic oracle.
+        for len in 1..=records.len() {
+            let bytes: Vec<u8> = records[..len].iter().flatten().copied().collect();
+            let expected = preflight_recovery(&records[..len], store).is_ok();
+            assert_eq!(validate_record_chain(&bytes).is_ok(), expected, "prefix {len}");
+        }
+        for boundary in [32,64] {
+            let mut bad = records.clone(); bad.swap(boundary-1, boundary);
+            assert!(preflight_recovery(&bad, store).is_err());
+            assert!(validate_record_chain(&bad.iter().flatten().copied().collect::<Vec<u8>>()).is_err());
+            let mut bad = records.clone(); bad[boundary][0] ^= 1;
+            assert!(validate_record_chain(&bad.iter().flatten().copied().collect::<Vec<u8>>()).is_err());
+        }
+    }
+
+    #[test]
+    fn relocated_snapshot_preserves_tables_and_checks_generation_constraints() {
+        let original = sample().with_external_roots(vec![PersistentRootEntry {
+            object_id: 42, commit_generation: 9, object_kind: 7,
+        }]).unwrap();
+        let moved = original.relocated(10).unwrap();
+        let mut expected = encode_persistent_authority_snapshot(&original).unwrap();
+        put_u64(&mut expected, 0x10, 10);
+        assert_eq!(encode_persistent_authority_snapshot(&moved).unwrap(), expected);
+        assert_eq!(decode_persistent_authority_snapshot(&expected).unwrap(), moved);
+        assert!(original.relocated(0).is_err());
+        // Both object bindings and external roots must remain valid at the
+        // new generation; bypassing stream replay must not bypass these.
+        assert!(original.relocated(8).is_err());
+        assert!(sample().relocated(6).is_err());
+        let mut bad_binding = original.clone();
+        bad_binding.objects[0].object_kind = 0;
+        assert!(bad_binding.relocated(10).is_err());
     }
 
     #[test]

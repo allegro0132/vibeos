@@ -2150,3 +2150,60 @@ fn cold_mount_does_not_reuse_highest_object_id_collected_by_gc() {
     assert!(after_ids[1] > 2, "collected ObjectId 2 was reused");
     drop(replacement);
 }
+
+#[test]
+fn partial_gc_retains_unselected_manifest_across_reuse_and_cold_mount() {
+    let device = MemoryDevice::blank(64);
+    let mut store = format(device.clone());
+    // Keep enough dead sources that both 8- and 16-source rounds can
+    // yield without selecting the live manifest this fixture protects.
+    for value in 0..10_u8 {
+        drop(put(&mut store, &[value; PAGE_SIZE]));
+    }
+    let bytes = vec![0x6d; 128 * 1024];
+    let live = put(&mut store, &bytes);
+    block_on(store.synchronize_gc_roots(&[&live])).unwrap();
+    let before = device.durable_image();
+    let (_, cas) = cas_at_selected_checkpoint(&before);
+    let original = cas.blobs.iter().find(|m| m.blob_key.exact_len() == bytes.len() as u64)
+        .unwrap().manifest;
+    let PhysicalPointer::Value(original_value) = original else { panic!("manifest pointer"); };
+    for round in 0..2_u8 {
+        if round != 0 {
+            for value in 0..10_u8 {
+                drop(put(&mut store, &[0x80 + value; PAGE_SIZE]));
+            }
+        }
+        // Even when a previous GC cached the containing segment proof,
+        // each new collection must authenticate the retained manifest bytes.
+        let page = ANCHOR_PAGES + original_value.segment_no * SEGMENT_PAGES
+            + u64::from(original_value.payload_relative_page);
+        device.pages.lock().unwrap().get_mut(&page).unwrap()[0] ^= 1;
+        let damaged = device.durable_image();
+        assert!(block_on(store.collect_garbage()).is_err());
+        assert_eq!(device.durable_image(), damaged, "corrupt retained manifest must fail before writes");
+        device.pages.lock().unwrap().get_mut(&page).unwrap()[0] ^= 1;
+        let telemetry = block_on(store.collect_garbage()).unwrap();
+        assert_eq!(telemetry.copied_bytes, 0);
+        let image = device.durable_image();
+        let (_, cas) = cas_at_selected_checkpoint(&image);
+        let mapping = cas.blobs.iter().find(|m| m.blob_key.exact_len() == bytes.len() as u64).unwrap();
+        assert_eq!(mapping.manifest, original, "unselected manifest must remain in place");
+        let (_, allocation) = allocation_at_selected_checkpoint(&image);
+        assert_eq!(allocation.segment_state(original_value.segment_no), Some(SegmentAllocation::Allocated));
+        assert_eq!(pointer_payload(&image, original), pointer_payload(&before, original));
+        let path = raw_image_path("retained-manifest");
+        write_raw_image(&image, device.page_count, &path);
+        let verified = run_raw_gc_verifier(&path);
+        let _ = std::fs::remove_file(path);
+        assert!(verified.status.success(), "{}", String::from_utf8_lossy(&verified.stdout));
+    }
+    let runtime = store.runtime_context();
+    drop(store);
+    let mut cold = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+    block_on(cold.mount()).unwrap();
+    for leaf in 0..bytes.len() / PAGE_SIZE {
+        assert_eq!(block_on(cold.get_blob_chunk(&live, leaf as u32)).unwrap().bytes,
+            bytes[leaf * PAGE_SIZE..(leaf + 1) * PAGE_SIZE]);
+    }
+}

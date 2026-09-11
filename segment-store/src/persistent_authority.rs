@@ -497,6 +497,16 @@ impl<D: PageDevice> SegmentStore<D> {
         }))
     }
 
+    /// Allocation-free scheduling hint to avoid constructing an import when
+    /// runtime roots/readers already rule out quiescent compaction. A true
+    /// result may immediately become stale: it never authorizes a rewrite or
+    /// replaces compact_unpinned_persistent_authority's admission guard.
+    pub fn quiescent_compaction_hint(&self) -> bool {
+        self.require_current_generation().is_ok()
+            && self.pins.roots_are_empty(4).unwrap_or(false)
+            && self.pins.is_quiescent_through(u64::MAX)
+    }
+
     /// Compact history only while the shared runtime has no object or reader
     /// pins. Registration stays closed through durable publication; the
     /// caller's exact policy must revalidate the proposed record stream.
@@ -1259,8 +1269,10 @@ impl<D: PageDevice> SegmentStore<D> {
                 .iter()
                 .filter(|object| reservation_ids.contains(&object.object_id.get()))
             {
-                let reservation =
+                let mut reservation =
                     self.reserve_blob_quota(principal, recovered.byte_len())?;
+                reservation.reserve_persistent_candidate()
+                    .map_err(|error| PersistentAuthorityError::Store(StoreError::Quota(error)))?;
                 quota_reservations.push((recovered.object_id.get(), reservation));
             }
             quota_reservations.sort_unstable_by_key(|(stable_id, _)| *stable_id);
@@ -1458,7 +1470,7 @@ impl<D: PageDevice> SegmentStore<D> {
                     )?,
                 }
             };
-            writer.enable_staged_batching();
+            writer.enable_fused_packing();
             let content: &[u8] = match recovered.external_root {
                 Some(_) => external_payloads
                     .get(&stable_id)

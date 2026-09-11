@@ -139,7 +139,7 @@ class State:
         )
 
 
-def decode_sector(sector: bytes, physical: int) -> Record | None:
+def decode_sector(sector: bytes, physical: int, *, expected_store_id: int = STORE_ID) -> Record | None:
     if sector == bytes(SECTOR_SIZE) or sector[SEAL_OFFSET:] != SEAL:
         return None
     if sector[:8] != MAGIC or u16(sector, 0x08) != 1:
@@ -165,7 +165,7 @@ def decode_sector(sector: bytes, physical: int) -> Record | None:
         fail(f"sealed sector {physical}: bad sequence copy")
     if u128(sector, CRC_OFFSET + 16) != transaction:
         fail(f"sealed sector {physical}: bad transaction copy")
-    if u128(sector, 0x28) != STORE_ID:
+    if u128(sector, 0x28) != expected_store_id:
         fail(f"sealed sector {physical}: wrong platform StoreId")
     transactional = kind in {
         GRANT_PREPARE,
@@ -199,6 +199,10 @@ def records_from_image(image: bytes) -> list[Record]:
         record = decode_sector(image[start : start + SECTOR_SIZE], physical)
         if record is not None:
             records.append(record)
+    return validate_record_chain(records)
+
+
+def validate_record_chain(records: list[Record]) -> list[Record]:
     previous_sequence = 0
     previous_crc = 0
     for index, record in enumerate(records):
@@ -216,7 +220,27 @@ def records_from_image(image: bytes) -> list[Record]:
 
 
 def recover(image: bytes, *, allow_external: bool = False) -> State:
-    records = records_from_image(image)
+    return _recover_records(records_from_image(image), allow_external=allow_external)
+
+
+def recover_record_stream(record_stream: bytes, *, max_records: int,
+                          allow_external: bool = False, expected_store_id: int = STORE_ID) -> State:
+    """Recover a bounded logical stream, independently of the fixed M4 disk region."""
+    if (max_records <= 0 or not record_stream or len(record_stream) % SECTOR_SIZE
+            or len(record_stream) // SECTOR_SIZE > max_records):
+        fail("logical record stream length is invalid")
+    records = []
+    for index in range(len(record_stream) // SECTOR_SIZE):
+        start = index * SECTOR_SIZE
+        record = decode_sector(record_stream[start:start + SECTOR_SIZE],
+                               STORE_FIRST_SECTOR + index, expected_store_id=expected_store_id)
+        if record is None:
+            fail("logical record stream contains a non-canonical record")
+        records.append(record)
+    return _recover_records(validate_record_chain(records), allow_external=allow_external)
+
+
+def _recover_records(records: list[Record], *, allow_external: bool) -> State:
     if not records:
         return State(False, 0, {}, [], {}, {}, {})
 

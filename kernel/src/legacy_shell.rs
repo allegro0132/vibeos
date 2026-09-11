@@ -3322,6 +3322,14 @@ async fn storage_file_tree_bench(
     }
     #[cfg(feature = "qemu-virt")]
     let io_started = crate::virtio_blk::telemetry();
+    #[cfg(feature = "qemu-virt")]
+    let mut file_phase_boundaries = [io_started; 4];
+    #[cfg(feature = "qemu-virt")]
+    let mut file_phase_elapsed = [0_u64; 3];
+    #[cfg(feature = "qemu-virt")]
+    let mut stage_detail_ticks = [0_u64; 3];
+    #[cfg(feature = "qemu-virt")]
+    let mut verify_detail_ticks = [0_u64; 2];
     let started = crate::sbi::time();
     let mut transferred = 0_u64;
     let mut operations = 0_u64;
@@ -3418,31 +3426,62 @@ async fn storage_file_tree_bench(
             let mut stager = root.begin_content_stager(&path, false)?;
             let mut chunk = alloc::vec![0_u8; DATA_CHUNK_SIZE];
             for index in 0..size.div_ceil(DATA_CHUNK_SIZE) {
+                #[cfg(feature = "qemu-virt")]
+                let pattern_started = crate::sbi::time();
                 sequential_pattern::fill(&mut chunk, seed, (index * DATA_CHUNK_SIZE) as u64);
+                #[cfg(feature = "qemu-virt")]
+                { stage_detail_ticks[0] += crate::sbi::time().saturating_sub(pattern_started); }
                 let len = core::cmp::min(DATA_CHUNK_SIZE, size.saturating_sub(index * DATA_CHUNK_SIZE));
+                #[cfg(feature = "qemu-virt")]
+                let push_started = crate::sbi::time();
                 stager.push(&chunk[..len]).await?;
+                #[cfg(feature = "qemu-virt")]
+                { stage_detail_ticks[1] += crate::sbi::time().saturating_sub(push_started); }
             }
+            #[cfg(feature = "qemu-virt")]
+            let finish_started = crate::sbi::time();
             let staged = stager.finish().await?;
+            #[cfg(feature = "qemu-virt")]
+            { stage_detail_ticks[2] = crate::sbi::time().saturating_sub(finish_started); }
+            #[cfg(feature = "qemu-virt")]
+            { file_phase_boundaries[0] = crate::virtio_blk::telemetry();
+              file_phase_elapsed[0] = crate::sbi::time().saturating_sub(started); }
             let mut tx = root.begin()?;
             tx.write_staged(&path, staged)?;
             tx.commit_durable().await?;
+            #[cfg(feature = "qemu-virt")]
+            { file_phase_boundaries[1] = crate::virtio_blk::telemetry();
+              file_phase_elapsed[1] = crate::sbi::time().saturating_sub(started); }
             let reader = root.reader(&path)?;
             let mut read = 0_u64;
             for index in 0..reader.chunk_count() {
+                #[cfg(feature = "qemu-virt")]
+                let read_started = crate::sbi::time();
                 let bytes = reader.read_chunk(index).await?.ok_or(FileError::Conflict)?;
+                #[cfg(feature = "qemu-virt")]
+                { verify_detail_ticks[0] += crate::sbi::time().saturating_sub(read_started); }
+                #[cfg(feature = "qemu-virt")]
+                let match_started = crate::sbi::time();
                 if bytes.is_empty() || !sequential_pattern::matches(&bytes, seed, read) {
                     return Err(FileError::Conflict);
                 }
+                #[cfg(feature = "qemu-virt")]
+                { verify_detail_ticks[1] += crate::sbi::time().saturating_sub(match_started); }
                 read = read.checked_add(bytes.len() as u64).ok_or(FileError::Conflict)?;
             }
             if read != size as u64 {
                 return Err(FileError::Conflict);
             }
+            #[cfg(feature = "qemu-virt")]
+            { file_phase_boundaries[2] = crate::virtio_blk::telemetry();
+              file_phase_elapsed[2] = crate::sbi::time().saturating_sub(started); }
             // Remove the file so repeated samples measure a steady state
             // instead of accumulating tens of megabytes of live data.
             let mut tx = root.begin()?;
             tx.remove(&path, false, false)?;
             tx.commit_durable().await?;
+            #[cfg(feature = "qemu-virt")]
+            { file_phase_boundaries[3] = crate::virtio_blk::telemetry(); }
             operations = 3;
             transferred = (size as u64).saturating_add(read);
             Ok(())
@@ -3493,6 +3532,47 @@ async fn storage_file_tree_bench(
     #[cfg(feature = "qemu-virt")]
     let io = (io.requests, io.read_requests, io.write_requests, io.flush_requests,
         io.read_bytes, io.write_bytes, io.used_interrupts);
+    // Serialize only after measured work and aggregate counters are captured.
+    #[allow(unused_mut)]
+    let mut file_phase_json = String::new();
+    #[cfg(feature = "qemu-virt")]
+    if workload == "file-sequential" && result.is_ok() {
+        use core::fmt::Write as _;
+        let stage_other = file_phase_elapsed[0].saturating_sub(stage_detail_ticks.iter().sum());
+        for (name, ticks) in [
+            ("pattern", stage_detail_ticks[0]), ("push", stage_detail_ticks[1]),
+            ("finish", stage_detail_ticks[2]), ("other", stage_other),
+        ] {
+            write!(&mut file_phase_json, ",\"file_stage_{}_ticks\":{}", name, ticks).expect("format staging time");
+        }
+        let verify_elapsed = file_phase_elapsed[2].saturating_sub(file_phase_elapsed[1]);
+        let verify_other = verify_elapsed.saturating_sub(verify_detail_ticks.iter().sum());
+        for (name, ticks) in [
+            ("reader", verify_detail_ticks[0]), ("pattern", verify_detail_ticks[1]),
+            ("other", verify_other),
+        ] {
+            write!(&mut file_phase_json, ",\"file_verify_{}_ticks\":{}", name, ticks).expect("format verification time");
+        }
+        let mut previous = io_started;
+        let mut previous_ticks = 0;
+        // The final phase includes async-scope cleanup through the same
+        // endpoint as total elapsed, so phase times partition the workload.
+        let phase_ticks = [file_phase_elapsed[0], file_phase_elapsed[1], file_phase_elapsed[2], elapsed];
+        for ((phase, boundary), ticks) in ["stage", "publish", "verify", "remove"].into_iter().zip(file_phase_boundaries).zip(phase_ticks) {
+            write!(&mut file_phase_json, ",\"file_{}_elapsed_ticks\":{}", phase, ticks.saturating_sub(previous_ticks)).expect("format file phase time");
+            previous_ticks = ticks;
+            let delta = boundary.saturating_sub(previous);
+            previous = boundary;
+            for (name, value) in [
+                ("requests", delta.requests), ("read_requests", delta.read_requests),
+                ("write_requests", delta.write_requests), ("flush_requests", delta.flush_requests),
+                ("read_bytes", delta.read_bytes), ("write_bytes", delta.write_bytes),
+                ("used_interrupts", delta.used_interrupts),
+            ] {
+                write!(&mut file_phase_json, ",\"file_{}_{}\":{}", phase, name, value).expect("format file phase");
+            }
+        }
+    }
     let status = if result.is_ok() { "ok" } else { "failed-closed" };
     let reason = match result {
         Ok(()) => "",
@@ -3515,11 +3595,11 @@ async fn storage_file_tree_bench(
         },
     };
     println!(
-        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"file-tree\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":{},\"seed\":{},\"timebase_hz\":{},\"operations\":{},\"transferred_bytes\":{},\"elapsed_ticks\":{},\"latency_ticks\":{},\"recovery_ticks\":{},\"content_pattern\":\"{}\",\"latency_scope\":\"workload\",\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\",\"reason\":\"{}\"}}",
+        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"file-tree\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":{},\"seed\":{},\"timebase_hz\":{},\"operations\":{},\"transferred_bytes\":{},\"elapsed_ticks\":{},\"latency_ticks\":{},\"recovery_ticks\":{},\"content_pattern\":\"{}\",\"latency_scope\":\"workload\",\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\",\"reason\":\"{}\"{}}}",
         backend, workload, size, count, seed, crate::exec::timebase_hz(), operations,
         transferred, elapsed, elapsed, recovery_ticks,
         if matches!(workload, "file-sequential" | "file-batch-create-unique") { "splitmix64-offset-v1" } else { "legacy" },
-        io.0, io.1, io.2, io.3, io.4, io.5, io.6, status, reason
+        io.0, io.1, io.2, io.3, io.4, io.5, io.6, status, reason, file_phase_json
     );
 }
 

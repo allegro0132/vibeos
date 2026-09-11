@@ -883,3 +883,36 @@ fn rust_grown_powered_off_image_passes_the_anonymous_maintenance_verifier() {
         assert!(stdout.contains("\"status\":\"corrupt\""), "{stdout}");
     }
 }
+
+#[test]
+fn growth_reuses_verified_content_without_reads_proportional_to_blob_size() {
+    let mut observed = Vec::new();
+    for size in [4096, 128 * 1024] {
+        let device = MemoryDevice::blank(16, 24);
+        let mut store = SegmentStore::new(device.clone(), limits_with_memory(4 * 1024 * 1024));
+        block_on(store.format(FormatOptions {
+            store_uuid: StoreUuid::new([7; 16]).unwrap(),
+            cleaner_reserve_segments: 2,
+            limits: limits_with_memory(4 * 1024 * 1024),
+        })).unwrap();
+        let bytes = alloc::vec![0x57; size];
+        let mut writer = store.begin_blob(7, size as u64, None).unwrap();
+        for chunk in bytes.chunks(PAGE_SIZE) {
+            block_on(writer.write_chunk(chunk)).unwrap();
+        }
+        let object = block_on(writer.commit()).unwrap();
+        let maintenance = store.mint_maintenance_root().unwrap();
+        device.reset_io();
+        block_on(store.grow(&maintenance, adjacent_range(16, 4))).unwrap();
+        observed.push(device.io_counts());
+        assert_eq!(block_on(store.read_verified_blob(&object)).unwrap(), bytes);
+        block_on(store.grow(&maintenance, adjacent_range(20, 4))).unwrap();
+        assert_eq!(block_on(store.read_verified_blob(&object)).unwrap(), bytes);
+        let mut cold = SegmentStore::new(
+            MemoryDevice::from_durable(24, 24, device.durable_image()),
+            limits_with_memory(4 * 1024 * 1024),
+        );
+        assert_eq!(block_on(cold.mount()).unwrap().admitted_segments, 24);
+    }
+    assert_eq!(observed[0], observed[1], "growth must not reread unchanged content");
+}

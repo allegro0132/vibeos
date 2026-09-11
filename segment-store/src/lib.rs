@@ -14,6 +14,9 @@ extern crate std;
 mod allocation_v2;
 mod authority;
 mod authority_snapshot;
+// Experimental codec; not admitted by production mount/publication yet.
+#[cfg(test)]
+mod authority_delta;
 mod cas;
 mod cas_codec;
 mod codec;

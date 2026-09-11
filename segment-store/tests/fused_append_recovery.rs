@@ -374,6 +374,7 @@ fn drive_append_with(device: &FaultDevice, size: usize, external: bool) -> Poll<
             .unwrap();
     let mut store =
         SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+    store.set_hot_content_proof_max_bytes(72 * 1024);
     if let Err(error) = block_on(store.mount()) {
         return Poll::Ready(Err(format!("mount: {:?}", error)));
     }
@@ -521,4 +522,21 @@ fn small_external_append_cut_boundaries_recover() {
     sweep_cut_boundaries_with(4 * 1024 + 1, 1, true);
     sweep_cut_boundaries_with(16 * 1024 + 1, 1, true);
     sweep_cut_boundaries_with(128 * 1024, 1, true);
+}
+
+#[test]
+fn compact_fused_append_uses_one_segment_and_recovers_content() {
+    fn allocated(image: BTreeMap<u64, Page>) -> u64 {
+        let device = FaultDevice::from_image(SEGMENTS, image);
+        let mut store = SegmentStore::new(device, limits());
+        block_on(store.mount()).unwrap();
+        store.info().unwrap().allocated_segments
+    }
+    let (image, _) = prepared_image();
+    let before = allocated(image.clone());
+    let device = FaultDevice::from_image(SEGMENTS, image);
+    assert!(matches!(drive_append_with(&device, 4096, false), Poll::Ready(Ok(()))));
+    let after = device.durable_image();
+    assert_eq!(allocated(after.clone()) - before, 1);
+    assert_eq!(recovered_objects(after, 4096), 1);
 }

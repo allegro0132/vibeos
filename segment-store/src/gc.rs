@@ -83,7 +83,7 @@ const METADATA_KIND_PERSISTENT_AUTHORITY: u32 = 0xffff_0021;
 /// Upper bound on source segments relocated by one collection round. Bounds
 /// the foreground pause and the round's read/copy volume; remaining dead
 /// space is reclaimed by subsequent rounds.
-const GC_MAX_SOURCES_PER_ROUND: usize = 8;
+const GC_MAX_SOURCES_PER_ROUND: usize = 16;
 
 /// Allocate page I/O scratch directly in its final heap representation so the
 /// segment-builder futures remain safe for the kernel's bounded stack.
@@ -210,8 +210,7 @@ impl<E> From<GcError> for GcStoreError<E> {
     }
 }
 
-/// One Blob manifest after every referenced extent has been copied and
-/// authenticated at its target location.
+/// One live Blob's manifest, either relocated or retained outside the sources.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RelocatedBlob {
     pub(crate) blob_key: BlobKey,
@@ -221,7 +220,7 @@ pub(crate) struct RelocatedBlob {
 }
 
 /// Filter the selected CAS through the authoritative mark result and bind each
-/// live Blob to its newly verified manifest.  Shared Blobs remain one physical
+/// live Blob to its verified manifest.  Shared Blobs remain one physical
 /// entry even when several live objects name them.
 pub(crate) fn build_relocated_snapshot(
     checkpoint_generation: u64,
@@ -1828,7 +1827,27 @@ fn post_relocation_workspace_upper_bound(
 /// Simulate canonical packing so all target segments can be reserved before
 /// the first copy. Each physical source extent remains one physical target
 /// extent; no operation holds more than that exact payload in memory.
+// Both planner and writer use this decision: a kept manifest must not name
+// a reclaimed segment, either for its own record or any referenced extent.
+fn manifest_relocation(
+    manifest: &BlobManifest,
+    blobs: &[BlobMapping],
+    sources: &[u64],
+) -> Result<(PhysicalPointer, bool), GcError> {
+    let index = blobs.binary_search_by_key(&manifest.blob_key, |blob| blob.blob_key)
+        .map_err(|_| GcError::Corrupt)?;
+    let pointer = blobs[index].manifest;
+    pointer_segment(pointer).ok_or(GcError::Corrupt)?;
+    let mut relocate = source_contains(sources, pointer);
+    for extent in &manifest.extents {
+        pointer_segment(extent.pointer).ok_or(GcError::Corrupt)?;
+        relocate |= source_contains(sources, extent.pointer);
+    }
+    Ok((pointer, relocate))
+}
+
 fn required_gc_segments(
+    blobs: &[BlobMapping],
     manifests: &[BlobManifest],
     manifest_payload_lens: &[usize],
     sources: &[u64],
@@ -1866,7 +1885,9 @@ fn required_gc_segments(
                 place(usize::try_from(extent.payload_byte_len).map_err(|_| GcError::Capacity)?)?;
             }
         }
-        place(*manifest_len)?;
+        if manifest_relocation(manifest, blobs, sources)?.1 {
+            place(*manifest_len)?;
+        }
     }
     place(snapshot_len)?;
     let authority_chunk = MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE;
@@ -2762,6 +2783,7 @@ async fn relocate_live_state<D: PageDevice>(
     // Table widths are frozen; physical pointer values cannot affect length.
     let snapshot_len = cas_snapshot_len(mark.live_objects().len(), mark.live_blobs().len())?;
     let required = required_gc_segments(
+        &cas.blobs,
         manifests,
         manifest_lens,
         &plan.sources,
@@ -2785,7 +2807,17 @@ async fn relocate_live_state<D: PageDevice>(
         .try_reserve_exact(manifests.len())
         .map_err(|_| GcError::MemoryLimit)?;
     let mut copied_bytes = 0_u64;
+    let mut written_manifest_bytes = 0_usize;
     for manifest in manifests {
+        let (original, needs_relocation) = manifest_relocation(manifest, &cas.blobs, &plan.sources)?;
+        if !needs_relocation {
+            relocated.push(RelocatedBlob {
+                blob_key: manifest.blob_key,
+                manifest: original,
+                copied_bytes: 0,
+            });
+            continue;
+        }
         let mut new_extents = Vec::new();
         new_extents
             .try_reserve_exact(manifest.extents.len())
@@ -2840,6 +2872,8 @@ async fn relocate_live_state<D: PageDevice>(
         };
         let bytes = encode_blob_manifest(&new_manifest, context)
             .map_err(|_| GcError::CorruptAt("relocate-manifest-encode"))?;
+        written_manifest_bytes = written_manifest_bytes.checked_add(bytes.len())
+            .ok_or(GcError::ArithmeticOverflow)?;
         let pointer = builder
             .payload(
                 device,
@@ -2993,7 +3027,21 @@ async fn relocate_live_state<D: PageDevice>(
     let staged_state = ManifestReadContext::for_generation(
         state, plan.relocation_generation, target_next_generation,
     );
-    for mapping in &snapshot.blobs {
+    // Reuse only this collection's authenticated, unchanged manifest. Its
+    // segment and all content extents are immutable and disjoint from both
+    // source and target sets. Fresh metadata still requires device readback.
+    for mapping in snapshot.blobs.iter().rev() {
+        let original = manifests.binary_search_by_key(&mapping.blob_key, |m| m.blob_key)
+            .ok().and_then(|index| manifests.get(index)).ok_or(GcError::Corrupt)?;
+        let (old_pointer, changed) = manifest_relocation(original, &cas.blobs, &plan.sources)?;
+        if !changed && mapping.manifest == old_pointer {
+            if source_contains(&plan.targets, old_pointer)
+                || original.extents.iter().any(|extent| source_contains(&plan.targets, extent.pointer))
+            {
+                return Err(GcError::Corrupt.into());
+            }
+            continue;
+        }
         let manifest_payload = read_pointer_payload(
             device,
             state.superblock.binding.store_uuid,
@@ -3041,18 +3089,11 @@ async fn relocate_live_state<D: PageDevice>(
                 })?;
         }
     }
-    let metadata_bytes = manifest_lens.iter().try_fold(
-        snapshot_bytes
-            .len()
-            .checked_add(root_bytes.len())
-            .and_then(|bytes| bytes.checked_add(allocation_bytes.len()))
-            .ok_or(GcError::ArithmeticOverflow)?,
-        |total, manifest_len| {
-            total
-                .checked_add(*manifest_len)
-                .ok_or(GcError::ArithmeticOverflow)
-        },
-    )? as u64;
+    let metadata_bytes = snapshot_bytes.len()
+        .checked_add(root_bytes.len())
+        .and_then(|bytes| bytes.checked_add(allocation_bytes.len()))
+        .and_then(|bytes| bytes.checked_add(written_manifest_bytes))
+        .ok_or(GcError::ArithmeticOverflow)? as u64;
     let telemetry = GcTelemetry {
         epoch_generation: state.generation,
         root_count: u32::try_from(root_count).unwrap_or(u32::MAX),
@@ -3942,6 +3983,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 })
                 .ok_or(GcError::ArithmeticOverflow)?;
             let required = required_gc_segments(
+                &cas.blobs,
                 &manifests,
                 &manifest_lens,
                 &candidate,
@@ -4484,6 +4526,28 @@ mod tests {
         packing_manifest_at(index, payload_pages, 0)
     }
 
+    fn packing_mappings(manifests: &[BlobManifest]) -> Vec<BlobMapping> {
+        let mut mappings: Vec<_> = manifests.iter().map(|m| BlobMapping {
+            blob_key: m.blob_key, manifest: m.extents[0].pointer,
+        }).collect();
+        mappings.sort_unstable_by_key(|m| m.blob_key);
+        mappings
+    }
+
+    #[test]
+    fn manifest_reuse_requires_record_and_every_extent_outside_sources() {
+        let mut manifest = packing_manifest_at(0, 1, 1);
+        let mappings = packing_mappings(&[packing_manifest_at(0, 1, 0)]);
+        assert!(!manifest_relocation(&manifest, &mappings, &[2]).unwrap().1);
+        assert!(manifest_relocation(&manifest, &mappings, &[0]).unwrap().1);
+        assert!(manifest_relocation(&manifest, &mappings, &[1]).unwrap().1);
+        manifest.extents.push(packing_manifest_at(0, 1, 3).extents[0]);
+        assert!(manifest_relocation(&manifest, &mappings, &[3]).unwrap().1);
+        assert!(manifest_relocation(&manifest, &[], &[2]).is_err());
+        manifest.extents[0].pointer = PhysicalPointer::Null;
+        assert!(manifest_relocation(&manifest, &mappings, &[2]).is_err());
+    }
+
     #[test]
     fn source_ranking_is_live_bytes_then_segment_number() {
         let manifests = vec![packing_manifest_at(0, 2, 1), packing_manifest_at(1, 1, 0)];
@@ -4503,6 +4567,7 @@ mod tests {
         ];
         let manifest_lens = vec![PAGE_SIZE; manifests.len()];
         let partial = required_gc_segments(
+            &packing_mappings(&manifests),
             &manifests,
             &manifest_lens,
             &[0],
@@ -4512,6 +4577,7 @@ mod tests {
         )
         .unwrap();
         let full = required_gc_segments(
+            &packing_mappings(&manifests),
             &manifests,
             &manifest_lens,
             &[0, 1],
@@ -4564,6 +4630,7 @@ mod tests {
         );
         assert_eq!(
             required_gc_segments(
+                &packing_mappings(&manifests),
                 &manifests,
                 &manifest_lens,
                 &[0],
@@ -4589,6 +4656,7 @@ mod tests {
         );
         assert_eq!(
             required_gc_segments(
+                &packing_mappings(&manifests),
                 &manifests,
                 &manifest_lens,
                 &[0],

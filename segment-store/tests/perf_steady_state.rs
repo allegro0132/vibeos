@@ -736,3 +736,26 @@ fn large_stream_batches_writes_and_verifies_after_cold_mount() {
         );
     }
 }
+
+#[test]
+fn two_page_tree_authenticates_every_leaf_after_cold_mount() {
+    let device = CountingDevice::blank(SEGMENTS);
+    let limits = StoreLimits::default();
+    let mut store = SegmentStore::new(device.clone(), limits);
+    block_on(store.format(FormatOptions {
+        store_uuid: StoreUuid::new(*b"TWO-PAGE-TREE!!!").unwrap(),
+        cleaner_reserve_segments: 2,
+        limits,
+    })).unwrap();
+    let bytes: Vec<u8> = (0..360 * 1024usize).map(|i| (i ^ (i >> 11)) as u8).collect();
+    let mut writer = store.begin_blob(OBJECT_KIND_RAW, bytes.len() as u64, None).unwrap();
+    for chunk in bytes.chunks(4096) { block_on(writer.write_chunk(chunk)).unwrap(); }
+    let object = block_on(writer.commit()).unwrap();
+    let runtime = store.runtime_context();
+    drop(store);
+    let mut cold = SegmentStore::new_with_runtime_context(device, limits, runtime);
+    block_on(cold.mount()).unwrap();
+    for (index, expected) in bytes.chunks(4096).enumerate() {
+        assert_eq!(block_on(cold.get_blob_chunk(&object, index as u32)).unwrap().bytes, expected);
+    }
+}

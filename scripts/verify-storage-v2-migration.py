@@ -54,7 +54,8 @@ AUTHORITY_HEADER_LEN = 0x80
 AUTHORITY_OBJECT_LEN = 0x30
 AUTHORITY_PRINCIPAL_LEN = 0x40
 AUTHORITY_EXTERNAL_ROOT_LEN = 0x20
-MAX_AUTHORITY_BYTES = 256 * PAGE
+MAX_AUTHORITY_BYTES = 16_384 * PAGE
+MAX_AUTHORITY_RECORDS = (MAX_AUTHORITY_BYTES - AUTHORITY_HEADER_LEN) // BLOCK
 MAX_PRINCIPALS = 256
 EXTERNAL_POLICY = b"vibeos.storage-v2.external-policy.v1\0persistent-space=0x5053,slot=0,generation=0,rights=rgx,kind=0x43535043\0program-space=0x50524f47,slot=0,generation=0,rights=r,kind=0x50524731\0sealed-singleton-optional=0x53534801"
 PERSISTENT_SPACE = 0x5053
@@ -306,23 +307,9 @@ def canonical_m4_stream(image: bytes | bytearray) -> tuple[bytes, Any]:
 
 
 def recover_record_stream(record_stream: bytes) -> Any:
-    require(
-        record_stream
-        and len(record_stream) % BLOCK == 0
-        and len(record_stream) <= M4_COUNT * BLOCK,
-        "persistent authority record stream length is invalid",
+    state = legacy_codec.recover_record_stream(
+        record_stream, max_records=MAX_AUTHORITY_RECORDS, allow_external=True,
     )
-    journal = bytearray((M4_FIRST + M4_COUNT) * BLOCK)
-    for index in range(0, len(record_stream), BLOCK):
-        sector = record_stream[index:index + BLOCK]
-        require(
-            legacy_codec.decode_sector(sector, M4_FIRST + index // BLOCK)
-            is not None,
-            "persistent authority record stream contains a non-canonical record",
-        )
-        at = M4_FIRST * BLOCK + index
-        journal[at:at + BLOCK] = sector
-    state = legacy_codec.recover(bytes(journal), allow_external=True)
     require(state.formatted, "persistent authority record stream is not formatted")
     return state
 
@@ -2400,6 +2387,46 @@ def fixture() -> bytearray:
     return image
 
 
+def extended_authority_stream_selftest() -> int:
+    codec = legacy_codec
+    records = []
+    crc = 0
+    for index in range(513):
+        kind = codec.FORMAT if index == 0 else codec.HIGH_WATER
+        payload = b"" if index == 0 else index.to_bytes(16, "little")
+        raw = codec.encode_record(kind, payload, index + 1, index, crc, 0)
+        crc = codec.u32(raw, codec.CRC_OFFSET)
+        records.append(raw)
+    stream = b"".join(records)
+    recovered = recover_record_stream(stream)
+    require(recovered.high_water == 512, "extended authority stream was truncated")
+    fixed = bytes(M4_FIRST * BLOCK) + stream
+    require(codec.recover(fixed).high_water == 511,
+            "logical stream support changed the fixed M4 disk boundary")
+    cases = 2
+    damaged = bytearray(stream)
+    damaged[-BLOCK + codec.CRC_OFFSET] ^= 1
+    for bad in [b"", stream[:-1], bytes(damaged),
+                b"".join(records[:-2] + [records[-1], records[-2]]),
+                stream + records[-1]]:
+        try:
+            recover_record_stream(bad)
+        except (Violation, ValueError):
+            cases += 1
+        else:
+            raise Violation("invalid extended authority stream was accepted")
+    try:
+        codec.recover_record_stream(stream, max_records=512, allow_external=True)
+    except ValueError:
+        cases += 1
+    else:
+        raise Violation("logical stream record budget was ignored")
+    require(codec.recover_record_stream(stream, max_records=513,
+                                        allow_external=True).high_water == 512,
+            "exact logical stream budget was rejected")
+    return cases + 1
+
+
 def external_record_selftest() -> int:
     codec = legacy_codec
     payload = bytearray(64)
@@ -2490,7 +2517,7 @@ def selftest() -> dict[str, Any]:
     )
     old = parse_control(page_at(image, CONTROL_FIRST, 0), page_at(image, CONTROL_FIRST, 1))
     body, seal = encode_control(STAGED, 2)
-    cases = 1 + external_record_selftest()
+    cases = 1 + external_record_selftest() + extended_authority_stream_selftest()
     for length in range(PAGE + 1):
         candidate = parse_control(body[:length] + bytes(PAGE - length), bytes(PAGE))
         require(select_control([old, candidate])["generation"] == 1, "body prefix selected V2")

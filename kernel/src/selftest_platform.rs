@@ -1377,7 +1377,8 @@ fn components(h: &mut Harness) {
     h.eq(
         "the system image registers every discovered supervised component",
         snapshots.len(),
-        4 + usize::from(w.block.is_some()) + usize::from(w.net_control.is_some()),
+        4 + usize::from(w.block.is_some()) + usize::from(w.net_control.is_some())
+            + usize::from(w.entropy_driver_present()),
     );
     h.check(
         "component memory accounts use the stable component identity",

@@ -1807,6 +1807,7 @@ dependencies = [
  "vibeos-driver-virtio-core",
  "vibeos-driver-virtio-mmio",
  "vibeos-driver-virtio-net",
+ "vibeos-driver-virtio-rng",
  "vibeos-eqos-net",
  "vibeos-ethernet",
  "vibeos-firmware-milkv-mars",

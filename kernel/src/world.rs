@@ -24,7 +24,7 @@ use crate::net_device;
 use crate::saved_program;
 use crate::store;
 use crate::sync::SpinLock;
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "queued-entropy")]
 use crate::virtio_rng;
 use crate::{exec, HEAP};
 
@@ -134,7 +134,7 @@ enum ComponentTemplate {
     NetDriver,
     #[cfg(feature = "milkv-duo")]
     UsbEcmNetDriver,
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     VirtioRng,
     #[cfg(feature = "ssh-security-test")]
     SshSecurityTest,
@@ -184,7 +184,7 @@ enum ComponentGrants {
         inbound: Cap,
         control: Cap,
     },
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     VirtioRng {
         mmio: Cap,
         dma: Cap,
@@ -569,17 +569,17 @@ pub struct World {
     #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     iperf_data_listener_root: Option<Cap>,
     #[cfg(any(
-        feature = "qemu-virt",
+        feature = "queued-entropy",
         feature = "milkv-ssh-acceptance",
         feature = "provisioned-ssh"
     ))]
     rng_policy: Option<Arc<Space>>,
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     rng_mmio: Option<Cap>,
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     rng_dma: Option<Cap>,
     #[cfg(any(
-        feature = "qemu-virt",
+        feature = "queued-entropy",
         feature = "milkv-ssh-acceptance",
         feature = "provisioned-ssh"
     ))]
@@ -621,6 +621,13 @@ struct StoreBlockGrants {
 }
 
 impl World {
+    /// Discovery state, independent of whether the supervised driver is online.
+    pub(crate) fn entropy_driver_present(&self) -> bool {
+        #[cfg(feature = "queued-entropy")]
+        { self.rng_mmio.is_some() }
+        #[cfg(not(feature = "queued-entropy"))]
+        { false }
+    }
     /// Hand the C7.4 supervisor its already-provisioned journal endpoint
     /// through init's explicit store authority. The acceptance task receives
     /// no `Cap`, CSpace, object name, or durable identity; it can only request
@@ -919,7 +926,7 @@ impl World {
             };
         }
 
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-entropy")]
         if template == ComponentTemplate::VirtioRng {
             let policy = self
                 .rng_policy
@@ -1176,7 +1183,7 @@ impl World {
             ComponentTemplate::UsbEcmNetDriver => {
                 unreachable!("USB network grants come from the private policy CSpace")
             }
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-entropy")]
             ComponentTemplate::VirtioRng => {
                 unreachable!("entropy grants come from the private policy CSpace")
             }
@@ -1287,7 +1294,7 @@ impl World {
                     ),
                 )
             },
-            #[cfg(feature = "qemu-virt")]
+            #[cfg(feature = "queued-entropy")]
             ComponentGrants::VirtioRng { mmio, dma, source } => unsafe {
                 exec::spawn_reclaimable_owned(
                     domain,
@@ -1806,7 +1813,7 @@ pub fn start_usb_net_supervisor() {
 /// Restart only faulted entropy-driver incarnations. A failed or unconfirmed
 /// device reset remains quarantined inside the driver and cannot be converted
 /// into synthetic output by the supervisor.
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "queued-entropy")]
 pub fn start_rng_supervisor() {
     let world = world();
     let Some(component) = world.component_named("virtio-rng") else {
@@ -1979,15 +1986,15 @@ pub fn build() {
     let usb_net_policy = usb_net_resources
         .as_ref()
         .map(|_| Space::new("usb-ecm-net-policy"));
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     let rng_resources = virtio_rng::discover();
     #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
     let rng_resources = Some(vibeos_kernel_acceptance::ssh_acceptance_rng::provision());
     #[cfg(all(feature = "jitter-entropy", feature = "provisioned-ssh"))]
     let rng_resources = crate::jitterentropy_random::provision().ok();
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     let rng_space = rng_resources.as_ref().map(|_| Space::new("virtio-rng"));
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     let rng_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("virtio-rng-policy"));
@@ -2582,7 +2589,7 @@ pub fn build() {
         .expect("the iperf3 data listener policy is valid");
         policy_space.0.lock().mint(listener, Rights::ALL_VOLATILE)
     });
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     let (rng_mmio_root, rng_dma_root, rng_source_root, rng_grants) =
         match (rng_resources, rng_space.as_ref(), rng_policy.as_ref()) {
             (Some(resources), Some(driver_space), Some(policy_space)) => {
@@ -3058,11 +3065,11 @@ pub fn build() {
     if let Some(space) = usb_net_policy.as_ref() {
         spaces.insert("usb-ecm-net-policy", space.clone());
     }
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     if let Some(space) = rng_space.as_ref() {
         spaces.insert("virtio-rng", space.clone());
     }
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     if let Some(space) = rng_policy.as_ref() {
         spaces.insert("virtio-rng-policy", space.clone());
     }
@@ -3196,17 +3203,17 @@ pub fn build() {
         #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
         iperf_data_listener_root,
         #[cfg(any(
-            feature = "qemu-virt",
+            feature = "queued-entropy",
             feature = "milkv-ssh-acceptance",
             feature = "provisioned-ssh"
         ))]
         rng_policy,
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-entropy")]
         rng_mmio: rng_mmio_root,
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-entropy")]
         rng_dma: rng_dma_root,
         #[cfg(any(
-            feature = "qemu-virt",
+            feature = "queued-entropy",
             feature = "milkv-ssh-acceptance",
             feature = "provisioned-ssh"
         ))]
@@ -3301,7 +3308,7 @@ pub fn build() {
         );
     }
 
-    #[cfg(feature = "qemu-virt")]
+    #[cfg(feature = "queued-entropy")]
     if let (Some(space), Some((mmio, dma, source))) = (rng_space, rng_grants) {
         world.spawn_component_inner(
             "virtio-rng",

@@ -944,8 +944,10 @@ compile_error!(
 compile_error!("jitter-entropy is restricted to the existing Duo configuration");
 #[cfg(all(feature = "provisioned-ssh", not(any(feature = "qemu-virt", feature = "jitter-entropy"))))]
 compile_error!("provisioned-ssh requires an explicitly selected entropy provider");
-#[cfg(all(feature = "jitter-entropy", feature = "qemu-virt"))]
+#[cfg(all(feature = "jitter-entropy", feature = "queued-entropy"))]
 compile_error!("select exactly one entropy provider");
+#[cfg(all(feature = "queued-entropy", feature = "milkv-ssh-acceptance"))]
+compile_error!("queued entropy and the Duo deterministic acceptance source are mutually exclusive");
 #[cfg(all(feature = "milkv-ssh-acceptance", not(feature = "milkv-duo")))]
 compile_error!("feature `milkv-ssh-acceptance` is the Milk-V Duo hardware acceptance image");
 #[cfg(all(
@@ -1008,7 +1010,7 @@ compile_error!("Milk-V Wasmtime requires riscv64gc-unknown-none-elf; use build-m
 pub use vibeos_core::arch as sbi;
 pub use vibeos_core::net;
 pub use vibeos_core::{cap, chan, exec, heap, instance, interrupt, ipi, sync};
-#[cfg(any(feature = "queued-block", feature = "queued-network", feature = "qemu-virt"))]
+#[cfg(any(feature = "queued-block", feature = "queued-network"))]
 pub use vibeos_virtio_protocol as virtio;
 pub use vibeos_durable_format as durable;
 pub use vibeos_program_store as program;
@@ -1143,15 +1145,15 @@ mod usb_ecm_net;
 mod queued_block;
 #[cfg(feature = "queued-block")]
 mod virtio_blk;
-#[cfg(any(feature = "queued-block", feature = "queued-network", feature = "qemu-virt"))]
+#[cfg(any(feature = "queued-block", feature = "queued-network"))]
 mod virtio_mmio;
 #[cfg(feature = "queued-network")]
 mod queued_network;
 #[cfg(feature = "queued-network")]
 mod virtio_net;
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "queued-entropy")]
 mod entropy_device;
-#[cfg(feature = "qemu-virt")]
+#[cfg(feature = "queued-entropy")]
 mod virtio_rng;
 mod vsh_platform;
 mod world;
@@ -1666,7 +1668,7 @@ fn start_services(boot_time: u64) -> ! {
     ))]
     world::start_usb_net_supervisor();
     #[cfg(all(
-        feature = "qemu-virt",
+        feature = "queued-entropy",
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -2213,7 +2215,7 @@ unsafe fn reclaim_faulted_component(
         net_device::recover_faulted_domain(domain);
         #[cfg(feature = "milkv-duo")]
         usb_ecm_net::recover_faulted_domain(domain);
-        #[cfg(feature = "qemu-virt")]
+        #[cfg(feature = "queued-entropy")]
         virtio_rng::recover_faulted_domain(domain);
         world::world().recover_faulted_domain(domain);
         #[cfg(feature = "wasmtime-guarded-memory")]

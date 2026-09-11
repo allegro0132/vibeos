@@ -74,7 +74,7 @@ use crate::world::Space;
 
 #[cfg(feature = "provisioned-ssh")]
 use crate::ssh_entropy as ssh_rng;
-#[cfg(all(feature = "qemu-virt", not(feature = "provisioned-ssh")))]
+#[cfg(all(feature = "queued-entropy", not(feature = "provisioned-ssh")))]
 use crate::virtio_rng as ssh_rng;
 use ssh_rng::RandomError;
 #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]

@@ -1403,3 +1403,31 @@ DMA callbacks. QEMU's real DMA entropy provider passes the two-boot security
 acceptance after the capability wiring change. Evidence is in
 `boards/milkv-mars/entropy-backing-evidence.json`. Native Mars controller service
 publication and physical qualification remain pending; SD images are unchanged.
+
+### Independent kernel entropy feature
+
+`queued-entropy` now selects the generic endpoint, capability, supervisor and
+fault-recovery code independently of `qemu-virt`. The old QEMU switch includes
+it as a compatibility feature. World initialization and component restart no
+longer use the QEMU board switch to decide whether entropy state exists. Mixing
+this provider with Duo jitter entropy or deterministic acceptance entropy is
+rejected. Existing production-SSH qualification guards are retained.
+
+The QEMU HAL acceptance firmware can compose the provider with
+`entropy-composition-test`; its resolved kernel features include
+`queued-entropy` and exclude `qemu-virt`. With a real emulated RNG attached,
+four harts start, the entropy capability becomes operational, and all 395
+selftests pass. This exposed and fixed an older selftest assumption that counted
+discovered block/network drivers but omitted the entropy driver; the expected
+count now uses entropy discovery state, independently of registered components.
+
+A PIO-block/packet-network/bounded-image kernel with `queued-entropy` also
+passes target compilation without the QEMU profile. The legacy QEMU two-boot
+security test and normal Mars Ethernet image build remain valid. Evidence is
+in `boards/milkv-mars/entropy-feature-evidence.json`. The independent QEMU test
+proves composition and startup, not native Mars hardware; the PIO build is a
+kernel compile check, not a linked native entropy firmware. Mars default
+profiles still omit the service pending native composition and qualification.
+Restoring the old module-level QEMU condition makes the independent kernel
+check fail; the mutation is detected. Selecting queued and jitter providers
+together is also rejected by the intended single-provider compile guard.

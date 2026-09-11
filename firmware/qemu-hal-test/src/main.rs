@@ -5,6 +5,9 @@
 use core::arch::global_asm;
 global_asm!(".section .text.boot\n.option norvc\n.global _start\n_start:\nj vibeos_kernel_start");
 extern crate vibeos_kernel;
+#[cfg(feature = "entropy-composition-test")]
+#[path = "../../qemu-virt/src/entropy.rs"]
+mod entropy;
 #[cfg(not(feature = "mars-ethernet-test"))]
 use vibeos_bsp_qemu_virt::Board;
 #[cfg(feature = "mars-ethernet-test")]

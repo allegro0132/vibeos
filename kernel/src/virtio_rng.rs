@@ -1,16 +1,14 @@
-//! Capability-gated modern virtio-rng backend for the QEMU `virt` machine.
+//! Capability-gated entropy policy over a firmware-owned device instance.
 //!
 //! Entropy crosses the component boundary only as a bounded value. Client
-//! pointers never enter a descriptor: the device can write solely into the
-//! fixed SYSTEM-owned DMA slab below. Every invocation is fallible, retains its
+//! pointers never enter a hardware descriptor: firmware owns device buffers. Every invocation is fallible, retains its
 //! non-cloneable capability lease until completion, and either returns exactly
 //! the requested byte count or no bytes at all.
 //!
-//! This whole module is QEMU-only. In particular, the Milk-V Duo build gets no
-//! synthetic provider from this file; SSH must remain disabled there until a
-//! separately validated hardware source exists.
+//! Firmware explicitly selects this service and supplies the entropy provider.
+//! This file never creates a synthetic source or qualifies hardware entropy.
 
-#![cfg(feature = "qemu-virt")]
+#![cfg(feature = "queued-entropy")]
 
 extern crate alloc;
 
@@ -306,9 +304,9 @@ pub struct RandomResources {
 
 /// Discover only the endpoint admitted by the firmware entropy provider.
 ///
-/// There is intentionally no clock/counter/deterministic fallback. Since this
-/// module is removed wholesale outside `qemu-virt`, a Milk-V build cannot
-/// accidentally publish a fake `RandomSource`.
+/// There is intentionally no clock/counter/deterministic fallback. Since the
+/// provider must be supplied by firmware, the kernel cannot manufacture an
+/// available source when hardware admission fails.
 pub fn discover() -> Option<RandomResources> {
     // Safety: firmware resources are mapped before device discovery begins;
     // the provider validates hardware identity and assigned resource ownership.

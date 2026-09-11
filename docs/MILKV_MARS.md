@@ -1122,3 +1122,27 @@ Production Mars firmware does not yet map, initialize or register this source.
 Clock/shared-reset preparation, HAL service integration, physical behavior and
 entropy qualification remain required. The existing test SD image and its
 disabled SSH state are unchanged.
+
+### TRNG resource admission and shared provider parsing
+
+The BSP now admits the final Mars TRNG DTB node and exposes its exact register
+window, IRQ, clock IDs and shared-security reset scope. A matching node is
+required; a serial/network-only fixture cannot silently provide entropy.
+Provider substitution, reversed clock ordering, interrupt-parent rerouting,
+duplicate nodes/properties and any partially overlapping direct `/soc` register
+alias are rejected. Adjacent crypto/security-DMA windows remain valid.
+This description grants no exclusive ownership of the shared reset.
+
+Clock/reset provider and strict node parsing are shared internally between
+Ethernet and TRNG, preserving existing network admission behavior. Both
+`inspect_trng` and `inspect_network` accept the actual pinned 52701-byte Mars
+DTB. Seven new TRNG tests bring BSP host coverage to 30 passing tests. RV64
+acceptance emits `MARS_TRNG_RESOURCES PASS` alongside the TRNG protocol model
+and 395 kernel selftests. Four mutations weakening clock binding, overlap
+rejection, IRQ-parent checking and duplicate-node detection are caught.
+
+Evidence is in `boards/milkv-mars/trng-resource-evidence.json`. The new TRNG
+resource description is not yet used by production firmware: its MMIO mapping,
+platform clock/shared-reset lifecycle, HAL integration and physical entropy
+qualification remain work before SSH can be enabled. No physical port was
+opened or board state changed by this stage.

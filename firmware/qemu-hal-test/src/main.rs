@@ -79,6 +79,13 @@ unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
     }
     #[cfg(feature = "mars-resources-test")]
     {
+        let trng_fixture = include_bytes!("../../../boards/milkv-mars/tests/fixtures/trng.dtb");
+        let trng = vibeos_bsp_milkv_mars::trng_resources::admit(trng_fixture)
+            .expect("Mars TRNG resource admission");
+        assert_eq!(trng.registers.start, 0x1600c000);
+        assert_eq!(trng.clock_ids, [205, 206]);
+        assert_eq!(trng.reset_scope, vibeos_bsp_milkv_mars::trng_resources::ResetScope::SharedSecuritySubsystem);
+        _print(format_args!("MARS_TRNG_RESOURCES PASS irq=30 reset=shared-security entropy=unqualified\n"));
         let network_fixture = include_bytes!("../../../boards/milkv-mars/tests/fixtures/network.dtb");
         let network = vibeos_bsp_milkv_mars::network_resources::admit(network_fixture)
             .expect("Mars GMAC/cache admission");

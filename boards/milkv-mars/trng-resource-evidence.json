@@ -1,0 +1,127 @@
+{
+  "status": "TRNG resource admission implemented; production platform and entropy service integration pending",
+  "host_bsp_tests": 30,
+  "new_trng_tests": 7,
+  "qemu": {
+    "status": "passed",
+    "boot_hart": 3,
+    "harts": 4,
+    "timebase_hz": 10000000,
+    "selftests": 395,
+    "heap_regions": 2,
+    "heap_bytes": 121925632,
+    "kernel_sha256": "7bc1ad2dfe725d1f318dbd8d74be72a305b1d977bf66f68f5215ec8bc453bf67",
+    "physical_acceptance": false,
+    "require_admission": true,
+    "memory": "128M"
+  },
+  "rv64_marker": "MARS_TRNG_RESOURCES PASS irq=30 reset=shared-security entropy=unqualified",
+  "official_dtb": {
+    "bytes": 52701,
+    "sha256": "f0224b4b1b6bfba25cfc81a0403804a4b7851af1a2bb385b01c9a880025c8b3d",
+    "trng_admission": "passed",
+    "network_admission": "passed"
+  },
+  "mutations": [
+    "clock binding disabled: detected",
+    "overlap rejection disabled: detected",
+    "interrupt-parent checking disabled: detected",
+    "duplicate node checking disabled: detected"
+  ],
+  "physical_acceptance": false,
+  "entropy_qualified": false,
+  "blind_spots": [
+    "Admission is a resource description, not a shared-reset exclusivity grant",
+    "No physical MMIO, clocks, IRQ or entropy validation",
+    "No production TRNG mapping or service registration yet"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage38-host.log",
+      "sha256": "ad55295d33f21a326ea9e77207a0c5c9af0f66a65c1705088422f0353c3e7c8e"
+    },
+    {
+      "path": "target/mars-reference/stage38-official-dtb.log",
+      "sha256": "6e3a17434c55651997d60e1df37ccbcac574ff6b4549d942bba61a281b85d008"
+    },
+    {
+      "path": "target/mars-reference/stage38-network-dtb.log",
+      "sha256": "daed942e7dc1ace5d8c1f824144d41bfe9fc1d82f69efa2f07e0632b707667c0"
+    },
+    {
+      "path": "target/mars-reference/stage38-rv64-build.log",
+      "sha256": "d9a52f118e4b6fe278735c83937fc63f4dad5855984bde4a589a1e3335463266"
+    },
+    {
+      "path": "target/mars-reference/stage38-rv64-model/serial.log",
+      "sha256": "c4c272ff8b336f19c8595baf5e96afb06a8d29bab9625b66a1c6fe14598dc215"
+    },
+    {
+      "path": "target/mars-reference/stage38-rv64-model/summary.json",
+      "sha256": "5c3cd448c14dc7139e4c49b800290c9d51ef3f1dc1866564708addcefd30f0be"
+    },
+    {
+      "path": "target/mars-reference/stage38-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage38-dtc.log",
+      "sha256": "bb5116cdf04d1e2209545b6b93e9d295f8da5f4a7010b1f262e5ffcdc6501732"
+    },
+    {
+      "path": "target/mars-reference/stage38-mutation-alias-window.log",
+      "sha256": "50ea48b4b64e519cbf265238662a043353a0a1f0723089f1ef5ab2fa530d2e74"
+    },
+    {
+      "path": "target/mars-reference/stage38-mutation-clock-binding.log",
+      "sha256": "077ba9f36ad283884cc5573ca86beb2e1165f77dfed2dbb40560e910c3e725ae"
+    },
+    {
+      "path": "target/mars-reference/stage38-mutation-duplicate-node.log",
+      "sha256": "8df5ce0fb521db37ca42824581e0183118b69158cd24136531bcb828d302c419"
+    },
+    {
+      "path": "target/mars-reference/stage38-mutation-irq-parent.log",
+      "sha256": "bce072c76ae060bc37c70e282b4a5d114a624dd2fdbcfa492911b92d08e4eee5"
+    },
+    {
+      "path": "target/mars-reference/stage38-mars-build.log",
+      "sha256": "0427e474432ba1e4554aba502ac66629819b0fa8428e7303b4da5fe7f706a033"
+    }
+  ],
+  "mars_network_payload_elf_contract": {
+    "status": "elf-contract-passed",
+    "entry": 1075838976,
+    "heap_start": 1095553024,
+    "heap_end": 5368709120,
+    "elf_sha256": "4f8a654bd44705ce47ccc67cac104f591fb31c4a66b8f6091512b3235545b5fd",
+    "loads": [
+      {
+        "address": 1075838976,
+        "file_bytes": 3035136,
+        "memory_bytes": 3035136,
+        "flags": 5
+      },
+      {
+        "address": 1078874112,
+        "file_bytes": 434176,
+        "memory_bytes": 434176,
+        "flags": 4
+      },
+      {
+        "address": 1079308288,
+        "file_bytes": 51984,
+        "memory_bytes": 15196160,
+        "flags": 6
+      }
+    ],
+    "physical_acceptance": false,
+    "flashable_sd_image": false,
+    "eqos_dma": {
+      "base": 1088110592,
+      "bytes": 102400,
+      "address_bits": 32,
+      "cache_line_bytes": 64
+    }
+  }
+}

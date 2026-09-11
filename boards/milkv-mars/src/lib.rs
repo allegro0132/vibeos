@@ -5,6 +5,8 @@
 pub mod harts;
 pub mod resources;
 pub mod network_resources;
+pub mod trng_resources;
+mod dtb;
 
 use vibeos_hal::{
     fdt::{Error as FdtError, Fdt},
@@ -75,6 +77,8 @@ pub const AON_PINCTRL: AddressRange = AddressRange::new(0x1702_0000, 0x1703_0000
 pub const GMAC0_TX_DRIVE: u8 = 1;
 pub const SYS_PINCTRL: AddressRange = AddressRange::new(0x1304_0000, 0x1305_0000);
 pub const L2_CACHE: AddressRange = AddressRange::new(0x0201_0000, 0x0201_4000);
+pub const TRNG_REGISTERS: AddressRange = AddressRange::new(0x1600_c000, 0x1601_0000);
+pub const TRNG_IRQ: u32 = 30;
 
 pub const fn plic_s_context(physical_hart: usize) -> Option<usize> {
     // S7 has only one M context, followed by M/S pairs for U74 harts 1..4.

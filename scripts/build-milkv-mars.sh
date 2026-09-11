@@ -2,19 +2,20 @@
 # Build a serial/SD or --ethernet DHCP/iperf3 test payload, not an SD card image.
 set -eu
 mars_network=0
-if [ "$#" -eq 1 ] && [ "$1" = --ethernet ]; then
-  mars_network=1
-elif [ "$#" -ne 0 ]; then
-  echo 'usage: build-milkv-mars.sh [--ethernet]' >&2
-  exit 2
-fi
+mars_trng=0
+for mars_arg in "$@"; do
+  case "$mars_arg" in
+    --ethernet) [ "$mars_network" -eq 0 ] || exit 2; mars_network=1 ;;
+    --trng-probe) [ "$mars_trng" -eq 0 ] || exit 2; mars_trng=1 ;;
+    *) echo 'usage: build-milkv-mars.sh [--ethernet] [--trng-probe]' >&2; exit 2 ;;
+  esac
+done
 mars_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$mars_root/firmware/milkv-mars"
-if [ "$mars_network" -eq 1 ]; then
-  cargo build --offline --locked --release --features ethernet
-else
-  cargo build --offline --locked --release
-fi
+mars_features=image
+if [ "$mars_network" -eq 1 ]; then mars_features="$mars_features,ethernet"; fi
+if [ "$mars_trng" -eq 1 ]; then mars_features="$mars_features,trng-probe"; fi
+cargo build --offline --locked --release --features "$mars_features"
 cd "$mars_root"
 mars_objcopy=${LLVM_OBJCOPY:-llvm-objcopy}
 if ! command -v "$mars_objcopy" >/dev/null 2>&1; then
@@ -26,6 +27,7 @@ if [ ! -x "$mars_objcopy" ] && ! command -v "$mars_objcopy" >/dev/null 2>&1; the
 fi
 mars_out=target/milkv-mars/bringup
 if [ "$mars_network" -eq 1 ]; then mars_out=target/milkv-mars/ethernet; fi
+if [ "$mars_trng" -eq 1 ]; then mars_out="$mars_out-trng-probe"; fi
 mkdir -p "$mars_out"
 "$mars_objcopy" --strip-debug target/riscv64imac-unknown-none-elf/release/vibeos-milkv-mars "$mars_out/vibeos.elf"
 "$mars_objcopy" -O binary "$mars_out/vibeos.elf" "$mars_out/vibeos.bin"
@@ -34,11 +36,12 @@ if [ "$mars_network" -eq 1 ]; then
 else
   python3 scripts/mars-check-image.py "$mars_out/vibeos.elf" --output "$mars_out/elf-check.json"
 fi
-python3 - "$mars_out" "$mars_network" <<'PY'
+python3 - "$mars_out" "$mars_network" "$mars_trng" <<'PY'
 import hashlib, json, re, subprocess, sys
 from pathlib import Path
 out = Path(sys.argv[1])
 network = sys.argv[2] == '1'
+trng = sys.argv[3] == '1'
 source = Path('firmware/milkv-mars/src/lib.rs').read_text()
 def value(name):
     match = re.search(r'pub const ' + name + r': u64 = ([0-9_]+);', source)
@@ -46,7 +49,8 @@ def value(name):
         raise SystemExit('Missing literal SD layout constant: ' + name)
     return int(match[1].replace('_', ''))
 manifest = {
-    'profile': 'mars-4gb-sd-dhcp-iperf3-bringup' if network else 'mars-4gb-serial-sd-bringup',
+    'profile': ('mars-4gb-sd-dhcp-iperf3-bringup' if network else 'mars-4gb-serial-sd-bringup') + ('-trng-probe' if trng else ''),
+    'trng_boot_probe': trng, 'entropy_qualified': False,
     'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
     'source_dirty': bool(subprocess.check_output(['git', 'status', '--porcelain'], text=True)),
     'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),

@@ -24,6 +24,7 @@ pub struct Admission {
     pub resources: mars::resources::Resources,
     pub heap: BootMemory<16>,
     pub network: Option<mars::network_resources::Resources>,
+    pub trng: Option<mars::trng_resources::Resources>,
 }
 /// The caller associates `dtb` with the handoff's physical DTB address.
 /// SBI bits are extension probes, not proof of successful four-hart startup.
@@ -51,18 +52,23 @@ pub fn admit(
     let network = Some(mars::network_resources::admit(dtb).map_err(|_| BootError::InvalidDtb)?);
     #[cfg(not(feature = "ethernet"))]
     let network = None;
+    #[cfg(feature = "trng-probe")]
+    let trng = Some(mars::trng_resources::admit(dtb).map_err(|_| BootError::InvalidDtb)?);
+    #[cfg(not(feature = "trng-probe"))]
+    let trng = None;
     Ok(Admission {
         harts,
         resources,
         heap,
         network,
+        trng,
     })
 }
 #[cfg(test)]
 mod tests {
     use super::*;
     use vibeos_hal::AddressRange;
-    const DTB: &[u8] = include_bytes!("../../../boards/milkv-mars/tests/fixtures/network.dtb");
+    const DTB: &[u8] = include_bytes!("../../../boards/milkv-mars/tests/fixtures/trng.dtb");
     #[test]
     fn four_hart_admission_requires_sbi_and_preserves_reserved_dtb_pages() {
         let mut request = BootRequest {
@@ -79,6 +85,14 @@ mod tests {
             time: true,
         };
         let result = admit(DTB, &request, all).unwrap();
+        #[cfg(feature = "trng-probe")]
+        {
+            assert_eq!(result.trng.unwrap().registers, mars::TRNG_REGISTERS);
+            let without_trng = include_bytes!("../../../boards/milkv-mars/tests/fixtures/network.dtb");
+            assert!(matches!(admit(without_trng, &request, all), Err(BootError::InvalidDtb)));
+        }
+        #[cfg(not(feature = "trng-probe"))]
+        assert!(result.trng.is_none());
         assert_eq!(result.harts.ids(), &[4, 1, 2, 3]);
         assert_eq!(result.heap.ranges().last().unwrap().end, mars::RAM.end);
         assert!(!result

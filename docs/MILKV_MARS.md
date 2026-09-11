@@ -1244,3 +1244,29 @@ The returned frequency is a configuration snapshot, not proof of a running
 physical clock or a lifetime lease. Firmware must serialize shared clock access
 and keep the parent stable while security clients are active. This change does
 not yet instantiate the SEC/TRNG owner or publish a qualified entropy service.
+
+### Explicit TRNG boot diagnostic composition
+
+`sh scripts/build-milkv-mars.sh --trng-probe` builds an independent diagnostic
+payload; add `--ethernet` to retain DHCP/iperf3. The diagnostic feature requires
+TRNG DTB admission and runs after device mappings, before secondary harts and
+services. It sets only the TRNG PLIC priority to zero with readback, decodes
+the STG parent, constructs the shared-domain and native TRNG owners, reads two
+conditioned blocks and explicitly stops the domain. A failure reports prepare,
+read and stop results and shuts down; no later service is started on failure.
+An atomic claim prevents repeated invocation. No raw block bytes are logged.
+
+This composition requires a quiescent SEC handoff from boot firmware and stable
+shared roots during the diagnostic. It never registers an entropy capability,
+never enables SSH and never labels the output cryptographically qualified.
+`protocol-observed` is only a hardware control-path diagnostic, even when a
+future physical run obtains that message. Real source qualification is still
+required. Failed stop does not permit owner reuse; the image halts.
+
+Payload directories are `target/milkv-mars/bringup-trng-probe` and
+`target/milkv-mars/ethernet-trng-probe`. Their manifests explicitly mark the
+diagnostic and unqualified entropy. The SD packer does not yet accept this
+profile; neither existing test SD image was replaced. Software evidence is in
+`boards/milkv-mars/trng-composition-evidence.json`. QEMU continues to exercise
+the driver/platform models and normal boot regression, not the physical Mars
+diagnostic entry. No physical SEC handoff or TRNG result has been observed.

@@ -35,5 +35,21 @@ but firmware entropy-service composition and physical qualification remain
 pending. Compiling or passing the ELF checker does not satisfy Mars physical
 acceptance.
 
+For an explicit hardware diagnostic payload, run
+`sh scripts/build-milkv-mars.sh --trng-probe` (optionally with `--ethernet`).
+It writes to a separate `bringup-trng-probe` or `ethernet-trng-probe` payload
+directory. Before secondary harts/services, it admits the TRNG DTB resource,
+suppresses its PLIC priority, reads the parent clock, prepares the shared SEC
+domain, reads two conditioned blocks and confirms stop. Failure logs the stage
+and halts; success says `protocol-observed` and `entropy=unqualified`.
+No random capability or SSH is enabled. This is currently a payload build;
+`build-mars-sd.sh` does not yet accept the diagnostic option.
+
+The probe requires the paired boot firmware to have relinquished all SEC
+clients, including crypto/security DMA, and stable shared clocks through stop.
+Do not chain it from firmware that leaves a live security operation behind.
+No physical TRNG result has been recorded yet. Reading two blocks checks the
+control path only and cannot qualify the source for cryptographic use.
+
 See [bootchain instructions](bootchain/README.md) for layout, build tools,
 hardware revision requirements and evidence limitations.

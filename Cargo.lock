@@ -1792,6 +1792,7 @@ dependencies = [
  "vibeos-kernel",
  "vibeos-platform-jh7110",
  "vibeos-runtime-riscv",
+ "vibeos-starfive-trng",
 ]
 
 [[package]]

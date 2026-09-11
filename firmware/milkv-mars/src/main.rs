@@ -19,6 +19,8 @@ extern crate vibeos_kernel;
 #[path = "../../early_devices.rs"]
 mod early_devices;
 mod storage;
+#[cfg(feature = "trng-probe")]
+mod trng_probe;
 #[cfg(feature = "ethernet")]
 mod network;
 struct BootState {
@@ -66,7 +68,10 @@ const MANAGED_BLOCK_ID: core::num::NonZeroU128 =
 const NETWORK_DRIVER_NAME: &str = "unavailable (serial/SD profile)";
 #[cfg(feature = "ethernet")]
 const NETWORK_DRIVER_NAME: &str = "JH7110 EQoS / YT8531";
-unsafe fn platform_init(_write: fn(&str)) {}
+unsafe fn platform_init(_write: fn(&str)) {
+    #[cfg(feature = "trng-probe")]
+    trng_probe::run(_write);
+}
 unsafe fn platform_report(print: fn(core::fmt::Arguments<'_>)) {
     print(format_args!("MARS_BOOT_ADMISSION PASS boot={} harts={} timebase={} heap_regions={} SBI=HSM,IPI,RFENCE,TIME\n",
         hart_ids()[0],hart_ids().len(),timebase_hz(),admission().heap.ranges().len()));

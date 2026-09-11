@@ -58,6 +58,7 @@ impl Registers for Model {
     }
 }
 pub fn run() {
+    clock_model();
     mmio_lane();
     platform_model();
     let mut trng = Trng::new(Model::new(false, false), 4_000_000, 4).unwrap();
@@ -72,6 +73,21 @@ pub fn run() {
     let mut trng = Trng::new(Model::new(false, true), 4_000_000, 4).unwrap();
     assert_eq!(trng.initialize(), Err(Error::TimedOut));
     assert_eq!(trng.initialize(), Err(Error::NotReady));
+}
+
+fn clock_model() {
+    use vibeos_platform_jh7110::clock::{stg_axiahb_hz, Bank};
+    let rate = stg_axiahb_hz(|bank, offset| match (bank, offset) {
+        (Bank::SysCrg, 0x14) => 1 << 24,
+        (Bank::SysCrg, 0x1c) => 3,
+        (Bank::SysCrg, 0x20) => 2,
+        (Bank::Syscon, 0x2c) => (3 << 15) | (99 << 17),
+        (Bank::Syscon, 0x30) => 0,
+        (Bank::Syscon, 0x34) => 2,
+        _ => panic!("unrelated clock access"),
+    }).unwrap();
+    assert_eq!(rate, 198_000_000);
+    assert!(stg_axiahb_hz(|_, _| 0).is_err());
 }
 
 // RAM-backed access test: executes the production volatile/fence lane on RV64,

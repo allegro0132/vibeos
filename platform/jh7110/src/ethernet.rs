@@ -39,34 +39,14 @@ pub trait Registers {
     fn write(&mut self, bank: Bank, offset: usize, value: u32);
     fn ticks(&mut self) -> u64;
 }
-fn pll(r: &mut impl Registers, zero: bool) -> Result<u64, Error> {
-    let (mode, fb, post, pre, mask) = if zero {
-        (
-            r.read(Bank::Syscon, 0x18),
-            r.read(Bank::Syscon, 0x1c) & 0xfff,
-            r.read(Bank::Syscon, 0x20),
-            r.read(Bank::Syscon, 0x24) & 63,
-            3 << 24,
-        )
-    } else {
-        let mode = r.read(Bank::Syscon, 0x2c);
-        (
-            mode,
-            (mode >> 17) & 0xfff,
-            r.read(Bank::Syscon, 0x30),
-            r.read(Bank::Syscon, 0x34) & 63,
-            3 << 15,
-        )
-    };
-    if mode & mask != mask || post & (1 << 27) != 0 || pre == 0 || fb < 8 {
-        return Err(Error::UnsupportedClock);
-    }
-    let divisor = u64::from(pre) * (1 << ((post >> 28) & 3));
-    let numerator = 24_000_000u64 * u64::from(fb);
-    if numerator % divisor != 0 {
-        return Err(Error::UnsupportedClock);
-    }
-    Ok(numerator / divisor)
+fn root_read(r: &mut impl Registers, bank: crate::clock::Bank, offset: usize) -> u32 {
+    r.read(
+        match bank {
+            crate::clock::Bank::SysCrg => Bank::SysCrg,
+            crate::clock::Bank::Syscon => Bank::Syscon,
+        },
+        offset,
+    )
 }
 fn exact_div(rate: u64, divisor: u32, maximum: u32) -> Result<u64, Error> {
     if divisor == 0 || divisor > maximum || rate % u64::from(divisor) != 0 {
@@ -78,21 +58,14 @@ fn exact_div(rate: u64, divisor: u32, maximum: u32) -> Result<u64, Error> {
 /// clock configurations before making any writes. 24 MHz oscillator is a
 /// board prerequisite. CSR comes from STG_AXI/AHB, never the 125 MHz GTX clock.
 pub fn clock_plan(r: &mut impl Registers) -> Result<Prepared, Error> {
-    let gmac = pll(r, true)?;
+    let gmac = crate::clock::pll(&mut |b, o| root_read(r, b, o), true)
+        .map_err(|_| Error::UnsupportedClock)?;
     let gtx_divider = gmac / 125_000_000;
     if gmac % 125_000_000 != 0 || !(1..=15).contains(&gtx_divider) {
         return Err(Error::UnsupportedClock);
     }
-    let bus = if r.read(Bank::SysCrg, 5 * 4) & MUX != 0 {
-        pll(r, false)?
-    } else {
-        24_000_000
-    };
-    let axi = exact_div(bus, r.read(Bank::SysCrg, 7 * 4) & 0x00ff_ffff, 3)?;
-    let csr = exact_div(axi, r.read(Bank::SysCrg, 8 * 4) & 0x00ff_ffff, 2)?;
-    if !(20_000_000..=300_000_000).contains(&csr) {
-        return Err(Error::UnsupportedClock);
-    }
+    let csr = crate::clock::stg_axiahb_hz(|b, o| root_read(r, b, o))
+        .map_err(|_| Error::UnsupportedClock)?;
     let ptp_parent = exact_div(gmac, r.read(Bank::SysCrg, 99 * 4) & 0x00ff_ffff, 7)?;
     let ptp_divider = ptp_parent.div_ceil(125_000_000);
     if !(1..=31).contains(&ptp_divider) || ptp_parent % ptp_divider != 0 {

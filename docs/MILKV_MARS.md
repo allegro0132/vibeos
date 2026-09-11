@@ -1222,3 +1222,25 @@ The RAM access test does not emulate hardware register side effects or verify
 the Mars MMIO bus. No production TRNG instance or random capability is published
 by this change. Parent-clock lifetime, shared-domain composition and physical
 entropy/SSH qualification remain required; existing SD images are unchanged.
+
+### Shared STG parent-clock decoding
+
+`vibeos-platform-jh7110::clock::stg_axiahb_hz` decodes the read-only
+BUS_ROOT/AXI_CFG0/STG_AXIAHB path independently of GMAC. Ethernet now uses the
+same decoder and the extracted PLL helper, preserving its previous rate and
+preflight rejection rules. Security-domain composition can query the parent
+without accessing GMAC GTX/PTP or requiring PLL0. The supported initial rate
+envelope remains 20–300 MHz; fractional, powered-down, malformed or non-integral
+configurations are rejected. The oscillator path does not read PLL registers.
+
+Three new host tests cover independent register access, both parent paths,
+post-dividers and invalid configurations. All 29 platform tests pass; QEMU
+executes the decoder and reports `JH7110_STG_CLOCK PASS` with 395 kernel selftests.
+Removing the divider limit, ignoring post-division or forcing the oscillator
+parent is detected by mutation tests. Evidence and pinned SDK source details
+are in `boards/milkv-mars/shared-clock-evidence.json`.
+
+The returned frequency is a configuration snapshot, not proof of a running
+physical clock or a lifetime lease. Firmware must serialize shared clock access
+and keep the parent stable while security clients are active. This change does
+not yet instantiate the SEC/TRNG owner or publish a qualified entropy service.

@@ -51,6 +51,7 @@ unsafe fn platform_report(_print: fn(core::fmt::Arguments<'_>)) {
         _print(format_args!("JH7110_SEC_MODEL PASS gates=STG reset=shared bit=3 stopped=acknowledged\n"));
         _print(format_args!("JH7110_TRNG_MODEL PASS reseed=per-block failure=no-output entropy=unqualified\n"));
         _print(format_args!("JH7110_TRNG_MMIO PASS backing=RAM access=volatile32 entropy=unqualified\n"));
+        _print(format_args!("JH7110_STG_CLOCK PASS backing=model rate=198000000 lease=none\n"));
     }
     #[cfg(feature = "eqos-model-test")]
     {

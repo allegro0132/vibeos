@@ -467,6 +467,116 @@ impl<D: PageDevice> SegmentStore<D> {
             .map(|(view, _)| view)
     }
 
+    /// Scheduling hint only: every observed root belongs to this exact new
+    /// transient witness, and there are no observed readers. This neither
+    /// closes registration nor authorizes removal of logical history.
+    pub fn transient_witness_covers_runtime_roots(
+        &self,
+        witness: &PersistentAuthorityTransientObjects,
+    ) -> bool {
+        let Ok(state) = self.require_current_generation() else { return false; };
+        // Durable bindings need not own runtime pins. Keep their established
+        // schedule too; an empty runtime registry alone does not classify them.
+        if state.persistent_authority.as_ref().is_none_or(|authority| {
+            !authority.objects.is_empty() || !authority.external_roots().is_empty()
+        }) || witness.objects.is_empty()
+            || witness.objects.iter().any(|object| object.object.backend_handle().root_key(&self.pins).is_err())
+        {
+            return false;
+        }
+        let Ok(mut roots) = crate::pins::RuntimeRootSnapshot::with_capacity(crate::store::ROOT_PIN_SLOTS) else {
+            return false;
+        };
+        if self.pins.snapshot_roots(&mut roots, 8).is_err()
+            || !self.pins.is_quiescent_through(u64::MAX)
+        {
+            return false;
+        }
+        roots.roots().iter().all(|root| witness.objects.iter().any(|object| {
+            object.object.backend_handle().root_key(&self.pins).is_ok_and(|key| key == root.key)
+        }))
+    }
+
+    /// Compact history only while the shared runtime has no object or reader
+    /// pins. Registration stays closed through durable publication; the
+    /// caller's exact policy must revalidate the proposed record stream.
+    /// Busy runtimes and rewrites without useful savings return None.
+    pub async fn compact_unpinned_persistent_authority<F>(
+        &mut self,
+        writer: &PersistentAuthorityWriter,
+        expected_generation: u64,
+        current_import: PersistentAuthorityImport,
+        revalidate: F,
+    ) -> Result<Option<PersistentAuthorityView>, PersistentAuthorityError<D::Error>>
+    where
+        F: FnOnce(&[[u8; vibeos_durable_format::RECORD_SIZE]])
+            -> Result<PersistentAuthorityImport, PersistentAuthorityError<D::Error>>,
+    {
+        let _lease = self.acquire_maintenance(
+            &writer.maintenance, MaintenanceOperation::ExplicitMaintenance,
+        ).ok_or(PersistentAuthorityError::Unauthorized)?;
+        let state = self.require_current_generation()?.clone();
+        let current = state.persistent_authority.as_ref()
+            .ok_or(PersistentAuthorityError::NotInitialized)?;
+        if current.checkpoint_generation() != expected_generation {
+            return Err(PersistentAuthorityError::GenerationMismatch);
+        }
+        if current_import.record_stream() != current.record_stream()
+            || current_import.root_policy_sha256() != current.root_policy_sha256()
+            || current_import.principals != current.principals()
+            || current_import.admitted_object_count() != current.objects.len()
+            || current.objects.iter().any(|binding| !current_import.is_admitted(binding.stable_object_id))
+        {
+            return Err(PersistentAuthorityError::PolicyMismatch);
+        }
+        if !state.allocation.retired_segments().is_empty() {
+            return Err(PersistentAuthorityError::Store(StoreError::GcResumeRequired));
+        }
+        let guard = match self.pins.try_close_empty_root_admission() {
+            Ok(Some(guard)) => guard,
+            Ok(None) | Err(_) => return Ok(None),
+        };
+        let compacted = current_import.compact_boot_boundary_records()
+            .map_err(PersistentAuthorityError::Snapshot)?;
+        if compacted.len().saturating_add(compacted.len() / 4).saturating_add(1)
+            >= current.record_stream().len() / vibeos_durable_format::RECORD_SIZE
+        {
+            return Ok(None);
+        }
+        let replacement = revalidate(&compacted)?;
+        if replacement.root_policy_sha256() != current.root_policy_sha256()
+            || replacement.principals != current.principals()
+            || replacement.admitted_object_count() != current.objects.len()
+            || current.objects.iter().any(|binding| !replacement.is_admitted(binding.stable_object_id))
+            || replacement.record_stream().len() != compacted.len() * vibeos_durable_format::RECORD_SIZE
+            || !replacement.record_stream().chunks_exact(vibeos_durable_format::RECORD_SIZE)
+                .zip(&compacted).all(|(observed, expected)| observed == expected)
+        {
+            return Err(PersistentAuthorityError::PolicyMismatch);
+        }
+        let generation = state.generation.checked_add(1)
+            .ok_or(PersistentAuthorityError::Gc(GcError::InvalidGeneration))?;
+        let snapshot = PersistentAuthoritySnapshot::from_validated_import_parts(
+            generation, replacement.root_policy_sha256, replacement.record_stream,
+            current.objects.clone(), current.principals().to_vec(), current.external_roots().to_vec(),
+        ).map_err(PersistentAuthorityError::Snapshot)?;
+        self.preflight_persistent_quota(snapshot.principals(), &snapshot.objects)?;
+        let bytes = encode_persistent_authority_snapshot(&snapshot)
+            .map_err(PersistentAuthorityError::Snapshot)?;
+        // Revalidation is caller code: reject any intervening shared-runtime
+        // publication before this transaction performs its first media write.
+        self.require_current_generation()?;
+        self.logical_roots.clear();
+        self.committed_ids_cache = None;
+        self.promotion_claims_cache = None;
+        self.publish_persistent_snapshot(state, generation, bytes, &snapshot).await?;
+        // The replacement is now durable. Reopening before view construction
+        // permits its policy-bound handles to acquire fresh runtime pins.
+        drop(guard);
+        self.build_persistent_view(self.require_current_generation()?, snapshot, false)
+            .await.map(Some)
+    }
+
     /// Append a strict successor of the current logical M4 record stream.
     /// Newly committed objects which are not yet admitted by a live grant or
     /// sealed-singleton policy remain boot-local: only this return value can
@@ -1886,6 +1996,8 @@ impl<D: PageDevice> SegmentStore<D> {
             catalog_root,
             authority_root,
             allocation_root,
+            (state.replay_count, state.replay_tail),
+            None,
         )
         .await?;
         // All transaction payloads are verified after the checkpoint write is
@@ -1948,9 +2060,11 @@ impl<D: PageDevice> SegmentStore<D> {
             next_segment_generation,
             next_object_id: state.next_object_id.max(u128::from(generation)),
             cleaner_reserve_segments: state.cleaner_reserve_segments,
-            replay_count: 0,
+            // The authority rewrite does not emit a replacement CAS catalog.
+            // Preserve its delta chain in both the checkpoint and mounted view.
+            replay_count: state.replay_count,
             catalog_root,
-            replay_tail: PhysicalPointer::Null,
+            replay_tail: state.replay_tail,
             authority_root,
             allocation_root,
             allocation,

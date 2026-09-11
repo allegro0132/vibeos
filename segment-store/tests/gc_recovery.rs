@@ -1017,13 +1017,29 @@ fn every_legacy_bootstrap_mutation_boundary_selects_old_or_complete_gc_state() {
 
 #[test]
 fn full_gc_keeps_shared_blob_until_last_authority_is_gone_and_cold_mounts() {
+    for policy in [
+        vibeos_segment_store::CatalogDeltaPolicy::Auto,
+        vibeos_segment_store::CatalogDeltaPolicy::Always,
+    ] {
+        full_gc_keeps_shared_blob_with_policy(policy);
+    }
+}
+
+fn full_gc_keeps_shared_blob_with_policy(policy: vibeos_segment_store::CatalogDeltaPolicy) {
     let device = MemoryDevice::blank(16);
     let mut store = format(device.clone());
+    store.set_catalog_delta_policy(policy);
     let bytes = vec![0xa5; PAGE_SIZE];
     let first = put(&mut store, &bytes);
     let duplicate = put(&mut store, &bytes);
     let runtime = store.runtime_context();
+    let before = store.info().unwrap();
+    if policy == vibeos_segment_store::CatalogDeltaPolicy::Always {
+        assert!(before.replay_count > 0);
+    }
     block_on(store.synchronize_gc_roots(&[&first])).unwrap();
+    assert_eq!(store.info().unwrap().replay_count, before.replay_count);
+    assert_eq!(store.info().unwrap().object_count, before.object_count);
     drop(duplicate);
 
     let telemetry = block_on(store.collect_garbage()).unwrap();
@@ -1242,6 +1258,49 @@ fn acknowledged_copied_payload_or_padding_corruption_fails_before_checkpoint_sea
         let recovered = block_on(cold.mount()).unwrap();
         assert_eq!(recovered.generation, old.generation, "{case}");
         assert_eq!(recovered.object_count, 1, "{case}");
+    }
+}
+
+#[test]
+fn corrupt_reuse_allocation_never_publishes_and_cold_resume_remains_safe() {
+    const SEGMENTS: u64 = 16;
+    let seed_device = MemoryDevice::blank(SEGMENTS);
+    let mut seed = format(seed_device.clone());
+    let object = put(&mut seed, &vec![0x73; PAGE_SIZE]);
+    block_on(seed.synchronize_gc_roots(&[&object])).unwrap();
+    let epoch = seed.info().unwrap().generation;
+    let mut image = seed_device.durable_image();
+
+    // Exercise both the normal G -> G+2 path and cold G+1 reuse resumption.
+    for resumed in [false, true] {
+        let probe_device = FaultDevice::from_image(SEGMENTS, image.clone());
+        let mut probe = mount_fault(probe_device.clone(), StoreRuntimeContext::new());
+        probe_device.reset_mutation_count();
+        block_on(probe.collect_garbage()).unwrap();
+        let checkpoint = selected_checkpoint(&probe_device.durable_image());
+        assert_eq!(checkpoint.binding.generation, epoch + 2);
+        let PhysicalPointer::Value(pointer) = checkpoint.allocation_root else {
+            panic!("reuse must publish an allocation extent");
+        };
+        let payload_page = ANCHOR_PAGES + pointer.segment_no * SEGMENT_PAGES
+            + u64::from(pointer.payload_relative_page);
+        let mutation = probe_device.mutation_pages().iter()
+            .position(|page| *page == Some(payload_page)).unwrap();
+        let device = FaultDevice::from_image(SEGMENTS, image);
+        let mut store = mount_fault(device.clone(), StoreRuntimeContext::new());
+        device.arm(mutation, FaultAction::AcknowledgeCorrupt { byte_index: 0 });
+        assert!(block_on(store.collect_garbage()).is_err(), "resumed={resumed}");
+        assert_eq!(store.info(), Err(StoreError::RecoveryRequired));
+        assert_eq!(selected_checkpoint(&device.durable_image()).binding.generation, epoch + 1);
+        device.power_cycle();
+        image = device.durable_image();
+        let mut cold = mount_fault(device.clone(), StoreRuntimeContext::new());
+        assert_eq!(cold.info().unwrap().object_count, 1);
+        let completed = block_on(cold.collect_garbage()).unwrap();
+        assert_eq!(completed.reuse_generation, epoch + 2);
+        device.power_cycle();
+        let final_cold = mount_fault(device, StoreRuntimeContext::new());
+        assert_eq!(final_cold.info().unwrap().object_count, 1);
     }
 }
 

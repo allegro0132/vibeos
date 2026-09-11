@@ -1721,7 +1721,188 @@ fn delayed_grants_keep_duplicate_content_stable_objects_independent() {
 }
 
 #[test]
+fn quiescent_compaction_is_atomic_at_every_mutation_and_cancel_point() {
+    let seed_device = AuthorityFaultDevice::blank();
+    let (runtime, _quota, provisioner) =
+        StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut seed = SegmentStore::new_with_runtime_context(seed_device.clone(), limits(), runtime);
+    block_on(seed.format(authority_fault_options())).unwrap();
+    let maintenance = seed.provision_maintenance_root(&provisioner).unwrap();
+    let initial = block_on(seed.import_persistent_authority(
+        &maintenance, import(&format_records(), &[]))).unwrap();
+    let writer = seed.derive_persistent_authority_writer(&maintenance).unwrap();
+    let records = append_object_records(&format_records(), &vec![0x81; 4096]);
+    let appended = block_on(seed.append_persistent_authority(&writer,
+        initial.checkpoint_generation(), import(&records, &[]), &initial.principals()[0])).unwrap();
+    let old_generation = appended.view().checkpoint_generation();
+    drop(appended);
+    drop(seed);
+    seed_device.power_cycle();
+    let image = seed_device.durable_image();
+    let prepare = |device: AuthorityFaultDevice| {
+        let (runtime, _quota, provisioner) =
+            StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+        let mut store = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+        block_on(store.mount()).unwrap();
+        let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+        let writer = store.derive_persistent_authority_writer(&maintenance).unwrap();
+        (store, writer)
+    };
+    let probe_device = AuthorityFaultDevice::from_durable(image.clone());
+    let (mut probe, writer) = prepare(probe_device.clone());
+    probe_device.reset_mutation_count();
+    let compact = block_on(probe.compact_unpinned_persistent_authority(
+        &writer, old_generation, import(&records, &[]), |r| Ok(import(r, &[]))))
+        .unwrap().unwrap();
+    let expected = compact.record_stream().to_vec();
+    let mutations = probe_device.mutation_count();
+    assert!(mutations > 0);
+    let original = import(&records, &[]).record_stream().to_vec();
+    let actions = [
+        AuthorityFaultAction::FailNotSubmitted,
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::None),
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::Visible),
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::Durable),
+        AuthorityFaultAction::Pending(AuthorityEffect::None),
+        AuthorityFaultAction::Pending(AuthorityEffect::Visible),
+        AuthorityFaultAction::Pending(AuthorityEffect::Durable),
+    ];
+    let mut old_count = 0;
+    let mut new_count = 0;
+    for mutation in 0..mutations {
+        for action in actions {
+            let case = alloc::format!("mutation {mutation}/{mutations}: {action:?}");
+            let device = AuthorityFaultDevice::from_durable(image.clone());
+            let (mut store, writer) = prepare(device.clone());
+            device.arm(mutation, action);
+            let mut operation = Box::pin(store.compact_unpinned_persistent_authority(
+                &writer, old_generation, import(&records, &[]), |r| Ok(import(r, &[]))));
+            if matches!(action, AuthorityFaultAction::Pending(_)) {
+                assert!(matches!(poll_once(operation.as_mut()), Poll::Pending), "{case}");
+            } else {
+                assert!(block_on(operation.as_mut()).is_err(), "{case}");
+            }
+            drop(operation);
+            let reopened = store.pins.try_close_empty_root_admission().unwrap()
+                .unwrap_or_else(|| panic!("{case}: admission remained closed"));
+            drop(reopened);
+            drop(store);
+            device.power_cycle();
+            let (cold, _) = prepare(device);
+            let view = block_on(cold.recover_persistent_authority(root_policy_commitment(POLICY)))
+                .unwrap_or_else(|error| panic!("{case}: recovery: {error:?}"));
+            if view.checkpoint_generation() == old_generation {
+                assert_eq!(view.record_stream(), original, "{case}");
+                old_count += 1;
+            } else {
+                assert_eq!(view.checkpoint_generation(), old_generation + 1, "{case}");
+                assert_eq!(view.record_stream(), expected, "{case}");
+                new_count += 1;
+            }
+        }
+    }
+    assert!(old_count > 0 && new_count > 0);
+}
+
+#[test]
+fn quiescent_compaction_preserves_live_witnesses_and_reclaims_only_after_drop() {
+    for external in [false, true] {
+        let device = MemoryDevice::blank();
+        let (runtime, _quota, provisioner) =
+            StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+        let mut store = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+        block_on(store.format(FormatOptions {
+            store_uuid: StoreUuid::new(*b"M7.7-AUTH-TEST!!").unwrap(),
+            cleaner_reserve_segments: 4, limits: limits(),
+        })).unwrap();
+        let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+        let initial = block_on(store.import_persistent_authority(
+            &maintenance, import(&format_records(), &[]))).unwrap();
+        let principal = initial.principals()[0].clone();
+        let writer = store.derive_persistent_authority_writer(&maintenance).unwrap();
+        let payload = vec![0x61; 4096];
+        let records = if external {
+            let root = vibeos_blob_format::BlobDescriptor::from_content(OBJECT_KIND_RAW, &payload)
+                .unwrap().root;
+            let first = append_external_object_records(&format_records(), payload.len() as u64, root).0;
+            append_external_object_records(&first, payload.len() as u64, root).0
+        } else { append_object_records(&format_records(), &payload) };
+        let recovered = find_object(&records);
+        let mut update = import(&records, &[]);
+        if external {
+            let preflight = vibeos_durable_format::preflight_recovery(&records, store_id()).unwrap();
+            for object in preflight.committed_objects() {
+                update.attach_external_payload(object.object_id.get(), payload.clone()).unwrap();
+            }
+        }
+        let appended = block_on(store.append_persistent_authority(
+            &writer, initial.checkpoint_generation(), update, &principal)).unwrap();
+        let (view, witness) = appended.into_parts();
+        let generation = view.checkpoint_generation();
+        assert!(store.transient_witness_covers_runtime_roots(&witness));
+        let owner = store.pins.allocate_owner().unwrap();
+        let unrelated = store.pins.pin_root(
+            crate::pins::RootKey::new(u128::MAX, 1, OBJECT_KIND_RAW).unwrap(),
+            crate::pins::RuntimeRootClass::InvocationLease, owner, crate::pins::PinAdmission::Ordinary,
+        ).unwrap();
+        assert!(!store.transient_witness_covers_runtime_roots(&witness));
+        drop(unrelated);
+        let reader = store.pins.pin_read_generation(generation, owner, crate::pins::PinAdmission::Ordinary).unwrap();
+        assert!(!store.transient_witness_covers_runtime_roots(&witness));
+        drop(reader);
+        assert!(store.transient_witness_covers_runtime_roots(&witness));
+        let (foreign_runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+        let mut foreign = SegmentStore::new_with_runtime_context(store.device.clone(), limits(), foreign_runtime);
+        block_on(foreign.mount()).unwrap();
+        assert!(!foreign.transient_witness_covers_runtime_roots(&witness));
+        drop(foreign);
+
+        assert!(matches!(block_on(store.compact_unpinned_persistent_authority(
+            &writer, generation - 1, import(&records, &[]), |_| panic!("stale"))),
+            Err(PersistentAuthorityError::GenerationMismatch)));
+        assert!(block_on(store.compact_unpinned_persistent_authority(
+            &writer, generation, import(&records, &[]), |_| panic!("live witness")))
+            .unwrap().is_none());
+        assert_eq!(block_on(store.read_transient_object(&witness, &recovered)).unwrap(), payload);
+        drop(witness);
+        drop(view);
+        for wrong_stream in [false, true] {
+            let result = block_on(store.compact_unpinned_persistent_authority(
+                &writer, generation, import(&records, &[]), |_| {
+                    if wrong_stream { Ok(import(&records, &[])) }
+                    else { Err(PersistentAuthorityError::PolicyMismatch) }
+                }));
+            assert!(matches!(result, Err(PersistentAuthorityError::PolicyMismatch)));
+            assert_eq!(store.info().unwrap().generation, generation);
+            let reopened = store.pins.try_close_empty_root_admission().unwrap().unwrap();
+            drop(reopened);
+        }
+        let compacted = block_on(store.compact_unpinned_persistent_authority(
+            &writer, generation, import(&records, &[]), |compact| Ok(import(compact, &[]))))
+            .unwrap().unwrap();
+        let compact_records: Vec<[u8; vibeos_durable_format::RECORD_SIZE]> = compacted.record_stream()
+            .chunks_exact(vibeos_durable_format::RECORD_SIZE).map(|r| r.try_into().unwrap()).collect();
+        let before = vibeos_durable_format::preflight_recovery(&records, store_id()).unwrap();
+        let after = vibeos_durable_format::preflight_recovery(&compact_records, store_id()).unwrap();
+        assert!(after.committed_objects().is_empty());
+        assert_eq!(after.id_high_water(), before.id_high_water());
+        assert_eq!(compacted.checkpoint_generation(), generation + 1);
+        drop(compacted);
+        block_on(store.mount()).unwrap();
+        let cold = block_on(store.recover_persistent_authority(root_policy_commitment(POLICY))).unwrap();
+        assert_eq!(cold.record_stream().len(), compact_records.len() * vibeos_durable_format::RECORD_SIZE);
+        assert_eq!(cold.checkpoint_generation(), generation + 1);
+    }
+}
+
+#[test]
 fn compacted_replace_preserves_stale_handles_and_witnesses() {
+    for external in [false, true] {
+        compacted_replace_preserves_handles(external);
+    }
+}
+
+fn compacted_replace_preserves_handles(external: bool) {
     let device = MemoryDevice::blank();
     let (runtime, _quota, maintenance_provisioner) =
         StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
@@ -1745,7 +1926,12 @@ fn compacted_replace_preserves_stale_handles_and_witnesses() {
 
     // Granted object A, then ungranted object B.
     let bytes_a = b"granted object a";
-    let bytes_b = b"boot-local object b";
+    let external_bytes = vec![0x71; 4096];
+    let bytes_b: &[u8] = if external {
+        &external_bytes
+    } else {
+        b"boot-local object b"
+    };
     let object_records = append_object_records(&format_records(), bytes_a);
     let object_a = find_object(&object_records);
     let appended = block_on(store.append_persistent_authority(
@@ -1775,7 +1961,14 @@ fn compacted_replace_preserves_stale_handles_and_witnesses() {
         .clone();
     let after_grant = rooted.view().checkpoint_generation();
     drop(rooted);
-    let (both_records, object_b_id) = append_next_object_records(&grant_records, bytes_b);
+    store.set_catalog_delta_policy(crate::CatalogDeltaPolicy::Always);
+    let (both_records, object_b_id) = if external {
+        let descriptor = vibeos_blob_format::BlobDescriptor::from_content(OBJECT_KIND_RAW, bytes_b)
+            .unwrap();
+        append_external_object_records(&grant_records, bytes_b.len() as u64, descriptor.root)
+    } else {
+        append_next_object_records(&grant_records, bytes_b)
+    };
     let object_b = vibeos_durable_format::preflight_recovery(&both_records, store_id())
         .unwrap()
         .committed_objects()
@@ -1783,23 +1976,33 @@ fn compacted_replace_preserves_stale_handles_and_witnesses() {
         .find(|object| object.object_id == object_b_id)
         .unwrap()
         .clone();
+    let mut update_b = import(&both_records, &[RootPolicy { grant: grant.clone() }]);
+    if external {
+        update_b
+            .attach_external_payload(object_b_id.get(), bytes_b.to_vec())
+            .unwrap();
+    }
     let appended_b = block_on(store.append_persistent_authority(
         &writer,
         after_grant,
-        import(&both_records, &[RootPolicy {
-            grant: grant.clone(),
-        }]),
+        update_b,
         &principal,
     ))
     .unwrap();
     let (view_b, witness_b) = appended_b.into_parts();
+    assert!(!store.transient_witness_covers_runtime_roots(&witness_b));
     let after_b = view_b.checkpoint_generation();
+    let replay_before = store.info().unwrap().replay_count;
+    assert!(replay_before > 0, "fixture must have catalog deltas to preserve");
     drop(view_b);
 
     // Compact (runtime policy: keep the ungranted object) and replace.
     let preflight =
         vibeos_durable_format::preflight_recovery(&both_records, store_id()).unwrap();
     let compacted = preflight.compact(false).unwrap();
+    let compacted_preflight = vibeos_durable_format::preflight_recovery(&compacted, store_id())
+        .unwrap();
+    assert_eq!(compacted_preflight.id_high_water(), preflight.id_high_water());
     assert!(
         compacted.len() < both_records.len(),
         "redundant high-water records must fold away ({} -> {})",
@@ -1813,6 +2016,11 @@ fn compacted_replace_preserves_stale_handles_and_witnesses() {
     ))
     .unwrap();
 
+    assert_eq!(store.info().unwrap().replay_count, replay_before);
+    // Force the checkpoint's catalog replay to be read from media before
+    // resolving old live handles; the in-memory CAS can mask a missing tail.
+    block_on(store.mount()).unwrap();
+    assert_eq!(store.info().unwrap().replay_count, replay_before);
     // Handles minted before the replacement must still read.
     assert_eq!(block_on(read_handle(&store, &stale_persistent)), bytes_a);
     assert_eq!(

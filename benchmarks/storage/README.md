@@ -1571,3 +1571,362 @@ ELF/hash, baseline reference, JSONL and raw serial log, policy tests and summary
 The production three-boot QEMU file-tree gate passes, including GC, cold
 recovery and powered-off verification. Duo `file-tree` compilation passes.
 These logs and the exact policy source are saved with the benchmark evidence.
+
+### A 16-segment QEMU profile and rejected small-object floor tuning (2026-09-11)
+
+Build from `firmware/qemu-virt` with
+`--features storage-bench-128m,storage-bench-small-store` to cap the benchmark's
+provisioned v2 region at 16 four-MiB segments plus its anchor area. The initial
+eight-segment format grows only within that cap. The runner still uses its
+1 GiB data image and the separate raw-block window stays in the same location.
+This models the small region's capacity, not the SD controller, card FTL or
+physical latency. Default benchmark builds keep the larger provisioned region.
+
+Benchmark kernels now emit `VIBE_STORAGE_BENCH_GEOMETRY` before the shell-ready
+banner. The runner validates it and records `storage_v2_provisioned_segments`
+in the environment. Object/file summaries reject mixed known sizes, and also
+reject mixing known with unknown geometry for one storage-v2 coordinate.
+Older ELFs without the marker remain runnable; their geometry is unknown.
+Raw-block comparisons are exempt because their separate window did not move.
+Twelve runner tests pass, including parsing, malformed/duplicate records and
+mixed-geometry rejection.
+
+Small-store workload: `v2-dedup-gc`, 4 KiB, `unique`, seed 32, one 128 MiB VM,
+zero warmups, 4/2 MiB/s and 400/200 IOPS. Every sample puts, verifies and revokes
+eight objects. Seeds overlap between adjacent samples, so `unique` describes
+the eight contents within a sample, not globally unique contents across the
+run. Both the 8-sample (64-operation) and 32-sample (256-operation) baselines
+pass with the guest reporting exactly 16 provisioned segments.
+
+An experimental runtime change sent small object appends through the existing
+scaled free-capacity helper, reducing their foreground floor from nine to six
+on this profile. It also passed both lengths, but the longer run did not show
+a sustained barrier reduction:
+
+| 256-operation run | Original policy | Rejected scaled-floor trial |
+| --- | ---: | ---: |
+| GC rounds | 85 | 84 |
+| Write requests | 3,773 | 3,758 |
+| Written bytes | 91,660,288 | 91,353,088 |
+| Flushes | 1,542 | 1,533 |
+| Flushes after the first 64 operations | 1,152 | 1,152 |
+
+The short-run improvement was mainly one deferred GC round. The trial is
+removed; no production free-floor, quota or cleaner-reserve policy changes
+remain from this experiment. The accepted change is the capacity profile and
+geometry-aware measurement support. This gives a small-store baseline for
+addressing growing metadata write amplification rather than treating a lower
+foreground target as a demonstrated sustained optimization.
+
+Evidence: `target/storage-small-store-20260911/` includes baseline and rejected
+trial ELFs, short/long JSONL and serial logs, a summary, the rejected patch and
+runner test output. `candidate.elf` in that directory is the rejected floor
+trial; `baseline.elf` is the accepted small-profile behavior.
+
+A rebuilt default `storage-bench-128m` ELF reports 223 provisioned segments
+and passes a put/readback smoke test, confirming that the small-store cap is
+feature-scoped. No physical device was accessed or modified in this step.
+
+### Small-region authority compaction and catalog replay preservation (2026-09-11)
+
+Runtime authority compaction now evaluates streams from 128 records on regions
+of at most 16 segments. Larger regions and boot compaction retain the 2,048
+record threshold. The existing quarter-growth evaluation watermark and minimum
+compaction savings remain in force. Runtime compaction preserves ungranted
+objects, stable object IDs and ID high-water; it only folds redundant history.
+
+The experiment also exposed a correctness bug: authority replacement reused the
+CAS catalog root but reset the checkpoint's catalog replay count/tail. The
+in-memory catalog masked the lost delta mappings until remount/growth, after
+which GC could fail with `RootDoesNotResolve`. Authority replacement and GC-root
+policy publication now preserve the replay chain when retaining the catalog.
+GC relocation still resets it when publishing a complete replacement catalog.
+Regression coverage forces catalog deltas, replaces authority, remounts, and
+reads both old persistent handles and transient witnesses for inline/external
+objects. Root-policy synchronization and shared-blob GC also exercise forced
+deltas. Checkpoint format and durability barriers are unchanged.
+
+Using the 16-segment profile and the same 32-sample/256-operation workload above:
+
+| Counter | Baseline | Early compaction with replay fix |
+| --- | ---: | ---: |
+| Write requests | 3,773 | 3,689 |
+| Written bytes | 91,660,288 | 75,288,576 |
+| Flushes | 1,542 | 1,576 |
+| Read bytes | 32,768 | 32,768 |
+
+All operations pass. This trades 2.2% more flushes for 17.9% fewer written bytes;
+physical SD latency and wear effects remain unmeasured. Content uniqueness is
+per sample, as documented above. The same early threshold on the 223-segment
+profile passed 128 retained-object puts/readbacks after the replay fix, but
+increased written bytes from 38,957,056 to 43,368,448 and flushes from 477 to 521.
+That large-region policy is rejected; the lower threshold is capacity-scoped.
+
+Evidence is in `target/storage-runtime-compaction-20260911/`. `default.elf` is
+the failed pre-fix trial; `default-fixed.elf` fixes replay but still uses the
+rejected early threshold on large regions. `small-fixed.elf` measures the
+corrected early threshold on 16 segments, before adding the capacity guard.
+Use the `*-final` artifacts for the final capacity-scoped implementation.
+
+Final qualification: the capacity-scoped `small-final` run passes all 256
+operations and exactly reproduces the small-region I/O totals above. The
+223-segment `default-final` run passes all 128 retained-object operations and
+exactly matches baseline counters (3,626 reads / 39,096,320 read bytes, 1,400
+writes / 38,957,056 written bytes, 477 flushes). The 224 selected segment-store
+unit/recovery/steady-state tests pass (one existing test ignored). The production
+three-boot file-tree gate passes GC, cold recovery and powered-off verification;
+Duo file-tree compilation passes. No physical SD device was accessed.
+
+### Reuse the GC checkpoint-slot clear proof (2026-09-11)
+
+The G+2 reuse checkpoint writes the same anchor slot whose old G seal GC
+already durably cleared after reader quiescence. Previously publication
+cleared that slot again, adding one page write and one flush per collection.
+The normal and cold-resume reuse paths now pass the existing exact-zero proof
+to publication. Publication rereads the entire seal and requires it to remain
+zero before writing the checkpoint body; all other callers still clear their
+slots normally. Allocation-segment sealing/flush and payload verification stay
+before checkpoint publication. The G+1 relocation checkpoint, reader barrier,
+old-seal durable clear, and G+2 body/seal durability barriers remain intact.
+
+A new fault regression corrupts the reuse allocation while acknowledging the
+write, in both normal collection and cold G+1 resumption. Both fail before
+publishing G+2, preserve a mountable G+1, and subsequently resume to G+2.
+The existing every-mutation failure/cancellation matrix also passes.
+
+The 16-segment QEMU workload from the preceding section passes all 256
+operations. Against `storage-runtime-compaction-20260911/small-final.jsonl`:
+
+| Counter | Before | After |
+| --- | ---: | ---: |
+| Write requests | 3,689 | 3,602 |
+| Written bytes | 75,288,576 | 74,932,224 |
+| Flushes | 1,576 | 1,489 |
+| Read requests / bytes | 8 / 32,768 | 8 / 32,768 |
+
+There are 87 GC rounds: each saves exactly one write and one flush. The 5.5%
+flush reduction is a QEMU I/O-count result, not a physical SD latency claim.
+Evidence, candidate ELFs and transcripts are in
+`target/storage-gc-barrier-20260911/`. The earlier `tests.log` exercised a
+superseded experiment that moved verification after publication; that ordering
+was not retained. `final-tests.log` and `gc-regression-tests.log` cover the
+accepted implementation with verification before publication.
+
+The default 223-segment profile also passes all 128 retained-object
+puts/readbacks: eight GC rounds reduce flushes from 477 to 469 and writes from
+1,400 / 38,957,056 bytes to 1,392 / 38,924,288 bytes. Reads remain
+3,626 / 39,096,320 bytes. Both comparisons use the same seed and throttles
+as their preceding baselines. The selected 225 host tests pass (one existing
+test ignored), including all 23 GC recovery tests. The production three-boot
+file-tree gate passes GC, cold recovery and powered-off verification; Duo
+file-tree compilation passes. No physical device was accessed.
+
+### Long-running small-region churn exposes authority-history amplification (2026-09-11)
+
+The accepted `storage-gc-barrier-20260911/small.elf` also passes 128 samples,
+1,024 put/readback/revoke operations, with the same 16-segment profile, seed 32,
+128 MiB RAM and 4/2 MiB/s, 400/200 IOPS throttles. The first 32 samples exactly
+reproduce the preceding short-run counters. Full transcripts and window totals
+are `small-long.{jsonl,serial.log}` and `small-long-summary.json` in that evidence
+directory. This workload's content uniqueness remains per sample, not global.
+
+| Operation window | Written bytes | Flushes | Final authority records |
+| --- | ---: | ---: | ---: |
+| 1–256 | 74,932,224 | 1,489 | 296 |
+| 257–512 | 126,926,848 | 1,472 | 546 |
+| 513–768 | 178,130,944 | 1,460 | 829 |
+| 769–1,024 | 235,655,168 | 1,448 | 1,341 |
+
+All windows pass, but the final window writes 3.15 times the first window's
+bytes. Fewer checkpoint barriers do not bound the metadata growth. Runtime
+`compact(false)` retains ungranted logical objects even after callers revoke
+their capabilities; GC can reclaim their CAS payloads while the authority
+snapshot keeps accumulating and being rewritten. This is evidence of a
+remaining sustained-write bottleneck, not a steady-state throughput claim.
+
+The next optimization needs a store-owned proof of runtime liveness before
+removing ungranted history. A conservative path can compact at a pre-append
+boundary only when the runtime root registry proves there are no live object
+pins, retaining all policy-required objects and ID/slot high-water history.
+The proof and replacement must share the exclusive mutation epoch; a kernel
+scan of object kinds/IDs or an earlier GC count is insufficient. The current
+post-append hook already owns the newly minted transient witness, so it cannot
+simply enable boot-boundary dropping. Any implementation must preserve active
+persistent and transient handles, reject stale proofs, and pass remount,
+fault-injection and long-churn comparison before replacing the current policy.
+No runtime dropping behavior is enabled by this investigation.
+
+Runtime-quiescence groundwork: `PinRegistry::roots_are_empty` now provides an
+allocation-free, bounded seqlock observation. A live or claimed root reports
+nonempty; an in-progress writer or concurrent handoff reports `SnapshotBusy`.
+Nine pin tests pass, including explicit handoff assertions for this observation
+(`target/storage-quiescent-compaction-20260911/pin-tests.log`). This is not a
+persistable proof: a subsequent registration can invalidate the observation.
+`recover_persistent_authority_recognized(&self, ...)` can construct handles, so
+an exclusive mutation borrow alone is not a complete registration exclusion
+across shared-runtime store instances. The compaction transaction needs that
+exclusion without holding a spin lock across I/O, and must permit creation of
+the replacement view only after publication. No caller uses the observation to
+drop history yet; no new performance improvement is claimed by this groundwork.
+
+The registry now also provides an internal `EmptyRootAdmissionGuard`: under
+the short root-writer lock it checks that every root slot is free and closes
+root registration. The owning guard retains no spin lock across suspension;
+ordinary and completion-critical registrations return `SnapshotBusy` until
+drop reopens admission. Nested closure is rejected. Tests cover live roots,
+32 concurrent mint/closure races (exactly one succeeds), cross-thread rejection,
+and cancellation of a pending future. All 12 pin tests pass; the preceding full
+library run passes 195 tests with one existing ignored test (before adding the
+final race test). Duo file-tree compilation passes. Evidence is in
+`storage-quiescent-compaction-20260911/admission-*.log` under `target/`.
+
+This guard closes root registration only; it is not a reader-epoch proof or a
+license to rewrite authority. It is not yet wired into runtime compaction.
+Integration must check reader quiescence and exact authority generation/policy,
+keep exclusion through durable publication, then release it before rebuilding
+any returned view that itself needs to mint roots. A stale/cancelled/failed
+transaction must not accidentally publish a history-pruned view.
+
+The store transaction `compact_unpinned_persistent_authority` is now implemented
+but not yet called by the kernel. Its admission guard also requires all reader
+slots (including claims) to be free and excludes subsequent reader registration.
+The transaction checks exact generation, stream, policy, principal policy and
+admitted bindings; derives a compacted stream with preserved high-water state;
+and requires an exact policy-revalidated import of those proposed bytes. It
+retains existing CAS bindings/external roots and the registration guard through
+snapshot publication, then reopens registration before constructing the returned
+view. Caller revalidation is followed by a shared-generation check before I/O.
+
+The new inline/external-object regression verifies that a live transient witness
+prevents compaction and remains readable; after its release the transaction
+removes orphan history, preserves ID high-water and survives remount. Rejected
+policy callbacks, wrong replacement bytes and stale generations do not publish.
+The selected suite passes 231 tests (one existing ignored); after adding the
+final pre-I/O generation recheck, the focused transaction test is rerun. Evidence
+is `transaction-suite.log` and `transaction-focused-tests.log`. Kernel wiring,
+transaction-specific power-cut/cancellation tests and the 1,024-operation QEMU
+comparison remain required before this path can replace the current runtime
+policy. There is no new performance claim yet.
+
+### Qualified quiescent-history compaction on small regions (2026-09-11)
+
+The kernel now calls the store-owned quiescent transaction when obtaining the
+baseline-policy authority head, before a facade caller encodes its next append.
+It is limited to regions of at most 16 segments and at least 128 logical records.
+Busy device epochs skip the attempt. Active root or reader pins prevent it;
+other external policies and larger regions retain their existing behavior.
+The exact shared mutation epoch covers the transaction and publication of the
+new runtime view, and rewritten-chain preflight caches are invalidated.
+
+A dedicated fault matrix now injects failures and cancellations at every media
+mutation of this transaction. Each cold recovery selects the exact old stream
+or the exact complete compacted stream, and registration reopens in every case.
+The selected host suite passes 232 tests (one existing ignored test), including
+that matrix and live-witness/ID-high-water checks. Evidence is
+`target/storage-quiescent-compaction-20260911/integrated-tests.log` and
+`transaction-fault-tests.log`.
+
+The qualified 16-segment ELF passes a 128-operation smoke test and the same
+1,024-operation churn run used above. All operations put, verify and revoke;
+content uniqueness is per sample. QEMU throttles, seed and memory are unchanged.
+
+| Operation window | Previous written bytes | Quiescent compaction written bytes | New final records |
+| --- | ---: | ---: | ---: |
+| 1–256 | 74,932,224 | 60,497,920 | 70 |
+| 257–512 | 126,926,848 | 62,001,152 | 75 |
+| 513–768 | 178,130,944 | 62,185,472 | 111 |
+| 769–1,024 | 235,655,168 | 60,809,216 | 52 |
+
+Total written bytes fall from 615,645,184 to 245,493,760 (60.1%); write requests
+fall from 16,849 to 13,811. Flushes increase from 5,869 to 5,989 (2.0%). Reads
+remain eight requests / 32,768 bytes. History and window write volume remain
+bounded across this run; the result does not establish arbitrary-duration
+behavior or a physical SD latency improvement. Workloads retaining live handles
+continue using conservative history retention and cannot assume this saving.
+Candidate ELF/hash, short/long JSONL, serial logs and `long-summary.json` are in
+the same evidence directory. `small.elf` is the integrated small-profile build.
+
+Final qualification also passes the production three-boot file-tree gate
+(including GC, cold recovery and powered-off verification) and Duo file-tree
+compilation. A rebuilt default 223-segment benchmark passes all 128 retained
+object puts/readbacks and exactly matches its preceding baseline: 3,626 reads /
+39,096,320 bytes, 1,392 writes / 38,924,288 bytes, and 469 flushes. Its ELF/hash,
+JSONL and `default-summary.json` accompany the small-region evidence. No physical
+SD device was accessed or modified.
+
+### Rejected one-append compaction deferral (2026-09-11)
+
+The preceding churn transcript showed two conservative rewrites before each
+quiescent rewrite. A trial deferred the conservative rewrite only when an
+append first crossed the small-region threshold, giving the next authority
+recovery a chance to reclaim orphan history. If pins remained live, the next
+append could still run the conservative compactor.
+
+The identical 1,024-operation churn run passed: writes fell from 245,493,760 to
+233,197,568 bytes (5.0%), with 16 quiescent rewrites instead of 18 conservative
+plus nine quiescent rewrites. GC rounds rose from 350 to 355, offsetting most
+barrier savings: flushes only fell from 5,989 to 5,985.
+
+A second, matched 16-segment comparison retained all 128 object capabilities.
+Both versions passed and neither ran quiescent compaction, but deferral changed
+allocation/GC placement adversely:
+
+| Retained-object counter | Qualified baseline | Rejected deferral |
+| --- | ---: | ---: |
+| Read requests | 6,487 | 6,955 |
+| Read bytes | 32,575,488 | 35,016,704 |
+| Write requests | 2,321 | 2,334 |
+| Written bytes | 88,788,992 | 90,001,408 |
+| Flushes | 745 | 745 |
+
+The 7.5% read-byte and 1.4% write-byte regressions make unconditional threshold
+crossing an inadequate scheduling signal. The trial is removed; the kernel
+code was compared back to the qualified quiescent-compaction patch (ignoring
+only Git hash-abbreviation length). The preceding 60.1% churn-write reduction
+remains the accepted implementation. Future scheduling changes should use a
+current liveness hint, without treating that hint as authorization to drop
+history, and qualify both revoked and retained workloads.
+
+Evidence: `target/storage-compaction-order-20260911/`, including matched JSONL,
+serial logs, counter summary, rejected ELF/hash and revert verification.
+`small.elf` there is the rejected trial, not the accepted production policy.
+
+### Liveness-aware compaction scheduling (2026-09-11)
+
+The small-region threshold-crossing deferral now additionally requires a
+store-owned scheduling hint: the exact new transient witness covers every
+observed runtime root, there are no observed readers, and the current authority
+has neither durable object bindings nor external persistent roots. Durable
+bindings need not occupy runtime pin slots, so they are checked separately.
+A foreign witness, a busy root snapshot, failed allocation or extra root rejects
+the hint. The hint does not close admission and never authorizes history removal;
+quiescent compaction still performs its full guarded transaction. If the hint is
+false, conservative compaction runs at its original point.
+
+The helper uses a bounded root snapshot, and the kernel charges its temporary
+allocation to the system owner. Tests cover the new witness alone, unrelated
+runtime roots, readers, foreign runtime context and an older persistent handle.
+The full library suite passes 199 tests with one existing ignored test; after
+adding the unrelated-root assertion the two focused quiescent tests pass,
+including the transaction fault matrix. Duo file-tree compilation passes.
+
+Both comparisons use the same qualified 16-segment profile, 4 KiB payloads,
+seed 32, one 128 MiB VM, no warmups and 4/2 MiB/s, 400/200 IOPS throttles:
+
+| Counter | Qualified baseline | Liveness-aware scheduling |
+| --- | ---: | ---: |
+| 1,024 revoked-object operations: written bytes | 245,493,760 | 233,197,568 |
+| Write requests | 13,811 | 13,675 |
+| Flushes | 5,989 | 5,985 |
+| Read requests / bytes | 8 / 32,768 | 8 / 32,768 |
+| 128 retained-object operations: read bytes | 32,575,488 | 32,575,488 |
+| Write bytes | 88,788,992 | 88,788,992 |
+| Read / write requests | 6,487 / 2,321 | 6,487 / 2,321 |
+| Flushes | 745 | 745 |
+
+Every operation passes. The revoked workload keeps the 5.0% write-byte saving
+of the rejected unconditional trial; the retained workload exactly reproduces
+baseline I/O instead of regressing. These remain scoped QEMU counter results,
+not physical SD latency claims; revoked-workload uniqueness remains per sample.
+Evidence is `target/storage-live-compaction-order-20260911/`, including qualified
+ELF/hash, transcripts, JSONL, `summary.json`, tests and build logs.

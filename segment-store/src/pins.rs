@@ -31,7 +31,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const FREE: u64 = 0;
 const CLAIM_BIT: u64 = 1 << 63;
@@ -268,12 +268,30 @@ pub(crate) struct PinRegistry<const ROOT_SLOTS: usize, const READER_SLOTS: usize
     next_lease: AtomicU64,
     next_owner: AtomicU64,
     root_revision: AtomicU64,
+    root_admission_closed: AtomicBool,
 }
 
 /// Shareable fixed-capacity registry used by long-lived handles. Cloning this
 /// value clones only an `Arc`; slot arrays remain one bounded allocation.
 pub(crate) type SharedPinRegistry<const ROOT_SLOTS: usize, const READER_SLOTS: usize> =
     Arc<PinRegistry<ROOT_SLOTS, READER_SLOTS>>;
+
+/// Excludes new root registrations after an atomic empty-registry check.
+/// Owns no spin lock while alive; dropping it reopens admission, including
+/// when a suspended transaction is cancelled. Reader admission is also closed,
+/// and creation requires every reader slot (including claims) to be free.
+pub(crate) struct EmptyRootAdmissionGuard<const ROOT_SLOTS: usize, const READER_SLOTS: usize> {
+    registry: SharedPinRegistry<ROOT_SLOTS, READER_SLOTS>,
+}
+
+impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> Drop
+    for EmptyRootAdmissionGuard<ROOT_SLOTS, READER_SLOTS>
+{
+    fn drop(&mut self) {
+        let _write = self.registry.begin_root_write();
+        self.registry.root_admission_closed.store(false, Ordering::Release);
+    }
+}
 
 impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS, READER_SLOTS> {
     pub(crate) fn new(reserved_roots: usize, reserved_readers: usize) -> Result<Self, PinError> {
@@ -296,6 +314,7 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
             next_lease: AtomicU64::new(1),
             next_owner: AtomicU64::new(1),
             root_revision: AtomicU64::new(0),
+            root_admission_closed: AtomicBool::new(false),
         })
     }
 
@@ -324,6 +343,25 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
             }
             spin_loop();
         }
+    }
+
+    /// Close root and reader admission only if every slot, including claims, is free.
+    /// The check and closure share the registration lock, eliminating the
+    /// gap between observing emptiness and blocking a concurrent mint or read.
+    pub(crate) fn try_close_empty_root_admission(
+        self: &Arc<Self>,
+    ) -> Result<Option<EmptyRootAdmissionGuard<ROOT_SLOTS, READER_SLOTS>>, PinError> {
+        let _write = self.begin_root_write();
+        if self.root_admission_closed.load(Ordering::Acquire) {
+            return Err(PinError::SnapshotBusy);
+        }
+        if self.roots.iter().any(|slot| slot.lease.load(Ordering::Acquire) != FREE)
+            || self.readers.iter().any(|slot| slot.lease.load(Ordering::Acquire) != FREE)
+        {
+            return Ok(None);
+        }
+        self.root_admission_closed.store(true, Ordering::Release);
+        Ok(Some(EmptyRootAdmissionGuard { registry: Arc::clone(self) }))
     }
 
     pub(crate) fn allocate_owner(&self) -> Result<PinOwner, PinError> {
@@ -361,6 +399,9 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
             PinAdmission::CompletionCritical => ROOT_SLOTS,
         };
         let _write = self.begin_root_write();
+        if self.root_admission_closed.load(Ordering::Acquire) {
+            return Err(PinError::SnapshotBusy);
+        }
         for (index, slot) in self.roots[..admitted].iter().enumerate() {
             if slot
                 .lease
@@ -411,6 +452,10 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
             return Err(PinError::InvalidGeneration);
         }
         validate_owner(owner)?;
+        let _write = self.begin_root_write();
+        if self.root_admission_closed.load(Ordering::Acquire) {
+            return Err(PinError::SnapshotBusy);
+        }
         let lease = next_non_reserved(&self.next_lease)?;
         let admitted = match admission {
             PinAdmission::Ordinary => READER_SLOTS.saturating_sub(self.reserved_readers),
@@ -492,6 +537,29 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
             }
         }
         destination.roots.clear();
+        Err(PinError::SnapshotBusy)
+    }
+
+    /// Allocation-free observation of an empty runtime-root registry.
+    /// Claimed slots count as occupied. As with snapshot_roots, an observation
+    /// is accepted only across an unchanged even revision. This does not
+    /// prevent later registrations: callers must also hold their mutation
+    /// epoch and prove that no independent authority can mint a new root.
+    pub(crate) fn roots_are_empty(&self, max_attempts: usize) -> Result<bool, PinError> {
+        if max_attempts == 0 {
+            return Err(PinError::InvalidConfiguration);
+        }
+        for _ in 0..max_attempts {
+            let before = self.root_revision.load(Ordering::SeqCst);
+            if before & 1 != 0 {
+                continue;
+            }
+            let empty = self.roots.iter().all(|slot| slot.lease.load(Ordering::Acquire) == FREE);
+            let after = self.root_revision.load(Ordering::SeqCst);
+            if before == after && after & 1 == 0 {
+                return Ok(empty);
+            }
+        }
         Err(PinError::SnapshotBusy)
     }
 
@@ -1116,6 +1184,124 @@ mod tests {
     }
 
     #[test]
+    fn empty_root_admission_guard_excludes_mints_and_reopens_on_drop() {
+        let pins = PinRegistry::<2, 1>::new(0, 0).unwrap().into_shared();
+        let owner = pins.allocate_owner().unwrap();
+        let root = pins.pin_root(key(1), RuntimeRootClass::ObjectResource,
+            owner, PinAdmission::Ordinary).unwrap();
+        assert!(pins.try_close_empty_root_admission().unwrap().is_none());
+        drop(root);
+        let guard = pins.try_close_empty_root_admission().unwrap().unwrap();
+        assert!(matches!(pins.try_close_empty_root_admission(), Err(PinError::SnapshotBusy)));
+        // Exercise a different thread while the guard lives. No spin lock is
+        // retained, and both ordinary and completion-critical mints fail.
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for admission in [PinAdmission::Ordinary, PinAdmission::CompletionCritical] {
+                    assert!(matches!(pins.pin_root(key(2), RuntimeRootClass::InvocationLease,
+                        owner, admission), Err(PinError::SnapshotBusy)));
+                }
+                assert_eq!(pins.roots_are_empty(1), Ok(true));
+            }).join().unwrap();
+        });
+        drop(guard);
+        let root = PinRegistry::pin_root_owned(&pins, key(3), RuntimeRootClass::ObjectResource,
+            owner, PinAdmission::Ordinary).unwrap();
+        assert!(pins.try_close_empty_root_admission().unwrap().is_none());
+        drop(root);
+        assert!(pins.try_close_empty_root_admission().unwrap().is_some());
+    }
+
+    #[test]
+    fn empty_admission_requires_quiescent_readers_and_blocks_new_readers() {
+        let pins = PinRegistry::<2, 1>::new(0, 0).unwrap().into_shared();
+        let owner = pins.allocate_owner().unwrap();
+        let reader = pins.pin_read_generation(1, owner, PinAdmission::Ordinary).unwrap();
+        assert!(pins.try_close_empty_root_admission().unwrap().is_none());
+        drop(reader);
+        pins.readers[0].lease.store(claim_value(owner), Ordering::Release);
+        assert!(pins.try_close_empty_root_admission().unwrap().is_none());
+        pins.readers[0].lease.store(FREE, Ordering::Release);
+        let guard = pins.try_close_empty_root_admission().unwrap().unwrap();
+        for admission in [PinAdmission::Ordinary, PinAdmission::CompletionCritical] {
+            assert!(matches!(pins.pin_read_generation(1, owner, admission),
+                Err(PinError::SnapshotBusy)));
+        }
+        drop(guard);
+        assert!(pins.pin_read_generation(1, owner, PinAdmission::Ordinary).is_ok());
+    }
+
+    #[test]
+    fn root_mint_and_empty_admission_closure_cannot_both_win() {
+        for _ in 0..32 {
+            let pins = PinRegistry::<2, 1>::new(0, 0).unwrap().into_shared();
+            let owner = pins.allocate_owner().unwrap();
+            let start = Barrier::new(2);
+            let held = Barrier::new(2);
+            let release = Barrier::new(2);
+            let minted = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    start.wait();
+                    let root = pins.pin_root(key(1), RuntimeRootClass::ObjectResource,
+                        owner, PinAdmission::Ordinary);
+                    assert!(root.is_ok() || matches!(root, Err(PinError::SnapshotBusy)));
+                    minted.store(root.is_ok(), Ordering::Release);
+                    held.wait();
+                    release.wait();
+                    drop(root);
+                });
+                start.wait();
+                let guard = pins.try_close_empty_root_admission().unwrap();
+                held.wait();
+                let closed = guard.is_some();
+                let registered = minted.load(Ordering::Acquire);
+                release.wait();
+                worker.join().unwrap();
+                assert_ne!(closed, registered, "exactly one side must win");
+                drop(guard);
+            });
+        }
+    }
+
+    #[test]
+    fn cancelling_suspended_empty_root_guard_reopens_admission() {
+        use core::future::Future;
+        use core::task::{Context, Poll};
+        let pins = PinRegistry::<2, 1>::new(0, 0).unwrap().into_shared();
+        let owner = pins.allocate_owner().unwrap();
+        let mut transaction = alloc::boxed::Box::pin(async {
+            let _guard = pins.try_close_empty_root_admission().unwrap().unwrap();
+            core::future::pending::<()>().await;
+        });
+        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(transaction.as_mut().poll(&mut context), Poll::Pending));
+        assert!(matches!(pins.pin_root(key(1), RuntimeRootClass::ObjectResource,
+            owner, PinAdmission::Ordinary), Err(PinError::SnapshotBusy)));
+        drop(transaction);
+        assert!(pins.pin_root(key(1), RuntimeRootClass::ObjectResource,
+            owner, PinAdmission::Ordinary).is_ok());
+    }
+
+    #[test]
+    fn empty_root_observation_rejects_live_and_claimed_slots() {
+        let pins = PinRegistry::<2, 1>::new(0, 0).unwrap();
+        let owner = pins.allocate_owner().unwrap();
+        assert_eq!(pins.roots_are_empty(0), Err(PinError::InvalidConfiguration));
+        assert_eq!(pins.roots_are_empty(1), Ok(true));
+        let root = pins.pin_root(key(1), RuntimeRootClass::ObjectResource,
+            owner, PinAdmission::Ordinary).unwrap();
+        assert_eq!(pins.roots_are_empty(1), Ok(false));
+        drop(root);
+        assert_eq!(pins.roots_are_empty(1), Ok(true));
+        // Even an unpublished claim must prevent reclamation.
+        pins.roots[0].lease.store(claim_value(owner), Ordering::Release);
+        assert_eq!(pins.roots_are_empty(1), Ok(false));
+        pins.roots[0].lease.store(FREE, Ordering::Release);
+        assert_eq!(pins.roots_are_empty(1), Ok(true));
+    }
+
+    #[test]
     fn snapshot_returns_busy_while_root_writer_remains_in_progress() {
         let pins = PinRegistry::<2, 1>::new(0, 0).unwrap();
         let mut snapshot = RuntimeRootSnapshot::with_capacity(2).unwrap();
@@ -1127,6 +1313,7 @@ mod tests {
             Err(PinError::SnapshotBusy)
         ));
         assert!(snapshot.roots().is_empty());
+        assert_eq!(pins.roots_are_empty(8), Err(PinError::SnapshotBusy));
 
         drop(writer);
         pins.snapshot_roots(&mut snapshot, 1).unwrap();
@@ -1212,6 +1399,7 @@ mod tests {
                 Err(PinError::SnapshotBusy)
             ));
             assert!(snapshot.roots().is_empty());
+            assert_eq!(pins.roots_are_empty(8), Err(PinError::SnapshotBusy));
             let _ = writer_may_finish.wait();
             worker.join().unwrap();
         });
@@ -1220,6 +1408,7 @@ mod tests {
         pins.snapshot_roots(&mut snapshot, 1).unwrap();
         assert_eq!(snapshot.roots().len(), 1);
         assert_eq!(snapshot.roots()[0].key, key(3));
+        assert_eq!(pins.roots_are_empty(1), Ok(false));
         assert_eq!(snapshot.revision() & 1, 0);
     }
 

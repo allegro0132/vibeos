@@ -3147,6 +3147,8 @@ pub(crate) async fn publish_checkpoint<D: PageDevice>(
     catalog_root: PhysicalPointer,
     authority_root: PhysicalPointer,
     allocation_root: PhysicalPointer,
+    catalog_replay: (u32, PhysicalPointer),
+    cleared_slot: Option<ExactZeroCheckpointSeal>,
 ) -> Result<Checkpoint, GcStoreError<D::Error>> {
     let slot = ((generation - 1) & 1) as u8;
     let checkpoint = Checkpoint {
@@ -3164,15 +3166,26 @@ pub(crate) async fn publish_checkpoint<D: PageDevice>(
             .map_err(StoreError::Format)?,
         admitted_segments: state.admitted_segments,
         next_segment_generation,
-        replay_count: 0,
+        replay_count: catalog_replay.0,
         max_replay_records: limits.max_replay_records,
         cleaner_reserve_segments: state.cleaner_reserve_segments,
         catalog_root,
         authority_root,
         allocation_root,
-        replay_tail: PhysicalPointer::Null,
+        replay_tail: catalog_replay.1,
     };
-    write_checkpoint(device, &checkpoint, true).await?;
+    // Reuse already durably cleared this slot before writing its allocation
+    // segment. Recheck the complete seal after those writes, so a misdirected
+    // write cannot turn the earlier proof into an unchecked assumption.
+    if cleared_slot.is_some() {
+        let mut observed = heap_page();
+        device
+            .read_page(5 + u64::from(slot) * 2, &mut observed)
+            .await
+            .map_err(StoreError::Device)?;
+        ExactZeroCheckpointSeal::from_readback(&observed)?;
+    }
+    write_checkpoint(device, &checkpoint, cleared_slot.is_none()).await?;
     Ok(checkpoint)
 }
 
@@ -3284,7 +3297,6 @@ impl<D: PageDevice> SegmentStore<D> {
         self.poisoned = true;
         memory.release(state_bytes)?;
         let zero = clear_old_checkpoint_seal(&self.device, epoch_generation).await?;
-        let _ = zero;
         let mut builder =
             SegmentBuilder::begin(&self.device, &state, reuse_generation, barrier).await?;
         let allocation_root = builder
@@ -3323,6 +3335,8 @@ impl<D: PageDevice> SegmentStore<D> {
             state.catalog_root,
             state.authority_root,
             allocation_root,
+            (state.replay_count, state.replay_tail),
+            Some(zero),
         )
         .await?;
         let source_count = sources.len();
@@ -3564,6 +3578,8 @@ impl<D: PageDevice> SegmentStore<D> {
             state.catalog_root,
             authority_root,
             allocation_root,
+            (state.replay_count, state.replay_tail),
+            None,
         )
         .await?;
         drop(root_bytes);
@@ -4074,6 +4090,8 @@ impl<D: PageDevice> SegmentStore<D> {
             relocation.catalog_root,
             relocation.authority_root,
             relocation.allocation_root,
+            (0, PhysicalPointer::Null),
+            None,
         )
         .await?;
         // Fast-path mount: the relocation already cold-read every staged
@@ -4148,6 +4166,8 @@ impl<D: PageDevice> SegmentStore<D> {
             relocation_checkpoint.catalog_root,
             relocation_checkpoint.authority_root,
             reuse_allocation_root,
+            (barrier_state.replay_count, barrier_state.replay_tail),
+            Some(zero),
         )
         .await?;
         let mut reuse_successor = barrier_state.clone();

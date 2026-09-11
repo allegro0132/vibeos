@@ -1144,9 +1144,12 @@ pub(crate) struct StorageV2Runtime {
     _quota_provisioner: StorageQuotaProvisioner,
 }
 
-/// Below this many logical records the authority stream is not worth
-/// rewriting: migration fixtures and small stores never trigger compaction.
+/// Boot compaction only rewrites authority streams above this record count.
 const STORAGE_V2_COMPACT_MIN_RECORDS: usize = 2048;
+// On regions of at most 16 segments, frequent GC amplifies ID reservation
+// history. Fold it earlier there; larger regions keep the original threshold
+// because an early rewrite adds checkpoint traffic before that cost amortizes.
+const STORAGE_V2_SMALL_COMPACT_MIN_RECORDS: usize = 128;
 
 const STORAGE_V2_HOT_READ_CACHE_BYTES: usize = 256 * 1024;
 // Object-store tokens retain the encoded Merkle envelope, so a 64 KiB user
@@ -2217,6 +2220,62 @@ impl StorageV2Runtime {
         Ok(())
     }
 
+    /// Bound orphan history before the facade constructs its next journal
+    /// extension. Only the baseline policy and qualified small regions use
+    /// this path; shared store pins decide whether rewriting is safe now.
+    async fn compact_unpinned_authority(
+        self: &Arc<Self>,
+        view: &PersistentAuthorityView,
+    ) -> Result<Option<Arc<PersistentAuthorityView>>, vibeos_object_store::StoreError> {
+        let total_segments = self.device.provisioned_page_count()
+            / vibeos_segment_format::SEGMENT_PAGES;
+        if total_segments > 16
+            || view.record_stream().len() / LOGICAL_BLOCK_SIZE < STORAGE_V2_SMALL_COMPACT_MIN_RECORDS
+            || view.root_policy_sha256() != crate::durable_cspace::storage_v2_external_policy_sha256()
+        {
+            return Ok(None);
+        }
+        let mut operation = match self.begin() {
+            Ok(operation) => operation,
+            Err(V2RuntimeError::Busy) => return Ok(None),
+            Err(error) => return Err(map_facade_error(error)),
+        };
+        let policy = view.root_policy_sha256();
+        let result = poll_as_system(async {
+            let import = crate::durable_cspace::storage_v2_recovery_import_for_policy(
+                view.record_stream(), policy,
+            ).map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
+            let maintenance = self.maintenance.lock().clone()
+                .ok_or(PersistentAuthorityError::Unauthorized)?;
+            let store = operation.store();
+            let writer = store.derive_persistent_authority_writer(&maintenance)?;
+            store.compact_unpinned_persistent_authority(
+                &writer, view.checkpoint_generation(), import,
+                |records| crate::durable_cspace::storage_v2_compaction_import_for_policy(records, policy)
+                    .map_err(|_| PersistentAuthorityError::PolicyMismatch),
+            ).await
+        }).await;
+        match result {
+            Ok(Some(compacted)) => {
+                #[cfg(feature = "storage-bench")]
+                crate::println!("  bench-detail quiescent compact records={} -> {}",
+                    view.record_stream().len() / LOGICAL_BLOCK_SIZE,
+                    compacted.record_stream().len() / LOGICAL_BLOCK_SIZE);
+                *self.preflight_cache.lock() = None;
+                self.compact_watermark.store(0, Ordering::Release);
+                let published = self.publish_authority(compacted);
+                operation.finish();
+                Ok(Some(published))
+            }
+            Ok(None) => { operation.finish(); Ok(None) }
+            Err(_) => {
+                self.invalidate_recovery_cache();
+                operation.finish();
+                Err(vibeos_object_store::StoreError::Corrupt)
+            }
+        }
+    }
+
     /// Steady-state stream compaction. When the appended logical journal has
     /// outgrown the threshold and a rewrite would shed at least a quarter of
     /// its records, replace the persistent authority with the compacted
@@ -2228,10 +2287,35 @@ impl StorageV2Runtime {
     async fn maybe_compact_authority(
         self: &Arc<Self>,
         view: &PersistentAuthorityView,
+        previous_record_count: usize,
+        transient: &PersistentAuthorityTransientObjects,
     ) -> Result<Option<Arc<PersistentAuthorityView>>, vibeos_object_store::StoreError> {
         let record_count = (view.record_stream().len() / LOGICAL_BLOCK_SIZE) as u64;
-        if (record_count as usize) < STORAGE_V2_COMPACT_MIN_RECORDS {
+        let total_segments =
+            self.device.provisioned_page_count() / vibeos_segment_format::SEGMENT_PAGES;
+        let minimum_records = if total_segments <= 16 {
+            STORAGE_V2_SMALL_COMPACT_MIN_RECORDS
+        } else {
+            STORAGE_V2_COMPACT_MIN_RECORDS
+        };
+        if (record_count as usize) < minimum_records {
             return Ok(None);
+        }
+        // Defer a threshold-crossing rewrite only when the new witness
+        // covers all currently observed roots. The next recovery may then
+        // reclaim history; live older handles keep the original schedule.
+        // This hint never substitutes for the store's admission guard.
+        if total_segments <= 16
+            && previous_record_count < STORAGE_V2_SMALL_COMPACT_MIN_RECORDS
+            && view.root_policy_sha256() == crate::durable_cspace::storage_v2_external_policy_sha256()
+        {
+            if let Ok(mut operation) = self.begin() {
+                let defer = poll_as_system(async {
+                    operation.store().transient_witness_covers_runtime_roots(transient)
+                }).await;
+                operation.finish();
+                if defer { return Ok(None); }
+            }
         }
         let watermark = self.compact_watermark.load(Ordering::Acquire);
         if watermark != 0 && record_count < watermark.saturating_add(watermark / 4) {
@@ -2253,6 +2337,12 @@ impl StorageV2Runtime {
             Ok(Some(compacted)) => compacted,
             _ => return Ok(None),
         };
+        #[cfg(feature = "storage-bench")]
+        crate::println!(
+            "  bench-detail runtime compact records={} -> {}",
+            record_count,
+            compacted.len()
+        );
         let Ok(import) = crate::durable_cspace::storage_v2_compaction_import_for_policy(
             &compacted,
             view.root_policy_sha256(),
@@ -4109,6 +4199,7 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             let view = runtime
                 .boot_proved_authority()
                 .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            let view = runtime.compact_unpinned_authority(&view).await?.unwrap_or(view);
             recovered_v2_snapshot(&view, &runtime.hot_reads)
         })
     }
@@ -4335,14 +4426,7 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                         .saturating_add(8)
                 })
                 .unwrap_or(STORAGE_V2_FOREGROUND_FREE_SEGMENTS);
-            // Small payloads occupy one scratch segment plus metadata; the
-            // store still enforces its real reserve/quota checks at append.
-            // Avoid imposing a large-device free target on tiny partitions.
-            if external_payload.is_none_or(|(_, payload)| payload.len() <= 128 * 1024) {
-                let _ = runtime.ensure_foreground_capacity_for_scaled(required_free).await;
-            } else {
-                let _ = runtime.ensure_foreground_capacity_for(required_free).await;
-            }
+            let _ = runtime.ensure_foreground_capacity_for(required_free).await;
             let current = runtime
                 .authority_view()
                 .ok_or(vibeos_object_store::StoreError::Corrupt)?;
@@ -4450,7 +4534,9 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             // ids, so the snapshot below stays valid either way; the
             // just-appended (still ungranted) objects resolve through the
             // transient witness.
-            let compacted_view = runtime.maybe_compact_authority(&view).await?;
+            let compacted_view = runtime.maybe_compact_authority(
+                &view, current.record_stream().len() / LOGICAL_BLOCK_SIZE, &transient,
+            ).await?;
             if compacted_view.is_none() {
                 // The appended stream is now the published stream; retain its
                 // validated replay for the next strict extension. A compacted

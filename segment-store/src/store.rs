@@ -63,9 +63,9 @@ const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 
 /// Every persistent file held open by a namespace pins its stream tail, so
 /// this bounds how many files an open file tree can carry, not merely how
-/// many reads are in flight. 1024 keeps a directory of several hundred files
-/// recoverable with headroom for transaction-scoped pins.
-pub(crate) const ROOT_PIN_SLOTS: usize = 1024;
+/// many reads are in flight. 2048 admits a thousand-file batch plus its
+/// tree nodes and transaction-scoped pins without changing reserve semantics.
+pub(crate) const ROOT_PIN_SLOTS: usize = 2048;
 pub(crate) const READER_PIN_SLOTS: usize = 256;
 pub(crate) const RESERVED_ROOT_PIN_SLOTS: usize = 8;
 pub(crate) const RESERVED_READER_PIN_SLOTS: usize = 8;
@@ -1784,7 +1784,11 @@ async fn scan_segment_with_matches<D: PageDevice>(
             return interpreted;
         }
     }
-    let header_pages = read_pair(device, base).await?;
+    // Every referenced segment starts with a header pair followed by its
+    // first descriptor pair. Reuse the latter half for subsequent descriptors.
+    const _: () = assert!(DATA_FIRST_PAGE == 2);
+    let mut header_pages = alloc::vec![[0; PAGE_SIZE]; 4].into_boxed_slice();
+    device.read_pages(base, &mut header_pages).await.map_err(StoreError::Device)?;
     let header = match decode_segment_header_verified(&header_pages[0], &header_pages[1])? {
         DecodeStatus::Sealed(value) => value,
         _ => return Err(StoreError::Corrupt),
@@ -1797,14 +1801,20 @@ async fn scan_segment_with_matches<D: PageDevice>(
         return Err(StoreError::Corrupt);
     }
 
-    let summary_pages = read_pair(device, base + u64::from(SUMMARY_BODY_PAGE)).await?;
-    let summary = match decode_segment_summary_verified(&summary_pages[0], &summary_pages[1])? {
+    // Summary and final seal are adjacent immutable pairs. Fetch their four
+    // pages together while still authenticating each body/seal independently.
+    const _: () = assert!(SEGMENT_SEAL_BODY_PAGE == SUMMARY_BODY_PAGE + 2);
+    let mut trailer = alloc::vec![[0; PAGE_SIZE]; 4].into_boxed_slice();
+    device
+        .read_pages(base + u64::from(SUMMARY_BODY_PAGE), &mut trailer)
+        .await
+        .map_err(StoreError::Device)?;
+    let summary = match decode_segment_summary_verified(&trailer[0], &trailer[1])? {
         DecodeStatus::Sealed(value) => value,
         _ => return Err(StoreError::Corrupt),
     };
-    let segment_seal_pages = read_pair(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE)).await?;
     let segment_seal =
-        match decode_segment_seal_verified(&segment_seal_pages[0], &segment_seal_pages[1])? {
+        match decode_segment_seal_verified(&trailer[2], &trailer[3])? {
             DecodeStatus::Sealed(value) => value,
             _ => return Err(StoreError::Corrupt),
         };
@@ -1825,8 +1835,13 @@ async fn scan_segment_with_matches<D: PageDevice>(
         .try_reserve_exact(summary.value().record_count as usize)
         .map_err(|_| StoreError::MemoryLimit)?;
     for ordinal in 1..=summary.value().record_count {
-        let descriptor_pages = read_pair(device, base + u64::from(relative)).await?;
-        let extent = match decode_extent_verified(&descriptor_pages[0], &descriptor_pages[1])? {
+        if ordinal != 1 {
+            device
+                .read_pages(base + u64::from(relative), &mut header_pages[2..])
+                .await
+                .map_err(StoreError::Device)?;
+        }
+        let extent = match decode_extent_verified(&header_pages[2], &header_pages[3])? {
             DecodeStatus::Sealed(value) => value,
             _ => return Err(StoreError::Corrupt),
         };

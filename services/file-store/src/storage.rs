@@ -1844,6 +1844,42 @@ mod io_trace {
     }
 
     #[test]
+    #[ignore = "qualify the thousand-file single-transaction workload"]
+    fn thousand_file_batch_commit_and_cold_recovery() {
+        let fixture = fixture_with(0, 256);
+        let payload = alloc::vec![0x5au8; 4096];
+        let mut staged = Vec::new();
+        let mut expected = Vec::new();
+        for index in 0..1000 {
+            let name = alloc::format!("batch-{index:04}");
+            let path = crate::RelPath::parse(&name).unwrap();
+            let mut stager = fixture.root.begin_content_stager(&path, false).unwrap();
+            block_on(stager.push(&payload)).unwrap();
+            staged.push((path, block_on(stager.finish()).unwrap()));
+            expected.push((name, payload.clone()));
+        }
+        let mut tx = fixture.root.begin().unwrap();
+        for (path, content) in staged {
+            tx.write_staged(&path, content).unwrap();
+        }
+        block_on(tx.commit_persistent_for_maintenance(
+            &mut fixture.backend.store.lock().unwrap(), &fixture.backend.maintenance
+        )).unwrap();
+        let events = fixture.device.take();
+        let written_pages: u64 = events.iter().map(|event| match event {
+            Event::Write(_, pages) => *pages,
+            _ => 0,
+        }).sum();
+        assert!(written_pages * (PAGE_SIZE as u64) < 2 * 1024 * 1024,
+            "duplicate file content consumed scratch pages: {written_pages}");
+        assert!(flushes(&events) <= 4);
+        report("thousand-file-commit", &events);
+        let expected: Vec<_> = expected.iter().map(|(name, bytes)| (name.as_str(), bytes.clone())).collect();
+        cold_mount_and_check(&fixture.device,
+            0x5649_4245_4f53_2d54_5241_4345_5f49_4f31, &expected);
+    }
+
+    #[test]
     fn large_unique_file_io_attribution() {
         trace_unique_file_io(16 * 1024 * 1024, 64);
     }

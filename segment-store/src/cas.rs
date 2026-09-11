@@ -4212,6 +4212,44 @@ impl<D: PageDevice> SegmentStore<D> {
         let predicted = batch
             .predicted_object(batch.staged.len())
             .ok_or(StoreError::IdExhausted)?;
+        // Reuse a payload already authenticated/staged by this same trusted
+        // batch before reserving scratch. Object identities remain distinct;
+        // publication still emits an ObjectMapping for every input entry.
+        if payload.len() <= SMALL_BLOB_SINK_LIMIT as usize
+            && batch.staged.iter().any(|entry| {
+                entry.object_kind == object_kind
+                    && entry.reference_codec == reference_codec
+                    && entry.exact_len == payload.len() as u64
+            })
+        {
+            let descriptor = BlobDescriptor::from_content(object_kind, payload)?;
+            let key = BlobKey::sha256(object_kind, payload.len() as u64, descriptor.root)?;
+            if let Some(source) = batch.staged.iter().find(|entry| {
+                entry.blob_key == key && entry.reference_codec == reference_codec
+            }) {
+                let duplicate = StagedObjectCommit {
+                    predecessor: batch.planning.clone(),
+                    blob_key: key,
+                    manifest: source.manifest.clone(),
+                    existing: source.existing,
+                    extents: Vec::new(),
+                    segments: Vec::new(),
+                    payload_hashes: Vec::new(),
+                    reference_codec,
+                    object_kind,
+                    exact_len: payload.len() as u64,
+                    quota_charge: None,
+                    last_scratch_seal: None,
+                    sink: PageSink::new(),
+                    owned_from: 0,
+                    packable: true,
+                    batch_packed: true,
+                };
+                batch.staged.try_reserve(1).map_err(|_| StoreError::MemoryLimit)?;
+                batch.staged.push(duplicate);
+                return Ok(predicted);
+            }
+        }
         // Cursor packing works on both allocation formats: fresh segments
         // still advance strictly, and only the metadata records' placement at
         // publication is V2-specific. The publication keeps the legacy

@@ -851,3 +851,180 @@ first page, second page). All five records report `ok`. These immediate
 put/get samples report zero device reads during get: they qualify the byte
 check and warm path, not cold-media random-read performance. Firmware, logs
 and JSONL records are under `target/storage-range-bytes-20260911/`.
+
+
+### Data-cache-evicted range-get diagnostic (2026-09-11)
+
+Use `--workload object-range-get-uncached-data` to evict the kernel object-byte
+cache and write-through page cache between put and the timed range read.
+Eviction holds the exclusive V2/page-device operation; it neither writes nor
+flushes storage and leaves mounted authority/proof metadata intact. Failure
+to obtain that operation makes the sample fail closed. This is explicitly
+not powered-off recovery or a fully cold metadata cache. The separate workload
+name keeps it out of ordinary warm range-get comparison coordinates.
+
+QEMU 128 MiB, standard limits, with 131,073-byte objects at seeds 32/33/34
+(one-byte tail, first leaf, second leaf) passes exact byte validation and
+performs 17/18/19 get read requests for 114,688/118,784/122,880 bytes. Get times
+are 10.957/5.585/5.592 ms; these are single diagnostic samples. The matching
+warm reads previously did no device I/O. A 4,097-byte tail/first-page pair
+also passes with nonzero device reads. Every get phase has zero writes and
+flushes. This establishes a reproducible physical-read path for further
+metadata/proof attribution, not evidence about physical SD performance.
+Evidence: `target/storage-uncached-range-20260911/`.
+
+
+### Coalesce the immutable segment trailer read (2026-09-11)
+
+A descriptor-chain scan now reads the contiguous summary body/seal and final
+segment body/seal as one 16 KiB request instead of two 8 KiB requests. A constant
+assertion binds their adjacency; both record pairs are independently decoded
+and verified as before. The successful-path bytes and 16 KiB total buffer
+allocation remain unchanged. On malformed summary input the new request may
+also fetch the final-seal pair before rejecting the summary, but cannot
+publish or authenticate an invalid result.
+
+All 186 segment-store unit tests (one ignored), 12 streaming, five fused
+recovery and 28 file-store tests (two ignored) pass. QEMU 128 MiB repeats the
+same data-cache-evicted range samples as the preceding diagnostic:
+
+| Object bytes / requested leaves | Old get requests | New get requests | Get read bytes |
+| --- | --- | --- | --- |
+| 4,097 / tail, first | 14, 14 | 12, 12 | 102,400 each |
+| 131,073 / tail, first, second | 17, 18, 19 | 15, 16, 17 | 114,688 / 118,784 / 122,880 |
+
+All five exact-byte validations pass; read bytes, workload writes and flushes
+match by seed. The two-request reduction per get is visible on QEMU, without
+claiming a physical SD timing improvement. Evidence is preserved under
+`target/storage-trailer-read-20260911/`.
+
+
+### Coalesce the segment header and first descriptor (2026-09-11)
+
+For a referenced sealed segment, the two header pages are immediately followed
+by the first descriptor pair. The scan now fetches all four together, with a
+compile-time adjacency assertion. Later descriptors reuse the second half of
+this buffer and are still read at their exact positions; no intervening payload
+pages are fetched. Peak page-buffer storage matches the old header-plus-current-
+descriptor allocation. A corrupt header/empty segment may cause two extra pages
+to be fetched before rejection, without changing validation or publication.
+
+The same 186 unit, 12 streaming, five fused recovery and 28 file-store tests
+pass. QEMU data-cache-evicted range-get with identical seeds confirms another
+two-request reduction per sample: 4,097-byte objects now use 10 get requests;
+131,073-byte tail/first/second reads use 13/14/15. All five byte checks pass,
+with read bytes, writes and flushes unchanged. Together with trailer coalescing,
+this saves four requests versus the initial uncached-data baseline (14 and
+17/18/19 respectively). This is an I/O-count result, not a physical SD timing
+claim. Evidence: `target/storage-header-read-20260911/`.
+
+
+### Repeated request-limited range comparison (2026-09-11)
+
+To test whether coalescing segment headers/trailers translates into latency,
+compare the pre-coalescing `storage-uncached-range-20260911/candidate.elf` with
+`storage-header-read-20260911/candidate.elf`. Each variant uses two fresh
+128 MiB VMs, one warmup and eight retained samples per VM, 131,073-byte objects,
+seed 32, 4/2 MiB/s read/write bandwidth, and 20/200 read/write IOPS. Runs are
+sequential with no concurrent builds or host tests. Workload remains
+`object-range-get-uncached-data`, retaining mounted metadata as documented.
+
+| Median metric | Before | After |
+| --- | ---: | ---: |
+| Get, all 16 retained samples | 914.211 ms | 711.410 ms |
+| Put + get, all retained samples | 960.780 ms | 765.849 ms |
+| Get, VM 0 | 914.211 ms | 692.865 ms |
+| Get, VM 1 | 913.772 ms | 712.447 ms |
+
+All records pass exact byte checks. Each paired get saves exactly four read
+requests; get read bytes and workload write bytes/requests/flushes match by
+seed. Get median improves about 22%, and full-workload median about 20%.
+Both VM groups agree on direction. Samples within a VM share evolving store
+state, so they are paired workload observations, not 16 independent VM trials.
+The intentionally low request limit establishes a QEMU request-limited benefit;
+it does not predict performance at normal limits or on a physical SD card.
+JSONL records, runner logs and per-seed comparison are in
+`target/storage-range-iops-20260911/`.
+
+
+### Standard-limit range comparison with reversed run order (2026-09-11)
+
+Repeat the preceding pre/post-coalescing comparison at the usual 400 read IOPS
+(4/2 MiB/s, 200 write IOPS, same 128 MiB RAM, workload, size and seeds). An
+initial before/after pair of two-VM runs gave inconsistent VM-level directions,
+so add after/before runs to balance ordering. Each variant now has four fresh
+VMs and 32 retained samples, with one warmup and eight samples per VM. No
+compilation or host tests run during sampling.
+
+| Pooled median | Before | After |
+| --- | ---: | ---: |
+| Get | 5.1415 ms | 5.0340 ms |
+| Put + get | 58.1755 ms | 58.5150 ms |
+
+Two paired VM get medians improve and two worsen; pooled changes are small.
+Treat normal-limit latency as approximately flat in this experiment, rather
+than asserting a general speedup from the 20-IOPS result. All 32 paired samples
+still save four get requests with identical get read bytes and workload writes/
+flushes, and all exact-byte checks pass. The reproducible benefit remains fewer
+requests and lower latency when request rate is the bottleneck. Samples within
+a VM are not independent VM trials. Evidence and all per-VM medians are in
+`target/storage-range-standard-20260911/balanced-summary.json`.
+
+
+### SD command-path compatibility of coalesced reads (2026-09-11)
+
+The Duo production file-tree firmware compiles with the current storage read
+coalescing (`cargo check --release --features file-tree` from its firmware
+directory). The SD backend forwards multi-sector reads to the SDHCI driver's
+CMD18 path; the transfer ceiling is 256 sectors / 128 KiB, so the coalesced
+16 KiB metadata request is 32 sectors within that limit.
+
+A new SDHCI host test checks 4/16/128 KiB requests publish CMD18 with exact
+8/32/256 sector counts and perform the existing abort on the fake device's
+interrupt error. The full driver suite passes. Plain MMIO memory cannot emulate
+write-one-to-clear interrupt status, so this validates command setup and error
+handling, not successful transfers on physical media. The board wrapper still
+falls back to single-sector CMD17 for the session after a CMD18 failure; in
+that mode, fewer upper-layer requests need not reduce SD command count.
+No hardware policy or fallback was changed. Logs:
+`target/storage-sd-read-contract-20260911/`.
+
+
+### Admit the thousand-file batch within bounded pin storage (2026-09-11)
+
+A host reproduction of 1,000 staged 4 KiB files in one transaction failed with
+`Capacity(Metadata)` at the old 1,024 runtime-root-pin capacity. The same test
+passes with 2,048 slots, including a fresh mount and checking all 1,000 file
+contents. An open namespace pins file stream tails as well as transient tree
+nodes, so the file count alone is not the required pin count.
+
+Simply enlarging the by-value array caused the QEMU kernel to hit its guarded
+stack during boot. Root/reader slot arrays now have fixed-length boxed storage,
+initialized incrementally via checked heap allocation. Pin acquisition still
+never grows the arrays; reservation, owner cleanup and generation validation
+are unchanged. On the 64-bit host the registry handle is 56 bytes and backing
+slots use 153,600 bytes, versus 79,912 bytes for the previous inline 1,024-root
+registry: about 72 KiB additional storage per runtime. A test bounds both the
+handle size and total allocation. The failed boot log is retained as evidence
+of why heap initialization is required.
+
+The guest benchmark now admits 101–1,000 files only when each is at most 4 KiB;
+its existing <=100-file behavior and transaction edit guard remain. A fresh
+128 MiB QEMU VM completes one `file-batch-create`, 1,000 x 4,096 bytes, seed 32,
+at the usual 4/2 MiB/s and 400/200 read/write IOPS limits. Complete commit time
+is 8.934386 s, with 151 write requests / 18,096,128 bytes, eight flushes and
+one read request / 24,576 bytes. This benchmark shares one generated payload
+between files; it is not a unique-content-per-file result. It verifies commit
+success; the independent host test supplies all-file cold-content validation.
+One fresh-VM batch does not qualify repeated accumulation of 1,000-file batches.
+No new Linux ratio is inferred from the historical table.
+
+After heap initialization, 187 segment-store unit tests (one ignored), 12
+streaming, five fused recovery, 28 file-store tests (three ignored) and the
+explicit thousand-file recovery test pass. Duo production file-tree compilation
+also passes. Evidence is in `target/storage-batch1000-20260911/`.
+
+The production file-tree QEMU gate also passes all three boots after this
+change: hard/symbolic links, recursive removal, GC pressure, cold recovery and
+powered-off independent verification. Its boot logs and verifier reports are
+included in the same evidence directory.

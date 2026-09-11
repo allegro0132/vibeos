@@ -3163,10 +3163,13 @@ async fn storage_object_bench(
         .0
         .lock()
         .lookup_lease::<crate::store::StoredObject>(publication.capability, Rights::READ);
+    let range_get = matches!(workload, "object-range-get" | "object-range-get-uncached-data");
+    let cache_ready = workload != "object-range-get-uncached-data"
+        || crate::segment_store_platform::benchmark_evict_read_data();
     let range_leaf = (seed as u32) % ((size.max(1) + 4095) / 4096) as u32;
     let get_started = crate::sbi::time();
     let read_back = match (service, object) {
-        (Ok(service), Ok(object)) if workload == "object-range-get" => {
+        (Ok(service), Ok(object)) if range_get => {
             crate::store::get_blob_chunk_with(service, object, range_leaf)
                 .await
                 .map(|chunk| crate::store::VerifiedBlob {
@@ -3189,13 +3192,13 @@ async fn storage_object_bench(
         )),
     };
     let get_ticks = crate::sbi::time().saturating_sub(get_started).max(1);
-    let expected_read_back = if workload == "object-range-get" {
+    let expected_read_back = if range_get {
         let start = range_leaf as usize * 4096;
         &payload[start..payload.len().min(start + 4096)]
     } else {
         payload.as_slice()
     };
-    let mut status = if read_back.as_ref().is_ok_and(|verified| {
+    let mut status = if cache_ready && read_back.as_ref().is_ok_and(|verified| {
         verified.bytes == expected_read_back && verified.descriptor == publication.descriptor
     }) {
         "ok"
@@ -3288,7 +3291,7 @@ async fn storage_file_tree_bench(
     }
     if (workload == "file-sequential" && size > 512 * 1024 * 1024)
         || (workload == "file-overwrite-1m" && size > 64 * 1024 * 1024)
-        || (workload == "file-batch-create" && count > 100) {
+        || (workload == "file-batch-create" && count > 100 && (count > 1000 || size > 4096)) {
         unsupported("staged persistence exceeds the bounded guest benchmark budget");
         return;
     }

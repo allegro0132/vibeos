@@ -261,8 +261,8 @@ impl ReaderSlot {
 /// Fixed-capacity pins shared by the authority bridge, Blob readers, and the
 /// cleaner. No operation grows either slot array.
 pub(crate) struct PinRegistry<const ROOT_SLOTS: usize, const READER_SLOTS: usize> {
-    roots: [RootSlot; ROOT_SLOTS],
-    readers: [ReaderSlot; READER_SLOTS],
+    roots: alloc::boxed::Box<[RootSlot; ROOT_SLOTS]>,
+    readers: alloc::boxed::Box<[ReaderSlot; READER_SLOTS]>,
     reserved_roots: usize,
     reserved_readers: usize,
     next_lease: AtomicU64,
@@ -280,9 +280,17 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
         if reserved_roots > ROOT_SLOTS || reserved_readers > READER_SLOTS {
             return Err(PinError::InvalidConfiguration);
         }
+        // Build bounded arrays in heap storage: constructing the full root
+        // array by value can overflow the firmware's guarded kernel stack.
+        let mut roots = Vec::new();
+        roots.try_reserve_exact(ROOT_SLOTS).map_err(|_| PinError::AllocationFailed)?;
+        roots.resize_with(ROOT_SLOTS, RootSlot::new);
+        let mut readers = Vec::new();
+        readers.try_reserve_exact(READER_SLOTS).map_err(|_| PinError::AllocationFailed)?;
+        readers.resize_with(READER_SLOTS, ReaderSlot::new);
         Ok(Self {
-            roots: core::array::from_fn(|_| RootSlot::new()),
-            readers: core::array::from_fn(|_| ReaderSlot::new()),
+            roots: roots.into_boxed_slice().try_into().map_err(|_| PinError::InvalidConfiguration)?,
+            readers: readers.into_boxed_slice().try_into().map_err(|_| PinError::InvalidConfiguration)?,
             reserved_roots,
             reserved_readers,
             next_lease: AtomicU64::new(1),
@@ -472,7 +480,7 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
             if before & 1 != 0 {
                 continue;
             }
-            for slot in &self.roots {
+            for slot in self.roots.iter() {
                 if let Some((_lease, key, class)) = slot.read_stable() {
                     destination.roots.push(RuntimeRoot { key, class });
                 }
@@ -529,7 +537,7 @@ impl<const ROOT_SLOTS: usize, const READER_SLOTS: usize> PinRegistry<ROOT_SLOTS,
             // must therefore happen after the registry writer guard is gone.
             drop(retention);
         }
-        for slot in &self.readers {
+        for slot in self.readers.iter() {
             loop {
                 let lease = slot.lease.load(Ordering::Acquire);
                 if lease == FREE {
@@ -927,6 +935,16 @@ pub(crate) struct ReleasedPins {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn store_root_pin_capacity_has_a_bounded_fixed_allocation() {
+        let handle = core::mem::size_of::<crate::store::StorePinRegistry>();
+        let backing = core::mem::size_of::<super::RootSlot>() * crate::store::ROOT_PIN_SLOTS
+            + core::mem::size_of::<super::ReaderSlot>() * crate::store::READER_PIN_SLOTS;
+        std::println!("root pin registry: handle={handle}, backing={backing} bytes");
+        assert!(handle <= 128);
+        assert!(handle + backing <= 256 * 1024);
+    }
+
     extern crate std;
 
     use super::*;

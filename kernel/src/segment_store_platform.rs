@@ -1237,6 +1237,23 @@ impl HotReadCache {
 static NEXT_V2_OPERATION: AtomicU64 = AtomicU64::new(1);
 static INSTALLED_V2_RUNTIME: SpinLock<Option<Arc<StorageV2Runtime>>> = SpinLock::new(None);
 
+/// Benchmark data-cache eviction only: retain mounted metadata and proof
+/// provenance. This is not a cold recovery or a physical-media scrub.
+#[cfg(feature = "legacy-shell")]
+pub(crate) fn benchmark_evict_read_data() -> bool {
+    let Some(runtime) = INSTALLED_V2_RUNTIME.lock().clone() else {
+        return false;
+    };
+    let Ok(operation) = runtime.begin() else {
+        return false;
+    };
+    runtime.hot_reads.clear();
+    runtime.device.page_cache.clear();
+    operation.finish();
+    true
+}
+
+
 struct V2Operation {
     runtime: Arc<StorageV2Runtime>,
     claim: ActiveV2Operation,

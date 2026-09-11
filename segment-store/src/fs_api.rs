@@ -3356,7 +3356,8 @@ mod tests {
             .map(|index| (index * 13) as u8)
             .collect::<Vec<u8>>();
         let small_b = alloc::vec![0x33_u8; 2048];
-        let payloads = [&small_a, &large, &committed, &small_b];
+        let small_c = alloc::vec![0x44_u8; 4096];
+        let payloads = [&small_a, &large, &committed, &small_b, &small_c, &small_a, &committed];
         let mut batch = store.begin_staged_batch().unwrap();
         for payload in payloads {
             block_on(store.stage_blob_in_batch(
@@ -3368,7 +3369,7 @@ mod tests {
             .unwrap();
         }
         let published = block_on(store.publish_staged_batch(batch)).unwrap();
-        assert_eq!(published.len(), 4);
+        assert_eq!(published.len(), payloads.len());
         for (object, payload) in published.iter().zip(payloads) {
             assert_eq!(object.exact_len(), payload.len() as u64);
             let chunk = block_on(store.get_blob_chunk(object, 0)).unwrap();

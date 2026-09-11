@@ -76,6 +76,37 @@ static void fill_payload(uint8_t *buffer, size_t length, uint64_t seed) {
     }
 }
 
+// BEGIN offset-addressed sequential benchmark pattern (mirrors Rust).
+static uint64_t sequential_word(uint64_t seed, uint64_t index) {
+    uint64_t x = seed + index * UINT64_C(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return x ^ (x >> 31);
+}
+
+static bool sequential_pattern(uint8_t *buffer, size_t length, uint64_t seed,
+                               uint64_t offset, bool verify) {
+    size_t at = 0;
+    while (at < length) {
+        uint64_t word = sequential_word(seed, offset / 8);
+        size_t within = offset % 8;
+        size_t take = 8 - within;
+        if (take > length - at) take = length - at;
+        for (size_t i = 0; i < take; ++i) {
+            uint8_t expected = (uint8_t)(word >> (8 * (within + i)));
+            if (verify) {
+                if (buffer[at + i] != expected) return false;
+            } else {
+                buffer[at + i] = expected;
+            }
+        }
+        at += take;
+        offset += take;
+    }
+    return true;
+}
+// END offset-addressed sequential benchmark pattern.
+
 static bool durable_put(int dirfd, const char *temporary, const char *final,
                         uint8_t *payload, uint8_t *readback, size_t length) {
     int fd = openat(dirfd, temporary, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
@@ -369,18 +400,20 @@ static int run_extended_workload(const char *workload, const char *directory,
             ok = fd >= 0;
             for (uint64_t offset = 0; ok && offset < bytes; offset += 128 * 1024) {
                 size_t length = (size_t)((bytes - offset) < 128 * 1024 ? bytes - offset : 128 * 1024);
+                sequential_pattern(payload, length, seed, offset, false);
                 ok = pwrite_all(fd, payload, length, offset);
                 transferred += length;
             }
             ok = ok && fdatasync(fd) == 0;
             for (uint64_t offset = 0; ok && offset < bytes; offset += 128 * 1024) {
                 size_t length = (size_t)((bytes - offset) < 128 * 1024 ? bytes - offset : 128 * 1024);
-                ok = pread_all(fd, readback, length, offset);
+                ok = pread_all(fd, readback, length, offset)
+                    && sequential_pattern(readback, length, seed, offset, true);
                 transferred += length;
             }
-            if (fd >= 0) close(fd);
-            unlinkat(dirfd, path, 0);
-            fsync(dirfd);
+            if (fd >= 0 && close(fd) != 0) ok = false;
+            if (unlinkat(dirfd, path, 0) != 0) ok = false;
+            if (fsync(dirfd) != 0) ok = false;
             operations = 2;
         } else if (strcmp(workload, "file-directory") == 0) {
             for (uint64_t file = 0; file < object_count && ok; ++file) {
@@ -435,7 +468,7 @@ static int run_extended_workload(const char *workload, const char *directory,
                    ",\"block_requests\":%" PRIu64 ",\"block_read_requests\":%" PRIu64
                    ",\"block_write_requests\":%" PRIu64 ",\"block_flush_requests\":%" PRIu64
                    ",\"block_read_bytes\":%" PRIu64 ",\"block_write_bytes\":%" PRIu64
-                   "%s,\"status\":\"ok\"}\n",
+                   "%s%s,\"status\":\"ok\"}\n",
                    (strcmp(workload, "object-range-get") == 0 ||
                     strcmp(workload, "object-revoke") == 0 ||
                     strcmp(workload, "object-v2-large") == 0) ? "object" : "file-tree",
@@ -444,7 +477,10 @@ static int run_extended_workload(const char *workload, const char *directory,
                    index < warmups ? "true" : "false", operations, transferred,
                    elapsed == 0 ? 1 : elapsed, elapsed == 0 ? 1 : elapsed,
                    reads + writes + flushes, reads, writes, flushes,
-                   read_bytes, write_bytes, phase_json);
+                   read_bytes, write_bytes, phase_json,
+                   strcmp(workload, "file-sequential") == 0
+                       ? ",\"content_pattern\":\"splitmix64-offset-v1\",\"latency_scope\":\"workload\""
+                       : (strncmp(workload, "file-", 5) == 0 ? ",\"latency_scope\":\"workload\"" : ""));
         } else {
             emit_unsupported_sample("file-tree", workload, bytes, object_count,
                                     seed, index < warmups ? index : index - warmups,

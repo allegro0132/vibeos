@@ -124,36 +124,37 @@ impl PageSink {
     ) -> Result<(), StoreError<D::Error>> {
         self.entries
             .sort_by(|left, right| left.0.cmp(&right.0));
-        // Deduplicate: keep the last write per page.
-        let mut deduped: Vec<(u64, Box<Page>)> = Vec::new();
-        deduped
-            .try_reserve_exact(self.entries.len())
-            .map_err(|_| StoreError::MemoryLimit)?;
-        for entry in self.entries {
-            if deduped.last().is_some_and(|last| last.0 == entry.0) {
-                *deduped.last_mut().expect("non-empty") = entry;
+        // Stable sorting preserves submission order within each page. Keep
+        // the last value in place without a second allocation of entries.
+        self.entries.dedup_by(|later, earlier| {
+            if later.0 == earlier.0 {
+                core::mem::swap(&mut later.1, &mut earlier.1);
+                true
             } else {
-                deduped.push(entry);
+                false
             }
-        }
-        let mut index = 0;
-        while index < deduped.len() {
-            let first_page = deduped[index].0;
-            let mut end = index + 1;
-            while end < deduped.len() && deduped[end].0 == first_page + (end - index) as u64 {
-                end += 1;
-            }
-            let mut run = Vec::new();
-            run.try_reserve_exact(end - index)
-                .map_err(|_| StoreError::MemoryLimit)?;
-            for entry in &deduped[index..end] {
-                run.push(*entry.1);
+        });
+        // Match the 128 KiB device request ceiling without copying an entire
+        // multi-megabyte transaction into another contiguous allocation.
+        const DRAIN_PAGES: usize = 32;
+        let mut run = Vec::new();
+        run.try_reserve_exact(self.entries.len().min(DRAIN_PAGES))
+            .map_err(|_| StoreError::MemoryLimit)?;
+        let mut entries = self.entries.into_iter().peekable();
+        while let Some((first_page, bytes)) = entries.next() {
+            run.clear();
+            run.push(*bytes);
+            while run.len() < DRAIN_PAGES
+                && entries.peek().is_some_and(|entry| {
+                    first_page.checked_add(run.len() as u64) == Some(entry.0)
+                })
+            {
+                run.push(*entries.next().expect("peeked contiguous page").1);
             }
             device
                 .write_pages(first_page, &run)
                 .await
                 .map_err(StoreError::Mutation)?;
-            index = end;
         }
         Ok(())
     }
@@ -1750,6 +1751,9 @@ impl<D: PageDevice> SegmentStore<D> {
             .ok()
             .map(|index| cas.blobs[index])
             .ok_or(StoreError::ObjectUnavailable)?;
+        // Reuse the authenticated immutable segment chain, just as content
+        // descriptors do. The manifest payload is still read and hash-checked
+        // against the current catalog pointer on every invocation.
         let payload = read_pointer_payload(
             &self.device,
             state.superblock.binding.store_uuid,
@@ -1759,7 +1763,7 @@ impl<D: PageDevice> SegmentStore<D> {
             blob.manifest,
             ExtentKind::Catalog,
             self.limits.recovery_memory_bytes,
-            None,
+            Some(&self.verified_scans),
         )
         .await?;
         let context = CasCodecContext::new(
@@ -6101,6 +6105,90 @@ fn find_scratch_page<E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sink_drain_bounds_buffers_preserves_latest_pages_and_stops_on_failure() {
+        use core::cell::RefCell;
+        use core::task::{Context, Poll, Waker};
+        use vibeos_storage_device::{MutationFailure, MutationResult};
+
+        struct Device {
+            writes: RefCell<Vec<(u64, Vec<Page>)>>,
+            fail_at: usize,
+        }
+        impl PageDevice for Device {
+            type Error = ();
+            fn info(&self) -> PageDeviceInfo {
+                panic!("drain must not query geometry")
+            }
+            async fn read_page(&self, _: u64, _: &mut Page) -> Result<(), ()> {
+                panic!("drain must not read")
+            }
+            async fn write_page(&self, _: u64, _: &Page) -> MutationResult<(), ()> {
+                panic!("drain must batch")
+            }
+            async fn write_pages(&self, first: u64, pages: &[Page]) -> MutationResult<(), ()> {
+                let mut writes = self.writes.borrow_mut();
+                writes.push((first, pages.to_vec()));
+                if writes.len() == self.fail_at {
+                    return Err(MutationFailure::ambiguous(()));
+                }
+                Ok(())
+            }
+            async fn flush(&self) -> MutationResult<(), ()> {
+                panic!("drain must not flush")
+            }
+        }
+        for fail_at in [usize::MAX, 2] {
+            let device = Device {
+                writes: RefCell::new(Vec::new()),
+                fail_at,
+            };
+            let mut sink = PageSink::new();
+            // Unordered pages, a gap, and three versions of every page.
+            for version in 0..3u8 {
+                for page in (0..130u64).rev() {
+                    let physical = if page < 65 { page } else { page + 10 };
+                    let mut bytes = [version; PAGE_SIZE];
+                    bytes[..8].copy_from_slice(&page.to_le_bytes());
+                    sink.push::<()>(physical, &bytes).unwrap();
+                }
+            }
+            let mut future = core::pin::pin!(sink.drain(&device));
+            let Poll::Ready(result) = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("the test device completes synchronously");
+            };
+            let writes = device.writes.borrow();
+            if fail_at == 2 {
+                assert!(matches!(result, Err(StoreError::Mutation(_))));
+                assert_eq!(writes.len(), 2);
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    writes
+                        .iter()
+                        .map(|(p, b)| (*p, b.len()))
+                        .collect::<Vec<_>>(),
+                    [(0, 32), (32, 32), (64, 1), (75, 32), (107, 32), (139, 1)]
+                );
+                for (first, pages) in writes.iter() {
+                    for (offset, bytes) in pages.iter().enumerate() {
+                        let physical = first + offset as u64;
+                        let logical = if physical < 65 {
+                            physical
+                        } else {
+                            physical - 10
+                        };
+                        assert_eq!(&bytes[..8], &logical.to_le_bytes());
+                        assert!(bytes[8..].iter().all(|byte| *byte == 2));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn scratch_page_location_uses_extent_relative_alignment() {

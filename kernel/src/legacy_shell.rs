@@ -2,6 +2,10 @@
 
 extern crate alloc;
 
+#[cfg(feature = "file-tree")]
+#[path = "storage_bench_pattern.rs"]
+mod sequential_pattern;
+
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -2838,6 +2842,24 @@ async fn storage_v2_command(args: &[&str]) {
     }
 }
 
+async fn storage_bench_boot_selection(
+    storage: &Arc<crate::segment_store_platform::StorageV2Devices>,
+) -> Option<crate::segment_store_platform::BootStoreSelection> {
+    let selection_deadline =
+        crate::sbi::time().saturating_add(exec::timebase_hz().saturating_mul(180));
+    loop {
+        match storage.selected_boot_store() {
+            Some(crate::segment_store_platform::BootStoreSelection::LegacyM4)
+            | Some(crate::segment_store_platform::BootStoreSelection::StorageV2)
+            | Some(crate::segment_store_platform::BootStoreSelection::FailClosed) => {
+                break storage.selected_boot_store();
+            }
+            _ if crate::sbi::time() >= selection_deadline => break None,
+            _ => exec::yield_now().await,
+        }
+    }
+}
+
 async fn storage_object_bench(
     storage: &Arc<crate::segment_store_platform::StorageV2Devices>,
     args: &[&str],
@@ -2864,19 +2886,7 @@ async fn storage_object_bench(
     };
     let workload = args.get(2).copied().unwrap_or("object-durable-put-get");
     let content_class = args.get(3).copied().unwrap_or("unique");
-    let selection_deadline =
-        crate::sbi::time().saturating_add(exec::timebase_hz().saturating_mul(180));
-    let selection = loop {
-        match storage.selected_boot_store() {
-            Some(crate::segment_store_platform::BootStoreSelection::LegacyM4)
-            | Some(crate::segment_store_platform::BootStoreSelection::StorageV2)
-            | Some(crate::segment_store_platform::BootStoreSelection::FailClosed) => {
-                break storage.selected_boot_store();
-            }
-            _ if crate::sbi::time() >= selection_deadline => break None,
-            _ => exec::yield_now().await,
-        }
-    };
+    let selection = storage_bench_boot_selection(storage).await;
     let backend = match selection {
         Some(crate::segment_store_platform::BootStoreSelection::LegacyM4) => "m4",
         Some(crate::segment_store_platform::BootStoreSelection::StorageV2) => "storage-v2",
@@ -3290,6 +3300,9 @@ async fn storage_file_tree_bench(
         unsupported("staged persistence exceeds the bounded guest benchmark budget");
         return;
     }
+    // Boot mount/scrub may take seconds on a limited device. Match the
+    // object benchmark's bounded wait before any file-tree work or timing.
+    storage_bench_boot_selection(storage).await;
     let root = match storage.recover_file_tree_root(namespace).await {
         Ok(root) => root,
         Err(_) => {
@@ -3382,9 +3395,7 @@ async fn storage_file_tree_bench(
             let mut stager = root.begin_content_stager(&path, false)?;
             let mut chunk = alloc::vec![0_u8; DATA_CHUNK_SIZE];
             for index in 0..size.div_ceil(DATA_CHUNK_SIZE) {
-                for (offset, byte) in chunk.iter_mut().enumerate() {
-                    *byte = (seed.wrapping_add((index * DATA_CHUNK_SIZE + offset) as u64) & 0xff) as u8;
-                }
+                sequential_pattern::fill(&mut chunk, seed, (index * DATA_CHUNK_SIZE) as u64);
                 let len = core::cmp::min(DATA_CHUNK_SIZE, size.saturating_sub(index * DATA_CHUNK_SIZE));
                 stager.push(&chunk[..len]).await?;
             }
@@ -3395,7 +3406,14 @@ async fn storage_file_tree_bench(
             let reader = root.reader(&path)?;
             let mut read = 0_u64;
             for index in 0..reader.chunk_count() {
-                read = read.saturating_add(reader.read_chunk(index).await?.map(|chunk| chunk.len() as u64).unwrap_or(0));
+                let bytes = reader.read_chunk(index).await?.ok_or(FileError::Conflict)?;
+                if bytes.is_empty() || !sequential_pattern::matches(&bytes, seed, read) {
+                    return Err(FileError::Conflict);
+                }
+                read = read.checked_add(bytes.len() as u64).ok_or(FileError::Conflict)?;
+            }
+            if read != size as u64 {
+                return Err(FileError::Conflict);
             }
             // Remove the file so repeated samples measure a steady state
             // instead of accumulating tens of megabytes of live data.
@@ -3474,9 +3492,10 @@ async fn storage_file_tree_bench(
         },
     };
     println!(
-        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"file-tree\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":{},\"seed\":{},\"timebase_hz\":{},\"operations\":{},\"transferred_bytes\":{},\"elapsed_ticks\":{},\"latency_ticks\":{},\"recovery_ticks\":{},\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\",\"reason\":\"{}\"}}",
+        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"file-tree\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":{},\"seed\":{},\"timebase_hz\":{},\"operations\":{},\"transferred_bytes\":{},\"elapsed_ticks\":{},\"latency_ticks\":{},\"recovery_ticks\":{},\"content_pattern\":\"{}\",\"latency_scope\":\"workload\",\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\",\"reason\":\"{}\"}}",
         backend, workload, size, count, seed, crate::exec::timebase_hz(), operations,
-        transferred, elapsed, (elapsed / operations.max(1)).max(1), recovery_ticks,
+        transferred, elapsed, elapsed, recovery_ticks,
+        if workload == "file-sequential" { "splitmix64-offset-v1" } else { "legacy" },
         io.0, io.1, io.2, io.3, io.4, io.5, io.6, status, reason
     );
 }

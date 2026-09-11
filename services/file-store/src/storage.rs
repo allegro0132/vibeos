@@ -1801,6 +1801,86 @@ mod io_trace {
         backend.store.lock().unwrap().info().unwrap().generation
     }
 
+    #[test]
+    fn populated_tree_recovery_io_is_bounded() {
+        let fixture = fixture_with(100, 64);
+        let namespace = fixture.root.snapshot().namespace();
+        let (context, _quota, _maintenance) =
+            StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
+                &vibeos_segment_store::fs_typed_reference_kinds(),
+            )
+            .unwrap();
+        let mut cold =
+            SegmentStore::new_with_runtime_context(fixture.device.clone(), limits(), context);
+        block_on(cold.mount()).unwrap();
+        fixture.device.take();
+        let root = block_on(crate::FileTreeRoot::recover_persistent(
+            &cold, namespace, 4096,
+        ))
+        .unwrap()
+        .unwrap();
+        for index in 0..100 {
+            let path = crate::RelPath::parse(&alloc::format!("warm-{index:04}")).unwrap();
+            assert_eq!(root.snapshot().stat(&path, false).unwrap().size, 4096);
+        }
+        let events = fixture.device.take();
+        let mut requests = 0;
+        let mut pages = 0;
+        for event in &events {
+            if let Event::Read(_, count) = event {
+                requests += 1;
+                pages += count;
+            }
+        }
+        std::println!("tree recovery: requests={requests}, pages={pages}");
+        assert!(
+            requests < 800 && pages < 1200,
+            "metadata recovery repeated sealed segment walks: {requests} requests, {pages} pages"
+        );
+    }
+
+    #[test]
+    fn large_unique_file_io_attribution() {
+        let fixture = fixture_with(0, 64);
+        let path = crate::RelPath::parse("large-unique").unwrap();
+        let bytes: Vec<u8> = (0..16 * 1024 * 1024usize)
+            .map(|i| ((i as u64).wrapping_mul(131) ^ ((i as u64) >> 13) ^ ((i as u64) >> 21)) as u8)
+            .collect();
+        let mut stager = fixture.root.begin_content_stager(&path, false).unwrap();
+        block_on(stager.push(&bytes)).unwrap();
+        let staged = block_on(stager.finish()).unwrap();
+        report("unique-stage", &fixture.device.take());
+        let mut tx = fixture.root.begin().unwrap();
+        tx.write_staged(&path, staged).unwrap();
+        block_on(tx.commit_durable()).unwrap();
+        report("unique-commit", &fixture.device.take());
+        let reader = fixture.root.reader(&path).unwrap();
+        let mut at = 0;
+        for index in 0..reader.chunk_count() {
+            let chunk = block_on(reader.read_chunk(index)).unwrap().unwrap();
+            assert_eq!(chunk, bytes[at..at + chunk.len()]);
+            at += chunk.len();
+        }
+        assert_eq!(at, bytes.len());
+        let reads = fixture.device.take();
+        let read_pages: u64 = reads
+            .iter()
+            .map(|event| match event {
+                Event::Read(_, count) => *count,
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            read_pages * (PAGE_SIZE as u64) < bytes.len() as u64 * 5 / 4,
+            "whole-file read repeated payload verification: {read_pages} pages"
+        );
+        report("unique-read", &reads);
+        let mut tx = fixture.root.begin().unwrap();
+        tx.remove(&path, false, false).unwrap();
+        block_on(tx.commit_durable()).unwrap();
+        report("unique-remove", &fixture.device.take());
+    }
+
     /// A small file's content rides the fused tree transaction: the stager
     /// touches no media, the create is exactly one checkpoint whose slot
     /// protocol is the only barrier (three flushes, the scratch seal having

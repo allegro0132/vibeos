@@ -705,8 +705,9 @@ impl<D: PageDevice> SegmentStore<D> {
     }
 
     /// Read and validate a data node's structural prefix from its first leaf.
-    /// The header and full ancestor table always fit one leaf, so a skip-list
-    /// hop costs one verified 4 KiB read regardless of the chunk's size.
+    /// The header and full ancestor table always fit one leaf. Small nodes
+    /// use the batched whole-object verifier; large nodes keep a directed
+    /// first-leaf proof so skip-list traversal never scans their content.
     async fn read_fs_data_node_meta(
         &self,
         object: &AuthorizedObject<CasObjectHandle>,
@@ -717,8 +718,12 @@ impl<D: PageDevice> SegmentStore<D> {
                 <= vibeos_blob_format::LEAF_SIZE,
             "a data node's structural prefix must fit the first Merkle leaf",
         );
-        let first = self.get_blob_chunk(object, 0).await?;
-        let meta = decode_fs_data_node_v1_prefix(&first.bytes)?;
+        let prefix = if object.exact_len() <= 2 * vibeos_blob_format::LEAF_SIZE as u64 {
+            self.read_verified_blob(object).await?
+        } else {
+            self.get_blob_chunk(object, 0).await?.bytes
+        };
+        let meta = decode_fs_data_node_v1_prefix(&prefix)?;
         // Bind the prefix to the whole object: the recorded payload length
         // must name exactly the committed blob's byte length.
         if meta.encoded_len() as u64 != object.exact_len() {
@@ -2261,15 +2266,10 @@ impl<D: PageDevice> SegmentStore<D> {
         &self,
         object: &AuthorizedObject<CasObjectHandle>,
     ) -> Result<Vec<u8>, CasStoreError<D::Error>> {
-        let verified = self.verify_blob(object).await?;
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(object.exact_len() as usize)
-            .map_err(|_| StoreError::MemoryLimit)?;
-        for index in 0..verified.descriptor.leaf_count {
-            bytes.extend_from_slice(&self.get_blob_chunk(object, index).await?.bytes);
-        }
-        Ok(bytes)
+        // Resolve once and return only a completely verified snapshot. The
+        // former verify-then-read loop resolved each leaf again and repeated
+        // proof work after the full-object verification had already succeeded.
+        self.read_verified_blob(object).await
     }
 
     fn current_fs_root_mapping(
@@ -2806,6 +2806,67 @@ mod tests {
             block_on(store.commit_fs_btree_node(FsTreeKind::Dirent, 0, generation, &[])).unwrap();
         block_on(store.commit_fs_root(NAMESPACE, generation, next_file_id, 1, &inode, &dirent))
             .unwrap()
+    }
+
+    #[test]
+    fn whole_fs_object_read_verifies_bytes_on_every_invocation() {
+        for len in [4097usize, 131073, 600001] {
+            let device = TestDevice::blank(48);
+            let mut store = format(device.clone());
+            let expected: Vec<u8> = (0..len)
+                .map(|i| (i.wrapping_mul(137) % 251) as u8)
+                .collect();
+            let mut writer = store.begin_blob(0x5445_5354, len as u64, None).unwrap();
+            for chunk in expected.chunks(vibeos_blob_format::LEAF_SIZE) {
+                block_on(writer.write_chunk(chunk)).unwrap();
+            }
+            let object = block_on(writer.commit()).unwrap();
+            assert_eq!(
+                block_on(store.read_fs_object_bytes(&object)).unwrap(),
+                expected
+            );
+            // Corrupt a requested payload byte after a successful read on
+            // this mount. Cached metadata must not hide newly damaged content.
+            let mut media = device.media.lock().unwrap();
+            let (number, at) = media
+                .visible
+                .iter()
+                .find_map(|(number, page)| {
+                    page.windows(64)
+                        .position(|bytes| bytes == &expected[..64])
+                        .map(|at| (*number, at))
+                })
+                .expect("the canonical payload must be on media");
+            media.visible.get_mut(&number).unwrap()[at + 7] ^= 1;
+            drop(media);
+            assert!(block_on(store.read_fs_object_bytes(&object)).is_err());
+            device
+                .media
+                .lock()
+                .unwrap()
+                .visible
+                .get_mut(&number)
+                .unwrap()[at + 7] ^= 1;
+            assert_eq!(
+                block_on(store.read_fs_object_bytes(&object)).unwrap(),
+                expected
+            );
+            // The segment-chain memo must not cache manifest bytes or skip
+            // their payload hash, even after a successful dereference.
+            let mut media = device.media.lock().unwrap();
+            let (number, at) = media
+                .visible
+                .iter()
+                .find_map(|(number, page)| {
+                    page.windows(8)
+                        .position(|bytes| bytes == b"VIBEBMF2")
+                        .map(|at| (*number, at))
+                })
+                .expect("manifest must be on media");
+            media.visible.get_mut(&number).unwrap()[at + 32] ^= 1;
+            drop(media);
+            assert!(block_on(store.read_fs_object_bytes(&object)).is_err());
+        }
     }
 
     #[test]

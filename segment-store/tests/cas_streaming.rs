@@ -60,6 +60,7 @@ enum Effect {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FaultAction {
     Normal,
+    CorruptWriteAndAcknowledge,
     FailNotSubmitted,
     FailAmbiguous(Effect),
     Pending(Effect),
@@ -266,6 +267,12 @@ impl PageDevice for FaultDevice {
                 self.write_effect(page, bytes, Effect::Visible);
                 Ok(())
             }
+            FaultAction::CorruptWriteAndAcknowledge => {
+                let mut damaged = bytes;
+                damaged[7] ^= 1;
+                self.write_effect(page, damaged, Effect::Visible);
+                Ok(())
+            }
             FaultAction::FailNotSubmitted => {
                 Err(MutationFailure::not_submitted(TestError::Injected))
             }
@@ -282,7 +289,7 @@ impl PageDevice for FaultDevice {
 
     async fn flush(&self) -> Result<(), MutationFailure<Self::Error>> {
         match self.next_action() {
-            FaultAction::Normal => {
+            FaultAction::Normal | FaultAction::CorruptWriteAndAcknowledge => {
                 self.flush_effect(Effect::Durable);
                 Ok(())
             }
@@ -936,5 +943,41 @@ fn streaming_run_partial_failure_or_cancellation_never_publishes() {
             assert_eq!(recovered.generation, initial.generation);
             assert_eq!(recovered.object_count, 0);
         }
+    }
+}
+
+
+#[test]
+fn deferred_readback_never_serves_an_acknowledged_damaged_write() {
+    for deferred in [false, true] {
+        let device = FaultDevice::blank(16);
+        let mut store = format(device.clone());
+        store.set_deferred_commit_readback(deferred);
+        let length = 1024 * 1024 + 1;
+        let mut writer = store.begin_blob(OBJECT_KIND, length, None).unwrap();
+        for index in 0..15 {
+            block_on(writer.write_chunk(&pattern_chunk(index, PAGE_SIZE))).unwrap();
+        }
+        // Damage the first content page of the next submitted run while
+        // acknowledging success; subsequent barriers make that damage durable.
+        device.arm(0, FaultAction::CorruptWriteAndAcknowledge);
+        for index in 15..length.div_ceil(PAGE_SIZE as u64) {
+            let count = (length - index * PAGE_SIZE as u64).min(PAGE_SIZE as u64) as usize;
+            block_on(writer.write_chunk(&pattern_chunk(index as u32, count))).unwrap();
+        }
+        let result = block_on(writer.commit());
+        if !deferred {
+            assert!(result.is_err(), "strict commit must detect damaged media");
+            continue;
+        }
+        let object = result.expect("deferred policy does not reread committed content");
+        assert!(block_on(store.get_blob_chunk(&object, 0)).is_err());
+        assert!(block_on(store.verify_blob(&object)).is_err());
+        let runtime = store.runtime_context();
+        drop(store);
+        device.power_cycle();
+        let (cold, _) = mount_with_runtime(device, runtime);
+        assert!(block_on(cold.get_blob_chunk(&object, 0)).is_err());
+        assert!(block_on(cold.verify_blob(&object)).is_err());
     }
 }

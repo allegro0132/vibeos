@@ -1261,6 +1261,24 @@ impl Drop for V2Operation {
 }
 
 impl StorageV2Runtime {
+    // Rebuilding after an unformatted probe or a cancelled operation must
+    // retain the same kernel verification policy as the initial instance.
+    fn new_store(
+        device: CapabilityPageDevice,
+        context: StoreRuntimeContext,
+    ) -> SegmentStore<CapabilityPageDevice> {
+        let mut store = SegmentStore::new_with_runtime_context(
+            device,
+            storage_v2_store_limits(),
+            context,
+        );
+        // Every read Merkle-verifies content and boot performs a full scrub.
+        // A damaged acknowledged write is detected there rather than by an
+        // extra foreground readback of every newly committed payload page.
+        store.set_deferred_commit_readback(true);
+        store
+    }
+
     fn new(device: CapabilityPageDevice) -> Arc<Self> {
         let typed_kinds: &[u32] = if cfg!(feature = "file-tree") {
             &vibeos_segment_store::fs_typed_reference_kinds()
@@ -1272,17 +1290,7 @@ impl StorageV2Runtime {
                 typed_kinds,
             )
             .expect("fixed Storage V2 governed runtime policy is valid");
-        let mut store = SegmentStore::new_with_runtime_context(
-            device.clone(),
-            storage_v2_store_limits(),
-            context.clone(),
-        );
-        // Deferred commit read-back: every read path Merkle-verifies content
-        // and boot performs a full cold scrub, so a damaged device write is
-        // detected at first use instead of at the commit that produced it.
-        // This trades that detection window for not re-reading and re-hashing
-        // every just-written page on the foreground commit path.
-        store.set_deferred_commit_readback(true);
+        let store = Self::new_store(device.clone(), context.clone());
         let runtime = Arc::new(Self {
             store: StableSegmentStore(UnsafeCell::new(store)),
             device,
@@ -1343,11 +1351,7 @@ impl StorageV2Runtime {
             // Safety: this exact claim excludes every other access and fault
             // cleanup marked the previous task permanently detached.
             unsafe {
-                *self.store.0.get() = SegmentStore::new_with_runtime_context(
-                    self.device.clone(),
-                    storage_v2_store_limits(),
-                    self.context.clone(),
-                );
+                *self.store.0.get() = Self::new_store(self.device.clone(), self.context.clone());
             }
             system.restore();
             *self.authority.lock() = None;

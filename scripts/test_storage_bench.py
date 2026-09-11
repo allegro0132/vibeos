@@ -109,6 +109,53 @@ class StorageBenchTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.ValidationError, "cannot replace"):
             MODULE.require_baseline_evidence([incompatible], pathlib.Path("unused"), pathlib.Path("unused"))
 
+    def test_content_pattern_identity_is_preserved_and_mixing_rejected(self):
+        sample = {"schema": "vibeos.storage-bench.sample", "version": 1,
+                  "backend": "storage-v2", "layer": "file-tree", "workload": "file-sequential",
+                  "object_bytes": 4096, "seed": 7, "timebase_hz": 1000,
+                  "latency_ticks": 10, "latency_ns": 10, "sample_index": 0, "warmup": False,
+                  "content_pattern": "splitmix64-offset-v1", "latency_scope": "workload", "status": "ok"}
+        env = {"git_commit": "1234567", "qemu_version": "qemu", "qemu_args": [], "cache_state": "unknown"}
+        record = MODULE.convert_guest_sample(sample, run_id="r", vm_index=0,
+                 sample_index=0, warmup=False, seed=7, env=env)
+        linux = MODULE.convert_linux_sample(dict(sample, backend="linux-ext4"),
+                 run_id="linux", vm_index=0, env=env)
+        self.assertEqual(record["environment"]["content_pattern"], "splitmix64-offset-v1")
+        self.assertEqual(record["environment"]["latency_scope"], "workload")
+        self.assertNotIn("content_pattern", env)
+        with self.assertRaisesRegex(MODULE.ValidationError, "latency scopes"):
+            MODULE.summaries([record, dict(linux, environment={**env, "content_pattern": "splitmix64-offset-v1"})])
+        self.assertEqual(len(MODULE.summaries([record, linux])), 2)
+        with self.assertRaisesRegex(MODULE.ValidationError, "content patterns"):
+            MODULE.summaries([record, dict(linux, environment=env)])
+
+    def test_sequential_pattern_matches_rust_and_c_and_detects_corruption(self):
+        import json
+        import shutil
+        import subprocess
+        import tempfile
+        if not shutil.which("rustc") or not shutil.which("cc"):
+            self.skipTest("cross-language pattern check requires rustc and cc")
+        root = SCRIPT.parent.parent
+        source = (root / "benchmarks/storage/linux/package/storage-bench-agent/src/storage-bench-agent.c").read_text()
+        c = source.split("// BEGIN offset-addressed")[1].split("// END offset-addressed")[0]
+        c = c[c.index("static uint64_t"):]
+        cases = [(0, 0), (19, 1), (19, 7), (19, 4095), (2**64-1, 3*1024*1024)]
+        with tempfile.TemporaryDirectory() as tmp:
+            d = pathlib.Path(tmp)
+            c += "\nint main(void) { unsigned char b[129];\n"
+            r = '#[path = ' + json.dumps(str(root / "kernel/src/storage_bench_pattern.rs")) + '] mod pattern;\nuse std::io::Write;\nfn main() { let mut b = [0u8;129];\n'
+            for seed, offset in cases:
+                c += f"sequential_pattern(b,129,UINT64_C({seed}),{offset},false); assert(sequential_pattern(b,129,UINT64_C({seed}),{offset},true)); fwrite(b,1,129,stdout); b[7]^=1; assert(!sequential_pattern(b,129,UINT64_C({seed}),{offset},true));\n"
+                r += f"pattern::fill(&mut b,{seed},{offset}); assert!(pattern::matches(&b,{seed},{offset})); std::io::stdout().write_all(&b).unwrap(); b[7]^=1; assert!(!pattern::matches(&b,{seed},{offset}));\n"
+            (d / "pattern.c").write_text("#include <stdint.h>\n#include <stdbool.h>\n#include <stdio.h>\n#include <assert.h>\n" + c + "return 0;}\n")
+            (d / "pattern.rs").write_text(r + "}\n")
+            subprocess.run(["cc", "-Wall", "-Wextra", "-Werror", str(d / "pattern.c"), "-o", str(d / "c")], check=True, capture_output=True)
+            subprocess.run(["rustc", "--edition=2021", str(d / "pattern.rs"), "-o", str(d / "rust")], check=True, capture_output=True)
+            actual = subprocess.check_output([str(d / "rust")])
+            self.assertEqual(actual, subprocess.check_output([str(d / "c")]))
+            self.assertEqual(len(actual), 129 * len(cases))
+
 
 if __name__ == "__main__":
     unittest.main()

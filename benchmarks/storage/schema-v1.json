@@ -51,6 +51,8 @@
         "host_os": { "type": "string" },
         "qemu_args": { "type": "array", "items": { "type": "string" } },
         "cache_state": { "enum": ["cold", "warm", "mixed", "unknown"] },
+        "latency_scope": {"enum": ["workload"]},
+        "content_pattern": {"enum": ["legacy", "splitmix64-offset-v1"]},
         "storage_throttle": {
           "type": "object",
           "additionalProperties": false,

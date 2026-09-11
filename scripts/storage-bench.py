@@ -98,6 +98,11 @@ def validate_record(record: dict[str, Any]) -> None:
                 "invalid storage throttle profile")
         require(all(type(value) is int and value >= 0 for value in profile.values()),
                 "invalid storage throttle rate")
+    if "latency_scope" in environment:
+        require(environment["latency_scope"] == "workload", "invalid latency scope")
+    if "content_pattern" in environment:
+        require(environment["content_pattern"] in ("legacy", "splitmix64-offset-v1"),
+                "invalid content pattern")
     if record["status"] == "ok":
         require(any(name in record["metrics"] for name in TIMED_METRICS),
                 "ok record has no timed metric")
@@ -293,6 +298,9 @@ def convert_guest_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
         result["object_count"] = sample["object_count"]
     if "content_class" in sample:
         result["content_class"] = sample["content_class"]
+    for name in ("content_pattern", "latency_scope"):
+        if name in sample:
+            result["environment"] = {**result["environment"], name: sample[name]}
     validate_record(result)
     return result
 
@@ -354,6 +362,9 @@ def convert_linux_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
         result["object_count"] = sample["object_count"]
     if "content_class" in sample:
         result["content_class"] = sample["content_class"]
+    for name in ("content_pattern", "latency_scope"):
+        if name in sample:
+            result["environment"] = {**result["environment"], name: sample[name]}
     validate_record(result)
     return result
 
@@ -673,6 +684,8 @@ def coordinate(record: dict[str, Any], metric: str) -> tuple[Any, ...]:
 def summaries(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[tuple[Any, ...], list[float]] = defaultdict(list)
     profiles: dict[tuple[Any, ...], tuple[int, ...]] = {}
+    patterns: dict[tuple[Any, ...], str] = {}
+    scopes: dict[tuple[Any, ...], str] = {}
     for record in records:
         if record["warmup"] or record["status"] != "ok":
             continue
@@ -688,6 +701,12 @@ def summaries(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
             shared_key = key[1:]
             require(profiles.setdefault(shared_key, signature) == signature,
                     "incompatible storage throttle profiles for the same coordinate")
+            pattern = record["environment"].get("content_pattern", "legacy")
+            require(patterns.setdefault(shared_key, pattern) == pattern,
+                    "incompatible content patterns for the same coordinate")
+            scope = record["environment"].get("latency_scope", "legacy")
+            require(scopes.setdefault(shared_key, scope) == scope,
+                    "incompatible latency scopes for the same coordinate")
             groups[key].append(float(value))
     result = []
     for key, values in sorted(groups.items(), key=lambda item: str(item[0])):

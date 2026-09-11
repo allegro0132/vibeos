@@ -28,7 +28,6 @@ use crate::exec::{self, WaitQueue};
 use crate::heap::{AllocationDomain, ArenaId};
 use crate::plic;
 use crate::sync::SpinLock;
-use crate::virtio::{self, ENTROPY_QUEUE_SIZE};
 use crate::virtio_mmio::MmioTransport;
 use crate::world::Space;
 use crate::entropy_device::Engine;
@@ -223,7 +222,7 @@ impl RandomSource {
             online: control.online,
             quarantined: control.quarantined,
             max_request_bytes: MAX_RANDOM_BYTES as u16,
-            queue_size: ENTROPY_QUEUE_SIZE,
+            queue_size: vibeos_hal::entropy::device().queue_size,
             session_epoch: control.epoch,
             irq: control.transport.map_or(0, MmioTransport::irq),
             used_interrupts: USED_INTERRUPT_COUNT.load(Ordering::Acquire),
@@ -844,7 +843,7 @@ impl DriverSession {
         if !authority_live(self.transport) {
             return Err(RandomError::AuthorityRevoked);
         }
-        let _ = virtio::InterruptCauses::from_status(IRQ_CAUSES.swap(0, Ordering::AcqRel));
+        let _ = IRQ_CAUSES.swap(0, Ordering::AcqRel);
         if !self.engine.operational() {
             self.engine.require_reset();
             self.reset_required_transport()?;
@@ -1116,17 +1115,17 @@ async fn wait_for_completion(
 
 fn irq_top_half(transport_base: usize, _irq_entry: u64) {
     let causes = acknowledge_irq_transport(transport_base);
-    if causes != 0 {
-        if virtio::InterruptCauses::from_status(causes).used_buffer() {
+    if causes.completion || causes.state_changed {
+        if causes.completion {
             USED_INTERRUPT_COUNT.fetch_add(1, Ordering::Relaxed);
         }
-        IRQ_CAUSES.fetch_or(causes, Ordering::Release);
+        IRQ_CAUSES.fetch_or(u32::from(causes.completion) | (u32::from(causes.state_changed) << 1), Ordering::Release);
         IRQ_WAIT.wake_all();
         REQUEST_WAIT.wake_all();
     }
 }
 
-fn acknowledge_irq_transport(transport_base: usize) -> u32 {
+fn acknowledge_irq_transport(transport_base: usize) -> vibeos_hal::entropy::Events {
     // SAFETY: QEMU's BSP identity-maps every VirtIO transport for the firmware
     // lifetime and assigns this fixed slot only to the entropy device. PLIC
     // teardown may leave one copied handler in flight, but concurrent W1C

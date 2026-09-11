@@ -1,0 +1,52 @@
+{
+  "status": "Entropy event/queue boundary refactored; native Mars service remains pending",
+  "host_hal_driver_tests": 40,
+  "firmware_event_tests": 1,
+  "qemu_selftest_checks": 390,
+  "qemu_rng_smoke": "modern VirtIO RNG discovered, started, queue 8 epoch 1; no random request issued",
+  "mutations": [
+    "config mistaken for completion: detected",
+    "unknown status notification lost: detected"
+  ],
+  "physical_acceptance": false,
+  "sd_images_rebuilt": false,
+  "blind_spots": [
+    "Random-request IRQ completion was not exercised by the capability-description smoke test",
+    "Discovery and DMA/polling ownership still require native entropy integration",
+    "No Mars entropy qualification or production SSH enabled"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage46-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage46-events.log",
+      "sha256": "af13aa289db5def742c9f1ed7d598cf979484dcd7952b86caf0bc037e9d9cd35"
+    },
+    {
+      "path": "target/mars-reference/stage46-host.log",
+      "sha256": "e2c39a1219fd1da9107ccd3b6ee5b9b16c0c56cb8e74efcce4b737d057137e34"
+    },
+    {
+      "path": "target/mars-reference/stage46-mutation-completion.log",
+      "sha256": "6f98ae4fa19a17089ce2da85fcf8f7e228907fce813ddc7588e585c2b1ea297b"
+    },
+    {
+      "path": "target/mars-reference/stage46-mutation-unknown.log",
+      "sha256": "f92c3b8af4cbc9978d058d40f283db136fc923a97d258ed3a619b25136a22977"
+    },
+    {
+      "path": "target/mars-reference/stage46-qemu-build.log",
+      "sha256": "82392a981295c0b221cbfc2732880c08af03e3086ef29c9005e5918fda41efaa"
+    },
+    {
+      "path": "target/mars-reference/stage46-qemu-selftest.log",
+      "sha256": "a2e33c54eef0a0ae8ebe7b8d3cb69e077f2f5bf2499ee05232596697978b9ac2"
+    },
+    {
+      "path": "target/mars-reference/stage46-rng-device.log",
+      "sha256": "ca0d0a651c99d942ddebc41613db9161b4ea7a1a45e8dd479fa6c5a7f8cc1e36"
+    }
+  ]
+}

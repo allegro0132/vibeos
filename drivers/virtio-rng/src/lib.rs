@@ -144,6 +144,7 @@ unsafe impl Sync for StableDma {}
 #[cfg_attr(target_os = "none", link_section = ".dma")]
 static DMA: StableDma = StableDma(UnsafeCell::new(DmaSlab::ZERO));
 
+pub const QUEUE_SIZE: u16 = ENTROPY_QUEUE_SIZE;
 pub const DMA_BYTES: usize = core::mem::size_of::<DmaSlab>();
 
 pub struct Engine {

@@ -1306,3 +1306,26 @@ the requirement, accepting failed stop and ignoring partial duplicates are
 detected. Evidence is in `boards/milkv-mars/trng-serial-evidence.json`.
 These tests use synthetic logs/PTYs only; no physical serial port was opened
 and no SD image needed rebuilding for this host-side change.
+
+### Entropy event and queue descriptions
+
+The HAL entropy operation table now reports controller-independent completion
+and state-change events, plus the device queue capacity. QEMU firmware converts
+the acknowledged VirtIO bits; the kernel no longer parses those bits or imports
+the fixed VirtIO entropy queue size. Unexpected non-completion status still
+wakes the policy layer to recheck operational/request state. Neither event
+itself authorizes returning bytes. Existing capability names, invocation checks,
+timeouts and quarantine policy remain compatible.
+
+HAL/driver host tests and the firmware conversion test pass, including mutations
+that confuse configuration with completion or drop unknown notifications.
+QEMU passes its 390-check selftest golden. A modern VirtIO RNG device also
+discovers, starts and publishes the existing random capability with queue 8
+and epoch 1. That smoke test does not issue random requests and does not prove
+the interrupt completion path. Evidence is in
+`boards/milkv-mars/entropy-events-evidence.json`.
+
+This removes two protocol assumptions from the policy layer. Discovery,
+polling completion, non-DMA instance ownership and Mars entropy qualification
+still require further work; no Mars production random service or new SD image
+is delivered by this change.

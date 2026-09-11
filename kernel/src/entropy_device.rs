@@ -1,6 +1,6 @@
 //! Exclusive invocation token for firmware-owned entropy hardware.
 use crate::virtio_mmio::MmioTransport;
-use vibeos_hal::entropy::{device, Error, Submission};
+use vibeos_hal::entropy::{device, Error, Events, Submission};
 pub struct Engine(());
 impl Engine {
     /// # Safety
@@ -43,7 +43,7 @@ impl Engine {
 pub unsafe fn confirmed_reset(t: MmioTransport, budget: usize) -> bool {
     (device().confirmed_reset)(t.slot(), t.base(), budget)
 }
-pub unsafe fn acknowledge_interrupt_at(base: usize) -> u32 {
+pub unsafe fn acknowledge_interrupt_at(base: usize) -> Events {
     (device().acknowledge)(base)
 }
 pub fn dma_base() -> usize {

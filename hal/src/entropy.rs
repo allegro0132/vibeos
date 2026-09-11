@@ -16,6 +16,14 @@ pub struct Submission {
     pub serial: u64,
 }
 pub const MAX_RANDOM_BYTES: usize = 64;
+/// Controller-independent IRQ observations. Firmware translates and acknowledges
+/// hardware status before returning; no register bit encoding crosses into the
+/// kernel. Neither event is proof that a request completed successfully.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Events {
+    pub completion: bool,
+    pub state_changed: bool,
+}
 /// # Safety
 /// Every operation except `acknowledge` requires exclusive ownership of the
 /// instance and its DMA pool. Completion reads may not race mutation. The IRQ
@@ -23,6 +31,8 @@ pub const MAX_RANDOM_BYTES: usize = 64;
 /// are copied only at finish; no caller pointer may be published to hardware.
 /// A failed reset retains DMA ownership until a later confirmed reset.
 pub struct EntropyDevice {
+    /// Hardware queue capacity for diagnostics, not the kernel request limit.
+    pub queue_size: u16,
     pub dma_base: fn() -> usize,
     pub dma_bytes: usize,
     pub prepare: unsafe fn(usize, usize, u64, usize) -> Result<(), Error>,
@@ -37,7 +47,7 @@ pub struct EntropyDevice {
     pub reset_and_prepare: unsafe fn(u64, usize) -> Result<(), Error>,
     pub shutdown: unsafe fn(usize) -> Result<(), Error>,
     pub confirmed_reset: unsafe fn(usize, usize, usize) -> bool,
-    pub acknowledge: unsafe fn(usize) -> u32,
+    pub acknowledge: unsafe fn(usize) -> Events,
 }
 extern "Rust" {
     static VIBEOS_ENTROPY_DEVICE: EntropyDevice;

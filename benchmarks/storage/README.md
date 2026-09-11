@@ -1103,3 +1103,126 @@ expanded correctness cases and ignored
 `unique_128k_file_batch_commit_and_cold_recovery` control are retained. Evidence
 is in `target/storage-batch-sample-filter-20260911/`; its `candidate.elf` is a
 compiled but rejected experiment, not a qualified QEMU performance result.
+
+### Unique-file batch QEMU control (2026-09-11)
+
+`file-batch-create-unique` creates distinct deterministic content using the
+SplitMix64 offset pattern, commits one transaction, and validates every byte of
+every file through its reader. Its timed scope includes generation, staging,
+commit and full readback. It has a separate workload name from the existing
+shared-payload, commit-only batch test. The guest bounds it to 100 files and
+128 KiB per file (nonempty input); this does not qualify 1,000 unique files.
+
+Eight fresh 128 MiB QEMU runs use seed 32, 4/2 MiB/s and 400/200 IOPS. At each
+size the order is early dedup enabled / disabled / disabled / enabled, one
+sample per VM, without warmups. All pass full readback:
+
+| 100-file workload | Enabled median | Disabled median | Reads | Writes | Flushes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4 KiB per file | 2.691077 s | 2.624491 s | 476 / 2,691,072 B | 34 / 3,223,552 B | 4 |
+| 128 KiB per file | 17.824328 s | 17.609923 s | 3,600 / 15,237,120 B | 138 / 16,416,768 B | 7 |
+
+Each row's I/O is identical across all four runs. Two samples per variant do
+not establish a small timing regression or speedup. The full-workload medians
+are about 2.5% and 1.2% higher with early dedup; the duplicate-content benefit
+must still not be generalized to these inputs. The Raw file-data reader calls
+`get_blob_chunk` per 4 KiB, unlike the batched whole-node Stream reader. This
+is a candidate for reducing sequential read requests; these aggregate counters
+do not independently attribute every request to that path.
+
+Evidence and both ELF hashes: `target/storage-qemu-unique-batch-20260911/`.
+The disabled guard was restored and the standard target ELF restored from the
+enabled build. These tests validate in-boot readback, not cold remount or SD
+hardware performance; the host unique-file controls separately cover cold
+recovery.
+
+### Read authenticated payloads in bounded page runs (2026-09-11)
+
+The unique batch investigation traced the request count below the file reader:
+fused content uses the FS Stream codec and already reaches whole-node reads,
+but `read_pointer_payload_after_scan` fetched its payload one page at a time.
+An explicit sequential reader API did not change the QEMU I/O counts and was
+removed, including its WASI and shell call-site changes. That rejected
+experiment is recorded in `target/storage-raw-read-batch-20260911/`.
+
+The payload reader now issues runs of at most 32 pages (128 KiB) directly into
+the final byte allocation using safe array slices. Only a partial final page
+uses the previous one-page temporary buffer. No additional recovery workspace
+or data cache is introduced. Pointer/extent binding, exact page count and full
+payload SHA-256 validation precede exposure of the result; media errors still
+discard the incomplete result. The on-disk format and write barriers are
+unchanged. This benefits existing whole-payload consumers without a new file
+reader API.
+
+Fresh 128 MiB QEMU samples use the same 100-file unique workload, seed 32,
+4/2 MiB/s and 400/200 IOPS. Each size runs before / after / after / before:
+
+| Size per file | Before median | After median | Read requests before / after |
+| --- | ---: | ---: | ---: |
+| 4 KiB | 2.722473 s | 2.719284 s | 476 / 476 |
+| 128 KiB | 17.704007 s | 12.441084 s | 3,600 / 500 |
+
+All eight samples pass full readback. The 128 KiB workload has 86.1% fewer
+read requests and about 29.7% lower observed median total time. Each variant
+has two fresh-VM samples; this is not a physical-SD latency claim. Read bytes
+(15,237,120), write bytes (16,416,768), write requests (138) and flushes (seven)
+are identical for the 128 KiB workload. The 4 KiB counters are also unchanged.
+
+All 188 segment-store unit tests pass, including post-read content corruption
+and publication fault tests. The 100 x 128 KiB unique host cold-recovery test
+passes, and Duo production file-tree compilation passes. Logs, ELF hashes and
+summary: `target/storage-payload-read-runs-20260911/`.
+
+The production file-tree QEMU gate also passes all three boots after this
+change: hard links, symbolic links, recursive removal, GC pressure, cold
+recovery and powered-off independent verification. Its boot logs and verifier
+reports are included in the same evidence directory.
+
+### Batch authority snapshot reads during recovery (2026-09-11)
+
+`read_pointer_authority_payload` now uses the same bounded 128 KiB direct-read
+helper as ordinary payloads. Each extent fills a slice of the final, pre-reserved
+snapshot buffer instead of allocating a second extent-sized buffer and copying
+it. The existing maximum snapshot size, extent-chain checks, each extent's
+SHA-256 and the final chain hash are retained. No larger recovery budget, extra
+cache or on-disk change is required.
+
+The host `large_object_append_and_cold_recover` fixture appends three distinct
+1 MiB objects and recovers a multi-extent authority chain spanning segments.
+Its counting device now reports cold mount and subsequent authority recovery
+separately. A control restores only the old per-page authority I/O loop:
+
+| Phase | Per-page control requests | Batched requests | Read bytes, both |
+| --- | ---: | ---: | ---: |
+| Cold mount | 2,031 | 266 | 9,695,232 |
+| Subsequent authority recovery | 66 | 66 | 3,514,368 |
+
+Cold mount issues 86.9% fewer reads in this fixture. The regression requires
+fewer than 512 cold-mount requests and still checks recovery of all three
+objects. This is host device-call attribution, not measured SD latency or a
+QEMU boot-time speedup. The control keeps the new allocation layout to isolate
+I/O grouping and is removed after the comparison.
+
+All 188 unit tests and five fused append recovery tests pass, including the
+multi-extent publication path. The cold recovery fixture passes again with
+the request-count guard enabled. Evidence:
+`target/storage-authority-read-runs-20260911/`.
+
+Duo production file-tree compilation and the three-boot QEMU file-tree gate
+also pass, including GC pressure, cold recovery and powered-off independent
+verification. Their logs and boot verifier reports are in the same directory.
+
+### Payload read failure boundaries (2026-09-11)
+
+The shared direct-read helper now has a regression covering ten lengths: empty,
+single-byte, page tails, exact pages, the 128 KiB boundary, and two full runs
+plus a partial page. It verifies contiguous addresses, exact page coverage and
+the 32-page request ceiling. For each request in each nonempty case, a fake
+device writes the first page of the transfer and then reports an error. All
+15 injected failures propagate without issuing later requests; retrying with
+the failure removed returns all expected bytes. This qualifies error handling
+of the helper, not cancellation or a physical device's DMA behavior.
+
+The new test and the SDHCI 4/16/128 KiB multiblock command-size contract test
+pass. No production behavior changed in this validation step. Evidence:
+`target/storage-payload-read-errors-20260911/`.

@@ -2327,23 +2327,12 @@ async fn read_pointer_payload_after_scan<D: PageDevice>(
         return Err(StoreError::Corrupt);
     }
     let exact_len = usize::try_from(pointer.exact_byte_len).map_err(|_| StoreError::Corrupt)?;
-    let mut bytes = vec![0; exact_len];
-    let mut copied = 0;
-    for index in 0..pointer.payload_pages {
-        let mut page = Box::new([0; PAGE_SIZE]);
-        device
-            .read_page(
-                base + u64::from(pointer.payload_relative_page) + u64::from(index),
-                page.as_mut(),
-            )
-            .await
-            .map_err(StoreError::Device)?;
-        let remaining = exact_len - copied;
-        let take = remaining.min(PAGE_SIZE);
-        bytes[copied..copied + take].copy_from_slice(&page[..take]);
-        copied += take;
+    if exact_len.div_ceil(PAGE_SIZE) != pointer.payload_pages as usize {
+        return Err(StoreError::Corrupt);
     }
-    if copied != exact_len || payload_sha256(&bytes) != pointer.payload_sha256 {
+    let mut bytes = vec![0; exact_len];
+    read_payload_into(device, base + u64::from(pointer.payload_relative_page), &mut bytes).await?;
+    if payload_sha256(&bytes) != pointer.payload_sha256 {
         return Err(StoreError::Corrupt);
     }
     Ok(ResolvedPayload {
@@ -2353,6 +2342,31 @@ async fn read_pointer_payload_after_scan<D: PageDevice>(
         previous_segment: scanned.previous_segment,
         header_target_checkpoint_generation: scanned.header_target_checkpoint_generation,
     })
+}
+
+async fn read_payload_into<D: PageDevice>(
+    device: &D,
+    payload_first: u64,
+    bytes: &mut [u8],
+) -> Result<(), StoreError<D::Error>> {
+    // Read full pages directly into the final payload allocation. This keeps
+    // the recovery memory bound unchanged while issuing up to 128 KiB per
+    // request instead of allocating/copying one temporary page per read.
+    let (pages, tail) = bytes.as_chunks_mut::<PAGE_SIZE>();
+    let full_pages = pages.len();
+    for (index, chunk) in pages.chunks_mut(32).enumerate() {
+        device.read_pages(payload_first + (index * 32) as u64, chunk)
+            .await.map_err(StoreError::Device)?;
+    }
+    if !tail.is_empty() {
+        let mut page = Box::new([0; PAGE_SIZE]);
+        device
+            .read_page(payload_first + full_pages as u64, page.as_mut())
+            .await
+            .map_err(StoreError::Device)?;
+        tail.copy_from_slice(&page[..tail.len()]);
+    }
+    Ok(())
 }
 
 fn recovery_remaining<E>(limit: usize, resident: usize) -> Result<usize, StoreError<E>> {
@@ -2676,29 +2690,22 @@ pub(crate) async fn read_pointer_authority_payload<D: PageDevice>(
         let exact_len =
             usize::try_from(extent.payload_byte_len).map_err(|_| StoreError::Corrupt)?;
         let base = segment_base_page(extent.binding.segment_no)?;
-        let mut chunk = Vec::new();
-        chunk
-            .try_reserve_exact(exact_len)
-            .map_err(|_| StoreError::MemoryLimit)?;
-        let mut copied = 0;
-        for index in 0..extent.payload_pages {
-            let mut page = Box::new([0; PAGE_SIZE]);
-            device
-                .read_page(
-                    base + u64::from(extent.payload_first_relative_page) + u64::from(index),
-                    page.as_mut(),
-                )
-                .await
-                .map_err(StoreError::Device)?;
-            let remaining = exact_len - copied;
-            let take = remaining.min(PAGE_SIZE);
-            chunk.extend_from_slice(&page[..take]);
-            copied += take;
-        }
-        if copied != exact_len || payload_sha256(&chunk) != extent.payload_sha256 {
+        if exact_len.div_ceil(PAGE_SIZE) != extent.payload_pages as usize {
             return Err(StoreError::Corrupt);
         }
-        bytes.extend_from_slice(&chunk);
+        let start = bytes.len();
+        let end = start.checked_add(exact_len).ok_or(StoreError::Corrupt)?;
+        if end > total {
+            return Err(StoreError::Corrupt);
+        }
+        bytes.resize(end, 0);
+        let chunk = &mut bytes[start..end];
+        read_payload_into(
+            device, base + u64::from(extent.payload_first_relative_page), chunk,
+        ).await?;
+        if payload_sha256(chunk) != extent.payload_sha256 {
+            return Err(StoreError::Corrupt);
+        }
     }
     if bytes.len() != total || payload_sha256(&bytes) != records[0].merkle_root {
         return Err(StoreError::Corrupt);
@@ -4386,6 +4393,112 @@ fn _mutation_is_ambiguous<E>(failure: &MutationFailure<E>) -> bool {
 const _: () = {
     assert!(CATALOG_ENTRY_LEN <= PAGE_SIZE);
 };
+
+#[cfg(test)]
+mod payload_read_tests {
+    use super::*;
+    use core::cell::{Cell, RefCell};
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+
+    struct Device {
+        calls: RefCell<Vec<(u64, usize)>>,
+        fail_at: Cell<Option<usize>>,
+    }
+
+    impl PageDevice for Device {
+        type Error = ();
+        fn info(&self) -> crate::device::PageDeviceInfo {
+            unreachable!()
+        }
+        async fn write_page(&self, _: u64, _: &Page) -> Result<(), MutationFailure<()>> {
+            unreachable!()
+        }
+        async fn flush(&self) -> Result<(), MutationFailure<()>> {
+            unreachable!()
+        }
+        async fn read_page(&self, first: u64, out: &mut Page) -> Result<(), ()> {
+            self.read_pages(first, core::slice::from_mut(out)).await
+        }
+        async fn read_pages(&self, first: u64, out: &mut [Page]) -> Result<(), ()> {
+            let index = self.calls.borrow().len();
+            self.calls.borrow_mut().push((first, out.len()));
+            // Drivers may modify the DMA buffer before reporting failure.
+            for (page_index, page) in out.iter_mut().enumerate() {
+                for (byte_index, byte) in page.iter_mut().enumerate() {
+                    *byte = (((first as usize + page_index) * PAGE_SIZE + byte_index) % 251) as u8;
+                }
+                if self.fail_at.get() == Some(index) {
+                    return Err(());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn run<F: Future>(future: F) -> F::Output {
+        let mut future = Box::pin(future);
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("memory device unexpectedly yielded"),
+        }
+    }
+
+    #[test]
+    fn payload_runs_bound_requests_and_propagate_partial_transfer_errors() {
+        for len in [
+            0,
+            1,
+            PAGE_SIZE - 1,
+            PAGE_SIZE,
+            PAGE_SIZE + 1,
+            31 * PAGE_SIZE,
+            32 * PAGE_SIZE,
+            32 * PAGE_SIZE + 1,
+            33 * PAGE_SIZE + 19,
+            64 * PAGE_SIZE + 3,
+        ] {
+            let device = Device {
+                calls: RefCell::new(Vec::new()),
+                fail_at: Cell::new(None),
+            };
+            let expected: Vec<u8> = (0..len)
+                .map(|i| ((7 * PAGE_SIZE + i) % 251) as u8)
+                .collect();
+            let mut bytes = vec![0; len];
+            run(read_payload_into(&device, 7, &mut bytes)).unwrap();
+            assert_eq!(bytes, expected);
+            let calls = device.calls.borrow().clone();
+            let mut next = 7;
+            for &(first, count) in &calls {
+                assert_eq!(first, next);
+                assert!((1..=32).contains(&count));
+                next += count as u64;
+            }
+            assert_eq!(next - 7, len.div_ceil(PAGE_SIZE) as u64);
+            if len == 64 * PAGE_SIZE + 3 {
+                assert_eq!(calls, [(7, 32), (39, 32), (71, 1)]);
+            }
+            for failure in 0..calls.len() {
+                device.calls.borrow_mut().clear();
+                device.fail_at.set(Some(failure));
+                bytes.fill(0);
+                assert!(matches!(
+                    run(read_payload_into(&device, 7, &mut bytes)),
+                    Err(StoreError::Device(()))
+                ));
+                assert_eq!(device.calls.borrow().len(), failure + 1);
+                device.calls.borrow_mut().clear();
+                device.fail_at.set(None);
+                run(read_payload_into(&device, 7, &mut bytes)).unwrap();
+                assert_eq!(bytes, expected);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod transition_tests {

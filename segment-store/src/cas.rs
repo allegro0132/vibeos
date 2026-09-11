@@ -186,6 +186,13 @@ pub(crate) struct SpanSnapshotDevice<'a, D> {
 }
 
 impl<'a, D: PageDevice> SpanSnapshotDevice<'a, D> {
+    fn buffered_page(&self, page: u64) -> Option<&Page> {
+        self.spans.iter().find_map(|(first, pages)| {
+            page.checked_sub(*first).and_then(|offset| usize::try_from(offset).ok())
+                .and_then(|offset| pages.get(offset))
+        })
+    }
+
     pub(crate) async fn capture(
         inner: &'a D,
         ranges: &[(u64, u64)],
@@ -228,6 +235,32 @@ impl<D: PageDevice> PageDevice for SpanSnapshotDevice<'_, D> {
         self.inner.read_page(page, output).await
     }
 
+    async fn read_pages(&self, first: u64, output: &mut [Page]) -> Result<(), Self::Error> {
+        // Preserve the single-page view on overflowing ranges as well; the
+        // inner device remains responsible for reporting invalid addresses.
+        if first.checked_add(output.len() as u64).is_none() {
+            for (index, page) in output.iter_mut().enumerate() {
+                self.read_page(first.saturating_add(index as u64), page).await?;
+            }
+            return Ok(());
+        }
+        let mut index = 0;
+        while index < output.len() {
+            if let Some(page) = self.buffered_page(first + index as u64) {
+                output[index].copy_from_slice(page);
+                index += 1;
+                continue;
+            }
+            let start = index;
+            index += 1;
+            while index < output.len() && self.buffered_page(first + index as u64).is_none() {
+                index += 1;
+            }
+            self.inner.read_pages(first + start as u64, &mut output[start..index]).await?;
+        }
+        Ok(())
+    }
+
     async fn write_page(
         &self,
         page: u64,
@@ -250,6 +283,11 @@ pub(crate) struct SinkOverlayDevice<'a, D> {
 }
 
 impl<'a, D> SinkOverlayDevice<'a, D> {
+    fn buffered_page(&self, page: u64) -> Option<&Page> {
+        self.sink.and_then(|sink| sink.entries.iter().rev()
+            .find(|(sunk, _)| *sunk == page).map(|(_, bytes)| bytes.as_ref()))
+    }
+
     pub(crate) fn new(inner: &'a D, sink: Option<&'a PageSink>) -> Self {
         Self { inner, sink }
     }
@@ -271,6 +309,32 @@ impl<D: PageDevice> PageDevice for SinkOverlayDevice<'_, D> {
             }
         }
         self.inner.read_page(page, output).await
+    }
+
+    async fn read_pages(&self, first: u64, output: &mut [Page]) -> Result<(), Self::Error> {
+        // Preserve the single-page view on overflowing ranges as well; the
+        // inner device remains responsible for reporting invalid addresses.
+        if first.checked_add(output.len() as u64).is_none() {
+            for (index, page) in output.iter_mut().enumerate() {
+                self.read_page(first.saturating_add(index as u64), page).await?;
+            }
+            return Ok(());
+        }
+        let mut index = 0;
+        while index < output.len() {
+            if let Some(page) = self.buffered_page(first + index as u64) {
+                output[index].copy_from_slice(page);
+                index += 1;
+                continue;
+            }
+            let start = index;
+            index += 1;
+            while index < output.len() && self.buffered_page(first + index as u64).is_none() {
+                index += 1;
+            }
+            self.inner.read_pages(first + start as u64, &mut output[start..index]).await?;
+        }
+        Ok(())
     }
 
     async fn write_page(

@@ -540,12 +540,20 @@ fn large_object_append_and_cold_recover() {
     }
     drop(store);
     // Cold recovery must reassemble the multi-extent authority payload.
+    device.epoch_counters();
     let (runtime, _quota, _provisioner) = runtime_ctx();
     let mut cold = SegmentStore::new_with_runtime_context(device.clone(), large_limits, runtime);
     block_on(cold.mount()).unwrap_or_else(|error| panic!("cold mount: {:?}", error));
+    let mount_io = device.epoch_counters();
+    assert!(mount_io.read_requests < 512,
+        "cold authority recovery regressed to per-page I/O: {} requests", mount_io.read_requests);
     let recovered =
         block_on(cold.recover_persistent_authority(root_policy_commitment(POLICY))).unwrap();
     assert_eq!(recovered.objects().len(), 3);
+    let authority_io = device.epoch_counters();
+    println!("cold-mount: {} requests, {} bytes; authority-recover: {} requests, {} bytes",
+        mount_io.read_requests, mount_io.read_bytes,
+        authority_io.read_requests, authority_io.read_bytes);
 }
 
 #[test]

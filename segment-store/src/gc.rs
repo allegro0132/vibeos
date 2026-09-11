@@ -44,8 +44,9 @@ use crate::authority_snapshot::{
     encode_persistent_authority_snapshot, AuthoritySnapshotError, PersistentAuthoritySnapshot,
 };
 use crate::cas::{
-    build_record, flush, read_manifest_range, verify_manifest_blob, write_page,
-    write_payload_records_with_header, CasObjectHandle, CasStoreError, FinalRecord,
+    build_record, flush, read_manifest_range, sink_or_write_page, verify_manifest_blob,
+    write_page, write_payload_records_with_header, CasObjectHandle, CasStoreError, FinalRecord,
+    PageSink,
 };
 use crate::cas_codec::{
     decode_blob_manifest, encode_blob_manifest, encode_cas_snapshot, BlobKey, BlobManifest,
@@ -1721,7 +1722,20 @@ pub(crate) struct SegmentBuilder {
     header_seal: Option<Box<Page>>,
     summary: SegmentSummaryAccumulator,
     previous: Option<(u64, u64, [u8; 32])>,
+    /// Buffered writes of the segment under construction. Relocation copies
+    /// one extent record at a time; without buffering every record cost
+    /// three single-page device requests (descriptor body, seal, payload),
+    /// which on a PIO SD card is the dominant cost of a collection round.
+    /// The buffer drains as contiguous ascending runs when it fills and
+    /// when the segment seals; nothing reads a target segment before that.
+    sink: PageSink,
+    /// Free segments whose final seal page the previous publication proved
+    /// durably zero, so opening them needs no zero-write and no flush.
+    cleared_seals: alloc::collections::BTreeSet<u64>,
 }
+
+/// Buffered segment pages (256 KiB) before a relocation drain.
+const SEGMENT_BUILDER_SINK_PAGES: usize = 64;
 
 #[derive(Clone, Copy)]
 pub(crate) struct SegmentPayload<'a> {
@@ -1842,9 +1856,25 @@ impl SegmentBuilder {
                 state.next_segment_generation,
             ),
             previous: state.last_segment,
+            sink: PageSink::new(),
+            cleared_seals: state.durably_cleared_seals.clone(),
         };
         builder.open(device, first).await?;
         Ok(builder)
+    }
+
+    /// Write every buffered page as contiguous runs.
+    async fn drain_sink<D: PageDevice>(
+        &mut self,
+        device: &D,
+    ) -> Result<(), GcStoreError<D::Error>> {
+        if self.sink.len() == 0 {
+            return Ok(());
+        }
+        core::mem::replace(&mut self.sink, PageSink::new())
+            .drain(device)
+            .await?;
+        Ok(())
     }
 
     fn segment_generation(&self) -> Result<u64, GcError> {
@@ -1861,17 +1891,30 @@ impl SegmentBuilder {
         let segment_generation = self.segment_generation()?;
         let base = segment_base_page(segment_no).map_err(StoreError::Format)?;
         // An unsealed target is never authoritative. Exact-zero the final seal
-        // before writing payload and verify the zero write durably.
+        // before writing payload and verify the zero write durably — unless
+        // the previous publication already proved this seal durably zero, in
+        // which case the read-back alone re-establishes the fact.
         let zero = heap_page();
-        write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &zero).await?;
-        flush(device).await?;
-        let mut observed = heap_page();
-        device
-            .read_page(base + u64::from(SEGMENT_SEAL_PAGE), &mut observed)
-            .await
-            .map_err(StoreError::Device)?;
-        if observed != zero {
-            return Err(GcError::Corrupt.into());
+        let mut proven = self.cleared_seals.remove(&segment_no);
+        if proven {
+            let mut observed = heap_page();
+            device
+                .read_page(base + u64::from(SEGMENT_SEAL_PAGE), &mut observed)
+                .await
+                .map_err(StoreError::Device)?;
+            proven = observed == zero;
+        }
+        if !proven {
+            write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &zero).await?;
+            flush(device).await?;
+            let mut observed = heap_page();
+            device
+                .read_page(base + u64::from(SEGMENT_SEAL_PAGE), &mut observed)
+                .await
+                .map_err(StoreError::Device)?;
+            if observed != zero {
+                return Err(GcError::Corrupt.into());
+            }
         }
         let (previous_segment_no, previous_segment_generation, previous_hash) =
             self.previous.unwrap_or((ANCHOR_SEGMENT_NO, 0, [0; 32]));
@@ -1931,9 +1974,11 @@ impl SegmentBuilder {
                 self.header_digest.ok_or(GcError::Corrupt)?,
                 self.summary,
                 flush_final_seal,
+                &mut self.sink,
             )
             .await?,
         );
+        self.drain_sink(device).await?;
         Ok(())
     }
 
@@ -2005,8 +2050,18 @@ impl SegmentBuilder {
         // Every SegmentBuilder consumer publishes a checkpoint before its
         // segments become referenced; that slot protocol's first flush is the
         // shared durability barrier for all deferred phases below.
-        write_payload_records_with_header(device, base, header, &[(&record, bytes)], true, None)
-            .await?;
+        write_payload_records_with_header(
+            device,
+            base,
+            header,
+            &[(&record, bytes)],
+            true,
+            Some(&mut self.sink),
+        )
+        .await?;
+        if self.sink.len() >= SEGMENT_BUILDER_SINK_PAGES {
+            self.drain_sink(device).await?;
+        }
         self.relative = self
             .relative
             .checked_add(record.value.record_span_pages)
@@ -2114,7 +2169,18 @@ impl SegmentBuilder {
         let header = header_pages
             .as_ref()
             .map(|(body, seal)| (body.as_ref(), seal.as_ref()));
-        write_payload_records_with_header(device, base, header, &writes, true, None).await?;
+        write_payload_records_with_header(
+            device,
+            base,
+            header,
+            &writes,
+            true,
+            Some(&mut self.sink),
+        )
+        .await?;
+        if self.sink.len() >= SEGMENT_BUILDER_SINK_PAGES {
+            self.drain_sink(device).await?;
+        }
         let mut pointers = Vec::new();
         pointers
             .try_reserve_exact(records.len())
@@ -2165,6 +2231,7 @@ async fn finalize_accumulated_segment<D: PageDevice>(
     header_digest: BodyDigest,
     accumulated: SegmentSummaryAccumulator,
     flush_final_seal: bool,
+    sink: &mut PageSink,
 ) -> Result<(u64, u64, [u8; 32]), GcStoreError<D::Error>> {
     if accumulated.record_count == 0
         || accumulated.first_target_checkpoint_generation == 0
@@ -2225,10 +2292,14 @@ async fn finalize_accumulated_segment<D: PageDevice>(
     encode_record_seal(seal_digest, &mut final_seal).map_err(StoreError::Format)?;
     // Deferred like the commit path: no checkpoint can name this segment
     // until the caller's slot protocol flushes, which covers every phase.
-    write_page(device, base + u64::from(SUMMARY_BODY_PAGE), &summary_body).await?;
-    write_page(device, base + u64::from(SUMMARY_SEAL_PAGE), &summary_seal).await?;
-    write_page(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE), &seal_body).await?;
-    write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &final_seal).await?;
+    sink_or_write_page(device, Some(&mut *sink), base + u64::from(SUMMARY_BODY_PAGE), &summary_body)
+        .await?;
+    sink_or_write_page(device, Some(&mut *sink), base + u64::from(SUMMARY_SEAL_PAGE), &summary_seal)
+        .await?;
+    sink_or_write_page(device, Some(&mut *sink), base + u64::from(SEGMENT_SEAL_BODY_PAGE), &seal_body)
+        .await?;
+    sink_or_write_page(device, Some(&mut *sink), base + u64::from(SEGMENT_SEAL_PAGE), &final_seal)
+        .await?;
     let _ = flush_final_seal;
     Ok((segment_no, segment_generation, seal_digest.body_sha256()))
 }

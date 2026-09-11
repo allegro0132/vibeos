@@ -1473,6 +1473,43 @@ mod io_trace {
         for (key, (count, pages)) in read_by_region {
             std::println!("  R {key}: {count} requests, {} KiB", pages * 4);
         }
+        let mut distinct: BTreeMap<u64, u64> = BTreeMap::new();
+        for event in events {
+            if let Event::Read(first, count) = event {
+                for page in *first..*first + *count {
+                    *distinct.entry(page).or_insert(0) += 1;
+                }
+            }
+        }
+        let repeated: u64 = distinct.values().map(|n| n - 1).sum();
+        let mut classes: BTreeMap<&str, u64> = BTreeMap::new();
+        for (page, count) in &distinct {
+            if *count < 2 {
+                continue;
+            }
+            let class = if *page < ANCHOR_PAGES {
+                "anchor"
+            } else {
+                match (*page - ANCHOR_PAGES) % SEGMENT_PAGES {
+                    0 | 1 => "segment header",
+                    1020..=1023 => "summary/seal",
+                    _ => "descriptor or payload",
+                }
+            };
+            *classes.entry(class).or_insert(0) += count - 1;
+        }
+        for (class, count) in classes {
+            std::println!("  R repeats in {class}: {count} pages");
+        }
+        if !distinct.is_empty() {
+            std::println!(
+                "  R distinct pages={} ({} KiB), repeated page reads={} ({} KiB)",
+                distinct.len(),
+                distinct.len() * 4,
+                repeated,
+                repeated * 4
+            );
+        }
     }
 
     impl PageDevice for TraceDevice {
@@ -1606,7 +1643,11 @@ mod io_trace {
     fn fixture(warm: u32) -> Fixture {
         const NAMESPACE: u128 = 0x5649_4245_4f53_2d54_5241_4345_5f49_4f31;
         const POLICY: &[u8] = b"io trace policy v1";
-        let device = TraceDevice::blank(256);
+        let segments: u64 = std::env::var("VIBE_IO_TRACE_SEGMENTS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(256);
+        let device = TraceDevice::blank(segments);
         let (context, _quota, provisioner) =
             StoreRuntimeContext::governed_with_typed_reference_kinds_and_maintenance_provisioner(
                 &vibeos_segment_store::fs_typed_reference_kinds(),
@@ -1643,7 +1684,28 @@ mod io_trace {
             block_on(tx.commit_durable()).unwrap();
             done += batch;
         }
-        device.take();
+        let warm_events = device.take();
+        if std::env::var("VIBE_IO_TRACE_WARM_REPORT").is_ok() {
+            let single_page_writes = warm_events
+                .iter()
+                .filter(|event| matches!(event, Event::Write(_, 1)))
+                .count();
+            let (mut writes, mut pages, mut flushes) = (0_u64, 0_u64, 0_u64);
+            for event in &warm_events {
+                match event {
+                    Event::Write(_, count) => {
+                        writes += 1;
+                        pages += count;
+                    }
+                    Event::Flush => flushes += 1,
+                    Event::Read(..) => {}
+                }
+            }
+            std::println!(
+                "== warm phase: writes={writes} ({} KiB, {single_page_writes} single-page) flushes={flushes}",
+                pages * 4
+            );
+        }
         Fixture { device, root, backend }
     }
 

@@ -155,6 +155,15 @@ Three engine changes on branch `wasm_threads` (measured against the
   published handles are bound after the checkpoint. A small create or
   overwrite is one checkpoint.
 
+- **Batched collection writes** (`segment-store/src/gc.rs`,
+  `SegmentBuilder::sink`). Relocation copied one extent record at a time
+  as three single-page device requests (descriptor body, seal, payload);
+  the builder now buffers a segment's pages and drains them as contiguous
+  runs when 64 pages accumulate and when the segment seals. A round that
+  relocated a segment of live nodes went from 986 write requests to 36 at
+  identical bytes. Nothing reads a relocation target before its seal, and
+  the pre-cleared seal set also spares the target-open flush.
+
 Per create+fsync+unlink sample (host trace, in-memory device; the QEMU
 `counters` are now per-sample deltas — the file-tree bench previously
 reported cumulative-since-boot telemetry):
@@ -169,18 +178,21 @@ matter for the SD-card target are the flush and byte counts above):
 
 | coordinate | before | after |
 |---|---:|---:|
-| object put 4 KiB | 26.9 ms | 12.7 ms |
+| object put 4 KiB | 26.9 ms | 12.7 / 28.5 / 31.1 ms (three runs) |
 | object range-get / revoke 4 KiB | 26.6 / 29.3 ms | 16.5 / 13.2 ms |
-| create+fsync+unlink 4 KiB | 22.4 ms | 20.9 ms |
-| overwrite 4 KiB | 27.3 ms | 23.5 ms |
-| directory of 100 files | 32.0 ms | 23.5 ms |
+| create+fsync+unlink 4 KiB | 22.4 ms | 20.9 / 24.6 ms (two runs) |
+| overwrite 4 KiB | 27.3 ms | 23.5 / 25.7 / 24.7 ms (three runs) |
+| directory of 100 files | 32.0 ms | 23.5 / 27.0 ms (two runs) |
 | sequential write 64 / 256 MiB | 3.96 / 14.95 s | 3.66 / 14.01 s |
 
-Raw block coordinates are unchanged. The bimodal outlier on durable
-object commits (one sample in five 3-8x above the rest) persists and is
-unrelated to these changes. Remaining per-commit costs, in order: the
+Raw block coordinates are unchanged. On QEMU the latency deltas are
+inside run-to-run variance (a 5-sample run moves 10-20% between
+sessions, and the bimodal outlier on durable object commits — one sample
+in five 3-8x above the rest — persists and is unrelated to these
+changes); the flush and byte reductions above are the durable result. Remaining per-commit costs, in order: the
 frozen 2-page descriptor pair per extent and the 3-extent split of every
 small blob (about 60% of a small fused segment), the full CAS catalog
 snapshot rewritten per checkpoint (31 pages at ~1200 objects; the format's
-replay-record mechanism could carry deltas), and GC relocation writing one
-page per request.
+replay-record mechanism could carry deltas), and the per-round mark walk, which reads
+about three distinct pages per live node (manifest, first leaf, tree page)
+and therefore stays O(live objects) until marking becomes incremental.

@@ -84,7 +84,12 @@ impl PageSink {
         }
     }
 
-    fn push<E>(&mut self, page: u64, bytes: &Page) -> Result<(), StoreError<E>> {
+    /// Pages staged and not yet drained.
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn push<E>(&mut self, page: u64, bytes: &Page) -> Result<(), StoreError<E>> {
         self.entries
             .try_reserve(1)
             .map_err(|_| StoreError::MemoryLimit)?;
@@ -148,7 +153,7 @@ impl PageSink {
     }
 }
 
-async fn sink_or_write_page<D: PageDevice>(
+pub(crate) async fn sink_or_write_page<D: PageDevice>(
     device: &D,
     sink: Option<&mut PageSink>,
     page: u64,

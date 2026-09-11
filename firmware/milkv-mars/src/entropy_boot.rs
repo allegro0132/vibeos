@@ -1,4 +1,5 @@
-//! One-shot, boot-hart-only hardware diagnostic. Never publishes entropy.
+//! Boot-hart native owner installation and optional one-shot diagnostic.
+//! Installing an owner does not prepare hardware or credit entropy.
 use core::{
     fmt,
     sync::atomic::{AtomicBool, Ordering},
@@ -33,7 +34,7 @@ fn fence() {
 /// firmware must have relinquished ALL SEC clients and their DMA/interrupts.
 /// This composition owns the entire shared domain; no crypto/security-DMA
 /// driver is present. Shared root clocks remain stable through final stop.
-pub unsafe fn run(write: fn(&str)) {
+pub unsafe fn install(write: fn(&str)) -> u32 {
     if CLAIMED.swap(true, Ordering::AcqRel) {
         halt(
             write,
@@ -88,6 +89,16 @@ pub unsafe fn run(write: fn(&str)) {
     )
     .unwrap();
     super::entropy::install(vibeos_firmware_milkv_mars::entropy_instance::Instance::new(domain, trng));
+    // No prepare/submit occurs in device-only assembly. The kernel receives
+    // epoch zero and a fresh request namespace if source admission later allows it.
+    hz
+}
+
+/// # Safety
+/// Boot hart only, after install and before kernel claims or secondary harts.
+/// The installed owner is exclusively accessible here through its operation table.
+#[cfg(feature = "trng-probe")]
+pub unsafe fn probe(write: fn(&str), hz: u32) {
     let table = &super::VIBEOS_ENTROPY_DEVICE;
     let endpoint = (table.discover)().expect("admitted TRNG source").endpoint;
     let prepared = (table.prepare)(endpoint.slot, endpoint.base, 1, super::entropy::POLL_BUDGET);

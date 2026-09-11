@@ -61,8 +61,16 @@ service images can compose that device independently. The existing `ethernet`
 feature is a compatibility alias selecting `ethernet-device` plus the DHCP/iperf3
 service image; `--ethernet` build and SD packaging commands keep that behavior.
 
-A native link check combining `ethernet-device,trng-probe` with
+A native link check combining `ethernet-device,entropy-device` with
 `vibeos-kernel/provisioned-command` verifies the generic command service can be
-assembled without a benchmark service conflict. The diagnostic TRNG source is
-still unapproved and stopped, so this is not an operational SSH/WASM image or
+assembled without a benchmark service conflict. The TRNG source is
+still unapproved and unstarted, so this is not an operational SSH/WASM image or
 entropy qualification. No service profile bypasses firmware source admission.
+
+`entropy-device` admits the DTB resources, masks the PLIC source, checks the
+parent clock and installs the retained SEC/TRNG owner. It performs no SEC reset
+or entropy command and preserves epoch zero for kernel startup. The existing
+`trng-probe` feature includes `entropy-device` and explicitly exercises the
+installed owner before stopping it. Both modes remain `DiagnosticOnly` at HAL
+discovery; neither enables production entropy or SSH. Complete SEC ownership
+handoff and physical source qualification are still required.

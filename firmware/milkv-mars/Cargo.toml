@@ -12,7 +12,10 @@ ethernet-device = ["dep:vibeos-eqos-net", "dep:vibeos-ethernet"]
 # Compatibility profile used by --ethernet build/package commands.
 ethernet = ["ethernet-device", "vibeos-kernel?/dhcp-iperf3-server"]
 
-trng-probe = ["dep:vibeos-starfive-trng", "vibeos-kernel?/queued-entropy"]
+# Install a retained, unstarted native owner; source approval is separate.
+entropy-device = ["dep:vibeos-starfive-trng", "vibeos-kernel?/queued-entropy"]
+# Compatibility diagnostic explicitly exercises and stops that owner at boot.
+trng-probe = ["entropy-device"]
 
 [lib]
 path = "src/lib.rs"
@@ -20,7 +23,7 @@ path = "src/lib.rs"
 [[test]]
 name = "entropy_model"
 path = "tests/entropy_model.rs"
-required-features = ["trng-probe"]
+required-features = ["entropy-device"]
 
 [[bin]]
 name = "vibeos-milkv-mars"

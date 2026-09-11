@@ -1631,3 +1631,35 @@ builds and passes its ELF check.
 Evidence: `boards/milkv-mars/ethernet-service-separation-evidence.json`. The
 stage-54 SD image is unchanged; no new SD image or production SSH profile was
 published in this stage.
+
+### Unstarted entropy device handoff (stage 57)
+
+The Mars `entropy-device` feature now owns DTB admission, native HAL assembly
+and boot installation independently of `trng-probe`. Boot installation checks
+the parent clock, masks the PLIC source and stores the exclusive SEC/TRNG owner;
+it does not call prepare, reset, reseed or generate. The table retains epoch zero
+and an unused request namespace. This supplies the unstarted handoff required
+by a future qualified service profile, without changing source approval.
+
+The compatibility `trng-probe` feature includes the device and explicitly invokes
+the existing two-block diagnostic through the table, then confirms stop. The
+boot helper is now `firmware/milkv-mars/src/entropy_boot.rs`, with separate
+installation and optional probe entry points. Diagnostic output and build-script
+flags remain compatible. Both feature modes return `DiagnosticOnly` on discovery
+and therefore do not publish a cryptographic random capability or SSH service.
+
+A native release link with
+`ethernet-device,entropy-device,vibeos-kernel/provisioned-command` passes the
+Ethernet ELF contract check without compiling the boot-probe success path. The
+resolved feature set excludes `trng-probe`. Host and RV64 table models verify
+that installation leaves epoch, generated-block count, reset and child gates at
+zero; inserting an eager prepare into installation fails the test. Four QEMU
+harts pass all 395 selftests. The compatibility diagnostic payload and serial
+collector regressions also pass. A clock-rate return-type mismatch found by the
+first target build was corrected; its failed log is retained as evidence.
+
+Evidence: `boards/milkv-mars/entropy-handoff-evidence.json`. The models exercise
+production instance/table code with simulated registers; they cannot establish
+real bootloader SEC relinquishment, parent-clock stability or entropy quality.
+Native linking is not physical execution, authentication or WASM acceptance.
+No SD image was repacked and no source approval was granted in this stage.

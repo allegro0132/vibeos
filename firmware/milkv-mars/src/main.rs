@@ -19,17 +19,17 @@ extern crate vibeos_kernel;
 #[path = "../../early_devices.rs"]
 mod early_devices;
 mod storage;
-#[cfg(feature = "trng-probe")]
-mod trng_probe;
-#[cfg(feature = "trng-probe")]
+#[cfg(feature = "entropy-device")]
+mod entropy_boot;
+#[cfg(feature = "entropy-device")]
 mod entropy;
-#[cfg(feature = "trng-probe")]
+#[cfg(feature = "entropy-device")]
 #[no_mangle]
 pub static VIBEOS_ENTROPY_DEVICE: vibeos_hal::entropy::EntropyDevice = entropy::DEVICE;
-#[cfg(feature = "trng-probe")]
+#[cfg(feature = "entropy-device")]
 type NativeEntropyInstance = vibeos_firmware_milkv_mars::entropy_instance::Instance<
     vibeos_platform_jh7110::security::Mmio, vibeos_starfive_trng::Mmio>;
-#[cfg(feature = "trng-probe")]
+#[cfg(feature = "entropy-device")]
 fn entropy_description() -> Option<vibeos_hal::device_transport::Descriptor> {
     let r = admission().trng?;
     Some(vibeos_hal::device_transport::Descriptor {
@@ -85,8 +85,12 @@ const NETWORK_DRIVER_NAME: &str = "unavailable (serial/SD profile)";
 #[cfg(feature = "ethernet-device")]
 const NETWORK_DRIVER_NAME: &str = "JH7110 EQoS / YT8531";
 unsafe fn platform_init(_write: fn(&str)) {
-    #[cfg(feature = "trng-probe")]
-    trng_probe::run(_write);
+    #[cfg(feature = "entropy-device")]
+    {
+        let _parent_hz = entropy_boot::install(_write);
+        #[cfg(feature = "trng-probe")]
+        entropy_boot::probe(_write, _parent_hz);
+    }
 }
 unsafe fn platform_report(print: fn(core::fmt::Arguments<'_>)) {
     print(format_args!("MARS_BOOT_ADMISSION PASS boot={} harts={} timebase={} heap_regions={} SBI=HSM,IPI,RFENCE,TIME\n",

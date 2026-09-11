@@ -140,6 +140,12 @@ fn table_model() { unsafe {
     assert_eq!((table.prepare)(0, 0x1600c000, 1, provider::POLL_BUDGET), Err(Error::Unsupported));
     let m = &*TABLE_MODEL.0.get();
     provider::install(m.instance());
+    assert_eq!((table.epoch)(), 0);
+    assert!(!(table.operational)());
+    assert_eq!(m.generated.get(), 0);
+    assert_eq!(m.reset.get(), 0);
+    assert_eq!(m.gates[0].get(), 0);
+    assert_eq!(m.gates[1].get(), 0);
     assert_eq!((table.prepare)(1, 0x1600c000, 1, provider::POLL_BUDGET), Err(Error::Unsupported));
     assert_eq!((table.prepare)(0, 0x1600d000, 1, provider::POLL_BUDGET), Err(Error::Unsupported));
     assert_eq!((table.prepare)(0, 0x1600c000, 1, 0), Err(Error::Unsupported));

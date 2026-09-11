@@ -2,7 +2,7 @@
 //! Mars composition policy. Host tests exercise admission and data-only block
 //! translation; only the binary performs SBI calls or real device accesses.
 pub mod partition;
-#[cfg(feature = "trng-probe")]
+#[cfg(feature = "entropy-device")]
 pub mod entropy_instance;
 #[cfg(feature = "ethernet-device")]
 pub mod packet;
@@ -54,9 +54,9 @@ pub fn admit(
     let network = Some(mars::network_resources::admit(dtb).map_err(|_| BootError::InvalidDtb)?);
     #[cfg(not(feature = "ethernet-device"))]
     let network = None;
-    #[cfg(feature = "trng-probe")]
+    #[cfg(feature = "entropy-device")]
     let trng = Some(mars::trng_resources::admit(dtb).map_err(|_| BootError::InvalidDtb)?);
-    #[cfg(not(feature = "trng-probe"))]
+    #[cfg(not(feature = "entropy-device"))]
     let trng = None;
     Ok(Admission {
         harts,
@@ -91,13 +91,13 @@ mod tests {
         assert_eq!(result.network.unwrap().mac, AddressRange::new(0x16030000, 0x16040000));
         #[cfg(not(feature = "ethernet-device"))]
         assert!(result.network.is_none());
-        #[cfg(feature = "trng-probe")]
+        #[cfg(feature = "entropy-device")]
         {
             assert_eq!(result.trng.unwrap().registers, mars::TRNG_REGISTERS);
             let without_trng = include_bytes!("../../../boards/milkv-mars/tests/fixtures/network.dtb");
             assert!(matches!(admit(without_trng, &request, all), Err(BootError::InvalidDtb)));
         }
-        #[cfg(not(feature = "trng-probe"))]
+        #[cfg(not(feature = "entropy-device"))]
         assert!(result.trng.is_none());
         assert_eq!(result.harts.ids(), &[4, 1, 2, 3]);
         assert_eq!(result.heap.ranges().last().unwrap().end, mars::RAM.end);

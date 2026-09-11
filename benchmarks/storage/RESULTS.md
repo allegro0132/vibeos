@@ -265,3 +265,22 @@ QEMU medians (two independent runs each): create+fsync+unlink 4 KiB
 sequential 16 MiB unchanged (709 / 730 ms isolated) and object put 128 KiB
 unchanged (138.6 ms). Goldens `storage_v2`, `storage_v2_native` and the
 three-boot file-tree acceptance pass.
+
+## 2026-09-11 (later still): compact Blob layout
+
+The last CPU item was the frozen three-extent split of every small Blob
+(header / content / tree), each extent costing a descriptor pair — two
+4 KiB pages, one of them SHA-256 hashed — plus a page-rounded payload. The
+manifest ABI now admits a **compact layout**: a Blob whose complete
+canonical encoding fits one extent (up to 1 MiB) may be stored as exactly
+one extent carrying header, content, and tree contiguously; readers locate
+bytes by encoded offset, so both layouts decode the identical canonical
+Blob. The writer assembles every sink-buffered Blob (up to 256 KiB) in
+memory and emits the compact form; deduplication compares complete
+encodings across layouts; the codec, scrub, the powered-off verifiers, and
+the format document accept both. Existing canonical-split Blobs remain
+valid; images holding compact manifests need readers at or after this
+revision.
+
+Effect on a small fused create (host trace, 8 files): segment pages
+60 → 37, bytes 276 → 180 KiB, transaction wall 1.15 → 0.84 ms.

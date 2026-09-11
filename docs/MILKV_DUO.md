@@ -660,6 +660,9 @@ file-tree QEMU case's powered-off verifier.
   just published (twice), and namespace encoding is linear instead of
   quadratic in the file count — both were pure CPU and card reads that
   grew with `@home`.
+  Small Blobs now use the compact single-extent layout, so each tree node
+  or small file costs one descriptor pair instead of three (about 40%
+  fewer segment pages per transaction and correspondingly less SHA-256).
   Collection rounds batch their relocation writes into contiguous runs
   (986 → 36 device requests for one relocated segment). Both matter far
   more on 1-bit PIO SD than on QEMU's RAM-backed disk. Later rounds in one

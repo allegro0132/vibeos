@@ -199,16 +199,26 @@ impl FaultDevice {
         file.flush().expect("raw image flush must succeed");
     }
 
+    /// Flip one byte `byte_offset` past the first occurrence of `prefix`.
+    /// The canonical split starts content and tree on page boundaries; the
+    /// compact layout places them at 32-byte aligned offsets after the
+    /// 128-byte header, so search every aligned offset of every page.
     fn flip_durable_page_with_prefix(&self, prefix: &[u8], byte_offset: usize) {
         let mut media = self.0.lock().unwrap();
-        let page_no = media
+        let (page_no, at) = media
             .durable
             .iter()
-            .find(|(_, page)| page.starts_with(prefix))
-            .map(|(page_no, _)| *page_no)
+            .find_map(|(page_no, page)| {
+                (0..PAGE_SIZE)
+                    .step_by(32)
+                    .find(|offset| page[*offset..].starts_with(prefix))
+                    .map(|offset| (*page_no, offset))
+            })
             .expect("expected canonical Blob page was not found");
-        let page = media.durable.get_mut(&page_no).unwrap();
-        page[byte_offset] ^= 0x80;
+        let target = at + byte_offset;
+        let (page_no, target) = (page_no + (target / PAGE_SIZE) as u64, target % PAGE_SIZE);
+        let page = media.durable.get_mut(&page_no).expect("target page is durable");
+        page[target] ^= 0x80;
         let page = *page;
         media.visible.insert(page_no, page);
     }

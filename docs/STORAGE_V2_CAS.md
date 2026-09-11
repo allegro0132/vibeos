@@ -245,7 +245,7 @@ exactly one Blob mapping.
 | `0x0e` | 2 | reserved | All zero |
 | `0x10` | `0x40` | BlobKey | Must match the owning Blob mapping |
 | `0x50` | 8 | encoded Blob length | Exact canonical geometry |
-| `0x58` | 4 | extent count | Exactly `ceil(exact_len / 1 MiB) + 2`; 2 through 66 |
+| `0x58` | 4 | extent count | Exactly `ceil(exact_len / 1 MiB) + 2` (2 through 66), or 1 for the compact layout |
 | `0x5c` | 4 | reserved | All zero |
 | `0x60` | 8 | extent table offset | `0x80` |
 | `0x68` | 8 | manifest encoded length | `0x80 + count * 0x80` |
@@ -267,9 +267,19 @@ immediately follows the header, with no prefix, gap, or suffix.
 
 All manifest pointers MUST be pairwise non-conflicting. Their exact logical
 ranges MUST cover `[0, encoded_blob_len)` once, in order, without overlap, gap,
-or suffix. Entry 0 MUST be the 128-byte header; entries 1 through
-`content_extent_count` MUST be the canonical content split; the final entry
-MUST be the complete tree and no other bytes.
+or suffix. In the canonical split, entry 0 MUST be the 128-byte header;
+entries 1 through `content_extent_count` MUST be the canonical content split;
+the final entry MUST be the complete tree and no other bytes. Since 2026-09-11
+a Blob whose complete canonical encoding fits one extent
+(`encoded_len <= 1 MiB`) MAY instead use the **compact layout**: exactly one
+extent (`extent_index` 0, `extent_count` 1, `encoded_offset` 0,
+`payload_byte_len == encoded_len`) carrying header, content, and tree
+contiguously. Readers locate every byte by encoded offset, so both layouts
+decode the identical canonical Blob; the compact form halves a small Blob's
+descriptor pairs. The writer uses it for every sink-buffered Blob (encoded
+length up to 256 KiB). Deduplication across layouts compares the complete
+canonical encodings. Images holding compact manifests require readers and
+verifiers at or after this revision.
 
 ### CAS snapshot header ABI (`0x80` bytes)
 

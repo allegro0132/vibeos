@@ -901,6 +901,10 @@ pub struct BlobWriter<'a, D: PageDevice> {
     content_hashers: Vec<Sha256>,
     header_hash: Option<Hash>,
     tree_hash: Option<Hash>,
+    /// Compact layout: the complete canonical encoding assembled in memory
+    /// and written as one extent at finish (see `compact_layout_admitted`).
+    compact: Option<Vec<u8>>,
+    compact_hash: Option<Hash>,
     prepared: bool,
     mutated: bool,
     failed: bool,
@@ -1445,6 +1449,11 @@ impl<D: PageDevice> SegmentStore<D> {
         // larger blobs stream payload pages directly to their own segments.
         let cursor =
             batch_cursor.filter(|_| geometry.encoded_len() as u64 <= SMALL_BLOB_SINK_LIMIT);
+        // Sink-buffered blobs are assembled in memory anyway, so they take
+        // the compact single-extent layout: one descriptor pair instead of
+        // three, and one payload hash instead of header/content/tree hashes.
+        let compact = geometry.encoded_len() as u64 <= SMALL_BLOB_SINK_LIMIT
+            && crate::cas_codec::compact_layout_admitted(exact_len)?;
         let (mut extents, mut segments, mut owned_from) = plan_scratch_with_cursor(
             current.superblock.binding.store_uuid,
             cursor,
@@ -1452,6 +1461,7 @@ impl<D: PageDevice> SegmentStore<D> {
             current.next_segment_generation,
             checkpoint_generation,
             geometry,
+            compact,
         )?;
         let fresh_segments = segments
             .len()
@@ -1472,13 +1482,18 @@ impl<D: PageDevice> SegmentStore<D> {
                 current.next_segment_generation,
                 checkpoint_generation,
                 geometry,
+                compact,
             )?;
         }
         let state = self.mounted.take().ok_or(StoreError::NotMounted)?;
         self.poisoned = true;
-        let content_count = usize::try_from(geometry.exact_len())
-            .map_err(|_| StoreError::ObjectTooLarge)?
-            .div_ceil(CANONICAL_CONTENT_EXTENT_LEN as usize);
+        let content_count = if compact {
+            0
+        } else {
+            usize::try_from(geometry.exact_len())
+                .map_err(|_| StoreError::ObjectTooLarge)?
+                .div_ceil(CANONICAL_CONTENT_EXTENT_LEN as usize)
+        };
         let mut content_hashers = Vec::new();
         content_hashers
             .try_reserve_exact(content_count)
@@ -1486,9 +1501,23 @@ impl<D: PageDevice> SegmentStore<D> {
         for _ in 0..content_count {
             content_hashers.push(Sha256::new());
         }
-        let tree_page_count = usize::try_from(geometry.tree_len())
-            .map_err(|_| StoreError::ObjectTooLarge)?
-            .div_ceil(PAGE_SIZE);
+        let compact_buffer = if compact {
+            let mut buffer = Vec::new();
+            buffer
+                .try_reserve_exact(geometry.encoded_len())
+                .map_err(|_| StoreError::MemoryLimit)?;
+            buffer.resize(geometry.encoded_len(), 0);
+            Some(buffer)
+        } else {
+            None
+        };
+        let tree_page_count = if compact {
+            0
+        } else {
+            usize::try_from(geometry.tree_len())
+                .map_err(|_| StoreError::ObjectTooLarge)?
+                .div_ceil(PAGE_SIZE)
+        };
         let mut tree_pages = Vec::new();
         tree_pages
             .try_reserve_exact(tree_page_count)
@@ -1516,6 +1545,8 @@ impl<D: PageDevice> SegmentStore<D> {
             content_hashers,
             header_hash: None,
             tree_hash: None,
+            compact: compact_buffer,
+            compact_hash: None,
             prepared: false,
             mutated: false,
             failed: false,
@@ -2170,11 +2201,21 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
         if let Some(hasher) = self.content_hashers.get_mut(content_slot) {
             hasher.update(bytes);
         }
-        let mut page = heap_page();
-        page[..bytes.len()].copy_from_slice(bytes);
-        if let Err(error) = self.write_exact_page(content_offset, &page).await {
-            self.failed = true;
-            return Err(error);
+        if let Some(buffer) = self.compact.as_mut() {
+            let at = usize::try_from(content_offset).map_err(|_| StoreError::Corrupt)?;
+            let end = at.checked_add(bytes.len()).ok_or(StoreError::Corrupt)?;
+            if end > buffer.len() {
+                self.failed = true;
+                return Err(StoreError::Corrupt.into());
+            }
+            buffer[at..end].copy_from_slice(bytes);
+        } else {
+            let mut page = heap_page();
+            page[..bytes.len()].copy_from_slice(bytes);
+            if let Err(error) = self.write_exact_page(content_offset, &page).await {
+                self.failed = true;
+                return Err(error);
+            }
         }
         if let Err(error) = self.drain_emissions().await {
             self.failed = true;
@@ -2312,6 +2353,15 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
                 .ok()
                 .and_then(|offset| offset.checked_add(tree_relative))
                 .ok_or(StoreError::Corrupt)?;
+            if let Some(buffer) = self.compact.as_mut() {
+                let at = usize::try_from(encoded_offset).map_err(|_| StoreError::Corrupt)?;
+                let end = at.checked_add(HASH_SIZE).ok_or(StoreError::Corrupt)?;
+                if end > buffer.len() {
+                    return Err(StoreError::Corrupt.into());
+                }
+                buffer[at..end].copy_from_slice(&emission.hash);
+                continue;
+            }
             let (_extent, within) =
                 find_scratch_extent(&self.extents, encoded_offset, HASH_SIZE as u64)?;
             let tree_page =
@@ -2435,6 +2485,34 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             return Err(CasStoreError::ExpectedRootMismatch);
         }
 
+        if let Some(buffer) = self.compact.as_mut() {
+            buffer[..HEADER_SIZE].copy_from_slice(&streaming.header);
+            self.compact_hash = Some(Sha256::digest(buffer.as_slice()).into());
+            let extent = self
+                .extents
+                .first()
+                .cloned()
+                .ok_or(CasStoreError::WriterFailed)?;
+            let base = segment_base_page(extent.segment_no)?;
+            for (index, chunk) in buffer.chunks(PAGE_SIZE).enumerate() {
+                let mut page = heap_page();
+                page[..chunk.len()].copy_from_slice(chunk);
+                let physical = base
+                    .checked_add(u64::from(extent.payload_relative_page))
+                    .and_then(|page| page.checked_add(index as u64))
+                    .ok_or(StoreError::Corrupt)?;
+                sink_or_write_page(&self.store.device, self.staged_sink.as_mut(), physical, &page)
+                    .await?;
+            }
+            if !defer_barriers {
+                self.store
+                    .device
+                    .flush()
+                    .await
+                    .map_err(StoreError::Mutation)?;
+            }
+            return Ok(streaming.descriptor.root);
+        }
         let mut header_page = heap_page();
         header_page[..HEADER_SIZE].copy_from_slice(&streaming.header);
         self.header_hash = Some(Sha256::digest(&streaming.header).into());
@@ -2511,11 +2589,15 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
         // Extent payload hashes come from the streaming in-memory state: the
         // canonical header, the per-extent content hashers, and the buffered
         // tree pages. No media re-read is needed for data just written.
-        payload_hashes.push(self.header_hash.take().ok_or(CasStoreError::WriterFailed)?);
-        for hasher in self.content_hashers.drain(..) {
-            payload_hashes.push(hasher.finalize().into());
+        if self.compact.is_some() {
+            payload_hashes.push(self.compact_hash.take().ok_or(CasStoreError::WriterFailed)?);
+        } else {
+            payload_hashes.push(self.header_hash.take().ok_or(CasStoreError::WriterFailed)?);
+            for hasher in self.content_hashers.drain(..) {
+                payload_hashes.push(hasher.finalize().into());
+            }
+            payload_hashes.push(self.tree_hash.take().ok_or(CasStoreError::WriterFailed)?);
         }
-        payload_hashes.push(self.tree_hash.take().ok_or(CasStoreError::WriterFailed)?);
         if payload_hashes.len() != self.extents.len() {
             return Err(StoreError::Corrupt.into());
         }
@@ -3104,9 +3186,46 @@ async fn compare_manifests<D: PageDevice>(
 ) -> Result<bool, StoreError<D::Error>> {
     if scratch_manifest.blob_key != existing_manifest.blob_key
         || scratch_manifest.encoded_blob_len != existing_manifest.encoded_blob_len
-        || scratch_manifest.extents.len() != existing_manifest.extents.len()
     {
         return Ok(false);
+    }
+    if scratch_manifest.extents.len() != existing_manifest.extents.len() {
+        // Compact versus canonical layout of the same key: authenticate the
+        // existing extents through their descriptors and compare the
+        // complete canonical encodings byte for byte.
+        let len = usize::try_from(existing_manifest.encoded_blob_len)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        let mut existing_bytes = Vec::new();
+        existing_bytes
+            .try_reserve_exact(len)
+            .map_err(|_| StoreError::MemoryLimit)?;
+        for declared in &existing_manifest.extents {
+            let payload = read_pointer_payload(
+                device,
+                state.superblock.binding.store_uuid,
+                state.admitted_segments,
+                state.next_segment_generation,
+                state.generation,
+                declared.pointer,
+                ExtentKind::Blob,
+                len,
+                None,
+            )
+            .await?;
+            if existing_bytes.len() as u64 != declared.encoded_offset
+                || payload.bytes.len() as u64 != declared.payload_byte_len
+            {
+                return Ok(false);
+            }
+            existing_bytes.extend_from_slice(&payload.bytes);
+        }
+        let scratch_bytes = read_manifest_range(device, state, scratch_manifest, 0, len)
+            .await
+            .map_err(|error| match error {
+                CasStoreError::Store(error) => error,
+                _ => StoreError::Corrupt,
+            })?;
+        return Ok(existing_bytes.len() == len && existing_bytes == scratch_bytes);
     }
     for (((scratch_declared, existing), scratch), scratch_hash) in scratch_manifest
         .extents
@@ -5555,11 +5674,12 @@ fn plan_scratch_with_cursor<E>(
     first_generation: u64,
     _checkpoint_generation: u64,
     geometry: BlobGeometry,
+    compact: bool,
 ) -> Result<(Vec<ScratchExtent>, Vec<ScratchSegment>, usize), CasStoreError<E>> {
     let content_count = usize::try_from(geometry.exact_len())
         .map_err(|_| StoreError::ObjectTooLarge)?
         .div_ceil(CANONICAL_CONTENT_EXTENT_LEN as usize);
-    let extent_count = content_count + 2;
+    let extent_count = if compact { 1 } else { content_count + 2 };
     if extent_count > MAX_BLOB_EXTENTS {
         return Err(StoreError::ObjectTooLarge.into());
     }
@@ -5567,14 +5687,19 @@ fn plan_scratch_with_cursor<E>(
     lengths
         .try_reserve_exact(extent_count)
         .map_err(|_| StoreError::Capacity(CapacityClass::Metadata))?;
-    lengths.push(HEADER_SIZE as u64);
-    let mut remaining = geometry.exact_len();
-    while remaining != 0 {
-        let len = remaining.min(CANONICAL_CONTENT_EXTENT_LEN);
-        lengths.push(len);
-        remaining -= len;
+    if compact {
+        // One extent carries the complete canonical encoding.
+        lengths.push(geometry.encoded_len() as u64);
+    } else {
+        lengths.push(HEADER_SIZE as u64);
+        let mut remaining = geometry.exact_len();
+        while remaining != 0 {
+            let len = remaining.min(CANONICAL_CONTENT_EXTENT_LEN);
+            lengths.push(len);
+            remaining -= len;
+        }
+        lengths.push(geometry.tree_len() as u64);
     }
-    lengths.push(geometry.tree_len() as u64);
 
     let mut extents = Vec::new();
     extents
@@ -5708,7 +5833,7 @@ mod tests {
     fn scratch_page_location_uses_extent_relative_alignment() {
         let geometry = BlobGeometry::for_len(CANONICAL_CONTENT_EXTENT_LEN + 1).unwrap();
         let (extents, _, _) =
-            plan_scratch_with_cursor::<()>(StoreUuid::new([1; 16]).unwrap(), None, 1, 2, 3, geometry)
+            plan_scratch_with_cursor::<()>(StoreUuid::new([1; 16]).unwrap(), None, 1, 2, 3, geometry, false)
                 .unwrap();
         assert_eq!(extents.len(), 4);
         assert_eq!(extents[0].encoded_offset, 0);
@@ -5753,7 +5878,7 @@ mod tests {
     fn exact_range_never_crosses_canonical_extent_boundaries() {
         let geometry = BlobGeometry::for_len(CANONICAL_CONTENT_EXTENT_LEN + 1).unwrap();
         let (extents, _, _) =
-            plan_scratch_with_cursor::<()>(StoreUuid::new([1; 16]).unwrap(), None, 1, 2, 3, geometry)
+            plan_scratch_with_cursor::<()>(StoreUuid::new([1; 16]).unwrap(), None, 1, 2, 3, geometry, false)
                 .unwrap();
         assert!(find_scratch_extent::<()>(&extents, 0, HEADER_SIZE as u64).is_ok());
         assert!(find_scratch_extent::<()>(

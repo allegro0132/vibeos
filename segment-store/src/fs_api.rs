@@ -3280,11 +3280,12 @@ mod tests {
         let mut store = format_v2(device.clone());
         let before = store.info().unwrap();
         // Fill two shared segments almost exactly: each ~250 KiB blob packs
-        // to a 71-page record span, fourteen per 1018-page segment. After 28
-        // entries the second shared segment keeps only a couple dozen free
-        // pages, so the batch's metadata records cannot join it and must
-        // claim a dedicated metadata segment exactly like the unpacked path.
-        let payloads: Vec<Vec<u8>> = (0..28_u8)
+        // (compact layout) to a 65-page record span, fifteen per 1018-page
+        // segment. After 30 entries the second shared segment keeps only a
+        // few dozen free pages, so the batch's metadata records cannot join
+        // it and must claim a dedicated metadata segment exactly like the
+        // unpacked path.
+        let payloads: Vec<Vec<u8>> = (0..30_u8)
             .map(|index| alloc::vec![index + 1; 250 * 1024])
             .collect();
         let mut batch = store.begin_staged_batch().unwrap();

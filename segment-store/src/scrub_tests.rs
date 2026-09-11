@@ -279,11 +279,18 @@ fn live_pointers(
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(manifest.extents.len(), 3);
+    // Canonical split (header / content / tree) or the compact single
+    // extent: the content is in the first payload page either way and the
+    // tree ends the last payload page either way.
+    let (data, tree) = match manifest.extents.len() {
+        3 => (manifest.extents[1].pointer, manifest.extents[2].pointer),
+        1 => (manifest.extents[0].pointer, manifest.extents[0].pointer),
+        other => panic!("unexpected manifest layout with {other} extents"),
+    };
     (
         checkpoint.catalog_root,
-        manifest.extents[1].pointer,
-        manifest.extents[2].pointer,
+        data,
+        tree,
         checkpoint.authority_root,
         checkpoint.allocation_root,
     )
@@ -294,6 +301,13 @@ fn payload_first_page(pointer: PhysicalPointer) -> u64 {
         panic!("expected non-null pointer");
     };
     segment_base_page(pointer.segment_no).unwrap() + u64::from(pointer.payload_relative_page)
+}
+
+fn payload_last_page(pointer: PhysicalPointer) -> u64 {
+    let PhysicalPointer::Value(pointer) = pointer else {
+        panic!("expected non-null pointer");
+    };
+    payload_first_page(PhysicalPointer::Value(pointer)) + u64::from(pointer.payload_pages.max(1)) - 1
 }
 
 fn segment_summary_page(pointer: PhysicalPointer) -> u64 {
@@ -795,8 +809,8 @@ fn detects_anchor_data_tree_summary_mapping_authority_and_allocation_corruption_
             CorruptionCase::SuperblockLeftUnsealed => (1, PAGE_SIZE - 1),
             CorruptionCase::SuperblockRightUnsealed => (3, PAGE_SIZE - 1),
             CorruptionCase::Data => (payload_first_page(data), 17),
-            CorruptionCase::Tree => (payload_first_page(tree), 7),
-            CorruptionCase::Padding => (payload_first_page(tree), PAGE_SIZE - 1),
+            CorruptionCase::Tree => (payload_last_page(tree), 7),
+            CorruptionCase::Padding => (payload_last_page(tree), PAGE_SIZE - 1),
             CorruptionCase::Summary => (segment_summary_page(data), 0x90),
             CorruptionCase::Mapping => (payload_first_page(mapping), 0x88),
             CorruptionCase::Authority => (payload_first_page(authority), 0x18),

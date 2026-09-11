@@ -71,6 +71,10 @@ const MAX_BATCHED_BLOB_READ_LIMIT: usize = 512 * 1024;
 /// page sink; the bound keeps the transient heap cost of one commit small.
 const SMALL_BLOB_SINK_LIMIT: u64 = 256 * 1024;
 
+// Large blobs retain only one bounded contiguous run, independent of object
+// size. Keep it below the SD driver's 128 KiB request ceiling.
+const STREAMING_WRITE_PAGES: usize = 16;
+
 /// Buffered writes of a deferred-barrier publication window. Pages are
 /// staged in memory and drained to the device as contiguous multi-page
 /// requests immediately before the checkpoint slot protocol, whose first
@@ -913,6 +917,8 @@ pub struct BlobWriter<'a, D: PageDevice> {
     /// payload/seal pages accumulate here and drain as batched requests
     /// before the fused checkpoint.
     staged_sink: Option<PageSink>,
+    streaming_first_page: u64,
+    streaming_pages: Vec<Page>,
     /// True when this writer stages inside a [`StagedBlobBatch`]: segment
     /// sealing is deferred to the batch so several small blobs can share one
     /// scratch segment whose seal covers all of them.
@@ -1552,6 +1558,8 @@ impl<D: PageDevice> SegmentStore<D> {
             failed: false,
             quota_reservation,
             staged_sink,
+            streaming_first_page: 0,
+            streaming_pages: Vec::new(),
             batch_packing: false,
             owned_from,
         })
@@ -2533,8 +2541,59 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             .checked_add(u64::from(extent.payload_relative_page))
             .and_then(|page| page.checked_add(within / PAGE_SIZE as u64))
             .ok_or(StoreError::Corrupt)?;
-        sink_or_write_page(&self.store.device, self.staged_sink.as_mut(), physical, page)
-            .await?;
+        self.write_scratch_page(physical, page).await?;
+        Ok(())
+    }
+
+    async fn drain_streaming_pages(&mut self) -> Result<(), CasStoreError<D::Error>> {
+        if self.streaming_pages.is_empty() {
+            return Ok(());
+        }
+        // Cancellation may leave a submitted prefix. Keep the writer failed
+        // unless the entire run completes, so a dropped write future cannot
+        // be followed by reuse or publication of uncertain scratch contents.
+        self.failed = true;
+        if let Err(error) = self
+            .store
+            .device
+            .write_pages(self.streaming_first_page, &self.streaming_pages)
+            .await
+        {
+            self.failed = true;
+            return Err(StoreError::Mutation(error).into());
+        }
+        self.streaming_pages.clear();
+        self.failed = false;
+        Ok(())
+    }
+
+    async fn write_scratch_page(
+        &mut self,
+        physical: u64,
+        page: &Page,
+    ) -> Result<(), CasStoreError<D::Error>> {
+        if let Some(sink) = self.staged_sink.as_mut() {
+            sink.push::<D::Error>(physical, page)?;
+            return Ok(());
+        }
+        if !self.streaming_pages.is_empty()
+            && self
+                .streaming_first_page
+                .checked_add(self.streaming_pages.len() as u64)
+                != Some(physical)
+        {
+            self.drain_streaming_pages().await?;
+        }
+        if self.streaming_pages.is_empty() {
+            self.streaming_pages
+                .try_reserve_exact(STREAMING_WRITE_PAGES)
+                .map_err(|_| StoreError::MemoryLimit)?;
+            self.streaming_first_page = physical;
+        }
+        self.streaming_pages.push(*page);
+        if self.streaming_pages.len() == STREAMING_WRITE_PAGES {
+            self.drain_streaming_pages().await?;
+        }
         Ok(())
     }
 
@@ -2751,8 +2810,7 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
                 .as_ref()
                 .expect("materialized tree page")
                 .clone();
-            sink_or_write_page(&self.store.device, self.staged_sink.as_mut(), physical, &page)
-                .await?;
+            self.write_scratch_page(physical, &page).await?;
         }
         let mut tree_hasher = Sha256::new();
         let mut remaining = tree_len;
@@ -2765,6 +2823,11 @@ impl<'a, D: PageDevice> BlobWriter<'a, D> {
             return Err(StoreError::Corrupt.into());
         }
         self.tree_hash = Some(tree_hasher.finalize().into());
+        // Dedup comparison reads scratch content from the device (unlike the
+        // small-object sink overlay), so drain before returning to either
+        // publication path. This is submission, not an added durability barrier.
+        self.drain_streaming_pages().await?;
+        self.streaming_pages = Vec::new();
         // Scratch content, tree pages, and the canonical header are still
         // unreachable from every sealed extent and checkpoint. They may share
         // one data-dependency barrier before hashing and metadata publication;

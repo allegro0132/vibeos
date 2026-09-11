@@ -896,3 +896,45 @@ fn every_commit_mutation_boundary_recovers_the_old_or_exact_new_cas_checkpoint()
         }
     }
 }
+
+
+#[test]
+fn streaming_run_partial_failure_or_cancellation_never_publishes() {
+    // PageDevice's default batched writer exposes every page boundary,
+    // including a durable prefix followed by a failed/cancelled page.
+    for boundary in 0..16 {
+        for action in [
+            FaultAction::FailNotSubmitted,
+            FaultAction::FailAmbiguous(Effect::Durable),
+            FaultAction::Pending(Effect::Durable),
+        ] {
+            let device = FaultDevice::blank(12);
+            let mut store = format(device.clone());
+            let initial = store.info().unwrap();
+            let mut writer = store
+                .begin_blob(OBJECT_KIND, 1024 * 1024 + 1, None)
+                .unwrap();
+            for index in 0..15 {
+                block_on(writer.write_chunk(&pattern_chunk(index, PAGE_SIZE))).unwrap();
+            }
+            device.arm(boundary, action);
+            let chunk = pattern_chunk(15, PAGE_SIZE);
+            let mut write = Box::pin(writer.write_chunk(&chunk));
+            match action {
+                FaultAction::Pending(_) => assert!(poll_once(write.as_mut()).is_pending()),
+                _ => assert!(block_on(write.as_mut()).is_err()),
+            }
+            drop(write);
+            assert!(matches!(
+                block_on(writer.write_chunk(&chunk)),
+                Err(CasStoreError::WriterFailed)
+            ));
+            drop(writer);
+            assert_eq!(store.info(), Err(StoreError::RecoveryRequired));
+            device.power_cycle();
+            let (_cold, recovered) = mount(device);
+            assert_eq!(recovered.generation, initial.generation);
+            assert_eq!(recovered.object_count, 0);
+        }
+    }
+}

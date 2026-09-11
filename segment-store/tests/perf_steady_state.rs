@@ -602,3 +602,51 @@ fn two_transient_large_appends() {
         records = next_records;
     }
 }
+
+
+#[test]
+fn large_stream_batches_writes_and_verifies_after_cold_mount() {
+    let device = CountingDevice::blank(SEGMENTS);
+    let limits = StoreLimits::default();
+    let mut store = SegmentStore::new(device.clone(), limits);
+    block_on(store.format(FormatOptions {
+        store_uuid: StoreUuid::new(*b"PERF-WRITE-RUN!!").unwrap(),
+        cleaner_reserve_segments: 2,
+        limits,
+    }))
+    .unwrap();
+    // Cross content extents and segment boundaries, ending in a partial page
+    // and a partial write run. Read every byte back through verification.
+    let bytes: Vec<u8> = (0..3 * 1024 * 1024 + 17usize)
+        .map(|i| (i.wrapping_mul(131) ^ (i >> 13)) as u8)
+        .collect();
+    device.epoch_counters();
+    let mut writer = store
+        .begin_blob(OBJECT_KIND_RAW, bytes.len() as u64, None)
+        .unwrap();
+    for chunk in bytes.chunks(4096) {
+        block_on(writer.write_chunk(chunk)).unwrap();
+    }
+    let object = block_on(writer.commit()).unwrap();
+    let writes = device.epoch_counters();
+    println!(
+        "stream write pages={} requests={} flushes={}",
+        writes.writes, writes.write_requests, writes.flushes
+    );
+    assert!(
+        writes.write_requests < writes.writes / 4,
+        "large stream lost write coalescing: {writes:?}"
+    );
+    let runtime = store.runtime_context();
+    drop(store);
+    let mut cold = SegmentStore::new_with_runtime_context(device, limits, runtime);
+    block_on(cold.mount()).unwrap();
+    for (index, expected) in bytes.chunks(4096).enumerate() {
+        assert_eq!(
+            block_on(cold.get_blob_chunk(&object, index as u32))
+                .unwrap()
+                .bytes,
+            expected
+        );
+    }
+}

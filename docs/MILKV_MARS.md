@@ -66,7 +66,7 @@ bootloader build or an image manifest.
 | Timebase | 4 MHz |
 | microSD | DW-MSHC SDIO1 at `0x16020000`, IRQ 75, 32-word FIFO at offset `0x200` |
 | SD clock profile | 50 MHz source, initial clock no greater than 400 kHz, data clock 25 MHz |
-| GMAC0 | `0x16030000`, MAC IRQ 7; GMAC5 register/descriptor engine remains unimplemented |
+| GMAC0 | `0x16030000`, MAC IRQ 7; GMAC5/EQoS engine implemented; physical qualification pending |
 
 Treat clock rates above as the pinned SDK profile, not evidence that arbitrary
 pre-existing firmware leaves the same configuration. Platform initialization
@@ -74,8 +74,8 @@ must establish them before attaching the relevant controller.
 
 ## Remaining implementation
 
-1. Implement JH7110 clock/reset/pinmux preparation and verify DMA coherence for
-   the GMAC path. Add the GMAC5/EQoS engine and PHY setup using the Mars wiring.
+1. Qualify JH7110 clock/reset/pinmux preparation, GMAC5/EQoS, PHY setup and
+   DMA coherence on the board using the implemented platform and driver paths.
 2. Qualify DW-MSHC data-only IO, persistence, timeout/reset behavior and protection
    of boot partitions on the board.
 3. Qualify the paired SPL/OpenSBI/U-Boot image, four-core HSM startup, IPI,
@@ -1740,3 +1740,21 @@ Evidence: `boards/milkv-mars/tcp-close-overlap-evidence.json`. This resolves the
 observed QEMU reconnect failure; it does not establish sustained load, physical
 Mars networking/DMA, entropy qualification, Wasmtime or thread support. The
 stage-54 SD image remains unchanged in this stage.
+
+### Refreshed diagnostic SD image (stage 60)
+
+The clean `e03fdc9d6d41674350b2773146271ca00d780bd3` source builds a new image at
+`target/mars-boot-stage60/out/mars-ethernet-trng-probe-sd.img` (641 MiB).
+It includes the native entropy handoff and TCP pending-connection changes,
+with DHCP, iperf3 TCP port 5201 and the optional TRNG protocol diagnostic.
+SSH remains disabled and entropy remains unqualified.
+
+SHA-256: `417ea6ceebd761c486fb8a68bc90385f7ad0c11b3bf8b28ce221163b84c283ea`.
+The adjacent `manifest.json` records the clean source, pinned SDK, build tools,
+component hashes, bootchain checks and separated boot/data partition geometry;
+`SHA256SUMS` provides the image checksum. Stage 54 remains byte-for-byte intact.
+Actual bootchain checks, four corruption cases, all artifact hashes after
+restoration, and eight SD layout/work-directory tests passed. Evidence is in
+`boards/milkv-mars/sd-stage60-evidence.json`. No physical media or SPI was written.
+Use the existing bootchain instructions and confirm the board revision and
+explicit test-card/serial devices before physical acceptance.

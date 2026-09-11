@@ -1,0 +1,231 @@
+{
+  "status": "Independent provisioned native Wasmtime and threads passed in QEMU; Mars link contract passed, physical acceptance pending",
+  "result": {
+    "status": "passed",
+    "boots": 2,
+    "harts": 4,
+    "selftests_per_boot": 416,
+    "host_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFdcwg/34LuVwdK4jchMDuiBv/mXeVy+HEryr9HY8XyJ",
+    "identity_persisted": true,
+    "authentication_tested": true,
+    "wasm_tested": true,
+    "wasm_threads_tested": true,
+    "wasmtime_tested": true,
+    "command_retries_allowed": false,
+    "consecutive_echo_connections_per_boot": 16,
+    "module_sha256": {
+      "composition-hello.wasm": "2fc8f58df91a31eaf91698693fca489bea9014871f1b99227a04e09b39a11303",
+      "composition-trap.wasm": "f871c8e6845227d776312d643b2bfbf076f9b5a55f9322a33440f18db838c58f",
+      "threads-atomics.wasm": "ab036c42a427ec15eddb0b6b91f3ec81547a6afceaa3137ac76ca685bfabd8b9",
+      "threads-counter.wasm": "308a068267f20139355e8de33127427a2e9305d9130ed2c979306134e11795fe",
+      "threads-wait-timeout.wasm": "b8203ab87455321b01ce1d8659e2c35ec93b6455699dd5053098bde37b8ee16d",
+      "threads-exit.wasm": "0d5494980be30846ca87ed0d32e2bb12a8ede4fbbc822b82ac8c4e76c0ba2290",
+      "threads-spawn-cap.wasm": "f4c2e694fc7216bd8e35cd24ef8442c6bb7df412699743c5fdb4126af2f44f17",
+      "threads-grow.wasm": "e227726a61be015cd7dbe94537c3bf5e6e822e80de490111a8d3674935562751",
+      "threads-fault.wasm": "159c46b8ecc0231f4079704cb55822cc202e575a0674e241c73bbdb39ee0433a",
+      "threads-busy.wasm": "d51f7be802f8a192c160524ef13fe9ed6df7598c99dfd6ee8986e19151a1cf49",
+      "threads-defined-shared.wasm": "648c01ec460c361e7f587f44e8b498754e94f3939afffa366a4ea13bd12335b5",
+      "threads-no-start.wasm": "e67a7c8291fb605526e82fcd1b9f2832548d693b3b38a0665aae902c83f4210c",
+      "c-threads.wasm": "bc604d893f948a8afe3725907f993eefee9d66e37c286927911d997eea94c92a"
+    },
+    "physical_acceptance": false,
+    "kernel_sha256": "d8da2744267e8d9d0781fd88bb66806818d37d2629d1d43a9db4d46613a67884",
+    "preauth_command_retries": 0
+  },
+  "kernel_features": [
+    "boot-dtb-probe",
+    "file-tree",
+    "legacy-shell",
+    "provisioned-command",
+    "provisioned-ssh",
+    "provisioned-wasmtime",
+    "qemu-default-image",
+    "queued-block",
+    "queued-entropy",
+    "queued-network",
+    "ssh-commands",
+    "ssh-component-command",
+    "wasi-preview1",
+    "wasmtime-async",
+    "wasmtime-command",
+    "wasmtime-command-fuel-batch",
+    "wasmtime-discovered-isa",
+    "wasmtime-guarded-memory",
+    "wasmtime-hardware-traps",
+    "wasmtime-native",
+    "wasmtime-threads"
+  ],
+  "successful_commands_per_boot": [
+    49,
+    36
+  ],
+  "worker_hart_masks_per_boot": [
+    [
+      0,
+      2,
+      4,
+      8,
+      14
+    ],
+    [
+      0,
+      2,
+      4,
+      8,
+      14
+    ]
+  ],
+  "per_wasm_run_reclamation_required": true,
+  "selftest_completed_before_ssh_commands": true,
+  "debug_runs": {
+    "v1": "All boot-one commands passed; harness rejected native selftest count 416 against old 395 expectation",
+    "v2": "Boot-two native fault-injection selftests overlapped command execution and halted; harness now waits for exact SELFTEST OK before service checks"
+  },
+  "wasmi_compatibility": {
+    "status": "passed",
+    "boots": 2,
+    "harts": 4,
+    "selftests_per_boot": 395,
+    "host_public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM5G6bJ43r69X8nUxRVD/kiQ9oPOFQ5Ooe+r9g5Dz2LQ",
+    "identity_persisted": true,
+    "authentication_tested": true,
+    "wasm_tested": true,
+    "wasm_threads_tested": false,
+    "wasmtime_tested": false,
+    "command_retries_allowed": false,
+    "consecutive_echo_connections_per_boot": 16,
+    "module_sha256": {
+      "composition-hello.wasm": "2fc8f58df91a31eaf91698693fca489bea9014871f1b99227a04e09b39a11303",
+      "composition-trap.wasm": "f871c8e6845227d776312d643b2bfbf076f9b5a55f9322a33440f18db838c58f"
+    },
+    "physical_acceptance": false,
+    "kernel_sha256": "922786f7b4caa8829922f4c2a5034dc5130cef8a37377799613b250ec4e3bac6",
+    "preauth_command_retries": 0
+  },
+  "mars_native_link": {
+    "status": "elf-contract-passed",
+    "entry": 1075838976,
+    "heap_start": 1101213696,
+    "heap_end": 5368709120,
+    "elf_sha256": "527c68189c5ae48a2881fe8395cfcba68acc0a9096018928cc938e09b6cab692",
+    "loads": [
+      {
+        "address": 1075838976,
+        "file_bytes": 7655424,
+        "memory_bytes": 7655424,
+        "flags": 5
+      },
+      {
+        "address": 1083494400,
+        "file_bytes": 1097728,
+        "memory_bytes": 1097728,
+        "flags": 4
+      },
+      {
+        "address": 1084592128,
+        "file_bytes": 72632,
+        "memory_bytes": 15572992,
+        "flags": 6
+      }
+    ],
+    "physical_acceptance": false,
+    "flashable_sd_image": false,
+    "eqos_dma": {
+      "base": 1093771264,
+      "bytes": 102400,
+      "address_bits": 32,
+      "cache_line_bytes": 64
+    }
+  },
+  "mars_native_frozen_elf": {
+    "path": "target/mars-reference/stage61-mars-wasmtime.elf",
+    "sha256": "527c68189c5ae48a2881fe8395cfcba68acc0a9096018928cc938e09b6cab692"
+  },
+  "physical_acceptance": false,
+  "mars_ssh_enabled": false,
+  "mars_entropy_qualified": false,
+  "one_hour_stability_tested": false,
+  "sd_image_repacked": false,
+  "logs": [
+    {
+      "path": "target/mars-reference/stage61-wasmtime-build.log",
+      "sha256": "ced17d767872784bdced26724ba1ad3b86e7b93e7aa884410a96a98d5e495c9d"
+    },
+    {
+      "path": "target/mars-reference/stage61-mars-wasmtime-build.log",
+      "sha256": "1e01a55af1191ea8df0be4366cc13db205dfdbc53dbb8c9f27641200d439512a"
+    },
+    {
+      "path": "target/mars-reference/stage61-mars-elf-check.json",
+      "sha256": "959fd4fa87c1ab02ac0085f4b7674e569d35f935908b37e028ebfcc794b4b525"
+    },
+    {
+      "path": "target/mars-reference/stage61-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage61-feature-packages.log",
+      "sha256": "e81a0a1ab7f8d80b5a6dbf9b39c14c84b1449ccec816965e705f5ab936e256fc"
+    },
+    {
+      "path": "target/mars-reference/stage61-runtime.log",
+      "sha256": "015d74ada17287f4222f750520e1d92c593408504095047fef655d0a485988fa"
+    },
+    {
+      "path": "target/mars-reference/stage61-runtime-v2.log",
+      "sha256": "8ac9495723a7d6c3c982766c0df4c52644ccef249efde0aed5c69472250df61a"
+    },
+    {
+      "path": "target/mars-reference/stage61-runtime-v3.log",
+      "sha256": "f7cde8450c844228f0e96b501b78c599b62a170350060a20ff658924c18d70f7"
+    },
+    {
+      "path": "target/mars-reference/stage61-wasmi-compat.log",
+      "sha256": "b860376861da77880f281d90eed75842b7d7d2e3a47e2903cee9bf1e99586fad"
+    },
+    {
+      "path": "target/mars-reference/stage61-wasmtime-threads-v3/boot-1.log",
+      "sha256": "a14988fcffe9f75922e0cd6606f64f40198d4ca044b13baf6dee14ebd09a3d1d"
+    },
+    {
+      "path": "target/mars-reference/stage61-wasmtime-threads-v3/boot-2.log",
+      "sha256": "d627fa721b23f2c51e49b853dde5afd5d3add0ab7224da760c1cc886d28e51a0"
+    },
+    {
+      "path": "target/mars-reference/stage61-wasmtime-threads-v3/commands-1.json",
+      "sha256": "a8671acde49e3eac6ad4b1670152084cf80ee16aef2f0b3ad1a5cd1a14dbb7ba"
+    },
+    {
+      "path": "target/mars-reference/stage61-wasmtime-threads-v3/commands-2.json",
+      "sha256": "f8f1443741c7a346aa1202dfa2767145bf3af65758541e38584aaab519ea632e"
+    },
+    {
+      "path": "target/mars-reference/stage61-wasmtime-threads-v3/result.json",
+      "sha256": "f7cde8450c844228f0e96b501b78c599b62a170350060a20ff658924c18d70f7"
+    },
+    {
+      "path": "target/mars-reference/stage61-wasmi-compat/boot-1.log",
+      "sha256": "435e0123b597f545dce935be63699fc4c12d480830d8ffbfd18964e84b229ccd"
+    },
+    {
+      "path": "target/mars-reference/stage61-wasmi-compat/boot-2.log",
+      "sha256": "ae61bad1578453fe7954cd877cf46a2f370fb505966b79454cef968ea6d7e505"
+    },
+    {
+      "path": "target/mars-reference/stage61-wasmi-compat/commands-1.json",
+      "sha256": "9547c49c4b309f6c45a3a4866e081b95c09f69c05ddde3a968949dad477b26fc"
+    },
+    {
+      "path": "target/mars-reference/stage61-wasmi-compat/commands-2.json",
+      "sha256": "837f6db6547aa9cebb74504f750530987cca52446374686117f041f301bab1fa"
+    },
+    {
+      "path": "target/mars-reference/stage61-wasmi-compat/result.json",
+      "sha256": "b860376861da77880f281d90eed75842b7d7d2e3a47e2903cee9bf1e99586fad"
+    },
+    {
+      "path": "target/mars-reference/stage61-wasmtime-threads-v2/boot-2.log",
+      "sha256": "ef67767df3e507d4cdaf7eabcbd893e1935cdb345e42615aad381053ca87e589"
+    }
+  ]
+}

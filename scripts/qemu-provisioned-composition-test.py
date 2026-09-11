@@ -5,8 +5,9 @@ Build qemu-hal-test with boot-admission-test,ssh-composition-test,
 entropy-composition-test first. Uses host /dev/urandom and no fixed host identity.
 Optional --command-module/--trap-module also test public-key authentication,
 upload, WASI IO/arguments/exit/traps and persistence. Build command-composition-test
-instead of ssh-composition-test for that mode. Does not test threads or physical
-entropy quality. Never use the generated disk as a production identity.
+instead of ssh-composition-test for that mode. Native backend/thread checks
+require wasmtime-composition-test and the explicit fixture options. Does not
+test physical entropy quality. Never use the generated disk as a production identity.
 Command checks never reconnect or replay on failure. PCAP files are retained
 for virtual TCP close/accept diagnostics.
 """
@@ -15,13 +16,15 @@ import hashlib
 import json
 from pathlib import Path
 import shlex
+import re
+import wasi_threads_cases
 import shutil
 import socket
 import subprocess
 import time
 
 
-def boot(kernel, output, disk, number, modules=None, expected_key=None):
+def boot(kernel, output, disk, number, modules=None, expected_key=None, wasmtime=False, threads=False):
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
@@ -43,6 +46,15 @@ def boot(kernel, output, disk, number, modules=None, expected_key=None):
             time.sleep(2)
             vm.stdin.write(b'quiet\ncaps virtio-rng\ncaps sshd\nselftest\n')
             vm.stdin.flush()
+            # Native selftests deliberately fault fibers and claim global
+            # probe resources. Complete them before exercising SSH commands.
+            expected_checks = 416 if wasmtime else 395
+            deadline = time.monotonic() + 90
+            marker = f'SELFTEST OK ({expected_checks} checks)'.encode()
+            while marker not in path.read_bytes():
+                if vm.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError(f'boot {number}: selftest did not finish before service checks')
+                time.sleep(0.05)
             deadline = time.monotonic() + 45
             key = None
             attempts = []
@@ -76,7 +88,7 @@ def boot(kernel, output, disk, number, modules=None, expected_key=None):
                 raise RuntimeError('host identity changed before authenticated commands')
             if modules is not None:
                 commands(table_path=path, output=output, vm=vm, port=port,
-                         number=number, modules=modules)
+                         number=number, modules=modules, threads=threads)
             time.sleep(1)
         finally:
             if vm.poll() is None:
@@ -90,12 +102,19 @@ def boot(kernel, output, disk, number, modules=None, expected_key=None):
     text = path.read_text(errors='replace')
     if 'no such space: sshd' in text or 'no such space: virtio-rng' in text:
         raise RuntimeError('required capability absent')
-    if 'selftest: 395 passed, 0 failed' not in text:
+    expected_checks = 416 if wasmtime else 395
+    if f'selftest: {expected_checks} passed, 0 failed' not in text:
         raise RuntimeError('kernel selftest did not pass')
+    if wasmtime and 'WASI running backend=wasmtime' not in text:
+        raise RuntimeError('native Wasmtime execution was not observed')
+    if threads:
+        used = [int(mask, 16) for mask in re.findall(r'harts_used=(0x[0-9a-f]+)', text)]
+        if not used or max(mask.bit_count() for mask in used) < 2:
+            raise RuntimeError('WASM threads did not execute on multiple harts')
     return key
 
 
-def commands(table_path, output, vm, port, number, modules):
+def commands(table_path, output, vm, port, number, modules, threads=False):
     key = output / 'client-key'
     if number == 1:
         public = key.with_suffix('.pub').read_text().split()
@@ -128,12 +147,15 @@ def commands(table_path, output, vm, port, number, modules):
         raise RuntimeError('persisted client key did not authenticate')
     evidence = []
     def execute(words, data=b'', status=0, stdout=b'', stderr=b''):
+        offset = table_path.stat().st_size
         result = subprocess.run([*base, shlex.join(words)], input=data,
                                 capture_output=True, timeout=30)
         evidence.append({'command': words, 'status': result.returncode,
                          'preauth_retry': False,
                          'stdout_hex': result.stdout.hex(), 'stderr_hex': result.stderr.hex()})
         (output / f'commands-{number}.json').write_text(json.dumps(evidence, indent=2) + '\n')
+        if words[0] == 'wasm-run' and b'reclaimed=true caps=0 waiters=0' not in table_path.read_bytes()[offset:]:
+            raise RuntimeError(f'command did not report resource reclamation: {words}')
         if (result.returncode, result.stdout, result.stderr) != (status, stdout, stderr):
             raise RuntimeError(f'command mismatch: {words}; inspect commands-{number}.json')
     # Boot two deliberately skips both authorization and upload.
@@ -149,6 +171,11 @@ def commands(table_path, output, vm, port, number, modules):
     execute([*run, 'stderr'], stdout=b'out\n', stderr=b'err\n')
     execute([*run, 'exit'], status=7)
     execute(['wasm-run', 'composition-trap.wasm'], status=125)
+    if threads:
+        for name, status in wasi_threads_cases.FIXTURES:
+            execute(['wasm-run', name + '.wasm'], status=status)
+        for args, status, stdout in wasi_threads_cases.PTHREADS:
+            execute(['wasm-run', 'c-threads.wasm', *args], status=status, stdout=stdout)
     # No pacing or reconnect retry: a successor SYN may overlap the previous
     # command's passive TCP close. Each connection gets a fresh SSH session.
     for index in range(16):
@@ -161,12 +188,25 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--command-module', type=Path, help='compiled tests/wasi/hello.c module')
     parser.add_argument('--trap-module', type=Path, help='fixture exporting an immediately trapping _start')
+    parser.add_argument('--wasmtime', action='store_true', help='require native backend UART evidence')
+    parser.add_argument('--thread-fixtures', type=Path, help='generated wasi-threads fixture directory')
+    parser.add_argument('--pthread-module', type=Path, help='compiled tests/wasi/threads.c')
     args = parser.parse_args()
+    if args.wasmtime and args.command_module is None:
+        parser.error('--wasmtime requires command fixtures')
+    if bool(args.thread_fixtures) != bool(args.pthread_module):
+        parser.error('--thread-fixtures and --pthread-module must be supplied together')
+    if args.thread_fixtures and not args.wasmtime:
+        parser.error('thread checks require --wasmtime')
     if bool(args.command_module) != bool(args.trap_module):
         parser.error('--command-module and --trap-module must be supplied together')
     modules = None if args.command_module is None else {
         'composition-hello.wasm': args.command_module.read_bytes(),
         'composition-trap.wasm': args.trap_module.read_bytes()}
+    if args.thread_fixtures:
+        modules.update({name + '.wasm': (args.thread_fixtures / (name + '.wasm')).read_bytes()
+                        for name, _ in wasi_threads_cases.FIXTURES})
+        modules['c-threads.wasm'] = args.pthread_module.read_bytes()
     if modules is not None and any(not (8 <= len(b) <= 512 * 1024 and b.startswith(b'\0asm\x01\0\0\0')) for b in modules.values()):
         parser.error('fixtures must be bounded core WASM modules')
     kernel = args.kernel.resolve(strict=True)
@@ -187,16 +227,17 @@ def main():
     if modules is not None:
         subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '',
                         '-f', str(output / 'client-key')], check=True)
-    first = boot(kernel, output, disk, 1, modules)
-    second = boot(kernel, output, disk, 2, modules, first)
+    first = boot(kernel, output, disk, 1, modules, wasmtime=args.wasmtime, threads=bool(args.thread_fixtures))
+    second = boot(kernel, output, disk, 2, modules, first, wasmtime=args.wasmtime, threads=bool(args.thread_fixtures))
     if first != second:
         raise RuntimeError('provisioned public host identity changed across reboot')
     if hashlib.sha256(kernel.read_bytes()).hexdigest() != kernel_hash:
         raise RuntimeError('frozen kernel changed during the test')
-    result = {'status': 'passed', 'boots': 2, 'harts': 4, 'selftests_per_boot': 395,
+    result = {'status': 'passed', 'boots': 2, 'harts': 4, 'selftests_per_boot': 416 if args.wasmtime else 395,
               'host_public_key': ' '.join(first), 'identity_persisted': True,
               'authentication_tested': modules is not None, 'wasm_tested': modules is not None,
-              'wasm_threads_tested': False,
+              'wasm_threads_tested': bool(args.thread_fixtures),
+              'wasmtime_tested': args.wasmtime,
               'command_retries_allowed': False,
               'consecutive_echo_connections_per_boot': 0 if modules is None else 16,
               'module_sha256': {} if modules is None else {n: hashlib.sha256(b).hexdigest() for n, b in modules.items()},

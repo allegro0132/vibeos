@@ -1758,3 +1758,36 @@ restoration, and eight SD layout/work-directory tests passed. Evidence is in
 `boards/milkv-mars/sd-stage60-evidence.json`. No physical media or SPI was written.
 Use the existing bootchain instructions and confirm the board revision and
 explicit test-card/serial devices before physical acceptance.
+
+### Independent native WASM and threads (stage 61)
+
+The QEMU HAL firmware now offers `wasmtime-composition-test`, selecting the
+existing generic `provisioned-wasmtime` service. Build it with the
+`riscv64gc-unknown-none-elf` target, `boot-admission-test` and
+`entropy-composition-test`. The kernel feature set has no `qemu-virt`,
+`milkv-duo` or jitter-entropy dependency. The composition harness accepts
+`--wasmtime --thread-fixtures target/wasi-fixtures --pthread-module
+ target/wasi-examples/c-threads.wasm` along with the existing command/trap
+fixtures. It freezes and persists all modules using the same fresh test keys.
+
+Both four-hart boots passed 416 selftests, native backend detection, the ordinary
+WASI IO/status/trap checks, ten shared-memory/atomic/thread fixtures and three
+compiled pthread scenarios. Worker masks included `0xe` on both boots. There
+were 49 command checks on boot one and 36 on boot two, with zero command retries;
+boot two did not re-authorize or re-upload. Every WASM run must report reclaimed
+resources with zero capabilities/waiters. The existing Wasmi profile still
+passes its two-boot, 395-check and command regression.
+
+Native selftests deliberately fault fibers and exercise global probe resources.
+An initial run overlapped them with boot-two SSH commands and halted. The
+harness now explicitly waits for the profile's exact `SELFTEST OK` marker before
+starting service checks. These tests do not establish safe concurrent use of
+destructive selftests and production workloads.
+
+Mars also links `ethernet-device,entropy-device,vibeos-kernel/provisioned-wasmtime`
+on RV64GC, passing the ELF load/heap and below-4-GiB EQoS DMA placement checks.
+This is link evidence only: its entropy provider remains diagnostic-only, so
+this does not enable a functioning Mars SSH endpoint or qualify native execution
+on physical U74 cores. The stage-60 SD image is unchanged. Full physical boot,
+DMA, entropy, SSH/WASM and sustained-load acceptance remain outstanding.
+Evidence: `boards/milkv-mars/wasmtime-composition-evidence.json`.

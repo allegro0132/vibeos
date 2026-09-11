@@ -29,12 +29,20 @@ pub struct Events {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionMode { Interrupt, Polling }
 /// # Safety
-/// Every operation except `acknowledge` requires exclusive ownership of the
-/// instance and its DMA pool. Completion reads may not race mutation. The IRQ
-/// acknowledgement callback must not borrow mutable instance state. Buffers
+/// Engine operations require exclusive ownership of the instance and its DMA
+/// pool. Discovery runs before claims. Completion reads may not race mutation.
+/// Acknowledgement and quiesce must not borrow mutable instance state. Buffers
 /// are copied only at finish; no caller pointer may be published to hardware.
 /// A failed reset retains DMA ownership until a later confirmed reset.
 pub struct EntropyDevice {
+    /// Firmware admits one entropy endpoint after resources are mapped.
+    pub discover: unsafe fn() -> Option<crate::device_transport::Descriptor>,
+    pub resource_kind: &'static str,
+    pub transport_name: &'static str,
+    /// Hardware-only best-effort stop for inconsistent CPU ownership. Must not
+    /// mutate/drop software engine state, clear pending tokens or release DMA.
+    /// Success is not permission to reuse an instance with an unknown CPU owner.
+    pub quiesce: unsafe fn(crate::device_transport::Descriptor, usize) -> bool,
     pub completion_mode: CompletionMode,
     /// Hardware queue capacity for diagnostics, not the kernel request limit.
     pub queue_size: u16,

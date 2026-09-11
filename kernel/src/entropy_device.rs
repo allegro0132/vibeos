@@ -1,11 +1,33 @@
 //! Exclusive invocation token for firmware-owned entropy hardware.
-use crate::virtio_mmio::MmioTransport;
+use vibeos_hal::device_transport::{Descriptor, Kind};
 use vibeos_hal::entropy::{device, Error, Events, Submission};
+/// Immutable identity supplied by the firmware's entropy provider. No register
+/// access or dependency on the shared block/network transport registry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Endpoint(Descriptor);
+impl Endpoint {
+    /// # Safety
+    /// Firmware resources are mapped; this is boot-time admission before claims.
+    pub unsafe fn discover() -> Option<Self> {
+        (device().discover)().filter(|d| d.kind == Kind::Entropy).map(Self)
+    }
+    pub const fn slot(self) -> usize { self.0.slot }
+    pub const fn base(self) -> usize { self.0.base }
+    pub const fn irq(self) -> u32 { self.0.irq }
+    pub const fn vendor_id(self) -> u32 { self.0.vendor_id }
+    /// Does not clear instance state or authorize reuse after uncertain ownership.
+    pub fn quiesce(self, budget: usize) -> bool {
+        unsafe { (device().quiesce)(self.0, budget) }
+    }
+    pub fn acknowledge_interrupt(self) -> Events {
+        unsafe { (device().acknowledge)(self.base()) }
+    }
+}
 pub struct Engine(());
 impl Engine {
     /// # Safety
     /// Caller holds the exact device/DMA claim and excludes every old engine.
-    pub unsafe fn prepare(t: MmioTransport, epoch: u64, budget: usize) -> Result<Self, Error> {
+    pub unsafe fn prepare(t: Endpoint, epoch: u64, budget: usize) -> Result<Self, Error> {
         (device().prepare)(t.slot(), t.base(), epoch, budget)?;
         Ok(Self(()))
     }
@@ -40,7 +62,7 @@ impl Engine {
         unsafe { (device().shutdown)(budget) }
     }
 }
-pub unsafe fn confirmed_reset(t: MmioTransport, budget: usize) -> bool {
+pub unsafe fn confirmed_reset(t: Endpoint, budget: usize) -> bool {
     (device().confirmed_reset)(t.slot(), t.base(), budget)
 }
 pub unsafe fn acknowledge_interrupt_at(base: usize) -> Events {

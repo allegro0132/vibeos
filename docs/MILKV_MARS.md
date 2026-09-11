@@ -1359,3 +1359,27 @@ mode is tested separately. Evidence is in
 These are QEMU device and policy tests. Native discovery, non-DMA state
 ownership, shared SEC lifecycle and physical entropy qualification remain
 outstanding; existing Mars SD images are unchanged.
+
+### Independent entropy endpoint provider
+
+Entropy discovery, resource labels and hardware-only quiesce now belong to the
+entropy operation table. The kernel entropy adapter uses its own immutable
+endpoint token and no longer calls the shared block/network transport host.
+QEMU firmware still performs the same modern VirtIO identity validation and
+publishes the existing capability descriptions. A non-entropy descriptor is
+rejected before creating an endpoint.
+
+Hardware-only quiesce is distinct from confirmed reset/retirement: it cannot
+clear software engine state, pending tokens or ownership. The inconsistent
+attach path therefore keeps its permanent quarantine even if a hardware stop
+succeeds. The host test compiles the actual kernel adapter without defining
+`VIBEOS_DEVICE_TRANSPORT`, supplies a separate native-shaped provider and checks
+this distinction. Wrong-kind admission and retirement substituted for quiesce
+are detected by mutations.
+
+Actual QEMU random requests pass the existing two-boot security acceptance in
+both interrupt and polling modes. Evidence is recorded in
+`boards/milkv-mars/entropy-endpoint-evidence.json`. The native-shaped host test
+does not run a Mars controller or prove a complete non-DMA kernel service.
+Backing-state ownership and native service publication remain to be completed;
+physical entropy qualification is still required and SD images are unchanged.

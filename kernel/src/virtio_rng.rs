@@ -28,7 +28,7 @@ use crate::exec::{self, WaitQueue};
 use crate::heap::{AllocationDomain, ArenaId};
 use crate::plic;
 use crate::sync::SpinLock;
-use crate::virtio_mmio::MmioTransport;
+use crate::entropy_device::Endpoint;
 use crate::world::Space;
 use crate::entropy_device::Engine;
 use vibeos_hal::entropy::Submission;
@@ -155,25 +155,26 @@ impl Drop for RandomBytes {
     }
 }
 
-/// Capability naming exactly one discovered modern virtio-rng MMIO window.
+/// Capability naming exactly one firmware-admitted entropy endpoint.
 pub struct MmioWindow {
-    transport: MmioTransport,
+    transport: Endpoint,
 }
 
 impl MmioWindow {
-    fn new(transport: MmioTransport) -> Arc<Self> {
+    fn new(transport: Endpoint) -> Arc<Self> {
         Arc::new(Self { transport })
     }
 }
 
 impl Resource for MmioWindow {
     fn kind(&self) -> &'static str {
-        "virtio-mmio"
+        vibeos_hal::entropy::device().resource_kind
     }
 
     fn describe(&self) -> String {
         format!(
-            "modern entropy transport slot {} @ {:#x}, IRQ {}, vendor {:#x}",
+            "{} slot {} @ {:#x}, IRQ {}, vendor {:#x}",
+            vibeos_hal::entropy::device().transport_name,
             self.transport.slot(),
             self.transport.base(),
             self.transport.irq(),
@@ -224,7 +225,7 @@ impl RandomSource {
             max_request_bytes: MAX_RANDOM_BYTES as u16,
             queue_size: vibeos_hal::entropy::device().queue_size,
             session_epoch: control.epoch,
-            irq: control.transport.map_or(0, MmioTransport::irq),
+            irq: control.transport.map_or(0, Endpoint::irq),
             used_interrupts: USED_INTERRUPT_COUNT.load(Ordering::Acquire),
             bytes_returned: BYTE_COUNT.load(Ordering::Acquire),
             resets: RESET_COUNT.load(Ordering::Acquire),
@@ -302,15 +303,15 @@ pub struct RandomResources {
     pub source: Arc<RandomSource>,
 }
 
-/// Discover only a real QEMU modern transport with device id 4.
+/// Discover only the endpoint admitted by the firmware entropy provider.
 ///
 /// There is intentionally no clock/counter/deterministic fallback. Since this
 /// module is removed wholesale outside `qemu-virt`, a Milk-V build cannot
 /// accidentally publish a fake `RandomSource`.
 pub fn discover() -> Option<RandomResources> {
-    // Safety: the selected BSP maps this trusted VirtIO MMIO aperture into
-    // the kernel's identity address space before device discovery begins.
-    let transport = unsafe { MmioTransport::scan_entropy() }?;
+    // Safety: firmware resources are mapped before device discovery begins;
+    // the provider validates hardware identity and assigned resource ownership.
+    let transport = unsafe { Endpoint::discover() }?;
     {
         // The transport is a boot-discovered, immutable part of the DMA claim.
         // Publish it before any component can claim the slab so raw-fault
@@ -362,7 +363,7 @@ enum RequestSlot {
 }
 
 struct DriverControl {
-    transport: Option<MmioTransport>,
+    transport: Option<Endpoint>,
     accepted_features: u64,
     epoch: u64,
     online: bool,
@@ -679,19 +680,19 @@ fn complete_active(result: Result<RandomBytes, RandomError>) {
 fn polling_completion() -> bool {
     vibeos_hal::entropy::device().completion_mode == vibeos_hal::entropy::CompletionMode::Polling
 }
-fn enable_completion_irq(transport: MmioTransport) -> Result<(), plic::RegisterError> {
+fn enable_completion_irq(transport: Endpoint) -> Result<(), plic::RegisterError> {
     if polling_completion() { plic::disable(transport.irq()) } else { plic::enable(transport.irq()) }
 }
 
 struct DriverSession {
-    transport: MmioTransport,
+    transport: Endpoint,
     engine: Engine,
     claim_arena: ArenaId,
     armed: bool,
 }
 
 impl DriverSession {
-    fn attach(transport: MmioTransport, authority: DriverAuthority) -> Option<Self> {
+    fn attach(transport: Endpoint, authority: DriverAuthority) -> Option<Self> {
         if CONTROL.lock().quarantined {
             complete_active(Err(RandomError::Quarantined));
             return None;
@@ -967,7 +968,7 @@ fn advance_epoch() -> Result<u64, RandomError> {
     Ok(epoch)
 }
 
-fn attach_failed(transport: MmioTransport, claim_arena: ArenaId, error: RandomError) {
+fn attach_failed(transport: Endpoint, claim_arena: ArenaId, error: RandomError) {
     // Safety: attach owns the exact DMA claim and the failed local Engine is
     // no longer accessed; no replacement can attach until claim release.
     let reset = unsafe { crate::entropy_device::confirmed_reset(transport, RESET_POLL_BUDGET) };
@@ -976,13 +977,13 @@ fn attach_failed(transport: MmioTransport, claim_arena: ArenaId, error: RandomEr
     finish_claimed_teardown(claim_arena, reset, error);
 }
 
-fn quarantine_inconsistent_attach(transport: MmioTransport) {
+fn quarantine_inconsistent_attach(transport: Endpoint) {
     let _ = plic::disable(transport.irq());
     let _ = plic::unregister(transport.irq());
     // Do not clear DMA here: the inconsistent stale authority means an old CPU
     // session cannot be proven quiescent. Reset best-effort and quarantine the
     // exact claim forever instead.
-    let _ = transport.reset(RESET_POLL_BUDGET);
+    let _ = transport.quiesce(RESET_POLL_BUDGET);
     let _ = transport.acknowledge_interrupt();
     IRQ_CAUSES.store(0, Ordering::Release);
     *AUTHORITY.lock() = None;
@@ -995,7 +996,7 @@ fn quarantine_inconsistent_attach(transport: MmioTransport) {
     // DMA_CLAIM_ARENA intentionally remains non-zero forever.
 }
 
-fn shutdown(transport: MmioTransport, claim_arena: ArenaId, reason: RandomError) {
+fn shutdown(transport: Endpoint, claim_arena: ArenaId, reason: RandomError) {
     let _ = plic::disable(transport.irq());
     let _ = plic::unregister(transport.irq());
     CONTROL.lock().online = false;
@@ -1045,7 +1046,7 @@ fn release_dma_claim(claim_arena: ArenaId) -> bool {
             .is_ok()
 }
 
-fn authority_live(transport: MmioTransport) -> bool {
+fn authority_live(transport: Endpoint) -> bool {
     let authority = AUTHORITY.lock();
     let Some(authority) = authority.as_ref() else {
         return false;
@@ -1135,8 +1136,8 @@ fn irq_top_half(transport_base: usize, _irq_entry: u64) {
 }
 
 fn acknowledge_irq_transport(transport_base: usize) -> vibeos_hal::entropy::Events {
-    // SAFETY: QEMU's BSP identity-maps every VirtIO transport for the firmware
-    // lifetime and assigns this fixed slot only to the entropy device. PLIC
+    // SAFETY: firmware retains immutable resources for the sole entropy
+    // endpoint for its lifetime. PLIC
     // teardown may leave one copied handler in flight, but concurrent W1C
     // acknowledgements of the same transport are explicitly supported.
     unsafe { crate::entropy_device::acknowledge_interrupt_at(transport_base) }

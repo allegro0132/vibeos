@@ -50,6 +50,15 @@ unsafe fn transport(slot: usize, base: usize) -> Result<MmioTransport, Error> {
 }
 #[no_mangle]
 pub static VIBEOS_ENTROPY_DEVICE: EntropyDevice = EntropyDevice {
+    discover: || unsafe {
+        MmioTransport::scan_entropy(Board::INFO.virtio_mmio?)?.descriptor()
+    },
+    resource_kind: "virtio-mmio",
+    transport_name: "modern entropy transport",
+    quiesce: |description, budget| unsafe {
+        let Some(layout) = Board::INFO.virtio_mmio else { return false; };
+        MmioTransport::from_descriptor(layout, description).is_some_and(|t| t.reset(budget))
+    },
     completion_mode: if cfg!(feature = "entropy-polling") { CompletionMode::Polling } else { CompletionMode::Interrupt },
     queue_size: driver::QUEUE_SIZE,
     dma_base: driver::dma_base,

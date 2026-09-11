@@ -1,0 +1,81 @@
+{
+  "status": "Independent entropy provider and endpoint verified; native backing ownership remains pending",
+  "host_hal_driver_tests": 41,
+  "new_endpoint_tests": 1,
+  "qemu_statistics": {
+    "interrupt": [
+      {
+        "bytes": 64,
+        "interrupts": 1
+      },
+      {
+        "bytes": 64,
+        "interrupts": 1
+      }
+    ],
+    "polling": [
+      {
+        "bytes": 64,
+        "interrupts": 0
+      },
+      {
+        "bytes": 64,
+        "interrupts": 0
+      }
+    ]
+  },
+  "qemu_harts_per_boot": 1,
+  "mutations": [
+    "wrong device kind accepted: detected",
+    "hardware-only quiesce replaced with state retirement: detected"
+  ],
+  "physical_acceptance": false,
+  "sd_images_rebuilt": false,
+  "blind_spots": [
+    "Native-shaped provider test has no hardware or DMA execution",
+    "Non-DMA full kernel ownership/publication remains pending",
+    "QEMU security acceptance does not qualify physical Mars entropy or production SSH"
+  ],
+  "logs": [
+    {
+      "path": "target/mars-reference/stage48-boundaries.log",
+      "sha256": "5fcb6652ae7ca0aeb04c5953c7d516236d9cb59f0635cf4c6d8af8681e41d1d0"
+    },
+    {
+      "path": "target/mars-reference/stage48-host.log",
+      "sha256": "7937b63326372296dcdc34a0d26e70866815bc48cd5bbd6663fb74d92a4836b7"
+    },
+    {
+      "path": "target/mars-reference/stage48-interrupt-test.log",
+      "sha256": "d4d33d85d532fc726faca37be4eaeecd82060847d2bd75340de83fc223c534c7"
+    },
+    {
+      "path": "target/mars-reference/stage48-mutation-quiesce-releases-state.log",
+      "sha256": "ebae9ff3485ca39ba2e1e477e198a61972d790da6284c2531792fab52c06c616"
+    },
+    {
+      "path": "target/mars-reference/stage48-mutation-wrong-kind.log",
+      "sha256": "a02987afab85268976f172e232c16f28da83ec536f7e1408357917f912bbed74"
+    },
+    {
+      "path": "target/mars-reference/stage48-polling-test.log",
+      "sha256": "39796e19769af9a912eaf4cd7cd2641eae293cce57e7124027e2e77dff49947c"
+    },
+    {
+      "path": "target/mars-reference/stage48-interrupt/boot-1.log",
+      "sha256": "198cb039cd3bcd135c23b7c784594f68471f5760b47ed291cde9fea3c2f64c77"
+    },
+    {
+      "path": "target/mars-reference/stage48-interrupt/boot-2.log",
+      "sha256": "1a55a1e81220209afd3f8c6de56e5a030570d8fa7260050137ac3d19e2a33e28"
+    },
+    {
+      "path": "target/mars-reference/stage48-polling/boot-1.log",
+      "sha256": "21a57e3dd1a58a0384505b6970ad854d610c976701d786637e0e48b102d0aefa"
+    },
+    {
+      "path": "target/mars-reference/stage48-polling/boot-2.log",
+      "sha256": "1ff46a200ac2446bc2d9149d39748355f0186816b9ccfa344217c66384576ea8"
+    }
+  ]
+}

@@ -14,6 +14,11 @@ trng-probe = ["dep:vibeos-starfive-trng"]
 [lib]
 path = "src/lib.rs"
 
+[[test]]
+name = "entropy_model"
+path = "tests/entropy_model.rs"
+required-features = ["trng-probe"]
+
 [[bin]]
 name = "vibeos-milkv-mars"
 path = "src/main.rs"

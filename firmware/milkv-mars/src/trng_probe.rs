@@ -69,14 +69,14 @@ pub unsafe fn run(write: fn(&str)) {
         )
     });
     let timebase = super::timebase_hz();
-    let mut domain = security::Domain::new_exclusive(
+    let domain = security::Domain::new_exclusive(
         security::Mmio::new(resources.stg_crg, vibeos_runtime_riscv::time).unwrap(),
         timebase,
     )
     .unwrap();
     // Retain both owners on this stack until a confirmed stop, or SBI shutdown
     // on failure. There is no retry, dynamic registration or fallback source.
-    let mut trng = Trng::new(
+    let trng = Trng::new(
         Mmio::new(
             resources.registers.start,
             resources.registers.len(),
@@ -87,22 +87,22 @@ pub unsafe fn run(write: fn(&str)) {
         100_000,
     )
     .unwrap();
-    let prepared = domain.prepare();
+    let mut instance = vibeos_firmware_milkv_mars::entropy_instance::Instance::new(domain, trng);
+    let prepared = instance.prepare(1);
     let mut blocks = 0;
     let result = if prepared.is_ok() {
-        trng.initialize().and_then(|()| {
-            for _ in 0..2 {
-                let _ = trng.read_block()?;
-                blocks += 1;
-            }
+        instance.submit(64).and_then(|token| {
+            let mut output = [0; 64];
+            let bytes = instance.finish(token, &mut output)?;
+            for byte in &mut output { core::ptr::write_volatile(byte, 0); }
+            blocks = bytes / 32;
             Ok(())
         })
     } else {
-        Err(vibeos_starfive_trng::Error::NotReady)
+        Err(vibeos_hal::entropy::Error::DriverRestarted)
     };
-    // No child can be invoked after this point. Even a prepare/protocol failure
-    // requires explicit reset acknowledgement before child clocks are gated.
-    let stopped = domain.stop();
+    // A failure keeps the sole SEC/child owner retained through SBI halt.
+    let stopped = instance.shutdown();
     if prepared.is_err() || result.is_err() || stopped.is_err() {
         halt(write, format_args!("MARS_TRNG_PROBE FAIL parent_hz={hz} prepare={prepared:?} read={result:?} stop={stopped:?} blocks={blocks}\n"));
     }

@@ -71,6 +71,17 @@ impl<R: Registers> Trng<R> {
             previous: None,
         })
     }
+    /// Re-arm this same owner after a platform-controlled hardware reset.
+    /// Retain output history so reset cannot bypass stuck-output rejection.
+    /// This performs no IO and grants no entropy qualification.
+    ///
+    /// # Safety
+    /// The exclusive owner has confirmed reset assertion and release, restored
+    /// clocks, and excluded every other SEC client/IRQ throughout that sequence.
+    /// No old invocation may resume. Merely requesting reset is insufficient.
+    pub unsafe fn reset_observed(&mut self) {
+        self.state = State::New;
+    }
     fn events(&mut self) -> Result<u32, Error> {
         let events = self.io.read(ISTAT);
         if events & LOCKUP != 0 {

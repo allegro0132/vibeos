@@ -1454,3 +1454,33 @@ identity and does not qualify Mars entropy or production SSH.
 
 Evidence: `boards/milkv-mars/entropy-approval-evidence.json`. No Mars native
 entropy service was composed in this stage and no SD image was rebuilt.
+
+### Native PIO entropy request lifecycle (stage 52)
+
+The Mars boot diagnostic now uses a firmware-owned `entropy_instance::Instance`
+that retains the shared SEC domain and TRNG register owner together. It accepts
+1–64 byte requests, executes at most two bounded PIO block commands, and copies
+output only after complete success. Partial failures publish no completion.
+Request serials survive reset, and epochs must increase. Stale completions and
+undersized destinations are rejected without changing caller memory. Retained
+output bytes are cleared after delivery or confirmed shutdown; this is not a
+guarantee that all transient stack/compiler copies have been erased.
+
+A failed SEC stop keeps the owner faulted and unavailable. Recovery uses that
+same owner; it never constructs an overlapping register view. After confirmed
+reset assertion/release, the driver can be re-armed while preserving its previous
+output block, so reset does not bypass repeated-output rejection. The unsafe
+constructor requires exclusive ownership of every SEC client, a masked PLIC
+source, stable parent clocks, serialized CRG accesses, and retention until
+confirmed stop. These remain hardware handoff prerequisites, not properties
+proved by the model.
+
+Host and RV64 tests execute the same lifecycle model, including second-block
+failure, short destinations, stale tokens, failed stop/recovery, and repeated
+output across reset. Mutations that recycle serials, erase history, or ignore
+stop failure are detected. QEMU also passes the 395 kernel checks on four harts.
+The Mars Ethernet/TRNG diagnostic ELF is rebuilt and checked. This stage does
+not publish a native HAL operation table or approve an entropy source; it
+provides the owner used by the existing diagnostic and the future table.
+Existing SD images were not repacked. Evidence is recorded in
+`boards/milkv-mars/entropy-instance-evidence.json`.

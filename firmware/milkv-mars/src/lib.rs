@@ -2,6 +2,8 @@
 //! Mars composition policy. Host tests exercise admission and data-only block
 //! translation; only the binary performs SBI calls or real device accesses.
 pub mod partition;
+#[cfg(feature = "trng-probe")]
+pub mod entropy_instance;
 #[cfg(feature = "ethernet")]
 pub mod packet;
 use vibeos_bsp_milkv_mars as mars;

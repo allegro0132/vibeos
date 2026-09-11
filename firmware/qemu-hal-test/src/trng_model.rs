@@ -1,4 +1,6 @@
 //! RV64 protocol execution only; registers/noise are modeled, not physical.
+#[path = "../../milkv-mars/tests/entropy_model.rs"]
+mod entropy_model;
 use vibeos_starfive_trng::{Error, Registers, Trng};
 struct Model {
     words: [u32; 26],
@@ -58,6 +60,7 @@ impl Registers for Model {
     }
 }
 pub fn run() {
+    entropy_model::run();
     clock_model();
     mmio_lane();
     platform_model();

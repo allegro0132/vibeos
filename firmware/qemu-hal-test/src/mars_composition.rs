@@ -52,7 +52,7 @@ pub fn run() {
         rfence: true,
         time: true,
     };
-    let fixture = include_bytes!("../../../boards/milkv-mars/tests/fixtures/network.dtb");
+    let fixture = include_bytes!("../../../boards/milkv-mars/tests/fixtures/trng.dtb");
     let admitted = admit(fixture, &request, capabilities).unwrap();
     assert_eq!(admitted.harts.ids(), &[4, 1, 2, 3]);
     assert!(admit(

@@ -71,8 +71,9 @@ pub const STORE_CLIENT_MEMORY_BUDGET: usize = 8 * 1024 * 1024;
 // This is a write-policy threshold, not a format limit. Larger v2 objects
 // already have a content-by-reference representation; keeping them out of
 // the authority stream avoids rewriting their payload on every later append.
-// Small objects retain the compact inline path, including 4 KiB blob envelopes.
-const V2_INLINE_OBJECT_LIMIT: usize = 16 * 1024;
+// Tiny objects retain the inline path; a 4 KiB blob plus its Merkle
+// envelope uses CAS, avoiding repeated payload copies in the authority log.
+const V2_INLINE_OBJECT_LIMIT: usize = 4 * 1024;
 
 // Stable platform trust anchor for this object journal.  VibeOS has no entropy
 // source yet, so this is intentionally a fixed, documented value rather than a

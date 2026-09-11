@@ -9,7 +9,7 @@ tombstone ordering, and slot-generation history directly from the raw disk.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import struct
 import sys
 from pathlib import Path
@@ -33,6 +33,7 @@ TOMBSTONE = 5
 OBJECT_PREPARE = 6
 OBJECT_CHUNK = 7
 OBJECT_COMMIT = 8
+OBJECT_EXTERNAL = 9
 PAYLOAD_LENGTH = {
     FORMAT: 0,
     HIGH_WATER: 16,
@@ -42,6 +43,7 @@ PAYLOAD_LENGTH = {
     OBJECT_PREPARE: 40,
     OBJECT_CHUNK: 384,
     OBJECT_COMMIT: 48,
+    OBJECT_EXTERNAL: 64,
 }
 
 PERSISTENT_SPACE_ID = 0x5053
@@ -122,8 +124,11 @@ class State:
     live: dict[int, Grant]
     slots: dict[tuple[int, int], tuple[int, int | None]]
 
+    external_objects: dict[int, tuple[int, bytes]] = field(default_factory=dict)
+
     def fingerprint(self) -> tuple:
         return (
+            tuple(sorted(self.external_objects.items())),
             self.formatted,
             self.high_water,
             tuple(sorted((key, kind, content, sequence) for key, (kind, content, sequence) in self.objects.items())),
@@ -169,6 +174,7 @@ def decode_sector(sector: bytes, physical: int) -> Record | None:
         OBJECT_PREPARE,
         OBJECT_CHUNK,
         OBJECT_COMMIT,
+        OBJECT_EXTERNAL,
     }
     if transactional != (transaction != 0):
         fail(f"sealed sector {physical}: non-canonical transaction id")
@@ -209,7 +215,7 @@ def records_from_image(image: bytes) -> list[Record]:
     return records
 
 
-def recover(image: bytes) -> State:
+def recover(image: bytes, *, allow_external: bool = False) -> State:
     records = records_from_image(image)
     if not records:
         return State(False, 0, {}, [], {}, {}, {})
@@ -220,6 +226,7 @@ def recover(image: bytes) -> State:
     seen_derivations: set[int] = set()
     seen_objects: set[int] = set()
     objects: dict[int, tuple[int, bytes, int]] = {}
+    external_objects: dict[int, tuple[int, bytes]] = {}
     grants: list[Grant] = []
     tombstones: dict[int, int] = {}
 
@@ -343,6 +350,30 @@ def recover(image: bytes) -> State:
                 fail("tombstone reused a transaction id")
             transactions[tx] = {"type": "finished"}
             tombstones.setdefault(derivation, sequence)
+            continue
+
+        if record.kind == OBJECT_EXTERNAL:
+            if not allow_external:
+                fail("external object requires a Storage V2 content verifier")
+            object_id = u128(raw, PAYLOAD_OFFSET)
+            object_kind = u32(raw, PAYLOAD_OFFSET + 16)
+            byte_len = u64(raw, PAYLOAD_OFFSET + 24)
+            root = raw[PAYLOAD_OFFSET + 32:PAYLOAD_OFFSET + 64]
+            if (object_kind == 0 or u32(raw, PAYLOAD_OFFSET + 20) != 0
+                    or not 0 < byte_len <= 64 * 1024 * 1024 or not any(root)):
+                fail("external object metadata is non-canonical")
+            if not reserved(tx) or not reserved(object_id):
+                fail("external object mentions an unreserved stable id")
+            claim(tx, "transaction")
+            claim(object_id, "object")
+            if tx in transactions or object_id in seen_objects:
+                fail("duplicate external object transaction or object")
+            seen_objects.add(object_id)
+            transactions[tx] = {"type": "finished"}
+            # No bytes are authenticated by this journal record alone. The
+            # V2 verifier must materialize selected objects from verified CAS.
+            objects[object_id] = (object_kind, b"", sequence)
+            external_objects[object_id] = (byte_len, root)
             continue
 
         if record.kind == OBJECT_PREPARE:
@@ -491,7 +522,7 @@ def recover(image: bytes) -> State:
         key: (generation, derivation if derivation in live else None)
         for key, (generation, derivation) in slot_history.items()
     }
-    return State(True, high_water, objects, grants, tombstones, live, slots)
+    return State(True, high_water, objects, grants, tombstones, live, slots, external_objects)
 
 
 def select_external_root(state: State) -> Grant | None:

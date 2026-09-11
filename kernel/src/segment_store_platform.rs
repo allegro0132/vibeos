@@ -1209,6 +1209,24 @@ impl HotReadCache {
         Some(weak)
     }
 
+    fn insert_external(
+        &self,
+        object: &vibeos_durable_format::RecoveredObject,
+        bytes: &[u8],
+    ) -> Option<Weak<[u8]>> {
+        let root = object.external_root?;
+        if bytes.len() > STORAGE_V2_HOT_READ_MAX_OBJECT_BYTES
+            || object.byte_len != bytes.len() as u64
+        {
+            return None;
+        }
+        let descriptor = crate::store::BlobDescriptor::from_content(object.object_kind.get(), bytes).ok()?;
+        if descriptor.root != root {
+            return None;
+        }
+        self.insert(bytes)
+    }
+
     fn clear(&self) {
         let mut state = self.state.lock();
         state.entries.clear();
@@ -3477,6 +3495,32 @@ mod storage_v2_transition_tests {
         assert!(survivor.upgrade().is_none());
         page.resize(STORAGE_V2_HOT_READ_MAX_OBJECT_BYTES + 1, 0);
         assert!(cache.insert(&page).is_none());
+        let bytes = [1, 2, 3, 4];
+        let kind = vibeos_durable_format::ObjectKind::new(123).unwrap();
+        let root = crate::store::BlobDescriptor::from_content(kind.get(), &bytes).unwrap().root;
+        let mut object = vibeos_durable_format::RecoveredObject {
+            object_id: vibeos_durable_format::ObjectId::new(2).unwrap(),
+            object_kind: kind,
+            bytes: Vec::new(),
+            byte_len: bytes.len() as u64,
+            external_root: Some(root),
+            transaction_id: vibeos_durable_format::TransactionId::new(1).unwrap(),
+            prepare_sequence: 3,
+            commit_sequence: 3,
+        };
+        let cached = cache.insert_external(&object, &bytes).unwrap();
+        assert_eq!(cached.upgrade().unwrap().as_ref(), &bytes);
+        assert!(cache.insert_external(&object, &[1, 2, 3, 5]).is_none());
+        object.byte_len += 1;
+        assert!(cache.insert_external(&object, &bytes).is_none());
+        object.byte_len -= 1;
+        object.object_kind = vibeos_durable_format::ObjectKind::new(124).unwrap();
+        assert!(cache.insert_external(&object, &bytes).is_none());
+        object.object_kind = kind;
+        object.external_root = None;
+        assert!(cache.insert_external(&object, &bytes).is_none());
+        cache.clear();
+        assert!(cached.upgrade().is_none());
     }
 
     fn frozen_predecessor(staged: MigrationControl) -> MigrationControl {
@@ -3821,6 +3865,7 @@ fn appended_v2_snapshot(
     view: &PersistentAuthorityView,
     transient: Arc<PersistentAuthorityTransientObjects>,
     hot_reads: &HotReadCache,
+    external_payload: Option<(u128, &[u8])>,
 ) -> Result<vibeos_object_store::StorageV2AuthoritySnapshot, vibeos_object_store::StoreError> {
     let authority_generation = view.checkpoint_generation();
     recovered_v2_snapshot_with(
@@ -3828,18 +3873,25 @@ fn appended_v2_snapshot(
         view.root_policy_sha256(),
         hot_reads,
         |object| {
+            // Only the exact newly committed object can inherit the submitted
+            // bytes. Recheck its canonical root before entering the existing
+            // bounded, generation-checked cache; old or cold objects fall back
+            // to physical CAS verification.
+            let cached = external_payload
+                .filter(|(id, _)| *id == object.object_id.get())
+                .and_then(|(_, bytes)| hot_reads.insert_external(object, bytes));
             if let Some(handle) = view.object_for_recovered(object) {
                 Some(StorageV2ReadToken::Persistent {
                     handle: handle.clone(),
                     authority_generation,
-                    cached: None,
+                    cached,
                 })
             } else if transient.object_for_recovered(object).is_some() {
                 Some(StorageV2ReadToken::Transient {
                     witness: transient.clone(),
                     recovered: system_arc(object.clone()),
                     authority_generation,
-                    cached: None,
+                    cached,
                 })
             } else {
                 None
@@ -4218,7 +4270,7 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                     return Err(vibeos_object_store::StoreError::Corrupt);
                 }
                 let transient = system_arc(transient);
-                let snapshot = match appended_v2_snapshot(&view, transient, &runtime.hot_reads) {
+                let snapshot = match appended_v2_snapshot(&view, transient, &runtime.hot_reads, None) {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
                         runtime.invalidate_recovery_cache();
@@ -4401,7 +4453,7 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                 Some(replacement) => replacement,
                 None => &view,
             };
-            let snapshot = match appended_v2_snapshot(snapshot_view, transient, &runtime.hot_reads)
+            let snapshot = match appended_v2_snapshot(snapshot_view, transient, &runtime.hot_reads, external_payload)
             {
                 Ok(snapshot) => snapshot,
                 Err(error) => {

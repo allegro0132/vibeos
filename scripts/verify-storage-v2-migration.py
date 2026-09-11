@@ -322,7 +322,7 @@ def recover_record_stream(record_stream: bytes) -> Any:
         )
         at = M4_FIRST * BLOCK + index
         journal[at:at + BLOCK] = sector
-    state = legacy_codec.recover(bytes(journal))
+    state = legacy_codec.recover(bytes(journal), allow_external=True)
     require(state.formatted, "persistent authority record stream is not formatted")
     return state
 
@@ -1102,8 +1102,6 @@ def reconstruct_v2_checkpoint(
             authority_generation,
             authority_policy=authority_policy,
         )
-        authority_state = recover_record_stream(authority["record_stream"])
-        authority_objects = authority_policy.exact_objects(authority_state)
     else:
         require(
             authority_pointer["status"] == "null" and not require_authority,
@@ -1284,6 +1282,12 @@ def reconstruct_v2_checkpoint(
         )
         contents[key] = gc_verifier.verify_canonical_blob(
             bytes(encoded), blob["blob_key"]
+        )
+
+    if authority is not None:
+        authority_state = recover_record_stream(authority["record_stream"])
+        authority_objects = select_verified_authority_objects(
+            authority_state, contents, authority_policy
         )
 
     roots = [] if authority is None else [
@@ -2003,6 +2007,23 @@ def verify_file_tree(v2: dict[str, Any], require_present: bool) -> dict[str, Any
     }
 
 
+def select_verified_authority_objects(state: Any, contents: dict, policy: AuthorityPolicy) -> dict:
+    """Materialize external records only from fully verified canonical CAS blobs."""
+    resolved_external = set()
+    for stable_id, (length, root) in state.external_objects.items():
+        kind, _, sequence = state.objects[stable_id]
+        content = contents.get((1, kind, length, root))
+        if content is not None:
+            state.objects[stable_id] = (kind, content, sequence)
+            resolved_external.add(stable_id)
+    selected = policy.exact_objects(state)
+    require(
+        (set(selected) & set(state.external_objects)) <= resolved_external,
+        "selected external journal object has no verified CAS content",
+    )
+    return selected
+
+
 def verify_authority_bindings(v2: dict[str, Any], require_file_tree: bool = False) -> dict[str, Any]:
     recovered = v2["recovered"]
     authority = recovered["authority"]
@@ -2379,6 +2400,84 @@ def fixture() -> bytearray:
     return image
 
 
+def external_record_selftest() -> int:
+    codec = legacy_codec
+    payload = bytearray(64)
+    payload[:16] = (2).to_bytes(16, "little")
+    struct.pack_into("<I", payload, 16, 123)
+    content = b"external payload"
+    struct.pack_into("<Q", payload, 24, len(content))
+    root = gc_verifier.canonical_blob_root(123, content)
+    payload[32:] = root
+
+    def records(value: bytes, duplicate: bool = False) -> list[bytes]:
+        result = []
+        crc = 0
+        items = [(codec.FORMAT, b"", 0), (codec.HIGH_WATER, (10).to_bytes(16, "little"), 0),
+                 (codec.OBJECT_EXTERNAL, value, 1)]
+        if duplicate:
+            items.append((codec.OBJECT_EXTERNAL, value, 3))
+        for index, (kind, data, tx) in enumerate(items):
+            raw = codec.encode_record(kind, data, index + 1, index, crc, tx)
+            crc = codec.u32(raw, codec.CRC_OFFSET)
+            result.append(raw)
+        return result
+
+    stream = b"".join(records(bytes(payload)))
+    state = recover_record_stream(stream)
+    require(state.external_objects == {2: (len(content), root)}, "external identity drifted")
+    require(state.objects[2][1] == b"", "journal invented external bytes")
+    select_all = AuthorityPolicy(b"external-test", lambda state: dict(state.objects))
+    require(select_verified_authority_objects(state, {(1, 123, len(content), root): content},
+                                             select_all)[2][1] == content,
+            "verified external content was not materialized")
+    cases = 1
+    complete = records(bytes(payload))
+    baseline = codec.recover(codec.image_with(complete[:2]), allow_external=True)
+    for cut in range(BLOCK):
+        partial = codec.recover(codec.image_with(complete[:2], complete[2][:cut]),
+                                allow_external=True)
+        require(partial.fingerprint() == baseline.fingerprint(),
+                "partial external record published an object")
+        cases += 1
+    # Absent or mismatched CAS identities may never materialize a selected object.
+    for contents in ({}, {(1, 124, len(content), root): content},
+                     {(1, 123, len(content) + 1, root): content},
+                     {(1, 123, len(content), bytes(32)): content}):
+        try:
+            select_verified_authority_objects(recover_record_stream(stream), contents, select_all)
+        except Violation:
+            cases += 1
+        else:
+            raise Violation("missing external content was accepted")
+    # Retired/unselected history need not retain its payload after GC.
+    require(not select_verified_authority_objects(recover_record_stream(stream), {},
+                AuthorityPolicy(b"unselected", lambda state: {})), "unselected history gained authority")
+    try:
+        codec.recover(codec.image_with(records(bytes(payload))))
+    except ValueError:
+        cases += 1
+    else:
+        raise Violation("legacy recovery silently accepted external bytes")
+    malformed = []
+    for offset, data in [(16, bytes(4)), (20, b"\x01"), (24, bytes(8)),
+                         (24, (64 * 1024 * 1024 + 1).to_bytes(8, "little")),
+                         (32, bytes(32)), (0, (10).to_bytes(16, "little")),
+                         (0, (1).to_bytes(16, "little"))]:
+        bad = bytearray(payload)
+        bad[offset:offset + len(data)] = data
+        malformed.append(records(bytes(bad)))
+    malformed.append(records(bytes(payload), duplicate=True))
+    for bad in malformed:
+        try:
+            recover_record_stream(b"".join(bad))
+        except ValueError:
+            cases += 1
+        else:
+            raise Violation("invalid external record was accepted")
+    return cases
+
+
 def selftest() -> dict[str, Any]:
     image = fixture()
     unmanaged_prefix_baseline = bytes(image[:M4_FIRST * BLOCK])
@@ -2391,7 +2490,7 @@ def selftest() -> dict[str, Any]:
     )
     old = parse_control(page_at(image, CONTROL_FIRST, 0), page_at(image, CONTROL_FIRST, 1))
     body, seal = encode_control(STAGED, 2)
-    cases = 1
+    cases = 1 + external_record_selftest()
     for length in range(PAGE + 1):
         candidate = parse_control(body[:length] + bytes(PAGE - length), bytes(PAGE))
         require(select_control([old, candidate])["generation"] == 1, "body prefix selected V2")

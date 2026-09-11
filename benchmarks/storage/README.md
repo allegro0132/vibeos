@@ -4,6 +4,13 @@ This directory defines the fixed QEMU `virt`/RV64 comparison contract. Results
 come from guest production paths only; host-only adapters are not accepted by
 the record validator.
 
+Current v2 write policy in this worktree uses a 4 KiB inline cutoff and the
+bounded external hot-read cache described below. Earlier 16 KiB measurements
+and the rejected uncached 4 KiB trial are historical comparisons, not the
+current policy. These QEMU results do not qualify physical SD hardware.
+Streaming scratch writes now use up to 128 KiB per submission; the earlier
+64 KiB run measurements below are retained as baselines.
+
 `workloads-v1.json` is the complete qualification matrix. `schema-v1.json` is
 the versioned JSONL record contract. Every coordinate has one of `ok`,
 `unsupported`, `failed-closed`, or `inconclusive`; unsupported measurements do
@@ -421,3 +428,234 @@ Validation passes 184 segment-store unit tests (one ignored), 11 CAS streaming,
 file-store tests (one ignored). The QEMU three-boot production acceptance,
 including GC and independent powered-off verification, and Milk-V Duo
 compile-only check also pass. No physical SD device was exercised.
+
+## Rejected experiment: move 4 KiB blob envelopes out of the inline journal
+
+A fresh profile of the saved bounded-sink firmware shows that ordinary 4 KiB
+blob writes still append 15 authority records per invocation. Device writes
+grow as those inline payloads accumulate. Moving the write-policy cutoff from
+16 KiB to 4 KiB routes a 4 KiB logical blob plus its envelope through external
+CAS (an unwrapped object of exactly 4 KiB would still be inline).
+
+The experiment uses the same blank image, 4/2 MiB/s and 400/200 IOPS limits,
+one VM, one warmup and twelve retained `object-durable-put-get` samples per
+version. Each sample publishes unique content and reads it immediately, so
+these are hot read-after-write results, not cold SD reads. Samples accumulate
+objects in one VM. Baseline and candidate runs were sequential, not interleaved.
+
+| Twelve 4 KiB publications | Existing 16 KiB cutoff | Trial 4 KiB cutoff |
+| --- | ---: | ---: |
+| Median put | 26.608 ms | 18.468 ms |
+| Sum of put times | 493.631 ms | 369.859 ms |
+| Median get | 0.258 ms | 3.5995 ms |
+| Total device bytes written | 2,359,296 | 1,761,280 |
+| Total flush requests | 40 | 40 |
+
+Although writes improve, the approximately fourteenfold hot-read slowdown is
+not acceptable as a default small-object policy. The experiment is rejected;
+the worktree and index retain the 16 KiB cutoff. Further work should reduce
+inline authority append amplification while preserving its small-read path,
+or lower external-read CPU overhead before reconsidering the cutoff.
+
+Both variants passed all twelve byte-verifying samples. Object-store tests
+pass (77 unit/integration tests and 14 documentation tests), as do the five
+fused-append recovery sweeps, including compact small external objects. The
+trial firmware, restored-policy baseline, JSONL, summary, rejected source and
+decision manifest are retained in `target/storage-inline4k-20260911/`.
+The preceding profile is in `target/storage-current-profile-20260911/`;
+its 16 MiB timings overlapped a compiler run and must not be used for latency
+comparisons. None of these runs qualifies a physical SD card.
+
+The trial's `storage_v2_native` acceptance boots and passes shell checks, but
+the overall script exits 1: the powered-off verifier rejects sealed sector 95
+with `unknown record kind 9`. Rust defines kind 9 as `ObjectExternal`;
+`scripts/persistent-cspace-image.py` does not decode it. This is not a passing
+cold-image verification. The rejected raw image and full log are retained with
+the experiment, and supporting external records in the independent verifier
+remains necessary before relying on that acceptance for this representation.
+
+## External-object support in the independent verifier
+
+The verifier now decodes `ObjectExternal` records, enforcing canonical length,
+reserved bytes, nonzero Merkle root, reserved stable IDs and unique transaction
+and object identities. Legacy M4 recovery still rejects external records by
+default. V2 journal recovery retains their identity separately from bytes;
+selected external objects are materialized only from fully verified CAS content
+with the matching hash algorithm, object kind, length and root. Existing exact
+authority-to-CAS mapping and quota checks still apply. Unselected historical
+objects may lack content after collection without gaining authority.
+
+The unchanged QEMU image rejected above now passes the complete powered-off
+CLI verifier. Flipping a byte in its external Blob content is rejected. The
+migration verifier selftest passes 25,120 cases, including missing/mismatched
+CAS identities, malformed external metadata, duplicate IDs, legacy rejection
+and all 512 strict byte prefixes of an external record. The existing 19-record
+legacy strict-prefix suite also passes. Evidence is saved in
+`target/storage-external-verifier-20260911/`.
+
+This closes the offline parser gap; it does not reverse the rejected 4 KiB
+cutoff experiment or change runtime durability or storage policy. The image was
+reverified offline; the complete QEMU acceptance script was not rerun here.
+
+## Cache newly committed small external objects
+
+The runtime's existing hot-read cache previously accepted only recovered inline
+bytes. External records contain no inline bytes, so even an immediate read after
+a successful external publication repeated CAS resolution and verification.
+
+After successful publication, the exact new stable object may now populate that
+cache from its submitted payload. Before insertion, its kind, exact length and
+canonical Merkle root must match the committed external record. The cache keeps
+the existing 72 KiB per-object, 256 KiB total and 64-entry limits. Reads still
+require the current authority generation and boot proof; cold recovery and
+ambiguous failures clear the cache. A stale or evicted token falls back to the
+normal verified read path. As with the existing inline and page caches, a hot
+hit is not fresh evidence about subsequent physical-media damage.
+
+The matched QEMU experiment uses 32 KiB logical blobs, the unchanged 16 KiB
+inline threshold, one VM per version, one warmup and twelve retained unique
+put/get samples, under 4/2 MiB/s and 400/200 IOPS limits. Baseline and candidate
+run sequentially from the same blank template.
+
+| Metric | Before external cache admission | After |
+| --- | ---: | ---: |
+| Median put | 19.453 ms | 18.9475 ms |
+| Median immediate get | 2.747 ms | 0.6995 ms |
+| Median complete put/get | 22.1075 ms | 19.665 ms |
+
+All samples verify the returned bytes, and all device counters match per sample.
+The approximately 3.9-times get improvement is a hot-read software-path result:
+both versions already perform zero device reads in this get phase. It is not a
+cold-read or physical SD-card speedup. No format, threshold or durability policy
+changes accompany cache admission. Evidence and saved firmware are under
+`target/storage-external-hot-20260911/`.
+
+QEMU kernel selftest passes (390 reported checks), including the extended
+hot-cache assertions for altered payload, wrong length, wrong kind, inline
+records, capacity eviction and clearing weak tokens. Milk-V Duo compilation
+also passes. The independent verifier changes from the previous section remain
+unchanged; this runtime cache does not participate in powered-off verification.
+
+## Retest the 4 KiB cutoff with external hot-read caching
+
+With verified external cache admission in place, the v2 facade now uses a
+4 KiB inline write cutoff. The fixed format limits and existing on-disk
+representations are unchanged. Blob envelopes for 4 KiB and 8 KiB logical
+payloads use external CAS, keeping their content out of later authority-log
+rewrites. Raw objects of at most 4 KiB remain inline.
+
+Each variant uses two fresh QEMU VMs, one warmup and twelve retained unique
+put/get samples per VM, with the same blank template and 4/2 MiB/s, 400/200 IOPS
+limits. Both variants have the external cache; only the inline cutoff differs.
+Variants and sizes run sequentially. Totals below cover 24 retained samples.
+
+| Metric | 16 KiB cutoff | 4 KiB cutoff |
+| --- | ---: | ---: |
+| 4 KiB median put | 16.5655 ms | 10.6905 ms |
+| 4 KiB median hot get | 0.1305 ms | 0.1445 ms |
+| 4 KiB total device writes | 4,718,592 bytes | 3,522,560 bytes |
+| 8 KiB median put | 49.775 ms | 12.625 ms |
+| 8 KiB median hot get | 0.3475 ms | 0.172 ms |
+| 8 KiB total device writes | 5,931,008 bytes | 3,620,864 bytes |
+
+For each size both variants issue 80 flushes, and their immediate get phases
+perform no device reads. The cutoff reduces total writes by approximately 25%
+and 39% respectively. The earlier fourteenfold 4 KiB read regression is gone;
+the new 4 KiB hot-get median is still 14 microseconds higher, while its put
+median improves about 35%. These are read-after-write results; cold-read
+performance has not been quantified by this experiment.
+
+Object-store tests pass (77 unit/integration and 14 documentation tests).
+The five fused-append recovery sweeps now also exercise an admitted external
+object of 4,097 bytes at every mutation boundary, verifying cold-recovered
+contents and old-or-complete-new publication. The existing 16 KiB and 128 KiB
+external cut sweeps remain. Firmware, source hashes, JSONL and summaries are
+saved under `target/storage-small-cas-20260911/`.
+
+The native Storage V2 QEMU acceptance now passes both boots and the complete
+powered-off verifier (including the external record that previously failed
+parsing). Milk-V Duo compile-only validation passes. The 4 KiB cutoff is
+retained with external cache admission; no real device was modified or tested.
+
+## Reuse pages within a directed CAS read
+
+Directed chunk/range reads now retain the header-validation window for their
+content and proof reads. Hash lookups may also hit an existing content window;
+a hash miss still uses the separate hash slots so proof traversal cannot evict
+payload read-ahead. This avoids rereading the compact Blob's first page after
+checking its header, and its final page when content and proof hashes share it.
+All windows are per invocation, and all Merkle proof checks remain in place.
+
+A host fault-device regression mounts an 8 KiB compact Blob cold, then reads
+its final leaf. Page reads fall from 25 to 24; the shared content/proof page is
+read once rather than twice. A first-leaf check also bounds its header page to
+one read. Damaging a required proof hash after those successful reads makes
+the next invocation fail. These counts exclude mount I/O and count pages,
+not necessarily grouped device requests or actual SD commands. No wall-clock
+speedup is claimed from this trace.
+
+Validation passes 184 segment-store unit tests (one ignored), 12 CAS streaming
+tests, 5 fused-append recovery sweeps, 4 steady-state tests and 28 file-store
+tests (one ignored). QEMU release and Milk-V Duo compile-only checks pass.
+Source and traces are saved in `target/storage-proof-reuse-20260911/`.
+The native QEMU acceptance also passes two boots and independent powered-off
+verification. This acceptance validates behavior, not the trace's performance
+on the emulated device; its hot cache can already hide redundant page reads.
+
+## Empty logical ranges do not select leaf zero
+
+`read_blob_ranges` previously mapped every zero-length range to leaf zero.
+It now emits an empty result in place and preserves the preceding verified
+leaf for subsequent ranges. Bounds, object authority, manifest and canonical
+header checks still precede this handling; this is not an unchecked early
+return. Nonempty requested bytes still require their normal Merkle proofs.
+
+The regression compares an empty batch with two zero-length ranges at offset
+zero and EOF: both now perform only two metadata/header page reads in the test
+fixture, versus four for the old zero-length range path. An empty range beyond
+EOF fails before I/O. A mixed batch reading the second leaf still succeeds
+when the unrequested first leaf is damaged, while a request for that damaged
+content fails. This is a host page-count result, not a throughput measurement.
+
+Validation passes 185 segment-store unit tests (one ignored), 12 CAS streaming
+tests and the QEMU firmware compile check. No fresh QEMU timing or hardware
+run is claimed for this boundary fix. Logs and source hashes are saved under
+`target/storage-empty-range-20260911/`.
+
+## Match streaming writes to the 128 KiB transfer ceiling
+
+Large-object scratch writes now buffer up to 32 pages (128 KiB), matching the
+existing SD/virtio transfer ceiling and the bounded metadata-drain buffer.
+This increases payload-buffer capacity by 64 KiB per active streaming writer;
+it does not reduce total bytes written or change durability barriers.
+
+Host attribution for a 16 MiB file changes staging from 329 to 201 write
+requests, with the same 17,436 KiB and ten flushes. A separate 3 MiB + 17-byte
+CAS stream changes from 89 to 65 write requests, with 824 pages and four
+flushes in both versions. Partial-failure/cancellation coverage now exercises
+all 32 page boundaries of a submitted run. Acknowledged-damaged-write tests
+still cover both strict and deferred verification policies.
+
+The matched QEMU workload writes, verifies and deletes a unique 16 MiB file,
+using one fresh VM and one warmup per variant. Read/write bandwidth stays at
+4/2 MiB/s and read IOPS at 400. Both profiles are reported:
+
+| Write request limit | Retained samples | 64 KiB batches | 128 KiB batches |
+| --- | ---: | ---: | ---: |
+| 200 IOPS (standard profile) | 3 | 12.955218 s | 13.084967 s |
+| 20 IOPS (request-limited control) | 2 | 21.466940 s | 16.009608 s |
+
+Values are median complete-workload times. The standard profile is roughly
+unchanged (candidate about 1% slower); the deliberately request-limited
+control improves about 25%. The latter was added to distinguish request
+overhead from bandwidth limits, not as a claim about a particular SD card.
+Device read/write bytes and flush counts match per sample in both profiles.
+Standard-profile write requests fall from 337 / 346 / 337 to 209 / 218 / 209.
+
+The baseline is the saved proof-reuse firmware. It predates the empty-range
+fix, which this nonempty file workload does not exercise. Candidate firmware
+includes that fix and the enlarged streaming buffer. The retained baseline
+samples start after an overlapping host-test build finished during warmup.
+Twelve CAS streaming tests, five fused-append recovery sweeps, four steady-state
+tests, the large-file attribution check, QEMU execution and Duo compilation
+validate this change. Evidence is in `target/storage-stream128-20260911/`.

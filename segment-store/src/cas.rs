@@ -72,8 +72,8 @@ const MAX_BATCHED_BLOB_READ_LIMIT: usize = 512 * 1024;
 const SMALL_BLOB_SINK_LIMIT: u64 = 256 * 1024;
 
 // Large blobs retain only one bounded contiguous run, independent of object
-// size. Keep it below the SD driver's 128 KiB request ceiling.
-const STREAMING_WRITE_PAGES: usize = 16;
+// size. Match the SD/virtio 128 KiB request ceiling.
+const STREAMING_WRITE_PAGES: usize = 32;
 
 /// Buffered writes of a deferred-barrier publication window. Pages are
 /// staged in memory and drained to the device as contiguous multi-page
@@ -1572,9 +1572,9 @@ impl<D: PageDevice> SegmentStore<D> {
         index: u32,
     ) -> Result<VerifiedCasChunk, CasStoreError<D::Error>> {
         let read_pin = self.pin_blob_reader(object)?;
-        let (descriptor, manifest) = self.resolve_authorized_manifest(object).await?;
-        let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
         let mut reader = ManifestRangeReader::new(false);
+        let (descriptor, manifest) = self.resolve_authorized_manifest(object, &mut reader).await?;
+        let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
         let chunk = read_resolved_chunk(
             &self.device,
             state,
@@ -1606,9 +1606,9 @@ impl<D: PageDevice> SegmentStore<D> {
                 .ok_or(StoreError::ObjectUnavailable)?;
         }
         let read_pin = self.pin_blob_reader(object)?;
-        let (descriptor, manifest) = self.resolve_authorized_manifest(object).await?;
-        let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
         let mut reader = ManifestRangeReader::new(false);
+        let (descriptor, manifest) = self.resolve_authorized_manifest(object, &mut reader).await?;
+        let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
         let mut previous: Option<VerifiedCasChunk> = None;
         let mut results = Vec::new();
         results
@@ -1616,13 +1616,19 @@ impl<D: PageDevice> SegmentStore<D> {
             .map_err(|_| StoreError::MemoryLimit)?;
         let leaf_size = LEAF_SIZE as u64;
         for &(offset, len) in ranges {
+            if len == 0 {
+                // No leaf intersects an empty range. Preserve the previously
+                // verified leaf for the next nonempty range in this batch.
+                results.push(Vec::new());
+                continue;
+            }
             let end = offset + len as u64; // all ranges were checked before I/O
             let mut bytes = Vec::new();
             bytes
                 .try_reserve_exact(len)
                 .map_err(|_| StoreError::MemoryLimit)?;
-            let first = if len == 0 { 0 } else { offset / leaf_size };
-            let last = if len == 0 { 0 } else { (end - 1) / leaf_size };
+            let first = offset / leaf_size;
+            let last = (end - 1) / leaf_size;
             for index in first..=last {
                 let index = u32::try_from(index).map_err(|_| StoreError::Corrupt)?;
                 if previous.as_ref().is_none_or(|chunk| chunk.index != index) {
@@ -1639,12 +1645,10 @@ impl<D: PageDevice> SegmentStore<D> {
                     );
                 }
                 let chunk = previous.as_ref().expect("verified leaf initialized");
-                if len != 0 {
-                    let base = u64::from(index) * leaf_size;
-                    let start = offset.saturating_sub(base) as usize;
-                    let stop = (end - base).min(chunk.bytes.len() as u64) as usize;
-                    bytes.extend_from_slice(&chunk.bytes[start..stop]);
-                }
+                let base = u64::from(index) * leaf_size;
+                let start = offset.saturating_sub(base) as usize;
+                let stop = (end - base).min(chunk.bytes.len() as u64) as usize;
+                bytes.extend_from_slice(&chunk.bytes[start..stop]);
             }
             results.push(bytes);
         }
@@ -1657,7 +1661,8 @@ impl<D: PageDevice> SegmentStore<D> {
         object: &AuthorizedObject<CasObjectHandle>,
     ) -> Result<VerifiedCasBlob, CasStoreError<D::Error>> {
         let read_pin = self.pin_blob_reader(object)?;
-        let (descriptor, manifest) = self.resolve_authorized_manifest(object).await?;
+        let mut reader = ManifestRangeReader::new(false);
+        let (descriptor, manifest) = self.resolve_authorized_manifest(object, &mut reader).await?;
         let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
         verify_resolved_blob(&self.device, state, descriptor, &manifest).await?;
         drop(read_pin);
@@ -1686,7 +1691,7 @@ impl<D: PageDevice> SegmentStore<D> {
         let bytes = if manifest.encoded_blob_len <= batched_limit as u64 {
             read_small_verified_blob(&self.device, state, descriptor, &manifest, Some(&self.verified_scans)).await?
         } else {
-            validate_resolved_manifest(&self.device, state, descriptor, &manifest, Some(&self.verified_scans)).await?;
+            validate_resolved_manifest(&self.device, state, descriptor, &manifest, Some(&self.verified_scans), &mut ManifestRangeReader::new(false)).await?;
             read_and_verify_resolved_blob(&self.device, state, descriptor, &manifest).await?
         };
         drop(read_pin);
@@ -1696,10 +1701,11 @@ impl<D: PageDevice> SegmentStore<D> {
     async fn resolve_authorized_manifest(
         &self,
         object: &AuthorizedObject<CasObjectHandle>,
+        reader: &mut ManifestRangeReader,
     ) -> Result<(BlobDescriptor, BlobManifest), CasStoreError<D::Error>> {
         let (descriptor, manifest) = self.resolve_authorized_manifest_unverified(object).await?;
         let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
-        validate_resolved_manifest(&self.device, state, descriptor, &manifest, Some(&self.verified_scans)).await?;
+        validate_resolved_manifest(&self.device, state, descriptor, &manifest, Some(&self.verified_scans), reader).await?;
         Ok((descriptor, manifest))
     }
 
@@ -1874,6 +1880,7 @@ async fn validate_resolved_manifest<D: PageDevice>(
     descriptor: BlobDescriptor,
     manifest: &BlobManifest,
     memo: Option<&VerifiedSegmentScans>,
+    reader: &mut ManifestRangeReader,
 ) -> Result<(), CasStoreError<D::Error>> {
     validate_cas_blob_descriptors(
         device,
@@ -1885,7 +1892,7 @@ async fn validate_resolved_manifest<D: PageDevice>(
         memo,
     )
     .await?;
-    let header = read_manifest_range(device, state, manifest, 0, HEADER_SIZE).await?;
+    let header = reader.read(device, state, manifest, 0, HEADER_SIZE).await?;
     let header: &[u8; HEADER_SIZE] = header
         .as_slice()
         .try_into()
@@ -2201,7 +2208,7 @@ async fn verify_tree_emissions<D: PageDevice>(
     Ok(())
 }
 
-/// Per-invocation windows: at most 64 KiB of content and 16 hash pages.
+/// Per-invocation windows: at most 128 KiB of content and 16 hash pages.
 /// The hash-page LRU retains upper tree levels while leaves stream past;
 /// no observation survives a read operation.
 #[derive(Default)]
@@ -2291,8 +2298,13 @@ impl ManifestRangeReader {
                 self.windows
                     .iter()
                     .enumerate()
-                    .skip(1)
-                    .find(|(_, window)| window.first == physical && !window.pages.is_empty())
+                    // A compact Blob can place proof hashes in the last
+                    // content page already read by this invocation. Reuse
+                    // that snapshot too; misses still choose hash-only slots.
+                    .find(|(_, window)| {
+                        physical >= window.first
+                            && physical - window.first < window.pages.len() as u64
+                    })
                     .map(|(slot, _)| slot)
                     .unwrap_or_else(|| {
                         self.windows
@@ -2317,7 +2329,7 @@ impl ManifestRangeReader {
                 let wanted = if len == HASH_SIZE {
                     1
                 } else if self.read_ahead {
-                    16
+                    32
                 } else {
                     (len - copied
                         + if page_index == first_page {

@@ -1874,6 +1874,9 @@ mod io_trace {
             read_pages * (PAGE_SIZE as u64) < bytes.len() as u64 * 5 / 4,
             "whole-file read repeated payload verification: {read_pages} pages"
         );
+        let read_requests = reads.iter().filter(|event| matches!(event, Event::Read(_, _))).count();
+        assert!(read_requests < 400,
+            "whole-file verification fragmented sequential reads: {read_requests} requests");
         report("unique-read", &reads);
         let mut tx = fixture.root.begin().unwrap();
         tx.remove(&path, false, false).unwrap();

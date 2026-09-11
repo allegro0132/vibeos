@@ -633,6 +633,53 @@ fn empty_blob_is_canonical_across_commit_and_cold_mount() {
 }
 
 #[test]
+fn directed_tail_read_reuses_content_page_for_its_proof() {
+    let exact_len = (PAGE_SIZE * 2) as u64;
+    let device = FaultDevice::blank(12);
+    let mut store = format(device.clone());
+    let object = put_stream(&mut store, exact_len);
+    let runtime = store.runtime_context();
+    drop(store);
+    device.power_cycle();
+    let (cold, _) = mount_with_runtime(device.clone(), runtime);
+    let header_page = device
+        .durable_image()
+        .iter()
+        .find_map(|(number, page)| page.starts_with(b"VIBEBLB\0").then_some(*number))
+        .expect("compact Blob header must be on media");
+    device.reset_reads();
+    let chunk = block_on(cold.get_blob_chunk(&object, 1)).unwrap();
+    assert_eq!(chunk.bytes, pattern_chunk(1, PAGE_SIZE));
+    vibeos_blob_format::verify_proof(chunk.descriptor, &chunk.bytes, &chunk.proof).unwrap();
+    let tail_reads = device
+        .0
+        .lock()
+        .unwrap()
+        .read_pages
+        .get(&(header_page + 2))
+        .copied()
+        .unwrap_or(0);
+    println!(
+        "directed tail: {} total page reads, {tail_reads} tail-page reads",
+        device.read_count()
+    );
+    assert_eq!(
+        tail_reads, 1,
+        "proof reread the content window's final page"
+    );
+    device.reset_reads();
+    let first = block_on(cold.get_blob_chunk(&object, 0)).unwrap();
+    assert_eq!(first.bytes, pattern_chunk(0, PAGE_SIZE));
+    let header_reads = device.0.lock().unwrap().read_pages.get(&header_page).copied().unwrap_or(0);
+    assert_eq!(header_reads, 1, "content reread the validated header page");
+    // Reuse lasts only for this invocation; a later damaged proof must fail.
+    let encoded = vibeos_blob_format::encode_blob(OBJECT_KIND, &content(exact_len)).unwrap();
+    let tree = &encoded[vibeos_blob_format::HEADER_SIZE + exact_len as usize..];
+    device.flip_durable_page_with_prefix(tree, 0);
+    assert!(block_on(cold.get_blob_chunk(&object, 1)).is_err());
+}
+
+#[test]
 fn corrupted_content_and_required_proof_bytes_fail_closed() {
     let exact_len = (PAGE_SIZE * 2) as u64;
     let device = FaultDevice::blank(12);
@@ -909,7 +956,7 @@ fn every_commit_mutation_boundary_recovers_the_old_or_exact_new_cas_checkpoint()
 fn streaming_run_partial_failure_or_cancellation_never_publishes() {
     // PageDevice's default batched writer exposes every page boundary,
     // including a durable prefix followed by a failed/cancelled page.
-    for boundary in 0..16 {
+    for boundary in 0..32 {
         for action in [
             FaultAction::FailNotSubmitted,
             FaultAction::FailAmbiguous(Effect::Durable),
@@ -921,11 +968,11 @@ fn streaming_run_partial_failure_or_cancellation_never_publishes() {
             let mut writer = store
                 .begin_blob(OBJECT_KIND, 1024 * 1024 + 1, None)
                 .unwrap();
-            for index in 0..15 {
+            for index in 0..31 {
                 block_on(writer.write_chunk(&pattern_chunk(index, PAGE_SIZE))).unwrap();
             }
             device.arm(boundary, action);
-            let chunk = pattern_chunk(15, PAGE_SIZE);
+            let chunk = pattern_chunk(31, PAGE_SIZE);
             let mut write = Box::pin(writer.write_chunk(&chunk));
             match action {
                 FaultAction::Pending(_) => assert!(poll_once(write.as_mut()).is_pending()),
@@ -955,13 +1002,13 @@ fn deferred_readback_never_serves_an_acknowledged_damaged_write() {
         store.set_deferred_commit_readback(deferred);
         let length = 1024 * 1024 + 1;
         let mut writer = store.begin_blob(OBJECT_KIND, length, None).unwrap();
-        for index in 0..15 {
+        for index in 0..31 {
             block_on(writer.write_chunk(&pattern_chunk(index, PAGE_SIZE))).unwrap();
         }
         // Damage the first content page of the next submitted run while
         // acknowledging success; subsequent barriers make that damage durable.
         device.arm(0, FaultAction::CorruptWriteAndAcknowledge);
-        for index in 15..length.div_ceil(PAGE_SIZE as u64) {
+        for index in 31..length.div_ceil(PAGE_SIZE as u64) {
             let count = (length - index * PAGE_SIZE as u64).min(PAGE_SIZE as u64) as usize;
             block_on(writer.write_chunk(&pattern_chunk(index as u32, count))).unwrap();
         }

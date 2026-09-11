@@ -2647,6 +2647,7 @@ mod tests {
         visible: BTreeMap<u64, Page>,
         durable: BTreeMap<u64, Page>,
         mutation_count: usize,
+        read_count: usize,
         fault: Option<(usize, FaultAction)>,
     }
 
@@ -2658,6 +2659,7 @@ mod tests {
                     visible: BTreeMap::new(),
                     durable: BTreeMap::new(),
                     mutation_count: 0,
+                    read_count: 0,
                     fault: None,
                 })),
             }
@@ -2712,7 +2714,8 @@ mod tests {
         }
 
         async fn read_page(&self, page: u64, output: &mut Page) -> Result<(), Self::Error> {
-            let media = self.media.lock().unwrap();
+            let mut media = self.media.lock().unwrap();
+            media.read_count += 1;
             if page >= media.page_count {
                 return Err(TestError::OutsideRange);
             }
@@ -2806,6 +2809,62 @@ mod tests {
             block_on(store.commit_fs_btree_node(FsTreeKind::Dirent, 0, generation, &[])).unwrap();
         block_on(store.commit_fs_root(NAMESPACE, generation, next_file_id, 1, &inode, &dirent))
             .unwrap()
+    }
+
+    #[test]
+    fn empty_ranges_do_not_read_unrequested_leaves() {
+        let device = TestDevice::blank(24);
+        let mut store = format(device.clone());
+        let expected: Vec<u8> = (0..8192).map(|i| (i * 137 % 251) as u8).collect();
+        let mut writer = store
+            .begin_blob(0x5445_5354, expected.len() as u64, None)
+            .unwrap();
+        for chunk in expected.chunks(vibeos_blob_format::LEAF_SIZE) {
+            block_on(writer.write_chunk(chunk)).unwrap();
+        }
+        let object = block_on(writer.commit()).unwrap();
+        block_on(store.read_blob_ranges(&object, &[])).unwrap();
+        device.media.lock().unwrap().read_count = 0;
+        assert!(block_on(store.read_blob_ranges(&object, &[]))
+            .unwrap()
+            .is_empty());
+        let metadata_reads = device.media.lock().unwrap().read_count;
+        device.media.lock().unwrap().read_count = 0;
+        let empty = block_on(store.read_blob_ranges(&object, &[(0, 0), (8192, 0)])).unwrap();
+        assert_eq!(empty, [Vec::<u8>::new(), Vec::new()]);
+        assert_eq!(
+            device.media.lock().unwrap().read_count,
+            metadata_reads,
+            "empty ranges read a payload leaf beyond manifest/header validation"
+        );
+        device.media.lock().unwrap().read_count = 0;
+        assert!(block_on(store.read_blob_ranges(&object, &[(8193, 0)])).is_err());
+        assert_eq!(device.media.lock().unwrap().read_count, 0);
+        let mut media = device.media.lock().unwrap();
+        let (number, at) = media
+            .visible
+            .iter()
+            .find_map(|(number, page)| {
+                page.windows(64)
+                    .position(|bytes| bytes == &expected[..64])
+                    .map(|at| (*number, at))
+            })
+            .unwrap();
+        media.visible.get_mut(&number).unwrap()[at + 7] ^= 1;
+        drop(media);
+        let observed =
+            block_on(store.read_blob_ranges(&object, &[(4096, 8), (0, 0), (4104, 8), (8192, 0)]))
+                .unwrap();
+        assert_eq!(
+            observed,
+            [
+                expected[4096..4104].to_vec(),
+                Vec::new(),
+                expected[4104..4112].to_vec(),
+                Vec::new()
+            ]
+        );
+        assert!(block_on(store.read_blob_ranges(&object, &[(0, 8)])).is_err());
     }
 
     #[test]

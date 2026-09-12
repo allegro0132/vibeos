@@ -8,11 +8,10 @@
 use alloc::boxed::Box;
 use core::fmt;
 
-use sha2::{Digest, Sha256};
 use vibeos_segment_format::{
-    decode_extent_verified, decode_segment_header_verified, payload_sha256, segment_base_page,
+    payload_sha256, segment_base_page,
     select_checkpoint_for_superblock, select_superblock, Checkpoint, DecodeStatus, ExtentKind,
-    ExtentRecord, PhysicalPointer, PointerValue, DATA_FIRST_PAGE, PAGE_SIZE, SEGMENT_PAGES,
+    PhysicalPointer, PAGE_SIZE, SEGMENT_PAGES,
 };
 
 use crate::allocation_v2::SegmentAllocation;
@@ -27,7 +26,7 @@ use crate::maintenance::{MaintenanceOperation, StoreMaintenance};
 use crate::mark::{MarkRoot, RootClass};
 use crate::pins::RootKey;
 use crate::store::{
-    read_checkpoint, read_pointer_payload, read_superblock, recover_state_for_scrub, scan_segment,
+    read_checkpoint, read_pointer_payload, read_superblock, recover_state_for_scrub, scan_segment_for_scrub,
     validate_checkpoint_transition, CheckpointTransitionWitness, MountedState, SegmentStore,
     StoreError, VerifiedSegmentScans,
 };
@@ -809,56 +808,16 @@ async fn verify_segment_set<D: PageDevice>(
         if peak > total_memory_limit { return Err(StepError::MemoryLimit); }
         observed_peak = peak;
         if let Some(value) = report.as_deref_mut() { value.observe_memory(peak); }
-        let base = segment_base_page(segment_no).map_err(|_| StepError::Corrupt)?;
-        let mut pair = Box::new([[0; PAGE_SIZE]; 2]);
-        device.read_pages(base, pair.as_mut()).await.map_err(StepError::Device)?;
-        let header = match decode_segment_header_verified(&pair[0], &pair[1])
-            .map_err(|_| StepError::Corrupt)?
-        {
-            DecodeStatus::Sealed(value) => value,
-            DecodeStatus::Empty | DecodeStatus::Unsealed => return Err(StepError::Corrupt),
-        };
-        let value = *header.value();
-        drop(pair);
-        if value.binding.store_uuid != state.superblock.binding.store_uuid
-            || value.binding.segment_no != segment_no
-            || value.binding.generation == 0
-            || value.binding.generation >= state.next_segment_generation
-            || value.binding.target_checkpoint_generation > state.generation
-        {
-            return Err(StepError::Corrupt);
-        }
-        let probe = PointerValue {
-            store_uuid: state.superblock.binding.store_uuid,
-            segment_no,
-            segment_generation: value.binding.generation,
-            descriptor_relative_page: 0,
-            payload_relative_page: 0,
-            payload_pages: 1,
-            ordinal: 0,
-            exact_byte_len: 1,
-            extent_kind: ExtentKind::Blob,
-            payload_sha256: [0; 32],
-        };
-        let scanned = scan_segment(
+        let scanned = scan_segment_for_scrub(
             device,
             state.superblock.binding.store_uuid,
             state.admitted_segments,
             state.next_segment_generation,
             state.generation,
-            probe,
-            None,
+            segment_no,
         )
         .await
         .map_err(StepError::from_store)?;
-        verify_segment_payloads_and_padding(
-            device,
-            state,
-            segment_no,
-            value.binding.generation,
-            scanned.record_count,
-        )
-        .await?;
         if let Some(value) = report.as_deref_mut() {
             value.verified_segments = value.verified_segments.saturating_add(1);
             value.verified_record_pairs = value
@@ -1120,7 +1079,7 @@ async fn verify_state_contents_with_memo<D: PageDevice>(
 }
 
 /// Authenticate exact payload bytes and require canonical zero padding with a
-/// single page of stack workspace.  Semantic Blob-tree verification remains a
+/// two-page heap workspace.  Semantic Blob-tree verification remains a
 /// separate pass because a valid per-extent hash alone cannot bind the tree to
 /// the Blob descriptor.
 async fn verify_pointer_payload_and_padding<D: PageDevice>(
@@ -1148,103 +1107,12 @@ async fn verify_pointer_payload_and_padding<D: PageDevice>(
     .await
 }
 
-async fn verify_segment_payloads_and_padding<D: PageDevice>(
-    device: &D,
-    state: &MountedState,
-    segment_no: u64,
-    segment_generation: u64,
-    record_count: u32,
-) -> Result<(), StepError<D::Error>> {
-    let base = segment_base_page(segment_no).map_err(|_| StepError::Corrupt)?;
-    let mut relative = DATA_FIRST_PAGE;
-    for ordinal in 1..=record_count {
-        let descriptor_page = base
-            .checked_add(u64::from(relative))
-            .ok_or(StepError::Corrupt)?;
-        // Descriptor and seal are adjacent and retain the same two-page
-        // workspace. Release it before streaming the payload.
-        descriptor_page.checked_add(1).ok_or(StepError::Corrupt)?;
-        let mut pair = Box::new([[0; PAGE_SIZE]; 2]);
-        device.read_pages(descriptor_page, pair.as_mut()).await.map_err(StepError::Device)?;
-        let extent = match decode_extent_verified(&pair[0], &pair[1]).map_err(|_| StepError::Corrupt)? {
-            DecodeStatus::Sealed(extent) => *extent.value(),
-            DecodeStatus::Empty | DecodeStatus::Unsealed => return Err(StepError::Corrupt),
-        };
-        drop(pair);
-        if extent.binding.store_uuid != state.superblock.binding.store_uuid
-            || extent.binding.segment_no != segment_no
-            || extent.binding.generation != segment_generation
-            || extent.binding.ordinal != ordinal
-            || extent.binding.self_page != descriptor_page
-            || extent.binding.target_checkpoint_generation > state.generation
-            || extent.payload_first_relative_page != relative + 2
-        {
-            return Err(StepError::Corrupt);
-        }
-        verify_extent_payload_and_padding(device, base, extent).await?;
-        relative = relative
-            .checked_add(extent.record_span_pages)
-            .ok_or(StepError::Corrupt)?;
-    }
-    Ok(())
-}
-
-async fn verify_extent_payload_and_padding<D: PageDevice>(
-    device: &D,
-    segment_base: u64,
-    extent: ExtentRecord,
-) -> Result<(), StepError<D::Error>> {
-    let first = segment_base
-        .checked_add(u64::from(extent.payload_first_relative_page))
-        .ok_or(StepError::Corrupt)?;
-    verify_exact_payload_and_padding(
-        device,
-        first,
-        extent.payload_pages,
-        extent.payload_byte_len,
-        extent.payload_sha256,
-    )
-    .await
-}
-
 async fn verify_exact_payload_and_padding<D: PageDevice>(
-    device: &D,
-    first_page: u64,
-    payload_pages: u32,
-    exact_byte_len: u64,
+    device: &D, first_page: u64, payload_pages: u32, exact_byte_len: u64,
     expected_sha256: [u8; 32],
 ) -> Result<(), StepError<D::Error>> {
-    if exact_byte_len == 0 || u64::from(payload_pages) != exact_byte_len.div_ceil(PAGE_SIZE as u64)
-    {
-        return Err(StepError::Corrupt);
-    }
-    let mut remaining = exact_byte_len;
-    let mut hasher = Sha256::new();
-    // Keep the batch within scrub's existing two-page streaming workspace.
-    // The final read is shortened so it never crosses this extent's payload.
-    let mut pages = Box::new([[0; PAGE_SIZE]; 2]);
-    let mut page_index = 0_u64;
-    while page_index < u64::from(payload_pages) {
-        let count = (u64::from(payload_pages) - page_index).min(pages.len() as u64) as usize;
-        device.read_pages(
-            first_page.checked_add(page_index).ok_or(StepError::Corrupt)?,
-            &mut pages[..count],
-        ).await.map_err(StepError::Device)?;
-        for page in &pages[..count] {
-            let take = usize::try_from(remaining.min(PAGE_SIZE as u64)).map_err(|_| StepError::Corrupt)?;
-            hasher.update(&page[..take]);
-            if page[take..].iter().any(|byte| *byte != 0) {
-                return Err(StepError::Corrupt);
-            }
-            remaining -= take as u64;
-        }
-        page_index += count as u64;
-    }
-    let observed: [u8; 32] = hasher.finalize().into();
-    if remaining != 0 || observed != expected_sha256 {
-        return Err(StepError::Corrupt);
-    }
-    Ok(())
+    crate::store::verify_payload_and_zero_padding(device, first_page, payload_pages,
+        exact_byte_len, expected_sha256).await.map_err(StepError::from_store)
 }
 
 pub(crate) fn cas_mappings_are_closed(objects: &[ObjectMapping], blobs: &[BlobMapping]) -> bool {

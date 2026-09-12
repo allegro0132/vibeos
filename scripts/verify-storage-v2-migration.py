@@ -1585,8 +1585,9 @@ def validate_checkpoint_allocation_transition(
             newer_root["status"] == "value"
             and newer_root != older_root
             and newer_root["segment_no"] in allocate
-            and newer_root["segment_generation"]
-            == older_allocation["next_segment_generation"],
+            and older_allocation["next_segment_generation"]
+            <= newer_root["segment_generation"]
+            < newer_allocation["next_segment_generation"],
             "allocation-v1 G+1 conversion is not carried by its fresh segment",
         )
     old_retired = older_allocation["retired"]
@@ -1617,6 +1618,7 @@ def verify_v2_checkpoint_fallbacks(
     selected_recovered: dict[str, Any],
     *,
     authority_policy: AuthorityPolicy = DEFAULT_AUTHORITY_POLICY,
+    allow_experimental_delta: bool = False,
 ) -> int:
     slots = v2_checkpoint_slots(region)
     sealed = sorted(
@@ -1646,6 +1648,7 @@ def verify_v2_checkpoint_fallbacks(
                 candidate_structural,
                 require_authority=False,
                 authority_policy=authority_policy,
+                allow_experimental_delta=allow_experimental_delta,
             )
     if len(sealed) == 2:
         older, newer = sealed
@@ -3086,6 +3089,26 @@ def selftest() -> dict[str, Any]:
         cases += 1
     else:
         raise Violation("allocation-v1 G+1 conversion used a stale carrier")
+
+    # A large first authority publication can consume multiple fresh segments
+    # before writing its allocation payload. The carrier need not be first.
+    multiple_allocation = dict(newer_allocation)
+    multiple_allocation["states"] = [gc_verifier.SEGMENT_ALLOCATED] * 6 + [gc_verifier.SEGMENT_FREE] * 2
+    multiple_allocation["next_segment_generation"] = 7
+    for carrier in [allocation_pointer(4, 5), allocation_pointer(5, 6)]:
+        multiple_checkpoint = allocation_checkpoint(4, 3, 7, carrier)
+        validate_checkpoint_allocation_transition(older_checkpoint, multiple_checkpoint,
+            older_allocation, multiple_allocation, older_version, newer_version)
+        cases += 1
+    for carrier in [allocation_pointer(5, 4), allocation_pointer(5, 7), allocation_pointer(3, 6)]:
+        try:
+            validate_checkpoint_allocation_transition(older_checkpoint,
+                allocation_checkpoint(4, 3, 7, carrier), older_allocation,
+                multiple_allocation, older_version, newer_version)
+        except Violation:
+            cases += 1
+        else:
+            raise Violation("multi-segment v1 conversion accepted a stale or out-of-range carrier")
 
     # A persistent-authority-only publication may reuse a catalog snapshot
     # from an older checkpoint, while the catalog extent remains an exact

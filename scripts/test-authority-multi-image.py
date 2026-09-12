@@ -29,6 +29,19 @@ def main():
         assert result["experimental_authority_depth"] == depth
         assert v.verify_authority_bindings({"recovered": result})["authority_objects"] == 0
         structural = v.gc_verifier.parse_raw_structure(image)
+        copies = v.verify_v2_checkpoint_fallbacks(memoryview(image), structural,
+            v.selected_v2_superblock(memoryview(image)), result,
+            authority_policy=policy, allow_experimental_delta=True)
+        assert copies == 2, "multi-extent fixtures must retain both checkpoints"
+        if depth == 2:
+            try:
+                v.verify_v2_checkpoint_fallbacks(memoryview(image), structural,
+                    v.selected_v2_superblock(memoryview(image)), result, authority_policy=policy)
+            except ValueError as error:
+                v.require("admission is disabled" in str(error), str(error))
+                rejected += 1
+            else:
+                raise AssertionError("default fallback admitted multi-extent experimental history")
         pointer = structural["checkpoint"]["record"]["authority_root"]
         resolver = v.gc_verifier.RawImageResolver(image, structural["checkpoint"],
             structural["segments"], result["allocation"])
@@ -76,7 +89,7 @@ def main():
                 rejected += 1
             else:
                 raise AssertionError(f"{name}: damaged extent admitted")
-        results[name] = {"depth": depth, "base_extents": len(base), "damaged_extents_rejected": len(extents)}
+        results[name] = {"depth": depth, "verified_checkpoint_copies": copies, "base_extents": len(base), "damaged_extents_rejected": len(extents)}
     print(json.dumps({"status": "ok", "regions": results, "rejected_cases": rejected}, indent=2))
 
 

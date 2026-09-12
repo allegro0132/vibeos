@@ -1725,10 +1725,10 @@ impl<D: PageDevice> SegmentStore<D> {
         object: &AuthorizedObject<CasObjectHandle>,
     ) -> Result<VerifiedCasBlob, CasStoreError<D::Error>> {
         let read_pin = self.pin_blob_reader(object)?;
-        let mut reader = ManifestRangeReader::new(false);
+        let mut reader = ManifestRangeReader::new(true);
         let (descriptor, manifest) = self.resolve_authorized_manifest(object, &mut reader).await?;
         let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
-        verify_resolved_blob(&self.device, state, descriptor, &manifest).await?;
+        verify_resolved_blob(&self.device, state, descriptor, &manifest, &mut reader).await?;
         drop(read_pin);
         Ok(VerifiedCasBlob {
             descriptor,
@@ -1955,7 +1955,10 @@ pub(crate) async fn verify_manifest_blob<D: PageDevice>(
         memo,
     )
     .await?;
-    let header = ManifestRangeReader::new(false).read(device, state, manifest, 0, HEADER_SIZE).await?;
+    // Full verification consumes the entire Blob. Retain header read-ahead
+    // for the following content/tree walk instead of starting a second window.
+    let mut reader = ManifestRangeReader::new(true);
+    let header = reader.read(device, state, manifest, 0, HEADER_SIZE).await?;
     let header: &[u8; HEADER_SIZE] = header
         .as_slice()
         .try_into()
@@ -1963,7 +1966,7 @@ pub(crate) async fn verify_manifest_blob<D: PageDevice>(
     if BlobDescriptor::decode_header(header)? != descriptor {
         return Err(StoreError::Corrupt.into());
     }
-    verify_resolved_blob(device, state, descriptor, manifest).await
+    verify_resolved_blob(device, state, descriptor, manifest, &mut reader).await
 }
 
 async fn validate_resolved_manifest<D: PageDevice>(
@@ -2150,10 +2153,10 @@ async fn verify_resolved_blob<D: PageDevice>(
     state: impl Into<ManifestReadContext>,
     descriptor: BlobDescriptor,
     manifest: &BlobManifest,
+    reader: &mut ManifestRangeReader,
 ) -> Result<(), CasStoreError<D::Error>> {
     let state = state.into();
     let geometry = BlobGeometry::for_len(descriptor.byte_len)?;
-    let mut reader = ManifestRangeReader::new(true);
     let mut builder = StreamingMerkle::begin(
         descriptor.object_kind,
         descriptor.byte_len,
@@ -2181,7 +2184,7 @@ async fn verify_resolved_blob<D: PageDevice>(
             .push_chunk(index, &bytes)
             .map_err(map_streaming_error)?;
         verify_tree_emissions(
-            &mut reader,
+            reader,
             device,
             state,
             manifest,
@@ -2193,7 +2196,7 @@ async fn verify_resolved_blob<D: PageDevice>(
     while builder.padding_remaining().map_err(map_streaming_error)? != 0 {
         builder.pad_next().map_err(map_streaming_error)?;
         verify_tree_emissions(
-            &mut reader,
+            reader,
             device,
             state,
             manifest,
@@ -6457,6 +6460,27 @@ mod tests {
                 .collect::<Vec<_>>());
             std::println!("full proof: size={} tree_pages={} read_pages={} requests={}", size, tree_pages,
                 full_tree_reads.iter().map(|(_, count)| count).sum::<usize>(), full_tree_reads.len());
+            // Full validation must retain its header window while streaming
+            // the first content extent, rather than reading that page twice.
+            let first_extent = &manifest.extents[0];
+            let PhysicalPointer::Value(first_pointer) = first_extent.pointer else { panic!("missing first extent") };
+            let payload_first = segment_base_page(first_pointer.segment_no).unwrap()
+                + u64::from(first_pointer.payload_relative_page);
+            let payload_end = payload_first + u64::from(first_pointer.payload_pages);
+            for through_scrub in [false, true] {
+                device.reads.borrow_mut().clear();
+                if through_scrub {
+                    run(verify_manifest_blob(&device, store.mounted.as_ref().unwrap(), &manifest, None)).unwrap();
+                } else {
+                    run(store.verify_blob(&object)).unwrap();
+                }
+                let mut pages: Vec<_> = device.reads.borrow().iter()
+                    .flat_map(|(first, count)| *first..*first + *count as u64)
+                    .filter(|page| *page >= payload_first && *page < payload_end).collect();
+                pages.sort_unstable();
+                assert_eq!(pages, (payload_first..payload_end).collect::<Vec<_>>(),
+                    "header/content read once: size={size}, scrub={through_scrub}");
+            }
             // Corrupt a required sibling in both the leaf-hash area and
             // the top tree level. Every invocation must authenticate media
             // again even when segment descriptor proofs remain memoized.

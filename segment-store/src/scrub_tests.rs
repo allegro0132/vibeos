@@ -56,6 +56,7 @@ struct Media {
     page_count: u64,
     pages: BTreeMap<u64, Page>,
     reads: usize,
+    reads_by_page: BTreeMap<u64, usize>,
     writes: usize,
     next_read_error: Option<TestError>,
 }
@@ -69,6 +70,7 @@ impl MemoryDevice {
             page_count: admitted_pages(SEGMENTS).unwrap(),
             pages: BTreeMap::new(),
             reads: 0,
+            reads_by_page: BTreeMap::new(),
             writes: 0,
             next_read_error: None,
         })))
@@ -79,6 +81,7 @@ impl MemoryDevice {
             page_count: admitted_pages(SEGMENTS).unwrap(),
             pages: image,
             reads: 0,
+            reads_by_page: BTreeMap::new(),
             writes: 0,
             next_read_error: None,
         })))
@@ -91,6 +94,7 @@ impl MemoryDevice {
     fn reset_io(&self) {
         let mut media = self.0.lock().unwrap();
         media.reads = 0;
+        media.reads_by_page.clear();
         media.writes = 0;
     }
 
@@ -130,6 +134,7 @@ impl PageDevice for MemoryDevice {
             return Err(TestError::OutsideRange);
         }
         media.reads += 1;
+        *media.reads_by_page.entry(page).or_default() += 1;
         if let Some(error) = media.next_read_error.take() {
             return Err(error);
         }
@@ -1091,4 +1096,36 @@ fn segment_probe_workspace_is_admitted_before_device_io() {
     assert_eq!(block_on(store.scrub(&maintenance)),
         Err(ScrubError::DeviceUnavailable { failures: 1 }));
     assert_eq!(device.io_counts(), (1, 0));
+}
+
+#[test]
+fn scrub_scan_reads_header_once_and_checks_discovered_generation() {
+    let device = MemoryDevice::blank();
+    let mut store = format(device.clone());
+    let mut batch = store.begin_staged_batch().unwrap();
+    block_on(store.stage_blob_in_batch(&mut batch, OBJECT_KIND,
+        crate::cas_codec::REFERENCE_CODEC_RAW, &[0x61; PAGE_SIZE])).unwrap();
+    let _objects = block_on(store.publish_staged_batch(batch)).unwrap();
+    let state = store.mounted.as_ref().unwrap();
+    let segment = (0..state.admitted_segments).find(|&n|
+        state.allocation.segment_state(n) != Some(SegmentAllocation::Free)).unwrap();
+    let base = segment_base_page(segment).unwrap();
+    device.reset_io();
+    block_on(crate::store::scan_segment_for_scrub(&device, uuid(),
+        state.admitted_segments, state.next_segment_generation, state.generation, segment)).unwrap();
+    {
+        let media = device.0.lock().unwrap();
+        assert_eq!(media.reads_by_page.get(&base), Some(&1));
+        assert_eq!(media.reads_by_page.get(&(base + 1)), Some(&1));
+    }
+    let image = device.image();
+    let DecodeStatus::Sealed(header) = decode_segment_header(
+        &image_page(&image, base), &image_page(&image, base + 1)).unwrap()
+    else { panic!("formatted segment must be sealed") };
+    assert!(matches!(block_on(crate::store::scan_segment_for_scrub(&device, uuid(),
+        state.admitted_segments, header.binding.generation, state.generation, segment)),
+        Err(crate::StoreError::Corrupt)));
+    device.corrupt(base, 0);
+    assert!(block_on(crate::store::scan_segment_for_scrub(&device, uuid(),
+        state.admitted_segments, state.next_segment_generation, state.generation, segment)).is_err());
 }

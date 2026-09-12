@@ -1956,8 +1956,68 @@ pub(crate) async fn scan_segment<D: PageDevice>(
         false,
         None,
         memo,
+        false,
     )
     .await
+}
+
+// Full media verification never consumes or populates a metadata-only memo.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scan_segment_for_scrub<D: PageDevice>(
+    device: &D, store_uuid: StoreUuid, admitted_segments: u64,
+    next_segment_generation: u64, checkpoint_generation: u64, segment_no: u64,
+) -> Result<ScannedSegment, StoreError<D::Error>> {
+    // Scrub discovers the generation from the same authenticated header that
+    // starts the full scan, rather than issuing a separate header-pair read.
+    let pointer = PointerValue {
+        store_uuid, segment_no, segment_generation: 0,
+        descriptor_relative_page: 0, payload_relative_page: 0, payload_pages: 1,
+        ordinal: 0, exact_byte_len: 1, extent_kind: ExtentKind::Blob,
+        payload_sha256: [0; 32],
+    };
+    scan_segment_with_matches(device, store_uuid, admitted_segments,
+        next_segment_generation, checkpoint_generation, pointer, &[], false, None, None, true).await
+}
+
+pub(crate) async fn verify_payload_and_zero_padding<D: PageDevice>(
+    device: &D,
+    first_page: u64,
+    payload_pages: u32,
+    exact_byte_len: u64,
+    expected_sha256: [u8; 32],
+) -> Result<(), StoreError<D::Error>> {
+    use sha2::{Digest, Sha256};
+    if exact_byte_len == 0 || u64::from(payload_pages) != exact_byte_len.div_ceil(PAGE_SIZE as u64)
+    {
+        return Err(StoreError::Corrupt);
+    }
+    let mut remaining = exact_byte_len;
+    let mut hasher = Sha256::new();
+    // Keep the batch within scrub's existing two-page streaming workspace.
+    // The final read is shortened so it never crosses this extent's payload.
+    let mut pages = Box::new([[0; PAGE_SIZE]; 2]);
+    let mut page_index = 0_u64;
+    while page_index < u64::from(payload_pages) {
+        let count = (u64::from(payload_pages) - page_index).min(pages.len() as u64) as usize;
+        device.read_pages(
+            first_page.checked_add(page_index).ok_or(StoreError::Corrupt)?,
+            &mut pages[..count],
+        ).await.map_err(StoreError::Device)?;
+        for page in &pages[..count] {
+            let take = usize::try_from(remaining.min(PAGE_SIZE as u64)).map_err(|_| StoreError::Corrupt)?;
+            hasher.update(&page[..take]);
+            if page[take..].iter().any(|byte| *byte != 0) {
+                return Err(StoreError::Corrupt);
+            }
+            remaining -= take as u64;
+        }
+        page_index += count as u64;
+    }
+    let observed: [u8; 32] = hasher.finalize().into();
+    if remaining != 0 || observed != expected_sha256 {
+        return Err(StoreError::Corrupt);
+    }
+    Ok(())
 }
 
 // Even an individually sealed summary must describe a physically possible
@@ -1982,16 +2042,22 @@ async fn scan_segment_with_matches<D: PageDevice>(
     admitted_segments: u64,
     next_segment_generation: u64,
     checkpoint_generation: u64,
-    pointer: PointerValue,
+    mut pointer: PointerValue,
     additional: &[PointerValue],
     collect_authority_siblings: bool,
     authority_generation: Option<(u64, usize)>,
     memo: Option<&VerifiedSegmentScans>,
+    verify_payloads: bool,
 ) -> Result<ScannedSegment, StoreError<D::Error>> {
+    if verify_payloads && (memo.is_some() || pointer.ordinal != 0
+        || !additional.is_empty() || collect_authority_siblings || authority_generation.is_some())
+    {
+        return Err(StoreError::Corrupt);
+    }
     if pointer.store_uuid != store_uuid
         || pointer.segment_no >= admitted_segments
-        || pointer.segment_generation == 0
-        || pointer.segment_generation >= next_segment_generation
+        || (!verify_payloads && (pointer.segment_generation == 0
+            || pointer.segment_generation >= next_segment_generation))
     {
         return Err(StoreError::Corrupt);
     }
@@ -2024,6 +2090,13 @@ async fn scan_segment_with_matches<D: PageDevice>(
         DecodeStatus::Sealed(value) => value,
         _ => return Err(StoreError::Corrupt),
     };
+    if verify_payloads {
+        let generation = header.value().binding.generation;
+        if generation == 0 || generation >= next_segment_generation {
+            return Err(StoreError::Corrupt);
+        }
+        pointer.segment_generation = generation;
+    }
     if header.value().binding.store_uuid != store_uuid
         || header.value().binding.segment_no != pointer.segment_no
         || header.value().binding.generation != pointer.segment_generation
@@ -2098,6 +2171,14 @@ async fn scan_segment_with_matches<D: PageDevice>(
         {
             return Err(StoreError::Corrupt);
         }
+        let next_relative = relative.checked_add(value.record_span_pages)
+            .filter(|next| *next <= summary.value().next_free_page && *next <= DATA_END_PAGE)
+            .ok_or(StoreError::Corrupt)?;
+        if verify_payloads {
+            verify_payload_and_zero_padding(device,
+                base.checked_add(u64::from(value.payload_first_relative_page)).ok_or(StoreError::Corrupt)?,
+                value.payload_pages, value.payload_byte_len, value.payload_sha256).await?;
+        }
         if first_target == 0 {
             first_target = value.binding.target_checkpoint_generation;
         }
@@ -2134,9 +2215,7 @@ async fn scan_segment_with_matches<D: PageDevice>(
             .checked_add(value.payload_byte_len)
             .ok_or(StoreError::Corrupt)?;
         if retain_extents { extents.push(value); }
-        relative = relative
-            .checked_add(value.record_span_pages)
-            .ok_or(StoreError::Corrupt)?;
+        relative = next_relative;
     }
     // Descriptor pairs have been decoded and accumulated; release their
     // page window before interpreting matches or inserting the final proof.
@@ -2466,6 +2545,7 @@ pub(crate) async fn read_pointer_payloads<D: PageDevice>(
         false,
         None,
         memo,
+        false,
     )
     .await?;
     let base = segment_base_page(first.segment_no)?;
@@ -2875,6 +2955,7 @@ pub(crate) async fn scan_segment_authority_records<D: PageDevice>(
         false,
         Some((target_generation, maximum)),
         memo,
+        false,
     )
     .await?;
     Ok(scanned.authority_siblings)
@@ -3005,6 +3086,7 @@ pub(crate) async fn read_pointer_authority_payload_with_memo<D: PageDevice>(
         true,
         None,
         memo,
+        false,
     )
     .await?;
     let first = scanned.matched.ok_or(StoreError::Corrupt)?;

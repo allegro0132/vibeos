@@ -849,7 +849,11 @@ fn encode_snapshot(
         .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
     let encoded_len = persistent_authority_encoded_len(value)?;
     let output_len = if include_records { encoded_len } else { record_offset };
-    let mut output = vec![0; output_len];
+    // Metadata has reserved fields that must stay zero. Record bytes are
+    // already canonical and fill the suffix completely: reserve their space
+    // now, but avoid zeroing it only to overwrite it during the final copy.
+    let mut output = Vec::with_capacity(output_len);
+    output.resize(record_offset, 0);
     output[..8].copy_from_slice(MAGIC);
     put_u16(&mut output, 0x08, PERSISTENT_AUTHORITY_SNAPSHOT_VERSION);
     put_u16(&mut output, 0x0a, PERSISTENT_AUTHORITY_HEADER_LEN as u16);
@@ -899,7 +903,7 @@ fn encode_snapshot(
         put_u32(&mut output, offset + 0x18, root.object_kind);
     }
     if include_records {
-        output[record_offset..].copy_from_slice(&value.record_stream);
+        output.extend_from_slice(&value.record_stream);
     }
     Ok(output)
 }
@@ -907,7 +911,7 @@ fn encode_snapshot(
 pub fn decode_persistent_authority_snapshot(
     input: &[u8],
 ) -> Result<PersistentAuthoritySnapshot, AuthoritySnapshotError> {
-    decode_snapshot(input, true, usize::MAX)
+    decode_snapshot(input, true, usize::MAX).map(|(snapshot, _)| snapshot)
 }
 
 /// Validate canonical V2 bytes and their full authority graph without retaining
@@ -929,20 +933,17 @@ pub(crate) fn validate_canonical_authority_bytes(
 pub(crate) fn validate_authority_bytes(
     input: &[u8],
 ) -> Result<(u64, usize), AuthoritySnapshotError> {
-    let decoded = decode_snapshot(input, false, usize::MAX)?;
+    let (decoded, _) = decode_snapshot(input, false, usize::MAX)?;
     Ok((decoded.checkpoint_generation(), get_u64(input, 0x60) as usize))
 }
 
-// This budget covers only owned metadata vectors, not semantic replay maps.
+// This budget covers metadata vectors and their temporary ID index, not semantic replay maps.
 #[cfg(test)]
 pub(crate) fn validate_authority_metadata_bounded(
     input: &[u8], budget: usize,
 ) -> Result<(u64, usize, usize), AuthoritySnapshotError> {
-    let decoded = decode_snapshot(input, false, budget)?;
-    let bytes = decoded.objects.capacity() * core::mem::size_of::<PersistentObjectBinding>()
-        + decoded.principals.capacity() * core::mem::size_of::<PersistentPrincipalPolicy>()
-        + decoded.external_roots.capacity() * core::mem::size_of::<PersistentRootEntry>();
-    Ok((decoded.checkpoint_generation(), get_u64(input, 0x60) as usize, bytes))
+    let (decoded, peak) = decode_snapshot(input, false, budget)?;
+    Ok((decoded.checkpoint_generation(), get_u64(input, 0x60) as usize, peak))
 }
 
 fn reserve_metadata<T>(table: &mut Vec<T>, count: usize, used: &mut usize, budget: usize)
@@ -962,7 +963,7 @@ fn decode_snapshot(
     input: &[u8],
     retain_records: bool,
     metadata_budget: usize,
-) -> Result<PersistentAuthoritySnapshot, AuthoritySnapshotError> {
+) -> Result<(PersistentAuthoritySnapshot, usize), AuthoritySnapshotError> {
     if input.len() < PERSISTENT_AUTHORITY_HEADER_LEN
         || input.len() > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN
     {
@@ -1115,11 +1116,15 @@ fn decode_snapshot(
         principals,
         external_roots,
     };
-    validate_with_records(&snapshot, &input[record_offset..], true)?;
+    let scratch_budget = metadata_budget.checked_sub(metadata_used)
+        .ok_or(AuthoritySnapshotError::OutOfBounds)?;
+    let scratch_peak = validate_with_records_bounded(&snapshot, &input[record_offset..], true, scratch_budget)?;
+    let metadata_peak = metadata_used.checked_add(scratch_peak)
+        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
     if retain_records {
         snapshot.record_stream = input[record_offset..].to_vec();
     }
-    Ok(snapshot)
+    Ok((snapshot, metadata_peak))
 }
 
 fn validate(
@@ -1134,6 +1139,15 @@ fn validate_with_records(
     records: &[u8],
     check_record_chain: bool,
 ) -> Result<(), AuthoritySnapshotError> {
+    validate_with_records_bounded(value, records, check_record_chain, usize::MAX).map(|_| ())
+}
+
+fn validate_with_records_bounded(
+    value: &PersistentAuthoritySnapshot,
+    records: &[u8],
+    check_record_chain: bool,
+    scratch_budget: usize,
+) -> Result<usize, AuthoritySnapshotError> {
     if value.checkpoint_generation == 0
         || value.root_policy_sha256 == [0; 32]
         || records.is_empty()
@@ -1145,7 +1159,7 @@ fn validate_with_records(
     if check_record_chain {
         validate_record_chain(records)?;
     }
-    let v2_object_ids = validate_binding_index(value)?;
+    let v2_object_ids = validate_binding_index(value, scratch_budget)?;
     validate_principals(&value.principals)?;
     let mut previous_external = None;
     for root in &value.external_roots {
@@ -1170,7 +1184,9 @@ fn validate_with_records(
     if encoded_len > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN {
         return Err(AuthoritySnapshotError::OutOfBounds);
     }
-    Ok(())
+    v2_object_ids.as_ref().map_or(Ok(0), |ids|
+        ids.capacity().checked_mul(core::mem::size_of::<u128>())
+            .ok_or(AuthoritySnapshotError::ArithmeticOverflow))
 }
 
 // Most publications preserve V2 ID order as well as stable ID order. In that
@@ -1178,6 +1194,7 @@ fn validate_with_records(
 // necessary. A non-monotonic mapping remains valid and uses a sorted fallback.
 fn validate_binding_index(
     value: &PersistentAuthoritySnapshot,
+    budget: usize,
 ) -> Result<Option<Vec<u128>>, AuthoritySnapshotError> {
     let mut previous_stable = None;
     let mut previous_v2 = None;
@@ -1198,7 +1215,8 @@ fn validate_binding_index(
     }
     if ordered_v2 { return Ok(None); }
     let mut ids = Vec::new();
-    ids.try_reserve_exact(value.objects.len()).map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    let mut used = 0;
+    reserve_metadata(&mut ids, value.objects.len(), &mut used, budget)?;
     ids.extend(value.objects.iter().map(|binding| binding.v2_object_id));
     ids.sort_unstable();
     if ids.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -1490,6 +1508,35 @@ mod tests {
     }
 
     #[test]
+    fn metadata_budget_includes_unordered_id_index_overlap() {
+        let mut value = sample();
+        value.objects.push(PersistentObjectBinding {
+            stable_object_id: 4, v2_object_id: 3, commit_generation: 7, object_kind: 0x41,
+        });
+        let ordered = encode_persistent_authority_snapshot(&value).unwrap();
+        let (_, _, tables) = validate_authority_metadata_bounded(&ordered, usize::MAX).unwrap();
+        assert!(validate_binding_index(&value, 0).unwrap().is_none());
+        assert_eq!(validate_authority_metadata_bounded(&ordered, tables).unwrap().2, tables);
+
+        value.objects[0].v2_object_id = 3;
+        value.objects[1].v2_object_id = 1;
+        let unordered = encode_persistent_authority_snapshot(&value).unwrap();
+        let (_, _, peak) = validate_authority_metadata_bounded(&unordered, usize::MAX).unwrap();
+        let scratch = value.objects.len() * core::mem::size_of::<u128>();
+        assert_eq!(peak, tables + scratch);
+        assert_eq!(validate_authority_metadata_bounded(&unordered, peak).unwrap().2, peak);
+        for budget in [tables, peak - 1] {
+            assert_eq!(validate_authority_metadata_bounded(&unordered, budget),
+                Err(AuthoritySnapshotError::OutOfBounds));
+        }
+        // Duplicate detection still executes when admitted. A missing scratch
+        // byte must be refused before allocating/populating the sorted index.
+        value.objects[1].v2_object_id = 3;
+        assert_eq!(validate_binding_index(&value, scratch - 1), Err(AuthoritySnapshotError::OutOfBounds));
+        assert_eq!(validate_binding_index(&value, scratch), Err(AuthoritySnapshotError::UnsortedOrDuplicate));
+    }
+
+    #[test]
     fn metadata_budget_checks_all_tables_before_decode_and_exact_capacity() {
         let value = sample().with_external_roots(vec![PersistentRootEntry {
             object_id: 99, commit_generation: 1, object_kind: 3,
@@ -1548,7 +1595,7 @@ mod tests {
                         stable_object_id: 3 + index as u128, v2_object_id: id,
                         commit_generation: 7, object_kind: 0x41,
                     }).collect();
-                    match validate_binding_index(&value) {
+                    match validate_binding_index(&value, usize::MAX) {
                         Ok(index) => {
                             assert!(unique);
                             assert_eq!(index.is_none(), ids.windows(2).all(|pair| pair[0] < pair[1]));
@@ -1575,7 +1622,7 @@ mod tests {
         }
         let mut value = sample();
         value.objects.clear();
-        assert_eq!(validate_binding_index(&value).unwrap(), None);
+        assert_eq!(validate_binding_index(&value, usize::MAX).unwrap(), None);
     }
 
     #[test]

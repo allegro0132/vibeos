@@ -6864,3 +6864,240 @@ result to the reproducible scrub request reduction rather than claiming the
 mount timing difference as a benefit. Mount's reported peak remains 133,842
 bytes; this is not an actual whole-heap measurement. Builds and tests finished
 before timing. No actual SD-card speedup is established by this QEMU experiment.
+
+### Rejected: reuse full-segment payload checks within scrub (2026-09-12)
+
+A trial returned a private device/state-bound proof from the complete segment
+pass, then omitted duplicate CAS manifest/extent payload-padding checks in the
+content pass. Root/replay checks and all semantic/pointer/Merkle checks remained.
+The trial passed 246 unit tests (one ignored), including identical-report and
+fewer-logical-reads comparison, plus QEMU three-boot verification and Duo compile.
+
+However, logical-read savings did not translate to physical I/O savings under
+the production cache. A controlled ABBA comparison against the two-page-batch
+baseline on the same 128-file image increased scrub requests from 3,811 to 4,008,
+while bytes fell only from 27,373,568 to 27,369,472 (one page). The removed reads
+appear to have served as useful batched cache prefetch ahead of semantic reads;
+this is an inference from I/O counters, not a traced attribution. The trial was
+rejected and production scrub restored to the exact pre-trial source hash. The
+prior two-page batching optimization remains. Any future elimination of these
+logical duplicate reads must preserve downstream physical read coalescing.
+
+Trial sources, successful functional checks, ABBA logs, comparison and exact
+restoration evidence are retained under `target/storage-scrub-payload-proof-20260912/`.
+
+Measured scrub means were 9.520875 s baseline and 10.035747 s trial (+5.41%). No SD-card performance claim is made.
+
+### Retain the header window during full CAS verification (2026-09-12)
+
+`verify_blob` and scrub's `verify_manifest_blob` now use one invocation-local
+read-ahead reader for both header authentication and the complete Merkle walk.
+Previously the header used a demand reader and full verification created a
+second reader, losing the header's page window. Complete validation still
+checks descriptors, headers, every content leaf and all emitted tree hashes.
+Range-reading policy is unchanged; only whole-Blob validation starts read-ahead
+while reading the header. This does not reuse any observation across calls or
+remove scrub's payload/padding checks.
+
+The no-device-cache proof test now exercises both full-verification entry points
+and requires every page of the first payload extent to be fetched exactly once,
+for each existing large-object fixture. Evidence is in
+`target/storage-cas-full-reader-reuse-20260912/`.
+
+All 245 unit tests (one ignored), 12 CAS streaming integration tests, QEMU
+three-boot file-tree/GC/cold recovery/powered-off verification and Duo compile
+pass. A control/candidate/candidate/control measurement on the same 128-file
+image, 64-page cache, 128 MiB single-hart TCG, 4/2 MiB/s and 400/200 IOPS yields
+scrub means 9.546825 / 9.560049 s
+(+0.14%). Both versions still have exactly 3,811 scrub
+reads / 27,373,568 bytes and 576 mount reads / 3,641,344 bytes. All four cold
+recoveries and subsequent object validations pass with zero cold writes/flushes.
+No scrub speedup is established; cached physical I/O is unchanged. The benefit
+proved here is removal of duplicate first-extent page fetches in the uncached
+whole-Blob verification paths. Actual SD-card behavior remains unmeasured.
+
+### Fuse scrub descriptor and payload scanning (2026-09-12)
+
+The whole-segment scrub pass previously scanned all descriptor pairs for chain
+and summary validation, then reread each pair to locate payloads for hash/padding
+validation. A dedicated uncached scanner entry point now performs the payload
+check immediately after validating each descriptor. It still compares final
+counts, geometry, descriptor/payload chains and segment seal before success.
+An extent's end is checked against the sealed summary and segment data boundary
+before reading its payload. All ordinary scan callers remain metadata-only.
+Full payload mode rejects memo/match/collection requests so it cannot accidentally
+return success from a metadata-only cached proof.
+
+The existing two-page hash/padding verifier is shared between the scanner and
+scrub pointer checks; the duplicate descriptor pass is removed. Trailer buffers
+are dropped before the loop, so the 16 KiB descriptor window overlaps only the
+8 KiB payload window, below the already budgeted 32 KiB probe page workspace.
+This is a page-buffer bound, not a claim about the complete recovery heap.
+Evidence is in `target/storage-scrub-fused-scan-20260912/`.
+
+All 245 unit tests pass (one ignored), including stale/retired payload and
+padding corruption. QEMU three-boot file-tree/GC/cold recovery/powered-off
+verification and Duo compilation pass. In control/candidate/candidate/control
+order on the same 128-file image, 64-page cache, 128 MiB single-hart TCG,
+4/2 MiB/s and 400/200 IOPS, scrub means are
+9.623144 / 8.447482 s
+(-12.22%). Requests fall from 3,811 to 3,376
+(-11.41%), and bytes from 27,373,568 to 23,810,048
+(-13.02%), identical across both boots per build.
+All measured cold phases have zero writes/flushes; all four subsequent object
+validations pass. Phase sums are 11.039985 / 9.893111 s.
+Builds/tests completed before timing. This is a QEMU result, not a measured
+SD-card performance claim.
+
+### Independently verify retained delta checkpoints (2026-09-12)
+
+The opt-in experimental region verifier now propagates delta admission into
+`verify_v2_checkpoint_fallbacks`, so both retained checkpoints and their allocation
+transition can be checked independently. The default remains disabled and the
+normal CLI still does not admit experimental delta images. Four empty/live and
+three multi-extent Rust-exported fixtures now verify both checkpoint copies,
+including older delta predecessors. Default-denial checks cover fallback replay
+as well as selected-tip replay; mutation and payload-budget checks remain.
+
+This exposed an existing offline-verifier error: allocation-v1 conversion
+incorrectly required the allocation carrier to have the first newly assigned
+segment generation. The Rust multi-extent authority publisher may write payloads
+into several new segments before the allocation record. The verifier now requires
+the carrier's segment to be newly allocated and its generation to lie in the
+exact newly consumed generation interval. Existing stale-carrier checks and new
+old/future-generation cases still reject. The original failed multi-extent log
+is retained; the fix does not bypass transition validation.
+
+All seven fixtures pass (21 empty/live rejection cases; 29 multi-extent rejection
+cases). The normal verifier passes all 25,134 selftest cases and independently
+accepts the retained native 128-file image using the default CLI. Evidence is
+in `target/storage-delta-fallback-verifier-20260912/`. This improves delta recovery
+validation coverage and fixes a full-snapshot verifier false rejection; it does
+not enable production delta writes or establish a performance improvement.
+
+### Charge the temporary authority ID index to metadata budgets (2026-09-12)
+
+Bounded snapshot decoding now accounts for the temporary sorted V2 ObjectId
+index alongside all simultaneously retained metadata tables. The non-monotonic
+path checks requested and actual reserved index capacity against the remaining
+budget before populating/sorting it. Decoder metadata peaks propagate through
+the existing base/per-link experimental delta buffer accounting. Ordered-ID
+validation still uses the binding table directly and requests no index memory.
+
+A boundary test requires exact table-plus-index admission, rejects one byte less,
+checks the table-only budget for ordered mappings, and confirms duplicate IDs
+remain invalid once index memory is admitted. All 246 unit tests (one ignored),
+QEMU three-boot file-tree/GC/cold recovery/powered-off verification and Duo compile
+pass. Evidence is in `target/storage-authority-index-budget-20260912/`.
+This closes the metadata-index overlap only: semantic replay maps/sets and source
+scan workspaces still need comprehensive accounting before production delta
+admission. Ordinary public decoding retains its existing unbounded metadata
+policy; no performance or total-heap claim is made for this budget correction.
+
+### Compact retained transaction states during replay (2026-09-12)
+
+Prepared grant/object states now live in boxes, keeping transaction-map values
+small after commit. Finished transaction IDs remain retained to reject reuse;
+transaction validation and recovery semantics are unchanged. This trades an
+additional allocation per pending prepared state for smaller retained map nodes.
+
+An isolated allocator measurement replays 2,048 sequential grant transactions.
+Append-phase retained allocation falls from 1,064,272 to 645,392 bytes (39.36%);
+peak requested allocation falls from 1,064,272 to 645,520 bytes. Input records are
+allocated before measurement; finish-time graph materialization, stack, allocator
+bookkeeping and RSS are excluded. This is not a complete recovery heap budget or
+a timing/SD-card performance claim. Run the ignored integration measurement alone:
+`cargo test -p vibeos-durable-format --test replay_memory -- --ignored --nocapture --test-threads=1`.
+
+The full durable-format suite, 246 segment-store unit tests (one ignored), QEMU
+three-boot file-tree/GC/cold recovery/powered-off verification and Duo compilation
+pass. Before/after logs, source hashes and gate evidence are retained in
+`target/storage-replay-compact-transactions-20260912/`.
+
+### Share replay ID classification and consumption state (2026-09-12)
+
+Replay now stores the object/derivation consumption bit alongside the existing
+ID class, eliminating separate seen-object and seen-derivation BTreeSets. Merely
+referencing an ID does not consume it. Later references preserve consumption,
+and prepare/orphan-commit/external-object records retain their original
+duplicate checks and error order. Class claims use a single entry lookup.
+
+The isolated 2,048 sequential grant-transaction measurement drops retained
+append-phase requested allocation from 645,392 to 586,400 bytes (9.14%), with
+peak decreasing from 645,520 to 586,528 bytes. This comparison starts after the
+boxed transaction-state change. It excludes input records, finish-time graph
+materialization, stack and allocator overhead; neither whole-heap nor timing
+improvement is claimed.
+
+Full durable-format tests (including reference/consumption, cloning and class
+collision checks), 246 segment-store unit tests (one ignored), QEMU three-boot
+file-tree/GC/cold recovery/powered-off verification and Duo compilation pass.
+Evidence and source hashes: `target/storage-replay-id-state-20260912/`.
+
+### Recheck current replay changes under throttled cold recovery (2026-09-12)
+
+Compare the retained fused-scrub firmware with current metadata-index budgeting,
+boxed transaction states and shared ID consumption state. Eight sequential boots
+run ABBA then BAAB using the same 128-file image, 64-page cache, 128 MiB
+single-hart TCG and 4/2 MiB/s, 400/200 IOPS. Builds complete before timing.
+All eight object samples validate; every measured cold phase has zero writes
+and flushes. Both builds use 576 mount reads / 3,641,344 bytes and 3,376 scrub
+reads / 23,810,048 bytes on every boot.
+
+Control/current scrub means are 8.576423 / 8.447337 seconds, but the first
+control boot takes 9.007072 seconds while the other control boots take about
+8.432–8.434 seconds. Medians are 8.433200 / 8.445470 seconds. Mount medians
+are 1.439916 / 1.439828 seconds. The mean difference does not establish a
+repeatable speedup; retained allocation savings remain the supported benefit
+of the replay changes. Further SD-oriented work should target physical I/O
+and full authority publication writes. Evidence, source hashes, firmware,
+per-boot samples and comparison: `target/storage-replay-current-cold-20260912/`.
+
+### Discover scrub segment generation in the full header read (2026-09-12)
+
+Full scrub scanning now obtains the segment generation from its authenticated
+four-page header/first-descriptor read, eliminating the separate two-page
+header pre-read. UUID, segment number, nonzero generation, next-generation
+upper bound and checkpoint bound still validate before scanning descriptors.
+Ordinary pointer-based scanning retains its exact generation match and memo
+behavior; scrub remains uncached at the metadata-proof layer. Page workspace
+budgeting is unchanged.
+
+A no-device-cache regression verifies that each header page is read once and
+that discovered generation at the exclusive upper bound and corrupt headers
+reject. The original fixture failed because an empty formatted store had no
+allocated data segment; the corrected fixture first publishes an object. The
+failed log is retained. All 247 unit tests (one ignored), QEMU three-boot
+file-tree/GC/cold recovery/powered-off verification and Duo compilation pass.
+
+ABBA comparison against the immediately preceding replay firmware uses the
+same 128-file image, 64-page cache, 128 MiB single-hart TCG, 4/2 MiB/s and
+400/200 IOPS. Scrub requests fall from 3,376 to 3,369 on both candidate boots
+(0.21%); bytes remain 23,810,048. Control/candidate mean scrub times are
+8.504894 / 8.515483 seconds, so no latency improvement is claimed. Mount I/O
+is unchanged. All four object samples pass and all cold phases have zero
+writes/flushes. Builds/tests completed before timing. Evidence is retained in
+`target/storage-scrub-header-single-read-20260912/`.
+
+### Reject four-page full-scan payload batches (2026-09-12)
+
+A trial increased only full-segment payload batches from two to four pages;
+other pointer verifiers kept two pages. The 16 KiB descriptor plus 16 KiB
+payload overlap stayed inside the existing 32 KiB probe page budget. Boundary
+tests covered 1/3/4/5/8/9 pages, full/partial final pages, exact read coverage,
+content hashes and nonzero padding rejection. All 248 trial unit tests (one
+ignored), QEMU three-boot recovery/GC/offline checks and Duo compilation passed.
+
+ABBA under the established 128-file, 64-page-cache, 128 MiB single-hart TCG,
+4/2 MiB/s and 400/200 IOPS setup reduced scrub requests only from 3,369 to
+3,365 (0.12%). Bytes stayed 23,810,048. Mean scrub times were 8.469257 /
+8.408403 seconds; this small difference does not establish a repeatable
+latency gain. All four object samples passed; all cold phases had zero writes
+and flushes. Builds/tests completed before timing.
+
+The trial is rejected: doubling the payload buffer for four fewer requests is
+not compelling for memory-constrained targets. Production source and tests
+were restored byte-for-byte to the preceding two-page implementation; trial
+source, results and restoration hashes remain in
+`target/storage-scrub-four-page-payload-20260912/`. No four-page optimization
+is present in production.

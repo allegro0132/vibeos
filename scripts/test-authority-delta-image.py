@@ -64,6 +64,27 @@ def main():
                 raise AssertionError("default accepted experimental delta")
         result = recover()
         assert result["experimental_authority_depth"] == depth
+        # Prove both durable alternatives, including the incremental fixture's
+        # older delta checkpoint, rather than only the selected tip.
+        superblock = verifier.selected_v2_superblock(memoryview(image))
+        fallback_copies = verifier.verify_v2_checkpoint_fallbacks(
+            memoryview(image), structure, superblock, result,
+            authority_policy=policy, allow_experimental_delta=True)
+        assert fallback_copies == 2, "fixture must exercise both checkpoint slots"
+        older = min(verifier.v2_checkpoint_slots(memoryview(image)),
+                    key=lambda slot: slot["record"]["binding"]["generation"])
+        older_structure = dict(structure, checkpoint=older)
+        older_result = verifier.reconstruct_v2_checkpoint(memoryview(image), older_structure,
+            require_authority=False, authority_policy=policy, allow_experimental_delta=True)
+        if older_result["experimental_authority_depth"]:
+            try:
+                verifier.verify_v2_checkpoint_fallbacks(memoryview(image), structure,
+                    superblock, result, authority_policy=policy)
+            except ValueError as error:
+                verifier.require("admission is disabled" in str(error), str(error))
+                rejected += 1
+            else:
+                raise AssertionError("default fallback verifier accepted experimental delta")
         bindings = verifier.verify_authority_bindings({"recovered": result})
         assert bindings["authority_objects"] == int(live)
         assert bindings["logical_bytes"] == (4096 if live else 0)
@@ -101,6 +122,8 @@ def main():
             assert corrupted_ancestors == depth + 1, "ancestor corruption loop did not cover the chain"
             assert not live or corrupted_blobs > 0, "live fixture never checked damaged object content"
         results[name] = {"depth": depth, "checkpoint_generation": result["checkpoint_generation"],
+                         "verified_checkpoint_copies": fallback_copies,
+                         "fallback_authority_depth": older_result["experimental_authority_depth"],
                          "verified_objects": bindings["authority_objects"], "logical_bytes": bindings["logical_bytes"]}
     print(json.dumps({"status": "ok", "regions": results, "rejected_cases": rejected}, indent=2))
 

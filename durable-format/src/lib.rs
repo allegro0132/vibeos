@@ -18,6 +18,7 @@ pub use policy::{
     TombstonePartition, TombstonePartitionError,
 };
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
@@ -1810,8 +1811,10 @@ struct PreparedObject {
 
 #[derive(Clone)]
 enum TxState {
-    GrantPrepared(PreparedGrant),
-    ObjectPrepared(PreparedObject),
+    // Finished transaction IDs remain in the map to prevent reuse. Keep each
+    // value small instead of retaining prepared-state-sized slots forever.
+    GrantPrepared(Box<PreparedGrant>),
+    ObjectPrepared(Box<PreparedObject>),
     Finished,
 }
 
@@ -1821,6 +1824,14 @@ enum IdClass {
     Derivation,
     Space,
     Transaction,
+}
+
+// References claim an ID's class without consuming its stable identity. Prepare
+// and orphan-commit records consume it; later references must preserve that bit.
+#[derive(Clone, Copy)]
+struct IdState {
+    class: IdClass,
+    consumed: bool,
 }
 
 /// Decode and semantically validate one unified object/authority journal.
@@ -1850,10 +1861,8 @@ pub struct PreflightReplay {
     high_water_event_count: usize,
     first_high_water_event: Option<(u64, u128)>,
     second_high_water_event: Option<(u64, u128)>,
-    id_classes: BTreeMap<u128, IdClass>,
+    id_classes: BTreeMap<u128, IdState>,
     transactions: BTreeMap<TransactionId, TxState>,
-    seen_derivations: BTreeSet<DerivationId>,
-    seen_objects: BTreeSet<ObjectId>,
     committed: Vec<RecoveredGrant>,
     committed_objects: Vec<RecoveredObject>,
     tombstone_sequence: BTreeMap<DerivationId, u64>,
@@ -1876,8 +1885,6 @@ impl PreflightReplay {
             second_high_water_event: None,
             id_classes: BTreeMap::new(),
             transactions: BTreeMap::new(),
-            seen_derivations: BTreeSet::new(),
-            seen_objects: BTreeSet::new(),
             committed: Vec::new(),
             committed_objects: Vec::new(),
             tombstone_sequence: BTreeMap::new(),
@@ -1992,8 +1999,6 @@ impl PreflightReplay {
         let second_high_water_event = &mut self.second_high_water_event;
         let id_classes = &mut self.id_classes;
         let transactions = &mut self.transactions;
-        let seen_derivations = &mut self.seen_derivations;
-        let seen_objects = &mut self.seen_objects;
         let committed = &mut self.committed;
         let committed_objects = &mut self.committed_objects;
         let tombstone_sequence = &mut self.tombstone_sequence;
@@ -2050,17 +2055,17 @@ impl PreflightReplay {
                         return Err(RecoveryError::DuplicateTransaction { sequence });
                     }
                     if tombstone_sequence.contains_key(&grant.derivation_id)
-                        || !seen_derivations.insert(grant.derivation_id)
+                        || !consume_claimed_id(id_classes, grant.derivation_id.get())
                     {
                         return Err(RecoveryError::DuplicateDerivation { sequence });
                     }
                     transactions.insert(
                         tx,
-                        TxState::GrantPrepared(PreparedGrant {
+                        TxState::GrantPrepared(Box::new(PreparedGrant {
                             grant: grant.clone(),
                             sequence,
                             crc32c: decoded.crc32c,
-                        }),
+                        })),
                     );
                 }
                 RecordBody::GrantCommit {
@@ -2110,7 +2115,7 @@ impl PreflightReplay {
                             // A complete orphan commit is harmless but consumes its
                             // transaction and derivation IDs so later records cannot
                             // attach to it or reuse stable identity.
-                            if !seen_derivations.insert(*derivation_id) {
+                            if !consume_claimed_id(id_classes, derivation_id.get()) {
                                 return Err(RecoveryError::DuplicateDerivation { sequence });
                             }
                             transactions.insert(tx, TxState::Finished);
@@ -2165,12 +2170,12 @@ impl PreflightReplay {
                     if transactions.contains_key(&tx) {
                         return Err(RecoveryError::DuplicateTransaction { sequence });
                     }
-                    if !seen_objects.insert(metadata.object_id) {
+                    if !consume_claimed_id(id_classes, metadata.object_id.get()) {
                         return Err(RecoveryError::DuplicateObject { sequence });
                     }
                     transactions.insert(
                         tx,
-                        TxState::ObjectPrepared(PreparedObject {
+                        TxState::ObjectPrepared(Box::new(PreparedObject {
                             metadata: metadata.clone(),
                             sequence,
                             crc32c: decoded.crc32c,
@@ -2180,7 +2185,7 @@ impl PreflightReplay {
                             content_digest: Crc32cDigest::new(),
                             byte_len: 0,
                             bytes: Vec::new(),
-                        }),
+                        })),
                     );
                 }
                 RecordBody::ObjectChunk(chunk) => {
@@ -2306,7 +2311,7 @@ impl PreflightReplay {
                     if transactions.insert(tx, TxState::Finished).is_some() {
                         return Err(RecoveryError::DuplicateTransaction { sequence });
                     }
-                    if !seen_objects.insert(*object_id) {
+                    if !consume_claimed_id(id_classes, object_id.get()) {
                         return Err(RecoveryError::DuplicateObject { sequence });
                     }
                     committed_objects.push(RecoveredObject {
@@ -2352,8 +2357,6 @@ impl PreflightReplay {
         // unfinished inline-object buffer) before allocating graph/slot maps.
         drop(self.transactions);
         drop(self.id_classes);
-        drop(self.seen_derivations);
-        drop(self.seen_objects);
         let mut graph: BTreeMap<DerivationId, RecoveredGrant> = BTreeMap::new();
         let mut object_kinds: BTreeMap<ObjectId, ResourceKind> = BTreeMap::new();
         for recovered in &self.committed {
@@ -2525,16 +2528,29 @@ const fn id_reserved(id: u128, high_water: u128) -> bool {
 }
 
 fn claim_id_class(
-    classes: &mut BTreeMap<u128, IdClass>,
+    classes: &mut BTreeMap<u128, IdState>,
     id: u128,
     class: IdClass,
     sequence: u64,
 ) -> Result<(), RecoveryError> {
-    if classes.get(&id).is_some_and(|existing| *existing != class) {
-        return Err(RecoveryError::IdClassCollision { sequence });
+    match classes.entry(id) {
+        alloc::collections::btree_map::Entry::Occupied(existing) => {
+            if existing.get().class != class {
+                return Err(RecoveryError::IdClassCollision { sequence });
+            }
+        }
+        alloc::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(IdState { class, consumed: false });
+        }
     }
-    classes.insert(id, class);
     Ok(())
+}
+
+// Every caller has already claimed and checked this record's ID class. Return
+// the same first-use result as inserting into the former separate seen sets.
+fn consume_claimed_id(classes: &mut BTreeMap<u128, IdState>, id: u128) -> bool {
+    let state = classes.get_mut(&id).expect("record ID class already checked");
+    !core::mem::replace(&mut state.consumed, true)
 }
 
 fn is_tombstoned_before(
@@ -2641,6 +2657,24 @@ fn get_u128(bytes: &[u8], at: usize) -> u128 {
 #[cfg(test)]
 mod validator_tests {
     use super::*;
+
+    #[test]
+    fn identity_references_preserve_consumption_and_class_collisions() {
+        for class in [IdClass::Object, IdClass::Derivation] {
+            let mut states = BTreeMap::new();
+            claim_id_class(&mut states, 7, class, 1).unwrap();
+            claim_id_class(&mut states, 7, class, 2).unwrap();
+            assert!(consume_claimed_id(&mut states, 7));
+            // A reference after prepare/commit must not permit identity reuse.
+            claim_id_class(&mut states, 7, class, 3).unwrap();
+            let mut cloned = states.clone();
+            assert!(!consume_claimed_id(&mut states, 7));
+            assert!(!consume_claimed_id(&mut cloned, 7));
+            assert_eq!(claim_id_class(&mut states, 7, IdClass::Transaction, 4),
+                Err(RecoveryError::IdClassCollision { sequence: 4 }));
+            assert!(!consume_claimed_id(&mut states, 7));
+        }
+    }
 
     #[test]
     fn validation_discards_inline_content_and_matches_recovery_prefixes() {

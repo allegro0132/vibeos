@@ -933,6 +933,51 @@ enum CorruptionCase {
 }
 
 #[test]
+fn sealed_impossible_summary_counts_fail_before_extent_table_allocation() {
+    let (image, _) = fixture();
+    let (_, data, _, _, _) = live_pointers(&image);
+    let summary_page = segment_summary_page(data);
+    let original = match decode_segment_summary(&image_page(&image, summary_page),
+        &image_page(&image, summary_page + 1)).unwrap() {
+        DecodeStatus::Sealed(value) => value,
+        _ => panic!("sealed fixture summary"),
+    };
+    for case in 0..3 {
+        let device = MemoryDevice::from_image(image.clone());
+        let store = mount(device.clone());
+        let mut summary = original;
+        match case {
+            0 => {
+                summary.record_count = u32::MAX - 1;
+                summary.binding.ordinal = u32::MAX;
+                summary.kind_counts = [u32::MAX - 1, 0, 0, 0, 0];
+            }
+            1 => summary.payload_page_count = summary.record_count - 1,
+            _ => summary.next_free_page += 1,
+        }
+        let mut body = [0; PAGE_SIZE];
+        let mut seal = [0; PAGE_SIZE];
+        let digest = vibeos_segment_format::encode_segment_summary_body(&summary, &mut body).unwrap();
+        vibeos_segment_format::encode_record_seal(digest, &mut seal).unwrap();
+        assert!(matches!(decode_segment_summary(&body, &seal).unwrap(), DecodeStatus::Sealed(_)));
+        {
+            let mut media = device.0.lock().unwrap();
+            media.pages.insert(summary_page, body);
+            media.pages.insert(summary_page + 1, seal);
+        }
+        let damaged = device.image();
+        let maintenance = store.mint_maintenance_root().unwrap()
+            .attenuate(&[MaintenanceOperation::Scrub]).unwrap();
+        device.reset_io();
+        let report = block_on(store.scrub(&maintenance)).unwrap();
+        assert_eq!(report.status, ScrubStatus::Corrupt, "case {case}");
+        assert_eq!(report.corruption_domain, Some(ScrubCorruptionDomain::SegmentMetadata));
+        assert_eq!(device.io_counts().1, 0);
+        assert_eq!(device.image(), damaged);
+    }
+}
+
+#[test]
 fn detects_anchor_data_tree_summary_mapping_authority_and_allocation_corruption_without_repair() {
     let (image, _) = fixture();
     let (mapping, data, tree, authority, allocation) = live_pointers(&image);
@@ -1025,4 +1070,25 @@ fn detects_anchor_data_tree_summary_mapping_authority_and_allocation_corruption_
             "case {case:?} repaired media"
         );
     }
+}
+
+#[test]
+fn segment_probe_workspace_is_admitted_before_device_io() {
+    let (image, _) = fixture();
+    let device = MemoryDevice::from_image(image);
+    let mut store = mount(device.clone());
+    let maintenance = store.mint_maintenance_root().unwrap()
+        .attenuate(&[MaintenanceOperation::Scrub]).unwrap();
+    let peak = store.mounted.as_ref().unwrap().resident_heap_bytes().unwrap()
+        + crate::store::SEGMENT_PROBE_PAGE_WORKSPACE_BYTES;
+    store.limits.recovery_memory_bytes = peak - 1;
+    device.reset_io();
+    device.fail_next_read(TestError::SensitiveLocation(0xdead_beef));
+    assert_eq!(block_on(store.scrub(&maintenance)), Err(ScrubError::MemoryLimit));
+    assert_eq!(device.io_counts(), (0, 0));
+
+    store.limits.recovery_memory_bytes = peak;
+    assert_eq!(block_on(store.scrub(&maintenance)),
+        Err(ScrubError::DeviceUnavailable { failures: 1 }));
+    assert_eq!(device.io_counts(), (1, 0));
 }

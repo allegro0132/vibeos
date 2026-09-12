@@ -1932,6 +1932,10 @@ mod scan_memo_tests {
     }
 }
 
+// Uncached ordinal-zero probes with no match/sibling requests retain no
+// descriptor table. Their two four-page I/O windows are the heap workspace.
+pub(crate) const SEGMENT_PROBE_PAGE_WORKSPACE_BYTES: usize = 8 * PAGE_SIZE;
+
 pub(crate) async fn scan_segment<D: PageDevice>(
     device: &D,
     store_uuid: StoreUuid,
@@ -1954,6 +1958,21 @@ pub(crate) async fn scan_segment<D: PageDevice>(
         memo,
     )
     .await
+}
+
+// Even an individually sealed summary must describe a physically possible
+// extent population before its count is allowed to size an allocation.
+fn validate_scan_summary_geometry<E>(summary: &SegmentSummary) -> Result<(), StoreError<E>> {
+    let occupied = summary.next_free_page.checked_sub(DATA_FIRST_PAGE).ok_or(StoreError::Corrupt)?;
+    let described = summary.record_count.checked_mul(2)
+        .and_then(|pages| pages.checked_add(summary.payload_page_count)).ok_or(StoreError::Corrupt)?;
+    if summary.next_free_page > DATA_END_PAGE
+        || summary.payload_page_count < summary.record_count
+        || described != occupied
+    {
+        return Err(StoreError::Corrupt);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2030,6 +2049,9 @@ async fn scan_segment_with_matches<D: PageDevice>(
             DecodeStatus::Sealed(value) => value,
             _ => return Err(StoreError::Corrupt),
         };
+    // VerifiedRecord owns both decoded fields and digests. Raw trailer pages
+    // are no longer needed while accumulating the extent proof vector.
+    drop(trailer);
 
     let mut relative = DATA_FIRST_PAGE;
     let mut descriptor_chain =
@@ -2042,10 +2064,17 @@ async fn scan_segment_with_matches<D: PageDevice>(
     let mut kind_bytes = [0_u64; 5];
     let mut first_target = 0_u64;
     let mut last_target = 0_u64;
+    validate_scan_summary_geometry(summary.value())?;
+    // Ordinal zero is a metadata-only segment probe, never an extent. With
+    // no requested matches/siblings and no cache to populate, stream every
+    // descriptor into the chain checks without retaining a duplicate table.
+    let retain_extents = memo.is_some() || pointer.ordinal != 0
+        || !additional.is_empty() || collect_authority_siblings || authority_generation.is_some();
     let mut extents = Vec::new();
-    extents
-        .try_reserve_exact(summary.value().record_count as usize)
-        .map_err(|_| StoreError::MemoryLimit)?;
+    if retain_extents {
+        extents.try_reserve_exact(summary.value().record_count as usize)
+            .map_err(|_| StoreError::MemoryLimit)?;
+    }
     for ordinal in 1..=summary.value().record_count {
         if ordinal != 1 {
             device
@@ -2104,11 +2133,14 @@ async fn scan_segment_with_matches<D: PageDevice>(
         kind_bytes[kind] = kind_bytes[kind]
             .checked_add(value.payload_byte_len)
             .ok_or(StoreError::Corrupt)?;
-        extents.push(value);
+        if retain_extents { extents.push(value); }
         relative = relative
             .checked_add(value.record_span_pages)
             .ok_or(StoreError::Corrupt)?;
     }
+    // Descriptor pairs have been decoded and accumulated; release their
+    // page window before interpreting matches or inserting the final proof.
+    drop(header_pages);
     let summary_value = summary.value();
     let seal_value = segment_seal.value();
     if relative != summary_value.next_free_page

@@ -229,7 +229,7 @@ impl<D: PageDevice> SegmentStore<D> {
         }
 
         if let Err(error) =
-            Box::pin(verify_segment_set(&self.device, current, Some(&mut report))).await
+            Box::pin(verify_segment_set(&self.device, current, self.limits.recovery_memory_bytes, 0, Some(&mut report))).await
         {
             return finish_step_error(report, ScrubCorruptionDomain::SegmentMetadata, error);
         }
@@ -396,14 +396,19 @@ impl<D: PageDevice> SegmentStore<D> {
                         error,
                     );
                 }
-                if let Err(error) =
-                    Box::pin(verify_segment_set(&self.device, &older_state, None)).await
-                {
-                    return finish_step_error(
+                match Box::pin(verify_segment_set(
+                    &self.device,
+                    &older_state,
+                    self.limits.recovery_memory_bytes,
+                    current_resident,
+                    None,
+                )).await {
+                    Ok(peak) => report.observe_memory(peak),
+                    Err(error) => return finish_step_error(
                         report,
                         ScrubCorruptionDomain::SegmentMetadata,
                         error,
-                    );
+                    ),
                 }
                 if let Err(error) = Box::pin(verify_state_contents(
                     &self.device,
@@ -789,12 +794,21 @@ fn map_gc_step_error<E>(error: GcStoreError<E>) -> StepError<E> {
 async fn verify_segment_set<D: PageDevice>(
     device: &D,
     state: &MountedState,
+    total_memory_limit: usize,
+    base_resident: usize,
     mut report: Option<&mut ScrubReport>,
-) -> Result<(), StepError<D::Error>> {
+) -> Result<usize, StepError<D::Error>> {
+    let peak = state.resident_heap_bytes().and_then(|bytes| bytes.checked_add(base_resident))
+        .and_then(|bytes| bytes.checked_add(crate::store::SEGMENT_PROBE_PAGE_WORKSPACE_BYTES))
+        .ok_or(StepError::MemoryLimit)?;
+    let mut observed_peak = 0;
     for segment_no in 0..state.admitted_segments {
         if state.allocation.segment_state(segment_no) == Some(SegmentAllocation::Free) {
             continue;
         }
+        if peak > total_memory_limit { return Err(StepError::MemoryLimit); }
+        observed_peak = peak;
+        if let Some(value) = report.as_deref_mut() { value.observe_memory(peak); }
         let base = segment_base_page(segment_no).map_err(|_| StepError::Corrupt)?;
         let mut pair = Box::new([[0; PAGE_SIZE]; 2]);
         device.read_pages(base, pair.as_mut()).await.map_err(StepError::Device)?;
@@ -855,7 +869,7 @@ async fn verify_segment_set<D: PageDevice>(
                 .saturating_add(scanned.total_payload_bytes);
         }
     }
-    Ok(())
+    Ok(observed_peak)
 }
 
 #[cfg(test)]
@@ -1206,24 +1220,25 @@ async fn verify_exact_payload_and_padding<D: PageDevice>(
     }
     let mut remaining = exact_byte_len;
     let mut hasher = Sha256::new();
-    let mut page = Box::new([0; PAGE_SIZE]);
-    for page_index in 0..u64::from(payload_pages) {
-        device
-            .read_page(
-                first_page
-                    .checked_add(page_index)
-                    .ok_or(StepError::Corrupt)?,
-                page.as_mut(),
-            )
-            .await
-            .map_err(StepError::Device)?;
-        let take =
-            usize::try_from(remaining.min(PAGE_SIZE as u64)).map_err(|_| StepError::Corrupt)?;
-        hasher.update(&page[..take]);
-        if page[take..].iter().any(|byte| *byte != 0) {
-            return Err(StepError::Corrupt);
+    // Keep the batch within scrub's existing two-page streaming workspace.
+    // The final read is shortened so it never crosses this extent's payload.
+    let mut pages = Box::new([[0; PAGE_SIZE]; 2]);
+    let mut page_index = 0_u64;
+    while page_index < u64::from(payload_pages) {
+        let count = (u64::from(payload_pages) - page_index).min(pages.len() as u64) as usize;
+        device.read_pages(
+            first_page.checked_add(page_index).ok_or(StepError::Corrupt)?,
+            &mut pages[..count],
+        ).await.map_err(StepError::Device)?;
+        for page in &pages[..count] {
+            let take = usize::try_from(remaining.min(PAGE_SIZE as u64)).map_err(|_| StepError::Corrupt)?;
+            hasher.update(&page[..take]);
+            if page[take..].iter().any(|byte| *byte != 0) {
+                return Err(StepError::Corrupt);
+            }
+            remaining -= take as u64;
         }
-        remaining -= take as u64;
+        page_index += count as u64;
     }
     let observed: [u8; 32] = hasher.finalize().into();
     if remaining != 0 || observed != expected_sha256 {

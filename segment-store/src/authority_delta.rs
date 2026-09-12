@@ -117,6 +117,77 @@ fn reconstruct(base: &[u8], delta: &[u8]) -> Result<Vec<u8>, DeltaError> {
 // Return generations from the same complete validation used to rebuild bytes;
 // the physical-link layer must not decode both snapshots a second time.
 fn reconstruct_checked(base: &[u8], delta: &[u8]) -> Result<(Vec<u8>, u64, u64), DeltaError> {
+    reconstruct_checked_bounded(base, delta, usize::MAX).map(|(bytes, before, after, _)| (bytes, before, after))
+}
+
+fn metadata_error(error: crate::authority_snapshot::AuthoritySnapshotError) -> DeltaError {
+    match error {
+        crate::authority_snapshot::AuthoritySnapshotError::OutOfBounds => DeltaError::Memory,
+        _ => DeltaError::Invalid,
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static SNAPSHOT_VALIDATION_PASSES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+// This proof borrows the exact immutable bytes that passed complete snapshot
+// and semantic validation. It cannot outlive or be applied to another buffer.
+struct ValidatedSnapshot<'a> {
+    bytes: &'a [u8],
+    generation: u64,
+    record_offset: usize,
+    canonical: bool,
+}
+
+impl<'a> ValidatedSnapshot<'a> {
+    fn validate(bytes: &'a [u8], budget: usize) -> Result<(Self, usize), DeltaError> {
+        #[cfg(test)]
+        SNAPSHOT_VALIDATION_PASSES.with(|count| count.set(count.get() + 1));
+        let (generation, record_offset, metadata) =
+            crate::authority_snapshot::validate_authority_metadata_bounded(bytes, budget)
+                .map_err(metadata_error)?;
+        Ok((Self { bytes, generation, record_offset,
+            canonical: bytes[8..10] == crate::authority_snapshot::PERSISTENT_AUTHORITY_SNAPSHOT_VERSION.to_le_bytes(),
+        }, metadata))
+    }
+}
+
+// Owned successor plus the facts established by validating that successor.
+// Keeping these together permits reuse only within this replay invocation.
+struct ValidatedSnapshotBytes {
+    bytes: Vec<u8>,
+    generation: u64,
+    record_offset: usize,
+    canonical: bool,
+}
+
+impl ValidatedSnapshotBytes {
+    fn as_validated(&self) -> ValidatedSnapshot<'_> {
+        ValidatedSnapshot { bytes: &self.bytes, generation: self.generation,
+            record_offset: self.record_offset, canonical: self.canonical }
+    }
+}
+
+// Additional owned memory beyond the caller's retained base/link buffers.
+// Semantic replay maps/sets still require separate accounting.
+fn reconstruct_checked_bounded(base: &[u8], delta: &[u8], budget: usize)
+    -> Result<(Vec<u8>, u64, u64, usize), DeltaError>
+{
+    let (validated, base_metadata) = ValidatedSnapshot::validate(base, budget)?;
+    let predecessor_generation = validated.generation;
+    let (next, peak) = reconstruct_validated(validated, delta, budget)?;
+    Ok((next.bytes, predecessor_generation, next.generation, base_metadata.max(peak)))
+}
+
+fn reconstruct_validated(base: ValidatedSnapshot<'_>, delta: &[u8], budget: usize)
+    -> Result<(ValidatedSnapshotBytes, usize), DeltaError>
+{
+    if !base.canonical { return Err(DeltaError::Invalid); }
+    let predecessor_generation = base.generation;
+    let verified_base_offset = base.record_offset;
+    let base = base.bytes;
     if delta.len() < HEADER
         || delta.len() > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN
         || base.len() > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN
@@ -150,8 +221,6 @@ fn reconstruct_checked(base: &[u8], delta: &[u8]) -> Result<(Vec<u8>, u64, u64),
     {
         return Err(DeltaError::Invalid);
     }
-    let (predecessor_generation, verified_base_offset) =
-        validate_canonical_authority_bytes(base).map_err(|_| DeltaError::Invalid)?;
     if verified_base_offset != base_offset {
         return Err(DeltaError::Invalid);
     }
@@ -161,21 +230,24 @@ fn reconstruct_checked(base: &[u8], delta: &[u8]) -> Result<(Vec<u8>, u64, u64),
         return Err(DeltaError::Invalid);
     }
     let mut output = Vec::new();
-    output
-        .try_reserve_exact(next_len)
-        .map_err(|_| DeltaError::Memory)?;
+    if next_len > budget { return Err(DeltaError::Memory); }
+    output.try_reserve_exact(next_len).map_err(|_| DeltaError::Memory)?;
+    let metadata_budget = budget.checked_sub(output.capacity()).ok_or(DeltaError::Memory)?;
     output.extend_from_slice(&delta[HEADER..prefix_end]);
     output.extend_from_slice(&base[base_offset..]);
     output.extend_from_slice(&delta[prefix_end..]);
     if output.len() != next_len || digest(&output).as_slice() != &delta[88..120] {
         return Err(DeltaError::Invalid);
     }
-    let (successor_generation, verified_next_offset) =
-        validate_canonical_authority_bytes(&output).map_err(|_| DeltaError::Invalid)?;
-    if successor_generation <= predecessor_generation || verified_next_offset != next_offset {
+    let (proof, next_metadata) = ValidatedSnapshot::validate(&output, metadata_budget)?;
+    let successor_generation = proof.generation;
+    let verified_next_offset = proof.record_offset;
+    if !proof.canonical || successor_generation <= predecessor_generation || verified_next_offset != next_offset {
         return Err(DeltaError::Invalid);
     }
-    Ok((output, predecessor_generation, successor_generation))
+    let peak = output.capacity().checked_add(next_metadata).ok_or(DeltaError::Memory)?;
+    Ok((ValidatedSnapshotBytes { bytes: output, generation: successor_generation,
+        record_offset: verified_next_offset, canonical: true }, peak))
 }
 
 // Experimental envelope: canonical pointer plus predecessor/result checkpoint
@@ -286,22 +358,48 @@ fn apply_link(
     bytes: &[u8],
     context: LinkContext,
 ) -> Result<Vec<u8>, DeltaError> {
+    apply_link_bounded(resolved_pointer, base, predecessor_depth, bytes, context, usize::MAX)
+        .map(|(bytes, _)| bytes)
+}
+
+fn apply_link_bounded(
+    resolved_pointer: vibeos_segment_format::PhysicalPointer,
+    base: &[u8], predecessor_depth: u32, bytes: &[u8], context: LinkContext,
+    budget: usize,
+) -> Result<(Vec<u8>, usize), DeltaError> {
     let link = decode_link(bytes, context)?;
     if link.predecessor != resolved_pointer || predecessor_depth.checked_add(1) != Some(link.depth)
     {
         return Err(DeltaError::Invalid);
     }
-    let (output, predecessor_generation, generation) = reconstruct_checked(base, link.delta)?;
+    let (output, predecessor_generation, generation, peak) = reconstruct_checked_bounded(base, link.delta, budget)?;
     if predecessor_generation != link.predecessor_generation || generation != link.generation {
         return Err(DeltaError::Invalid);
     }
-    Ok(output)
+    Ok((output, peak))
+}
+
+fn apply_validated_link(
+    resolved_pointer: vibeos_segment_format::PhysicalPointer,
+    base: ValidatedSnapshot<'_>, predecessor_depth: u32, bytes: &[u8],
+    context: LinkContext, budget: usize,
+) -> Result<(ValidatedSnapshotBytes, usize), DeltaError> {
+    let link = decode_link(bytes, context)?;
+    if link.predecessor != resolved_pointer || predecessor_depth.checked_add(1) != Some(link.depth)
+        || base.generation != link.predecessor_generation
+    {
+        return Err(DeltaError::Invalid);
+    }
+    let (next, peak) = reconstruct_validated(base, link.delta, budget)?;
+    if next.generation != link.generation { return Err(DeltaError::Invalid); }
+    Ok((next, peak))
 }
 
 /// Payload budget is cumulative across fetched ancestors, not just one extent.
 /// `buffer_bytes` bounds owned fetched payloads plus the overlapping rebuilt
 /// snapshot buffer, ancestor/pending tables, and conservative table reallocation
-/// overlap. Decoder/preflight and source scan workspace are separate costs;
+/// overlap, plus metadata vectors during base and per-link validation.
+/// Semantic preflight and source scan workspace remain separate costs;
 /// this is not a total replay heap budget.
 struct ReplayLimits {
     payload_bytes: usize,
@@ -481,7 +579,7 @@ async fn replay<L: AuthoritySource>(
     let mut resident_buffers = 0_usize;
     let mut peak_buffers = 0_usize;
     let mut expected = None;
-    let mut bytes;
+    let mut validated;
     loop {
         if ancestors.len() > MAX_REPLAY_DEPTH as usize || ancestors.contains(&pointer) {
             return Err(DeltaError::Invalid.into());
@@ -552,17 +650,15 @@ async fn replay<L: AuthoritySource>(
                 return Err(DeltaError::Memory.into());
             }
             let metadata_budget = limits.buffer_bytes.checked_sub(resident_buffers).ok_or(DeltaError::Memory)?;
-            let (base_generation, _, metadata_bytes) =
-                crate::authority_snapshot::validate_authority_metadata_bounded(&loaded, metadata_budget)
-                    .map_err(|error| match error {
-                        crate::authority_snapshot::AuthoritySnapshotError::OutOfBounds => DeltaError::Memory,
-                        _ => DeltaError::Invalid,
-                    })?;
+            let (proof, metadata_bytes) = ValidatedSnapshot::validate(&loaded, metadata_budget)?;
+            let base_generation = proof.generation;
+            let record_offset = proof.record_offset;
+            let canonical = proof.canonical;
             peak_buffers = peak_buffers.max(resident_buffers.checked_add(metadata_bytes).ok_or(DeltaError::Memory)?);
             if base_generation != generation {
                 return Err(DeltaError::Invalid.into());
             }
-            bytes = loaded;
+            validated = ValidatedSnapshotBytes { bytes: loaded, generation: base_generation, record_offset, canonical };
             break;
         }
     }
@@ -574,29 +670,31 @@ async fn replay<L: AuthoritySource>(
         if overlapping > limits.buffer_bytes {
             return Err(DeltaError::Memory.into());
         }
-        // Check before apply_link can reserve its successor buffer. Decoding
-        // scratch allocations inside apply_link have a separate budget gap.
+        // Reserve successor bytes and metadata tables against the remaining
+        // budget while all caller-owned buffers and tables are still live.
         peak_buffers = peak_buffers.max(overlapping);
-        let old_capacity = bytes.capacity();
-        let next = apply_link(predecessor, &bytes, depth, &delta, context)?;
+        let old_capacity = validated.bytes.capacity();
+        let available = limits.buffer_bytes.checked_sub(resident_buffers).ok_or(DeltaError::Memory)?;
+        let (next, extra_peak) = apply_validated_link(predecessor, validated.as_validated(), depth, &delta, context, available)?;
+        peak_buffers = peak_buffers.max(resident_buffers.checked_add(extra_peak).ok_or(DeltaError::Memory)?);
         // The allocator may supply more capacity than the requested length.
         // Old bytes and the pending delta are still live at this point.
-        let actual_overlap = resident_buffers.checked_add(next.capacity()).ok_or(DeltaError::Memory)?;
+        let actual_overlap = resident_buffers.checked_add(next.bytes.capacity()).ok_or(DeltaError::Memory)?;
         if actual_overlap > limits.buffer_bytes {
             return Err(DeltaError::Memory.into());
         }
         peak_buffers = peak_buffers.max(actual_overlap);
         resident_buffers = resident_buffers.checked_sub(old_capacity)
             .and_then(|n| n.checked_sub(delta.capacity()))
-            .and_then(|n| n.checked_add(next.capacity())).ok_or(DeltaError::Memory)?;
+            .and_then(|n| n.checked_add(next.bytes.capacity())).ok_or(DeltaError::Memory)?;
         if resident_buffers > limits.buffer_bytes {
             return Err(DeltaError::Memory.into());
         }
-        bytes = next;
+        validated = next;
         depth += 1;
     }
     Ok(ReplayedAuthority {
-        bytes,
+        bytes: validated.bytes,
         depth,
         ancestors,
         payload_bytes: consumed,
@@ -1295,6 +1393,51 @@ mod tests {
     }
 
     #[test]
+    fn link_budget_includes_successor_bytes_and_simultaneous_metadata() {
+        let (base, next) = pair();
+        let base_bytes = encode_persistent_authority_snapshot(&base).unwrap();
+        let expected = encode_persistent_authority_snapshot(&next).unwrap();
+        let (pointer, context) = link_fixture();
+        let link = encode_link(&base, &next, pointer, 0, context).unwrap().unwrap();
+        let (decoded, peak) = apply_link_bounded(pointer, &base_bytes, 0, &link, context, usize::MAX).unwrap();
+        assert_eq!(decoded, expected);
+        assert!(peak > decoded.capacity(), "successor metadata must remain charged alongside output");
+        assert_eq!(apply_link_bounded(pointer, &base_bytes, 0, &link, context, peak).unwrap().0, expected);
+        assert!(matches!(apply_link_bounded(pointer, &base_bytes, 0, &link, context, peak - 1), Err(DeltaError::Memory)));
+        assert!(matches!(apply_link_bounded(pointer, &base_bytes, 0, &link, context, expected.len()), Err(DeltaError::Memory)));
+    }
+
+    #[test]
+    fn validated_predecessor_reuse_preserves_link_rejection_and_output() {
+        let (base, next) = pair();
+        let base_bytes = encode_persistent_authority_snapshot(&base).unwrap();
+        let (pointer, context) = link_fixture();
+        let link = encode_link(&base, &next, pointer, 0, context).unwrap().unwrap();
+        let compare = |candidate: &[u8]| {
+            let (proof, _) = ValidatedSnapshot::validate(&base_bytes, usize::MAX).unwrap();
+            let fast = apply_validated_link(pointer, proof, 0, candidate, context, usize::MAX)
+                .map(|(next, _)| next.bytes);
+            assert_eq!(fast, apply_link(pointer, &base_bytes, 0, candidate, context));
+        };
+        compare(&link);
+        for end in 0..link.len() { compare(&link[..end]); }
+        for offset in 0..link.len() {
+            let mut changed = link.clone();
+            changed[offset] ^= 1;
+            compare(&changed);
+        }
+        let (proof, _) = ValidatedSnapshot::validate(&base_bytes, usize::MAX).unwrap();
+        let (output, peak) = apply_validated_link(pointer, proof, 0, &link, context, usize::MAX).unwrap();
+        assert_eq!(output.bytes, encode_persistent_authority_snapshot(&next).unwrap());
+        for budget in [peak, peak - 1] {
+            let (proof, _) = ValidatedSnapshot::validate(&base_bytes, usize::MAX).unwrap();
+            let result = apply_validated_link(pointer, proof, 0, &link, context, budget);
+            if budget == peak { assert_eq!(result.unwrap().0.bytes, output.bytes); }
+            else { assert!(matches!(result, Err(DeltaError::Memory))); }
+        }
+    }
+
+    #[test]
     fn reserved_link_prefix_preserves_exact_delta_bytes_and_size_fallback() {
         let (base, next) = pair();
         let raw = encode(&base, &next).unwrap().unwrap();
@@ -1444,6 +1587,7 @@ mod tests {
             .iter()
             .map(|(_, b, _)| b.len())
             .sum::<usize>();
+        SNAPSHOT_VALIDATION_PASSES.with(|count| count.set(0));
         let replayed = run(replay(
             &mut source,
             tip,
@@ -1456,6 +1600,8 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(replayed.bytes, reconstructed);
+        assert_eq!(SNAPSHOT_VALIDATION_PASSES.with(|count| count.get()),
+            MAX_REPLAY_DEPTH as usize + 1, "validate the full base and each successor exactly once");
         assert_eq!(replayed.depth, MAX_REPLAY_DEPTH);
         assert_eq!(replayed.ancestors.len(), MAX_REPLAY_DEPTH as usize + 1);
         assert_eq!(replayed.payload_bytes, budget);

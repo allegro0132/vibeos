@@ -2335,6 +2335,12 @@ impl PreflightReplay {
     /// of the committed object bytes; a caller that keeps the builder for
     /// the next strict extension finishes a clone instead.
     pub fn finish(self) -> Result<RecoveryPreflight, RecoveryError> {
+        self.finish_inner(true)
+    }
+
+    // Only validation may omit the output slot table. All fallible graph and
+    // slot-history checks below are shared with complete recovery.
+    fn finish_inner(self, materialize_slots: bool) -> Result<RecoveryPreflight, RecoveryError> {
         if self.poisoned {
             return Err(RecoveryError::ReplayPoisoned);
         }
@@ -2428,18 +2434,22 @@ impl PreflightReplay {
             );
         }
 
-        let slots = slots
-            .into_iter()
-            .map(
-                |((space, slot), (max_generation, derivation))| RecoveredSlot {
-                    space,
-                    slot,
-                    max_generation,
-                    live_derivation: (!is_tombstoned(derivation, &graph, &self.tombstone_sequence))
-                        .then_some(derivation),
-                },
-            )
-            .collect();
+        let slots = if materialize_slots {
+            slots
+                .into_iter()
+                .map(
+                    |((space, slot), (max_generation, derivation))| RecoveredSlot {
+                        space,
+                        slot,
+                        max_generation,
+                        live_derivation: (!is_tombstoned(derivation, &graph, &self.tombstone_sequence))
+                            .then_some(derivation),
+                    },
+                )
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(RecoveryPreflight {
             store_id: self.store_id,
             id_high_water: self.high_water,
@@ -2478,7 +2488,7 @@ impl PreflightValidator {
     }
 
     pub fn finish(self) -> Result<u64, RecoveryError> {
-        self.replay.finish().map(|validated| validated.last_sequence())
+        self.replay.finish_inner(false).map(|validated| validated.last_sequence())
     }
 }
 

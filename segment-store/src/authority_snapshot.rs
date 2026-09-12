@@ -1145,28 +1145,7 @@ fn validate_with_records(
     if check_record_chain {
         validate_record_chain(records)?;
     }
-    let mut previous_stable = None;
-    let mut v2_object_ids = Vec::new();
-    v2_object_ids
-        .try_reserve_exact(value.objects.len())
-        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
-    for binding in &value.objects {
-        if binding.stable_object_id == 0
-            || binding.v2_object_id == 0
-            || binding.commit_generation == 0
-            || binding.commit_generation > value.checkpoint_generation
-            || binding.object_kind == 0
-            || previous_stable.is_some_and(|id| id >= binding.stable_object_id)
-        {
-            return Err(AuthoritySnapshotError::UnsortedOrDuplicate);
-        }
-        previous_stable = Some(binding.stable_object_id);
-        v2_object_ids.push(binding.v2_object_id);
-    }
-    v2_object_ids.sort_unstable();
-    if v2_object_ids.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(AuthoritySnapshotError::UnsortedOrDuplicate);
-    }
+    let v2_object_ids = validate_binding_index(value)?;
     validate_principals(&value.principals)?;
     let mut previous_external = None;
     for root in &value.external_roots {
@@ -1175,7 +1154,10 @@ fn validate_with_records(
             || root.commit_generation > value.checkpoint_generation
             || root.object_kind == 0
             || previous_external.is_some_and(|id| id >= root.object_id)
-            || v2_object_ids.binary_search(&root.object_id).is_ok()
+            || v2_object_ids.as_ref().map_or_else(
+                || value.objects.binary_search_by_key(&root.object_id, |binding| binding.v2_object_id).is_ok(),
+                |ids| ids.binary_search(&root.object_id).is_ok(),
+            )
         {
             return Err(AuthoritySnapshotError::UnsortedOrDuplicate);
         }
@@ -1189,6 +1171,40 @@ fn validate_with_records(
         return Err(AuthoritySnapshotError::OutOfBounds);
     }
     Ok(())
+}
+
+// Most publications preserve V2 ID order as well as stable ID order. In that
+// case the binding table itself is an index: no copied ID array or sort is
+// necessary. A non-monotonic mapping remains valid and uses a sorted fallback.
+fn validate_binding_index(
+    value: &PersistentAuthoritySnapshot,
+) -> Result<Option<Vec<u128>>, AuthoritySnapshotError> {
+    let mut previous_stable = None;
+    let mut previous_v2 = None;
+    let mut ordered_v2 = true;
+    for binding in &value.objects {
+        if binding.stable_object_id == 0
+            || binding.v2_object_id == 0
+            || binding.commit_generation == 0
+            || binding.commit_generation > value.checkpoint_generation
+            || binding.object_kind == 0
+            || previous_stable.is_some_and(|id| id >= binding.stable_object_id)
+        {
+            return Err(AuthoritySnapshotError::UnsortedOrDuplicate);
+        }
+        previous_stable = Some(binding.stable_object_id);
+        ordered_v2 &= previous_v2.is_none_or(|id| id < binding.v2_object_id);
+        previous_v2 = Some(binding.v2_object_id);
+    }
+    if ordered_v2 { return Ok(None); }
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(value.objects.len()).map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    ids.extend(value.objects.iter().map(|binding| binding.v2_object_id));
+    ids.sort_unstable();
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(AuthoritySnapshotError::UnsortedOrDuplicate);
+    }
+    Ok(Some(ids))
 }
 
 fn validate_record_chain(record_stream: &[u8]) -> Result<(), AuthoritySnapshotError> {
@@ -1474,6 +1490,28 @@ mod tests {
     }
 
     #[test]
+    fn metadata_budget_checks_all_tables_before_decode_and_exact_capacity() {
+        let value = sample().with_external_roots(vec![PersistentRootEntry {
+            object_id: 99, commit_generation: 1, object_kind: 3,
+        }]).unwrap();
+        let bytes = encode_persistent_authority_snapshot(&value).unwrap();
+        let expected = value.objects.len() * core::mem::size_of::<PersistentObjectBinding>()
+            + value.principals.len() * core::mem::size_of::<PersistentPrincipalPolicy>()
+            + value.external_roots.len() * core::mem::size_of::<PersistentRootEntry>();
+        let (generation, offset, allocated) = validate_authority_metadata_bounded(&bytes, expected).unwrap();
+        assert_eq!(generation, value.checkpoint_generation());
+        assert_eq!(allocated, expected);
+        assert_eq!(&bytes[offset..], value.record_stream());
+        assert_eq!(validate_authority_metadata_bounded(&bytes, expected - 1), Err(AuthoritySnapshotError::OutOfBounds));
+        // With insufficient table space, fail before inspecting even the
+        // first object's reserved field (and before semantic replay).
+        let mut corrupt = bytes.clone();
+        corrupt[PERSISTENT_AUTHORITY_HEADER_LEN + 0x2c] = 1;
+        assert_eq!(validate_authority_metadata_bounded(&corrupt, expected - 1), Err(AuthoritySnapshotError::OutOfBounds));
+        assert_eq!(validate_authority_metadata_bounded(&corrupt, expected), Err(AuthoritySnapshotError::NonZeroReserved));
+    }
+
+    #[test]
     fn external_roots_round_trip_without_becoming_authority_objects() {
         let sample = sample()
             .with_external_roots(vec![PersistentRootEntry {
@@ -1496,6 +1534,48 @@ mod tests {
             decode_persistent_authority_snapshot(&corrupt),
             Err(AuthoritySnapshotError::NonZeroReserved)
         );
+    }
+
+    #[test]
+    fn binding_index_fast_path_preserves_permutations_duplicates_and_root_collisions() {
+        for first in 1..=3_u128 {
+            for second in 1..=3_u128 {
+                for third in 1..=3_u128 {
+                    let ids = [first, second, third];
+                    let unique = first != second && first != third && second != third;
+                    let mut value = sample();
+                    value.objects = ids.iter().enumerate().map(|(index, &id)| PersistentObjectBinding {
+                        stable_object_id: 3 + index as u128, v2_object_id: id,
+                        commit_generation: 7, object_kind: 0x41,
+                    }).collect();
+                    match validate_binding_index(&value) {
+                        Ok(index) => {
+                            assert!(unique);
+                            assert_eq!(index.is_none(), ids.windows(2).all(|pair| pair[0] < pair[1]));
+                            if let Some(index) = index { assert_eq!(index, vec![1, 2, 3]); }
+                        }
+                        Err(error) => {
+                            assert!(!unique);
+                            assert_eq!(error, AuthoritySnapshotError::UnsortedOrDuplicate);
+                        }
+                    }
+                    for root_id in 1..=4 {
+                        value.external_roots = vec![PersistentRootEntry {
+                            object_id: root_id, commit_generation: 7, object_kind: 0x41,
+                        }];
+                        let encoded = encode_persistent_authority_snapshot(&value);
+                        if unique && !ids.contains(&root_id) {
+                            assert_eq!(decode_persistent_authority_snapshot(&encoded.unwrap()).unwrap(), value);
+                        } else {
+                            assert_eq!(encoded, Err(AuthoritySnapshotError::UnsortedOrDuplicate));
+                        }
+                    }
+                }
+            }
+        }
+        let mut value = sample();
+        value.objects.clear();
+        assert_eq!(validate_binding_index(&value).unwrap(), None);
     }
 
     #[test]

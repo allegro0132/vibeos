@@ -1329,3 +1329,38 @@ fn incremental_replay_equals_whole_stream_recovery_at_every_cut() {
         Err(vibeos_durable_format::RecoveryError::ReplayPoisoned)
     ));
 }
+
+#[test]
+fn validation_only_finish_matches_recovery_graph_and_slot_errors() {
+    use vibeos_durable_format::PreflightValidator;
+    let mut logs = Vec::new();
+    for generation in [0, 1, 2, u64::MAX] {
+        for revoked in [false, true] {
+            logs.push(slot_log(generation, revoked).0);
+        }
+    }
+    let mut missing = TestLog::formatted();
+    missing.grant(tx(30), child_grant(11, 10, 20, 1));
+    logs.push(missing);
+    let mut amplification = TestLog::formatted();
+    let mut parent = root_grant(10, 20, 1, 1);
+    parent.rights = DurableRights::READ;
+    amplification.grant(tx(30), parent);
+    amplification.grant(tx(31), child_grant(11, 10, 20, 2));
+    logs.push(amplification);
+    let mut many = TestLog::formatted();
+    for i in 0..64 {
+        many.grant(tx(300 + i), root_grant(10 + i, 800, i as u32, 1));
+    }
+    assert_eq!(preflight_recovery(&many.sectors, store()).unwrap().slots().len(), 64);
+    logs.push(many);
+    for (case, log) in logs.iter().enumerate() {
+        for len in 1..=log.sectors.len() {
+            let records = &log.sectors[..len];
+            let expected = preflight_recovery(records, store()).map(|value| value.last_sequence());
+            let mut validator = PreflightValidator::new(store());
+            let actual = validator.append(records).and_then(|()| validator.finish());
+            assert_eq!(actual, expected, "case {case}, prefix {len}");
+        }
+    }
+}

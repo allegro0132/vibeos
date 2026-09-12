@@ -6602,3 +6602,265 @@ This reduces an explicit encoder temporary allocation and strengthens owned
 buffer accounting. Semantic decoder/preflight allocations and source scan
 workspace remain outside that budget, so total replay heap bounds and
 production delta admission are still incomplete. No QEMU/SD speedup is claimed.
+
+### Authority metadata-vector budget foundation (2026-09-12)
+
+Snapshot decoding now preflights the combined in-memory object-binding,
+principal-policy and external-root table sizes before allocating any table.
+Each exact reservation subsequently checks actual Vec capacity against the
+remaining table budget. Ordinary decoding retains its existing unrestricted
+table budget; a test-only bounded validator returns the observed table bytes
+without retaining a record-stream copy. Initial full-base validation during
+experimental delta replay uses the remaining owned-buffer budget and records
+the metadata overlap in its peak. Table-budget exhaustion maps to MemoryLimit.
+
+The regression includes all three table types, exact-budget acceptance,
+one-byte-less rejection, and a malformed first table item that proves the
+budget preflight precedes table decoding. All 240 host tests pass with one
+ignored. QEMU three-boot file-tree/GC/cold-recovery/powered-off verification
+and Duo release compilation pass. Evidence:
+`target/storage-authority-metadata-budget-20260912/` contains host/gate/Duo logs
+and retained gate evidence.
+
+This is a table-vector budget, not a total semantic heap bound. Per-link
+snapshot validation, preflight maps/sets and device segment-scan workspace
+still require accounting; allocator over-reservation is checked after it
+occurs. Production delta admission remains disabled. No performance claim is
+made for this budget change.
+
+### Per-link authority metadata overlap budget (2026-09-12)
+
+Experimental delta reconstruction now accepts the remaining owned-memory
+budget for each link. It validates predecessor metadata within that budget,
+checks successor output length before reservation, subtracts actual output
+capacity before successor metadata allocation, and reports the larger of
+predecessor metadata or simultaneous successor bytes plus metadata. Replay
+adds this extra peak to its retained input buffers and ancestor/pending tables.
+Canonical V2, SHA, sequence, observed-depth, pointer and generation checks are
+unchanged; metadata exhaustion reports MemoryLimit.
+
+The new direct link test compares exact reconstructed bytes, accepts the
+measured overlap peak, rejects one byte less, and rejects a budget that covers
+the output alone but not its simultaneous metadata. Existing 32-link replay,
+large multi-extent, corruption and publication/GC/growth fault matrices pass.
+All 241 host tests pass with one ignored. Evidence:
+`target/storage-delta-link-metadata-budget-20260912/host.log`.
+
+This extends metadata-vector accounting from the initial base to every link;
+it does not yet count semantic preflight map/set allocations, source scan
+workspace or allocator overhead. Production delta format admission remains
+disabled, and no runtime performance improvement is claimed.
+
+### Bound segment scan count before allocation (2026-09-12)
+
+The production segment scanner previously reserved its extent vector from an
+individually sealed summary's record_count before proving that count fits in
+the segment. Individual summary decoding checked fields/checksums but not the
+complete page accounting. Add a pre-allocation geometry check: each extent
+requires two descriptor/seal pages and at least one payload page; their sum
+must equal next_free_page minus DATA_FIRST_PAGE and stay within DATA_END_PAGE.
+Impossible summaries now return Corrupt before sizing the extent allocation,
+including arithmetic overflow. Subsequent complete chain validation remains.
+
+An end-to-end scrub regression rewrites and reseals three summaries: a count
+of u32::MAX - 1, too few payload pages, and inconsistent next_free_page. All
+remain individually decodable but scrub rejects them as segment metadata
+corruption without modifying media. All 242 host tests pass with one ignored;
+QEMU three-boot file-tree/GC/cold-recovery/powered-off verification and Duo
+compilation pass. Evidence: `target/storage-scan-geometry-bound-20260912/`.
+
+This establishes a physical upper bound on the descriptor vector request and
+closes a potential oversized allocation path. It does not yet charge valid
+scan workspace against the whole recovery budget, nor does it establish a
+performance improvement on healthy media. Production delta remains disabled.
+
+### Shorten segment scan page-buffer lifetimes (2026-09-12)
+
+VerifiedRecord owns decoded fields and body digests. Once summary and segment
+seal decoding completes, the scanner now drops the four-page trailer buffer
+before allocating/growing the extent proof vector. After the descriptor walk,
+it drops the four-page header/descriptor window before interpreting requested
+matches or inserting the proof into the memo. Later checks continue using the
+owned decoded records, digests and accumulated descriptor/payload chains.
+
+This removes 16 KiB of raw-page overlap during extent collection and another
+16 KiB window during result construction; these phase-local savings must not
+be added into a claimed fixed whole-operation peak reduction. Initial header
+and trailer reads still overlap, and complete scan-budget integration remains
+unfinished. No read requests, payload checks or format semantics change.
+
+All 242 host tests pass with one ignored. QEMU three-boot file-tree/GC/cold
+recovery/powered-off verification and Duo compilation pass. Evidence is in
+`target/storage-scan-buffer-lifetime-20260912/`, including retained gate logs.
+No timing or whole-heap measurement is claimed for this change.
+
+### Stream metadata-only segment probes (2026-09-12)
+
+An uncached ordinal-zero segment probe requests only verified aggregate
+metadata, not an extent match. When it also requests no additional pointers,
+authority siblings or authority-generation collection, the scanner now feeds
+each decoded extent through the complete chain/geometry/statistics checks
+without reserving or populating the extent proof Vec. Its resulting empty
+extent list never enters a memo. Ordinary pointer lookup, authority collection
+and any scan that populates a memo retain the existing full descriptor table.
+
+This removes the count-dependent descriptor allocation from scrub's whole
+segment probe, while still reading and validating every descriptor. Raw page
+windows and all final summary/seal comparisons remain. It does not yet bound
+the entire scrub/recovery heap or remove tables from authority pointer reads.
+All 242 host tests pass with one ignored, including sealed impossible summary
+counts and repeated media-corruption cases. QEMU three-boot file-tree/GC/cold
+recovery/powered-off verification and Duo compilation pass. Evidence is under
+`target/storage-streaming-segment-probe-20260912/`. No timing claim is made.
+
+### Budget scrub segment-probe page workspace (2026-09-12)
+
+The streaming, uncached ordinal-zero segment probe has two simultaneous
+four-page I/O windows and no retained descriptor table. Scrub now admits its
+32 KiB page workspace together with the mounted state before the first device
+read. Predecessor verification additionally charges the current resident
+state. Both passes contribute to the memory high-water mark; predecessor
+verification does not duplicate the current publication's diagnostic counts.
+Free segments require no probe workspace.
+
+A boundary test rejects a budget one byte below the required peak with zero
+I/O, then proves that the exact budget reaches an injected first-read failure.
+All 243 host tests pass with one ignored, and Duo compilation passes. Evidence
+is under `target/storage-scrub-probe-budget-20260912/`. This bounds the probe's
+page buffers only, not the complete recovery heap, allocator overhead or
+device-backend allocations. No timing improvement is claimed.
+
+QEMU three-boot file-tree/GC/cold recovery and powered-off verification also
+pass; the gate logs and JSON reports are retained in the same evidence folder.
+
+### Omit recovery slot output during authority validation (2026-09-12)
+
+`PreflightValidator` previously completed ordinary recovery, including a
+`RecoveredSlot` Vec and the final ancestor/tombstone walk for each slot,
+then immediately discarded that output. Its shared finish implementation now
+omits just this output materialization in validation mode. All fallible graph,
+rights, slot-generation and prior-tombstone checks still execute; public
+`PreflightReplay::finish` continues to produce the complete recovered slots.
+The partial internal result is private and validation exposes only its sequence.
+
+A differential test covers all record prefixes of valid/invalid slot reuse,
+missing parents, a parent without grant rights and a 64-slot journal. Exact
+results, including errors, match full preflight recovery. This removes a
+slot-count-dependent result allocation and final graph walks; it does not
+bound the remaining semantic maps or enable experimental authority deltas.
+QEMU three-boot file-tree/GC/cold recovery and powered-off verification and
+Duo compilation pass. Evidence is in
+`target/storage-validation-slot-output-20260912/`. No end-to-end latency or
+SD-card performance improvement is claimed from this change.
+
+The broader host run exposed three stale crash-recovery memory assertions
+from before optional mount memo admission. They now distinguish cached peak
+reservation, successful uncached fallback and mandatory uncached workspace.
+Both dense and replay-merge fixtures must recover at the exact mandatory
+peak and reject one byte less. All 13 crash-recovery tests pass after this
+correction; the initial failed log is retained alongside the successful rerun.
+
+All remaining fused-append, GC codec/recovery and steady-state integration
+tests pass. Per-suite counts are retained in `test-summary.json`; the broad
+run also passed all 243 segment-store unit tests (one ignored) and all durable
+format tests, including the new semantic differential test.
+
+### Reuse validated predecessors within experimental delta replay (2026-09-12)
+
+Experimental replay previously validated the initial full snapshot and then
+validated both predecessor and successor for every link. It now retains the
+validated generation, record offset and canonical-version fact alongside the
+owned immutable reconstructed bytes. A borrowed proof can only refer to those
+bytes within this replay. Each successor still receives complete metadata and
+record/graph validation, including the checks after recomputed payload digests.
+Physical predecessor, depth, generation and both snapshot hashes remain checked.
+Legacy V1 full bases remain readable but cannot become delta predecessors.
+
+The maximum-depth test counts exactly 33 full snapshot validation passes for
+32 links, replacing the former 65 calls. A new differential test compares
+ordinary and proof-based link application for every truncation and single-byte
+mutation, plus exact and one-byte-short workspace admission. The existing
+base/link retention, successor metadata budget and crash/growth/GC tests remain.
+This is test-only experimental code: production delta admission and total
+semantic/source-workspace accounting remain incomplete. It does not change
+on-media bytes or claim an end-to-end speedup. Evidence is under
+`target/storage-delta-validation-reuse-20260912/`.
+
+Final host verification passes all 244 segment-store unit tests (one ignored),
+including experimental publication, GC and growth fault matrices. No QEMU
+timing run was performed because the changed delta path is not production-enabled.
+
+### Avoid copied V2 ID index for ordered authority bindings (2026-09-12)
+
+Authority snapshot validation previously copied every V2 ObjectId to a Vec and
+sorted it even when bindings were already strictly ordered by both stable and
+V2 IDs. The validator now checks both orders in its binding pass. Strict V2
+order proves uniqueness and permits external-root collision checks directly
+against the binding slice. That path avoids the temporary ID Vec (16 bytes
+requested per binding) and its sort. Non-monotonic V2 mappings remain supported
+through the original copied/sorted index, including non-adjacent duplicates.
+
+A test enumerates all 27 three-ID combinations and four external-root IDs per
+combination, checking accepted permutations, duplicates, collisions and exact
+encode/decode round trips. It also verifies that ordered and empty tables need
+no fallback index. The fallback allocation and semantic replay maps are still
+separate costs pending full budget accounting. No end-to-end timing or SD-card
+speedup is claimed. Evidence is in
+`target/storage-authority-binding-index-20260912/`.
+
+All 245 segment-store unit tests pass (one ignored). QEMU three-boot file-tree,
+GC, cold recovery and powered-off verification and Duo compilation also pass;
+gate logs and independent verifier JSON are retained in the evidence folder.
+
+### Current production cold-recovery recheck, 128 live files (2026-09-12)
+
+Compared the preserved `storage-scrub-pair-read-20260912/candidate.elf` with
+current production, using the same retained two-batch 128-file image and
+64-page cache, 128 MiB guest, single-hart TCG, 4/2 MiB/s and 400/200 IOPS.
+No compilation/tests overlapped timed runs. Ran control/current/current/control,
+then the reverse order after the first comparison showed stage-dependent
+latency variation. All eight cold recoveries and following object checks pass;
+all measured cold phases perform zero writes and flushes.
+
+Across four boots per build, control/current mount means are 1.422553/1.486454 s,
+authority 0.006523/0.006407 s, scrub 10.608201/10.765774 s. Phase sums average
+12.037276/12.258635 s: current is 1.84% slower in this sample, not a measured
+end-to-end improvement. Per-boot sums span 11.926055–12.174586 s for control and
+12.065189–12.498314 s for current; this does not isolate a particular code change.
+
+Every boot has identical mount 576 reads / 3,641,344 bytes and scrub 4,221 reads /
+27,373,568 bytes. Mount's reported peak remains 133,842 bytes (not whole-heap
+measurement). Scrub latency is close to the 4,221 / 400 IOPS time, suggesting
+request count is the useful next target. `verify_exact_payload_and_padding`
+still reads payload pages individually; batching those reads warrants a
+workspace-preserving experiment. No actual SD-card result is implied.
+Evidence, source hashes, restored cache configuration, individual serial logs,
+ABBA/reverse summaries and `comparison.json` are under
+`target/storage-current-cold-128-20260912/`.
+
+### Batch scrub payload verification in two-page reads (2026-09-12)
+
+`verify_exact_payload_and_padding` now reads up to two adjacent payload pages
+per device request. The final request is shortened at the extent boundary;
+every byte still contributes to the SHA-256 or zero-padding check in order.
+The buffer grows from one page to two, within the existing 8 KiB scrub streaming
+workspace and below the already admitted segment-probe workspace. No extent
+is skipped and no proof is reused across scrub invocations. This targets the
+per-request limit observed in the 128-file QEMU cold-recovery fixture.
+Evidence is in `target/storage-scrub-payload-pairs-20260912/`.
+
+All 245 host unit tests pass (one ignored), along with QEMU three-boot file-tree,
+GC, cold recovery, powered-off verification and Duo compilation. The preserved
+pre-change current-production ELF is the control. In control/candidate/candidate/
+control order with the same 128-file image, 64-page cache, 128 MiB RAM, single-hart
+TCG and 4/2 MiB/s, 400/200 IOPS limits, scrub means are 10.543396 / 9.521581 s
+(9.69% lower). Scrub reads fall from 4,221 to 3,811 (9.71% fewer); bytes remain
+27,373,568 in every boot. All measured cold phases have zero writes/flushes and
+all four post-boot object validations pass.
+
+Phase sums average 12.137424 / 10.968381 s, but mount also fluctuated despite
+identical 576 reads / 3,641,344 bytes and no mount-path change. Attribute the
+result to the reproducible scrub request reduction rather than claiming the
+mount timing difference as a benefit. Mount's reported peak remains 133,842
+bytes; this is not an actual whole-heap measurement. Builds and tests finished
+before timing. No actual SD-card speedup is established by this QEMU experiment.

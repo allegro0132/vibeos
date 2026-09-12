@@ -357,6 +357,11 @@ struct AuthorityFaultMedia {
     visible: BTreeMap<u64, Page>,
     durable: BTreeMap<u64, Page>,
     mutation_count: usize,
+    reads: usize,
+    read_pages: Option<BTreeMap<u64, usize>>,
+    read_trace: Option<Vec<u64>>,
+    writes: usize,
+    flushes: usize,
     fault: Option<(usize, AuthorityFaultAction)>,
 }
 
@@ -376,6 +381,11 @@ impl AuthorityFaultDevice {
                 visible: durable.clone(),
                 durable,
                 mutation_count: 0,
+                reads: 0,
+                read_pages: None,
+                read_trace: None,
+                writes: 0,
+                flushes: 0,
                 fault: None,
             })),
         }
@@ -390,7 +400,13 @@ impl AuthorityFaultDevice {
     }
 
     fn reset_mutation_count(&self) {
-        self.media.lock().unwrap().mutation_count = 0;
+        let mut media = self.media.lock().unwrap();
+        media.mutation_count = 0;
+        media.reads = 0;
+        if let Some(pages) = &mut media.read_pages { pages.clear(); }
+        if let Some(trace) = &mut media.read_trace { trace.clear(); }
+        media.writes = 0;
+        media.flushes = 0;
     }
 
     fn arm(&self, mutation_index: usize, action: AuthorityFaultAction) {
@@ -406,10 +422,11 @@ impl AuthorityFaultDevice {
         media.fault = None;
     }
 
-    fn next_action(&self) -> AuthorityFaultAction {
+    fn next_action(&self, flush: bool) -> AuthorityFaultAction {
         let mut media = self.media.lock().unwrap();
         let index = media.mutation_count;
         media.mutation_count += 1;
+        if flush { media.flushes += 1; } else { media.writes += 1; }
         media
             .fault
             .filter(|(mutation, _)| *mutation == index)
@@ -452,8 +469,12 @@ impl PageDevice for AuthorityFaultDevice {
         if page >= self.info().page_count {
             return Err(AuthorityFaultError::OutsideRange);
         }
+        let mut media = self.media.lock().unwrap();
+        media.reads += 1;
+        if let Some(pages) = &mut media.read_pages { *pages.entry(page).or_default() += 1; }
+        if let Some(trace) = &mut media.read_trace { trace.push(page); }
         output.fill(0);
-        if let Some(stored) = self.media.lock().unwrap().visible.get(&page) {
+        if let Some(stored) = media.visible.get(&page) {
             output.copy_from_slice(stored);
         }
         Ok(())
@@ -470,7 +491,7 @@ impl PageDevice for AuthorityFaultDevice {
             ));
         }
         let bytes = *input;
-        match self.next_action() {
+        match self.next_action(false) {
             AuthorityFaultAction::Normal => {
                 self.write_effect(page, bytes, AuthorityEffect::Visible);
                 Ok(())
@@ -492,7 +513,7 @@ impl PageDevice for AuthorityFaultDevice {
     }
 
     async fn flush(&self) -> Result<(), MutationFailure<Self::Error>> {
-        match self.next_action() {
+        match self.next_action(true) {
             AuthorityFaultAction::Normal => {
                 self.flush_effect(AuthorityEffect::Durable);
                 Ok(())
@@ -2625,4 +2646,606 @@ fn experimental_authority_replay_uses_verified_device_snapshot() {
     let damaged = device.snapshot();
     assert!(block_on(crate::authority_delta::replay_device_for_test(&device, state, expected.len())).is_err());
     assert_eq!(device.snapshot(), damaged);
+}
+
+#[test]
+fn experimental_delta_checkpoint_cold_mount_and_gc_materialize() {
+    use crate::PersistentAuthoritySnapshot;
+    use vibeos_segment_format::{PhysicalPointer, segment_base_page};
+    let device = MemoryDevice::blank();
+    let export = |name: &str| {
+        if let Some(directory) = std::env::var_os("VIBE_DELTA_IMAGE_FIXTURES") {
+            use std::io::{Seek, SeekFrom, Write};
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            let mut file = std::fs::File::create(directory.join(name)).unwrap();
+            file.set_len(device.info().page_count * 4096).unwrap();
+            for (page, bytes) in device.snapshot() {
+                file.seek(SeekFrom::Start(page * 4096)).unwrap();
+                file.write_all(&bytes).unwrap();
+            }
+        }
+    };
+
+    let (runtime, _quota, provisioner) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+    block_on(store.format(FormatOptions { store_uuid: StoreUuid::new([7;16]).unwrap(), cleaner_reserve_segments: 4, limits: limits() })).unwrap();
+    let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+    block_on(store.import_persistent_authority(&maintenance, import(&format_records(), &[]))).unwrap();
+    let mut chain = RecordChain::new(store_id());
+    let mut records = chain.append(None, RecordBody::Format).unwrap().to_vec();
+    let mut old_roots = Vec::new();
+    for step in 1..=3 {
+        let state = store.mounted.as_ref().unwrap();
+        old_roots.push(state.authority_root);
+        let base = state.persistent_authority.as_ref().unwrap();
+        records.extend_from_slice(&chain.append(None, RecordBody::IdHighWater { exclusive_end: step * 32 }).unwrap());
+        let next = PersistentAuthoritySnapshot::new(state.generation + 1,
+            root_policy_commitment(POLICY), records.clone(), vec![], base.principals().to_vec()).unwrap();
+        block_on(store.publish_experimental_delta_for_test(next)).unwrap();
+        let PhysicalPointer::Value(pointer) = store.mounted.as_ref().unwrap().authority_root else { panic!("root"); };
+        let page = segment_base_page(pointer.segment_no).unwrap() + u64::from(pointer.payload_relative_page);
+        assert_eq!(&device.snapshot()[&page][..8], b"VIBEAUL1");
+    }
+    old_roots.push(store.mounted.as_ref().unwrap().authority_root);
+    export("delta.raw");
+    for old in &old_roots {
+        let damaged = MemoryDevice::blank();
+        *damaged.pages.lock().unwrap() = device.snapshot();
+        let PhysicalPointer::Value(old) = old else { panic!("old root"); };
+        let page = segment_base_page(old.segment_no).unwrap() + u64::from(old.payload_relative_page);
+        damaged.pages.lock().unwrap().get_mut(&page).unwrap()[0] ^= 1;
+        let before_mount = damaged.snapshot();
+        let (runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+        let mut invalid = SegmentStore::new_with_runtime_context(damaged.clone(), limits(), runtime);
+        assert!(block_on(invalid.mount()).is_err(), "damaged ancestor must prevent admission");
+        assert_eq!(damaged.snapshot(), before_mount, "rejected mount must not mutate media");
+    }
+
+    let expected = crate::encode_persistent_authority_snapshot(store.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap();
+    // Exercise the same store instance after a successful cached mount. Every
+    // old proof must be gone on remount, including shared delta ancestors.
+    for old in &old_roots {
+        let PhysicalPointer::Value(old) = old else { panic!("old root"); };
+        let base_page = segment_base_page(old.segment_no).unwrap();
+        for relative in [u64::from(old.payload_relative_page),
+                         u64::from(old.descriptor_relative_page),
+                         u64::from(vibeos_segment_format::SEGMENT_SEAL_BODY_PAGE)] {
+            let changed = MemoryDevice::blank();
+            *changed.pages.lock().unwrap() = device.snapshot();
+            let (runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+            let mut remounted = SegmentStore::new_with_runtime_context(changed.clone(), limits(), runtime);
+            block_on(remounted.mount()).unwrap();
+            let page = base_page + relative;
+            let original = changed.snapshot()[&page];
+            changed.pages.lock().unwrap().get_mut(&page).unwrap()[0] ^= 1;
+            let damaged_image = changed.snapshot();
+            assert!(block_on(remounted.mount()).is_err(), "warm remount must reject changed authority media");
+            assert!(remounted.mounted.is_none(), "failed remount must discard the admitted state");
+            assert_eq!(changed.snapshot(), damaged_image, "rejected remount must be read-only");
+            changed.pages.lock().unwrap().insert(page, original);
+            block_on(remounted.mount()).unwrap();
+            assert_eq!(crate::encode_persistent_authority_snapshot(remounted.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap(), expected);
+        }
+    }
+    std::println!("mount-local memo: 12 same-instance payload/descriptor/seal corruptions rejected; repaired remounts match");
+    drop(store);
+    let (runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut cold = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+    block_on(cold.mount()).unwrap();
+    assert_eq!(crate::encode_persistent_authority_snapshot(cold.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap(), expected);
+    block_on(cold.collect_garbage()).unwrap();
+    let state = cold.mounted.as_ref().unwrap();
+    assert_eq!(state.persistent_authority.as_ref().unwrap().record_stream(), records);
+    let PhysicalPointer::Value(pointer) = state.authority_root else { panic!("root"); };
+    let page = segment_base_page(pointer.segment_no).unwrap() + u64::from(pointer.payload_relative_page);
+    assert_eq!(&device.snapshot()[&page][..8], b"VIBEAUT2");
+    export("materialized.raw");
+    // A materialized checkpoint must no longer read any predecessor payload.
+    for old in old_roots {
+        let PhysicalPointer::Value(old) = old else { panic!("old root"); };
+        assert_ne!(old.segment_no, pointer.segment_no);
+        let page = segment_base_page(old.segment_no).unwrap() + u64::from(old.payload_relative_page);
+        if let Some(bytes) = device.pages.lock().unwrap().get_mut(&page) { bytes[0] ^= 1; }
+    }
+    drop(cold);
+    let (runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut final_store = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+    block_on(final_store.mount()).unwrap();
+    assert_eq!(final_store.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap().record_stream(), records);
+}
+
+#[test]
+fn experimental_delta_publish_is_atomic_at_each_mutation_and_cancel_point() {
+    exercise_experimental_delta_publish(false);
+}
+
+#[test]
+fn experimental_cached_delta_publish_is_atomic_at_each_mutation_and_cancel_point() {
+    exercise_experimental_delta_publish(true);
+}
+
+fn exercise_experimental_delta_publish(warm_cache: bool) {
+    use crate::PersistentAuthoritySnapshot;
+    fn mount(device: AuthorityFaultDevice) -> SegmentStore<AuthorityFaultDevice> {
+        let (runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+        let mut store = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+        block_on(store.mount()).unwrap();
+        store
+    }
+    let seed_device = AuthorityFaultDevice::blank();
+    let (runtime, _, provisioner) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut seed = SegmentStore::new_with_runtime_context(seed_device.clone(), limits(), runtime);
+    block_on(seed.format(authority_fault_options())).unwrap();
+    let maintenance = seed.provision_maintenance_root(&provisioner).unwrap();
+    block_on(seed.import_persistent_authority(&maintenance, import(&format_records(), &[]))).unwrap();
+    let principals = seed.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap().principals().to_vec();
+    let mut chain = RecordChain::new(store_id());
+    let mut records = chain.append(None, RecordBody::Format).unwrap().to_vec();
+    records.extend_from_slice(&chain.append(None, RecordBody::IdHighWater { exclusive_end: 32 }).unwrap());
+    let base = PersistentAuthoritySnapshot::new(3, root_policy_commitment(POLICY), records.clone(), vec![], principals.clone()).unwrap();
+    block_on(seed.publish_experimental_delta_for_test(base.clone())).unwrap();
+    let warm_base = seed.experimental_authority_base.take().unwrap();
+    drop(seed);
+    seed_device.power_cycle();
+    let initial = seed_device.durable_image();
+    records.extend_from_slice(&chain.append(None, RecordBody::IdHighWater { exclusive_end: 64 }).unwrap());
+    let next = PersistentAuthoritySnapshot::new(4, root_policy_commitment(POLICY), records, vec![], principals).unwrap();
+    let old_bytes = crate::encode_persistent_authority_snapshot(&base).unwrap();
+    let new_bytes = crate::encode_persistent_authority_snapshot(&next).unwrap();
+    let probe_device = AuthorityFaultDevice::from_durable(initial.clone());
+    let mut probe = mount(probe_device.clone());
+    probe_device.reset_mutation_count();
+    block_on(probe.publish_experimental_delta_for_test(next.clone())).unwrap();
+    let mutations = probe_device.mutation_count();
+    assert!(mutations > 0);
+    let vibeos_segment_format::PhysicalPointer::Value(pointer) = probe.mounted.as_ref().unwrap().authority_root else { panic!("delta root"); };
+    let page = vibeos_segment_format::segment_base_page(pointer.segment_no).unwrap() + u64::from(pointer.payload_relative_page);
+    assert_eq!(&probe_device.durable_image()[&page][..8], b"VIBEAUL1");
+    drop(probe);
+    let actions = [
+        AuthorityFaultAction::FailNotSubmitted,
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::None),
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::Visible),
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::Durable),
+        AuthorityFaultAction::Pending(AuthorityEffect::None),
+        AuthorityFaultAction::Pending(AuthorityEffect::Visible),
+        AuthorityFaultAction::Pending(AuthorityEffect::Durable),
+    ];
+    let mut old = 0;
+    let mut new = 0;
+    for mutation in 0..mutations {
+        for action in actions {
+            let case = alloc::format!("delta mutation {mutation}/{mutations} {action:?}");
+            let device = AuthorityFaultDevice::from_durable(initial.clone());
+            let mut store = mount(device.clone());
+            if warm_cache { store.experimental_authority_base = Some(warm_base.clone()); }
+            device.arm(mutation, action);
+            let mut operation = Box::pin(store.publish_experimental_delta_for_test(next.clone()));
+            let outcome = poll_once(operation.as_mut());
+            match action {
+                AuthorityFaultAction::Pending(_) => assert!(matches!(outcome, Poll::Pending), "{case}"),
+                _ => assert!(matches!(outcome, Poll::Ready(Err(_))), "{case}"),
+            }
+            drop(operation);
+            assert!(store.experimental_authority_base.is_none(), "{case}: failed publication retained cache");
+            drop(store);
+            device.power_cycle();
+            let before_mount = device.durable_image();
+            let mut cold = mount(device.clone());
+            let state = cold.mounted.as_ref().unwrap();
+            let actual = crate::encode_persistent_authority_snapshot(state.persistent_authority.as_ref().unwrap()).unwrap();
+            if actual == old_bytes {
+                old += 1;
+                assert_eq!(state.generation, 3, "{case}");
+            } else {
+                assert_eq!(actual, new_bytes, "{case}: neither complete old nor new snapshot");
+                assert_eq!(state.generation, 4, "{case}");
+                new += 1;
+            }
+            assert_eq!(device.mutation_count(), 0, "{case}: recovery wrote media");
+            assert_eq!(device.durable_image(), before_mount, "{case}");
+            if actual == old_bytes {
+                block_on(cold.publish_experimental_delta_for_test(next.clone()))
+                    .unwrap_or_else(|e| panic!("{case}: retry failed: {e:?}"));
+            }
+            drop(cold);
+            device.power_cycle();
+            let confirmed = mount(device.clone());
+            assert_eq!(crate::encode_persistent_authority_snapshot(
+                confirmed.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()
+            ).unwrap(), new_bytes, "{case}: retry/confirmed checkpoint");
+
+        }
+    }
+    assert!(old > 0 && new > 0, "must exercise both checkpoint outcomes");
+    std::println!("delta publish warm_cache={warm_cache}: {mutations} mutation points, {} fault/cancel cases, {old} old, {new} new", mutations * actions.len());
+}
+
+#[test]
+fn experimental_delta_gc_is_atomic_at_each_mutation_and_cancel_point() {
+    exercise_experimental_delta_gc(false);
+}
+
+#[test]
+fn experimental_delta_gc_preserves_live_object_and_grant_at_each_cut() {
+    exercise_experimental_delta_gc(true);
+}
+
+// Shared only by host tests: the growth matrix uses the same live authority
+// fixture and exact object/grant/quota assertions as the delta GC work.
+pub(super) fn delta_growth_fixture(has_object: bool) -> (
+    StoreId, &'static [u8], Vec<RootPolicy>, Vec<[u8; 512]>, Vec<u8>,
+) {
+    let payload: Vec<u8> = if has_object { (0..4096).map(|n| (n % 251) as u8).collect() } else { Vec::new() };
+    let records = if has_object { append_grant_records(&append_object_records(&format_records(), &payload)) } else { format_records() };
+    let roots = if has_object { vec![RootPolicy { grant: root_grant() }] } else { Vec::new() };
+    (store_id(), POLICY, roots, records, payload)
+}
+
+pub(super) fn assert_delta_growth_object<D: PageDevice>(store: &SegmentStore<D>, payload: &[u8])
+where D::Error: core::fmt::Debug {
+    if payload.is_empty() { return; }
+    let view = block_on(store.recover_persistent_authority(root_policy_commitment(POLICY))).unwrap();
+    let sectors = view.record_stream().as_chunks::<512>().0;
+    let graph = vibeos_durable_format::preflight_recovery(sectors, store_id()).unwrap()
+        .finish(&[RootPolicy { grant: root_grant() }]).unwrap();
+    assert_eq!(graph.grants.len(), 1);
+    assert_eq!(graph.grants[0].grant, root_grant());
+    assert_eq!(view.objects().len(), 1);
+    let object = find_object(sectors);
+    let handle = view.object_for_recovered(&object).unwrap();
+    assert_eq!(block_on(store.read_persistent_object(handle)).unwrap(), payload);
+    let usage = store.principal_quota_usage(&view.principals()[0]).unwrap();
+    assert_eq!(usage.committed_logical_bytes, payload.len() as u64);
+    assert_eq!(usage.committed_physical_bytes, canonical_attributable_physical_bytes(payload.len() as u64).unwrap());
+}
+
+fn exercise_experimental_delta_gc(has_object: bool) {
+    use crate::PersistentAuthoritySnapshot;
+    fn mount(device: AuthorityFaultDevice) -> SegmentStore<AuthorityFaultDevice> {
+        let (runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+        let mut store = SegmentStore::new_with_runtime_context(device, limits(), runtime);
+        block_on(store.mount()).unwrap();
+        store
+    }
+    fn check_object(store: &SegmentStore<AuthorityFaultDevice>, payload: &[u8]) {
+        let view = block_on(store.recover_persistent_authority(root_policy_commitment(POLICY))).unwrap();
+        let sectors: Vec<_> = view.record_stream().as_chunks::<512>().0.to_vec();
+        let graph = vibeos_durable_format::preflight_recovery(&sectors, store_id()).unwrap()
+            .finish(&[RootPolicy { grant: root_grant() }]).unwrap();
+        assert_eq!(graph.grants.len(), 1);
+        assert_eq!(graph.grants[0].grant, root_grant());
+        assert_eq!(view.objects().len(), 1);
+        let object = find_object(&sectors);
+        let handle = view.object_for_recovered(&object).unwrap();
+        assert_eq!(block_on(store.read_persistent_object(handle)).unwrap(), payload);
+        let usage = store.principal_quota_usage(&view.principals()[0]).unwrap();
+        assert_eq!(usage.committed_logical_bytes, payload.len() as u64);
+        assert_eq!(usage.committed_physical_bytes, canonical_attributable_physical_bytes(payload.len() as u64).unwrap());
+    }
+    let payload: Vec<u8> = (0..4096).map(|n| (n % 251) as u8).collect();
+    let export = |name: &str, image: &BTreeMap<u64, Page>| {
+        if has_object {
+            if let Some(directory) = std::env::var_os("VIBE_DELTA_IMAGE_FIXTURES") {
+                use std::io::{Seek, SeekFrom, Write};
+                let directory = std::path::PathBuf::from(directory);
+                std::fs::create_dir_all(&directory).unwrap();
+                let mut file = std::fs::File::create(directory.join(name)).unwrap();
+                file.set_len(admitted_pages(SEGMENTS).unwrap() * 4096).unwrap();
+                for (page, bytes) in image {
+                    file.seek(SeekFrom::Start(page * 4096)).unwrap();
+                    file.write_all(bytes).unwrap();
+                }
+            }
+        }
+    };
+    let seed_device = AuthorityFaultDevice::blank();
+    let (runtime, _, provisioner) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut seed = SegmentStore::new_with_runtime_context(seed_device.clone(), limits(), runtime);
+    block_on(seed.format(authority_fault_options())).unwrap();
+    let maintenance = seed.provision_maintenance_root(&provisioner).unwrap();
+    let seed_records = if has_object { append_grant_records(&append_object_records(&format_records(), &payload)) } else { format_records() };
+    let roots = if has_object { vec![RootPolicy { grant: root_grant() }] } else { vec![] };
+    block_on(seed.import_persistent_authority(&maintenance, import(&seed_records, &roots))).unwrap();
+    let preflight = vibeos_durable_format::preflight_recovery(&seed_records, store_id()).unwrap();
+    let mut chain = RecordChain::from_checkpoint(store_id(), preflight.chain_checkpoint().unwrap()).unwrap();
+    let mut records: Vec<u8> = seed_records.iter().flatten().copied().collect();
+    let mut ancestors = Vec::new();
+    for step in 1..=3 {
+        let state = seed.mounted.as_ref().unwrap();
+        ancestors.push(state.authority_root);
+        records.extend_from_slice(&chain.append(None, RecordBody::IdHighWater { exclusive_end: step * 32 }).unwrap());
+        let next = PersistentAuthoritySnapshot::new(state.generation + 1, root_policy_commitment(POLICY),
+            records.clone(), state.persistent_authority.as_ref().unwrap().objects.clone(), state.persistent_authority.as_ref().unwrap().principals().to_vec()).unwrap();
+        block_on(seed.publish_experimental_delta_for_test(next)).unwrap();
+    }
+    let state = seed.mounted.as_ref().unwrap();
+    ancestors.push(state.authority_root);
+    let old = crate::encode_persistent_authority_snapshot(state.persistent_authority.as_ref().unwrap()).unwrap();
+    let old_generation = state.generation;
+    if has_object { check_object(&seed, &payload); }
+    drop(seed);
+    seed_device.power_cycle();
+    let initial = seed_device.durable_image();
+    export("live-delta.raw", &initial);
+    let probe_device = AuthorityFaultDevice::from_durable(initial.clone());
+    let mut probe = mount(probe_device.clone());
+    probe_device.reset_mutation_count();
+    block_on(probe.collect_garbage()).unwrap();
+    let mutations = probe_device.mutation_count();
+    export("live-materialized.raw", &probe_device.durable_image());
+    let state = probe.mounted.as_ref().unwrap();
+    assert_eq!(state.generation, old_generation + 2);
+    let materialized = crate::encode_persistent_authority_snapshot(state.persistent_authority.as_ref().unwrap()).unwrap();
+    assert_ne!(old, materialized);
+    assert_eq!(state.persistent_authority.as_ref().unwrap().record_stream(), records);
+    drop(probe);
+    let actions = [
+        AuthorityFaultAction::FailNotSubmitted,
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::None),
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::Visible),
+        AuthorityFaultAction::FailAmbiguous(AuthorityEffect::Durable),
+        AuthorityFaultAction::Pending(AuthorityEffect::None),
+        AuthorityFaultAction::Pending(AuthorityEffect::Visible),
+        AuthorityFaultAction::Pending(AuthorityEffect::Durable),
+    ];
+    let mut outcomes = [0_usize; 3];
+    for mutation in 0..mutations {
+        for action in actions {
+            let case = alloc::format!("delta GC mutation {mutation}/{mutations} {action:?}");
+            let device = AuthorityFaultDevice::from_durable(initial.clone());
+            let mut store = mount(device.clone());
+            device.arm(mutation, action);
+            let mut operation = Box::pin(store.collect_garbage());
+            let result = poll_once(operation.as_mut());
+            match action {
+                AuthorityFaultAction::Pending(_) => assert!(matches!(result, Poll::Pending), "{case}"),
+                _ => assert!(matches!(result, Poll::Ready(Err(_))), "{case}"),
+            }
+            drop(operation);
+            drop(store);
+            device.power_cycle();
+            let durable = device.durable_image();
+            let mut cold = mount(device.clone());
+            let state = cold.mounted.as_ref().unwrap();
+            assert!((old_generation..=old_generation + 2).contains(&state.generation), "{case}");
+            outcomes[(state.generation - old_generation) as usize] += 1;
+            let actual = crate::encode_persistent_authority_snapshot(state.persistent_authority.as_ref().unwrap()).unwrap();
+            assert_eq!(actual, if state.generation == old_generation { &old } else { &materialized }.as_slice(), "{case}");
+            if state.generation == old_generation {
+                for pointer in &ancestors {
+                    let vibeos_segment_format::PhysicalPointer::Value(pointer) = pointer else { panic!("ancestor"); };
+                    assert_eq!(state.allocation.segment_state(pointer.segment_no), Some(crate::SegmentAllocation::Allocated), "{case}");
+                }
+            }
+            if state.generation == old_generation + 1 {
+                for pointer in &ancestors {
+                    let vibeos_segment_format::PhysicalPointer::Value(pointer) = pointer else { panic!("ancestor"); };
+                    assert!(matches!(state.allocation.segment_state(pointer.segment_no),
+                        Some(crate::SegmentAllocation::Allocated | crate::SegmentAllocation::Retired)),
+                        "{case}: ancestor reusable before barrier");
+                }
+            }
+            assert_eq!(device.mutation_count(), 0, "{case}: recovery wrote media");
+            assert_eq!(device.durable_image(), durable, "{case}");
+            if has_object { check_object(&cold, &payload); }
+            if state.generation < old_generation + 2 {
+                block_on(cold.collect_garbage()).unwrap_or_else(|e| panic!("{case}: GC retry/resume: {e:?}"));
+            }
+            drop(cold);
+            device.power_cycle();
+            let confirmed = mount(device.clone());
+            assert_eq!(confirmed.mounted.as_ref().unwrap().generation, old_generation + 2, "{case}");
+
+            assert_eq!(crate::encode_persistent_authority_snapshot(
+                confirmed.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()
+            ).unwrap(), materialized, "{case}: completed GC");
+            if has_object { check_object(&confirmed, &payload); }
+        }
+    }
+    assert!(outcomes.iter().all(|&count| count > 0));
+    std::println!("delta GC has_object={has_object}: {mutations} mutation points, {} cases, old/relocated/barrier: {outcomes:?}", mutations * actions.len());
+}
+
+#[test]
+fn experimental_delta_publication_io_against_full_snapshot() {
+    use crate::PersistentAuthoritySnapshot;
+    let device = AuthorityFaultDevice::blank();
+    let (runtime, _, provisioner) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut seed = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+    block_on(seed.format(authority_fault_options())).unwrap();
+    let maintenance = seed.provision_maintenance_root(&provisioner).unwrap();
+    let mut chain = RecordChain::new(store_id());
+    let mut sectors = vec![chain.append(None, RecordBody::Format).unwrap()];
+    for n in 1..=320 {
+        sectors.push(chain.append(None, RecordBody::IdHighWater { exclusive_end: n * 32 }).unwrap());
+    }
+    block_on(seed.import_persistent_authority(&maintenance, import(&sectors, &[]))).unwrap();
+    let base = seed.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap().clone();
+    let mut next_records: Vec<u8> = sectors.iter().flatten().copied().collect();
+    let mut successors = Vec::new();
+    for n in 1..=8 {
+        next_records.extend_from_slice(&chain.append(None, RecordBody::IdHighWater { exclusive_end: (320 + n) * 32 }).unwrap());
+        successors.push(PersistentAuthoritySnapshot::new(base.checkpoint_generation() + n as u64,
+            root_policy_commitment(POLICY), next_records.clone(), vec![], base.principals().to_vec()).unwrap());
+    }
+    drop(seed);
+    device.power_cycle();
+    let initial = device.durable_image();
+    let expected = crate::encode_persistent_authority_snapshot(successors.last().unwrap()).unwrap();
+    let mut measured = Vec::new();
+    let mut cold_reads = Vec::new();
+    for delta in [false, true] {
+        let device = AuthorityFaultDevice::from_durable(initial.clone());
+        let (runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+        let mut store = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+        block_on(store.mount()).unwrap();
+        device.reset_mutation_count();
+        for snapshot in &successors {
+            if delta {
+                block_on(store.publish_experimental_delta_for_test(snapshot.clone())).unwrap();
+                let state = store.mounted.as_ref().unwrap();
+                let witness = store.experimental_authority_base.as_ref().unwrap();
+                assert!(witness.matches(state));
+                for field in 0..6 {
+                    let mut changed = state.clone();
+                    match field {
+                        0 => changed.generation += 1,
+                        1 => changed.authority_root = vibeos_segment_format::PhysicalPointer::Null,
+                        2 => changed.admitted_segments += 1,
+                        3 => changed.next_segment_generation += 1,
+                        4 => changed.superblock.binding.store_uuid = StoreUuid::new([8;16]).unwrap(),
+                        _ => {
+                            let base = changed.persistent_authority.as_ref().unwrap();
+                            let mut policies = base.principals().to_vec();
+                            policies[0].admission_revoked = true;
+                            changed.persistent_authority = Some(PersistentAuthoritySnapshot::new(
+                                base.checkpoint_generation(), root_policy_commitment(POLICY),
+                                base.record_stream().to_vec(), base.objects.clone(), policies,
+                            ).unwrap());
+                        },
+                    }
+                    assert!(!witness.matches(&changed), "cache accepted changed field {field}");
+                }
+
+            } else {
+                block_on(store.publish_full_snapshot_for_test(snapshot.clone())).unwrap();
+            }
+        }
+        let media = device.media.lock().unwrap();
+        let io = (media.reads * 4096, media.writes * 4096, media.flushes);
+        drop(media);
+        std::println!("authority 321-record base, 8 appends, delta={delta}: reads={} writes={} flushes={}", io.0, io.1, io.2);
+        measured.push(io);
+        drop(store);
+        device.power_cycle();
+        let (runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+        device.reset_mutation_count();
+        device.media.lock().unwrap().read_pages = Some(BTreeMap::new());
+        device.media.lock().unwrap().read_trace = Some(Vec::new());
+        let mut cold = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+        block_on(cold.mount()).unwrap();
+        let media = device.media.lock().unwrap();
+        let reads = media.reads * 4096;
+        let pages = media.read_pages.as_ref().unwrap();
+        let mut segments = BTreeMap::<Option<u64>, (usize, usize, usize)>::new();
+        for (&page, &count) in pages {
+            let segment = page.checked_sub(vibeos_segment_format::ANCHOR_PAGES)
+                .map(|relative| relative / vibeos_segment_format::SEGMENT_PAGES);
+            let stats = segments.entry(segment).or_default();
+            stats.0 += count;
+            stats.1 += 1;
+            stats.2 = stats.2.max(count);
+        }
+        assert_eq!(pages.values().sum::<usize>(), media.reads);
+        let trace = media.read_trace.as_ref().unwrap();
+        assert_eq!(trace.len(), media.reads);
+        let mut cache_estimates = Vec::new();
+        for capacity in [0, 64, 512] {
+            let mut lru = Vec::new();
+            let mut misses = 0;
+            for &page in trace {
+                if let Some(index) = lru.iter().position(|&cached| cached == page) {
+                    lru.remove(index);
+                } else {
+                    misses += 1;
+                    if capacity > 0 && lru.len() == capacity { lru.remove(0); }
+                }
+                if capacity > 0 { lru.push(page); }
+            }
+            if capacity == 0 { assert_eq!(misses, media.reads); }
+            if capacity >= pages.len() { assert_eq!(misses, pages.len()); }
+            cache_estimates.push((capacity, misses));
+        }
+        std::println!("cold read-trace LRU simulation delta={delta}: (capacity,misses)={cache_estimates:?}");
+        std::println!("cold page attribution delta={delta}: total={} unique={} segments(total,unique,max_repeats)={segments:?}", media.reads, pages.len());
+        assert_eq!((media.writes, media.flushes), (0, 0), "cold recovery must be read-only");
+        drop(media);
+        cold_reads.push(reads);
+        std::println!("authority 321-record base, 8 appends, delta={delta}: cold recovery reads={reads} writes=0 flushes=0");
+        assert!(cold.experimental_authority_base.is_none(), "cold mount must clear provenance cache");
+        assert_eq!(crate::encode_persistent_authority_snapshot(cold.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap(), expected);
+        // Reserving the optional 64 KiB memo must not reduce admission. This
+        // budget sits between the cached and uncached recovery upper bounds.
+        let mut tight_limits = limits();
+        tight_limits.recovery_memory_bytes = cold.info().unwrap().recovery_peak_bytes - 32 * 1024;
+        let tight_device = AuthorityFaultDevice::from_durable(device.durable_image());
+        let (runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+        let mut tight = SegmentStore::new_with_runtime_context(tight_device.clone(), tight_limits, runtime);
+        block_on(tight.mount()).unwrap();
+        assert_eq!(tight.info().unwrap().recovery_peak_bytes, tight_limits.recovery_memory_bytes,
+            "expected the conservative peak of the uncached retry");
+        assert_eq!(crate::encode_persistent_authority_snapshot(tight.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap(), expected);
+        assert_eq!(tight_device.mutation_count(), 0, "fallback mount must remain read-only");
+        std::println!("cold memo delta={delta}: tight-budget uncached fallback passed at {} bytes", tight_limits.recovery_memory_bytes);
+    }
+    std::println!("publication plus one cold mount: full reads={} delta reads={}",
+        measured[0].0 + cold_reads[0], measured[1].0 + cold_reads[1]);
+    assert!(measured[1].1 < measured[0].1);
+    assert_eq!(measured[0].2, measured[1].2, "must preserve flush durability boundaries");
+}
+
+#[test]
+fn experimental_delta_with_multi_extent_base_cold_recovery() {
+    use crate::PersistentAuthoritySnapshot;
+    use std::io::{Seek, SeekFrom, Write};
+    let device = MemoryDevice::blank();
+    let mut budget = limits();
+    budget.recovery_memory_bytes = 32 * 1024 * 1024;
+    let (runtime, _, provisioner) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut store = SegmentStore::new_with_runtime_context(device.clone(), budget, runtime);
+    block_on(store.format(FormatOptions { store_uuid: StoreUuid::new([7;16]).unwrap(), cleaner_reserve_segments: 4, limits: budget })).unwrap();
+    let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+    let mut chain = RecordChain::new(store_id());
+    let mut sectors = vec![chain.append(None, RecordBody::Format).unwrap()];
+    for n in 1..=8192 {
+        sectors.push(chain.append(None, RecordBody::IdHighWater { exclusive_end: n * 32 }).unwrap());
+    }
+    block_on(store.import_persistent_authority(&maintenance, import(&sectors, &[]))).unwrap();
+    let base = store.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap().clone();
+    let encoded = crate::encode_persistent_authority_snapshot(&base).unwrap();
+    assert!(encoded.len() > vibeos_segment_format::SEGMENT_PAGES as usize * 4096);
+    let export = |name: &str| {
+        if let Some(directory) = std::env::var_os("VIBE_DELTA_IMAGE_FIXTURES") {
+            let directory = std::path::PathBuf::from(directory);
+            std::fs::create_dir_all(&directory).unwrap();
+            let mut file = std::fs::File::create(directory.join(name)).unwrap();
+            file.set_len(device.info().page_count * 4096).unwrap();
+            for (page, bytes) in device.snapshot() {
+                file.seek(SeekFrom::Start(page * 4096)).unwrap();
+                file.write_all(&bytes).unwrap();
+            }
+        }
+    };
+    export("multi-base.raw");
+    let mut records = base.record_stream().to_vec();
+    records.extend_from_slice(&chain.append(None, RecordBody::IdHighWater { exclusive_end: 8193 * 32 }).unwrap());
+    let next = PersistentAuthoritySnapshot::new(base.checkpoint_generation() + 1,
+        root_policy_commitment(POLICY), records, vec![], base.principals().to_vec()).unwrap();
+    block_on(store.publish_experimental_delta_for_test(next.clone())).unwrap();
+    export("multi-delta.raw");
+    drop(store);
+    let (runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut cold = SegmentStore::new_with_runtime_context(device.clone(), budget, runtime);
+    block_on(cold.mount()).unwrap();
+    assert_eq!(crate::encode_persistent_authority_snapshot(cold.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap(),
+        crate::encode_persistent_authority_snapshot(&next).unwrap());
+    let mut records = next.record_stream().to_vec();
+    for n in 8194..=16385 {
+        records.extend_from_slice(&chain.append(None, RecordBody::IdHighWater { exclusive_end: n * 32 }).unwrap());
+    }
+    let large = PersistentAuthoritySnapshot::new(next.checkpoint_generation() + 1,
+        root_policy_commitment(POLICY), records, vec![], next.principals().to_vec()).unwrap();
+    block_on(cold.publish_experimental_delta_for_test(large.clone())).unwrap();
+    let vibeos_segment_format::PhysicalPointer::Value(pointer) = cold.mounted.as_ref().unwrap().authority_root else { panic!("root"); };
+    let page = vibeos_segment_format::segment_base_page(pointer.segment_no).unwrap() + u64::from(pointer.payload_relative_page);
+    assert_eq!(&device.snapshot()[&page][..8], b"VIBEAUL1", "must exercise a delta, not full fallback");
+    export("multi-large-delta.raw");
+    drop(cold);
+    let (runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut recovered = SegmentStore::new_with_runtime_context(device.clone(), budget, runtime);
+    block_on(recovered.mount()).unwrap();
+    assert_eq!(crate::encode_persistent_authority_snapshot(recovered.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap(),
+        crate::encode_persistent_authority_snapshot(&large).unwrap());
 }

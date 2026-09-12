@@ -564,6 +564,13 @@ def run_vibeos(args: argparse.Namespace) -> int:
                     except subprocess.TimeoutExpired:
                         process.terminate()
                         process.wait(timeout=5)
+                if args.retain_images is not None:
+                    args.retain_images.mkdir(parents=True, exist_ok=True)
+                    retained = args.retain_images / f"vm-{vm_index:03d}.raw"
+                    # Only copy after QEMU has stopped. Never replace a prior
+                    # fixture, even when overwriting benchmark result logs.
+                    with retained.open("xb") as destination, disk.open("rb") as source:
+                        shutil.copyfileobj(source, destination)
                 if failed:
                     return 1
     finally:
@@ -1010,6 +1017,8 @@ def main() -> int:
     run.add_argument("--data-image", type=Path, required=True,
                      help="powered-off verified backend template; cloned once per VM")
     run.add_argument("--output", type=Path, required=True)
+    run.add_argument("--retain-images", type=Path,
+                     help="retain stopped per-VM images without overwriting existing files; verify independently before reuse")
     run.add_argument("--object-bytes", type=int, required=True)
     run.add_argument("--object-count", type=int, default=1)
     run.add_argument("--content-class", choices=("unique", "half-duplicate", "all-duplicate"))

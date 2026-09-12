@@ -799,6 +799,22 @@ pub(crate) fn persistent_authority_encoded_len(
 pub fn encode_persistent_authority_snapshot(
     value: &PersistentAuthoritySnapshot,
 ) -> Result<Vec<u8>, AuthoritySnapshotError> {
+    encode_snapshot(value, true)
+}
+
+/// Canonical metadata prefix for experimental delta encoding. The header still
+/// describes the full snapshot; this prefix alone is not a decodable snapshot.
+#[cfg(test)]
+pub(crate) fn encode_persistent_authority_metadata(
+    value: &PersistentAuthoritySnapshot,
+) -> Result<Vec<u8>, AuthoritySnapshotError> {
+    encode_snapshot(value, false)
+}
+
+fn encode_snapshot(
+    value: &PersistentAuthoritySnapshot,
+    include_records: bool,
+) -> Result<Vec<u8>, AuthoritySnapshotError> {
     // Every constructor validated the snapshot, including its record chain;
     // re-run only the cheap structural checks before encoding.
     validate(value, false)?;
@@ -832,7 +848,8 @@ pub fn encode_persistent_authority_snapshot(
         )
         .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
     let encoded_len = persistent_authority_encoded_len(value)?;
-    let mut output = vec![0; encoded_len];
+    let output_len = if include_records { encoded_len } else { record_offset };
+    let mut output = vec![0; output_len];
     output[..8].copy_from_slice(MAGIC);
     put_u16(&mut output, 0x08, PERSISTENT_AUTHORITY_SNAPSHOT_VERSION);
     put_u16(&mut output, 0x0a, PERSISTENT_AUTHORITY_HEADER_LEN as u16);
@@ -881,12 +898,70 @@ pub fn encode_persistent_authority_snapshot(
         put_u64(&mut output, offset + 0x10, root.commit_generation);
         put_u32(&mut output, offset + 0x18, root.object_kind);
     }
-    output[record_offset..].copy_from_slice(&value.record_stream);
+    if include_records {
+        output[record_offset..].copy_from_slice(&value.record_stream);
+    }
     Ok(output)
 }
 
 pub fn decode_persistent_authority_snapshot(
     input: &[u8],
+) -> Result<PersistentAuthoritySnapshot, AuthoritySnapshotError> {
+    decode_snapshot(input, true, usize::MAX)
+}
+
+/// Validate canonical V2 bytes and their full authority graph without retaining
+/// another copy of the record stream. Metadata tables remain decoder-owned.
+#[cfg(test)]
+pub(crate) fn validate_canonical_authority_bytes(
+    input: &[u8],
+) -> Result<(u64, usize), AuthoritySnapshotError> {
+    let validated = validate_authority_bytes(input)?;
+    if get_u16(input, 0x08) != PERSISTENT_AUTHORITY_SNAPSHOT_VERSION {
+        return Err(AuthoritySnapshotError::InvalidField);
+    }
+    Ok(validated)
+}
+
+/// Validate any supported full snapshot, including legacy V1, without copying
+/// its record stream. Only validated generation/offset escape this helper.
+#[cfg(test)]
+pub(crate) fn validate_authority_bytes(
+    input: &[u8],
+) -> Result<(u64, usize), AuthoritySnapshotError> {
+    let decoded = decode_snapshot(input, false, usize::MAX)?;
+    Ok((decoded.checkpoint_generation(), get_u64(input, 0x60) as usize))
+}
+
+// This budget covers only owned metadata vectors, not semantic replay maps.
+#[cfg(test)]
+pub(crate) fn validate_authority_metadata_bounded(
+    input: &[u8], budget: usize,
+) -> Result<(u64, usize, usize), AuthoritySnapshotError> {
+    let decoded = decode_snapshot(input, false, budget)?;
+    let bytes = decoded.objects.capacity() * core::mem::size_of::<PersistentObjectBinding>()
+        + decoded.principals.capacity() * core::mem::size_of::<PersistentPrincipalPolicy>()
+        + decoded.external_roots.capacity() * core::mem::size_of::<PersistentRootEntry>();
+    Ok((decoded.checkpoint_generation(), get_u64(input, 0x60) as usize, bytes))
+}
+
+fn reserve_metadata<T>(table: &mut Vec<T>, count: usize, used: &mut usize, budget: usize)
+    -> Result<(), AuthoritySnapshotError>
+{
+    let requested = count.checked_mul(core::mem::size_of::<T>())
+        .and_then(|bytes| used.checked_add(bytes)).ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    if requested > budget { return Err(AuthoritySnapshotError::OutOfBounds); }
+    table.try_reserve_exact(count).map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    *used = table.capacity().checked_mul(core::mem::size_of::<T>())
+        .and_then(|bytes| used.checked_add(bytes)).ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    if *used > budget { return Err(AuthoritySnapshotError::OutOfBounds); }
+    Ok(())
+}
+
+fn decode_snapshot(
+    input: &[u8],
+    retain_records: bool,
+    metadata_budget: usize,
 ) -> Result<PersistentAuthoritySnapshot, AuthoritySnapshotError> {
     if input.len() < PERSISTENT_AUTHORITY_HEADER_LEN
         || input.len() > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN
@@ -976,10 +1051,15 @@ pub fn decode_persistent_authority_snapshot(
     {
         return Err(AuthoritySnapshotError::InvalidLength);
     }
+    // Reject the complete declared metadata footprint before any table allocation.
+    let requested = object_count.checked_mul(core::mem::size_of::<PersistentObjectBinding>())
+        .and_then(|bytes| principal_count.checked_mul(core::mem::size_of::<PersistentPrincipalPolicy>()).and_then(|n| bytes.checked_add(n)))
+        .and_then(|bytes| external_root_count.checked_mul(core::mem::size_of::<PersistentRootEntry>()).and_then(|n| bytes.checked_add(n)))
+        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    if requested > metadata_budget { return Err(AuthoritySnapshotError::OutOfBounds); }
+    let mut metadata_used = 0;
     let mut objects = Vec::new();
-    objects
-        .try_reserve_exact(object_count)
-        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    reserve_metadata(&mut objects, object_count, &mut metadata_used, metadata_budget)?;
     for index in 0..object_count {
         let offset = object_offset + index * PERSISTENT_AUTHORITY_OBJECT_BINDING_LEN;
         if get_u32(input, offset + 0x2c) != 0 {
@@ -993,9 +1073,7 @@ pub fn decode_persistent_authority_snapshot(
         });
     }
     let mut principals = Vec::new();
-    principals
-        .try_reserve_exact(principal_count)
-        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    reserve_metadata(&mut principals, principal_count, &mut metadata_used, metadata_budget)?;
     for index in 0..principal_count {
         let offset = principal_offset + index * PERSISTENT_AUTHORITY_PRINCIPAL_LEN;
         if input[offset + 0x30] > 1 || !is_zero(&input[offset + 0x31..offset + 0x40]) {
@@ -1017,9 +1095,7 @@ pub fn decode_persistent_authority_snapshot(
         });
     }
     let mut external_roots = Vec::new();
-    external_roots
-        .try_reserve_exact(external_root_count)
-        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    reserve_metadata(&mut external_roots, external_root_count, &mut metadata_used, metadata_budget)?;
     for index in 0..external_root_count {
         let offset = external_root_offset + index * PERSISTENT_ROOT_ENTRY_LEN;
         if get_u32(input, offset + 0x1c) != 0 {
@@ -1031,16 +1107,18 @@ pub fn decode_persistent_authority_snapshot(
             object_kind: get_u32(input, offset + 0x18),
         });
     }
-    let record_stream = input[record_offset..].to_vec();
-    let snapshot = PersistentAuthoritySnapshot {
+    let mut snapshot = PersistentAuthoritySnapshot {
         checkpoint_generation: get_u64(input, 0x10),
         root_policy_sha256: input[0x18..0x38].try_into().expect("fixed policy digest"),
-        record_stream,
+        record_stream: Vec::new(),
         objects,
         principals,
         external_roots,
     };
-    validate(&snapshot, true)?;
+    validate_with_records(&snapshot, &input[record_offset..], true)?;
+    if retain_records {
+        snapshot.record_stream = input[record_offset..].to_vec();
+    }
     Ok(snapshot)
 }
 
@@ -1048,16 +1126,24 @@ fn validate(
     value: &PersistentAuthoritySnapshot,
     check_record_chain: bool,
 ) -> Result<(), AuthoritySnapshotError> {
+    validate_with_records(value, &value.record_stream, check_record_chain)
+}
+
+fn validate_with_records(
+    value: &PersistentAuthoritySnapshot,
+    records: &[u8],
+    check_record_chain: bool,
+) -> Result<(), AuthoritySnapshotError> {
     if value.checkpoint_generation == 0
         || value.root_policy_sha256 == [0; 32]
-        || value.record_stream.is_empty()
-        || !value.record_stream.len().is_multiple_of(RECORD_SIZE)
+        || records.is_empty()
+        || !records.len().is_multiple_of(RECORD_SIZE)
         || value.principals.len() > MAX_STABLE_PRINCIPALS
     {
         return Err(AuthoritySnapshotError::InvalidField);
     }
     if check_record_chain {
-        validate_record_chain(&value.record_stream)?;
+        validate_record_chain(records)?;
     }
     let mut previous_stable = None;
     let mut v2_object_ids = Vec::new();
@@ -1095,17 +1181,26 @@ fn validate(
         }
         previous_external = Some(root.object_id);
     }
-    persistent_authority_encoded_len(value)?;
+    let encoded_len = persistent_authority_encoded_len(value)?
+        .checked_sub(value.record_stream.len())
+        .and_then(|n| n.checked_add(records.len()))
+        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    if encoded_len > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN {
+        return Err(AuthoritySnapshotError::OutOfBounds);
+    }
     Ok(())
 }
 
 fn validate_record_chain(record_stream: &[u8]) -> Result<(), AuthoritySnapshotError> {
-    let record_count = record_stream.len() / RECORD_SIZE;
+    let (sectors, remainder) = record_stream.as_chunks::<RECORD_SIZE>();
+    if !remainder.is_empty() {
+        return Err(AuthoritySnapshotError::InvalidRecord);
+    }
+    let record_count = sectors.len();
     let mut store_id = None;
     // Preserve the strict sealed-record pass before semantic replay. The
     // preflight API also accepts empty/torn sectors, while snapshots do not.
-    for bytes in record_stream.chunks_exact(RECORD_SIZE) {
-        let sector: &[u8; RECORD_SIZE] = bytes.try_into().expect("exact record chunk");
+    for sector in sectors {
         let decoded = match LogRecord::decode(sector) {
             Ok(DecodeStatus::Valid(decoded)) => decoded,
             _ => return Err(AuthoritySnapshotError::InvalidRecord),
@@ -1113,24 +1208,16 @@ fn validate_record_chain(record_stream: &[u8]) -> Result<(), AuthoritySnapshotEr
         store_id.get_or_insert(decoded.record.store_id);
     }
     let store_id = store_id.ok_or(AuthoritySnapshotError::InvalidRecord)?;
-    let mut replay = vibeos_durable_format::PreflightReplay::new(store_id);
-    // Bound the copied sectors and PreflightReplay's per-append probes rather
-    // than duplicating the entire authority stream. Graph state remains live
-    // across batches; transactions and grants may cross a batch boundary.
+    let mut replay = vibeos_durable_format::PreflightValidator::new(store_id);
+    // Borrow the original sectors while bounding PreflightReplay's per-append
+    // probes. Graph state persists across batches, including transactions and
+    // grants which cross a boundary. No duplicate sector buffer is needed.
     const BATCH_RECORDS: usize = 32;
-    let mut sectors = Vec::new();
-    sectors.try_reserve_exact(record_count.min(BATCH_RECORDS))
-        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
-    for chunk in record_stream.chunks(BATCH_RECORDS * RECORD_SIZE) {
-        sectors.clear();
-        sectors.extend(chunk.chunks_exact(RECORD_SIZE).map(|bytes| {
-            <[u8; RECORD_SIZE]>::try_from(bytes).expect("exact record chunk")
-        }));
-        replay.append(&sectors).map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?;
+    for batch in sectors.chunks(BATCH_RECORDS) {
+        replay.append(batch).map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?;
     }
-    drop(sectors);
-    let preflight = replay.finish().map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?;
-    if preflight.last_sequence() as usize != record_count {
+    let last_sequence = replay.finish().map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?;
+    if last_sequence as usize != record_count {
         return Err(AuthoritySnapshotError::InvalidRecord);
     }
     Ok(())
@@ -1324,6 +1411,15 @@ mod tests {
             let bytes: Vec<u8> = records[..len].iter().flatten().copied().collect();
             let expected = preflight_recovery(&records[..len], store).is_ok();
             assert_eq!(validate_record_chain(&bytes).is_ok(), expected, "prefix {len}");
+        }
+        // A partial final record must be rejected rather than dropped by a
+        // chunking API. Also exercise a borrowed slice starting one byte in.
+        let complete: Vec<u8> = records.iter().flatten().copied().collect();
+        let mut offset = vec![0xff];
+        offset.extend_from_slice(&complete);
+        assert!(validate_record_chain(&offset[1..]).is_ok());
+        for tail in 1..RECORD_SIZE {
+            assert!(validate_record_chain(&complete[..complete.len() - tail]).is_err());
         }
         for boundary in [32,64] {
             let mut bad = records.clone(); bad.swap(boundary-1, boundary);

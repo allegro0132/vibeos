@@ -3,7 +3,9 @@
 //! These bytes are not yet an admitted on-media format or an authority handle.
 
 use crate::authority_snapshot::{
-    decode_persistent_authority_snapshot, encode_persistent_authority_snapshot,
+    decode_persistent_authority_snapshot, encode_persistent_authority_metadata,
+    encode_persistent_authority_snapshot, persistent_authority_encoded_len,
+    validate_authority_bytes, validate_canonical_authority_bytes,
     PersistentAuthoritySnapshot, MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN,
 };
 use alloc::vec::Vec;
@@ -21,6 +23,12 @@ enum DeltaError {
 fn digest(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
+fn snapshot_digest(metadata: &[u8], records: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(metadata);
+    hasher.update(records);
+    hasher.finalize().into()
+}
 fn number(bytes: &[u8], at: usize) -> Result<usize, DeltaError> {
     usize::try_from(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()))
         .map_err(|_| DeltaError::Invalid)
@@ -35,41 +43,68 @@ fn encode(
     base: &PersistentAuthoritySnapshot,
     next: &PersistentAuthoritySnapshot,
 ) -> Result<Option<Vec<u8>>, DeltaError> {
+    encode_with_prefix(base, next, 0)
+}
+
+// Reserve physical-envelope space in the same allocation as the delta. Large
+// links must not retain a second full payload merely to prepend their header.
+fn encode_with_prefix(
+    base: &PersistentAuthoritySnapshot,
+    next: &PersistentAuthoritySnapshot,
+    prefix: usize,
+) -> Result<Option<Vec<u8>>, DeltaError> {
     if next.checkpoint_generation() <= base.checkpoint_generation()
         || next.record_stream().len() <= base.record_stream().len()
         || !next.record_stream().starts_with(base.record_stream())
     {
         return Ok(None);
     }
-    let before = encode_persistent_authority_snapshot(base).map_err(|_| DeltaError::Invalid)?;
-    let after = encode_persistent_authority_snapshot(next).map_err(|_| DeltaError::Invalid)?;
-    let base_offset = before.len() - base.record_stream().len();
-    let next_offset = after.len() - next.record_stream().len();
+    let before = encode_persistent_authority_metadata(base).map_err(|_| DeltaError::Invalid)?;
+    let after = encode_persistent_authority_metadata(next).map_err(|_| DeltaError::Invalid)?;
+    let base_offset = before.len();
+    let next_offset = after.len();
+    let base_len = persistent_authority_encoded_len(base).map_err(|_| DeltaError::Invalid)?;
+    let next_len = persistent_authority_encoded_len(next).map_err(|_| DeltaError::Invalid)?;
     let common = base.record_stream().len();
-    let len = HEADER
-        .checked_add(after.len() - common)
+    let len = prefix.checked_add(HEADER)
+        .and_then(|n| n.checked_add(next_len - common))
         .ok_or(DeltaError::Invalid)?;
-    if len >= after.len() {
+    if len >= next_len {
         return Ok(None);
     }
     let mut output = Vec::new();
     output
         .try_reserve_exact(len)
         .map_err(|_| DeltaError::Memory)?;
-    output.resize(HEADER, 0);
-    output[..8].copy_from_slice(MAGIC);
-    output[8..10].copy_from_slice(&1_u16.to_le_bytes());
-    output[10..12].copy_from_slice(&(HEADER as u16).to_le_bytes());
-    put(&mut output, 16, before.len());
-    put(&mut output, 24, base_offset);
-    put(&mut output, 32, after.len());
-    put(&mut output, 40, next_offset);
-    put(&mut output, 48, common);
-    output[56..88].copy_from_slice(&digest(&before));
-    output[88..120].copy_from_slice(&digest(&after));
-    output.extend_from_slice(&after[..next_offset]);
-    output.extend_from_slice(&after[next_offset + common..]);
+    output.resize(prefix + HEADER, 0);
+    let header = &mut output[prefix..];
+    header[..8].copy_from_slice(MAGIC);
+    header[8..10].copy_from_slice(&1_u16.to_le_bytes());
+    header[10..12].copy_from_slice(&(HEADER as u16).to_le_bytes());
+    put(header, 16, base_len);
+    put(header, 24, base_offset);
+    put(header, 32, next_len);
+    put(header, 40, next_offset);
+    put(header, 48, common);
+    header[56..88].copy_from_slice(&snapshot_digest(&before, base.record_stream()));
+    header[88..120].copy_from_slice(&snapshot_digest(&after, next.record_stream()));
+    output.extend_from_slice(&after);
+    output.extend_from_slice(&next.record_stream()[common..]);
     Ok(Some(output))
+}
+
+// Compare the canonical encoding without serializing its record stream again.
+// The decoded snapshot has already passed full record/graph validation. Keep
+// byte equality (not just digest equality), including all reserved metadata.
+fn canonical_snapshot_matches(
+    snapshot: &PersistentAuthoritySnapshot,
+    bytes: &[u8],
+) -> Result<bool, DeltaError> {
+    let metadata = encode_persistent_authority_metadata(snapshot)
+        .map_err(|_| DeltaError::Invalid)?;
+    Ok(metadata.len().checked_add(snapshot.record_stream().len()) == Some(bytes.len())
+        && bytes.starts_with(&metadata)
+        && bytes[metadata.len()..] == *snapshot.record_stream())
 }
 
 /// Reconstruct inert canonical snapshot bytes. Even a matching result digest
@@ -115,18 +150,11 @@ fn reconstruct_checked(base: &[u8], delta: &[u8]) -> Result<(Vec<u8>, u64, u64),
     {
         return Err(DeltaError::Invalid);
     }
-    let predecessor =
-        decode_persistent_authority_snapshot(base).map_err(|_| DeltaError::Invalid)?;
-    if predecessor.record_stream().len() != common
-        || encode_persistent_authority_snapshot(&predecessor).map_err(|_| DeltaError::Invalid)?
-            != base
-    {
+    let (predecessor_generation, verified_base_offset) =
+        validate_canonical_authority_bytes(base).map_err(|_| DeltaError::Invalid)?;
+    if verified_base_offset != base_offset {
         return Err(DeltaError::Invalid);
     }
-    let predecessor_generation = predecessor.checkpoint_generation();
-    // The record bytes remain in `base`; release the decoded tables/stream
-    // before allocating the successor and running its full preflight.
-    drop(predecessor);
     // Bounds and maximum output length are proved before reserving output.
     let prefix_end = HEADER.checked_add(next_offset).ok_or(DeltaError::Invalid)?;
     if prefix_end > delta.len() {
@@ -142,21 +170,12 @@ fn reconstruct_checked(base: &[u8], delta: &[u8]) -> Result<(Vec<u8>, u64, u64),
     if output.len() != next_len || digest(&output).as_slice() != &delta[88..120] {
         return Err(DeltaError::Invalid);
     }
-    let successor =
-        decode_persistent_authority_snapshot(&output).map_err(|_| DeltaError::Invalid)?;
-    if successor.checkpoint_generation() <= predecessor_generation
-        || output.len() - successor.record_stream().len() != next_offset
-        || !successor.record_stream().starts_with(&base[base_offset..])
-        || encode_persistent_authority_snapshot(&successor).map_err(|_| DeltaError::Invalid)?
-            != output
-    {
+    let (successor_generation, verified_next_offset) =
+        validate_canonical_authority_bytes(&output).map_err(|_| DeltaError::Invalid)?;
+    if successor_generation <= predecessor_generation || verified_next_offset != next_offset {
         return Err(DeltaError::Invalid);
     }
-    Ok((
-        output,
-        predecessor_generation,
-        successor.checkpoint_generation(),
-    ))
+    Ok((output, predecessor_generation, successor_generation))
 }
 
 // Experimental envelope: canonical pointer plus predecessor/result checkpoint
@@ -239,21 +258,12 @@ fn encode_link(
     else {
         return Ok(None);
     };
-    let Some(delta) = encode(base, next)? else {
+    let Some(mut bytes) = encode_with_prefix(base, next, LINK_HEADER)? else {
         return Ok(None);
     };
-    let len = LINK_HEADER
-        .checked_add(delta.len())
-        .ok_or(DeltaError::Invalid)?;
-    let full = encode_persistent_authority_snapshot(next).map_err(|_| DeltaError::Invalid)?;
-    if len >= full.len() || len > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN {
+    if bytes.len() > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN {
         return Ok(None);
     }
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(len)
-        .map_err(|_| DeltaError::Memory)?;
-    bytes.resize(LINK_HEADER, 0);
     bytes[..8].copy_from_slice(LINK_MAGIC);
     bytes[8..12].copy_from_slice(&depth.to_le_bytes());
     let mut pointer = [0; vibeos_segment_format::POINTER_SIZE];
@@ -261,7 +271,6 @@ fn encode_link(
     bytes[16..112].copy_from_slice(&pointer);
     bytes[112..120].copy_from_slice(&base.checkpoint_generation().to_le_bytes());
     bytes[120..128].copy_from_slice(&next.checkpoint_generation().to_le_bytes());
-    bytes.extend_from_slice(&delta);
     decode_link(&bytes, context)?;
     Ok(Some(bytes))
 }
@@ -290,10 +299,14 @@ fn apply_link(
 }
 
 /// Payload budget is cumulative across fetched ancestors, not just one extent.
-/// This does not yet account for decoder/preflight heap or segment scan I/O.
+/// `buffer_bytes` bounds owned fetched payloads plus the overlapping rebuilt
+/// snapshot buffer, ancestor/pending tables, and conservative table reallocation
+/// overlap. Decoder/preflight and source scan workspace are separate costs;
+/// this is not a total replay heap budget.
 struct ReplayLimits {
     payload_bytes: usize,
     snapshot_bytes: usize,
+    buffer_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -318,10 +331,32 @@ trait AuthoritySource {
     ) -> Result<(Vec<u8>, u64), Self::Error>;
 }
 
+// Recovery borrows the canonical bitmap; small codec fixtures can supply an
+// explicit slice without constructing a production allocation map.
+enum AllocatedSegments<'a> {
+    Bitmap(&'a crate::allocation_v2::AllocationV2),
+    Fixture(&'a [u64]),
+}
+impl AllocatedSegments<'_> {
+    fn contains(&self, segment: u64) -> bool {
+        match self {
+            Self::Bitmap(map) => map.segment_state(segment) == Some(crate::SegmentAllocation::Allocated),
+            Self::Fixture(segments) => segments.contains(&segment),
+        }
+    }
+
+    fn iter(&self, admitted: u64) -> impl Iterator<Item = u64> + '_ {
+        (0..admitted).filter(|&segment| self.contains(segment))
+    }
+}
+
 struct DeviceAuthoritySource<'a, D> {
     device: &'a D,
     context: LinkContext,
-    allocated: &'a [u64],
+    allocated: AllocatedSegments<'a>,
+    memo: Option<&'a crate::store::VerifiedSegmentScans>,
+    // Owned by this recovery only; supplied by the preceding authenticated read.
+    verified_tip: Option<(vibeos_segment_format::PhysicalPointer, Vec<u8>, u64)>,
 }
 impl<D: crate::PageDevice> AuthoritySource for DeviceAuthoritySource<'_, D> {
     type Error = crate::StoreError<D::Error>;
@@ -333,18 +368,28 @@ impl<D: crate::PageDevice> AuthoritySource for DeviceAuthoritySource<'_, D> {
         let vibeos_segment_format::PhysicalPointer::Value(value) = pointer else {
             return Err(crate::StoreError::Corrupt);
         };
-        if !self.allocated.contains(&value.segment_no) {
+        if !self.allocated.contains(value.segment_no) {
             return Err(crate::StoreError::Corrupt);
         }
-        let (bytes, record) = crate::store::read_pointer_authority_payload(
+        if let Some((verified_pointer, bytes, generation)) = self.verified_tip.take() {
+            if pointer != verified_pointer {
+                return Err(crate::StoreError::Corrupt);
+            }
+            if bytes.capacity() > maximum {
+                return Err(crate::StoreError::MemoryLimit);
+            }
+            return Ok((bytes, generation));
+        }
+        let (bytes, record) = crate::store::read_pointer_authority_payload_with_memo(
             self.device,
             self.context.store_uuid,
             self.context.admitted_segments,
             self.context.next_segment_generation,
             self.context.checkpoint_generation,
             pointer,
-            self.allocated,
+            self.allocated.iter(self.context.admitted_segments),
             maximum,
+            self.memo,
         )
         .await?;
         Ok((bytes, record.binding.target_checkpoint_generation))
@@ -358,6 +403,68 @@ struct ReplayedAuthority {
     // them or materialize a full snapshot before reclaiming any ancestor.
     ancestors: Vec<vibeos_segment_format::PhysicalPointer>,
     payload_bytes: usize,
+    peak_buffer_bytes: usize,
+}
+
+/// Select an experimental delta only from the actual reconstructed media bytes.
+/// A supported legacy full snapshot is readable but cannot be the canonical V2
+/// digest base. None tells the publisher to materialize a full snapshot first.
+/// The caller must retain all replay ancestors until that checkpoint is durable.
+fn encode_replayed_link(
+    base: &ReplayedAuthority,
+    next: &PersistentAuthoritySnapshot,
+    context: LinkContext,
+) -> Result<Option<Vec<u8>>, DeltaError> {
+    let snapshot = decode_persistent_authority_snapshot(&base.bytes)
+        .map_err(|_| DeltaError::Invalid)?;
+    if next.checkpoint_generation() <= snapshot.checkpoint_generation()
+        || next.checkpoint_generation() > context.checkpoint_generation
+        || base.depth > MAX_REPLAY_DEPTH
+        || base.ancestors.len() != base.depth as usize + 1
+    {
+        return Err(DeltaError::Invalid);
+    }
+    if !canonical_snapshot_matches(&snapshot, &base.bytes)? {
+        // Only legacy full bases may legitimately differ from canonical V2.
+        if base.depth != 0 || base.bytes[8..10] != 1_u16.to_le_bytes() {
+            return Err(DeltaError::Invalid);
+        }
+        return Ok(None);
+    }
+    encode_link(&snapshot, next, base.ancestors[0], base.depth, context)
+}
+
+/// Reserve one table entry while accounting for a moving reallocation: the old
+/// allocation may remain live until the replacement has been allocated. Pending
+/// table capacity remains charged after pop because Vec retains that storage.
+fn reserve_replay_entry<T>(
+    table: &mut Vec<T>,
+    resident: &mut usize,
+    peak: &mut usize,
+    limit: usize,
+) -> Result<(), DeltaError> {
+    if table.len() < table.capacity() {
+        return Ok(());
+    }
+    let item = core::mem::size_of::<T>();
+    let old = table.capacity().checked_mul(item).ok_or(DeltaError::Memory)?;
+    let requested = table.len().checked_add(1)
+        .and_then(|n| n.checked_mul(item)).ok_or(DeltaError::Memory)?;
+    let overlap = resident.checked_add(requested).ok_or(DeltaError::Memory)?;
+    if overlap > limit {
+        return Err(DeltaError::Memory);
+    }
+    table.try_reserve_exact(1).map_err(|_| DeltaError::Memory)?;
+    // Vec may supply more capacity than requested. Check that capacity too;
+    // allocator-internal overhead is outside this owned-allocation budget.
+    let actual = table.capacity().checked_mul(item).ok_or(DeltaError::Memory)?;
+    let overlap = resident.checked_add(actual).ok_or(DeltaError::Memory)?;
+    if overlap > limit {
+        return Err(DeltaError::Memory);
+    }
+    *peak = (*peak).max(overlap);
+    *resident = overlap.checked_sub(old).ok_or(DeltaError::Memory)?;
+    Ok(())
 }
 
 async fn replay<L: AuthoritySource>(
@@ -371,6 +478,8 @@ async fn replay<L: AuthoritySource>(
     let mut ancestors = Vec::new();
     let mut pending: Vec<(PhysicalPointer, Vec<u8>)> = Vec::new();
     let mut consumed = 0_usize;
+    let mut resident_buffers = 0_usize;
+    let mut peak_buffers = 0_usize;
     let mut expected = None;
     let mut bytes;
     loop {
@@ -393,7 +502,8 @@ async fn replay<L: AuthoritySource>(
         let remaining = limits
             .payload_bytes
             .checked_sub(consumed)
-            .ok_or(DeltaError::Memory)?;
+            .ok_or(DeltaError::Memory)?
+            .min(limits.buffer_bytes.checked_sub(resident_buffers).ok_or(DeltaError::Memory)?);
         if value.exact_byte_len > remaining as u64 {
             return Err(DeltaError::Memory.into());
         }
@@ -401,15 +511,16 @@ async fn replay<L: AuthoritySource>(
             .read(pointer, remaining)
             .await
             .map_err(ReplayError::Source)?;
-        if loaded.len() > remaining {
+        if loaded.capacity() > remaining {
             return Err(DeltaError::Memory.into());
         }
+        resident_buffers = resident_buffers.checked_add(loaded.capacity()).ok_or(DeltaError::Memory)?;
+        peak_buffers = peak_buffers.max(resident_buffers);
         consumed = consumed
             .checked_add(loaded.len())
             .ok_or(DeltaError::Memory)?;
-        ancestors
-            .try_reserve_exact(1)
-            .map_err(|_| DeltaError::Memory)?;
+        reserve_replay_entry(&mut ancestors, &mut resident_buffers,
+            &mut peak_buffers, limits.buffer_bytes)?;
         ancestors.push(pointer);
         if generation == 0 || generation > context.checkpoint_generation {
             return Err(DeltaError::Invalid.into());
@@ -430,9 +541,8 @@ async fn replay<L: AuthoritySource>(
             }
             expected = Some((link.depth - 1, link.predecessor_generation));
             pointer = link.predecessor;
-            pending
-                .try_reserve_exact(1)
-                .map_err(|_| DeltaError::Memory)?;
+            reserve_replay_entry(&mut pending, &mut resident_buffers,
+                &mut peak_buffers, limits.buffer_bytes)?;
             pending.push((pointer, loaded));
         } else {
             if expected.is_some_and(|pair| pair != (0, generation)) {
@@ -441,9 +551,15 @@ async fn replay<L: AuthoritySource>(
             if loaded.len() > limits.snapshot_bytes {
                 return Err(DeltaError::Memory.into());
             }
-            let snapshot =
-                decode_persistent_authority_snapshot(&loaded).map_err(|_| DeltaError::Invalid)?;
-            if snapshot.checkpoint_generation() != generation {
+            let metadata_budget = limits.buffer_bytes.checked_sub(resident_buffers).ok_or(DeltaError::Memory)?;
+            let (base_generation, _, metadata_bytes) =
+                crate::authority_snapshot::validate_authority_metadata_bounded(&loaded, metadata_budget)
+                    .map_err(|error| match error {
+                        crate::authority_snapshot::AuthoritySnapshotError::OutOfBounds => DeltaError::Memory,
+                        _ => DeltaError::Invalid,
+                    })?;
+            peak_buffers = peak_buffers.max(resident_buffers.checked_add(metadata_bytes).ok_or(DeltaError::Memory)?);
+            if base_generation != generation {
                 return Err(DeltaError::Invalid.into());
             }
             bytes = loaded;
@@ -452,7 +568,31 @@ async fn replay<L: AuthoritySource>(
     }
     let mut depth = 0;
     while let Some((predecessor, delta)) = pending.pop() {
-        bytes = apply_link(predecessor, &bytes, depth, &delta, context)?;
+        let link = decode_link(&delta, context)?;
+        let next_len = number(link.delta, 32)?;
+        let overlapping = resident_buffers.checked_add(next_len).ok_or(DeltaError::Memory)?;
+        if overlapping > limits.buffer_bytes {
+            return Err(DeltaError::Memory.into());
+        }
+        // Check before apply_link can reserve its successor buffer. Decoding
+        // scratch allocations inside apply_link have a separate budget gap.
+        peak_buffers = peak_buffers.max(overlapping);
+        let old_capacity = bytes.capacity();
+        let next = apply_link(predecessor, &bytes, depth, &delta, context)?;
+        // The allocator may supply more capacity than the requested length.
+        // Old bytes and the pending delta are still live at this point.
+        let actual_overlap = resident_buffers.checked_add(next.capacity()).ok_or(DeltaError::Memory)?;
+        if actual_overlap > limits.buffer_bytes {
+            return Err(DeltaError::Memory.into());
+        }
+        peak_buffers = peak_buffers.max(actual_overlap);
+        resident_buffers = resident_buffers.checked_sub(old_capacity)
+            .and_then(|n| n.checked_sub(delta.capacity()))
+            .and_then(|n| n.checked_add(next.capacity())).ok_or(DeltaError::Memory)?;
+        if resident_buffers > limits.buffer_bytes {
+            return Err(DeltaError::Memory.into());
+        }
+        bytes = next;
         depth += 1;
     }
     Ok(ReplayedAuthority {
@@ -460,7 +600,104 @@ async fn replay<L: AuthoritySource>(
         depth,
         ancestors,
         payload_bytes: consumed,
+        peak_buffer_bytes: peak_buffers,
     })
+}
+
+// Test-only bridge into checkpoint recovery. Production mount must continue
+// rejecting this experimental format until budgets and offline admission land.
+pub(crate) async fn replay_checkpoint_for_test<D: crate::PageDevice>(
+    device: &D,
+    superblock: &vibeos_segment_format::Superblock,
+    checkpoint: &vibeos_segment_format::Checkpoint,
+    allocation: &crate::allocation_v2::AllocationV2,
+    maximum: usize,
+    verified_bytes: Vec<u8>,
+    verified_generation: u64,
+    memo: Option<&crate::store::VerifiedSegmentScans>,
+) -> Result<Vec<u8>, crate::StoreError<D::Error>> {
+    let context = LinkContext {
+        store_uuid: superblock.binding.store_uuid,
+        admitted_segments: checkpoint.admitted_segments,
+        next_segment_generation: checkpoint.next_segment_generation,
+        checkpoint_generation: checkpoint.binding.generation,
+    };
+    let mut source = DeviceAuthoritySource { device, context, allocated: AllocatedSegments::Bitmap(allocation), verified_tip: Some((checkpoint.authority_root, verified_bytes, verified_generation)),  memo, };
+    replay(&mut source, checkpoint.authority_root, context,
+        ReplayLimits { payload_bytes: maximum, snapshot_bytes: maximum, buffer_bytes: maximum.saturating_mul(3) }).await
+        .map(|r| r.bytes).map_err(|e| match e {
+            ReplayError::Source(e) => e,
+            ReplayError::Codec(DeltaError::Memory) => crate::StoreError::MemoryLimit,
+            ReplayError::Codec(DeltaError::Invalid) => crate::StoreError::Corrupt,
+        })
+}
+
+// Test-only provenance witness. It stores no duplicate snapshot or ancestor
+// buffers, and can only be installed after a verified successful publication.
+#[derive(Clone)]
+pub(crate) struct VerifiedBaseForTest {
+    generation: u64,
+    root: vibeos_segment_format::PhysicalPointer,
+    admitted: u64,
+    next_segment: u64,
+    store_uuid: vibeos_segment_format::StoreUuid,
+    digest: [u8; 32],
+    depth: u32,
+}
+
+impl VerifiedBaseForTest {
+    pub(crate) fn from_published<E>(state: &crate::store::MountedState, depth: u32) -> Result<Self, crate::StoreError<E>> {
+        let snapshot = state.persistent_authority.as_ref().ok_or(crate::StoreError::Corrupt)?;
+        let metadata = encode_persistent_authority_metadata(snapshot).map_err(|_| crate::StoreError::Corrupt)?;
+        Ok(Self { generation: state.generation, root: state.authority_root,
+            admitted: state.admitted_segments, next_segment: state.next_segment_generation,
+            store_uuid: state.superblock.binding.store_uuid,
+            digest: snapshot_digest(&metadata, snapshot.record_stream()), depth })
+    }
+
+    pub(crate) fn matches(&self, state: &crate::store::MountedState) -> bool {
+        Self::from_published::<()>(state, self.depth).is_ok_and(|other|
+            self.generation == other.generation && self.root == other.root
+            && self.admitted == other.admitted && self.next_segment == other.next_segment
+            && self.store_uuid == other.store_uuid && self.digest == other.digest
+            && self.depth <= MAX_REPLAY_DEPTH)
+    }
+}
+
+pub(crate) async fn encode_next_for_test<D: crate::PageDevice>(
+    device: &D,
+    state: &crate::store::MountedState,
+    next: &PersistentAuthoritySnapshot,
+    maximum: usize,
+    cached: Option<&VerifiedBaseForTest>,
+) -> Result<(Vec<u8>, u32), crate::StoreError<D::Error>> {
+    let context = LinkContext {
+        store_uuid: state.superblock.binding.store_uuid,
+        admitted_segments: state.admitted_segments,
+        next_segment_generation: state.next_segment_generation,
+        checkpoint_generation: next.checkpoint_generation(),
+    };
+    if let Some(cached) = cached.filter(|cached| cached.matches(state)) {
+        let base = state.persistent_authority.as_ref().ok_or(crate::StoreError::Corrupt)?;
+        if next.checkpoint_generation() <= base.checkpoint_generation() {
+            return Err(crate::StoreError::Corrupt);
+        }
+        return match encode_link(base, next, state.authority_root, cached.depth, context)
+            .map_err(|_| crate::StoreError::Corrupt)? {
+            Some(bytes) => Ok((bytes, cached.depth + 1)),
+            None => encode_persistent_authority_snapshot(next)
+                .map(|bytes| (bytes, 0)).map_err(|_| crate::StoreError::Corrupt),
+        };
+    }
+    let mut source = DeviceAuthoritySource { device, context, allocated: AllocatedSegments::Bitmap(&state.allocation), verified_tip: None,  memo: None, };
+    let recovered = replay(&mut source, state.authority_root, context,
+        ReplayLimits { payload_bytes: maximum, snapshot_bytes: maximum, buffer_bytes: maximum.saturating_mul(3) }).await
+        .map_err(|_| crate::StoreError::Corrupt)?;
+    match encode_replayed_link(&recovered, next, context).map_err(|_| crate::StoreError::Corrupt)? {
+        Some(bytes) => Ok((bytes, recovered.depth + 1)),
+        None => encode_persistent_authority_snapshot(next)
+            .map(|bytes| (bytes, 0)).map_err(|_| crate::StoreError::Corrupt),
+    }
 }
 
 pub(crate) async fn replay_device_for_test<D: crate::PageDevice>(
@@ -474,14 +711,12 @@ pub(crate) async fn replay_device_for_test<D: crate::PageDevice>(
         next_segment_generation: state.next_segment_generation,
         checkpoint_generation: state.generation,
     };
-    let allocated: Vec<_> = (0..state.admitted_segments)
-        .filter(|&n| state.allocation.segment_state(n) == Some(crate::SegmentAllocation::Allocated))
-        .collect();
     let mut source = DeviceAuthoritySource {
         device,
         context,
-        allocated: &allocated,
-    };
+        allocated: AllocatedSegments::Bitmap(&state.allocation),
+        verified_tip: None,
+     memo: None, };
     replay(
         &mut source,
         state.authority_root,
@@ -489,6 +724,7 @@ pub(crate) async fn replay_device_for_test<D: crate::PageDevice>(
         ReplayLimits {
             payload_bytes: maximum,
             snapshot_bytes: maximum,
+            buffer_bytes: maximum.saturating_mul(3),
         },
     )
     .await
@@ -506,6 +742,58 @@ mod tests {
     use crate::authority_snapshot::{PersistentPrincipalPolicy, StablePrincipalId};
     use alloc::vec;
     use vibeos_durable_format::{RecordBody, RecordChain, StoreId};
+
+    #[test]
+    fn borrowed_allocation_filters_retired_free_and_unadmitted_segments() {
+        use crate::allocation_v2::{AllocationV2, RetiredSegment, SegmentAllocation};
+        let mut states = vec![SegmentAllocation::Free; 4096];
+        for index in (1..states.len()).step_by(7) {
+            states[index] = SegmentAllocation::Allocated;
+        }
+        states[2] = SegmentAllocation::Retired;
+        let map = AllocationV2::new(4, 5, 2, &states,
+            &[RetiredSegment { segment_no: 2, retire_generation: 3 }]).unwrap();
+        let borrowed = AllocatedSegments::Bitmap(&map);
+        assert!(!borrowed.contains(0));
+        assert!(borrowed.contains(1));
+        assert!(!borrowed.contains(2));
+        assert!(!borrowed.contains(4096));
+        assert!(!borrowed.contains(u64::MAX));
+        for admitted in [0, 1, 2, 100, 4096, 4100] {
+            let expected: Vec<_> = states.iter().enumerate()
+                .take(admitted as usize)
+                .filter(|(_, state)| **state == SegmentAllocation::Allocated)
+                .map(|(index, _)| index as u64).collect();
+            assert_eq!(borrowed.iter(admitted).collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[test]
+    fn replay_table_budget_covers_reallocation_and_retained_capacity() {
+        let mut table = Vec::<u64>::new();
+        let mut resident = 100;
+        let mut peak = resident;
+        assert_eq!(reserve_replay_entry(&mut table, &mut resident, &mut peak, 107),
+            Err(DeltaError::Memory));
+        assert_eq!((table.capacity(), resident, peak), (0, 100, 100));
+        reserve_replay_entry(&mut table, &mut resident, &mut peak, 108).unwrap();
+        table.push(9);
+        assert_eq!((resident, peak), (108, 108));
+        // Growing to two entries needs old + replacement, not just the net
+        // increase. Rejection must happen before changing the allocation.
+        assert_eq!(reserve_replay_entry(&mut table, &mut resident, &mut peak, 123),
+            Err(DeltaError::Memory));
+        assert_eq!((table.capacity(), resident, peak), (1, 108, 108));
+        assert_eq!(table, vec![9]);
+        reserve_replay_entry(&mut table, &mut resident, &mut peak, 124).unwrap();
+        table.push(10);
+        assert_eq!((resident, peak), (116, 124));
+        table.pop();
+        // Pop releases the entry's payload elsewhere, but not this table's
+        // backing allocation. Reusing its spare entry adds no allocation.
+        reserve_replay_entry(&mut table, &mut resident, &mut peak, 116).unwrap();
+        assert_eq!((table.capacity(), resident, peak), (2, 116, 124));
+    }
 
     #[derive(Clone)]
     struct Source {
@@ -553,6 +841,7 @@ mod tests {
     struct Media {
         pages: core::cell::RefCell<std::collections::BTreeMap<u64, vibeos_segment_format::Page>>,
         writes: core::cell::Cell<usize>,
+        reads: core::cell::Cell<usize>,
     }
     impl crate::PageDevice for Media {
         type Error = ();
@@ -570,6 +859,7 @@ mod tests {
             page: u64,
             output: &mut vibeos_segment_format::Page,
         ) -> Result<(), ()> {
+            self.reads.set(self.reads.get() + 1);
             *output = self.pages.borrow().get(&page).copied().unwrap_or([0; 4096]);
             Ok(())
         }
@@ -712,16 +1002,32 @@ mod tests {
         let mut source = DeviceAuthoritySource {
             device: &device,
             context,
-            allocated: &[0, 1, 2],
-        };
+            allocated: AllocatedSegments::Fixture(&[0, 1, 2]),
+            verified_tip: None,
+         memo: None, };
         let budget = before.len() + delta.len() + second.len();
         let limits = || ReplayLimits {
             payload_bytes: budget,
             snapshot_bytes: after.len(),
+            buffer_bytes: MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN.saturating_mul(3),
         };
         let writes = device.writes.get();
+        let reads_before = device.reads.get();
         let result = run(replay(&mut source, tip, context, limits())).unwrap();
+        let unseeded_reads = device.reads.get() - reads_before;
         assert_eq!(result.bytes, after);
+        // Mount has already authenticated this exact tip. Transfer its owned
+        // payload once, and compare device reads with an unseeded replay.
+        let (verified_bytes, verified_generation) = run(source.read(tip, budget)).unwrap();
+        source.verified_tip = Some((tip, verified_bytes, verified_generation));
+        let reads_before = device.reads.get();
+        let seeded = run(replay(&mut source, tip, context, limits())).unwrap();
+        let seeded_reads = device.reads.get() - reads_before;
+        assert_eq!(seeded.bytes, after);
+        assert_eq!(seeded.payload_bytes, result.payload_bytes);
+        assert!(source.verified_tip.is_none(), "verified payload must be consumed once");
+        assert!(seeded_reads < unseeded_reads);
+        std::println!("verified tip transfer: replay reads {unseeded_reads} -> {seeded_reads} pages (initial read excluded from both)");
         assert_eq!(result.depth, 2);
         assert_eq!(result.ancestors, vec![tip, middle, predecessor]);
         assert_eq!(result.payload_bytes, budget);
@@ -752,8 +1058,9 @@ mod tests {
         let mut unallocated = DeviceAuthoritySource {
             device: &device,
             context,
-            allocated: &[1, 2],
-        };
+            allocated: AllocatedSegments::Fixture(&[1, 2]),
+            verified_tip: None,
+         memo: None, };
         assert!(run(replay(&mut unallocated, tip, context, limits())).is_err());
         // GC's existing writer uses relocated() and emits a full snapshot.
         // Prove the resulting root is independent of the old delta ancestors.
@@ -761,11 +1068,28 @@ mod tests {
         let full = encode_persistent_authority_snapshot(&relocated).unwrap();
         context.checkpoint_generation = 6;
         let full_root = run(write_authority_fixture(&device, context, 3, 6, &full));
+        // A complete root-segment payload must never enumerate other segments.
+        // Panic on iteration catches an accidental eager allocation-map walk.
+        let (direct, _) = run(crate::store::read_pointer_authority_payload(
+            &device,
+            context.store_uuid,
+            context.admitted_segments,
+            context.next_segment_generation,
+            context.checkpoint_generation,
+            full_root,
+            core::iter::from_fn(|| -> Option<u64> {
+                panic!("single-segment authority enumerated allocation map")
+            }),
+            full.len(),
+        )).unwrap();
+        assert_eq!(direct, full);
+
         let mut old_source = DeviceAuthoritySource {
             device: &device,
             context,
-            allocated: &[0, 1, 2, 3],
-        };
+            allocated: AllocatedSegments::Fixture(&[0, 1, 2, 3]),
+            verified_tip: None,
+         memo: None, };
         assert_eq!(
             run(replay(&mut old_source, tip, context, limits()))
                 .unwrap()
@@ -775,8 +1099,9 @@ mod tests {
         let mut new_source = DeviceAuthoritySource {
             device: &device,
             context,
-            allocated: &[3],
-        };
+            allocated: AllocatedSegments::Fixture(&[3]),
+            verified_tip: None,
+         memo: None, };
         let result = run(replay(
             &mut new_source,
             full_root,
@@ -784,6 +1109,7 @@ mod tests {
             ReplayLimits {
                 payload_bytes: full.len(),
                 snapshot_bytes: full.len(),
+                buffer_bytes: MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN.saturating_mul(3),
             },
         ))
         .unwrap();
@@ -805,6 +1131,7 @@ mod tests {
                 ReplayLimits {
                     payload_bytes: full.len(),
                     snapshot_bytes: full.len(),
+                    buffer_bytes: MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN.saturating_mul(3),
                 }
             ))
             .unwrap()
@@ -833,8 +1160,9 @@ mod tests {
         let mut resumed_source = DeviceAuthoritySource {
             device: &device,
             context,
-            allocated: &[3, 4],
-        };
+            allocated: AllocatedSegments::Fixture(&[3, 4]),
+            verified_tip: None,
+         memo: None, };
         let result = run(replay(
             &mut resumed_source,
             resumed_root,
@@ -842,6 +1170,7 @@ mod tests {
             ReplayLimits {
                 payload_bytes: full.len() + link.len(),
                 snapshot_bytes: expected.len(),
+                buffer_bytes: MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN.saturating_mul(3),
             },
         ))
         .unwrap();
@@ -906,6 +1235,81 @@ mod tests {
                 checkpoint_generation: 4,
             },
         )
+    }
+
+    #[test]
+    fn replayed_legacy_base_requires_full_materialization_before_delta() {
+        use vibeos_segment_format::PhysicalPointer;
+        let (base, next) = pair();
+        let (pointer, context) = link_fixture();
+        let canonical = encode_persistent_authority_snapshot(&base).unwrap();
+        let mut legacy = canonical.clone();
+        legacy[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        legacy[0x70..0x80].fill(0);
+        for (bytes, expect_delta) in [(legacy, false), (canonical.clone(), true)] {
+            let check_borrowed = |input: &[u8]| {
+                let owned = decode_persistent_authority_snapshot(input)
+                    .map(|snapshot| snapshot.checkpoint_generation());
+                assert_eq!(validate_authority_bytes(input).map(|(generation, _)| generation),
+                    owned);
+            };
+            check_borrowed(&bytes);
+            for end in 0..bytes.len() {
+                check_borrowed(&bytes[..end]);
+            }
+            let mut mutated = bytes.clone();
+            for at in 0..mutated.len() {
+                mutated[at] ^= 1;
+                check_borrowed(&mutated);
+                mutated[at] ^= 1;
+            }
+            let PhysicalPointer::Value(mut value) = pointer else { unreachable!() };
+            value.exact_byte_len = bytes.len() as u64;
+            value.payload_sha256 = digest(&bytes);
+            let actual = PhysicalPointer::Value(value);
+            let mut source = Source { entries: vec![(actual, bytes.clone(), 3)], calls: 0 };
+            let recovered = run(replay(&mut source, actual, context, ReplayLimits {
+                payload_bytes: bytes.len(), snapshot_bytes: bytes.len(),
+                buffer_bytes: MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN.saturating_mul(3),
+            })).unwrap();
+            let selected = encode_replayed_link(&recovered, &next, context).unwrap();
+            assert_eq!(selected.is_some(), expect_delta);
+            if let Some(delta) = selected {
+                assert_eq!(apply_link(actual, &bytes, 0, &delta, context).unwrap(),
+                    encode_persistent_authority_snapshot(&next).unwrap());
+            } else {
+                // Reading V1 is supported, but a canonically encoded delta
+                // against that decoded snapshot cannot replay over V1 bytes.
+                let unsafe_delta = encode_link(&base, &next, actual, 0, context).unwrap().unwrap();
+                assert!(apply_link(actual, &bytes, 0, &unsafe_delta, context).is_err());
+            }
+            assert!(encode_replayed_link(&recovered, &base, context).is_err());
+            let mut stale_context = context;
+            stale_context.checkpoint_generation = base.checkpoint_generation();
+            assert!(encode_replayed_link(&recovered, &next, stale_context).is_err());
+
+            let mut damaged = recovered;
+            damaged.bytes[0] ^= 1;
+            assert!(encode_replayed_link(&damaged, &next, context).is_err());
+        }
+    }
+
+    #[test]
+    fn reserved_link_prefix_preserves_exact_delta_bytes_and_size_fallback() {
+        let (base, next) = pair();
+        let raw = encode(&base, &next).unwrap().unwrap();
+        let full = persistent_authority_encoded_len(&next).unwrap();
+        for prefix in [0, 1, LINK_HEADER] {
+            let framed = encode_with_prefix(&base, &next, prefix).unwrap().unwrap();
+            assert_eq!(framed.len(), prefix + raw.len());
+            assert!(framed[..prefix].iter().all(|byte| *byte == 0));
+            assert_eq!(&framed[prefix..], raw.as_slice());
+        }
+        assert!(encode_with_prefix(&base, &next, full - raw.len()).unwrap().is_none());
+        assert!(matches!(encode_with_prefix(&base, &next, usize::MAX), Err(DeltaError::Invalid)));
+        let (pointer, context) = link_fixture();
+        let link = encode_link(&base, &next, pointer, 0, context).unwrap().unwrap();
+        assert_eq!(decode_link(&link, context).unwrap().delta, raw.as_slice());
     }
 
     #[test]
@@ -1047,6 +1451,7 @@ mod tests {
             ReplayLimits {
                 payload_bytes: budget,
                 snapshot_bytes: reconstructed.len(),
+                buffer_bytes: MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN.saturating_mul(3),
             },
         ))
         .unwrap();
@@ -1054,11 +1459,35 @@ mod tests {
         assert_eq!(replayed.depth, MAX_REPLAY_DEPTH);
         assert_eq!(replayed.ancestors.len(), MAX_REPLAY_DEPTH as usize + 1);
         assert_eq!(replayed.payload_bytes, budget);
+        let successor = PersistentAuthoritySnapshot::new(
+            base.checkpoint_generation() + 1, [1; 32], records.clone(), vec![], vec![],
+        ).unwrap();
+        assert!(encode_replayed_link(&replayed, &successor, context).unwrap().is_none());
+
         assert_eq!(source.calls, MAX_REPLAY_DEPTH as usize + 1);
         let limits = || ReplayLimits {
             payload_bytes: budget,
             snapshot_bytes: reconstructed.len(),
+            buffer_bytes: MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN.saturating_mul(3),
         };
+        let peak = replayed.peak_buffer_bytes;
+        assert!(peak > reconstructed.len());
+        let exact = run(replay(&mut source, tip, context, ReplayLimits {
+            buffer_bytes: peak, ..limits()
+        })).unwrap();
+        assert_eq!(exact.bytes, reconstructed);
+        assert_eq!(exact.peak_buffer_bytes, peak);
+        assert!(matches!(run(replay(&mut source, tip, context, ReplayLimits {
+            buffer_bytes: peak - 1, ..limits()
+        })), Err(ReplayError::Codec(DeltaError::Memory))));
+        let mut unread = source.clone();
+        unread.calls = 0;
+        let PhysicalPointer::Value(tip_value) = tip else { unreachable!() };
+        assert!(matches!(run(replay(&mut unread, tip, context, ReplayLimits {
+            buffer_bytes: tip_value.exact_byte_len as usize - 1, ..limits()
+        })), Err(ReplayError::Codec(DeltaError::Memory))));
+        assert_eq!(unread.calls, 0, "known payload cannot fit: reject before source allocation");
+        std::println!("32-link owned buffer/table peak: {peak} bytes; exact budget passes, one byte less rejects");
         assert!(run(replay(
             &mut source,
             tip,
@@ -1110,6 +1539,38 @@ mod tests {
         let delta = encode(&base, &next).unwrap().unwrap();
         let before = encode_persistent_authority_snapshot(&base).unwrap();
         let after = encode_persistent_authority_snapshot(&next).unwrap();
+        let check_borrowed = |bytes: &[u8]| {
+            let owned_canonical = decode_persistent_authority_snapshot(bytes)
+                .and_then(|value| encode_persistent_authority_snapshot(&value))
+                .is_ok_and(|encoded| encoded == bytes);
+            assert_eq!(validate_canonical_authority_bytes(bytes).is_ok(), owned_canonical);
+        };
+        for (snapshot, full) in [(&base, &before), (&next, &after)] {
+            let metadata = encode_persistent_authority_metadata(snapshot).unwrap();
+            assert_eq!(metadata, full[..full.len() - snapshot.record_stream().len()]);
+            assert_eq!(snapshot_digest(&metadata, snapshot.record_stream()), digest(full));
+            assert_eq!(persistent_authority_encoded_len(snapshot).unwrap(), full.len());
+            assert!(canonical_snapshot_matches(snapshot, full).unwrap());
+            check_borrowed(full);
+            // The split comparison must be exactly as strict as comparing the
+            // full canonical encoding, including reserved bytes and suffixes.
+            for len in 0..full.len() {
+                assert!(!canonical_snapshot_matches(snapshot, &full[..len]).unwrap());
+                check_borrowed(&full[..len]);
+            }
+            let mut damaged = full.clone();
+            for at in 0..damaged.len() {
+                damaged[at] ^= 1;
+                assert!(!canonical_snapshot_matches(snapshot, &damaged).unwrap());
+                check_borrowed(&damaged);
+                damaged[at] ^= 1;
+            }
+            damaged.push(0);
+            assert!(!canonical_snapshot_matches(snapshot, &damaged).unwrap());
+            check_borrowed(&damaged);
+
+        }
+
         if let Some(directory) = std::env::var_os("VIBE_AUTHORITY_DELTA_FIXTURES") {
             let directory = std::path::PathBuf::from(directory);
             std::fs::create_dir_all(&directory).unwrap();

@@ -74,7 +74,7 @@ def snapshot(data, expected_store_id):
     for index in range(roots):
         at = root_offset + index * 32
         identity = integer(data, at, 16)
-        require(identity > previous and 0 < integer(data, at + 16) <= generation and
+        require(identity > previous and identity not in backend_ids and 0 < integer(data, at + 16) <= generation and
                 integer(data, at + 24, 4) > 0 and integer(data, at + 28, 4) == 0, "external root")
         previous = identity
     # Independent logical-record oracle: strict seals/CRC/sequence/semantics.
@@ -181,7 +181,8 @@ def selftest(root):
     for offset, replacement in [
         (128, bytes(16)), (144, bytes(16)), (160, bytes(8)),
         (160, (5).to_bytes(8, "little")), (168, bytes(4)), (172, b"\x01"),
-        (external, bytes(16)), (external + 16, bytes(8)),
+        (external, bytes(16)), (external, integer(rich_result, 144, 16).to_bytes(16, "little")),
+        (external + 16, bytes(8)),
         (external + 16, (5).to_bytes(8, "little")),
         (external + 24, bytes(4)), (external + 28, b"\x01"),
     ]:

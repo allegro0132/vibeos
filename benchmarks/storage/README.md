@@ -5199,3 +5199,1406 @@ Evidence in `target/storage-authority-root-budget-20260912/`: before/final store
 source, host/gate/Duo logs and retained boot verification files. Whitespace check
 passes. Incremental authority publishing/mount remains disabled pending complete
 memory, GC, verifier and fault/performance qualification.
+
+### Preallocate and budget recovered authority roots (2026-09-12)
+
+Retain an exact-sized root construction path during production authority mount.
+Previously objects were collected into a Vec, then external roots appended,
+which could grow the vector. The new helper checked-adds both counts, reserves
+once, appends both sets, sorts and applies the same PersistentRootSet validation.
+The pre-decode budget now includes this root array, which remains live alongside
+the decoded authority snapshot. Snapshot table/record storage and the separate
+root array are both counted; this still does not account every semantic preflight
+or segment-scan temporary allocation.
+
+Regression coverage constructs a mixed object/external-root snapshot, checks
+ordering and exact requested root capacity, demonstrates the formerly admitted
+one-byte-short combined budget now rejects, and checks exact-budget acceptance.
+An initial test incorrectly expected the snapshot constructor to permit a root
+collision; its existing validator already rejects it. Correct the fixture and
+also test the root helper defensively with a crate-mutated conflicting binding.
+This inspection exposed the same missing cross-table collision check in the
+experimental Python oracle; add it and a rehashed-invalid-root case.
+
+Final selected host suite passes 255 tests / one ignored (219 library and 36
+integrations). The earlier failed test log is retained alongside host-final.log.
+Production three-boot file-tree gate and Duo release check pass; subsequent
+changes were test correction and Python-only validation, not runtime changes.
+Python independently reconstructs three links and rejects 1,941 malformed cases.
+No timed performance claim is made. The improvement is predictable root allocation
+and earlier accurate budget admission for that storage. No disk format changes.
+
+Evidence: `target/storage-authority-recovery-roots-20260912/` with before/final
+source, both host logs, gate/Duo/boot reports and Python result. Whitespace check
+passes. Incremental authority remains test-only; complete recovery memory and
+production checkpoint/GC/verifier qualification remain pending.
+
+### Current authority runtime QEMU qualification (2026-09-12)
+
+Compare the saved bounded-preflight baseline ELF with the current runtime after
+relocation validation reuse and recovery root-budget/preallocation changes.
+The experimental authority-delta module remains cfg(test) and is absent from
+both firmware builds. This is a cumulative comparison; it cannot identify which
+individual change or layout effect causes a latency difference.
+
+Four fresh-disk runs in before/after/after/before order each pass 256 retained
+4 KiB put/get operations. Same 64-page cache, 128 MiB, one-hart TCG, 4/2 MiB/s
+read/write limits and 400/200 IOPS. No builds run during timed measurements.
+
+| Metric | Baseline mean | Current mean | Change |
+| --- | ---: | ---: | ---: |
+| Total seconds | 11.3541415 | 11.5483665 | +1.71% |
+| Per-run median ms | 28.49575 | 28.96575 | +1.65% |
+| Per-run maximum seconds | 1.8935665 | 1.9026735 | +0.48% |
+| Operations at indices 206/234, seconds | 3.419845 | 3.438946 | +0.56% |
+
+Totals in run order are 11.340800 / 11.649559 / 11.447174 / 11.367483 seconds.
+The two indexed operations contain the GC episodes in this workload. Every
+per-sample I/O counter is identical: 8,097,792 bytes / 1,565 read requests,
+53,694,464 bytes / 1,862 write requests and 825 flushes per run. Current changes
+do not establish an end-to-end speedup and show a small slowdown in this sample.
+Do not compare the absolute times directly with older sessions, whose identical
+baseline ELF ran more slowly. Use this within-session ABBA comparison.
+
+The root-budget fixes have independent correctness justification and remain.
+Relocation validation reuse removes redundant replay, but has no demonstrated
+latency benefit here; isolate it from budget/preallocation changes before making
+an attribution or further performance decision. No runtime changes are made in
+this qualification turn. Normal page-cache configuration is restored and checked.
+The major write amplification from full authority snapshots remains unresolved.
+
+Evidence: exact commands/ELF hashes, saved current ELF, source snapshots/hashes,
+build log, four validated JSONL/transcripts and summary.json under
+`target/storage-authority-current-qemu-20260912/`. All 1,024 operations pass.
+No new physical SD measurement or power-cut qualification is claimed.
+
+### Isolated authority relocation validation comparison (2026-09-12)
+
+Build an old-checks variant by restoring only relocated()'s former new()+
+with_external_roots() implementation. It retains all current recovery root
+budget/preallocation fixes and bounded preflight. Compare it with the saved
+current 64-page ELF; source hashes confirm the restored current sources match
+that ELF's saved source snapshot. Normal cache/source are restored before runs.
+
+Four independent fresh-disk QEMU runs each pass 256 retained 4 KiB put/get
+operations, in old/current/current/old order. Same 128 MiB, one-hart TCG,
+64-page cache, 4/2 MiB/s read/write and 400/200 IOPS limits. No builds overlap.
+Seconds: 11.865101 / 11.506376 / 11.581362 / 11.523970.
+
+| Metric | Old checks mean | Current mean | Change |
+| --- | ---: | ---: | ---: |
+| Total seconds | 11.6945355 | 11.5438690 | -1.29% |
+| Per-run median ms | 29.2490 | 29.0255 | -0.76% |
+| Per-run maximum seconds | 1.9096600 | 1.9002885 | -0.49% |
+| GC-episode operations 206/234, seconds | 3.437789 | 3.432738 | -0.15% |
+
+Every per-sample I/O counter matches: per run reads 8,097,792 bytes / 1,565
+requests, writes 53,694,464 bytes / 1,862 requests and flushes 825 times.
+The small mean improvement and near-identical GC episodes do not prove a stable
+speedup; baseline repetitions themselves vary. They also do not support blaming
+relocation validation reuse for the earlier cumulative +1.71% result. Retain its
+verified removal of redundant replay, without a universal latency claim. Root
+budget correctness fixes remain. The dominant full-authority write amplification
+is unchanged and incremental publication remains unfinished.
+
+All 1,024 operations pass and all four JSONL validations pass. Source and cache
+restoration are byte-checked; no runtime changes this turn. Evidence includes
+current/old-checks source snapshots, build/variant ELF, exact commands/hashes,
+serial/JSONL and summary under `target/storage-relocate-isolated-20260912/`.
+Existing recovery qualification still applies; no new crash or hardware claim.
+
+
+### Experimental authority delta streaming digest (2026-09-12)
+
+The test-only delta encoder now encodes canonical metadata prefixes and hashes
+metadata plus borrowed record streams incrementally. It no longer serializes
+both full snapshots merely to obtain digests and payload slices. Physical-link
+size selection uses the allocation-free encoded-length helper instead of a
+third full snapshot encoding. Hashing still processes the complete histories;
+this removes temporary history copies, not the linear hashing work.
+
+The production full-snapshot encoder shares the same metadata implementation
+and continues to emit the complete frozen-format bytes. Metadata-only output
+retains full snapshot lengths in its header and is not independently decodable.
+The metadata-only entry point and delta codec remain test-only. Publication,
+mount admission, complete recovery memory accounting and delta GC qualification
+remain unfinished; no production I/O reduction or latency improvement is claimed.
+
+All eight exported fixtures are byte-identical to the prior encoder, including
+changed principal, policy, binding and external-root tables. Seven delta tests
+pass; the independent Python oracle reconstructs three links and rejects 1,941
+invalid cases. The selected host suite passes 255 tests with one ignored. QEMU
+file-tree three-boot recovery/GC/offline verification passes; Duo release check
+passes without hardware execution. Evidence is retained under
+`target/storage-authority-delta-stream-20260912/`, including fixture hashes,
+Python results and build/test logs.
+
+
+### Bound retained authority scan history (2026-09-12)
+
+Production multi-extent authority recovery previously appended every authority
+record from scanned allocated segments and filtered old checkpoint generations
+only after all scans. Filter each scanned batch before retaining it instead,
+using the once-reserved declared chain count. Reject excess same-generation
+records before pushing, and release the first scan result before scanning other
+segments. The accumulated descriptor vector no longer grows with unrelated
+historical authority generations. Per-segment scan buffers and the allocated
+segment list remain separate costs; this is not a complete recovery heap bound.
+
+The scan still visits subsequent allocated segments after finding the expected
+count, preserving rejection of extra same-generation records; final chain and
+payload authentication remain unchanged. No media-format, publication, read-I/O
+or latency improvement is claimed. The experimental delta codec remains outside
+production admission.
+
+A regression supplies 10,000 historical descriptors, verifies constant retained
+capacity and correct selection, and rejects an extra matching sibling without
+buffer growth. The final selected suite passes 256 tests with one ignored,
+including multi-extent cold recovery and 1 MiB append cut-boundary recovery.
+QEMU's three-boot file-tree/GC/cold-recovery/offline gate and Duo release check
+pass. Earlier new-fixture construction failures were fixed (valid StoreUuid,
+nonzero ordinal/object kind); authoritative results are host-pass.log and
+collection.log. Evidence: `target/storage-authority-scan-retention-20260912/`.
+
+
+### Lazy allocation enumeration during authority recovery (2026-09-12)
+
+Production recovery now passes a borrowed allocation-bitmap iterator into the
+multi-extent authority reader. Previously it counted all allocated segments,
+reserved a u64 vector, enumerated the bitmap again, and kept that vector alive
+alongside payload/decode buffers. The reader only needs other segment numbers
+when the root segment does not contain the complete chain. Lazy enumeration
+removes the temporary N * size_of::<u64>() requested allocation and the eager
+count/enumeration passes; single-segment authority recovery never advances the
+iterator. Cross-segment reads enumerate the same allocated segments in the same
+order and retain full segment/chain authentication. This closes the unaccounted
+segment-list residency by eliminating it, rather than increasing the budget.
+Other decoder/preflight/scan allocations still require independent accounting.
+
+The sealed-device recovery test passes a panic-on-next iterator to a complete
+root-segment payload and verifies exact recovered bytes, proving no eager walk.
+The selected host suite passes 256 tests with one ignored, including multi-extent
+cold recovery and append cut boundaries; the strengthened sealed-device test
+also passes separately. QEMU three-boot file-tree, GC pressure, cold recovery and
+powered-off verification pass; Duo release check passes without device execution.
+No end-to-end timing or SD I/O reduction is claimed. Incremental authority
+publication remains unfinished. Evidence: `target/storage-authority-lazy-segments-20260912/`.
+
+
+### Borrow authority preflight record batches (2026-09-12)
+
+The production authority record-chain validator now uses slice::as_chunks to
+borrow fixed-size sectors from its existing contiguous stream, then passes
+borrowed batches of at most 32 records to PreflightReplay. This removes the
+previous min(record_count, 32) * 512-byte temporary sector allocation (up to
+16 KiB) and the per-record copy. The strict sealed-record pass, bounded replay
+probe batches, semantic graph state across boundaries and final sequence check
+remain. No unsafe conversion or on-media change is introduced. The eliminated
+buffer is one component of peak memory, not a measurement of total guest heap;
+semantic replay state remains a separate accounting problem.
+
+The strengthened boundary test compares every complete-record prefix against
+whole-stream preflight, rejects swaps/corruption at boundaries 32 and 64,
+accepts a borrowed stream starting at byte offset one, and rejects each partial
+final-record truncation of 1 through 511 bytes. The selected host suite passes
+256 tests with one ignored; the strengthened boundary test passes separately.
+QEMU three-boot file-tree/GC/cold-recovery/powered-off verification and Duo
+release check pass. No timed benchmark or SD I/O improvement is claimed.
+Incremental authority publication and complete replay heap accounting remain
+unfinished. Evidence: `target/storage-authority-borrowed-preflight-20260912/`.
+
+
+### Experimental delta selection binds reconstructed base encoding (2026-09-12)
+
+Add an experimental writer-selection helper accepting ReplayedAuthority rather
+than only its decoded snapshot. Recovery accepts V1 full snapshots, but the
+encoder always produces canonical V2. Computing a delta against a decoded V1
+snapshot therefore hashes different predecessor bytes than exist on media.
+The new helper compares the actual reconstructed bytes with canonical metadata
+plus the decoded record stream. A valid legacy full base selects full-snapshot
+materialization (None); canonical V2 remains eligible for delta encoding. Invalid
+bytes, non-increasing/out-of-context generations and inconsistent replay depth
+are rejected. The existing depth-32 fallback and size/prefix checks still apply.
+The helper remains test-only and does not change production publication or GC.
+
+A regression recovers both V1 and V2 through the authenticated mock source,
+reproduces failed reconstruction of a directly encoded delta over V1, verifies
+safe V1 fallback and exact V2 delta reconstruction, and rejects damaged input
+and stale generations. The 32-link replay fixture also verifies selection falls
+back at the depth limit. All eight delta tests pass; independent Python recovery
+reconstructs three fixture links and rejects 1,941 invalid cases. Production
+sources are unchanged this turn, so no new QEMU timing or recovery claim is made.
+Publication integration, ancestor GC lifetime and full replay memory budgeting
+remain unfinished. Evidence: `target/storage-authority-legacy-base-20260912/`.
+
+
+### Cumulative authority recovery ABBA qualification (2026-09-12)
+
+Compare the saved `storage-authority-current-qemu-20260912/candidate.elf` with a
+fresh current ELF. Current includes early filtering of historical authority
+scan descriptors, lazy allocation enumeration, borrowed preflight batches and
+the shared full/metadata encoding helper; test-only delta changes are inactive.
+Saved source diffs and hashes identify the comparison. The initial build from
+the repository root missed firmware target configuration and failed; only the
+successful build from firmware/qemu-virt is used. Normal cache source is restored
+and byte-checked before running. No build overlaps the timed runs.
+
+Four independent fresh disks, old/current/current/old, each retain 256 unique
+4 KiB objects under 128 MiB, 64-page cache, one-hart TCG, 4/2 MiB/s read/write
+and 400/200 IOPS limits. All 1,024 samples and four JSONL validations pass.
+Summed operation seconds: 12.951374 / 13.151162 / 12.218738 / 11.935168.
+
+| Metric | Old mean | Current mean | Change |
+| --- | ---: | ---: | ---: |
+| Total seconds | 12.443271 | 12.684950 | +1.94% |
+| Per-run median ms | 32.6815 | 33.9335 | +3.83% |
+| Per-run maximum seconds | 1.9024085 | 1.9086850 | +0.33% |
+| GC-episode operations 206/234, seconds | 3.440773 | 3.454297 | +0.39% |
+
+Every per-sample I/O counter matches across all four runs. Each run reads
+8,097,792 bytes in 1,565 requests, writes 53,694,464 bytes in 1,862 requests and
+flushes 825 times. These results do not establish a speedup: current is slightly
+slower on average, while baseline repetitions themselves vary by about 7.85%.
+Do not attribute the cumulative difference to an individual change or compare
+absolute latency against older sessions. Retain the verified bounded-memory
+changes without a latency claim. Full authority snapshot write amplification
+remains the main unresolved cost; further work should prioritize incremental
+publication rather than claiming these recovery changes solve SD throughput.
+
+Evidence: `target/storage-authority-recovery-abba-20260912/` contains current ELF,
+source snapshots/diffs/hashes, exact commands/ELF hashes, four serial/JSONL logs,
+validation output and summary.json. No production edits in this qualification
+turn and no physical SD measurement or new crash-qualification claim.
+
+
+### Test-only incremental checkpoint mount and GC integration (2026-09-12)
+
+Connect the experimental delta selector to the existing persistent snapshot
+publisher via a cfg(test) wrapper, and connect cold checkpoint recovery to the
+experimental replayer only in cfg(test) builds. Normal builds still reject
+VIBEAUL1 authority roots. This harness deliberately does not establish complete
+heap budgeting or production admission; its bridge uses a copied allocation
+list and rereads the tip, so it is not a performance implementation.
+
+A new integration test publishes three incremental authority checkpoints through
+the actual segment/allocation/checkpoint writer, confirms each on-media root is
+VIBEAUL1, and cold-mounts the resulting image to the exact expected snapshot.
+Before GC, independently corrupting each ancestor/tip payload rejects cold mount
+without writing media. The real collect_garbage path then materializes VIBEAUT2,
+retains the record stream, and a subsequent cold mount succeeds even after all
+old ancestor payloads are damaged. This establishes that the existing full
+materialization GC path can detach the chain in this successful execution.
+It does not prove delta publication/GC power-cut atomicity, physical reuse safety
+at every cut, nonempty capability graphs or independent full-image admission.
+
+The selected host suite passes 258 tests with one ignored (222 library, 6 fused,
+24 GC, 6 steady-state). Production cargo check passes separately. Existing
+integration suites exercise their normal full-snapshot paths; they must not be
+counted as delta-specific fault qualification. No QEMU delta timing or SD
+performance claim is made. Next work must cover incremental checkpoint fault
+injection and complete replay memory accounting before production enablement.
+Evidence: `target/storage-authority-delta-mount-gc-20260912/`.
+
+
+### Experimental incremental publication mutation/cancellation matrix (2026-09-12)
+
+Extend the test-only checkpoint integration with actual publisher fault injection.
+Start from a durable generation-3 delta over a generation-2 full snapshot, then
+publish a generation-4 delta. A successful probe confirms VIBEAUL1 on media and
+measures 20 write/flush mutation points. At each point inject not-submitted failure,
+ambiguous failure (no effect / visible-only / durable), or cancellation while
+pending (the same three effects): 140 independent cases from the same durable
+base image. This exercises continuation of an existing delta chain.
+
+After discarding volatile state, cold recovery must equal the complete encoded
+old or new snapshot and its exact checkpoint generation, and must perform zero
+mutations. Results: 136 old and 4 new, no mixed snapshots or mount failures.
+Every old outcome successfully retries publication; another power cycle and
+cold mount confirms the exact new snapshot in all 140 cases. This covers
+page-write/flush effects exposed by this host fault device, not arbitrary torn
+sectors, nonempty capability graphs, multi-extent deltas, GC cut boundaries or
+real SD power loss. Those remain separate qualification requirements.
+
+Three experimental integration tests and all eight codec tests pass. Production
+code is unchanged this turn; no new QEMU or latency claim. Incremental admission
+remains cfg(test), with production memory budgeting/offline verification and
+GC fault qualification unfinished. Evidence, including counted outcomes:
+`target/storage-authority-delta-publish-cuts-20260912/experimental.log` and
+`codec.log`. The earlier cuts.log records the first matrix without retry checks.
+
+
+### Experimental delta GC mutation/cancellation matrix (2026-09-12)
+
+Start from generation 5 containing three incremental authority checkpoints over
+a full base. Run the real GC materialization and reuse-barrier protocol. The
+successful probe has 40 write/flush mutation points; each is tested with the same
+seven failure/cancellation effects as the incremental publication matrix, for
+280 independent cases. All effects begin from an identical durable image.
+
+Cold recovery returns exactly the old encoded snapshot at generation 5 or the
+complete materialized snapshot at generation 6/7. Outcomes are 157 / 119 / 4
+respectively. Mount performs zero mutations. Generation 5 keeps every ancestor
+allocated; generation 6 allows allocated/retired ancestors but none free before
+the reuse barrier. Retrying or resuming GC from either interrupted stage succeeds,
+and another power cycle recovers the materialized snapshot at generation 7 in
+all 280 cases. No mixed authority state or premature ancestor reuse was observed
+within this matrix. Four experimental integration tests pass together, including
+the prior 140-case incremental publisher matrix.
+
+This is cfg(test) host qualification with empty object/grant graphs and short
+single-extent deltas. It does not cover nonempty graph GC relocation, arbitrary
+torn sectors, large delta extents, bounded replay heap, independent full-image
+admission, or real SD power failure. Production delta admission remains disabled;
+no throughput claim is made. Evidence: `target/storage-authority-delta-gc-cuts-20260912/`.
+`experimental.log` includes the final ancestor-allocation/barrier assertions;
+`cuts.log` is the initial successful matrix before those assertions were added.
+
+
+### Live object/grant incremental GC fault qualification (2026-09-12)
+
+Generalize the experimental GC fault harness to keep both empty-graph coverage
+and a live 4 KiB patterned object with a root grant. The object and grant are
+initially imported through the normal full-snapshot path; three subsequent
+deltas preserve those bindings while appending high-water records. The GC
+matrix now exercises a nonempty catalog, manifest and authority graph.
+
+The live-object probe has 45 write/flush mutation points, yielding 315 fault or
+cancellation cases. Cold outcomes: 192 old incremental checkpoints, 119 complete
+materializations before the barrier, 4 completed reuse barriers. Every case
+recovers the exact encoded authority snapshot for its phase without writing
+media, then retries/resumes GC and cold-mounts the completed checkpoint.
+Before retry and after final recovery, independently replay the record stream
+against the exact external root grant, compare the complete grant record, read
+and compare all object bytes, and verify logical/physical quota usage. All pass.
+Ancestor allocation/barrier assertions remain active in both graph variants.
+
+Five experimental integration tests pass together: 140 publication fault cases,
+280 empty-graph GC cases and 315 live-graph GC cases, plus successful recovery
+fixtures. This covers one preexisting live root grant; it does not establish
+correctness for grant/revoke mutations in deltas, multi-object graph topologies,
+large/multi-extent chains, arbitrary torn sectors, or real SD power failure.
+Production code is unchanged. Bounded replay memory, independent image admission
+and production incremental enablement remain unfinished; no speedup is claimed.
+Evidence: `target/storage-authority-delta-live-gc-20260912/experimental.log` and
+`cuts-final.log`. Initial cuts.log records a test field-name compile error fixed
+before running the matrix.
+
+
+### Independent experimental checkpoint-region reconstruction (2026-09-12)
+
+The independent migration verifier's reconstruct_v2_checkpoint API now has an
+explicit allow_experimental_delta=False parameter. Default behavior still rejects
+delta roots; no CLI or migration-container enablement is added. In opt-in mode,
+resolve/authenticate each predecessor through RawImageResolver (including segment
+framing and Allocated membership), bound the chain to 32 links and 64 MiB cumulative
+payload, and reconstruct with the separately implemented Python delta codec.
+Each physical target generation is checked; canonical snapshot policy, catalog,
+blob and object-graph verification then follows the existing path. All dependency
+pointers are recorded. This first bridge accepts single-extent payloads only.
+AuthorityPolicy also carries an explicit record-store ID with the existing ID as
+default, avoiding global mutation for Rust test fixtures.
+
+The Rust successful checkpoint/GC fixture optionally exports raw V2 regions via
+VIBE_DELTA_IMAGE_FIXTURES. scripts/test-authority-delta-image.py verifies exported
+generation 5 at depth 3 and generation 7 at depth 0 under an explicit empty-graph
+fixture policy. It rejects default-disabled delta admission, wrong external policy,
+wrong record-store identity, and corruption of each of the four physical authority
+payloads: nine rejection cases. An explicit corruption-count assertion prevents a
+vacuous loop over the nested structural parser output. Earlier image.json preceded
+that fix; image-final.json is authoritative. Existing byte-oracle reconstruction
+still passes three links/1,941 rejections, and the production verifier selftest
+passes 25,129 cases. Rust export test passes.
+
+This is independent checkpoint-region validation, not yet full migration-container
+or retained-checkpoint fallback admission, multi-extent delta support, live-object
+fixture verification, or a bounded Rust heap proof. Production delta mount remains
+cfg(test). No QEMU/SD speedup is claimed. Evidence:
+`target/storage-authority-delta-image-20260912/` (fixtures, export.log,
+image-final.json, codec.json and selftest.json).
+
+
+### Independent live-object incremental image verification (2026-09-12)
+
+Extend the Rust live-object GC fixture export to include live-delta.raw and
+live-materialized.raw alongside the empty-graph pair. The independent Python
+fixture policy requires exactly the expected root grant (identity, parent,
+object, slot/generation, rights, resource kind and flags), live slot membership,
+object-before-grant ordering, raw kind and all 4 KiB patterned content bytes.
+Then call the existing verify_authority_bindings path for every region, including
+the empty fixtures, to check exact policy-selected object sets, CAS mappings,
+commit generations, kinds, reference codec, content and principal quota totals.
+
+All four exported V2 regions verify: generations 5/7 with depths 3/0; the live
+pair each has one verified object and 4,096 logical bytes. Nineteen rejection
+cases cover default-disabled incremental admission, foreign policy/store ID,
+every authority ancestor payload and live canonical Blob payload corruption.
+Explicit counters ensure both ancestry and Blob corruption loops execute.
+The Rust export run also passes all five experimental integration tests,
+including the 140/280/315-case publication and GC fault matrices.
+
+No production code changes this turn. This verifies the specified live root in
+raw V2 checkpoint regions, not arbitrary authority policies, grant/revoke changes,
+full migration-container/fallback admission, multi-extent deltas, or bounded Rust
+replay heap. Production incremental admission remains disabled. Evidence:
+`target/storage-authority-delta-live-image-20260912/` (fixtures, export.log,
+image.json). No performance claim is made.
+
+
+### Experimental replay owned-buffer budget (2026-09-12)
+
+Add a separate buffer_bytes limit to the test-only replay engine. Cumulative
+payload traffic and maximum individual snapshot length do not bound the overlap
+of retained ancestor payloads, an old reconstructed snapshot and its successor.
+Track capacities of fetched payload Vecs, constrain each source read by remaining
+buffer budget, and precheck resident_buffers + declared successor length before
+apply_link can allocate the next output. Release accounted predecessor/delta
+capacity as each link is consumed. Report the peak of this accounting separately.
+
+The 32-link fixture reports 34,432 bytes for these owned buffers. Exactly that
+budget succeeds with identical output; one byte less rejects with Memory before
+the corresponding successor allocation. A cap smaller than the known tip payload
+rejects before any source call. All eight codec tests and five integration tests
+pass, retaining the 140/280/315 publication and GC fault cases.
+
+This is deliberately NOT a total heap bound: decoded snapshot copies, canonical
+re-encoding, semantic graph/preflight state, Vec descriptor tables, source scan
+workspace and allocator overhead are excluded. A source must also honor its
+supplied maximum; returned capacity is defensively checked after reading. Existing
+test bridges use generous explicit buffer caps and do not claim to enforce the
+production recovery_memory_bytes budget. The remaining costs must be bounded or
+removed before production enablement. No production source, media encoding or
+performance claim changes. Evidence:
+`target/storage-authority-delta-buffer-budget-20260912/codec-final.log` and
+`integration.log`.
+
+
+### Avoid full canonical re-encoding during delta replay (2026-09-12)
+
+Experimental delta reconstruction previously encoded the fully decoded predecessor
+and successor into separate complete temporary payloads to check canonical byte
+equality. Share a canonical_snapshot_matches helper which encodes metadata only
+and compares that prefix plus the decoded record stream directly against the
+original bytes. The writer's replayed-base selection uses the same helper.
+This removes the record-stream copy from both canonical checks per link; full
+snapshot decoding, graph validation, result digests and exact byte equality remain.
+The legacy-base full-snapshot fallback is unchanged. Production code is unchanged.
+
+For both rich-table snapshots, compare canonical output successfully and reject
+every truncation, each single-byte flip and a trailing byte. Existing corruption,
+legacy and 32-link tests pass: eight codec tests total. Five integration tests
+also pass, retaining 140 publication, 280 empty GC and 315 live-object GC fault
+cases. The previously reported owned-buffer peak remains 34,432 bytes because
+that accounting excluded canonical encoding scratch; this is not a measured
+whole-heap reduction or latency claim. Metadata encoding, decoded record copies,
+semantic replay and scan workspace still need complete budgeting before release.
+Evidence: `target/storage-authority-delta-canonical-borrow-20260912/`.
+
+
+### Actual page-I/O comparison of experimental delta publication (2026-09-12)
+
+Instrument the host fault device with read-page, write-page and flush counters
+without changing its failure semantics. From the same durable 321-record empty
+object-graph authority history, publish the same eight one-record successors
+using either the existing full snapshot publisher or the experimental selector
+plus that publisher. Count actual PageDevice operations after mount and before
+final cold verification, including publication verification reads. Both final
+cold mounts reproduce the exact same snapshot. This is authority-only metadata
+traffic; it is not an object workload or a QEMU timing result.
+
+| Eight publications | Full snapshots | Experimental deltas | Change |
+| --- | ---: | ---: | ---: |
+| Read bytes | 2,105,344 | 3,784,704 | +79.77% |
+| Write bytes | 1,843,200 | 524,288 | -71.56% |
+| Flush calls | 32 | 32 | unchanged |
+
+The format reduces actual page writes substantially while preserving flush
+boundaries. However, the test-only bridge rereads and reconstructs the ancestry
+before every append, producing a large read penalty; total transferred bytes
+also increase. Do not claim end-to-end speedup. Production integration should
+retain verified base provenance/state across successful publications instead of
+copying this deliberately inefficient test bridge, while preserving invalidation
+on mount/generation changes and legacy full-snapshot fallback. Full recovery heap
+budgeting and remaining admission work still gate enablement.
+
+Six experimental tests pass, including the I/O comparison and prior fault matrices.
+The selected host suite passes 262 tests with one ignored (226 library, 6 fused,
+24 GC, 6 steady-state). Production code is unchanged. Evidence:
+`target/storage-authority-delta-io-20260912/` (io.log, summary.json, integration.log,
+host.log). No real-device or QEMU latency claim is made.
+
+
+### Verified base provenance cache for experimental publication (2026-09-12)
+
+The test-only delta publisher now retains a small provenance witness after a
+successful verified publication: store UUID, checkpoint generation, authority
+pointer, admitted/next-segment horizons, canonical snapshot digest and observed
+chain depth. It stores no duplicate history/ancestor buffers. The next append
+checks all identities and hashes the current in-memory snapshot before reusing
+the verified base; a mismatch falls back to device replay. Full publication
+fallback resets depth. The witness is taken before fallible encoding/publication,
+installed only after verified success, and cleared on mount. GC/growth/ordinary
+publications change the bound context so a retained stale witness cannot match.
+This remains cfg(test), not a production feature or total heap budget solution.
+
+Tests reject changes to each of six bound context/snapshot components and check
+cold-mount clearing. Both cold and warm-cache publication fault matrices pass
+140 cases each; every failure/cancellation leaves no cached witness, and recovery
+plus retry remains exact. Empty/live GC matrices still pass 280/315 cases.
+
+For the same actual host page-I/O test (321-record base, eight metadata appends):
+
+| Metric | Full snapshots | Cached experimental delta | Change |
+| --- | ---: | ---: | ---: |
+| Read bytes | 2,105,344 | 1,003,520 | -52.33% |
+| Write bytes | 1,843,200 | 524,288 | -71.56% |
+| Flush calls | 32 | 32 | unchanged |
+
+This removes the earlier uncached bridge read penalty (3,784,704 read bytes).
+It includes the initial cold-base read and verification reads, excludes setup
+and final cold validation, and makes no QEMU/SD latency claim. Final snapshots
+remain byte-identical. Seven experimental tests pass; selected host suite passes
+263 tests with one ignored, and production cargo check passes. Full recovery
+budgeting and production admission remain unfinished. Evidence:
+`target/storage-authority-delta-base-cache-20260912/verified.log`, summary.json,
+host.log and production.log. integration-final.log is an intermediate failed
+compile from accessing a private test field; verified.log uses public construction.
+
+
+### Borrowed record validation during snapshot decode (2026-09-12)
+
+Factor authority snapshot parsing so metadata tables are decoded first and the
+record stream is validated directly from input bytes. Production full decoding
+copies the record stream only after full semantic/structural validation finishes,
+so that copy no longer overlaps the preflight graph workspace. A test-only
+canonical-V2 validation entry point returns generation/record offset without
+retaining any record copy. Experimental delta reconstruction uses that entry
+point for both predecessor and successor, eliminating their decoded-stream
+copies as well as the already removed canonical re-encoding copies. Record
+chain, graph, tables, offsets, reserved fields and generation checks remain.
+Only the private parsing helper can temporarily hold metadata without records;
+public full decoding continues returning an owned, validated snapshot.
+
+Differential tests compare borrowed canonical admission with owned decode plus
+canonical re-encoding equality for rich snapshots, every truncation and each
+single-byte mutation. Existing corruption/legacy/depth and publication/GC matrices
+pass. The selected host suite passes 263 tests with one ignored. QEMU three-boot
+file-tree/GC/cold recovery/powered-off verification and Duo release check pass.
+
+This changes production decode allocation lifetime but not its bytes or accepted
+format. No timing/whole-heap measurement is claimed. Metadata tables, semantic
+BTree/transaction state and source scanning still require complete accounting
+before production delta admission. Evidence:
+`target/storage-authority-borrowed-decode-20260912/` (host.log, codec.log,
+gate.log, gate-evidence and duo.log).
+
+
+### Validation-only semantic replay without retained object content (2026-09-12)
+
+Add durable-format PreflightValidator as a wrapper with a private replay builder.
+It shares the existing record/transaction/CRC/graph validation, but skips storing
+ObjectChunk bytes in PreparedObject. Length and content CRC continue accumulating;
+committed metadata uses validated byte_len rather than retained Vec length. The
+wrapper returns only the final validated sequence, never recovered objects or a
+RecoveryPreflight, so missing content cannot escape as a recovered object.
+PreflightReplay::new continues retaining complete content for ordinary recovery.
+Production authority snapshot validation now uses PreflightValidator.
+
+A 32 KiB inline-object test checks zero content-buffer capacity in both prepared
+and committed validator state at every batch, compares every complete-record
+prefix against ordinary recovery, verifies poisoning after error, and confirms
+ordinary recovery still returns exact object bytes. Durable-format's 37 tests
+pass; the selected segment-store suite passes 263 with one ignored. QEMU
+three-boot file-tree/GC/cold-recovery/powered-off verification and Duo release
+check pass. Existing authority corruption/graph and delta fault cases remain
+covered by the library suite.
+
+This removes retained inline content from semantic validation, including content
+of incomplete transactions, without skipping digest work. It is not a measured
+whole-heap peak or timing result. Metadata BTree/graph entries and scan workspace
+still require budgeting before production incremental admission. Evidence:
+`target/storage-authority-validator-content-20260912/` (durable.log, host.log,
+gate.log, gate-evidence, duo.log).
+
+
+### Release append-time replay indexes before graph construction (2026-09-12)
+
+PreflightReplay::finish now drops transaction, ID-class, seen-derivation and
+seen-object indexes after append-time validation has completed and before
+allocating the recovered graph and slot maps. This also releases any unfinished
+inline-object buffers in ordinary recovery. The temporary object-kind map is
+released after grant validation, before slot construction. Committed content and
+all existing transaction, identity, graph and slot validation remain intact.
+
+Durable-format passes 37 tests; selected segment-store suites pass 263 with one
+ignored. QEMU three-boot file-tree, GC pressure, cold recovery and powered-off
+verification pass. Duo release check passes (compile only; no real device used).
+This reduces overlapping allocation lifetimes; no measured heap peak or latency
+improvement is claimed. Full recovery memory budgeting and production delta
+admission remain unfinished. Evidence:
+`target/storage-preflight-index-lifetime-20260912/` (durable.log, host.log,
+gate.log, gate-evidence and duo.log).
+
+
+### Experimental replay table allocation budget (2026-09-12)
+
+Extend the test-only authority delta replay owned-allocation budget to include
+ancestor and pending-link Vec storage. Growth checks conservatively allow for
+the old table and its full replacement to coexist before reserving; actual
+capacity is checked after reservation as well. Pending table capacity remains
+charged after entries are popped. This closes a bookkeeping gap rather than
+increasing the chain's allocations or changing the on-media format. Allocator
+internal overhead, semantic decoder/preflight allocations and source scan
+workspace remain outside this budget, so production admission is still pending.
+
+The 32-link fixture's accounted peak changes from 34,432 to 41,440 bytes. Exact
+budget succeeds and one byte less rejects. A targeted test verifies rejection
+before table allocation/growth, retained contents on rejection, reallocation
+overlap, and reuse after pop without charging another allocation. Selected host
+suites pass 264 tests with one ignored, including publication/GC fault matrices.
+No QEMU timing or real-device claim: this change is confined to cfg(test) replay.
+Evidence: `target/storage-delta-table-budget-20260912/codec.log` (initial eight
+codec tests and peak output), `host.log` (final suite including the new test).
+
+
+### Borrowed full-base validation in experimental delta replay (2026-09-12)
+
+Experimental cold replay now validates its full-snapshot base through a borrowed
+record-stream helper instead of constructing an owned record-stream copy solely
+to check the generation. The helper accepts both supported V1 and V2 snapshots,
+runs the existing full metadata/record/graph validation, and returns only the
+validated generation and record offset. Canonical delta reconstruction wraps
+that helper with its existing V2-only requirement; legacy bases still require
+full materialization before a delta can be published.
+
+The legacy/current-base test now compares exact success/error results against
+owned decoding for valid fixtures, every truncation and every single-byte
+mutation. Selected host suites pass 264 tests with one ignored, including cold
+recovery and publication/GC fault matrices. No latency or total-heap result is
+claimed, and these entry points remain cfg(test). Decoder metadata/graph and
+source scan budgeting remain required before production delta admission.
+Evidence: `target/storage-delta-borrowed-base-20260912/host.log`.
+
+
+### Independent multi-extent authority reconstruction (2026-09-12)
+
+The migration verifier now reconstructs authority payloads across extents and
+segments instead of requiring a single extent. Every member resolves through
+the sealed-segment/pointer verifier in Allocated media. Reconstruction checks
+index/count, generation, offsets, shared metadata, per-extent SHA-256, total
+length and complete-payload SHA-256. All physical members participate in the
+existing overlap checks. Matching extent accumulation and payload reads are
+bounded. Experimental delta ancestors use the same resolver; delta admission
+remains explicitly opt-in and disabled in the normal CLI.
+
+A new Rust test publishes an 8,193-record base (>4 MiB, five extents across
+multiple 4 MiB segments), appends one incremental checkpoint and verifies exact
+cold-recovered bytes. It exports multi-base.raw and multi-delta.raw for the
+independent scripts/test-authority-multi-image.py check. Both regions pass;
+corrupting every authority payload individually yields 11 rejected cases. The
+existing four delta/live/GC-materialized regions still pass their 19 rejection
+cases. Selected Rust suites pass 265 tests with one ignored; migration verifier
+selftest passes 25,129 cases.
+
+This adds offline coverage for multi-extent full bases beneath delta links. It
+does not yet establish coverage of a multi-extent delta payload, full-container
+checkpoint fallback, or production incremental admission/heap budgeting. No
+QEMU latency or SD-device result is claimed. Evidence:
+`target/storage-authority-multi-image-20260912/` (host.log, multi.json,
+existing.json, selftest.json and fixtures). rust.log is the initial smaller
+fixture; the final cross-segment test is in host.log.
+
+
+### Cross-segment delta payload and remaining-read budget (2026-09-12)
+
+Extend the multi-extent fixture with a second incremental publication containing
+8,192 additional high-water records. Its delta payload spans five extents and
+multiple segments; the reconstructed snapshot contains 16,386 records. The Rust
+test checks the physical VIBEAUL1 magic to rule out full-snapshot fallback, then
+cold-mounts and compares the exact canonical snapshot. This is host simulation
+with a 32 MiB configured recovery budget, not proof of full heap accounting or
+SD-device suitability.
+
+Independent Python verification now covers the full base, small delta and large
+delta at depths 0/1/2. All 22 individual physical authority-payload corruptions
+are rejected across the three images. Six short-budget checks also reject: known
+first-extent overflow before any resolver read, and declared multi-extent total
+overflow after the first extent but before sibling reads. Exact payload budgets
+succeed. Ancestor resolution now receives the chain's remaining cumulative
+payload budget before reading, rather than checking only after loading it.
+
+Selected Rust suites pass 265 tests with one ignored; migration selftest passes
+25,129 cases. Evidence: `target/storage-authority-large-delta-image-20260912/`
+(rust.log, host.log, multi.json, selftest.json, fixtures). Production incremental
+admission, complete heap budgeting and full-container fallback remain pending;
+no new QEMU timing or physical-device measurement is claimed.
+
+
+### Transfer the already verified tip into experimental replay (2026-09-12)
+
+The experimental mount bridge previously discarded the authority tip bytes that
+read_recovery_authority_payload had just authenticated, then read the tip again
+as the first replay step. It now transfers that owned buffer and its verified
+extent generation into a one-use DeviceAuthoritySource slot. The slot requires
+the exact pointer and an Allocated segment, checks capacity against the read
+budget, and is consumed once. Normal replay pointer, generation, depth and
+cumulative buffer/payload checks still apply. Nothing is retained across mount
+attempts, and production format admission remains unchanged.
+
+The sealed three-payload fixture compares ordinary replay with replay supplied
+the preceding authenticated read. Replay-stage reads fall from 27 to 18 pages
+(36 KiB avoided); both measurements exclude the common initial mount read.
+Reconstructed bytes and cumulative logical payload accounting match, and the
+one-use slot is empty afterward. Selected host suites pass 265 tests with one
+ignored, including publication/GC fault matrices and the cross-segment large
+delta. Evidence: `target/storage-delta-reuse-tip-20260912/host.log` and reads.log.
+This is an experimental host I/O result, not a QEMU timing or SD measurement.
+Repeated ancestor segment scans and complete replay heap accounting remain.
+
+
+### Borrow the allocation bitmap in experimental device replay (2026-09-12)
+
+Remove allocated-segment Vec construction from the experimental mount bridge,
+cold-base publisher path and device replay adapter. DeviceAuthoritySource now
+borrows AllocationV2 directly for membership checks and lazily enumerates
+admitted segment numbers only when a cross-segment authority chain requests
+them. Small sealed-media codec fixtures retain a borrowed-slice adapter. This
+eliminates the separate u64 array proportional to allocated segment count; no
+new cache or persistent state is introduced.
+
+The selected host suite passes 265 tests with one ignored, including the large
+cross-segment delta and fault matrices. A subsequently added 4,096-segment sparse
+bitmap test checks Free/Retired exclusions, membership beyond the map (including
+u64::MAX), and iteration at empty, partial and excessive admitted bounds. All
+10 codec tests pass, retaining the verified-tip read result and 32-link budget
+boundary. Evidence: `target/storage-delta-borrowed-allocation-20260912/host.log`
+and codec.log. No new latency or whole-heap result is claimed; scan workspace
+and semantic graph allocations still need accounting for production admission.
+
+
+### Filter authority generation before scan-result allocation (2026-09-12)
+
+Production cross-segment authority recovery now passes the requested generation
+and descriptor-count cap into the shared verified-segment interpreter. Previously
+scan_segment_authority_records copied every historical Authority descriptor, then
+compared the unfiltered result count to the selected chain's extent count. This
+could allocate unnecessary result storage and reject a valid selected generation
+when unrelated historical records exceeded that cap. Collection now filters kind
+and generation first and checks the count before reserving each matching entry.
+Segment descriptor/summary/seal verification is unchanged; later chain-wide
+collection still rejects excess matching siblings across segments.
+
+The targeted test sends 10,000 unrelated records through the collection helper
+and observes zero result capacity, then verifies an excess matching record is
+rejected without further allocation. Selected host suites pass 266 tests with
+one ignored. QEMU three-boot file-tree/GC pressure/cold recovery/powered-off
+verification and Duo release compilation pass. Evidence:
+`target/storage-authority-scan-filter-20260912/` (host.log, gate.log,
+gate-evidence, duo.log). This reduces the filtered result allocation; the full
+verified descriptor table still exists and needs separate memory accounting.
+No timing or physical SD measurement is claimed.
+
+
+### Bound declared authority chains before descriptor reservation (2026-09-12)
+
+Production authority resolution now checks the authenticated first extent before
+reserving the chain descriptor array: index/offset zero, nonzero count and stride,
+matching logical/encoded length, fixed-stride/nonempty-tail length bounds, and
+declared payload within the supplied budget. Variable descriptor-array bytes
+are independently capped by that budget (one descriptor remains fixed overhead
+for tiny payloads). This prevents small declared fragments from inducing a huge
+descriptor reservation even when their payload total fits. After gathering all
+extents, the actual byte sum must also match the declared total.
+
+Tests cover exact descriptor budget, one byte less, payload overflow, impossible
+length/count combinations and u32::MAX declared extent counts. Selected host
+suites pass 267 tests with one ignored; QEMU three-boot file-tree/GC pressure/
+cold-recovery/powered-off verification and Duo release compilation pass.
+Evidence: `target/storage-authority-declared-budget-20260912/` (host.log,
+gate.log, gate-evidence and duo.log). These checks separately bound payload and
+variable descriptor storage; they do not yet sum all overlapping scan, decoder
+and graph allocations into a complete recovery heap budget. No timing or
+physical-device improvement is claimed.
+
+
+### Include cold recovery in the authority delta I/O comparison (2026-09-12)
+
+Extend the existing 321-record base / eight high-water appends comparison with
+separately reset device counters around the final power-cycle and mount. Both
+paths recover byte-identical canonical snapshots and perform zero writes/flushes
+during mount. Complete publication counters remain unchanged: full versus delta
+reads 2,105,344 / 1,003,520 bytes, writes 1,843,200 / 524,288 bytes, flushes 32 / 32.
+
+Cold mount reads are 716,800 bytes for full snapshots and 1,400,832 for the delta
+chain (+95.43%). Publication plus one cold mount reads 2,822,144 / 2,404,352 bytes
+(-14.80%). Arithmetic using two identical cold mounts reverses the read advantage
+(3,538,944 / 3,805,184 bytes, +7.52%); that two-mount figure is an extrapolation,
+not a second measured execution. Write savings remain 71.56%. This identifies
+ancestor replay/read amplification as the next optimization target and argues
+for evaluating periodic materialization against expected reboot frequency.
+
+The instrumented comparison test passes. Evidence:
+`target/storage-delta-cold-io-20260912/io.log` and summary.json. This is a host
+metadata-only workload, not QEMU timing, an object workload, or an SD benchmark.
+Experimental production admission and complete heap budgeting remain unfinished.
+
+
+### Attribute cold reads and model finite page caches (2026-09-12)
+
+The authority comparison's fault device can now optionally record per-page
+counts and read order during cold mount; other tests leave tracing disabled.
+Full recovery reads 175 pages / 134 unique pages, versus delta recovery's
+342 / 159. The delta base segment alone accounts for 132 reads / 54 unique
+pages. Code inspection confirms mount strictly reconstructs both sealed
+checkpoint slots, so shared ancestors are revisited; removing the older-slot
+validation would change the recovery contract.
+
+Replaying the observed read order through an initially empty ideal LRU gives
+full/delta misses of 154/321 at 64 pages and 134/159 at 512 pages. Zero-capacity
+misses equal all reads; a cache larger than the footprint equals unique pages.
+These are offline trace simulations, not measurements of the kernel cache or
+QEMU, and exclude other concurrent cache users/prefetch behavior. They show
+that the small-cache configuration does not absorb most repeated reads. The
+next candidate is budgeted reuse of authenticated shared state across the two
+checkpoint reconstructions, preserving strict validation.
+
+Selected host suites pass 267 tests with one ignored. No production runtime
+change was made this step. Evidence:
+`target/storage-delta-cold-page-attribution-20260912/io.log`, host.log and
+summary.json. Full production delta admission remains unfinished.
+
+
+### Configurable bounded verified-segment memo (2026-09-12)
+
+VerifiedSegmentScans now accepts explicit byte and entry limits (clamped to the
+existing 320 KiB / 256-entry session maxima) and reports owned allocation bytes.
+The default constructor preserves the existing session-cache limits. Zero or
+undersized budgets disable admission; oversized proofs are still verified but
+not cached; eviction continues using the configured allocation limit and exact
+segment-generation/checkpoint-horizon checks.
+
+A new 8 KiB memo test covers zero allocation when disabled, repeated insertion
+and eviction within budget, oversized proofs, wrong segment generation and
+future checkpoint proofs. Selected host suites pass 268 tests with one ignored.
+QEMU three-boot file-tree/GC pressure/cold recovery/powered-off verification and
+Duo release compilation pass. Evidence:
+`target/storage-recovery-memo-budget-20260912/` (host.log, gate.log,
+gate-evidence, duo.log).
+
+This is infrastructure for a recovery-local memo, not yet cross-checkpoint cold
+recovery reuse. Integration must reserve its memory and fall back without the
+optional memo if that reservation would prevent an otherwise valid recovery.
+No cold-read reduction or timing improvement is claimed for this step.
+
+
+### Mount-local memo across both checkpoint reconstructions (2026-09-12)
+
+Mount now reserves a 64 KiB / 32-entry verified-segment memo for authority reads
+across both strictly reconstructed checkpoint slots. The memo is local to this
+mount, keyed by sealed segment identity and constrained by checkpoint horizon.
+All pointer/allocation, authority payload hashes, graph and checkpoint-transition
+validation remain. Scrub and standalone recover_state use the uncached path.
+Experimental delta ancestor reads share the same local memo.
+
+The full reservation is subtracted before recovery and included in the reported
+conservative peak. A MemoryLimit result drops the memo and retries the entire
+pair uncached under the original budget; other failures are not retried. The
+retry conservatively reports the original limit as its peak. This avoids losing
+otherwise valid images to optional cache reservation, at the cost of extra reads
+when that retry is needed. Both full/delta fixtures exercise this fallback at
+369,920 bytes, recover exact snapshots and perform no writes.
+
+For the 321-record base / eight append host fixture, delta cold reads decrease
+from 1,400,832 to 1,064,960 bytes (-23.98%, 342 to 260 pages). Full snapshot cold
+reads stay at 716,800 bytes. Publication I/O remains unchanged; publication plus
+one cold mount totals 2,822,144 full versus 2,068,480 delta read bytes. Offline
+64-page LRU simulation of the new delta trace gives 239 misses (previously321);
+512-page misses remain159. These cache figures are simulations, not kernel
+measurements.
+
+Selected host suites pass 268 tests with one ignored. QEMU three-boot file-tree,
+GC pressure, cold recovery and powered-off verification pass; Duo release
+compilation passes. A scrub test's comparison between mount and scrub peaks was
+removed because mount now has an optional cache reservation absent from scrub;
+its stronger tight-budget assertion remains: mount succeeds where typed scrub
+fails for lack of aggregate scratch. Evidence:
+`target/storage-cold-recovery-memo-20260912/` (host.log, io.log, summary.json,
+gate.log, gate-evidence, duo.log). No QEMU timing/physical SD speedup is claimed.
+Production delta admission and complete semantic replay heap accounting remain.
+
+
+### Verify mount-local memo lifetime on same-instance remount (2026-09-12)
+
+Extend the delta checkpoint integration test beyond fresh-instance corruption.
+For each of four physical authority generations, a store first mounts intact
+media, then the payload, descriptor or segment-seal body is corrupted before
+mounting again on that same instance. All 12 remounts reject, clear the admitted
+state and leave the damaged image unchanged. Restoring the exact original page
+allows another mount whose canonical snapshot equals the expected result.
+This verifies that shared-ancestor proofs from a successful mount do not survive
+into a new mount attempt and that failure does not prevent a valid repaired
+retry. The targeted test, including its existing cold/GC materialization checks,
+passes. Evidence: `target/storage-cold-memo-remount-20260912/remount.log`.
+No production code or timing result changed in this step.
+
+
+### Current production firmware QEMU ABBA recheck (2026-09-12)
+
+Compare the previous storage-authority-recovery-abba candidate ELF with a fresh
+current production build, both with 64 cached pages. The current source was
+temporarily overridden only for the build and restored byte-for-byte afterward;
+the ELF was saved before restoration. Four runs use old/new/new/old order, each
+256 unique 4 KiB durable object put+get samples, fresh cloned 1 GiB template,
+128 MiB guest, one TCG hart, cache=none/aio=threads and 4/2 MiB/s, 400/200 IOPS
+read/write throttles. No other builds/tests ran during timed sampling.
+
+Total sample time is 12.191378 / 13.343220 / 11.563796 / 10.930814 seconds.
+Mean old/new is 11.561096 / 12.453508 seconds (+7.72% slower for the candidate).
+Old repeats differ by 10.34% relative to the first old run; new repeats differ
+by 13.34%. This is not evidence of improvement and leaves possible steady-state
+CPU regression versus environmental variation unresolved. GC episode sums at
+samples 206/234 are 3.440943 / 3.441864 / 3.417276 / 3.419118 seconds.
+
+All 1,024 records pass schema/status validation. Every per-sample counter is
+identical across all four runs: per run 8,097,792 read bytes / 1,565 reads,
+53,694,464 write bytes / 1,862 writes and 825 flushes. The experiment therefore
+shows no device-I/O reduction in this workload. Experimental authority deltas
+remain disabled in firmware; the prior host delta cold-mount savings are not
+being measured here. Follow-up needs a dedicated cold-mount measurement and
+isolation of CPU-path changes rather than a throughput speedup claim.
+
+Evidence: `target/storage-current-production-abba-20260912/` contains candidate
+ELF, source hashes, restoration check, exact commands/ELF hashes, four JSONL and
+serial logs, validation logs, analysis script and summary.json. This comparison
+covers cumulative production changes since the baseline ELF, not one isolated
+cache patch.
+
+
+### Dedicated benchmark-build mount telemetry (2026-09-12)
+
+QEMU storage-bench builds now emit VIBE_STORAGE_MOUNT JSON around the mount
+inside cold_recover_and_scrub, after clearing the page/recovery caches and before
+authority recovery/scrub. Each record includes status, checkpoint generation,
+elapsed ticks/timebase, block read/write requests and bytes, flushes and reported
+recovery peak. Both successful and failed mount attempts are recorded. UART
+formatting happens after timing and counter snapshots, so logging is excluded
+from the mount sample. Ordinary non-benchmark firmware does not emit the record.
+The existing object sample format is unchanged.
+
+A fresh 128 MiB / 64-cache-page QEMU boot with the usual SD-like throttles
+produces an initial unformatted-media failure (3.123 ms, 16 KiB read), followed
+by generation-2 successful mount after native initialization (23.009 ms, 120 KiB
+read, 19 read requests, reported peak 66,812 bytes). Both attempts have zero
+writes and flushes. These tiny fresh-store numbers only validate telemetry;
+they do not measure a prepopulated cold boot or prove a cache speedup. The
+subsequent 4 KiB object sample passes schema validation.
+
+Evidence: `target/storage-mount-telemetry-20260912/` (candidate.elf, build.log,
+sources.json, restored.json, serial.log, mount.json, sample.jsonl). The temporary
+64-page build override was restored byte-for-byte. Dedicated populated-image
+mount comparisons remain the next measurement step.
+
+
+### Populated QEMU mount: reuse CAS segment verification (2026-09-12)
+
+Add optional run-vibeos --retain-images DIR support. Images are copied only
+after QEMU stops, named vm-NNN.raw, and opened exclusively so existing fixtures
+are never overwritten. Retention is not itself verification. A fresh QEMU run
+created and content-checked 32 unique 4 KiB files using file-batch-create-unique.
+The retained image passes the independent native migration verifier, including
+32 data nodes, 32 dirents, 33 inodes and 35 CAS objects. The runner selftest and
+seed sample validation pass. Fixture and verification evidence reside under
+`target/storage-populated-mount-20260912/`.
+
+An initial memo-off/on ABBA comparison showed authority-only memoization does
+not reduce this fixture's mount reads: all four read 45,985,792 bytes in 5,515
+requests. Inspection found CAS manifest and Blob-descriptor recovery still
+passed None to the existing verified-segment memo. Production recovery now
+threads the same already-reserved mount-local memo through allocation/catalog/
+manifest/delta payload reads and CAS Blob descriptor validation. Individual
+payload SHA checks, pointer/allocation checks, strict old/new checkpoint
+reconstruction, transition validation and uncached scrub remain. No additional
+cache reservation is introduced; the existing 64 KiB fallback policy applies.
+
+A second isolated ABBA run compares the authority-only memo firmware with the
+CAS-enabled memo firmware, using the same verified generation-4 image hash,
+128 MiB guest, 64 cached pages, one TCG hart and 4/2 MiB/s plus 400/200 IOPS
+throttles. No builds or other tests run concurrently with timed boots. Mount
+seconds are 13.792193 / 0.466847 / 0.468221 / 13.787285. Mean decreases from
+13.789739 to 0.467534 seconds (29.49x, -96.61%). Both baseline runs read
+45,985,792 bytes / 5,515 requests; both candidates read 1,159,168 / 187
+(-97.48% bytes). All mount samples have zero writes/flushes and report the same
+82,482-byte conservative recovery peak.
+
+Selected host suites pass 268 tests with one ignored, including fallback and
+remount corruption checks. QEMU three-boot file-tree/GC/cold-recovery/powered-off
+verification and Duo release compilation pass. The four cold-boot runs also
+complete boot and pass their subsequent object sample validation. Evidence:
+`target/storage-cas-recovery-memo-20260912/` contains exact commands and ELF
+hashes, source/restoration hashes, four serial/JSONL files, analysis script,
+summary.json, host.log, gate.log/gate-evidence and duo.log.
+
+This speedup is for the mount phase of this populated QEMU fixture, excluding
+subsequent authority recovery and full scrub. It is not a real SD benchmark or
+a steady-state put/get claim. Production delta admission and total semantic
+replay heap accounting remain unfinished.
+
+### Populated QEMU cold-recovery phase baseline (2026-09-12)
+
+The storage-bench QEMU build additionally emits VIBE_STORAGE_COLD_PHASE JSON
+for authority reconstruction/policy validation (including any boot compaction)
+and independent scrub. Each phase captures its elapsed time and block counters
+before emitting its UART record. Authority errors that return early do not emit
+an authority record; missing records must not be interpreted as zero work.
+Scrub status describes the scrub result, before the caller's final authority
+generation and policy checks. Ordinary firmware does not emit these records.
+
+Two isolated boots reuse the independently verified generation-4, 32-file image
+and the same 128 MiB / 64-page cache / single-hart TCG / throttled-device setup.
+Both complete their subsequent object put/get sample and JSONL validation.
+
+| Phase | Mean seconds | Read requests per boot | Read bytes per boot |
+| --- | ---: | ---: | ---: |
+| Mount | 0.467270 | 187 | 1,159,168 |
+| Authority | 0.003530 | 0 | 0 |
+| Scrub | 48.785980 | 19,516 | 160,686,080 |
+
+All three phases perform zero writes and flushes on this fixture. Scrub takes
+48.786543 / 48.785416 seconds, or 99.04% of the summed measured phases
+(49.256779 seconds). The sum is not whole-boot wall time: UART output and gaps
+between phases are excluded. This confirms the remaining cold-proof bottleneck
+without claiming an additional performance improvement. The next optimization
+must preserve scrub's fresh independent proof, payload checks, checkpoint
+transition checks and memory limits. This small file-tree fixture has no
+persistent authority objects, so its authority timing does not characterize a
+large authority graph.
+
+Evidence: `target/storage-cold-phases-20260912/` contains candidate ELF, build
+and source-restoration evidence, serial log, sample JSONL, analysis script and
+summary with the recorded QEMU environment. No builds or tests ran concurrently
+with these timed boots.
+
+### Scrub checkpoint reconstruction memo (2026-09-12)
+
+Scrub now creates a fresh 64 KiB / 32-entry verified-segment memo for each
+checkpoint reconstruction. It does not reuse mount or previous scrub proofs,
+and drops the memo before independent content, padding and authority-closure
+checks. The candidate recovery budget already excludes the mounted state and
+any predecessor witness; the helper additionally reserves the memo, reports
+that reservation in its peak, and drops/retries uncached on MemoryLimit.
+Other errors are returned without retry. Tight budgets below the reservation
+continue directly through uncached recovery.
+
+Host tests pass 233 cases with one ignored. A dedicated test verifies fewer
+checkpoint-recovery reads, no writes and successful uncached fallback under
+an insufficient cache budget. The typed scrub scratch-boundary test derives
+the mandatory peak without optional caching and still rejects one byte less.
+The corruption matrix now performs a healthy scrub before corrupting media,
+then requires the same instance's next scrub to detect each corruption.
+QEMU three-boot file-tree/GC/cold-recovery/powered-off verification passes,
+as does Duo release compilation.
+
+Two isolated runs on the same verified 32-file image and previous controlled
+QEMU setup measure scrub at 35.466881 / 35.465441 seconds. Compared with the
+preceding two-run baseline, the mean decreases from 48.785980 to 35.466161
+seconds (27.3%). Reads decrease from 160,686,080 bytes / 19,516 requests to
+115,859,456 / 14,188 (27.9% fewer bytes). Mount remains 0.467003 seconds;
+authority averages 0.003313 seconds. The measured phase sum decreases from
+49.256779 to 35.936477 seconds. All phases perform zero writes and flushes;
+both subsequent object samples pass validation. These are sequential baseline
+and candidate pairs, not an interleaved ABBA trial or a real SD measurement.
+
+Evidence is under `target/storage-scrub-recovery-memo-20260912/`: candidate ELF,
+source/restoration hashes, build/host/gate/Duo logs, retained gate evidence,
+serial log, samples and analysis summary. No builds or tests overlapped timed
+boots. Scrub still accounts for 98.7% of measured cold-recovery time; remaining
+content-validation scans and production delta admission remain open work.
+
+### Scrub content-pass segment memo (2026-09-12)
+
+Each independent content-verification pass now owns a fresh 64 KiB / 32-entry
+segment proof memo, shared by CAS delta/manifest reads and Blob descriptor
+validation. The memo is not shared with mount, checkpoint reconstruction,
+another content pass or another scrub. Payload SHA, Merkle-tree validation,
+zero-padding checks and allocation/generation bindings remain intact.
+
+The reservation is included in the pass's base resident bytes, alongside any
+retained current state and predecessor witness. Obvious insufficient budgets
+skip caching; MemoryLimit during a cached pass drops the memo and retries
+uncached, reporting a conservative peak. Other failures are not retried.
+The content pass now records its initial streaming workspace peak even before
+entering a manifest loop.
+
+Host tests pass 234 cases with one ignored. A dedicated eight-object packed
+batch test compares cached/uncached content checks: identical diagnostic
+results apart from memory peak, fewer reads, no writes, successful tight-budget
+fallback, and rejection one byte below mandatory scratch. Existing repeated
+scrub corruption tests, strict typed-closure memory boundary, QEMU three-boot
+file-tree/GC/cold-recovery/powered-off verification and Duo compilation pass.
+
+Two isolated runs on the same verified 32-file image and controlled QEMU
+configuration measure mean scrub at 9.427953 seconds, down from 35.466161
+seconds (73.4%). Both runs read 29,114,368 bytes in 3,774 requests, down from
+115,859,456 bytes / 14,188 requests (74.9% fewer bytes). Mount averages
+0.467619 seconds; authority 0.004976 seconds; the measured phase sum is
+9.900547 seconds. All measured phases perform zero writes/flushes, and both
+subsequent object samples validate. The two scrub improvements together reduce
+the earlier 48.785980-second scrub baseline by approximately 5.17x.
+
+Evidence: `target/storage-scrub-content-memo-20260912/` contains source/build
+and restoration evidence, ELF, host/gate/Duo logs, retained gate evidence,
+serial log, JSONL, analysis and comparison summaries. No builds/tests overlap
+timed boots. This is a sequential two-run comparison on one QEMU fixture, not
+real SD performance or whole-boot latency. Scrub still dominates the measured
+phase sum; production delta admission and complete heap accounting remain
+unfinished.
+
+### Scrub authority-closure segment memo (2026-09-12)
+
+The independent typed/file-tree semantic closure walk now uses its own fresh
+64 KiB / 32-entry verified-segment memo. The reservation is subtracted from
+the remaining graph decode budget after mounted state and semantic roots are
+accounted. Its peak is included in the reported decode peak; it is dropped
+before retaining the decoded result. On MemoryLimit, the memo is dropped and
+the original uncached decode retries with its full budget. Other errors are
+returned directly. No prior mount, content or scrub proof is reused, and no
+typed-edge cache is introduced.
+
+Host tests pass 235 cases with one ignored. A packed graph with four distinct
+typed-parent/raw-child pairs checks reduced reads, identical diagnostics
+apart from memory peak, low-budget uncached admission, optional-cache fallback
+and rejection below retained-root memory. Existing dangling-child, malformed
+typed content, repeated-media-corruption and mandatory typed-scratch boundary
+tests pass. QEMU three-boot file-tree/GC/cold-recovery/powered-off verification
+and Duo release compilation also pass.
+
+On the same verified 32-file image, with 128 MiB guest, 64 cached pages, one TCG
+hart and 4/2 MiB/s plus 400/200 IOPS limits, two isolated scrub measurements are
+2.581303 / 2.584533 seconds. Mean falls from 9.427953 to 2.582918 seconds
+(72.6%); reads fall from 29,114,368 bytes / 3,774 requests to 6,078,464 / 1,036
+(79.1% fewer bytes). Mount averages 0.467857 seconds and authority 0.006028;
+the measured phase sum is 3.056803 seconds. Both subsequent object samples
+validate, and all cold phases perform zero writes/flushes.
+
+Across the three scoped scrub memo changes, mean scrub falls from 48.785980
+to 2.582918 seconds (18.89x); the measured cold-phase sum falls from 49.256779
+to 3.056803 seconds (93.8%). These remain sequential two-run comparisons on
+one populated QEMU fixture, excluding between-phase gaps and whole boot time;
+they are not real SD measurements or general steady-state throughput claims.
+Evidence is in `target/storage-scrub-closure-memo-20260912/`: source/restoration
+hashes, ELF, build/host/gate/Duo logs, gate evidence, serial log, samples and
+analysis/comparison summaries. No builds or tests overlapped timed boots.
+
+### 128-file scaling and memo-capacity experiment (2026-09-12)
+
+The current unique-file benchmark rejects a single 128-file transaction before
+storage work because its per-transaction cap is 100. Preserve this admission
+limit. Instead, two 64-file unique batches with seeds 128/129 create and read
+back 128 distinct 4 KiB files. The independent native image verifier confirms
+128 data nodes, 128 dirents, 129 inodes, 8 tree nodes and 142 CAS objects.
+The retained image selects checkpoint generation 5; its predecessor retains
+the earlier 64-file publication, unlike the previous 32-file fixture. Thus
+raw ratios against that fixture do not isolate file-count scaling alone.
+
+Two controlled cold boots with the production 64 KiB scoped memos yield mean
+mount 1.439442 seconds (576 requests, 3,641,344 bytes), authority 0.003616
+seconds and scrub 13.449823 seconds (5,382 requests, 31,547,392 bytes).
+The measured phase sum is 14.892880 seconds; mount reports a 133,842-byte peak.
+Both subsequent object samples validate and all cold phases perform zero
+writes/flushes.
+
+A temporary experiment doubles only the four phase-local memo reservations
+to 128 KiB, preserving the 32-entry limit and the same 64-page block cache,
+128 MiB guest, image, hart and device throttles. Two boots yield mount
+1.440365 seconds and scrub 13.492389 seconds. Every phase's read request and
+byte count is identical to the 64 KiB version, while the mount-reported peak
+increases to 199,378 bytes. Both object samples validate. There is no measured
+I/O benefit from doubling these memos on this fixture; retain production
+64 KiB limits. All temporary source changes were restored after building.
+
+This does not establish cache sufficiency for every layout or device, but
+rules out a byte-capacity benefit from this specific doubling experiment.
+Further scaling work should separate predecessor/current verification costs
+and physical layout from current live-file count. Evidence lives under
+`target/storage-populated-128-20260912/`: rejected single-batch attempt,
+two-batch samples and retained image, independent verification, production
+cold samples/summary and the memo128 experiment/build/restoration evidence
+with memo-comparison.json. No builds/tests overlapped timed boots.
+
+### Reuse current content proof after exact publication equality (2026-09-12)
+
+Scrub already freshly verifies current contents before reconstructing both
+checkpoint slots. After recovering the newer checkpoint, it checks the strict
+predecessor transition and same_publication equality, including all catalog
+and CAS mappings, physical roots, allocation state and generations used by
+content verification. It no longer repeats the identical newer content pass
+after that equality succeeds. Older checkpoint contents remain independently
+verified; proofs are not reused between scrub invocations. No cache capacity
+or durable format changes.
+
+Host suites pass 236 tests with one ignored. A new regression removes one of
+two in-memory object mappings that deduplicate to the same valid Blob: the
+remaining mapping is content-valid and closed, but scrub must reject it as
+different from the independently reconstructed durable publication. Existing
+media-corruption and memory-boundary tests pass, along with QEMU three-boot
+file-tree/GC/cold-recovery/powered-off verification and Duo compilation.
+
+On the verified 128-file/two-batch image with the existing controlled QEMU
+setup, two scrub runs take 11.652875 / 11.652324 seconds. Mean decreases from
+13.449823 to 11.652600 seconds (13.36%). Reads decrease from 31,547,392 bytes /
+5,382 requests to 27,373,568 / 4,663 (13.23% fewer bytes). Both subsequent
+object samples validate; all cold phases perform zero writes and flushes.
+Mount averages 1.508318 seconds with unchanged 576 requests / 3,641,344 bytes;
+the measured phase sum is 13.164648 seconds. This is a sequential two-run
+comparison on one QEMU image, not a real SD or whole-boot measurement.
+
+Evidence: `target/storage-scrub-publication-reuse-20260912/` contains the ELF,
+build/source-restoration records, host/gate/Duo logs, retained gate evidence,
+serial log, samples, analysis and comparison summaries. No builds or tests
+overlapped timed boots.
+
+### Scrub adjacent metadata reads (2026-09-12)
+
+Segment header/seal and extent descriptor/seal verification now reads each
+adjacent pair through PageDevice::read_pages with the same two-page workspace.
+Both pages still pass the existing sealed-record decoder and binding checks.
+The pair buffer is dropped before payload streaming; exact payload hashing
+reuses one page buffer instead of allocating it anew for every page. No cache
+budget increase or change to SHA, zero-padding, semantic or fallback checks.
+Backends without a batched override retain the ordered read_page fallback.
+
+All 236 host tests pass with one ignored, including corrupt data/seals/padding
+and device-read errors. QEMU three-boot file-tree/GC/cold-recovery/powered-off
+verification and Duo release compilation pass. Two controlled boots from the
+verified 128-file image produce mean scrub 10.544453 seconds, versus 11.652600
+seconds previously (9.5% lower). Read bytes remain exactly 27,373,568, while
+requests decrease from 4,663 to 4,221 (9.5%). This isolates a request-count
+benefit under the existing 400 read-IOPS cap rather than reduced verification
+coverage. Both subsequent object samples validate, and cold phases perform
+zero writes/flushes. The measured phase sum is 11.991378 seconds.
+
+Evidence: `target/storage-scrub-pair-read-20260912/` contains candidate/build
+and source-restoration records, host/gate/Duo logs, retained gate evidence,
+serial log, samples and analysis/comparison summaries. No builds or tests
+overlap timed boots. These are sequential two-run QEMU comparisons; actual SD
+request latency and throughput remain unmeasured.
+
+### Return to steady object-write amplification (2026-09-12)
+
+The current firmware (including scoped scrub memos, publication proof reuse
+and adjacent metadata reads) completes two runs of 256 unique 4 KiB durable
+put/get samples on fresh images. All 512 samples validate. The setup retains
+the 128 MiB guest, 64-page block cache, single TCG hart and existing device
+throttles. Per-sample block counters are identical to the earlier production
+run in `target/storage-current-production-abba-20260912/after.jsonl`.
+
+Each run reads 8,097,792 bytes / 1,565 requests and writes 53,694,464 bytes /
+1,862 requests with 825 flushes. User payload is 1 MiB per run, giving 51.207x
+host block-write amplification (not SD-internal NAND/FTL amplification).
+Measured sample-latency sums are 11.573399 / 11.643028 seconds, median
+29.274 / 29.2765 ms. These sums exclude shell/runner gaps, during which QEMU
+throttle credit can replenish; they must not be converted into sustained
+device throughput or compared directly with whole-run bandwidth limits.
+
+Samples 206 and 234 coincide with two GC rounds each and take approximately
+1.54 and 1.90 seconds in both runs. In the first run they consume 29.7% of
+summed sample latency but only 3,252,224 of 53,694,464 written bytes. The
+remaining 254 samples still write 50,442,240 bytes. Thus GC dominates the
+largest observed latency spikes, while reducing total write amplification
+requires attention to ordinary publication as well. Cold-recovery gains do
+not establish a steady-write improvement; no such improvement is claimed.
+
+Evidence: `target/storage-steady-current-20260912/` contains serial log,
+512 JSONL samples, analysis/summary and attribution.json. No builds or tests
+overlapped the timed runs. Production delta publication and its full memory
+accounting/admission requirements remain open work.
+
+### Experimental authority delta across growth (2026-09-12)
+
+Add a host regression for the test-only authority delta prototype on the
+growable fault-media device. Starting with eight admitted segments and twelve
+available, publish a full authority base and a delta, grow by four segments,
+power-cycle and cold-mount with the expanded parent range, then append another
+delta without a warm predecessor witness. A second cold mount must reproduce
+the complete encoded authority snapshot exactly and scrub Healthy.
+
+The test checks that both appends physically contain VIBEAUL1, that growth
+retains the original delta root rather than silently materializing a snapshot,
+and that cold mount performs no mutations. It uses a governed runtime with
+the same quota-policy admission as existing authority tests. All 237 host
+tests pass with one ignored; evidence is in
+`target/storage-delta-growth-20260912/host.log`.
+
+This closes a successful-growth/context-change coverage gap only. It does not
+qualify delta-specific power cuts during growth, full replay heap budgeting,
+production format admission or real-device performance. No production delta
+writer was enabled and no write-amplification improvement is claimed here.
+
+### Experimental delta growth failure and cancellation matrix (2026-09-12)
+
+Extend the growth regression across all 17 mutation boundaries of the actual
+growth operation. At each boundary inject not-submitted failure, ambiguous
+failure with no/visible/durable effect, and cancellation with no/visible/durable
+effect: 119 cases. Every injected boundary must be reached, and the interrupted
+store must require recovery. After power cycling and exposing the full parent
+range, recovery must match the complete old or new StoreInfo state, retain the
+delta root, and reconstruct the exact encoded authority snapshot. Cold mount
+and scrub must leave the durable image unchanged and perform no mutations.
+
+Every recovered case then publishes another experimental delta and cold-mounts
+again, requiring exact successor authority bytes. This checks continued writer
+usability after both old-state and new-state recovery, not just readability.
+The full host suite passes 237 tests with one ignored; the matrix extends an
+existing test. Evidence: `target/storage-delta-growth-cuts-20260912/` contains
+the targeted boundary-count run and final host.log including resumed appends.
+
+The fixture contains Format/IdHighWater authority records, so this matrix does
+not establish live-object/grant behavior across growth cuts. The prototype is
+still test-only; production admission, total replay heap accounting and real
+SD measurements remain unfinished. No performance claim is made this turn.
+
+### Live object and grant across delta growth cuts (2026-09-12)
+
+Parameterize the experimental delta growth matrix and add a live fixture with
+a distinct-pattern 4 KiB object, one root READ grant and governed quota policy.
+Both metadata-only and live fixtures still cover 17 growth boundaries with
+seven failure/cancellation effects, now 238 cases total. Every live case
+checks exact authority reconstruction, the unchanged root grant, persistent
+handle resolution, complete payload bytes and canonical logical/physical quota
+usage after recovery. It then appends another delta, cold-recovers and repeats
+the object/grant/quota checks. Recovery remains read-only and must select the
+complete old or new growth state; scrub must be Healthy.
+
+The live fixture physically publishes VIBEAUL1 before and after growth, so
+the test does not accidentally qualify only full-snapshot fallback. A shared
+host-test fixture helper derives the same object/grant records used by the
+existing live delta GC test. All 238 host tests pass with one ignored. Evidence:
+`target/storage-delta-growth-live-20260912/live.log` records the live matrix's
+119 cases; host.log contains the full suite including the metadata matrix.
+
+This closes the previously documented live-object growth-cut coverage gap
+for this fixture. It does not enable production delta admission or establish
+complete replay heap bounds, arbitrary graph coverage or SD performance.
+
+### Single-buffer experimental delta envelope (2026-09-12)
+
+Physical-link encoding previously allocated an inner delta Vec, then a second
+Vec for the physical header plus a copy of that delta. The shared encoder now
+accepts reserved prefix space and emits the payload directly after it. Link
+encoding fills the prefix in place, eliminating the separately owned complete
+inner payload and its copy. Raw codec encoding uses a zero-length prefix. The
+physical-size saving/fallback decision still includes the link header.
+
+A regression compares raw payload bytes against prefixed output and decoded
+physical-link payload, checks zeroed reserved prefix bytes, exact no-saving
+fallback and overflowing prefix rejection. Existing multi-extent, corruption,
+publication/GC and live growth-cut tests pass. Replay additionally checks the
+actual successor Vec capacity while predecessor and delta are still live,
+instead of relying only on requested length for the overlap peak. An allocator
+over-reservation is detected after allocation; this is not an allocator-level
+hard cap. All 239 host tests pass with one ignored; evidence:
+`target/storage-delta-single-buffer-20260912/host.log`.
+
+This reduces an explicit encoder temporary allocation and strengthens owned
+buffer accounting. Semantic decoder/preflight allocations and source scan
+workspace remain outside that budget, so total replay heap bounds and
+production delta admission are still incomplete. No QEMU/SD speedup is claimed.

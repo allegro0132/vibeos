@@ -1761,6 +1761,36 @@ impl<D: PageDevice> SegmentStore<D> {
         Ok((view, transient_objects))
     }
 
+    #[cfg(test)]
+    pub(crate) async fn publish_experimental_delta_for_test(
+        &mut self,
+        snapshot: PersistentAuthoritySnapshot,
+    ) -> Result<(), PersistentAuthorityError<D::Error>> {
+        let state = self.require_current_generation()?.clone();
+        // Consume before any fallible work, so failure/cancellation cannot
+        // retain a witness for a publication with an ambiguous outcome.
+        let cached = self.experimental_authority_base.take();
+        let (bytes, depth) = crate::authority_delta::encode_next_for_test(
+            &self.device, &state, &snapshot, self.limits.recovery_memory_bytes, cached.as_ref(),
+        ).await?;
+        self.publish_persistent_snapshot(state, snapshot.checkpoint_generation(), bytes, &snapshot).await?;
+        self.experimental_authority_base = Some(crate::authority_delta::VerifiedBaseForTest::from_published(
+            self.require_current_generation()?, depth,
+        )?);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn publish_full_snapshot_for_test(
+        &mut self,
+        snapshot: PersistentAuthoritySnapshot,
+    ) -> Result<(), PersistentAuthorityError<D::Error>> {
+        let state = self.require_current_generation()?.clone();
+        let bytes = encode_persistent_authority_snapshot(&snapshot)
+            .map_err(PersistentAuthorityError::Snapshot)?;
+        self.publish_persistent_snapshot(state, snapshot.checkpoint_generation(), bytes, &snapshot).await
+    }
+
     async fn publish_persistent_snapshot(
         &mut self,
         state: MountedState,

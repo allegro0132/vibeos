@@ -409,6 +409,151 @@ fn same_selected_state(left: crate::StoreInfo, right: crate::StoreInfo) -> bool 
 }
 
 #[test]
+fn experimental_authority_delta_survives_growth_and_post_growth_append() {
+    exercise_delta_growth(false);
+}
+
+#[test]
+fn experimental_live_authority_delta_survives_growth_cuts() {
+    exercise_delta_growth(true);
+}
+
+fn exercise_delta_growth(has_object: bool) {
+    use vibeos_durable_format::{RecordBody, RecordChain};
+    use crate::{PersistentAuthorityImport, PersistentAuthoritySnapshot, root_policy_commitment};
+    let device = MemoryDevice::blank(8, 12);
+    let (runtime, _, provisioner) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut store = format_with_runtime(device.clone(), runtime, [9; 16]);
+    let maintenance = store.provision_maintenance_root(&provisioner).unwrap();
+    let (store_id, policy, roots, seed_records, payload) =
+        crate::persistent_authority_tests::delta_growth_fixture(has_object);
+    let import = PersistentAuthorityImport::from_m4(&seed_records, store_id, &roots, policy, Vec::new()).unwrap();
+    block_on(store.import_persistent_authority(&maintenance, import)).unwrap();
+    let preflight = vibeos_durable_format::preflight_recovery(&seed_records, store_id).unwrap();
+    let mut chain = RecordChain::from_checkpoint(store_id, preflight.chain_checkpoint().unwrap()).unwrap();
+    let mut records: Vec<u8> = seed_records.iter().flatten().copied().collect();
+    use crate::persistent_authority_tests::assert_delta_growth_object as check_object;
+    check_object(&store, &payload);
+    for step in 1..=2 {
+        let state = store.mounted.as_ref().unwrap();
+        let base = state.persistent_authority.as_ref().unwrap();
+        records.extend_from_slice(&chain.append(None, RecordBody::IdHighWater {
+            exclusive_end: step * 32,
+        }).unwrap());
+        let next = PersistentAuthoritySnapshot::new(state.generation + 1,
+            root_policy_commitment(policy), records.clone(), base.objects.clone(), base.principals().to_vec()).unwrap();
+        block_on(store.publish_experimental_delta_for_test(next)).unwrap();
+        let delta_root = store.mounted.as_ref().unwrap().authority_root;
+        assert!(pointer_payload(&device.durable_image(), delta_root).starts_with(b"VIBEAUL1"));
+        if step == 1 {
+            let expected = crate::encode_persistent_authority_snapshot(
+                store.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap();
+            let before = store.info().unwrap();
+            let seed_image = device.durable_image();
+            device.reset_io();
+            let info = block_on(store.grow(&maintenance, adjacent_range(8, 4))).unwrap();
+            let boundaries = device.io_counts().1;
+            assert!(boundaries > 10);
+            for boundary in 0..boundaries {
+                for action in [FaultAction::FailNotSubmitted,
+                    FaultAction::FailAmbiguous(Effect::None),
+                    FaultAction::FailAmbiguous(Effect::Visible),
+                    FaultAction::FailAmbiguous(Effect::Durable),
+                    FaultAction::Pending(Effect::None),
+                    FaultAction::Pending(Effect::Visible),
+                    FaultAction::Pending(Effect::Durable)]
+                {
+                    let cut = MemoryDevice::from_durable(8, 12, seed_image.clone());
+                    let (runtime, _, provisioner) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+                    let mut candidate = SegmentStore::new_with_runtime_context(cut.clone(), limits(), runtime);
+                    block_on(candidate.mount()).unwrap();
+                    let authority = candidate.provision_maintenance_root(&provisioner).unwrap();
+                    cut.arm(boundary, action);
+                    if matches!(action, FaultAction::Pending(_)) {
+                        let mut future = Box::pin(candidate.grow(&authority, adjacent_range(8, 4)));
+                        assert!(matches!(poll_once(future.as_mut()), Poll::Pending),
+                            "unreached boundary {boundary}: {action:?}");
+                        drop(future);
+                    } else {
+                        assert!(block_on(candidate.grow(&authority, adjacent_range(8, 4))).is_err(),
+                            "unreached boundary {boundary}: {action:?}");
+                    }
+                    assert_eq!(candidate.info(), Err(StoreError::RecoveryRequired));
+                    cut.power_cycle();
+                    cut.expose_full_parent_range();
+                    let durable = cut.durable_image();
+                    let (runtime, _, provisioner) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+                    let mut recovered = SegmentStore::new_with_runtime_context(cut.clone(), limits(), runtime);
+                    let recovered_info = block_on(recovered.mount()).unwrap_or_else(|error|
+                        panic!("boundary {boundary}: {action:?}: {error:?}"));
+                    assert!(same_selected_state(recovered_info, before) || same_selected_state(recovered_info, info),
+                        "mixed state at boundary {boundary}: {action:?}");
+                    let state = recovered.mounted.as_ref().unwrap();
+                    assert_eq!(state.authority_root, delta_root);
+                    assert_eq!(crate::encode_persistent_authority_snapshot(
+                        state.persistent_authority.as_ref().unwrap()).unwrap(), expected);
+                    assert_eq!(cut.io_counts().1, 0);
+                    let authority = recovered.provision_maintenance_root(&provisioner).unwrap();
+                    assert_eq!(block_on(recovered.scrub(&authority)).unwrap().status, crate::ScrubStatus::Healthy,
+                        "scrub boundary {boundary}: {action:?}");
+                    assert_eq!(cut.io_counts().1, 0);
+                    assert_eq!(cut.durable_image(), durable);
+                    check_object(&recovered, &payload);
+                    let preflight = vibeos_durable_format::preflight_recovery(records.as_chunks::<512>().0, store_id).unwrap();
+                    let mut resume_chain = RecordChain::from_checkpoint(store_id, preflight.chain_checkpoint().unwrap()).unwrap();
+                    let mut resumed_records = records.clone();
+                    resumed_records.extend_from_slice(&resume_chain.append(None,
+                        RecordBody::IdHighWater { exclusive_end: 64 }).unwrap());
+                    let state = recovered.mounted.as_ref().unwrap();
+                    let next = PersistentAuthoritySnapshot::new(state.generation + 1,
+                        root_policy_commitment(policy), resumed_records, state.persistent_authority.as_ref().unwrap().objects.clone(),
+                        state.persistent_authority.as_ref().unwrap().principals().to_vec()).unwrap();
+                    block_on(recovered.publish_experimental_delta_for_test(next)).unwrap();
+                    let expected_resume = crate::encode_persistent_authority_snapshot(
+                        recovered.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap();
+                    cut.power_cycle();
+                    let (runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+                    let mut resumed = SegmentStore::new_with_runtime_context(cut.clone(), limits(), runtime);
+                    block_on(resumed.mount()).unwrap();
+                    assert_eq!(crate::encode_persistent_authority_snapshot(
+                        resumed.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap(), expected_resume);
+                    check_object(&resumed, &payload);
+                    assert_eq!(cut.io_counts().1, 0);
+                }
+            }
+            std::println!("experimental delta growth: {boundaries} boundaries, {} failure/cancel cases", boundaries * 7);
+            assert_eq!(info.admitted_segments, 12);
+            assert_eq!(store.mounted.as_ref().unwrap().authority_root, delta_root);
+            device.power_cycle();
+            device.expose_full_parent_range();
+            let (runtime, _, _) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+            let mut cold = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+            block_on(cold.mount()).unwrap();
+            assert_eq!(crate::encode_persistent_authority_snapshot(
+                cold.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap(), expected);
+            assert_eq!(device.io_counts().1, 0);
+            // The next append now has no warm predecessor witness and must
+            // authenticate ancestors under the expanded allocation context.
+            store = cold;
+        }
+    }
+    let expected = crate::encode_persistent_authority_snapshot(
+        store.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap();
+    let image = device.durable_image();
+    device.power_cycle();
+    let (runtime, _, provisioner) = StoreRuntimeContext::governed_with_maintenance_provisioner().unwrap();
+    let mut cold = SegmentStore::new_with_runtime_context(device.clone(), limits(), runtime);
+    assert_eq!(block_on(cold.mount()).unwrap().admitted_segments, 12);
+    assert_eq!(crate::encode_persistent_authority_snapshot(
+        cold.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap(), expected);
+    assert_eq!(device.io_counts().1, 0);
+    assert_eq!(device.durable_image(), image);
+    check_object(&cold, &payload);
+    let maintenance = cold.provision_maintenance_root(&provisioner).unwrap();
+    assert_eq!(block_on(cold.scrub(&maintenance)).unwrap().status, crate::ScrubStatus::Healthy);
+}
+
+#[test]
 fn grow_publishes_exact_free_suffix_before_it_is_reported() {
     let device = MemoryDevice::blank(8, 12);
     let mut store = format_with_runtime(device.clone(), StoreRuntimeContext::new(), [1; 16]);

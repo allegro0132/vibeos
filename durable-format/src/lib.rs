@@ -1840,6 +1840,7 @@ enum IdClass {
 #[derive(Clone)]
 pub struct PreflightReplay {
     store_id: StoreId,
+    retain_object_bytes: bool,
     poisoned: bool,
     total_sectors: usize,
     valid_records: u64,
@@ -1863,6 +1864,7 @@ impl PreflightReplay {
     pub fn new(store_id: StoreId) -> Self {
         Self {
             store_id,
+            retain_object_bytes: true,
             poisoned: false,
             total_sectors: 0,
             valid_records: 0,
@@ -2221,7 +2223,9 @@ impl PreflightReplay {
                     prepared.chunk_digest.update(&decoded.crc32c.to_le_bytes());
                     prepared.content_digest.update(&chunk.data);
                     prepared.byte_len += chunk.data.len();
-                    prepared.bytes.extend_from_slice(&chunk.data);
+                    if self.retain_object_bytes {
+                        prepared.bytes.extend_from_slice(&chunk.data);
+                    }
                     prepared.next_chunk += 1;
                 }
                 RecordBody::ObjectCommit(commit) => {
@@ -2269,7 +2273,7 @@ impl PreflightReplay {
                     {
                         return Err(RecoveryError::ObjectContentCrcMismatch { sequence });
                     }
-                    let byte_len = prepared.bytes.len() as u64;
+                    let byte_len = prepared.byte_len as u64;
                     committed_objects.push(RecoveredObject {
                         object_id: prepared.metadata.object_id,
                         object_kind: prepared.metadata.object_kind,
@@ -2337,6 +2341,13 @@ impl PreflightReplay {
         if self.valid_records == 0 {
             return Err(RecoveryError::MissingFormat);
         }
+        // Append-time identity/transaction checks are complete. These indexes
+        // are not part of the recovered graph; release them (including any
+        // unfinished inline-object buffer) before allocating graph/slot maps.
+        drop(self.transactions);
+        drop(self.id_classes);
+        drop(self.seen_derivations);
+        drop(self.seen_objects);
         let mut graph: BTreeMap<DerivationId, RecoveredGrant> = BTreeMap::new();
         let mut object_kinds: BTreeMap<ObjectId, ResourceKind> = BTreeMap::new();
         for recovered in &self.committed {
@@ -2386,6 +2397,7 @@ impl PreflightReplay {
             graph.insert(grant.derivation_id, recovered.clone());
         }
 
+        drop(object_kinds);
         let mut slots: BTreeMap<(SpaceId, u32), (u64, DerivationId)> = BTreeMap::new();
         for recovered in &self.committed {
             let key = (recovered.grant.target.space, recovered.grant.target.slot);
@@ -2443,6 +2455,30 @@ impl PreflightReplay {
             last_sequence: self.previous_sequence,
             last_crc32c: self.previous_crc,
         })
+    }
+}
+
+/// Semantic validation without retaining inline object content. This wrapper
+/// cannot yield recovered objects or a RecoveryPreflight: its only output is
+/// the validated final sequence. Length, CRC, transaction and graph checks use
+/// the same replay implementation as ordinary recovery.
+pub struct PreflightValidator {
+    replay: PreflightReplay,
+}
+
+impl PreflightValidator {
+    pub fn new(store_id: StoreId) -> Self {
+        let mut replay = PreflightReplay::new(store_id);
+        replay.retain_object_bytes = false;
+        Self { replay }
+    }
+
+    pub fn append(&mut self, sectors: &[[u8; RECORD_SIZE]]) -> Result<(), RecoveryError> {
+        self.replay.append(sectors)
+    }
+
+    pub fn finish(self) -> Result<u64, RecoveryError> {
+        self.replay.finish().map(|validated| validated.last_sequence())
     }
 }
 
@@ -2590,4 +2626,44 @@ fn get_u64(bytes: &[u8], at: usize) -> u64 {
 }
 fn get_u128(bytes: &[u8], at: usize) -> u128 {
     u128::from_le_bytes(bytes[at..at + 16].try_into().expect("fixed record field"))
+}
+
+#[cfg(test)]
+mod validator_tests {
+    use super::*;
+
+    #[test]
+    fn validation_discards_inline_content_and_matches_recovery_prefixes() {
+        let store = StoreId::new(7).unwrap();
+        let mut chain = RecordChain::new(store);
+        let mut records = alloc::vec![chain.append(None, RecordBody::Format).unwrap(),
+            chain.append(None, RecordBody::IdHighWater { exclusive_end: 32 }).unwrap()];
+        let payload = alloc::vec![0x59; 32 * 1024];
+        records.extend(encode_object_transaction(&mut chain, TransactionId::new(3).unwrap(),
+            ObjectId::new(4).unwrap(), ObjectKind::new(5).unwrap(), &payload).unwrap().records);
+        let recovered = preflight_recovery(&records, store).unwrap();
+        assert_eq!(recovered.committed_objects()[0].bytes, payload);
+        for len in 1..=records.len() {
+            let expected = preflight_recovery(&records[..len], store).map(|v| v.last_sequence());
+            let mut validator = PreflightValidator::new(store);
+            for batch in records[..len].chunks(32) {
+                validator.append(batch).unwrap();
+                for state in validator.replay.transactions.values() {
+                    if let TxState::ObjectPrepared(prepared) = state {
+                        assert_eq!(prepared.bytes.capacity(), 0);
+                    }
+                }
+                for object in &validator.replay.committed_objects {
+                    assert_eq!(object.bytes.capacity(), 0);
+                }
+            }
+            assert_eq!(validator.finish(), expected, "prefix {len}");
+        }
+        let mut invalid = records.clone();
+        invalid.swap(32, 33);
+        let mut validator = PreflightValidator::new(store);
+        assert!(validator.append(&invalid).is_err());
+        assert!(validator.append(&records).is_err(), "failed builder must remain poisoned");
+        assert!(validator.finish().is_err());
+    }
 }

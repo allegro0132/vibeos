@@ -45,6 +45,17 @@ use crate::block_device::{self, BlockDevice, BlockError};
 use crate::world::Space;
 use crate::{exec, heap, sync::SpinLock};
 
+#[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+fn emit_cold_phase(phase: &str, started: (u64, crate::virtio_blk::BlockTelemetry), success: bool) {
+    let elapsed = crate::sbi::time().saturating_sub(started.0);
+    let io = crate::virtio_blk::telemetry().saturating_sub(started.1);
+    crate::uart::_print(format_args!(
+        "VIBE_STORAGE_COLD_PHASE {{\"schema\":\"vibeos.storage-bench.cold-phase\",\"version\":1,\"phase\":\"{}\",\"status\":\"{}\",\"elapsed_ticks\":{},\"timebase_hz\":{},\"read_requests\":{},\"read_bytes\":{},\"write_requests\":{},\"write_bytes\":{},\"flush_requests\":{}}}\n",
+        phase, if success { "ok" } else { "error" }, elapsed, crate::exec::timebase_hz(),
+        io.read_requests, io.read_bytes, io.write_requests, io.write_bytes, io.flush_requests,
+    ));
+}
+
 const LOGICAL_BLOCK_SIZE: usize = 512;
 const BLOCKS_PER_PAGE: u64 = (PAGE_SIZE / LOGICAL_BLOCK_SIZE) as u64;
 
@@ -1862,10 +1873,26 @@ impl StorageV2Runtime {
         // early failures first release the exact operation epoch and then
         // atomically invalidate the previously published runtime cache.
         let recovered = async {
-            let info =
-                poll_as_system(operation.store().mount())
-                    .await
-                    .map_err(|error| match error {
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            let mount_io_started = crate::virtio_blk::telemetry();
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            let mount_started = crate::sbi::time();
+            let mounted = poll_as_system(operation.store().mount()).await;
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            {
+                let ticks = crate::sbi::time().saturating_sub(mount_started);
+                let io = crate::virtio_blk::telemetry().saturating_sub(mount_io_started);
+                let (status, generation, peak) = match &mounted {
+                    Ok(info) => ("ok", info.generation, info.recovery_peak_bytes),
+                    Err(_) => ("error", 0, 0),
+                };
+                crate::uart::_print(format_args!(
+                    "VIBE_STORAGE_MOUNT {{\"schema\":\"vibeos.storage-bench.mount\",\"version\":1,\"status\":\"{}\",\"generation\":{},\"elapsed_ticks\":{},\"timebase_hz\":{},\"read_requests\":{},\"read_bytes\":{},\"write_requests\":{},\"write_bytes\":{},\"flush_requests\":{},\"recovery_peak_bytes\":{}}}\n",
+                    status, generation, ticks, crate::exec::timebase_hz(), io.read_requests,
+                    io.read_bytes, io.write_requests, io.write_bytes, io.flush_requests, peak,
+                ));
+            }
+            let info = mounted.map_err(|error| match error {
                         vibeos_segment_store::StoreError::Unformatted => {
                             V2RuntimeError::Unformatted
                         }
@@ -1897,6 +1924,8 @@ impl StorageV2Runtime {
             // writers replenish capacity themselves (with hysteresis) on
             // their first commit instead.
             *self.last_info.lock() = Some(info);
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            let authority_started = (crate::sbi::time(), crate::virtio_blk::telemetry());
             let view = poll_as_system(recover_recognized_persistent_authority(
                 operation.store(),
                 expected_policy_sha256,
@@ -1992,9 +2021,15 @@ impl StorageV2Runtime {
                     }
                 }
             };
-            let scrub = poll_as_system(operation.store().scrub(&maintenance))
-                .await
-                .map_err(|_| V2RuntimeError::Corrupt)?;
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            emit_cold_phase("authority", authority_started, true);
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            let scrub_started = (crate::sbi::time(), crate::virtio_blk::telemetry());
+            let scrub = poll_as_system(operation.store().scrub(&maintenance)).await;
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            emit_cold_phase("scrub", scrub_started,
+                scrub.as_ref().is_ok_and(|report| report.status == ScrubStatus::Healthy));
+            let scrub = scrub.map_err(|_| V2RuntimeError::Corrupt)?;
             // A crash may durably publish anonymous CAS extents/checkpoints
             // before the atomic authority snapshot which would bind them.
             // Scrub may therefore be newer than authority, never older.

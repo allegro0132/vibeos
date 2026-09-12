@@ -306,9 +306,9 @@ def canonical_m4_stream(image: bytes | bytearray) -> tuple[bytes, Any]:
     return bytes(records), state
 
 
-def recover_record_stream(record_stream: bytes) -> Any:
+def recover_record_stream(record_stream: bytes, *, expected_store_id: int = legacy_codec.STORE_ID) -> Any:
     state = legacy_codec.recover_record_stream(
-        record_stream, max_records=MAX_AUTHORITY_RECORDS, allow_external=True,
+        record_stream, max_records=MAX_AUTHORITY_RECORDS, allow_external=True, expected_store_id=expected_store_id,
     )
     require(state.formatted, "persistent authority record stream is not formatted")
     return state
@@ -577,12 +577,14 @@ class AuthorityPolicy:
 
     external_policy: bytes
     exact_objects: Callable[[Any], dict[int, tuple[int, bytes, int]]]
+    store_id: int = legacy_codec.STORE_ID
 
     def __post_init__(self) -> None:
         require(
             isinstance(self.external_policy, bytes) and bool(self.external_policy),
             "external authority policy must be non-empty immutable bytes",
         )
+        require(isinstance(self.store_id, int) and 0 < self.store_id < 1 << 128, "invalid authority store identity")
         require(callable(self.exact_objects), "exact authority selector is not callable")
 
 
@@ -992,12 +994,118 @@ def parse_checkpoint_allocation(
     return allocation, version
 
 
+def resolve_authority_payload(resolver, pointer, label, maximum=MAX_AUTHORITY_BYTES):
+    """Authenticate each extent and assemble one bounded authority generation."""
+    require(pointer.get("status") == "value" and pointer["exact_byte_len"] <= maximum,
+            f"{label} first extent exceeds remaining payload budget")
+    first, first_payload = resolver.resolve(pointer, gc_verifier.EXTENT_AUTHORITY, label)
+    require(first["extent_index"] == 0 and first["encoded_offset"] == 0,
+            f"{label} must start at extent zero")
+    count = first["extent_count"]
+    require(0 < count <= MAX_AUTHORITY_BYTES // storage_codec.PAGE_SIZE,
+            f"{label} extent count exceeds budget")
+    require(0 < first["encoded_blob_len"] <= maximum,
+            f"{label} payload exceeds budget")
+    generation = first["binding"]["target_checkpoint_generation"]
+    entries = [(first, first_payload, pointer)]
+    consumed = len(first_payload)
+    if count > 1:
+        for segment in resolver.segments:
+            number = segment["segment_no"]
+            if number >= resolver.checkpoint["record"]["admitted_segments"]:
+                continue
+            if resolver.allocation["states"][number] != gc_verifier.SEGMENT_ALLOCATED:
+                continue
+            # An allocated segment participates in the search and must be sealed.
+            require(segment.get("status") == "sealed", f"{label} unsealed allocated segment")
+            for framed in segment.get("extents", []):
+                extent = framed.get("record", {})
+                binding = extent.get("binding", {})
+                if (extent.get("extent_kind") != gc_verifier.EXTENT_AUTHORITY
+                        or binding.get("target_checkpoint_generation") != generation):
+                    continue
+                sibling = {
+                    "status": "value", "store_uuid": binding["store_uuid"],
+                    "segment_no": number, "segment_generation": binding["generation"],
+                    "descriptor_relative_page": binding["self_page"] - storage_codec.segment_base_page(number),
+                    "payload_relative_page": extent["payload_first_relative_page"],
+                    "payload_pages": extent["payload_pages"], "ordinal": binding["ordinal"],
+                    "exact_byte_len": extent["payload_byte_len"],
+                    "extent_kind": gc_verifier.EXTENT_AUTHORITY,
+                    "payload_sha256": extent["payload_sha256"],
+                }
+                if storage_codec.pointer_identity(sibling) == storage_codec.pointer_identity(pointer):
+                    continue
+                require(len(entries) < count, f"{label} excess matching extents")
+                require(sibling["exact_byte_len"] <= maximum - consumed,
+                        f"{label} cumulative payload exceeds budget")
+                verified, payload = resolver.resolve(sibling, gc_verifier.EXTENT_AUTHORITY, label)
+                consumed += len(payload)
+                entries.append((verified, payload, sibling))
+    require(len(entries) == count, f"{label} missing extents")
+    entries.sort(key=lambda entry: entry[0]["extent_index"])
+    total = 0
+    for index, (extent, payload, _) in enumerate(entries):
+        require(extent["extent_index"] == index and extent["extent_count"] == count,
+                f"{label} duplicate or inconsistent extent index/count")
+        require(all(extent[key] == first[key] for key in
+                    ("object_kind", "content_byte_len", "encoded_blob_len", "merkle_root")),
+                f"{label} inconsistent extent metadata")
+        require(extent["encoded_offset"] == total == index * first["payload_byte_len"],
+                f"{label} noncontiguous extent offsets")
+        require(hashlib.sha256(payload).digest() == extent["payload_sha256"],
+                f"{label} extent digest mismatch")
+        total += len(payload)
+        require(total <= maximum, f"{label} cumulative payload exceeds budget")
+    require(total == first["encoded_blob_len"] == first["content_byte_len"],
+            f"{label} logical length mismatch")
+    payload = b"".join(entry[1] for entry in entries)
+    require(hashlib.sha256(payload).digest() == first["merkle_root"],
+            f"{label} complete payload digest mismatch")
+    return first, payload, [entry[2] for entry in entries]
+
+
+def reconstruct_experimental_authority(resolver, payload, target_generation, context, generation, store_id):
+    """Opt-in delta-chain verification; every ancestor extent resolves on media."""
+    codec = load_module("authority-delta-codec.py", "vibeos_image_delta_codec")
+    pending = []
+    pointers = []
+    seen = set()
+    consumed = len(payload)
+    while payload.startswith(b"VIBEAUL1"):
+        require(len(payload) >= 256 and len(pending) < 32, "experimental delta depth/length")
+        require(codec.integer(payload, 120) == target_generation, "delta extent generation mismatch")
+        pointer_bytes = payload[16:112]
+        pointer = storage_codec.parse_pointer(pointer_bytes)
+        identity = storage_codec.pointer_identity(pointer) if pointer.get("status") == "value" else None
+        require(identity is not None and identity not in seen, "delta null/cyclic predecessor")
+        seen.add(identity)
+        pending.append((payload, pointer_bytes))
+        extent, payload, parts = resolve_authority_payload(resolver, pointer,
+            "experimental authority ancestor", maximum=MAX_AUTHORITY_BYTES - consumed)
+        pointers.extend(parts)
+        target_generation = extent["binding"]["target_checkpoint_generation"]
+        consumed += len(payload)
+        require(consumed <= MAX_AUTHORITY_BYTES, "experimental chain payload budget")
+    require(codec.integer(payload, 16) == target_generation, "base extent generation mismatch")
+    depth = 0
+    for link, pointer_bytes in reversed(pending):
+        try:
+            payload = codec.reconstruct(payload, link, pointer_bytes, depth,
+                **context, checkpoint_generation=generation, expected_store_id=store_id)
+        except ValueError as error:
+            raise Violation(str(error)) from error
+        depth += 1
+    return payload, pointers, depth
+
+
 def reconstruct_v2_checkpoint(
     region: memoryview,
     structural: dict[str, Any],
     *,
     require_authority: bool,
     authority_policy: AuthorityPolicy = DEFAULT_AUTHORITY_POLICY,
+    allow_experimental_delta: bool = False,
 ) -> dict[str, Any]:
     checkpoint = structural["checkpoint"]
     require(checkpoint is not None, "V2 has no selected checkpoint")
@@ -1070,20 +1178,19 @@ def reconstruct_v2_checkpoint(
     authority_generation = 0
     authority_state = None
     authority_objects: dict[int, tuple[int, bytes, int]] = {}
+    authority_ancestors = []
+    authority_depth = 0
     if authority_pointer["status"] == "value":
-        authority_extent, authority_payload = resolver.resolve(
-            authority_pointer,
-            gc_verifier.EXTENT_AUTHORITY,
-            "persistent authority root",
-            metadata=True,
-        )
-        require(
-            hashlib.sha256(authority_payload).digest()
-            == authority_pointer["payload_sha256"],
-            "V2 authority payload digest mismatch",
-        )
+        authority_extent, authority_payload, authority_parts = resolve_authority_payload(
+            resolver, authority_pointer, "persistent authority root")
+        authority_ancestors.extend(authority_parts[1:])
         authority_generation = authority_extent["binding"]["target_checkpoint_generation"]
         require(authority_generation <= generation, "V2 authority targets a future checkpoint")
+        if authority_payload.startswith(b"VIBEAUL1"):
+            require(allow_experimental_delta, "experimental authority delta admission is disabled")
+            authority_payload, delta_ancestors, authority_depth = reconstruct_experimental_authority(
+                resolver, authority_payload, authority_generation, context, generation, authority_policy.store_id)
+            authority_ancestors.extend(delta_ancestors)
         authority = parse_authority_snapshot(
             authority_payload,
             authority_generation,
@@ -1100,6 +1207,9 @@ def reconstruct_v2_checkpoint(
         add_physical_pointer(physical_pointers, allocation_pointer, "allocation-v2 root")
     if authority_pointer["status"] == "value":
         add_physical_pointer(physical_pointers, authority_pointer, "persistent authority root")
+
+    for ancestor in authority_ancestors:
+        add_physical_pointer(physical_pointers, ancestor, "experimental authority ancestor")
 
     objects: dict[int, dict[str, Any]] = {}
     blobs: dict[tuple[int, int, int, bytes], dict[str, Any]] = {}
@@ -1272,7 +1382,7 @@ def reconstruct_v2_checkpoint(
         )
 
     if authority is not None:
-        authority_state = recover_record_stream(authority["record_stream"])
+        authority_state = recover_record_stream(authority["record_stream"], expected_store_id=authority_policy.store_id)
         authority_objects = select_verified_authority_objects(
             authority_state, contents, authority_policy
         )
@@ -1289,6 +1399,7 @@ def reconstruct_v2_checkpoint(
     return {
         "checkpoint_generation": generation,
         "authority_generation": authority_generation,
+        "experimental_authority_depth": authority_depth,
         "store_uuid": context["store_uuid"].hex(),
         "authority_sha256": (
             hashlib.sha256(authority_payload).hexdigest()

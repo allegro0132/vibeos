@@ -27,9 +27,9 @@ use crate::maintenance::{MaintenanceOperation, StoreMaintenance};
 use crate::mark::{MarkRoot, RootClass};
 use crate::pins::RootKey;
 use crate::store::{
-    read_checkpoint, read_pointer_payload, read_superblock, recover_state, scan_segment,
+    read_checkpoint, read_pointer_payload, read_superblock, recover_state_for_scrub, scan_segment,
     validate_checkpoint_transition, CheckpointTransitionWitness, MountedState, SegmentStore,
-    StoreError,
+    StoreError, VerifiedSegmentScans,
 };
 
 /// Version of the public, anonymous diagnostic schema.
@@ -361,7 +361,7 @@ impl<D: PageDevice> SegmentStore<D> {
                     } else {
                         (right, left)
                     };
-                let older_state = match Box::pin(recover_state(
+                let older_state = match Box::pin(recover_state_for_scrub(
                     &self.device,
                     current.superblock,
                     older,
@@ -433,7 +433,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 let newer_budget = candidate_budget
                     .checked_sub(witness_bytes)
                     .ok_or(ScrubError::MemoryLimit)?;
-                let newer_state = match Box::pin(recover_state(
+                let newer_state = match Box::pin(recover_state_for_scrub(
                     &self.device,
                     current.superblock,
                     newer,
@@ -467,21 +467,17 @@ impl<D: PageDevice> SegmentStore<D> {
                 {
                     return Ok(report.corrupt(ScrubCorruptionDomain::AllocationOrMapping));
                 }
-                if let Err(error) = Box::pin(verify_state_contents(
-                    &self.device,
-                    &newer_state,
-                    self.limits.recovery_memory_bytes,
-                    current_resident.saturating_add(witness_bytes),
-                    None,
-                ))
-                .await
-                {
-                    return finish_step_error(report, ScrubCorruptionDomain::BlobDataOrTree, error);
-                }
+                // Current contents were freshly verified earlier in this
+                // scrub. The exact publication equality above binds those
+                // proofs to the independently recovered newer checkpoint:
+                // every catalog/CAS mapping, physical root, allocation and
+                // generation used by content verification is equal. Keep
+                // older-state verification separate; it may name different
+                // payloads. No proof survives beyond this scrub invocation.
                 report.checkpoint_fallback_verified = true;
             }
             (Some(candidate), None) | (None, Some(candidate)) => {
-                let recovered = match Box::pin(recover_state(
+                let recovered = match Box::pin(recover_state_for_scrub(
                     &self.device,
                     current.superblock,
                     candidate,
@@ -590,6 +586,20 @@ async fn verify_checkpoint_payloads<D: PageDevice>(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn verify_closure_for_test<D: PageDevice>(
+    device: &D,
+    state: &MountedState,
+    limits: crate::store::StoreLimits,
+    kinds: &[u32],
+) -> Result<ScrubReport, ScrubError> {
+    let mut report = ScrubReport::from_state(state)?;
+    match verify_durable_authority_closure(device, state, limits, kinds, 0, Some(&mut report)).await {
+        Ok(()) => Ok(report),
+        Err(error) => finish_step_error(report, ScrubCorruptionDomain::AuthorityGraph, error),
+    }
 }
 
 async fn verify_durable_authority_closure<D: PageDevice>(
@@ -716,22 +726,42 @@ async fn verify_durable_authority_closure<D: PageDevice>(
         .recovery_memory_bytes
         .checked_sub(retained)
         .ok_or(StepError::MemoryLimit)?;
-    let typed = decode_typed_children(
-        device,
-        state,
-        crate::store::StoreLimits {
-            recovery_memory_bytes: decode_budget,
-            ..limits
-        },
-        &roots,
-        typed_reference_kinds,
-        None,
-        None,
-    )
-    .await
-    .map_err(map_gc_step_error)?;
+    // This semantic walk gets fresh proofs, independent of both recovery
+    // and content verification. Reserve its memo alongside the graph budget.
+    const MEMO_BYTES: usize = 64 * 1024;
+    let mut memo_peak = 0;
+    let typed = if let Some(remaining) = decode_budget.checked_sub(MEMO_BYTES) {
+        let memo = VerifiedSegmentScans::with_budget(MEMO_BYTES, 32);
+        match decode_typed_children(device, state,
+            crate::store::StoreLimits { recovery_memory_bytes: remaining, ..limits },
+            &roots, typed_reference_kinds, Some(&memo), None).await
+            .map_err(map_gc_step_error)
+        {
+            Ok(typed) => {
+                memo_peak = MEMO_BYTES;
+                typed
+            }
+            Err(StepError::MemoryLimit) => {
+                drop(memo);
+                if let Some(value) = report.as_deref_mut() {
+                    value.observe_memory(limits.recovery_memory_bytes);
+                }
+                decode_typed_children(device, state,
+                    crate::store::StoreLimits { recovery_memory_bytes: decode_budget, ..limits },
+                    &roots, typed_reference_kinds, None, None).await
+                    .map_err(map_gc_step_error)?
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        decode_typed_children(device, state,
+            crate::store::StoreLimits { recovery_memory_bytes: decode_budget, ..limits },
+            &roots, typed_reference_kinds, None, None).await
+            .map_err(map_gc_step_error)?
+    };
     let decode_peak = retained
-        .checked_add(typed.peak_bytes())
+        .checked_add(memo_peak)
+        .and_then(|bytes| bytes.checked_add(typed.peak_bytes()))
         .ok_or(StepError::MemoryLimit)?;
     if decode_peak > limits.recovery_memory_bytes {
         return Err(StepError::MemoryLimit);
@@ -766,22 +796,16 @@ async fn verify_segment_set<D: PageDevice>(
             continue;
         }
         let base = segment_base_page(segment_no).map_err(|_| StepError::Corrupt)?;
-        let mut body = Box::new([0; PAGE_SIZE]);
-        let mut seal = Box::new([0; PAGE_SIZE]);
-        device
-            .read_page(base, body.as_mut())
-            .await
-            .map_err(StepError::Device)?;
-        device
-            .read_page(base + 1, seal.as_mut())
-            .await
-            .map_err(StepError::Device)?;
-        let header =
-            match decode_segment_header_verified(&body, &seal).map_err(|_| StepError::Corrupt)? {
-                DecodeStatus::Sealed(value) => value,
-                DecodeStatus::Empty | DecodeStatus::Unsealed => return Err(StepError::Corrupt),
-            };
-        let value = header.value();
+        let mut pair = Box::new([[0; PAGE_SIZE]; 2]);
+        device.read_pages(base, pair.as_mut()).await.map_err(StepError::Device)?;
+        let header = match decode_segment_header_verified(&pair[0], &pair[1])
+            .map_err(|_| StepError::Corrupt)?
+        {
+            DecodeStatus::Sealed(value) => value,
+            DecodeStatus::Empty | DecodeStatus::Unsealed => return Err(StepError::Corrupt),
+        };
+        let value = *header.value();
+        drop(pair);
         if value.binding.store_uuid != state.superblock.binding.store_uuid
             || value.binding.segment_no != segment_no
             || value.binding.generation == 0
@@ -834,12 +858,68 @@ async fn verify_segment_set<D: PageDevice>(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) async fn verify_contents_for_test<D: PageDevice>(
+    device: &D,
+    state: &MountedState,
+    limit: usize,
+    cached: bool,
+) -> Result<ScrubReport, ScrubError> {
+    let mut report = ScrubReport::from_state(state)?;
+    let result = if cached {
+        verify_state_contents(device, state, limit, 0, Some(&mut report)).await
+    } else {
+        verify_state_contents_with_memo(device, state, limit, 0, Some(&mut report), None).await
+    };
+    match result {
+        Ok(()) => Ok(report),
+        Err(error) => finish_step_error(report, ScrubCorruptionDomain::BlobDataOrTree, error),
+    }
+}
+
+// Each content pass establishes its own segment proofs. Never carry them
+// across scrub calls or reuse the mount/checkpoint-reconstruction memo.
 async fn verify_state_contents<D: PageDevice>(
     device: &D,
     state: &MountedState,
     total_memory_limit: usize,
     base_resident: usize,
     mut report: Option<&mut ScrubReport>,
+) -> Result<(), StepError<D::Error>> {
+    const MEMO_BYTES: usize = 64 * 1024;
+    let state_resident = state.resident_heap_bytes().ok_or(StepError::MemoryLimit)?;
+    if let Some(cached_base) = base_resident.checked_add(MEMO_BYTES)
+        .filter(|base| base.checked_add(state_resident)
+            .and_then(|bytes| bytes.checked_add(SCRUB_STREAMING_WORKSPACE_BYTES))
+            .is_some_and(|peak| peak <= total_memory_limit))
+    {
+        let memo = VerifiedSegmentScans::with_budget(MEMO_BYTES, 32);
+        match verify_state_contents_with_memo(device, state, total_memory_limit,
+            cached_base, report.as_deref_mut(), Some(&memo)).await
+        {
+            Ok(()) => return Ok(()),
+            Err(StepError::MemoryLimit) => {
+                // Drop all optional proofs before retrying. Preserve a
+                // conservative peak for the discarded bounded attempt.
+                drop(memo);
+                if let Some(value) = report.as_deref_mut() {
+                    value.observe_memory(total_memory_limit);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    verify_state_contents_with_memo(device, state, total_memory_limit,
+        base_resident, report, None).await
+}
+
+async fn verify_state_contents_with_memo<D: PageDevice>(
+    device: &D,
+    state: &MountedState,
+    total_memory_limit: usize,
+    base_resident: usize,
+    mut report: Option<&mut ScrubReport>,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(), StepError<D::Error>> {
     let state_resident = state.resident_heap_bytes().ok_or(StepError::MemoryLimit)?;
     let resident = base_resident
@@ -850,6 +930,10 @@ async fn verify_state_contents<D: PageDevice>(
         .is_none_or(|peak| peak > total_memory_limit)
     {
         return Err(StepError::MemoryLimit);
+    }
+
+    if let Some(value) = report.as_deref_mut() {
+        value.observe_memory(resident + SCRUB_STREAMING_WORKSPACE_BYTES);
     }
 
     for pointer in [state.catalog_root, state.authority_root, state.replay_tail] {
@@ -885,7 +969,7 @@ async fn verify_state_contents<D: PageDevice>(
                 pointer,
                 ExtentKind::CatalogDelta,
                 crate::cas_codec::CAS_DELTA_NEW_BLOB_LEN,
-                None,
+                memo,
             )
             .await
             .map_err(StepError::from_store)?;
@@ -943,7 +1027,7 @@ async fn verify_state_contents<D: PageDevice>(
                 blob.manifest,
                 ExtentKind::Catalog,
                 manifest_len,
-                None,
+                memo,
             )
             .await
             .map_err(StepError::from_store)?;
@@ -961,7 +1045,7 @@ async fn verify_state_contents<D: PageDevice>(
             for extent in &manifest.extents {
                 verify_pointer_payload_and_padding(device, state, extent.pointer).await?;
             }
-            verify_manifest_blob(device, state, &manifest, None)
+            verify_manifest_blob(device, state, &manifest, memo)
                 .await
                 .map_err(|error| match error {
                     crate::cas::CasStoreError::Store(error) => StepError::from_store(error),
@@ -995,7 +1079,7 @@ async fn verify_state_contents<D: PageDevice>(
                     entry.blob,
                     ExtentKind::Blob,
                     self_legacy_limit(state, total_memory_limit, resident)?,
-                    None,
+                    memo,
                 )
                 .await
                 .map_err(StepError::from_store)?;
@@ -1063,23 +1147,16 @@ async fn verify_segment_payloads_and_padding<D: PageDevice>(
         let descriptor_page = base
             .checked_add(u64::from(relative))
             .ok_or(StepError::Corrupt)?;
-        let mut body = Box::new([0; PAGE_SIZE]);
-        let mut seal = Box::new([0; PAGE_SIZE]);
-        device
-            .read_page(descriptor_page, body.as_mut())
-            .await
-            .map_err(StepError::Device)?;
-        device
-            .read_page(
-                descriptor_page.checked_add(1).ok_or(StepError::Corrupt)?,
-                seal.as_mut(),
-            )
-            .await
-            .map_err(StepError::Device)?;
-        let extent = match decode_extent_verified(&body, &seal).map_err(|_| StepError::Corrupt)? {
+        // Descriptor and seal are adjacent and retain the same two-page
+        // workspace. Release it before streaming the payload.
+        descriptor_page.checked_add(1).ok_or(StepError::Corrupt)?;
+        let mut pair = Box::new([[0; PAGE_SIZE]; 2]);
+        device.read_pages(descriptor_page, pair.as_mut()).await.map_err(StepError::Device)?;
+        let extent = match decode_extent_verified(&pair[0], &pair[1]).map_err(|_| StepError::Corrupt)? {
             DecodeStatus::Sealed(extent) => *extent.value(),
             DecodeStatus::Empty | DecodeStatus::Unsealed => return Err(StepError::Corrupt),
         };
+        drop(pair);
         if extent.binding.store_uuid != state.superblock.binding.store_uuid
             || extent.binding.segment_no != segment_no
             || extent.binding.generation != segment_generation
@@ -1129,8 +1206,8 @@ async fn verify_exact_payload_and_padding<D: PageDevice>(
     }
     let mut remaining = exact_byte_len;
     let mut hasher = Sha256::new();
+    let mut page = Box::new([0; PAGE_SIZE]);
     for page_index in 0..u64::from(payload_pages) {
-        let mut page = Box::new([0; PAGE_SIZE]);
         device
             .read_page(
                 first_page

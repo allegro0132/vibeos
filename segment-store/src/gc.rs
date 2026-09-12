@@ -2211,6 +2211,33 @@ impl SegmentBuilder {
         merkle_root: [u8; 32],
         bytes: &[u8],
     ) -> Result<PhysicalPointer, GcStoreError<D::Error>> {
+        self.payload_with_root(device, extent_kind, object_kind, extent_index,
+            extent_count, content_byte_len, encoded_blob_len, encoded_offset,
+            Some(merkle_root), bytes).await
+    }
+
+    // Complete metadata uses the same byte digest for both record fields.
+    async fn metadata_payload<D: PageDevice>(
+        &mut self, device: &D, extent_kind: ExtentKind, object_kind: u32, bytes: &[u8],
+    ) -> Result<PhysicalPointer, GcStoreError<D::Error>> {
+        self.payload_with_root(device, extent_kind, object_kind, 0, 1,
+            bytes.len() as u64, bytes.len() as u64, 0, None, bytes).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn payload_with_root<D: PageDevice>(
+        &mut self,
+        device: &D,
+        extent_kind: ExtentKind,
+        object_kind: u32,
+        extent_index: u32,
+        extent_count: u32,
+        content_byte_len: u64,
+        encoded_blob_len: u64,
+        encoded_offset: u64,
+        merkle_root: Option<[u8; 32]>,
+        bytes: &[u8],
+    ) -> Result<PhysicalPointer, GcStoreError<D::Error>> {
         self.ensure(device, bytes.len()).await?;
         let segment_no = self.segments[self.index];
         let base = segment_base_page(segment_no).map_err(StoreError::Format)?;
@@ -2230,7 +2257,7 @@ impl SegmentBuilder {
             encoded_blob_len,
             encoded_offset,
             bytes.len() as u64,
-            merkle_root,
+            merkle_root.unwrap_or(hash),
             hash,
         )
         .map_err(StoreError::Format)?;
@@ -2875,18 +2902,7 @@ async fn relocate_live_state<D: PageDevice>(
         written_manifest_bytes = written_manifest_bytes.checked_add(bytes.len())
             .ok_or(GcError::ArithmeticOverflow)?;
         let pointer = builder
-            .payload(
-                device,
-                ExtentKind::Catalog,
-                METADATA_KIND_MANIFEST,
-                0,
-                1,
-                bytes.len() as u64,
-                bytes.len() as u64,
-                0,
-                payload_sha256(&bytes),
-                &bytes,
-            )
+            .metadata_payload(device, ExtentKind::Catalog, METADATA_KIND_MANIFEST, &bytes)
             .await?;
         relocated.push(RelocatedBlob {
             blob_key: manifest.blob_key,
@@ -2904,18 +2920,7 @@ async fn relocate_live_state<D: PageDevice>(
     let snapshot_bytes = encode_cas_snapshot(&snapshot, context)
         .map_err(|_| GcError::CorruptAt("relocate-snapshot-encode"))?;
     let catalog_root = builder
-        .payload(
-            device,
-            ExtentKind::Catalog,
-            METADATA_KIND_CAS_SNAPSHOT,
-            0,
-            1,
-            snapshot_bytes.len() as u64,
-            snapshot_bytes.len() as u64,
-            0,
-            payload_sha256(&snapshot_bytes),
-            &snapshot_bytes,
-        )
+        .metadata_payload(device, ExtentKind::Catalog, METADATA_KIND_CAS_SNAPSHOT, &snapshot_bytes)
         .await?;
     let authority_chunk_bytes = MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE;
     let authority_extent_count = root_bytes.len().div_ceil(authority_chunk_bytes) as u32;
@@ -2977,18 +2982,7 @@ async fn relocate_live_state<D: PageDevice>(
         .copied()
         .ok_or(GcError::Corrupt)?;
     let allocation_root = builder
-        .payload(
-            device,
-            ExtentKind::Allocation,
-            METADATA_KIND_ALLOCATION,
-            0,
-            1,
-            allocation_bytes.len() as u64,
-            allocation_bytes.len() as u64,
-            0,
-            payload_sha256(&allocation_bytes),
-            &allocation_bytes,
-        )
+        .metadata_payload(device, ExtentKind::Allocation, METADATA_KIND_ALLOCATION, &allocation_bytes)
         .await?;
     let last = builder.finish(device).await?;
 
@@ -3134,6 +3128,8 @@ fn build_relocation_successor<E>(
     relocated_roots: PersistentRootSet,
 ) -> Result<MountedState, GcStoreError<E>> {
     let mut successor = MountedState {
+        #[cfg(feature = "experimental-authority-delta")]
+        recovered_authority_depth: None,
         superblock: state.superblock,
         generation: plan.relocation_generation,
         admitted_segments: state.admitted_segments,

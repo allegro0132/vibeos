@@ -57,6 +57,19 @@ fn structural_to_root_publish<E>(error: FsStructuralCommitError<E>) -> FsRootPub
     }
 }
 
+fn fs_root_switch_authority_len(
+    current: &PersistentAuthoritySnapshot,
+) -> Result<usize, AuthoritySnapshotError> {
+    // Match build_fs_root_switch_authority: preserve non-namespace roots,
+    // replace all namespace-root entries with the single successor entry.
+    let roots = current.external_roots().iter()
+        .filter(|root| root.object_kind != FS_ROOT_V1_KIND).count()
+        .checked_add(1).ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    crate::authority_snapshot::persistent_authority_encoded_len_for_parts(
+        current.record_stream().len(), current.objects.len(),
+        current.principals().len(), roots)
+}
+
 /// Build the fused successor policy for one namespace-root switch: the
 /// current authority snapshot relocated to the publishing checkpoint with its
 /// namespace-root external entry replaced by the batch's position-predicted
@@ -67,7 +80,7 @@ fn build_fs_root_switch_authority(
     current: &PersistentAuthoritySnapshot,
     root_id: u128,
     root_generation: u64,
-) -> Result<FusedAuthorityPublication, AuthoritySnapshotError> {
+) -> Result<FusedAuthorityPublication<'static>, AuthoritySnapshotError> {
     let mut external_roots: Vec<PersistentRootEntry> = current
         .external_roots()
         .iter()
@@ -97,11 +110,7 @@ fn build_fs_root_switch_authority(
     root_entries.sort_unstable_by_key(|entry| entry.object_id);
     let persistent_roots = PersistentRootSet::new(root_generation, root_entries)
         .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
-    Ok(FusedAuthorityPublication {
-        authority_bytes,
-        persistent_authority: snapshot,
-        persistent_roots,
-    })
+    Ok(FusedAuthorityPublication::owned(authority_bytes, snapshot, persistent_roots))
 }
 
 #[derive(Debug)]
@@ -1241,16 +1250,13 @@ impl<D: PageDevice> SegmentStore<D> {
             .persistent_authority
             .as_ref()
             .ok_or(FsRootPublishError::InvalidRoot)?;
-        // The fused publication carries the successor snapshot as one
-        // Authority extent. Adding or replacing the namespace-root entry
-        // changes the encoded length by at most one root-entry record.
-        let fused_fits = encode_persistent_authority_snapshot(current_authority)
+        // The mounted snapshot is already validated. Sizing its successor
+        // needs only table counts; the actual successor is validated by the
+        // builder before publication. Avoid encoding the entire log just to
+        // choose the route, and do not charge an extra root on replacement.
+        let fused_fits = fs_root_switch_authority_len(current_authority)
             .map_err(|_| FsRootPublishError::InvalidRoot)?
-            .len()
-            .checked_add(64)
-            .is_some_and(|len| {
-                len <= vibeos_segment_format::MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE
-            });
+            <= vibeos_segment_format::MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE;
         // Quota admission is unchanged by an external-root replacement, but
         // run the same pure preflight as the two-checkpoint path so a
         // divergent quota table declines before any staging.
@@ -1681,7 +1687,7 @@ impl<D: PageDevice> SegmentStore<D> {
             .map_err(|_| FsStructuralCommitError::Store(CasStoreError::WriterFailed))?;
             // Same ordering contract as every fused authority publication:
             // the pure quota installation precedes the publication mutation.
-            self.install_persistent_quota_snapshot(&fused.persistent_authority)
+            self.install_persistent_quota_snapshot(fused.snapshot())
                 .map_err(|_| FsStructuralCommitError::Store(CasStoreError::WriterFailed))?;
             self.publish_staged_batch_with_authority(batch, fused).await?
         } else {
@@ -2605,6 +2611,49 @@ mod tests {
 
     use crate::device::PageDeviceInfo;
     use crate::store::{FormatOptions, StoreLimits, StoreRuntimeContext};
+
+    #[test]
+    fn root_switch_size_matches_actual_encoding_for_add_and_replace() {
+        use vibeos_durable_format::{RecordChain, RecordBody, StoreId};
+        let mut chain = RecordChain::new(StoreId::new(7).unwrap());
+        let log = chain.append(None, RecordBody::Format).unwrap().to_vec();
+        let other = PersistentRootEntry { object_id: 10, commit_generation: 1, object_kind: 7 };
+        let old_fs = PersistentRootEntry { object_id: 20, commit_generation: 1, object_kind: FS_ROOT_V1_KIND };
+        for roots in [alloc::vec![], alloc::vec![other], alloc::vec![old_fs], alloc::vec![other, old_fs]] {
+            let snapshot = PersistentAuthoritySnapshot::from_validated_import_parts(
+                2, [7; 32], log.clone(), Vec::new(), Vec::new(), roots.clone()).unwrap();
+            let current_len = crate::authority_snapshot::persistent_authority_encoded_len(&snapshot).unwrap();
+            let expected = fs_root_switch_authority_len(&snapshot).unwrap();
+            let built = build_fs_root_switch_authority(&snapshot, 30, 3).unwrap();
+            let actual = encode_persistent_authority_snapshot(built.snapshot()).unwrap();
+            assert_eq!(expected, actual.len());
+            assert_eq!(expected, current_len + if roots.iter().any(|root| root.object_kind == FS_ROOT_V1_KIND) {
+                0
+            } else { crate::root_codec::PERSISTENT_ROOT_ENTRY_LEN });
+            assert_eq!(built.snapshot().external_roots().iter().filter(|root| root.object_kind == FS_ROOT_V1_KIND).count(), 1);
+        }
+    }
+
+    #[test]
+    fn root_switch_replacement_at_extent_ceiling_stays_fused() {
+        use vibeos_durable_format::{RecordChain, RecordBody, StoreId};
+        let mut chain = RecordChain::new(StoreId::new(7).unwrap());
+        let mut log = chain.append(None, RecordBody::Format).unwrap().to_vec();
+        for index in 1..=2046 {
+            log.extend_from_slice(&chain.append(None, RecordBody::IdHighWater { exclusive_end: index * 32 }).unwrap());
+        }
+        let roots = (1..=12).map(|id| PersistentRootEntry {
+            object_id: id, commit_generation: 1,
+            object_kind: if id == 12 { FS_ROOT_V1_KIND } else { 7 },
+        }).collect();
+        let snapshot = PersistentAuthoritySnapshot::from_validated_import_parts(
+            2, [7; 32], log, Vec::new(), Vec::new(), roots).unwrap();
+        let ceiling = vibeos_segment_format::MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE;
+        assert_eq!(fs_root_switch_authority_len(&snapshot).unwrap(), ceiling);
+        let built = build_fs_root_switch_authority(&snapshot, 30, 3).unwrap();
+        assert_eq!(encode_persistent_authority_snapshot(built.snapshot()).unwrap().len(), ceiling);
+        assert!(crate::authority_snapshot::persistent_authority_encoded_len(&snapshot).unwrap() + 64 > ceiling);
+    }
 
     const NAMESPACE: u128 = 0x5649_4245_4f53_2d46_494c_4554_5245_45;
 

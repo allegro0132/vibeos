@@ -14,8 +14,8 @@ extern crate std;
 mod allocation_v2;
 mod authority;
 mod authority_snapshot;
-// Experimental codec; not admitted by production mount/publication yet.
-#[cfg(test)]
+// Experimental codec; default builds do not admit this format.
+#[cfg(any(test, feature = "experimental-authority-delta"))]
 mod authority_delta;
 mod cas;
 mod cas_codec;

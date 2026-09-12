@@ -11,6 +11,10 @@ extern crate alloc;
 
 mod object;
 mod policy;
+mod replay_ids;
+mod replay_budget;
+use replay_budget::ReplayBudget;
+use replay_ids::{ReplayIds, ReplayIndex};
 
 pub use object::{encode_object_transaction, preview_object_transaction, EncodedObjectTransaction};
 pub use policy::{
@@ -495,6 +499,21 @@ impl LogRecord {
     }
 
     pub fn decode(bytes: &[u8; RECORD_SIZE]) -> Result<DecodeStatus, DecodeError> {
+        Self::decode_inner(bytes, true)
+    }
+
+    /// Validate a sector without allocating chunk content. Empty or unsealed
+    /// sectors return None; a valid sealed sector yields its store and sequence.
+    pub fn inspect_sector(bytes: &[u8; RECORD_SIZE]) -> Result<Option<(StoreId, u64)>, DecodeError> {
+        match Self::decode_inner(bytes, false)? {
+            DecodeStatus::Valid(decoded) => Ok(Some((decoded.record.store_id, decoded.record.sequence))),
+            DecodeStatus::Empty | DecodeStatus::Torn => Ok(None),
+        }
+    }
+
+    // Replay borrows chunk content from the validated input sector. Only this
+    // private path may omit ObjectChunk.data; the public decoder stays owned.
+    fn decode_inner(bytes: &[u8; RECORD_SIZE], retain_chunk: bool) -> Result<DecodeStatus, DecodeError> {
         if bytes.iter().all(|byte| *byte == 0) {
             return Ok(DecodeStatus::Empty);
         }
@@ -548,7 +567,7 @@ impl LogRecord {
         let store_id = StoreId::new(get_u128(bytes, 0x28)).ok_or(DecodeError::ZeroStoreId)?;
         let transaction_id = TransactionId::new(transaction_raw);
 
-        let body = decode_body(bytes, kind)?;
+        let body = decode_body(bytes, kind, retain_chunk)?;
         let record = LogRecord {
             store_id,
             transaction_id,
@@ -664,7 +683,7 @@ fn validate_decoded_envelope(record: &LogRecord) -> Result<(), DecodeError> {
     Ok(())
 }
 
-fn decode_body(bytes: &[u8; RECORD_SIZE], kind: RecordKind) -> Result<RecordBody, DecodeError> {
+fn decode_body(bytes: &[u8; RECORD_SIZE], kind: RecordKind, retain_chunk: bool) -> Result<RecordBody, DecodeError> {
     Ok(match kind {
         RecordKind::Format => RecordBody::Format,
         RecordKind::IdHighWater => {
@@ -763,7 +782,7 @@ fn decode_body(bytes: &[u8; RECORD_SIZE], kind: RecordKind) -> Result<RecordBody
             RecordBody::ObjectChunk(ObjectChunk {
                 object_id: id::<ObjectId>(get_u128(bytes, PAYLOAD_OFFSET))?,
                 chunk_index: get_u32(bytes, PAYLOAD_OFFSET + 16),
-                data: bytes[data_start..data_start + data_len].to_vec(),
+                data: if retain_chunk { bytes[data_start..data_start + data_len].to_vec() } else { Vec::new() },
             })
         }
         RecordKind::ObjectCommit => {
@@ -1181,11 +1200,11 @@ pub struct RecoveryPreflight {
     second_id_high_water_event: Option<(u64, u128)>,
     committed: Vec<RecoveredGrant>,
     objects: Vec<RecoveredObject>,
-    tombstone_sequence: BTreeMap<DerivationId, u64>,
+    tombstone_sequence: ReplayIndex<u64>,
     /// The transaction that carried each tombstone, retained so a compacted
     /// stream can re-emit the tombstone under its original stable identity.
-    tombstone_transactions: BTreeMap<DerivationId, TransactionId>,
-    graph: BTreeMap<DerivationId, RecoveredGrant>,
+    tombstone_transactions: ReplayIndex<TransactionId>,
+    graph: ReplayIndex<usize>,
     slots: Vec<RecoveredSlot>,
     last_sequence: u64,
     last_crc32c: u32,
@@ -1236,8 +1255,8 @@ impl RecoveryPreflight {
     ) -> bool {
         self.tombstone_sequence.len() == 1
             && self.tombstone_transactions.len() == 1
-            && self.tombstone_sequence.get(&derivation_id) == Some(&sequence)
-            && self.tombstone_transactions.get(&derivation_id) == Some(&transaction_id)
+            && self.tombstone_sequence.get(&derivation_id.get()) == Some(&sequence)
+            && self.tombstone_transactions.get(&derivation_id.get()) == Some(&transaction_id)
     }
 
     pub const fn last_sequence(&self) -> u64 {
@@ -1281,7 +1300,7 @@ impl RecoveryPreflight {
                 let grant = &candidate.grant;
                 if !grant.flags.is_root()
                     || grant.parent_id.is_some()
-                    || is_tombstoned(grant.derivation_id, &self.graph, &self.tombstone_sequence)
+                    || is_tombstoned(grant.derivation_id, &self.graph, &self.committed, &self.tombstone_sequence)
                     || grant.target.space != constraint.space
                     || grant.target.slot < constraint.first_slot
                     || grant.target.slot > constraint.last_slot_inclusive
@@ -1418,6 +1437,7 @@ impl RecoveryPreflight {
             if !is_tombstoned(
                 recovered.grant.derivation_id,
                 &self.graph,
+                &self.committed,
                 &self.tombstone_sequence,
             ) {
                 retained.insert(recovered.grant.derivation_id);
@@ -1437,10 +1457,10 @@ impl RecoveryPreflight {
         }
         let mut closure: Vec<DerivationId> = retained.iter().copied().collect();
         while let Some(derivation) = closure.pop() {
-            let Some(node) = self.graph.get(&derivation) else {
+            let Some(index) = self.graph.get(&derivation.get()) else {
                 return Err(RecoveryError::CompactionMismatch);
             };
-            if let Some(parent) = node.grant.parent_id {
+            if let Some(parent) = self.committed[*index].grant.parent_id {
                 if retained.insert(parent) {
                     closure.push(parent);
                 }
@@ -1495,13 +1515,14 @@ impl RecoveryPreflight {
                 events.push((recovered.commit_sequence, Event::Grant(recovered)));
             }
         }
-        for (derivation, sequence) in &self.tombstone_sequence {
-            if retained.contains(derivation) {
+        for (raw_derivation, sequence) in self.tombstone_sequence.iter() {
+            let derivation = DerivationId::new(*raw_derivation).expect("replayed nonzero ID");
+            if retained.contains(&derivation) {
                 let transaction = self
                     .tombstone_transactions
-                    .get(derivation)
+                    .get(&derivation.get())
                     .ok_or(RecoveryError::CompactionMismatch)?;
-                events.push((*sequence, Event::Tombstone(*derivation, *transaction)));
+                events.push((*sequence, Event::Tombstone(derivation, *transaction)));
             }
         }
         events.sort_by_key(|(sequence, _)| *sequence);
@@ -1600,6 +1621,7 @@ impl RecoveryPreflight {
                     !is_tombstoned(
                         recovered.grant.derivation_id,
                         &preflight.graph,
+                        &preflight.committed,
                         &preflight.tombstone_sequence,
                     )
                 })
@@ -1651,7 +1673,7 @@ impl RecoveryPreflight {
         for recovered in &self.committed {
             let grant = &recovered.grant;
             if grant.flags.is_root()
-                && !is_tombstoned(grant.derivation_id, &self.graph, &self.tombstone_sequence)
+                && !is_tombstoned(grant.derivation_id, &self.graph, &self.committed, &self.tombstone_sequence)
                 && !roots.iter().any(|root| root.grant == *grant)
             {
                 return Err(RecoveryError::RootNotTrusted {
@@ -1660,18 +1682,18 @@ impl RecoveryPreflight {
             }
         }
 
-        let grants = self
-            .committed
-            .into_iter()
-            .filter(|grant| {
-                !is_tombstoned(
-                    grant.grant.derivation_id,
-                    &self.graph,
-                    &self.tombstone_sequence,
-                )
-            })
-            .collect();
-        let tombstones = self.tombstone_sequence.keys().copied().collect();
+        // Compute liveness before moving/compacting the indexed grant vector.
+        let mut live = Vec::new();
+        live.try_reserve_exact(self.committed.len()).map_err(|_| RecoveryError::AllocationFailed)?;
+        for grant in &self.committed {
+            live.push(!is_tombstoned(grant.grant.derivation_id, &self.graph,
+                &self.committed, &self.tombstone_sequence));
+        }
+        let grants = self.committed.into_iter().enumerate()
+            .filter_map(|(index, grant)| live[index].then_some(grant)).collect();
+        let mut tombstones: Vec<_> = self.tombstone_sequence.iter()
+            .map(|(id, _)| DerivationId::new(*id).expect("replayed nonzero ID")).collect();
+        tombstones.sort_unstable();
         Ok(RecoveredStore {
             store_id: self.store_id,
             id_high_water: self.id_high_water,
@@ -1789,6 +1811,28 @@ pub enum RecoveryError {
     ReplayPoisoned,
 }
 
+// Box::try_new is not available on the host toolchain used by this crate.
+// Allocate the same layout as Box::new but report null as a recovery error.
+fn try_replay_box<T>(value: T, budget: &mut ReplayBudget) -> Result<Box<T>, RecoveryError> {
+    let layout = core::alloc::Layout::new::<T>();
+    if layout.size() == 0 {
+        return Ok(Box::new(value));
+    }
+    budget.charge(layout.size())?;
+    // SAFETY: the nonzero layout is for T. A successful allocation is aligned
+    // and large enough for one T; initialize it before transferring exclusive
+    // ownership to Box, which deallocates with the same global allocator/layout.
+    unsafe {
+        let pointer = alloc::alloc::alloc(layout).cast::<T>();
+        if pointer.is_null() {
+            budget.release(layout.size());
+            return Err(RecoveryError::AllocationFailed);
+        }
+        pointer.write(value);
+        Ok(Box::from_raw(pointer))
+    }
+}
+
 #[derive(Clone)]
 struct PreparedGrant {
     grant: GrantRecord,
@@ -1851,7 +1895,7 @@ struct IdState {
 #[derive(Clone)]
 pub struct PreflightReplay {
     store_id: StoreId,
-    retain_object_bytes: bool,
+    retain_recovery_output: bool,
     poisoned: bool,
     total_sectors: usize,
     valid_records: u64,
@@ -1861,19 +1905,21 @@ pub struct PreflightReplay {
     high_water_event_count: usize,
     first_high_water_event: Option<(u64, u128)>,
     second_high_water_event: Option<(u64, u128)>,
-    id_classes: BTreeMap<u128, IdState>,
-    transactions: BTreeMap<TransactionId, TxState>,
+    allocation_budget: ReplayBudget,
+    prepared_box_bytes: usize,
+    id_classes: ReplayIds,
+    transactions: ReplayIndex<TxState>,
     committed: Vec<RecoveredGrant>,
     committed_objects: Vec<RecoveredObject>,
-    tombstone_sequence: BTreeMap<DerivationId, u64>,
-    tombstone_transactions: BTreeMap<DerivationId, TransactionId>,
+    tombstone_sequence: ReplayIndex<u64>,
+    tombstone_transactions: ReplayIndex<TransactionId>,
 }
 
 impl PreflightReplay {
     pub fn new(store_id: StoreId) -> Self {
         Self {
             store_id,
-            retain_object_bytes: true,
+            retain_recovery_output: true,
             poisoned: false,
             total_sectors: 0,
             valid_records: 0,
@@ -1883,13 +1929,25 @@ impl PreflightReplay {
             high_water_event_count: 0,
             first_high_water_event: None,
             second_high_water_event: None,
-            id_classes: BTreeMap::new(),
-            transactions: BTreeMap::new(),
+            allocation_budget: ReplayBudget::new(usize::MAX),
+            prepared_box_bytes: 0,
+            id_classes: ReplayIds::new(),
+            transactions: ReplayIndex::new(),
             committed: Vec::new(),
             committed_objects: Vec::new(),
-            tombstone_sequence: BTreeMap::new(),
-            tombstone_transactions: BTreeMap::new(),
+            tombstone_sequence: ReplayIndex::new(),
+            tombstone_transactions: ReplayIndex::new(),
         }
+    }
+
+    fn retained_tracked_bytes(&self) -> Result<usize, RecoveryError> {
+        self.id_classes.allocated_bytes()
+            .checked_add(self.transactions.allocated_bytes())
+            .and_then(|bytes| bytes.checked_add(self.tombstone_sequence.allocated_bytes()))
+            .and_then(|bytes| bytes.checked_add(self.tombstone_transactions.allocated_bytes()))
+            .and_then(|bytes| bytes.checked_add(self.prepared_box_bytes))
+            .and_then(|bytes| bytes.checked_add(self.committed.capacity() * core::mem::size_of::<RecoveredGrant>()))
+            .ok_or(RecoveryError::AllocationFailed)
     }
 
     pub const fn record_count(&self) -> u64 {
@@ -1925,78 +1983,72 @@ impl PreflightReplay {
     }
 
     fn append_inner(&mut self, sectors: &[[u8; RECORD_SIZE]]) -> Result<(), RecoveryError> {
-        // Decode-only chain probe over exactly the appended records, seeded
-        // from the retained chain state, mirroring the whole-stream probe.
-        #[derive(Clone, Copy)]
-        struct ChainProbe {
-            sequence: u64,
-            previous_sequence: u64,
-            previous_crc32c: u32,
-            crc32c: u32,
-            store_id: StoreId,
-            is_format: bool,
-        }
-        let mut probes: Vec<Option<ChainProbe>> = Vec::new();
-        probes
-            .try_reserve_exact(sectors.len())
-            .map_err(|_| RecoveryError::AllocationFailed)?;
+        // Keep only the first chain error, but decode the entire batch before
+        // returning it: a later sealed-record error has precedence. No semantic
+        // state is changed until both decode and chain validation succeed.
+        let mut previous_sequence = self.previous_sequence;
+        let mut previous_crc = self.previous_crc;
+        let mut valid_index = self.valid_records;
+        let mut chain_error = None;
         for (sector, bytes) in sectors.iter().enumerate() {
-            match LogRecord::decode(bytes) {
-                Ok(DecodeStatus::Empty | DecodeStatus::Torn) => probes.push(None),
-                Ok(DecodeStatus::Valid(decoded)) => probes.push(Some(ChainProbe {
-                    sequence: decoded.record.sequence,
-                    previous_sequence: decoded.record.previous_sequence,
-                    previous_crc32c: decoded.record.previous_crc32c,
-                    crc32c: decoded.crc32c,
-                    store_id: decoded.record.store_id,
-                    is_format: matches!(decoded.record.body, RecordBody::Format),
-                })),
+            let decoded = match LogRecord::decode_inner(bytes, false) {
+                Ok(DecodeStatus::Empty | DecodeStatus::Torn) => continue,
+                Ok(DecodeStatus::Valid(decoded)) => decoded,
                 Err(source) => {
                     return Err(RecoveryError::SealedRecord {
                         sector: self.total_sectors + sector,
                         source,
                     })
                 }
+            };
+            if chain_error.is_some() {
+                continue;
             }
+            let record = &decoded.record;
+            let result = (|| {
+                let is_format = matches!(record.body, RecordBody::Format);
+                if valid_index == 0 && (record.sequence != 1 || !is_format) {
+                    return Err(RecoveryError::FormatNotFirst);
+                }
+                if record.store_id != self.store_id {
+                    return Err(RecoveryError::WrongStore {
+                        sector: self.total_sectors + sector,
+                    });
+                }
+                let expected = previous_sequence
+                    .checked_add(1)
+                    .ok_or(RecoveryError::SequenceOverflow)?;
+                if record.sequence != expected
+                    || record.previous_sequence != previous_sequence
+                    || record.previous_crc32c != previous_crc
+                {
+                    return Err(RecoveryError::BrokenSequence {
+                        sector: self.total_sectors + sector,
+                    });
+                }
+                if valid_index != 0 && is_format {
+                    return Err(RecoveryError::DuplicateFormat);
+                }
+                previous_sequence = record.sequence;
+                previous_crc = decoded.crc32c;
+                valid_index += 1;
+                Ok(())
+            })();
+            chain_error = result.err();
         }
-        let mut previous_sequence = self.previous_sequence;
-        let mut previous_crc = self.previous_crc;
-        let mut valid_index = self.valid_records;
-        for (sector, entry) in probes.iter().enumerate() {
-            let Some(probe) = entry else { continue };
-            if valid_index == 0 && (probe.sequence != 1 || !probe.is_format) {
-                return Err(RecoveryError::FormatNotFirst);
-            }
-            if probe.store_id != self.store_id {
-                return Err(RecoveryError::WrongStore {
-                    sector: self.total_sectors + sector,
-                });
-            }
-            let expected = previous_sequence
-                .checked_add(1)
-                .ok_or(RecoveryError::SequenceOverflow)?;
-            if probe.sequence != expected
-                || probe.previous_sequence != previous_sequence
-                || probe.previous_crc32c != previous_crc
-            {
-                return Err(RecoveryError::BrokenSequence {
-                    sector: self.total_sectors + sector,
-                });
-            }
-            if valid_index != 0 && probe.is_format {
-                return Err(RecoveryError::DuplicateFormat);
-            }
-            previous_sequence = probe.sequence;
-            previous_crc = probe.crc32c;
-            valid_index += 1;
+        if let Some(error) = chain_error {
+            return Err(error);
         }
-        drop(probes);
 
+        // Reconcile exact retained capacities after a possible builder clone.
+        self.allocation_budget.sync_retained(self.retained_tracked_bytes()?)?;
         // Semantic replay of the appended records against retained state.
         let high_water = &mut self.high_water;
         let high_water_event_count = &mut self.high_water_event_count;
         let first_high_water_event = &mut self.first_high_water_event;
         let second_high_water_event = &mut self.second_high_water_event;
+        let allocation_budget = &mut self.allocation_budget;
+        let prepared_box_bytes = &mut self.prepared_box_bytes;
         let id_classes = &mut self.id_classes;
         let transactions = &mut self.transactions;
         let committed = &mut self.committed;
@@ -2004,7 +2056,7 @@ impl PreflightReplay {
         let tombstone_sequence = &mut self.tombstone_sequence;
         let tombstone_transactions = &mut self.tombstone_transactions;
         for bytes in sectors {
-            let decoded = match LogRecord::decode(bytes) {
+            let decoded = match LogRecord::decode_inner(bytes, false) {
                 Ok(DecodeStatus::Empty | DecodeStatus::Torn) => continue,
                 Ok(DecodeStatus::Valid(decoded)) => decoded,
                 Err(_) => unreachable!("decode-only preflight accepted this sector"),
@@ -2034,39 +2086,39 @@ impl PreflightReplay {
                     if !ids_reserved_for_grant(grant, tx, *high_water) {
                         return Err(RecoveryError::IdNotReserved { sequence });
                     }
-                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence, allocation_budget)?;
                     claim_id_class(
                         id_classes,
                         grant.derivation_id.get(),
                         IdClass::Derivation,
-                        sequence,
-                    )?;
+                        sequence, allocation_budget)?;
                     if let Some(parent) = grant.parent_id {
-                        claim_id_class(id_classes, parent.get(), IdClass::Derivation, sequence)?;
+                        claim_id_class(id_classes, parent.get(), IdClass::Derivation, sequence, allocation_budget)?;
                     }
-                    claim_id_class(id_classes, grant.object_id.get(), IdClass::Object, sequence)?;
+                    claim_id_class(id_classes, grant.object_id.get(), IdClass::Object, sequence, allocation_budget)?;
                     claim_id_class(
                         id_classes,
                         grant.target.space.get(),
                         IdClass::Space,
-                        sequence,
-                    )?;
-                    if transactions.contains_key(&tx) {
+                        sequence, allocation_budget)?;
+                    if transactions.get_mut(&tx.get()).is_some() {
                         return Err(RecoveryError::DuplicateTransaction { sequence });
                     }
-                    if tombstone_sequence.contains_key(&grant.derivation_id)
+                    if tombstone_sequence.get(&grant.derivation_id.get()).is_some()
                         || !consume_claimed_id(id_classes, grant.derivation_id.get())
                     {
                         return Err(RecoveryError::DuplicateDerivation { sequence });
                     }
-                    transactions.insert(
-                        tx,
-                        TxState::GrantPrepared(Box::new(PreparedGrant {
+                    transactions.insert_budgeted(
+                        tx.get(),
+                        TxState::GrantPrepared(try_replay_box(PreparedGrant {
                             grant: grant.clone(),
                             sequence,
                             crc32c: decoded.crc32c,
-                        })),
-                    );
+                        }, allocation_budget)?),
+                        allocation_budget,
+                    )?;
+                    *prepared_box_bytes += core::mem::size_of::<PreparedGrant>();
                 }
                 RecordBody::GrantCommit {
                     prepare_sequence,
@@ -2082,14 +2134,14 @@ impl PreflightReplay {
                     {
                         return Err(RecoveryError::IdNotReserved { sequence });
                     }
-                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence, allocation_budget)?;
                     claim_id_class(
                         id_classes,
                         derivation_id.get(),
                         IdClass::Derivation,
-                        sequence,
-                    )?;
-                    match transactions.remove(&tx) {
+                        sequence, allocation_budget)?;
+                    match transactions.get_mut(&tx.get())
+                        .map(|state| core::mem::replace(state, TxState::Finished)) {
                         Some(TxState::GrantPrepared(prepared)) => {
                             if prepared.sequence != *prepare_sequence
                                 || prepared.crc32c != *prepare_crc32c
@@ -2097,13 +2149,15 @@ impl PreflightReplay {
                             {
                                 return Err(RecoveryError::CommitMismatch { sequence });
                             }
+                            replay_budget::reserve_vec(committed, 1, allocation_budget)?;
                             committed.push(RecoveredGrant {
                                 grant: prepared.grant,
                                 transaction_id: tx,
                                 prepare_sequence: prepared.sequence,
                                 commit_sequence: sequence,
                             });
-                            transactions.insert(tx, TxState::Finished);
+                            allocation_budget.release(core::mem::size_of::<PreparedGrant>());
+                            *prepared_box_bytes -= core::mem::size_of::<PreparedGrant>();
                         }
                         Some(TxState::Finished) => {
                             return Err(RecoveryError::DuplicateTransaction { sequence });
@@ -2118,7 +2172,7 @@ impl PreflightReplay {
                             if !consume_claimed_id(id_classes, derivation_id.get()) {
                                 return Err(RecoveryError::DuplicateDerivation { sequence });
                             }
-                            transactions.insert(tx, TxState::Finished);
+                            transactions.insert_budgeted(tx.get(), TxState::Finished, allocation_budget)?;
                         }
                     }
                 }
@@ -2132,23 +2186,23 @@ impl PreflightReplay {
                     {
                         return Err(RecoveryError::IdNotReserved { sequence });
                     }
-                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence, allocation_budget)?;
                     claim_id_class(
                         id_classes,
                         derivation_id.get(),
                         IdClass::Derivation,
-                        sequence,
-                    )?;
-                    if transactions.insert(tx, TxState::Finished).is_some() {
+                        sequence, allocation_budget)?;
+                    if transactions.insert_budgeted(tx.get(), TxState::Finished, allocation_budget)?.is_some() {
                         return Err(RecoveryError::DuplicateTransaction { sequence });
                     }
-                    if !tombstone_sequence.contains_key(derivation_id) {
-                        tombstone_transactions.insert(*derivation_id, tx);
+                    if self.retain_recovery_output && tombstone_sequence.get(&derivation_id.get()).is_none() {
+                        tombstone_transactions.insert_absent_budgeted(derivation_id.get(), tx, allocation_budget)?;
                     }
-                    tombstone_sequence
-                        .entry(*derivation_id)
-                        .and_modify(|old| *old = (*old).min(sequence))
-                        .or_insert(sequence);
+                    if let Some(old) = tombstone_sequence.get_mut(&derivation_id.get()) {
+                        *old = (*old).min(sequence);
+                    } else {
+                        tombstone_sequence.insert_absent_budgeted(derivation_id.get(), sequence, allocation_budget)?;
+                    }
                 }
                 RecordBody::ObjectPrepare(metadata) => {
                     let tx = decoded
@@ -2160,22 +2214,21 @@ impl PreflightReplay {
                     {
                         return Err(RecoveryError::IdNotReserved { sequence });
                     }
-                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence, allocation_budget)?;
                     claim_id_class(
                         id_classes,
                         metadata.object_id.get(),
                         IdClass::Object,
-                        sequence,
-                    )?;
-                    if transactions.contains_key(&tx) {
+                        sequence, allocation_budget)?;
+                    if transactions.get_mut(&tx.get()).is_some() {
                         return Err(RecoveryError::DuplicateTransaction { sequence });
                     }
                     if !consume_claimed_id(id_classes, metadata.object_id.get()) {
                         return Err(RecoveryError::DuplicateObject { sequence });
                     }
-                    transactions.insert(
-                        tx,
-                        TxState::ObjectPrepared(Box::new(PreparedObject {
+                    transactions.insert_budgeted(
+                        tx.get(),
+                        TxState::ObjectPrepared(try_replay_box(PreparedObject {
                             metadata: metadata.clone(),
                             sequence,
                             crc32c: decoded.crc32c,
@@ -2185,10 +2238,16 @@ impl PreflightReplay {
                             content_digest: Crc32cDigest::new(),
                             byte_len: 0,
                             bytes: Vec::new(),
-                        })),
-                    );
+                        }, allocation_budget)?),
+                        allocation_budget,
+                    )?;
+                    *prepared_box_bytes += core::mem::size_of::<PreparedObject>();
                 }
                 RecordBody::ObjectChunk(chunk) => {
+                    // decode_inner already validated the encoded length and
+                    // padding, so this slice borrows exactly the sealed content.
+                    let start = PAYLOAD_OFFSET + 24;
+                    let data = &bytes[start..start + get_u16(bytes, PAYLOAD_OFFSET + 20) as usize];
                     let tx = decoded
                         .record
                         .transaction_id
@@ -2198,9 +2257,9 @@ impl PreflightReplay {
                     {
                         return Err(RecoveryError::IdNotReserved { sequence });
                     }
-                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
-                    claim_id_class(id_classes, chunk.object_id.get(), IdClass::Object, sequence)?;
-                    let Some(state) = transactions.get_mut(&tx) else {
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence, allocation_budget)?;
+                    claim_id_class(id_classes, chunk.object_id.get(), IdClass::Object, sequence, allocation_budget)?;
+                    let Some(state) = transactions.get_mut(&tx.get()) else {
                         return Err(RecoveryError::ObjectChunkWithoutPrepare { sequence });
                     };
                     let TxState::ObjectPrepared(prepared) = state else {
@@ -2219,17 +2278,19 @@ impl PreflightReplay {
                         prepared.next_chunk,
                         prepared.metadata.chunk_count,
                     );
-                    if chunk.data.len() != expected_len {
+                    if data.len() != expected_len {
                         return Err(RecoveryError::ObjectChunkLength { sequence });
                     }
                     if prepared.next_chunk == 0 {
                         prepared.first_chunk_sequence = sequence;
                     }
                     prepared.chunk_digest.update(&decoded.crc32c.to_le_bytes());
-                    prepared.content_digest.update(&chunk.data);
-                    prepared.byte_len += chunk.data.len();
-                    if self.retain_object_bytes {
-                        prepared.bytes.extend_from_slice(&chunk.data);
+                    prepared.content_digest.update(data);
+                    prepared.byte_len += data.len();
+                    if self.retain_recovery_output {
+                        prepared.bytes.try_reserve(data.len())
+                            .map_err(|_| RecoveryError::AllocationFailed)?;
+                        prepared.bytes.extend_from_slice(data);
                     }
                     prepared.next_chunk += 1;
                 }
@@ -2243,16 +2304,17 @@ impl PreflightReplay {
                     {
                         return Err(RecoveryError::IdNotReserved { sequence });
                     }
-                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence, allocation_budget)?;
                     claim_id_class(
                         id_classes,
                         commit.object_id.get(),
                         IdClass::Object,
-                        sequence,
-                    )?;
-                    // Commit is an ownership transfer: removing the state prevents
-                    // any accumulated payload from being cloned at publication.
-                    let Some(state) = transactions.remove(&tx) else {
+                        sequence, allocation_budget)?;
+                    // Commit transfers the prepared state out of its retained ID slot.
+                    // Keep Finished in place to prevent reuse without removing
+                    // and reinserting a node or cloning accumulated payload.
+                    let Some(state) = transactions.get_mut(&tx.get())
+                        .map(|state| core::mem::replace(state, TxState::Finished)) else {
                         return Err(RecoveryError::ObjectCommitWithoutPrepare { sequence });
                     };
                     let TxState::ObjectPrepared(prepared) = state else {
@@ -2279,17 +2341,22 @@ impl PreflightReplay {
                         return Err(RecoveryError::ObjectContentCrcMismatch { sequence });
                     }
                     let byte_len = prepared.byte_len as u64;
-                    committed_objects.push(RecoveredObject {
-                        object_id: prepared.metadata.object_id,
-                        object_kind: prepared.metadata.object_kind,
-                        bytes: prepared.bytes,
-                        byte_len,
-                        external_root: None,
-                        transaction_id: tx,
-                        prepare_sequence: prepared.sequence,
-                        commit_sequence: sequence,
-                    });
-                    transactions.insert(tx, TxState::Finished);
+                    if self.retain_recovery_output {
+                        committed_objects.try_reserve(1)
+                            .map_err(|_| RecoveryError::AllocationFailed)?;
+                        committed_objects.push(RecoveredObject {
+                            object_id: prepared.metadata.object_id,
+                            object_kind: prepared.metadata.object_kind,
+                            bytes: prepared.bytes,
+                            byte_len,
+                            external_root: None,
+                            transaction_id: tx,
+                            prepare_sequence: prepared.sequence,
+                            commit_sequence: sequence,
+                        });
+                    }
+                    allocation_budget.release(core::mem::size_of::<PreparedObject>());
+                    *prepared_box_bytes -= core::mem::size_of::<PreparedObject>();
                 }
                 RecordBody::ObjectExternal {
                     object_id,
@@ -2306,24 +2373,28 @@ impl PreflightReplay {
                     {
                         return Err(RecoveryError::IdNotReserved { sequence });
                     }
-                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence)?;
-                    claim_id_class(id_classes, object_id.get(), IdClass::Object, sequence)?;
-                    if transactions.insert(tx, TxState::Finished).is_some() {
+                    claim_id_class(id_classes, tx.get(), IdClass::Transaction, sequence, allocation_budget)?;
+                    claim_id_class(id_classes, object_id.get(), IdClass::Object, sequence, allocation_budget)?;
+                    if transactions.insert_budgeted(tx.get(), TxState::Finished, allocation_budget)?.is_some() {
                         return Err(RecoveryError::DuplicateTransaction { sequence });
                     }
                     if !consume_claimed_id(id_classes, object_id.get()) {
                         return Err(RecoveryError::DuplicateObject { sequence });
                     }
-                    committed_objects.push(RecoveredObject {
-                        object_id: *object_id,
-                        object_kind: *object_kind,
-                        bytes: Vec::new(),
-                        byte_len: *byte_len,
-                        external_root: Some(*merkle_root),
-                        transaction_id: tx,
-                        prepare_sequence: sequence,
-                        commit_sequence: sequence,
-                    });
+                    if self.retain_recovery_output {
+                        committed_objects.try_reserve(1)
+                            .map_err(|_| RecoveryError::AllocationFailed)?;
+                        committed_objects.push(RecoveredObject {
+                            object_id: *object_id,
+                            object_kind: *object_kind,
+                            bytes: Vec::new(),
+                            byte_len: *byte_len,
+                            external_root: Some(*merkle_root),
+                            transaction_id: tx,
+                            prepare_sequence: sequence,
+                            commit_sequence: sequence,
+                        });
+                    }
                 }
             }
         }
@@ -2340,12 +2411,12 @@ impl PreflightReplay {
     /// of the committed object bytes; a caller that keeps the builder for
     /// the next strict extension finishes a clone instead.
     pub fn finish(self) -> Result<RecoveryPreflight, RecoveryError> {
-        self.finish_inner(true)
+        self.finish_inner(true).map(|(recovered, _)| recovered)
     }
 
     // Only validation may omit the output slot table. All fallible graph and
     // slot-history checks below are shared with complete recovery.
-    fn finish_inner(self, materialize_slots: bool) -> Result<RecoveryPreflight, RecoveryError> {
+    fn finish_inner(self, materialize_slots: bool) -> Result<(RecoveryPreflight, usize), RecoveryError> {
         if self.poisoned {
             return Err(RecoveryError::ReplayPoisoned);
         }
@@ -2355,13 +2426,19 @@ impl PreflightReplay {
         // Append-time identity/transaction checks are complete. These indexes
         // are not part of the recovered graph; release them (including any
         // unfinished inline-object buffer) before allocating graph/slot maps.
+        let retained_tracked_bytes = self.retained_tracked_bytes()?;
+        let mut allocation_budget = self.allocation_budget;
+        allocation_budget.sync_retained(retained_tracked_bytes)?;
+        allocation_budget.release(self.transactions.allocated_bytes());
+        allocation_budget.release(self.prepared_box_bytes);
         drop(self.transactions);
+        allocation_budget.release(self.id_classes.allocated_bytes());
         drop(self.id_classes);
-        let mut graph: BTreeMap<DerivationId, RecoveredGrant> = BTreeMap::new();
-        let mut object_kinds: BTreeMap<ObjectId, ResourceKind> = BTreeMap::new();
-        for recovered in &self.committed {
+        let mut graph: ReplayIndex<usize> = ReplayIndex::new();
+        let mut object_kinds: ReplayIndex<ResourceKind> = ReplayIndex::new();
+        for (index, recovered) in self.committed.iter().enumerate() {
             let grant = &recovered.grant;
-            if let Some(kind) = object_kinds.insert(grant.object_id, grant.resource_kind) {
+            if let Some(kind) = object_kinds.insert_budgeted(grant.object_id.get(), grant.resource_kind, &mut allocation_budget)? {
                 if kind != grant.resource_kind {
                     return Err(RecoveryError::ObjectMismatch {
                         sequence: recovered.commit_sequence,
@@ -2380,11 +2457,12 @@ impl PreflightReplay {
                         sequence: recovered.commit_sequence,
                     });
                 };
-                let Some(parent) = graph.get(&parent_id) else {
+                let Some(parent) = graph.get(&parent_id.get()) else {
                     return Err(RecoveryError::MissingParent {
                         sequence: recovered.commit_sequence,
                     });
                 };
+                let parent = &self.committed[*parent];
                 if !parent.grant.rights.contains(DurableRights::GRANT) {
                     return Err(RecoveryError::ParentCannotGrant {
                         sequence: recovered.commit_sequence,
@@ -2403,14 +2481,15 @@ impl PreflightReplay {
                     });
                 }
             }
-            graph.insert(grant.derivation_id, recovered.clone());
+            graph.insert_absent_budgeted(grant.derivation_id.get(), index, &mut allocation_budget)?;
         }
 
+        allocation_budget.release(object_kinds.allocated_bytes());
         drop(object_kinds);
-        let mut slots: BTreeMap<(SpaceId, u32), (u64, DerivationId)> = BTreeMap::new();
+        let mut slot_index: ReplayIndex<(u64, DerivationId), (SpaceId, u32)> = ReplayIndex::new();
         for recovered in &self.committed {
             let key = (recovered.grant.target.space, recovered.grant.target.slot);
-            if let Some((old_generation, old_derivation)) = slots.get(&key).copied() {
+            if let Some((old_generation, old_derivation)) = slot_index.get(&key).copied() {
                 if old_generation == u64::MAX || recovered.grant.target.generation <= old_generation
                 {
                     return Err(RecoveryError::SlotGeneration {
@@ -2421,6 +2500,7 @@ impl PreflightReplay {
                     old_derivation,
                     recovered.commit_sequence,
                     &graph,
+                    &self.committed,
                     &self.tombstone_sequence,
                 ) {
                     return Err(RecoveryError::SlotStillLive {
@@ -2428,32 +2508,38 @@ impl PreflightReplay {
                     });
                 }
             }
-            slots.insert(
+            slot_index.insert_budgeted(
                 key,
                 (
                     recovered.grant.target.generation,
                     recovered.grant.derivation_id,
                 ),
-            );
+                &mut allocation_budget,
+            )?;
         }
 
-        let slots = if materialize_slots {
-            slots
-                .into_iter()
-                .map(
-                    |((space, slot), (max_generation, derivation))| RecoveredSlot {
-                        space,
-                        slot,
-                        max_generation,
-                        live_derivation: (!is_tombstoned(derivation, &graph, &self.tombstone_sequence))
-                            .then_some(derivation),
-                    },
-                )
-                .collect()
-        } else {
-            Vec::new()
+        let mut slots = Vec::new();
+        if materialize_slots {
+            slots.try_reserve_exact(slot_index.len()).map_err(|_| RecoveryError::AllocationFailed)?;
+            for (&(space, slot), &(max_generation, derivation)) in slot_index.iter() {
+                slots.push(RecoveredSlot {
+                    space, slot, max_generation,
+                    live_derivation: (!is_tombstoned(derivation, &graph, &self.committed,
+                        &self.tombstone_sequence)).then_some(derivation),
+                });
+            }
+            slots.sort_unstable_by_key(|slot| (slot.space, slot.slot));
+        }
+        allocation_budget.release(slot_index.allocated_bytes());
+        drop(slot_index);
+        // Positions refer to the immutable committed vector owned by the result.
+        // No second owned grant graph or self-referential pointers are needed.
+        let graph = if materialize_slots { graph } else {
+            allocation_budget.release(graph.allocated_bytes());
+            drop(graph);
+            ReplayIndex::new()
         };
-        Ok(RecoveryPreflight {
+        Ok((RecoveryPreflight {
             store_id: self.store_id,
             id_high_water: self.high_water,
             id_high_water_event_count: self.high_water_event_count,
@@ -2467,11 +2553,11 @@ impl PreflightReplay {
             slots,
             last_sequence: self.previous_sequence,
             last_crc32c: self.previous_crc,
-        })
+        }, allocation_budget.peak()))
     }
 }
 
-/// Semantic validation without retaining inline object content. This wrapper
+/// Semantic validation without object or tombstone-transaction output. This wrapper
 /// cannot yield recovered objects or a RecoveryPreflight: its only output is
 /// the validated final sequence. Length, CRC, transaction and graph checks use
 /// the same replay implementation as ordinary recovery.
@@ -2479,11 +2565,34 @@ pub struct PreflightValidator {
     replay: PreflightReplay,
 }
 
+/// Requested semantic allocation capacity, excluding input sectors, stack and
+/// allocator bookkeeping. Peak includes conservative old/new growth overlap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidationMemoryUsage {
+    pub retained_bytes: usize,
+    pub peak_bytes: usize,
+}
+
 impl PreflightValidator {
     pub fn new(store_id: StoreId) -> Self {
+        Self::with_memory_limit(store_id, usize::MAX)
+    }
+
+    /// Bound validation's indexes, prepared boxes and committed-grant vector
+    /// across append and finish. No inline content/output vectors are retained.
+    /// Admission/allocator failure returns AllocationFailed; append failure
+    /// poisons the validator. This is not an allocator-overhead or RSS limit.
+    pub fn with_memory_limit(store_id: StoreId, maximum_bytes: usize) -> Self {
         let mut replay = PreflightReplay::new(store_id);
-        replay.retain_object_bytes = false;
+        replay.retain_recovery_output = false;
+        replay.allocation_budget = ReplayBudget::new(maximum_bytes);
         Self { replay }
+    }
+
+    pub fn memory_usage(&self) -> Result<ValidationMemoryUsage, RecoveryError> {
+        if self.replay.poisoned { return Err(RecoveryError::ReplayPoisoned); }
+        Ok(ValidationMemoryUsage { retained_bytes: self.replay.allocation_budget.used(),
+            peak_bytes: self.replay.allocation_budget.peak() })
     }
 
     pub fn append(&mut self, sectors: &[[u8; RECORD_SIZE]]) -> Result<(), RecoveryError> {
@@ -2491,7 +2600,16 @@ impl PreflightValidator {
     }
 
     pub fn finish(self) -> Result<u64, RecoveryError> {
-        self.replay.finish_inner(false).map(|validated| validated.last_sequence())
+        self.finish_with_memory_usage().map(|(sequence, _)| sequence)
+    }
+
+    /// On success all retained validation state is freed before returning.
+    pub fn finish_with_memory_usage(self) -> Result<(u64, ValidationMemoryUsage), RecoveryError> {
+        self.replay.finish_inner(false).map(|(validated, peak_bytes)| {
+            let sequence = validated.last_sequence();
+            drop(validated);
+            (sequence, ValidationMemoryUsage { retained_bytes: 0, peak_bytes })
+        })
     }
 }
 
@@ -2528,27 +2646,25 @@ const fn id_reserved(id: u128, high_water: u128) -> bool {
 }
 
 fn claim_id_class(
-    classes: &mut BTreeMap<u128, IdState>,
+    classes: &mut ReplayIds,
     id: u128,
     class: IdClass,
     sequence: u64,
+    allocation_budget: &mut ReplayBudget,
 ) -> Result<(), RecoveryError> {
-    match classes.entry(id) {
-        alloc::collections::btree_map::Entry::Occupied(existing) => {
-            if existing.get().class != class {
-                return Err(RecoveryError::IdClassCollision { sequence });
-            }
+    if let Some(existing) = classes.get_mut(&id) {
+        if existing.class != class {
+            return Err(RecoveryError::IdClassCollision { sequence });
         }
-        alloc::collections::btree_map::Entry::Vacant(entry) => {
-            entry.insert(IdState { class, consumed: false });
-        }
+    } else {
+        classes.insert_absent_budgeted(id, IdState { class, consumed: false }, allocation_budget)?;
     }
     Ok(())
 }
 
 // Every caller has already claimed and checked this record's ID class. Return
 // the same first-use result as inserting into the former separate seen sets.
-fn consume_claimed_id(classes: &mut BTreeMap<u128, IdState>, id: u128) -> bool {
+fn consume_claimed_id(classes: &mut ReplayIds, id: u128) -> bool {
     let state = classes.get_mut(&id).expect("record ID class already checked");
     !core::mem::replace(&mut state.consumed, true)
 }
@@ -2556,17 +2672,18 @@ fn consume_claimed_id(classes: &mut BTreeMap<u128, IdState>, id: u128) -> bool {
 fn is_tombstoned_before(
     mut derivation: DerivationId,
     before: u64,
-    graph: &BTreeMap<DerivationId, RecoveredGrant>,
-    tombstones: &BTreeMap<DerivationId, u64>,
+    graph: &ReplayIndex<usize>,
+    committed: &[RecoveredGrant],
+    tombstones: &ReplayIndex<u64>,
 ) -> bool {
     loop {
         if tombstones
-            .get(&derivation)
+            .get(&derivation.get())
             .is_some_and(|sequence| *sequence < before)
         {
             return true;
         }
-        match graph.get(&derivation).and_then(|node| node.grant.parent_id) {
+        match graph.get(&derivation.get()).and_then(|index| committed[*index].grant.parent_id) {
             Some(parent) => derivation = parent,
             None => return false,
         }
@@ -2575,14 +2692,15 @@ fn is_tombstoned_before(
 
 fn is_tombstoned(
     mut derivation: DerivationId,
-    graph: &BTreeMap<DerivationId, RecoveredGrant>,
-    tombstones: &BTreeMap<DerivationId, u64>,
+    graph: &ReplayIndex<usize>,
+    committed: &[RecoveredGrant],
+    tombstones: &ReplayIndex<u64>,
 ) -> bool {
     loop {
-        if tombstones.contains_key(&derivation) {
+        if tombstones.get(&derivation.get()).is_some() {
             return true;
         }
-        match graph.get(&derivation).and_then(|node| node.grant.parent_id) {
+        match graph.get(&derivation.get()).and_then(|index| committed[*index].grant.parent_id) {
             Some(parent) => derivation = parent,
             None => return false,
         }
@@ -2659,18 +2777,118 @@ mod validator_tests {
     use super::*;
 
     #[test]
+    fn replay_chunk_decode_matches_owned_decode_and_all_mutation_errors() {
+        for len in [1, CHUNK_DATA_SIZE - 1, CHUNK_DATA_SIZE] {
+            let record = LogRecord {
+                store_id: StoreId::new(7).unwrap(), transaction_id: TransactionId::new(8),
+                sequence: 2, previous_sequence: 1, previous_crc32c: 0,
+                body: RecordBody::ObjectChunk(ObjectChunk {
+                    object_id: ObjectId::new(9).unwrap(), chunk_index: 0,
+                    data: alloc::vec![0x59; len],
+                }),
+            }.encode().unwrap();
+            let compare = |bytes: &[u8; RECORD_SIZE]| {
+                let mut owned = LogRecord::decode(bytes);
+                if let Ok(DecodeStatus::Valid(decoded)) = &mut owned {
+                    if let RecordBody::ObjectChunk(chunk) = &mut decoded.record.body {
+                        assert_eq!(chunk.data.len(), get_u16(bytes, PAYLOAD_OFFSET + 20) as usize);
+                        chunk.data.clear();
+                    }
+                }
+                let borrowed = LogRecord::decode_inner(bytes, false);
+                if let Ok(DecodeStatus::Valid(decoded)) = &borrowed {
+                    if let RecordBody::ObjectChunk(chunk) = &decoded.record.body {
+                        assert_eq!(chunk.data.capacity(), 0);
+                    }
+                }
+                let expected_identity = owned.as_ref().map(|status| match status {
+                    DecodeStatus::Valid(decoded) => Some((decoded.record.store_id, decoded.record.sequence)),
+                    DecodeStatus::Empty | DecodeStatus::Torn => None,
+                }).map_err(|error| *error);
+                assert_eq!(LogRecord::inspect_sector(bytes), expected_identity);
+                assert_eq!(borrowed, owned);
+            };
+            compare(&record);
+            for offset in 0..RECORD_SIZE {
+                let mut changed = record;
+                changed[offset] ^= 1;
+                compare(&changed);
+                // Also exercise canonical-body/envelope errors behind the CRC.
+                let crc = crc32c(&changed[..CRC_OFFSET]);
+                put_u32(&mut changed, CRC_OFFSET, crc);
+                put_u32(&mut changed, CRC_OFFSET + 4, !crc);
+                compare(&changed);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_allocation_budget_rejects_append_and_poisoned_finish() {
+        let store = StoreId::new(7).unwrap();
+        let mut chain = RecordChain::new(store);
+        let records = [chain.append(None, RecordBody::Format).unwrap(),
+            chain.append(None, RecordBody::IdHighWater { exclusive_end: 32 }).unwrap(),
+            chain.append(Some(TransactionId::new(3).unwrap()), RecordBody::RevokeTombstone {
+                derivation_id: DerivationId::new(4).unwrap(),
+            }).unwrap()];
+        let mut validator = PreflightValidator::new(store);
+        validator.replay.allocation_budget = ReplayBudget::new(64);
+        assert_eq!(validator.append(&records), Err(RecoveryError::AllocationFailed));
+        assert!(validator.replay.allocation_budget.used() <= 64);
+        assert!(validator.replay.allocation_budget.peak() <= 64);
+        assert_eq!(validator.append(&[]), Err(RecoveryError::ReplayPoisoned));
+        assert_eq!(validator.finish(), Err(RecoveryError::ReplayPoisoned));
+    }
+
+    #[test]
+    fn cloned_replay_reconciles_index_capacity_before_append() {
+        let store = StoreId::new(7).unwrap();
+        let mut chain = RecordChain::new(store);
+        let records = [chain.append(None, RecordBody::Format).unwrap(),
+            chain.append(None, RecordBody::IdHighWater { exclusive_end: 32 }).unwrap(),
+            chain.append(Some(TransactionId::new(3).unwrap()), RecordBody::RevokeTombstone {
+                derivation_id: DerivationId::new(4).unwrap(),
+            }).unwrap()];
+        let mut replay = PreflightReplay::new(store);
+        replay.append(&records).unwrap();
+        let mut cloned = replay.clone();
+        cloned.append(&[]).unwrap();
+        assert_eq!(cloned.allocation_budget.used(), cloned.retained_tracked_bytes().unwrap());
+        assert_eq!(cloned.finish().unwrap().last_sequence(), 3);
+        assert_eq!(replay.finish().unwrap().last_sequence(), 3);
+    }
+
+    #[test]
+    fn prepared_box_budget_checks_before_allocation() {
+        let size = core::mem::size_of::<u64>();
+        let mut short = ReplayBudget::new(size - 1);
+        assert_eq!(try_replay_box(7u64, &mut short), Err(RecoveryError::AllocationFailed));
+        assert_eq!(short.used(), 0);
+        let mut exact = ReplayBudget::new(size);
+        let boxed = try_replay_box(7u64, &mut exact).unwrap();
+        assert_eq!(exact.used(), size);
+        drop(boxed);
+        exact.release(size);
+        assert_eq!(exact.used(), 0);
+        let mut zero = ReplayBudget::new(0);
+        drop(try_replay_box((), &mut zero).unwrap());
+        assert_eq!(zero.peak(), 0);
+    }
+
+    #[test]
     fn identity_references_preserve_consumption_and_class_collisions() {
         for class in [IdClass::Object, IdClass::Derivation] {
-            let mut states = BTreeMap::new();
-            claim_id_class(&mut states, 7, class, 1).unwrap();
-            claim_id_class(&mut states, 7, class, 2).unwrap();
+            let mut states = ReplayIds::new();
+            let allocation_budget = &mut ReplayBudget::new(usize::MAX);
+            claim_id_class(&mut states, 7, class, 1, allocation_budget).unwrap();
+            claim_id_class(&mut states, 7, class, 2, allocation_budget).unwrap();
             assert!(consume_claimed_id(&mut states, 7));
             // A reference after prepare/commit must not permit identity reuse.
-            claim_id_class(&mut states, 7, class, 3).unwrap();
+            claim_id_class(&mut states, 7, class, 3, allocation_budget).unwrap();
             let mut cloned = states.clone();
             assert!(!consume_claimed_id(&mut states, 7));
             assert!(!consume_claimed_id(&mut cloned, 7));
-            assert_eq!(claim_id_class(&mut states, 7, IdClass::Transaction, 4),
+            assert_eq!(claim_id_class(&mut states, 7, IdClass::Transaction, 4, allocation_budget),
                 Err(RecoveryError::IdClassCollision { sequence: 4 }));
             assert!(!consume_claimed_id(&mut states, 7));
         }
@@ -2685,7 +2903,19 @@ mod validator_tests {
         let payload = alloc::vec![0x59; 32 * 1024];
         records.extend(encode_object_transaction(&mut chain, TransactionId::new(3).unwrap(),
             ObjectId::new(4).unwrap(), ObjectKind::new(5).unwrap(), &payload).unwrap().records);
+        records.push(chain.append(Some(TransactionId::new(9).unwrap()), RecordBody::ObjectExternal {
+            object_id: ObjectId::new(8).unwrap(), object_kind: ObjectKind::new(5).unwrap(),
+            byte_len: 4096, merkle_root: [1;32],
+        }).unwrap());
+        let revoke = DerivationId::new(12).unwrap();
+        records.push(chain.append(Some(TransactionId::new(11).unwrap()),
+            RecordBody::RevokeTombstone { derivation_id: revoke }).unwrap());
+        records.push(chain.append(Some(TransactionId::new(13).unwrap()),
+            RecordBody::RevokeTombstone { derivation_id: revoke }).unwrap());
         let recovered = preflight_recovery(&records, store).unwrap();
+        assert_eq!(recovered.tombstone_transactions.get(&revoke.get()), Some(&TransactionId::new(11).unwrap()));
+        assert_eq!(recovered.tombstone_sequence.get(&revoke.get()), Some(&(records.len() as u64 - 1)));
+        assert_eq!(recovered.committed_objects().len(), 2);
         assert_eq!(recovered.committed_objects()[0].bytes, payload);
         for len in 1..=records.len() {
             let expected = preflight_recovery(&records[..len], store).map(|v| v.last_sequence());
@@ -2697,12 +2927,20 @@ mod validator_tests {
                         assert_eq!(prepared.bytes.capacity(), 0);
                     }
                 }
-                for object in &validator.replay.committed_objects {
-                    assert_eq!(object.bytes.capacity(), 0);
-                }
+                assert_eq!(validator.replay.committed_objects.capacity(), 0);
+                assert!(validator.replay.tombstone_transactions.is_empty());
             }
             assert_eq!(validator.finish(), expected, "prefix {len}");
         }
+        let mut duplicate = records.clone();
+        duplicate.push(chain.append(Some(TransactionId::new(10).unwrap()), RecordBody::ObjectExternal {
+            object_id: ObjectId::new(8).unwrap(), object_kind: ObjectKind::new(5).unwrap(),
+            byte_len: 4096, merkle_root: [1;32],
+        }).unwrap());
+        let expected = preflight_recovery(&duplicate, store).map(|_| ());
+        let mut duplicate_validator = PreflightValidator::new(store);
+        assert_eq!(duplicate_validator.append(&duplicate), expected);
+        assert!(expected.is_err());
         let mut invalid = records.clone();
         invalid.swap(32, 33);
         let mut validator = PreflightValidator::new(store);

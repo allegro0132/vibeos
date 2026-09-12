@@ -339,6 +339,9 @@ impl<D: GrowablePageDevice> SegmentStore<D> {
         let _maintenance_lease = self
             .acquire_maintenance(maintenance, MaintenanceOperation::Grow)
             .ok_or(GrowError::Unauthorized)?;
+        // A failed or cancelled growth must not retain predecessor provenance.
+        #[cfg(feature = "experimental-authority-delta")]
+        let experimental_cached = self.experimental_authority_base.take();
         let state = self.require_current_generation()?;
         if !state.allocation.retired_segments().is_empty() {
             return Err(GrowError::GcPending);
@@ -572,8 +575,17 @@ impl<D: GrowablePageDevice> SegmentStore<D> {
         successor.durably_cleared_seals.remove(&carrier);
         successor.recovery_peak_bytes = successor.resident_heap_bytes()
             .ok_or(GrowError::ArithmeticOverflow)?;
-        self.mount_verified_successor_witness(previous, checkpoint, successor, true, operation_peak)
-            .await.map_err(GrowError::Store)
+        let info = self.mount_verified_successor_witness(previous, checkpoint, successor, true, operation_peak)
+            .await.map_err(GrowError::Store)?;
+        #[cfg(feature = "experimental-authority-delta")]
+        if let Some(cached) = experimental_cached {
+            let state = self.require_current_generation()?;
+            let witness = state.resident_heap_bytes()
+                .and_then(|resident| self.limits.recovery_memory_bytes.checked_sub(resident))
+                .and_then(|budget| cached.after_verified_growth(state, budget));
+            self.experimental_authority_base = witness;
+        }
+        Ok(info)
     }
 }
 

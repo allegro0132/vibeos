@@ -7101,3 +7101,2142 @@ were restored byte-for-byte to the preceding two-page implementation; trial
 source, results and restoration hashes remain in
 `target/storage-scrub-four-page-payload-20260912/`. No four-page optimization
 is present in production.
+
+### Initialize only the authority metadata prefix when encoding (2026-09-12)
+
+The encoder reserves capacity for the entire output, zero-initializes only the
+metadata prefix (including all reserved fields), then appends the canonical
+record stream into the reserved suffix. Previously the full buffer was zeroed
+before the record suffix was overwritten. This removes explicit initialization
+of `record_stream.len()` bytes per full encoding without unsafe code or changing
+encoded length, metadata-only encoding, capacity requirements or physical I/O.
+No allocator-specific memory-bandwidth or end-to-end timing claim is made.
+
+All 247 segment-store unit tests (one ignored), QEMU three-boot recovery/GC/
+powered-off checks and Duo compilation pass. Newly exported empty/live delta
+and materialized images are byte-identical to all four pre-change fixtures;
+the independent verifier accepts them and rejects all 21 mutation/default-
+admission cases. Fixture generation includes the live GC power-cut matrix.
+The initial verification attempt lacked the separately generated live fixtures;
+complete results are in `independent-final.log`. Evidence and source hashes:
+`target/storage-authority-encode-prefix-20260912/`. This is an encoding-path
+change, not a reduction of authority snapshot write amplification.
+
+### Charge fixed source page buffers during experimental delta replay (2026-09-12)
+
+Before each source read, replay subtracts the source-declared fixed page
+workspace from its explicit remaining buffer budget. The reported peak includes
+retained ancestors/payloads, newly returned payload capacity and those page
+buffers. Device reads declare the existing 32 KiB segment-probe page workspace;
+a one-time transfer of the already verified tip declares zero additional pages.
+The page charge is conservative across sequential scan/payload-read phases.
+
+A 32-link regression rejects payload-plus-pages minus one byte before calling
+the source, validates exact reported-peak admission and rejects one byte less.
+All 247 unit tests (one ignored), including experimental publication/GC/growth
+fault matrices, pass. The initial full run exposed a test adapter that derived
+its buffer allowance solely as three times a payload maximum. Test adapters now
+explicitly add fixed source pages to that derived allowance; caller-supplied
+ReplayLimits are never expanded. The original failure is retained. Evidence:
+`target/storage-delta-source-pages-20260912/`.
+
+This module remains test-only, so no production firmware behavior or timing
+claim changes. Dynamic source descriptor tables, semantic replay structures,
+external caches and allocator overhead are not covered by this fixed-page
+charge; comprehensive heap admission remains unfinished before production
+authority delta can be enabled.
+
+### Reuse same-segment authority chain descriptor storage (2026-09-12)
+
+Authority sibling collection reserves an additional slot for extent zero,
+bounded by the authenticated segment's available descriptor count as well as
+the declared chain count. The authority payload reader takes ownership of the
+sibling vector and adds the first extent, avoiding a separate complete-chain
+allocation/copy for same-segment chains with sufficient capacity. Oversized
+sibling capacity falls back to an exact reservation; cross-segment collection
+and final sorting/chain validation remain intact. Actual retained descriptor
+capacity is checked against the existing descriptor allowance after reservation.
+
+All 247 unit tests (one ignored), including multi-extent recovery and delta
+publication/GC/growth fault matrices, pass. Final QEMU three-boot file-tree/GC/
+cold recovery/powered-off verification and Duo compilation pass. Final logs and
+source hashes are in `target/storage-authority-chain-reuse-20260912/`.
+No device-I/O, write-amplification or end-to-end latency gain is claimed. This
+reduces duplicate descriptor ownership but does not yet bound all simultaneous
+dynamic source allocations or enable production authority deltas.
+
+### Exercise descriptor allocation reuse during real cold recovery (2026-09-12)
+
+A regression imports 3,001 authority sectors (about 1.5 MiB), drops the mounted
+store and cold mounts it again. Test-only thread-local observations report one
+read with same-segment siblings and one reuse preserving both the allocation
+address and capacity. Recovered canonical snapshot bytes match the published
+snapshot, and the complete sparse device image remains unchanged. The assertion
+requires the optimized path to execute, rather than accepting a fixture that
+only exercises single-extent authority.
+
+The targeted test and full 248-unit suite (one ignored) pass. Evidence is in
+`target/storage-authority-chain-evidence-20260912/`. These observations add no
+production counters or behavior. They verify allocation reuse, not a complete
+heap peak, reduced physical I/O or SD latency improvement.
+
+### Reuse the observed digest for single-extent authority payloads (2026-09-12)
+
+A single-extent authority read now compares its computed payload SHA-256 with
+both the extent commitment and complete logical-payload root, avoiding a second
+hash of identical bytes. Multi-extent reads still hash the full concatenation.
+Descriptor storage is released before final whole-payload verification. Extent
+count/length, chain validation and both digest commitments remain enforced.
+
+All 248 unit tests (one ignored), QEMU three-boot recovery/GC/powered-off checks
+and Duo compilation pass. An exact pre-change control and candidate were built
+with only store.rs differing among the recorded production source hashes. ABBA
+uses the established 128-file image, 64-page cache, 128 MiB single-hart TCG,
+4/2 MiB/s and 400/200 IOPS; builds/tests completed before timing. All four object
+samples pass and all cold phases have zero writes/flushes. Both versions have
+576 mount requests / 3,641,344 bytes and 3,369 scrub requests / 23,810,048 bytes.
+Control/candidate scrub means are 8.498607 / 8.414900 seconds, and mount means
+1.439804 / 1.439496 seconds. The small timing difference is not established as
+a repeatable latency gain; eliminated duplicate hashing is the retained change.
+Evidence: `target/storage-authority-single-hash-20260912/`.
+
+### Admit payload plus final authority descriptor-chain overlap (2026-09-12)
+
+A bounded authority reader now accepts separate payload and payload-plus-chain
+limits. Once the complete descriptor chain has been validated, it checks requested
+payload length plus actual chain capacity before reserving the payload. Actual
+returned capacity is checked again before filling it. The reader returns chain
+capacity bytes to experimental delta replay, which charges them alongside retained
+ancestors, the loaded payload and fixed source pages in its read-phase peak.
+Payload quota and buffer quota are passed independently; verified-tip transfer
+reports no additional descriptor chain. Existing ordinary callers use an unbounded
+overlap allowance, preserving their payload-only policy.
+
+The real 3,001-sector fixture reports 1,537,072 bytes of payload/chain overlap,
+including 368 descriptor bytes. Exact overlap passes; one byte less and payload-
+only allowance fail with MemoryLimit; the device image is unchanged. All 248
+unit tests (one ignored), QEMU three-boot recovery/GC/powered-off verification
+and Duo compilation pass. Initial compile failures from outdated test call
+signatures are retained; final unit evidence is `segment-fixed.log`. Evidence:
+`target/storage-authority-payload-overlap-20260912/`.
+
+This closes only final-chain/payload overlap. Earlier segment-scan temporary
+tables, caller-owned memo capacity, semantic replay structures and allocator
+overhead remain outside this source constraint. No total-heap, performance or
+production-delta-admission claim is made.
+
+### Release discovery header pages before cross-segment authority scans (2026-09-12)
+
+The cross-segment authority scanner previously retained its boxed two-page
+discovery header while awaiting a full segment scan with four header/descriptor
+and four trailer pages. Explicitly dropping the discovery pair before that
+await prevents the extra 8 KiB page-buffer overlap. VerifiedRecord owns its
+decoded header fields and digests, so subsequent generation/binding checks do
+not borrow the released pages. This makes the source path consistent with the
+previously charged 32 KiB fixed probe page workspace, rather than potentially
+retaining 40 KiB of page buffers. Dynamic descriptor tables remain separate.
+
+All 248 unit tests (one ignored), including multi-segment authority and delta
+fault recovery, QEMU three-boot recovery/GC/powered-off checks and Duo compilation
+pass. Evidence: `target/storage-authority-header-lifetime-20260912/`. This is
+a source-lifetime correction supporting the fixed-page budget, not an observed
+whole-heap peak measurement or an I/O/performance improvement claim.
+
+### Bound retained segment descriptor tables before allocation (2026-09-12)
+
+The segment scanner accepts a descriptor-table limit and checks the validated
+summary record count times ExtentRecord size before reserving its retained
+table, then checks actual capacity. Bounded authority reads supply their
+remaining buffer allowance; cross-segment reads subtract the already retained
+final-chain capacity first. Declared final-chain size is also checked against
+the buffer limit before its reservation, with a post-reservation capacity check.
+Ordinary scan callers retain their unbounded table policy. Existing memo-owned
+proof storage remains an external cost.
+
+A regression verifies that one-byte-short and arithmetic-overflow requests leave
+the table capacity at zero, while exact capacity succeeds. All 249 unit tests
+(one ignored), final QEMU three-boot recovery/GC/powered-off verification and
+Duo compilation pass. Evidence: `target/storage-scan-descriptor-budget-20260912/`.
+These checks bound the full scan table and final-chain reservations; overlapping
+scan result lists, reallocation overlap, external memo capacity and semantic
+replay still need aggregate accounting. They do not establish a total source
+heap bound or enable production authority delta writes.
+
+### Bound scan-table/result-list and result-reallocation overlap (2026-09-12)
+
+Interpretation now receives the scan descriptor limit and charges actual
+verified-table capacity together with additional-match and authority-sibling
+result capacity. Result reservation checks retained tables plus existing result
+capacity; growth conservatively admits old and requested new capacity together,
+then checks the actual new capacity. Existing spare capacity remains charged.
+Historical generations are filtered before reserving result space. The same
+interpretation path handles fresh scans and memo hits; counting the referenced
+proof table on a memo hit is conservative, not an external-cache ownership bound.
+
+A boundary test verifies first-reservation failure with zero capacity, exact
+admission, failure without capacity change at one byte below growth overlap,
+and charging of existing spare capacity. All 250 unit tests (one ignored),
+QEMU three-boot recovery/GC/powered-off verification and Duo compilation pass.
+Evidence: `target/storage-scan-result-overlap-20260912/`. Final-chain takeover/
+growth overlap, external memo aggregate ownership, semantic replay and complete
+peak reporting remain to be checked before production delta admission. No
+performance or total-heap claim is made by these local overlap checks.
+
+### Bound final authority-chain growth and replacement overlap (2026-09-12)
+
+Final-chain storage preparation now uses the same checked reservation path as
+scan results. Taking a sibling allocation with enough space charges its existing
+capacity only. Growing it admits old plus new capacity together. Replacing an
+oversized sibling allocation charges the old list while the exact-size replacement
+is created and filled; only then can the old list be released. Sorting and complete
+chain validation remain unchanged.
+
+A regression covers one-slot-to-two-slot growth (three slots of overlap),
+four-slot-to-two-slot replacement (six slots of overlap), exact/one-byte-short
+budgets and pointer-preserving two-slot reuse. All 251 unit tests (one ignored),
+QEMU three-boot recovery/GC/powered-off verification and Duo compilation pass.
+Evidence: `target/storage-authority-chain-overlap-20260912/`. Local reservations
+are constrained; complete source-phase peak reporting, external memo aggregate
+ownership and semantic replay budgeting remain unfinished. No production delta
+admission or performance claim is made.
+
+### Propagate source allocation phase peaks into delta replay (2026-09-12)
+
+Checked result reservations now return their admitted peak, including old/new
+capacity overlap. Segment interpretation reports table/result peaks; authority
+chain preparation reports reuse/growth/replacement peaks. Cross-segment scans
+add the caller's retained chain capacity. The authority reader returns the
+maximum of these descriptor phases and final payload/chain overlap. Delta replay
+combines this source peak with previously retained replay buffers and separately
+reserved fixed pages, rejecting reports smaller than the returned payload or
+exceeding the explicit budget. Verified-tip transfer reports just its capacity.
+
+Tests assert reported chain reuse/growth/replacement peaks, retain the real
+source exact/one-byte-short boundary, and verify nonzero spare scan capacity
+is reported even without matching extents. All 252 unit tests (one ignored),
+QEMU three-boot recovery/GC/powered-off checks and Duo compilation pass. Evidence:
+`target/storage-source-peak-report-20260912/`. This reports conservative owned
+source vector/payload peaks, not total recovery heap: aggregate external memo
+ownership, semantic replay maps/sets, allocator overhead and stack are still
+outside this accounting. Production authority delta remains disabled.
+
+### Reserve the source memo growth allowance across delta replay (2026-09-12)
+
+The experimental source declares its retained-buffer reservation. Device sources
+reserve the supplied memo's complete bounded byte allowance, even when empty,
+so later population remains covered. Replay includes that allowance in its
+initial resident/peak count and all subsequent read, validation and rebuild
+phases. Insufficient reservation rejects before any read. A test adapter taking
+a payload maximum explicitly adds the memo allowance to its derived buffer
+limit; explicitly supplied ReplayLimits are never increased.
+
+Tests verify empty/populated memo reservation stability and a 32-link source
+with both retained buffers and fixed read pages, including zero-read rejection,
+reported-peak exact admission and one-byte-short failure. All 252 unit tests
+(one ignored), including device delta recovery and publication/GC/growth fault
+matrices, pass. Evidence: `target/storage-delta-memo-reservation-20260912/`.
+This turn changes only test-enabled delta accounting/accessors, not production
+firmware behavior. Reservation counts are conservative allowances, not measured
+live heap. Semantic replay maps/sets, stack and allocator overhead remain outside
+the accounting; production authority delta remains disabled.
+
+### Borrow grant records while validating the recovery graph (2026-09-12)
+
+Finish-time graph checks now build a map of references to committed grants
+instead of cloning every RecoveredGrant into that temporary map. Validation-only
+finish drops the borrowed graph after all fallible checks; complete recovery
+materializes an owned graph for its public result. Tombstone traversal is shared
+for owned and borrowed nodes. Parent rights/object checks and slot/revocation
+history checks retain their original order. No borrowed graph escapes finish.
+
+The isolated 2,048-grant allocator measurement now records finish peaks separately
+from append peaks. Validation finish requested-allocation peak drops from
+1,152,768 to 646,848 bytes (43.89%). Complete recovery finish peak drops from
+1,283,840 to 1,091,056 bytes (15.02%); append retained/peak bytes are unchanged
+at 586,400 / 586,528. Finish figures include replay state live at entry but
+exclude input records, allocator bookkeeping, RSS and stack. These are measured
+fixture results, not a hard semantic replay budget or SD latency claim.
+
+Full durable-format tests, 252 segment-store unit tests (one ignored), QEMU
+three-boot recovery/GC/powered-off checks and Duo compilation pass. Evidence,
+source hashes and before/after measurements are in
+`target/storage-validation-borrowed-graph-20260912/`.
+
+### Omit committed object output during validation-only replay (2026-09-12)
+
+PreflightValidator now omits the committed RecoveredObject output vector as
+well as inline content. Full recovery retains both. Transaction completion,
+object identity consumption, chunk lengths and content/commit CRC checks still
+run before the optional output insertion. Mixed inline/external prefix tests
+assert zero output-vector capacity while complete recovery returns both objects;
+a repeated external object ID remains invalid.
+
+An isolated 2,048-external-object fixture reduces validation retained and peak
+requested allocation from 553,088 to 290,944 bytes (47.40%). Input records,
+stack, allocator bookkeeping and RSS are excluded. The complete durable-format
+suite, 252 segment-store unit tests (one ignored), QEMU three-boot recovery/GC/
+powered-off verification and Duo compilation pass. Evidence and source hashes:
+`target/storage-validation-object-output-20260912/`. This is a measured memory
+reduction, not a semantic replay hard budget or a demonstrated SD latency gain.
+
+### Omit tombstone transaction output during validation-only replay (2026-09-12)
+
+Validation retains each derivation's earliest tombstone sequence for graph and
+slot-history checks, but no longer builds the separate first-tombstone transaction
+map used only by complete recovery output/rewriting. Stable transaction identity
+consumption and duplicate checks remain in the transaction map. Full recovery
+still records the first revoking transaction. The private output-retention flag
+now covers both object and tombstone-transaction output.
+
+Mixed-prefix tests include repeated revocation, assert an empty validation output
+map and confirm complete recovery retains the earliest sequence/transaction.
+For 2,048 tombstones, isolated retained and peak requested allocation drops from
+523,200 to 393,472 bytes (24.79%). Input records, stack, allocator bookkeeping
+and RSS are excluded. Full durable-format tests, 252 segment-store unit tests
+(one ignored), QEMU three-boot recovery/GC/powered-off verification and Duo
+compilation pass. Evidence: `target/storage-validation-tombstone-output-20260912/`.
+This reduces retained validation state but does not yet enforce a complete
+semantic replay heap budget or demonstrate SD latency improvement.
+
+
+### Stream replay chain probes without a batch-sized array (2026-09-12)
+
+Incremental replay now checks the chain during its existing decode pass, retaining
+only the first chain error. It still decodes later sectors before returning that
+error, preserving sealed-record error precedence and absolute sector offsets.
+Semantic mutation starts only after the entire decode/chain pass succeeds. This
+removes the temporary Vec<Option<ChainProbe>> without adding another decoding
+pass. Both complete recovery and validation use this path.
+
+An isolated batch of 65,536 empty sectors after a valid format record reduces
+additional allocator-requested peak from 3,145,728 bytes to zero. This fixture
+isolates the probe array; the existing completed-grant, external-object and
+tombstone fixtures have unchanged peaks because their later semantic state
+already dominates. A new 2,048-pending-grant fixture retains/peaks at 553,632
+bytes before finish in both versions. Measurements exclude input records,
+allocator bookkeeping, RSS and stack; they are not an SD latency result.
+
+The kernel allocator's owner quota cannot by itself make semantic replay
+fallible: quota rejection returns null, while BTreeMap insertion and Box::new
+still use infallible allocation. Replacing these structures with explicitly
+capacity-accounted fallible storage is required before claiming a complete hard
+budget. Admission must include prepared transactions, retained identities,
+committed grants, tombstone indexes, finish-time graph/slot storage and growth
+overlap. Returning a budget error must poison the replay and prevent publication;
+it must not silently discard unfinished transactions or identity history.
+Production authority delta remains disabled.
+
+Evidence: `target/storage-replay-streaming-probe-20260912/`. A regression covers
+later sealed errors versus earlier chain errors, absolute offsets after a prior
+append, and poisoned replay/validator behavior. Full durable-format tests and
+252 segment-store unit tests (one ignored) pass.
+QEMU three-boot recovery/GC/powered-off verification and Duo compilation also
+pass; gate logs are retained alongside the allocation measurements.
+
+### Fallible contiguous stable-ID index (2026-09-12)
+
+Replay's append-only identity/class/consumption index now uses AVL nodes in one
+Vec instead of BTreeMap nodes. Sorted, reverse and shuffled IDs retain logarithmic
+lookup/insert depth, without relying on randomized hashes or standard-library
+BTreeMap node layout. The same class-collision and identity-consumption checks
+remain shared by complete recovery and validation; cloning preserves consumed
+bits. No journal or authority payload bytes change.
+
+New node capacity is reserved with try_reserve_exact before changing tree links.
+The private insertion API admits an explicit node-buffer allowance, charging old
+and replacement capacities during growth and allowing smaller growth near the
+limit. Boundary tests cover exact admission, one-byte-short rejection, preserved
+entries after rejection, all rotation shapes and 4,096 IDs in three orders.
+Production callers currently pass an unrestricted allowance: this is a fallible,
+capacity-accountable building block, not an enabled total semantic replay budget.
+Cloning, transaction boxes/maps, output vectors and finish-time maps still need
+separate treatment before that budget can be claimed. Allocator bookkeeping and
+stack are outside node-buffer accounting; production authority delta stays off.
+
+Isolated 2,048-entry allocation fixtures show these retained-byte changes:
+
+| Fixture | Before | After | Reduction |
+| --- | ---: | ---: | ---: |
+| completed grants | 586,400 | 557,248 | 4.97% |
+| external objects | 290,944 | 262,336 | 9.83% |
+| pending grants | 553,632 | 524,480 | 5.27% |
+| tombstones | 393,472 | 364,864 | 7.27% |
+
+The completed-grant finish peaks are unchanged because the identity index is
+released before graph construction. Input storage, allocator bookkeeping, RSS
+and stack are excluded from these fixture measurements. Full durable-format
+coverage, 252 segment-store unit tests (one ignored), QEMU three-boot recovery/
+GC/powered-off verification and Duo compilation pass. Evidence and exact source
+control/candidate builds: `target/storage-replay-fallible-ids-20260912/`.
+
+Controlled 128-file cold-image ABBA runs (cache 64, 128 MiB, one hart, TCG single,
+4/2 MiB/s and 400/200 IOPS limits) produce essentially unchanged phase sums:
+9.8615335 s control versus 9.8617595 s candidate. Mount remains 576 reads /
+3,641,344 bytes; scrub remains 3,369 reads / 23,810,048 bytes. All cold phases
+report zero writes/flushes and all four object samples pass. This supports
+retaining the memory/accounting change without claiming a latency improvement
+or extrapolating to real SD hardware.
+
+### Fallible transaction index and in-place completion (2026-09-12)
+
+The contiguous AVL index is now generic over its value and also stores replay
+transaction states. Keys remain permanently retained to reject transaction ID
+reuse. Grant/object commits transfer the prepared value out with mem::replace,
+leaving Finished in the same node; they no longer remove and reinsert map nodes.
+Orphan grant commits still consume their stable transaction/derivation IDs, and
+invalid or repeated commits still poison replay. Prepared object content is
+transferred without cloning. Existing recovery and validator checks are shared.
+
+Node growth remains fallible and capacity-accountable. A focused test confirms
+that replacing an owned value returns the original contents with unchanged node
+pointer/capacity even under zero growth allowance. Production node allowances
+remain unrestricted; prepared-state boxes, cloning, other buffers and finish
+indexes still need admission before a full semantic memory limit can be enabled.
+Authority delta is still test-only.
+
+For 2,048 completed grants, append allocation/reallocation calls decrease from
+2,751 to 2,085 (24.21%). This includes prepared boxes and committed-vector growth,
+not just index allocations. There is a retained-capacity tradeoff: the measured
+completed, pending, external-object and tombstone fixtures each retain 2,896 more
+bytes (0.5–1.1%) than the prior index implementation. Completed-grant retained
+bytes are 557,248 -> 560,144; append peak is 557,376 -> 560,272. Finish peaks are
+unchanged. Measurements exclude input storage, stack, allocator bookkeeping and
+RSS, and do not establish SD latency or physical write amplification gains.
+
+Full durable-format coverage, 252 segment-store unit tests (one ignored), QEMU
+three-boot recovery/GC/powered-off verification and Duo compilation pass.
+Evidence: `target/storage-replay-fallible-transactions-20260912/`.
+
+Controlled cold-image ABBA (cache 64, 128 MiB, one hart, TCG single, 4/2 MiB/s
+and 400/200 IOPS limits) yields phase sums of 9.8619760 s control
+and 9.8601925 s candidate, effectively unchanged. Mount remains
+576 requests / 3,641,344 bytes; scrub remains 3,369 / 23,810,048. All cold
+phases have zero writes/flushes and all four object samples pass. Retain the
+change for fallible node growth and fewer allocation calls, without claiming
+a measured latency improvement or real-SD result.
+
+### Return prepared-state allocation failures instead of aborting (2026-09-12)
+
+Prepared grant/object boxes now allocate the same Layout through a small checked
+helper and return RecoveryError::AllocationFailed on null. A successful allocation
+is initialized before Box takes ownership; zero-sized values use allocation-free
+Box construction. Replay also calls try_reserve before growing committed-grant,
+committed-object and retained inline-content vectors. Any append error continues
+to poison the builder, preventing publication of partially applied state.
+
+A separate integration-test process uses thread-local allocator fault injection
+to reject every allocation/reallocation in a mixed 32-grant, empty-object and
+external-object append. All 45 complete-replay and 44 validation-only failure
+points return AllocationFailed, and subsequent append/finish return ReplayPoisoned.
+The sweep then reaches a successful append and finish. Thread-local injection
+keeps test-harness allocations outside the failure window. This fixture explicitly
+contains no ObjectChunk records: chunk decoding still constructs its own Vec,
+and its failure handling is a remaining task, as are tombstone/finish maps and
+cloning. No total semantic quota or production authority delta is enabled.
+
+Isolated successful replay allocation measurements are unchanged from the prior
+transaction-index change: 2,048 completed grants use 2,085 append allocation calls,
+560,144 retained bytes and 560,272 peak bytes. This is failure-path work, not a
+claim of lower SD latency or write amplification. Evidence:
+`target/storage-replay-fallible-prepared-20260912/`.
+Full durable-format coverage, 252 segment-store unit tests (one ignored), QEMU
+three-boot recovery/GC/powered-off verification and Duo compilation pass.
+
+### Borrow sealed inline chunks during replay (2026-09-12)
+
+Both replay decoding passes now omit the temporary owned ObjectChunk.data Vec.
+The private decoder still validates chunk length, zero padding, CRC, seal and
+envelope exactly as the public decoder does; semantic replay borrows the checked
+payload slice from the input sector for chunk/content CRC and optional output
+copying. Public LogRecord::decode retains its original owned-data contract.
+No borrowed content escapes append. Full recovery still retains object bytes;
+validation retains only counters/digests.
+
+For one 32 KiB inline object (92 chunks), append allocation calls decrease from
+196 to 12 for complete replay and from 187 to 3 for validation: both avoid 184
+short-lived chunk allocations across the two passes. Complete replay retained/
+peak bytes stay 47,872 / 47,984. Validation retained bytes stay 1,280 and peak
+drops from 1,752 to 1,392. Figures exclude input storage, stack, allocator
+bookkeeping and RSS. These measurements do not establish SD latency or physical
+write-amplification improvement.
+
+Decoder parity tests cover valid lengths 1, 359 and 360 plus every byte position
+mutated before and after refreshing CRC (3,072 mutation comparisons), asserting
+the same decoded metadata/errors and zero internal chunk capacity. Allocation
+fault injection now includes a 4 KiB nonempty inline object: all 51 complete-
+replay and 45 validation append allocation points return AllocationFailed and
+poison subsequent append/finish. A successful recovery also checks exact content.
+Tombstone and finish indexes, cloning and total semantic admission remain work
+items; authority delta remains test-only. Evidence:
+`target/storage-replay-borrowed-chunks-20260912/`.
+Full durable-format coverage, 252 segment-store unit tests (one ignored), QEMU
+three-boot recovery/GC/powered-off verification and Duo compilation pass.
+
+### Fallible tombstone indexes (2026-09-12)
+
+Replay and recovered-preflight tombstone sequence/transaction indexes now use
+capacity-accountable AVL storage. Repeated revocations preserve the earliest
+sequence and original transaction; validation still omits the transaction-only
+output index. Retaining the indexes in RecoveryPreflight avoids re-materializing
+BTreeMaps at finish. Read-only lookup shares the same index search as updates.
+
+Index iteration follows insertion order. Compaction events still sort by record
+sequence, and the public recovered tombstone vector explicitly sorts by ID to
+preserve its prior ordering. A regression covers out-of-order and duplicate
+revocations; existing rewrite/equivalence and earliest-tombstone tests pass.
+
+The 2,048-tombstone validation fixture reduces append allocation calls from 367
+to 40, with a capacity tradeoff: retained/peak bytes increase from 367,760 to
+397,856 (8.18%). These requested-allocation figures exclude input storage, stack,
+allocator bookkeeping and RSS. Keep the change for fallible admission building
+blocks and fewer allocator calls, not as a memory reduction or measured SD
+latency improvement. Production allowances are not yet bounded globally.
+
+Fault injection includes 32 reverse-ordered orphan tombstones and a repeat:
+all 58 complete-replay and 50 validation append allocation failures return
+AllocationFailed and poison append/finish. Successful recovery still verifies
+inline content. Finish graph/slot indexes, cloning and total semantic admission
+remain outstanding; production authority delta remains disabled. Evidence:
+`target/storage-replay-fallible-tombstones-20260912/`.
+Full durable-format coverage, 252 segment-store unit tests (one ignored), QEMU
+three-boot recovery/GC/powered-off verification and Duo compilation pass.
+
+### Index committed grants by position and make finish growth fallible (2026-09-12)
+
+The recovery graph now maps derivation IDs to positions in the immutable
+committed-grant vector. Complete RecoveryPreflight keeps that index instead of
+cloning every grant into a second owned graph; validation drops it after checks.
+Parent lookups only see previously inserted grants, preserving missing-parent,
+rights and object-kind error order. Compaction and root selection use the same
+indexed vector. Applying root policy computes fallible liveness flags before
+consuming/compacting that vector, so positions cannot become stale mid-traversal.
+
+ReplayIndex now accepts copyable ordered keys as well as u128 IDs. Finish's
+object-kind and compound (space, slot) indexes use fallible node growth; output
+slots reserve fallibly and sort by (space, slot), preserving public order.
+Graph/slot/ancestor checks still run in their original commit order. A regression
+covers slots inserted out of order across spaces.
+
+For 2,048 completed grants, builder finish requested-allocation peak decreases
+from 1,091,056 to 779,648 bytes (28.54%). Validation finish peak increases slightly
+from 646,848 to 648,576 bytes (0.27%). Append retained/peak bytes and calls remain
+560,144 / 560,272 and 2,085. These fixture measurements include replay state live
+at finish entry but exclude input storage, stack, allocator bookkeeping and RSS;
+they are not a whole-system or real-SD latency measurement.
+
+The mixed grant/inline-object/tombstone fault fixture now sweeps finish as well:
+all six complete-builder and five validator finish allocation points return
+AllocationFailed. The 58/50 append failure points still poison replay. Public
+root-policy finalization, arbitrary cloning/rewriting and a coordinated total
+semantic byte allowance are not covered by that finish sweep. Production
+allowances remain unrestricted and authority delta remains test-only. Evidence:
+`target/storage-replay-fallible-finish-20260912/`.
+Full durable-format coverage, 252 segment-store unit tests (one ignored), QEMU
+three-boot recovery/GC/powered-off verification and Duo compilation pass.
+
+Fixed-image cold ABBA (cache 64, 128 MiB, one hart, TCG single, 4/2 MiB/s
+and 400/200 IOPS limits) yields phase sums 9.8617495 s control
+and 9.8618190 s candidate, effectively unchanged. Mount retains
+576 reads / 3,641,344 bytes, scrub 3,369 / 23,810,048; all cold phases report
+zero writes/flushes and all four object samples pass. No latency improvement
+is claimed from this comparison.
+
+### Share index capacity admission across replay phases (2026-09-12)
+
+A replay-local requested-capacity ledger now spans ID, transaction, tombstone,
+graph, object-kind and slot indexes. Index growth charges the replacement while
+all other retained indexes and the old capacity remain charged, then releases
+the old capacity. Allocation failure rolls back the reserved charge. Finish
+releases append-only and temporary index charges when their buffers are dropped.
+The ledger itself allocates no heap storage.
+
+A shared-index boundary test admits two retained 16-node indexes plus a minimum
+17-node replacement at exactly 49 node sizes and rejects one byte less before
+mutation. It also checks that another index stays readable and releasing indexes
+returns usage to zero. A 64-byte validator index allowance rejects append and
+poisons append/finish. Builder clones reconcile the ledger against actual Vec
+capacities before the next append/finish, since cloning may shrink spare capacity;
+a regression verifies reconciliation and successful independent finish.
+
+This limit is deliberately private and index-only. Production constructors still
+use an unrestricted allowance. Prepared boxes, committed/output vectors, inline
+content, allocator bookkeeping and stack are outside this ledger; it must not
+be presented as the complete semantic heap budget. Clone allocations themselves
+are not admitted by the ledger. Production authority delta remains disabled.
+
+All existing 58/50 append and 6/5 finish allocation-failure points still reject
+safely. Successful 2,048-grant measurements remain 2,085 append calls, 560,144 /
+560,272 retained/peak bytes, and 779,648 / 648,576 complete/validation finish peaks.
+There is no newly demonstrated latency or SD I/O improvement in this step.
+Evidence: `target/storage-replay-shared-index-budget-20260912/`.
+Full durable-format coverage, 252 segment-store unit tests (one ignored), QEMU
+three-boot recovery/GC/powered-off verification and Duo compilation pass.
+
+### Bound validation's requested semantic allocation capacity (2026-09-12)
+
+PreflightValidator::with_memory_limit now applies one allowance across append
+and finish to all validation-owned indexes, prepared grant/object boxes and the
+committed-grant vector. Growth admits replacement capacity while old buffers
+remain charged; committed transactions and finish release prepared-box charges.
+Validation borrows chunk input and omits content/object/tombstone-transaction/
+slot output, so those output allocations are absent from the limited path.
+Normal PreflightReplay remains unrestricted and its recovery output, cloning
+and root-policy finalization are not covered by this validation-only contract.
+
+memory_usage returns retained/peak accounted bytes for an unpoisoned validator;
+finish_with_memory_usage returns the validated sequence, zero retained bytes and
+the conservative requested-capacity peak after dropping all validation state.
+Allocation/admission failure returns AllocationFailed; failed append poisons all
+subsequent operations, including usage queries. The allowance excludes input
+sectors, stack and allocator bookkeeping/RSS. It is not a whole-heap/device quota.
+
+A mixed grant/inline/external-object/tombstone fixture scans 286 allowances:
+13 succeed and 273 reject. The unrestricted reference retains 14,784 bytes with
+an 18,240-byte admitted peak; that peak succeeds as an explicit limit. Batches
+of 1, 3 and 17 records also succeed within it. Zero allowance accepts a format-only
+journal. Box and vector tests cover exact admission and one-byte-short rejection,
+including another retained buffer and old/new vector overlap. All 58/50 append
+and 6/5 finish injected allocator-failure points continue to fail closed.
+
+Independent allocator measurements now assert that ledger-retained bytes equal
+actual requested live bytes for completed/pending grants, external objects,
+inline validation and tombstones. Successful fixture allocation counts and peaks
+are unchanged: 2,048 grants use 2,085 append allocations, 560,144 / 560,272 retained/
+peak bytes and 779,648 / 648,576 complete/validation finish peaks. There is no new
+SD latency or physical-I/O claim. Authority delta is still disabled: its enclosing
+payload/metadata/source budget must pass the remaining allowance into this API
+and account for the reported semantic peak before production admission.
+Evidence: `target/storage-validator-memory-limit-20260912/`.
+Full durable-format coverage, 252 segment-store unit tests (one ignored), QEMU
+three-boot recovery/GC/powered-off verification and Duo compilation pass.
+
+### Include semantic validation in authority delta admission (2026-09-12)
+
+Delta's base and successor validation now receive the workspace allowance left
+after resident source/payload/reconstruction buffers. Snapshot decoding first
+charges retained metadata tables, then gives the remainder to PreflightValidator.
+The returned workspace peak is retained metadata plus the larger of semantic
+replay and temporary binding-ID index peaks; these scratch phases do not overlap.
+The delta reader adds that workspace to resident buffers and propagates semantic
+AllocationFailed as its Memory error. Physical pointer/hash/depth checks remain.
+
+Strict snapshot-sector inspection now uses an allocation-free LogRecord API
+that validates canonical bodies/seals/envelopes and returns store/sequence only.
+It rejects empty/torn sectors and preserves sealed-record error precedence without
+allocating temporary inline chunk Vecs outside the semantic budget. Public owned
+decoding remains unchanged. Mutation parity and allocator-denial tests cover this
+inspection path, including inline records.
+
+A 4 KiB inline-object successor has 8,832 output bytes and 1,392 semantic workspace
+bytes: reconstruction reports 10,224 extra bytes. Output-only allowance rejects;
+the reported combined peak succeeds and reproduces exact canonical bytes. Another
+assertion exercises the outer reader with loaded base and ancestor table still
+resident, checking their sum with semantic peak and refusal when no semantic
+allowance remains. An unordered metadata fixture checks metadata + max(semantic,
+ID-index) and sealed-error precedence under insufficient semantic space.
+
+All 254 segment-store unit tests (one ignored), durable-format coverage, QEMU
+three-boot recovery/GC/powered-off verification and Duo compilation pass.
+Evidence: `target/storage-delta-semantic-budget-20260912/`. This is requested
+buffer/workspace-capacity admission, not allocator bookkeeping, stack or total
+process memory. Authority delta remains test-only pending production admission
+review; no new SD latency or write-amplification measurement is claimed here.
+
+### Honor the checkpoint caller's remaining delta allowance (2026-09-12)
+
+The experimental checkpoint bridge previously treated recovery's remaining byte
+allowance as a payload maximum, expanding it to three payloads plus source pages
+and memo reservation. It now passes that exact allowance as the replay buffer
+limit. Pages, memo, metadata and semantic state must fit inside it. Standalone
+writer/device test adapters still have their documented derived allowances and
+are not production admission paths.
+
+The bridge also returns its transient peak; mount adds the pre-existing resident
+state and observes the total in recovery_peak. This prevents delta reconstruction
+workspace from disappearing from recovery telemetry after only the resulting
+snapshot remains. The source's verified-tip reuse remains intact.
+
+A regression checks zero/small/maximum allowance preservation. A 1,152-byte
+snapshot cannot replay with only 1,152 bytes available; its measured covered peak
+is 1,248 bytes, which succeeds as the exact allowance. All 255 segment-store unit
+tests (one ignored) pass. Fresh empty/live delta and GC-materialized images pass
+the independent offline verifier and its 21 rejection cases. Evidence:
+`target/storage-delta-checkpoint-budget-20260912/`. This turn changes test-enabled
+checkpoint integration only; the production format gate remains closed.
+
+The admission review identified remaining work before enabling production:
+normal post-replay snapshot decoding still uses a retained-record/table capacity
+estimate and an unrestricted semantic decoder; it should use the bounded decoder
+with observed workspace. Publication's cold-read adapter still derives a larger
+allowance and maps replay failures too broadly. Offline admission is explicitly
+opt-in and must be coordinated with any writer/reader feature rollout. Existing
+fault/GC proofs do not by themselves resolve these integration conditions.
+
+### Bound owned authority decoding during cold recovery (2026-09-12)
+
+Production VIBEAUT2 recovery now passes its remaining allowance to the owned
+snapshot decoder, charging the input buffer and existing recovery state
+separately. The decoder admits retained metadata, semantic/index scratch and the
+final record-stream copy, and mount observes their peak overlap. The existing
+final snapshot/root capacity preflight remains in place. Record copying now uses
+fallible reservation instead of an unchecked allocation.
+
+Memory admission/allocation failures have a distinct MemoryLimit error; fixed
+format bounds remain OutOfBounds and mount treats them as corruption. The
+experimental delta validator uses the same distinction. Tests cover an oversized
+principal count, record-copy admission one byte below its requirement, semantic
+workspace overlap and successful smaller index reservations under a tight budget.
+One fixture retains 1,640 bytes but uses 2,152 bytes at unconstrained decode peak;
+with a 1,640-byte allowance it successfully limits that peak to 1,640 bytes.
+
+All 257 segment-store unit tests pass (one ignored). QEMU three-boot recovery,
+GC pressure and powered-off verification pass, as does Duo firmware compilation
+(no real-device execution). Evidence is in
+`target/storage-bounded-authority-decode-20260912/`. These figures count requested
+buffer capacity, excluding caller-owned input, stack and allocator bookkeeping;
+they do not describe total heap/RSS or establish a latency improvement. Authority
+delta remains test-only. Writer cold-read budget integration and coordinated
+production/offline admission remain outstanding before enabling it.
+
+### Honor cold writer replay allowance and preserve errors (2026-09-12)
+
+The experimental authority publisher's cold path no longer expands the supplied
+replay allowance to three payloads plus fixed source pages. It now shares the
+checkpoint reader's exact allowance conversion, including source/reconstruction
+workspace within that limit. The parameter is explicitly named cold_replay_bytes:
+this does not yet bound caller-owned mounted state, the successor snapshot or the
+subsequent encoding phase. The standalone device fixture adapter still accepts a
+payload bound and derives a larger workspace allowance.
+
+Cold replay now preserves source device errors and maps workspace exhaustion to
+MemoryLimit, keeping corrupt bytes classified as Corrupt. Codec allocation errors
+are likewise preserved through the publisher. A regression exercises zero and
+snapshot-only allowances, injected device read failure, corrupted predecessor
+media, and exact warm/cold output equality. A valid warm provenance witness works
+with zero cold-read allowance against a device that refuses every read. All these
+encoding attempts leave media unchanged.
+
+All 258 segment-store unit tests pass (one ignored). Fresh full/delta and
+GC-materialized empty/live images pass independent offline verification and its
+21 rejection cases. Evidence: `target/storage-delta-writer-cold-budget-20260912/`.
+These edits are test-only and do not change the QEMU production firmware, so no
+new firmware latency or SD write-amplification result is claimed. Production delta
+admission is still closed: the full writer encoding/ownership budget and the
+coordinated writer/reader/offline format rollout remain to be completed.
+
+### Bound authority encoding and release predecessor metadata earlier (2026-09-12)
+
+The shared full/metadata snapshot encoder now reserves output fallibly and offers
+an explicit requested-capacity allowance. Its peak is max(structural ID-index
+scratch, output capacity): structural validation finishes and drops scratch before
+output allocation. The public production encoder retains its existing unlimited
+API but allocation failure now returns MemoryLimit rather than using infallible
+Vec::with_capacity. Canonical output bytes are unchanged.
+
+Experimental delta encoding now offers a bounded variant that includes both
+metadata encoders' scratch/capacities and final output overlap. Once the old
+metadata digest is computed, that buffer is dropped before delta output is
+allocated. The physical-link fixture's former simultaneous capacity was 1,280
+bytes; the new covered peak is 1,152 bytes (10% lower). Without the physical header,
+it is 1,152 to 1,024 bytes. Exact peak allowances succeed and peak minus one fails
+for these fixtures. Reconstruction produces the same successor bytes. These small
+fixture values are not a bound on arbitrary workloads or total process RSS.
+
+All 260 segment-store unit tests pass (one ignored). An isolated allocator-fault
+integration test denies the production output allocation and observes MemoryLimit;
+retry returns the original independently constructed canonical fixture. QEMU
+three-boot recovery/GC/powered-off verification and Duo compilation pass. Fresh
+empty/live delta and GC-materialized fixtures pass independent offline validation
+and its 21 rejection cases. Evidence: `target/storage-authority-encode-budget-20260912/`.
+
+The bounded encoder primitives are available, but the experimental publisher has
+not yet combined mounted input ownership, cold decode, encoding and publication
+into one writer budget; its existing encoding wrapper remains unlimited. Authority
+delta stays test-only pending that integration and coordinated format admission.
+No SD throughput, latency or additional write-amplification gain is claimed here.
+
+### Integrate one encoder workspace allowance across delta paths (2026-09-12)
+
+The experimental writer now applies its workspace allowance beyond cold replay.
+Warm provenance validation uses bounded metadata encoding; warm physical-link
+encoding and full-snapshot fallback use the bounded encoders. Cold link selection
+charges reconstructed byte capacity and retained ancestor capacity before owned
+snapshot decoding. It then subtracts the decoded snapshot's actual capacity
+before canonical metadata comparison and link encoding. Canonical comparison
+still checks exact bytes and releases its metadata before encoding the output.
+A full-snapshot fallback releases the recovered predecessor before allocating its
+replacement. Device errors and memory/corruption classification remain distinct.
+
+A cold fixture retains 1,248 replay bytes/ancestor bytes plus a 1,024-byte decoded
+snapshot and needs 1,152 bytes of encoding workspace, for a covered peak of 3,424
+bytes. The exact combined allowance succeeds; resident-only, resident+decoded,
+and peak-minus-one allowances refuse. The warm path now correctly refuses zero
+and output-only workspace even with a valid witness. Full-snapshot warm fallback
+succeeds at exact output size and refuses one byte less. Warm encoding still
+makes no reads and produces the same bytes as cold encoding.
+
+All 261 segment-store unit tests pass (one ignored). Fresh empty/live delta and
+GC-materialized images pass the independent offline verifier and its 21 rejection
+cases. Evidence: `target/storage-delta-encode-integration-20260912/`. This change is
+within test-only authority delta; the production firmware was not changed and no
+new QEMU timing/SD performance claim is made.
+
+This is an encoder-owned workspace limit, not a total writer heap limit. The
+publisher still owns the mounted state, a cloned publication state, and the next
+snapshot outside this allowance; publication buffers and installation of the new
+witness also require admission. MountedState::resident_heap_bytes is available to
+account for the mounted snapshot, and cloning can be delayed until after encoding.
+Those caller ownership/publication phases plus coordinated format rollout remain
+before production delta admission. The production gate stays closed.
+
+### Charge caller snapshot residency and defer the publication clone (2026-09-12)
+
+Experimental delta publication now borrows the mounted state throughout encoding
+instead of cloning it before replay begins. It subtracts the mounted state's
+tracked resident capacities and the next snapshot's actual capacities from the
+allowance passed to the encoder. After encoding, it checks the tracked overlap of
+both input snapshots, output capacity and publication clone before creating that
+clone. The original next snapshot is dropped after publication and before the new
+provenance witness is built.
+
+A 33-record predecessor fixture defers 16,956 tracked bytes of state cloning
+until after encoding a 960-byte delta. This removes that clone from the encoder's
+live buffers; it is not a measured reduction in the whole publication peak.
+Regression cases deny admission below input residency, with no workspace left,
+and when encoding fits but its output plus the clone does not. They check zero
+mutations, unchanged durable media/generation, no poisoned store, cleared witness,
+and successful retry after restoring the normal allowance.
+
+All 262 segment-store unit tests pass (one ignored). Fresh empty/live delta and
+GC-materialized images pass independent offline verification and 21 rejection
+cases. Evidence: `target/storage-delta-caller-budget-20260912/`. These changes are
+inside the experimental test-only publisher; production QEMU firmware is unchanged.
+
+The existing resident_heap_bytes accounting covers the Vec-backed mounted tables;
+it excludes runtime BTreeSet proof nodes, other store caches, allocator bookkeeping
+and stack. Clone reservation is still an estimate using tracked capacities, not
+fallible admission for every underlying allocation. Publication itself additionally
+allocates free-segment lists, successor allocation state/encoding, framed payloads
+and mounted successor state; those phases and witness construction remain to be
+integrated before production authority delta admission. No new SD performance or
+write-amplification result is claimed.
+
+### Prepare publication descriptors before mutation and release verified bytes (2026-09-12)
+
+Production authority publication now reserves the exact number of payload
+descriptors: authority extent count plus allocation and optional empty catalog.
+The old fixed reservation of three could trigger infallible Vec growth after
+SegmentBuilder had started writing a multi-extent publication. Both payload and
+readback descriptor tables are now reserved fallibly and assembled/admitted as
+appropriate before quota installation, clearing mounted state or beginning I/O.
+The readback table uses the same exact descriptor count instead of count+3.
+
+After checkpoint durability and staged payload verification, the publisher drops
+both descriptor tables, physical pointers, encoded authority bytes, allocation
+bytes and optional catalog bytes before constructing roots and cloning successor
+state. No reader needs those buffers afterward. The successor still records whether
+an empty CAS catalog was published via a saved boolean. On-media framing, write
+order, checkpoint barrier and readback validation remain unchanged.
+
+All 262 segment-store unit tests pass (one ignored), including publication and GC
+mutation/cancellation fault cases and multi-extent authority cases. QEMU three-boot
+file-tree recovery/GC/powered-off verification and Duo compilation pass. Evidence:
+`target/storage-publication-buffer-lifetime-20260912/`. There is no new latency or
+whole-operation peak-memory measurement. Readback descriptors are now resident
+earlier during writes; the large encoded payloads are released earlier during
+successor installation. Authority delta remains test-only, and complete publication
+allocation admission is still outstanding.
+
+### Measure publication allocations; reject naive mid-batch draining (2026-09-12)
+
+A new isolated host probe, `authority_publication_memory`, uses a preallocated
+page device so media writes do not allocate BTreeMap nodes. It imports format and
+high-water records with no object payloads at 32, 2,048 and 4,096 records. The input
+journal, import and device are prepared before the baseline. It measures extra
+live allocator-requested bytes, allocation/reallocation calls, I/O-boundary live
+bytes, written pages, write requests and flushes. Each case cold-mounts and compares
+the exact recovered record stream. Run alone:
+
+```sh
+cargo test -p vibeos-segment-store --test authority_publication_memory -- --ignored --nocapture --test-threads=1
+```
+
+The preceding descriptor/lifetime change did **not** lower whole-operation peak.
+For 32/2,048/4,096 records, control extra peaks were 199,280/2,358,648/4,480,704
+bytes; the current implementation reports 199,640/2,358,952/4,481,216. Large cases
+save one allocation, with identical page I/O and flush counts. Earlier descriptor
+reservation shifts a few hundred bytes into the peak; earlier payload release
+helps a later phase that did not set this maximum. The change retains its
+pre-mutation allocation benefit, but is not claimed as a peak-memory improvement.
+
+Inspection found SegmentBuilder checks its 64-page drain threshold only after a
+whole payload batch is staged. A trial draining during payload fill reduced peak
+but split coalesced header/descriptor/payload writes:
+
+| Journal records | Current extra peak | Trial extra peak | Current/trial allocations | Current/trial write requests |
+| --- | ---: | ---: | ---: | ---: |
+| 32 | 199,640 | 199,640 | 93 / 93 | 6 / 6 |
+| 2,048 | 2,358,952 | 2,131,564 | 357 / 374 | 14 / 17 |
+| 4,096 | 4,481,216 | 4,229,708 | 619 / 659 | 22 / 27 |
+
+Written pages stay 23/277/535 and flushes stay four in all cases. The trial passed
+262 storage unit tests, but was **reverted**: a 9.6%/5.6% peak saving came with
+21.4%/22.7% more write requests, an undesirable unmeasured SD latency tradeoff.
+A better streaming design should retain contiguous header/descriptor/payload
+coalescing and the checkpoint durability protocol. The production writer is back
+to its prior batching behavior. No QEMU timing or real SD result is claimed.
+
+Evidence: `target/storage-publication-allocation-measure-20260912/`. Control and
+candidate measurements were repeated; final restored measurements confirm original
+request counts. This is requested live allocation accounting, excluding baseline
+storage, allocator bookkeeping, stack and transient allocator-internal realloc
+copies. The synthetic authority-only workload is not an object-store throughput
+benchmark. Authority delta remains test-only.
+
+### Stream deferred records in physical order without extra write requests (2026-09-12)
+
+The deferred-barrier sink path now stages the header, each descriptor body/seal,
+and its payload in physical record order, draining at 64 queued pages while
+filling the batch. Previously the sink eventually sorted this same set of pages
+into physical order, but had to retain the entire batch first. Simply draining
+payloads earlier split descriptor/header runs (the rejected preceding trial).
+Ordered staging preserves coalescing in the measured publication cases. The
+non-deferred path retains its original payload/body/seal barrier phases.
+
+Drains issue writes only, with the same 32-page/128-KiB request ceiling and no
+extra flush. A complete segment summary/checkpoint still must be published before
+these pages are admissible. The 64-page threshold bounds this staging loop, not
+all caller-owned buffers or the temporary contiguous drain buffer.
+
+Repeated host publication allocation results against the preceding implementation:
+
+| Journal records | Prior extra peak bytes | Ordered extra peak bytes | Write requests, both | Flushes, both |
+| --- | ---: | ---: | ---: | ---: |
+| 32 | 199,640 | 199,640 | 6 | 4 |
+| 2,048 (1 MiB journal) | 2,358,952 | 2,131,564 | 14 | 4 |
+| 4,096 (2 MiB journal) | 4,481,216 | 4,229,708 | 22 | 4 |
+
+The large cases reduce whole-operation extra requested-live peaks by 9.6% and
+5.6%; page reads/writes are unchanged. Allocation calls rise from 357/619 to
+374/659 because each bounded drain recreates its small tables/run buffer. These
+are memory/request measurements, not an SD throughput or latency result, and do
+not imply request-count equivalence for every possible caller page ordering.
+
+A dedicated regression compares exact page bytes and request grouping with an
+independently assembled full sink across multiple extents, including partial-page
+padding. Injected failures on writes one/three and cancellation on write three
+stop at the corresponding reference prefix without flushes or subsequent writes.
+All 263 unit tests pass (one ignored). The c74 publication, CAS streaming, crash
+recovery, fused append and GC recovery integration suites pass 64 tests. QEMU
+three-boot recovery/GC/powered-off verification and Duo compilation pass. Evidence:
+`target/storage-ordered-sink-20260912/`; the earlier control is in
+`target/storage-publication-allocation-measure-20260912/`. This production change
+is retained. Authority delta remains test-only and SD hardware validation remains
+outstanding under the user's QEMU-first instruction.
+
+### Reuse entry capacity across bounded sink drains (2026-09-12)
+
+Bounded deferred drains now retain the small PageSink entry Vec rather than
+recreating it after every 64 staged pages. The draining iterator removes owned
+pages while preserving that Vec's capacity. The public consuming drain uses the
+same implementation, dropping capacity at final consumption. The contiguous
+32-page write buffer remains temporary rather than retaining another 128 KiB
+between fills.
+
+The iterator is created before reserving the contiguous run, so any subsequent
+allocation error, write failure or cancelled future drops all remaining queued
+pages. Tests now explicitly require an empty queue and retained table capacity
+after injected failure/cancellation, in addition to exact write-prefix/content
+comparison. Retaining capacity must never retain pending writes for accidental
+replay. The injected cases cover write failure/cancellation; a separate allocation
+fault injection for this private drain was not added.
+
+Repeated host publication measurements show allocation calls for 32/2,048/4,096
+records of 93/355/620, compared with 93/374/659 before table reuse and 93/357/619
+before bounded streaming. Extra requested-live peaks stay 199,640/2,131,564/4,229,708
+bytes. Write requests stay 6/14/22, pages written 23/277/535, and flushes four.
+Thus the preceding peak savings are retained while most extra allocation calls
+are removed. These measurements do not establish SD throughput or latency gains.
+
+All 263 unit tests pass (one ignored), CAS streaming/GC integration suites pass
+36 tests, and QEMU three-boot recovery/GC/powered-off verification and Duo
+compilation pass. Evidence: `target/storage-sink-table-reuse-20260912/`. Authority
+delta remains test-only; the overall storage/SD performance goal is still active.
+
+### QEMU ABBA check of ordered streaming and table reuse (2026-09-12)
+
+Compared the pre-ordered-streaming PageSink against current ordered streaming plus
+entry-table reuse, keeping every other current source unchanged. Each ELF used
+the same temporary 64-page cache override, 128 MiB guest, one-hart single-thread
+TCG and a fresh clone of the same zero-filled disk. Both source overrides were
+restored and SHA-256 checked after building. Runs were serial with no overlapping
+build/test load, in control/candidate/candidate/control order, seed 71, one 64 MiB
+file-sequential write/read/remove workload per boot, no warmup. The backend was
+limited to 4 MiB/s reads, 2 MiB/s writes, 400 read IOPS and 200 write IOPS.
+
+| Order | Version | Workload seconds | Write requests | Read requests | Flushes |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1 | Control | 51.545480 | 783 | 1,457 | 32 |
+| 2 | Candidate | 51.666502 | 788 | 1,457 | 32 |
+| 3 | Candidate | 51.626074 | 788 | 1,457 | 32 |
+| 4 | Control | 51.510825 | 783 | 1,457 | 32 |
+
+Mean times are 51.528153 s control and 51.646288 s candidate (+0.229%). Every run
+writes 71,430,144 bytes and reads 72,392,704 bytes, for host-block write amplification
+of 1.064392 against 64 MiB of file data. That write-amplification level belongs to
+the full current stack; this change does not reduce it. All normalized records
+validate successfully and the workload's content readback succeeds.
+
+The host authority-only probe's identical request counts did not generalize to
+this file workload. The five extra writes occur entirely in the stage phase:
+771 to 776 writes, unchanged 71,118,848 written bytes and 26 flushes. Mean staging
+time rises from 34.838956 to 34.948774 s. Publish/verify/remove request counts are
+unchanged. This is a concrete request-coalescing regression to investigate at
+bounded-drain boundaries. It is not evidence of a throughput improvement; two
+samples per version are insufficient for broad statistical or SD-hardware claims.
+
+Evidence: `target/storage-ordered-sink-qemu-20260912/` contains reproducible build,
+run and analysis scripts, source/ELF identities, raw UART logs, validated JSONL and
+`summary.json`. Current source was left restored with ordered streaming/table
+reuse retained for its measured memory benefit, with the additional file-stage
+requests explicitly outstanding. Authority delta remains test-only. No real SD
+benchmark or Linux/ext4 re-comparison was performed in this experiment.
+
+### Retain incomplete physical tails across bounded drains (2026-09-12)
+
+Threshold drains now keep the incomplete suffix of the final contiguous physical
+run (at most 31 pages), rather than writing a short request that the next payload
+could extend. Complete preceding runs are submitted; final consuming drains still
+write every page. Selection follows physical continuity, not simply a page-count
+suffix across gaps. Stable sorting/latest-page selection remains in place.
+
+A guard clears both the selected prefix and retained suffix unless the drain
+finishes successfully. It is installed before run allocation; dropping a pending
+future or returning a write error cannot leave stale tail pages for replay. A new
+gap-bearing test stages three isolated pages plus a 61-page run, retains 29 pages,
+then extends them into a full 32-page request. Error/cancellation cases explicitly
+check an empty queue and no writes after the stopping request.
+
+All 264 unit tests (one ignored), 36 CAS streaming/GC integration tests, QEMU
+three-boot recovery/GC/powered-off verification and Duo compilation pass. Host
+allocation measurements remain 199,640/2,131,564/4,229,708 extra peak bytes and
+93/355/620 allocation calls for 32/2,048/4,096 records. Evidence:
+`target/storage-sink-tail-20260912/`.
+
+Repeated the preceding 64 MiB file-sequential QEMU ABBA experiment with the same
+seed 71, blank template, 128 MiB guest, 64-page cache, single-hart single-thread
+TCG, 4/2 MiB/s read/write limits and 400/200 read/write IOPS. Only the tail policy
+and its guard differ between these builds. No concurrent build/test load ran
+during timing, and source overrides were restored and hash-checked.
+
+| Order | Version | Seconds | Write requests |
+| --- | --- | ---: | ---: |
+| 1 | Control, drain entire queue | 51.712115 | 788 |
+| 2 | Candidate, retain tail | 51.659862 | 783 |
+| 3 | Candidate, retain tail | 51.651019 | 783 |
+| 4 | Control, drain entire queue | 51.616087 | 788 |
+
+Both candidates eliminate exactly five stage-phase write requests (776 to 771),
+restoring the 783 total writes observed before ordered streaming. All other I/O
+is unchanged: 1,457 reads, 32 flushes, 71,430,144 written bytes and 72,392,704 read
+bytes. Write amplification remains 1.064392, not an improvement from this change.
+Mean time is 51.664101 s control versus 51.655441 s candidate (-0.0168%); this is
+not evidence of a meaningful latency gain. The proven result is removal of the
+request-coalescing regression while retaining bounded staging and its measured
+memory savings. All four records validate and content verification succeeds.
+
+Benchmark evidence: `target/storage-sink-tail-qemu-20260912/`, including source/ELF
+identities, build/run/analysis scripts, raw UART logs, JSONL and `summary.json`.
+The change is retained in production code. Authority delta remains test-only;
+actual SD throughput/latency and the broader storage performance goal remain
+unresolved.
+
+### Borrow single-extent bytes for full small-object verification (2026-09-12)
+
+Small verified reads previously held resolved extent payloads, a second contiguous
+copy of the complete encoded envelope, and decoded output. After checking every
+extent's identity, offset and length, the single-extent path now borrows its
+already-owned payload directly for BlobView decoding and complete Merkle
+verification. Multi-extent input still assembles a contiguous buffer. Logical
+output remains independently owned; no validation is skipped and no borrowed
+bytes escape the call. The existing conservative batched-read limit is unchanged.
+
+The allocation harness now also exercises public read_persistent_object after
+importing a rooted object. Its preallocated device, prepared input and mounted
+state are outside the baseline. Read output is checked byte-for-byte, and writes
+and flushes must remain zero. Run this probe alone:
+
+```sh
+cargo test -p vibeos-segment-store --test authority_publication_memory persistent_object_read_requested_allocation -- --ignored --nocapture --test-threads=1
+```
+
+| Object bytes | Prior extra peak | Borrowed extra peak | Prior/new allocation calls | Read pages, both |
+| --- | ---: | ---: | ---: | ---: |
+| 4,096 | 37,808 | 37,808 | 15 / 14 | 11 |
+| 65,536 | 204,072 | 137,416 | 15 / 14 | 26 |
+| 131,072 | 402,728 | 269,512 | 15 / 14 | 42 |
+| 368,640 | 1,129,144 | 1,129,144 | 20 / 20 | 106 |
+
+The 64/128 KiB cases reduce extra requested-live peaks by about one third. The
+4 KiB case saves a copy/allocation without lowering its earlier peak; the 360 KiB
+multi-extent case is unchanged. These are after-import host measurements, not
+cold-device latency, total RSS or SD throughput. Existing proof/manifest state is
+identical on both sides; firmware code was restored after the control measurement.
+
+All 264 storage unit tests pass (one ignored), including full-object corruption
+checks; 12 CAS streaming integration tests pass. QEMU three-boot recovery/GC/
+powered-off verification and Duo compilation pass. Evidence:
+`target/storage-small-verified-borrow-20260912/`. Production keeps this change;
+authority delta remains test-only and the broader SD performance work continues.
+
+### Consume resolved extents before allocating verified output (2026-09-12)
+
+The small verified-read path now moves the single extent's encoded Vec directly,
+and consumes multiple resolved extents while concatenating their payloads. Extent
+identity/offset/length checks still finish before this step. Complete BlobView
+and Merkle verification still precede independently owned logical output. This
+releases resolved payloads and their descriptor table before allocating output;
+the conservative batching limit remains unchanged.
+
+Controlled host measurements against the preceding single-extent borrowing change:
+
+| Object bytes | Previous extra peak | Consuming extra peak | Allocation calls, both | Read pages, both |
+| --- | ---: | ---: | ---: | ---: |
+| 4,096 | 37,808 | 37,808 | 14 | 11 |
+| 65,536 | 137,416 | 137,120 | 14 | 26 |
+| 131,072 | 269,512 | 269,216 | 14 | 42 |
+| 368,640 | 1,129,144 | 760,504 | 20 | 106 |
+
+The 360 KiB case reduces additional requested-live allocation peak by 32.6%.
+The encoding reserve still temporarily overlaps all input payloads; this does
+not remove every overlapping buffer or reduce the number of allocations. These
+measurements use the existing after-import, preallocated-device probe, exclude
+resident mounted state from baseline, and are not RSS or SD latency measurements.
+No reads were eliminated; writes and flushes remain zero.
+
+Validation: 264 unit tests pass (one ignored), 12 CAS streaming integration tests
+pass, including existing complete-object corruption checks in the unit suite.
+QEMU three-boot recovery/GC/powered-off verification and Duo compilation pass.
+The controlled source swap was restored and verified. Evidence, source snapshots,
+allocation logs and QEMU logs: `target/storage-verified-owned-20260912/`.
+No timed performance comparison or real SD run was performed for this change.
+Authority delta remains test-only; the broader storage performance work continues.
+
+### Prepare the experimental successor witness before publication (2026-09-12)
+
+The test-only delta writer previously encoded successor metadata without a
+workspace limit after the checkpoint had already been published and verified.
+That allocation could fail after durable success and was classified as corruption.
+It now prepares a fixed-size generation/digest value before delta encoding or
+media mutation, using the recovery budget remaining after the mounted state and
+input snapshot's tracked allocations. Encoder scratch and metadata are released
+before delta encoding, so their workspaces do not overlap the delta output.
+
+After successful publication/read-back, preparation binds the actual physical
+root, store and generation into the cache without heap allocation. Preparation
+alone is not a verified-base witness. Binding checks the published generation
+and depth; the caller must publish the exact prepared snapshot. Existing cached
+writer crash/cancellation tests continue to check that failures discard the cache.
+The unlimited from_published helper remains only for already-published test
+fixtures; the experimental writer no longer calls it.
+
+A new boundary regression uses a 1,152-byte canonical snapshot with empty tables:
+128 bytes of metadata workspace succeeds, 127 and zero return MemoryLimit, and
+the prepared digest equals SHA-256 of the complete canonical snapshot. The caller
+regression also rejects binding a successor preparation to predecessor state;
+its budget refusals leave mutation count zero, old generation/media unchanged,
+store unpoisoned and cache absent, and a restored budget permits retry.
+
+Validation: 265 unit tests pass (one ignored), including both cached/uncached
+publication cut and cancellation suites; freshly exported delta fixtures pass
+the offline verifier's four regions and 21 rejection cases. Evidence:
+`target/storage-delta-witness-admission-20260912/`.
+
+This removes one memory-admission gap on the path toward lower-write-amplification
+authority publication. It does not change production I/O or establish latency
+savings. Full publication-buffer accounting, fallible state cloning/runtime
+proof allocation, and coordinated format rollout remain unresolved. Delta remains
+cfg(test); no firmware or QEMU timing change is claimed for this test-only step.
+
+### Stream authority view digests over the existing record buffer (2026-09-12)
+
+Production build_persistent_view previously encoded the complete authority
+snapshot into a temporary Vec solely to hash it. It now encodes only canonical
+metadata (whose lengths still describe the full snapshot), then updates SHA-256
+with that prefix and the existing record stream. This preserves the exact
+canonical digest and structural validation while removing the temporary log copy.
+No on-media format, publication barrier or authority-delta enablement changes.
+
+The isolated host allocation probe now counts gross allocator-requested bytes:
+alloc requests add their requested size and realloc requests add their new size.
+This is allocation traffic, not simultaneous residency or physical memory usage.
+Preparation/device storage and cold recovery are outside the measured import.
+Both control and candidate also compare the view digest with cold recovery.
+
+| Log records | Previous requested bytes | Streaming requested bytes | Saved | Extra live peak, both |
+| --- | ---: | ---: | ---: | ---: |
+| 32 | 471,432 | 455,048 | 16,384 | 199,640 |
+| 2,048 | 6,167,584 | 5,119,008 | 1,048,576 | 2,131,564 |
+| 4,096 | 11,961,016 | 9,863,864 | 2,097,152 | 4,229,708 |
+
+Allocation counts remain 93/355/620. Read pages remain 31/285/543; written pages
+23/277/535, write requests 6/14/22, and flushes four in every case. The saving is
+exactly one log-stream copy per view construction. The whole-operation peak is
+unchanged because it occurs earlier; no latency or SD throughput gain is claimed.
+
+Validation: 266 unit tests pass (one ignored), including a new digest comparison
+against complete canonical bytes with object/principal tables, changed generation,
+external roots and invalid metadata rejection. The controlled allocation probes,
+QEMU three-boot recovery/GC/powered-off verification and Duo compilation pass.
+Source overrides were restored and verified; removal of the now-unused SHA import
+was the only cleanup after the firmware build. Evidence:
+`target/storage-view-streaming-digest-20260912/`.
+
+The remaining post-publication root/state allocations still need attention;
+this change does not claim to complete publication memory admission. Delta stays
+test-only, and ordinary authority snapshot write amplification remains open.
+
+### Recheck current production small-object writes in QEMU (2026-09-12)
+
+An ABBA comparison runs the saved production ELF from
+`storage-current-production-abba-20260912/candidate.elf` against a freshly built
+current worktree ELF. This is an aggregate comparison of intervening changes,
+not isolated attribution to the view digest or any individual memory change.
+Each fresh image runs 256 unique 4 KiB durable put/get samples, seed 32, with a
+128 MiB guest, 64-page cache, one TCG hart and read/write limits of 4/2 MiB/s and
+400/200 IOPS. No builds or tests overlapped the timed runs. All 1,024 samples
+validate; the temporary cache override was restored and its hash checked.
+
+| Order | Version | Sum of sample seconds | Median ms | Write requests |
+| --- | --- | ---: | ---: | ---: |
+| A1 | Saved production | 12.279777 | 32.2335 | 1,862 |
+| B1 | Current | 13.111390 | 36.8445 | 1,857 |
+| B2 | Current | 13.127196 | 36.6940 | 1,857 |
+| A2 | Saved production | 13.081828 | 36.6230 | 1,862 |
+
+Means are 12.6808025 versus 13.119293 seconds (+3.46%). However, the same control
+binary varies by 6.53% between its two runs; this evidence does not establish a
+speedup or a stable regression. Sums exclude command/runner gaps, including the
+guest's pre-command quiet interval, during which throttle credit can replenish;
+do not interpret these sums as sustained throughput.
+
+Every run reads 8,097,792 bytes in 1,565 requests, writes 53,694,464 bytes and
+flushes 825 times. Write amplification remains 51.207x relative to 1 MiB of user
+payload. Per-sample counters agree within each version. Cross-version differences
+are confined to samples 206 and 234, the known GC episodes: current firmware
+saves three and two write requests respectively, with no byte or flush change.
+Their combined latency stays about 3.45 seconds. Ordinary publications retain
+exactly the previous I/O counts.
+
+Every get phase performs zero device reads: this workload measures cached get
+and durable put, not cold object-read performance. Current put time accounts for
+13.071096/13.086988 seconds; get for only 0.040294/0.040208 seconds. Consequently,
+recent read-memory improvements cannot be evaluated as cold-read gains here.
+
+Evidence: `target/storage-current-small-qemu-20260912/` contains build/run/analysis
+scripts, source and ELF identities, raw UART logs, validated JSONL, summary and
+per-sample attribution. The result redirects performance work to ordinary full
+authority publication/write amplification; allocation savings alone have not
+established a steady-write latency benefit. Authority delta remains test-only,
+and actual SD measurement remains pending under the user's QEMU-first scope.
+
+### Prepare authority roots before publication mutation (2026-09-12)
+
+publish_persistent_snapshot previously collected object roots, extended the Vec
+with external roots and validated their combined set after publishing and reading
+back the checkpoint. It now checks the combined table's requested size against
+the recovery-memory limit, reserves the exact combined count fallibly, sorts by
+physical object ID and validates PersistentRootSet before quota installation,
+poisoning or media writes. A root allocation/validation failure cannot leave this
+publication durably committed but reported as failed. The root set is retained
+and moved into the verified successor after publication.
+
+This admission checks the root table alone, not the sum of all live publication
+buffers. Earlier root preparation overlaps roots with the write buffers; snapshot,
+catalog/CAS cloning and other finalization allocations still require attention.
+No format, I/O ordering, barrier or production-delta enablement changes are made.
+
+New regressions verify exact combined-root budget and physical ordering across
+object/external roots, one-byte-short MemoryLimit, and invalid generation refusal.
+A rooted publication under a one-entry-minus-one-byte budget performs zero
+mutations, preserves the durable image and mounted generation, stays unpoisoned,
+and succeeds after restoring its budget; its object remains readable.
+
+The allocation probe now also reports the preceding rooted import. Controlled
+measurements for 4/64/128/360 KiB objects have identical additional requested-live
+peaks of 344,232 / 687,840 / 1,158,560 / 2,926,512 bytes, and identical allocation
+counts 172 / 225 / 281 / 407. Subsequent read measurements also remain unchanged.
+These one-root fixtures do not prove unchanged peak for arbitrarily large root
+tables. This is publication-admission work, not a latency or write-volume gain.
+
+Validation: 268 unit tests pass (one ignored), including existing publication
+power-cut/cancellation coverage; QEMU three-boot recovery/GC/powered-off image
+verification and Duo compilation pass. Source overrides were restored and
+verified. Evidence: `target/storage-root-preparation-20260912/`.
+Full authority snapshot write amplification and complete delta admission remain
+open; delta stays test-only.
+
+### Reuse standalone authority encoding for the installed successor (2026-09-12)
+
+The standalone authority publisher previously cloned the successor snapshot after
+checkpoint publication/read-back. It now prepares its object/principal/external
+root tables with fallible, bounded reservations before mutation. A private prepared
+value owns the exact encoded Vec throughout publication. After successful read-back,
+it repurposes that buffer for the installed record stream if its capacity suffices.
+Otherwise, as for a short experimental delta, it reserves the complete log capacity
+before publication. Finalization copies the source log into already-reserved space;
+it performs no allocation. This saves allocation traffic, not the final log copy.
+
+The preparation budget covers additional successor tables/fallback log plus the
+prepared root table. It does not account for every caller, builder, catalog/CAS
+clone or runtime proof allocation; full publication admission remains incomplete.
+Reused full-encoding capacity includes metadata slack, so mounted residency can
+increase slightly. The final mounted-state capacity check still runs.
+
+Controlled standalone import measurements (preallocated host device):
+
+| Records | Requested bytes before / after | Allocation calls before / after | Extra peak before / after |
+| --- | ---: | ---: | ---: |
+| 32 | 455,048 / 438,664 | 93 / 92 | 199,640 / 199,696 |
+| 2,048 | 5,119,008 / 4,070,432 | 355 / 354 | 2,131,564 / 2,131,620 |
+| 4,096 | 9,863,864 / 7,766,712 | 620 / 619 | 4,229,708 / 4,229,764 |
+
+Each case removes one log-sized allocation. Earlier table preparation adds 56 bytes
+to the observed peak; retained live allocation at return adds 192 bytes from encoded
+metadata capacity. Read pages remain 31/285/543, written pages 23/277/535, write
+requests 6/14/22 and flushes four. Rooted object-import probe counts/peaks are
+unchanged: that fused publication path does not use this helper. These results
+must not be generalized to every put, reduced media write amplification or SD
+latency improvements.
+
+New tests compare the complete successor snapshot, prove reuse by exact buffer
+address/capacity, and prove the short-buffer fallback reserves before finalization.
+One-byte-short table/fallback budgets return MemoryLimit. The publisher regression
+also confirms successor-table refusal leaves zero mutations, unchanged durable
+media/generation, an unpoisoned store and successful retry after budget restoration.
+
+Validation: 269 unit tests pass (one ignored), including cached/uncached experimental
+delta crash/cancellation cases. QEMU three-boot recovery/GC/powered-off verification
+and Duo compilation pass; fresh delta fixtures pass all 21 offline rejection cases.
+Controlled source overrides were restored and verified. Evidence:
+`target/storage-successor-buffer-reuse-20260912/`.
+Production authority delta stays disabled. Fused publication, its full admission,
+and ordinary full-snapshot write amplification remain the next major work.
+
+### Move fused authority state into the verified successor (2026-09-12)
+
+Both single-object and batch CAS commit functions now own the optional fused
+authority publication instead of borrowing it. Encoding is borrowed only for
+record construction/write/read-back; afterwards its Vec is released and the
+already-owned authority snapshot and root set are moved into the successor.
+Previously both were cloned after publication, while the originals remained
+owned by the outer caller. Non-fused commits retain their existing predecessor
+state-clone behavior. Validation, conditional read-back policy, checkpoint order
+and durable format remain unchanged.
+
+The rooted-import probe exercises this production path. Gross requested bytes
+count allocator requests, not simultaneous residency, RSS or physical SD writes:
+
+| Object bytes | Allocations before / after | Requested bytes before / after | Extra live peak, both |
+| --- | ---: | ---: | ---: |
+| 4,096 | 172 / 168 | 823,976 / 814,624 | 344,232 |
+| 65,536 | 225 / 221 | 1,730,920 / 1,634,016 | 687,840 |
+| 131,072 | 281 / 277 | 2,835,816 / 2,645,728 | 1,158,560 |
+| 368,640 | 407 / 403 | 5,891,344 / 5,363,848 | 2,926,512 |
+
+All four save four allocations; the 360 KiB case saves 527,496 requested bytes.
+Overall peaks occur elsewhere and do not decrease. Read pages remain
+43/79/118/264, written pages 35/71/110/256, write requests 8/9/10/19, and flushes
+four for each fresh import. Subsequent verified read results/metrics and standalone
+authority publication probes are unchanged. This fresh rooted-import workload is
+not identical to the steady QEMU unrooted put/get sequence; no latency or media
+write-amplification improvement is inferred from these allocation results.
+
+Validation: 269 unit tests pass (one ignored), plus 43 integrations across CAS
+streaming, the 128 KiB fused reproduction, fused append recovery and GC recovery.
+Existing mutation-boundary, cancellation, cold-recovery and damaged-write checks
+remain green. QEMU three-boot recovery/GC/powered-off verification and Duo
+compilation pass. Controlled source swaps were restored and verified. Evidence:
+`target/storage-fused-owned-state-20260912/`.
+
+This removes one complete successor clone in the ordinary fused path. The caller's
+view snapshot and other predecessor/catalog clones remain, as does the full
+authority payload write. Production authority delta remains disabled.
+
+### Release redundant staged predecessor states (2026-09-12)
+
+StagedObjectCommit now carries an optional, private predecessor. The standalone
+fused publisher takes it instead of cloning the entire mounted state. Entries
+added to a batch release the temporary writer predecessor immediately; duplicate
+entries never construct it. The batch already owns the exact base and current
+planning state used for publication, so retaining a copy per entry was redundant.
+The store remains poisoned between staging and publication/remount as before.
+
+A new mixed-duplicate regression stages 16 objects, checks that every queued entry
+has released its predecessor, publishes and verifies all contents, then cold-mounts
+and checks 16 mappings / 8 blobs. Existing failure/cancellation/GC coverage passes.
+This removes a per-entry retained state; it does not remove the temporary planning
+clone needed while each writer stages its payload or the batch's shared base.
+
+The host probe now covers fresh import and append against seeded authority history.
+The seeded case first publishes 258 records (format, initial high-water, then 256
+additional high-water records), drops the seed view and uses the public append
+writer with its principal. Seed preparation is outside the measured interval.
+Repeated import was initially rejected as AlreadyInitialized; the corrected probe
+uses append for initialized state, preserving the API's transition rules.
+
+| Appended object bytes | Previous extra peak | New extra peak | Allocation calls before / after |
+| --- | ---: | ---: | ---: |
+| 4,096 | 997,724 | 865,568 | 222 / 219 |
+| 65,536 | 1,407,836 | 1,275,680 | 274 / 271 |
+| 131,072 | 1,847,132 | 1,714,976 | 330 / 327 |
+| 368,640 | 3,453,884 | 3,321,728 | 448 / 445 |
+
+Each seeded case reduces extra requested-live peak and gross requested allocation
+by 132,156 bytes (13.2% peak reduction for 4 KiB). Fresh imports save just the empty
+predecessor's four-byte allocation bitmap and one allocation: their predecessor
+has no authority history. This contrast is why the seeded measurement matters.
+No claim about peak RSS, maximum batch size or SD latency follows from this probe.
+
+Seeded read pages remain 68/104/143/296, written pages 64/106/145/292, write requests
+11/16/17/24 and flushes four. Fresh-import and subsequent read I/O also match their
+controls. No media write amplification reduction is claimed.
+
+Validation: 270 unit tests pass (one ignored), 43 CAS/fused/GC integration tests
+pass; QEMU three-boot recovery/GC/powered-off verification and Duo compilation
+pass. Controlled source swaps were restored and verified; the final probe also
+passes on the restored source. Evidence: `target/storage-staged-predecessor-20260912/`.
+Authority delta remains test-only; ordinary authority payload write amplification
+is still unresolved.
+
+### Use a narrow metadata-placement view for fused commits (2026-09-12)
+
+commit_batch_snapshot only used the planning MountedState to find a free metadata
+segment when open-segment packing was unavailable. It now receives a borrowed
+allocation plus the legacy sequential frontier. The standalone packed publisher
+constructs only its provisional allocation transition rather than cloning the
+whole authority/catalog state. General batches project the same two fields from
+their existing planning state. The allocation is still searched lazily, only when
+a dedicated metadata segment is required.
+
+MountedState's original free-run implementation delegates to the same search with
+its own allocation/frontier; the projected path supplies the provisional values.
+Required capacity, extra headroom, cleaner reserve, V1 sequential placement, V2
+first-fit placement and overflow handling retain the original policy. The base's
+admitted range/allocation version/reserve are unchanged by batch planning.
+
+A targeted regression independently checks provisional first-fit, cleaner-reserve
+refusal/authorized reserve use, extra capacity and overflow, legacy frontier
+selection, occupied frontier, range exhaustion and zero-size refusal.
+
+Controlled append allocation measurements against the preceding worktree, after
+258 seed records (256 additional high-water records):
+
+| Object bytes | Extra peak before / after | Calls before / after | Requested bytes before / after |
+| --- | ---: | ---: | ---: |
+| 4,096 | 865,568 / 732,424 | 219 / 216 | 1,583,768 / 1,450,620 |
+| 65,536 | 1,275,680 / 1,142,536 | 271 / 268 | 2,521,736 / 2,388,588 |
+| 131,072 | 1,714,976 / 1,581,832 | 327 / 324 | 3,390,856 / 3,257,708 |
+| 368,640 | 3,321,728 / 3,320,736 | 445 / 445 | 6,142,660 / 6,141,668 |
+
+The first three cases reduce peak by 133,144 bytes (15.4% for 4 KiB) and gross
+allocation requests by 133,148 bytes. The 360 KiB case only saves 992 bytes, and
+fresh imports also save 992 bytes with unchanged allocation counts; do not
+extrapolate the seeded packed-path saving to all objects. These are requested
+allocation metrics including compiler-generated async storage, not RSS or SD
+latency measurements.
+
+All per-case read/write pages, write requests and flushes match the controls,
+as do subsequent verified reads. No media write amplification reduction or timed
+latency improvement is claimed. The full authority payload remains on the write
+path, and production authority delta is still disabled.
+
+Validation: 271 unit tests pass (one ignored), plus 43 CAS/fused/GC integrations.
+QEMU three-boot recovery/GC/powered-off verification and Duo compilation pass.
+Both temporarily overridden source files were restored and verified. Evidence:
+`target/storage-placement-view-20260912/`.
+
+### First test-only fused authority-delta publication (2026-09-12)
+
+The existing delta prototype previously exercised standalone authority publication,
+not the ordinary one-object fused path. A cfg(test)-only, default-false store toggle
+now selects the existing bounded delta encoder for that path. It borrows the staged
+object's exact predecessor, consumes the previous provenance cache, prepares the
+successor digest under the remaining codec allowance, and supplies the encoded
+link to the existing fused writer. Only after successful publication and view
+construction does it bind/install the successor witness. Non-test builds retain
+the original full-snapshot encoder; no production feature or disk admission is
+turned on. The existing one-extent fused-size routing limit is unchanged.
+
+A fresh host fault-device scenario first publishes 257 records (format plus 256
+high-water records). It then performs three public rooted object appends with
+4 KiB contents: new, duplicate of the first, then a distinct object. The full and
+delta variants use identical input/grant histories. Page counts exclude seeding
+and later GC:
+
+| Append | Full page writes | Delta page writes | Flushes, both |
+| --- | ---: | ---: | ---: |
+| New object | 64 | 32 | 4 |
+| Duplicate content, new object/grant | 55 | 21 | 3 |
+| Distinct object | 64 | 28 | 3 |
+| Total | 183 | 81 | 10 |
+
+The prototype saves 102 page writes (417,792 bytes), or 55.7%, in these three
+appends. It retains three logical objects backed by two blobs. Every appended
+object is read and checked, the actual authority root contains VIBEAUL1, and
+warm provenance matches the published state. Cold mounting recovers the exact
+record stream and all three objects; GC subsequently materializes authority and
+preserves those objects. This is host page-device evidence, not QEMU timing,
+real SD NAND amplification, a long-running steady workload or production speedup.
+
+The optional Rust export adds fused-delta.raw and fused-materialized.raw. The
+independent Python verifier now checks these when either is present (then both
+are required), while preserving compatibility with the earlier four-fixture set.
+Its external policy permits exactly the known object/grant prefix at either
+checkpoint, checks content, slots and rights, and rejects additional identities.
+All six regions validate, including both checkpoint slots, three bound objects,
+depth 3 before GC and depth 0 afterwards. Default delta rejection, foreign policy/
+store rejection and corrupted ancestor/blob rejection total 33 cases.
+
+Validation: 272 unit tests pass (one ignored); the new exported scenario passes;
+production cargo check passes. Evidence: `target/storage-fused-delta-prototype-20260912/`.
+No QEMU or physical SD run used this test-only toggle.
+
+Outstanding: the new fused path needs its own exhaustive mutation/cancellation
+matrix and long-chain/GC-pressure scenarios. Codec accounting currently subtracts
+the tracked predecessor and input snapshot but does not cover all staging/runtime
+buffers. Scratch staging has already occurred before encoding, so an encoding
+refusal is not a zero-write operation. Full admission and coordinated writer,
+reader, GC and offline rollout remain prerequisites to production enablement.
+
+### Fault/cancellation coverage for the fused delta prototype (2026-09-12)
+
+The new matrix starts from a durable fused delta containing one rooted object,
+then appends either distinct content or duplicate content with a separate object
+identity/root grant. Each is exercised with cold codec replay and a matching warm
+provenance witness. A successful probe determines every write/flush mutation point.
+At each point, the test injects not-submitted failure, ambiguous failure with no /
+visible / durable effect, and cancellation after pending with those same effects.
+
+The first run exposed a witness-lifetime bug: warm distinct-content mutation zero,
+FailNotSubmitted, left the predecessor cache installed because the encoder only
+consumed it after scratch staging. The test-only cache is now taken into a local
+at install_persistent_import entry, before staging can mutate media. Failure or
+cancellation drops that local. Encoding still uses it, and only a fully successful
+publication/view construction installs a successor. Production encoding is unchanged.
+
+| Content | Codec cache | Mutation points | Cases | Old state | New state |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Distinct | Cold | 36 | 252 | 248 | 4 |
+| Distinct | Warm | 36 | 252 | 248 | 4 |
+| Duplicate | Cold | 29 | 203 | 199 | 4 |
+| Duplicate | Warm | 29 | 203 | 199 | 4 |
+| Total | | | 910 | 894 | 16 |
+
+Every injected operation returns an error or suspends exactly as requested;
+dropping it leaves no experimental provenance cache. A fresh runtime/power cycle
+must recover exactly the old or new canonical authority snapshot and generation.
+Object mappings, deduplicated blob counts, all object bytes and principal logical/
+physical quota totals are checked. The canonical comparison includes bindings,
+recorded grants and policy metadata. Recovery performs zero media mutations and
+leaves the durable image byte-identical. Each old-state outcome is retried; another
+power cycle then confirms the exact new snapshot and readable objects.
+
+Validation: 273 unit tests pass (one ignored), including the 910-case matrix.
+Fresh exports of all six offline regions pass the 33 rejection cases; the earlier
+three-append write counts remain 64/55/64 full versus 32/21/28 delta pages.
+Production cargo check passes. Evidence, including the initial failure:
+`target/storage-fused-delta-cuts-20260912/`.
+
+This is host fault-device evidence for write/flush mutation points; it does not
+cover allocation failures, every possible asynchronous read cancellation, long
+chains under GC pressure, or actual SD behavior. Full fused memory admission and
+coordinated format rollout remain open. The fused delta toggle stays cfg(test),
+default false; no QEMU firmware or production writer has enabled it.
+
+### Repeated fused delta append and GC pressure (2026-09-12)
+
+The host fault-device regression now compares 48 rooted 4 KiB appends on a
+16-segment region. Consecutive pairs share content, leaving 48 object identities
+and 24 blobs. Both runs start with the same 257-record authority seed and use a
+16 MiB recovery budget to exercise space reclamation independently of the small
+codec-budget boundary tests. Every eight appends, a fresh runtime cold-mounts the
+durable image and verifies the complete record stream, every object's contents,
+and logical/physical quota totals. Recovery performs zero mutations and preserves
+the durable image byte-for-byte.
+
+| Encoding | Appends | Page writes | Flushes | Extra checkpoint generations |
+| --- | ---: | ---: | ---: | ---: |
+| Full | 48 | 6,486 | 198 | 12 |
+| Experimental fused delta | 48 | 2,279 | 198 | 12 |
+
+Counts exclude initial seeding and include foreground GC during the appends.
+The delta run writes 4,207 fewer pages (17,231,872 bytes), a 64.9% reduction.
+Every delta append publishes an actual VIBEAUL1 tip. Both paths advance twelve
+additional checkpoint generations under allocation pressure. This exercises
+repeated short chains across collection and cold mounts; it does not establish
+the maximum uninterrupted chain-depth boundary or inject faults during this
+entire sustained workload.
+
+Evidence: `target/storage-fused-delta-pressure-20260912/pressure.log`.
+Validation: 274 unit tests pass (one ignored). The default-production QEMU
+file-tree gate passes all three boots, covering durable links, recursive removal,
+GC pressure, cold recovery and powered-off verification. Logs and JSON evidence
+are retained alongside the pressure log; this QEMU run does not enable delta.
+These are host simulated page-device counts, not QEMU latency, sustained SD
+throughput, or NAND write amplification. The toggle remains test-only and off by
+default; full memory admission and coordinated format rollout remain open.
+
+### Fused publication root-table admission (2026-09-12)
+
+Fused object/authority publication now uses the same fallible, combined root-table
+preparation as standalone authority publication. It reserves space for object and
+external roots once, checks the configured root-table budget, and preserves the
+existing physical-object ordering and root validation. This replaces collecting
+object roots and subsequently extending the allocation for external roots.
+The table is prepared before encoding; experimental delta codec workspace now
+subtracts its allocated bytes as well as the predecessor and input snapshot.
+
+This is partial admission: scratch staging has already occurred, the full encoder
+and successor snapshot clone still need broader accounting, and an admission
+error is not guaranteed to perform zero writes. Production format, flush ordering,
+and default delta rejection are unchanged.
+
+Validation: 274 unit tests pass (one ignored), including combined-root exact-budget
+and sorting coverage, fused mutation/cancellation coverage, and repeated append/GC
+pressure. The default-production QEMU three-boot file-tree gate and Duo release
+compilation pass. The production allocation probe passes for fresh imports and
+seeded appends at 4/64/128/360 KiB, including content verification. Seeded append
+extra peaks are 732,392 / 1,142,504 / 1,581,800 / 3,320,704 bytes. These are current
+host measurements, not a controlled latency or memory-reduction claim. Evidence:
+`target/storage-fused-root-admission-20260912/`. No real SD test was performed.
+
+### Reuse fused authority encoding for the successor log (2026-09-12)
+
+The object/authority fused path now prepares successor metadata fallibly before
+publication instead of cloning the complete canonical snapshot. After successful
+read-back, the full encoding's allocation becomes the installed record-stream
+buffer: it is cleared and filled from the original canonical log without another
+allocation. A small delta encoding uses a separately pre-reserved fallback log.
+The same prepared-snapshot implementation already used by standalone publication
+handles both cases. The source snapshot remains available for constructing the
+returned authority view. Namespace-root switches retain their existing owned
+snapshot path through the shared CAS publisher.
+
+| History records | Object bytes | Before extra peak | After extra peak |
+| ---: | ---: | ---: | ---: |
+| 0 | 4,096 | 343,204 | 334,052 |
+| 0 | 65,536 | 686,812 | 590,108 |
+| 0 | 131,072 | 1,157,532 | 967,644 |
+| 0 | 368,640 | 2,925,484 | 2,398,188 |
+| 256 | 4,096 | 732,392 | 592,168 |
+| 256 | 65,536 | 1,142,504 | 914,728 |
+| 256 | 131,072 | 1,581,800 | 1,260,840 |
+| 256 | 368,640 | 3,320,704 | 2,662,336 |
+
+These production-path host allocation probes compare the preceding root-admission
+implementation with this change. Each case makes one fewer allocation; reductions
+in gross requested bytes equal the listed peak differences. Read/write page
+counts, request counts and flush counts match in every case. The retained log may
+keep encoding metadata capacity, and log bytes are still copied; this removes an
+allocation and its overlap, not the copy or media traffic. Successor workspace
+admission remains partial and occurs after scratch staging.
+
+Validation: 274 unit tests pass (one ignored), including fused failure/cancellation
+and GC/cold-mount regressions. The allocation probe verifies object contents.
+Default-production QEMU passes the three-boot file-tree gate; Duo release checking
+passes. Evidence: `target/storage-fused-buffer-reuse-20260912/`, including the
+previous source files and machine-readable memory comparison. No timed QEMU or
+real SD performance claim is made; experimental delta remains disabled by default.
+
+### QEMU timing check for fused buffer reuse (2026-09-12)
+
+An isolated ABBA run compares the immediately preceding root-admission source
+with fused-buffer reuse. Both ELFs are built from the same remaining worktree,
+with the same 64-page cache override; all overridden source bytes are restored
+and hash-checked. Each fresh VM runs 256 unique 4 KiB object-durable-put-get
+samples, seed 32, no warmups, 128 MiB RAM and one TCG hart. Read limits are
+4 MiB/s and 400 IOPS; write limits are 2 MiB/s and 200 IOPS. Builds and tests do
+not overlap timed runs.
+
+| Run | Sum of operation seconds | Median operation ms |
+| --- | ---: | ---: |
+| Before | 13.159832 | 37.1205 |
+| After | 13.196447 | 37.2560 |
+| After, repeat | 13.106225 | 36.8880 |
+| Before, repeat | 13.089145 | 36.4685 |
+
+All 1,024 samples validate. Mean summed time changes from 13.124489 to
+13.151336 seconds (+0.205%), smaller than the respective two-run spreads of
+0.539% and 0.686%. This run does not demonstrate a distinguishable latency
+improvement or regression; it does not negate the host allocation reduction.
+Every per-sample I/O counter matches across all four runs. Each run reads
+8,097,792 bytes in 1,565 requests and writes 53,694,464 bytes in 1,857 requests,
+with 825 flushes. Device write bytes/user payload remain 51.207x.
+
+This shell workload publishes boot-local capabilities; each sample starts with
+zero admitted authority objects, unlike the rooted-object host allocation probe.
+Authority journal history still grows, and collection occurs during the run.
+Every get has zero device requests, so this is not a cold-read comparison.
+Operation sums exclude boot and shell gaps, and throttle credit can accumulate
+between commands; they are not sustained throughput. No actual SD or new ext4
+comparison was performed. The result keeps media write-volume reduction as the
+next performance priority. Experimental delta remains test-only and off.
+
+Evidence: `target/storage-fused-buffer-qemu-20260912/`, including build/run/analysis
+scripts, source and ELF hashes, raw JSONL, serial logs and `summary.json`.
+
+### Exact single-extent admission for fused authority (2026-09-12)
+
+Ordinary single-object authority append previously required the log length plus
+a fixed 128 KiB metadata allowance to fit one extent. That rejected some snapshots
+whose actual encoding fits, causing a separate CAS publication followed by
+authority publication. Routing now uses the final admitted-object, principal and
+external-root counts plus log bytes and frozen-format widths. Physical binding
+values are assigned later but cannot affect these widths. The existing snapshot
+length helper delegates to the same checked calculation. Overflow or an encoding
+above the single-extent ceiling continues to select the general path.
+
+The regression seeds a canonical high-water journal, appends a rooted 4 KiB
+object, compares the predicted size to the actual encoding, checks checkpoint
+advances and content, then cold-mounts and verifies the entire log and object.
+Recovery performs no mutations and leaves the durable image unchanged. A control
+run temporarily restores the preceding routing implementation, then restores and
+hash-checks current source bytes. Counts below exclude seed creation.
+
+| Seed high-water records | Encoded snapshot bytes | Old commits / pages / flushes | New commits / pages / flushes |
+| ---: | ---: | --- | --- |
+| 1,800 | 931,568 | 2 / 276 / 7 | 1 / 263 / 4 |
+| 2,100 | 1,085,168 | 2 / 315 / 7 | 2 / 315 / 7 |
+
+The fitting case removes 13 page writes (53,248 bytes, 4.7%) and three flushes.
+The oversize case retains the multi-extent fallback. This is a production routing
+change with no format or delta-admission change. It applies to the former slack
+rejection band, not all 4 KiB operations. Host fault-device counts use a 16 MiB
+recovery budget; no timed QEMU or actual SD speedup is inferred. Evidence:
+`target/storage-exact-fused-fit-20260912/`.
+
+Validation: 275 unit tests pass (one ignored), including existing publication
+fault/cancellation matrices and the new fit/fallback cold-recovery regression.
+The default-production QEMU three-boot file-tree gate and Duo release compilation
+pass. The new near-ceiling fixture itself is a success/recovery test, not a new
+exhaustive power-cut matrix at that size.
+
+### File-tree root-switch sizing without encoding (2026-09-12)
+
+File-tree route selection no longer encodes the complete current authority
+snapshot merely to obtain its length. It counts the successor's object,
+principal and external-root tables using the shared checked frozen-format size
+calculation. Its external-root count mirrors the builder: preserve non-file-tree
+roots and replace file-tree roots with one successor entry. Replacement therefore
+does not add the old unconditional 64-byte allowance. The actual successor builder
+still validates and encodes before publication; the sizing helper trusts the
+already validated mounted snapshot and is not an independent validator.
+
+Tests compare predicted lengths with actual successor encoding for addition and
+replacement, both with and without unrelated roots. A canonical 2,047-record log
+with twelve external roots produces an exact 1 MiB successor on replacement. The new
+predicate accepts it; the previous length-plus-64 predicate rejects it. This
+boundary test verifies sizing and encoding, not a full near-ceiling media commit.
+
+This removes the route-selection encoding allocation and its validation work,
+and avoids that replacement-boundary fallback. It does not change disk format or
+enable delta. No end-to-end timing, allocation-peak reduction, or SD improvement
+is inferred from these tests. Evidence: `target/storage-fs-root-fit-20260912/`.
+
+Validation: 277 unit tests pass (one ignored), and the default-production QEMU
+three-boot file-tree gate and Duo release check pass. The initial ceiling fixture
+incorrectly assumed 64-byte roots; correcting it to twelve actual 32-byte entries
+made the exact-boundary assertion valid. The initial failure and corrected full
+test run are both retained. Only test-fixture code changed after the QEMU gate.
+
+### Near-ceiling fused publication fault/cancellation matrix (2026-09-12)
+
+The newly admitted 931,568-byte full authority snapshot now has a dedicated host
+fault-device matrix. It seeds 1,800 high-water records and appends one rooted
+4 KiB object with a 16 MiB recovery budget. The success probe asserts the actual
+canonical encoding length and exactly one checkpoint generation advance, so this
+exercises the former fixed-slack rejection band on the default full-encoding path.
+
+All 267 write/flush mutation points are exercised with seven actions:
+not-submitted failure; ambiguous failure with no, visible or durable effect; and
+pending/cancellation with those same three effects. All 1,869 cases pass: 1,865
+recover the old canonical snapshot and four recover the new snapshot. Each case
+checks the returned error/pending state, drops the operation, power-cycles into a
+fresh runtime and compares the entire canonical snapshot and generation. Object
+and blob counts, object contents and principal logical/physical usage must agree.
+Recovery makes zero mutations and preserves the durable image byte-for-byte.
+Every old-state outcome is retried, then another power cycle confirms the exact
+new snapshot and readable content.
+
+The targeted matrix passed in 104.78 seconds. Evidence:
+`target/storage-near-ceiling-cuts-20260912/cuts.log`. This turn adds test coverage
+only; it does not change production code or rerun the unchanged QEMU firmware.
+This is not allocation-failure or arbitrary asynchronous-read cancellation
+coverage, and does not model actual SD power-loss behavior. Delta remains off.
+
+### Reuse metadata payload digests during CAS publication (2026-09-12)
+
+Both single-object and batch metadata publishers previously invoked SHA-256
+twice consecutively on each identical immutable metadata payload, supplying the
+result as both payload and logical-object digests. Ten construction sites now
+compute a local digest once and copy it into both fields: manifests, CAS deltas,
+CAS snapshots, fused authority and allocation payloads in each publisher.
+
+The reuse is local to record construction. It does not cache across publications,
+change digest inputs or fields, or remove read-back/integrity checks. No record
+layout, I/O ordering or delta-admission behavior changes. The saved source calls
+include a full authority-buffer hash on fused publication; generated-code savings
+and end-to-end latency have not yet been measured, so this is not a quantified
+CPU or SD speedup. Evidence: `target/storage-metadata-digest-reuse-20260912/`.
+
+Validation: 278 unit tests pass (one ignored), including the near-ceiling fused
+mutation/cancellation matrix. The default-production QEMU three-boot file-tree
+gate and Duo release check pass. The preceding CAS source is retained for a
+subsequent isolated performance comparison.
+
+### QEMU comparison for metadata digest reuse (2026-09-12)
+
+An ABBA comparison builds the immediately preceding CAS source and the digest
+reuse source against identical remaining code. Each fresh VM runs 32 unique
+128 KiB object-durable-put-get samples, seed 32, no warmups, with 128 MiB RAM,
+a 64-page cache and one TCG hart. Read limits are 4 MiB/s and 400 IOPS; write
+limits are 2 MiB/s and 200 IOPS. All source overrides are restored and checked
+by hash; compilation/tests finish before the timed runs.
+
+| Run | Sum of operation seconds | Median operation ms |
+| --- | ---: | ---: |
+| Before | 1.750608 | 54.9395 |
+| After | 1.659696 | 51.2700 |
+| After, repeat | 1.662086 | 53.0745 |
+| Before, repeat | 1.755301 | 53.6735 |
+
+All 128 samples validate. Mean summed operation time falls from 1.752955 to
+1.660891 seconds, 5.25% in this configuration. The two-run spreads are 0.268%
+for the control and 0.144% for the candidate. Every per-sample I/O counter is
+identical across all four runs. Each run reads 1,961,984 bytes in 168 requests,
+writes 8,216,576 bytes in 240 requests, and issues 104 flushes.
+
+Mean summed put time is 1.537075 versus 1.470794 seconds; mean get time is
+0.215880 versus 0.190098 seconds. Gets perform 917,504 read bytes in 104 requests
+per run with this cache size, with no writes or flushes. Since get timing also
+changes despite unchanged get code and counters, the complete observed gain
+cannot be identified as direct hashing CPU savings. These are short, cache-
+dependent QEMU runs; operation sums exclude shell gaps and throttle-credit
+accumulation. This is not sustained throughput, a cold-remount read test, a new
+ext4 comparison or an actual SD speedup. Delta remains off.
+
+Evidence: `target/storage-digest-qemu-20260912/`, including build/run/analysis
+scripts, source and ELF hashes, raw JSONL, serial logs, `summary.json` and phase
+totals in `phases.json`.
+
+### Reuse full metadata digests in GC relocation (2026-09-12)
+
+GC relocation now writes complete manifest, CAS snapshot and allocation payloads
+through a private metadata entry point. Previously each caller hashed its buffer
+for the logical root, then the segment writer hashed it again for the payload
+digest. The new entry point derives both from one hash inside the writer.
+The general payload API still supplies a separate content root and hashes the
+individual payload, preserving fragmented object/authority semantics. The common
+record writer uses an optional root internally; absence is only requested by the
+complete-metadata wrapper, which fixes index/count/offset and byte lengths.
+
+No bytes, barriers, recovery validation or delta admission are intentionally
+changed. This removes duplicate source-level work at three GC construction sites
+(the manifest site runs per relocated blob). GC latency and generated-code
+savings have not yet been measured. Evidence:
+`target/storage-gc-digest-reuse-20260912/`, with the prior GC source retained.
+
+Validation: the changed-source full suite passes 278 unit tests (one ignored),
+including GC and near-ceiling mutation/cancellation coverage. QEMU passes the
+three-boot file-tree gate with GC pressure and cold recovery; Duo release checking
+passes. The changed-source result is `changed-unit.log`; the earlier `unit.log`
+was started before the source edit and is not the candidate validation result.
+
+### QEMU check of GC metadata digest reuse (2026-09-12)
+
+An isolated ABBA comparison uses the immediately preceding GC source versus its
+complete-metadata digest wrapper, with identical other source. Four fresh VMs
+each execute 256 unique 4 KiB durable put+get samples (seed 32, no warmups),
+128 MiB RAM, a 64-page cache and one TCG hart. Limits remain 4 MiB/s and 400 read
+IOPS, 2 MiB/s and 200 write IOPS. No build or test overlaps measurement. All
+overridden sources are restored and hash-checked.
+
+| Run | Sum of operation seconds | High-I/O sample seconds |
+| --- | ---: | ---: |
+| Before | 12.777347 | 3.450961 |
+| After | 12.739108 | 3.456154 |
+| After, repeat | 12.737619 | 3.445815 |
+| Before, repeat | 12.714902 | 3.446718 |
+
+All 1,024 records validate. Mean total time changes from 12.746125 to 12.738364
+seconds (-0.061%), smaller than the control's 0.490% two-run spread. Candidate
+spread is 0.012%. High-I/O samples are selected from the control by at least
+1 MiB of reads: indices 206 and 234, reading 2,961,408 and 3,559,424 bytes. Their
+mean combined time changes from 3.448840 to 3.450985 seconds (+0.062%). Neither
+comparison demonstrates a distinguishable improvement. The high-I/O samples
+include complete operations, not isolated GC CPU time.
+
+All per-sample I/O counters match. Each run reads 8,097,792 bytes in 1,565
+requests and writes 53,694,464 bytes in 1,857 requests, with 825 flushes. Thus
+the workload still writes 51.207 times its user payload. This leaves reducing
+media traffic as the performance priority. Operation sums omit shell gaps and
+throttle-credit accumulation; this is not sustained throughput or real SD data.
+The single-extent authority batch path was inspected but left unchanged to avoid
+altering request grouping as part of digest reuse. Delta remains disabled.
+
+Evidence: `target/storage-gc-digest-qemu-20260912/`, with source/build manifests,
+run commands, serial logs, raw JSONL, analysis script and `summary.json`.
+
+### Explicit experimental delta build feature (2026-09-12)
+
+`experimental-authority-delta` now compiles the codec, bounded recovery bridge,
+provenance state and fused writer outside cfg(test). It is forwarded through the
+kernel and QEMU firmware feature tables, with no default-feature change. A
+feature build accepts experimental delta during mount, but constructors still
+leave delta writing off. The feature-only
+`SegmentStore::enable_experimental_authority_delta` API requires an initialized
+authority snapshot and explicitly opts that instance into fused delta writes.
+It clears the previous witness. With no physical predecessor, fused publication
+uses the existing full encoder rather than attempting to replay a null root.
+
+The first non-test build identified a missing feature gate on the verified-scan
+memo's reservation accounting method. That interface and codec-specific snapshot
+helpers now compile under the same explicit feature; test instrumentation and
+fixture mutation helpers remain test-only. The QEMU firmware release check with
+`storage-bench-128m,experimental-authority-delta` succeeds on the RISC-V target.
+The feature's positive object/dedup/cold-mount/GC test invokes the public opt-in
+API and retains the earlier 64/55/64 versus 32/21/28 page counts.
+
+This is build and API plumbing, not a production rollout or a guest timing result.
+QEMU startup has not yet opted into writes. Default builds still reject delta;
+feature-enabled recovery acceptance must not be confused with default admission.
+Full publication-memory accounting is incomplete and encoding refusals can follow
+scratch writes. Coordinated writer/reader/offline deployment and guest recovery
+testing remain open. Evidence: `target/storage-delta-feature-20260912/`, including
+the initial compile error, corrected checks and feature test logs.
+
+Validation: feature-enabled full unit suite passes 278 tests (one ignored),
+including the fused delta fault/cancellation and append/GC-pressure regressions.
+Both default and feature-enabled library checks pass. The QEMU/RISC-V check is
+a compilation check only; no feature-enabled QEMU boot was performed this turn.
+
+### First guest delta writes and depth-limit cold recovery (2026-09-12)
+
+The feature-enabled kernel facade now opts into experimental fused delta writes
+at append entry, after authority initialization. Library opt-in is idempotent:
+repeated calls retain valid warm provenance instead of clearing it. The host
+positive scenario calls opt-in again after publication and verifies the witness
+still matches. Default feature selection and default writer behavior are unchanged.
+
+A QEMU image built with `storage-bench-128m,experimental-authority-delta` completes
+32 unique 4 KiB durable put+get operations (seed 32, one TCG hart, 128 MiB RAM,
+the normal 512-page cache configuration). This is a functional run without the
+previous performance throttle configuration, not a timing comparison. The
+powered-off image contains actual VIBEAUL1 records. Independent reconstruction
+selects generation 36 with delta depth 32 and validates both checkpoint copies.
+The default fallback verifier rejects the experimental history as intended.
+
+A new VM boots from a copy of that image and successfully appends/reads seed 64.
+The resulting image selects generation 37, depth 0: the depth limit causes full
+materialization. Both checkpoint copies validate with explicit experimental
+admission, while default history verification still rejects the older delta
+checkpoint. This workload has no durably granted authority objects: it retains
+32, then 33 CAS mappings/blobs, but does not prove old capability-backed payload
+reads after reboot. Each new payload is verified in its originating guest run.
+
+The initial 32 measured operations write 3,530,752 bytes with 104 flushes. The
+post-reboot append reads 1,875,968 bytes in 173 requests and writes 155,648 bytes
+in 10 requests with four flushes. These counters expose cold replay overhead;
+they are not a controlled improvement estimate. Write savings must be evaluated
+alongside that replay cost. Full memory admission, rooted guest recovery/GC
+coverage and controlled performance comparison remain open; no SD run was made.
+
+Evidence: `target/storage-delta-guest-20260912/`, including the ELF/source hashes,
+idempotent API test, guest records and serial logs, retained images, and the
+explicit-admission verifier wrapper/results (`offline.json`,
+`reboot-offline.json`). The experimental build now writes delta through the
+facade; this supersedes the preceding build-only status.
+
+### Reuse verified cold-mount delta provenance (2026-09-12)
+
+Feature-enabled mount can now retain the depth established by successful delta
+replay and prepare a fixed-size provenance witness from the decoded canonical
+snapshot. This avoids replaying the same chain on the first subsequent append.
+The temporary depth is consumed during mount and absent from constructed commit
+successors. The witness binds generation, physical authority pointer, admitted
+range, segment frontier, store UUID, canonical digest and depth; later encoding
+still checks that binding against its actual predecessor. Enabling writes does
+not discard this validated witness.
+
+Preparation uses the budget remaining after mounted resident allocations. Its
+workspace peak is included in recovery telemetry; the optional scan memo is
+explicitly dropped beforehand. A memory refusal skips caching and leaves the
+original cold-encode path available. The first feature test run exposed valid
+growth checkpoints referencing an older authority generation: these now skip
+witness preparation rather than treating the generation difference as corruption.
+Mount clears any old witness before recovery and installs the new one only after
+runtime generation publication succeeds. Default builds do not seed this cache.
+Fault matrices explicitly clear or install witnesses to preserve separate cold
+and warm coverage despite the new feature behavior.
+
+| Same depth-32 image, first append after reboot | Before | After |
+| --- | ---: | ---: |
+| Read bytes | 1,875,968 | 32,768 |
+| Read requests | 173 | 1 |
+| Write bytes | 155,648 | 155,648 |
+| Write requests | 10 | 10 |
+| Flushes | 4 | 4 |
+
+Both QEMU runs start from the preceding guest's identical retained depth-32 image,
+append/read the same 4 KiB seed-64 payload with 128 MiB RAM and the normal cache,
+then power off. Both resulting full disk images have identical SHA-256:
+`81d24c872b714362a250051f00e634496c2a7c4f4580cd6e7b360252ab3f4ba6`.
+Independent verification selects generation 37, depth 0 and verifies both
+checkpoint copies; default history verification still rejects the older delta.
+This is an I/O comparison for that cold-append case, not repeated timing or actual
+SD throughput. Mount now performs additional bounded hashing to prepare the
+witness; its time must be included in future boot-plus-append timing comparisons.
+
+Validation: corrected feature suite passes 278 tests (one ignored), including
+growth, budget, cold/warm cancellation and near-ceiling cases. Default library
+checking and experimental QEMU firmware build pass. Evidence, including initial
+growth failures and final logs, images and `comparison.json`:
+`target/storage-mounted-delta-witness-20260912/`. Full publication-memory
+admission and broader guest workload qualification remain open.
+
+### Full versus experimental delta QEMU ABBA (2026-09-12)
+
+The same current source is built with default full authority writes and with
+`experimental-authority-delta`. Each fresh VM runs 256 unique 4 KiB durable
+put+get samples, seed 32, no warmups, 128 MiB RAM, a 64-page cache and one TCG
+hart. Limits are 4 MiB/s and 400 read IOPS, 2 MiB/s and 200 write IOPS. Source
+overrides are restored; builds/tests finish before the timed runs.
+
+| Run | Sum of operation seconds | Median operation ms |
+| --- | ---: | ---: |
+| Full | 12.840072 | 36.2145 |
+| Delta | 13.637503 | 38.5325 |
+| Delta, repeat | 13.558370 | 38.6110 |
+| Full, repeat | 12.721952 | 34.8240 |
+
+All 1,024 samples validate. Mean operation sum rises from 12.781012 to
+13.597937 seconds (+6.39%), exceeding the respective two-run spreads of 0.924%
+and 0.582%. Per-sample counters repeat exactly within each build.
+
+| Per-run device work | Full | Delta | Change |
+| --- | ---: | ---: | ---: |
+| Read bytes | 8,097,792 | 12,541,952 | +54.88% |
+| Write bytes | 53,694,464 | 31,084,544 | -42.11% |
+| Read requests | 1,565 | 1,989 | +27.09% |
+| Write requests | 1,857 | 1,662 | -10.50% |
+| Flushes | 825 | 825 | unchanged |
+
+Device write bytes/user payload fall from 51.207x to 29.645x, but this workload
+is slower. The candidate adds high-read samples at indices 22 and 55 (1,486,848
+and 1,536,000 bytes); samples 206 and 234 also read more than full encoding.
+Those four samples repeat across candidate runs. This identifies concrete
+follow-up points for replay/invalidation investigation, not proof of their exact
+cause. Lower write volume alone is not an end-to-end performance win here.
+
+The retained candidate image independently verifies generation 273, delta depth
+22 and both checkpoint copies. Default verification rejects the delta history.
+It contains 256 CAS objects/blobs but no durably granted authority objects; guest
+get verifies each newly published object during its run. Operation sums exclude
+shell gaps and throttle-credit recovery, so this is not sustained throughput or
+actual SD performance. The experiment stays opt-in pending replay-cost work,
+complete memory admission and broader qualification.
+
+Evidence: `target/storage-delta-abba-20260912/`, including build/command/source
+manifests, raw JSONL and serial logs, `summary.json`, `io-comparison.json`, retained
+candidate image and `offline.json`.
+
+### Preserve verified delta provenance across online growth (2026-09-12)
+
+Serial capacity diagnostics identify samples 22 and 55 as online growth. Growth
+preserves the physical authority root and canonical snapshot while changing the
+checkpoint generation, admitted range and segment frontier. Those changes made
+the former provenance witness miss and forced complete delta replay on append.
+
+The experimental path now takes the witness before growth can mutate media.
+Only after growth checkpoint/read-back and successor verification succeed may it
+rebind: generation must advance exactly once, admitted range and segment frontier
+must increase, and store UUID and physical authority pointer must be unchanged.
+A bounded canonical digest/depth check then verifies the successor snapshot.
+Budget failure or any mismatch leaves caching disabled. Failed or cancelled
+growth drops the local witness. This does not relax cold-mount generation checks
+or change any on-media data; default builds do not use the rebinding path.
+
+The existing empty/live growth matrices now assert successful cache preservation,
+zero-budget and changed-root rejection, and absence of cache after each failed or
+cancelled growth. The full feature suite passed 278 tests (one ignored), and the
+augmented empty/live matrix tests pass separately. Default checking and QEMU
+experimental firmware builds pass.
+
+| Matched 64-operation QEMU prefix | Before | After |
+| --- | ---: | ---: |
+| Read bytes | 3,264,512 | 258,048 |
+| Read requests | 358 | 63 |
+| Write bytes | 7,036,928 | 7,036,928 |
+| Write requests | 406 | 406 |
+| Flushes | 203 | 203 |
+
+Both runs use 64 unique 4 KiB operations, seed 32, 128 MiB RAM, a 64-page cache,
+one TCG hart and the same read/write limits as the previous ABBA. Builds and
+tests finish before measurement. Sample 22 drops from 1,486,848 bytes/148 reads
+to 8,192 bytes/two reads; sample 55 drops from 1,536,000 bytes/151 reads to the
+same 8,192 bytes/two reads. Per-sample write and flush counters all match. The
+two powered-off images have identical SHA-256:
+`1002c5f5fe00fae4e62463b9278ee2b7ea5dadf4e668623edb1efb87d0b5185e`.
+
+Observed operation sums are 2.121284 versus 1.508586 seconds, but this is one
+prefix comparison, not repeated timing or the complete 256-operation workload.
+The later pressure samples still need remeasurement. Independent explicit-
+admission image verification passes; default verification rejects delta history.
+No SD throughput claim is made. Evidence:
+`target/storage-growth-delta-witness-20260912/`, including source/build manifests,
+test logs, matched commands, JSONL, retained images and `comparison.json`.
+
+### Complete delta ABBA after growth-witness preservation (2026-09-12)
+
+Fresh full and experimental-delta ELFs from the current source repeat the same
+256-operation 4 KiB workload, seed 32, ABBA order, 128 MiB RAM, 64-page cache,
+one TCG hart, read 4 MiB/s/400 IOPS and write 2 MiB/s/200 IOPS. No builds or
+tests overlap measurement; all 1,024 records validate.
+
+| Run | Operation sum seconds | Median operation ms |
+| --- | ---: | ---: |
+| Full | 12.834312 | 35.1490 |
+| Delta | 12.908250 | 38.9525 |
+| Delta, repeat | 12.817783 | 38.6740 |
+| Full, repeat | 12.651473 | 34.9355 |
+
+Mean operation sums are 12.742893 and 12.863017 seconds (+0.943%). This is smaller
+than the full build's 1.435% two-run spread (delta spread 0.703%), so overall
+timing does not establish a stable improvement. The average of run medians,
+however, rises from 35.04225 to 38.81325 ms (+10.76%); reporting only the total
+would hide this ordinary-operation cost. The first three 64-operation quarters
+are slower for delta, while the last quarter is faster overall. Further work
+should examine warm append encoding/validation, not assume the latency problem
+is resolved by eliminating growth replay.
+
+Within each build, every per-sample I/O counter repeats exactly. Full still reads
+8,097,792 bytes and writes 53,694,464 bytes per run. Delta now reads 8,437,760
+bytes (+4.20%) and writes 31,084,544 bytes (-42.11%); read requests are 1,606
+versus 1,565, write requests 1,662 versus 1,857, and both issue 825 flushes.
+Growth samples 22/55 read only 8 KiB. The remaining high-read samples are 206/234;
+their combined mean time is 3.577508 versus 3.452452 seconds.
+
+The candidate disk is byte-identical to the pre-growth-fix candidate disk from
+the preceding complete ABBA (SHA-256
+`84f2d929240dd64dd3f1d7f725d245b86496044fdca3f640092ea8fffc97352c`).
+Independent verification again accepts generation 273, depth 22 and both
+checkpoint copies with explicit admission; default verification rejects it.
+There remain no durably granted authority objects in this shell workload.
+Command gaps and throttle-credit recovery are excluded from operation sums;
+these results are not sustained throughput or real SD behavior. Experimental
+delta remains opt-in and full memory admission remains incomplete.
+
+Evidence: `target/storage-delta-growth-abba-20260912/`, including raw records,
+serial logs, source/build/command manifests, `summary.json`, quarter/phase data
+and image hashes in `phases.json`, retained image and `offline.json`.

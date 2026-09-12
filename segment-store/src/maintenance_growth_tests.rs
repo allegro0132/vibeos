@@ -450,8 +450,20 @@ fn exercise_delta_growth(has_object: bool) {
                 store.mounted.as_ref().unwrap().persistent_authority.as_ref().unwrap()).unwrap();
             let before = store.info().unwrap();
             let seed_image = device.durable_image();
+            #[cfg(feature = "experimental-authority-delta")]
+            let predecessor_witness = store.experimental_authority_base.clone().unwrap();
             device.reset_io();
             let info = block_on(store.grow(&maintenance, adjacent_range(8, 4))).unwrap();
+            #[cfg(feature = "experimental-authority-delta")]
+            {
+                let state = store.mounted.as_ref().unwrap();
+                assert!(store.experimental_authority_base.as_ref().unwrap().matches(state));
+                assert!(state.persistent_authority.as_ref().unwrap().checkpoint_generation() < state.generation);
+                assert!(predecessor_witness.after_verified_growth(state, 0).is_none());
+                let mut changed_root = state.clone();
+                changed_root.authority_root = vibeos_segment_format::PhysicalPointer::Null;
+                assert!(predecessor_witness.after_verified_growth(&changed_root, limits().recovery_memory_bytes).is_none());
+            }
             let boundaries = device.io_counts().1;
             assert!(boundaries > 10);
             for boundary in 0..boundaries {
@@ -479,6 +491,8 @@ fn exercise_delta_growth(has_object: bool) {
                             "unreached boundary {boundary}: {action:?}");
                     }
                     assert_eq!(candidate.info(), Err(StoreError::RecoveryRequired));
+                    #[cfg(feature = "experimental-authority-delta")]
+                    assert!(candidate.experimental_authority_base.is_none(), "failed growth retained provenance");
                     cut.power_cycle();
                     cut.expose_full_parent_range();
                     let durable = cut.durable_image();

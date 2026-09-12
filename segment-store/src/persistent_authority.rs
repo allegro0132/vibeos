@@ -8,7 +8,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
 
-use sha2::{Digest, Sha256};
 use vibeos_blob_format::{BlobDescriptor, LEAF_SIZE};
 use vibeos_segment_format::{
     payload_sha256, ExtentKind, PhysicalPointer, ANCHOR_SEGMENT_NO, DATA_END_PAGE,
@@ -1155,6 +1154,13 @@ impl<D: PageDevice> SegmentStore<D> {
         (PersistentAuthorityView, Vec<PersistentObjectHandle>),
         PersistentAuthorityError<D::Error>,
     > {
+        // The experimental witness must leave the store before any scratch
+        // staging can fail or be cancelled. Keep it local for bounded encoding
+        // and install a replacement only after the whole append succeeds.
+        #[cfg(any(test, feature = "experimental-authority-delta"))]
+        let experimental_cached = if self.experimental_fused_authority_delta {
+            self.experimental_authority_base.take()
+        } else { None };
         if transient_ids
             .iter()
             .chain(charged_ids.iter())
@@ -1400,17 +1406,13 @@ impl<D: PageDevice> SegmentStore<D> {
             }
             fresh.push(recovered);
         }
-        // The fused single-checkpoint path writes the authority snapshot as
-        // one extent; route payloads that could exceed the 1 MiB extent
-        // ceiling through the general multi-extent publication instead. The
-        // slack covers the header, bindings, principals, and external roots.
-        let fused_authority_fits = import
-            .record_stream
-            .len()
-            .checked_add(128 * 1024)
-            .is_some_and(|estimate| {
-                estimate <= MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE
-            });
+        // Physical binding values are assigned after staging, but the final
+        // table counts are known now. Use their exact frozen-format length so
+        // the former 128 KiB slack does not force an unnecessary second commit.
+        let fused_authority_fits = crate::authority_snapshot::persistent_authority_encoded_len_for_parts(
+            import.record_stream.len(), import.admitted_object_count(),
+            import.principals.len(), external_roots.len())
+            .is_ok_and(|len| len <= MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE);
         if fresh.len() == 1 && fused_authority_fits {
             let recovered = fresh[0];
             let stable_id = recovered.object_id.get();
@@ -1525,33 +1527,53 @@ impl<D: PageDevice> SegmentStore<D> {
                 external_roots,
             )
             .map_err(PersistentAuthorityError::Snapshot)?;
+            // Reserve the complete root table once, fallibly, before encoding
+            // and fused publication. Scratch staging above may already have
+            // written media; this is not whole-operation admission.
+            let persistent_roots = prepare_authority_roots(
+                &snapshot, generation, self.limits.recovery_memory_bytes)?;
+            #[cfg(any(test, feature = "experimental-authority-delta"))]
+            let mut experimental_successor = None;
+            #[cfg(any(test, feature = "experimental-authority-delta"))]
+            let authority_bytes = if self.experimental_fused_authority_delta
+                && staged.predecessor_for_delta_test().is_some_and(|base| base.authority_root != PhysicalPointer::Null)
+            {
+                let base = staged.predecessor_for_delta_test().ok_or(StoreError::Corrupt)?;
+                let resident = base.resident_heap_bytes()
+                    .and_then(|n| n.checked_add(snapshot.allocated_bytes()?))
+                    .and_then(|n| n.checked_add(persistent_roots.allocated_bytes()?))
+                    .ok_or(StoreError::MemoryLimit)?;
+                // This prototype bounds codec workspace only. Staging has
+                // already written scratch; full fused admission remains open.
+                let workspace = self.limits.recovery_memory_bytes.checked_sub(resident)
+                    .ok_or(StoreError::MemoryLimit)?;
+                let prepared = crate::authority_delta::PreparedBaseForTest::prepare::<D::Error>(&snapshot, workspace)?;
+                let (bytes, depth) = crate::authority_delta::encode_next_for_test(
+                    &self.device, base, &snapshot, workspace, experimental_cached.as_ref()).await?;
+                experimental_successor = Some((prepared, depth));
+                bytes
+            } else {
+                encode_persistent_authority_snapshot(&snapshot).map_err(PersistentAuthorityError::Snapshot)?
+            };
+            #[cfg(not(any(test, feature = "experimental-authority-delta")))]
             let authority_bytes = encode_persistent_authority_snapshot(&snapshot)
                 .map_err(PersistentAuthorityError::Snapshot)?;
-            let mut root_entries: Vec<PersistentRootEntry> = snapshot
-                .objects
-                .iter()
-                .map(|binding| PersistentRootEntry {
-                    object_id: binding.v2_object_id,
-                    commit_generation: binding.commit_generation,
-                    object_kind: binding.object_kind,
-                })
-                .collect();
-            root_entries.extend_from_slice(snapshot.external_roots());
-            root_entries.sort_unstable_by_key(|entry| entry.object_id);
-            let persistent_roots = PersistentRootSet::new(generation, root_entries)
-                .map_err(|_| PersistentAuthorityError::Store(StoreError::Corrupt))?;
             // Same ordering contract as publish_persistent_snapshot: the pure
             // quota installation precedes the first media mutation of the
             // fused publication.
+            let successor_workspace = self.limits.recovery_memory_bytes
+                .checked_sub(persistent_roots.allocated_bytes().ok_or(StoreError::MemoryLimit)?)
+                .ok_or(StoreError::MemoryLimit)?;
+            let prepared_snapshot = snapshot.prepare_publication(authority_bytes, successor_workspace)
+                .map_err(|error| match error {
+                    AuthoritySnapshotError::MemoryLimit => PersistentAuthorityError::Store(StoreError::MemoryLimit),
+                    error => PersistentAuthorityError::Snapshot(error),
+                })?;
             self.install_persistent_quota_snapshot(&snapshot)?;
             let object = self
                 .publish_staged_object_with_authority(
                     staged,
-                    crate::cas::FusedAuthorityPublication {
-                        authority_bytes,
-                        persistent_authority: snapshot.clone(),
-                        persistent_roots,
-                    },
+                    crate::cas::FusedAuthorityPublication::prepared(prepared_snapshot, persistent_roots),
                 )
                 .await?;
             object
@@ -1587,6 +1609,10 @@ impl<D: PageDevice> SegmentStore<D> {
             let view = self
                 .build_persistent_view(self.require_current_generation()?, snapshot, false)
                 .await?;
+            #[cfg(any(test, feature = "experimental-authority-delta"))]
+            if let Some((prepared, depth)) = experimental_successor {
+                self.experimental_authority_base = Some(prepared.bind(self.require_current_generation()?, depth)?);
+            }
             return Ok((view, transient_objects));
         }
         let mut committed = Vec::new();
@@ -1766,17 +1792,39 @@ impl<D: PageDevice> SegmentStore<D> {
         &mut self,
         snapshot: PersistentAuthoritySnapshot,
     ) -> Result<(), PersistentAuthorityError<D::Error>> {
-        let state = self.require_current_generation()?.clone();
         // Consume before any fallible work, so failure/cancellation cannot
         // retain a witness for a publication with an ambiguous outcome.
         let cached = self.experimental_authority_base.take();
+        let state = self.require_current_generation()?;
+        // Keep only the mounted state during encoding. A publication clone is
+        // needed later, but must not overlap cold replay/semantic workspace.
+        let resident = state.resident_heap_bytes()
+            .and_then(|bytes| bytes.checked_add(snapshot.allocated_bytes()?))
+            .ok_or(StoreError::MemoryLimit)?;
+        let workspace = self.limits.recovery_memory_bytes.checked_sub(resident)
+            .ok_or(StoreError::MemoryLimit)?;
+        // Prepare the successor digest before I/O, while only the borrowed
+        // inputs are live. Its encoder workspace drops before delta encoding;
+        // successful publication must not allocate metadata to install a cache.
+        let prepared = crate::authority_delta::PreparedBaseForTest::prepare::<D::Error>(
+            &snapshot, workspace,
+        )?;
         let (bytes, depth) = crate::authority_delta::encode_next_for_test(
-            &self.device, &state, &snapshot, self.limits.recovery_memory_bytes, cached.as_ref(),
+            &self.device, state, &snapshot, workspace, cached.as_ref(),
         ).await?;
+        // Admit the tracked Vec-backed clone while output and inputs remain
+        // live. Runtime BTreeSet proofs and allocator overhead are outside
+        // resident_heap_bytes; publication still needs its own admission.
+        let clone_overlap = resident.checked_add(bytes.capacity())
+            .and_then(|bytes| bytes.checked_add(state.resident_heap_bytes()?))
+            .ok_or(StoreError::MemoryLimit)?;
+        if clone_overlap > self.limits.recovery_memory_bytes {
+            return Err(StoreError::MemoryLimit.into());
+        }
+        let state = state.clone();
         self.publish_persistent_snapshot(state, snapshot.checkpoint_generation(), bytes, &snapshot).await?;
-        self.experimental_authority_base = Some(crate::authority_delta::VerifiedBaseForTest::from_published(
-            self.require_current_generation()?, depth,
-        )?);
+        drop(snapshot);
+        self.experimental_authority_base = Some(prepared.bind(self.require_current_generation()?, depth)?);
         Ok(())
     }
 
@@ -1798,6 +1846,23 @@ impl<D: PageDevice> SegmentStore<D> {
         authority_bytes: Vec<u8>,
         snapshot: &PersistentAuthoritySnapshot,
     ) -> Result<(), PersistentAuthorityError<D::Error>> {
+        // Root construction must be fallible and finish before quota changes,
+        // poisoning or media mutation. This bounds the root table only; the
+        // surrounding publication workspace still requires separate admission.
+        let persistent_roots = prepare_authority_roots(snapshot, generation, self.limits.recovery_memory_bytes)?;
+        // Prepare successor tables (and delta fallback log capacity) before
+        // mutation. The full encoding normally supplies the installed log's
+        // capacity after read-back. This budget covers additional workspace,
+        // not all of the caller's or builder's live allocations.
+        let successor_workspace = self.limits.recovery_memory_bytes
+            .checked_sub(persistent_roots.allocated_bytes().ok_or(StoreError::MemoryLimit)?)
+            .ok_or(StoreError::MemoryLimit)?;
+        let prepared = snapshot.prepare_publication(authority_bytes, successor_workspace)
+            .map_err(|error| match error {
+                AuthoritySnapshotError::MemoryLimit => PersistentAuthorityError::Store(StoreError::MemoryLimit),
+                error => PersistentAuthorityError::Snapshot(error),
+            })?;
+        let authority_bytes = prepared.encoded();
         let counts = state
             .allocation
             .counts()
@@ -1917,19 +1982,12 @@ impl<D: PageDevice> SegmentStore<D> {
         } else {
             None
         };
-        // Repeat the pure admission plan with the final stable/V2 assignments,
-        // then install it atomically before the authority checkpoint can begin
-        // mutation. Every fallible allocation, capacity calculation, and codec
-        // operation above leaves the old accounting untouched. Any I/O failure
-        // below poisons the store and a subsequent mount reconstructs quota from
-        // whichever complete checkpoint is actually durable.
-        self.install_persistent_quota_snapshot(snapshot)?;
-        self.mounted = None;
-        self.poisoned = true;
-        let mut builder = SegmentBuilder::begin(&self.device, &state, generation, free).await?;
+        let has_empty_cas_snapshot = empty_cas_snapshot.is_some();
+        let payload_count = authority_extent_count.checked_add(1 + usize::from(has_empty_cas_snapshot))
+            .ok_or(StoreError::MemoryLimit)?;
         let mut payloads = Vec::new();
         payloads
-            .try_reserve_exact(3)
+            .try_reserve_exact(payload_count)
             .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
         if let Some(bytes) = empty_cas_snapshot.as_ref() {
             payloads.push(SegmentPayload {
@@ -1976,6 +2034,21 @@ impl<D: PageDevice> SegmentStore<D> {
             merkle_root: payload_sha256(&allocation_bytes),
             bytes: &allocation_bytes,
         });
+        // Allocate both descriptor tables before changing quota or touching
+        // media. Multi-extent authority must not outgrow a fixed three entries.
+        let mut staged = Vec::new();
+        staged.try_reserve_exact(payload_count)
+            .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
+        // Repeat the pure admission plan with the final stable/V2 assignments,
+        // then install it atomically before the authority checkpoint can begin
+        // mutation. Every fallible allocation, capacity calculation, and codec
+        // operation above leaves the old accounting untouched. Any I/O failure
+        // below poisons the store and a subsequent mount reconstructs quota from
+        // whichever complete checkpoint is actually durable.
+        self.install_persistent_quota_snapshot(snapshot)?;
+        self.mounted = None;
+        self.poisoned = true;
+        let mut builder = SegmentBuilder::begin(&self.device, &state, generation, free).await?;
         let pointers = match builder
             .payload_batch_single_segment(&self.device, &payloads)
             .await
@@ -2046,10 +2119,6 @@ impl<D: PageDevice> SegmentStore<D> {
         // durable, so a misdirected anchor write cannot evade the final
         // read-back. Unchanged CAS/catalog state remains covered by the
         // predecessor witness and the exact checkpoint transition.
-        let mut staged = Vec::new();
-        staged
-            .try_reserve_exact(3 + authority_extent_count as usize)
-            .map_err(|_| PersistentAuthorityError::Store(StoreError::MemoryLimit))?;
         if let (Some(bytes), PhysicalPointer::Value(_)) =
             (empty_cas_snapshot.as_ref(), catalog_root)
         {
@@ -2076,25 +2145,23 @@ impl<D: PageDevice> SegmentStore<D> {
             None,
         )
         .await?;
-        let mut root_entries: Vec<PersistentRootEntry> = snapshot
-            .objects
-            .iter()
-            .map(|binding| PersistentRootEntry {
-                object_id: binding.v2_object_id,
-                commit_generation: binding.commit_generation,
-                object_kind: binding.object_kind,
-            })
-            .collect();
-        root_entries.extend_from_slice(snapshot.external_roots());
-        root_entries.sort_unstable_by_key(|entry| entry.object_id);
-        let persistent_roots = PersistentRootSet::new(generation, root_entries)
-            .map_err(|_| PersistentAuthorityError::Store(StoreError::Corrupt))?;
+        // Verification is the last consumer of these bytes. Release them
+        // before installing the prepared successor. Its log takes ownership
+        // of the encoding buffer when that capacity is sufficient.
+        drop(staged);
+        drop(payloads);
+        drop(pointers);
+        drop(allocation_bytes);
+        drop(empty_cas_snapshot);
+        let successor_authority = prepared.finish();
         let next_physical_segment = (0..state.admitted_segments)
             .find(|segment_no| {
                 allocation.segment_state(*segment_no) == Some(SegmentAllocation::Free)
             })
             .unwrap_or(state.admitted_segments);
         let mut successor = MountedState {
+        #[cfg(feature = "experimental-authority-delta")]
+        recovered_authority_depth: None,
             superblock: state.superblock,
             generation,
             admitted_segments: state.admitted_segments,
@@ -2112,9 +2179,9 @@ impl<D: PageDevice> SegmentStore<D> {
             allocation,
             allocation_version: 2,
             persistent_roots: Some(persistent_roots),
-            persistent_authority: Some(snapshot.clone()),
+            persistent_authority: Some(successor_authority),
             catalog: state.catalog.clone(),
-            cas: if empty_cas_snapshot.is_some() {
+            cas: if has_empty_cas_snapshot {
                 Some(CasMountedState {
                     objects: Vec::new(),
                     blobs: Vec::new(),
@@ -2374,11 +2441,11 @@ impl<D: PageDevice> SegmentStore<D> {
             None if snapshot.principals().is_empty() => Vec::new(),
             None => return Err(PersistentAuthorityError::InvalidQuotaPolicy),
         };
-        let encoded = encode_persistent_authority_snapshot(&snapshot)
+        let snapshot_sha256 = crate::authority_snapshot::persistent_authority_snapshot_sha256(&snapshot)
             .map_err(PersistentAuthorityError::Snapshot)?;
         Ok(PersistentAuthorityView {
             store_uuid: state.superblock.binding.store_uuid.into_bytes(),
-            snapshot_sha256: Sha256::digest(&encoded).into(),
+            snapshot_sha256,
             snapshot,
             objects,
             principals,
@@ -2409,6 +2476,31 @@ impl<D: PageDevice> SegmentStore<D> {
         self.build_persistent_view(&state, view.snapshot.clone(), true)
             .await
     }
+}
+
+fn prepare_authority_roots<E>(
+    snapshot: &PersistentAuthoritySnapshot,
+    generation: u64,
+    maximum_bytes: usize,
+) -> Result<PersistentRootSet, PersistentAuthorityError<E>> {
+    let count = snapshot.objects.len().checked_add(snapshot.external_roots().len())
+        .ok_or(StoreError::MemoryLimit)?;
+    let requested = count.checked_mul(core::mem::size_of::<PersistentRootEntry>())
+        .ok_or(StoreError::MemoryLimit)?;
+    if requested > maximum_bytes {
+        return Err(StoreError::MemoryLimit.into());
+    }
+    let mut entries = Vec::new();
+    entries.try_reserve_exact(count).map_err(|_| StoreError::MemoryLimit)?;
+    entries.extend(snapshot.objects.iter().map(|binding| PersistentRootEntry {
+        object_id: binding.v2_object_id,
+        commit_generation: binding.commit_generation,
+        object_kind: binding.object_kind,
+    }));
+    entries.extend_from_slice(snapshot.external_roots());
+    entries.sort_unstable_by_key(|entry| entry.object_id);
+    PersistentRootSet::new(generation, entries)
+        .map_err(|_| StoreError::Corrupt.into())
 }
 
 fn validate_quota_totals<E>(
@@ -2490,4 +2582,29 @@ fn persistent_quota_binding_pairs<E>(
             .map(|binding| (binding.stable_object_id, binding.v2_object_id)),
     );
     Ok(pairs)
+}
+
+#[cfg(test)]
+mod root_preparation_tests {
+    use super::*;
+    #[test]
+    fn combined_root_table_uses_exact_budget_and_sorts_by_physical_object() {
+        let mut chain = vibeos_durable_format::RecordChain::new(vibeos_durable_format::StoreId::new(7).unwrap());
+        let records = chain.append(None, vibeos_durable_format::RecordBody::Format).unwrap().to_vec();
+        let snapshot = PersistentAuthoritySnapshot::from_validated_import_parts(5, [7; 32], records,
+            alloc::vec![PersistentObjectBinding { stable_object_id: 1, v2_object_id: 9,
+                commit_generation: 4, object_kind: 7 }], Vec::new(),
+            alloc::vec![PersistentRootEntry { object_id: 2, commit_generation: 3, object_kind: 8 }]).unwrap();
+        let budget = 2 * core::mem::size_of::<PersistentRootEntry>();
+        assert!(matches!(prepare_authority_roots::<()>(&snapshot, 5, budget - 1),
+            Err(PersistentAuthorityError::Store(StoreError::MemoryLimit))));
+        let roots = prepare_authority_roots::<()>(&snapshot, 5, budget).unwrap();
+        assert_eq!(roots.allocated_bytes(), Some(budget));
+        assert_eq!(roots.entries(), &[
+            PersistentRootEntry { object_id: 2, commit_generation: 3, object_kind: 8 },
+            PersistentRootEntry { object_id: 9, commit_generation: 4, object_kind: 7 },
+        ]);
+        assert!(matches!(prepare_authority_roots::<()>(&snapshot, 2, budget),
+            Err(PersistentAuthorityError::Store(StoreError::Corrupt))));
+    }
 }

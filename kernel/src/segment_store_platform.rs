@@ -1816,6 +1816,11 @@ impl StorageV2Runtime {
             .ok_or(V2RuntimeError::Corrupt)?;
         let result = poll_as_system(async {
             let store = operation.store();
+            // Research-only guest opt-in after authority initialization. The
+            // library call is idempotent so warm predecessor provenance survives.
+            #[cfg(feature = "experimental-authority-delta")]
+            store.enable_experimental_authority_delta()
+                .map_err(|_| V2RuntimeError::Corrupt)?;
             let writer = store
                 .derive_persistent_authority_writer(&maintenance)
                 .map_err(|_| V2RuntimeError::Corrupt)?;

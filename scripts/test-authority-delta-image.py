@@ -36,16 +36,44 @@ def live_object(state):
     return {2: state.objects[2]}
 
 
+def fused_objects(state):
+    # The external policy permits exactly the known prefix at either durable
+    # checkpoint, including the older two-object fallback of the final append.
+    count = len(state.objects)
+    expected_ids = [8193, 8198, 8203][:count]
+    verifier.require(count <= 3 and set(state.objects) == set(expected_ids)
+                     and len(state.grants) == count and not state.tombstones,
+                     "fused fixture history differs")
+    live, slots = {}, {}
+    for index, (object_id, grant) in enumerate(zip(expected_ids, state.grants)):
+        derivation, space = 8195 + 5 * index, 8196 + 5 * index
+        verifier.require((grant.derivation, grant.parent, grant.object_id, grant.space,
+                          grant.slot, grant.generation, grant.rights, grant.resource_kind, grant.flags)
+                         == (derivation, 0, object_id, space, 0, 0, 1, 0x41555432, 1),
+                         "fused root policy differs")
+        kind, content, sequence = state.objects[object_id]
+        verifier.require(kind == 0x41555432 and content == bytes([0x61 if index < 2 else 0x62]) * 4096
+                         and sequence < grant.commit_sequence, "fused object differs")
+        live[derivation] = grant
+        slots[(space, 0)] = (0, derivation)
+    verifier.require(state.live == live and state.slots == slots, "fused grant/slot state differs")
+    return {object_id: state.objects[object_id] for object_id in expected_ids}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("fixtures", type=Path)
     args = parser.parse_args()
     results = {}
     rejected = 0
-    for name, depth in [("delta.raw", 3), ("materialized.raw", 0),
-                        ("live-delta.raw", 3), ("live-materialized.raw", 0)]:
-        live = name.startswith("live-")
-        selector = live_object if live else empty_objects
+    fixtures = [("delta.raw", 3), ("materialized.raw", 0),
+                ("live-delta.raw", 3), ("live-materialized.raw", 0)]
+    if any((args.fixtures / name).exists() for name in ("fused-delta.raw", "fused-materialized.raw")):
+        fixtures += [("fused-delta.raw", 3), ("fused-materialized.raw", 0)]
+    for name, depth in fixtures:
+        fused = name.startswith("fused-")
+        live = fused or name.startswith("live-")
+        selector = fused_objects if fused else live_object if live else empty_objects
         policy = verifier.AuthorityPolicy(b"test authority roots v1", selector, 0x415554482D5445535401)
         image = (args.fixtures / name).read_bytes()
         structure = verifier.gc_verifier.parse_raw_structure(image)
@@ -86,8 +114,9 @@ def main():
             else:
                 raise AssertionError("default fallback verifier accepted experimental delta")
         bindings = verifier.verify_authority_bindings({"recovered": result})
-        assert bindings["authority_objects"] == int(live)
-        assert bindings["logical_bytes"] == (4096 if live else 0)
+        expected_objects = 3 if fused else int(live)
+        assert bindings["authority_objects"] == expected_objects
+        assert bindings["logical_bytes"] == 4096 * expected_objects
         for bad_policy in [verifier.AuthorityPolicy(b"wrong policy", selector, policy.store_id),
                            verifier.AuthorityPolicy(policy.external_policy, selector, policy.store_id + 1)]:
             try:

@@ -5,6 +5,8 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+# Research-only format admission; writes require runtime opt-in.
+experimental-authority-delta = ["vibeos-kernel/experimental-authority-delta"]
 python-wasi = ["vibeos-kernel/python-wasi"]
 wasmtime-command = ["vibeos-kernel/wasmtime-command"]
 wasmtime-command-fuel-batch = ["vibeos-kernel/wasmtime-command-fuel-batch"]

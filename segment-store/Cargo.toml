@@ -3,6 +3,11 @@ name = "vibeos-segment-store"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Opt-in research build only: accepts experimental authority delta media.
+# Writers still require an explicit runtime opt-in; default builds reject it.
+experimental-authority-delta = []
+
 [dependencies]
 sha2 = { version = "0.11.0", default-features = false }
 vibeos-blob-format = { path = "../blob-format" }

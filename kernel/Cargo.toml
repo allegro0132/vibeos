@@ -5,6 +5,8 @@ edition = "2021"
 autobins = false
 
 [features]
+# Research-only format admission; writes require runtime opt-in.
+experimental-authority-delta = ["vibeos-segment-store/experimental-authority-delta"]
 # Production Duo command image; never pulls in QEMU test identities.
 milkv-wasmtime = ["milkv-command", "wasi-preview1", "vibeos-sshd/wasi-exec", "wasmtime-command-fuel-batch", "wasmtime-threads"]
 python-command = ["wasi-preview1", "vibeos-wasi-runtime/python-wasi", "vibeos-sshd/python-wasi"]

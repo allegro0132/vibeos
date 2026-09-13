@@ -40,6 +40,9 @@ mod quota;
 #[cfg(test)]
 mod quota_integration_tests;
 mod root_codec;
+/// Experimental codec only; not admitted by any mount or publication path.
+#[cfg(any(test, feature = "experimental-root-bundle"))]
+pub mod experimental_root_bundle;
 mod scrub;
 #[cfg(test)]
 mod scrub_tests;

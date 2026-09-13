@@ -7,6 +7,8 @@ edition = "2021"
 # Opt-in research build only: accepts experimental authority delta media.
 # Writers still require an explicit runtime opt-in; default builds reject it.
 experimental-authority-delta = []
+# Codec research only; this does not enable media admission or a writer path.
+experimental-root-bundle = ["vibeos-segment-format/experimental-root-bundle"]
 
 [dependencies]
 sha2 = { version = "0.11.0", default-features = false }

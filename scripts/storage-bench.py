@@ -260,10 +260,11 @@ def convert_guest_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
             if value is not None:
                 require(isinstance(value, int) and value >= 0, f"bad {name}")
                 counters[name.removeprefix("block_")] = value
-        file_phase_names = ("stage", "publish", "verify", "remove")
+        batch_phases = sample.get("workload") in ("file-batch-create", "file-batch-create-unique")
+        file_phase_names = ("stage", "publish", "verify", "cleanup" if batch_phases else "remove")
         if any(name.startswith(tuple(f"file_{phase}_" for phase in file_phase_names))
                for name in sample):
-            require(sample.get("workload") == "file-sequential", "file phases on another workload")
+            require(sample.get("workload") == "file-sequential" or batch_phases, "file phases on another workload")
             for metric in ("requests", "read_requests", "write_requests", "flush_requests",
                            "read_bytes", "write_bytes", "used_interrupts"):
                 total = 0
@@ -276,7 +277,7 @@ def convert_guest_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
                 require(total == counters.get(metric), f"file phase sum differs for {metric}")
         time_names = [f"file_{phase}_elapsed_ticks" for phase in file_phase_names]
         if any(name in sample for name in time_names):
-            require(sample.get("workload") == "file-sequential", "file times on another workload")
+            require(sample.get("workload") == "file-sequential" or batch_phases, "file times on another workload")
             for name in time_names:
                 value = sample.get(name)
                 require(type(value) is int and value >= 0, f"bad or missing {name}")
@@ -1046,6 +1047,25 @@ def selftest() -> None:
             pass
         else:
             raise AssertionError("converter accepted inconsistent file phase times")
+    for workload in ("file-batch-create", "file-batch-create-unique"):
+        batch = {name.replace("file_remove_", "file_cleanup_"): value
+                 for name, value in timed.items()}
+        batch["workload"] = workload
+        assert convert(batch)["phases"]["file_cleanup_elapsed_ticks"] == 4
+        for mutate in (
+            lambda item: item.pop("file_cleanup_read_bytes"),
+            lambda item: item.update(file_cleanup_elapsed_ticks=True),
+            lambda item: item.update(file_cleanup_write_bytes=5),
+            lambda item: item.update(elapsed_ticks=11),
+        ):
+            malformed = dict(batch)
+            mutate(malformed)
+            try:
+                convert(malformed)
+            except ValidationError:
+                pass
+            else:
+                raise AssertionError("converter accepted inconsistent batch phases")
     detailed = dict(timed, file_stage_pattern_ticks=0, file_stage_push_ticks=1,
                     file_stage_finish_ticks=0, file_stage_other_ticks=0)
     assert convert(detailed)["phases"]["file_stage_push_ticks"] == 1

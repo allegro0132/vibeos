@@ -2596,7 +2596,23 @@ fn validate_authority_extent_chain<E>(extents: &[ExtentRecord]) -> Result<(), St
     Ok(())
 }
 
-pub(crate) async fn read_pointer_payload<D: PageDevice>(
+pub(crate) fn read_pointer_payload<'a, D: PageDevice>(
+    device: &'a D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    pointer: PhysicalPointer,
+    expected_kind: ExtentKind,
+    maximum_bytes: usize,
+    memo: Option<&'a VerifiedSegmentScans>,
+) -> impl core::future::Future<Output = Result<ResolvedPayload, StoreError<D::Error>>> + 'a {
+    read_pointer_payload_with_read_capacity(device, store_uuid, admitted_segments,
+        next_segment_generation, checkpoint_generation, pointer, expected_kind,
+        maximum_bytes, memo, 0)
+}
+
+pub(crate) async fn read_pointer_payload_with_read_capacity<D: PageDevice>(
     device: &D,
     store_uuid: StoreUuid,
     admitted_segments: u64,
@@ -2606,6 +2622,7 @@ pub(crate) async fn read_pointer_payload<D: PageDevice>(
     expected_kind: ExtentKind,
     maximum_bytes: usize,
     memo: Option<&VerifiedSegmentScans>,
+    read_capacity_limit: usize,
 ) -> Result<ResolvedPayload, StoreError<D::Error>> {
     let PhysicalPointer::Value(pointer) = pointer else {
         return Err(StoreError::Corrupt);
@@ -2634,6 +2651,7 @@ pub(crate) async fn read_pointer_payload<D: PageDevice>(
         checkpoint_generation,
         extent,
         &scanned,
+        read_capacity_limit,
     )
     .await
 }
@@ -2775,6 +2793,7 @@ pub(crate) async fn read_pointer_payloads<D: PageDevice>(
                 checkpoint_generation,
                 extent,
                 &scanned,
+                0,
             )
             .await?,
         );
@@ -2804,6 +2823,7 @@ async fn read_pointer_payload_after_scan<D: PageDevice>(
     checkpoint_generation: u64,
     extent: ExtentRecord,
     scanned: &ScannedSegment,
+    read_capacity_limit: usize,
 ) -> Result<ResolvedPayload, StoreError<D::Error>> {
     let base = segment_base_page(pointer.segment_no)?;
     if pointer.payload_relative_page
@@ -2839,8 +2859,8 @@ async fn read_pointer_payload_after_scan<D: PageDevice>(
     if exact_len.div_ceil(PAGE_SIZE) != pointer.payload_pages as usize {
         return Err(StoreError::Corrupt);
     }
-    let mut bytes = vec![0; exact_len];
-    read_payload_into(device, base + u64::from(pointer.payload_relative_page), &mut bytes).await?;
+    let bytes = read_payload_owned(device, base + u64::from(pointer.payload_relative_page),
+        exact_len, read_capacity_limit).await?;
     if payload_sha256(&bytes) != pointer.payload_sha256 {
         return Err(StoreError::Corrupt);
     }
@@ -2851,6 +2871,27 @@ async fn read_pointer_payload_after_scan<D: PageDevice>(
         previous_segment: scanned.previous_segment,
         header_target_checkpoint_generation: scanned.header_target_checkpoint_generation,
     })
+}
+
+// Opt-in only: recovery callers retain exact allocation and tail-scratch behavior.
+// A single small blob may use its explicit envelope budget to include the tail
+// in one device request. No request exceeds the existing 32-page maximum.
+async fn read_payload_owned<D: PageDevice>(
+    device: &D, first: u64, exact_len: usize, capacity_limit: usize,
+) -> Result<Vec<u8>, StoreError<D::Error>> {
+    let rounded = exact_len.checked_next_multiple_of(PAGE_SIZE).ok_or(StoreError::MemoryLimit)?;
+    let coalesce = exact_len > PAGE_SIZE && exact_len % PAGE_SIZE != 0
+        && rounded <= 32 * PAGE_SIZE && rounded <= capacity_limit;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(if coalesce { rounded } else { exact_len })
+        .map_err(|_| StoreError::MemoryLimit)?;
+    if coalesce && bytes.capacity() > capacity_limit {
+        return Err(StoreError::MemoryLimit);
+    }
+    bytes.resize(if coalesce { rounded } else { exact_len }, 0);
+    read_payload_into(device, first, &mut bytes).await?;
+    bytes.truncate(exact_len);
+    Ok(bytes)
 }
 
 async fn read_payload_into<D: PageDevice>(
@@ -5523,6 +5564,36 @@ mod payload_read_tests {
                     other => panic!("unexpected write result: {other:?}"),
                 }
                 assert_eq!(*writer.calls.borrow(), expected[..=failure]);
+            }
+        }
+    }
+
+    #[test]
+    fn owned_payload_coalescing_respects_budget_and_errors() {
+        for len in [0, 1, PAGE_SIZE, PAGE_SIZE + 1, 2 * PAGE_SIZE - 1,
+            31 * PAGE_SIZE + 1, 32 * PAGE_SIZE, 32 * PAGE_SIZE + 1] {
+            let rounded = len.next_multiple_of(PAGE_SIZE);
+            for budget in [0, rounded.saturating_sub(1), rounded] {
+                let device = Device { calls: RefCell::new(Vec::new()), fail_at: Cell::new(None) };
+                let bytes = run(read_payload_owned(&device, 7, len, budget)).unwrap();
+                let expected: Vec<u8> = (0..len).map(|i| ((7 * PAGE_SIZE + i) % 251) as u8).collect();
+                assert_eq!(bytes, expected);
+                let eligible = len > PAGE_SIZE && len % PAGE_SIZE != 0
+                    && rounded <= 32 * PAGE_SIZE && rounded <= budget;
+                let calls = device.calls.borrow().clone();
+                if eligible {
+                    assert_eq!(calls, [(7, len.div_ceil(PAGE_SIZE))]);
+                    assert!(bytes.capacity() <= budget);
+                } else if len == PAGE_SIZE + 1 {
+                    assert_eq!(calls, [(7, 1), (8, 1)]);
+                }
+                for failed in 0..calls.len() {
+                    device.calls.borrow_mut().clear();
+                    device.fail_at.set(Some(failed));
+                    assert!(matches!(run(read_payload_owned(&device, 7, len, budget)),
+                        Err(StoreError::Device(()))));
+                    assert_eq!(*device.calls.borrow(), calls[..=failed]);
+                }
             }
         }
     }

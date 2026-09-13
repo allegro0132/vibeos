@@ -3380,32 +3380,58 @@ async fn storage_file_tree_bench(
             let mut staged_files = Vec::with_capacity(count);
             for index in 0..count {
                 if unique {
+                    #[cfg(feature = "qemu-virt")]
+                    let pattern_started = crate::sbi::time();
                     sequential_pattern::fill(&mut payload, seed, (index * size) as u64);
+                    #[cfg(feature = "qemu-virt")]
+                    { stage_detail_ticks[0] += crate::sbi::time().saturating_sub(pattern_started); }
                 }
                 let name = alloc::format!("bench-{seed:016x}-{index:04}");
                 let path = RelPath::parse(&name)?;
                 let mut stager = root.begin_content_stager(&path, false)?;
+                #[cfg(feature = "qemu-virt")]
+                let push_started = crate::sbi::time();
                 stager.push(&payload).await?;
+                #[cfg(feature = "qemu-virt")]
+                { stage_detail_ticks[1] += crate::sbi::time().saturating_sub(push_started); }
+                #[cfg(feature = "qemu-virt")]
+                let finish_started = crate::sbi::time();
                 let staged = stager.finish().await?;
+                #[cfg(feature = "qemu-virt")]
+                { stage_detail_ticks[2] += crate::sbi::time().saturating_sub(finish_started); }
                 staged_files.push((path, staged));
             }
+            #[cfg(feature = "qemu-virt")]
+            { file_phase_boundaries[0] = crate::virtio_blk::telemetry();
+              file_phase_elapsed[0] = crate::sbi::time().saturating_sub(started); }
             let mut tx = root.begin()?;
             for (path, staged) in staged_files {
                 tx.write_staged(&path, staged)?;
             }
             tx.commit_durable().await?;
+            #[cfg(feature = "qemu-virt")]
+            { file_phase_boundaries[1] = crate::virtio_blk::telemetry();
+              file_phase_elapsed[1] = crate::sbi::time().saturating_sub(started); }
             if unique {
                 for index in 0..count {
                     let name = alloc::format!("bench-{seed:016x}-{index:04}");
                     let reader = root.reader(&RelPath::parse(&name)?)?;
                     let mut read = 0;
                     for chunk in 0..reader.chunk_count() {
+                        #[cfg(feature = "qemu-virt")]
+                        let read_started = crate::sbi::time();
                         let bytes = reader.read_chunk(chunk).await?.ok_or(FileError::Conflict)?;
+                        #[cfg(feature = "qemu-virt")]
+                        { verify_detail_ticks[0] += crate::sbi::time().saturating_sub(read_started); }
+                        #[cfg(feature = "qemu-virt")]
+                        let match_started = crate::sbi::time();
                         if bytes.is_empty() || !sequential_pattern::matches(
                             &bytes, seed, (index * size + read) as u64,
                         ) {
                             return Err(FileError::Conflict);
                         }
+                        #[cfg(feature = "qemu-virt")]
+                        { verify_detail_ticks[1] += crate::sbi::time().saturating_sub(match_started); }
                         read += bytes.len();
                     }
                     if read != size {
@@ -3413,6 +3439,9 @@ async fn storage_file_tree_bench(
                     }
                 }
             }
+            #[cfg(feature = "qemu-virt")]
+            { file_phase_boundaries[2] = crate::virtio_blk::telemetry();
+              file_phase_elapsed[2] = crate::sbi::time().saturating_sub(started); }
             operations = count as u64;
             transferred = (size as u64).saturating_mul(count as u64);
             if unique {
@@ -3526,7 +3555,9 @@ async fn storage_file_tree_bench(
     let elapsed = crate::sbi::time().saturating_sub(started).max(1);
     // Per-sample accounting: the device telemetry is cumulative since boot.
     #[cfg(feature = "qemu-virt")]
-    let io = crate::virtio_blk::telemetry().saturating_sub(io_started);
+    let io_ended = crate::virtio_blk::telemetry();
+    #[cfg(feature = "qemu-virt")]
+    let io = io_ended.saturating_sub(io_started);
     #[cfg(feature = "milkv-duo")]
     let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
     #[cfg(feature = "qemu-virt")]
@@ -3536,7 +3567,7 @@ async fn storage_file_tree_bench(
     #[allow(unused_mut)]
     let mut file_phase_json = String::new();
     #[cfg(feature = "qemu-virt")]
-    if workload == "file-sequential" && result.is_ok() {
+    if matches!(workload, "file-sequential" | "file-batch-create" | "file-batch-create-unique") && result.is_ok() {
         use core::fmt::Write as _;
         let stage_other = file_phase_elapsed[0].saturating_sub(stage_detail_ticks.iter().sum());
         for (name, ticks) in [
@@ -3558,7 +3589,12 @@ async fn storage_file_tree_bench(
         // The final phase includes async-scope cleanup through the same
         // endpoint as total elapsed, so phase times partition the workload.
         let phase_ticks = [file_phase_elapsed[0], file_phase_elapsed[1], file_phase_elapsed[2], elapsed];
-        for ((phase, boundary), ticks) in ["stage", "publish", "verify", "remove"].into_iter().zip(file_phase_boundaries).zip(phase_ticks) {
+        if workload != "file-sequential" {
+            // Batch workloads retain files; this final interval is scope cleanup.
+            file_phase_boundaries[3] = io_ended;
+        }
+        let final_phase = if workload == "file-sequential" { "remove" } else { "cleanup" };
+        for ((phase, boundary), ticks) in ["stage", "publish", "verify", final_phase].into_iter().zip(file_phase_boundaries).zip(phase_ticks) {
             write!(&mut file_phase_json, ",\"file_{}_elapsed_ticks\":{}", phase, ticks.saturating_sub(previous_ticks)).expect("format file phase time");
             previous_ticks = ticks;
             let delta = boundary.saturating_sub(previous);

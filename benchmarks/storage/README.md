@@ -11695,3 +11695,485 @@ through the original exec session.
 The current partial audit verifies 192 positions / 576 outcomes. The strict
 completion invocation correctly exits 2. The original campaign remains running;
 no runtime source or benchmark timings change during this audit.
+
+### Completed exhaustive multi-segment publication campaign (2026-09-13)
+
+The original pinned campaign has now exited successfully. Independent strict
+completion audit verifies all **2,381 page-write/flush positions and 7,143
+outcomes**, including NotSubmitted, AmbiguousNone and AmbiguousDurable. Every
+shard has successful terminal output; exact position coverage and log/executable
+hashes pass. The recovered state is old or complete; complete recovered batches
+are checked against all 331 chunks before retry. Retry content checks remain
+sampled. This supersedes the partial/running status above.
+
+Final source identity matches the pinned campaign after excluding only the later
+GC and fragmented-layout qualification tests. Evidence is in
+`target/storage-metadata-fault-exhaustive-20260913/full/`, including
+`coverage.json`, `manifest.json`, `source-identity-final.json` and `audit.py`.
+This is the allocation-v2 fixture's exhaustive publication campaign, not an
+exhaustive matrix for every legacy/fragmented layout or real-device power loss.
+
+Isolated performance qualification follows in
+`target/storage-metadata-performance-20260913/`: fixed firmware/input hashes,
+fresh temporary images, 128 MiB single-hart QEMU with 64 cache pages, serial ABBA
+runs for 100 unique 4 KiB files and 16 MiB sequential writes. Limited mode uses
+4/2 MiB/s read/write and 400/200 read/write IOPS; unthrottled mode is measured
+separately. The harness refuses to start until strict fault completion passes.
+
+### Multi-segment performance qualification: regression observed (2026-09-13)
+
+Both isolated orders completed: initial ABBA and confirmation BAAB, 32 successful
+samples total. Each variant has two fresh-image observations per workload/mode
+in each campaign. All eight retained candidate images pass independent offline
+validation including unchanged unmanaged prefixes. All before/after physical I/O
+counters match exactly within each workload.
+
+| Workload | Mode | ABBA before → after (s) | BAAB before → after (s) |
+|---|---|---:|---:|
+| 100 unique 4 KiB files | limited | 2.778676 → 2.798466 (+0.71%) | 2.741761 → 2.759013 (+0.63%) |
+| 100 unique 4 KiB files | unthrottled | 0.237498 → 0.289170 (+21.76%) | 0.232997 → 0.298997 (+28.33%) |
+| 16 MiB sequential | limited | 12.939057 → 13.850381 (+7.04%) | 12.957011 → 13.065793 (+0.84%) |
+| 16 MiB sequential | unthrottled | 1.795053 → 2.275288 (+26.75%) | 1.938310 → 2.925602 (+50.94%) |
+
+The unthrottled regression persists across reversed order. Sequential samples
+also show substantial variation, including unchanged pattern generation/checking
+phases, so these totals do not isolate metadata-placement CPU cost. Do not claim
+performance acceptance or real-SD improvement from this capacity change. The
+1,000-file admission improvement and exhaustive crash qualification stand as
+separate correctness/capacity results. Further CPU-path and code-generation
+isolation is required before performance acceptance; neither campaign is discarded.
+
+Evidence: `target/storage-metadata-performance-20260913/` contains both runners,
+fixed input hashes, `analysis.json`, `analysis-confirm.json`, raw samples,
+per-run commands, telemetry, serial logs, retained images and both offline
+qualification summaries. Firmware SHA-256 and the separate source manifests
+identify the compared builds; generic sample git fields are not used as proof
+of the dirty workspace's source identity.
+
+### Isolating metadata regression from benchmark code generation (2026-09-13)
+
+Current runtime sources still match the qualified firmware; the working tree's
+prior storage changes are already present in HEAD. A diagnostic build restored
+only the old 100-file benchmark guard while preserving multi-segment storage.
+The current 1,000-file guard and default cache source were restored byte-for-byte
+in `finally`. This is an artifact-only experiment, not a retained admission change.
+
+Unthrottled ABBA comparing current candidate against old-guard diagnostic:
+100-file means 0.284195 → 0.345800 s (+21.68%); sequential means
+1.797959 → 1.771671 s (-1.46%). All eight runs pass with identical physical I/O.
+Restoring the old guard does not eliminate the observed batch regression.
+Evidence: `target/storage-metadata-guard-isolation-20260913/`.
+
+An initial QEMU `-icount shift=0,align=off,sleep=off` diagnostic fails during
+file-tree root recovery, before workload execution; it is excluded and retained
+in `target/storage-metadata-icount-20260913/`. Enabling clock synchronization
+(`shift=0,align=on,sleep=on`) succeeds for both fixed firmwares and workloads,
+then succeeds again in reversed order. All eight successful diagnostic samples
+have matching before/after I/O counters. These virtual-time measurements are
+not wall-clock performance or SD results. Whole-workload virtual ticks include
+I/O waiting/clock behavior and must not be presented as exact instruction counts.
+
+| Diagnostic | Forward before → after ticks | Reverse before → after ticks |
+|---|---:|---:|
+| 100-file total | 5,973,570 → 6,074,925 | 5,980,808 → 5,976,258 |
+| 16 MiB total | 48,826,535 → 49,165,719 | 48,809,662 → 49,138,436 |
+| Sequential pattern generation | 3,252,893 → 3,252,906 | 3,252,889 → 3,252,935 |
+| Sequential pattern comparison | 2,852,131 → 3,208,647 | 2,852,129 → 3,208,646 |
+| Sequential stage finish | 6,882,282 → 6,887,353 | 6,888,358 → 6,890,281 |
+| Sequential reader | 15,709,103 → 15,673,182 | 15,676,795 → 15,674,490 |
+
+The unchanged pattern-comparison source costs **12.5% more virtual ticks** in
+both orders. Full function-range disassembly shows the old firmware's direct
+length check/memcmp becoming an out-of-line slice-equality call in the candidate,
+adding a call in each eight-byte iteration. Pattern generation is effectively
+unchanged. The extra pattern-comparison ticks exceed the small whole-sequential
+virtual-time increase; these diagnostics therefore do not support attributing
+the large wall-clock regression solely to metadata placement CPU work. They do
+not invalidate the wall-clock observations or prove performance acceptance.
+
+Evidence: `target/storage-metadata-icount-sync-20260913/` and
+`target/storage-metadata-icount-sync-confirm-20260913/`, with raw samples,
+analysis, wrapper flags and assembly. The wrapper appends icount arguments after
+the generic runner captures its argument metadata; use the wrapper and
+qualification manifest for the actual diagnostic configuration. Next isolation
+should hold benchmark helper code generation constant between storage variants
+and separately time batch staging/publication/verification before changing the
+qualified publication protocol.
+
+### Batch phase telemetry and matched-source comparison (2026-09-13)
+
+Retained QEMU benchmark instrumentation now partitions `file-batch-create` and
+`file-batch-create-unique` into stage, publish, verify and cleanup. Batches retain
+files, so the last phase is explicitly cleanup, not removal. Stage separately
+counts pattern generation, push and finish; verification counts reader and
+pattern comparison. Serialization follows capture of the total endpoint; phase
+I/O accounting uses the same final telemetry snapshot. Non-QEMU builds do not
+collect these counters.
+
+The host converter accepts these batch phases and enforces complete nonnegative
+integer counters/times and exact phase sums, including cleanup. Selftests cover
+both batch workloads and reject missing cleanup counters, boolean times and
+inconsistent totals. Existing sequential phase tests still pass.
+
+QEMU qualification passes unique 100/1,000-file batches, duplicate 100-file batch
+and 16 MiB sequential work; all four retained disks pass independent offline
+verification including unchanged unmanaged prefixes. Unique batch and sequential
+I/O counts match the previous qualified results. Duo release check passes.
+Evidence: `target/storage-batch-phase-20260913/`. These single samples validate
+instrumentation; they do not establish speed improvements. The 1,000-file sample
+spends 1.020444 s in publication and 1.766272 s in full readback verification
+(2.910721 s total), illustrating why total workload time is not publication time.
+
+A matched-source ABBA comparison rebuilds both variants with this exact same
+benchmark code and current 1,000-file guard. The baseline CAS file is reconstructed
+from the owned-seal baseline plus its recorded patch and verified against the
+original SHA-256. Source manifests differ only in `segment-store/src/cas.rs`;
+all temporary baseline/cache changes are restored exactly. Identical source for
+helpers does not guarantee identical helper machine code under whole-program
+optimization. All eight comparison samples pass and preserve I/O counters.
+
+Sequential means: total 1.459047 → 1.655258 s; pattern comparison
+0.217672 → 0.354763 s; reader 0.351213 → 0.379533 s; publication
+0.012418 → 0.012985 s; stage finish 0.153656 → 0.149702 s. About
+137 ms of the 196 ms total increase is benchmark pattern checking. Batch totals
+are 0.309237 → 0.356869 s but have large outliers (candidate stage 0.114728 vs
+0.011159 s), so no batch phase regression/improvement is accepted from these two
+observations per variant. Preserve all samples; do not infer publication speed
+from the aggregate. Evidence is in the `comparison/` subdirectory, including
+source qualification, commands, firmware hashes and per-phase analysis.
+
+Next work remains stabilizing helper machine code and investigating the reader
+path. This instrumentation is a measurement improvement, not a storage-speed
+claim, and does not supersede the unresolved wall-clock performance gate.
+
+### Reuse the verified small-object envelope for output (2026-09-13)
+
+`read_small_verified_blob` previously allocated a separate logical-output Vec
+while retaining the verified encoded envelope. After descriptor matching and
+full `verify_all` succeed, it now moves the logical bytes to offset zero in the
+owned envelope and truncates its length. Verification order, authority checks,
+read pin lifetime, I/O and the conservative admission threshold are unchanged.
+The returned Vec retains envelope capacity (including former header/tree space);
+this trades a small retained-capacity overhead for avoiding a second allocation
+and overlapping logical-output buffer. No zero-copy claim: the in-buffer move
+still copies logical bytes.
+
+Ten isolated persistent-object allocation probes (0/256 history records, sizes
+4/64/128/360/512 KiB) pass with unchanged read pages. Eligible sizes avoid one
+allocation; the 512 KiB case remains on the existing larger-object path.
+At zero history, 64 KiB peak extra requested allocation drops 137,200 → 76,056 B;
+128 KiB drops 269,296 → 142,616 B. At 256 records the corresponding reductions
+are 137,016 → 75,872 B and 269,112 → 142,432 B. The 4 KiB and 360 KiB total
+peaks are dominated by other work and do not improve, despite one fewer call.
+
+Validation: 288 unit tests pass (six ignored), including whole-object reread
+verification and publication/recovery fault tests; Duo release check passes.
+QEMU unthrottled ABBA uses identical instrumented benchmark sources and tests
+100 unique 4 KiB files plus 16 MiB sequential work. All eight samples and both
+retained-image offline checks pass; all physical I/O counters are identical.
+Total means are 0.231567 → 0.228376 s and 1.711277 → 1.675529 s respectively.
+These approximately 1–2% differences are not accepted as speed gains from two
+observations per variant. Reader phase means rise 2.28% and 5.08%, with visible
+sample variation; do not hide those results or infer a real-SD latency gain.
+The retained benefit is measured allocation/peak-memory reduction.
+
+Evidence: `target/storage-read-owned-buffer-20260913/` contains exact baseline
+source, allocation logs/comparison, unit and build logs, source/firmware hashes,
+ABBA commands/raw samples, phase analysis and offline checks. Temporary cache
+settings are restored. This does not close the earlier multi-segment wall-clock
+performance gate or substitute for physical SD measurements.
+
+### Trace-confirmed small-read tail splitting (2026-09-13)
+
+QEMU `virtio_blk_handle_read` tracing on the retained owned-read-buffer firmware
+captures a 100 unique 4 KiB file batch. The trace suffix matches the guest's
+entire measured read count and byte total, and separately every phase's read
+count and byte total. Publication makes one 48-sector read; staging and cleanup
+make none. Full readback makes **521 requests**: one 32-sector, 220 16-sector,
+and 300 8-sector requests. Exactly **100 adjacent pairs** are consecutive
+8-sector/4 KiB reads. Trace overhead excludes this run from latency evidence.
+
+`store.rs::read_payload_into` submits full pages directly to the final payload
+allocation, then reads a partial last page through a separate 4 KiB buffer.
+This is a plausible source of the observed adjacent pairs for small encoded
+objects. Their positions/counts are measured; direct source attribution is an
+inference, not an instrumented call-stack proof. Coalescing all 100 such pairs
+would save at most 100/521 = 19.19% of this readback's requests, with unchanged
+bytes. This is an opportunity estimate, not an implemented/measured reduction.
+
+The same helper also reads authority recovery chains with explicit capacity
+budgets. A global scratch-buffer enlargement or retained rounded allocation
+could change multi-extent residency and admission. Next implementation should
+scope coalescing to a budgeted small-object path and measure both peak and
+retained allocation. Preserve exact payload hashing and partial-transfer error
+propagation; do not change recovery capacity assumptions implicitly.
+
+Evidence: `target/storage-read-trace-20260913/` contains command, socket wrapper
+with appended trace option, full trace, serial/guest sample, per-phase analysis,
+workload read ranges and hashed qualification. The run passes guest content
+verification. Runtime source was unchanged during this diagnostic.
+
+### Budgeted small-blob tail coalescing candidate (2026-09-13)
+
+Single-extent small-blob reads may now opt into a rounded envelope allocation,
+using the existing small-read capacity limit. Coalescing applies only to a
+partial-tail payload larger than one page whose rounded length is at most
+32 pages / 128 KiB and fits that explicit limit. Payload hashing uses the exact
+logical length after truncation. Descriptor/authority checks and full Blob
+verification remain unchanged. Default pointer reads and authority-chain
+recovery do not opt in; multiple extents use the existing path. No larger device
+requests or global recovery-budget expansion are introduced. The returned
+single envelope can retain up to 4,095 extra padding bytes within its budget.
+
+The single-Blob path also avoids allocating the empty authority-chain validation
+list used by the generic multi-pointer wrapper. Ten isolated allocation probes
+pass with unchanged read pages and no increased measured peak versus the owned
+buffer baseline. 64 KiB zero-history peak changes 76,056 → 74,936 B; 4 KiB stays
+37,888 B. The helper test covers empty/aligned/partial/32-page boundaries, exact
+and insufficient budgets, returned capacity, bytes and every request failure.
+Full unit suite: 289 passed, six ignored. Duo release check passes.
+
+Two isolated QEMU orders (ABBA then BAAB) each run 100 unique 4 KiB files in
+limited/unthrottled mode plus 16 MiB sequential work unthrottled. All 24 samples
+pass, as do all six retained-image offline checks. Batch read requests decrease
+**522 → 422** (verification 521 → 421), total requests/interrupts **560 → 460**.
+Read/write bytes, write requests and flush counts remain identical. Sequential
+I/O remains unchanged. The limited profile is 4/2 MiB/s read/write, 400/200 IOPS.
+
+| Workload / mode | ABBA total before → after | BAAB total before → after |
+|---|---:|---:|
+| 100 files, limited | 2.749748 → 2.501698 s (-9.02%) | 2.737406 → 2.494977 s (-8.86%) |
+| 100 files, unthrottled | 0.216086 → 0.225471 s (+4.34%) | 0.239928 → 0.262656 s (+9.47%) |
+| 16 MiB, unthrottled | 1.621031 → 1.914068 s (+18.08%) | 1.803591 → 2.137820 s (+18.53%) |
+
+Limited batch reader time decreases 22.06% and 21.69%. Unthrottled batch reader
+changes -2.99%/-0.30%, and sequential reader +6.41%/+0.51%. The unthrottled
+aggregate regression repeats and remains unresolved; this candidate is retained
+for its repeatable request-count and slow-backend benefit, not declared a
+universal performance win. Further CPU/code-generation isolation is required,
+including the shared async wrapper introduced for opt-in reading. These QEMU
+limits are a model, not a measurement of an SD card or a claim about every card.
+
+A separate 1,000-file batch still passes full guest pattern verification and
+independent retained-image verification. Evidence:
+`target/storage-read-coalesced-20260913/`, including source snapshots, build and
+unit logs, memory comparison, both ABBA/BAAB campaigns, raw phase samples,
+firmware hashes, offline checks and `large/`. Temporary cache source is restored.
+
+### Forward the default read Future directly (2026-09-13)
+
+`read_pointer_payload` now returns the budgeted reader's Future directly instead
+of constructing an async state machine whose only operation awaits that Future.
+Explicit shared lifetimes cover device and scan memo. Validation, read budget,
+coalescing, return/error behavior and the underlying async reader are unchanged.
+The QEMU `.text` section decreases 2,072,576 → 2,068,480 bytes. Eight payload
+boundary/fault tests, Duo release check and all ten allocation probes pass;
+allocation observations are identical to the coalescing candidate. Source/cache
+restoration hashes match the current workspace.
+
+Isolated ABBA against the wrapped coalescing candidate: 100-file unthrottled
+means 0.258980 → 0.236088 s (-8.84%); 16 MiB unthrottled
+2.077693 → 1.753144 s (-15.62%); limited 100-file
+2.492557 → 2.489756 s (-0.11%). All physical counters are identical, including
+422 batch reads. All 12 samples and three retained-image offline checks pass.
+This supports retaining the simpler forwarding implementation, but does not
+prove that the earlier regression against pre-coalescing firmware is eliminated.
+
+A separate reversed-order comparison directly against the owned-buffer,
+pre-coalescing firmware also passes 12 samples and three offline checks. Its
+unthrottled observations are much slower and more variable for both binaries:
+batch means 0.647205 → 1.076451 s (+66.32%); sequential
+3.167492 → 4.064298 s (+28.31%). Limited batch remains
+2.757532 → 2.606488 s (-5.48%) with 522 → 422 reads. These unfavorable
+results are retained. Host load averages are elevated in both campaigns and
+1-second process telemetry cannot attribute the subsecond-workload difference
+to scheduling, code generation or runtime overhead. Do not label the unfavorable
+campaign invalid solely from that observation, or compare means across campaigns
+as though they were contemporaneous controls. Performance acceptance against the
+pre-coalescing baseline remains open.
+
+Evidence: `target/storage-read-future-forward-20260913/` and `versus-owned/`,
+including exact prior source, source/firmware hashes, text-section hashes,
+allocation comparison, raw phases, telemetry and offline checks. No real SD
+measurement or universal speedup is claimed.
+
+### Synchronized-clock diagnostic of final coalescing path (2026-09-13)
+
+The directly forwarded coalescing firmware is compared with the pre-coalescing
+owned-buffer firmware using `-icount shift=0,align=on,sleep=on`, in BAAB order
+for 100 unique 4 KiB files and 16 MiB sequential work. Current source hashes
+match the final firmware's source manifest. All eight diagnostic samples pass.
+Batch reads remain 522 → 422; sequential I/O and all read/write bytes, writes
+and flushes are unchanged.
+
+Mean virtual ticks: batch total 6,041,583 → 6,077,357 (+0.59%), publication
+3,062,711 → 3,068,821.5 (+0.20%), reader 2,788,602.5 → 2,818,262 (+1.06%).
+Sequential total 49,294,617 → 49,680,239.5 (+0.78%), stage finish
+6,893,614.5 → 6,924,565 (+0.45%), reader
+15,764,637.5 → 16,070,691 (+1.94%). One candidate reader observation is visibly
+higher than its replicate. Pattern generation and checking are essentially
+identical in both firmware variants (sequential checking about 3,208,646 ticks).
+The prior helper-inlining discrepancy is therefore not observed in this pair's
+pure-computation phases.
+
+This diagnostic does not reproduce the large wall-clock difference. It neither
+invalidates the unfavorable wall-clock samples nor establishes universal
+performance acceptance: whole-workload virtual time includes I/O and QEMU clock
+behavior and is not an exact instruction count. Keep the repeatable request
+reduction/limited-backend evidence separate from unresolved wall-clock behavior.
+No runtime changes were made during this diagnostic. Evidence:
+`target/storage-read-final-icount-20260913/`, including source identity,
+explicit wrapper flags, commands, raw phase samples, analysis and qualification.
+
+### Remaining read traffic after tail coalescing (2026-09-13)
+
+A fresh `virtio_blk_handle_read` trace on the directly forwarded final candidate
+passes guest verification. Its measured trace suffix exactly matches all phase
+read counts and byte totals. Publication reads six pages once. Verification
+reads 744 unique pages in 421 requests: one four-page request, 320 two-page
+requests and 100 one-page requests. There are **no repeated pages, repeated
+exact requests, or consecutively issued physically adjacent requests** within
+verification. Merely enlarging a cache is therefore not supported by this trace
+as a way to reduce these device reads. The earlier 100 adjacent tail pairs have
+disappeared.
+
+The early trace follows descriptor pairs with payload gaps, consistent with
+`scan_segment_with_matches` reading each descriptor pair and jumping over the
+payload after authenticating its record span. Offline greedy grouping within
+each phase (ascending addresses only, gaps at most two pages) gives this ideal
+request/byte tradeoff:
+
+| Maximum group pages | Requests | Read bytes | Extra bytes |
+|---|---:|---:|---:|
+| 4 | 422 | 3,072,000 | 0 |
+| 6 | 312 | 3,735,552 | 663,552 |
+| 8 | 293 | 3,813,376 | 741,376 |
+| 16 | 251 | 4,091,904 | 1,019,904 |
+| 32 | 226 | 4,247,552 | 1,175,552 |
+
+These are **oracle groupings of an already observed trace**, not implemented
+prefetch or measured latency. Actual reads cannot know future descriptor spans
+before decoding them; a real bounded window may fetch additional unused bytes.
+At 400 read IOPS and 4 MiB/s, the separate read-demand lower bounds shift from
+1.055 s IOPS / 0.732 s bytes to 0.780 / 0.891 s for six-page groups. They are not
+additive workload predictions. Larger windows progressively spend bandwidth to
+save requests and do not monotonically improve the combined lower bound. Six
+pages is a bounded hypothesis to test, not a selected production setting.
+
+Any implementation must explicitly account for descriptor-window memory: the
+current scan drops its four-page trailer before building the descriptor table,
+and enlarging the remaining four-page header window can increase peak residency.
+Preserve recovery admission and descriptor/payload authentication. Evidence:
+`target/storage-read-final-trace-20260913/` contains trace, exact command/wrapper,
+phase analysis, workload ranges, oracle-grouping results and hashes. Trace timing
+is excluded; no runtime change or additional speed gain is claimed this turn.
+
+### Six-page descriptor prefetch experiment: rejected (2026-09-13)
+
+A bounded experimental scan window was enabled only when a small-object caller
+provided at least 8 KiB of unused envelope budget. It used the previous validated
+short record span as a heuristic, clipped reads to authenticated `next_free_page`,
+and continued authenticating each descriptor independently. The four-page trailer
+was released before resizing the header window to six pages and before allocating
+the descriptor table, bounding additional peak workspace to two pages. Explicit
+bounded authority scans and scrub did not opt in.
+
+The first experiment enabled the window only while resolving content pointers.
+It passed 289 unit tests, Duo compilation, memory probes and 12 QEMU samples,
+but I/O was unchanged: manifest resolution had already populated the immutable
+scan memo. The second experiment supplied the same budget after authorization
+at the manifest read entry point. This version again passed 289 tests, Duo
+compilation and ten allocation probes; their measured whole-read peaks were
+unchanged, while some zero-history cases added one resize allocation. All 12
+QEMU comparison samples and three retained-image offline checks passed in each
+experiment. These are experiment-specific results, not evidence of net speedup.
+
+The active-entry version changes 100-file reads **422 → 313**, but bytes
+**3,072,000 → 3,969,024** (+29.2%, 876 KiB extra), greater than oracle grouping
+because real prefetch speculates about future spans. Writes and flushes remain
+unchanged. Limited ABBA means are **2.479199 → 2.481258 s (+0.08%)**;
+reader phase is +0.75%. Unthrottled batch is essentially flat (-0.14% total),
+while sequential total is -7.89% in two observations per variant and sequential
+reads change 271 → 270 with 12 KiB extra. Those noisy ancillary results do not
+justify the extra bytes and workspace when the target limited batch has no net
+benefit. A blind/single-sector card could also pay for the additional bytes;
+request-count savings alone are insufficient.
+
+**Both prefetch changes are reverted byte-for-byte.** Current runtime source
+matches the previously qualified direct-Future/tail-coalescing candidate; its
+422-read batch behavior remains retained. Rejected source and all evidence are
+preserved under `target/storage-descriptor-window-20260913/`, with the active
+entry experiment in `manifest-route/`, plus `restoration.json`. No weakened
+verification, expanded descriptor workspace or manifest prefetch remains in
+production source. Future experiments would need a better request/byte tradeoff;
+this turn makes no new retained latency improvement claim.
+
+### Refreshed object-store baseline after read-path changes (2026-09-13)
+
+The retained direct-Future/tail-coalescing firmware was rerun for 4/128/360 KiB
+`object-durable-put-get` and 1 MiB `object-v2-large`, with fresh images per
+size/mode, one warmup and two measured unique seeds (33/34). Both unthrottled
+and 4/2 MiB/s, 400/200 IOPS configurations pass: 24 guest operations, 16 measured
+samples, eight retained disks independently verified including unchanged
+unmanaged prefixes. The source manifest matches the current runtime. These
+are refreshed baselines, not an A/B speedup claim against the original user table.
+
+| Logical bytes | Measured put bytes written | Write requests | Flushes | Write amplification | Unthrottled mean put / get |
+|---|---:|---:|---:|---:|---:|
+| 4 KiB | 106,496 | 6 | 3 | 26.00× | 14.769 / 0.181 ms |
+| 128 KiB | 237,568 | 7 | 3 | 1.81× | 27.414 / 9.626 ms |
+| 360 KiB | 536,576 | 13 | 3 | 1.46× | 34.336 / 19.504 ms |
+| 1 MiB | 1,257,472 | 20 | 3 | 1.20× | 76.968 / 45.179 ms |
+
+The measured history has three then five authority records; the warmup's
+first-publication costs are excluded. Write counters repeat exactly between
+seeds and modes. Small put fixed overhead remains substantial: 4 KiB logically
+writes 26 pages. Current `commit_snapshot` places data and metadata in separate
+segments, while the batch path already supports packing. Investigating the
+26-page composition and single-publication packing is therefore more relevant
+than removing checkpoint durability barriers. No new packing change is made here.
+
+Configured limited-mode put means are 9.233, 25.707, 186.025 and 544.359 ms in
+size order. The first two operations are shorter than their byte-count/nominal
+rate quotient, so these isolated small samples do **not** establish sustained
+rate-limited device latency. QEMU throttling/available burst allowance and
+between-command idle time must be considered before interpreting them; the
+longer batch tests remain separate evidence. Reads follow puts on the same VM
+with cache state labelled unknown. No Linux rerun or same-semantics ratio is
+claimed from these numbers.
+
+Evidence: `target/storage-object-refresh-20260913/` contains commands and pinned
+firmware hashes, current source identity, all warmup/measured records, serial
+and host telemetry, per-put/get phase counters, validated analysis and all eight
+offline checks. No runtime source was changed during this baseline refresh.
+
+### Reconfirmed small-put framing and bundle feasibility (2026-09-13)
+
+A new three-operation traced run matches the current 26-page stable put and
+independently verifies its stopped disk. Final-image decoding identifies the
+72 KiB prefix and 16 KiB trailer in the **same segment**. This corrects the
+recent refresh's suggestion that this object workload might benefit from merging
+separate data/metadata segments: that suggestion followed `commit_snapshot`,
+whereas this workload already uses packed publication. It also reconfirms the
+older `storage-unique-current-profile` framing analysis above.
+
+The write trace contains addresses/counts, not transient write buffers. The
+checkpoint seal location is written twice, and only its final contents remain
+in the disk; interpreting the first as seal clearing comes from the checkpoint
+protocol, not from its final bytes. All six request lengths reconcile to
+106,496 bytes. The future-seal zero page is necessary to amortize the next
+writer's safe invalidation, not disposable overhead.
+
+The next concrete artifact is a host-only metadata-bundle prototype using the
+four actual payloads (256/896/3,776/137 bytes). It round-trips a 5,385-byte
+experimental bundle and rejects twelve selected malformed inputs. A hypothetical
+single-envelope representation reduces metadata framing from 12 to 4 pages,
+and total put pages from 26 to 18. This is **not implemented storage performance**.
+Existing PhysicalPointer cannot represent it directly: a catalog pointing at its
+own container creates a hash self-reference if member references commit to the
+whole-container hash. Typed member references, incompatible-format rejection,
+recovery, GC and memory limits must be designed before integration.
+
+Design constraints are recorded in `docs/STORAGE_METADATA_BUNDLE_EXPERIMENT.md`.
+Evidence and exploratory code: `target/storage-small-put-trace-20260913/`.
+No runtime, on-disk format or durability behavior changed in this experiment.

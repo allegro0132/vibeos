@@ -3,5 +3,9 @@ name = "vibeos-segment-format"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Codec research only; callers must implement incompatible superblock admission.
+experimental-root-bundle = []
+
 [dependencies]
 sha2 = { version = "0.11.0", default-features = false }

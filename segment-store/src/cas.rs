@@ -1794,13 +1794,12 @@ impl<D: PageDevice> SegmentStore<D> {
         let read_pin = self.pin_blob_reader(object)?;
         let (descriptor, manifest) = self.resolve_authorized_manifest_unverified(object).await?;
         let state = self.mounted.as_ref().ok_or(StoreError::NotMounted)?;
-        // Batching overlaps resolved payloads with contiguous encoding, then
-        // encoding with independently owned output. Keep the conservative
-        // allowance for read/verification scratch and extent metadata even
-        // though consumed payloads no longer overlap the logical output.
+        // Batching overlaps resolved payloads with contiguous encoding. Keep
+        // the conservative allowance for read/verification scratch and extent
+        // metadata; the verified envelope becomes the returned output.
         let batched_limit = MAX_BATCHED_BLOB_READ_LIMIT.min(self.limits.recovery_memory_bytes / 4);
         let bytes = if manifest.encoded_blob_len <= batched_limit as u64 {
-            read_small_verified_blob(&self.device, state, descriptor, &manifest, Some(&self.verified_scans)).await?
+            read_small_verified_blob(&self.device, state, descriptor, &manifest, Some(&self.verified_scans), batched_limit).await?
         } else {
             validate_resolved_manifest(&self.device, state, descriptor, &manifest, Some(&self.verified_scans), &mut ManifestRangeReader::new(false)).await?;
             read_and_verify_resolved_blob(&self.device, state, descriptor, &manifest).await?
@@ -2051,6 +2050,7 @@ async fn read_small_verified_blob<D: PageDevice>(
     descriptor: BlobDescriptor,
     manifest: &BlobManifest,
     memo: Option<&VerifiedSegmentScans>,
+    read_capacity_limit: usize,
 ) -> Result<Vec<u8>, CasStoreError<D::Error>> {
     let mut requests = Vec::new();
     requests
@@ -2063,7 +2063,14 @@ async fn read_small_verified_blob<D: PageDevice>(
             CANONICAL_CONTENT_EXTENT_LEN as usize,
         )
     }));
-    let resolved = read_pointer_payloads(
+    let resolved = if requests.len() == 1 {
+        let (pointer, kind, maximum) = requests[0];
+        alloc::vec![crate::store::read_pointer_payload_with_read_capacity(device,
+            state.superblock.binding.store_uuid, state.admitted_segments,
+            state.next_segment_generation, state.generation, pointer, kind,
+            maximum, memo, read_capacity_limit).await?]
+    } else {
+        read_pointer_payloads(
         device,
         state.superblock.binding.store_uuid,
         state.admitted_segments,
@@ -2072,7 +2079,8 @@ async fn read_small_verified_blob<D: PageDevice>(
         &requests,
         memo,
     )
-    .await?;
+    .await?
+    };
     if resolved.len() != manifest.extents.len() {
         return Err(StoreError::Corrupt.into());
     }
@@ -2102,8 +2110,8 @@ async fn read_small_verified_blob<D: PageDevice>(
     }
     // Move a single envelope without copying. For multiple extents, consume
     // each resolved payload after appending it so those buffers do not overlap
-    // the eventual independently-owned logical output.
-    let encoded = if resolved.len() == 1 {
+    // verification of the final envelope.
+    let mut encoded = if resolved.len() == 1 {
         resolved.into_iter().next().expect("one resolved extent").bytes
     } else {
         let mut bytes = Vec::new();
@@ -2116,7 +2124,12 @@ async fn read_small_verified_blob<D: PageDevice>(
         return Err(StoreError::Corrupt.into());
     }
     blob.verify_all()?;
-    Ok(blob.data().to_vec())
+    let data_len = blob.data().len();
+    // Verification is complete. Reuse the owned envelope for the logical
+    // output instead of allocating a second buffer while both are live.
+    encoded.copy_within(HEADER_SIZE..HEADER_SIZE + data_len, 0);
+    encoded.truncate(data_len);
+    Ok(encoded)
 }
 
 async fn read_resolved_chunk<D: PageDevice>(

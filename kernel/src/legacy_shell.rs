@@ -180,6 +180,14 @@ async fn run(line: &str, boot_time: u64, vsh: &mut crate::vsh::Session) {
                 exec::cancelled_count()
             );
             println!("  component allocation quotas are enforced; `mem` shows live and peak use");
+            #[cfg(feature = "executor-profile")]
+            {
+                let (now, ticks, calls) = exec::execution_profile();
+                println!("EXEC_PROFILE now={} hz={} ticks={:?} calls={:?}", now, exec::timebase_hz(), ticks, calls);
+                for task in exec::task_report() {
+                    println!("TASK_PROFILE name={} polls={} ticks={}", task.name, task.polls, task.poll_ticks);
+                }
+            }
             if tty::is_quiet() {
                 println!("  background output is muted; poll counts still rising");
             }

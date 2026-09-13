@@ -1861,7 +1861,7 @@ pub fn start_ipv4_stack_supervisor() {
     let Some(component) = world.component_named(crate::netstack_platform::COMPONENT_NAME) else {
         return;
     };
-    exec::spawn("supervisor:ipv4-stack", async move {
+    let supervise = async move {
         let mut attempts = 0u32;
         loop {
             let (generation, join) = component.join_current();
@@ -1886,7 +1886,13 @@ pub fn start_ipv4_stack_supervisor() {
                 exec::TaskState::Faulted | exec::TaskState::Running => return,
             }
         }
-    });
+    };
+    #[cfg(feature = "network-pipeline")]
+    if crate::online_hart_mask() & 2 != 0 {
+        exec::spawn_pinned_on(exec::HartId::new(1).unwrap(), "supervisor:ipv4-stack", supervise);
+        return;
+    }
+    exec::spawn("supervisor:ipv4-stack", supervise);
 }
 
 /// Restart only faulted SSH acceptance-server incarnations. A fresh template
@@ -3413,15 +3419,7 @@ pub fn build() {
         feature = "iperf3-server",
         feature = "dhcp-iperf3-server"
     ))]
-    #[cfg(any(
-        feature = "tcp-echo",
-        feature = "net-shell",
-        feature = "ssh-test",
-        feature = "milkv-ssh-acceptance",
-        feature = "provisioned-ssh",
-        feature = "iperf3-server",
-        feature = "dhcp-iperf3-server"
-    ))]
+    #[cfg(not(feature = "network-pipeline"))]
     if let (Some(space), Some(interfaces)) = (ipv4_stack_space, ipv4_stack_grants) {
         world.spawn_component_inner(
             crate::netstack_platform::COMPONENT_NAME,
@@ -3454,7 +3452,48 @@ pub fn build() {
         );
     }
 
-    *WORLD.lock() = Some(world);
+    *WORLD.lock() = Some(world.clone());
+    #[cfg(any(
+        feature = "tcp-echo",
+        feature = "net-shell",
+        feature = "ssh-test",
+        feature = "milkv-ssh-acceptance",
+        feature = "provisioned-ssh",
+        feature = "iperf3-server",
+        feature = "dhcp-iperf3-server"
+    ))]
+    #[cfg(feature = "network-pipeline")]
+    if let (Some(space), Some(interfaces)) = (ipv4_stack_space, ipv4_stack_grants) {
+        let start = move || {
+            world.spawn_component_inner(
+                crate::netstack_platform::COMPONENT_NAME,
+                space.clone(),
+                NETWORK_STACK_MEMORY_BUDGET,
+                Some(ComponentTemplate::Ipv4Stack),
+                crate::netstack_platform::task_with_discovered(SpaceRef::new(&space).get(), interfaces),
+            );
+        };
+        #[cfg(feature = "network-pipeline")]
+        if crate::online_hart_mask() & 2 != 0 {
+            // Construct a fresh arena on its eventual home hart. No existing
+            // reclaimable task or arena is migrated. Publish the component
+            // before allowing boot to install its supervisor.
+            static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+            READY.store(false, Ordering::Release);
+            exec::spawn_pinned_on(exec::HartId::new(1).unwrap(), "net-stack-init", async move {
+                start();
+                READY.store(true, Ordering::Release);
+            });
+            let began = crate::sbi::time();
+            while !READY.load(Ordering::Acquire) {
+                assert!(crate::sbi::time().wrapping_sub(began) < exec::timebase_hz() * 5,
+                    "network pipeline initial publication timed out");
+                core::hint::spin_loop();
+            }
+        } else {
+            start();
+        }
+    }
 }
 
 /// Samples a (fake) thermometer and publishes it. Holds SEND and nothing else —

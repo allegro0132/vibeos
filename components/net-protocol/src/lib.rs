@@ -882,46 +882,56 @@ impl SharedIpv4TcpStack {
 
         let mut report = TcpFrontendDriveReport::default();
         frontend.network_update_state(self.tcp_stream_status(listener)?.state)?;
-        let mut scratch = [0u8; MAX_TCP_STREAM_BYTES_PER_CALL];
-
+        // Borrow transport storage only for the synchronous copy. No socket
+        // buffer escapes into the frontend, and each turn retains its byte and
+        // chunk limits even when either ring wraps. This avoids clearing and
+        // copying through a 32 KiB scratch buffer on every frontend poll.
         for _ in 0..MAX_FRONTEND_CHUNKS_PER_DRIVE {
-            let capacity = frontend.network_receive_capacity().min(scratch.len());
+            let capacity = frontend
+                .network_receive_capacity()
+                .min(MAX_TCP_STREAM_BYTES_PER_CALL);
             if capacity == 0 {
                 break;
             }
-            match self.tcp_try_recv(listener, &mut scratch[..capacity])? {
-                TcpIoResult::Progress(0) | TcpIoResult::WouldBlock | TcpIoResult::Closed => break,
-                TcpIoResult::Progress(length) => {
-                    if frontend.network_receive(&scratch[..length]) != length {
-                        return Err(TcpFrontendDriveError::QueueInvariant);
-                    }
-                    report.received_bytes += length;
-                }
+            self.device.revalidate_authority()?;
+            let entry = self.listener(listener)?;
+            if entry.reset_requested {
+                break;
+            }
+            let socket = entry.socket;
+            match self.sockets.get_mut::<tcp::Socket>(socket).recv(|input| {
+                let length = frontend.network_receive(&input[..input.len().min(capacity)]);
+                (length, length)
+            }) {
+                Ok(0) | Err(tcp::RecvError::Finished | tcp::RecvError::InvalidState) => break,
+                Ok(length) => report.received_bytes += length,
             }
         }
 
         for _ in 0..MAX_FRONTEND_CHUNKS_PER_DRIVE {
-            let writable = self
-                .tcp_stream_status(listener)?
-                .writable_bytes
-                .min(scratch.len());
-            if writable == 0 {
+            if self.tcp_stream_status(listener)?.writable_bytes == 0 {
                 break;
             }
-            let queued = frontend.network_copy_transmit(&mut scratch[..writable]);
-            if queued == 0 {
+            self.device.revalidate_authority()?;
+            let entry = self.listener(listener)?;
+            if entry.reset_requested {
                 break;
             }
-            match self.tcp_try_send(listener, &scratch[..queued])? {
-                TcpIoResult::Progress(sent) => {
+            let socket = entry.socket;
+            match self.sockets.get_mut::<tcp::Socket>(socket).send(|output| {
+                let capacity = output.len().min(MAX_TCP_STREAM_BYTES_PER_CALL);
+                let length = frontend.network_copy_transmit(&mut output[..capacity]);
+                (length, length)
+            }) {
+                Ok(0) => break,
+                Ok(sent) => {
+                    // Commit only bytes actually enqueued by the transport.
                     frontend.network_consume_transmit(sent);
                     report.transmitted_bytes += sent;
-                    if sent != queued {
-                        break;
-                    }
                 }
-                TcpIoResult::WouldBlock => break,
-                TcpIoResult::Closed => return Err(TcpFrontendDriveError::QueueInvariant),
+                Err(tcp::SendError::InvalidState) => {
+                    return Err(TcpFrontendDriveError::QueueInvariant);
+                }
             }
         }
 

@@ -1185,3 +1185,65 @@ fn idle_control_connection_survives_long_transfer_but_dead_peer_expires() {
     }
     assert_ne!(server.stream_status().state, TcpStreamState::Established);
 }
+
+#[test]
+fn frontend_direct_transfer_preserves_bytes_across_wrap_and_backpressure() {
+    let to_server = Endpoint::new("direct-to-server", 128);
+    let to_client = Endpoint::new("direct-to-client", 128);
+    let mut space = CSpace::new("direct-transfer");
+    let (server_in_root, server_in) = authority(&mut space, &to_server, Rights::RECV);
+    let (_, server_out) = authority(&mut space, &to_client, Rights::SEND);
+    let (_, client_in) = authority(&mut space, &to_client, Rights::RECV);
+    let (_, client_out) = authority(&mut space, &to_server, Rights::SEND);
+    let config = Ipv4StackConfig::new(SERVER_MAC, SERVER_IP, 24, 0x5eed);
+    let mut server = SharedIpv4TcpStack::new(config, session_stamp(), server_in, server_out).unwrap();
+    let socket = server.add_tcp_listener(SERVER_PORT).unwrap();
+    // Odd, small capacities force wrapped frontend storage and partial writes.
+    let frontend = TcpListener::new("direct", TcpListenerId::new(1).unwrap(), SERVER_PORT, 127, 191).unwrap();
+    let mut client = TestClient::new(client_in, client_out);
+    // Exceeds both the default and large TCP windows to wrap transport storage.
+    let request: Vec<u8> = (0..600_007).map(|i| (i * 37 + i / 251) as u8).collect();
+    let response: Vec<u8> = request.iter().map(|b| b ^ 0xa5).collect();
+    let (mut request_sent, mut response_sent) = (0, 0);
+    let (mut received_request, mut received_response) = (Vec::new(), Vec::new());
+    let mut connection = None;
+    let mut scratch = [0u8; 997];
+    for now in 0..100_000 {
+        client.poll(now);
+        server.poll_network(now).unwrap();
+        let report = server.drive_tcp_frontend(socket, &frontend).unwrap();
+        assert!(report.received_bytes <= 4 * 32768);
+        assert!(report.transmitted_bytes <= 4 * 32768);
+        connection = connection.or_else(|| frontend.try_accept());
+        if client.socket().can_send() && request_sent < request.len() {
+            request_sent += client.socket().send_slice(&request[request_sent..]).unwrap();
+        }
+        if let Some(peer) = connection {
+            // Leave receive queues full on alternate turns to exercise backpressure.
+            if now % 2 == 0 {
+                if let TcpIoResult::Progress(n) = frontend.try_recv(peer, &mut scratch[..61]).unwrap() {
+                    received_request.extend_from_slice(&scratch[..n]);
+                }
+            }
+            if response_sent < response.len() {
+                if let TcpIoResult::Progress(n) = frontend.try_send(peer, &response[response_sent..]).unwrap() {
+                    response_sent += n;
+                }
+            }
+        }
+        if now % 5 == 0 && client.socket().can_recv() {
+            let n = client.socket().recv_slice(&mut scratch).unwrap();
+            received_response.extend_from_slice(&scratch[..n]);
+        }
+        if received_request.len() == request.len() && received_response.len() == response.len() {
+            break;
+        }
+    }
+    assert_eq!(received_request, request);
+    assert_eq!(received_response, response);
+    space.revoke(server_in_root).unwrap();
+    assert_eq!(
+        server.drive_tcp_frontend(socket, &frontend),
+        Err(vibeos_net_protocol::TcpFrontendDriveError::Stack(StackError::AuthorityRevoked))
+    );
+}

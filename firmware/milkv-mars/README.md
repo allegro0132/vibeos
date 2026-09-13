@@ -30,6 +30,8 @@ boundary. The kernel has no exported raw-card diagnostic entry.
 The default payload has no NIC. Add `--ethernet` to either build script for
 the EQoS test composition (DHCP and TCP 5201 iperf3); its SD artifacts are kept
 separately in `target/mars-boot-ethernet/out`. Neither profile enables SSH.
+See [network performance experiments](NETWORK-PERFORMANCE.md) for TCP tuning,
+the repeatable benchmark command, and measured qualification limits.
 The TRNG protocol and ordered MMIO lane are available as a separate driver,
 and its native HAL table is composed by the diagnostic profile. Qualified
 entropy-service activation and physical qualification remain pending. Compiling or passing the ELF checker does not satisfy Mars physical

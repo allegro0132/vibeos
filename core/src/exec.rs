@@ -702,6 +702,8 @@ enum CancelRequest {
 struct TaskStatus {
     published: Arc<AtomicBool>,
     polls: AtomicU64,
+    #[cfg(feature = "executor-profile")]
+    poll_ticks: AtomicU64,
     state: AtomicU8,
     next_joiner: AtomicU64,
     joiners: SpinLock<Vec<JoinWaiter>>,
@@ -724,6 +726,8 @@ impl TaskStatus {
         Self {
             published,
             polls: AtomicU64::new(0),
+            #[cfg(feature = "executor-profile")]
+            poll_ticks: AtomicU64::new(0),
             state: AtomicU8::new(TaskState::Running as u8),
             next_joiner: AtomicU64::new(1),
             joiners: SpinLock::new(joiners),
@@ -1671,6 +1675,8 @@ pub struct TaskReport {
     pub name: String,
     pub state: TaskState,
     pub polls: u64,
+    #[cfg(feature = "executor-profile")]
+    pub poll_ticks: u64,
 }
 
 struct Task {
@@ -6154,6 +6160,8 @@ pub fn task_report() -> Vec<TaskReport> {
                     name,
                     state: task.status.state(),
                     polls: task.status.polls.load(Ordering::Acquire),
+                    #[cfg(feature = "executor-profile")]
+                    poll_ticks: task.status.poll_ticks.load(Ordering::Relaxed),
                 });
             }
             if !allocation_failed {
@@ -6171,6 +6179,8 @@ pub fn task_report() -> Vec<TaskReport> {
                         name,
                         state: running.status.state(),
                         polls: running.status.polls.load(Ordering::Acquire),
+                    #[cfg(feature = "executor-profile")]
+                    poll_ticks: running.status.poll_ticks.load(Ordering::Relaxed),
                     });
                 }
             }
@@ -6354,7 +6364,29 @@ pub fn poll_once() -> bool {
     poll_once_on(hart)
 }
 
+#[cfg(feature = "executor-profile")]
+static PROFILE_TICKS: [AtomicU64; MAX_HARTS] = [const { AtomicU64::new(0) }; MAX_HARTS];
+#[cfg(feature = "executor-profile")]
+static PROFILE_CALLS: [AtomicU64; MAX_HARTS] = [const { AtomicU64::new(0) }; MAX_HARTS];
+/// Cumulative elapsed time inside executor turns (including task polls and
+/// interrupts), not CPU cycles or WFI residency. Snapshots are approximate.
+#[cfg(feature = "executor-profile")]
+pub fn execution_profile() -> (u64, [u64; MAX_HARTS], [u64; MAX_HARTS]) {
+    (arch::time(), core::array::from_fn(|i| PROFILE_TICKS[i].load(Ordering::Relaxed)),
+     core::array::from_fn(|i| PROFILE_CALLS[i].load(Ordering::Relaxed)))
+}
+#[cfg(feature = "executor-profile")]
+struct ProfileTurn { hart: HartId, start: u64 }
+#[cfg(feature = "executor-profile")]
+impl Drop for ProfileTurn {
+    fn drop(&mut self) {
+        PROFILE_TICKS[self.hart.index()].fetch_add(arch::time().wrapping_sub(self.start), Ordering::Relaxed);
+        PROFILE_CALLS[self.hart.index()].fetch_add(1, Ordering::Relaxed);
+    }
+}
 fn poll_once_on(hart: HartId) -> bool {
+    #[cfg(feature = "executor-profile")]
+    let _profile = ProfileTurn { hart, start: arch::time() };
     debug_assert_eq!(
         current_scheduler_hart(),
         Some(hart),
@@ -6517,6 +6549,8 @@ fn poll_once_on(hart: HartId) -> bool {
     // boundary; ordinary safe tasks carry an untracked domain.
     let mut owner_scope = unsafe { heap::enter_domain_on_hart(task.domain, hart) };
     check_active_poll!(id, task.domain, &status);
+    #[cfg(feature = "executor-profile")]
+    let profile_start = arch::time();
     let faulted = match guard {
         Some(run_guarded) => {
             let fut = task.future.as_mut();
@@ -6536,6 +6570,8 @@ fn poll_once_on(hart: HartId) -> bool {
             false
         }
     };
+    #[cfg(feature = "executor-profile")]
+    status.poll_ticks.fetch_add(arch::time().wrapping_sub(profile_start), Ordering::Relaxed);
     // `run_guarded` may have returned through a longjmp, which bypasses Drop
     // for scopes created inside the guarded call. Restore at the executor
     // boundary before touching scheduler infrastructure or another task.

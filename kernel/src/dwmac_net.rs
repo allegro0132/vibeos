@@ -508,23 +508,22 @@ fn driver_turn(
             *tx_deadline = 0;
         }
 
-        // Keep the same rebind barrier from descriptor consumption through
-        // exact session stamping, endpoint publication, and RX rearm. A stack
-        // restart cannot relabel a raw frame after the driver consumes it.
-        let mut frame = [0u8; MAX_PACKET_LEN];
-        for _ in 0..DRIVER_BATCH_PACKETS {
-            let Some(length) = engine.receive(&mut frame) else {
-                break;
-            };
-            immediate_work = true;
-            let packet = Packet::copy_from(&frame[..length]).expect("DWMAC bounded receive");
-            match send_inbound(inbound, &state.sessions, packet) {
-                Ok(()) => {}
-                // RX has already consumed and rearmed this descriptor. Stop
-                // the batch after one pressure drop so the stack can drain.
-                Err(NetError::QueueFull) => break,
-                Err(error) => return Err(error),
-            }
+    }
+
+    let mut frame = [0u8; MAX_PACKET_LEN];
+    for _ in 0..DRIVER_BATCH_PACKETS {
+        // Consume, stamp, publish and rearm one RX frame under the same
+        // barrier. Rebinding between frames cannot relabel a consumed frame.
+        let state = CONTROL.lock();
+        let Some(length) = engine.receive(&mut frame) else {
+            break;
+        };
+        immediate_work = true;
+        let packet = Packet::copy_from(&frame[..length]).expect("bounded network receive");
+        match send_inbound(inbound, &state.sessions, packet) {
+            Ok(()) => {}
+            Err(NetError::QueueFull) => break,
+            Err(error) => return Err(error),
         }
     }
     Ok(immediate_work)

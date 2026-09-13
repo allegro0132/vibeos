@@ -5,6 +5,10 @@ edition = "2021"
 autobins = false
 
 [features]
+# Experimental static network pipeline placement on admitted logical hart 1.
+network-pipeline = []
+# Diagnostic execution timing; excludes sleeping/WFI time.
+executor-profile = ["vibeos-core/executor-profile"]
 # Larger bounded socket storage for high-throughput network compositions.
 tcp-large-window = ["vibeos-netstack?/tcp-large-window"]
 mmu-large-memory-test = []

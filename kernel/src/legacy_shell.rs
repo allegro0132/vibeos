@@ -2521,6 +2521,9 @@ async fn block_benchmark(init: &Arc<Space>, block_cap: Cap, args: &[&str]) {
     };
     #[cfg(feature = "milkv-duo")]
     let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
+    if let Err(error) = &result {
+        println!("  block benchmark failed: {:?}", error);
+    }
     let status = if result.is_ok() {
         "ok"
     } else {

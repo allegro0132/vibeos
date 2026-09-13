@@ -892,3 +892,18 @@ other layouts recover catalog first, then authority with all retained tables
 charged. Separate-catalog/bundled-authority and separate-catalog/separate-authority
 fixtures call this dispatcher. Null bootstrap roots, growth, legacy roots and
 authority deltas remain integration gates. This is not production mount state.
+
+## Device recovery wrapper and experiment wrap-up
+
+`recover_device_checkpoint` selects authenticated device anchors, handles the
+strict empty bootstrap, and dispatches supported nonempty root layouts. It
+returns recovered data, not mounted state or write authority. The anchor buffer
+is released before payload recovery. Device fixtures cover bootstrap anchor-only
+reads, insufficient budgets, supported nonempty layouts and rejected duplicate
+Blob insertion. The 11 targeted root-bundle tests and the RISC-V bare-metal
+feature compile check passed on 2026-09-13.
+
+Development of this experiment is paused at this boundary. Production mount,
+publication/crash qualification, growth, legacy authority root sets and authority
+deltas remain outstanding. The experiment is disabled in the production QEMU
+performance comparison and has no measured performance acceptance claim.

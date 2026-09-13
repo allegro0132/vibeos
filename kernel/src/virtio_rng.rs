@@ -209,9 +209,13 @@ impl Resource for InstanceState {
 
 /// Bounded, fallible entropy service. Possessing the Rust object is not enough:
 /// every public operation accepts an invocation lease and checks READ rights.
+#[cfg(not(all(feature = "universal", feature = "jitter-entropy")))]
 pub struct RandomSource;
+#[cfg(all(feature = "universal", feature = "jitter-entropy"))]
+pub use crate::jitterentropy_random::RandomSource;
 
 impl RandomSource {
+    #[cfg(not(all(feature = "universal", feature = "jitter-entropy")))]
     fn new() -> Arc<Self> {
         Arc::new(Self)
     }
@@ -233,6 +237,7 @@ impl RandomSource {
     }
 }
 
+#[cfg(not(all(feature = "universal", feature = "jitter-entropy")))]
 impl Resource for RandomSource {
     fn kind(&self) -> &'static str {
         "random-source"
@@ -308,6 +313,8 @@ pub struct RandomResources {
 /// provider must be supplied by firmware, the kernel cannot manufacture an
 /// available source when hardware admission fails.
 pub fn discover() -> Option<RandomResources> {
+    #[cfg(feature = "universal")]
+    if vibeos_hal::runtime_platform::get().entropy_backend != vibeos_hal::runtime_platform::EntropyBackend::Queued { return None; }
     // Safety: firmware resources are mapped before device discovery begins;
     // the provider validates hardware identity and assigned resource ownership.
     let transport = unsafe { Endpoint::discover() }?;

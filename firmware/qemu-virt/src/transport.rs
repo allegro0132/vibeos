@@ -8,7 +8,7 @@ use vibeos_hal::{
 unsafe fn resolve(d: Descriptor) -> Option<MmioTransport> {
     MmioTransport::from_descriptor(Board::INFO.virtio_mmio?, d)
 }
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_DEVICE_TRANSPORT: Host = Host {
     discover: |kind| unsafe {
         let description = Board::INFO.virtio_mmio?;

@@ -42,10 +42,13 @@ use vibeos_component_format::{
 #[cfg(all(feature = "bounded-device", any(feature = "qemu-default", feature = "milkv-duo-sd")))]
 compile_error!("bounded-device cannot be combined with another image policy");
 
+#[cfg(all(feature = "runtime-image", any(feature = "qemu-default", feature = "milkv-duo-sd", feature = "bounded-device")))]
+compile_error!("runtime-image cannot be combined with a static image policy");
+
 #[cfg(all(feature = "qemu-default", feature = "milkv-duo-sd"))]
 compile_error!("image policies `qemu-default` and `milkv-duo-sd` are mutually exclusive");
 
-#[cfg(not(any(feature = "qemu-default", feature = "milkv-duo-sd", feature = "bounded-device")))]
+#[cfg(not(any(feature = "runtime-image", feature = "qemu-default", feature = "milkv-duo-sd", feature = "bounded-device")))]
 compile_error!("exactly one image policy must be selected");
 
 #[cfg(all(
@@ -2881,3 +2884,7 @@ mod tests {
         assert_eq!(BLOCK_DATA_SLICE.unwrap().end_sector(), Some(1_310_721));
     }
 }
+
+// Universal firmware supplies its admitted board's storage policy at runtime.
+#[cfg(feature = "runtime-image")]
+pub const BLOCK_DATA_SLICE: Option<BlockSlice> = None;

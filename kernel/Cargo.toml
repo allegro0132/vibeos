@@ -5,6 +5,10 @@ edition = "2021"
 autobins = false
 
 [features]
+universal-pci-usb = ["vibeos-vsh/pci-usb-help"]
+universal-dwc2 = []
+universal-python = ["python-command", "vibeos-wasi-runtime/python-duo"]
+universal = ["pio-block", "queued-block", "packet-network", "queued-network", "queued-entropy", "vibeos-hal/runtime-platform", "vibeos-image-policy/runtime-image"]
 # Experimental static network pipeline placement on admitted logical hart 1.
 network-pipeline = []
 # Diagnostic execution timing; excludes sleeping/WFI time.

@@ -391,3 +391,158 @@ whether the host/link, hardware FIFO/ring, or a software queue lost them.
 TCP completed both directions (560.09 / 626.85 Mbps under this mixed workload).
 Kernel selftest passed 395/0. Keep recycle opt-in until the loss path and
 repeat A/B comparison are resolved. See `rx-integrity-concurrent-*` evidence.
+
+### Larger-ring burst experiment
+
+`dma-ring128-experiment` selects 128 slots instead of 32 for both directions
+of the existing EQoS layout. Static DMA storage grows from 102400 to 409600
+bytes. It does not alter protocol endpoint queue capacities or service poll
+budgets; HAL queue size reports actual hardware ring capacity. Initialization
+logs `MARS_NET_RING` so the loaded image's selection is observable. Default
+remains 32 pending the controlled hardware comparison. Test with the same
+TX/RX checksum and read-only recycle flags as the diagnostics baseline.
+
+The ELF verifier now admits exactly the two composed ring sizes (32/128),
+reports `eqos_dma.ring_slots`, and still rejects misalignment, truncated slab
+reservation, incomplete writable load backing, and addresses outside the
+controller's 32-bit DMA region. Its five image-contract tests include malformed
+larger-ring images. This updates an explicit layout assumption; it does not
+turn a successful image check into physical qualification.
+
+The 128-slot image FIT SHA-256 is
+`da2789d2b0b128d032ac21e6d0a6632a66418abeba126adcb8d49f1dfc75791c`.
+Boot logs confirm 128 slots / 409600 bytes. Under the same mixed workload,
+8191/8192 replies arrived with exact payloads and valid checksums; one
+request (sequence 3680) had no captured reply. No capture drops or >2-second
+late replies occurred. RX unavailable and MTL overflow stayed clear, unlike
+the 32-slot diagnostics run. Software RX verification counted all 8192
+requests. This is improvement, not a complete loss-free qualification.
+
+Code inspection found a remaining policy-layer discard: `driver_turn` reads
+and rearms DMA before `send_inbound`, then drops the packet on `QueueFull`.
+Bounded pending ingress with preserved session stamps is the next candidate;
+this observed path has not yet been proven responsible for this exact timeout.
+
+The 128-slot uncaptured 60-second TCP pair measured 578.53 / 624.59 Mbps
+(host-to-board / board-to-host). Selftest passed 395/0; the following status
+snapshot still had RX unavailable and MTL overflow clear. Keep this as the
+comparison baseline for the pending software ingress backpressure fix.
+
+### Bounded ingress backpressure
+
+The kernel packet adapter now retains one stamped ingress frame if the
+protocol endpoint is full, and does not consume more DMA RX until it is
+delivered or retired. TX remains serviced each driver turn. Retry keeps the
+original device/stack stamp, validates the current binding under CONTROL,
+and rechecks endpoint authority. Stale frames are retired and counted; a
+revoked endpoint terminates the owner without publishing its retained frame.
+The retained frame is fixed-size task-local storage, not an unbounded queue.
+
+Host regression covers repeated full-queue retries, exact-once delivery when
+space returns, stack rebinding, device reset/detach and revocation on retry.
+The 23 core network tests passed. This closes a concrete discard path but
+requires physical load comparison before attributing prior ICMP loss to it.
+
+The bounded-ingress fix FIT
+`3543b060d27cfe25fc5871302e8f04b965d051ddf53481152dc7b8b8d9c9b6c8`
+passed the mixed 8192-pattern test with zero timeout/corruption. Capture
+confirmed 8192 requests and 8192 valid replies, max RTT21.40 ms, zero capture
+drops. RBU occurred but MTL overflow stayed clear. Selftest passed395/0.
+
+Pure TCP measured536.85/610.64 Mbps, below the previous128-slot578.53/624.59.
+The implementation currently moves each fresh frame through the pending slot
+before enqueue. The next optimization will attempt direct enqueue first and
+retain only on actual backpressure, preserving original stamps and authority
+checks. The performance cause is not yet isolated; do not claim this fixes
+throughput or that one loss-free bounded test is long-duration qualification.
+
+### Direct ingress before retention
+
+Fresh ingress now attempts direct enqueue under the same session lock and
+per-invocation endpoint authority check. Only a full queue writes the pending
+slot. Existing pending frames still use exact-stamp retry validation. The
+24 core network tests include direct-to-full-to-retry transitions and stale
+or revoked fresh submissions.
+
+The RAM image FIT SHA-256 is
+`4fdebac4c6dad2a1701f680458dd4ef97c7c57dab54d94e074e9487aebf2c792`.
+Mixed-load capture verified all 8192 requests/replies, exact payloads, no
+timeouts or bad checksums, max RTT 21.38 ms, and zero capture drops. DMA RBU
+and MTL overflow remained clear. Mixed TCP measured 564.41 / 621.68 Mbps.
+The shared worktree also contains ongoing universal platform/configuration
+changes; retain source snapshots and avoid treating this as isolated proof
+of the optimization's throughput contribution.
+
+Direct ingress pure TCP measured 579.60 / 619.89 Mbps in one 60-second pair,
+restoring RX throughput relative to the first retained-ingress implementation
+(536.85 / 610.64). Selftest passed 395/0. The next candidate is TX descriptor
+publication: pinned U-Boot `drivers/net/dwc_eth_qos.c` writes payload fields,
+orders them with `mb()`, then writes OWN and flushes the descriptor once. Our
+shared publication currently flushes before and after OWN. Any experiment
+must preserve payload visibility, OWN-last order, completion proof and tail
+ordering; do not infer RX safety from that TX-only reference path.
+
+### Single TX descriptor synchronization experiment
+
+`tx-single-sync-experiment` selects the opt-in Ring publication mode before
+DMA starts. TX data synchronization stays unchanged. Descriptor fields are
+written before a backend barrier, OWN is written last, and the full isolated
+descriptor line is synchronized once before the final barrier and tail MMIO.
+RX retains both descriptor synchronizations. A live or quarantined ring
+cannot change this mode; default remains conservative.
+
+The reference is pinned SDK `u-boot/drivers/net/dwc_eth_qos.c`, whose TX
+path orders fields, OWN and one descriptor flush in that sequence. This is
+not permission to remove payload synchronization or weaken the Backend's
+cache/order contract. Model coverage checks the complete publication trace,
+no overwrite when full, unchanged RX synchronization and configuration only
+after proven stop. Eight firmware packet tests also passed. Hardware
+throughput and corruption/loss checks remain separate qualification gates.
+
+Hardware evidence for the single-TX-sync image (FIT SHA-256
+`c0cf52ad305b010ba618aa41f96d723979f658a3674c92c43d751b80c6b81d4a`)
+is under `target/mars-acceptance/20260913-gigabit/20260914-tx-single-*`.
+One 60-second TCP pair measured 583.44 / 623.45 Mbps (host-to-board /
+board-to-host), less than 1% above the preceding direct-ingress pair;
+this does not establish a repeatable throughput improvement.
+Mixed-load integrity verified 8192/8192 exact payloads and captured replies,
+no timeouts or bad checksums, maximum RTT 21.17 ms. A separate 30-second
+reverse-only TCP load covered the entire additional 8192-probe run:
+8192/8192 verified, no timeouts or bad checksums, maximum RTT 20.71 ms,
+zero capture drops, receiver throughput 635.06 Mbps. These are bounded
+integrity results, not long-duration qualification.
+
+Selftest passed 395/0. A subsequent five-second pair fell to 492.69 / 403.22
+Mbps; the later reverse load recovered to the above result, so throughput
+variability remains unresolved. Serial observation after the pure TCP pair
+showed DMA status `0x00000c84` and MTL interrupt `0x00010000`: RX buffer
+unavailable and FIFO overflow flags were set, despite remaining clear during
+the earlier mixed capture. These are sticky flags, not event counts, and
+cannot identify the exact failing packet or interval. The experiment stays
+default-off; 900 Mbps and complete Mars qualification remain unachieved.
+
+### Receive directly into owned packet storage
+
+`Packet::receive_with` provides a fixed-size initialized destination to the
+firmware receive operation, validates its optional returned length and clears
+the unused tail. The DWMAC policy adapter now receives directly into this
+packet instead of receiving into a temporary array and copying the complete
+frame again. DMA-to-CPU copying and synchronization remain in the firmware;
+this is not a zero-copy DMA contract. Session locking, stamp validation,
+one-frame bounded retention, and per-invocation authority checks are unchanged.
+Host network coverage passes 25 tests, including producer writes beyond the
+returned length, no frame, invalid lengths, and prior session/backpressure tests.
+Hardware performance remains to be measured for this candidate.
+
+The direct-fill RAM image FIT SHA-256 is
+`1d0ddff086567034802d5ff20590b2f43b84685f12d44854ddd22ef99f599bfa`.
+A 60-second single-stream pair measured 594.58 / 615.94 Mbps versus
+583.44 / 623.45 in the preceding single-TX-sync image. RX improved 1.9%
+and TX decreased 1.2%; this pair does not establish an overall speedup.
+Mixed-load integrity verified 8192/8192 exact payloads and captured replies,
+no timeouts or bad checksums, max RTT 21.28 ms and zero capture drops.
+DMA status remained `0x00000c04` and MTL interrupt status zero in the
+collected pure/mixed logs, including the state after both pure directions.
+This bounded absence of sticky errors does not prove loss-free operation
+under every load. Source snapshots and raw evidence use the prefix
+`target/mars-acceptance/20260913-gigabit/20260914-rx-fill-*`.

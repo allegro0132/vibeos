@@ -22,7 +22,7 @@ unsafe fn engine() -> &'static mut Engine {
     (*ENGINE.0.get()).as_mut().expect("claimed packet device")
 }
 const DESC: vibeos_hal::DwmacDescription = Board::INFO.dwmac.unwrap();
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_PACKET_DEVICE: Device = Device {
     present: true,
     registers: DESC.registers,

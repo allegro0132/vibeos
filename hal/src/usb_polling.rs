@@ -301,11 +301,17 @@ pub struct Host {
     pub hub_topology_changed: unsafe fn() -> Result<bool, Error>,
     pub poll_keyboard: unsafe fn() -> Result<HidInputBatch, Error>,
 }
+#[cfg(not(feature = "runtime-platform"))]
 extern "Rust" {
     static VIBEOS_POLLING_USB_HOST: Host;
 }
+#[cfg(not(feature = "runtime-platform"))]
 pub fn host() -> &'static Host {
     unsafe { &VIBEOS_POLLING_USB_HOST }
+}
+#[cfg(feature = "runtime-platform")]
+pub fn host() -> &'static Host {
+    crate::runtime_platform::get().polling_usb.expect("firmware did not admit polling_usb")
 }
 
 /// Owned, implementation-private rollback words, interpreted only by platform

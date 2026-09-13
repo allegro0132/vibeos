@@ -96,9 +96,15 @@ pub struct Host {
     pub functions: unsafe fn(&mut dyn FnMut(Function)),
     pub enable_bus_mastering: unsafe fn(Function) -> Result<(), Error>,
 }
+#[cfg(not(feature = "runtime-platform"))]
 extern "Rust" {
     static VIBEOS_PCI_HOST: Host;
 }
+#[cfg(not(feature = "runtime-platform"))]
 pub fn host() -> &'static Host {
     unsafe { &VIBEOS_PCI_HOST }
+}
+#[cfg(feature = "runtime-platform")]
+pub fn host() -> &'static Host {
+    crate::runtime_platform::get().pci.expect("firmware did not admit pci")
 }

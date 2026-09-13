@@ -5,6 +5,8 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+# Suppress legacy exports when these source modules are embedded by universal firmware.
+universal = []
 # Qualification experiment: complete IPv4 TX requests; RX stays in software.
 tx-checksum-experiment = ["ethernet-device"]
 # Observe hardware RX status while retaining software checksum verification.
@@ -17,12 +19,14 @@ rx-readonly-recycle-experiment = ["ethernet-device"]
 rx-error-forward-experiment = ["rx-status-experiment"]
 # Burst-absorption experiment; both RX and TX ring counts increase.
 dma-ring128-experiment = ["ethernet-device"]
+tx-single-sync-experiment = ["ethernet-device"]
 default = ["image"]
-image = ["dep:vibeos-kernel", "dep:vibeos-runtime-riscv", "dep:vibeos-image-policy"]
+sd-device = ["dep:vibeos-driver-dw-mshc"]
+image = ["sd-device", "dep:vibeos-kernel", "dep:vibeos-runtime-riscv", "dep:vibeos-image-policy"]
 # Hardware assembly is independent of the selected network service image.
 ethernet-device = ["dep:vibeos-eqos-net", "dep:vibeos-ethernet"]
 # Compatibility profile used by --ethernet build/package commands.
-ethernet = ["ethernet-device", "tx-checksum-experiment", "rx-ipv4-checksum-experiment", "rx-error-forward-experiment", "rx-readonly-recycle-experiment", "dma-ring128-experiment", "vibeos-kernel?/dhcp-iperf3-server", "vibeos-kernel?/tcp-large-window", "vibeos-kernel?/network-pipeline"]
+ethernet = ["ethernet-device", "vibeos-kernel?/dhcp-iperf3-server", "vibeos-kernel?/tcp-large-window", "vibeos-kernel?/executor-profile", "vibeos-kernel?/network-pipeline"]
 
 # Install a retained, unstarted native owner; source approval is separate.
 entropy-device = ["dep:vibeos-starfive-trng", "vibeos-kernel?/queued-entropy"]
@@ -51,7 +55,7 @@ vibeos-bsp-milkv-mars = { path = "../../boards/milkv-mars" }
 vibeos-platform-jh7110 = { path = "../../platform/jh7110" }
 vibeos-driver-uart16550 = { path = "../../drivers/uart16550" }
 vibeos-driver-plic = { path = "../../drivers/plic" }
-vibeos-driver-dw-mshc = { path = "../../drivers/dw-mshc" }
+vibeos-driver-dw-mshc = { path = "../../drivers/dw-mshc", optional = true }
 vibeos-eqos-net = { path = "../../drivers/eqos-net", optional = true }
 vibeos-ethernet = { path = "../../drivers/ethernet", optional = true }
 

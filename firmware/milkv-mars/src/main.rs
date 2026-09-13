@@ -46,7 +46,7 @@ mod entropy_boot;
 #[cfg(feature = "entropy-device")]
 mod entropy;
 #[cfg(feature = "entropy-device")]
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_ENTROPY_DEVICE: vibeos_hal::entropy::EntropyDevice = entropy::DEVICE;
 #[cfg(feature = "entropy-device")]
 type NativeEntropyInstance = vibeos_firmware_milkv_mars::entropy_instance::Instance<
@@ -122,7 +122,7 @@ unsafe fn platform_report(print: fn(core::fmt::Arguments<'_>)) {
     print(format_args!("Mars bring-up: SD data-only PIO; network={}; SSH disabled; physical acceptance pending\n", NETWORK_DRIVER_NAME));
 }
 #[cfg(not(feature = "ethernet-device"))]
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_PACKET_DEVICE: vibeos_hal::network::Device = vibeos_hal::network::Device {
     present: false,
     registers: vibeos_hal::AddressRange::new(0, 0),

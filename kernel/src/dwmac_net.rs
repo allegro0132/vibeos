@@ -13,8 +13,7 @@ use vibeos_hal::network::{device, Error as HardwareError};
 use crate::cap::{Cap, InvocationLease, Resource, Revocable, Rights};
 use crate::heap::{AllocationDomain, ArenaId, OwnerId};
 use crate::net::{
-    Endpoint, Packet, PacketSessionError, PacketSessionFence, PacketStamp, StampedPacket,
-    MAX_PACKET_LEN,
+    flush_pending_ingress, submit_ingress, IngressDelivery, Endpoint, Packet, PacketSessionError, PacketSessionFence, PacketStamp, StampedPacket,
 };
 use crate::sync::SpinLock;
 use crate::world::Space;
@@ -33,6 +32,7 @@ const HELLO_PAYLOAD: &[u8] = b"VIBEOS-NET-HELLO-v1";
 const CHALLENGE_PAYLOAD: &[u8] = b"VIBEOS-NET-CHALLENGE-v1";
 const ACK_PAYLOAD: &[u8] = b"VIBEOS-NET-ACK-v1";
 
+#[cfg(not(feature = "universal"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetError {
     Offline,
@@ -49,6 +49,7 @@ pub enum NetError {
     IdentityExhausted,
 }
 
+#[cfg(not(feature = "universal"))]
 impl core::fmt::Display for NetError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
@@ -68,6 +69,7 @@ impl core::fmt::Display for NetError {
     }
 }
 
+#[cfg(not(feature = "universal"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetInfo {
     pub online: bool,
@@ -141,7 +143,9 @@ impl Resource for DmaRegion {
     }
 }
 
+#[cfg(not(feature = "universal"))]
 pub struct NetDevice;
+#[cfg(not(feature = "universal"))]
 impl NetDevice {
     fn info(&self) -> NetInfo {
         let state = CONTROL.lock();
@@ -189,6 +193,53 @@ impl NetDevice {
         }
     }
 }
+#[cfg(feature = "universal")]
+pub(crate) fn universal_info() -> NetInfo {
+        let state = CONTROL.lock();
+        // SAFETY: the Milk-V BSP maps all DWMAC, clock, ePHY, and eFuse
+        // apertures for the firmware lifetime. CONTROL serializes this
+        // diagnostic snapshot with kernel packet-engine operations; the
+        // selected status registers are non-destructive reads.
+        let hardware = unsafe { (device().telemetry)() };
+        NetInfo {
+            online: state.online,
+            quarantined: state.quarantined,
+            queue_size: u16::try_from(device().rx_queue_size)
+                .expect("DWMAC ring size fits telemetry"),
+            header_size: 0,
+            accepted_features: 0,
+            session_epoch: state.sessions.device_epoch(),
+            stack_generation: state
+                .sessions
+                .active_stamp()
+                .map_or(0, PacketStamp::stack_generation),
+            irq: description().irq,
+            used_interrupts: 0,
+            rx_packets: hardware.rx_packets,
+            tx_packets: hardware.tx_packets,
+            tx_checksum_offload: hardware.tx_checksum_offload,
+            rx_checksum_offload: hardware.rx_checksum_offload,
+            stale_ingress_drops: STALE_INGRESS_DROPS.load(Ordering::Acquire),
+            stale_egress_drops: STALE_EGRESS_DROPS.load(Ordering::Acquire),
+            stale_egress_device_epoch_drops: STALE_EGRESS_DEVICE_EPOCH_DROPS
+                .load(Ordering::Acquire),
+            stale_egress_stack_generation_drops: STALE_EGRESS_STACK_GENERATION_DROPS
+                .load(Ordering::Acquire),
+            resets: hardware.resets,
+            timeouts: TIMEOUTS.load(Ordering::Acquire),
+            rx_inflight: u8::from(state.online),
+            tx_inflight: u8::from(state.tx_inflight),
+            ethernet_address: GUEST_MAC,
+            phy_link_up: hardware.phy_link_up,
+            tx_descriptor_status: hardware.tx_descriptor_status,
+            dma_status: hardware.dma_status,
+            clock_enable: hardware.clock_enable,
+            clock_bypass: hardware.clock_bypass,
+            clock_divider: hardware.clock_divider,
+            ephy_control: hardware.ephy_control,
+        }
+    }
+#[cfg(not(feature = "universal"))]
 impl Resource for NetDevice {
     fn kind(&self) -> &'static str {
         "network-device"
@@ -382,6 +433,7 @@ pub async fn driver_task(
     };
 
     let mut pending_tx = None;
+    let mut pending_rx = None;
     let mut tx_deadline = 0;
     let mut link_poll = None;
     let mut poll_budget = vibeos_core::poll_budget::PollBudget::new(crate::exec::timebase_hz() / 1000, 64);
@@ -395,6 +447,7 @@ pub async fn driver_task(
                 &outbound,
                 &inbound,
                 &mut pending_tx,
+                &mut pending_rx,
                 &mut tx_deadline,
                 &mut link_poll,
             )
@@ -452,6 +505,7 @@ fn driver_turn(
     outbound: &Revocable<Endpoint<StampedPacket>>,
     inbound: &Revocable<Endpoint<StampedPacket>>,
     pending_tx: &mut Option<Packet>,
+    pending_rx: &mut Option<StampedPacket>,
     tx_deadline: &mut u64,
     link_poll: &mut Option<u64>,
 ) -> Result<bool, NetError> {
@@ -510,20 +564,34 @@ fn driver_turn(
 
     }
 
-    let mut frame = [0u8; MAX_PACKET_LEN];
     for _ in 0..DRIVER_BATCH_PACKETS {
         // Consume, stamp, publish and rearm one RX frame under the same
         // barrier. Rebinding between frames cannot relabel a consumed frame.
         let state = CONTROL.lock();
-        let Some(length) = engine.receive(&mut frame) else {
-            break;
-        };
+        // Never consume another DMA frame while one awaits queue space.
+        // Its immutable stamp survives retries; a rebind retires it instead
+        // of relabeling it for the new stack. TX remains serviced each turn.
+        let delivery = if pending_rx.is_some() {
+            flush_pending_ingress(pending_rx, &state.sessions, inbound)
+        } else {
+            let Some(packet) = Packet::receive_with(|frame| engine.receive(frame))
+                .map_err(|_| NetError::Protocol)? else { break; };
+            immediate_work = true;
+            let packet = match state.sessions.stamp_ingress(packet) {
+                Ok(packet) => packet,
+                Err(PacketSessionError::Inactive) => {
+                    STALE_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Err(_) => unreachable!(),
+            };
+            submit_ingress(packet, pending_rx, &state.sessions, inbound)
+        }.map_err(|_| NetError::AuthorityRevoked)?;
         immediate_work = true;
-        let packet = Packet::copy_from(&frame[..length]).expect("bounded network receive");
-        match send_inbound(inbound, &state.sessions, packet) {
-            Ok(()) => {}
-            Err(NetError::QueueFull) => break,
-            Err(error) => return Err(error),
+        match delivery {
+            IngressDelivery::Backpressured => break,
+            IngressDelivery::Stale => { STALE_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed); }
+            IngressDelivery::Delivered | IngressDelivery::Empty => {}
         }
     }
     Ok(immediate_work)
@@ -566,25 +634,6 @@ fn take_admitted_outbound(
         }
     }
     Ok(None)
-}
-
-fn send_inbound(
-    inbound: &Revocable<Endpoint<StampedPacket>>,
-    sessions: &PacketSessionFence,
-    packet: Packet,
-) -> Result<(), NetError> {
-    let packet = match sessions.stamp_ingress(packet) {
-        Ok(packet) => packet,
-        Err(PacketSessionError::Inactive) => {
-            STALE_INGRESS_DROPS.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
-        }
-        Err(_) => unreachable!(),
-    };
-    inbound
-        .try_with(|endpoint| endpoint.try_send(packet))
-        .map_err(|_| NetError::AuthorityRevoked)?
-        .map_err(|_| NetError::QueueFull)
 }
 
 pub fn hello_packet() -> Packet {
@@ -644,3 +693,6 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
 pub fn debug_waiter_count() -> usize {
     0
 }
+
+#[cfg(feature = "universal")]
+pub use crate::universal_net::{NetError, NetInfo, NetDevice};

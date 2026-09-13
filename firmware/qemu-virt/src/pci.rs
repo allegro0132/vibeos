@@ -7,7 +7,7 @@ struct HostState(UnsafeCell<Pci>);
 // SAFETY: the kernel's PCI lock covers all mutable/shared host operations.
 unsafe impl Sync for HostState {}
 static PCI: HostState = HostState(UnsafeCell::new(Pci::new(Board::INFO.pci.unwrap())));
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_PCI_HOST: Host = Host {
     init: || unsafe { (&mut *PCI.0.get()).init() },
     functions: |visit| unsafe { (&*PCI.0.get()).visit_functions(visit) },

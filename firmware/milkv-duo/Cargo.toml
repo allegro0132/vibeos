@@ -5,6 +5,8 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+# Suppress legacy exports when these source modules are embedded by universal firmware.
+universal = []
 # Reusable services; this firmware selects the appropriate entropy provider.
 provisioned-ssh = ["vibeos-kernel/provisioned-ssh", "vibeos-kernel/jitter-entropy"]
 provisioned-command = ["provisioned-ssh", "vibeos-kernel/provisioned-command"]

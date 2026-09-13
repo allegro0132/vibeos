@@ -43,12 +43,18 @@ pub struct PioBlockDevice {
     /// Optional explicit bring-up diagnostic, never used by ordinary I/O.
     pub probe_read: Option<unsafe fn(u64, &mut [u8], usize) -> (usize, Result<(), Error>)>,
 }
+#[cfg(not(feature = "runtime-platform"))]
 extern "Rust" {
     static VIBEOS_PIO_BLOCK_DEVICE: PioBlockDevice;
 }
+#[cfg(not(feature = "runtime-platform"))]
 pub fn pio_device() -> &'static PioBlockDevice {
     // SAFETY: the final firmware defines one immutable operation table.
     unsafe { &VIBEOS_PIO_BLOCK_DEVICE }
+}
+#[cfg(feature = "runtime-platform")]
+pub fn pio_device() -> &'static PioBlockDevice {
+    crate::runtime_platform::get().pio_block.expect("firmware did not admit pio_block")
 }
 
 /// The only physical sector interval admitted to an ordinary block service.

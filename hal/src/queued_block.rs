@@ -69,9 +69,15 @@ pub struct Device {
     pub recover: unsafe fn(usize, usize) -> Result<(), Error>,
     pub acknowledge: unsafe fn(usize) -> u32,
 }
+#[cfg(not(feature = "runtime-platform"))]
 extern "Rust" {
     static VIBEOS_QUEUED_BLOCK_DEVICE: Device;
 }
+#[cfg(not(feature = "runtime-platform"))]
 pub fn device() -> &'static Device {
     unsafe { &VIBEOS_QUEUED_BLOCK_DEVICE }
+}
+#[cfg(feature = "runtime-platform")]
+pub fn device() -> &'static Device {
+    crate::runtime_platform::get().queued_block.expect("firmware did not admit queued_block")
 }

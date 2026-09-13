@@ -1,0 +1,324 @@
+# UI and dependency metadata. Physical addresses stay in boards/* and platform/*.
+version = 1
+
+[[boards]]
+id = "qemu-virt"
+name = "QEMU virt"
+description = "RISC-V virt with 128 MiB RAM, VirtIO storage and networking."
+required = ["uart16550", "plic"]
+defaults = ["virtio-blk", "virtio-net"]
+feature = "board-qemu-virt"
+load_address = 2149580800
+memory_bytes = 132120576
+
+[[boards]]
+id = "milkv-duo"
+name = "Milk-V Duo"
+description = "CV1800B / C906 with a 60 MiB kernel memory window."
+required = ["uart16550", "plic", "cv1800b"]
+defaults = ["sdhci-blk", "dwmac-net"]
+feature = "board-milkv-duo"
+load_address = 2149580800
+memory_bytes = 62914560
+
+[[boards]]
+id = "milkv-mars"
+name = "Milk-V Mars"
+description = "JH7110 4 GiB with native SD and EQoS; jitterentropy supplies the entropy fallback."
+required = ["uart16550", "plic", "jh7110", "dw-i2c"]
+defaults = ["dw-mshc", "eqos-net"]
+feature = "board-milkv-mars"
+load_address = 1075838976
+memory_bytes = 4292870144
+
+[[nodes]]
+id = "uart16550"
+name = "Serial console"
+description = "Required for boot; register layout follows the admitted board."
+kind = "driver"
+feature = "driver-uart16550"
+boards = []
+requires = []
+provides = ["console"]
+
+[[nodes]]
+id = "plic"
+name = "PLIC interrupt controller"
+description = "Required for boot; the BSP supplies hart and supervisor context mappings."
+kind = "driver"
+feature = "driver-plic"
+boards = []
+requires = []
+provides = ["interrupts"]
+
+[[nodes]]
+id = "cv1800b"
+name = "CV1800B platform"
+description = "Duo clocks, pinmux, cache maintenance and reset."
+kind = "driver"
+feature = "driver-cv1800b"
+boards = ["milkv-duo"]
+requires = []
+provides = []
+
+[[nodes]]
+id = "jh7110"
+name = "JH7110 platform"
+description = "Mars clocks, pinmux, cache maintenance and reset."
+kind = "driver"
+feature = "driver-jh7110"
+boards = ["milkv-mars"]
+requires = []
+provides = []
+
+[[nodes]]
+id = "dw-i2c"
+name = "DW I2C / Mars reset"
+description = "Mars reset transport requires I2C5."
+kind = "driver"
+feature = "driver-dw-i2c"
+boards = ["milkv-mars"]
+requires = ["jh7110"]
+provides = []
+
+[[nodes]]
+id = "virtio-core"
+name = "VirtIO protocol"
+description = "Shared VirtIO queues and protocol."
+kind = "driver"
+feature = "driver-virtio-core"
+boards = ["qemu-virt"]
+requires = []
+provides = []
+
+[[nodes]]
+id = "virtio-mmio"
+name = "VirtIO MMIO"
+description = "VirtIO register transport."
+kind = "driver"
+feature = "driver-virtio-mmio"
+boards = ["qemu-virt"]
+requires = ["virtio-core"]
+provides = []
+
+[[nodes]]
+id = "virtio-blk"
+name = "VirtIO block"
+description = "QEMU managed data disk."
+kind = "driver"
+feature = "driver-virtio-blk"
+boards = ["qemu-virt"]
+requires = ["virtio-mmio"]
+provides = ["block"]
+
+[[nodes]]
+id = "virtio-net"
+name = "VirtIO network"
+description = "QEMU network device."
+kind = "driver"
+feature = "driver-virtio-net"
+boards = ["qemu-virt"]
+requires = ["virtio-mmio"]
+provides = ["network"]
+
+[[nodes]]
+id = "virtio-rng"
+name = "VirtIO entropy"
+description = "Firmware-approved QEMU entropy source; device health is checked at runtime."
+kind = "driver"
+feature = "driver-virtio-rng"
+boards = ["qemu-virt"]
+requires = ["virtio-mmio"]
+provides = ["entropy"]
+
+[[nodes]]
+id = "sd-protocol"
+name = "SD protocol"
+description = "SD card capacity and sector protocol."
+kind = "driver"
+feature = "driver-sd-protocol"
+boards = ["milkv-duo", "milkv-mars"]
+requires = []
+provides = []
+
+[[nodes]]
+id = "sdhci-blk"
+name = "SDHCI storage"
+description = "Duo SD data partition; boot regions are excluded."
+kind = "driver"
+feature = "driver-sdhci-blk"
+boards = ["milkv-duo"]
+requires = ["cv1800b", "sd-protocol"]
+provides = ["block"]
+
+[[nodes]]
+id = "dw-mshc"
+name = "DW-MSHC storage"
+description = "Mars SD data partition; boot regions are excluded."
+kind = "driver"
+feature = "driver-dw-mshc"
+boards = ["milkv-mars"]
+requires = ["jh7110", "sd-protocol"]
+provides = ["block"]
+
+[[nodes]]
+id = "dwmac-net"
+name = "DWMAC network"
+description = "Duo onboard Ethernet."
+kind = "driver"
+feature = "driver-dwmac-net"
+boards = ["milkv-duo"]
+requires = ["cv1800b"]
+provides = ["network"]
+
+[[nodes]]
+id = "eqos-net"
+name = "EQoS / YT8531 network"
+description = "Mars onboard Ethernet using the existing board driver."
+kind = "driver"
+feature = "driver-eqos-net"
+boards = ["milkv-mars"]
+requires = ["jh7110"]
+provides = ["network"]
+
+[[nodes]]
+id = "pci"
+name = "PCI ECAM"
+description = "QEMU PCI enumeration and BAR allocation."
+kind = "driver"
+feature = "driver-pci"
+boards = ["qemu-virt"]
+requires = []
+provides = ["pci"]
+
+[[nodes]]
+id = "xhci"
+name = "XHCI USB"
+description = "QEMU USB host, keyboard and storage."
+kind = "driver"
+feature = "driver-xhci"
+boards = ["qemu-virt"]
+requires = ["pci"]
+provides = ["usb"]
+
+[[nodes]]
+id = "dwc2-host"
+name = "DWC2 USB"
+description = "Duo USB host and CDC-ECM networking."
+kind = "driver"
+feature = "driver-dwc2-host"
+boards = ["milkv-duo"]
+requires = ["cv1800b", "rtl815x"]
+provides = ["usb", "network"]
+
+[[nodes]]
+id = "rtl815x"
+name = "RTL815x USB helper"
+description = "Duo USB NIC identification and mode switching."
+kind = "driver"
+feature = "driver-rtl815x"
+boards = ["milkv-duo"]
+requires = []
+provides = []
+
+[[nodes]]
+id = "milkv-duo-led"
+name = "Duo status LED"
+description = "Optional onboard LED."
+kind = "driver"
+feature = "driver-milkv-duo-led"
+boards = ["milkv-duo"]
+requires = ["cv1800b"]
+provides = []
+
+[[nodes]]
+id = "jitter-entropy"
+name = "Jitterentropy"
+description = "Entropy fallback using jitterentropy OSR=3 / 256 KiB; failed health checks reject random requests."
+kind = "driver"
+feature = "driver-jitter-entropy"
+boards = ["qemu-virt", "milkv-duo", "milkv-mars"]
+requires = []
+provides = ["entropy"]
+
+[[nodes]]
+id = "starfive-trng"
+name = "StarFive TRNG"
+description = "Hardware diagnostics only; does not satisfy the SSH entropy dependency."
+kind = "driver"
+feature = "driver-starfive-trng"
+boards = ["milkv-mars"]
+requires = ["jh7110"]
+provides = ["diagnostic-entropy"]
+
+[[nodes]]
+id = "vsh"
+name = "VSH console"
+description = "The required capability shell."
+kind = "component"
+feature = "component-vsh"
+requires = []
+conflicts = []
+
+[[nodes]]
+id = "file-tree"
+name = "File services"
+description = "Managed storage, file trees and persistent programs."
+kind = "component"
+feature = "component-file-tree"
+requires = ["cap:block"]
+conflicts = []
+
+[[nodes]]
+id = "network"
+name = "Networking"
+description = "IPv4, DHCP and ip/dhclient commands on available network interfaces."
+kind = "component"
+feature = "component-network"
+requires = ["cap:network"]
+conflicts = []
+
+[[nodes]]
+id = "ssh"
+name = "SSH service"
+description = "Locally provisioned persistent identities; requires networking, storage and entropy."
+kind = "component"
+feature = "component-ssh"
+requires = ["network", "file-tree", "cap:entropy"]
+conflicts = ["iperf3"]
+
+[[nodes]]
+id = "wasi"
+name = "WASI command runtime"
+description = "Built-in WASI Preview 1 support; external programs are installed separately."
+kind = "component"
+feature = "component-wasi"
+requires = ["file-tree"]
+conflicts = []
+
+[[nodes]]
+id = "wasmtime"
+name = "Wasmtime native backend"
+description = "Requires RV64GC; runtime ISA, memory and command authority checks remain enforced."
+kind = "component"
+feature = "component-wasmtime"
+requires = ["wasi"]
+conflicts = ["python"]
+
+[[nodes]]
+id = "python"
+name = "Python/WASI support"
+description = "Bounded Wasmi interpreter with limits suitable for small boards; install the Python program separately."
+kind = "component"
+feature = "component-python"
+requires = ["wasi"]
+conflicts = ["wasmtime"]
+
+[[nodes]]
+id = "iperf3"
+name = "iperf3 service"
+description = "DHCP TCP benchmark service; conflicts with the existing SSH service profile."
+kind = "component"
+feature = "component-iperf3"
+requires = ["network"]
+conflicts = ["ssh"]

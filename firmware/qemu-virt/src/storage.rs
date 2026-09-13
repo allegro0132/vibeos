@@ -61,7 +61,7 @@ fn pending(s: &State, token: Submission) -> Result<driver::PendingSubmission, Er
         .map(|(_, p)| p)
         .ok_or(Error::Protocol)
 }
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_QUEUED_BLOCK_DEVICE: Device = Device {
     dma_base: driver::dma_base,
     dma_bytes: driver::DMA_BYTES,

@@ -6,17 +6,17 @@ spec = importlib.util.spec_from_file_location('mars_image', Path(__file__).resol
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
-def fixture(ethernet=False):
+def fixture(ethernet=False, slots=32):
     data = bytearray(0x3600)
     load = module.LOAD
-    stack = load + (0x20000 if ethernet else 0x3000)
+    stack = load + ((0x20000 if slots == 32 else 0x70000) if ethernet else 0x3000)
     values = {'_start': load, '__heap_start': stack + 0x100000, '__heap_end': module.RAM_END,
               '__stacks_bottom': stack, '__stacks_top': stack + 0x100000,
               '__stack_guard_size': 4096, '__kernel_stack_stride': 256 * 1024,
               '__bss_start': load + 0x1100, '__bss_end': load + 0x2000}
     if ethernet:
         values.update(VIBEOS_MARS_EQOS_DMA=load + 0x3000,
-                      __dma_start=load + 0x3000, __dma_end=load + 0x1c000,
+                      __dma_start=load + 0x3000, __dma_end=load + 0x3000 + slots * 3200,
                       VIBEOS_PACKET_DEVICE=load + 0x1000)
     ident = b'\x7fELF\x02\x01\x01' + bytes(9)
     struct.pack_into('<16sHHIQQQIHHHHHH', data, 0, ident, 2, 243, 1, load, 64, 0x400, 1, 64, 56, 2, 64, 3, 0)
@@ -26,7 +26,7 @@ def fixture(ethernet=False):
     offsets = {}
     for i, (name, value) in enumerate(values.items()):
         offset = 0x3100 + (i + 1) * 24
-        size = 102400 if name == 'VIBEOS_MARS_EQOS_DMA' else 0
+        size = slots * 3200 if name == 'VIBEOS_MARS_EQOS_DMA' else 0
         struct.pack_into('<IBBHQQ', data, offset, len(strings), 0x10, 0, 1, value, size)
         strings.extend(name.encode() + b'\0')
         offsets[name] = offset + 8
@@ -51,6 +51,19 @@ class MarsImage(unittest.TestCase):
             mutated = data.copy()
             struct.pack_into('<Q', mutated, offset, value)
             with self.subTest(offset=offset), self.assertRaises(ValueError):
+                module.inspect(mutated, ethernet=True)
+    def test_larger_ring_requires_full_permanent_backing(self):
+        data, symbols = fixture(ethernet=True, slots=128)
+        report = module.inspect(data, ethernet=True)
+        self.assertEqual(report['eqos_dma']['ring_slots'], 128)
+        self.assertEqual(report['eqos_dma']['bytes'], 409600)
+        for offset, value in [(symbols['__dma_end'], module.LOAD + 0x1c000),
+                              (120 + 40, 0x1f000),
+                              (symbols['VIBEOS_MARS_EQOS_DMA'] + 8, 64 * 3200),
+                              (symbols['VIBEOS_MARS_EQOS_DMA'] + 8, 409536)]:
+            mutated = data.copy()
+            struct.pack_into('<Q', mutated, offset, value)
+            with self.subTest(offset=offset, value=value), self.assertRaises(ValueError):
                 module.inspect(mutated, ethernet=True)
     def test_64_bit_heap_ceiling_is_preserved(self):
         report = module.inspect(fixture()[0])

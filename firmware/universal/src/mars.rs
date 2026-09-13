@@ -1,0 +1,136 @@
+use core::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicU8, Ordering},
+};
+use vibeos_bsp_milkv_mars::Board as MarsBoard;
+// Firmware assembles the SoC reset resources and independent controller driver.
+struct Board;
+impl vibeos_hal::Board for Board {
+    const INFO: vibeos_hal::BoardInfo = MarsBoard::INFO;
+    const MEMORY_MAP: &'static [vibeos_hal::MemoryRegion] = MarsBoard::MEMORY_MAP;
+    const MMU: vibeos_hal::MmuDescription = MarsBoard::MMU;
+    const HART_IDS: &'static [usize] = MarsBoard::HART_IDS;
+    const PREPARE_RESET: Option<fn() -> bool> = Some(prepare_reset);
+    fn plic_s_context(hart: usize) -> Option<usize> {
+        MarsBoard::plic_s_context(hart)
+    }
+}
+fn prepare_reset() -> bool {
+    use vibeos_bsp_milkv_mars::{I2C5_REGISTERS, SYS_CRG};
+    // Mars I2C5 uses the 24 MHz oscillator. These standard-mode counts are
+    // the vendor U-Boot configuration, also measured on this physical board.
+    let timing = vibeos_driver_dw_i2c::StandardTiming {
+        high_count: 0x20,
+        low_count: 0xb0,
+        sda_hold: 8,
+    };
+    unsafe {
+        vibeos_platform_jh7110::reset::prepare_mmio(SYS_CRG)
+            && vibeos_driver_dw_i2c::prepare_mmio(I2C5_REGISTERS.start, timing)
+    }
+}
+use vibeos_firmware_milkv_mars::{Admission, SbiExtensions};
+use vibeos_hal::{
+    boot::{BootError, BootRequest},
+    Board as BoardContract,
+};
+use vibeos_runtime_riscv as sbi;
+#[path = "../../early_devices.rs"]
+pub(super) mod early_devices;
+#[cfg(feature = "entropy-device")]
+#[cfg(feature = "entropy-device")]
+#[path = "../../milkv-mars/src/entropy.rs"]
+pub(super) mod entropy;
+#[cfg(feature = "entropy-device")]
+#[cfg(feature = "entropy-device")]
+#[path = "../../milkv-mars/src/entropy_boot.rs"]
+pub(super) mod entropy_boot;
+#[cfg(feature = "driver-dw-mshc")]
+#[path = "../../milkv-mars/src/storage.rs"]
+pub(super) mod storage;
+#[cfg(feature = "entropy-device")]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
+pub static VIBEOS_ENTROPY_DEVICE: vibeos_hal::entropy::EntropyDevice = entropy::DEVICE;
+#[cfg(feature = "entropy-device")]
+type NativeEntropyInstance = vibeos_firmware_milkv_mars::entropy_instance::Instance<
+    vibeos_platform_jh7110::security::Mmio,
+    vibeos_starfive_trng::Mmio,
+>;
+#[cfg(feature = "entropy-device")]
+fn entropy_description() -> Option<vibeos_hal::device_transport::Descriptor> {
+    let r = admission().trng?;
+    Some(vibeos_hal::device_transport::Descriptor {
+        kind: vibeos_hal::device_transport::Kind::Entropy,
+        slot: 0,
+        base: r.registers.start,
+        irq: r.irq,
+        vendor_id: 0,
+    })
+}
+#[cfg(feature = "ethernet-device")]
+#[cfg(feature = "ethernet-device")]
+#[path = "../../milkv-mars/src/network.rs"]
+pub(super) mod network;
+struct BootState {
+    ready: AtomicU8,
+    value: UnsafeCell<Option<Admission>>,
+}
+unsafe impl Sync for BootState {}
+static BOOT: BootState = BootState {
+    ready: AtomicU8::new(0),
+    value: UnsafeCell::new(None),
+};
+fn admission() -> &'static Admission {
+    assert_eq!(BOOT.ready.load(Ordering::Acquire), 2);
+    unsafe { (&*BOOT.value.get()).as_ref().unwrap() }
+}
+unsafe fn admit(request: BootRequest) -> Result<(), BootError> {
+    let dtb = unsafe { request.dtb()? };
+    let capabilities = SbiExtensions {
+        hsm: sbi::probe_extension(0x48534d),
+        ipi: sbi::probe_extension(0x735049),
+        rfence: sbi::probe_extension(sbi::RFENCE_EXTENSION_ID),
+        time: sbi::probe_extension(0x54494d45),
+    };
+    let value = vibeos_firmware_milkv_mars::admit(dtb, &request, capabilities)?;
+    BOOT.ready
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| BootError::AlreadyInitialized)?;
+    unsafe { *BOOT.value.get() = Some(value) };
+    BOOT.ready.store(2, Ordering::Release);
+    Ok(())
+}
+fn hart_ids() -> &'static [usize] {
+    admission().harts.ids()
+}
+fn timebase_hz() -> u64 {
+    u64::from(admission().harts.timebase_hz)
+}
+const BOOT_ADMISSION: Option<unsafe fn(BootRequest) -> Result<(), BootError>> = Some(admit);
+const BOOT_HEAP_REGIONS: Option<fn() -> &'static [vibeos_hal::AddressRange]> =
+    Some(|| admission().heap.ranges());
+const HEAP_END: usize = vibeos_bsp_milkv_mars::RAM.end;
+const MANAGED_BLOCK_ID: core::num::NonZeroU128 =
+    core::num::NonZeroU128::new(0x5649_4245_4f53_0000_0000_0000_0000_0003).unwrap();
+#[cfg(not(feature = "ethernet-device"))]
+const NETWORK_DRIVER_NAME: &str = "unavailable (serial/SD profile)";
+#[cfg(feature = "ethernet-device")]
+const NETWORK_DRIVER_NAME: &str = "JH7110 EQoS / YT8531";
+unsafe fn platform_init(_write: fn(&str)) {
+    #[cfg(feature = "ethernet-device")]
+    network::install_logger(_write);
+    #[cfg(feature = "entropy-device")]
+    {
+        let _parent_hz = entropy_boot::install(_write);
+        #[cfg(feature = "trng-probe")]
+        entropy_boot::probe(_write, _parent_hz);
+    }
+}
+unsafe fn platform_report(print: fn(core::fmt::Arguments<'_>)) {
+    print(format_args!("MARS_BOOT_ADMISSION PASS boot={} harts={} timebase={} heap_regions={} SBI=HSM,IPI,RFENCE,TIME\n",
+        hart_ids()[0],hart_ids().len(),timebase_hz(),admission().heap.ranges().len()));
+    print(format_args!(
+        "Mars bring-up: SD data-only PIO; network={}; physical acceptance pending\n",
+        NETWORK_DRIVER_NAME
+    ));
+}

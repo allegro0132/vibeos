@@ -19,7 +19,7 @@ fn platform_error(error: sd::Error) -> Error {
         _ => Error::InvalidConfiguration,
     }
 }
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_PIO_BLOCK_DEVICE: PioBlockDevice = PioBlockDevice {
     resource_kind: "jh7110-dw-mshc-mmio",
     name: "JH7110 SDIO1 data partition",

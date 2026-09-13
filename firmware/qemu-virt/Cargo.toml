@@ -5,6 +5,8 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+# Suppress legacy exports when these source modules are embedded by universal firmware.
+universal = []
 entropy-diagnostic-only = []
 entropy-polling = []
 boot-dtb-probe = ["vibeos-kernel/boot-dtb-probe"]

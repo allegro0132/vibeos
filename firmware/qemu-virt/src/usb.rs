@@ -23,7 +23,7 @@ unsafe fn read_controller() -> &'static Controller<'static> {
         .expect("initialized USB host")
         .1
 }
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_USB_HOST: Host = Host {
     initialize: |mmio, irq| unsafe {
         let resources = XhciResources { mmio, irq };

@@ -45,11 +45,21 @@ static mut PROFILE_CHECKSUM_LAST: u64 = 0;
 
 // Serialized diagnostic counters for locating the gigabit bottleneck. Device
 // invocation authority is the sole owner, just as for ENGINE and its DMA ring.
-struct Profile { ticks: [u64; 3], calls: [u64; 3], last: u64 }
+struct Profile {
+    ticks: [u64; 3],
+    calls: [u64; 3],
+    last: u64,
+}
 struct ProfileSlot(UnsafeCell<Profile>);
 unsafe impl Sync for ProfileSlot {}
-static PROFILE: ProfileSlot = ProfileSlot(UnsafeCell::new(Profile { ticks: [0;3], calls: [0;3], last: 0 }));
-fn profile_time() -> u64 { vibeos_runtime_riscv::time() }
+static PROFILE: ProfileSlot = ProfileSlot(UnsafeCell::new(Profile {
+    ticks: [0; 3],
+    calls: [0; 3],
+    last: 0,
+}));
+fn profile_time() -> u64 {
+    vibeos_runtime_riscv::time()
+}
 unsafe fn profile_end(kind: usize, start: u64) {
     let p = &mut *PROFILE.0.get();
     p.ticks[kind] += profile_time().wrapping_sub(start);
@@ -59,9 +69,21 @@ unsafe fn profile_report() {
     let now = profile_time();
     let p = &mut *PROFILE.0.get();
     if now.wrapping_sub(p.last) >= 20_000_000 {
-        report(format_args!("MARS_NET_PROFILE dt={} owned={}/{} tx={}/{} rx={}/{} packets={}/{}\n",
-            now.wrapping_sub(p.last),p.ticks[0],p.calls[0],p.ticks[1],p.calls[1],p.ticks[2],p.calls[2],TX.load(Ordering::Relaxed),RX.load(Ordering::Relaxed)));
-        p.last=now;p.ticks=[0;3];p.calls=[0;3];
+        report(format_args!(
+            "MARS_NET_PROFILE dt={} owned={}/{} tx={}/{} rx={}/{} packets={}/{}\n",
+            now.wrapping_sub(p.last),
+            p.ticks[0],
+            p.calls[0],
+            p.ticks[1],
+            p.calls[1],
+            p.ticks[2],
+            p.calls[2],
+            TX.load(Ordering::Relaxed),
+            RX.load(Ordering::Relaxed)
+        ));
+        p.last = now;
+        p.ticks = [0; 3];
+        p.calls = [0; 3];
     }
 }
 
@@ -86,7 +108,10 @@ fn report(args: core::fmt::Arguments<'_>) {
     }
 }
 fn failed(stage: &str, detail: impl core::fmt::Debug, error: Error) -> Error {
-    report(format_args!("MARS_NET_INIT FAIL stage={} detail={:?}\n", stage, detail));
+    report(format_args!(
+        "MARS_NET_INIT FAIL stage={} detail={:?}\n",
+        stage, detail
+    ));
     error
 }
 
@@ -116,7 +141,10 @@ impl Registers for Lane {
         let v = unsafe { (self.address(o) as *const u32).read_volatile() };
         fence();
         if o == 0x1004 {
-            report(format_args!("MARS_NET_AXI base={:#x} bus={:#010x}\n", self.base, v));
+            report(format_args!(
+                "MARS_NET_AXI base={:#x} bus={:#010x}\n",
+                self.base, v
+            ));
         }
         v
     }
@@ -155,9 +183,13 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .map_err(|e| failed("ownership", e, Error::Busy))?;
     let result = (|| {
-        let r = super::admission()
-            .network
-            .ok_or_else(|| failed("resources", "missing DTB network", Error::InvalidDescription))?;
+        let r = super::admission().network.ok_or_else(|| {
+            failed(
+                "resources",
+                "missing DTB network",
+                Error::InvalidDescription,
+            )
+        })?;
         let base = super::admission().resources;
         let mut platform = ethernet::Mmio::new(
             [r.sys_crg, base.syscon, r.aon_crg, r.aon_syscon, r.aon_pins],
@@ -166,7 +198,10 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
         .map_err(|e| failed("platform-resources", e, Error::InvalidDescription))?;
         let prepared = ethernet::prepare(&mut platform, mars::GMAC0_TX_DRIVE, hz)
             .map_err(|e| failed("platform-prepare", e, Error::TimedOut))?;
-        report(format_args!("MARS_NET_INIT clocks csr={} gtx={} ptp={}\n", prepared.csr_hz, prepared.gtx_hz, prepared.ptp_hz));
+        report(format_args!(
+            "MARS_NET_INIT clocks csr={} gtx={} ptp={}\n",
+            prepared.csr_hz, prepared.gtx_hz, prepared.ptp_hz
+        ));
         let mut controller = Controller::new(
             Lane {
                 base: r.mac.start,
@@ -183,12 +218,17 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
             },
         )
         .map_err(|e| failed("controller-config", e, Error::InvalidDescription))?;
-        report(format_args!("MARS_NET_CHECKSUM_CAP {:?}\n", controller.checksum_capabilities()));
+        report(format_args!(
+            "MARS_NET_CHECKSUM_CAP {:?}\n",
+            controller.checksum_capabilities()
+        ));
         #[cfg(feature = "rx-status-experiment")]
-        controller.set_rx_checksum(true)
+        controller
+            .set_rx_checksum(true)
             .map_err(|e| failed("rx-checksum-mode", e, Error::InvalidDescription))?;
         #[cfg(feature = "rx-error-forward-experiment")]
-        controller.set_rx_error_forwarding(true)
+        controller
+            .set_rx_error_forwarding(true)
             .map_err(|e| failed("rx-error-forward", e, Error::InvalidDescription))?;
         let port = Port::new(
             Lane {
@@ -199,7 +239,8 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
             u64::from(prepared.csr_hz),
         )
         .map_err(|e| failed("mdio-config", e, Error::InvalidDescription))?;
-        let mut phy = Yt8531::probe(port, mars::PHY_SCAN_ADDRESSES, 100_000).map_err(|e| failed("phy-probe", e, Error::TimedOut))?;
+        let mut phy = Yt8531::probe(port, mars::PHY_SCAN_ADDRESSES, 100_000)
+            .map_err(|e| failed("phy-probe", e, Error::TimedOut))?;
         report(format_args!("MARS_NET_INIT phy={:?}\n", phy.identity()));
         let p = r.phy;
         phy.initialize(
@@ -214,9 +255,11 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
             10_000,
         )
         .map_err(|e| failed("phy-init", e, Error::TimedOut))?;
-        let cache =
-            cache::Cache::new(cache::Mmio::new(r.cache).map_err(|e| failed("cache-resources", e, Error::InvalidDescription))?)
-                .map_err(|e| failed("cache-geometry", e, Error::InvalidDescription))?;
+        let cache = cache::Cache::new(
+            cache::Mmio::new(r.cache)
+                .map_err(|e| failed("cache-resources", e, Error::InvalidDescription))?,
+        )
+        .map_err(|e| failed("cache-geometry", e, Error::InvalidDescription))?;
         let cache = cache.with_readonly_recycle(cfg!(feature = "rx-readonly-recycle-experiment"));
         // .dma is NOLOAD; initialize every byte before creating the Rust pool.
         // No ring has started in this claim; earlier claims require proven stop.
@@ -224,11 +267,23 @@ unsafe fn claim(mac: [u8; 6], time: fn() -> u64, hz: u64) -> Result<(), Error> {
         let pool = Pool::new(&mut *DMA.0.get(), DMA.0.get() as u64, cache, 8)
             .map_err(|e| failed("dma-pool", e, Error::AddressTooWide))?;
         let layout = pool.layout();
-        report(format_args!("MARS_NET_RING count={} bytes={}\n", COUNT, core::mem::size_of::<Storage<COUNT>>()));
+        report(format_args!(
+            "MARS_NET_RING count={} bytes={} tx_single_sync={}\n",
+            COUNT,
+            core::mem::size_of::<Storage<COUNT>>(),
+            cfg!(feature = "tx-single-sync-experiment")
+        ));
         *POOL.0.get() = Some(pool);
         *HARDWARE.0.get() = Some(Backend::new(controller, (*POOL.0.get()).as_mut().unwrap()));
-        *ENGINE.0.get() =
-            Some(Engine::new((*HARDWARE.0.get()).as_mut().unwrap(), layout, phy).map_err(|e| { report(format_args!("MARS_NET_INIT FAIL stage=ring-init detail={:?}\n", e)); error(e) })?);
+        *ENGINE.0.get() = Some(
+            Engine::new((*HARDWARE.0.get()).as_mut().unwrap(), layout, phy).map_err(|e| {
+                report(format_args!(
+                    "MARS_NET_INIT FAIL stage=ring-init detail={:?}\n",
+                    e
+                ));
+                error(e)
+            })?,
+        );
         LINK.store(false, Ordering::Release);
         TX.store(0, Ordering::Relaxed);
         RX.store(0, Ordering::Relaxed);
@@ -257,7 +312,7 @@ unsafe fn retire() -> bool {
     }
     stopped
 }
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_PACKET_DEVICE: Device = Device {
     present: true,
     registers: mars::GMAC0_REGISTERS,
@@ -292,7 +347,11 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
         snapshot();
         result.map_err(|e| {
             if !matches!(e, EngineError::Ring(ring::Error::Full)) {
-                report(format_args!("MARS_NET_TX FAIL bytes={} detail={:?}\n", p.len(), e));
+                report(format_args!(
+                    "MARS_NET_TX FAIL bytes={} detail={:?}\n",
+                    p.len(),
+                    e
+                ));
             }
             error(e)
         })
@@ -308,20 +367,32 @@ pub static VIBEOS_PACKET_DEVICE: Device = Device {
         let before = engine().link();
         let result = engine().poll_link();
         let after = engine().link();
-        if before != after { report(format_args!("MARS_NET_LINK {:?}\n", after)); }
+        if before != after {
+            report(format_args!("MARS_NET_LINK {:?}\n", after));
+        }
         #[cfg(feature = "rx-status-experiment")]
         if engine().rx_packets != 0 && PROFILE_CHECKSUM_LAST + 20_000_000 < profile_time() {
             PROFILE_CHECKSUM_LAST = profile_time();
-            report(format_args!("MARS_NET_RX_CHECKSUM {:?}\n", engine().rx_checksum_status));
+            report(format_args!(
+                "MARS_NET_RX_CHECKSUM {:?}\n",
+                engine().rx_checksum_status
+            ));
             #[cfg(feature = "rx-ipv4-checksum-experiment")]
-            report(format_args!("MARS_NET_RX_VERIFY {:?}\n", engine().rx_verified));
+            report(format_args!(
+                "MARS_NET_RX_VERIFY {:?}\n",
+                engine().rx_verified
+            ));
             if let Some(d) = engine().dma_diagnostics() {
-                report(format_args!("MARS_NET_DMA_STATUS dma={:#010x} mtl_irq={:#010x} mtl_rx={:#010x}\n",
-                    d.dma_status, d.mtl_interrupt, d.mtl_rx_debug));
+                report(format_args!(
+                    "MARS_NET_DMA_STATUS dma={:#010x} mtl_irq={:#010x} mtl_rx={:#010x}\n",
+                    d.dma_status, d.mtl_interrupt, d.mtl_rx_debug
+                ));
             }
             let drops = engine().rx_diagnostics();
-            report(format_args!("MARS_NET_RX_REJECT count={} status={:#010x} word1={:#010x}\n",
-                drops.rejected, drops.last_status, drops.last_word1));
+            report(format_args!(
+                "MARS_NET_RX_REJECT count={} status={:#010x} word1={:#010x}\n",
+                drops.rejected, drops.last_status, drops.last_word1
+            ));
         }
         profile_report();
         snapshot();

@@ -21,6 +21,32 @@ fn frame(len: usize) -> Vec<u8> {
 
 struct NoopWake;
 
+#[test]
+fn receive_builder_validates_lengths_and_clears_producer_tail() {
+    for len in [1, 63, 64, 65, 1513, MAX_PACKET_LEN] {
+        let expected = frame(len);
+        let packet = Packet::receive_with(|storage| {
+            assert_eq!(storage.len(), MAX_PACKET_LEN);
+            storage.fill(0xa5);
+            storage[..len].copy_from_slice(&expected);
+            Some(len)
+        }).unwrap().unwrap();
+        // Packet equality includes its private backing array, so this also
+        // proves that bytes written beyond the reported length were cleared.
+        assert_eq!(packet, Packet::copy_from(&expected).unwrap());
+    }
+    let mut calls = 0;
+    assert_eq!(Packet::receive_with(|storage| {
+        calls += 1;
+        storage.fill(0xff);
+        None
+    }), Ok(None));
+    assert_eq!(calls, 1);
+    assert_eq!(Packet::receive_with(|_| Some(0)), Err(PacketError::Empty));
+    assert_eq!(Packet::receive_with(|_| Some(usize::MAX)),
+        Err(PacketError::TooLong { len: usize::MAX, max: MAX_PACKET_LEN }));
+}
+
 impl Wake for NoopWake {
     fn wake(self: Arc<Self>) {}
 }
@@ -424,4 +450,109 @@ fn packet_and_directional_handles_are_send_and_sync_without_payload_clone_bounds
         .map_err(|value| value.0)
         .unwrap();
     assert_eq!(receiver_clone.try_recv().unwrap().0, 7);
+}
+
+#[test]
+fn retained_ingress_survives_pressure_and_delivers_exactly_once() {
+    use vibeos_core::net::{flush_pending_ingress, IngressDelivery as D};
+    let endpoint = Endpoint::new("retained-rx", 1);
+    let mut space = CSpace::new("driver-rx");
+    let cap = space.mint(endpoint.clone(), Rights::SEND.union(Rights::REVOKE));
+    let token = space.lookup_revocable::<Endpoint<StampedPacket>>(cap, Rights::SEND).unwrap();
+    let mut fence = PacketSessionFence::new();
+    fence.attach_device().unwrap();
+    let stamp = fence.bind_stack(0).unwrap();
+    let blocker = StampedPacket::copy_from(&[0xa5; 64], stamp).unwrap();
+    endpoint.try_send(blocker.clone()).unwrap();
+    let expected = StampedPacket::copy_from(&frame(1514), stamp).unwrap();
+    let mut pending = Some(expected.clone());
+    for _ in 0..64 {
+        assert_eq!(flush_pending_ingress(&mut pending, &fence, &token), Ok(D::Backpressured));
+        assert_eq!(pending.as_ref(), Some(&expected));
+    }
+    assert_eq!(endpoint.try_recv(), Some(blocker));
+    assert_eq!(flush_pending_ingress(&mut pending, &fence, &token), Ok(D::Delivered));
+    assert!(pending.is_none());
+    assert_eq!(endpoint.try_recv(), Some(expected));
+    assert_eq!(flush_pending_ingress(&mut pending, &fence, &token), Ok(D::Empty));
+    assert!(endpoint.try_recv().is_none());
+}
+
+#[test]
+fn retained_ingress_cannot_cross_stack_rebind_device_reset_or_detach() {
+    use vibeos_core::net::{flush_pending_ingress, IngressDelivery as D};
+    for transition in 0..3 {
+        let endpoint = Endpoint::<StampedPacket>::new("stale-rx", 1);
+        let mut space = CSpace::new("driver-rx");
+        let cap = space.mint(endpoint.clone(), Rights::SEND);
+        let token = space.lookup_revocable::<Endpoint<StampedPacket>>(cap, Rights::SEND).unwrap();
+        let mut fence = PacketSessionFence::new();
+        fence.attach_device().unwrap();
+        let stamp = fence.bind_stack(0).unwrap();
+        let mut pending = Some(StampedPacket::copy_from(&frame(64), stamp).unwrap());
+        match transition {
+            0 => { fence.unbind_stack(); fence.bind_stack(0).unwrap(); }
+            1 => { fence.attach_device().unwrap(); fence.bind_stack(0).unwrap(); }
+            _ => fence.detach_device(),
+        }
+        assert_eq!(flush_pending_ingress(&mut pending, &fence, &token), Ok(D::Stale));
+        assert!(pending.is_none());
+        assert!(endpoint.try_recv().is_none());
+    }
+}
+
+#[test]
+fn retained_ingress_rechecks_revocation_before_retry_and_owner_can_discard() {
+    use vibeos_core::net::{flush_pending_ingress, IngressDelivery as D};
+    let endpoint = Endpoint::new("revoked-rx", 1);
+    let mut space = CSpace::new("driver-rx");
+    let cap = space.mint(endpoint.clone(), Rights::SEND.union(Rights::REVOKE));
+    let token = space.lookup_revocable::<Endpoint<StampedPacket>>(cap, Rights::SEND).unwrap();
+    let mut fence = PacketSessionFence::new();
+    fence.attach_device().unwrap();
+    let stamp = fence.bind_stack(0).unwrap();
+    endpoint.try_send(StampedPacket::copy_from(&frame(64), stamp).unwrap()).unwrap();
+    let expected = StampedPacket::copy_from(&frame(1514), stamp).unwrap();
+    let mut pending = Some(expected.clone());
+    assert_eq!(flush_pending_ingress(&mut pending, &fence, &token), Ok(D::Backpressured));
+    space.revoke(cap).unwrap();
+    endpoint.try_recv().unwrap();
+    assert_eq!(flush_pending_ingress(&mut pending, &fence, &token), Err(CapError::Invalid));
+    assert_eq!(pending, Some(expected));
+    drop(pending); // cancellation/fault owns and drops this bounded local frame
+    assert!(endpoint.try_recv().is_none());
+}
+
+#[test]
+fn fresh_ingress_uses_direct_delivery_then_transitions_to_retained_retry() {
+    use vibeos_core::net::{submit_ingress, flush_pending_ingress, IngressDelivery as D};
+    let endpoint = Endpoint::<StampedPacket>::new("direct-rx", 1);
+    let mut space = CSpace::new("direct-driver");
+    let cap = space.mint(endpoint.clone(), Rights::SEND.union(Rights::REVOKE));
+    let token = space.lookup_revocable::<Endpoint<StampedPacket>>(cap, Rights::SEND).unwrap();
+    let mut fence = PacketSessionFence::new();
+    fence.attach_device().unwrap();
+    let stamp = fence.bind_stack(0).unwrap();
+    let first = StampedPacket::copy_from(&frame(64), stamp).unwrap();
+    let second = StampedPacket::copy_from(&frame(1514), stamp).unwrap();
+    let mut pending = None;
+    assert_eq!(submit_ingress(first.clone(), &mut pending, &fence, &token), Ok(D::Delivered));
+    assert!(pending.is_none());
+    assert_eq!(submit_ingress(second.clone(), &mut pending, &fence, &token), Ok(D::Backpressured));
+    assert_eq!(pending, Some(second.clone()));
+    assert_eq!(endpoint.try_recv(), Some(first));
+    assert_eq!(flush_pending_ingress(&mut pending, &fence, &token), Ok(D::Delivered));
+    assert!(pending.is_none());
+    assert_eq!(endpoint.try_recv(), Some(second));
+    assert!(endpoint.try_recv().is_none());
+
+    fence.bind_stack(0).unwrap();
+    assert_eq!(submit_ingress(StampedPacket::copy_from(&frame(64), stamp).unwrap(),
+        &mut pending, &fence, &token), Ok(D::Stale));
+    assert!(pending.is_none());
+    space.revoke(cap).unwrap();
+    let fresh = fence.stamp_ingress(Packet::copy_from(&frame(64)).unwrap()).unwrap();
+    assert_eq!(submit_ingress(fresh, &mut pending, &fence, &token), Err(CapError::Invalid));
+    assert!(pending.is_none());
+    assert!(endpoint.try_recv().is_none());
 }

@@ -24,7 +24,7 @@ unsafe fn transport(slot: usize, base: usize) -> Option<MmioTransport> {
     let t = MmioTransport::probe_slot(Board::INFO.virtio_mmio?, slot)?;
     (t.base() == base && t.device_id() == 1).then_some(t)
 }
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_QUEUED_PACKET_DEVICE: Device = Device {
     dma_base: driver::dma_base,
     dma_size: driver::dma_size(),

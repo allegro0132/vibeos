@@ -48,7 +48,7 @@ unsafe fn transport(slot: usize, base: usize) -> Result<MmioTransport, Error> {
     }
     Ok(t)
 }
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_ENTROPY_DEVICE: EntropyDevice = EntropyDevice {
     discover: || unsafe {
         let endpoint = MmioTransport::scan_entropy(Board::INFO.virtio_mmio?)?.descriptor()?;

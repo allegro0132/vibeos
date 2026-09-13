@@ -56,6 +56,7 @@ impl<B: BlockIo> Partition<B> {
         self.hardware.diagnostics()
     }
 }
+#[cfg(feature = "sd-device")]
 impl<R: vibeos_driver_dw_mshc::Registers> BlockIo for vibeos_driver_dw_mshc::Card<R> {
     fn read(&mut self, sector: u64, output: &mut [u8]) -> Result<(), Error> {
         self.read_blocks(sector, output).map_err(Into::into)

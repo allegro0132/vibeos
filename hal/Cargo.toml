@@ -8,3 +8,6 @@ test = true
 
 [dev-dependencies]
 vibeos-driver-virtio-core = { path = "../drivers/virtio-core" }
+
+[features]
+runtime-platform = []

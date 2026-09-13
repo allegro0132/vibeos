@@ -64,7 +64,7 @@ const BLOCKS_PER_PAGE: u64 = (PAGE_SIZE / LOGICAL_BLOCK_SIZE) as u64;
 #[cfg(feature = "queued-block")]
 const MAX_PAGES_PER_REQUEST: usize =
     crate::virtio::BLOCK_MAX_TRANSFER_SIZE as usize / vibeos_segment_format::PAGE_SIZE;
-#[cfg(feature = "pio-block")]
+#[cfg(all(feature = "pio-block", not(feature = "universal")))]
 const MAX_PAGES_PER_REQUEST: usize = crate::sdhci_blk::MAX_TRANSFER_BLOCKS as usize
     * LOGICAL_BLOCK_SIZE
     / vibeos_segment_format::PAGE_SIZE;

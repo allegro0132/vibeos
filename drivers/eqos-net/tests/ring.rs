@@ -525,3 +525,38 @@ fn readonly_recycle_is_after_completion_before_own_and_never_initialization() {
     assert_eq!(state.borrow().events.iter().filter(|e| matches!(e,
         Event::Device(_, BUFFER, Direction::FromDevice))).count(), layout().count);
 }
+
+#[test]
+fn single_tx_sync_orders_payload_fields_own_flush_and_tail() {
+    let (mut r, s) = model();
+    r.set_single_tx_sync(true).unwrap();
+    r.initialize().unwrap();
+    assert_eq!(r.set_single_tx_sync(false), Err(Error::Controller));
+    s.borrow_mut().events.clear();
+    r.transmit(&[7; 60]).unwrap();
+    let d = layout().tx_descriptors;
+    let b = layout().tx_buffers;
+    assert_eq!(s.borrow().events, vec![
+        Event::Tx(b, 60), Event::Device(b, 64, Direction::ToDevice),
+        Event::Word(d, 0, b as u32), Event::Word(d, 1, 0),
+        Event::Word(d, 2, 60), Event::Word(d, 3, 0x3000003c),
+        Event::Barrier, Event::Word(d, 3, 0xb000003c),
+        Event::Device(d, 64, Direction::Bidirectional), Event::Barrier,
+        Event::Tail(false, d + 64),
+    ]);
+    // A still-owned TX slot cannot be overwritten, even in the faster mode.
+    for _ in 0..2 { r.transmit(&[8;60]).unwrap(); }
+    s.borrow_mut().events.clear();
+    assert_eq!(r.transmit(&[9;60]), Err(Error::Full));
+    assert!(!s.borrow().events.iter().any(|e| matches!(e, Event::Tx(..) | Event::Word(..))));
+    // RX retains its conservative two descriptor visibility operations.
+    let rx = layout().rx_descriptors;
+    s.borrow_mut().words.insert((rx, 3), 0x30000040);
+    s.borrow_mut().events.clear();
+    assert_eq!(r.receive(&mut [0;64]), Ok(Some(60)));
+    assert_eq!(s.borrow().events.iter().filter(|e| **e == Event::Device(rx,64,Direction::Bidirectional)).count(),2);
+    r.fault();
+    assert_eq!(r.set_single_tx_sync(false), Err(Error::Controller));
+    assert!(r.shutdown());
+    r.set_single_tx_sync(false).unwrap();
+}

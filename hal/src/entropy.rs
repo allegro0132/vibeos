@@ -81,11 +81,17 @@ pub struct EntropyDevice {
     pub confirmed_reset: unsafe fn(usize, usize, usize) -> bool,
     pub acknowledge: unsafe fn(usize) -> Events,
 }
+#[cfg(not(feature = "runtime-platform"))]
 extern "Rust" {
     static VIBEOS_ENTROPY_DEVICE: EntropyDevice;
 }
+#[cfg(not(feature = "runtime-platform"))]
 pub fn device() -> &'static EntropyDevice {
     unsafe { &VIBEOS_ENTROPY_DEVICE }
+}
+#[cfg(feature = "runtime-platform")]
+pub fn device() -> &'static EntropyDevice {
+    crate::runtime_platform::get().entropy.expect("firmware did not admit entropy")
 }
 
 /// Associates an opaque driver completion with a non-reused invocation token.

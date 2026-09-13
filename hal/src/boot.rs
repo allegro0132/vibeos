@@ -93,6 +93,7 @@ impl BootRequest {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct BootPlatform {
     /// Persistent logical device identity is image policy, not controller type.
     pub managed_block_id: core::num::NonZeroU128,
@@ -134,12 +135,18 @@ pub struct BootPlatform {
     pub ram_page_tables: unsafe fn() -> PageTableArena,
 }
 
+#[cfg(not(feature = "runtime-platform"))]
 extern "Rust" {
     static VIBEOS_BOOT_PLATFORM: BootPlatform;
 }
+#[cfg(not(feature = "runtime-platform"))]
 pub fn platform() -> &'static BootPlatform {
     // SAFETY: immutable storage defined once by the final firmware.
     unsafe { &VIBEOS_BOOT_PLATFORM }
+}
+#[cfg(feature = "runtime-platform")]
+pub fn platform() -> &'static BootPlatform {
+    crate::runtime_platform::get().platform
 }
 
 /// Page counts for an identity-mapped RAM span: one level-1 per GiB window

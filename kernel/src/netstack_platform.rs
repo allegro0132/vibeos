@@ -56,7 +56,7 @@ impl Platform for NetstackPlatform {
                 _ => NetworkBindError::Failed,
             });
         }
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         if let Ok(lease) =
             cspace.lookup_lease::<crate::usb_ecm_net::NetDevice>(control, Rights::INVOKE)
         {
@@ -87,7 +87,7 @@ impl Platform for NetstackPlatform {
                 rx_checksum_offload: crate::net_device::rx_checksum_offload(&info),
             });
         }
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         if let Ok(lease) =
             cspace.lookup_lease::<crate::usb_ecm_net::NetDevice>(control, Rights::READ)
         {

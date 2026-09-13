@@ -15,7 +15,7 @@ unsafe fn card() -> &'static mut AdaptiveCard {
         .as_mut()
         .expect("initialized PIO instance")
 }
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_PIO_BLOCK_DEVICE: PioBlockDevice = PioBlockDevice {
     resource_kind: "cv1800b-sdhci-mmio",
     name: "CV1800B SDIO0",

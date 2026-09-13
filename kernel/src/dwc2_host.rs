@@ -68,6 +68,8 @@ impl Controller {
 }
 
 pub fn init() -> Result<Info, Error> {
+    #[cfg(feature = "universal")]
+    if vibeos_hal::runtime_platform::get().polling_usb.is_none() { return Err(Error::NoDevice); }
     let mut published = CONTROLLER.lock();
     if let Some(controller) = published.as_ref() {
         return Ok(controller.info());

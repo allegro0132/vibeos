@@ -15,7 +15,7 @@ unsafe fn controller() -> &'static mut Controller {
         .as_mut()
         .expect("initialized polling USB host")
 }
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_POLLING_USB_HOST: Host = Host {
     initialize: |hz, time| unsafe {
         if let Some(c) = (*STATE.0.get()).as_ref() {

@@ -89,7 +89,7 @@ impl NetworkLocation {
     }
 }
 
-#[cfg(feature = "packet-network")]
+#[cfg(all(feature = "packet-network", not(feature = "universal")))]
 #[allow(unused_imports)]
 pub use crate::dwmac_net::{
     ack_packet, bind_stack_with, challenge_packet, debug_waiter_count, discover, driver_task,
@@ -98,7 +98,7 @@ pub use crate::dwmac_net::{
     HANDSHAKE_FRAME_LEN, PEER_MAC,
 };
 
-#[cfg(feature = "queued-network")]
+#[cfg(all(feature = "queued-network", not(feature = "universal")))]
 #[allow(unused_imports)]
 pub use crate::virtio_net::{
     ack_packet, bind_stack_with, challenge_packet, debug_waiter_count, discover, driver_task,
@@ -119,13 +119,13 @@ pub(crate) use crate::virtio_net::{
 /// while DWMAC publishes the actual PHY state. Keeping that distinction here
 /// prevents service adapters from depending on a board-specific `NetInfo`
 /// layout.
-#[cfg(feature = "queued-network")]
+#[cfg(all(feature = "queued-network", not(feature = "universal")))]
 #[allow(dead_code)]
 pub const fn carrier_up(_info: &NetInfo) -> bool {
     true
 }
 
-#[cfg(feature = "packet-network")]
+#[cfg(all(feature = "packet-network", not(feature = "universal")))]
 #[allow(dead_code)]
 pub const fn carrier_up(info: &NetInfo) -> bool {
     info.phy_link_up
@@ -133,22 +133,25 @@ pub const fn carrier_up(info: &NetInfo) -> bool {
 
 /// Report whether the selected physical backend completes IPv4/TCP/UDP
 /// checksums requested by its packet descriptors.
-#[cfg(feature = "queued-network")]
+#[cfg(all(feature = "queued-network", not(feature = "universal")))]
 pub const fn tx_checksum_offload(_info: &NetInfo) -> bool {
     false
 }
 
-#[cfg(feature = "packet-network")]
+#[cfg(all(feature = "packet-network", not(feature = "universal")))]
 pub const fn tx_checksum_offload(info: &NetInfo) -> bool {
     info.tx_checksum_offload
 }
 
-#[cfg(feature = "queued-network")]
+#[cfg(all(feature = "queued-network", not(feature = "universal")))]
 pub const fn rx_checksum_offload(_info: &NetInfo) -> bool {
     false
 }
 
-#[cfg(feature = "packet-network")]
+#[cfg(all(feature = "packet-network", not(feature = "universal")))]
 pub const fn rx_checksum_offload(info: &NetInfo) -> bool {
     info.rx_checksum_offload
 }
+
+#[cfg(feature = "universal")]
+pub use crate::universal_net::*;

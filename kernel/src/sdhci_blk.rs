@@ -25,10 +25,10 @@ use crate::world::Space;
 fn description() -> &'static vibeos_hal::block::PioBlockDevice {
     vibeos_hal::block::pio_device()
 }
-const DATA_SLICE: vibeos_image_policy::BlockSlice = match crate::platform::BLOCK_DATA_SLICE {
+fn data_slice() -> vibeos_image_policy::BlockSlice { match crate::platform::block_data_slice() {
     Some(slice) => slice,
     None => panic!("PIO firmware must select a data block slice"),
-};
+} }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlockError {
@@ -521,14 +521,14 @@ impl Card {
         let physical_capacity = hardware.info().capacity_sectors;
         let window = BlockWindow::new(
             physical_capacity,
-            DATA_SLICE.first_sector,
-            DATA_SLICE.sector_count,
+            data_slice().first_sector,
+            data_slice().sector_count,
         )
         .map_err(|_| BlockError::Unsupported)?;
         Ok(Self {
             hardware,
             window,
-            capacity_sectors: DATA_SLICE.sector_count,
+            capacity_sectors: data_slice().sector_count,
         })
     }
 

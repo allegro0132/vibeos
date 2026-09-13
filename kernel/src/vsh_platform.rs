@@ -6,7 +6,7 @@ use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
-#[cfg(feature = "milkv-duo")]
+#[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
 use core::fmt::Write as _;
 
 use vibeos_core::cap::{Cap, Rights};
@@ -99,17 +99,18 @@ pub async fn run_legacy_source(source: &str, session: &mut Session) {
 
 pub fn install_standard_commands(session: &mut Session) {
     #[cfg(feature = "wasi-preview1")]
-    crate::wasi::install(session);
+    if crate::platform::component_enabled("wasi") { crate::wasi::install(session); }
     install_shared_commands(session);
     vibeos_vsh::install_lsblk_command(session);
     #[cfg(feature = "file-tree")]
-    vibeos_vsh::install_file_commands(session);
+    if crate::platform::component_enabled("file-tree") { vibeos_vsh::install_file_commands(session); }
     #[cfg(feature = "provisioned-ssh")]
-    vibeos_vsh::install_async_commands(session, SSH_UART_MUTATION_COMMANDS);
+    if crate::platform::component_enabled("ssh") { vibeos_vsh::install_async_commands(session, SSH_UART_MUTATION_COMMANDS); }
 }
 
 #[cfg(feature = "file-tree")]
 pub async fn bind_persistent_file_tree(session: &mut Session) {
+    if !crate::platform::component_enabled("file-tree") { return; }
     const HOME_NAMESPACE: u128 = 0x5649_4245_4f53_2d46_494c_4554_5245_4501;
     let Some(storage) = world().storage_v2.clone() else {
         return;
@@ -156,12 +157,12 @@ pub async fn bind_persistent_file_tree(session: &mut Session) {
 /// Install commands shared by the physical console and authenticated SSH.
 fn install_shared_commands(session: &mut Session) {
     vibeos_vsh::install_commands(session, BASE_COMMANDS);
-    #[cfg(feature = "qemu-virt")]
-    vibeos_vsh::install_commands(session, QEMU_COMMANDS);
+    #[cfg(any(feature = "qemu-virt", feature = "universal-pci-usb"))]
+    if !cfg!(feature = "universal") || crate::platform::info().pci.is_some() { vibeos_vsh::install_commands(session, QEMU_COMMANDS); }
     #[cfg(feature = "pio-block")]
     vibeos_vsh::install_commands(session, PIO_STORAGE_COMMANDS);
-    #[cfg(feature = "milkv-duo")]
-    vibeos_vsh::install_commands(session, MILKV_USB_COMMANDS);
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
+    if !cfg!(feature = "universal") || crate::platform::info().dwc2.is_some() { vibeos_vsh::install_commands(session, MILKV_USB_COMMANDS); }
     #[cfg(any(
         feature = "tcp-echo",
         feature = "net-shell",
@@ -173,9 +174,9 @@ fn install_shared_commands(session: &mut Session) {
     ))]
     vibeos_vsh::install_commands(session, NETWORK_COMMANDS);
     #[cfg(feature = "provisioned-ssh")]
-    vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
+    if crate::platform::component_enabled("ssh") { vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS); }
     #[cfg(feature = "provisioned-ssh")]
-    vibeos_vsh::install_async_commands(session, SSH_OBJECT_COMMANDS);
+    if crate::platform::component_enabled("ssh") { vibeos_vsh::install_async_commands(session, SSH_OBJECT_COMMANDS); }
 }
 
 /// Install commands admitted to an authenticated public-key SSH session.
@@ -196,8 +197,8 @@ pub fn install_remote_commands(session: &mut Session) {
 /// with a client public key. It never receives the standard remote profile.
 #[cfg(feature = "provisioned-ssh")]
 pub fn install_ssh_onboarding_commands(session: &mut Session) {
-    vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS);
-    vibeos_vsh::install_async_commands(session, SSH_OBJECT_COMMANDS);
+    if crate::platform::component_enabled("ssh") { vibeos_vsh::install_commands(session, SSH_PROVISIONING_COMMANDS); }
+    if crate::platform::component_enabled("ssh") { vibeos_vsh::install_async_commands(session, SSH_OBJECT_COMMANDS); }
     vibeos_vsh::install_async_commands(session, SSH_REMOTE_MUTATION_COMMANDS);
 }
 
@@ -304,7 +305,7 @@ const BASE_COMMANDS: &[CommandSpec] = &[
     },
 ];
 
-#[cfg(feature = "qemu-virt")]
+#[cfg(any(feature = "qemu-virt", feature = "universal-pci-usb"))]
 const QEMU_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "pci",
@@ -336,7 +337,7 @@ const PIO_STORAGE_COMMANDS: &[CommandSpec] = &[
     },
 ];
 
-#[cfg(feature = "milkv-duo")]
+#[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
 const MILKV_USB_COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "lsusb",
@@ -429,7 +430,7 @@ fn vsh_mem(_args: &[String]) -> Result<String, Status> {
     Ok(output)
 }
 
-#[cfg(feature = "qemu-virt")]
+#[cfg(any(feature = "qemu-virt", feature = "universal-pci-usb"))]
 pub(crate) fn vsh_pci(_args: &[String]) -> Result<String, Status> {
     let mut output = String::from("BDF VID:DID CLASS IRQ BARS\n");
     for function in crate::pci::functions() {
@@ -453,7 +454,7 @@ pub(crate) fn vsh_pci(_args: &[String]) -> Result<String, Status> {
     Ok(output)
 }
 
-#[cfg(feature = "qemu-virt")]
+#[cfg(any(feature = "qemu-virt", feature = "universal-pci-usb"))]
 pub(crate) fn vsh_usb(args: &[String]) -> Result<String, Status> {
     use crate::xhci::DeviceKind;
 
@@ -531,7 +532,7 @@ pub(crate) fn vsh_usb(args: &[String]) -> Result<String, Status> {
     }
 }
 
-#[cfg(feature = "milkv-duo")]
+#[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
 fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
     let Some(snapshot) = crate::dwc2_host::snapshot() else {
         return Ok(String::from("DWC2 offline\n"));
@@ -733,7 +734,7 @@ fn vsh_lsusb(_args: &[String]) -> Result<String, Status> {
     Ok(output)
 }
 
-#[cfg(feature = "milkv-duo")]
+#[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
 fn vsh_milkv_usb(args: &[String]) -> Result<String, Status> {
     if args.first().is_some_and(|argument| argument == "net-rx") {
         if args.len() != 1 {

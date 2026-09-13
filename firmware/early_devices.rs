@@ -13,7 +13,7 @@ static PLIC: Plic<PlicMmio> = Plic::new(
     Board::INFO.plic.max_irq,
 );
 
-#[no_mangle]
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_EARLY_DEVICES: EarlyDevices = EarlyDevices {
     console: ConsoleOps {
         description: Board::INFO.uart,
@@ -34,19 +34,32 @@ pub static VIBEOS_EARLY_DEVICES: EarlyDevices = EarlyDevices {
     },
 };
 
+#[cfg(not(feature = "universal"))]
 use core::cell::UnsafeCell;
-use vibeos_hal::boot::{ram_page_table_pages, BootPlatform, PageTableArena};
+use vibeos_hal::boot::BootPlatform;
+#[cfg(not(feature = "universal"))]
+use vibeos_hal::boot::{ram_page_table_pages, PageTableArena};
 const _: () = {
     assert!(Board::MMU.device_level1_tables <= vibeos_hal::boot::MAX_DEVICE_LEVEL1_TABLES);
     assert!(Board::MMU.device_level0_tables <= vibeos_hal::boot::MAX_DEVICE_LEVEL0_TABLES);
 };
-const RAM_TABLE_PAGES: usize = ram_page_table_pages(Board::MMU.ram);
-#[repr(C, align(4096))]
-struct RamTables(UnsafeCell<[[u64; 512]; RAM_TABLE_PAGES]>);
-// SAFETY: only the kernel page-table owner accesses this static after boot.
-unsafe impl Sync for RamTables {}
-static RAM_TABLES: RamTables = RamTables(UnsafeCell::new([[0; 512]; RAM_TABLE_PAGES]));
-#[no_mangle]
+#[cfg(not(feature = "universal"))]
+mod ram_tables {
+    use super::*;
+    const RAM_TABLE_PAGES: usize = ram_page_table_pages(Board::MMU.ram);
+    #[repr(C, align(4096))]
+    struct RamTables(UnsafeCell<[[u64; 512]; RAM_TABLE_PAGES]>);
+    // SAFETY: only the kernel page-table owner accesses this static after boot.
+    unsafe impl Sync for RamTables {}
+    static RAM_TABLES: RamTables = RamTables(UnsafeCell::new([[0; 512]; RAM_TABLE_PAGES]));
+    pub(super) unsafe fn arena() -> PageTableArena {
+        PageTableArena {
+            base: RAM_TABLES.0.get() as usize,
+            pages: RAM_TABLE_PAGES,
+        }
+    }
+}
+#[cfg_attr(not(feature = "universal"), no_mangle)]
 pub static VIBEOS_BOOT_PLATFORM: BootPlatform = BootPlatform {
     managed_block_id: super::MANAGED_BLOCK_ID,
     network_driver_name: super::NETWORK_DRIVER_NAME,
@@ -63,8 +76,14 @@ pub static VIBEOS_BOOT_PLATFORM: BootPlatform = BootPlatform {
     prepare_reset: Board::PREPARE_RESET,
     early_platform_init: super::platform_init,
     platform_report: super::platform_report,
-    ram_page_tables: || PageTableArena {
-        base: RAM_TABLES.0.get() as usize,
-        pages: RAM_TABLE_PAGES,
+    ram_page_tables: {
+        #[cfg(not(feature = "universal"))]
+        {
+            ram_tables::arena
+        }
+        #[cfg(feature = "universal")]
+        {
+            crate::page_tables
+        }
     },
 };

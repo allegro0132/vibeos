@@ -10,6 +10,8 @@ pub fn init() -> Result<usize, Error> {
     unsafe { (host().init)() }
 }
 pub fn functions() -> Vec<Function> {
+    #[cfg(feature = "universal")]
+    if vibeos_hal::runtime_platform::get().pci.is_none() { return Vec::new(); }
     let _lock = PCI.lock();
     let mut functions = Vec::new();
     unsafe {

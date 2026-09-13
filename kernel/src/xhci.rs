@@ -34,6 +34,8 @@ impl From<vibeos_hal::usb::Error> for Error {
 }
 
 pub fn init() -> Result<Option<Info>, Error> {
+    #[cfg(feature = "universal")]
+    if vibeos_hal::runtime_platform::get().usb.is_none() { return Ok(None); }
     // Holding the composition lock across initialization prevents a retry from
     // manufacturing a second mutable reference to the permanent DMA storage.
     let mut published = CONTROLLER.lock();

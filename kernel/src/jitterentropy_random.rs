@@ -1,4 +1,4 @@
-//! Production random service for Milk-V Duo, seeded by jitterentropy-rs.
+//! Fallible timer entropy service using jitterentropy-rs and its health checks.
 
 extern crate alloc;
 
@@ -87,7 +87,7 @@ pub struct RandomSource {
     state: SpinLock<Option<ChaCha20Random<JitterSeeds>>>,
 }
 impl RandomSource {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             state: SpinLock::new(None),
         })
@@ -126,6 +126,10 @@ impl Resource for RandomSource {
         "random-source"
     }
     fn describe(&self) -> String {
+        #[cfg(feature = "universal")]
+        if vibeos_hal::runtime_platform::get().entropy_backend != vibeos_hal::runtime_platform::EntropyBackend::Jitter {
+            return String::from("virtio-rng [max 64 bytes]");
+        }
         String::from("jitterentropy-rs OSR=3 -> ChaCha20 DRBG [max 64 bytes]")
     }
     fn as_any(&self) -> &dyn Any {

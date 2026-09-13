@@ -941,11 +941,11 @@ compile_error!(
 );
 // Provider selection is distinct from enabling the reusable SSH service.
 // Queued sources must also pass firmware approval at endpoint discovery.
-#[cfg(all(feature = "jitter-entropy", not(feature = "milkv-duo")))]
+#[cfg(all(feature = "jitter-entropy", not(feature = "universal"), not(feature = "milkv-duo")))]
 compile_error!("jitter-entropy is restricted to the existing Duo configuration");
 #[cfg(all(feature = "provisioned-ssh", not(any(feature = "queued-entropy", feature = "jitter-entropy"))))]
 compile_error!("provisioned-ssh requires an explicitly selected entropy provider");
-#[cfg(all(feature = "jitter-entropy", feature = "queued-entropy"))]
+#[cfg(all(feature = "jitter-entropy", feature = "queued-entropy", not(feature = "universal")))]
 compile_error!("select exactly one entropy provider");
 #[cfg(all(feature = "queued-entropy", feature = "milkv-ssh-acceptance"))]
 compile_error!("queued entropy and the Duo deterministic acceptance source are mutually exclusive");
@@ -995,9 +995,9 @@ compile_error!(
 ))]
 compile_error!("feature `milkv-jitterentropy-probe` is an isolated UART qualification image");
 
-#[cfg(any(all(feature = "pio-block", feature = "queued-block"), not(any(feature = "pio-block", feature = "queued-block"))))]
+#[cfg(all(not(feature = "universal"), any(all(feature = "pio-block", feature = "queued-block"), not(any(feature = "pio-block", feature = "queued-block")))))]
 compile_error!("select exactly one block frontend: pio-block or queued-block");
-#[cfg(any(all(feature = "packet-network", feature = "queued-network"), not(any(feature = "packet-network", feature = "queued-network"))))]
+#[cfg(all(not(feature = "universal"), any(all(feature = "packet-network", feature = "queued-network"), not(any(feature = "packet-network", feature = "queued-network")))))]
 compile_error!("select exactly one network frontend: packet-network or queued-network");
 
 extern crate alloc;
@@ -1068,7 +1068,7 @@ mod net_echo_platform;
     feature = "dhcp-iperf3-server"
 ))]
 mod netstack_platform;
-#[cfg(feature = "qemu-virt")]
+#[cfg(any(feature = "qemu-virt", feature = "universal-pci-usb"))]
 mod pci;
 mod platform;
 mod plic;
@@ -1121,7 +1121,7 @@ pub use vibeos_ssh_identity as ssh_security;
 #[cfg(feature = "boot-dtb-probe")]
 mod boot_dtb_probe;
 mod block_device;
-#[cfg(feature = "milkv-duo")]
+#[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
 mod dwc2_host;
 #[cfg(feature = "packet-network")]
 mod packet_device;
@@ -1141,7 +1141,7 @@ mod trampoline;
 mod trap;
 mod tty;
 mod uart;
-#[cfg(feature = "milkv-duo")]
+#[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
 mod usb_ecm_net;
 #[cfg(feature = "queued-block")]
 mod queued_block;
@@ -1159,7 +1159,7 @@ mod entropy_device;
 mod virtio_rng;
 mod vsh_platform;
 mod world;
-#[cfg(feature = "qemu-virt")]
+#[cfg(any(feature = "qemu-virt", feature = "universal-pci-usb"))]
 mod xhci;
 
 use core::arch::global_asm;
@@ -1313,6 +1313,10 @@ const BANNER: &str = r#"
 
 #[no_mangle]
 pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
+    #[cfg(feature = "universal")] {
+        extern "C" { fn vibeos_select_platform(hart: usize, dtb: usize) -> bool; }
+        if !unsafe { vibeos_select_platform(_boot_hart, _firmware_dtb) } { sbi::shutdown(true); }
+    }
     uart::early_write("\r\n[VibeOS] entry\r\n");
     let boot_physical_hart = sbi::current_hart_id();
 
@@ -1434,7 +1438,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
         mmu::enabled_hart_mask()
     );
     #[cfg(all(
-        feature = "qemu-virt",
+        any(feature = "qemu-virt", feature = "universal-pci-usb"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1442,7 +1446,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
             feature = "wasm-c810-s5-simd-qemu-qualification"
         ))
     ))]
-    {
+    if platform::info().pci.is_some() {
         let functions = pci::init().expect("QEMU PCI resource assignment must succeed");
         println!(
             "  pci       {} function(s), ECAM {:#x}, MMIO {:#x}..{:#x}",
@@ -1463,7 +1467,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
         }
     }
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1487,7 +1491,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
         Err(error) => println!("  usb       DWC2 bring-up FAILED: {:?}", error),
     }
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1507,7 +1511,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
         );
     }
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1660,7 +1664,7 @@ fn start_services(boot_time: u64) -> ! {
     )))]
     world::start_net_supervisor();
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1680,7 +1684,7 @@ fn start_services(boot_time: u64) -> ! {
     ))]
     world::start_rng_supervisor();
     #[cfg(all(
-        feature = "qemu-virt",
+        any(feature = "qemu-virt", feature = "universal-pci-usb"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -1933,7 +1937,7 @@ fn start_services(boot_time: u64) -> ! {
         component_instances::run_native_async_revoke_worker(),
     );
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         not(any(
             feature = "wasm-c83-runtime-costs",
             feature = "wasm-c88-f5-float-qemu-acceptance",
@@ -2215,7 +2219,7 @@ unsafe fn reclaim_faulted_component(
         // visible to safe lifecycle callers.
         block_device::recover_faulted_domain(domain);
         net_device::recover_faulted_domain(domain);
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         usb_ecm_net::recover_faulted_domain(domain);
         #[cfg(feature = "queued-entropy")]
         virtio_rng::recover_faulted_domain(domain);
@@ -2367,3 +2371,8 @@ fn oom(layout: core::alloc::Layout) -> ! {
 
 #[cfg(feature = "wasmtime-native")]
 mod wasmtime_platform;
+
+#[cfg(feature = "universal")]
+mod universal_block;
+#[cfg(feature = "universal")]
+mod universal_net;

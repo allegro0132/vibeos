@@ -47,8 +47,10 @@ impl<R: Io + 'static, M: Memory, P: MdioPort> Engine<R, M, P> {
         layout: Layout,
         phy: Yt8531<P>,
     ) -> Result<Self, Error> {
+        let mut ring = Ring::new(backend, layout)?;
+        ring.set_single_tx_sync(cfg!(feature = "tx-single-sync-experiment"))?;
         Ok(Self {
-            ring: Ring::new(backend, layout)?,
+            ring,
             phy,
             link: None,
             faulted: false,

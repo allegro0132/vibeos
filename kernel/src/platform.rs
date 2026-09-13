@@ -75,3 +75,18 @@ pub fn reboot() {
     }
     crate::println!("  reboot failed: SBI returned {} and no hardware fallback is available", error);
 }
+
+pub fn block_data_slice() -> Option<vibeos_image_policy::BlockSlice> {
+    #[cfg(feature = "universal")] {
+        let f = vibeos_hal::runtime_platform::get();
+        (f.block_sector_count != 0).then_some(vibeos_image_policy::BlockSlice { first_sector: f.block_first_sector, sector_count: f.block_sector_count })
+    }
+    #[cfg(not(feature = "universal"))] { BLOCK_DATA_SLICE }
+}
+
+/// Compile-time legacy images enable their whole profile; universal images use
+/// the admitted board's resolved service set.
+pub fn component_enabled(id: &str) -> bool {
+    #[cfg(feature = "universal")] { vibeos_hal::runtime_platform::component_enabled(id) }
+    #[cfg(not(feature = "universal"))] { let _ = id; true }
+}

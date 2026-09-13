@@ -8,6 +8,7 @@ vibeos-component-admission = { path = "../../services/component-admission", opti
 vibeos-component-format = { path = "../../component-format" }
 
 [features]
+runtime-image = []
 default = ["qemu-default"]
 qemu-default = []
 milkv-duo-sd = []

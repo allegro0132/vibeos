@@ -160,9 +160,15 @@ pub struct Host {
     pub write_sector: unsafe fn(u64, &[u8; 512]) -> Result<(), Error>,
     pub service: unsafe fn() -> HidInputBatch,
 }
+#[cfg(not(feature = "runtime-platform"))]
 extern "Rust" {
     static VIBEOS_USB_HOST: Host;
 }
+#[cfg(not(feature = "runtime-platform"))]
 pub fn host() -> &'static Host {
     unsafe { &VIBEOS_USB_HOST }
+}
+#[cfg(feature = "runtime-platform")]
+pub fn host() -> &'static Host {
+    crate::runtime_platform::get().usb.expect("firmware did not admit usb")
 }

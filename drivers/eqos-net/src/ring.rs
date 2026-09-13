@@ -138,6 +138,7 @@ pub struct Ring<B: Backend + 'static> {
     pending: usize,
     receive: usize,
     rx_diagnostics: RxDiagnostics,
+    single_tx_sync: bool,
 }
 
 impl<B: Backend> Ring<B> {
@@ -154,7 +155,16 @@ impl<B: Backend> Ring<B> {
             pending: 0,
             receive: 0,
             rx_diagnostics: RxDiagnostics::default(),
+            single_tx_sync: false,
         })
+    }
+    /// Opt-in TX publication experiment; select only while proven offline.
+    /// Backend barriers must order all prior descriptor writes before OWN and
+    /// the final full-line cache operation must complete before tail MMIO.
+    pub fn set_single_tx_sync(&mut self, enabled: bool) -> Result<(), Error> {
+        if self.state != State::Offline { return Err(Error::Controller); }
+        self.single_tx_sync = enabled;
+        Ok(())
     }
     /// Release the backend only before first DMA start or after a successful
     /// shutdown. A running/quarantined ring retains exclusive pool ownership.
@@ -203,12 +213,16 @@ impl<B: Backend> Ring<B> {
         self.state = State::Running;
         Ok(())
     }
-    fn publish(&mut self, address: u64, words: [u32; 4]) {
+    fn publish(&mut self, address: u64, words: [u32; 4], prepare_visibility: bool) {
         for (index, value) in words.into_iter().enumerate() {
             self.backend.write_word(address, index, value);
         }
-        self.backend
-            .for_device(address, STRIDE, Direction::Bidirectional);
+        if prepare_visibility {
+            self.backend.for_device(address, STRIDE, Direction::Bidirectional);
+        }
+        // An owned descriptor must never become visible ahead of its fields.
+        // TX can flush the complete isolated line once after this release;
+        // the default/RX path also publishes unowned fields before release.
         self.backend.barrier();
         self.backend.write_word(address, 3, words[3] | OWN);
         self.backend
@@ -228,6 +242,7 @@ impl<B: Backend> Ring<B> {
         self.publish(
             self.layout.desc(true, index),
             descriptor::rx(buffer, BUFFER).unwrap(),
+            true,
         );
     }
     fn snapshot(&mut self, rx: bool, index: usize) -> [u32; 4] {
@@ -312,7 +327,7 @@ impl<B: Backend> Ring<B> {
         // Only the copied prefix can be consumed by DMA. Round to isolated
         // cache lines; keep descriptor ownership publication after this sync.
         self.backend.for_device(buffer, packet.len().div_ceil(STRIDE) * STRIDE, Direction::ToDevice);
-        self.publish(self.layout.desc(false, self.producer), words);
+        self.publish(self.layout.desc(false, self.producer), words, !self.single_tx_sync);
         self.pending += 1;
         self.producer = (self.producer + 1) % self.layout.count;
         self.backend

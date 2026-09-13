@@ -21,10 +21,12 @@ use vibeos_storage_device::{
     Operation, RangeInfo, RangeSession, WriteCache, WriteDurability,
 };
 
-#[cfg(feature = "pio-block")]
+#[cfg(all(feature = "pio-block", not(feature = "universal")))]
 use crate::sdhci_blk as backend;
-#[cfg(feature = "queued-block")]
+#[cfg(all(feature = "queued-block", not(feature = "universal")))]
 use crate::virtio_blk as backend;
+#[cfg(feature = "universal")]
+use crate::universal_block as backend;
 
 #[allow(unused_imports)]
 pub use backend::{
@@ -115,7 +117,7 @@ pub(crate) struct BlockResources {
 
 pub(crate) fn discover() -> Option<BlockResources> {
     let resources = backend::discover()?;
-    let slice = vibeos_image_policy::BLOCK_DATA_SLICE?;
+    let slice = crate::platform::block_data_slice()?;
     // The SDHCI backend already translates its provisioned physical partition
     // into a zero-based managed namespace. QEMU's managed image also starts at
     // logical zero. Partition offsets therefore never enter a client CSpace.
@@ -367,10 +369,15 @@ fn current_device_info() -> Result<DeviceInfo, BlockError> {
     }
     let session =
         DeviceSession::new(managed_device_id(), raw.session_epoch).map_err(map_contract_error)?;
-    #[cfg(feature = "queued-block")]
+    #[cfg(all(feature = "queued-block", not(feature = "universal")))]
     let max_transfer_blocks = vibeos_virtio_protocol::BLOCK_MAX_TRANSFER_BLOCKS;
-    #[cfg(feature = "pio-block")]
+    #[cfg(all(feature = "pio-block", not(feature = "universal")))]
     let max_transfer_blocks = backend::MAX_TRANSFER_BLOCKS;
+    #[cfg(feature = "universal")]
+    let max_transfer_blocks = match vibeos_hal::runtime_platform::get().block_backend {
+        vibeos_hal::runtime_platform::BlockBackend::Pio => crate::sdhci_blk::MAX_TRANSFER_BLOCKS,
+        _ => vibeos_virtio_protocol::BLOCK_MAX_TRANSFER_BLOCKS,
+    };
     let geometry = DeviceGeometry::new(
         512,
         None,

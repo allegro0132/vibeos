@@ -137,7 +137,7 @@ enum ComponentTemplate {
     Guest,
     BlockDriver,
     NetDriver,
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     UsbEcmNetDriver,
     #[cfg(feature = "queued-entropy")]
     VirtioRng,
@@ -182,7 +182,7 @@ enum ComponentGrants {
         inbound: Cap,
         control: Cap,
     },
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     UsbEcmNetDriver {
         transport: Cap,
         outbound: Cap,
@@ -553,15 +553,15 @@ pub struct World {
         feature = "dhcp-iperf3-server"
     ))]
     network_stack_roots: Vec<NetworkStackRoot>,
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     usb_net_policy: Option<Arc<Space>>,
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     usb_net_transport: Option<Cap>,
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     usb_net_outbound_root: Option<Cap>,
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     usb_net_inbound_root: Option<Cap>,
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     usb_net_control_root: Option<Cap>,
     #[cfg(any(
         feature = "tcp-echo",
@@ -628,6 +628,13 @@ struct StoreBlockGrants {
 }
 
 impl World {
+    fn listener_policy(&self) -> Option<&Arc<Space>> {
+        #[cfg(all(feature = "universal", feature = "universal-dwc2"))]
+        { self.net_policy.as_ref().or(self.usb_net_policy.as_ref()) }
+        #[cfg(not(all(feature = "universal", feature = "universal-dwc2")))]
+        { self.net_policy.as_ref() }
+    }
+
     /// Hand the C7.4 supervisor its already-provisioned journal endpoint
     /// through init's explicit store authority. The acceptance task receives
     /// no `Cap`, CSpace, object name, or durable identity; it can only request
@@ -807,8 +814,7 @@ impl World {
             let mut target = space.0.lock();
             let listener = {
                 let policy = self
-                    .net_policy
-                    .as_ref()
+                    .listener_policy()
                     .expect("network policy CSpace exists")
                     .0
                     .lock();
@@ -1040,7 +1046,7 @@ impl World {
             };
         }
 
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         if template == ComponentTemplate::UsbEcmNetDriver {
             let policy = self
                 .usb_net_policy
@@ -1103,8 +1109,7 @@ impl World {
         #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
         if template == ComponentTemplate::TcpEcho {
             let policy = self
-                .net_policy
-                .as_ref()
+                .listener_policy()
                 .expect("network policy CSpace exists");
             let policy = policy.0.lock();
             let mut target = space.0.lock();
@@ -1126,8 +1131,7 @@ impl World {
         #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
         if template == ComponentTemplate::Iperf3Server {
             let policy = self
-                .net_policy
-                .as_ref()
+                .listener_policy()
                 .expect("network policy CSpace exists");
             let policy = policy.0.lock();
             let mut target = space.0.lock();
@@ -1179,7 +1183,7 @@ impl World {
             ComponentTemplate::NetDriver => {
                 unreachable!("network grants come from the private policy CSpace")
             }
-            #[cfg(feature = "milkv-duo")]
+            #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
             ComponentTemplate::UsbEcmNetDriver => {
                 unreachable!("USB network grants come from the private policy CSpace")
             }
@@ -1275,7 +1279,7 @@ impl World {
                     net_device::driver_task(space.get(), mmio, dma, outbound, inbound, control),
                 )
             },
-            #[cfg(feature = "milkv-duo")]
+            #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
             ComponentGrants::UsbEcmNetDriver {
                 transport,
                 outbound,
@@ -1779,7 +1783,7 @@ pub fn start_net_supervisor() {
 /// Restart the USB ECM frontend independently from both DWC2 host service and
 /// the native DWMAC component. Synchronous class transactions leave no DMA
 /// ownership behind when this component faults.
-#[cfg(feature = "milkv-duo")]
+#[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
 pub fn start_usb_net_supervisor() {
     let world = world();
     let Some(component) = world.component_named("usb-ecm-net") else {
@@ -1967,10 +1971,10 @@ pub fn build() {
     let net_policy = net_resources
         .as_ref()
         .map(|_| Space::new("virtio-net-policy"));
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     let usb_net_resources = crate::usb_ecm_net::discover();
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         any(
             feature = "tcp-echo",
             feature = "net-shell",
@@ -1984,19 +1988,22 @@ pub fn build() {
     let usb_net_location = usb_net_resources
         .as_ref()
         .map(|resources| resources.location);
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     let usb_net_space = usb_net_resources
         .as_ref()
         .map(|_| Space::new("usb-ecm-net"));
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     let usb_net_policy = usb_net_resources
         .as_ref()
         .map(|_| Space::new("usb-ecm-net-policy"));
+    let service_policy = net_policy.clone();
+    #[cfg(all(feature = "universal", feature = "universal-dwc2"))]
+    let service_policy = service_policy.or_else(|| usb_net_policy.clone());
     #[cfg(feature = "queued-entropy")]
     let rng_resources = virtio_rng::discover();
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+    #[cfg(all(any(feature = "milkv-duo", feature = "universal-dwc2"), feature = "milkv-ssh-acceptance"))]
     let rng_resources = Some(vibeos_kernel_acceptance::ssh_acceptance_rng::provision());
-    #[cfg(all(feature = "jitter-entropy", feature = "provisioned-ssh"))]
+    #[cfg(all(feature = "jitter-entropy", feature = "provisioned-ssh", not(feature = "universal")))]
     let rng_resources = crate::jitterentropy_random::provision().ok();
     #[cfg(feature = "queued-entropy")]
     let rng_space = rng_resources.as_ref().map(|_| Space::new("virtio-rng"));
@@ -2004,14 +2011,20 @@ pub fn build() {
     let rng_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("virtio-rng-policy"));
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+    #[cfg(all(any(feature = "milkv-duo", feature = "universal-dwc2"), feature = "milkv-ssh-acceptance"))]
     let rng_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("ssh-acceptance-random-policy"));
-    #[cfg(all(feature = "jitter-entropy", feature = "provisioned-ssh"))]
+    #[cfg(all(feature = "jitter-entropy", feature = "provisioned-ssh", not(feature = "universal")))]
     let rng_policy = rng_resources
         .as_ref()
         .map(|_| Space::new("ssh-random-policy"));
+    #[cfg(all(feature = "universal", feature = "jitter-entropy", feature = "provisioned-ssh"))]
+    let jitter_resources = if vibeos_hal::runtime_platform::get().entropy_backend == vibeos_hal::runtime_platform::EntropyBackend::Jitter {
+        crate::jitterentropy_random::provision().ok()
+    } else { None };
+    #[cfg(all(feature = "universal", feature = "jitter-entropy", feature = "provisioned-ssh"))]
+    let rng_policy = if jitter_resources.is_some() { Some(Space::new("ssh-random-policy")) } else { rng_policy };
     #[cfg(feature = "ssh-security-test")]
     let ssh_security_test_space = rng_resources
         .as_ref()
@@ -2021,7 +2034,11 @@ pub fn build() {
         .as_ref()
         .zip(rng_resources.as_ref())
         .map(|_| Space::new("ssh-test"));
-    #[cfg(feature = "provisioned-ssh")]
+    #[cfg(all(feature = "universal", feature = "provisioned-ssh"))]
+    let ssh_production_space = if service_policy.is_some() && rng_policy.is_some() && vibeos_hal::runtime_platform::component_enabled("ssh") {
+        Some(Space::new("sshd"))
+    } else { None };
+    #[cfg(all(feature = "provisioned-ssh", not(feature = "universal")))]
     let ssh_production_space = net_resources
         .as_ref()
         .zip(rng_resources.as_ref())
@@ -2043,12 +2060,12 @@ pub fn build() {
         feature = "iperf3-server",
         feature = "dhcp-iperf3-server"
     ))]
-    #[cfg(not(feature = "milkv-duo"))]
+    #[cfg(not(any(feature = "milkv-duo", feature = "universal-dwc2")))]
     let ipv4_stack_space = net_resources
         .as_ref()
         .map(|_| Space::new(crate::netstack_platform::COMPONENT_NAME));
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         any(
             feature = "tcp-echo",
             feature = "net-shell",
@@ -2062,11 +2079,11 @@ pub fn build() {
     let ipv4_stack_space = (net_resources.is_some() || usb_net_resources.is_some())
         .then(|| Space::new(crate::netstack_platform::COMPONENT_NAME));
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
-    let tcp_echo_app_space = net_resources
+    let tcp_echo_app_space = service_policy
         .as_ref()
         .map(|_| Space::new("tcp-echo-service"));
     #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
-    let iperf3_app_space = net_resources.as_ref().map(|_| Space::new("iperf3-server"));
+    let iperf3_app_space = service_policy.as_ref().map(|_| Space::new("iperf3-server"));
     let store_backend = block_resources
         .as_ref()
         .map(|_| Space::new("store-backend"));
@@ -2485,7 +2502,7 @@ pub fn build() {
         (None, None, None) => (None, None, None, None, None, None, None, None, None),
         _ => unreachable!("network resources and CSpaces are constructed together"),
     };
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     let (
         usb_net_transport_root,
         usb_net_outbound_root,
@@ -2544,7 +2561,7 @@ pub fn build() {
         feature = "iperf3-server",
         feature = "dhcp-iperf3-server"
     ))]
-    let tcp_listener_root = net_policy.as_ref().map(|policy_space| {
+    let tcp_listener_root = service_policy.as_ref().filter(|_| !cfg!(feature = "provisioned-ssh") || crate::platform::component_enabled("ssh")).map(|policy_space| {
         let listener_label = if cfg!(any(
             feature = "ssh-test",
             feature = "milkv-ssh-acceptance",
@@ -2594,7 +2611,7 @@ pub fn build() {
         policy_space.0.lock().mint(listener, Rights::ALL_VOLATILE)
     });
     #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
-    let iperf_data_listener_root = net_policy.as_ref().map(|policy_space| {
+    let iperf_data_listener_root = service_policy.as_ref().map(|policy_space| {
         let listener = vibeos_net_api::TcpListener::new_shared(
             "iperf3-data",
             vibeos_net_api::TcpListenerId::new(2).expect("listener identity is non-zero"),
@@ -2642,9 +2659,16 @@ pub fn build() {
                 )
             }
             (None, None, None) => (None, None, None, None),
+            #[cfg(feature = "universal")]
+            (None, None, Some(_)) => (None, None, None, None),
             _ => unreachable!("entropy resources and CSpaces are constructed together"),
         };
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+    #[cfg(all(feature = "universal", feature = "jitter-entropy", feature = "provisioned-ssh"))]
+    let rng_source_root = match jitter_resources {
+        Some(resources) => Some(rng_policy.as_ref().expect("jitter policy").0.lock().mint(resources.source, Rights::ALL)),
+        None => rng_source_root,
+    };
+    #[cfg(all(any(feature = "milkv-duo", feature = "universal-dwc2"), feature = "milkv-ssh-acceptance"))]
     let rng_source_root = match (rng_resources, rng_policy.as_ref()) {
         (Some(resources), Some(policy_space)) => {
             let mut policy = policy_space.0.lock();
@@ -2653,7 +2677,7 @@ pub fn build() {
         (None, None) => None,
         _ => unreachable!("acceptance entropy resource and policy are constructed together"),
     };
-    #[cfg(all(feature = "jitter-entropy", feature = "provisioned-ssh"))]
+    #[cfg(all(feature = "jitter-entropy", feature = "provisioned-ssh", not(feature = "universal")))]
     let rng_source_root = match (rng_resources, rng_policy.as_ref()) {
         (Some(resources), Some(policy_space)) => {
             Some(policy_space.0.lock().mint(resources.source, Rights::ALL))
@@ -2723,7 +2747,7 @@ pub fn build() {
     });
     #[cfg(any(feature = "ssh-test", feature = "milkv-ssh-acceptance"))]
     let ssh_test_grants = ssh_test_space.as_ref().map(|test_space| {
-        let network = net_policy
+        let network = service_policy
             .as_ref()
             .expect("SSH test requires the network policy")
             .0
@@ -2782,7 +2806,7 @@ pub fn build() {
     });
     #[cfg(feature = "provisioned-ssh")]
     let ssh_production_grants = ssh_production_space.as_ref().map(|target_space| {
-        let network = net_policy
+        let network = service_policy
             .as_ref()
             .expect("SSH requires network policy")
             .0
@@ -2860,7 +2884,7 @@ pub fn build() {
         });
     }
     #[cfg(all(
-        feature = "milkv-duo",
+        any(feature = "milkv-duo", feature = "universal-dwc2"),
         any(
             feature = "tcp-echo",
             feature = "net-shell",
@@ -2885,7 +2909,16 @@ pub fn build() {
             outbound,
             inbound,
             control,
-            listeners: vibeos_netstack::no_tcp_listeners(),
+            listeners: {
+                #[cfg(all(feature = "universal", any(feature = "iperf3-server", feature = "dhcp-iperf3-server")))]
+                { if net_policy.is_none() {
+                    vibeos_netstack::two_tcp_listeners(tcp_listener_root.expect("USB control listener"), iperf_data_listener_root.expect("USB data listener"))
+                } else { vibeos_netstack::no_tcp_listeners() } }
+                #[cfg(all(feature = "universal", not(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))))]
+                { if net_policy.is_none() { tcp_listener_root.map_or_else(vibeos_netstack::no_tcp_listeners, vibeos_netstack::one_tcp_listener) } else { vibeos_netstack::no_tcp_listeners() } }
+                #[cfg(not(feature = "universal"))]
+                { vibeos_netstack::no_tcp_listeners() }
+            },
         });
     }
     #[cfg(any(
@@ -2928,7 +2961,7 @@ pub fn build() {
         .map(|space| grant_network_stack(&network_stack_roots, space));
     #[cfg(any(feature = "tcp-echo", feature = "net-shell"))]
     let tcp_echo_app_grant = match (
-        net_policy.as_ref(),
+        service_policy.as_ref(),
         tcp_echo_app_space.as_ref(),
         tcp_listener_root,
     ) {
@@ -2953,7 +2986,7 @@ pub fn build() {
     };
     #[cfg(any(feature = "iperf3-server", feature = "dhcp-iperf3-server"))]
     let iperf3_app_grants = match (
-        net_policy.as_ref(),
+        service_policy.as_ref(),
         iperf3_app_space.as_ref(),
         tcp_listener_root,
         iperf_data_listener_root,
@@ -3074,11 +3107,11 @@ pub fn build() {
     if let Some(space) = net_policy.as_ref() {
         spaces.insert("virtio-net-policy", space.clone());
     }
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     if let Some(space) = usb_net_space.as_ref() {
         spaces.insert("usb-ecm-net", space.clone());
     }
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     if let Some(space) = usb_net_policy.as_ref() {
         spaces.insert("usb-ecm-net-policy", space.clone());
     }
@@ -3090,7 +3123,7 @@ pub fn build() {
     if let Some(space) = rng_policy.as_ref() {
         spaces.insert("virtio-rng-policy", space.clone());
     }
-    #[cfg(all(feature = "milkv-duo", feature = "milkv-ssh-acceptance"))]
+    #[cfg(all(any(feature = "milkv-duo", feature = "universal-dwc2"), feature = "milkv-ssh-acceptance"))]
     if let Some(space) = rng_policy.as_ref() {
         spaces.insert("ssh-acceptance-random-policy", space.clone());
     }
@@ -3156,7 +3189,7 @@ pub fn build() {
     // used to infer whether its driver or IPv4/SSH service was discovered.
     let expected_boot_components = 4 + usize::from(block_space.is_some())
         + usize::from(net_space.is_some());
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     let expected_boot_components = expected_boot_components + usize::from(usb_net_space.is_some());
     #[cfg(feature = "queued-entropy")]
     let expected_boot_components = expected_boot_components + usize::from(rng_space.is_some());
@@ -3221,15 +3254,15 @@ pub fn build() {
             feature = "dhcp-iperf3-server"
         ))]
         network_stack_roots,
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         usb_net_policy,
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         usb_net_transport: usb_net_transport_root,
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         usb_net_outbound_root,
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         usb_net_inbound_root,
-        #[cfg(feature = "milkv-duo")]
+        #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
         usb_net_control_root,
         #[cfg(any(
             feature = "tcp-echo",
@@ -3330,7 +3363,7 @@ pub fn build() {
         );
     }
 
-    #[cfg(feature = "milkv-duo")]
+    #[cfg(any(feature = "milkv-duo", feature = "universal-dwc2"))]
     if let (Some(space), Some((transport, outbound, inbound, control))) =
         (usb_net_space, usb_net_grants)
     {

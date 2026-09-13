@@ -10,6 +10,14 @@ v0.1 boots on RISC-V under QEMU and gives you an interactive shell.
      \_/  |_||_.__/ \___/ \____/|____/   v0.1
 ```
 
+## Configure a universal image
+
+Run `./configure.sh` to choose boards, drivers and built-in components, then
+`./build.sh` to resolve dependencies and build one kernel for the selected boards.
+Use `./run.sh --config vibeos.toml` to run that image under QEMU.
+See [the configuration guide](docs/CONFIGURATION.md) for presets, artifact checks
+and Duo/Mars packaging.
+
 ## Documents
 
 - **[docs/BLUEPRINT.md](docs/BLUEPRINT.md)** — architecture, the four bets, the

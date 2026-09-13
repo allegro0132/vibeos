@@ -319,6 +319,61 @@ impl PacketSessionFence {
     }
 }
 
+/// Outcome of retrying the driver's single retained ingress frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressDelivery { Empty, Delivered, Backpressured, Stale }
+
+/// Submit a fresh frame directly; retain it only if the endpoint is full.
+/// The caller serializes session changes through this operation and must not
+/// receive another frame while `pending` is occupied. A failed authority check
+/// retires the fresh frame; the driver must terminate that invocation.
+#[inline]
+pub fn submit_ingress(
+    packet: StampedPacket,
+    pending: &mut Option<StampedPacket>,
+    sessions: &PacketSessionFence,
+    endpoint: &crate::cap::Revocable<Endpoint<StampedPacket>>,
+) -> Result<IngressDelivery, crate::cap::CapError> {
+    assert!(pending.is_none(), "pending ingress must drain before fresh receive");
+    if Some(packet.stamp()) != sessions.active_stamp() {
+        return Ok(IngressDelivery::Stale);
+    }
+    endpoint.try_with(|queue| match queue.try_send(packet) {
+        Ok(()) => IngressDelivery::Delivered,
+        Err(packet) => {
+            *pending = Some(packet);
+            IngressDelivery::Backpressured
+        }
+    })
+}
+
+/// Retry without cloning, allocating, or changing the frame's original stamp.
+/// The caller must serialize session changes with this complete operation.
+/// Revocation is checked at each invocation; on failure the owner retains the
+/// frame until its fault/cancellation cleanup. Full queues retain it for the
+/// next driver turn.
+pub fn flush_pending_ingress(
+    pending: &mut Option<StampedPacket>,
+    sessions: &PacketSessionFence,
+    endpoint: &crate::cap::Revocable<Endpoint<StampedPacket>>,
+) -> Result<IngressDelivery, crate::cap::CapError> {
+    let Some(packet) = pending.as_ref() else { return Ok(IngressDelivery::Empty); };
+    if Some(packet.stamp()) != sessions.active_stamp() {
+        *pending = None;
+        return Ok(IngressDelivery::Stale);
+    }
+    endpoint.try_with(|queue| {
+        let packet = pending.take().expect("checked pending ingress");
+        match queue.try_send(packet) {
+            Ok(()) => IngressDelivery::Delivered,
+            Err(packet) => {
+                *pending = Some(packet);
+                IngressDelivery::Backpressured
+            }
+        }
+    })
+}
+
 /// Why bytes could not be converted into a [`Packet`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PacketError {
@@ -404,6 +459,25 @@ impl Packet {
         };
         let result = write(&mut packet.bytes[..len]);
         Ok((packet, result))
+    }
+
+    /// Receive directly into owned storage when the frame length is known only
+    /// after the producer runs. `None` publishes no packet; invalid reported
+    /// lengths are rejected. Bytes outside the reported frame are cleared even
+    /// if the producer touched them, preserving the packet tail invariant.
+    #[inline]
+    pub fn receive_with(
+        receive: impl FnOnce(&mut [u8]) -> Option<usize>,
+    ) -> Result<Option<Self>, PacketError> {
+        let mut packet = Self { bytes: [0; MAX_PACKET_LEN], len: 0 };
+        let Some(len) = receive(&mut packet.bytes) else { return Ok(None); };
+        if len == 0 { return Err(PacketError::Empty); }
+        if len > Self::MAX_LEN {
+            return Err(PacketError::TooLong { len, max: Self::MAX_LEN });
+        }
+        packet.bytes[len..].fill(0);
+        packet.len = len as u16;
+        Ok(Some(packet))
     }
 
     /// Number of meaningful frame bytes.

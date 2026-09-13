@@ -39,6 +39,7 @@ pub struct EarlyDevices {
     pub interrupts: InterruptControllerOps,
 }
 
+#[cfg(not(feature = "runtime-platform"))]
 extern "Rust" {
     static VIBEOS_EARLY_DEVICES: EarlyDevices;
 }
@@ -46,9 +47,14 @@ extern "Rust" {
 /// Firmware must define the immutable table and retain its instances for the
 /// entire boot. Linking without a firmware composition fails, rather than
 /// silently selecting a hardware backend inside the kernel.
+#[cfg(not(feature = "runtime-platform"))]
 pub fn early_devices() -> &'static EarlyDevices {
     // SAFETY: a single final firmware provides the immutable Rust static.
     unsafe { &VIBEOS_EARLY_DEVICES }
+}
+#[cfg(feature = "runtime-platform")]
+pub fn early_devices() -> &'static EarlyDevices {
+    crate::runtime_platform::get().early
 }
 
 /// Retire metadata for an owner that cannot resume, without running a driver

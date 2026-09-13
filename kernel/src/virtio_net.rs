@@ -40,6 +40,7 @@ const HELLO_PAYLOAD: &[u8] = b"VIBEOS-NET-HELLO-v1";
 const CHALLENGE_PAYLOAD: &[u8] = b"VIBEOS-NET-CHALLENGE-v1";
 const ACK_PAYLOAD: &[u8] = b"VIBEOS-NET-ACK-v1";
 
+#[cfg(not(feature = "universal"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NetError {
     Offline,
@@ -56,6 +57,7 @@ pub enum NetError {
     IdentityExhausted,
 }
 
+#[cfg(not(feature = "universal"))]
 impl core::fmt::Display for NetError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
@@ -75,6 +77,7 @@ impl core::fmt::Display for NetError {
     }
 }
 
+#[cfg(not(feature = "universal"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetInfo {
     pub online: bool,
@@ -153,8 +156,10 @@ impl Resource for DmaRegion {
 
 /// Client-visible control and status authority. Packet transfer itself uses
 /// the two directional `Endpoint<StampedPacket>` capabilities.
+#[cfg(not(feature = "universal"))]
 pub struct NetDevice;
 
+#[cfg(not(feature = "universal"))]
 impl NetDevice {
     fn new() -> Arc<Self> {
         Arc::new(Self)
@@ -191,7 +196,41 @@ impl NetDevice {
         }
     }
 }
+#[cfg(feature = "universal")]
+pub(crate) fn universal_info() -> NetInfo {
+        let control = CONTROL.lock();
+        NetInfo {
+            online: control.online,
+            quarantined: control.quarantined,
+            queue_size: NET_QUEUE_SIZE,
+            header_size: NET_HEADER_SIZE,
+            accepted_features: control.features.map_or(0, |features| features.accepted()),
+            session_epoch: control.sessions.device_epoch(),
+            stack_generation: control
+                .sessions
+                .active_stamp()
+                .map_or(0, PacketStamp::stack_generation),
+            irq: control.transport.map_or(0, MmioTransport::irq),
+            used_interrupts: USED_INTERRUPT_COUNT.load(Ordering::Acquire),
+            rx_packets: RX_PACKET_COUNT.load(Ordering::Acquire),
+            tx_packets: TX_PACKET_COUNT.load(Ordering::Acquire),
+            stale_ingress_drops: STALE_INGRESS_DROPS.load(Ordering::Acquire),
+            stale_egress_drops: STALE_EGRESS_DROPS.load(Ordering::Acquire),
+            stale_egress_device_epoch_drops: STALE_EGRESS_DEVICE_EPOCH_DROPS
+                .load(Ordering::Acquire),
+            stale_egress_stack_generation_drops: STALE_EGRESS_STACK_GENERATION_DROPS
+                .load(Ordering::Acquire),
+            resets: RESET_COUNT.load(Ordering::Acquire),
+            timeouts: TIMEOUT_COUNT.load(Ordering::Acquire),
+            rx_inflight: control.rx_inflight,
+            tx_inflight: control.tx_inflight,
+            ethernet_address: GUEST_MAC,
+            phy_link_up: true,
+            ..NetInfo::default()
+        }
+    }
 
+#[cfg(not(feature = "universal"))]
 impl Resource for NetDevice {
     fn kind(&self) -> &'static str {
         "network-device"
@@ -1017,3 +1056,6 @@ pub unsafe fn recover_faulted_domain(domain: AllocationDomain) {
 pub fn debug_waiter_count() -> usize {
     IRQ_WAIT.waiter_count()
 }
+
+#[cfg(feature = "universal")]
+pub use crate::universal_net::{NetError, NetInfo, NetDevice};

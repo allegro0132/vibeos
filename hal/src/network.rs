@@ -49,11 +49,17 @@ pub struct Device {
     pub shutdown: unsafe fn() -> bool,
     pub recover: unsafe fn() -> bool,
 }
+#[cfg(not(feature = "runtime-platform"))]
 extern "Rust" {
     static VIBEOS_PACKET_DEVICE: Device;
 }
+#[cfg(not(feature = "runtime-platform"))]
 pub fn device() -> &'static Device {
     unsafe { &VIBEOS_PACKET_DEVICE }
+}
+#[cfg(feature = "runtime-platform")]
+pub fn device() -> &'static Device {
+    crate::runtime_platform::get().packet.expect("firmware did not admit packet")
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

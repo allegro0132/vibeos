@@ -26,9 +26,15 @@ pub struct Host {
     pub reset: unsafe fn(Descriptor, usize) -> bool,
     pub acknowledge: unsafe fn(Descriptor) -> u32,
 }
+#[cfg(not(feature = "runtime-platform"))]
 extern "Rust" {
     static VIBEOS_DEVICE_TRANSPORT: Host;
 }
+#[cfg(not(feature = "runtime-platform"))]
 pub fn host() -> &'static Host {
     unsafe { &VIBEOS_DEVICE_TRANSPORT }
+}
+#[cfg(feature = "runtime-platform")]
+pub fn host() -> &'static Host {
+    crate::runtime_platform::get().transport.expect("firmware did not admit transport")
 }

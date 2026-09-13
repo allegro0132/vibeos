@@ -54,7 +54,8 @@ AUTHORITY_HEADER_LEN = 0x80
 AUTHORITY_OBJECT_LEN = 0x30
 AUTHORITY_PRINCIPAL_LEN = 0x40
 AUTHORITY_EXTERNAL_ROOT_LEN = 0x20
-MAX_AUTHORITY_BYTES = 256 * PAGE
+MAX_AUTHORITY_BYTES = 16_384 * PAGE
+MAX_AUTHORITY_RECORDS = (MAX_AUTHORITY_BYTES - AUTHORITY_HEADER_LEN) // BLOCK
 MAX_PRINCIPALS = 256
 EXTERNAL_POLICY = b"vibeos.storage-v2.external-policy.v1\0persistent-space=0x5053,slot=0,generation=0,rights=rgx,kind=0x43535043\0program-space=0x50524f47,slot=0,generation=0,rights=r,kind=0x50524731\0sealed-singleton-optional=0x53534801"
 PERSISTENT_SPACE = 0x5053
@@ -76,6 +77,7 @@ FS_ROOT_LEN = 0xB0
 FS_NODE_HEADER_LEN = 0x40
 FS_ENTRY_HEADER_LEN = 0x30
 FS_DATA_HEADER_LEN = 0x40
+FS_DATA_CHUNK_MAX_LEN = 4 * 1024 * 1024
 FS_REFERENCE_LEN = 0x28
 
 
@@ -305,24 +307,10 @@ def canonical_m4_stream(image: bytes | bytearray) -> tuple[bytes, Any]:
     return bytes(records), state
 
 
-def recover_record_stream(record_stream: bytes) -> Any:
-    require(
-        record_stream
-        and len(record_stream) % BLOCK == 0
-        and len(record_stream) <= M4_COUNT * BLOCK,
-        "persistent authority record stream length is invalid",
+def recover_record_stream(record_stream: bytes, *, expected_store_id: int = legacy_codec.STORE_ID) -> Any:
+    state = legacy_codec.recover_record_stream(
+        record_stream, max_records=MAX_AUTHORITY_RECORDS, allow_external=True, expected_store_id=expected_store_id,
     )
-    journal = bytearray((M4_FIRST + M4_COUNT) * BLOCK)
-    for index in range(0, len(record_stream), BLOCK):
-        sector = record_stream[index:index + BLOCK]
-        require(
-            legacy_codec.decode_sector(sector, M4_FIRST + index // BLOCK)
-            is not None,
-            "persistent authority record stream contains a non-canonical record",
-        )
-        at = M4_FIRST * BLOCK + index
-        journal[at:at + BLOCK] = sector
-    state = legacy_codec.recover(bytes(journal))
     require(state.formatted, "persistent authority record stream is not formatted")
     return state
 
@@ -590,12 +578,14 @@ class AuthorityPolicy:
 
     external_policy: bytes
     exact_objects: Callable[[Any], dict[int, tuple[int, bytes, int]]]
+    store_id: int = legacy_codec.STORE_ID
 
     def __post_init__(self) -> None:
         require(
             isinstance(self.external_policy, bytes) and bool(self.external_policy),
             "external authority policy must be non-empty immutable bytes",
         )
+        require(isinstance(self.store_id, int) and 0 < self.store_id < 1 << 128, "invalid authority store identity")
         require(callable(self.exact_objects), "exact authority selector is not callable")
 
 
@@ -1005,12 +995,118 @@ def parse_checkpoint_allocation(
     return allocation, version
 
 
+def resolve_authority_payload(resolver, pointer, label, maximum=MAX_AUTHORITY_BYTES):
+    """Authenticate each extent and assemble one bounded authority generation."""
+    require(pointer.get("status") == "value" and pointer["exact_byte_len"] <= maximum,
+            f"{label} first extent exceeds remaining payload budget")
+    first, first_payload = resolver.resolve(pointer, gc_verifier.EXTENT_AUTHORITY, label)
+    require(first["extent_index"] == 0 and first["encoded_offset"] == 0,
+            f"{label} must start at extent zero")
+    count = first["extent_count"]
+    require(0 < count <= MAX_AUTHORITY_BYTES // storage_codec.PAGE_SIZE,
+            f"{label} extent count exceeds budget")
+    require(0 < first["encoded_blob_len"] <= maximum,
+            f"{label} payload exceeds budget")
+    generation = first["binding"]["target_checkpoint_generation"]
+    entries = [(first, first_payload, pointer)]
+    consumed = len(first_payload)
+    if count > 1:
+        for segment in resolver.segments:
+            number = segment["segment_no"]
+            if number >= resolver.checkpoint["record"]["admitted_segments"]:
+                continue
+            if resolver.allocation["states"][number] != gc_verifier.SEGMENT_ALLOCATED:
+                continue
+            # An allocated segment participates in the search and must be sealed.
+            require(segment.get("status") == "sealed", f"{label} unsealed allocated segment")
+            for framed in segment.get("extents", []):
+                extent = framed.get("record", {})
+                binding = extent.get("binding", {})
+                if (extent.get("extent_kind") != gc_verifier.EXTENT_AUTHORITY
+                        or binding.get("target_checkpoint_generation") != generation):
+                    continue
+                sibling = {
+                    "status": "value", "store_uuid": binding["store_uuid"],
+                    "segment_no": number, "segment_generation": binding["generation"],
+                    "descriptor_relative_page": binding["self_page"] - storage_codec.segment_base_page(number),
+                    "payload_relative_page": extent["payload_first_relative_page"],
+                    "payload_pages": extent["payload_pages"], "ordinal": binding["ordinal"],
+                    "exact_byte_len": extent["payload_byte_len"],
+                    "extent_kind": gc_verifier.EXTENT_AUTHORITY,
+                    "payload_sha256": extent["payload_sha256"],
+                }
+                if storage_codec.pointer_identity(sibling) == storage_codec.pointer_identity(pointer):
+                    continue
+                require(len(entries) < count, f"{label} excess matching extents")
+                require(sibling["exact_byte_len"] <= maximum - consumed,
+                        f"{label} cumulative payload exceeds budget")
+                verified, payload = resolver.resolve(sibling, gc_verifier.EXTENT_AUTHORITY, label)
+                consumed += len(payload)
+                entries.append((verified, payload, sibling))
+    require(len(entries) == count, f"{label} missing extents")
+    entries.sort(key=lambda entry: entry[0]["extent_index"])
+    total = 0
+    for index, (extent, payload, _) in enumerate(entries):
+        require(extent["extent_index"] == index and extent["extent_count"] == count,
+                f"{label} duplicate or inconsistent extent index/count")
+        require(all(extent[key] == first[key] for key in
+                    ("object_kind", "content_byte_len", "encoded_blob_len", "merkle_root")),
+                f"{label} inconsistent extent metadata")
+        require(extent["encoded_offset"] == total == index * first["payload_byte_len"],
+                f"{label} noncontiguous extent offsets")
+        require(hashlib.sha256(payload).digest() == extent["payload_sha256"],
+                f"{label} extent digest mismatch")
+        total += len(payload)
+        require(total <= maximum, f"{label} cumulative payload exceeds budget")
+    require(total == first["encoded_blob_len"] == first["content_byte_len"],
+            f"{label} logical length mismatch")
+    payload = b"".join(entry[1] for entry in entries)
+    require(hashlib.sha256(payload).digest() == first["merkle_root"],
+            f"{label} complete payload digest mismatch")
+    return first, payload, [entry[2] for entry in entries]
+
+
+def reconstruct_experimental_authority(resolver, payload, target_generation, context, generation, store_id):
+    """Opt-in delta-chain verification; every ancestor extent resolves on media."""
+    codec = load_module("authority-delta-codec.py", "vibeos_image_delta_codec")
+    pending = []
+    pointers = []
+    seen = set()
+    consumed = len(payload)
+    while payload.startswith(b"VIBEAUL1"):
+        require(len(payload) >= 256 and len(pending) < 32, "experimental delta depth/length")
+        require(codec.integer(payload, 120) == target_generation, "delta extent generation mismatch")
+        pointer_bytes = payload[16:112]
+        pointer = storage_codec.parse_pointer(pointer_bytes)
+        identity = storage_codec.pointer_identity(pointer) if pointer.get("status") == "value" else None
+        require(identity is not None and identity not in seen, "delta null/cyclic predecessor")
+        seen.add(identity)
+        pending.append((payload, pointer_bytes))
+        extent, payload, parts = resolve_authority_payload(resolver, pointer,
+            "experimental authority ancestor", maximum=MAX_AUTHORITY_BYTES - consumed)
+        pointers.extend(parts)
+        target_generation = extent["binding"]["target_checkpoint_generation"]
+        consumed += len(payload)
+        require(consumed <= MAX_AUTHORITY_BYTES, "experimental chain payload budget")
+    require(codec.integer(payload, 16) == target_generation, "base extent generation mismatch")
+    depth = 0
+    for link, pointer_bytes in reversed(pending):
+        try:
+            payload = codec.reconstruct(payload, link, pointer_bytes, depth,
+                **context, checkpoint_generation=generation, expected_store_id=store_id)
+        except ValueError as error:
+            raise Violation(str(error)) from error
+        depth += 1
+    return payload, pointers, depth
+
+
 def reconstruct_v2_checkpoint(
     region: memoryview,
     structural: dict[str, Any],
     *,
     require_authority: bool,
     authority_policy: AuthorityPolicy = DEFAULT_AUTHORITY_POLICY,
+    allow_experimental_delta: bool = False,
 ) -> dict[str, Any]:
     checkpoint = structural["checkpoint"]
     require(checkpoint is not None, "V2 has no selected checkpoint")
@@ -1083,27 +1179,24 @@ def reconstruct_v2_checkpoint(
     authority_generation = 0
     authority_state = None
     authority_objects: dict[int, tuple[int, bytes, int]] = {}
+    authority_ancestors = []
+    authority_depth = 0
     if authority_pointer["status"] == "value":
-        authority_extent, authority_payload = resolver.resolve(
-            authority_pointer,
-            gc_verifier.EXTENT_AUTHORITY,
-            "persistent authority root",
-            metadata=True,
-        )
-        require(
-            hashlib.sha256(authority_payload).digest()
-            == authority_pointer["payload_sha256"],
-            "V2 authority payload digest mismatch",
-        )
+        authority_extent, authority_payload, authority_parts = resolve_authority_payload(
+            resolver, authority_pointer, "persistent authority root")
+        authority_ancestors.extend(authority_parts[1:])
         authority_generation = authority_extent["binding"]["target_checkpoint_generation"]
         require(authority_generation <= generation, "V2 authority targets a future checkpoint")
+        if authority_payload.startswith(b"VIBEAUL1"):
+            require(allow_experimental_delta, "experimental authority delta admission is disabled")
+            authority_payload, delta_ancestors, authority_depth = reconstruct_experimental_authority(
+                resolver, authority_payload, authority_generation, context, generation, authority_policy.store_id)
+            authority_ancestors.extend(delta_ancestors)
         authority = parse_authority_snapshot(
             authority_payload,
             authority_generation,
             authority_policy=authority_policy,
         )
-        authority_state = recover_record_stream(authority["record_stream"])
-        authority_objects = authority_policy.exact_objects(authority_state)
     else:
         require(
             authority_pointer["status"] == "null" and not require_authority,
@@ -1116,19 +1209,20 @@ def reconstruct_v2_checkpoint(
     if authority_pointer["status"] == "value":
         add_physical_pointer(physical_pointers, authority_pointer, "persistent authority root")
 
+    for ancestor in authority_ancestors:
+        add_physical_pointer(physical_pointers, ancestor, "experimental authority ancestor")
+
     objects: dict[int, dict[str, Any]] = {}
     blobs: dict[tuple[int, int, int, bytes], dict[str, Any]] = {}
     snapshot_generation = 0
     catalog_pointer = record["catalog_root"]
     if catalog_pointer["status"] == "value":
-        # The CAS delta ABI is frozen for a later milestone, but the current
-        # production VIBECAS2 mount path publishes and accepts only one dense
-        # snapshot.  A powered-off verifier must never accept a state the
-        # kernel itself would reject.
+        # Production emits the frozen CAS delta chain (one minted object per
+        # delta) within the superblock replay budget; the mount path replays
+        # it under the same rules enforced below.
         require(
-            record["replay_count"] == 0
-            and record["replay_tail"]["status"] == "null",
-            "current VIBECAS2 production requires a compact snapshot",
+            record["replay_count"] <= record["max_replay_records"],
+            "VIBECAS2 replay chain exceeds the superblock budget",
         )
         add_physical_pointer(physical_pointers, catalog_pointer, "CAS snapshot root")
         catalog_extent, catalog_payload = resolver.resolve(
@@ -1198,9 +1292,11 @@ def reconstruct_v2_checkpoint(
     previous_generation = snapshot_generation
     previous_object = max(objects, default=0)
     for delta in reversed(reverse_deltas):
+        # One checkpoint may append several deltas: generations never
+        # decrease along the chain, and the snapshot root precedes them all.
         require(
-            delta["checkpoint_generation"] > previous_generation,
-            "CAS replay generations are not strictly increasing",
+            delta["checkpoint_generation"] >= previous_generation,
+            "CAS replay generations decrease along the chain",
         )
         previous_generation = delta["checkpoint_generation"]
         obj = delta["object"]
@@ -1286,6 +1382,12 @@ def reconstruct_v2_checkpoint(
             bytes(encoded), blob["blob_key"]
         )
 
+    if authority is not None:
+        authority_state = recover_record_stream(authority["record_stream"], expected_store_id=authority_policy.store_id)
+        authority_objects = select_verified_authority_objects(
+            authority_state, contents, authority_policy
+        )
+
     roots = [] if authority is None else [
         {
             "object_id": binding["v2_object_id"],
@@ -1298,6 +1400,7 @@ def reconstruct_v2_checkpoint(
     return {
         "checkpoint_generation": generation,
         "authority_generation": authority_generation,
+        "experimental_authority_depth": authority_depth,
         "store_uuid": context["store_uuid"].hex(),
         "authority_sha256": (
             hashlib.sha256(authority_payload).hexdigest()
@@ -1483,8 +1586,9 @@ def validate_checkpoint_allocation_transition(
             newer_root["status"] == "value"
             and newer_root != older_root
             and newer_root["segment_no"] in allocate
-            and newer_root["segment_generation"]
-            == older_allocation["next_segment_generation"],
+            and older_allocation["next_segment_generation"]
+            <= newer_root["segment_generation"]
+            < newer_allocation["next_segment_generation"],
             "allocation-v1 G+1 conversion is not carried by its fresh segment",
         )
     old_retired = older_allocation["retired"]
@@ -1515,6 +1619,7 @@ def verify_v2_checkpoint_fallbacks(
     selected_recovered: dict[str, Any],
     *,
     authority_policy: AuthorityPolicy = DEFAULT_AUTHORITY_POLICY,
+    allow_experimental_delta: bool = False,
 ) -> int:
     slots = v2_checkpoint_slots(region)
     sealed = sorted(
@@ -1544,6 +1649,7 @@ def verify_v2_checkpoint_fallbacks(
                 candidate_structural,
                 require_authority=False,
                 authority_policy=authority_policy,
+                allow_experimental_delta=allow_experimental_delta,
             )
     if len(sealed) == 2:
         older, newer = sealed
@@ -1825,7 +1931,7 @@ def parse_fs_data(payload: bytes) -> dict[str, Any]:
     ancestor_count = u16(payload, 0x24)
     require(ancestor_count == chunk_index.bit_length(), "FsDataV1 ancestor count is invalid")
     bytes_at = FS_DATA_HEADER_LEN + ancestor_count * FS_REFERENCE_LEN
-    require(bytes_at + bytes_len == len(payload) and bytes_len <= PAGE, "FsDataV1 body length is invalid")
+    require(bytes_at + bytes_len == len(payload) and bytes_len <= FS_DATA_CHUNK_MAX_LEN, "FsDataV1 body length is invalid")
     ancestors = [
         parse_fs_reference(
             payload[FS_DATA_HEADER_LEN + index * FS_REFERENCE_LEN:FS_DATA_HEADER_LEN + (index + 1) * FS_REFERENCE_LEN],
@@ -2001,6 +2107,23 @@ def verify_file_tree(v2: dict[str, Any], require_present: bool) -> dict[str, Any
         "tree_nodes": len(inode_nodes | dirent_nodes),
         "data_nodes": len(content_cache),
     }
+
+
+def select_verified_authority_objects(state: Any, contents: dict, policy: AuthorityPolicy) -> dict:
+    """Materialize external records only from fully verified canonical CAS blobs."""
+    resolved_external = set()
+    for stable_id, (length, root) in state.external_objects.items():
+        kind, _, sequence = state.objects[stable_id]
+        content = contents.get((1, kind, length, root))
+        if content is not None:
+            state.objects[stable_id] = (kind, content, sequence)
+            resolved_external.add(stable_id)
+    selected = policy.exact_objects(state)
+    require(
+        (set(selected) & set(state.external_objects)) <= resolved_external,
+        "selected external journal object has no verified CAS content",
+    )
+    return selected
 
 
 def verify_authority_bindings(v2: dict[str, Any], require_file_tree: bool = False) -> dict[str, Any]:
@@ -2379,6 +2502,148 @@ def fixture() -> bytearray:
     return image
 
 
+def extended_authority_stream_selftest() -> int:
+    codec = legacy_codec
+    records = []
+    crc = 0
+    for index in range(513):
+        kind = codec.FORMAT if index == 0 else codec.HIGH_WATER
+        payload = b"" if index == 0 else index.to_bytes(16, "little")
+        raw = codec.encode_record(kind, payload, index + 1, index, crc, 0)
+        crc = codec.u32(raw, codec.CRC_OFFSET)
+        records.append(raw)
+    stream = b"".join(records)
+    recovered = recover_record_stream(stream)
+    require(recovered.high_water == 512, "extended authority stream was truncated")
+    fixed = bytes(M4_FIRST * BLOCK) + stream
+    require(codec.recover(fixed).high_water == 511,
+            "logical stream support changed the fixed M4 disk boundary")
+    cases = 2
+    damaged = bytearray(stream)
+    damaged[-BLOCK + codec.CRC_OFFSET] ^= 1
+    for bad in [b"", stream[:-1], bytes(damaged),
+                b"".join(records[:-2] + [records[-1], records[-2]]),
+                stream + records[-1]]:
+        try:
+            recover_record_stream(bad)
+        except (Violation, ValueError):
+            cases += 1
+        else:
+            raise Violation("invalid extended authority stream was accepted")
+    try:
+        codec.recover_record_stream(stream, max_records=512, allow_external=True)
+    except ValueError:
+        cases += 1
+    else:
+        raise Violation("logical stream record budget was ignored")
+    require(codec.recover_record_stream(stream, max_records=513,
+                                        allow_external=True).high_water == 512,
+            "exact logical stream budget was rejected")
+    return cases + 1
+
+
+def external_record_selftest() -> int:
+    codec = legacy_codec
+    payload = bytearray(64)
+    payload[:16] = (2).to_bytes(16, "little")
+    struct.pack_into("<I", payload, 16, 123)
+    content = b"external payload"
+    struct.pack_into("<Q", payload, 24, len(content))
+    root = gc_verifier.canonical_blob_root(123, content)
+    payload[32:] = root
+
+    def records(value: bytes, duplicate: bool = False) -> list[bytes]:
+        result = []
+        crc = 0
+        items = [(codec.FORMAT, b"", 0), (codec.HIGH_WATER, (10).to_bytes(16, "little"), 0),
+                 (codec.OBJECT_EXTERNAL, value, 1)]
+        if duplicate:
+            items.append((codec.OBJECT_EXTERNAL, value, 3))
+        for index, (kind, data, tx) in enumerate(items):
+            raw = codec.encode_record(kind, data, index + 1, index, crc, tx)
+            crc = codec.u32(raw, codec.CRC_OFFSET)
+            result.append(raw)
+        return result
+
+    stream = b"".join(records(bytes(payload)))
+    state = recover_record_stream(stream)
+    require(state.external_objects == {2: (len(content), root)}, "external identity drifted")
+    require(state.objects[2][1] == b"", "journal invented external bytes")
+    select_all = AuthorityPolicy(b"external-test", lambda state: dict(state.objects))
+    require(select_verified_authority_objects(state, {(1, 123, len(content), root): content},
+                                             select_all)[2][1] == content,
+            "verified external content was not materialized")
+    cases = 1
+    complete = records(bytes(payload))
+    baseline = codec.recover(codec.image_with(complete[:2]), allow_external=True)
+    for cut in range(BLOCK):
+        partial = codec.recover(codec.image_with(complete[:2], complete[2][:cut]),
+                                allow_external=True)
+        require(partial.fingerprint() == baseline.fingerprint(),
+                "partial external record published an object")
+        cases += 1
+    # Absent or mismatched CAS identities may never materialize a selected object.
+    for contents in ({}, {(1, 124, len(content), root): content},
+                     {(1, 123, len(content) + 1, root): content},
+                     {(1, 123, len(content), bytes(32)): content}):
+        try:
+            select_verified_authority_objects(recover_record_stream(stream), contents, select_all)
+        except Violation:
+            cases += 1
+        else:
+            raise Violation("missing external content was accepted")
+    # Retired/unselected history need not retain its payload after GC.
+    require(not select_verified_authority_objects(recover_record_stream(stream), {},
+                AuthorityPolicy(b"unselected", lambda state: {})), "unselected history gained authority")
+    try:
+        codec.recover(codec.image_with(records(bytes(payload))))
+    except ValueError:
+        cases += 1
+    else:
+        raise Violation("legacy recovery silently accepted external bytes")
+    malformed = []
+    for offset, data in [(16, bytes(4)), (20, b"\x01"), (24, bytes(8)),
+                         (24, (64 * 1024 * 1024 + 1).to_bytes(8, "little")),
+                         (32, bytes(32)), (0, (10).to_bytes(16, "little")),
+                         (0, (1).to_bytes(16, "little"))]:
+        bad = bytearray(payload)
+        bad[offset:offset + len(data)] = data
+        malformed.append(records(bytes(bad)))
+    malformed.append(records(bytes(payload), duplicate=True))
+    for bad in malformed:
+        try:
+            recover_record_stream(b"".join(bad))
+        except ValueError:
+            cases += 1
+        else:
+            raise Violation("invalid external record was accepted")
+    return cases
+
+
+def fs_data_length_selftest() -> int:
+    def payload(size: int) -> bytes:
+        encoded = bytearray(FS_DATA_HEADER_LEN + size)
+        encoded[:8] = b"VIBEFSD1"
+        struct.pack_into("<HHIQQIH", encoded, 8, 1, FS_DATA_HEADER_LEN,
+                         len(encoded), 0, size, size, 0)
+        return bytes(encoded)
+
+    cases = 0
+    for size in [0, PAGE, PAGE + 1, 128 * 1024, FS_DATA_CHUNK_MAX_LEN]:
+        require(len(parse_fs_data(payload(size))["bytes"]) == size,
+                "valid multi-page FsDataV1 rejected")
+        cases += 1
+    for malformed in [payload(FS_DATA_CHUNK_MAX_LEN + 1), payload(PAGE + 1)[:-1],
+                      payload(0) + b"x"]:
+        try:
+            parse_fs_data(malformed)
+        except ValueError:
+            cases += 1
+        else:
+            raise AssertionError("invalid FsDataV1 length accepted")
+    return cases
+
+
 def selftest() -> dict[str, Any]:
     image = fixture()
     unmanaged_prefix_baseline = bytes(image[:M4_FIRST * BLOCK])
@@ -2391,7 +2656,7 @@ def selftest() -> dict[str, Any]:
     )
     old = parse_control(page_at(image, CONTROL_FIRST, 0), page_at(image, CONTROL_FIRST, 1))
     body, seal = encode_control(STAGED, 2)
-    cases = 1
+    cases = 1 + external_record_selftest() + extended_authority_stream_selftest() + fs_data_length_selftest()
     for length in range(PAGE + 1):
         candidate = parse_control(body[:length] + bytes(PAGE - length), bytes(PAGE))
         require(select_control([old, candidate])["generation"] == 1, "body prefix selected V2")
@@ -2849,6 +3114,26 @@ def selftest() -> dict[str, Any]:
         cases += 1
     else:
         raise Violation("allocation-v1 G+1 conversion used a stale carrier")
+
+    # A large first authority publication can consume multiple fresh segments
+    # before writing its allocation payload. The carrier need not be first.
+    multiple_allocation = dict(newer_allocation)
+    multiple_allocation["states"] = [gc_verifier.SEGMENT_ALLOCATED] * 6 + [gc_verifier.SEGMENT_FREE] * 2
+    multiple_allocation["next_segment_generation"] = 7
+    for carrier in [allocation_pointer(4, 5), allocation_pointer(5, 6)]:
+        multiple_checkpoint = allocation_checkpoint(4, 3, 7, carrier)
+        validate_checkpoint_allocation_transition(older_checkpoint, multiple_checkpoint,
+            older_allocation, multiple_allocation, older_version, newer_version)
+        cases += 1
+    for carrier in [allocation_pointer(5, 4), allocation_pointer(5, 7), allocation_pointer(3, 6)]:
+        try:
+            validate_checkpoint_allocation_transition(older_checkpoint,
+                allocation_checkpoint(4, 3, 7, carrier), older_allocation,
+                multiple_allocation, older_version, newer_version)
+        except Violation:
+            cases += 1
+        else:
+            raise Violation("multi-segment v1 conversion accepted a stale or out-of-range carrier")
 
     # A persistent-authority-only publication may reuse a catalog snapshot
     # from an older checkpoint, while the catalog extent remains an exact

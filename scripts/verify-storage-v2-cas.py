@@ -355,7 +355,9 @@ def parse_blob_manifest(payload: bytes, context: dict[str, Any]) -> dict[str, An
     require(encoded_blob_len == geometry["encoded_len"], "Blob manifest encoded Blob length is not canonical")
 
     content_extent_count = (key["exact_len"] + CANONICAL_CONTENT_EXTENT_LEN - 1) // CANONICAL_CONTENT_EXTENT_LEN
-    require(count == content_extent_count + 2, "Blob manifest extent count is not canonical")
+    # Compact layout: one extent carries the complete canonical encoding.
+    compact = count == 1 and encoded_blob_len <= CANONICAL_CONTENT_EXTENT_LEN
+    require(compact or count == content_extent_count + 2, "Blob manifest extent count is not canonical")
 
     extents = []
     expected_offset = 0
@@ -375,7 +377,9 @@ def parse_blob_manifest(payload: bytes, context: dict[str, Any]) -> dict[str, An
         require(extent["extent_index"] == index, f"Blob manifest extent[{index}] index is invalid")
         require(extent["extent_count"] == count, f"Blob manifest extent[{index}] count is invalid")
         require(extent["encoded_offset"] == expected_offset, f"Blob manifest extent[{index}] leaves a gap or overlap")
-        if index == 0:
+        if compact:
+            canonical_len = encoded_blob_len
+        elif index == 0:
             canonical_len = BLOB_HEADER_LEN
         elif index <= content_extent_count:
             canonical_len = min(
@@ -552,7 +556,7 @@ def reconstruct_cas(
     previous_generation = snapshot_generation
     previous_object = max(objects, default=0)
     for delta in reversed(reverse_deltas):
-        require(delta["checkpoint_generation"] > previous_generation, "CAS delta generations are not increasing")
+        require(delta["checkpoint_generation"] >= previous_generation, "CAS delta generations decrease along the chain")
         previous_generation = delta["checkpoint_generation"]
         obj = delta["object"]
         require(obj["object_id"] > previous_object, "CAS delta object IDs are not increasing")

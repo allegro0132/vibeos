@@ -303,7 +303,8 @@ fn format_admits_the_allocation_v2_maximum_and_rejects_max_plus_one_before_writi
     let maximum_store = format(maximum_device, generous, 2);
     let info = maximum_store.info().unwrap();
     assert_eq!(info.admitted_segments, maximum);
-    assert_eq!(info.recovery_peak_bytes, maximum.div_ceil(4) as usize);
+    // Successful cached recovery reserves the complete optional proof memo.
+    assert_eq!(info.recovery_peak_bytes, maximum.div_ceil(4) as usize + 64 * 1024);
 
     let oversized = FaultDevice::blank(maximum + 1);
     let mut refused = SegmentStore::new(oversized.clone(), generous);
@@ -811,13 +812,33 @@ fn dense_recovery_reports_and_enforces_its_memory_ceiling() {
     );
     assert_eq!(exact_info.recovery_peak_bytes, info.recovery_peak_bytes);
 
-    let too_small = StoreLimits {
+    // A smaller budget may drop the optional memo, not reject the image.
+    let fallback_limit = StoreLimits {
         recovery_memory_bytes: info.recovery_peak_bytes - 1,
         ..limits
     };
+    let (_, fallback_info) = mount(
+        FaultDevice::from_durable(device.page_count(), image.clone()), fallback_limit);
+    assert_eq!(fallback_info.object_count, info.object_count);
+    assert_eq!(fallback_info.replay_count, info.replay_count);
+    assert!(fallback_info.recovery_peak_bytes <= fallback_limit.recovery_memory_bytes);
+
+    // Disable the 64 KiB memo entirely to measure the mandatory workspace.
+    let uncached_limit = StoreLimits { recovery_memory_bytes: 64 * 1024 - 1, ..limits };
+    let (_, uncached_info) = mount(
+        FaultDevice::from_durable(device.page_count(), image.clone()), uncached_limit);
+    assert!(uncached_info.recovery_peak_bytes < uncached_limit.recovery_memory_bytes);
+    let exact_required = StoreLimits {
+        recovery_memory_bytes: uncached_info.recovery_peak_bytes, ..limits
+    };
+    let (_, exact_required_info) = mount(
+        FaultDevice::from_durable(device.page_count(), image.clone()), exact_required);
+    assert_eq!(exact_required_info.object_count, info.object_count);
+    assert_eq!(exact_required_info.replay_count, info.replay_count);
+    assert_eq!(exact_required_info.recovery_peak_bytes, uncached_info.recovery_peak_bytes);
     let mut refused = SegmentStore::new(
         FaultDevice::from_durable(device.page_count(), image),
-        too_small,
+        StoreLimits { recovery_memory_bytes: uncached_info.recovery_peak_bytes - 1, ..limits },
     );
     assert_eq!(block_on(refused.mount()), Err(StoreError::MemoryLimit));
 }
@@ -850,13 +871,33 @@ fn replay_merge_reports_and_enforces_its_aggregate_memory_ceiling() {
     );
     assert_eq!(exact_info.recovery_peak_bytes, info.recovery_peak_bytes);
 
-    let too_small = StoreLimits {
+    // A smaller budget may drop the optional memo, not reject the image.
+    let fallback_limit = StoreLimits {
         recovery_memory_bytes: info.recovery_peak_bytes - 1,
         ..limits
     };
+    let (_, fallback_info) = mount(
+        FaultDevice::from_durable(device.page_count(), image.clone()), fallback_limit);
+    assert_eq!(fallback_info.object_count, info.object_count);
+    assert_eq!(fallback_info.replay_count, info.replay_count);
+    assert!(fallback_info.recovery_peak_bytes <= fallback_limit.recovery_memory_bytes);
+
+    // Disable the 64 KiB memo entirely to measure the mandatory workspace.
+    let uncached_limit = StoreLimits { recovery_memory_bytes: 64 * 1024 - 1, ..limits };
+    let (_, uncached_info) = mount(
+        FaultDevice::from_durable(device.page_count(), image.clone()), uncached_limit);
+    assert!(uncached_info.recovery_peak_bytes < uncached_limit.recovery_memory_bytes);
+    let exact_required = StoreLimits {
+        recovery_memory_bytes: uncached_info.recovery_peak_bytes, ..limits
+    };
+    let (_, exact_required_info) = mount(
+        FaultDevice::from_durable(device.page_count(), image.clone()), exact_required);
+    assert_eq!(exact_required_info.object_count, info.object_count);
+    assert_eq!(exact_required_info.replay_count, info.replay_count);
+    assert_eq!(exact_required_info.recovery_peak_bytes, uncached_info.recovery_peak_bytes);
     let mut refused = SegmentStore::new(
         FaultDevice::from_durable(device.page_count(), image),
-        too_small,
+        StoreLimits { recovery_memory_bytes: uncached_info.recovery_peak_bytes - 1, ..limits },
     );
     assert_eq!(block_on(refused.mount()), Err(StoreError::MemoryLimit));
 }

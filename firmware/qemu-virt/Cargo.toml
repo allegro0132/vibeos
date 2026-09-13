@@ -16,6 +16,8 @@ dhcp-iperf3-server = ["vibeos-kernel/dhcp-iperf3-server"]
 
 mmu-large-memory = ["legacy-shell", "vibeos-bsp-qemu-virt/mmu-large-memory", "vibeos-kernel/mmu-large-memory-test"]
 python-wasi = ["vibeos-kernel/python-wasi", "vibeos-bsp-qemu-virt/python-wasi"]
+# Research-only format admission; writes require runtime opt-in.
+experimental-authority-delta = ["vibeos-kernel/experimental-authority-delta"]
 wasmtime-command = ["vibeos-kernel/wasmtime-command"]
 wasmtime-command-fuel-batch = ["vibeos-kernel/wasmtime-command-fuel-batch"]
 wasmtime-threads = ["vibeos-kernel/wasmtime-threads"]
@@ -37,6 +39,8 @@ legacy-shell = ["vibeos-kernel/legacy-shell"]
 # feature prevents benchmark builds from silently omitting the V2 file-tree
 # policy while preserving the production storage and capability paths.
 storage-bench = ["legacy-shell", "file-tree", "vibeos-kernel/storage-bench", "vibeos-bsp-qemu-virt/storage-bench"]
+storage-bench-128m = ["storage-bench", "vibeos-kernel/storage-bench-128m", "vibeos-bsp-qemu-virt/storage-bench-128m"]
+storage-bench-small-store = ["storage-bench", "vibeos-kernel/storage-bench-small-store"]
 tcp-echo = ["vibeos-kernel/tcp-echo"]
 tcp-echo-recovery-test = ["vibeos-kernel/tcp-echo-recovery-test"]
 iperf3-server = ["vibeos-kernel/iperf3-server"]

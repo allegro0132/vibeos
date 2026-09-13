@@ -2,6 +2,10 @@
 
 extern crate alloc;
 
+#[cfg(feature = "file-tree")]
+#[path = "storage_bench_pattern.rs"]
+mod sequential_pattern;
+
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -2517,6 +2521,9 @@ async fn block_benchmark(init: &Arc<Space>, block_cap: Cap, args: &[&str]) {
     };
     #[cfg(feature = "pio-block")]
     let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
+    if let Err(error) = &result {
+        println!("  block benchmark failed: {:?}", error);
+    }
     let status = if result.is_ok() {
         "ok"
     } else {
@@ -2838,6 +2845,24 @@ async fn storage_v2_command(args: &[&str]) {
     }
 }
 
+async fn storage_bench_boot_selection(
+    storage: &Arc<crate::segment_store_platform::StorageV2Devices>,
+) -> Option<crate::segment_store_platform::BootStoreSelection> {
+    let selection_deadline =
+        crate::sbi::time().saturating_add(exec::timebase_hz().saturating_mul(180));
+    loop {
+        match storage.selected_boot_store() {
+            Some(crate::segment_store_platform::BootStoreSelection::LegacyM4)
+            | Some(crate::segment_store_platform::BootStoreSelection::StorageV2)
+            | Some(crate::segment_store_platform::BootStoreSelection::FailClosed) => {
+                break storage.selected_boot_store();
+            }
+            _ if crate::sbi::time() >= selection_deadline => break None,
+            _ => exec::yield_now().await,
+        }
+    }
+}
+
 async fn storage_object_bench(
     storage: &Arc<crate::segment_store_platform::StorageV2Devices>,
     args: &[&str],
@@ -2864,19 +2889,7 @@ async fn storage_object_bench(
     };
     let workload = args.get(2).copied().unwrap_or("object-durable-put-get");
     let content_class = args.get(3).copied().unwrap_or("unique");
-    let selection_deadline =
-        crate::sbi::time().saturating_add(exec::timebase_hz().saturating_mul(180));
-    let selection = loop {
-        match storage.selected_boot_store() {
-            Some(crate::segment_store_platform::BootStoreSelection::LegacyM4)
-            | Some(crate::segment_store_platform::BootStoreSelection::StorageV2)
-            | Some(crate::segment_store_platform::BootStoreSelection::FailClosed) => {
-                break storage.selected_boot_store();
-            }
-            _ if crate::sbi::time() >= selection_deadline => break None,
-            _ => exec::yield_now().await,
-        }
-    };
+    let selection = storage_bench_boot_selection(storage).await;
     let backend = match selection {
         Some(crate::segment_store_platform::BootStoreSelection::LegacyM4) => "m4",
         Some(crate::segment_store_platform::BootStoreSelection::StorageV2) => "storage-v2",
@@ -3153,11 +3166,14 @@ async fn storage_object_bench(
         .0
         .lock()
         .lookup_lease::<crate::store::StoredObject>(publication.capability, Rights::READ);
+    let range_get = matches!(workload, "object-range-get" | "object-range-get-uncached-data");
+    let cache_ready = workload != "object-range-get-uncached-data"
+        || crate::segment_store_platform::benchmark_evict_read_data();
+    let range_leaf = (seed as u32) % ((size.max(1) + 4095) / 4096) as u32;
     let get_started = crate::sbi::time();
     let read_back = match (service, object) {
-        (Ok(service), Ok(object)) if workload == "object-range-get" => {
-            let leaf = (seed as u32) % ((size.max(1) + 4095) / 4096) as u32;
-            crate::store::get_blob_chunk_with(service, object, leaf)
+        (Ok(service), Ok(object)) if range_get => {
+            crate::store::get_blob_chunk_with(service, object, range_leaf)
                 .await
                 .map(|chunk| crate::store::VerifiedBlob {
                     descriptor: chunk.descriptor,
@@ -3179,27 +3195,19 @@ async fn storage_object_bench(
         )),
     };
     let get_ticks = crate::sbi::time().saturating_sub(get_started).max(1);
-    let mut status = if read_back.as_ref().is_ok_and(|verified| {
-        verified.bytes == payload && verified.descriptor == publication.descriptor
+    let expected_read_back = if range_get {
+        let start = range_leaf as usize * 4096;
+        &payload[start..payload.len().min(start + 4096)]
+    } else {
+        payload.as_slice()
+    };
+    let mut status = if cache_ready && read_back.as_ref().is_ok_and(|verified| {
+        verified.bytes == expected_read_back && verified.descriptor == publication.descriptor
     }) {
         "ok"
     } else {
         "failed-closed"
     };
-    if workload == "object-range-get" {
-        // Range-get authenticates one 4 KiB leaf, so its returned bytes are
-        // intentionally shorter than the full payload.  The descriptor is
-        // still checked above; the proof verifier has already checked the
-        // leaf and sibling path.
-        status = if read_back
-            .as_ref()
-            .is_ok_and(|verified| verified.descriptor == publication.descriptor)
-        {
-            "ok"
-        } else {
-            "failed-closed"
-        };
-    }
     if workload == "object-revoke" {
         let revoked = init.0.lock().revoke_slot(publication.capability.slot()) != 0;
         let denied = init
@@ -3285,11 +3293,15 @@ async fn storage_file_tree_bench(
         return;
     }
     if (workload == "file-sequential" && size > 512 * 1024 * 1024)
+        || (workload == "file-batch-create-unique" && (count > 1000 || (count > 100 && size > 4096) || size == 0 || size > 128 * 1024))
         || (workload == "file-overwrite-1m" && size > 64 * 1024 * 1024)
-        || (workload == "file-batch-create" && count > 100) {
+        || (workload == "file-batch-create" && count > 100 && (count > 1000 || size > 4096)) {
         unsupported("staged persistence exceeds the bounded guest benchmark budget");
         return;
     }
+    // Boot mount/scrub may take seconds on a limited device. Match the
+    // object benchmark's bounded wait before any file-tree work or timing.
+    storage_bench_boot_selection(storage).await;
     let root = match storage.recover_file_tree_root(namespace).await {
         Ok(root) => root,
         Err(_) => {
@@ -3311,6 +3323,16 @@ async fn storage_file_tree_bench(
                 .wrapping_add(0x5a) as u8
         }));
     }
+    #[cfg(feature = "queued-block")]
+    let io_started = crate::virtio_blk::telemetry();
+    #[cfg(feature = "queued-block")]
+    let mut file_phase_boundaries = [io_started; 4];
+    #[cfg(feature = "queued-block")]
+    let mut file_phase_elapsed = [0_u64; 3];
+    #[cfg(feature = "queued-block")]
+    let mut stage_detail_ticks = [0_u64; 3];
+    #[cfg(feature = "queued-block")]
+    let mut verify_detail_ticks = [0_u64; 2];
     let started = crate::sbi::time();
     let mut transferred = 0_u64;
     let mut operations = 0_u64;
@@ -3356,23 +3378,79 @@ async fn storage_file_tree_bench(
             transferred = (size as u64).saturating_mul(2);
             Ok(())
         }
-        "file-batch-create" => {
+        "file-batch-create" | "file-batch-create-unique" => {
+            let unique = workload == "file-batch-create-unique";
             let mut staged_files = Vec::with_capacity(count);
             for index in 0..count {
+                if unique {
+                    #[cfg(feature = "queued-block")]
+                    let pattern_started = crate::sbi::time();
+                    sequential_pattern::fill(&mut payload, seed, (index * size) as u64);
+                    #[cfg(feature = "queued-block")]
+                    { stage_detail_ticks[0] += crate::sbi::time().saturating_sub(pattern_started); }
+                }
                 let name = alloc::format!("bench-{seed:016x}-{index:04}");
                 let path = RelPath::parse(&name)?;
                 let mut stager = root.begin_content_stager(&path, false)?;
+                #[cfg(feature = "queued-block")]
+                let push_started = crate::sbi::time();
                 stager.push(&payload).await?;
+                #[cfg(feature = "queued-block")]
+                { stage_detail_ticks[1] += crate::sbi::time().saturating_sub(push_started); }
+                #[cfg(feature = "queued-block")]
+                let finish_started = crate::sbi::time();
                 let staged = stager.finish().await?;
+                #[cfg(feature = "queued-block")]
+                { stage_detail_ticks[2] += crate::sbi::time().saturating_sub(finish_started); }
                 staged_files.push((path, staged));
             }
+            #[cfg(feature = "queued-block")]
+            { file_phase_boundaries[0] = crate::virtio_blk::telemetry();
+              file_phase_elapsed[0] = crate::sbi::time().saturating_sub(started); }
             let mut tx = root.begin()?;
             for (path, staged) in staged_files {
                 tx.write_staged(&path, staged)?;
             }
             tx.commit_durable().await?;
+            #[cfg(feature = "queued-block")]
+            { file_phase_boundaries[1] = crate::virtio_blk::telemetry();
+              file_phase_elapsed[1] = crate::sbi::time().saturating_sub(started); }
+            if unique {
+                for index in 0..count {
+                    let name = alloc::format!("bench-{seed:016x}-{index:04}");
+                    let reader = root.reader(&RelPath::parse(&name)?)?;
+                    let mut read = 0;
+                    for chunk in 0..reader.chunk_count() {
+                        #[cfg(feature = "queued-block")]
+                        let read_started = crate::sbi::time();
+                        let bytes = reader.read_chunk(chunk).await?.ok_or(FileError::Conflict)?;
+                        #[cfg(feature = "queued-block")]
+                        { verify_detail_ticks[0] += crate::sbi::time().saturating_sub(read_started); }
+                        #[cfg(feature = "queued-block")]
+                        let match_started = crate::sbi::time();
+                        if bytes.is_empty() || !sequential_pattern::matches(
+                            &bytes, seed, (index * size + read) as u64,
+                        ) {
+                            return Err(FileError::Conflict);
+                        }
+                        #[cfg(feature = "queued-block")]
+                        { verify_detail_ticks[1] += crate::sbi::time().saturating_sub(match_started); }
+                        read += bytes.len();
+                    }
+                    if read != size {
+                        return Err(FileError::Conflict);
+                    }
+                }
+            }
+            #[cfg(feature = "queued-block")]
+            { file_phase_boundaries[2] = crate::virtio_blk::telemetry();
+              file_phase_elapsed[2] = crate::sbi::time().saturating_sub(started); }
             operations = count as u64;
             transferred = (size as u64).saturating_mul(count as u64);
+            if unique {
+                operations *= 2;
+                transferred *= 2;
+            }
             Ok(())
         }
         "file-sequential" => {
@@ -3380,26 +3458,62 @@ async fn storage_file_tree_bench(
             let mut stager = root.begin_content_stager(&path, false)?;
             let mut chunk = alloc::vec![0_u8; DATA_CHUNK_SIZE];
             for index in 0..size.div_ceil(DATA_CHUNK_SIZE) {
-                for (offset, byte) in chunk.iter_mut().enumerate() {
-                    *byte = (seed.wrapping_add((index * DATA_CHUNK_SIZE + offset) as u64) & 0xff) as u8;
-                }
+                #[cfg(feature = "queued-block")]
+                let pattern_started = crate::sbi::time();
+                sequential_pattern::fill(&mut chunk, seed, (index * DATA_CHUNK_SIZE) as u64);
+                #[cfg(feature = "queued-block")]
+                { stage_detail_ticks[0] += crate::sbi::time().saturating_sub(pattern_started); }
                 let len = core::cmp::min(DATA_CHUNK_SIZE, size.saturating_sub(index * DATA_CHUNK_SIZE));
+                #[cfg(feature = "queued-block")]
+                let push_started = crate::sbi::time();
                 stager.push(&chunk[..len]).await?;
+                #[cfg(feature = "queued-block")]
+                { stage_detail_ticks[1] += crate::sbi::time().saturating_sub(push_started); }
             }
+            #[cfg(feature = "queued-block")]
+            let finish_started = crate::sbi::time();
             let staged = stager.finish().await?;
+            #[cfg(feature = "queued-block")]
+            { stage_detail_ticks[2] = crate::sbi::time().saturating_sub(finish_started); }
+            #[cfg(feature = "queued-block")]
+            { file_phase_boundaries[0] = crate::virtio_blk::telemetry();
+              file_phase_elapsed[0] = crate::sbi::time().saturating_sub(started); }
             let mut tx = root.begin()?;
             tx.write_staged(&path, staged)?;
             tx.commit_durable().await?;
+            #[cfg(feature = "queued-block")]
+            { file_phase_boundaries[1] = crate::virtio_blk::telemetry();
+              file_phase_elapsed[1] = crate::sbi::time().saturating_sub(started); }
             let reader = root.reader(&path)?;
             let mut read = 0_u64;
             for index in 0..reader.chunk_count() {
-                read = read.saturating_add(reader.read_chunk(index).await?.map(|chunk| chunk.len() as u64).unwrap_or(0));
+                #[cfg(feature = "queued-block")]
+                let read_started = crate::sbi::time();
+                let bytes = reader.read_chunk(index).await?.ok_or(FileError::Conflict)?;
+                #[cfg(feature = "queued-block")]
+                { verify_detail_ticks[0] += crate::sbi::time().saturating_sub(read_started); }
+                #[cfg(feature = "queued-block")]
+                let match_started = crate::sbi::time();
+                if bytes.is_empty() || !sequential_pattern::matches(&bytes, seed, read) {
+                    return Err(FileError::Conflict);
+                }
+                #[cfg(feature = "queued-block")]
+                { verify_detail_ticks[1] += crate::sbi::time().saturating_sub(match_started); }
+                read = read.checked_add(bytes.len() as u64).ok_or(FileError::Conflict)?;
             }
+            if read != size as u64 {
+                return Err(FileError::Conflict);
+            }
+            #[cfg(feature = "queued-block")]
+            { file_phase_boundaries[2] = crate::virtio_blk::telemetry();
+              file_phase_elapsed[2] = crate::sbi::time().saturating_sub(started); }
             // Remove the file so repeated samples measure a steady state
             // instead of accumulating tens of megabytes of live data.
             let mut tx = root.begin()?;
             tx.remove(&path, false, false)?;
             tx.commit_durable().await?;
+            #[cfg(feature = "queued-block")]
+            { file_phase_boundaries[3] = crate::virtio_blk::telemetry(); }
             operations = 3;
             transferred = (size as u64).saturating_add(read);
             Ok(())
@@ -3442,13 +3556,62 @@ async fn storage_file_tree_bench(
     }
     .await;
     let elapsed = crate::sbi::time().saturating_sub(started).max(1);
+    // Per-sample accounting: the device telemetry is cumulative since boot.
     #[cfg(feature = "queued-block")]
-    let io = crate::virtio_blk::telemetry();
+    let io_ended = crate::virtio_blk::telemetry();
+    #[cfg(feature = "queued-block")]
+    let io = io_ended.saturating_sub(io_started);
     #[cfg(feature = "pio-block")]
     let io = (0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64, 0_u64);
     #[cfg(feature = "queued-block")]
     let io = (io.requests, io.read_requests, io.write_requests, io.flush_requests,
         io.read_bytes, io.write_bytes, io.used_interrupts);
+    // Serialize only after measured work and aggregate counters are captured.
+    #[allow(unused_mut)]
+    let mut file_phase_json = String::new();
+    #[cfg(feature = "queued-block")]
+    if matches!(workload, "file-sequential" | "file-batch-create" | "file-batch-create-unique") && result.is_ok() {
+        use core::fmt::Write as _;
+        let stage_other = file_phase_elapsed[0].saturating_sub(stage_detail_ticks.iter().sum());
+        for (name, ticks) in [
+            ("pattern", stage_detail_ticks[0]), ("push", stage_detail_ticks[1]),
+            ("finish", stage_detail_ticks[2]), ("other", stage_other),
+        ] {
+            write!(&mut file_phase_json, ",\"file_stage_{}_ticks\":{}", name, ticks).expect("format staging time");
+        }
+        let verify_elapsed = file_phase_elapsed[2].saturating_sub(file_phase_elapsed[1]);
+        let verify_other = verify_elapsed.saturating_sub(verify_detail_ticks.iter().sum());
+        for (name, ticks) in [
+            ("reader", verify_detail_ticks[0]), ("pattern", verify_detail_ticks[1]),
+            ("other", verify_other),
+        ] {
+            write!(&mut file_phase_json, ",\"file_verify_{}_ticks\":{}", name, ticks).expect("format verification time");
+        }
+        let mut previous = io_started;
+        let mut previous_ticks = 0;
+        // The final phase includes async-scope cleanup through the same
+        // endpoint as total elapsed, so phase times partition the workload.
+        let phase_ticks = [file_phase_elapsed[0], file_phase_elapsed[1], file_phase_elapsed[2], elapsed];
+        if workload != "file-sequential" {
+            // Batch workloads retain files; this final interval is scope cleanup.
+            file_phase_boundaries[3] = io_ended;
+        }
+        let final_phase = if workload == "file-sequential" { "remove" } else { "cleanup" };
+        for ((phase, boundary), ticks) in ["stage", "publish", "verify", final_phase].into_iter().zip(file_phase_boundaries).zip(phase_ticks) {
+            write!(&mut file_phase_json, ",\"file_{}_elapsed_ticks\":{}", phase, ticks.saturating_sub(previous_ticks)).expect("format file phase time");
+            previous_ticks = ticks;
+            let delta = boundary.saturating_sub(previous);
+            previous = boundary;
+            for (name, value) in [
+                ("requests", delta.requests), ("read_requests", delta.read_requests),
+                ("write_requests", delta.write_requests), ("flush_requests", delta.flush_requests),
+                ("read_bytes", delta.read_bytes), ("write_bytes", delta.write_bytes),
+                ("used_interrupts", delta.used_interrupts),
+            ] {
+                write!(&mut file_phase_json, ",\"file_{}_{}\":{}", phase, name, value).expect("format file phase");
+            }
+        }
+    }
     let status = if result.is_ok() { "ok" } else { "failed-closed" };
     let reason = match result {
         Ok(()) => "",
@@ -3471,10 +3634,11 @@ async fn storage_file_tree_bench(
         },
     };
     println!(
-        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"file-tree\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":{},\"seed\":{},\"timebase_hz\":{},\"operations\":{},\"transferred_bytes\":{},\"elapsed_ticks\":{},\"latency_ticks\":{},\"recovery_ticks\":{},\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\",\"reason\":\"{}\"}}",
+        "VIBE_STORAGE_BENCH {{\"schema\":\"vibeos.storage-bench.sample\",\"version\":1,\"backend\":\"{}\",\"layer\":\"file-tree\",\"workload\":\"{}\",\"object_bytes\":{},\"object_count\":{},\"seed\":{},\"timebase_hz\":{},\"operations\":{},\"transferred_bytes\":{},\"elapsed_ticks\":{},\"latency_ticks\":{},\"recovery_ticks\":{},\"content_pattern\":\"{}\",\"latency_scope\":\"workload\",\"block_requests\":{},\"block_read_requests\":{},\"block_write_requests\":{},\"block_flush_requests\":{},\"block_read_bytes\":{},\"block_write_bytes\":{},\"block_used_interrupts\":{},\"status\":\"{}\",\"reason\":\"{}\"{}}}",
         backend, workload, size, count, seed, crate::exec::timebase_hz(), operations,
-        transferred, elapsed, (elapsed / operations.max(1)).max(1), recovery_ticks,
-        io.0, io.1, io.2, io.3, io.4, io.5, io.6, status, reason
+        transferred, elapsed, elapsed, recovery_ticks,
+        if matches!(workload, "file-sequential" | "file-batch-create-unique") { "splitmix64-offset-v1" } else { "legacy" },
+        io.0, io.1, io.2, io.3, io.4, io.5, io.6, status, reason, file_phase_json
     );
 }
 

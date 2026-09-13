@@ -2141,7 +2141,7 @@ pub fn build() {
             const STORAGE_V2_BLOCKS: u64 = crate::segment_store_platform::STORAGE_V2_BLOCK_COUNT;
             const STORAGE_V2_GRANULE: u64 =
                 crate::segment_store_platform::STORAGE_V2_GROWTH_GRANULE_BLOCKS;
-            // The benchmark harness always provisions a 1 GiB data disk. Park
+            // The benchmark harness provisions a 1 GiB data disk. Park
             // the dedicated raw-block window near its tail so the Storage V2
             // growth range keeps roughly 900 MiB for large-file workloads.
             #[cfg(feature = "storage-bench")]
@@ -2173,6 +2173,17 @@ pub fn build() {
                 .expect("image block range contains the initial Storage V2 window");
             let storage_v2_provisioned_blocks =
                 STORAGE_V2_BLOCKS + (storage_v2_extra / STORAGE_V2_GRANULE) * STORAGE_V2_GRANULE;
+            // Match a 16-segment store without moving the disjoint raw-block
+            // benchmark window or shrinking the harness's 1 GiB image.
+            #[cfg(feature = "storage-bench-small-store")]
+            let storage_v2_provisioned_blocks = storage_v2_provisioned_blocks.min(
+                STORAGE_V2_BLOCKS + 8 * STORAGE_V2_GRANULE,
+            );
+            #[cfg(feature = "storage-bench")]
+            crate::println!(
+                "VIBE_STORAGE_BENCH_GEOMETRY {{\"provisioned_segments\":{}}}",
+                storage_v2_provisioned_blocks / STORAGE_V2_GRANULE,
+            );
             let storage_v2_range = managed_range
                 .attenuate(STORAGE_V2_FIRST, storage_v2_provisioned_blocks)
                 .expect("image block range contains the initial Storage V2 window");

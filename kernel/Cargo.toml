@@ -9,6 +9,8 @@ mmu-large-memory-test = []
 boot-dtb-probe = []
 # Provisioned command service; never pulls in acceptance identities.
 provisioned-wasmtime = ["provisioned-command", "wasi-preview1", "vibeos-sshd/wasi-exec", "wasmtime-command-fuel-batch", "wasmtime-threads"]
+# Research-only format admission; writes require runtime opt-in.
+experimental-authority-delta = ["vibeos-segment-store/experimental-authority-delta"]
 python-command = ["wasi-preview1", "vibeos-wasi-runtime/python-wasi", "vibeos-sshd/python-wasi"]
 python-wasi = ["wasi-ssh-upload", "python-command"]
 milkv-python = ["milkv-command", "python-command", "vibeos-wasi-runtime/python-duo"]
@@ -58,6 +60,8 @@ legacy-shell = []
 # Dedicated raw-block benchmark authority. This is only enabled by the
 # benchmark image and is absent from production capability layouts.
 storage-bench = ["vibeos-image-policy/storage-bench"]
+storage-bench-128m = ["storage-bench"]
+storage-bench-small-store = ["storage-bench"]
 file-tree = [
     "dep:vibeos-file-store",
     "vibeos-vsh/file-tree",

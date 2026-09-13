@@ -1,5 +1,8 @@
 #![no_std]
 
+#[cfg(feature = "experimental-root-bundle")]
+pub mod experimental_root_checkpoint;
+
 use core::fmt;
 use sha2::{Digest, Sha256};
 
@@ -785,7 +788,9 @@ pub fn validate_pointer(
     Ok(())
 }
 
-fn pointers_overlap(left: PhysicalPointer, right: PhysicalPointer) -> bool {
+/// Whether two pointers overlap within the same store/segment incarnation.
+/// This does not validate pointers or authenticate the segment generation.
+pub fn pointers_overlap(left: PhysicalPointer, right: PhysicalPointer) -> bool {
     let (PhysicalPointer::Value(left), PhysicalPointer::Value(right)) = (left, right) else {
         return false;
     };
@@ -877,6 +882,11 @@ pub fn encode_superblock_body(
     out: &mut Page,
 ) -> Result<BodyDigest, FormatError> {
     validate_superblock(value)?;
+    write_superblock_fields(value, out)?;
+    Ok(finish_body(RecordKind::Superblock, 0x80, value.binding, out))
+}
+
+fn write_superblock_fields(value: &Superblock, out: &mut Page) -> Result<(), FormatError> {
     begin_body(RecordKind::Superblock, 0x80, value.binding, out)?;
     out[0x080] = value.copy;
     put_u32(out, 0x088, value.geometry.page_size);
@@ -899,12 +909,7 @@ pub fn encode_superblock_body(
     put_u64(out, 0x0e8, value.initial_block_count);
     put_u32(out, 0x0f0, value.logical_block_size);
     put_u32(out, 0x0f8, value.max_replay_records);
-    Ok(finish_body(
-        RecordKind::Superblock,
-        0x80,
-        value.binding,
-        out,
-    ))
+    Ok(())
 }
 
 pub fn decode_superblock_verified(
@@ -925,6 +930,11 @@ pub fn decode_superblock_verified(
     {
         return Err(FormatError::NonZeroReserved);
     }
+    let value = read_superblock_fields(body, digest)?;
+    Ok(DecodeStatus::Sealed(VerifiedRecord { value, digest }))
+}
+
+fn read_superblock_fields(body: &Page, digest: BodyDigest) -> Result<Superblock, FormatError> {
     let value = Superblock {
         binding: digest.binding,
         copy: body[0x080],
@@ -950,7 +960,7 @@ pub fn decode_superblock_verified(
         max_replay_records: get_u32(body, 0x0f8),
     };
     validate_superblock(&value)?;
-    Ok(DecodeStatus::Sealed(VerifiedRecord { value, digest }))
+    Ok(value)
 }
 
 pub fn decode_superblock(
@@ -1035,6 +1045,12 @@ pub fn encode_checkpoint_body(
     out: &mut Page,
 ) -> Result<BodyDigest, FormatError> {
     validate_checkpoint(value)?;
+    write_checkpoint_fields(value, out)?;
+    Ok(finish_body(RecordKind::Checkpoint, 0x1c0, value.binding, out))
+}
+
+// Shared serialization only; each format's caller validates its root semantics.
+fn write_checkpoint_fields(value: &Checkpoint, out: &mut Page) -> Result<(), FormatError> {
     begin_body(RecordKind::Checkpoint, 0x1c0, value.binding, out)?;
     out[0x080] = value.slot;
     put_u64(out, 0x088, value.previous_generation);
@@ -1048,12 +1064,7 @@ pub fn encode_checkpoint_body(
     write_pointer(out, 0x120, value.authority_root)?;
     write_pointer(out, 0x180, value.allocation_root)?;
     write_pointer(out, 0x1e0, value.replay_tail)?;
-    Ok(finish_body(
-        RecordKind::Checkpoint,
-        0x1c0,
-        value.binding,
-        out,
-    ))
+    Ok(())
 }
 
 pub fn decode_checkpoint_verified(

@@ -1148,6 +1148,27 @@ mod tests {
     }
 
     #[test]
+    fn storage_page_runs_publish_one_multiblock_read_with_exact_sector_count() {
+        // 4 KiB page, 16 KiB coalesced metadata, and the 128 KiB batch ceiling.
+        // Plain MMIO memory cannot emulate W1C status: this checks command
+        // publication and abort, not successful transfer on a real SD card.
+        for sectors in [8u16, 32, 256] {
+            let mut registers = [0u32; TEST_MMIO_WORDS];
+            let mut card = fake_card(&mut registers);
+            card.capacity_sectors = 1024;
+            let mut output = [0u8; MAX_TRANSFER_BLOCKS as usize * SECTOR_SIZE];
+            assert_eq!(
+                card.read_blocks(16, &mut output[..sectors as usize * SECTOR_SIZE]),
+                Err(Error::DeviceIo)
+            );
+            assert_eq!(card.last_command(), 18);
+            assert_abort_published(&registers);
+            let count_address = registers.as_ptr() as usize + BLOCK_COUNT;
+            assert_eq!(unsafe { (count_address as *const u16).read_volatile() }, sectors);
+        }
+    }
+
+    #[test]
     fn tracked_multi_block_write_publishes_once_immediately_before_cmd25_store() {
         let mut registers = [0u32; TEST_MMIO_WORDS];
         let mut card = fake_card(&mut registers);

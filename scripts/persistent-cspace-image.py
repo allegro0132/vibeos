@@ -9,7 +9,7 @@ tombstone ordering, and slot-generation history directly from the raw disk.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import struct
 import sys
 from pathlib import Path
@@ -33,6 +33,7 @@ TOMBSTONE = 5
 OBJECT_PREPARE = 6
 OBJECT_CHUNK = 7
 OBJECT_COMMIT = 8
+OBJECT_EXTERNAL = 9
 PAYLOAD_LENGTH = {
     FORMAT: 0,
     HIGH_WATER: 16,
@@ -42,6 +43,7 @@ PAYLOAD_LENGTH = {
     OBJECT_PREPARE: 40,
     OBJECT_CHUNK: 384,
     OBJECT_COMMIT: 48,
+    OBJECT_EXTERNAL: 64,
 }
 
 PERSISTENT_SPACE_ID = 0x5053
@@ -122,8 +124,11 @@ class State:
     live: dict[int, Grant]
     slots: dict[tuple[int, int], tuple[int, int | None]]
 
+    external_objects: dict[int, tuple[int, bytes]] = field(default_factory=dict)
+
     def fingerprint(self) -> tuple:
         return (
+            tuple(sorted(self.external_objects.items())),
             self.formatted,
             self.high_water,
             tuple(sorted((key, kind, content, sequence) for key, (kind, content, sequence) in self.objects.items())),
@@ -134,7 +139,7 @@ class State:
         )
 
 
-def decode_sector(sector: bytes, physical: int) -> Record | None:
+def decode_sector(sector: bytes, physical: int, *, expected_store_id: int = STORE_ID) -> Record | None:
     if sector == bytes(SECTOR_SIZE) or sector[SEAL_OFFSET:] != SEAL:
         return None
     if sector[:8] != MAGIC or u16(sector, 0x08) != 1:
@@ -160,7 +165,7 @@ def decode_sector(sector: bytes, physical: int) -> Record | None:
         fail(f"sealed sector {physical}: bad sequence copy")
     if u128(sector, CRC_OFFSET + 16) != transaction:
         fail(f"sealed sector {physical}: bad transaction copy")
-    if u128(sector, 0x28) != STORE_ID:
+    if u128(sector, 0x28) != expected_store_id:
         fail(f"sealed sector {physical}: wrong platform StoreId")
     transactional = kind in {
         GRANT_PREPARE,
@@ -169,6 +174,7 @@ def decode_sector(sector: bytes, physical: int) -> Record | None:
         OBJECT_PREPARE,
         OBJECT_CHUNK,
         OBJECT_COMMIT,
+        OBJECT_EXTERNAL,
     }
     if transactional != (transaction != 0):
         fail(f"sealed sector {physical}: non-canonical transaction id")
@@ -193,6 +199,10 @@ def records_from_image(image: bytes) -> list[Record]:
         record = decode_sector(image[start : start + SECTOR_SIZE], physical)
         if record is not None:
             records.append(record)
+    return validate_record_chain(records)
+
+
+def validate_record_chain(records: list[Record]) -> list[Record]:
     previous_sequence = 0
     previous_crc = 0
     for index, record in enumerate(records):
@@ -209,8 +219,28 @@ def records_from_image(image: bytes) -> list[Record]:
     return records
 
 
-def recover(image: bytes) -> State:
-    records = records_from_image(image)
+def recover(image: bytes, *, allow_external: bool = False) -> State:
+    return _recover_records(records_from_image(image), allow_external=allow_external)
+
+
+def recover_record_stream(record_stream: bytes, *, max_records: int,
+                          allow_external: bool = False, expected_store_id: int = STORE_ID) -> State:
+    """Recover a bounded logical stream, independently of the fixed M4 disk region."""
+    if (max_records <= 0 or not record_stream or len(record_stream) % SECTOR_SIZE
+            or len(record_stream) // SECTOR_SIZE > max_records):
+        fail("logical record stream length is invalid")
+    records = []
+    for index in range(len(record_stream) // SECTOR_SIZE):
+        start = index * SECTOR_SIZE
+        record = decode_sector(record_stream[start:start + SECTOR_SIZE],
+                               STORE_FIRST_SECTOR + index, expected_store_id=expected_store_id)
+        if record is None:
+            fail("logical record stream contains a non-canonical record")
+        records.append(record)
+    return _recover_records(validate_record_chain(records), allow_external=allow_external)
+
+
+def _recover_records(records: list[Record], *, allow_external: bool) -> State:
     if not records:
         return State(False, 0, {}, [], {}, {}, {})
 
@@ -220,6 +250,7 @@ def recover(image: bytes) -> State:
     seen_derivations: set[int] = set()
     seen_objects: set[int] = set()
     objects: dict[int, tuple[int, bytes, int]] = {}
+    external_objects: dict[int, tuple[int, bytes]] = {}
     grants: list[Grant] = []
     tombstones: dict[int, int] = {}
 
@@ -343,6 +374,30 @@ def recover(image: bytes) -> State:
                 fail("tombstone reused a transaction id")
             transactions[tx] = {"type": "finished"}
             tombstones.setdefault(derivation, sequence)
+            continue
+
+        if record.kind == OBJECT_EXTERNAL:
+            if not allow_external:
+                fail("external object requires a Storage V2 content verifier")
+            object_id = u128(raw, PAYLOAD_OFFSET)
+            object_kind = u32(raw, PAYLOAD_OFFSET + 16)
+            byte_len = u64(raw, PAYLOAD_OFFSET + 24)
+            root = raw[PAYLOAD_OFFSET + 32:PAYLOAD_OFFSET + 64]
+            if (object_kind == 0 or u32(raw, PAYLOAD_OFFSET + 20) != 0
+                    or not 0 < byte_len <= 64 * 1024 * 1024 or not any(root)):
+                fail("external object metadata is non-canonical")
+            if not reserved(tx) or not reserved(object_id):
+                fail("external object mentions an unreserved stable id")
+            claim(tx, "transaction")
+            claim(object_id, "object")
+            if tx in transactions or object_id in seen_objects:
+                fail("duplicate external object transaction or object")
+            seen_objects.add(object_id)
+            transactions[tx] = {"type": "finished"}
+            # No bytes are authenticated by this journal record alone. The
+            # V2 verifier must materialize selected objects from verified CAS.
+            objects[object_id] = (object_kind, b"", sequence)
+            external_objects[object_id] = (byte_len, root)
             continue
 
         if record.kind == OBJECT_PREPARE:
@@ -491,7 +546,7 @@ def recover(image: bytes) -> State:
         key: (generation, derivation if derivation in live else None)
         for key, (generation, derivation) in slot_history.items()
     }
-    return State(True, high_water, objects, grants, tombstones, live, slots)
+    return State(True, high_water, objects, grants, tombstones, live, slots, external_objects)
 
 
 def select_external_root(state: State) -> Grant | None:

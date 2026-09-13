@@ -41,11 +41,13 @@ use crate::allocation_v2::{
 };
 use crate::authority::AuthorizedObject;
 use crate::authority_snapshot::{
-    encode_persistent_authority_snapshot, AuthoritySnapshotError, PersistentAuthoritySnapshot,
+    encode_persistent_authority_snapshot, persistent_authority_encoded_len, AuthoritySnapshotError,
+    PersistentAuthoritySnapshot,
 };
 use crate::cas::{
-    build_record, flush, read_manifest_range, verify_manifest_blob, write_page,
-    write_payload_records_with_header, CasObjectHandle, CasStoreError, FinalRecord,
+    build_record, flush, read_manifest_range, sink_or_write_page, verify_manifest_blob,
+    write_page, write_payload_records_with_header, CasObjectHandle, CasStoreError, FinalRecord,
+    ManifestReadContext, PageSink,
 };
 use crate::cas_codec::{
     decode_blob_manifest, encode_blob_manifest, encode_cas_snapshot, BlobKey, BlobManifest,
@@ -78,10 +80,16 @@ const METADATA_KIND_CAS_SNAPSHOT: u32 = 0xffff_0011;
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 const METADATA_KIND_ROOT_SET: u32 = 0xffff_0020;
 const METADATA_KIND_PERSISTENT_AUTHORITY: u32 = 0xffff_0021;
-/// Upper bound on source segments relocated by one collection round. Bounds
-/// the foreground pause and the round's read/copy volume; remaining dead
-/// space is reclaimed by subsequent rounds.
-const GC_MAX_SOURCES_PER_ROUND: usize = 8;
+/// Ordinary source limit. Low-copy rounds may extend it under the additional
+/// byte and target bounds below; dense rounds retain this fallback. These
+/// work bounds do not imply a wall-clock deadline on a particular device.
+const GC_MAX_SOURCES_PER_ROUND: usize = 16;
+// Amortize repeated manifest walks only for low-copy collections. Keep the
+// original 16-source fallback for dense stores; extension also has a bound
+// on complete target segments (Blob + metadata + framing/padding).
+const GC_EXTENDED_SOURCES_PER_ROUND: usize = 32;
+const GC_EXTENDED_COPY_BYTES: u64 = 4 * 1024 * 1024;
+const GC_EXTENDED_TARGET_SEGMENTS: usize = 6;
 
 /// Allocate page I/O scratch directly in its final heap representation so the
 /// segment-builder futures remain safe for the kernel's bounded stack.
@@ -208,8 +216,7 @@ impl<E> From<GcError> for GcStoreError<E> {
     }
 }
 
-/// One Blob manifest after every referenced extent has been copied and
-/// authenticated at its target location.
+/// One live Blob's manifest, either relocated or retained outside the sources.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RelocatedBlob {
     pub(crate) blob_key: BlobKey,
@@ -219,7 +226,7 @@ pub(crate) struct RelocatedBlob {
 }
 
 /// Filter the selected CAS through the authoritative mark result and bind each
-/// live Blob to its newly verified manifest.  Shared Blobs remain one physical
+/// live Blob to its verified manifest.  Shared Blobs remain one physical
 /// entry even when several live objects name them.
 pub(crate) fn build_relocated_snapshot(
     checkpoint_generation: u64,
@@ -379,6 +386,117 @@ pub(crate) fn capture_mark_roots<const ROOT_SLOTS: usize, const READER_SLOTS: us
 /// Typed-child adapter used by the asynchronous engine.  MarkPlanner itself is
 /// deliberately synchronous, so all admitted typed payloads are authenticated
 /// and decoded into this bounded table before traversal starts.
+/// Runtime memo of the typed child references each committed object names.
+/// Objects are immutable and id-addressed: once an object's bytes were read
+/// and authenticated by one mark walk, the children it names never change,
+/// so a later collection round in the same process rebuilds reachability
+/// from these edges and reads only objects it has not seen. Entries stay
+/// bound to the object's BlobKey and are dropped when the id leaves the
+/// catalog, so a stale or re-bound identity can never be served. Bounded by
+/// bytes; on overflow the whole memo is dropped and the next round walks
+/// from media again. Never persisted: every cold mount starts empty.
+pub(crate) struct TypedEdgeCache {
+    edges: alloc::collections::BTreeMap<u128, TypedEdgeEntry>,
+    bytes: usize,
+    hits: u64,
+    misses: u64,
+}
+
+struct TypedEdgeEntry {
+    blob_key: BlobKey,
+    commit_generation: u64,
+    children: Vec<ChildReference>,
+}
+
+/// Upper bound on cached edge bytes (the store's own catalog tables are of
+/// the same order at the catalog-entry ceiling).
+const TYPED_EDGE_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+impl TypedEdgeCache {
+    pub(crate) const fn new() -> Self {
+        Self {
+            edges: alloc::collections::BTreeMap::new(),
+            bytes: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// `(cached objects, walk hits, walk misses)` since the store opened.
+    pub(crate) fn stats(&self) -> (usize, u64, u64) {
+        (self.edges.len(), self.hits, self.misses)
+    }
+
+    fn entry_bytes(children: usize) -> usize {
+        core::mem::size_of::<u128>()
+            + core::mem::size_of::<TypedEdgeEntry>()
+            + children * core::mem::size_of::<ChildReference>()
+    }
+
+    /// Children of `object` as authenticated by an earlier walk, if known.
+    fn lookup(&self, object: &ObjectMapping) -> Option<&[ChildReference]> {
+        self.edges
+            .get(&object.object_id)
+            .filter(|entry| {
+                entry.blob_key == object.blob_key
+                    && entry.commit_generation == object.commit_generation
+            })
+            .map(|entry| entry.children.as_slice())
+    }
+
+    fn insert(&mut self, object: &ObjectMapping, children: &[ChildReference]) {
+        let bytes = Self::entry_bytes(children.len());
+        if self.bytes.saturating_add(bytes) > TYPED_EDGE_CACHE_MAX_BYTES {
+            self.clear();
+            if bytes > TYPED_EDGE_CACHE_MAX_BYTES {
+                return;
+            }
+        }
+        let mut copy = Vec::new();
+        if copy.try_reserve_exact(children.len()).is_err() {
+            return;
+        }
+        copy.extend_from_slice(children);
+        if let Some(previous) = self.edges.insert(
+            object.object_id,
+            TypedEdgeEntry {
+                blob_key: object.blob_key,
+                commit_generation: object.commit_generation,
+                children: copy,
+            },
+        ) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(Self::entry_bytes(previous.children.len()));
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// Drop every id the catalog no longer names.
+    fn retain_catalog(&mut self, objects: &[ObjectMapping]) {
+        let mut dropped = 0_usize;
+        self.edges.retain(|object_id, entry| {
+            let live = objects
+                .binary_search_by_key(object_id, |object| object.object_id)
+                .is_ok();
+            if !live {
+                dropped = dropped.saturating_add(Self::entry_bytes(entry.children.len()));
+            }
+            live
+        });
+        self.bytes = self.bytes.saturating_sub(dropped);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.edges.clear();
+        self.bytes = 0;
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.edges.len()
+    }
+}
+
 pub(crate) struct DecodedTypedChildren {
     entries: Vec<(u128, Vec<ChildReference>)>,
     allocated_bytes: usize,
@@ -431,9 +549,16 @@ impl GcMemoryAccount {
     }
 
     fn transient(&mut self, bytes: usize) -> Result<(), GcError> {
+        self.transient_after_release(0, bytes)
+    }
+
+    /// Preflight a later phase without changing the current allocation ledger.
+    /// The caller must drop `released` bytes before allocating its workspace.
+    fn transient_after_release(&mut self, released: usize, bytes: usize) -> Result<(), GcError> {
         let high = self
             .current
-            .checked_add(bytes)
+            .checked_sub(released)
+            .and_then(|current| current.checked_add(bytes))
             .ok_or(GcError::ArithmeticOverflow)?;
         self.peak = self.peak.max(high);
         if high > self.limit {
@@ -509,8 +634,12 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
     roots: &[MarkRoot],
     typed_reference_kinds: &[u32],
     memo: Option<&VerifiedSegmentScans>,
+    mut edge_cache: Option<&mut TypedEdgeCache>,
 ) -> Result<DecodedTypedChildren, GcStoreError<D::Error>> {
     let cas = state.cas.as_ref().ok_or(GcError::NotCas)?;
+    if let Some(cache) = edge_cache.as_deref_mut() {
+        cache.retain_catalog(&cas.objects);
+    }
     let object_budget =
         usize::try_from(limits.max_catalog_entries).map_err(|_| GcError::MemoryLimit)?;
     if object_budget == 0 || roots.len() > object_budget {
@@ -595,6 +724,44 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
             // A media tag never admits its own parser. Unregistered kinds are
             // opaque even when their bytes happen to be valid VIBEREF1.
             entries.push((object.object_id, Vec::new()));
+            continue;
+        }
+        let cached: Option<Vec<ChildReference>> = match edge_cache.as_deref_mut() {
+            Some(cache) => match cache.lookup(&object) {
+                Some(children) => {
+                    let mut copy = Vec::new();
+                    copy.try_reserve_exact(children.len())
+                        .map_err(|_| GcError::MemoryLimit)?;
+                    copy.extend_from_slice(children);
+                    cache.hits = cache.hits.saturating_add(1);
+                    Some(copy)
+                }
+                None => {
+                    cache.misses = cache.misses.saturating_add(1);
+                    None
+                }
+            },
+            None => None,
+        };
+        if let Some(children) = cached {
+            // Authenticated by an earlier walk in this process: rebuild the
+            // edge without touching media.
+            let object_children = children;
+            for child in &object_children {
+                let child_key =
+                    RootKey::new(child.object_id, child.commit_generation, child.object_kind)
+                        .map_err(GcError::from)?;
+                if visited.binary_search(&child_key).is_err()
+                    && pending.binary_search(&child_key).is_err()
+                {
+                    if pending.len() == object_budget {
+                        return Err(GcError::MemoryLimit.into());
+                    }
+                    let insert = pending.binary_search(&child_key).unwrap_err();
+                    pending.insert(insert, child_key);
+                }
+            }
+            entries.push((object.object_id, object_children));
             continue;
         }
         // Reject an over-budget typed payload from the authenticated BlobKey
@@ -914,6 +1081,9 @@ pub(crate) async fn decode_typed_children<D: PageDevice>(
                 let insert = pending.binary_search(&child_key).unwrap_err();
                 pending.insert(insert, child_key);
             }
+        }
+        if let Some(cache) = edge_cache.as_deref_mut() {
+            cache.insert(&object, &object_children);
         }
         entries.push((object.object_id, object_children));
     }
@@ -1375,10 +1545,13 @@ fn ranked_gc_sources(
     for manifest in manifests {
         for extent in &manifest.extents {
             let segment_no = pointer_segment(extent.pointer).ok_or(GcError::Corrupt)?;
-            let slot = ranked
-                .iter_mut()
-                .find(|entry| entry.1 == segment_no)
-                .ok_or(GcError::Corrupt)?;
+            // Construction above keeps segment numbers strictly ascending
+            // until the final live-byte sort. Resolve sparse segment IDs in
+            // that order instead of rescanning every allocated segment.
+            let index = ranked
+                .binary_search_by_key(&segment_no, |entry| entry.1)
+                .map_err(|_| GcError::Corrupt)?;
+            let slot = &mut ranked[index];
             slot.0 = slot
                 .0
                 .checked_add(extent.payload_byte_len)
@@ -1527,6 +1700,11 @@ fn relocation_workspace_upper_bound(
         .and_then(|bytes| bytes.checked_add(PAGE_SIZE))
         .ok_or(GcError::ArithmeticOverflow)?;
     let verification = root_readback.max(manifest_readback);
+    // The relocated authority value still owns its tables/stream alongside
+    // the encoded root and its readback, even without a staged-state clone.
+    let relocated_authority_bytes = state.persistent_authority.as_ref()
+        .map(|authority| authority.allocated_bytes().ok_or(GcError::ArithmeticOverflow))
+        .transpose()?.unwrap_or(0);
     [
         root_len,
         allocation_len,
@@ -1537,7 +1715,8 @@ fn relocation_workspace_upper_bound(
         maximum_manifest_len,
         snapshot_tables,
         snapshot_len,
-        mounted_state_heap_bytes(state)?,
+        relocated_authority_bytes,
+        core::mem::size_of::<ManifestReadContext>(),
         verification,
     ]
     .into_iter()
@@ -1657,7 +1836,27 @@ fn post_relocation_workspace_upper_bound(
 /// Simulate canonical packing so all target segments can be reserved before
 /// the first copy. Each physical source extent remains one physical target
 /// extent; no operation holds more than that exact payload in memory.
+// Both planner and writer use this decision: a kept manifest must not name
+// a reclaimed segment, either for its own record or any referenced extent.
+fn manifest_relocation(
+    manifest: &BlobManifest,
+    blobs: &[BlobMapping],
+    sources: &[u64],
+) -> Result<(PhysicalPointer, bool), GcError> {
+    let index = blobs.binary_search_by_key(&manifest.blob_key, |blob| blob.blob_key)
+        .map_err(|_| GcError::Corrupt)?;
+    let pointer = blobs[index].manifest;
+    pointer_segment(pointer).ok_or(GcError::Corrupt)?;
+    let mut relocate = source_contains(sources, pointer);
+    for extent in &manifest.extents {
+        pointer_segment(extent.pointer).ok_or(GcError::Corrupt)?;
+        relocate |= source_contains(sources, extent.pointer);
+    }
+    Ok((pointer, relocate))
+}
+
 fn required_gc_segments(
+    blobs: &[BlobMapping],
     manifests: &[BlobManifest],
     manifest_payload_lens: &[usize],
     sources: &[u64],
@@ -1695,7 +1894,9 @@ fn required_gc_segments(
                 place(usize::try_from(extent.payload_byte_len).map_err(|_| GcError::Capacity)?)?;
             }
         }
-        place(*manifest_len)?;
+        if manifest_relocation(manifest, blobs, sources)?.1 {
+            place(*manifest_len)?;
+        }
     }
     place(snapshot_len)?;
     let authority_chunk = MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE;
@@ -1721,7 +1922,20 @@ pub(crate) struct SegmentBuilder {
     header_seal: Option<Box<Page>>,
     summary: SegmentSummaryAccumulator,
     previous: Option<(u64, u64, [u8; 32])>,
+    /// Buffered writes of the segment under construction. Relocation copies
+    /// one extent record at a time; without buffering every record cost
+    /// three single-page device requests (descriptor body, seal, payload),
+    /// which on a PIO SD card is the dominant cost of a collection round.
+    /// The buffer drains as contiguous ascending runs when it fills and
+    /// when the segment seals; nothing reads a target segment before that.
+    sink: PageSink,
+    /// Free segments whose final seal page the previous publication proved
+    /// durably zero, so opening them needs no zero-write and no flush.
+    cleared_seals: alloc::collections::BTreeSet<u64>,
 }
+
+/// Buffered segment pages (256 KiB) before a relocation drain.
+const SEGMENT_BUILDER_SINK_PAGES: usize = 64;
 
 #[derive(Clone, Copy)]
 pub(crate) struct SegmentPayload<'a> {
@@ -1842,9 +2056,25 @@ impl SegmentBuilder {
                 state.next_segment_generation,
             ),
             previous: state.last_segment,
+            sink: PageSink::new(),
+            cleared_seals: state.durably_cleared_seals.clone(),
         };
         builder.open(device, first).await?;
         Ok(builder)
+    }
+
+    /// Write every buffered page as contiguous runs.
+    async fn drain_sink<D: PageDevice>(
+        &mut self,
+        device: &D,
+    ) -> Result<(), GcStoreError<D::Error>> {
+        if self.sink.len() == 0 {
+            return Ok(());
+        }
+        core::mem::replace(&mut self.sink, PageSink::new())
+            .drain(device)
+            .await?;
+        Ok(())
     }
 
     fn segment_generation(&self) -> Result<u64, GcError> {
@@ -1861,17 +2091,30 @@ impl SegmentBuilder {
         let segment_generation = self.segment_generation()?;
         let base = segment_base_page(segment_no).map_err(StoreError::Format)?;
         // An unsealed target is never authoritative. Exact-zero the final seal
-        // before writing payload and verify the zero write durably.
+        // before writing payload and verify the zero write durably — unless
+        // the previous publication already proved this seal durably zero, in
+        // which case the read-back alone re-establishes the fact.
         let zero = heap_page();
-        write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &zero).await?;
-        flush(device).await?;
-        let mut observed = heap_page();
-        device
-            .read_page(base + u64::from(SEGMENT_SEAL_PAGE), &mut observed)
-            .await
-            .map_err(StoreError::Device)?;
-        if observed != zero {
-            return Err(GcError::Corrupt.into());
+        let mut proven = self.cleared_seals.remove(&segment_no);
+        if proven {
+            let mut observed = heap_page();
+            device
+                .read_page(base + u64::from(SEGMENT_SEAL_PAGE), &mut observed)
+                .await
+                .map_err(StoreError::Device)?;
+            proven = observed == zero;
+        }
+        if !proven {
+            write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &zero).await?;
+            flush(device).await?;
+            let mut observed = heap_page();
+            device
+                .read_page(base + u64::from(SEGMENT_SEAL_PAGE), &mut observed)
+                .await
+                .map_err(StoreError::Device)?;
+            if observed != zero {
+                return Err(GcError::Corrupt.into());
+            }
         }
         let (previous_segment_no, previous_segment_generation, previous_hash) =
             self.previous.unwrap_or((ANCHOR_SEGMENT_NO, 0, [0; 32]));
@@ -1931,9 +2174,11 @@ impl SegmentBuilder {
                 self.header_digest.ok_or(GcError::Corrupt)?,
                 self.summary,
                 flush_final_seal,
+                &mut self.sink,
             )
             .await?,
         );
+        self.drain_sink(device).await?;
         Ok(())
     }
 
@@ -1975,6 +2220,33 @@ impl SegmentBuilder {
         merkle_root: [u8; 32],
         bytes: &[u8],
     ) -> Result<PhysicalPointer, GcStoreError<D::Error>> {
+        self.payload_with_root(device, extent_kind, object_kind, extent_index,
+            extent_count, content_byte_len, encoded_blob_len, encoded_offset,
+            Some(merkle_root), bytes).await
+    }
+
+    // Complete metadata uses the same byte digest for both record fields.
+    async fn metadata_payload<D: PageDevice>(
+        &mut self, device: &D, extent_kind: ExtentKind, object_kind: u32, bytes: &[u8],
+    ) -> Result<PhysicalPointer, GcStoreError<D::Error>> {
+        self.payload_with_root(device, extent_kind, object_kind, 0, 1,
+            bytes.len() as u64, bytes.len() as u64, 0, None, bytes).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn payload_with_root<D: PageDevice>(
+        &mut self,
+        device: &D,
+        extent_kind: ExtentKind,
+        object_kind: u32,
+        extent_index: u32,
+        extent_count: u32,
+        content_byte_len: u64,
+        encoded_blob_len: u64,
+        encoded_offset: u64,
+        merkle_root: Option<[u8; 32]>,
+        bytes: &[u8],
+    ) -> Result<PhysicalPointer, GcStoreError<D::Error>> {
         self.ensure(device, bytes.len()).await?;
         let segment_no = self.segments[self.index];
         let base = segment_base_page(segment_no).map_err(StoreError::Format)?;
@@ -1994,7 +2266,7 @@ impl SegmentBuilder {
             encoded_blob_len,
             encoded_offset,
             bytes.len() as u64,
-            merkle_root,
+            merkle_root.unwrap_or(hash),
             hash,
         )
         .map_err(StoreError::Format)?;
@@ -2005,8 +2277,18 @@ impl SegmentBuilder {
         // Every SegmentBuilder consumer publishes a checkpoint before its
         // segments become referenced; that slot protocol's first flush is the
         // shared durability barrier for all deferred phases below.
-        write_payload_records_with_header(device, base, header, &[(&record, bytes)], true, None)
-            .await?;
+        write_payload_records_with_header(
+            device,
+            base,
+            header,
+            &[(&record, bytes)],
+            true,
+            Some(&mut self.sink),
+        )
+        .await?;
+        if self.sink.len() >= SEGMENT_BUILDER_SINK_PAGES {
+            self.drain_sink(device).await?;
+        }
         self.relative = self
             .relative
             .checked_add(record.value.record_span_pages)
@@ -2114,7 +2396,18 @@ impl SegmentBuilder {
         let header = header_pages
             .as_ref()
             .map(|(body, seal)| (body.as_ref(), seal.as_ref()));
-        write_payload_records_with_header(device, base, header, &writes, true, None).await?;
+        write_payload_records_with_header(
+            device,
+            base,
+            header,
+            &writes,
+            true,
+            Some(&mut self.sink),
+        )
+        .await?;
+        if self.sink.len() >= SEGMENT_BUILDER_SINK_PAGES {
+            self.drain_sink(device).await?;
+        }
         let mut pointers = Vec::new();
         pointers
             .try_reserve_exact(records.len())
@@ -2165,6 +2458,7 @@ async fn finalize_accumulated_segment<D: PageDevice>(
     header_digest: BodyDigest,
     accumulated: SegmentSummaryAccumulator,
     flush_final_seal: bool,
+    sink: &mut PageSink,
 ) -> Result<(u64, u64, [u8; 32]), GcStoreError<D::Error>> {
     if accumulated.record_count == 0
         || accumulated.first_target_checkpoint_generation == 0
@@ -2225,10 +2519,14 @@ async fn finalize_accumulated_segment<D: PageDevice>(
     encode_record_seal(seal_digest, &mut final_seal).map_err(StoreError::Format)?;
     // Deferred like the commit path: no checkpoint can name this segment
     // until the caller's slot protocol flushes, which covers every phase.
-    write_page(device, base + u64::from(SUMMARY_BODY_PAGE), &summary_body).await?;
-    write_page(device, base + u64::from(SUMMARY_SEAL_PAGE), &summary_seal).await?;
-    write_page(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE), &seal_body).await?;
-    write_page(device, base + u64::from(SEGMENT_SEAL_PAGE), &final_seal).await?;
+    sink_or_write_page(device, Some(&mut *sink), base + u64::from(SUMMARY_BODY_PAGE), &summary_body)
+        .await?;
+    sink_or_write_page(device, Some(&mut *sink), base + u64::from(SUMMARY_SEAL_PAGE), &summary_seal)
+        .await?;
+    sink_or_write_page(device, Some(&mut *sink), base + u64::from(SEGMENT_SEAL_BODY_PAGE), &seal_body)
+        .await?;
+    sink_or_write_page(device, Some(&mut *sink), base + u64::from(SEGMENT_SEAL_PAGE), &final_seal)
+        .await?;
     let _ = flush_final_seal;
     Ok((segment_no, segment_generation, seal_digest.body_sha256()))
 }
@@ -2262,17 +2560,11 @@ async fn load_live_manifests<D: PageDevice>(
     manifests
         .try_reserve_exact(mark.live_blobs().len())
         .map_err(|_| GcError::MemoryLimit)?;
+    // Manifests and their extent capacities are immutable after insertion.
+    // Maintain the exact retained sum instead of rescanning all prior entries
+    // for each blob (quadratic in the number of live manifests).
+    let mut existing_extents = 0_usize;
     for key in mark.live_blobs() {
-        let existing_extents =
-            manifests
-                .iter()
-                .try_fold(0_usize, |bytes, manifest: &BlobManifest| {
-                    vector_bytes(
-                        manifest.extents.capacity(),
-                        core::mem::size_of::<ManifestExtent>(),
-                    )
-                    .and_then(|more| bytes.checked_add(more).ok_or(GcError::ArithmeticOverflow))
-                })?;
         let blob = cas
             .blobs
             .binary_search_by_key(key, |blob| blob.blob_key)
@@ -2319,6 +2611,9 @@ async fn load_live_manifests<D: PageDevice>(
         if manifest.blob_key != *key {
             return Err(GcError::Corrupt.into());
         }
+        existing_extents = existing_extents.checked_add(vector_bytes(
+            manifest.extents.capacity(), core::mem::size_of::<ManifestExtent>(),
+        )?).ok_or(GcError::ArithmeticOverflow)?;
         manifests.push(manifest);
     }
     Ok(manifests)
@@ -2416,6 +2711,7 @@ async fn verify_staged_copied_extent<D: PageDevice>(
     checkpoint_generation: u64,
     next_segment_generation: u64,
     declared: &ManifestExtent,
+    whole_blob: Option<&BlobManifest>,
     memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(), GcStoreError<D::Error>> {
     let maximum_bytes =
@@ -2440,6 +2736,35 @@ async fn verify_staged_copied_extent<D: PageDevice>(
     })?;
     if observed.bytes.len() != maximum_bytes {
         return Err(GcError::CorruptAt("relocate-copied-payload-length").into());
+    }
+    if let Some(manifest) = whole_blob {
+        let extent = observed.extent;
+        if manifest.extents.len() != 1
+            || declared.extent_index != 0
+            || declared.extent_count != 1
+            || declared.encoded_offset != 0
+            || declared.payload_byte_len != manifest.encoded_blob_len
+            || extent.object_kind != manifest.blob_key.object_kind()
+            || extent.extent_index != declared.extent_index
+            || extent.extent_count != declared.extent_count
+            || extent.content_byte_len != manifest.blob_key.exact_len()
+            || extent.encoded_blob_len != manifest.encoded_blob_len
+            || extent.encoded_offset != declared.encoded_offset
+            || extent.payload_byte_len != declared.payload_byte_len
+            || extent.merkle_root != manifest.blob_key.merkle_root()
+        {
+            return Err(GcError::CorruptAt("relocate-whole-envelope-descriptor").into());
+        }
+        let blob = BlobView::decode(&observed.bytes)
+            .map_err(|_| GcError::CorruptAt("relocate-whole-envelope-header"))?;
+        if blob.descriptor().object_kind != manifest.blob_key.object_kind()
+            || blob.descriptor().byte_len != manifest.blob_key.exact_len()
+            || blob.descriptor().root != manifest.blob_key.merkle_root()
+        {
+            return Err(GcError::CorruptAt("relocate-whole-envelope-identity").into());
+        }
+        blob.verify_all()
+            .map_err(|_| GcError::CorruptAt("relocate-whole-envelope-tree"))?;
     }
     drop(observed);
 
@@ -2521,6 +2846,7 @@ async fn relocate_live_state<D: PageDevice>(
     // Table widths are frozen; physical pointer values cannot affect length.
     let snapshot_len = cas_snapshot_len(mark.live_objects().len(), mark.live_blobs().len())?;
     let required = required_gc_segments(
+        &cas.blobs,
         manifests,
         manifest_lens,
         &plan.sources,
@@ -2544,7 +2870,17 @@ async fn relocate_live_state<D: PageDevice>(
         .try_reserve_exact(manifests.len())
         .map_err(|_| GcError::MemoryLimit)?;
     let mut copied_bytes = 0_u64;
+    let mut written_manifest_bytes = 0_usize;
     for manifest in manifests {
+        let (original, needs_relocation) = manifest_relocation(manifest, &cas.blobs, &plan.sources)?;
+        if !needs_relocation {
+            relocated.push(RelocatedBlob {
+                blob_key: manifest.blob_key,
+                manifest: original,
+                copied_bytes: 0,
+            });
+            continue;
+        }
         let mut new_extents = Vec::new();
         new_extents
             .try_reserve_exact(manifest.extents.len())
@@ -2599,19 +2935,10 @@ async fn relocate_live_state<D: PageDevice>(
         };
         let bytes = encode_blob_manifest(&new_manifest, context)
             .map_err(|_| GcError::CorruptAt("relocate-manifest-encode"))?;
+        written_manifest_bytes = written_manifest_bytes.checked_add(bytes.len())
+            .ok_or(GcError::ArithmeticOverflow)?;
         let pointer = builder
-            .payload(
-                device,
-                ExtentKind::Catalog,
-                METADATA_KIND_MANIFEST,
-                0,
-                1,
-                bytes.len() as u64,
-                bytes.len() as u64,
-                0,
-                payload_sha256(&bytes),
-                &bytes,
-            )
+            .metadata_payload(device, ExtentKind::Catalog, METADATA_KIND_MANIFEST, &bytes)
             .await?;
         relocated.push(RelocatedBlob {
             blob_key: manifest.blob_key,
@@ -2629,18 +2956,7 @@ async fn relocate_live_state<D: PageDevice>(
     let snapshot_bytes = encode_cas_snapshot(&snapshot, context)
         .map_err(|_| GcError::CorruptAt("relocate-snapshot-encode"))?;
     let catalog_root = builder
-        .payload(
-            device,
-            ExtentKind::Catalog,
-            METADATA_KIND_CAS_SNAPSHOT,
-            0,
-            1,
-            snapshot_bytes.len() as u64,
-            snapshot_bytes.len() as u64,
-            0,
-            payload_sha256(&snapshot_bytes),
-            &snapshot_bytes,
-        )
+        .metadata_payload(device, ExtentKind::Catalog, METADATA_KIND_CAS_SNAPSHOT, &snapshot_bytes)
         .await?;
     let authority_chunk_bytes = MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE;
     let authority_extent_count = root_bytes.len().div_ceil(authority_chunk_bytes) as u32;
@@ -2702,18 +3018,7 @@ async fn relocate_live_state<D: PageDevice>(
         .copied()
         .ok_or(GcError::Corrupt)?;
     let allocation_root = builder
-        .payload(
-            device,
-            ExtentKind::Allocation,
-            METADATA_KIND_ALLOCATION,
-            0,
-            1,
-            allocation_bytes.len() as u64,
-            allocation_bytes.len() as u64,
-            0,
-            payload_sha256(&allocation_bytes),
-            &allocation_bytes,
-        )
+        .metadata_payload(device, ExtentKind::Allocation, METADATA_KIND_ALLOCATION, &allocation_bytes)
         .await?;
     let last = builder.finish(device).await?;
 
@@ -2749,10 +3054,24 @@ async fn relocate_live_state<D: PageDevice>(
         memo,
     )
     .await?;
-    let mut staged_state = state.clone();
-    staged_state.generation = plan.relocation_generation;
-    staged_state.next_segment_generation = target_next_generation;
-    for mapping in &snapshot.blobs {
+    let staged_state = ManifestReadContext::for_generation(
+        state, plan.relocation_generation, target_next_generation,
+    );
+    // Reuse only this collection's authenticated, unchanged manifest. Its
+    // segment and all content extents are immutable and disjoint from both
+    // source and target sets. Fresh metadata still requires device readback.
+    for mapping in snapshot.blobs.iter().rev() {
+        let original = manifests.binary_search_by_key(&mapping.blob_key, |m| m.blob_key)
+            .ok().and_then(|index| manifests.get(index)).ok_or(GcError::Corrupt)?;
+        let (old_pointer, changed) = manifest_relocation(original, &cas.blobs, &plan.sources)?;
+        if !changed && mapping.manifest == old_pointer {
+            if source_contains(&plan.targets, old_pointer)
+                || original.extents.iter().any(|extent| source_contains(&plan.targets, extent.pointer))
+            {
+                return Err(GcError::Corrupt.into());
+            }
+            continue;
+        }
         let manifest_payload = read_pointer_payload(
             device,
             state.superblock.binding.store_uuid,
@@ -2781,6 +3100,7 @@ async fn relocate_live_state<D: PageDevice>(
                     plan.relocation_generation,
                     target_next_generation,
                     extent,
+                    (manifest.extents.len() == 1).then_some(&manifest),
                     memo,
                 )
                 .await?;
@@ -2791,8 +3111,10 @@ async fn relocate_live_state<D: PageDevice>(
         // Untouched Blobs were authenticated when their own commit published
         // them, and re-verifying the complete live set every round makes one
         // collection cost reads proportional to the store's total content.
-        if relocated {
-            verify_manifest_blob(device, &staged_state, &manifest, memo)
+        // A single copied envelope was already checked in full while its
+        // authenticated payload was resident, including every tree node.
+        if relocated && manifest.extents.len() != 1 {
+            verify_manifest_blob(device, staged_state, &manifest, memo)
                 .await
                 .map_err(|error| match error {
                     CasStoreError::Store(error) => GcStoreError::Store(error),
@@ -2800,18 +3122,11 @@ async fn relocate_live_state<D: PageDevice>(
                 })?;
         }
     }
-    let metadata_bytes = manifest_lens.iter().try_fold(
-        snapshot_bytes
-            .len()
-            .checked_add(root_bytes.len())
-            .and_then(|bytes| bytes.checked_add(allocation_bytes.len()))
-            .ok_or(GcError::ArithmeticOverflow)?,
-        |total, manifest_len| {
-            total
-                .checked_add(*manifest_len)
-                .ok_or(GcError::ArithmeticOverflow)
-        },
-    )? as u64;
+    let metadata_bytes = snapshot_bytes.len()
+        .checked_add(root_bytes.len())
+        .and_then(|bytes| bytes.checked_add(allocation_bytes.len()))
+        .and_then(|bytes| bytes.checked_add(written_manifest_bytes))
+        .ok_or(GcError::ArithmeticOverflow)? as u64;
     let telemetry = GcTelemetry {
         epoch_generation: state.generation,
         root_count: u32::try_from(root_count).unwrap_or(u32::MAX),
@@ -2852,6 +3167,8 @@ fn build_relocation_successor<E>(
     relocated_roots: PersistentRootSet,
 ) -> Result<MountedState, GcStoreError<E>> {
     let mut successor = MountedState {
+        #[cfg(feature = "experimental-authority-delta")]
+        recovered_authority_depth: None,
         superblock: state.superblock,
         generation: plan.relocation_generation,
         admitted_segments: state.admitted_segments,
@@ -2888,6 +3205,7 @@ fn build_relocation_successor<E>(
             [0; 32],
         ))),
         last_segment_target_checkpoint_generation: plan.relocation_generation,
+        durably_cleared_seals: alloc::collections::BTreeSet::new(),
     };
     successor.recovery_peak_bytes = successor
         .resident_heap_bytes()
@@ -2905,6 +3223,8 @@ pub(crate) async fn publish_checkpoint<D: PageDevice>(
     catalog_root: PhysicalPointer,
     authority_root: PhysicalPointer,
     allocation_root: PhysicalPointer,
+    catalog_replay: (u32, PhysicalPointer),
+    cleared_slot: Option<ExactZeroCheckpointSeal>,
 ) -> Result<Checkpoint, GcStoreError<D::Error>> {
     let slot = ((generation - 1) & 1) as u8;
     let checkpoint = Checkpoint {
@@ -2922,15 +3242,26 @@ pub(crate) async fn publish_checkpoint<D: PageDevice>(
             .map_err(StoreError::Format)?,
         admitted_segments: state.admitted_segments,
         next_segment_generation,
-        replay_count: 0,
+        replay_count: catalog_replay.0,
         max_replay_records: limits.max_replay_records,
         cleaner_reserve_segments: state.cleaner_reserve_segments,
         catalog_root,
         authority_root,
         allocation_root,
-        replay_tail: PhysicalPointer::Null,
+        replay_tail: catalog_replay.1,
     };
-    write_checkpoint(device, &checkpoint, true).await?;
+    // Reuse already durably cleared this slot before writing its allocation
+    // segment. Recheck the complete seal after those writes, so a misdirected
+    // write cannot turn the earlier proof into an unchecked assumption.
+    if cleared_slot.is_some() {
+        let mut observed = heap_page();
+        device
+            .read_page(5 + u64::from(slot) * 2, &mut observed)
+            .await
+            .map_err(StoreError::Device)?;
+        ExactZeroCheckpointSeal::from_readback(&observed)?;
+    }
+    write_checkpoint(device, &checkpoint, cleared_slot.is_none()).await?;
     Ok(checkpoint)
 }
 
@@ -3042,7 +3373,6 @@ impl<D: PageDevice> SegmentStore<D> {
         self.poisoned = true;
         memory.release(state_bytes)?;
         let zero = clear_old_checkpoint_seal(&self.device, epoch_generation).await?;
-        let _ = zero;
         let mut builder =
             SegmentBuilder::begin(&self.device, &state, reuse_generation, barrier).await?;
         let allocation_root = builder
@@ -3081,6 +3411,8 @@ impl<D: PageDevice> SegmentStore<D> {
             state.catalog_root,
             state.authority_root,
             allocation_root,
+            (state.replay_count, state.replay_tail),
+            Some(zero),
         )
         .await?;
         let source_count = sources.len();
@@ -3322,6 +3654,8 @@ impl<D: PageDevice> SegmentStore<D> {
             state.catalog_root,
             authority_root,
             allocation_root,
+            (state.replay_count, state.replay_tail),
+            None,
         )
         .await?;
         drop(root_bytes);
@@ -3512,18 +3846,26 @@ impl<D: PageDevice> SegmentStore<D> {
             &roots,
             &self.typed_reference_kinds,
             Some(&self.verified_scans),
+            Some(&mut self.typed_edge_cache),
         )
         .await?;
         memory.transient(typed.peak_bytes)?;
         memory.retain(typed.allocated_bytes)?;
+        // Marking cannot discover more distinct valid identities than this
+        // frozen catalog contains. Do not retain maximum-size tables for a
+        // small catalog; keep the configured ceiling and nonzero empty case.
+        let object_capacity = cas.objects.len().max(1).min(self.limits.max_catalog_entries as usize);
+        let blob_capacity = cas.blobs.len().max(1).min(self.limits.max_catalog_entries as usize);
         let budget = MarkBudget::new(
-            self.limits.max_catalog_entries as usize,
-            self.limits.max_catalog_entries as usize,
+            object_capacity,
+            blob_capacity,
             GC_CHILD_BUDGET,
             maximum_roots,
         );
-        let planned_mark_bytes = (self.limits.max_catalog_entries as usize)
-            .checked_mul(core::mem::size_of::<RootKey>() * 2 + core::mem::size_of::<BlobKey>())
+        let planned_mark_bytes = object_capacity
+            .checked_mul(core::mem::size_of::<RootKey>() * 2)
+            .and_then(|bytes| blob_capacity.checked_mul(core::mem::size_of::<BlobKey>())
+                .and_then(|more| bytes.checked_add(more)))
             .and_then(|bytes| {
                 GC_CHILD_BUDGET
                     .checked_mul(core::mem::size_of::<ChildReference>())
@@ -3570,9 +3912,21 @@ impl<D: PageDevice> SegmentStore<D> {
         drop(planner);
         memory.release(typed.allocated_bytes)?;
         drop(typed);
+        // The mark owns the resolved live identities. This copied root list
+        // owns no pins and is now used only for its telemetry count.
+        let root_count = roots.len();
+        memory.release(roots_bytes)?;
+        drop(roots);
         let manifests =
-            load_live_manifests(&self.device, &state, self.limits, &mark, memory.current, Some(&self.verified_scans))
-                .await
+            load_live_manifests(
+                &self.device,
+                &state,
+                self.limits,
+                &mark,
+                memory.current,
+                Some(&self.verified_scans),
+            )
+            .await
                 .map_err(|error| match error {
                     GcStoreError::Gc(GcError::Corrupt) => {
                         GcStoreError::Gc(GcError::CorruptAt("load-manifests"))
@@ -3611,14 +3965,7 @@ impl<D: PageDevice> SegmentStore<D> {
             vector_bytes(manifest_lens.capacity(), core::mem::size_of::<usize>())?;
         memory.retain(manifest_lens_bytes)?;
         let root_len = match state.persistent_authority.as_ref() {
-            Some(authority) => {
-                let relocated = authority
-                    .relocated(relocation_generation)
-                    .map_err(GcError::from)?;
-                encode_persistent_authority_snapshot(&relocated)
-                    .map_err(GcError::from)?
-                    .len()
-            }
+            Some(authority) => persistent_authority_encoded_len(authority).map_err(GcError::from)?,
             None => persistent_root_encoded_len(&relocated_roots)?,
         };
         // Exact snapshot length from table counts.
@@ -3650,7 +3997,16 @@ impl<D: PageDevice> SegmentStore<D> {
         let candidate_bytes = vector_bytes(candidate.capacity(), core::mem::size_of::<u64>())?;
         memory.retain(candidate_bytes)?;
         let mut selected = None;
-        for prefix_len in 1..=ranked_sources.len() {
+        let mut candidate_live_bytes = 0_u64;
+        for prefix_len in 1..=ranked_sources.len().min(GC_EXTENDED_SOURCES_PER_ROUND) {
+            candidate_live_bytes = candidate_live_bytes
+                .checked_add(ranked_sources[prefix_len - 1].0)
+                .ok_or(GcError::ArithmeticOverflow)?;
+            if prefix_len > GC_MAX_SOURCES_PER_ROUND
+                && candidate_live_bytes > GC_EXTENDED_COPY_BYTES
+            {
+                break;
+            }
             validate_gc_source_budget(
                 &state.allocation,
                 prefix_len,
@@ -3671,6 +4027,7 @@ impl<D: PageDevice> SegmentStore<D> {
                 })
                 .ok_or(GcError::ArithmeticOverflow)?;
             let required = required_gc_segments(
+                &cas.blobs,
                 &manifests,
                 &manifest_lens,
                 &candidate,
@@ -3679,10 +4036,12 @@ impl<D: PageDevice> SegmentStore<D> {
                 allocation_len,
             )?;
             let reservation = required.checked_add(1).ok_or(GcError::ArithmeticOverflow)?;
-            // Bound one collection round: relocating an unbounded number of
-            // sources makes the foreground pause proportional to total dead
-            // space. Net yield still decides between admissible prefixes.
-            if candidate.len() > GC_MAX_SOURCES_PER_ROUND {
+            // Exact placement includes all rewritten manifests, checkpoint
+            // roots and framing. Bound their total footprint as well as Blob
+            // copy bytes before permitting a larger low-live source prefix.
+            if candidate.len() > GC_MAX_SOURCES_PER_ROUND
+                && required > GC_EXTENDED_TARGET_SEGMENTS
+            {
                 break;
             }
             // The cleaner reserve guarantees worst-case progress, but when more
@@ -3763,7 +4122,10 @@ impl<D: PageDevice> SegmentStore<D> {
                 })
                 .ok_or(GcError::ArithmeticOverflow)?,
         )?;
-        memory.transient(relocation_workspace_upper_bound(
+        // The original mounted copy is dropped immediately below, before
+        // either workspace exists. Keep it charged during planning, but do
+        // not include it in these subsequent-phase peaks a second time.
+        memory.transient_after_release(state_bytes, relocation_workspace_upper_bound(
             &state,
             &mark,
             &manifests,
@@ -3773,7 +4135,7 @@ impl<D: PageDevice> SegmentStore<D> {
             root_len,
             provisional_allocation_len,
         )?)?;
-        memory.transient(post_relocation_workspace_upper_bound(
+        memory.transient_after_release(state_bytes, post_relocation_workspace_upper_bound(
             &state,
             &relocated_roots,
             &manifests,
@@ -3791,7 +4153,7 @@ impl<D: PageDevice> SegmentStore<D> {
             &state,
             self.limits,
             &mark,
-            roots.len(),
+            root_count,
             &relocated_roots,
             state.persistent_authority.as_ref(),
             &manifests,
@@ -3816,6 +4178,8 @@ impl<D: PageDevice> SegmentStore<D> {
             relocation.catalog_root,
             relocation.authority_root,
             relocation.allocation_root,
+            (0, PhysicalPointer::Null),
+            None,
         )
         .await?;
         // Fast-path mount: the relocation already cold-read every staged
@@ -3890,6 +4254,8 @@ impl<D: PageDevice> SegmentStore<D> {
             relocation_checkpoint.catalog_root,
             relocation_checkpoint.authority_root,
             reuse_allocation_root,
+            (barrier_state.replay_count, barrier_state.replay_tail),
+            Some(zero),
         )
         .await?;
         let mut reuse_successor = barrier_state.clone();
@@ -3931,6 +4297,23 @@ impl<D: PageDevice> SegmentStore<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phase_preflight_preserves_current_charges_and_requires_real_release() {
+        let mut memory = GcMemoryAccount::new(100);
+        memory.retain(80).unwrap();
+        memory.transient_after_release(30, 40).unwrap();
+        assert_eq!(memory.current, 80);
+        assert_eq!(memory.peak, 90);
+        // Projection must not silently make room in the active phase.
+        assert_eq!(memory.transient(40), Err(GcError::MemoryLimit));
+        assert_eq!(memory.transient_after_release(81, 0), Err(GcError::ArithmeticOverflow));
+        assert_eq!(memory.transient_after_release(0, usize::MAX), Err(GcError::ArithmeticOverflow));
+        assert_eq!(memory.transient_after_release(30, 51), Err(GcError::MemoryLimit));
+        memory.release(30).unwrap();
+        memory.transient(40).unwrap();
+        assert_eq!(memory.current, 50);
+    }
     use crate::allocation_v2::SegmentAllocation;
     use crate::pins::{PinAdmission, RuntimeRootClass};
     use core::cell::Cell;
@@ -4189,6 +4572,28 @@ mod tests {
         packing_manifest_at(index, payload_pages, 0)
     }
 
+    fn packing_mappings(manifests: &[BlobManifest]) -> Vec<BlobMapping> {
+        let mut mappings: Vec<_> = manifests.iter().map(|m| BlobMapping {
+            blob_key: m.blob_key, manifest: m.extents[0].pointer,
+        }).collect();
+        mappings.sort_unstable_by_key(|m| m.blob_key);
+        mappings
+    }
+
+    #[test]
+    fn manifest_reuse_requires_record_and_every_extent_outside_sources() {
+        let mut manifest = packing_manifest_at(0, 1, 1);
+        let mappings = packing_mappings(&[packing_manifest_at(0, 1, 0)]);
+        assert!(!manifest_relocation(&manifest, &mappings, &[2]).unwrap().1);
+        assert!(manifest_relocation(&manifest, &mappings, &[0]).unwrap().1);
+        assert!(manifest_relocation(&manifest, &mappings, &[1]).unwrap().1);
+        manifest.extents.push(packing_manifest_at(0, 1, 3).extents[0]);
+        assert!(manifest_relocation(&manifest, &mappings, &[3]).unwrap().1);
+        assert!(manifest_relocation(&manifest, &[], &[2]).is_err());
+        manifest.extents[0].pointer = PhysicalPointer::Null;
+        assert!(manifest_relocation(&manifest, &mappings, &[2]).is_err());
+    }
+
     #[test]
     fn source_ranking_is_live_bytes_then_segment_number() {
         let manifests = vec![packing_manifest_at(0, 2, 1), packing_manifest_at(1, 1, 0)];
@@ -4196,6 +4601,30 @@ mod tests {
             ranked_gc_sources(&selected(), &manifests).unwrap(),
             vec![(0, 2), (PAGE_SIZE as u64, 0), (2 * PAGE_SIZE as u64, 1)]
         );
+    }
+
+    #[test]
+    fn source_ranking_handles_sparse_ids_repeated_extents_and_invalid_sources() {
+        let allocation = AllocationV2::new(9, 30, 2, &[
+            SegmentAllocation::Free,
+            SegmentAllocation::Allocated,
+            SegmentAllocation::Free,
+            SegmentAllocation::Allocated,
+            SegmentAllocation::Free,
+            SegmentAllocation::Allocated,
+        ], &[]).unwrap();
+        let manifests = vec![packing_manifest_at(0, 3, 5),
+            packing_manifest_at(1, 1, 1), packing_manifest_at(2, 2, 1)];
+        assert_eq!(ranked_gc_sources(&allocation, &manifests).unwrap(),
+            vec![(0, 3), (3 * PAGE_SIZE as u64, 1), (3 * PAGE_SIZE as u64, 5)]);
+        for segment in [0, 2, 4, 6, u64::MAX] {
+            assert_eq!(ranked_gc_sources(&allocation,
+                &[packing_manifest_at(0, 1, segment)]), Err(GcError::Corrupt));
+        }
+        let mut overflow = packing_manifest_at(0, 1, 5);
+        overflow.extents[0].payload_byte_len = u64::MAX;
+        assert_eq!(ranked_gc_sources(&allocation,
+            &[overflow, packing_manifest_at(1, 1, 5)]), Err(GcError::ArithmeticOverflow));
     }
 
     #[test]
@@ -4208,6 +4637,7 @@ mod tests {
         ];
         let manifest_lens = vec![PAGE_SIZE; manifests.len()];
         let partial = required_gc_segments(
+            &packing_mappings(&manifests),
             &manifests,
             &manifest_lens,
             &[0],
@@ -4217,6 +4647,7 @@ mod tests {
         )
         .unwrap();
         let full = required_gc_segments(
+            &packing_mappings(&manifests),
             &manifests,
             &manifest_lens,
             &[0, 1],
@@ -4269,6 +4700,7 @@ mod tests {
         );
         assert_eq!(
             required_gc_segments(
+                &packing_mappings(&manifests),
                 &manifests,
                 &manifest_lens,
                 &[0],
@@ -4294,6 +4726,7 @@ mod tests {
         );
         assert_eq!(
             required_gc_segments(
+                &packing_mappings(&manifests),
                 &manifests,
                 &manifest_lens,
                 &[0],

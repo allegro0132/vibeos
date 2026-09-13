@@ -1563,3 +1563,62 @@ present in the unmodified baseline image:
   thread is joined, so whichever of the two paths runs last still waits.
 
 Current formal measurements are in the first section of this document.
+
+Host wall-clock effect of the three changes, measured as an interleaved
+`M1` A/B in one host window (fuel batch, ISA, final, repeated three times;
+each run is one 15-second performance sample plus its validation sample,
+`--workers 1 --samples 1 --seconds 15`; host load fell from 8 to 5 during it):
+
+| image | samples (iterations/s) | about |
+| --- | --- | ---: |
+| fuel batch only | 2403, 2354, 2310, 2384 | 2,360 |
+| fuel batch + discovered ISA | 2419, 2607, 2157, 2427, 2349, 2549 | 2,420 |
+| final (+ lock-free gate, fixes) | 2973, 2967, 2846, 2926, 2925, 2934 | 2,930 |
+
+The ISA step is worth more in instructions than in host time under TCG, while
+the lock-free gate is worth more in host time than its instruction count: the
+seven atomic operations it removes per boundary are contended across the
+worker harts under multi-threaded TCG. Absolute numbers on this host move by
+more than 10% with load; only the interleaving makes the comparison usable.
+
+Formal four-hart results with the retained harness (three 20-second samples
+per worker count, validation seeds as a fourth sample, Debian control run
+immediately afterwards in the same host window):
+
+| Workers | VibeOS before (2026-09-09, `vibeos-4h-r4`) | VibeOS after (`vibeos-4h-fuel-batch-isa-probe`) | Debian control, same window (`debian-std-4h-r4`) | after / control |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1,389 | **2,611** (2,540–2,784) | 3,453 (3,361–3,470) | 76% |
+| 2 | 2,271 | **5,088** (4,681–5,111) | 6,136 (6,098–6,369) | 83% |
+| 3 | 3,262 | **6,581** (6,273–7,164) | 8,601 (8,237–8,637) | 77% |
+
+Medians of three 20-second performance samples, iterations/second aggregate
+over all workers; every sample passed upstream CRC validation and the fourth
+(validation-seed) sample also passed. Against the Debian medians of the
+original comparison (3,153 / 5,880 / 8,031, measured earlier the same day),
+the new image reaches 83% / 87% / 82%. The Debian control measured 40 minutes
+earlier in the same session (`debian-std-4h-r3-early`) gave 3,260 / 5,902 /
+8,122. Host load on this machine moves both platforms by more than 10%
+between windows, so only pairs measured back to back should be compared.
+
+Evidence: `target/coremark-threads/vibeos-4h-fuel-batch-isa-probe/`,
+`debian-std-4h-r4/`, `debian-std-4h-r3-early/` and
+`comparison-fuel-batch-isa-probe.json`; the earlier
+`vibeos-4h-r4`/`debian-std-4h-r2` sets are the original comparison. The
+benchmark script now lengthens its calibration until it lasts three seconds
+(a 1,000-iteration calibration under-estimated the batched image's `M3`
+throughput enough for a measured run to fall below CoreMark's ten-second
+minimum), records `--fuel-batch` and the per-thread batching counters, and
+offers the icount diagnostic mode; `summarize-coremark-threads.py` counts
+calibration attempts from the evidence directory.
+
+Validation of the final tree: 19 core host suites (including the new run-queue
+hint, continuation-probe and concurrent-free tests) and the WASI runtime and
+command suites pass; the default IMAC firmware still builds; on the four-hart
+benchmark image 30 consecutive `M3` runs reclaimed cleanly (the unfixed tree
+failed about one in eight), six mid-run disconnects ended `Cancelled` with a
+clean lifecycle and a clean follow-up run, and the single-hart icount
+diagnostic reads 768,500 instructions per iteration; on the ordinary-limit
+acceptance image `scripts/test-wasi-threads-fixtures.py` passed all 57 cases
+with 61 clean lifecycles (the unmodified tree failed it at case 18 with an
+unclean reclamation). Neither script needs wasi-sdk; the pthreads fixture is
+the retained `target/coremark-threads/threads.wasm`.

@@ -56,6 +56,7 @@ struct Media {
     page_count: u64,
     pages: BTreeMap<u64, Page>,
     reads: usize,
+    reads_by_page: BTreeMap<u64, usize>,
     writes: usize,
     next_read_error: Option<TestError>,
 }
@@ -69,6 +70,7 @@ impl MemoryDevice {
             page_count: admitted_pages(SEGMENTS).unwrap(),
             pages: BTreeMap::new(),
             reads: 0,
+            reads_by_page: BTreeMap::new(),
             writes: 0,
             next_read_error: None,
         })))
@@ -79,6 +81,7 @@ impl MemoryDevice {
             page_count: admitted_pages(SEGMENTS).unwrap(),
             pages: image,
             reads: 0,
+            reads_by_page: BTreeMap::new(),
             writes: 0,
             next_read_error: None,
         })))
@@ -91,6 +94,7 @@ impl MemoryDevice {
     fn reset_io(&self) {
         let mut media = self.0.lock().unwrap();
         media.reads = 0;
+        media.reads_by_page.clear();
         media.writes = 0;
     }
 
@@ -130,6 +134,7 @@ impl PageDevice for MemoryDevice {
             return Err(TestError::OutsideRange);
         }
         media.reads += 1;
+        *media.reads_by_page.entry(page).or_default() += 1;
         if let Some(error) = media.next_read_error.take() {
             return Err(error);
         }
@@ -279,11 +284,18 @@ fn live_pointers(
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(manifest.extents.len(), 3);
+    // Canonical split (header / content / tree) or the compact single
+    // extent: the content is in the first payload page either way and the
+    // tree ends the last payload page either way.
+    let (data, tree) = match manifest.extents.len() {
+        3 => (manifest.extents[1].pointer, manifest.extents[2].pointer),
+        1 => (manifest.extents[0].pointer, manifest.extents[0].pointer),
+        other => panic!("unexpected manifest layout with {other} extents"),
+    };
     (
         checkpoint.catalog_root,
-        manifest.extents[1].pointer,
-        manifest.extents[2].pointer,
+        data,
+        tree,
         checkpoint.authority_root,
         checkpoint.allocation_root,
     )
@@ -294,6 +306,13 @@ fn payload_first_page(pointer: PhysicalPointer) -> u64 {
         panic!("expected non-null pointer");
     };
     segment_base_page(pointer.segment_no).unwrap() + u64::from(pointer.payload_relative_page)
+}
+
+fn payload_last_page(pointer: PhysicalPointer) -> u64 {
+    let PhysicalPointer::Value(pointer) = pointer else {
+        panic!("expected non-null pointer");
+    };
+    payload_first_page(PhysicalPointer::Value(pointer)) + u64::from(pointer.payload_pages.max(1)) - 1
 }
 
 fn segment_summary_page(pointer: PhysicalPointer) -> u64 {
@@ -376,6 +395,121 @@ fn stale_extent_in_state(
 }
 
 #[test]
+fn scrub_closure_memo_is_bounded_and_reduces_packed_graph_reads() {
+    let device = MemoryDevice::blank();
+    let mut store = format(device.clone());
+    let mut batch = store.begin_staged_batch().unwrap();
+    for seed in 0..4_u8 {
+        let (object_id, commit_generation) = block_on(store.stage_blob_in_batch(
+            &mut batch, OBJECT_KIND, crate::cas_codec::REFERENCE_CODEC_RAW,
+            &[seed; PAGE_SIZE])).unwrap();
+        let refs = TypedManifestRefsV1::new(TYPED_KIND, commit_generation,
+            Vec::from([TypedObjectReference { object_id, commit_generation,
+                object_kind: OBJECT_KIND }])).unwrap();
+        let bytes = encode_typed_manifest_refs_v1(&refs).unwrap();
+        block_on(store.stage_blob_in_batch(&mut batch, TYPED_KIND,
+            REFERENCE_CODEC_TYPED_V1, &bytes)).unwrap();
+    }
+    let _objects = block_on(store.publish_staged_batch(batch)).unwrap();
+    let state = store.mounted.as_ref().unwrap();
+    device.reset_io();
+    let cached = block_on(crate::scrub::verify_closure_for_test(
+        &device, state, limits(), &[TYPED_KIND])).unwrap();
+    let cached_reads = device.io_counts().0;
+    assert_eq!(cached.status, ScrubStatus::Healthy);
+    let mut small = limits();
+    small.recovery_memory_bytes = 64 * 1024;
+    device.reset_io();
+    let plain = block_on(crate::scrub::verify_closure_for_test(
+        &device, state, small, &[TYPED_KIND])).unwrap();
+    assert!(cached_reads < device.io_counts().0);
+    assert_eq!(plain.status, ScrubStatus::Healthy);
+    assert!(plain.scrub_memory_high_water_bytes < small.recovery_memory_bytes);
+    let mut normalized = cached;
+    normalized.scrub_memory_high_water_bytes = plain.scrub_memory_high_water_bytes;
+    assert_eq!(normalized, plain);
+    small.recovery_memory_bytes = cached.scrub_memory_high_water_bytes - 1;
+    let fallback = block_on(crate::scrub::verify_closure_for_test(
+        &device, state, small, &[TYPED_KIND])).unwrap();
+    assert_eq!(fallback.status, ScrubStatus::Healthy);
+    assert!(fallback.scrub_memory_high_water_bytes <= small.recovery_memory_bytes);
+    // Reject before graph allocation when even the retained roots do not fit.
+    small.recovery_memory_bytes = state.resident_heap_bytes().unwrap()
+        + 4 * core::mem::size_of::<crate::mark::MarkRoot>() - 1;
+    assert!(matches!(block_on(crate::scrub::verify_closure_for_test(
+        &device, state, small, &[TYPED_KIND])), Err(ScrubError::MemoryLimit)));
+    assert_eq!(device.io_counts().1, 0);
+}
+
+#[test]
+fn scrub_content_memo_reduces_reads_without_changing_health_or_budget_admission() {
+    let device = MemoryDevice::blank();
+    let mut store = format(device.clone());
+    let mut batch = store.begin_staged_batch().unwrap();
+    for seed in 0..8_u8 {
+        block_on(store.stage_blob_in_batch(&mut batch, OBJECT_KIND,
+            crate::cas_codec::REFERENCE_CODEC_RAW, &[seed; PAGE_SIZE])).unwrap();
+    }
+    let _objects = block_on(store.publish_staged_batch(batch)).unwrap();
+    let state = store.mounted.as_ref().unwrap();
+    device.reset_io();
+    let plain = block_on(crate::scrub::verify_contents_for_test(
+        &device, state, limits().recovery_memory_bytes, false)).unwrap();
+    let plain_reads = device.io_counts().0;
+    device.reset_io();
+    let cached = block_on(crate::scrub::verify_contents_for_test(
+        &device, state, limits().recovery_memory_bytes, true)).unwrap();
+    assert!(device.io_counts().0 < plain_reads);
+    assert_eq!(device.io_counts().1, 0);
+    let mut normalized = cached;
+    normalized.scrub_memory_high_water_bytes = plain.scrub_memory_high_water_bytes;
+    assert_eq!(normalized, plain);
+    assert_eq!(cached.status, ScrubStatus::Healthy);
+    let tight = cached.scrub_memory_high_water_bytes - 1;
+    let fallback = block_on(crate::scrub::verify_contents_for_test(
+        &device, state, tight, true)).unwrap();
+    assert_eq!(fallback.status, ScrubStatus::Healthy);
+    assert!(fallback.scrub_memory_high_water_bytes <= tight);
+    assert!(matches!(block_on(crate::scrub::verify_contents_for_test(
+        &device, state, plain.scrub_memory_high_water_bytes - 1, true)),
+        Err(ScrubError::MemoryLimit)));
+    assert_eq!(device.io_counts().1, 0);
+}
+
+#[test]
+fn scrub_checkpoint_memo_reduces_reads_and_falls_back_under_tight_budget() {
+    let (image, _) = fixture();
+    let device = MemoryDevice::from_image(image);
+    let store = mount(device.clone());
+    let state = store.mounted.as_ref().unwrap();
+    let checkpoint = [4, 6].into_iter()
+        .filter_map(|page| block_on(crate::store::read_checkpoint(&device, page)).unwrap())
+        .max_by_key(|record| record.value().binding.generation).unwrap();
+    device.reset_io();
+    let plain = block_on(crate::store::recover_state(
+        &device, state.superblock, checkpoint, limits())).unwrap();
+    let plain_reads = device.io_counts().0;
+    device.reset_io();
+    let cached = block_on(crate::store::recover_state_for_scrub(
+        &device, state.superblock, checkpoint, limits())).unwrap();
+    assert!(device.io_counts().0 < plain_reads);
+    assert_eq!(device.io_counts().1, 0);
+    assert_eq!(cached.generation, plain.generation);
+    assert_eq!(cached.catalog, plain.catalog);
+    let mut tight = limits();
+    tight.recovery_memory_bytes = 64 * 1024 + plain.recovery_peak_bytes / 2;
+    // Ensure the memo is attempted, but leaves too little mandatory scratch.
+    assert!(tight.recovery_memory_bytes >= 64 * 1024);
+    device.reset_io();
+    let fallback = block_on(crate::store::recover_state_for_scrub(
+        &device, state.superblock, checkpoint, tight)).unwrap();
+    assert_eq!(fallback.recovery_peak_bytes, tight.recovery_memory_bytes);
+    assert_eq!(fallback.generation, plain.generation);
+    assert_eq!(fallback.catalog, plain.catalog);
+    assert_eq!(device.io_counts().1, 0);
+}
+
+#[test]
 fn healthy_scrub_is_bounded_anonymous_read_only_and_verifies_fallback() {
     let (image, bytes) = fixture();
     let device = MemoryDevice::from_image(image);
@@ -440,14 +574,33 @@ fn persistent_typed_authority_closure_uses_the_trusted_runtime_policy() {
     assert_eq!(report.live_objects, 2);
     assert_eq!(report.unique_blobs, 2);
     assert!(report.scrub_memory_high_water_bytes <= limits().recovery_memory_bytes);
-    assert!(
-        report.scrub_memory_high_water_bytes > store.info().unwrap().recovery_peak_bytes,
-        "typed mark scratch must be included in scrub's aggregate high-water"
-    );
     assert_eq!(device.io_counts().1, 0);
 
+    let cached_reads = device.io_counts().0;
+
+    // Force uncached recovery: the current resident state leaves less than
+    // 64 KiB for candidates. Optional memo reservations are not a mandatory
+    // scrub-memory minimum, so derive the exact scratch boundary here.
+    let mut uncached_limits = limits();
+    uncached_limits.recovery_memory_bytes = 64 * 1024;
+    let uncached_device = MemoryDevice::from_image(device.image());
+    let mut uncached = SegmentStore::new_with_runtime_context(
+        uncached_device.clone(),
+        uncached_limits,
+        StoreRuntimeContext::with_typed_reference_kinds(&[TYPED_KIND]).unwrap(),
+    );
+    block_on(uncached.mount()).unwrap();
+    let uncached_maintenance = uncached.mint_maintenance_root().unwrap()
+        .attenuate(&[MaintenanceOperation::Scrub]).unwrap();
+    uncached_device.reset_io();
+    let uncached_report = block_on(uncached.scrub(&uncached_maintenance)).unwrap();
+    assert!(cached_reads < uncached_device.io_counts().0);
+    assert_eq!(uncached_device.io_counts().1, 0);
+    assert_eq!(uncached_report.status, ScrubStatus::Healthy);
+    assert!(uncached_report.scrub_memory_high_water_bytes < 64 * 1024);
+
     let mut exact_below = limits();
-    exact_below.recovery_memory_bytes = report.scrub_memory_high_water_bytes - 1;
+    exact_below.recovery_memory_bytes = uncached_report.scrub_memory_high_water_bytes - 1;
     let cold_device = MemoryDevice::from_image(device.image());
     let mut cold = SegmentStore::new_with_runtime_context(
         cold_device,
@@ -679,6 +832,27 @@ fn retired_extent_payload_and_padding_are_not_skipped() {
 }
 
 #[test]
+fn scrub_rejects_valid_but_incomplete_current_mapping_against_recovered_checkpoint() {
+    let (image, _) = fixture();
+    let device = MemoryDevice::from_image(image);
+    let mut store = mount(device.clone());
+    let cas = store.mounted.as_mut().unwrap().cas.as_mut().unwrap();
+    assert_eq!(cas.objects.len(), 2);
+    assert_eq!(cas.blobs.len(), 1);
+    // Both objects deduplicate to the same valid Blob. Removing the second
+    // leaves a closed, content-valid graph, but not the durable publication.
+    cas.objects.pop();
+    assert!(crate::scrub::cas_mappings_are_closed(&cas.objects, &cas.blobs));
+    let maintenance = store.mint_maintenance_root().unwrap()
+        .attenuate(&[MaintenanceOperation::Scrub]).unwrap();
+    device.reset_io();
+    let report = block_on(store.scrub(&maintenance)).unwrap();
+    assert_eq!(report.status, ScrubStatus::Corrupt);
+    assert_eq!(report.corruption_domain, Some(ScrubCorruptionDomain::AllocationOrMapping));
+    assert_eq!(device.io_counts().1, 0);
+}
+
+#[test]
 fn object_blob_mapping_closure_rejects_orphan_blob_mappings() {
     let (image, _) = fixture();
     let store = mount(MemoryDevice::from_image(image));
@@ -764,6 +938,51 @@ enum CorruptionCase {
 }
 
 #[test]
+fn sealed_impossible_summary_counts_fail_before_extent_table_allocation() {
+    let (image, _) = fixture();
+    let (_, data, _, _, _) = live_pointers(&image);
+    let summary_page = segment_summary_page(data);
+    let original = match decode_segment_summary(&image_page(&image, summary_page),
+        &image_page(&image, summary_page + 1)).unwrap() {
+        DecodeStatus::Sealed(value) => value,
+        _ => panic!("sealed fixture summary"),
+    };
+    for case in 0..3 {
+        let device = MemoryDevice::from_image(image.clone());
+        let store = mount(device.clone());
+        let mut summary = original;
+        match case {
+            0 => {
+                summary.record_count = u32::MAX - 1;
+                summary.binding.ordinal = u32::MAX;
+                summary.kind_counts = [u32::MAX - 1, 0, 0, 0, 0];
+            }
+            1 => summary.payload_page_count = summary.record_count - 1,
+            _ => summary.next_free_page += 1,
+        }
+        let mut body = [0; PAGE_SIZE];
+        let mut seal = [0; PAGE_SIZE];
+        let digest = vibeos_segment_format::encode_segment_summary_body(&summary, &mut body).unwrap();
+        vibeos_segment_format::encode_record_seal(digest, &mut seal).unwrap();
+        assert!(matches!(decode_segment_summary(&body, &seal).unwrap(), DecodeStatus::Sealed(_)));
+        {
+            let mut media = device.0.lock().unwrap();
+            media.pages.insert(summary_page, body);
+            media.pages.insert(summary_page + 1, seal);
+        }
+        let damaged = device.image();
+        let maintenance = store.mint_maintenance_root().unwrap()
+            .attenuate(&[MaintenanceOperation::Scrub]).unwrap();
+        device.reset_io();
+        let report = block_on(store.scrub(&maintenance)).unwrap();
+        assert_eq!(report.status, ScrubStatus::Corrupt, "case {case}");
+        assert_eq!(report.corruption_domain, Some(ScrubCorruptionDomain::SegmentMetadata));
+        assert_eq!(device.io_counts().1, 0);
+        assert_eq!(device.image(), damaged);
+    }
+}
+
+#[test]
 fn detects_anchor_data_tree_summary_mapping_authority_and_allocation_corruption_without_repair() {
     let (image, _) = fixture();
     let (mapping, data, tree, authority, allocation) = live_pointers(&image);
@@ -795,8 +1014,8 @@ fn detects_anchor_data_tree_summary_mapping_authority_and_allocation_corruption_
             CorruptionCase::SuperblockLeftUnsealed => (1, PAGE_SIZE - 1),
             CorruptionCase::SuperblockRightUnsealed => (3, PAGE_SIZE - 1),
             CorruptionCase::Data => (payload_first_page(data), 17),
-            CorruptionCase::Tree => (payload_first_page(tree), 7),
-            CorruptionCase::Padding => (payload_first_page(tree), PAGE_SIZE - 1),
+            CorruptionCase::Tree => (payload_last_page(tree), 7),
+            CorruptionCase::Padding => (payload_last_page(tree), PAGE_SIZE - 1),
             CorruptionCase::Summary => (segment_summary_page(data), 0x90),
             CorruptionCase::Mapping => (payload_first_page(mapping), 0x88),
             CorruptionCase::Authority => (payload_first_page(authority), 0x18),
@@ -804,6 +1023,8 @@ fn detects_anchor_data_tree_summary_mapping_authority_and_allocation_corruption_
             CorruptionCase::CheckpointLeft => (4, 0x80),
             CorruptionCase::CheckpointRight => (6, 0x80),
         };
+        // A previous successful scrub must not hide subsequent media damage.
+        assert_eq!(block_on(store.scrub(&maintenance)).unwrap().status, ScrubStatus::Healthy);
         device.corrupt(page, offset);
         let corrupted_image = device.image();
         device.reset_io();
@@ -854,4 +1075,57 @@ fn detects_anchor_data_tree_summary_mapping_authority_and_allocation_corruption_
             "case {case:?} repaired media"
         );
     }
+}
+
+#[test]
+fn segment_probe_workspace_is_admitted_before_device_io() {
+    let (image, _) = fixture();
+    let device = MemoryDevice::from_image(image);
+    let mut store = mount(device.clone());
+    let maintenance = store.mint_maintenance_root().unwrap()
+        .attenuate(&[MaintenanceOperation::Scrub]).unwrap();
+    let peak = store.mounted.as_ref().unwrap().resident_heap_bytes().unwrap()
+        + crate::store::SEGMENT_PROBE_PAGE_WORKSPACE_BYTES;
+    store.limits.recovery_memory_bytes = peak - 1;
+    device.reset_io();
+    device.fail_next_read(TestError::SensitiveLocation(0xdead_beef));
+    assert_eq!(block_on(store.scrub(&maintenance)), Err(ScrubError::MemoryLimit));
+    assert_eq!(device.io_counts(), (0, 0));
+
+    store.limits.recovery_memory_bytes = peak;
+    assert_eq!(block_on(store.scrub(&maintenance)),
+        Err(ScrubError::DeviceUnavailable { failures: 1 }));
+    assert_eq!(device.io_counts(), (1, 0));
+}
+
+#[test]
+fn scrub_scan_reads_header_once_and_checks_discovered_generation() {
+    let device = MemoryDevice::blank();
+    let mut store = format(device.clone());
+    let mut batch = store.begin_staged_batch().unwrap();
+    block_on(store.stage_blob_in_batch(&mut batch, OBJECT_KIND,
+        crate::cas_codec::REFERENCE_CODEC_RAW, &[0x61; PAGE_SIZE])).unwrap();
+    let _objects = block_on(store.publish_staged_batch(batch)).unwrap();
+    let state = store.mounted.as_ref().unwrap();
+    let segment = (0..state.admitted_segments).find(|&n|
+        state.allocation.segment_state(n) != Some(SegmentAllocation::Free)).unwrap();
+    let base = segment_base_page(segment).unwrap();
+    device.reset_io();
+    block_on(crate::store::scan_segment_for_scrub(&device, uuid(),
+        state.admitted_segments, state.next_segment_generation, state.generation, segment)).unwrap();
+    {
+        let media = device.0.lock().unwrap();
+        assert_eq!(media.reads_by_page.get(&base), Some(&1));
+        assert_eq!(media.reads_by_page.get(&(base + 1)), Some(&1));
+    }
+    let image = device.image();
+    let DecodeStatus::Sealed(header) = decode_segment_header(
+        &image_page(&image, base), &image_page(&image, base + 1)).unwrap()
+    else { panic!("formatted segment must be sealed") };
+    assert!(matches!(block_on(crate::store::scan_segment_for_scrub(&device, uuid(),
+        state.admitted_segments, header.binding.generation, state.generation, segment)),
+        Err(crate::StoreError::Corrupt)));
+    device.corrupt(base, 0);
+    assert!(block_on(crate::store::scan_segment_for_scrub(&device, uuid(),
+        state.admitted_segments, state.next_segment_generation, state.generation, segment)).is_err());
 }

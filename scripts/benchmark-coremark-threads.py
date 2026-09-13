@@ -93,9 +93,18 @@ def measure(run, work, args):
             # Instruction-count virtual time: fixed work, no calibration, no rating.
             iterations[workers] = args.icount_iterations
             continue
-        output = run(f'calibration-m{workers}', workers, '0 0 0x66', 1000)
-        row = parse(output, workers, False)
-        iterations[workers] = max(1, math.ceil(args.seconds * 1000 / row['seconds']))
+        # A very short calibration is dominated by thread start-up and code
+        # translation and under-estimates steady-state throughput, which can
+        # leave a measured run under CoreMark's ten-second minimum. Lengthen
+        # the calibration until it runs for at least three seconds.
+        count = 1000
+        for attempt in range(4):
+            output = run(f'calibration-m{workers}' + (f'-{attempt}' if attempt else ''), workers, '0 0 0x66', count)
+            row = parse(output, workers, False)
+            if row['seconds'] >= 3 or attempt == 3:
+                break
+            count = math.ceil(count * 3.5 / max(row['seconds'], 0.05))
+        iterations[workers] = max(1, math.ceil(args.seconds * count / row['seconds']))
     # Interleave worker counts so an entire configuration does not occupy one
     # thermal/frequency window. Validation uses the second upstream seed set.
     for sample in [f'performance-{n+1}' for n in range(args.samples)] + ['validation']:

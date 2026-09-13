@@ -646,6 +646,29 @@ by closing the shared segment before any younger segment seals. The packed
 layout is byte-compatible with what the GC compactor already writes, and is
 exercised by the staged-batch crash matrix, the packing unit tests, and the
 file-tree QEMU case's powered-off verifier.
+- **2026-09-11: flushes and bytes per file transaction halved** (see
+  `benchmarks/storage/RESULTS.md`). Small file creates and overwrites are
+  one checkpoint of three flushes instead of two checkpoints of four
+  (content now rides the fused tree batch; scratch seals are pre-cleared by
+  the previous publication), and the COW planner keeps old node boundaries
+  so an edit in a populated directory re-stages only its own path instead
+  of most of the tree (600-file namespace: 908 KiB → 420 KiB per create).
+  Catalog changes ride the format's bounded replay chain (one 3-page delta
+  per minted object) instead of rewriting the whole object catalog every
+  checkpoint, so the per-commit catalog cost no longer grows with `@home`.
+  A transaction no longer re-reads and re-scans the namespace root it
+  just published (twice), and namespace encoding is linear instead of
+  quadratic in the file count — both were pure CPU and card reads that
+  grew with `@home`.
+  Small Blobs now use the compact single-extent layout, so each tree node
+  or small file costs one descriptor pair instead of three (about 40%
+  fewer segment pages per transaction and correspondingly less SHA-256).
+  Collection rounds batch their relocation writes into contiguous runs
+  (986 → 36 device requests for one relocated segment). Both matter far
+  more on 1-bit PIO SD than on QEMU's RAM-backed disk. Later rounds in one
+  boot reuse the previous round's authenticated edges, so only the first
+  round pays the full mark walk (~3 page reads per live node); a warm round
+  over 900 files reads about a third of a cold one.
 - One spontaneous board reset was observed under sustained write load
   (possible supply dip; worth checking the Duo's power source). Data written
   minutes before the reset survived except one subtree, consistent with the

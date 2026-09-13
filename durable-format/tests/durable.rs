@@ -1329,3 +1329,87 @@ fn incremental_replay_equals_whole_stream_recovery_at_every_cut() {
         Err(vibeos_durable_format::RecoveryError::ReplayPoisoned)
     ));
 }
+
+#[test]
+fn validation_only_finish_matches_recovery_graph_and_slot_errors() {
+    use vibeos_durable_format::PreflightValidator;
+    let mut logs = Vec::new();
+    for generation in [0, 1, 2, u64::MAX] {
+        for revoked in [false, true] {
+            logs.push(slot_log(generation, revoked).0);
+        }
+    }
+    let mut missing = TestLog::formatted();
+    missing.grant(tx(30), child_grant(11, 10, 20, 1));
+    logs.push(missing);
+    let mut amplification = TestLog::formatted();
+    let mut parent = root_grant(10, 20, 1, 1);
+    parent.rights = DurableRights::READ;
+    amplification.grant(tx(30), parent);
+    amplification.grant(tx(31), child_grant(11, 10, 20, 2));
+    logs.push(amplification);
+    let mut many = TestLog::formatted();
+    for i in 0..64 {
+        many.grant(tx(300 + i), root_grant(10 + i, 800, i as u32, 1));
+    }
+    assert_eq!(preflight_recovery(&many.sectors, store()).unwrap().slots().len(), 64);
+    logs.push(many);
+    for (case, log) in logs.iter().enumerate() {
+        for len in 1..=log.sectors.len() {
+            let records = &log.sectors[..len];
+            let expected = preflight_recovery(records, store()).map(|value| value.last_sequence());
+            let mut validator = PreflightValidator::new(store());
+            let actual = validator.append(records).and_then(|()| validator.finish());
+            assert_eq!(actual, expected, "case {case}, prefix {len}");
+        }
+    }
+}
+
+#[test]
+fn later_sealed_error_precedes_chain_error_in_the_same_append() {
+    use vibeos_durable_format::{PreflightReplay, PreflightValidator};
+    let mut chain = RecordChain::new(store());
+    let format = chain.append(None, RecordBody::Format).unwrap();
+    let mut bad = format;
+    bad[0x08] ^= 2;
+    let expected = RecoveryError::SealedRecord {
+        sector: 2,
+        source: DecodeError::UnsupportedVersion,
+    };
+    // The duplicate format at sector 1 breaks the chain before the bad seal.
+    assert_eq!(preflight_recovery(&[format, format, bad], store()).map(|v| v.last_sequence()), Err(expected));
+    let mut replay = PreflightReplay::new(store());
+    replay.append(&[format]).unwrap();
+    assert_eq!(replay.append(&[format, bad]), Err(expected));
+    assert_eq!(replay.finish().map(|v| v.last_sequence()), Err(RecoveryError::ReplayPoisoned));
+    let mut validator = PreflightValidator::new(store());
+    validator.append(&[format]).unwrap();
+    assert_eq!(validator.append(&[format, bad]), Err(expected));
+    assert_eq!(validator.finish(), Err(RecoveryError::ReplayPoisoned));
+    assert_eq!(preflight_recovery(&[format, format], store()).map(|v| v.last_sequence()),
+        Err(RecoveryError::BrokenSequence { sector: 1 }));
+}
+
+#[test]
+fn unordered_repeated_tombstones_keep_sorted_public_output() {
+    let mut chain = RecordChain::new(store());
+    let mut records = vec![chain.append(None, RecordBody::Format).unwrap(),
+        chain.append(None, RecordBody::IdHighWater { exclusive_end: HIGH_WATER }).unwrap()];
+    for (transaction, derivation) in [(31, 90), (32, 10), (33, 70), (34, 10)] {
+        records.push(chain.append(Some(tx(transaction)), RecordBody::RevokeTombstone {
+            derivation_id: deriv(derivation),
+        }).unwrap());
+    }
+    assert_eq!(recover_with(&records, &[]).unwrap().tombstones, vec![deriv(10), deriv(70), deriv(90)]);
+}
+
+#[test]
+fn indexed_graph_keeps_slots_sorted_across_spaces() {
+    let mut log = TestLog::formatted();
+    for (transaction, id, space_id, slot) in [(31, 10, 21, 4), (32, 11, 20, 9), (33, 12, 20, 2)] {
+        log.grant(tx(transaction), root_grant(id, space_id, slot, 1));
+    }
+    let recovered = preflight_recovery(&log.sectors, store()).unwrap();
+    let keys: Vec<_> = recovered.slots().iter().map(|slot| (slot.space, slot.slot)).collect();
+    assert_eq!(keys, vec![(space(20), 2), (space(20), 9), (space(21), 4)]);
+}

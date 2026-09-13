@@ -188,10 +188,23 @@ BlobKey. ObjectId MUST NOT be a digest truncation or other derivation of content
 Deduplication may omit a new Blob mapping, but it never omits the new Object
 mapping.
 
-The M7.4 writer emits a complete canonical CAS snapshot at each checkpoint and
-sets replay depth to zero. The delta ABI below is frozen for a later bounded
-replay optimization; a writer MUST NOT start emitting deltas until mount and the
-independent verifier enforce the documented chain rules.
+The M7.4 writer emitted a complete canonical CAS snapshot at each checkpoint
+with replay depth zero. Since 2026-09-11 the writer also uses the frozen delta
+ABI below as a bounded replay chain: a commit that mints `k` objects may
+append `k` delta records (one object each, chained from the checkpoint's
+replay tail back to the unchanged snapshot root) instead of rewriting the
+snapshot, provided `replay_count + k` stays within the superblock's
+`max_replay_records`. The default policy chooses deltas only when they cost
+fewer segment pages than the snapshot they would replace (one descriptor pair
+plus one payload page per delta), so small transactions against a populated
+catalog stop paying O(objects) per checkpoint while tiny catalogs keep dense
+snapshots. Every collection round and every out-of-budget commit re-emits a
+complete snapshot and resets the chain. Mount, scrub, and the independent
+verifier enforce the chain rules: chain counts decrease by one to null,
+generations never decrease along the chain (one checkpoint may append
+several deltas), ObjectIds strictly increase, a reuse delta resolves an
+already published BlobKey, and a new-Blob delta publishes its key exactly
+once.
 
 Every `PhysicalPointer` field below uses the frozen `0x60`-byte M7.2 encoding.
 Mount MUST validate store UUID, admitted segment range, non-zero and historical
@@ -232,7 +245,7 @@ exactly one Blob mapping.
 | `0x0e` | 2 | reserved | All zero |
 | `0x10` | `0x40` | BlobKey | Must match the owning Blob mapping |
 | `0x50` | 8 | encoded Blob length | Exact canonical geometry |
-| `0x58` | 4 | extent count | Exactly `ceil(exact_len / 1 MiB) + 2`; 2 through 66 |
+| `0x58` | 4 | extent count | Exactly `ceil(exact_len / 1 MiB) + 2` (2 through 66), or 1 for the compact layout |
 | `0x5c` | 4 | reserved | All zero |
 | `0x60` | 8 | extent table offset | `0x80` |
 | `0x68` | 8 | manifest encoded length | `0x80 + count * 0x80` |
@@ -254,9 +267,19 @@ immediately follows the header, with no prefix, gap, or suffix.
 
 All manifest pointers MUST be pairwise non-conflicting. Their exact logical
 ranges MUST cover `[0, encoded_blob_len)` once, in order, without overlap, gap,
-or suffix. Entry 0 MUST be the 128-byte header; entries 1 through
-`content_extent_count` MUST be the canonical content split; the final entry
-MUST be the complete tree and no other bytes.
+or suffix. In the canonical split, entry 0 MUST be the 128-byte header;
+entries 1 through `content_extent_count` MUST be the canonical content split;
+the final entry MUST be the complete tree and no other bytes. Since 2026-09-11
+a Blob whose complete canonical encoding fits one extent
+(`encoded_len <= 1 MiB`) MAY instead use the **compact layout**: exactly one
+extent (`extent_index` 0, `extent_count` 1, `encoded_offset` 0,
+`payload_byte_len == encoded_len`) carrying header, content, and tree
+contiguously. Readers locate every byte by encoded offset, so both layouts
+decode the identical canonical Blob; the compact form halves a small Blob's
+descriptor pairs. The writer uses it for every sink-buffered Blob (encoded
+length up to 256 KiB). Deduplication across layouts compares the complete
+canonical encodings. Images holding compact manifests require readers and
+verifiers at or after this revision.
 
 ### CAS snapshot header ABI (`0x80` bytes)
 
@@ -304,8 +327,10 @@ A reuse delta is exactly `0x100` bytes; a new-Blob delta is exactly `0x1a0`
 bytes. A new Blob mapping's key MUST equal the Object mapping's key. During
 replay, a reuse delta MUST resolve its key in the base snapshot or an earlier
 delta. Following `previous_delta` MUST reduce the chain depth by one and
-terminate at null within the checkpoint's replay limit. Duplicate ObjectIds,
-conflicting Blob mappings, and mixed generations fail closed.
+terminate at null within the checkpoint's replay limit. Chain generations are
+non-decreasing from the snapshot root to the tail. Duplicate ObjectIds,
+conflicting Blob mappings, and a delta whose generation precedes its
+predecessor's fail closed.
 
 ## BlobWriter state machine
 

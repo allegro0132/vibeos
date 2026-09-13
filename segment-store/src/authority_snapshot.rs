@@ -341,7 +341,7 @@ impl PersistentAuthorityImport {
         let mut record_stream = Vec::new();
         record_stream
             .try_reserve_exact(record_bytes)
-            .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+            .map_err(|_| AuthoritySnapshotError::MemoryLimit)?;
         let dense_stream = recovered.last_sequence == sectors.len() as u64;
         if dense_stream {
             // Valid sequences are strictly dense (1..=n), so a stream whose
@@ -600,7 +600,76 @@ pub struct PersistentAuthoritySnapshot {
     external_roots: Vec<PersistentRootEntry>,
 }
 
+// Own the publication encoding until read-back finishes. Reuse its capacity
+// for the installed log when possible, instead of allocating another log copy.
+pub(crate) struct PreparedPublicationSnapshot<'a> {
+    source: &'a PersistentAuthoritySnapshot,
+    encoded: Vec<u8>,
+    successor: PersistentAuthoritySnapshot,
+    reuse_encoded: bool,
+}
+
+impl PreparedPublicationSnapshot<'_> {
+    pub(crate) fn source(&self) -> &PersistentAuthoritySnapshot { self.source }
+    pub(crate) fn encoded(&self) -> &Vec<u8> { &self.encoded }
+
+    // All capacity was reserved before publication. Neither branch allocates.
+    pub(crate) fn finish(self) -> PersistentAuthoritySnapshot {
+        let Self { source, encoded, mut successor, reuse_encoded } = self;
+        if reuse_encoded {
+            successor.record_stream = encoded;
+            successor.record_stream.clear();
+        } else {
+            drop(encoded);
+        }
+        successor.record_stream.extend_from_slice(source.record_stream());
+        successor
+    }
+}
+
 impl PersistentAuthoritySnapshot {
+    // Experimental publication phase only. `other_resident` includes the
+    // predecessor state and root table. Charge this source and the owned
+    // encoding as well before reserving successor tables/log capacity.
+    #[cfg(any(test, feature = "experimental-authority-delta"))]
+    pub(crate) fn prepare_publication_with_resident(
+        &self,
+        encoded: Vec<u8>,
+        other_resident: usize,
+        maximum_bytes: usize,
+    ) -> Result<PreparedPublicationSnapshot<'_>, AuthoritySnapshotError> {
+        let workspace = other_resident.checked_add(self.allocated_bytes().ok_or(AuthoritySnapshotError::MemoryLimit)?)
+            .and_then(|bytes| bytes.checked_add(encoded.capacity()))
+            .and_then(|bytes| maximum_bytes.checked_sub(bytes))
+            .ok_or(AuthoritySnapshotError::MemoryLimit)?;
+        self.prepare_publication(encoded, workspace)
+    }
+
+    pub(crate) fn prepare_publication(
+        &self,
+        encoded: Vec<u8>,
+        maximum_workspace: usize,
+    ) -> Result<PreparedPublicationSnapshot<'_>, AuthoritySnapshotError> {
+        let mut successor = Self {
+            checkpoint_generation: self.checkpoint_generation,
+            root_policy_sha256: self.root_policy_sha256,
+            record_stream: Vec::new(), objects: Vec::new(),
+            principals: Vec::new(), external_roots: Vec::new(),
+        };
+        let mut used = 0;
+        reserve_metadata(&mut successor.objects, self.objects.len(), &mut used, maximum_workspace)?;
+        successor.objects.extend_from_slice(&self.objects);
+        reserve_metadata(&mut successor.principals, self.principals.len(), &mut used, maximum_workspace)?;
+        successor.principals.extend_from_slice(&self.principals);
+        reserve_metadata(&mut successor.external_roots, self.external_roots.len(), &mut used, maximum_workspace)?;
+        successor.external_roots.extend_from_slice(&self.external_roots);
+        let reuse_encoded = encoded.capacity() >= self.record_stream.len();
+        if !reuse_encoded {
+            reserve_metadata(&mut successor.record_stream, self.record_stream.len(), &mut used, maximum_workspace)?;
+        }
+        Ok(PreparedPublicationSnapshot { source: self, encoded, successor, reuse_encoded })
+    }
+
     pub(crate) fn new(
         checkpoint_generation: u64,
         root_policy_sha256: [u8; 32],
@@ -621,9 +690,9 @@ impl PersistentAuthoritySnapshot {
     }
 
     /// Build a snapshot whose record stream is known to be validated because
-    /// it was taken verbatim from a [`PersistentAuthorityImport`], whose only
-    /// constructors preflight the stream. Every structural field check still
-    /// runs; only the per-record chain walk is skipped.
+    /// it was taken verbatim from a [`PersistentAuthorityImport`] or another
+    /// validated snapshot. Their constructors preflight the stream. Every
+    /// structural field check still runs; only the record-chain walk is skipped.
     pub(crate) fn from_validated_import_parts(
         checkpoint_generation: u64,
         root_policy_sha256: [u8; 32],
@@ -706,14 +775,17 @@ impl PersistentAuthoritySnapshot {
         &self,
         checkpoint_generation: u64,
     ) -> Result<Self, AuthoritySnapshotError> {
-        Self::new(
+        // The private record stream was validated on construction and is
+        // cloned unchanged. Recheck structural fields against the new
+        // generation without replaying the same authority graph twice.
+        Self::from_validated_import_parts(
             checkpoint_generation,
             self.root_policy_sha256,
             self.record_stream.clone(),
             self.objects.clone(),
             self.principals.clone(),
-        )?
-        .with_external_roots(self.external_roots.clone())
+            self.external_roots.clone(),
+        )
     }
 }
 
@@ -726,6 +798,7 @@ pub enum AuthoritySnapshotError {
     InvalidAuthorityGraph,
     InvalidRecord,
     NonZeroReserved,
+    MemoryLimit,
     OutOfBounds,
     PolicyMismatch,
     UnsortedOrDuplicate,
@@ -743,6 +816,7 @@ impl fmt::Display for AuthoritySnapshotError {
             }
             Self::InvalidRecord => "persistent authority record stream is not canonical",
             Self::NonZeroReserved => "persistent authority reserved bytes are non-zero",
+            Self::MemoryLimit => "persistent authority workspace allocation exceeds its allowance",
             Self::OutOfBounds => "persistent authority snapshot exceeds its fixed bound",
             Self::PolicyMismatch => "persistent authority external root policy does not match",
             Self::UnsortedOrDuplicate => {
@@ -758,12 +832,84 @@ pub fn root_policy_commitment(canonical_policy: &[u8]) -> [u8; 32] {
     Sha256::digest(canonical_policy).into()
 }
 
+/// Exact frozen-format size; unlike encoding, this performs no allocation.
+/// Checkpoint generation changes values, never the encoded table widths.
+pub(crate) fn persistent_authority_encoded_len(
+    value: &PersistentAuthoritySnapshot,
+) -> Result<usize, AuthoritySnapshotError> {
+    persistent_authority_encoded_len_for_parts(
+        value.record_stream.len(), value.objects.len(), value.principals.len(),
+        value.external_roots.len())
+}
+
+// Size a pending snapshot before its physical object bindings exist. Counts
+// must describe the final tables; their values cannot change encoded widths.
+pub(crate) fn persistent_authority_encoded_len_for_parts(
+    record_bytes: usize,
+    objects: usize,
+    principals: usize,
+    external_roots: usize,
+) -> Result<usize, AuthoritySnapshotError> {
+    let encoded_len = PERSISTENT_AUTHORITY_HEADER_LEN
+        .checked_add(objects.checked_mul(PERSISTENT_AUTHORITY_OBJECT_BINDING_LEN)
+            .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?)
+        .and_then(|bytes| principals.checked_mul(PERSISTENT_AUTHORITY_PRINCIPAL_LEN)
+            .and_then(|more| bytes.checked_add(more)))
+        .and_then(|bytes| bytes.checked_add(record_bytes))
+        .and_then(|bytes| external_roots.checked_mul(PERSISTENT_ROOT_ENTRY_LEN)
+            .and_then(|more| bytes.checked_add(more)))
+        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    if encoded_len > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN {
+        return Err(AuthoritySnapshotError::OutOfBounds);
+    }
+    Ok(encoded_len)
+}
+
 pub fn encode_persistent_authority_snapshot(
     value: &PersistentAuthoritySnapshot,
 ) -> Result<Vec<u8>, AuthoritySnapshotError> {
-    // Every constructor validated the snapshot, including its record chain;
-    // re-run only the cheap structural checks before encoding.
-    validate(value, false)?;
+    encode_snapshot(value, true)
+}
+
+/// Hash the canonical snapshot without copying the validated record stream.
+/// Metadata carries the full encoded lengths, exactly as the on-media encoder.
+pub(crate) fn persistent_authority_snapshot_sha256(
+    value: &PersistentAuthoritySnapshot,
+) -> Result<[u8; 32], AuthoritySnapshotError> {
+    let metadata = encode_snapshot(value, false)?;
+    let mut hash = Sha256::new();
+    hash.update(&metadata);
+    hash.update(value.record_stream());
+    Ok(hash.finalize().into())
+}
+
+/// Canonical metadata prefix for experimental delta encoding. The header still
+/// describes the full snapshot; this prefix alone is not a decodable snapshot.
+#[cfg(any(test, feature = "experimental-authority-delta"))]
+pub(crate) fn encode_persistent_authority_metadata(
+    value: &PersistentAuthoritySnapshot,
+) -> Result<Vec<u8>, AuthoritySnapshotError> {
+    encode_snapshot(value, false)
+}
+
+fn encode_snapshot(
+    value: &PersistentAuthoritySnapshot,
+    include_records: bool,
+) -> Result<Vec<u8>, AuthoritySnapshotError> {
+    encode_snapshot_bounded(value, include_records, usize::MAX).map(|(bytes, _)| bytes)
+}
+
+// Input snapshot storage belongs to the caller. Structural index scratch is
+// dropped before output allocation; peak is the larger of those two phases.
+pub(crate) fn encode_snapshot_bounded(
+    value: &PersistentAuthoritySnapshot,
+    include_records: bool,
+    maximum_bytes: usize,
+) -> Result<(Vec<u8>, usize), AuthoritySnapshotError> {
+    // Constructors validate the record chain; encoding rechecks structure only.
+    let scratch_peak = validate_with_records_bounded(
+        value, &value.record_stream, false, maximum_bytes,
+    )?;
     let object_offset = PERSISTENT_AUTHORITY_HEADER_LEN;
     let principal_offset = object_offset
         .checked_add(
@@ -793,13 +939,15 @@ pub fn encode_persistent_authority_snapshot(
                 .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?,
         )
         .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
-    let encoded_len = record_offset
-        .checked_add(value.record_stream.len())
-        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
-    if encoded_len > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN {
-        return Err(AuthoritySnapshotError::OutOfBounds);
-    }
-    let mut output = vec![0; encoded_len];
+    let encoded_len = persistent_authority_encoded_len(value)?;
+    let output_len = if include_records { encoded_len } else { record_offset };
+    // Metadata has reserved fields that must stay zero. Record bytes are
+    // already canonical and fill the suffix completely: reserve their space
+    // now, but avoid zeroing it only to overwrite it during the final copy.
+    let mut output = Vec::new();
+    let mut output_bytes = 0;
+    reserve_metadata(&mut output, output_len, &mut output_bytes, maximum_bytes)?;
+    output.resize(record_offset, 0);
     output[..8].copy_from_slice(MAGIC);
     put_u16(&mut output, 0x08, PERSISTENT_AUTHORITY_SNAPSHOT_VERSION);
     put_u16(&mut output, 0x0a, PERSISTENT_AUTHORITY_HEADER_LEN as u16);
@@ -848,13 +996,77 @@ pub fn encode_persistent_authority_snapshot(
         put_u64(&mut output, offset + 0x10, root.commit_generation);
         put_u32(&mut output, offset + 0x18, root.object_kind);
     }
-    output[record_offset..].copy_from_slice(&value.record_stream);
-    Ok(output)
+    if include_records {
+        output.extend_from_slice(&value.record_stream);
+    }
+    Ok((output, scratch_peak.max(output_bytes)))
 }
 
 pub fn decode_persistent_authority_snapshot(
     input: &[u8],
 ) -> Result<PersistentAuthoritySnapshot, AuthoritySnapshotError> {
+    decode_snapshot(input, true, usize::MAX).map(|(snapshot, _)| snapshot)
+}
+
+/// Decode an owned snapshot within a requested workspace allowance. Input bytes
+/// are owned by the caller and must be charged separately. Includes metadata,
+/// semantic/index scratch and the final record-stream copy at their peak overlap.
+pub(crate) fn decode_persistent_authority_snapshot_bounded(
+    input: &[u8], maximum_bytes: usize,
+) -> Result<(PersistentAuthoritySnapshot, usize), AuthoritySnapshotError> {
+    decode_snapshot(input, true, maximum_bytes)
+}
+
+/// Validate canonical V2 bytes and their full authority graph without retaining
+/// another copy of the record stream. Metadata tables remain decoder-owned.
+#[cfg(any(test, feature = "experimental-authority-delta"))]
+pub(crate) fn validate_canonical_authority_bytes(
+    input: &[u8],
+) -> Result<(u64, usize), AuthoritySnapshotError> {
+    let validated = validate_authority_bytes(input)?;
+    if get_u16(input, 0x08) != PERSISTENT_AUTHORITY_SNAPSHOT_VERSION {
+        return Err(AuthoritySnapshotError::InvalidField);
+    }
+    Ok(validated)
+}
+
+/// Validate any supported full snapshot, including legacy V1, without copying
+/// its record stream. Only validated generation/offset escape this helper.
+#[cfg(any(test, feature = "experimental-authority-delta"))]
+pub(crate) fn validate_authority_bytes(
+    input: &[u8],
+) -> Result<(u64, usize), AuthoritySnapshotError> {
+    let (decoded, _) = decode_snapshot(input, false, usize::MAX)?;
+    Ok((decoded.checkpoint_generation(), get_u64(input, 0x60) as usize))
+}
+
+// Bound metadata plus the larger of semantic replay and temporary ID-index workspace.
+#[cfg(any(test, feature = "experimental-authority-delta"))]
+pub(crate) fn validate_authority_bytes_bounded(
+    input: &[u8], budget: usize,
+) -> Result<(u64, usize, usize), AuthoritySnapshotError> {
+    let (decoded, peak) = decode_snapshot(input, false, budget)?;
+    Ok((decoded.checkpoint_generation(), get_u64(input, 0x60) as usize, peak))
+}
+
+fn reserve_metadata<T>(table: &mut Vec<T>, count: usize, used: &mut usize, budget: usize)
+    -> Result<(), AuthoritySnapshotError>
+{
+    let requested = count.checked_mul(core::mem::size_of::<T>())
+        .and_then(|bytes| used.checked_add(bytes)).ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    if requested > budget { return Err(AuthoritySnapshotError::MemoryLimit); }
+    table.try_reserve_exact(count).map_err(|_| AuthoritySnapshotError::MemoryLimit)?;
+    *used = table.capacity().checked_mul(core::mem::size_of::<T>())
+        .and_then(|bytes| used.checked_add(bytes)).ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    if *used > budget { return Err(AuthoritySnapshotError::MemoryLimit); }
+    Ok(())
+}
+
+fn decode_snapshot(
+    input: &[u8],
+    retain_records: bool,
+    metadata_budget: usize,
+) -> Result<(PersistentAuthoritySnapshot, usize), AuthoritySnapshotError> {
     if input.len() < PERSISTENT_AUTHORITY_HEADER_LEN
         || input.len() > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN
     {
@@ -943,10 +1155,15 @@ pub fn decode_persistent_authority_snapshot(
     {
         return Err(AuthoritySnapshotError::InvalidLength);
     }
+    // Reject the complete declared metadata footprint before any table allocation.
+    let requested = object_count.checked_mul(core::mem::size_of::<PersistentObjectBinding>())
+        .and_then(|bytes| principal_count.checked_mul(core::mem::size_of::<PersistentPrincipalPolicy>()).and_then(|n| bytes.checked_add(n)))
+        .and_then(|bytes| external_root_count.checked_mul(core::mem::size_of::<PersistentRootEntry>()).and_then(|n| bytes.checked_add(n)))
+        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    if requested > metadata_budget { return Err(AuthoritySnapshotError::MemoryLimit); }
+    let mut metadata_used = 0;
     let mut objects = Vec::new();
-    objects
-        .try_reserve_exact(object_count)
-        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    reserve_metadata(&mut objects, object_count, &mut metadata_used, metadata_budget)?;
     for index in 0..object_count {
         let offset = object_offset + index * PERSISTENT_AUTHORITY_OBJECT_BINDING_LEN;
         if get_u32(input, offset + 0x2c) != 0 {
@@ -960,9 +1177,7 @@ pub fn decode_persistent_authority_snapshot(
         });
     }
     let mut principals = Vec::new();
-    principals
-        .try_reserve_exact(principal_count)
-        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    reserve_metadata(&mut principals, principal_count, &mut metadata_used, metadata_budget)?;
     for index in 0..principal_count {
         let offset = principal_offset + index * PERSISTENT_AUTHORITY_PRINCIPAL_LEN;
         if input[offset + 0x30] > 1 || !is_zero(&input[offset + 0x31..offset + 0x40]) {
@@ -984,9 +1199,7 @@ pub fn decode_persistent_authority_snapshot(
         });
     }
     let mut external_roots = Vec::new();
-    external_roots
-        .try_reserve_exact(external_root_count)
-        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    reserve_metadata(&mut external_roots, external_root_count, &mut metadata_used, metadata_budget)?;
     for index in 0..external_root_count {
         let offset = external_root_offset + index * PERSISTENT_ROOT_ENTRY_LEN;
         if get_u32(input, offset + 0x1c) != 0 {
@@ -998,39 +1211,101 @@ pub fn decode_persistent_authority_snapshot(
             object_kind: get_u32(input, offset + 0x18),
         });
     }
-    let record_stream = input[record_offset..].to_vec();
-    let snapshot = PersistentAuthoritySnapshot {
+    let mut snapshot = PersistentAuthoritySnapshot {
         checkpoint_generation: get_u64(input, 0x10),
         root_policy_sha256: input[0x18..0x38].try_into().expect("fixed policy digest"),
-        record_stream,
+        record_stream: Vec::new(),
         objects,
         principals,
         external_roots,
     };
-    validate(&snapshot, true)?;
-    Ok(snapshot)
+    let scratch_budget = metadata_budget.checked_sub(metadata_used)
+        .ok_or(AuthoritySnapshotError::MemoryLimit)?;
+    let scratch_peak = validate_with_records_bounded(&snapshot, &input[record_offset..], true, scratch_budget)?;
+    let mut metadata_peak = metadata_used.checked_add(scratch_peak)
+        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    if retain_records {
+        reserve_metadata(&mut snapshot.record_stream, input.len() - record_offset,
+            &mut metadata_used, metadata_budget)?;
+        snapshot.record_stream.extend_from_slice(&input[record_offset..]);
+        metadata_peak = metadata_peak.max(metadata_used);
+    }
+    Ok((snapshot, metadata_peak))
 }
 
 fn validate(
     value: &PersistentAuthoritySnapshot,
     check_record_chain: bool,
 ) -> Result<(), AuthoritySnapshotError> {
+    validate_with_records(value, &value.record_stream, check_record_chain)
+}
+
+fn validate_with_records(
+    value: &PersistentAuthoritySnapshot,
+    records: &[u8],
+    check_record_chain: bool,
+) -> Result<(), AuthoritySnapshotError> {
+    validate_with_records_bounded(value, records, check_record_chain, usize::MAX).map(|_| ())
+}
+
+fn validate_with_records_bounded(
+    value: &PersistentAuthoritySnapshot,
+    records: &[u8],
+    check_record_chain: bool,
+    scratch_budget: usize,
+) -> Result<usize, AuthoritySnapshotError> {
     if value.checkpoint_generation == 0
         || value.root_policy_sha256 == [0; 32]
-        || value.record_stream.is_empty()
-        || !value.record_stream.len().is_multiple_of(RECORD_SIZE)
+        || records.is_empty()
+        || !records.len().is_multiple_of(RECORD_SIZE)
         || value.principals.len() > MAX_STABLE_PRINCIPALS
     {
         return Err(AuthoritySnapshotError::InvalidField);
     }
-    if check_record_chain {
-        validate_record_chain(&value.record_stream)?;
+    let semantic_peak = if check_record_chain {
+        validate_record_chain_bounded(records, scratch_budget)?
+    } else { 0 };
+    let v2_object_ids = validate_binding_index(value, scratch_budget)?;
+    validate_principals(&value.principals)?;
+    let mut previous_external = None;
+    for root in &value.external_roots {
+        if root.object_id == 0
+            || root.commit_generation == 0
+            || root.commit_generation > value.checkpoint_generation
+            || root.object_kind == 0
+            || previous_external.is_some_and(|id| id >= root.object_id)
+            || v2_object_ids.as_ref().map_or_else(
+                || value.objects.binary_search_by_key(&root.object_id, |binding| binding.v2_object_id).is_ok(),
+                |ids| ids.binary_search(&root.object_id).is_ok(),
+            )
+        {
+            return Err(AuthoritySnapshotError::UnsortedOrDuplicate);
+        }
+        previous_external = Some(root.object_id);
     }
+    let encoded_len = persistent_authority_encoded_len(value)?
+        .checked_sub(value.record_stream.len())
+        .and_then(|n| n.checked_add(records.len()))
+        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
+    if encoded_len > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN {
+        return Err(AuthoritySnapshotError::OutOfBounds);
+    }
+    let index_peak = v2_object_ids.as_ref().map_or(Ok(0), |ids|
+        ids.capacity().checked_mul(core::mem::size_of::<u128>())
+            .ok_or(AuthoritySnapshotError::ArithmeticOverflow))?;
+    Ok(semantic_peak.max(index_peak))
+}
+
+// Most publications preserve V2 ID order as well as stable ID order. In that
+// case the binding table itself is an index: no copied ID array or sort is
+// necessary. A non-monotonic mapping remains valid and uses a sorted fallback.
+fn validate_binding_index(
+    value: &PersistentAuthoritySnapshot,
+    budget: usize,
+) -> Result<Option<Vec<u128>>, AuthoritySnapshotError> {
     let mut previous_stable = None;
-    let mut v2_object_ids = Vec::new();
-    v2_object_ids
-        .try_reserve_exact(value.objects.len())
-        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    let mut previous_v2 = None;
+    let mut ordered_v2 = true;
     for binding in &value.objects {
         if binding.stable_object_id == 0
             || binding.v2_object_id == 0
@@ -1042,79 +1317,49 @@ fn validate(
             return Err(AuthoritySnapshotError::UnsortedOrDuplicate);
         }
         previous_stable = Some(binding.stable_object_id);
-        v2_object_ids.push(binding.v2_object_id);
+        ordered_v2 &= previous_v2.is_none_or(|id| id < binding.v2_object_id);
+        previous_v2 = Some(binding.v2_object_id);
     }
-    v2_object_ids.sort_unstable();
-    if v2_object_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+    if ordered_v2 { return Ok(None); }
+    let mut ids = Vec::new();
+    let mut used = 0;
+    reserve_metadata(&mut ids, value.objects.len(), &mut used, budget)?;
+    ids.extend(value.objects.iter().map(|binding| binding.v2_object_id));
+    ids.sort_unstable();
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(AuthoritySnapshotError::UnsortedOrDuplicate);
     }
-    validate_principals(&value.principals)?;
-    let mut previous_external = None;
-    for root in &value.external_roots {
-        if root.object_id == 0
-            || root.commit_generation == 0
-            || root.commit_generation > value.checkpoint_generation
-            || root.object_kind == 0
-            || previous_external.is_some_and(|id| id >= root.object_id)
-            || v2_object_ids.binary_search(&root.object_id).is_ok()
-        {
-            return Err(AuthoritySnapshotError::UnsortedOrDuplicate);
-        }
-        previous_external = Some(root.object_id);
-    }
-    let encoded_len = PERSISTENT_AUTHORITY_HEADER_LEN
-        .checked_add(
-            value
-                .objects
-                .len()
-                .checked_mul(PERSISTENT_AUTHORITY_OBJECT_BINDING_LEN)
-                .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?,
-        )
-        .and_then(|bytes| {
-            value
-                .principals
-                .len()
-                .checked_mul(PERSISTENT_AUTHORITY_PRINCIPAL_LEN)
-                .and_then(|more| bytes.checked_add(more))
-        })
-        .and_then(|bytes| bytes.checked_add(value.record_stream.len()))
-        .and_then(|bytes| {
-            value
-                .external_roots
-                .len()
-                .checked_mul(PERSISTENT_ROOT_ENTRY_LEN)
-                .and_then(|more| bytes.checked_add(more))
-        })
-        .ok_or(AuthoritySnapshotError::ArithmeticOverflow)?;
-    if encoded_len > MAX_PERSISTENT_AUTHORITY_PAYLOAD_LEN {
-        return Err(AuthoritySnapshotError::OutOfBounds);
-    }
-    Ok(())
+    Ok(Some(ids))
 }
 
 fn validate_record_chain(record_stream: &[u8]) -> Result<(), AuthoritySnapshotError> {
-    let record_count = record_stream.len() / RECORD_SIZE;
-    let mut sectors = Vec::new();
-    sectors
-        .try_reserve_exact(record_count)
-        .map_err(|_| AuthoritySnapshotError::OutOfBounds)?;
+    validate_record_chain_bounded(record_stream, usize::MAX).map(|_| ())
+}
+
+fn validate_record_chain_bounded(record_stream: &[u8], budget: usize)
+    -> Result<usize, AuthoritySnapshotError> {
+    let (sectors, remainder) = record_stream.as_chunks::<RECORD_SIZE>();
+    if !remainder.is_empty() { return Err(AuthoritySnapshotError::InvalidRecord); }
     let mut store_id = None;
-    for bytes in record_stream.chunks_exact(RECORD_SIZE) {
-        let sector: [u8; RECORD_SIZE] = bytes.try_into().expect("exact record chunk");
-        let decoded = match LogRecord::decode(&sector) {
-            Ok(DecodeStatus::Valid(decoded)) => decoded,
-            _ => return Err(AuthoritySnapshotError::InvalidRecord),
-        };
-        store_id.get_or_insert(decoded.record.store_id);
-        sectors.push(sector);
+    // Snapshot streams reject empty/torn records. Inspect without allocating
+    // chunk content, preserving sealed-record errors before semantic errors.
+    for sector in sectors {
+        let Some((store, _)) = LogRecord::inspect_sector(sector)
+            .map_err(|_| AuthoritySnapshotError::InvalidRecord)? else {
+                return Err(AuthoritySnapshotError::InvalidRecord);
+            };
+        store_id.get_or_insert(store);
     }
-    let store_id = store_id.ok_or(AuthoritySnapshotError::InvalidRecord)?;
-    let preflight = preflight_recovery(&sectors, store_id)
-        .map_err(|_| AuthoritySnapshotError::InvalidAuthorityGraph)?;
-    if preflight.last_sequence() as usize != sectors.len() {
-        return Err(AuthoritySnapshotError::InvalidAuthorityGraph);
-    }
-    Ok(())
+    let store = store_id.ok_or(AuthoritySnapshotError::InvalidRecord)?;
+    let map_error = |error| match error {
+        vibeos_durable_format::RecoveryError::AllocationFailed => AuthoritySnapshotError::MemoryLimit,
+        _ => AuthoritySnapshotError::InvalidAuthorityGraph,
+    };
+    let mut replay = vibeos_durable_format::PreflightValidator::with_memory_limit(store, budget);
+    for batch in sectors.chunks(32) { replay.append(batch).map_err(map_error)?; }
+    let (last_sequence, usage) = replay.finish_with_memory_usage().map_err(map_error)?;
+    if last_sequence as usize != sectors.len() { return Err(AuthoritySnapshotError::InvalidRecord); }
+    Ok(usage.peak_bytes)
 }
 
 fn validate_principals(
@@ -1291,9 +1536,93 @@ mod tests {
     }
 
     #[test]
+    fn bounded_encoder_admits_output_and_releases_structural_scratch() {
+        let mut value = sample();
+        value.objects.push(PersistentObjectBinding {
+            stable_object_id: 4, v2_object_id: 3, commit_generation: 7, object_kind: 0x41,
+        });
+        value.objects[0].v2_object_id = 3;
+        value.objects[1].v2_object_id = 1;
+        let scratch = value.objects.len() * core::mem::size_of::<u128>();
+        for include_records in [false, true] {
+            let expected = encode_snapshot(&value, include_records).unwrap();
+            let output_bytes = expected.len();
+            assert!(output_bytes > scratch);
+            assert_eq!(encode_snapshot_bounded(&value, include_records, output_bytes - 1),
+                Err(AuthoritySnapshotError::MemoryLimit));
+            let (bytes, peak) = encode_snapshot_bounded(&value, include_records, output_bytes).unwrap();
+            assert_eq!(bytes, expected);
+            assert_eq!(peak, output_bytes, "scratch must be dropped before output allocation");
+            assert_eq!(encode_snapshot_bounded(&value, include_records, scratch - 1),
+                Err(AuthoritySnapshotError::MemoryLimit));
+        }
+        value.objects[1].v2_object_id = 3;
+        assert_eq!(encode_snapshot_bounded(&value, true, usize::MAX),
+            Err(AuthoritySnapshotError::UnsortedOrDuplicate));
+    }
+
+    #[test]
+    fn bounded_record_replay_matches_whole_stream_across_transaction_boundaries() {
+        let store = StoreId::new(7).unwrap();
+        let mut chain = RecordChain::new(store);
+        let mut records = vec![chain.append(None, RecordBody::Format).unwrap(),
+            chain.append(None, RecordBody::IdHighWater { exclusive_end: 32 }).unwrap()];
+        records.extend(encode_object_transaction(&mut chain, TransactionId::new(3).unwrap(),
+            ObjectId::new(4).unwrap(), ObjectKind::new(5).unwrap(), &vec![0x59; 32 * 1024]).unwrap().records);
+        assert!(records.len() > 64);
+        // Compare all complete-record prefixes, including incomplete object
+        // transactions, against the original whole-stream semantic oracle.
+        for len in 1..=records.len() {
+            let bytes: Vec<u8> = records[..len].iter().flatten().copied().collect();
+            let expected = preflight_recovery(&records[..len], store).is_ok();
+            assert_eq!(validate_record_chain(&bytes).is_ok(), expected, "prefix {len}");
+        }
+        // A partial final record must be rejected rather than dropped by a
+        // chunking API. Also exercise a borrowed slice starting one byte in.
+        let complete: Vec<u8> = records.iter().flatten().copied().collect();
+        let mut offset = vec![0xff];
+        offset.extend_from_slice(&complete);
+        assert!(validate_record_chain(&offset[1..]).is_ok());
+        for tail in 1..RECORD_SIZE {
+            assert!(validate_record_chain(&complete[..complete.len() - tail]).is_err());
+        }
+        for boundary in [32,64] {
+            let mut bad = records.clone(); bad.swap(boundary-1, boundary);
+            assert!(preflight_recovery(&bad, store).is_err());
+            assert!(validate_record_chain(&bad.iter().flatten().copied().collect::<Vec<u8>>()).is_err());
+            let mut bad = records.clone(); bad[boundary][0] ^= 1;
+            assert!(validate_record_chain(&bad.iter().flatten().copied().collect::<Vec<u8>>()).is_err());
+        }
+    }
+
+    #[test]
+    fn relocated_snapshot_preserves_tables_and_checks_generation_constraints() {
+        let original = sample().with_external_roots(vec![PersistentRootEntry {
+            object_id: 42, commit_generation: 9, object_kind: 7,
+        }]).unwrap();
+        let moved = original.relocated(10).unwrap();
+        let mut expected = encode_persistent_authority_snapshot(&original).unwrap();
+        put_u64(&mut expected, 0x10, 10);
+        assert_eq!(encode_persistent_authority_snapshot(&moved).unwrap(), expected);
+        assert_eq!(decode_persistent_authority_snapshot(&expected).unwrap(), moved);
+        assert!(original.relocated(0).is_err());
+        // Both object bindings and external roots must remain valid at the
+        // new generation; bypassing stream replay must not bypass these.
+        assert!(original.relocated(8).is_err());
+        assert!(sample().relocated(6).is_err());
+        let mut bad_binding = original.clone();
+        bad_binding.objects[0].object_kind = 0;
+        assert!(bad_binding.relocated(10).is_err());
+    }
+
+    #[test]
     fn canonical_round_trip_and_reserved_corruption_fail_closed() {
         let sample = sample();
         let bytes = encode_persistent_authority_snapshot(&sample).unwrap();
+        assert_eq!(persistent_authority_encoded_len(&sample).unwrap(), bytes.len());
+        let relocated = sample.relocated(sample.checkpoint_generation + 1).unwrap();
+        assert_eq!(persistent_authority_encoded_len(&relocated).unwrap(), bytes.len());
+        assert_eq!(encode_persistent_authority_snapshot(&relocated).unwrap().len(), bytes.len());
         assert_eq!(&bytes[..8], b"VIBEAUT2");
         assert_eq!(
             decode_persistent_authority_snapshot(&bytes).unwrap(),
@@ -1310,6 +1639,207 @@ mod tests {
     }
 
     #[test]
+    fn publication_successor_reuses_encoding_and_prepares_short_buffer_fallback() {
+        let value = sample().with_external_roots(vec![PersistentRootEntry {
+            object_id: 17, commit_generation: 8, object_kind: 0x4653_0001,
+        }]).unwrap();
+        let table_bytes = value.objects.len() * core::mem::size_of::<PersistentObjectBinding>()
+            + value.principals.len() * core::mem::size_of::<PersistentPrincipalPolicy>()
+            + value.external_roots.len() * core::mem::size_of::<PersistentRootEntry>();
+        let encoded = encode_persistent_authority_snapshot(&value).unwrap();
+        let address = encoded.as_ptr();
+        let capacity = encoded.capacity();
+        assert!(matches!(value.prepare_publication(encoded.clone(), table_bytes - 1),
+            Err(AuthoritySnapshotError::MemoryLimit)));
+        let prepared = value.prepare_publication(encoded, table_bytes).unwrap();
+        let successor = prepared.finish();
+        assert_eq!(successor, value);
+        assert_eq!(successor.record_stream.as_ptr(), address);
+        assert_eq!(successor.record_stream.capacity(), capacity);
+        // A short delta encoding cannot hold the complete log. Its extra
+        // record capacity must be admitted now, not after durable publication.
+        let required = table_bytes + value.record_stream.len();
+        assert!(matches!(value.prepare_publication(vec![0; 16], required - 1),
+            Err(AuthoritySnapshotError::MemoryLimit)));
+        let prepared = value.prepare_publication(vec![0; 16], required).unwrap();
+        let reserved = prepared.successor.record_stream.as_ptr();
+        assert_eq!(prepared.successor.record_stream.capacity(), value.record_stream.len());
+        let successor = prepared.finish();
+        assert_eq!(successor, value);
+        assert_eq!(successor.record_stream.as_ptr(), reserved);
+    }
+
+    #[test]
+    fn publication_overlap_charges_source_encoding_and_successor_capacity() {
+        let value = sample();
+        let tables = value.objects.len() * core::mem::size_of::<PersistentObjectBinding>()
+            + value.principals.len() * core::mem::size_of::<PersistentPrincipalPolicy>()
+            + value.external_roots.len() * core::mem::size_of::<PersistentRootEntry>();
+        let mut spare = Vec::with_capacity(value.record_stream.len() + 4096);
+        spare.resize(16, 0);
+        for encoded in [encode_persistent_authority_snapshot(&value).unwrap(), vec![0; 16], spare] {
+            let other = 1234;
+            let resident = other + value.allocated_bytes().unwrap() + encoded.capacity();
+            let extra_log = if encoded.capacity() < value.record_stream.len() { value.record_stream.len() } else { 0 };
+            let exact = resident + tables + extra_log;
+            let copy = || {
+                let mut bytes = Vec::with_capacity(encoded.capacity());
+                bytes.extend_from_slice(&encoded);
+                bytes
+            };
+            for denied in [0, resident - 1, exact - 1] {
+                assert!(matches!(value.prepare_publication_with_resident(copy(), other, denied),
+                    Err(AuthoritySnapshotError::MemoryLimit)));
+            }
+            assert!(matches!(value.prepare_publication_with_resident(copy(), usize::MAX, usize::MAX),
+                Err(AuthoritySnapshotError::MemoryLimit)));
+            let prepared = value.prepare_publication_with_resident(encoded, other, exact).unwrap();
+            assert_eq!(prepared.finish(), value);
+        }
+    }
+
+    #[test]
+    fn streamed_snapshot_digest_matches_canonical_bytes_and_rejects_bad_metadata() {
+        let base = sample();
+        let rooted = base.clone().with_external_roots(vec![PersistentRootEntry {
+            object_id: 17, commit_generation: 8, object_kind: 0x4653_0001,
+        }]).unwrap();
+        for value in [base.clone(), base.relocated(12).unwrap(), rooted] {
+            let complete = encode_persistent_authority_snapshot(&value).unwrap();
+            let expected: [u8; 32] = Sha256::digest(&complete).into();
+            assert_eq!(persistent_authority_snapshot_sha256(&value).unwrap(), expected);
+        }
+        let mut invalid = base;
+        invalid.objects.push(invalid.objects[0]);
+        assert_eq!(persistent_authority_snapshot_sha256(&invalid).unwrap_err(),
+            encode_persistent_authority_snapshot(&invalid).unwrap_err());
+    }
+
+    #[test]
+    fn bounded_snapshot_combines_retained_metadata_and_semantic_peak() {
+        let mut value = sample();
+        let mut chain = RecordChain::new(StoreId::new(7).unwrap());
+        let mut sectors = vec![chain.append(None, RecordBody::Format).unwrap(),
+            chain.append(None, RecordBody::IdHighWater { exclusive_end: 128 }).unwrap()];
+        sectors.extend(encode_object_transaction(&mut chain, TransactionId::new(9).unwrap(),
+            ObjectId::new(10).unwrap(), ObjectKind::new(7).unwrap(), &[0x59; 4096]).unwrap().records);
+        value.record_stream = sectors.iter().flatten().copied().collect();
+        value.objects.push(PersistentObjectBinding {
+            stable_object_id: 4, v2_object_id: 3, commit_generation: 7, object_kind: 0x41,
+        });
+        value.objects[0].v2_object_id = 3;
+        value.objects[1].v2_object_id = 1;
+        let bytes = encode_persistent_authority_snapshot(&value).unwrap();
+        let metadata = value.objects.len() * core::mem::size_of::<PersistentObjectBinding>()
+            + value.principals.len() * core::mem::size_of::<PersistentPrincipalPolicy>();
+        let semantic = validate_record_chain_bounded(&value.record_stream, usize::MAX).unwrap();
+        let scratch = value.objects.len() * core::mem::size_of::<u128>();
+        let (_, offset, peak) = validate_authority_bytes_bounded(&bytes, usize::MAX).unwrap();
+        assert_eq!(peak, metadata + semantic.max(scratch));
+        assert!(semantic > scratch);
+        assert_eq!(validate_authority_bytes_bounded(&bytes, metadata), Err(AuthoritySnapshotError::MemoryLimit));
+        assert_eq!(validate_authority_bytes_bounded(&bytes, peak).unwrap().2, peak);
+        let mut corrupt = bytes.clone();
+        corrupt[offset + 3 * RECORD_SIZE + vibeos_durable_format::PAYLOAD_OFFSET + 24] ^= 1;
+        // Strict sealed errors still precede semantic admission failure.
+        assert_eq!(validate_authority_bytes_bounded(&corrupt, metadata), Err(AuthoritySnapshotError::InvalidRecord));
+    }
+
+    #[test]
+    fn malformed_fixed_bound_is_distinct_from_workspace_exhaustion() {
+        let mut bytes = encode_persistent_authority_snapshot(&sample()).unwrap();
+        bytes[0x3c..0x40].copy_from_slice(&((MAX_STABLE_PRINCIPALS + 1) as u32).to_le_bytes());
+        for budget in [0, usize::MAX] {
+            assert_eq!(decode_persistent_authority_snapshot_bounded(&bytes, budget),
+                Err(AuthoritySnapshotError::OutOfBounds));
+        }
+    }
+
+    #[test]
+    fn owned_decode_reserves_record_copy_and_reports_semantic_overlap() {
+        let mut value = sample();
+        let bytes = encode_persistent_authority_snapshot(&value).unwrap();
+        let metadata = value.objects.len() * core::mem::size_of::<PersistentObjectBinding>()
+            + value.principals.len() * core::mem::size_of::<PersistentPrincipalPolicy>();
+        let retained = metadata + value.record_stream.len();
+        assert_eq!(decode_persistent_authority_snapshot_bounded(&bytes, retained - 1),
+            Err(AuthoritySnapshotError::MemoryLimit));
+        let (decoded, peak) = decode_persistent_authority_snapshot_bounded(&bytes, retained).unwrap();
+        assert_eq!(decoded, value);
+        assert_eq!(peak, retained);
+
+        let mut chain = RecordChain::new(StoreId::new(7).unwrap());
+        let records = [chain.append(None, RecordBody::Format).unwrap(),
+            chain.append(None, RecordBody::IdHighWater { exclusive_end: 32 }).unwrap(),
+            chain.append(Some(TransactionId::new(9).unwrap()), RecordBody::RevokeTombstone {
+                derivation_id: vibeos_durable_format::DerivationId::new(10).unwrap(),
+            }).unwrap()];
+        value.record_stream = records.iter().flatten().copied().collect();
+        let bytes = encode_persistent_authority_snapshot(&value).unwrap();
+        let semantic = validate_record_chain_bounded(&value.record_stream, usize::MAX).unwrap();
+        assert!(semantic > value.record_stream.len(), "retained record bytes are not a semantic upper bound");
+        let (decoded, peak) = decode_persistent_authority_snapshot_bounded(&bytes, usize::MAX).unwrap();
+        assert_eq!(peak, metadata + semantic);
+        assert_eq!(decoded, value);
+        let tight = metadata + value.record_stream.len();
+        let (decoded, tight_peak) = decode_persistent_authority_snapshot_bounded(&bytes, tight).unwrap();
+        assert_eq!(decoded, value);
+        assert!(tight_peak <= tight);
+        std::eprintln!("OWNED_AUTHORITY_BUDGET retained={tight} unconstrained_peak={peak} constrained_peak={tight_peak}");
+    }
+
+    #[test]
+    fn metadata_budget_includes_unordered_id_index_overlap() {
+        let mut value = sample();
+        value.objects.push(PersistentObjectBinding {
+            stable_object_id: 4, v2_object_id: 3, commit_generation: 7, object_kind: 0x41,
+        });
+        let ordered = encode_persistent_authority_snapshot(&value).unwrap();
+        let (_, _, tables) = validate_authority_bytes_bounded(&ordered, usize::MAX).unwrap();
+        assert!(validate_binding_index(&value, 0).unwrap().is_none());
+        assert_eq!(validate_authority_bytes_bounded(&ordered, tables).unwrap().2, tables);
+
+        value.objects[0].v2_object_id = 3;
+        value.objects[1].v2_object_id = 1;
+        let unordered = encode_persistent_authority_snapshot(&value).unwrap();
+        let (_, _, peak) = validate_authority_bytes_bounded(&unordered, usize::MAX).unwrap();
+        let scratch = value.objects.len() * core::mem::size_of::<u128>();
+        assert_eq!(peak, tables + scratch);
+        assert_eq!(validate_authority_bytes_bounded(&unordered, peak).unwrap().2, peak);
+        for budget in [tables, peak - 1] {
+            assert_eq!(validate_authority_bytes_bounded(&unordered, budget),
+                Err(AuthoritySnapshotError::MemoryLimit));
+        }
+        // Duplicate detection still executes when admitted. A missing scratch
+        // byte must be refused before allocating/populating the sorted index.
+        value.objects[1].v2_object_id = 3;
+        assert_eq!(validate_binding_index(&value, scratch - 1), Err(AuthoritySnapshotError::MemoryLimit));
+        assert_eq!(validate_binding_index(&value, scratch), Err(AuthoritySnapshotError::UnsortedOrDuplicate));
+    }
+
+    #[test]
+    fn metadata_budget_checks_all_tables_before_decode_and_exact_capacity() {
+        let value = sample().with_external_roots(vec![PersistentRootEntry {
+            object_id: 99, commit_generation: 1, object_kind: 3,
+        }]).unwrap();
+        let bytes = encode_persistent_authority_snapshot(&value).unwrap();
+        let expected = value.objects.len() * core::mem::size_of::<PersistentObjectBinding>()
+            + value.principals.len() * core::mem::size_of::<PersistentPrincipalPolicy>()
+            + value.external_roots.len() * core::mem::size_of::<PersistentRootEntry>();
+        let (generation, offset, allocated) = validate_authority_bytes_bounded(&bytes, expected).unwrap();
+        assert_eq!(generation, value.checkpoint_generation());
+        assert_eq!(allocated, expected);
+        assert_eq!(&bytes[offset..], value.record_stream());
+        assert_eq!(validate_authority_bytes_bounded(&bytes, expected - 1), Err(AuthoritySnapshotError::MemoryLimit));
+        // With insufficient table space, fail before inspecting even the
+        // first object's reserved field (and before semantic replay).
+        let mut corrupt = bytes.clone();
+        corrupt[PERSISTENT_AUTHORITY_HEADER_LEN + 0x2c] = 1;
+        assert_eq!(validate_authority_bytes_bounded(&corrupt, expected - 1), Err(AuthoritySnapshotError::MemoryLimit));
+        assert_eq!(validate_authority_bytes_bounded(&corrupt, expected), Err(AuthoritySnapshotError::NonZeroReserved));
+    }
+
+    #[test]
     fn external_roots_round_trip_without_becoming_authority_objects() {
         let sample = sample()
             .with_external_roots(vec![PersistentRootEntry {
@@ -1319,6 +1849,7 @@ mod tests {
             }])
             .unwrap();
         let bytes = encode_persistent_authority_snapshot(&sample).unwrap();
+        assert_eq!(persistent_authority_encoded_len(&sample).unwrap(), bytes.len());
         let decoded = decode_persistent_authority_snapshot(&bytes).unwrap();
         assert_eq!(decoded, sample);
         assert_eq!(decoded.objects.len(), 1);
@@ -1331,6 +1862,48 @@ mod tests {
             decode_persistent_authority_snapshot(&corrupt),
             Err(AuthoritySnapshotError::NonZeroReserved)
         );
+    }
+
+    #[test]
+    fn binding_index_fast_path_preserves_permutations_duplicates_and_root_collisions() {
+        for first in 1..=3_u128 {
+            for second in 1..=3_u128 {
+                for third in 1..=3_u128 {
+                    let ids = [first, second, third];
+                    let unique = first != second && first != third && second != third;
+                    let mut value = sample();
+                    value.objects = ids.iter().enumerate().map(|(index, &id)| PersistentObjectBinding {
+                        stable_object_id: 3 + index as u128, v2_object_id: id,
+                        commit_generation: 7, object_kind: 0x41,
+                    }).collect();
+                    match validate_binding_index(&value, usize::MAX) {
+                        Ok(index) => {
+                            assert!(unique);
+                            assert_eq!(index.is_none(), ids.windows(2).all(|pair| pair[0] < pair[1]));
+                            if let Some(index) = index { assert_eq!(index, vec![1, 2, 3]); }
+                        }
+                        Err(error) => {
+                            assert!(!unique);
+                            assert_eq!(error, AuthoritySnapshotError::UnsortedOrDuplicate);
+                        }
+                    }
+                    for root_id in 1..=4 {
+                        value.external_roots = vec![PersistentRootEntry {
+                            object_id: root_id, commit_generation: 7, object_kind: 0x41,
+                        }];
+                        let encoded = encode_persistent_authority_snapshot(&value);
+                        if unique && !ids.contains(&root_id) {
+                            assert_eq!(decode_persistent_authority_snapshot(&encoded.unwrap()).unwrap(), value);
+                        } else {
+                            assert_eq!(encoded, Err(AuthoritySnapshotError::UnsortedOrDuplicate));
+                        }
+                    }
+                }
+            }
+        }
+        let mut value = sample();
+        value.objects.clear();
+        assert_eq!(validate_binding_index(&value, usize::MAX).unwrap(), None);
     }
 
     #[test]

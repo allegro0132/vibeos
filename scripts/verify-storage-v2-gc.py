@@ -622,7 +622,10 @@ def parse_blob_manifest_v2(payload: bytes, context: dict[str, Any]) -> dict[str,
     geometry = canonical_blob_geometry(key["exact_len"])
     require(encoded_blob_len == geometry["encoded_len"], "Blob manifest encoded length is not canonical")
     content_count = (key["exact_len"] + CANONICAL_CONTENT_EXTENT_LEN - 1) // CANONICAL_CONTENT_EXTENT_LEN
-    require(count == content_count + 2, "Blob manifest extent count is not canonical")
+    # Compact layout: one extent carries the complete canonical encoding when
+    # it fits a single extent; otherwise the header / content / tree split.
+    compact = count == 1 and encoded_blob_len <= CANONICAL_CONTENT_EXTENT_LEN
+    require(compact or count == content_count + 2, "Blob manifest extent count is not canonical")
 
     extents: list[dict[str, Any]] = []
     expected_offset = 0
@@ -645,7 +648,8 @@ def parse_blob_manifest_v2(payload: bytes, context: dict[str, Any]) -> dict[str,
         require(item["extent_count"] == count, f"Blob manifest extent[{index}] count is invalid")
         require(item["encoded_offset"] == expected_offset, f"Blob manifest extent[{index}] leaves a gap or overlap")
         require(
-            item["payload_byte_len"] == _canonical_blob_extent_length(key, index, count),
+            item["payload_byte_len"]
+            == (encoded_blob_len if compact else _canonical_blob_extent_length(key, index, count)),
             f"Blob manifest extent[{index}] split is not canonical",
         )
         require(pointer["exact_byte_len"] == item["payload_byte_len"], f"Blob manifest extent[{index}] pointer length mismatch")

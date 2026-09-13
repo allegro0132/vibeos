@@ -1135,6 +1135,7 @@ mod pio_block;
 #[cfg(feature = "pio-block")]
 mod sdhci_blk;
 mod segment_store_platform;
+mod storage_capacity_policy;
 mod store_platform;
 mod trampoline;
 mod trap;

@@ -155,6 +155,7 @@ struct State {
     reset_stuck: bool,
     sticky_enable: bool,
     drop_start: bool,
+    drop_bus_limits: bool,
     ticks: u64,
     step: u64,
     mode_reads: usize,
@@ -174,7 +175,9 @@ impl Registers for Model {
     fn write(&mut self, a: usize, v: u32) {
         let mut s = self.0.borrow_mut();
         s.writes.push((a, v));
-        let value = if a == 0x1000 && !s.reset_stuck {
+        let value = if a == 0x1004 && s.drop_bus_limits {
+            v & !0x0f0f_0000
+        } else if a == 0x1000 && !s.reset_stuck {
             0
         } else if s.drop_start && a == 0x1104 {
             v & !1
@@ -229,6 +232,7 @@ fn configuration_matches_ring_contract_and_does_not_start_dma() {
     assert_eq!(r[&0xd00], 15 << 16 | 10);
     assert_eq!(r[&0xd30], 15 << 20 | 32);
     assert_eq!(r[&0x1100], 6 << 18);
+    assert_eq!(r[&0x1004], 2 << 16 | 14);
     assert_eq!(r[&0x1104], 8 << 16 | 16);
     assert_eq!(r[&0x1108], 8 << 16 | 1536 << 1);
     assert_eq!(r[&0x1114], 0x42000000);
@@ -432,4 +436,14 @@ fn speed_modes_keep_fcs_and_checksum_disabled() {
         c.configure(layout()).unwrap();
         assert_eq!(s.borrow().registers[&0], expected);
     }
+}
+
+#[test]
+fn rejected_bus_limits_do_not_authorize_dma_start() {
+    let (mut controller, state) = model();
+    controller.reset().unwrap();
+    state.borrow_mut().drop_bus_limits = true;
+    assert_eq!(controller.configure(layout()), Err(Error::ConfigurationRejected));
+    assert_eq!(controller.start(), Err(Error::NotReady));
+    assert!(!state.borrow().registers.contains_key(&0x1114));
 }

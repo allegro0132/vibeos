@@ -68,3 +68,12 @@ opt-level = 3
 opt-level = 3
 [profile.release.package.vibeos-iperf3-server]
 opt-level = 3
+
+# Mars packet DMA, ownership checks and cache maintenance run per frame.
+# Preserve all checks/barriers while compiling these paths for throughput.
+[profile.release.package.vibeos-eqos-net]
+opt-level = 3
+[profile.release.package.vibeos-platform-jh7110]
+opt-level = 3
+[profile.release.package.vibeos-firmware-milkv-mars]
+opt-level = 3

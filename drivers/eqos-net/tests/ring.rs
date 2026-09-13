@@ -372,3 +372,29 @@ fn small_packets_sync_only_complete_cache_lines() {
         assert!(s.borrow().events.contains(&Event::Device(layout().rx_buffers, BUFFER, Direction::FromDevice)));
     }
 }
+
+#[test]
+fn tx_batch_defers_status_sync_until_pressure_and_reclaims_before_reuse() {
+    let (mut r, s) = started();
+    for _ in 0..3 { r.transmit(&[7; 60]).unwrap(); }
+    assert!(!s.borrow().events.iter().any(|e| matches!(e, Event::Cpu(..) | Event::Read(..))));
+    s.borrow_mut().words.insert((layout().tx_descriptors, 3), 0x10000000);
+    s.borrow_mut().events.clear();
+    r.transmit(&[7; 60]).unwrap();
+    assert_eq!(r.pending(), 3);
+    let events = &s.borrow().events;
+    let reclaim = events.iter().position(|e| *e == Event::Cpu(layout().tx_buffers, BUFFER, Direction::ToDevice)).unwrap();
+    let copy = events.iter().position(|e| matches!(e, Event::Tx(..))).unwrap();
+    assert!(reclaim < copy);
+}
+
+#[test]
+fn tx_pressure_completion_error_prevents_further_dma_publication() {
+    let (mut r, s) = started();
+    for _ in 0..3 { r.transmit(&[7; 60]).unwrap(); }
+    s.borrow_mut().words.insert((layout().tx_descriptors, 3), 0x10008000);
+    s.borrow_mut().events.clear();
+    assert_eq!(r.transmit(&[7; 60]), Err(Error::Descriptor(descriptor::Error::Hardware)));
+    assert!(r.quarantined());
+    assert!(!s.borrow().events.iter().any(|e| matches!(e, Event::Tx(..) | Event::Word(..) | Event::Tail(..))));
+}

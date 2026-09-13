@@ -108,6 +108,9 @@ impl Registers for Lane {
         fence();
         let v = unsafe { (self.address(o) as *const u32).read_volatile() };
         fence();
+        if o == 0x1004 {
+            report(format_args!("MARS_NET_AXI base={:#x} bus={:#010x}\n", self.base, v));
+        }
         v
     }
     fn write(&mut self, o: usize, v: u32) {

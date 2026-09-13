@@ -137,3 +137,65 @@ still enabled in these experimental payloads. Three cold boots, link recovery,
 and one hour of concurrent network/storage/WASM testing remain separate
 acceptance requirements. TRNG protocol probing does not qualify entropy and
 these images do not enable SSH.
+
+## Driver and platform speed compilation
+
+Compiling `vibeos-eqos-net`, `vibeos-platform-jh7110` and the Mars firmware at
+release opt-level 3 instead of z measured 575.53 Mbps host-to-board and
+640.17 Mbps board-to-host in separate 60-second single-stream tests. The previous
+RX-lock baseline measured 494.07 / 530.15 Mbps. DMA PBL and AXI limits remain at
+the baseline values; runtime AXI readback was `0x0002000e`. The candidate also
+contains the new AXI readback guard/diagnostic from the preceding experiments.
+No ownership checks, cache barriers, or capability checks were removed.
+
+FIT size grows from 3,830,624 to 4,080,480 bytes. Candidate FIT SHA-256:
+`2513d2dad5e4b6e1a0c7c0bc14f197bd4b75fa1f07b4762963d49f6d3bc3c3a4`.
+SD image SHA-256:
+`9d181894eb8cdf22612527e32da19c183ea24fb87666fbb2ef0c6034761461bf`.
+Artifacts are under `target/mars-boot-20260913-gigabit-driver-speed/out/`.
+
+The EQoS/JH7110 release host tests passed 71 checks and the real-board selftest
+passed 395 checks. Before fault-injection selftests, every component remained
+running with zero faults/cancellations and one expected bootstrap exit. Netstack
+live memory was 2,105,216 bytes with no quota denials. Logs and throughput JSON
+are under `target/mars-acceptance/20260913-gigabit/driver-speed-*`.
+
+The board runs this candidate from RAM; SD contents remain unchanged. These
+measurements do not establish long-duration stability, SSH entropy qualification,
+or attainment of the 900 Mbps objective.
+
+## Rejected whole-kernel speed experiment
+
+Adding opt-level 3 for the entire kernel increased FIT size to 4,825,952 bytes
+and measured 491.40 / 596.08 Mbps in separate 60-second tests, below the retained
+driver-speed candidate's 575.53 / 640.17 Mbps. The kernel-only override was
+removed. Candidate FIT SHA-256:
+`876c202f308c115b5b493f1cf0fed2d45468dc40eae1599eb54ad77b43a3c82e`.
+
+QEMU/Duo DHCP/iperf3 build checks passed. QEMU four-hart DTB boot and 390
+selftests passed. On Mars, the selftest reported 391 passed / 4 failed in the
+ready-task cancellation test: the freshly spawned task was polled and faulted
+before cancellation took effect. This observation is not yet classified as a
+test timing assumption or an executor defect; it remains an investigation item.
+No faults occurred during the throughput test before the deliberate selftests.
+The previous driver-speed FIT was selected for recovery. Logs and source patch
+are retained under `target/mars-acceptance/20260913-gigabit/kernel-speed-*`.
+
+## Multi-hart cancellation test precondition
+
+The ready-task test now pins its probe to the caller's logical hart and cancels
+it before yielding. An ordinary untracked task is stealable, so the previous
+test could legally lose its “never polled” precondition before cancellation.
+No executor cancellation behavior or cancellation assertions were weakened.
+A deterministic host test dispatches a remote hart between spawn/cancel: the
+ordinary task is polled once, whereas the pinned task remains unpolled and
+terminates as Cancelled. All 106 executor host tests passed.
+
+The retained driver-speed configuration plus this test correction booted on
+Mars and passed three consecutive selftests, each 395 passed / 0 failed.
+FIT SHA-256 `58794ec49faf5ecc876af84deae2034038412173e57a8bacfe7980f750933352`.
+Artifacts: `target/mars-boot-20260913-gigabit-cancel-ready/out/`; evidence:
+`target/mars-acceptance/20260913-gigabit/cancel-ready-*` and
+`target/mars-reference/20260913-cancel-ready-runtime.log`. This validates the
+ready-state test setup; it is not a general proof of all concurrent cancellation
+interleavings or complete Mars hardware qualification.

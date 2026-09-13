@@ -40,6 +40,7 @@ pub enum Error {
     InvalidConfig,
     InvalidLayout,
     UnsupportedFifo,
+    ConfigurationRejected,
     TimedOut,
     ResetFailed,
     StartFailed,
@@ -166,7 +167,14 @@ impl<R: Io> Controller<R> {
             u32::from_le_bytes([c.mac[0], c.mac[1], c.mac[2], c.mac[3]]),
         );
         // 8 beats without PBLx8 fits even the smallest admitted FIFO.
-        self.io.write(0x1004, 2 << 16 | 1 << 3 | 1 << 2 | 1 << 1);
+        // Retain the measured baseline outstanding limits. Hardware may
+        // implement fewer field bits than the generic register definition;
+        // reject a configuration it cannot represent before starting DMA.
+        let bus = 2 << 16 | 1 << 3 | 1 << 2 | 1 << 1;
+        self.io.write(0x1004, bus);
+        if self.io.read(0x1004) & 0x0f0f_000e != bus {
+            return Err(Error::ConfigurationRejected);
+        }
         self.io.write(
             0x1100,
             descriptor::skip_length(STRIDE, layout.axi_bytes).unwrap(),

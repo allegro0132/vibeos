@@ -686,7 +686,13 @@ async fn scheduler(h: &mut Harness) {
 /// ready or parked future is detached and reclaimed without one extra poll.
 async fn cancellation(h: &mut Harness) {
     let cancelled_before = exec::cancelled_count();
-    let ready = exec::spawn_tracked("selftest-cancel-ready", async {
+    // This case requires a genuinely ready (never polled) task. Ordinary
+    // untracked tasks are stealable: another hart may legally poll one before
+    // spawn_tracked returns. Pin to this hart and cancel without yielding so
+    // the cooperative executor cannot dispatch it before the cancellation.
+    let hart = crate::ipi::current_logical_hart()
+        .expect("self-test runs on a registered hart");
+    let ready = exec::spawn_pinned_on(hart, "selftest-cancel-ready", async {
         panic!("a cancelled ready task must never be polled");
     });
     h.eq(

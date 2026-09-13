@@ -255,12 +255,17 @@ impl<B: Backend> Ring<B> {
         }
         Ok(completed)
     }
+    /// Queue one frame. Call `reap` at bounded batch boundaries to observe
+    /// completion/errors even under light traffic. Admission reaps on pressure,
+    /// but does not resynchronize an outstanding descriptor for every packet.
     pub fn transmit(&mut self, packet: &[u8]) -> Result<(), Error> {
         self.running()?;
         // Validate the whole packet before any DMA or controller operation.
         let buffer = self.layout.buffer(false, self.producer);
         let words = descriptor::tx(buffer, packet.len()).map_err(|_| Error::Packet)?;
-        self.reap()?;
+        if self.pending == self.layout.count - 1 {
+            self.reap()?;
+        }
         // Reserve one slot so an exclusive TX tail never aliases the DMA head
         // merely because software filled an otherwise empty circular ring.
         if self.pending == self.layout.count - 1 {

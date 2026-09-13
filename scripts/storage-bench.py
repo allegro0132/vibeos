@@ -20,6 +20,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections import defaultdict
@@ -92,6 +93,23 @@ def validate_record(record: dict[str, Any]) -> None:
     for key in ("git_commit", "qemu_version", "qemu_args", "cache_state"):
         require(key in environment, f"environment.{key} is missing")
     require(isinstance(environment["qemu_args"], list), "environment.qemu_args must be an array")
+    if "memory_mib" in environment:
+        require(type(environment["memory_mib"]) is int and environment["memory_mib"] > 0,
+                "invalid guest memory size")
+    if "storage_v2_provisioned_segments" in environment:
+        value = environment["storage_v2_provisioned_segments"]
+        require(type(value) is int and value > 0, "invalid storage geometry")
+    if "storage_throttle" in environment:
+        profile = environment["storage_throttle"]
+        require(isinstance(profile, dict) and set(profile) <= set(THROTTLE_FIELDS),
+                "invalid storage throttle profile")
+        require(all(type(value) is int and value >= 0 for value in profile.values()),
+                "invalid storage throttle rate")
+    if "latency_scope" in environment:
+        require(environment["latency_scope"] == "workload", "invalid latency scope")
+    if "content_pattern" in environment:
+        require(environment["content_pattern"] in ("legacy", "splitmix64-offset-v1"),
+                "invalid content pattern")
     if record["status"] == "ok":
         require(any(name in record["metrics"] for name in TIMED_METRICS),
                 "ok record has no timed metric")
@@ -154,6 +172,22 @@ def file_sha256(path: Path) -> str:
         while chunk := source.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+THROTTLE_FIELDS = {"read_bps": "bps_rd", "write_bps": "bps_wr",
+                   "read_iops": "iops_rd", "write_iops": "iops_wr"}
+
+
+def storage_throttle(args: argparse.Namespace) -> dict[str, int]:
+    profile = {name: getattr(args, name, 0) for name in THROTTLE_FIELDS}
+    require(all(type(value) is int and value >= 0 for value in profile.values()),
+            "storage bandwidth/IOPS limits must be non-negative integers")
+    return profile
+
+
+def throttle_drive_options(args: argparse.Namespace) -> str:
+    return "".join(f",{THROTTLE_FIELDS[name]}={value}"
+                   for name, value in storage_throttle(args).items() if value)
 
 
 def environment(qemu_args: list[str], qemu_version: str) -> dict[str, Any]:
@@ -226,6 +260,49 @@ def convert_guest_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
             if value is not None:
                 require(isinstance(value, int) and value >= 0, f"bad {name}")
                 counters[name.removeprefix("block_")] = value
+        batch_phases = sample.get("workload") in ("file-batch-create", "file-batch-create-unique")
+        file_phase_names = ("stage", "publish", "verify", "cleanup" if batch_phases else "remove")
+        if any(name.startswith(tuple(f"file_{phase}_" for phase in file_phase_names))
+               for name in sample):
+            require(sample.get("workload") == "file-sequential" or batch_phases, "file phases on another workload")
+            for metric in ("requests", "read_requests", "write_requests", "flush_requests",
+                           "read_bytes", "write_bytes", "used_interrupts"):
+                total = 0
+                for phase in file_phase_names:
+                    name = f"file_{phase}_{metric}"
+                    value = sample.get(name)
+                    require(type(value) is int and value >= 0, f"bad or missing {name}")
+                    phases[name] = value
+                    total += value
+                require(total == counters.get(metric), f"file phase sum differs for {metric}")
+        time_names = [f"file_{phase}_elapsed_ticks" for phase in file_phase_names]
+        if any(name in sample for name in time_names):
+            require(sample.get("workload") == "file-sequential" or batch_phases, "file times on another workload")
+            for name in time_names:
+                value = sample.get(name)
+                require(type(value) is int and value >= 0, f"bad or missing {name}")
+                phases[name] = value
+            require(type(sample.get("elapsed_ticks")) is int, "missing elapsed_ticks for file times")
+            require(sum(phases[name] for name in time_names) == sample["elapsed_ticks"],
+                    "file time sum differs from elapsed_ticks")
+        stage_names = [f"file_stage_{part}_ticks" for part in ("pattern", "push", "finish", "other")]
+        if any(name in sample for name in stage_names):
+            require("file_stage_elapsed_ticks" in phases, "missing file phase times for staging details")
+            for name in stage_names:
+                value = sample.get(name)
+                require(type(value) is int and value >= 0, f"bad or missing {name}")
+                phases[name] = value
+            require(sum(phases[name] for name in stage_names) == phases["file_stage_elapsed_ticks"],
+                    "staging detail sum differs from stage elapsed_ticks")
+        verify_names = [f"file_verify_{part}_ticks" for part in ("reader", "pattern", "other")]
+        if any(name in sample for name in verify_names):
+            require("file_verify_elapsed_ticks" in phases, "missing file phase times for verification details")
+            for name in verify_names:
+                value = sample.get(name)
+                require(type(value) is int and value >= 0, f"bad or missing {name}")
+                phases[name] = value
+            require(sum(phases[name] for name in verify_names) == phases["file_verify_elapsed_ticks"],
+                    "verification detail sum differs from verify elapsed_ticks")
         if "put_block_requests" in sample:
             for name in ("put_block_requests", "put_block_read_requests",
                          "put_block_write_requests", "put_block_flush_requests",
@@ -234,6 +311,12 @@ def convert_guest_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
                 value = sample.get(name)
                 require(isinstance(value, int) and value >= 0, f"missing {name}")
                 phases["put_" + name.removeprefix("put_block_")] = value
+                total_name = name.removeprefix("put_")
+                if total_name in sample:
+                    total = sample[total_name]
+                    require(isinstance(total, int) and total >= value,
+                            f"{total_name} is smaller than its put phase")
+                    phases["get_" + name.removeprefix("put_block_")] = total - value
         for name in ("authority_objects", "authority_records", "cas_payloads_verified",
                      "allocated_segments", "free_segments", "cleaner_reserved_segments"):
             if name in sample:
@@ -265,6 +348,9 @@ def convert_guest_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
         result["object_count"] = sample["object_count"]
     if "content_class" in sample:
         result["content_class"] = sample["content_class"]
+    for name in ("content_pattern", "latency_scope"):
+        if name in sample:
+            result["environment"] = {**result["environment"], name: sample[name]}
     validate_record(result)
     return result
 
@@ -285,7 +371,7 @@ def convert_linux_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
             require(isinstance(value, int) and value > 0, "missing latency_ns")
             metrics["latency_ns"] = float(value)
             phases["latency_total_ns"] = value
-        else:
+        if "latency_ns" not in sample or "put_ns" in sample or "get_ns" in sample:
             for source, target in (("put_ns", "put_latency_ns"), ("get_ns", "get_latency_ns")):
                 value = sample.get(source)
                 require(isinstance(value, int) and value > 0, f"missing {source}")
@@ -326,31 +412,108 @@ def convert_linux_sample(sample: dict[str, Any], *, run_id: str, vm_index: int,
         result["object_count"] = sample["object_count"]
     if "content_class" in sample:
         result["content_class"] = sample["content_class"]
+    for name in ("content_pattern", "latency_scope"):
+        if name in sample:
+            result["environment"] = {**result["environment"], name: sample[name]}
     validate_record(result)
     return result
 
 
+def process_cpu_seconds(value: str) -> float:
+    """Parse ps TIME (minutes:seconds, hours:minutes:seconds, optional days)."""
+    days, clock = value.split("-", 1) if "-" in value else ("0", value)
+    parts = clock.split(":")
+    require(len(parts) in (2, 3), "invalid ps CPU time")
+    total = float(parts[-1]) + 60 * int(parts[-2])
+    if len(parts) == 3:
+        total += 3600 * int(parts[0])
+    total += 86400 * int(days)
+    require(math.isfinite(total) and total >= 0, "invalid ps CPU time")
+    return total
+
+
+class HostTelemetry:
+    """Opt-in diagnostic sidecar. Its sampling overhead is not subtracted."""
+
+    def __init__(self, output: Any, process: Any, run_id: str, vm_index: int):
+        self.output = output
+        self.process = process
+        self.coordinates = dict(run_id=run_id, vm_index=vm_index, qemu_pid=process.pid)
+        self.lock = threading.Lock()
+        self.stopping = threading.Event()
+        self.failure: Exception | None = None
+        self.emit("start", interval_seconds=1.0, cpu_source="ps TIME",
+                  note="diagnostic overhead included; wall intervals include serial transport")
+        self.thread = threading.Thread(target=self.sample, name="qemu-host-telemetry", daemon=True)
+        self.thread.start()
+
+    def emit(self, event: str, **fields: Any) -> None:
+        with self.lock:
+            row = dict(schema="vibeos.storage-bench.host", version=1,
+                       **self.coordinates, event=event, monotonic_ns=time.monotonic_ns(),
+                       wall_time_ns=time.time_ns(), **fields)
+            self.output.write(json.dumps(row, sort_keys=True) + "\n")
+            self.output.flush()
+
+    def sample(self) -> None:
+        try:
+            while not self.stopping.is_set():
+                begin = time.monotonic_ns()
+                try:
+                    result = subprocess.run(
+                        ["ps", "-p", str(self.process.pid), "-o", "time=", "-o", "state="],
+                        capture_output=True, text=True, timeout=2, check=False,
+                        env={**os.environ, "LC_ALL": "C"})
+                    fields: dict[str, Any] = {"poll_started_ns": begin,
+                        "poll_elapsed_ns": time.monotonic_ns() - begin,
+                        "load_average": list(os.getloadavg()), "ps_exit_code": result.returncode}
+                    if result.returncode == 0:
+                        cpu, state = result.stdout.strip().split(None, 1)
+                        fields.update(cpu_seconds=process_cpu_seconds(cpu), process_state=state)
+                    else:
+                        fields["error"] = result.stderr.strip() or "process unavailable"
+                    self.emit("poll", **fields)
+                except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                    self.emit("poll_error", poll_started_ns=begin, error=str(error))
+                self.stopping.wait(1.0)
+        except Exception as error:
+            self.failure = error
+
+    def close(self) -> None:
+        self.stopping.set()
+        self.thread.join()  # ps has a two-second timeout.
+        if self.failure is not None:
+            raise self.failure
+        self.emit("stop", qemu_returncode=self.process.returncode)
+
+
 def wait_for(stream: Any, process: subprocess.Popen[bytes], marker: bytes,
-             timeout: float) -> bytes:
+             timeout: float, transcript: Any = None) -> bytes:
     selector = selectors.DefaultSelector()
     selector.register(stream, selectors.EVENT_READ)
     collected = bytearray()
     deadline = time.monotonic() + timeout
-    while marker not in collected:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            tail = bytes(collected[-4096:]).decode("utf-8", errors="replace").replace("\r", "\n")
-            raise TimeoutError(f"timed out waiting for {marker!r}; serial tail:\n{tail}")
-        events = selector.select(min(remaining, 1.0))
-        if not events:
-            if process.poll() is not None:
-                raise RuntimeError(f"guest exited with {process.returncode}")
-            continue
-        chunk = os.read(stream.fileno(), 65536)
-        if not chunk:
-            raise RuntimeError("guest serial closed")
-        collected.extend(chunk)
-    return bytes(collected)
+    try:
+        while marker not in collected:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                tail = bytes(collected[-4096:]).decode("utf-8", errors="replace").replace("\r", "\n")
+                raise TimeoutError(f"timed out waiting for {marker!r}; serial tail:\n{tail}")
+            events = selector.select(min(remaining, 1.0))
+            if not events:
+                if process.poll() is not None:
+                    raise RuntimeError(f"guest exited with {process.returncode}")
+                continue
+            chunk = os.read(stream.fileno(), 65536)
+            if not chunk:
+                raise RuntimeError("guest serial closed")
+            if transcript is not None:
+                transcript.write(chunk)
+                transcript.flush()
+            collected.extend(chunk)
+        return bytes(collected)
+    finally:
+        selector.close()
 
 
 def guest_record_from(data: bytes) -> dict[str, Any]:
@@ -362,7 +525,22 @@ def guest_record_from(data: bytes) -> dict[str, Any]:
     return value
 
 
+def guest_storage_geometry(boot: bytes) -> dict[str, int]:
+    prefix = b"VIBE_STORAGE_BENCH_GEOMETRY "
+    lines = [line.split(prefix, 1)[1] for line in boot.splitlines() if prefix in line]
+    require(len(lines) <= 1, "multiple guest storage geometry records")
+    if not lines:
+        return {} # Older benchmark ELFs do not report their provisioned geometry.
+    value = json.loads(lines[0])
+    require(isinstance(value, dict), "invalid guest storage geometry")
+    segments = value.get("provisioned_segments")
+    require(type(segments) is int and segments > 0, "invalid guest storage geometry")
+    return {"storage_v2_provisioned_segments": segments}
+
+
 def run_vibeos(args: argparse.Namespace) -> int:
+    require(args.memory_mib > 0, "memory-mib must be positive")
+    throttle_options = throttle_drive_options(args)
     kernel = args.kernel.resolve()
     require(kernel.is_file(), f"kernel not found: {kernel}")
     qemu_version = subprocess.run([args.qemu, "--version"], check=True, text=True,
@@ -372,7 +550,14 @@ def run_vibeos(args: argparse.Namespace) -> int:
     run_id = args.run_id or str(uuid.uuid4())
     total = args.warmups + args.samples
     output = args.output.open("x" if not args.overwrite else "w", encoding="utf-8")
+    transcript = None
+    telemetry_output = None
+    failed = False
     try:
+        if args.serial_log is not None:
+            transcript = args.serial_log.open("wb" if args.overwrite else "xb")
+        if args.host_telemetry is not None:
+            telemetry_output = args.host_telemetry.open("w" if args.overwrite else "x", encoding="utf-8")
         for vm_index in range(args.vms):
             with tempfile.TemporaryDirectory(prefix="vibeos-storage-bench-") as temporary:
                 disk = Path(temporary) / "data.raw"
@@ -380,20 +565,28 @@ def run_vibeos(args: argparse.Namespace) -> int:
                 with disk.open("r+b") as target:
                     target.truncate(1024 * 1024 * 1024)
                 qemu_args = [
-                    args.qemu, "-machine", "virt", "-cpu", "rv64", "-smp", "1", "-m", "512M",
+                    args.qemu, "-machine", "virt", "-cpu", "rv64", "-smp", "1", "-m", f"{args.memory_mib}M",
                     "-accel", "tcg,thread=single", "-nographic", "-bios", "default",
                     "-kernel", str(kernel), "-drive",
-                    f"if=none,id=bench-disk,format=raw,file={disk},cache=none,aio=threads",
+                    f"if=none,id=bench-disk,format=raw,file={disk},cache=none,aio=threads{throttle_options}",
                     "-device", "virtio-blk-device,drive=bench-disk,bus=virtio-mmio-bus.0,queue-size=128",
                     "-global", "virtio-mmio.force-legacy=false",
                 ]
                 env = environment(qemu_args, qemu_version)
+                env["storage_throttle"] = storage_throttle(args)
+                env["memory_mib"] = args.memory_mib
+                if telemetry_output is not None:
+                    env["host_telemetry"] = {"interval_seconds": 1.0, "cpu_source": "ps TIME"}
                 env.update(artifact_hashes)
                 process = subprocess.Popen(qemu_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                            stderr=subprocess.STDOUT)
+                monitor = None
                 try:
+                    if telemetry_output is not None:
+                        monitor = HostTelemetry(telemetry_output, process, run_id, vm_index)
                     assert process.stdin is not None and process.stdout is not None
-                    wait_for(process.stdout, process, b"VibeOS shell ready", args.boot_timeout)
+                    boot = wait_for(process.stdout, process, b"VibeOS shell ready", args.boot_timeout, transcript)
+                    env.update(guest_storage_geometry(boot))
                     # The shell-ready banner is emitted before the async
                     # virtio task has necessarily published its online
                     # session. Keep this bootstrap wait outside the timed
@@ -401,14 +594,14 @@ def run_vibeos(args: argparse.Namespace) -> int:
                     time.sleep(1.0)
                     process.stdin.write(b"blk info\n")
                     process.stdin.flush()
-                    wait_for(process.stdout, process, b"vibe> ", args.sample_timeout)
+                    wait_for(process.stdout, process, b"vibe> ", args.sample_timeout, transcript)
                     process.stdin.write(b"quiet\n")
                     process.stdin.flush()
                     # Wait for the shell to finish the quiet command before
                     # submitting the timed workload. Sending both lines in
                     # one UART burst can otherwise race the legacy parser and
                     # produce a valid but failed-closed guest record.
-                    wait_for(process.stdout, process, b"vibe> ", args.sample_timeout)
+                    wait_for(process.stdout, process, b"vibe> ", args.sample_timeout, transcript)
                     for index in range(total):
                         seed = (args.seed + vm_index * total + index) & ((1 << 64) - 1)
                         if args.workload.startswith("block-"):
@@ -422,12 +615,18 @@ def run_vibeos(args: argparse.Namespace) -> int:
                                 if getattr(args, "content_class", None):
                                     extra += f" {args.content_class}"
                             command = f"storage bench {args.object_bytes} {seed}{extra}\n".encode()
+                        if monitor is not None:
+                            monitor.emit("sample_begin", sample_index=index if index < args.warmups else index - args.warmups,
+                                         warmup=index < args.warmups, seed=seed)
                         process.stdin.write(command)
                         process.stdin.flush()
-                        data = wait_for(process.stdout, process, PREFIX.encode(), args.sample_timeout)
+                        data = wait_for(process.stdout, process, PREFIX.encode(), args.sample_timeout, transcript)
                         prefix_at = data.rfind(PREFIX.encode())
                         if b"\n" not in data[prefix_at:]:
-                            data += wait_for(process.stdout, process, b"\n", args.sample_timeout)
+                            data += wait_for(process.stdout, process, b"\n", args.sample_timeout, transcript)
+                        if monitor is not None:
+                            monitor.emit("sample_received", sample_index=index if index < args.warmups else index - args.warmups,
+                                         warmup=index < args.warmups, seed=seed)
                         sample = guest_record_from(data)
                         require(sample.get("backend") == args.backend,
                                 f"expected {args.backend}, guest selected {sample.get('backend')}")
@@ -438,20 +637,42 @@ def run_vibeos(args: argparse.Namespace) -> int:
                         )
                         output.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
                         output.flush()
+                        if args.stop_on_failure and record["status"] != "ok":
+                            failed = True
+                            break
                     process.stdin.write(b"halt\n")
                     process.stdin.flush()
                 finally:
                     try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.terminate()
-                        process.wait(timeout=5)
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.terminate()
+                            process.wait(timeout=5)
+                    finally:
+                        if monitor is not None:
+                            monitor.close()
+                if args.retain_images is not None:
+                    args.retain_images.mkdir(parents=True, exist_ok=True)
+                    retained = args.retain_images / f"vm-{vm_index:03d}.raw"
+                    # Only copy after QEMU has stopped. Never replace a prior
+                    # fixture, even when overwriting benchmark result logs.
+                    with retained.open("xb") as destination, disk.open("rb") as source:
+                        shutil.copyfileobj(source, destination)
+                if failed:
+                    return 1
     finally:
+        if telemetry_output is not None:
+            telemetry_output.close()
+        if transcript is not None:
+            transcript.close()
         output.close()
     return 0
 
 
 def run_linux(args: argparse.Namespace) -> int:
+    require(args.memory_mib > 0, "memory-mib must be positive")
+    throttle_options = throttle_drive_options(args)
     for path in (args.root_image, args.firmware_code, args.firmware_vars,
                  args.agent, args.data_image):
         require(path.is_file(), f"guest artifact not found: {path}")
@@ -479,17 +700,19 @@ def run_linux(args: argparse.Namespace) -> int:
                         "Linux ext4 template must be exactly 1 GiB")
                 seed = (args.seed + vm_index * (args.warmups + args.samples)) & ((1 << 64) - 1)
                 qemu_args = [
-                    args.qemu, "-machine", "virt", "-cpu", "rv64", "-smp", "1", "-m", "512M",
+                    args.qemu, "-machine", "virt", "-cpu", "rv64", "-smp", "1", "-m", f"{args.memory_mib}M",
                     "-accel", "tcg,thread=single", "-nographic", "-drive",
                     f"if=pflash,format=raw,unit=0,readonly=on,file={args.firmware_code.resolve()}",
                     "-drive", f"if=pflash,format=raw,unit=1,file={variables}",
                     "-drive", f"if=none,id=root,format=qcow2,file={root},cache=none,aio=threads",
                     "-device", "virtio-blk-device,drive=root,queue-size=128,serial=debian-root",
-                    "-drive", f"if=none,id=bench-disk,format=raw,file={disk},cache=none,aio=threads",
+                    "-drive", f"if=none,id=bench-disk,format=raw,file={disk},cache=none,aio=threads{throttle_options}",
                     "-device", "virtio-blk-device,drive=bench-disk,queue-size=128,serial=vibeos-bench-data",
                     "-virtfs", f"local,path={args.agent.resolve().parent},mount_tag=bench,security_model=none,readonly=on",
                 ]
                 env = environment(qemu_args, qemu_version)
+                env["storage_throttle"] = storage_throttle(args)
+                env["memory_mib"] = args.memory_mib
                 env.update({"linux_version": args.linux_version,
                             "debian_release": args.debian_release})
                 env.update(artifact_hashes)
@@ -640,11 +863,43 @@ def coordinate(record: dict[str, Any], metric: str) -> tuple[Any, ...]:
 
 def summaries(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[tuple[Any, ...], list[float]] = defaultdict(list)
+    profiles: dict[tuple[Any, ...], tuple[int, ...]] = {}
+    memories: dict[tuple[Any, ...], int] = {}
+    geometries: dict[tuple[Any, ...], int | None] = {}
+    patterns: dict[tuple[Any, ...], str] = {}
+    scopes: dict[tuple[Any, ...], str] = {}
     for record in records:
         if record["warmup"] or record["status"] != "ok":
             continue
         for metric, value in record["metrics"].items():
-            groups[coordinate(record, metric)].append(float(value))
+            key = coordinate(record, metric)
+            profile = record["environment"].get("storage_throttle", {})
+            require(isinstance(profile, dict), "invalid storage throttle profile")
+            signature = tuple(profile.get(name, 0) for name in THROTTLE_FIELDS)
+            require(all(type(value) is int and value >= 0 for value in signature),
+                    "invalid storage throttle profile")
+            # Exclude backend so Linux/VibeOS comparisons also require the
+            # same limits for an otherwise identical workload coordinate.
+            shared_key = key[1:]
+            memory = record["environment"].get("memory_mib", 512)
+            require(type(memory) is int and memory > 0, "invalid guest memory size")
+            require(memories.setdefault(shared_key, memory) == memory,
+                    "incompatible guest memory sizes for the same coordinate")
+            require(profiles.setdefault(shared_key, signature) == signature,
+                    "incompatible storage throttle profiles for the same coordinate")
+            pattern = record["environment"].get("content_pattern", "legacy")
+            require(patterns.setdefault(shared_key, pattern) == pattern,
+                    "incompatible content patterns for the same coordinate")
+            scope = record["environment"].get("latency_scope", "legacy")
+            require(scopes.setdefault(shared_key, scope) == scope,
+                    "incompatible latency scopes for the same coordinate")
+            if record["backend"] == "storage-v2" and record["layer"] != "block":
+                geometry = record["environment"].get("storage_v2_provisioned_segments")
+                require(geometry is None or (type(geometry) is int and geometry > 0),
+                        "invalid storage geometry")
+                require(geometries.setdefault(key, geometry) == geometry,
+                        "incompatible storage geometries for the same coordinate")
+            groups[key].append(float(value))
     result = []
     for key, values in sorted(groups.items(), key=lambda item: str(item[0])):
         mean = statistics.fmean(values)
@@ -690,6 +945,9 @@ def compare(records: list[dict[str, Any]]) -> tuple[bool, list[dict[str, Any]]]:
 
 def require_baseline_evidence(records: list[dict[str, Any]], manifest_path: Path,
                               evidence_path: Path) -> None:
+    require(all(not any(record["environment"].get("storage_throttle", {}).values())
+                for record in records),
+            "rate-limited exploratory runs cannot replace the unthrottled v1 baseline")
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
     require(isinstance(evidence, dict) and evidence.get("status") == "ok",
             "correctness evidence is not ok")
@@ -715,6 +973,9 @@ def require_baseline_evidence(records: list[dict[str, Any]], manifest_path: Path
 
 
 def selftest() -> None:
+    for value, expected in [("00:01.25", 1.25), ("02:03", 123),
+                            ("01:02:03.5", 3723.5), ("2-01:02:03", 176523)]:
+        assert process_cpu_seconds(value) == expected
     base = {
         "schema": RECORD_SCHEMA, "version": 1, "run_id": "test", "backend": "storage-v2",
         "layer": "object", "workload": "durable-put-get", "status": "ok", "vm_index": 0,
@@ -738,6 +999,111 @@ def selftest() -> None:
             pass
         else:
             raise AssertionError("validator accepted a malformed record")
+
+    guest = {"schema": "vibeos.storage-bench.sample", "version": 1,
+             "backend": "storage-v2", "layer": "file-tree", "workload": "file-sequential",
+             "status": "ok", "seed": 1, "timebase_hz": 1000, "latency_ticks": 1}
+    metrics = ("requests", "read_requests", "write_requests", "flush_requests",
+               "read_bytes", "write_bytes", "used_interrupts")
+    for metric in metrics:
+        guest["block_" + metric] = 10
+        for value, phase in enumerate(("stage", "publish", "verify", "remove"), 1):
+            guest[f"file_{phase}_{metric}"] = value
+    def convert(item):
+        return convert_guest_sample(item, run_id="test", vm_index=0, sample_index=0,
+                                    warmup=False, seed=1, env=base["environment"])
+    assert convert(guest)["phases"]["file_remove_read_bytes"] == 4
+    for mutate in (
+        lambda item: item.pop("file_verify_read_bytes"),
+        lambda item: item.update(file_stage_read_bytes=-1),
+        lambda item: item.update(file_stage_read_bytes=True),
+        lambda item: item.update(block_read_bytes=11),
+        lambda item: item.update(workload="object-range-get"),
+    ):
+        candidate = dict(guest)
+        mutate(candidate)
+        try:
+            convert(candidate)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("converter accepted inconsistent file phases")
+    timed = dict(guest, elapsed_ticks=10, transferred_bytes=0)
+    for value, phase in enumerate(("stage", "publish", "verify", "remove"), 1):
+        timed[f"file_{phase}_elapsed_ticks"] = value
+    assert convert(timed)["phases"]["file_verify_elapsed_ticks"] == 3
+    for mutate in (
+        lambda item: item.pop("file_verify_elapsed_ticks"),
+        lambda item: item.update(file_stage_elapsed_ticks=-1),
+        lambda item: item.update(file_stage_elapsed_ticks=True),
+        lambda item: item.update(elapsed_ticks=11),
+        lambda item: item.pop("elapsed_ticks"),
+    ):
+        candidate = dict(timed)
+        mutate(candidate)
+        try:
+            convert(candidate)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("converter accepted inconsistent file phase times")
+    for workload in ("file-batch-create", "file-batch-create-unique"):
+        batch = {name.replace("file_remove_", "file_cleanup_"): value
+                 for name, value in timed.items()}
+        batch["workload"] = workload
+        assert convert(batch)["phases"]["file_cleanup_elapsed_ticks"] == 4
+        for mutate in (
+            lambda item: item.pop("file_cleanup_read_bytes"),
+            lambda item: item.update(file_cleanup_elapsed_ticks=True),
+            lambda item: item.update(file_cleanup_write_bytes=5),
+            lambda item: item.update(elapsed_ticks=11),
+        ):
+            malformed = dict(batch)
+            mutate(malformed)
+            try:
+                convert(malformed)
+            except ValidationError:
+                pass
+            else:
+                raise AssertionError("converter accepted inconsistent batch phases")
+    detailed = dict(timed, file_stage_pattern_ticks=0, file_stage_push_ticks=1,
+                    file_stage_finish_ticks=0, file_stage_other_ticks=0)
+    assert convert(detailed)["phases"]["file_stage_push_ticks"] == 1
+    for mutate in (
+        lambda item: item.pop("file_stage_finish_ticks"),
+        lambda item: item.update(file_stage_other_ticks=True),
+        lambda item: item.update(file_stage_push_ticks=-1),
+        lambda item: item.update(file_stage_push_ticks=2),
+        lambda item: item.pop("file_stage_elapsed_ticks"),
+    ):
+        candidate = dict(detailed)
+        mutate(candidate)
+        try:
+            convert(candidate)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("converter accepted inconsistent staging details")
+    verify_details = dict(timed, file_verify_reader_ticks=1,
+                          file_verify_pattern_ticks=1, file_verify_other_ticks=1)
+    assert convert(verify_details)["phases"]["file_verify_reader_ticks"] == 1
+    for mutate in (
+        lambda item: item.pop("file_verify_pattern_ticks"),
+        lambda item: item.update(file_verify_other_ticks=True),
+        lambda item: item.update(file_verify_reader_ticks=-1),
+        lambda item: item.update(file_verify_reader_ticks=2),
+        lambda item: item.pop("file_verify_elapsed_ticks"),
+    ):
+        candidate = dict(verify_details)
+        mutate(candidate)
+        try:
+            convert(candidate)
+        except ValidationError:
+            pass
+        else:
+            raise AssertionError("converter accepted inconsistent verification details")
+    legacy = {name: value for name, value in guest.items() if not name.startswith("file_")}
+    assert "file_stage_read_bytes" not in convert(legacy)["phases"]
 
 
 def main() -> int:
@@ -763,6 +1129,8 @@ def main() -> int:
     run.add_argument("--data-image", type=Path, required=True,
                      help="powered-off verified backend template; cloned once per VM")
     run.add_argument("--output", type=Path, required=True)
+    run.add_argument("--retain-images", type=Path,
+                     help="retain stopped per-VM images without overwriting existing files; verify independently before reuse")
     run.add_argument("--object-bytes", type=int, required=True)
     run.add_argument("--object-count", type=int, default=1)
     run.add_argument("--content-class", choices=("unique", "half-duplicate", "all-duplicate"))
@@ -777,6 +1145,12 @@ def main() -> int:
     run.add_argument("--qemu", default="qemu-system-riscv64")
     run.add_argument("--boot-timeout", type=float, default=180)
     run.add_argument("--sample-timeout", type=float, default=300)
+    run.add_argument("--serial-log", type=Path,
+                     help="save raw guest serial output, including diagnostic lines")
+    run.add_argument("--host-telemetry", type=Path,
+                     help="opt-in host/QEMU CPU diagnostic JSONL; sampling overhead is included, never subtracted")
+    run.add_argument("--stop-on-failure", action="store_true",
+                     help="stop after the first non-ok sample and return exit status 1")
     run.add_argument("--overwrite", action="store_true")
     linux = subparsers.add_parser("run-linux")
     linux.add_argument("--root-image", type=Path, required=True)
@@ -802,6 +1176,12 @@ def main() -> int:
     linux.add_argument("--boot-timeout", type=float, default=300)
     linux.add_argument("--sample-timeout", type=float, default=900)
     linux.add_argument("--overwrite", action="store_true")
+    for runner in (run, linux):
+        runner.add_argument("--memory-mib", type=int, default=512,
+                            help="guest RAM in MiB (default: 512)")
+        for flag in THROTTLE_FIELDS:
+            runner.add_argument("--" + flag.replace("_", "-"), type=int, default=0,
+                                help="benchmark disk rate limit; 0 leaves it unlimited")
     provision = subparsers.add_parser("provision-debian")
     provision.add_argument("--base-image", type=Path, required=True)
     provision.add_argument("--firmware-code", type=Path, required=True)

@@ -125,3 +125,162 @@ fixed machine contract:
   band above, so treat those two deltas as directionally real but not
   precisely quantified by this run; a rerun with more samples per
   coordinate is recommended before citing exact numbers for either.
+
+## 2026-09-11: fewer flushes and less write amplification per file transaction
+
+Three engine changes on branch `wasm_threads` (measured against the
+2026-09-10 run above, same machine contract, 1 VM, 1 warmup, 5 samples):
+
+- **Boundary-stable COW partitioning** (`segment-store/src/fs_api.rs`,
+  `partition_fs_entries_stable`). The fused tree planner re-packed every
+  leaf greedily from the sorted entry list, so one inserted name shifted
+  every later leaf boundary and re-staged most of the tree: a single 4 KiB
+  create in a 600-file namespace re-staged 14 B+tree nodes (219 segment
+  pages, 908 KiB). Leaves and internal nodes now keep the previous tree's
+  boundaries, so an edit re-stages only its own path: 97 pages / 420 KiB
+  for the same create, and reads per commit fell from 2.7 MiB to 1.1 MiB.
+- **Pre-cleared scratch seals** (`segment-store/src/cas.rs`,
+  `preclear_scratch_seals`, `MountedState::durably_cleared_seals`). Every
+  publication zeroes the final seal page of the next free scratch run
+  inside its own batched write; the checkpoint barriers make the zeros
+  durable and the successor state records them, so the next writer skips
+  the zero-write + flush + read-back it paid per scratch segment. One
+  checkpoint now costs 3 flushes (clear old slot seal, body, seal) instead
+  of 4, on every commit path (object put, file transaction, chunk batch).
+- **Content folded into the fused transaction** (`file-store`
+  `FUSED_CONTENT_LIMIT`, segment-store `FsPendingContent`). Content up to
+  192 KiB from the stager or `write_chunks` is no longer published through
+  its own checkpoint before the tree commit; the fused batch stages it as
+  the first entries, the leaves name its predicted identity, and the
+  published handles are bound after the checkpoint. A small create or
+  overwrite is one checkpoint.
+
+- **Batched collection writes** (`segment-store/src/gc.rs`,
+  `SegmentBuilder::sink`). Relocation copied one extent record at a time
+  as three single-page device requests (descriptor body, seal, payload);
+  the builder now buffers a segment's pages and drains them as contiguous
+  runs when 64 pages accumulate and when the segment seals. A round that
+  relocated a segment of live nodes went from 986 write requests to 36 at
+  identical bytes. Nothing reads a relocation target before its seal, and
+  the pre-cleared seal set also spares the target-open flush.
+
+- **Catalog delta records** (`segment-store/src/cas.rs`,
+  `CatalogDeltaPolicy`; mount replay in `store.rs`; chain verification in
+  `scrub.rs` and `scripts/verify-storage-v2-migration.py`). Every checkpoint
+  rewrote the complete `VIBECAS2` snapshot, about 100 bytes per object, so
+  a 4 KiB create in a 600-file namespace spent 31 of its ~100 segment pages
+  on the catalog and the share grew linearly with the namespace. The writer
+  now uses the format's frozen delta ABI: one 3-page `CatalogDelta` record
+  per minted object, chained from the checkpoint's replay tail back to the
+  unchanged snapshot root, chosen whenever that costs fewer pages than the
+  snapshot and the chain stays within the superblock's 32-record budget;
+  the chain resets to a snapshot when the budget would be exceeded and on
+  every collection round. A 600-file unlink dropped from 97 to 83 pages,
+  and the per-checkpoint catalog cost is now flat (3 pages per object
+  minted) instead of proportional to the live object count.
+
+- **Reusable mark edges** (`segment-store/src/gc.rs`, `TypedEdgeCache`).
+  Every collection round re-read and re-authenticated every live typed
+  object (manifest, first leaf, tree page) to learn its child references:
+  a round over 900 files read 18 MiB in 4,000 requests. Objects are
+  immutable and id-addressed, so the store now keeps the child list each
+  walk authenticated, bound to the object's BlobKey and pruned to the live
+  catalog; a later round in the same process reads only objects committed
+  since the previous one. Second and later rounds over the same 900 files
+  read 6.6 MiB in 1,174 requests with ~6 misses each; the first round of a
+  process is unchanged. The memo is bounded (4 MiB) and never persisted.
+- Delta chains were also exercised on QEMU: after seven 100-file directory
+  transactions the small-file samples left a 29-record replay chain that
+  the powered-off native verifier (`verify-storage-v2-migration.py
+  --expect-native`) accepted.
+
+Per create+fsync+unlink sample (host trace, in-memory device; the QEMU
+`counters` are now per-sample deltas — the file-tree bench previously
+reported cumulative-since-boot telemetry):
+
+| namespace | flushes before → after | bytes written before → after |
+|---|---:|---:|
+| 8 files | 12 → 6 | 516 KiB → 448 KiB |
+| 600 files | 12 → 6 | 1.5 MiB → 0.9 MiB |
+
+QEMU medians (RAM-backed disk, so flushes are nearly free; the ratios that
+matter for the SD-card target are the flush and byte counts above):
+
+| coordinate | before | after |
+|---|---:|---:|
+| object put 4 KiB | 26.9 ms | 12.7 / 28.5 / 31.1 ms (three runs) |
+| object range-get / revoke 4 KiB | 26.6 / 29.3 ms | 16.5 / 13.2 ms |
+| create+fsync+unlink 4 KiB | 22.4 ms | 20.9 / 24.6 ms (two runs) |
+| overwrite 4 KiB | 27.3 ms | 23.5 / 25.7 / 24.7 ms (three runs) |
+| directory of 100 files | 32.0 ms | 23.5 / 27.0 ms (two runs) |
+| sequential write 64 / 256 MiB | 3.96 / 14.95 s | 3.66 / 14.01 s |
+
+Raw block coordinates are unchanged. On QEMU the latency deltas are
+inside run-to-run variance (a 5-sample run moves 10-20% between
+sessions, and the bimodal outlier on durable object commits — one sample
+in five 3-8x above the rest — persists and is unrelated to these
+changes); the flush and byte reductions above are the durable result.
+
+Remaining per-commit costs, in order: the frozen 2-page descriptor pair per
+extent and the 3-extent split of every small blob (about 60% of a small
+fused segment, a format change), the first collection round of each process
+(its mark walk reads about three distinct pages per live node; later rounds
+reuse the edge memo), and the relocation copy itself, which reads every live
+extent of a source segment once and verifies the copy.
+
+## 2026-09-11 (later): CPU profile of a small transaction, and two more cuts
+
+Host profile (release build, in-memory device, Apple M5) of one fused
+create at 8 and 600 files, using timestamped phase probes. Engine time is
+dominated by SHA-256 over descriptor pages that the frozen format mandates
+(two 4 KiB pages per extent, three extents per small blob): building the
+packed extent records costs ~0.1 ms per staged blob, manifest and
+catalog/allocation records ~0.2 ms, segment summary/seal ~0.15 ms, the
+checkpoint pair ~0.1 ms, and the mandated re-read of the checkpoint pair on
+successor mount ~0.15 ms. Blob staging itself (Merkle, encoding) is under
+10 µs per blob. The object-store append profiles the same way (~1.1 ms
+store-side, flat in object count; the host-side import build is linear in
+stream length but the kernel caches that replay). QEMU's TCG multiplies
+these by roughly 13x, which is why its latencies are CPU-bound.
+
+Two costs outside the hashing floor were found and removed:
+
+- **Root re-reads.** Every transaction read the current namespace root from
+  media twice — once in `expect_current_fs_root` before staging and once in
+  `recover_fs_root` after publication — and each read re-scanned a segment's
+  descriptor chain: 43 + 73 requests, ~900 KiB and the matching hashing per
+  commit. The store now memoizes the decoded root it just published, keyed
+  by the object identity the authority names (`FsRootMemo`); a commit reads
+  4 pages (48 KiB) instead.
+- **Quadratic link counts.** `encode_namespace` computed each inode's link
+  count by scanning every directory entry, so encoding a 600-file namespace
+  cost 1.2–1.5 ms per commit (40% of the transaction). `link_counts()` now
+  derives all counts in one pass; cold-recovery validation uses it too. The
+  publish step also moves the working state instead of cloning it again.
+
+Whole-transaction wall time on the host: 600-file create 3.9 → 1.8 ms.
+QEMU medians (two independent runs each): create+fsync+unlink 4 KiB
+22.4 → 14.7 / 12.9 ms, overwrite 4 KiB 27.3 → 15.9 / 14.9 ms, object put
+4 KiB 26.9 → 15.1 / 14.6 ms, directory of 100 files 32.0 → 23.0 ms;
+sequential 16 MiB unchanged (709 / 730 ms isolated) and object put 128 KiB
+unchanged (138.6 ms). Goldens `storage_v2`, `storage_v2_native` and the
+three-boot file-tree acceptance pass.
+
+## 2026-09-11 (later still): compact Blob layout
+
+The last CPU item was the frozen three-extent split of every small Blob
+(header / content / tree), each extent costing a descriptor pair — two
+4 KiB pages, one of them SHA-256 hashed — plus a page-rounded payload. The
+manifest ABI now admits a **compact layout**: a Blob whose complete
+canonical encoding fits one extent (up to 1 MiB) may be stored as exactly
+one extent carrying header, content, and tree contiguously; readers locate
+bytes by encoded offset, so both layouts decode the identical canonical
+Blob. The writer assembles every sink-buffered Blob (up to 256 KiB) in
+memory and emits the compact form; deduplication compares complete
+encodings across layouts; the codec, scrub, the powered-off verifiers, and
+the format document accept both. Existing canonical-split Blobs remain
+valid; images holding compact manifests need readers at or after this
+revision.
+
+Effect on a small fused create (host trace, 8 files): segment pages
+60 → 37, bytes 276 → 180 KiB, transaction wall 1.15 → 0.84 ms.

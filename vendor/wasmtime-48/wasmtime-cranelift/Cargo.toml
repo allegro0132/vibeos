@@ -34,6 +34,8 @@ repository = "https://github.com/bytecodealliance/wasmtime"
 resolver = "2"
 
 [features]
+# VibeOS: keep the compiler's builtin table in step with wasmtime-environ.
+threads = ["wasmtime-environ/threads"]
 riscv64 = ["cranelift-codegen/riscv64"]
 default = ["std"]
 std = ["dep:cranelift-native", "cranelift-codegen/std", "cranelift-codegen/timing", "cranelift-frontend/std", "gimli/std", "object/write", "wasmtime-environ/std", "wasmtime-environ/threads"]

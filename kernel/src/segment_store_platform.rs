@@ -45,6 +45,17 @@ use crate::block_device::{self, BlockDevice, BlockError};
 use crate::world::Space;
 use crate::{exec, heap, sync::SpinLock};
 
+#[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+fn emit_cold_phase(phase: &str, started: (u64, crate::virtio_blk::BlockTelemetry), success: bool) {
+    let elapsed = crate::sbi::time().saturating_sub(started.0);
+    let io = crate::virtio_blk::telemetry().saturating_sub(started.1);
+    crate::uart::_print(format_args!(
+        "VIBE_STORAGE_COLD_PHASE {{\"schema\":\"vibeos.storage-bench.cold-phase\",\"version\":1,\"phase\":\"{}\",\"status\":\"{}\",\"elapsed_ticks\":{},\"timebase_hz\":{},\"read_requests\":{},\"read_bytes\":{},\"write_requests\":{},\"write_bytes\":{},\"flush_requests\":{}}}\n",
+        phase, if success { "ok" } else { "error" }, elapsed, crate::exec::timebase_hz(),
+        io.read_requests, io.read_bytes, io.write_requests, io.write_bytes, io.flush_requests,
+    ));
+}
+
 const LOGICAL_BLOCK_SIZE: usize = 512;
 const BLOCKS_PER_PAGE: u64 = (PAGE_SIZE / LOGICAL_BLOCK_SIZE) as u64;
 
@@ -57,25 +68,10 @@ const MAX_PAGES_PER_REQUEST: usize =
 const MAX_PAGES_PER_REQUEST: usize = crate::sdhci_blk::MAX_TRANSFER_BLOCKS as usize
     * LOGICAL_BLOCK_SIZE
     / vibeos_segment_format::PAGE_SIZE;
-const STORAGE_V2_FOREGROUND_FREE_SEGMENTS: u64 = 10;
-/// Extra segments requested beyond the floor whenever foreground growth
-/// runs, so one growth transaction serves many subsequent commits.
-const STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS: u64 = 22;
-
-/// Scale the fixed foreground floor and hysteresis to the device: they were
-/// tuned on large bench devices, and on a small store (the Milk-V 64 MiB
-/// slice is sixteen 4 MiB segments) a 10-segment floor is structurally
-/// unreachable once a handful of segments hold live data — growth exhausts
-/// immediately and every subsequent commit pays up to eight full GC mark
-/// walks of the live object graph. An eighth of the device (clamped to the
-/// tuned values) keeps foreground collection an emergency, not a tax.
-fn scaled_free_floor(total_segments: u64) -> u64 {
-    (total_segments / 8).clamp(2, STORAGE_V2_FOREGROUND_FREE_SEGMENTS)
-}
-
-fn scaled_growth_hysteresis(total_segments: u64) -> u64 {
-    (total_segments / 4).clamp(2, STORAGE_V2_GROWTH_HYSTERESIS_SEGMENTS)
-}
+use crate::storage_capacity_policy::{
+    scaled_admission_hysteresis, scaled_free_floor, scaled_growth_hysteresis,
+    STORAGE_V2_FOREGROUND_FREE_SEGMENTS,
+};
 pub(crate) const STORAGE_V2_GROWTH_GRANULE_BLOCKS: u64 =
     vibeos_segment_format::SEGMENT_PAGES * BLOCKS_PER_PAGE;
 const M4_STORE_ID_RAW: u128 = 0x5649_4245_4f53_2d53_544f_5245_2d4d_3401;
@@ -186,11 +182,22 @@ async fn recover_recognized_persistent_authority(
 /// but a 25 MHz PIO microSD cannot. All runtime I/O flows through this one
 /// device, so hits are coherent: writes update or drop the affected entries,
 /// and an ambiguous write failure drops them as well.
-const PAGE_CACHE_CAPACITY: usize = 512;
+// Each boxed 4 KiB page is charged as an 8 KiB heap allocation. The small
+// Duo Python image must leave room for the interpreter's admission peak.
+const PAGE_CACHE_CAPACITY: usize = if cfg!(feature = "milkv-python") { 64 } else { 512 };
+
+const NO_CACHE_SLOT: u16 = u16::MAX;
+const _: () = assert!(PAGE_CACHE_CAPACITY < NO_CACHE_SLOT as usize);
 
 struct PageCacheEntry {
     data: alloc::boxed::Box<Page>,
-    tick: u64,
+    slot: u16,
+}
+
+struct PageCacheLink {
+    page: u64,
+    previous: u16,
+    next: u16,
 }
 
 struct PageCache {
@@ -199,7 +206,80 @@ struct PageCache {
 
 struct PageCacheState {
     entries: alloc::collections::BTreeMap<u64, PageCacheEntry>,
-    tick: u64,
+    // At most one slot per cache entry. Removed slots form a free list;
+    // recency changes never allocate or perform another map lookup.
+    links: Vec<PageCacheLink>,
+    oldest: u16,
+    newest: u16,
+    free: u16,
+}
+
+impl PageCacheState {
+    fn unlink(&mut self, slot: u16) {
+        let link = &self.links[slot as usize];
+        let (previous, next) = (link.previous, link.next);
+        if previous != NO_CACHE_SLOT {
+            self.links[previous as usize].next = next;
+        } else {
+            self.oldest = next;
+        }
+        if next != NO_CACHE_SLOT {
+            self.links[next as usize].previous = previous;
+        } else {
+            self.newest = previous;
+        }
+    }
+
+    fn append(&mut self, slot: u16) {
+        let link = &mut self.links[slot as usize];
+        link.previous = self.newest;
+        link.next = NO_CACHE_SLOT;
+        if self.newest != NO_CACHE_SLOT {
+            self.links[self.newest as usize].next = slot;
+        } else {
+            self.oldest = slot;
+        }
+        self.newest = slot;
+    }
+
+    fn touch(&mut self, slot: u16) {
+        if self.newest != slot {
+            self.unlink(slot);
+            self.append(slot);
+        }
+    }
+
+    fn remove(&mut self, page: u64) -> Option<PageCacheEntry> {
+        let entry = self.entries.remove(&page)?;
+        self.unlink(entry.slot);
+        self.links[entry.slot as usize].next = self.free;
+        self.free = entry.slot;
+        Some(entry)
+    }
+
+    fn oldest_page(&self) -> u64 {
+        self.links[self.oldest as usize].page
+    }
+
+    fn insert(&mut self, page: u64, mut entry: PageCacheEntry) {
+        debug_assert!(!self.entries.contains_key(&page));
+        let slot = if self.free != NO_CACHE_SLOT {
+            let slot = self.free;
+            self.free = self.links[slot as usize].next;
+            self.links[slot as usize].page = page;
+            slot
+        } else {
+            assert!(self.links.len() < PAGE_CACHE_CAPACITY);
+            let slot = self.links.len() as u16;
+            self.links.push(PageCacheLink {
+                page, previous: NO_CACHE_SLOT, next: NO_CACHE_SLOT,
+            });
+            slot
+        };
+        entry.slot = slot;
+        self.entries.insert(page, entry);
+        self.append(slot);
+    }
 }
 
 /// Bounded page-cache effectiveness telemetry: a one-line hit-rate report
@@ -230,7 +310,10 @@ impl PageCache {
         Self {
             state: SpinLock::new_recoverable(PageCacheState {
                 entries: alloc::collections::BTreeMap::new(),
-                tick: 0,
+                links: Vec::new(),
+                oldest: NO_CACHE_SLOT,
+                newest: NO_CACHE_SLOT,
+                free: NO_CACHE_SLOT,
             }),
         }
     }
@@ -238,47 +321,92 @@ impl PageCache {
     /// Copy a cached page into `output`, refreshing its recency.
     fn get(&self, page: u64, output: &mut Page) -> bool {
         let mut state = self.state.lock();
-        state.tick += 1;
-        let tick = state.tick;
         match state.entries.get_mut(&page) {
             Some(entry) => {
-                entry.tick = tick;
                 output.copy_from_slice(&entry.data[..]);
+                let slot = entry.slot;
+                state.touch(slot);
                 true
             }
             None => false,
         }
     }
 
-    fn insert(&self, page: u64, data: &Page) {
-        let boxed = alloc::boxed::Box::new(*data);
+    /// Copy cached pages and return the smallest contiguous span covering all
+    /// misses. One span per hardware-sized batch avoids turning alternating
+    /// hits/misses into many expensive SD commands. Cached prefixes/suffixes
+    /// never need another device transfer. The caller validates the range.
+    fn read_span(&self, first_page: u64, output: &mut [Page]) -> core::ops::Range<usize> {
+        let mut missing = output.len()..0;
         let mut state = self.state.lock();
-        state.tick += 1;
-        let tick = state.tick;
+        for (index, page) in output.iter_mut().enumerate() {
+            let key = first_page + index as u64;
+            match state.entries.get_mut(&key) {
+                Some(entry) => {
+                    page.copy_from_slice(&entry.data[..]);
+                    let slot = entry.slot;
+                    state.touch(slot);
+                }
+                None => {
+                    missing.start = missing.start.min(index);
+                    missing.end = index + 1;
+                }
+            }
+        }
+        if missing.end == 0 {
+            0..0
+        } else {
+            missing
+        }
+    }
+
+    fn insert(&self, page: u64, data: &Page) {
+        self.insert_with_allocator(page, data, |data| alloc::boxed::Box::new(*data));
+    }
+
+    fn insert_with_allocator(
+        &self,
+        page: u64,
+        data: &Page,
+        allocate: impl FnOnce(&Page) -> alloc::boxed::Box<Page>,
+    ) {
+        {
+            let mut state = self.state.lock();
+            if let Some(entry) = state.entries.get_mut(&page) {
+                entry.data.copy_from_slice(data);
+                let slot = entry.slot;
+                state.touch(slot);
+                return;
+            }
+            if state.entries.len() >= PAGE_CACHE_CAPACITY {
+                let oldest = state.oldest_page();
+                let mut entry = state.remove(oldest).expect("LRU page");
+                entry.data.copy_from_slice(data);
+                state.insert(page, entry);
+                return;
+            }
+        }
+        // Allocate outside the cache lock. Recheck after allocation because
+        // another inserter may have updated the key or filled the cache.
+        let boxed = allocate(data);
+        let mut state = self.state.lock();
         if let Some(entry) = state.entries.get_mut(&page) {
             entry.data.copy_from_slice(data);
-            entry.tick = tick;
+            let slot = entry.slot;
+            state.touch(slot);
             return;
         }
         if state.entries.len() >= PAGE_CACHE_CAPACITY {
-            if let Some(oldest) = state
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.tick)
-                .map(|(page, _)| *page)
-            {
-                state.entries.remove(&oldest);
-            }
+            let oldest = state.oldest_page();
+            state.remove(oldest);
         }
-        state
-            .entries
-            .insert(page, PageCacheEntry { data: boxed, tick });
+        state.insert(page, PageCacheEntry { data: boxed, slot: NO_CACHE_SLOT });
     }
 
     fn invalidate(&self, first_page: u64, page_count: usize) {
         let mut state = self.state.lock();
         for page in first_page..first_page.saturating_add(page_count as u64) {
-            state.entries.remove(&page);
+            state.remove(page);
         }
     }
 
@@ -289,7 +417,10 @@ impl PageCache {
     fn clear(&self) {
         let mut state = self.state.lock();
         state.entries.clear();
-        state.tick = 0;
+        state.links.clear();
+        state.oldest = NO_CACHE_SLOT;
+        state.newest = NO_CACHE_SLOT;
+        state.free = NO_CACHE_SLOT;
     }
 }
 
@@ -818,6 +949,7 @@ pub(crate) enum BootProbeError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum V2RuntimeError {
+    CandidateCapacity,
     Busy,
     OutsideTask,
     Unformatted,
@@ -920,7 +1052,7 @@ struct KernelFileTreeBackend {
 #[cfg(feature = "file-tree")]
 fn map_file_runtime_error(error: V2RuntimeError) -> FileError {
     match error {
-        V2RuntimeError::Busy | V2RuntimeError::JournalChanged => FileError::Busy,
+        V2RuntimeError::Busy | V2RuntimeError::JournalChanged | V2RuntimeError::CandidateCapacity => FileError::Busy,
         V2RuntimeError::OutsideTask
         | V2RuntimeError::Unformatted
         | V2RuntimeError::AuthorityMissing
@@ -1129,9 +1261,13 @@ pub(crate) struct StorageV2Runtime {
     _quota_provisioner: StorageQuotaProvisioner,
 }
 
-/// Below this many logical records the authority stream is not worth
-/// rewriting: migration fixtures and small stores never trigger compaction.
+/// Boot compaction only rewrites authority streams above this record count.
 const STORAGE_V2_COMPACT_MIN_RECORDS: usize = 2048;
+// Foreground compaction amortizes reservation history once 256 records
+// accumulate. The existing reduction and policy checks still gate a rewrite.
+const STORAGE_V2_FOREGROUND_COMPACT_MIN_RECORDS: usize = 256;
+// Regions of at most 16 segments encounter GC pressure earlier.
+const STORAGE_V2_SMALL_COMPACT_MIN_RECORDS: usize = 128;
 
 const STORAGE_V2_HOT_READ_CACHE_BYTES: usize = 256 * 1024;
 // Object-store tokens retain the encoded Merkle envelope, so a 64 KiB user
@@ -1179,6 +1315,24 @@ impl HotReadCache {
         Some(weak)
     }
 
+    fn insert_external(
+        &self,
+        object: &vibeos_durable_format::RecoveredObject,
+        bytes: &[u8],
+    ) -> Option<Weak<[u8]>> {
+        let root = object.external_root?;
+        if bytes.len() > STORAGE_V2_HOT_READ_MAX_OBJECT_BYTES
+            || object.byte_len != bytes.len() as u64
+        {
+            return None;
+        }
+        let descriptor = crate::store::BlobDescriptor::from_content(object.object_kind.get(), bytes).ok()?;
+        if descriptor.root != root {
+            return None;
+        }
+        self.insert(bytes)
+    }
+
     fn clear(&self) {
         let mut state = self.state.lock();
         state.entries.clear();
@@ -1188,6 +1342,23 @@ impl HotReadCache {
 
 static NEXT_V2_OPERATION: AtomicU64 = AtomicU64::new(1);
 static INSTALLED_V2_RUNTIME: SpinLock<Option<Arc<StorageV2Runtime>>> = SpinLock::new(None);
+
+/// Benchmark data-cache eviction only: retain mounted metadata and proof
+/// provenance. This is not a cold recovery or a physical-media scrub.
+#[cfg(feature = "legacy-shell")]
+pub(crate) fn benchmark_evict_read_data() -> bool {
+    let Some(runtime) = INSTALLED_V2_RUNTIME.lock().clone() else {
+        return false;
+    };
+    let Ok(operation) = runtime.begin() else {
+        return false;
+    };
+    runtime.hot_reads.clear();
+    runtime.device.page_cache.clear();
+    operation.finish();
+    true
+}
+
 
 struct V2Operation {
     runtime: Arc<StorageV2Runtime>,
@@ -1231,6 +1402,25 @@ impl Drop for V2Operation {
 }
 
 impl StorageV2Runtime {
+    // Rebuilding after an unformatted probe or a cancelled operation must
+    // retain the same kernel verification policy as the initial instance.
+    fn new_store(
+        device: CapabilityPageDevice,
+        context: StoreRuntimeContext,
+    ) -> SegmentStore<CapabilityPageDevice> {
+        let mut store = SegmentStore::new_with_runtime_context(
+            device,
+            storage_v2_store_limits(),
+            context,
+        );
+        // Every read Merkle-verifies content and boot performs a full scrub.
+        // A damaged acknowledged write is detected there rather than by an
+        // extra foreground readback of every newly committed payload page.
+        store.set_deferred_commit_readback(true);
+        store.set_hot_content_proof_max_bytes(STORAGE_V2_HOT_READ_MAX_OBJECT_BYTES as u64);
+        store
+    }
+
     fn new(device: CapabilityPageDevice) -> Arc<Self> {
         let typed_kinds: &[u32] = if cfg!(feature = "file-tree") {
             &vibeos_segment_store::fs_typed_reference_kinds()
@@ -1242,17 +1432,7 @@ impl StorageV2Runtime {
                 typed_kinds,
             )
             .expect("fixed Storage V2 governed runtime policy is valid");
-        let mut store = SegmentStore::new_with_runtime_context(
-            device.clone(),
-            storage_v2_store_limits(),
-            context.clone(),
-        );
-        // Deferred commit read-back: every read path Merkle-verifies content
-        // and boot performs a full cold scrub, so a damaged device write is
-        // detected at first use instead of at the commit that produced it.
-        // This trades that detection window for not re-reading and re-hashing
-        // every just-written page on the foreground commit path.
-        store.set_deferred_commit_readback(true);
+        let store = Self::new_store(device.clone(), context.clone());
         let runtime = Arc::new(Self {
             store: StableSegmentStore(UnsafeCell::new(store)),
             device,
@@ -1313,11 +1493,7 @@ impl StorageV2Runtime {
             // Safety: this exact claim excludes every other access and fault
             // cleanup marked the previous task permanently detached.
             unsafe {
-                *self.store.0.get() = SegmentStore::new_with_runtime_context(
-                    self.device.clone(),
-                    storage_v2_store_limits(),
-                    self.context.clone(),
-                );
+                *self.store.0.get() = Self::new_store(self.device.clone(), self.context.clone());
             }
             system.restore();
             *self.authority.lock() = None;
@@ -1354,6 +1530,15 @@ impl StorageV2Runtime {
         cached: &Weak<[u8]>,
         expected_generation: u64,
     ) -> Result<Option<Vec<u8>>, vibeos_object_store::StoreError> {
+        self.read_hot_range(cached, expected_generation, None)
+    }
+
+    fn read_hot_range(
+        &self,
+        cached: &Weak<[u8]>,
+        expected_generation: u64,
+        range: Option<(u64, usize)>,
+    ) -> Result<Option<Vec<u8>>, vibeos_object_store::StoreError> {
         let Some(bytes) = cached.upgrade() else {
             return Ok(None);
         };
@@ -1382,7 +1567,15 @@ impl StorageV2Runtime {
             // fails closed only if the object is genuinely unresolvable.
             return Ok(None);
         }
-        let output = bytes.as_ref().to_vec();
+        let selected = match range {
+            None => bytes.as_ref(),
+            Some((offset, len)) => usize::try_from(offset)
+                .ok()
+                .and_then(|start| start.checked_add(len).map(|end| (start, end)))
+                .and_then(|(start, end)| bytes.get(start..end))
+                .ok_or(vibeos_object_store::StoreError::ObjectUnavailable)?,
+        };
+        let output = selected.to_vec();
         drop(authority);
         drop(active);
         Ok(Some(output))
@@ -1623,6 +1816,11 @@ impl StorageV2Runtime {
             .ok_or(V2RuntimeError::Corrupt)?;
         let result = poll_as_system(async {
             let store = operation.store();
+            // Research-only guest opt-in after authority initialization. The
+            // library call is idempotent so warm predecessor provenance survives.
+            #[cfg(feature = "experimental-authority-delta")]
+            store.enable_experimental_authority_delta()
+                .map_err(|_| V2RuntimeError::Corrupt)?;
             let writer = store
                 .derive_persistent_authority_writer(&maintenance)
                 .map_err(|_| V2RuntimeError::Corrupt)?;
@@ -1631,9 +1829,16 @@ impl StorageV2Runtime {
                 .await
                 .map_err(|error| match error {
                     PersistentAuthorityError::GenerationMismatch => V2RuntimeError::JournalChanged,
+                    PersistentAuthorityError::Store(vibeos_segment_store::StoreError::Quota(
+                        vibeos_segment_store::QuotaError::PersistentCandidateCapacity,
+                    )) => {
+                        #[cfg(feature = "storage-bench")]
+                        crate::println!("  bench-detail candidate capacity rejected before append; store={:?}", store.info());
+                        V2RuntimeError::CandidateCapacity
+                    },
                     _error => {
                         #[cfg(feature = "storage-bench")]
-                        crate::println!("  bench-detail authority append error: {_error:?}");
+                        crate::println!("  bench-detail authority append error: {_error:?}; store={:?}", store.info());
                         V2RuntimeError::Corrupt
                     }
                 })
@@ -1643,7 +1848,7 @@ impl StorageV2Runtime {
             .as_ref()
             .is_err_and(|error| append_error_requires_cold_recovery(*error))
         {
-            // Every non-stale-check append failure may have crossed an
+            // Failures not proved to precede append I/O may have crossed an
             // on-media mutation boundary. Revoke the predecessor proof while
             // this operation still owns the runtime claim; only a new boot
             // probe may establish which atomic checkpoint became durable.
@@ -1673,10 +1878,26 @@ impl StorageV2Runtime {
         // early failures first release the exact operation epoch and then
         // atomically invalidate the previously published runtime cache.
         let recovered = async {
-            let info =
-                poll_as_system(operation.store().mount())
-                    .await
-                    .map_err(|error| match error {
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            let mount_io_started = crate::virtio_blk::telemetry();
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            let mount_started = crate::sbi::time();
+            let mounted = poll_as_system(operation.store().mount()).await;
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            {
+                let ticks = crate::sbi::time().saturating_sub(mount_started);
+                let io = crate::virtio_blk::telemetry().saturating_sub(mount_io_started);
+                let (status, generation, peak) = match &mounted {
+                    Ok(info) => ("ok", info.generation, info.recovery_peak_bytes),
+                    Err(_) => ("error", 0, 0),
+                };
+                crate::uart::_print(format_args!(
+                    "VIBE_STORAGE_MOUNT {{\"schema\":\"vibeos.storage-bench.mount\",\"version\":1,\"status\":\"{}\",\"generation\":{},\"elapsed_ticks\":{},\"timebase_hz\":{},\"read_requests\":{},\"read_bytes\":{},\"write_requests\":{},\"write_bytes\":{},\"flush_requests\":{},\"recovery_peak_bytes\":{}}}\n",
+                    status, generation, ticks, crate::exec::timebase_hz(), io.read_requests,
+                    io.read_bytes, io.write_requests, io.write_bytes, io.flush_requests, peak,
+                ));
+            }
+            let info = mounted.map_err(|error| match error {
                         vibeos_segment_store::StoreError::Unformatted => {
                             V2RuntimeError::Unformatted
                         }
@@ -1708,6 +1929,8 @@ impl StorageV2Runtime {
             // writers replenish capacity themselves (with hysteresis) on
             // their first commit instead.
             *self.last_info.lock() = Some(info);
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            let authority_started = (crate::sbi::time(), crate::virtio_blk::telemetry());
             let view = poll_as_system(recover_recognized_persistent_authority(
                 operation.store(),
                 expected_policy_sha256,
@@ -1803,9 +2026,15 @@ impl StorageV2Runtime {
                     }
                 }
             };
-            let scrub = poll_as_system(operation.store().scrub(&maintenance))
-                .await
-                .map_err(|_| V2RuntimeError::Corrupt)?;
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            emit_cold_phase("authority", authority_started, true);
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            let scrub_started = (crate::sbi::time(), crate::virtio_blk::telemetry());
+            let scrub = poll_as_system(operation.store().scrub(&maintenance)).await;
+            #[cfg(all(feature = "storage-bench", feature = "qemu-virt"))]
+            emit_cold_phase("scrub", scrub_started,
+                scrub.as_ref().is_ok_and(|report| report.status == ScrubStatus::Healthy));
+            let scrub = scrub.map_err(|_| V2RuntimeError::Corrupt)?;
             // A crash may durably publish anonymous CAS extents/checkpoints
             // before the atomic authority snapshot which would bind them.
             // Scrub may therefore be newer than authority, never older.
@@ -2033,7 +2262,7 @@ impl StorageV2Runtime {
         // growth checkpoint. Overshooting amortizes one growth transaction
         // across many commits.
         let growth_blocks = floor
-            .saturating_add(hysteresis)
+            .saturating_add(scaled_admission_hysteresis(total_segments, info.admitted_segments))
             .saturating_sub(info.free_segments)
             .checked_mul(STORAGE_V2_GROWTH_GRANULE_BLOCKS)
             .ok_or(V2RuntimeError::Corrupt)?;
@@ -2065,7 +2294,7 @@ impl StorageV2Runtime {
             // only rejoins the free set two checkpoint generations later, so
             // one round cannot observe its own relief — iterate bounded
             // rounds until the requested floor is met or reclaim stalls.
-            // Reclaim past the floor with the same hysteresis as growth:
+            // Reclaim past the floor with the bounded collection hysteresis:
             // every mark walk costs one pass over the live object graph, so
             // stopping at the floor makes the very next batch dip below it
             // and charges a full walk per handful of freed segments.
@@ -2146,6 +2375,68 @@ impl StorageV2Runtime {
         Ok(())
     }
 
+    /// Bound orphan history before the facade constructs its next journal
+    /// extension. Only the baseline policy uses this path; shared store pins
+    /// decide whether rewriting is safe now. Larger regions amortize the
+    /// replacement checkpoint with a higher record threshold.
+    async fn compact_unpinned_authority(
+        self: &Arc<Self>,
+        view: &PersistentAuthorityView,
+    ) -> Result<Option<Arc<PersistentAuthorityView>>, vibeos_object_store::StoreError> {
+        let total_segments = self.device.provisioned_page_count()
+            / vibeos_segment_format::SEGMENT_PAGES;
+        let minimum_records = if total_segments <= 16 {
+            STORAGE_V2_SMALL_COMPACT_MIN_RECORDS
+        } else {
+            STORAGE_V2_FOREGROUND_COMPACT_MIN_RECORDS
+        };
+        if view.record_stream().len() / LOGICAL_BLOCK_SIZE < minimum_records
+            || view.root_policy_sha256() != crate::durable_cspace::storage_v2_external_policy_sha256()
+        {
+            return Ok(None);
+        }
+        let mut operation = match self.begin() {
+            Ok(operation) => operation,
+            Err(V2RuntimeError::Busy) => return Ok(None),
+            Err(error) => return Err(map_facade_error(error)),
+        };
+        let policy = view.root_policy_sha256();
+        let result = poll_as_system(async {
+            let store = operation.store();
+            if !store.quiescent_compaction_hint() { return Ok(None); }
+            let import = crate::durable_cspace::storage_v2_recovery_import_for_policy(
+                view.record_stream(), policy,
+            ).map_err(|_| PersistentAuthorityError::PolicyMismatch)?;
+            let maintenance = self.maintenance.lock().clone()
+                .ok_or(PersistentAuthorityError::Unauthorized)?;
+            let writer = store.derive_persistent_authority_writer(&maintenance)?;
+            store.compact_unpinned_persistent_authority(
+                &writer, view.checkpoint_generation(), import,
+                |records| crate::durable_cspace::storage_v2_compaction_import_for_policy(records, policy)
+                    .map_err(|_| PersistentAuthorityError::PolicyMismatch),
+            ).await
+        }).await;
+        match result {
+            Ok(Some(compacted)) => {
+                #[cfg(feature = "storage-bench")]
+                crate::println!("  bench-detail quiescent compact records={} -> {}",
+                    view.record_stream().len() / LOGICAL_BLOCK_SIZE,
+                    compacted.record_stream().len() / LOGICAL_BLOCK_SIZE);
+                *self.preflight_cache.lock() = None;
+                self.compact_watermark.store(0, Ordering::Release);
+                let published = self.publish_authority(compacted);
+                operation.finish();
+                Ok(Some(published))
+            }
+            Ok(None) => { operation.finish(); Ok(None) }
+            Err(_) => {
+                self.invalidate_recovery_cache();
+                operation.finish();
+                Err(vibeos_object_store::StoreError::Corrupt)
+            }
+        }
+    }
+
     /// Steady-state stream compaction. When the appended logical journal has
     /// outgrown the threshold and a rewrite would shed at least a quarter of
     /// its records, replace the persistent authority with the compacted
@@ -2157,10 +2448,35 @@ impl StorageV2Runtime {
     async fn maybe_compact_authority(
         self: &Arc<Self>,
         view: &PersistentAuthorityView,
+        previous_record_count: usize,
+        transient: &PersistentAuthorityTransientObjects,
     ) -> Result<Option<Arc<PersistentAuthorityView>>, vibeos_object_store::StoreError> {
         let record_count = (view.record_stream().len() / LOGICAL_BLOCK_SIZE) as u64;
-        if (record_count as usize) < STORAGE_V2_COMPACT_MIN_RECORDS {
+        let total_segments =
+            self.device.provisioned_page_count() / vibeos_segment_format::SEGMENT_PAGES;
+        let minimum_records = if total_segments <= 16 {
+            STORAGE_V2_SMALL_COMPACT_MIN_RECORDS
+        } else {
+            STORAGE_V2_FOREGROUND_COMPACT_MIN_RECORDS
+        };
+        if (record_count as usize) < minimum_records {
             return Ok(None);
+        }
+        // Defer a threshold-crossing rewrite only when the new witness
+        // covers all currently observed roots. The next recovery may then
+        // reclaim history; live older handles keep the original schedule.
+        // This hint never substitutes for the store's admission guard.
+        if total_segments <= 16
+            && previous_record_count < STORAGE_V2_SMALL_COMPACT_MIN_RECORDS
+            && view.root_policy_sha256() == crate::durable_cspace::storage_v2_external_policy_sha256()
+        {
+            if let Ok(mut operation) = self.begin() {
+                let defer = poll_as_system(async {
+                    operation.store().transient_witness_covers_runtime_roots(transient)
+                }).await;
+                operation.finish();
+                if defer { return Ok(None); }
+            }
         }
         let watermark = self.compact_watermark.load(Ordering::Acquire);
         if watermark != 0 && record_count < watermark.saturating_add(watermark / 4) {
@@ -2182,6 +2498,12 @@ impl StorageV2Runtime {
             Ok(Some(compacted)) => compacted,
             _ => return Ok(None),
         };
+        #[cfg(feature = "storage-bench")]
+        crate::println!(
+            "  bench-detail runtime compact records={} -> {}",
+            record_count,
+            compacted.len()
+        );
         let Ok(import) = crate::durable_cspace::storage_v2_compaction_import_for_policy(
             &compacted,
             view.root_policy_sha256(),
@@ -3329,6 +3651,200 @@ impl StorageV2Devices {
 mod storage_v2_transition_tests {
     use super::*;
 
+    #[cfg_attr(test, test)]
+    pub(crate) fn cached_read_spans_preserve_data_and_bound_command_count() {
+        const PAGES: usize = 8;
+        let cache = PageCache::new();
+        let mut output = alloc::vec![[0; PAGE_SIZE]; PAGES];
+        let mut data = alloc::vec![[0; PAGE_SIZE]; PAGES];
+        for (index, page) in data.iter_mut().enumerate() {
+            page.fill(index as u8 + 1);
+        }
+        for hits in 0u32..(1 << PAGES) {
+            cache.clear();
+            for (index, page) in data.iter().enumerate() {
+                if hits & (1 << index) != 0 {
+                    cache.insert(71 + index as u64, page);
+                }
+            }
+            output.fill([0; PAGE_SIZE]);
+            let missing = cache.read_span(71, &mut output);
+            // A single request covers every miss, without rereading a cached
+            // prefix/suffix; simulated device bytes must complete the result.
+            for index in 0..PAGES {
+                if hits & (1 << index) == 0 {
+                    assert!(missing.contains(&index));
+                }
+            }
+            if !missing.is_empty() {
+                assert_eq!(hits & (1 << missing.start), 0);
+                assert_eq!(hits & (1 << (missing.end - 1)), 0);
+                output[missing.clone()].copy_from_slice(&data[missing]);
+            }
+            assert_eq!(output, data);
+        }
+        // Mutation invalidation must force just the changed page to media.
+        cache.invalidate(74, 1);
+        assert_eq!(cache.read_span(71, &mut output), 3..4);
+        cache.clear();
+        assert_eq!(cache.read_span(71, &mut output), 0..PAGES);
+        assert!(cache.read_span(71, &mut []).is_empty());
+    }
+
+    #[cfg_attr(test, test)]
+    pub(crate) fn page_cache_reuses_buffers_and_preserves_lru() {
+        let cache = PageCache::new();
+        let allocations = core::cell::Cell::new(0);
+        let mut data = alloc::boxed::Box::new([0x51; PAGE_SIZE]);
+        for page in 0..PAGE_CACHE_CAPACITY as u64 {
+            cache.insert_with_allocator(page, &data, |data| {
+                allocations.set(allocations.get() + 1);
+                alloc::boxed::Box::new(*data)
+            });
+        }
+        assert_eq!(allocations.get(), PAGE_CACHE_CAPACITY);
+        let mut output = alloc::boxed::Box::new([0; PAGE_SIZE]);
+        data.fill(0x72);
+        cache.insert_with_allocator(0, &data, |_| panic!("update allocated a page"));
+        let victim = cache.state.lock().entries.get(&1).unwrap().data.as_ptr();
+        cache.insert_with_allocator(PAGE_CACHE_CAPACITY as u64, &data, |_| {
+            panic!("replacement allocated a page")
+        });
+        assert_eq!(
+            cache.state.lock().entries.get(&(PAGE_CACHE_CAPACITY as u64))
+                .unwrap().data.as_ptr(),
+            victim,
+        );
+        assert!(cache.get(0, &mut output));
+        assert_eq!(output[..], data[..]);
+        assert!(!cache.get(1, &mut output));
+        assert!(cache.get(PAGE_CACHE_CAPACITY as u64, &mut output));
+        assert_eq!(output[..], data[..]);
+        assert_eq!(cache.state.lock().entries.len(), PAGE_CACHE_CAPACITY);
+        cache.clear();
+        // Simulate a competing insert while the allocator is running; this
+        // also verifies that allocation happens without holding the lock.
+        cache.insert_with_allocator(7, &data, |data| {
+            cache.insert(7, &[0x99; PAGE_SIZE]);
+            alloc::boxed::Box::new(*data)
+        });
+        assert_eq!(cache.state.lock().entries.len(), 1);
+        assert!(cache.get(7, &mut output));
+        assert_eq!(output[..], data[..]);
+        cache.invalidate(7, 1);
+        assert!(!cache.get(7, &mut output));
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn page_cache_links_match_reference_lru() {
+        use alloc::collections::{BTreeMap, VecDeque};
+        let cache = PageCache::new();
+        let mut order = VecDeque::new();
+        let mut values = BTreeMap::new();
+        let mut random = 17_u64;
+        let mut output = alloc::vec![[0; PAGE_SIZE]; 4];
+        for step in 0..6000_u64 {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            let page = random % (PAGE_CACHE_CAPACITY as u64 * 2);
+            let operation = if step < PAGE_CACHE_CAPACITY as u64 * 3 { 0 } else { random % 5 };
+            let touch = |order: &mut VecDeque<u64>, key| {
+                if let Some(index) = order.iter().position(|p| *p == key) {
+                    order.remove(index);
+                }
+                order.push_back(key);
+            };
+            match operation {
+                0 | 1 => {
+                    let value = step as u8;
+                    cache.insert(page, &[value; PAGE_SIZE]);
+                    if !values.contains_key(&page) && values.len() == PAGE_CACHE_CAPACITY {
+                        values.remove(&order.pop_front().unwrap());
+                    }
+                    values.insert(page, value);
+                    touch(&mut order, page);
+                }
+                2 => {
+                    let hit = cache.get(page, &mut output[0]);
+                    assert_eq!(hit, values.contains_key(&page));
+                    if let Some(value) = values.get(&page) {
+                        assert_eq!(output[0], [*value; PAGE_SIZE]);
+                        touch(&mut order, page);
+                    }
+                }
+                3 => {
+                    let missing = cache.read_span(page, &mut output);
+                    let mut expected = 4..0;
+                    for index in 0..4 {
+                        let key = page + index as u64;
+                        if let Some(value) = values.get(&key) {
+                            assert_eq!(output[index], [*value; PAGE_SIZE]);
+                            touch(&mut order, key);
+                        } else {
+                            expected.start = expected.start.min(index);
+                            expected.end = index + 1;
+                        }
+                    }
+                    assert_eq!(missing, if expected.end == 0 { 0..0 } else { expected });
+                }
+                _ => {
+                    cache.invalidate(page, 3);
+                    for key in page..page + 3 {
+                        values.remove(&key);
+                        order.retain(|p| *p != key);
+                    }
+                }
+            }
+            if step % 1999 == 1998 {
+                cache.clear();
+                order.clear();
+                values.clear();
+            }
+            let state = cache.state.lock();
+            assert_eq!(state.entries.len(), values.len());
+            let key = |slot: u16| {
+                if slot == NO_CACHE_SLOT { None } else { Some(state.links[slot as usize].page) }
+            };
+            assert_eq!(key(state.oldest), order.front().copied());
+            assert_eq!(key(state.newest), order.back().copied());
+            assert!(state.links.len() <= PAGE_CACHE_CAPACITY);
+            let mut seen = alloc::collections::BTreeSet::new();
+            for (index, key) in order.iter().enumerate() {
+                let entry = state.entries.get(key).unwrap();
+                assert!(seen.insert(entry.slot));
+                let link = &state.links[entry.slot as usize];
+                assert_eq!(link.page, *key);
+                let previous = if link.previous == NO_CACHE_SLOT { None }
+                    else { Some(state.links[link.previous as usize].page) };
+                let next = if link.next == NO_CACHE_SLOT { None }
+                    else { Some(state.links[link.next as usize].page) };
+                assert_eq!(previous, index.checked_sub(1).map(|i| order[i]));
+                assert_eq!(next, order.get(index + 1).copied());
+                assert_eq!(entry.data[..], [values[key]; PAGE_SIZE]);
+            }
+            let mut free = state.free;
+            while free != NO_CACHE_SLOT {
+                assert!(seen.insert(free));
+                free = state.links[free as usize].next;
+            }
+            assert_eq!(seen.len(), state.links.len());
+        }
+        // The allocator can also race with enough inserts to fill the cache.
+        cache.clear();
+        cache.insert_with_allocator(u64::MAX, &[0x42; PAGE_SIZE], |data| {
+            for page in 0..PAGE_CACHE_CAPACITY as u64 {
+                cache.insert(page, &[0x31; PAGE_SIZE]);
+            }
+            alloc::boxed::Box::new(*data)
+        });
+        assert!(!cache.get(0, &mut output[0]));
+        assert!(cache.get(u64::MAX, &mut output[0]));
+        assert_eq!(output[0], [0x42; PAGE_SIZE]);
+        assert_eq!(cache.state.lock().entries.len(), PAGE_CACHE_CAPACITY);
+    }
+
     fn staged() -> MigrationControl {
         MigrationControl {
             state: MigrationState::V2Staged,
@@ -3386,6 +3902,32 @@ mod storage_v2_transition_tests {
         assert!(survivor.upgrade().is_none());
         page.resize(STORAGE_V2_HOT_READ_MAX_OBJECT_BYTES + 1, 0);
         assert!(cache.insert(&page).is_none());
+        let bytes = [1, 2, 3, 4];
+        let kind = vibeos_durable_format::ObjectKind::new(123).unwrap();
+        let root = crate::store::BlobDescriptor::from_content(kind.get(), &bytes).unwrap().root;
+        let mut object = vibeos_durable_format::RecoveredObject {
+            object_id: vibeos_durable_format::ObjectId::new(2).unwrap(),
+            object_kind: kind,
+            bytes: Vec::new(),
+            byte_len: bytes.len() as u64,
+            external_root: Some(root),
+            transaction_id: vibeos_durable_format::TransactionId::new(1).unwrap(),
+            prepare_sequence: 3,
+            commit_sequence: 3,
+        };
+        let cached = cache.insert_external(&object, &bytes).unwrap();
+        assert_eq!(cached.upgrade().unwrap().as_ref(), &bytes);
+        assert!(cache.insert_external(&object, &[1, 2, 3, 5]).is_none());
+        object.byte_len += 1;
+        assert!(cache.insert_external(&object, &bytes).is_none());
+        object.byte_len -= 1;
+        object.object_kind = vibeos_durable_format::ObjectKind::new(124).unwrap();
+        assert!(cache.insert_external(&object, &bytes).is_none());
+        object.object_kind = kind;
+        object.external_root = None;
+        assert!(cache.insert_external(&object, &bytes).is_none());
+        cache.clear();
+        assert!(cached.upgrade().is_none());
     }
 
     fn frozen_predecessor(staged: MigrationControl) -> MigrationControl {
@@ -3546,6 +4088,7 @@ mod storage_v2_transition_tests {
         assert!(!append_error_requires_cold_recovery(
             V2RuntimeError::JournalChanged
         ));
+        assert!(!append_error_requires_cold_recovery(V2RuntimeError::CandidateCapacity));
         for error in [
             V2RuntimeError::Busy,
             V2RuntimeError::OutsideTask,
@@ -3652,6 +4195,8 @@ mod storage_v2_transition_tests {
 
 #[cfg(feature = "legacy-shell")]
 pub(crate) fn run_storage_v2_transition_selftests() {
+    storage_v2_transition_tests::cached_read_spans_preserve_data_and_bound_command_count();
+    storage_v2_transition_tests::page_cache_reuses_buffers_and_preserves_lru();
     storage_v2_transition_tests::stage_retry_accepts_only_exact_old_or_new_selector();
     storage_v2_transition_tests::rollback_requires_exact_staged_evidence_and_source_stream();
     storage_v2_transition_tests::close_preserves_activation_floor_and_accepts_newer_healthy_evidence();
@@ -3665,6 +4210,7 @@ pub(crate) fn run_storage_v2_transition_selftests() {
 
 fn map_facade_error(error: V2RuntimeError) -> vibeos_object_store::StoreError {
     match error {
+        V2RuntimeError::CandidateCapacity => vibeos_object_store::StoreError::InsufficientMemory,
         V2RuntimeError::Busy => vibeos_object_store::StoreError::Busy,
         V2RuntimeError::JournalChanged => vibeos_object_store::StoreError::JournalChanged,
         V2RuntimeError::ObjectUnavailable => vibeos_object_store::StoreError::ObjectUnavailable,
@@ -3699,10 +4245,9 @@ fn cache_metadata_matches_boot_proof(
 }
 
 fn append_error_requires_cold_recovery(error: V2RuntimeError) -> bool {
-    // GenerationMismatch is checked against the mounted authority before any
-    // append mutation. Every other error is conservatively ambiguous at this
-    // sealed facade boundary and must revoke the boot proof.
-    error != V2RuntimeError::JournalChanged
+    // Generation and candidate-slot admission are checked before append I/O.
+    // Other errors remain conservatively ambiguous at this facade boundary.
+    !matches!(error, V2RuntimeError::JournalChanged | V2RuntimeError::CandidateCapacity)
 }
 
 fn recovered_v2_snapshot(
@@ -3729,6 +4274,7 @@ fn appended_v2_snapshot(
     view: &PersistentAuthorityView,
     transient: Arc<PersistentAuthorityTransientObjects>,
     hot_reads: &HotReadCache,
+    external_payload: Option<(u128, &[u8])>,
 ) -> Result<vibeos_object_store::StorageV2AuthoritySnapshot, vibeos_object_store::StoreError> {
     let authority_generation = view.checkpoint_generation();
     recovered_v2_snapshot_with(
@@ -3736,18 +4282,25 @@ fn appended_v2_snapshot(
         view.root_policy_sha256(),
         hot_reads,
         |object| {
+            // Only the exact newly committed object can inherit the submitted
+            // bytes. Recheck its canonical root before entering the existing
+            // bounded, generation-checked cache; old or cold objects fall back
+            // to physical CAS verification.
+            let cached = external_payload
+                .filter(|(id, _)| *id == object.object_id.get())
+                .and_then(|(_, bytes)| hot_reads.insert_external(object, bytes));
             if let Some(handle) = view.object_for_recovered(object) {
                 Some(StorageV2ReadToken::Persistent {
                     handle: handle.clone(),
                     authority_generation,
-                    cached: None,
+                    cached,
                 })
             } else if transient.object_for_recovered(object).is_some() {
                 Some(StorageV2ReadToken::Transient {
                     witness: transient.clone(),
                     recovered: system_arc(object.clone()),
                     authority_generation,
-                    cached: None,
+                    cached,
                 })
             } else {
                 None
@@ -3963,6 +4516,7 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             let view = runtime
                 .boot_proved_authority()
                 .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            let view = runtime.compact_unpinned_authority(&view).await?.unwrap_or(view);
             recovered_v2_snapshot(&view, &runtime.hot_reads)
         })
     }
@@ -4126,7 +4680,7 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                     return Err(vibeos_object_store::StoreError::Corrupt);
                 }
                 let transient = system_arc(transient);
-                let snapshot = match appended_v2_snapshot(&view, transient, &runtime.hot_reads) {
+                let snapshot = match appended_v2_snapshot(&view, transient, &runtime.hot_reads, None) {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
                         runtime.invalidate_recovery_cache();
@@ -4297,7 +4851,9 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
             // ids, so the snapshot below stays valid either way; the
             // just-appended (still ungranted) objects resolve through the
             // transient witness.
-            let compacted_view = runtime.maybe_compact_authority(&view).await?;
+            let compacted_view = runtime.maybe_compact_authority(
+                &view, current.record_stream().len() / LOGICAL_BLOCK_SIZE, &transient,
+            ).await?;
             if compacted_view.is_none() {
                 // The appended stream is now the published stream; retain its
                 // validated replay for the next strict extension. A compacted
@@ -4309,7 +4865,7 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                 Some(replacement) => replacement,
                 None => &view,
             };
-            let snapshot = match appended_v2_snapshot(snapshot_view, transient, &runtime.hot_reads)
+            let snapshot = match appended_v2_snapshot(snapshot_view, transient, &runtime.hot_reads, external_payload)
             {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
@@ -4332,6 +4888,175 @@ impl vibeos_object_store::StorageV2Backend for StorageV2Runtime {
                 );
             }
             Ok(snapshot)
+        })
+    }
+
+    fn read_object_ranges<'a>(
+        &'a self,
+        object: &'a vibeos_object_store::StorageV2ObjectToken,
+        ranges: &'a [(u64, usize)],
+    ) -> vibeos_object_store::StorageV2Future<'a, Vec<Vec<u8>>> {
+        if ranges.len() > 32 {
+            return Box::pin(async { Err(vibeos_object_store::StoreError::ObjectTooLarge) });
+        }
+        let hot = (|| {
+            let installed_current = INSTALLED_V2_RUNTIME
+                .lock()
+                .as_ref()
+                .is_some_and(|runtime| core::ptr::eq(runtime.as_ref(), self));
+            if !installed_current {
+                return Err(vibeos_object_store::StoreError::Corrupt);
+            }
+            let token = object
+                .downcast_ref::<StorageV2ReadToken>()
+                .ok_or(vibeos_object_store::StoreError::ObjectUnavailable)?;
+            let (cached, generation) = match token {
+                StorageV2ReadToken::Persistent {
+                    cached,
+                    authority_generation,
+                    ..
+                }
+                | StorageV2ReadToken::Transient {
+                    cached,
+                    authority_generation,
+                    ..
+                } => (cached, *authority_generation),
+            };
+            match cached.as_ref() {
+                Some(cached) => {
+                    if ranges.is_empty() {
+                        return self.read_hot_range(cached, generation, Some((0, 0)))
+                            .map(|value| value.map(|_| Vec::new()));
+                    }
+                    let mut values = Vec::new();
+                    for &(offset, len) in ranges {
+                        match self.read_hot_range(cached, generation, Some((offset, len)))? {
+                            Some(bytes) => values.push(bytes),
+                            None => return Ok(None),
+                        }
+                    }
+                    Ok(Some(values))
+                }
+                None => Ok(None),
+            }
+        })();
+        match hot {
+            Ok(Some(bytes)) => return Box::pin(async move { Ok(bytes) }),
+            Err(error) => return Box::pin(async move { Err(error) }),
+            Ok(None) => {}
+        }
+        Box::pin(async move {
+            let runtime = INSTALLED_V2_RUNTIME
+                .lock()
+                .as_ref()
+                .filter(|runtime| core::ptr::eq(runtime.as_ref(), self))
+                .cloned()
+                .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            let token = object
+                .downcast_ref::<StorageV2ReadToken>()
+                .ok_or(vibeos_object_store::StoreError::ObjectUnavailable)?;
+            let mut operation = runtime.begin().map_err(map_facade_error)?;
+            let result = match token {
+                StorageV2ReadToken::Persistent { handle, .. } => {
+                    poll_as_system(
+                        operation
+                            .store()
+                            .read_persistent_object_ranges(handle, ranges),
+                    )
+                    .await
+                }
+                StorageV2ReadToken::Transient {
+                    witness, recovered, ..
+                } => {
+                    poll_as_system(
+                        operation
+                            .store()
+                            .read_transient_object_ranges(witness, recovered, ranges),
+                    )
+                    .await
+                }
+            };
+            operation.finish();
+            result
+                .map_err(map_persistent_read_error)
+                .map_err(map_facade_error)
+        })
+    }
+
+    fn read_object_range<'a>(
+        &'a self,
+        object: &'a vibeos_object_store::StorageV2ObjectToken,
+        offset: u64,
+        len: usize,
+    ) -> vibeos_object_store::StorageV2Future<'a, Vec<u8>> {
+        let hot = (|| {
+            let installed_current = INSTALLED_V2_RUNTIME
+                .lock()
+                .as_ref()
+                .is_some_and(|runtime| core::ptr::eq(runtime.as_ref(), self));
+            if !installed_current {
+                return Err(vibeos_object_store::StoreError::Corrupt);
+            }
+            let token = object
+                .downcast_ref::<StorageV2ReadToken>()
+                .ok_or(vibeos_object_store::StoreError::ObjectUnavailable)?;
+            let (cached, generation) = match token {
+                StorageV2ReadToken::Persistent {
+                    cached,
+                    authority_generation,
+                    ..
+                }
+                | StorageV2ReadToken::Transient {
+                    cached,
+                    authority_generation,
+                    ..
+                } => (cached, *authority_generation),
+            };
+            match cached.as_ref() {
+                Some(cached) => self.read_hot_range(cached, generation, Some((offset, len))),
+                None => Ok(None),
+            }
+        })();
+        match hot {
+            Ok(Some(bytes)) => return Box::pin(async move { Ok(bytes) }),
+            Err(error) => return Box::pin(async move { Err(error) }),
+            Ok(None) => {}
+        }
+        Box::pin(async move {
+            let runtime = INSTALLED_V2_RUNTIME
+                .lock()
+                .as_ref()
+                .filter(|runtime| core::ptr::eq(runtime.as_ref(), self))
+                .cloned()
+                .ok_or(vibeos_object_store::StoreError::Corrupt)?;
+            let token = object
+                .downcast_ref::<StorageV2ReadToken>()
+                .ok_or(vibeos_object_store::StoreError::ObjectUnavailable)?;
+            let mut operation = runtime.begin().map_err(map_facade_error)?;
+            let result = match token {
+                StorageV2ReadToken::Persistent { handle, .. } => {
+                    poll_as_system(
+                        operation
+                            .store()
+                            .read_persistent_object_range(handle, offset, len),
+                    )
+                    .await
+                }
+                StorageV2ReadToken::Transient {
+                    witness, recovered, ..
+                } => {
+                    poll_as_system(
+                        operation
+                            .store()
+                            .read_transient_object_range(witness, recovered, offset, len),
+                    )
+                    .await
+                }
+            };
+            operation.finish();
+            result
+                .map_err(map_persistent_read_error)
+                .map_err(map_facade_error)
         })
     }
 
@@ -4506,48 +5231,54 @@ impl PageDevice for CapabilityPageDevice {
         if output.is_empty() {
             return Ok(());
         }
-        let all_cached = output
-            .iter_mut()
-            .enumerate()
-            .all(|(index, page)| self.page_cache.get(first_page + index as u64, page));
-        page_cache_account(
-            output.len() as u64,
-            if all_cached { output.len() as u64 } else { 0 },
-        );
-        if all_cached {
-            return Ok(());
-        }
         let first = self.page_range_first_sector(first_page, output.len())?;
-        let lease = self.lease(Rights::READ)?;
-        let session = block_device::range_info_with(&lease)
-            .map_err(PageIoError::Block)?
-            .session();
-        self.require_session(session)?;
+        let mut active_read = None;
         for (chunk_index, chunk) in output.chunks_mut(MAX_PAGES_PER_REQUEST).enumerate() {
             let page_offset = chunk_index
                 .checked_mul(MAX_PAGES_PER_REQUEST)
                 .ok_or(PageIoError::InvalidRange)?;
-            let block_offset = (page_offset as u64)
-                .checked_mul(BLOCKS_PER_PAGE)
+            let chunk_first = first_page
+                .checked_add(page_offset as u64)
                 .ok_or(PageIoError::InvalidRange)?;
-            let block_count = u32::try_from(chunk.len())
+            let missing = self.page_cache.read_span(chunk_first, chunk);
+            page_cache_account(chunk.len() as u64, (chunk.len() - missing.len()) as u64);
+            if missing.is_empty() {
+                continue;
+            }
+            if active_read.is_none() {
+                let lease = self.lease(Rights::READ)?;
+                let session = block_device::range_info_with(&lease)
+                    .map_err(PageIoError::Block)?
+                    .session();
+                self.require_session(session)?;
+                active_read = Some((lease, session));
+            }
+            let (lease, session) = active_read.as_ref().expect("read session initialized");
+            let block_offset = (page_offset as u64)
+                .checked_add(missing.start as u64)
+                .and_then(|offset| offset.checked_mul(BLOCKS_PER_PAGE))
+                .ok_or(PageIoError::InvalidRange)?;
+            let block_count = u32::try_from(missing.len())
                 .ok()
                 .and_then(|count| count.checked_mul(BLOCKS_PER_PAGE as u32))
                 .ok_or(PageIoError::InvalidRange)?;
             block_device::read_blocks_with_session(
-                &lease,
-                session,
+                lease,
+                *session,
                 first
                     .checked_add(block_offset)
                     .ok_or(PageIoError::InvalidRange)?,
                 block_count,
-                chunk.as_flattened_mut(),
+                chunk[missing.clone()].as_flattened_mut(),
             )
             .await
             .map_err(PageIoError::Block)?;
-        }
-        for (index, page) in output.iter().enumerate() {
-            self.page_cache.insert(first_page + index as u64, page);
+            // Publish only the successfully read span. A failed transfer
+            // cannot introduce partially filled pages into the cache.
+            for index in missing {
+                self.page_cache
+                    .insert(chunk_first + index as u64, &chunk[index]);
+            }
         }
         Ok(())
     }

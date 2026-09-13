@@ -18,6 +18,7 @@ p.add_argument('--require-fiber-stack',action='store_true')
 p.add_argument('--require-compile-recovery',action='store_true')
 p.add_argument('--require-hardware-traps',action='store_true')
 p.add_argument('--require-guarded-memory',action='store_true')
+p.add_argument('--require-threads',action='store_true',help='Require the shared-memory wait/notify/grow probe')
 p.add_argument('--host-fault',action='store_true',help='After selftests require a fatal host rodata write fault')
 p.add_argument('--coremark-module',type=Path,help='Require a >=10-second validated embedded CoreMark run')
 p.add_argument('--harts',type=int,choices=(1,4),default=4)
@@ -58,6 +59,15 @@ with (a.work/'boot.log').open('wb') as log:
         if a.require_hardware_traps: assert any('TRAPS PASS' in x for x in hardware), 'native hardware trap test missing'
         guarded = [x.decode(errors='replace') for x in result.splitlines() if b'WASMTIME GUARDED MEMORY PASS' in x]
         if a.require_guarded_memory: assert guarded, 'guarded guest memory test missing'
+        threads = [x.decode(errors='replace') for x in result.splitlines() if b'WASMTIME THREADS PASS' in x]
+        if a.require_threads:
+            assert any('wait=1 notify=1 timeout=1 mismatch=1 grow_shared=1' in x for x in threads), 'shared-memory threads probe missing'
+            parallel = [x.decode(errors='replace') for x in result.splitlines() if b'WASMTIME PARALLEL RECOVERY PASS' in x]
+            assert any('cycles=16 siblings=3 drops=0' in x for x in parallel), 'parallel domain recovery probe missing'
+            if a.harts > 1:
+                harts = int(re.search(r'harts=(0x[0-9a-f]+)', parallel[0]).group(1), 16)
+                assert bin(harts).count('1') >= 2, 'siblings never ran on a second hart'
+                assert int(re.search(r'remote_detaches=(\d+)', parallel[0]).group(1)) > 0, 'no sibling was collected mid-poll on another hart'
         async_probes = [x.decode(errors='replace') for x in result.splitlines() if b'WASMTIME ASYNC PASS' in x or b'WASMTIME ASYNC HEAP' in x]
         if a.require_async: assert any('ASYNC PASS' in x for x in async_probes), 'native async test missing'
         streams = [x.decode(errors='replace') for x in result.splitlines() if b'WASMTIME STREAMS PASS' in x]

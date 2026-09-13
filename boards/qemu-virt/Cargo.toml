@@ -7,4 +7,6 @@ edition = "2021"
 vibeos-hal = { path = "../../hal" }
 
 [features]
+python-wasi = []
 storage-bench = []
+storage-bench-128m = ["storage-bench"]

@@ -918,6 +918,59 @@ pub unsafe fn replace_wasm_memory(old: usize, old_size: usize, new: usize, new_s
 }
 
 
+/// Map a fresh physical chunk at the tail of the guest alias without touching
+/// existing leaves. Shared memories grow this way so guest threads running on
+/// other harts keep every translation they already hold; only the new range
+/// receives the all-hart shootdown.
+#[cfg(feature = "wasmtime-guarded-memory")]
+pub unsafe fn append_wasm_memory(offset: usize, physical: usize, len: usize) {
+    const LIMIT: usize = 16 * 1024 * 1024;
+    assert!(len != 0 && len % sv39::PAGE_SIZE == 0 && offset % sv39::PAGE_SIZE == 0);
+    let end = offset.checked_add(len).unwrap();
+    assert!(end <= LIMIT);
+    assert_eq!(physical % sv39::PAGE_SIZE, 0);
+    assert!(physical >= core::ptr::addr_of!(crate::__heap_start) as usize);
+    assert!(physical.checked_add(len).unwrap() <= core::ptr::addr_of!(crate::__heap_end) as usize);
+    assert!(TABLES_READY.load(Ordering::Acquire));
+    let _lock = PAGE_TABLE_LOCK.lock();
+    let tables = unsafe { &mut *TABLES.0.get() };
+    for page in offset / sv39::PAGE_SIZE..end / sv39::PAGE_SIZE {
+        assert!(!tables.guest_level0[page / 512].entries[page % 512].is_valid());
+    }
+    for page in offset / sv39::PAGE_SIZE..end / sv39::PAGE_SIZE {
+        let chunk_offset = page * sv39::PAGE_SIZE - offset;
+        tables.guest_level0[page / 512].entries[page % 512] =
+            ram_leaf(physical + chunk_offset, WRITABLE_PERMISSIONS).unwrap();
+    }
+    publish_pte_writes();
+    synchronize_tlbs(WASM_MEMORY_BASE + offset, len);
+}
+
+/// Remove every guest leaf below `size` regardless of physical layout. Used by
+/// chunked shared memories and by raw fault recovery, which cannot assume one
+/// contiguous backing buffer.
+#[cfg(feature = "wasmtime-guarded-memory")]
+pub unsafe fn unmap_wasm_memory(size: usize) {
+    const LIMIT: usize = 16 * 1024 * 1024;
+    assert!(size <= LIMIT && size % sv39::PAGE_SIZE == 0);
+    assert!(TABLES_READY.load(Ordering::Acquire));
+    let _lock = PAGE_TABLE_LOCK.lock();
+    let tables = unsafe { &mut *TABLES.0.get() };
+    for page in 0..LIMIT / sv39::PAGE_SIZE {
+        let entry = tables.guest_level0[page / 512].entries[page % 512];
+        if page * sv39::PAGE_SIZE < size {
+            assert!(entry.is_valid() && entry.is_leaf());
+        } else {
+            assert!(!entry.is_valid());
+        }
+    }
+    for table in &mut tables.guest_level0 {
+        table.entries.fill(PageTableEntry::EMPTY);
+    }
+    publish_pte_writes();
+    synchronize_tlbs(WASM_MEMORY_BASE, LIMIT);
+}
+
 // Independent trap stacks are mapped below 17, 18, ... GiB. The entry assembly
 // computes the top from the encoded sscratch hart id using only t0, preserving
 // every interrupted register without touching the interrupted stack first.

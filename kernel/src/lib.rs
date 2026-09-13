@@ -993,6 +993,9 @@ compile_error!("feature `milkv-jitterentropy-probe` is an isolated UART qualific
 
 extern crate alloc;
 
+#[cfg(all(feature = "milkv-wasmtime", target_arch = "riscv64", not(target_feature = "d")))]
+compile_error!("Milk-V Wasmtime requires riscv64gc-unknown-none-elf; use build-milkv-duo.sh --wasmtime");
+
 // Portable kernel logic lives in `vibeos-core`; the bare SBI seam lives in the
 // RISC-V runtime. Re-export both under the names the rest of the tree uses.
 #[cfg(not(all(target_arch = "riscv64", target_os = "none")))]
@@ -1115,6 +1118,7 @@ mod net_device;
 #[cfg(feature = "milkv-duo")]
 mod sdhci_blk;
 mod segment_store_platform;
+mod storage_capacity_policy;
 mod store_platform;
 mod trampoline;
 mod trap;
@@ -1314,6 +1318,8 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
     #[cfg(feature = "milkv-duo")]
     uart::early_write(if blue_led.on() {
         "[VibeOS] blue status LED on\r\n"
+    } else if blue_led.output_asserted() {
+        "[VibeOS] blue status LED output asserted (input unconfirmed)\r\n"
     } else {
         "[VibeOS] blue status LED readback failed\r\n"
     });
@@ -1328,7 +1334,7 @@ pub extern "C" fn kmain(_boot_hart: usize, _firmware_dtb: usize) -> ! {
     #[cfg(feature = "milkv-duo")]
     println!(
         "  led       blue GPIOC24 {} (pinmux {:#x}, dir {:#010x}, data {:#010x}, input {:#010x})",
-        if blue_led.on() { "on" } else { "FAILED" },
+        blue_led.status(),
         blue_led.pinmux,
         blue_led.direction,
         blue_led.data,
@@ -2148,6 +2154,12 @@ unsafe fn reclaim_faulted_component(
     #[cfg(feature = "wasmtime-async")]
     if unsafe { wasmtime_platform::recover_code_probe(domain) } {
         unsafe { HEAP.reclaim_faulted_domain(domain) }.expect("native code probe arena reclaim");
+        return exec::FaultReclaimOutcome::Reclaimed;
+    }
+    #[cfg(feature = "wasmtime-threads")]
+    if unsafe { wasmtime_platform::recover_threads_probe(domain) } {
+        // Plain futures only: siblings on other harts have already detached.
+        unsafe { HEAP.reclaim_faulted_domain(domain) }.expect("parallel probe arena reclaim");
         return exec::FaultReclaimOutcome::Reclaimed;
     }
     #[cfg(feature = "wasmtime-guarded-memory")]

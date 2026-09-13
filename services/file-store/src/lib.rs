@@ -183,6 +183,29 @@ impl NamespaceState {
             .map(|value| value.0)
     }
 
+    /// Link counts of every inode in one pass over the directory entries:
+    /// directories count 2 plus their subdirectories, everything else counts
+    /// its incoming entries. Encoding or validating a whole namespace must
+    /// use this instead of [`Self::link_count`] per inode, which scans every
+    /// entry per inode and made each commit quadratic in the file count.
+    fn link_counts(&self) -> BTreeMap<FileId, u64> {
+        let mut counts: BTreeMap<FileId, u64> = BTreeMap::new();
+        for (id, inode) in &self.inodes {
+            counts.insert(*id, if inode.file_type == FileType::Directory { 2 } else { 0 });
+        }
+        for ((parent, _), child) in &self.dirents {
+            let child_is_directory = self
+                .inodes
+                .get(child)
+                .is_some_and(|inode| inode.file_type == FileType::Directory);
+            let counted = if child_is_directory { *parent } else { *child };
+            if let Some(count) = counts.get_mut(&counted) {
+                *count += 1;
+            }
+        }
+        counts
+    }
+
     fn link_count(&self, id: FileId, kind: FileType) -> u64 {
         if kind == FileType::Directory {
             2 + self
@@ -368,8 +391,20 @@ pub struct FsContentStager {
     staged: Vec<Vec<u8>>,
 }
 
+/// Content no larger than this that a stager finishes without having staged
+/// anything stays in memory and is published inside the transaction's own
+/// fused checkpoint, instead of through a checkpoint of its own first. The
+/// bound matches the segment store's small-blob packing, so the content
+/// shares the tree nodes' scratch segment.
+pub const FUSED_CONTENT_LIMIT: usize = 192 * 1024;
+
 pub struct StagedFileContent {
-    data: vibeos_segment_store::FsPersistentData,
+    source: StagedContentSource,
+}
+
+enum StagedContentSource {
+    Persistent(vibeos_segment_store::FsPersistentData),
+    Inline(Vec<u8>),
 }
 
 impl FsContentStager {
@@ -379,6 +414,14 @@ impl FsContentStager {
                 PERSISTENT_STAGE_CHUNK_SIZE - self.pending.len(),
                 bytes.len(),
             );
+            if self.pending.len() + take > self.pending.capacity()
+                && self.pending.capacity() > PERSISTENT_STAGE_CHUNK_SIZE / 2
+            {
+                // Geometric growth would round a 3 MiB chunk up to 4 MiB.
+                // Keep small writes incremental, but cap the final growth
+                // so a four-chunk batch holds at most 12 MiB of capacity.
+                self.pending.reserve_exact(PERSISTENT_STAGE_CHUNK_SIZE - self.pending.len());
+            }
             self.pending.extend_from_slice(&bytes[..take]);
             bytes = &bytes[take..];
             if self.pending.len() == PERSISTENT_STAGE_CHUNK_SIZE {
@@ -401,6 +444,17 @@ impl FsContentStager {
     }
 
     pub async fn finish(mut self) -> Result<StagedFileContent, FileError> {
+        if self.tail.is_none()
+            && self.staged.is_empty()
+            && !self.pending.is_empty()
+            && self.pending.len() <= FUSED_CONTENT_LIMIT
+        {
+            // Nothing reached the backend yet: let the committing transaction
+            // publish this content under its own checkpoint.
+            return Ok(StagedFileContent {
+                source: StagedContentSource::Inline(core::mem::take(&mut self.pending)),
+            });
+        }
         if !self.pending.is_empty() {
             self.staged.push(core::mem::take(&mut self.pending));
         }
@@ -410,7 +464,7 @@ impl FsContentStager {
             self.tail = Some(self.backend.stage_chunk(None, Vec::new()).await?);
         }
         Ok(StagedFileContent {
-            data: self.tail.ok_or(FileError::InvalidType)?,
+            source: StagedContentSource::Persistent(self.tail.ok_or(FileError::InvalidType)?),
         })
     }
 }
@@ -885,6 +939,15 @@ impl FsTransaction {
         staged: StagedFileContent,
     ) -> Result<(), FileError> {
         let generation = self.next_generation()?;
+        let content = match staged.source {
+            StagedContentSource::Persistent(data) => Content::PersistentFile(data),
+            StagedContentSource::Inline(bytes) => Content::File(
+                bytes
+                    .chunks(DATA_CHUNK_SIZE)
+                    .map(Arc::<[u8]>::from)
+                    .collect(),
+            ),
+        };
         match self.working.resolve(path, true) {
             Ok(id) => {
                 self.charge(1)?;
@@ -899,7 +962,7 @@ impl FsTransaction {
                 if inode.file_type != FileType::Regular {
                     return Err(FileError::InvalidType);
                 }
-                inode.content = Content::PersistentFile(staged.data);
+                inode.content = content;
                 inode.change_generation = generation;
             }
             Err(FileError::NotFound) => {
@@ -911,7 +974,7 @@ impl FsTransaction {
                 let id = self.working.allocate(Inode {
                     file_type: FileType::Regular,
                     change_generation: generation,
-                    content: Content::PersistentFile(staged.data),
+                    content,
                 })?;
                 self.working.dirents.insert((parent, name), id);
             }

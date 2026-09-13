@@ -7,6 +7,10 @@ ROOT=pathlib.Path(__file__).resolve().parents[2]
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--runner',type=pathlib.Path,default=ROOT/'target/wasmtime-platform/debug/examples/wasi-custom')
 parser.add_argument('--work',type=pathlib.Path,default=ROOT/'target/coremark-performance/wasmtime-wasi-host')
+parser.add_argument('--threads-runner',type=pathlib.Path,default=ROOT/'target/wasmtime-platform/debug/examples/threads-custom',
+    help='threads-custom example (compiler,host-custom,threads); wasi-threads cases are skipped when absent')
+parser.add_argument('--fixtures',type=pathlib.Path,default=ROOT/'target/wasi-fixtures',
+    help='directory produced by `cargo run -p vibeos-wasi-runtime --example fixtures`')
 args=parser.parse_args()
 OUT=args.work.resolve();OUT.mkdir(parents=True,exist_ok=True)
 RUN=args.runner.resolve()
@@ -93,5 +97,40 @@ run('coremark-smoke',module,('0','0','0x66','1000'))
 text=(OUT/'coremark-smoke.stdout').read_text()
 assert all(crc in text for crc in ('seedcrc          : 0xe9f5', '[0]crclist       : 0xe714', '[0]crcmatrix     : 0x1fd7', '[0]crcstate      : 0x8e3a'))
 # Short run validates the ABI/CRC path only; it is deliberately not a formal score.
+# wasi-threads through the host round-robin driver: atomics, wait/notify,
+# timeouts, exit-from-worker, spawn cap, shared growth, trap and fuel containment.
+THREADS=args.threads_runner.resolve()
+if THREADS.exists():
+    subprocess.run(['cargo','run','--locked','--offline','-p','vibeos-wasi-runtime','--example','fixtures','--',str(args.fixtures)],check=True,cwd=ROOT)
+    def threads(name,code,marker,args=()):
+        module=args_fixture=(args.fixtures if False else None)
+        module=(pathlib.Path(globals()['args'].fixtures)/(name+'.wasm')).resolve()
+        p=subprocess.run([str(THREADS),*args,str(module)],capture_output=True,timeout=120)
+        (OUT/(name+'.stdout')).write_bytes(p.stdout);(OUT/(name+'.stderr')).write_bytes(p.stderr)
+        assert p.returncode==code,(name,p.returncode,p.stderr[-400:])
+        assert marker in p.stderr,(name,p.stderr[-400:])
+        results.append(dict(name=name,exit=code,module_sha256=hashlib.sha256(module.read_bytes()).hexdigest()))
+    threads('threads-atomics',0,b'wasi_exit=0 threads=1')
+    threads('threads-counter',0,b'wasi_exit=0 threads=4 finished=4')
+    threads('threads-wait-timeout',0,b'sleeps=2')
+    threads('threads-exit',7,b'wasi_exit=7 threads=2 finished=1 cancelled=1')
+    threads('threads-spawn-cap',3,b'wasi_exit=3 threads=4')
+    threads('threads-grow',0,b'wasi_exit=0 threads=2 finished=2')
+    threads('threads-fault',128,b'wasi_trap=')
+    threads('threads-busy',128,b'cancelled=3')
+    for name in ('threads-defined-shared','threads-no-start'):
+        module=(pathlib.Path(args.fixtures)/(name+'.wasm')).resolve()
+        p=subprocess.run([str(THREADS),str(module)],capture_output=True,timeout=60)
+        assert p.returncode!=0 and b'WASI admission' in p.stderr,(name,p.stderr[-300:])
+        results.append(dict(name=name,exit=p.returncode,module_sha256=hashlib.sha256(module.read_bytes()).hexdigest()))
+    pthreads=ROOT/'target/wasi-examples/c-threads.wasm'
+    if pthreads.exists():
+        p=subprocess.run([str(THREADS),str(pthreads)],capture_output=True,timeout=120)
+        assert p.returncode==0 and p.stdout==b'sum=3000 cond=1\n',(p.returncode,p.stdout,p.stderr[-300:])
+        p=subprocess.run([str(THREADS),str(pthreads),'exit'],capture_output=True,timeout=120)
+        assert p.returncode==7,(p.returncode,p.stderr[-300:])
+        p=subprocess.run([str(THREADS),str(pthreads),'spawnmany'],capture_output=True,timeout=120)
+        assert p.returncode==0 and p.stdout.startswith(b'eagain=1 created=3'),(p.returncode,p.stdout,p.stderr[-300:])
+        results.append(dict(name='c-threads',exit=0,module_sha256=hashlib.sha256(pthreads.read_bytes()).hexdigest()))
 (OUT/'results.json').write_text(json.dumps(dict(scope='host custom-platform WASI ABI; not VibeOS benchmark',runner=str(RUN),runner_sha256=hashlib.sha256(RUN.read_bytes()).hexdigest(),tests=results),indent=2)+'\n')
 print(f'PASS {len(results)} cases; logs: {OUT}')

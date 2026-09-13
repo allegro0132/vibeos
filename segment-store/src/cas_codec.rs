@@ -523,7 +523,8 @@ fn validate_blob_mapping(
     let content_count = usize::try_from(value.blob_key.exact_len)
         .map_err(|_| CasCodecError::ArithmeticOverflow)?
         .div_ceil(CANONICAL_CONTENT_EXTENT_LEN as usize);
-    if declared_count != content_count + 2 {
+    let compact_allowed = compact_layout_admitted(value.blob_key.exact_len)?;
+    if declared_count != content_count + 2 && !(declared_count == 1 && compact_allowed) {
         return Err(CasCodecError::InvalidPointer);
     }
     Ok(pointer)
@@ -563,6 +564,16 @@ fn read_blob_mapping(
     Ok((value, pointer))
 }
 
+/// Whether a Blob of this exact length may use the compact layout: one
+/// extent carrying the complete canonical encoding (header, content, tree)
+/// instead of the header / content / tree split. Compact manifests halve
+/// the descriptor pairs — and the 4 KiB SHA-256 each costs — of every small
+/// Blob; readers locate bytes by encoded offset, so both layouts decode the
+/// same canonical Blob.
+pub fn compact_layout_admitted(exact_len: u64) -> Result<bool, CasCodecError> {
+    Ok(canonical_blob_encoded_len(exact_len)? <= CANONICAL_CONTENT_EXTENT_LEN)
+}
+
 fn validate_manifest(value: &BlobManifest, context: CasCodecContext) -> Result<(), CasCodecError> {
     validate_blob_key(value.blob_key)?;
     if value.encoded_blob_len != canonical_blob_encoded_len(value.blob_key.exact_len)?
@@ -583,9 +594,14 @@ fn validate_manifest(value: &BlobManifest, context: CasCodecContext) -> Result<(
     let content_extent_count = usize::try_from(value.blob_key.exact_len)
         .map_err(|_| CasCodecError::ArithmeticOverflow)?
         .div_ceil(CANONICAL_CONTENT_EXTENT_LEN as usize);
-    let expected_extent_count = content_extent_count
-        .checked_add(2)
-        .ok_or(CasCodecError::ArithmeticOverflow)?;
+    let compact = value.extents.len() == 1 && compact_layout_admitted(value.blob_key.exact_len)?;
+    let expected_extent_count = if compact {
+        1
+    } else {
+        content_extent_count
+            .checked_add(2)
+            .ok_or(CasCodecError::ArithmeticOverflow)?
+    };
     if value.extents.len() != expected_extent_count {
         return Err(CasCodecError::InvalidField);
     }
@@ -594,7 +610,9 @@ fn validate_manifest(value: &BlobManifest, context: CasCodecContext) -> Result<(
     let mut expected_offset = 0_u64;
     for (index, extent) in value.extents.iter().enumerate() {
         let expected_index = u32::try_from(index).map_err(|_| CasCodecError::ArithmeticOverflow)?;
-        let expected_payload_len = if index == 0 {
+        let expected_payload_len = if compact {
+            value.encoded_blob_len
+        } else if index == 0 {
             HEADER_SIZE as u64
         } else if index <= content_extent_count {
             value
@@ -1193,6 +1211,45 @@ mod tests {
             encoded_blob_len: geometry.encoded_len() as u64,
             extents,
         }
+    }
+
+    fn compact_manifest(blob_key: BlobKey, segment: u64) -> BlobManifest {
+        let geometry = BlobGeometry::for_len(blob_key.exact_len()).unwrap();
+        let len = geometry.encoded_len() as u64;
+        BlobManifest {
+            blob_key,
+            encoded_blob_len: len,
+            extents: vec![ManifestExtent {
+                extent_index: 0,
+                extent_count: 1,
+                encoded_offset: 0,
+                payload_byte_len: len,
+                pointer: pointer(segment, 10 + segment, 2, 1, len, ExtentKind::Blob, 7),
+            }],
+        }
+    }
+
+    /// A Blob whose canonical encoding fits one extent may be stored as one
+    /// extent; the rule rejects a compact manifest for a Blob that does not
+    /// fit, and a malformed single extent.
+    #[test]
+    fn compact_manifest_round_trips_and_is_bounded() {
+        let context = context();
+        let small = BlobKey::sha256(7, 4_096, [3; 32]).unwrap();
+        let manifest = compact_manifest(small, 3);
+        let encoded = encode_blob_manifest(&manifest, context).unwrap();
+        assert_eq!(decode_blob_manifest(&encoded, context).unwrap(), manifest);
+        assert!(compact_layout_admitted(4_096).unwrap());
+        assert!(compact_layout_admitted(900 * 1024).unwrap());
+        assert!(!compact_layout_admitted(2 * 1024 * 1024).unwrap());
+
+        let mut wrong_len = manifest.clone();
+        wrong_len.extents[0].payload_byte_len -= 1;
+        assert!(encode_blob_manifest(&wrong_len, context).is_err());
+
+        let large = BlobKey::sha256(7, 2 * 1024 * 1024, [4; 32]).unwrap();
+        assert!(encode_blob_manifest(&compact_manifest(large, 3), context).is_err());
+        assert!(encode_blob_manifest(&canonical_manifest(large, 3), context).is_ok());
     }
 
     #[test]

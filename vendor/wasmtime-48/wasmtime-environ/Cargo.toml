@@ -72,7 +72,8 @@ std = [
     "cpp_demangle?/std",
     "rustc-demangle?/std",
 ]
-threads = ["std"]
+# VibeOS: the atomics builtins and their trap sentinels do not need std.
+threads = []
 wmemcheck = ["std"]
 
 [lib]

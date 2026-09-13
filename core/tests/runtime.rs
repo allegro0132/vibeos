@@ -172,6 +172,7 @@ fn observe_exclusive_fault_gate(task: exec::TaskId, domain: AllocationDomain) {
             home_hart: exec::HartId::new(current_hart_id()).unwrap(),
             live_tasks: 1,
             exclusive: true,
+            parallel: false,
             phase: exec::ReclaimableDomainPhase::TearingDown,
         })
     );
@@ -312,6 +313,7 @@ fn assert_exclusive_batch_active_from_notify(_hart: exec::HartId) {
                 home_hart,
                 live_tasks: 1,
                 exclusive: true,
+                parallel: false,
                 phase: exec::ReclaimableDomainPhase::Active,
             })
         );
@@ -1129,6 +1131,7 @@ fn exclusive_prepared_task_is_inert_until_exact_registry_activation() {
             home_hart: home,
             live_tasks: 1,
             exclusive: true,
+            parallel: false,
             phase: exec::ReclaimableDomainPhase::Active,
         })
     );
@@ -1963,6 +1966,7 @@ fn an_exclusive_reclaimable_domain_is_single_home_and_retires_after_publication(
             home_hart: home,
             live_tasks: 1,
             exclusive: true,
+            parallel: false,
             phase: exec::ReclaimableDomainPhase::Active,
         })
     );
@@ -2735,6 +2739,7 @@ fn a_refused_exclusive_reclaim_is_sticky_and_never_reopens_the_domain() {
             home_hart: exec::HartId::new(0).unwrap(),
             live_tasks: 1,
             exclusive: true,
+            parallel: false,
             phase: exec::ReclaimableDomainPhase::Quarantined,
         })
     );
@@ -4802,4 +4807,106 @@ fn cancelling_a_channel_sender_does_not_poison_the_next_sender() {
     assert_eq!(ep.try_recv(), Some(3));
     assert_eq!(cancelled.state(), TaskState::Cancelled);
     assert_eq!(cancelled.polls(), 1);
+}
+
+#[test]
+fn a_parallel_reclaimable_domain_admits_siblings_on_other_harts() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    let domains_before = exec::reclaimable_domain_count();
+    let domain = AllocationDomain::new(OwnerId::new(20_301), ArenaId::new(30_301));
+    let primary = unsafe {
+        exec::spawn_reclaimable_owned_parallel(domain, "parallel-primary", async {})
+    };
+    let remote = {
+        let _hart = TestHartScope::enter(2);
+        unsafe { exec::spawn_reclaimable_owned_parallel(domain, "parallel-remote", async {}) }
+    };
+    assert_eq!(
+        exec::reclaimable_domain_snapshot(domain),
+        Some(exec::ReclaimableDomainSnapshot {
+            home_hart: exec::HartId::new(0).unwrap(),
+            live_tasks: 2,
+            exclusive: false,
+            parallel: true,
+            phase: exec::ReclaimableDomainPhase::Active,
+        })
+    );
+    // A non-parallel domain still refuses a cross-hart sibling.
+    let affine = AllocationDomain::new(OwnerId::new(20_302), ArenaId::new(30_302));
+    let affine_primary = unsafe {
+        exec::spawn_reclaimable_owned(affine, "affine-primary", std::future::pending::<()>())
+    };
+    let rejected = {
+        let _hart = TestHartScope::enter(2);
+        std::panic::catch_unwind(|| unsafe {
+            exec::spawn_reclaimable_owned_parallel(affine, "affine-remote", async {})
+        })
+    };
+    assert!(rejected.is_err());
+    assert_eq!(affine_primary.cancel(), CancelOutcome::Requested);
+    assert_eq!(affine_primary.state(), TaskState::Cancelled);
+
+    // Each sibling runs only on the hart it was placed on.
+    assert!(exec::poll_once(), "hart 0 runs the primary");
+    assert_eq!(primary.state(), TaskState::Exited);
+    assert!(!exec::poll_once(), "hart 0 must not run the hart-2 sibling");
+    {
+        let _hart = TestHartScope::enter(1);
+        assert!(!exec::poll_once(), "hart 1 must not steal a pinned sibling");
+    }
+    {
+        let _hart = TestHartScope::enter(2);
+        assert!(exec::poll_once(), "hart 2 runs its sibling");
+    }
+    assert_eq!(remote.state(), TaskState::Exited);
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+    assert_eq!(exec::reclaimable_domain_count(), domains_before);
+}
+
+#[test]
+fn a_parallel_domain_fault_collects_queued_siblings_on_other_harts() {
+    let _g = scheduler();
+    exec::run_until_idle(BUDGET);
+    exec::set_fault_reclaimer(record_fault_reclaim);
+    RECLAIMED_DOMAINS.lock().unwrap().clear();
+    let domains_before = exec::reclaimable_domain_count();
+    let domain = AllocationDomain::new(OwnerId::new(20_303), ArenaId::new(30_303));
+    let primary_drops = Arc::new(AtomicU64::new(0));
+    let sibling_drops = Arc::new(AtomicU64::new(0));
+    let primary = unsafe {
+        exec::spawn_reclaimable_owned_parallel(
+            domain,
+            "parallel-fault-primary",
+            DropBombFuture { drops: primary_drops.clone() },
+        )
+    };
+    let sibling = {
+        let _hart = TestHartScope::enter(3);
+        unsafe {
+            exec::spawn_reclaimable_owned_parallel(
+                domain,
+                "parallel-fault-sibling",
+                DropBombFuture { drops: sibling_drops.clone() },
+            )
+        }
+    };
+    assert!(!exec::current_domain_tearing_down());
+    // The primary faults on hart 0 while the sibling is still queued on hart 3.
+    exec::set_fault_guard(fault_after_poll);
+    assert!(exec::poll_once());
+    exec::set_fault_guard(fault_once_then_passthrough);
+    assert_eq!(primary.state(), TaskState::Faulted);
+    assert_eq!(sibling.state(), TaskState::Faulted, "queued cross-hart sibling joined the teardown");
+    assert_eq!(primary_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(sibling_drops.load(Ordering::SeqCst), 0, "raw teardown ran a sibling destructor");
+    assert_eq!(RECLAIMED_DOMAINS.lock().unwrap().as_slice(), &[domain]);
+    {
+        let _hart = TestHartScope::enter(3);
+        assert!(!exec::poll_once(), "a torn-down sibling stayed runnable on its hart");
+    }
+    assert_eq!(exec::reclaimable_domain_snapshot(domain), None);
+    assert_eq!(exec::reclaimable_domain_count(), domains_before);
+    assert!(!exec::current_domain_tearing_down());
 }

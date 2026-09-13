@@ -5,4 +5,7 @@ wasm-candidates/evidence/*
 !wasm-candidates/evidence/README.md
 !wasm-candidates/evidence/baseline-v1.json
 !wasm-candidates/evidence/workloads-v1.json
+.DS_Store
+benchmarks
 __pycache__
+results

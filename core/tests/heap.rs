@@ -1195,3 +1195,180 @@ fn fresh_domain_batch_retire_busy_or_extra_arena_never_consumes_a_peer() {
         domains.len()
     );
 }
+
+/// Guest threads on several harts free and allocate in one shared arena at
+/// once. `dealloc` must read a block's arena links under the allocator lock:
+/// a snapshot taken before the lock can see a neighbour that has since moved,
+/// fail the link checks and silently leave the block linked and charged, which
+/// surfaced as an intermittent unclean reclamation after multi-thread runs.
+#[test]
+fn concurrent_frees_in_one_arena_leave_nothing_linked() {
+    let _serial = serial();
+    let h = heap_of(32 * 1024 * 1024);
+    let owner = h.create_owner(24 * 1024 * 1024).unwrap();
+    let arena = h.create_arena(owner).unwrap();
+    let domain = AllocationDomain::new(owner, arena);
+    let mut scope = unsafe { enter_domain(domain) };
+    // Two workers churn the arena head: each free races the other's
+    // allocation for the same list position.
+    std::thread::scope(|threads| {
+        for worker in 0..2usize {
+            threads.spawn(move || {
+                let l = layout(8 + worker * 24, 8);
+                for _ in 0..100_000 {
+                    let a = unsafe { h.alloc(l) };
+                    let b = unsafe { h.alloc(l) };
+                    assert!(!a.is_null() && !b.is_null());
+                    unsafe { h.dealloc(a, l) };
+                    unsafe { h.dealloc(b, l) };
+                }
+            });
+        }
+    });
+    scope.restore();
+    let stats = h.arena_stats(arena).unwrap();
+    assert_eq!(
+        (stats.live_allocations, stats.live_bytes),
+        (0, 0),
+        "a racing free silently left blocks charged to the arena"
+    );
+    h.close_empty_domain(domain).unwrap();
+    h.unregister_owner(owner).unwrap();
+}
+
+#[test]
+fn exhausted_bump_reuses_a_larger_free_block_without_changing_live_accounts() {
+    let _serial = serial();
+    let h = heap_of(4096);
+    let large = layout(2000, 16); // 4096-byte charged block
+    let small = layout(500, 16); // 1024-byte charged block
+    let p = unsafe { h.alloc(large) };
+    assert!(!p.is_null());
+    unsafe { h.dealloc(p, large) };
+    assert_eq!(h.stats().0, 0);
+    let mut pieces = Vec::new();
+    for _ in 0..4 {
+        let q = unsafe { h.alloc(small) };
+        assert!(!q.is_null(), "free larger blocks must remain usable after the bump reaches the end");
+        assert_eq!(q as usize % 16, 0);
+        assert!(!pieces.contains(&q));
+        pieces.push(q);
+    }
+    assert_eq!(h.stats().0, 4096);
+    assert!(unsafe { h.alloc(small) }.is_null());
+    for q in pieces { unsafe { h.dealloc(q, small) }; }
+    assert_eq!(h.stats().0, 0);
+}
+
+#[test]
+fn same_class_realloc_grows_in_place_even_when_heap_is_full() {
+    let _serial = serial();
+    let h = heap_of(1024);
+    let old = layout(600, 8);
+    let new = layout(800, 8);
+    let p = unsafe { h.alloc(old) };
+    assert!(!p.is_null());
+    unsafe { p.write_bytes(0x5a, 600); }
+    let before = h.snapshot();
+    let q = unsafe { h.realloc(p, old, 800) };
+    assert_eq!(q, p);
+    assert!(unsafe { std::slice::from_raw_parts(q, 600) }.iter().all(|&b| b == 0x5a));
+    assert_eq!(h.snapshot().live_bytes, before.live_bytes);
+    assert_eq!(h.snapshot().peak_live_bytes, before.peak_live_bytes);
+    unsafe { h.dealloc(q, new); }
+    assert_eq!(h.stats().0, 0);
+}
+
+#[test]
+fn free_blocks_are_reused_before_consuming_contiguous_bump_space() {
+    let _serial = serial();
+    let h = heap_of(12 * 1024);
+    let scratch = layout(2000, 16); // 4096 charged
+    let small = layout(500, 16); // 1024 charged
+    let large = layout(5000, 16); // 8192 charged
+    let p = unsafe { h.alloc(scratch) };
+    assert!(!p.is_null());
+    unsafe { h.dealloc(p, scratch); }
+    let q = unsafe { h.alloc(small) };
+    assert!(!q.is_null());
+    let r = unsafe { h.alloc(large) };
+    assert!(!r.is_null(), "a small allocation must reuse free space before fragmenting the large bump region");
+    unsafe { h.dealloc(q, small); h.dealloc(r, large); }
+    assert_eq!(h.stats().0, 0);
+}
+
+#[test]
+fn realloc_in_another_owner_still_transfers_accounting() {
+    let _serial = serial();
+    let h = heap_of(4096);
+    let owner = h.create_owner(2048).unwrap();
+    let l = layout(600, 8);
+    let p = unsafe { h.alloc(l) };
+    assert!(!p.is_null());
+    unsafe { p.write_bytes(0x33, l.size()); }
+    let mut scope = unsafe { enter_owner(owner) };
+    let q = unsafe { h.realloc(p, l, 800) };
+    assert!(!q.is_null());
+    assert_ne!(p, q);
+    assert!(unsafe { std::slice::from_raw_parts(q, 600) }.iter().all(|&b| b == 0x33));
+    unsafe { h.dealloc(q, layout(800, 8)); }
+    scope.restore();
+    assert_eq!(h.stats().0, 0);
+    h.unregister_owner(owner).unwrap();
+}
+
+#[test]
+fn pressure_coalesces_adjacent_classes_without_touching_live_blocks() {
+    let _serial = serial();
+    let h = heap_of(8192);
+    let l = layout(500, 16);
+    let blocks: Vec<_> = (0..8).map(|_| unsafe { h.alloc(l) }).collect();
+    assert!(blocks.iter().all(|p| !p.is_null()));
+    unsafe { blocks[0].write_bytes(0x5a, 500); blocks[7].write_bytes(0xa5, 500); }
+    for &p in &blocks[1..7] { unsafe { h.dealloc(p, l); } }
+    let big = layout(3000, 16);
+    let p = unsafe { h.alloc(big) };
+    assert!(!p.is_null());
+    assert!(unsafe { std::slice::from_raw_parts(blocks[0], 500) }.iter().all(|b| *b == 0x5a));
+    assert!(unsafe { std::slice::from_raw_parts(blocks[7], 500) }.iter().all(|b| *b == 0xa5));
+    unsafe { h.dealloc(p, big); h.dealloc(blocks[0], l); h.dealloc(blocks[7], l); }
+    let all = layout(6000, 16);
+    let p = unsafe { h.alloc(all) };
+    assert!(!p.is_null(), "coalescing must recover the complete freed heap");
+    unsafe { h.dealloc(p, all); }
+    assert_eq!(h.stats().0, 0);
+}
+
+#[test]
+fn coalescing_churn_preserves_alignment_and_live_payloads() {
+    let _serial = serial();
+    let h = heap_of(128 * 1024);
+    let mut slots: Vec<Option<(*mut u8, std::alloc::Layout, u8)>> = vec![None; 48];
+    let mut seed = 42u64;
+    for step in 0..4000 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let index = (seed >> 32) as usize % slots.len();
+        if let Some((p, l, byte)) = slots[index].take() {
+            assert!(unsafe { std::slice::from_raw_parts(p, l.size()) }.iter().all(|b| *b == byte));
+            unsafe { h.dealloc(p, l); }
+        } else {
+            let l = layout(1 + (seed as usize % 6000), 1 << ((seed >> 20) % 10));
+            let p = unsafe { h.alloc(l) };
+            if !p.is_null() {
+                assert_eq!(p as usize % l.align(), 0);
+                let byte = step as u8;
+                unsafe { p.write_bytes(byte, l.size()); }
+                slots[index] = Some((p, l, byte));
+            }
+        }
+    }
+    for (p, l, byte) in slots.into_iter().flatten() {
+        assert!(unsafe { std::slice::from_raw_parts(p, l.size()) }.iter().all(|b| *b == byte));
+        unsafe { h.dealloc(p, l); }
+    }
+    let l = layout(100 * 1024, 16);
+    let p = unsafe { h.alloc(l) };
+    assert!(!p.is_null());
+    unsafe { h.dealloc(p, l); }
+    assert_eq!(h.stats().0, 0);
+}

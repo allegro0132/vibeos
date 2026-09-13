@@ -456,13 +456,18 @@ python3 scripts/wasmtime/test-riscv-isa.py \
 Format references: [DTSpec flattened format](https://devicetree-specification.readthedocs.io/en/stable/flattened-format.html)
 and [Linux RISC-V CPU bindings](https://github.com/torvalds/linux/blob/master/Documentation/devicetree/bindings/riscv/cpus.yaml).
 
-Detected scalar B extensions are **not enabled by default**: the measured QEMU
-cohort favored GC. `wasmtime-discovered-isa` is an explicit experiment and still
-requires firmware support on every schedulable hart. Reproduce with that feature
-plus `wasmtime-coremark-probe`; `--cpu` and `--isa-mask` in the kernel verifier
+Detected scalar B extensions are generated **by default for command images**
+(`wasmtime-command` now selects `wasmtime-discovered-isa`); the bare native
+probe still opts in. The earlier wall-clock cohort could not resolve their
+effect inside host noise, but the deterministic single-hart icount diagnostic
+(`benchmark-coremark-threads.py --icount-iterations`) shows the pthread CoreMark
+module executing 795,000 instead of 892,000 instructions per iteration with
+them, so the policy changed (see `docs/WASI_PERFORMANCE.md`). Discovery still
+requires firmware support on every schedulable hart; a hart set without the
+extensions receives RV64GC code. `--cpu` and `--isa-mask` in the kernel verifier
 allow individual extension controls. `extra_mask` reports discovery, not the
-compiler policy. The final default four-hart image passed 407 checks and retained
-1870.324190 iterations/s with zero post-drop allocations (`wasmtime-isa-default/`).
+compiler policy. The historical default four-hart image passed 407 checks and
+retained 1870.324190 iterations/s with zero post-drop allocations (`wasmtime-isa-default/`).
 
 The fixed-GC Debian VM controls showed a 1.6107x median advantage for protected
 virtual memory/native traps over explicit checks/movable memory. Full data and
@@ -610,5 +615,49 @@ normal refueling; it never grants extra fuel or changes memory checks.
 For formal CoreMark, build `wasi-benchmark,wasmtime-command-fuel-batch`, then use
 `python3 scripts/benchmark-coremark-wasi.py --wasmtime --fuel-batch --require-isa-mask 0xf --kernel PATH --work FRESH_DIRECTORY`.
 This benchmark feature explicitly grants the long-running fuel allowance.
-The firmware ISA mask describes available extensions; code generation still
-uses GC unless `wasmtime-discovered-isa` is separately selected.
+The firmware ISA mask describes available extensions; command images generate
+code for the discovered scalar B extensions when every hart advertises them.
+
+### wasi-threads
+
+The `threads` crate feature (`wasmtime/custom-threads`, implies `async`) adds
+`wasi::threads`: `create_shared_memory`, `linker_threads` with a
+`ThreadSpawner`, `define_shared_memory`, and `thread_start`. `enable_threads`
+turns on the threads proposal, shared memories and a `wasmtime::ThreadHooks`
+implementation supplied by the embedding. `compile_with(.., true)` admits the
+wasi-threads contract through the shared structural inspector. Complete threaded
+commands may have a Core start section for LLD's shared-data/TLS initialization;
+the embedding must instantiate them under its guest execution limits. Other
+commands continue to reject Core start sections.
+
+Without `std` a `memory.atomic.wait*` cannot park an OS thread. The vendored
+runtime instead records the waiter as a copy-only token in a fixed 16-entry
+table per shared memory and suspends the calling guest thread's async fiber;
+`memory.atomic.notify` marks waiters and asks the hooks to wake their tokens,
+and timeouts poll a hook-supplied timer future. The wait libcalls return to
+Cranelift through the same trap sentinel as every other builtin, so dropping a
+suspended waiter unwinds the guest like any other cancelled fiber.
+
+Host memories that back a shared memory must never move: the host
+`BoundedMemoryCreator` commits a shared memory at its declared maximum. Host
+calls on shared memory copy through a per-store scratch buffer across any
+await, and `Streams::output_remaining` lets the embedding cap output across
+every thread of one command.
+
+```sh
+cargo run --locked --offline -p vibeos-wasi-runtime --example fixtures -- target/wasi-fixtures
+CARGO_TARGET_DIR="$PWD/target/wasmtime-platform" cargo build --locked \
+  --manifest-path wasmtime-runtime/Cargo.toml --features compiler,host-custom,threads --example threads-custom
+target/wasmtime-platform/debug/examples/threads-custom [--cap N] target/wasi-fixtures/threads-counter.wasm
+python3 scripts/wasmtime/test-wasi-host.py
+```
+
+`threads-custom` is a round-robin host driver standing in for the kernel
+executor: one Store per guest thread, a spawn cap (default 3), the job-wide
+output budget, and the process semantics of the kernel backend. The fixtures
+cover atomics, a counter shared by three workers with wait/notify completion,
+wait timeouts, `proc_exit` from a worker cancelling a parked main thread, the
+spawn cap, `memory.grow` visibility across stores, a worker trap and an
+all-threads busy loop ending in fuel exhaustion, plus the two admission
+rejections. Cancelling a fiber suspended inside a wait is exercised with
+`THREADS_CUSTOM_CANCEL_AFTER=1`.

@@ -102,14 +102,17 @@ revocations.
 ## Compatibility and limits
 
 A module must export `memory` and `_start: () -> ()`. `_start` is explicitly
-called after instantiation; a Core start section is rejected. Only function
+called after instantiation; a Core start section is rejected except for the
+complete native WASI threads contract described below. Only function
 imports from `wasi_snapshot_preview1` with exact Preview 1 signatures are allowed.
 Component binaries and host memory/table/global imports are rejected.
 
 Enabled features: Wasm32, one memory and at most one table, scalar integers and
 software float, mutable globals, sign extension, saturating float conversion,
-multi-value, bulk memory and reference types. SIMD, threads, GC, exceptions,
-memory64, multiple memories, tail calls and extended constants are excluded.
+multi-value, bulk memory and reference types. SIMD, GC, exceptions, memory64,
+multiple memories, tail calls and extended constants are excluded. Threads are
+excluded on the interpreter image and admitted only by the `wasmtime-threads`
+native image described below.
 Omitted memory/table maxima are supported; the host limiter remains authoritative.
 
 | Interface | Behavior |
@@ -117,7 +120,7 @@ Omitted memory/table maxima are supported; the host limiter remains authoritativ
 | `args_sizes_get`, `args_get` | UTF-8 program name and arguments, NUL terminated |
 | `environ_sizes_get`, `environ_get` | Empty environment |
 | `fd_read`, `fd_write` | fd 0 stdin, fd 1 stdout, fd 2 stderr; EOF and short transfers |
-| `fd_fdstat_get`, `fd_filestat_get`, `fd_close` | Standard-stream metadata and invocation-local close |
+| `fd_fdstat_get`, `fd_filestat_get`, `fd_close` | Non-terminal byte-pipe metadata (`UNKNOWN` file type) and invocation-local close |
 | `fd_seek`, `fd_tell` | `SPIPE` for open standard streams |
 | `fd_prestat_get`, `fd_prestat_dir_name` | `BADF`; no preopened directories |
 | `proc_exit` | Non-returning, preserves the full `u32` status |
@@ -149,9 +152,47 @@ permission denial and resource exhaustion. SSH maps non-exit terminals to 125,
 own process exit status may truncate that value. Vsh preserves 1–255, maps larger
 nonzero guest values to status 1, and retains the original in `TerminalDetail::WasiExit`.
 
-There is no guest filesystem, networking, random source, threading, or
-promise of the complete WASI standard world. Standard libraries may import such
-functions successfully but receive `NOSYS` if they use them.
+There is no guest filesystem, networking, random source, or promise of the
+complete WASI standard world. Standard libraries may import such functions
+successfully but receive `NOSYS` if they use them.
+
+The separate opt-in [`python-wasi` image](PYTHON_WASI.md) runs a self-contained
+CPython/WASI command with frozen standard-library modules. It raises command
+resource ceilings explicitly and uses a single-hart, 1 GiB QEMU configuration;
+the ordinary WASI and Component profiles retain their existing resource limits.
+
+## wasi-threads (native backend)
+
+The `wasmtime-threads` firmware feature (which implies `wasmtime-command`)
+admits the [wasi-threads](https://github.com/WebAssembly/wasi-threads) contract
+as produced by wasi-sdk `--target=wasm32-wasi-threads -pthread` with
+`-Wl,--import-memory -Wl,--export-memory`: an imported shared, bounded `env.memory`, the
+`wasi::thread-spawn: (i32) -> i32` import, the exported `wasi_thread_start`
+entry, and the threads proposal's atomics, `memory.atomic.wait32/64` and
+`memory.atomic.notify`. A module that uses any half of the contract without the
+other is rejected before compilation; a defined (non-imported) shared memory is
+rejected; the interpreter image rejects all of it with the existing `Import`
+terminal.
+
+For this complete contract, a Core start section is allowed: LLD uses it to
+initialize shared passive data and pthread TLS. It runs during asynchronous
+instantiation under the same fuel, memory, and allocation limits as guest
+execution. Non-threaded commands still reject Core start sections.
+
+| Aspect | Behavior |
+| --- | --- |
+| Threads | At most 3 spawned threads per command (main plus three, one native fiber stack each); `thread-spawn` beyond that returns `-EAGAIN` (`-6`) |
+| Placement | Each thread is a kernel task pinned round-robin to an online hart; threads run in parallel on a multi-hart machine |
+| Shared memory | One fixed guest virtual reservation; growth appends zeroed pages and never relocates; failure returns `-1` to the guest instead of terminating |
+| Waits | `memory.atomic.wait*` suspends the thread's fiber through the executor; timeouts are rounded up to whole milliseconds |
+| Process semantics | `proc_exit` or a trap in any thread ends the command with that status; `_start` returning ends every thread; cancellation, revocation and fuel/output limits apply to the whole command |
+| Budgets | Each thread's store carries the invocation fuel budget; the command is limited to four budgets in total; stdout/stderr share one 64 KiB budget |
+| Faults | A fault in any thread tears down the whole arena after siblings mid-poll on other harts have detached; no destructor runs |
+
+`fd_read`/`fd_write` from several threads interleave at the granularity of one
+host call. There is still no `sched_yield` beyond the Preview 1 stub, no
+thread-local descriptor state, and no thread join primitive other than the
+guest's own atomics.
 
 Clock IDs 2/3 (CPU time) return `NOSYS`; invalid IDs return `INVAL`. The complete
 8-byte result range is checked before consulting the embedding, including
@@ -168,6 +209,35 @@ are unchanged. Run `WASI_BENCHMARK=1 scripts/run-wasi-qemu.sh` for the benchmark
 image and real-time QEMU clock configuration (no `icount`). See
 [CoreMark](COREMARK_WASI.md) for benchmark methodology and reproduction.
 
+### Multi-hart lifecycle rules
+
+Guest threads of one command share its pipes, output ceiling and process
+outcome from several harts, and the executor's parallel domain teardown must
+account for every sibling wherever it is:
+
+- Pipes keep a bounded table of parked pollers (one per guest thread plus the
+  main thread) and wake all of them when data moves; a full table wakes the
+  oldest poller so it re-registers. A single waker slot let one thread sleep
+  through another thread's wakeup on a full stdout pipe.
+- The whole-invocation 64 KiB output ceiling is reserved before each write
+  (`Streams::reserve_output`) and the unused part returned afterwards, so two
+  threads cannot both spend the same remaining bytes; the counter never wraps.
+- The first process-ending event (main returning, any thread's `proc_exit`,
+  trap or resource limit) fixes the exit status; a worker that trips a limit
+  while it is already being stopped cannot rewrite it. Session cancellation and
+  loss of authority observed while main ran still override the guest status,
+  as they do on the single-store path.
+- A sibling that returned normally is still running its destructors inside the
+  arena after it left its hart's scheduler. The scheduler counts such tasks as
+  `completing`: a fault teardown on another hart expects them in its live-task
+  gate and waits for them (with the mid-poll siblings) before the arena is
+  reclaimed raw. `parallel_fault_teardown_accounts_for_completing_siblings`
+  replays that interleaving on the host.
+- Wasmtime's sync-hook spins are bounded by wall time (60 s), not iterations:
+  a holder may legitimately zero 16 MiB and shoot down every hart's TLB under
+  the shared-memory write lock. A holder whose domain is being torn down is
+  still detected at the next spin check.
+
 ## Repeatable acceptance
 
 ```sh
@@ -179,6 +249,18 @@ WASI_EXAMPLE="$PWD/target/wasi-examples/c-hello.wasm" \
 ./scripts/test-wasi-oracle.py --wasmtime /path/to/wasmtime-48.0.0
 (cd firmware/qemu-virt && cargo build --locked --offline --release --features wasi-ssh-upload)
 ./scripts/test-wasi-qemu.py --work target/wasi-acceptance-fresh
+# wasi-threads on the native backend (4 harts):
+(cd firmware/qemu-virt && cargo build --locked --offline --release --target riscv64gc-unknown-none-elf \
+   --features wasi-ssh-upload,wasmtime-command-fuel-batch,wasmtime-threads)
+./scripts/test-wasi-qemu.py --work target/wasi-acceptance-threads --wasmtime --fuel-batch --threads
+# Thread lifecycle regressions that need no wasi-sdk on the host: interleaved
+# fixture/fault/CoreMark runs on the image above, and client disconnects
+# during long pthread CoreMark runs on the benchmark image.
+cargo run --locked --offline -p vibeos-wasi-runtime --example fixtures -- target/wasi-fixtures
+./scripts/test-wasi-threads-fixtures.py target/riscv64gc-unknown-none-elf/release/vibeos-qemu-virt \
+   target/wasi-threads-fixtures target/wasi-fixtures target/wasi-examples/c-threads.wasm \
+   target/coremark-wasi/coremark-threads.wasm
+./scripts/test-wasi-threads-disconnect.py BENCHMARK_KERNEL target/wasi-threads-disconnect 3
 ```
 
 Use a fresh acceptance work directory. The QEMU harness uses real OpenSSH clients,

@@ -3,6 +3,7 @@ fn main() {
     let out = std::env::args().nth(1).expect("output directory");
     std::fs::create_dir_all(&out).unwrap();
     let fixtures = [
+        ("stdio-pipes", include_str!("../../tests/wasi/stdio-pipes.wat")),
         (
             "loop",
             r#"(module (memory (export "memory") 1) (func (export "_start") (loop $l br $l)))"#,
@@ -39,6 +40,9 @@ fn main() {
         )
         .unwrap();
     }
+    for (name, source) in threads_fixtures() {
+        std::fs::write(format!("{out}/{name}.wasm"), wat::parse_str(source).unwrap()).unwrap();
+    }
 
     // Constant bulk copies must compile on RV64GC without introducing V
     // instructions. Check both overlap directions, unaligned addresses and
@@ -66,4 +70,100 @@ fn main() {
     let copy = format!("(module (memory (export \"memory\") 1) {data}
         (func (export \"_start\") (local $i i32) {body}))");
     std::fs::write(format!("{out}/copy.wasm"), wat::parse_str(copy).unwrap()).unwrap();
+}
+
+/// wasi-threads fixtures: an imported bounded shared memory, `wasi::thread-spawn`,
+/// and `wasi_thread_start`. Workers publish through atomics and notify; the
+/// main thread waits, verifies, and exits 0 on success or 1 on a wrong value.
+fn threads_fixtures() -> Vec<(&'static str, String)> {
+    let header = r#"(import "env" "memory" (memory 1 4 shared))
+        (import "wasi" "thread-spawn" (func $spawn (param i32) (result i32)))
+        (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+        (export "memory" (memory 0))"#;
+    // Wait until the i32 at $addr equals $value, using wait/notify.
+    let wait_for = |addr: u32, value: u32| format!(
+        "(block $done (loop $w
+            (br_if $done (i32.eq (i32.atomic.load (i32.const {addr})) (i32.const {value})))
+            (drop (memory.atomic.wait32 (i32.const {addr}) (i32.atomic.load (i32.const {addr})) (i64.const -1)))
+            (br $w)))");
+    let spawn_n = |n: u32| format!(
+        "(local $i i32) (loop $s
+            (if (i32.lt_s (call $spawn (local.get $i)) (i32.const 1)) (then unreachable))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br_if $s (i32.lt_u (local.get $i) (i32.const {n}))))");
+    let finish = "(drop (i32.atomic.rmw.add (i32.const 4) (i32.const 1)))
+        (drop (memory.atomic.notify (i32.const 4) (i32.const -1)))";
+    vec![
+        ("threads-counter", format!("(module {header}
+            (func (export \"_start\") {} {} 
+                (if (i32.ne (i32.atomic.load (i32.const 0)) (i32.const 3000)) (then (call $exit (i32.const 1)))))
+            (func (export \"wasi_thread_start\") (param $tid i32) (param $arg i32) (local $n i32)
+                (loop $l (drop (i32.atomic.rmw.add (i32.const 0) (i32.const 1)))
+                    (local.set $n (i32.add (local.get $n) (i32.const 1)))
+                    (br_if $l (i32.lt_u (local.get $n) (i32.const 1000))))
+                {finish}))", spawn_n(3), wait_for(4, 3))),
+        ("threads-atomics", format!("(module {header}
+            (func (export \"_start\")
+                (if (i32.ne (i32.atomic.rmw.cmpxchg (i32.const 16) (i32.const 0) (i32.const 7)) (i32.const 0)) (then (call $exit (i32.const 1))))
+                (if (i32.ne (i32.atomic.rmw.cmpxchg (i32.const 16) (i32.const 0) (i32.const 9)) (i32.const 7)) (then (call $exit (i32.const 1))))
+                (if (i64.ne (i64.atomic.rmw.xchg (i32.const 24) (i64.const 0x1122334455667788)) (i64.const 0)) (then (call $exit (i32.const 1))))
+                (if (i64.ne (i64.atomic.load (i32.const 24)) (i64.const 0x1122334455667788)) (then (call $exit (i32.const 1))))
+                (if (i32.ne (i32.atomic.rmw8.add_u (i32.const 32) (i32.const 250)) (i32.const 0)) (then (call $exit (i32.const 1))))
+                (if (i32.ne (i32.atomic.rmw8.add_u (i32.const 32) (i32.const 10)) (i32.const 250)) (then (call $exit (i32.const 1))))
+                (if (i32.ne (i32.atomic.load8_u (i32.const 32)) (i32.const 4)) (then (call $exit (i32.const 1))))
+                (if (i32.ne (i32.atomic.rmw16.sub_u (i32.const 40) (i32.const 1)) (i32.const 0)) (then (call $exit (i32.const 1))))
+                (if (i32.ne (i32.atomic.load16_u (i32.const 40)) (i32.const 65535)) (then (call $exit (i32.const 1))))
+                (if (i32.ne (i32.atomic.rmw.xor (i32.const 44) (i32.const 0xff)) (i32.const 0)) (then (call $exit (i32.const 1))))
+                (if (i32.ne (i32.atomic.rmw.and (i32.const 44) (i32.const 0x0f)) (i32.const 0xff)) (then (call $exit (i32.const 1))))
+                (if (i32.ne (i32.atomic.rmw.or (i32.const 44) (i32.const 0xf0)) (i32.const 0x0f)) (then (call $exit (i32.const 1))))
+                (i32.atomic.store (i32.const 48) (i32.const 5)) (atomic.fence)
+                (if (i32.ne (i32.atomic.load (i32.const 48)) (i32.const 5)) (then (call $exit (i32.const 1))))
+                (if (i32.ne (memory.atomic.notify (i32.const 48) (i32.const 1)) (i32.const 0)) (then (call $exit (i32.const 1))))
+                (if (i32.ne (memory.atomic.wait32 (i32.const 48) (i32.const 6) (i64.const -1)) (i32.const 1)) (then (call $exit (i32.const 1)))))
+            (func (export \"wasi_thread_start\") (param i32 i32)))")),
+        ("threads-wait-timeout", format!("(module {header}
+            (func (export \"_start\")
+                (if (i32.ne (memory.atomic.wait32 (i32.const 0) (i32.const 0) (i64.const 1000000)) (i32.const 2)) (then (call $exit (i32.const 1))))
+                (if (i32.ne (memory.atomic.wait64 (i32.const 8) (i64.const 0) (i64.const 1000000)) (i32.const 2)) (then (call $exit (i32.const 1)))))
+            (func (export \"wasi_thread_start\") (param i32 i32)))")),
+        ("threads-exit", format!("(module {header}
+            (func (export \"_start\") {}
+                (drop (memory.atomic.wait32 (i32.const 0) (i32.const 0) (i64.const -1))) (call $exit (i32.const 1)))
+            (func (export \"wasi_thread_start\") (param i32 i32) (call $exit (i32.const 7))))", spawn_n(1))),
+        ("threads-spawn-cap", format!("(module {header}
+            (func (export \"_start\") (local $i i32) (local $r i32)
+                (loop $s
+                    (local.set $r (call $spawn (local.get $i)))
+                    (if (i32.gt_s (local.get $r) (i32.const 0))
+                        (then (drop (i32.atomic.rmw.add (i32.const 8) (i32.const 1))))
+                        (else (if (i32.ne (local.get $r) (i32.const -6)) (then (call $exit (i32.const 1))))))
+                    (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                    (br_if $s (i32.lt_u (local.get $i) (i32.const 16))))
+                (block $done (loop $w
+                    (br_if $done (i32.eq (i32.atomic.load (i32.const 4)) (i32.atomic.load (i32.const 8))))
+                    (drop (memory.atomic.wait32 (i32.const 4) (i32.atomic.load (i32.const 4)) (i64.const -1)))
+                    (br $w)))
+                (call $exit (i32.atomic.load (i32.const 8))))
+            (func (export \"wasi_thread_start\") (param i32 i32) {finish}))")),
+        ("threads-grow", format!("(module {header}
+            (func (export \"_start\") {} {}
+                (if (i32.ne (memory.size) (i32.const 2)) (then (call $exit (i32.const 1))))
+                (if (i32.ne (i32.atomic.load (i32.const 65536)) (i32.const 42)) (then (call $exit (i32.const 1)))))
+            (func (export \"wasi_thread_start\") (param i32 i32)
+                (if (i32.ne (memory.grow (i32.const 1)) (i32.const 1)) (then (call $exit (i32.const 1))))
+                (i32.atomic.store (i32.const 65536) (i32.const 42)) {finish}))", spawn_n(1), wait_for(4, 1))),
+        ("threads-fault", format!("(module {header}
+            (func (export \"_start\") {}
+                (drop (memory.atomic.wait32 (i32.const 0) (i32.const 0) (i64.const -1))) (call $exit (i32.const 1)))
+            (func (export \"wasi_thread_start\") (param i32 i32) unreachable))", spawn_n(1))),
+        ("threads-busy", format!("(module {header}
+            (func (export \"_start\") {}
+                (drop (memory.atomic.wait32 (i32.const 0) (i32.const 0) (i64.const -1))) (call $exit (i32.const 1)))
+            (func (export \"wasi_thread_start\") (param i32 i32) (loop $l (br $l))))", spawn_n(3))),
+        ("threads-defined-shared", format!("(module
+            (import \"wasi\" \"thread-spawn\" (func $spawn (param i32) (result i32)))
+            (memory (export \"memory\") 1 4 shared)
+            (func (export \"_start\")) (func (export \"wasi_thread_start\") (param i32 i32)))")),
+        ("threads-no-start", format!("(module {header} (func (export \"_start\")))")),
+    ]
 }

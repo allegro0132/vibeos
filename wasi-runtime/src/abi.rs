@@ -40,6 +40,16 @@ pub(crate) fn signature(name: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
+/// wasi-threads: `wasi::thread-spawn(start_arg: i32) -> i32` (tid >= 1 or -errno).
+/// Kept outside the Preview 1 table so single-threaded engines never link it.
+#[allow(dead_code)]
+pub(crate) const THREAD_SPAWN_MODULE: &str = "wasi";
+#[allow(dead_code)]
+pub(crate) const THREAD_SPAWN_NAME: &str = "thread-spawn";
+#[allow(dead_code)]
+pub(crate) const THREAD_START_EXPORT: &str = "wasi_thread_start";
+#[allow(dead_code)]
+pub(crate) const AGAIN: i32 = 6;
 pub(crate) const SUCCESS: i32 = 0;
 pub(crate) const BADF: i32 = 8;
 pub(crate) const FAULT: i32 = 21;

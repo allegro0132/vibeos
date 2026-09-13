@@ -5,8 +5,12 @@ edition = "2021"
 build = "build.rs"
 
 [features]
+# Research-only format admission; writes require runtime opt-in.
+experimental-authority-delta = ["vibeos-kernel/experimental-authority-delta"]
+python-wasi = ["vibeos-kernel/python-wasi"]
 wasmtime-command = ["vibeos-kernel/wasmtime-command"]
 wasmtime-command-fuel-batch = ["vibeos-kernel/wasmtime-command-fuel-batch"]
+wasmtime-threads = ["vibeos-kernel/wasmtime-threads"]
 wasmtime-async = ["vibeos-kernel/wasmtime-async"]
 wasmtime-guarded-memory = ["vibeos-kernel/wasmtime-guarded-memory"]
 wasmtime-hardware-traps = ["vibeos-kernel/wasmtime-hardware-traps"]
@@ -25,6 +29,8 @@ legacy-shell = ["vibeos-kernel/legacy-shell"]
 # feature prevents benchmark builds from silently omitting the V2 file-tree
 # policy while preserving the production storage and capability paths.
 storage-bench = ["legacy-shell", "file-tree", "vibeos-kernel/storage-bench"]
+storage-bench-128m = ["storage-bench", "vibeos-kernel/storage-bench-128m"]
+storage-bench-small-store = ["storage-bench", "vibeos-kernel/storage-bench-small-store"]
 tcp-echo = ["vibeos-kernel/tcp-echo"]
 tcp-echo-recovery-test = ["vibeos-kernel/tcp-echo-recovery-test"]
 iperf3-server = ["vibeos-kernel/iperf3-server"]

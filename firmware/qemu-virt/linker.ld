@@ -1,9 +1,12 @@
 OUTPUT_ARCH(riscv)
 ENTRY(_start)
 
-/* QEMU virt exposes 128 MiB; OpenSBI occupies the first 2 MiB. */
+/* OpenSBI occupies the first 2 MiB. build.rs substitutes the RAM length for
+   the selected boot contract (128M golden/test or storage-bench-128m,
+   512M storage bench, 1G Python
+   WASI); the board's RAM_END follows the same feature selection. */
 MEMORY {
-  RAM (rwxa) : ORIGIN = 0x80200000, LENGTH = 126M
+  RAM (rwxa) : ORIGIN = 0x80200000, LENGTH = @RAM_LENGTH@
 }
 
 SECTIONS {

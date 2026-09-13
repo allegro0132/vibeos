@@ -68,6 +68,13 @@ pub const STORE_WORKING_HEADROOM: usize = 4 * 1024 * 1024;
 /// It leaves room for their own future/payload plus the recovery floor above.
 pub const STORE_CLIENT_MEMORY_BUDGET: usize = 8 * 1024 * 1024;
 
+// This is a write-policy threshold, not a format limit. Larger v2 objects
+// already have a content-by-reference representation; keeping them out of
+// the authority stream avoids rewriting their payload on every later append.
+// Tiny objects retain the inline path; a 4 KiB blob plus its Merkle
+// envelope uses CAS, avoiding repeated payload copies in the authority log.
+const V2_INLINE_OBJECT_LIMIT: usize = 4 * 1024;
+
 // Stable platform trust anchor for this object journal.  VibeOS has no entropy
 // source yet, so this is intentionally a fixed, documented value rather than a
 // boot-local counter pretending to be globally unique.
@@ -445,6 +452,49 @@ pub trait StorageV2Backend: Send + Sync {
         }
     }
     fn read_object<'a>(&'a self, object: &'a StorageV2ObjectToken) -> StorageV2Future<'a, Vec<u8>>;
+    /// Authenticate up to 32 ranges of one exact object. Native backends
+    /// share a manifest/proof reader; existing bridges retain their fallback.
+    fn read_object_ranges<'a>(
+        &'a self,
+        object: &'a StorageV2ObjectToken,
+        ranges: &'a [(u64, usize)],
+    ) -> StorageV2Future<'a, Vec<Vec<u8>>> {
+        Box::pin(async move {
+            if ranges.len() > 32 {
+                return Err(StoreError::ObjectTooLarge);
+            }
+            let mut output = Vec::new();
+            if ranges.is_empty() {
+                self.read_object_range(object, 0, 0).await?;
+            }
+            for &(offset, len) in ranges {
+                output.push(self.read_object_range(object, offset, len).await?);
+            }
+            Ok(output)
+        })
+    }
+
+    /// Return an authenticated range of the exact capability-bound object.
+    /// The compatibility fallback verifies the complete object first; native
+    /// CAS backends authenticate only the intersecting leaves and their proofs.
+    fn read_object_range<'a>(
+        &'a self,
+        object: &'a StorageV2ObjectToken,
+        offset: u64,
+        len: usize,
+    ) -> StorageV2Future<'a, Vec<u8>> {
+        Box::pin(async move {
+            let mut bytes = self.read_object(object).await?;
+            let result = usize::try_from(offset)
+                .ok()
+                .and_then(|start| start.checked_add(len).map(|end| (start, end)))
+                .and_then(|(start, end)| bytes.get(start..end))
+                .map(|range| range.to_vec())
+                .ok_or(StoreError::ObjectUnavailable);
+            erase_bytes(&mut bytes);
+            result
+        })
+    }
 }
 
 /// Error boundary for the canonical Merkle-blob profile. Journal failures and
@@ -2934,11 +2984,10 @@ async fn put_to_space(
     let target_incarnation = target.incarnation();
     let inner = lease.with(|service| service.inner.clone());
     if let Some(backend) = selected_v2_backend(&inner)? {
-        // The logical v2 record stream admits inline objects up to the
-        // journal chunk envelope; larger objects commit by reference with
-        // their content in the V2 content-addressed store. The M4 backend
-        // additionally enforces its physical sector capacity below.
-        let external = bytes.len() > journal::MAX_OBJECT_SIZE;
+        // Choose inline storage for small objects, rather than filling the
+        // format's entire chunk envelope. External commits keep payload bytes
+        // in CAS and the authority journal proportional to object count.
+        let external = bytes.len() > V2_INLINE_OBJECT_LIMIT.min(journal::MAX_OBJECT_SIZE);
         if bytes.len() as u64 > journal::MAX_EXTERNAL_OBJECT_SIZE {
             return Err(StoreError::ObjectTooLarge);
         }
@@ -3289,19 +3338,95 @@ pub async fn get_blob_with(
     result
 }
 
-/// Read and authenticate one logical 4 KiB blob chunk. The v1 journal backend
-/// still recovers the enclosing object in full; the API and proof semantics are
-/// intentionally stable for a later extent-addressed backend.
+/// Read and authenticate one logical 4 KiB blob chunk. V2 authenticates
+/// the envelope header, selected content, and sibling hashes with native CAS
+/// proofs, then verifies the outer blob proof. M4 retains its full-read path.
 pub async fn get_blob_chunk_with(
     service: InvocationLease<StoreService>,
     object: InvocationLease<StoredObject>,
     index: u32,
 ) -> Result<VerifiedBlobChunk, BlobStoreError> {
-    let object_kind = object.with(|stored| stored.object_kind);
+    if !service.authorizes(Rights::READ) || !object.authorizes(Rights::READ) {
+        return Err(StoreError::PermissionDenied.into());
+    }
+    let (object_kind, token, encoded_len) =
+        object.with(|stored| (stored.object_kind, stored.v2_token.clone(), stored.byte_len));
+    if let Some(token) = token {
+        let inner = service.with(|store| store.inner.clone());
+        let backend = selected_v2_backend(&inner)?.ok_or(StoreError::ObjectUnavailable)?;
+        return read_v2_blob_chunk(backend.as_ref(), &token, object_kind, encoded_len, index).await;
+    }
     let mut encoded = get_with(service, object).await?;
     let result = verify_blob_object_chunk(object_kind, &encoded, index);
     erase_bytes(&mut encoded);
     result
+}
+
+async fn read_v2_blob_chunk(
+    backend: &dyn StorageV2Backend,
+    token: &StorageV2ObjectToken,
+    object_kind: journal::ObjectKind,
+    encoded_len: usize,
+    index: u32,
+) -> Result<VerifiedBlobChunk, BlobStoreError> {
+    use vibeos_blob_format::{verify_proof, BlobGeometry, HASH_SIZE, HEADER_SIZE};
+    let header = backend.read_object_range(token, 0, HEADER_SIZE).await?;
+    let header = header
+        .as_slice()
+        .try_into()
+        .map_err(|_| StoreError::Corrupt)?;
+    let descriptor = BlobDescriptor::decode_header(header)?;
+    if descriptor.object_kind != object_kind.get() {
+        return Err(BlobStoreError::ObjectKindMismatch);
+    }
+    let geometry = BlobGeometry::for_len(descriptor.byte_len)?;
+    if geometry.encoded_len() != encoded_len {
+        return Err(StoreError::Corrupt.into());
+    }
+    if index >= geometry.leaf_count() {
+        return Err(BlobError::ChunkOutOfRange.into());
+    }
+    let offset = u64::from(index) * LEAF_SIZE as u64;
+    let len = descriptor
+        .byte_len
+        .saturating_sub(offset)
+        .min(LEAF_SIZE as u64) as usize;
+    let mut requests = Vec::new();
+    requests.push((HEADER_SIZE as u64 + offset, len));
+    let mut position = index as usize;
+    let mut width = geometry.padded_leaf_count() as usize;
+    let mut base = 0;
+    while width > 1 {
+        let offset = geometry.tree_offset() + (base + (position ^ 1)) * HASH_SIZE;
+        requests.push((offset as u64, HASH_SIZE));
+        base += width;
+        width /= 2;
+        position /= 2;
+    }
+    let values = backend.read_object_ranges(token, &requests).await?;
+    if values.len() != requests.len() {
+        return Err(StoreError::Corrupt.into());
+    }
+    let mut values = values.into_iter();
+    let bytes = values.next().ok_or(StoreError::Corrupt)?;
+    let mut proof = MerkleProof {
+        leaf_index: index,
+        siblings: Vec::new(),
+    };
+    for node in values {
+        proof.siblings.push(
+            node.as_slice()
+                .try_into()
+                .map_err(|_| StoreError::Corrupt)?,
+        );
+    }
+    verify_proof(descriptor, &bytes, &proof)?;
+    Ok(VerifiedBlobChunk {
+        descriptor,
+        index,
+        bytes,
+        proof,
+    })
 }
 
 pub const fn blob_leaf_size() -> usize {
@@ -3836,6 +3961,131 @@ mod tests {
             _object: &'a StorageV2ObjectToken,
         ) -> StorageV2Future<'a, Vec<u8>> {
             Box::pin(async { Err(StoreError::ObjectUnavailable) })
+        }
+    }
+
+    struct RangeOnlyBackend {
+        encoded: Vec<u8>,
+        requested: AtomicUsize,
+    }
+
+    impl StorageV2Backend for RangeOnlyBackend {
+        fn selection(&self) -> StorageBackendSelection {
+            StorageBackendSelection::StorageV2
+        }
+        fn info(&self) -> StorageV2BackendInfo {
+            StorageV2BackendInfo::default()
+        }
+        fn revoke_authority_boot_proof(&self) {}
+        fn recover_authority(&self) -> StorageV2Future<'_, StorageV2AuthoritySnapshot> {
+            Box::pin(async { Err(StoreError::Corrupt) })
+        }
+        fn append_authority<'a>(
+            &'a self,
+            _: ChainCheckpoint,
+            _: &'a [[u8; journal::RECORD_SIZE]],
+        ) -> StorageV2Future<'a, StorageV2AuthoritySnapshot> {
+            Box::pin(async { Err(StoreError::Corrupt) })
+        }
+        fn read_object<'a>(&'a self, _: &'a StorageV2ObjectToken) -> StorageV2Future<'a, Vec<u8>> {
+            panic!("directed blob reads must not request the entire object")
+        }
+        fn read_object_range<'a>(
+            &'a self,
+            _: &'a StorageV2ObjectToken,
+            offset: u64,
+            len: usize,
+        ) -> StorageV2Future<'a, Vec<u8>> {
+            self.requested.fetch_add(len, Ordering::Relaxed);
+            Box::pin(async move {
+                self.encoded
+                    .get(offset as usize..offset as usize + len)
+                    .map(|bytes| bytes.to_vec())
+                    .ok_or(StoreError::ObjectUnavailable)
+            })
+        }
+    }
+
+    #[test]
+    fn directed_v2_blob_reads_are_bounded_and_reject_corrupt_proofs() {
+        use vibeos_blob_format::{BlobGeometry, HASH_SIZE, HEADER_SIZE};
+        let kind = journal::ObjectKind::new(17).unwrap();
+        let token = StorageV2ObjectToken::new(());
+        for len in [0, 1, 4096, 4097, 128 * 1024, 1024 * 1024 + 13] {
+            let content: Vec<u8> = (0..len).map(|i| (i * 131 + i / 251) as u8).collect();
+            let mut backend = RangeOnlyBackend {
+                encoded: encode_blob_object(kind, &content).unwrap(),
+                requested: AtomicUsize::new(0),
+            };
+            let geometry = BlobGeometry::for_len(len as u64).unwrap();
+            let index = geometry.leaf_count() - 1;
+            let result = poll_ready(read_v2_blob_chunk(
+                &backend,
+                &token,
+                kind,
+                backend.encoded.len(),
+                index,
+            ))
+            .unwrap();
+            assert_eq!(
+                result.bytes,
+                content[(index as usize * LEAF_SIZE).min(len)..]
+            );
+            assert_eq!(
+                backend.requested.load(Ordering::Relaxed),
+                HEADER_SIZE + result.bytes.len() + geometry.height() as usize * HASH_SIZE
+            );
+            assert!(matches!(
+                poll_ready(read_v2_blob_chunk(
+                    &backend,
+                    &token,
+                    kind,
+                    backend.encoded.len(),
+                    geometry.leaf_count()
+                )),
+                Err(BlobStoreError::Format(BlobError::ChunkOutOfRange))
+            ));
+            assert!(poll_ready(read_v2_blob_chunk(
+                &backend,
+                &token,
+                kind,
+                backend.encoded.len() + 1,
+                index
+            ))
+            .is_err());
+            assert!(matches!(
+                poll_ready(read_v2_blob_chunk(
+                    &backend,
+                    &token,
+                    journal::ObjectKind::new(18).unwrap(),
+                    backend.encoded.len(),
+                    index
+                )),
+                Err(BlobStoreError::ObjectKindMismatch)
+            ));
+            if len > 0 {
+                backend.encoded[HEADER_SIZE + index as usize * LEAF_SIZE] ^= 1;
+                assert!(poll_ready(read_v2_blob_chunk(
+                    &backend,
+                    &token,
+                    kind,
+                    backend.encoded.len(),
+                    index
+                ))
+                .is_err());
+                backend.encoded[HEADER_SIZE + index as usize * LEAF_SIZE] ^= 1;
+            }
+            if geometry.height() > 0 {
+                backend.encoded[geometry.tree_offset() + (index as usize ^ 1) * HASH_SIZE] ^= 1;
+                assert!(poll_ready(read_v2_blob_chunk(
+                    &backend,
+                    &token,
+                    kind,
+                    backend.encoded.len(),
+                    index
+                ))
+                .is_err());
+            }
         }
     }
 

@@ -167,6 +167,8 @@ impl LineDiscipline {
             b'\t' => self.complete_command(),
             0x7f | 0x08 => self.backspace(),
             0x03 => self.interrupt(),
+            0x04 if self.input.is_empty() => self.transport_eof(),
+            0x04 => self.submit(),
             0x1b => {
                 self.escape = EscapeState::Escape;
                 InputAction::None

@@ -9,8 +9,68 @@
 extern crate alloc;
 
 use alloc::collections::{TryReserveError, VecDeque};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const MAX_HARTS: usize = 4;
+
+/// Lock-free mirror of queue occupancy, updated inside the same critical
+/// sections that mutate the queues. A task continuing on its own fiber between
+/// fuel quanta samples this instead of taking the scheduler lock; the answer
+/// is exactly what [`RunQueues::hart_idle`] would return at that instant, and
+/// a wake landing right after the sample is observed at the next quantum, as
+/// with the locked check.
+pub struct ReadyHint {
+    queued: [AtomicUsize; MAX_HARTS],
+    stealable: AtomicUsize,
+}
+
+impl ReadyHint {
+    pub const fn new() -> Self {
+        Self {
+            queued: [const { AtomicUsize::new(0) }; MAX_HARTS],
+            stealable: AtomicUsize::new(0),
+        }
+    }
+
+    /// Same predicate as [`RunQueues::hart_idle`]: no local entry and no
+    /// stealable entry anywhere. An empty local queue holds no stealable
+    /// entry, so the global stealable count suffices.
+    pub fn hart_idle(&self, hart: HartId) -> bool {
+        self.queued[hart.index()].load(Ordering::Acquire) == 0
+            && self.stealable.load(Ordering::Acquire) == 0
+    }
+
+    pub fn queued_on(&self, hart: HartId) -> usize {
+        self.queued[hart.index()].load(Ordering::Acquire)
+    }
+
+    pub fn stealable(&self) -> usize {
+        self.stealable.load(Ordering::Acquire)
+    }
+
+    fn record(&self, hart: HartId, stealable: bool, added: bool) {
+        let update = |cell: &AtomicUsize| {
+            if added {
+                cell.fetch_add(1, Ordering::AcqRel);
+            } else {
+                cell.fetch_sub(1, Ordering::AcqRel);
+            }
+        };
+        update(&self.queued[hart.index()]);
+        if stealable {
+            update(&self.stealable);
+        }
+    }
+}
+
+impl Default for ReadyHint {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Hint for queues constructed with [`RunQueues::new`]; no executor reads it.
+static UNOBSERVED_HINT: ReadyHint = ReadyHint::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HartId(u8);
@@ -61,6 +121,7 @@ pub struct RunQueues<T> {
     queues: [VecDeque<ReadyEntry<T>>; MAX_HARTS],
     dispatches: [u64; MAX_HARTS],
     steals: [u64; MAX_HARTS],
+    hint: &'static ReadyHint,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,10 +132,16 @@ struct ReadyEntry<T> {
 
 impl<T> RunQueues<T> {
     pub const fn new() -> Self {
+        Self::with_hint(&UNOBSERVED_HINT)
+    }
+
+    /// Queues whose occupancy is mirrored into `hint` on every change.
+    pub const fn with_hint(hint: &'static ReadyHint) -> Self {
         Self {
             queues: [const { VecDeque::new() }; MAX_HARTS],
             dispatches: [0; MAX_HARTS],
             steals: [0; MAX_HARTS],
+            hint,
         }
     }
 
@@ -168,6 +235,7 @@ impl<T: Copy + Eq> RunQueues<T> {
             return Err(EnqueueError::CapacityExhausted);
         }
         queue.push_back(ReadyEntry { task, stealable });
+        self.hint.record(owner, stealable, true);
         Ok(())
     }
 
@@ -176,7 +244,8 @@ impl<T: Copy + Eq> RunQueues<T> {
         let Some(index) = queue.iter().position(|candidate| candidate.task == task) else {
             return false;
         };
-        queue.remove(index);
+        let entry = queue.remove(index).expect("position was found in this queue");
+        self.hint.record(owner, entry.stealable, false);
         true
     }
 
@@ -187,6 +256,7 @@ impl<T: Copy + Eq> RunQueues<T> {
         let executor_index = executor.index();
         if let Some(entry) = self.queues[executor_index].pop_front() {
             self.dispatches[executor_index] = self.dispatches[executor_index].saturating_add(1);
+            self.hint.record(executor, entry.stealable, false);
             return Some(RunQueueDispatch {
                 task: entry.task,
                 source: executor,
@@ -204,9 +274,11 @@ impl<T: Copy + Eq> RunQueues<T> {
             {
                 self.dispatches[executor_index] = self.dispatches[executor_index].saturating_add(1);
                 self.steals[executor_index] = self.steals[executor_index].saturating_add(1);
+                let source = HartId::new(source_index).expect("queue index is a valid hart");
+                self.hint.record(source, entry.stealable, false);
                 return Some(RunQueueDispatch {
                     task: entry.task,
-                    source: HartId::new(source_index).expect("queue index is a valid hart"),
+                    source,
                     executor,
                     stolen: true,
                 });

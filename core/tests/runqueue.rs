@@ -89,3 +89,45 @@ fn every_valid_hart_has_independent_stats_and_capacity() {
     }
     assert_eq!(HartId::new(MAX_HARTS), None);
 }
+
+#[test]
+fn ready_hint_mirrors_every_enqueue_remove_and_dispatch() {
+    use vibeos_core::runqueue::ReadyHint;
+    static HINT: ReadyHint = ReadyHint::new();
+    let mut queues = RunQueues::with_hint(&HINT);
+    queues.reserve_live_bound(4).unwrap();
+    for index in 0..MAX_HARTS {
+        assert!(HINT.hart_idle(hart(index)));
+    }
+    // A pinned entry on hart 1 only occupies hart 1.
+    queues.enqueue(hart(1), 10, false).unwrap();
+    assert!(!HINT.hart_idle(hart(1)));
+    assert!(HINT.hart_idle(hart(0)));
+    assert_eq!((HINT.queued_on(hart(1)), HINT.stealable()), (1, 0));
+    // A stealable entry anywhere keeps every hart busy, exactly like hart_idle.
+    queues.enqueue(hart(2), 11, true).unwrap();
+    for index in 0..MAX_HARTS {
+        assert!(!HINT.hart_idle(hart(index)));
+        assert_eq!(HINT.hart_idle(hart(index)), queues.hart_idle(hart(index)));
+    }
+    assert_eq!((HINT.queued_on(hart(2)), HINT.stealable()), (1, 1));
+    // Duplicates are rejected without touching the mirror.
+    assert_eq!(queues.enqueue(hart(0), 11, true), Err(EnqueueError::Duplicate));
+    assert_eq!(HINT.stealable(), 1);
+    // A remote steal drains the stealable count from its source hart.
+    let stolen = queues.dispatch(hart(3)).unwrap();
+    assert!(stolen.stolen && stolen.task == 11);
+    assert_eq!((HINT.queued_on(hart(2)), HINT.stealable()), (0, 0));
+    assert!(HINT.hart_idle(hart(0)) && !HINT.hart_idle(hart(1)));
+    // Explicit removal and local dispatch both release their entries.
+    queues.enqueue(hart(1), 12, true).unwrap();
+    assert!(queues.remove(hart(1), 12));
+    assert!(!queues.remove(hart(1), 12));
+    assert_eq!((HINT.queued_on(hart(1)), HINT.stealable()), (1, 0));
+    assert_eq!(queues.dispatch(hart(1)).unwrap().task, 10);
+    for index in 0..MAX_HARTS {
+        assert!(HINT.hart_idle(hart(index)));
+        assert_eq!(HINT.hart_idle(hart(index)), queues.hart_idle(hart(index)));
+    }
+    assert!(queues.dispatch(hart(1)).is_none());
+}

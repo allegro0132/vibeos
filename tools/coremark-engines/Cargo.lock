@@ -232,8 +232,6 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen"
 version = "0.135.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73eecedc85ffca4f34dbe197c6545c8ade6579a61352457936f53c3bffa6353b"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64",
@@ -1554,8 +1552,6 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-cranelift"
 version = "48.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a83f10fbd4bcacec9bcf7be49932a738356ec027816230f9d6f053433b3de97f"
 dependencies = [
  "cranelift-codegen",
  "cranelift-control",
@@ -1568,6 +1564,7 @@ dependencies = [
  "object",
  "pulley-interpreter",
  "smallvec",
+ "spin",
  "target-lexicon",
  "thiserror 2.0.20",
  "wasmparser 0.254.0",

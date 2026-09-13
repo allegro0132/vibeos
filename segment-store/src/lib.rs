@@ -14,6 +14,9 @@ extern crate std;
 mod allocation_v2;
 mod authority;
 mod authority_snapshot;
+// Experimental codec; default builds do not admit this format.
+#[cfg(any(test, feature = "experimental-authority-delta"))]
+mod authority_delta;
 mod cas;
 mod cas_codec;
 mod codec;
@@ -27,6 +30,7 @@ mod maintenance;
 #[cfg(test)]
 mod maintenance_growth_tests;
 mod mark;
+mod metadata_layout;
 mod migration;
 mod persistent_authority;
 #[cfg(test)]
@@ -36,6 +40,9 @@ mod quota;
 #[cfg(test)]
 mod quota_integration_tests;
 mod root_codec;
+/// Experimental codec only; not admitted by any mount or publication path.
+#[cfg(any(test, feature = "experimental-root-bundle"))]
+pub mod experimental_root_bundle;
 mod scrub;
 #[cfg(test)]
 mod scrub_tests;
@@ -65,7 +72,7 @@ pub use authority_snapshot::{
     PERSISTENT_AUTHORITY_PRINCIPAL_LEN, PERSISTENT_AUTHORITY_SNAPSHOT_VERSION,
 };
 pub use cas::{
-    BlobWriter, CasCommitError, CasObjectHandle, CasStoreError, ForegroundBlobError,
+    BlobWriter, CasCommitError, CatalogDeltaPolicy, CasObjectHandle, CasStoreError, ForegroundBlobError,
     ReleasedRuntimePins, RuntimeObjectPin, RuntimeObjectPinClass, RuntimePinOwner,
     RuntimePinOwnerError, StoppedRuntimePinOwner, VerifiedCasBlob, VerifiedCasChunk,
 };
@@ -88,7 +95,7 @@ pub use codec::{
 pub use compat::PutGetAdapter;
 pub use device::{BlockPageDevice, BlockPageError, GrowablePageDevice, PageDevice, PageDeviceInfo};
 pub use fs_api::{
-    FsNodeEntryInput, FsPersistentData, FsPersistentRoot, FsPersistentTreeEntry,
+    FsNodeEntryInput, FsPendingContent, FsPersistentData, FsPersistentRoot, FsPersistentTreeEntry,
     FsRootPublishError, FsStructuralCommitError,
 };
 pub use fs_codec::{

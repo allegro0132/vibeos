@@ -14,6 +14,8 @@ import sys
 import time
 
 ROOT=Path(__file__).resolve().parent.parent
+sys.path.insert(0,str(ROOT/'scripts'))
+import wasi_threads_cases
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
@@ -21,12 +23,14 @@ def main():
     parser.add_argument('--kernel',type=Path,help='Existing firmware ELF to freeze and verify')
     parser.add_argument('--wasmtime',action='store_true',help='Require the experimental native command backend')
     parser.add_argument('--fuel-batch',action='store_true',help='Require bounded in-fiber fuel batching')
+    parser.add_argument('--threads',action='store_true',help='Require wasi-threads on the native backend')
     parser.add_argument('--cycles',type=int,default=100)
     parser.add_argument('--boot-timeout',type=int,default=300)
     parser.add_argument('--server-alive-interval',type=int,default=2,
         help='SSH liveness window; values above 2 are functional diagnostics, not responsiveness acceptance')
     args=parser.parse_args();os.chdir(ROOT);work=args.work.resolve();work.mkdir(parents=True,exist_ok=True)
     if args.fuel_batch and not args.wasmtime:parser.error('--fuel-batch requires --wasmtime')
+    if args.threads and not args.wasmtime:parser.error('--threads requires --wasmtime')
     if (work/'disk.raw').exists():raise SystemExit('use a fresh --work directory for source-bound acceptance')
     spec=importlib.util.spec_from_file_location('wasi_peer',ROOT/'scripts/openssh-peer.py');peer=importlib.util.module_from_spec(spec);sys.modules[spec.name]=peer;spec.loader.exec_module(peer)
     with socket.socket() as s:s.bind(('127.0.0.1',0));port=s.getsockname()[1]
@@ -40,6 +44,7 @@ def main():
     env['WASI_KERNEL']=str(frozen)
     env['WASI_WASMTIME']=str(int(args.wasmtime))
     env['WASI_FUEL_BATCH']=str(int(args.fuel_batch))
+    env['WASI_THREADS']=str(int(args.threads))
     command=peer._base_ssh_command('ssh','127.0.0.1',port,'vibe',work/'id_ed25519',work/'known_hosts',15,None)
     assert args.server_alive_interval > 0
     command=[f'-oServerAliveInterval={args.server_alive_interval}' if option=='-oServerAliveInterval=2' else option for option in command]
@@ -155,6 +160,22 @@ def main():
             upload(name+'.wasm',(work/f'fixtures/{name}.wasm').read_bytes())
             p=ssh(['wasm-run',name+'.wasm'],status=status,out=None)
             assert len(p.stdout)<=65536
+        if args.threads:
+            # wasi-threads: sibling tasks on several harts share one memory.
+            # Every terminal must still reclaim the whole arena.
+            for name,status in wasi_threads_cases.FIXTURES:
+                upload(name+'.wasm',(work/f'fixtures/{name}.wasm').read_bytes())
+                before=(work/'boot-1.log').stat().st_size
+                ssh(['wasm-run',name+'.wasm'],status=status,out=b'')
+                wait_uart(b'reclaimed=true',before)
+            pthreads=ROOT/'target/wasi-examples/c-threads.wasm'
+            upload('c-threads.wasm',pthreads.read_bytes())
+            for pargs,status,out in wasi_threads_cases.PTHREADS:
+                ssh(['wasm-run','c-threads.wasm',*pargs],status=status,out=out)
+            text=(work/'boot-1.log').read_text(errors='replace')
+            used=[int(m,16) for m in re.findall(r'harts_used=(0x[0-9a-f]+)',text)]
+            assert used and max(bin(u).count('1') for u in used)>=2,('guest threads never ran on a second hart',used[-10:])
+            print('PASS wasi-threads fixtures, pthreads program, multi-hart placement',flush=True)
         # Disconnect while executing; the same server must admit a fresh invocation.
         before=(work/'boot-1.log').stat().st_size
         p=subprocess.Popen([*command,'wasm-run rust.wasm filter'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
@@ -195,6 +216,7 @@ def main():
         record['kernel_sha256']=hashlib.sha256(frozen.read_bytes()).hexdigest()
         record['backend']='wasmtime' if args.wasmtime else 'wasmi'
         record['fuel_batch']=args.fuel_batch
+        record['threads']=args.threads
         if args.fuel_batch:assert 'max_batch=32' in (work/'boot-1.log').read_text()
         record['ssh_server_alive_interval']=args.server_alive_interval
         record['responsiveness_acceptance']=args.server_alive_interval==2

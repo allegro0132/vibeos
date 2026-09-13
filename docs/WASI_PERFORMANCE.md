@@ -1,5 +1,164 @@
 # WASI runtime performance investigation
 
+## Pthread runtime optimization (2026-09-10)
+
+The final four-hart VibeOS image reaches the goal of **at least 90% of Debian
+Wasmtime with fuel at every worker count**, using three interleaved performance
+samples and an independent validation-seed sample per count. M1/M2/M3 are one,
+two or three actual pthread workers plus the waiting main thread.
+
+The final paired Debian M3 run was substantially slower than the preceding
+reference. To avoid crediting that fluctuation as a runtime advantage, the
+conservative comparison below uses the **higher median at each worker count**
+from the two adjacent Debian runs. This is a sensitivity check, not an additional
+physical run. Every raw sample, including low scores, remains in the reports.
+Values are aggregate iterations/second.
+
+| Measurement | M1 | M2 | M3 |
+| --- | ---: | ---: | ---: |
+| Final VibeOS Wasmtime | 2248.13 | 4526.90 | 7013.31 |
+| Immediately paired Debian Wasmtime, fuel | 2430.80 | 4691.72 | 6353.14 |
+| Preceding Debian Wasmtime, fuel | 2421.85 | 4891.33 | 7335.88 |
+| VibeOS / conservative reference | **92.5%** | **92.6%** | **95.6%** |
+
+VibeOS ranges were 2228.19–2257.62 (M1), 4030.38–4535.20 (M2), and
+6916.96–7057.53 (M3). The paired Debian M3 range was 5850.45–6678.70;
+the preceding reference range was 7284.26–7338.88. The apparent paired M3
+advantage is not evidence of a stable advantage over Linux. VibeOS M3/M1 is
+3.12×; slightly superlinear scaling can reflect fixed costs and host variation.
+These are median throughput results, not a lower bound for individual runs.
+
+All runs use QEMU 11.0.3, `virt`, `rv64`, four harts, 1 GiB, MTTCG, VM-clock RTC,
+no `icount`, the same Wasmtime 48/compiler correctness patches, and the identical
+46,489-byte threaded Wasm (SHA-256
+`3a6b9af26c55b962a79c5fd6a3e52f850b39d1ca373178a436379970a013017f`).
+The 36 retained samples across these three runs pass per-worker CRC validation
+and last at least 18.993 seconds. All 15 final VibeOS invocations, including
+calibration, report clean reclamation and the expected distinct worker harts.
+Builds completed before the serial VM runs. Five-second process snapshots found
+no overlapping QEMU or compiler during the final pair; editor/desktop background
+load remained. Measurements ran on an Apple M3 Max (14 CPU cores, 36 GiB RAM).
+
+The optimized image is based on `8717c4c40e46f9ad964186849a749ecaa3cce674`
+plus the recorded working-tree changes; that Git revision alone does not identify
+the measured source. Benchmark ELF SHA-256:
+`1bc44062f4ad91e7f01da33bf958ee5dcac23aa037d12537754807f6fceee8d3`.
+The [verified comparison](../benchmarks/wasm-runtime/results/coremark-threads-goal90.json)
+contains exact medians, ranges, configuration and executable hashes; the
+[acceptance record](../benchmarks/wasm-runtime/results/coremark-threads-goal90-acceptance.json)
+binds source-file hashes, regressions and conservative ratios to this image.
+
+Profiling found repeated invariant private capability lookups and shared writes
+in the fuel path. Same-image measurements also correlated slower runs with worker
+placement on the boot hart. The changes remove invariant private-slot lookups
+from each in-fiber continuation, remove a shared aggregate fuel counter whose
+bound is already enforced by the fixed Store count, separate worker counter
+cache lines, and record each pinned worker's hart once. Four-hart placement leaves
+the boot hart for I/O and supervision; smaller topologies retain all online harts.
+The 10 ms SYSTEM reaper is also pinned to the boot hart: previously workers could
+steal it, reintroducing periodic scheduling contention. After this change, M1
+fuel continuations follow the expected 31-of-32 batch pattern and its measured
+range narrows. This evidence does not isolate each kernel service's time cost.
+
+Per-Store fuel remains 100 billion in the benchmark and 10 million in the ordinary
+image, with a 10,000-fuel quantum and maximum batch of 32. Live cancellation,
+caller authority, memory/compiler checks and allocation-domain reclamation are
+unchanged. The [ownership proof](../benchmarks/wasm-runtime/coremark-threads.md#fuel-policy-ownership-invariants)
+explains why private-slot checks and the aggregate counter are redundant.
+No experimental synchronous-fuel vendor patch or function optimization attribute
+is retained; neither improved fixed-work instruction-count diagnostics.
+
+The final ordinary image passes 57 thread/atomic/trap/fuel/reuse cases with clean
+reclamation. The final benchmark image passes six SSH disconnect cancellations
+within 30 seconds and six successful follow-up runs. Placement unit tests cover
+small and sparse topologies. The final image also passes all six one-hart
+fixed-work diagnostic calls and all six two-hart real-clock performance/validation
+calls (M1/M2/M3). Thread statistics now come from the common retirement
+path after all joins, fixing missing short-call diagnostics when main exit raced
+worker cleanup. A previous two-hart `icount` M3 diagnostic timed out and remains
+recorded as a failed experiment; real-clock MTTCG fallback completed. This work
+does not claim to rerun the entire original WASI acceptance matrix.
+
+Evidence and intermediate attempts remain under `target/coremark-threads/goal90/`.
+`supervisor-full` and `supervisor-debian-fuel` are the final pair;
+`isolated-debian-fuel` is the conservative reference. `supervisor-source.json`
+and `.patch` bind the build to source; build logs, regression logs and
+`supervisor-process-audit.jsonl` are adjacent. The earlier `retire-*` pair overlapped
+an external VM near the end of its Debian run and is not final acceptance evidence.
+The next `isolated-*` pair failed M1 at 88.6%, motivating the supervisor fix.
+Neither failed nor noisy experiments were deleted or substituted into medians.
+
+Comparison limits remain: Linux uses OS threads and the official Preview 1
+adapter, fixed RV64GC compilation and synchronous fuel counting; VibeOS enables
+firmware-discovered Zba/Zbb/Zbc/Zbs and retains async scheduling/capability checks.
+Compilation and upload are outside CoreMark timing. These are QEMU throughput
+measurements, not certified CoreMark ratings or physical-hardware measurements.
+Reproduction commands are in the [benchmark guide](../benchmarks/wasm-runtime/coremark-threads.md).
+
+## Previous pthread CoreMark measurement: 66a1e6c (2026-09-09)
+
+Rebuilt kernel revision `66a1e6cfed113db8f2e017f5350ee2bb41b502c6` with
+`wasi-benchmark,wasmtime-command-fuel-batch,wasmtime-threads`, using the pinned
+nightly and wasi-sdk 33. No runtime optimization was changed for this measurement.
+All four runs used QEMU 11.0.3, `virt`, `rv64`, four harts, 1 GiB,
+`tcg,thread=multi`, `-rtc base=utc,clock=vm`, and no `icount`. Builds completed
+before measurement and VMs ran sequentially on an Apple M3 Max host (14 CPU
+cores, 36 GiB RAM). The native baseline compiled the
+same pinned upstream CoreMark POSIX pthread sources with Debian GCC 14.2.0
+and `-O3 -pthread -DMULTITHREAD=4 -DUSE_PTHREAD=1 -DITERATIONS=1`.
+
+Values below are median **aggregate iterations/second**, from three interleaved
+performance samples per worker count. M1/M2/M3 mean one/two/three actual pthread
+workers plus a waiting main thread, not independent processes. VibeOS currently
+has capacity for three workers and the main thread.
+
+| Platform | M1 | M2 | M3 | M3 / M1 |
+| --- | ---: | ---: | ---: | ---: |
+| VibeOS Wasmtime, bounded fuel batching | 2163.97 | 3906.73 | 5698.58 | 2.63× |
+| Debian native C pthread | 9317.84 | 18863.83 | 28183.75 | 3.02× |
+| Debian Wasmtime 48, no fuel | 2667.74 | 5365.68 | 8090.69 | 3.03× |
+| Debian Wasmtime 48, fuel | 2416.28 | 4840.18 | 7303.58 | 3.02× |
+| Native median / VibeOS median | 4.31× | 4.83× | 4.95× | — |
+
+VibeOS's M3 parallel efficiency is **87.8%**. Its M3 throughput is 70.4% of
+Linux Wasmtime without fuel, or 78.0% with fuel. Linux fuel counting reduces
+throughput by about 9–10%, without appreciably reducing scaling. VibeOS workers
+continue in the same fiber at 96.6–96.8% of fuel decisions across all three
+worker counts, confirming that batching is active. The remaining scaling gap
+therefore warrants profiling the concurrent runtime/scheduler/check paths;
+these measurements do not isolate a particular lock or establish a cause.
+
+All **48 measured samples**, including a separate validation-seed run for every
+platform/worker count, passed upstream CRC checks and lasted at least 17.334
+seconds. All **15 VibeOS invocations** (three calibrations plus twelve measured
+runs) exited zero, used the expected number of distinct worker harts, and
+reported `reclaimed=true caps=0 waiters=0`. VibeOS performance ranges were
+1851.09–2218.92 (M1), 3475.00–4297.06 (M2), and 5684.08–6145.87 (M3);
+the medians should not be interpreted as a guarantee for every run.
+
+Comparison limits: Debian Wasmtime uses the standard Linux runtime, OS threads
+and official Preview 1 adapter, with the repository's RISC-V compiler correctness
+fixes. Its compiler target is RV64GC; VibeOS additionally enables the firmware's
+Zba/Zbb/Zbc/Zbs extensions. Debian's fuel mode grants 100 billion per Store but
+does not reproduce VibeOS's asynchronous 10,000-fuel checks, capability checks,
+allocation domains or scheduling. Compilation and upload are outside CoreMark's
+timed region. These are QEMU throughput measurements, not physical hardware or
+certified CoreMark ratings.
+
+Reproduction and native baseline options are documented in
+[`coremark-threads.md`](../benchmarks/wasm-runtime/coremark-threads.md).
+The verified [machine-readable comparison](../benchmarks/wasm-runtime/results/coremark-threads-66a1e6c.json)
+includes revision, executable hashes, ranges and scaling. Full evidence is under
+`target/coremark-threads/current/{vibeos-4h,debian-native-4h,debian-wasmtime-4h,debian-wasmtime-fuel-4h}/`:
+commands, frozen kernel/native ELF/Linux runner, stdout/stderr, boot logs,
+calibration, per-invocation profiles and environment metadata. Build logs and
+toolchain provenance are in the parent directory.
+
+The shared Wasm is 46,489 bytes, SHA-256
+`3a6b9af26c55b962a79c5fd6a3e52f850b39d1ca373178a436379970a013017f`;
+kernel SHA-256 is
+`795483f3936e5308eb01173b38c65c9c379e58aebafa1d4b84d0f6fb36a32930`.
+
 ## Current Wasmtime command result (2026-09-09)
 
 Ordinary CoreMark Wasm was uploaded over authenticated OpenSSH, compiled inside
@@ -53,6 +212,7 @@ compiler scheduling/deadlines and compiler stack-fault supervision are not
 finished. Meeting the CoreMark target does not claim these hardening gates are
 complete. Default limits remain 10 million fuel; only the explicit benchmark
 image grants the larger allowance.
+
 
 ## Earlier interpreter investigation
 
@@ -1258,3 +1418,208 @@ and competing work. At most 31 boundaries continue on the existing fiber; the
 executor poll. Counter records verify that bound. The host `fuel-custom` test
 exhausts identical 1000000 fuel with 99 decisions, reducing 100 polls to 4,
 and verifies dropping a pending call followed by reuse.
+
+### wasi-threads on the native backend (2026-09-09)
+
+The `wasmtime-threads` image admits the wasi-threads contract (imported shared
+bounded `env.memory`, `wasi::thread-spawn`, `wasi_thread_start`, atomics,
+`memory.atomic.wait/notify`) and runs each guest thread as a kernel task pinned
+round-robin to an online hart. The vendored runtime gains
+`runtime-no-std-threads.patch`: `threads` no longer implies `std`, shared
+memories are allocated through the host `MemoryCreator`, atomic waits suspend
+the calling fiber through the executor with copy-only waiter tokens, and the
+`threads` feature is forwarded to `wasmtime-environ`/`wasmtime-cranelift` so
+the atomic builtins keep their trap sentinels (without it the compiler emitted no
+trap check after a wait and a cancelled waiter continued into the next host
+call). Shared guest memory keeps the fixed reservation and grows by appending
+zeroed pages, so threads on other harts never lose a translation. The executor
+gains parallel tracked domains: siblings may live on any hart, and a fault
+quiesces siblings mid-poll elsewhere (they detach without destructors) before
+the arena is reclaimed raw; a poisoned lock spin faults the spinner instead of
+hanging its hart. The command service adds up to three thread slots per job, a
+job-wide output budget and a four-budget aggregate fuel ceiling.
+
+Evidence on the 4-hart QEMU image (`wasi-ssh-upload,wasmtime-command-fuel-batch,
+wasmtime-threads`, generated fixtures uploaded over SSH):
+
+| Fixture | Status | Terminal | Threads / harts |
+| --- | ---: | --- | --- |
+| `threads-atomics` (cmpxchg/xchg/sub-word rmw/fence) | 0 | Exited(0) | 0 |
+| `threads-counter` (3 workers, wait/notify) | 0 | Exited(0) | 3 on `0x7` |
+| `threads-wait-timeout` (wait32/wait64 timeouts) | 0 | Exited(0) | 0 |
+| `threads-exit` (worker `proc_exit(7)`, main parked) | 7 | Exited(7) | 1 |
+| `threads-spawn-cap` (16 spawns, `-EAGAIN` past 3) | 3 | Exited(3) | 3 on `0x7` |
+| `threads-grow` (worker grows, main reads page 2) | 0 | Exited(0) | 1 |
+| `threads-fault` (worker `unreachable`) | 125 | Trapped | 1 |
+| `threads-busy` (3 spinning workers) | 124 | LimitExceeded | 3 |
+| `threads-defined-shared`, `threads-no-start` | 126 | Denied | rejected at admission |
+
+Every terminal printed `reclaimed=true caps=0 waiters=0`, and five repeated
+`threads-counter` runs followed. `harts_used=0x7` records three distinct harts
+polling the three workers of one command. The host `threads-custom` driver
+passes the same fixtures, including cancellation of a fiber suspended inside a
+wait. The kernel selftest adds `WASMTIME THREADS PASS` (two stores on one shared
+memory: atomics, suspended wait, notify, timeout, mismatch, shared growth) and
+`WASMTIME PARALLEL RECOVERY PASS` (16 cycles of a primary fault with three
+siblings on other harts; every cycle collected siblings mid-poll on another
+hart, ran no destructor and reclaimed the arena).
+
+Two selftest checks fail identically on the unmodified base commit and are not
+caused by this work: the streaming-adapter probe still expected errno 27 at the
+output quota after the adapter was changed to unwind the guest (the probe now
+expects the unwind), and `fault/restart heap bump use stabilizes after warmup`
+fails on the one-hart configuration at HEAD. The pthreads C fixture
+(`tests/wasi/threads.c`, `--target=wasm32-wasi-threads`) is wired into
+`build-wasi-examples.sh`, `test-wasi-host.py` and `test-wasi-qemu.py --threads`
+but was not executed here because no wasi-sdk is installed on this host. No
+CoreMark or throughput claim is made for threaded guests.
+
+### pthread CoreMark: fuel batching, discovered ISA, lock-free quantum gate (2026-09-09)
+
+The four-hart `wasi-benchmark,wasmtime-threads` image measured about 44% of
+the Linux Wasmtime control on `M1` (VibeOS 1,389 against Debian 3,153
+iterations/s; see `benchmarks/wasm-runtime/coremark-threads.md`). Three
+changes close most of that gap. Host-time scores on this machine vary by more
+than 10% between samples, so the code-level comparison below uses the new
+deterministic diagnostic instead: `benchmark-coremark-threads.py
+--icount-iterations 2000 --harts 1` runs a fixed 2,000 iterations per worker
+under `-icount shift=0` with single-thread TCG; two runs of one image agree to
+the instruction (892,000 per iteration twice), so differences are code, not
+noise. The virtual seconds are an instruction count, never a throughput score.
+
+| `M1` image (2,000 iterations, one hart, icount) | instructions per iteration |
+| --- | ---: |
+| `wasi-benchmark,wasmtime-threads` (the measured baseline) | 982,500 |
+| + `wasmtime-command-fuel-batch` | 892,000 |
+| + discovered zba/zbb/zbc/zbs code generation | 795,000 |
+| + lock-free continuation probe (final) | 768,500 |
+| (diagnostic only: fuel batch with every boundary check removed) | 832,500 |
+
+1. **Fuel batching** was already available (`wasmtime-command-fuel-batch`) but
+   the threads benchmark image did not select it, so every 10,000 fuel forced a
+   fiber switch and an executor round trip. The benchmark now documents and
+   records the batched image (`--fuel-batch`), and each invocation prints the
+   workers' `thread fuel checks=… continued=…` counters: on `M1` about 95% of
+   the 126,800 boundaries of a 20-second run continue on the fiber.
+2. **Discovered scalar ISA.** The Linux control compiles for plain RV64GC, and
+   VibeOS did too. `wasmtime-command` now selects `wasmtime-discovered-isa`:
+   when the boot DTB advertises zba/zbb/zbc/zbs on every schedulable hart,
+   Cranelift generates code for them. This is 10.9% fewer instructions per
+   iteration on the same module; a target without those extensions keeps
+   receiving GC code.
+3. **Lock-free quantum gate.** The batching callback used to take the per-hart
+   status lock, clone the status Arc, take the global scheduler lock, scan all
+   four ready queues and validate the domain record at every 10,000-fuel
+   boundary, about 790 instructions plus seven atomic operations that the
+   other worker harts contend on. `exec::continuation_probe()` now performs
+   that validation once per executor poll, and `ContinuationProbe::may_continue`
+   repeats the same decision from atomics: the task's cancellation state, a
+   `ReadyHint` occupancy mirror maintained inside every run-queue mutation, and
+   a domain epoch that every reclaimable-domain record transition advances.
+   The probe is armed before each fiber poll and released after it, in `Drop`
+   of the task futures, and in retire/recover. Host tests show it agreeing
+   with `current_task_may_continue()` across ready peers, yields and
+   cancellation; breaking the hint mirror or the hint check turns them red
+   (cancellation alone is also covered by the `Running` state check, so that
+   mutation is not distinguishable, as with the locked gate).
+
+Two pre-existing defects surfaced while validating multi-worker runs, both
+present in the unmodified baseline image:
+
+- **Intermittent `reclaimed=false` after a normal run** (about one in ten
+  `M2`/`M3` runs), after which the command service refused every request with
+  status 75. The allocator's `dealloc` read the block header before taking the
+  heap lock and then validated the arena links from that snapshot; a
+  neighbouring allocation or free on another hart in between (guest threads
+  share one arena) failed those checks and the free silently returned, leaving
+  the block linked and charged. The header is now read under the lock.
+  `core/tests/heap.rs` reproduces the race with two threads on one arena and
+  fails within one run when the old ordering is restored. The kernel now prints
+  what survived an unclean reclamation (size classes, allocating call sites
+  through the benchmark-only `alloc-site-trace` core feature, and the executor's
+  view), which is how the leaked object was identified: the boxed
+  `allocate_memory` future of a worker's shared-memory import.
+- **Hang after a client disconnect** in a threaded run. The reaper only woke
+  parked guest threads on authority loss; on cancellation the pipes closed but a
+  main thread parked in `memory.atomic.wait` for its join was never polled
+  again, and its workers had already stopped at their next fuel boundary. The
+  reaper now wakes every task of the job while it is cancelled, so the parked
+  thread observes the cancellation and the process ends. The disconnect test
+  kills the SSH client three seconds into `M3`/`M2` runs on the benchmark image
+  and requires `terminal=Cancelled reclaimed=true` within 30 seconds followed
+  by a clean run.
+
+- **Retirement racing a still-reclaiming worker** (once in about fifty
+  fixture runs on the ordinary-limit image, seen after `threads-counter`). When
+  main returns, `execute` calls `end` and awaits `join_threads`; that join can
+  pend, and at the next poll boundary the guest's own `end` makes `stopped`
+  drop the whole future, as it must for a main thread parked in a wait after a
+  worker's `proc_exit`. `join_threads` had taken the thread handles out of
+  their SYSTEM slots, so they vanished with the dropped future and the
+  reaper's `reap_threads` had nothing left to join: it retired the job while a
+  worker was still being reclaimed on another hart, and the arena check saw
+  the worker's entire runtime graph (291 allocations in the observed case).
+  `join_threads` now clones a slot's handle and clears the slot only after that
+  thread is joined, so whichever of the two paths runs last still waits.
+
+Current formal measurements are in the first section of this document.
+
+Host wall-clock effect of the three changes, measured as an interleaved
+`M1` A/B in one host window (fuel batch, ISA, final, repeated three times;
+each run is one 15-second performance sample plus its validation sample,
+`--workers 1 --samples 1 --seconds 15`; host load fell from 8 to 5 during it):
+
+| image | samples (iterations/s) | about |
+| --- | --- | ---: |
+| fuel batch only | 2403, 2354, 2310, 2384 | 2,360 |
+| fuel batch + discovered ISA | 2419, 2607, 2157, 2427, 2349, 2549 | 2,420 |
+| final (+ lock-free gate, fixes) | 2973, 2967, 2846, 2926, 2925, 2934 | 2,930 |
+
+The ISA step is worth more in instructions than in host time under TCG, while
+the lock-free gate is worth more in host time than its instruction count: the
+seven atomic operations it removes per boundary are contended across the
+worker harts under multi-threaded TCG. Absolute numbers on this host move by
+more than 10% with load; only the interleaving makes the comparison usable.
+
+Formal four-hart results with the retained harness (three 20-second samples
+per worker count, validation seeds as a fourth sample, Debian control run
+immediately afterwards in the same host window):
+
+| Workers | VibeOS before (2026-09-09, `vibeos-4h-r4`) | VibeOS after (`vibeos-4h-fuel-batch-isa-probe`) | Debian control, same window (`debian-std-4h-r4`) | after / control |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1,389 | **2,611** (2,540–2,784) | 3,453 (3,361–3,470) | 76% |
+| 2 | 2,271 | **5,088** (4,681–5,111) | 6,136 (6,098–6,369) | 83% |
+| 3 | 3,262 | **6,581** (6,273–7,164) | 8,601 (8,237–8,637) | 77% |
+
+Medians of three 20-second performance samples, iterations/second aggregate
+over all workers; every sample passed upstream CRC validation and the fourth
+(validation-seed) sample also passed. Against the Debian medians of the
+original comparison (3,153 / 5,880 / 8,031, measured earlier the same day),
+the new image reaches 83% / 87% / 82%. The Debian control measured 40 minutes
+earlier in the same session (`debian-std-4h-r3-early`) gave 3,260 / 5,902 /
+8,122. Host load on this machine moves both platforms by more than 10%
+between windows, so only pairs measured back to back should be compared.
+
+Evidence: `target/coremark-threads/vibeos-4h-fuel-batch-isa-probe/`,
+`debian-std-4h-r4/`, `debian-std-4h-r3-early/` and
+`comparison-fuel-batch-isa-probe.json`; the earlier
+`vibeos-4h-r4`/`debian-std-4h-r2` sets are the original comparison. The
+benchmark script now lengthens its calibration until it lasts three seconds
+(a 1,000-iteration calibration under-estimated the batched image's `M3`
+throughput enough for a measured run to fall below CoreMark's ten-second
+minimum), records `--fuel-batch` and the per-thread batching counters, and
+offers the icount diagnostic mode; `summarize-coremark-threads.py` counts
+calibration attempts from the evidence directory.
+
+Validation of the final tree: 19 core host suites (including the new run-queue
+hint, continuation-probe and concurrent-free tests) and the WASI runtime and
+command suites pass; the default IMAC firmware still builds; on the four-hart
+benchmark image 30 consecutive `M3` runs reclaimed cleanly (the unfixed tree
+failed about one in eight), six mid-run disconnects ended `Cancelled` with a
+clean lifecycle and a clean follow-up run, and the single-hart icount
+diagnostic reads 768,500 instructions per iteration; on the ordinary-limit
+acceptance image `scripts/test-wasi-threads-fixtures.py` passed all 57 cases
+with 61 clean lifecycles (the unmodified tree failed it at case 18 with an
+unclean reclamation). Neither script needs wasi-sdk; the pthreads fixture is
+the retained `target/coremark-threads/threads.wasm`.
+

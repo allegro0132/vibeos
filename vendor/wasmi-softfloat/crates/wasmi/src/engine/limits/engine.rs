@@ -194,6 +194,12 @@ pub struct AvgBytesPerFunctionLimit {
 }
 
 impl EnforcedLimits {
+    /// Override the function ceiling to match a validated embedding profile.
+    pub fn with_max_functions(mut self, maximum: u32) -> Self {
+        self.max_functions = Some(maximum);
+        self
+    }
+
     /// A strict set of limits that makes use of Wasmi implementation details.
     ///
     /// This set of strict enforced rules can be used by Wasmi users in order

@@ -465,7 +465,7 @@ impl Memory {
     }
 
     /// Implementation of `memory.atomic.notify` for all memories.
-    #[cfg(feature = "threads")]
+    #[cfg(all(feature = "threads", not(has_custom_threads)))]
     pub fn atomic_notify(&mut self, addr: u64, count: u32) -> Result<u32, Trap> {
         match self.as_shared_memory() {
             Some(m) => m.atomic_notify(addr, count),
@@ -476,8 +476,26 @@ impl Memory {
         }
     }
 
+    /// Implementation of `memory.atomic.notify` for all memories, waking
+    /// suspended guest threads through the embedder's hooks.
+    #[cfg(has_custom_threads)]
+    pub fn atomic_notify(
+        &mut self,
+        addr: u64,
+        count: u32,
+        hooks: Option<&dyn crate::runtime::vm::threads::ThreadHooks>,
+    ) -> Result<u32, Trap> {
+        match self.as_shared_memory() {
+            Some(m) => m.atomic_notify(addr, count, hooks),
+            None => {
+                validate_atomic_addr(&self.vmmemory(), addr, 4, 4)?;
+                Ok(0)
+            }
+        }
+    }
+
     /// Implementation of `memory.atomic.wait32` for all memories.
-    #[cfg(feature = "threads")]
+    #[cfg(all(feature = "threads", not(has_custom_threads)))]
     pub fn atomic_wait32(
         &mut self,
         addr: u64,
@@ -494,7 +512,7 @@ impl Memory {
     }
 
     /// Implementation of `memory.atomic.wait64` for all memories.
-    #[cfg(feature = "threads")]
+    #[cfg(all(feature = "threads", not(has_custom_threads)))]
     pub fn atomic_wait64(
         &mut self,
         addr: u64,
@@ -507,6 +525,15 @@ impl Memory {
                 validate_atomic_addr(&self.vmmemory(), addr, 8, 8)?;
                 Err(Trap::AtomicWaitNonSharedMemory)
             }
+        }
+    }
+
+    /// Validate a wait address on a non-shared memory: the wait itself traps.
+    #[cfg(has_custom_threads)]
+    pub fn atomic_wait_unshared(&self, addr: u64, size: u64) -> Trap {
+        match validate_atomic_addr(&self.vmmemory(), addr, size, size) {
+            Ok(_) => Trap::AtomicWaitNonSharedMemory,
+            Err(trap) => trap,
         }
     }
 

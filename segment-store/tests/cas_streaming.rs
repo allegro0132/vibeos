@@ -60,6 +60,7 @@ enum Effect {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FaultAction {
     Normal,
+    CorruptWriteAndAcknowledge,
     FailNotSubmitted,
     FailAmbiguous(Effect),
     Pending(Effect),
@@ -199,16 +200,26 @@ impl FaultDevice {
         file.flush().expect("raw image flush must succeed");
     }
 
+    /// Flip one byte `byte_offset` past the first occurrence of `prefix`.
+    /// The canonical split starts content and tree on page boundaries; the
+    /// compact layout places them at 32-byte aligned offsets after the
+    /// 128-byte header, so search every aligned offset of every page.
     fn flip_durable_page_with_prefix(&self, prefix: &[u8], byte_offset: usize) {
         let mut media = self.0.lock().unwrap();
-        let page_no = media
+        let (page_no, at) = media
             .durable
             .iter()
-            .find(|(_, page)| page.starts_with(prefix))
-            .map(|(page_no, _)| *page_no)
+            .find_map(|(page_no, page)| {
+                (0..PAGE_SIZE)
+                    .step_by(32)
+                    .find(|offset| page[*offset..].starts_with(prefix))
+                    .map(|offset| (*page_no, offset))
+            })
             .expect("expected canonical Blob page was not found");
-        let page = media.durable.get_mut(&page_no).unwrap();
-        page[byte_offset] ^= 0x80;
+        let target = at + byte_offset;
+        let (page_no, target) = (page_no + (target / PAGE_SIZE) as u64, target % PAGE_SIZE);
+        let page = media.durable.get_mut(&page_no).expect("target page is durable");
+        page[target] ^= 0x80;
         let page = *page;
         media.visible.insert(page_no, page);
     }
@@ -256,6 +267,12 @@ impl PageDevice for FaultDevice {
                 self.write_effect(page, bytes, Effect::Visible);
                 Ok(())
             }
+            FaultAction::CorruptWriteAndAcknowledge => {
+                let mut damaged = bytes;
+                damaged[7] ^= 1;
+                self.write_effect(page, damaged, Effect::Visible);
+                Ok(())
+            }
             FaultAction::FailNotSubmitted => {
                 Err(MutationFailure::not_submitted(TestError::Injected))
             }
@@ -272,7 +289,7 @@ impl PageDevice for FaultDevice {
 
     async fn flush(&self) -> Result<(), MutationFailure<Self::Error>> {
         match self.next_action() {
-            FaultAction::Normal => {
+            FaultAction::Normal | FaultAction::CorruptWriteAndAcknowledge => {
                 self.flush_effect(Effect::Durable);
                 Ok(())
             }
@@ -616,6 +633,53 @@ fn empty_blob_is_canonical_across_commit_and_cold_mount() {
 }
 
 #[test]
+fn directed_tail_read_reuses_content_page_for_its_proof() {
+    let exact_len = (PAGE_SIZE * 2) as u64;
+    let device = FaultDevice::blank(12);
+    let mut store = format(device.clone());
+    let object = put_stream(&mut store, exact_len);
+    let runtime = store.runtime_context();
+    drop(store);
+    device.power_cycle();
+    let (cold, _) = mount_with_runtime(device.clone(), runtime);
+    let header_page = device
+        .durable_image()
+        .iter()
+        .find_map(|(number, page)| page.starts_with(b"VIBEBLB\0").then_some(*number))
+        .expect("compact Blob header must be on media");
+    device.reset_reads();
+    let chunk = block_on(cold.get_blob_chunk(&object, 1)).unwrap();
+    assert_eq!(chunk.bytes, pattern_chunk(1, PAGE_SIZE));
+    vibeos_blob_format::verify_proof(chunk.descriptor, &chunk.bytes, &chunk.proof).unwrap();
+    let tail_reads = device
+        .0
+        .lock()
+        .unwrap()
+        .read_pages
+        .get(&(header_page + 2))
+        .copied()
+        .unwrap_or(0);
+    println!(
+        "directed tail: {} total page reads, {tail_reads} tail-page reads",
+        device.read_count()
+    );
+    assert_eq!(
+        tail_reads, 1,
+        "proof reread the content window's final page"
+    );
+    device.reset_reads();
+    let first = block_on(cold.get_blob_chunk(&object, 0)).unwrap();
+    assert_eq!(first.bytes, pattern_chunk(0, PAGE_SIZE));
+    let header_reads = device.0.lock().unwrap().read_pages.get(&header_page).copied().unwrap_or(0);
+    assert_eq!(header_reads, 1, "content reread the validated header page");
+    // Reuse lasts only for this invocation; a later damaged proof must fail.
+    let encoded = vibeos_blob_format::encode_blob(OBJECT_KIND, &content(exact_len)).unwrap();
+    let tree = &encoded[vibeos_blob_format::HEADER_SIZE + exact_len as usize..];
+    device.flip_durable_page_with_prefix(tree, 0);
+    assert!(block_on(cold.get_blob_chunk(&object, 1)).is_err());
+}
+
+#[test]
 fn corrupted_content_and_required_proof_bytes_fail_closed() {
     let exact_len = (PAGE_SIZE * 2) as u64;
     let device = FaultDevice::blank(12);
@@ -656,6 +720,38 @@ fn corrupted_content_and_required_proof_bytes_fail_closed() {
         block_on(tree_store.verify_blob(&object)).is_err(),
         "whole verification must detect serialized-tree corruption"
     );
+}
+
+#[test]
+fn read_windows_do_not_hide_corruption_between_invocations() {
+    let device = FaultDevice::blank(16);
+    let mut store = format(device.clone());
+    let object = put_stream(&mut store, 1024 * 1024 + 4097);
+    block_on(store.verify_blob(&object)).unwrap();
+    block_on(store.get_blob_chunk(&object, 0)).unwrap();
+
+    // Keep the mounted store and authority intact: only the payload changes.
+    // A window accidentally retained across calls would hide this damage.
+    let first = pattern_chunk(0, PAGE_SIZE);
+    device.flip_durable_page_with_prefix(&first[..64], 7);
+    assert!(block_on(store.get_blob_chunk(&object, 0)).is_err());
+    assert!(block_on(store.verify_blob(&object)).is_err());
+}
+
+#[test]
+fn first_dedup_comparison_rejects_corruption_at_batch_edges_and_short_tail() {
+    let exact_len = 1024 * 1024 + 37;
+    for page_index in [0, 7, 8, 255, 256] {
+        let device = FaultDevice::blank(20);
+        let mut store = format(device.clone());
+        let _first = put_stream(&mut store, exact_len);
+        let prefix = pattern_chunk(0, 64);
+        device.flip_durable_page_with_prefix(&prefix, page_index * PAGE_SIZE + 7);
+        let mut writer = store.begin_blob(OBJECT_KIND, exact_len, None).unwrap();
+        stream_into_writer(&mut writer, exact_len);
+        assert!(block_on(writer.commit()).is_err(),
+            "first dedup must reject changed page {page_index}");
+    }
 }
 
 #[test]
@@ -868,5 +964,83 @@ fn every_commit_mutation_boundary_recovers_the_old_or_exact_new_cas_checkpoint()
                 &format!("commit mutation {boundary}, cancelled with {effect:?}"),
             );
         }
+    }
+}
+
+
+#[test]
+fn streaming_run_partial_failure_or_cancellation_never_publishes() {
+    // PageDevice's default batched writer exposes every page boundary,
+    // including a durable prefix followed by a failed/cancelled page.
+    for boundary in 0..32 {
+        for action in [
+            FaultAction::FailNotSubmitted,
+            FaultAction::FailAmbiguous(Effect::Durable),
+            FaultAction::Pending(Effect::Durable),
+        ] {
+            let device = FaultDevice::blank(12);
+            let mut store = format(device.clone());
+            let initial = store.info().unwrap();
+            let mut writer = store
+                .begin_blob(OBJECT_KIND, 1024 * 1024 + 1, None)
+                .unwrap();
+            for index in 0..31 {
+                block_on(writer.write_chunk(&pattern_chunk(index, PAGE_SIZE))).unwrap();
+            }
+            device.arm(boundary, action);
+            let chunk = pattern_chunk(31, PAGE_SIZE);
+            let mut write = Box::pin(writer.write_chunk(&chunk));
+            match action {
+                FaultAction::Pending(_) => assert!(poll_once(write.as_mut()).is_pending()),
+                _ => assert!(block_on(write.as_mut()).is_err()),
+            }
+            drop(write);
+            assert!(matches!(
+                block_on(writer.write_chunk(&chunk)),
+                Err(CasStoreError::WriterFailed)
+            ));
+            drop(writer);
+            assert_eq!(store.info(), Err(StoreError::RecoveryRequired));
+            device.power_cycle();
+            let (_cold, recovered) = mount(device);
+            assert_eq!(recovered.generation, initial.generation);
+            assert_eq!(recovered.object_count, 0);
+        }
+    }
+}
+
+
+#[test]
+fn deferred_readback_never_serves_an_acknowledged_damaged_write() {
+    for deferred in [false, true] {
+        let device = FaultDevice::blank(16);
+        let mut store = format(device.clone());
+        store.set_deferred_commit_readback(deferred);
+        let length = 1024 * 1024 + 1;
+        let mut writer = store.begin_blob(OBJECT_KIND, length, None).unwrap();
+        for index in 0..31 {
+            block_on(writer.write_chunk(&pattern_chunk(index, PAGE_SIZE))).unwrap();
+        }
+        // Damage the first content page of the next submitted run while
+        // acknowledging success; subsequent barriers make that damage durable.
+        device.arm(0, FaultAction::CorruptWriteAndAcknowledge);
+        for index in 31..length.div_ceil(PAGE_SIZE as u64) {
+            let count = (length - index * PAGE_SIZE as u64).min(PAGE_SIZE as u64) as usize;
+            block_on(writer.write_chunk(&pattern_chunk(index as u32, count))).unwrap();
+        }
+        let result = block_on(writer.commit());
+        if !deferred {
+            assert!(result.is_err(), "strict commit must detect damaged media");
+            continue;
+        }
+        let object = result.expect("deferred policy does not reread committed content");
+        assert!(block_on(store.get_blob_chunk(&object, 0)).is_err());
+        assert!(block_on(store.verify_blob(&object)).is_err());
+        let runtime = store.runtime_context();
+        drop(store);
+        device.power_cycle();
+        let (cold, _) = mount_with_runtime(device, runtime);
+        assert!(block_on(cold.get_blob_chunk(&object, 0)).is_err());
+        assert!(block_on(cold.verify_blob(&object)).is_err());
     }
 }

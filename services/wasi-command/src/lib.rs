@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use vibeos_core::sync::SpinLock;
 use vibeos_file_store::{FileTreeRoot, FileType, RelPath};
 use vibeos_wasi_runtime::{WasiIo, WasiIoError, WasiTerminal, IO_CHUNK};
+use vibeos_wasi_runtime::profile::MODULE_BYTES;
 
 const DEPTH: usize = 8;
 struct PipeState {
@@ -21,8 +22,46 @@ struct PipeState {
     count: usize,
     offset: usize,
     closed: bool,
-    reader: Option<Waker>,
-    writer: Option<Waker>,
+    readers: Waiters,
+    writers: Waiters,
+}
+/// Pollers parked on one end of a pipe. A wasi-threads guest writes one
+/// stdout/stderr pipe from every thread's store on several harts, so a single
+/// waker slot would silently forget the earlier writer and leave that thread
+/// suspended forever. One slot per guest thread plus the main thread.
+const MAX_WAITERS: usize = 4;
+struct Waiters([Option<Waker>; MAX_WAITERS]);
+impl Waiters {
+    const fn new() -> Self {
+        Self([const { None }; MAX_WAITERS])
+    }
+    /// Park `waker`. Re-registration by the same poller replaces its entry.
+    /// A full table evicts the oldest entry, which the caller must wake so
+    /// that poller re-polls and re-registers instead of sleeping forever.
+    fn register(&mut self, waker: &Waker) -> Option<Waker> {
+        if self.0.iter().flatten().any(|parked| parked.will_wake(waker)) {
+            return None;
+        }
+        if let Some(slot) = self.0.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(waker.clone());
+            return None;
+        }
+        let evicted = self.0[0].take();
+        self.0.rotate_left(1);
+        self.0[MAX_WAITERS - 1] = Some(waker.clone());
+        evicted
+    }
+    fn take_all(&mut self) -> [Option<Waker>; MAX_WAITERS] {
+        core::mem::replace(&mut self.0, [const { None }; MAX_WAITERS])
+    }
+    fn len(&self) -> usize {
+        self.0.iter().flatten().count()
+    }
+}
+fn wake_all(wakers: [Option<Waker>; MAX_WAITERS]) {
+    for waker in wakers.into_iter().flatten() {
+        waker.wake();
+    }
 }
 pub struct Pipe(SpinLock<PipeState>);
 impl Pipe {
@@ -34,8 +73,8 @@ impl Pipe {
             count: 0,
             offset: 0,
             closed: false,
-            reader: None,
-            writer: None,
+            readers: Waiters::new(),
+            writers: Waiters::new(),
         }))
     }
     pub fn read(&self, cx: &mut Context<'_>, out: &mut [u8]) -> Poll<Result<usize, WasiIoError>> {
@@ -47,7 +86,11 @@ impl Pipe {
             if s.closed {
                 return Poll::Ready(Ok(0));
             }
-            s.reader = Some(cx.waker().clone());
+            let evicted = s.readers.register(cx.waker());
+            drop(s);
+            if let Some(w) = evicted {
+                w.wake();
+            }
             return Poll::Pending;
         }
         let n = out.len().min(s.sizes[s.head] - s.offset);
@@ -58,11 +101,9 @@ impl Pipe {
             s.count -= 1;
             s.offset = 0;
         }
-        let wake = s.writer.take();
+        let wake = s.writers.take_all();
         drop(s);
-        if let Some(w) = wake {
-            w.wake();
-        }
+        wake_all(wake);
         Poll::Ready(Ok(n))
     }
     pub fn write(&self, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<Result<usize, WasiIoError>> {
@@ -74,7 +115,11 @@ impl Pipe {
             return Poll::Ready(Err(WasiIoError::Closed));
         }
         if s.count == DEPTH {
-            s.writer = Some(cx.waker().clone());
+            let evicted = s.writers.register(cx.waker());
+            drop(s);
+            if let Some(w) = evicted {
+                w.wake();
+            }
             return Poll::Pending;
         }
         let n = bytes.len().min(IO_CHUNK);
@@ -82,25 +127,19 @@ impl Pipe {
         s.data[tail][..n].copy_from_slice(&bytes[..n]);
         s.sizes[tail] = n;
         s.count += 1;
-        let wake = s.reader.take();
+        let wake = s.readers.take_all();
         drop(s);
-        if let Some(w) = wake {
-            w.wake();
-        }
+        wake_all(wake);
         Poll::Ready(Ok(n))
     }
     pub fn close(&self) {
         let mut s = self.0.lock();
         s.closed = true;
-        let r = s.reader.take();
-        let w = s.writer.take();
+        let readers = s.readers.take_all();
+        let writers = s.writers.take_all();
         drop(s);
-        if let Some(w) = r {
-            w.wake();
-        }
-        if let Some(w) = w {
-            w.wake();
-        }
+        wake_all(readers);
+        wake_all(writers);
     }
     pub fn drained(&self) -> bool {
         let s = self.0.lock();
@@ -108,7 +147,7 @@ impl Pipe {
     }
     fn pending_waiters(&self) -> usize {
         let s = self.0.lock();
-        usize::from(s.reader.is_some()) + usize::from(s.writer.is_some())
+        s.readers.len() + s.writers.len()
     }
 }
 pub struct CommandIo {
@@ -251,24 +290,30 @@ pub fn digest(text: &str) -> Result<[u8; 32], u32> {
 /// its immutable content while uploads can publish a later namespace version.
 pub async fn load(root: &FileTreeRoot, path: &RelPath) -> Result<Vec<u8>, u32> {
     let (meta, reader) = root.regular_reader(path).map_err(|_| 126u32)?;
-    if meta.file_type != FileType::Regular || meta.size > 512 * 1024 {
+    if meta.file_type != FileType::Regular || meta.size > MODULE_BYTES as u64 {
         return Err(126);
     }
-    load_reader(reader).await
+    load_reader(reader, meta.size).await
 }
-pub async fn load_reader(reader: vibeos_file_store::FsFileReader) -> Result<Vec<u8>, u32> {
+pub async fn load_reader(reader: vibeos_file_store::FsFileReader, size: u64) -> Result<Vec<u8>, u32> {
+    let size = usize::try_from(size).map_err(|_| 126u32)?;
+    if size > MODULE_BYTES { return Err(126); }
     let mut bytes = Vec::new();
+    // Allocate once from the pinned metadata. Growth would temporarily retain
+    // both large buffers, and SYSTEM allocation failure is not guest-recoverable.
+    bytes.try_reserve_exact(size).map_err(|_| 124u32)?;
     for i in 0..reader.chunk_count() {
         let chunk = reader
             .read_chunk(i)
             .await
             .map_err(|_| 125u32)?
             .ok_or(125u32)?;
-        if bytes.len() + chunk.len() > 512 * 1024 {
+        if chunk.len() > size.saturating_sub(bytes.len()) {
             return Err(126);
         }
         bytes.extend_from_slice(&chunk);
     }
+    if bytes.len() != size { return Err(125); }
     Ok(bytes)
 }
 pub async fn upload(
@@ -278,7 +323,7 @@ pub async fn upload(
     expected: [u8; 32],
     io: &CommandIo,
 ) -> Result<(), u32> {
-    if length > 512 * 1024 || length == 0 {
+    if length > MODULE_BYTES || length == 0 {
         return Err(2);
     }
     let path = upload_path(name)?;
@@ -427,7 +472,7 @@ pub fn parse_request(source: &str) -> Option<Request> {
         }),
         "wasm-upload" if words.len() == 4 => {
             let length = words[2].parse::<usize>().ok()?;
-            if length == 0 || length > 512 * 1024 {
+            if length == 0 || length > MODULE_BYTES {
                 return None;
             }
             Some(Request::Upload {
@@ -497,6 +542,58 @@ mod tests {
         }
         assert_eq!(io.stdin.read(&mut cx, &mut buf), Poll::Ready(Ok(0)));
     }
+    struct CountingWake(core::sync::atomic::AtomicUsize);
+    impl alloc::task::Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn counting_waker() -> (Arc<CountingWake>, Waker) {
+        let count = Arc::new(CountingWake(core::sync::atomic::AtomicUsize::new(0)));
+        (count.clone(), Waker::from(count))
+    }
+    /// Several guest threads block on one full stdout pipe; draining it must
+    /// wake every one of them, not only the last to register.
+    #[test]
+    fn pipe_wakes_every_parked_writer_and_reader() {
+        let io = CommandIo::new();
+        let mut noop = Context::from_waker(Waker::noop());
+        for _ in 0..DEPTH {
+            assert_eq!(io.stdout.write(&mut noop, b"full"), Poll::Ready(Ok(4)));
+        }
+        let (a, wa) = counting_waker();
+        let (b, wb) = counting_waker();
+        assert_eq!(io.stdout.write(&mut Context::from_waker(&wa), b"x"), Poll::Pending);
+        assert_eq!(io.stdout.write(&mut Context::from_waker(&wb), b"y"), Poll::Pending);
+        // The same poller re-registering keeps one entry.
+        assert_eq!(io.stdout.write(&mut Context::from_waker(&wa), b"x"), Poll::Pending);
+        assert_eq!(io.stdout.pending_waiters(), 2);
+        let mut buf = [0; 4];
+        assert_eq!(io.stdout.read(&mut noop, &mut buf), Poll::Ready(Ok(4)));
+        assert_eq!(a.0.load(Ordering::SeqCst), 1);
+        assert_eq!(b.0.load(Ordering::SeqCst), 1);
+        assert_eq!(io.stdout.pending_waiters(), 0);
+        // More pollers than slots: the oldest is woken so it re-polls.
+        let wakers: Vec<_> = (0..MAX_WAITERS + 1).map(|_| counting_waker()).collect();
+        for _ in 0..DEPTH {
+            let _ = io.stdout.write(&mut noop, b"full");
+        }
+        for (_, waker) in &wakers {
+            assert_eq!(io.stdout.write(&mut Context::from_waker(waker), b"z"), Poll::Pending);
+        }
+        assert_eq!(wakers[0].0 .0.load(Ordering::SeqCst), 1, "evicted poller must be woken");
+        assert_eq!(io.stdout.pending_waiters(), MAX_WAITERS);
+        io.stdout.close();
+        assert!(wakers[1..].iter().all(|(count, _)| count.0.load(Ordering::SeqCst) == 1));
+        // Readers parked on an empty pipe are all woken by one write.
+        let empty = CommandIo::new();
+        let (r1, wr1) = counting_waker();
+        let (r2, wr2) = counting_waker();
+        assert_eq!(empty.stdin.read(&mut Context::from_waker(&wr1), &mut buf), Poll::Pending);
+        assert_eq!(empty.stdin.read(&mut Context::from_waker(&wr2), &mut buf), Poll::Pending);
+        assert_eq!(empty.stdin.write(&mut noop, b"go"), Poll::Ready(Ok(2)));
+        assert_eq!((r1.0.load(Ordering::SeqCst), r2.0.load(Ordering::SeqCst)), (1, 1));
+    }
     #[test]
     fn first_cancellation_reason_survives_teardown_revocation() {
         let cancelled = CommandIo::new();
@@ -509,6 +606,22 @@ mod tests {
         assert!(denied.denied());
         denied.complete(WasiTerminal::Denied);
         assert_eq!(denied.pending_waiters(), 0);
+    }
+
+    #[test]
+    fn loader_uses_exact_snapshot_length_and_rejects_mismatch() {
+        let root = FileTreeRoot::new_empty(124).unwrap();
+        let path = RelPath::parse("chunks.wasm").unwrap();
+        let mut tx = root.begin().unwrap();
+        tx.write_chunks(&path, [b"abc", b"def", b"ghi"], false).unwrap();
+        tx.commit().unwrap();
+        for (size, expected) in [(9, Ok(b"abcdefghi".to_vec())), (8, Err(126)), (10, Err(125))] {
+            let (_, reader) = root.regular_reader(&path).unwrap();
+            let mut future = core::pin::pin!(load_reader(reader, size));
+            let Poll::Ready(result) = future.as_mut().poll(&mut Context::from_waker(Waker::noop())) else { panic!("volatile reader must be ready") };
+            if let Ok(bytes) = &result { assert_eq!(bytes.capacity(), size as usize); }
+            assert_eq!(result, expected);
+        }
     }
 
     #[test]

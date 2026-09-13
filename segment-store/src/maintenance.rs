@@ -21,7 +21,7 @@ use crate::allocation_v2::{
 };
 use crate::device::GrowablePageDevice;
 use crate::gc::{GcError, GcStoreError, SegmentBuilder};
-use crate::store::{read_pointer_payload, write_checkpoint, SegmentStore, StoreError, StoreInfo};
+use crate::store::{read_pointer_payload, write_checkpoint, CheckpointTransitionWitness, SegmentStore, StoreError, StoreInfo};
 
 const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 
@@ -339,6 +339,9 @@ impl<D: GrowablePageDevice> SegmentStore<D> {
         let _maintenance_lease = self
             .acquire_maintenance(maintenance, MaintenanceOperation::Grow)
             .ok_or(GrowError::Unauthorized)?;
+        // A failed or cancelled growth must not retain predecessor provenance.
+        #[cfg(feature = "experimental-authority-delta")]
+        let experimental_cached = self.experimental_authority_base.take();
         let state = self.require_current_generation()?;
         if !state.allocation.retired_segments().is_empty() {
             return Err(GrowError::GcPending);
@@ -512,7 +515,7 @@ impl<D: GrowablePageDevice> SegmentStore<D> {
                 &allocation_bytes,
             )
             .await?;
-        builder.finish(&self.device).await?;
+        let last_segment = builder.finish(&self.device).await?;
         let staged = read_pointer_payload(
             &self.device,
             state.superblock.binding.store_uuid,
@@ -554,9 +557,35 @@ impl<D: GrowablePageDevice> SegmentStore<D> {
         };
         write_checkpoint(&self.device, &checkpoint, true).await?;
         drop(allocation_bytes);
-        drop(allocation);
-        drop(state);
-        self.mount().await.map_err(GrowError::Store)
+        let mut successor = state;
+        let previous = CheckpointTransitionWitness::replace_growth_allocation(&mut successor, allocation);
+        successor.last_segment_previous = Some(successor.last_segment.unwrap_or((ANCHOR_SEGMENT_NO, 0, [0; 32])));
+        successor.last_segment = Some(last_segment);
+        successor.last_segment_target_checkpoint_generation = generation;
+        successor.generation = generation;
+        successor.admitted_segments = enlarged_segments;
+        successor.next_segment_generation = next_segment_generation;
+        successor.next_object_id = successor.next_object_id.max(u128::from(generation));
+        successor.next_physical_segment = (0..enlarged_segments)
+            .find(|segment| matches!(successor.allocation.segment_state(*segment),
+                Some(crate::allocation_v2::SegmentAllocation::Free)))
+            .unwrap_or(enlarged_segments);
+        successor.allocation_root = allocation_root;
+        successor.allocation_version = 2;
+        successor.durably_cleared_seals.remove(&carrier);
+        successor.recovery_peak_bytes = successor.resident_heap_bytes()
+            .ok_or(GrowError::ArithmeticOverflow)?;
+        let info = self.mount_verified_successor_witness(previous, checkpoint, successor, true, operation_peak)
+            .await.map_err(GrowError::Store)?;
+        #[cfg(feature = "experimental-authority-delta")]
+        if let Some(cached) = experimental_cached {
+            let state = self.require_current_generation()?;
+            let witness = state.resident_heap_bytes()
+                .and_then(|resident| self.limits.recovery_memory_bytes.checked_sub(resident))
+                .and_then(|budget| cached.after_verified_growth(state, budget));
+            self.experimental_authority_base = witness;
+        }
+        Ok(info)
     }
 }
 

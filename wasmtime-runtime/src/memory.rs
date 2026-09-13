@@ -11,9 +11,13 @@ struct BoundedMemory {
     layout: Layout,
     size: usize,
     maximum: usize,
+    /// Shared memories are allocated at their maximum and never relocate, so
+    /// every guest thread keeps the same base.
+    fixed: bool,
 }
 // Ownership remains with one Wasmtime memory. Access through its raw pointer is
-// governed by Wasmtime's store borrowing rules; shared memories are rejected.
+// governed by Wasmtime's store borrowing rules; a shared memory is guarded by
+// Wasmtime's shared-memory lock and never moves.
 unsafe impl Send for BoundedMemory {}
 unsafe impl Sync for BoundedMemory {}
 unsafe impl LinearMemory for BoundedMemory {
@@ -25,6 +29,9 @@ unsafe impl LinearMemory for BoundedMemory {
             return Err(wasmtime::Error::msg("linear memory growth exceeds its bound"));
         }
         if new_size > self.layout.size() {
+            if self.fixed {
+                return Err(wasmtime::Error::msg("shared linear memory cannot relocate"));
+            }
             let capacity = new_size.next_power_of_two().min(MEMORY_LIMIT);
             let layout = Layout::from_size_align(capacity, PAGE).unwrap();
             let Some(base) = NonNull::new(unsafe { alloc_zeroed(layout) }) else {
@@ -50,14 +57,19 @@ impl Drop for BoundedMemory {
 unsafe impl MemoryCreator for BoundedMemoryCreator {
     fn new_memory(&self, ty: MemoryType, minimum: usize, maximum: Option<usize>,
         reservation: Option<usize>, guard: usize) -> Result<Box<dyn LinearMemory>, String> {
-        if ty.is_shared() || ty.is_64() || guard != 0 || minimum > MEMORY_LIMIT || minimum % PAGE != 0 {
+        if ty.is_64() || guard != 0 || minimum > MEMORY_LIMIT || minimum % PAGE != 0 {
             return Err(String::from("unsupported linear memory configuration"));
+        }
+        if ty.is_shared() && maximum.is_none() {
+            return Err(String::from("shared linear memory requires a maximum"));
         }
         let maximum = maximum.unwrap_or(MEMORY_LIMIT).min(MEMORY_LIMIT);
         // A zero reservation is Wasmtime's movable-memory configuration. A
         // small amount of initial capacity avoids relocating the first growth.
+        // A shared memory is committed at its maximum so its base never moves.
         let capacity = match reservation {
             Some(size) if size != 0 => size,
+            _ if ty.is_shared() => maximum.max(PAGE),
             _ => minimum.max(PAGE).next_power_of_two().saturating_mul(2).min(MEMORY_LIMIT),
         };
         if minimum > maximum || minimum > capacity || capacity > MEMORY_LIMIT || capacity % PAGE != 0
@@ -66,6 +78,6 @@ unsafe impl MemoryCreator for BoundedMemoryCreator {
         }
         let layout = Layout::from_size_align(capacity, PAGE).map_err(|_| String::from("invalid linear memory layout"))?;
         let base = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or_else(|| String::from("linear memory allocation failed"))?;
-        Ok(Box::new(BoundedMemory { base, layout, size: minimum, maximum }))
+        Ok(Box::new(BoundedMemory { base, layout, size: minimum, maximum, fixed: ty.is_shared() }))
     }
 }

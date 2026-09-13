@@ -1,6 +1,22 @@
 # Debian RISC-V engine controls
 
-This isolated workspace builds two Linux runners. `wasmi` includes the repository's
+The `compiled-threads` feature also builds `wasmtime-threads`, a trusted
+CoreMark-only control using standard Wasmtime 48, official WASI Preview 1 and
+Linux OS threads (one Store per worker with shared memory). It accepts
+`[--fuel] MODULE [args...]`; `--fuel` grants 100 billion fuel to every Store,
+without asynchronous yields. The runtime graph is joined and released before
+successful return. This is not an untrusted WASI threads service: process-wide
+worker exit/cancellation policies beyond CoreMark's join-before-exit pattern
+are outside its scope.
+
+The compiler dependencies now use the same vendored RISC-V correctness fixes
+as VibeOS (fs1 preservation and scalar constant-copy lowering). The Wasmtime
+runtime and WASI adapter remain upstream standard Linux implementations.
+The official 48 CLI cannot run this workload directly: `-S threads` was removed,
+and unpatched RV64 compilation without V can panic on constant memory copies.
+See `benchmarks/wasm-runtime/coremark-threads.md` for the measurement protocol.
+
+This isolated workspace builds three Linux runners. `wasmi` includes the repository's
 host example and uses the exact vendored software-float Wasmi and WASI runtime.
 Build it without the `compiled` feature so Wasmtime cannot unify extra dependency
 features into its graph. Its release profile matches the root workspace: size optimization and LTO, with

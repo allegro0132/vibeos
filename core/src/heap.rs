@@ -605,6 +605,7 @@ impl OwnerAccount {
 }
 
 struct FreeNode {
+    size: usize, // populated by pressure coalescing
     next: Option<NonNull<FreeNode>>,
 }
 
@@ -618,6 +619,25 @@ struct AllocationHeader {
     class: usize,
     arena_prev: Option<NonNull<AllocationHeader>>,
     arena_next: Option<NonNull<AllocationHeader>>,
+    /// Return address of the allocating call (diagnostic feature only).
+    #[cfg(feature = "alloc-site-trace")]
+    site: usize,
+}
+
+/// The caller's return address, captured before anything else in `alloc`.
+#[cfg(feature = "alloc-site-trace")]
+#[inline(always)]
+fn allocation_site() -> usize {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let ra: usize;
+        unsafe { core::arch::asm!("mv {}, ra", out(reg) ra, options(nomem, nostack, preserves_flags)); }
+        ra
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1113,6 +1133,48 @@ impl Heap {
         }
     }
 
+    /// Size classes (in bytes) of the allocations still live in `arena`, oldest
+    /// first, truncated to `out.len()`; returns the total live count. This is
+    /// an allocation-free diagnostic for unclean lifecycle reports.
+    pub fn arena_live_classes(&self, arena: ArenaId, out: &mut [usize], detail: &mut [(usize, usize, [u64; 32])]) -> usize {
+        if !arena.is_tracked() {
+            return 0;
+        }
+        let h = self.0.lock();
+        let Some(index) = find_arena(&h, arena) else { return 0 };
+        let mut cursor = h.arenas[index].head;
+        let mut count = 0;
+        while let Some(header) = cursor {
+            // SAFETY: arena list nodes are live headers owned by this heap and
+            // only unlinked under the same lock held here.
+            let node = unsafe { header.as_ref() };
+            if let Some(slot) = out.get_mut(count) {
+                *slot = class_size(node.class);
+            }
+            if let Some(slot) = detail.get_mut(count) {
+                // Diagnostic only: the block's user base and its first words,
+                // enough to recognise a vtable, a pointer or text in the log.
+                // The payload follows the header at the class alignment; never
+                // read past the block's own class size.
+                let offset = size_of::<AllocationHeader>().next_multiple_of(MIN_CLASS_SIZE);
+                let words = (node.base + offset) as *const u64;
+                let available = (class_size(node.class) - offset) / size_of::<u64>();
+                let mut first = [0u64; 32];
+                for (index, word) in first.iter_mut().enumerate().take(available) {
+                    *word = unsafe { words.add(index).read_unaligned() };
+                }
+                #[cfg(feature = "alloc-site-trace")]
+                let site = node.site;
+                #[cfg(not(feature = "alloc-site-trace"))]
+                let site = 0;
+                *slot = (node.base, site, first);
+            }
+            count += 1;
+            cursor = node.arena_next;
+        }
+        count
+    }
+
     pub fn arena_stats(&self, arena: ArenaId) -> Option<ArenaStats> {
         if !arena.is_tracked() {
             return None;
@@ -1265,6 +1327,7 @@ impl Heap {
                 });
                 let free = base as *mut FreeNode;
                 free.write(FreeNode {
+                    size: 0,
                     next: h.free[class],
                 });
                 h.free[class] = NonNull::new(free);
@@ -1436,6 +1499,72 @@ fn align_up(value: usize, align: usize) -> Option<usize> {
         .map(|aligned| aligned & !(align - 1))
 }
 
+// Merge two address-ordered intrusive lists without allocating scratch memory.
+unsafe fn merge_free(mut a: Option<NonNull<FreeNode>>, mut b: Option<NonNull<FreeNode>>) -> Option<NonNull<FreeNode>> {
+    let mut result = None;
+    let mut tail = &mut result as *mut Option<NonNull<FreeNode>>;
+    while a.is_some() && b.is_some() {
+        let take_a = a.unwrap().as_ptr() < b.unwrap().as_ptr();
+        let mut node = if take_a { a.unwrap() } else { b.unwrap() };
+        if take_a { a = unsafe { node.as_ref().next }; } else { b = unsafe { node.as_ref().next }; }
+        unsafe { *tail = Some(node); tail = &mut node.as_mut().next; }
+    }
+    unsafe { *tail = a.or(b); }
+    result
+}
+
+// Allocation-free bottom-up merge sort: O(n log n) time, O(word bits) stack.
+// Runs under the heap lock only when ordinary allocation cannot find space.
+// Blocks need only MIN_CLASS_SIZE alignment; unlike a buddy allocator, existing
+// bump allocations are not aligned to their size. Merge by adjacency, then
+// partition each free extent back into power-of-two size classes.
+unsafe fn coalesce_free(h: &mut HeapInner) {
+    let mut bins = [None; usize::BITS as usize];
+    for class in 0..NUM_CLASSES {
+        let mut list = h.free[class].take();
+        while let Some(mut node) = list {
+            unsafe {
+                list = node.as_ref().next;
+                node.as_mut().next = None;
+                node.as_mut().size = class_size(class);
+            }
+            let mut run = Some(node);
+            let mut i = 0;
+            while bins[i].is_some() {
+                run = unsafe { merge_free(bins[i].take(), run) };
+                i += 1;
+            }
+            bins[i] = run;
+        }
+    }
+    let mut list = None;
+    for bin in bins { list = unsafe { merge_free(list, bin) }; }
+    while let Some(node) = list {
+        let mut base = node.as_ptr() as usize;
+        let mut size = unsafe { node.as_ref().size };
+        list = unsafe { node.as_ref().next };
+        while let Some(next) = list {
+            if base + size != next.as_ptr() as usize { break; }
+            size += unsafe { next.as_ref().size };
+            list = unsafe { next.as_ref().next };
+        }
+        if base + size == h.cursor {
+            h.cursor = base;
+            continue;
+        }
+        while size != 0 {
+            let shift = usize::BITS as usize - 1 - size.leading_zeros() as usize;
+            let class = shift - MIN_CLASS_SHIFT;
+            let block = base as *mut FreeNode;
+            unsafe { block.write(FreeNode { size: 0, next: h.free[class] }); }
+            h.free[class] = NonNull::new(block);
+            let bytes = class_size(class);
+            base += bytes;
+            size -= bytes;
+        }
+    }
+}
+
 fn class_size(index: usize) -> usize {
     1usize << (index + MIN_CLASS_SHIFT)
 }
@@ -1469,6 +1598,8 @@ fn user_address(base: usize, plan: AllocationPlan, layout: Layout) -> Option<usi
 
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        #[cfg(feature = "alloc-site-trace")]
+        let site = allocation_site();
         let Some(hart) = allocation_context_hart_index() else {
             // Allocating without a registered logical hart must not borrow
             // another hart's owner, arena, or diagnostic slot.
@@ -1567,6 +1698,37 @@ unsafe impl GlobalAlloc for Heap {
             return ptr::null_mut();
         };
 
+        // Only the pressure path sorts free blocks. No allocation is performed;
+        // address-order merging recovers adjacent space across size classes.
+        if h.cursor.checked_add(plan.charge).is_none_or(|end| end > h.end)
+            && h.free[plan.class..].iter().all(Option::is_none)
+        {
+            unsafe { coalesce_free(&mut h); }
+        }
+
+        // Reuse the smallest suitable free class before consuming the contiguous
+        // bump region. Waiting until bump exhaustion lets small allocations
+        // strand that region before a later large request arrives. At most
+        // NUM_CLASSES heads and splits are visited; no free-list scan occurs.
+        // The exact-class fast path is unchanged.
+        if h.free[plan.class].is_none() {
+            if let Some(mut class) = ((plan.class + 1)..NUM_CLASSES)
+                .find(|&class| h.free[class].is_some())
+            {
+                let node = h.free[class].take().unwrap();
+                let base = node.as_ptr() as usize;
+                h.free[class] = unsafe { node.as_ref().next };
+                while class > plan.class {
+                    class -= 1;
+                    let sibling = (base + class_size(class)) as *mut FreeNode;
+                    unsafe { sibling.write(FreeNode { size: 0, next: h.free[class] }); }
+                    h.free[class] = Some(unsafe { NonNull::new_unchecked(sibling) });
+                }
+                unsafe { (base as *mut FreeNode).write(FreeNode { size: 0, next: h.free[plan.class] }); }
+                h.free[plan.class] = Some(node);
+            }
+        }
+
         let (base, user) = if let Some(node) = h.free[plan.class] {
             let base = node.as_ptr().cast::<u8>() as usize;
             let Some(user) = user_address(base, plan, layout) else {
@@ -1615,6 +1777,8 @@ unsafe impl GlobalAlloc for Heap {
                 class: plan.class,
                 arena_prev: None,
                 arena_next,
+                #[cfg(feature = "alloc-site-trace")]
+                site,
             });
             if let Some(mut next) = arena_next {
                 next.as_mut().arena_prev = Some(header_ptr);
@@ -1643,12 +1807,51 @@ unsafe impl GlobalAlloc for Heap {
         user as *mut u8
     }
 
+    unsafe fn realloc(&self, allocation: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let Ok(new_layout) = Layout::from_size_align(new_size, layout.align()) else {
+            return ptr::null_mut();
+        };
+        // A size-class block already owns its padding. Growing within that
+        // block must not allocate a second equally large buffer temporarily.
+        if let (Some(old), Some(new), Some(hart)) = (
+            allocation_plan(layout), allocation_plan(new_layout), allocation_context_hart_index(),
+        ) {
+            if old.class == new.class {
+                let domain = domain_on_hart(hart);
+                let mut h = self.0.lock();
+                let header = unsafe { &*allocation.sub(size_of::<AllocationHeader>()).cast::<AllocationHeader>() };
+                if header.magic == HEADER_MAGIC && header.class == old.class
+                    && header.owner == domain.owner && header.arena == domain.arena
+                {
+                    h.last_failures[hart] = None;
+                    return allocation;
+                }
+            }
+        }
+        let replacement = unsafe { self.alloc(new_layout) };
+        if !replacement.is_null() {
+            unsafe {
+                ptr::copy_nonoverlapping(allocation, replacement, layout.size().min(new_size));
+                self.dealloc(allocation, layout);
+            }
+        }
+        replacement
+    }
+
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         if ptr.is_null() {
             return;
         }
         let header_ptr =
             unsafe { ptr.sub(size_of::<AllocationHeader>()) }.cast::<AllocationHeader>();
+        // Read the header only under the allocator lock. Its arena links are
+        // rewritten by every neighbouring allocation or free in the same
+        // arena, and guest threads on other harts share one arena: a snapshot
+        // taken before the lock could see a neighbour that has since moved,
+        // fail the link checks below, and silently leave this block linked and
+        // charged forever (an intermittent "reclaimed=false" after a normal
+        // multi-thread run).
+        let mut h = self.0.lock();
         let header = unsafe { header_ptr.read() };
         if header.magic != HEADER_MAGIC || header.class >= NUM_CLASSES {
             // A bad pointer is already a GlobalAlloc contract violation. Leak
@@ -1657,7 +1860,6 @@ unsafe impl GlobalAlloc for Heap {
         }
 
         let charge = class_size(header.class);
-        let mut h = self.0.lock();
         let Some(owner_index) = find_owner(&h, header.owner) else {
             return;
         };
@@ -1735,6 +1937,7 @@ unsafe impl GlobalAlloc for Heap {
             });
             let node = header.base as *mut FreeNode;
             node.write(FreeNode {
+                size: 0,
                 next: h.free[header.class],
             });
             h.free[header.class] = NonNull::new(node);

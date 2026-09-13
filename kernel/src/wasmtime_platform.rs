@@ -32,6 +32,12 @@ pub(crate) mod native_traps;
 #[cfg(feature = "wasmtime-coremark-probe")]
 #[path = "wasmtime_coremark_probe.rs"]
 mod coremark_probe;
+#[cfg(feature = "wasmtime-threads")]
+#[path = "wasmtime_thread_hooks.rs"]
+pub(crate) mod thread_hooks;
+#[cfg(feature = "wasmtime-threads")]
+#[path = "wasmtime_threads_probe.rs"]
+mod threads_probe;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use crate::code_pool::{CodeImage, WritableCode};
 use crate::sync::SpinLock;
@@ -44,23 +50,74 @@ struct Mapping { base: usize, len: usize, image: Option<Image>, domain: vibeos_c
 static MAPS: SpinLock<[Option<Mapping>; 16]> = SpinLock::new([const { None }; 16]);
 static TLS: [[AtomicPtr<u8>; 2]; crate::exec::MAX_HARTS] =
     [const { [const { AtomicPtr::new(core::ptr::null_mut()) }; 2] }; crate::exec::MAX_HARTS];
-fn hart() -> usize { crate::ipi::current_logical_hart().expect("Wasmtime needs a registered hart").index() }
+pub(crate) fn hart() -> usize { crate::ipi::current_logical_hart().expect("Wasmtime needs a registered hart").index() }
 #[no_mangle]
 extern "C" fn wasmtime_tls_get(slot: usize) -> *mut u8 { TLS[hart()][slot].load(Ordering::Relaxed) }
 #[no_mangle]
 extern "C" fn wasmtime_tls_set(slot: usize, ptr: *mut u8) { TLS[hart()][slot].store(ptr, Ordering::Relaxed); }
+// Wasmtime never holds these locks across a fiber suspension, so a holder is
+// always running on some hart. Guest threads of one command may contend from
+// several harts. The wait is bounded by wall time, not iterations: a holder
+// may legitimately zero up to 16 MiB and shoot down every hart's TLB under the
+// shared-memory write lock, which takes far longer under TCG than any
+// iteration count would suggest. A holder that faulted is detected through
+// its domain teardown instead; exceeding the time bound means an invariant
+// broke, and the panic becomes a recoverable task fault rather than a
+// silently hung hart.
+const SPIN_SECS: u64 = 60;
+const WRITER: usize = 1 << (usize::BITS - 1);
+struct Spin { iterations: usize, started: u64 }
+impl Spin {
+    const fn new() -> Self { Self { iterations: 0, started: 0 } }
+    fn once(&mut self) {
+        core::hint::spin_loop();
+        self.iterations += 1;
+        if self.iterations % 4096 != 0 { return; }
+        // A sibling on another hart faulted: the holder will never run again, so
+        // fault this thread too and let the domain teardown collect it.
+        if crate::exec::current_domain_tearing_down() {
+            panic!("wasmtime sync hook abandoned by a torn-down guest thread");
+        }
+        let now = crate::sbi::time();
+        if self.started == 0 {
+            self.started = now.max(1);
+        } else if now.saturating_sub(self.started) > SPIN_SECS.saturating_mul(crate::exec::timebase_hz()) {
+            panic!("wasmtime sync hook exceeded its {SPIN_SECS} s wait bound");
+        }
+    }
+}
 unsafe fn lock(ptr: *mut usize) {
     let value = unsafe { AtomicUsize::from_ptr(ptr) };
-    while value.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() { core::hint::spin_loop(); }
+    let mut spin = Spin::new();
+    while value.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() { spin.once(); }
 }
 unsafe fn unlock(ptr: *mut usize) { unsafe { AtomicUsize::from_ptr(ptr) }.store(0, Ordering::Release); }
+// Reader/writer word: bit 63 marks the writer, the low bits count readers.
+unsafe fn read(ptr: *mut usize) {
+    let value = unsafe { AtomicUsize::from_ptr(ptr) };
+    let mut spin = Spin::new();
+    loop {
+        let current = value.load(Ordering::Relaxed);
+        if current & WRITER == 0
+            && value.compare_exchange_weak(current, current + 1, Ordering::Acquire, Ordering::Relaxed).is_ok()
+        { return; }
+        spin.once();
+    }
+}
+unsafe fn read_release(ptr: *mut usize) { unsafe { AtomicUsize::from_ptr(ptr) }.fetch_sub(1, Ordering::Release); }
+unsafe fn write(ptr: *mut usize) {
+    let value = unsafe { AtomicUsize::from_ptr(ptr) };
+    let mut spin = Spin::new();
+    while value.compare_exchange_weak(0, WRITER, Ordering::Acquire, Ordering::Relaxed).is_err() { spin.once(); }
+}
+unsafe fn write_release(ptr: *mut usize) { unsafe { AtomicUsize::from_ptr(ptr) }.store(0, Ordering::Release); }
 macro_rules! sync_hook { ($name:ident, $f:ident) => { #[no_mangle] unsafe extern "C" fn $name(ptr: *mut usize) { unsafe { $f(ptr) }; } }; }
 sync_hook!(wasmtime_sync_lock_acquire, lock);
 sync_hook!(wasmtime_sync_lock_release, unlock);
-sync_hook!(wasmtime_sync_rwlock_read, lock);
-sync_hook!(wasmtime_sync_rwlock_read_release, unlock);
-sync_hook!(wasmtime_sync_rwlock_write, lock);
-sync_hook!(wasmtime_sync_rwlock_write_release, unlock);
+sync_hook!(wasmtime_sync_rwlock_read, read);
+sync_hook!(wasmtime_sync_rwlock_read_release, read_release);
+sync_hook!(wasmtime_sync_rwlock_write, write);
+sync_hook!(wasmtime_sync_rwlock_write_release, write_release);
 #[no_mangle]
 extern "C" fn wasmtime_sync_lock_free(_: *mut usize) {}
 #[no_mangle]
@@ -199,6 +256,15 @@ pub(crate) fn configuration() -> vibeos_wasmtime_runtime::Config {
     config
 }
 
+/// The threads configuration: shared memory, atomics, and waits that suspend
+/// the guest thread's fiber through the kernel executor.
+#[cfg(feature = "wasmtime-threads")]
+pub(crate) fn configuration_threads() -> vibeos_wasmtime_runtime::Config {
+    let mut config = configuration();
+    vibeos_wasmtime_runtime::enable_threads(&mut config, alloc::sync::Arc::new(thread_hooks::KernelThreadHooks));
+    config
+}
+
 /// All synchronous kernel entries restore privileged state after a native trap
 /// resumes Wasmtime's handler without returning through the kernel's sret.
 pub(super) fn call<P, R, T>(func: &vibeos_wasmtime_runtime::wasmtime::TypedFunc<P, R>, store: &mut vibeos_wasmtime_runtime::Store<T>, args: P)
@@ -221,6 +287,8 @@ pub fn selftest() -> Result<(), vibeos_wasmtime_runtime::wasmtime::Error> {
         wasi_probe::run(&engine)?;
         #[cfg(feature = "wasmtime-hardware-traps")]
         native_traps::selftest(&engine)?;
+        #[cfg(feature = "wasmtime-threads")]
+        threads_probe::run()?;
         #[cfg(feature = "wasmtime-coremark-probe")]
         coremark_probe::run()?;
         // Ordinary unmodified core Wasm: (func (export "run") (result i32) i32.const 42).
@@ -319,6 +387,12 @@ pub unsafe fn recover_memory_probe(domain: vibeos_core::heap::AllocationDomain) 
 
 #[cfg(feature = "wasmtime-async")]
 pub async fn code_recovery_selftest() { code_registry::recovery_selftest().await; }
+#[cfg(feature = "wasmtime-threads")]
+pub async fn threads_recovery_selftest() { threads_probe::parallel_recovery_selftest().await; }
+#[cfg(feature = "wasmtime-threads")]
+pub unsafe fn recover_threads_probe(domain: vibeos_core::heap::AllocationDomain) -> bool {
+    unsafe { threads_probe::recover_probe(domain) }
+}
 #[cfg(feature = "wasmtime-async")]
 pub unsafe fn recover_code_probe(domain: vibeos_core::heap::AllocationDomain) -> bool {
     unsafe { code_registry::recover_probe(domain) }

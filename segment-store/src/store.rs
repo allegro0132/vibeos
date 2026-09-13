@@ -28,11 +28,13 @@ use crate::allocation_v2::{
     MAX_ALLOCATION_V2_SEGMENTS, RETIRED_SEGMENT_ENTRY_LEN,
 };
 use crate::authority_snapshot::{
-    decode_persistent_authority_snapshot, PersistentAuthoritySnapshot,
+    decode_persistent_authority_snapshot_bounded, PersistentAuthoritySnapshot,
     PERSISTENT_AUTHORITY_HEADER_LEN,
 };
 use crate::cas_codec::{
-    decode_blob_manifest, decode_cas_snapshot, BlobManifest, BlobMapping,
+    decode_blob_manifest, decode_cas_delta, decode_cas_snapshot, BlobManifest, BlobMapping,
+    CasSnapshot,
+    CasDelta,
     CasCodecContext, ManifestExtent, ObjectMapping, BLOB_MANIFEST_HEADER_LEN, BLOB_MAPPING_LEN,
     CAS_SNAPSHOT_HEADER_LEN, MANIFEST_EXTENT_LEN, OBJECT_MAPPING_LEN,
 };
@@ -61,9 +63,9 @@ const METADATA_KIND_ALLOCATION: u32 = 0xffff_0002;
 
 /// Every persistent file held open by a namespace pins its stream tail, so
 /// this bounds how many files an open file tree can carry, not merely how
-/// many reads are in flight. 1024 keeps a directory of several hundred files
-/// recoverable with headroom for transaction-scoped pins.
-pub(crate) const ROOT_PIN_SLOTS: usize = 1024;
+/// many reads are in flight. 2048 admits a thousand-file batch plus its
+/// tree nodes and transaction-scoped pins without changing reserve semantics.
+pub(crate) const ROOT_PIN_SLOTS: usize = 2048;
 pub(crate) const READER_PIN_SLOTS: usize = 256;
 pub(crate) const RESERVED_ROOT_PIN_SLOTS: usize = 8;
 pub(crate) const RESERVED_READER_PIN_SLOTS: usize = 8;
@@ -460,6 +462,8 @@ pub(crate) struct CasMountedState {
 
 #[derive(Clone)]
 pub(crate) struct MountedState {
+    #[cfg(feature = "experimental-authority-delta")]
+    pub(crate) recovered_authority_depth: Option<u32>,
     pub(crate) superblock: Superblock,
     pub(crate) generation: u64,
     pub(crate) admitted_segments: u64,
@@ -482,9 +486,18 @@ pub(crate) struct MountedState {
     pub(crate) last_segment: Option<(u64, u64, [u8; 32])>,
     pub(crate) last_segment_previous: Option<(u64, u64, [u8; 32])>,
     pub(crate) last_segment_target_checkpoint_generation: u64,
+    /// Free segments whose final publication seal page is known to be
+    /// durably zero: this generation's own publication wrote the zero and
+    /// the checkpoint barrier that installed this state flushed it. A writer
+    /// claiming one of them skips the zero-write + flush + read-back that
+    /// otherwise precedes every scratch segment (one flush per checkpoint).
+    /// Runtime knowledge only; every cold mount starts empty.
+    pub(crate) durably_cleared_seals: alloc::collections::BTreeSet<u64>,
 }
 
 pub(crate) struct CheckpointTransitionWitness {
+    superblock: Superblock,
+    recovery_peak_bytes: usize,
     store_uuid: StoreUuid,
     generation: u64,
     admitted_segments: u64,
@@ -500,8 +513,31 @@ pub(crate) struct CheckpointTransitionWitness {
 }
 
 impl CheckpointTransitionWitness {
+    /// Move only the predecessor allocation into the transition proof; the
+    /// unchanged catalogs and authority stay owned by the growth successor.
+    pub(crate) fn replace_growth_allocation(state: &mut MountedState, allocation: AllocationV2) -> Self {
+        Self {
+            superblock: state.superblock,
+            recovery_peak_bytes: state.recovery_peak_bytes,
+            store_uuid: state.superblock.binding.store_uuid,
+            generation: state.generation,
+            admitted_segments: state.admitted_segments,
+            next_segment_generation: state.next_segment_generation,
+            cleaner_reserve_segments: state.cleaner_reserve_segments,
+            replay_count: state.replay_count,
+            catalog_root: state.catalog_root,
+            replay_tail: state.replay_tail,
+            authority_root: state.authority_root,
+            allocation_root: state.allocation_root,
+            allocation: mem::replace(&mut state.allocation, allocation),
+            last_segment: state.last_segment,
+        }
+    }
+
     pub(crate) fn from_mounted(state: MountedState) -> Self {
         Self {
+            superblock: state.superblock,
+            recovery_peak_bytes: state.recovery_peak_bytes,
             store_uuid: state.superblock.binding.store_uuid,
             generation: state.generation,
             admitted_segments: state.admitted_segments,
@@ -558,6 +594,10 @@ pub struct SegmentStore<D> {
     /// The committed M4 ObjectId set of the exact installed authority
     /// generation, captured at installation so a strict-successor append does
     /// not re-decode the whole predecessor stream to learn it.
+    #[cfg(any(test, feature = "experimental-authority-delta"))]
+    pub(crate) experimental_authority_base: Option<crate::authority_delta::VerifiedBaseForTest>,
+    #[cfg(any(test, feature = "experimental-authority-delta"))]
+    pub(crate) experimental_fused_authority_delta: bool,
     pub(crate) committed_ids_cache: Option<(u64, alloc::collections::BTreeSet<u128>)>,
     /// Promotion claims computed by the last live authority append, keyed by
     /// the exact logical stream they were computed against. A strict stream
@@ -567,12 +607,21 @@ pub struct SegmentStore<D> {
     /// Decoded successor trees of the last fused file transaction, keyed by
     /// the exact root they belong to.
     pub(crate) fs_tree_cache: Option<crate::fs_api::FsTreeCache>,
+    /// See [`crate::fs_api::FsRootMemo`].
+    pub(crate) fs_root_memo: Option<crate::fs_api::FsRootMemo>,
     /// When set, commits skip the publication-time read-back verification of
     /// the pages they just wrote. See [`SegmentStore::set_deferred_commit_readback`].
     pub(crate) defer_commit_readback: bool,
+    /// Platform hot-content cache admission bound; zero disables eager proofs.
+    pub(crate) hot_content_proof_max_bytes: u64,
+    /// See [`SegmentStore::set_catalog_delta_policy`].
+    pub(crate) catalog_delta_policy: crate::cas::CatalogDeltaPolicy,
     /// See [`VerifiedSegmentScans`]: chain-authentication memo for sealed
     /// segments, cleared around every collection round.
     pub(crate) verified_scans: VerifiedSegmentScans,
+    /// See [`crate::gc::TypedEdgeCache`]: authenticated typed edges reused by
+    /// later collection rounds in this process.
+    pub(crate) typed_edge_cache: crate::gc::TypedEdgeCache,
 }
 
 impl<D: PageDevice> SegmentStore<D> {
@@ -600,11 +649,32 @@ impl<D: PageDevice> SegmentStore<D> {
             dedup_verified: alloc::collections::BTreeSet::new(),
             logical_roots: alloc::collections::BTreeMap::new(),
             committed_ids_cache: None,
+            #[cfg(any(test, feature = "experimental-authority-delta"))]
+            experimental_authority_base: None,
+            #[cfg(any(test, feature = "experimental-authority-delta"))]
+            experimental_fused_authority_delta: false,
             promotion_claims_cache: None,
             fs_tree_cache: None,
+            fs_root_memo: None,
             defer_commit_readback: false,
+            hot_content_proof_max_bytes: 0,
+            catalog_delta_policy: crate::cas::CatalogDeltaPolicy::Auto,
             verified_scans: VerifiedSegmentScans::new(),
+            typed_edge_cache: crate::gc::TypedEdgeCache::new(),
         }
+    }
+
+    /// Opt into experimental fused authority writes for this store instance.
+    /// Requires an initialized authority snapshot. This research format is not
+    /// readable by default builds; full publication-memory admission is pending.
+    /// Merely compiling the feature enables reading, not writing, delta media.
+    #[cfg(feature = "experimental-authority-delta")]
+    pub fn enable_experimental_authority_delta(&mut self) -> Result<(), StoreError<D::Error>> {
+        if self.require_current_generation()?.persistent_authority.is_none() {
+            return Err(StoreError::Corrupt);
+        }
+        self.experimental_fused_authority_delta = true;
+        Ok(())
     }
 
     pub fn runtime_context(&self) -> StoreRuntimeContext {
@@ -702,6 +772,29 @@ impl<D: PageDevice> SegmentStore<D> {
     /// scrub instead of at the commit that wrote it.
     pub fn set_deferred_commit_readback(&mut self, deferred: bool) {
         self.defer_commit_readback = deferred;
+    }
+
+    /// Preverify new packed segments for objects admitted by an upper-layer
+    /// content cache, whose hits may bypass CAS reads until collection. This
+    /// is a performance policy only: normal scan validation is always used.
+    /// Zero (the default) disables it; the bound includes the exact object size.
+    pub fn set_hot_content_proof_max_bytes(&mut self, max_bytes: u64) {
+        self.hot_content_proof_max_bytes = max_bytes;
+    }
+
+    /// Choose how commits publish catalog changes: complete snapshots or the
+    /// frozen bounded-replay delta chain (see
+    /// [`crate::cas::CatalogDeltaPolicy`]). `Auto` writes deltas only when
+    /// they cost fewer pages than the snapshot they would replace, which is
+    /// the case for every small transaction against a populated catalog.
+    pub fn set_catalog_delta_policy(&mut self, policy: crate::cas::CatalogDeltaPolicy) {
+        self.catalog_delta_policy = policy;
+    }
+
+    /// Diagnostics: `(cached objects, mark-walk hits, misses)` of the typed
+    /// edge memo collection rounds reuse in this process.
+    pub fn typed_edge_cache_stats(&self) -> (usize, u64, u64) {
+        self.typed_edge_cache.stats()
     }
 
     pub fn info(&self) -> Result<StoreInfo, StoreError<D::Error>> {
@@ -860,6 +953,8 @@ impl<D: PageDevice> SegmentStore<D> {
         self.dedup_verified.clear();
         self.logical_roots.clear();
         self.committed_ids_cache = None;
+        #[cfg(any(test, feature = "experimental-authority-delta"))]
+        { self.experimental_authority_base = None; }
         self.promotion_claims_cache = None;
         self.fs_tree_cache = None;
         self.mounted = None;
@@ -911,52 +1006,36 @@ impl<D: PageDevice> SegmentStore<D> {
         // on the older slot. Recover it first, retain only the allocation-map
         // witness, then recover the newer state under the remaining memory
         // budget. This validates the pair without holding two full catalogs.
-        let mut state = match (left, right) {
-            (Some(left), Some(right)) => {
-                let (older, newer) =
-                    if left.value().binding.generation < right.value().binding.generation {
-                        (left, right)
-                    } else if right.value().binding.generation < left.value().binding.generation {
-                        (right, left)
-                    } else {
-                        return Err(StoreError::Corrupt);
-                    };
-                if newer.value().binding.generation != selected_generation {
-                    return Err(StoreError::Corrupt);
+        // Reserve the entire optional memo before recovering either slot.
+        // Retry without it on MemoryLimit so caching cannot reduce admission.
+        const RECOVERY_MEMO_BYTES: usize = 64 * 1024;
+        let memo = VerifiedSegmentScans::with_budget(RECOVERY_MEMO_BYTES, 32);
+        let mut state = if let Some(remaining) = self.limits.recovery_memory_bytes.checked_sub(RECOVERY_MEMO_BYTES) {
+            let cached_limits = StoreLimits { recovery_memory_bytes: remaining, ..self.limits };
+            match recover_checkpoint_pair(&self.device, superblock, left, right,
+                selected_generation, cached_limits, Some(&memo)).await {
+                Ok(mut state) => {
+                    debug_assert!(memo.allocated_bytes() <= RECOVERY_MEMO_BYTES);
+                    state.recovery_peak_bytes = state.recovery_peak_bytes
+                        .checked_add(RECOVERY_MEMO_BYTES).ok_or(StoreError::MemoryLimit)?;
+                    drop(memo);
+                    state
                 }
-                let older_state =
-                    recover_state(&self.device, superblock, older, self.limits).await?;
-                let older_peak = older_state.recovery_peak_bytes;
-                let witness = CheckpointTransitionWitness::from_mounted(older_state);
-                let witness_bytes = witness.resident_bytes().ok_or(StoreError::MemoryLimit)?;
-                let remaining = self
-                    .limits
-                    .recovery_memory_bytes
-                    .checked_sub(witness_bytes)
-                    .ok_or(StoreError::MemoryLimit)?;
-                let newer_limits = StoreLimits {
-                    recovery_memory_bytes: remaining,
-                    ..self.limits
-                };
-                let mut newer_state =
-                    recover_state(&self.device, superblock, newer, newer_limits).await?;
-                validate_checkpoint_transition(&witness, &newer_state)?;
-                let pair_peak = witness_bytes
-                    .checked_add(newer_state.recovery_peak_bytes)
-                    .ok_or(StoreError::MemoryLimit)?;
-                newer_state.recovery_peak_bytes = older_peak.max(pair_peak);
-                if newer_state.recovery_peak_bytes > self.limits.recovery_memory_bytes {
-                    return Err(StoreError::MemoryLimit);
+                Err(StoreError::MemoryLimit) => {
+                    drop(memo);
+                    let mut state = recover_checkpoint_pair(&self.device, superblock, left, right,
+                        selected_generation, self.limits, None).await?;
+                    // The discarded attempt was independently bounded by this
+                    // limit; retain that conservative peak across the retry.
+                    state.recovery_peak_bytes = self.limits.recovery_memory_bytes;
+                    state
                 }
-                newer_state
+                Err(error) => return Err(error),
             }
-            (Some(candidate), None) | (None, Some(candidate)) => {
-                if candidate.value().binding.generation != selected_generation {
-                    return Err(StoreError::Corrupt);
-                }
-                recover_state(&self.device, superblock, candidate, self.limits).await?
-            }
-            (None, None) => return Err(StoreError::Unformatted),
+        } else {
+            drop(memo);
+            recover_checkpoint_pair(&self.device, superblock, left, right,
+                selected_generation, self.limits, None).await?
         };
         state.recovery_peak_bytes = state
             .recovery_peak_bytes
@@ -964,12 +1043,37 @@ impl<D: PageDevice> SegmentStore<D> {
         if state.recovery_peak_bytes > self.limits.recovery_memory_bytes {
             return Err(StoreError::MemoryLimit);
         }
+        // Retain only bounded, fixed-size provenance from this successful
+        // cold replay. Cache admission is optional and cannot reject a mount.
+        #[cfg(feature = "experimental-authority-delta")]
+        let recovered_witness = if let Some(depth) = state.recovered_authority_depth.take()
+            .filter(|_| state.persistent_authority.as_ref()
+                .is_some_and(|snapshot| snapshot.checkpoint_generation() == state.generation))
+        {
+            let resident = state.resident_heap_bytes().ok_or(StoreError::MemoryLimit)?;
+            let workspace = self.limits.recovery_memory_bytes.checked_sub(resident).ok_or(StoreError::MemoryLimit)?;
+            match crate::authority_delta::PreparedBaseForTest::prepare_with_peak(
+                state.persistent_authority.as_ref().ok_or(StoreError::Corrupt)?, workspace) {
+                Ok((prepared, peak)) => {
+                    state.recovery_peak_bytes = state.recovery_peak_bytes.max(
+                        resident.checked_add(peak).ok_or(StoreError::MemoryLimit)?);
+                    Some(prepared.bind(&state, depth)?)
+                }
+                Err(StoreError::MemoryLimit) => {
+                    state.recovery_peak_bytes = self.limits.recovery_memory_bytes;
+                    None
+                }
+                Err(error) => return Err(error),
+            }
+        } else { None };
         let info = state.info();
         if !publish_runtime_generation(&self.published_generation, state.generation) {
             self.poisoned = true;
             return Err(StoreError::RecoveryRequired);
         }
         self.mounted = Some(state);
+        #[cfg(feature = "experimental-authority-delta")]
+        { self.experimental_authority_base = recovered_witness; }
         self.poisoned = false;
         Ok(info)
     }
@@ -983,8 +1087,21 @@ impl<D: PageDevice> SegmentStore<D> {
         &mut self,
         previous: MountedState,
         expected: Checkpoint,
+        successor: MountedState,
+        verifies_all_cas: bool,
+    ) -> Result<StoreInfo, StoreError<D::Error>> {
+        self.mount_verified_successor_witness(
+            CheckpointTransitionWitness::from_mounted(previous), expected, successor, verifies_all_cas, 0,
+        ).await
+    }
+
+    pub(crate) async fn mount_verified_successor_witness(
+        &mut self,
+        previous: CheckpointTransitionWitness,
+        expected: Checkpoint,
         mut successor: MountedState,
         verifies_all_cas: bool,
+        operation_peak: usize,
     ) -> Result<StoreInfo, StoreError<D::Error>> {
         self.mounted = None;
         self.poisoned = true;
@@ -1024,7 +1141,7 @@ impl<D: PageDevice> SegmentStore<D> {
         }
         let predecessor =
             if expected.slot == 0 { right } else { left }.ok_or(StoreError::Corrupt)?;
-        if !checkpoint_matches_mounted(predecessor.value(), &previous, self.limits) {
+        if !checkpoint_matches_witness(predecessor.value(), &previous, self.limits) {
             return Err(StoreError::Corrupt);
         }
         if !checkpoint_matches_mounted(&expected, &successor, self.limits) {
@@ -1034,13 +1151,13 @@ impl<D: PageDevice> SegmentStore<D> {
         let predecessor_cas_verified =
             self.verified_cas_generation.load(Ordering::Acquire) == previous.generation;
         let previous_peak = previous.recovery_peak_bytes;
-        let witness = CheckpointTransitionWitness::from_mounted(previous);
+        let witness = previous;
         let witness_bytes = witness.resident_bytes().ok_or(StoreError::MemoryLimit)?;
         validate_checkpoint_transition(&witness, &successor)?;
         let pair_peak = witness_bytes
             .checked_add(successor.recovery_peak_bytes)
             .ok_or(StoreError::MemoryLimit)?;
-        successor.recovery_peak_bytes = previous_peak.max(pair_peak).max(
+        successor.recovery_peak_bytes = previous_peak.max(pair_peak).max(operation_peak).max(
             successor
                 .resident_heap_bytes()
                 .ok_or(StoreError::MemoryLimit)?,
@@ -1248,6 +1365,31 @@ fn checkpoint_matches_mounted(
         && checkpoint.replay_tail == state.replay_tail
 }
 
+fn checkpoint_matches_witness(
+    checkpoint: &Checkpoint,
+    state: &CheckpointTransitionWitness,
+    limits: StoreLimits,
+) -> bool {
+    checkpoint.binding.store_uuid == state.superblock.binding.store_uuid
+        && checkpoint.binding.generation == state.generation
+        && checkpoint.binding.segment_no == ANCHOR_SEGMENT_NO
+        && checkpoint.binding.ordinal == u32::from(checkpoint.slot)
+        && checkpoint.binding.self_page == 4 + u64::from(checkpoint.slot) * 2
+        && checkpoint.binding.target_checkpoint_generation == state.generation
+        && checkpoint.slot == ((state.generation - 1) & 1) as u8
+        && admitted_pages(state.admitted_segments)
+            .is_ok_and(|pages| checkpoint.admitted_range_pages == pages)
+        && checkpoint.admitted_segments == state.admitted_segments
+        && checkpoint.next_segment_generation == state.next_segment_generation
+        && checkpoint.replay_count == state.replay_count
+        && checkpoint.max_replay_records == limits.max_replay_records
+        && checkpoint.cleaner_reserve_segments == state.cleaner_reserve_segments
+        && checkpoint.catalog_root == state.catalog_root
+        && checkpoint.authority_root == state.authority_root
+        && checkpoint.allocation_root == state.allocation_root
+        && checkpoint.replay_tail == state.replay_tail
+}
+
 impl MountedState {
     pub(crate) fn resident_heap_bytes(&self) -> Option<usize> {
         let mut bytes = self.allocation.allocated_bytes()?.checked_add(
@@ -1278,30 +1420,54 @@ impl MountedState {
     }
 
     pub(crate) fn find_free_run(&self, required: u64, may_use_reserve: bool) -> Option<u64> {
+        self.find_free_run_with_headroom(required, 0, may_use_reserve)
+    }
+
+    /// Reserve extra free capacity without requiring adjacency to the run.
+    pub(crate) fn find_free_run_with_headroom(
+        &self,
+        required: u64,
+        extra: u64,
+        may_use_reserve: bool,
+    ) -> Option<u64> {
+        self.find_free_run_in(&self.allocation, self.next_physical_segment, required, extra, may_use_reserve)
+    }
+
+    // Share the exact placement policy with a provisional allocation without
+    // cloning unrelated authority/catalog state merely to substitute two fields.
+    pub(crate) fn find_free_run_in(
+        &self,
+        allocation: &AllocationV2,
+        next_physical_segment: u64,
+        required: u64,
+        extra: u64,
+        may_use_reserve: bool,
+    ) -> Option<u64> {
         if required == 0 {
             return None;
         }
-        let free = self.allocation.counts().ok()?.free;
+        let reserved = required.checked_add(extra)?;
+        let free = allocation.counts().ok()?.free;
         let ordinary_floor = u64::from(self.cleaner_reserve_segments)
             .checked_add(u64::from(ROOT_POLICY_HEADROOM_SEGMENTS))?;
-        if free < required || (!may_use_reserve && free.checked_sub(required)? < ordinary_floor) {
+        if free < reserved || (!may_use_reserve && free.checked_sub(reserved)? < ordinary_floor) {
             return None;
         }
         if self.allocation_version == 1 {
-            let end = self.next_physical_segment.checked_add(required)?;
+            let end = next_physical_segment.checked_add(required)?;
             if end > self.admitted_segments {
                 return None;
             }
-            return (self.next_physical_segment..end)
+            return (next_physical_segment..end)
                 .all(|segment_no| {
-                    self.allocation.segment_state(segment_no) == Some(SegmentAllocation::Free)
+                    allocation.segment_state(segment_no) == Some(SegmentAllocation::Free)
                 })
-                .then_some(self.next_physical_segment);
+                .then_some(next_physical_segment);
         }
         let mut run_start = 0_u64;
         let mut run_len = 0_u64;
         for segment_no in 0..self.admitted_segments {
-            if self.allocation.segment_state(segment_no) == Some(SegmentAllocation::Free) {
+            if allocation.segment_state(segment_no) == Some(SegmentAllocation::Free) {
                 if run_len == 0 {
                     run_start = segment_no;
                 }
@@ -1351,7 +1517,7 @@ impl MountedState {
     }
 }
 
-fn allocation_resident_bytes(allocation: &AllocationV2) -> Result<usize, ()> {
+pub(crate) fn allocation_resident_bytes(allocation: &AllocationV2) -> Result<usize, ()> {
     allocation.allocated_bytes().ok_or(())
 }
 
@@ -1534,6 +1700,7 @@ pub(crate) struct ScannedSegment {
     pub(crate) matched: Option<ExtentRecord>,
     additional_matches: Vec<ExtentRecord>,
     authority_siblings: Vec<ExtentRecord>,
+    descriptor_peak_bytes: usize,
     pub(crate) record_count: u32,
     pub(crate) total_payload_bytes: u64,
     pub(crate) segment_seal_body_sha256: [u8; 32],
@@ -1549,13 +1716,15 @@ pub(crate) struct ScannedSegment {
 /// re-walking the whole chain on every pointer dereference, which measures
 /// as the dominant read amplification of small-store commits. Collection is
 /// the only path that retires and eventually reuses segment numbers, so the
-/// memo is cleared around every GC round; cold scrub and migration passes
-/// never consult it.
+/// memo drops retired/freed segments around GC; cold scrub and migration
+/// passes never consult it.
 pub(crate) struct VerifiedSegmentScans {
     entries: ScanMemoCell,
+    byte_budget: usize,
+    entry_limit: usize,
 }
 
-struct ScanMemoCell(core::cell::RefCell<BTreeMap<(u64, u64), VerifiedSegment>>);
+struct ScanMemoCell(core::cell::RefCell<alloc::collections::VecDeque<ScanMemoEntry>>);
 
 // Safety: the memo lives inside `SegmentStore`, whose every operation runs
 // through `&mut self`, and shared kernel handles serialize all store access
@@ -1578,14 +1747,46 @@ struct VerifiedSegment {
 }
 
 /// Bounded so a large store cannot grow the memo without limit; eviction is
-/// oldest-key-first and only costs a re-walk on the next access.
-const VERIFIED_SEGMENT_SCAN_CAPACITY: usize = 48;
+/// least-recently-used and only costs a re-walk on the next access.
+const VERIFIED_SEGMENT_SCAN_CAPACITY: usize = 256;
+// Bounds requested resident allocation bytes, including queue capacity and
+// all extent Vec capacities. Allocator bookkeeping/rounding is platform-owned.
+const VERIFIED_SEGMENT_SCAN_BYTE_BUDGET: usize = 320 * 1024;
+
+type ScanMemoEntry = ((u64, u64), VerifiedSegment);
+
+fn scan_extent_bytes(verified: &VerifiedSegment) -> usize {
+    verified.extents.capacity().checked_mul(core::mem::size_of::<ExtentRecord>())
+        .unwrap_or(usize::MAX)
+}
 
 impl VerifiedSegmentScans {
     pub(crate) fn new() -> Self {
+        Self::with_budget(VERIFIED_SEGMENT_SCAN_BYTE_BUDGET, VERIFIED_SEGMENT_SCAN_CAPACITY)
+    }
+
+    /// A recovery-local memo can use a smaller fixed reservation than the
+    /// session cache. An undersized budget disables caching, not validation.
+    pub(crate) fn with_budget(byte_budget: usize, entry_limit: usize) -> Self {
+        let entry_limit = entry_limit.min(VERIFIED_SEGMENT_SCAN_CAPACITY)
+            .min(byte_budget / core::mem::size_of::<ScanMemoEntry>());
         Self {
-            entries: ScanMemoCell(core::cell::RefCell::new(BTreeMap::new())),
+            entries: ScanMemoCell(core::cell::RefCell::new(alloc::collections::VecDeque::new())),
+            byte_budget: byte_budget.min(VERIFIED_SEGMENT_SCAN_BYTE_BUDGET),
+            entry_limit,
         }
+    }
+
+    /// Reserve the complete memo allowance across reads, including later growth.
+    #[cfg(any(test, feature = "experimental-authority-delta"))]
+    pub(crate) fn reservation_bytes(&self) -> usize {
+        self.byte_budget
+    }
+
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        let entries = self.entries.0.borrow();
+        entries.capacity().saturating_mul(core::mem::size_of::<ScanMemoEntry>())
+            .saturating_add(entries.iter().map(|(_, proof)| scan_extent_bytes(proof)).sum::<usize>())
     }
 
     pub(crate) fn clear(&self) {
@@ -1601,14 +1802,17 @@ impl VerifiedSegmentScans {
         checkpoint_generation: u64,
         interpret: impl FnOnce(&VerifiedSegment) -> T,
     ) -> Option<T> {
-        let entries = self.entries.0.borrow();
-        let cached = entries.get(&(segment_no, segment_generation))?;
+        let mut entries = self.entries.0.borrow_mut();
+        let position = entries.iter().position(|(key, _)| *key == (segment_no, segment_generation))?;
+        let cached = &entries[position].1;
         if cached.header_target_checkpoint_generation > checkpoint_generation
             || cached.last_target_checkpoint_generation > checkpoint_generation
         {
             return None;
         }
-        Some(interpret(cached))
+        let entry = entries.remove(position).expect("located cached segment");
+        entries.push_back(entry);
+        Some(interpret(&entries.back().expect("promoted cached segment").1))
     }
 
     /// Drop every entry whose segment is no longer Allocated: only such
@@ -1616,7 +1820,7 @@ impl VerifiedSegmentScans {
     /// fresh generation, so proofs for them must not outlive the round that
     /// freed them. Allocated sealed segments remain immutable and provable.
     pub(crate) fn retain_allocated(&self, allocation: &crate::allocation_v2::AllocationV2) {
-        self.entries.0.borrow_mut().retain(|(segment_no, _), _| {
+        self.entries.0.borrow_mut().retain(|((segment_no, _), _)| {
             matches!(
                 allocation.segment_state(*segment_no),
                 Some(crate::allocation_v2::SegmentAllocation::Allocated)
@@ -1625,13 +1829,236 @@ impl VerifiedSegmentScans {
     }
 
     fn insert(&self, segment_no: u64, segment_generation: u64, verified: VerifiedSegment) {
+        if self.entry_limit == 0 { return; }
         let mut entries = self.entries.0.borrow_mut();
-        while entries.len() >= VERIFIED_SEGMENT_SCAN_CAPACITY {
-            entries.pop_first();
+        let key = (segment_no, segment_generation);
+        if let Some(position) = entries.iter().position(|(cached, _)| *cached == key) {
+            entries.remove(position);
         }
-        entries.insert((segment_no, segment_generation), verified);
+        let incoming = scan_extent_bytes(&verified);
+        let minimum_queue = self.entry_limit * core::mem::size_of::<ScanMemoEntry>();
+        if incoming > self.byte_budget.saturating_sub(minimum_queue) {
+            return; // A proof too large to memoize remains valid for this read.
+        }
+        if entries.capacity() == 0
+            && entries.try_reserve_exact(self.entry_limit).is_err()
+        {
+            return; // Optional memo allocation must not fail a verified read.
+        }
+        let queue_bytes = entries.capacity().checked_mul(core::mem::size_of::<ScanMemoEntry>())
+            .unwrap_or(usize::MAX);
+        if queue_bytes > self.byte_budget {
+            *entries = alloc::collections::VecDeque::new();
+            return;
+        }
+        let available = self.byte_budget - queue_bytes;
+        if incoming > available { return; }
+        let mut resident = entries.iter().fold(0usize, |bytes, (_, proof)| {
+            bytes.saturating_add(scan_extent_bytes(proof))
+        });
+        while entries.len() >= self.entry_limit || resident > available - incoming {
+            let (_, evicted) = entries.pop_front().expect("memo eviction candidate");
+            resident = resident.saturating_sub(scan_extent_bytes(&evicted));
+        }
+        entries.push_back((key, verified));
     }
 }
+
+#[cfg(test)]
+mod scan_memo_tests {
+    use super::*;
+
+    #[test]
+    fn scan_result_budget_includes_retained_table_and_reallocation() {
+        let item = core::mem::size_of::<ExtentRecord>();
+        let retained = 7 * item;
+        let mut result = Vec::new();
+        assert!(matches!(reserve_scan_results::<()>(&mut result, 2, retained, retained + 2 * item - 1),
+            Err(StoreError::MemoryLimit)));
+        assert_eq!(result.capacity(), 0);
+        reserve_scan_results::<()>(&mut result, 2, retained, retained + 2 * item).unwrap();
+        let old = result.capacity() * item;
+        // The vector need not be populated to force growth beyond its capacity.
+        let more = result.capacity() + 1;
+        let peak = retained + old + more * item;
+        assert!(matches!(reserve_scan_results::<()>(&mut result, more, retained, peak - 1),
+            Err(StoreError::MemoryLimit)));
+        assert_eq!(result.capacity() * item, old);
+        reserve_scan_results::<()>(&mut result, more, retained, peak).unwrap();
+        assert_eq!(result.capacity(), more);
+        assert!(matches!(reserve_scan_results::<()>(&mut result, 0, retained, retained),
+            Err(StoreError::MemoryLimit)), "existing spare capacity must still be charged");
+    }
+
+
+    #[test]
+    fn scan_descriptor_budget_rejects_before_reservation() {
+        let exact = 3 * core::mem::size_of::<ExtentRecord>();
+        let mut table = Vec::new();
+        assert!(matches!(reserve_scan_descriptors::<()>(&mut table, 3, exact - 1),
+            Err(StoreError::MemoryLimit)));
+        assert_eq!(table.capacity(), 0);
+        assert!(matches!(reserve_scan_descriptors::<()>(&mut table, usize::MAX, usize::MAX),
+            Err(StoreError::MemoryLimit)));
+        assert_eq!(table.capacity(), 0);
+        reserve_scan_descriptors::<()>(&mut table, 3, exact).unwrap();
+        assert_eq!(table.capacity() * core::mem::size_of::<ExtentRecord>(), exact);
+    }
+
+
+    fn proof_with_capacity(capacity: usize) -> VerifiedSegment {
+        VerifiedSegment {
+            extents: Vec::with_capacity(capacity),
+            record_count: 0,
+            total_payload_bytes: 0,
+            segment_seal_body_sha256: [0; 32],
+            previous_segment: (0, 0, [0; 32]),
+            header_target_checkpoint_generation: 1,
+            last_target_checkpoint_generation: 2,
+        }
+    }
+
+    fn resident_bytes(memo: &VerifiedSegmentScans) -> usize {
+        let entries = memo.entries.0.borrow();
+        entries.capacity() * core::mem::size_of::<ScanMemoEntry>()
+            + entries.iter().map(|(_, p)| scan_extent_bytes(p)).sum::<usize>()
+    }
+
+    #[test]
+    fn scan_peak_reports_retained_capacity_without_matches() {
+        let verified = proof_with_capacity(7);
+        let bytes = scan_extent_bytes(&verified);
+        let pointer = PointerValue {
+            store_uuid: StoreUuid::new([7;16]).unwrap(), segment_no: 0, segment_generation: 1,
+            descriptor_relative_page: 0, payload_relative_page: 0, payload_pages: 1,
+            ordinal: 0, exact_byte_len: 1, extent_kind: ExtentKind::Authority,
+            payload_sha256: [0;32],
+        };
+        let scanned = interpret_verified_extents::<()>(&verified, 0, pointer, &[], false, None, bytes).unwrap();
+        assert_eq!(scanned.descriptor_peak_bytes, bytes);
+        assert!(scanned.authority_siblings.is_empty());
+        assert!(matches!(interpret_verified_extents::<()>(&verified, 0, pointer, &[], false, None, bytes - 1),
+            Err(StoreError::MemoryLimit)));
+    }
+
+    #[test]
+    fn recovery_memo_small_budget_and_checkpoint_horizon() {
+        let disabled = VerifiedSegmentScans::with_budget(0, 32);
+        disabled.insert(0, 1, proof_with_capacity(1));
+        assert_eq!(disabled.allocated_bytes(), 0);
+        assert!(disabled.with_verified(0, 1, 2, |_| ()).is_none());
+        let limit = 8 * 1024;
+        let memo = VerifiedSegmentScans::with_budget(limit, 8);
+        assert_eq!(memo.allocated_bytes(), 0);
+        assert_eq!(memo.reservation_bytes(), limit, "empty memo still needs its growth allowance");
+        for segment in 0..64 {
+            memo.insert(segment, 1, proof_with_capacity(4));
+            assert!(memo.allocated_bytes() <= limit);
+            assert_eq!(memo.reservation_bytes(), limit);
+        }
+        assert!(memo.with_verified(63, 1, 1, |_| ()).is_none(), "future proof must miss");
+        assert!(memo.with_verified(63, 2, 2, |_| ()).is_none(), "different seal generation must miss");
+        assert!(memo.with_verified(63, 1, 2, |_| ()).is_some());
+        assert!(memo.with_verified(0, 1, 2, |_| ()).is_none(), "old proof must be evicted");
+        memo.insert(65, 1, proof_with_capacity(1024));
+        assert!(memo.allocated_bytes() <= limit);
+        assert!(memo.with_verified(65, 1, 2, |_| ()).is_none(), "oversized proof is optional");
+    }
+
+    #[test]
+    fn scan_memo_budget_charges_capacity_and_evicts_lru() {
+        let memo = VerifiedSegmentScans::new();
+        memo.insert(0, 1, proof_with_capacity(0));
+        let queue = resident_bytes(&memo);
+        memo.clear();
+        assert_eq!(resident_bytes(&memo), queue);
+        let available = VERIFIED_SEGMENT_SCAN_BYTE_BUDGET - queue;
+        let extent_size = core::mem::size_of::<ExtentRecord>();
+        let half = available / 2 / extent_size;
+        memo.insert(1, 1, proof_with_capacity(half));
+        memo.insert(2, 1, proof_with_capacity(half));
+        assert_eq!(memo.with_verified(1, 1, 2, |_| ()), Some(()));
+        let extra = (available - 2 * half * extent_size) / extent_size + 1;
+        memo.insert(3, 1, proof_with_capacity(extra));
+        assert_eq!(memo.with_verified(2, 1, 2, |_| ()), None);
+        assert_eq!(memo.with_verified(1, 1, 2, |_| ()), Some(()));
+        assert_eq!(memo.with_verified(3, 1, 2, |_| ()), Some(()));
+        assert!(resident_bytes(&memo) <= VERIFIED_SEGMENT_SCAN_BYTE_BUDGET);
+        // Empty vectors with reserved capacity consume the full byte budget.
+        assert!(memo.entries.0.borrow().iter().all(|(_, p)| p.extents.is_empty()));
+        memo.insert(1, 1, proof_with_capacity(0));
+        memo.insert(4, 1, proof_with_capacity(half));
+        assert_eq!(memo.with_verified(3, 1, 2, |_| ()), Some(()));
+        assert!(resident_bytes(&memo) <= VERIFIED_SEGMENT_SCAN_BYTE_BUDGET);
+        use crate::allocation_v2::{AllocationV2, SegmentAllocation};
+        let states = [SegmentAllocation::Free, SegmentAllocation::Allocated,
+            SegmentAllocation::Free, SegmentAllocation::Free, SegmentAllocation::Free];
+        memo.retain_allocated(&AllocationV2::new(2, 10, 2, &states, &[]).unwrap());
+        assert_eq!(memo.entries.0.borrow().len(), 1);
+        memo.insert(5, 1, proof_with_capacity(available / extent_size));
+        assert_eq!(memo.with_verified(1, 1, 2, |_| ()), Some(()));
+        assert!(resident_bytes(&memo) <= VERIFIED_SEGMENT_SCAN_BYTE_BUDGET);
+    }
+
+    #[test]
+    fn oversized_scan_proof_is_not_retained() {
+        let memo = VerifiedSegmentScans::new();
+        let oversized = VERIFIED_SEGMENT_SCAN_BYTE_BUDGET / core::mem::size_of::<ExtentRecord>() + 1;
+        memo.insert(1, 1, proof_with_capacity(oversized));
+        assert_eq!(resident_bytes(&memo), 0);
+        memo.insert(1, 1, proof_with_capacity(0));
+        memo.insert(2, 1, proof_with_capacity(1));
+        memo.insert(1, 1, proof_with_capacity(oversized));
+        assert_eq!(memo.with_verified(1, 1, 2, |_| ()), None);
+        assert_eq!(memo.with_verified(2, 1, 2, |_| ()), Some(()));
+        assert!(resident_bytes(&memo) <= VERIFIED_SEGMENT_SCAN_BYTE_BUDGET);
+    }
+
+    #[test]
+    fn scan_memo_evicts_unused_entries_and_preserves_proof_identity() {
+        let memo = VerifiedSegmentScans::new();
+        let verified = || VerifiedSegment {
+            extents: Vec::new(),
+            record_count: 0,
+            total_payload_bytes: 0,
+            segment_seal_body_sha256: [0; 32],
+            previous_segment: (0, 0, [0; 32]),
+            header_target_checkpoint_generation: 1,
+            last_target_checkpoint_generation: 2,
+        };
+        for segment in 0..VERIFIED_SEGMENT_SCAN_CAPACITY as u64 {
+            memo.insert(segment, 1, verified());
+        }
+        assert_eq!(memo.with_verified(0, 2, 2, |_| ()), None);
+        assert_eq!(memo.with_verified(0, 1, 1, |_| ()), None);
+        assert_eq!(memo.with_verified(0, 1, 2, |_| ()), Some(()));
+        let next = VERIFIED_SEGMENT_SCAN_CAPACITY as u64;
+        memo.insert(next, 1, verified());
+        assert_eq!(memo.with_verified(1, 1, 2, |_| ()), None);
+        assert_eq!(memo.with_verified(0, 1, 2, |_| ()), Some(()));
+        // Replacing a cached key must not evict an unrelated proof.
+        memo.insert(next, 1, verified());
+        assert_eq!(memo.entries.0.borrow().len(), VERIFIED_SEGMENT_SCAN_CAPACITY);
+        assert_eq!(memo.with_verified(2, 1, 2, |_| ()), Some(()));
+        use crate::allocation_v2::{AllocationV2, RetiredSegment, SegmentAllocation};
+        let mut states = [SegmentAllocation::Free; VERIFIED_SEGMENT_SCAN_CAPACITY];
+        states[0] = SegmentAllocation::Allocated;
+        states[2] = SegmentAllocation::Retired;
+        let allocation = AllocationV2::new(2, 50, 6, &states,
+            &[RetiredSegment { segment_no: 2, retire_generation: 2 }]).unwrap();
+        memo.retain_allocated(&allocation);
+        assert_eq!(memo.entries.0.borrow().len(), 1);
+        assert_eq!(memo.with_verified(0, 1, 2, |_| ()), Some(()));
+        assert_eq!(memo.with_verified(2, 1, 2, |_| ()), None);
+        assert_eq!(memo.with_verified(next, 1, 2, |_| ()), None);
+        memo.clear();
+        assert_eq!(memo.with_verified(0, 1, 2, |_| ()), None);
+    }
+}
+
+// Uncached ordinal-zero probes with no match/sibling requests retain no
+// descriptor table. Their two four-page I/O windows are the heap workspace.
+pub(crate) const SEGMENT_PROBE_PAGE_WORKSPACE_BYTES: usize = 8 * PAGE_SIZE;
 
 pub(crate) async fn scan_segment<D: PageDevice>(
     device: &D,
@@ -1651,10 +2078,100 @@ pub(crate) async fn scan_segment<D: PageDevice>(
         pointer,
         &[],
         false,
-        false,
+        None,
         memo,
+        false,
+        usize::MAX,
     )
     .await
+}
+
+// Full media verification never consumes or populates a metadata-only memo.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn scan_segment_for_scrub<D: PageDevice>(
+    device: &D, store_uuid: StoreUuid, admitted_segments: u64,
+    next_segment_generation: u64, checkpoint_generation: u64, segment_no: u64,
+) -> Result<ScannedSegment, StoreError<D::Error>> {
+    // Scrub discovers the generation from the same authenticated header that
+    // starts the full scan, rather than issuing a separate header-pair read.
+    let pointer = PointerValue {
+        store_uuid, segment_no, segment_generation: 0,
+        descriptor_relative_page: 0, payload_relative_page: 0, payload_pages: 1,
+        ordinal: 0, exact_byte_len: 1, extent_kind: ExtentKind::Blob,
+        payload_sha256: [0; 32],
+    };
+    scan_segment_with_matches(device, store_uuid, admitted_segments,
+        next_segment_generation, checkpoint_generation, pointer, &[], false, None, None, true, usize::MAX).await
+}
+
+pub(crate) async fn verify_payload_and_zero_padding<D: PageDevice>(
+    device: &D,
+    first_page: u64,
+    payload_pages: u32,
+    exact_byte_len: u64,
+    expected_sha256: [u8; 32],
+) -> Result<(), StoreError<D::Error>> {
+    use sha2::{Digest, Sha256};
+    if exact_byte_len == 0 || u64::from(payload_pages) != exact_byte_len.div_ceil(PAGE_SIZE as u64)
+    {
+        return Err(StoreError::Corrupt);
+    }
+    let mut remaining = exact_byte_len;
+    let mut hasher = Sha256::new();
+    // Keep the batch within scrub's existing two-page streaming workspace.
+    // The final read is shortened so it never crosses this extent's payload.
+    let mut pages = Box::new([[0; PAGE_SIZE]; 2]);
+    let mut page_index = 0_u64;
+    while page_index < u64::from(payload_pages) {
+        let count = (u64::from(payload_pages) - page_index).min(pages.len() as u64) as usize;
+        device.read_pages(
+            first_page.checked_add(page_index).ok_or(StoreError::Corrupt)?,
+            &mut pages[..count],
+        ).await.map_err(StoreError::Device)?;
+        for page in &pages[..count] {
+            let take = usize::try_from(remaining.min(PAGE_SIZE as u64)).map_err(|_| StoreError::Corrupt)?;
+            hasher.update(&page[..take]);
+            if page[take..].iter().any(|byte| *byte != 0) {
+                return Err(StoreError::Corrupt);
+            }
+            remaining -= take as u64;
+        }
+        page_index += count as u64;
+    }
+    let observed: [u8; 32] = hasher.finalize().into();
+    if remaining != 0 || observed != expected_sha256 {
+        return Err(StoreError::Corrupt);
+    }
+    Ok(())
+}
+
+// Even an individually sealed summary must describe a physically possible
+// extent population before its count is allowed to size an allocation.
+fn validate_scan_summary_geometry<E>(summary: &SegmentSummary) -> Result<(), StoreError<E>> {
+    let occupied = summary.next_free_page.checked_sub(DATA_FIRST_PAGE).ok_or(StoreError::Corrupt)?;
+    let described = summary.record_count.checked_mul(2)
+        .and_then(|pages| pages.checked_add(summary.payload_page_count)).ok_or(StoreError::Corrupt)?;
+    if summary.next_free_page > DATA_END_PAGE
+        || summary.payload_page_count < summary.record_count
+        || described != occupied
+    {
+        return Err(StoreError::Corrupt);
+    }
+    Ok(())
+}
+
+// Bound the retained scan table before allocation. Summary geometry is
+// validated by the caller; allocator capacity is checked again afterwards.
+fn reserve_scan_descriptors<E>(table: &mut Vec<ExtentRecord>, count: usize, limit: usize)
+    -> Result<(), StoreError<E>> {
+    let size = core::mem::size_of::<ExtentRecord>();
+    let requested = count.checked_mul(size).ok_or(StoreError::MemoryLimit)?;
+    if requested > limit { return Err(StoreError::MemoryLimit); }
+    table.try_reserve_exact(count).map_err(|_| StoreError::MemoryLimit)?;
+    if table.capacity().checked_mul(size).is_none_or(|bytes| bytes > limit) {
+        return Err(StoreError::MemoryLimit);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1664,16 +2181,23 @@ async fn scan_segment_with_matches<D: PageDevice>(
     admitted_segments: u64,
     next_segment_generation: u64,
     checkpoint_generation: u64,
-    pointer: PointerValue,
+    mut pointer: PointerValue,
     additional: &[PointerValue],
     collect_authority_siblings: bool,
-    collect_authority_records: bool,
+    authority_generation: Option<(u64, usize)>,
     memo: Option<&VerifiedSegmentScans>,
+    verify_payloads: bool,
+    descriptor_limit: usize,
 ) -> Result<ScannedSegment, StoreError<D::Error>> {
+    if verify_payloads && (memo.is_some() || pointer.ordinal != 0
+        || !additional.is_empty() || collect_authority_siblings || authority_generation.is_some())
+    {
+        return Err(StoreError::Corrupt);
+    }
     if pointer.store_uuid != store_uuid
         || pointer.segment_no >= admitted_segments
-        || pointer.segment_generation == 0
-        || pointer.segment_generation >= next_segment_generation
+        || (!verify_payloads && (pointer.segment_generation == 0
+            || pointer.segment_generation >= next_segment_generation))
     {
         return Err(StoreError::Corrupt);
     }
@@ -1690,18 +2214,30 @@ async fn scan_segment_with_matches<D: PageDevice>(
                     pointer,
                     additional,
                     collect_authority_siblings,
-                    collect_authority_records,
+                    authority_generation,
+                    descriptor_limit,
                 )
             },
         ) {
             return interpreted;
         }
     }
-    let header_pages = read_pair(device, base).await?;
+    // Every referenced segment starts with a header pair followed by its
+    // first descriptor pair. Reuse the latter half for subsequent descriptors.
+    const _: () = assert!(DATA_FIRST_PAGE == 2);
+    let mut header_pages = alloc::vec![[0; PAGE_SIZE]; 4].into_boxed_slice();
+    device.read_pages(base, &mut header_pages).await.map_err(StoreError::Device)?;
     let header = match decode_segment_header_verified(&header_pages[0], &header_pages[1])? {
         DecodeStatus::Sealed(value) => value,
         _ => return Err(StoreError::Corrupt),
     };
+    if verify_payloads {
+        let generation = header.value().binding.generation;
+        if generation == 0 || generation >= next_segment_generation {
+            return Err(StoreError::Corrupt);
+        }
+        pointer.segment_generation = generation;
+    }
     if header.value().binding.store_uuid != store_uuid
         || header.value().binding.segment_no != pointer.segment_no
         || header.value().binding.generation != pointer.segment_generation
@@ -1710,17 +2246,26 @@ async fn scan_segment_with_matches<D: PageDevice>(
         return Err(StoreError::Corrupt);
     }
 
-    let summary_pages = read_pair(device, base + u64::from(SUMMARY_BODY_PAGE)).await?;
-    let summary = match decode_segment_summary_verified(&summary_pages[0], &summary_pages[1])? {
+    // Summary and final seal are adjacent immutable pairs. Fetch their four
+    // pages together while still authenticating each body/seal independently.
+    const _: () = assert!(SEGMENT_SEAL_BODY_PAGE == SUMMARY_BODY_PAGE + 2);
+    let mut trailer = alloc::vec![[0; PAGE_SIZE]; 4].into_boxed_slice();
+    device
+        .read_pages(base + u64::from(SUMMARY_BODY_PAGE), &mut trailer)
+        .await
+        .map_err(StoreError::Device)?;
+    let summary = match decode_segment_summary_verified(&trailer[0], &trailer[1])? {
         DecodeStatus::Sealed(value) => value,
         _ => return Err(StoreError::Corrupt),
     };
-    let segment_seal_pages = read_pair(device, base + u64::from(SEGMENT_SEAL_BODY_PAGE)).await?;
     let segment_seal =
-        match decode_segment_seal_verified(&segment_seal_pages[0], &segment_seal_pages[1])? {
+        match decode_segment_seal_verified(&trailer[2], &trailer[3])? {
             DecodeStatus::Sealed(value) => value,
             _ => return Err(StoreError::Corrupt),
         };
+    // VerifiedRecord owns both decoded fields and digests. Raw trailer pages
+    // are no longer needed while accumulating the extent proof vector.
+    drop(trailer);
 
     let mut relative = DATA_FIRST_PAGE;
     let mut descriptor_chain =
@@ -1733,13 +2278,24 @@ async fn scan_segment_with_matches<D: PageDevice>(
     let mut kind_bytes = [0_u64; 5];
     let mut first_target = 0_u64;
     let mut last_target = 0_u64;
+    validate_scan_summary_geometry(summary.value())?;
+    // Ordinal zero is a metadata-only segment probe, never an extent. With
+    // no requested matches/siblings and no cache to populate, stream every
+    // descriptor into the chain checks without retaining a duplicate table.
+    let retain_extents = memo.is_some() || pointer.ordinal != 0
+        || !additional.is_empty() || collect_authority_siblings || authority_generation.is_some();
     let mut extents = Vec::new();
-    extents
-        .try_reserve_exact(summary.value().record_count as usize)
-        .map_err(|_| StoreError::MemoryLimit)?;
+    if retain_extents {
+        reserve_scan_descriptors(&mut extents, summary.value().record_count as usize, descriptor_limit)?;
+    }
     for ordinal in 1..=summary.value().record_count {
-        let descriptor_pages = read_pair(device, base + u64::from(relative)).await?;
-        let extent = match decode_extent_verified(&descriptor_pages[0], &descriptor_pages[1])? {
+        if ordinal != 1 {
+            device
+                .read_pages(base + u64::from(relative), &mut header_pages[2..])
+                .await
+                .map_err(StoreError::Device)?;
+        }
+        let extent = match decode_extent_verified(&header_pages[2], &header_pages[3])? {
             DecodeStatus::Sealed(value) => value,
             _ => return Err(StoreError::Corrupt),
         };
@@ -1754,6 +2310,14 @@ async fn scan_segment_with_matches<D: PageDevice>(
             || (last_target != 0 && value.binding.target_checkpoint_generation < last_target)
         {
             return Err(StoreError::Corrupt);
+        }
+        let next_relative = relative.checked_add(value.record_span_pages)
+            .filter(|next| *next <= summary.value().next_free_page && *next <= DATA_END_PAGE)
+            .ok_or(StoreError::Corrupt)?;
+        if verify_payloads {
+            verify_payload_and_zero_padding(device,
+                base.checked_add(u64::from(value.payload_first_relative_page)).ok_or(StoreError::Corrupt)?,
+                value.payload_pages, value.payload_byte_len, value.payload_sha256).await?;
         }
         if first_target == 0 {
             first_target = value.binding.target_checkpoint_generation;
@@ -1790,11 +2354,12 @@ async fn scan_segment_with_matches<D: PageDevice>(
         kind_bytes[kind] = kind_bytes[kind]
             .checked_add(value.payload_byte_len)
             .ok_or(StoreError::Corrupt)?;
-        extents.push(value);
-        relative = relative
-            .checked_add(value.record_span_pages)
-            .ok_or(StoreError::Corrupt)?;
+        if retain_extents { extents.push(value); }
+        relative = next_relative;
     }
+    // Descriptor pairs have been decoded and accumulated; release their
+    // page window before interpreting matches or inserting the final proof.
+    drop(header_pages);
     let summary_value = summary.value();
     let seal_value = segment_seal.value();
     if relative != summary_value.next_free_page
@@ -1842,12 +2407,35 @@ async fn scan_segment_with_matches<D: PageDevice>(
         pointer,
         additional,
         collect_authority_siblings,
-        collect_authority_records,
+        authority_generation,
+        descriptor_limit,
     );
     if let Some(memo) = memo {
         memo.insert(pointer.segment_no, pointer.segment_generation, verified);
     }
     interpreted
+}
+
+// Include existing result capacity and possible old/new allocation overlap.
+// `retained` is the independently live scan table plus other result vectors.
+fn reserve_scan_results<E>(result: &mut Vec<ExtentRecord>, additional: usize,
+    retained: usize, limit: usize) -> Result<usize, StoreError<E>> {
+    let item = core::mem::size_of::<ExtentRecord>();
+    let needed = result.len().checked_add(additional).ok_or(StoreError::MemoryLimit)?;
+    let old = result.capacity().checked_mul(item).ok_or(StoreError::MemoryLimit)?;
+    let resident = retained.checked_add(old).ok_or(StoreError::MemoryLimit)?;
+    if resident > limit { return Err(StoreError::MemoryLimit); }
+    if needed <= result.capacity() { return Ok(resident); }
+    let requested = needed.checked_mul(item).ok_or(StoreError::MemoryLimit)?;
+    if resident.checked_add(requested).is_none_or(|bytes| bytes > limit) {
+        return Err(StoreError::MemoryLimit);
+    }
+    result.try_reserve_exact(additional).map_err(|_| StoreError::MemoryLimit)?;
+    let actual = result.capacity().checked_mul(item).ok_or(StoreError::MemoryLimit)?;
+    if resident.checked_add(actual).is_none_or(|bytes| bytes > limit) {
+        return Err(StoreError::MemoryLimit);
+    }
+    Ok(resident + actual)
 }
 
 /// Resolve one scan request against a segment's already-authenticated extent
@@ -1859,13 +2447,16 @@ fn interpret_verified_extents<E>(
     pointer: PointerValue,
     additional: &[PointerValue],
     collect_authority_siblings: bool,
-    collect_authority_records: bool,
+    authority_generation: Option<(u64, usize)>,
+    descriptor_limit: usize,
 ) -> Result<ScannedSegment, StoreError<E>> {
     let mut matched = None;
     let mut additional_matches = Vec::new();
-    additional_matches
-        .try_reserve_exact(additional.len())
-        .map_err(|_| StoreError::MemoryLimit)?;
+    let table_bytes = verified.extents.capacity().checked_mul(core::mem::size_of::<ExtentRecord>())
+        .ok_or(StoreError::MemoryLimit)?;
+    let mut descriptor_peak = reserve_scan_results(&mut additional_matches, additional.len(), table_bytes, descriptor_limit)?;
+    let retained = additional_matches.capacity().checked_mul(core::mem::size_of::<ExtentRecord>())
+        .and_then(|bytes| bytes.checked_add(table_bytes)).ok_or(StoreError::MemoryLimit)?;
     let mut authority_siblings = Vec::new();
     for value in &verified.extents {
         let value = *value;
@@ -1875,8 +2466,14 @@ fn interpret_verified_extents<E>(
         if relative == pointer.descriptor_relative_page && ordinal == pointer.ordinal {
             matched = Some(value);
         }
-        if collect_authority_records && value.extent_kind == ExtentKind::Authority {
-            authority_siblings.push(value);
+        if let Some((generation, maximum)) = authority_generation {
+            if value.extent_kind == ExtentKind::Authority
+                && value.binding.target_checkpoint_generation == generation
+            {
+                if authority_siblings.len() >= maximum { return Err(StoreError::Corrupt); }
+                descriptor_peak = descriptor_peak.max(reserve_scan_results(&mut authority_siblings, 1, retained, descriptor_limit)?);
+            }
+            collect_requested_authority(&mut authority_siblings, value, generation, maximum)?;
         }
         if collect_authority_siblings && ordinal > pointer.ordinal {
             let still_collecting = matched.as_ref().is_some_and(|first| {
@@ -1904,6 +2501,17 @@ fn interpret_verified_extents<E>(
                 {
                     return Err(StoreError::Corrupt);
                 }
+                if authority_siblings.is_empty() {
+                    // Leave one slot for extent zero so the authority reader
+                    // can take this allocation without allocating a copy.
+                    // Bound the reservation by authenticated segment geometry,
+                    // never just the extent count declared by this record.
+                    let available = verified.extents.len()
+                        .saturating_sub(pointer.ordinal.saturating_sub(1) as usize);
+                    descriptor_peak = descriptor_peak.max(reserve_scan_results(&mut authority_siblings,
+                        (first.extent_count as usize).min(available), retained, descriptor_limit)?);
+                }
+                descriptor_peak = descriptor_peak.max(reserve_scan_results(&mut authority_siblings, 1, retained, descriptor_limit)?);
                 authority_siblings.push(value);
             }
         }
@@ -1932,6 +2540,7 @@ fn interpret_verified_extents<E>(
         matched,
         additional_matches,
         authority_siblings,
+        descriptor_peak_bytes: descriptor_peak,
         record_count: verified.record_count,
         total_payload_bytes: verified.total_payload_bytes,
         segment_seal_body_sha256: verified.segment_seal_body_sha256,
@@ -1987,7 +2596,23 @@ fn validate_authority_extent_chain<E>(extents: &[ExtentRecord]) -> Result<(), St
     Ok(())
 }
 
-pub(crate) async fn read_pointer_payload<D: PageDevice>(
+pub(crate) fn read_pointer_payload<'a, D: PageDevice>(
+    device: &'a D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    pointer: PhysicalPointer,
+    expected_kind: ExtentKind,
+    maximum_bytes: usize,
+    memo: Option<&'a VerifiedSegmentScans>,
+) -> impl core::future::Future<Output = Result<ResolvedPayload, StoreError<D::Error>>> + 'a {
+    read_pointer_payload_with_read_capacity(device, store_uuid, admitted_segments,
+        next_segment_generation, checkpoint_generation, pointer, expected_kind,
+        maximum_bytes, memo, 0)
+}
+
+pub(crate) async fn read_pointer_payload_with_read_capacity<D: PageDevice>(
     device: &D,
     store_uuid: StoreUuid,
     admitted_segments: u64,
@@ -1997,6 +2622,7 @@ pub(crate) async fn read_pointer_payload<D: PageDevice>(
     expected_kind: ExtentKind,
     maximum_bytes: usize,
     memo: Option<&VerifiedSegmentScans>,
+    read_capacity_limit: usize,
 ) -> Result<ResolvedPayload, StoreError<D::Error>> {
     let PhysicalPointer::Value(pointer) = pointer else {
         return Err(StoreError::Corrupt);
@@ -2025,6 +2651,7 @@ pub(crate) async fn read_pointer_payload<D: PageDevice>(
         checkpoint_generation,
         extent,
         &scanned,
+        read_capacity_limit,
     )
     .await
 }
@@ -2118,8 +2745,10 @@ pub(crate) async fn read_pointer_payloads<D: PageDevice>(
         first,
         &additional,
         false,
-        false,
+        None,
         memo,
+        false,
+        usize::MAX,
     )
     .await?;
     let base = segment_base_page(first.segment_no)?;
@@ -2164,6 +2793,7 @@ pub(crate) async fn read_pointer_payloads<D: PageDevice>(
                 checkpoint_generation,
                 extent,
                 &scanned,
+                0,
             )
             .await?,
         );
@@ -2193,6 +2823,7 @@ async fn read_pointer_payload_after_scan<D: PageDevice>(
     checkpoint_generation: u64,
     extent: ExtentRecord,
     scanned: &ScannedSegment,
+    read_capacity_limit: usize,
 ) -> Result<ResolvedPayload, StoreError<D::Error>> {
     let base = segment_base_page(pointer.segment_no)?;
     if pointer.payload_relative_page
@@ -2225,23 +2856,12 @@ async fn read_pointer_payload_after_scan<D: PageDevice>(
         return Err(StoreError::Corrupt);
     }
     let exact_len = usize::try_from(pointer.exact_byte_len).map_err(|_| StoreError::Corrupt)?;
-    let mut bytes = vec![0; exact_len];
-    let mut copied = 0;
-    for index in 0..pointer.payload_pages {
-        let mut page = Box::new([0; PAGE_SIZE]);
-        device
-            .read_page(
-                base + u64::from(pointer.payload_relative_page) + u64::from(index),
-                page.as_mut(),
-            )
-            .await
-            .map_err(StoreError::Device)?;
-        let remaining = exact_len - copied;
-        let take = remaining.min(PAGE_SIZE);
-        bytes[copied..copied + take].copy_from_slice(&page[..take]);
-        copied += take;
+    if exact_len.div_ceil(PAGE_SIZE) != pointer.payload_pages as usize {
+        return Err(StoreError::Corrupt);
     }
-    if copied != exact_len || payload_sha256(&bytes) != pointer.payload_sha256 {
+    let bytes = read_payload_owned(device, base + u64::from(pointer.payload_relative_page),
+        exact_len, read_capacity_limit).await?;
+    if payload_sha256(&bytes) != pointer.payload_sha256 {
         return Err(StoreError::Corrupt);
     }
     Ok(ResolvedPayload {
@@ -2253,11 +2873,57 @@ async fn read_pointer_payload_after_scan<D: PageDevice>(
     })
 }
 
+// Opt-in only: recovery callers retain exact allocation and tail-scratch behavior.
+// A single small blob may use its explicit envelope budget to include the tail
+// in one device request. No request exceeds the existing 32-page maximum.
+async fn read_payload_owned<D: PageDevice>(
+    device: &D, first: u64, exact_len: usize, capacity_limit: usize,
+) -> Result<Vec<u8>, StoreError<D::Error>> {
+    let rounded = exact_len.checked_next_multiple_of(PAGE_SIZE).ok_or(StoreError::MemoryLimit)?;
+    let coalesce = exact_len > PAGE_SIZE && exact_len % PAGE_SIZE != 0
+        && rounded <= 32 * PAGE_SIZE && rounded <= capacity_limit;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(if coalesce { rounded } else { exact_len })
+        .map_err(|_| StoreError::MemoryLimit)?;
+    if coalesce && bytes.capacity() > capacity_limit {
+        return Err(StoreError::MemoryLimit);
+    }
+    bytes.resize(if coalesce { rounded } else { exact_len }, 0);
+    read_payload_into(device, first, &mut bytes).await?;
+    bytes.truncate(exact_len);
+    Ok(bytes)
+}
+
+async fn read_payload_into<D: PageDevice>(
+    device: &D,
+    payload_first: u64,
+    bytes: &mut [u8],
+) -> Result<(), StoreError<D::Error>> {
+    // Read full pages directly into the final payload allocation. This keeps
+    // the recovery memory bound unchanged while issuing up to 128 KiB per
+    // request instead of allocating/copying one temporary page per read.
+    let (pages, tail) = bytes.as_chunks_mut::<PAGE_SIZE>();
+    let full_pages = pages.len();
+    for (index, chunk) in pages.chunks_mut(32).enumerate() {
+        device.read_pages(payload_first + (index * 32) as u64, chunk)
+            .await.map_err(StoreError::Device)?;
+    }
+    if !tail.is_empty() {
+        let mut page = Box::new([0; PAGE_SIZE]);
+        device
+            .read_page(payload_first + full_pages as u64, page.as_mut())
+            .await
+            .map_err(StoreError::Device)?;
+        tail.copy_from_slice(&page[..tail.len()]);
+    }
+    Ok(())
+}
+
 fn recovery_remaining<E>(limit: usize, resident: usize) -> Result<usize, StoreError<E>> {
     limit.checked_sub(resident).ok_or(StoreError::MemoryLimit)
 }
 
-fn recovery_preflight_decode<E>(
+pub(crate) fn recovery_preflight_decode<E>(
     limit: usize,
     resident: usize,
     encoded_capacity: usize,
@@ -2284,7 +2950,7 @@ fn input_u32(input: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
-fn allocation_decode_capacity_upper_bound<E>(
+pub(crate) fn allocation_decode_capacity_upper_bound<E>(
     input: &[u8],
     version: u16,
     admitted_segments: u64,
@@ -2313,7 +2979,7 @@ fn allocation_decode_capacity_upper_bound<E>(
     }
 }
 
-fn cas_snapshot_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
+pub(crate) fn cas_snapshot_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
     let object_count = input_u32(input, 0x18).ok_or(StoreError::Corrupt)? as usize;
     let blob_count = input_u32(input, 0x1c).ok_or(StoreError::Corrupt)? as usize;
     let expected_len = object_count
@@ -2341,7 +3007,7 @@ fn catalog_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreEr
         .ok_or(StoreError::MemoryLimit)
 }
 
-fn blob_manifest_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
+pub(crate) fn blob_manifest_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
     let extent_count = input_u32(input, 0x58).ok_or(StoreError::Corrupt)? as usize;
     let expected_len = extent_count
         .checked_mul(MANIFEST_EXTENT_LEN)
@@ -2378,6 +3044,9 @@ fn persistent_authority_decode_capacity_upper_bound<E>(
     let object_count = input_u32(input, 0x38).ok_or(StoreError::Corrupt)? as usize;
     let principal_count = input_u32(input, 0x3c).ok_or(StoreError::Corrupt)? as usize;
     let record_count = input_u32(input, 0x40).ok_or(StoreError::Corrupt)? as usize;
+    // V1 reserves this field as zero; V2 uses it for the external-root table.
+    // Full snapshot decoding still validates the version and reserved fields.
+    let external_root_count = input_u32(input, 0x70).ok_or(StoreError::Corrupt)? as usize;
     object_count
         .checked_mul(core::mem::size_of::<
             crate::authority_snapshot::PersistentObjectBinding,
@@ -2388,11 +3057,42 @@ fn persistent_authority_decode_capacity_upper_bound<E>(
                 .checked_add(bytes)
         })
         .and_then(|bytes| {
+            external_root_count
+                .checked_mul(core::mem::size_of::<PersistentRootEntry>())?
+                .checked_add(bytes)
+        })
+        .and_then(|bytes| {
             record_count
                 .checked_mul(vibeos_durable_format::RECORD_SIZE)?
                 .checked_add(bytes)
         })
         .ok_or(StoreError::MemoryLimit)
+}
+
+
+pub(crate) fn persistent_authority_recovery_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
+    let decoded = persistent_authority_decode_capacity_upper_bound(input)?;
+    let objects = input_u32(input, 0x38).ok_or(StoreError::Corrupt)? as usize;
+    let external = input_u32(input, 0x70).ok_or(StoreError::Corrupt)? as usize;
+    objects.checked_add(external)
+        .and_then(|count| count.checked_mul(mem::size_of::<PersistentRootEntry>()))
+        .and_then(|roots| decoded.checked_add(roots))
+        .ok_or(StoreError::MemoryLimit)
+}
+
+pub(crate) fn authority_roots_from_snapshot<E>(decoded: &PersistentAuthoritySnapshot) -> Result<PersistentRootSet, StoreError<E>> {
+    let count = decoded.objects.len().checked_add(decoded.external_roots().len())
+        .ok_or(StoreError::MemoryLimit)?;
+    let mut entries = Vec::new();
+    entries.try_reserve_exact(count).map_err(|_| StoreError::MemoryLimit)?;
+    entries.extend(decoded.objects.iter().map(|binding| PersistentRootEntry {
+        object_id: binding.v2_object_id,
+        commit_generation: binding.commit_generation,
+        object_kind: binding.object_kind,
+    }));
+    entries.extend_from_slice(decoded.external_roots());
+    entries.sort_unstable_by_key(|entry| entry.object_id);
+    PersistentRootSet::new(decoded.checkpoint_generation(), entries).map_err(|_| StoreError::Corrupt)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2406,6 +3106,7 @@ async fn read_recovery_pointer_payload<D: PageDevice>(
     expected_kind: ExtentKind,
     memory_limit: usize,
     resident_bytes: usize,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<ResolvedPayload, StoreError<D::Error>> {
     let remaining = recovery_remaining(memory_limit, resident_bytes)?;
     if let PhysicalPointer::Value(pointer) = pointer {
@@ -2426,13 +3127,13 @@ async fn read_recovery_pointer_payload<D: PageDevice>(
         pointer,
         expected_kind,
         remaining,
-        None,
+        memo,
     )
     .await
 }
 
-/// Scan one allocated segment and return every Authority extent record it
-/// contains, authenticated by the segment's full descriptor/summary/seal
+/// Scan one allocated segment and return Authority records of the requested
+/// generation, bounded before allocation and authenticated by the segment's full descriptor/summary/seal
 /// chain. Used to reassemble authority chains whose extents span segments.
 pub(crate) async fn scan_segment_authority_records<D: PageDevice>(
     device: &D,
@@ -2442,7 +3143,10 @@ pub(crate) async fn scan_segment_authority_records<D: PageDevice>(
     checkpoint_generation: u64,
     segment_no: u64,
     maximum: usize,
-) -> Result<Vec<ExtentRecord>, StoreError<D::Error>> {
+    target_generation: u64,
+    memo: Option<&VerifiedSegmentScans>,
+    descriptor_limit: usize,
+) -> Result<(Vec<ExtentRecord>, usize), StoreError<D::Error>> {
     let base = segment_base_page(segment_no)?;
     let header_pages = read_pair(device, base).await?;
     let header = match decode_segment_header_verified(&header_pages[0], &header_pages[1])? {
@@ -2455,6 +3159,10 @@ pub(crate) async fn scan_segment_authority_records<D: PageDevice>(
     {
         return Err(StoreError::Corrupt);
     }
+    // The verified header owns its decoded fields. Release the discovery
+    // pair before the full scan allocates its header/trailer page windows;
+    // otherwise this source path exceeds the eight-page probe workspace.
+    drop(header_pages);
     let pointer = PointerValue {
         store_uuid,
         segment_no,
@@ -2476,14 +3184,109 @@ pub(crate) async fn scan_segment_authority_records<D: PageDevice>(
         pointer,
         &[],
         false,
-        true,
-        None,
+        Some((target_generation, maximum)),
+        memo,
+        false,
+        descriptor_limit,
     )
     .await?;
-    if scanned.authority_siblings.len() > maximum {
+    Ok((scanned.authority_siblings, scanned.descriptor_peak_bytes))
+}
+
+// Filter before reserving: historical authority generations must neither grow
+// the result Vec nor consume the selected chain's descriptor count budget.
+fn collect_requested_authority<E>(
+    records: &mut Vec<ExtentRecord>,
+    extent: ExtentRecord,
+    generation: u64,
+    maximum: usize,
+) -> Result<(), StoreError<E>> {
+    if extent.extent_kind != ExtentKind::Authority
+        || extent.binding.target_checkpoint_generation != generation
+    {
+        return Ok(());
+    }
+    if records.len() >= maximum {
+        return Err(StoreError::Corrupt);
+    }
+    records.try_reserve_exact(1).map_err(|_| StoreError::MemoryLimit)?;
+    records.push(extent);
+    Ok(())
+}
+
+// Siblings are authenticated by the scan. Keep their allocation where useful,
+// charging any growth overlap; otherwise charge the old list while allocating
+// the exact-size replacement. Leave one slot for the caller to add extent zero.
+fn prepare_authority_chain_storage<E>(siblings: Vec<ExtentRecord>, first: &ExtentRecord,
+    limit: usize) -> Result<(Vec<ExtentRecord>, usize), StoreError<E>> {
+    let mut peak = 0;
+    let count = first.extent_count as usize;
+    let mut records = if siblings.capacity() <= count {
+        siblings
+    } else {
+        let retained = siblings.capacity().checked_mul(core::mem::size_of::<ExtentRecord>())
+            .ok_or(StoreError::MemoryLimit)?;
+        let mut records = Vec::new();
+        peak = reserve_scan_results(&mut records, count, retained, limit)?;
+        collect_authority_generation(&mut records, siblings, first)?;
+        records
+    };
+    if records.len() >= count { return Err(StoreError::Corrupt); }
+    let additional = count - records.len();
+    peak = peak.max(reserve_scan_results(&mut records, additional, 0, limit)?);
+    Ok((records, peak))
+}
+
+// Retain only the selected generation while scanning historical segments. The
+// caller reserves the chain's declared count once; unrelated history must not
+// grow that allocation, and excess matching records are corruption.
+fn collect_authority_generation<E>(
+    records: &mut Vec<ExtentRecord>,
+    candidates: impl IntoIterator<Item = ExtentRecord>,
+    first: &ExtentRecord,
+) -> Result<(), StoreError<E>> {
+    for extent in candidates {
+        if extent.binding.target_checkpoint_generation != first.binding.target_checkpoint_generation {
+            continue;
+        }
+        if records.len() >= first.extent_count as usize {
+            return Err(StoreError::Corrupt);
+        }
+        records.push(extent);
+    }
+    Ok(())
+}
+
+// Bound the declared chain before reserving its descriptor array or scanning
+// other segments. Authority chunks have a fixed stride and a nonempty tail.
+fn validate_authority_payload_bound<E>(first: &ExtentRecord, maximum: usize) -> Result<(), StoreError<E>> {
+    if first.extent_index != 0 || first.encoded_offset != 0 || first.extent_count == 0
+        || first.payload_byte_len == 0
+        || first.payload_byte_len > MAX_EXTENT_PAYLOAD_PAGES as u64 * PAGE_SIZE as u64
+        || first.content_byte_len != first.encoded_blob_len
+    {
+        return Err(StoreError::Corrupt);
+    }
+    let stride = first.payload_byte_len;
+    let minimum = stride.checked_mul(u64::from(first.extent_count - 1))
+        .and_then(|n| n.checked_add(1)).ok_or(StoreError::Corrupt)?;
+    let upper = stride.checked_mul(u64::from(first.extent_count)).ok_or(StoreError::Corrupt)?;
+    if first.encoded_blob_len < minimum || first.encoded_blob_len > upper {
+        return Err(StoreError::Corrupt);
+    }
+    if first.encoded_blob_len > maximum as u64 {
         return Err(StoreError::MemoryLimit);
     }
-    Ok(scanned.authority_siblings)
+    let descriptor_size = core::mem::size_of::<ExtentRecord>();
+    let descriptor_bytes = (first.extent_count as usize).checked_mul(descriptor_size)
+        .ok_or(StoreError::MemoryLimit)?;
+    // A single descriptor is fixed read overhead even for a tiny payload.
+    // Variable chain storage must independently fit the supplied budget;
+    // this is not yet accounting for all simultaneously live scan buffers.
+    if descriptor_bytes > maximum.max(descriptor_size) {
+        return Err(StoreError::MemoryLimit);
+    }
+    Ok(())
 }
 
 /// Resolve a possibly multi-extent authority payload. Extent 0 is named by
@@ -2499,9 +3302,55 @@ pub(crate) async fn read_pointer_authority_payload<D: PageDevice>(
     next_segment_generation: u64,
     checkpoint_generation: u64,
     pointer: PhysicalPointer,
-    allocated_segments: &[u64],
+    allocated_segments: impl Iterator<Item = u64>,
     maximum_bytes: usize,
 ) -> Result<(Vec<u8>, ExtentRecord), StoreError<D::Error>> {
+    read_pointer_authority_payload_with_memo(device, store_uuid, admitted_segments,
+        next_segment_generation, checkpoint_generation, pointer, allocated_segments,
+        maximum_bytes, None).await
+}
+
+// Test-only observations of real authority reads, with no allocator hooks or
+// production counters: reads with siblings, allocation reused without growth.
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static AUTHORITY_CHAIN_REUSE: core::cell::Cell<(usize, usize)> = const {
+        core::cell::Cell::new((0, 0))
+    };
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn read_pointer_authority_payload_with_memo<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    pointer: PhysicalPointer,
+    allocated_segments: impl Iterator<Item = u64>,
+    maximum_bytes: usize,
+    memo: Option<&VerifiedSegmentScans>,
+) -> Result<(Vec<u8>, ExtentRecord), StoreError<D::Error>> {
+    read_pointer_authority_payload_with_buffer_limit(device, store_uuid, admitted_segments,
+        next_segment_generation, checkpoint_generation, pointer, allocated_segments,
+        maximum_bytes, usize::MAX, memo).await.map(|(bytes, record, _)| (bytes, record))
+}
+
+// Bounds owned scan/result/chain vectors and payload, returning their peak.
+// Fixed page buffers and aggregate caller-owned memo allocations are separate.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn read_pointer_authority_payload_with_buffer_limit<D: PageDevice>(
+    device: &D,
+    store_uuid: StoreUuid,
+    admitted_segments: u64,
+    next_segment_generation: u64,
+    checkpoint_generation: u64,
+    pointer: PhysicalPointer,
+    allocated_segments: impl Iterator<Item = u64>,
+    maximum_bytes: usize,
+    payload_chain_limit: usize,
+    memo: Option<&VerifiedSegmentScans>,
+) -> Result<(Vec<u8>, ExtentRecord, usize), StoreError<D::Error>> {
     let PhysicalPointer::Value(pointer) = pointer else {
         return Err(StoreError::Corrupt);
     };
@@ -2519,23 +3368,50 @@ pub(crate) async fn read_pointer_authority_payload<D: PageDevice>(
         pointer,
         &[],
         true,
-        false,
         None,
+        memo,
+        false,
+        payload_chain_limit,
     )
     .await?;
     let first = scanned.matched.ok_or(StoreError::Corrupt)?;
-    let mut records = Vec::new();
-    records
-        .try_reserve_exact(first.extent_count as usize)
-        .map_err(|_| StoreError::MemoryLimit)?;
+    validate_authority_payload_bound(&first, maximum_bytes)?;
+    let requested_chain_bytes = (first.extent_count as usize)
+        .checked_mul(core::mem::size_of::<ExtentRecord>()).ok_or(StoreError::MemoryLimit)?;
+    if requested_chain_bytes > payload_chain_limit { return Err(StoreError::MemoryLimit); }
+    #[cfg(test)]
+    let sibling_allocation = (
+        scanned.authority_siblings.as_ptr(), scanned.authority_siblings.capacity(),
+        !scanned.authority_siblings.is_empty(),
+    );
+    let mut descriptor_peak = scanned.descriptor_peak_bytes;
+    let (mut records, chain_preparation_peak) = prepare_authority_chain_storage(
+        scanned.authority_siblings, &first, payload_chain_limit)?;
+    descriptor_peak = descriptor_peak.max(chain_preparation_peak);
+    let descriptor_bytes = records.capacity().checked_mul(core::mem::size_of::<ExtentRecord>())
+        .ok_or(StoreError::MemoryLimit)?;
+    if descriptor_bytes > maximum_bytes.max(core::mem::size_of::<ExtentRecord>())
+        || descriptor_bytes > payload_chain_limit
+    {
+        return Err(StoreError::MemoryLimit);
+    }
+    #[cfg(test)]
+    if sibling_allocation.2 {
+        let reused = sibling_allocation.1 <= first.extent_count as usize
+            && records.as_ptr() == sibling_allocation.0
+            && records.capacity() == sibling_allocation.1;
+        AUTHORITY_CHAIN_REUSE.with(|stats| {
+            let (reads, stable) = stats.get();
+            stats.set((reads + 1, stable + usize::from(reused)));
+        });
+    }
     records.push(first);
-    records.extend(scanned.authority_siblings.iter().copied());
     if records.len() as u32 != first.extent_count {
-        for segment_no in allocated_segments.iter().copied() {
+        for segment_no in allocated_segments {
             if segment_no == pointer.segment_no {
                 continue;
             }
-            let found = scan_segment_authority_records(
+            let (found, scan_peak) = scan_segment_authority_records(
                 device,
                 store_uuid,
                 admitted_segments,
@@ -2543,16 +3419,15 @@ pub(crate) async fn read_pointer_authority_payload<D: PageDevice>(
                 checkpoint_generation,
                 segment_no,
                 first.extent_count as usize,
+                first.binding.target_checkpoint_generation,
+                memo,
+                payload_chain_limit.checked_sub(descriptor_bytes).ok_or(StoreError::MemoryLimit)?,
             )
             .await?;
-            records.extend(found);
+            descriptor_peak = descriptor_peak.max(descriptor_bytes.checked_add(scan_peak).ok_or(StoreError::MemoryLimit)?);
+            collect_authority_generation(&mut records, found, &first)?;
         }
     }
-    // Older generations' authority chains remain allocated on media; only
-    // extents targeting this checkpoint's generation belong to the chain.
-    records.retain(|extent| {
-        extent.binding.target_checkpoint_generation == first.binding.target_checkpoint_generation
-    });
     records.sort_unstable_by_key(|extent| extent.extent_index);
     validate_authority_extent_chain(&records)?;
     if records.len() as u32 != first.extent_count {
@@ -2563,45 +3438,61 @@ pub(crate) async fn read_pointer_authority_payload<D: PageDevice>(
             .map_err(|_| StoreError::Corrupt)
             .and_then(|bytes| total.checked_add(bytes).ok_or(StoreError::Corrupt))
     })?;
+    if total as u64 != first.encoded_blob_len {
+        return Err(StoreError::Corrupt);
+    }
     if total > maximum_bytes {
         return Err(StoreError::MemoryLimit);
     }
+    let chain_bytes = records.capacity().checked_mul(core::mem::size_of::<ExtentRecord>())
+        .ok_or(StoreError::MemoryLimit)?;
+    if total.checked_add(chain_bytes).is_none_or(|bytes| bytes > payload_chain_limit) {
+        return Err(StoreError::MemoryLimit);
+    }
     let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(total)
-        .map_err(|_| StoreError::MemoryLimit)?;
+    bytes.try_reserve_exact(total).map_err(|_| StoreError::MemoryLimit)?;
+    if bytes.capacity() > maximum_bytes || bytes.capacity().checked_add(chain_bytes)
+        .is_none_or(|bytes| bytes > payload_chain_limit)
+    {
+        return Err(StoreError::MemoryLimit);
+    }
+    let mut single_extent_digest = None;
     for extent in &records {
         let exact_len =
             usize::try_from(extent.payload_byte_len).map_err(|_| StoreError::Corrupt)?;
         let base = segment_base_page(extent.binding.segment_no)?;
-        let mut chunk = Vec::new();
-        chunk
-            .try_reserve_exact(exact_len)
-            .map_err(|_| StoreError::MemoryLimit)?;
-        let mut copied = 0;
-        for index in 0..extent.payload_pages {
-            let mut page = Box::new([0; PAGE_SIZE]);
-            device
-                .read_page(
-                    base + u64::from(extent.payload_first_relative_page) + u64::from(index),
-                    page.as_mut(),
-                )
-                .await
-                .map_err(StoreError::Device)?;
-            let remaining = exact_len - copied;
-            let take = remaining.min(PAGE_SIZE);
-            chunk.extend_from_slice(&page[..take]);
-            copied += take;
-        }
-        if copied != exact_len || payload_sha256(&chunk) != extent.payload_sha256 {
+        if exact_len.div_ceil(PAGE_SIZE) != extent.payload_pages as usize {
             return Err(StoreError::Corrupt);
         }
-        bytes.extend_from_slice(&chunk);
+        let start = bytes.len();
+        let end = start.checked_add(exact_len).ok_or(StoreError::Corrupt)?;
+        if end > total {
+            return Err(StoreError::Corrupt);
+        }
+        bytes.resize(end, 0);
+        let chunk = &mut bytes[start..end];
+        read_payload_into(
+            device, base + u64::from(extent.payload_first_relative_page), chunk,
+        ).await?;
+        let observed = payload_sha256(chunk);
+        if observed != extent.payload_sha256 {
+            return Err(StoreError::Corrupt);
+        }
+        if first.extent_count == 1 {
+            single_extent_digest = Some(observed);
+        }
     }
-    if bytes.len() != total || payload_sha256(&bytes) != records[0].merkle_root {
+    // The sole extent is the entire logical payload. Compare its observed
+    // digest with both commitments without hashing identical bytes twice.
+    // Multi-extent reads still hash the complete concatenated payload.
+    drop(records);
+    let complete_digest = single_extent_digest.unwrap_or_else(|| payload_sha256(&bytes));
+    if bytes.len() != total || complete_digest != first.merkle_root {
         return Err(StoreError::Corrupt);
     }
-    Ok((bytes, first))
+    let source_peak = descriptor_peak.max(bytes.capacity().checked_add(chain_bytes).ok_or(StoreError::MemoryLimit)?);
+    if source_peak > payload_chain_limit { return Err(StoreError::MemoryLimit); }
+    Ok((bytes, first, source_peak))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2612,9 +3503,10 @@ async fn read_recovery_authority_payload<D: PageDevice>(
     next_segment_generation: u64,
     checkpoint_generation: u64,
     pointer: PhysicalPointer,
-    allocated_segments: &[u64],
+    allocated_segments: impl Iterator<Item = u64>,
     memory_limit: usize,
     resident_bytes: usize,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<(Vec<u8>, ExtentRecord), StoreError<D::Error>> {
     let remaining = recovery_remaining(memory_limit, resident_bytes)?;
     if let PhysicalPointer::Value(pointer) = pointer {
@@ -2627,7 +3519,7 @@ async fn read_recovery_authority_payload<D: PageDevice>(
             return Err(StoreError::MemoryLimit);
         }
     }
-    read_pointer_authority_payload(
+    read_pointer_authority_payload_with_memo(
         device,
         store_uuid,
         admitted_segments,
@@ -2636,8 +3528,100 @@ async fn read_recovery_authority_payload<D: PageDevice>(
         pointer,
         allocated_segments,
         remaining,
+        memo,
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recover_checkpoint_pair<D: PageDevice>(
+    device: &D,
+    superblock: Superblock,
+    left: Option<VerifiedRecord<Checkpoint>>,
+    right: Option<VerifiedRecord<Checkpoint>>,
+    selected_generation: u64,
+    limits: StoreLimits,
+    memo: Option<&VerifiedSegmentScans>,
+) -> Result<MountedState, StoreError<D::Error>> {
+    let state = match (left, right) {
+            (Some(left), Some(right)) => {
+                let (older, newer) =
+                    if left.value().binding.generation < right.value().binding.generation {
+                        (left, right)
+                    } else if right.value().binding.generation < left.value().binding.generation {
+                        (right, left)
+                    } else {
+                        return Err(StoreError::Corrupt);
+                    };
+                if newer.value().binding.generation != selected_generation {
+                    return Err(StoreError::Corrupt);
+                }
+                let older_state =
+                    recover_state_with_memo(device, superblock, older, limits, memo).await?;
+                let older_peak = older_state.recovery_peak_bytes;
+                let witness = CheckpointTransitionWitness::from_mounted(older_state);
+                let witness_bytes = witness.resident_bytes().ok_or(StoreError::MemoryLimit)?;
+                let remaining = limits
+                    .recovery_memory_bytes
+                    .checked_sub(witness_bytes)
+                    .ok_or(StoreError::MemoryLimit)?;
+                let newer_limits = StoreLimits {
+                    recovery_memory_bytes: remaining,
+                    ..limits
+                };
+                let mut newer_state =
+                    recover_state_with_memo(device, superblock, newer, newer_limits, memo).await?;
+                validate_checkpoint_transition(&witness, &newer_state)?;
+                let pair_peak = witness_bytes
+                    .checked_add(newer_state.recovery_peak_bytes)
+                    .ok_or(StoreError::MemoryLimit)?;
+                newer_state.recovery_peak_bytes = older_peak.max(pair_peak);
+                if newer_state.recovery_peak_bytes > limits.recovery_memory_bytes {
+                    return Err(StoreError::MemoryLimit);
+                }
+                newer_state
+            }
+            (Some(candidate), None) | (None, Some(candidate)) => {
+                if candidate.value().binding.generation != selected_generation {
+                    return Err(StoreError::Corrupt);
+                }
+                recover_state_with_memo(device, superblock, candidate, limits, memo).await?
+            }
+            (None, None) => return Err(StoreError::Unformatted),
+        };
+    Ok(state)
+}
+
+/// Scrub must establish fresh media proofs, independently of mount and prior
+/// scrub calls. Cache only within this checkpoint reconstruction, then drop it
+/// before the caller's separate content/padding/closure verification.
+pub(crate) async fn recover_state_for_scrub<D: PageDevice>(
+    device: &D,
+    superblock: Superblock,
+    checkpoint: VerifiedRecord<Checkpoint>,
+    limits: StoreLimits,
+) -> Result<MountedState, StoreError<D::Error>> {
+    const MEMO_BYTES: usize = 64 * 1024;
+    if let Some(remaining) = limits.recovery_memory_bytes.checked_sub(MEMO_BYTES) {
+        let memo = VerifiedSegmentScans::with_budget(MEMO_BYTES, 32);
+        let cached_limits = StoreLimits { recovery_memory_bytes: remaining, ..limits };
+        match recover_state_with_memo(device, superblock, checkpoint, cached_limits, Some(&memo)).await {
+            Ok(mut state) => {
+                debug_assert!(memo.allocated_bytes() <= MEMO_BYTES);
+                state.recovery_peak_bytes = state.recovery_peak_bytes
+                    .checked_add(MEMO_BYTES).ok_or(StoreError::MemoryLimit)?;
+                return Ok(state);
+            }
+            Err(StoreError::MemoryLimit) => {
+                drop(memo);
+                let mut state = recover_state(device, superblock, checkpoint, limits).await?;
+                state.recovery_peak_bytes = limits.recovery_memory_bytes;
+                return Ok(state);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    recover_state(device, superblock, checkpoint, limits).await
 }
 
 pub(crate) async fn recover_state<D: PageDevice>(
@@ -2645,6 +3629,16 @@ pub(crate) async fn recover_state<D: PageDevice>(
     superblock: Superblock,
     checkpoint: VerifiedRecord<Checkpoint>,
     limits: StoreLimits,
+) -> Result<MountedState, StoreError<D::Error>> {
+    recover_state_with_memo(device, superblock, checkpoint, limits, None).await
+}
+
+async fn recover_state_with_memo<D: PageDevice>(
+    device: &D,
+    superblock: Superblock,
+    checkpoint: VerifiedRecord<Checkpoint>,
+    limits: StoreLimits,
+    memo: Option<&VerifiedSegmentScans>,
 ) -> Result<MountedState, StoreError<D::Error>> {
     let checkpoint = *checkpoint.value();
     let mut catalog = Vec::new();
@@ -2693,6 +3687,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
             ExtentKind::Allocation,
             limits.recovery_memory_bytes,
             0,
+            memo,
         )
         .await?;
         let allocation_encoded_bytes = payload.bytes.capacity();
@@ -2797,12 +3792,10 @@ pub(crate) async fn recover_state<D: PageDevice>(
             ExtentKind::Catalog,
             limits.recovery_memory_bytes,
             allocation_bytes,
+            memo,
         )
         .await?;
         if snapshot.bytes.starts_with(b"VIBECAS2") {
-            if checkpoint.replay_count != 0 || checkpoint.replay_tail != PhysicalPointer::Null {
-                return Err(StoreError::Corrupt);
-            }
             let context = CasCodecContext::new(
                 superblock.binding.store_uuid,
                 checkpoint.admitted_segments,
@@ -2825,19 +3818,129 @@ pub(crate) async fn recover_state<D: PageDevice>(
             {
                 return Err(StoreError::Corrupt);
             }
-            let cas_bytes = decoded
-                .objects
+            let snapshot_generation = decoded.checkpoint_generation;
+            let CasSnapshot {
+                objects: mut objects,
+                blobs: mut blobs,
+                ..
+            } = decoded;
+            let snapshot_capacity = snapshot.bytes.capacity();
+            // The decoded tables own their data; release the encoded snapshot
+            // before reading anything else so the measured recovery peak is
+            // also the actual live-memory bound.
+            drop(snapshot);
+            if checkpoint.replay_count != 0 {
+                // Bounded replay: every delta after the snapshot root minted
+                // exactly one object (and at most one new Blob). Walk the
+                // chain from the checkpoint's tail back to the root, then
+                // apply it in commit order under the frozen chain rules.
+                let replay_count = checkpoint.replay_count as usize;
+                let chain_bytes = replay_count
+                    .checked_mul(mem::size_of::<CasDelta>())
+                    .ok_or(StoreError::MemoryLimit)?;
+                let table_bytes = objects
+                    .capacity()
+                    .checked_mul(mem::size_of::<ObjectMapping>())
+                    .and_then(|bytes| {
+                        blobs
+                            .capacity()
+                            .checked_mul(mem::size_of::<BlobMapping>())
+                            .and_then(|more| bytes.checked_add(more))
+                    })
+                    .ok_or(StoreError::MemoryLimit)?;
+                let replay_resident = allocation_bytes
+                    .checked_add(table_bytes)
+                    .and_then(|bytes| bytes.checked_add(chain_bytes))
+                    .ok_or(StoreError::MemoryLimit)?;
+                recovery_observe(
+                    &mut recovery_peak,
+                    limits.recovery_memory_bytes,
+                    replay_resident,
+                )?;
+                let mut chain: Vec<CasDelta> = Vec::new();
+                chain
+                    .try_reserve_exact(replay_count)
+                    .map_err(|_| StoreError::MemoryLimit)?;
+                let mut pointer = checkpoint.replay_tail;
+                let mut depth = checkpoint.replay_count;
+                while depth != 0 {
+                    require_allocated_pointer(&allocation, pointer)?;
+                    let record = read_recovery_pointer_payload(
+                        device,
+                        superblock.binding.store_uuid,
+                        checkpoint.admitted_segments,
+                        checkpoint.next_segment_generation,
+                        checkpoint.binding.generation,
+                        pointer,
+                        ExtentKind::CatalogDelta,
+                        limits.recovery_memory_bytes,
+                        replay_resident,
+                        memo,
+                    )
+                    .await?;
+                    let delta = decode_cas_delta(&record.bytes, context)
+                        .map_err(|_| StoreError::Corrupt)?;
+                    if delta.chain_count != depth
+                        || delta.checkpoint_generation > checkpoint.binding.generation
+                        || delta.checkpoint_generation
+                            != record.extent.binding.target_checkpoint_generation
+                    {
+                        return Err(StoreError::Corrupt);
+                    }
+                    chain.push(delta);
+                    pointer = delta.previous_delta;
+                    depth -= 1;
+                }
+                if pointer != PhysicalPointer::Null {
+                    return Err(StoreError::Corrupt);
+                }
+                objects
+                    .try_reserve(replay_count)
+                    .map_err(|_| StoreError::MemoryLimit)?;
+                blobs
+                    .try_reserve(replay_count)
+                    .map_err(|_| StoreError::MemoryLimit)?;
+                let mut previous_generation = snapshot_generation;
+                let mut previous_id = objects.last().map_or(0, |object| object.object_id);
+                for delta in chain.iter().rev() {
+                    // Chain generations never decrease (one checkpoint may
+                    // append several deltas), ObjectIds strictly increase, a
+                    // reuse resolves an already published Blob and a new
+                    // Blob mapping publishes its key exactly once.
+                    if delta.checkpoint_generation < previous_generation
+                        || delta.object.object_id <= previous_id
+                    {
+                        return Err(StoreError::Corrupt);
+                    }
+                    previous_generation = delta.checkpoint_generation;
+                    previous_id = delta.object.object_id;
+                    let position =
+                        blobs.binary_search_by_key(&delta.object.blob_key, |blob| blob.blob_key);
+                    match (delta.new_blob, position) {
+                        (None, Ok(_)) => {}
+                        (Some(blob), Err(insert)) if blob.blob_key == delta.object.blob_key => {
+                            blobs.insert(insert, blob);
+                        }
+                        _ => return Err(StoreError::Corrupt),
+                    }
+                    objects.push(delta.object);
+                }
+                if objects.len() > limits.max_catalog_entries as usize
+                    || blobs.len() > limits.max_catalog_entries as usize
+                {
+                    return Err(StoreError::Corrupt);
+                }
+            }
+            let cas_bytes = objects
                 .capacity()
                 .checked_mul(mem::size_of::<ObjectMapping>())
                 .and_then(|bytes| {
-                    decoded
-                        .blobs
+                    blobs
                         .capacity()
                         .checked_mul(mem::size_of::<BlobMapping>())
                         .and_then(|more| bytes.checked_add(more))
                 })
                 .ok_or(StoreError::MemoryLimit)?;
-            let snapshot_capacity = snapshot.bytes.capacity();
             recovery_observe(
                 &mut recovery_peak,
                 limits.recovery_memory_bytes,
@@ -2846,11 +3949,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
                     .and_then(|bytes| bytes.checked_add(snapshot_capacity))
                     .ok_or(StoreError::MemoryLimit)?,
             )?;
-            // The decoded tables own their data; release the encoded snapshot
-            // before reading a manifest so the measured recovery peak is also
-            // the actual live-memory bound.
-            drop(snapshot);
-            for blob in &decoded.blobs {
+            for blob in &blobs {
                 let PhysicalPointer::Value(_manifest_pointer) = blob.manifest else {
                     return Err(StoreError::Corrupt);
                 };
@@ -2867,6 +3966,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
                     allocation_bytes
                         .checked_add(cas_bytes)
                         .ok_or(StoreError::MemoryLimit)?,
+                    memo,
                 )
                 .await?;
                 recovery_preflight_decode(
@@ -2895,7 +3995,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
                     checkpoint.next_segment_generation,
                     checkpoint.binding.generation,
                     &decoded_manifest,
-                    None,
+                    memo,
                 )
                 .await?;
                 recovery_observe(
@@ -2915,10 +4015,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
                         .ok_or(StoreError::MemoryLimit)?,
                 )?;
             }
-            cas = Some(CasMountedState {
-                objects: decoded.objects,
-                blobs: decoded.blobs,
-            });
+            cas = Some(CasMountedState { objects, blobs });
         } else {
             recovery_preflight_decode(
                 limits.recovery_memory_bytes,
@@ -2953,20 +4050,19 @@ pub(crate) async fn recover_state<D: PageDevice>(
     }
 
     let mut persistent_roots = None;
+    #[cfg(feature = "experimental-authority-delta")]
+    let mut recovered_authority_depth = None;
     let mut persistent_authority = None;
     if checkpoint.authority_root != PhysicalPointer::Null {
         let resident_before_roots =
             recovery_resident_bytes(&allocation, &catalog, cas.as_ref(), None, None)
                 .map_err(|_| StoreError::MemoryLimit)?;
-        let mut allocated_segments = Vec::new();
-        allocated_segments
-            .try_reserve_exact(usize::try_from(allocation.counts().map_err(|_| StoreError::Corrupt)?.allocated).unwrap_or(0))
-            .map_err(|_| StoreError::MemoryLimit)?;
-        for segment_no in 0..checkpoint.admitted_segments {
-            if allocation.segment_state(segment_no) == Some(SegmentAllocation::Allocated) {
-                allocated_segments.push(segment_no);
-            }
-        }
+        // Most authority payloads fit in the root segment. Defer enumeration
+        // until a cross-segment chain actually needs it, and borrow the bitmap
+        // instead of keeping an allocated-segment Vec alongside read buffers.
+        let allocated_segments = (0..checkpoint.admitted_segments).filter(|&segment_no| {
+            allocation.segment_state(segment_no) == Some(SegmentAllocation::Allocated)
+        });
         let (authority_bytes, authority_extent) = read_recovery_authority_payload(
             device,
             superblock.binding.store_uuid,
@@ -2974,11 +4070,28 @@ pub(crate) async fn recover_state<D: PageDevice>(
             checkpoint.next_segment_generation,
             checkpoint.binding.generation,
             checkpoint.authority_root,
-            &allocated_segments,
+            allocated_segments,
             limits.recovery_memory_bytes,
             resident_before_roots,
+            memo,
         )
         .await?;
+        #[cfg(any(test, feature = "experimental-authority-delta"))]
+        let authority_bytes = if authority_bytes.starts_with(b"VIBEAUL1") {
+            // Experimental bridge must respect the mount's remaining allowance
+            // and expose its transient workspace peak to recovery telemetry.
+            let (bytes, delta_peak, _delta_depth) = crate::authority_delta::replay_checkpoint_for_test(
+                device, &superblock, &checkpoint, &allocation,
+                recovery_remaining(limits.recovery_memory_bytes, resident_before_roots)?,
+                authority_bytes, authority_extent.binding.target_checkpoint_generation,
+                memo,
+            ).await?;
+            #[cfg(feature = "experimental-authority-delta")]
+            { recovered_authority_depth = Some(_delta_depth); }
+            recovery_observe(&mut recovery_peak, limits.recovery_memory_bytes,
+                resident_before_roots.checked_add(delta_peak).ok_or(StoreError::MemoryLimit)?)?;
+            bytes
+        } else { authority_bytes };
         // A freshly formatted V2 store has a null catalog root. Installing an
         // explicit empty authority snapshot is still valid: there are no
         // bindings which would require CAS resolution yet.
@@ -2989,28 +4102,25 @@ pub(crate) async fn recover_state<D: PageDevice>(
                 limits.recovery_memory_bytes,
                 resident_before_roots,
                 authority_bytes.capacity(),
-                persistent_authority_decode_capacity_upper_bound(&authority_bytes)?,
+                persistent_authority_recovery_capacity_upper_bound(&authority_bytes)?,
             )?;
-            let decoded = decode_persistent_authority_snapshot(&authority_bytes)
-                .map_err(|_| StoreError::Corrupt)?;
+            let decode_resident = resident_before_roots.checked_add(authority_bytes.capacity())
+                .ok_or(StoreError::MemoryLimit)?;
+            let decode_budget = recovery_remaining(limits.recovery_memory_bytes, decode_resident)?;
+            let (decoded, decode_peak) = decode_persistent_authority_snapshot_bounded(
+                &authority_bytes, decode_budget,
+            ).map_err(|error| match error {
+                crate::authority_snapshot::AuthoritySnapshotError::MemoryLimit => StoreError::MemoryLimit,
+                _ => StoreError::Corrupt,
+            })?;
+            recovery_observe(&mut recovery_peak, limits.recovery_memory_bytes,
+                decode_resident.checked_add(decode_peak).ok_or(StoreError::MemoryLimit)?)?;
             if decoded.checkpoint_generation()
                 != authority_extent.binding.target_checkpoint_generation
             {
                 return Err(StoreError::Corrupt);
             }
-            let mut entries: Vec<PersistentRootEntry> = decoded
-                .objects
-                .iter()
-                .map(|binding| PersistentRootEntry {
-                    object_id: binding.v2_object_id,
-                    commit_generation: binding.commit_generation,
-                    object_kind: binding.object_kind,
-                })
-                .collect();
-            entries.extend_from_slice(decoded.external_roots());
-            entries.sort_unstable_by_key(|entry| entry.object_id);
-            let roots = PersistentRootSet::new(decoded.checkpoint_generation(), entries)
-                .map_err(|_| StoreError::Corrupt)?;
+            let roots = authority_roots_from_snapshot(&decoded)?;
             (roots, Some(decoded))
         } else {
             recovery_preflight_decode(
@@ -3061,7 +4171,10 @@ pub(crate) async fn recover_state<D: PageDevice>(
     }
 
     let mut reverse_deltas = Vec::new();
-    let replay_capacity_bytes = usize::try_from(checkpoint.replay_count)
+    // A CAS catalog consumed its replay chain above; only the legacy catalog
+    // replays entries here.
+    let legacy_replay_count = if cas.is_some() { 0 } else { checkpoint.replay_count };
+    let replay_capacity_bytes = usize::try_from(legacy_replay_count)
         .ok()
         .and_then(|count| count.checked_mul(mem::size_of::<CatalogEntry>()))
         .ok_or(StoreError::MemoryLimit)?;
@@ -3080,7 +4193,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
         return Err(StoreError::MemoryLimit);
     }
     reverse_deltas
-        .try_reserve_exact(checkpoint.replay_count as usize)
+        .try_reserve_exact(legacy_replay_count as usize)
         .map_err(|_| StoreError::MemoryLimit)?;
     recovery_observe(
         &mut recovery_peak,
@@ -3089,8 +4202,12 @@ pub(crate) async fn recover_state<D: PageDevice>(
             .checked_add(reverse_deltas.capacity() * mem::size_of::<CatalogEntry>())
             .ok_or(StoreError::MemoryLimit)?,
     )?;
-    let mut pointer = checkpoint.replay_tail;
-    let mut expected_depth = u64::from(checkpoint.replay_count);
+    let mut pointer = if cas.is_some() {
+        PhysicalPointer::Null
+    } else {
+        checkpoint.replay_tail
+    };
+    let mut expected_depth = u64::from(legacy_replay_count);
     while expected_depth != 0 {
         let replay_resident = resident_bytes
             .checked_add(
@@ -3110,6 +4227,7 @@ pub(crate) async fn recover_state<D: PageDevice>(
             ExtentKind::CatalogDelta,
             limits.recovery_memory_bytes,
             replay_resident,
+            memo,
         )
         .await?;
         recovery_preflight_decode(
@@ -3273,6 +4391,8 @@ pub(crate) async fn recover_state<D: PageDevice>(
     // high-water exceeds the generation-backed floor.
     let next_object_id = media_next_object_id.max(u128::from(checkpoint.binding.generation));
     Ok(MountedState {
+        #[cfg(feature = "experimental-authority-delta")]
+        recovered_authority_depth,
         superblock,
         generation: checkpoint.binding.generation,
         admitted_segments: checkpoint.admitted_segments,
@@ -3295,10 +4415,11 @@ pub(crate) async fn recover_state<D: PageDevice>(
         last_segment,
         last_segment_previous,
         last_segment_target_checkpoint_generation,
+        durably_cleared_seals: alloc::collections::BTreeSet::new(),
     })
 }
 
-fn require_allocated_pointer<E>(
+pub(crate) fn require_allocated_pointer<E>(
     allocation: &AllocationV2,
     pointer: PhysicalPointer,
 ) -> Result<(), StoreError<E>> {
@@ -3412,7 +4533,7 @@ fn validate_growth_checkpoint_transition<E>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_allocation_checkpoint_transition<E>(
+pub(crate) fn validate_allocation_checkpoint_transition<E>(
     older: &AllocationV2,
     newer: &AllocationV2,
     older_generation: u64,
@@ -3710,32 +4831,39 @@ fn build_extent<'a>(
     })
 }
 
+/// Keep the existing 32-page request boundaries while borrowing complete
+/// payload pages. Only the last, partial-page batch needs a zero-padded copy.
+/// Publication barriers remain the caller's responsibility.
+pub(crate) async fn write_payload_pages<D: PageDevice>(
+    device: &D,
+    first_page: u64,
+    payload: &[u8],
+) -> Result<(), StoreError<D::Error>> {
+    for (index, bytes) in payload.chunks(32 * PAGE_SIZE).enumerate() {
+        let (pages, tail) = bytes.as_chunks::<PAGE_SIZE>();
+        let first = first_page + (index * 32) as u64;
+        if tail.is_empty() {
+            device.write_pages(first, pages).await.map_err(StoreError::Mutation)?;
+        } else {
+            let mut padded = vec![[0; PAGE_SIZE]; pages.len() + 1];
+            padded.as_flattened_mut()[..bytes.len()].copy_from_slice(bytes);
+            device.write_pages(first, &padded).await.map_err(StoreError::Mutation)?;
+        }
+    }
+    Ok(())
+}
+
 async fn write_extent<D: PageDevice>(
     device: &D,
     base: u64,
     extent: &BuiltExtent<'_>,
 ) -> Result<(), StoreError<D::Error>> {
     let relative = extent.value.binding.self_page - base;
-    let mut copied = 0;
-    let mut page_index = 0_u32;
-    while page_index < extent.value.payload_pages {
-        let batch_pages = (extent.value.payload_pages - page_index).min(32) as usize;
-        let mut pages = vec![[0; PAGE_SIZE]; batch_pages];
-        for page in &mut pages {
-            let remaining = extent.payload.len() - copied;
-            let take = remaining.min(PAGE_SIZE);
-            page[..take].copy_from_slice(&extent.payload[copied..copied + take]);
-            copied += take;
-        }
-        device
-            .write_pages(
-                base + u64::from(extent.value.payload_first_relative_page + page_index),
-                &pages,
-            )
-            .await
-            .map_err(StoreError::Mutation)?;
-        page_index += batch_pages as u32;
-    }
+    write_payload_pages(
+        device,
+        base + u64::from(extent.value.payload_first_relative_page),
+        extent.payload,
+    ).await?;
     flush(device).await?;
     write_page(device, base + relative, &extent.body).await?;
     flush(device).await?;
@@ -4177,6 +5305,351 @@ fn _mutation_is_ambiguous<E>(failure: &MutationFailure<E>) -> bool {
 const _: () = {
     assert!(CATALOG_ENTRY_LEN <= PAGE_SIZE);
 };
+
+#[cfg(test)]
+mod payload_read_tests {
+    use super::*;
+    use core::cell::{Cell, RefCell};
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+
+    #[test]
+    fn authority_declared_chain_is_bounded_before_descriptor_reservation() {
+        let mut first = build_extent(StoreUuid::new([7; 16]).unwrap(), 1, 1, 9, 1, DATA_FIRST_PAGE,
+            ExtentKind::Authority, 1, 16, [1; 32], &[1; 16]).unwrap().value;
+        first.extent_count = 2;
+        first.content_byte_len = 25;
+        first.encoded_blob_len = 25;
+        let descriptor_budget = 2 * core::mem::size_of::<ExtentRecord>();
+        validate_authority_payload_bound::<()>(&first, descriptor_budget).unwrap();
+        assert!(matches!(validate_authority_payload_bound::<()>(&first, descriptor_budget - 1), Err(StoreError::MemoryLimit)));
+        assert!(matches!(validate_authority_payload_bound::<()>(&first, 24), Err(StoreError::MemoryLimit)));
+        for length in [0, 16, 33] {
+            let mut bad = first;
+            bad.content_byte_len = length;
+            bad.encoded_blob_len = length;
+            assert!(matches!(validate_authority_payload_bound::<()>(&bad, usize::MAX), Err(StoreError::Corrupt)));
+        }
+        first.extent_count = u32::MAX;
+        assert!(matches!(validate_authority_payload_bound::<()>(&first, usize::MAX), Err(StoreError::Corrupt)));
+        first.content_byte_len = u64::from(u32::MAX) * 16;
+        first.encoded_blob_len = first.content_byte_len;
+        assert!(matches!(validate_authority_payload_bound::<()>(&first, 1024), Err(StoreError::MemoryLimit)));
+    }
+
+    #[test]
+    fn authority_chain_storage_charges_growth_and_replacement_overlap() {
+        let mut first = build_extent(StoreUuid::new([7; 16]).unwrap(), 1, 1, 9, 1, DATA_FIRST_PAGE,
+            ExtentKind::Authority, 1, 16, [1; 32], &[1;16]).unwrap().value;
+        first.extent_count = 2;
+        let mut sibling = first;
+        sibling.extent_index = 1;
+        let item = core::mem::size_of::<ExtentRecord>();
+        let input = |capacity| {
+            let mut values = Vec::with_capacity(capacity);
+            values.push(sibling);
+            values
+        };
+        // Grow a one-slot sibling list into the two-slot chain, allowing
+        // allocator relocation to keep the old allocation alive temporarily.
+        assert!(matches!(prepare_authority_chain_storage::<()>(input(1), &first, 3 * item - 1),
+            Err(StoreError::MemoryLimit)));
+        let (grown, growth_peak) = prepare_authority_chain_storage::<()>(input(1), &first, 3 * item).unwrap();
+        assert_eq!(grown.as_slice(), &[sibling]);
+        assert_eq!(grown.capacity(), 2);
+        assert_eq!(growth_peak, 3 * item);
+        // Oversized sibling capacity is retained until its replacement exists.
+        assert!(matches!(prepare_authority_chain_storage::<()>(input(4), &first, 6 * item - 1),
+            Err(StoreError::MemoryLimit)));
+        let (replaced, replacement_peak) = prepare_authority_chain_storage::<()>(input(4), &first, 6 * item).unwrap();
+        assert_eq!(replaced.as_slice(), &[sibling]);
+        assert_eq!(replaced.capacity(), 2);
+        assert_eq!(replacement_peak, 6 * item);
+        let ready = input(2);
+        let pointer = ready.as_ptr();
+        let (reused, reuse_peak) = prepare_authority_chain_storage::<()>(ready, &first, 2 * item).unwrap();
+        assert_eq!(reused.as_ptr(), pointer);
+        assert_eq!(reused.capacity(), 2);
+        assert_eq!(reuse_peak, 2 * item);
+    }
+
+    #[test]
+    fn authority_collection_bounds_retained_history_and_rejects_extra_siblings() {
+        let payload = [1_u8; 16];
+        let mut first = build_extent(StoreUuid::new([7; 16]).unwrap(), 1, 1, 9, 1, DATA_FIRST_PAGE,
+            ExtentKind::Authority, 1, 16, [1; 32], &payload).unwrap().value;
+        first.extent_count = 2;
+        let mut sibling = first;
+        sibling.extent_index = 1;
+        let mut old = first;
+        old.binding.target_checkpoint_generation = 8;
+        let mut selected = Vec::new();
+        for _ in 0..10_000 {
+            collect_requested_authority::<()>(&mut selected, old, 9, 2).unwrap();
+        }
+        assert_eq!(selected.capacity(), 0, "unrelated history must allocate nothing");
+        collect_requested_authority::<()>(&mut selected, first, 9, 2).unwrap();
+        collect_requested_authority::<()>(&mut selected, sibling, 9, 2).unwrap();
+        let retained = selected.capacity();
+        assert!(matches!(collect_requested_authority::<()>(&mut selected, sibling, 9, 2), Err(StoreError::Corrupt)));
+        assert_eq!(selected.capacity(), retained);
+        let mut records = Vec::with_capacity(2);
+        records.push(first);
+        let capacity = records.capacity();
+        collect_authority_generation::<()>(&mut records, core::iter::repeat_n(old, 10_000), &first).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records.capacity(), capacity);
+        collect_authority_generation::<()>(&mut records, [old, sibling, old], &first).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].extent_index, 1);
+        assert_eq!(records.capacity(), capacity);
+        // Continue checking later segments even after the expected count was
+        // found, so a duplicate authenticated sibling cannot be hidden.
+        assert!(matches!(collect_authority_generation::<()>(&mut records, [old, sibling], &first), Err(StoreError::Corrupt)));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records.capacity(), capacity);
+    }
+
+    #[test]
+    fn authority_decode_budget_includes_external_root_table() {
+        use vibeos_durable_format::{RecordBody, RecordChain, StoreId};
+        let records = RecordChain::new(StoreId::new(7).unwrap())
+            .append(None, RecordBody::Format).unwrap().to_vec();
+        let plain = PersistentAuthoritySnapshot::new(3, [1;32], records, vec![], vec![]).unwrap();
+        let rooted = plain.clone().with_external_roots(vec![
+            PersistentRootEntry { object_id: 1, commit_generation: 2, object_kind: 7 },
+            PersistentRootEntry { object_id: 2, commit_generation: 3, object_kind: 8 },
+        ]).unwrap();
+        let before = crate::encode_persistent_authority_snapshot(&plain).unwrap();
+        let encoded = crate::encode_persistent_authority_snapshot(&rooted).unwrap();
+        let base = persistent_authority_decode_capacity_upper_bound::<()>(&before).unwrap();
+        let required = persistent_authority_decode_capacity_upper_bound::<()>(&encoded).unwrap();
+        assert_eq!(required - base, 2 * mem::size_of::<PersistentRootEntry>());
+        let decoded = crate::authority_snapshot::decode_persistent_authority_snapshot(&encoded).unwrap();
+        assert!(required >= decoded.allocated_bytes().unwrap());
+        // The old estimate admitted this budget although the root table did
+        // not fit. The pre-allocation check must reject it now.
+        let budget = encoded.len() + required - 1;
+        assert!(recovery_preflight_decode::<()>(budget, 0, encoded.len(), base).is_ok());
+        assert!(matches!(recovery_preflight_decode::<()>(budget, 0, encoded.len(), required), Err(StoreError::MemoryLimit)));
+        recovery_preflight_decode::<()>(budget+1, 0, encoded.len(), required).unwrap();
+    }
+
+    #[test]
+    fn authority_roots_are_preallocated_budgeted_and_reject_collisions() {
+        use vibeos_durable_format::{RecordBody, RecordChain, StoreId};
+        let records = RecordChain::new(StoreId::new(7).unwrap()).append(None, RecordBody::Format).unwrap().to_vec();
+        let snapshot = PersistentAuthoritySnapshot::new(3, [1;32], records, vec![
+            crate::authority_snapshot::PersistentObjectBinding {
+                stable_object_id: 1, v2_object_id: 3, commit_generation: 2, object_kind: 7,
+            }
+        ], vec![]).unwrap().with_external_roots(vec![
+            PersistentRootEntry { object_id: 2, commit_generation: 3, object_kind: 8 },
+        ]).unwrap();
+        let encoded = crate::encode_persistent_authority_snapshot(&snapshot).unwrap();
+        let roots = authority_roots_from_snapshot::<()>(&snapshot).unwrap();
+        assert_eq!(roots.entries().iter().map(|entry| entry.object_id).collect::<Vec<_>>(), vec![2,3]);
+        assert_eq!(roots.allocated_bytes().unwrap(), 2 * mem::size_of::<PersistentRootEntry>());
+        let decoded = persistent_authority_decode_capacity_upper_bound::<()>(&encoded).unwrap();
+        let required = persistent_authority_recovery_capacity_upper_bound::<()>(&encoded).unwrap();
+        assert_eq!(required, decoded + roots.allocated_bytes().unwrap());
+        let short = encoded.len()+required-1;
+        assert!(recovery_preflight_decode::<()>(short, 0, encoded.len(), decoded).is_ok());
+        assert!(matches!(recovery_preflight_decode::<()>(short, 0, encoded.len(), required), Err(StoreError::MemoryLimit)));
+        recovery_preflight_decode::<()>(short+1, 0, encoded.len(), required).unwrap();
+        assert!(snapshot.clone().with_external_roots(vec![
+            PersistentRootEntry { object_id: 3, commit_generation: 2, object_kind: 7 },
+        ]).is_err());
+        // Crate-visible bindings can be changed internally; the root builder
+        // remains defensive even if supplied a conflicting binding table.
+        let mut colliding = snapshot;
+        colliding.objects[0].v2_object_id = 2;
+        assert!(matches!(authority_roots_from_snapshot::<()>(&colliding), Err(StoreError::Corrupt)));
+    }
+
+    struct Device {
+        calls: RefCell<Vec<(u64, usize)>>,
+        fail_at: Cell<Option<usize>>,
+    }
+
+    impl PageDevice for Device {
+        type Error = ();
+        fn info(&self) -> crate::device::PageDeviceInfo {
+            unreachable!()
+        }
+        async fn write_page(&self, _: u64, _: &Page) -> Result<(), MutationFailure<()>> {
+            unreachable!()
+        }
+        async fn flush(&self) -> Result<(), MutationFailure<()>> {
+            unreachable!()
+        }
+        async fn read_page(&self, first: u64, out: &mut Page) -> Result<(), ()> {
+            self.read_pages(first, core::slice::from_mut(out)).await
+        }
+        async fn read_pages(&self, first: u64, out: &mut [Page]) -> Result<(), ()> {
+            let index = self.calls.borrow().len();
+            self.calls.borrow_mut().push((first, out.len()));
+            // Drivers may modify the DMA buffer before reporting failure.
+            for (page_index, page) in out.iter_mut().enumerate() {
+                for (byte_index, byte) in page.iter_mut().enumerate() {
+                    *byte = (((first as usize + page_index) * PAGE_SIZE + byte_index) % 251) as u8;
+                }
+                if self.fail_at.get() == Some(index) {
+                    return Err(());
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn run<F: Future>(future: F) -> F::Output {
+        let mut future = Box::pin(future);
+        match future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
+            Poll::Ready(result) => result,
+            Poll::Pending => panic!("memory device unexpectedly yielded"),
+        }
+    }
+
+    #[test]
+    fn payload_writes_borrow_full_batches_preserve_padding_and_failures() {
+        struct Writer<'a> {
+            source: &'a [u8],
+            calls: RefCell<Vec<(u64, usize)>>,
+            fail_at: Cell<Option<usize>>,
+        }
+        impl PageDevice for Writer<'_> {
+            type Error = ();
+            fn info(&self) -> crate::device::PageDeviceInfo { unreachable!() }
+            async fn read_page(&self, _: u64, _: &mut Page) -> Result<(), ()> { unreachable!() }
+            async fn write_page(&self, _: u64, _: &Page) -> Result<(), MutationFailure<()>> { unreachable!() }
+            async fn flush(&self) -> Result<(), MutationFailure<()>> { panic!("helper changed barriers") }
+            async fn write_pages(&self, first: u64, pages: &[Page]) -> Result<(), MutationFailure<()>> {
+                let index = self.calls.borrow().len();
+                self.calls.borrow_mut().push((first, pages.len()));
+                let offset = (first - 7) as usize * PAGE_SIZE;
+                let len = (self.source.len() - offset).min(32 * PAGE_SIZE);
+                let expected = &self.source[offset..offset + len];
+                assert_eq!(pages.len(), len.div_ceil(PAGE_SIZE));
+                assert_eq!(&pages.as_flattened()[..len], expected);
+                assert!(pages.as_flattened()[len..].iter().all(|byte| *byte == 0));
+                if len % PAGE_SIZE == 0 {
+                    assert_eq!(pages.as_flattened().as_ptr(), expected.as_ptr());
+                }
+                if self.fail_at.get() == Some(index) {
+                    return Err(MutationFailure::ambiguous(()));
+                }
+                Ok(())
+            }
+        }
+        for len in [0, 1, PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE + 1,
+            31 * PAGE_SIZE + 1, 32 * PAGE_SIZE, 32 * PAGE_SIZE + 1,
+            33 * PAGE_SIZE, 64 * PAGE_SIZE + 3] {
+            // Deliberately offset the input: Page's byte alignment must not
+            // impose a stronger alignment requirement on the caller.
+            let input: Vec<u8> = (0..len + 1).map(|i| (i % 251) as u8).collect();
+            let writer = Writer { source: &input[1..], calls: RefCell::new(Vec::new()), fail_at: Cell::new(None) };
+            run(write_payload_pages(&writer, 7, writer.source)).unwrap();
+            let expected: Vec<_> = (0..len.div_ceil(32 * PAGE_SIZE))
+                .map(|i| (7 + (i * 32) as u64, (len - i * 32 * PAGE_SIZE).div_ceil(PAGE_SIZE).min(32)))
+                .collect();
+            assert_eq!(*writer.calls.borrow(), expected);
+            for failure in 0..expected.len() {
+                writer.calls.borrow_mut().clear();
+                writer.fail_at.set(Some(failure));
+                match run(write_payload_pages(&writer, 7, writer.source)) {
+                    Err(StoreError::Mutation(error)) => assert_eq!(error.certainty(), MutationCertainty::Ambiguous),
+                    other => panic!("unexpected write result: {other:?}"),
+                }
+                assert_eq!(*writer.calls.borrow(), expected[..=failure]);
+            }
+        }
+    }
+
+    #[test]
+    fn owned_payload_coalescing_respects_budget_and_errors() {
+        for len in [0, 1, PAGE_SIZE, PAGE_SIZE + 1, 2 * PAGE_SIZE - 1,
+            31 * PAGE_SIZE + 1, 32 * PAGE_SIZE, 32 * PAGE_SIZE + 1] {
+            let rounded = len.next_multiple_of(PAGE_SIZE);
+            for budget in [0, rounded.saturating_sub(1), rounded] {
+                let device = Device { calls: RefCell::new(Vec::new()), fail_at: Cell::new(None) };
+                let bytes = run(read_payload_owned(&device, 7, len, budget)).unwrap();
+                let expected: Vec<u8> = (0..len).map(|i| ((7 * PAGE_SIZE + i) % 251) as u8).collect();
+                assert_eq!(bytes, expected);
+                let eligible = len > PAGE_SIZE && len % PAGE_SIZE != 0
+                    && rounded <= 32 * PAGE_SIZE && rounded <= budget;
+                let calls = device.calls.borrow().clone();
+                if eligible {
+                    assert_eq!(calls, [(7, len.div_ceil(PAGE_SIZE))]);
+                    assert!(bytes.capacity() <= budget);
+                } else if len == PAGE_SIZE + 1 {
+                    assert_eq!(calls, [(7, 1), (8, 1)]);
+                }
+                for failed in 0..calls.len() {
+                    device.calls.borrow_mut().clear();
+                    device.fail_at.set(Some(failed));
+                    assert!(matches!(run(read_payload_owned(&device, 7, len, budget)),
+                        Err(StoreError::Device(()))));
+                    assert_eq!(*device.calls.borrow(), calls[..=failed]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn payload_runs_bound_requests_and_propagate_partial_transfer_errors() {
+        for len in [
+            0,
+            1,
+            PAGE_SIZE - 1,
+            PAGE_SIZE,
+            PAGE_SIZE + 1,
+            31 * PAGE_SIZE,
+            32 * PAGE_SIZE,
+            32 * PAGE_SIZE + 1,
+            33 * PAGE_SIZE + 19,
+            64 * PAGE_SIZE + 3,
+        ] {
+            let device = Device {
+                calls: RefCell::new(Vec::new()),
+                fail_at: Cell::new(None),
+            };
+            let expected: Vec<u8> = (0..len)
+                .map(|i| ((7 * PAGE_SIZE + i) % 251) as u8)
+                .collect();
+            let mut bytes = vec![0; len];
+            run(read_payload_into(&device, 7, &mut bytes)).unwrap();
+            assert_eq!(bytes, expected);
+            let calls = device.calls.borrow().clone();
+            let mut next = 7;
+            for &(first, count) in &calls {
+                assert_eq!(first, next);
+                assert!((1..=32).contains(&count));
+                next += count as u64;
+            }
+            assert_eq!(next - 7, len.div_ceil(PAGE_SIZE) as u64);
+            if len == 64 * PAGE_SIZE + 3 {
+                assert_eq!(calls, [(7, 32), (39, 32), (71, 1)]);
+            }
+            for failure in 0..calls.len() {
+                device.calls.borrow_mut().clear();
+                device.fail_at.set(Some(failure));
+                bytes.fill(0);
+                assert!(matches!(
+                    run(read_payload_into(&device, 7, &mut bytes)),
+                    Err(StoreError::Device(()))
+                ));
+                assert_eq!(device.calls.borrow().len(), failure + 1);
+                device.calls.borrow_mut().clear();
+                device.fail_at.set(None);
+                run(read_payload_into(&device, 7, &mut bytes)).unwrap();
+                assert_eq!(bytes, expected);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod transition_tests {

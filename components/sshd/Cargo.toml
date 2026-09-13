@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+python-wasi = ["wasi-exec", "vibeos-wasi-runtime/python-wasi"]
 wasi-exec = ["dep:vibeos-wasi-command", "dep:vibeos-wasi-runtime"]
 default = []
 qualification-stream = []

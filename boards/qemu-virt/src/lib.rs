@@ -14,9 +14,19 @@ pub const RAM_START: usize = 0x8020_0000;
 /// benchmark contract boots with -m 512M and its qualification workloads
 /// legitimately hold multi-MiB record streams in transit. The linker script
 /// variant selected by the same feature sizes the heap to match.
-#[cfg(feature = "storage-bench")]
+/// storage-bench-128m instead qualifies the benchmark at 128 MiB.
+#[cfg(feature = "python-wasi")]
+pub const RAM_END: usize = 0xc000_0000;
+#[cfg(all(
+    feature = "storage-bench",
+    not(feature = "storage-bench-128m"),
+    not(feature = "python-wasi")
+))]
 pub const RAM_END: usize = 0xa000_0000;
-#[cfg(not(feature = "storage-bench"))]
+#[cfg(all(
+    not(feature = "python-wasi"),
+    any(not(feature = "storage-bench"), feature = "storage-bench-128m")
+))]
 pub const RAM_END: usize = 0x8800_0000;
 pub const PLIC_BASE: usize = 0x0c00_0000;
 pub const PLIC_MMIO_END: usize = PLIC_BASE + 0x0040_0000;

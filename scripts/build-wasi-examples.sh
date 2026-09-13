@@ -14,4 +14,9 @@ cp "$CARGO_TARGET_DIR/wasm32-wasip1/release/wasi-hello.wasm" target/wasi-example
 "$WASI_SDK_PATH/bin/clang" --target=wasm32-wasip1 -Oz -msign-ext -mbulk-memory \
     tests/wasi/hello.c -Wl,--max-memory=16777216 -Wl,-z,stack-size=65536 -Wl,--strip-all \
     -o target/wasi-examples/c-hello.wasm
-shasum -a 256 target/wasi-examples/*-hello.wasm
+# wasi-threads: imported shared memory (re-exported for the command contract),
+# wasi::thread-spawn and wasi_thread_start, from the SDK's threads sysroot.
+"$WASI_SDK_PATH/bin/clang" --target=wasm32-wasi-threads -pthread -O2 -msign-ext -mbulk-memory \
+    tests/wasi/threads.c -Wl,--max-memory=16777216 -Wl,--import-memory -Wl,--export-memory -Wl,-z,stack-size=65536 -Wl,--strip-all \
+    -o target/wasi-examples/c-threads.wasm
+shasum -a 256 target/wasi-examples/*-hello.wasm target/wasi-examples/c-threads.wasm

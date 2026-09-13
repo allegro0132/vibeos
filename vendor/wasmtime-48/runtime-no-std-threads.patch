@@ -1,0 +1,891 @@
+diff --git a/vendor/wasmtime-48/wasmtime-cranelift/Cargo.toml b/vendor/wasmtime-48/wasmtime-cranelift/Cargo.toml
+index 3579ec2..005ef36 100644
+--- a/vendor/wasmtime-48/wasmtime-cranelift/Cargo.toml
++++ b/vendor/wasmtime-48/wasmtime-cranelift/Cargo.toml
+@@ -34,6 +34,8 @@ repository = "https://github.com/bytecodealliance/wasmtime"
+ resolver = "2"
+ 
+ [features]
++# VibeOS: keep the compiler's builtin table in step with wasmtime-environ.
++threads = ["wasmtime-environ/threads"]
+ riscv64 = ["cranelift-codegen/riscv64"]
+ default = ["std"]
+ std = ["dep:cranelift-native", "cranelift-codegen/std", "cranelift-codegen/timing", "cranelift-frontend/std", "gimli/std", "object/write", "wasmtime-environ/std", "wasmtime-environ/threads"]
+diff --git a/vendor/wasmtime-48/wasmtime-environ/Cargo.toml b/vendor/wasmtime-48/wasmtime-environ/Cargo.toml
+index 4c6d9db..de9d982 100644
+--- a/vendor/wasmtime-48/wasmtime-environ/Cargo.toml
++++ b/vendor/wasmtime-48/wasmtime-environ/Cargo.toml
+@@ -72,7 +72,8 @@ std = [
+     "cpp_demangle?/std",
+     "rustc-demangle?/std",
+ ]
+-threads = ["std"]
++# VibeOS: the atomics builtins and their trap sentinels do not need std.
++threads = []
+ wmemcheck = ["std"]
+ 
+ [lib]
+diff --git a/vendor/wasmtime-48/wasmtime/Cargo.toml b/vendor/wasmtime-48/wasmtime/Cargo.toml
+index 479cdf3..e79ab29 100644
+--- a/vendor/wasmtime-48/wasmtime/Cargo.toml
++++ b/vendor/wasmtime-48/wasmtime/Cargo.toml
+@@ -204,7 +204,16 @@ std = [
+     "wasmtime-jit-debug?/std",
+     "futures?/std",
+ ]
+-threads = ["std"]
++threads = [
++    "wasmtime-environ/threads",
++    "wasmtime-cranelift?/threads",
++]
++# VibeOS: no_std threads over embedder hooks (see runtime-no-std-threads.patch).
++custom-threads = [
++    "threads",
++    "async",
++    "custom-sync-primitives",
++]
+ trace-log = ["wasmtime-cranelift?/trace-log"]
+ wave = [
+     "dep:wasm-wave",
+@@ -563,4 +572,5 @@ check-cfg = [
+     "cfg(arc_try_new)",
+     "cfg(fuzzing)",
+     "cfg(gc_zeal)",
++    "cfg(has_custom_threads)",
+ ]
+diff --git a/vendor/wasmtime-48/wasmtime/build.rs b/vendor/wasmtime-48/wasmtime/build.rs
+index 1248e64..29e17f6 100644
+--- a/vendor/wasmtime-48/wasmtime/build.rs
++++ b/vendor/wasmtime-48/wasmtime/build.rs
+@@ -45,11 +45,17 @@ fn main() {
+         && cfg!(feature = "custom-sync-primitives")
+         && cfg!(feature = "runtime");
+     let has_custom_fiber = !has_builtin_stackswitch && cfg!(feature = "custom-fiber");
++    // Threads without `std`: waits suspend the async fiber through embedder hooks.
++    let has_custom_threads = !cfg!(feature = "std")
++        && cfg!(feature = "threads")
++        && cfg!(feature = "async")
++        && cfg!(feature = "runtime");
+ 
+     custom_cfg("has_native_signals", has_native_signals);
+     custom_cfg("has_virtual_memory", has_virtual_memory);
+     custom_cfg("has_custom_fiber", has_custom_fiber);
+     custom_cfg("has_custom_sync", has_custom_sync);
++    custom_cfg("has_custom_threads", has_custom_threads);
+     custom_cfg("has_host_compiler_backend", has_host_compiler_backend);
+     custom_cfg("gc_zeal", cfg("fuzzing"));
+ 
+diff --git a/vendor/wasmtime-48/wasmtime/src/config.rs b/vendor/wasmtime-48/wasmtime/src/config.rs
+index 337c6d6..f5711ef 100644
+--- a/vendor/wasmtime-48/wasmtime/src/config.rs
++++ b/vendor/wasmtime-48/wasmtime/src/config.rs
+@@ -170,6 +170,8 @@ pub struct Config {
+     pub(crate) cache: Option<Cache>,
+     #[cfg(feature = "runtime")]
+     pub(crate) mem_creator: Option<Arc<dyn RuntimeMemoryCreator>>,
++    #[cfg(has_custom_threads)]
++    pub(crate) thread_hooks: Option<Arc<dyn crate::runtime::vm::threads::ThreadHooks>>,
+     #[cfg(feature = "runtime")]
+     pub(crate) custom_code_memory: Option<Arc<dyn CustomCodeMemory>>,
+     pub(crate) allocation_strategy: InstanceAllocationStrategy,
+@@ -284,6 +286,8 @@ impl Config {
+             profiling_strategy: ProfilingStrategy::None,
+             #[cfg(feature = "runtime")]
+             mem_creator: None,
++            #[cfg(has_custom_threads)]
++            thread_hooks: None,
+             #[cfg(feature = "runtime")]
+             custom_code_memory: None,
+             allocation_strategy: InstanceAllocationStrategy::OnDemand,
+@@ -1702,6 +1706,21 @@ impl Config {
+         self
+     }
+ 
++    /// Installs the scheduler hooks used by shared-memory waits without `std`.
++    ///
++    /// `memory.atomic.wait32/64` suspend the calling guest thread's async
++    /// fiber and complete when another thread notifies the token the hooks
++    /// reported, or when the hook-supplied timer completes. Blocking waits
++    /// fail with an error when no hooks are installed.
++    #[cfg(has_custom_threads)]
++    pub fn with_thread_hooks(
++        &mut self,
++        hooks: Arc<dyn crate::runtime::vm::threads::ThreadHooks>,
++    ) -> &mut Self {
++        self.thread_hooks = Some(hooks);
++        self
++    }
++
+     /// Sets a custom stack creator.
+     ///
+     /// Custom memory creators are used when creating creating async instance stacks for
+diff --git a/vendor/wasmtime-48/wasmtime/src/runtime/memory.rs b/vendor/wasmtime-48/wasmtime/src/runtime/memory.rs
+index ab41825..e63ef97 100644
+--- a/vendor/wasmtime-48/wasmtime/src/runtime/memory.rs
++++ b/vendor/wasmtime-48/wasmtime/src/runtime/memory.rs
+@@ -13,6 +13,8 @@ use core::time::Duration;
+ use wasmtime_environ::DefinedMemoryIndex;
+ 
+ pub use crate::runtime::vm::WaitResult;
++#[cfg(has_custom_threads)]
++pub use crate::runtime::vm::threads::ThreadHooks;
+ 
+ /// Error for out of bounds [`Memory`] access.
+ #[derive(Debug)]
+@@ -994,10 +996,20 @@ impl SharedMemory {
+     ///
+     /// This function will return an error if `addr` is not within bounds or
+     /// not aligned to a 4-byte boundary.
++    #[cfg(not(has_custom_threads))]
+     pub fn atomic_notify(&self, addr: u64, count: u32) -> Result<u32, Trap> {
+         self.vm.atomic_notify(addr, count)
+     }
+ 
++    /// Equivalent of the WebAssembly `memory.atomic.notify` instruction for
++    /// this shared memory, waking suspended guest threads through the
++    /// engine's [`ThreadHooks`](crate::ThreadHooks).
++    #[cfg(has_custom_threads)]
++    pub fn atomic_notify(&self, addr: u64, count: u32) -> Result<u32, Trap> {
++        self.vm
++            .atomic_notify(addr, count, self.engine.config().thread_hooks.as_deref())
++    }
++
+     /// Equivalent of the WebAssembly `memory.atomic.wait32` instruction for
+     /// this shared memory.
+     ///
+@@ -1031,6 +1043,7 @@ impl SharedMemory {
+     ///
+     /// This function will return an error if `addr` is not within bounds or
+     /// not aligned to a 4-byte boundary.
++    #[cfg(not(has_custom_threads))]
+     pub fn atomic_wait32(
+         &self,
+         addr: u64,
+@@ -1040,6 +1053,23 @@ impl SharedMemory {
+         self.vm.atomic_wait32(addr, expected, timeout)
+     }
+ 
++    /// Asynchronous equivalent of `memory.atomic.wait32` for embedders
++    /// without `std`; the future completes when notified or timed out.
++    #[cfg(has_custom_threads)]
++    pub async fn atomic_wait32_async(
++        &self,
++        addr: u64,
++        expected: u32,
++        timeout: Option<Duration>,
++    ) -> Result<WaitResult> {
++        let Some(hooks) = self.engine.config().thread_hooks.clone() else {
++            bail!("atomic wait requires `Config::with_thread_hooks`");
++        };
++        self.vm
++            .atomic_wait32_async(addr, expected, timeout, &*hooks)
++            .await
++    }
++
+     /// Equivalent of the WebAssembly `memory.atomic.wait64` instruction for
+     /// this shared memory.
+     ///
+@@ -1049,6 +1079,7 @@ impl SharedMemory {
+     ///
+     /// Returns the same error as [`SharedMemory::atomic_wait32`] except that
+     /// the specified address must be 8-byte aligned instead of 4-byte aligned.
++    #[cfg(not(has_custom_threads))]
+     pub fn atomic_wait64(
+         &self,
+         addr: u64,
+@@ -1058,6 +1089,23 @@ impl SharedMemory {
+         self.vm.atomic_wait64(addr, expected, timeout)
+     }
+ 
++    /// Asynchronous equivalent of `memory.atomic.wait64` for embedders
++    /// without `std`.
++    #[cfg(has_custom_threads)]
++    pub async fn atomic_wait64_async(
++        &self,
++        addr: u64,
++        expected: u64,
++        timeout: Option<Duration>,
++    ) -> Result<WaitResult> {
++        let Some(hooks) = self.engine.config().thread_hooks.clone() else {
++            bail!("atomic wait requires `Config::with_thread_hooks`");
++        };
++        self.vm
++            .atomic_wait64_async(addr, expected, timeout, &*hooks)
++            .await
++    }
++
+     /// Return a reference to the [`Engine`] used to configure the shared
+     /// memory.
+     pub(crate) fn engine(&self) -> &Engine {
+diff --git a/vendor/wasmtime-48/wasmtime/src/runtime/vm.rs b/vendor/wasmtime-48/wasmtime/src/runtime/vm.rs
+index 2f503d1..e9ddbcd 100644
+--- a/vendor/wasmtime-48/wasmtime/src/runtime/vm.rs
++++ b/vendor/wasmtime-48/wasmtime/src/runtime/vm.rs
+@@ -72,8 +72,14 @@ mod throw;
+ mod traphandlers;
+ mod vmcontext;
+ 
+-#[cfg(feature = "threads")]
++#[cfg(all(feature = "threads", not(has_custom_threads)))]
+ mod parking_spot;
++#[cfg(has_custom_threads)]
++mod parking_spot_nostd;
++#[cfg(has_custom_threads)]
++use parking_spot_nostd as parking_spot;
++#[cfg(has_custom_threads)]
++pub mod threads;
+ 
+ // Note that `debug_builtins` here is disabled with a feature or a lack of a
+ // native compilation backend because it's only here to assist in debugging
+diff --git a/vendor/wasmtime-48/wasmtime/src/runtime/vm/libcalls.rs b/vendor/wasmtime-48/wasmtime/src/runtime/vm/libcalls.rs
+index 8bdee5a..f33f133 100644
+--- a/vendor/wasmtime-48/wasmtime/src/runtime/vm/libcalls.rs
++++ b/vendor/wasmtime-48/wasmtime/src/runtime/vm/libcalls.rs
+@@ -622,7 +622,7 @@ fn is_subtype(
+ }
+ 
+ // Implementation of `memory.atomic.notify` for locally defined memories.
+-#[cfg(feature = "threads")]
++#[cfg(all(feature = "threads", not(has_custom_threads)))]
+ fn memory_atomic_notify(
+     store: &mut dyn VMStore,
+     instance: InstanceId,
+@@ -638,7 +638,7 @@ fn memory_atomic_notify(
+ }
+ 
+ // Implementation of `memory.atomic.wait32` for locally defined memories.
+-#[cfg(feature = "threads")]
++#[cfg(all(feature = "threads", not(has_custom_threads)))]
+ fn memory_atomic_wait32(
+     store: &mut dyn VMStore,
+     instance: InstanceId,
+@@ -656,7 +656,7 @@ fn memory_atomic_wait32(
+ }
+ 
+ // Implementation of `memory.atomic.wait64` for locally defined memories.
+-#[cfg(feature = "threads")]
++#[cfg(all(feature = "threads", not(has_custom_threads)))]
+ fn memory_atomic_wait64(
+     store: &mut dyn VMStore,
+     instance: InstanceId,
+@@ -673,6 +673,82 @@ fn memory_atomic_wait64(
+         .atomic_wait64(addr_index, expected, timeout)? as u32)
+ }
+ 
++// `memory.atomic.notify` without `std`: wake suspended guest threads through
++// the engine's thread hooks.
++#[cfg(has_custom_threads)]
++fn memory_atomic_notify(
++    store: &mut dyn VMStore,
++    instance: InstanceId,
++    memory_index: u32,
++    addr_index: u64,
++    count: u32,
++) -> Result<u32, Trap> {
++    let memory = DefinedMemoryIndex::from_u32(memory_index);
++    let hooks = store.engine().config().thread_hooks.clone();
++    store
++        .instance_mut(instance)
++        .get_defined_memory_mut(memory)
++        .atomic_notify(addr_index, count, hooks.as_deref())
++}
++
++// `memory.atomic.wait32` without `std`: suspend this guest thread's fiber.
++#[cfg(has_custom_threads)]
++fn memory_atomic_wait32(
++    store: &mut dyn VMStore,
++    instance: InstanceId,
++    memory_index: u32,
++    addr_index: u64,
++    expected: u32,
++    timeout: u64,
++) -> Result<u32> {
++    let timeout = (timeout as i64 >= 0).then(|| Duration::from_nanos(timeout));
++    let memory = DefinedMemoryIndex::from_u32(memory_index);
++    let shared = {
++        let memory = store.instance_mut(instance).get_defined_memory_mut(memory);
++        match memory.as_shared_memory() {
++            Some(shared) => shared.clone(),
++            None => return Err(memory.atomic_wait_unshared(addr_index, 4).into()),
++        }
++    };
++    let Some(hooks) = store.engine().config().thread_hooks.clone() else {
++        bail!("memory.atomic.wait32 requires `Config::with_thread_hooks`");
++    };
++    block_on!(store, async |_store, _| {
++        Ok(shared
++            .atomic_wait32_async(addr_index, expected, timeout, &*hooks)
++            .await? as u32)
++    })?
++}
++
++// `memory.atomic.wait64` without `std`: suspend this guest thread's fiber.
++#[cfg(has_custom_threads)]
++fn memory_atomic_wait64(
++    store: &mut dyn VMStore,
++    instance: InstanceId,
++    memory_index: u32,
++    addr_index: u64,
++    expected: u64,
++    timeout: u64,
++) -> Result<u32> {
++    let timeout = (timeout as i64 >= 0).then(|| Duration::from_nanos(timeout));
++    let memory = DefinedMemoryIndex::from_u32(memory_index);
++    let shared = {
++        let memory = store.instance_mut(instance).get_defined_memory_mut(memory);
++        match memory.as_shared_memory() {
++            Some(shared) => shared.clone(),
++            None => return Err(memory.atomic_wait_unshared(addr_index, 8).into()),
++        }
++    };
++    let Some(hooks) = store.engine().config().thread_hooks.clone() else {
++        bail!("memory.atomic.wait64 requires `Config::with_thread_hooks`");
++    };
++    block_on!(store, async |_store, _| {
++        Ok(shared
++            .atomic_wait64_async(addr_index, expected, timeout, &*hooks)
++            .await? as u32)
++    })?
++}
++
+ // Hook for when an instance runs out of fuel.
+ fn out_of_gas(store: &mut dyn VMStore, _instance: InstanceId) -> Result<()> {
+     block_on!(store, async |store, _| {
+diff --git a/vendor/wasmtime-48/wasmtime/src/runtime/vm/memory.rs b/vendor/wasmtime-48/wasmtime/src/runtime/vm/memory.rs
+index ef68214..2f9e4f2 100644
+--- a/vendor/wasmtime-48/wasmtime/src/runtime/vm/memory.rs
++++ b/vendor/wasmtime-48/wasmtime/src/runtime/vm/memory.rs
+@@ -465,7 +465,7 @@ impl Memory {
+     }
+ 
+     /// Implementation of `memory.atomic.notify` for all memories.
+-    #[cfg(feature = "threads")]
++    #[cfg(all(feature = "threads", not(has_custom_threads)))]
+     pub fn atomic_notify(&mut self, addr: u64, count: u32) -> Result<u32, Trap> {
+         match self.as_shared_memory() {
+             Some(m) => m.atomic_notify(addr, count),
+@@ -476,8 +476,26 @@ impl Memory {
+         }
+     }
+ 
++    /// Implementation of `memory.atomic.notify` for all memories, waking
++    /// suspended guest threads through the embedder's hooks.
++    #[cfg(has_custom_threads)]
++    pub fn atomic_notify(
++        &mut self,
++        addr: u64,
++        count: u32,
++        hooks: Option<&dyn crate::runtime::vm::threads::ThreadHooks>,
++    ) -> Result<u32, Trap> {
++        match self.as_shared_memory() {
++            Some(m) => m.atomic_notify(addr, count, hooks),
++            None => {
++                validate_atomic_addr(&self.vmmemory(), addr, 4, 4)?;
++                Ok(0)
++            }
++        }
++    }
++
+     /// Implementation of `memory.atomic.wait32` for all memories.
+-    #[cfg(feature = "threads")]
++    #[cfg(all(feature = "threads", not(has_custom_threads)))]
+     pub fn atomic_wait32(
+         &mut self,
+         addr: u64,
+@@ -494,7 +512,7 @@ impl Memory {
+     }
+ 
+     /// Implementation of `memory.atomic.wait64` for all memories.
+-    #[cfg(feature = "threads")]
++    #[cfg(all(feature = "threads", not(has_custom_threads)))]
+     pub fn atomic_wait64(
+         &mut self,
+         addr: u64,
+@@ -510,6 +528,15 @@ impl Memory {
+         }
+     }
+ 
++    /// Validate a wait address on a non-shared memory: the wait itself traps.
++    #[cfg(has_custom_threads)]
++    pub fn atomic_wait_unshared(&self, addr: u64, size: u64) -> Trap {
++        match validate_atomic_addr(&self.vmmemory(), addr, size, size) {
++            Ok(_) => Trap::AtomicWaitNonSharedMemory,
++            Err(trap) => trap,
++        }
++    }
++
+     /// Returns the range of bytes that WebAssembly should be able to address in
+     /// this linear memory. Note that this includes guard pages which wasm can
+     /// hit.
+diff --git a/vendor/wasmtime-48/wasmtime/src/runtime/vm/memory/shared_memory.rs b/vendor/wasmtime-48/wasmtime/src/runtime/vm/memory/shared_memory.rs
+index 9f0721b..a6cad2a 100644
+--- a/vendor/wasmtime-48/wasmtime/src/runtime/vm/memory/shared_memory.rs
++++ b/vendor/wasmtime-48/wasmtime/src/runtime/vm/memory/shared_memory.rs
+@@ -1,14 +1,22 @@
+ use crate::Engine;
+ use crate::prelude::*;
+-use crate::runtime::vm::memory::{LocalMemory, MmapMemory, validate_atomic_addr};
+-use crate::runtime::vm::parking_spot::{ParkingSpot, Waiter};
++#[cfg(not(has_custom_threads))]
++use crate::runtime::vm::parking_spot::Waiter;
++use crate::runtime::vm::memory::{LocalMemory, validate_atomic_addr};
++use crate::runtime::vm::parking_spot::ParkingSpot;
++#[cfg(has_custom_threads)]
++use crate::runtime::vm::threads::ThreadHooks;
+ use crate::runtime::vm::{self, Memory, VMMemoryDefinition, WaitResult};
++use crate::sync::RwLock;
++use alloc::sync::Arc;
++use core::ops::Range;
++use core::ptr::NonNull;
++use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
++use core::time::Duration;
++#[cfg(not(has_custom_threads))]
+ use std::cell::RefCell;
+-use std::ops::Range;
+-use std::ptr::NonNull;
+-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+-use std::sync::{Arc, RwLock};
+-use std::time::{Duration, Instant};
++#[cfg(not(has_custom_threads))]
++use std::time::Instant;
+ use wasmtime_environ::Trap;
+ 
+ /// For shared memory (and only for shared memory), this lock-version restricts
+@@ -31,6 +39,10 @@ struct SharedMemoryInner {
+ 
+ impl SharedMemory {
+     /// Construct a new [`SharedMemory`].
++    ///
++    /// The backing store comes from the engine's configured host memory
++    /// creator when one is installed; otherwise the default mmap-backed
++    /// allocation is used.
+     pub fn new(engine: &Engine, ty: &wasmtime_environ::Memory) -> Result<Self> {
+         let tunables = engine.tunables();
+         let memory_tunables = wasmtime_environ::MemoryTunables::new(
+@@ -40,9 +52,28 @@ impl SharedMemory {
+         // Note that without a limiter being passed to `limit_new` this
+         // `assert_ready` should never panic.
+         let (minimum_bytes, maximum_bytes) = vm::assert_ready(Memory::limit_new(ty, None))?;
+-        let mmap_memory = MmapMemory::new(ty, &memory_tunables, minimum_bytes, maximum_bytes)?;
+         let boxed: Box<dyn crate::runtime::vm::RuntimeLinearMemory> =
+-            try_new::<Box<_>>(mmap_memory)?;
++            match &engine.config().mem_creator {
++                Some(creator) => {
++                    creator.new_memory(ty, &memory_tunables, minimum_bytes, maximum_bytes)?
++                }
++                None => {
++                    #[cfg(has_virtual_memory)]
++                    {
++                        let mmap_memory = crate::runtime::vm::memory::MmapMemory::new(
++                            ty,
++                            &memory_tunables,
++                            minimum_bytes,
++                            maximum_bytes,
++                        )?;
++                        try_new::<Box<_>>(mmap_memory)?
++                    }
++                    #[cfg(not(has_virtual_memory))]
++                    {
++                        bail!("shared memory requires a host memory creator on this platform")
++                    }
++                }
++            };
+         Self::wrap(
+             engine,
+             ty,
+@@ -89,7 +120,7 @@ impl SharedMemory {
+ 
+     /// Same as `RuntimeLinearMemory::grow`, except with `&self`.
+     pub fn grow(&self, delta_pages: u64) -> Result<Option<(usize, usize)>, Error> {
+-        let mut memory = self.0.memory.write().unwrap();
++        let mut memory = self.0.memory.write();
+         // Without a limiter being passed in this shouldn't have an await point,
+         // so it should be safe to assert that it's ready.
+         let result = vm::assert_ready(memory.grow(delta_pages, None))?;
+@@ -123,6 +154,7 @@ impl SharedMemory {
+     }
+ 
+     /// Implementation of `memory.atomic.notify` for this shared memory.
++    #[cfg(not(has_custom_threads))]
+     pub fn atomic_notify(&self, addr_index: u64, count: u32) -> Result<u32, Trap> {
+         let ptr = validate_atomic_addr(&self.0.def.0, addr_index, 4, 4)?;
+         log::trace!("memory.atomic.notify(addr={addr_index:#x}, count={count})");
+@@ -130,7 +162,25 @@ impl SharedMemory {
+         Ok(self.0.spot.notify(ptr, count))
+     }
+ 
++    /// Implementation of `memory.atomic.notify` for this shared memory.
++    ///
++    /// Waiters are woken through `hooks`; without hooks the waiters are still
++    /// marked notified and complete at their next poll.
++    #[cfg(has_custom_threads)]
++    pub fn atomic_notify(
++        &self,
++        addr_index: u64,
++        count: u32,
++        hooks: Option<&dyn ThreadHooks>,
++    ) -> Result<u32, Trap> {
++        let ptr = validate_atomic_addr(&self.0.def.0, addr_index, 4, 4)?;
++        log::trace!("memory.atomic.notify(addr={addr_index:#x}, count={count})");
++        let ptr = unsafe { &*ptr };
++        Ok(self.0.spot.notify(ptr, count, hooks))
++    }
++
+     /// Implementation of `memory.atomic.wait32` for this shared memory.
++    #[cfg(not(has_custom_threads))]
+     pub fn atomic_wait32(
+         &self,
+         addr_index: u64,
+@@ -143,8 +193,8 @@ impl SharedMemory {
+         );
+ 
+         // SAFETY: `addr_index` was validated by `validate_atomic_addr` above.
+-        assert!(std::mem::size_of::<AtomicU32>() == 4);
+-        assert!(std::mem::align_of::<AtomicU32>() <= 4);
++        assert!(core::mem::size_of::<AtomicU32>() == 4);
++        assert!(core::mem::align_of::<AtomicU32>() <= 4);
+         let atomic = unsafe { AtomicU32::from_ptr(addr.cast()) };
+         // Wasm linear memory is always little-endian, but `AtomicU32` uses the
+         // host's native endianness.
+@@ -163,6 +213,7 @@ impl SharedMemory {
+     }
+ 
+     /// Implementation of `memory.atomic.wait64` for this shared memory.
++    #[cfg(not(has_custom_threads))]
+     pub fn atomic_wait64(
+         &self,
+         addr_index: u64,
+@@ -175,8 +226,8 @@ impl SharedMemory {
+         );
+ 
+         // SAFETY: `addr_index` was validated by `validate_atomic_addr` above.
+-        assert!(std::mem::size_of::<AtomicU64>() == 8);
+-        assert!(std::mem::align_of::<AtomicU64>() <= 8);
++        assert!(core::mem::size_of::<AtomicU64>() == 8);
++        assert!(core::mem::align_of::<AtomicU64>() <= 8);
+         let atomic = unsafe { AtomicU64::from_ptr(addr.cast()) };
+         // Wasm linear memory is always little-endian, but `AtomicU64` uses the
+         // host's native endianness.
+@@ -191,19 +242,65 @@ impl SharedMemory {
+         })
+     }
+ 
++    /// Implementation of `memory.atomic.wait32` that suspends the calling
++    /// guest thread's async fiber instead of an OS thread.
++    #[cfg(has_custom_threads)]
++    pub async fn atomic_wait32_async(
++        &self,
++        addr_index: u64,
++        expected: u32,
++        timeout: Option<Duration>,
++        hooks: &dyn ThreadHooks,
++    ) -> Result<WaitResult> {
++        let addr = validate_atomic_addr(&self.0.def.0, addr_index, 4, 4)?;
++        log::trace!(
++            "memory.atomic.wait32(addr={addr_index:#x}, expected={expected}, timeout={timeout:?})"
++        );
++        // SAFETY: `addr_index` was validated by `validate_atomic_addr` above,
++        // and the base pointer of a shared memory never changes.
++        assert!(core::mem::size_of::<AtomicU32>() == 4);
++        assert!(core::mem::align_of::<AtomicU32>() <= 4);
++        let atomic = unsafe { AtomicU32::from_ptr(addr.cast()) };
++        let expected = expected.to_le();
++        self.0.spot.wait32(atomic, expected, timeout, hooks).await
++    }
++
++    /// Implementation of `memory.atomic.wait64` that suspends the calling
++    /// guest thread's async fiber instead of an OS thread.
++    #[cfg(has_custom_threads)]
++    pub async fn atomic_wait64_async(
++        &self,
++        addr_index: u64,
++        expected: u64,
++        timeout: Option<Duration>,
++        hooks: &dyn ThreadHooks,
++    ) -> Result<WaitResult> {
++        let addr = validate_atomic_addr(&self.0.def.0, addr_index, 8, 8)?;
++        log::trace!(
++            "memory.atomic.wait64(addr={addr_index:#x}, expected={expected}, timeout={timeout:?})"
++        );
++        // SAFETY: see `atomic_wait32_async`.
++        assert!(core::mem::size_of::<AtomicU64>() == 8);
++        assert!(core::mem::align_of::<AtomicU64>() <= 8);
++        let atomic = unsafe { AtomicU64::from_ptr(addr.cast()) };
++        let expected = expected.to_le();
++        self.0.spot.wait64(atomic, expected, timeout, hooks).await
++    }
++
+     pub(crate) fn byte_size(&self) -> usize {
+-        self.0.memory.read().unwrap().byte_size()
++        self.0.memory.read().byte_size()
+     }
+ 
+     pub(crate) fn needs_init(&self) -> bool {
+-        self.0.memory.read().unwrap().needs_init()
++        self.0.memory.read().needs_init()
+     }
+ 
+     pub(crate) fn wasm_accessible(&self) -> Range<usize> {
+-        self.0.memory.read().unwrap().wasm_accessible()
++        self.0.memory.read().wasm_accessible()
+     }
+ }
+ 
++#[cfg(not(has_custom_threads))]
+ thread_local! {
+     /// Structure used in conjunction with `ParkingSpot` to block the current
+     /// thread if necessary. Note that this is lazily initialized.
+diff --git a/vendor/wasmtime-48/wasmtime/src/runtime/vm/parking_spot_nostd.rs b/vendor/wasmtime-48/wasmtime/src/runtime/vm/parking_spot_nostd.rs
+new file mode 100644
+index 0000000..0a9306c
+--- /dev/null
++++ b/vendor/wasmtime-48/wasmtime/src/runtime/vm/parking_spot_nostd.rs
+@@ -0,0 +1,217 @@
++//! Wait/notify for shared memories without `std`.
++//!
++//! Waiters are recorded in a fixed table of copy-only scalars; nothing owned
++//! by the embedder is stored here. A waiting guest thread suspends its async
++//! fiber; `notify` marks the waiter and asks the embedder to wake its token.
++
++#![deny(missing_docs)]
++
++use crate::prelude::*;
++use crate::runtime::vm::WaitResult;
++use crate::runtime::vm::threads::ThreadHooks;
++use crate::sync::RwLock;
++use core::future::{Future, poll_fn};
++use core::pin::Pin;
++use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
++use core::task::Poll;
++use core::time::Duration;
++
++/// Maximum number of simultaneously suspended waiters per shared memory.
++pub const MAX_WAITERS: usize = 16;
++
++#[derive(Clone, Copy, Debug)]
++struct Waiter {
++    key: u64,
++    token: [usize; 2],
++    notified: bool,
++    seq: u64,
++}
++
++#[derive(Debug)]
++struct Table {
++    slots: [Option<Waiter>; MAX_WAITERS],
++    next_seq: u64,
++}
++
++/// The per-memory waiter table.
++#[derive(Debug)]
++pub struct ParkingSpot {
++    inner: RwLock<Table>,
++}
++
++impl Default for ParkingSpot {
++    fn default() -> Self {
++        Self {
++            inner: RwLock::new(Table {
++                slots: [None; MAX_WAITERS],
++                next_seq: 0,
++            }),
++        }
++    }
++}
++
++struct Registration<'a> {
++    spot: &'a ParkingSpot,
++    seq: u64,
++    armed: bool,
++}
++
++impl Drop for Registration<'_> {
++    fn drop(&mut self) {
++        if self.armed {
++            self.spot.remove(self.seq);
++        }
++    }
++}
++
++impl ParkingSpot {
++    /// Atomically validates `atomic == expected` and, if so, suspends the
++    /// current guest thread until notified or until `timeout` elapses.
++    pub async fn wait32(
++        &self,
++        atomic: &AtomicU32,
++        expected: u32,
++        timeout: Option<Duration>,
++        hooks: &dyn ThreadHooks,
++    ) -> Result<WaitResult> {
++        self.wait(
++            atomic.as_ptr() as u64,
++            || atomic.load(SeqCst) == expected,
++            timeout,
++            hooks,
++        )
++        .await
++    }
++
++    /// Same as `wait32`, but for 64-bit values.
++    pub async fn wait64(
++        &self,
++        atomic: &AtomicU64,
++        expected: u64,
++        timeout: Option<Duration>,
++        hooks: &dyn ThreadHooks,
++    ) -> Result<WaitResult> {
++        self.wait(
++            atomic.as_ptr() as u64,
++            || atomic.load(SeqCst) == expected,
++            timeout,
++            hooks,
++        )
++        .await
++    }
++
++    async fn wait(
++        &self,
++        key: u64,
++        validate: impl FnOnce() -> bool,
++        timeout: Option<Duration>,
++        hooks: &dyn ThreadHooks,
++    ) -> Result<WaitResult> {
++        let seq = {
++            let mut table = self.inner.write();
++            // The validation happens under the table lock, so a concurrent
++            // `notify` either sees this waiter or happens before the load.
++            if !validate() {
++                return Ok(WaitResult::Mismatch);
++            }
++            let Some(slot) = table.slots.iter().position(Option::is_none) else {
++                bail!("atomic wait table exhausted ({MAX_WAITERS} waiters)");
++            };
++            let seq = table.next_seq;
++            table.next_seq += 1;
++            table.slots[slot] = Some(Waiter {
++                key,
++                token: hooks.current(),
++                notified: false,
++                seq,
++            });
++            seq
++        };
++        let mut registration = Registration {
++            spot: self,
++            seq,
++            armed: true,
++        };
++        let timeout_ns = timeout.map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
++        let mut timer: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
++        let result = poll_fn(|cx| {
++            if self.take_notified(seq) {
++                return Poll::Ready(WaitResult::Ok);
++            }
++            if let Some(ns) = timeout_ns {
++                let timer = timer.get_or_insert_with(|| hooks.sleep(ns));
++                if timer.as_mut().poll(cx).is_ready() {
++                    // Notify may have raced the timer; prefer the notification
++                    // so a notified count is never lost.
++                    return Poll::Ready(if self.take_notified(seq) {
++                        WaitResult::Ok
++                    } else {
++                        self.remove(seq);
++                        WaitResult::TimedOut
++                    });
++                }
++            }
++            Poll::Pending
++        })
++        .await;
++        registration.armed = false;
++        Ok(result)
++    }
++
++    fn take_notified(&self, seq: u64) -> bool {
++        let mut table = self.inner.write();
++        match table.slots.iter().position(|w| w.is_some_and(|w| w.seq == seq)) {
++            Some(index) if table.slots[index].unwrap().notified => {
++                table.slots[index] = None;
++                true
++            }
++            _ => false,
++        }
++    }
++
++    fn remove(&self, seq: u64) {
++        let mut table = self.inner.write();
++        if let Some(index) = table.slots.iter().position(|w| w.is_some_and(|w| w.seq == seq)) {
++            table.slots[index] = None;
++        }
++    }
++
++    /// Notify at most `n` threads waiting on `addr`, in arrival order.
++    ///
++    /// Returns the number of threads notified.
++    pub fn notify<T>(&self, addr: &T, n: u32, hooks: Option<&dyn ThreadHooks>) -> u32 {
++        if n == 0 {
++            return 0;
++        }
++        let key = addr as *const _ as u64;
++        let mut tokens = [None; MAX_WAITERS];
++        let mut count = 0u32;
++        {
++            let mut table = self.inner.write();
++            loop {
++                let next = table
++                    .slots
++                    .iter()
++                    .enumerate()
++                    .filter(|(_, w)| w.is_some_and(|w| w.key == key && !w.notified))
++                    .min_by_key(|(_, w)| w.unwrap().seq)
++                    .map(|(i, _)| i);
++                let Some(index) = next else { break };
++                let waiter = table.slots[index].as_mut().unwrap();
++                waiter.notified = true;
++                tokens[count as usize] = Some(waiter.token);
++                count += 1;
++                if count == n {
++                    break;
++                }
++            }
++        }
++        // Wake outside the table lock: the embedder may take scheduler locks.
++        if let Some(hooks) = hooks {
++            for token in tokens.iter().flatten() {
++                hooks.wake(*token);
++            }
++        }
++        count
++    }
++}
+diff --git a/vendor/wasmtime-48/wasmtime/src/runtime/vm/threads.rs b/vendor/wasmtime-48/wasmtime/src/runtime/vm/threads.rs
+new file mode 100644
+index 0000000..edacc55
+--- /dev/null
++++ b/vendor/wasmtime-48/wasmtime/src/runtime/vm/threads.rs
+@@ -0,0 +1,25 @@
++//! Embedder hooks for the no_std `threads` implementation.
++//!
++//! Without `std` there is no OS thread to park, so `memory.atomic.wait*`
++//! suspends the current async fiber instead. The embedder identifies the
++//! executing guest thread with a copy-only token, wakes a token when another
++//! thread notifies it, and supplies a timer future for bounded waits.
++
++use alloc::boxed::Box;
++use core::future::Future;
++use core::pin::Pin;
++
++/// Scheduler integration for guest threads sharing one linear memory.
++///
++/// All methods may be called from any guest thread. `wake` may be called
++/// while another thread is suspended in `wait`; it must not allocate, block or
++/// re-enter the runtime. `sleep` is only called on a fiber and its future is
++/// polled with the same `Context` that drives the guest's async call.
++pub trait ThreadHooks: Send + Sync + 'static {
++    /// Copy-only identity of the currently executing guest thread.
++    fn current(&self) -> [usize; 2];
++    /// Make the thread identified by `token` poll its guest call again.
++    fn wake(&self, token: [usize; 2]);
++    /// A future that completes after at least `nanoseconds`.
++    fn sleep(&self, nanoseconds: u64) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
++}

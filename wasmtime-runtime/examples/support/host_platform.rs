@@ -14,8 +14,10 @@ extern "C" fn wasmtime_tls_set(slot: usize, value: *mut u8) {
     TLS.with(|tls| tls[slot].set(value));
 }
 
-// The custom ABI supplies aligned, initially zero usize storage. Serialize
-// readers as well as writers; this preserves correctness without OS handles.
+// The custom ABI supplies aligned, initially zero usize storage. The rwlock
+// is a real reader/writer lock (bit 63 = writer, low bits = reader count),
+// matching the kernel hooks so shared memories behave the same on both.
+const WRITER: usize = 1 << (usize::BITS - 1);
 unsafe fn acquire(lock: *mut usize) {
     let lock = unsafe { AtomicUsize::from_ptr(lock) };
     while lock
@@ -28,6 +30,35 @@ unsafe fn acquire(lock: *mut usize) {
 unsafe fn release(lock: *mut usize) {
     unsafe { AtomicUsize::from_ptr(lock) }.store(0, Ordering::Release);
 }
+unsafe fn read(lock: *mut usize) {
+    let lock = unsafe { AtomicUsize::from_ptr(lock) };
+    loop {
+        let value = lock.load(Ordering::Relaxed);
+        if value & WRITER == 0
+            && lock
+                .compare_exchange_weak(value, value + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            return;
+        }
+        std::thread::yield_now();
+    }
+}
+unsafe fn read_release(lock: *mut usize) {
+    unsafe { AtomicUsize::from_ptr(lock) }.fetch_sub(1, Ordering::Release);
+}
+unsafe fn write(lock: *mut usize) {
+    let lock = unsafe { AtomicUsize::from_ptr(lock) };
+    while lock
+        .compare_exchange_weak(0, WRITER, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        std::thread::yield_now();
+    }
+}
+unsafe fn write_release(lock: *mut usize) {
+    unsafe { AtomicUsize::from_ptr(lock) }.store(0, Ordering::Release);
+}
 macro_rules! lock_hook {
     ($name:ident, $operation:ident) => {
         #[unsafe(no_mangle)]
@@ -38,10 +69,10 @@ macro_rules! lock_hook {
 }
 lock_hook!(wasmtime_sync_lock_acquire, acquire);
 lock_hook!(wasmtime_sync_lock_release, release);
-lock_hook!(wasmtime_sync_rwlock_read, acquire);
-lock_hook!(wasmtime_sync_rwlock_read_release, release);
-lock_hook!(wasmtime_sync_rwlock_write, acquire);
-lock_hook!(wasmtime_sync_rwlock_write_release, release);
+lock_hook!(wasmtime_sync_rwlock_read, read);
+lock_hook!(wasmtime_sync_rwlock_read_release, read_release);
+lock_hook!(wasmtime_sync_rwlock_write, write);
+lock_hook!(wasmtime_sync_rwlock_write_release, write_release);
 #[unsafe(no_mangle)]
 extern "C" fn wasmtime_sync_lock_free(_: *mut usize) {}
 #[unsafe(no_mangle)]

@@ -97,3 +97,18 @@ is gone and the child joined; it owns no external reference in the arena.
 The patch chain was replayed from hash-verified published runtime files.
 `fuel-custom` verifies identical exhaustion, 99 callback boundaries with or
 without batching, a maximum of 32 boundaries per poll, cancellation and reuse.
+
+`runtime-no-std-threads.patch` applies after `runtime-custom-fuel-yield.patch`
+and adds the opt-in `custom-threads` runtime feature. `threads` no longer
+implies `std` in `wasmtime`, `wasmtime-environ` or `wasmtime-cranelift`; the
+`wasmtime` feature now forwards `threads` to both so the builtin table and its
+trap sentinels agree across the three crates (without that forwarding the
+compiler emitted no trap check after the atomic wait/notify libcalls). Host
+`SharedMemory::new` routes through the configured `MemoryCreator`. With
+`custom-threads`, `shared_memory.rs` uses the crate's no_std locks, waiters are
+copy-only tokens in a fixed table (`parking_spot_nostd.rs`), `memory.atomic.wait*`
+suspends the current async fiber through `block_on`, notify wakes tokens through
+the new `ThreadHooks` config hook (`Config::with_thread_hooks`), and timeouts use
+the hook's timer future. `std` builds keep the OS-thread parking implementation
+unchanged. No `Waker`, `Instant`, thread-local or heap allocation is used on the
+no_std wait path.

@@ -327,20 +327,30 @@ fn fs_data_ancestor_count(chunk_index: u64) -> usize {
 }
 
 pub fn encode_fs_data_node_v1(node: &FsDataNodeV1) -> Result<Vec<u8>, FsCodecError> {
+    encode_fs_data_node_parts(node.chunk_index, node.total_len, &node.ancestors, &node.bytes)
+}
+
+/// Encode borrowed content without first cloning it into a decoded node.
+pub(crate) fn encode_fs_data_node_parts(
+    chunk_index: u64,
+    total_len: u64,
+    ancestors: &[TypedObjectReference],
+    bytes: &[u8],
+) -> Result<Vec<u8>, FsCodecError> {
     validate_data_node_shape(
-        node.chunk_index,
-        node.total_len,
-        node.bytes.len(),
-        &node.ancestors,
+        chunk_index,
+        total_len,
+        bytes.len(),
+        ancestors,
     )?;
     let length = FS_DATA_HEADER_LEN
         .checked_add(
-            node.ancestors
+            ancestors
                 .len()
                 .checked_mul(FS_DATA_REFERENCE_LEN)
                 .ok_or(FsCodecError::ArithmeticOverflow)?,
         )
-        .and_then(|length| length.checked_add(node.bytes.len()))
+        .and_then(|length| length.checked_add(bytes.len()))
         .ok_or(FsCodecError::ArithmeticOverflow)?;
     let mut out = vec![0; length];
     out[..8].copy_from_slice(FS_DATA_MAGIC);
@@ -351,16 +361,16 @@ pub fn encode_fs_data_node_v1(node: &FsDataNodeV1) -> Result<Vec<u8>, FsCodecErr
         0x0c,
         u32::try_from(length).map_err(|_| FsCodecError::OutOfBounds)?,
     );
-    put_u64(&mut out, 0x10, node.chunk_index);
-    put_u64(&mut out, 0x18, node.total_len);
-    put_u32(&mut out, 0x20, node.bytes.len() as u32);
-    put_u16(&mut out, 0x24, node.ancestors.len() as u16);
+    put_u64(&mut out, 0x10, chunk_index);
+    put_u64(&mut out, 0x18, total_len);
+    put_u32(&mut out, 0x20, bytes.len() as u32);
+    put_u16(&mut out, 0x24, ancestors.len() as u16);
     let mut offset = FS_DATA_HEADER_LEN;
-    for reference in &node.ancestors {
+    for reference in ancestors {
         encode_reference(&mut out, offset, *reference);
         offset += FS_DATA_REFERENCE_LEN;
     }
-    out[offset..].copy_from_slice(&node.bytes);
+    out[offset..].copy_from_slice(bytes);
     Ok(out)
 }
 

@@ -5,6 +5,8 @@ edition = "2021"
 publish = false
 
 [features]
+python-duo = ["python-wasi"]
+python-wasi = []
 instruction-profile = ["wasmi/instruction-profile"]
 rv64-cache = ["wasmi/rv64-cache"]
 
@@ -14,4 +16,5 @@ wasmparser = { version = "=0.255.0", default-features = false, features = ["feat
 vibeos-component-format = { path = "../component-format" }
 
 [dev-dependencies]
+vibeos-core = { path = "../core" }
 wat = { version = "=1.255.0", default-features = false }

@@ -34,6 +34,8 @@ use vibeos_wasi_runtime::{
     WasiClockError, WasiInvocation, WasiIo, WasiIoError, WasiLimits, WasiTerminal,
 };
 static BUSY: AtomicBool = AtomicBool::new(false);
+#[cfg(all(feature = "python-command", any(feature = "wasmtime-command", feature = "wasi-rv64-cache")))]
+compile_error!("python-wasi currently requires the bounded Wasmi interpreter backend");
 struct KernelIo<'a>(GuestIo<'a>);
 impl WasiIo for KernelIo<'_> {
     fn read(&mut self, cx: &mut Context<'_>, bytes: &mut [u8]) -> Poll<Result<usize, WasiIoError>> {
@@ -60,7 +62,7 @@ fn clock_error(errno: i32) -> WasiClockError {
 
 fn invocation_limits() -> WasiLimits {
     WasiLimits {
-        #[cfg(feature = "wasi-benchmark")]
+        #[cfg(feature = "wasi-long-fuel")]
         total_fuel: 100_000_000_000,
         ..WasiLimits::default()
     }
@@ -88,6 +90,8 @@ struct Job {
     native_signal: wasmtime_backend::PollSignal,
     #[cfg(feature = "wasmtime-command-fuel-batch")]
     native_fuel: wasmtime_backend::FuelBatch,
+    #[cfg(feature = "wasmtime-threads")]
+    threads: wasmtime_backend::Threads,
     authority: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 struct Guest {
@@ -147,7 +151,10 @@ impl Future for Guest {
                         crate::println!("WASI running");
                     }
                     Err(error) => {
+                        let failure = HEAP.last_failure();
+                        let snapshot = HEAP.snapshot();
                         crate::println!("WASI admission rejected: {:?}", error);
+                        crate::println!("WASI admission heap={:?} allocation_failure={:?}", snapshot, failure);
                         *job.result.lock() =
                             Some(if error == vibeos_wasi_runtime::WasiError::Limit {
                                 WasiTerminal::LimitExceeded
@@ -228,6 +235,23 @@ fn launch(
     io: Arc<CommandIo>,
     authority: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 ) -> Result<(), u32> {
+    // Local command input can belong to the caller's allocation domain.
+    // Keep the asynchronous job's input in SYSTEM until the job retires.
+    let _system = unsafe { heap::enter_domain(AllocationDomain::SYSTEM) };
+    let mut owned = Vec::new();
+    owned.try_reserve_exact(bytes.len()).map_err(|_| 124u32)?;
+    owned.extend_from_slice(bytes);
+    launch_owned(owned, argv, io, authority)
+}
+
+// The SSH request already owns its loaded snapshot in SYSTEM. Transfer it
+// directly instead of retaining a second full module buffer during admission.
+fn launch_owned(
+    bytes: Vec<u8>,
+    argv: &[String],
+    io: Arc<CommandIo>,
+    authority: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+) -> Result<(), u32> {
     if BUSY
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -267,7 +291,7 @@ fn launch(
         space.mint(Arc::new(Endpoint), Rights::WRITE),
     ];
     let job = Box::new(Job {
-        bytes: bytes.to_vec(),
+        bytes,
         argv: argv.to_vec(),
         io,
         space,
@@ -277,6 +301,8 @@ fn launch(
         native_signal: wasmtime_backend::PollSignal::new(),
         #[cfg(feature = "wasmtime-command-fuel-batch")]
         native_fuel: wasmtime_backend::FuelBatch::new(),
+        #[cfg(feature = "wasmtime-threads")]
+        threads: wasmtime_backend::Threads::new(),
         authority,
     });
     let raw = Box::into_raw(job) as usize;
@@ -287,6 +313,7 @@ fn launch(
     let guest = { wasmtime_backend::register(domain, raw); wasmtime_backend::Guest::new(raw) };
     #[cfg(not(feature = "wasmtime-command"))]
     let guest = Guest { job: raw, instance: None, #[cfg(feature = "wasi-benchmark")] profile: (0, 0, 0) };
+    #[cfg(not(feature = "wasmtime-threads"))]
     let child = unsafe {
         exec::spawn_reclaimable_owned(
             domain,
@@ -294,7 +321,11 @@ fn launch(
             guest,
         )
     };
-    exec::spawn_tracked("wasi-reaper", async move {
+    // Guest threads are siblings of this task placed on other harts; a fault
+    // anywhere quiesces them before the arena is reclaimed raw.
+    #[cfg(feature = "wasmtime-threads")]
+    let child = unsafe { exec::spawn_reclaimable_owned_parallel(domain, "wasi-guest", guest) };
+    let reaper = async move {
         let exit = {
             let mut joined = pin!(child.join());
             loop {
@@ -320,8 +351,23 @@ fn launch(
                 if job.authority.as_ref().is_some_and(|check| !check()) {
                     job.io.deny();
                 }
+                // A thread parked in an atomic wait has no I/O wait to
+                // interrupt: closing the pipes on cancellation (an SSH channel
+                // that went away) wakes nobody, and its siblings stop at their
+                // next fuel boundary without ever reaching the notify it waits
+                // for. Wake every task so it observes the denial or
+                // cancellation through `stopped` and the process can end.
+                #[cfg(feature = "wasmtime-threads")]
+                if job.io.cancelled() {
+                    wasmtime_backend::notify_denied(raw);
+                }
             }
         };
+        // Sibling thread tasks share the arena. Main normally joins them; after
+        // a main fault the executor tore them down. Join whatever remains so
+        // retirement sees every handle released.
+        #[cfg(feature = "wasmtime-threads")]
+        wasmtime_backend::reap_threads(raw).await;
         // The join proves guest polling/destruction and executor fault reclaim
         // have completed. Only the reaper owns and retires the control record.
         #[cfg(feature = "wasmtime-command")]
@@ -336,7 +382,8 @@ fn launch(
                 WasiTerminal::Cancelled
             },
         );
-        let clean = if HEAP.arena_stats(arena).is_some() {
+        let leftover = HEAP.arena_stats(arena);
+        let clean = if leftover.is_some() {
             HEAP.close_empty_domain(domain).is_ok()
         } else {
             true
@@ -355,6 +402,34 @@ fn launch(
             BUSY.store(false, Ordering::Release);
         }
         io.complete(if clean { t } else { WasiTerminal::Trapped });
+        if !clean {
+            // Name what survived so an unclean lifecycle is diagnosable from
+            // the log alone: arena bytes/allocations and owner accounting,
+            // then every live block's size class, allocating call site (with
+            // the benchmark image's `alloc-site-trace`) and first words, and
+            // the executor's view. A failed close leaves the arena in place.
+            let mut leftover_classes = [0usize; 8];
+            let mut leftover_detail = [(0usize, 0usize, [0u64; 32]); 8];
+            let leftover_count = HEAP.arena_live_classes(arena, &mut leftover_classes, &mut leftover_detail);
+            crate::println!(
+                "WASI unclean reclamation: arena={:?} owner={:?} live_classes={:?} ({} total)",
+                leftover,
+                HEAP.account_stats(owner),
+                &leftover_classes[..leftover_count.min(leftover_classes.len())],
+                leftover_count
+            );
+            for (index, (base, site, words)) in leftover_detail[..leftover_count.min(leftover_detail.len())].iter().enumerate() {
+                crate::println!("WASI unclean block base={base:#x} class={} site={site:#x} words={words:x?}", leftover_classes[index]);
+            }
+            crate::println!(
+                "WASI unclean executor: remote_detaches={} completed={} faulted={} cancelled={} domain={:?}",
+                exec::parallel_remote_detaches(), exec::completed_count(), exec::faulted_count(), exec::cancelled_count(),
+                exec::reclaimable_domain_snapshot(domain)
+            );
+            for task in exec::task_report() {
+                crate::println!("WASI unclean live task id={} name={} state={:?} owner={:?} arena={:?} polls={}", task.id.0, task.name, task.state, task.owner, task.arena, task.polls);
+            }
+        }
         crate::println!(
             "WASI terminal={:?} reclaimed={} caps={} waiters={}",
             t,
@@ -362,7 +437,14 @@ fn launch(
             caps,
             io.pending_waiters()
         );
-    });
+    };
+    // The periodic SYSTEM supervisor belongs with boot-hart housekeeping.
+    // Letting idle workers steal it makes their future CPU-bound polls share
+    // that hart with every 10 ms wakeup, defeating worker placement isolation.
+    #[cfg(feature = "wasmtime-threads")]
+    exec::spawn_pinned_on(exec::HartId::BOOT, "wasi-reaper", reaper);
+    #[cfg(not(feature = "wasmtime-threads"))]
+    exec::spawn_tracked("wasi-reaper", reaper);
     system.restore();
     Ok(())
 }
@@ -407,10 +489,10 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
             .lookup::<vibeos_file_store::FileTreeRoot>(root_cap, Rights::READ)?
             .with(|root| root.regular_reader(&path))
             .map_err(|_| Status::Denied)?;
-        if reader.0.size > 512 * 1024 {
+        if reader.0.size > vibeos_wasi_runtime::profile::MODULE_BYTES as u64 {
             return Err(Status::BudgetExceeded);
         }
-        let bytes = vibeos_wasi_command::load_reader(reader.1)
+        let bytes = vibeos_wasi_command::load_reader(reader.1, reader.0.size)
             .await
             .map_err(|_| Status::Denied)?;
         let mut argv = alloc::vec![path.file_name().unwrap_or("command.wasm").to_string()];
@@ -435,6 +517,10 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
                 Status::BudgetExceeded
             }
         })?;
+        // launch copied the snapshot into SYSTEM so the child can outlive this
+        // command. Release the caller-domain copy before yielding to admission:
+        // retaining it across the I/O pump costs another 8 MiB for CPython.
+        drop(bytes);
         let _cancel = CancelOnDrop(io.clone());
         let input = async {
             loop {
@@ -527,22 +613,23 @@ fn run_local(ctx: CapabilityCommandContext) -> CapabilityCommandFuture {
     })
 }
 
-#[cfg(feature = "wasi-ssh")]
+#[cfg(feature = "ssh-commands")]
 pub fn permitted(
     profile: vibeos_sshd::AuthorizedProfile,
     request: &vibeos_wasi_command::Request,
 ) -> bool {
-    // Explicit QEMU acceptance profile, separate upload/run capability switches.
-    profile.profile.get() == 1
-        && profile.generation == 1
-        && match request {
-            vibeos_wasi_command::Request::Upload { .. } => cfg!(feature = "wasi-ssh-upload"),
-            vibeos_wasi_command::Request::Run { .. } => true,
-        }
+    #[cfg(feature = "milkv-command")]
+    let admitted = crate::ssh_provisioning::command_profile_current(profile);
+    #[cfg(not(feature = "milkv-command"))]
+    let admitted = profile.profile.get() == 1 && profile.generation == 1;
+    admitted && match request {
+        vibeos_wasi_command::Request::Upload { .. } => cfg!(any(feature = "wasi-ssh-upload", feature = "milkv-command")),
+        vibeos_wasi_command::Request::Run { .. } => true,
+    }
 }
-#[cfg(feature = "wasi-ssh")]
+#[cfg(feature = "ssh-commands")]
 struct RequestService(bool);
-#[cfg(feature = "wasi-ssh")]
+#[cfg(feature = "ssh-commands")]
 impl Resource for RequestService {
     fn kind(&self) -> &'static str {
         if self.0 {
@@ -558,7 +645,7 @@ impl Resource for RequestService {
         self
     }
 }
-#[cfg(feature = "wasi-ssh")]
+#[cfg(feature = "ssh-commands")]
 pub fn open(
     profile: vibeos_sshd::AuthorizedProfile,
     request: vibeos_wasi_command::Request,
@@ -595,6 +682,9 @@ pub fn open(
             };
             if task_io.cancelled() {
                 return Err(130);
+            }
+            if !permitted(profile, &request) {
+                return Err(126);
             }
             // Translate the explicitly admitted SSH profile into least-rights
             // loader capabilities. This CSpace belongs to the trusted request,
@@ -633,15 +723,22 @@ pub fn open(
                     let mut argv = alloc::vec![name];
                     argv.extend(args);
                     let authority = Box::new(move || {
+                        // Both handles are fresh private roots, validated by
+                        // lookup_lease/lookup_as above. This closure exclusively
+                        // owns their loader CSpace and never mutates it or
+                        // exports either derivation. Retain it for the complete
+                        // invocation, but do not re-walk invariant slots at
+                        // every fuel boundary. The invocation lease retains
+                        // the granted execution right; session denial and
+                        // disconnect still revoke CommandIo at every boundary.
+                        let _keep_loader_alive = &loader;
+                        #[cfg(feature = "milkv-command")]
+                        if !crate::ssh_provisioning::command_profile_current(profile) {
+                            return false;
+                        }
                         service_lease.authorizes(Rights::INVOKE)
-                            && loader
-                                .rights_of(source)
-                                .is_ok_and(|r| r.contains(Rights::READ))
-                            && loader
-                                .rights_of(service)
-                                .is_ok_and(|r| r.contains(Rights::INVOKE))
                     });
-                    launch(&bytes, &argv, task_io.clone(), Some(authority))?;
+                    launch_owned(bytes, &argv, task_io.clone(), Some(authority))?;
                     Ok(true)
                 }
             }

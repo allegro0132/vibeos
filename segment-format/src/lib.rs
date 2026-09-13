@@ -882,6 +882,11 @@ pub fn encode_superblock_body(
     out: &mut Page,
 ) -> Result<BodyDigest, FormatError> {
     validate_superblock(value)?;
+    write_superblock_fields(value, out)?;
+    Ok(finish_body(RecordKind::Superblock, 0x80, value.binding, out))
+}
+
+fn write_superblock_fields(value: &Superblock, out: &mut Page) -> Result<(), FormatError> {
     begin_body(RecordKind::Superblock, 0x80, value.binding, out)?;
     out[0x080] = value.copy;
     put_u32(out, 0x088, value.geometry.page_size);
@@ -904,12 +909,7 @@ pub fn encode_superblock_body(
     put_u64(out, 0x0e8, value.initial_block_count);
     put_u32(out, 0x0f0, value.logical_block_size);
     put_u32(out, 0x0f8, value.max_replay_records);
-    Ok(finish_body(
-        RecordKind::Superblock,
-        0x80,
-        value.binding,
-        out,
-    ))
+    Ok(())
 }
 
 pub fn decode_superblock_verified(
@@ -930,6 +930,11 @@ pub fn decode_superblock_verified(
     {
         return Err(FormatError::NonZeroReserved);
     }
+    let value = read_superblock_fields(body, digest)?;
+    Ok(DecodeStatus::Sealed(VerifiedRecord { value, digest }))
+}
+
+fn read_superblock_fields(body: &Page, digest: BodyDigest) -> Result<Superblock, FormatError> {
     let value = Superblock {
         binding: digest.binding,
         copy: body[0x080],
@@ -955,7 +960,7 @@ pub fn decode_superblock_verified(
         max_replay_records: get_u32(body, 0x0f8),
     };
     validate_superblock(&value)?;
-    Ok(DecodeStatus::Sealed(VerifiedRecord { value, digest }))
+    Ok(value)
 }
 
 pub fn decode_superblock(

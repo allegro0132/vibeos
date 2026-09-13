@@ -25,6 +25,52 @@ pub const MAX_BYTES: usize = MAX_EXTENT_PAYLOAD_PAGES as usize * PAGE_SIZE;
 const MAGIC: &[u8; 8] = b"EXPBND01";
 pub const OBJECT_KIND_ROOT_BUNDLE: u32 = 0xffff_0030;
 
+/// Read and structurally select experimental anchors from this device. This is
+/// not a mounted store: allocation transitions and root semantics are unchecked.
+/// A single four-page workspace is reused, then released before payload reads.
+#[cfg(feature = "experimental-root-bundle")]
+pub async fn select_device_checkpoint<D: crate::PageDevice>(device: &D, anchor_budget: usize,
+    expected_max_replay_records: u32)
+    -> Result<vibeos_segment_format::experimental_root_checkpoint::SelectedCheckpoint, crate::StoreError<D::Error>>
+{
+    use crate::StoreError;
+    use vibeos_segment_format::{experimental_root_checkpoint as format, ANCHOR_PAGES, SEGMENT_PAGES};
+    let info = device.info();
+    if !matches!(info.logical_block_size, 512 | 1024 | 2048 | 4096)
+        || info.page_count <= ANCHOR_PAGES
+        || (info.page_count - ANCHOR_PAGES) % SEGMENT_PAGES != 0
+        || info.range_first_logical_block.checked_add(info.logical_block_count).is_none()
+        || expected_max_replay_records == 0 {
+        return Err(StoreError::InvalidConfig);
+    }
+    let blocks_per_page = PAGE_SIZE as u64 / u64::from(info.logical_block_size);
+    if info.logical_block_count % blocks_per_page != 0
+        || info.logical_block_count / blocks_per_page != info.page_count {
+        return Err(StoreError::InvalidConfig);
+    }
+    if anchor_budget < 4 * PAGE_SIZE { return Err(StoreError::MemoryLimit); }
+    let mut pages = Vec::new();
+    pages.try_reserve_exact(4).map_err(|_| StoreError::MemoryLimit)?;
+    if pages.capacity() > anchor_budget / PAGE_SIZE { return Err(StoreError::MemoryLimit); }
+    pages.resize(4, [0; PAGE_SIZE]);
+    device.read_pages(0, &mut pages).await.map_err(StoreError::Device)?;
+    let admitted = format::admit((&pages[0], &pages[1]), (&pages[2], &pages[3]))?
+        .ok_or(StoreError::Unformatted)?;
+    let superblock = admitted.superblock();
+    if superblock.device_id != info.device_id
+        || superblock.range_first_logical_block != info.range_first_logical_block
+        || superblock.logical_block_size != info.logical_block_size
+        || superblock.initial_block_count > info.logical_block_count
+        || superblock.initial_range_pages > info.page_count
+        || superblock.initial_range_pages.checked_mul(blocks_per_page) != Some(superblock.initial_block_count)
+        || superblock.max_replay_records != expected_max_replay_records {
+        return Err(StoreError::Corrupt);
+    }
+    device.read_pages(4, &mut pages).await.map_err(StoreError::Device)?;
+    admitted.select_checkpoints((&pages[0], &pages[1]), (&pages[2], &pages[3]), info.page_count)?
+        .ok_or(StoreError::Unformatted)
+}
+
 pub(crate) struct PreparedRootBundle {
     pub(crate) payload: Vec<u8>,
     pub(crate) record: crate::cas::FinalRecord,
@@ -115,9 +161,666 @@ pub struct OwnedRootBundle {
     bytes: Vec<u8>,
     ranges: [Range<usize>; 3],
     selected: [bool; 3],
+    source_pointer: PhysicalPointer,
+    target_checkpoint_generation: u64,
+}
+
+/// Allocation map with its decoded version and checkpoint binding preserved.
+#[cfg(feature = "experimental-root-bundle")]
+pub struct RecoveredAllocation {
+    allocation: crate::AllocationV2,
+    checkpoint: vibeos_segment_format::experimental_root_checkpoint::BundleCheckpoint,
+    version: u16,
+}
+
+#[cfg(feature = "experimental-root-bundle")]
+pub struct RecoveredAllocationPair {
+    pub previous: Option<RecoveredAllocation>,
+    pub current: RecoveredAllocation,
+}
+
+/// Device-selected recovery data. No runtime mount or write authority is
+/// installed by producing this value. `roots` is absent for empty bootstrap.
+#[cfg(feature = "experimental-root-bundle")]
+pub struct RecoveredCheckpoint {
+    pub selected: vibeos_segment_format::experimental_root_checkpoint::SelectedCheckpoint,
+    pub allocations: RecoveredAllocationPair,
+    pub roots: Option<RecoveredBundleRoots>,
+}
+
+/// Select experimental anchors and recover their current data under one
+/// dynamic-memory allowance. Anchor buffers are released before root reads.
+#[cfg(feature = "experimental-root-bundle")]
+pub async fn recover_device_checkpoint<D: crate::PageDevice>(device: &D,
+    memory_limit: usize, resident_bytes: usize, max_entries: usize, expected_max_replay_records: u32)
+    -> Result<RecoveredCheckpoint, crate::StoreError<D::Error>>
+{
+    let anchor_budget = memory_limit.checked_sub(resident_bytes).ok_or(crate::StoreError::MemoryLimit)?;
+    let selected = select_device_checkpoint(device, anchor_budget, expected_max_replay_records).await?;
+    let (allocations, roots) = if selected.value().base.allocation_root == PhysicalPointer::Null {
+        (recover_same_admission_allocations(device, &selected, memory_limit, resident_bytes).await?, None)
+    } else {
+        let (allocations, roots) = recover_checkpoint_roots(device, &selected, memory_limit, resident_bytes, max_entries).await?;
+        (allocations, Some(roots))
+    };
+    Ok(RecoveredCheckpoint { selected, allocations, roots })
+}
+
+/// Dispatch non-null CAS/full-authority roots by their explicit layout bits.
+/// This returns recovery data only; bootstrap, growth and authority deltas
+/// still require their dedicated integration paths.
+#[cfg(feature = "experimental-root-bundle")]
+pub async fn recover_checkpoint_roots<D: crate::PageDevice>(device: &D,
+    selected: &vibeos_segment_format::experimental_root_checkpoint::SelectedCheckpoint,
+    memory_limit: usize, resident_bytes: usize, max_entries: usize)
+    -> Result<(RecoveredAllocationPair, RecoveredBundleRoots), crate::StoreError<D::Error>>
+{
+    use crate::StoreError;
+    let cp = selected.value();
+    if cp.root_bundle_mask & 3 == 3 && cp.base.catalog_root == cp.base.authority_root {
+        return recover_bundled_checkpoint(device, selected, memory_limit, resident_bytes, max_entries).await;
+    }
+    let maps = recover_same_admission_allocations(device, selected, memory_limit, resident_bytes).await?;
+    let old = maps.previous.as_ref().map_or(Some(0), |map| map.map().allocated_bytes()).ok_or(StoreError::MemoryLimit)?;
+    let resident = resident_bytes.checked_add(old).ok_or(StoreError::MemoryLimit)?;
+    let current = maps.current.map().allocated_bytes().ok_or(StoreError::MemoryLimit)?;
+    let catalog = if cp.root_bundle_mask & 1 == 0 {
+        recover_separate_catalog(device, &maps.current, memory_limit, resident, max_entries).await?
+    } else {
+        let budget = resident.checked_add(current).and_then(|n| memory_limit.checked_sub(n)).ok_or(StoreError::MemoryLimit)?;
+        let (refs, context) = RootReferences::from_checkpoint(selected.current(), budget).map_err(|_| StoreError::Corrupt)?;
+        refs.read_bundle(device, Role::Catalog, context).await?.recover_catalog(device,
+            &maps.current, memory_limit, resident, max_entries).await?
+    };
+    let (authority, roots) = if cp.root_bundle_mask & 2 == 0 {
+        recover_separate_authority(device, &maps.current, &catalog, memory_limit, resident).await?
+    } else {
+        let tables = catalog.objects.capacity().checked_mul(core::mem::size_of::<crate::ObjectMapping>())
+            .and_then(|n| catalog.blobs.capacity().checked_mul(core::mem::size_of::<crate::BlobMapping>())
+                .and_then(|m| n.checked_add(m))).ok_or(StoreError::MemoryLimit)?;
+        let budget = resident.checked_add(current).and_then(|n| n.checked_add(tables))
+            .and_then(|n| memory_limit.checked_sub(n)).ok_or(StoreError::MemoryLimit)?;
+        let (refs, context) = RootReferences::from_checkpoint(selected.current(), budget).map_err(|_| StoreError::Corrupt)?;
+        refs.read_bundle(device, Role::Authority, context).await?.decode_authority_snapshot(
+            &maps.current, &catalog, memory_limit, resident)?
+    };
+    Ok((maps, RecoveredBundleRoots { catalog, authority, roots }))
+}
+
+/// Explicit no-replay compatibility entry point.
+#[cfg(feature = "experimental-root-bundle")]
+pub async fn recover_bundled_checkpoint_without_replay<D: crate::PageDevice>(device: &D,
+    selected: &vibeos_segment_format::experimental_root_checkpoint::SelectedCheckpoint,
+    memory_limit: usize, resident_bytes: usize, max_entries: usize)
+    -> Result<(RecoveredAllocationPair, RecoveredBundleRoots), crate::StoreError<D::Error>>
+{
+    if selected.value().base.replay_count != 0 { return Err(crate::StoreError::Corrupt); }
+    recover_bundled_checkpoint(device, selected, memory_limit, resident_bytes, max_entries).await
+}
+
+/// Recover bundled catalog/authority and CAS replay after validating both
+/// allocation generations. Reuse the allocation container when shared, or
+/// release it before reading the catalog/authority container for a mixed layout.
+#[cfg(feature = "experimental-root-bundle")]
+pub async fn recover_bundled_checkpoint<D: crate::PageDevice>(device: &D,
+    selected: &vibeos_segment_format::experimental_root_checkpoint::SelectedCheckpoint,
+    memory_limit: usize, resident_bytes: usize, max_entries: usize)
+    -> Result<(RecoveredAllocationPair, RecoveredBundleRoots), crate::StoreError<D::Error>>
+{
+    use crate::StoreError;
+    let checkpoint = selected.value();
+    if checkpoint.root_bundle_mask & 3 != 3
+        || checkpoint.base.catalog_root != checkpoint.base.authority_root {
+        return Err(StoreError::Corrupt);
+    }
+    let (allocations, bundle) = recover_allocation_pair(device, selected, memory_limit, resident_bytes, true).await?;
+    let previous_bytes = allocations.previous.as_ref().map_or(Some(0), |map| map.map().allocated_bytes())
+        .ok_or(StoreError::MemoryLimit)?;
+    let resident = resident_bytes.checked_add(previous_bytes).ok_or(StoreError::MemoryLimit)?;
+    let bundle = match bundle {
+        Some(bundle) if bundle.source_pointer == checkpoint.base.catalog_root => bundle,
+        other => {
+            drop(other);
+            let current_bytes = allocations.current.map().allocated_bytes().ok_or(StoreError::MemoryLimit)?;
+            let live = resident.checked_add(current_bytes).ok_or(StoreError::MemoryLimit)?;
+            let budget = memory_limit.checked_sub(live).ok_or(StoreError::MemoryLimit)?;
+            let (refs, context) = RootReferences::from_checkpoint(selected.current(), budget).map_err(|_| StoreError::Corrupt)?;
+            refs.read_bundle(device, Role::Catalog, context).await?
+        }
+    };
+    let roots = bundle.recover_roots(device,
+        &allocations.current, memory_limit, resident, max_entries).await?;
+    Ok((allocations, roots))
+}
+
+/// Recover two allocation roots sequentially, releasing each encoded buffer
+/// before reading the next and charging the retained old map against the budget.
+/// This entry point covers unchanged admission with bundled or separate roots;
+/// empty bootstrap checkpoints are supported, while growth requires its own path.
+#[cfg(feature = "experimental-root-bundle")]
+pub async fn recover_same_admission_allocations<D: crate::PageDevice>(device: &D,
+    selected: &vibeos_segment_format::experimental_root_checkpoint::SelectedCheckpoint,
+    memory_limit: usize, resident_bytes: usize) -> Result<RecoveredAllocationPair, crate::StoreError<D::Error>>
+{
+    Ok(recover_allocation_pair(device, selected, memory_limit, resident_bytes, false).await?.0)
+}
+
+#[cfg(feature = "experimental-root-bundle")]
+async fn recover_allocation_pair<D: crate::PageDevice>(device: &D,
+    selected: &vibeos_segment_format::experimental_root_checkpoint::SelectedCheckpoint,
+    memory_limit: usize, resident_bytes: usize, retain_current: bool)
+    -> Result<(RecoveredAllocationPair, Option<OwnedRootBundle>), crate::StoreError<D::Error>>
+{
+    use crate::StoreError;
+    let mut retained = None;
+    let mut previous: Option<RecoveredAllocation> = None;
+    for (checkpoint, is_current) in selected.previous().map(|cp| (cp, false)).into_iter()
+        .chain(core::iter::once((selected.current(), true))) {
+        let old_bytes = previous.as_ref().map_or(Some(0), |old| old.map().allocated_bytes())
+            .ok_or(StoreError::MemoryLimit)?;
+        let resident = resident_bytes.checked_add(old_bytes).ok_or(StoreError::MemoryLimit)?;
+        let budget = memory_limit.checked_sub(resident).ok_or(StoreError::MemoryLimit)?;
+        let (refs, context) = RootReferences::from_checkpoint(checkpoint, budget).map_err(|_| StoreError::Corrupt)?;
+        let recovered = match refs.0[2] {
+            RootReference::Separate(PhysicalPointer::Null) => {
+                let value = checkpoint.value();
+                let base = &value.base;
+                if base.binding.generation != 1 || base.next_segment_generation != 1
+                    || [base.catalog_root, base.authority_root, base.replay_tail]
+                        .iter().any(|p| *p != PhysicalPointer::Null)
+                    || base.admitted_segments > crate::allocation_v2::MAX_ALLOCATION_V2_SEGMENTS as u64 {
+                    return Err(StoreError::Corrupt);
+                }
+                let bitmap_bytes = usize::try_from(base.admitted_segments.div_ceil(4))
+                    .map_err(|_| StoreError::MemoryLimit)?;
+                crate::store::recovery_preflight_decode(memory_limit, resident, 0, bitmap_bytes)?;
+                let allocation = crate::AllocationV2::from_v1_prefix(crate::AllocationState {
+                    checkpoint_generation: 1, admitted_segments: base.admitted_segments,
+                    allocated_prefix_segments: 0, next_segment_generation: 1,
+                    cleaner_reserve_segments: base.cleaner_reserve_segments,
+                }).map_err(|_| StoreError::Corrupt)?;
+                let actual = crate::store::allocation_resident_bytes(&allocation)
+                    .map_err(|_| StoreError::MemoryLimit)?;
+                crate::store::recovery_preflight_decode(memory_limit, resident, 0, actual)?;
+                RecoveredAllocation { allocation, checkpoint: *value, version: 1 }
+            }
+            RootReference::Bundle(_) => {
+                let bundle = refs.read_bundle(device, Role::Allocation, context).await?;
+                let recovered = bundle.recover_allocation(checkpoint, memory_limit, resident)?;
+                if is_current && retain_current { retained = Some(bundle); }
+                recovered
+            }
+            RootReference::Separate(pointer) => {
+                let PhysicalPointer::Value(value) = pointer else { return Err(StoreError::Corrupt); };
+                if value.exact_byte_len > budget as u64 { return Err(StoreError::MemoryLimit); }
+                let payload = crate::store::read_pointer_payload_with_read_capacity(device, context.store,
+                    context.admitted_segments, context.next_segment_generation, context.checkpoint_generation,
+                    pointer, ExtentKind::Allocation, budget, None, budget).await?;
+                if payload.extent.binding.target_checkpoint_generation != context.checkpoint_generation {
+                    return Err(StoreError::Corrupt);
+                }
+                recover_allocation_bytes(&payload.bytes, payload.bytes.capacity(), checkpoint.value(),
+                    memory_limit, resident)?
+            }
+        };
+        if is_current {
+            if let Some(old) = &previous { old.validate_same_admission_successor(&recovered)?; }
+            return Ok((RecoveredAllocationPair { previous, current: recovered }, retained));
+        }
+        previous = Some(recovered);
+    }
+    Err(StoreError::Corrupt)
+}
+
+#[cfg(feature = "experimental-root-bundle")]
+impl RecoveredAllocation {
+    pub fn map(&self) -> &crate::AllocationV2 { &self.allocation }
+
+    /// Validate an ordinary publication, relocation or reuse barrier with an
+    /// unchanged admitted range. Growth requires its separate carrier/chain
+    /// validation and must not be admitted through this entry point.
+    pub fn validate_same_admission_successor<E>(&self, newer: &Self) -> Result<(), crate::StoreError<E>> {
+        let old = &self.checkpoint.base;
+        let new = &newer.checkpoint.base;
+        if old.binding.generation.checked_add(1) != Some(new.binding.generation)
+            || new.previous_generation != old.binding.generation
+            || old.binding.store_uuid != new.binding.store_uuid
+            || old.cleaner_reserve_segments != new.cleaner_reserve_segments
+            || old.max_replay_records != new.max_replay_records
+            || old.admitted_segments != new.admitted_segments
+            || old.admitted_range_pages != new.admitted_range_pages {
+            return Err(crate::StoreError::Corrupt);
+        }
+        crate::store::validate_allocation_checkpoint_transition(&self.allocation, &newer.allocation,
+            old.binding.generation, new.binding.generation, old.next_segment_generation,
+            new.next_segment_generation, newer.version)
+    }
+}
+
+
+#[cfg(feature = "experimental-root-bundle")]
+fn recover_allocation_bytes<E>(bytes: &[u8], encoded_capacity: usize,
+    checkpoint: &vibeos_segment_format::experimental_root_checkpoint::BundleCheckpoint,
+    memory_limit: usize, resident_bytes: usize) -> Result<RecoveredAllocation, crate::StoreError<E>>
+{
+    use crate::{AllocationV2, StoreError};
+    let base = &checkpoint.base;
+    let version = bytes.get(8..10).map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .ok_or(StoreError::Corrupt)?;
+    let bound = crate::store::allocation_decode_capacity_upper_bound(bytes, version, base.admitted_segments)?;
+    crate::store::recovery_preflight_decode(memory_limit, resident_bytes, encoded_capacity, bound)?;
+    let allocation = match version {
+        1 => {
+            let legacy = crate::decode_allocation(bytes).map_err(|_| StoreError::Corrupt)?;
+            let PhysicalPointer::Value(pointer) = base.allocation_root else { return Err(StoreError::Corrupt); };
+            if legacy.allocated_prefix_segments == 0
+                || pointer.segment_no.checked_add(1) != Some(legacy.allocated_prefix_segments) {
+                return Err(StoreError::Corrupt);
+            }
+            AllocationV2::from_v1_prefix(legacy).map_err(|_| StoreError::Corrupt)?
+        }
+        2 => crate::decode_allocation_v2(bytes).map_err(|_| StoreError::Corrupt)?,
+        _ => return Err(StoreError::Corrupt),
+    };
+    if allocation.checkpoint_generation != base.binding.generation
+        || allocation.admitted_segments != base.admitted_segments
+        || allocation.next_segment_generation != base.next_segment_generation
+        || allocation.cleaner_reserve_segments != base.cleaner_reserve_segments {
+        return Err(StoreError::Corrupt);
+    }
+    for pointer in [base.catalog_root, base.authority_root, base.allocation_root, base.replay_tail] {
+        crate::store::require_allocated_pointer(&allocation, pointer)?;
+    }
+    let actual = crate::store::allocation_resident_bytes(&allocation).map_err(|_| StoreError::MemoryLimit)?;
+    crate::store::recovery_preflight_decode(memory_limit, resident_bytes, encoded_capacity, actual)?;
+    Ok(RecoveredAllocation { allocation, checkpoint: *checkpoint, version })
+}
+
+#[cfg(feature = "experimental-root-bundle")]
+async fn validate_catalog_references<D: crate::PageDevice>(device: &D, allocation: &RecoveredAllocation,
+    snapshot: &crate::CasSnapshot, memory_limit: usize, resident_bytes: usize)
+    -> Result<(), crate::StoreError<D::Error>>
+{
+    use crate::StoreError;
+    let base = &allocation.checkpoint.base;
+        let table_bytes = snapshot.objects.capacity().checked_mul(core::mem::size_of::<crate::ObjectMapping>())
+            .and_then(|n| snapshot.blobs.capacity().checked_mul(core::mem::size_of::<crate::BlobMapping>())
+                .and_then(|m| n.checked_add(m))).ok_or(StoreError::MemoryLimit)?;
+        let resident = resident_bytes.checked_add(table_bytes)
+            .and_then(|n| allocation.map().allocated_bytes().and_then(|m| n.checked_add(m)))
+            .ok_or(StoreError::MemoryLimit)?;
+        let budget = memory_limit.checked_sub(resident).ok_or(StoreError::MemoryLimit)?;
+        let context = crate::CasCodecContext::new(base.binding.store_uuid,
+            base.admitted_segments, base.next_segment_generation).map_err(|_| StoreError::Corrupt)?;
+        for blob in &snapshot.blobs {
+            let PhysicalPointer::Value(pointer) = blob.manifest else { return Err(StoreError::Corrupt); };
+            if pointer.exact_byte_len > budget as u64 { return Err(StoreError::MemoryLimit); }
+            let payload = crate::store::read_pointer_payload_with_read_capacity(device, base.binding.store_uuid,
+                base.admitted_segments, base.next_segment_generation, base.binding.generation,
+                blob.manifest, ExtentKind::Catalog, budget, None, budget).await?;
+            let upper = crate::store::blob_manifest_decode_capacity_upper_bound(&payload.bytes)?;
+            crate::store::recovery_preflight_decode(memory_limit, resident, payload.bytes.capacity(), upper)?;
+            let manifest = crate::decode_blob_manifest(&payload.bytes, context).map_err(|_| StoreError::Corrupt)?;
+            if manifest.blob_key != blob.blob_key { return Err(StoreError::Corrupt); }
+            for extent in &manifest.extents {
+                crate::store::require_allocated_pointer(allocation.map(), extent.pointer)?;
+            }
+            let actual = manifest.extents.capacity().checked_mul(core::mem::size_of::<crate::ManifestExtent>())
+                .ok_or(StoreError::MemoryLimit)?;
+            crate::store::recovery_preflight_decode(memory_limit, resident, payload.bytes.capacity(), actual)?;
+            drop(payload);
+            crate::store::validate_cas_blob_descriptors(device, base.binding.store_uuid,
+                base.admitted_segments, base.next_segment_generation, base.binding.generation,
+                &manifest, None).await?;
+        }
+    Ok(())
+}
+
+#[cfg(feature = "experimental-root-bundle")]
+async fn replay_catalog<D: crate::PageDevice>(device: &D, allocation: &RecoveredAllocation,
+    mut snapshot: crate::CasSnapshot, memory_limit: usize, resident_bytes: usize, max_entries: usize)
+    -> Result<crate::CasSnapshot, crate::StoreError<D::Error>>
+{
+    use crate::StoreError;
+    if allocation.checkpoint.base.replay_count == 0 { return Ok(snapshot); }
+        let base = &allocation.checkpoint.base;
+        let context = crate::CasCodecContext::new(base.binding.store_uuid, base.admitted_segments,
+            base.next_segment_generation).map_err(|_| StoreError::Corrupt)?;
+        let count = base.replay_count as usize;
+        let object_limit = snapshot.objects.len().checked_add(count).ok_or(StoreError::MemoryLimit)?;
+        if object_limit > max_entries { return Err(StoreError::Corrupt); }
+        let old_tables = snapshot.objects.capacity().checked_mul(core::mem::size_of::<crate::ObjectMapping>())
+            .and_then(|n| snapshot.blobs.capacity().checked_mul(core::mem::size_of::<crate::BlobMapping>())
+                .and_then(|m| n.checked_add(m))).ok_or(StoreError::MemoryLimit)?;
+        let resident = resident_bytes.checked_add(old_tables)
+            .and_then(|n| allocation.map().allocated_bytes().and_then(|m| n.checked_add(m)))
+            .ok_or(StoreError::MemoryLimit)?;
+        let chain_bound = count.checked_mul(core::mem::size_of::<crate::CasDelta>()).ok_or(StoreError::MemoryLimit)?;
+        crate::store::recovery_preflight_decode(memory_limit, resident, 0, chain_bound)?;
+        let mut chain = Vec::<crate::CasDelta>::new();
+        chain.try_reserve_exact(count).map_err(|_| StoreError::MemoryLimit)?;
+        let chain_bytes = chain.capacity().checked_mul(core::mem::size_of::<crate::CasDelta>()).ok_or(StoreError::MemoryLimit)?;
+        let live = resident.checked_add(chain_bytes).ok_or(StoreError::MemoryLimit)?;
+        let budget = memory_limit.checked_sub(live).ok_or(StoreError::MemoryLimit)?;
+        let mut pointer = base.replay_tail;
+        for depth in (1..=base.replay_count).rev() {
+            crate::store::require_allocated_pointer(allocation.map(), pointer)?;
+            let PhysicalPointer::Value(value) = pointer else { return Err(StoreError::Corrupt); };
+            if value.exact_byte_len > budget as u64 { return Err(StoreError::MemoryLimit); }
+            let payload = crate::store::read_pointer_payload_with_read_capacity(device, base.binding.store_uuid,
+                base.admitted_segments, base.next_segment_generation, base.binding.generation,
+                pointer, ExtentKind::CatalogDelta, budget, None, budget).await?;
+            let delta = crate::decode_cas_delta(&payload.bytes, context).map_err(|_| StoreError::Corrupt)?;
+            if delta.chain_count != depth || delta.checkpoint_generation > base.binding.generation
+                || delta.checkpoint_generation != payload.extent.binding.target_checkpoint_generation {
+                return Err(StoreError::Corrupt);
+            }
+            pointer = delta.previous_delta;
+            chain.push(delta);
+        }
+        if pointer != PhysicalPointer::Null { return Err(StoreError::Corrupt); }
+        let additions = chain.iter().filter(|delta| delta.new_blob.is_some()).count();
+        let blob_limit = snapshot.blobs.len().checked_add(additions).ok_or(StoreError::MemoryLimit)?;
+        if blob_limit > max_entries { return Err(StoreError::Corrupt); }
+        // Charge complete successor tables while old allocations are still
+        // live, covering allocator overlap during each reserve.
+        let growth = object_limit.checked_mul(core::mem::size_of::<crate::ObjectMapping>())
+            .and_then(|n| blob_limit.checked_mul(core::mem::size_of::<crate::BlobMapping>())
+                .and_then(|m| n.checked_add(m))).ok_or(StoreError::MemoryLimit)?;
+        crate::store::recovery_preflight_decode(memory_limit, live, 0, growth)?;
+        snapshot.objects.try_reserve_exact(count).map_err(|_| StoreError::MemoryLimit)?;
+        snapshot.blobs.try_reserve_exact(additions).map_err(|_| StoreError::MemoryLimit)?;
+        let actual_tables = snapshot.objects.capacity().checked_mul(core::mem::size_of::<crate::ObjectMapping>())
+            .and_then(|n| snapshot.blobs.capacity().checked_mul(core::mem::size_of::<crate::BlobMapping>())
+                .and_then(|m| n.checked_add(m))).ok_or(StoreError::MemoryLimit)?;
+        let actual_live = resident_bytes.checked_add(chain_bytes)
+            .and_then(|n| allocation.map().allocated_bytes().and_then(|m| n.checked_add(m)))
+            .ok_or(StoreError::MemoryLimit)?;
+        crate::store::recovery_preflight_decode(memory_limit, actual_live, 0, actual_tables)?;
+        let mut generation = snapshot.checkpoint_generation;
+        let mut object_id = snapshot.objects.last().map_or(0, |object| object.object_id);
+        for delta in chain.iter().rev() {
+            if delta.checkpoint_generation < generation || delta.object.object_id <= object_id {
+                return Err(StoreError::Corrupt);
+            }
+            generation = delta.checkpoint_generation;
+            object_id = delta.object.object_id;
+            match (delta.new_blob, snapshot.blobs.binary_search_by_key(&delta.object.blob_key, |blob| blob.blob_key)) {
+                (None, Ok(_)) => {},
+                (Some(blob), Err(index)) if blob.blob_key == delta.object.blob_key => snapshot.blobs.insert(index, blob),
+                _ => return Err(StoreError::Corrupt),
+            }
+            snapshot.objects.push(delta.object);
+        }
+        drop(chain);
+        snapshot.checkpoint_generation = base.binding.generation;
+        for blob in &snapshot.blobs { crate::store::require_allocated_pointer(allocation.map(), blob.manifest)?; }
+    Ok(snapshot)
+}
+
+/// Decoded roots whose catalog references and CAS replay have been checked.
+/// This is recovery data, not an installed mount or authority grant.
+#[cfg(feature = "experimental-root-bundle")]
+pub struct RecoveredBundleRoots {
+    pub catalog: crate::CasSnapshot,
+    pub authority: crate::PersistentAuthoritySnapshot,
+    pub roots: crate::PersistentRootSet,
+}
+
+#[cfg(feature = "experimental-root-bundle")]
+fn decode_catalog_bytes<E>(bytes: &[u8], encoded_capacity: usize, target_generation: u64,
+    allocation: &RecoveredAllocation, memory_limit: usize, resident_bytes: usize, max_entries: usize)
+    -> Result<crate::CasSnapshot, crate::StoreError<E>>
+{
+    use crate::StoreError;
+    let base = &allocation.checkpoint.base;
+    if target_generation > base.binding.generation { return Err(StoreError::Corrupt); }
+        let map_bytes = crate::store::allocation_resident_bytes(allocation.map())
+            .map_err(|_| StoreError::MemoryLimit)?;
+        let resident = resident_bytes.checked_add(map_bytes).ok_or(StoreError::MemoryLimit)?;
+        let upper = crate::store::cas_snapshot_decode_capacity_upper_bound(bytes)?;
+        // The size preflight above establishes the fixed header bounds. Reject
+        // oversized tables before the codec allocates their decoded storage.
+        let objects = u32::from_le_bytes(bytes[0x18..0x1c].try_into().map_err(|_| StoreError::Corrupt)?) as usize;
+        let blobs = u32::from_le_bytes(bytes[0x1c..0x20].try_into().map_err(|_| StoreError::Corrupt)?) as usize;
+        if objects > max_entries || blobs > max_entries { return Err(StoreError::Corrupt); }
+        crate::store::recovery_preflight_decode(memory_limit, resident, encoded_capacity, upper)?;
+        let context = crate::CasCodecContext::new(base.binding.store_uuid,
+            base.admitted_segments, base.next_segment_generation).map_err(|_| StoreError::Corrupt)?;
+        let decoded = crate::decode_cas_snapshot(bytes, context).map_err(|_| StoreError::Corrupt)?;
+        if decoded.checkpoint_generation != target_generation
+            || decoded.objects.len() > max_entries || decoded.blobs.len() > max_entries {
+            return Err(StoreError::Corrupt);
+        }
+        for blob in &decoded.blobs {
+            crate::store::require_allocated_pointer(allocation.map(), blob.manifest)?;
+        }
+        let actual = decoded.objects.capacity().checked_mul(core::mem::size_of::<crate::ObjectMapping>())
+            .and_then(|n| decoded.blobs.capacity().checked_mul(core::mem::size_of::<crate::BlobMapping>())
+                .and_then(|m| n.checked_add(m))).ok_or(StoreError::MemoryLimit)?;
+        crate::store::recovery_preflight_decode(memory_limit, resident, encoded_capacity, actual)?;
+        Ok(decoded)
+}
+
+/// Recover a separate CAS catalog root with the same replay/reference checks
+/// as a bundled member. Full authority recovery remains a separate step.
+#[cfg(feature = "experimental-root-bundle")]
+pub async fn recover_separate_catalog<D: crate::PageDevice>(device: &D,
+    allocation: &RecoveredAllocation, memory_limit: usize, resident_bytes: usize, max_entries: usize)
+    -> Result<crate::CasSnapshot, crate::StoreError<D::Error>>
+{
+    use crate::StoreError;
+    let base = &allocation.checkpoint.base;
+    if allocation.checkpoint.root_bundle_mask & 1 != 0 { return Err(StoreError::Corrupt); }
+    let PhysicalPointer::Value(pointer) = base.catalog_root else { return Err(StoreError::Corrupt); };
+    let resident = resident_bytes.checked_add(allocation.map().allocated_bytes().ok_or(StoreError::MemoryLimit)?)
+        .ok_or(StoreError::MemoryLimit)?;
+    let budget = memory_limit.checked_sub(resident).ok_or(StoreError::MemoryLimit)?;
+    if pointer.exact_byte_len > budget as u64 { return Err(StoreError::MemoryLimit); }
+    let payload = crate::store::read_pointer_payload_with_read_capacity(device, base.binding.store_uuid,
+        base.admitted_segments, base.next_segment_generation, base.binding.generation,
+        base.catalog_root, ExtentKind::Catalog, budget, None, budget).await?;
+    let snapshot = decode_catalog_bytes(&payload.bytes, payload.bytes.capacity(),
+        payload.extent.binding.target_checkpoint_generation, allocation, memory_limit, resident_bytes, max_entries)?;
+    drop(payload);
+    let snapshot = replay_catalog(device, allocation, snapshot, memory_limit, resident_bytes, max_entries).await?;
+    validate_catalog_references(device, allocation, &snapshot, memory_limit, resident_bytes).await?;
+    Ok(snapshot)
+}
+
+#[cfg(feature = "experimental-root-bundle")]
+fn decode_authority_bytes<E>(bytes: &[u8], encoded_capacity: usize, target_generation: u64,
+    allocation: &RecoveredAllocation, catalog: &crate::CasSnapshot, memory_limit: usize, resident_bytes: usize)
+    -> Result<(crate::PersistentAuthoritySnapshot, crate::PersistentRootSet), crate::StoreError<E>>
+{
+    use crate::StoreError;
+    if target_generation > allocation.checkpoint.base.binding.generation { return Err(StoreError::Corrupt); }
+        let tables = catalog.objects.capacity().checked_mul(core::mem::size_of::<crate::ObjectMapping>())
+            .and_then(|n| catalog.blobs.capacity().checked_mul(core::mem::size_of::<crate::BlobMapping>())
+                .and_then(|m| n.checked_add(m))).ok_or(StoreError::MemoryLimit)?;
+        let resident = resident_bytes.checked_add(tables)
+            .and_then(|n| allocation.map().allocated_bytes().and_then(|m| n.checked_add(m)))
+            .ok_or(StoreError::MemoryLimit)?;
+        let upper = crate::store::persistent_authority_recovery_capacity_upper_bound(bytes)?;
+        crate::store::recovery_preflight_decode(memory_limit, resident, encoded_capacity, upper)?;
+        let live = resident.checked_add(encoded_capacity).ok_or(StoreError::MemoryLimit)?;
+        let budget = memory_limit.checked_sub(live).ok_or(StoreError::MemoryLimit)?;
+        let (authority, peak) = crate::authority_snapshot::decode_persistent_authority_snapshot_bounded(bytes, budget)
+            .map_err(|error| match error {
+                crate::AuthoritySnapshotError::MemoryLimit => StoreError::MemoryLimit,
+                _ => StoreError::Corrupt,
+            })?;
+        crate::store::recovery_preflight_decode(memory_limit, live, 0, peak)?;
+        if authority.checkpoint_generation() != target_generation {
+            return Err(StoreError::Corrupt);
+        }
+        let roots = crate::store::authority_roots_from_snapshot(&authority)?;
+        for root in roots.entries() {
+            let index = catalog.objects.binary_search_by_key(&root.object_id, |object| object.object_id)
+                .map_err(|_| StoreError::Corrupt)?;
+            let object = &catalog.objects[index];
+            if object.commit_generation != root.commit_generation || object.blob_key.object_kind() != root.object_kind {
+                return Err(StoreError::Corrupt);
+            }
+        }
+        let actual = authority.allocated_bytes().and_then(|n| roots.allocated_bytes().and_then(|m| n.checked_add(m)))
+            .ok_or(StoreError::MemoryLimit)?;
+        crate::store::recovery_preflight_decode(memory_limit, live, 0, actual)?;
+        Ok((authority, roots))
+}
+
+/// Recover an explicitly separate full authority snapshot. Legacy root sets
+/// and authority deltas require their respective decoders.
+#[cfg(feature = "experimental-root-bundle")]
+pub async fn recover_separate_authority<D: crate::PageDevice>(device: &D,
+    allocation: &RecoveredAllocation, catalog: &crate::CasSnapshot, memory_limit: usize, resident_bytes: usize)
+    -> Result<(crate::PersistentAuthoritySnapshot, crate::PersistentRootSet), crate::StoreError<D::Error>>
+{
+    use crate::StoreError;
+    let base = &allocation.checkpoint.base;
+    if allocation.checkpoint.root_bundle_mask & 2 != 0 { return Err(StoreError::Corrupt); }
+    let PhysicalPointer::Value(pointer) = base.authority_root else { return Err(StoreError::Corrupt); };
+    let tables = catalog.objects.capacity().checked_mul(core::mem::size_of::<crate::ObjectMapping>())
+        .and_then(|n| catalog.blobs.capacity().checked_mul(core::mem::size_of::<crate::BlobMapping>())
+            .and_then(|m| n.checked_add(m))).ok_or(StoreError::MemoryLimit)?;
+    let resident = resident_bytes.checked_add(tables)
+        .and_then(|n| allocation.map().allocated_bytes().and_then(|m| n.checked_add(m)))
+        .ok_or(StoreError::MemoryLimit)?;
+    let budget = memory_limit.checked_sub(resident).ok_or(StoreError::MemoryLimit)?;
+    if pointer.exact_byte_len > budget as u64 { return Err(StoreError::MemoryLimit); }
+    let payload = crate::store::read_pointer_payload_with_read_capacity(device, base.binding.store_uuid,
+        base.admitted_segments, base.next_segment_generation, base.binding.generation,
+        base.authority_root, ExtentKind::Authority, budget, None, budget).await?;
+    decode_authority_bytes(&payload.bytes, payload.bytes.capacity(), payload.extent.binding.target_checkpoint_generation,
+        allocation, catalog, memory_limit, resident_bytes)
 }
 
 impl OwnedRootBundle {
+    /// Recover a selected allocation member while charging both this retained
+    /// container and the decoded map. This does not validate a transition from
+    /// the older checkpoint or recover catalog/authority semantics.
+    #[cfg(feature = "experimental-root-bundle")]
+    pub fn recover_allocation<E>(&self,
+        checkpoint: &vibeos_segment_format::experimental_root_checkpoint::RecoveryCheckpoint,
+        memory_limit: usize, resident_bytes: usize) -> Result<RecoveredAllocation, crate::StoreError<E>>
+    {
+        use crate::StoreError;
+        let checkpoint = checkpoint.value();
+        let base = &checkpoint.base;
+        if checkpoint.root_bundle_mask & 4 == 0 || base.allocation_root != self.source_pointer
+            || self.target_checkpoint_generation != base.binding.generation {
+            return Err(StoreError::Corrupt);
+        }
+        let bytes = self.get(Role::Allocation).map_err(|_| StoreError::Corrupt)?;
+        recover_allocation_bytes(bytes, self.bytes.capacity(), checkpoint, memory_limit, resident_bytes)
+    }
+
+    /// Decode a full authority snapshot and resolve its roots against the
+    /// caller's recovered catalog. Authority deltas require their separate path.
+    #[cfg(feature = "experimental-root-bundle")]
+    pub fn decode_authority_snapshot<E>(&self, allocation: &RecoveredAllocation,
+        catalog: &crate::CasSnapshot, memory_limit: usize, resident_bytes: usize)
+        -> Result<(crate::PersistentAuthoritySnapshot, crate::PersistentRootSet), crate::StoreError<E>>
+    {
+        use crate::StoreError;
+        let base = &allocation.checkpoint.base;
+        if allocation.checkpoint.root_bundle_mask & 2 == 0 || base.authority_root != self.source_pointer
+            || self.target_checkpoint_generation > base.binding.generation {
+            return Err(StoreError::Corrupt);
+        }
+        let bytes = self.get(Role::Authority).map_err(|_| StoreError::Corrupt)?;
+        decode_authority_bytes(bytes, self.bytes.capacity(), self.target_checkpoint_generation,
+            allocation, catalog, memory_limit, resident_bytes)
+    }
+
+    /// Recover bundled catalog, CAS replay and full authority together. Keep
+    /// the container only through replay/authority decode, then release it
+    /// before manifest reads. Authority deltas are not handled here.
+    #[cfg(feature = "experimental-root-bundle")]
+    pub async fn recover_roots<D: crate::PageDevice>(self, device: &D,
+        allocation: &RecoveredAllocation, memory_limit: usize, resident_bytes: usize,
+        max_entries: usize) -> Result<RecoveredBundleRoots, crate::StoreError<D::Error>>
+    {
+        use crate::StoreError;
+        let catalog = self.decode_catalog_snapshot(allocation, memory_limit, resident_bytes, max_entries)?;
+        let replay_resident = resident_bytes.checked_add(self.bytes.capacity()).ok_or(StoreError::MemoryLimit)?;
+        let catalog = replay_catalog(device, allocation, catalog, memory_limit, replay_resident, max_entries).await?;
+        let (authority, roots) = self.decode_authority_snapshot(allocation, &catalog, memory_limit, resident_bytes)?;
+        drop(self);
+        let resident = authority.allocated_bytes()
+            .and_then(|n| roots.allocated_bytes().and_then(|m| n.checked_add(m)))
+            .and_then(|n| resident_bytes.checked_add(n)).ok_or(StoreError::MemoryLimit)?;
+        validate_catalog_references(device, allocation, &catalog, memory_limit, resident).await?;
+        Ok(RecoveredBundleRoots { catalog, authority, roots })
+    }
+
+    /// Decode catalog and full authority from this container once, then release
+    /// it before reading manifests while charging all retained decoded roots.
+    #[cfg(feature = "experimental-root-bundle")]
+    pub async fn recover_roots_without_replay<D: crate::PageDevice>(self, device: &D,
+        allocation: &RecoveredAllocation, memory_limit: usize, resident_bytes: usize,
+        max_entries: usize) -> Result<RecoveredBundleRoots, crate::StoreError<D::Error>>
+    {
+        use crate::StoreError;
+        let base = &allocation.checkpoint.base;
+        if base.replay_count != 0 || base.replay_tail != PhysicalPointer::Null {
+            return Err(StoreError::Corrupt);
+        }
+        self.recover_roots(device, allocation, memory_limit, resident_bytes, max_entries).await
+    }
+
+    /// Consume the container, then authenticate all manifests and Blob
+    /// descriptors for a snapshot without replay. This is not a complete mount:
+    /// authority, replay and the other checkpoint remain caller responsibilities.
+    #[cfg(feature = "experimental-root-bundle")]
+    pub async fn recover_catalog_without_replay<D: crate::PageDevice>(self, device: &D,
+        allocation: &RecoveredAllocation, memory_limit: usize, resident_bytes: usize,
+        max_entries: usize) -> Result<crate::CasSnapshot, crate::StoreError<D::Error>>
+    {
+        use crate::StoreError;
+        let base = &allocation.checkpoint.base;
+        if base.replay_count != 0 || base.replay_tail != PhysicalPointer::Null {
+            return Err(StoreError::Corrupt);
+        }
+        let snapshot = self.decode_catalog_snapshot(allocation, memory_limit, resident_bytes, max_entries)?;
+        drop(self);
+        validate_catalog_references(device, allocation, &snapshot, memory_limit, resident_bytes).await?;
+        Ok(snapshot)
+    }
+
+    /// Recover a catalog snapshot plus its bounded CAS replay chain. Authority
+    /// must be resolved separately against the resulting object table.
+    #[cfg(feature = "experimental-root-bundle")]
+    pub async fn recover_catalog<D: crate::PageDevice>(self, device: &D,
+        allocation: &RecoveredAllocation, memory_limit: usize, resident_bytes: usize,
+        max_entries: usize) -> Result<crate::CasSnapshot, crate::StoreError<D::Error>>
+    {
+        let snapshot = self.decode_catalog_snapshot(allocation, memory_limit, resident_bytes, max_entries)?;
+        drop(self);
+        let snapshot = replay_catalog(device, allocation, snapshot, memory_limit, resident_bytes, max_entries).await?;
+        validate_catalog_references(device, allocation, &snapshot, memory_limit, resident_bytes).await?;
+        Ok(snapshot)
+    }
+
+    /// Decode only the bundled CAS snapshot. Replay and referenced manifests
+    /// still require validation before the result can be used as mounted state.
+    #[cfg(feature = "experimental-root-bundle")]
+    pub fn decode_catalog_snapshot<E>(&self, allocation: &RecoveredAllocation,
+        memory_limit: usize, resident_bytes: usize, max_entries: usize)
+        -> Result<crate::CasSnapshot, crate::StoreError<E>>
+    {
+        use crate::StoreError;
+        let checkpoint = &allocation.checkpoint;
+        let base = &checkpoint.base;
+        if checkpoint.root_bundle_mask & 1 == 0 || base.catalog_root != self.source_pointer
+            || self.target_checkpoint_generation > base.binding.generation {
+            return Err(StoreError::Corrupt);
+        }
+        let bytes = self.get(Role::Catalog).map_err(|_| StoreError::Corrupt)?;
+        decode_catalog_bytes(bytes, self.bytes.capacity(), self.target_checkpoint_generation,
+            allocation, memory_limit, resident_bytes, max_entries)
+    }
+
     pub fn get(&self, role: Role) -> Result<&[u8], Error> {
         let index = role as usize - 2;
         if !self.selected[index] { return Err(Error::Binding); }
@@ -154,10 +857,10 @@ impl RootReference {
 pub struct RootReferences(pub [RootReference; 3]);
 
 impl RootReferences {
-    /// Adapts a sealed experimental checkpoint after caller-controlled media
-    /// admission/selection. A valid seal alone does not establish freshness.
+    /// Adapts a structurally selected experimental checkpoint. Allocation and
+    /// payload recovery, plus actual device-capability matching, remain required.
     #[cfg(feature = "experimental-root-bundle")]
-    pub fn from_checkpoint(checkpoint: &VerifiedRecord<vibeos_segment_format::experimental_root_checkpoint::BundleCheckpoint>,
+    pub fn from_checkpoint(checkpoint: &vibeos_segment_format::experimental_root_checkpoint::RecoveryCheckpoint,
         payload_budget: usize) -> Result<(Self, ReadContext), Error>
     {
         let checkpoint = checkpoint.value();
@@ -208,7 +911,9 @@ impl RootReferences {
             start..at
         });
         let selected = self.0.map(|r| r == RootReference::Bundle(PhysicalPointer::Value(pointer)));
-        Ok(OwnedRootBundle { bytes: resolved.bytes, ranges, selected })
+        Ok(OwnedRootBundle { bytes: resolved.bytes, ranges, selected,
+            source_pointer: PhysicalPointer::Value(pointer),
+            target_checkpoint_generation: resolved.extent.binding.target_checkpoint_generation })
     }
 
     /// Caller supplies an authenticated checkpoint root set and a descriptor

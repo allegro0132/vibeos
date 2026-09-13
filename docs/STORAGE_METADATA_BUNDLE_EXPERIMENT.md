@@ -426,3 +426,469 @@ intermediate legacy checkpoint hash during experimental encoding. Five existing
 production codec tests, the reserved-field test, two experimental checkpoint
 tests and seven feature-enabled store tests pass; the latter include the sealed
 checkpoint-to-device-reader path. RISC-V bare-metal compilation remains checked.
+
+## Tagged superblock admission and structural selection
+
+The experimental codec now seals the same explicit `EBR1` format tag in
+superblock field `0xf4`. `admit` decodes both copies through the tagged codec
+before applying the existing superblock agreement rules. A legacy or corrupt
+sealed copy is an error even when its peer is valid. Empty/unsealed copies retain
+the existing behavior; this supports interrupted formatting of new disposable
+media, not an in-place upgrade from a legacy volume.
+
+Admission returns an `AdmittedFormat` with private construction. Its
+`select_checkpoints` method decodes both slots, checks their physical slot and
+superblock binding/admitted range, enforces the existing adjacent-generation and
+monotonic-allocation-field rules, then returns a privately constructed
+`SelectedCheckpoint`. The store's `from_checkpoint` adapter now requires this
+selected type instead of a merely sealed record. This distinguishes structural
+selection from individual-record integrity without claiming full store recovery.
+
+Tests cover both valid copies, either empty copy, two empty copies, old/new format
+mixes in either position, swapped copies, corruption, newest-slot selection,
+swapped checkpoint slots, a generation gap, an undersized device-page bound,
+seven incomplete seal prefixes, a corrupt sealed newer checkpoint and an untagged
+newer checkpoint. Incomplete seals retain the older checkpoint; complete corrupt
+or untagged records fail instead of silently selecting the older one. The device
+fixture now derives its reader context through tagged superblocks and structural
+checkpoint selection before reading the sealed segment.
+
+Actual device identity/range matching, allocation-map transition validation,
+root semantic recovery, publication ordering and end-to-end interrupted-format
+tests remain store integration work. No existing mount path invokes this codec.
+
+## Device-backed anchor selection
+
+`select_device_checkpoint` now reads superblock pages 0–3 and checkpoint pages
+4–7 through PageDevice, using one reusable four-page allocation. It validates
+device block/page geometry before I/O and matches the admitted superblock's
+device ID, logical range start, block size, initial capacity and replay limit
+against the actual device context. It then selects the checkpoint under the
+device's real page bound. The workspace is released when selection returns,
+before a caller reads a root bundle.
+
+The feature-enabled device fixture writes tagged anchors into its page map and
+uses this function, replacing direct in-memory codec calls. It observes exactly
+two four-page anchor requests, rejects a workspace budget one byte short before
+I/O, propagates failures on both anchor reads, and rejects device ID/range/size/
+capacity/replay mismatches. Injected read failures now overwrite the first output
+page before returning an error, checking that partial buffer fills cannot become
+selected state. Corrupt superblock/checkpoint pages fail closed; temporarily
+removing all anchors returns Unformatted, and restoring them permits selection.
+The same test then reads the sealed segment and checks all selected root bytes.
+
+This is a device-backed structural selection entry point, not SegmentStore::mount.
+It still does not recover allocation transitions, grant authority, install mounted
+state or publish a checkpoint. Its 16 KiB anchor budget excludes fixed stack and
+returned metadata structures; overall recovery memory still requires accounting.
+
+## Allocation member recovery
+
+`OwnedRootBundle::recover_allocation` now preserves and checks the source physical
+pointer and extent target checkpoint generation before decoding a selected
+allocation member. It reuses existing allocation codecs, allocation decode-size
+estimates, resident-byte accounting and allocated-pointer checks. Both legacy
+prefix and v2 bitmap encodings are handled; generation, admitted segments, next
+segment generation and cleaner reserve must match the selected checkpoint. The
+legacy prefix must end immediately after the allocation carrier. Every current
+root and replay pointer must name an Allocated segment.
+
+Preflight and post-decode checks account for caller-reported resident memory,
+the retained whole bundle capacity and decoded allocation memory together. This
+does not claim a bound for the preceding segment scanner's fixed overhead.
+
+The device fixture now uses a canonical v2 allocation map instead of placeholder
+bytes and recovers it through the complete device selection/read path. It checks
+the exact combined-memory boundary, one byte short and additional resident state.
+Separate semantic-layer cases cover a stale generation, Free/Retired carrier
+states and valid/incorrect v1 prefix endings. Those semantic cases deliberately
+alter private test buffers after the authentication stage; they are not claimed
+to be sealed on-disk corruption fixtures. Full two-checkpoint allocation
+transition validation, CAS and authority semantic recovery remain pending.
+
+## Recovered allocation transition witness
+
+Allocation recovery now returns an immutable `RecoveredAllocation` wrapper which
+retains the decoded map, its actual encoding version and the selected checkpoint
+binding. Callers can inspect the map but cannot substitute a version argument or
+mutate the stored binding. `validate_same_admission_successor` requires adjacent
+checkpoint generations, matching store/policy and an unchanged admitted range,
+then invokes the existing allocation transition validator without changing its
+rules. Ordinary allocation, relocation retirement and complete next-generation
+reclamation therefore share the production checks.
+
+Semantic transition tests accept ordinary allocation, retirement with a new
+carrier, and complete reclamation with a distinct new carrier. They reject direct
+Allocated-to-Free reuse, assigned-generation count mismatches, generation gaps,
+advancing an ordinary checkpoint while retirement is pending, partial reclamation
+and store mismatch. These are typed-map transition fixtures, not a two-checkpoint
+disk crash campaign. The device-backed pair recovery below now reads both actual
+checkpoint maps and invokes this check; installing mounted state remains pending.
+
+Growth is intentionally outside this unchanged-range entry point: its existing
+carrier, previous-segment seal chain, unchanged-root and suffix checks remain
+necessary. This is an incomplete integration gate, not removal of growth support
+from the intended runtime. CAS and authority recovery are also outstanding.
+
+## Device-backed allocation pair recovery
+
+Structural checkpoint selection now retains immutable recovery tokens for both
+the current and previous sealed candidates. The experimental pair reader decodes
+the old allocation bundle first, drops its container, then reads the current
+bundle while charging the retained old bitmap against the memory budget. It
+validates the allocation transition before returning either recovered pair.
+
+A device fixture writes two sealed segments and tagged checkpoint slots with
+canonical allocation maps. Ordinary allocation succeeds; a fully sealed successor
+that directly changes an Allocated segment to Free fails transition validation.
+The fixture also checks the exact combined-memory boundary, one byte short, and
+corruption of the previous container. This covers actual anchor selection and
+segment authentication, rather than only private decoded-map mutations.
+
+The nine root-bundle unit tests and ten format/compatibility tests pass. This is
+still an in-memory PageDevice test, not a QEMU timing or crash campaign. Catalog
+and authority members in this pair fixture are placeholders. Bootstrap, separated
+allocation roots, growth, full semantic recovery and runtime publication remain
+integration gates; no production mount or performance claim follows from this
+test.
+
+## Allocation layout fallback across checkpoints
+
+`recover_same_admission_allocations` now accepts either an explicitly bundled
+allocation root or a separate Allocation extent in each selected checkpoint.
+Both paths use the existing sealed-segment reader and share allocation decode,
+checkpoint binding, allocated-pointer and memory checks. The separate path also
+requires the extent's target checkpoint generation to match the recovery token.
+The encoded buffer is dropped before reading the next generation in either path.
+
+The device pair fixture now exercises all four old/new allocation layout
+combinations, with both valid allocation and fully sealed illegal direct reuse.
+Catalog and authority remain bundled placeholders; this does not test a complete
+all-roots-separated mount. Memory boundaries include whichever generation has
+the larger live encoded-buffer-plus-map footprint. Corruption targets the actual
+previous allocation payload, which differs between the two layouts.
+
+Bootstrap and growth remain unsupported in this pair entry point. These changes
+remove the allocation layout fallback gate only; catalog/authority recovery,
+production publication, crash validation and QEMU performance remain outstanding.
+
+## Empty bootstrap allocation recovery
+
+The pair reader now handles an allocation-root-null checkpoint only at generation
+1, with next segment generation 1 and all remaining roots null. It constructs
+the existing v1-compatible all-Free map after checking the maximum segment count
+and preflighting bitmap memory, then checks actual resident allocation capacity.
+No payload or segment reads are needed for this case.
+
+A sealed-anchor device fixture checks the empty map for all 16 segments, its
+four-byte bitmap budget, one byte short and caller-resident memory. Noninitial
+empty checkpoints and an initial checkpoint with an advanced next segment
+generation fail without payload I/O. All ten experimental root-bundle unit tests
+pass. This adds empty bootstrap recovery only: a device-backed initial-to-first-
+publication transition and runtime formatting/publication still need validation.
+Growth and complete catalog/authority semantic recovery remain outstanding.
+
+## First-publication device fixture
+
+The allocation-pair fixture now includes a generation-1 empty checkpoint followed
+by a generation-2 sealed segment, for both bundled and separate allocation roots.
+The valid successor allocates one segment and advances the next segment generation
+once. Its negative counterpart is fully sealed but marks an extra segment
+Allocated without a corresponding generation advance; transition validation must
+reject it. Memory and payload corruption checks also cover these bootstrap cases.
+
+Seven incomplete checkpoint-seal prefixes exercise selection of the initial
+checkpoint despite the already-written new segment and body. Recovery must return
+an all-Free map within the initial bitmap budget; restoring the complete seal
+must select and recover generation 2. These are explicit device-image fixtures,
+not an exhaustive write/flush failure campaign or a production writer. Catalog
+and authority payloads remain placeholders, and QEMU latency remains unmeasured
+for the experimental format.
+
+## Bundled CAS snapshot decoding
+
+`OwnedRootBundle::decode_catalog_snapshot` binds the selected Catalog member to
+the recovered allocation checkpoint, reuses the production CAS codec and decode
+capacity estimate, and checks snapshot/extent generation equality, entry limits
+and manifest carrier allocation. Its budget charges the retained container,
+current allocation map, caller-reported resident state and decoded table capacity.
+It returns a decoded snapshot only: replay, manifest contents and Blob descriptors
+must still be validated before installation as mounted state.
+
+The paired-device fixture now encodes canonical empty CAS snapshots instead of
+catalog placeholder bytes. It decodes the selected snapshot in every successful
+layout/bootstrap case, checks the exact memory boundary and rejects using the
+previous allocation checkpoint with the new container. These empty fixtures do
+not yet exercise nonempty tables, manifest references or replay; authority remains
+a placeholder. No production mount or QEMU performance claim is made.
+
+## Nonempty CAS decode limits
+
+The bundled snapshot adapter now checks object/blob counts against the configured
+entry limit after header/length preflight but before allocating decoded tables.
+The existing post-decode checks remain. A nonempty semantic fixture covers one
+object and one Blob mapping, exact encoded-plus-map-plus-table memory, one byte
+short, entry-limit rejection before memory allocation, stale snapshot generation
+and a manifest pointer into a Free segment.
+
+These additional cases deliberately construct private decoded-member buffers;
+they are not sealed bundle fixtures and their manifest contents do not exist on
+disk. They verify the adapter's semantic checks, not complete reference recovery.
+The device-backed canonical empty snapshots remain the authentication coverage.
+
+## No-replay manifest and descriptor recovery
+
+`OwnedRootBundle::recover_catalog_without_replay` consumes the container and
+releases it after snapshot decoding, before reading each manifest. It invokes
+the existing physical payload reader, manifest codec and Blob descriptor
+validator, checks BlobKey equality and allocated extent carriers, and preflights
+and checks decoded manifest capacity against retained maps/tables and caller
+memory. Encoded manifest storage is released before descriptor validation.
+
+This entry point explicitly rejects replay checkpoints. It returns a catalog,
+not mounted authority or complete store state. Existing empty sealed-device
+fixtures now call the entry point. The nonempty semantic fixture additionally
+checks that its unresolved manifest reference causes device reads and rejection;
+it is not a successful nonempty end-to-end reference fixture. Successful actual
+manifest/Blob data fixtures, replay integration and QEMU timing remain necessary.
+Scanner fixed buffers are still outside the dynamic-memory accounting claim.
+
+## Sealed nonempty catalog reference fixture
+
+A new PageDevice fixture encodes a four-byte canonical Blob, a separate compact
+manifest and a nonempty CAS snapshot inside the root bundle. It writes actual
+extent records and seals, finalizes the containing segment and selects tagged
+checkpoint anchors before recovering allocation and catalog. The returned object
+and Blob mappings must equal the encoded snapshot. Corrupting the manifest
+payload or the Blob descriptor seal must reject reference recovery.
+
+This is successful no-replay metadata/descriptor recovery with real physical
+references, not full Blob payload verification, authority recovery or production
+mount. The fixture still uses authority placeholder bytes. QEMU performance and
+publication crash validation remain outstanding.
+
+## Full authority snapshot adapter
+
+The bundled authority member now has a decode adapter using the existing bounded
+persistent-authority decoder and root extraction. It binds the member to the
+allocation checkpoint, checks its extent generation, and resolves extracted roots
+against the caller's catalog by object ID, commit generation and object kind.
+Memory accounting includes retained container, allocation, catalog tables, caller
+state, decoder peak, authority storage and extracted roots. The caller must pass
+a recovered catalog; this API does not authenticate an arbitrary supplied table.
+
+The checkpoint-pair device fixture replaces its authority placeholder with a
+canonical Format record stream and empty authority bindings, then decodes it
+across successful layout and bootstrap cases. Nonempty authority bindings,
+legacy root sets, authority deltas and end-to-end mount remain integration work.
+The separate nonempty Blob fixture still has placeholder authority bytes.
+
+## Sealed external authority root fixture
+
+The nonempty catalog fixture now replaces its authority placeholder with a
+canonical Format record stream and a persisted external root naming the catalog
+object. Device-backed bundle recovery decodes that authority and resolves the
+root successfully. Separate caller-table mutations check missing objects,
+mismatched commit generation and object kind. These mutations are semantic tests,
+not separately sealed malformed authority images.
+
+A bounded search finds the adapter's smallest accepted memory budget for this
+fixture, then checks that one byte less or one extra resident byte fails with
+MemoryLimit. The updated targeted fixture passes. This budget checks the adapter's
+accounting contract, not whole-process resident memory. Full managed-principal
+bindings, replay/deltas, runtime mount and QEMU performance remain outstanding.
+
+## Combined no-replay root recovery
+
+`recover_roots_without_replay` consumes a single authenticated container, decodes
+its CAS snapshot once and resolves full authority against that same table. It
+then releases the container and invokes shared manifest/descriptor validation,
+charging retained authority and extracted roots in addition to allocation and
+catalog memory. The existing catalog-only entry point uses the same reference
+validator. The result is recovery data, not installed mount state or an authority
+grant; both members must be in the selected container and replay is rejected.
+
+The sealed nonempty external-root fixture invokes the combined path and asserts
+that its root-container payload is requested only once. This covers reuse within
+catalog/authority recovery, not the earlier allocation-pair reader, which still
+reads allocation independently. It establishes an I/O property of the fixture,
+not a measured QEMU latency improvement.
+
+## Reuse current allocation container for all-root recovery
+
+`recover_bundled_checkpoint_without_replay` now retains the current container
+from allocation-pair recovery and hands it to combined catalog/authority
+recovery. Older containers are dropped as before. Both allocation generations
+are validated before root recovery; retained previous-map memory is charged
+throughout. The existing allocation-only API still drops the current container.
+This fast entry point requires all three current roots to share one bundle and
+no replay, while other layouts use their existing entry points.
+
+The nonempty sealed fixture checks that allocation, catalog and authority share
+one current-container payload read. The paired fixtures exercise the fast path
+with ordinary and bootstrap predecessors, including a separate old allocation,
+and ensure illegal transitions remain rejected. This reduces duplicate fixture
+I/O; production mount integration and QEMU performance are still unverified.
+
+## Combined recovery failure and memory boundaries
+
+The combined no-replay path is now exercised with an injected partial-fill error
+at every read request observed in successful recovery. Coverage includes the
+nonempty manifest/authority fixture and paired ordinary/bootstrap predecessors,
+including a separate previous allocation root. Every injection must fail rather
+than return recovered roots; the device's original bytes are preserved.
+
+The nonempty fixture also searches the smallest accepted combined recovery
+budget and checks one byte less and one extra resident byte. This checks the
+entry point's dynamic-memory contract across allocation, catalog, authority and
+manifest phases. It excludes anchor selection (performed beforehand), fixed
+scanner/stack storage and process-level allocations. This remains a bounded
+read-error campaign, not write/crash validation or a QEMU performance result.
+
+## CAS replay recovery adapter
+
+A catalog-only `recover_catalog` entry point now releases the bundle after
+snapshot decoding, reads the selected CAS delta chain backwards and applies it
+in commit order. It checks chain depth/termination, descriptor generation,
+monotonic generation and ObjectId, existing-Blob reuse versus new-Blob insertion,
+allocated carriers and final entry limits. The materialized table is stamped
+with the selected checkpoint generation before reference validation.
+
+Preflight charges resident maps/tables, delta chain capacity and complete
+successor table capacity during reservation; actual capacities are checked again.
+The nonempty device fixture adds a sealed reuse delta for ObjectId 2 and checks
+that recovery returns two objects backed by the original single Blob. A one-entry
+limit rejects it. Multi-delta/new-Blob/error cases remain to be exercised, and
+combined authority recovery still uses its explicit no-replay path. Production
+mount and QEMU performance are not established by this adapter.
+
+## Multi-delta replay fixture
+
+The sealed nonempty fixture now runs with zero, one and three CAS reuse deltas.
+It verifies ordered materialization of ObjectIds 1 through 4 with one shared Blob,
+selected checkpoint generation and entry-limit rejection. Corrupting the tail
+payload fails recovery. A separately re-encoded and sealed checkpoint that
+understates the chain count also fails, testing semantic chain-depth validation
+rather than only digest rejection. The updated targeted fixture passes.
+
+These chains remain within one sealed segment and generation and introduce no
+new Blob mapping. Cross-generation/multi-segment replay, new-Blob insertion,
+authority integration and production/QEMU validation remain outstanding.
+
+## Replay new-Blob insertion and budget errors
+
+The fixture now starts with an empty catalog, introduces a real sealed Blob
+mapping in the first delta and reuses it in later deltas. A fully sealed chain
+that attempts a second insertion of the same Blob is rejected. Successful replay
+cases inject partial-fill errors at every observed replay/reference read and
+search the minimum accepted dynamic-memory budget.
+
+That budget test exposed a classification bug: the physical reader treats its
+maximum payload length as a format constraint, so passing insufficient remaining
+memory could yield Corrupt. Replay and manifest adapters now check declared
+payload length against remaining memory before reading and return MemoryLimit.
+The updated eleven root-bundle tests pass, including boundary and read-error
+cases. These fixtures remain within one segment/generation; mount, cross-segment
+replay, authority integration and QEMU performance remain outstanding.
+
+## Combined CAS replay and authority recovery
+
+Catalog-only and combined recovery now share the same bounded replay helper.
+`recover_roots` applies CAS replay before resolving full authority roots, keeping
+and charging the container through those phases, then releasing it before
+manifest reads. `recover_bundled_checkpoint` additionally reuses the allocation
+reader's current container and preserves predecessor transition validation.
+Explicit no-replay entry points retain their rejection behavior and delegate.
+
+The sealed replay fixture calls the all-bundled checkpoint entry point, including
+an initially empty catalog whose authority root names a replay-created object.
+It checks materialized tables, authority resolution and one current-container
+payload request across allocation, replay and authority recovery. Authority
+deltas, mixed current-root layouts, cross-generation/segment replay and actual
+mount/publication/QEMU validation remain outstanding.
+
+## Replay in a separate sealed segment
+
+The nonempty fixture now places its three new-Blob/reuse deltas in segment 8,
+while Blob, manifest and root bundle remain in segment 7. Both carriers are
+Allocated, the next segment generation advances accordingly, and the delta
+segment header names the sealed root segment as predecessor. Recovery follows
+actual cross-segment references, resolves authority and still reads the root
+container once. The same read-failure and memory-boundary checks cover this mode.
+Corrupting the separate delta segment seal must fail combined recovery.
+
+This exercises a delta chain in a separate segment at the same checkpoint
+generation. It does not yet exercise a chain spanning several delta segments or
+multiple checkpoint generations, nor production mount/publication/QEMU timing.
+
+## Replay chain spanning three delta segments
+
+The fixture additionally places each of three deltas in its own segment (8, 9,
+10), with distinct segment generations, allocated carriers and sealed predecessor
+links. Replay pointers now cross between delta segments, rather than merely
+pointing from the root segment to one delta segment. Existing ordered recovery,
+new-Blob reuse, read-failure and memory-budget checks exercise this layout.
+Each delta segment seal is independently corrupted and must cause rejection.
+
+All records still target the same checkpoint generation. Cross-checkpoint replay,
+mixed current-root layouts and actual mount/publication/QEMU validation remain
+outstanding; this is not a latency benchmark.
+
+## Mixed allocation and shared catalog/authority bundle
+
+Checkpoint recovery now accepts separate allocation storage while catalog and
+full authority share a bundle. After allocation-pair validation it reuses a
+matching retained container or drops the allocation container before reading
+the catalog/authority bundle, charging both retained maps. Current catalog and
+authority must still share one bundle; separated catalog/authority need further
+integration. A separate allocation read now preflights payload length against
+remaining memory, matching replay/manifest MemoryLimit classification.
+
+All old/new allocation layout combinations and bootstrap predecessors now call
+the combined entry point, including illegal-transition rejection, one catalog
+container request, partial-read failures and minimum-memory boundary checks.
+This integrates allocation fallback only, not production mount/publication or
+QEMU performance.
+
+## Replay across checkpoint generations
+
+The split-delta fixture now also selects checkpoint generation 6 while retaining
+a generation-4 catalog/authority bundle. Its three delta segments target
+generations 4, 5 and 6, and a separate generation-6 allocation extent records all
+current carriers. Recovery materializes generation 6, resolves the older full
+authority snapshot and reads the shared catalog/authority container once.
+Existing replay read failures, minimum-memory checks, tail corruption and each
+delta segment's seal corruption cover this variant. The targeted fixture passes.
+
+This is a single selected checkpoint backed by cross-generation records; it does
+not provide a prior sealed checkpoint slot for this variant, simulate historical
+publication/crashes, or establish production mount/QEMU performance.
+
+## Separate catalog recovery adapter
+
+`recover_separate_catalog` reads an explicitly separate Catalog extent and uses
+the same extracted snapshot decoder, replay helper and manifest/descriptor
+validator as bundled recovery. It checks remaining payload memory before I/O,
+charges allocation/encoded/table capacities and drops encoded catalog storage
+before replay/reference reads. It does not install authority or mounted state.
+
+The nonempty device fixture adds an actual separate catalog record selected by
+mask 6, while allocation and authority remain bundled. It recovers the catalog,
+resolves bundled authority against it, rejects insufficient memory and rejects
+catalog payload corruption. Eleven root-bundle tests pass. Separate-catalog replay
+and complete layout dispatch remain to be exercised/integrated.
+
+## Separate authority and root layout dispatch
+
+`recover_separate_authority` uses the same extracted bounded authority decoder,
+root extraction and catalog matching as bundled authority. It charges catalog
+and allocation state before reading its separate extent. The fixture adds mask 4
+with separate catalog and full authority, checking restored roots, insufficient
+memory and authority payload corruption.
+
+`recover_checkpoint_roots` dispatches non-null CAS/full-authority roots using the
+explicit mask: shared catalog/authority bundles use the retained-container path;
+other layouts recover catalog first, then authority with all retained tables
+charged. Separate-catalog/bundled-authority and separate-catalog/separate-authority
+fixtures call this dispatcher. Null bootstrap roots, growth, legacy roots and
+authority deltas remain integration gates. This is not production mount state.

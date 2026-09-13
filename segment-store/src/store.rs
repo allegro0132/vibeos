@@ -1517,7 +1517,7 @@ impl MountedState {
     }
 }
 
-fn allocation_resident_bytes(allocation: &AllocationV2) -> Result<usize, ()> {
+pub(crate) fn allocation_resident_bytes(allocation: &AllocationV2) -> Result<usize, ()> {
     allocation.allocated_bytes().ok_or(())
 }
 
@@ -2923,7 +2923,7 @@ fn recovery_remaining<E>(limit: usize, resident: usize) -> Result<usize, StoreEr
     limit.checked_sub(resident).ok_or(StoreError::MemoryLimit)
 }
 
-fn recovery_preflight_decode<E>(
+pub(crate) fn recovery_preflight_decode<E>(
     limit: usize,
     resident: usize,
     encoded_capacity: usize,
@@ -2950,7 +2950,7 @@ fn input_u32(input: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(bytes.try_into().ok()?))
 }
 
-fn allocation_decode_capacity_upper_bound<E>(
+pub(crate) fn allocation_decode_capacity_upper_bound<E>(
     input: &[u8],
     version: u16,
     admitted_segments: u64,
@@ -2979,7 +2979,7 @@ fn allocation_decode_capacity_upper_bound<E>(
     }
 }
 
-fn cas_snapshot_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
+pub(crate) fn cas_snapshot_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
     let object_count = input_u32(input, 0x18).ok_or(StoreError::Corrupt)? as usize;
     let blob_count = input_u32(input, 0x1c).ok_or(StoreError::Corrupt)? as usize;
     let expected_len = object_count
@@ -3007,7 +3007,7 @@ fn catalog_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreEr
         .ok_or(StoreError::MemoryLimit)
 }
 
-fn blob_manifest_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
+pub(crate) fn blob_manifest_decode_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
     let extent_count = input_u32(input, 0x58).ok_or(StoreError::Corrupt)? as usize;
     let expected_len = extent_count
         .checked_mul(MANIFEST_EXTENT_LEN)
@@ -3070,7 +3070,7 @@ fn persistent_authority_decode_capacity_upper_bound<E>(
 }
 
 
-fn persistent_authority_recovery_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
+pub(crate) fn persistent_authority_recovery_capacity_upper_bound<E>(input: &[u8]) -> Result<usize, StoreError<E>> {
     let decoded = persistent_authority_decode_capacity_upper_bound(input)?;
     let objects = input_u32(input, 0x38).ok_or(StoreError::Corrupt)? as usize;
     let external = input_u32(input, 0x70).ok_or(StoreError::Corrupt)? as usize;
@@ -3080,7 +3080,7 @@ fn persistent_authority_recovery_capacity_upper_bound<E>(input: &[u8]) -> Result
         .ok_or(StoreError::MemoryLimit)
 }
 
-fn authority_roots_from_snapshot<E>(decoded: &PersistentAuthoritySnapshot) -> Result<PersistentRootSet, StoreError<E>> {
+pub(crate) fn authority_roots_from_snapshot<E>(decoded: &PersistentAuthoritySnapshot) -> Result<PersistentRootSet, StoreError<E>> {
     let count = decoded.objects.len().checked_add(decoded.external_roots().len())
         .ok_or(StoreError::MemoryLimit)?;
     let mut entries = Vec::new();
@@ -4419,7 +4419,7 @@ async fn recover_state_with_memo<D: PageDevice>(
     })
 }
 
-fn require_allocated_pointer<E>(
+pub(crate) fn require_allocated_pointer<E>(
     allocation: &AllocationV2,
     pointer: PhysicalPointer,
 ) -> Result<(), StoreError<E>> {
@@ -4533,7 +4533,7 @@ fn validate_growth_checkpoint_transition<E>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn validate_allocation_checkpoint_transition<E>(
+pub(crate) fn validate_allocation_checkpoint_transition<E>(
     older: &AllocationV2,
     newer: &AllocationV2,
     older_generation: u64,
